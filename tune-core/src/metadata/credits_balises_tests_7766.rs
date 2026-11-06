@@ -120,6 +120,35 @@ fn ni_various_artists_ni_coupure_sur_l_esperluette_7766() {
     );
 }
 
+/// « A; B; B & A » : deux personnes, la troisième entrée ne fait que les
+/// réunir. Le découpage est celui d'`artist_split` (« feat. » coupe aussi).
+#[test]
+fn une_reformulation_des_personnes_citees_n_est_pas_un_credit_7766() {
+    let lignes = lignes_des_balises(&m(&[
+        (
+            "composer",
+            "John Lennon; Paul McCartney; Paul McCartney & John Lennon",
+        ),
+        (
+            "performer",
+            "Ella Fitzgerald (vocals) feat. Louis Armstrong (trumpet)",
+        ),
+        ("producer", "Simon & Garfunkel; Roy Halee"),
+    ]));
+    assert_eq!(
+        triplets(&lignes),
+        vec![
+            "composer|John Lennon|",
+            "composer|Paul McCartney|",
+            "performer|Ella Fitzgerald|vocals",
+            "performer|Louis Armstrong|trumpet",
+            "producer|Roy Halee|",
+            "producer|Simon & Garfunkel|",
+        ],
+        "#7766 — « A; B; B & A » doit donner deux personnes : {lignes:?}"
+    );
+}
+
 #[test]
 fn la_tmcl_et_l_ensemble_bruts_completent_les_cles_7766() {
     let mut meta = m(&[("performer", "Jim Hall (guitar)")]);
@@ -400,5 +429,32 @@ fn le_scan_ecrit_ses_lignes_sans_toucher_aux_autres_sources_7766() {
             "balises|composer|Richard Rodgers|",
             "musicbrainz|producer|Alan Douglas|",
         ]
+    );
+}
+
+/// #7766 — la lecture des pistes (`parse_credits`) coupe « Nom (instrument) »
+/// comme l'écriture au scan, à la DERNIÈRE parenthèse : elle coupait à la
+/// première et rendait « Orchestre » joué au « de chambre) de Paris (violon ».
+#[test]
+fn la_lecture_des_pistes_coupe_l_instrument_comme_le_scan_7766() {
+    use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+    let mut tag = Tag::new(TagType::VorbisComments);
+    tag.push(TagItem::new(
+        ItemKey::Performer,
+        ItemValue::Text("Orchestre (de chambre) de Paris (violon)".into()),
+    ));
+    let credits = super::parse_credits(&tag);
+    let lus: Vec<(String, Option<String>)> = credits
+        .into_iter()
+        .filter(|c| c.role == "performer")
+        .map(|c| (c.name, c.instrument))
+        .collect();
+    assert_eq!(
+        lus,
+        vec![(
+            "Orchestre (de chambre) de Paris".to_string(),
+            Some("violon".to_string())
+        )],
+        "#7766 — `parse_credits` ne découpe pas comme `nom_et_instrument`"
     );
 }

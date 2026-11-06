@@ -56,6 +56,75 @@ fn sans_lignes_balises(engine: tune_core::db::engine::Engine) -> &'static str {
     }
 }
 
+/// `item` porte déjà le crédit (piste, rôle, nom sans casse) : même
+/// instrument, ou l'un des deux n'en précise pas.
+fn meme_credit(
+    item: &Value,
+    track_id: i64,
+    role: &str,
+    nom: &str,
+    instrument: Option<&str>,
+) -> bool {
+    item["track_id"].as_i64() == Some(track_id)
+        && item["role"].as_str() == Some(role)
+        && item["artist_name"]
+            .as_str()
+            .is_some_and(|n| n.trim().to_lowercase() == nom.trim().to_lowercase())
+        && match (item["instrument"].as_str(), instrument) {
+            (Some(deja), Some(nouveau)) => {
+                deja.trim().to_lowercase() == nouveau.trim().to_lowercase()
+            }
+            // Une ligne structurée sans instrument peut être
+            // précisée par la première balise correspondante.
+            (None, _) | (Some(_), None) => true,
+        }
+}
+
+/// #7766 — une ligne `balises` de `track_credits` ne s'affiche pas quand une
+/// autre source (MusicBrainz, Roon, Discogs, manuel…) porte déjà le même
+/// crédit : elle peut seulement compléter son instrument. C'est la règle de
+/// [`ajouter_credits_des_balises`], appliquée aux lignes que le scan écrit
+/// désormais dans la table. Sans elle, « Bill Evans, piano » de MusicBrainz
+/// et la balise « Bill Evans (piano) » donnaient deux entrées.
+///
+/// Les lignes doivent porter leur `source` ; le champ est retiré ensuite, la
+/// réponse garde sa forme. L'ordre des lignes restantes est conservé.
+fn fusionner_les_lignes_balises(items: &mut Vec<Value>) {
+    use tune_core::metadata::source_des_credits::BALISES;
+    let est_balise = |item: &Value| item["source"].as_str() == Some(BALISES);
+    let mut retirees = vec![false; items.len()];
+    for i in 0..items.len() {
+        if !est_balise(&items[i]) {
+            continue;
+        }
+        let (Some(track_id), Some(role), Some(nom)) = (
+            items[i]["track_id"].as_i64(),
+            items[i]["role"].as_str().map(str::to_owned),
+            items[i]["artist_name"].as_str().map(str::to_owned),
+        ) else {
+            continue;
+        };
+        let instrument = items[i]["instrument"].as_str().map(str::to_owned);
+        let Some(j) = (0..items.len()).find(|&j| {
+            !est_balise(&items[j])
+                && meme_credit(&items[j], track_id, &role, &nom, instrument.as_deref())
+        }) else {
+            continue;
+        };
+        if items[j]["instrument"].is_null() && instrument.is_some() {
+            items[j]["instrument"] = json!(instrument);
+        }
+        retirees[i] = true;
+    }
+    let mut retirees = retirees.into_iter();
+    items.retain(|_| !retirees.next().unwrap_or(false));
+    for item in items.iter_mut() {
+        if let Some(o) = item.as_object_mut() {
+            o.remove("source");
+        }
+    }
+}
+
 /// Ajoute les crédits portés par le fichier à la réponse existante. Une ligne
 /// structurée MusicBrainz/Roon garde sa fiche et sa position ; une balise de
 /// même personne et de même rôle peut seulement compléter son instrument.
@@ -85,21 +154,10 @@ fn ajouter_credits_des_balises(
                 + 1
         });
         for (nom, instrument) in personnes_de_la_balise(valeur, role) {
-            if let Some(existant) = items.iter_mut().find(|item| {
-                item["track_id"].as_i64() == Some(track_id)
-                    && item["role"].as_str() == Some(role)
-                    && item["artist_name"]
-                        .as_str()
-                        .is_some_and(|n| n.trim().to_lowercase() == nom.to_lowercase())
-                    && match (item["instrument"].as_str(), instrument.as_deref()) {
-                        (Some(deja), Some(nouveau)) => {
-                            deja.trim().to_lowercase() == nouveau.to_lowercase()
-                        }
-                        // Une ligne structurée sans instrument peut être
-                        // précisée par la première balise correspondante.
-                        (None, _) | (Some(_), None) => true,
-                    }
-            }) {
+            if let Some(existant) = items
+                .iter_mut()
+                .find(|item| meme_credit(item, track_id, role, &nom, instrument.as_deref()))
+            {
                 if existant["instrument"].is_null() && instrument.is_some() {
                     existant["instrument"] = json!(instrument);
                 }
@@ -193,7 +251,7 @@ pub(super) async fn track_credits(
     let rows = state
         .backend
         .query_many(
-            "SELECT id, track_id, artist_id, artist_name, role, instrument, position FROM track_credits WHERE track_id = ? ORDER BY position",
+            "SELECT id, track_id, artist_id, artist_name, role, instrument, position, source FROM track_credits WHERE track_id = ? ORDER BY position",
             &[&id as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
@@ -208,9 +266,11 @@ pub(super) async fn track_credits(
                 "role": r.get(4).and_then(|v| v.as_string()),
                 "instrument": r.get(5).and_then(|v| v.as_string()),
                 "position": r.get(6).and_then(|v| v.as_i64()),
+                "source": r.get(7).and_then(|v| v.as_string()),
             })
         })
         .collect();
+    fusionner_les_lignes_balises(&mut items);
     let id_str = id.to_string();
     let (cle_piste, piste_param): (&str, &dyn ToSqlValue) = match state.backend.engine() {
         tune_core::db::engine::Engine::Postgres => ("CAST(tm.track_id AS TEXT) = ?", &id_str),
@@ -245,7 +305,7 @@ pub(super) async fn artist_credits(
         tune_core::db::engine::Engine::Sqlite => "tc.artist_id = ?",
     };
     let sql = format!(
-        "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position \
+        "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position, tc.source \
          FROM track_credits tc \
          WHERE {cle_fiche} OR tc.artist_name = (SELECT name FROM artists WHERE id = ?) \
          ORDER BY tc.track_id, tc.position"
@@ -254,7 +314,7 @@ pub(super) async fn artist_credits(
         .backend
         .query_many(&sql, &[&id_str as &dyn ToSqlValue, &id as &dyn ToSqlValue])
         .map_err(AppError::internal)?;
-    let items: Vec<Value> = rows
+    let mut items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
@@ -265,9 +325,13 @@ pub(super) async fn artist_credits(
                 "role": r.get(4).and_then(|v| v.as_string()),
                 "instrument": r.get(5).and_then(|v| v.as_string()),
                 "position": r.get(6).and_then(|v| v.as_i64()),
+                "source": r.get(7).and_then(|v| v.as_string()),
             })
         })
         .collect();
+    // #7766 — même règle que la piste : la fiche d'artiste et son nom
+    // retrouvent la ligne MusicBrainz ET la ligne `balises` du même crédit.
+    fusionner_les_lignes_balises(&mut items);
     Ok(Json(json!(items)))
 }
 
@@ -301,7 +365,7 @@ pub(super) async fn album_credits(
     };
     let sql = format!(
         "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position, \
-                t.title, t.track_number, t.disc_number, tc.artist_mbid \
+                t.title, t.track_number, t.disc_number, tc.artist_mbid, tc.source \
          FROM track_credits tc \
          JOIN tracks t ON {jointure} \
          WHERE {cle_album} \
@@ -327,9 +391,11 @@ pub(super) async fn album_credits(
                 "track_number": r.get(8).and_then(|v| v.as_i64()),
                 "disc_number": r.get(9).and_then(|v| v.as_i64()),
                 "artist_mbid": r.get(10).and_then(|v| v.as_string()),
+                "source": r.get(11).and_then(|v| v.as_string()),
             })
         })
         .collect();
+    fusionner_les_lignes_balises(&mut items);
     ajouter_instruments_wikidata(&state.backend, &mut items);
     let (jointure_metadonnees, cle_album_metadonnees) = match state.backend.engine() {
         Engine::Postgres => (
@@ -1561,6 +1627,90 @@ mod tests_balises_5160 {
             album.as_array().unwrap().len(),
             2,
             "#7766 — crédits d'album doublés : {album}"
+        );
+    }
+
+    /// #7766 — un crédit que MusicBrainz porte déjà et que le scan a aussi
+    /// écrit depuis les balises s'affiche UNE fois, sur la piste, l'album et
+    /// la page artiste. La ligne `balises` peut seulement compléter
+    /// l'instrument ; un crédit propre aux balises reste affiché.
+    #[tokio::test]
+    async fn un_credit_musicbrainz_et_balises_ne_s_affiche_qu_une_fois_7766() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (91, 'Bill Evans');
+                 INSERT INTO albums (id, title, artist_id) VALUES (92, 'Undercurrent', 91);
+                 INSERT INTO tracks (id, title, file_path, album_id, track_number, disc_number)
+                    VALUES (93, 'My Funny Valentine', '/musique/93.flac', 92, 1, 1);
+                 INSERT INTO track_credits (track_id, artist_id, artist_name, role, position, source)
+                    VALUES (93, 91, 'Bill Evans', 'performer', 0, 'musicbrainz');
+                 INSERT INTO track_credits (track_id, artist_name, role, instrument, position, source)
+                    VALUES (93, 'Richard Rodgers', 'composer', NULL, 1, 'musicbrainz');
+                 INSERT INTO track_credits (track_id, artist_name, role, instrument, position, source)
+                    VALUES (93, 'Bill Evans', 'performer', 'piano', 0, 'balises');
+                 INSERT INTO track_credits (track_id, artist_name, role, position, source)
+                    VALUES (93, 'richard rodgers', 'composer', 1, 'balises');
+                 INSERT INTO track_credits (track_id, artist_name, role, instrument, position, source)
+                    VALUES (93, 'Jim Hall', 'performer', 'guitar', 2, 'balises');",
+            )
+            .unwrap();
+
+        let resume = |credits: &Value| -> Vec<String> {
+            let mut v: Vec<String> = credits
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}|{}|{}",
+                        c["artist_name"].as_str().unwrap_or_default(),
+                        c["role"].as_str().unwrap_or_default(),
+                        c["instrument"].as_str().unwrap_or("-")
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let attendu = vec![
+            "Bill Evans|performer|piano".to_string(),
+            "Jim Hall|performer|guitar".to_string(),
+            "Richard Rodgers|composer|-".to_string(),
+        ];
+
+        let Json(piste) = track_credits(State(state.clone()), Path(93))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits de piste"));
+        assert_eq!(
+            resume(&piste),
+            attendu,
+            "#7766 — crédit MusicBrainz doublé par sa ligne `balises` sur la piste : {piste}"
+        );
+        assert!(
+            piste
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c.get("source").is_none()),
+            "la réponse garde sa forme : {piste}"
+        );
+        let Json(album) = album_credits(State(state.clone()), Path(92))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits d'album"));
+        assert_eq!(
+            resume(&album),
+            attendu,
+            "#7766 — crédit MusicBrainz doublé par sa ligne `balises` sur l'album : {album}"
+        );
+        let Json(artiste) = artist_credits(State(state), Path(91))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits d'artiste"));
+        assert_eq!(
+            resume(&artiste),
+            vec!["Bill Evans|performer|piano".to_string()],
+            "#7766 — crédit doublé sur la page artiste : {artiste}"
         );
     }
 

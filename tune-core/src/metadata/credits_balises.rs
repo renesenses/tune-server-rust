@@ -33,6 +33,11 @@ use crate::library::regle_compilation::est_artistes_divers;
 ///
 /// L'ordre est celui de l'écriture : un compositeur avant ses interprètes,
 /// comme sur une pochette.
+///
+/// `ensemble` (ENSEMBLE, ORCHESTRA) suit MusicBrainz, qui crédite l'orchestre
+/// par la relation « performing orchestra » : le rôle écrit est `performer`,
+/// sans instrument, comme un soliste dont l'instrument n'est pas dit.
+/// L'affichage par rôle (#7767) ne les distingue donc pas par la ligne.
 pub const CLES_DE_CREDIT: [(&str, &str); 12] = [
     ("composer", "composer"),
     ("lyricist", "lyricist"),
@@ -139,11 +144,35 @@ pub fn nom_et_instrument(entree: &str) -> (String, Option<String>) {
     (entree.to_owned(), None)
 }
 
+/// Les entrées d'une valeur de balise, coupées par le découpage fort de
+/// [`super::artist_split`] (« ; », « feat. »), sans « & » ni « , ».
+fn personnes_de_la_valeur(valeur: &str) -> Vec<String> {
+    super::artist_split::split_artist_credit(valeur, &[], false)
+}
+
+/// `nom` (l'entrée `rang` de `personnes`) ne fait que réunir d'autres
+/// personnes de la même valeur : « B & A » à côté de « A » et « B ».
+/// « Simon & Garfunkel » seul n'est pas une reformulation.
+fn est_une_reformulation(nom: &str, rang: usize, personnes: &[(String, Option<String>)]) -> bool {
+    let cle = |n: &str| crate::db::engine::fold_diacritics(n.trim()).to_lowercase();
+    let parties = super::artist_split::split_artist_credit(nom, &[], true);
+    parties.len() >= 2
+        && parties.iter().all(|partie| {
+            personnes
+                .iter()
+                .enumerate()
+                .any(|(j, (autre, _))| j != rang && cle(autre) == cle(partie))
+        })
+}
+
 /// Les lignes de crédit portées par les métadonnées étendues d'une piste.
 ///
 /// Une valeur porte une ou plusieurs personnes séparées par « ; » — le
-/// séparateur de [`super::read_extended_metadata`] pour une balise répétée.
-/// « & » et « , » ne coupent PAS : « Simon & Garfunkel » est un seul crédit.
+/// séparateur de [`super::read_extended_metadata`] pour une balise répétée —
+/// ou par « feat. », découpées par [`super::artist_split`] comme les
+/// artistes du scan. « & » et « , » ne coupent PAS : « Simon & Garfunkel »
+/// est un seul crédit. Une entrée qui ne fait que réunir des personnes déjà
+/// citées (« A; B; B & A ») est une reformulation et n'est pas écrite.
 /// « Various Artists » et ses variantes ne sont pas des personnes et sont
 /// écartés. Un même crédit (nom sans casse, rôle, instrument) n'est écrit
 /// qu'une fois : ID3 range TEXT à la fois en parolier et en auteur.
@@ -156,13 +185,22 @@ pub fn lignes_des_balises(meta: &HashMap<String, String>) -> Vec<LigneCredit> {
         let Some(role) = role_canonique(type_mb) else {
             continue;
         };
-        for entree in valeur.split(';') {
-            let (nom, instrument) = if role == "performer" {
-                nom_et_instrument(entree)
-            } else {
-                (entree.trim().to_owned(), None)
-            };
+        let personnes: Vec<(String, Option<String>)> = personnes_de_la_valeur(valeur)
+            .into_iter()
+            .map(|entree| {
+                if role == "performer" {
+                    nom_et_instrument(&entree)
+                } else {
+                    (entree.trim().to_owned(), None)
+                }
+            })
+            .collect();
+        for (i, (nom, instrument)) in personnes.iter().enumerate() {
+            let (nom, instrument) = (nom.clone(), instrument.clone());
             if nom.is_empty() || est_artistes_divers(&nom) {
+                continue;
+            }
+            if est_une_reformulation(&nom, i, &personnes) {
                 continue;
             }
             let instrument = instrument
@@ -227,6 +265,11 @@ pub fn ecrire_credits_des_balises(
 /// Appelée par le scan manuel et le scan automatique, dans la transaction du
 /// lot, juste après `TrackMetadataRepo::set_batch_multi`. Une piste en échec
 /// est journalisée et n'arrête pas le lot. Rend le nombre de lignes écrites.
+///
+/// Choix assumé : un `INSERT` qui échoue au milieu d'une piste laisse à cette
+/// piste une partie de ses lignes `balises` (la purge a déjà eu lieu, dans la
+/// même transaction). Une piste aux crédits incomplets, refaits au prochain
+/// scan du fichier, vaut mieux qu'un lot entier de pistes perdu.
 pub fn ecrire_lot(backend: &Arc<dyn DbBackend>, lot: &[(i64, HashMap<String, String>)]) -> usize {
     let mut ecrites = 0usize;
     for (track_id, meta) in lot {

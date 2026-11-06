@@ -4842,14 +4842,10 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
         if item.key() == ItemKey::Performer
             && let Some(val) = item.value().text()
         {
-            let (name, instrument) = if let Some((n, i)) = val.split_once('(') {
-                (
-                    n.trim().to_string(),
-                    Some(i.trim_end_matches(')').trim().to_string()),
-                )
-            } else {
-                (val.to_string(), None)
-            };
+            // #7766 — le découpage « Nom (instrument) » des crédits de balise,
+            // à la dernière parenthèse : « Orchestre (de chambre) de Paris
+            // (violon) » garde son nom entier.
+            let (name, instrument) = credits_balises::nom_et_instrument(val);
             credits.push(TrackCredit {
                 name,
                 role: "performer".into(),
