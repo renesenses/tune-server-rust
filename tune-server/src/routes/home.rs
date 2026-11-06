@@ -2371,7 +2371,90 @@ const ECOUTES_STREAMING: usize = 6;
 async fn other_versions(
     State(state): State<AppState>,
     Query(p): Query<OtherVersionsParams>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<axum::response::Response, AppError> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let fournisseur = fournisseur_streaming_reel(state.clone());
+    let (groupes, en_preparation) = autres_versions(&state, &p, fournisseur)?;
+    if en_preparation {
+        // 202 + un corps qui reste LA LISTE des groupes (ceux que la
+        // bibliotheque a deja rendus, vide au pire) : un client qui ne connait
+        // pas ce code lit une reponse valide ; un client qui le connait sait
+        // que la moitie streaming se prepare et peut redemander.
+        return Ok((
+            StatusCode::ACCEPTED,
+            [(EN_PREPARATION_ENTETE, "true")],
+            Json(Value::Array(groupes)),
+        )
+            .into_response());
+    }
+    Ok(Json(Value::Array(groupes)).into_response())
+}
+
+/// L'en-tete qui dit « la partie streaming se prepare, redemande plus tard ».
+pub(crate) const EN_PREPARATION_ENTETE: &str = "x-en-preparation";
+
+/// Ce qui va chercher les versions streaming d'un titre : (titre, artiste,
+/// album, filtre) → pistes. Injecte pour que les temoins puissent le rendre
+/// lent sans reseau.
+type FournisseurStreaming = std::sync::Arc<
+    dyn Fn(
+            String,
+            String,
+            String,
+            FiltreSources,
+        ) -> futures_util::future::BoxFuture<'static, Vec<Value>>
+        + Send
+        + Sync,
+>;
+
+fn fournisseur_streaming_reel(state: AppState) -> FournisseurStreaming {
+    std::sync::Arc::new(
+        move |titre: String, artiste: String, album: String, filtre: FiltreSources| {
+            let state = state.clone();
+            futures_util::FutureExt::boxed(async move {
+                let reference = crate::routes::versions::Reference {
+                    titre,
+                    artiste,
+                    album,
+                    ..Default::default()
+                };
+                crate::routes::versions::versions_streaming(&state, &reference, &filtre).await
+            })
+        },
+    )
+}
+
+/// Les versions streaming deja calculees, par (sources, titre, artiste).
+///
+/// Mesure du 31/10 sur un serveur reel : 20,8 s au premier appel, 0,08 s au
+/// suivant. Les 20 s sont les recherches des services (jusqu'a 6 titres × 5
+/// services × 2 requetes, SEQUENTIELLES) ; le rapprochement local, lui, est
+/// dans le bruit. La route ne les attend donc plus : elle rend ce qui est
+/// pret, et le reste se calcule en tache de fond.
+static STREAMING_ACCUEIL: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<Value>)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Les cles dont un calcul de fond est en cours : une seule tache par cle.
+static STREAMING_ACCUEIL_EN_COURS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Au-dela, une entree est rendue PERIMEE et recalculee en fond. Meme duree
+/// que le cache des recherches sous-jacent.
+const STREAMING_ACCUEIL_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+const STREAMING_ACCUEIL_TTL_VIDE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Le calcul de la route, sans HTTP : `(groupes, en_preparation)`.
+///
+/// Ne fait JAMAIS d'appel reseau en ligne : la bibliotheque (rapide) est lue
+/// sur place, le streaming vient du cache ou d'une tache de fond.
+fn autres_versions(
+    state: &AppState,
+    p: &OtherVersionsParams,
+    fournisseur: FournisseurStreaming,
+) -> Result<(Vec<Value>, bool), AppError> {
     let filtre = FiltreSources::depuis(p.sources.as_deref());
     // Plafond borne cote serveur : ce nombre part dans le SQL, il ne doit pas
     // venir tel quel de l'URL.
@@ -2460,19 +2543,77 @@ async fn other_versions(
         Vec::new()
     };
 
-    for (titre, artiste, album) in recentes {
-        // Le vivier de cette route est `listen_history` : il ne porte ni ISRC
-        // ni duree ni annee. La reference part donc sans signaux, et le score
-        // ne repose ici que sur le titre — c'est moins que sur la route par
-        // piste, et c'est assume : inventer une duree serait pire.
-        let reference = crate::routes::versions::Reference {
-            titre: titre.clone(),
-            artiste: artiste.clone(),
-            album: album.clone(),
-            ..Default::default()
-        };
-        let trouvees =
-            crate::routes::versions::versions_streaming(&state, &reference, &filtre).await;
+    // L'identite de l'etat entre dans la cle : deux `AppState` (les temoins en
+    // montent des dizaines dans un meme processus) ne partagent pas un cache
+    // qui n'est vrai que pour les services de l'un. En production il n'y en a
+    // qu'un.
+    let id_etat = std::sync::Arc::as_ptr(&state.services) as *const () as usize;
+    let cle_sources = format!(
+        "{id_etat}\u{1}{}",
+        p.sources.clone().unwrap_or_default().to_lowercase()
+    );
+    let mut en_preparation = false;
+    let mut a_calculer: Vec<(String, String, String, String)> = Vec::new();
+    let mut pretes: Vec<(String, String, String, Vec<Value>)> = Vec::new();
+    {
+        let cache = STREAMING_ACCUEIL.lock().unwrap_or_else(|e| e.into_inner());
+        for (titre, artiste, album) in recentes {
+            let cle = format!(
+                "{cle_sources}\u{1}{}\u{1}{}",
+                titre.to_lowercase(),
+                artiste.to_lowercase()
+            );
+            match cache.get(&cle) {
+                Some((quand, v)) => {
+                    // Un resultat VIDE (service pas encore connecte, panne) ne
+                    // reste pas six heures : il est retente vite.
+                    let ttl = if v.is_empty() {
+                        STREAMING_ACCUEIL_TTL_VIDE
+                    } else {
+                        STREAMING_ACCUEIL_TTL
+                    };
+                    if quand.elapsed() >= ttl {
+                        // Perime : on le sert quand meme, et on le renouvelle.
+                        a_calculer.push((cle, titre.clone(), artiste.clone(), album.clone()));
+                    }
+                    pretes.push((titre, artiste, album, v.clone()));
+                }
+                None => {
+                    en_preparation = true;
+                    a_calculer.push((cle, titre, artiste, album));
+                }
+            }
+        }
+    }
+    // Une seule tache de fond par cle : un accueil rouvert pendant le calcul
+    // ne relance rien.
+    let a_lancer: Vec<_> = {
+        let mut en_cours = STREAMING_ACCUEIL_EN_COURS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        a_calculer
+            .into_iter()
+            .filter(|(cle, ..)| en_cours.insert(cle.clone()))
+            .collect()
+    };
+    if !a_lancer.is_empty() {
+        let filtre_fond = filtre.clone();
+        tokio::spawn(async move {
+            for (cle, titre, artiste, album) in a_lancer {
+                let trouvees = fournisseur(titre, artiste, album, filtre_fond.clone()).await;
+                STREAMING_ACCUEIL
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cle.clone(), (std::time::Instant::now(), trouvees));
+                STREAMING_ACCUEIL_EN_COURS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&cle);
+            }
+        });
+    }
+
+    for (titre, artiste, album, trouvees) in pretes {
         if trouvees.is_empty() {
             continue;
         }
@@ -2498,7 +2639,7 @@ async fn other_versions(
         }
     }
 
-    Ok(Json(json!(groupes)))
+    Ok((groupes, en_preparation))
 }
 
 #[cfg(test)]
@@ -2545,23 +2686,22 @@ mod tests_other_versions {
         )
         .unwrap();
 
-        let resultat = other_versions(
-            State(state),
+        let fournisseur = fournisseur_streaming_reel(state.clone());
+        let resultat = autres_versions(
+            &state,
             // `sources: None` = « Tous » : ces essais portent sur le
             // rapprochement, pas sur la provenance. Ils disent desormais
             // explicitement qu'ils ne filtrent rien.
-            Query(OtherVersionsParams {
+            &OtherVersionsParams {
                 limit: Some(20),
                 sources: None,
-            }),
-        )
-        .await;
-        let Json(groupes) = match resultat {
-            Ok(reponse) => reponse,
+            },
+            fournisseur,
+        );
+        let groupes = match resultat {
+            Ok((groupes, _)) => groupes,
             Err(_) => panic!("la route doit repondre"),
         };
-
-        let groupes = groupes.as_array().expect("groupes de versions");
         assert_eq!(groupes.len(), 1, "groupes rendus : {groupes:?}");
         assert_eq!(
             groupes[0]["versions"][0]["album_title"].as_str(),
@@ -2615,24 +2755,23 @@ mod tests_other_versions {
             .unwrap();
         }
 
-        let resultat = other_versions(
-            State(state),
+        let fournisseur = fournisseur_streaming_reel(state.clone());
+        let resultat = autres_versions(
+            &state,
             // `sources: None` = « Tous » : ces essais portent sur le
             // rapprochement, pas sur la provenance. Ils disent desormais
             // explicitement qu'ils ne filtrent rien.
-            Query(OtherVersionsParams {
+            &OtherVersionsParams {
                 limit: Some(20),
                 sources: None,
-            }),
-        )
-        .await;
+            },
+            fournisseur,
+        );
         // `AppError` n'implemente pas `Debug` : un `expect` ne compile pas.
-        let Json(groupes) = match resultat {
-            Ok(reponse) => reponse,
+        let groupes = match resultat {
+            Ok((groupes, _)) => groupes,
             Err(_) => panic!("la route doit repondre"),
         };
-
-        let groupes = groupes.as_array().expect("groupes de versions");
         assert_eq!(groupes.len(), 1, "groupes rendus : {groupes:?}");
         let versions = groupes[0]["versions"]
             .as_array()
@@ -2644,6 +2783,123 @@ mod tests_other_versions {
             versions.len()
         );
         assert_eq!(versions[0]["album_title"].as_str(), Some("Before The Dawn"));
+    }
+
+    /// `AppError` n'implemente pas `Debug` : ni `unwrap` ni `expect`.
+    fn reponse_ou_panique<T>(r: Result<T, AppError>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(_) => panic!("la route doit repondre"),
+        }
+    }
+
+    /// Un fournisseur streaming LENT (1,5 s), qui rend une version.
+    fn fournisseur_lent(titre_attendu: &'static str) -> FournisseurStreaming {
+        std::sync::Arc::new(
+            move |titre: String, artiste: String, album: String, _filtre: FiltreSources| {
+                futures_util::FutureExt::boxed(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    assert_eq!(titre, titre_attendu);
+                    vec![json!({
+                        "service": "qobuz",
+                        "title": titre,
+                        "artist_name": artiste,
+                        "album_title": format!("{album} (Live)"),
+                        "kind": "version",
+                    })]
+                })
+            },
+        )
+    }
+
+    fn state_avec_une_ecoute(titre: &str, artiste: &str) -> AppState {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history (title, artist_name, album_title, listened_at) \
+                 VALUES (?1, ?2, 'Studio', '2026-10-31T09:00:00Z')",
+                &[&titre as &dyn ToSqlValue, &artiste as &dyn ToSqlValue],
+            )
+            .unwrap();
+        state
+    }
+
+    /// TEMOIN (31/10) : a froid, avec des recherches streaming de 1,5 s, la
+    /// route rend en moins d'une seconde, annonce `en_preparation`, puis le
+    /// resultat complet est servi sans nouvelle attente. Mesure reelle avant
+    /// correctif : 20,8 s au premier appel.
+    #[tokio::test]
+    async fn la_route_ne_bloque_pas_sur_les_services_a_froid() {
+        let titre = "Temoin Froid Autres Versions";
+        let state = state_avec_une_ecoute(titre, "Artiste Temoin Froid");
+        let params = OtherVersionsParams {
+            limit: Some(20),
+            sources: None,
+        };
+
+        let debut = std::time::Instant::now();
+        let (groupes, en_preparation) =
+            reponse_ou_panique(autres_versions(&state, &params, fournisseur_lent(titre)));
+        assert!(
+            debut.elapsed() < std::time::Duration::from_millis(800),
+            "la route a attendu les services : {:?}",
+            debut.elapsed()
+        );
+        assert!(
+            en_preparation,
+            "a froid, le streaming est annonce en preparation"
+        );
+        assert!(
+            groupes.is_empty(),
+            "rien en bibliotheque ni en cache : {groupes:?}"
+        );
+
+        // Le calcul de fond finit ; la reponse suivante est complete et rapide.
+        let mut complet = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let debut = std::time::Instant::now();
+            let (g, prep) =
+                reponse_ou_panique(autres_versions(&state, &params, fournisseur_lent(titre)));
+            assert!(debut.elapsed() < std::time::Duration::from_millis(800));
+            if !prep {
+                complet = Some(g);
+                break;
+            }
+        }
+        let g = complet.expect("le calcul de fond n'a jamais abouti");
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(g[0]["streaming"][0]["service"].as_str(), Some("qobuz"));
+        assert_eq!(g[0]["versions"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// Pendant qu'un calcul de fond tourne, rouvrir l'accueil n'en lance pas
+    /// un second : le fournisseur n'est appele qu'une fois.
+    #[tokio::test]
+    async fn un_accueil_rouvert_pendant_le_calcul_ne_le_relance_pas() {
+        let titre = "Temoin Relance Autres Versions";
+        let state = state_avec_une_ecoute(titre, "Artiste Temoin Relance");
+        let params = OtherVersionsParams {
+            limit: Some(20),
+            sources: None,
+        };
+        let appels = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let compteur = appels.clone();
+        let fournisseur: FournisseurStreaming = std::sync::Arc::new(
+            move |_t: String, _a: String, _al: String, _f: FiltreSources| {
+                compteur.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                futures_util::FutureExt::boxed(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    Vec::new()
+                })
+            },
+        );
+        for _ in 0..3 {
+            let _ = reponse_ou_panique(autres_versions(&state, &params, fournisseur.clone()));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(appels.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
 

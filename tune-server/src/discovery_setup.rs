@@ -24,6 +24,10 @@ mod media_server_tests_3786;
 #[path = "renderer_allume_avant_le_serveur_tests_6961.rs"]
 mod renderer_allume_avant_le_serveur_tests_6961;
 
+#[cfg(test)]
+#[path = "discovery_setup/renderer_sans_services_de_rendu_tests_7279.rs"]
+mod renderer_sans_services_de_rendu_tests_7279;
+
 #[cfg(all(test, feature = "oaat"))]
 #[path = "deux_pi_verox_oaat_airplay_tests_6947.rs"]
 mod deux_pi_verox_oaat_airplay_tests_6947;
@@ -43,6 +47,10 @@ mod deux_pi_verox_oaat_airplay_tests_6947;
 /// intéresse — s'y abonner coûterait un renouvellement toutes les 250 s pour
 /// rien.
 pub(crate) const SERVICES_EVENEMENTS_DLNA: [&str; 2] = ["avtransport", "renderingcontrol"];
+
+/// Les deux services sans lesquels une sortie DLNA ne s'enregistre pas
+/// (`handle_ssdp_discovered`) ; `GET /zones` publie ceux qui manquent (#7279).
+pub(crate) const SERVICES_DE_RENDU: [&str; 2] = ["avtransport", "renderingcontrol"];
 
 /// `eventSubURL` absolues des services abonnables, à partir des chemins bruts
 /// du descripteur.
@@ -100,6 +108,21 @@ pub(crate) fn scpd_av_transport(
     urls.get("avtransport")
         .filter(|p| !p.trim().is_empty())
         .map(|p| resolve_control_url(&dev.host, dev.port, p))
+}
+
+/// #6335 — la même URL, lue dans un descriptif relu par HTTP (ajout manuel,
+/// nouveau sondage, balayage, création de zone). Sans elle, la sortie rend
+/// `AnnonceSuivante::Inconnue` jusqu'à la prochaine découverte SSDP, et aucun
+/// suivant DSD n'est armé sur un renderer qui sait pourtant enchaîner.
+pub(crate) fn scpd_av_transport_du_descriptif(
+    host: &str,
+    port: u16,
+    desc: &tune_core::discovery::xml_parser::DeviceDescription,
+) -> Option<String> {
+    desc.scpd_urls()
+        .get("avtransport")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| resolve_control_url(host, port, p))
 }
 
 pub(crate) fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
@@ -954,6 +977,28 @@ async fn handle_ssdp_discovered(
         );
     }
 
+    // #7279 — sans sortie enregistrée, pas de zone. La chaîne de rattachement
+    // et de création ci-dessous ne regardait pas `registered` : un renderer
+    // sans AVTransport ou sans RenderingControl recevait une zone « en ligne »
+    // qui ne pouvait rien jouer, absente de la liste des appareils de lecture,
+    // et sans un mot dans le journal (Innuos Zenith, fil 2495).
+    if !registered {
+        let manquants: Vec<&str> = SERVICES_DE_RENDU
+            .into_iter()
+            .filter(|cle| !svc_urls.contains_key(*cle))
+            .collect();
+        let annonces: Vec<&String> = svc_urls.keys().collect();
+        warn!(
+            id = %dev.id,
+            name = %dev.name,
+            host = %dev.host,
+            manquants = ?manquants,
+            annonces = ?annonces,
+            "ssdp_renderer_sans_services_de_rendu"
+        );
+        return;
+    }
+
     let skip_keywords = [
         "tv",
         "décodeur",
@@ -1398,7 +1443,107 @@ async fn reregister_known_renderers_avec(state: &AppState, recours: RecoursUnica
         save_known_renderers(&state.backend, &renderers);
     }
     info!(count = renderers.len(), "reregistering_known_renderers");
+    let recovered = rattacher_les_renderers_connus(state, renderers, recours, true).await;
+    info!(recovered, "known_renderers_reregister_complete");
+}
 
+/// #6961 — échéancier de la réévaluation des zones DLNA/OpenHome hors ligne :
+/// rapprochée juste après le démarrage (le réseau de la machine peut ne pas
+/// être prêt quand la resonde unique de démarrage part), puis lente.
+const REEVALUATION_HORS_LIGNE_PREMIERS_DELAIS_S: [u64; 4] = [15, 30, 60, 120];
+const REEVALUATION_HORS_LIGNE_PERIODE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// #6961 — un renderer allumé AVANT le serveur ne doit pas rester hors ligne.
+///
+/// Au démarrage, `reset_zones_offline` met toutes les zones hors ligne ; seule
+/// une découverte les remet en ligne. Or un renderer déjà allumé n'émet pas de
+/// `NOTIFY` tant qu'il ne change pas d'état, et ceux qui ne répondent pas au
+/// `M-SEARCH` multicast (#1126) n'avaient qu'une chance : la resonde UNIQUE de
+/// [`reregister_known_renderers`], lancée dans les premières secondes. Si elle
+/// échouait — réseau de la machine pas encore prêt, appareil occupé, réponse
+/// perdue —, plus rien ne réévaluait la zone : elle restait hors ligne
+/// jusqu'au redémarrage de l'appareil, seul geste qui lui fait émettre un
+/// `NOTIFY` (Silviu, NanoPlayer, rc7).
+///
+/// Cette tâche reprend, à intervalles, la même sonde pour les seules zones
+/// DLNA/OpenHome encore hors ligne dont l'appareil est au magasin des
+/// renderers connus. Une zone en ligne n'est jamais sondée.
+pub fn spawn_reevaluation_des_zones_hors_ligne(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut delais = REEVALUATION_HORS_LIGNE_PREMIERS_DELAIS_S
+            .into_iter()
+            .map(std::time::Duration::from_secs);
+        loop {
+            let delai = delais.next().unwrap_or(REEVALUATION_HORS_LIGNE_PERIODE);
+            tokio::time::sleep(delai).await;
+            reevaluer_les_zones_hors_ligne_avec(&state, RecoursUnicast::PRODUCTION).await;
+        }
+    });
+}
+
+/// Les renderers connus dont la zone DLNA/OpenHome est hors ligne (et non
+/// masquée). Fonction sans réseau : c'est elle qui décide qui est sondé.
+fn renderers_des_zones_hors_ligne(state: &AppState) -> Vec<KnownRenderer> {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let hors_ligne: std::collections::HashSet<String> = zone_repo
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|z| !z.online)
+        .filter(|z| matches!(z.output_type.as_deref(), Some("dlna") | Some("openhome")))
+        .filter_map(|z| z.output_device_id)
+        .filter(|id| !id.is_empty() && !zone_repo.is_device_hidden(id))
+        .collect();
+    if hors_ligne.is_empty() {
+        return Vec::new();
+    }
+    let a_nous = nos_adresses(state.config.advertised_ip.as_deref());
+    let port_api = state.config.port;
+    dedup_renderers_by_location(
+        load_known_renderers(&state.backend)
+            .into_iter()
+            .filter(|kr| hors_ligne.contains(&kr.device_id))
+            .filter(|kr| !est_notre_propre_renderer(&kr.location, port_api, port_api, &a_nous))
+            .collect(),
+    )
+}
+
+/// Un passage de la réévaluation. Rend le nombre de zones rattachées.
+async fn reevaluer_les_zones_hors_ligne_avec(state: &AppState, recours: RecoursUnicast) -> usize {
+    let renderers = renderers_des_zones_hors_ligne(state);
+    if renderers.is_empty() {
+        return 0;
+    }
+    let sondes = renderers.len();
+    let rattaches = rattacher_les_renderers_connus(state, renderers, recours, false).await;
+    if rattaches > 0 {
+        info!(
+            sondes,
+            rattaches, "zones_hors_ligne_reevaluees_renderer_retrouve"
+        );
+    } else {
+        debug!(
+            sondes,
+            "zones_hors_ligne_reevaluees_aucun_renderer_retrouve"
+        );
+    }
+    rattaches
+}
+
+/// Sonde les renderers connus donnés et rattache ceux qui répondent, par le
+/// MÊME chemin qu'une découverte vivante. Rend le nombre de rattachés.
+///
+/// Partagé par la resonde de démarrage et par la réévaluation des zones hors
+/// ligne (#6961) : `au_demarrage` ne règle que le niveau de la ligne d'échec,
+/// pour qu'un appareil éteint ne remplisse pas le journal toutes les cinq
+/// minutes.
+async fn rattacher_les_renderers_connus(
+    state: &AppState,
+    renderers: Vec<KnownRenderer>,
+    recours: RecoursUnicast,
+    au_demarrage: bool,
+) -> usize {
     // LE récepteur du processus, pas un second.
     //
     // Ce chemin s'en passait : celui du gestionnaire SSDP n'était pas
@@ -1511,16 +1656,23 @@ async fn reregister_known_renderers_avec(state: &AppState, recours: RecoursUnica
                     }
                 }
             }
-            None => {
+            None if au_demarrage => {
                 warn!(
                     id = %kr.device_id,
                     location = %kr.location,
                     "known_renderer_probe_failed"
                 );
             }
+            None => {
+                debug!(
+                    id = %kr.device_id,
+                    location = %kr.location,
+                    "zone_hors_ligne_renderer_toujours_injoignable"
+                );
+            }
         }
     }
-    info!(recovered, "known_renderers_reregister_complete");
+    recovered
 }
 
 /// Spawn the mDNS handler that registers Chromecast/AirPlay/BluOS/OAAT/Squeezebox outputs.
@@ -1650,6 +1802,9 @@ pub fn spawn_mdns_handler(
                                     dev.id.clone(),
                                     ap_dev_id,
                                 );
+                                tune_core::outputs::airplay2::composant_manquant_7084::retablir(
+                                    &dev.id,
+                                );
                                 info!(name = %dev.name, "airplay2_output_registered");
                                 (Some(Box::new(ap2)), "airplay2")
                             } else {
@@ -1665,12 +1820,46 @@ pub fn spawn_mdns_handler(
                                     // v2 zone if daemon absent").
                                     airplay_v2_fallback = true;
                                 }
+                                // Un appareil AirPlay 2, ou dont le mDNS (bits
+                                // `features`/`sf`) exige l'appairage, servi par le
+                                // chemin AirPlay 1 qui n'en fait aucun : son 403
+                                // dira l'appairage manquant, pas « un autre
+                                // émetteur » (Xiaomi Sound 2 Max sous Windows).
+                                let appairage_requis = is_v2
+                                    || dev
+                                        .capabilities
+                                        .get("airplay_requires_pairing")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                // #7084 — servie ici FAUTE de composant AirPlay 2
+                                // (antivirus) : la zone et la lecture le disent.
+                                let composant_manquant =
+                                    is_v2 && !tune_core::outputs::airplay2::daemon_available();
+                                if composant_manquant {
+                                    tune_core::outputs::airplay2::composant_manquant_7084::signaler(
+                                        &dev.id,
+                                    );
+                                } else {
+                                    tune_core::outputs::airplay2::composant_manquant_7084::retablir(
+                                        &dev.id,
+                                    );
+                                }
+                                if appairage_requis {
+                                    warn!(
+                                        name = %dev.name,
+                                        airplay_version = dev.airplay_version.as_deref().unwrap_or("?"),
+                                        daemon = tune_core::outputs::airplay2::daemon_available(),
+                                        "airplay_appairage_requis_servi_en_airplay1"
+                                    );
+                                }
                                 let ap = tune_core::outputs::airplay::AirplayOutput::new(
                                     dev.name.clone(),
                                     dev.id.clone(),
                                     dev.host.clone(),
                                     dev.port,
-                                );
+                                )
+                                .avec_appairage_airplay2_requis(appairage_requis)
+                                .avec_composant_airplay2_manquant(composant_manquant);
                                 (Some(Box::new(ap)), "airplay")
                             }
                         }

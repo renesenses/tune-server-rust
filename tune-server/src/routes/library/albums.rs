@@ -352,12 +352,14 @@ fn corps_de_la_page(
             tracing::warn!(error = %e, "hires_par_album a échoué — page servie sans verdict");
             std::collections::HashMap::new()
         });
+    let canaux_par_id = canaux_max_par_album(repo, &ids);
     let items: Vec<Value> = items
         .iter()
         .map(|a| {
             let mut j = a.to_json();
             if let Some(obj) = j.as_object_mut() {
                 obj.remove("bio");
+                inserer_max_channels(obj, a, &canaux_par_id);
                 let dr =
                     a.id.and_then(|id| dr_par_id.get(&id))
                         .map(|v| Value::String(v.to_string()))
@@ -381,6 +383,32 @@ fn corps_de_la_page(
         corps["seed"] = json!(graine);
     }
     corps
+}
+
+/// #7725 — le nombre de canaux le plus grand parmi les pistes de chaque album
+/// de `ids`, pour le filtre Multicanal du client (`max_channels` > 2). Un
+/// échec ne vide pas la liste : elle part sans `max_channels`, et le journal
+/// le dit.
+pub(super) fn canaux_max_par_album(
+    repo: &AlbumRepo,
+    ids: &[i64],
+) -> std::collections::HashMap<i64, i64> {
+    repo.canaux_max_par_album(ids).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "canaux_max_par_album a échoué — liste servie sans canaux");
+        std::collections::HashMap::new()
+    })
+}
+
+/// Pose `max_channels` sur l'album, quand ses pistes le disent ; clé absente
+/// sinon. Champ additif : un client qui l'ignore lit la réponse d'avant.
+pub(super) fn inserer_max_channels(
+    obj: &mut serde_json::Map<String, Value>,
+    album: &Album,
+    canaux_par_id: &std::collections::HashMap<i64, i64>,
+) {
+    if let Some(n) = album.id.and_then(|id| canaux_par_id.get(&id)) {
+        obj.insert("max_channels".into(), json!(n));
+    }
 }
 
 pub(super) async fn album_count(State(state): State<AppState>) -> Json<Value> {

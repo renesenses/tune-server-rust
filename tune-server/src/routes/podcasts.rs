@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 use tune_core::playback::NowPlaying;
 use tune_core::streaming::podcast_annuaires::RelaisPodcastIndex;
+use tune_core::streaming::podcast_par_adresse::{self, EchecAjoutParAdresse};
 use tune_core::streaming::podcasts::{EchecResolution, PodcastService};
 use tune_core::streaming::radiofrance::{RadioFranceApi, RfStation};
 use tune_core::streaming::vignette_podcast;
@@ -197,7 +198,10 @@ fn default_episode_limit() -> usize {
 struct Subscribe {
     #[serde(default)]
     feed_url: String,
-    title: String,
+    /// #7819 — facultatif : sans titre, le flux est lu et c'est lui qui
+    /// donne le titre, l'auteur, l'image et la description.
+    #[serde(default)]
+    title: Option<String>,
     author: Option<String>,
     image_url: Option<String>,
     description: Option<String>,
@@ -220,6 +224,49 @@ fn echec_de_resolution(e: &EchecResolution) -> AppError {
         code: Some(e.code().to_string()),
     }
 }
+/// L'échec d'un ajout par adresse (#7819) : un code stable et une phrase
+/// dans la langue de l'interface.
+fn echec_d_ajout_par_adresse(lang: &str, e: &EchecAjoutParAdresse) -> AppError {
+    let status = match e {
+        EchecAjoutParAdresse::AdresseInvalide => StatusCode::BAD_REQUEST,
+        EchecAjoutParAdresse::Injoignable(_) => StatusCode::BAD_GATEWAY,
+        EchecAjoutParAdresse::PasUnFlux => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    AppError {
+        status,
+        message: crate::i18n::t(lang, &format!("podcasts.ajoutParAdresse.{}", e.code())),
+        code: Some(e.code().to_string()),
+    }
+}
+
+/// L'abonnement déjà enregistré pour `feed_url`, tel que la route le rend
+/// (#7819).
+fn abonnement_existant(state: &AppState, feed_url: &str) -> Option<Value> {
+    use tune_core::db::backend::ToSqlValue;
+    let r = state
+        .backend
+        .query_one(
+            "SELECT id, title, author, image_url, description FROM podcast_subscriptions WHERE feed_url = ?",
+            &[&feed_url as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()?;
+    let image_url = r.get(3).and_then(|v| v.as_string());
+    let cover_url = image_url
+        .as_deref()
+        .and_then(|u| vignette_podcast::en_cache(&crate::routes::library::artwork_cache_dir(), u));
+    Some(json!({
+        "id": r.first().and_then(|v| v.as_i64()),
+        "created": false,
+        "title": r.get(1).and_then(|v| v.as_string()),
+        "author": r.get(2).and_then(|v| v.as_string()),
+        "image_url": image_url,
+        "description": r.get(4).and_then(|v| v.as_string()),
+        "feed_url": feed_url,
+        "cover_url": cover_url,
+    }))
+}
+
 #[derive(Deserialize)]
 pub(super) struct PlayEpisodeRequest {
     pub(super) audio_url: String,
@@ -318,11 +365,13 @@ async fn list_subscriptions(State(state): State<AppState>) -> Result<Json<Value>
 }
 async fn subscribe(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<Subscribe>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
 
-    let feed_url = if body.feed_url.is_empty() {
+    let lang = crate::i18n::lang_from_header(&headers);
+    let feed_url = if body.feed_url.trim().is_empty() {
         // Top chart podcasts have no feed URL — resolve via iTunes lookup.
         let apple_id = body
             .source_id
@@ -345,8 +394,37 @@ async fn subscribe(
             Err(e) => return echec_de_resolution(&e).into_response(),
         }
     } else {
-        body.feed_url.clone()
+        // #7819 — `feed://`, espaces, schéma ou hôte en majuscules : une même
+        // adresse ne s'enregistre que sous une seule forme.
+        match podcast_par_adresse::normaliser_adresse_de_flux(&body.feed_url) {
+            Ok(url) => url,
+            Err(e) => return echec_d_ajout_par_adresse(&lang, &e).into_response(),
+        }
     };
+
+    let mut title = body.title.clone().filter(|t| !t.trim().is_empty());
+    let mut author = body.author.clone();
+    let mut image_url = body.image_url.clone();
+    let mut description = body.description.clone();
+    if title.is_none() {
+        // #7819 — ajout par adresse : un flux déjà suivi n'est ni relu ni
+        // abonné une seconde fois.
+        if let Some(existant) = abonnement_existant(&state, &feed_url) {
+            return (StatusCode::OK, Json(existant)).into_response();
+        }
+        let entete = match podcast_par_adresse::lire_le_flux(&state.http_client, &feed_url).await {
+            Ok(entete) => entete,
+            Err(e) => {
+                warn!(feed_url = %feed_url, code = e.code(), error = ?e, "podcast_ajout_par_adresse_refuse");
+                return echec_d_ajout_par_adresse(&lang, &e).into_response();
+            }
+        };
+        title = Some(entete.titre.unwrap_or_else(|| feed_url.clone()));
+        author = author.or(entete.auteur);
+        image_url = image_url.or(entete.image_url);
+        description = description.or(entete.description);
+    }
+    let title = title.unwrap_or_default();
 
     let sql = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
         "INSERT INTO podcast_subscriptions (feed_url, title, author, image_url, description, source_id) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (feed_url) DO NOTHING"
@@ -357,10 +435,10 @@ async fn subscribe(
         sql,
         &[
             &feed_url as &dyn ToSqlValue,
-            &body.title as &dyn ToSqlValue,
-            &body.author as &dyn ToSqlValue,
-            &body.image_url as &dyn ToSqlValue,
-            &body.description as &dyn ToSqlValue,
+            &title as &dyn ToSqlValue,
+            &author as &dyn ToSqlValue,
+            &image_url as &dyn ToSqlValue,
+            &description as &dyn ToSqlValue,
             &body.source_id as &dyn ToSqlValue,
         ],
     ) {
@@ -387,7 +465,7 @@ async fn subscribe(
                 .flatten()
                 .and_then(|r| r.first().and_then(|v| v.as_i64()));
             info!(
-                title = %body.title,
+                title = %title,
                 feed_url = %feed_url,
                 creation,
                 id,
@@ -397,7 +475,7 @@ async fn subscribe(
             // temps : un hébergeur lent ne retient pas l'abonnement. Un échec
             // ne fait pas échouer l'abonnement ; le rattrapage du démarrage et
             // le prochain rafraîchissement du flux réessaient.
-            let cover_url = match body.image_url.as_deref().filter(|u| !u.trim().is_empty()) {
+            let cover_url = match image_url.as_deref().filter(|u| !u.trim().is_empty()) {
                 Some(image) => tokio::time::timeout(
                     DELAI_VIGNETTE_ABONNEMENT,
                     mettre_vignette_en_cache(&state, image),
@@ -421,7 +499,10 @@ async fn subscribe(
                 Json(json!({
                     "id": id,
                     "created": creation,
-                    "title": body.title,
+                    "title": title,
+                    "author": author,
+                    "image_url": image_url,
+                    "description": description,
                     "feed_url": feed_url,
                     "cover_url": cover_url,
                 })),
@@ -709,11 +790,14 @@ pub(super) async fn play_episode(
 ) -> impl IntoResponse {
     let title = body.title.as_deref().unwrap_or("Podcast Episode");
     let podcast_name = body.podcast_name.as_deref().unwrap_or("Podcast");
-    let device_id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
-        .flatten()
-        .and_then(|z| z.output_device_id);
+        .flatten();
+    let navigateur = zone
+        .as_ref()
+        .is_some_and(|z| z.output_type.as_deref() == Some("browser"));
+    let device_id = zone.and_then(|z| z.output_device_id);
     let mime_type = guess_audio_mime(&body.audio_url);
     // #5214 — la pochette « en cours », que Lecture en cours et l'Historique
     // du client reprennent : la vignette en cache quand elle existe. La sortie
@@ -789,6 +873,61 @@ pub(super) async fn play_episode(
             np.cover_path.clone(),
         )
         .await;
+    if navigateur {
+        // Le chemin commun fournit une session Tune et attend la parole du
+        // lecteur avant l'historique et la reprise. playback.play seul ne
+        // créait ni flux confirmable, ni annonce de démarrage navigateur.
+        let demande = tune_core::orchestrator::PlayRequest {
+            zone_id,
+            source: Some("podcast".into()),
+            source_id: Some(body.audio_url.clone()),
+            title: Some(title.into()),
+            artist_name: Some(podcast_name.into()),
+            album_title: Some(podcast_name.into()),
+            cover_url: np.cover_path.clone(),
+            duration_ms: Some(body.duration_ms.unwrap_or(0) as i64),
+            ..Default::default()
+        };
+        let resultat = if body.seek_ms.is_some() {
+            state.orchestrator.play_context_resume(demande).await
+        } else {
+            state.orchestrator.play(demande).await
+        };
+        let resultat = match resultat {
+            Ok(r) if r.sortie_refusee().is_none() => r,
+            Ok(r) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":r.error,"code":"podcast_sortie_refuse"})),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":e,"code":"podcast_preparation_refusee"})),
+                );
+            }
+        };
+        if resultat.stream_url.is_some() {
+            if let Some(ms) = body.seek_ms {
+                // L'élément du navigateur applique cet offset au média complet.
+                state
+                    .playback
+                    .seek(zone_id, ms.min(i64::MAX as u64) as i64)
+                    .await;
+            }
+        }
+        let zone_state = state.playback.get_state(zone_id).await;
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "zone_id":zone_id,"title":title,"podcast":podcast_name,
+                "audio_url":resultat.stream_url.clone().unwrap_or(body.audio_url.clone()),
+                "stream_url":resultat.stream_url,"mime_type":mime_type,
+                "output_sent":false,"error":null,"code":null,"state":zone_state
+            })),
+        );
+    }
     state.playback.play(zone_id, np).await;
     // #6468 — un échec n'est plus un `200` : la réponse porte un vrai code
     // HTTP et un `code` stable, que le client peut afficher.
@@ -846,8 +985,7 @@ pub(super) async fn play_episode(
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(json!({"error": e.to_string(), "code": "podcast_resume_seek_failed"})),
-                )
-                    .into_response();
+                );
             }
         }
         if output_sent {
@@ -871,9 +1009,10 @@ pub(super) async fn play_episode(
     let output_error = echec.map(|(_, _, e)| e);
     (
         statut,
-        Json(json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "code": code, "state": zone_state})),
+        Json(
+            json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "code": code, "state": zone_state}),
+        ),
     )
-        .into_response()
 }
 // ─── Vignette mise en cache (#5214) ─────────────────────────────────
 
@@ -1257,3 +1396,7 @@ mod tests {
         assert_eq!(PodcastService::CURATED_COUNTRY, "fr");
     }
 }
+
+#[cfg(test)]
+#[path = "podcasts/reprise_navigateur_7354_tests.rs"]
+mod reprise_navigateur_7354_tests;

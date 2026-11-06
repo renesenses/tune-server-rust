@@ -48,8 +48,8 @@ pub const PERIODE_MAX_S: u64 = 10;
 /// lecture lente ne chevauche jamais la suivante.
 const DELAI_LECTURE: Duration = Duration::from_secs(4);
 
-/// Après un relais muet (panne, ou relais inactif faute de clé d'API), on ne
-/// le réinterroge pas avant ce délai. Sans cette pause, chaque station suivie
+/// Après un relais muet (plusieurs échecs de suite, ou relais inactif faute de
+/// clé d'API), on ne le réinterroge pas avant ce délai. Sans cette pause, chaque station suivie
 /// paierait un aller-retour perdu toutes les 5 s avant d'atteindre son repli.
 const PAUSE_APRES_PANNE: Duration = Duration::from_secs(600);
 
@@ -304,18 +304,44 @@ pub fn relais_en_pause(base: &str) -> bool {
         .is_some_and(|t| Instant::now() < t)
 }
 
-fn noter_panne(base: &str, panne: bool) {
-    if let Ok(mut g) = PANNES.lock() {
-        if panne {
-            g.insert(base.to_string(), Instant::now() + PAUSE_APRES_PANNE);
-        } else {
-            g.remove(base);
-        }
+/// Échecs consécutifs par racine de relais, depuis la dernière lecture réussie.
+static ECHECS: LazyLock<Mutex<HashMap<String, u32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Nombre d'échecs de suite (délai dépassé, connexion, statut non 2xx, corps
+/// illisible) avant de mettre le relais en pause. Un échec isolé ne coupe plus
+/// l'enrichissement pour dix minutes (#7010) : la lecture suivante est tentée.
+const ECHECS_AVANT_PAUSE: u32 = 3;
+
+/// Note le résultat d'une lecture. `panne` : la lecture a échoué ; `immediat` :
+/// le relais a dit lui-même qu'il est inactif (`active: false`, faute de clé
+/// d'API), la pause est alors posée tout de suite. Une lecture réussie remet
+/// le compte à zéro. Rend `true` quand la pause vient d'être posée.
+fn noter_panne(base: &str, panne: bool, immediat: bool) -> bool {
+    let Ok(mut pannes) = PANNES.lock() else {
+        return false;
+    };
+    let Ok(mut echecs) = ECHECS.lock() else {
+        return false;
+    };
+    if !panne {
+        echecs.remove(base);
+        pannes.remove(base);
+        return false;
+    }
+    let n = echecs.entry(base.to_string()).or_insert(0);
+    *n += 1;
+    if immediat || *n >= ECHECS_AVANT_PAUSE {
+        echecs.remove(base);
+        pannes.insert(base.to_string(), Instant::now() + PAUSE_APRES_PANNE);
+        true
+    } else {
+        false
     }
 }
 
 /// Le titre d'une station suivie, si le relais le donne ; `None` sinon, et la
-/// pause est posée quand le relais lui-même est en défaut.
+/// pause est posée quand le relais lui-même est en défaut (relais inactif, ou
+/// `ECHECS_AVANT_PAUSE` échecs de suite).
 ///
 /// Une station suivie absente de la réponse n'est pas une panne : le relais a
 /// répondu, il ne sait rien d'elle à cet instant.
@@ -329,25 +355,47 @@ pub async fn titre_par_le_relais(base: &str, cle: &str) -> Option<IcyMetadata> {
         .timeout(DELAI_LECTURE)
         .send()
         .await;
-    let Ok(reponse) = reponse else {
-        noter_panne(base, true);
-        info!(cle, "radio_metadata_relais_injoignable_pause");
-        return None;
+    let reponse = match reponse {
+        Ok(r) => r,
+        Err(e) => {
+            let en_pause = noter_panne(base, true, false);
+            info!(
+                cle,
+                erreur = %e,
+                delai_depasse = e.is_timeout(),
+                connexion = e.is_connect(),
+                en_pause,
+                "radio_metadata_relais_lecture_echouee"
+            );
+            if en_pause {
+                info!(cle, "radio_metadata_relais_injoignable_pause");
+            }
+            return None;
+        }
     };
-    if !reponse.status().is_success() {
-        noter_panne(base, true);
-        info!(status = %reponse.status(), cle, "radio_metadata_relais_inactif_pause");
+    let statut = reponse.status();
+    let corps = reponse.json::<Value>().await.ok();
+    let inactif = corps
+        .as_ref()
+        .and_then(|c| c.get("active"))
+        .and_then(Value::as_bool)
+        == Some(false);
+    if inactif {
+        noter_panne(base, true, true);
+        info!(status = %statut, cle, "radio_metadata_relais_inactif_pause");
         return None;
     }
-    let Ok(corps) = reponse.json::<Value>().await else {
-        noter_panne(base, true);
+    let Some(corps) = corps.filter(|_| statut.is_success()) else {
+        let en_pause = noter_panne(base, true, false);
+        info!(
+            status = %statut,
+            cle,
+            en_pause,
+            "radio_metadata_relais_lecture_echouee"
+        );
         return None;
     };
-    if corps.get("active").and_then(Value::as_bool) == Some(false) {
-        noter_panne(base, true);
-        return None;
-    }
-    noter_panne(base, false);
+    noter_panne(base, false, false);
     lire_l_entree(&corps, cle)
 }
 

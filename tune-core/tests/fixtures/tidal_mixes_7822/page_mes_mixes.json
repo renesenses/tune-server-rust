@@ -1,0 +1,55 @@
+{
+  "id": "eyJwIjoiMWI0YjI1NWUtNjdkNC00ZjViLWI2MjktOTk5OWFiY2RlZjAxIn0",
+  "title": "My Mixes",
+  "rows": [
+    {
+      "modules": [
+        {
+          "id": "eyJwIjoiYWJjIiwibSI6IjEifQ",
+          "type": "MIX_LIST",
+          "width": 100,
+          "title": "",
+          "description": "",
+          "pagedList": {
+            "limit": 50,
+            "offset": 0,
+            "totalNumberOfItems": 3,
+            "items": [
+              {
+                "id": "0011aa22bb33cc44dd55ee66ff7788",
+                "title": "My Daily Discovery",
+                "subTitle": "GoGo Penguin, Nils Frahm, Hania Rani",
+                "mixType": "DISCOVERY_MIX",
+                "images": {
+                  "SMALL": {"width": 320, "height": 320, "url": "https://images.tidal.invalid/discovery/320.jpg"},
+                  "MEDIUM": {"width": 640, "height": 640, "url": "https://images.tidal.invalid/discovery/640.jpg"},
+                  "LARGE": {"width": 1500, "height": 1500, "url": "https://images.tidal.invalid/discovery/1500.jpg"}
+                },
+                "master": false
+              },
+              {
+                "id": "0022bb33cc44dd55ee66ff77889900",
+                "title": "My Mix 1",
+                "subTitle": "John Coltrane, Bill Evans, Miles Davis",
+                "mixType": "DAILY_MIX",
+                "images": {
+                  "SMALL": {"width": 320, "height": 320, "url": "https://images.tidal.invalid/mix1/320.jpg"},
+                  "MEDIUM": {"width": 640, "height": 640, "url": "https://images.tidal.invalid/mix1/640.jpg"}
+                },
+                "master": false
+              },
+              {
+                "id": "0033cc44dd55ee66ff778899aabb11",
+                "title": "My New Arrivals",
+                "subTitle": "",
+                "mixType": "NEW_RELEASE_MIX",
+                "images": {},
+                "master": false
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

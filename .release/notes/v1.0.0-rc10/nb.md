@@ -1,0 +1,33 @@
+Tune 1.0.0-rc10, den tiende utgivelseskandidaten av Tune 1.0.
+
+- **Min fysiske samling**: et nytt tillegg sammenligner Discogs-samlingen din med biblioteket ditt og strømmetjenestene, i et rutenett av omslag som mellomlagres på serveren. En egen oppføring vises i sidefeltet, rett etter Tune Circle.
+- **Mitt tema**: velg alle fargene i grensesnittet, per profil. Et tillegg kan også levere et tema, og du kan sende ditt til en kontakt i Tune Circle, som tar det i bruk med ett klikk.
+- **Crosstalk**: tillegget som demper overhøring mellom høyttalere kommer inn i utvidelseskatalogen, med sin innstillingsskjerm; i samme sone slår det av crossfeed og viser det.
+- **Mapper**: spill av eller legg i køen en mappe med alle undermappene, i rekkefølge; bibliotekets katalogfilter går ned i undermappene og tilbyr å gå tilbake til hele biblioteket.
+- **Radio**: en linje «Flere filtre» i Mine radiokanaler og i Katalogen lar deg søke etter kriterier; fire nye sjangre kommer i katalogen.
+- **Radio under avspilling**: strømmene til en kanal er sortert etter kvalitet; Spilles nå viser kanalens logo og en knapp «Mine radiokanaler»; lytteland stilles inn under Innstillinger › Generelt.
+- **Plateselskaper**: logoene til plateselskapene vises, delt av mozaiklabs.fr; serverstatus følger framdriften for albumomslag og plateselskapslogoer.
+- **Volum**: glidebryteren er gradert i dB, komfort- og sikkerhetsgrensene vises i farge, og en komfortgrense over sikkerhetsgrensen avvises.
+- **Oxygen og metadata**: endre et felt i et helt filtrert resultat; utelat mapper fra automatisk berikelse av metadata.
+- **Tune Circle**: zoom inn på et område av jordkloden i Verden-visningen; Tune Circle-spillelister har egen merkelapp i spillelistefiltrene; en tjenestes spilleliste kan deles fra siden sin.
+- **Skrivebordswidget**: minivinduet bruker minivisningen i nettgrensesnittet og får søk etter artister, Qobuz og TIDAL, med miniatyrbilder og tastaturnavigering.
+- **AES67-utgang**: en eksperimentell utgang til AES67-kompatible Dante- og Ravenna-lydnettverk, avslått som standard, ligger under Innstillinger › Eksperimentelt.
+- **Denne nettleseren**: neste spor klargjøres før slutten for jevnere overganger, og serverens sone «Denne nettleseren» spiller uten forhåndsoppsett.
+- **Fortsett å lytte**: kortet viser navnet på albumet, spillelisten eller episoden som gjenopptas, og en fullført lytting forsvinner fra listen.
+- **Historikk og populære spor**: sporene i et åpnet album eller en åpnet spilleliste går fra nyeste til eldste; en artists populære spor får med dem du lytter mest til, fra alle kilder.
+- **Bibliotek**: filtrene etter DR og originalår er mye raskere i store bibliotek; kolonnene i sporlisten kan endres i bredde, og hver skjerm husker bredden; den akustiske analysen forklarer tempoet sitt og viser framdriften.
+- **Equalizer**: fri inntasting av frekvens og Q, som bekreftes når inntastingen er ferdig; sletting av importerte forhåndsinnstillinger krever bekreftelse; romkorreksjon og DAC-kalibrering bruker hele equalizerprofilen.
+- **Spillelister**: import av .m3u, .m3u8 og .dpl ligger i Spillelistebehandleren og oppgir det reelle antallet spor; Importer, Overfør og Sammenlign forteller hvorfor de mislykkes.
+- **Omslag**: innebygde omslag leses fra alle tagger, forsiden først; nettsøket følger etter ny lesing av filen; det rektangulære bildet til en Qobuz-spilleliste vises i sin helhet.
+- **Meldinger**: de siste feilmeldingene som fortsatt var på fransk er oversatt til grensesnittets språk; en AirPlay 2-høyttaler som avviser tilkoblingen, melder at paring mangler; en applikasjons-ID som Qobuz avviser, vises ikke lenger som feil passord.
+- **Lisens**: skjermen viser at Premium kommer fra Mozaiklabs-kontoen din, uten å be om en nøkkel.
+- **Startside**: «Andre versjoner» henger ikke lenger mens den venter på strømmetjenestene.
+- **ASIO**: når DSD-støtten ikke kan kontrolleres, sier Tune fra og forklarer hva utgangen kan.
+- **Rettet, avspilling**: bytte mellom PURE og equalizer starter ikke lenger en stoppet sone på nytt; å fjerne avkrysningen for «Gjenta som standard» slår virkelig av gjentakelsen for sonen; overganger mellom kompatible spor forblir sammenhengende.
+- **Rettet, OpenHome**: pause og stopp fjerner det klargjorte neste sporet fra spilleren, og sluttposisjonen beholdes under overgangen til neste spor.
+- **Rettet, radio**: med ukjent lytteland erstattes ikke lenger den valgte strømmen av en strøm på 96 kbit/s; en kanal lagt til fra konsollen beholder koblingen til siden sin; en enkeltstående feil setter ikke lenger radiometadata på pause; «Nylig spilt» viser riktig dato; Qobuz-spillelisten som lages fra radiofavorittene, vises med en gang.
+- **Rettet, bibliotek og profiler**: filtrene for favoritter og vurderinger følger den aktive profilen; «Mest spilt» teller ikke lenger én lytting flere ganger; berikelsen erstatter ikke lenger en eksisterende sjanger; UPnP-spor beholder år og sjangre; en MusicBrainz-ID som allerede er i bruk, tildeles ikke en gang til.
+- **Rettet, samlinger og spillelister**: en avvist lagring meldes, en feilaktig mappe tømmer ikke lenger listen, og alle sidene med spillelister leses.
+- **Rettet, tillegg og konto**: å avinstallere et aktivt innebygd tillegg deaktiverer det varig; den første koblingen til en Mozaiklabs-konto knyttes til den eneste profilen også uten e-postadresse.
+- **Rettet, diverse**: spillelisteimporten under skanning forteller hvorfor den ikke importerer; en feil ved lesing av innstillingene meldes i stedet for å falle tilbake til standardverdier; dvalemodus på datamaskinen meldes ikke lenger som en frysing; det gamle grensesnittet overlever ikke lenger en serveroppdatering; VU-meterlinjen flyter ikke lenger over mellom 1280 og 1800 px; WASAPI-modus forblir synlig med Windows-standardinnstillingen; lyd komprimeres ikke lenger når den sendes.
+- **Sikkerhet**: herdingsrettelser.

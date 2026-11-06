@@ -70,6 +70,14 @@ pub(super) const SUPPORT_SETTING_KEYS: &[ReglageExpose] = &[
     //
     // Non sensible : un booléen de consentement, comme les huit au-dessus.
     ("lyrics_lrclib_enabled", || json!(false)),
+    // #7307 — « mon choix d'écrire dans les fichiers est revenu au défaut ».
+    // La fiche portait le consentement des paroles, pas celui-ci : un rapport
+    // ne pouvait donc pas dire si la valeur était encore en base (affichage
+    // trompeur) ou réellement effacée. Non sensible : un booléen de
+    // consentement, même défaut que `GET /system/config`.
+    (tune_core::metadata::ecriture_fichiers::CLE, || {
+        json!(tune_core::metadata::ecriture_fichiers::DEFAUT)
+    }),
 ];
 
 /// Projette les settings bruts sur l'allowlist support. Les valeurs stockées
@@ -333,6 +341,24 @@ mod tests {
         // Et la valeur persistee est rendue telle quelle, re-typee.
         let out = support_settings(|k| (k == "lyrics_lrclib_enabled").then(|| "true".to_string()));
         assert_eq!(out["lyrics_lrclib_enabled"], json!(true));
+    }
+
+    /// #7307 — le choix « écrire les métadonnées dans les fichiers » revient
+    /// au défaut chez un testeur, et la fiche ne portait pas ce réglage : son
+    /// rapport ne pouvait pas trancher entre « effacé en base » et « bien là,
+    /// mais affiché décoché ».
+    #[test]
+    fn la_fiche_publie_le_consentement_d_ecriture_dans_les_fichiers() {
+        let cle = tune_core::metadata::ecriture_fichiers::CLE;
+        let out = support_settings(|_| None);
+        assert_eq!(
+            out.get(cle),
+            Some(&json!(false)),
+            "la fiche support doit publier {cle:?} (absent = désactivé), sans quoi \
+             un rapport « choix revenu au défaut » reste indécidable (#7307)"
+        );
+        let out = support_settings(|k| (k == cle).then(|| "true".to_string()));
+        assert_eq!(out.get(cle), Some(&json!(true)));
     }
 
     #[test]
