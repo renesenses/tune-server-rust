@@ -5,11 +5,17 @@
 //! speexrate et samplerate. Les inventaires s'y suivent toutes les minutes
 //! (08:43:07, 08:44:07).
 //!
-//! Ce témoin rejoue la séquence : un inventaire ALSA dans l'ordre du journal,
-//! une passe par minute pendant une heure, à travers la porte unique par
-//! laquelle `outputs::local::parc` obtient les capacités. Il compte les PCM
-//! réellement OUVERTS : aucun greffon logiciel ne doit l'être, quelle que soit
-//! la cadence, et les sorties matérielles le restent.
+//! Ce témoin rejoue la séquence de PCM du relevé du 05/11 : un inventaire
+//! ALSA dans l'ordre du journal (`speexrate` puis `jack`, avec `pipewire` et
+//! `pulse` dans le même passage), à travers la porte unique par laquelle
+//! `outputs::local::parc` obtient les capacités. Il compte les PCM réellement
+//! OUVERTS : aucun greffon logiciel ne doit l'être, et les sorties
+//! matérielles le restent.
+//!
+//! Il ne dit rien de la cadence des inventaires : la garde qui empêche la
+//! fiche de diagnostic de refaire l'inventaire chaque minute est le témoin
+//! serveur `la_fiche_de_diagnostic_ne_rebalaye_pas_un_parc_recent_7263`
+//! (https://github.com/renesenses/tune-server-rust/pull/7471).
 
 use super::capacites_a_l_inventaire;
 
@@ -49,22 +55,19 @@ fn pcm_ouverts_par_une_passe() -> Vec<&'static str> {
 }
 
 #[test]
-fn l_inventaire_de_chaque_minute_n_ouvre_ni_jack_ni_les_convertisseurs_7625() {
-    // Une heure à la cadence du relevé : 60 inventaires complets.
-    for minute in 0..60 {
-        let ouverts = pcm_ouverts_par_une_passe();
-        for greffon in INVENTAIRE_DU_RELEVE
-            .iter()
-            .filter(|(_, sonder)| !sonder)
-            .map(|(endpoint_id, _)| *endpoint_id)
-        {
-            assert!(
-                !ouverts.contains(&greffon),
-                "minute {minute} : l'inventaire a ouvert {greffon} ; l'ouvrir charge une \
-                 bibliothèque native dans le processus (greffon jack, libjack, speexrate, \
-                 samplerate), c'est le segfault de #7625 / #7263"
-            );
-        }
+fn l_inventaire_du_releve_n_ouvre_ni_jack_ni_les_convertisseurs_7625() {
+    let ouverts = pcm_ouverts_par_une_passe();
+    for greffon in INVENTAIRE_DU_RELEVE
+        .iter()
+        .filter(|(_, sonder)| !sonder)
+        .map(|(endpoint_id, _)| *endpoint_id)
+    {
+        assert!(
+            !ouverts.contains(&greffon),
+            "l'inventaire a ouvert {greffon} ; l'ouvrir charge une bibliothèque native \
+             dans le processus (greffon jack, libjack, speexrate, samplerate), c'est le \
+             segfault de #7625 / #7263"
+        );
     }
 }
 
