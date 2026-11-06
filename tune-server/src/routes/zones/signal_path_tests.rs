@@ -553,8 +553,10 @@ fn local_runtime_zone(
 /// toutes les autres plateformes. Elle vaut aussi ici.
 #[test]
 fn software_volume_alone_does_not_announce_a_transcode() {
+    // #7762 — `zone.volume` est le gain ; l'étape montre la position du
+    // curseur `db60` de la sortie locale : 85 % du curseur.
     let (zone, ps, backend) = local_runtime_zone(
-        85.0,
+        tune_core::audio::volume_scale::gain_perceptif(0.85) * 100.0,
         OutputVolumeState::Applied,
         vec![OutputSignalReason::SoftwareVolume],
     );
@@ -583,6 +585,61 @@ fn software_volume_alone_does_not_announce_a_transcode() {
         Some("Volume logiciel appliqué")
     );
     assert!(!sp["summary"].as_str().unwrap().contains("transcode"));
+}
+
+/// #7762 — rc10, Windows, WASAPI exclusif (fil 2623) : « le volume est
+/// imposé à 3 % alors qu'il est réglé à 50 % dans les zones ». Le 3 % se lit
+/// sur le chemin bit-perfect. Sur une sortie locale, le curseur suit la loi
+/// `db60` (#6787) : 50 % du curseur = −30 dB = un gain de 0,0316, et c'est ce
+/// gain que porte `zone.volume`. L'étape Volume le montrait en pourcentage
+/// linéaire (« 3 % ») au lieu de la position que la page affiche (« 50 % »).
+///
+/// Avant le correctif : « Volume logiciel 3% » et « Volume 3% ». Après :
+/// « 50% » sur les deux branches (sonde Windows, et sans sonde).
+#[test]
+fn sur_une_sortie_locale_l_etape_volume_montre_le_curseur_db60_pas_le_gain_7762() {
+    let gain_du_curseur_a_50 = tune_core::audio::volume_scale::gain_perceptif(0.5);
+    assert!(
+        (gain_du_curseur_a_50 - 0.031_622_776).abs() < 1e-6,
+        "50 % du curseur db60 = −30 dB : {gain_du_curseur_a_50}"
+    );
+
+    // Sonde Windows (WASAPI exclusif) : le volume logiciel est appliqué.
+    let (zone, ps, backend) = local_runtime_zone(
+        gain_du_curseur_a_50 * 100.0,
+        OutputVolumeState::Applied,
+        vec![OutputSignalReason::SoftwareVolume],
+    );
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+    assert_eq!(
+        step_desc(&sp, "Volume").as_deref(),
+        Some("Volume logiciel 50%"),
+        "{sp}"
+    );
+
+    // Sans sonde (la même zone, autre plateforme) : même lecture.
+    let mut ps = ps;
+    ps.output_signal_path = None;
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+    assert_eq!(
+        step_desc(&sp, "Volume").as_deref(),
+        Some("Volume 50%"),
+        "{sp}"
+    );
+}
+
+/// #7762 — témoin : une sortie RÉSEAU garde le curseur linéaire (il est le
+/// nombre envoyé à l'appareil) ; le correctif ne la convertit pas.
+#[test]
+fn sur_une_sortie_reseau_l_etape_volume_reste_lineaire_7762() {
+    let (backend, zone) = dlna_zone();
+    let repo = ZoneRepo::with_backend(backend.clone());
+    let id = zone.id.unwrap();
+    repo.update_volume(id, 50.0).unwrap();
+    let zone = repo.get(id).unwrap().unwrap();
+    let ps = alac_hires_playing();
+    let sp = build_signal_path(&ps, &zone, &backend, Some("Node"), "none", None).unwrap();
+    assert_eq!(step_desc(&sp, "Volume").as_deref(), Some("Volume 50%"));
 }
 
 /// Contre-épreuve : l'exemption ne vaut QUE pour le volume seul. Dès qu'une
@@ -5388,5 +5445,38 @@ fn radio_6821_source_porte_le_debit_annonce() {
                 "{output}"
             );
         }
+    }
+}
+
+/// #7616 — étage casque exclusif : une zone qui demande `crossfeed-…` ET
+/// `crosstalk` n'a qu'un étage en service, `crosstalk`, et l'étape du chemin
+/// du signal porte SON nom. Ni le nom ni la description ne parlent de
+/// crossfeed ; le `code` reste `crossfeed` pour les clients qui le lisent.
+#[test]
+fn l_etape_se_nomme_crosstalk_quand_crosstalk_est_en_service_7616() {
+    let demandes = vec![
+        ("crossfeed-essai".to_string(), json!({"enabled": true})),
+        ("crosstalk".to_string(), json!({"enabled": true})),
+    ];
+    let en_service = tune_core::audio::crossfeed::etages_tiers_en_service(demandes);
+    let greffon = tune_core::audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed(&en_service);
+    assert_eq!(greffon, Some("crosstalk"));
+    for lang in ["fr", "en", "de", "ja"] {
+        let mut steps = vec![json!({
+            "name": "Crossfeed",
+            "code": "crossfeed",
+            "description": "Crossfeed casque dans le flux",
+            "bit_perfect": false,
+        })];
+        nommer_le_crossfeed_du_greffon_lang(lang, &mut steps, greffon);
+        assert_eq!(steps[0]["name"], "Crosstalk", "{lang}");
+        assert_eq!(steps[0]["plugin"], "crosstalk", "{lang}");
+        assert_eq!(steps[0]["code"], "crossfeed", "{lang}");
+        let description = steps[0]["description"].as_str().unwrap_or_default();
+        assert!(description.contains("Crosstalk"), "{lang} : {description}");
+        assert!(
+            !description.to_lowercase().contains("crossfe"),
+            "{lang} : la description parle encore de crossfeed : {description}"
+        );
     }
 }

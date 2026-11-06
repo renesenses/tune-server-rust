@@ -159,6 +159,9 @@ impl PlaybackOrchestrator {
         if erreur.starts_with("hqplayer_output_start_failed:") {
             return crate::outputs::hqplayer::MESSAGE_ECHEC_DE_SORTIE.into();
         }
+        if erreur.starts_with("hqplayer_control_unsolicited_response:") {
+            return crate::outputs::hqplayer::MESSAGE_OCTETS_NON_SOLLICITES.into();
+        }
         if dsd_mode == "native" && annonce == Some(false) && est_dsd_brut(mime_type) {
             return format!(
                 "Output device error: le mode DSD de cette zone est réglé sur « natif » \
@@ -640,6 +643,9 @@ impl PlaybackOrchestrator {
         )
     }
 
+    /// #7852 — n'écrit plus rien au démarrage : ARME l'écoute de la zone, que
+    /// le sondeur valide au seuil min(30 s, 50 %) (voir `ecoute_validee_7852`).
+    /// Un titre sans durée connue est écrit tout de suite, comme avant.
     // Un argument par colonne écrite ; une structure changerait tous les appelants pour un gain de forme (clippy 1.98).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_listen(
@@ -657,11 +663,47 @@ impl PlaybackOrchestrator {
         contexte: ContexteEcoute<'_>,
         album_ref: Option<&str>,
     ) {
+        self.armer_l_ecoute(
+            zone_id,
+            super::ecoute_validee_7852::EcouteEnAttente {
+                title: title.into(),
+                artist: artist.map(Into::into),
+                album: album.map(Into::into),
+                source: source.into(),
+                source_id: source_id.map(Into::into),
+                album_id,
+                duration_ms,
+                cover_url: cover_url.map(Into::into),
+                session_profile_id,
+                contexte: super::ecoute_validee_7852::ContexteRetenu::de(&contexte),
+                album_ref: album_ref.map(Into::into),
+            },
+        );
+    }
+
+    /// L'écriture d'une écoute validée : la ligne d'historique, puis l'entrée
+    /// « Reprendre l'écoute ». Appelée une seule fois par écoute, par
+    /// `valider_l_ecoute` (ou par `armer_l_ecoute` pour un titre sans durée).
+    pub(super) fn ecrire_l_ecoute(
+        &self,
+        zone_id: i64,
+        ecoute: &super::ecoute_validee_7852::EcouteEnAttente,
+    ) {
+        let title = ecoute.title.as_str();
+        let artist = ecoute.artist.as_deref();
+        let album = ecoute.album.as_deref();
+        let source = ecoute.source.as_str();
+        let source_id = ecoute.source_id.as_deref();
+        let album_id = ecoute.album_id;
+        let duration_ms = ecoute.duration_ms;
+        let cover_url = ecoute.cover_url.as_deref();
+        let session_profile_id = ecoute.session_profile_id;
+        let contexte = ecoute.contexte.emprunt();
         // La référence d'album du service (fil 2121, migration 114). Donnée
         // par la demande quand elle la porte ; sinon, pour une piste Bandcamp,
         // celle que la file ou les favoris connaissent déjà — une avance
         // gapless ou une annonce différée n'ont pas la demande sous la main.
-        let album_ref = album_ref.map(String::from).or_else(|| {
+        let album_ref = ecoute.album_ref.clone().or_else(|| {
             source_id.filter(|_| source == "bandcamp").and_then(|sid| {
                 crate::db::reference_d_album::reference_d_album_bandcamp(&self.db, sid)
             })
@@ -976,13 +1018,25 @@ impl PlaybackOrchestrator {
                 .await;
         }
         if let Some(did) = device_id {
-            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+            // #7841 — comme le volume depuis #7633 : un renderer OpenHome reçoit
+            // sa sourdine sans le verrou de la sortie, que le sondeur tient
+            // pendant ses relevés SOAP.
+            let (output, envoi_direct) = {
+                let registre = self.outputs.lock().await;
+                (registre.get(did), registre.envoi_de_volume(did))
+            };
+            let output = output.ok_or_else(|| {
                 OutputCommandError::failed(
                     OutputCommand::SetMute,
                     format!("output {did} is not registered"),
                 )
             })?;
-            output.lock().await.checked_set_mute(muted).await?;
+            match envoi_direct {
+                Some(envoi) => envoi.set_mute(muted).await.map_err(|message| {
+                    OutputCommandError::failed(OutputCommand::SetMute, message)
+                })?,
+                None => output.lock().await.checked_set_mute(muted).await?,
+            }
         }
         let _tenue_air = if let Some(ref file) = file_air {
             Some(file.etat.lock().await)

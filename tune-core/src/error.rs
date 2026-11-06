@@ -61,6 +61,20 @@ pub enum TuneError {
     #[error("{0}")]
     Credentials(String),
 
+    /// Le service a répondu en refusant **l'application Tune**, pas le compte.
+    ///
+    /// Mesuré le 01/11/2026 (rc9, deux testeurs macOS) : le fichier de
+    /// configuration distant servait un `app_id` Qobuz que `user/login` refuse
+    /// par `401 {"message":"User authentication is required"}`. Tune rangeait
+    /// ce 401 avec les mauvais mots de passe ([`TuneError::Credentials`]) et
+    /// l'écran disait « mot de passe incorrect » à des testeurs dont le mot de
+    /// passe était bon. Ressaisir son mot de passe n'y peut rien : c'est la
+    /// configuration de l'application qu'il faut corriger.
+    ///
+    /// Le texte porté est court et sans JSON du service.
+    #[error("{0}")]
+    AppRefused(String),
+
     #[error("{0}")]
     Other(String),
 }

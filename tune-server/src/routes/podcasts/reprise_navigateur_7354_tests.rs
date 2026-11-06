@@ -135,6 +135,15 @@ async fn podcast_navigateur_7354_confirme_position_identite_et_une_seule_ecoute(
         r.cover_path.as_deref(),
         Some("https://cover.invalid/podcast.jpg")
     );
+    // #7852 : l'écoute n'est écrite qu'au point de décision du sondeur ; le
+    // banc le consulte comme le ferait un tour, une fois le seuil (30 s)
+    // franchi par la position confirmée.
+    let etat = b.state.playback.get_state(b.zone).await;
+    assert!(
+        b.state.orchestrator.valider_l_ecoute(&etat),
+        "l'épisode confirmé à 320 s doit valider son écoute (position {})",
+        etat.position_ms
+    );
     assert_eq!(ecoutes(&b), 1);
     signaler(&b, "flux-perime", 990000).await;
     assert_eq!(
@@ -149,6 +158,11 @@ async fn podcast_navigateur_7354_confirme_position_identite_et_une_seule_ecoute(
         .unwrap()
         .unwrap();
     assert_eq!(suivant.position_ms, 325000);
+    let etat = b.state.playback.get_state(b.zone).await;
+    assert!(
+        !b.state.orchestrator.valider_l_ecoute(&etat),
+        "un tour suivant ne doit pas réécrire l'écoute déjà validée"
+    );
     assert_eq!(ecoutes(&b), 1);
     b.state.orchestrator.stop(b.zone, None).await;
 }
@@ -163,7 +177,8 @@ async fn podcast_navigateur_7354_recul_10_0_300_et_reprises_explicites_sans_doub
         (5000, 10, 0),
         (320000, 10, 310000),
         (320000, 0, 320000),
-        (320000, 300, 20000),
+        // #7840 — un recul enregistré à 300 s (ancienne borne) recule de 60 s.
+        (320000, 300, 260000),
     ] {
         signaler(&b, &sid, position).await;
         let r = listening_resume::recent(&b.state.backend, Some(b.zone), 10)

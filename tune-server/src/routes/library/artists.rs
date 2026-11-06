@@ -747,12 +747,15 @@ pub(super) async fn artist_albums(
         tracing::warn!(error = %e, "types_secondaires_par_album a échoué — fiche sans section Live");
         Default::default()
     });
+    // #7725 — `max_channels` de chaque album, pour le filtre Multicanal.
+    let canaux = super::albums::canaux_max_par_album(&repo, &ids);
     let items: Vec<(bool, Value)> = items
         .iter()
         .map(|a| {
             let mut v = a.to_json();
             let types = a.id.and_then(|id| secondaires.get(&id));
             if let Some(o) = v.as_object_mut() {
+                super::albums::inserer_max_channels(o, a, &canaux);
                 if let Some(t) = a.id.and_then(|id| deduits.get(&id)) {
                     o.insert("inferred_release_type".into(), json!(t.as_str()));
                 }
@@ -826,7 +829,18 @@ pub(super) async fn artist_albums(
         }
         let mut albums = albums;
         repo.attacher_added_at(&mut albums);
-        let albums: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
+        let ids: Vec<i64> = albums.iter().filter_map(|a| a.id).collect();
+        let canaux = super::albums::canaux_max_par_album(&repo, &ids);
+        let albums: Vec<Value> = albums
+            .iter()
+            .map(|a| {
+                let mut v = a.to_json();
+                if let Some(o) = v.as_object_mut() {
+                    super::albums::inserer_max_channels(o, a, &canaux);
+                }
+                v
+            })
+            .collect();
         obj.insert(cle.to_string(), json!(albums));
     }
     inserer_sections_de_credits(&repo, &state, id, obj);

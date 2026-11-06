@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tune_core::db::album_repo::AlbumRepo;
+use tune_core::db::album_repo::{AlbumRepo, QualiteDuFichier};
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::DbBackend;
 use tune_core::db::models::{Album, Artist, Track};
@@ -466,6 +466,10 @@ pub struct TrackImporter {
     /// pendant ce scan. Une ligne reprise pour une clé ne l'est jamais pour
     /// une autre : ce serait fondre deux parutions en une.
     albums_en_cache: HashSet<i64>,
+    /// #7694 — les qualités (`score_qualite`) des fichiers lus pendant ce
+    /// scan, par dossier d'album. La règle des dossiers miroirs les compare
+    /// avant que le lot n'écrive ses pistes en base.
+    qualites_par_dossier: HashMap<String, HashSet<(bool, i64)>>,
     /// `(dossier, album)` dont la décision « compilation » a déjà été
     /// journalisée pendant ce scan. Sans cette marque, un album de 63 CD
     /// écrirait la même ligne huit cents fois.
@@ -612,6 +616,7 @@ impl TrackImporter {
             types_de_sortie_poses: HashSet::new(),
             types_secondaires_poses: HashSet::new(),
             albums_en_cache: HashSet::new(),
+            qualites_par_dossier: HashMap::new(),
             decisions_journalisees: HashSet::new(),
             comp_decision: HashMap::new(),
             folder_comp: HashMap::new(),
@@ -1738,6 +1743,29 @@ impl TrackImporter {
         } else {
             String::new()
         };
+        // #7694 — la qualité de ce fichier, pour que la règle des dossiers
+        // miroirs (#4907) ne fonde pas l'édition DSD et l'édition CD rangées
+        // sous deux racines. Inconnue (aucune des trois valeurs lue) : la
+        // règle joue comme avant. Sans `quality_split`, le dossier est vide et
+        // la règle ne joue pas.
+        let qualite_du_fichier = (meta.format.is_some()
+            || meta.sample_rate.is_some()
+            || meta.bit_depth.is_some())
+        .then(|| {
+            tune_core::library::quality::score_qualite(
+                meta.format.as_deref(),
+                meta.sample_rate.map(i64::from),
+                meta.bit_depth.map(i64::from),
+            )
+        });
+        if let Some(score) = qualite_du_fichier
+            && !album_folder.is_empty()
+        {
+            self.qualites_par_dossier
+                .entry(album_folder.clone())
+                .or_default()
+                .insert(score);
+        }
         let album_key = if use_folder_title {
             // Mixed compilation: one album per folder, named after the folder and
             // keyed on folder + Various-Artists id. The per-track album / year /
@@ -1809,7 +1837,14 @@ impl TrackImporter {
                         meta.musicbrainz_release_id.as_deref(),
                     )
                 } else {
-                    self.album_repo.get_or_create_for_folder_with_track(
+                    let qualites_par_dossier = &self.qualites_par_dossier;
+                    let vues_dans_le_scan = |dossier: &str| -> Vec<(bool, i64)> {
+                        qualites_par_dossier
+                            .get(dossier)
+                            .map(|q| q.iter().copied().collect())
+                            .unwrap_or_default()
+                    };
+                    self.album_repo.get_or_create_for_folder_de_qualite(
                         &key.0,
                         &key.1,
                         key.2,
@@ -1824,6 +1859,10 @@ impl TrackImporter {
                         // un numéro déjà pris ⇒ seconde extraction, pas second
                         // disque.
                         meta.disc_number.map(|n| n as i32),
+                        qualite_du_fichier.map(|score| QualiteDuFichier {
+                            score,
+                            vues_dans_le_scan: &vues_dans_le_scan,
+                        }),
                     )
                 };
                 if let Err(ref e) = result {
@@ -4065,6 +4104,10 @@ mod nom_de_tri_tests_6474;
 #[cfg(test)]
 #[path = "scan_import_moondial_tests_6460.rs"]
 mod moondial_tests_6460;
+
+#[cfg(test)]
+#[path = "scan_import_editions_miroirs_tests_7694.rs"]
+mod editions_miroirs_tests_7694;
 
 #[cfg(test)]
 #[path = "scan_import_artistes_piste_tests_3179.rs"]
