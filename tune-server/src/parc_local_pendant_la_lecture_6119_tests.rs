@@ -131,3 +131,50 @@ async fn la_garde_reseau_linux_est_verifiee_sur_tous_les_hotes_7263() {
         "#7263 : le hotplug reprend à l'arrêt sous Linux"
     );
 }
+
+/// Énumérations déclenchées par la fiche de diagnostic, pour un âge de parc
+/// publié donné.
+async fn enumerations_du_diagnostic(
+    state: &AppState,
+    age_du_parc: Option<std::time::Duration>,
+) -> usize {
+    let compteur = Arc::new(AtomicUsize::new(0));
+    let appels = compteur.clone();
+    parc_local_pour_le_diagnostic_selon(state, "linux", age_du_parc, || async move {
+        appels.fetch_add(1, Ordering::SeqCst);
+        Vec::new()
+    })
+    .await;
+    compteur.load(Ordering::SeqCst)
+}
+
+/// #7263 (fils 2517, 2525) : arrêts pendant un scan SANS lecture, l'écran
+/// « État du serveur » ouvert. Il interroge `/system/diagnostics` toutes les
+/// 5 s ; chaque appel relançait un inventaire ALSA complet.
+#[tokio::test]
+async fn la_fiche_de_diagnostic_ne_rebalaye_pas_un_parc_recent_7263() {
+    let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+    // Rien ne joue : seule la fraîcheur du parc peut éviter la sonde.
+    for secondes in [0, 5, 10, 60, 299] {
+        assert_eq!(
+            enumerations_du_diagnostic(&state, Some(std::time::Duration::from_secs(secondes)))
+                .await,
+            0,
+            "#7263 : un parc publié il y a {secondes} s suffit à la fiche ; la rebalayer \
+             toutes les 5 s rouvrait les greffons ALSA ~500 fois par heure"
+        );
+    }
+}
+
+/// Contre-épreuve : sans parc publié, ou avec un parc trop vieux, la fiche
+/// sonde bien — sinon un DAC branché n'y apparaîtrait jamais.
+#[tokio::test]
+async fn la_fiche_de_diagnostic_sonde_sans_parc_ou_parc_perime_7263() {
+    let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+    assert_eq!(enumerations_du_diagnostic(&state, None).await, 1);
+    assert_eq!(
+        enumerations_du_diagnostic(&state, Some(DUREE_DU_PARC_POUR_LE_DIAGNOSTIC)).await,
+        1
+    );
+    assert!(DUREE_DU_PARC_POUR_LE_DIAGNOSTIC >= std::time::Duration::from_secs(60));
+}

@@ -107,6 +107,289 @@ pub(super) fn zone_eq_alters_signal(
     active_zone_eq_profile(backend, zone_id).is_some()
 }
 
+/// #7632 — la correction de pièce d'une zone, telle que le chemin du signal
+/// la décrit.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct CorrectionPiece {
+    /// `ir` : la réponse impulsionnelle (`ir_path_{zone}`, convolueur) ;
+    /// `eq` : le profil de pièce appliqué à l'égaliseur (C2).
+    pub kind: &'static str,
+    /// `applied`, `bypassed_pure`, `rate_mismatch`, `unreadable`, et pour
+    /// `eq` : `equalizer_off` (greffon égaliseur désactivé).
+    pub status: &'static str,
+    pub applied: bool,
+    pub description: String,
+    pub reason: Option<String>,
+    pub ir_sample_rate: Option<u32>,
+    pub taps: Option<usize>,
+}
+
+impl CorrectionPiece {
+    pub fn resume(&self) -> Value {
+        json!({
+            "configured": true,
+            "kind": self.kind,
+            "applied": self.applied,
+            "status": self.status,
+            "reason": self.reason,
+            "ir_sample_rate": self.ir_sample_rate,
+            "taps": self.taps,
+        })
+    }
+}
+
+/// Latence du convolueur partitionné : un bloc de 1024 trames (codé en dur
+/// dans `load_convolver`), en millisecondes à la cadence du flux.
+fn latence_convolueur_ms(sample_rate: u32) -> f64 {
+    1024.0 * 1000.0 / sample_rate.max(1) as f64
+}
+
+/// L'étape « Correction de pièce » (#7632) : `None` sans `ir_path_{zone}`.
+/// Le fichier est LU (cadence, taps) pour dire si le convolueur l'applique
+/// au flux courant — la même règle que `ConvolverConfig::build_for` : pas de
+/// rééchantillonnage, donc cadence de l'IR = cadence du flux, sinon rien.
+pub(super) fn zone_correction_piece_lang(
+    lang: &str,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    wire_sample_rate: Option<u32>,
+) -> Option<CorrectionPiece> {
+    let chemin = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+        .get(&format!("ir_path_{zone_id}"))
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty());
+    let Some(chemin) = chemin else {
+        return correction_piece_egaliseur_lang(lang, backend, zone_id);
+    };
+    let pure = tune_core::audio::audiophile::zone_enabled(backend, zone_id);
+    let (taps, ir_sr) = match tune_core::audio::convolver::Convolver::read_ir_taps(&chemin) {
+        Ok((canaux, sr)) => (canaux.first().map(Vec::len), Some(sr)),
+        Err(e) => {
+            return Some(CorrectionPiece {
+                kind: "ir",
+                status: "unreadable",
+                applied: false,
+                description: fs(lang, "correction_piece_illisible", &[&e]),
+                reason: Some(e),
+                ir_sample_rate: None,
+                taps: None,
+            });
+        }
+    };
+    if pure {
+        return Some(CorrectionPiece {
+            kind: "ir",
+            status: "bypassed_pure",
+            applied: false,
+            description: ts(lang, "correction_piece_pure").to_string(),
+            reason: Some("pure".into()),
+            ir_sample_rate: ir_sr,
+            taps,
+        });
+    }
+    if let (Some(fil), Some(ir)) = (wire_sample_rate, ir_sr)
+        && fil != ir
+    {
+        return Some(CorrectionPiece {
+            kind: "ir",
+            status: "rate_mismatch",
+            applied: false,
+            description: fs(
+                lang,
+                "correction_piece_cadence",
+                &[&ir.to_string(), &fil.to_string()],
+            ),
+            reason: Some(format!("ir_sample_rate {ir} != stream_sample_rate {fil}")),
+            ir_sample_rate: ir_sr,
+            taps,
+        });
+    }
+    let cadence = wire_sample_rate.or(ir_sr).unwrap_or(48_000);
+    Some(CorrectionPiece {
+        kind: "ir",
+        status: "applied",
+        applied: true,
+        description: fs(
+            lang,
+            "correction_piece_active",
+            &[
+                &taps.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+                &ir_sr.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
+                &format!("{:.0}", latence_convolueur_ms(cadence)),
+            ],
+        ),
+        reason: None,
+        ir_sample_rate: ir_sr,
+        taps,
+    })
+}
+
+/// #7632 (C2) — la correction de pièce faite par l'ÉGALISEUR : le profil de
+/// pièce de la zone (`room_profile_{zone}`, écrit par le greffon calibration)
+/// tel que `POST /room-correction/profiles/{zone}/apply` l'a posé dans
+/// `zone_{id}_eq_profile`. `None` si l'égaliseur de la zone n'est pas ce
+/// profil (réglé à la main depuis, ou jamais appliqué).
+///
+/// PURE ne construit pas l'égaliseur : l'étape DSP disparaît alors, et sans
+/// celle-ci rien ne dirait qu'une correction armée ne s'entend pas.
+fn correction_piece_egaliseur_lang(
+    lang: &str,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> Option<CorrectionPiece> {
+    let profil = tune_core::room_correction::load_profile(backend, &zone_id.to_string())?;
+    if profil.filters.is_empty() {
+        return None;
+    }
+    let eq = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+        .get(&format!("zone_{zone_id}_eq_profile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())?;
+    let attendu = tune_core::room_correction::profil_eq_de_correction(&profil.filters);
+    let proche = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let meme = eq.enabled
+        && eq.bands.len() == attendu.bands.len()
+        && eq.bands.iter().zip(&attendu.bands).all(|(a, b)| {
+            a.band_type == b.band_type
+                && proche(a.freq, b.freq)
+                && proche(a.gain, b.gain)
+                && proche(a.q, b.q)
+        });
+    if !meme {
+        return None;
+    }
+    let bandes = profil.filters.len().to_string();
+    let (status, applied, description, reason) =
+        if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
+            (
+                "bypassed_pure",
+                false,
+                ts(lang, "correction_piece_pure").to_string(),
+                Some("pure".to_string()),
+            )
+        } else if active_zone_eq_profile(backend, zone_id).is_none() {
+            (
+                "equalizer_off",
+                false,
+                ts(lang, "correction_piece_eq_inactive").to_string(),
+                Some("equalizer_off".to_string()),
+            )
+        } else {
+            (
+                "applied",
+                true,
+                fs(lang, "correction_piece_eq_active", &[&bandes, &profil.name]),
+                None,
+            )
+        };
+    Some(CorrectionPiece {
+        kind: "eq",
+        status,
+        applied,
+        description,
+        reason,
+        ir_sample_rate: None,
+        taps: None,
+    })
+}
+
+/// #7632 — la correction de pièce est un droit Premium (`RoomCorrection`,
+/// décisions du 04/11/2026). Sans ce droit :
+///
+/// * l'égaliseur posé par un profil de pièce (`kind: "eq"`) n'est plus
+///   PRÉSENTÉ comme une « Correction de pièce » — ni étape, ni résumé.
+///   L'égaliseur, lui, filtre toujours et reste décrit par l'étape DSP ;
+/// * la RI (`kind: "ir"`) n'est plus convoluée (l'orchestrateur et la sortie
+///   locale la retirent, `correction_ir_autorisee`) : l'étape le DIT, état
+///   `unlicensed`, `applied: false`, au lieu de l'annoncer appliquée.
+pub fn correction_de_piece_sous_licence_lang(
+    lang: &str,
+    signal_path: Option<Value>,
+    premium: bool,
+) -> Option<Value> {
+    let mut sp = signal_path?;
+    if premium {
+        return Some(sp);
+    }
+    let kind = sp
+        .get("room_correction")
+        .and_then(|r| r.get("kind"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let Some(o) = sp.as_object_mut() else {
+        return Some(sp);
+    };
+    match kind.as_deref() {
+        Some("eq") => {
+            o.insert("room_correction".into(), Value::Null);
+            if let Some(etapes) = o.get_mut("steps").and_then(Value::as_array_mut) {
+                etapes.retain(|e| e.get("code") != Some(&json!("room_correction")));
+            }
+        }
+        Some("ir") => {
+            let description = ts(lang, "correction_piece_sans_licence");
+            if let Some(rc) = o.get_mut("room_correction").and_then(Value::as_object_mut) {
+                rc.insert("status".into(), json!("unlicensed"));
+                rc.insert("applied".into(), json!(false));
+                rc.insert("reason".into(), json!("unlicensed"));
+            }
+            if let Some(etapes) = o.get_mut("steps").and_then(Value::as_array_mut) {
+                for e in etapes
+                    .iter_mut()
+                    .filter(|e| e.get("code") == Some(&json!("room_correction")))
+                {
+                    e["status"] = json!("unlicensed");
+                    e["applied"] = json!(false);
+                    e["bit_perfect"] = json!(true);
+                    e["reason"] = json!("unlicensed");
+                    e["description"] = json!(description);
+                }
+            }
+        }
+        _ => {}
+    }
+    Some(sp)
+}
+
+/// [`correction_de_piece_sous_licence_lang`] dans la langue de la requête.
+pub fn correction_de_piece_sous_licence(
+    signal_path: Option<Value>,
+    premium: bool,
+) -> Option<Value> {
+    correction_de_piece_sous_licence_lang(
+        super::textes_signal::langue_courante(),
+        signal_path,
+        premium,
+    )
+}
+
+/// [`correction_de_piece_sous_licence_lang`] avec la licence de l'hôte.
+pub async fn signal_path_sous_licence_lang(
+    lang: &str,
+    license: &tune_core::license::LicenseManager,
+    signal_path: Option<Value>,
+) -> Option<Value> {
+    let premium = license
+        .check_feature(tune_core::license::Feature::RoomCorrection)
+        .await;
+    correction_de_piece_sous_licence_lang(lang, signal_path, premium)
+}
+
+/// [`signal_path_sous_licence_lang`] dans la langue de la requête.
+pub async fn signal_path_sous_licence(
+    license: &tune_core::license::LicenseManager,
+    signal_path: Option<Value>,
+) -> Option<Value> {
+    signal_path_sous_licence_lang(
+        super::textes_signal::langue_courante(),
+        license,
+        signal_path,
+    )
+    .await
+}
+
 /// Description du traitement EQ réellement configuré, y compris le headroom
 /// automatique.
 ///
@@ -225,6 +508,10 @@ pub(super) fn annoter_l_ombre_du_crossfeed_lang(
 /// le crossfeed intégré est alors éteint, l'appeler « Crossfeed » désignerait
 /// l'autre. Le `code` reste `crossfeed` pour les clients qui le lisent ;
 /// `plugin` porte l'identifiant du greffon. Sans greffon, rien ne change.
+///
+/// #7616 — l'étage `crosstalk` (enceintes) remplace lui aussi le crossfeed :
+/// l'étape porte alors son nom et une description qui ne parle pas de
+/// crossfeed.
 pub(super) fn nommer_le_crossfeed_du_greffon_lang(
     lang: &str,
     steps: &mut [Value],
@@ -234,9 +521,14 @@ pub(super) fn nommer_le_crossfeed_du_greffon_lang(
         return;
     };
     let nom = tune_core::audio::natifs_tiers::nom_affichable(id);
+    let texte = if id == tune_core::audio::crossfeed::ID_CROSSTALK {
+        "plugin_crosstalk"
+    } else {
+        "plugin_crossfeed"
+    };
     for etape in steps.iter_mut().filter(|e| e["code"] == "crossfeed") {
         etape["name"] = json!(nom);
-        etape["description"] = json!(fs(lang, "plugin_crossfeed", &[&nom]));
+        etape["description"] = json!(fs(lang, texte, &[&nom]));
         etape["plugin"] = json!(id);
     }
 }
@@ -1024,8 +1316,8 @@ pub fn build_signal_path_lang(
         runtime_signal_path,
         analyse,
     );
-    // Un greffon natif tiers de la famille du crossfeed remplace le crossfeed
-    // intégré : l'étape porte SON nom, et l'ombre de la tête du crossfeed
+    // Un greffon natif tiers de la famille du crossfeed, ou `crosstalk`
+    // (#7616), remplace le crossfeed intégré : l'étape porte SON nom, et l'ombre de la tête du crossfeed
     // intégré, éteint, n'a rien à y annoncer.
     let greffon_de_crossfeed = tune_core::audio::natifs_tiers::greffon_de_crossfeed_de_la_zone(
         &tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone()),
@@ -1068,6 +1360,11 @@ pub fn build_signal_path_lang(
         // plutôt que convertir (la lecture n'aurait alors pas démarré).
         "pure": pure,
         "pure_degraded": pure_degraded(pure, etapes.rate_conversion, dsd_decime_en_pcm),
+        // #7632 — la correction de pièce (IR/convolueur) : `null` sans réglage ;
+        // sinon `{configured, applied, status, reason, ir_sample_rate, taps}`.
+        // Une IR à la mauvaise cadence est retirée EN SILENCE par le
+        // convolueur (#5190) : c'est ici que l'auditeur l'apprend.
+        "room_correction": etapes.correction_piece,
         "strict_bitperfect": tune_core::audio::bitperfect_strict::zone_enabled(backend, zone_id_courant),
         "rate_conversion": etapes.rate_conversion.map(|(de, vers)| json!({
             "from_hz": de,
@@ -1267,6 +1564,9 @@ struct Etapes {
     /// #3973 — la conversion de fréquence nommée par l'étape `Resampler`
     /// (de, vers), en Hz. `None` : aucune conversion.
     rate_conversion: Option<(u32, u32)>,
+    /// #7632 — la correction de pièce (réponse impulsionnelle, convolueur)
+    /// telle que l'étape la décrit : configurée, appliquée ou non, et pourquoi.
+    correction_piece: Option<Value>,
 }
 
 /// Assemble les étapes du chemin de signal ; sixième bloc de
@@ -1310,6 +1610,7 @@ fn assembler_les_etapes_lang(
         crossfeed_du_flux,
         ui_volume,
         volume_full,
+        correction_piece,
         ..
     } = analyse.traitements;
     let Forcages {
@@ -1533,6 +1834,17 @@ fn assembler_les_etapes_lang(
         {
             etape["code"] = json!("dsd_pcm_repli");
             etape["detail"] = json!(repli.raison());
+        }
+        // #7265 — la zone demandait du DoP, la sortie WASAPI ne pouvait pas le
+        // porter : la piste part en PCM, et l'étape dit pourquoi au lieu de
+        // laisser croire à une conversion choisie.
+        if is_dsd
+            && !dop_sur_le_fil
+            && let Some(ecart) =
+                tune_core::audio::dop_ecarte_7265::ecart_de_la_zone(zone.id.unwrap_or(0))
+        {
+            etape["code"] = json!("dsd_dop_ecarte");
+            etape["detail"] = json!(ecart.raison());
         }
         if flac_ffmpeg_vers_le_reseau {
             // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
@@ -1758,6 +2070,31 @@ fn assembler_les_etapes_lang(
         }));
     }
 
+    // Étape « Correction de pièce » (#7632) — la réponse impulsionnelle de la
+    // zone, dans l'ordre réel de la chaîne : après l'égaliseur, avant le
+    // crossfeed. Elle est publiée dès qu'un `ir_path_{zone}` existe, que le
+    // convolueur l'applique ou non : une IR à la mauvaise cadence est
+    // retirée en silence par `build_for` (#5190, « not planned »), et PURE
+    // la contourne ; dans les deux cas l'auditeur a un réglage armé et
+    // n'entend rien — c'est l'étape qui le lui dit, comme pour le DSP sur DSD.
+    let correction_piece_resume = correction_piece.as_ref().map(CorrectionPiece::resume);
+    if let Some(cp) = correction_piece
+        && !dsp_contourne_par_le_dsd
+    {
+        steps.push(json!({
+            "name": "Correction de pièce",
+            "code": "room_correction",
+            "kind": cp.kind,
+            "status": cp.status,
+            "description": cp.description,
+            "bit_perfect": !cp.applied,
+            "applied": cp.applied,
+            "reason": cp.reason,
+            "ir_sample_rate": cp.ir_sample_rate,
+            "taps": cp.taps,
+        }));
+    }
+
     // Étape « Crossfeed » (#5114) — le crossfeed que le flux RÉSEAU porte
     // dans ses octets. Ce panneau ne le voyait pas : l'étape DSP ne lit que
     // l'égaliseur et le préréglage, et une zone DLNA dont le flux croisait
@@ -1969,6 +2306,7 @@ fn assembler_les_etapes_lang(
         summary,
         dsp_metrics,
         rate_conversion,
+        correction_piece: correction_piece_resume,
     }
 }
 
@@ -2667,6 +3005,8 @@ struct Traitements {
     crossfeed_du_flux: bool,
     ui_volume: f64,
     volume_full: bool,
+    /// #7632 — la correction de pièce de la zone (`ir_path_{zone}`), décrite.
+    correction_piece: Option<CorrectionPiece>,
 }
 
 /// Relève les traitements armés sur la zone, la sonde locale primant sur les réglages.
@@ -2738,8 +3078,20 @@ fn relever_les_traitements_lang(
     // face à un curseur ailleurs, jusqu'à ce qu'on touche le volume — le PUT
     // réécrit alors les deux sources (#1504 Jean Valjean, même symptôme
     // Bebelalu55 #1480). Une seule source pour les deux affichages.
-    let ui_volume = (zone.volume / 100.0).clamp(0.0, 1.0);
-    let volume_full = zone.fixed_volume || ui_volume >= 1.0 || ui_volume <= 0.0; // 0.0 means no software vol set
+    //
+    // #7762 — « une seule source » veut aussi dire « la même LECTURE » :
+    // `zone.volume` est le GAIN (#6787), et la page le montre comme POSITION
+    // du curseur de la zone. Sur une sortie logicielle (curseur `db60`), 50 %
+    // du curseur valent −30 dB, soit un gain de 0,0316 : l'étape affichait
+    // « Volume logiciel 3 % » face au curseur à 50 % (rc10, WASAPI exclusif,
+    // fil 2623). On affiche la position, lue par la même loi que
+    // `volume_curve` (`EchelleDeVolume::de_la_sortie`) ; une sortie réseau
+    // reste linéaire, son curseur EST le nombre envoyé.
+    let gain = (zone.volume / 100.0).clamp(0.0, 1.0);
+    let ui_volume =
+        tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(zone.output_type.as_deref())
+            .position(gain);
+    let volume_full = zone.fixed_volume || gain >= 1.0 || gain <= 0.0; // 0.0 means no software vol set
     Traitements {
         configured_dsp_enabled,
         dsp_enabled,
@@ -2752,6 +3104,12 @@ fn relever_les_traitements_lang(
         crossfeed_du_flux,
         ui_volume,
         volume_full,
+        correction_piece: zone_correction_piece_lang(
+            lang,
+            backend,
+            zid,
+            wire.map(|w| w.sample_rate).filter(|v| *v > 0),
+        ),
     }
 }
 

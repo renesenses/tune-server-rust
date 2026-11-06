@@ -269,3 +269,71 @@ async fn cles_differentes_mbid_distincts_et_artiste_inconnu_sont_refuses() {
         "rien n'a bougé"
     );
 }
+
+/// #7535 : « Phil Selway » et « Philip Selway » portent le même MBID (posé
+/// par le nom avant la garde). L'onglet Doublons les propose, rien ne les
+/// réunit d'office, et la fusion manuelle passe malgré deux clés
+/// différentes. Contre-épreuve : deux clés différentes SANS MBID commun
+/// restent refusées (`cles_differentes`).
+#[tokio::test]
+async fn deux_fiches_d_un_meme_mbid_sont_proposees_puis_absorbees_a_la_main_7535() {
+    let (app, state) = serveur();
+    let philip = artiste(&state, "Philip Selway", Some("mbid-selway"));
+    let phil = artiste(&state, "Phil Selway", Some("mbid-selway"));
+    let yorke = artiste(&state, "Thom Yorke", None);
+    inserer(
+        &state,
+        "INSERT INTO albums (title, artist_id, source) VALUES ('Strange Dance', ?, 'local')",
+        &[&phil as &dyn ToSqlValue],
+    );
+
+    let (statut, liste) = appel(&app, "GET", "/api/v1/library/artists/doublons").await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(liste["count"].as_u64(), Some(1), "{liste}");
+    let groupe = &liste["groups"][0];
+    assert_eq!(groupe["motif"], "mbid", "{liste}");
+    assert_eq!(groupe["mbid_distincts"], false);
+    let ids: Vec<i64> = groupe["artistes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![philip, phil]);
+    // Proposé, pas fusionné : les deux fiches sont toujours là.
+    assert_eq!(
+        compte(&state, "SELECT COUNT(*) FROM artists WHERE 1 = ?", 1),
+        3
+    );
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/artists/{philip}/absorber/{yorke}"),
+    )
+    .await;
+    assert_eq!(
+        (statut, corps["error"].as_str()),
+        (StatusCode::CONFLICT, Some("cles_differentes")),
+        "{corps}"
+    );
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/artists/{philip}/absorber/{phil}"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["albums"].as_u64(), Some(1));
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM albums WHERE artist_id = ?",
+            philip
+        ),
+        1
+    );
+    let (_, apres) = appel(&app, "GET", "/api/v1/library/artists/doublons").await;
+    assert_eq!(apres["count"].as_u64(), Some(0), "{apres}");
+}

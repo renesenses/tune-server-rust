@@ -2904,6 +2904,9 @@ async fn avance_gapless_ecrit_la_piste_atteinte_dans_l_historique() {
     orch.advance_queue_metadata(zone_id, 1)
         .await
         .expect("l'avance gapless doit aboutir");
+    // #7852 : l'avance arme l'écoute de la piste atteinte, écrite au seuil.
+    assert_eq!(lignes_historique(&orch), 0);
+    assert!(orch.amener_au_seuil(zone_id).await);
 
     let history = crate::db::history_repo::HistoryRepo::with_backend(orch.db.clone())
         .recent(10)
@@ -6178,7 +6181,9 @@ async fn bascule_pure_avec_egaliseur_sur_dlna_refabrique_le_flux() {
 /// lui.
 #[tokio::test]
 async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
-    let orch = test_orchestrator();
+    let mut orch = test_orchestrator();
+    // #7632 — la correction de pièce n'est un traitement que sous Premium.
+    orch.license = Some(crate::license::licence_premium_pour_test(orch.db.clone()));
     let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
     let zr = ZoneRepo::with_backend(orch.db.clone());
     let zone_vide = zr.create("Vide", Some("dlna"), Some("dlna:vide")).unwrap();
@@ -6746,7 +6751,9 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
             None,
             crate::orchestrator::ContexteEcoute::default(),
             album_ref,
-        )
+        );
+        // #7852 : l'écoute armée est écrite au seuil, réputé franchi ici.
+        assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
     };
     let derniere = || {
         orch.db
@@ -6827,6 +6834,10 @@ async fn test_record_listen() {
         },
         None,
     );
+    // #7852 : rien n'est écrit avant le seuil ; réputé franchi ici, le test
+    // porte sur les colonnes écrites.
+    assert_eq!(lignes_historique(&orch), 0);
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
 
     let repo = HistoryRepo::with_backend(orch.db.clone());
     let history = repo.recent(10).unwrap();
@@ -7010,6 +7021,9 @@ async fn zone_navigateur_l_annonce_attend_que_l_onglet_tire_le_flux() {
         orch.confirmer_lecture_navigateur(zone_id, &sid).await,
         "l'onglet consomme le flux : l'annonce doit partir"
     );
+    // #7852 : la confirmation arme l'écoute, le seuil l'écrit.
+    assert!(orch.ecoute_en_attente(zone_id));
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
     assert_eq!(
         lignes_historique(&orch),
         1,
@@ -7216,6 +7230,8 @@ async fn zone_navigateur_le_lecteur_qui_joue_confirme_6066() {
         crate::orchestrator::SignalDuLecteur::Confirmee,
         "le lecteur de la zone dit jouer ce flux : l'annonce part"
     );
+    // #7852 : la confirmation arme l'écoute, le seuil l'écrit.
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
     assert_eq!(lignes_historique(&orch), 1);
 
     assert_eq!(
@@ -9081,6 +9097,8 @@ async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
     );
 
     // L'historique — l'autre moitié du fil : la rangée « Récemment joué ».
+    // #7852 : écrit au seuil de l'écoute.
+    assert!(orch.amener_au_seuil(zone_id).await);
     let titre_historise = orch
         .db
         .query_one(
@@ -9592,6 +9610,153 @@ async fn toute_bascule_pure_annonce_la_zone_au_client_5683() {
         PorteeDuReglage::Immediate
     );
     assert!(annoncee(&mut rx3, zone3));
+}
+
+// ── #7556 — une bascule de réglage ne lance JAMAIS de lecture ────────────────
+
+/// `play_media` reçus par la sortie factice d'une zone réseau.
+async fn lectures_envoyees_7556(orch: &PlaybackOrchestrator, device_id: &str) -> usize {
+    let arc = orch.outputs.lock().await.get(device_id).expect("sortie");
+    let sortie = arc.lock().await;
+    sortie
+        .as_any()
+        .downcast_ref::<crate::outputs::mock::MockOutput>()
+        .expect("mock")
+        .play_call_count()
+        .await
+}
+
+/// LE défaut du .18 (zone 10, 31/10), version piste : une zone DLNA dont le
+/// flux porte un égaliseur est ARRÊTÉE, puis on bascule PURE. `stop` garde
+/// `now_playing` (l'interface montre où la lecture s'est arrêtée) ; la
+/// bascule le prenait pour « quelque chose joue », refabriquait le flux, et
+/// la relance remettait la piste en lecture. Après : rien n'est lancé, la
+/// zone reste arrêtée, la bascule portera sur la prochaine lecture.
+///
+/// Même règle pour l'égaliseur, qui passe par la même relance.
+#[tokio::test]
+async fn bascule_pure_sur_une_zone_arretee_ne_lance_rien_7556() {
+    use crate::orchestrator::PorteeDuReglage;
+    let device_id = "dlna:uuid-7556-piste";
+    let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    orch.stop(zone_id, None).await;
+    let avant = orch.playback.get_state(zone_id).await;
+    assert_eq!(avant.state, PlayState::Stopped, "prémisse : zone arrêtée");
+    assert!(
+        avant.now_playing.is_some(),
+        "prémisse du défaut : l'arrêt garde `now_playing` pour l'affichage"
+    );
+    let lectures_avant = lectures_envoyees_7556(&orch, device_id).await;
+
+    regler_pure(&orch, zone_id, true);
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        PorteeDuReglage::RienNeJoue,
+        "zone arrêtée : la bascule s'applique à la prochaine lecture, rien n'est relancé"
+    );
+    regler_pure(&orch, zone_id, false);
+    assert_eq!(
+        orch.apply_eq_change_portee(zone_id).await,
+        PorteeDuReglage::RienNeJoue,
+        "zone arrêtée : un changement d'égaliseur ne relance rien non plus"
+    );
+    assert!(
+        !orch.eq_replay_gen.lock().unwrap().contains_key(&zone_id),
+        "aucune relance ne doit être armée sur une zone arrêtée"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    let apres = orch.playback.get_state(zone_id).await;
+    assert_eq!(
+        apres.state,
+        PlayState::Stopped,
+        "la zone doit rester arrêtée"
+    );
+    assert_eq!(
+        apres.track_generation, avant.track_generation,
+        "aucune lecture ne doit avoir été refaite"
+    );
+    assert_eq!(
+        lectures_envoyees_7556(&orch, device_id).await,
+        lectures_avant,
+        "aucune commande de lecture ne doit partir vers la sortie"
+    );
+}
+
+/// #7556 — zone EN PAUSE : la bascule ne la remet pas en lecture. Le flux en
+/// pause est gardé, la bascule portera sur la piste suivante.
+#[tokio::test]
+async fn bascule_pure_sur_une_zone_en_pause_la_laisse_en_pause_7556() {
+    use crate::orchestrator::PorteeDuReglage;
+    let device_id = "dlna:uuid-7556-pause";
+    let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    let _ = orch.pause(zone_id, None).await;
+    let avant = orch.playback.get_state(zone_id).await;
+    assert_eq!(avant.state, PlayState::Paused, "prémisse : zone en pause");
+    let lectures_avant = lectures_envoyees_7556(&orch, device_id).await;
+
+    regler_pure(&orch, zone_id, true);
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        PorteeDuReglage::PisteSuivante
+    );
+    regler_pure(&orch, zone_id, false);
+    assert_ne!(
+        orch.apply_eq_change_portee(zone_id).await,
+        PorteeDuReglage::Relance,
+        "zone en pause : l'égaliseur ne relance pas le flux"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    let apres = orch.playback.get_state(zone_id).await;
+    assert_eq!(
+        apres.state,
+        PlayState::Paused,
+        "la zone doit rester en pause"
+    );
+    assert_eq!(apres.track_generation, avant.track_generation);
+    assert_eq!(
+        lectures_envoyees_7556(&orch, device_id).await,
+        lectures_avant,
+        "aucune commande de lecture ne doit partir vers la sortie"
+    );
+}
+
+/// #7556, contre-épreuve : la zone JOUE, la bascule refabrique bien le flux
+/// (relance à la position courante, nouvelle lecture envoyée à la sortie).
+#[tokio::test]
+async fn bascule_pure_sur_une_zone_qui_joue_refabrique_le_flux_7556() {
+    use crate::orchestrator::PorteeDuReglage;
+    let device_id = "dlna:uuid-7556-joue";
+    let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
+    let lectures_avant = lectures_envoyees_7556(&orch, device_id).await;
+
+    regler_pure(&orch, zone_id, true);
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        PorteeDuReglage::Relance
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    let apres = orch.playback.get_state(zone_id).await;
+    assert_ne!(
+        apres.track_generation, generation_avant,
+        "le flux doit avoir été refabriqué"
+    );
+    assert!(
+        lectures_envoyees_7556(&orch, device_id).await > lectures_avant,
+        "la relance doit être partie vers la sortie"
+    );
 }
 
 // ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────

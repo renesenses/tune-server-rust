@@ -20,6 +20,24 @@ impl PositionPoller {
 
         let device_id = self.get_zone_device_id(zone_id);
 
+        // #7415 : la piste qui s'achève était peut-être la dernière de son
+        // album / de sa playlist ; la file peut pourtant continuer (suite
+        // automatique, radio, répétition). Sa reprise s'en va dans tous les cas.
+        if let Some(np) = zone_state
+            .now_playing
+            .as_ref()
+            .filter(|np| np.source != "podcast")
+            && let Err(e) = crate::db::listening_resume::contexte_fini(
+                &self.db,
+                zone_id,
+                np,
+                zone_state.position_ms,
+                true,
+            )
+        {
+            warn!(zone_id, error = %e, "reprise_contexte_non_retiree");
+        }
+
         let Some(next_pos) = Self::next_position(zone_state) else {
             self.terminer_la_file(zone_id, zone_state, device_id.as_deref())
                 .await;
@@ -71,6 +89,17 @@ impl PositionPoller {
         // rouvre pas l'album terminé.
         if let Err(e) = crate::db::listening_resume::terminee(&self.db, zone_id) {
             warn!(zone_id, error = %e, "reprise_terminee_non_retiree");
+        }
+        // #7415 : un épisode de podcast n'a pas de ligne de file dans sa
+        // reprise ; sa file qui s'achève le retire par son adresse.
+        if let Some(np) = zone_state
+            .now_playing
+            .as_ref()
+            .filter(|np| np.source == "podcast")
+            && let Some(url) = np.source_id.as_deref()
+            && let Err(e) = crate::db::listening_resume::podcast_termine(&self.db, zone_id, url)
+        {
+            warn!(zone_id, error = %e, "reprise_podcast_terminee_non_retiree");
         }
         // #6634 — le contrôleur UPnP décide de la suite. Sa dernière piste
         // ne doit pas amorcer la radio ou un album de la bibliothèque locale.
@@ -1255,18 +1284,46 @@ impl PositionPoller {
                     // DSD next on DLNA; handle_track_end plays it explicitly at
                     // end-of-track instead (a small gap, never a cut). Local
                     // output keeps its internal DSD gapless chain untouched.
+                    //
+                    // #6910 — sauf renderer qui annonce le DSD (GetProtocolInfo)
+                    // ET `SetNextAVTransportURI` (SCPD) et n'a pas déjà lâché un
+                    // suivant DSD : le blanc entre deux pistes enchaînées sur le
+                    // disque (fil 2412). Un renderer qui annonce tout et ne suit
+                    // pas est rattrapé par `StuckForceEnd`, puis retenu : une
+                    // transition perdue, pas une par piste.
+                    let mut dsd_arme = false;
                     if output.output_type() == "dlna" {
                         let url_lc = resolved.url.to_lowercase();
                         let next_is_dsd = crate::playback::gapless::est_dsd(&resolved.mime_type)
                             || url_lc.ends_with(".dsf")
                             || url_lc.ends_with(".dff");
                         if next_is_dsd {
+                            let annonce_suivante = output.annonce_la_suivante().await;
+                            // #6335 — la ligne dit laquelle des conditions a
+                            // manqué : limite du renderer, sondage sans
+                            // réponse ou SCPD jamais lu par Tune.
+                            if let Some(refus) = self
+                                .orchestrator
+                                .refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
+                                .await
+                            {
+                                info!(
+                                    zone_id,
+                                    device_id,
+                                    mime = %resolved.mime_type,
+                                    raison = refus.raison(),
+                                    annonce_suivante = ?annonce_suivante,
+                                    "gapless_skipped_dsd_next_dlna"
+                                );
+                                return GaplessPrep::DsdNextSkipped;
+                            }
                             info!(
                                 zone_id,
+                                device_id,
                                 mime = %resolved.mime_type,
-                                "gapless_skipped_dsd_next_dlna"
+                                "gapless_dsd_next_dlna_arme — le renderer annonce le DSD et SetNextAVTransportURI"
                             );
-                            return GaplessPrep::DsdNextSkipped;
+                            dsd_arme = true;
                         }
                     }
                     let media = crate::outputs::PlayMedia {
@@ -1331,6 +1388,7 @@ impl PositionPoller {
                         // répondre rend `Inconnue` et rien ne change.
                         let t_verif = Instant::now();
                         let tenue = output.suivante_preparee(&resolved.url).await;
+                        self.noter_le_suivant_arme(zone_id, device_id, dsd_arme, tenue);
                         info!(
                             zone_id,
                             title = %resolved.title,
@@ -1355,6 +1413,60 @@ impl PositionPoller {
                 );
                 GaplessPrep::NotArmed
             }
+        }
+    }
+}
+
+impl PositionPoller {
+    /// #6910 — ce qui vient d'être armé : un suivant DSD sur DLNA est retenu
+    /// pour la zone (tout autre armement efface la note). Un renderer qui
+    /// dit déjà avoir PERDU ce suivant DSD est retenu sans attendre la fin
+    /// de piste.
+    fn noter_le_suivant_arme(
+        &self,
+        zone_id: i64,
+        device_id: &str,
+        dsd_arme: bool,
+        tenue: crate::outputs::traits::SuivantePreparee,
+    ) {
+        let mut notes = self
+            .dsd_suivant_arme
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !dsd_arme {
+            notes.remove(&zone_id);
+            return;
+        }
+        if tenue == crate::outputs::traits::SuivantePreparee::Perdue {
+            notes.remove(&zone_id);
+            drop(notes);
+            self.retenir_dsd_suivant_lache(zone_id, device_id, "suivante_perdue");
+            return;
+        }
+        notes.insert(zone_id, device_id.to_string());
+    }
+
+    /// #6910 — le suivant armé de `zone_id` n'a pas été suivi : si c'était un
+    /// DSD sur DLNA, l'appareil retrouve la garde de #402.
+    pub(super) fn constater_le_suivant_non_suivi(&self, zone_id: i64) {
+        let appareil = self
+            .dsd_suivant_arme
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&zone_id);
+        if let Some(appareil) = appareil {
+            self.retenir_dsd_suivant_lache(zone_id, &appareil, "avance_bloquee");
+        }
+    }
+
+    fn retenir_dsd_suivant_lache(&self, zone_id: i64, device_id: &str, motif: &str) {
+        if self.orchestrator.retenir_dsd_suivant_lache(device_id) {
+            info!(
+                zone_id,
+                device_id,
+                motif,
+                "gapless_dsd_next_dlna_non_suivi — garde DSD rendue à cet appareil jusqu'au redémarrage"
+            );
         }
     }
 }

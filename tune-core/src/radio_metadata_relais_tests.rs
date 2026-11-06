@@ -4,6 +4,21 @@
 use super::*;
 use serde_json::json;
 
+/// La racine d'un relais monté par un essai, UNIQUE dans le processus.
+///
+/// L'état du relais (pause, échecs) est tenu par racine, dans des tables
+/// globales. Un essai fini libère son port, que le noyau peut redonner à un
+/// relais monté ensuite (`bind` sur le port 0, `SO_REUSEADDR`) : la racine
+/// `http://127.0.0.1:<port>/now-playing` d'un relais neuf héritait alors de
+/// la pause de dix minutes posée par un essai précédent, et sa première
+/// lecture rendait `None` sans rien demander. Le paramètre `essai`, ignoré
+/// par le faux relais, sépare les racines.
+fn racine_unique(port: u16) -> String {
+    static NUMERO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NUMERO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("http://127.0.0.1:{port}/now-playing?essai={n}")
+}
+
 async fn faux_relais(statut: u16, corps: Value) -> String {
     let app = axum::Router::new().route(
         "/now-playing",
@@ -24,7 +39,7 @@ async fn faux_relais(statut: u16, corps: Value) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    format!("http://127.0.0.1:{port}/now-playing")
+    racine_unique(port)
 }
 
 #[test]
@@ -163,6 +178,72 @@ async fn le_relais_rend_le_titre_et_un_relais_inactif_se_met_en_pause() {
     );
     // La pause d'un relais ne touche pas l'autre.
     assert!(!relais_en_pause(&base));
+}
+
+/// Relais qui répond 500 aux `echecs` premières lectures, puis le titre.
+async fn relais_qui_echoue_puis_repond(echecs: usize) -> String {
+    let compte = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/now-playing",
+        axum::routing::get(move || {
+            let compte = compte.clone();
+            async move {
+                let n = compte.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < echecs {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({})))
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"active": true, "items": {"fip": {"mode": "song", "title": "T", "artist": "A"}}})),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port local");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    racine_unique(port)
+}
+
+/// #7010 : une lecture isolée en échec ne suspend pas le relais dix minutes ;
+/// la suivante est tentée tout de suite et redonne le titre.
+#[tokio::test]
+async fn une_lecture_isolee_en_echec_ne_met_pas_le_relais_en_pause() {
+    let base = relais_qui_echoue_puis_repond(1).await;
+    assert!(titre_par_le_relais(&base, "fip").await.is_none());
+    assert!(
+        !relais_en_pause(&base),
+        "un échec isolé ne doit pas suspendre le relais"
+    );
+    let m = titre_par_le_relais(&base, "fip")
+        .await
+        .expect("la lecture suivante doit être tentée et réussir");
+    assert_eq!(m.title.as_str(), "T");
+}
+
+/// Des échecs de suite restent une vraie panne : la pause est posée, et un
+/// succès intercalé remet le compte à zéro.
+#[tokio::test]
+async fn des_echecs_de_suite_mettent_le_relais_en_pause() {
+    let base = relais_qui_echoue_puis_repond(ECHECS_AVANT_PAUSE as usize).await;
+    for _ in 0..ECHECS_AVANT_PAUSE {
+        assert!(!relais_en_pause(&base));
+        assert!(titre_par_le_relais(&base, "fip").await.is_none());
+    }
+    assert!(relais_en_pause(&base), "le relais doit être en pause");
+
+    let base2 = relais_qui_echoue_puis_repond(0).await;
+    assert!(titre_par_le_relais(&base2, "fip").await.is_some());
+    noter_panne(&base2, true, false);
+    noter_panne(&base2, true, false);
+    noter_panne(&base2, false, false);
+    noter_panne(&base2, true, false);
+    assert!(!relais_en_pause(&base2), "un succès remet le compte à zéro");
 }
 
 #[test]

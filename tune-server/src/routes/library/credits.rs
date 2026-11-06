@@ -156,7 +156,12 @@ fn ecrire_credits(
     // crédits PAR DISQUE (`POST /system/enrich-credits`) écrive exactement
     // comme ces routes : même purge, mêmes positions, même liaison de fiche
     // (par MBID d'abord, puis par nom), jamais de fiche créée.
-    tune_core::metadata::credits_release::ecrire_credits_piste(backend, track_id, lignes)
+    tune_core::metadata::credits_release::ecrire_credits_piste(
+        backend,
+        track_id,
+        tune_core::metadata::source_des_credits::MUSICBRAINZ,
+        lignes,
+    )
 }
 
 pub(super) async fn track_credits(
@@ -552,14 +557,21 @@ pub(super) async fn enrich_album_credits(
 /// deux colonnes du même type sur les deux backends (`INTEGER` sur SQLite,
 /// `TEXT` sur le miroir PostgreSQL). Un `IN (…)` avec des identifiants liés
 /// aurait rejoué le piège `text = bigint` documenté en tête de ce fichier.
-fn requete_candidats(only_missing: bool) -> &'static str {
+///
+/// #7765 — « sans crédit » veut dire sans crédit HORS balises : le filtre est
+/// celui de `tune_core::metadata::source_des_credits::PISTE_SANS_CREDIT`.
+fn requete_candidats(only_missing: bool) -> String {
     if only_missing {
-        "SELECT t.id, t.musicbrainz_recording_id FROM tracks t \
-         WHERE t.musicbrainz_recording_id IS NOT NULL AND t.musicbrainz_recording_id != '' \
-         AND NOT EXISTS (SELECT 1 FROM track_credits tc WHERE tc.track_id = t.id)"
+        format!(
+            "SELECT t.id, t.musicbrainz_recording_id FROM tracks t \
+             WHERE t.musicbrainz_recording_id IS NOT NULL AND t.musicbrainz_recording_id != '' \
+             AND {}",
+            tune_core::metadata::source_des_credits::PISTE_SANS_CREDIT
+        )
     } else {
         "SELECT t.id, t.musicbrainz_recording_id FROM tracks t \
          WHERE t.musicbrainz_recording_id IS NOT NULL AND t.musicbrainz_recording_id != ''"
+            .to_string()
     }
 }
 
@@ -642,7 +654,7 @@ pub(super) async fn enrich_all_credits(
         let _garde_tache = garde_tache; // libère la tâche à la fin de ce futur
         let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
         let track_ids: Vec<(i64, String)> = backend
-            .query_many(requete_candidats(only_missing), &[])
+            .query_many(&requete_candidats(only_missing), &[])
             .ou_defaut_journalise()
             .into_iter()
             .filter_map(|r| {
@@ -800,16 +812,17 @@ const PREMIER_TOUR_APRES: std::time::Duration = std::time::Duration::from_secs(9
 /// Quand la passe manuelle tourne, on repasse plus tard sans compter un tour.
 const REESSAI_SI_PASSE_MANUELLE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Les candidats d'un tour : pistes sans aucun crédit, au-delà du curseur,
+/// Les candidats d'un tour : pistes sans crédit hors balises (#7765), au-delà du curseur,
 /// par identifiant croissant, bornées. Emplacements : 1 = curseur, 2 = borne.
 pub(crate) fn requete_candidats_auto(engine: tune_core::db::engine::Engine) -> String {
     let m = |i: usize| crate::routes::versions::marqueur(engine, i);
     format!(
         "SELECT t.id, t.title, ar.name, t.duration_ms, t.musicbrainz_recording_id \
          FROM tracks t LEFT JOIN artists ar ON ar.id = t.artist_id \
-         WHERE t.id > {} AND NOT EXISTS (SELECT 1 FROM track_credits tc WHERE tc.track_id = t.id) \
+         WHERE t.id > {} AND {} \
          ORDER BY t.id LIMIT {}",
         m(1),
+        tune_core::metadata::source_des_credits::PISTE_SANS_CREDIT,
         m(2)
     )
 }
@@ -1051,7 +1064,10 @@ mod tests {
     fn la_requete_du_tour_automatique_est_bornee_et_reprenable() {
         let s = requete_candidats_auto(tune_core::db::engine::Engine::Sqlite);
         assert!(s.contains("t.id > ?"), "{s}");
-        assert!(s.contains("NOT EXISTS (SELECT 1 FROM track_credits"), "{s}");
+        assert!(
+            s.contains(tune_core::metadata::source_des_credits::PISTE_SANS_CREDIT),
+            "{s}"
+        );
         assert!(s.contains("ORDER BY t.id LIMIT ?"), "{s}");
         let p = requete_candidats_auto(tune_core::db::engine::Engine::Postgres);
         assert!(p.contains("t.id > $1") && p.contains("LIMIT $2"), "{p}");
@@ -1288,12 +1304,82 @@ mod tests {
     #[test]
     fn only_missing_exclut_les_pistes_deja_creditees() {
         let q = requete_candidats(true);
+        // #7765 — le filtre partagé, qui ignore les lignes `balises`.
         assert!(
-            q.contains("NOT EXISTS (SELECT 1 FROM track_credits tc WHERE tc.track_id = t.id)"),
+            q.contains(tune_core::metadata::source_des_credits::PISTE_SANS_CREDIT),
             "{q}"
         );
         // Le socle historique reste : on RESTREINT, on ne remplace pas.
         assert!(q.contains("musicbrainz_recording_id IS NOT NULL"), "{q}");
+    }
+
+    /// #7765 — trois pistes identifiées : la 81 n'a que des crédits lus dans
+    /// les balises, la 82 a un crédit MusicBrainz, la 83 une ligne ancienne
+    /// (source inconnue). Rend l'état et les identifiants attendus « à faire ».
+    fn pistes_aux_credits_de_sources_diverses() -> AppState {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute_batch(
+                "INSERT INTO tracks (id, title, file_path, musicbrainz_recording_id) VALUES
+                    (81, 'Blue in Green', '/m/81.flac', 'rec-81'),
+                    (82, 'So What', '/m/82.flac', 'rec-82'),
+                    (83, 'Flamenco Sketches', '/m/83.flac', 'rec-83');
+                 INSERT INTO track_credits (track_id, artist_name, role, source) VALUES
+                    (81, 'Bill Evans', 'performer', 'balises'),
+                    (81, 'Miles Davis', 'performer', 'balises'),
+                    (82, 'Paul Chambers', 'performer', 'musicbrainz'),
+                    (83, 'Jimmy Cobb', 'performer', NULL);",
+            )
+            .unwrap();
+        state
+    }
+
+    fn ids(lignes: &[Vec<tune_core::db::backend::SqlValue>]) -> Vec<i64> {
+        let mut v: Vec<i64> = lignes
+            .iter()
+            .filter_map(|r| r.first().and_then(|x| x.as_i64()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Témoin de `requete_candidats(true)` : une piste qui n'a que des lignes
+    /// `balises` reste candidate de la passe « seulement les manquantes ».
+    #[test]
+    fn une_piste_aux_seuls_credits_de_balises_reste_candidate_des_manquantes() {
+        let state = pistes_aux_credits_de_sources_diverses();
+        let lus = state
+            .backend
+            .query_many(&requete_candidats(true), &[])
+            .unwrap();
+        assert_eq!(
+            ids(&lus),
+            vec![81],
+            "piste 81 « Blue in Green » : n'a que des crédits de balises, elle doit rester à faire \
+             (et les pistes 82, 83 déjà créditées, non)"
+        );
+    }
+
+    /// Témoin de `requete_candidats_auto` : même règle pour la passe
+    /// automatique.
+    #[test]
+    fn une_piste_aux_seuls_credits_de_balises_reste_candidate_de_la_passe_automatique() {
+        use tune_core::db::backend::ToSqlValue;
+        let state = pistes_aux_credits_de_sources_diverses();
+        let lus = state
+            .backend
+            .query_many(
+                &requete_candidats_auto(tune_core::db::engine::Engine::Sqlite),
+                &[&0i64 as &dyn ToSqlValue, &100i64 as &dyn ToSqlValue],
+            )
+            .unwrap();
+        assert_eq!(
+            ids(&lus),
+            vec![81],
+            "piste 81 « Blue in Green » : n'a que des crédits de balises, la passe automatique doit la prendre \
+             (et pas les pistes 82, 83 déjà créditées)"
+        );
     }
 }
 
