@@ -416,7 +416,7 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
             // Payant : greffon audio de #4861, ou greffon qui déclare son module
-            // (`TunePlugin::required_feature`, « Concerts »). Le nom du module suit,
+            // (`TunePlugin::required_feature`). Le nom du module suit,
             // pour que l'écran montre le cadenas AVANT le clic.
             "premium": tune_core::audio::premium_plugins::requires_premium(&info.name)
                 || info.required_feature.is_some(),
@@ -473,7 +473,7 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
             // Payant : greffon audio de #4861, ou greffon qui déclare son module
-            // (`TunePlugin::required_feature`, « Concerts »). Le nom du module suit,
+            // (`TunePlugin::required_feature`). Le nom du module suit,
             // pour que l'écran montre le cadenas AVANT le clic.
             "premium": tune_core::audio::premium_plugins::requires_premium(&info.name)
                 || info.required_feature.is_some(),
@@ -812,7 +812,7 @@ async fn get_plugin_brut(name: String, state: AppState) -> Json<Value> {
             "status": "loaded",
             "config_schema": info.config_schema,
             // Payant : greffon audio de #4861, ou greffon qui déclare son module
-            // (`TunePlugin::required_feature`, « Concerts »). Le nom du module suit,
+            // (`TunePlugin::required_feature`). Le nom du module suit,
             // pour que l'écran montre le cadenas AVANT le clic.
             "premium": tune_core::audio::premium_plugins::requires_premium(&info.name)
                 || info.required_feature.is_some(),
