@@ -1097,10 +1097,16 @@ impl TidalService {
         let mut items: Vec<serde_json::Value> = Vec::new();
         let mut total: Option<usize> = None;
         let mut derniere_page_pleine = false;
+        // #7729 — une page qui n'apporte aucun favori neuf (décalage ignoré
+        // ou qui stagne) arrête la lecture : sans cela, un service qui
+        // renvoie toujours la même page pleine, sans total, valait cent
+        // requêtes et dix mille doublons avant la première réponse.
+        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut offset = 0usize;
+        let mut stagne = false;
         for _ in 0..Self::PAGES_FAVORIS_MAX {
             // #7250 : le service peut plafonner la page sous la limite demandée.
             // Avancer du nombre reçu évite de sauter les favoris intermédiaires.
-            let offset = items.len();
             let data = self
                 .api_get(&format!(
                     "/users/{user_id}/favorites/{type_tidal}?limit={}&offset={offset}",
@@ -1109,7 +1115,26 @@ impl TidalService {
                 .await?;
             let lot = data["items"].as_array().cloned().unwrap_or_default();
             let recus = lot.len();
-            items.extend(lot);
+            offset += recus;
+            let avant = items.len();
+            for enveloppe in lot {
+                let cle = match &enveloppe["item"]["id"] {
+                    serde_json::Value::Null => enveloppe.to_string(),
+                    id => id.to_string(),
+                };
+                if vus.insert(cle) {
+                    items.push(enveloppe);
+                }
+            }
+            if recus > 0 && items.len() == avant {
+                stagne = true;
+                tracing::warn!(
+                    type_tidal,
+                    offset,
+                    "tidal_favoris_pagination_sans_progression"
+                );
+                break;
+            }
             total = data["totalNumberOfItems"].as_u64().map(|t| t as usize);
             let limite_servie = data["limit"]
                 .as_u64()
@@ -1126,6 +1151,10 @@ impl TidalService {
             }
         }
         let incomplete = match total {
+            _ if stagne => Some(format!(
+                "tidal: lecture des favoris « {type_tidal} » arrêtée, une page n'apportait aucun favori neuf ({} lus)",
+                items.len()
+            )),
             Some(t) if items.len() < t => Some(format!(
                 "tidal: lecture des favoris « {type_tidal} » incomplète ({} sur {t})",
                 items.len()
@@ -5322,6 +5351,102 @@ mod favoris_complets_5997 {
             .unwrap()
             .unwrap();
         assert_eq!(affichage.len(), 100);
+    }
+}
+
+/// #7729 — un TIDAL qui ignore le décalage renvoie toujours la même page
+/// pleine. La lecture des favoris doit s'arrêter dès la page sans favori
+/// neuf, sans doublons, et le miroir ne doit pas la prendre pour complète.
+#[cfg(test)]
+mod favoris_decalage_qui_stagne_7729 {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn faux_tidal_qui_stagne(
+        annoncer_total: Option<usize>,
+    ) -> (TidalService, Arc<AtomicUsize>) {
+        use axum::extract::State;
+        use axum::routing::get;
+        async fn favoris(
+            State((appels, total)): State<(Arc<AtomicUsize>, Option<usize>)>,
+        ) -> axum::Json<serde_json::Value> {
+            appels.fetch_add(1, Ordering::SeqCst);
+            // Toujours les 100 premiers, quel que soit `offset`.
+            let items: Vec<_> = (0..100)
+                .map(|i| {
+                    json!({"created": "2026-10-01T10:00:00.000+0000",
+                    "item": {"id": i + 1, "title": format!("piste {}", i + 1)}})
+                })
+                .collect();
+            let mut reponse = json!({"limit": 100, "offset": 0, "items": items});
+            if let Some(t) = total {
+                reponse["totalNumberOfItems"] = json!(t);
+            }
+            axum::Json(reponse)
+        }
+        let appels = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route("/users/7/favorites/tracks", get(favoris))
+            .with_state((appels.clone(), annoncer_total));
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let mut svc = TidalService::new();
+        svc.base_forcee = Some(format!("http://{adresse}"));
+        svc.user_id = Some(7);
+        svc.tokens = Mutex::new(TokenState {
+            access_token: Some("jeton-essai".into()),
+            refresh_token: None,
+            token_expires: None,
+        });
+        (svc, appels)
+    }
+
+    #[tokio::test]
+    async fn un_decalage_ignore_sans_total_arrete_la_lecture_7729() {
+        let (svc, appels) = faux_tidal_qui_stagne(None).await;
+        let affichage = svc
+            .get_user_favorites_dated("tracks")
+            .await
+            .expect("lecture des favoris")
+            .expect("favoris datés");
+        let requetes = appels.load(Ordering::SeqCst);
+        assert!(
+            requetes <= 2,
+            "#7729 : la pagination ne s'arrête pas sur un décalage qui stagne ({requetes} requêtes)"
+        );
+        assert_eq!(
+            affichage.len(),
+            100,
+            "#7729 : la même page relue a été empilée en doublons"
+        );
+        assert!(
+            svc.favoris_dates_complets("tracks").await.is_err(),
+            "#7729 : une lecture arrêtée faute de progression ne doit pas passer pour complète"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_decalage_ignore_avec_total_ne_rend_pas_de_doublons_7729() {
+        let (svc, appels) = faux_tidal_qui_stagne(Some(357)).await;
+        let types = svc.get_user_tracks().await.expect("favoris typés");
+        assert!(
+            appels.load(Ordering::SeqCst) <= 2,
+            "#7729 : la pagination continue sur une page déjà lue"
+        );
+        let mut ids: Vec<_> = types.iter().map(|t| t.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            types.len(),
+            "#7729 : des favoris en double ont été rendus"
+        );
     }
 }
 
