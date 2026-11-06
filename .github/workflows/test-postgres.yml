@@ -109,7 +109,9 @@ jobs:
     # du 01/09/2026 — le job tenait en 6 min 21 et 6 min 31 sur les deux
     # dernieres executions reelles, et `tune-server` ajoute une compilation
     # froide de ~4 min. Un plafond ne peut que faire echouer plus tot.
-    timeout-minutes: 75
+    # 100 depuis le 06/11 : les passages réussis du lot rc11 prenaient déjà
+    # 52 à 75 min, au ras du plafond de 75, qui a coupé #7989 à 75 min.
+    timeout-minutes: 100
 
     services:
       postgres:
@@ -130,11 +132,12 @@ jobs:
       CARGO_TERM_COLOR: always
       # Depuis le 05/11, GitHub arrête la machine en pleine compilation
       # (« The runner has received a shutdown signal », code 143) : la
-      # machine gratuite manque de mémoire et de disque sur ce job. Deux
-      # compilations à la fois au lieu de quatre, et pas d'informations de
-      # débogage : les tests n'en ont pas besoin, et c'est elles qui pèsent
-      # le plus en mémoire à l'édition de liens et sur le disque.
-      CARGO_BUILD_JOBS: "2"
+      # machine gratuite manque de mémoire et de disque sur ce job. Pas
+      # d'informations de débogage : les tests n'en ont pas besoin, et c'est
+      # elles qui pèsent le plus en mémoire à l'édition de liens et sur le
+      # disque. Trois compilations à la fois (deux, essayées le 05/11, ont
+      # dépassé le plafond de durée ; quatre est la valeur par défaut).
+      CARGO_BUILD_JOBS: "3"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
