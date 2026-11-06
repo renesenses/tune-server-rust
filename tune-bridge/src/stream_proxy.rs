@@ -236,7 +236,13 @@ pub fn reponse_relayee_comptee(resp: PendingResponse, comptage: Option<Comptage>
 
 /// En-tetes de la reponse du serveur qui passent jusqu'au navigateur. Tout le
 /// reste est retire. `content-type` passe par [`type_relaye`].
-const ENTETES_RELAYES: [&str; 7] = [
+///
+/// `content-encoding` (#7602) : une reponse d'API que le serveur a
+/// compressee parce que le navigateur l'acceptait
+/// (`api_proxy::ENTETE_ENCODAGES_ACCEPTES`). Sans lui, le navigateur
+/// recevrait du gzip qu'il ne saurait pas lire.
+const ENTETES_RELAYES: [&str; 8] = [
+    "content-encoding",
     "content-length",
     "content-range",
     "accept-ranges",

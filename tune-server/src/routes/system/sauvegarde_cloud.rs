@@ -42,6 +42,14 @@ fn erreur_site(e: sc::ErreurSite) -> Response {
             })),
         )
             .into_response(),
+        e @ sc::ErreurSite::TropVolumineux { octets, max_octets } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(
+                json!({ "error": "payload_too_large", "payload_bytes": octets,
+                "max_bytes": max_octets, "detail": e.to_string() }),
+            ),
+        )
+            .into_response(),
         sc::ErreurSite::Reseau(_) => erreur(StatusCode::BAD_GATEWAY, "cloud_unreachable"),
         sc::ErreurSite::Illisible => erreur(StatusCode::BAD_GATEWAY, "cloud_bad_response"),
     }

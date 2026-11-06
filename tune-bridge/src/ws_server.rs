@@ -136,23 +136,26 @@ pub async fn handle_server_ws(socket: WebSocket, state: Arc<RelayState>) {
 
     let (msg_tx, mut msg_rx) = mpsc::channel::<String>(256);
 
-    if let Err(reason) = state.register_server(
+    let generation = match state.register_server(
         register.server_id.clone(),
         register.server_name.clone(),
         register.bridge_token,
         cle_serveur,
         msg_tx,
     ) {
-        // Log the server_id and reason, never the bridge_token.
-        warn!(server_id = %register.server_id, reason, "register rejected");
-        let reject = serde_json::json!({
-            "type": "relay.registered",
-            "ok": false,
-            "error": reason
-        });
-        let _ = ws_tx.send(Message::Text(reject.to_string().into())).await;
-        return;
-    }
+        Ok(generation) => generation,
+        Err(reason) => {
+            // Log the server_id and reason, never the bridge_token.
+            warn!(server_id = %register.server_id, reason, "register rejected");
+            let reject = serde_json::json!({
+                "type": "relay.registered",
+                "ok": false,
+                "error": reason
+            });
+            let _ = ws_tx.send(Message::Text(reject.to_string().into())).await;
+            return;
+        }
+    };
 
     let ack = protocol::RelayRegistered {
         msg_type: "relay.registered",
@@ -179,8 +182,11 @@ pub async fn handle_server_ws(socket: WebSocket, state: Arc<RelayState>) {
                 break;
             }
         }
-        // If writer dies, unregister
-        state_writer.unregister_server(&server_id_writer);
+        // Le canal se ferme aussi quand une nouvelle inscription du meme
+        // serveur a remplace celle-ci (#7833) : on ferme alors cette
+        // connexion, et on ne desinscrit que si elle est encore la sienne.
+        let _ = ws_tx.close().await;
+        state_writer.unregister_server_si(&server_id_writer, generation);
     });
 
     // Reader loop: server WS → relay
@@ -206,18 +212,27 @@ pub async fn handle_server_ws(socket: WebSocket, state: Arc<RelayState>) {
                 }
             }
             _ = heartbeat_interval.tick() => {
-                if let Some(conn) = state.servers.get(&server_id)
-                    && conn.last_heartbeat.elapsed() > heartbeat_timeout {
-                        warn!(server_id = %server_id, "heartbeat timeout");
+                match state.servers.get(&server_id) {
+                    Some(conn) if conn.generation == generation => {
+                        if conn.last_heartbeat.elapsed() > heartbeat_timeout {
+                            warn!(server_id = %server_id, "heartbeat timeout");
+                            break;
+                        }
+                    }
+                    // Remplacee ou retiree (#7833) : cette connexion ne
+                    // porte plus rien, elle ne doit pas rester ouverte.
+                    _ => {
+                        info!(server_id = %server_id, "server connection superseded");
                         break;
                     }
+                }
             }
         }
     }
 
     // Cleanup
     writer_handle.abort();
-    state.unregister_server(&server_id);
+    state.unregister_server_si(&server_id, generation);
     info!(server_id = %server_id, "server disconnected");
 }
 
