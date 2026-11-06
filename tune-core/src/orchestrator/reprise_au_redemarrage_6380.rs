@@ -300,16 +300,36 @@ async fn reprise_fabien_7280_titre_seul_navigateur_garde_sa_position_sans_fausse
         orch.signaler_lecture_navigateur(zone_id, &sid, 12500).await,
         super::SignalDuLecteur::RienEnAttente
     );
+    // #7852 : l'écoute (et sa reprise) n'est écrite qu'au seuil de 30 s, au
+    // tour du sondeur ; 12,5 s n'y suffisent pas.
+    assert!(!orch.valider_l_ecoute(&orch.playback.get_state(zone_id).await));
+    assert!(
+        crate::db::listening_resume::recent(&orch.db, Some(zone_id), 10)
+            .unwrap()
+            .is_empty(),
+        "#7852 : sous le seuil, pas d'entrée « Reprendre l'écoute »"
+    );
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 30_500)
+            .await,
+        super::SignalDuLecteur::RienEnAttente
+    );
+    assert!(orch.valider_l_ecoute(&orch.playback.get_state(zone_id).await));
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 32_500)
+            .await,
+        super::SignalDuLecteur::RienEnAttente
+    );
     assert_eq!(
         crate::db::listening_resume::recent(&orch.db, Some(zone_id), 10).unwrap()[0].position_ms,
-        12500,
+        32500,
         "la reprise doit conserver la position mesurée après confirmation, pas la position initiale"
     );
     orch.signaler_lecture_navigateur(zone_id, "ancien-flux", 99000)
         .await;
     assert_eq!(
         crate::db::listening_resume::recent(&orch.db, Some(zone_id), 10).unwrap()[0].position_ms,
-        12500,
+        32500,
         "un ancien flux ne déplace pas la reprise courante"
     );
     let count = orch

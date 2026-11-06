@@ -687,6 +687,36 @@ fn string_similarity(a: &str, b: &str) -> f64 {
     common as f64 / max_len as f64
 }
 
+/// [`GENRE_COMBLE_PAR_L_ENRICHISSEMENT`] en littéral, pour les `concat!` des
+/// requêtes constantes (partage communautaire).
+macro_rules! genre_comble_par_l_enrichissement {
+    () => {
+        "COALESCE(genre, CASE WHEN COALESCE(genres, '') IN ('', '[]') \
+         THEN COALESCE((SELECT NULLIF(a.genre, '') FROM albums a WHERE a.id = tracks.album_id), ?) \
+         END)"
+    };
+}
+pub(crate) use genre_comble_par_l_enrichissement;
+
+/// #7538 — l'expression `SET genre = …` de TOUT enrichissement automatique
+/// (MusicBrainz, partage communautaire) : un `?`, le genre proposé.
+///
+/// « Un genre "Jazz" devient "Latin Jazz" » (Jean-François Paquet, 30/10).
+/// `COALESCE(genre, ?)` ne comblait que la colonne, et deux genres déjà là
+/// passaient à travers :
+///
+/// - le TABLEAU `tracks.genres` (multivaleur) : rempli, il porte les genres de
+///   la piste ; la colonne vide n'y est pas un trou à combler ;
+/// - le genre de l'ALBUM : une piste sans genre d'un album « Jazz » recevait
+///   le genre plus fin de MusicBrainz ou du nuage (« Latin Jazz »), puis
+///   montrait ce genre dans Oxygen (qui lit les pistes) à côté de « Jazz ».
+///   La piste prend désormais le genre de son album ; la proposition ne sert
+///   que si l'album n'en a aucun.
+///
+/// Le texte est le même sur SQLite et PostgreSQL ; la sous-requête est
+/// corrélée par le nom de la table (`UPDATE tracks`, sans alias).
+pub const GENRE_COMBLE_PAR_L_ENRICHISSEMENT: &str = genre_comble_par_l_enrichissement!();
+
 /// Ecrit en base ce qu'un enrichissement MusicBrainz vient de trouver pour UNE
 /// piste, puis remonte le resultat au niveau de son album.
 ///
@@ -726,15 +756,40 @@ pub fn write_track_enrichment(
     let isrc_val: Option<String> = details.isrc.clone();
     let mb_id_val: Option<String> = Some(mb_id.to_string());
 
+    // #7538 — une piste d'un dossier exclu de l'enrichissement n'est jamais
+    // touchée, ni elle ni (par elle) son album. Les passes écartent déjà ces
+    // pistes de leurs candidats ; ceci est la garde au point d'écriture.
+    let exclus = crate::taches_de_fond::perimetre::dossiers_exclus_de_l_enrichissement(backend);
+    if !exclus.is_empty() {
+        let chemin = backend
+            .query_one(
+                &format!(
+                    "SELECT {} FROM tracks WHERE id = ?",
+                    crate::taches_de_fond::perimetre::CHEMIN_OUVRABLE_DE_TRACKS
+                ),
+                &[&track_id as &dyn ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_string()));
+        if chemin.is_some_and(|c| {
+            crate::taches_de_fond::perimetre::exclu_de_l_enrichissement(&c, &exclus)
+        }) {
+            return Ok(0);
+        }
+    }
+
     let result = backend.execute(
-        "UPDATE tracks SET \
-         genre = COALESCE(genre, ?), \
-         year = COALESCE(year, ?), \
-         label = COALESCE(label, ?), \
-         composer = COALESCE(composer, ?), \
-         isrc = COALESCE(isrc, ?), \
-         musicbrainz_recording_id = COALESCE(musicbrainz_recording_id, ?) \
-         WHERE id = ?",
+        &format!(
+            "UPDATE tracks SET \
+             genre = {GENRE_COMBLE_PAR_L_ENRICHISSEMENT}, \
+             year = COALESCE(year, ?), \
+             label = COALESCE(label, ?), \
+             composer = COALESCE(composer, ?), \
+             isrc = COALESCE(isrc, ?), \
+             musicbrainz_recording_id = COALESCE(musicbrainz_recording_id, ?) \
+             WHERE id = ?"
+        ),
         &[
             &genre_val as &dyn ToSqlValue,
             &year_val as &dyn ToSqlValue,
@@ -1056,3 +1111,7 @@ mod tests {
         assert!(info.tags.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "exclusion_enrichissement_tests_7538.rs"]
+mod exclusion_enrichissement_tests_7538;

@@ -2215,6 +2215,36 @@ pub fn decode_vers_pcm_en_continu(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
 ) -> Result<(u16, u32), String> {
+    decode_vers_pcm_en_continu_depuis(
+        chemin,
+        source,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        0.0,
+    )
+}
+
+/// #7336 — [`decode_vers_pcm_en_continu`] à partir de `seek_s` secondes du
+/// fichier source (saut dans la piste d'une sortie qui consomme le flux
+/// elle-même : Sortie AES67). Même saut à l'échantillon près que les autres
+/// variantes ; une source qui ne sait pas sauter (corps HTTP lu en continu)
+/// repart du début, à l'appelant d'écarter les trames en trop.
+// Même signature que la variante sans saut, plus `seek_s` ; même choix que
+// decode_ape_streaming.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_vers_pcm_en_continu_depuis(
+    chemin: &str,
+    source: Option<Box<dyn MediaSource>>,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
     decode_to_pcm_streaming_inner(
         chemin,
         target_sample_rate,
@@ -2224,7 +2254,7 @@ pub fn decode_vers_pcm_en_continu(
         chunk_size,
         None,
         None,
-        0.0,
+        seek_s.max(0.0),
         source,
     )
 }
@@ -5760,6 +5790,26 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert!(!result.samples_i32.is_empty(), "MP3 should produce samples");
         assert_eq!(result.sample_rate, 44100);
         assert_eq!(result.channels, 2);
+    }
+
+    /// #7854 — un MP3 LAME décodé ne garde que ses échantillons utiles : le
+    /// délai du codeur en tête et le remplissage en fin sont rognés, sinon un
+    /// album enchaîné entend un blanc entre deux pistes. `test.mp3` porte
+    /// 40 trames de 1152 échantillons (46 080) et son en-tête LAME déclare
+    /// 576 de délai et 1404 de remplissage : il reste 44 100 échantillons par
+    /// canal, exactement 1 s à 44,1 kHz.
+    #[test]
+    fn decode_mp3_rogne_delai_et_remplissage_lame_7854() {
+        let path = fixture_path("test.mp3");
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert_eq!(result.sample_rate, 44100);
+        assert_eq!(result.channels, 2);
+        let trames = result.samples_i32.len() / result.channels as usize;
+        assert_eq!(
+            trames, 44_100,
+            "MP3 sans blanc : 44 100 échantillons utiles par canal attendus, \
+             {trames} décodés (46 080 = délai codeur et remplissage LAME non rognés)"
+        );
     }
 
     #[test]

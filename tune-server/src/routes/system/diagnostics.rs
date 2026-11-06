@@ -162,6 +162,83 @@ fn bug_report_url(state: &AppState) -> String {
 /// The community endpoint caps the thread body at 50k chars; keep headroom.
 const BUG_REPORT_MAX_BODY_CHARS: usize = 49_000;
 
+/// Ramène le corps du fil sous la limite du site en retirant les lignes de
+/// journal les PLUS ANCIENNES (#7468).
+///
+/// La section « Recent Logs » est la dernière du rapport et ses lignes vont de
+/// la plus ancienne à la plus récente : couper la fin du texte (ce que faisait
+/// `.take(N)`) retirait l'instant même du défaut signalé. On garde donc l'en-tête
+/// du rapport et la fin du journal, et une phrase dit ce qui a été retiré et
+/// quelle période reste présente. Sans section de journal reconnaissable, repli
+/// sur l'ancienne coupe de la fin, signalée aussi.
+fn couper_le_rapport(complet: &str, max: usize) -> String {
+    if complet.chars().count() <= max {
+        return complet.to_string();
+    }
+    let repli = || {
+        let garde: String = complet.chars().take(max).collect();
+        format!("{garde}\n\n_…report truncated…_")
+    };
+    let Some(debut_section) = complet.rfind("\n## Recent Logs") else {
+        return repli();
+    };
+    let section = &complet[debut_section..];
+    let Some(ouverture) = section.find("```\n") else {
+        return repli();
+    };
+    let apres_ouverture = debut_section + ouverture + 4;
+    let Some(fermeture) = complet[apres_ouverture..].rfind("\n```") else {
+        return repli();
+    };
+    let fin_journal = apres_ouverture + fermeture;
+    let avant = &complet[..debut_section + ouverture];
+    let lignes: Vec<&str> = complet[apres_ouverture..fin_journal].lines().collect();
+    let suite = &complet[fin_journal..];
+
+    // Phrase de coupe : sa longueur est majorée avant de savoir combien de
+    // lignes partent (le nombre y tient sur autant de chiffres que le total).
+    let phrase = |retirees: usize, restantes: &[&str]| {
+        let periode = periode_couverte(&restantes.join("\n"))
+            .map(|p| format!(" ; période conservée : {p}"))
+            .unwrap_or_default();
+        format!(
+            "_Rapport raccourci pour tenir dans la limite du site : les {retirees} lignes de journal les plus anciennes sur {} ont été retirées{periode}._\n",
+            lignes.len()
+        )
+    };
+    let fixe = avant.chars().count()
+        + suite.chars().count()
+        + phrase(lignes.len(), &lignes).chars().count()
+        + 5;
+    let Some(budget) = max.checked_sub(fixe) else {
+        return repli();
+    };
+    // On retire par l'avant jusqu'à tenir.
+    let mut taille: usize = lignes.iter().map(|l| l.chars().count() + 1).sum();
+    let mut premiere = 0;
+    while taille > budget && premiere < lignes.len() {
+        taille -= lignes[premiere].chars().count() + 1;
+        premiere += 1;
+    }
+    let restantes = &lignes[premiere..];
+    format!(
+        "{avant}{}```\n{}{suite}",
+        phrase(premiere, restantes),
+        restantes.join("\n")
+    )
+}
+
+/// Le `User-Agent` du client, borné et sans caractère de contrôle, pour tenir
+/// sur une ligne du rapport (#7468).
+fn navigateur_lisible(brut: &str) -> String {
+    brut.chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Relevé de la famine de l'anneau audio, sortie par sortie (#3205).
 ///
 /// Ce qui est compté : un rappel du pilote à qui l'anneau a rendu MOINS
@@ -271,7 +348,8 @@ fn ligne_famine(output_id: &str, etat: EtatDuReleve<'_>) -> Option<Value> {
         EtatDuReleve::Occupee => Some(json!({
             "output_id": output_id,
             "mesure": "indisponible",
-            "raison": "sortie verrouillée au moment du relevé (elle jouait, ou le sondeur la lisait)",
+            "raison": crate::message_api::texte("api.diagnostics.outputLocked", &[]),
+            "raison_key": "api.diagnostics.outputLocked",
         })),
         EtatDuReleve::Mesure { nom, famine } => Some(json!({
             "output_id": output_id,
@@ -713,12 +791,8 @@ fn groupe_json(motif: &str, cle: &str, zones: &[&ZoneVue]) -> Value {
         "cle": cle,
         "en_ligne": en_ligne,
         "fusionnable": fusionnable,
-        "fusion_refusee_motif": (!fusionnable).then_some(
-            "deux protocoles de découverte différents sur le même hôte : \
-             SSDP/DLNA et mDNS/AirPlay n'ont aucun identifiant commun, et la \
-             fusion serait refusée (409 zones_distinctes). Supprimez la zone \
-             dont vous ne voulez pas ; ses réglages ne sont pas reportés.",
-        ),
+        "fusion_refusee_motif": (!fusionnable)
+            .then(|| crate::message_api::texte("api.diagnostics.mergeRefusedDifferentProtocols", &[])),
         "zones": zones.iter().map(|z| json!({
             "id": z.id,
             "name": z.name,
@@ -839,8 +913,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
             // dans le greffon ALSA de PipeWire ne doit pas figer le serveur.
             // #6119 — jamais pendant qu'une sortie locale joue : la page Zones
             // charge cette fiche, et sonder ASIO y coupait la lecture WASAPI.
+            // #7263 — et pas un inventaire complet par appel : l'écran « État du
+            // serveur » interroge cette fiche toutes les 5 s ; le parc publié de
+            // moins de 5 min suffit pour en donner les noms.
             let devs: Vec<String> =
-                crate::background::parc_local_sans_couper_la_lecture(&state, || {
+                crate::background::parc_local_pour_le_diagnostic(&state, || {
                     tune_core::outputs::local::list_audio_devices_with_backend_bounded(
                         audio_backend_pref,
                     )
@@ -2259,6 +2336,9 @@ fn lignes_zones_masquees(
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
+    tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    ));
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
@@ -2293,11 +2373,32 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let zone_count = zone_repo.count().unwrap_or(0);
     let zone_settings_ignored = tune_core::db::zone_repo::zone_settings_ignored();
     let asio_warm_scan = crate::startup::asio_warm_status();
+    // #7841 — la ligne Markdown du volume de chaque zone, dans l'ordre de
+    // `zones`.
+    let mut zones_volume_md: Vec<Option<String>> = Vec::new();
     let zones: Vec<Value> = zone_repo
         .list()
         .unwrap_or_default()
         .iter()
-        .map(|z| json!({ "id": z.id, "name": z.name, "output_type": z.output_type }))
+        .map(|z| {
+            // #7841 — le trim et les limites de la zone, pour qu'un rapport
+            // suffise à dire pourquoi un volume de 30 ne s'entend plus.
+            let volume = z.id.map(|id| {
+                tune_core::audio::volume_au_rapport::lire(
+                    &state.backend,
+                    id,
+                    z.volume / 100.0,
+                    z.output_type.as_deref().unwrap_or(""),
+                )
+            });
+            zones_volume_md.push(volume.as_ref().map(|v| v.ligne_markdown()));
+            json!({
+                "id": z.id,
+                "name": z.name,
+                "output_type": z.output_type,
+                "volume": volume,
+            })
+        })
         .collect();
     // #6378 — `count()` et `list()` ignorent les zones masquées : sans cette
     // lecture, « Zones (0) » ne distingue pas « aucune zone » de « la seule
@@ -2497,12 +2598,15 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push('\n');
 
     md.push_str(&format!("## Zones ({zone_count})\n"));
-    for z in &zones {
+    for (i, z) in zones.iter().enumerate() {
         md.push_str(&format!(
             "- {} ({})\n",
             z["name"].as_str().unwrap_or("?"),
             z["output_type"].as_str().unwrap_or("?")
         ));
+        if let Some(Some(volume)) = zones_volume_md.get(i) {
+            md.push_str(&format!("  - {volume}\n"));
+        }
     }
     md.push_str(&lignes_zones_masquees(&zones_masquees));
     md.push_str(&format!(
@@ -3143,6 +3247,14 @@ pub(super) async fn submit_bug_report(
     use axum::RequestExt;
     use axum::response::IntoResponse;
 
+    // #7468 — le navigateur du client qui envoie : déjà dans la requête.
+    let navigateur = req
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(navigateur_lisible)
+        .filter(|s| !s.is_empty());
+
     let est_multipart = req
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -3172,7 +3284,7 @@ pub(super) async fn submit_bug_report(
         }
     };
 
-    let (code, corps) = envoyer_le_rapport(state, description, images).await;
+    let (code, corps) = envoyer_le_rapport(state, description, images, navigateur).await;
     let mut resp = (code, Json(&corps)).into_response();
     // #5068 — le délai du site, aussi sous sa forme standard.
     if let Some(secs) = corps.get("retry_after").and_then(Value::as_u64) {
@@ -3194,6 +3306,7 @@ async fn envoyer_le_rapport(
     state: AppState,
     description: String,
     images: Vec<CaptureJointe>,
+    navigateur: Option<String>,
 ) -> (axum::http::StatusCode, Value) {
     use axum::http::StatusCode;
 
@@ -3221,6 +3334,10 @@ async fn envoyer_le_rapport(
     }
 
     // Compose the thread body: the user's own words first, then diagnostics.
+    let report_md = match &navigateur {
+        Some(n) => format!("**Navigateur de l'interface** : {n}\n\n{report_md}"),
+        None => report_md,
+    };
     let full_markdown = if description.is_empty() {
         report_md
     } else {
@@ -3238,17 +3355,14 @@ async fn envoyer_le_rapport(
         .map(|l| format!("Bug: {}", l.chars().take(80).collect::<String>()))
         .unwrap_or_else(|| format!("Bug report — Tune {version} ({platform})"));
 
-    // The site caps the body at 50k chars — truncate the tail (oldest logs) if
-    // the report runs long rather than getting rejected wholesale.
-    let body_md = if full_markdown.chars().count() > BUG_REPORT_MAX_BODY_CHARS {
-        let kept: String = full_markdown
-            .chars()
-            .take(BUG_REPORT_MAX_BODY_CHARS)
-            .collect();
-        format!("{kept}\n\n_…report truncated…_")
-    } else {
-        full_markdown
-    };
+    // The site caps the body at 50k chars. On retire les lignes de journal les
+    // plus ANCIENNES (#7468) : le défaut est dans les dernières minutes.
+    // Le diagnostic est déjà nettoyé (`generate_bug_report`). Les mots du
+    // testeur, le résumé joint et le titre passent par la porte commune des
+    // identifiants d'accès distant : un lien ou un journal collé y passe aussi.
+    let full_markdown = tune_core::confidentialite::masquer_acces_distant(&full_markdown);
+    let title = tune_core::confidentialite::masquer_acces_distant(&title);
+    let body_md = couper_le_rapport(&full_markdown, BUG_REPORT_MAX_BODY_CHARS);
 
     let instance_id = tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
         .get("instance_id")
@@ -3460,7 +3574,8 @@ pub(super) async fn rearm_asio_warm_scan(
             Json(json!({
                 "status": "rearmed",
                 "retry": "next_restart",
-                "message": "Le balayage ASIO sera retenté une fois au prochain démarrage de Tune.",
+                "message": crate::message_api::texte("api.asio.rearmed", &[]),
+                "message_key": "api.asio.rearmed",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3469,7 +3584,8 @@ pub(super) async fn rearm_asio_warm_scan(
             Json(json!({
                 "status": "already_ready",
                 "retry": "next_restart",
-                "message": "Le balayage ASIO est déjà autorisé au prochain démarrage.",
+                "message": crate::message_api::texte("api.asio.alreadyReady", &[]),
+                "message_key": "api.asio.alreadyReady",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3477,7 +3593,8 @@ pub(super) async fn rearm_asio_warm_scan(
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "asio_warm_scan_disabled_by_env",
-                "message": "Retirez TUNE_DISABLE_ASIO_SCAN puis redémarrez Tune ; le réarmement ne contourne pas ce coupe-circuit.",
+                "message": crate::message_api::texte("api.asio.disabledByEnv", &[]),
+                "message_key": "api.asio.disabledByEnv",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3485,7 +3602,8 @@ pub(super) async fn rearm_asio_warm_scan(
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({
                 "error": "asio_not_supported",
-                "message": "Le préchauffage ASIO ne concerne que Windows.",
+                "message": crate::message_api::texte("api.asio.windowsOnly", &[]),
+                "message_key": "api.asio.windowsOnly",
                 "asio_warm_scan": crate::startup::asio_warm_status(),
             })),
         ),
@@ -3631,12 +3749,11 @@ pub(super) async fn api_insights(State(state): State<AppState>) -> Json<Value> {
                 "severity": "warning",
                 "type": "zone_playback_beyond_duration",
                 "zone_id": zone_id,
-                "message": format!(
-                    "Zone {zone_id} : l'appareil annonce toujours la lecture alors que la \
-                     position a atteint la fin de la piste. Soit la lecture est bloquee, soit \
-                     la duree connue est fausse — voir lecture_annoncee_au_dela_de_la_duree \
-                     dans le journal."
+                "message": crate::message_api::texte(
+                    "api.diagnostics.playbackBeyondDuration",
+                    &[("zone_id", zone_id.to_string())],
                 ),
+                "message_key": "api.diagnostics.playbackBeyondDuration",
             }));
         }
     }
@@ -3700,6 +3817,11 @@ pub(super) async fn api_docs() -> Json<Value> {
         ("POST", "/system/import/roon", "Import from Roon"),
         ("POST", "/system/import/jriver", "Import from JRiver XML"),
         ("POST", "/system/import/plex", "Import from Plex"),
+        (
+            "POST",
+            "/system/import/m3u-plays",
+            "Add N plays to every track of an m3u list (?plays=N, ?preview=true)",
+        ),
         // Library
         (
             "GET",
@@ -3871,6 +3993,62 @@ mod log_tail_tests {
             Err(LogTailError::Missing) => {}
             _ => panic!("expected Missing"),
         }
+    }
+
+    #[test]
+    fn la_coupe_du_rapport_retire_les_lignes_les_plus_anciennes() {
+        let lignes: Vec<String> = (0..2000)
+            .map(|i| {
+                format!(
+                    "2026-10-29T12:{:02}:{:02} INFO ligne-{i:04}",
+                    i / 60 % 60,
+                    i % 60
+                )
+            })
+            .collect();
+        let rapport = format!(
+            "description\n\n---\n\n# Bug Report\n- Version: x\n\n## Recent Logs (3000 dernières lignes)\n```\n{}\n```\n",
+            lignes.join("\n")
+        );
+        let max = 10_000;
+        assert!(rapport.chars().count() > max);
+        let coupe = couper_le_rapport(&rapport, max);
+        assert!(coupe.chars().count() <= max, "{}", coupe.chars().count());
+        // l'en-tête reste, la fin du journal reste, le début part
+        assert!(coupe.contains("# Bug Report"));
+        assert!(
+            coupe.contains("ligne-1999"),
+            "la ligne la plus récente doit rester"
+        );
+        assert!(
+            !coupe.contains("ligne-0000"),
+            "la plus ancienne doit partir"
+        );
+        assert!(coupe.contains("lignes de journal les plus anciennes"));
+        assert!(coupe.contains("période conservée"));
+        assert!(!coupe.contains("report truncated"));
+        assert!(coupe.trim_end().ends_with("```"));
+    }
+
+    #[test]
+    fn la_coupe_du_rapport_ne_touche_pas_un_rapport_court() {
+        let r = "court\n## Recent Logs\n```\na\n```\n";
+        assert_eq!(couper_le_rapport(r, 49_000), r);
+    }
+
+    #[test]
+    fn la_coupe_sans_section_de_journal_garde_le_repli() {
+        let r = "x".repeat(300);
+        let c = couper_le_rapport(&r, 100);
+        assert!(c.starts_with(&"x".repeat(100)));
+        assert!(c.contains("report truncated"));
+    }
+
+    #[test]
+    fn le_navigateur_est_borne_et_sans_controle() {
+        let n = navigateur_lisible(&format!("Mozilla\n\t{}", "a".repeat(500)));
+        assert!(n.chars().count() <= 200);
+        assert!(!n.contains('\n'));
     }
 
     #[test]
@@ -5284,5 +5462,59 @@ mod tests_bridage_leve_6713 {
         // Température lisible : rien à dire, réglage ou non.
         assert_eq!(repartir_le_bridage(None, true), (None, None));
         assert_eq!(repartir_le_bridage(None, false), (None, None));
+    }
+}
+
+/// #7841 — Linn Klimax en OpenHome : « à 30, plus de son ». Le rapport ne
+/// disait de chaque zone que son nom et son type ; un trim de −12 dB ou une
+/// limite de sécurité, qui font partir 30 % bien plus bas, n'y paraissaient
+/// pas. L'épreuve lit le rapport tel que le testeur le colle (Markdown) et
+/// son JSON.
+#[cfg(test)]
+mod volume_des_zones_au_rapport_7841 {
+    use super::*;
+    use tune_core::db::zone_repo::ZoneRepo;
+
+    #[tokio::test]
+    async fn le_rapport_dit_le_trim_et_la_limite_de_chaque_zone() {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("AppState");
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = repo
+            .create("Klimax", Some("openhome"), Some("uuid:linn-7841"))
+            .unwrap();
+        repo.update_volume(zone_id, 30.0).unwrap();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .set(&format!("zone_{zone_id}_gain_trim_db"), "-12")
+            .unwrap();
+        settings
+            .set(
+                &tune_core::audio::volume_limites::cle_securite(zone_id),
+                "0.25",
+            )
+            .unwrap();
+
+        let Json(rapport) = generate_bug_report(State(state)).await;
+
+        let md = rapport["markdown"].as_str().unwrap_or_default();
+        let ligne = md
+            .lines()
+            .find(|l| l.contains("gain trim"))
+            .unwrap_or_else(|| panic!("#7841 : aucune ligne de trim dans le rapport :\n{md}"));
+        for attendu in [
+            "volume 30 %",
+            "gain trim -12.0 dB",
+            "safety limit 25 %",
+            "device setpoint 7.5 %",
+        ] {
+            assert!(ligne.contains(attendu), "{attendu} absent de : {ligne}");
+        }
+        let zone = rapport["zones"]["items"]
+            .as_array()
+            .and_then(|z| z.iter().find(|z| z["id"] == json!(zone_id)))
+            .cloned()
+            .expect("la zone dans le JSON du rapport");
+        assert_eq!(zone["volume"]["gain_trim_db"], json!(-12.0));
+        assert_eq!(zone["volume"]["limite_securite"], json!(0.25));
     }
 }

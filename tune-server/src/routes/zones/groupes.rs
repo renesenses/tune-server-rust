@@ -177,7 +177,13 @@ pub(super) async fn create_group(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let id = groups.len() as i64 + 1;
+    // #7937 — une zone n'appartient qu'à UN groupe : celles du nouveau
+    // quittent les précédents. Sans cela l'ancien groupe survivait au
+    // nouveau (le client web regroupe sans dégrouper d'abord), et défaire
+    // l'un laissait l'autre — le groupe « revenait ».
+    use tune_core::zones::groupes_enregistres::{prochain_numero, retirer_les_zones};
+    retirer_les_zones(&mut groups, &zone_ids);
+    let id = prochain_numero(&groups);
     let group = json!({
         "id": id,
         "group_id": id.to_string(),

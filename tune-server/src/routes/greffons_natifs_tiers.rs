@@ -12,9 +12,14 @@
 //!   UNE ligne de réglages par greffon, `{ id, name, settings, created_at }`,
 //!   sans migration. Un profil se choisit, il ne s'applique pas ici : le
 //!   client envoie ses `settings` au `PUT` de la zone.
+//! - `POST /audio-plugins/{id}/diagnostics` : ce que le greffon calcule pour
+//!   un réglage (ses diagnostics), sans rien enregistrer ni jouer — une
+//!   grandeur que seul le greffon sait calculer, qu'un écran de réglage
+//!   affiche. L'hôte la relaie telle quelle.
 //!
-//! Droits : lire est libre ; écrire demande le Premium (un greffon natif tiers
-//! n'a jamais de droit gratuit) ET le greffon installé, activé et chargé.
+//! Droits : lire est libre (diagnostics compris : ils ne changent rien) ;
+//! écrire demande le Premium (un greffon natif tiers n'a jamais de droit
+//! gratuit) ET le greffon installé, activé et chargé.
 //! Les quatre emplacements intégrés gardent leurs propres routes.
 
 use axum::extract::{Path, State};
@@ -135,6 +140,39 @@ pub async fn regler_la_zone(
         "applied_live": applied_live,
     }))
     .into_response())
+}
+
+/// `POST /audio-plugins/{id}/diagnostics` — corps : un JSON de réglages du
+/// greffon. Rend `{ plugin, diagnostics }`, ce que le greffon calcule pour ce
+/// réglage, sans rien enregistrer ni toucher à la lecture. Le greffon doit
+/// être chargé (409 sinon) ; un réglage qu'il refuse rend 400
+/// `invalid_plugin_settings`, comme le `PUT`. Le calcul appartient au
+/// greffon et peut durer : il tourne hors du fil de l'exécuteur.
+pub async fn diagnostics_du_reglage(
+    Path(id): Path<String>,
+    Json(reglage): Json<Value>,
+) -> Response {
+    if !connu(&id) {
+        return inconnu(&id);
+    }
+    if natifs_tiers::fournisseur_dsp(&id).is_none() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "plugin_not_loaded", "plugin": id})),
+        )
+            .into_response();
+    }
+    let calcul = {
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || natifs_tiers::diagnostics_du_reglage(&id, &reglage))
+    };
+    match calcul.await {
+        Ok(Ok(diagnostics)) => {
+            Json(json!({"plugin": id, "diagnostics": diagnostics})).into_response()
+        }
+        Ok(Err(detail)) => refus_du_greffon(detail),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 fn charger(state: &AppState, id: &str) -> Vec<Value> {

@@ -85,10 +85,11 @@ pub(super) async fn albums_manquants(
             tracing::warn!(artist_id = id, erreur = %e, "albums_manquants_bibliotheque_illisible_6288");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "code": CODE_BIBLIOTHEQUE_ILLISIBLE,
-                    "error": "la bibliothèque n'a pas pu être lue : aucune comparaison n'est faite",
-                })),
+                Json(crate::message_api::corps_refus(
+                    CODE_BIBLIOTHEQUE_ILLISIBLE,
+                    "api.library.readFailedNoComparison",
+                    &[],
+                )),
             )
                 .into_response();
         }

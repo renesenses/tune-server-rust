@@ -229,8 +229,12 @@ pub(crate) struct EtatDuLancement {
     pub armee: bool,
     /// L'utilisateur a suspendu la passe (`/background-tasks/replaygain/pause`).
     pub en_pause: bool,
-    /// Une campagne est ouverte (`progression::releve().actif`).
-    pub campagne_ouverte: bool,
+    /// La passe DÉCODE en ce moment : campagne ouverte ET rang ReplayGain au
+    /// travail — la source de `working` et de la carte « en cours » (#7724).
+    /// Une campagne seulement ouverte ne suffit pas : elle le reste quand la
+    /// passe cède à la lecture, à la garde thermique, à la plage dynamique
+    /// « En premier », ou après une requête de candidates en échec.
+    pub au_travail: bool,
     /// Pistes que la passe prendrait maintenant.
     pub candidates: i64,
     /// La zone qui joue, s'il y en a une : la passe lui cède (#1310).
@@ -258,7 +262,7 @@ pub(crate) fn decider_le_lancement(e: &EtatDuLancement) -> (axum::http::StatusCo
             false,
         );
     }
-    if e.campagne_ouverte {
+    if e.au_travail {
         return (
             StatusCode::CONFLICT,
             json!({"status": "already_running"}),
@@ -300,7 +304,10 @@ pub(crate) fn decider_le_lancement(e: &EtatDuLancement) -> (axum::http::StatusCo
 /// Même contrat que `POST /system/dynamic-range/analyze` :
 /// - **202** `{"status":"started","candidates":n,"waiting_reason":null|"playback","playing_zone":…}` ;
 /// - **200** `{"status":"nothing_to_do","candidates":0}` ;
-/// - **409** `{"status":"already_running"}` : une campagne est ouverte ;
+/// - **409** `{"status":"already_running"}` : la passe décode en ce moment
+///   (`working`). Une campagne restée ouverte sans personne au travail n'est
+///   pas un refus (#7724) : sans candidate elle est refermée (200
+///   `nothing_to_do`), sinon la boucle est réveillée (202) ;
 /// - **409** `{"status":"refused","reason":"analysis_disabled"|"paused"}`.
 pub(crate) async fn replaygain_analyze(
     State(state): State<AppState>,
@@ -310,10 +317,15 @@ pub(crate) async fn replaygain_analyze(
 
     let armee = rg::analysis_enabled(&state.backend);
     let en_pause = est_en_pause(Tache::ReplayGain);
-    let campagne_ouverte = rg::progression::releve().actif;
+    // #7724 — même lecture que `working` de `/system/replaygain/progress` :
+    // la carte disait « au repos » pendant que « Lancer » répondait « tourne
+    // déjà », sur une campagne ouverte que plus personne ne faisait avancer.
+    let au_travail = rg::progression::releve().actif
+        && tune_core::taches_de_fond::ordre::rang_au_travail()
+            == Some(tune_core::taches_de_fond::ordre::Rang::ReplayGain);
     // Le COUNT parcourt `tracks` : compté seulement quand il peut décider, et
     // hors des fils de l'exécuteur.
-    let (candidates, zone_qui_joue) = if armee && !en_pause && !campagne_ouverte {
+    let (candidates, zone_qui_joue) = if armee && !en_pause && !au_travail {
         let backend = state.backend.clone();
         tokio::task::spawn_blocking(move || {
             (
@@ -329,10 +341,16 @@ pub(crate) async fn replaygain_analyze(
     let (statut, corps, reveiller) = decider_le_lancement(&EtatDuLancement {
         armee,
         en_pause,
-        campagne_ouverte,
+        au_travail,
         candidates,
         zone_qui_joue,
     });
+    if corps["status"] == "nothing_to_do" {
+        // #7724 — plus rien à mesurer : une campagne restée ouverte est
+        // refermée, sans quoi `active` et `remaining` continueraient d'annoncer
+        // une passe en cours. Sans effet si elle l'est déjà.
+        rg::progression::au_repos();
+    }
     if reveiller {
         rg::reessai::reveiller_la_cascade();
     }

@@ -28,6 +28,14 @@ pub struct OpenHomeOutput {
     event_sub_ids: tokio::sync::Mutex<Vec<String>>,
     client: Client,
     current_oh_id: tokio::sync::Mutex<Option<u32>>,
+    /// #6753 — les entrées que `set_next_media` a rangées dans la liste du
+    /// renderer et qu'il n'a pas encore atteintes. Une pause ou un arrêt les
+    /// retire : sinon le renderer les enchaîne seul après les pistes qu'un
+    /// autre point de contrôle (Kazoo) a insérées dans la même liste.
+    pending_next_oh_ids: tokio::sync::Mutex<Vec<u32>>,
+    /// #7841 — l'échelle de volume du renderer, partagée avec son
+    /// [`EnvoiDeVolume`] (voir [`EnvoiDeVolume::echelle`]).
+    echelle_de_volume: Arc<tokio::sync::OnceCell<Option<EchelleDeVolume>>>,
 }
 
 impl OpenHomeOutput {
@@ -64,6 +72,8 @@ impl OpenHomeOutput {
                 .build()
                 .unwrap_or_default(),
             current_oh_id: tokio::sync::Mutex::new(None),
+            pending_next_oh_ids: tokio::sync::Mutex::new(Vec::new()),
+            echelle_de_volume: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -93,55 +103,27 @@ impl OpenHomeOutput {
         action: &str,
         args: &[(&str, &str)],
     ) -> Result<String, String> {
-        let mut body_args = String::new();
-        for (k, v) in args {
-            let escaped = quick_xml::escape::escape(*v);
-            body_args.push_str(&format!("<{k}>{escaped}</{k}>"));
-        }
+        appel_soap(&self.client, &self.name, url, service_type, action, args)
+            .await
+            .map(|(_, texte)| texte)
+    }
 
-        let envelope = format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-  <s:Body>
-    <u:{action} xmlns:u="{service_type}">
-      {body_args}
-    </u:{action}>
-  </s:Body>
-</s:Envelope>"#
-        );
-
-        let soap_action = format!("{service_type}#{action}");
-        let mut last_err = String::new();
-
-        for attempt in 0..=SOAP_MAX_RETRIES {
-            if attempt > 0 {
-                let delay = 200 * (1 << (attempt - 1));
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                debug!(device = %self.name, action, attempt, "oh_soap_retry");
-            }
-
-            match self
-                .client
-                .post(url)
-                .header("Content-Type", r#"text/xml; charset="utf-8""#)
-                .header("SOAPAction", format!("\"{soap_action}\""))
-                .body(envelope.clone())
-                .send()
-                .await
-            {
-                Ok(resp) => match resp.text().await {
-                    Ok(text) => return Ok(text),
-                    Err(e) => last_err = format!("oh read: {e}"),
-                },
-                Err(e) if e.is_connect() || e.is_timeout() => {
-                    last_err = format!("oh send: {e}");
-                }
-                Err(e) => return Err(format!("oh send: {e}")),
-            }
-        }
-
-        warn!(device = %self.name, action, error = %last_err, "oh_soap_all_retries_failed");
-        Err(last_err)
+    /// #7633 — de quoi envoyer `SetVolume` au renderer SANS passer par le
+    /// verrou de la sortie. `None` sans service Volume.
+    ///
+    /// Le sondeur tient ce verrou pendant tout `get_status` : jusqu'à cinq
+    /// appels SOAP à la suite quand les évènements du renderer n'arrivent
+    /// pas (pare-feu Windows, #4677). Un changement de volume qui attendait
+    /// derrière lui partait avec 1 à 2 s de retard, et le Linn jouait encore
+    /// l'ancienne valeur (« 50 reste trop fort après 70 »).
+    pub fn envoi_de_volume(&self) -> Option<EnvoiDeVolume> {
+        Some(EnvoiDeVolume {
+            name: self.name.clone(),
+            url: self.svc_url("volume")?.clone(),
+            client: self.client.clone(),
+            event_state: self.event_state.clone(),
+            echelle: self.echelle_de_volume.clone(),
+        })
     }
 
     async fn oh_play(&self) -> Result<(), String> {
@@ -223,6 +205,52 @@ impl OpenHomeOutput {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn playlist_delete_id(&self, id: u32) -> Result<(), String> {
+        if let Some(url) = self.svc_url("playlist") {
+            self.soap_call(url, SVC_PLAYLIST, "DeleteId", &[("Value", &id.to_string())])
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// L'entrée que le renderer lit en ce moment (`Playlist Id`), `None`
+    /// sans service Playlist, sur échec ou pour `0` (aucune entrée).
+    async fn playlist_current_id(&self) -> Option<u32> {
+        let url = self.svc_url("playlist")?;
+        let resp = self.soap_call(url, SVC_PLAYLIST, "Id", &[]).await.ok()?;
+        extract_tag(&resp, "Value")
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|id| *id != 0)
+    }
+
+    /// #6753 — retire de la liste du renderer les suivantes armées par Tune
+    /// et pas encore atteintes. Sans cela, une file Tune en pause laisse sa
+    /// suivante dans la liste partagée : quand un autre point de contrôle y
+    /// insère ses pistes, le renderer enchaîne ensuite sur celle de Tune et
+    /// le testeur croit que Tune « reprend la zone ».
+    ///
+    /// L'entrée en cours n'est jamais retirée (le renderer a pu avancer sur
+    /// la suivante en gapless). Un échec est écrit au journal sans faire
+    /// échouer la pause ni l'arrêt.
+    async fn retirer_suivantes_armees(&self) {
+        let pending = std::mem::take(&mut *self.pending_next_oh_ids.lock().await);
+        if pending.is_empty() {
+            return;
+        }
+        let courante = self.playlist_current_id().await;
+        for id in pending {
+            if Some(id) == courante {
+                continue;
+            }
+            match self.playlist_delete_id(id).await {
+                Ok(()) => info!(device = %self.name, oh_id = id, "oh_next_retire_a_la_pause"),
+                Err(e) => {
+                    warn!(device = %self.name, oh_id = id, error = %e, "oh_next_retire_echec")
+                }
+            }
+        }
     }
 
     /// #6718 — ce que le renderer ANNONCE savoir lire, au format d'un Sink
@@ -475,6 +503,7 @@ impl OutputTarget for OpenHomeOutput {
         );
 
         self.playlist_delete_all().await?;
+        self.pending_next_oh_ids.lock().await.clear();
 
         let new_id = self.playlist_insert(0, media.url, &metadata).await?;
         if let Some(id) = new_id {
@@ -490,7 +519,9 @@ impl OutputTarget for OpenHomeOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
-        self.oh_pause().await
+        self.oh_pause().await?;
+        self.retirer_suivantes_armees().await;
+        Ok(())
     }
 
     async fn resume(&self) -> Result<(), String> {
@@ -500,6 +531,7 @@ impl OutputTarget for OpenHomeOutput {
     async fn stop(&self) -> Result<(), String> {
         self.unsubscribe_events().await;
         self.oh_stop().await?;
+        self.retirer_suivantes_armees().await;
         *self.current_oh_id.lock().await = None;
         info!(device = %self.name, "oh_stop");
         Ok(())
@@ -530,32 +562,17 @@ impl OutputTarget for OpenHomeOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        let level = (volume * 100.0).round().clamp(0.0, 100.0) as u32;
-        if let Some(url) = self.svc_url("volume") {
-            self.soap_call(
-                url,
-                SVC_VOLUME,
-                "SetVolume",
-                &[("Value", &level.to_string())],
-            )
-            .await?;
-            self.event_state.lock().await.volume = Some(level);
-        } else {
-            return Err("volume not supported by this OpenHome renderer".into());
-        }
-        Ok(())
+        self.envoi_de_volume()
+            .ok_or_else(|| "volume not supported by this OpenHome renderer".to_string())?
+            .set_volume(volume)
+            .await
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
-        let val = if muted { "1" } else { "0" };
-        if let Some(url) = self.svc_url("volume") {
-            self.soap_call(url, SVC_VOLUME, "SetMute", &[("Value", val)])
-                .await?;
-            self.event_state.lock().await.muted = Some(muted);
-        } else {
-            return Err("mute not supported by this OpenHome renderer".into());
-        }
-        Ok(())
+        self.envoi_de_volume()
+            .ok_or_else(|| "mute not supported by this OpenHome renderer".to_string())?
+            .set_mute(muted)
+            .await
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
@@ -563,7 +580,7 @@ impl OutputTarget for OpenHomeOutput {
         let es = self.event_state.lock().await;
         let eventing = es.is_fresh();
         let cached_state = es.transport_state;
-        let cached_volume = es.volume.map(|v| v as f64 / 100.0);
+        let cached_level = es.volume;
         let cached_muted = es.muted;
         let cached_uri = es.track_uri.clone();
         drop(es);
@@ -593,15 +610,21 @@ impl OutputTarget for OpenHomeOutput {
             (0, 0)
         };
 
-        let volume = if let Some(v) = cached_volume.filter(|_| eventing) {
-            v
-        } else if let Some(url) = self.svc_url("volume") {
-            let response = self.soap_call(url, SVC_VOLUME, "Volume", &[]).await?;
-            extract_tag(&response, "Value")
-                .ok_or("OpenHome Volume response has no Value")?
-                .parse::<f64>()
-                .map(|v| v / 100.0)
-                .map_err(|e| format!("invalid OpenHome Volume value: {e}"))?
+        // #7841 — le niveau du renderer se lit sur SON échelle : un niveau
+        // 15 d'un appareil à `VolumeMax` 50 vaut 30 %, pas 15 %.
+        let volume = if let Some(envoi) = self.envoi_de_volume() {
+            let level = if let Some(v) = cached_level.filter(|_| eventing) {
+                v
+            } else {
+                let response = self
+                    .soap_call(&envoi.url, SVC_VOLUME, "Volume", &[])
+                    .await?;
+                extract_tag(&response, "Value")
+                    .ok_or("OpenHome Volume response has no Value")?
+                    .parse::<u32>()
+                    .map_err(|e| format!("invalid OpenHome Volume value: {e}"))?
+            };
+            envoi.echelle().await.depuis_niveau(level)
         } else {
             0.5
         };
@@ -682,14 +705,299 @@ impl OutputTarget for OpenHomeOutput {
             && id != 0
         {
             *self.current_oh_id.lock().await = Some(id);
+            // Une suivante déjà atteinte est la piste en cours : elle n'est
+            // plus « en attente » (#6753).
+            self.pending_next_oh_ids.lock().await.retain(|p| *p != id);
         }
         let after_id = self.current_oh_id.lock().await.unwrap_or(0);
         let new_id = self.playlist_insert(after_id, media.url, &metadata).await?;
         if let Some(id) = new_id {
+            self.pending_next_oh_ids.lock().await.push(id);
             info!(device = %self.name, url = media.url, oh_id = id, "oh_set_next");
         }
         Ok(())
     }
+}
+
+/// #7841 — l'échelle de volume que publie un renderer OpenHome (action
+/// `Characteristics` du service `Volume:1`).
+///
+/// `VolumeMax` est le niveau le plus haut que `SetVolume` accepte ; il n'est
+/// PAS toujours 100. `VolumeUnity` est le niveau du gain unité (0 dB), et
+/// `VolumeMilliDbPerStep` l'écart d'un cran en millièmes de dB : à eux deux,
+/// ils disent ce qu'un niveau vaut en dB, ce que le rapport doit montrer pour
+/// trancher un « plus de son à 30 ».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EchelleDeVolume {
+    pub volume_max: u32,
+    pub volume_unity: u32,
+    pub volume_steps: u32,
+    pub volume_milli_db_per_step: u32,
+}
+
+impl EchelleDeVolume {
+    /// L'échelle supposée quand le renderer n'en publie aucune : 0..100,
+    /// le comportement d'avant #7841.
+    pub const PAR_DEFAUT: Self = Self {
+        volume_max: 100,
+        volume_unity: 100,
+        volume_steps: 100,
+        volume_milli_db_per_step: 0,
+    };
+
+    /// Lit la réponse SOAP de `Characteristics`. `None` si `VolumeMax` manque,
+    /// est illisible ou vaut 0 : une échelle nulle couperait le son.
+    pub fn depuis_reponse(reponse: &str) -> Option<Self> {
+        let lire = |balise: &str| extract_tag(reponse, balise).and_then(|v| v.parse::<u32>().ok());
+        let volume_max = lire("VolumeMax").filter(|m| *m > 0)?;
+        Some(Self {
+            volume_max,
+            volume_unity: lire("VolumeUnity").unwrap_or(volume_max),
+            volume_steps: lire("VolumeSteps").unwrap_or(volume_max),
+            volume_milli_db_per_step: lire("VolumeMilliDbPerStep").unwrap_or(0),
+        })
+    }
+
+    /// Le niveau de l'appareil pour une consigne 0..1 de Tune :
+    /// `round(volume × VolumeMax)`, borné à `0..VolumeMax`. Proportionnel :
+    /// jamais au-dessus de ce que la consigne demande sur l'échelle.
+    pub fn vers_niveau(&self, volume: f64) -> u32 {
+        let volume = if volume.is_finite() { volume } else { 0.0 };
+        let max = f64::from(self.volume_max);
+        (volume.clamp(0.0, 1.0) * max).round().clamp(0.0, max) as u32
+    }
+
+    /// La consigne 0..1 de Tune pour un niveau de l'appareil.
+    pub fn depuis_niveau(&self, niveau: u32) -> f64 {
+        (f64::from(niveau) / f64::from(self.volume_max.max(1))).clamp(0.0, 1.0)
+    }
+
+    /// L'écart en dB d'un niveau au gain unité, quand l'appareil publie le
+    /// pas en dB ; `None` sinon.
+    pub fn ecart_au_gain_unite_db(&self, niveau: u32) -> Option<f64> {
+        if self.volume_milli_db_per_step == 0 {
+            return None;
+        }
+        Some(
+            (f64::from(niveau) - f64::from(self.volume_unity))
+                * f64::from(self.volume_milli_db_per_step)
+                / 1000.0,
+        )
+    }
+}
+
+/// #7633 — l'envoi du volume d'un renderer OpenHome, détaché de
+/// l'[`OpenHomeOutput`] : l'orchestrateur le garde à part (registre des
+/// sorties) et l'appelle sans prendre le verrou de la sortie, que le sondeur
+/// tient pendant ses relevés. La file de `volume_coalescent` garantit
+/// toujours une seule commande en vol et la dernière valeur gagnante.
+#[derive(Clone)]
+pub struct EnvoiDeVolume {
+    name: String,
+    url: String,
+    client: Client,
+    event_state: Arc<tokio::sync::Mutex<EventState>>,
+    /// #7841 — partagée avec l'[`OpenHomeOutput`] : lue une fois, au premier
+    /// besoin de l'un ou de l'autre. `None` dedans : le renderer n'en publie
+    /// pas (faute SOAP, réponse illisible), et l'échelle 0..100 s'applique.
+    echelle: Arc<tokio::sync::OnceCell<Option<EchelleDeVolume>>>,
+}
+
+impl EnvoiDeVolume {
+    /// #7841 — l'échelle de volume du renderer, lue par `Characteristics` au
+    /// premier appel et retenue ensuite. Un échec de connexion n'est pas
+    /// retenu : l'appel suivant relit. En attendant, 0..100.
+    pub async fn echelle(&self) -> EchelleDeVolume {
+        let lue = self
+            .echelle
+            .get_or_try_init(|| async {
+                let (status, reponse) = appel_soap(
+                    &self.client,
+                    &self.name,
+                    &self.url,
+                    SVC_VOLUME,
+                    "Characteristics",
+                    &[],
+                )
+                .await?;
+                let echelle = match refus_soap(status, &reponse) {
+                    Some(refus) => {
+                        warn!(device = %self.name, error = %refus, "oh_volume_characteristics_absentes");
+                        None
+                    }
+                    None => EchelleDeVolume::depuis_reponse(&reponse),
+                };
+                match echelle {
+                    Some(e) => info!(
+                        device = %self.name,
+                        volume_max = e.volume_max,
+                        volume_unity = e.volume_unity,
+                        volume_steps = e.volume_steps,
+                        volume_milli_db_per_step = e.volume_milli_db_per_step,
+                        "oh_volume_characteristics"
+                    ),
+                    None => warn!(
+                        device = %self.name,
+                        volume_max = 100,
+                        "oh_volume_characteristics_illisibles_echelle_0_100"
+                    ),
+                }
+                Ok::<_, String>(echelle)
+            })
+            .await;
+        match lue {
+            Ok(echelle) => echelle.unwrap_or(EchelleDeVolume::PAR_DEFAUT),
+            Err(e) => {
+                warn!(device = %self.name, error = %e, "oh_volume_characteristics_echec");
+                EchelleDeVolume::PAR_DEFAUT
+            }
+        }
+    }
+
+    /// `SetVolume round(volume × VolumeMax)`, sur l'échelle que publie le
+    /// renderer (#7841). La valeur n'est retenue en mémoire que si le
+    /// renderer l'a acceptée : une faute SOAP (statut HTTP d'erreur ou
+    /// `<s:Fault>`) est une erreur, et l'orchestrateur rétablit alors la
+    /// dernière valeur acceptée.
+    pub async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        let echelle = self.echelle().await;
+        let level = echelle.vers_niveau(volume);
+        info!(
+            device = %self.name,
+            volume,
+            level,
+            volume_max = echelle.volume_max,
+            db_relative_to_unity = echelle.ecart_au_gain_unite_db(level),
+            "oh_set_volume"
+        );
+        commande_soap(
+            &self.client,
+            &self.name,
+            &self.url,
+            SVC_VOLUME,
+            "SetVolume",
+            &[("Value", &level.to_string())],
+        )
+        .await?;
+        self.event_state.lock().await.noter_consigne_volume(level);
+        Ok(())
+    }
+
+    /// #7841 — `SetMute`, sans le verrou de la sortie, comme `SetVolume`
+    /// depuis #7633 : la sourdine attendait elle aussi la fin des relevés du
+    /// sondeur. Une faute SOAP est une erreur.
+    pub async fn set_mute(&self, muted: bool) -> Result<(), String> {
+        let val = if muted { "1" } else { "0" };
+        commande_soap(
+            &self.client,
+            &self.name,
+            &self.url,
+            SVC_VOLUME,
+            "SetMute",
+            &[("Value", val)],
+        )
+        .await?;
+        self.event_state.lock().await.muted = Some(muted);
+        Ok(())
+    }
+}
+
+/// Un appel SOAP, avec ses reprises sur échec de connexion ou délai dépassé.
+/// Rend le statut HTTP et le corps de la réponse, quels qu'ils soient.
+async fn appel_soap(
+    client: &Client,
+    device: &str,
+    url: &str,
+    service_type: &str,
+    action: &str,
+    args: &[(&str, &str)],
+) -> Result<(reqwest::StatusCode, String), String> {
+    let mut body_args = String::new();
+    for (k, v) in args {
+        let escaped = quick_xml::escape::escape(*v);
+        body_args.push_str(&format!("<{k}>{escaped}</{k}>"));
+    }
+
+    let envelope = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:{action} xmlns:u="{service_type}">
+      {body_args}
+    </u:{action}>
+  </s:Body>
+</s:Envelope>"#
+    );
+
+    let soap_action = format!("{service_type}#{action}");
+    let mut last_err = String::new();
+
+    for attempt in 0..=SOAP_MAX_RETRIES {
+        if attempt > 0 {
+            let delay = 200 * (1 << (attempt - 1));
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            debug!(device, action, attempt, "oh_soap_retry");
+        }
+
+        match client
+            .post(url)
+            .header("Content-Type", r#"text/xml; charset="utf-8""#)
+            .header("SOAPAction", format!("\"{soap_action}\""))
+            .body(envelope.clone())
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.text().await {
+                    Ok(text) => return Ok((status, text)),
+                    Err(e) => last_err = format!("oh read: {e}"),
+                }
+            }
+            Err(e) if e.is_connect() || e.is_timeout() => {
+                last_err = format!("oh send: {e}");
+            }
+            Err(e) => return Err(format!("oh send: {e}")),
+        }
+    }
+
+    warn!(device, action, error = %last_err, "oh_soap_all_retries_failed");
+    Err(last_err)
+}
+
+/// #7633 — un appel SOAP qui COMMANDE (volume, sourdine) : un statut HTTP
+/// d'erreur ou une `Fault` dans la réponse est un refus du renderer, pas une
+/// réussite. Avant, `soap_call` rendait `Ok` sur un 500, et la valeur refusée
+/// passait pour appliquée.
+async fn commande_soap(
+    client: &Client,
+    device: &str,
+    url: &str,
+    service_type: &str,
+    action: &str,
+    args: &[(&str, &str)],
+) -> Result<String, String> {
+    let (status, texte) = appel_soap(client, device, url, service_type, action, args).await?;
+    if let Some(refus) = refus_soap(status, &texte) {
+        warn!(device, action, %status, error = %refus, "oh_soap_refus");
+        return Err(refus);
+    }
+    Ok(texte)
+}
+
+/// Le refus porté par une réponse SOAP, s'il y en a un.
+fn refus_soap(status: reqwest::StatusCode, texte: &str) -> Option<String> {
+    if !status.is_success() || texte.contains("Fault>") {
+        let detail = extract_tag(texte, "errorDescription")
+            .or_else(|| extract_tag(texte, "faultstring"))
+            .unwrap_or_default();
+        return Some(
+            format!("oh soap fault: HTTP {} {detail}", status.as_u16())
+                .trim_end()
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Extrait le texte d'une balise d'une réponse SOAP.

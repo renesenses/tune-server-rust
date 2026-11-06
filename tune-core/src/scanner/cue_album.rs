@@ -52,6 +52,10 @@ pub struct PisteCue {
     pub compositeur: Option<String>,
     /// `REM COMMENT` de la piste (#5463).
     pub commentaire: Option<String>,
+    /// Le numéro du disque de la feuille dans un coffret (#7751), quand il se
+    /// déduit : voir [`disque_de_la_feuille`]. `None` pour une feuille qui ne
+    /// dit pas de quel disque elle est.
+    pub disque: Option<u32>,
     /// Début dans `media`, en millisecondes.
     pub debut_ms: u64,
     /// Fin dans `media`, ou `None` si la piste court jusqu'au bout du fichier.
@@ -258,6 +262,8 @@ struct FeuilleResolue {
     feuille: CueSheet,
     /// Référence `FILE` → fichier réel. Toutes résolues et décodables.
     images: HashMap<String, PathBuf>,
+    /// Le disque du coffret que décrit la feuille (#7751).
+    disque: Option<u32>,
 }
 
 impl FeuilleResolue {
@@ -362,16 +368,66 @@ pub fn planifier_dossier(dossier: &Path) -> PlanCue {
 
         match ecart {
             Some(motif) => plan.ecartees.push((chemin, motif)),
-            None => resolues.push(FeuilleResolue {
-                chemin,
-                feuille,
-                images,
-            }),
+            None => {
+                let disque = disque_de_la_feuille(dossier, &chemin, &feuille, &images);
+                resolues.push(FeuilleResolue {
+                    chemin,
+                    feuille,
+                    images,
+                    disque,
+                })
+            }
         }
     }
 
     plan.albums = regrouper(resolues);
     plan
+}
+
+/// Le numéro du disque qu'une feuille décrit dans un coffret (#7751).
+///
+/// Un coffret rippé « un FLAC + un CUE par CD » porte le même `TITLE` sur
+/// toutes ses feuilles : le numéro du disque est ailleurs. On le cherche, dans
+/// cet ordre :
+/// 1. `REM DISCNUMBER` de la feuille, quand l'outil de rip l'a écrit ;
+/// 2. le dossier, quand il n'est QUE cela (`CD2/`) — la même lecture que le
+///    scan ordinaire ([`crate::metadata::numero_de_disque`]), où le dossier
+///    tranche aussi ;
+/// 3. le marqueur en FIN de nom du fichier image, puis de la feuille :
+///    « Ring CD03.flac », « Ring (Disc 3).cue », ou le nom nu « cd3.flac ».
+///
+/// Le nom du fichier n'est lu qu'avec les règles étroites des coffrets
+/// ([`crate::metadata::coffrets::marqueur_final`]) : « Vol. 2 », « Abcd 2 »
+/// ou « Side B » ne disent aucun disque. La balise `DISCNUMBER` de l'image
+/// n'est pas lue ici — ce module n'ouvre pas les fichiers audio : l'écriture
+/// en base la prend en dernier recours.
+fn disque_de_la_feuille(
+    dossier: &Path,
+    chemin: &Path,
+    feuille: &CueSheet,
+    images: &HashMap<String, PathBuf>,
+) -> Option<u32> {
+    let du_nom = |p: &Path| {
+        let racine = p.file_stem()?.to_str()?;
+        crate::metadata::coffrets::marqueur_final(racine)
+            .map(|(_, d)| d)
+            .or_else(|| crate::metadata::numero_de_disque(racine))
+    };
+    feuille
+        .disc_number
+        .or_else(|| {
+            dossier
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(crate::metadata::numero_de_disque)
+        })
+        .or_else(|| {
+            feuille
+                .premier_fichier()
+                .and_then(|r| images.get(r))
+                .and_then(|image| du_nom(image))
+        })
+        .or_else(|| du_nom(chemin))
 }
 
 /// Regroupe les feuilles résolues en albums.
@@ -383,6 +439,13 @@ pub fn planifier_dossier(dossier: &Path) -> PlanCue {
 /// deux à 01 sont deux disques distincts qui partagent un titre — les fusionner
 /// entrelacerait leurs pistes. Dans le doute, on sépare : un album de trop se
 /// voit et se corrige, une pochette de dix pistes mélangées ne se comprend pas.
+///
+/// #7751 — sauf quand chaque feuille DIT son disque : les dix CD d'un coffret
+/// recommencent tous à 01, mais « CD01 », « CD02 »… les rangent sans
+/// entrelacer. Ils forment alors un album à plusieurs disques, à trois
+/// conditions qui gardent séparés deux albums distincts de même titre : même
+/// `PERFORMER` d'album, un numéro de disque connu sur CHAQUE feuille, et aucun
+/// numéro en double (deux extractions du même disque 1 restent deux albums).
 fn regrouper(resolues: Vec<FeuilleResolue>) -> Vec<AlbumCue> {
     // Un groupe = (clé de titre, feuilles). La clé est `None` pour une feuille
     // sans titre : elle ne se regroupe avec rien, faute de quoi toutes les
@@ -394,7 +457,10 @@ fn regrouper(resolues: Vec<FeuilleResolue>) -> Vec<AlbumCue> {
         let position = cle.as_ref().and_then(|c| {
             groupes.iter().position(|(autre, membres)| {
                 autre.as_deref() == Some(c.as_str())
-                    && membres.iter().all(|deja| plages_disjointes(deja, &feuille))
+                    && (membres.iter().all(|deja| plages_disjointes(deja, &feuille))
+                        || membres
+                            .iter()
+                            .all(|deja| disques_du_meme_coffret(deja, &feuille)))
             })
         });
         match position {
@@ -416,8 +482,21 @@ fn plages_disjointes(a: &FeuilleResolue, b: &FeuilleResolue) -> bool {
     }
 }
 
+/// #7751 — deux feuilles de même titre sont-elles deux disques d'un coffret ?
+fn disques_du_meme_coffret(a: &FeuilleResolue, b: &FeuilleResolue) -> bool {
+    let interprete = |f: &FeuilleResolue| f.feuille.album_performer.as_deref().map(cle_album);
+    matches!((a.disque, b.disque), (Some(x), Some(y)) if x != y) && interprete(a) == interprete(b)
+}
+
 fn album_depuis(mut groupe: Vec<FeuilleResolue>) -> AlbumCue {
-    groupe.sort_by(|a, b| a.plage().cmp(&b.plage()).then(a.chemin.cmp(&b.chemin)));
+    // Par disque d'abord (#7751) : le disque 1 du coffret fait la première
+    // feuille, celle qui donne son titre et son interprète à l'album.
+    groupe.sort_by(|a, b| {
+        a.disque
+            .cmp(&b.disque)
+            .then(a.plage().cmp(&b.plage()))
+            .then(a.chemin.cmp(&b.chemin))
+    });
 
     let premiere = &groupe[0].feuille;
     let titre = premiere.album_title.clone();
@@ -459,6 +538,7 @@ fn album_depuis(mut groupe: Vec<FeuilleResolue>) -> AlbumCue {
                 isrc: piste.isrc.clone(),
                 compositeur: piste.songwriter.clone(),
                 commentaire: piste.comment.clone(),
+                disque: resolue.disque,
                 debut_ms: piste.start_ms,
                 fin_ms: piste.end_ms,
             });
@@ -806,12 +886,16 @@ mod tests {
 
     /// Deux disques qui partagent un titre et recommencent tous deux à 01 ne
     /// sont pas un album coupé en deux : les fusionner entrelacerait les pistes.
+    ///
+    /// #7751 — les noms ne disent ici AUCUN numéro de disque : « cd1 » et
+    /// « cd2 » en disaient un, et c'est désormais un coffret (voir
+    /// `un_coffret_dont_chaque_feuille_dit_son_disque_fait_un_album_7751`).
     #[test]
     fn deux_feuilles_aux_numeros_qui_se_recouvrent_restent_deux_albums() {
         let d = tempfile::TempDir::new().unwrap();
-        ecrire_wav(&d.path().join("cd1.wav"), 50);
-        ecrire_wav(&d.path().join("cd2.wav"), 50);
-        for (nom, image) in [("cd1.cue", "cd1.wav"), ("cd2.cue", "cd2.wav")] {
+        ecrire_wav(&d.path().join("premier.wav"), 50);
+        ecrire_wav(&d.path().join("second.wav"), 50);
+        for (nom, image) in [("premier.cue", "premier.wav"), ("second.cue", "second.wav")] {
             fs::write(
                 d.path().join(nom),
                 format!(
@@ -823,6 +907,116 @@ mod tests {
 
         let plan = planifier_dossier(d.path());
         assert_eq!(plan.albums.len(), 2, "deux disques ont été entrelacés");
+    }
+
+    /// Une feuille de coffret : même titre, même interprète, deux pistes 01-02.
+    fn feuille_de_coffret(interprete: &str, image: &str, rem: &str) -> String {
+        format!(
+            "{rem}PERFORMER \"{interprete}\"\nTITLE \"Der Ring des Nibelungen\"\nFILE \"{image}\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 00:00:02\n"
+        )
+    }
+
+    /// #7751 — le coffret du forum : dix CD, un FLAC + un CUE par CD, toutes
+    /// les feuilles au même `TITLE` et au même `PERFORMER`, le numéro du CD
+    /// dans le nom du fichier. Chaque CD recommence à 01 : avant, chacun
+    /// faisait un album. Le numéro écrit dans le nom les range sans les
+    /// entrelacer : UN album, ses disques dans l'ordre.
+    #[test]
+    fn un_coffret_dont_chaque_feuille_dit_son_disque_fait_un_album_7751() {
+        let d = tempfile::TempDir::new().unwrap();
+        // Écrits dans le désordre : l'ordre vient du numéro, pas de l'écriture.
+        for n in [3, 1, 2] {
+            let image = format!("Der Ring CD{n:02}.wav");
+            ecrire_wav(&d.path().join(&image), 50);
+            fs::write(
+                d.path().join(format!("Der Ring CD{n:02}.cue")),
+                feuille_de_coffret("Georg Solti", &image, ""),
+            )
+            .unwrap();
+        }
+
+        let plan = planifier_dossier(d.path());
+        assert!(plan.ecartees.is_empty(), "{:?}", plan.ecartees);
+        assert_eq!(
+            plan.albums.len(),
+            1,
+            "les CD d'un même coffret sont vus comme des albums séparés"
+        );
+        let a = &plan.albums[0];
+        assert_eq!(a.titre.as_deref(), Some("Der Ring des Nibelungen"));
+        assert_eq!(a.feuilles.len(), 3);
+        let disques: Vec<(Option<u32>, u32)> =
+            a.pistes.iter().map(|p| (p.disque, p.numero)).collect();
+        assert_eq!(
+            disques,
+            vec![
+                (Some(1), 1),
+                (Some(1), 2),
+                (Some(2), 1),
+                (Some(2), 2),
+                (Some(3), 1),
+                (Some(3), 2)
+            ]
+        );
+        assert_eq!(a.pistes[2].media, d.path().join("Der Ring CD02.wav"));
+    }
+
+    /// #7751 — `REM DISCNUMBER` dit le disque quand les noms se taisent.
+    #[test]
+    fn rem_discnumber_range_les_feuilles_d_un_coffret_7751() {
+        let d = tempfile::TempDir::new().unwrap();
+        for (n, nom) in [(1, "premier"), (2, "second")] {
+            ecrire_wav(&d.path().join(format!("{nom}.wav")), 50);
+            fs::write(
+                d.path().join(format!("{nom}.cue")),
+                feuille_de_coffret(
+                    "Georg Solti",
+                    &format!("{nom}.wav"),
+                    &format!("REM DISCNUMBER {n}\n"),
+                ),
+            )
+            .unwrap();
+        }
+        let plan = planifier_dossier(d.path());
+        assert_eq!(plan.albums.len(), 1, "{plan:?}");
+        assert_eq!(plan.albums[0].pistes[2].disque, Some(2));
+    }
+
+    /// #7751, CONTRE-POIDS — deux albums DIFFÉRENTS de même titre restent
+    /// deux albums, même quand leurs noms portent un numéro de disque :
+    /// - un autre interprète, c'est un autre album ;
+    /// - deux feuilles qui se disent toutes deux « disque 1 » sont deux
+    ///   extractions du même disque, pas deux disques d'un coffret.
+    #[test]
+    fn deux_albums_differents_de_meme_titre_restent_separes_7751() {
+        let d = tempfile::TempDir::new().unwrap();
+        for (n, interprete) in [(1, "Georg Solti"), (2, "Herbert von Karajan")] {
+            let image = format!("Der Ring CD{n}.wav");
+            ecrire_wav(&d.path().join(&image), 50);
+            fs::write(
+                d.path().join(format!("Der Ring CD{n}.cue")),
+                feuille_de_coffret(interprete, &image, ""),
+            )
+            .unwrap();
+        }
+        let plan = planifier_dossier(d.path());
+        assert_eq!(plan.albums.len(), 2, "deux interprètes ont été fusionnés");
+
+        let d = tempfile::TempDir::new().unwrap();
+        for nom in ["Der Ring CD1", "Der Ring CD1 (copie)"] {
+            ecrire_wav(&d.path().join(format!("{nom}.wav")), 50);
+            fs::write(
+                d.path().join(format!("{nom}.cue")),
+                feuille_de_coffret("Georg Solti", &format!("{nom}.wav"), "REM DISCNUMBER 1\n"),
+            )
+            .unwrap();
+        }
+        let plan = planifier_dossier(d.path());
+        assert_eq!(
+            plan.albums.len(),
+            2,
+            "deux extractions du disque 1 ont été fusionnées"
+        );
     }
 
     /// Une feuille bancale ne doit emporter ni le dossier, ni le scan.

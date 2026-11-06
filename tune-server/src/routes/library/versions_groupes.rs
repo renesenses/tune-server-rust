@@ -85,7 +85,11 @@ fn profil_nomme(headers: &HeaderMap, profil: &ActiveProfile) -> Result<Option<i6
         Some(id) if id > 0 && id == profil.id() => Ok(Some(id)),
         _ => Err((
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "X-Profile-Id: profil introuvable ou non autorisé" })),
+            Json(crate::message_api::corps_refus(
+                "profile_not_found",
+                "api.profiles.notFoundOrForbidden",
+                &[],
+            )),
         )
             .into_response()),
     }
