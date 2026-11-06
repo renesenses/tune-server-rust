@@ -393,6 +393,7 @@ pub(super) async fn artist_bio(
     };
     let lang = langue_demandee(q.lang.as_deref(), &headers);
     let lang = lang.as_str();
+    memoriser_langue_pour_bio_sync(&state.backend, lang);
 
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy — this surfaces the sourced Wikipedia/Last.fm/Qobuz/
@@ -568,6 +569,20 @@ pub(super) fn reponse_du_proxy(cle: &str, nom: &str, data: &Value) -> Value {
 /// #3089 : les notes de version la partagent, une seule implémentation.
 pub(super) fn langue_demandee(param: Option<&str>, headers: &HeaderMap) -> String {
     crate::i18n::lang_from_request(param, headers)
+}
+
+/// Mémorise la langue d'interface vue pour `cloud::bio_sync` (réglage
+/// `bio_langue`), sans retarder la réponse : lecture + écriture éventuelle sur
+/// un thread bloquant, jamais attendues.
+pub(super) fn memoriser_langue_pour_bio_sync(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    lang: &str,
+) {
+    let (backend, lang) = (backend.clone(), lang.to_string());
+    tokio::task::spawn_blocking(move || {
+        let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend);
+        tune_core::cloud::bio_sync::memoriser_langue_interface(&settings, &lang);
+    });
 }
 
 /// La langue d'une bio stockée convient-elle à celle qu'on demande ?

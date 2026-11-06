@@ -395,10 +395,9 @@ pub async fn download_bios(db: &Arc<dyn DbBackend>) {
     download_album_bios(db, &client, DOWNLOAD_ALBUM_URL).await;
 }
 
-/// Langue réglée pour les bios, ramenée à sa base minuscule (`fr-CA` -> `fr`).
-/// `None` si le réglage est absent, vide ou n'a pas la forme d'une langue.
-fn langue_des_bios(settings: &SettingsRepo) -> Option<String> {
-    let brut = settings.get(REGLAGE_LANGUE_BIOS).ok().flatten()?;
+/// Ramène une langue à sa base minuscule (`fr-CA` -> `fr`). `None` si elle
+/// n'a pas la forme d'une langue (2 ou 3 lettres).
+pub fn normaliser_langue(brut: &str) -> Option<String> {
     let base = brut
         .trim()
         .split(['-', '_'])
@@ -407,6 +406,26 @@ fn langue_des_bios(settings: &SettingsRepo) -> Option<String> {
         .to_ascii_lowercase();
     let valide = (2..=3).contains(&base.len()) && base.chars().all(|c| c.is_ascii_lowercase());
     valide.then_some(base)
+}
+
+/// Langue réglée pour les bios. `None` si le réglage est absent, vide ou invalide.
+fn langue_des_bios(settings: &SettingsRepo) -> Option<String> {
+    let brut = settings.get(REGLAGE_LANGUE_BIOS).ok().flatten()?;
+    normaliser_langue(&brut)
+}
+
+/// Mémorise la dernière langue d'interface vue sur les routes de bio (artiste,
+/// notes d'album) dans `bio_langue`. Lecture d'abord : aucune écriture si la
+/// base de langue est inchangée ; langue invalide : réglage inchangé.
+/// Rend `true` si une écriture a eu lieu.
+pub fn memoriser_langue_interface(settings: &SettingsRepo, lang: &str) -> bool {
+    let Some(base) = normaliser_langue(lang) else {
+        return false;
+    };
+    if langue_des_bios(settings).as_deref() == Some(base.as_str()) {
+        return false;
+    }
+    settings.set(REGLAGE_LANGUE_BIOS, &base).is_ok()
 }
 
 /// Ajoute `&lang=<langue>` à l'URL quand une langue est réglée.
@@ -1249,5 +1268,36 @@ mod tests {
             .unwrap();
         assert_eq!(pa["lang"], "en", "{pa}");
         assert_eq!(pb["lang"], "en", "{pb}");
+    }
+
+    #[test]
+    fn la_derniere_langue_vue_alimente_le_reglage() {
+        let db = fresh_db();
+        let st = SettingsRepo::with_backend(db);
+        assert!(memoriser_langue_interface(&st, "en"), "première visite");
+        assert_eq!(st.get(REGLAGE_LANGUE_BIOS).unwrap().as_deref(), Some("en"));
+        assert!(!memoriser_langue_interface(&st, "en"), "répétition");
+        assert!(!memoriser_langue_interface(&st, "en-GB"), "même base");
+        assert!(memoriser_langue_interface(&st, "fr"), "passage à fr");
+        assert_eq!(st.get(REGLAGE_LANGUE_BIOS).unwrap().as_deref(), Some("fr"));
+        for faux in ["", "x", "fr&x=1", "français", "123"] {
+            assert!(!memoriser_langue_interface(&st, faux), "{faux}");
+        }
+        assert_eq!(st.get(REGLAGE_LANGUE_BIOS).unwrap().as_deref(), Some("fr"));
+    }
+
+    #[tokio::test]
+    async fn bio_sync_envoie_lang_en_apres_une_visite_en_anglais() {
+        let db = fresh_db();
+        semer_trois_candidats(&db);
+        memoriser_langue_interface(&SettingsRepo::with_backend(db.clone()), "en");
+        let (base, vues) = doublure_site("en").await;
+        download_artist_bios(&db, &client_de_test(), &format!("{base}/artists")).await;
+        download_album_bios(&db, &client_de_test(), &format!("{base}/albums")).await;
+        let v = vues.lock().unwrap().clone();
+        assert_eq!(v.len(), 3, "{v:?}");
+        for r in &v {
+            assert!(r.ends_with("&lang=en"), "{r}");
+        }
     }
 }
