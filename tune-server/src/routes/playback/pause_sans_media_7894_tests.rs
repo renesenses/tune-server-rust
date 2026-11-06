@@ -105,3 +105,92 @@ async fn la_phrase_suit_la_langue_de_l_interface() {
         "{message}"
     );
 }
+
+/// Ce que la sortie factice a reçu : les types annoncés à `play_media`.
+async fn types_recus(state: &AppState) -> Vec<String> {
+    let registre = state.outputs.lock().await;
+    let sortie = registre.get(APPAREIL).expect("sortie enregistrée");
+    let garde = sortie.lock().await;
+    let mock = garde
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("la sortie factice");
+    mock.play_mime_types().await
+}
+
+async fn poster(state: &AppState, chemin: &str, corps: Value) -> (StatusCode, Value) {
+    let reponse = crate::routes::router(state.clone())
+        .oneshot(
+            Request::post(chemin)
+                .header("content-type", "application/json")
+                .body(Body::from(corps.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let statut = reponse.status();
+    let octets = to_bytes(reponse.into_body(), 1024 * 1024).await.unwrap();
+    (
+        statut,
+        serde_json::from_slice(&octets).unwrap_or(Value::Null),
+    )
+}
+
+/// **La reprise possible, de bout en bout.** Un M4A servi sous une adresse
+/// SANS extension (l'hébergeur dit `audio/mp4`) est lancé sur l'appareil, qui
+/// n'a rien chargé : la pause arrête la zone. Lecture rejoue alors l'épisode
+/// par l'orchestrateur — et l'appareil doit recevoir le MÊME type qu'au
+/// lancement, pas l'`audio/mpeg` que l'adresse seule ferait annoncer.
+///
+/// Contre-épreuve : dans la route `resume`, repasser `media_format: None` fait
+/// tomber ce témoin sur « audio/mpeg ».
+#[tokio::test]
+async fn lecture_apres_une_pause_sans_media_rejoue_l_episode_avec_son_type() {
+    use axum::{Router, routing::get};
+    let hebergeur = Router::new().route(
+        "/media/42",
+        get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "audio/mp4")],
+                vec![0u8; 64],
+            )
+        }),
+    );
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", ecoute.local_addr().unwrap());
+    let amont = tokio::spawn(async move {
+        axum::serve(ecoute, hebergeur).await.unwrap();
+    });
+
+    let (state, zid) = zone_sur_appareil_sans_media().await;
+    let (statut, corps) = poster(
+        &state,
+        &format!("/api/v1/podcasts/play/{zid}"),
+        serde_json::json!({"audio_url": format!("{base}/media/42"), "title": "Épisode"}),
+    )
+    .await;
+    assert!(statut.is_success(), "{statut} {corps}");
+    assert_eq!(types_recus(&state).await, vec!["audio/mp4".to_string()]);
+
+    let (statut, corps) = pause(&state, zid, "fr").await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["state"], "stopped", "{corps}");
+
+    let (statut, corps) = poster(&state, &format!("/api/v1/zones/{zid}/resume"), Value::Null).await;
+    assert!(
+        statut.is_success(),
+        "la reprise doit aboutir : {statut} {corps}"
+    );
+    let types = types_recus(&state).await;
+    assert_eq!(
+        types.len(),
+        2,
+        "Lecture rejoue l'épisode sur l'appareil : {types:?}"
+    );
+    assert_eq!(
+        types[1], "audio/mp4",
+        "à la reprise, l'appareil doit recevoir le type retenu au lancement, \
+         pas audio/mpeg : {types:?}"
+    );
+    amont.abort();
+}

@@ -3892,7 +3892,14 @@ async fn resume(
             temp_file_path: None,
             sample_rate: None,
             bit_depth: None,
-            media_format: None,
+            // #7894 — un épisode garde le type retenu à son lancement : sous
+            // une adresse sans extension, l'orchestrateur ne saurait que
+            // l'annoncer MP3, et l'appareil retomberait en silence.
+            media_format: if np.source == "podcast" {
+                np.format.clone()
+            } else {
+                None
+            },
             track_number: None,
             disc_number: None,
             album_ref: None,

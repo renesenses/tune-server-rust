@@ -879,6 +879,10 @@ pub(super) async fn play_episode(
         source: "podcast".into(),
         source_id: Some(body.audio_url.clone()),
         stream_id: relais.as_ref().map(|(_, session)| session.clone()),
+        // #7894 — le type retenu voyage avec l'épisode : Lecture après une
+        // pause sans média le rejoue par l'orchestrateur, qui ne le
+        // retrouverait pas dans une adresse sans extension.
+        format: format_de_l_episode(mime_type),
         ..Default::default()
     };
     // #6465 — un épisode n'appartient à aucun album ni playlist joué avant.
@@ -908,6 +912,7 @@ pub(super) async fn play_episode(
             album_title: Some(podcast_name.into()),
             cover_url: np.cover_path.clone(),
             duration_ms: Some(body.duration_ms.unwrap_or(0) as i64),
+            media_format: np.format.clone(),
             ..Default::default()
         };
         let resultat = if body.seek_ms.is_some() {
@@ -1306,21 +1311,20 @@ fn guess_audio_mime(url: &str) -> &'static str {
 }
 
 /// Le type que dit l'extension de l'adresse, ou `None` si elle ne dit rien.
+/// La règle est celle de l'orchestrateur, qui rejoue l'épisode à la reprise :
+/// les deux chemins lisent la même extension de la même façon.
 fn mime_par_extension(url: &str) -> Option<&'static str> {
-    let lower = url.to_lowercase();
-    let path = lower.split(['?', '#']).next().unwrap_or(&lower);
-    if path.ends_with(".mp3") {
-        Some("audio/mpeg")
-    } else if path.ends_with(".m4a") || path.ends_with(".aac") || path.ends_with(".mp4") {
-        Some("audio/mp4")
-    } else if path.ends_with(".ogg") || path.ends_with(".opus") {
-        Some("audio/ogg")
-    } else if path.ends_with(".flac") {
-        Some("audio/flac")
-    } else if path.ends_with(".wav") {
-        Some("audio/wav")
-    } else {
-        None
+    tune_core::orchestrator::mime_depuis_l_extension(url)
+}
+
+/// #7894 — le format rangé dans `NowPlaying.format` pour un épisode : la forme
+/// réduite que la reprise repasse en `PlayRequest.media_format`, et que
+/// l'orchestrateur retraduit en ce même type (`mime_d_un_episode`).
+fn format_de_l_episode(mime_type: &str) -> Option<String> {
+    match mime_type.strip_prefix("audio/")? {
+        "" => None,
+        "mpeg" => Some("mp3".into()),
+        autre => Some(autre.to_string()),
     }
 }
 
@@ -1385,6 +1389,18 @@ async fn type_de_l_episode(
 /// un `GET` du premier octet si le `HEAD` est refusé. `None` sur échec, délai
 /// dépassé ou type qui n'est pas de l'audio.
 async fn type_de_l_hebergeur(client: &reqwest::Client, url: &str) -> Option<String> {
+    // Un seul budget pour les deux questions : un hébergeur qui ne répond pas
+    // retarde le départ de 3 s, pas de 3 s par requête.
+    match tokio::time::timeout(DELAI_TYPE_DE_L_HEBERGEUR, demander_le_type(client, url)).await {
+        Ok(t) => t,
+        Err(_) => {
+            warn!(url, "podcast_type_hebergeur_delai_depasse");
+            None
+        }
+    }
+}
+
+async fn demander_le_type(client: &reqwest::Client, url: &str) -> Option<String> {
     let lire = |r: reqwest::Response| {
         r.status()
             .is_success()
@@ -1396,11 +1412,7 @@ async fn type_de_l_hebergeur(client: &reqwest::Client, url: &str) -> Option<Stri
             })
             .flatten()
     };
-    if let Ok(r) = client
-        .head(url)
-        .timeout(DELAI_TYPE_DE_L_HEBERGEUR)
-        .send()
-        .await
+    if let Ok(r) = client.head(url).send().await
         && let Some(t) = lire(r)
     {
         return Some(t);
@@ -1408,7 +1420,6 @@ async fn type_de_l_hebergeur(client: &reqwest::Client, url: &str) -> Option<Stri
     match client
         .get(url)
         .header(reqwest::header::RANGE, "bytes=0-0")
-        .timeout(DELAI_TYPE_DE_L_HEBERGEUR)
         .send()
         .await
     {

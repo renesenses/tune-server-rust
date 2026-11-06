@@ -16,6 +16,8 @@ pub struct PlayCall {
     pub bit_depth: Option<u32>,
     /// La durée annoncée à la sortie (`PlayMedia::duration_ms`), #7551.
     pub duration_ms: Option<u64>,
+    /// Le type annoncé à la sortie (`PlayMedia::mime_type`), #7894.
+    pub mime_type: String,
 }
 
 /// A mock OutputTarget for testing playback flows.
@@ -327,6 +329,16 @@ impl MockOutput {
             .collect()
     }
 
+    /// Les types annoncés à `play_media`, DANS L'ORDRE (#7894).
+    pub async fn play_mime_types(&self) -> Vec<String> {
+        self.play_calls
+            .lock()
+            .await
+            .iter()
+            .map(|c| c.mime_type.clone())
+            .collect()
+    }
+
     /// L'URI que le renderer joue reellement.
     pub async fn current_uri(&self) -> Option<String> {
         self.current_uri.lock().await.clone()
@@ -455,6 +467,7 @@ impl OutputTarget for MockOutput {
                 title: media.title.map(String::from),
                 bit_depth: media.bit_depth,
                 duration_ms: media.duration_ms,
+                mime_type: media.mime_type.to_string(),
             });
             return Err(motif);
         }
@@ -471,6 +484,7 @@ impl OutputTarget for MockOutput {
             title: media.title.map(String::from),
             bit_depth: media.bit_depth,
             duration_ms: media.duration_ms,
+            mime_type: media.mime_type.to_string(),
         });
         Ok(())
     }
@@ -581,6 +595,7 @@ impl OutputTarget for MockOutput {
             title: media.title.map(String::from),
             bit_depth: media.bit_depth,
             duration_ms: media.duration_ms,
+            mime_type: media.mime_type.to_string(),
         });
         let refus = self.refus_de_set_next.lock().unwrap().clone();
         if let Some(motif) = refus {

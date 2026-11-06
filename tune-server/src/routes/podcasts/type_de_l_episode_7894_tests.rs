@@ -20,6 +20,7 @@ use tune_core::outputs::mock::MockOutput;
 
 struct Banc {
     app: Router,
+    state: AppState,
     zone: i64,
     base: String,
     amont: tokio::task::JoinHandle<()>,
@@ -70,10 +71,24 @@ async fn banc() -> Banc {
     let app = crate::routes::router(state.clone());
     Banc {
         app,
+        state,
         zone,
         base,
         amont,
     }
+}
+
+/// Les types que la sortie factice a reçus de `play_media`, dans l'ordre.
+async fn types_recus(b: &Banc) -> Vec<String> {
+    let registre = b.state.outputs.lock().await;
+    let sortie = registre.get("uuid:salon-7894").expect("sortie enregistrée");
+    let garde = sortie.lock().await;
+    garde
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("la sortie factice")
+        .play_mime_types()
+        .await
 }
 
 async fn lancer(b: &Banc, corps: Value) -> Value {
@@ -102,11 +117,13 @@ async fn un_m4a_sans_extension_est_annonce_audio_mp4_a_l_appareil_dlna() {
         json!({"audio_url": format!("{}/media/42", b.base), "title": "Épisode"}),
     )
     .await;
+    assert_eq!(r["output_sent"], true, "{r}");
     assert_eq!(
-        r["mime_type"], "audio/mp4",
+        types_recus(&b).await,
+        vec!["audio/mp4".to_string()],
         "l'appareil doit recevoir le type de l'audio servi, pas audio/mpeg : {r}"
     );
-    assert_eq!(r["output_sent"], true, "{r}");
+    assert_eq!(r["mime_type"], "audio/mp4", "{r}");
 }
 
 /// Le type déclaré par le flux (`enclosure@type`) passe avant l'adresse.
@@ -122,6 +139,7 @@ async fn le_type_declare_par_le_flux_prime_sur_l_adresse() {
         }),
     )
     .await;
+    assert_eq!(types_recus(&b).await, vec!["audio/mp4".to_string()], "{r}");
     assert_eq!(r["mime_type"], "audio/mp4", "{r}");
 }
 
