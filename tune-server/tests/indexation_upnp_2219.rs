@@ -511,7 +511,15 @@ async fn un_serveur_inconnu_se_refuse_en_le_disant() {
     let (statut, corps) = poster(&app, "/api/v1/network/media-servers/uuid:fantome/indexer").await;
     assert_eq!(statut, StatusCode::OK);
     assert_eq!(corps["indexe"], json!(false), "corps : {corps}");
-    assert_eq!(corps["raison"], json!("serveur inconnu"), "corps : {corps}");
+    // #7077 : le refus porte un code stable et une phrase traduite (anglais
+    // sans langue demandée), plus de phrase française codée en dur.
+    assert_eq!(corps["code"], json!("unknown_server"), "corps : {corps}");
+    assert_eq!(corps["raison"], json!("Unknown server."), "corps : {corps}");
+    assert_eq!(
+        corps["message_key"],
+        json!("api.upnp.unknownServerDetail"),
+        "corps : {corps}"
+    );
 }
 
 /// A complete catalogue, a partial HTTP failure, and guarded removal through

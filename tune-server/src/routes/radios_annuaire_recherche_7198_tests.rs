@@ -117,6 +117,7 @@ fn recherche_7198_filtres_facettes_et_pagination_portent_sur_les_correspondances
         genre: Some("classical".into()),
         offset: Some(1),
         limit: Some(1),
+        ..Default::default()
     };
     let corps = corps_annuaire(&fiches, &[], &filtres, &EtatAnnuaire::default());
     assert_eq!(noms(&corps), vec!["BBC Radio 3"]);

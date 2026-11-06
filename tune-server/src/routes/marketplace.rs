@@ -199,11 +199,67 @@ struct InstalledRecord {
     plugin_id: Option<String>,
 }
 
+/// Greffon présent sur ce serveur, désigné par l'identifiant de son manifeste.
+struct GreffonLocal {
+    id: String,
+    version: String,
+}
+
+/// Les greffons présents sur ce serveur, qu'ils viennent de la boutique ou
+/// soient livrés avec lui (Party) : ceux du dossier des greffons wasm, sauf
+/// ceux que l'utilisateur a retirés, plus ceux que la boutique a installés.
+async fn greffons_locaux(
+    settings: &SettingsRepo,
+    installed: &[InstalledRecord],
+) -> Vec<GreffonLocal> {
+    let mut locaux: Vec<GreffonLocal> = match crate::plugins::scan_wasm_plugins().await {
+        Ok(infos) => infos
+            .into_iter()
+            .filter(|info| !crate::plugins::greffon_masque(settings, &info.manifest.id))
+            .map(|info| GreffonLocal {
+                id: info.manifest.id,
+                version: info.manifest.version,
+            })
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "marketplace_scan_greffons_locaux_en_echec");
+            Vec::new()
+        }
+    };
+    for rec in installed {
+        if let Some(id) = &rec.plugin_id
+            && !locaux.iter().any(|l| &l.id == id)
+        {
+            locaux.push(GreffonLocal {
+                id: id.clone(),
+                version: rec.version.clone(),
+            });
+        }
+    }
+    locaux
+}
+
 /// Merge installed state into a catalog entry.
-fn enrich(mut plugin: MarketplacePlugin, installed: &[InstalledRecord]) -> MarketplacePlugin {
+///
+/// Une fiche est installée si la boutique l'a installée (même `slug`), ou si
+/// son `plugin_id` désigne un greffon présent sur ce serveur (#7428) : le
+/// greffon livré « Party Mode » (`party`) et sa fiche « Mode Party »
+/// (`party-mode`) ne font alors qu'une extension. Une fiche sans `plugin_id`
+/// garde la seule comparaison par `slug`.
+fn enrich(
+    mut plugin: MarketplacePlugin,
+    installed: &[InstalledRecord],
+    locaux: &[GreffonLocal],
+) -> MarketplacePlugin {
     if let Some(rec) = installed.iter().find(|r| r.slug == plugin.slug) {
         plugin.installed = true;
         plugin.installed_version = Some(rec.version.clone());
+    } else if let Some(id) = plugin.plugin_id.as_deref().map(str::trim)
+        && !id.is_empty()
+        && let Some(local) = locaux.iter().find(|l| l.id == id)
+    {
+        plugin.installed = true;
+        plugin.installed_version = Some(local.version.clone());
     }
     plugin
 }
@@ -226,9 +282,12 @@ async fn list_marketplace_plugins(State(state): State<AppState>) -> Json<Value> 
     // On dégrade le seul champ concerné (`installed`) et on le DIT — ce chemin
     // n'écrit rien, il ne peut donc pas perdre la liste.
     let installed = installed_plugins(&settings).ou_defaut_journalise();
+    let locaux = greffons_locaux(&settings, &installed).await;
 
-    let plugins: Vec<MarketplacePlugin> =
-        catalog.into_iter().map(|p| enrich(p, &installed)).collect();
+    let plugins: Vec<MarketplacePlugin> = catalog
+        .into_iter()
+        .map(|p| enrich(p, &installed, &locaux))
+        .collect();
 
     Json(json!({
         "plugins": plugins,
@@ -250,7 +309,8 @@ async fn get_plugin_detail(
         Some(plugin) => {
             let settings = SettingsRepo::with_backend(state.backend.clone());
             let installed = installed_plugins(&settings).ou_defaut_journalise();
-            let plugin = enrich(plugin, &installed);
+            let locaux = greffons_locaux(&settings, &installed).await;
+            let plugin = enrich(plugin, &installed, &locaux);
             Json(json!(plugin)).into_response()
         }
         None => (
@@ -448,6 +508,13 @@ async fn uninstall_plugin(
                 );
             }
         };
+    }
+    if !registered
+        && plugin_id.is_none()
+        && crate::routes::plugins::natif_actif_par_defaut(&state, &slug)
+    {
+        // #7470 — greffon compilé et actif d'office : on le désactive.
+        return crate::routes::plugins::desinstaller_natif(&state, &slug, &lang);
     }
     if !registered && plugin_id.is_none() {
         return (
@@ -751,5 +818,80 @@ mod signature_tests {
             PLUGIN_PUBLIC_KEY.is_empty(),
             "a key is embedded — enable {REQUIRE_SIGNATURE_SETTING} by default and drop this test"
         );
+    }
+}
+
+/// #7428 — une fiche du catalogue et le greffon présent sur ce serveur se
+/// reconnaissent par l'identifiant du manifeste (`plugin_id`), jamais par le
+/// `slug` ni par le nom affiché.
+#[cfg(test)]
+mod plugin_id_tests_7428 {
+    use super::{GreffonLocal, InstalledRecord, enrich};
+    use tune_core::cloud::plugins::MarketplacePlugin;
+
+    fn fiche(json: &str) -> MarketplacePlugin {
+        serde_json::from_str(json).expect("fiche du catalogue")
+    }
+
+    /// Party, livré avec le serveur : aucun enregistrement de la boutique.
+    fn party_livre() -> Vec<GreffonLocal> {
+        vec![GreffonLocal {
+            id: "party".into(),
+            version: "1.2.0".into(),
+        }]
+    }
+
+    #[test]
+    fn la_fiche_du_greffon_livre_est_installee_par_son_plugin_id_7428() {
+        let mode_party = fiche(
+            r#"{"name":"tune-plugin-party","slug":"party-mode","display_name":"Mode Party",
+                "platforms":"wasm","plugin_id":"party"}"#,
+        );
+        let enrichie = enrich(mode_party, &[], &party_livre());
+        assert!(
+            enrichie.installed,
+            "la fiche « Mode Party » (plugin_id party) doit se lire installée : \
+             c'est le greffon « Party Mode » déjà présent sur ce serveur"
+        );
+        assert_eq!(enrichie.installed_version.as_deref(), Some("1.2.0"));
+    }
+
+    #[test]
+    fn deux_greffons_distincts_restent_distincts_7428() {
+        let autre = fiche(
+            r#"{"name":"tune-plugin-autre","slug":"autre","platforms":"wasm","plugin_id":"autre"}"#,
+        );
+        let enrichie = enrich(autre, &[], &party_livre());
+        assert!(!enrichie.installed);
+        assert!(enrichie.installed_version.is_none());
+    }
+
+    #[test]
+    fn une_fiche_sans_plugin_id_garde_la_comparaison_par_slug_7428() {
+        // Même slug que l'id du greffon local, mais aucun plugin_id : la
+        // fiche n'est pas rapprochée du greffon local, comme avant.
+        let sans_id = fiche(r#"{"name":"tune-plugin-party","slug":"party","platforms":"wasm"}"#);
+        assert!(!enrich(sans_id, &[], &party_livre()).installed);
+
+        // Et la règle par slug de la boutique reste la même.
+        let installee = vec![InstalledRecord {
+            slug: "lyrics".into(),
+            version: "0.3.0".into(),
+            plugin_id: None,
+        }];
+        let lyrics = fiche(r#"{"name":"tune-plugin-lyrics","slug":"lyrics"}"#);
+        let enrichie = enrich(lyrics, &installee, &[]);
+        assert!(enrichie.installed);
+        assert_eq!(enrichie.installed_version.as_deref(), Some("0.3.0"));
+    }
+
+    #[test]
+    fn un_plugin_id_vide_ne_rapproche_rien_7428() {
+        let vide = fiche(r#"{"name":"x","slug":"x","plugin_id":"  "}"#);
+        let locaux = vec![GreffonLocal {
+            id: String::new(),
+            version: "0".into(),
+        }];
+        assert!(!enrich(vide, &[], &locaux).installed);
     }
 }

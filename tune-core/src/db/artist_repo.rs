@@ -505,14 +505,37 @@ pub mod sql {
     ///
     /// #6463 — la provenance est écrite avec le MBID (emplacement 2), et une
     /// fiche `manuel` n'est jamais touchée.
+    ///
+    /// #7535 — un MBID déjà porté par une AUTRE fiche n'est pas posé
+    /// (emplacements 4 et 5 : l'identifiant, encore, et la valeur) : une
+    /// recherche par le nom (« Phil Selway ») qui rend le MBID d'une fiche
+    /// existante (« Philip Selway ») faisait deux fiches d'un même MBID. La
+    /// garde est celle de `artistes_du_pressage::poser_les_mbid`. Un MBID
+    /// vide (`NULL`) ne rencontre personne et passe.
     pub fn update_mbid<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE artists SET musicbrainz_id = {}, musicbrainz_id_source = {} WHERE id = {} \
-             AND {}",
+             AND {} \
+             AND NOT EXISTS (SELECT 1 FROM artists autre WHERE autre.id <> {} \
+                             AND LOWER(TRIM(autre.musicbrainz_id)) = LOWER(TRIM(CAST({} AS TEXT))))",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
-            super::PAS_UN_MBID_MANUEL
+            super::PAS_UN_MBID_MANUEL,
+            d.placeholder(4),
+            d.placeholder(5)
+        )
+    }
+
+    /// #7535 — la fiche (autre que `id`, emplacement 1) qui porte déjà le
+    /// MBID (emplacement 2), la plus ancienne.
+    pub fn autre_fiche_du_mbid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, name FROM artists WHERE id <> {} \
+             AND LOWER(TRIM(musicbrainz_id)) = LOWER(TRIM(CAST({} AS TEXT))) \
+             ORDER BY id LIMIT 1",
+            d.placeholder(1),
+            d.placeholder(2)
         )
     }
 
@@ -893,7 +916,10 @@ impl ArtistRepo {
     /// [`Self::get_or_create`] retombe sur la fiche survivante pour toute
     /// graphie de la même clé — un fichier taggé « Ayọ » ne fait pas renaître
     /// « Ayọ ». L'appelant a vérifié la clé, les MBID et l'artiste inconnu ;
-    /// rien n'est automatique.
+    /// rien n'est automatique. #7535 : la route laisse aussi passer deux clés
+    /// différentes qui portent le MÊME MBID (« Phil » / « Philip Selway ») ;
+    /// la graphie perdante, sans MBID dans ses balises, peut alors renaître
+    /// d'un fichier rescanné.
     pub fn absorber(
         &self,
         cible: i64,
@@ -1498,7 +1524,9 @@ impl ArtistRepo {
 
     /// Pose un MBID avec sa provenance (#6463). Rend `true` si la fiche a
     /// changé ; `false` pour une fiche `manuel`, que rien d'automatique ne
-    /// touche.
+    /// touche, et (#7535) pour un MBID qu'une AUTRE fiche porte déjà : il
+    /// n'est pas posé, c'est journalisé (`artist_mbid_deja_porte`). Les deux
+    /// fiches ne se réunissent qu'à la main (onglet Doublons).
     pub fn poser_mbid(
         &self,
         id: i64,
@@ -1507,16 +1535,52 @@ impl ArtistRepo {
     ) -> Result<bool, TuneError> {
         let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
         let mbid = usable_musicbrainz_id(Some(mbid));
-        let provenance = mbid.map(|_| provenance.as_str());
-        // Ordre lié = ordre déclaré : la valeur, sa provenance, l'identifiant.
-        Ok(self.db.execute(
+        let source = mbid.map(|_| provenance.as_str());
+        // Ordre lié = ordre déclaré : la valeur, sa provenance,
+        // l'identifiant, puis la garde (l'identifiant, la valeur).
+        let ecrit = self.db.execute(
             &sql,
             &[
                 &mbid as &dyn ToSqlValue,
-                &provenance as &dyn ToSqlValue,
+                &source as &dyn ToSqlValue,
                 &id,
+                &id,
+                &mbid,
             ],
-        )? > 0)
+        )? > 0;
+        if !ecrit
+            && let Some(m) = mbid
+            && let Some((autre_id, autre_nom)) = self.autre_fiche_du_mbid(id, m)?
+        {
+            tracing::info!(
+                artist_id = id,
+                mbid = %m,
+                provenance = provenance.as_str(),
+                autre_id,
+                autre = %autre_nom,
+                "artist_mbid_deja_porte"
+            );
+        }
+        Ok(ecrit)
+    }
+
+    /// #7535 — la fiche, autre que `id`, qui porte déjà `mbid` (la plus
+    /// ancienne) : son identifiant et son nom.
+    pub fn autre_fiche_du_mbid(
+        &self,
+        id: i64,
+        mbid: &str,
+    ) -> Result<Option<(i64, String)>, TuneError> {
+        let sql = self.dialect_sql(sql::autre_fiche_du_mbid, sql::autre_fiche_du_mbid);
+        Ok(self
+            .db
+            .query_one(&sql, &[&id as &dyn ToSqlValue, &mbid as &dyn ToSqlValue])?
+            .and_then(|l| {
+                Some((
+                    l.first().and_then(|v| v.as_i64())?,
+                    l.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                ))
+            }))
     }
 
     /// Le MBID saisi par l'utilisateur, ou son retrait (`None`, « Détacher

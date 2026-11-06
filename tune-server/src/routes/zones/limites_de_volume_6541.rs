@@ -12,7 +12,8 @@
 //!   d'APPAREIL, exclusifs eux aussi ; la réponse publie alors
 //!   `volume_limit_safety_device_db` / `volume_limit_comfort_device_db`.
 //!   Le PUT remplace les deux : un seuil absent ou
-//!   `null` est effacé (pas de limite).
+//!   `null` est effacé (pas de limite). #7517 : un confort au-dessus de la
+//!   sécurité est refusé (`400` `comfort_above_safety`).
 //!   - Une sécurité ABAISSÉE (ou posée là où il n'y en avait pas) sous ce que
 //!     reçoit l'appareil ramène la zone sur-le-champ, À LA BAISSE seulement.
 //!     Relever ou effacer une limite n'envoie RIEN à l'appareil : la nouvelle
@@ -193,6 +194,17 @@ pub(super) async fn regler_les_limites(
         Ok(v) => v,
         Err(m) => return refus("invalid_volume_limit", m),
     };
+    // #7517 — un confort au-dessus de la sécurité n'a pas de sens (à l'usage
+    // il est de toute façon plafonné à la sécurité) : refusé à
+    // l'enregistrement, pour que le réglage dise ce qui agit vraiment.
+    if let (Some(s), Some(c)) = (securite, confort)
+        && c > s + 1e-9
+    {
+        return refus(
+            "comfort_above_safety",
+            "la limite de confort ne peut pas dépasser la limite de sécurité",
+        );
+    }
     // Décision du 21/10 : pas de limite sur une zone PURE ou à volume fixe.
     // Effacer (les deux seuils absents) reste permis : cela n'envoie rien.
     if (securite.is_some() || confort.is_some())

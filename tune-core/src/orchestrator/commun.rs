@@ -159,6 +159,9 @@ impl PlaybackOrchestrator {
         if erreur.starts_with("hqplayer_output_start_failed:") {
             return crate::outputs::hqplayer::MESSAGE_ECHEC_DE_SORTIE.into();
         }
+        if erreur.starts_with("hqplayer_control_unsolicited_response:") {
+            return crate::outputs::hqplayer::MESSAGE_OCTETS_NON_SOLLICITES.into();
+        }
         if dsd_mode == "native" && annonce == Some(false) && est_dsd_brut(mime_type) {
             return format!(
                 "Output device error: le mode DSD de cette zone est réglé sur « natif » \
@@ -561,11 +564,33 @@ impl PlaybackOrchestrator {
         }
         // Pas de chemin local vivant. Le redémarrage n'a de sens que si quelque
         // chose joue : sinon la prochaine lecture appliquera l'état toute seule.
-        let Some(np) = self.playback.get_state(zone_id).await.now_playing else {
+        //
+        // 🔴 #7556 — « quelque chose joue » se lit dans `state`, PAS dans
+        // `now_playing`. `PlaybackManager::stop` garde `now_playing` pour que
+        // l'interface montre où la lecture s'est arrêtée : sur une zone
+        // ARRÊTÉE après une radio, la bascule voyait encore la station,
+        // refabriquait le flux et la relance (`replay_zone_at_position` →
+        // `play`) remettait la radio en route sans geste de lecture (.18,
+        // zone 10, 31/10). Une bascule de réglage ne lance JAMAIS de lecture.
+        let etat = self.playback.get_state(zone_id).await;
+        let Some(np) = etat.now_playing else {
             return PorteeDuReglage::RienNeJoue;
         };
+        if etat.state == crate::playback::PlayState::Stopped {
+            info!(zone_id, "pure_bascule_zone_arretee_rien_n_est_lance");
+            return PorteeDuReglage::RienNeJoue;
+        }
         let pure = self.zone_audiophile(zone_id);
         match self.traitement_que_pure_gouverne(zone_id, np.track_id) {
+            // #7556 — zone EN PAUSE : la relance la remettrait en lecture. On
+            // garde le flux ; la bascule portera sur la piste suivante.
+            Some(traitement) if etat.state != crate::playback::PlayState::Playing => {
+                info!(
+                    zone_id,
+                    pure, traitement, "pure_bascule_zone_en_pause_flux_conserve"
+                );
+                PorteeDuReglage::PisteSuivante
+            }
             Some(traitement) => {
                 info!(
                     zone_id,
@@ -618,6 +643,9 @@ impl PlaybackOrchestrator {
         )
     }
 
+    /// #7852 — n'écrit plus rien au démarrage : ARME l'écoute de la zone, que
+    /// le sondeur valide au seuil min(30 s, 50 %) (voir `ecoute_validee_7852`).
+    /// Un titre sans durée connue est écrit tout de suite, comme avant.
     // Un argument par colonne écrite ; une structure changerait tous les appelants pour un gain de forme (clippy 1.98).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_listen(
@@ -635,11 +663,47 @@ impl PlaybackOrchestrator {
         contexte: ContexteEcoute<'_>,
         album_ref: Option<&str>,
     ) {
+        self.armer_l_ecoute(
+            zone_id,
+            super::ecoute_validee_7852::EcouteEnAttente {
+                title: title.into(),
+                artist: artist.map(Into::into),
+                album: album.map(Into::into),
+                source: source.into(),
+                source_id: source_id.map(Into::into),
+                album_id,
+                duration_ms,
+                cover_url: cover_url.map(Into::into),
+                session_profile_id,
+                contexte: super::ecoute_validee_7852::ContexteRetenu::de(&contexte),
+                album_ref: album_ref.map(Into::into),
+            },
+        );
+    }
+
+    /// L'écriture d'une écoute validée : la ligne d'historique, puis l'entrée
+    /// « Reprendre l'écoute ». Appelée une seule fois par écoute, par
+    /// `valider_l_ecoute` (ou par `armer_l_ecoute` pour un titre sans durée).
+    pub(super) fn ecrire_l_ecoute(
+        &self,
+        zone_id: i64,
+        ecoute: &super::ecoute_validee_7852::EcouteEnAttente,
+    ) {
+        let title = ecoute.title.as_str();
+        let artist = ecoute.artist.as_deref();
+        let album = ecoute.album.as_deref();
+        let source = ecoute.source.as_str();
+        let source_id = ecoute.source_id.as_deref();
+        let album_id = ecoute.album_id;
+        let duration_ms = ecoute.duration_ms;
+        let cover_url = ecoute.cover_url.as_deref();
+        let session_profile_id = ecoute.session_profile_id;
+        let contexte = ecoute.contexte.emprunt();
         // La référence d'album du service (fil 2121, migration 114). Donnée
         // par la demande quand elle la porte ; sinon, pour une piste Bandcamp,
         // celle que la file ou les favoris connaissent déjà — une avance
         // gapless ou une annonce différée n'ont pas la demande sous la main.
-        let album_ref = album_ref.map(String::from).or_else(|| {
+        let album_ref = ecoute.album_ref.clone().or_else(|| {
             source_id.filter(|_| source == "bandcamp").and_then(|sid| {
                 crate::db::reference_d_album::reference_d_album_bandcamp(&self.db, sid)
             })
@@ -901,13 +965,17 @@ impl PlaybackOrchestrator {
             .now_playing
             .as_ref()
             .filter(|np| np.source == "podcast")
-            && let Some(url) = np.source_id.as_deref()
         {
-            let _ = crate::db::listening_resume::podcast_position(
+            // La première position prouve aussi le premier démarrage de cet
+            // épisode navigateur : il n'existe pas encore forcément de reprise.
+            // #7415 : `podcast_started_in_context` retire aussi la reprise d'un
+            // épisode arrivé à sa fin (durée `np.duration_ms`).
+            let _ = crate::db::listening_resume::podcast_started_in_context(
                 &self.db,
                 zone_id,
-                url,
+                np,
                 state.position_ms,
+                state.session_context_id.as_deref(),
             );
         }
     }
@@ -950,13 +1018,25 @@ impl PlaybackOrchestrator {
                 .await;
         }
         if let Some(did) = device_id {
-            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+            // #7841 — comme le volume depuis #7633 : un renderer OpenHome reçoit
+            // sa sourdine sans le verrou de la sortie, que le sondeur tient
+            // pendant ses relevés SOAP.
+            let (output, envoi_direct) = {
+                let registre = self.outputs.lock().await;
+                (registre.get(did), registre.envoi_de_volume(did))
+            };
+            let output = output.ok_or_else(|| {
                 OutputCommandError::failed(
                     OutputCommand::SetMute,
                     format!("output {did} is not registered"),
                 )
             })?;
-            output.lock().await.checked_set_mute(muted).await?;
+            match envoi_direct {
+                Some(envoi) => envoi.set_mute(muted).await.map_err(|message| {
+                    OutputCommandError::failed(OutputCommand::SetMute, message)
+                })?,
+                None => output.lock().await.checked_set_mute(muted).await?,
+            }
         }
         let _tenue_air = if let Some(ref file) = file_air {
             Some(file.etat.lock().await)
@@ -999,6 +1079,11 @@ impl PlaybackOrchestrator {
             .await;
     }
 
+    /// #6932 — voir [`AudioStreamer::stream_servi_jusqu_au_bout`].
+    pub async fn streamer_servi_jusqu_au_bout(&self, stream_id: &str) -> bool {
+        self.streamer.stream_servi_jusqu_au_bout(stream_id).await
+    }
+
     /// Taille totale du flux (voir [`AudioStreamer::stream_total_bytes`]).
     pub async fn streamer_total_bytes(&self, stream_id: &str) -> Option<u64> {
         self.streamer.stream_total_bytes(stream_id).await
@@ -1010,11 +1095,12 @@ impl PlaybackOrchestrator {
         if let Some(ref np) = state.now_playing {
             if np.source == "podcast" {
                 if let Some(url) = np.source_id.as_deref() {
-                    let _ = crate::db::listening_resume::podcast_position(
+                    let _ = crate::db::listening_resume::podcast_position_avec_duree(
                         &self.db,
                         zone_id,
                         url,
                         state.position_ms,
+                        np.duration_ms,
                     );
                 }
             }
