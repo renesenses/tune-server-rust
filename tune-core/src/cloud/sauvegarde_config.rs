@@ -1043,6 +1043,11 @@ pub enum ErreurSite {
         statut: u16,
         code: Option<String>,
     },
+    /// Refus du dépôt : taille UTF-8 du blob et plafond annoncé par le site.
+    TropVolumineux {
+        octets: usize,
+        max_octets: Option<u64>,
+    },
     Reseau(String),
     Illisible,
 }
@@ -1055,6 +1060,13 @@ impl std::fmt::Display for ErreurSite {
                 Some(c) => write!(f, "HTTP {statut} {c}"),
                 None => write!(f, "HTTP {statut}"),
             },
+            ErreurSite::TropVolumineux { octets, max_octets } => {
+                write!(f, "HTTP 413 : sauvegarde de {octets} octets ; ")?;
+                match max_octets {
+                    Some(max) => write!(f, "limite : {max} octets"),
+                    None => write!(f, "limite non communiquée par le site ou le proxy"),
+                }
+            }
             ErreurSite::Reseau(e) => write!(f, "network: {e}"),
             ErreurSite::Illisible => write!(f, "unreadable response"),
         }
@@ -1221,6 +1233,18 @@ pub async fn deposer(
         req
     })
     .await?;
+    if r.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        let max_octets = r
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("max_bytes").and_then(Value::as_u64))
+            .filter(|max| *max > 0);
+        return Err(ErreurSite::TropVolumineux {
+            octets: blob.len(),
+            max_octets,
+        });
+    }
     if !r.status().is_success() {
         return Err(erreur_de(r).await);
     }

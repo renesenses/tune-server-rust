@@ -39,6 +39,8 @@ pub mod disposition_canaux;
 /// Dither TPDF — UNE implémentation, partagée par tous les étages qui
 /// repassent du flottant à l'entier (#4075, #4076).
 pub mod dither;
+/// #7704 — continuité du porteur DoP dans les rappels de rendu.
+pub mod dop_continu;
 /// #7265 — un DSD que la sortie WASAPI ne peut pas porter en DoP part en PCM.
 pub mod dop_ecarte_7265;
 #[cfg(test)]
@@ -155,6 +157,8 @@ pub mod text_embedding;
 pub mod thermal;
 /// #6918 — le volume en dB d'une sortie qui règle son volume en décibels.
 pub mod volume_appareil_db;
+/// #7841 — trim et limites de chaque zone, tels que le rapport de diagnostic les montre.
+pub mod volume_au_rapport;
 /// #6541 — limites de sécurité et de confort du volume d'une zone.
 pub mod volume_limites;
 /// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).

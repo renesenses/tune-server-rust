@@ -53,9 +53,6 @@ const SOUS_DOSSIER: &str = "demo-tracks";
 /// et de leurs licences, relue par `GET /demo-tracks`.
 const COPIE_DU_MANIFESTE: &str = "tune-demo-tracks.json";
 
-/// Un seul ajout ou retrait à la fois.
-static EN_COURS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/demo-tracks", get(etat))
@@ -630,7 +627,9 @@ async fn ajouter(
         .dossier_titres_demo
         .clone()
         .ok_or(Refus::DossierIndisponible)?;
-    let _verrou = EN_COURS.try_lock().map_err(|_| Refus::Occupe)?;
+    // Un seul ajout ou retrait à la fois, par serveur (`AppState`).
+    let verrou = state.verrou_titres_demo.clone();
+    let _verrou = verrou.try_lock().map_err(|_| Refus::Occupe)?;
     let url = url_du_manifeste(&state);
     let r = installer(&state, &dossier, &url).await?;
     tracing::info!(
@@ -666,7 +665,8 @@ async fn retirer(_admin: crate::auth::RequireAdmin, State(state): State<AppState
     let Some(dossier) = state.dossier_titres_demo.clone() else {
         return Refus::DossierIndisponible.into_response();
     };
-    let Ok(_verrou) = EN_COURS.try_lock() else {
+    let verrou = state.verrou_titres_demo.clone();
+    let Ok(_verrou) = verrou.try_lock() else {
         return Refus::Occupe.into_response();
     };
     match desinstaller(&state, &dossier) {
