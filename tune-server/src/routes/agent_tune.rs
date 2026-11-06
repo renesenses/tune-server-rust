@@ -85,7 +85,11 @@ async fn oublier_maitre(
     } else {
         (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "maître inconnu" })),
+            Json(crate::message_api::corps_refus(
+                "unknown_master",
+                "api.agent.unknownMaster",
+                &[],
+            )),
         )
             .into_response()
     }
@@ -133,7 +137,11 @@ async fn appairer_agent(
     if host.is_empty() || corps.code.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "hôte et code d'appairage requis" })),
+            Json(crate::message_api::corps_refus(
+                "pairing_host_and_code_required",
+                "api.agent.pairingHostAndCodeRequired",
+                &[],
+            )),
         )
             .into_response();
     }
@@ -175,11 +183,12 @@ fn maitre_authentifie(state: &AppState, headers: &HeaderMap) -> Result<MaitreApp
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     agent::maitre_du_jeton(state, jeton).ok_or_else(|| {
-        (
+        crate::message_api::refus(
             StatusCode::UNAUTHORIZED,
-            "jeton d'appairage absent ou révoqué",
+            "pairing_token_invalid",
+            "api.agent.pairingTokenInvalid",
+            &[],
         )
-            .into_response()
     })
 }
 

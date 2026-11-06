@@ -165,6 +165,11 @@ fn appliquer_stopped(ps: &mut ZonePollState, issue: StoppedOutcome) -> (bool, bo
             return (true, false);
         }
         Waiting => ps.stopped_ticks += 1, // :1595
+        SuivantDeLAppareil => {
+            // #7700 — un tour d'arrêt de plus, puis la piste est finie.
+            ps.stopped_ticks += 1;
+            return (true, false);
+        }
         NaturalEndAdvance => {
             // tick.rs:1595, :1697-1699
             ps.stopped_ticks += 1;

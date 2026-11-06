@@ -1958,6 +1958,28 @@ impl AudioStreamer {
         tokio::fs::metadata(path).await.ok().map(|m| m.len())
     }
 
+    /// #6932 — le flux a-t-il été servi JUSQU'AU BOUT à son lecteur ?
+    ///
+    /// Une session fichier : les octets servis atteignent la taille du
+    /// fichier ([`Self::stream_total_bytes`]). Un flux décodé à la volée (WAV
+    /// chunké d'une conversion) n'a pas de taille : une connexion en a atteint
+    /// la fin du canal ([`StreamSession::fin_du_canal`]). Une radio, jamais.
+    pub async fn stream_servi_jusqu_au_bout(&self, stream_id: &str) -> bool {
+        let Some(session) = ({ self.sessions.lock().await.get(stream_id).cloned() }) else {
+            return false;
+        };
+        if session.is_radio {
+            return false;
+        }
+        if session.fin_du_canal().is_some() {
+            return true;
+        }
+        let servis = session
+            .bytes_sent
+            .load(std::sync::atomic::Ordering::Relaxed);
+        matches!(self.stream_total_bytes(stream_id).await, Some(total) if total > 0 && servis >= total)
+    }
+
     pub async fn stream_bytes_sent(&self, stream_id: &str) -> Option<u64> {
         let sessions = self.sessions.lock().await;
         sessions

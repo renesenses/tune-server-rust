@@ -216,30 +216,23 @@ impl Device {
     /// The caller serialises this with every other use of the driver (Tune's
     /// process-wide ASIO device lock).
     pub fn dsd_output_rates(&self) -> Vec<u32> {
-        if self.driver.callback_count() > 0 || !self.supports_dsd_output() {
-            return Vec::new();
-        }
-        super::stream::forget_asio_buffers(&self.asio_streams);
-        if self.driver.dispose_buffers().is_err()
-            || self
-                .driver
-                .set_io_format(sys::AsioIoFormatType::Dsd)
-                .is_err()
-        {
-            let _ = self.driver.set_io_format(sys::AsioIoFormatType::Pcm);
-            return Vec::new();
-        }
-        let rates = super::dsd::DSD_RATES
-            .iter()
-            .copied()
-            .filter(|rate| {
-                self.driver
-                    .can_sample_rate(f64::from(*rate))
-                    .unwrap_or(false)
-            })
-            .collect();
-        let _ = self.driver.set_io_format(sys::AsioIoFormatType::Pcm);
-        rates
+        self.try_dsd_output_rates().unwrap_or_default()
+    }
+
+    /// `None` means the probe could not establish the capability. Callers
+    /// must not cache it as a driver declaring no native DSD rates.
+    pub fn try_dsd_output_rates(&self) -> Option<Vec<u32>> {
+        super::dsd::probe_dsd_rates(
+            self.driver.callback_count() > 0,
+            || self.driver.can_io_format(sys::AsioIoFormatType::Dsd).ok(),
+            || {
+                super::stream::forget_asio_buffers(&self.asio_streams);
+                self.driver.dispose_buffers().ok()?;
+                self.driver.set_io_format(sys::AsioIoFormatType::Dsd).ok()
+            },
+            |rate| self.driver.can_sample_rate(f64::from(rate)).ok(),
+            || self.driver.set_io_format(sys::AsioIoFormatType::Pcm).ok(),
+        )
     }
 }
 

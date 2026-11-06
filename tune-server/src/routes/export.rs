@@ -12,12 +12,15 @@ use tune_core::db::track_repo::TrackRepo;
 use crate::error::AppError;
 use crate::state::AppState;
 
+pub mod catalogue;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/tracks.csv", get(export_tracks_csv))
         .route("/albums.csv", get(export_albums_csv))
         .route("/artists.csv", get(export_artists_csv))
         .route("/library-audit.csv", get(export_library_audit_csv))
+        .route("/catalogue.html", get(catalogue::export_catalogue_html))
 }
 
 async fn export_tracks_csv(State(state): State<AppState>) -> impl IntoResponse {
@@ -137,25 +140,25 @@ async fn export_library_audit_csv(
                 .iter()
                 .any(|root| crate::routes::system::scan::sous_le_dossier(d, root));
             if !autorise {
-                return (
+                return crate::message_api::refus(
                     StatusCode::BAD_REQUEST,
-                    format!(
-                        "dir hors des racines musique configurées ({})",
-                        music_dirs.join(", ")
-                    ),
+                    "dir_outside_music_roots",
+                    "api.export.dirOutsideMusicRoots",
+                    &[("roots", music_dirs.join(", "))],
                 )
-                    .into_response();
+                .into_response();
             }
             vec![d.to_string()]
         }
         _ => music_dirs.clone(),
     };
     if dirs.is_empty() {
-        return (
+        return crate::message_api::refus(
             StatusCode::BAD_REQUEST,
-            "aucune racine musique configurée".to_string(),
-        )
-            .into_response();
+            "no_music_root",
+            "api.export.noMusicRoot",
+            &[],
+        );
     }
 
     // Côté disque : le walker du scan, avec ses gardes (NAS gelé, montage

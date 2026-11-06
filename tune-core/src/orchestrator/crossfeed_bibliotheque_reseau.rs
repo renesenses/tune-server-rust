@@ -159,8 +159,10 @@ impl PlaybackOrchestrator {
     }
 }
 
+// #7616 — ses montages servent aussi aux étages tiers sur zone réseau
+// (`greffon_natif_tiers_reseau_7616_tests`).
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[cfg(test)]
 mod ombre_5081_tests {

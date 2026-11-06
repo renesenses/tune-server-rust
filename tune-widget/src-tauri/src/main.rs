@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod server;
+mod volume;
+mod vue_mini;
 
 use serde::Serialize;
 use tauri::{
@@ -117,7 +119,8 @@ async fn set_volume(state: State<'_, AppState>, volume: i32) -> Result<(), Strin
     state
         .http
         .put(format!("{url}/api/v1/zones/{zone_id}/volume"))
-        .json(&serde_json::json!({"volume": volume}))
+        // Une fraction, jamais un pourcentage : voir `volume.rs`.
+        .json(&volume::corps_lineaire(volume))
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -136,7 +139,7 @@ async fn search(state: State<'_, AppState>, query: String) -> Result<serde_json:
     let resp = state
         .http
         .get(format!(
-            "{url}/api/v1/search?q={}&limit=8",
+            "{url}/api/v1/search?q={}&limit=8&sources=local",
             urlencoding::encode(&query)
         ))
         .send()
@@ -158,7 +161,14 @@ async fn set_server_url(state: State<'_, AppState>, url: String) -> Result<Strin
         let cfg_dir = dir.join("tune-widget");
         std::fs::create_dir_all(&cfg_dir).ok();
         let cfg_file = cfg_dir.join("config.json");
-        let cfg = serde_json::json!({"server_url": &clean});
+        // Fusionner, pas écraser : `full_mode` (remember_mode) vit dans le
+        // même fichier.
+        let mut cfg: serde_json::Value = std::fs::read_to_string(&cfg_file)
+            .ok()
+            .and_then(|d| serde_json::from_str(&d).ok())
+            .filter(|v: &serde_json::Value| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        cfg["server_url"] = serde_json::json!(&clean);
         std::fs::write(&cfg_file, cfg.to_string()).ok();
     }
     Ok(clean)
@@ -310,26 +320,29 @@ async fn run_shortcut_action(app: tauri::AppHandle, action: ShortcutAction) {
                 .await;
         }
         ShortcutAction::VolUp | ShortcutAction::VolDown => {
-            if let Some(data) = fetch_widget_data(&http, &url, zone_id).await {
-                // widget/data reports volume as 0..1 or 0..100 depending on zone.
-                let vol = data["volume"].as_f64().unwrap_or(0.5);
-                let current = if vol > 1.0 {
-                    vol as i32
-                } else {
-                    (vol * 100.0) as i32
-                };
-                let delta = if matches!(action, ShortcutAction::VolUp) {
-                    5
-                } else {
-                    -5
-                };
-                let next = (current + delta).clamp(0, 100);
-                let _ = http
-                    .put(format!("{url}/api/v1/zones/{zone_id}/volume"))
-                    .json(&serde_json::json!({ "volume": next }))
-                    .send()
-                    .await;
-            }
+            // Le gain et la courbe de la zone sont dans `GET /zones`, pas à la
+            // racine de `/widget/data` (voir `volume::zone_dans`). Sans eux,
+            // on ne touche à rien plutôt que de repartir d'une valeur inventée.
+            let zones = match http.get(format!("{url}/api/v1/zones")).send().await {
+                Ok(r) => r.json::<serde_json::Value>().await.ok(),
+                Err(_) => None,
+            };
+            let Some((gain, courbe)) = zones.as_ref().and_then(|z| volume::zone_dans(z, zone_id))
+            else {
+                tracing::info!(zone_id, "shortcut_volume_zone_unknown");
+                return;
+            };
+            let delta = if matches!(action, ShortcutAction::VolUp) {
+                5
+            } else {
+                -5
+            };
+            let next = volume::apres_un_pas(gain, courbe, delta);
+            let _ = http
+                .put(format!("{url}/api/v1/zones/{zone_id}/volume"))
+                .json(&serde_json::json!({ "volume": next }))
+                .send()
+                .await;
         }
     }
 }
@@ -522,68 +535,40 @@ async fn set_display_mode(app: tauri::AppHandle, full: bool) -> Result<(), Strin
     Ok(())
 }
 
-/// First server version whose web interface has the `?mini=1` layout
-/// (tune-web-client `MiniPlayer.svelte`, shipped in v0.9.64).
-const MINI_LAYOUT_MIN_VERSION: (u32, u32, u32) = (0, 9, 64);
-
-fn parse_version(raw: &str) -> Option<(u32, u32, u32)> {
-    // "0.9.64", "v0.9.64", "0.9.64-rc1" — the pre-release suffix is ignored:
-    // an rc of a supporting version supports it too.
-    let cleaned = raw.trim().trim_start_matches('v');
-    let core = cleaned.split(['-', '+']).next()?;
-    let mut it = core.split('.');
-    let major = it.next()?.parse().ok()?;
-    let minor = it.next()?.parse().ok()?;
-    let patch = it.next().unwrap_or("0").parse().unwrap_or(0);
-    Some((major, minor, patch))
-}
-
-/// Does the server's own web interface provide the mini layout?
+/// Le client web servi par ce serveur affiche-t-il la vue mini ?
 ///
-/// The answer decides between one window and two. It must be a real question
-/// asked of the running server, not an assumption: Sandro points his widget at
-/// a GentooPlayer on another machine, which upgrades on its own schedule. Get
-/// this wrong and `?mini=1` returns the full interface crammed into 320 px —
-/// worse than what the widget does today.
+/// La réponse choisit entre une fenêtre et deux. C'est une vraie question posée
+/// au serveur en marche, pas une supposition : Sandro pointe son widget vers un
+/// GentooPlayer sur une autre machine, mis à jour à son rythme.
 ///
-/// Anything unclear — unreachable, unparseable, missing field — answers `false`
-/// and keeps the current two-window behaviour. The fallback has to be the one
-/// that already works.
+/// On ne sonde plus la VERSION du serveur. Le seuil 0.9.64 désignait
+/// `MiniPlayer.svelte`, parti avec l'ancienne interface le 19/09/2026 : tout
+/// serveur de 0.9.64 à la rc9 répondait « oui » et la fenêtre de 380 px
+/// recevait l'interface complète. Le client web annonce désormais lui-même la
+/// vue mini par `vue-mini.json` (voir `vue_mini::annonce_vue_mini`).
+///
+/// Tout ce qui n'est pas clair — injoignable, 404, `index.html` — répond
+/// `false` et garde l'interface embarquée : le repli doit être ce qui marche.
 async fn server_has_mini_layout(http: &reqwest::Client, url: &str) -> bool {
-    let resp = match http
-        .get(format!("{url}/api/v1/system/version"))
+    let sonde = format!("{}/vue-mini.json", url.trim_end_matches('/'));
+    let corps = match http
+        .get(&sonde)
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
     {
-        Ok(r) => r,
+        Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
+        Ok(r) => {
+            tracing::info!(url = %sonde, status = %r.status(), "mini_layout_probe_absent_keeping_two_windows");
+            return false;
+        }
         Err(e) => {
-            tracing::info!(url = %url, error = %e, "mini_layout_probe_failed_keeping_two_windows");
+            tracing::info!(url = %sonde, error = %e, "mini_layout_probe_failed_keeping_two_windows");
             return false;
         }
     };
-    let body: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::info!(url = %url, error = %e, "mini_layout_probe_unparseable");
-            return false;
-        }
-    };
-    let raw = body
-        .get("version")
-        .or_else(|| body.get("server_version"))
-        .and_then(|v| v.as_str());
-    let Some(parsed) = raw.and_then(parse_version) else {
-        tracing::info!(url = %url, body = %body, "mini_layout_probe_no_version_field");
-        return false;
-    };
-    let supported = parsed >= MINI_LAYOUT_MIN_VERSION;
-    tracing::info!(
-        url = %url,
-        version = ?parsed,
-        supported,
-        "mini_layout_probe"
-    );
+    let supported = vue_mini::annonce_vue_mini(&corps);
+    tracing::info!(url = %sonde, supported, "mini_layout_probe");
     supported
 }
 
@@ -603,7 +588,7 @@ async fn navigate_unified(app: &tauri::AppHandle, full: bool) -> bool {
     let target = if full {
         url.clone()
     } else {
-        format!("{url}/?mini=1")
+        vue_mini::adresse_mini(&url)
     };
     let parsed = match target.parse() {
         Ok(u) => u,
@@ -624,18 +609,36 @@ async fn navigate_unified(app: &tauri::AppHandle, full: bool) -> bool {
     }
     // The two layouts want very different windows. Mini stays on top and out of
     // the taskbar, like the widget it replaces; full behaves like an app.
-    let (w, h) = if full {
+    if full {
         // Meme borne que a l'ouverture : sans elle, repasser en grand rendait
         // a la fenetre les 800 points de haut qui ne tiennent pas sur un
         // bureau de 720 (#1598).
         let (work_area, scale) = active_work_area(app);
-        fit_to_work_area(work_area, scale, FULL_WINDOW_SIZE, FULL_WINDOW_MIN_SIZE)
+        let (w, h) = fit_to_work_area(work_area, scale, FULL_WINDOW_SIZE, FULL_WINDOW_MIN_SIZE);
+        let _ = win.set_max_size(None::<tauri::Size>);
+        let _ = win.set_min_size(Some(tauri::LogicalSize::new(
+            FULL_WINDOW_MIN_SIZE.0,
+            FULL_WINDOW_MIN_SIZE.1,
+        )));
+        let _ = win.set_size(tauri::LogicalSize::new(w, h));
+        let _ = win.set_always_on_top(false);
     } else {
-        (380.0, 560.0)
-    };
-    let _ = win.set_size(tauri::LogicalSize::new(w, h));
-    let _ = win.set_resizable(full);
-    let _ = win.set_always_on_top(!full);
+        // 🔴 La borne MINIMALE d'abord : la fenêtre est construite avec celle
+        // de la fenêtre complète (900 × 600), et `set_size` ne descend pas
+        // en dessous. La fenêtre « mini » faisait donc 900 × 600.
+        let _ = win.set_min_size(Some(tauri::LogicalSize::new(
+            vue_mini::MINI_MIN.0,
+            vue_mini::MINI_MIN.1,
+        )));
+        let _ = win.set_max_size(Some(tauri::LogicalSize::new(
+            vue_mini::MINI_LARGEUR_MAX,
+            vue_mini::MINI_HAUTEUR_MAX,
+        )));
+        let (w, h) = taille_mini(lire_cfg_bool("mini_replie", false));
+        let _ = win.set_size(tauri::LogicalSize::new(w, h));
+        let _ = win.set_always_on_top(lire_cfg_bool("mini_epingle", true));
+    }
+    let _ = win.set_resizable(true);
     let _ = win.set_skip_taskbar(!full);
     let _ = win.set_decorations(true);
     let _ = win.show();
@@ -685,6 +688,109 @@ fn full_mode_active(app: &tauri::AppHandle) -> bool {
     app.get_webview_window("full")
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false)
+}
+
+fn config_file() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("tune-widget").join("config.json"))
+}
+
+/// Lit un booléen de `config.json` (`mini_epingle`, `mini_replie`…).
+fn lire_cfg_bool(cle: &str, defaut: bool) -> bool {
+    config_file()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+        .and_then(|c| c[cle].as_bool())
+        .unwrap_or(defaut)
+}
+
+/// Écrit un booléen dans `config.json` en FUSIONNANT : `server_url` et
+/// `full_mode` vivent dans le même fichier.
+fn ecrire_cfg_bool(cle: &str, valeur: bool) {
+    let Some(file) = config_file() else {
+        return;
+    };
+    let mut cfg: serde_json::Value = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .filter(|v: &serde_json::Value| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    cfg[cle] = serde_json::json!(valeur);
+    if let Some(dir) = file.parent() {
+        if std::fs::create_dir_all(dir).is_ok() {
+            let _ = std::fs::write(&file, cfg.to_string());
+        }
+    }
+}
+
+/// Taille de la fenêtre mini selon qu'elle est repliée (maquette C) ou non.
+fn taille_mini(replie: bool) -> (f64, f64) {
+    if replie {
+        vue_mini::MINI_REPLIE
+    } else {
+        vue_mini::MINI_DEPLIE
+    }
+}
+
+/// Exécute un geste natif demandé par la page (`/__widget/<action>`).
+///
+/// La page ne parle à la fenêtre QUE par ces quatre adresses, que
+/// `vue_mini::decider_navigation` n'accepte que depuis le serveur configuré.
+/// Aucune commande Tauri n'est ouverte à la page distante.
+async fn executer_action(app: tauri::AppHandle, action: vue_mini::ActionWidget) {
+    use vue_mini::ActionWidget;
+    let Some(win) = app.get_webview_window("full") else {
+        return;
+    };
+    match action {
+        ActionWidget::Epingle => {
+            let epingle = !lire_cfg_bool("mini_epingle", true);
+            let _ = win.set_always_on_top(epingle);
+            ecrire_cfg_bool("mini_epingle", epingle);
+            tracing::info!(epingle, "mini_epingle");
+        }
+        ActionWidget::Replier | ActionWidget::Deplier => {
+            let replie = matches!(action, ActionWidget::Replier);
+            let (w, h) = taille_mini(replie);
+            let _ = win.set_size(tauri::LogicalSize::new(w, h));
+            ecrire_cfg_bool("mini_replie", replie);
+            tracing::info!(replie, "mini_replie");
+        }
+        ActionWidget::Complet => set_full_mode(&app, true).await,
+    }
+}
+
+/// Décide d'une navigation de la fenêtre qui charge le serveur, et exécute ce
+/// qui doit l'être. `true` = le moteur charge l'adresse.
+fn garder_navigation(app: &tauri::AppHandle, cible: &tauri::Url) -> bool {
+    // Lecture non bloquante : on est sur le fil de l'interface. Le verrou n'est
+    // tenu qu'un instant, le temps d'écrire une adresse ; s'il l'est, on
+    // refuse plutôt que de charger sans savoir ce qu'est le serveur.
+    let serveur = match app.state::<AppState>().server_url.try_read() {
+        Ok(s) => s.clone(),
+        Err(_) => return false,
+    };
+    match vue_mini::decider_navigation(&serveur, cible) {
+        vue_mini::Decision::Autoriser => true,
+        vue_mini::Decision::Action(action) => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(executer_action(app, action));
+            false
+        }
+        vue_mini::Decision::Externe => {
+            #[allow(deprecated)]
+            {
+                use tauri_plugin_shell::ShellExt;
+                if let Err(e) = app.shell().open(cible.as_str(), None) {
+                    tracing::warn!(url = %cible, error = %e, "lien_externe_non_ouvert");
+                }
+            }
+            false
+        }
+        vue_mini::Decision::Refuser => {
+            tracing::warn!(url = %cible, "navigation_refusee");
+            false
+        }
+    }
 }
 
 /// Persist the chosen mode next to the server URL, so a restart comes back the
@@ -827,6 +933,13 @@ async fn open_full_window(app: &tauri::AppHandle) {
         // equivalent (`plugin:webview|set_webview_zoom`), d'ou la capacite
         // `full-window` qui autorise cette commande sur cette fenetre.
         .zoom_hotkeys_enabled(true)
+        // La fenêtre charge le serveur configuré, et RIEN d'autre : les liens
+        // externes partent dans le navigateur, les gestes `/__widget/…` sont
+        // exécutés sans être chargés (voir `vue_mini::decider_navigation`).
+        .on_navigation({
+            let app = app.clone();
+            move |cible| garder_navigation(&app, cible)
+        })
         .build()
     {
         Ok(win) => {
@@ -1064,8 +1177,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_is_stale, fit_to_work_area, parse_version, FULL_WINDOW_MIN_SIZE, FULL_WINDOW_SIZE,
-        MINI_LAYOUT_MIN_VERSION,
+        cache_is_stale, fit_to_work_area, taille_mini, FULL_WINDOW_MIN_SIZE, FULL_WINDOW_SIZE,
     };
 
     #[test]
@@ -1145,33 +1257,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_shapes_a_server_actually_returns() {
-        assert_eq!(parse_version("0.9.64"), Some((0, 9, 64)));
-        assert_eq!(parse_version("v0.9.64"), Some((0, 9, 64)));
-        assert_eq!(parse_version(" 0.9.64 "), Some((0, 9, 64)));
-        // A pre-release of a supporting version supports it too.
-        assert_eq!(parse_version("0.9.64-rc1"), Some((0, 9, 64)));
-        assert_eq!(parse_version("0.9.64+build7"), Some((0, 9, 64)));
-        // Two components: patch defaults to 0 rather than failing.
-        assert_eq!(parse_version("1.0"), Some((1, 0, 0)));
-    }
-
-    #[test]
-    fn refuses_what_it_cannot_read() {
-        assert_eq!(parse_version(""), None);
-        assert_eq!(parse_version("unknown"), None);
-        assert_eq!(parse_version("0.x.1"), None);
-    }
-
-    #[test]
-    fn the_threshold_sits_where_the_mini_layout_shipped() {
-        // Below: the widget must keep its bundled mini window, because
-        // `?mini=1` on those servers returns the full interface.
-        assert!(parse_version("0.9.63").unwrap() < MINI_LAYOUT_MIN_VERSION);
-        assert!(parse_version("0.8.99").unwrap() < MINI_LAYOUT_MIN_VERSION);
-        // At and above: the server can serve both layouts.
-        assert!(parse_version("0.9.64").unwrap() >= MINI_LAYOUT_MIN_VERSION);
-        assert!(parse_version("0.9.70").unwrap() >= MINI_LAYOUT_MIN_VERSION);
-        assert!(parse_version("1.0.0").unwrap() >= MINI_LAYOUT_MIN_VERSION);
+    fn la_fenetre_mini_se_replie_en_bandeau() {
+        assert_eq!(taille_mini(false), (360.0, 560.0));
+        assert_eq!(taille_mini(true), (360.0, 140.0));
     }
 }

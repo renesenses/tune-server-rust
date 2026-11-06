@@ -1,0 +1,4 @@
+module TuneServerFFI {
+    header "tuneserver.h"
+    export *
+}

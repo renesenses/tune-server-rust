@@ -215,6 +215,11 @@ pub(super) async fn lyrics_fetch(State(state): State<AppState>) -> impl IntoResp
         }));
     });
 
+    let cle_message = if consent {
+        "api.lyrics.passStartedLrclib"
+    } else {
+        "api.lyrics.passStartedLrcOnly"
+    };
     (
         StatusCode::ACCEPTED,
         Json(json!({
@@ -222,12 +227,8 @@ pub(super) async fn lyrics_fetch(State(state): State<AppState>) -> impl IntoResp
             // Ce que la passe va réellement faire — pas ce qu'on aimerait
             // qu'elle fasse.
             "lrclib": consent,
-            "message": if consent {
-                "passe de fond démarrée (fichiers .lrc puis LRCLIB)"
-            } else {
-                "passe de fond démarrée (fichiers .lrc seulement — \
-                 lyrics_lrclib_enabled n'est pas activé)"
-            },
+            "message": crate::message_api::texte(cle_message, &[]),
+            "message_key": cle_message,
         })),
     )
 }
@@ -262,8 +263,8 @@ pub(super) async fn lyrics_write(State(state): State<AppState>) -> impl IntoResp
                 "status": "refused",
                 "reason": "write_disabled",
                 "setting": lyrics_pass::SETTING_WRITE_ENABLED,
-                "message": "l'écriture dans les fichiers n'est pas autorisée \
-                            (lyrics_write_files_enabled)",
+                "message": crate::message_api::texte("api.lyrics.writeDisabled", &[]),
+                "message_key": "api.lyrics.writeDisabled",
             })),
         );
     }
@@ -333,7 +334,8 @@ pub(super) async fn lyrics_write(State(state): State<AppState>) -> impl IntoResp
         Json(json!({
             "status": "accepted",
             "target": target,
-            "message": "écriture démarrée",
+            "message": crate::message_api::texte("api.lyrics.writeStarted", &[]),
+            "message_key": "api.lyrics.writeStarted",
         })),
     )
 }

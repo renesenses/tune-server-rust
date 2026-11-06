@@ -120,6 +120,17 @@ pub struct Convolver {
     scratch: Vec<Vec<f32>>,
     fwd: Arc<dyn RealToComplex<f32>>,
     inv: Arc<dyn ComplexToReal<f32>>,
+    /// #7632 — l'entrée SÈCHE, retardée de `block_size` trames : exactement
+    /// alignée sur la sortie convoluée. Elle sert au fondu d'extinction
+    /// ([`Self::eteindre_en_fondu`]) : passer du convolué au direct sans
+    /// sauter de `latency_frames()` trames, donc sans clic.
+    direct_retarde: Vec<VecDeque<f32>>,
+    /// Fondu d'extinction en cours : (trames restantes, trames totales).
+    fondu: Option<(usize, usize)>,
+    /// Fondu terminé : le moteur ne convolue plus, il ne rend que l'entrée
+    /// retardée de sa latence, jusqu'à ce qu'on le retire à la frontière de
+    /// piste suivante.
+    eteint: bool,
 }
 
 impl Convolver {
@@ -163,6 +174,7 @@ impl Convolver {
         // Amorçage : la latence de la convolution, rendue explicite.
         let output_buf = vec![VecDeque::from(vec![0.0f32; block_size]); channels];
         let scratch = vec![vec![0.0f32; block_size]; channels];
+        let direct_retarde = vec![VecDeque::from(vec![0.0f32; block_size]); channels];
 
         Self {
             block_size,
@@ -177,7 +189,32 @@ impl Convolver {
             scratch,
             fwd,
             inv,
+            direct_retarde,
+            fondu: None,
+            eteint: false,
         }
+    }
+
+    /// #7632 — éteindre la convolution EN FONDU, flux en cours : sur
+    /// `trames` trames, la sortie passe du convolué à l'entrée directe
+    /// retardée de `latency_frames()` (alignée sur le convolué), puis ne rend
+    /// plus que celle-ci. Ni saut d'échantillon ni saut de temps : pas de
+    /// clic. Le moteur reste un simple retard jusqu'à la piste suivante, où
+    /// la sortie ne le reconstruit pas. Sans effet s'il est déjà éteint.
+    pub fn eteindre_en_fondu(&mut self, trames: usize) {
+        if self.eteint || self.fondu.is_some() {
+            return;
+        }
+        if trames == 0 {
+            self.eteint = true;
+        } else {
+            self.fondu = Some((trames, trames));
+        }
+    }
+
+    /// La convolution est-elle éteinte (fondu terminé) ?
+    pub fn est_eteint(&self) -> bool {
+        self.eteint
     }
 
     /// Parse a WAV impulse response into per-channel f32 taps + its sample
@@ -405,6 +442,8 @@ impl Convolver {
             // suivante sortirait du néant.
             self.output_buf[c].extend(std::iter::repeat_n(0.0f32, self.block_size));
             self.overlap[c].iter_mut().for_each(|v| *v = 0.0);
+            self.direct_retarde[c].clear();
+            self.direct_retarde[c].extend(std::iter::repeat_n(0.0f32, self.block_size));
             for slot in self.fdl[c].iter_mut() {
                 slot.iter_mut().for_each(|v| *v = Complex::new(0.0, 0.0));
             }
@@ -457,6 +496,18 @@ impl Convolver {
         let frame_count = samples.len() / ch;
 
         for frame in 0..frame_count {
+            // #7632 — l'entrée sèche, retardée de la latence : la sortie d'un
+            // moteur éteint, et l'autre moitié du fondu d'extinction.
+            for c in 0..ch {
+                let x = samples[frame * ch + c];
+                self.direct_retarde[c].push_back(x);
+            }
+            if self.eteint {
+                for c in 0..ch {
+                    samples[frame * ch + c] = self.direct_retarde[c].pop_front().unwrap_or(0.0);
+                }
+                continue;
+            }
             for c in 0..ch {
                 self.input_buf[c].push(samples[frame * ch + c]);
             }
@@ -474,8 +525,24 @@ impl Convolver {
             // Une trame entrée, une trame sortie. La file est amorcée, donc
             // elle n'est jamais vide — le `unwrap_or` ne couvre qu'un canal
             // dont l'IR aurait zéro partition.
+            let gain_convolue = self
+                .fondu
+                .map(|(restant, total)| restant as f32 / total as f32);
             for c in 0..ch {
-                samples[frame * ch + c] = self.output_buf[c].pop_front().unwrap_or(0.0);
+                let convolue = self.output_buf[c].pop_front().unwrap_or(0.0);
+                let direct = self.direct_retarde[c].pop_front().unwrap_or(0.0);
+                samples[frame * ch + c] = match gain_convolue {
+                    None => convolue,
+                    Some(g) => convolue * g + direct * (1.0 - g),
+                };
+            }
+            if let Some((restant, total)) = self.fondu {
+                if restant <= 1 {
+                    self.fondu = None;
+                    self.eteint = true;
+                } else {
+                    self.fondu = Some((restant - 1, total));
+                }
             }
         }
     }
@@ -600,13 +667,85 @@ impl Convolver {
     /// ajouter du bruit détruirait précisément l'identité qu'on vient de lui
     /// rendre. Voir « Où ce dither ne doit PAS aller » dans [`crate::audio::dither`].
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16) {
+        let Some(mut buf) = self.pcm_vers_f32(pcm, bit_depth) else {
+            return;
+        };
+        self.process_offline(&mut buf);
+        f32_vers_pcm(&buf, pcm, bit_depth);
+    }
+
+    /// Convolution d'un FLUX découpé en tampons successifs (#7642).
+    ///
+    /// [`Self::process_pcm`] traite chaque appel comme une piste entière : il
+    /// complète le tampon de zéros jusqu'au bloc, pousse `latency_frames()`
+    /// trames de silence pour compenser la latence, puis les jette. Appelé
+    /// tampon après tampon sur la MÊME instance, ces zéros entrent dans la
+    /// ligne à retard comme s'ils étaient du signal : la queue de l'IR qui
+    /// déborde d'un tampon ne rejoint jamais le suivant, et le suivant voit un
+    /// passé décalé. Une IR de correction de pièce (des milliers de taps)
+    /// était ainsi coupée à chaque frontière de tampon du bras progressif.
+    ///
+    /// Ici, l'état est conservé d'un appel à l'autre ([`Self::process_interleaved`],
+    /// indépendant du découpage), et la latence est compensée sur le flux
+    /// entier : les `latency_frames()` premières trames de sortie — l'amorce
+    /// de silence — sont retirées du début (`reste_a_jeter`, tenu par
+    /// l'appelant et initialisé à `latency_frames()`), et
+    /// [`Self::terminer_pcm_en_flux`] rend en fin de flux ce que le moteur
+    /// retient encore. Somme des longueurs rendues = somme des longueurs
+    /// reçues, et le résultat est celui de [`Self::process_pcm`] sur la piste
+    /// entière. Le tampon peut donc RACCOURCIR (jamais en dessous de zéro) au
+    /// début du flux ; il reste aligné sur la trame.
+    pub fn process_pcm_en_flux(
+        &mut self,
+        pcm: &mut Vec<u8>,
+        bit_depth: u16,
+        reste_a_jeter: &mut usize,
+    ) {
+        let Some(mut buf) = self.pcm_vers_f32(pcm, bit_depth) else {
+            return;
+        };
+        self.process_interleaved(&mut buf);
+        let ch = self.channels;
+        let jetees = (*reste_a_jeter).min(buf.len() / ch);
+        *reste_a_jeter -= jetees;
+        let garde = &buf[jetees * ch..];
+        let bps = (bit_depth / 8) as usize;
+        pcm.truncate(garde.len() * bps);
+        f32_vers_pcm(garde, pcm, bit_depth);
+    }
+
+    /// Fin du flux de [`Self::process_pcm_en_flux`] : rend, en octets PCM, les
+    /// trames que la latence retenait encore, puis remet le moteur à zéro
+    /// (`reste_a_jeter` est réarmé pour un flux suivant).
+    pub fn terminer_pcm_en_flux(&mut self, bit_depth: u16, reste_a_jeter: &mut usize) -> Vec<u8> {
+        let ch = self.channels;
+        let bps = (bit_depth / 8) as usize;
+        if ch == 0 || bps == 0 || !matches!(bit_depth, 16 | 24 | 32) {
+            return Vec::new();
+        }
+        let latence = self.latency_frames();
+        let mut queue = vec![0.0f32; latence * ch];
+        self.process_interleaved(&mut queue);
+        let jetees = (*reste_a_jeter).min(latence);
+        let garde = &queue[jetees * ch..];
+        let mut pcm = vec![0u8; garde.len() * bps];
+        f32_vers_pcm(garde, &mut pcm, bit_depth);
+        self.reset();
+        *reste_a_jeter = self.latency_frames();
+        pcm
+    }
+
+    /// Décodage du PCM entier entrelacé en `f32`, à l'échelle 2^(n−1) (voir
+    /// [`Self::process_pcm`]). `None` : rien à faire (aucun canal, tampon vide,
+    /// profondeur non gérée).
+    fn pcm_vers_f32(&self, pcm: &[u8], bit_depth: u16) -> Option<Vec<f32>> {
         let ch = self.channels;
         if ch == 0 || pcm.is_empty() {
-            return;
+            return None;
         }
         let bps = (bit_depth / 8) as usize;
         if bps == 0 {
-            return;
+            return None;
         }
         let total = pcm.len() / bps;
         let mut buf: Vec<f32> = Vec::with_capacity(total);
@@ -629,41 +768,50 @@ impl Convolver {
                     let v = i32::from_le_bytes([pcm[o], pcm[o + 1], pcm[o + 2], pcm[o + 3]]);
                     v as f32 / 2147483648.0
                 }
-                _ => return,
+                _ => return None,
             };
             buf.push(s);
         }
-        self.process_offline(&mut buf);
-        for i in 0..total {
-            let o = i * bps;
-            let s = buf.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
-            match bit_depth {
-                // Même échelle qu'au décodage (2^(n−1)), arrondi au plus
-                // proche, saturation au rail EN DERNIER — par la porte
-                // partagée, avec un bruit nul : le convolveur ne dithère pas.
-                16 => {
-                    let v = quantifier_avec(f64::from(s) * 32_768.0, 0.0, -32_768.0, 32_767.0);
-                    pcm[o..o + 2].copy_from_slice(&(v as i16).to_le_bytes());
-                }
-                24 => {
-                    let v =
-                        quantifier_avec(f64::from(s) * 8_388_608.0, 0.0, -8_388_608.0, 8_388_607.0);
-                    let b = (v as i32).to_le_bytes();
-                    pcm[o] = b[0];
-                    pcm[o + 1] = b[1];
-                    pcm[o + 2] = b[2];
-                }
-                32 => {
-                    let v = quantifier_avec(
-                        f64::from(s) * 2_147_483_648.0,
-                        0.0,
-                        f64::from(i32::MIN),
-                        f64::from(i32::MAX),
-                    );
-                    pcm[o..o + 4].copy_from_slice(&(v as i32).to_le_bytes());
-                }
-                _ => {}
+        Some(buf)
+    }
+}
+
+/// Réencodage des échantillons `f32` dans `pcm` (autant d'échantillons que
+/// `pcm` en contient), à la même échelle qu'au décodage.
+fn f32_vers_pcm(buf: &[f32], pcm: &mut [u8], bit_depth: u16) {
+    let bps = (bit_depth / 8) as usize;
+    if bps == 0 {
+        return;
+    }
+    let total = pcm.len() / bps;
+    for i in 0..total {
+        let o = i * bps;
+        let s = buf.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+        match bit_depth {
+            // Même échelle qu'au décodage (2^(n−1)), arrondi au plus
+            // proche, saturation au rail EN DERNIER — par la porte
+            // partagée, avec un bruit nul : le convolveur ne dithère pas.
+            16 => {
+                let v = quantifier_avec(f64::from(s) * 32_768.0, 0.0, -32_768.0, 32_767.0);
+                pcm[o..o + 2].copy_from_slice(&(v as i16).to_le_bytes());
             }
+            24 => {
+                let v = quantifier_avec(f64::from(s) * 8_388_608.0, 0.0, -8_388_608.0, 8_388_607.0);
+                let b = (v as i32).to_le_bytes();
+                pcm[o] = b[0];
+                pcm[o + 1] = b[1];
+                pcm[o + 2] = b[2];
+            }
+            32 => {
+                let v = quantifier_avec(
+                    f64::from(s) * 2_147_483_648.0,
+                    0.0,
+                    f64::from(i32::MIN),
+                    f64::from(i32::MAX),
+                );
+                pcm[o..o + 4].copy_from_slice(&(v as i32).to_le_bytes());
+            }
+            _ => {}
         }
     }
 }
@@ -1246,5 +1394,83 @@ mod tests {
              gauche, les deux canaux partagent le meme filtre : {}",
             sortie[i + 1]
         );
+    }
+}
+
+/// #7632 — extinction de la convolution flux en cours (droit Premium retiré).
+#[cfg(test)]
+mod extinction_7632_tests {
+    use super::*;
+
+    /// Un sinus stéréo de 1 kHz à 48 kHz.
+    fn sinus(trames: usize) -> Vec<f32> {
+        (0..trames)
+            .flat_map(|n| {
+                let v = (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin() * 0.5;
+                [v, v]
+            })
+            .collect()
+    }
+
+    /// IR d'un gain de 0,25 : la convolution rend `0,25 · x` retardé.
+    fn moteur() -> Convolver {
+        let mut ir = vec![0.0f32; 300];
+        ir[0] = 0.25;
+        Convolver::new(&[ir.clone(), ir], 256)
+    }
+
+    #[test]
+    fn le_fondu_rend_l_entree_intacte_sans_saut_7632() {
+        let mut c = moteur();
+        let lat = c.latency_frames();
+        let x = sinus(48_000);
+        let mut y = x.clone();
+        // 0,2 s convoluées, puis extinction en 480 trames (10 ms).
+        let coupe = 9_600 * 2;
+        c.process_interleaved(&mut y[..coupe]);
+        c.eteindre_en_fondu(480);
+        c.process_interleaved(&mut y[coupe..]);
+        assert!(c.est_eteint());
+
+        // Avant : convolué (0,25 · x retardé). Après le fondu : x retardé,
+        // À L'ÉCHANTILLON PRÈS — aucune convolution.
+        for n in (lat + 10)..(coupe / 2) {
+            assert!(
+                (y[2 * n] - 0.25 * x[2 * (n - lat)]).abs() < 1e-4,
+                "trame {n}"
+            );
+        }
+        for n in (coupe / 2 + 480)..48_000 {
+            assert_eq!(y[2 * n], x[2 * (n - lat)], "trame {n} : encore convoluée");
+            assert_eq!(y[2 * n + 1], x[2 * (n - lat) + 1]);
+        }
+        // Pas de clic : aucun pas d'échantillon plus grand que celui du sinus
+        // d'entrée (la pente maximale d'un sinus de 0,5 à 1 kHz).
+        let pas_max_entree = x
+            .chunks(2)
+            .zip(x.chunks(2).skip(1))
+            .map(|(a, b)| (b[0] - a[0]).abs())
+            .fold(0.0f32, f32::max);
+        for n in (lat + 1)..48_000 {
+            let pas = (y[2 * n] - y[2 * (n - 1)]).abs();
+            assert!(
+                pas <= pas_max_entree * 1.05,
+                "saut de {pas} à la trame {n} (entrée : {pas_max_entree}) : clic"
+            );
+        }
+    }
+
+    #[test]
+    fn eteint_le_flush_rend_la_reserve_directe_7632() {
+        let mut c = moteur();
+        let lat = c.latency_frames();
+        c.eteindre_en_fondu(0);
+        let x = sinus(1_000);
+        let mut y = x.clone();
+        c.process_interleaved(&mut y);
+        let queue = c.flush();
+        assert_eq!(queue.len(), lat * 2);
+        // Les `lat` dernières trames d'entrée sortent telles quelles.
+        assert_eq!(&queue[..], &x[(1_000 - lat) * 2..]);
     }
 }

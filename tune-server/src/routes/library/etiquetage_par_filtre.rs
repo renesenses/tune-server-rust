@@ -42,8 +42,13 @@ pub(super) struct CorpsEtiquetage {
 }
 
 /// Le filtre de la vue, collection résolue comme `GET /library/tracks`.
-fn filtre_de_la_vue(state: &AppState, raw: Option<&str>) -> Result<TrackFilter, AppError> {
+fn filtre_de_la_vue(
+    state: &AppState,
+    profil: i64,
+    raw: Option<&str>,
+) -> Result<TrackFilter, AppError> {
     let mut filtre = track_filter_from_raw(raw)?;
+    filtre.profile_id = profil;
     if let Some(nom) = values_of(raw, "collection")
         .into_iter()
         .map(|s| s.trim().to_string())
@@ -104,6 +109,7 @@ fn erreur_interne(e: impl std::fmt::Display) -> Response {
 
 /// `GET /library/tag-by-filter/preview` — combien d'objets le geste toucherait.
 pub(super) async fn apercu(
+    profile: crate::routes::active_profile::ActiveProfile,
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, AppError> {
@@ -115,7 +121,7 @@ pub(super) async fn apercu(
         Ok(c) => c,
         Err(r) => return Ok(r),
     };
-    let filtre = filtre_de_la_vue(&state, raw.as_deref())?;
+    let filtre = filtre_de_la_vue(&state, profile.id(), raw.as_deref())?;
     hors_executeur("tag_by_filter_preview", move || {
         let repo = TrackRepo::with_backend(state.backend.clone());
         match repo.compter_pour_etiquetage(&filtre, c) {
@@ -137,6 +143,7 @@ pub(super) async fn apercu(
 /// résultat, en une instruction SQL. `changed` compte les lignes réellement
 /// posées (ou retirées) : relancer la pose rend `changed: 0`.
 pub(super) async fn appliquer(
+    profile: crate::routes::active_profile::ActiveProfile,
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
     Json(corps): Json<CorpsEtiquetage>,
@@ -145,7 +152,7 @@ pub(super) async fn appliquer(
         Ok(c) => c,
         Err(r) => return Ok(r),
     };
-    let filtre = filtre_de_la_vue(&state, raw.as_deref())?;
+    let filtre = filtre_de_la_vue(&state, profile.id(), raw.as_deref())?;
     hors_executeur("tag_by_filter", move || {
         let tags = TagRepo::with_backend(state.backend.clone());
         match tags.get(corps.tag_id) {
