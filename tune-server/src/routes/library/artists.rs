@@ -728,6 +728,9 @@ pub(super) fn bio_stockee_dans_une_autre_langue(
 /// une autre langue CONNUE, la stockée d'abord, puis celle du site, servie avec
 /// sa vraie langue (`bio_provenance.lang`) et `repli` ; (d) rien (voir
 /// [`bio_stockee_dans_une_autre_langue`] pour les bios sans langue).
+// Les routes passent par `choisir_apres_le_site_et_le_service` (#8022) ;
+// cette forme sans service reste pour les témoins de #7027.
+#[cfg(test)]
 pub(super) fn choisir_apres_le_site(
     cle: &str,
     nom: &str,
