@@ -3478,6 +3478,8 @@ pub(crate) async fn appliquer_le_parc_local(
     // Phase 1: Register new devices and remove stale ones (hold lock briefly)
     let mut new_devices_to_zone: Vec<(String, String, bool)> = Vec::new();
     let mut removed_device_ids: Vec<String> = Vec::new();
+    // #7949 — les sorties retirées, arrêtées une fois le registre relâché.
+    let mut sorties_retirees = Vec::new();
     {
         let mut outputs = state.outputs.lock().await;
         let existing_ids: std::collections::HashSet<String> = outputs
@@ -3582,7 +3584,7 @@ pub(crate) async fn appliquer_le_parc_local(
             }
 
             if !is_playing {
-                outputs.remove(old_id);
+                sorties_retirees.extend(outputs.remove(old_id));
                 info!(device_id = %old_id, "local_audio_device_removed");
                 removed_device_ids.push(old_id.clone());
             }
@@ -3596,6 +3598,9 @@ pub(crate) async fn appliquer_le_parc_local(
             );
         }
     } // outputs lock released here
+    // #7949 — une sortie en pause retirée garde sinon son fil et son
+    // périphérique : le DAC rebranché le trouverait occupé.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(sorties_retirees).await;
 
     // Phase 2a: Mark zones of unplugged devices offline and tell the clients
     // (no lock held). Without this the zone stayed listed as playable after a

@@ -1823,8 +1823,9 @@ async fn clear_devices(State(state): State<AppState>) -> impl IntoResponse {
     drop(outputs);
     let mut removed = 0;
     for id in ids {
-        let mut outputs = state.outputs.lock().await;
-        outputs.remove(&id);
+        let retiree = state.outputs.lock().await.remove(&id);
+        // #7949 — une sortie retirée en lecture continuait de jouer.
+        tune_core::outputs::registry::arreter_les_sorties_retirees(retiree).await;
         removed += 1;
     }
     // Forget all persisted manual devices too, so a clear is durable.
@@ -1843,9 +1844,9 @@ async fn delete_device(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
 ) -> impl IntoResponse {
-    let mut outputs = state.outputs.lock().await;
-    outputs.remove(&device_id);
-    drop(outputs);
+    let retiree = state.outputs.lock().await.remove(&device_id);
+    // #7949 — arrêtée hors du verrou : elle jouait encore, sans zone.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(retiree).await;
     // Also drop it from persistence so it isn't re-registered on next startup.
     forget_manual_device(&state, &device_id);
     // #6299 — un renderer DLNA decouvert aussi : il etait re-sonde a chaque
@@ -1968,9 +1969,10 @@ async fn ignore_device(
     // Les identifiants jumeaux retirés du registre avec lui : leurs zones
     // sont les siennes (#4957).
     let mut jumelles: Vec<String> = Vec::new();
+    let mut sorties_retirees = Vec::new();
     {
         let mut outputs = state.outputs.lock().await;
-        outputs.remove(&device_id);
+        sorties_retirees.extend(outputs.remove(&device_id));
         // Les identités JUMELLES du même appareil, enregistrées sous un autre
         // identifiant : c'est par elles que le Sonos revenait.
         for info in &infos {
@@ -1985,11 +1987,14 @@ async fn ignore_device(
                 tune_core::db::ignored_device_repo::DeviceIdentity::new(id, s("host"), s("name"))
                     .with_protocol(Some(s("type")));
             if tune_core::db::ignored_device_repo::identity_matches(&snapshot, identite) {
-                outputs.remove(id);
+                sorties_retirees.extend(outputs.remove(id));
                 jumelles.push(id.to_string());
             }
         }
     }
+    // #7949 — un appareil ignoré se tait : ses sorties sont arrêtées, pas
+    // seulement oubliées.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(sorties_retirees).await;
     forget_manual_device(&state, &device_id);
 
     // La zone de l'appareil, s'il en a une : masquée, au motif `appareil_ignore`
@@ -3312,6 +3317,84 @@ mod oubli_des_dlna_decouverts_6299 {
         assert!(
             uuids_dlna_decouverts(&state.backend).is_empty(),
             "apres « effacer », aucun renderer decouvert ne doit rester a re-sonder"
+        );
+    }
+}
+
+/// #7949 — une sortie retirée du registre par une route est arrêtée : sans
+/// cela, elle continuait de jouer sur une zone qui n'existait plus.
+#[cfg(test)]
+mod sortie_retiree_arretee_7949 {
+    use super::*;
+    use tune_core::outputs::mock::MockOutput;
+    use tune_core::outputs::traits::OutputTarget;
+
+    type Sortie = Arc<tokio::sync::Mutex<Box<dyn OutputTarget>>>;
+
+    /// Une sortie factice en lecture dans le registre, et sa poignée gardée
+    /// pour relire ses `stop()` après le retrait.
+    async fn banc(id: &str) -> (tempfile::TempDir, AppState, Sortie) {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("tune.db");
+        let state = AppState::new(chemin.to_str().unwrap(), 0, Default::default()).unwrap();
+        let mut outputs = state.outputs.lock().await;
+        outputs.register(Box::new(MockOutput::new(id, "Factice 7949")));
+        let sortie = outputs.get(id).unwrap();
+        drop(outputs);
+        sortie
+            .lock()
+            .await
+            .play_url("http://127.0.0.1:9/7949.flac", "audio/flac", None, None)
+            .await
+            .unwrap();
+        (dossier, state, sortie)
+    }
+
+    async fn arrets(sortie: &Sortie) -> u64 {
+        let sortie = sortie.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .unwrap()
+            .stop_call_count()
+    }
+
+    #[tokio::test]
+    async fn supprimer_l_appareil_arrete_sa_sortie() {
+        let (_dossier, state, sortie) = banc("dlna:factice-7949").await;
+        let _ = delete_device(State(state.clone()), Path("dlna:factice-7949".into()))
+            .await
+            .into_response();
+        assert!(!state.outputs.lock().await.contains("dlna:factice-7949"));
+        assert_eq!(
+            arrets(&sortie).await,
+            1,
+            "#7949 : l'appareil supprimé n'a pas été arrêté, il joue encore sans zone"
+        );
+    }
+
+    #[tokio::test]
+    async fn tout_effacer_arrete_chaque_sortie() {
+        let (_dossier, state, sortie) = banc("dlna:factice-7949").await;
+        let _ = clear_devices(State(state.clone())).await.into_response();
+        assert_eq!(
+            arrets(&sortie).await,
+            1,
+            "#7949 : « effacer les appareils » a laissé jouer une sortie retirée"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignorer_l_appareil_arrete_sa_sortie() {
+        let (_dossier, state, sortie) = banc("dlna:factice-7949").await;
+        let _ = ignore_device(State(state.clone()), Path("dlna:factice-7949".into()))
+            .await
+            .into_response();
+        assert!(!state.outputs.lock().await.contains("dlna:factice-7949"));
+        assert_eq!(
+            arrets(&sortie).await,
+            1,
+            "#7949 : l'appareil ignoré a été retiré sans être arrêté"
         );
     }
 }

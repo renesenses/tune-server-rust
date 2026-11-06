@@ -2785,6 +2785,7 @@ pub(crate) async fn remplacer_le_repli_wasapi(
         enregistrees: enregistrees.clone(),
         ..Default::default()
     };
+    let mut sorties_retirees = Vec::new();
     {
         let mut outputs = state.outputs.lock().await;
         for id in repli {
@@ -2804,10 +2805,13 @@ pub(crate) async fn remplacer_le_repli_wasapi(
                 rapport.gardees_en_lecture.push(id.clone());
                 continue;
             }
-            outputs.remove(id);
+            sorties_retirees.extend(outputs.remove(id));
             rapport.retirees.push(id.clone());
         }
     }
+    // #7949 — arrêtées hors du verrou du registre : une sortie WASAPI en
+    // pause gardait son fil et son périphérique.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(sorties_retirees).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     for id in &rapport.retirees {
         let _ = zone_repo.set_online_by_device(id, false);
