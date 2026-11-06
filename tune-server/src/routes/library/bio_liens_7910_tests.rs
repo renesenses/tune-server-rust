@@ -144,6 +144,55 @@ async fn une_bio_reecrite_ne_reprend_pas_les_liens_de_l_ancienne_7910() {
             .all(|s| s.get("url").is_none()),
         "{corps}"
     );
+    assert!(
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .get("bio_liens:artiste:1")
+            .unwrap()
+            .is_none(),
+        "les liens d'une bio réécrite doivent être effacés à la lecture"
+    );
+}
+
+#[tokio::test]
+async fn les_liens_ranges_ne_sortent_pas_dans_la_configuration_7910() {
+    let state = etat();
+    bio_segments::ranger_liens_externes(
+        &state.backend,
+        GenreDeLien::Artiste,
+        1,
+        BIO_ARTISTE,
+        &[LienExterne {
+            texte: "Read more on Last.fm".into(),
+            url: "https://www.last.fm/music/Radiohead".into(),
+        }],
+    );
+    let (status, config) = demander(&state, "/api/v1/system/config").await;
+    assert_eq!(status, StatusCode::OK);
+    let fuites: Vec<&String> = config
+        .as_object()
+        .expect("la configuration est un objet")
+        .keys()
+        .filter(|k| k.starts_with("bio_liens:"))
+        .collect();
+    assert!(
+        fuites.is_empty(),
+        "GET /system/config publie les liens rangés des bios : {fuites:?}"
+    );
+    let export = tune_core::config_export::exporter(&state.backend, false).unwrap();
+    assert!(
+        !export.to_string().contains("bio_liens:"),
+        "l'export de configuration emporte les liens rangés des bios"
+    );
+    // Les liens restent lisibles par leur clé : la bio les porte toujours.
+    let (_, corps) = demander(&state, "/api/v1/library/artists/1/bio?lang=fr").await;
+    assert!(
+        corps["bio_segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.get("url").is_some()),
+        "{corps}"
+    );
 }
 
 #[tokio::test]

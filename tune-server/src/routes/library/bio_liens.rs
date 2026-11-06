@@ -112,7 +112,7 @@ async fn avec_segments(
     let mut sortie = Json(json).into_response();
     for (nom, valeur) in parts.headers.iter() {
         if nom != header::CONTENT_LENGTH && nom != header::CONTENT_TYPE {
-            sortie.headers_mut().insert(nom.clone(), valeur.clone());
+            sortie.headers_mut().append(nom.clone(), valeur.clone());
         }
     }
     sortie
@@ -166,48 +166,62 @@ fn segments_en_cache(
         ),
     );
     let signature = signature_de_la_bibliotheque(db);
-
-    let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
-    caches.retain(|c| c.base.strong_count() > 0);
     let ici = Arc::downgrade(db);
-    let position = caches.iter().position(|c| Weak::ptr_eq(&c.base, &ici));
-    let a_jour = position.is_some_and(|p| {
-        let c = &caches[p];
-        c.signature == signature && c.bati_le.elapsed() < DUREE_DE_L_INDEX
-    });
-    if !a_jour {
-        let index = match bio_segments::charger_index(db) {
-            Ok(i) => Arc::new(i),
-            Err(e) => {
-                tracing::warn!(error = %e, "bio_segments_index_failed");
-                Arc::new(IndexDesNoms::default())
+
+    // Le verrou n'est jamais tenu pendant la lecture de la bibliothèque : une
+    // grosse base ferait attendre toutes les bios, de toutes les bases.
+    let index_a_jour = {
+        let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
+        caches.retain(|c| c.base.strong_count() > 0);
+        match caches.iter().find(|c| Weak::ptr_eq(&c.base, &ici)) {
+            Some(c) if c.signature == signature && c.bati_le.elapsed() < DUREE_DE_L_INDEX => {
+                if let Some(s) = c.segments.get(&cle) {
+                    return s.clone();
+                }
+                Some(c.index.clone())
             }
-        };
-        let neuf = CacheDUneBase {
-            base: ici,
-            signature,
-            bati_le: Instant::now(),
-            index,
-            segments: HashMap::new(),
-        };
-        match position {
-            Some(p) => caches[p] = neuf,
-            None => caches.push(neuf),
+            _ => None,
         }
+    };
+    let index = match index_a_jour {
+        Some(index) => index,
+        None => {
+            let index = match bio_segments::charger_index(db) {
+                Ok(i) => Arc::new(i),
+                Err(e) => {
+                    tracing::warn!(error = %e, "bio_segments_index_failed");
+                    Arc::new(IndexDesNoms::default())
+                }
+            };
+            let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
+            let neuf = CacheDUneBase {
+                base: ici.clone(),
+                signature: signature.clone(),
+                bati_le: Instant::now(),
+                index: index.clone(),
+                segments: HashMap::new(),
+            };
+            match caches.iter().position(|c| Weak::ptr_eq(&c.base, &ici)) {
+                Some(p) => caches[p] = neuf,
+                None => caches.push(neuf),
+            }
+            index
+        }
+    };
+
+    let segments = bio_segments::segments_de_la_bio(bio, &index, exclus, &externes);
+    let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
+    // L'entrée peut avoir été rebâtie entre-temps par une autre requête : on
+    // ne range ces segments qu'auprès de l'index qui les a produits.
+    if let Some(cache) = caches
+        .iter_mut()
+        .find(|c| Weak::ptr_eq(&c.base, &ici) && Arc::ptr_eq(&c.index, &index))
+    {
+        if cache.segments.len() >= SEGMENTS_MAX {
+            cache.segments.clear();
+        }
+        cache.segments.insert(cle, segments.clone());
     }
-    let p = caches
-        .iter()
-        .position(|c| Weak::ptr_eq(&c.base, &Arc::downgrade(db)))
-        .expect("entrée posée ci-dessus");
-    let cache = &mut caches[p];
-    if let Some(s) = cache.segments.get(&cle) {
-        return s.clone();
-    }
-    let segments = bio_segments::segments_de_la_bio(bio, &cache.index, exclus, &externes);
-    if cache.segments.len() >= SEGMENTS_MAX {
-        cache.segments.clear();
-    }
-    cache.segments.insert(cle, segments.clone());
     segments
 }
 

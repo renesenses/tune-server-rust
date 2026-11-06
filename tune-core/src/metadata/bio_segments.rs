@@ -612,13 +612,46 @@ pub fn liens_externes_ranges(
     texte: &str,
 ) -> Vec<LienExterne> {
     let reglages = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
-    let Some(json) = reglages.get(&cle_des_liens(genre, id)).ok().flatten() else {
+    let cle = cle_des_liens(genre, id);
+    let Some(json) = reglages.get(&cle).ok().flatten() else {
         return Vec::new();
     };
     match serde_json::from_str::<LiensRanges>(&json) {
         Ok(r) if r.empreinte == empreinte(texte) => r.liens,
-        _ => Vec::new(),
+        Ok(r) => {
+            // La bio ENREGISTRÉE a été réécrite depuis (synchronisation
+            // communautaire, saisie à la main) : ces liens ne la décrivent
+            // plus, la ligne s'efface. Une bio servie dans une autre langue
+            // que celle enregistrée ne l'efface pas.
+            if bio_enregistree(db, genre, id).is_none_or(|b| empreinte(&b) != r.empreinte) {
+                reglages.delete(&cle).ok();
+            }
+            Vec::new()
+        }
+        Err(_) => {
+            reglages.delete(&cle).ok();
+            Vec::new()
+        }
     }
+}
+
+fn bio_enregistree(db: &Arc<dyn DbBackend>, genre: GenreDeLien, id: i64) -> Option<String> {
+    let table = match genre {
+        GenreDeLien::Artiste => "artists",
+        GenreDeLien::Album => "albums",
+    };
+    let marque = match db.engine() {
+        crate::db::engine::Engine::Sqlite => "?",
+        crate::db::engine::Engine::Postgres => "$1",
+    };
+    db.query_one(
+        &format!("SELECT bio FROM {table} WHERE id = {marque}"),
+        &[&id],
+    )
+    .ok()
+    .flatten()?
+    .first()?
+    .as_string()
 }
 
 #[cfg(test)]

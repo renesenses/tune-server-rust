@@ -259,3 +259,39 @@ fn les_liens_ranges_ne_valent_que_pour_le_meme_texte_7910() {
     );
     assert!(liens_externes_ranges(&db, GenreDeLien::Album, 1, "texte A").is_empty());
 }
+
+#[test]
+fn la_ligne_perimee_s_efface_seulement_si_la_bio_enregistree_a_change_7910() {
+    let base = crate::db::sqlite::SqliteDb::open_in_memory().expect("base en mémoire");
+    base.init_schema().expect("schéma");
+    crate::db::migrations::run_migrations(&base).expect("migrations");
+    let db: Arc<dyn DbBackend> = Arc::new(base);
+    db.execute(
+        "INSERT INTO artists (id, name, bio) VALUES (1, 'Radiohead', 'texte A')",
+        &[],
+    )
+    .expect("artiste");
+    let reglages = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
+    let liens = vec![LienExterne {
+        texte: "Read more on Last.fm".into(),
+        url: "https://www.last.fm/music/Radiohead".into(),
+    }];
+    ranger_liens_externes(&db, GenreDeLien::Artiste, 1, "texte A", &liens);
+
+    // Une bio servie dans une autre langue que l'enregistrée : rien à lier,
+    // mais la ligne de la bio enregistrée reste.
+    assert!(liens_externes_ranges(&db, GenreDeLien::Artiste, 1, "text in English").is_empty());
+    assert!(
+        reglages.get("bio_liens:artiste:1").unwrap().is_some(),
+        "les liens de la bio enregistrée ne doivent pas s'effacer pour une autre langue"
+    );
+
+    // La bio enregistrée est réécrite : la ligne périmée s'efface.
+    db.execute("UPDATE artists SET bio = 'texte réécrit' WHERE id = 1", &[])
+        .expect("réécriture");
+    assert!(liens_externes_ranges(&db, GenreDeLien::Artiste, 1, "texte réécrit").is_empty());
+    assert!(
+        reglages.get("bio_liens:artiste:1").unwrap().is_none(),
+        "la ligne des liens d'une bio réécrite doit être effacée"
+    );
+}
