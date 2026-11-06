@@ -1031,7 +1031,7 @@ impl TrackImporter {
         // `false` : l'artiste est tenu à la main, la ligne ne bouge pas.
         if !self
             .album_repo
-            .realigner_sur_les_balises(id, None, Some(*artiste))
+            .realigner_sur_les_balises_relues(id, None, Some(*artiste), lu_depuis_le_chemin)
             .unwrap_or(false)
         {
             return None;

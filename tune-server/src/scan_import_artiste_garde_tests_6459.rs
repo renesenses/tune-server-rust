@@ -135,6 +135,25 @@ fn une_relecture_sans_artiste_garde_l_artiste(quality_split: bool) {
         1,
         "aucune seconde ligne « Unknown Artist »"
     );
+
+    // Seconde relecture (« Scan complet », date du fichier changée) : la
+    // première a réécrit les pistes sans balise d'artiste, la garde ne doit
+    // pas dépendre de ce que la base en garde.
+    scanner(&db, tmp.path(), &fichiers(tmp.path(), false), quality_split);
+    AlbumRepo::with_backend(db.clone())
+        .rendre_leur_artiste_aux_albums_inconnus()
+        .unwrap();
+    let encore = rangement(&db, &balises);
+    assert!(
+        encore.iter().all(|r| r == &avant[0]),
+        "#6459 (quality_split={quality_split}) — une SECONDE relecture sans balise \
+         d'artiste a rétrogradé l'album : avant {avant:?}, après {encore:?}"
+    );
+    assert_eq!(
+        AlbumRepo::with_backend(db.clone()).count().unwrap(),
+        1,
+        "aucune seconde ligne « Unknown Artist » après deux relectures"
+    );
 }
 
 #[test]
@@ -307,10 +326,43 @@ fn une_relecture_sans_artiste_garde_l_artiste_balise_en_artist_seul() {
     scanner(&db, tmp.path(), &balises, true);
     let avant = rangement(&db, &balises);
     assert_eq!(avant[0].1.as_deref(), Some(ARTISTE));
+    for passage in 1..=2 {
+        scanner(&db, tmp.path(), &fichiers(tmp.path(), false), true);
+        let apres = rangement(&db, &balises);
+        assert!(
+            apres.iter().all(|r| r == &avant[0]),
+            "#6459 — un album balisé en ARTIST seul a été rétrogradé à la relecture \
+             {passage} : après {apres:?}"
+        );
+    }
+}
+
+/// Le surveillant ne propose qu'un artiste balisé : son réalignement garde
+/// aussi un artiste égal au nom du dossier de l'album.
+#[test]
+fn le_realignement_garde_un_artiste_egal_au_nom_du_dossier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = base();
+    let mut lot = fichiers(tmp.path(), true);
+    for f in &mut lot {
+        f.metadata.as_mut().unwrap().album_artist = None;
+    }
+    scanner(&db, tmp.path(), &lot, true);
+    let id = rangement(&db, &lot)[0].0;
+    // Les pistes ont ensuite été relues sans balise : la base n'en garde rien.
     scanner(&db, tmp.path(), &fichiers(tmp.path(), false), true);
-    let apres = rangement(&db, &balises);
-    assert!(
-        apres.iter().all(|r| r == &avant[0]),
-        "#6459 — un album balisé en ARTIST seul a été rétrogradé : après {apres:?}"
+    let inconnu = ArtistRepo::with_backend(db.clone())
+        .get_or_create(UNKNOWN_ARTIST_NAME, None, None)
+        .unwrap()
+        .id
+        .unwrap();
+    AlbumRepo::with_backend(db.clone())
+        .realigner_sur_les_balises(id, None, Some(inconnu))
+        .unwrap();
+    assert_eq!(
+        artiste_de(&db, id).as_deref(),
+        Some(ARTISTE),
+        "#6459 — le réalignement a écrit « Unknown Artist » sur un album rangé \
+         sous un dossier de son nom"
     );
 }
