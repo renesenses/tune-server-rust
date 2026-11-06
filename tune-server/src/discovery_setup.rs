@@ -614,12 +614,7 @@ fn est_notre_propre_renderer(
     if !location.contains(tune_core::upnp_renderer::RENDERER_MOUNT) {
         return false;
     }
-    let hote = location
-        .split("://")
-        .nth(1)
-        .and_then(|reste| reste.split('/').next())
-        .map(|hp| hp.split(':').next().unwrap_or(hp))
-        .unwrap_or_default();
+    let hote = hote_de_location(location);
     !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
 }
 
@@ -666,6 +661,69 @@ fn renderer_tiers_sur_cette_machine<'a>(
         return par_location;
     }
     est_a_nous(hote).then_some(location.unwrap_or(hote))
+}
+
+/// #7875 — retenir la création AUTOMATIQUE d'une zone pour ce renderer ?
+///
+/// Rend la LOCATION (ou l'hôte) à journaliser quand les trois conditions sont
+/// réunies, `None` sinon :
+/// - la zone à créer serait une zone `dlna` : un renderer OpenHome de la
+///   machine est le plus souvent un mandataire (BubbleUPnP Server) qui joue
+///   sur un AUTRE appareil, il ne double rien ;
+/// - le renderer tourne sur cette machine ([`renderer_tiers_sur_cette_machine`]) ;
+/// - une sortie locale est inscrite : c'est elle que la zone DLNA doublerait,
+///   avec un chemin du signal réseau au lieu du chemin local.
+///
+/// La règle ne retire RIEN : la sortie du renderer reste inscrite (une zone
+/// se crée encore à la main depuis la liste des appareils), et une zone déjà
+/// liée à ce renderer se rattache comme avant. Seule la zone neuve que la
+/// découverte aurait créée d'elle-même, en double, ne l'est plus.
+pub(crate) fn zone_auto_retenue_sur_cette_machine<'a>(
+    type_de_zone: &str,
+    hote: &'a str,
+    location: Option<&'a str>,
+    nos_adresses: &[String],
+    sortie_locale_inscrite: bool,
+) -> Option<&'a str> {
+    if type_de_zone != "dlna" || !sortie_locale_inscrite {
+        return None;
+    }
+    renderer_tiers_sur_cette_machine(hote, location, nos_adresses)
+}
+
+/// Une sortie locale (carte de la machine) est-elle inscrite au registre ?
+pub(crate) fn sortie_locale_inscrite(registre: &OutputRegistry) -> bool {
+    registre
+        .list()
+        .iter()
+        .any(|id| registre.type_of(id).as_deref() == Some("local"))
+}
+
+/// Journal de [`zone_auto_retenue_sur_cette_machine`] : une ligne `info` à la
+/// première annonce de l'appareil, `debug` ensuite. Le renderer se réannonce
+/// toutes les quelques minutes ; le journal n'a pas à le redire à chaque fois.
+pub(crate) fn journaliser_zone_auto_retenue(id: &str, name: &str, location: &str) {
+    static DEJA_DIT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let premiere_fois = DEJA_DIT
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut dits| dits.insert(id.to_string()))
+        .unwrap_or(true);
+    if premiere_fois {
+        info!(
+            id,
+            name,
+            location,
+            "ssdp_renderer_sur_cette_machine_sans_zone_auto — renderer de cette machine, \
+             la sortie locale est à utiliser ; une zone se crée à la main si besoin"
+        );
+    } else {
+        debug!(
+            id,
+            name, location, "ssdp_renderer_sur_cette_machine_sans_zone_auto"
+        );
+    }
 }
 
 /// Les UDN de nos propres façades (`upnp_renderer_udn_<zone>`), tels que
@@ -718,7 +776,7 @@ fn est_notre_propre_serveur_multimedia(
 /// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et
 /// les formes locales, qu'un M-SEARCH émis depuis la machine elle-même peut
 /// nous renvoyer.
-fn nos_adresses(annoncee: Option<&str>) -> Vec<String> {
+pub(crate) fn nos_adresses(annoncee: Option<&str>) -> Vec<String> {
     nos_adresses_depuis(
         &tune_core::discovery::ssdp::local_ipv4_addresses(),
         tune_core::discovery::ssdp::get_local_ip(),
@@ -836,26 +894,6 @@ async fn handle_ssdp_discovered(
             id = %dev.id,
             name = %dev.name,
             "ssdp_notre_facade_reconnue_par_udn_ignoree"
-        );
-        return;
-    }
-
-    // #7875 — troisième rideau : un renderer UPnP qui n'est PAS notre façade
-    // mais tourne sur cette machine (upmpdcli, gmediarender… sur un NUC Tune
-    // OS). Il joue sur la même carte que la sortie locale : en zone DLNA, il
-    // doublait cette sortie avec un chemin du signal réseau au lieu du chemin
-    // local. Un AUTRE serveur Tune sur cette machine garde sa zone.
-    if let Some(loc) = renderer_tiers_sur_cette_machine(
-        &dev.host,
-        dev.location.as_deref(),
-        &nos_adresses(config.advertised_ip.as_deref()),
-    ) {
-        warn!(
-            id = %dev.id,
-            name = %dev.name,
-            host = %dev.host,
-            location = %loc,
-            "ssdp_renderer_sur_cette_machine_ecarte — la sortie locale de la machine est à utiliser"
         );
         return;
     }
@@ -1173,6 +1211,23 @@ async fn handle_ssdp_discovered(
             "ssdp_zone_reancree_par_mac"
         );
     } else if !is_tv {
+        // #7875 — un renderer DLNA tiers qui tourne sur cette machine
+        // (upmpdcli, gmediarender… sur un NUC Tune OS) doublerait la sortie
+        // locale. Placé ICI, après les trois barreaux de rattachement : une
+        // zone déjà liée à ce renderer se rattache comme avant, et sa sortie
+        // reste inscrite plus haut. Seule la zone NEUVE n'est pas créée.
+        let sortie_locale = sortie_locale_inscrite(&*outputs.lock().await);
+        if let Some(loc) = zone_auto_retenue_sur_cette_machine(
+            type_str,
+            &dev.host,
+            dev.location.as_deref(),
+            &nos_adresses(config.advertised_ip.as_deref()),
+            sortie_locale,
+        ) {
+            journaliser_zone_auto_retenue(&dev.id, &dev.name, loc);
+            return;
+        }
+
         // Check zone_auto_create setting — #3529 : lecture unique, portée par
         // `ZoneRepo`. Elle était recopiée mot pour mot en cinq endroits, ce
         // qui a permis à cinq autres chemins de ne jamais la recopier.

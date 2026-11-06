@@ -925,7 +925,10 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     }
                 }
             }
+            let sortie_locale = crate::discovery_setup::sortie_locale_inscrite(&outputs);
             drop(outputs);
+            let nos_adresses =
+                crate::discovery_setup::nos_adresses(state.config.advertised_ip.as_deref());
 
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
             for d in &devices {
@@ -1007,6 +1010,22 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 // ligne (`online` vaut `DEFAULT 1` au schéma). D'où « elles
                 // apparaissent ET s'activent toutes seules », chez Fabien, sur
                 // une installation où la case est décochée.
+                //
+                // #7875 — même règle que la découverte vivante : un renderer
+                // DLNA tiers de cette machine ne reçoit pas de zone NEUVE en
+                // double de la sortie locale ; une zone existante se rattache.
+                if !possede_deja_sa_zone
+                    && let Some(loc) = crate::discovery_setup::zone_auto_retenue_sur_cette_machine(
+                        "dlna",
+                        &d.host,
+                        d.location.as_deref(),
+                        &nos_adresses,
+                        sortie_locale,
+                    )
+                {
+                    crate::discovery_setup::journaliser_zone_auto_retenue(&d.id, &d.name, loc);
+                    continue;
+                }
                 match zone_repo.get_or_create_si_autorise(
                     &d.name,
                     Some("dlna"),
