@@ -292,7 +292,10 @@ pub(super) async fn get_config(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     // A failed snapshot is not an empty settings table: serving defaults here
     // made persisted choices look reset, despite a successful earlier write.
-    let all = settings.all().map_err(|_| {
+    // #7307 — l'erreur était jetée sans trace : le rapport d'un testeur dont
+    // les choix « reviennent au défaut » ne pouvait pas en porter la cause.
+    let all = settings.all().map_err(|e| {
+        tracing::error!(erreur = %e, "reglages_illisibles");
         AppError::service_unavailable("Server settings are temporarily unavailable")
     })?;
     let mut config = serde_json::Map::new();
@@ -332,6 +335,17 @@ pub(super) async fn get_config(
         } else {
             config.insert(k, Value::String(v));
         }
+    }
+    // #7840 — une valeur enregistrée sous l'ancienne borne (jusqu'à 300 s)
+    // se relit comme le recul réellement appliqué : 60 s au plus.
+    if let Some(v) = config.get_mut(tune_core::db::listening_resume::REWIND_KEY) {
+        let brut = match &*v {
+            Value::String(s) => s.clone(),
+            autre => autre.to_string(),
+        };
+        *v = json!(tune_core::db::listening_resume::effective_rewind(Some(
+            &brut
+        )));
     }
     let defaults: Vec<(&str, Value)> = vec![
         ("api_port", json!(state.port)),
@@ -1747,6 +1761,70 @@ fn prendre_reponse_ecoutes(
     }
 }
 
+/// L'authentification est-elle ACTIVE ? Seul ce cas rend `RequireAdmin`
+/// effectif (un jeton admin valide a été exigé) ; désactivée, la garde laisse
+/// passer tout appelant.
+pub(super) fn authentification_admin_effective(state: &AppState) -> bool {
+    SettingsRepo::with_backend(state.backend.clone())
+        .get("auth_enabled")
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == "true")
+}
+
+/// `403` qui nomme les clés protégées d'une écriture générique, ou `None`
+/// quand l'écriture peut avoir lieu (aucune clé protégée, ou admin effectif).
+pub(super) fn refus_des_cles_protegees<'a>(
+    state: &AppState,
+    cles: impl IntoIterator<Item = &'a str>,
+) -> Option<axum::response::Response> {
+    let refusees = tune_core::reglages_proteges::cles_protegees(cles);
+    if refusees.is_empty() || authentification_admin_effective(state) {
+        return None;
+    }
+    tracing::warn!(cles = %refusees.join(","), "reglages_proteges_refuses");
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "protected_settings",
+                "message": "These settings can only be changed by an authenticated administrator.",
+                "refused_keys": refusees,
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// Retire d'un import les clés protégées quand l'admin n'est pas effectif, et
+/// rend les avertissements à joindre à la réponse.
+pub(super) fn ecarter_les_cles_protegees<T>(
+    state: &AppState,
+    reglages: &mut Vec<(String, T)>,
+) -> Vec<String> {
+    if authentification_admin_effective(state) {
+        return Vec::new();
+    }
+    let mut avertissements = Vec::new();
+    reglages.retain(|(cle, _)| {
+        if tune_core::reglages_proteges::est_protege(cle) {
+            avertissements.push(format!(
+                "setting '{cle}' is protected (authenticated administrator required); skipped"
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    if !avertissements.is_empty() {
+        tracing::warn!(
+            nombre = avertissements.len(),
+            "import_reglages_proteges_ecartes"
+        );
+    }
+    avertissements
+}
+
 fn touche_le_replaygain(cles_posees: &[String]) -> bool {
     cles_posees.iter().any(|c| c.starts_with("replaygain_"))
 }
@@ -1758,10 +1836,21 @@ pub(super) async fn update_config(
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut values = body.0;
+    // Les clés qui changent qui contrôle le serveur, ce qu'il exécute ou à
+    // qui il parle (`tune_core::reglages_proteges`) ne passent par cette route
+    // qu'avec une authentification admin EFFECTIVE. Authentification
+    // désactivée, `RequireAdmin` laisse passer tout appelant : ces clés-là sont
+    // alors refusées, en bloc, avant toute écriture.
+    if let Some(refus) = refus_des_cles_protegees(&state, values.keys().map(String::as_str)) {
+        return Ok(refus);
+    }
     if let Some(value) = values.get(tune_core::db::listening_resume::REWIND_KEY) {
-        if value.as_u64().is_none_or(|n| n > 300) {
+        if value
+            .as_u64()
+            .is_none_or(|n| n > tune_core::db::listening_resume::REWIND_MAX)
+        {
             return Err(AppError::bad_request(
-                "continue_listening_rewind_seconds : entier de 0 à 300 attendu",
+                "continue_listening_rewind_seconds : entier de 0 à 60 attendu",
             ));
         }
     }
@@ -2814,8 +2903,12 @@ pub(super) async fn import_config(
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
     use tune_core::config_export as ce;
-    let fichier = ce::lire(body).map_err(AppError::bad_request)?;
-    let plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
+    let mut fichier = ce::lire(body).map_err(AppError::bad_request)?;
+    // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
+    // elles sont écartées de l'import et nommées dans `warnings`.
+    let ecartees = ecarter_les_cles_protegees(&state, &mut fichier.settings);
+    let mut plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
+    plan.avertissements.extend(ecartees.iter().cloned());
     let mut reponse = ce::rapport(&plan);
     if q.dry_run {
         reponse["dry_run"] = json!(true);
@@ -2838,7 +2931,13 @@ pub(super) async fn import_config(
     reponse["imported"] = json!(bilan.reglages_ecrits);
     reponse["zones_added"] = json!(bilan.zones_creees.len());
     reponse["zones_modified"] = json!(bilan.zones_modifiees.len());
-    reponse["warnings"] = json!(bilan.avertissements);
+    let mut avertissements = bilan.avertissements.clone();
+    for a in ecartees {
+        if !avertissements.contains(&a) {
+            avertissements.push(a);
+        }
+    }
+    reponse["warnings"] = json!(avertissements);
     Ok(Json(reponse))
 }
 
@@ -4546,8 +4645,11 @@ pub(super) async fn set_license(
 }
 
 pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
-    state.license.clear_license().await;
-    Json(json!({ "status": "ok", "tier": "free" }))
+    let remote_released = crate::routes::cloud::retirer_la_licence(&state).await;
+    Json(crate::routes::cloud::reponse_de_retrait(
+        json!({ "status": "ok", "tier": "free" }),
+        remote_released,
+    ))
 }
 
 /// Nom convivial de CETTE machine — la réponse à « à quel serveur je parle ? ».
@@ -6719,6 +6821,65 @@ mod instantane_reglages_7343_tests {
             value
                 .get(tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED)
                 .is_none()
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #7307 — le 503 de #7343 sans trace laissait le rapport muet sur la
+    /// cause : l'erreur de lecture doit être journalisée, avec son message.
+    #[tokio::test]
+    async fn une_lecture_impossible_laisse_sa_cause_au_journal() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .sqlite()
+            .unwrap()
+            .execute_batch("DROP TABLE settings")
+            .unwrap();
+        let journal = Journal::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(journal.clone())
+            .finish();
+        let response = {
+            let _garde = tracing::subscriber::set_default(subscriber);
+            lire(&state).await
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let journal = String::from_utf8(journal.0.lock().unwrap().clone()).unwrap();
+        let ligne = journal
+            .lines()
+            .find(|l| l.contains("reglages_illisibles"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "un échec de lecture des réglages doit laisser `reglages_illisibles` \
+                     au journal (#7307) ; journal : {journal:?}"
+                )
+            });
+        assert!(
+            ligne.contains("settings"),
+            "la ligne doit porter l'erreur SQLite : {ligne:?}"
         );
     }
 

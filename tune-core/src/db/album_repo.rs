@@ -253,6 +253,16 @@ pub mod sql {
         )
     }
 
+    /// #7694 — chemin et qualité de chaque piste d'un album, pour la règle
+    /// des dossiers miroirs.
+    pub fn qualites_des_pistes_de_l_album<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT file_path, format, sample_rate, bit_depth FROM tracks \
+             WHERE album_id = {} AND file_path IS NOT NULL",
+            d.placeholder(1)
+        )
+    }
+
     pub fn set_artist_id<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET artist_id = {} WHERE id = {}",
@@ -650,6 +660,13 @@ pub mod sql {
 
     pub fn list_without_bio() -> &'static str {
         "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.bio IS NULL OR a.bio = '') AND a.source = 'local' ORDER BY a.id"
+    }
+
+    /// Écran « État du serveur » (01/11/2026) : les albums LOCAUX et ceux
+    /// d'entre eux sans pochette, en une lecture. Même filtre que
+    /// [`list_without_cover`] : les deux nombres ne divergent pas.
+    pub fn compter_pochettes_locales() -> &'static str {
+        "SELECT COUNT(*), COUNT(CASE WHEN a.cover_path IS NULL OR a.cover_path = '' THEN 1 END) FROM albums a WHERE a.source = 'local'"
     }
 
     pub fn count_with_bio() -> &'static str {
@@ -1135,6 +1152,20 @@ pub struct BilanRecalculCompilations {
     /// Laissés tels quels : sous « Various Artists » sans artiste à rendre.
     pub indecis: usize,
     pub erreurs: usize,
+}
+
+/// #7694 — la qualité du fichier que le scan range, pour la règle des
+/// dossiers miroirs (#4907) : un dossier recopié sous une autre racine n'est
+/// la même parution que s'il porte la même qualité. L'édition DSD et
+/// l'édition CD d'un album, rangées `…/DSD/Artiste/Album` et
+/// `…/CD/Artiste/Album`, restent deux albums, chacun avec sa pochette.
+pub struct QualiteDuFichier<'a> {
+    /// [`crate::library::quality::score_qualite`] du fichier en cours.
+    pub score: (bool, i64),
+    /// Les scores que le scan en cours a déjà vus sous un dossier et qu'il
+    /// n'a pas encore écrits en base : les pistes d'un lot ne sont écrites
+    /// qu'à sa fin, et les deux éditions tiennent souvent dans le même lot.
+    pub vues_dans_le_scan: &'a dyn Fn(&str) -> Vec<(bool, i64)>,
 }
 
 pub struct AlbumRepo {
@@ -1773,6 +1804,36 @@ impl AlbumRepo {
         track_number: Option<i32>,
         disc_number: Option<i32>,
     ) -> Result<Album, TuneError> {
+        self.get_or_create_for_folder_de_qualite(
+            folder,
+            title,
+            artist_id,
+            year,
+            mbid,
+            track_number,
+            disc_number,
+            None,
+        )
+    }
+
+    /// #7694 — [`Self::get_or_create_for_folder_with_track`] qui connaît aussi
+    /// la QUALITÉ du fichier en cours. Elle ne sert qu'à la règle des dossiers
+    /// miroirs (#4907) : l'édition DSD et l'édition CD d'un album, rangées
+    /// sous le même chemin relatif de deux racines (`…/DSD/Artiste/Album` et
+    /// `…/CD/Artiste/Album`), sont deux parutions, pas une copie de
+    /// sauvegarde. `None` garde la règle telle qu'elle était.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_or_create_for_folder_de_qualite(
+        &self,
+        folder: &str,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+        mbid: Option<&str>,
+        track_number: Option<i32>,
+        disc_number: Option<i32>,
+        qualite: Option<QualiteDuFichier<'_>>,
+    ) -> Result<Album, TuneError> {
         if folder.is_empty() {
             return self.get_or_create_with_mbid(title, artist_id, year, mbid);
         }
@@ -1782,7 +1843,7 @@ impl AlbumRepo {
         // édition de plus : sans ce rattrapage, chaque copie d'une racine à
         // l'autre dédoublait l'album dans toutes les vues.
         if self.find_id_by_folder(folder)?.is_none() {
-            if let Some(album) = self.album_du_dossier_miroir(folder, title)? {
+            if let Some(album) = self.album_du_dossier_miroir(folder, title, qualite)? {
                 return Ok(album);
             }
         }
@@ -1939,10 +2000,14 @@ impl AlbumRepo {
     /// ([`crate::library::exemplaires::dossiers_miroirs`]) — quand il porte le
     /// même titre (#4907). Le titre est exigé en plus du chemin : un dossier
     /// homonyme qui contiendrait une autre parution reste un autre album.
+    ///
+    /// #7694 — quand la qualité du fichier est connue, le miroir doit aussi
+    /// porter cette qualité : voir [`QualiteDuFichier`].
     fn album_du_dossier_miroir(
         &self,
         folder: &str,
         title: &str,
+        qualite: Option<QualiteDuFichier<'_>>,
     ) -> Result<Option<Album>, TuneError> {
         let racines = crate::library::exemplaires::dossiers_de_musique(&*self.db);
         let titre = title.trim().to_lowercase();
@@ -1956,17 +2021,68 @@ impl AlbumRepo {
                 continue;
             };
             let album = row_to_album(&row);
-            if album.title.trim().to_lowercase() == titre {
+            if album.title.trim().to_lowercase() != titre {
+                continue;
+            }
+            if let Some(q) = qualite.as_ref()
+                && !self.miroir_de_meme_qualite(id, &miroir, q)?
+            {
                 tracing::info!(
                     album_id = id,
                     dossier = folder,
                     miroir = %miroir,
-                    "album_miroir_rattache — même dossier sous une autre racine : même album"
+                    "album_miroir_ecarte — même dossier sous une autre racine, autre qualité : autre édition"
                 );
-                return Ok(Some(album));
+                continue;
             }
+            tracing::info!(
+                album_id = id,
+                dossier = folder,
+                miroir = %miroir,
+                "album_miroir_rattache — même dossier sous une autre racine : même album"
+            );
+            return Ok(Some(album));
         }
         Ok(None)
+    }
+
+    /// #7694 — le dossier `miroir` de l'album `album_id` porte-t-il la qualité
+    /// du fichier en cours ? On compare aux pistes rangées SOUS ce dossier, en
+    /// base et vues par le scan en cours, pas à tout l'album : un album déjà
+    /// réuni à tort (DSD + CD) se sépare ainsi au scan suivant. Une qualité
+    /// présente parmi celles du miroir suffit, pour qu'une édition aux disques
+    /// de cadences différentes reste une copie. Rien de connu sous le miroir :
+    /// la règle #4907 joue comme avant.
+    fn miroir_de_meme_qualite(
+        &self,
+        album_id: i64,
+        miroir: &str,
+        qualite: &QualiteDuFichier<'_>,
+    ) -> Result<bool, TuneError> {
+        let sql = self.dialect_sql(
+            sql::qualites_des_pistes_de_l_album,
+            sql::qualites_des_pistes_de_l_album,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        let mut connues: Vec<(bool, i64)> = self
+            .db
+            .query_many_strong(&sql, &params)?
+            .iter()
+            .filter(|r| {
+                r.first().and_then(|v| v.as_str()).is_some_and(|chemin| {
+                    crate::library::local_path::sous_le_dossier_stocke(chemin, miroir)
+                })
+            })
+            .map(|r| {
+                crate::library::quality::score_qualite(
+                    r.get(1).and_then(|v| v.as_str()),
+                    r.get(2).and_then(|v| v.as_i64()),
+                    r.get(3).and_then(|v| v.as_i64()),
+                )
+            })
+            .collect();
+        connues.extend((qualite.vues_dans_le_scan)(miroir));
+        Ok(connues.is_empty() || connues.contains(&qualite.score))
     }
 
     /// Rend à l'album son vrai artiste quand il est resté sur « Unknown Artist ».
@@ -2983,6 +3099,18 @@ impl AlbumRepo {
         }
     }
 
+    /// `(albums locaux, albums locaux sans pochette)` — voir
+    /// [`sql::compter_pochettes_locales`].
+    pub fn compter_pochettes_locales(&self) -> Result<(i64, i64), TuneError> {
+        match self.db.query_one(sql::compter_pochettes_locales(), &[])? {
+            None => Ok((0, 0)),
+            Some(cols) => Ok((
+                cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+            )),
+        }
+    }
+
     pub fn count_with_bio(&self) -> Result<i64, TuneError> {
         match self.db.query_one(sql::count_with_bio(), &[])? {
             None => Ok(0),
@@ -3265,8 +3393,17 @@ impl AlbumRepo {
     /// partagent l'expression AU CARACTÈRE PRÈS (#3397). Recopiée, elle
     /// dériverait, et le tri « Ajout récent » cesserait de correspondre à la
     /// date rendue.
+    ///
+    /// #7722 — la date mesurée est celle d'« Ajouts récents › Date de
+    /// création » ([`super::home_queries::DATE_DE_CREATION`]) : le btime du
+    /// fichier, sinon la première vue, sinon le mtime. La première vue seule
+    /// vaut le mtime d'origine d'un fichier recopié (#2138) : 3 000 pistes
+    /// déposées la veille se rangeaient parmi les vieux albums. Le texte de
+    /// la constante doit contenir `MAX(DATE_DE_CREATION)` au caractère près,
+    /// ce que garde un test.
     pub(crate) const ADDED_AT_SOURCE: &'static str = "SELECT t.album_id, \
-                MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))) AS added_at \
+                MAX(COALESCE(ffs.created_at, COALESCE(ffs.first_seen_at, \
+     CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION)))) AS added_at \
            FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path";
 
     /// La date d'ajout des albums de la PAGE, en une requête groupée (#3397).
@@ -3614,6 +3751,37 @@ impl AlbumRepo {
                     row.get(1).and_then(|v| v.as_i64()),
                 ) {
                     par_id.insert(id, dr);
+                }
+            }
+        }
+        Ok(par_id)
+    }
+
+    /// #7725 — le plus grand nombre de canaux des pistes de chaque album de
+    /// `ids`, en une requête groupée par paquet. Un album absent de la table
+    /// rendue n'a aucune piste dont le nombre de canaux soit connu.
+    pub fn canaux_max_par_album(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, i64>, TuneError> {
+        let mut par_id = std::collections::HashMap::new();
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT album_id, MAX(channels) FROM tracks \
+                  WHERE album_id IN ({id_list}) AND channels IS NOT NULL \
+                  GROUP BY album_id"
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                if let (Some(id), Some(n)) = (
+                    row.first().and_then(|v| v.as_i64()),
+                    row.get(1).and_then(|v| v.as_i64()),
+                ) {
+                    par_id.insert(id, n);
                 }
             }
         }
@@ -4046,7 +4214,10 @@ impl AlbumRepo {
         // de `Album::quality()`, sur les mêmes champs d'album. Avant, `hires`
         // gardait tout album dont UNE piste dépassait 44,1 kHz (DSD compris)
         // et `cd` exigeait 44,1 kHz / 16 bits pile.
-        if let Some(pred) = quality.and_then(|q| Album::quality_sql(q, "a")) {
+        // #7725 : Multicanal se lit sur les pistes, l'album n'a pas de canaux.
+        if quality == Some(Album::QUALITE_MULTICANAL) {
+            wheres.push(Album::multicanal_sql_album("a"));
+        } else if let Some(pred) = quality.and_then(|q| Album::quality_sql(q, "a")) {
             wheres.push(pred);
         }
         // `COALESCE` : une base migrée depuis SQLite peut porter des NULL, et
@@ -8427,6 +8598,72 @@ pub(crate) mod tests {
         let asc = arepo.list_sorted(100, 0, "added_at", "asc").unwrap();
         assert_eq!(asc[0].title, "C");
         assert_eq!(asc[2].title, "A");
+    }
+
+    /// #7722 — un album ajouté après les autres passe en tête de « Derniers
+    /// ajouts », même si ses fichiers ont gardé un mtime ancien.
+    ///
+    /// Le scan date la première vue par le mtime (#2138) ; une copie qui le
+    /// conserve range donc l'album parmi les vieux. Sa date de création, elle,
+    /// dit le jour du dépôt, comme « Ajouts récents › Date de création ».
+    #[test]
+    fn derniers_ajouts_suit_la_date_de_creation_7722() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let ancien = arepo.create(&Album::new("Ancien".into())).unwrap();
+        let nouveau = arepo.create(&Album::new("Nouveau".into())).unwrap();
+        for (album_id, path) in [(ancien, "/ancien.flac"), (nouveau, "/nouveau.flac")] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album_id);
+            t.file_path = Some(path.into());
+            t.file_mtime = Some(500.0);
+            trepo.create(&t).unwrap();
+        }
+        // « Ancien » : vu et créé il y a longtemps. « Nouveau » : déposé
+        // après, mais la première vue a repris son mtime d'origine (500).
+        for (path, seen, created) in [
+            ("/ancien.flac", 1000.0f64, 1000.0f64),
+            ("/nouveau.flac", 500.0, 3000.0),
+        ] {
+            db.execute_batch(&format!(
+                "UPDATE file_first_seen SET first_seen_at = {seen}, created_at = {created} \
+                 WHERE file_path = '{path}';"
+            ))
+            .unwrap();
+        }
+
+        for tri in ["added_at", "added_date", "added"] {
+            let desc = arepo.list_sorted(100, 0, tri, "desc").unwrap();
+            assert_eq!(
+                desc.iter().map(|a| a.title.as_str()).collect::<Vec<_>>(),
+                vec!["Nouveau", "Ancien"],
+                "tri {tri} : l'album ajouté le dernier doit être en tête (#7722)"
+            );
+            assert_eq!(
+                desc[0].added_at,
+                Some(3000.0),
+                "tri {tri} : la date rendue doit être la date de création"
+            );
+        }
+    }
+
+    /// #7722 — « Derniers ajouts » des albums et « Ajouts récents › Date de
+    /// création » lisent la même expression : recopiée, elle dériverait.
+    #[test]
+    fn derniers_ajouts_partage_l_expression_de_creation_7722() {
+        let attendu = format!(
+            "MAX({}) AS added_at",
+            crate::db::home_queries::DATE_DE_CREATION
+        );
+        assert!(
+            AlbumRepo::ADDED_AT_SOURCE.contains(&attendu),
+            "ADDED_AT_SOURCE doit mesurer MAX(DATE_DE_CREATION) : {}",
+            AlbumRepo::ADDED_AT_SOURCE
+        );
     }
 
     /// #3397 — la date d'ajout ne dépend PAS du tri demandé.

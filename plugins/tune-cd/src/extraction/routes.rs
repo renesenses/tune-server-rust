@@ -533,6 +533,23 @@ async fn preparer(
         .and_then(|p| p.chemin.parent())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| destination.clone());
+    // #7105 — droits, disque en lecture seule et place vérifiés AVANT de
+    // lancer : un refus qui nomme la cause et le chemin, pas un 202 suivi
+    // d'un échec au premier fichier.
+    let secteurs: u64 = pistes_plan.iter().map(|p| (p.fin - p.debut) as u64).sum();
+    let besoin = destination::octets_necessaires(secteurs, format == Format::Flac);
+    if let Err(err) = destination::verifier_ecriture(&dossier, besoin, e.ex.espace_libre) {
+        tracing::warn!(
+            cause = err.cause.unwrap_or("autre"),
+            chemin = err.chemin.as_deref().unwrap_or(""),
+            "cd_extraction_destination_non_inscriptible"
+        );
+        return Err(conflit(
+            err.code,
+            err.message,
+            json!({ "cause": err.cause, "chemin": err.chemin }),
+        ));
+    }
     let verification = d.verification.unwrap_or_default();
     let mut etat = EtatTravail {
         id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),

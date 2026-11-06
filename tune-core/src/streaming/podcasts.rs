@@ -1136,19 +1136,32 @@ impl Default for PodcastService {
 fn parse_rss(xml: &str, limit: usize) -> Result<Vec<PodcastEpisode>, String> {
     let mut episodes = Vec::new();
     let channel_cover = extract_channel_image(xml);
+    // #7819 — un flux Atom porte ses épisodes dans `<entry>`, et leur audio
+    // dans `<link rel="enclosure" href="…">`.
+    let atom = !xml.contains("<item") && xml.contains("<entry");
+    let (open, close) = if atom {
+        ("<entry", "</entry>")
+    } else {
+        ("<item", "</item>")
+    };
     let mut search_from = 0;
     while episodes.len() < limit {
-        let item_start = match xml[search_from..].find("<item") {
+        let item_start = match xml[search_from..].find(open) {
             Some(pos) => search_from + pos,
             None => break,
         };
-        let item_end = match xml[item_start..].find("</item>") {
-            Some(pos) => item_start + pos + 7,
+        let item_end = match xml[item_start..].find(close) {
+            Some(pos) => item_start + pos + close.len(),
             None => break,
         };
         let item = &xml[item_start..item_end];
         let title = extract_tag(item, "title").unwrap_or_default();
-        let audio_url = extract_attr(item, "enclosure", "url").unwrap_or_default();
+        let audio_url = if atom {
+            atom_enclosure(item)
+        } else {
+            extract_attr(item, "enclosure", "url")
+        }
+        .unwrap_or_default();
         if audio_url.is_empty() {
             search_from = item_end;
             continue;
@@ -1156,10 +1169,15 @@ fn parse_rss(xml: &str, limit: usize) -> Result<Vec<PodcastEpisode>, String> {
         let duration_text = extract_tag(item, "itunes:duration").unwrap_or_default();
         let duration_ms = parse_duration(&duration_text);
         let description = extract_tag(item, "itunes:summary")
-            .or_else(|| extract_tag(item, "description"))
+            .or_else(|| extract_tag(item, if atom { "summary" } else { "description" }))
             .map(|d| strip_html_tags(&d))
             .unwrap_or_default();
-        let published = extract_tag(item, "pubDate").unwrap_or_default();
+        let published = if atom {
+            extract_tag(item, "published").or_else(|| extract_tag(item, "updated"))
+        } else {
+            extract_tag(item, "pubDate")
+        }
+        .unwrap_or_default();
         let cover_url =
             extract_attr(item, "itunes:image", "href").unwrap_or_else(|| channel_cover.clone());
         episodes.push(PodcastEpisode {
@@ -1175,9 +1193,35 @@ fn parse_rss(xml: &str, limit: usize) -> Result<Vec<PodcastEpisode>, String> {
     Ok(episodes)
 }
 
+/// L'audio d'une entrée Atom : le `href` de son `<link rel="enclosure">`
+/// (#7819).
+fn atom_enclosure(entry: &str) -> Option<String> {
+    let mut rest = entry;
+    while let Some(start) = rest.find("<link ") {
+        let tag = &rest[start..];
+        let end = tag.find('>')?;
+        let link = &tag[..=end];
+        if link.contains("rel=\"enclosure\"") {
+            return extract_attr(link, "link", "href");
+        }
+        rest = &tag[end..];
+    }
+    None
+}
+
 /// [`extract_tag`] pour les annuaires (#7152).
 pub(crate) fn extraire_balise(xml: &str, tag: &str) -> Option<String> {
     extract_tag(xml, tag)
+}
+
+/// [`extract_channel_image`] pour l'ajout par adresse (#7819).
+pub(crate) fn image_de_la_chaine(xml: &str) -> String {
+    extract_channel_image(xml)
+}
+
+/// [`strip_html_tags`] pour l'ajout par adresse (#7819).
+pub(crate) fn texte_sans_balises(html: &str) -> String {
+    strip_html_tags(html)
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
@@ -1596,6 +1640,24 @@ mod tests {
             premiere.contains("id=333&") && premiere.contains("country=zz"),
             "sans pays du client, le pays retenu du palmarès doit partir : {premiere}"
         );
+    }
+
+    /// #7819 — les épisodes d'un flux Atom se lisent comme ceux d'un RSS.
+    #[test]
+    fn un_flux_atom_donne_ses_episodes() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>P</title>
+<entry><title>E1</title><published>2026-11-01T08:00:00Z</published>
+<link rel="alternate" href="https://ex.test/page1"/>
+<link rel="enclosure" type="audio/mpeg" href="https://ex.test/e1.mp3"/>
+<summary>Résumé 1</summary></entry>
+<entry><title>Sans audio</title><link rel="alternate" href="https://ex.test/p2"/></entry>
+</feed>"#;
+        let episodes = parse_rss(xml, 10).unwrap();
+        assert_eq!(episodes.len(), 1, "{episodes:?}");
+        assert_eq!(episodes[0].title, "E1");
+        assert_eq!(episodes[0].audio_url, "https://ex.test/e1.mp3");
+        assert_eq!(episodes[0].published, "2026-11-01T08:00:00Z");
+        assert_eq!(episodes[0].description, "Résumé 1");
     }
 }
 

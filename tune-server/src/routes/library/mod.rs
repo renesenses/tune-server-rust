@@ -57,6 +57,8 @@ mod labels;
 /// #6481 — le livret PDF rangé dans le dossier d'un album.
 mod livrets;
 mod lyrics_pass;
+/// #7849 — notes personnelles en Markdown (artiste, album, piste).
+mod notes;
 mod proposals;
 mod query_multi;
 mod ratings;
@@ -66,6 +68,8 @@ mod reports;
 // fichiers de CETTE machine.
 pub(crate) mod reveler;
 mod search;
+/// #7857 — le spectrogramme d'une piste, en PNG, généré à la demande.
+mod spectrogramme;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
 // source de la même façon. Un seul point de vérité, partagé (#2147).
@@ -77,6 +81,8 @@ pub(crate) mod stats;
 mod tracks;
 pub(crate) mod write_tags;
 
+/// Les versions d'un même album regroupées sous une fiche (#7617).
+mod oeuvres;
 /// Les versions d'une piste regroupées par enregistrement (#2264).
 mod versions_groupes;
 use axum::Router;
@@ -382,6 +388,18 @@ pub fn router() -> Router<AppState> {
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
+        // #7617 — les œuvres : segments statiques AVANT `/albums/{id}`.
+        .route("/albums/works", get(oeuvres::lister_oeuvres))
+        .route("/albums/works/members", get(oeuvres::membres_des_oeuvres))
+        .route(
+            "/albums/works/settings",
+            get(oeuvres::lire_reglage).put(oeuvres::ecrire_reglage),
+        )
+        .route(
+            "/albums/works/preferred",
+            axum::routing::put(oeuvres::ecrire_preferee),
+        )
+        .route("/albums/{id}/versions", get(oeuvres::versions_de_l_album))
         // tune-web-client#1875 — admin, depuis cette machine seulement.
         .route("/reveal/available", get(reveler::revelation_disponible))
         .route("/albums/{id}/reveal", post(reveler::reveler_album))
@@ -496,6 +514,7 @@ pub fn router() -> Router<AppState> {
         // la demande (lecture seule, plafonnée, sans image).
         .route("/tracks/{id}/file-tags", get(tracks::track_file_tags))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
+        .route("/tracks/{id}/spectrogramme.png", get(spectrogramme::png))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
         // #2264 — les mêmes candidats, regroupés par enregistrement, avec la
@@ -676,6 +695,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/stats", get(stats::library_stats))
         .route("/labels", get(labels::list_labels))
+        // Écran « État du serveur » (01/11/2026) : avant `/labels/{nom}/…`,
+        // qui ne capture de toute façon pas ces chemins (segment `artists`).
+        .route("/labels/logos/enrich", post(labels::lancer_logos))
+        .route("/labels/logos/status", get(labels::statut_logos))
         .route("/labels/{nom}/artists", get(labels::artistes_du_label))
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))
@@ -761,6 +784,14 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/lyrics", get(tracks::track_lyrics))
         .route("/ratings/export", get(ratings::export_ratings))
         .route("/ratings/import", post(ratings::import_ratings))
+        // #7849 — notes personnelles, privées au profil de l'appelant.
+        .route("/notes", get(notes::list_notes))
+        .route(
+            "/notes/{item_type}/{item_id}",
+            get(notes::get_note)
+                .put(notes::put_note)
+                .delete(notes::delete_note),
+        )
         // Lot 2 de l'enrichissement d'après MetaRust (#4805) : les passes de
         // lot, à la main. Suspendues par la tâche de fond `enrichment`.
         .route("/bpm-all", post(passes_metarust::bpm_lot_start))
@@ -797,6 +828,8 @@ pub fn router() -> Router<AppState> {
             "/dr/gravure",
             get(graver_dr::statut).post(graver_dr::lancer),
         )
+        // #7719 — arrêter la gravure en cours, entre deux fichiers.
+        .route("/dr/gravure/cancel", post(graver_dr::annuler))
         // 25/09/2026 — le compositeur des CRÉDITS descend dans la colonne ET
         // dans la balise du fichier. La balise est indispensable : `update_batch`
         // reconstruit `tracks.composer` à partir du fichier seul dès qu'un scan
@@ -948,6 +981,22 @@ mod routage_tests {
 #[cfg(test)]
 #[path = "banc_rail_5993.rs"]
 mod banc_rail_5993;
+
+#[cfg(test)]
+#[path = "facettes_lentes_2144_tests.rs"]
+mod facettes_lentes_2144_tests;
+
+#[cfg(test)]
+#[path = "liste_dr_7580_tests.rs"]
+mod liste_dr_7580_tests;
+
+#[cfg(test)]
+#[path = "filtre_qualite_7725_tests.rs"]
+mod filtre_qualite_7725_tests;
+
+#[cfg(test)]
+#[path = "notes_et_repartitions_7849_tests.rs"]
+mod notes_et_repartitions_7849_tests;
 
 #[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]

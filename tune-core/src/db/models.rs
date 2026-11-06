@@ -109,6 +109,10 @@ const BADGE_FORMATS_LOSSY: [&str; 5] = ["mp3", "ogg", "opus", "wma", "aac"];
 /// comme de l'ALAC, et tout badge — `cd` par défaut jusqu'ici, ou `hi-res`
 /// sur sa seule fréquence — affirmerait ce que personne n'a mesuré.
 const BADGE_FORMATS_INDETERMINES: [&str; 1] = ["m4a"];
+/// Multicanal (#7725) : une piste de PLUS de deux canaux. C'est un critère À
+/// PART des paliers DSD, Hi-Res, CD et lossy, pas un palier de plus : un
+/// album DSD 5.1 sort sous « DSD » ET sous « Multicanal ».
+const MULTICANAL_AU_DELA_DE: i32 = 2;
 
 impl Album {
     pub fn to_json(&self) -> serde_json::Value {
@@ -196,6 +200,27 @@ impl Album {
         };
         // Un format sans badge ne sort sous AUCUN filtre (fil 2126).
         Some(format!("(NOT ({indetermine}) AND {predicat})"))
+    }
+
+    /// La clé du filtre Multicanal (#7725), sur `GET /library/albums?quality=`
+    /// et sur la fiche album filtrée (`/library/albums/{id}/tracks?quality=`).
+    pub const QUALITE_MULTICANAL: &'static str = "multichannel";
+
+    /// Le prédicat qui garde les PISTES multicanales d'alias `alias` : plus
+    /// de [`MULTICANAL_AU_DELA_DE`] canaux. Une piste sans nombre de canaux
+    /// connu n'est pas multicanale.
+    pub fn multicanal_sql_piste(alias: &str) -> String {
+        format!("COALESCE({alias}.channels, 0) > {MULTICANAL_AU_DELA_DE}")
+    }
+
+    /// Le prédicat qui garde les ALBUMS d'alias `alias` dont au moins une
+    /// piste est multicanale (#7725). L'album ne porte pas ses canaux : ils
+    /// se lisent sur ses pistes, comme `max_channels` dans les listes.
+    pub fn multicanal_sql_album(alias: &str) -> String {
+        format!(
+            "EXISTS (SELECT 1 FROM tracks tmc WHERE tmc.album_id = {alias}.id AND {})",
+            Self::multicanal_sql_piste("tmc")
+        )
     }
 
     pub fn new(title: String) -> Self {

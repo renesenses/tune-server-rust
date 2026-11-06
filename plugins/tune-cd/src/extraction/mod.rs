@@ -109,6 +109,13 @@ pub enum StatutPiste {
 pub struct ErreurTravail {
     pub code: &'static str,
     pub message: String,
+    /// #7105 — pour `ecriture` : `droits_refuses`, `lecture_seule`,
+    /// `espace_insuffisant`, `dossier_introuvable` ou `autre`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<&'static str>,
+    /// #7105 — le fichier ou le dossier en cause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chemin: Option<String>,
 }
 
 impl ErreurTravail {
@@ -116,6 +123,20 @@ impl ErreurTravail {
         Self {
             code,
             message: message.into(),
+            cause: None,
+            chemin: None,
+        }
+    }
+
+    /// #7105 — une écriture refusée par le système : code `ecriture`
+    /// (que l'interface sait déjà traduire), la cause et le chemin.
+    pub fn ecriture(chemin: &std::path::Path, e: &std::io::Error) -> Self {
+        let cause = destination::cause_d_ecriture(e);
+        Self {
+            code: "ecriture",
+            message: destination::message_d_ecriture(cause, chemin, e),
+            cause: Some(cause),
+            chemin: Some(chemin.to_string_lossy().to_string()),
         }
     }
 }
@@ -242,6 +263,8 @@ pub struct Extractions {
     pub bus: Option<EventBus>,
     pub scan: Option<Arc<dyn ScanCible>>,
     pub pochettes: Arc<dyn routes::Pochettes>,
+    /// #7105 — la place libre d'un disque (un témoin en test).
+    pub espace_libre: fn(&std::path::Path) -> Option<u64>,
     travaux: Mutex<Vec<Arc<Travail>>>,
 }
 
@@ -256,6 +279,7 @@ impl Extractions {
             bus,
             scan,
             pochettes: Arc::new(routes::CoverArtArchive),
+            espace_libre: destination::espace_libre,
             travaux: Mutex::new(Vec::new()),
         }
     }
@@ -263,6 +287,12 @@ impl Extractions {
     /// Une autre source de pochettes (témoins).
     pub fn avec_pochettes(mut self, p: Arc<dyn routes::Pochettes>) -> Self {
         self.pochettes = p;
+        self
+    }
+
+    /// Une autre mesure de la place libre (témoins).
+    pub fn avec_espace_libre(mut self, f: fn(&std::path::Path) -> Option<u64>) -> Self {
+        self.espace_libre = f;
         self
     }
 
