@@ -1192,6 +1192,13 @@ pub(super) async fn album_bio(
     {
         return Json(cached).into_response();
     }
+    let cle_repli = super::artists::cle_du_repli(&cache_key);
+    if let Some(cached) =
+        super::api_cache_get_ttl(&state.backend, &cle_repli, super::artists::TTL_REPLI_SECS)
+        && super::artists::a_une_bio(&cached)
+    {
+        return Json(cached).into_response();
+    }
     let reponse_du_site = state
         .http_client
         .get("https://mozaiklabs.fr/api/v1/albums/bio")
@@ -1207,30 +1214,50 @@ pub(super) async fn album_bio(
         ])
         .send()
         .await;
-    if let Ok(resp) = reponse_du_site
-        && resp.status().is_success()
-    {
-        let data: Value = resp.json().await.unwrap_or(json!({}));
-        // Provenance comprise (CC BY-SA des extraits Wikipédia) : cf.
-        // `super::artists::reponse_du_proxy`.
-        let out = super::artists::reponse_du_proxy("album", &album.title, &data);
-        if super::artists::a_une_bio(&out) && super::artists::reponse_dans_la_langue(&out, lang) {
-            super::api_cache_set(&state.backend, &cache_key, &out);
-            return Json(out).into_response();
+    // Provenance comprise (CC BY-SA des extraits Wikipédia) : cf.
+    // `super::artists::reponse_du_proxy`.
+    let reponse_du_site = match reponse_du_site {
+        Ok(resp) if resp.status().is_success() => {
+            let data: Value = resp.json().await.unwrap_or(json!({}));
+            Some(super::artists::reponse_du_proxy(
+                "album",
+                &album.title,
+                &data,
+            ))
         }
-    }
-    // Ni bio stockee, ni cache, ni site dans la langue demandee : `bio` nul et
-    // le repli dit (#7027), au lieu de ressortir la bio stockee dans une autre
-    // langue. Cf. `super::artists::sans_bio_dans_la_langue`.
-    let mut out = super::artists::sans_bio_dans_la_langue(
+        _ => None,
+    };
+    let autre_langue = super::artists::bio_stockee_dans_une_autre_langue(
+        "album",
+        &album.title,
+        album.bio.as_deref(),
+        prov.as_ref(),
+        lang,
+    );
+    // Ordre : bio stockee dans la langue, cache, site dans la langue, puis une
+    // autre langue connue avec `repli` (#7027). Cf. `choisir_apres_le_site`.
+    match super::artists::choisir_apres_le_site(
         "album",
         &album.title,
         lang,
+        reponse_du_site,
+        autre_langue,
         album.bio.as_deref(),
         prov.as_ref(),
-    );
-    out["source"] = Value::Null;
-    Json(out).into_response()
+    ) {
+        super::artists::Issue::DansLaLangue(out) => {
+            super::api_cache_set(&state.backend, &cache_key, &out);
+            Json(out).into_response()
+        }
+        super::artists::Issue::Repli(out) => {
+            super::api_cache_set(&state.backend, &cle_repli, &out);
+            Json(out).into_response()
+        }
+        super::artists::Issue::Vide(mut out) => {
+            out["source"] = Value::Null;
+            Json(out).into_response()
+        }
+    }
 }
 
 pub(super) async fn album_similar(

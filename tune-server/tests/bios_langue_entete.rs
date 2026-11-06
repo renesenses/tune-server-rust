@@ -462,7 +462,7 @@ async fn album_une_bio_de_service_sans_langue_ne_passe_plus_pour_de_l_anglais_70
 }
 
 /// Bio française (langue connue), pas de version anglaise, site injoignable :
-/// rien n'est servi et le repli le dit, avec la langue disponible.
+/// le français est servi AVEC sa langue et un `repli` qui le dit.
 #[tokio::test]
 async fn artiste_sans_version_anglaise_le_repli_est_dit_7027() {
     let (app, state) = app_site_injoignable();
@@ -471,8 +471,9 @@ async fn artiste_sans_version_anglaise_le_repli_est_dit_7027() {
     let (status, body) = bio_artiste(&app, "", Some("en")).await;
 
     assert_eq!(status, StatusCode::OK);
-    sans_francais(&body);
-    assert!(body["bio"].is_null(), "bio attendue nulle : {body}");
+    // Décision du 06/11 : le français vaut mieux qu'un vide, mais il est dit.
+    assert_eq!(body["bio"].as_str(), Some(BIO_FR), "{body}");
+    assert_eq!(body["bio_provenance"]["lang"], "fr", "{body}");
     assert_eq!(body["repli"]["raison"], "langue_indisponible", "{body}");
     assert_eq!(body["repli"]["langue_demandee"], "en", "{body}");
     assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
@@ -486,8 +487,9 @@ async fn album_sans_version_anglaise_le_repli_est_dit_7027() {
     let (status, body) = bio_album(&app, "", Some("en")).await;
 
     assert_eq!(status, StatusCode::OK);
-    sans_francais(&body);
-    assert!(body["bio"].is_null(), "bio attendue nulle : {body}");
+    // Décision du 06/11 : le français vaut mieux qu'un vide, mais il est dit.
+    assert_eq!(body["bio"].as_str(), Some(BIO_FR), "{body}");
+    assert_eq!(body["bio_provenance"]["lang"], "fr", "{body}");
     assert_eq!(body["repli"]["raison"], "langue_indisponible", "{body}");
     assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
 }
@@ -528,8 +530,9 @@ async fn artiste_un_cache_anglais_qui_contient_du_francais_est_ignore_7027() {
 
     let (_, body) = bio_artiste(&app, "", Some("en")).await;
 
-    sans_francais(&body);
-    assert!(body["bio"].is_null(), "{body}");
+    // Le cache fautif est ignoré : le français servi vient de la bio LOCALE
+    // (source wikipedia), pas de l'entrée de cache (source community).
+    assert_eq!(body["bio_provenance"]["source"], "wikipedia", "{body}");
     assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
 }
 
@@ -552,8 +555,9 @@ async fn album_un_cache_anglais_qui_contient_du_francais_est_ignore_7027() {
 
     let (_, body) = bio_album(&app, "", Some("en")).await;
 
-    sans_francais(&body);
-    assert!(body["bio"].is_null(), "{body}");
+    // Le cache fautif est ignoré : le français servi vient de la bio LOCALE
+    // (source wikipedia), pas de l'entrée de cache (source community).
+    assert_eq!(body["bio_provenance"]["source"], "wikipedia", "{body}");
     assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
 }
 
@@ -577,4 +581,115 @@ async fn artiste_une_bio_ecrite_a_la_main_reste_servie_7027() {
     let (_, body) = bio_artiste(&app, "", Some("en")).await;
 
     assert_eq!(body["bio"].as_str(), Some("Mon texte à moi."), "{body}");
+}
+
+// === 5. Repli dans une autre langue (décision du 06/11) ====================
+//
+// Sans bio dans la langue demandée, une bio dans une autre langue CONNUE vaut
+// mieux qu'un vide : elle est servie avec sa vraie langue et un `repli`. Une
+// bio sans langue n'est jamais servie comme celle de l'interface.
+
+fn semer_repli(state: &Etat, cle: &str, corps: &Value) {
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(cle, &corps.to_string())
+        .expect("ecriture du repli");
+}
+
+fn repli_en_cache(nom_cle: &str, bio: &str) -> Value {
+    json!({
+        "artist": NOM, "album": TITRE, "bio": bio, "source": "community",
+        "bio_provenance": {"source": "community", "lang": "fr"},
+        "repli": {"raison": "langue_indisponible", "langue_demandee": "en", "langue_disponible": "fr"},
+        "cle": nom_cle,
+    })
+}
+
+/// Un repli rangé il y a moins d'une heure répond sans rappeler le site.
+#[tokio::test]
+async fn artiste_un_repli_recent_est_servi_avec_sa_langue() {
+    let (app, state) = app_site_injoignable();
+    artiste_avec_bio_de_service(&state, BIO_DE);
+    semer_repli(
+        &state,
+        &format!("cache:artistbio:{NOM}:en:repli"),
+        &repli_en_cache("a", BIO_FR),
+    );
+
+    let (_, body) = bio_artiste(&app, "", Some("en")).await;
+
+    assert_eq!(body["bio"].as_str(), Some(BIO_FR), "{body}");
+    assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
+    assert_eq!(body["repli"]["langue_demandee"], "en", "{body}");
+}
+
+#[tokio::test]
+async fn album_un_repli_recent_est_servi_avec_sa_langue() {
+    let (app, state) = app_site_injoignable();
+    album_avec_bio_de_service(&state, BIO_DE);
+    semer_repli(
+        &state,
+        &format!("cache:albumbio:{TITRE}::en:repli"),
+        &repli_en_cache("b", BIO_FR),
+    );
+
+    let (_, body) = bio_album(&app, "", Some("en")).await;
+
+    assert_eq!(body["bio"].as_str(), Some(BIO_FR), "{body}");
+    assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
+}
+
+/// Une bio anglaise en cache l'emporte sur un repli : le repli ne fige rien.
+#[tokio::test]
+async fn artiste_l_anglais_en_cache_l_emporte_sur_le_repli() {
+    let (app, state) = app_site_injoignable();
+    artiste_avec_bio_de_service(&state, BIO_DE);
+    cache_artiste(&state, "en", BIO_EN);
+    semer_repli(
+        &state,
+        &format!("cache:artistbio:{NOM}:en:repli"),
+        &repli_en_cache("a", BIO_FR),
+    );
+
+    let (_, body) = bio_artiste(&app, "", Some("en")).await;
+
+    assert_eq!(body["bio"].as_str(), Some(BIO_EN), "{body}");
+    assert!(body.get("repli").is_none(), "{body}");
+}
+
+/// Un repli de plus d'une heure n'est plus servi : le site serait rappelé.
+/// Ici il est injoignable et la bio de service n'a pas de langue : rien.
+#[tokio::test]
+async fn artiste_un_repli_perime_n_est_plus_servi() {
+    let (app, state) = app_site_injoignable();
+    artiste_avec_bio_de_service(&state, BIO_DE);
+    let cle = format!("cache:artistbio:{NOM}:en:repli");
+    semer_repli(&state, &cle, &repli_en_cache("a", BIO_FR));
+    state
+        .backend
+        .execute(
+            "UPDATE settings SET updated_at = datetime('now', '-2 hours') WHERE key = ?",
+            &[&cle as &dyn ToSqlValue],
+        )
+        .expect("vieillissement du repli");
+
+    let (_, body) = bio_artiste(&app, "", Some("en")).await;
+
+    assert!(body["bio"].is_null(), "{body}");
+    assert!(body["repli"]["langue_disponible"].is_null(), "{body}");
+}
+
+/// Utilisateur en français : bio française servie telle quelle, sans `repli`.
+#[tokio::test]
+async fn artiste_et_album_en_francais_rien_ne_change() {
+    let (app, state) = app_site_injoignable();
+    artiste_avec_bio(&state, 1, "fr", BIO_FR);
+    album_avec_bio(&state, 1, "fr", BIO_FR);
+
+    let (_, a) = bio_artiste(&app, "", Some("fr")).await;
+    let (_, b) = bio_album(&app, "", Some("fr-FR")).await;
+
+    for body in [a, b] {
+        assert_eq!(body["bio"].as_str(), Some(BIO_FR), "{body}");
+        assert!(body.get("repli").is_none(), "{body}");
+    }
 }
