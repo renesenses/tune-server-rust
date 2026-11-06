@@ -25,11 +25,22 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tracing::{debug, info, warn};
 
 use super::canaux_de_carte_6171::{CanauxDeCarte, Dispersion, PlanDeCanaux, remplir_le_tampon};
+use super::local::gain_au_rendu_7264::GainAuRendu;
 use super::local::{NativePcmRing, RingBuf};
 use super::silence_avant_liberation_6133::{
     BORNE_SILENCE_AVANT_LIBERATION, SilenceAvantLiberation, remplir_le_bloc_dsd_natif,
 };
 use super::traits::RingStarvation;
+
+/// #7934 — ce que le rappel natif doit savoir pour pondérer au rendu : la
+/// cadence (durée de la rampe), les voies de l'anneau (frontières de trame)
+/// et la profondeur déclarée de la source (arrondi et borne du mot).
+#[derive(Clone, Copy)]
+struct RenduNatif {
+    cadence: u32,
+    voies: u32,
+    bits: u16,
+}
 
 #[derive(Default)]
 struct RealtimeCounters {
@@ -495,6 +506,11 @@ impl AsioExclusiveOutput {
             transport,
             float_ring.clone(),
             native_ring.clone(),
+            RenduNatif {
+                cadence: sample_rate,
+                voies: channels,
+                bits: bit_depth.clamp(16, 32) as u16,
+            },
             volume.clone(),
             paused.clone(),
             silence.clone(),
@@ -768,11 +784,17 @@ impl AsioExclusiveOutput {
         transport: AsioTransport,
         float_ring: Arc<RingBuf>,
         native_ring: Arc<NativePcmRing>,
+        rendu: RenduNatif,
         volume: Arc<AtomicU32>,
         paused: Arc<AtomicBool>,
         silence: Arc<SilenceAvantLiberation>,
         counters: Arc<RealtimeCounters>,
     ) -> Result<cpal::Stream, String> {
+        // #7934 — le volume de la zone appliqué ICI, aux mots tirés de
+        // l'anneau natif, et non plus dans le producteur deux secondes plus
+        // tôt (`bras_asio.rs` monte l'étage à l'unité). Au repos à la
+        // consigne courante : ni fondu d'ouverture, ni mot pondéré à 100 %.
+        let mut gain = GainAuRendu::nouveau(volume.clone(), rendu.cadence, rendu.voies);
         match transport {
             AsioTransport::NativeI32 => {
                 info!("asio_exclusive_building_i32_stream");
@@ -786,7 +808,9 @@ impl AsioExclusiveOutput {
                                 data.fill(0);
                                 return;
                             }
-                            if remplir_le_tampon(data, &mut dispersion, 0, |d| native_ring.pop(d)) {
+                            if remplir_le_tampon(data, &mut dispersion, 0, |d| {
+                                native_ring.pop_mapped_au_gain(d, rendu.bits, &mut gain, |m| m)
+                            }) {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
                         },
@@ -810,7 +834,12 @@ impl AsioExclusiveOutput {
                                 return;
                             }
                             if remplir_le_tampon(data, &mut dispersion, I24_ZERO, |d| {
-                                native_ring.pop_mapped(d, |sample| i24_borne(sample >> 8))
+                                native_ring.pop_mapped_au_gain(
+                                    d,
+                                    rendu.bits.min(24),
+                                    &mut gain,
+                                    |sample| i24_borne(sample >> 8),
+                                )
                             }) {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
@@ -835,7 +864,9 @@ impl AsioExclusiveOutput {
                                 return;
                             }
                             if remplir_le_tampon(data, &mut dispersion, 0, |d| {
-                                native_ring.pop_mapped(d, |sample| (sample >> 16) as i16)
+                                native_ring.pop_mapped_au_gain(d, 16, &mut gain, |sample| {
+                                    (sample >> 16) as i16
+                                })
                             }) {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
