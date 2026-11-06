@@ -117,6 +117,15 @@ Piège : des bancs de tune-smart-http (`smart_collections.rs`,
 de `source_streaming::requete` les casse (« no such column ») : lancer
 `cargo test -p tune-smart-http` en entier.
 
+## Ajouter une table sans numéro de migration (PostgreSQL)
+
+Un fichier SQL inclus dans `ENSURE_TABLES` (`postgres.rs`) ne se termine **pas**
+par `;` : la garde `ensure_ddl_is_one_statement_per_entry` (#1706) le refuse et
+fait rougir le job « Test (PostgreSQL) », qui saute alors toutes ses étapes
+suivantes. Ce test et ses voisins ne demandent pas de serveur PostgreSQL :
+`cargo test -p tune-core --lib --no-default-features --features postgres postgres::tests`
+(environ 6 min à froid). Clippy avec `--features postgres` ne les exécute pas.
+
 ## CI
 
 - La CI ne refuse que `clippy::correctness` (`-D clippy::correctness`, `ci.yml`).
