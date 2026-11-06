@@ -108,6 +108,65 @@ impl DsdToDoP {
     }
 }
 
+/// Charge utile DSD du repos : densité 50 %, MSB-first (motif conventionnel,
+/// même valeur que `dsd_brut::SILENCE_DSD_MSB_FIRST`). JAMAIS des zéros : en
+/// DSD, un octet nul est la pleine échelle négative.
+pub const REPOS_DSD: u8 = 0x69;
+
+/// Le premier marqueur DoP d'un flux, puis l'alternance.
+pub const MARQUEUR_PAIR: u8 = 0x05;
+pub const MARQUEUR_IMPAIR: u8 = 0xFA;
+
+/// Le marqueur qui suit `m` dans l'alternance DoP.
+#[must_use]
+pub const fn marqueur_suivant(m: u8) -> u8 {
+    if m == MARQUEUR_PAIR {
+        MARQUEUR_IMPAIR
+    } else {
+        MARQUEUR_PAIR
+    }
+}
+
+/// Le mot 24 bits (signé, non aligné) d'une trame DoP de repos portant
+/// `marqueur` : `[marqueur][0x69][0x69]`.
+#[must_use]
+pub const fn mot_de_repos(marqueur: u8) -> i32 {
+    let mot = ((marqueur as u32) << 16) | ((REPOS_DSD as u32) << 8) | REPOS_DSD as u32;
+    // Extension de signe du 24 bits (0xFA…… est négatif).
+    ((mot << 8) as i32) >> 8
+}
+
+impl DsdToDoP {
+    /// #7704 — clôt le flux d'une piste : si elle a émis un nombre IMPAIR de
+    /// trames, sa dernière porte 0x05 et la piste suivante, enchaînée sur le
+    /// même flux ouvert, recommencerait par 0x05 — deux 0x05 de suite,
+    /// l'alternance rompue à une frontière sur deux. Une trame de repos
+    /// (0x69, marqueur 0xFA) rend le compte pair : toute piste commence par
+    /// 0x05 et finit par 0xFA. 5,7 µs de repos en DSD64, inaudibles.
+    ///
+    /// Les octets d'une trame incomplète restés en report sont abandonnés,
+    /// comme avant. `taille_wav_dop` (DSF, DFF) compte cette trame.
+    pub fn terminer(&mut self) -> Vec<u8> {
+        self.reste.clear();
+        if self.channels == 0 || self.frame_count.is_multiple_of(2) {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(3 * self.channels);
+        for _ in 0..self.channels {
+            out.extend_from_slice(&[REPOS_DSD, REPOS_DSD, MARQUEUR_IMPAIR]);
+        }
+        self.frame_count += 1;
+        out
+    }
+}
+
+/// #7704 — nombre de trames DoP d'un flux de `trames_dsd` trames entières,
+/// trame de clôture comprise : toujours PAIR (voir [`DsdToDoP::terminer`]).
+#[must_use]
+pub const fn trames_dop_avec_cloture(trames_dsd: u64) -> u64 {
+    trames_dsd + (trames_dsd % 2)
+}
+
 fn reverse_bits(b: u8) -> u8 {
     let mut r = 0u8;
     for i in 0..8 {

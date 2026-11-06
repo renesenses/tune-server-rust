@@ -82,6 +82,16 @@ pub enum SamplesMut<'a> {
     F64(&'a mut [f64]),
 }
 
+/// Borrowed, interleaved, read-only PCM: the input side of a
+/// [`crate::rate::RateChanger`], which reads one block and writes another.
+pub enum Samples<'a> {
+    S16(&'a [i16]),
+    S24Le(&'a [u8]),
+    S32(&'a [i32]),
+    F32(&'a [f32]),
+    F64(&'a [f64]),
+}
+
 pub struct AudioBlock<'a> {
     format: AudioFormat,
     frames: usize,
@@ -127,6 +137,16 @@ impl<'a> AudioBlock<'a> {
     }
     pub fn frames(&self) -> usize {
         self.frames
+    }
+    /// Read-only view of the payload, at the block's format and frame count.
+    pub fn samples(&self) -> Samples<'_> {
+        match &self.samples {
+            SamplesMut::S16(s) => Samples::S16(s),
+            SamplesMut::S24Le(s) => Samples::S24Le(s),
+            SamplesMut::S32(s) => Samples::S32(s),
+            SamplesMut::F32(s) => Samples::F32(s),
+            SamplesMut::F64(s) => Samples::F64(s),
+        }
     }
     pub fn samples_mut(&mut self) -> SamplesMut<'_> {
         // Reborrow the payload instead of exposing the enum slot: callers

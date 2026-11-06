@@ -217,6 +217,9 @@ const MIGRATION_TABLES: &[&str] = &[
     "metadata_reports",
     // Paroles deja trouvees (les identifiants de pistes sont conserves).
     "lyrics_cache",
+    // Contrôle parental (#7856) : sans cette ligne, un profil supervisé
+    // retrouverait des listes sans filtre après la bascule.
+    "politiques_parentales",
 ];
 
 /// Tables copiees APRES `run_pg_migrations` : elles ne sont creees que par
@@ -229,6 +232,12 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Écoutes importées (#7763, script 101) : sans cette ligne, les écoutes
     // reportées de Roon, Plex ou d'une liste m3u seraient perdues à la bascule.
     "imported_plays",
+    // Notes personnelles (#7849), créées par le script 103. Le script en
+    // reprend les notes d'album ; la copie, qui suit, n'écrase pas.
+    "notes_personnelles",
+    // Clés des clients Subsonic (#7855, script 104) : sans cette ligne, chaque
+    // client devrait être réappairé après la bascule.
+    "cles_clients",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",
@@ -445,7 +454,8 @@ CREATE TABLE IF NOT EXISTS track_credits (
     role TEXT DEFAULT 'performer',
     instrument TEXT,
     position TEXT DEFAULT 0,
-    artist_mbid TEXT
+    artist_mbid TEXT,
+    source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_metadata (
@@ -1134,6 +1144,15 @@ CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_t
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
+-- Contrôle parental (#7856). Sans script numéroté : présente ici (bascule) ET
+-- dans `ENSURE_TABLES`, mêmes types (migrations/politiques_parentales.sql).
+CREATE TABLE IF NOT EXISTS politiques_parentales (
+ profile_id BIGINT PRIMARY KEY,
+ superviseur_id BIGINT NOT NULL,
+ revision BIGINT NOT NULL,
+ politique_json TEXT NOT NULL,
+ maj_le TEXT NOT NULL
+);
 -- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3 de
 -- MetaRust). Sans script numéroté : présente ici (bascule) ET dans
 -- `ENSURE_TABLES` (toute base, à chaque démarrage). Non copiée à la bascule :
@@ -1258,6 +1277,11 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_type TEXT;
 ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS artist_mbid TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS credits_mb_at TEXT;
 
+-- Source d'un crédit de piste (SQLite migration v136, #7765) : manuel,
+-- musicbrainz, balises, discogs ou roon ; NUL = ligne ancienne. Tous les
+-- écrivains de crédits et les passes « à faire » NOMMENT cette colonne.
+ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS source TEXT;
+
 -- Source de la pochette d'album (SQLite migration v111, #5034). Sans défaut :
 -- NUL = inconnue, l'état de toute ligne d'avant la migration.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source TEXT;
@@ -1346,6 +1370,9 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating TEXT;
 -- tracks: debit moyen du fichier en kbit/s (SQLite migration v130 / PG 094,
 -- #6332). TEXT pour la copie ; la 094, rejouee juste apres, le convertit.
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bitrate_kbps TEXT;
+-- tracks: cle de tri de la vue des pistes (#7619, L1, sans numero). Copiee
+-- telle quelle ; recalculee de toute facon par `assurer_les_cles_de_tri`.
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE "C";
 -- radio_stations: lien avec la fiche de l'annuaire (SQLite migration v126 /
 -- PG 090, #6516). TEXT des deux côtés : la copie texte n'a rien à convertir.
 ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT;
@@ -1796,6 +1823,8 @@ fn conflict_clause(table: &str) -> &'static str {
     match table {
         "settings" => "ON CONFLICT (key) DO NOTHING",
         "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
+        "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
+        "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "track_metadata" => "ON CONFLICT (track_id, key) DO NOTHING",
         "album_metadata" => "ON CONFLICT (album_id, key) DO NOTHING",
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",

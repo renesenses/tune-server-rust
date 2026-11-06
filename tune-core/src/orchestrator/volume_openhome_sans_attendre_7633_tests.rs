@@ -82,6 +82,17 @@ async fn faux_linn(refuse: Option<u32>) -> (u16, Arc<Linn>) {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or_default()
                         .to_string();
+                    // #7841 — ce Linn-ci ne publie pas d'échelle : il le dit
+                    // tout de suite, et l'échelle 0..100 s'applique.
+                    if action.contains("#Characteristics") {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "<s:Envelope><s:Body><s:Fault><faultcode>s:Client</faultcode>\
+                             <faultstring>UPnPError</faultstring></s:Fault></s:Body>\
+                             </s:Envelope>"
+                                .to_string(),
+                        );
+                    }
                     if action.contains("#SetVolume") {
                         let v = valeur(&corps).unwrap_or(u32::MAX);
                         if linn.refuse == Some(v) {

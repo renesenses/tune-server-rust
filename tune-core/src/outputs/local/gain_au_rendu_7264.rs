@@ -45,6 +45,16 @@
 //! * **Jamais plus fort que la consigne** : le gain est borné à `[0, 1]`, et
 //!   chaque mot pondéré est arrondi à la profondeur déclarée puis borné à sa
 //!   pleine échelle.
+//!
+//! # #7703 — la pondération est dithérée
+//!
+//! Ce rendu est la DERNIÈRE quantification du WASAPI exclusif : depuis #7264,
+//! l'étage natif travaille à l'unité, et c'est ici que le volume réduit la
+//! piste. Un arrondi nu y gardait l'erreur corrélée au signal que #7703
+//! retire de `f32_to_native_i32`. Le mot pondéré reçoit donc le TPDF ±1 LSB
+//! du dépôt (`audio::dither`) avant l'arrondi, à 16 et 24 bits ; rien à
+//! 32 bits. Un produit qui tombe déjà sur un mot exact (silence numérique,
+//! gain qui divise juste) sort sans bruit : le silence reste un zéro.
 
 // Seul le fil de rendu WASAPI s'en sert hors des témoins.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -79,6 +89,8 @@ pub(crate) struct GainAuRendu {
     canaux: u64,
     /// Le passage en cours de rendu est-il intact (DoP, reliquat brut) ?
     intact: bool,
+    /// #7703 — le TPDF de la pondération (état de 64 bits, sans allocation).
+    dither: crate::audio::dither::Dither,
 }
 
 impl GainAuRendu {
@@ -97,6 +109,7 @@ impl GainAuRendu {
             trames_de_rampe,
             canaux: u64::from(canaux.max(1)),
             intact: false,
+            dither: crate::audio::dither::Dither::depuis_graine(GRAINE_DU_RENDU),
         }
     }
 
@@ -140,7 +153,7 @@ impl GainAuRendu {
         let rendu = if self.courant == 1.0 {
             mot
         } else {
-            ponderer(mot, bits, self.courant)
+            ponderer_avec_dither(mot, bits, self.courant, &mut self.dither)
         };
         if position % self.canaux == self.canaux - 1 && self.courant != self.cible {
             self.courant = if self.cible > self.courant {
@@ -163,6 +176,7 @@ fn gain_de(volume_units: u32) -> f64 {
 /// multiplié en `f64` (exact pour 32 bits), arrondi, borné à la pleine
 /// échelle de `bits`, puis réaligné à gauche — les bits bas inoccupés restent
 /// nuls, comme `pop_pcm_bytes` l'attend.
+#[cfg(test)]
 #[inline]
 fn ponderer(mot: i32, bits: u16, gain: f64) -> i32 {
     let bits = u32::from(bits.clamp(8, 32));
@@ -171,6 +185,32 @@ fn ponderer(mot: i32, bits: u16, gain: f64) -> i32 {
     let max = ((1i64 << (bits - 1)) - 1) as f64;
     let min = -max - 1.0;
     let v = (utile * gain).round().clamp(min, max) as i32;
+    v << decalage
+}
+
+/// Graine fixe du TPDF du rendu : le bruit ne dépend pas du signal.
+const GRAINE_DU_RENDU: u64 = 0x7703_7264_d17e_0001;
+
+/// #7703 — [`ponderer`], avec le TPDF ±1 LSB de la profondeur déclarée avant
+/// l'arrondi (16 et 24 bits). Un produit exact sort sans bruit.
+#[inline]
+fn ponderer_avec_dither(
+    mot: i32,
+    bits: u16,
+    gain: f64,
+    dither: &mut crate::audio::dither::Dither,
+) -> i32 {
+    let bits = u32::from(bits.clamp(8, 32));
+    let decalage = 32 - bits;
+    let ideal = f64::from(mot >> decalage) * gain;
+    let max = ((1i64 << (bits - 1)) - 1) as f64;
+    let min = -max - 1.0;
+    let bruit = if bits < 32 && ideal.fract() != 0.0 {
+        dither.tirer()
+    } else {
+        0.0
+    };
+    let v = crate::audio::dither::quantifier_avec(ideal, bruit, min, max) as i32;
     v << decalage
 }
 
@@ -258,7 +298,8 @@ mod tests {
     }
 
     /// La rampe ne fait jamais de marche : d'une trame à la suivante, l'écart
-    /// est d'au plus un pas de rampe (+1 d'arrondi), monotone vers la cible.
+    /// est d'au plus un pas de rampe (+1 d'arrondi, +2 du TPDF de #7703),
+    /// monotone vers la cible.
     #[test]
     fn la_rampe_du_volume_glisse_sans_marche() {
         let anneau = anneau_de_deux_secondes();
@@ -272,13 +313,17 @@ mod tests {
                 rendre_une_periode(&anneau, &mut gain)
                     .chunks_exact(2)
                     .map(|t| {
-                        assert_eq!(t[0], t[1], "même facteur pour les voies d'une trame");
+                        // #7703 : chaque voie reçoit son tirage TPDF (±1 LSB).
+                        assert!(
+                            (t[0] - t[1]).abs() <= 2,
+                            "même facteur pour les voies d'une trame : {t:?}"
+                        );
                         t[0]
                     }),
             );
         }
         let trames_de_rampe = (CADENCE * RAMPE_DU_VOLUME_MS / 1000) as f64;
-        let pas_max = (f64::from(0x40_0000) / trames_de_rampe).ceil() as i32 + 1;
+        let pas_max = (f64::from(0x40_0000) / trames_de_rampe).ceil() as i32 + 3;
         for fenetre in gauche.windows(2) {
             assert!(fenetre[1] <= fenetre[0], "monotone vers le silence");
             assert!(
@@ -399,6 +444,66 @@ mod tests {
     /// Jamais plus fort que la pleine échelle ni que la consigne : un volume
     /// stocké au-dessus de 1000 est rendu à l'unité, un mot pondéré reste
     /// dans la pleine échelle et garde ses bits bas nuls.
+    /// #7762 — témoin (vert avant comme après) : 50 % du curseur `db60`
+    /// d'une sortie locale (gain 0,0316, −30 dB) est rendu par le fil WASAPI
+    /// UNE fois — le mot sort à −30 dB (au millième de volume près), pas à
+    /// −60 dB (gain appliqué deux fois) ni à −6 dB (position prise pour un
+    /// gain). Même conversion que `set_volume` et `effective_volume_units`.
+    #[test]
+    fn cinquante_pour_cent_du_curseur_db60_sont_rendus_une_seule_fois_a_moins_30_db_7762() {
+        let gain = crate::audio::volume_scale::gain_perceptif(0.5);
+        // `LocalOutput::set_volume` : millièmes tronqués.
+        let utilisateur = (gain.clamp(0.0, 1.0) * 1000.0) as u32;
+        let effectif = super::super::effective_volume_units(utilisateur, 1000, false);
+        let anneau = anneau_de_deux_secondes();
+        remplir(&anneau, PERIODE);
+        let volume = Arc::new(AtomicU32::new(effectif));
+        let mut gain_au_rendu = GainAuRendu::nouveau(volume, CADENCE, VOIES);
+        let rendu = rendre_une_periode(&anneau, &mut gain_au_rendu);
+        let db = 20.0 * (f64::from(rendu[0]) / f64::from(0x40_0000)).log10();
+        assert!(
+            (db + 30.0).abs() < 0.3,
+            "50 % du curseur db60 doivent sortir à −30 dB, mesuré {db:.2} dB \
+             ({effectif} millièmes)"
+        );
+        // #7703 : le mot pondéré porte le TPDF (±1 LSB) ; le gain, lui, est
+        // constant.
+        assert!(
+            rendu.iter().all(|&m| (m - rendu[0]).abs() <= 2),
+            "gain constant, sans rampe"
+        );
+    }
+    /// #7703 — le rendu WASAPI est la dernière quantification depuis #7264 :
+    /// à volume réduit, le mot 16 bits est dithéré, pas arrondi à nu. Un mot
+    /// de 10 LSB à 3 % vaut 0,3 LSB : l'arrondi nu rend toujours 0 (le
+    /// signal disparaît, l'erreur lui est corrélée) ; le TPDF garde la
+    /// moyenne. Le silence numérique reste un zéro exact.
+    #[test]
+    fn a_volume_reduit_le_rendu_16_bits_est_dithere_7703() {
+        let mut gain = GainAuRendu::nouveau(Arc::new(AtomicU32::new(30)), CADENCE, VOIES);
+        let n = 20_000u64;
+        let mut somme = 0i64;
+        for position in 0..n {
+            let rendu = gain.rendre(10 << 16, 16, position);
+            assert_eq!(rendu & 0xFFFF, 0, "bits bas nuls");
+            let utile = rendu >> 16;
+            assert!((-1..=2).contains(&utile), "±1 LSB au plus : {utile}");
+            somme += i64::from(utile);
+        }
+        let moyenne = somme as f64 / n as f64;
+        assert!(
+            (moyenne - 0.3).abs() < 0.05,
+            "rendu WASAPI sans dither après le volume (#7703) : moyenne au puits {moyenne:+.4} \
+             LSB pour 0,3 LSB attendus — le mot atténué est arrondi à nu, l'erreur est \
+             corrélée au signal"
+        );
+        for position in 0..64 {
+            assert_eq!(gain.rendre(0, 16, position), 0, "le silence reste un zéro");
+        }
+        // 32 bits : aucun bruit ajouté.
+        assert_eq!(gain.rendre(10, 32, 0), 0);
+    }
+
     #[test]
     fn le_gain_est_borne_et_le_mot_reste_aligne() {
         let mut gain = GainAuRendu::nouveau(Arc::new(AtomicU32::new(1500)), CADENCE, VOIES);
