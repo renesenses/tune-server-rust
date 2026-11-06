@@ -460,14 +460,16 @@ impl SpotifyService {
             self.note_token_rejected();
             return Err("token expired".into());
         }
-        // #7659 — un refus (400, 403, 429…) porte un corps JSON valide,
-        // `{"error":{"status":400,"message":"Invalid limit"}}` : le lire comme
-        // une réponse faisait passer le refus pour une recherche sans
-        // résultat. Le chemin est journalisé sans sa requête.
+        // #7659 et #6825 — un refus (400, 403, 404, 429…) porte un corps JSON
+        // valide, `{"error":{"status":400,"message":"Invalid limit"}}` : le
+        // lire comme une réponse faisait passer le refus pour une recherche
+        // sans résultat ou un onglet Éditorial vide (mis en cache 30 min).
+        // C'est une erreur, journalisée avec son statut ; le chemin est
+        // journalisé sans sa requête, le motif borné à 200 caractères.
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let corps = resp.text().await.unwrap_or_default();
-            let message = message_d_erreur(&corps);
+            let message = motif_du_refus(&corps);
             let route = path.split('?').next().unwrap_or(path);
             warn!(status, route, message = %message, "spotify_api_error");
             return Err(format!("spotify GET {route}: HTTP {status} — {message}"));
@@ -1415,13 +1417,6 @@ fn spotify_needs_refresh(
 
 /// #7659 — le message d'un refus de l'API Web (`error.message`), ou le corps
 /// brut s'il n'en porte pas.
-fn message_d_erreur(corps: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(corps)
-        .ok()
-        .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| corps.trim().to_owned())
-}
-
 /// #7659 — l'erreur d'[`SpotifyService::api_get`] est-elle le refus de la
 /// limite de recherche (`400 Invalid limit`) ?
 fn refus_de_limite(erreur: &str) -> bool {
@@ -1467,6 +1462,18 @@ fn motif_refus_403(detail: &str) -> String {
     }
 }
 
+/// #6825 — le motif d'un refus de l'API Web, borné : `error.message` du
+/// corps JSON de Spotify (`{"error": {"status", "message"}}`), sinon le début
+/// du texte brut. Jamais plus de 200 caractères dans le journal.
+fn motif_du_refus(corps: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(corps).unwrap_or_default();
+    let message = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error_description"].as_str())
+        .unwrap_or(corps)
+        .trim();
+    message.chars().take(200).collect()
+}
 fn base64url_encode(data: &[u8]) -> String {
     let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut output = String::new();
@@ -2390,6 +2397,76 @@ mod tests {
             vu[0].1,
             json!({"uris": ["spotify:track:4uLU6hMCjMI75M1A2tKUQC"], "position_ms": 5000})
         );
+    }
+
+    /// #6825 — un refus de l'API Web sur une rubrique éditoriale est une
+    /// erreur, avec son statut et le motif de Spotify, et non une liste vide.
+    /// Une réponse 200 garde son contenu.
+    #[tokio::test]
+    async fn spotify_6825_un_refus_editorial_est_une_erreur_et_non_une_liste_vide() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/browse/featured-playlists",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(json!({"error": {"status": 404, "message": "Not Found"}})),
+                    )
+                }),
+            )
+            .route(
+                "/v1/browse/new-releases",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        axum::Json(json!({"error": {"status": 403, "message": "Forbidden"}})),
+                    )
+                }),
+            )
+            .route(
+                "/v1/browse/categories",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"categories": {"items": [
+                        {"id": "jazz", "name": "Jazz", "icons": []}
+                    ]}}))
+                }),
+            );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", ecoute.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+        let mut svc =
+            SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(&base);
+        svc.access_token = Some("jeton".into());
+
+        let err = svc
+            .get_new_releases()
+            .await
+            .expect_err("#6825 : un 403 de /browse/new-releases rendait une liste vide")
+            .to_string();
+        assert!(err.contains("403") && err.contains("Forbidden"), "{err}");
+        assert!(!err.contains("jeton"), "le jeton ne sort jamais : {err}");
+        let err = svc
+            .get_featured()
+            .await
+            .expect_err("#6825 : un 404 de /browse/featured-playlists rendait une liste vide")
+            .to_string();
+        assert!(err.contains("404"), "{err}");
+        let genres = svc.get_genres(None).await.expect("200");
+        assert_eq!(genres.len(), 1);
+    }
+
+    #[test]
+    fn spotify_6825_motif_du_refus_borne() {
+        assert_eq!(
+            motif_du_refus(r#"{"error": {"status": 403, "message": "Forbidden"}}"#),
+            "Forbidden"
+        );
+        assert_eq!(
+            motif_du_refus("  <html>bad gateway</html> "),
+            "<html>bad gateway</html>"
+        );
+        assert_eq!(motif_du_refus(&"x".repeat(500)).chars().count(), 200);
+        assert_eq!(motif_du_refus(""), "");
     }
 
     /// Sans Premium, Spotify répond 403 : Tune le dit en clair.

@@ -220,6 +220,8 @@ mod tests {
             child: None,
             stdin: Box::new(server_stdin),
         });
+        // Un daemon de banc deja relie au recepteur (#7441).
+        *output.pairing.lock().await = crate::outputs::airplay2::PairingPhase::Connected;
         output.start_event_reader(BufReader::new(server_stdout));
 
         let mut conn = Some(BufReader::new(TcpStream::connect(recepteur).await.unwrap()));

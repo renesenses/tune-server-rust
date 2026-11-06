@@ -142,7 +142,8 @@ impl DffInfo {
             .map(|ms| super::dsd_brut::octets_par_canal_pour_ms(self.sample_rate, ms))
             .unwrap_or(total)
             .min(total);
-        (fin.saturating_sub(atteint) / 2)
+        // #7704 — la trame de clôture qui rend le compte pair.
+        super::dsd_to_dop::trames_dop_avec_cloture(fin.saturating_sub(atteint) / 2)
             .checked_mul(self.channels as u64)?
             .checked_mul(3)?
             .checked_add(44)
