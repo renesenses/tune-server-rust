@@ -444,6 +444,8 @@ fn gapless_cooldown_suppresses_stopped() {
         radio_source_annonce: (None, None),
         fige_a_zero_depuis: None,
         octets_du_demarrage: None,
+        tune_tested_rendu_ms: 0,
+        tune_tested_releve: None,
     };
 
     // While cooldown > 0, stopped_ticks must not accumulate
@@ -520,6 +522,8 @@ fn playing_state_resets_cooldown() {
         radio_source_annonce: (None, None),
         fige_a_zero_depuis: None,
         octets_du_demarrage: None,
+        tune_tested_rendu_ms: 0,
+        tune_tested_releve: None,
     };
 
     // Simulates entering Playing state
@@ -841,6 +845,8 @@ fn backoff_exponential() {
         radio_source_annonce: (None, None),
         fige_a_zero_depuis: None,
         octets_du_demarrage: None,
+        tune_tested_rendu_ms: 0,
+        tune_tested_releve: None,
     };
 
     // Simulate consecutive errors with exponential backoff
@@ -1832,6 +1838,8 @@ fn gapless_stuck_forces_track_end() {
         radio_source_annonce: (None, None),
         fige_a_zero_depuis: None,
         octets_du_demarrage: None,
+        tune_tested_rendu_ms: 0,
+        tune_tested_releve: None,
     };
 
     // Simulate renderer staying Stopped after cooldown expired.
@@ -2177,6 +2185,8 @@ fn gapless_stuck_cleared_on_playing() {
         radio_source_annonce: (None, None),
         fige_a_zero_depuis: None,
         octets_du_demarrage: None,
+        tune_tested_rendu_ms: 0,
+        tune_tested_releve: None,
     };
 
     // Simulate entering Playing state (renderer auto-transitioned)
