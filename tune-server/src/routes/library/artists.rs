@@ -1704,7 +1704,8 @@ mod tests_proxy_bio {
 
 #[cfg(test)]
 mod tests_langue_bio {
-    use super::langue_convient;
+    use super::{Issue, bio_stockee_dans_une_autre_langue, choisir_apres_le_site, langue_convient};
+    use serde_json::{Value, json};
 
     /// Le cas de Dimitri (#1849) : bibliothèque enrichie en français, lecteur
     /// anglophone. La bio stockée ne doit PAS être resservie telle quelle.
