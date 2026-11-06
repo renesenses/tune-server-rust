@@ -293,6 +293,11 @@ path = "tests/agent_tune_4626.rs"
 name = "subsonic_socle_7855"
 path = "tests/subsonic_socle_7855.rs"
 
+# #7945 — Subsonic étape 2 : navigation, recherche, stream en Range.
+[[test]]
+name = "subsonic_navigation_7945"
+path = "tests/subsonic_navigation_7945.rs"
+
 # #7335 — les écritures des dossiers de collections refusées par la base ne
 # répondent plus 201/200. Cible propre (pas un `mod` de `server_contracts`) :
 # `autotests = false` plus haut, sans cette entrée le fichier n'est jamais
