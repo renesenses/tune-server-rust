@@ -1647,9 +1647,6 @@ impl LocalOutput {
             .store(Self::pack_format(taux, canaux), Ordering::Relaxed);
     }
 
-    /// Force l'état de la boucle d'enchaînement, pour les tests : c'est la
-    /// seule façon d'atteindre la sonde sans carte son. Même point d'entrée que
-    /// `OaatOutput::set_chain_exhausted_for_test` (#1323).
     /// #7949 — installe un fil de lecture factice, sans carte son, à la place
     /// de celui que lance `play_url` : même canal d'arrêt, même `paused`, même
     /// `force_silent`, même sentinelle déclarée en premier. Rend la sentinelle,
@@ -1676,6 +1673,9 @@ impl LocalOutput {
         sentinelle
     }
 
+    /// Force l'état de la boucle d'enchaînement, pour les tests : c'est la
+    /// seule façon d'atteindre la sonde sans carte son. Même point d'entrée que
+    /// `OaatOutput::set_chain_exhausted_for_test` (#1323).
     #[cfg(test)]
     pub(crate) fn set_chain_exhausted_for_test(&self, exhausted: bool) {
         self.chain_exhausted.store(exhausted, Ordering::SeqCst);
