@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+use tune_core::cloud::tune_tested::RACINE_PAR_DEFAUT;
 use tune_core::cloud::tune_tested_proposition::{self as proposition, EtatProposition};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
@@ -22,8 +23,9 @@ use crate::state::AppState;
 
 /// Chemin de la route du site qui reçoit les propositions.
 pub(crate) const CHEMIN_DU_SITE: &str = "/api/v1/community/tune-tested/proposals";
-const RACINE_PAR_DEFAUT: &str = "https://mozaiklabs.fr";
 
+/// La racine est celle du catalogue Tune tested (`RACINE_PAR_DEFAUT`, ou
+/// `mozaik_base_url`), pour que les deux ne divergent pas.
 fn url_du_site(settings: &SettingsRepo) -> String {
     let base = settings
         .get("mozaik_base_url")
@@ -87,9 +89,20 @@ pub async fn etat_tune_tested(State(state): State<AppState>, Path(zone_id): Path
     }
 }
 
+/// L'aperçu montré à l'utilisateur, si le client le renvoie avec sa
+/// confirmation (`{"preview": …}`). Un corps vide ou illisible n'en porte pas.
+fn apercu_confirme(corps: &[u8]) -> Option<Value> {
+    serde_json::from_slice::<Value>(corps)
+        .ok()?
+        .get("preview")
+        .cloned()
+        .filter(|v| !v.is_null())
+}
+
 pub async fn proposer_tune_tested(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    confirmation: axum::body::Bytes,
 ) -> Response {
     let Some((settings, etat)) = etat_de_la_zone(&state, zone_id) else {
         return refus(StatusCode::NOT_FOUND, "zone_not_found", json!({}));
@@ -129,6 +142,17 @@ pub async fn proposer_tune_tested(
         );
     };
     let corps = corps_envoye(&settings, apercu);
+    // L'aperçu est exact : si une piste s'est terminée depuis qu'il a été
+    // montré, rien ne part et le client reçoit le nouveau à confirmer.
+    if let Some(montre) = apercu_confirme(&confirmation)
+        && montre != corps
+    {
+        return refus(
+            StatusCode::CONFLICT,
+            "tune_tested_preview_changed",
+            json!({ "preview": corps }),
+        );
+    }
     let client = match tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()

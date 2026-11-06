@@ -122,6 +122,10 @@ impl Banc {
     }
 
     async fn appeler(&self, methode: &str) -> (StatusCode, Value) {
+        self.appeler_avec(methode, Body::empty()).await
+    }
+
+    async fn appeler_avec(&self, methode: &str, corps: Body) -> (StatusCode, Value) {
         let resp = self
             .app
             .clone()
@@ -129,7 +133,8 @@ impl Banc {
                 Request::builder()
                     .method(methode)
                     .uri(format!("/api/v1/zones/{}/tune-tested", self.zone))
-                    .body(Body::empty())
+                    .header("content-type", "application/json")
+                    .body(corps)
                     .unwrap(),
             )
             .await
@@ -246,6 +251,36 @@ async fn tune_tested_7922_l_envoi_porte_l_identite_du_rapport_de_bogue() {
     assert_eq!(statut, StatusCode::PRECONDITION_FAILED, "{corps}");
     assert_eq!(corps["error"], "tune_tested_not_connected");
     assert_eq!(site.appels.load(Ordering::SeqCst), avant);
+}
+
+#[tokio::test]
+async fn tune_tested_7922_un_apercu_perime_n_est_pas_envoye() {
+    let site = faux_site().await;
+    let banc = banc(&site.base, &[("license_key", "CLE-ESSAI-7922")]);
+    banc.ecouter(60);
+    let (_, etat) = banc.appeler("GET").await;
+    let montre = etat["preview"].clone();
+    // Une piste se termine entre l'aperçu et la confirmation.
+    banc.ecouter(4);
+    let confirmation = |apercu: &Value| Body::from(json!({ "preview": apercu }).to_string());
+    let (statut, corps) = banc.appeler_avec("POST", confirmation(&montre)).await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
+    assert_eq!(
+        corps["error"], "tune_tested_preview_changed",
+        "un aperçu qui ne correspond plus à l'envoi est refusé par une erreur nommée"
+    );
+    assert_eq!(corps["preview"]["error_free_seconds"], 3840);
+    assert_eq!(
+        site.appels.load(Ordering::SeqCst),
+        0,
+        "rien ne part que l'utilisateur n'a pas vu"
+    );
+
+    // Le nouvel aperçu, confirmé, part tel quel.
+    let nouveau = corps["preview"].clone();
+    let (statut, corps) = banc.appeler_avec("POST", confirmation(&nouveau)).await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(site.dernier.lock().await.corps, nouveau);
 }
 
 #[tokio::test]
