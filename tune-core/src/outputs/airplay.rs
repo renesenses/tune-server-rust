@@ -305,6 +305,12 @@ impl AirplayOutput {
         self
     }
 
+    /// #7447 — l'appareil exige l'appairage AirPlay 2 que ce chemin ne fait
+    /// pas : la route de jumelage le dit au lieu d'annoncer un succès.
+    pub fn exige_l_appairage_airplay2(&self) -> bool {
+        self.appairage_airplay2_requis || self.composant_airplay2_manquant
+    }
+
     /// Ce qu'un 403 au ANNOUNCE ou au SETUP veut dire pour cet appareil.
     fn refus_airplay2(&self) -> RefusAirplay2 {
         if self.composant_airplay2_manquant {
@@ -841,6 +847,11 @@ impl OutputTarget for AirplayOutput {
 
     fn output_type(&self) -> &str {
         "airplay"
+    }
+
+    /// #7447 — la route de jumelage lit `exige_l_appairage_airplay2`.
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn capabilities(&self) -> OutputCapabilities {
