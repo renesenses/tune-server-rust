@@ -377,3 +377,68 @@ async fn un_scan_incremental_ne_rouvre_aucun_fichier_inchange() {
         cles(&etat.backend, id)
     );
 }
+
+// ---------------------------------------------------------------------------
+// #7766 — le scan écrit les crédits des balises dans `track_credits`, source
+// `balises`, sans toucher aux crédits d'une autre source.
+// ---------------------------------------------------------------------------
+
+fn credits(db: &Arc<dyn DbBackend>, id: i64) -> Vec<String> {
+    let mut v: Vec<String> = db
+        .query_many(
+            &format!(
+                "SELECT COALESCE(source, 'NULL'), role, artist_name FROM track_credits \
+                 WHERE track_id = {id}"
+            ),
+            &[],
+        )
+        .expect("lecture track_credits")
+        .into_iter()
+        .map(|c| {
+            c.iter()
+                .map(|x| x.as_string().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn le_scan_ecrit_les_credits_des_balises_sans_ecraser_les_autres_7766() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+    let (racine, _piste) = piste_sur_disque("credits-7766");
+    let etat = etat(racine.path());
+
+    scan_manuel(&etat, false).await;
+    let id = id_de_la_piste(&etat.backend);
+    assert_eq!(
+        credits(&etat.backend, id),
+        vec![format!("balises|composer|{COMPOSITEUR}")],
+        "#7766 — le scan n'a pas écrit le compositeur de la balise COMPOSER dans \
+         `track_credits` (source `balises`)"
+    );
+
+    // Une ligne MusicBrainz posée entre deux scans reste en place, et le scan
+    // complet ne double pas ses propres lignes.
+    etat.backend
+        .execute(
+            &format!(
+                "INSERT INTO track_credits (track_id, artist_name, role, position, source) \
+                 VALUES ({id}, 'Herbert von Karajan', 'conductor', 0, 'musicbrainz')"
+            ),
+            &[],
+        )
+        .unwrap();
+    scan_manuel(&etat, true).await;
+    assert_eq!(
+        credits(&etat.backend, id),
+        vec![
+            format!("balises|composer|{COMPOSITEUR}"),
+            "musicbrainz|conductor|Herbert von Karajan".to_string(),
+        ],
+        "#7766 — le second scan a doublé ou effacé des crédits"
+    );
+}

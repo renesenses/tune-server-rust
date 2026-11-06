@@ -28,16 +28,32 @@ fn personnes_de_la_balise(
         if entree.is_empty() {
             return None;
         }
-        if role == "performer"
-            && let Some(sans_parenthese) = entree.strip_suffix(')')
-            && let Some((nom, instrument)) = sans_parenthese.rsplit_once(" (")
-            && !nom.trim().is_empty()
-            && !instrument.trim().is_empty()
-        {
-            return Some((nom.trim().to_owned(), Some(instrument.trim().to_owned())));
+        if role == "performer" {
+            // #7766 — le découpage unique, partagé avec l'écriture au scan.
+            return Some(tune_core::metadata::credits_balises::nom_et_instrument(
+                entree,
+            ));
         }
         Some((entree.to_owned(), None))
     })
+}
+
+/// #7766 — la piste de `track_metadata tm` n'a pas encore de lignes
+/// `balises` dans `track_credits`. Une piste scannée depuis #7766 a ses
+/// crédits de balises dans la table, déjà rendus par la requête principale :
+/// les relire ici les afficherait deux fois (« grand piano » relu brut à côté
+/// de « piano » canonisé). Les pistes pas encore rescannées gardent ce repli.
+fn sans_lignes_balises(engine: tune_core::db::engine::Engine) -> &'static str {
+    match engine {
+        tune_core::db::engine::Engine::Postgres => {
+            "NOT EXISTS (SELECT 1 FROM track_credits tb \
+             WHERE CAST(tb.track_id AS TEXT) = CAST(tm.track_id AS TEXT) AND tb.source = 'balises')"
+        }
+        tune_core::db::engine::Engine::Sqlite => {
+            "NOT EXISTS (SELECT 1 FROM track_credits tb \
+             WHERE tb.track_id = tm.track_id AND tb.source = 'balises')"
+        }
+    }
 }
 
 /// Ajoute les crédits portés par le fichier à la réponse existante. Une ligne
@@ -197,12 +213,14 @@ pub(super) async fn track_credits(
         .collect();
     let id_str = id.to_string();
     let (cle_piste, piste_param): (&str, &dyn ToSqlValue) = match state.backend.engine() {
-        tune_core::db::engine::Engine::Postgres => ("CAST(track_id AS TEXT) = ?", &id_str),
-        tune_core::db::engine::Engine::Sqlite => ("track_id = ?", &id),
+        tune_core::db::engine::Engine::Postgres => ("CAST(tm.track_id AS TEXT) = ?", &id_str),
+        tune_core::db::engine::Engine::Sqlite => ("tm.track_id = ?", &id),
     };
+    let sans_lignes_balises = sans_lignes_balises(state.backend.engine());
     let sql = format!(
-        "SELECT track_id, key, value FROM track_metadata \
-         WHERE {cle_piste} AND key IN ('performer', 'producer') ORDER BY key"
+        "SELECT tm.track_id, tm.key, tm.value FROM track_metadata tm \
+         WHERE {cle_piste} AND tm.key IN ('performer', 'producer') \
+         AND {sans_lignes_balises} ORDER BY tm.key"
     );
     let balises = state
         .backend
@@ -324,7 +342,9 @@ pub(super) async fn album_credits(
         "SELECT t.id, tm.key, tm.value, t.title, t.track_number, t.disc_number \
          FROM tracks t JOIN track_metadata tm ON {jointure_metadonnees} \
          WHERE {cle_album_metadonnees} AND tm.key IN ('performer', 'producer') \
-         ORDER BY t.disc_number, t.track_number, t.id, tm.key"
+         AND {sans_lignes_balises} \
+         ORDER BY t.disc_number, t.track_number, t.id, tm.key",
+        sans_lignes_balises = sans_lignes_balises(state.backend.engine())
     );
     let balises = state
         .backend
@@ -1501,6 +1521,48 @@ mod tests_tache_de_fond_credits {
 #[cfg(test)]
 mod tests_balises_5160 {
     use super::*;
+
+    /// #7766 — une piste dont le scan a écrit les crédits `balises` ne les
+    /// voit pas une seconde fois, relus bruts depuis `track_metadata`
+    /// (« grand piano » à côté du « piano » canonisé).
+    #[tokio::test]
+    async fn une_piste_aux_lignes_balises_ne_relit_pas_ses_balises_7766() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (81, 'Bill Evans');
+                 INSERT INTO albums (id, title, artist_id) VALUES (82, 'Undercurrent', 81);
+                 INSERT INTO tracks (id, title, file_path, album_id, track_number, disc_number)
+                    VALUES (83, 'Dream Gypsy', '/musique/83.flac', 82, 1, 1);
+                 INSERT INTO track_credits (track_id, artist_name, role, instrument, position, source)
+                    VALUES (83, 'Bill Evans', 'performer', 'piano', 0, 'balises');
+                 INSERT INTO track_credits (track_id, artist_name, role, position, source)
+                    VALUES (83, 'Alan Douglas', 'producer', 1, 'balises');
+                 INSERT INTO track_metadata (track_id, key, value)
+                    VALUES (83, 'performer', 'Bill Evans (grand piano)');
+                 INSERT INTO track_metadata (track_id, key, value)
+                    VALUES (83, 'producer', 'Alan Douglas');",
+            )
+            .unwrap();
+
+        let Json(piste) = track_credits(State(state.clone()), Path(83))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits de piste"));
+        assert_eq!(
+            piste.as_array().unwrap().len(),
+            2,
+            "#7766 — les balises sont relues alors que la piste a déjà ses lignes `balises` : {piste}"
+        );
+        let Json(album) = album_credits(State(state), Path(82))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits d'album"));
+        assert_eq!(
+            album.as_array().unwrap().len(),
+            2,
+            "#7766 — crédits d'album doublés : {album}"
+        );
+    }
 
     #[tokio::test]
     async fn les_balises_de_fichier_entrent_dans_les_credits_de_piste_et_d_album() {

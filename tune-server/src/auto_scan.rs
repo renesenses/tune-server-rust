@@ -966,6 +966,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                                 ecritures = ecritures.avec_dr_des_rapports_voisins(
                                     meta_entries.iter().map(|(_, m)| m),
                                 );
+                                // #7766 — sœur exacte du scan manuel : les
+                                // crédits des balises, source `balises`.
+                                tune_core::metadata::credits_balises::ecrire_lot(
+                                    &db,
+                                    &meta_entries,
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "auto_scan_extended_metadata_insert_failed");
@@ -2516,7 +2522,10 @@ pub(crate) fn reimporter_fichier_surveillant(
                     _ => return Err("la relecture des crédits a échoué".to_string()),
                 };
                 tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone())
-                    .set_batch(id, &ext)
+                    .set_batch(id, &ext)?;
+                // #7766 — les crédits des balises, comme les deux scans.
+                tune_core::metadata::credits_balises::ecrire_lot(db, &[(id, ext)]);
+                Ok(())
             })();
             if let Err(e) = metadonnees {
                 tracing::warn!(path = %sf.path, error = %e, "watcher_extended_metadata_failed");
