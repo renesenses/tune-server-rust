@@ -418,6 +418,74 @@ pub(crate) fn est_une_station_de_radio(item: &Value) -> bool {
     classe_diffusee || station_de_tune
 }
 
+/// Les extensions qui ne désignent jamais du son : photos (dont les RAW des
+/// appareils, le DNG du #7695) et vidéos. `.mp4`, `.mkv` et `.3gp` n'y sont
+/// PAS : ils peuvent contenir de l'audio (AAC/ALAC, Matroska audio, que Tune
+/// sert en `audio/x-matroska`, `audio/3gpp`), tout comme `.m4a` et `.mka`.
+const EXTENSIONS_NON_AUDIO: &[&str] = &[
+    "dng", "jpg", "jpeg", "jpe", "png", "gif", "bmp", "tif", "tiff", "heic", "heif", "webp", "raw",
+    "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf", "srw", "pef", "avi", "mov", "wmv", "m4v",
+    "mpg", "mpeg", "mts", "m2ts",
+];
+
+/// **Cet item DIDL n'est-il certainement pas du son ?** (#7695)
+///
+/// Le partage multimédia de Windows publie aussi les photos et les vidéos du
+/// poste : la récolte gardait tout item titré et doté d'une URL, et chaque
+/// photo DNG devenait une « piste » sans artiste. Les signes, du plus sûr au
+/// moins sûr, et le premier qui parle décide :
+///
+/// 1. un MIME `audio/*` (ou `application/ogg`) : c'est du son, gardé, quelle
+///    que soit la classe ;
+/// 2. une classe `object.item.audioItem…` : gardé ;
+/// 3. une classe `object.item.imageItem…` ou `object.item.videoItem…` : écarté ;
+/// 4. un MIME `image/*` ou `video/*` : écarté ;
+/// 5. une URL de lecture terminée par une extension de photo ou de vidéo
+///    (`EXTENSIONS_NON_AUDIO`) : écarté.
+///
+/// Un item dont rien ne parle — classe générique `object.item` ou absente,
+/// MIME absent ou opaque, extension muette — est GARDÉ, comme avant : un vrai
+/// fichier audio aux métadonnées pauvres ne doit pas disparaître par excès de
+/// zèle.
+pub(crate) fn est_un_objet_non_audio(item: &Value) -> bool {
+    let classe = item
+        .get("class")
+        .and_then(Value::as_str)
+        .map(|c| c.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = item
+        .get("protocol_info")
+        .and_then(Value::as_str)
+        .and_then(|p| p.split(':').nth(2))
+        .map(|m| m.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if mime.starts_with("audio/") || mime == "application/ogg" {
+        return false;
+    }
+    if classe.starts_with("object.item.audioitem") {
+        return false;
+    }
+    if classe.starts_with("object.item.imageitem") || classe.starts_with("object.item.videoitem") {
+        return true;
+    }
+    if mime.starts_with("image/") || mime.starts_with("video/") {
+        return true;
+    }
+    item.get("res_url")
+        .and_then(Value::as_str)
+        .and_then(extension_de_l_url)
+        .is_some_and(|ext| EXTENSIONS_NON_AUDIO.contains(&ext.as_str()))
+}
+
+/// L'extension du dernier segment de chemin d'une URL, en minuscules, sans
+/// la requête ni le fragment.
+fn extension_de_l_url(url: &str) -> Option<String> {
+    let chemin = url.split(['?', '#']).next()?;
+    let segment = chemin.rsplit('/').next()?;
+    let (nom, ext) = segment.rsplit_once('.')?;
+    (!nom.is_empty() && !ext.is_empty()).then(|| ext.to_ascii_lowercase())
+}
+
 /// Ce que l'indexation retient d'un item DIDL.
 #[derive(Debug, Clone)]
 struct PisteDistante {
@@ -438,6 +506,8 @@ struct PisteDistante {
     numero_de_piste: Option<i32>,
     /// `upnp:originalDiscNumber` — même règle.
     numero_de_disque: Option<i32>,
+    annee: Option<i32>,
+    genres: Vec<String>,
 }
 
 fn texte(v: &Value, cle: &str) -> Option<String> {
@@ -477,6 +547,17 @@ impl PisteDistante {
             protocol_info: texte(item, "protocol_info"),
             numero_de_piste: numero(item, "track_number"),
             numero_de_disque: numero(item, "disc_number"),
+            annee: numero(item, "year").filter(|y| *y <= 9999),
+            genres: item
+                .get("genres")
+                .and_then(Value::as_array)
+                .map(|g| {
+                    g.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -504,6 +585,8 @@ struct Bilan {
     sans_taille: usize,
     /// #6500 — les stations de radio croisées et écartées.
     radios_ecartees: usize,
+    /// #7695 — les photos et vidéos croisées et écartées.
+    non_audio_ecartes: usize,
     albums_ajoutes: usize,
     /// #4581 — les coquilles distantes retirées par cette passe.
     albums_vides_retires: usize,
@@ -541,11 +624,10 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
     let Some(ms) = serveurs.get(id).cloned() else {
         return Json(json!({
             "indexe": false,
-            "raison": "serveur inconnu",
-            "detail": format!(
-                "aucun serveur multimédia enregistré sous « {id} » — \
-                 la liste vit dans GET /api/v1/network/media-servers"
-            ),
+            "code": "unknown_server",
+            "raison": crate::message_api::texte("api.upnp.unknownServer", &[]),
+            "detail": crate::message_api::texte("api.upnp.unknownServerDetail", &[("id", id.to_string())]),
+            "message_key": "api.upnp.unknownServerDetail",
         }));
     };
     drop(serveurs);
@@ -636,6 +718,7 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
             "mises_a_jour": bilan.mises_a_jour,
             "ecartees_sans_url_de_lecture": bilan.sans_url,
             "ecartees_radios": bilan.radios_ecartees,
+            "ecartees_non_audio": bilan.non_audio_ecartes,
             "sans_res_size": bilan.sans_taille,
         },
         "albums_ajoutes": bilan.albums_ajoutes,
@@ -747,6 +830,12 @@ async fn recolter(
             // d'artiste, donc triée la première), sans durée ni album.
             if est_une_station_de_radio(item) {
                 bilan.radios_ecartees += 1;
+                continue;
+            }
+            // #7695 — une photo ou une vidéo n'est pas une piste : le partage
+            // multimédia de Windows publie aussi les DNG du poste.
+            if est_un_objet_non_audio(item) {
+                bilan.non_audio_ecartes += 1;
                 continue;
             }
             let Some(piste) = PisteDistante::depuis_item(item) else {
@@ -1033,6 +1122,16 @@ fn ecrire(
         ligne.format = piste.format();
         ligne.sample_rate = piste.sample_rate;
         ligne.bit_depth = piste.bit_depth;
+        // Métadonnées annoncées par la source, comme le titre et l'artiste.
+        // Une source qui ne les annonce pas ne doit pas effacer les valeurs conservées.
+        if let Some(annee) = piste.annee {
+            ligne.year = Some(annee);
+        }
+        if !piste.genres.is_empty() {
+            ligne.genre = piste.genres.first().cloned();
+            ligne.genres =
+                Some(serde_json::to_string(&piste.genres).expect("genres sérialisables"));
+        }
         // `channels` est un `i32` NON optionnel dont `to_json` dérive une
         // pastille AFFICHÉE. Un serveur muet sur `nrAudioChannels` ne prouve
         // rien : on retombe sur le défaut du modèle (2) plutôt que d'affirmer
@@ -1317,10 +1416,111 @@ mod tests {
             protocol_info: Some("http-get:*:audio/x-flac:DLNA.ORG_PN=FLAC".into()),
             numero_de_piste: None,
             numero_de_disque: None,
+            annee: None,
+            genres: Vec::new(),
         };
         assert_eq!(p.format().as_deref(), Some("flac"));
         p.protocol_info = None;
         assert_eq!(p.format(), None, "rien n'est inventé quand rien n'est dit");
+    }
+
+    fn item_didl(classe: Option<&str>, protocol_info: Option<&str>, url: &str) -> Value {
+        json!({
+            "id": "x",
+            "title": "T",
+            "class": classe,
+            "protocol_info": protocol_info,
+            "res_url": url,
+        })
+    }
+
+    /// #7695 — ce que publie le partage multimédia de Windows : une photo DNG
+    /// en `imageItem.photo`. Écartée par sa classe, par son MIME, ou à défaut
+    /// par son extension.
+    #[test]
+    fn i7695_une_photo_ou_une_video_n_est_pas_du_son() {
+        let photo = item_didl(
+            Some("object.item.imageItem.photo"),
+            Some("http-get:*:image/x-adobe-dng:*"),
+            "http://192.0.2.7:10243/WMPNSSv4/1/IMG_0042.dng",
+        );
+        assert!(est_un_objet_non_audio(&photo), "la photo DNG est gardée");
+        let classe_seule = item_didl(Some("OBJECT.ITEM.IMAGEITEM"), None, "http://h/res/0_1");
+        assert!(
+            est_un_objet_non_audio(&classe_seule),
+            "la classe imageItem seule doit suffire, casse comprise"
+        );
+        let video = item_didl(
+            Some("object.item.videoItem.movie"),
+            Some("http-get:*:video/mp4:*"),
+            "http://h/v.mp4",
+        );
+        assert!(est_un_objet_non_audio(&video), "la vidéo est gardée");
+        let mime_seul = item_didl(None, Some("http-get:*:image/jpeg:*"), "http://h/r/1");
+        assert!(
+            est_un_objet_non_audio(&mime_seul),
+            "le MIME image/* doit suffire sans classe"
+        );
+        let extension_seule = item_didl(Some("object.item"), None, "http://h/p/IMG.DNG?x=1");
+        assert!(
+            est_un_objet_non_audio(&extension_seule),
+            "l'extension .dng doit suffire quand ni classe ni MIME ne parlent"
+        );
+    }
+
+    /// #7695 — le revers : un vrai fichier audio aux métadonnées pauvres reste
+    /// une piste.
+    #[test]
+    fn i7695_un_audio_aux_metadonnees_pauvres_est_garde() {
+        for item in [
+            // Classe générique, MIME audio : gardé.
+            item_didl(
+                Some("object.item"),
+                Some("http-get:*:audio/flac:*"),
+                "http://h/a/1",
+            ),
+            // Sans classe, MIME audio : gardé.
+            item_didl(None, Some("http-get:*:audio/mp4:*"), "http://h/a/2.mp4"),
+            // Classe audio, sans MIME : gardé.
+            item_didl(
+                Some("object.item.audioItem.musicTrack"),
+                None,
+                "http://h/a/3",
+            ),
+            // Ogg sous un MIME `application/` : gardé.
+            item_didl(
+                None,
+                Some("http-get:*:application/ogg:*"),
+                "http://h/a/4.ogg",
+            ),
+            // Rien ne parle : gardé, comme avant.
+            item_didl(None, None, "http://h/a/5"),
+            item_didl(
+                Some("object.item"),
+                Some("http-get:*:*:*"),
+                "http://h/a/6.mp4",
+            ),
+            // Un MIME audio l'emporte sur une extension trompeuse.
+            item_didl(None, Some("http-get:*:audio/wav:*"), "http://h/a/7.jpg"),
+            // `.mkv` et `.3gp` peuvent être du son : sans autre signe, gardés.
+            item_didl(Some("object.item"), None, "http://h/a/8.mkv"),
+            item_didl(None, None, "http://h/a/9.3gp"),
+        ] {
+            assert!(
+                !est_un_objet_non_audio(&item),
+                "un audio aux métadonnées pauvres est écarté : {item}"
+            );
+        }
+    }
+
+    #[test]
+    fn i7695_l_extension_se_lit_sans_requete_ni_fragment() {
+        assert_eq!(
+            extension_de_l_url("http://h/a/b.DNG?t=1#f").as_deref(),
+            Some("dng")
+        );
+        assert_eq!(extension_de_l_url("http://h/a/b"), None);
+        assert_eq!(extension_de_l_url("http://h/a/.cache"), None);
     }
 
     /// b209 — l'import rangeait 0 sur chaque piste UPnP : la fiche d'album
@@ -1345,6 +1545,8 @@ mod tests {
             protocol_info: None,
             numero_de_piste: numero,
             numero_de_disque: numero.map(|_| 1),
+            annee: None,
+            genres: Vec::new(),
         };
         let pistes = vec![
             p("Alive", Some(3)),
@@ -1454,6 +1656,8 @@ mod tests {
             protocol_info: None,
             numero_de_piste: numero,
             numero_de_disque: None,
+            annee: None,
+            genres: Vec::new(),
         };
         let revision = |state: &AppState| {
             state
@@ -1544,6 +1748,8 @@ mod tests {
             protocol_info: None,
             numero_de_piste: None,
             numero_de_disque: None,
+            annee: None,
+            genres: Vec::new(),
         };
         // La première piste n'annonce pas d'image, la suivante oui.
         let pistes = vec![p("A", None), p("B", Some(url.clone())), p("C", Some(url))];

@@ -21,7 +21,7 @@ FROM rust:1-bookworm AS builder
 # Install librespot + airplay-daemon build dependencies (cmake/clang are for
 # airplay-daemon's vendored C encoders: fdk-aac + alac-encoder)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libasound2-dev pkg-config cmake clang && \
+    apt-get install -y --no-install-recommends libasound2-dev pkg-config cmake clang python3 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -40,19 +40,19 @@ RUN echo 'fn main() {}' > tune-server/src/main.rs && \
     cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,local-audio,bandcamp,dj,karaoke,plugins-wasm,audio-embedding,dst 2>/dev/null || true && \
     rm -rf tune-core/src tune-server/src tune-cli/src
 
-# Build librespot (Spotify Connect) — optional, touch a placeholder if it fails.
-# #6872 : version épinglée et fonctionnalités de l'archive Linux (release.yml) ;
-# sans TLS, librespot 0.8.0 ne compile pas (le fichier vide était livré).
-RUN cargo install librespot --version 0.8.0 --locked --no-default-features \
-      --features "rustls-tls-webpki-roots,with-libmdns" \
-    || touch /usr/local/cargo/bin/librespot
+# #6872: same source and dependency notices as the release archives.
+COPY scripts/build-librespot.py scripts/
+COPY packaging/librespot/ packaging/librespot/
+RUN cargo install cargo-about --version 0.9.3 --locked && \
+    python3 scripts/build-librespot.py --target "$(rustc -vV | sed -n 's/^host: //p')" \
+      --output /opt/librespot --work /tmp/librespot-source
 
 # Build airplay-daemon (AirPlay 2 sender, #700) — GPL-2.0 standalone subprocess
 # binary from a pinned rev of our fork. Optional in this dev image: on failure,
 # touch a placeholder so a local build still succeeds (AirPlay 2 then falls back
 # to legacy AirPlay 1). The release path (Dockerfile.dist) requires it.
 RUN cargo install --git https://github.com/renesenses/airplay2-rs \
-      --rev a7d7ad6637507eaedd61de7461574adfb7b0a987 airplay-daemon --locked \
+      --rev 83a7def6ab39d3709fa47a40eb90993b64afe9b4 airplay-daemon --locked \
     || touch /usr/local/cargo/bin/airplay-daemon
 
 # Build real source — clean dummy artifacts to force recompilation
@@ -134,7 +134,8 @@ COPY packaging/docker/entrypoint.sh /usr/local/bin/tune-entrypoint
 RUN chmod 755 /usr/local/bin/tune-entrypoint
 
 COPY --from=builder /build/target/release/tune-server /app/tune-server
-COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot
+COPY --from=builder /opt/librespot/bin/librespot /usr/local/bin/librespot
+COPY --from=builder /opt/librespot/LIBRESPOT-*.txt /usr/share/doc/librespot/
 COPY --from=builder /usr/local/cargo/bin/airplay-daemon /usr/local/bin/airplay-daemon
 COPY --from=web /web/dist/ /app/web/
 

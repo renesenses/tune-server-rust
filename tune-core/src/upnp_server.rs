@@ -26,6 +26,10 @@ mod dossiers;
 #[cfg(test)]
 mod grande_bibliotheque_5885_tests;
 
+/// #7636 — « Playlists » sur 2 000 listes : pages bornées, temps mesuré.
+#[cfg(test)]
+mod listes_par_pages_7636_tests;
+
 /// L'ordre alphabétique du serveur média, partagé avec les listes paginées de
 /// l'API REST de la bibliothèque (#4956) : un même rayon se lit dans le même
 /// ordre sur un lecteur DLNA et dans le client web.
@@ -2456,6 +2460,10 @@ const UPNP_PROFILE_ID: i64 = 1;
 /// largement au-delà de toute bibliothèque réelle, et bornent la mémoire.
 const PLAYLIST_FETCH_CAP: i64 = 10_000;
 
+/// #7636 — taille maximale d'une page de « Playlists », la même que celle des
+/// pistes d'une liste (`browse_playlist_tracks`).
+const PAGE_MAX_DES_LISTES: u64 = 500;
+
 /// Les listes de lecture du profil par défaut, triées par nom.
 ///
 /// **Une liste vide n'est pas publiée.** C'est la règle de `ROOT_CONTAINERS`
@@ -2466,12 +2474,21 @@ const PLAYLIST_FETCH_CAP: i64 = 10_000;
 ///
 /// `total` est le nombre RÉEL de listes publiables, pas la taille de la page :
 /// c'est lui que le point de contrôle lit pour savoir s'il reste des pages.
+///
+/// #7636 — la page est bornée à [`PAGE_MAX_DES_LISTES`], comme celle des
+/// pistes d'une liste : `RequestedCount=0` (« tout ») sur deux mille listes
+/// bâtissait un DIDL de près de 400 Ko en une seule réponse, que Kazoo doit
+/// lire en entier avant d'afficher quoi que ce soit.
 fn browse_playlists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let listes = lire_listes_publiables(state);
 
     let total = listes.len();
     let debut = usize::try_from(start).unwrap_or(usize::MAX).min(total);
-    let demande = usize::try_from(count).unwrap_or(usize::MAX);
+    let demande = match count {
+        0 => PAGE_MAX_DES_LISTES,
+        n => n.min(PAGE_MAX_DES_LISTES),
+    };
+    let demande = usize::try_from(demande).unwrap_or(usize::MAX);
     let fin = debut.saturating_add(demande).min(total);
     let mut didl = didl_listes(&listes[debut..fin]);
     didl.total = total as u64;
@@ -3705,6 +3722,11 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
         .channels(track.channels as u32)
         .artist_opt(track.artist_name.as_deref())
         .album_opt(track.album_title.as_deref())
+        .year_opt(track.year)
+        .genres(crate::db::edition_album::genres_de_piste(
+            track.genre.clone(),
+            track.genres.clone(),
+        ))
         .album_art_opt(cover_url.as_deref())
         .sample_rate_opt(advertised_sr)
         .bit_depth_opt(advertised_bd)

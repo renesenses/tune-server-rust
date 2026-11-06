@@ -880,7 +880,16 @@ impl PlaybackOrchestrator {
             // Pas de chemin local vivant. Reste le redémarrage — mais uniquement si
             // quelque chose joue : sinon la prochaine lecture rebâtira l'EQ toute
             // seule, et redémarrer un flux inexistant n'a aucun sens.
-            let np = self.playback.get_state(zone_id).await.now_playing;
+            //
+            // 🔴 #7556 — « joue » se lit dans `state` : une zone ARRÊTÉE garde
+            // son `now_playing` (affichage), et la relance la remettait en
+            // lecture sans geste de lecture. Une zone EN PAUSE garde son flux
+            // et ne doit pas repartir non plus.
+            let etat = self.playback.get_state(zone_id).await;
+            let en_lecture = etat.state == crate::playback::PlayState::Playing;
+            let np = etat
+                .now_playing
+                .filter(|_| etat.state != crate::playback::PlayState::Stopped);
             chemin = if np.is_none() {
                 "rien_ne_joue"
             } else if np
@@ -902,7 +911,11 @@ impl PlaybackOrchestrator {
                 // refabriquer…) : la relance reste le seul chemin, et le
                 // journal dit pourquoi.
                 en_vol_impossible = Some(raison);
-                if self.schedule_eq_replay(zone_id) {
+                if !en_lecture {
+                    // #7556 — zone en pause : la relance la remettrait en
+                    // lecture. Le réglage portera sur la piste suivante.
+                    "relance_evitee_zone_en_pause"
+                } else if self.schedule_eq_replay(zone_id) {
                     "replay_programme"
                 } else {
                     // `schedule_eq_replay` a déjà dit POURQUOI (#2595) ; ici on
@@ -1355,7 +1368,15 @@ impl PlaybackOrchestrator {
                     return;
                 }
             }
-            let position_ms = moi.playback.get_state(zone_id).await.position_ms.max(0) as u64;
+            // #7556 — la zone a pu être arrêtée ou mise en pause pendant
+            // l'anti-rebond : la relance la remettrait en lecture sans geste
+            // de lecture. Un réglage ne lance JAMAIS de lecture.
+            let etat = moi.playback.get_state(zone_id).await;
+            if etat.state != crate::playback::PlayState::Playing {
+                info!(zone_id, etat = ?etat.state, "eq_replay_skipped_zone_pas_en_lecture");
+                return;
+            }
+            let position_ms = etat.position_ms.max(0) as u64;
             match moi
                 .replay_zone_at_position(zone_id, position_ms, "eq_change")
                 .await
@@ -1754,6 +1775,7 @@ impl PlaybackOrchestrator {
             compensation: None,
             sample_rate,
             en_vol: None,
+            convolveur_reste_a_jeter: None,
         };
         // #5071 — la compensation lit les étages RÉELLEMENT exécutés : un
         // crossfeed n'agit qu'en stéréo (`StreamingDsp::process`).
@@ -2004,7 +2026,96 @@ impl PlaybackOrchestrator {
     /// partagée avec [`Self::zone_has_active_ir`] et
     /// [`Self::traitement_que_pure_gouverne`]. `None` si la clé est absente ou
     /// vide ; l'existence du fichier n'est PAS vérifiée ici.
+    ///
+    /// #7632 — `None` aussi SANS le droit Premium `RoomCorrection`
+    /// ([`Self::correction_ir_autorisee`]) : la convolution par RI n'est
+    /// alors ni cuite dans le flux réseau, ni comptée dans son empreinte, ni
+    /// présentée comme un traitement que PURE gouverne. Même place que la
+    /// garde du crossfeed (`crossfeed_configure_sous_licence`).
     pub(super) fn chemin_ir_configure(&self, zone_id: i64) -> Option<String> {
+        if !self.correction_ir_autorisee() {
+            return None;
+        }
+        self.chemin_ir_enregistre(zone_id)
+    }
+
+    /// #7632 — la licence vient de changer : chaque sortie locale reçoit le
+    /// droit de convoluer (retiré, son moteur s'éteint EN FONDU, sans clic,
+    /// `LocalOutput::set_convolution_autorisee`) ; chaque zone réseau qui JOUE
+    /// un flux où une RI était cuite est relancée à sa position, comme une
+    /// bascule PURE (`schedule_eq_replay`), et repart sans convolution.
+    /// Rend le nombre de zones réseau relancées. Appelé par l'hôte quand il
+    /// voit le droit changer (tune-server, `surveiller_le_droit_de_convoluer`).
+    pub async fn appliquer_le_droit_de_convoluer(self: &std::sync::Arc<Self>) -> usize {
+        let autorisee = self.correction_ir_autorisee();
+        #[cfg(feature = "local-audio")]
+        {
+            let sorties: Vec<_> = {
+                let registre = self.outputs.lock().await;
+                registre
+                    .list()
+                    .into_iter()
+                    .filter(|id| id.starts_with("local:"))
+                    .filter_map(|id| registre.get(&id))
+                    .collect()
+            };
+            for sortie in sorties {
+                let sortie = sortie.lock().await;
+                if let Some(locale) = sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                {
+                    locale.set_convolution_autorisee(autorisee);
+                }
+            }
+        }
+        if autorisee {
+            // Accordé : la piste suivante bâtit le moteur ; relancer un flux
+            // pour l'entendre plus tôt n'est pas demandé.
+            return 0;
+        }
+        let zones = ZoneRepo::with_backend(self.db.clone())
+            .list()
+            .unwrap_or_default();
+        let mut relancees = 0;
+        for zone in zones {
+            let Some(zone_id) = zone.id else { continue };
+            let reseau = zone
+                .output_device_id
+                .as_deref()
+                .is_some_and(|d| !d.starts_with("local:"));
+            let ri_cuite = !self.zone_audiophile(zone_id)
+                && self
+                    .chemin_ir_enregistre(zone_id)
+                    .is_some_and(|p| std::path::Path::new(&p).exists());
+            if !reseau || !ri_cuite {
+                continue;
+            }
+            let etat = self.playback.get_state(zone_id).await;
+            if etat.state == crate::playback::PlayState::Playing
+                && etat.now_playing.is_some()
+                && self.schedule_eq_replay(zone_id)
+            {
+                tracing::info!(zone_id, "convolution_retiree_flux_reseau_relance");
+                relancees += 1;
+            }
+        }
+        relancees
+    }
+
+    /// #7632 — le droit de convoluer : Premium (`RoomCorrection`, décision du
+    /// 04/11/2026). ⚠️ Un orchestrateur SANS licence n'y a pas droit : une
+    /// absence ne vaut pas Premium (contrairement au crossfeed, dont la garde
+    /// laisse passer l'orchestrateur des tests).
+    pub fn correction_ir_autorisee(&self) -> bool {
+        self.license
+            .as_ref()
+            .is_some_and(|license| license.premium_snapshot())
+    }
+
+    /// Le chemin `ir_path_{zone}` enregistré, sans aucune garde (ni PURE, ni
+    /// licence) : ce que l'utilisateur a réglé, pas ce qui s'entend.
+    pub(super) fn chemin_ir_enregistre(&self, zone_id: i64) -> Option<String> {
         crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
             .get(&format!("ir_path_{zone_id}"))
             .ok()
@@ -2126,8 +2237,9 @@ impl PlaybackOrchestrator {
     /// mêmes bornes. `None` sur la case décochée, une clé absente ou illisible,
     /// ou un `amount` nul (identité).
     ///
-    /// `None` aussi quand un greffon natif tiers de la famille du crossfeed
-    /// traite la zone (`audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed`) :
+    /// `None` aussi quand un greffon natif tiers de la famille du crossfeed,
+    /// ou `crosstalk` (#7616, étage casque exclusif), traite la zone
+    /// (`audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed`) :
     /// le crossfeed intégré est alors éteint, et ni l'empreinte du flux, ni la
     /// clé du cache, ni la compensation ne le comptent.
     pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {
@@ -2734,7 +2846,15 @@ impl PlaybackOrchestrator {
     /// relâché par l'appelant.
     #[cfg(feature = "local-audio")]
     pub(super) async fn rouvrir_pour_les_voies(&self, zone_id: i64) {
-        let position_ms = self.playback.get_state(zone_id).await.position_ms.max(0) as u64;
+        // #7556 — rouvrir = rejouer : sur une zone en pause ou arrêtée, ce
+        // serait relancer la lecture sans geste de lecture. La prochaine
+        // lecture ouvrira la sortie sur les bonnes voies.
+        let etat = self.playback.get_state(zone_id).await;
+        if etat.state != crate::playback::PlayState::Playing {
+            info!(zone_id, etat = ?etat.state, "reaffectation_voies_reouverture_reportee_zone_pas_en_lecture");
+            return;
+        }
+        let position_ms = etat.position_ms.max(0) as u64;
         match self
             .replay_zone_at_position(zone_id, position_ms, "reaffectation_voies")
             .await
@@ -3003,7 +3123,15 @@ impl PlaybackOrchestrator {
                 .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
             return Ok(retenu_final);
         };
-        let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+        // #7633 — un renderer OpenHome reçoit son volume sans le verrou de
+        // la sortie : le sondeur le tient pendant ses relevés SOAP (jusqu'à
+        // cinq à la suite sans évènements), et la consigne partait des
+        // secondes après le geste.
+        let (output, envoi_direct) = {
+            let registre = self.outputs.lock().await;
+            (registre.get(did), registre.envoi_de_volume(did))
+        };
+        let output = output.ok_or_else(|| {
             OutputCommandError::failed(
                 OutputCommand::SetVolume,
                 format!("output {did} is not registered"),
@@ -3015,7 +3143,9 @@ impl PlaybackOrchestrator {
         // Capacité absente : refus AVANT toute mutation, comme avant. Si une
         // commande de volume est déjà en vol sur cette file, elle a passé ce
         // contrôle : ne pas attendre le verrou de la sortie qu'elle tient.
-        if !file.etat.lock().await.en_vol {
+        // Un envoi direct OpenHome n'existe que si le renderer publie son
+        // service Volume : la capacité est acquise.
+        if envoi_direct.is_none() && !file.etat.lock().await.en_vol {
             output
                 .lock()
                 .await
@@ -3046,22 +3176,22 @@ impl PlaybackOrchestrator {
             );
             return Ok(retenu_final);
         }
-        let sortie = output.lock().await;
-        let device_volume = if pure_force {
-            1.0
-        } else {
+        let consigne_appareil = |output_type: &str| {
+            if pure_force {
+                return 1.0;
+            }
             // #6739 — la nature du volume de la sortie décide du trim : sur
             // une sortie à volume matériel (DLNA, OpenHome, AirPlay…), un trim
             // POSITIF n'augmente jamais la consigne envoyée. Lue ici, à notre
-            // tour, sous le verrou que prend de toute façon l'envoi.
+            // tour.
             let trim_db = gain_trim_db_enregistre(&self.db, zone_id);
-            let volume_materiel = !sortie_a_volume_logiciel(sortie.output_type());
+            let volume_materiel = !sortie_a_volume_logiciel(output_type);
             if volume_materiel && trim_db > 0.0 {
                 warn!(
                     zone_id,
                     trim_db,
                     volume,
-                    output_type = sortie.output_type(),
+                    output_type,
                     device_id = did,
                     "trim_positif_ignore_volume_materiel"
                 );
@@ -3069,16 +3199,35 @@ impl PlaybackOrchestrator {
             // Un trim positif ne fait pas passer la limite de sécurité.
             limites.borner_appareil(volume_appareil_avec_trim(volume, trim_db, volume_materiel))
         };
-        info!(
-            zone_id,
-            volume,
-            device_volume,
-            pure_force,
-            device_id = did,
-            "device_set_volume_sending"
-        );
-        let resultat = sortie.checked_set_volume(device_volume).await;
-        drop(sortie);
+        let resultat = match envoi_direct {
+            Some(envoi) => {
+                let device_volume = consigne_appareil("openhome");
+                info!(
+                    zone_id,
+                    volume,
+                    device_volume,
+                    pure_force,
+                    device_id = did,
+                    "device_set_volume_sending"
+                );
+                envoi.set_volume(device_volume).await.map_err(|message| {
+                    OutputCommandError::failed(OutputCommand::SetVolume, message)
+                })
+            }
+            None => {
+                let sortie = output.lock().await;
+                let device_volume = consigne_appareil(sortie.output_type());
+                info!(
+                    zone_id,
+                    volume,
+                    device_volume,
+                    pure_force,
+                    device_id = did,
+                    "device_set_volume_sending"
+                );
+                sortie.checked_set_volume(device_volume).await
+            }
+        };
         let issue = {
             let mut etat = file.etat.lock().await;
             etat.en_vol = false;

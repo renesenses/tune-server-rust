@@ -68,7 +68,10 @@ pub(super) async fn ordre_put(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "ces chemins ne sont pas des dossiers de musique configurés",
+                "error": "not_music_dirs",
+                "code": "not_music_dirs",
+                "message": crate::message_api::texte("api.library.notMusicDirs", &[]),
+                "message_key": "api.library.notMusicDirs",
                 "inconnus": inconnus,
                 "music_dirs": dossiers,
             })),
@@ -129,7 +132,10 @@ pub(super) async fn preference_put(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "cette racine n'est pas un dossier de musique configuré",
+                "error": "root_not_music_dir",
+                "code": "root_not_music_dir",
+                "message": crate::message_api::texte("api.library.rootNotMusicDir", &[]),
+                "message_key": "api.library.rootNotMusicDir",
                 "racine": racine,
                 "music_dirs": dossiers,
             })),

@@ -156,11 +156,14 @@ impl Banc {
         contexte_de_file::poser_apres(&self.db, zone, avant, contexte).unwrap();
     }
 
+    /// Lance la position, puis l'écoute jusqu'au seuil de validation (#7852) :
+    /// c'est là que l'historique et la reprise s'écrivent.
     async fn jouer(&self, zone: i64, position: i64) {
         self.orch
             .play_from_queue(zone, position)
             .await
             .unwrap_or_else(|e| panic!("la position {position} devait partir : {e}"));
+        self.orch.amener_au_seuil(zone).await;
     }
 
     /// `(titre, zone, conteneur, id du conteneur)` de chaque écoute, dans

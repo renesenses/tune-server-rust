@@ -1058,6 +1058,10 @@ pub(super) async fn create_zone(
                     // nulle part et croira l'avoir créée.
                     return echec_ecriture(id, "is_hidden", "0", e);
                 }
+                // #7937 — la zone recréée n'hérite d'aucun groupe. Sa
+                // suppression l'en retire désormais ; ceci répare celles
+                // supprimées avant ce correctif.
+                sortir_la_zone_recreee_des_groupes(&state, id);
                 if let Some(ref ot) = body.output_type {
                     let _ = repo.update_output_type(id, ot);
                 }
@@ -1246,6 +1250,7 @@ pub(super) async fn create_zone(
             if let Err(e) = repo.unhide(id) {
                 return echec_ecriture(id, "is_hidden", "0", e);
             }
+            sortir_la_zone_recreee_des_groupes(&state, id);
             if let Err(e) = repo.update_name(id, &body.name) {
                 return echec_ecriture(id, "name", &body.name, e);
             }
@@ -1308,6 +1313,26 @@ pub(super) async fn delete_all_zones(State(state): State<AppState>) -> impl Into
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// #7937 — une zone ressuscitée par `POST /zones` (même appareil, même
+/// numéro) repart sans groupe de lecture. Un échec d'écriture est journalisé
+/// et ne fait pas échouer la création : la zone est bien revenue.
+fn sortir_la_zone_recreee_des_groupes(state: &AppState, id: i64) {
+    match tune_core::zones::groupes_enregistres::retirer_des_groupes_enregistres(
+        &state.backend,
+        &[id],
+    ) {
+        Ok(true) => {
+            info!(zone_id = id, "zone_recreee_retiree_de_son_ancien_groupe");
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::GroupUpdated,
+                json!({ "zone_id": id }),
+            );
+        }
+        Ok(false) => {}
+        Err(e) => warn!(zone_id = id, error = %e, "zone_recreee_groupes_non_reecrits"),
     }
 }
 

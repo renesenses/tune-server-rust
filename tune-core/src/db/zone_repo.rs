@@ -3068,12 +3068,19 @@ impl ZoneRepo {
     /// never resurrects a hidden zone, only POST /zones does.
     pub fn delete_all(&self) -> Result<usize, String> {
         let sql = self.dialect_sql(sql::delete_all_avec_motif, sql::delete_all_avec_motif);
-        match self.db.execute(&sql, &[]) {
+        let masquees = match self.db.execute(&sql, &[]) {
             // Base sans les colonnes de la 112 : le masquage passe quand même,
             // sans motif — ne pas masquer serait pire que ne pas dire pourquoi.
             Err(e) if schema_incomplet(&e) => self.db.execute(sql::delete_all(), &[]),
             autre => autre,
+        }?;
+        // #7937 — plus aucune zone, plus aucun groupe : sinon les zones
+        // recréées (même numéro, voir `delete`) retombent dans leurs groupes.
+        // Un échec ici ne défait pas le masquage, déjà écrit : il est dit.
+        if let Err(e) = crate::zones::groupes_enregistres::vider_les_groupes_enregistres(&self.db) {
+            tracing::warn!(error = %e, "zones_supprimees_groupes_non_vides");
         }
+        Ok(masquees)
     }
 
     /// Supprimer une zone, geste de l'UTILISATEUR : c'est un masquage de motif
@@ -3087,8 +3094,21 @@ impl ZoneRepo {
     /// Rend le nombre de lignes masquées (#5322) : `0` veut dire qu'aucune
     /// zone ne porte cet identifiant. Le jeter faisait répondre `204` à la
     /// route pour une suppression qui n'avait rien touché.
+    ///
+    /// La zone quitte aussi tout groupe de lecture (#7937) : masquée, elle
+    /// garde son numéro, et `POST /zones` sur le même appareil la ressuscite
+    /// sous ce numéro — elle retombait alors dans son ancien groupe.
     pub fn delete(&self, id: i64) -> Result<usize, String> {
-        self.masquer(id, MotifMasquage::SuppressionUtilisateur)
+        let masquees = self.masquer(id, MotifMasquage::SuppressionUtilisateur)?;
+        // Un échec ici ne défait pas le masquage, déjà écrit : il est dit, et
+        // `POST /zones` refera le ménage si la zone est recréée.
+        if masquees > 0
+            && let Err(e) =
+                crate::zones::groupes_enregistres::retirer_des_groupes_enregistres(&self.db, &[id])
+        {
+            tracing::warn!(zone_id = id, error = %e, "zone_supprimee_groupes_non_reecrits");
+        }
+        Ok(masquees)
     }
 
     /// Masque la zone `id` en retenant POURQUOI et QUAND (#5077). Rend le

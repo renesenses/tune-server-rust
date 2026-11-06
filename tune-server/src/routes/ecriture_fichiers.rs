@@ -146,6 +146,8 @@ mod garde_ecriture_fichiers {
             1,
         ),
         ("tune-server/src/routes/library/edition_balises.rs", 1),
+        // #7539 — la passe de fond de la modification en masse d'Oxygen.
+        ("tune-server/src/routes/library/edition_par_filtre.rs", 1),
         ("tune-server/src/routes/library/graver_compilation.rs", 1),
         ("tune-server/src/routes/library/graver_dr.rs", 1),
         ("tune-server/src/routes/library/ingest.rs", 1),

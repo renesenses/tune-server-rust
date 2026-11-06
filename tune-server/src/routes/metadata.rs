@@ -471,7 +471,11 @@ async fn repair_mp3(
 
     for id in demande.track_ids {
         let Some((chemin, ancienne)) = connues.get(&id).cloned() else {
-            echecs.push(json!({"track_id": id, "error": "piste inconnue ou non MP3"}));
+            echecs.push(crate::message_api::avec_message(
+                json!({"track_id": id, "error": "track_unknown_or_not_mp3", "code": "track_unknown_or_not_mp3"}),
+                "api.metadata.trackUnknownOrNotMp3",
+                &[],
+            ));
             continue;
         };
 
@@ -484,7 +488,11 @@ async fn repair_mp3(
         .flatten();
 
         let Some(reelle) = reelle else {
-            echecs.push(json!({"track_id": id, "error": "fichier illisible ou absent"}));
+            echecs.push(crate::message_api::avec_message(
+                json!({"track_id": id, "error": "file_unreadable", "code": "file_unreadable"}),
+                "api.metadata.fileUnreadable",
+                &[],
+            ));
             continue;
         };
 
@@ -604,11 +612,13 @@ pub(crate) async fn edit_track(
             }
             Err(e) => {
                 tracing::warn!(track_id = id, error = %e, "edit_track_artiste_par_nom");
-                return (
+                return crate::message_api::refus_avec_cause(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Artiste « {nom} » impossible à enregistrer : {e}"),
-                )
-                    .into_response();
+                    "artist_save_failed",
+                    "api.metadata.artistSaveFailed",
+                    &[("name", nom.to_string())],
+                    e,
+                );
             }
         }
     }
@@ -661,11 +671,13 @@ pub(crate) async fn edit_track(
             }
             Err(e) => {
                 tracing::warn!(track_id = id, error = %e, "edit_track_album_par_titre");
-                return (
+                return crate::message_api::refus_avec_cause(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("Album « {titre} » impossible à enregistrer : {e}"),
-                )
-                    .into_response();
+                    "album_save_failed",
+                    "api.metadata.albumSaveFailed",
+                    &[("title", titre.to_string())],
+                    e,
+                );
             }
         }
     }
@@ -694,11 +706,13 @@ pub(crate) async fn edit_track(
     // ci-dessus, à l'autre bout de la route.
     if let Err(e) = repo.update(&track) {
         tracing::warn!(track_id = id, error = %e, "edit_track_update_failed");
-        return (
+        return crate::message_api::refus_avec_cause(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Enregistrement de la piste impossible : {e}"),
-        )
-            .into_response();
+            "track_save_failed",
+            "api.metadata.trackSaveFailed",
+            &[],
+            e,
+        );
     }
 
     // Les champs corrigés à la main sont TENUS : une analyse complète, qui
@@ -2047,6 +2061,9 @@ async fn fix_genres_by_artist(
         }
     }
 
+    // #7538 — les dossiers exclus de l'enrichissement, lus une fois.
+    let exclus =
+        tune_core::taches_de_fond::perimetre::dossiers_exclus_de_l_enrichissement(&state.backend);
     let mut fixed = 0usize;
     let mut skipped_low_coherence = 0usize;
     let mut skipped_no_known_genre = 0usize;
@@ -2076,6 +2093,15 @@ async fn fix_genres_by_artist(
             continue;
         }
         for (album_id, title) in missing {
+            // #7538 — un album d'un dossier exclu de l'enrichissement n'est
+            // pas réparé.
+            if tune_core::taches_de_fond::perimetre::album_touche_l_exclusion(
+                &state.backend,
+                *album_id,
+                &exclus,
+            ) {
+                continue;
+            }
             state
                 .backend
                 .execute(
@@ -2087,11 +2113,9 @@ async fn fix_genres_by_artist(
                 )
                 .ok();
             // #5314 — le genre réparé vaut pour les pistes (Oxygen).
-            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
-                &state.backend,
-                *album_id,
-                false,
-            );
+            // #7538 — une réparation COMBLE les pistes sans genre ; elle
+            // n'écrase plus le genre que portent les autres.
+            tune_core::db::genre_album_pistes::combler_ou_journaliser(&state.backend, *album_id);
             fixed += 1;
             if details.len() < 200 {
                 details.push(json!({
@@ -2177,6 +2201,9 @@ async fn fix_genres_by_artist_fuzzy(
         }
     }
 
+    // #7538 — les dossiers exclus de l'enrichissement, lus une fois.
+    let exclus =
+        tune_core::taches_de_fond::perimetre::dossiers_exclus_de_l_enrichissement(&state.backend);
     let mut fixed = 0usize;
     let mut skipped_low_coherence = 0usize;
     let mut skipped_no_known_genre = 0usize;
@@ -2206,6 +2233,15 @@ async fn fix_genres_by_artist_fuzzy(
             continue;
         }
         for (album_id, title, original_artist) in missing {
+            // #7538 — un album d'un dossier exclu de l'enrichissement n'est
+            // pas réparé.
+            if tune_core::taches_de_fond::perimetre::album_touche_l_exclusion(
+                &state.backend,
+                *album_id,
+                &exclus,
+            ) {
+                continue;
+            }
             state
                 .backend
                 .execute(
@@ -2217,11 +2253,9 @@ async fn fix_genres_by_artist_fuzzy(
                 )
                 .ok();
             // #5314 — le genre réparé vaut pour les pistes (Oxygen).
-            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
-                &state.backend,
-                *album_id,
-                false,
-            );
+            // #7538 — une réparation COMBLE les pistes sans genre ; elle
+            // n'écrase plus le genre que portent les autres.
+            tune_core::db::genre_album_pistes::combler_ou_journaliser(&state.backend, *album_id);
             fixed += 1;
             if details.len() < 200 {
                 details.push(json!({
@@ -2318,6 +2352,9 @@ async fn fix_genres_by_family(
         }
     }
 
+    // #7538 — les dossiers exclus de l'enrichissement, lus une fois.
+    let exclus =
+        tune_core::taches_de_fond::perimetre::dossiers_exclus_de_l_enrichissement(&state.backend);
     let mut fixed = 0usize;
     let mut skipped_low_coherence = 0usize;
     let mut skipped_no_known_genre = 0usize;
@@ -2373,6 +2410,15 @@ async fn fix_genres_by_family(
         }
 
         for (album_id, title, original_artist) in missing {
+            // #7538 — un album d'un dossier exclu de l'enrichissement n'est
+            // pas réparé.
+            if tune_core::taches_de_fond::perimetre::album_touche_l_exclusion(
+                &state.backend,
+                *album_id,
+                &exclus,
+            ) {
+                continue;
+            }
             state
                 .backend
                 .execute(
@@ -2384,11 +2430,9 @@ async fn fix_genres_by_family(
                 )
                 .ok();
             // #5314 — le genre réparé vaut pour les pistes (Oxygen).
-            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
-                &state.backend,
-                *album_id,
-                false,
-            );
+            // #7538 — une réparation COMBLE les pistes sans genre ; elle
+            // n'écrase plus le genre que portent les autres.
+            tune_core::db::genre_album_pistes::combler_ou_journaliser(&state.backend, *album_id);
             fixed += 1;
             if details.len() < 200 {
                 details.push(json!({
@@ -2518,6 +2562,9 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
 
     let gmap = genre_map();
     let total = rows.len();
+    // #7538 — les dossiers exclus de l'enrichissement, lus une fois.
+    let exclus =
+        tune_core::taches_de_fond::perimetre::dossiers_exclus_de_l_enrichissement(&state.backend);
     let mut fixed = 0usize;
     let mut details: Vec<serde_json::Value> = Vec::new();
 
@@ -2526,6 +2573,14 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
     for (album_id, album_title, artist_name) in &rows {
         let artist_name = artist_name.as_deref().unwrap_or("");
         if album_title.is_empty() || album_title == "Unknown Album" {
+            continue;
+        }
+        // #7538 — ni Last.fm ni Discogs pour un album d'un dossier exclu.
+        if tune_core::taches_de_fond::perimetre::album_touche_l_exclusion(
+            &state.backend,
+            *album_id,
+            &exclus,
+        ) {
             continue;
         }
 
@@ -2633,11 +2688,9 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
                 )
                 .ok();
             // #5314 — le genre trouvé (Last.fm, Discogs) vaut pour les pistes.
-            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
-                &state.backend,
-                *album_id,
-                false,
-            );
+            // #7538 — une réparation COMBLE les pistes sans genre ; elle
+            // n'écrase plus le genre que portent les autres.
+            tune_core::db::genre_album_pistes::combler_ou_journaliser(&state.backend, *album_id);
             fixed += 1;
             if details.len() < 100 {
                 details.push(json!({
@@ -4008,6 +4061,90 @@ mod tests_genre_repare_5314 {
             (Some("Jazz"), Some(r#"["Jazz"]"#)),
             "#5314 : le genre réparé de l'album doit descendre sur sa piste"
         );
+    }
+}
+
+/// #7538 — « un genre "Jazz" devient "Latin Jazz" » (Jean-François Paquet,
+/// 30/10). La réparation par FAMILLE vise un album sans genre et lui donne le
+/// genre le plus fréquent de la famille chez l'artiste (« Latin Jazz ») ; elle
+/// réécrivait ensuite TOUTES ses pistes, y compris celles qui portaient
+/// « Jazz ». Elle comble désormais les seules pistes sans genre, et laisse de
+/// côté un album d'un dossier exclu de l'enrichissement.
+#[cfg(test)]
+mod tests_reparation_sans_ecraser_7538 {
+    use super::*;
+
+    fn etat() -> AppState {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Tito Puente')",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id, genre) VALUES \
+             (1, 'Dance Mania', 1, 'Latin Jazz'), (2, 'Cuban Carnival', 1, 'Latin Jazz'), \
+             (3, 'Top Percussion', 1, ''), (4, 'Night Beat', 1, '')",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, genre, genres) VALUES \
+             (1, 'a', 1, 1, '/m/A/1.flac', 'Latin Jazz', NULL), \
+             (2, 'b', 2, 1, '/m/B/2.flac', 'Latin Jazz', NULL), \
+             (3, 'c', 3, 1, '/m/C/3.flac', 'Jazz', '[\"Jazz\"]'), \
+             (4, 'd', 3, 1, '/m/C/4.flac', NULL, NULL), \
+             (5, 'e', 4, 1, '/m/Exclu/5.flac', NULL, NULL)",
+            &[],
+        )
+        .unwrap();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(b.clone())
+            .set(
+                tune_core::taches_de_fond::perimetre::CLE_DOSSIERS_EXCLUS_ENRICHISSEMENT,
+                r#"["/m/Exclu"]"#,
+            )
+            .unwrap();
+        state
+    }
+
+    fn genre(state: &AppState, table: &str, id: i64) -> Option<String> {
+        state
+            .backend
+            .query_one(
+                &format!("SELECT genre FROM {table} WHERE id = ?"),
+                &[&id as &dyn tune_core::db::backend::ToSqlValue],
+            )
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_string()))
+    }
+
+    #[tokio::test]
+    async fn la_reparation_par_famille_ne_change_pas_jazz_en_latin_jazz_7538() {
+        let state = etat();
+        let _ = fix_genres_by_family(
+            State(state.clone()),
+            Query(CoherenceParams {
+                min_coherence: None,
+            }),
+        )
+        .await
+        .into_response();
+        // L'album sans genre est bien réparé — la réparation a eu lieu.
+        assert_eq!(genre(&state, "albums", 3).as_deref(), Some("Latin Jazz"));
+        assert_eq!(
+            genre(&state, "tracks", 3).as_deref(),
+            Some("Jazz"),
+            "#7538 : la piste qui portait « Jazz » est devenue « Latin Jazz »"
+        );
+        assert_eq!(
+            genre(&state, "tracks", 4).as_deref(),
+            Some("Latin Jazz"),
+            "la piste sans genre est comblée par la réparation"
+        );
+        // L'album d'un dossier exclu n'est pas réparé, ni sa piste.
+        assert_eq!(genre(&state, "albums", 4).as_deref(), Some(""));
+        assert_eq!(genre(&state, "tracks", 5), None);
     }
 }
 

@@ -147,6 +147,7 @@ async fn les_instruments_en_et_ne_gardent_que_la_piste_qui_les_porte_tous() {
     // Le rail compte ce que la liste rend.
     async fn annees(state: &AppState, raw: &str) -> Vec<String> {
         let Json(v) = library_facets(
+            crate::routes::active_profile::ActiveProfile(1),
             Query(FacetQuery {
                 fields: Some("year".into()),
                 ..Default::default()
