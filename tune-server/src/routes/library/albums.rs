@@ -1145,8 +1145,19 @@ pub(super) async fn album_bio(
     // `batch_enrich_album_bios(.., &lang)`) : une bibliotheque enrichie depuis
     // une interface en francais stocke tout en francais, et le ressert ensuite
     // a tout le monde.
-    let prov = album_repo.bio_provenance(id).ok().flatten();
-    let stored_ok = super::artists::bio_stockee_convient(prov.as_ref(), lang);
+    // #7027 : une provenance absente veut dire « écrite à la main » et reste
+    // servie. Une erreur de lecture n'est pas une absence : la langue est
+    // alors inconnue, et la bio stockée ne passe pas pour celle demandée.
+    let (prov, stored_ok) = match album_repo.bio_provenance(id) {
+        Ok(prov) => {
+            let ok = super::artists::bio_stockee_convient(prov.as_ref(), lang);
+            (prov, ok)
+        }
+        Err(e) => {
+            tracing::warn!(id, error = %e, "album_bio_provenance_illisible");
+            (None, false)
+        }
+    };
 
     if let Some(ref bio) = album.bio
         && !bio.is_empty()

@@ -407,8 +407,19 @@ pub(super) async fn artist_bio(
     // `lang_from_header`) : une bibliothèque enrichie depuis une interface en
     // français stocke tout en français, et le sert ensuite à tout le monde.
     // C'est exactement ce que voit Dimitri.
-    let prov = repo.bio_provenance(id).ok().flatten();
-    let stored_ok = bio_stockee_convient(prov.as_ref(), lang);
+    // #7027 : une provenance absente veut dire « écrite à la main » et reste
+    // servie. Une erreur de lecture n'est pas une absence : la langue est
+    // alors inconnue, et la bio stockée ne passe pas pour celle demandée.
+    let (prov, stored_ok) = match repo.bio_provenance(id) {
+        Ok(prov) => {
+            let ok = bio_stockee_convient(prov.as_ref(), lang);
+            (prov, ok)
+        }
+        Err(e) => {
+            tracing::warn!(id, error = %e, "artist_bio_provenance_illisible");
+            (None, false)
+        }
+    };
 
     if let Some(ref bio) = artist.bio
         && !bio.is_empty()
