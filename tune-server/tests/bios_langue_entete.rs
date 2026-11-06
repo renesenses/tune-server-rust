@@ -533,6 +533,30 @@ async fn artiste_un_cache_anglais_qui_contient_du_francais_est_ignore_7027() {
     assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
 }
 
+#[tokio::test]
+async fn album_un_cache_anglais_qui_contient_du_francais_est_ignore_7027() {
+    let (app, state) = app_site_injoignable();
+    album_avec_bio(&state, 1, "fr", BIO_FR);
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(
+            &format!("cache:albumbio:{TITRE}::en"),
+            &json!({
+                "album": TITRE,
+                "bio": BIO_FR,
+                "source": "community",
+                "bio_provenance": {"source": "community", "lang": "fr"},
+            })
+            .to_string(),
+        )
+        .expect("ecriture de l'entree de cache");
+
+    let (_, body) = bio_album(&app, "", Some("en")).await;
+
+    sans_francais(&body);
+    assert!(body["bio"].is_null(), "{body}");
+    assert_eq!(body["repli"]["langue_disponible"], "fr", "{body}");
+}
+
 /// Non-régression : un texte écrit à la main (sans provenance) reste servi,
 /// quelle que soit la langue de l'interface. Aucune source ne le remplace.
 #[tokio::test]
