@@ -1001,6 +1001,22 @@ pub(super) async fn play_episode(
                     warn!(zone_id, error = %e, "reprise_podcast_non_enregistree");
                 }
             }
+            // #7965 — l'épisode entre dans l'historique partagé, au seuil
+            // des pistes (#7852) : ce chemin ne passe pas par `play`.
+            state
+                .orchestrator
+                .enregistrer_ecoute_podcast(
+                    zone_id,
+                    title,
+                    podcast_name,
+                    s.now_playing
+                        .as_ref()
+                        .and_then(|np| np.cover_path.as_deref()),
+                    &body.audio_url,
+                    body.duration_ms.unwrap_or(0) as i64,
+                    body.podcast_id.as_deref(),
+                )
+                .await;
         }
     }
     let zone_state = state.playback.get_state(zone_id).await;
@@ -1400,3 +1416,7 @@ mod tests {
 #[cfg(test)]
 #[path = "podcasts/reprise_navigateur_7354_tests.rs"]
 mod reprise_navigateur_7354_tests;
+
+#[cfg(test)]
+#[path = "podcasts/historique_7965_tests.rs"]
+mod historique_7965_tests;
