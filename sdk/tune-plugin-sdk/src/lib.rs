@@ -19,6 +19,7 @@ pub mod audio;
 pub mod batch;
 pub mod manifest;
 pub mod observation;
+pub mod rate;
 pub mod ui;
 
 pub use serde_json::Value as Settings;
