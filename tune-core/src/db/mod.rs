@@ -63,6 +63,8 @@ pub mod photos_indexees_upnp_7695;
 pub mod play_queue_repo;
 pub mod playlist_repo;
 pub mod playlists_reconcile;
+/// Contrôle parental, étape 1 (#7856) : politique d'un profil supervisé.
+pub mod politique_parentale;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(all(test, feature = "postgres"))]
@@ -111,6 +113,8 @@ mod filtre_dr_190_tests;
 mod lenteur_albums_4800_tests;
 #[cfg(test)]
 mod lenteur_pistes_5138_tests;
+#[cfg(test)]
+mod liste_par_curseur_7619_tests;
 /// #7535 — un MBID trouvé par le nom n'est plus posé s'il est déjà porté.
 #[cfg(test)]
 mod mbid_deja_porte_7535_tests;

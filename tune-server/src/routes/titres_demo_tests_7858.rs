@@ -463,3 +463,27 @@ async fn le_retrait_ne_touche_qu_aux_titres_de_demo() {
     let (statut, _) = appel(&state, "POST", "/demo-tracks/remove").await;
     assert_eq!(statut, StatusCode::OK);
 }
+
+// ── Le verrou ──────────────────────────────────────────────────────────────
+
+/// 🔴 LE TÉMOIN DU VERROU. Un ajout ou un retrait en cours refuse un second
+/// geste sur le MÊME serveur (409), mais jamais sur un autre : avec un verrou
+/// global au processus, les bancs lancés en parallèle se refusaient l'un
+/// l'autre au hasard.
+#[tokio::test]
+async fn le_verrou_est_propre_a_chaque_serveur() {
+    let tmp = tempfile::tempdir().unwrap();
+    let occupe = etat(&tmp.path().join("a/demo-tracks"), None);
+    let libre = etat(&tmp.path().join("b/demo-tracks"), None);
+    let _en_cours = occupe.verrou_titres_demo.clone().lock_owned().await;
+
+    let (statut, corps) = appel(&libre, "POST", "/demo-tracks/remove").await;
+    assert_eq!(
+        statut,
+        StatusCode::OK,
+        "un geste en cours sur un autre serveur bloque celui-ci : {corps}"
+    );
+    let (statut, corps) = appel(&occupe, "POST", "/demo-tracks/remove").await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
+    assert_eq!(corps["code"], json!("demo_tracks_busy"));
+}

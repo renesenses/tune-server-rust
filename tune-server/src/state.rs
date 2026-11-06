@@ -87,6 +87,10 @@ pub struct AppState {
     /// `None` pour une base en mémoire. Champ public : un banc y pose un
     /// dossier temporaire.
     pub dossier_titres_demo: Option<std::path::PathBuf>,
+    /// #7858 — un seul ajout ou retrait des titres de démo à la fois, par
+    /// serveur : propre à cet état, pour que deux bancs d'essai parallèles ne
+    /// se refusent pas l'un l'autre (409).
+    pub verrou_titres_demo: Arc<tokio::sync::Mutex<()>>,
     pub port: u16,
     /// Origine du compteur `uptime_seconds` : un `Instant` capturé à la
     /// construction de l'état, donc AU DÉMARRAGE DU PROCESSUS. Il repart
@@ -682,6 +686,7 @@ impl AppState {
                 dossier_autoeq(db_path),
             )),
             dossier_titres_demo: crate::routes::titres_demo::dossier_par_defaut(db_path),
+            verrou_titres_demo: Arc::new(tokio::sync::Mutex::new(())),
             port,
             started_at: Instant::now(),
             process_started_at: time::OffsetDateTime::now_utc(),

@@ -693,13 +693,15 @@ pub fn dr_album_in(engine: Engine, having: &str) -> String {
 
 /// #2144 (rc10) — le DR de chaque album porteur d'un tag DR, sous le jeton de
 /// la base qui l'a rendu ([`super::backend::DbBackend::jeton_des_donnees`]).
-/// Une entrée PAR INSTANCE de base (l'instance est la première moitié du
-/// jeton) : un serveur n'ouvre qu'une base, donc une entrée — mais deux bases
-/// ouvertes dans le même processus (les tests, qui tournent en parallèle) ne
-/// s'évincent plus l'une l'autre. Avant, l'entrée unique faisait relire les
-/// tags DR à la première base dès qu'une seconde lisait sa carte (#7675 : le
-/// témoin de #7580 rougissait selon l'ordre des tests). Borné à
-/// [`DR_EN_CACHE_MAX`] entrées : les bases refermées ne s'accumulent pas.
+///
+/// #7675 puis #7817 — UNE ENTRÉE PAR INSTANCE de base (l'instance est la
+/// première moitié du jeton) : la lecture d'une autre base ne chasse plus la
+/// carte de celle-ci. Avec une seule case, deux bases ouvertes dans le même
+/// processus (les tests en parallèle) se chassaient l'une l'autre, et le
+/// témoin du #7580 comptait des relectures au hasard, selon l'ordre des tests.
+/// Un serveur n'a qu'une base, donc une entrée ; les tests en ouvrent des
+/// milliers : au-delà de [`DR_EN_CACHE_MAX`] bases, celle qui a été lue le
+/// moins récemment est oubliée (les bases refermées ne s'accumulent pas).
 type DrEnCache = Vec<(
     (u64, i64),
     std::sync::Arc<std::collections::HashMap<i64, i64>>,
@@ -724,10 +726,15 @@ pub fn dr_par_album(
     // jeton neuf.
     let jeton = db.jeton_des_donnees();
     if let Some(j) = jeton
-        && let Ok(cache) = DR_PAR_ALBUM_EN_CACHE.lock()
-        && let Some((_, carte)) = cache.iter().find(|(garde, _)| *garde == j)
+        && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+        && let Some(i) = cache.iter().position(|(garde, _)| *garde == j)
     {
-        return Ok(carte.clone());
+        // Servie : remise en dernier, la plus récemment lue est oubliée en
+        // dernier.
+        let entree = cache.remove(i);
+        let carte = entree.1.clone();
+        cache.push(entree);
+        return Ok(carte);
     }
     let sql = format!(
         "SELECT dr.album_id, dr.dr FROM ({}) dr",
@@ -745,8 +752,8 @@ pub fn dr_par_album(
     if let Some(j) = jeton
         && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
     {
-        // La carte précédente de CETTE base est périmée ; celles des autres
-        // bases restent servables sous leur propre jeton.
+        // La carte précédente de CETTE base est périmée ; les autres bases
+        // gardent la leur, servable sous leur propre jeton.
         cache.retain(|(garde, _)| garde.0 != j.0);
         if cache.len() >= DR_EN_CACHE_MAX {
             cache.remove(0);
@@ -1088,6 +1095,26 @@ pub fn socle_de_la_vue_des_pistes(engine: Engine) -> [String; 3] {
         hidden_tracks_excluded().to_string(),
         pistes_album_distant_double_exclu(engine),
         copie_de_moindre_qualite_exclue(),
+    ]
+}
+
+/// #7619 (L1) — le MÊME socle que [`socle_de_la_vue_des_pistes`], écrit en
+/// ensembles NON corrélés : le moteur les évalue une fois par requête au lieu
+/// de trois sous-requêtes par piste.
+///
+/// - albums masqués : `NOT IN` sur `hidden_items`. Une piste sans album reste
+///   visible (`t.album_id IS NULL OR …`), exactement comme le `NOT EXISTS`
+///   d'origine ; `item_id IS NOT NULL` garde le `NOT IN` d'un NULL qui le
+///   rendrait faux partout ;
+/// - doublon distant et copie de moindre qualité :
+///   [`sql_pistes_ecartees_par_le_socle`], bâti sur les mêmes fragments et
+///   exact par construction (#5977).
+pub fn socle_ensembliste_de_la_vue_des_pistes(engine: Engine) -> [String; 2] {
+    [
+        "(t.album_id IS NULL OR t.album_id NOT IN (SELECT h.item_id FROM hidden_items h \
+         WHERE h.item_type = 'album' AND h.item_id IS NOT NULL))"
+            .to_string(),
+        format!("t.id NOT IN ({})", sql_pistes_ecartees_par_le_socle(engine)),
     ]
 }
 

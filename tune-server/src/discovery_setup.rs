@@ -24,6 +24,10 @@ mod media_server_tests_3786;
 #[path = "renderer_allume_avant_le_serveur_tests_6961.rs"]
 mod renderer_allume_avant_le_serveur_tests_6961;
 
+#[cfg(test)]
+#[path = "discovery_setup/renderer_sans_services_de_rendu_tests_7279.rs"]
+mod renderer_sans_services_de_rendu_tests_7279;
+
 #[cfg(all(test, feature = "oaat"))]
 #[path = "deux_pi_verox_oaat_airplay_tests_6947.rs"]
 mod deux_pi_verox_oaat_airplay_tests_6947;
@@ -43,6 +47,10 @@ mod deux_pi_verox_oaat_airplay_tests_6947;
 /// intéresse — s'y abonner coûterait un renouvellement toutes les 250 s pour
 /// rien.
 pub(crate) const SERVICES_EVENEMENTS_DLNA: [&str; 2] = ["avtransport", "renderingcontrol"];
+
+/// Les deux services sans lesquels une sortie DLNA ne s'enregistre pas
+/// (`handle_ssdp_discovered`) ; `GET /zones` publie ceux qui manquent (#7279).
+pub(crate) const SERVICES_DE_RENDU: [&str; 2] = ["avtransport", "renderingcontrol"];
 
 /// `eventSubURL` absolues des services abonnables, à partir des chemins bruts
 /// du descripteur.
@@ -100,6 +108,21 @@ pub(crate) fn scpd_av_transport(
     urls.get("avtransport")
         .filter(|p| !p.trim().is_empty())
         .map(|p| resolve_control_url(&dev.host, dev.port, p))
+}
+
+/// #6335 — la même URL, lue dans un descriptif relu par HTTP (ajout manuel,
+/// nouveau sondage, balayage, création de zone). Sans elle, la sortie rend
+/// `AnnonceSuivante::Inconnue` jusqu'à la prochaine découverte SSDP, et aucun
+/// suivant DSD n'est armé sur un renderer qui sait pourtant enchaîner.
+pub(crate) fn scpd_av_transport_du_descriptif(
+    host: &str,
+    port: u16,
+    desc: &tune_core::discovery::xml_parser::DeviceDescription,
+) -> Option<String> {
+    desc.scpd_urls()
+        .get("avtransport")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| resolve_control_url(host, port, p))
 }
 
 pub(crate) fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
@@ -952,6 +975,28 @@ async fn handle_ssdp_discovered(
             dev.manufacturer.as_deref().unwrap_or_default(),
             dev.model.as_deref().unwrap_or_default(),
         );
+    }
+
+    // #7279 — sans sortie enregistrée, pas de zone. La chaîne de rattachement
+    // et de création ci-dessous ne regardait pas `registered` : un renderer
+    // sans AVTransport ou sans RenderingControl recevait une zone « en ligne »
+    // qui ne pouvait rien jouer, absente de la liste des appareils de lecture,
+    // et sans un mot dans le journal (Innuos Zenith, fil 2495).
+    if !registered {
+        let manquants: Vec<&str> = SERVICES_DE_RENDU
+            .into_iter()
+            .filter(|cle| !svc_urls.contains_key(*cle))
+            .collect();
+        let annonces: Vec<&String> = svc_urls.keys().collect();
+        warn!(
+            id = %dev.id,
+            name = %dev.name,
+            host = %dev.host,
+            manquants = ?manquants,
+            annonces = ?annonces,
+            "ssdp_renderer_sans_services_de_rendu"
+        );
+        return;
     }
 
     let skip_keywords = [

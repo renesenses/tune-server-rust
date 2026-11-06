@@ -162,16 +162,13 @@ async fn le_cache_reste_indexe_par_langue() {
     );
 }
 
-/// Choix delibere, repris de la route artiste (#2126) : une langue INCONNUE est
-/// acceptee. La refuser declencherait un appel reseau pour chaque album dont la
-/// provenance n'a jamais ete renseignee, a la premiere ouverture de chaque
-/// fiche — et rien ne prouve que ces bios soient dans la mauvaise langue.
-///
-/// Le cache anglais est seme ici pour que le test ait quelque chose d'autre a
-/// rendre s'il choisissait de passer outre : c'est bien la bio stockee qui doit
-/// gagner.
+/// #7027 : une bio de source connue mais de langue INCONNUE ne convient plus a
+/// une demande precise. #2126 l'acceptait ; or la bio editoriale d'un service
+/// de streaming et le fonds communautaire rangent des bios sans langue,
+/// souvent en francais, servies alors a une interface anglaise. Le cache
+/// anglais repond a sa place.
 #[tokio::test]
-async fn une_bio_de_langue_inconnue_reste_servie() {
+async fn une_bio_de_langue_inconnue_n_est_plus_servie_7027() {
     let (app, state) = app_et_etat();
     album_avec_bio(&state, 1, "");
     semer_le_cache(&state, "en", BIO_EN);
@@ -180,8 +177,8 @@ async fn une_bio_de_langue_inconnue_reste_servie() {
 
     assert_eq!(
         body["bio"].as_str(),
-        Some(BIO_FR),
-        "une ligne ancienne, sans bio_lang, doit rester servie"
+        Some(BIO_EN),
+        "une bio sans bio_lang a de nouveau ete servie comme de l'anglais"
     );
 }
 
