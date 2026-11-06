@@ -137,7 +137,11 @@ async fn verifier_dff_dop(zone: i64, depart_ms: u64) {
     assert_eq!(info.channels, 2);
     let cible_par_canal = 352_800u64 * depart_ms / 1000;
     let atteint_par_canal = cible_par_canal;
-    let attendue = 44 + (3 * 352_800 - atteint_par_canal) / 2 * 2 * 3;
+    // #7704 — compte de trames DoP rendu pair par la trame de clôture.
+    let attendue = 44
+        + crate::audio::dsd_to_dop::trames_dop_avec_cloture((3 * 352_800 - atteint_par_canal) / 2)
+            * 2
+            * 3;
     assert_eq!(
         octets.len() as u64,
         attendue,

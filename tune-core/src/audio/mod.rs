@@ -39,6 +39,8 @@ pub mod disposition_canaux;
 /// Dither TPDF — UNE implémentation, partagée par tous les étages qui
 /// repassent du flottant à l'entier (#4075, #4076).
 pub mod dither;
+/// #7704 — continuité du porteur DoP dans les rappels de rendu.
+pub mod dop_continu;
 /// #7265 — un DSD que la sortie WASAPI ne peut pas porter en DoP part en PCM.
 pub mod dop_ecarte_7265;
 #[cfg(test)]

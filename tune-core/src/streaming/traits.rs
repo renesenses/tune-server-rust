@@ -545,6 +545,27 @@ pub struct StreamAlbumDescription {
     pub language: Option<String>,
 }
 
+/// #8022 — l'album d'un service retrouvé pour un album de la bibliothèque
+/// LOCALE, par ses codes (code-barres, ISRC). N'existe que pour une
+/// correspondance SÛRE : une recherche qui rend plusieurs albums possibles ne
+/// rend rien.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumRetrouve {
+    pub id: String,
+    pub artist_id: Option<String>,
+    pub artist_name: String,
+}
+
+/// #8022 — un texte éditorial d'un service (biographie d'artiste, note
+/// d'album), déjà ramené à du TEXTE (aucune balise), avec la langue que le
+/// service annonce pour lui, et la page publique du service qui le porte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TexteEditorial {
+    pub texte: String,
+    pub langue: Option<String>,
+    pub url: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AlbumContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -968,6 +989,50 @@ pub trait StreamingService: Send + Sync {
         Err(TuneError::Unsupported(
             "album description not supported for this service".into(),
         ))
+    }
+
+    // ── #8022 — textes éditoriaux pour la bibliothèque LOCALE ──────────────
+    //
+    // Par défaut, un service ne sait rien retrouver : `Ok(None)`, aucun
+    // appel. Qobuz les met en œuvre ; TIDAL suivra (issue séparée).
+
+    /// L'album du service qui correspond SÛREMENT à ces codes : code-barres
+    /// (UPC/EAN) d'abord, sinon les ISRC de quelques titres (un seul album
+    /// doit les porter tous). Rien de sûr : `Ok(None)`.
+    async fn album_par_codes(
+        &self,
+        _upc: Option<&str>,
+        _isrcs: &[String],
+    ) -> Result<Option<AlbumRetrouve>, TuneError> {
+        Ok(None)
+    }
+
+    /// L'identifiant de l'UNIQUE artiste du service qui porte exactement ce
+    /// nom. Zéro ou plusieurs : `Ok(None)`.
+    async fn artiste_par_nom_exact(&self, _nom: &str) -> Result<Option<String>, TuneError> {
+        Ok(None)
+    }
+
+    /// La biographie éditoriale d'un artiste du service, en texte.
+    async fn bio_editoriale_artiste(
+        &self,
+        _artist_id: &str,
+    ) -> Result<Option<TexteEditorial>, TuneError> {
+        Ok(None)
+    }
+
+    /// La note éditoriale d'un album du service, en texte.
+    async fn note_editoriale_album(
+        &self,
+        _album_id: &str,
+    ) -> Result<Option<TexteEditorial>, TuneError> {
+        Ok(None)
+    }
+
+    /// La langue du magasin du compte connecté (`fr`, `en`…), quand le
+    /// service la donne : celle d'un texte qui n'annonce pas la sienne.
+    fn langue_du_magasin(&self) -> Option<String> {
+        None
     }
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         Ok(vec![])
