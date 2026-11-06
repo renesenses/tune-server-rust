@@ -131,7 +131,8 @@ pub struct Totaux {
     pub entree: Option<f64>,
 }
 
-/// Les totaux des albums donnés, en une requête.
+/// Les totaux des albums donnés, en une requête. `SUM` d'un entier rend un
+/// `numeric` sous PostgreSQL : il est ramené à `BIGINT` pour les deux moteurs.
 pub fn totaux(state: &AppState, albums: &[i64]) -> HashMap<i64, Totaux> {
     if albums.is_empty() {
         return HashMap::new();
@@ -142,7 +143,8 @@ pub fn totaux(state: &AppState, albums: &[i64]) -> HashMap<i64, Totaux> {
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT t.album_id, COUNT(*), SUM(t.duration_ms), MIN(t.file_mtime) FROM tracks t \
+        "SELECT t.album_id, COUNT(*), CAST(SUM(t.duration_ms) AS BIGINT), MIN(t.file_mtime) \
+         FROM tracks t \
          WHERE t.album_id IN ({liste}) AND {PISTE_EXPOSEE} GROUP BY t.album_id"
     );
     let lignes = state.backend.query_many(&sql, &[]).unwrap_or_default();

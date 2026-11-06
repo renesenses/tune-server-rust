@@ -54,6 +54,17 @@ fn octets(id: i64) -> Vec<u8> {
     (0..100u8).map(|i| i.wrapping_add(id as u8)).collect()
 }
 
+/// (artiste, nom, album, titre, année, genre, pistes)
+type Disque = (
+    i64,
+    &'static str,
+    i64,
+    &'static str,
+    i64,
+    &'static str,
+    &'static [i64],
+);
+
 fn bibliotheque(state: &AppState, dossier: &std::path::Path) {
     let db = &state.backend;
     let sql = |s: &str, p: &[&dyn ToSqlValue]| {
@@ -63,8 +74,7 @@ fn bibliotheque(state: &AppState, dossier: &std::path::Path) {
         "INSERT INTO profiles (id, username, display_name, is_admin) VALUES (2, 'enfant', 'Enfant', 0)",
         &[],
     );
-    // (artiste, nom, album, titre, année, genre, pistes)
-    let jeu: [(i64, &str, i64, &str, i64, &str, &[i64]); 2] = [
+    let jeu: [Disque; 2] = [
         (
             7,
             "Groupe Interdit",
