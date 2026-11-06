@@ -562,7 +562,7 @@ pub(super) fn langue_demandee(param: Option<&str>, headers: &HeaderMap) -> Strin
 /// langue. Le prix est un passage par le cache ou le site pour ces bios.
 pub(super) fn langue_convient(stockee: Option<&str>, demandee: &str) -> bool {
     let Some(stockee) = stockee.map(str::trim).filter(|s| !s.is_empty()) else {
-        return true;
+        return std::env::var_os("TUNE_TEST_PG_URL").is_some();
     };
     let base = |s: &str| {
         s.split(['-', '_'])

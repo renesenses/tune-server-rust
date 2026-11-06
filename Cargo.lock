@@ -3786,33 +3786,10 @@ dependencies = [
 [[package]]
 name = "oaat-controller"
 version = "0.2.8"
-source = "git+https://github.com/renesenses/oaat?rev=c96021f0#c96021f0f019598efaac8ec320ca886cf40102ed"
-dependencies = [
- "bytes",
- "hostname",
- "mdns-sd",
- "oaat-core",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
 
 [[package]]
 name = "oaat-core"
 version = "0.2.8"
-source = "git+https://github.com/renesenses/oaat?rev=c96021f0#c96021f0f019598efaac8ec320ca886cf40102ed"
-dependencies = [
- "bitflags 2.13.1",
- "bytes",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
- "zerocopy",
-]
 
 [[package]]
 name = "objc2"
@@ -7305,7 +7282,6 @@ checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
- "serde_core",
  "wasm-bindgen",
 ]
 
