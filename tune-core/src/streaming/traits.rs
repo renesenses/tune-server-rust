@@ -664,7 +664,8 @@ pub trait StreamingService: Send + Sync {
     /// perdre la moitié de la première page à Tidal, Deezer, Spotify, Amazon
     /// et YouTube dès que l'écran demande `paged=true` — le chemin non paginé
     /// leur passe la limite du client, 100 (`SEARCH_FEDEREE_LIMIT` du client
-    /// web). Seul `0` est traduit ([`limite_hors_pagination`]) : c'est le
+    /// web). Spotify a depuis son propre `search_page`, borné au plafond de
+    /// son API (#7659). Seul `0` est traduit ([`limite_hors_pagination`]) : c'est le
     /// « Tous » de la route, et `limit=0` dans l'URL d'un service qui ne
     /// pagine pas rend une page vide ou un refus (#2160).
     ///
