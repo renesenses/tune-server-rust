@@ -2235,6 +2235,10 @@ mod mesure_saut_cd_5079;
 mod qobuz_cadence_nulle_5283_tests;
 #[cfg(test)]
 mod tidal_aac_annonce_6334_tests;
+/// #7266 — de bout en bout, un FLAC CD TIDAL en DASH jusqu'au Play reçu par
+/// un faux renderer DLNA : durée de chaque étape et borne du démarrage.
+#[cfg(test)]
+mod tidal_cd_dash_jusqu_au_play_7266;
 
 /// #6401 — le préchargement sans blanc et la sonde de niveaux après une
 /// avance sans blanc passent par le même repli Qobuz en 16/44,1 que la
