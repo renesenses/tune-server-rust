@@ -1053,67 +1053,81 @@ pub fn natural_end(
 /// [`CONSIGNE_DE_SILENCE`]) n'adopte jamais une valeur plus haute : voir
 /// [`silence_rouvert_par_l_appareil`].
 ///
-/// #6739 — et jamais à la HAUSSE : un relevé plus haut que la consigne n'est
-/// pas adopté (voir [`juger_le_releve_de_volume`]). Les trois sites de
-/// `tick.rs` passent désormais par ce jugement ; ce prédicat ne sert plus
-/// qu'aux tests qui gardent la règle.
+/// #7379 — à la HAUSSE, jusqu'au plafond de suivi seulement (voir
+/// [`juger_le_releve_de_volume`]). Les trois sites de `tick.rs` passent par
+/// ce jugement ; ce prédicat ne sert plus qu'aux tests qui gardent la règle,
+/// sans limite réglée ni trim (plafond par défaut).
 #[cfg(test)]
 pub fn should_adopt_device_volume(
     prev_device_vol: Option<f64>,
     device_vol: f64,
     db_vol: f64,
 ) -> bool {
+    let plafond = crate::audio::volume_limites::LimitesDeVolume::default().plafond_de_suivi(db_vol);
     matches!(
-        juger_le_releve_de_volume(prev_device_vol, device_vol, db_vol, 0.0),
+        juger_le_releve_de_volume(prev_device_vol, device_vol, db_vol, 0.0, plafond),
         JugementDuReleve::Adopter(_)
     )
 }
 
-/// #6739 — ce que le sondeur fait d'un volume relevé sur l'appareil.
+/// #6739, #7379 — ce que le sondeur fait d'un volume relevé sur l'appareil.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JugementDuReleve {
     /// Rien : premier relevé, valeur figée, ou égale à la consigne.
     Ignorer,
-    /// L'appareil a été BAISSÉ hors de Tune (télécommande, molette) : la
-    /// consigne de la zone le reflète. La valeur est en échelle de consigne
-    /// (trim retiré) et ne dépasse jamais la consigne d'avant.
+    /// L'appareil a bougé hors de Tune (télécommande, molette, autre
+    /// application), plus bas, ou plus haut mais sous le plafond de suivi :
+    /// la consigne de la zone le reflète. La valeur est en échelle de
+    /// consigne (trim retiré), jamais au-dessus du plafond de suivi.
     Adopter(f64),
-    /// L'appareil dit plus haut que la consigne : on ne l'adopte pas, on le
-    /// dit au journal. La valeur est en échelle de consigne.
+    /// La consigne est le silence et l'appareil remonte : on ne l'adopte pas
+    /// ([`silence_rouvert_par_l_appareil`]). Échelle de consigne.
     PlusHautNonAdopte(f64),
+    /// #7379 — l'appareil dépasse le plafond de suivi : Tune le ramène AU
+    /// plafond, et la consigne s'y aligne. La valeur est la nouvelle consigne
+    /// (échelle de consigne, trim retiré).
+    RamenerAuPlafond(f64),
 }
 
 /// #6739 — le facteur par lequel un relevé d'appareil se ramène à l'échelle
 /// de la consigne : le trim tel que `set_volume` l'a composé, sans jamais
 /// dépasser 1 (un trim positif est ignoré sur une sortie à volume matériel ;
-/// sur la sortie locale, compter le relevé trop haut ne fait que refuser une
-/// adoption, jamais monter).
+/// sur la sortie locale, compter le relevé trop haut ne fait que le juger
+/// plus près du plafond, jamais monter).
 pub fn facteur_de_releve(trim_db: f64) -> f64 {
     crate::orchestrator::gain_trim_factor(trim_db).min(1.0)
 }
 
-/// #6739 (fil 2366/2375, Marantz NR1200, tweeter détruit) — décision de
-/// Bertrand du 22/10 : un relevé du volume de l'appareil ne remonte JAMAIS le
-/// volume utilisateur.
+/// #6739 (fil 2366/2375, Marantz NR1200, tweeter détruit), révisée par la
+/// décision de Bertrand du 02/11 (#7379).
 ///
-/// Le cliquet : `set_volume(0,36)` partait à 96 % avec un trim de +8,5 dB ;
-/// le sondeur relisait 96 et l'adoptait comme consigne, que le geste suivant
-/// remultipliait. Baisser le curseur finissait à 100 %.
+/// Le cliquet de #6739 : `set_volume(0,36)` partait à 96 % avec un trim de
+/// +8,5 dB ; le sondeur relisait 96 et l'adoptait comme consigne, que le
+/// geste suivant remultipliait. Le trim positif ne part plus vers un appareil
+/// à volume matériel (#6749), et le relevé est ramené à l'échelle de la
+/// consigne ([`facteur_de_releve`]) : le cliquet n'a plus de prise.
 ///
-/// Règle : le relevé est d'abord ramené à l'échelle de la consigne
-/// ([`facteur_de_releve`]) ; il n'est adopté que s'il a bougé depuis le tour
-/// précédent (front, #358), qu'il diffère de la consigne de plus de 2 points
-/// ET qu'il est plus BAS. Plus haut : [`JugementDuReleve::PlusHautNonAdopte`].
-/// La consigne de silence n'est jamais rouverte
-/// ([`silence_rouvert_par_l_appareil`]).
+/// Règle du 02/11 : quand l'appareil joue plus fort que la consigne (bouton
+/// de l'ampli, autre application), Tune le SUIT tant qu'il reste sous le
+/// plafond de suivi `plafond_appareil` (échelle de l'appareil : la limite de
+/// sécurité de la zone, ou [`crate::audio::volume_limites::PLAFOND_DE_SUIVI_PAR_DEFAUT`]
+/// sans limite réglée) ; au-dessus, [`JugementDuReleve::RamenerAuPlafond`].
+/// Un relevé n'est jugé que s'il a bougé depuis le tour précédent (front,
+/// #358) et qu'il diffère de la consigne de plus de 2 points. La consigne de
+/// silence n'est jamais rouverte ([`silence_rouvert_par_l_appareil`]).
 pub fn juger_le_releve_de_volume(
     prev_device_vol: Option<f64>,
     device_vol: f64,
     db_vol: f64,
     trim_db: f64,
+    plafond_appareil: f64,
 ) -> JugementDuReleve {
     let facteur = facteur_de_releve(trim_db);
-    if !device_vol.is_finite() || !db_vol.is_finite() || facteur <= 0.0 {
+    if !device_vol.is_finite()
+        || !db_vol.is_finite()
+        || !plafond_appareil.is_finite()
+        || facteur <= 0.0
+    {
         return JugementDuReleve::Ignorer;
     }
     let releve = device_vol / facteur;
@@ -1121,10 +1135,19 @@ pub fn juger_le_releve_de_volume(
     if !a_bouge || (releve - db_vol).abs() <= 0.02 {
         return JugementDuReleve::Ignorer;
     }
-    if releve > db_vol || silence_rouvert_par_l_appareil(releve, db_vol) {
+    if silence_rouvert_par_l_appareil(releve, db_vol) {
         return JugementDuReleve::PlusHautNonAdopte(releve);
     }
-    JugementDuReleve::Adopter(releve.clamp(0.0, db_vol.clamp(0.0, 1.0)))
+    if releve < db_vol {
+        return JugementDuReleve::Adopter(releve.clamp(0.0, db_vol.clamp(0.0, 1.0)));
+    }
+    // Le plafond en échelle de consigne : ce que `set_volume` doit recevoir
+    // pour que l'appareil reçoive le plafond, trim compris.
+    let plafond_consigne = (plafond_appareil.clamp(0.0, 1.0) / facteur).min(1.0);
+    if device_vol > plafond_appareil + crate::audio::volume_limites::TOLERANCE_RENDERER {
+        return JugementDuReleve::RamenerAuPlafond(plafond_consigne);
+    }
+    JugementDuReleve::Adopter(releve.clamp(0.0, plafond_consigne))
 }
 
 /// Plus haut volume de zone tenu pour une consigne de silence : la

@@ -69,11 +69,13 @@ async fn un_trim_negatif_reste_applique_sur_le_renderer_6739() {
     );
 }
 
-/// (b) Le cliquet : l'appareil relu à 96 alors que la consigne est 36. Le
-/// relevé ne doit pas devenir la consigne, et la consigne suivante (un pas de
-/// « volume − » depuis la consigne affichée) ne monte pas.
+/// (b) Le cliquet, sous la règle du 02/11 (#7379) : l'appareil relu à 96
+/// alors que la consigne est 36, zone SANS limite de sécurité réglée. Le
+/// relevé dépasse le plafond de suivi par défaut (85 %) : la consigne passe
+/// AU plafond, l'appareil y est ramené, et le geste suivant (« volume − »
+/// depuis la consigne affichée) descend. Jamais 96, jamais de cliquet.
 #[tokio::test]
-async fn un_releve_a_96_ne_remonte_pas_la_consigne_suivante_6739() {
+async fn un_releve_a_96_est_ramene_au_plafond_sans_cliquet_6739() {
     let mut banc = Banc::monter(false).await;
     banc.poser_reglage(
         &format!("zone_{}_gain_trim_db", banc.zone_id),
@@ -88,23 +90,63 @@ async fn un_releve_a_96_ne_remonte_pas_la_consigne_suivante_6739() {
         banc.tic().await;
     }
     assert!(
-        (banc.volume_en_base() - 36.0).abs() < 1e-6,
-        "#6739 : le relevé de l'appareil (96 %) a REMONTÉ le volume utilisateur en base \
-         ({} %) — cliquet vers 100 %",
+        (banc.volume_en_base() - 85.0).abs() < 1e-6,
+        "#6739/#7379 : le relevé de l'appareil (96 %) doit faire passer la consigne AU \
+         plafond de suivi par défaut (85 %), pas {} %",
         banc.volume_en_base()
     );
     let affiche = banc.volume_en_memoire().await;
     assert!(
-        affiche <= 0.36 + 1e-9,
-        "#6739 : le relevé de l'appareil (96 %) a remonté la consigne en mémoire ({affiche})"
+        (affiche - 0.85).abs() < 1e-9,
+        "#7379 : le curseur doit afficher le plafond, pas {affiche}"
+    );
+    let ramene = banc.commandes_depuis(deja).await;
+    assert_eq!(
+        ramene.iter().map(|v| en_pour_cent(*v)).collect::<Vec<_>>(),
+        vec![85],
+        "#7379 : l'appareil à 96 % doit être ramené une fois au plafond (85) : {ramene:?}"
     );
     // Le geste suivant : « volume − » d'un pas depuis ce que la zone affiche.
+    let deja = banc.appareil_a(0.85).await;
+    banc.tic().await;
     banc.consigne(affiche - 0.05).await;
     let recus = banc.commandes_depuis(deja).await;
     assert!(
-        !recus.is_empty() && recus.iter().all(|v| en_pour_cent(*v) <= 36),
+        !recus.is_empty() && recus.iter().all(|v| en_pour_cent(*v) <= 80),
         "#6739 : après un relevé à 96, un pas de « volume − » a envoyé {recus:?} — la \
          consigne suivante a MONTÉ"
+    );
+}
+
+/// Même cliquet sous une limite de sécurité réglée à 50 % : le plafond est la
+/// limite, l'appareil n'en reçoit jamais plus.
+#[tokio::test]
+async fn un_releve_a_96_sous_une_limite_est_ramene_a_la_limite_6739() {
+    let mut banc = Banc::monter(false).await;
+    banc.poser_reglage(
+        &format!("zone_{}_gain_trim_db", banc.zone_id),
+        TRIM_DU_RAPPORT,
+    );
+    banc.poser_reglage(
+        &crate::audio::volume_limites::cle_securite(banc.zone_id),
+        "0.5",
+    );
+    banc.tic().await;
+    banc.consigne(0.36).await;
+    banc.tic().await;
+    let deja = banc.appareil_a(0.96).await;
+    for _ in 0..3 {
+        banc.tic().await;
+    }
+    let recus = banc.commandes_depuis(deja).await;
+    assert!(
+        (banc.volume_en_base() - 50.0).abs() < 1e-6,
+        "consigne alignée sur la limite (50 %), pas {} %",
+        banc.volume_en_base()
+    );
+    assert!(
+        !recus.is_empty() && recus.iter().all(|v| en_pour_cent(*v) <= 50),
+        "jamais plus que la limite vers l'appareil : {recus:?}"
     );
 }
 
@@ -124,38 +166,88 @@ async fn une_baisse_sur_l_appareil_reste_adoptee_6739() {
     );
 }
 
-/// La règle elle-même, sans banc.
+/// La règle elle-même, sans banc (#7379 : suivi sous le plafond, retour au
+/// plafond au-dessus). `plafond` en échelle de l'appareil.
 #[test]
-fn la_regle_du_releve_ne_monte_jamais_6739() {
-    // Plus haut que la consigne : jamais adopté, avec ou sans trim.
-    assert!(matches!(
-        juger_le_releve_de_volume(Some(0.36), 0.96, 0.36, 8.5),
-        JugementDuReleve::PlusHautNonAdopte(_)
-    ));
-    assert!(matches!(
-        juger_le_releve_de_volume(Some(0.5), 0.62, 0.3, 0.0),
-        JugementDuReleve::PlusHautNonAdopte(_)
-    ));
-    // Trim −6 dB : le relevé du niveau composé n'est PAS une baisse.
-    let compose = 0.5 * 10f64.powf(-6.0 / 20.0);
+fn la_regle_du_releve_suit_sous_le_plafond_6739_7379() {
+    const DEFAUT: f64 = crate::audio::volume_limites::PLAFOND_DE_SUIVI_PAR_DEFAUT;
+    // Plus haut que la consigne, sous le plafond : suivi.
     assert_eq!(
-        juger_le_releve_de_volume(Some(0.1), compose, 0.5, -6.0),
+        juger_le_releve_de_volume(Some(0.5), 0.62, 0.3, 0.0, DEFAUT),
+        JugementDuReleve::Adopter(0.62)
+    );
+    // Au-dessus du plafond : retour AU plafond, avec ou sans trim positif
+    // (ignoré : facteur 1 sur une sortie à volume matériel).
+    assert_eq!(
+        juger_le_releve_de_volume(Some(0.36), 0.96, 0.36, 8.5, DEFAUT),
+        JugementDuReleve::RamenerAuPlafond(DEFAUT)
+    );
+    assert_eq!(
+        juger_le_releve_de_volume(Some(0.36), 0.96, 0.36, 0.0, 0.5),
+        JugementDuReleve::RamenerAuPlafond(0.5)
+    );
+    // Jamais au-delà du plafond, même à la tolérance près.
+    match juger_le_releve_de_volume(Some(0.3), 0.855, 0.3, 0.0, DEFAUT) {
+        JugementDuReleve::Adopter(v) => assert!(v <= DEFAUT + 1e-12, "{v}"),
+        autre => panic!("{autre:?}"),
+    }
+    // Trim −6 dB : le relevé du niveau composé n'est PAS une baisse.
+    let facteur = 10f64.powf(-6.0 / 20.0);
+    let compose = 0.5 * facteur;
+    assert_eq!(
+        juger_le_releve_de_volume(Some(0.1), compose, 0.5, -6.0, DEFAUT),
         JugementDuReleve::Ignorer
     );
     // Trim −6 dB, appareil baissé à 0,1 : consigne 0,1 / 0,501 ≈ 0,2.
-    match juger_le_releve_de_volume(Some(compose), 0.1, 0.5, -6.0) {
-        JugementDuReleve::Adopter(v) => assert!((v - 0.1 / 10f64.powf(-6.0 / 20.0)).abs() < 1e-9),
+    match juger_le_releve_de_volume(Some(compose), 0.1, 0.5, -6.0, DEFAUT) {
+        JugementDuReleve::Adopter(v) => assert!((v - 0.1 / facteur).abs() < 1e-9),
         autre => panic!("baisse sur l'appareil non adoptée : {autre:?}"),
     }
+    // Trim −6 dB, appareil monté à 0,6 (sous 0,7) : consigne 0,6 / 0,501,
+    // bornée à 1.
+    match juger_le_releve_de_volume(Some(compose), 0.6, 0.5, -6.0, DEFAUT) {
+        JugementDuReleve::Adopter(v) => assert!((v - 1.0).abs() < 1e-9, "{v}"),
+        autre => panic!("{autre:?}"),
+    }
+    // Consigne de silence : jamais rouverte, même sous le plafond.
+    assert!(matches!(
+        juger_le_releve_de_volume(Some(0.0), 0.4, 0.0, 0.0, DEFAUT),
+        JugementDuReleve::PlusHautNonAdopte(_)
+    ));
     // Premier relevé, NaN : rien.
     assert_eq!(
-        juger_le_releve_de_volume(None, 0.1, 0.5, 0.0),
+        juger_le_releve_de_volume(None, 0.1, 0.5, 0.0, DEFAUT),
         JugementDuReleve::Ignorer
     );
     assert_eq!(
-        juger_le_releve_de_volume(Some(0.5), f64::NAN, 0.5, 0.0),
+        juger_le_releve_de_volume(Some(0.5), f64::NAN, 0.5, 0.0, DEFAUT),
         JugementDuReleve::Ignorer
     );
+    assert_eq!(
+        juger_le_releve_de_volume(None, 0.96, 0.36, 0.0, DEFAUT),
+        JugementDuReleve::Ignorer,
+        "le premier relevé n'est jamais jugé (#358), même au-dessus du plafond"
+    );
+}
+
+/// #7379 — sans limite de sécurité réglée, le plafond de suivi est le
+/// plafond PAR DÉFAUT (85 %), jamais « illimité » ; il ne rabote pas une
+/// consigne que Tune a posée plus haut ; une limite réglée le remplace.
+#[test]
+fn sans_limite_reglee_le_plafond_de_suivi_est_le_defaut_7379() {
+    use crate::audio::volume_limites::{LimitesDeVolume, PLAFOND_DE_SUIVI_PAR_DEFAUT};
+    let sans = LimitesDeVolume::default();
+    assert_eq!(PLAFOND_DE_SUIVI_PAR_DEFAUT, 0.85);
+    assert_eq!(sans.plafond_de_suivi(0.3), 0.85);
+    assert_eq!(sans.plafond_de_suivi(0.0), 0.85);
+    assert_eq!(sans.plafond_de_suivi(f64::NAN), 0.85);
+    assert!(sans.plafond_de_suivi(0.3) < 1.0, "jamais illimité");
+    assert_eq!(sans.plafond_de_suivi(0.9), 0.9);
+    let avec = LimitesDeVolume {
+        securite: Some(0.5),
+        confort: None,
+    };
+    assert_eq!(avec.plafond_de_suivi(0.3), 0.5);
 }
 
 /// La composition du trim, selon la nature du volume de la sortie.

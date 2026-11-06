@@ -50,8 +50,8 @@ pub(crate) mod volume_illisible_5662;
 #[path = "dlna_volume_decoratif_5575.rs"]
 pub(crate) mod volume_decoratif_5575;
 
-/// #6008 (rc7, fil 2401) — une hausse de l'appareil corrigée aussi hors de la
-/// fenêtre d'après pose, sur un appareil qui porte la règle.
+/// #6008 (rc7, fil 2401) — hors de la fenêtre d'après pose. Depuis #7379, la
+/// hausse n'y est plus corrigée par la sortie : le sondeur en décide.
 #[path = "dlna_volume_hors_fenetre_6008.rs"]
 pub(crate) mod hors_fenetre_6008;
 
@@ -1455,9 +1455,9 @@ impl DlnaOutput {
     /// toute hausse de plus de 2 points corrigée sur-le-champ, et le sondeur
     /// reçoit le volume réimposé, pas le saut.
     ///
-    /// #6008 (rc7, fil 2401) — sur un appareil qui PORTE déjà la règle, la
-    /// hausse se corrige aussi hors de la fenêtre, tant que Tune lit : voir
-    /// [`hors_fenetre_6008`].
+    /// #7379 — hors de la fenêtre, plus aucune correction (fin de la règle
+    /// stricte de #6008/#6871) : le sondeur suit l'appareil sous le plafond
+    /// de suivi et le ramène au plafond au-dessus. Voir [`hors_fenetre_6008`].
     async fn volume_apres_controle_d_uri(&self, lu: f64, lecture_de_tune: bool) -> f64 {
         let dans_la_fenetre = self
             .uri_posee_a
