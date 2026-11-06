@@ -1358,6 +1358,10 @@ pub struct PlaybackOrchestrator {
     pub(crate) sources_physiques: Arc<crate::sources_physiques::RegistreSources>,
     /// #5662 — les files de volume par (sortie, zone) : voir `volume_coalescent`.
     pub(crate) volume_coalesceur: volume_coalescent::CoalesceurDeVolume,
+    /// #6721 — le dernier niveau connu de l'appareil de chaque zone : le
+    /// repère de la garde contre les montées brusques ne le dépasse jamais.
+    /// Voir `repere_de_hausse_6721`.
+    pub(crate) niveaux_des_appareils: repere_de_hausse_6721::NiveauxDesAppareils,
     /// #2264 — la mémoire de la règle de version : choix explicites en
     /// attente, réponses des services. Voir `version_de_lecture`.
     pub(crate) versions: version_de_lecture::EtatDesVersions,
@@ -1865,6 +1869,7 @@ impl PlaybackOrchestrator {
             sources_url: crate::source_url::SourcesUrl::default(),
             sources_physiques: Arc::default(),
             volume_coalesceur: volume_coalescent::CoalesceurDeVolume::default(),
+            niveaux_des_appareils: Default::default(),
             versions: Default::default(),
         }
     }
@@ -1992,6 +1997,9 @@ mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+mod repere_de_hausse_6721;
+#[cfg(test)]
+mod repere_de_hausse_6721_tests;
 mod volume_coalescent;
 #[cfg(test)]
 mod volume_coalescent_5662_tests;
