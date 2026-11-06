@@ -11,7 +11,10 @@
 //! Le banc : la Zone 2 sur un renderer DLNA factice, la Zone 5 sur une
 //! Chromecast factice, aucun son. Deux clients se distinguent par leurs
 //! en-têtes (`user-agent`, `x-client-id`) ; les lancements passent par
-//! `POST /zones/{id}/play`, la route qu'appelle le client web.
+//! `POST /zones/{id}/play`, la route qu'appelle le client web, et par
+//! `POST /radios/{id}/play/{zone}` pour la radio (le rapport parle d'une
+//! radio). La station est un petit serveur local qui sert le FLAC des
+//! fixtures : aucun son, aucun réseau.
 //!
 //! ⚠️ `tune-server` porte `autotests = false` — ce fichier n'est compilé que
 //! par son entrée `[[test]]` dans `Cargo.toml`.
@@ -28,6 +31,29 @@ use tune_core::outputs::mock::MockOutput;
 use tune_core::playback::PlayState;
 use tune_server::routes::zones::relais_de_groupe_6155::lancer_le_relais_de_groupe;
 use tune_server::state::AppState;
+
+/// Une station de radio factice, sur la boucle locale : elle sert le FLAC des
+/// fixtures. Rend l'adresse de son flux.
+async fn station_locale() -> String {
+    let octets = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tune-core/tests/fixtures/test.flac"
+    ))
+    .unwrap();
+    let app = axum::Router::new().route(
+        "/flux",
+        axum::routing::get(move || {
+            let octets = octets.clone();
+            async move { ([(axum::http::header::CONTENT_TYPE, "audio/flac")], octets) }
+        }),
+    );
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(ecoute, app).await.ok();
+    });
+    format!("http://{adresse}/flux")
+}
 
 /// Un appareil qui parle au serveur.
 #[derive(Clone, Copy)]
@@ -116,6 +142,7 @@ struct Banc {
 }
 
 const DLNA_ZONE2: &str = "dlna-zone-2";
+const RADIO: &str = "Station témoin";
 const CAST_ZONE5: &str = "chromecast-zone-5";
 
 /// Zone 2 (DLNA factice), Zone 5 (Chromecast factice), trois pistes FLAC
@@ -207,6 +234,31 @@ impl Banc {
             status,
             StatusCode::OK,
             "lecture de la piste {track_id} : {corps}"
+        );
+    }
+
+    /// Une station de « Mes radios », lancée comme le fait `playRadio` du
+    /// client web.
+    async fn lancer_la_radio(&self, client: Client, zone: i64) {
+        let flux = station_locale().await;
+        self.state
+            .backend
+            .execute_batch(&format!(
+                "INSERT INTO radio_stations (id, name, url) VALUES (7717, '{RADIO}', '{flux}');"
+            ))
+            .unwrap();
+        let (status, corps) = poster(
+            &self.app,
+            client,
+            &format!("/api/v1/radios/7717/play/{zone}"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "lecture de la radio : {corps}");
+        assert_eq!(
+            corps["error"],
+            json!(null),
+            "témoin : la radio part sur la zone {zone} — {corps}"
         );
     }
 
@@ -321,5 +373,101 @@ async fn la_zone_qui_rejoint_ne_reprend_pas_la_tete() {
         banc.meneuse_enregistree(),
         Some(banc.zone2),
         "la meneuse reste la zone du lancement, jamais celle qui rejoint"
+    );
+}
+
+/// (d) Le cas du rapport, avec une radio : groupe formé depuis la fiche de la
+/// Chromecast, qui joue « Deux » ; le portable lance une radio sur la Zone 2.
+/// La Chromecast doit passer sur la radio.
+#[tokio::test]
+async fn une_radio_lancee_sur_l_autre_zone_du_groupe_part_sur_la_chromecast() {
+    let banc = zone2_et_chromecast().await;
+    banc.lancer(PC, banc.zone5, 2).await;
+    banc.grouper_depuis_la_fiche_de(PC, banc.zone5).await;
+    assert!(
+        banc.la_zone_joue(banc.zone2, "Deux").await,
+        "témoin : la Zone 2 rejoint la Chromecast qui mène"
+    );
+
+    banc.lancer_la_radio(PORTABLE, banc.zone2).await;
+    assert!(
+        banc.la_zone_joue(banc.zone2, RADIO).await,
+        "témoin : la Zone 2 joue la radio — état : {:?}",
+        titre_en_cours(&banc.state, banc.zone2).await
+    );
+    assert!(
+        banc.la_zone_joue(banc.zone5, RADIO).await,
+        "la Chromecast, groupée avec la Zone 2, doit jouer la radio lancée sur \
+         la Zone 2 — état : {:?}, reçu : {:?}. Elle garde « Deux » : la radio \
+         ne fait pas suivre le groupe, le défaut de #7717.",
+        titre_en_cours(&banc.state, banc.zone5).await,
+        joues_par(&banc.state, CAST_ZONE5).await
+    );
+    assert_eq!(
+        banc.meneuse_enregistree(),
+        Some(banc.zone2),
+        "la zone où la radio a été lancée mène désormais le groupe"
+    );
+}
+
+/// (e) Lecture sans titre (le bouton Lecture après un arrêt) sur la zone qui
+/// suit : c'est une reprise, elle ne vaut que pour elle et ne prend pas la
+/// tête du groupe.
+#[tokio::test]
+async fn reprendre_sur_la_zone_qui_suit_ne_prend_pas_la_tete() {
+    let banc = zone2_et_chromecast().await;
+    banc.lancer(PC, banc.zone5, 2).await;
+    banc.grouper_depuis_la_fiche_de(PC, banc.zone5).await;
+    assert!(
+        banc.la_zone_joue(banc.zone2, "Deux").await,
+        "témoin : groupe aligné"
+    );
+
+    // Le corps vide du bouton Lecture : ni corps, ni type de contenu.
+    let status = banc
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/zones/{}/play", banc.zone2))
+                .header("user-agent", PORTABLE.agent)
+                .header("x-client-id", PORTABLE.id)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    assert!(status.is_success(), "reprise sur la Zone 2 : {status}");
+    assert_eq!(
+        banc.meneuse_enregistree(),
+        Some(banc.zone5),
+        "Lecture sans titre sur la zone qui suit est une reprise : la \
+         Chromecast doit rester la meneuse"
+    );
+}
+
+/// (f) Une lecture refusée (piste inconnue) sur la zone qui suit ne lance rien :
+/// la meneuse d'avant garde la tête.
+#[tokio::test]
+async fn une_lecture_refusee_rend_la_tete_a_la_meneuse_d_avant() {
+    let banc = zone2_et_chromecast().await;
+    banc.lancer(PC, banc.zone5, 2).await;
+    banc.grouper_depuis_la_fiche_de(PC, banc.zone5).await;
+
+    let (status, corps) = poster(
+        &banc.app,
+        PORTABLE,
+        &format!("/api/v1/zones/{}/play", banc.zone2),
+        json!({ "track_id": 999_999 }),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "témoin : une piste inconnue est refusée — {status} {corps}"
+    );
+    assert_eq!(
+        banc.meneuse_enregistree(),
+        Some(banc.zone5),
+        "la lecture refusée n'a rien lancé : la Chromecast doit garder la tête"
     );
 }

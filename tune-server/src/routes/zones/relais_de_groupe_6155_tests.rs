@@ -43,8 +43,9 @@ fn sans_leader_id_la_meneuse_est_la_premiere_zone() {
 fn lancer_sur_une_suiveuse_en_fait_la_meneuse_7717() {
     // Le groupe formé depuis la fiche de la Chromecast (zone 5) : elle mène.
     let mut groupes = vec![json!({ "id": 1, "leader_id": 5, "zone_ids": [5, 2] })];
-    assert!(
-        mener_les_groupes_de(&mut groupes, 2),
+    assert_eq!(
+        mener_les_groupes_de(&mut groupes, 2).len(),
+        1,
         "une lecture lancée sur la zone 2 doit en faire la meneuse du groupe"
     );
     assert_eq!(
@@ -57,7 +58,7 @@ fn lancer_sur_une_suiveuse_en_fait_la_meneuse_7717() {
         "une seule meneuse : la Chromecast ne renvoie pas la lecture"
     );
     assert!(
-        !mener_les_groupes_de(&mut groupes, 2),
+        mener_les_groupes_de(&mut groupes, 2).is_empty(),
         "déjà meneuse : rien ne change, rien n'est réécrit"
     );
 }
@@ -69,8 +70,11 @@ fn mener_ne_touche_que_les_groupes_de_la_zone_7717() {
         json!({ "id": 2, "leader_zone_id": 8, "zone_ids": [8, 9] }),
         json!({ "id": 3, "zone_ids": [4, 6] }),
     ];
-    assert!(!mener_les_groupes_de(&mut groupes, 42), "zone hors groupe");
-    assert!(mener_les_groupes_de(&mut groupes, 9));
+    assert!(
+        mener_les_groupes_de(&mut groupes, 42).is_empty(),
+        "zone hors groupe"
+    );
+    assert_eq!(mener_les_groupes_de(&mut groupes, 9).len(), 1);
     assert_eq!(groupes[1]["leader_id"], json!(9));
     assert_eq!(
         groupes[1]["leader_zone_id"],
@@ -82,9 +86,40 @@ fn mener_ne_touche_que_les_groupes_de_la_zone_7717() {
         json!(5),
         "l'autre groupe garde sa meneuse"
     );
-    assert!(mener_les_groupes_de(&mut groupes, 6));
+    assert_eq!(mener_les_groupes_de(&mut groupes, 6).len(), 1);
     assert_eq!(zones_suiveuses(&groupes, 6), vec![4]);
     assert!(groupes[2].get("leader_zone_id").is_none());
+}
+
+#[test]
+fn un_lancement_refuse_rend_la_tete_a_la_meneuse_d_avant_7717() {
+    let mut groupes = vec![
+        json!({ "id": 1, "leader_id": 5, "zone_ids": [5, 2] }),
+        json!({ "id": 2, "leader_zone_id": 8, "zone_ids": [8, 2] }),
+    ];
+    let remplacees = mener_les_groupes_de(&mut groupes, 2);
+    assert_eq!(remplacees.len(), 2);
+    assert!(rendre_les_groupes(&mut groupes, 2, &remplacees));
+    assert_eq!(zones_suiveuses(&groupes, 5), vec![2]);
+    assert_eq!(zones_suiveuses(&groupes, 8), vec![2]);
+    assert_eq!(groupes[1]["leader_zone_id"], json!(8));
+    assert!(zones_suiveuses(&groupes, 2).is_empty());
+}
+
+#[test]
+fn rendre_la_tete_ne_touche_pas_un_groupe_change_entre_temps_7717() {
+    let mut groupes = vec![json!({ "id": 1, "leader_id": 5, "zone_ids": [5, 2] })];
+    let remplacees = mener_les_groupes_de(&mut groupes, 2);
+    // Pendant le lancement, une lecture sur la zone 5 a repris la tête.
+    assert_eq!(mener_les_groupes_de(&mut groupes, 5).len(), 1);
+    assert!(
+        !rendre_les_groupes(&mut groupes, 2, &remplacees),
+        "la zone 2 ne mène plus : rien à rendre"
+    );
+    // Un groupe dissous puis reformé avec d'autres zones n'est pas touché.
+    let mut reforme = vec![json!({ "id": 1, "leader_id": 2, "zone_ids": [2, 7] })];
+    assert!(!rendre_les_groupes(&mut reforme, 2, &remplacees));
+    assert_eq!(reforme[0]["leader_id"], json!(2));
 }
 
 #[test]

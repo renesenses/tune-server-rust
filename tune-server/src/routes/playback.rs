@@ -1751,7 +1751,7 @@ pub fn router() -> Router<AppState> {
         .route("/upload", post(upload_audio_file))
         .route("/now-listening", get(now_listening))
         .route("/{id}/status", get(zone_status))
-        .route("/{id}/play", post(play))
+        .route("/{id}/play", post(play_en_tete_du_groupe))
         .route("/{id}/pause", post(pause))
         .route("/{id}/resume", post(resume))
         // #4566 — la bascule en un appel, pour les boutons physiques qui n'ont
@@ -1787,7 +1787,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/queue", get(get_queue).delete(queue_clear))
         .route("/{id}/queue/add", post(queue_add))
         .route("/{id}/queue/move", post(queue_move))
-        .route("/{id}/queue/jump", post(queue_jump))
+        .route("/{id}/queue/jump", post(queue_jump_en_tete_du_groupe))
         .route("/{id}/queue/clear", post(queue_clear))
         .route(
             "/{id}/queue/{position}",
@@ -1796,7 +1796,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/queue/save-as-playlist", post(save_queue_as_playlist))
         .route(
             "/{id}/radio/artist",
-            post(radio_artiste::lancer_radio_artiste),
+            post(radio_artiste::lancer_radio_artiste_en_tete_du_groupe),
         )
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
         .route("/{id}/eq", get(get_eq).post(set_eq))
@@ -1812,7 +1812,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/{id}/pins", get(get_zone_pins).post(set_zone_pin))
         .route("/{id}/pins/{index}", axum::routing::delete(clear_zone_pin))
-        .route("/{id}/pins/{index}/invoke", post(invoke_zone_pin))
+        .route(
+            "/{id}/pins/{index}/invoke",
+            post(invoke_zone_pin_en_tete_du_groupe),
+        )
         .route("/{id}/pins/from-queue", post(save_queue_as_pin))
         .route("/{id}/audiophile", get(get_audiophile).post(set_audiophile))
         .route("/{id}/quality", get(get_quality).post(set_quality))
@@ -2405,6 +2408,30 @@ fn reprise_applicable(
     meme_piste.then_some(position)
 }
 
+/// #7717 — `POST /zones/{id}/play` : une lecture lancée sur une zone d'un
+/// groupe, depuis n'importe quel client, fait de cette zone la meneuse, et le
+/// relais y fait suivre les autres zones. Le corps vide (Lecture après Arrêt)
+/// reprend ce que la zone jouait : une reprise sur une suiveuse ne vaut que
+/// pour elle, elle ne prend pas la tête.
+async fn play_en_tete_du_groupe(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<PlayRequest>>,
+) -> axum::response::Response {
+    if body.is_none() {
+        return play(State(state), profile, Path(zone_id), headers, None)
+            .await
+            .into_response();
+    }
+    let lancement = play(State(state.clone()), profile, Path(zone_id), headers, body);
+    crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
+        &state, zone_id, lancement,
+    )
+    .await
+}
+
 async fn play(
     State(state): State<AppState>,
     profile: ActiveProfile,
@@ -2437,10 +2464,6 @@ async fn play(
         .playback
         .set_session_profile(zone_id, Some(profile.id()))
         .await;
-    // #7717 — lancée sur une zone d'un groupe, depuis n'importe quel client,
-    // la lecture fait de cette zone la meneuse : le relais y fait suivre les
-    // autres zones du groupe.
-    crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe(&state, zone_id);
     // #2264 — un choix fait dans « Autres versions » prime sur la règle de
     // version : épinglé pour la lecture qui suit, qu'elle passe par la file
     // ou non. Une liste ou un conteneur n'est pas un choix de version.
@@ -5734,6 +5757,20 @@ async fn queue_move(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// #7717 — un saut dans la file est un lancement : comme `play`.
+async fn queue_jump_en_tete_du_groupe(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    body: Json<QueueJumpRequest>,
+) -> axum::response::Response {
+    let lancement = queue_jump(State(state.clone()), Path(zone_id), headers, body);
+    crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
+        &state, zone_id, lancement,
+    )
+    .await
+}
+
 async fn queue_jump(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
@@ -5746,8 +5783,6 @@ async fn queue_jump(
     if let Err(refus) = refuser_un_entier_negatif("position", body.position) {
         return refus;
     }
-    // #7717 — un saut dans la file est un lancement : comme `play`.
-    crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe(&state, zone_id);
     match state
         .orchestrator
         .play_from_queue(zone_id, body.position)
@@ -7146,6 +7181,19 @@ async fn clear_zone_pin(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// #7717 — un préréglage épinglé lancé sur la zone est un lancement.
+async fn invoke_zone_pin_en_tete_du_groupe(
+    State(state): State<AppState>,
+    Path((zone_id, index)): Path<(i64, usize)>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let lancement = invoke_zone_pin(State(state.clone()), Path((zone_id, index)), headers);
+    crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
+        &state, zone_id, lancement,
+    )
+    .await
+}
+
 async fn invoke_zone_pin(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
@@ -7687,7 +7735,22 @@ fn reponse_shuffle(
     payload
 }
 
+/// #7717 — la lecture aléatoire lancée sur une zone est un lancement.
 pub async fn shuffle_all(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Query(q): Query<ShuffleAllQuery>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let zone_id = q.zone_id.unwrap_or(1);
+    let lancement = shuffle_all_sans_groupe(State(state.clone()), profile, Query(q), headers);
+    crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
+        &state, zone_id, lancement,
+    )
+    .await
+}
+
+async fn shuffle_all_sans_groupe(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Query(q): Query<ShuffleAllQuery>,
