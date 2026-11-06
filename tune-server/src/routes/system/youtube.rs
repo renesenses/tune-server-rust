@@ -14,10 +14,22 @@ const STATUS_KEY: &str = "ytdlp_download_status";
 const VERSION_KEY: &str = tune_core::ytdlp::CLE_VERSION;
 
 /// GET /system/youtube/status — is YouTube playback enabled (yt-dlp present)?
+///
+/// #6967 — dit aussi la dernière version publiée de yt-dlp (`latest_version`)
+/// et si l'installée est à jour (`up_to_date` : `true`, `false`, ou `null`
+/// quand l'une des deux n'est pas connue ; `latest_error` dit pourquoi).
 pub(super) async fn youtube_status(State(state): State<AppState>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let installed = tune_core::ytdlp::binary().is_some();
-    let version = settings.get(VERSION_KEY).ok().flatten();
+    let binaire = tune_core::ytdlp::binary();
+    let installed = binaire.is_some();
+    let mut version = settings.get(VERSION_KEY).ok().flatten();
+    // Un yt-dlp du PATH ou choisi par l'utilisateur n'écrit pas le réglage :
+    // sa version se demande au binaire.
+    if version.is_none()
+        && let Some(chemin) = binaire.as_deref()
+    {
+        version = tune_core::ytdlp::version_of(chemin).await;
+    }
     let status = settings.get(STATUS_KEY).ok().flatten().unwrap_or_else(|| {
         if installed {
             "ready".into()
@@ -25,10 +37,18 @@ pub(super) async fn youtube_status(State(state): State<AppState>) -> Json<Value>
             "absent".into()
         }
     });
+    let derniere = tune_core::ytdlp::derniere_version_publiee().await;
+    let etat = tune_core::ytdlp::etat_de_version(
+        version.as_deref().filter(|_| installed),
+        derniere.as_deref().map_err(String::as_str),
+    );
     Json(json!({
         "installed": installed,
         "version": version,
         "status": status,
+        "latest_version": etat.publiee,
+        "up_to_date": etat.a_jour,
+        "latest_error": etat.erreur,
     }))
 }
 
