@@ -1419,8 +1419,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         );
 
         // Import any playlist files (.m3u/.m3u8/.pls) found in the library as
-        // local playlists — same as the manual scan (Bertrand). Idempotent by
-        // playlist name, so the startup scan re-running never duplicates them.
+        // local playlists — same as the manual scan (Bertrand). A file already
+        // imported and unchanged is skipped, even if its playlist was deleted
+        // (#7723), so the startup scan re-running never brings it back.
         let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &music_dirs);
         if pl.playlists_created > 0 {
             event_bus.emit(

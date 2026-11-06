@@ -158,6 +158,10 @@ pub struct AirplayOutput {
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
     volume: Arc<Mutex<f64>>,
+    /// Fil 2553 — une consigne reçue hors session RTSP (zone arrêtée, entre
+    /// deux pistes) : AirPlay 1 n'a aucun canal pour la porter, elle part
+    /// au début de la session suivante, une fois, puis s'efface.
+    volume_en_attente: Arc<Mutex<Option<f64>>>,
     muted: Arc<AtomicBool>,
     current_title: Arc<Mutex<Option<String>>>,
     current_artist: Arc<Mutex<Option<String>>>,
@@ -171,6 +175,9 @@ pub struct AirplayOutput {
     /// / `sf` du mDNS) alors qu'il est servi par ce chemin AirPlay 1 (RAOP),
     /// qui ne fait aucun appairage. Sert à dire la vraie cause d'un 403.
     appairage_airplay2_requis: bool,
+    /// #7084 — l'appareil est servi ici parce que le composant AirPlay 2
+    /// (`airplay-daemon`) manque. Un 403 dit alors ce composant manquant.
+    composant_airplay2_manquant: bool,
 }
 
 struct RtspSession {
@@ -268,6 +275,7 @@ impl AirplayOutput {
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
             volume: Arc::new(Mutex::new(1.0)),
+            volume_en_attente: Arc::new(Mutex::new(None)),
             muted: Arc::new(AtomicBool::new(false)),
             current_title: Arc::new(Mutex::new(None)),
             current_artist: Arc::new(Mutex::new(None)),
@@ -278,6 +286,7 @@ impl AirplayOutput {
             echec: Arc::new(std::sync::Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
             appairage_airplay2_requis: false,
+            composant_airplay2_manquant: false,
         }
     }
 
@@ -287,6 +296,49 @@ impl AirplayOutput {
     pub fn avec_appairage_airplay2_requis(mut self, requis: bool) -> Self {
         self.appairage_airplay2_requis = requis;
         self
+    }
+
+    /// #7084 — déclare que l'appareil, AirPlay 2, est servi par ce chemin
+    /// AirPlay 1 faute de composant AirPlay 2 : son 403 le dit.
+    pub fn avec_composant_airplay2_manquant(mut self, manquant: bool) -> Self {
+        self.composant_airplay2_manquant = manquant;
+        self
+    }
+
+    /// Ce qu'un 403 au ANNOUNCE ou au SETUP veut dire pour cet appareil.
+    fn refus_airplay2(&self) -> RefusAirplay2 {
+        if self.composant_airplay2_manquant {
+            RefusAirplay2::ComposantManquant
+        } else if self.appairage_airplay2_requis {
+            RefusAirplay2::AppairageRequis
+        } else {
+            RefusAirplay2::Ordinaire
+        }
+    }
+}
+
+/// La cause d'un 403 d'un appareil servi par le chemin AirPlay 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefusAirplay2 {
+    /// Rien n'indique AirPlay 2 : les messages ordinaires du 403.
+    Ordinaire,
+    /// L'appareil exige l'appairage AirPlay 2.
+    AppairageRequis,
+    /// #7084 — idem, et le composant AirPlay 2 est absent de l'installation.
+    ComposantManquant,
+}
+
+impl RefusAirplay2 {
+    /// Le message d'un 403 à `etape`, ou `None` pour les messages ordinaires.
+    fn message_403(self, etape: &str) -> Option<String> {
+        match self {
+            RefusAirplay2::Ordinaire => None,
+            RefusAirplay2::AppairageRequis => Some(pairing_required_message(etape)),
+            RefusAirplay2::ComposantManquant => Some(format!(
+                "{} (refused by the device at {etape}, 403)",
+                crate::outputs::airplay2::composant_manquant_7084::message_composant_manquant()
+            )),
+        }
     }
 }
 
@@ -472,7 +524,7 @@ impl RtspSession {
         Ok((status_code, resp_headers, body_str))
     }
 
-    async fn announce(&mut self, appairage_requis: bool) -> Result<(), String> {
+    async fn announce(&mut self, refus: RefusAirplay2) -> Result<(), String> {
         let sdp = self.identite.sdp_announce();
         let uri = self.identite.uri();
 
@@ -485,8 +537,10 @@ impl RtspSession {
             )
             .await?;
 
-        if code == 403 && appairage_requis {
-            return Err(pairing_required_message("ANNOUNCE"));
+        if code == 403
+            && let Some(message) = refus.message_403("ANNOUNCE")
+        {
+            return Err(message);
         }
         if code != 200 {
             return Err(announce_failure_message(code));
@@ -498,7 +552,7 @@ impl RtspSession {
         &mut self,
         control_port: u16,
         timing_port: u16,
-        appairage_requis: bool,
+        refus: RefusAirplay2,
     ) -> Result<(), String> {
         let transport = format!(
             "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port={};timing_port={}",
@@ -510,8 +564,10 @@ impl RtspSession {
             .send_request("SETUP", &uri, &[("Transport", &transport)], None)
             .await?;
 
-        if code == 403 && appairage_requis {
-            return Err(pairing_required_message("SETUP"));
+        if code == 403
+            && let Some(message) = refus.message_403("SETUP")
+        {
+            return Err(message);
         }
         if code != 200 {
             return Err(setup_failure_message(code));
@@ -654,6 +710,30 @@ fn setup_failure_message(code: u32) -> String {
     format!("AirPlay SETUP failed: {code}")
 }
 
+impl AirplayOutput {
+    /// Fil 2553 — envoie, juste après RECORD, la consigne restée sans
+    /// session. Un refus ne fait pas échouer la lecture : il est dit, et la
+    /// consigne est rendue à l'attente pour le prochain geste ou la
+    /// prochaine session.
+    async fn appliquer_le_volume_en_attente(&self, session: &mut RtspSession) {
+        let Some(volume) = self.volume_en_attente.lock().await.take() else {
+            return;
+        };
+        let db = if self.muted.load(Ordering::SeqCst) {
+            -144.0
+        } else {
+            linear_to_airplay_db(volume)
+        };
+        match session.set_volume_rtsp(db).await {
+            Ok(()) => info!(device = %self.name, volume, db, "airplay_volume_en_attente_applique"),
+            Err(error) => {
+                warn!(device = %self.name, volume, error = %error, "airplay_volume_en_attente_refuse");
+                self.volume_en_attente.lock().await.get_or_insert(volume);
+            }
+        }
+    }
+}
+
 fn linear_to_airplay_db(volume: f64) -> f64 {
     if volume <= 0.0 {
         -144.0
@@ -792,7 +872,7 @@ impl OutputTarget for AirplayOutput {
         let (control_port, timing_port) = auxiliary.ports();
         session.auxiliary_udp = Some(auxiliary);
 
-        if let Err(reason) = session.announce(self.appairage_airplay2_requis).await {
+        if let Err(reason) = session.announce(self.refus_airplay2()).await {
             if let Some(auxiliary) = session.auxiliary_udp.take() {
                 auxiliary.close().await;
             }
@@ -809,7 +889,7 @@ impl OutputTarget for AirplayOutput {
         // de session est independant de la connexion) : c'est donc NOUS qui
         // fabriquions l'« appareil occupe » de la tentative suivante (#2217).
         if let Err(raison) = session
-            .setup(control_port, timing_port, self.appairage_airplay2_requis)
+            .setup(control_port, timing_port, self.refus_airplay2())
             .await
         {
             self.rendre_session_annoncee(&mut session, "SETUP", &raison)
@@ -822,6 +902,8 @@ impl OutputTarget for AirplayOutput {
                 .await;
             return Err(raison);
         }
+
+        self.appliquer_le_volume_en_attente(&mut session).await;
 
         let server_port = session.server_port;
         let target_addr = format!("{}:{}", self.host, server_port);
@@ -941,12 +1023,22 @@ impl OutputTarget for AirplayOutput {
         let volume = volume.clamp(0.0, 1.0);
         let db = linear_to_airplay_db(volume);
         let mut session = self.rtsp_session.lock().await;
-        session
-            .as_mut()
-            .ok_or("AirPlay volume requires an active RTSP session")?
-            .set_volume_rtsp(db)
-            .await?;
-        drop(session);
+        let Some(session) = session.as_mut() else {
+            // Fil 2553 (Zeppelin Air, rc9) : la consigne donnée zone arrêtée
+            // était refusée (« requires an active RTSP session ») et PERDUE.
+            // La lecture suivante partait au niveau propre de l'enceinte
+            // pendant que Tune affichait la consigne. Elle attend désormais
+            // la session suivante, qui l'envoie après RECORD. Seule une
+            // consigne explicite attend : rien n'est réaffirmé à chaque
+            // piste (#2395).
+            *self.volume_en_attente.lock().await = Some(volume);
+            *self.volume.lock().await = volume;
+            self.muted.store(false, Ordering::SeqCst);
+            info!(device = %self.name, volume, "airplay_volume_en_attente_de_session");
+            return Ok(());
+        };
+        session.set_volume_rtsp(db).await?;
+        *self.volume_en_attente.lock().await = None;
         *self.volume.lock().await = volume;
         self.muted.store(false, Ordering::SeqCst);
         Ok(())
@@ -1638,6 +1730,48 @@ mod tests {
         assert_eq!(methodes, vec!["ANNOUNCE"]);
     }
 
+    /// #7084 — Devialet Mania sous Windows, `airplay-daemon.exe` retiré par
+    /// l'antivirus : l'enceinte AirPlay 2 est servie par ce chemin AirPlay 1
+    /// et refuse l'ANNOUNCE par 403. L'erreur doit dire le composant AirPlay 2
+    /// manquant, pas l'appairage HomeKit. La contre-épreuve est le témoin
+    /// voisin `un_announce_refuse_par_une_enceinte_airplay2_dit_l_appairage_manquant`
+    /// (même dialogue, composant présent).
+    #[tokio::test]
+    async fn un_refus_sans_composant_airplay2_dit_le_composant_manquant_7084() {
+        use crate::outputs::airplay2::composant_manquant_7084::CODE_AIRPLAY2_COMPONENT_MISSING;
+        for etape in ["ANNOUNCE", "SETUP"] {
+            let (port, recepteur) = faux_recepteur(vec![(etape, "403 Forbidden")]).await;
+            let sortie = AirplayOutput::new(
+                "Mania 7084".into(),
+                format!("airplay-127.0.0.1-{port}"),
+                "127.0.0.1".into(),
+                port,
+            )
+            .avec_appairage_airplay2_requis(true)
+            .avec_composant_airplay2_manquant(true);
+            let erreur = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sortie.play_media(&PlayMedia {
+                    url: "file:///dev/null",
+                    mime_type: "audio/wav",
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("play_media ne doit pas rester suspendu")
+            .expect_err("le recepteur a refuse : play_media doit rendre Err");
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), recepteur).await;
+
+            assert!(
+                erreur.starts_with(CODE_AIRPLAY2_COMPONENT_MISSING),
+                "le refus doit dire le composant AirPlay 2 manquant (#7084), obtenu : {erreur}"
+            );
+            assert!(erreur.contains("AirPlay 2 component missing"), "{erreur}");
+            assert!(erreur.contains(&format!("{etape}, 403")), "{erreur}");
+            assert!(!erreur.contains("HomeKit"), "obtenu : {erreur}");
+        }
+    }
+
     #[tokio::test]
     async fn un_setup_refuse_rend_la_session_ouverte_par_l_announce() {
         let (erreur, methodes) = dialogue_airplay(vec![("SETUP", "403 Forbidden")]).await;
@@ -2101,3 +2235,7 @@ mod identite_tests_6885;
 #[cfg(test)]
 #[path = "airplay_fermeture_tests_7259.rs"]
 mod fermeture_tests_7259;
+
+#[cfg(test)]
+#[path = "airplay_volume_hors_session_tests_2553.rs"]
+mod volume_hors_session_tests_2553;

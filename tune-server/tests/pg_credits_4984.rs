@@ -32,6 +32,7 @@ use tower::ServiceExt;
 use tune_core::db::backend::{SqlValue, ToSqlValue};
 use tune_core::metadata::credits_mb::LigneCredit;
 use tune_core::metadata::credits_release::ecrire_credits_piste;
+use tune_core::metadata::source_des_credits::MUSICBRAINZ;
 use tune_server::state::AppState;
 
 /// Suffixe propre à cette épreuve : les tables sont partagées avec les autres
@@ -126,7 +127,7 @@ async fn pg_4984_les_credits_s_ecrivent_se_purgent_et_se_relisent() {
 
     // Deux écritures des MÊMES lignes : sans purge, la seconde doublerait.
     for passe in 1..=2 {
-        let ecrites = ecrire_credits_piste(&b, track_id, &lignes(MARQUE));
+        let ecrites = ecrire_credits_piste(&b, track_id, MUSICBRAINZ, &lignes(MARQUE));
         assert_eq!(
             ecrites, 2,
             "passe {passe} : ecrire_credits_piste n'a écrit que {ecrites} crédit(s) sur 2 — \
