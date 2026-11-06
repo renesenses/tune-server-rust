@@ -1935,6 +1935,9 @@ pub use confirmation_navigateur_6066::SignalDuLecteur;
 /// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
 mod reenumeration_avant_refus;
 mod transport;
+pub use transport::IssueDePause;
+#[cfg(test)]
+mod pause_sans_media_7894_tests;
 // #2269 — le repli silencieux de la sortie locale, rendu audible.
 #[cfg(feature = "local-audio")]
 mod repli_de_peripherique;

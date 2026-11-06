@@ -48,6 +48,12 @@ pub struct MockOutput {
     /// en pause laisse l'appareil EN PAUSE — contrat UPnP. Armé, `seek`
     /// repasse l'état à `Paused`.
     seek_laisse_en_pause: Arc<AtomicBool>,
+    /// #7894 — armé, l'appareil n'a aucun média (`NO_MEDIA_PRESENT`) : la
+    /// pause n'a rien à suspendre, et la sortie le signale par
+    /// `take_nothing_playing_on_pause()`.
+    sans_media: Arc<AtomicBool>,
+    /// #7894 — posé par une pause reçue sans média ; lu une fois.
+    rien_ne_jouait: Arc<AtomicBool>,
     /// Chaque `resume` reçu, pour compter les relances.
     resume_calls: Arc<AtomicU64>,
     /// Le contrat de signal que la sortie PUBLIE (#4559).
@@ -125,6 +131,8 @@ impl MockOutput {
             set_next_calls: Arc::new(Mutex::new(Vec::new())),
             volume_calls: Arc::new(Mutex::new(Vec::new())),
             seek_laisse_en_pause: Arc::new(AtomicBool::new(false)),
+            sans_media: Arc::new(AtomicBool::new(false)),
+            rien_ne_jouait: Arc::new(AtomicBool::new(false)),
             resume_calls: Arc::new(AtomicU64::new(0)),
             signal_path: Arc::new(std::sync::Mutex::new(None)),
             suivante_preparee: Arc::new(std::sync::Mutex::new(SuivantePreparee::Inconnue)),
@@ -232,6 +240,12 @@ impl MockOutput {
     /// Reproduit un renderer qui reste en pause après un Seek (Devialet).
     pub fn with_seek_qui_laisse_en_pause(self) -> Self {
         self.seek_laisse_en_pause.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// #7894 — un renderer sans média, qui ne joue rien.
+    pub fn with_sans_media(self) -> Self {
+        self.sans_media.store(true, Ordering::Relaxed);
         self
     }
 
@@ -462,8 +476,17 @@ impl OutputTarget for MockOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
+        if self.sans_media.load(Ordering::Relaxed) {
+            *self.state.lock().await = TransportState::Stopped;
+            self.rien_ne_jouait.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         *self.state.lock().await = TransportState::Paused;
         Ok(())
+    }
+
+    fn take_nothing_playing_on_pause(&self) -> bool {
+        self.rien_ne_jouait.swap(false, Ordering::Relaxed)
     }
 
     async fn resume(&self) -> Result<(), String> {
