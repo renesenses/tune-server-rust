@@ -93,6 +93,8 @@ mod tests {
             child: None,
             stdin: Box::new(server_stdin),
         });
+        // Un daemon de banc deja relie au recepteur (#7441).
+        *sortie.pairing.lock().await = crate::outputs::airplay2::PairingPhase::Connected;
         sortie.start_event_reader(BufReader::new(server_stdout));
 
         let recues = Arc::new(Mutex::new(Vec::new()));
@@ -150,7 +152,9 @@ mod tests {
         })
         .await;
 
-        sortie.play_media(&piste()).await.unwrap();
+        sortie.play_media(&piste()).await.expect_err(
+            "#7441 : un setup échoué fait échouer le play, il ne se déguise plus en lecture",
+        );
         assert_eq!(
             etat_apres_le_play(&sortie).await,
             TransportState::Stopped,
@@ -219,7 +223,9 @@ mod tests {
         })
         .await;
 
-        sortie.play_media(&piste()).await.unwrap();
+        sortie.play_media(&piste()).await.expect_err(
+            "#7441 : un setup échoué fait échouer le play, il ne se déguise plus en lecture",
+        );
         assert_eq!(etat_apres_le_play(&sortie).await, TransportState::Stopped);
         assert!(sortie.pause().await.is_err());
 
