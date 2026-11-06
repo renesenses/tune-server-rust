@@ -33,6 +33,9 @@ pub struct OpenHomeOutput {
     /// retire : sinon le renderer les enchaîne seul après les pistes qu'un
     /// autre point de contrôle (Kazoo) a insérées dans la même liste.
     pending_next_oh_ids: tokio::sync::Mutex<Vec<u32>>,
+    /// #7841 — l'échelle de volume du renderer, partagée avec son
+    /// [`EnvoiDeVolume`] (voir [`EnvoiDeVolume::echelle`]).
+    echelle_de_volume: Arc<tokio::sync::OnceCell<Option<EchelleDeVolume>>>,
 }
 
 impl OpenHomeOutput {
@@ -70,6 +73,7 @@ impl OpenHomeOutput {
                 .unwrap_or_default(),
             current_oh_id: tokio::sync::Mutex::new(None),
             pending_next_oh_ids: tokio::sync::Mutex::new(Vec::new()),
+            echelle_de_volume: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -118,6 +122,7 @@ impl OpenHomeOutput {
             url: self.svc_url("volume")?.clone(),
             client: self.client.clone(),
             event_state: self.event_state.clone(),
+            echelle: self.echelle_de_volume.clone(),
         })
     }
 
@@ -564,23 +569,10 @@ impl OutputTarget for OpenHomeOutput {
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
-        let val = if muted { "1" } else { "0" };
-        if let Some(url) = self.svc_url("volume") {
-            // #7633 — une faute SOAP n'est pas une réussite.
-            commande_soap(
-                &self.client,
-                &self.name,
-                url,
-                SVC_VOLUME,
-                "SetMute",
-                &[("Value", val)],
-            )
-            .await?;
-            self.event_state.lock().await.muted = Some(muted);
-        } else {
-            return Err("mute not supported by this OpenHome renderer".into());
-        }
-        Ok(())
+        self.envoi_de_volume()
+            .ok_or_else(|| "mute not supported by this OpenHome renderer".to_string())?
+            .set_mute(muted)
+            .await
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
@@ -588,7 +580,7 @@ impl OutputTarget for OpenHomeOutput {
         let es = self.event_state.lock().await;
         let eventing = es.is_fresh();
         let cached_state = es.transport_state;
-        let cached_volume = es.volume.map(|v| v as f64 / 100.0);
+        let cached_level = es.volume;
         let cached_muted = es.muted;
         let cached_uri = es.track_uri.clone();
         drop(es);
@@ -618,15 +610,21 @@ impl OutputTarget for OpenHomeOutput {
             (0, 0)
         };
 
-        let volume = if let Some(v) = cached_volume.filter(|_| eventing) {
-            v
-        } else if let Some(url) = self.svc_url("volume") {
-            let response = self.soap_call(url, SVC_VOLUME, "Volume", &[]).await?;
-            extract_tag(&response, "Value")
-                .ok_or("OpenHome Volume response has no Value")?
-                .parse::<f64>()
-                .map(|v| v / 100.0)
-                .map_err(|e| format!("invalid OpenHome Volume value: {e}"))?
+        // #7841 — le niveau du renderer se lit sur SON échelle : un niveau
+        // 15 d'un appareil à `VolumeMax` 50 vaut 30 %, pas 15 %.
+        let volume = if let Some(envoi) = self.envoi_de_volume() {
+            let level = if let Some(v) = cached_level.filter(|_| eventing) {
+                v
+            } else {
+                let response = self
+                    .soap_call(&envoi.url, SVC_VOLUME, "Volume", &[])
+                    .await?;
+                extract_tag(&response, "Value")
+                    .ok_or("OpenHome Volume response has no Value")?
+                    .parse::<u32>()
+                    .map_err(|e| format!("invalid OpenHome Volume value: {e}"))?
+            };
+            envoi.echelle().await.depuis_niveau(level)
         } else {
             0.5
         };
@@ -721,6 +719,73 @@ impl OutputTarget for OpenHomeOutput {
     }
 }
 
+/// #7841 — l'échelle de volume que publie un renderer OpenHome (action
+/// `Characteristics` du service `Volume:1`).
+///
+/// `VolumeMax` est le niveau le plus haut que `SetVolume` accepte ; il n'est
+/// PAS toujours 100. `VolumeUnity` est le niveau du gain unité (0 dB), et
+/// `VolumeMilliDbPerStep` l'écart d'un cran en millièmes de dB : à eux deux,
+/// ils disent ce qu'un niveau vaut en dB, ce que le rapport doit montrer pour
+/// trancher un « plus de son à 30 ».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EchelleDeVolume {
+    pub volume_max: u32,
+    pub volume_unity: u32,
+    pub volume_steps: u32,
+    pub volume_milli_db_per_step: u32,
+}
+
+impl EchelleDeVolume {
+    /// L'échelle supposée quand le renderer n'en publie aucune : 0..100,
+    /// le comportement d'avant #7841.
+    pub const PAR_DEFAUT: Self = Self {
+        volume_max: 100,
+        volume_unity: 100,
+        volume_steps: 100,
+        volume_milli_db_per_step: 0,
+    };
+
+    /// Lit la réponse SOAP de `Characteristics`. `None` si `VolumeMax` manque,
+    /// est illisible ou vaut 0 : une échelle nulle couperait le son.
+    pub fn depuis_reponse(reponse: &str) -> Option<Self> {
+        let lire = |balise: &str| extract_tag(reponse, balise).and_then(|v| v.parse::<u32>().ok());
+        let volume_max = lire("VolumeMax").filter(|m| *m > 0)?;
+        Some(Self {
+            volume_max,
+            volume_unity: lire("VolumeUnity").unwrap_or(volume_max),
+            volume_steps: lire("VolumeSteps").unwrap_or(volume_max),
+            volume_milli_db_per_step: lire("VolumeMilliDbPerStep").unwrap_or(0),
+        })
+    }
+
+    /// Le niveau de l'appareil pour une consigne 0..1 de Tune :
+    /// `round(volume × VolumeMax)`, borné à `0..VolumeMax`. Proportionnel :
+    /// jamais au-dessus de ce que la consigne demande sur l'échelle.
+    pub fn vers_niveau(&self, volume: f64) -> u32 {
+        let volume = if volume.is_finite() { volume } else { 0.0 };
+        let max = f64::from(self.volume_max);
+        (volume.clamp(0.0, 1.0) * max).round().clamp(0.0, max) as u32
+    }
+
+    /// La consigne 0..1 de Tune pour un niveau de l'appareil.
+    pub fn depuis_niveau(&self, niveau: u32) -> f64 {
+        (f64::from(niveau) / f64::from(self.volume_max.max(1))).clamp(0.0, 1.0)
+    }
+
+    /// L'écart en dB d'un niveau au gain unité, quand l'appareil publie le
+    /// pas en dB ; `None` sinon.
+    pub fn ecart_au_gain_unite_db(&self, niveau: u32) -> Option<f64> {
+        if self.volume_milli_db_per_step == 0 {
+            return None;
+        }
+        Some(
+            (f64::from(niveau) - f64::from(self.volume_unity))
+                * f64::from(self.volume_milli_db_per_step)
+                / 1000.0,
+        )
+    }
+}
+
 /// #7633 — l'envoi du volume d'un renderer OpenHome, détaché de
 /// l'[`OpenHomeOutput`] : l'orchestrateur le garde à part (registre des
 /// sorties) et l'appelle sans prendre le verrou de la sortie, que le sondeur
@@ -732,15 +797,79 @@ pub struct EnvoiDeVolume {
     url: String,
     client: Client,
     event_state: Arc<tokio::sync::Mutex<EventState>>,
+    /// #7841 — partagée avec l'[`OpenHomeOutput`] : lue une fois, au premier
+    /// besoin de l'un ou de l'autre. `None` dedans : le renderer n'en publie
+    /// pas (faute SOAP, réponse illisible), et l'échelle 0..100 s'applique.
+    echelle: Arc<tokio::sync::OnceCell<Option<EchelleDeVolume>>>,
 }
 
 impl EnvoiDeVolume {
-    /// `SetVolume round(volume × 100)`. La valeur n'est retenue en mémoire
-    /// que si le renderer l'a acceptée : une faute SOAP (statut HTTP d'erreur
-    /// ou `<s:Fault>`) est une erreur, et l'orchestrateur rétablit alors la
+    /// #7841 — l'échelle de volume du renderer, lue par `Characteristics` au
+    /// premier appel et retenue ensuite. Un échec de connexion n'est pas
+    /// retenu : l'appel suivant relit. En attendant, 0..100.
+    pub async fn echelle(&self) -> EchelleDeVolume {
+        let lue = self
+            .echelle
+            .get_or_try_init(|| async {
+                let (status, reponse) = appel_soap(
+                    &self.client,
+                    &self.name,
+                    &self.url,
+                    SVC_VOLUME,
+                    "Characteristics",
+                    &[],
+                )
+                .await?;
+                let echelle = match refus_soap(status, &reponse) {
+                    Some(refus) => {
+                        warn!(device = %self.name, error = %refus, "oh_volume_characteristics_absentes");
+                        None
+                    }
+                    None => EchelleDeVolume::depuis_reponse(&reponse),
+                };
+                match echelle {
+                    Some(e) => info!(
+                        device = %self.name,
+                        volume_max = e.volume_max,
+                        volume_unity = e.volume_unity,
+                        volume_steps = e.volume_steps,
+                        volume_milli_db_per_step = e.volume_milli_db_per_step,
+                        "oh_volume_characteristics"
+                    ),
+                    None => warn!(
+                        device = %self.name,
+                        volume_max = 100,
+                        "oh_volume_characteristics_illisibles_echelle_0_100"
+                    ),
+                }
+                Ok::<_, String>(echelle)
+            })
+            .await;
+        match lue {
+            Ok(echelle) => echelle.unwrap_or(EchelleDeVolume::PAR_DEFAUT),
+            Err(e) => {
+                warn!(device = %self.name, error = %e, "oh_volume_characteristics_echec");
+                EchelleDeVolume::PAR_DEFAUT
+            }
+        }
+    }
+
+    /// `SetVolume round(volume × VolumeMax)`, sur l'échelle que publie le
+    /// renderer (#7841). La valeur n'est retenue en mémoire que si le
+    /// renderer l'a acceptée : une faute SOAP (statut HTTP d'erreur ou
+    /// `<s:Fault>`) est une erreur, et l'orchestrateur rétablit alors la
     /// dernière valeur acceptée.
     pub async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        let level = (volume * 100.0).round().clamp(0.0, 100.0) as u32;
+        let echelle = self.echelle().await;
+        let level = echelle.vers_niveau(volume);
+        info!(
+            device = %self.name,
+            volume,
+            level,
+            volume_max = echelle.volume_max,
+            db_relative_to_unity = echelle.ecart_au_gain_unite_db(level),
+            "oh_set_volume"
+        );
         commande_soap(
             &self.client,
             &self.name,
@@ -750,7 +879,25 @@ impl EnvoiDeVolume {
             &[("Value", &level.to_string())],
         )
         .await?;
-        self.event_state.lock().await.volume = Some(level);
+        self.event_state.lock().await.noter_consigne_volume(level);
+        Ok(())
+    }
+
+    /// #7841 — `SetMute`, sans le verrou de la sortie, comme `SetVolume`
+    /// depuis #7633 : la sourdine attendait elle aussi la fin des relevés du
+    /// sondeur. Une faute SOAP est une erreur.
+    pub async fn set_mute(&self, muted: bool) -> Result<(), String> {
+        let val = if muted { "1" } else { "0" };
+        commande_soap(
+            &self.client,
+            &self.name,
+            &self.url,
+            SVC_VOLUME,
+            "SetMute",
+            &[("Value", val)],
+        )
+        .await?;
+        self.event_state.lock().await.muted = Some(muted);
         Ok(())
     }
 }

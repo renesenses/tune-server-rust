@@ -385,6 +385,12 @@ pub struct ZoneState {
     /// the slider from bouncing back on slow DLNA renderers.
     #[serde(skip)]
     pub last_volume_set_at: Option<Instant>,
+    /// #8031 — instant du dernier changement de sourdine (posée ou levée).
+    /// Le sondeur n'adopte aucun volume relu sur l'appareil pendant la
+    /// sourdine ni juste après : l'appareil peut alors remonter 0 ou une
+    /// valeur transitoire, qui remplaçait la consigne de la zone.
+    #[serde(skip)]
+    pub last_mute_set_at: Option<Instant>,
     /// #6912 — observation distincte de la consigne, absente sans annonce fraîche.
     #[serde(default)]
     pub device_volume_observation: Option<ObservationVolumeAppareil>,
@@ -644,6 +650,7 @@ impl Default for ZoneState {
             paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
+            last_mute_set_at: None,
             device_volume_observation: None,
             last_restart_at: None,
             last_play_started_at: None,
@@ -2050,16 +2057,41 @@ impl PlaybackManager {
         }
     }
 
-    pub async fn set_mute(&self, zone_id: i64, muted: bool) {
+    /// Bancs seulement (#8031) : la grâce qui suit un changement de sourdine
+    /// est écoulée.
+    #[cfg(test)]
+    pub async fn ecouler_la_grace_de_sourdine(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
-            state.muted = muted;
+            state.last_mute_set_at = None;
         }
+    }
+
+    pub async fn set_mute(&self, zone_id: i64, muted: bool) {
+        let volume = {
+            let mut zones = self.zones.lock().await;
+            zones.get_mut(&zone_id).map(|state| {
+                state.muted = muted;
+                state.last_mute_set_at = Some(Instant::now());
+                state.volume
+            })
+        };
         self.emit(PlaybackEvent {
             event: "muted".into(),
             zone_id,
             data: serde_json::json!({ "muted": muted }),
         });
+        // #8031 — à la levée, le volume de la zone est repoussé à tous les
+        // clients : un curseur qui aurait reçu entre-temps une valeur
+        // transitoire revient au volume d'avant la sourdine. Ce n'est qu'un
+        // évènement : aucune commande ne part vers l'appareil.
+        if !muted && let Some(volume) = volume {
+            self.emit(PlaybackEvent {
+                event: "volume".into(),
+                zone_id,
+                data: serde_json::json!({ "volume": volume }),
+            });
+        }
     }
 
     /// `entry` pour la même raison que [`Self::update_queue_info`] : les trois
@@ -2553,6 +2585,7 @@ mod tests {
             paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
+            last_mute_set_at: None,
             device_volume_observation: None,
             last_restart_at: None,
             last_play_started_at: None,
