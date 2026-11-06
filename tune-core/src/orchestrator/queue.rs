@@ -740,6 +740,43 @@ impl PlaybackOrchestrator {
             .await
     }
 
+    /// #7846 (fil 2648) — le transfert vers une sortie qui DÉCODE elle-même
+    /// le flux (sortie locale, OAAT, agent Tune) : la piste part une seule
+    /// fois, directement à `seek_ms`, sans écrire l'historique.
+    ///
+    /// Lancer à 0:00 puis `seek` y faisait lancement, `stop()` puis second
+    /// lancement en quelques centaines de millisecondes
+    /// (`replay_zone_at_position`) : le DAC USB rouvert dans la foulée
+    /// restait muet jusqu'à Pause puis Lecture. Le décodeur part déjà de
+    /// l'offset (`set_pending_start_position_ms`) : il ne reste qu'à poser la
+    /// position de la zone, comme [`Self::replay_context_from_queue`].
+    pub async fn play_from_queue_transfere_a_la_position(
+        &self,
+        zone_id: i64,
+        position: i64,
+        seek_ms: u64,
+    ) -> Result<PlayResult, String> {
+        let result = self
+            .play_from_queue_inner(zone_id, position, false, Entree::Geste, Some(seek_ms))
+            .await?;
+        if seek_ms > 0 && result.output_sent {
+            self.playback.seek(zone_id, seek_ms as i64).await;
+            if let Some(zone) = ZoneRepo::with_backend(self.db.clone()).get(zone_id)? {
+                // Agent Tune : la sortie doit apprendre que le flux décodé
+                // commence à la position (#6370). Rien pour une sortie locale.
+                self.seek_output_after_replay(
+                    zone_id,
+                    zone.output_device_id.as_deref(),
+                    zone.output_type.as_deref(),
+                    seek_ms,
+                )
+                .await;
+            }
+            self.persist_position(zone_id).await;
+        }
+        Ok(result)
+    }
+
     async fn play_from_queue_inner(
         &self,
         zone_id: i64,

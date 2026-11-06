@@ -79,6 +79,11 @@ pub struct CueSheet {
     /// `REM COMMENT` écrit avant le premier `TRACK` (#5463) — EAC y signe
     /// souvent sa version.
     pub album_comment: Option<String>,
+    /// `REM DISCNUMBER …` (#7751) — le numéro du disque d'un coffret, que
+    /// foobar2000 et dBpoweramp écrivent quand chaque CD a sa feuille. Hors
+    /// norme comme `REM GENRE` ; `2/10` se lit 2, zéro ou du bruit se lisent
+    /// « inconnu ».
+    pub disc_number: Option<u32>,
     /// Les pistes AUDIO de la feuille. Une piste de données (`MODE1/2352`,
     /// `MODE2/2352`, `MODE1/2048`…) d'un CD mixte n'y figure pas : elle n'a
     /// rien d'audible, et la jouer comme du PCM rendrait un bruit blanc à
@@ -182,6 +187,7 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
         album_songwriter: None,
         catalog: None,
         album_comment: None,
+        disc_number: None,
         tracks: Vec::new(),
         file_types: Vec::new(),
         pistes_de_donnees: Vec::new(),
@@ -247,6 +253,13 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                     match sous_kw.as_str() {
                         "GENRE" => sheet.album_genre = unquote(valeur),
                         "DATE" => sheet.album_date = unquote(valeur),
+                        "DISCNUMBER" => {
+                            sheet.disc_number = unquote(valeur).and_then(|v| {
+                                let chiffres: String =
+                                    v.chars().take_while(char::is_ascii_digit).collect();
+                                chiffres.parse::<u32>().ok().filter(|&d| d > 0)
+                            })
+                        }
                         // #5463 — même règle de position que `TITLE` : sous
                         // une piste il est à elle, avant il est à l'album.
                         "COMMENT" => match sheet.tracks.last_mut() {
@@ -511,6 +524,24 @@ FILE "gould.ape" WAVE
         assert_eq!(s.album_date.as_deref(), Some("1984"));
         // Les autres `REM` restent ignorés, sans casser la lecture.
         assert_eq!(s.album_title.as_deref(), Some("Stationary Traveller"));
+        assert_eq!(s.disc_number, None);
+    }
+
+    /// #7751 — `REM DISCNUMBER` : le numéro du CD d'un coffret, seul ou sous
+    /// la forme « disque/total ». Zéro ne désigne aucun disque.
+    #[test]
+    fn reads_disc_number_from_rem_line_7751() {
+        let disque = |rem: &str| {
+            parse_cue_sheet(&format!(
+                "REM DISCNUMBER {rem}\nTITLE \"Ring\"\nFILE \"a.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n"
+            ))
+            .disc_number
+        };
+        assert_eq!(disque("3"), Some(3));
+        assert_eq!(disque("\"04\""), Some(4));
+        assert_eq!(disque("2/10"), Some(2));
+        assert_eq!(disque("0"), None);
+        assert_eq!(disque("deux"), None);
     }
 
     /// #5463 — la feuille du fil 2038 (EAC) : `CATALOG`, `ISRC`, `SONGWRITER`

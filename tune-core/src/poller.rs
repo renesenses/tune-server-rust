@@ -571,6 +571,11 @@ pub struct PositionPoller {
     /// piste relance aussitôt. Vit le temps du processus, HORS de
     /// ZonePollState, que chaque relance recrée.
     appareils_qui_ignorent_next: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// #6910 — zones dont le dernier suivant armé est un DSD sur un renderer
+    /// DLNA (zone → appareil). Si ce suivant n'est pas suivi
+    /// (`StuckForceEnd`), l'appareil est retenu par l'orchestrateur et la
+    /// garde de #402 lui est rendue.
+    dsd_suivant_arme: std::sync::Mutex<std::collections::HashMap<i64, String>>,
     /// #4382 — fins de piste établies par le guet de la dernière seconde
     /// (`sondage_accelere_4382`), par zone. Partagée avec les guetteurs.
     fins_precises: sondage_accelere_4382::FinsPrecises,
@@ -592,6 +597,10 @@ pub struct PositionPoller {
     /// #4970 — zones masquées en lecture déjà signalées au journal
     /// (`zone_masquee_en_lecture`), pour ne le dire qu'une fois par lecture.
     zones_masquees_signalees: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #7418 — zones mises en pause parce que leur APPAREIL s'est mis en pause
+    /// (télécommande, changement d'entrée). Seules celles-là suivent une
+    /// reprise faite sur l'appareil. Hors de ZonePollState : la pause le jette.
+    pauses_de_l_appareil: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// #5522 — la relance automatique d'un démarrage figé à 0, par zone : la
     /// ligne de file relancée et l'instant. Vit HORS de ZonePollState pour la
     /// même raison que `relances_demarrage_mort` : la relance recrée l'état de
@@ -644,10 +653,12 @@ impl PositionPoller {
             shared_metrics,
             event_bus: None,
             appareils_qui_ignorent_next: std::sync::Mutex::new(std::collections::HashSet::new()),
+            dsd_suivant_arme: std::sync::Mutex::new(std::collections::HashMap::new()),
             fins_precises: Default::default(),
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
             reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),
             zones_masquees_signalees: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pauses_de_l_appareil: std::sync::Mutex::new(std::collections::HashSet::new()),
             relances_demarrage_fige: std::sync::Mutex::new(std::collections::HashMap::new()),
             zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
             volumes_plafonnes: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1113,6 +1124,11 @@ mod demarrage_fige_5522;
 #[cfg(test)]
 mod demarrage_fige_5522_tests;
 
+/// #7636 — la liste qu'un autre point de contrôle a chargée dans un renderer
+/// OpenHome reste intacte : le banc, vrai sondeur et sortie factice.
+#[cfg(test)]
+mod liste_d_un_autre_point_de_controle_7636_tests;
+
 /// #6541 — au-dessus de la limite de sécurité, le volume du renderer n'est
 /// pas adopté : il est ramené sous la limite.
 mod volume_plafond_6541;
@@ -1384,6 +1400,18 @@ mod remontee_des_pannes_de_sortie_tests;
 /// OAAT) emmène la zone en pause.
 #[cfg(test)]
 mod pause_par_l_appareil_6790_tests;
+
+/// #7418 — une pause faite sur l'appareil DLNA (télécommande WiiM, autre
+/// entrée) met la zone en pause ; un arrêt qui suit ne relance plus rien.
+mod pause_de_l_appareil_7418;
+#[cfg(test)]
+mod pause_de_l_appareil_7418_tests;
+
+/// #7700 — un « suivant » pressé sur l'appareil DLNA (télécommande Eversolo)
+/// enchaîne la file de Tune en quelques secondes.
+mod suivant_de_l_appareil_7700;
+#[cfg(test)]
+mod suivant_de_l_appareil_7700_tests;
 
 #[cfg(test)]
 mod lecture_sans_destination_tests;

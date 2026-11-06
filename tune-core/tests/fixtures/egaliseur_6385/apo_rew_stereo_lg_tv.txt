@@ -1,0 +1,39 @@
+Device: 4 - LG TV SSCR2 AMD High Definition Audio Device {13c2d368-bc83-4957-9283-5400b59825f4}
+Channel: L
+Filter  1: ON  PK       Fc   300.0 Hz  Gain -10.10 dB  Q  1.000
+Filter  2: ON  PK       Fc   796.0 Hz  Gain  -5.70 dB  Q  1.461
+Filter  3: ON  PK       Fc   14571 Hz  Gain -11.10 dB  Q  2.846
+Filter  4: ON  PK       Fc   17132 Hz  Gain -14.10 dB  Q  3.884
+Filter  5: ON  PK       Fc   11422 Hz  Gain -11.10 dB  Q  3.348
+Filter  6: ON  PK       Fc   138.5 Hz  Gain -12.90 dB  Q  4.278
+Filter  7: ON  PK       Fc    2499 Hz  Gain  -7.30 dB  Q  3.290
+Filter  8: ON  PK       Fc    6266 Hz  Gain  -8.80 dB  Q  3.994
+Filter  9: ON  PK       Fc   18922 Hz  Gain  -9.50 dB  Q  5.000
+Filter 10: ON  PK       Fc    3120 Hz  Gain  -6.70 dB  Q  3.803
+Filter 11: ON  PK       Fc    4942 Hz  Gain  -6.40 dB  Q  3.655
+Filter 12: ON  PK       Fc    8935 Hz  Gain  -7.90 dB  Q  4.893
+Filter 13: ON  PK       Fc    8220 Hz  Gain  -4.00 dB  Q  4.458
+Filter 14: ON  PK       Fc    2059 Hz  Gain  -2.90 dB  Q  4.736
+Filter 15: ON  PK       Fc   43.60 Hz  Gain  -2.90 dB  Q  4.940
+Filter 16: ON  PK       Fc    1415 Hz  Gain  -1.10 dB  Q  4.936
+
+Channel: R
+Filter  1: ON  PK       Fc    8689 Hz  Gain  -8.30 dB  Q  1.780
+Filter  2: ON  PK       Fc   14620 Hz  Gain  -8.80 dB  Q  1.920
+Filter  3: ON  PK       Fc   139.5 Hz  Gain -15.10 dB  Q  3.489
+Filter  4: ON  PK       Fc   311.0 Hz  Gain -10.80 dB  Q  3.133
+Filter  5: ON  PK       Fc   17356 Hz  Gain  -7.90 dB  Q  2.552
+Filter  6: ON  PK       Fc   416.0 Hz  Gain  -7.90 dB  Q  3.234
+Filter  7: ON  PK       Fc    5831 Hz  Gain  -5.40 dB  Q  2.491
+Filter  8: ON  PK       Fc   18807 Hz  Gain  -7.70 dB  Q  3.964
+Filter  9: ON  PK       Fc   213.0 Hz  Gain  -9.10 dB  Q  5.000
+Filter 10: ON  PK       Fc   11734 Hz  Gain  -6.30 dB  Q  3.755
+Filter 11: ON  PK       Fc    2198 Hz  Gain  -5.60 dB  Q  3.616
+Filter 12: ON  PK       Fc    2638 Hz  Gain  -4.20 dB  Q  2.789
+Filter 13: ON  PK       Fc   613.0 Hz  Gain  -5.30 dB  Q  4.011
+Filter 14: ON  PK       Fc    3278 Hz  Gain  -5.30 dB  Q  4.407
+Filter 15: ON  PK       Fc   743.0 Hz  Gain  -5.30 dB  Q  4.948
+Filter 16: ON  PK       Fc    1002 Hz  Gain  -5.10 dB  Q  4.992
+Filter 17: ON  PK       Fc    4877 Hz  Gain  -4.90 dB  Q  4.995
+Filter 18: ON  PK       Fc    1426 Hz  Gain  -2.60 dB  Q  5.000
+Filter 19: ON  PK       Fc    1216 Hz  Gain  -2.20 dB  Q  5.000
