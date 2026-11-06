@@ -1985,6 +1985,12 @@ path = "tests/ecoutes_communaute_6738.rs"
 name = "groupe_dlna_joue_sur_les_deux_6155"
 path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
 
+# #7937 — un groupe défait ne revient ni par une zone recréée, ni par un
+# regroupement, ni au redémarrage.
+[[test]]
+name = "degrouper_zones_7937"
+path = "tests/degrouper_zones_7937.rs"
+
 # #7077, seconde passe — un refus jadis composé en français suit la langue de
 # l'interface (code stable + phrase traduite). `autotests = false` plus haut :
 # sans cette cible, le témoin ne serait JAMAIS compilé.
