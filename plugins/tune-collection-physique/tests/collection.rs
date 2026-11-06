@@ -84,6 +84,13 @@ struct HoteEssai {
     /// L'instant de chaque appel au CDN d'images (le recul se mesure entre
     /// deux appels, pas sur la durée totale, que le décodage allonge).
     instants_images: Mutex<Vec<std::time::Instant>>,
+    /// Combien de 403 le CDN d'images rend avant de répondre (#7927).
+    images_refusees: Mutex<u32>,
+    /// Les entrées de la liste portent leur dossier, et les dossiers de la
+    /// collection se lisent (#7929).
+    dossiers: Mutex<bool>,
+    /// Les services où « Chercher sur les services » cherche (#7928).
+    services_de_recherche: Vec<String>,
 }
 
 impl HoteEssai {
@@ -115,6 +122,9 @@ impl HoteEssai {
             images_avant_panne: Mutex::new(None),
             disque_retire: Mutex::new(false),
             instants_images: Mutex::new(Vec::new()),
+            images_refusees: Mutex::new(0),
+            dossiers: Mutex::new(false),
+            services_de_recherche: vec!["qobuz".into(), "tidal".into(), "spotify".into()],
         }
     }
 
@@ -126,6 +136,12 @@ impl HoteEssai {
                 let id = r["id"].as_u64().unwrap();
                 r["basic_information"]["thumb"] = json!(vignette_essai(id));
                 r["basic_information"]["cover_image"] = json!(pochette_essai(id));
+            }
+        }
+        if *self.dossiers.lock().unwrap() {
+            for r in p["releases"].as_array_mut().unwrap() {
+                let id = r["id"].as_u64().unwrap();
+                r["folder_id"] = json!(if id == 249504 || id == 1050 { 101 } else { 1 });
             }
         }
         if *self.disque_retire.lock().unwrap() {
@@ -212,6 +228,14 @@ impl Hote for HoteEssai {
             ("/users/exemple/collection/folders/0/releases", "2") => {
                 Reponse::Json(self.page("collection_page_2.json"))
             }
+            ("/users/exemple/collection/folders", _) if *self.dossiers.lock().unwrap() => {
+                Reponse::Json(json!({"folders": [
+                    {"id": 0, "name": "All", "count": 5},
+                    {"id": 1, "name": "Uncategorized", "count": 3},
+                    {"id": 101, "name": "Salon", "count": 2},
+                    {"id": 102, "name": "Vide", "count": 0}
+                ]}))
+            }
             ("/users/prive/collection/folders/0/releases", _) => Reponse::Refusee,
             ("/users/panne/collection/folders/0/releases", _) => return Err(Panne),
             ("/releases/249504", _) => Reponse::Json(fixture("release_249504.json")),
@@ -286,6 +310,10 @@ impl Hote for HoteEssai {
             .unwrap_or_default())
     }
 
+    async fn services_de_recherche(&self) -> Vec<String> {
+        self.services_de_recherche.clone()
+    }
+
     async fn albums_locaux(&self) -> Result<Vec<AlbumLocal>, String> {
         Ok(self.albums.lock().unwrap().clone())
     }
@@ -301,6 +329,13 @@ impl Hote for HoteEssai {
             if *l > 0 {
                 *l -= 1;
                 return Ok(Image::Limite);
+            }
+        }
+        {
+            let mut r = self.images_refusees.lock().unwrap();
+            if *r > 0 {
+                *r -= 1;
+                return Ok(Image::Refusee);
             }
         }
         if let Some(n) = self.images_avant_panne.lock().unwrap().as_mut() {
@@ -531,7 +566,8 @@ async fn la_deuxieme_synchronisation_ne_relit_que_la_liste() {
         "incrémentale : aucune fiche relue"
     );
     assert_eq!(
-        b.hote.appels("discogs /users/"),
+        b.hote
+            .appels("discogs /users/exemple/collection/folders/0/"),
         3,
         "la liste est relue PAR LE HAUT : sa première page touche la liste connue, la seconde n'est pas redemandée"
     );
@@ -733,7 +769,11 @@ async fn chaque_disque_porte_sa_vignette_et_l_album_local_sa_pochette() {
     assert_eq!(sm["bibliotheque"]["cover_path"], Value::Null, "{sm}");
     // Rien de plus qu'avant : une fiche par disque, deux pages de liste.
     assert_eq!(b.hote.appels("discogs /releases/"), 5);
-    assert_eq!(b.hote.appels("discogs /users/"), 2);
+    assert_eq!(
+        b.hote
+            .appels("discogs /users/exemple/collection/folders/0/"),
+        2
+    );
 }
 
 /// Une collection synchronisée AVANT les pochettes (mémoire d'une forme de
@@ -756,7 +796,9 @@ async fn une_synchronisation_d_avant_les_vignettes_les_recoit_a_la_suivante() {
     let fiches = b.hote.appels("discogs /releases/");
     let mb = b.hote.appels("mb ");
     let services = b.hote.appels("service ");
-    let pages = b.hote.appels("discogs /users/");
+    let pages = b
+        .hote
+        .appels("discogs /users/exemple/collection/folders/0/");
 
     // La mémoire telle qu'une version d'avant l'a écrite : sans
     // `version_liste`, sans `liste_complete_le`.
@@ -784,7 +826,8 @@ async fn une_synchronisation_d_avant_les_vignettes_les_recoit_a_la_suivante() {
         "{c}"
     );
     assert_eq!(
-        b.hote.appels("discogs /users/"),
+        b.hote
+            .appels("discogs /users/exemple/collection/folders/0/"),
         pages + 2,
         "une liste d'une forme ancienne se relit en entier"
     );
@@ -1249,10 +1292,17 @@ async fn un_429_sur_une_pochette_fait_reculer_puis_reussit() {
     );
 
     // Contre-épreuve : un CDN qui refuse toujours. Au plus `essais_limite`
-    // nouveaux essais, puis rien n'est rangé, et l'écran reçoit un 404.
+    // nouveaux essais, puis rien n'est rangé, et l'écran reçoit un 503
+    // « pochettes limitées » avec `Retry-After` (#7927 : plus un 404 muet).
     *b.hote.images_limites.lock().unwrap() = 100;
-    let (code, _, _) = brut(&b.app, "GET", "/pochettes/249504", &[]).await;
-    assert_eq!(code, StatusCode::NOT_FOUND);
+    let (code, h, octets) = brut(&b.app, "GET", "/pochettes/249504", &[]).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(h.contains_key("retry-after"), "{h:?}");
+    assert!(
+        String::from_utf8_lossy(&octets).contains("collection_physique.pochettes_limitees"),
+        "{}",
+        String::from_utf8_lossy(&octets)
+    );
     assert_eq!(
         b.hote.appels("image "),
         3 + 4,
@@ -1329,12 +1379,18 @@ async fn un_disque_retire_fait_relire_toute_la_liste() {
     suivre(&b, "exemple").await;
     b.moteur.synchroniser_maintenant("exemple").await.unwrap();
     b.moteur.synchroniser_maintenant("exemple").await.unwrap();
-    assert_eq!(b.hote.appels("discogs /users/"), 3, "2 pages, puis 1");
+    assert_eq!(
+        b.hote
+            .appels("discogs /users/exemple/collection/folders/0/"),
+        3,
+        "2 pages, puis 1"
+    );
 
     *b.hote.disque_retire.lock().unwrap() = true;
     b.moteur.synchroniser_maintenant("exemple").await.unwrap();
     assert_eq!(
-        b.hote.appels("discogs /users/"),
+        b.hote
+            .appels("discogs /users/exemple/collection/folders/0/"),
         5,
         "le compte annoncé (4) ne tombe plus juste : les deux pages"
     );
@@ -1379,4 +1435,278 @@ async fn effacer_le_cache_efface_les_pochettes_puis_la_memoire() {
     assert!(m.memoire().disques.is_empty());
     let (code, _) = appel(&b.app, "DELETE", "/cache?quoi=autre", None).await;
     assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+// ─── #7927 : les pochettes des disques absents de la bibliothèque ─────────
+
+/// Un recul du CDN (429) ne bloque plus la file : pendant que la demande
+/// refusée recule, une demande pour un AUTRE disque est refusée tout de
+/// suite (503 `pochettes_limitees`, `Retry-After`), sans appeler le CDN. Le
+/// recul fini, la première pochette arrive et la seconde se sert ensuite.
+///
+/// Avant le correctif, la seconde attendait le verrou de la file pendant tout
+/// le recul de la première (jusqu'à 7 minutes avec la cadence par défaut),
+/// puis rejouait son propre cycle de refus.
+#[tokio::test]
+async fn un_recul_du_cdn_ne_bloque_pas_les_autres_pochettes_7927() {
+    let hote = HoteEssai::new();
+    *hote.vignettes.lock().unwrap() = true;
+    let b = banc_avec_cadence(
+        hote,
+        Cadence {
+            attente_limite: std::time::Duration::from_millis(400),
+            attente_max: std::time::Duration::from_secs(1),
+            ..Cadence::immediate()
+        },
+    );
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    *b.hote.images_limites.lock().unwrap() = 1;
+
+    let app = b.app.clone();
+    let premiere = tokio::spawn(async move { brut(&app, "GET", "/pochettes/1050", &[]).await.0 });
+    attendre_que(
+        || b.hote.appels("image ") == 1,
+        "le premier appel au CDN, refusé",
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let debut = std::time::Instant::now();
+    let (code, h, octets) = brut(&b.app, "GET", "/pochettes/249504", &[]).await;
+    let duree = debut.elapsed();
+    assert_eq!(
+        code,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "pendant le recul, une autre pochette est refusée tout de suite ({duree:?}) : {}",
+        String::from_utf8_lossy(&octets)
+    );
+    assert!(
+        duree < std::time::Duration::from_millis(200),
+        "la demande n'attend pas le recul d'une autre : {duree:?}"
+    );
+    assert!(h.contains_key("retry-after"), "{h:?}");
+    assert_eq!(
+        b.hote.appels("image "),
+        1,
+        "aucun appel au CDN pendant le recul"
+    );
+    let (_, e) = appel(&b.app, "GET", "/etat", None).await;
+    assert_eq!(e["pochettes"]["limitees"], true, "{e}");
+    assert_eq!(e["pochettes"]["derniere_erreur"], "discogs_limite", "{e}");
+    assert!(e["pochettes"]["reprise_dans_s"].as_u64().is_some(), "{e}");
+
+    assert_eq!(
+        premiere.await.unwrap(),
+        StatusCode::OK,
+        "le recul fini, la pochette arrive"
+    );
+    let (code, _, _) = brut(&b.app, "GET", "/pochettes/249504", &[]).await;
+    assert_eq!(code, StatusCode::OK, "puis l'autre se sert");
+    let (_, e) = appel(&b.app, "GET", "/etat", None).await;
+    assert_eq!(e["pochettes"]["limitees"], false, "{e}");
+    assert_eq!(e["pochettes"]["derniere_erreur"], Value::Null, "{e}");
+}
+
+/// Un 403 du CDN ne condamne plus la pochette jusqu'au redémarrage : la
+/// passe de préremplissage s'arrête, le dit dans `GET /etat`, puis reprend
+/// D'ELLE-MÊME après le recul (et non à la synchronisation du lendemain),
+/// jusqu'à ranger toutes les pochettes.
+#[tokio::test]
+async fn un_403_du_cdn_fait_reculer_et_la_passe_reprend_seule_7927() {
+    let hote = HoteEssai::new();
+    *hote.vignettes.lock().unwrap() = true;
+    let b = banc_avec_cadence(
+        hote,
+        Cadence {
+            attente_limite: std::time::Duration::from_millis(20),
+            attente_max: std::time::Duration::from_millis(60),
+            ..Cadence::immediate()
+        },
+    );
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    // 1 + 3 essais refusés : la passe s'arrête sur la première pochette.
+    *b.hote.images_refusees.lock().unwrap() = 4;
+    assert!(b.moteur.lancer_pochettes());
+    attendre_que(
+        || b.moteur.etat_pochettes().derniere_erreur == Some("discogs_refuse"),
+        "le refus du CDN dit à l'écran",
+    )
+    .await;
+    attendre_que(
+        || b.moteur.etat_pochettes().en_cache == 5 && !b.moteur.etat_pochettes().en_cours,
+        "les cinq pochettes rangées après la reprise",
+    )
+    .await;
+    let e = b.moteur.etat_pochettes();
+    assert_eq!((e.echecs, e.restantes, e.limitees), (0, 0, false), "{e:?}");
+    assert_eq!(
+        b.hote.appels("image "),
+        4 + 5,
+        "4 refus, puis une image par disque"
+    );
+}
+
+// ─── #7928 : chercher un disque sur les services ──────────────────────────
+
+/// « Chercher sur les services » sur un disque absent de la bibliothèque :
+/// chaque service connecté qui sait chercher (Spotify compris), par numéro de
+/// catalogue puis artiste + titre ; le plus proche en tête.
+#[tokio::test]
+async fn chercher_sur_les_services_rend_le_plus_proche_7928() {
+    let mut hote = HoteEssai::new();
+    hote.recherches.insert(
+        (
+            "spotify".into(),
+            "Various The Haçienda - Play By 01/96".into(),
+        ),
+        vec![
+            AlbumDeService {
+                id: "S-voisin".into(),
+                titre: "The Haçienda Classics".into(),
+                artiste: "Various Artists".into(),
+            },
+            AlbumDeService {
+                id: "S-7024".into(),
+                titre: "The Hacienda - Play By 01/96".into(),
+                artiste: "Various Artists".into(),
+            },
+        ],
+    );
+    hote.recherches.insert(
+        ("qobuz".into(), "540 441-2".into()),
+        vec![AlbumDeService {
+            id: "Q-voisin".into(),
+            titre: "The Haçienda".into(),
+            artiste: "Various".into(),
+        }],
+    );
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let avant = b.hote.appels.lock().unwrap().len();
+
+    let (code, r) = appel(&b.app, "GET", "/disques/7024/services", None).await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["services"], json!(["qobuz", "tidal", "spotify"]), "{r}");
+    assert_eq!(r["meilleure"]["service"], "spotify", "{r}");
+    assert_eq!(r["meilleure"]["id"], "S-7024", "{r}");
+    assert_eq!(r["meilleure"]["exact"], true, "{r}");
+    // Puis les voisins : un numéro de catalogue compte plus qu'un titre
+    // seulement proche.
+    assert_eq!(r["propositions"][1]["id"], "Q-voisin", "{r}");
+    assert_eq!(r["propositions"][2]["id"], "S-voisin", "{r}");
+    let q = r["propositions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "Q-voisin")
+        .unwrap_or_else(|| panic!("{r}"));
+    assert_eq!(q["par"], "catalogue", "{r}");
+    let nouveaux: Vec<String> = b.hote.appels.lock().unwrap()[avant..].to_vec();
+    assert!(
+        nouveaux.contains(&"service spotify 540 441-2".to_string())
+            && nouveaux
+                .contains(&"service spotify Various The Haçienda - Play By 01/96".to_string()),
+        "catalogue puis artiste + titre : {nouveaux:?}"
+    );
+    assert!(
+        b.moteur
+            .memoire()
+            .streaming
+            .get(&7024)
+            .is_none_or(|s| s.trouves.is_empty()),
+        "rien n'est écrit dans la mémoire : l'utilisateur juge"
+    );
+
+    // Contre-épreuve : un disque hors de la collection.
+    let (code, r) = appel(&b.app, "GET", "/disques/424242/services", None).await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{r}");
+    assert_eq!(r["error"], "collection_physique.disque_inconnu");
+}
+
+// ─── #7929 : parcourir par dossier, genre et style ────────────────────────
+
+#[tokio::test]
+async fn parcourir_par_dossier_genre_et_style_7929() {
+    let hote = HoteEssai::new();
+    *hote.dossiers.lock().unwrap() = true;
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+
+    let (code, p) = appel(&b.app, "GET", "/parcourir", None).await;
+    assert_eq!(code, StatusCode::OK, "{p}");
+    assert_eq!(
+        p["par_dossier"],
+        json!([
+            {"id": 1, "nom": "Uncategorized", "nombre": 3},
+            {"id": 101, "nom": "Salon", "nombre": 2},
+            {"id": 102, "nom": "Vide", "nombre": 0}
+        ]),
+        "{p}"
+    );
+    assert_eq!(
+        p["par_genre"][0],
+        json!({"nom": "Electronic", "nombre": 4}),
+        "{p}"
+    );
+    assert!(
+        p["par_genre"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"nom": "Funk / Soul", "nombre": 1})),
+        "{p}"
+    );
+    assert_eq!(
+        p["par_style"][0],
+        json!({"nom": "House", "nombre": 2}),
+        "{p}"
+    );
+
+    let titres = |c: &Value| -> Vec<String> {
+        let mut t: Vec<String> = c["disques"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["titre"].as_str().unwrap().to_string())
+            .collect();
+        t.sort();
+        t
+    };
+    let (_, c) = appel(&b.app, "GET", "/collection?dossier=101", None).await;
+    assert_eq!(
+        titres(&c),
+        vec!["Montreal Mix Sessions Vol. 4", "Never Gonna Give You Up"],
+        "{c}"
+    );
+    assert_eq!(
+        c["compteurs"]["total"], 5,
+        "les compteurs portent sur toute la liste"
+    );
+    assert_eq!(c["compteurs"]["par_dossier"], p["par_dossier"]);
+    let (_, c) = appel(&b.app, "GET", "/collection?genre=Funk%20%2F%20Soul", None).await;
+    assert_eq!(titres(&c), vec!["Giving My Love / Brazil"], "{c}");
+    let (_, c) = appel(&b.app, "GET", "/collection?style=house", None).await;
+    assert_eq!(
+        titres(&c).len(),
+        2,
+        "le style se compare sans la casse : {c}"
+    );
+    let (_, c) = appel(&b.app, "GET", "/collection?dossier=101&style=House", None).await;
+    assert_eq!(
+        titres(&c),
+        vec!["Montreal Mix Sessions Vol. 4"],
+        "les filtres se combinent : {c}"
+    );
+    assert_eq!(disque(&c, "Montreal Mix Sessions Vol. 4")["dossier"], 101);
+    assert_eq!(
+        disque(&c, "Montreal Mix Sessions Vol. 4")["genres"],
+        json!(["Electronic"])
+    );
+
+    // Contre-épreuve : un dossier qui n'existe pas ne rend aucun disque.
+    let (_, c) = appel(&b.app, "GET", "/collection?dossier=999", None).await;
+    assert!(c["disques"].as_array().unwrap().is_empty(), "{c}");
 }

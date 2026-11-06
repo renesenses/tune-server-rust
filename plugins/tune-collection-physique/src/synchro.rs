@@ -81,10 +81,13 @@ pub enum Reponse {
 pub enum Image {
     /// Les octets de l'image (bornés par l'hôte).
     Octets(Vec<u8>),
-    /// 404 / 403 / 410 : l'image n'existe plus ; ne pas la redemander.
+    /// 404 / 410 : l'image n'existe plus ; ne pas la redemander.
     Introuvable,
     /// 429 / 503 : trop d'appels ; reculer.
     Limite,
+    /// 403 : le CDN refuse la requête (souvent passager : User-Agent, défi
+    /// anti-robots). Reculer et réessayer, sans condamner l'image (#7927).
+    Refusee,
 }
 
 /// Le service n'a pas répondu (transport, délai, statut inattendu).
@@ -132,6 +135,13 @@ pub trait Hote: Send + Sync {
     /// avec le User-Agent du serveur et SANS le jeton (le CDN n'en veut
     /// pas ; il ne sort pas vers un autre hôte que l'API).
     async fn image_discogs(&self, url: &str) -> Result<Image, Panne>;
+    /// Les services connectés où « Chercher sur les services » (#7928)
+    /// cherche un disque : tous ceux qui ont une recherche d'albums (Qobuz,
+    /// TIDAL, Spotify, Deezer…), pas seulement ceux de [`SERVICES`]. Par
+    /// défaut, ceux de [`SERVICES`].
+    async fn services_de_recherche(&self) -> Vec<String> {
+        self.services_connectes().await
+    }
 }
 
 /// L'espacement des appels du greffon.
@@ -223,6 +233,8 @@ pub mod code {
     pub const UTILISATEUR_INCONNU: &str = "utilisateur_inconnu";
     pub const COLLECTION_PRIVEE: &str = "collection_privee";
     pub const DISCOGS_LIMITE: &str = "discogs_limite";
+    /// Le CDN d'images de Discogs refuse (403) : les pochettes attendent.
+    pub const DISCOGS_REFUSE: &str = "discogs_refuse";
     pub const DISCOGS_INDISPONIBLE: &str = "discogs_indisponible";
     /// N'est PLUS rendu (MusicBrainz ne bloque plus rien) : une mémoire
     /// d'avant le correctif qui le porte encore l'oublie à la lecture.
@@ -573,6 +585,7 @@ impl Moteur {
         }
         let partielle = fusion.is_some();
         tracing::info!(target: "plugin", partielle, pages = page, "collection_physique_liste_lue");
+        let dossiers = self.lire_les_dossiers(nom).await;
         {
             let mut m = verrou(&self.memoire);
             m.changer_de_compte(Some(nom.to_string()));
@@ -586,8 +599,23 @@ impl Moteur {
             }
             m.version_liste = crate::memoire::VERSION_LISTE;
             m.liste_lue_le = Some(maintenant());
+            if let Some(d) = dossiers {
+                m.dossiers = d;
+            }
         }
         self.ecrire()
+    }
+
+    /// Les dossiers de la collection (#7929) : un appel de plus par
+    /// synchronisation. `None` sur un refus passager ou une panne (les
+    /// dossiers déjà connus restent) ; vide si Discogs ne les montre pas.
+    async fn lire_les_dossiers(&self, nom: &str) -> Option<Vec<discogs::Dossier>> {
+        let chemin = format!("/users/{}/collection/folders", urlencoding::encode(nom));
+        match self.discogs(&chemin, &[]).await {
+            Ok(Reponse::Json(v)) => Some(discogs::dossiers_de_la_collection(&v)),
+            Ok(Reponse::Introuvable | Reponse::Refusee) => Some(Vec::new()),
+            Ok(Reponse::Limite) | Err(_) => None,
+        }
     }
 
     /// Les releases de la liste, sans doublon, dans l'ordre de la liste.
@@ -611,7 +639,7 @@ impl Moteur {
     }
 
     /// La fiche Discogs d'un disque (ses codes-barres), lue une fois.
-    async fn lire_la_fiche(&self, release: u64) -> Result<Vec<String>, &'static str> {
+    pub(crate) async fn lire_la_fiche(&self, release: u64) -> Result<Vec<String>, &'static str> {
         if let Some(f) = verrou(&self.memoire).fiches.get(&release) {
             return Ok(f.codes_barres.clone());
         }
