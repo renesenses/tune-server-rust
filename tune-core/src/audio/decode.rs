@@ -4736,6 +4736,9 @@ fn decode_dsd_to_dop_streaming_inner(
         }
     }
 
+    // #7704 — compte de trames pair : la piste suivante, enchaînée sur le
+    // même flux, reprend l'alternance des marqueurs sans rupture.
+    pcm_buf.extend_from_slice(&encoder.terminer());
     if !pcm_buf.is_empty() {
         send_dop_chunk(&tx, pcm_buf, first_chunk_sent, data_ready, rt, send_timeout)?;
     }

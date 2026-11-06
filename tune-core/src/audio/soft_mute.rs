@@ -166,6 +166,11 @@ pub struct SoftMuteRamp {
     ms: u32,
     sample_rate: u32,
     channels: usize,
+    /// #7704 — la continuité DoP du même rappel. Le DoP ne se rampe pas
+    /// (`armed_ms` rend 0) : il se COMBLE, en trames de repos qui gardent
+    /// les marqueurs, là où le PCM reçoit des zéros. Rangé ici parce que la
+    /// rampe est déjà l'état que chaque rappel garde d'une période à l'autre.
+    pub dop: crate::audio::dop_continu::SuiviDoP,
 }
 
 impl SoftMuteRamp {
@@ -178,6 +183,7 @@ impl SoftMuteRamp {
             ms: 0,
             sample_rate: sample_rate.max(1),
             channels: channels.max(1) as usize,
+            dop: crate::audio::dop_continu::SuiviDoP::new(channels),
         }
     }
 

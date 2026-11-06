@@ -282,3 +282,91 @@ async fn en_dop_la_suivante_part_en_wav_et_reste_armee() {
             .is_none()
     );
 }
+
+/// #6335 — la ligne `gapless_skipped_dsd_next_dlna` dit POURQUOI le suivant
+/// DSD n'est pas armé. Elle ne portait que la zone et le type MIME : un
+/// renderer qui n'annonce pas le DSD et un SCPD que Tune n'a jamais lu
+/// laissaient la même trace (fil 2567).
+mod raison_du_refus_6335 {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Journal(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Journal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Journal;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// La ligne de refus du banc, après la fenêtre d'armement.
+    async fn ligne_de_refus(
+        appareil: &str,
+        mode: &str,
+        dsd: DsdCapability,
+        suivante: AnnonceSuivante,
+    ) -> String {
+        crate::journal_de_test::fiabiliser_la_capture();
+        let journal = Journal::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _garde = tracing::subscriber::set_default(abonne);
+        let mut banc = Banc::monter_en_dsd(appareil, mode, dsd, suivante).await;
+        banc.la_fenetre_d_armement().await;
+        assert_eq!(banc.armees().await, Vec::<String>::new());
+        let texte = String::from_utf8_lossy(&journal.0.lock().unwrap()).into_owned();
+        texte
+            .lines()
+            .find(|l| l.contains("gapless_skipped_dsd_next_dlna"))
+            .unwrap_or_else(|| panic!("aucune ligne gapless_skipped_dsd_next_dlna :\n{texte}"))
+            .to_string()
+    }
+
+    /// SCPD jamais lu : le refus vient de Tune, pas du renderer.
+    #[tokio::test]
+    async fn scpd_inconnu_nomme_setnext_inconnu() {
+        let ligne = ligne_de_refus(
+            "uuid:banc-6335-scpd-inconnu",
+            "auto",
+            annonce_dsd(true),
+            AnnonceSuivante::Inconnue,
+        )
+        .await;
+        assert!(
+            ligne.contains("raison=\"setnext_inconnu\"")
+                || ligne.contains("raison=setnext_inconnu"),
+            "#6335 : le refus doit nommer le SCPD d'AVTransport inconnu : {ligne}"
+        );
+        assert!(ligne.contains("uuid:banc-6335-scpd-inconnu"), "{ligne}");
+    }
+
+    /// DSD brut forcé sur un renderer qui ne l'annonce pas : limite de
+    /// l'appareil, dite comme telle.
+    #[tokio::test]
+    async fn dsd_non_annonce_nomme_dsd_non_annonce() {
+        let ligne = ligne_de_refus(
+            "uuid:banc-6335-natif-force",
+            "native",
+            annonce_dsd(false),
+            AnnonceSuivante::Annoncee,
+        )
+        .await;
+        assert!(
+            ligne.contains("dsd_non_annonce"),
+            "#6335 : le refus doit nommer l'absence d'annonce DSD : {ligne}"
+        );
+    }
+}
