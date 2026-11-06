@@ -393,7 +393,7 @@ pub(super) async fn artist_bio(
     };
     let lang = langue_demandee(q.lang.as_deref(), &headers);
     let lang = lang.as_str();
-    memoriser_langue_pour_bio_sync(&state.backend, lang);
+    memoriser_langue_pour_bio_sync(&state.backend, q.lang.as_deref(), &headers);
 
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy — this surfaces the sourced Wikipedia/Last.fm/Qobuz/
@@ -571,14 +571,35 @@ pub(super) fn langue_demandee(param: Option<&str>, headers: &HeaderMap) -> Strin
     crate::i18n::lang_from_request(param, headers)
 }
 
-/// Mémorise la langue d'interface vue pour `cloud::bio_sync` (réglage
-/// `bio_langue`), sans retarder la réponse : lecture + écriture éventuelle sur
-/// un thread bloquant, jamais attendues.
+/// La langue que la requête DONNE explicitement : `?lang=` non vide, ou un
+/// `Accept-Language` présent, lisible et nommant une langue servie. Le repli
+/// `i18n::FALLBACK` (aucune information) n'est PAS une langue donnée : il ne
+/// doit jamais alimenter `bio_langue`.
+pub(super) fn langue_explicite(param: Option<&str>, headers: &HeaderMap) -> Option<String> {
+    let param_donne = param.is_some_and(|p| !p.trim().is_empty());
+    let entete_donne = headers
+        .get(axum::http::header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| {
+            crate::i18n::langues_acceptees(s)
+                .iter()
+                .any(|b| crate::i18n::SUPPORTED.contains(&b.as_str()))
+        });
+    (param_donne || entete_donne).then(|| langue_demandee(param, headers))
+}
+
+/// Mémorise la dernière langue d'interface EXPLICITE vue pour
+/// `cloud::bio_sync` (réglage `bio_langue`), sans retarder la réponse :
+/// lecture + écriture éventuelle sur un thread bloquant, jamais attendues.
 pub(super) fn memoriser_langue_pour_bio_sync(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
-    lang: &str,
+    param: Option<&str>,
+    headers: &HeaderMap,
 ) {
-    let (backend, lang) = (backend.clone(), lang.to_string());
+    let Some(lang) = langue_explicite(param, headers) else {
+        return;
+    };
+    let backend = backend.clone();
     tokio::task::spawn_blocking(move || {
         let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend);
         tune_core::cloud::bio_sync::memoriser_langue_interface(&settings, &lang);

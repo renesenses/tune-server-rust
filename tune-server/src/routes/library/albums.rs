@@ -1129,7 +1129,7 @@ pub(super) async fn album_bio(
     // `Accept-Language`, puis `fr`. Cf. `super::artists::langue_demandee`.
     let lang = super::artists::langue_demandee(q.lang.as_deref(), &headers);
     let lang = lang.as_str();
-    super::artists::memoriser_langue_pour_bio_sync(&state.backend, lang);
+    super::artists::memoriser_langue_pour_bio_sync(&state.backend, q.lang.as_deref(), &headers);
 
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy.
