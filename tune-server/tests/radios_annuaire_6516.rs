@@ -809,3 +809,117 @@ async fn contre_epreuve_flux_hors_fiche_refuse_et_station_sans_fiche_refusee() {
         "https://perso.example/flux.mp3"
     );
 }
+
+// ── #7587 — choisir le flux d'une fiche qui n'est pas dans « Mes radios » ───
+
+/// L'extrait réel, ses flux FIP servis en local : aucune lecture n'atteint le
+/// vrai réseau. Rend aussi une zone navigateur où jouer.
+async fn annuaire_aux_flux_locaux() -> (axum::Router, i64) {
+    let corps: &'static [u8] = include_bytes!("../../tune-core/tests/fixtures/test.mp3");
+    let app = axum::Router::new()
+        .fallback(move || async move { ([("content-type", "audio/mpeg")], corps) });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let local = format!("http://127.0.0.1:{port}/");
+    let texte = EXTRAIT
+        .replace("https://icecast.radiofrance.fr/", &local)
+        .replace("http://radio-metadata.fr:8000/", &local);
+    let brut: Value = serde_json::from_str(&texte).unwrap();
+    let state = etat();
+    *state.annuaire_radios.write().unwrap() =
+        tune_server::routes::radios::annuaire_depuis_json(brut["radios"].as_array().unwrap());
+    // « Mes radios » vide : les stations installées d'office (dont FIP) ôtées.
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    for st in repo.list().unwrap() {
+        repo.delete(st.id.unwrap()).unwrap();
+    }
+    let app = tune_server::routes::router(state);
+    let (status, zone) = requete(
+        &app,
+        "POST",
+        "/api/v1/zones",
+        Some(json!({"name": "Onglet 7587", "output_type": "browser"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{zone}");
+    (app, zone["id"].as_i64().unwrap())
+}
+
+/// La fiche FIP telle que l'annuaire la montre : son flux principal et son
+/// flux MP3 128 kbit/s, secondaire.
+async fn fip_et_son_flux_midfi(app: &axum::Router) -> (String, String) {
+    let (_, ann) = requete(app, "GET", "/api/v1/radios/directory?q=fip", None).await;
+    let fip = ann["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["external_id"] == "S000973")
+        .unwrap()
+        .clone();
+    let midfi = fip["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|f| f["url"].as_str().filter(|u| u.contains("fip-midfi.mp3")))
+        .unwrap()
+        .to_string();
+    let principal = fip["stream_url"].as_str().unwrap().to_string();
+    assert_ne!(principal, midfi, "le témoin choisit un flux secondaire");
+    (principal, midfi)
+}
+
+/// Le geste de l'issue : depuis la fiche d'une station de l'annuaire qui
+/// n'est PAS dans « Mes radios », choisir un flux puis écouter. Avant #7587,
+/// la lecture ignorait le choix et jouait toujours le flux principal ; la
+/// seule voie (`preferred-stream/{radio_id}`) exigeait d'ajouter la station.
+#[tokio::test]
+async fn le_flux_choisi_d_une_fiche_non_ajoutee_est_celui_qui_joue_7587() {
+    let (app, zone_id) = annuaire_aux_flux_locaux().await;
+    let (principal, midfi) = fip_et_son_flux_midfi(&app).await;
+    let (s, lecture) = requete(
+        &app,
+        "POST",
+        &format!("/api/v1/radios/directory/S000973/play/{zone_id}"),
+        Some(json!({"stream_url": midfi})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{lecture}");
+    assert_eq!(
+        lecture["state"]["now_playing"]["source_id"],
+        midfi.as_str(),
+        "#7587 : le flux choisi sur la fiche non ajoutée doit être celui qui \
+         joue, pas le flux principal {principal} ({lecture})"
+    );
+
+    // Rien n'a été ajouté à « Mes radios ».
+    let (_, radios) = requete(&app, "GET", "/api/v1/radios", None).await;
+    assert_eq!(radios, json!([]), "{radios}");
+}
+
+#[tokio::test]
+async fn sans_choix_la_fiche_joue_son_flux_principal_et_un_flux_hors_fiche_est_refuse_7587() {
+    let (app, zone_id) = annuaire_aux_flux_locaux().await;
+    let (principal, _) = fip_et_son_flux_midfi(&app).await;
+    let chemin = format!("/api/v1/radios/directory/S000973/play/{zone_id}");
+
+    let (s, r) = requete(
+        &app,
+        "POST",
+        &chemin,
+        Some(json!({"stream_url": "https://ailleurs.example/fip.mp3"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{r}");
+    assert_eq!(r["error"], "flux_hors_fiche");
+
+    let (s, lecture) = requete(&app, "POST", &chemin, None).await;
+    assert_eq!(s, StatusCode::OK, "{lecture}");
+    assert_eq!(
+        lecture["state"]["now_playing"]["source_id"],
+        principal.as_str(),
+        "{lecture}"
+    );
+}

@@ -4859,6 +4859,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // interrogent à chaque lancement. PG : migration 086.
     index_des_identifiants_d_enregistrement(db);
 
+    // Politiques du contrôle parental (#7856) — SANS numéro de migration, sur
+    // le modèle du miroir des favoris : la 136 est demandée par plusieurs PR
+    // du même lot. Idempotent. PG : `ENSURE_TABLES` et `PG_FULL_SCHEMA`.
+    if let Err(e) = db.execute_batch(super::politique_parentale::SQL_TABLE) {
+        tracing::warn!(error = %e, "politiques_parentales_table_failed");
+    }
+
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
     // ci-dessus : une base venue de n'importe quelle version anterieure doit
@@ -4910,6 +4917,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // la constante.
     if let Err(e) = db.execute_batch(TRACKS_TITLE_INDEX) {
         warn!(error = %e, "sqlite_tracks_title_index_failed");
+    }
+    // #7619 (L1) — la clé de tri des pistes et son index : même passe, sans
+    // numéro de migration (aucune collision possible avec un lot voisin).
+    // La colonne naît NULL ; `TrackRepo::assurer_les_cles_de_tri` la remplit.
+    add_column_if_missing(db, "tracks", "cle_tri", "TEXT");
+    if let Err(e) = db.execute_batch(crate::db::track_repo::cle_de_tri::INDEX_CLE_TRI) {
+        warn!(error = %e, "sqlite_tracks_cle_tri_index_failed");
     }
     // #2149 — collections à règle de genre : même passe — voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_ALBUM_GENRE_INDEX) {
@@ -5797,6 +5811,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "cles_clients",
         include_str!("../../migrations/postgres/104_cles_clients.sql"),
     ),
+    // #7619 / #7656 : la clé de curseur existe aussi dans la chaîne migrée.
+    // Numéro 105 (décision de Bertrand du 06/11) : 101 à 104 sont pris.
+    (
+        105,
+        "tracks_cle_tri",
+        include_str!("../../migrations/postgres/105_tracks_cle_tri.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -6016,6 +6037,16 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // finale SQLite.
     if let Err(e) = sqlx::raw_sql(TRACKS_TITLE_INDEX).execute(pool).await {
         warn!(error = %e, "pg_tracks_title_index_failed");
+    }
+    // #7619 (L1) — même colonne et même index que la passe finale SQLite ;
+    // `COLLATE "C"` : l'ordre des octets, celui de SQLite et de la clé.
+    for sql in [
+        crate::db::track_repo::cle_de_tri::COLONNE_CLE_TRI_PG,
+        crate::db::track_repo::cle_de_tri::INDEX_CLE_TRI,
+    ] {
+        if let Err(e) = sqlx::raw_sql(sql).execute(pool).await {
+            warn!(error = %e, "pg_tracks_cle_tri_failed");
+        }
     }
     // #5998 — même passe que la passe finale SQLite, même raison.
     if let Err(e) = sqlx::raw_sql(crate::db::track_repo::INDEX_CHEMIN_DOSSIER_PG)
@@ -9345,7 +9376,10 @@ mod tests {
         // source des crédits de piste, que tous leurs écrivains NOMMENT.
         // 103 : `notes_personnelles` (#7849), jumelle de la SQLite 138. Crée
         // la table des notes, que les routes `/library/notes` NOMMENT.
-        assert_eq!(pg_latest_version(), 104, "latest PG migration must be 104");
+        // 104 : `cles_clients` (#7855), jumelle de la SQLite 139.
+        // 105 : tracks.cle_tri et son index de curseur (#7619 / #7656), sans
+        // jumelle numérotée côté SQLite (passe finale `add_column_if_missing`).
+        assert_eq!(pg_latest_version(), 105, "latest PG migration must be 105");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

@@ -1,0 +1,54 @@
+{
+  "id": "home",
+  "title": "Home",
+  "rows": [
+    {
+      "modules": [
+        {
+          "type": "MIXED_TYPES_LIST",
+          "title": "Custom mixes",
+          "pagedList": {
+            "limit": 10,
+            "offset": 0,
+            "totalNumberOfItems": 3,
+            "items": [
+              {
+                "type": "MIX",
+                "item": {
+                  "id": "0044dd55ee66ff778899aabbcc2233",
+                  "title": "My Mix 2",
+                  "subTitle": "Hiromi, Brad Mehldau",
+                  "mixType": "DAILY_MIX",
+                  "images": {"MEDIUM": {"width": 640, "height": 640, "url": "https://images.tidal.invalid/mix2/640.jpg"}}
+                }
+              },
+              {
+                "type": "ALBUM",
+                "item": {"id": 30557417, "title": "v2.0", "cover": "aaaa-bbbb-cccc"}
+              },
+              {
+                "type": "MIX",
+                "item": {
+                  "id": "0044dd55ee66ff778899aabbcc2233",
+                  "title": "My Mix 2",
+                  "subTitle": "Hiromi, Brad Mehldau",
+                  "mixType": "DAILY_MIX",
+                  "images": {}
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "modules": [
+        {
+          "type": "ALBUM_LIST",
+          "title": "New Albums",
+          "pagedList": {"items": [{"id": 30557418, "title": "Man Made Object", "cover": "dddd-eeee"}]}
+        }
+      ]
+    }
+  ]
+}

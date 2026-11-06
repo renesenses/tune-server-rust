@@ -1,0 +1,17 @@
+{
+  "id": "eyJwIjoiMWI0YjI1NWUtNjdkNC00ZjViLWI2MjktOTk5OWFiY2RlZjAxIn0",
+  "title": "My Mixes",
+  "rows": [
+    {
+      "modules": [
+        {
+          "id": "eyJwIjoiYWJjIiwibSI6IjEifQ",
+          "type": "MIX_LIST",
+          "width": 100,
+          "title": "",
+          "pagedList": {"limit": 50, "offset": 0, "totalNumberOfItems": 0, "items": []}
+        }
+      ]
+    }
+  ]
+}
