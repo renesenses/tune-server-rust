@@ -457,6 +457,7 @@ async fn http_directory_play_chosen_forbidden_stream_falls_back_to_allowed_one_7
         );
     }
 }
+
 /// La fiche BBC Radio 3 de l'annuaire, réduite à ses trois flux : le
 /// principal 320 kbit/s « ww » (autorisé partout sauf au Royaume-Uni), le
 /// « nonuk » 96 kbit/s sans restriction, le « uk » 320 kbit/s.
