@@ -4,11 +4,15 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
 use tokio::sync::{Mutex, mpsc, oneshot};
+
+/// Numéro de la prochaine connexion inscrite (#7833). Unique pour tout le
+/// processus : deux inscriptions du même `server_id` n'ont jamais le même.
+static PROCHAINE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub struct RelayState {
     pub servers: DashMap<String, ServerConnection>,
@@ -65,6 +69,10 @@ impl RelayState {
     /// registrant proving the same key — the bridge token alone no longer
     /// suffices. When the site knows a key for a `server_id`, `ws_server`
     /// refuses any registrant that does not prove it.
+    ///
+    /// Rend la génération de la connexion inscrite : c'est elle, et non le
+    /// seul `server_id`, que la connexion présente pour se désinscrire
+    /// (`unregister_server_si`).
     pub fn register_server(
         &self,
         server_id: String,
@@ -72,7 +80,7 @@ impl RelayState {
         bridge_token: String,
         cle_serveur: Option<String>,
         ws_tx: mpsc::Sender<String>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<u64, &'static str> {
         // Reads clone out of the map (no guard held across the later inserts,
         // which on the same DashMap would deadlock).
         let cle_en_place = self.servers.get(&server_id).map(|c| c.cle_serveur.clone());
@@ -104,9 +112,11 @@ impl RelayState {
 
         self.tokens.insert(bridge_token, server_id.clone());
         let trafic = self.trafic.serveur(&server_id);
+        let generation = PROCHAINE_GENERATION.fetch_add(1, Ordering::Relaxed);
         self.servers.insert(
             server_id.clone(),
             ServerConnection {
+                generation,
                 trafic,
                 cle_serveur,
                 server_id,
@@ -120,13 +130,37 @@ impl RelayState {
                 last_heartbeat: Instant::now(),
             },
         );
-        Ok(())
+        Ok(generation)
     }
 
     pub fn unregister_server(&self, server_id: &str) {
         if let Some((_, conn)) = self.servers.remove(server_id) {
             self.tokens.retain(|_, v| v != &conn.server_id);
         }
+    }
+
+    /// Désinscrit `server_id` seulement si l'inscription en place est encore
+    /// celle de cette `generation` (#7833).
+    ///
+    /// Un serveur qui se reconnecte avant que le relais ait vu tomber son
+    /// ancienne connexion la remplace. La fin de l'ancienne connexion ne doit
+    /// alors pas effacer la nouvelle : le serveur resterait relié, se croirait
+    /// « Connecté », et l'app recevrait `serveur_absent`.
+    pub fn unregister_server_si(&self, server_id: &str, generation: u64) {
+        if let Some((_, conn)) = self
+            .servers
+            .remove_if(server_id, |_, c| c.generation == generation)
+        {
+            self.tokens.retain(|_, v| v != &conn.server_id);
+        }
+    }
+
+    /// L'inscription en place pour `server_id` est-elle celle de cette
+    /// `generation` ?
+    pub fn est_inscrit(&self, server_id: &str, generation: u64) -> bool {
+        self.servers
+            .get(server_id)
+            .is_some_and(|c| c.generation == generation)
     }
 
     pub fn server_for_token(&self, token: &str) -> Option<String> {
@@ -161,6 +195,8 @@ impl RelayState {
 }
 
 pub struct ServerConnection {
+    /// Numéro de cette connexion (#7833), rendu par `register_server`.
+    pub generation: u64,
     pub server_id: String,
     pub server_name: String,
     pub ws_tx: mpsc::Sender<String>,
@@ -260,7 +296,7 @@ mod tests {
         }
     }
 
-    fn reg(state: &RelayState, server_id: &str, token: &str) -> Result<(), &'static str> {
+    fn reg(state: &RelayState, server_id: &str, token: &str) -> Result<u64, &'static str> {
         state.register_server(
             server_id.to_string(),
             "name".to_string(),

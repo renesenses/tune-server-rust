@@ -183,6 +183,36 @@ impl FeaturedCache {
     }
 }
 
+/// #7822 — préfixe que Tune donne à l'identifiant d'un mix TIDAL.
+///
+/// Un mix se sert comme une playlist (`StreamPlaylist`), mais TIDAL ne le lit
+/// pas par `/playlists/{uuid}/tracks` : son identifiant est une chaîne
+/// hexadécimale, et ses pistes viennent de `/pages/mix?mixId=`. Le préfixe
+/// permet à `get_playlist` et `get_playlist_tracks` de l'aiguiller, sans
+/// toucher aux routes de lecture et de file qui passent déjà par eux.
+pub const PREFIXE_MIX: &str = "mix:";
+
+/// #7822 — les mixes personnels du compte (My Daily Discovery, My Mix 1 à 8,
+/// My New Arrivals…). TIDAL les renouvelle chaque jour : on les garde peu.
+struct MixesCache {
+    /// Le compte qui les a reçus : les mixes d'un compte ne se servent pas à
+    /// un autre après une reconnexion.
+    compte: Option<u64>,
+    mixes: Vec<StreamPlaylist>,
+    fetched_at: Instant,
+}
+
+/// Durée de vie de la liste des mixes : une heure, sous les « quelques heures
+/// au plus » de #7822. Les pistes d'un mix, elles, sont relues à chaque
+/// lecture.
+const TTL_MIXES: Duration = Duration::from_secs(3600);
+
+impl MixesCache {
+    fn frais_pour(&self, compte: Option<u64>) -> bool {
+        self.compte == compte && self.fetched_at.elapsed() < TTL_MIXES
+    }
+}
+
 pub struct TidalService {
     client: Client,
     tokens: Mutex<TokenState>,
@@ -206,6 +236,8 @@ pub struct TidalService {
     /// `StreamingService` reçoivent `&self`, donc sans mutabilité intérieure il
     /// ne peut pas être rempli — c'est exactement ce qui l'avait condamné.
     featured_cache: std::sync::Mutex<Option<FeaturedCache>>,
+    /// #7822 — même choix de verrou que `featured_cache`.
+    mixes_cache: std::sync::Mutex<Option<MixesCache>>,
     enabled_override: Option<bool>,
     /// Racine de l'API, déplacée par les seuls témoins vers un serveur factice
     /// (#4803). `None` partout ailleurs : [`API_BASE`].
@@ -244,6 +276,7 @@ impl TidalService {
             pending_device_auth: None,
             device_auth_started: None,
             featured_cache: std::sync::Mutex::new(None),
+            mixes_cache: std::sync::Mutex::new(None),
             enabled_override: None,
             base_forcee: None,
             auth_forcee: None,
@@ -823,6 +856,169 @@ impl TidalService {
         }
     }
 
+    /// #7822 — un mix TIDAL sous la forme d'une playlist Tune.
+    ///
+    /// Forme lue (API v1, telle que python-tidal la décrit dans `Mix.parse`) :
+    /// `id` (chaîne), `title`, `subTitle`, `mixType`, et `images` rangées par
+    /// taille (`LARGE`, `MEDIUM`, `SMALL`, chacune avec `url`). `None` pour un
+    /// élément sans identifiant ou sans titre : il ne s'affiche ni ne se lit.
+    fn map_mix(item: &serde_json::Value) -> Option<StreamPlaylist> {
+        let id = item["id"].as_str().filter(|s| !s.is_empty())?;
+        let titre = item["title"].as_str().filter(|s| !s.is_empty())?;
+        let image = ["LARGE", "MEDIUM", "SMALL"]
+            .iter()
+            .find_map(|taille| item["images"][*taille]["url"].as_str())
+            .filter(|u| u.starts_with("http"))
+            .map(String::from);
+        Some(StreamPlaylist {
+            id: format!("{PREFIXE_MIX}{id}"),
+            name: titre.into(),
+            description: item["subTitle"]
+                .as_str()
+                .filter(|d| !d.is_empty())
+                .map(Into::into),
+            cover_path: image,
+            track_count: 0,
+            owner: Some("TIDAL".into()),
+            editable: Some(false),
+            covers: Vec::new(),
+        })
+    }
+
+    /// #7822 — les éléments `pagedList.items` de chaque module d'une page.
+    fn elements_des_modules(data: &serde_json::Value) -> Vec<(&str, &serde_json::Value)> {
+        let mut elements = Vec::new();
+        for row in data["rows"].as_array().into_iter().flatten() {
+            for module in row["modules"].as_array().into_iter().flatten() {
+                let type_module = module["type"].as_str().unwrap_or("");
+                for item in module["pagedList"]["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    elements.push((type_module, item));
+                }
+            }
+        }
+        elements
+    }
+
+    /// #7822 — les mixes d'une page TIDAL : `/pages/my_collection_my_mixes`
+    /// (modules `MIX_LIST`, mixes nus) ou `/pages/home` (modules
+    /// `MIXED_TYPES_LIST`, enveloppes `{"type": "MIX", "item": {…}}`).
+    ///
+    /// C'est la lecture que `absorber_la_page` ne fait pas : elle ne garde que
+    /// les albums, et une rangée de mixes y disparaît en entier. Une page sans
+    /// mix rend une liste vide, jamais une erreur. Un mix vu deux fois (dans
+    /// deux rangées) n'apparaît qu'une fois.
+    fn mixes_de_la_page(data: &serde_json::Value) -> Vec<StreamPlaylist> {
+        let mut mixes: Vec<StreamPlaylist> = Vec::new();
+        for (type_module, item) in Self::elements_des_modules(data) {
+            let mix = if item["type"].as_str() == Some("MIX") && item["item"].is_object() {
+                &item["item"]
+            } else if type_module == "MIX_LIST" || item["mixType"].is_string() {
+                item
+            } else {
+                continue;
+            };
+            if let Some(m) = Self::map_mix(mix)
+                && !mixes.iter().any(|deja| deja.id == m.id)
+            {
+                mixes.push(m);
+            }
+        }
+        mixes
+    }
+
+    /// #7822 — les pistes d'un mix : modules `TRACK_LIST` de `/pages/mix`,
+    /// ou `items` de `/mixes/{id}/items`. Chaque élément est une piste nue ou
+    /// une enveloppe `{"type": "track", "item": {…}}` ; une vidéo est écartée.
+    fn pistes_du_mix(data: &serde_json::Value) -> Vec<StreamTrack> {
+        let mut elements: Vec<&serde_json::Value> = Self::elements_des_modules(data)
+            .into_iter()
+            .filter(|(type_module, _)| *type_module == "TRACK_LIST")
+            .map(|(_, item)| item)
+            .collect();
+        if elements.is_empty() {
+            elements = data["items"].as_array().into_iter().flatten().collect();
+        }
+        elements
+            .into_iter()
+            .filter_map(|item| {
+                let piste = if item["item"].is_object() {
+                    &item["item"]
+                } else {
+                    item
+                };
+                let type_element = item["type"].as_str().unwrap_or("track");
+                let est_une_piste =
+                    type_element.eq_ignore_ascii_case("track") && piste["id"].as_u64().is_some();
+                est_une_piste.then(|| Self::map_track(piste))
+            })
+            .collect()
+    }
+
+    /// #7822 — l'en-tête d'une page `/pages/mix` (module `MIX_HEADER`).
+    fn entete_du_mix(data: &serde_json::Value) -> Option<StreamPlaylist> {
+        data["rows"]
+            .as_array()?
+            .iter()
+            .flat_map(|row| row["modules"].as_array().into_iter().flatten())
+            .find(|module| module["mix"].is_object())
+            .and_then(|module| Self::map_mix(&module["mix"]))
+    }
+
+    /// #7822 — la liste des mixes en cache, si elle est fraîche et de ce compte.
+    fn mixes_depuis_le_cache(&self) -> Option<Vec<StreamPlaylist>> {
+        let cache = self.mixes_cache.lock().ok()?;
+        let entree = cache.as_ref()?;
+        entree
+            .frais_pour(self.user_id)
+            .then(|| entree.mixes.clone())
+    }
+
+    fn vider_le_cache_des_mixes(&self) {
+        if let Ok(mut cache) = self.mixes_cache.lock() {
+            *cache = None;
+        }
+    }
+
+    /// #7822 — lit la page des mixes du compte, et à défaut les rangées de
+    /// mixes de la page d'accueil.
+    async fn lire_les_mixes(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        match self
+            .api_get("/pages/my_collection_my_mixes?deviceType=BROWSER")
+            .await
+        {
+            Ok(page) => {
+                let mixes = Self::mixes_de_la_page(&page);
+                if !mixes.is_empty() {
+                    return Ok(mixes);
+                }
+                debug!("tidal_mixes_page_vide_repli_accueil");
+            }
+            Err(e) => warn!(error = %e, "tidal_mixes_page_illisible_repli_accueil"),
+        }
+        let accueil = self.api_get("/pages/home?deviceType=BROWSER").await?;
+        Ok(Self::mixes_de_la_page(&accueil))
+    }
+
+    /// #7822 — les pistes d'un mix (identifiant TIDAL, sans le préfixe).
+    async fn pistes_d_un_mix(&self, mix_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        let id = urlencoding::encode(mix_id);
+        let page = self
+            .api_get(&format!("/pages/mix?mixId={id}&deviceType=BROWSER"))
+            .await?;
+        let pistes = Self::pistes_du_mix(&page);
+        if !pistes.is_empty() {
+            return Ok(pistes);
+        }
+        let items = self
+            .api_get(&format!("/mixes/{id}/items?limit=100"))
+            .await?;
+        Ok(Self::pistes_du_mix(&items))
+    }
+
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
         let base = self.api_base();
@@ -1317,6 +1513,7 @@ impl TidalService {
         if let Ok(mut cache) = self.featured_cache.lock() {
             *cache = None;
         }
+        self.vider_le_cache_des_mixes();
     }
 
     async fn api_post_form(
@@ -1857,6 +2054,8 @@ impl StreamingService for TidalService {
             ts.refresh_token = None;
         }
         self.username = None;
+        // #7822 — les mixes sont ceux du compte qui se déconnecte.
+        self.vider_le_cache_des_mixes();
         Ok(())
     }
 
@@ -2437,6 +2636,20 @@ impl StreamingService for TidalService {
     }
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
+        if let Some(mix_id) = playlist_id.strip_prefix(PREFIXE_MIX) {
+            if let Some(mix) = self
+                .mixes_depuis_le_cache()
+                .and_then(|mixes| mixes.into_iter().find(|m| m.id == playlist_id))
+            {
+                return Ok(mix);
+            }
+            let id = urlencoding::encode(mix_id);
+            let page = self
+                .api_get(&format!("/pages/mix?mixId={id}&deviceType=BROWSER"))
+                .await?;
+            return Self::entete_du_mix(&page)
+                .ok_or_else(|| TuneError::from(format!("tidal mix not found: {mix_id}")));
+        }
         let data = self.api_get(&format!("/playlists/{playlist_id}")).await?;
         Ok(Self::map_playlist(&data))
     }
@@ -2446,6 +2659,11 @@ impl StreamingService for TidalService {
     /// à la lecture — on écoute rarement au-delà — mais la FUSION, elle, en
     /// perdait les neuf dixièmes.
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        // #7822 — un mix se lit et s'ajoute à la file comme une playlist :
+        // les routes de lecture passent par ici avec son identifiant.
+        if let Some(mix_id) = playlist_id.strip_prefix(PREFIXE_MIX) {
+            return self.pistes_d_un_mix(mix_id).await;
+        }
         let mut toutes: Vec<StreamTrack> = Vec::new();
         let mut offset = 0u32;
         let page = 100u32;
@@ -2506,6 +2724,22 @@ impl StreamingService for TidalService {
         }
         let data = self.api_get("/pages/home").await?;
         Ok(self.absorber_la_page(&data))
+    }
+
+    async fn get_user_mixes(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        if let Some(mixes) = self.mixes_depuis_le_cache() {
+            debug!("tidal_mixes_cache_hit");
+            return Ok(mixes);
+        }
+        let mixes = self.lire_les_mixes().await?;
+        if let Ok(mut cache) = self.mixes_cache.lock() {
+            *cache = Some(MixesCache {
+                compte: self.user_id,
+                mixes: mixes.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
+        Ok(mixes)
     }
 
     async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
@@ -4917,6 +5151,11 @@ impl TidalService {
 #[cfg(test)]
 #[path = "tidal_qualite_livree_6334_tests.rs"]
 mod qualite_livree_6334_tests;
+
+// #7822 — les mixes du compte, lus dans des réponses TIDAL enregistrées.
+#[cfg(test)]
+#[path = "tidal_mixes_7822_tests.rs"]
+mod mixes_7822_tests;
 
 // #6334 — lecture par `trackManifests` v2, repli v1.
 #[path = "tidal_manifeste_v2.rs"]

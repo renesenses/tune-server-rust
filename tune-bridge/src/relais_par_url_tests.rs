@@ -238,3 +238,78 @@ async fn un_corps_texte_dun_ancien_serveur_reste_lu() {
     assert_eq!(statut, 200);
     assert_eq!(octets, b"[1,2]".to_vec());
 }
+
+/// #7602 — l'ecran Repertoires par le relais. Le navigateur accepte gzip : le
+/// pont doit le dire au serveur (sous `x-tune-accept-encoding`, qu'un serveur
+/// anterieur ignore), et rendre au navigateur la reponse compressee avec son
+/// `content-encoding`, octet pour octet. Sans cela, la liste des dossiers
+/// traversait le relais en clair, 5 a 10 fois plus lourde qu'en local, et le
+/// premier chargement passait les 30 s du relais.
+#[tokio::test]
+async fn la_liste_des_dossiers_traverse_le_relais_compressee() {
+    let mut pont = pont_de_test().await;
+    // Debut d'un vrai flux gzip (1F 8B 08 00), invalide en UTF-8.
+    let gzip: Vec<u8> = vec![0x1F, 0x8B, 0x08, 0x00, 0xFF, 0x01, 0x02, 0x80];
+    let requete = reqwest::Client::new()
+        .get(format!("{}/library/browse", pont.base))
+        .header("x-bridge-token", JETON)
+        .header("accept-encoding", "gzip, deflate, br, zstd");
+    let envoi = tokio::spawn(async move { requete.send().await.unwrap() });
+    let relayee = tokio::time::timeout(PATIENCE, pont.serveur.recv())
+        .await
+        .expect("requete non relayee")
+        .unwrap();
+    let relayee: serde_json::Value = serde_json::from_str(&relayee).unwrap();
+    assert_eq!(relayee["path"], "/api/v1/library/browse");
+    assert_eq!(
+        relayee["headers"]["x-tune-accept-encoding"], "gzip, deflate, br, zstd",
+        "le serveur ne sait pas que le navigateur accepte gzip : {}",
+        relayee["headers"]
+    );
+    assert!(
+        relayee["headers"].get("accept-encoding").is_none(),
+        "un serveur anterieur compresserait sans rendre content-encoding"
+    );
+    let reponse = serde_json::json!({
+        "type": "relay.response",
+        "id": relayee["id"],
+        "status": 200,
+        "headers": {
+            "content-type": "application/json",
+            "content-encoding": "gzip",
+            "vary": "accept-encoding",
+        },
+        "body_base64": "H4sIAP8BAoA=",
+    });
+    crate::ws_server::handle_server_message(&pont.state, "srv", &reponse.to_string()).await;
+    let rep = tokio::time::timeout(PATIENCE, envoi)
+        .await
+        .expect("le pont n'a jamais repondu")
+        .unwrap();
+    assert_eq!(rep.status().as_u16(), 200);
+    assert_eq!(
+        rep.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "content-encoding retire par le pont : le navigateur lirait du gzip comme du JSON"
+    );
+    assert_eq!(
+        rep.headers().get("vary").and_then(|v| v.to_str().ok()),
+        Some("accept-encoding")
+    );
+    assert_eq!(rep.bytes().await.unwrap().to_vec(), gzip);
+}
+
+/// Sans `accept-encoding` du navigateur, rien n'est demande au serveur.
+#[tokio::test]
+async fn sans_accept_encoding_rien_nest_demande_au_serveur() {
+    let mut pont = pont_de_test().await;
+    let requete = reqwest::Client::new()
+        .get(format!("{}/library/browse", pont.base))
+        .header("x-bridge-token", JETON);
+    let (relayee, _, _) = echange(&mut pont, requete, ok_json).await;
+    let h = &relayee.unwrap()["headers"];
+    assert!(h.get("x-tune-accept-encoding").is_none(), "{h}");
+    assert!(h.get("accept-encoding").is_none(), "{h}");
+}
