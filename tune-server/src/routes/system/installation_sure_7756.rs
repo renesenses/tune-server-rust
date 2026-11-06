@@ -268,12 +268,7 @@ pub(super) fn valider_binaire(chemin: &Path, controles: &Controles) -> Result<()
 /// répond pas dans le délai, est refusé.
 fn essayer_version(chemin: &Path) -> Result<(), String> {
     use std::io::Read;
-    let mut enfant = std::process::Command::new(chemin)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+    let mut enfant = lancer_quand_libre(chemin)
         .map_err(|e| format!("invalid binary: cannot run `--version`: {e}"))?;
     let debut = std::time::Instant::now();
     let statut = loop {
@@ -301,6 +296,39 @@ fn essayer_version(chemin: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Délai pendant lequel un `--version` refusé par `ETXTBSY` est relancé.
+const DELAI_FICHIER_OCCUPE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Lance `<binaire> --version`, en relançant tant que le système répond
+/// `ETXTBSY` (« Text file busy »).
+///
+/// Un `fork` d'un autre fil du serveur (ou d'un test voisin) pendant
+/// `ecrire_durablement` hérite du descripteur ouvert en écriture sur le
+/// `.new`, jusqu'à son propre `exec`. Pendant cette fenêtre, `exec` du `.new`
+/// échoue par `ETXTBSY` : le binaire est bon, il n'est simplement pas encore
+/// libre. Sans relance, un binaire valide était refusé (CI de #7755,
+/// « Text file busy (os error 26) — previous binary kept »).
+fn lancer_quand_libre(chemin: &Path) -> io::Result<std::process::Child> {
+    let debut = std::time::Instant::now();
+    loop {
+        let essai = std::process::Command::new(chemin)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match essai {
+            Err(e)
+                if e.kind() == io::ErrorKind::ExecutableFileBusy
+                    && debut.elapsed() < DELAI_FICHIER_OCCUPE =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            autre => return autre,
+        }
+    }
 }
 
 /// Force sur le disque les entrées du dossier (les renommages). Sans lui, la
@@ -548,6 +576,28 @@ mod tests {
 
         let neuf = inst.extrait(b"#!/bin/sh\necho tune-server 1.0.0-rc10\n");
         inst.installer(&neuf, &reel).expect("binaire qui répond");
+    }
+
+    /// Un binaire valide encore ouvert en écriture ailleurs (le `fork` d'un
+    /// autre fil hérite du descripteur de `ecrire_durablement`) n'est pas
+    /// refusé : l'essai attend qu'il soit libre. Le descripteur tenu ici
+    /// rejoue, sans dépendre du hasard, le « Text file busy » de la CI de
+    /// #7755.
+    #[test]
+    fn l_essai_version_attend_un_binaire_encore_ouvert_en_ecriture() {
+        let inst = Installation::nouvelle();
+        let neuf = inst.extrait(b"#!/bin/sh\necho tune-server 1.0.0-rc10\n");
+        std::fs::set_permissions(&neuf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ecrivain = std::fs::OpenOptions::new().write(true).open(&neuf).unwrap();
+        let liberation = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(ecrivain);
+        });
+        let resultat = essayer_version(&neuf);
+        liberation.join().unwrap();
+        resultat.unwrap_or_else(|e| {
+            panic!("un binaire valide, encore ouvert en écriture un instant, a été refusé : {e}")
+        });
     }
 
     /// Un échec après la bascule (`web/`) remet l'ancien binaire en place.
