@@ -34,8 +34,9 @@ const TAILLE_DES_BLOCS: usize = 32_768;
 /// Blocs en attente entre le décodeur et la boucle RTP : ~6 s de 44,1 kHz
 /// stéréo 32 bits. Le décodeur prend de l'avance sans charger la piste.
 const CAPACITE_DU_CANAL: usize = 64;
-/// L'en-tête WAV que toutes les branches du décodeur envoient en tête.
-const TAILLE_ENTETE_WAV: usize = 44;
+/// L'en-tête WAV que toutes les branches du décodeur envoient en tête. Aussi
+/// lu par la sortie Devialet AIR (#6911).
+pub(crate) const TAILLE_ENTETE_WAV: usize = 44;
 
 /// Le corps HTTP lu en continu, pour un serveur qui ignore `Range`. Aussi lu
 /// par la sortie Devialet AIR (#6911).

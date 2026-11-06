@@ -26,6 +26,7 @@ use super::emetteur::{
 };
 use super::protocole::{self, Annonce, PORT_AMPLI, PORT_ANNONCES, PORT_AUDIO_LOCAL, opcode};
 use super::reglages;
+use crate::outputs::airplay::flux_progressif::TAILLE_ENTETE_WAV;
 use crate::outputs::traits::{
     AudioSpec, FormatOuvert, OutputCapabilities, OutputStatus, OutputTarget, PlayMedia,
     TransformationsReelles, TransportState,
@@ -565,8 +566,8 @@ struct SourceOuverte {
     cadence_envoyee: u32,
 }
 
-/// L'en-tête WAV que le décodeur émet avant le PCM.
-const TAILLE_ENTETE_WAV: usize = 44;
+/// Octets d'une trame du décodeur : stéréo, 24 bits (3 octets par canal).
+const OCTETS_PAR_TRAME: usize = 6;
 
 /// Les octets PCM du décodeur, et la tâche qui les produit (profondeur, débit).
 type DecodeurOuvert = (
@@ -699,7 +700,7 @@ fn ouvrir_decodeur_distant(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 a_ecarter_octets = Some(match (depuis, cadence_de_l_entete(&entete)) {
-                    (Some(s), Some(c)) => (s * f64::from(c)) as usize * 6,
+                    (Some(s), Some(c)) => (s * f64::from(c)) as usize * OCTETS_PAR_TRAME,
                     _ => 0,
                 });
                 if tx.send(std::mem::take(&mut entete)).await.is_err() {
@@ -757,8 +758,11 @@ async fn ouvrir_la_source(
     let entete = premier_bloc(&mut rx, attente).await?;
     let Some(cadence_source) = entete.as_deref().and_then(cadence_de_l_entete) else {
         drop(rx);
-        return Err(match decodeur.await {
-            Ok(Err(e)) => format!("décodage impossible : {e}"),
+        // La raison du décodeur, attendue au plus `attente` : un décodeur qui
+        // a livré autre chose qu'un en-tête peut encore lire une source qui
+        // cale.
+        return Err(match tokio::time::timeout(attente, decodeur).await {
+            Ok(Ok(Err(e))) => format!("décodage impossible : {e}"),
             _ => "devialet_air: le décodeur n'a pas annoncé son format".into(),
         });
     };
@@ -766,8 +770,11 @@ async fn ouvrir_la_source(
     let (mut rx, decodeur) = if cadence_envoyee == cadence_source {
         (rx, decodeur)
     } else {
-        drop(rx);
-        let _ = decodeur.await;
+        // Le premier décodeur n'est pas attendu : sur une source distante
+        // qui a livré son en-tête puis cale, son fil reste en lecture sans
+        // fin, sortie verrouillée. Privé de récepteur, il s'arrête seul au
+        // prochain bloc ou quand la source ferme.
+        drop((rx, decodeur));
         let (mut rx, decodeur) =
             ouvrir_decodeur(&source, Some(cadence_envoyee), depuis_s, en_direct);
         match premier_bloc(&mut rx, attente)
@@ -791,7 +798,7 @@ async fn ouvrir_la_source(
         let mut envoye = false;
         while let Some(bloc) = rx.recv().await {
             reste.extend_from_slice(&bloc);
-            let complets = reste.len() / 6 * 6;
+            let complets = reste.len() / OCTETS_PAR_TRAME * OCTETS_PAR_TRAME;
             let lot: Vec<[i32; 2]> = reste[..complets]
                 .as_chunks::<6>()
                 .0

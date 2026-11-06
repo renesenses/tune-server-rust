@@ -25,6 +25,9 @@ enum Corps {
     SansFin,
     /// Rien du tout : la connexion reste ouverte, muette.
     Muet,
+    /// Un en-tête WAV à 192 kHz, cadence que AIR ne transporte pas, puis plus
+    /// rien : la source cale après avoir annoncé son format.
+    CaleApresLEntete,
     /// Un fichier fini, envoyé d'un bloc.
     Fini(Arc<Vec<u8>>),
 }
@@ -83,10 +86,19 @@ impl FausseSource {
                             }
                         }
                         Corps::Muet => {
-                            // Assez longtemps pour dépasser l'attente bornée,
+                            // Plus longtemps que `BORNE`, pour qu'une attente
+                            // sans borne rougisse sur son propre message ;
                             // puis la connexion se ferme : le fil du décodeur
                             // ne reste pas bloqué après le test.
-                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            tokio::time::sleep(SILENCE_DE_LA_SOURCE).await;
+                        }
+                        Corps::CaleApresLEntete => {
+                            let entete =
+                                crate::audio::wav::build_wav_header_streaming(2, 192_000, 24);
+                            if connexion.write_all(&entete).await.is_err() {
+                                return;
+                            }
+                            tokio::time::sleep(SILENCE_DE_LA_SOURCE).await;
                         }
                         Corps::Fini(octets) => {
                             let _ = connexion.write_all(&octets).await;
@@ -118,6 +130,9 @@ fn media_distant(url: &str, duree_ms: Option<u64>) -> PlayMedia<'_> {
 /// La borne au-delà de laquelle un démarrage tient la zone : bien plus que
 /// l'attente du premier son du banc (1 s), bien moins que les 600 s d'avant.
 const BORNE: Duration = Duration::from_secs(5);
+
+/// Ce que dure le silence d'une fausse source qui cale : au-delà de `BORNE`.
+const SILENCE_DE_LA_SOURCE: Duration = Duration::from_secs(7);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn air_6911_une_radio_sans_fin_demarre_sans_tenir_la_sortie() {
@@ -247,5 +262,39 @@ async fn air_6911_la_reprise_sur_une_source_sans_range_repart_de_la_pause() {
     assert!(
         trouve.is_some(),
         "la reprise doit partir de la trame {voulu} (±4) de la piste, pas du début"
+    );
+}
+
+/// Une source à 192 kHz est rouverte à 96 kHz. Le premier décodeur, qui lit
+/// une source qui cale après son en-tête, ne doit pas être attendu sortie
+/// verrouillée.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn air_6911_une_source_haute_cadence_qui_cale_ne_tient_pas_la_sortie() {
+    let b = banc(annonce_de_test(), true).await;
+    let source = FausseSource::demarrer(Corps::CaleApresLEntete).await;
+    let url = source.url("/stream/piste-192k.wav");
+
+    let debut = Instant::now();
+    let issue = tokio::time::timeout(
+        BORNE,
+        b.sortie.play_media(&media_distant(&url, Some(60_000))),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "#6911 : play_media tient la sortie plus de {BORNE:?} quand une source à 192 kHz \
+             cale après son en-tête (le premier décodeur est attendu sans borne avant la \
+             réouverture à 96 kHz)"
+        )
+    });
+    assert!(debut.elapsed() < BORNE);
+    let arret = tokio::time::timeout(Duration::from_secs(2), b.sortie.stop()).await;
+    assert!(
+        arret.is_ok(),
+        "#6911 : l'arrêt doit rendre la main ({issue:?})"
+    );
+    assert_eq!(
+        b.sortie.get_status().await.unwrap().state,
+        TransportState::Stopped
     );
 }
