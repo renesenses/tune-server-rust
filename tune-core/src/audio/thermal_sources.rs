@@ -543,6 +543,8 @@ pub(crate) mod windows_sources {
                     if code.is_err() {
                         return Err(echec("IEnumWbemClassObject::Next", code));
                     }
+                    // Les instances déjà lues sont écartées aussi : une
+                    // énumération incomplète passe à la source suivante.
                     if code == WBEM_S_DELAI_DEPASSE {
                         return Err(EchecDeSource::Erreur(format!(
                             "IEnumWbemClassObject::Next : délai dépassé ({DELAI_PAR_INSTANCE_MS} ms)"
