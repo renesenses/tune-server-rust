@@ -9,9 +9,10 @@
 //!   [`super::etage_natif::EtageNatif`] (#4011) décode vers des mots `i32`
 //!   alignés à gauche et écrit dans un [`super::etage_natif::PuitsAnneauNatif`]
 //!   posé sur l'anneau natif du backend (`Puits::Natif`). La décision DoP
-//!   reste dans le producteur, le DoP est porté tel quel, le volume s'applique
-//!   dans l'étage — exactement ce que `feed_windows_native_exclusive_leftover`
-//!   faisait. [`EtageNatifAsio`] est l'enveloppe qui le présente au trait
+//!   reste dans le producteur, le DoP est porté tel quel. L'étage est monté à
+//!   l'unité : le volume s'applique au rendu, dans le rappel
+//!   (`pop_mapped_au_gain`), et non plus avant l'anneau de 2 s (#7934).
+//!   [`EtageNatifAsio`] est l'enveloppe qui le présente au trait
 //!   `Etage` et qui publie le contrat du signal après chaque bloc ;
 //! * **route traitée** (`Processed*` : le pilote n'accepte qu'un mot qui ne
 //!   tient pas tous les bits de la source) — l'étage de R1
