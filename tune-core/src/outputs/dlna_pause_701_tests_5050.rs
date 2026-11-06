@@ -190,9 +190,10 @@ fn la_conduite_suit_l_etat_declare() {
     assert_eq!(conduite_apres_refus_pause(Some("TRANSITIONING")), Attendre);
     assert_eq!(conduite_apres_refus_pause(Some("PLAYING")), RenvoyerPause);
     assert_eq!(conduite_apres_refus_pause(Some("STOPPED")), Abandonner);
+    // #7894 — sans média, rien ne joue : ce n'est pas un refus à remonter.
     assert_eq!(
         conduite_apres_refus_pause(Some("NO_MEDIA_PRESENT")),
-        Abandonner
+        RienNeJoue
     );
     assert_eq!(conduite_apres_refus_pause(None), Abandonner);
 }

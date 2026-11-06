@@ -160,6 +160,12 @@ pub struct PodcastEpisode {
     pub duration_ms: u64,
     pub published: String,
     pub cover_url: String,
+    /// #7894 — le type que le flux DÉCLARE pour l'audio (`enclosure@type`,
+    /// ou `type` du lien `enclosure` en Atom). L'extension de l'adresse ne le
+    /// dit pas toujours : un M4A servi sous une adresse sans extension était
+    /// annoncé `audio/mpeg` à l'appareil de rendu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 /// Un flux lu : l'image de la chaîne (vide si le flux n'en déclare pas) et
@@ -1162,6 +1168,13 @@ fn parse_rss(xml: &str, limit: usize) -> Result<Vec<PodcastEpisode>, String> {
             extract_attr(item, "enclosure", "url")
         }
         .unwrap_or_default();
+        let mime_type = if atom {
+            atom_enclosure_type(item)
+        } else {
+            extract_attr(item, "enclosure", "type")
+        }
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
         if audio_url.is_empty() {
             search_from = item_end;
             continue;
@@ -1187,6 +1200,7 @@ fn parse_rss(xml: &str, limit: usize) -> Result<Vec<PodcastEpisode>, String> {
             duration_ms,
             published,
             cover_url,
+            mime_type,
         });
         search_from = item_end;
     }
@@ -1203,6 +1217,21 @@ fn atom_enclosure(entry: &str) -> Option<String> {
         let link = &tag[..=end];
         if link.contains("rel=\"enclosure\"") {
             return extract_attr(link, "link", "href");
+        }
+        rest = &tag[end..];
+    }
+    None
+}
+
+/// #7894 — le `type` du lien `enclosure` d'une entrée Atom.
+fn atom_enclosure_type(entry: &str) -> Option<String> {
+    let mut rest = entry;
+    while let Some(start) = rest.find("<link ") {
+        let tag = &rest[start..];
+        let end = tag.find('>')?;
+        let link = &tag[..=end];
+        if link.contains("rel=\"enclosure\"") {
+            return extract_attr(link, "link", "type");
         }
         rest = &tag[end..];
     }
@@ -1364,6 +1393,19 @@ mod tests {
         assert_eq!(episodes.len(), 2);
         assert_eq!(episodes[0].title, "Ep 1");
         assert_eq!(episodes[0].duration_ms, 1800000);
+    }
+    /// #7894 — le type déclaré par le flux est gardé avec l'épisode, en RSS
+    /// comme en Atom : c'est lui, et non l'extension de l'adresse, qui dit à
+    /// l'appareil de rendu ce qu'il va recevoir.
+    #[test]
+    fn le_type_declare_par_le_flux_suit_l_episode_7894() {
+        let rss = r#"<rss><channel><item><title>Ep</title><enclosure url="https://h.example/media/42" length="1" type="audio/x-m4a"/></item><item><title>Sans type</title><enclosure url="https://h.example/b.mp3"/></item></channel></rss>"#;
+        let episodes = parse_rss(rss, 10).unwrap();
+        assert_eq!(episodes[0].mime_type.as_deref(), Some("audio/x-m4a"));
+        assert_eq!(episodes[1].mime_type, None);
+        let atom = r#"<feed><entry><title>A</title><link rel="enclosure" type="audio/mp4" href="https://h.example/a"/></entry></feed>"#;
+        let episodes = parse_rss(atom, 10).unwrap();
+        assert_eq!(episodes[0].mime_type.as_deref(), Some("audio/mp4"));
     }
     #[test]
     fn curated_french_podcasts() {

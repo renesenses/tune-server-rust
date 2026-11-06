@@ -4028,6 +4028,23 @@
     "pl": "Strefa „{zone}”: urządzenie nie wykonało polecenia ({command}). Przyczyna: {cause}",
     "el": "Ζώνη «{zone}»: η συσκευή δεν εκτέλεσε την εντολή ({command}). Αιτία: {cause}"
   },
+  "api.playback.nothingPlayingOnDevice": {
+    "fr": "Rien ne joue sur {zone} : l'appareil n'a aucun média. La lecture est arrêtée ; appuyez sur Lecture pour reprendre.",
+    "en": "Nothing is playing on {zone}: the device has no media loaded. Playback has been stopped; press Play to resume.",
+    "de": "Auf {zone} wird nichts abgespielt: Das Gerät hat kein Medium geladen. Die Wiedergabe wurde gestoppt; drücken Sie Wiedergabe, um fortzufahren.",
+    "es": "No se está reproduciendo nada en {zone}: el dispositivo no tiene ningún medio cargado. La reproducción se ha detenido; pulse Reproducir para reanudar.",
+    "it": "Su {zone} non è in riproduzione nulla: il dispositivo non ha alcun contenuto caricato. La riproduzione è stata interrotta; premi Riproduci per riprendere.",
+    "zh": "{zone} 上没有正在播放的内容：设备未加载任何媒体。播放已停止；按“播放”继续。",
+    "ja": "{zone} では何も再生されていません。デバイスにメディアが読み込まれていません。再生を停止しました。再開するには再生を押してください。",
+    "ko": "{zone}에서 재생 중인 항목이 없습니다. 기기에 로드된 미디어가 없습니다. 재생을 중지했습니다. 다시 시작하려면 재생을 누르세요.",
+    "ro": "Nu se redă nimic pe {zone}: dispozitivul nu are niciun conținut încărcat. Redarea a fost oprită; apăsați Redare pentru a relua.",
+    "sv": "Inget spelas på {zone}: enheten har inget media inläst. Uppspelningen har stoppats; tryck på Spela för att fortsätta.",
+    "hu": "A(z) {zone} zónán semmi sem szól: az eszközön nincs betöltött média. A lejátszás leállt; a folytatáshoz nyomja meg a Lejátszás gombot.",
+    "vi": "Không có gì đang phát trên {zone}: thiết bị chưa nạp nội dung nào. Đã dừng phát; nhấn Phát để tiếp tục.",
+    "nb": "Ingenting spilles på {zone}: enheten har ikke noe medium lastet. Avspillingen er stoppet; trykk på Spill av for å fortsette.",
+    "pl": "Na {zone} nic nie jest odtwarzane: urządzenie nie ma załadowanych multimediów. Odtwarzanie zostało zatrzymane; naciśnij Odtwórz, aby wznowić.",
+    "el": "Δεν αναπαράγεται τίποτα στο {zone}: η συσκευή δεν έχει φορτωμένο μέσο. Η αναπαραγωγή διακόπηκε· πατήστε Αναπαραγωγή για συνέχεια."
+  },
   "api.playback.queueEmptyNothingToSave": {
     "fr": "La file d'attente est vide : il n'y a rien à enregistrer.",
     "en": "The queue is empty: there is nothing to save.",
