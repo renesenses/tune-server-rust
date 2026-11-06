@@ -2678,7 +2678,7 @@ pub(crate) fn armer_serveur_squeezebox(state: &AppState, config: &TuneConfig) {
 /// Au retour, les ports TCP sont libres : un Lyrion/LMS de la même machine peut
 /// les reprendre sans que Tune redémarre.
 pub(crate) async fn eteindre_serveur_squeezebox() -> bool {
-    let udp = tune_core::slimproto::discovery::eteindre();
+    let udp = tune_core::slimproto::discovery::eteindre_avec_le_serveur();
     let tcp = tune_core::slimproto::eteindre_serveur_tcp().await;
     let cli = tune_core::slimproto::cli_server::eteindre().await;
     udp || tcp || cli

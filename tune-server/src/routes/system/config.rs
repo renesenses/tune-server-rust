@@ -2128,7 +2128,14 @@ pub(super) async fn update_config(
         tracing::info!(actif, "network_noise_watch_applied");
     }
     // #7374 — le serveur d'abord, sans redémarrage : l'annonce n'a de sens
-    // que s'il tourne.
+    // que s'il tourne. Deux PATCH simultanés passent l'un après l'autre :
+    // sinon un « rallumer » arrivé pendant l'attente d'une extinction armerait
+    // un serveur dont l'extinction effacerait ensuite l'état d'écoute.
+    let _bascule = if serveur_demande.is_some() || annonce_demandee.is_some() {
+        Some(BASCULE_SQUEEZEBOX.lock().await)
+    } else {
+        None
+    };
     let serveur_applique = match serveur_demande {
         Some(actif) => Some(appliquer_serveur_squeezebox(&state, actif).await),
         None => None,
@@ -2321,6 +2328,9 @@ pub(crate) fn action_serveur(demande: bool, tcp_arme: bool, un_volet_arme: bool)
         _ => ActionServeur::Rien,
     }
 }
+
+/// Une seule bascule du serveur Squeezebox ou de son annonce à la fois (#7374).
+static BASCULE_SQUEEZEBOX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Applique le réglage « Serveur Squeezebox de Tune » sans redémarrage (#7374).
 /// Vrai si l'état a changé.
