@@ -443,7 +443,11 @@ async fn faux_renderer() -> (String, Arc<Mutex<JournalRenderer>>) {
                         jr.play.get_or_insert(Instant::now());
                         let (uri, journal) = (jr.uri.clone(), journal.clone());
                         tokio::spawn(async move {
-                            let reponse = reqwest::get(&uri).await.expect("GET du renderer");
+                            let reponse = crate::http::client::shared()
+                                .get(&uri)
+                                .send()
+                                .await
+                                .expect("GET du renderer");
                             let mime = reponse
                                 .headers()
                                 .get("content-type")
@@ -653,12 +657,9 @@ fn tableau(m: &Mesure) -> String {
 }
 
 fn pcm_de(octets: &[u8], ext: &str) -> (Vec<u8>, u32, u16) {
-    let chemin =
-        std::env::temp_dir().join(format!("tune-7266-banc-{}.{ext}", uuid::Uuid::new_v4()));
-    std::fs::write(&chemin, octets).unwrap();
-    let d = crate::audio::decode::decode_to_pcm(chemin.to_str().unwrap(), None, None, 0.0, 0.0)
-        .unwrap();
-    let _ = std::fs::remove_file(&chemin);
+    let chemin = crate::test_scratch::scratch_file("tune-7266-banc", &format!(".{ext}"));
+    std::fs::write(chemin.path(), octets).unwrap();
+    let d = crate::audio::decode::decode_to_pcm(&chemin.as_str(), None, None, 0.0, 0.0).unwrap();
     (d.pcm_bytes(), d.sample_rate, d.bit_depth)
 }
 
