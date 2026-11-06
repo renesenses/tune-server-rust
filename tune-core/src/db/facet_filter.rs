@@ -693,13 +693,15 @@ pub fn dr_album_in(engine: Engine, having: &str) -> String {
 
 /// #2144 (rc10) — le DR de chaque album porteur d'un tag DR, sous le jeton de
 /// la base qui l'a rendu ([`super::backend::DbBackend::jeton_des_donnees`]).
-/// Une entrée PAR INSTANCE de base (l'instance est la première moitié du
-/// jeton) : un serveur n'ouvre qu'une base, donc une entrée — mais deux bases
-/// ouvertes dans le même processus (les tests, qui tournent en parallèle) ne
-/// s'évincent plus l'une l'autre. Avant, l'entrée unique faisait relire les
-/// tags DR à la première base dès qu'une seconde lisait sa carte (#7675 : le
-/// témoin de #7580 rougissait selon l'ordre des tests). Borné à
-/// [`DR_EN_CACHE_MAX`] entrées : les bases refermées ne s'accumulent pas.
+///
+/// #7675 puis #7817 — UNE ENTRÉE PAR INSTANCE de base (l'instance est la
+/// première moitié du jeton) : la lecture d'une autre base ne chasse plus la
+/// carte de celle-ci. Avec une seule case, deux bases ouvertes dans le même
+/// processus (les tests en parallèle) se chassaient l'une l'autre, et le
+/// témoin du #7580 comptait des relectures au hasard, selon l'ordre des tests.
+/// Un serveur n'a qu'une base, donc une entrée ; les tests en ouvrent des
+/// milliers : au-delà de [`DR_EN_CACHE_MAX`] bases, celle qui a été lue le
+/// moins récemment est oubliée (les bases refermées ne s'accumulent pas).
 type DrEnCache = Vec<(
     (u64, i64),
     std::sync::Arc<std::collections::HashMap<i64, i64>>,
@@ -724,10 +726,15 @@ pub fn dr_par_album(
     // jeton neuf.
     let jeton = db.jeton_des_donnees();
     if let Some(j) = jeton
-        && let Ok(cache) = DR_PAR_ALBUM_EN_CACHE.lock()
-        && let Some((_, carte)) = cache.iter().find(|(garde, _)| *garde == j)
+        && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+        && let Some(i) = cache.iter().position(|(garde, _)| *garde == j)
     {
-        return Ok(carte.clone());
+        // Servie : remise en dernier, la plus récemment lue est oubliée en
+        // dernier.
+        let entree = cache.remove(i);
+        let carte = entree.1.clone();
+        cache.push(entree);
+        return Ok(carte);
     }
     let sql = format!(
         "SELECT dr.album_id, dr.dr FROM ({}) dr",
@@ -745,8 +752,8 @@ pub fn dr_par_album(
     if let Some(j) = jeton
         && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
     {
-        // La carte précédente de CETTE base est périmée ; celles des autres
-        // bases restent servables sous leur propre jeton.
+        // La carte précédente de CETTE base est périmée ; les autres bases
+        // gardent la leur, servable sous leur propre jeton.
         cache.retain(|(garde, _)| garde.0 != j.0);
         if cache.len() >= DR_EN_CACHE_MAX {
             cache.remove(0);

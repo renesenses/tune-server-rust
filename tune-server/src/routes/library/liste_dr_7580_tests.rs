@@ -355,6 +355,65 @@ fn la_liste_filtree_par_dr_ne_relit_plus_les_tags_7580() {
     );
 }
 
+/// #7817 — le témoin ci-dessus rougissait au hasard dans la CI : la carte DR
+/// tenait dans UNE case pour tout le processus, et un test voisin qui lisait
+/// la carte de SA base entre deux pages du témoin la chassait ; la page
+/// suivante relisait les tags DR. Ici, déterministe : des lectures de la carte
+/// sur d'autres bases, intercalées entre deux pages, ne font relire aucun tag
+/// à celle-ci (rougit avec une seule case : une relecture par page).
+#[test]
+fn la_carte_dr_d_une_autre_base_ne_chasse_pas_celle_ci_7817() {
+    let profil = Profil {
+        albums: 60,
+        pistes: 3,
+        copie_tous: 9,
+        cles_de_remplissage: false,
+    };
+    let (_d, state) = base("ici", &profil);
+    let (_d2, voisine) = base("voisine", &profil);
+    let (_d3, troisieme) = base("troisieme", &profil);
+    assert!(
+        voisine.backend.jeton_des_donnees().is_some()
+            && troisieme.backend.jeton_des_donnees().is_some(),
+        "bases de fichier : le jeton des données doit exister"
+    );
+    let sonde = std::sync::Arc::new(Sonde {
+        base: state.backend.clone(),
+        relectures: Default::default(),
+    });
+    let repo = TrackRepo::with_backend(sonde.clone());
+    let drs = dr_presents(&state);
+    let mut d = demande(&[drs[0]]);
+    (d.limit, d.avec_comptes) = (20, false);
+    assert!(
+        repo.page_de_pistes(&d).unwrap().total > 0,
+        "le banc doit rendre des pistes"
+    );
+    let avant = sonde.relectures();
+    for offset in [0, 20, 40] {
+        // Les voisines remplissent leur carte : chacune la sienne.
+        assert!(
+            !ff::dr_par_album(voisine.backend.as_ref())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !ff::dr_par_album(troisieme.backend.as_ref())
+                .unwrap()
+                .is_empty()
+        );
+        d.offset = offset;
+        let _ = repo.page_de_pistes(&d).unwrap();
+    }
+    assert_eq!(
+        sonde.relectures() - avant,
+        0,
+        "la lecture de la carte DR d'une autre base a chassé celle-ci : trois pages \
+         ont relu les tags DR de toute la bibliothèque ({} fois)",
+        sonde.relectures() - avant
+    );
+}
+
 /// #7675 — la carte DR est gardée PAR BASE : une seconde base qui lit la
 /// sienne (un autre test, en parallèle dans le même processus) ne fait plus
 /// relire les tags DR à la première. Avant, l'entrée unique du cache était
