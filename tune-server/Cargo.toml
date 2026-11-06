@@ -646,6 +646,13 @@ path = "tests/dossier_cue_4625.rs"
 name = "pg_group_by_strict_historique"
 path = "tests/pg_group_by_strict_historique.rs"
 
+# #7777 — les écoutes importées comptent dans « Titres les plus écoutés » et
+# les statistiques d'écoute : SQLite dans la suite ordinaire, PostgreSQL sous
+# `TUNE_TEST_PG_URL`.
+[[test]]
+name = "ecoutes_importees_partout_7777"
+path = "tests/ecoutes_importees_partout_7777.rs"
+
 # #7128 — étiqueter tout le résultat d'un filtre d'Oxygen : SQLite dans la
 # suite ordinaire, PostgreSQL sous `TUNE_TEST_PG_URL` (test-postgres.yml).
 # `autotests = false` en tête de ce manifeste : sans cette cible, jamais compilé.

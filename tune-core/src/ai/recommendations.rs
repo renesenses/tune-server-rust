@@ -135,13 +135,22 @@ pub fn get_recommendations(
     debug!(genres = ?genre_names, "ai_top_genres");
 
     // --- Top artists from history ---
+    // #7777 : plus les écoutes importées (`imported_plays`, #7763 : Roon,
+    // Plex, m3u), rattachées par l'interprète de leur piste. L'exclusion « déjà
+    // écouté ces sept jours » reste sur l'historique : elle est datée.
     let top_artists = backend
         .query_many(
-            "SELECT artist_name, COUNT(*) as c \
-             FROM listen_history \
-             WHERE artist_name IS NOT NULL AND artist_name != '' \
-             AND source != 'radio' \
-             GROUP BY artist_name ORDER BY c DESC LIMIT 5",
+            "SELECT e.artist_name, CAST(SUM(e.n) AS BIGINT) as c FROM ( \
+               SELECT artist_name, 1 AS n FROM listen_history \
+               WHERE artist_name IS NOT NULL AND artist_name != '' \
+               AND source != 'radio' \
+               UNION ALL \
+               SELECT a.name, ip.play_count FROM imported_plays ip \
+               JOIN tracks t ON t.id = ip.track_id \
+               JOIN artists a ON a.id = t.artist_id \
+               WHERE ip.play_count > 0 AND a.name IS NOT NULL AND a.name != '' \
+             ) e \
+             GROUP BY e.artist_name ORDER BY c DESC LIMIT 5",
             &[],
         )
         .unwrap_or_default();
