@@ -1890,10 +1890,52 @@ fn poser_le_tri(mut donnees: Value, q: &TriQuery) -> Value {
     donnees
 }
 
+/// #7729 — attente maximale de la route des favoris : verrous du registre et
+/// du service, puis lecture chez le service. Au-delà, la route répond 503
+/// avec un motif au lieu de laisser l'écran sur « Chargement… ».
+#[cfg(not(test))]
+const DELAI_FAVORIS: std::time::Duration = std::time::Duration::from_secs(20);
+/// Plus court en test, pour que le témoin du gel (#7729) reste rapide.
+#[cfg(test)]
+const DELAI_FAVORIS: std::time::Duration = std::time::Duration::from_secs(3);
+
 async fn service_favorites(
     State(state): State<StreamingHttpState>,
     Path((service, fav_type)): Path<(String, String)>,
     Query(tri): Query<TriQuery>,
+) -> Response {
+    // #7729 — journalisé AVANT toute attente : un gel ne laissait aucune
+    // ligne, la route attendant un verrou avant la première.
+    tracing::debug!(service = %service, fav_type = %fav_type, "streaming_favorites_demande");
+    let lecture = favoris_du_service(state, service.clone(), fav_type.clone(), tri);
+    match tokio::time::timeout(DELAI_FAVORIS, lecture).await {
+        Ok(reponse) => reponse,
+        Err(_) => {
+            tracing::warn!(
+                service = %service,
+                fav_type = %fav_type,
+                delai_s = DELAI_FAVORIS.as_secs(),
+                "streaming_favorites_delai_depasse"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "service_occupe",
+                    "message": format!(
+                        "{service} n'a pas répondu à temps pour les favoris ; réessayez dans un instant"
+                    ),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn favoris_du_service(
+    state: StreamingHttpState,
+    service: String,
+    fav_type: String,
+    tri: TriQuery,
 ) -> Response {
     let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
@@ -4053,6 +4095,9 @@ mod temoin_rubriques_dans_la_langue_demandee {
 
 #[cfg(test)]
 mod service_desactive_jamais_appele_tests;
+
+#[cfg(test)]
+mod favoris_sans_gel_7729_tests;
 
 #[cfg(test)]
 mod mixes_du_compte_7822_tests;
