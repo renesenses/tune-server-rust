@@ -951,6 +951,24 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{reponse}");
+        // Ni diagnostics : le greffon n'est pas chargé.
+        let (status, reponse) = appel_avec_corps(
+            &app,
+            "POST",
+            &format!("/api/v1/audio-plugins/{tiers}/diagnostics"),
+            json!({"enabled": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{reponse}");
+        assert_eq!(reponse["error"], "plugin_not_loaded", "{reponse}");
+        let (status, _) = appel_avec_corps(
+            &app,
+            "POST",
+            "/api/v1/audio-plugins/absent-du-disque/diagnostics",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, reponse) = appel(&app, "GET", "/api/v1/audio-plugins").await;
         assert_eq!(status, StatusCode::OK, "état : {status} {reponse}");
         assert!(
