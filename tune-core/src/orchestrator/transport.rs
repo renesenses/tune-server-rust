@@ -264,6 +264,14 @@ impl PlaybackOrchestrator {
         self.play_par_l_entree(req, true, Entree::Geste).await
     }
 
+    /// Un contexte repris explicitement doit créer sa nouvelle lecture même
+    /// s'il vient d'être joué : ce geste n'est pas un double appui ordinaire.
+    /// Le demandeur conserve la responsabilité du repositionnement de sa sortie.
+    pub async fn play_context_resume(&self, req: PlayRequest) -> Result<PlayResult, String> {
+        self.play_par_l_entree(req, true, Entree::RepriseDeContexte)
+            .await
+    }
+
     /// #6466 (fil 2302 point 15) — le transfert de zone : une lecture
     /// NOUVELLE sur la cible, qui passe par TOUTES les étapes d'entrée de
     /// [`play`](Self::play) (plafond de zones, dédoublonnage du re-tap), mais
@@ -1260,12 +1268,18 @@ impl PlaybackOrchestrator {
             artist_name: resolved.artist.clone(),
             album_title: habillage.album.clone(),
             cover_path: habillage.cover_path.clone(),
-            // #6059 — un flux natif relancé à la position : sa DIDL dit ce qui
-            // reste, la piste annoncée aux clients garde toute sa durée.
-            duration_ms: crate::outputs::dlna_depart_natif::duree_de_la_piste(
+            // #7360/#6059 — la durée restante du flux PCM ou natif ne
+            // raccourcit pas la piste annoncée aux clients après déplacement.
+            duration_ms: super::resolve_local::duree_piste_pcm_decodee(
                 resolved.duration_ms.unwrap_or(0),
                 resolved.stream_id.as_deref(),
-            ),
+            )
+            .unwrap_or_else(|| {
+                crate::outputs::dlna_depart_natif::duree_de_la_piste(
+                    resolved.duration_ms.unwrap_or(0),
+                    resolved.stream_id.as_deref(),
+                )
+            }),
             source: resolved.source.clone(),
             source_id: req.source_id.clone(),
             stream_id: resolved.stream_id.clone(),
@@ -1427,7 +1441,12 @@ impl PlaybackOrchestrator {
                 artist: resolved.artist.as_deref(),
                 album: habillage.album.as_deref(),
                 cover_url: resolved_cover_url.as_deref(),
-                duration_ms: resolved.duration_ms.map(|d| d as u64),
+                // #7551 (JeanPitre, fil 2566) — une sortie locale rapporte une
+                // position ABSOLUE après une relance (`LocalOutput::seek` pose le
+                // décalage) : sa durée doit être celle de la PISTE, pas le temps
+                // restant que sert le flux décodé (#6630). Sinon la position
+                // dépasse la « durée » et le sondeur passe au suivant trop tôt.
+                duration_ms: duree_annoncee_a_la_sortie(resolved, is_local),
                 file_size: resolved.file_size,
                 file_path: local_file_path.as_deref(),
                 sample_rate: resolved.sample_rate,
@@ -2290,6 +2309,10 @@ impl PlaybackOrchestrator {
                     // `false` en mode PURE, donc la promesse bit-perfect tient
                     // sans garde supplémentaire, exactement comme pour l'EQ.
                     local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+                    // #7632 — le droit de convoluer, posé à chaque lecture
+                    // comme PURE : sans Premium, l'IR mémorisée ne bâtit
+                    // aucun moteur pour la piste qui démarre.
+                    local_output.set_convolution_autorisee(self.correction_ir_autorisee());
                     // #6044 — la réaffectation des canaux : la règle de l'album
                     // prime sur celle de la zone, et aucune ne s'applique en
                     // PURE (`regle_effective_with` le vérifie). Les canaux de
@@ -3489,7 +3512,21 @@ impl PlaybackOrchestrator {
             .collect()
     }
 
-    pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
+    /// #7636 — la zone lâche un renderer qu'un autre point de contrôle tient
+    /// (Kazoo sur un Linn) : elle s'arrête côté Tune, sans envoyer à l'appareil
+    /// ni `Stop` ni `play_media`. Sa liste de lecture, que l'autre point de
+    /// contrôle vient de charger, reste intacte ; l'état « stopped » enregistré
+    /// empêche aussi le sondeur de « reprendre » cette lecture comme la sienne.
+    pub async fn ceder_la_zone_a_un_tiers(&self, zone_id: i64) {
+        if let Some(sid) = self.arreter_l_etat_de_la_zone(zone_id).await {
+            self.streamer.remove_session(&sid).await;
+        }
+    }
+
+    /// La moitié de [`Self::stop`] qui ne parle pas à l'appareil : l'état de
+    /// la zone, sa position, ses préparations. Rend l'identifiant du flux
+    /// qu'elle servait.
+    async fn arreter_l_etat_de_la_zone(&self, zone_id: i64) -> Option<String> {
         // #5476 — rend caduc un Seek de reprise détaché encore en attente.
         self.playback.marquer_commande_de_transport(zone_id).await;
         // #5050 — arrêtée : la pose d'un transfert en pause ne vaut plus.
@@ -3514,6 +3551,11 @@ impl PlaybackOrchestrator {
             .as_ref()
             .and_then(|np| np.stream_id.clone());
         self.playback.stop(zone_id).await;
+        old_stream_id
+    }
+
+    pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
+        let old_stream_id = self.arreter_l_etat_de_la_zone(zone_id).await;
 
         // Resolve device_id: prefer explicit, fall back to zone DB
         let resolved_did = match device_id {
@@ -4058,6 +4100,28 @@ impl PlaybackOrchestrator {
     pub async fn stream_session_alive(&self, stream_id: &str) -> bool {
         self.streamer.session_alive(stream_id).await
     }
+}
+
+/// #7551 — la durée que `play_media` annonce à la sortie.
+///
+/// Une sortie réseau reçoit la durée du flux SERVI : après une relance décodée
+/// à une position, son renderer compte depuis le début du flux neuf, et sa
+/// DIDL doit dire ce qui reste (#6630). Une sortie locale, elle, compte en
+/// position absolue (décalage du déplacement + trames) : elle reçoit la durée
+/// de la piste entière, la même que celle du `NowPlaying` (#7360). Sans départ
+/// connu, les deux sont la durée résolue, à l'identique d'avant.
+pub(super) fn duree_annoncee_a_la_sortie(
+    resolved: &ResolvedStream,
+    position_absolue: bool,
+) -> Option<u64> {
+    let servie = resolved.duration_ms?;
+    let duree = if position_absolue {
+        super::resolve_local::duree_piste_pcm_decodee(servie, resolved.stream_id.as_deref())
+            .unwrap_or(servie)
+    } else {
+        servie
+    };
+    Some(duree as u64)
 }
 
 /// #6062 — la traduction, fournie par l'appelant, du message d'une session

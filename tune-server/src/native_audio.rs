@@ -128,6 +128,10 @@ pub fn router() -> Router<AppState> {
                 .put(crate::routes::greffons_natifs_tiers::regler_la_zone),
         )
         .route(
+            "/{id}/diagnostics",
+            post(crate::routes::greffons_natifs_tiers::diagnostics_du_reglage),
+        )
+        .route(
             "/{id}/profiles",
             get(crate::routes::greffons_natifs_tiers::lister_les_profils)
                 .post(crate::routes::greffons_natifs_tiers::enregistrer_un_profil),

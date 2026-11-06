@@ -58,6 +58,50 @@ pub fn qui_tient_le_renderer(
     TenueDuRenderer::AutreApplication
 }
 
+/// #7636 — un autre point de contrôle tient-il le renderer OpenHome ?
+///
+/// Kazoo (ou Linn App) charge sa liste dans le renderer et la joue : l'URI
+/// rapportée n'est plus un flux Tune. Tant que la zone Tune se croit en
+/// lecture, chacune de ses relances automatiques (démarrage figé, démarrage
+/// mort, renderer calé, fin de piste suivie de la suivante) repasse par
+/// `play_media`, dont le `DeleteAll` vide la liste que Kazoo vient de
+/// charger. Après [`RELEVES_AVANT_DE_CEDER`] relevés concordants, la zone
+/// lâche donc l'appareil, sans lui envoyer d'ordre : la liste de Kazoo reste
+/// intacte, et seul un « Lire » fait dans Tune la remplace.
+///
+/// Seulement sur preuve :
+/// - une sortie OpenHome, la seule dont Tune réécrit la liste ;
+/// - une AUTRE application : l'URI d'un flux Tune (`/stream/…`) sans notre
+///   identifiant peut être la suivante armée d'un enchaînement pas encore
+///   adopté, elle ne compte pas ;
+/// - notre identifiant de flux connu : sans lui, on ne sait pas ce qui est
+///   à nous.
+pub fn renderer_tenu_par_un_autre_point_de_controle(
+    output_type: &str,
+    tenue: &TenueDuRenderer,
+    notre_stream_id_connu: bool,
+) -> bool {
+    output_type == "openhome"
+        && *tenue == TenueDuRenderer::AutreApplication
+        && notre_stream_id_connu
+}
+
+/// #7636 — relevés concordants avant de céder le renderer : une transition
+/// peut montrer un instant l'URI précédente.
+pub const RELEVES_AVANT_DE_CEDER: u8 = 3;
+
+/// #7636 — après un « Lire » fait dans Tune, le Linn peut rapporter encore
+/// quelques secondes l'URI du morceau que Kazoo jouait (événement Info en
+/// retard). Avant ce délai, compté depuis le chargement de la piste, une URI
+/// étrangère ne compte pas : la zone ne lâche pas sa propre lecture.
+pub const DELAI_AVANT_DE_JUGER_LA_TENUE_SECS: u64 = 10;
+
+/// #7636 — la piste chargée par Tune l'est-elle depuis assez longtemps pour
+/// qu'une URI étrangère dise qu'un autre point de contrôle a pris la main ?
+pub fn tenue_jugeable(secs_depuis_le_chargement: u64) -> bool {
+    secs_depuis_le_chargement >= DELAI_AVANT_DE_JUGER_LA_TENUE_SECS
+}
+
 /// Retrouver, dans l'URI qu'un renderer déclare jouer, le `stream_id` de la
 /// session Tune qu'il tire.
 ///
@@ -132,6 +176,9 @@ pub mod motif_fin {
     /// position épinglée sur sa durée, URI de la piste finie, `SetNext`
     /// accepté — sans attendre `END_MARGIN_MS` sur l'horloge de Tune.
     pub const POSITION_EPINGLEE_PISTE_FINIE_DLNA: &str = "position_pinned_finished_uri_dlna";
+    /// #7700 — l'appareil DLNA a quitté notre piste en milieu de lecture
+    /// (« suivant » à sa télécommande) avec de l'audio encore en main.
+    pub const SUIVANT_DE_L_APPAREIL: &str = "dlna_device_skipped_track";
 }
 
 /// Sondages à tenir avant de prononcer la fin « position au-delà de la fin ».
@@ -200,6 +247,10 @@ pub fn plancher_de_detection_ms(motif: &str) -> u64 {
         // Un sondage pour voir la position inchangée sur la durée rapportée
         // (au moins un de plus quand le bout caché par l'arrondi est long).
         motif_fin::POSITION_EPINGLEE_PISTE_FINIE_DLNA => tick,
+        // #7700 — deux sondages `Stopped` d'affilée.
+        motif_fin::SUIVANT_DE_L_APPAREIL => {
+            super::suivant_de_l_appareil_7700::TOURS_D_ARRET_DU_SUIVANT as u64 * tick
+        }
         _ => 0,
     }
 }

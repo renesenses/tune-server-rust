@@ -22,6 +22,9 @@ mod plugin_events;
 // #7067 : désinstaller un greffon fourni en lecture seule (Docker).
 #[path = "plugin_fourni_lecture_seule_7067.rs"]
 mod plugin_fourni_lecture_seule_7067;
+// rc11 — Mode Party se désactive et se réactive depuis Réglages › Extensions.
+#[path = "activation_party_b209.rs"]
+mod activation_party_b209;
 #[path = "plugin_party_e2e.rs"]
 mod plugin_party_e2e;
 #[path = "plugin_uninstall_4194.rs"]

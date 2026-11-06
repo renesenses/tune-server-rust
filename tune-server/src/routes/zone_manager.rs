@@ -380,6 +380,9 @@ async fn create_group(
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut groups = load_json_setting(&settings, "zone_groups");
+    // #7937 — une zone n'appartient qu'à UN groupe (même règle que
+    // `POST /zones/group`).
+    tune_core::zones::groupes_enregistres::retirer_les_zones(&mut groups, &body.zone_ids);
     let id = next_id(&groups);
     let group = json!({
         "id": id,

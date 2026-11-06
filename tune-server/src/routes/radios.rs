@@ -542,6 +542,8 @@ struct SearchQuery {
     country: Option<String>,
     codec: Option<String>,
     bitrate_min: Option<i32>,
+    /// #7718 — le niveau de qualité minimal d'au moins un flux.
+    quality_min: Option<String>,
     lossless: Option<bool>,
     hires: Option<bool>,
     favorites_only: Option<bool>,
@@ -562,6 +564,7 @@ impl SearchQuery {
             self.rated_min,
             self.metadata_plus,
         )
+        .avec_qualite_min(self.quality_min.as_deref())
     }
 }
 
@@ -730,6 +733,14 @@ pub struct StationAnnuaire {
     /// Une liste v2 vide ne doit pas réactiver les adresses historiques v1.
     #[serde(skip)]
     pub streams_declared: bool,
+    /// #7500 — l'ancienne clé `mozaiklabs:ID` (id interne de la v2), gardée
+    /// même quand la fiche porte un `external_id`. Une station du portail qui
+    /// reçoit un numéro radio-metadata (`S…`, site du 30/10/2026) change de
+    /// clé : « Mes radios » l'a enregistrée sous `mozaiklabs:ID`, et c'est par
+    /// cette clé qu'elle retrouve sa fiche, puis que son lien est réécrit
+    /// ([`super::radios_annuaire::lier_les_stations`]).
+    #[serde(skip)]
+    pub cle_locale: Option<String>,
     /// #7466 — la note moyenne de la fiche sur radio-metadata.fr
     /// (`avg_rating`, de 0 à 5), en CENTIÈMES pour garder `Eq` : 4,7 → 470.
     /// `None` tant que personne n'a noté la station (`rating_count` à 0).
@@ -763,6 +774,12 @@ pub struct FluxAnnuaire {
 pub(crate) mod geofencing;
 
 impl StationAnnuaire {
+    /// #7500 — la fiche porte-t-elle cette clé : son `external_id`, ou son
+    /// ancienne clé `mozaiklabs:ID` ([`StationAnnuaire::cle_locale`]) ?
+    pub fn porte_la_cle(&self, cle: &str) -> bool {
+        self.external_id.as_deref() == Some(cle) || self.cle_locale.as_deref() == Some(cle)
+    }
+
     /// #7215 — les genres de la fiche : `genres`, sinon le seul `genre` (une
     /// fiche construite sans `genres`, ou relevée sur un site plus ancien).
     pub fn genres_ou_genre(&self) -> Vec<&str> {
@@ -909,6 +926,13 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // #7500 — l'id interne de la v2 : la clé `mozaiklabs:ID`, gardée
+            // même quand un `external_id` la remplace.
+            let cle_locale = item
+                .get("id")
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0)
+                .map(|id| format!("mozaiklabs:{id}"));
             let entier = |v: Option<&Value>| {
                 v.and_then(Value::as_i64)
                     .and_then(|b| i32::try_from(b).ok())
@@ -942,12 +966,7 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                 // son nom ou son flux change. Sans ce repli, l'annuaire rend
                 // null et les gestes du client visent /directory/null/…,
                 // rejeté avant même une tentative de lecture.
-                external_id: texte(item, "external_id").or_else(|| {
-                    item.get("id")
-                        .and_then(Value::as_u64)
-                        .filter(|id| *id > 0)
-                        .map(|id| format!("mozaiklabs:{id}"))
-                }),
+                external_id: texte(item, "external_id").or_else(|| cle_locale.clone()),
                 radio_metadata_key: texte(item, "radio_metadata_key"),
                 description: texte(item, "description"),
                 categories,
@@ -961,6 +980,7 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                 stream_url,
                 flux,
                 streams_declared: item.get("streams").is_some_and(Value::is_array),
+                cle_locale,
                 note_centiemes: super::radios_criteres_7466::note_centiemes(item),
                 nombre_de_notes: item
                     .get("rating_count")
@@ -3253,14 +3273,26 @@ async fn create_streaming_playlist_from_favorites(
     );
 
     let mut remote_playlist_id: Option<String> = None;
+    let mut add_error: Option<String> = None;
     if !matched_ids.is_empty() {
-        match svc
+        let creation = svc
             .create_playlist(name, Some("Created by Tune from radio favorites"))
-            .await
-        {
+            .await;
+        // Voir `creer_playlist_depuis_titres_retenus` : sans purge, « Mes
+        // playlists » sert la liste mémorisée pendant 120 s.
+        tune_streaming_http::purge_contenu_utilisateur(service);
+        match creation {
             Ok(pid) => {
-                if let Err(e) = svc.add_tracks_to_playlist(&pid, &matched_ids).await {
-                    tracing::warn!(error = %e, "radio_fav_add_tracks_failed");
+                // L'échec de l'ajout était journalisé puis AVALÉ : la réponse
+                // annonçait `matched_tracks` titres dans une playlist vide.
+                match svc.add_tracks_to_playlist(&pid, &matched_ids).await {
+                    Ok(n) => {
+                        tracing::info!(service = %service, playlist_id = %pid, ajoutes = n, "radio_fav_playlist_created")
+                    }
+                    Err(e) => {
+                        tracing::warn!(service = %service, playlist_id = %pid, error = %e, "radio_fav_add_tracks_failed");
+                        add_error = Some(e.to_string());
+                    }
                 }
                 remote_playlist_id = Some(pid);
             }
@@ -3290,9 +3322,7 @@ async fn create_streaming_playlist_from_favorites(
 
     let (nb_matched, nb_approx, nb_not_found) = compter_par_statut(&details);
 
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({
+    let corps = json!({
             "service": service,
             "name": name,
             "favorites_count": favorites.len(),
@@ -3305,12 +3335,24 @@ async fn create_streaming_playlist_from_favorites(
             "approximate": nb_approx,
             "not_found": nb_not_found,
             "remote_playlist_id": remote_playlist_id.clone(),
-            "playlist_id": remote_playlist_id,
+            "add_error": add_error,
+            "message": Value::Null,
+            "playlist_id": remote_playlist_id.clone(),
             "details": details.clone(),
             "results": details,
-        })),
-    )
-        .into_response())
+    });
+    // Aucune correspondance : rien n'a été créé, et on le DIT — phrase
+    // traduite par clé (#7077), jamais du français en dur.
+    let corps = if remote_playlist_id.is_none() {
+        crate::message_api::avec_message(
+            corps,
+            "api.radioFavorites.noFavoriteFound",
+            &[("service", nom_du_service(service))],
+        )
+    } else {
+        corps
+    };
+    Ok((StatusCode::CREATED, Json(corps)).into_response())
 }
 
 /// Le service visé, s'il peut recevoir une playlist : inscrit, connecté, et
@@ -3506,6 +3548,15 @@ async fn apercu_appariement_favoris(
         .into_response())
 }
 
+/// « Qobuz », « Tidal »… pour les phrases montrées à l'utilisateur.
+fn nom_du_service(service: &str) -> String {
+    let mut c = service.chars();
+    match c.next() {
+        Some(p) => p.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 /// `create-playlist` avec `track_ids` : la playlist reçoit EXACTEMENT les
 /// titres validés à l'aperçu, sans nouvel appariement — une nouvelle
 /// playlist, ou `target_playlist_id` (une playlist existante du compte, sans
@@ -3521,18 +3572,35 @@ async fn creer_playlist_depuis_titres_retenus(
         .map(str::trim)
         .filter(|id| !id.is_empty());
     let service = service.unwrap_or("qobuz");
-    let erreur =
-        |code: StatusCode, err: &str| Ok((code, Json(json!({ "error": err }))).into_response());
+    // `error` = `code` : le code stable que le client teste ; `message` : la
+    // phrase à montrer, traduite depuis `i18n_server.json` (#7077) — jamais
+    // un code brut à l'écran.
+    let erreur = |code: StatusCode, err: &str, cle: &str| {
+        tracing::warn!(service = %service, erreur = err, "radio_fav_create_playlist_refusee");
+        Ok(crate::message_api::refus(code, err, cle, &[]))
+    };
     if service == "local" {
         // Les identifiants rendus par l'aperçu sont ceux d'un SERVICE : la
         // bibliothèque locale garde la création « en un geste ».
-        return erreur(StatusCode::BAD_REQUEST, "track_ids_service_seulement");
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "track_ids_service_seulement",
+            "api.radioFavorites.tracksAreServiceOnly",
+        );
     }
     if cible.is_none() && name.trim().is_empty() {
-        return erreur(StatusCode::BAD_REQUEST, "nom_vide");
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "nom_vide",
+            "api.radioFavorites.playlistNameRequired",
+        );
     }
     if dedoublonner_titres(track_ids).is_empty() {
-        return erreur(StatusCode::BAD_REQUEST, "aucun_titre_retenu");
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "aucun_titre_retenu",
+            "api.radioFavorites.noTrackSelected",
+        );
     }
     let arc = match service_pour_playlist(state, service).await {
         Ok(a) => a,
@@ -3543,10 +3611,20 @@ async fn creer_playlist_depuis_titres_retenus(
         Some(id) => ajouter_a_playlist_existante(&**svc, id, track_ids).await,
         None => creer_playlist_avec_titres(&**svc, name.trim(), track_ids).await,
     };
+    drop(svc);
+    // Radio → Qobuz, 01/11/2026 : la playlist existait chez Qobuz mais « Mes
+    // playlists » ne la montrait pas. La modale lit `GET /streaming/qobuz/
+    // playlists` À L'OUVERTURE (choix de la cible), ce qui remplit le cache
+    // du contenu utilisateur (120 s) juste AVANT la création ; rien ne le
+    // purgeait ensuite. Même motif que la fusion de playlists (21/09). Purge
+    // sans condition : un échec côté HTTP peut avoir abouti chez le service.
+    tune_streaming_http::purge_contenu_utilisateur(service);
     match verse {
         Ok(p) => {
             tracing::info!(
                 service = %service,
+                playlist_id = %p.playlist_id,
+                nom = %name.trim(),
                 retenus = track_ids.len(),
                 ajoutes = p.ajoutes,
                 doublons = p.doublons,
@@ -3573,17 +3651,26 @@ async fn creer_playlist_depuis_titres_retenus(
                 .into_response())
         }
         Err(e) => {
-            tracing::warn!(service = %service, error = %e, "radio_fav_create_playlist_failed");
-            Ok((
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
+            tracing::warn!(service = %service, error = %e, existante = cible.is_some(), "radio_fav_create_playlist_failed");
+            // Code stable + phrase traduite (#7077) ; le texte brut du service
+            // part dans `cause`, le détail replié, jamais dans `message`.
+            let mut corps = crate::message_api::avec_message(
+                json!({
                     "error": match cible {
                         Some(id) => format!("could not add to playlist '{id}' on '{service}': {e}"),
                         None => format!("could not create playlist on '{service}': {e}"),
                     },
-                })),
-            )
-                .into_response())
+                    "code": if cible.is_some() { "ajout_playlist_refuse" } else { "creation_playlist_refusee" },
+                }),
+                if cible.is_some() {
+                    "api.radioFavorites.addToPlaylistRefused"
+                } else {
+                    "api.radioFavorites.createPlaylistRefused"
+                },
+                &[("service", nom_du_service(service))],
+            );
+            corps["cause"] = json!(e.to_string());
+            Ok((StatusCode::BAD_GATEWAY, Json(corps)).into_response())
         }
     }
 }

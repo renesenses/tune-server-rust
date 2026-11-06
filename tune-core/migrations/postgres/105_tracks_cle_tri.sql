@@ -3,5 +3,5 @@
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE "C";
 CREATE INDEX IF NOT EXISTS idx_tracks_cle_tri ON tracks(cle_tri, id);
 
-INSERT INTO schema_version (version, name) VALUES (101, 'tracks_cle_tri')
+INSERT INTO schema_version (version, name) VALUES (105, 'tracks_cle_tri')
 ON CONFLICT (version) DO NOTHING;

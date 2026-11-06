@@ -1124,6 +1124,11 @@ mod demarrage_fige_5522;
 #[cfg(test)]
 mod demarrage_fige_5522_tests;
 
+/// #7636 — la liste qu'un autre point de contrôle a chargée dans un renderer
+/// OpenHome reste intacte : le banc, vrai sondeur et sortie factice.
+#[cfg(test)]
+mod liste_d_un_autre_point_de_controle_7636_tests;
+
 /// #6541 — au-dessus de la limite de sécurité, le volume du renderer n'est
 /// pas adopté : il est ramené sous la limite.
 mod volume_plafond_6541;
@@ -1398,6 +1403,12 @@ mod pause_par_l_appareil_6790_tests;
 mod pause_de_l_appareil_7418;
 #[cfg(test)]
 mod pause_de_l_appareil_7418_tests;
+
+/// #7700 — un « suivant » pressé sur l'appareil DLNA (télécommande Eversolo)
+/// enchaîne la file de Tune en quelques secondes.
+mod suivant_de_l_appareil_7700;
+#[cfg(test)]
+mod suivant_de_l_appareil_7700_tests;
 
 #[cfg(test)]
 mod lecture_sans_destination_tests;

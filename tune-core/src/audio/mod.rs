@@ -10,6 +10,8 @@ pub mod autoeq;
 pub mod autoeq_base;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
+/// #6385 — les profils d'égaliseur OPRA (JSON), lus vers le même modèle.
+pub mod opra;
 
 pub mod bitperfect_strict;
 /// #4969 — la carte des canaux de SORTIE (réaffectation, disposition,
@@ -141,6 +143,8 @@ pub mod sacd;
 mod sacd_lecture_5297_tests;
 /// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
 pub mod soft_mute;
+/// Le spectrogramme d'une piste en PNG, calculé sur le PCM décodé (#7857).
+pub mod spectrogramme;
 pub mod staged_growth;
 pub mod support;
 pub mod tap;
@@ -151,6 +155,8 @@ pub mod text_embedding;
 pub mod thermal;
 /// #6918 — le volume en dB d'une sortie qui règle son volume en décibels.
 pub mod volume_appareil_db;
+/// #7841 — trim et limites de chaque zone, tels que le rapport de diagnostic les montre.
+pub mod volume_au_rapport;
 /// #6541 — limites de sécurité et de confort du volume d'une zone.
 pub mod volume_limites;
 /// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).

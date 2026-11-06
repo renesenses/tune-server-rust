@@ -399,6 +399,33 @@ mod tests {
     /// Jamais plus fort que la pleine échelle ni que la consigne : un volume
     /// stocké au-dessus de 1000 est rendu à l'unité, un mot pondéré reste
     /// dans la pleine échelle et garde ses bits bas nuls.
+    /// #7762 — témoin (vert avant comme après) : 50 % du curseur `db60`
+    /// d'une sortie locale (gain 0,0316, −30 dB) est rendu par le fil WASAPI
+    /// UNE fois — le mot sort à −30 dB (au millième de volume près), pas à
+    /// −60 dB (gain appliqué deux fois) ni à −6 dB (position prise pour un
+    /// gain). Même conversion que `set_volume` et `effective_volume_units`.
+    #[test]
+    fn cinquante_pour_cent_du_curseur_db60_sont_rendus_une_seule_fois_a_moins_30_db_7762() {
+        let gain = crate::audio::volume_scale::gain_perceptif(0.5);
+        // `LocalOutput::set_volume` : millièmes tronqués.
+        let utilisateur = (gain.clamp(0.0, 1.0) * 1000.0) as u32;
+        let effectif = super::super::effective_volume_units(utilisateur, 1000, false);
+        let anneau = anneau_de_deux_secondes();
+        remplir(&anneau, PERIODE);
+        let volume = Arc::new(AtomicU32::new(effectif));
+        let mut gain_au_rendu = GainAuRendu::nouveau(volume, CADENCE, VOIES);
+        let rendu = rendre_une_periode(&anneau, &mut gain_au_rendu);
+        let db = 20.0 * (f64::from(rendu[0]) / f64::from(0x40_0000)).log10();
+        assert!(
+            (db + 30.0).abs() < 0.3,
+            "50 % du curseur db60 doivent sortir à −30 dB, mesuré {db:.2} dB \
+             ({effectif} millièmes)"
+        );
+        assert!(
+            rendu.iter().all(|&m| m == rendu[0]),
+            "gain constant, sans rampe"
+        );
+    }
     #[test]
     fn le_gain_est_borne_et_le_mot_reste_aligne() {
         let mut gain = GainAuRendu::nouveau(Arc::new(AtomicU32::new(1500)), CADENCE, VOIES);

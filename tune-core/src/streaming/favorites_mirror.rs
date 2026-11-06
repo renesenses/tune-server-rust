@@ -60,6 +60,25 @@
 //! Ailleurs, une ligne `playlist` n'est jamais retirée par un
 //! rafraîchissement.
 //!
+//! # Jamais d'abonnement à sa propre playlist, jamais de 401 en boucle
+//!
+//! Relevé sur le .18 le 01/11/2026 : trois playlists du compte, mises en
+//! cœur dans Tune, restaient `ajout_en_attente` ; toutes les cinq minutes la
+//! poussée retentait `/playlist/subscribe`, et Qobuz répondait 401 (« Current
+//! authenticated user is not authorized to perform this request ») — 12 360
+//! lignes de journal en quatorze jours. Une playlist POSSÉDÉE est déjà dans
+//! la bibliothèque : on ne s'y abonne pas.
+//!
+//! * un cœur posé dans Tune sur une playlist que le service déclare possédée
+//!   est `synchro` d'emblée, sans appel d'écriture ;
+//! * au rafraîchissement, une ligne en attente sur une playlist possédée est
+//!   réglée sans appel : l'ajout vaut `synchro`, le retrait est fait ;
+//! * un refus 401/403 du service sur UN identifiant, alors que la session
+//!   vient de lire le compte sans erreur, est un refus et non une session
+//!   expirée : la ligne passe [`ETAT_REFUSE`], le refus est journalisé UNE
+//!   fois, et la poussée ne la retente plus. Un nouveau cœur posé dans Tune
+//!   la relance.
+//!
 //! Contrat d'API complet : description de la PR #5997.
 
 use std::collections::{HashMap, HashSet};
@@ -83,6 +102,21 @@ pub const ETAT_SYNCHRO: &str = "synchro";
 pub const ETAT_AJOUT_EN_ATTENTE: &str = "ajout_en_attente";
 /// Retiré dans Tune, pas encore confirmé chez le service — masqué de la liste.
 pub const ETAT_RETRAIT_EN_ATTENTE: &str = "retrait_en_attente";
+/// Le service a REFUSÉ l'ajout (401/403 sur cet identifiant, session
+/// valide) : gardé avec son motif, plus jamais retenté par la poussée.
+pub const ETAT_REFUSE: &str = "refuse_par_le_service";
+
+/// Le motif d'un échec d'écriture est-il un refus 401/403 du service ?
+///
+/// Les connecteurs rendent l'échec en texte (`qobuz /playlist/subscribe: 401
+/// {...}`) : on cherche le code comme mot isolé. Seul, ce test ne distingue
+/// pas un refus d'une session expirée — l'appelant ne le retient que si la
+/// session vient de lire le compte sans erreur.
+pub fn est_un_refus_du_service(motif: &str) -> bool {
+    motif
+        .split(|c: char| !c.is_ascii_digit())
+        .any(|mot| mot == "401" || mot == "403")
+}
 
 /// Cache court de la liste : au-delà, l'ouverture des Favoris rafraîchit.
 pub const TTL_DEFAUT_S: u64 = 60;
@@ -197,6 +231,8 @@ pub struct BilanMiroir {
     pub en_attente: usize,
     /// Dernier motif d'échec rencontré, s'il y en a un.
     pub erreur: Option<String>,
+    /// Écritures que le service vient de refuser (401/403) : plus retentées.
+    pub refuses: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +553,7 @@ pub fn aligner_profil(
         let manquants = format!(
             "SELECT DISTINCT a.item_type, a.service_id FROM streaming_favorites a \
              WHERE a.service = {} AND {} \
-               AND a.miroir_etat IN ('{ETAT_SYNCHRO}', '{ETAT_AJOUT_EN_ATTENTE}') \
+               AND a.miroir_etat IN ('{ETAT_SYNCHRO}', '{ETAT_AJOUT_EN_ATTENTE}', '{ETAT_REFUSE}') \
                AND NOT EXISTS (SELECT 1 FROM streaming_favorites b WHERE {} \
                    AND b.item_type = a.item_type AND b.service = a.service AND b.service_id = a.service_id)",
             ph(backend, 1),
@@ -613,8 +649,16 @@ pub async fn ajouter(
     let service = arc.read().await.name().to_string();
     let fav_type = type_service(&fav.item_type)
         .ok_or_else(|| format!("type de favori inconnu : {}", fav.item_type))?;
-    let issue = ecrire_chez_le_service(arc, true, fav_type, &fav.service_id).await;
     let profils = profils(backend, appelant);
+    if fav.item_type == "playlist" && playlist_possedee(arc, &fav.service_id).await {
+        // Sa propre playlist : elle est déjà dans la bibliothèque du service,
+        // et Qobuz refuse l'abonnement (401). Aucun appel d'écriture.
+        info!(service = %service, service_id = %fav.service_id, "favori_miroir_playlist_possedee_sans_abonnement");
+        ecrire_partout(backend, &profils, &service, fav, ETAT_SYNCHRO, None)?;
+        noter_en_attente(&service, backend);
+        return Ok(Propagation::Propage);
+    }
+    let issue = ecrire_chez_le_service(arc, true, fav_type, &fav.service_id).await;
     let propagation = match issue {
         Ok(()) => {
             ecrire_partout(backend, &profils, &service, fav, ETAT_SYNCHRO, None)?;
@@ -649,6 +693,18 @@ pub async fn retirer(
     let service = arc.read().await.name().to_string();
     let fav_type =
         type_service(item_type).ok_or_else(|| format!("type de favori inconnu : {item_type}"))?;
+    // Un ajout que le service a refusé n'existe pas chez lui, et une playlist
+    // possédée n'y a jamais été « suivie » : le retrait est local.
+    let refuse = etats_locaux(backend, &service, item_type)
+        .ok()
+        .and_then(|l| l.get(identite_de_favori(service_id).as_ref()).cloned())
+        .flatten()
+        .is_some_and(|e| e == ETAT_REFUSE);
+    if refuse || (item_type == "playlist" && playlist_possedee(arc, service_id).await) {
+        retirer_partout(backend, &service, item_type, service_id)?;
+        noter_en_attente(&service, backend);
+        return Ok(Propagation::Propage);
+    }
     let propagation = match ecrire_chez_le_service(arc, false, fav_type, service_id).await {
         Ok(()) => {
             retirer_partout(backend, &service, item_type, service_id)?;
@@ -669,6 +725,19 @@ pub async fn retirer(
     };
     noter_en_attente(&service, backend);
     Ok(propagation)
+}
+
+/// Le service déclare-t-il cette playlist POSSÉDÉE par le compte ? `false`
+/// si on ne sait pas (pas de relecture, échec, auteur inconnu) : on ne
+/// conclut rien, l'appel d'écriture se fait comme avant.
+async fn playlist_possedee(arc: &ServiceArc, service_id: &str) -> bool {
+    let cle = identite_de_favori(service_id).into_owned();
+    match arc.read().await.playlists_de_la_bibliotheque().await {
+        Some(Ok(playlists)) => playlists
+            .iter()
+            .any(|p| p.editable == Some(true) && identite_de_favori(&p.id).as_ref() == cle),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -765,7 +834,22 @@ fn reconcilier(
         }
     }
     for (id, etat) in locaux {
-        if chez_service.contains(&id) || reserves.hors_favoris.contains(&id) {
+        if chez_service.contains(&id) {
+            continue;
+        }
+        if reserves.hors_favoris.contains(&id) {
+            // Playlist POSSÉDÉE : déjà dans la bibliothèque, aucun abonnement
+            // à pousser (Qobuz le refuse en 401, en boucle toutes les cinq
+            // minutes sur le .18). L'attente se règle ici, sans appel.
+            match etat.as_deref() {
+                Some(ETAT_AJOUT_EN_ATTENTE) | Some(ETAT_REFUSE) => {
+                    poser_etat(backend, service, item_type, &id, ETAT_SYNCHRO, None)?;
+                }
+                Some(ETAT_RETRAIT_EN_ATTENTE) => {
+                    retirer_partout(backend, service, item_type, &id)?;
+                }
+                _ => {}
+            }
             continue;
         }
         match etat.as_deref() {
@@ -845,10 +929,15 @@ fn trier_les_playlists(
 }
 
 /// Pousse au service les écritures en attente.
+///
+/// `session_valide` : le compte vient d'être relu sans erreur. Un 401/403
+/// sur un identifiant est alors un REFUS de cet identifiant, pas une session
+/// expirée : la ligne quitte l'attente et n'est plus retentée.
 async fn pousser_en_attente(
     arc: &ServiceArc,
     backend: &Arc<dyn DbBackend>,
     service: &str,
+    session_valide: bool,
     bilan: &mut BilanMiroir,
 ) -> Result<(), String> {
     let sql = format!(
@@ -875,6 +964,19 @@ async fn pousser_en_attente(
                     retirer_partout(backend, service, &item_type, &id)?;
                 }
                 bilan.pousses += 1;
+            }
+            Err(e) if session_valide && est_un_refus_du_service(&e) => {
+                // Journalisé UNE fois : la ligne quitte l'attente.
+                warn!(service = %service, item_type = %item_type, service_id = %id, ajout, erreur = %e, "favori_miroir_refuse_par_le_service");
+                if ajout {
+                    poser_etat(backend, service, &item_type, &id, ETAT_REFUSE, Some(&e))?;
+                } else {
+                    // Le service refuse de retirer ce qu'il ne nous laisse
+                    // pas toucher : l'auditeur voulait le cœur retiré, il
+                    // l'est dans Tune.
+                    retirer_partout(backend, service, &item_type, &id)?;
+                }
+                bilan.refuses += 1;
             }
             Err(e) => {
                 poser_etat(backend, service, &item_type, &id, &etat, Some(&e))?;
@@ -967,17 +1069,19 @@ pub async fn rafraichir(
             return bilan;
         }
     };
-    if let Err(e) = pousser_en_attente(arc, backend, &service, &mut bilan).await {
+    let session_valide = bilan.echecs == 0;
+    if let Err(e) = pousser_en_attente(arc, backend, &service, session_valide, &mut bilan).await {
         bilan.erreur = Some(e);
     }
     bilan.en_attente = compter_en_attente(backend, &service);
-    if bilan.ajoutes + bilan.retires + bilan.pousses + bilan.echecs > 0 {
+    if bilan.ajoutes + bilan.retires + bilan.pousses + bilan.echecs + bilan.refuses > 0 {
         info!(
             service = %service,
             lus = bilan.lus,
             ajoutes = bilan.ajoutes,
             retires = bilan.retires,
             pousses = bilan.pousses,
+            refuses = bilan.refuses,
             en_attente = bilan.en_attente,
             echecs = bilan.echecs,
             "favoris_miroir_rafraichis"
