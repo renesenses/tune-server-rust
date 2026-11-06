@@ -45,10 +45,17 @@ pub mod sql {
          h.artist_name, h.album_title, h.source, h.source_id, h.album_id, h.duration_ms, \
          h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position, h.cover_url";
 
+    /// #7965 — les lignes de radio que la liste montre : celles écrites au
+    /// nom de la station (`context_type = 'radio'`), une par lancement. Les
+    /// anciennes lignes de radio (avant la v0.8.258, titre ICY figé, sans
+    /// contexte) restent cachées, comme avant.
+    const LIGNE_LISTEE: &str = "(h.source != 'radio' OR h.context_type = 'radio')";
+
     /// La jointure qui résout `track_id`, commune aux deux listes.
     const JOINTURE_PISTE: &str = " FROM listen_history h \
          LEFT JOIN tracks t ON t.title = h.title AND t.album_id = h.album_id \
-         WHERE h.source != 'radio' ORDER BY h.listened_at DESC";
+         WHERE (h.source != 'radio' OR h.context_type = 'radio') \
+         ORDER BY h.listened_at DESC";
 
     pub fn record<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -74,11 +81,11 @@ pub mod sql {
         )
     }
 
-    // The play-history LIST excludes radio: since v0.8.258 the orchestrator no
-    // longer records radio plays (a live stream's title is a frozen snapshot
-    // that never matches what's actually on air), but pre-existing radio rows
-    // still surfaced here (Bilou: "la radio est toujours ajoutée à l'historique").
-    // Stats already filter `source != 'radio'`; align the list with them.
+    // #7965 (décision du 05/11) — la LISTE montre les radios, au nom de la
+    // station, une ligne par lancement (`LIGNE_LISTEE`). Les anciennes lignes
+    // de radio d'avant la v0.8.258, dont le titre est un titre ICY figé
+    // (Bilou : « la radio est toujours ajoutée à l'historique »), restent
+    // cachées. Les statistiques, elles, excluent toujours `source = 'radio'`.
     pub fn recent<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT {RECORD_COLS_RESOLUS}{JOINTURE_PISTE} LIMIT {}",
@@ -98,10 +105,10 @@ pub mod sql {
         "SELECT COUNT(*) FROM listen_history"
     }
 
-    /// Total excluding radio — the pagination total for the history list, which
-    /// hides radio rows.
-    pub fn count_non_radio() -> &'static str {
-        "SELECT COUNT(*) FROM listen_history WHERE source != 'radio'"
+    /// Le total de pagination de la liste : exactement les lignes qu'elle
+    /// montre (`LIGNE_LISTEE`).
+    pub fn count_listed() -> String {
+        format!("SELECT COUNT(*) FROM listen_history h WHERE {LIGNE_LISTEE}")
     }
 
     pub fn top_tracks<D: SqlDialect>(d: &D) -> String {
@@ -553,7 +560,7 @@ impl HistoryRepo {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<ListenRecord>, i64), String> {
-        let total = match self.db.query_one(sql::count_non_radio(), &[])? {
+        let total = match self.db.query_one(&sql::count_listed(), &[])? {
             None => 0,
             Some(cols) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
         };
@@ -1230,7 +1237,11 @@ impl HistoryRepo {
             Engine::Postgres => col.to_string(),
         };
 
-        let mut simple_conditions: Vec<String> = Vec::new();
+        // #7965 — l'historique contient désormais les radios (une ligne par
+        // station lancée) : toutes les statistiques ci-dessous les excluent,
+        // totaux, tendance, heures, zones et sources compris. Le temps
+        // d'écoute radio a sa propre section (`radio_listening`).
+        let mut simple_conditions: Vec<String> = vec!["source != 'radio'".to_string()];
         if let Some(d) = days {
             simple_conditions.push(dialect_since("listened_at", d));
         }
@@ -1246,13 +1257,9 @@ impl HistoryRepo {
         if let Some(pid) = profile_id {
             simple_conditions.push(format!("profile_id = {pid}"));
         }
-        let simple_where = if simple_conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", simple_conditions.join(" AND "))
-        };
+        let simple_where = format!("WHERE {}", simple_conditions.join(" AND "));
 
-        let mut aliased_conditions: Vec<String> = Vec::new();
+        let mut aliased_conditions: Vec<String> = vec!["h.source != 'radio'".to_string()];
         if let Some(d) = days {
             aliased_conditions.push(dialect_since("listened_at", d));
         }
@@ -1262,11 +1269,7 @@ impl HistoryRepo {
         if let Some(pid) = profile_id {
             aliased_conditions.push(format!("h.profile_id = {pid}"));
         }
-        let where_clause = if aliased_conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", aliased_conditions.join(" AND "))
-        };
+        let where_clause = format!("WHERE {}", aliased_conditions.join(" AND "));
 
         // ── Range ──
         let from_sql = if days.is_some() {
@@ -1305,11 +1308,8 @@ impl HistoryRepo {
         let u_artists = totals_row.get(3).and_then(|v| v.as_i64()).unwrap_or(0);
 
         // ── Top artists (exclude radio) ──
-        let no_radio_and = if simple_where.is_empty() {
-            "WHERE source != 'radio' AND"
-        } else {
-            "AND source != 'radio' AND"
-        };
+        // `simple_where` exclut déjà la radio (#7965).
+        let no_radio_and = "AND";
         // 🔴 LA POCHETTE N'EST PLUS RÉSOLUE PENDANT L'AGRÉGATION.
         //
         // Cette requête portait une sous-requête CORRÉLÉE sur `tracks ⋈ albums`
@@ -1360,11 +1360,8 @@ impl HistoryRepo {
             .collect();
 
         // ── Top albums (exclude radio) ──
-        let no_radio_and_h = if where_clause.is_empty() {
-            "WHERE h.source != 'radio' AND"
-        } else {
-            "AND h.source != 'radio' AND"
-        };
+        // `where_clause` exclut déjà la radio (#7965).
+        let no_radio_and_h = "AND";
         // Même correction que pour les artistes : la jointure
         // `LOWER(a.title) = LOWER(h.album_title)` balayait les 4 363 albums
         // pour chaque ligne d'historique de la période.
@@ -1522,7 +1519,7 @@ impl HistoryRepo {
         let trend_sql = format!(
             "SELECT {} as day, COUNT(*) as plays, CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT) as ms
              FROM listen_history
-             WHERE {} {trend_zone_and}
+             WHERE source != 'radio' AND {} {trend_zone_and}
              GROUP BY 1 ORDER BY 1",
             dialect_day("listened_at"),
             dialect_since("listened_at", trend_days)
@@ -1596,16 +1593,14 @@ impl HistoryRepo {
             .collect();
 
         // ── Completion stats ──
-        let inner_where = if simple_conditions.is_empty() {
-            String::new()
-        } else {
+        let inner_where = {
             // Re-build the WHERE with `lh.` prefix on column names.
             // simple_conditions hold either a `since_days(listened_at,
             // N)` clause (which already references `listened_at` —
             // need `lh.listened_at`) or `zone_id = N` (need
             // `lh.zone_id`). Easier: just emit the lh-prefixed form
             // directly here rather than try to mangle the strings.
-            let mut lh: Vec<String> = Vec::new();
+            let mut lh: Vec<String> = vec!["lh.source != 'radio'".to_string()];
             if let Some(d) = days {
                 lh.push(dialect_since("lh.listened_at", d));
             }
@@ -1614,11 +1609,7 @@ impl HistoryRepo {
             }
             format!("WHERE {}", lh.join(" AND "))
         };
-        let inner_and_or = if simple_conditions.is_empty() {
-            "WHERE"
-        } else {
-            "AND"
-        };
+        let inner_and_or = "AND";
         let cast_dur = match self.db.engine() {
             Engine::Sqlite => "t.duration_ms".to_string(),
             Engine::Postgres => "CAST(t.duration_ms AS bigint)".to_string(),
@@ -1659,13 +1650,8 @@ impl HistoryRepo {
             "SELECT t.genre, COUNT(*) as plays, CAST(COALESCE(SUM(h.duration_ms), 0) AS BIGINT) as ms
              FROM listen_history h
              INNER JOIN tracks t ON t.id = h.track_id
-             {where_clause} {and_or} t.genre IS NOT NULL AND t.genre != ''
+             {where_clause} AND t.genre IS NOT NULL AND t.genre != ''
              GROUP BY t.genre ORDER BY plays DESC LIMIT 50",
-            and_or = if where_clause.is_empty() {
-                "WHERE"
-            } else {
-                "AND"
-            },
         );
         let by_genre: Vec<ByGenreEntry> = self
             .db
@@ -1821,7 +1807,7 @@ impl HistoryRepo {
             "SELECT title, artist_name, MAX(album_title), NULL, MAX(listened_at),
                     MAX({yr_expr}) as yr
              FROM listen_history
-             WHERE {plages} listened_at LIKE {ph} AND {yr_expr} < {current_year}
+             WHERE source != 'radio' AND {plages} listened_at LIKE {ph} AND {yr_expr} < {current_year}
              GROUP BY {titre}, {artiste}
              ORDER BY yr DESC LIMIT 10",
             titre = sans_index("title"),
