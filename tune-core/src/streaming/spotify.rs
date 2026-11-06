@@ -1,6 +1,6 @@
 use reqwest::Client;
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{info, warn};
 
 use super::traits::*;
@@ -10,6 +10,17 @@ const AUTH_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const API_BASE: &str = "https://api.spotify.com/v1";
 const DEFAULT_CLIENT_ID: &str = "placeholder";
+/// #7659 — le plus grand `limit` que `/v1/search` accepte d'une application
+/// en quota étendu. Au-delà, Spotify répond `400 Invalid limit` : la limite
+/// du client web (100, `SEARCH_FEDEREE_LIMIT`) partait telle quelle et la
+/// recherche ne rendait rien.
+const PLAFOND_RECHERCHE: usize = 50;
+/// #7659 — le plafond d'une application en mode développement, celle que
+/// chaque utilisateur crée pour coller son Client ID (fil 221), depuis les
+/// changements de l'API Web de février 2026. Il n'est pas supposé d'avance :
+/// le service l'adopte au premier `400 Invalid limit` qu'il reçoit à 50
+/// (voir [`SpotifyService::recherche`]).
+const PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT: usize = 10;
 // Spotify n'accepte plus l'alias `localhost` : le HTTP en clair n'est admis
 // que pour un LITTERAL de boucle locale. C'est acquis depuis #2680 et ce
 // n'est pas ce qui change ici.
@@ -73,6 +84,11 @@ pub struct SpotifyService {
     /// `None` : inconnues (liaison restaurée d'une version qui ne les gardait
     /// pas, pas encore rafraîchie).
     portees: Option<String>,
+    /// #7659 — le `limit` de recherche que Spotify accepte de CETTE
+    /// application : [`PLAFOND_RECHERCHE`], ramené à
+    /// [`PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT`] après un refus de limite.
+    /// Atomique pour la même raison que `token_rejected`.
+    plafond_recherche: AtomicUsize,
 }
 
 impl Default for SpotifyService {
@@ -354,6 +370,7 @@ impl SpotifyService {
             enabled_override: None,
             token_rejected: AtomicBool::new(false),
             portees: None,
+            plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
         }
     }
 
@@ -443,23 +460,94 @@ impl SpotifyService {
             self.note_token_rejected();
             return Err("token expired".into());
         }
-        // #6825 — un refus de l'API Web (403, 404, 429…) est une ERREUR,
-        // journalisée avec son statut. Avant, son corps était lu comme une
-        // réponse : `data["albums"]["items"]` y manquait, et la méthode
-        // rendait `Ok(vec![])`. L'onglet Éditorial restait vide sans un mot,
-        // et cette liste vide partait dans le cache éditorial (30 min).
-        let statut = resp.status();
-        if !statut.is_success() {
+        // #7659 et #6825 — un refus (400, 403, 404, 429…) porte un corps JSON
+        // valide, `{"error":{"status":400,"message":"Invalid limit"}}` : le
+        // lire comme une réponse faisait passer le refus pour une recherche
+        // sans résultat ou un onglet Éditorial vide (mis en cache 30 min).
+        // C'est une erreur, journalisée avec son statut ; le chemin est
+        // journalisé sans sa requête, le motif borné à 200 caractères.
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
             let corps = resp.text().await.unwrap_or_default();
-            let motif = motif_du_refus(&corps);
+            let message = motif_du_refus(&corps);
             let route = path.split('?').next().unwrap_or(path);
-            warn!(route, statut = statut.as_u16(), motif = %motif, "spotify_api_refus");
-            return Err(format!(
-                "spotify GET {route}: {} — {motif}",
-                statut.as_u16()
-            ));
+            warn!(status, route, message = %message, "spotify_api_error");
+            return Err(format!("spotify GET {route}: HTTP {status} — {message}"));
         }
         resp.json().await.map_err(|e| format!("spotify json: {e}"))
+    }
+
+    /// #7659 — la limite envoyée à `/v1/search` pour une `limit` demandée :
+    /// le plafond accepté par cette application, `0` (« Tous ») compris.
+    fn borne_de_recherche(&self, limit: usize) -> usize {
+        let plafond = self.plafond_recherche.load(Ordering::Relaxed);
+        if limit == 0 {
+            plafond
+        } else {
+            limit.min(plafond)
+        }
+    }
+
+    /// #7659 — une page brute de `/v1/search`, et la limite réellement servie.
+    ///
+    /// Un `400 Invalid limit` reçu au-dessus du plafond du mode développement
+    /// fait adopter ce plafond, puis la même page est redemandée UNE fois :
+    /// la recherche aboutit pour les deux sortes d'applications, sans deviner
+    /// laquelle est configurée.
+    async fn recherche(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(serde_json::Value, usize), String> {
+        let borne = self.borne_de_recherche(limit);
+        match self.page_brute(query, borne, offset).await {
+            Err(e) if refus_de_limite(&e) && borne > PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT => {
+                self.plafond_recherche
+                    .store(PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT, Ordering::Relaxed);
+                warn!(
+                    refusee = borne,
+                    adoptee = PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT,
+                    "spotify_search_limit_lowered"
+                );
+                let borne = self.borne_de_recherche(limit);
+                self.page_brute(query, borne, offset)
+                    .await
+                    .map(|data| (data, borne))
+            }
+            r => r.map(|data| (data, borne)),
+        }
+    }
+
+    async fn page_brute(
+        &self,
+        query: &str,
+        borne: usize,
+        offset: usize,
+    ) -> Result<serde_json::Value, String> {
+        self.api_get(&format!(
+            "/search?q={}&type=track,album,artist&limit={borne}&offset={offset}",
+            urlencoding::encode(query)
+        ))
+        .await
+    }
+
+    fn resultats_de_recherche(data: &serde_json::Value) -> SearchResults {
+        SearchResults {
+            tracks: data["tracks"]["items"]
+                .as_array()
+                .map(|i| i.iter().map(Self::map_track).collect())
+                .unwrap_or_default(),
+            albums: data["albums"]["items"]
+                .as_array()
+                .map(|i| i.iter().map(Self::map_album).collect())
+                .unwrap_or_default(),
+            artists: data["artists"]["items"]
+                .as_array()
+                .map(|i| i.iter().map(Self::map_artist).collect())
+                .unwrap_or_default(),
+            playlists: vec![],
+        }
     }
 
     /// #6018 — le jeton d'accès courant, que librespot reçoit pour se
@@ -503,16 +591,31 @@ impl SpotifyService {
             .clone()
             .ok_or("Spotify n'est pas connecté")?;
         let mut appareil = None;
+        let mut derniere_erreur = None;
         for essai in 0..20 {
             if essai > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
-            appareil = self.appareil_par_nom(nom).await?;
+            // #7659 — `api_get` rend désormais un refus (429, 5xx…) en erreur :
+            // un refus passager vaut « appareil pas encore visible », seul le
+            // jeton rejeté arrête l'attente.
+            match self.appareil_par_nom(nom).await {
+                Ok(trouve) => {
+                    derniere_erreur = None;
+                    appareil = trouve;
+                }
+                Err(e) if e == "token expired" => return Err(e),
+                Err(e) => derniere_erreur = Some(e),
+            }
             if appareil.is_some() {
                 break;
             }
         }
-        let appareil = appareil.ok_or_else(|| motif_appareil_absent(nom))?;
+        let appareil = match (appareil, derniere_erreur) {
+            (Some(appareil), _) => appareil,
+            (None, Some(e)) => return Err(e),
+            (None, None) => return Err(motif_appareil_absent(nom)),
+        };
         let resp = self
             .client
             .put(format!(
@@ -887,26 +990,42 @@ impl StreamingService for SpotifyService {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
-        let data = self
-            .api_get(&format!(
-                "/search?q={}&type=track,album,artist&limit={limit}",
-                urlencoding::encode(query)
-            ))
-            .await?;
-        Ok(SearchResults {
-            tracks: data["tracks"]["items"]
-                .as_array()
-                .map(|i| i.iter().map(Self::map_track).collect())
-                .unwrap_or_default(),
-            albums: data["albums"]["items"]
-                .as_array()
-                .map(|i| i.iter().map(Self::map_album).collect())
-                .unwrap_or_default(),
-            artists: data["artists"]["items"]
-                .as_array()
-                .map(|i| i.iter().map(Self::map_artist).collect())
-                .unwrap_or_default(),
-            playlists: vec![],
+        let (data, _) = self.recherche(query, limit, 0).await?;
+        Ok(Self::resultats_de_recherche(&data))
+    }
+
+    /// #7659 — la limite servie est celle de [`Self::borne_de_recherche`] :
+    /// le curseur de la route avance de ce que Spotify a vraiment rendu.
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        self.borne_de_recherche(limit)
+    }
+
+    /// #7659 — une PAGE de la recherche Spotify : `/v1/search` sait paginer
+    /// (`offset`), et chaque catégorie annonce son `total` et, tant qu'il en
+    /// reste, `next`. Avec un plafond de 10 par page, c'est « Charger plus »
+    /// qui donne la suite.
+    async fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchPage, TuneError> {
+        let (data, _) = self.recherche(query, limit, offset).await?;
+        let total = |cat: &str| data[cat]["total"].as_u64().unwrap_or(0) as usize;
+        let has_more = ["tracks", "albums", "artists"]
+            .iter()
+            .any(|cat| data[*cat]["next"].is_string());
+        Ok(SearchPage {
+            results: Self::resultats_de_recherche(&data),
+            offset,
+            totals: SearchTotals {
+                tracks: total("tracks"),
+                albums: total("albums"),
+                artists: total("artists"),
+                playlists: 0,
+            },
+            has_more,
+            truncated: false,
         })
     }
 
@@ -1294,6 +1413,14 @@ fn spotify_needs_refresh(
             .unwrap_or(true),
         None => has_access && has_refresh,
     }
+}
+
+/// #7659 — le message d'un refus de l'API Web (`error.message`), ou le corps
+/// brut s'il n'en porte pas.
+/// #7659 — l'erreur d'[`SpotifyService::api_get`] est-elle le refus de la
+/// limite de recherche (`400 Invalid limit`) ?
+fn refus_de_limite(erreur: &str) -> bool {
+    erreur.contains("HTTP 400") && erreur.to_lowercase().contains("invalid limit")
 }
 
 /// #6933 — l'appareil librespot n'apparaît pas dans `/me/player/devices`.
@@ -2465,3 +2592,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "spotify_recherche_7659_tests.rs"]
+mod recherche_7659_tests;
