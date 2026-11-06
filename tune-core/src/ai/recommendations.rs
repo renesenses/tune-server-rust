@@ -1105,3 +1105,61 @@ mod smart_radio_rerank_tests {
         assert_eq!(titles, ["premier", "second"]);
     }
 }
+
+#[cfg(test)]
+mod ecoutes_importees_7777_tests {
+    use super::*;
+    use crate::db::ecoutes_importees::EcoutesImporteesRepo;
+    use crate::db::sqlite::SqliteDb;
+
+    fn executer(backend: &Arc<dyn DbBackend>, sql: &str) {
+        backend
+            .execute(sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"));
+    }
+
+    // #7777 : un artiste écouté seulement dans un autre logiciel (40 écoutes
+    // importées, rien dans l'historique de Tune) fait partie des artistes
+    // favoris d'où partent les recommandations. Sans les écoutes importées,
+    // seul l'artiste de l'historique servait de graine.
+    #[test]
+    fn i7777_les_ecoutes_importees_nourrissent_les_artistes_favoris() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        for sql in [
+            "INSERT INTO artists (id, name) VALUES (1, 'Artiste importé')",
+            "INSERT INTO artists (id, name) VALUES (2, 'Nina Simone')",
+            "INSERT INTO tracks (id, title, artist_id, file_path, format) \
+             VALUES (11, 'Ballade importée', 1, '/m/11.flac', 'flac')",
+            "INSERT INTO tracks (id, title, artist_id, file_path, format) \
+             VALUES (12, 'Autre ballade', 1, '/m/12.flac', 'flac')",
+            "INSERT INTO tracks (id, title, artist_id, file_path, format) \
+             VALUES (21, 'Sinnerman', 2, '/m/21.flac', 'flac')",
+            "INSERT INTO listen_history (title, artist_name, source, listened_at, duration_ms) \
+             VALUES ('Sinnerman', 'Nina Simone', 'local', '2020-01-01T00:00:00Z', 1000)",
+        ] {
+            executer(&backend, sql);
+        }
+        EcoutesImporteesRepo::with_backend(backend.clone())
+            .ajouter(11, 40, None)
+            .unwrap();
+
+        let recos = get_recommendations(&backend, None, 10);
+        let importees: Vec<i64> = recos
+            .iter()
+            .filter(|r| r.artist.as_deref() == Some("Artiste importé"))
+            .map(|r| r.track_id)
+            .collect();
+        assert!(
+            !importees.is_empty() && recos.iter().all(|r| r.reason == "artist affinity"),
+            "recommandations : écoutes importées ignorées dans les artistes favoris — \
+             obtenu {:?}",
+            recos
+                .iter()
+                .map(|r| (r.track_id, r.artist.clone(), r.reason.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+}

@@ -132,7 +132,10 @@ pub mod sql {
             // les additionne dans un seul groupe. `listen_history.track_id`
             // étant toujours NULL, `MAX(tid)` y prend l'identifiant de la
             // piste importée. `CAST … AS BIGINT` : `SUM` d'un BIGINT rend un
-            // NUMERIC sur PostgreSQL, que `as_i64` ne lit pas.
+            // NUMERIC sur PostgreSQL, que `as_i64` ne lit pas. Une écoute
+            // importée vaut `src = 'local'` : son `track_id` désigne une piste
+            // de la bibliothèque, donc `MAX(src)` d'un groupe mixte peut
+            // passer de « deezer » à « local », ce qui reste cohérent.
             "WITH u AS (SELECT h.title AS title, h.artist_name AS artist_name, \
                     1 AS n, h.track_id AS tid, h.album_title AS alb, \
                     h.cover_url AS cu, h.source AS src \

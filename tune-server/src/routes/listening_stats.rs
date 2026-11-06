@@ -500,12 +500,20 @@ fn query_top_genres(
 ) -> Result<Vec<Value>, AppError> {
     // Join listen_history with tracks to pull genre info.
     // Falls back gracefully if no tracks are linked.
+    // #7777 : les écoutes importées (`imported_plays`) comptent aussi, comme
+    // dans les autres classements tous temps ; elles portent un `track_id`
+    // réel, donc leur genre se lit directement sur la piste.
     let rows = b
         .query_many(
-            "SELECT t.genre, COUNT(*) as plays FROM listen_history lh \
-             INNER JOIN tracks t ON t.id = lh.track_id \
-             WHERE t.genre IS NOT NULL AND t.genre != '' \
-             GROUP BY t.genre ORDER BY plays DESC LIMIT ?",
+            "SELECT g.genre, CAST(SUM(g.n) AS BIGINT) AS plays FROM ( \
+               SELECT t.genre AS genre, 1 AS n FROM listen_history lh \
+               INNER JOIN tracks t ON t.id = lh.track_id \
+               UNION ALL \
+               SELECT t.genre, ip.play_count FROM imported_plays ip \
+               INNER JOIN tracks t ON t.id = ip.track_id \
+               WHERE ip.play_count > 0) g \
+             WHERE g.genre IS NOT NULL AND g.genre != '' \
+             GROUP BY g.genre ORDER BY plays DESC LIMIT ?",
             &[&limit as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;

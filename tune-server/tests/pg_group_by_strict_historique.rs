@@ -167,10 +167,10 @@ async fn scenario_ecoutes_importees(state: &AppState) -> Vec<String> {
         "INSERT INTO artists (id, name) VALUES (777702, 'Kate Bush')",
         "INSERT INTO albums (id, title, artist_id) VALUES (777701, 'Album importé', 777701)",
         "INSERT INTO albums (id, title, artist_id) VALUES (777702, 'The Kick Inside', 777702)",
-        "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format) \
-         VALUES (777701, 'Ballade importée', 777701, 777701, '/m/7777/1.flac', 'flac')",
-        "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format) \
-         VALUES (777702, 'Moving', 777702, 777702, '/m/7777/2.flac', 'flac')",
+        "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, genre) \
+         VALUES (777701, 'Ballade importée', 777701, 777701, '/m/7777/1.flac', 'flac', 'Folk')",
+        "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, genre) \
+         VALUES (777702, 'Moving', 777702, 777702, '/m/7777/2.flac', 'flac', 'Art Rock')",
     ] {
         executer(state, sql);
     }
@@ -271,6 +271,7 @@ async fn scenario_ecoutes_importees(state: &AppState) -> Vec<String> {
         ("top_tracks", "title", ("Ballade importée", 40)),
         ("top_artists", "artist", ("Artiste importé", 40)),
         ("top_albums", "album", ("Album importé", 40)),
+        ("top_genres", "genre", ("Folk", 40)),
     ] {
         let obtenu = premier(cle, nom);
         if obtenu != (attendu.0.to_string(), attendu.1) {
