@@ -154,7 +154,7 @@ pub(crate) fn activite_de(
 }
 
 /// L'avancement publié d'une passe, sans requête.
-fn avancement(state: &AppState, tache: Tache) -> Value {
+pub(crate) fn avancement(state: &AppState, tache: Tache) -> Value {
     let jauge = |processed: i64, total: i64, detail: &str| {
         json!({
             "processed": processed.max(0),
@@ -162,6 +162,21 @@ fn avancement(state: &AppState, tache: Tache) -> Value {
             "detail": detail,
         })
     };
+    // #7915 — les empreintes et la plage dynamique de la cascade publient
+    // leur propre campagne, ReplayGain coupé ou non, avec une estimation.
+    if matches!(tache, Tache::Empreintes | Tache::PlageDynamique) {
+        if let Some(a) = tune_core::taches_de_fond::avancement::releve(tache)
+            && a.active
+        {
+            return json!({
+                "processed": a.processed,
+                "total": a.total,
+                "detail": "cascade",
+                "eta_seconds": a.eta_seconds,
+                "started_at": a.started_at,
+            });
+        }
+    }
     match tache {
         // La cascade : une seule campagne, un seul avancement pour les trois
         // rangs (`routes/system/taches_de_fond.rs`, `cascade_en_cours`).
@@ -224,7 +239,12 @@ pub(crate) fn bloc_thermique(
     gardes_chaudes: &[String],
     bridage_leve: bool,
 ) -> Value {
-    let reglee = vitesse.largeur(coeurs);
+    // #7915 — `normal` décode un seul fichier à la fois sur une petite machine.
+    let reglee = tune_core::taches_de_fond::vitesse::largeur_sur_la_machine(
+        vitesse,
+        coeurs,
+        tune_core::taches_de_fond::vitesse::memoire_totale(),
+    );
     let effective = lecture.map(|l| thermal::largeur_selon_la_chaleur(reglee, &l, bridage_leve));
     let motif = lecture.and_then(|l| l.motif_du_bridage()).map(|m| m.id());
     json!({

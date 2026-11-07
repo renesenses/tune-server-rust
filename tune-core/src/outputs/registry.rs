@@ -34,7 +34,14 @@ impl OutputRegistry {
         }
     }
 
-    pub fn register(&mut self, output: Box<dyn OutputTarget>) {
+    /// Enregistre `output`. Rend la sortie qu'elle remplace sous le même
+    /// identifiant, s'il y en avait une : l'appelant l'arrête hors du verrou
+    /// du registre avec [`arreter_les_sorties_retirees`] (#7949). Ignorée, elle
+    /// est détruite quand sa dernière référence tombe.
+    pub fn register(
+        &mut self,
+        output: Box<dyn OutputTarget>,
+    ) -> Option<Arc<Mutex<Box<dyn OutputTarget>>>> {
         let id = output.device_id().to_string();
         self.meta.insert(
             id.clone(),
@@ -52,7 +59,7 @@ impl OutputRegistry {
             Some(envoi) => self.envois_de_volume.insert(id.clone(), envoi),
             None => self.envois_de_volume.remove(&id),
         };
-        self.outputs.insert(id, Arc::new(Mutex::new(output)));
+        self.outputs.insert(id, Arc::new(Mutex::new(output)))
     }
 
     /// #7633 — l'envoi du volume de cette sortie qui ne demande pas son
@@ -136,10 +143,14 @@ impl OutputRegistry {
         self.outputs.contains_key(device_id)
     }
 
-    pub fn remove(&mut self, device_id: &str) {
-        self.outputs.remove(device_id);
+    /// Retire la sortie et la rend, sans l'arrêter : le registre est tenu
+    /// sous un verrou que `stop()` ne doit pas allonger (jusqu'à 2 s pour une
+    /// sortie locale). L'appelant passe la sortie rendue à
+    /// [`arreter_les_sorties_retirees`] une fois le verrou relâché (#7949).
+    pub fn remove(&mut self, device_id: &str) -> Option<Arc<Mutex<Box<dyn OutputTarget>>>> {
         self.meta.remove(device_id);
         self.envois_de_volume.remove(device_id);
+        self.outputs.remove(device_id)
     }
 
     pub fn list(&self) -> Vec<String> {
@@ -190,6 +201,33 @@ impl OutputRegistry {
             results.push(entry);
         }
         results
+    }
+}
+
+/// Délai accordé à l'arrêt d'une sortie retirée. `LocalOutput::stop` attend
+/// déjà 2 s au plus son fil de lecture ; une sortie réseau qui ne répond pas
+/// ne doit pas retenir plus longtemps la route ou le balayage qui l'a retirée.
+const ECHEANCE_ARRET_SORTIE_RETIREE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #7949 — arrête les sorties qu'un retrait du registre vient de rendre.
+///
+/// Une sortie retirée sans `stop()` continuait de jouer sur une zone qui
+/// n'existait plus, ou, en pause, gardait son périphérique (EBUSY ALSA,
+/// DeviceBusy ASIO au rebranchement). À appeler APRÈS avoir relâché le verrou
+/// du registre : `stop()` peut attendre la fin d'un fil de lecture.
+pub async fn arreter_les_sorties_retirees(
+    retirees: impl IntoIterator<Item = Arc<Mutex<Box<dyn OutputTarget>>>>,
+) {
+    for sortie in retirees {
+        let sortie = sortie.lock().await;
+        let id = sortie.device_id().to_string();
+        match tokio::time::timeout(ECHEANCE_ARRET_SORTIE_RETIREE, sortie.stop()).await {
+            Ok(Ok(())) => tracing::debug!(device_id = %id, "output_removed_stopped"),
+            Ok(Err(e)) => {
+                tracing::warn!(device_id = %id, error = %e, "output_removed_stop_failed")
+            }
+            Err(_) => tracing::warn!(device_id = %id, "output_removed_stop_timeout"),
+        }
     }
 }
 

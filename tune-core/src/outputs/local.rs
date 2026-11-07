@@ -365,6 +365,66 @@ impl Drop for SentinelleDuFilDeLecture {
     }
 }
 
+/// #7949 — échéance de la sortie du fil de lecture quand la sortie est
+/// détruite. La même que celle de `stop()`.
+const ECHEANCE_FIL_A_LA_DESTRUCTION: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// #7949 — une sortie locale détruite arrête son fil de lecture.
+///
+/// Sans ce `Drop`, retirer la sortie du registre (débranchement, balayage à
+/// chaud, « ignorer », bascule ASIO) fermait `stop_tx` et détachait le fil :
+/// le fil ne prend pas un canal fermé pour un arrêt, et en pause il attendait
+/// `paused` ou `force_silent`, que plus personne ne pouvait changer. Il
+/// gardait le flux cpal, donc le PCM `hw:` ou le pilote ASIO, jusqu'à l'arrêt
+/// du serveur (EBUSY / DeviceBusy au rebranchement), ou continuait de jouer
+/// sur une zone qui n'existait plus.
+///
+/// Même procédure que `stop()`, en synchrone : faire taire le rappel, envoyer
+/// l'arrêt, lever la pause, puis attendre le fil avec une échéance. Après un
+/// `stop()`, il n'y a plus ni canal ni fil : rien à faire.
+impl Drop for LocalOutput {
+    fn drop(&mut self) {
+        let fil = self
+            .play_thread
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let stop_tx = self
+            .stop_tx
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if fil.is_none() && stop_tx.is_none() {
+            return;
+        }
+        self.force_silent
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .store(true, Ordering::SeqCst);
+        if let Some(tx) = stop_tx {
+            let _ = tx.send(());
+        }
+        self.paused.store(false, Ordering::SeqCst);
+        let Some(fil) = fil else {
+            return;
+        };
+        let echeance = std::time::Instant::now() + ECHEANCE_FIL_A_LA_DESTRUCTION;
+        while !fil.is_finished() {
+            if std::time::Instant::now() >= echeance {
+                warn!(
+                    device_id = %self.device_id,
+                    attente_ms = ECHEANCE_FIL_A_LA_DESTRUCTION.as_millis() as u64,
+                    "local_audio_drop_thread_detached — le fil de lecture de la sortie \
+                     détruite n'a pas rendu la main : il tient peut-être encore le périphérique"
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = fil.join();
+    }
+}
+
 /// #3575 — dire QUI tient le PCM, au moment exact où nous n'arrivons pas à
 /// l'ouvrir.
 ///
@@ -714,6 +774,13 @@ pub struct LocalOutput {
     /// sous PURE la chaîne dit toujours « rien d'armé ». Seuls les réglages
     /// disent ce que PURE contourne. Lu par `signal_path_status`.
     pure_contourne_un_reglage: Arc<AtomicBool>,
+    /// #4176 — PURE a contourné le préampli GARDÉ d'un égaliseur coupé
+    /// (#5215). Les réglages ne le voient pas (l'égaliseur y est désactivé),
+    /// mais le gain gardé changeait le niveau et PURE le retire. Posé par
+    /// `set_pure_bypass(true)` d'après la chaîne d'avant la bascule, effacé à
+    /// la sortie de PURE. Lu par `signal_path_status`, avec le drapeau
+    /// ci-dessus.
+    pure_contourne_un_gain_garde: Arc<AtomicBool>,
     /// #6211 — la lecture en cours est-elle un flux SANS FIN (radio) ? Posé
     /// par l'orchestrateur à chaque lecture, d'après `live_stream`. Armé, le
     /// préampli gardé d'un égaliseur coupé s'éteint en fondu au lieu de
@@ -1279,6 +1346,7 @@ impl LocalOutput {
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
+            pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
@@ -1394,6 +1462,18 @@ impl LocalOutput {
     fn reborner_le_preampli_garde(&self) {
         if let Ok(mut eq) = self.eq.lock() {
             self.borner_la_remontee(&mut eq);
+        }
+    }
+
+    /// #4176 — « Remettre à plat » : le gain gardé d'un égaliseur coupé
+    /// remonte, progressivement, jusqu'au niveau sans égaliseur, sans la borne
+    /// de volume de #6741 (voir `EqProcessor::liberer_le_gain_garde`). Sans
+    /// effet si la chaîne ne porte pas d'égaliseur coupé.
+    pub fn liberer_le_preampli_garde(&self) {
+        if let Ok(mut eq) = self.eq.lock()
+            && let Some(p) = eq.as_mut()
+        {
+            p.liberer_le_gain_garde();
         }
     }
 
@@ -1590,12 +1670,65 @@ impl LocalOutput {
             .store(Self::pack_format(taux, canaux), Ordering::Relaxed);
     }
 
+    /// #7949 — installe un fil de lecture factice, sans carte son, à la place
+    /// de celui que lance `play_url` : même canal d'arrêt, même `paused`, même
+    /// `force_silent`, même sentinelle déclarée en premier. Rend la sentinelle,
+    /// qui retombe quand le fil a fini (« périphérique rendu »).
+    #[cfg(test)]
+    pub(crate) fn lancer_un_fil_factice_for_test<F>(&self, corps: F) -> Arc<AtomicBool>
+    where
+        F: FnOnce(std::sync::mpsc::Receiver<()>, Arc<AtomicBool>, Arc<AtomicBool>) + Send + 'static,
+    {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        *self.stop_tx.lock().unwrap() = Some(stop_tx);
+        let force_silent = Arc::new(AtomicBool::new(false));
+        *self.force_silent.lock().unwrap() = force_silent.clone();
+        let paused = self.paused.clone();
+        self.playing.store(true, Ordering::SeqCst);
+        let sentinelle = Arc::new(AtomicBool::new(true));
+        *self.sentinelle_du_fil.lock().unwrap() = Some(sentinelle.clone());
+        let sentinelle_du_fil = sentinelle.clone();
+        let fil = std::thread::spawn(move || {
+            let _sentinelle_du_fil = SentinelleDuFilDeLecture(sentinelle_du_fil);
+            corps(stop_rx, paused, force_silent);
+        });
+        *self.play_thread.lock().unwrap() = Some(fil);
+        sentinelle
+    }
+
     /// Force l'état de la boucle d'enchaînement, pour les tests : c'est la
     /// seule façon d'atteindre la sonde sans carte son. Même point d'entrée que
     /// `OaatOutput::set_chain_exhausted_for_test` (#1323).
     #[cfg(test)]
     pub(crate) fn set_chain_exhausted_for_test(&self, exhausted: bool) {
         self.chain_exhausted.store(exhausted, Ordering::SeqCst);
+    }
+
+    /// #4176 — faire passer `secondes` de silence stéréo par la chaîne DSP,
+    /// au format déclaré, par la fonction de la boucle de lecture
+    /// (`apply_local_dsp`) : fondus et rampes du gain gardé avancent, et un
+    /// égaliseur coupé revenu au repos est retiré, comme en lecture.
+    #[cfg(test)]
+    pub(crate) fn jouer_du_pcm_pour_test(&self, secondes: f64) {
+        let (taux, canaux) = self.current_format().expect("format déclaré");
+        let trames = (f64::from(taux) * secondes) as usize;
+        let paquet = (taux / 10) as usize;
+        let mut faites = 0;
+        while faites < trames {
+            let n = paquet.min(trames - faites);
+            let mut pcm = vec![0.0_f32; n * usize::from(canaux)];
+            apply_local_dsp(
+                &mut pcm,
+                &self.eq,
+                &self.convolver,
+                &self.crossfeed,
+                &self.pure_bypass,
+                &self.mono_downmix,
+                canaux,
+                false,
+            );
+            faites += n;
+        }
     }
 
     /// Lecture du drapeau PURE, pour les tests : c'est lui que `apply_local_dsp`
@@ -1693,6 +1826,23 @@ impl LocalOutput {
     /// orchestrator so a bit-perfect (PURE) zone skips convolution while other
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
+        // #4176 — relevé AVANT la bascule : sous PURE, `preampli_garde` ne
+        // dit plus rien, et la chaîne va être vidée. Un début de piste sous
+        // PURE (chaîne déjà vide) n'efface pas ce qu'une bascule a relevé ;
+        // seule la sortie de PURE le fait.
+        if bypass {
+            let garde = self
+                .eq
+                .lock()
+                .is_ok_and(|e| e.as_ref().is_some_and(|p| p.preampli_garde().is_some()));
+            if garde {
+                self.pure_contourne_un_gain_garde
+                    .store(true, Ordering::Relaxed);
+            }
+        } else {
+            self.pure_contourne_un_gain_garde
+                .store(false, Ordering::Relaxed);
+        }
         self.pure_bypass.store(bypass, Ordering::Relaxed);
         // #4685 — un DSP contourné ne change aucun niveau : sa compensation
         // doit tomber avec lui.
@@ -2739,6 +2889,10 @@ mod dop_continu_7704;
 // #7703 — la quantification finale native est dithérée, après le volume.
 #[cfg(test)]
 mod quantification_finale_7703;
+
+// #7949 — une sortie locale retirée du registre rend son fil et son périphérique.
+#[cfg(test)]
+mod retrait_du_registre_7949;
 
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
@@ -8390,7 +8544,8 @@ impl OutputTarget for LocalOutput {
             .and_then(|status| status.clone())?;
         status.dsp = verdict_pure_selon_les_reglages(
             status.dsp,
-            self.pure_contourne_un_reglage.load(Ordering::Relaxed),
+            self.pure_contourne_un_reglage.load(Ordering::Relaxed)
+                || self.pure_contourne_un_gain_garde.load(Ordering::Relaxed),
         );
         Some(status)
     }

@@ -30,7 +30,11 @@ pub mod sql {
         // charger des centaines de milliers de chemins dans GET config, ni
         // dans les recherches de réglages des zones et artistes (#6286).
         // Le rapport les lit explicitement par préfixe et par pages.
-        "SELECT key, value FROM settings WHERE key NOT LIKE 'audit_integrite_ligne:%' ORDER BY key"
+        // Les liens d'origine des bios (#7910), une ligne par artiste ou album
+        // enrichi, ne sont pas des préférences non plus : ni GET config, ni
+        // l'export, ni la sauvegarde ne les emportent ; ils se lisent par clé.
+        "SELECT key, value FROM settings WHERE key NOT LIKE 'audit_integrite_ligne:%' \
+         AND key NOT LIKE 'bio_liens:%' ORDER BY key"
     }
 
     /// Upsert via the SQL standard `ON CONFLICT` form (SQLite 3.24+,
@@ -364,6 +368,22 @@ mod tests {
     }
 
     #[test]
+    fn liens_de_bio_absents_des_preferences_7910() {
+        let repo = fresh_repo();
+        repo.set("bio_liens:artiste:1", r#"{"empreinte":"x","liens":[]}"#)
+            .unwrap();
+        repo.set("bio_liens:album:2", r#"{"empreinte":"y","liens":[]}"#)
+            .unwrap();
+        repo.set("music_dirs", "[]").unwrap();
+        assert!(repo.get("bio_liens:artiste:1").unwrap().is_some());
+        assert_eq!(
+            repo.all().unwrap(),
+            vec![("music_dirs".into(), "[]".into())],
+            "les liens rangés des bios ne doivent pas alourdir chaque lecture des préférences"
+        );
+    }
+
+    #[test]
     fn audit_integrite_rapport_absent_des_preferences() {
         let repo = fresh_repo();
         repo.set("audit_integrite_ligne:passe:1", "rapport volumineux")
@@ -450,7 +470,8 @@ mod tests {
         assert_eq!(sql::delete_by_key(&d), "DELETE FROM settings WHERE key = ?");
         assert_eq!(
             sql::list_all(),
-            "SELECT key, value FROM settings WHERE key NOT LIKE 'audit_integrite_ligne:%' ORDER BY key"
+            "SELECT key, value FROM settings WHERE key NOT LIKE 'audit_integrite_ligne:%' \
+             AND key NOT LIKE 'bio_liens:%' ORDER BY key"
         );
     }
 

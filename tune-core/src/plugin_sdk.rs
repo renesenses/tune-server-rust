@@ -130,12 +130,13 @@ pub struct AvailablePluginInfo {
     /// "Install"); `false` = a default-on plugin the user disabled (offer
     /// "Enable").
     pub opt_in: bool,
-    /// Le module Premium exigé, par son `display_name` (« Concerts »).
+    /// Le module Premium exigé, par son `display_name` (par exemple
+    /// « Room Correction »).
     ///
     /// Sans ce champ, le gestionnaire proposerait « Installer » à quelqu'un
     /// dont les routes seront refusées juste après : il installe, redémarre,
     /// et n'obtient qu'un 402. Le porter ici permet d'afficher le cadenas
-    /// AVANT le clic (tune-web-client, `stores/concerts.ts`).
+    /// AVANT le clic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_feature: Option<String>,
 }
@@ -154,8 +155,8 @@ pub struct PluginContext {
     /// La licence du serveur, pour qu'un greffon payant ADAPTE sa réponse.
     ///
     /// ⚠️ POURQUOI ICI, ET PAS UN REFUS MONTÉ PAR L'HÔTE DEVANT LES ROUTES.
-    /// Un garde de l'hôte ne sait qu'ouvrir ou fermer. Or « Concerts » doit
-    /// un jour servir une version RÉDUITE aux comptes gratuits : la décision
+    /// Un garde de l'hôte ne sait qu'ouvrir ou fermer. Or un greffon payant
+    /// peut vouloir servir une version RÉDUITE aux comptes gratuits : la décision
     /// « complet / réduit / refusé » doit donc tenir chez le greffon, en une
     /// seule fonction.
     ///
