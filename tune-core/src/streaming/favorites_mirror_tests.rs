@@ -1497,3 +1497,145 @@ async fn un_refus_401_est_memorise_et_n_est_plus_retente_radio_qobuz() {
         vec![Some(ETAT_AJOUT_EN_ATTENTE.to_string())]
     );
 }
+
+/// #7729 — un service dont chaque lecture de favoris prend du temps, et qui
+/// note dans un journal partagé le début et la fin de chaque lecture.
+struct ServiceLent {
+    journal: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl StreamingService for ServiceLent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "miroir-lent-7729"
+    }
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn set_enabled(&mut self, _enabled: bool) {}
+    fn favoris_miroir(&self) -> bool {
+        true
+    }
+    async fn authenticate(&mut self, _c: &serde_json::Value) -> Result<AuthStatus, TuneError> {
+        Ok(Default::default())
+    }
+    async fn auth_status(&self) -> AuthStatus {
+        AuthStatus {
+            authenticated: true,
+            ..Default::default()
+        }
+    }
+    async fn logout(&mut self) -> Result<(), TuneError> {
+        Ok(())
+    }
+    async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_track(&self, _id: &str) -> Result<StreamTrack, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_track_url(&self, _id: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_album(&self, _id: &str) -> Result<StreamAlbum, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_album_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_artist(&self, _id: &str) -> Result<StreamArtist, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_playlist(&self, _id: &str) -> Result<StreamPlaylist, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_playlist_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        Ok(Vec::new())
+    }
+    async fn get_user_favorites_dated(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        self.journal
+            .lock()
+            .unwrap()
+            .push(format!("lecture {fav_type}"));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        Ok(Some(Vec::new()))
+    }
+    async fn favoris_dates_complets(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        self.get_user_favorites_dated(fav_type).await
+    }
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
+        Ok(Vec::new())
+    }
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+        Ok(Vec::new())
+    }
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+        Ok(Vec::new())
+    }
+}
+
+/// #7729 — pendant un rafraîchissement du miroir, une écriture demandée
+/// sur le service (le rafraîchissement du jeton, qui tient en même temps le
+/// registre des services) passe entre deux types de favoris, au lieu
+/// d'attendre la fin de toutes les lectures. C'est cette attente qui gelait
+/// la route des favoris, et toutes les routes de streaming derrière elle.
+#[tokio::test]
+async fn une_ecriture_en_attente_passe_entre_deux_types_du_miroir_7729() {
+    let (backend, profils, _dir) = base(1);
+    let journal = Arc::new(Mutex::new(Vec::new()));
+    let svc: Box<dyn StreamingService> = Box::new(ServiceLent {
+        journal: journal.clone(),
+    });
+    let arc: ServiceArc = Arc::new(RwLock::new(svc));
+
+    let miroir = {
+        let arc = arc.clone();
+        let backend = backend.clone();
+        let appelant = profils[0];
+        tokio::spawn(async move { rafraichir(&arc, &backend, appelant).await })
+    };
+    // Attendre que la première lecture (les titres) ait commencé.
+    while !journal
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.starts_with("lecture tracks"))
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let ecriture = {
+        let arc = arc.clone();
+        let journal = journal.clone();
+        tokio::spawn(async move {
+            let _ecriture = arc.write().await;
+            journal.lock().unwrap().push("ecriture".into());
+        })
+    };
+    ecriture.await.unwrap();
+    miroir.await.unwrap();
+
+    let journal = journal.lock().unwrap().clone();
+    let position = |motif: &str| journal.iter().position(|l| l.starts_with(motif));
+    let ecrit = position("ecriture").expect("l'écriture a eu lieu");
+    let albums = position("lecture albums").expect("les albums ont été lus");
+    assert!(
+        ecrit < albums,
+        "#7729 : le miroir garde le verrou de lecture pendant toutes ses lectures, \
+         l'écriture en attente passe après elles : {journal:?}"
+    );
+}

@@ -2823,8 +2823,11 @@ impl PlaybackOrchestrator {
                         let source_id = source_id.clone();
                         let provider_quality = provider_quality.clone();
                         Box::pin(async move {
-                            let registry = services.lock().await;
-                            let svc = registry
+                            // #7729 — le registre n'est tenu que le temps de
+                            // copier le service, jamais pendant le réseau.
+                            let svc = services
+                                .lock()
+                                .await
                                 .get(&service_name)
                                 .ok_or_else(|| format!("unknown service: {service_name}"))?;
                             let mut svc = svc.write().await;
