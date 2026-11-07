@@ -210,10 +210,22 @@ pub mod sql {
     /// « Titres les plus écoutés », sans quoi deux vues de la même donnée se
     /// contrediraient à l'écran.
     ///
-    /// # La radio est exclue
+    /// # Seules les écoutes locales comptent (#7980)
     ///
-    /// Comme partout ailleurs dans ce fichier : le titre d'une ligne de radio
-    /// est un instantané figé qui ne correspond pas à ce qui passait vraiment.
+    /// Une piste de `tracks` est un fichier de la bibliothèque : seule une
+    /// écoute de ce fichier lui revient. Une écoute Qobuz, Tidal… de même
+    /// titre et même interprète est l'écoute d'un AUTRE enregistrement, qui a
+    /// son propre compte par service et identifiant
+    /// ([`ecoutes_de_service_par_identifiant`], #8062). Avant #7980, seule la
+    /// radio était écartée, et écouter l'album sur Qobuz augmentait le
+    /// compteur de l'album local du même nom. `COALESCE(…, 'local')` garde
+    /// les lignes anciennes dont la source est NULL, comme
+    /// `track_repo::est_local`. La radio, dont le titre est un instantané
+    /// figé, reste exclue de fait.
+    ///
+    /// Conséquence : « Titres les plus écoutés » (`top_tracks`), qui regroupe
+    /// toutes les sources, peut donner un nombre plus grand que la fiche d'un
+    /// album local pour un titre écouté aussi sur un service.
     ///
     /// # Le compte est GLOBAL, pas par profil
     ///
@@ -234,7 +246,7 @@ pub mod sql {
              FROM tracks t \
              LEFT JOIN artists a ON a.id = t.artist_id \
              LEFT JOIN listen_history h \
-                    ON h.source != 'radio' \
+                    ON COALESCE(h.source, 'local') = 'local' \
                    AND h.title = t.title \
                    AND (h.artist_name = a.name \
                         OR (h.artist_name IS NULL AND a.name IS NULL)) \
@@ -249,8 +261,8 @@ pub mod sql {
     /// `h.track_id = t.id`, une colonne toujours NULL. « = 0 » y rendait
     /// toute la bibliothèque et « < 1 » rien du tout.
     ///
-    /// Même règle, donc même nombre que la colonne de la Bibliothèque : hors
-    /// radio, même titre, et même interprète ou interprète absent des deux
+    /// Même règle, donc même nombre que la colonne de la Bibliothèque : écoute
+    /// locale seulement (#7980), même titre, et même interprète ou interprète absent des deux
     /// côtés. L'interprète de la piste est relu par sous-requête pour ne
     /// dépendre d'aucun alias de la requête englobante. `piste` et `ecoute`
     /// sont des alias écrits par l'appelant, jamais une saisie.
@@ -265,7 +277,7 @@ pub mod sql {
         let interprete =
             format!("(SELECT ae.name FROM artists ae WHERE ae.id = {piste}.artist_id)");
         format!(
-            "{ecoute}.source != 'radio' AND ({ecoute}.track_id = {piste}.id \
+            "COALESCE({ecoute}.source, 'local') = 'local' AND ({ecoute}.track_id = {piste}.id \
              OR ({ecoute}.title = {piste}.title \
                  AND ({ecoute}.artist_name = {interprete} \
                       OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))))"
@@ -393,12 +405,13 @@ pub mod sql {
         )
     }
 
-    /// Non-radio play count for one track, matched by title + artist — the same
-    /// grouping `top_tracks` uses (many history rows carry a null track_id).
+    /// Le nombre d'écoutes d'une piste de la bibliothèque, par titre +
+    /// interprète (`track_id` est toujours NULL) : écoutes locales seulement,
+    /// la règle de [`plays_for_tracks`] (#7980).
     pub fn track_plays<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT COUNT(*) FROM listen_history \
-             WHERE source != 'radio' AND title = {} AND artist_name = {}",
+             WHERE COALESCE(source, 'local') = 'local' AND title = {} AND artist_name = {}",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -407,7 +420,7 @@ pub mod sql {
     pub fn track_plays_null_artist<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT COUNT(*) FROM listen_history \
-             WHERE source != 'radio' AND title = {} AND artist_name IS NULL",
+             WHERE COALESCE(source, 'local') = 'local' AND title = {} AND artist_name IS NULL",
             d.placeholder(1)
         )
     }
@@ -2338,6 +2351,10 @@ mod historique_album_de_service_7778_tests;
 #[cfg(test)]
 #[path = "ecoutes_pistes_de_service_8062_tests.rs"]
 mod ecoutes_pistes_de_service_8062_tests;
+
+#[cfg(test)]
+#[path = "ecoutes_d_une_piste_locale_7980_tests.rs"]
+mod ecoutes_d_une_piste_locale_7980_tests;
 
 #[cfg(test)]
 mod tests {
