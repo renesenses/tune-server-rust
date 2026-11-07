@@ -15,6 +15,13 @@
 //! * `POST /mesures/{id}/correction/profil` — même calcul, enregistré comme
 //!   profil de pièce de la zone ; il s'applique ensuite par
 //!   `POST /api/v1/room-correction/profiles/{zone}/apply`.
+//! * `POST /simulations` — simuler les modes de basse d'une pièce
+//!   rectangulaire sans micro (C5) : dimensions, surfaces, positions ;
+//!   modes, réponse estimée à la place d'écoute (201, `{ "id", … }`) ;
+//! * `POST /simulations/{id}/correction` — proposition C2 sur la réponse
+//!   estimée, plus prudente que sur mesure, marquée estimation ;
+//! * `POST /simulations/{id}/correction/profil` — la même, enregistrée comme
+//!   profil de pièce de la zone (`zone_id` de la simulation ou du corps).
 //!
 //! Aucune lecture ne part sans le `POST` explicite de l'utilisateur.
 //!
@@ -39,6 +46,7 @@ use tune_core::license::{Feature, LicenseManager};
 use crate::correction::{DemandeCorrection, Proposition, proposer};
 use crate::generateur::Voies;
 use crate::mesure::{Controleur, Demande};
+use crate::modes::{Entree, proposer_estimation, simuler};
 
 #[derive(Clone)]
 pub struct EtatRoutes {
@@ -99,6 +107,12 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
         .route("/mesures/{id}/ri.wav", get(ri_wav))
         .route("/mesures/{id}/correction", post(correction))
         .route("/mesures/{id}/correction/profil", post(correction_profil))
+        .route("/simulations", post(simulation))
+        .route("/simulations/{id}/correction", post(simulation_correction))
+        .route(
+            "/simulations/{id}/correction/profil",
+            post(simulation_correction_profil),
+        )
         .route_layer(from_fn_with_state(etat.clone(), garde_premium))
         .with_state(etat)
 }
@@ -424,6 +438,25 @@ async fn correction_profil(
         Ok(x) => x,
         Err(r) => return r,
     };
+    let nom = nom_du_profil(d.nom, || format!("Calibration {id}"));
+    enregistrer_le_profil(&etat, &id, zone_id, &nom, p, false).await
+}
+
+fn nom_du_profil(nom: Option<String>, defaut: impl FnOnce() -> String) -> String {
+    nom.map(|n| n.trim().chars().take(80).collect::<String>())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(defaut)
+}
+
+/// Enregistre la proposition comme profil de pièce de la zone (C2 et C5).
+async fn enregistrer_le_profil(
+    etat: &EtatRoutes,
+    id: &str,
+    zone_id: i64,
+    nom: &str,
+    p: Proposition,
+    estimation: bool,
+) -> Response {
     if p.bandes.is_empty() {
         return refus(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -431,12 +464,7 @@ async fn correction_profil(
             "aucune bande à enregistrer : rien à couper dans la zone".into(),
         );
     }
-    let nom = d
-        .nom
-        .map(|n| n.trim().chars().take(80).collect::<String>())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| format!("Calibration {id}"));
-    let profil = p.profil_de_zone(zone_id, &nom, &chrono::Utc::now().to_rfc3339());
+    let profil = p.profil_de_zone(zone_id, nom, &chrono::Utc::now().to_rfc3339());
     let hote = etat.controleur.hote.clone();
     let a_ecrire = profil.clone();
     let ecrit = tokio::task::spawn_blocking(move || hote.enregistrer_profil_piece(&a_ecrire))
@@ -456,10 +484,98 @@ async fn correction_profil(
             "zone_id": zone_id,
             "profil": profil,
             "proposition": p,
+            "estimation": estimation,
             // L'application est un second geste, par la route qui écrit
             // l'égaliseur de la zone et rafraîchit la sortie qui joue.
             "appliquer": format!("/api/v1/room-correction/profiles/{zone_id}/apply"),
         })),
     )
         .into_response()
+}
+
+/// Les entrées d'une simulation, avec un refus nommé quand elles ne
+/// décrivent pas une pièce.
+async fn simulation(State(etat): State<EtatRoutes>, Json(e): Json<Entree>) -> Response {
+    let r = tokio::task::spawn_blocking(move || simuler(&e))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    match r {
+        Ok(sim) => {
+            let mut v = serde_json::to_value(&sim).unwrap_or(Value::Null);
+            let id = etat.controleur.simulations.ranger(sim);
+            tracing::info!(simulation = %id, "calibration_simulation_calculee");
+            if let Some(o) = v.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
+        Err(e) => refus(StatusCode::BAD_REQUEST, "simulation_invalide", e),
+    }
+}
+
+// Même forme que `proposition_pour` : le refus est la réponse HTTP prête.
+#[allow(clippy::result_large_err)]
+fn proposition_estimee(
+    etat: &EtatRoutes,
+    id: &str,
+    demande: &DemandeCorrection,
+) -> Result<(Option<i64>, Proposition), Response> {
+    let Some(sim) = etat.controleur.simulations.simulation(id) else {
+        return Err(refus(
+            StatusCode::NOT_FOUND,
+            "simulation_inconnue",
+            format!("aucune simulation « {id} »"),
+        ));
+    };
+    let p = proposer_estimation(&sim, demande)
+        .map_err(|e| refus(StatusCode::UNPROCESSABLE_ENTITY, "correction_refusee", e))?;
+    Ok((sim.entree.zone_id, p))
+}
+
+async fn simulation_correction(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeCorrection>,
+) -> Response {
+    match proposition_estimee(&etat, &id, &d) {
+        Ok((zone_id, p)) => {
+            let mut v = serde_json::to_value(&p).unwrap_or(Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("id".into(), json!(id));
+                o.insert("zone_id".into(), json!(zone_id));
+                o.insert("estimation".into(), json!(true));
+            }
+            Json(v).into_response()
+        }
+        Err(r) => r,
+    }
+}
+
+#[derive(Deserialize)]
+struct DemandeProfilEstime {
+    #[serde(flatten)]
+    demande: DemandeCorrection,
+    nom: Option<String>,
+    /// Remplace la zone donnée à la simulation.
+    zone_id: Option<i64>,
+}
+
+async fn simulation_correction_profil(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeProfilEstime>,
+) -> Response {
+    let (zone_sim, p) = match proposition_estimee(&etat, &id, &d.demande) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let Some(zone_id) = d.zone_id.or(zone_sim) else {
+        return refus(
+            StatusCode::BAD_REQUEST,
+            "zone_requise",
+            "préciser la zone dont enregistrer le profil (zone_id)".into(),
+        );
+    };
+    let nom = nom_du_profil(d.nom, || format!("Estimation {id}"));
+    enregistrer_le_profil(&etat, &id, zone_id, &nom, p, true).await
 }
