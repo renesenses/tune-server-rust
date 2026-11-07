@@ -47,6 +47,10 @@ pub struct Cadence {
     pub vidage_max: Duration,
     pub attente_allumage: Duration,
     pub attente_source: Duration,
+    /// #6911 — au-delà, la source de la piste (fichier, `/stream/…`, radio)
+    /// n'a rien livré au décodeur : le démarrage échoue en le disant, au
+    /// lieu de tenir la sortie et la zone.
+    pub attente_premier_son: Duration,
 }
 
 impl Cadence {
@@ -63,6 +67,7 @@ impl Cadence {
         vidage_max: Duration::from_secs(5),
         attente_allumage: Duration::from_secs(20),
         attente_source: Duration::from_secs(3),
+        attente_premier_son: Duration::from_secs(10),
     };
 }
 
