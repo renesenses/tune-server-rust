@@ -1271,7 +1271,10 @@ impl TidalService {
             track_number: item["trackNumber"].as_u64().map(|n| n as u32),
             disc_number: item["volumeNumber"].as_u64().map(|n| n as u32),
             explicit: item["explicit"].as_bool().unwrap_or(false),
-            disponible: None,
+            // #8066 — la même source de vérité que Qobuz (`streamable`) :
+            // TIDAL dit `allowStreaming` et `streamReady`. Un seul `false`
+            // suffit ; les deux absents, on ne conclut rien.
+            disponible: Self::disponibilite(item),
             isrc: item["isrc"].as_str().map(Into::into),
             composer: None,
             // Même nœud que le nom : l'identifiant rendu appartient à l'artiste
@@ -1695,6 +1698,97 @@ impl TidalService {
             return Err(format!("tidal DELETE {path}: 401 token expired"));
         }
 
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(format!("tidal DELETE {path}: {status}"));
+        }
+        Ok(())
+    }
+
+    /// #8066 — `allowStreaming` / `streamReady` lus comme
+    /// [`StreamTrack::disponible`] : `Some(false)` dès que l'un est faux,
+    /// `Some(true)` si l'un est vrai et aucun faux, `None` s'ils manquent.
+    pub(crate) fn disponibilite(item: &serde_json::Value) -> Option<bool> {
+        let drapeaux = [
+            item["allowStreaming"].as_bool(),
+            item["streamReady"].as_bool(),
+        ];
+        if drapeaux.contains(&Some(false)) {
+            Some(false)
+        } else if drapeaux.contains(&Some(true)) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// #8066 — les éléments de la playlist (`/playlists/{id}/items`, paginé),
+    /// pistes ET vidéos : `(type, identifiant)`. Les indices d'écriture de
+    /// TIDAL comptent les vidéos, ceux de `get_playlist_tracks` non.
+    async fn elements_de_la_playlist(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut tous = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let data = self
+                .api_get(&format!(
+                    "/playlists/{playlist_id}/items?limit=100&offset={offset}"
+                ))
+                .await?;
+            let lot: Vec<(String, String)> = data["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|it| {
+                            (
+                                it["type"].as_str().unwrap_or("track").to_string(),
+                                it["item"]["id"]
+                                    .as_u64()
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_default(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let recus = lot.len();
+            tous.extend(lot);
+            offset += 100;
+            let total = data["totalNumberOfItems"].as_u64().unwrap_or(0) as usize;
+            if recus == 0 || tous.len() >= total {
+                break;
+            }
+        }
+        Ok(tous)
+    }
+
+    /// L'indice d'ÉLÉMENT du `rang`-ième titre (vidéos comprises), et son id.
+    fn indice_du_titre(elements: &[(String, String)], rang: usize) -> Option<(usize, &str)> {
+        elements
+            .iter()
+            .enumerate()
+            .filter(|(_, (genre, _))| genre == "track")
+            .nth(rang)
+            .map(|(i, (_, id))| (i, id.as_str()))
+    }
+
+    /// DELETE avec l'étiquette `If-None-Match` qu'exige l'écriture d'une
+    /// playlist (voir [`Self::etiquette_playlist`]).
+    async fn api_delete_etiquette(&self, path: &str, etiquette: &str) -> Result<(), String> {
+        let token = self.get_access_token().await?;
+        let url = format!("{}{path}", self.api_base());
+        let resp = self
+            .client
+            .delete(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header(reqwest::header::IF_NONE_MATCH, etiquette)
+            .query(&[("countryCode", &self.country_code)])
+            .send()
+            .await
+            .map_err(|e| format!("tidal delete: {e}"))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             return Err(format!("tidal DELETE {path}: {status}"));
@@ -2996,6 +3090,91 @@ impl StreamingService for TidalService {
 
     fn supports_write(&self) -> bool {
         self.user_id.is_some()
+    }
+
+    /// #8066 — une playlist TIDAL est modifiable quand son créateur
+    /// (`creator.id`) est le compte connecté. Un mix ne l'est jamais.
+    async fn playlist_modifiable(&self, playlist_id: &str) -> Result<Option<bool>, TuneError> {
+        if playlist_id.starts_with(PREFIXE_MIX) || self.user_id.is_none() {
+            return Ok(Some(false));
+        }
+        let data = self.api_get(&format!("/playlists/{playlist_id}")).await?;
+        Ok(data["creator"]["id"]
+            .as_u64()
+            .zip(self.user_id)
+            .map(|(createur, moi)| createur == moi))
+    }
+
+    /// #8066 — remplacer le titre au rang `rang` sans le déplacer : ajout du
+    /// nouveau À L'INDICE de l'ancien (`toIndex`), qui glisse d'un cran, puis
+    /// retrait de l'ancien par son nouvel indice. Chaque écriture porte une
+    /// étiquette fraîche ; l'ancien est relu à sa place avant d'être retiré,
+    /// et la playlist relue à la fin.
+    async fn replace_playlist_track(
+        &self,
+        playlist_id: &str,
+        rang: usize,
+        ancien: &str,
+        nouveau: &str,
+    ) -> Result<(), TuneError> {
+        if playlist_id.starts_with(PREFIXE_MIX) {
+            return Err(TuneError::Unsupported(
+                "tidal: un mix ne se modifie pas".into(),
+            ));
+        }
+        let elements = self.elements_de_la_playlist(playlist_id).await?;
+        let Some((indice, id_vu)) = Self::indice_du_titre(&elements, rang) else {
+            return Err(TuneError::NotFound(format!(
+                "tidal: aucun titre au rang {rang} de la playlist {playlist_id}"
+            )));
+        };
+        if id_vu != ancien {
+            return Err(TuneError::Other(format!(
+                "tidal: la playlist a changé (rang {rang} : {id_vu}, attendu {ancien})"
+            )));
+        }
+        let etiquette = self.etiquette_playlist(playlist_id).await?;
+        let indice_txt = indice.to_string();
+        let reponse = self
+            .api_post_form_etiquette(
+                &format!("/playlists/{playlist_id}/items"),
+                &[
+                    ("trackIds", nouveau),
+                    ("toIndex", &indice_txt),
+                    ("onArtifactNotFound", "FAIL"),
+                    ("onDupes", "ADD"),
+                ],
+                Some(&etiquette),
+            )
+            .await?;
+        if reponse["addedItemIds"]
+            .as_array()
+            .is_some_and(|a| a.is_empty())
+        {
+            return Err(TuneError::Other(format!(
+                "tidal: le titre {nouveau} n'a pas été ajouté"
+            )));
+        }
+        let elements = self.elements_de_la_playlist(playlist_id).await?;
+        let place = |i: usize| elements.get(i).map(|(_, id)| id.as_str());
+        if place(indice) != Some(nouveau) || place(indice + 1) != Some(ancien) {
+            return Err(TuneError::Other(format!(
+                "tidal: ajout à l'indice {indice} non confirmé ; l'ancien titre est gardé"
+            )));
+        }
+        let etiquette = self.etiquette_playlist(playlist_id).await?;
+        self.api_delete_etiquette(
+            &format!("/playlists/{playlist_id}/items/{}", indice + 1),
+            &etiquette,
+        )
+        .await?;
+        let elements = self.elements_de_la_playlist(playlist_id).await?;
+        match Self::indice_du_titre(&elements, rang) {
+            Some((_, id)) if id == nouveau => Ok(()),
+            autre => Err(TuneError::Other(format!(
+                "tidal: remplacement écrit mais position non confirmée (rang {rang} : {autre:?})"
+            ))),
+        }
     }
 
     fn supports_playlist_delete(&self) -> bool {
@@ -5219,6 +5398,10 @@ impl TidalService {
         svc
     }
 }
+
+#[cfg(test)]
+#[path = "tidal_remplacement_8066_tests.rs"]
+mod remplacement_8066_tests;
 
 #[cfg(test)]
 #[path = "tidal_qualite_livree_6334_tests.rs"]

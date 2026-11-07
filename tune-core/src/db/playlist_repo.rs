@@ -229,6 +229,30 @@ pub mod sql {
         )
     }
 
+    /// #8066 — réécrit UNE ligne de titre de service sur place : même
+    /// `id`, même `position`. Gardée par l'identité de l'ancien titre
+    /// (`source`, `source_id`) : si la ligne a changé entre la lecture et
+    /// l'écriture, rien n'est touché.
+    pub fn replace_service_entry<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE playlist_tracks SET source_id = {}, title = {}, artist = {}, album = {}, \
+             album_source_id = {}, duration_ms = {}, cover_url = {} \
+             WHERE id = {} AND playlist_id = {} AND source = {} AND source_id = {} \
+             AND track_id IS NULL",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10),
+            d.placeholder(11)
+        )
+    }
+
     pub fn delete_track_by_id<D: SqlDialect>(d: &D) -> String {
         format!(
             "DELETE FROM playlist_tracks WHERE playlist_id = {} AND track_id = {}",
@@ -854,6 +878,34 @@ impl PlaylistRepo {
             Ok(())
         })?;
         Ok(touchees)
+    }
+
+    /// #8066 — remplace, À SA PLACE, le titre de service de la ligne
+    /// `entry_id` par `nouveau` (même service). Rend `false` si la ligne
+    /// n'est plus ce titre-là (`ancien_source_id`) ou n'appartient pas à la
+    /// playlist.
+    pub fn replace_service_entry(
+        &self,
+        playlist_id: i64,
+        entry_id: i64,
+        ancien_source_id: &str,
+        nouveau: &ServiceEntry,
+    ) -> Result<bool, String> {
+        let sql = self.dialect_sql(sql::replace_service_entry, sql::replace_service_entry);
+        let p: [&dyn ToSqlValue; 11] = [
+            &nouveau.source_id,
+            &nouveau.title,
+            &nouveau.artist,
+            &nouveau.album,
+            &nouveau.album_source_id,
+            &nouveau.duration_ms,
+            &nouveau.cover_url,
+            &entry_id,
+            &playlist_id,
+            &nouveau.source,
+            &ancien_source_id,
+        ];
+        Ok(self.db.execute(&sql, &p)? == 1)
     }
 
     /// Replace the whole playlist contents with `track_ids`, in order,

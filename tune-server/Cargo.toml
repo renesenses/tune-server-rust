@@ -651,6 +651,13 @@ path = "tests/dossier_cue_4625.rs"
 name = "pg_group_by_strict_historique"
 path = "tests/pg_group_by_strict_historique.rs"
 
+# #8066 — remplacer un titre de service indisponible dans une playlist
+# locale : SQLite dans la suite ordinaire, PostgreSQL sous `TUNE_TEST_PG_URL`
+# (test-postgres.yml).
+[[test]]
+name = "remplacer_indisponibles_8066"
+path = "tests/remplacer_indisponibles_8066.rs"
+
 # #7128 — étiqueter tout le résultat d'un filtre d'Oxygen : SQLite dans la
 # suite ordinaire, PostgreSQL sous `TUNE_TEST_PG_URL` (test-postgres.yml).
 # `autotests = false` en tête de ce manifeste : sans cette cible, jamais compilé.

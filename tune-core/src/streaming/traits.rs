@@ -870,6 +870,47 @@ pub trait StreamingService: Send + Sync {
         false
     }
 
+    /// #8066 — l'utilisateur peut-il MODIFIER cette playlist du service ?
+    ///
+    /// `Some(true)` : elle est à lui ; `Some(false)` : non (suivie,
+    /// éditoriale, mix, ou service sans écriture) ; `None` : le service ne
+    /// permet pas de le dire. Seul `Some(true)` autorise une écriture.
+    ///
+    /// Par défaut : le drapeau `editable` de la playlist dans
+    /// [`Self::get_user_playlists`] (Qobuz le pose depuis
+    /// renesenses/tune-web-client#2097).
+    async fn playlist_modifiable(&self, playlist_id: &str) -> Result<Option<bool>, TuneError> {
+        if !self.supports_write() {
+            return Ok(Some(false));
+        }
+        Ok(self
+            .get_user_playlists()
+            .await?
+            .into_iter()
+            .find(|p| p.id == playlist_id)
+            .and_then(|p| p.editable))
+    }
+
+    /// #8066 — remplace, DANS la playlist du service, le titre au rang
+    /// `rang` (l'indice de [`Self::get_playlist_tracks`]) par `nouveau`, à la
+    /// même place.
+    ///
+    /// `ancien` est l'identifiant que l'appelant croit voir à ce rang : si la
+    /// playlist a changé entre-temps, rien n'est écrit et l'appel échoue.
+    /// L'implémentation relit la playlist à la fin et échoue si `nouveau`
+    /// n'est pas au rang `rang`.
+    async fn replace_playlist_track(
+        &self,
+        _playlist_id: &str,
+        _rang: usize,
+        _ancien: &str,
+        _nouveau: &str,
+    ) -> Result<(), TuneError> {
+        Err(TuneError::Unsupported(
+            "replace_playlist_track not supported by this service".into(),
+        ))
+    }
+
     /// Le service sait-il SUPPRIMER une playlist chez lui ?
     ///
     /// `delete_playlist` a une implémentation par défaut qui échoue : sans ce
