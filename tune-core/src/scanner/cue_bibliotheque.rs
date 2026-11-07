@@ -905,6 +905,9 @@ fn ecrire_album_avec(
             }
         }
     }
+    // #7979 — la feuille nomme-t-elle elle-même l'interprète de l'album ?
+    // Lu avant que les balises ne comblent son silence.
+    let la_feuille_nomme_l_interprete = valeur_de_la_feuille(&album.interprete).is_some();
     // #6459 — une valeur de remplissage d'EAC n'écrase jamais une balise.
     let nettoye;
     let album = if imposition.is_none() {
@@ -1023,6 +1026,7 @@ fn ecrire_album_avec(
         }
         _ => None,
     };
+    let rattache_au_coffret = deja_rattache.is_some();
     let ligne = match (
         artist_id,
         match deja_rattache {
@@ -1110,6 +1114,39 @@ fn ecrire_album_avec(
                 }
                 Err(e) => warn!(album_id = id, error = %e, "cue_titre_album_non_ecrit"),
             }
+        }
+    }
+
+    // #7979 — L'ARTISTE DE LA FEUILLE AUSSI. La ligne retrouvée par son
+    // dossier gardait l'artiste de sa première lecture (seul « Unknown
+    // Artist » était repris) : « BireliLagrene » corrigé en « Bireli
+    // Lagrene » passait sur les pistes, jamais sur l'album. On ne réaligne
+    // que sur un vrai `PERFORMER` de la feuille : ni sur le repli « Unknown
+    // Artist », ni sur ce que les balises comblent quand elle se tait (la
+    // lecture des balises peut alors deviner l'artiste d'après le nom du
+    // dossier). Avec les mêmes réserves que le titre : album disposé, coffret
+    // automatique, artiste tenu à la main (`realigner_sur_les_balises`). Ni
+    // sur un album de
+    // parution ou un coffret déjà occupé : une seule feuille n'y décrit pas
+    // l'album entier, et deux disques d'interprètes différents le feraient
+    // osciller d'une analyse à l'autre.
+    let artiste_de_la_feuille = artist_id.filter(|_| la_feuille_nomme_l_interprete);
+    if let (Some(id), Some(artiste_feuille)) = (ligne_album, artiste_de_la_feuille)
+        && ligne.artist_id != Some(artiste_feuille)
+        && !rattache_au_coffret
+        && !dossier_de_la_parution
+        && !tenues.albums_disposes().contains(&id)
+        && !tenues.est_un_coffret_auto(id)
+    {
+        match album_repo.realigner_sur_les_balises(id, None, Some(artiste_feuille)) {
+            Ok(true) => info!(
+                album_id = id,
+                avant = ?ligne.artist_id,
+                apres = artiste_feuille,
+                "cue_artiste_album_reconcilie"
+            ),
+            Ok(false) => {}
+            Err(e) => warn!(album_id = id, error = %e, "cue_artiste_album_non_ecrit"),
         }
     }
 
@@ -1967,6 +2004,11 @@ pub fn elaguer_les_pistes_cue(track_repo: &TrackRepo, racines: &[String]) -> usi
     supprimees
 }
 
+/// #7979 — l'artiste corrigé de la feuille gagne les pistes ET l'album.
+#[cfg(test)]
+#[path = "cue_artiste_corrige_7979_tests.rs"]
+mod artiste_corrige_7979_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1978,11 +2020,11 @@ mod tests {
     /// L'élagage borne sa remontée à la racine et refuse d'agir hors d'elle
     /// (#1943). Un test qui n'en passerait aucune n'élaguerait jamais rien —
     /// et serait vert sans rien prouver.
-    fn racines(racine: &Path) -> Vec<String> {
+    pub(super) fn racines(racine: &Path) -> Vec<String> {
         vec![racine.to_string_lossy().into_owned()]
     }
 
-    fn base() -> Arc<dyn DbBackend> {
+    pub(super) fn base() -> Arc<dyn DbBackend> {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         Arc::new(db)
@@ -1990,7 +2032,7 @@ mod tests {
 
     /// Un vrai WAV court : le plan écarte une image qu'aucun décodeur ne lit,
     /// donc une fixture vide ne prouverait rien.
-    fn ecrire_wav(chemin: &Path, millisecondes: u32) {
+    pub(super) fn ecrire_wav(chemin: &Path, millisecondes: u32) {
         const TAUX: u32 = 44_100;
         let trames = TAUX * millisecondes / 1000;
         let octets = trames * 4;
