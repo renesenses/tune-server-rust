@@ -623,6 +623,20 @@ pub struct RechercheDansUnGenre {
     pub genre_filter: &'static str,
 }
 
+/// L'année et le genre d'une piste de service, quand le service les publie
+/// (#8062) : les colonnes « Year » et « Genre » du tableau d'une playlist de
+/// service restaient vides.
+///
+/// À côté de [`StreamTrack`] et non dedans : la structure se construit en
+/// littéral à près d'une centaine d'endroits, et un champ de plus les aurait
+/// tous touchés pour deux colonnes d'affichage. Un champ à `None` est une
+/// absence : la route n'écrit alors pas la clé (cellule vide).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnneeEtGenre {
+    pub year: Option<u32>,
+    pub genre: Option<String>,
+}
+
 #[async_trait::async_trait]
 pub trait StreamingService: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
@@ -717,6 +731,20 @@ pub trait StreamingService: Send + Sync {
     ) -> Result<StreamUrl, TuneError>;
     async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError>;
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
+    /// Les pistes d'un album, avec l'année et le genre de l'album quand le
+    /// service les publie (#8062) — même contrat que
+    /// [`Self::get_playlist_tracks_avec_annee_et_genre`].
+    async fn get_album_tracks_avec_annee_et_genre(
+        &self,
+        album_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
+        Ok(self
+            .get_album_tracks(album_id)
+            .await?
+            .into_iter()
+            .map(|t| (t, AnneeEtGenre::default()))
+            .collect())
+    }
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError>;
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let _ = artist_id;
@@ -780,6 +808,20 @@ pub trait StreamingService: Send + Sync {
     }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
+    /// Les pistes d'une playlist, chacune avec son année et son genre quand le
+    /// service les publie (#8062). Par défaut : [`Self::get_playlist_tracks`]
+    /// sans rien de plus — un service qui ne les connaît pas ne régresse pas.
+    async fn get_playlist_tracks_avec_annee_et_genre(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
+        Ok(self
+            .get_playlist_tracks(playlist_id)
+            .await?
+            .into_iter()
+            .map(|t| (t, AnneeEtGenre::default()))
+            .collect())
+    }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError>;
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError>;

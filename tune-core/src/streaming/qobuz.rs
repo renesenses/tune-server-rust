@@ -2273,6 +2273,33 @@ impl QobuzService {
         }
     }
 
+    /// L'année d'un album Qobuz : `released_at`, à défaut
+    /// `release_date_original`. Partagée par la fiche d'album et par l'année
+    /// des pistes (#8062), pour que les deux écrans disent la même année.
+    fn annee_d_album(item: &serde_json::Value) -> Option<u32> {
+        item["released_at"]
+            .as_u64()
+            .map(|ts| 1970 + (ts / 31_536_000) as u32)
+            .or_else(|| {
+                item["release_date_original"]
+                    .as_str()
+                    .and_then(|d| d.get(..4)?.parse().ok())
+            })
+    }
+
+    /// #8062 — l'année et le genre qu'un objet album Qobuz publie : le
+    /// sous-objet `album` d'une piste de playlist, ou la réponse d'`album/get`.
+    fn annee_et_genre(album: &serde_json::Value) -> AnneeEtGenre {
+        AnneeEtGenre {
+            year: Self::annee_d_album(album),
+            genre: album["genre"]["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+                .map(Into::into),
+        }
+    }
+
     /// #6063 — le type de sortie d'un album Qobuz : celui que Qobuz annonce
     /// (`release_type`), corrigé par le titre et la règle des pistes quand
     /// Qobuz dit « album » ou ne dit rien
@@ -2349,14 +2376,7 @@ impl QobuzService {
             artist: item["artist"]["name"].as_str().unwrap_or("").into(),
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
             cover_path: Self::pochette(item),
-            year: item["released_at"]
-                .as_u64()
-                .map(|ts| 1970 + (ts / 31_536_000) as u32)
-                .or_else(|| {
-                    item["release_date_original"]
-                        .as_str()
-                        .and_then(|d| d.get(..4)?.parse().ok())
-                }),
+            year: Self::annee_d_album(item),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
             quality: item["maximum_bit_depth"].as_u64().map(|bd| StreamQuality {
                 codec: "FLAC".into(),
@@ -3342,6 +3362,18 @@ impl StreamingService for QobuzService {
         Ok(Self::map_album(&data))
     }
 
+    /// #8062 — l'année et le genre sont ceux de l'album, au niveau supérieur
+    /// d'`album/get`. Le second `detail_album` sort du cache que le premier
+    /// vient de remplir : pas de second appel à Qobuz.
+    async fn get_album_tracks_avec_annee_et_genre(
+        &self,
+        album_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
+        let pistes = self.get_album_tracks(album_id).await?;
+        let extras = Self::annee_et_genre(&self.detail_album(album_id).await?);
+        Ok(pistes.into_iter().map(|t| (t, extras.clone())).collect())
+    }
+
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self.detail_album(album_id).await?;
         // Qobuz album/get returns album metadata at the top level while
@@ -3458,6 +3490,20 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Ok(self
+            .get_playlist_tracks_avec_annee_et_genre(playlist_id)
+            .await?
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect())
+    }
+
+    /// #8062 — chaque piste de `playlist/get` porte son sous-objet `album`, avec
+    /// `released_at` et `genre` : la même réponse donne l'année et le genre.
+    async fn get_playlist_tracks_avec_annee_et_genre(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
         // La JUMELLE de `/album/get` (#2867). Le `limit=500` écrit ici n'était
         // pas une marge confortable : c'est le PLAFOND DUR de Qobuz, mesuré —
         // `limit=1000` en rend 500. Une playlist de plus de 500 titres était
@@ -3471,7 +3517,12 @@ impl StreamingService for QobuzService {
             .await?;
         let tracks = data["tracks"]["items"]
             .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| (Self::map_track(item), Self::annee_et_genre(&item["album"])))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(tracks)
     }
@@ -4781,6 +4832,32 @@ mod tests {
     }
 
     #[test]
+    /// #8062 — une piste de `playlist/get` porte l'année et le genre de son
+    /// album ; un album sans genre ni date n'invente rien.
+    #[test]
+    fn annee_et_genre_d_une_piste_de_playlist_8062() {
+        let item = json!({
+            "id": 8062001,
+            "title": "So What",
+            "album": {
+                "id": "a8062",
+                "release_date_original": "1959-08-17",
+                "genre": { "id": 80, "name": "Jazz" }
+            }
+        });
+        assert_eq!(
+            QobuzService::annee_et_genre(&item["album"]),
+            AnneeEtGenre {
+                year: Some(1959),
+                genre: Some("Jazz".into())
+            }
+        );
+        assert_eq!(
+            QobuzService::annee_et_genre(&json!({ "genre": { "name": "  " } })),
+            AnneeEtGenre::default()
+        );
+    }
+
     /// Point 10 — la disponibilité voyage jusqu'au client : dans un album
     /// annoncé, le single sorti se joue et le reste est grisé.
     #[test]
