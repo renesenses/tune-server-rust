@@ -7612,10 +7612,13 @@ impl OutputTarget for LocalOutput {
                         dop_active.load(Ordering::Relaxed),
                     )
                 });
-            let mut backend = match BackendCpal::ouvrir_pour_le_surechantillonneur(
-                &demande,
-                choix_du_surechantillonneur.as_ref(),
-            ) {
+            let ouverture = match choix_du_surechantillonneur.as_ref() {
+                Some(choix) => {
+                    BackendCpal::ouvrir_pour_le_surechantillonneur(&demande, Some(choix))
+                }
+                None => BackendCpal::ouvrir(&demande),
+            };
+            let mut backend = match ouverture {
                 Ok(backend) => backend,
                 Err(refus) => {
                     refus.rapporter(&device_name, &open_failure);

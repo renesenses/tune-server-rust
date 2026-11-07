@@ -374,8 +374,9 @@ fn play_url_branche_le_chemin_natif_avant_le_partage_6734() {
         .find("bras_alsa_natif::BackendAlsaNatif::tenter(&demande)")
         .expect("play_url doit tenter le chemin natif S32");
     let partage = local
-        // #7614 — l'ouverture partagée passe le choix du suréchantillonneur.
-        .find("let mut backend = match BackendCpal::ouvrir_pour_le_surechantillonneur(")
+        // #7614 — l'ouverture partagée passe, s'il y en a un, le choix du
+        // suréchantillonneur ; sans choix, c'est l'ouverture d'avant.
+        .find("None => BackendCpal::ouvrir(&demande),")
         .expect("ouverture du chemin partagé");
     assert!(natif < partage, "le natif doit être tenté avant le partagé");
     let bras = include_str!("bras_alsa_natif.rs");
