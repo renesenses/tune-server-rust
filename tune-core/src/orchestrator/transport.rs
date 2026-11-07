@@ -2257,6 +2257,10 @@ impl PlaybackOrchestrator {
             // on the same output keep their convolution.
             #[cfg(feature = "local-audio")]
             if device_id.starts_with("local:") {
+                // #6132 — la seconde sortie (zone groupée avec une autre zone
+                // locale), résolue AVANT de verrouiller la sortie de A : elle
+                // lit la sortie de B dans le registre.
+                let secondes_sorties = self.demandes_de_secondes_sorties(zone_id, device_id).await;
                 let output = output_arc.lock().await;
                 if let Some(local_output) = output
                     .as_any()
@@ -2269,6 +2273,9 @@ impl PlaybackOrchestrator {
                     local_output.set_strict_bitperfect(
                         crate::audio::bitperfect_strict::zone_enabled(&self.db, zone_id),
                     );
+                    // #6132 — la sortie double de la zone, posée à chaque
+                    // lecture comme le strict : `play_url` la lit une fois.
+                    local_output.set_secondes_sorties(secondes_sorties);
                     // #6522, #6524 — ce que PURE contourne, lu dans les
                     // réglages : la chaîne posée plus bas sera vide en PURE.
                     self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
@@ -4205,6 +4212,60 @@ pub(crate) fn sessions_a_fermer_apres_remplacement(
 
 #[cfg(test)]
 mod session_remplacee_ticket_134;
+
+#[cfg(feature = "local-audio")]
+impl PlaybackOrchestrator {
+    /// #6132 — les sorties suiveuses de la zone `zone_id` (sortie
+    /// `device_id`), telles que la route de groupement les a posées
+    /// (`zone_{id}_sortie_double`), avec ce qui règle chacune : le curseur de
+    /// volume de sa sortie (chaque membre garde le sien) et le décalage manuel
+    /// tiré des `sync_delay_ms` des deux zones.
+    pub(crate) async fn demandes_de_secondes_sorties(
+        &self,
+        zone_id: i64,
+        device_id: &str,
+    ) -> Vec<crate::outputs::sortie_double::SecondeSortieDemandee> {
+        use crate::outputs::sortie_double::{
+            SecondeSortieDemandee, decalage_manuel_s, secondes_sorties_de_zone,
+        };
+        let noms = secondes_sorties_de_zone(&self.db, zone_id);
+        if noms.is_empty() {
+            return Vec::new();
+        }
+        let zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .list()
+            .unwrap_or_default();
+        let delai = |dev: &str| {
+            zones
+                .iter()
+                .find(|z| z.output_device_id.as_deref() == Some(dev))
+                .map(|z| i64::from(z.sync_delay_ms))
+                .unwrap_or(0)
+        };
+        let mut demandes = Vec::new();
+        for nom in noms {
+            let id_b = format!("local:{nom}");
+            if id_b == device_id {
+                continue;
+            }
+            let sortie_b = { self.outputs.lock().await.get(&id_b) };
+            let volume_utilisateur = match sortie_b {
+                Some(arc) => arc
+                    .lock()
+                    .await
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                    .map(|b| b.volume_utilisateur()),
+                None => None,
+            };
+            let mut demande = SecondeSortieDemandee::nommee(nom);
+            demande.volume_utilisateur = volume_utilisateur;
+            demande.decalage_manuel_s = decalage_manuel_s(delai(device_id), delai(&id_b));
+            demandes.push(demande);
+        }
+        demandes
+    }
+}
 
 /// Le bandeau d'une lecture dont la session de flux est morte avant que la
 /// sortie n'en tire un octet : avant l'envoi (#5522) ou pendant (#6658).
