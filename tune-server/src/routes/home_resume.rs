@@ -13,6 +13,7 @@ pub(super) async fn resume_listening(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ResumeRequest>,
 ) -> Result<Response, AppError> {
     let _zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
@@ -31,7 +32,10 @@ pub(super) async fn resume_listening(
         let Some(demande) = super::super::podcasts::demande_de_reprise(&state, &r) else {
             return Err(AppError::bad_request("épisode de reprise absent"));
         };
-        return Ok(super::super::podcasts::jouer_et_rendre_la_zone(&state, zone_id, demande).await);
+        return Ok(super::super::podcasts::jouer_et_rendre_la_zone(
+            &state, zone_id, headers, profile, demande,
+        )
+        .await);
     }
     if r.context_type == "playlist" && r.source == "local" {
         let id = r
@@ -328,6 +332,7 @@ mod route_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
@@ -781,6 +786,7 @@ mod replay_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
@@ -888,6 +894,7 @@ mod replay_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
