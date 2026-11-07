@@ -342,6 +342,31 @@ pub mod sql {
         )
     }
 
+    /// Les écoutes de pistes d'un service, par identifiant (#8062) : pour
+    /// chacun des `n_ids` identifiants du service, le nombre d'écoutes et la
+    /// dernière. Placeholders : 1 = service, puis les identifiants.
+    ///
+    /// Une écoute de service s'écrit `source` = le service et `source_id` =
+    /// son identifiant chez lui (`ecrire_l_ecoute`) : aucune piste locale ne
+    /// la représente, d'où une clé propre, et non la règle titre + interprète
+    /// de [`plays_for_tracks`].
+    ///
+    /// Le compte est GLOBAL, tous profils confondus, comme celui de
+    /// [`plays_for_tracks`] dans la bibliothèque (arbitrage de Bertrand,
+    /// 07/11/2026) : les deux colonnes donnent le même genre de nombre.
+    pub fn ecoutes_de_service_par_identifiant<D: SqlDialect>(d: &D, n_ids: usize) -> String {
+        let ids = (2..2 + n_ids)
+            .map(|i| d.placeholder(i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT source_id, COUNT(*), MAX(listened_at) FROM listen_history \
+             WHERE source = {} AND source_id IN ({ids}) \
+             GROUP BY source_id",
+            d.placeholder(1)
+        )
+    }
+
     /// Les écoutes d'un interprète, toutes sources (#7416) : une ligne par
     /// enregistrement écouté (source, identifiant, titre, durée), avec son
     /// nombre d'écoutes, la dernière, et — pour un fichier — l'identifiant de
@@ -885,6 +910,50 @@ impl HistoryRepo {
                     Some((n, d)) => (n + compte, d.max(derniere.clone())),
                 });
             }
+        }
+        Ok(resultat)
+    }
+
+    /// Nombre d'écoutes et dernière écoute de pistes d'un service, tous
+    /// profils confondus (#8062) : la colonne « # Plays » d'une playlist ou
+    /// d'un album de service restait vide, faute de clé.
+    ///
+    /// Une entrée par identifiant DEMANDÉ : `(0, None)` pour une piste jamais
+    /// jouée — le zéro est une information, comme dans
+    /// [`Self::plays_for_tracks`]. Une seule requête pour toute la liste,
+    /// aucune sur une liste vide. Règle de rattachement :
+    /// [`sql::ecoutes_de_service_par_identifiant`].
+    pub fn ecoutes_de_service_par_identifiant(
+        &self,
+        service: &str,
+        identifiants: &[&str],
+    ) -> Result<HashMap<String, (i64, Option<String>)>, String> {
+        let mut ids: Vec<&str> = identifiants
+            .iter()
+            .map(|i| i.trim())
+            .filter(|i| !i.is_empty())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let sql = self.dialect_sql(
+            |d| sql::ecoutes_de_service_par_identifiant(d, ids.len()),
+            |d| sql::ecoutes_de_service_par_identifiant(d, ids.len()),
+        );
+        let mut params: Vec<&dyn ToSqlValue> = Vec::with_capacity(ids.len() + 1);
+        params.push(&service);
+        params.extend(ids.iter().map(|i| i as &dyn ToSqlValue));
+        let mut resultat: HashMap<String, (i64, Option<String>)> =
+            ids.iter().map(|i| ((*i).to_string(), (0, None))).collect();
+        for cols in self.db.query_many(&sql, &params)? {
+            let Some(id) = cols.first().and_then(|v| v.as_string()) else {
+                continue;
+            };
+            let compte = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+            let derniere = cols.get(2).and_then(|v| v.as_string());
+            resultat.insert(id, (compte, derniere));
         }
         Ok(resultat)
     }
@@ -2265,6 +2334,10 @@ fn row_to_listen(cols: &[SqlValue]) -> ListenRecord {
 #[cfg(test)]
 #[path = "historique_album_de_service_7778_tests.rs"]
 mod historique_album_de_service_7778_tests;
+
+#[cfg(test)]
+#[path = "ecoutes_pistes_de_service_8062_tests.rs"]
+mod ecoutes_pistes_de_service_8062_tests;
 
 #[cfg(test)]
 mod tests {
