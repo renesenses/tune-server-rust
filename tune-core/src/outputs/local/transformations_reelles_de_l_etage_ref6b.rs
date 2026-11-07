@@ -137,6 +137,7 @@ impl DspAvecRepliMono {
             spec: AudioSpec::nouvelle(48_000, ProfondeurPcm::Entier16, canaux).expect("spec"),
             sortie: FormatOuvert::new(48_000, canaux),
             needs_resample: false,
+            surechantillonneur: None,
         }
     }
 }

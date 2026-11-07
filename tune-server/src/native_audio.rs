@@ -296,6 +296,7 @@ pub(crate) fn feature(id: &str) -> tune_core::license::Feature {
         "crossfeed" => tune_core::license::Feature::Crossfeed,
         "converter" => tune_core::license::Feature::BatchConverter,
         "declick" => tune_core::license::Feature::Declick,
+        "upsampler" => tune_core::license::Feature::Upsampling,
         _ => THIRD_PARTY_FEATURE,
     }
 }

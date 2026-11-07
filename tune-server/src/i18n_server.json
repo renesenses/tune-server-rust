@@ -101,6 +101,23 @@
     "pl": "Przemapowanie kanałów: macierz dB dla strefy i albumu (4.0, 5.1…)",
     "el": "Αναδρομολόγηση καναλιών: πίνακας dB ανά ζώνη και ανά άλμπουμ (4.0, 5.1…)"
   },
+  "plugin.description.upsampler": {
+    "fr": "Suréchantillonnage : filtres polyphases vers la plus haute cadence du DAC, sortie locale",
+    "en": "Upsampling: polyphase filters to the DAC's highest rate, local output",
+    "de": "Upsampling: Polyphasenfilter bis zur höchsten Abtastrate des DAC, lokaler Ausgang",
+    "es": "Sobremuestreo: filtros polifásicos hasta la frecuencia más alta del DAC, salida local",
+    "it": "Sovracampionamento: filtri polifase verso la frequenza più alta del DAC, uscita locale",
+    "zh": "升频：多相滤波器升至 DAC 的最高采样率，本地输出",
+    "ja": "アップサンプリング：DAC の最高サンプルレートまでのポリフェーズフィルター、ローカル出力",
+    "ko": "업샘플링: DAC의 최고 샘플링 레이트까지 폴리페이즈 필터, 로컬 출력",
+    "ro": "Supraeșantionare: filtre polifazice până la cea mai mare frecvență a DAC-ului, ieșire locală",
+    "sv": "Uppsampling: polyfasfilter till DAC:ns högsta samplingsfrekvens, lokal utgång",
+    "hu": "Felülmintavételezés: többfázisú szűrők a DAC legmagasabb mintavételi frekvenciájáig, helyi kimenet",
+    "vi": "Tăng tần số lấy mẫu: bộ lọc đa pha lên tần số cao nhất của DAC, đầu ra cục bộ",
+    "nb": "Oppsampling: polyfasefiltre til DAC-ens høyeste samplingsfrekvens, lokal utgang",
+    "pl": "Nadpróbkowanie: filtry polifazowe do najwyższej częstotliwości przetwornika, wyjście lokalne",
+    "el": "Υπερδειγματοληψία: πολυφασικά φίλτρα έως την υψηλότερη συχνότητα του DAC, τοπική έξοδος"
+  },
   "plugin.description.declick": {
     "fr": "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
     "en": "Declick: leading/trailing silence and zero crossings, FLAC/WAV",
