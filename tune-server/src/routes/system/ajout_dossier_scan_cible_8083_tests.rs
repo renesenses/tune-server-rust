@@ -53,17 +53,26 @@ fn pistes(dossier: &Path, n: usize) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Attend le `library.scan.completed` et le rend.
+/// Attend le `library.scan.completed` et le rend, avec les portées (`scope`,
+/// #6167) annoncées par les `library.scan.progress` qui l'ont précédé : le
+/// rapport de fin ne porte pas la portée.
 async fn fin_du_scan(
     rx: &mut tokio::sync::broadcast::Receiver<tune_core::event_bus::TuneEvent>,
-) -> serde_json::Value {
+) -> (serde_json::Value, Vec<serde_json::Value>) {
     let fin = tune_core::event_types::EventType::ScanComplete.as_str();
+    let progression = tune_core::event_types::EventType::ScanProgress.as_str();
+    let mut portees = Vec::new();
     loop {
         match tokio::time::timeout(Duration::from_secs(180), rx.recv())
             .await
             .expect("le scan n'a pas annoncé sa fin")
         {
-            Ok(ev) if ev.event_type == fin => return ev.data,
+            Ok(ev) if ev.event_type == fin => return (ev.data, portees),
+            Ok(ev) if ev.event_type == progression => {
+                if let Some(p) = ev.data.get("scope") {
+                    portees.push(p.clone());
+                }
+            }
             Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
             Err(e) => panic!("bus fermé : {e}"),
         }
@@ -108,7 +117,7 @@ async fn ajouter_un_dossier_ne_scanne_que_ce_dossier_8083() {
     // 1. La première racine, scannée en entier.
     let mut rx = etat.event_bus.subscribe();
     assert!(crate::routes::system::scan::spawn_library_scan(etat.clone(), false, None).await);
-    let complet = fin_du_scan(&mut rx).await;
+    let (complet, _) = fin_du_scan(&mut rx).await;
     crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
     let repo = TrackRepo::with_backend(etat.backend.clone());
     for p in &anciennes {
@@ -139,12 +148,13 @@ async fn ajouter_un_dossier_ne_scanne_que_ce_dossier_8083() {
         Err(e) => panic!("l'ajout doit réussir : {}", e.into_response().status()),
     };
     assert_eq!(reponse.status(), StatusCode::OK);
-    let rapport = fin_du_scan(&mut rx).await;
+    let (rapport, portees) = fin_du_scan(&mut rx).await;
     crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
 
-    assert_eq!(
-        rapport["scope"], "folder",
-        "#8083 : ajouter un dossier a relancé un scan de toute la bibliothèque : {rapport}"
+    assert!(
+        !portees.is_empty() && portees.iter().all(|p| p == "folder"),
+        "#8083 : ajouter un dossier a relancé un scan de toute la bibliothèque : \
+         portées annoncées {portees:?}, rapport {rapport}"
     );
     assert_eq!(
         rapport["total_files"],
