@@ -23,3 +23,6 @@ async-trait = { workspace = true }
 
 tracing-subscriber = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+# #8066 : le faux service des routes de remplacement
+# (`streaming::remplacement_indisponibles::factice`).
+tune-core = { path = "../tune-core", default-features = false, features = ["services-factices"] }
