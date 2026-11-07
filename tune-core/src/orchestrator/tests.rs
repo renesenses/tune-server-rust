@@ -614,8 +614,9 @@ async fn levels_chain_emits_audio_levels_on_bus() {
 /// Garde de COMPORTEMENT, pas de texte : une même fenêtre à PLEINE ÉCHELLE
 /// part deux fois dans la chaîne réelle (forwarder cadencé → bus), et c'est la
 /// valeur PUBLIÉE qui est lue.
-///   * sans gain branché — tout chemin non local — elle vaut 0 dBFS, surcharge
-///     allumée : la mesure d'avant, inchangée ;
+///   * sans gain branché — tout chemin non local — elle vaut 0 dBFS ; la
+///     surcharge reste ÉTEINTE (#7100) : rien n'a écrêté la sortie, seule la
+///     source touche le plein, ce que dit `source_over_left` ;
 ///   * avec le gain de la sortie à 0,5 (−6,02 dB), elle vaut −6 dBFS et la
 ///     surcharge S'ÉTEINT — ce que GgB attendait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -682,7 +683,10 @@ async fn le_cretemetre_suit_le_gain_de_la_sortie() {
         brut_db > -0.1,
         "une fenêtre à pleine échelle sans gain doit se lire à 0 dBFS, lu {brut_db}"
     );
-    assert!(brut_over, "pleine échelle sans gain ⇒ surcharge");
+    assert!(
+        !brut_over,
+        "#7100 — source à pleine échelle sans gain : rien n'écrête la sortie, pas d'OVER"
+    );
     assert_eq!(brut_gain_db, 0.0, "aucun gain déclaré ⇒ 0 dB annoncé");
 
     // La même fenêtre, avec la sortie qui atténue de 6 dB (préampli −6 dB à
@@ -711,7 +715,10 @@ async fn le_cretemetre_suit_le_gain_de_la_sortie() {
         rendu_db > -0.1,
         "gain revenu à l'unité ⇒ 0 dBFS, lu {rendu_db}"
     );
-    assert!(rendu_over, "gain revenu à l'unité ⇒ surcharge de retour");
+    assert!(
+        !rendu_over,
+        "#7100 — gain revenu à l'unité : la source au plein n'est toujours pas un écrêtage"
+    );
     assert_eq!(rendu_gain_db, 0.0);
 }
 

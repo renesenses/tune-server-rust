@@ -111,19 +111,12 @@ pub fn compter_les_candidats(db: &Arc<dyn DbBackend>) -> i64 {
     .unwrap_or(0)
 }
 
-/// Combien de fichiers un lot décode à la fois. La vitesse réglée des
-/// analyses, et UN SEUL quand la température est illisible : c'est le
-/// bridage de #5410, maintenu par la décision de Bertrand du 20/10/2026
-/// (#6450).
-///
-/// #6713 — sauf si l'utilisateur a levé ce bridage
-/// (`vitesse::bridage_leve`) : la même règle que les autres passes.
+/// Combien de fichiers un lot décode à la fois : la vitesse réglée des
+/// analyses, même quand la température est illisible (#6450) — la même
+/// règle que les autres passes. Une température lue et trop haute arrête la
+/// passe par sa garde.
 pub fn largeur_de_la_passe(db: &Arc<dyn DbBackend>, lecture: &LectureThermique) -> usize {
-    largeur_selon_la_chaleur(
-        vitesse::vitesse(db).largeur(vitesse::coeurs()),
-        lecture,
-        vitesse::bridage_leve(db),
-    )
+    largeur_selon_la_chaleur(vitesse::vitesse(db).largeur(vitesse::coeurs()), lecture)
 }
 
 /// Une piste à mesurer.
