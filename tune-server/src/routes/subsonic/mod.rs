@@ -19,6 +19,9 @@
 
 pub mod gestion;
 pub mod identifiants;
+mod lecture;
+mod navigation;
+mod objets;
 pub mod reponse;
 
 use axum::extract::{Query, Request, State};
@@ -87,6 +90,39 @@ pub fn router_rest(state: AppState) -> Router {
             "/getOpenSubsonicExtensions.view",
             methode(get_open_subsonic_extensions),
         )
+        // Étape 2 (#7945) : navigation, recherche et lecture.
+        .route("/getArtists", methode(navigation::get_artists))
+        .route("/getArtists.view", methode(navigation::get_artists))
+        .route("/getArtist", methode(navigation::get_artist))
+        .route("/getArtist.view", methode(navigation::get_artist))
+        .route("/getAlbum", methode(navigation::get_album))
+        .route("/getAlbum.view", methode(navigation::get_album))
+        .route("/getSong", methode(navigation::get_song))
+        .route("/getSong.view", methode(navigation::get_song))
+        .route("/getAlbumList2", methode(navigation::get_album_list2))
+        .route("/getAlbumList2.view", methode(navigation::get_album_list2))
+        .route("/search3", methode(navigation::search3))
+        .route("/search3.view", methode(navigation::search3))
+        .route("/getGenres", methode(navigation::get_genres))
+        .route("/getGenres.view", methode(navigation::get_genres))
+        .route("/getSongsByGenre", methode(navigation::get_songs_by_genre))
+        .route(
+            "/getSongsByGenre.view",
+            methode(navigation::get_songs_by_genre),
+        )
+        .route("/getRandomSongs", methode(navigation::get_random_songs))
+        .route(
+            "/getRandomSongs.view",
+            methode(navigation::get_random_songs),
+        )
+        .route("/getScanStatus", methode(navigation::get_scan_status))
+        .route("/getScanStatus.view", methode(navigation::get_scan_status))
+        .route("/getCoverArt", methode(lecture::get_cover_art))
+        .route("/getCoverArt.view", methode(lecture::get_cover_art))
+        .route("/stream", methode(lecture::stream))
+        .route("/stream.view", methode(lecture::stream))
+        .route("/download", methode(lecture::download))
+        .route("/download.view", methode(lecture::download))
         .fallback(methode_inconnue)
         .layer(axum::middleware::from_fn_with_state(state.clone(), garde))
         .with_state(state)

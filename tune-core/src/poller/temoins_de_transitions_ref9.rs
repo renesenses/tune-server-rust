@@ -83,7 +83,9 @@ fn entree_stopped(ps: &ZonePollState, o: &Observation) -> StoppedInput {
         decisions::played_enough(o.track_duration_ms, ps.peak_position_ms, o.wall_elapsed);
     let in_track_load_grace = o.realtime
         && ps.track_loaded_at.elapsed().as_secs() < TRACK_LOAD_GRACE_SECS
-        && ps.peak_position_ms < 5_000;
+        && ps.peak_position_ms < 5_000
+        && !played_enough
+        && !decisions::titre_court_deja_avance(o.track_duration_ms, ps.peak_position_ms);
     StoppedInput {
         tune_is_playing: true,
         tune_has_track: true,

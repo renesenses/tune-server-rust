@@ -1940,6 +1940,9 @@ pub use confirmation_navigateur_6066::SignalDuLecteur;
 /// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
 mod reenumeration_avant_refus;
 mod transport;
+pub use transport::IssueDePause;
+#[cfg(test)]
+mod pause_sans_media_7894_tests;
 // #2269 — le repli silencieux de la sortie locale, rendu audible.
 #[cfg(feature = "local-audio")]
 mod repli_de_peripherique;
@@ -2038,6 +2041,9 @@ mod greffon_natif_tiers_reseau_7616_tests;
 // #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_6780_tests;
+// #7932 — PURE contourne aussi la réaffectation des canaux de l'album joué.
+#[cfg(all(test, feature = "local-audio"))]
+mod pure_reaffectation_album_7932_tests;
 // #6256 — la désinstallation d'un greffon natif tiers ne rebâtit que les
 // zones qui l'utilisent.
 #[cfg(all(test, feature = "local-audio"))]
@@ -2089,6 +2095,7 @@ pub use bandcamp::*;
 
 /// Fil 2121 — resigner une URL de flux Bandcamp expirée depuis sa page.
 mod bandcamp_resignature;
+pub use bandcamp_resignature::identifiant_de_piste as identifiant_de_piste_bandcamp;
 
 mod qualite_pre_armee;
 pub(crate) use qualite_pre_armee::{
