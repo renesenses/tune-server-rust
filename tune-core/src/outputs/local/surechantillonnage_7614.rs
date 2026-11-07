@@ -54,7 +54,10 @@ fn choix(enabled: bool) -> ChoixSurechantillonnage {
 fn sinus16(trames: usize) -> Vec<u8> {
     let mut octets = Vec::with_capacity(trames * 4);
     for n in 0..trames {
-        let x = 1.414 * (std::f64::consts::TAU * 11_025.0 * n as f64 / 44_100.0 + 0.7854).sin();
+        let x = 1.414
+            * (std::f64::consts::TAU * 11_025.0 * n as f64 / 44_100.0
+                + std::f64::consts::FRAC_PI_4)
+                .sin();
         let mot = (x * 32_767.0).round() as i16;
         octets.extend_from_slice(&mot.to_le_bytes());
         octets.extend_from_slice(&(-mot).to_le_bytes());
