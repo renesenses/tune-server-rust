@@ -366,5 +366,49 @@ async fn une_compilation_faite_main_reste_un_seul_album_8106() {
         "deux albums homonymes de deux artistes restent deux albums"
     );
 
+    // 6. La compilation faite main où chaque piste garde l'ALBUM et le
+    //    numéro de son disque d'origine (fil 2697 : « l'origine de l'album de
+    //    chaque titre ») : cinq titres d'album, cinq artistes, sans
+    //    ALBUMARTIST, et des numéros qui se répètent d'un disque à l'autre.
+    //    Un seul album, sous le nom du dossier.
+    let origines: Vec<Piste> = ARTISTES
+        .iter()
+        .enumerate()
+        .map(|(i, artiste)| Piste {
+            dossier: "Compilations/Soul du dimanche".to_string(),
+            fichier: format!("{:02} - {artiste}.flac", i + 1),
+            balises: vec![
+                ("TITLE", format!("Titre {}", i + 1)),
+                ("ARTIST", artiste.to_string()),
+                ("ALBUM", format!("Disque d'origine de {artiste}")),
+                // 3, 1, 3, 1, 3 : deux numéros partagés par plusieurs disques.
+                (
+                    "TRACKNUMBER",
+                    if i % 2 == 0 { "3" } else { "1" }.to_string(),
+                ),
+                ("DATE", (1960 + i).to_string()),
+            ],
+            format: Format::Flac,
+        })
+        .collect();
+    let (s, _) = scanner_une_bibliotheque(&base, "origines", &origines).await;
+    let a = albums(s.backend.as_ref());
+    eprintln!("[origines] albums : {a:?}");
+    assert_eq!(
+        a,
+        vec![(
+            "Soul du dimanche".to_string(),
+            "Various Artists".to_string(),
+            true,
+            5
+        )],
+        "une compilation faite main aux albums d'origine reste UN album (#8106)"
+    );
+    let mut tries = artistes_des_pistes(s.backend.as_ref());
+    tries.sort();
+    let mut attendus: Vec<String> = ARTISTES.iter().map(|s| s.to_string()).collect();
+    attendus.sort();
+    assert_eq!(tries, attendus, "chaque piste garde son ARTIST");
+
     let _ = std::fs::remove_dir_all(&base);
 }
