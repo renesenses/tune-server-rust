@@ -272,7 +272,7 @@ mod tests {
                 channels INTEGER, file_mtime DOUBLE PRECISION, file_size BIGINT, audio_hash TEXT, source_id TEXT,
                 isrc TEXT, composer TEXT, label TEXT, musicbrainz_recording_id TEXT, cover_path TEXT, genres TEXT,
                 comments TEXT, cue_start_ms BIGINT, cue_end_ms BIGINT, rating BIGINT,
-                bitrate_kbps BIGINT);
+                bitrate_kbps BIGINT, explicit BIGINT);
             INSERT INTO zones (id, autoplay_enabled) VALUES (1, 0), (2, 1), (3, NULL);")).unwrap();
             if initial_type == "TEXT" {
                 db.execute_batch(

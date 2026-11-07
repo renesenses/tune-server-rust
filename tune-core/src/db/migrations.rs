@@ -2773,7 +2773,40 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "smart_collections_expression",
         up: "",
     },
+    // #8088 — contrôle parental : le MARQUAGE EXPLICITE de la balise du
+    // fichier (`ITUNESADVISORY` = 1 ou 4, MP4 `rtng`), lu au scan :
+    // `tracks.explicit`, 1 explicite, 0 propre, NULL sans balise ou pas
+    // encore relu. Index partiel `idx_tracks_explicit` : le contrôle parental
+    // lit les seules pistes marquées.
+    //
+    // Numérotée 141 / PG 107, numéros libres dans `batch/bugs-rc11-20261101`
+    // au 07/11 (dernières : 140 / PG 106). La PR de #8077 (apports_service)
+    // réclame AUSSI 141 / 107 : celle qui fusionne après l'autre se
+    // renumérote.
+    //
+    // Colonne posée par `add_column_if_missing` dans le bloc de version et
+    // dans la passe finale, PAS dans `up` : même règle qu'à la 130 — l'INSERT
+    // et l'UPDATE des pistes la NOMMENT. Jumelle PG : 107.
+    Migration {
+        version: 141,
+        name: "tracks_explicit",
+        up: "",
+    },
 ];
+
+/// L'index partiel des pistes marquées explicites (#8088), commun aux deux
+/// moteurs. Posé APRÈS la colonne qu'il nomme.
+pub(crate) const SQL_INDEX_PISTES_EXPLICITES: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_explicit ON tracks(id) WHERE explicit = 1";
+
+/// Pose `tracks.explicit` et son index (#8088) — bloc de version de la 141 et
+/// passe finale.
+fn marquage_explicite_des_pistes(db: &SqliteDb) {
+    add_column_if_missing(db, "tracks", "explicit", "INTEGER");
+    if let Err(e) = db.execute_batch(SQL_INDEX_PISTES_EXPLICITES) {
+        warn!(erreur = %e, "migration_141_index_explicite");
+    }
+}
 
 /// SQL de l'attribution unique de la migration 137 (#7765) — jouée une seule
 /// fois, dans le bloc de version. Même texte que la jumelle PG 102.
@@ -4209,6 +4242,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // #7872 — la requête avancée d'une collection intelligente.
             add_column_if_missing(db, "smart_collections", "expression", "TEXT");
         }
+        if migration.version == 141 {
+            // #8088 — le marquage explicite de la balise, et son index.
+            marquage_explicite_des_pistes(db);
+        }
         if migration.version == 137 {
             // #7765 — la source des crédits, puis l'attribution UNE fois des
             // lignes existantes. L'index vient APRES la colonne qu'il nomme.
@@ -4815,6 +4852,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // raison que la note : l'INSERT et l'UPDATE des pistes le NOMMENT.
     // PG : migration 094.
     add_column_if_missing(db, "tracks", "bitrate_kbps", "INTEGER");
+    // Le marquage explicite de la balise (migration 141, #8088) — posé ICI
+    // aussi, même raison que le débit. PG : migration 107.
+    marquage_explicite_des_pistes(db);
     // Le lien des radios avec l'annuaire (migration 126, #6516) — posé ICI
     // aussi : le rapprochement le NOMME. PG : migration 090.
     lien_des_radios_avec_l_annuaire(db);
@@ -5843,6 +5883,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         106,
         "smart_collections_expression",
         include_str!("../../migrations/postgres/106_smart_collections_expression.sql"),
+    ),
+    // Jumelle de la SQLite 141 (#8088) : `tracks.explicit`, le marquage
+    // explicite de la balise, et l'index partiel des pistes marquées.
+    (
+        107,
+        "tracks_explicit",
+        include_str!("../../migrations/postgres/107_tracks_explicit.sql"),
     ),
 ];
 
@@ -8084,6 +8131,102 @@ mod tests {
         );
     }
 
+    /// #8088 — la migration 141 pose `tracks.explicit` et son index partiel,
+    /// sur une base NEUVE comme sur une base MONTÉE en 140 avec une piste ;
+    /// l'existant reste NULL (aucun marquage inventé) ; la jumelle PG 107
+    /// existe, est enregistrée, marque le bon numéro et convertit une colonne
+    /// TEXT de bascule ; le schéma de bascule et `ENSURE_COLUMNS` la portent.
+    #[test]
+    fn la_migration_141_pose_le_marquage_explicite_8088() {
+        let colonne = |db: &SqliteDb| -> Option<(String, bool)> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(tracks)").unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap())
+                .find(|(nom, _, _)| nom == "explicit")
+                .map(|(_, ty, non_nul)| (ty, non_nul != 0))
+        };
+        let index = |db: &SqliteDb| -> i64 {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_tracks_explicit'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let attendu = Some(("INTEGER".to_string(), false));
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(colonne(&neuve), attendu, "base neuve : `tracks.explicit`");
+        assert_eq!(index(&neuve), 1, "base neuve : index partiel absent");
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "DROP INDEX idx_tracks_explicit;
+                 ALTER TABLE tracks DROP COLUMN explicit;
+                 DELETE FROM _migrations WHERE version >= 141;
+                 INSERT INTO tracks (title, file_path) VALUES ('Piste', '/m/a.flac');",
+            )
+            .unwrap();
+        assert_eq!(colonne(&montee), None, "préparation : colonne retirée");
+        assert_eq!(current_version(&montee).unwrap(), 140);
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert!(latest_version() >= 141);
+        assert_eq!(colonne(&montee), attendu, "base montée : `tracks.explicit`");
+        assert_eq!(index(&montee), 1, "base montée : index partiel absent");
+        {
+            let conn = montee.connection().lock().unwrap();
+            let (lignes, avec): (i64, i64) = conn
+                .query_row("SELECT COUNT(*), COUNT(explicit) FROM tracks", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(
+                (lignes, avec),
+                (1, 0),
+                "la piste survit, sans marquage inventé"
+            );
+        }
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "107_tracks_explicit.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(sql_pg.contains("VALUES (107, 'tracks_explicit')"));
+        assert!(
+            sql_pg.contains("ADD COLUMN IF NOT EXISTS explicit BIGINT")
+                && sql_pg.contains("TYPE BIGINT USING")
+                && sql_pg.contains("idx_tracks_explicit"),
+            "la jumelle PG ne pose pas `tracks.explicit` en BIGINT, ne convertit pas \
+             la colonne TEXT d'une bascule, ou oublie l'index"
+        );
+        assert!(include_str!("migrations.rs").contains(fichier));
+        assert!(
+            include_str!("pg_migrate.rs")
+                .contains("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS explicit TEXT")
+        );
+        assert!(
+            include_str!("postgres.rs")
+                .contains("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS explicit BIGINT")
+        );
+    }
+
     /// #6332 — la migration 130 pose `tracks.bitrate_kbps` (le débit moyen du
     /// fichier), sur une base NEUVE comme sur une base MONTÉE en 129 avec une
     /// piste ; NULLABLE, l'existant reste NULL (le rescan le complète) ; la
@@ -9408,7 +9551,9 @@ mod tests {
         // 106 : `smart_collections_expression` (#7872), jumelle de la SQLite
         // 140. Pose la requête avancée des collections intelligentes, que
         // toutes leurs lectures NOMMENT.
-        assert_eq!(pg_latest_version(), 106, "latest PG migration must be 106");
+        // 107 : `tracks_explicit` (#8088), jumelle de la SQLite 141. Pose
+        // `tracks.explicit`, que l'INSERT et l'UPDATE des pistes NOMMENT.
+        assert_eq!(pg_latest_version(), 107, "latest PG migration must be 107");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
