@@ -3012,7 +3012,16 @@ impl PlaybackOrchestrator {
     ///
     /// Associée mais sans `self`, comme `message_session_perdue` est libre : le
     /// texte se vérifie sans monter d'orchestrateur ni de bus.
+    ///
+    /// #7778 (points 3 et 4) — un refus que le service oppose à CETTE piste
+    /// (`no url` de Qobuz) se dit en clair : l'auditeur lisait « no url ».
     pub fn message_piste_non_demarree(geste: &str, cause: &str) -> String {
+        if crate::poller::refus_propre_a_la_piste(cause) {
+            return format!(
+                "Impossible de lire la piste {geste} : {}",
+                crate::poller::MESSAGE_TITRE_INDISPONIBLE
+            );
+        }
         format!("Impossible de lire la piste {geste} : {cause}")
     }
 
