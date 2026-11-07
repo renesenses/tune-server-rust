@@ -2773,6 +2773,11 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "smart_collections_expression",
         up: "",
     },
+    // #8077 — les apports d'un service (Qobuz) à un album LOCAL : le
+    // rapprochement (`apports_service_albums`) et les champs repris
+    // (`apports_service`), en base seulement, réversibles. Jumelle PG : 107.
+    // Numéros libres dans le lot rc11 au 07/11 (dernières : 140 / PG 106).
+    Migration { version: 141, name: "apports_service", up: include_str!("../../migrations/apports_service.sql") },
 ];
 
 /// SQL de l'attribution unique de la migration 137 (#7765) — jouée une seule
@@ -5843,6 +5848,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         106,
         "smart_collections_expression",
         include_str!("../../migrations/postgres/106_smart_collections_expression.sql"),
+    ),
+    // Jumelle de la SQLite 141 (#8077) : les apports d'un service à un album
+    // local, même DDL (`migrations/apports_service.sql`).
+    (
+        107,
+        "apports_service",
+        include_str!("../../migrations/postgres/107_apports_service.sql"),
     ),
 ];
 
@@ -9408,7 +9420,9 @@ mod tests {
         // 106 : `smart_collections_expression` (#7872), jumelle de la SQLite
         // 140. Pose la requête avancée des collections intelligentes, que
         // toutes leurs lectures NOMMENT.
-        assert_eq!(pg_latest_version(), 106, "latest PG migration must be 106");
+        // 107 : `apports_service` (#8077), jumelle de la SQLite 141. Crée les
+        // tables des apports Qobuz, que la fiche album NOMME.
+        assert_eq!(pg_latest_version(), 107, "latest PG migration must be 107");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

@@ -238,6 +238,11 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Clés des clients Subsonic (#7855, script 104) : sans cette ligne, chaque
     // client devrait être réappairé après la bascule.
     "cles_clients",
+    // Apports Qobuz aux albums locaux (#8077, script 107) : sans ces lignes,
+    // un retrait (`retire`) serait oublié et la passe de fond remettrait les
+    // apports après la bascule.
+    "apports_service_albums",
+    "apports_service",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",
@@ -1827,6 +1832,8 @@ fn conflict_clause(table: &str) -> &'static str {
         "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
+        "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",
+        "apports_service" => "ON CONFLICT (album_id, track_id, champ, source) DO NOTHING",
         "track_metadata" => "ON CONFLICT (track_id, key) DO NOTHING",
         "album_metadata" => "ON CONFLICT (album_id, key) DO NOTHING",
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",

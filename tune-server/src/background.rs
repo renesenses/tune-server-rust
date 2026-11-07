@@ -29,6 +29,8 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // `running` en base ; on la dit `interrupted` pour débloquer le bouton.
     crate::routes::library::graver_dr::marquer_passe_interrompue_au_demarrage(&state.backend);
     spawn_squeezebox_poller(state);
+    // #8077 — la passe de fond des apports Qobuz (15 min après, puis 6 h).
+    crate::routes::library::apports_qobuz::armer_la_passe(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
     spawn_dash_temp_gc();

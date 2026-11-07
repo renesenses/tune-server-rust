@@ -1,6 +1,8 @@
 /// Apparier un titre connu sur la bibliothèque LOCALE (#4716) — le pendant de
 /// `streaming::matching` pour le sens service → bibliothèque.
 pub mod appariement_bibliotheque;
+/// #8077 — compléter un album local depuis Qobuz, sans rien écraser.
+pub mod apports_service;
 /// Les artistes du même label : bibliothèque, puis catalogue Qobuz (#6782).
 pub mod artistes_du_label;
 pub mod artwork;

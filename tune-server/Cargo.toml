@@ -1723,6 +1723,19 @@ name = "pg_requete_avancee_7872"
 path = "tests/pg_requete_avancee_7872.rs"
 required-features = ["postgres"]
 
+# #8077 — les apports Qobuz d'un album local (rapprochement, garde « compléter
+# seulement », retrait), sur SQLite puis sur PostgreSQL (migration 107), par le
+# vrai routeur et une doublure de l'API Qobuz. `autotests = false` : sans ces
+# cibles, jamais compilés.
+[[test]]
+name = "apports_qobuz_8077"
+path = "tests/apports_qobuz_8077.rs"
+
+[[test]]
+name = "pg_apports_qobuz_8077"
+path = "tests/pg_apports_qobuz_8077.rs"
+required-features = ["postgres"]
+
 # #6257 — l'ordre des étiquettes sur PostgreSQL : la 091 pose `tags.position`
 # en BIGINT, `PUT /tags/order` l'écrit, les listes le suivent.
 # `autotests = false` : sans cette cible, jamais compilé.
