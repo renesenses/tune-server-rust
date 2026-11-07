@@ -1,0 +1,10 @@
+# `cross` configuration for building airplay-daemon (#8112).
+#
+# Passed by scripts/build-airplay-daemon.py through CROSS_CONFIG, so that the
+# Cross.toml of the airplay2-rs fork is NOT used: its aarch64 `pre-build`
+# installs libfdk-aac-dev, libasound2-dev, avahi and dbus for the target, none
+# of which `airplay-daemon` links (`cargo tree -p airplay-daemon`: the only
+# native code is the vendored fdk-aac, compiled by `cc`, and `ring`). The image
+# toolchain is enough; an apt failure there would only fail the build.
+[target.aarch64-unknown-linux-gnu]
+[target.aarch64-unknown-linux-musl]

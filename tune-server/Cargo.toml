@@ -1495,6 +1495,12 @@ path = "tests/pg_pochette_lecture_bornee.rs"
 name = "exemplaires_par_repertoire_4907"
 path = "tests/exemplaires_par_repertoire_4907.rs"
 
+# #8106 — une compilation faite main (un dossier, un titre, des artistes de
+# piste différents, sans ALBUMARTIST) reste un album, par le vrai scan.
+[[test]]
+name = "compilations_regroupees_8106"
+path = "tests/compilations_regroupees_8106.rs"
+
 # #6917 — ne dédoublonner que les copies d'une même racine de musique : le
 # vrai scan et le nettoyage, option allumée et éteinte, SQLite et PostgreSQL.
 [[test]]
