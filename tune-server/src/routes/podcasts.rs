@@ -299,7 +299,7 @@ pub fn router() -> Router<AppState> {
         .route("/catalogue", get(catalogue_podcasts))
         .route("/episodes/{podcast_id}", get(podcast_episodes))
         .route("/episodes", get(episodes_by_feed_url))
-        .route("/play/{zone_id}", post(play_episode))
+        .route("/play/{zone_id}", post(play_episode_en_tete_du_groupe))
 }
 async fn search_podcasts(
     State(state): State<AppState>,
@@ -810,6 +810,19 @@ async fn podcast_episodes(
         ),
     }
 }
+/// #7717 — un épisode lancé sur une zone est un lancement.
+async fn play_episode_en_tete_du_groupe(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    body: Json<PlayEpisodeRequest>,
+) -> axum::response::Response {
+    let lancement = play_episode(State(state.clone()), Path(zone_id), body);
+    crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
+        &state, zone_id, lancement,
+    )
+    .await
+}
+
 pub(super) async fn play_episode(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,

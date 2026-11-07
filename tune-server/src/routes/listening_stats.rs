@@ -59,10 +59,13 @@ async fn listening_stats(
     // --- Totals ---
     let totals_row = b
         .query_one(
-            "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0), \
-             COUNT(DISTINCT COALESCE(title,'') || '::' || COALESCE(artist_name,'')), \
-             COUNT(DISTINCT artist_name) \
-             FROM listen_history WHERE COALESCE(source, '') <> 'radio'",
+            &format!(
+                "SELECT CAST(COALESCE(SUM(e.n), 0) AS BIGINT), \
+                 CAST(COALESCE(SUM(e.duree), 0) AS BIGINT), \
+                 COUNT(DISTINCT COALESCE(e.title,'') || '::' || COALESCE(e.artist_name,'')), \
+                 COUNT(DISTINCT e.artist_name) \
+                 FROM ({ECOUTES_TOUS_TEMPS}) e"
+            ),
             &[],
         )
         .map_err(AppError::internal)?
@@ -73,6 +76,18 @@ async fn listening_stats(
     let unique_tracks = totals_row.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
     let unique_artists = totals_row.get(3).and_then(|v| v.as_i64()).unwrap_or(0);
     let total_hours = (total_ms as f64 / 3_600_000.0 * 10.0).round() / 10.0;
+    // #7777 : la part importée de `total_listens`, pour que l'écran puisse
+    // dire « dont N importées ».
+    let imported_listens = b
+        .query_one(
+            "SELECT CAST(COALESCE(SUM(ip.play_count), 0) AS BIGINT) \
+             FROM imported_plays ip JOIN tracks t ON t.id = ip.track_id \
+             WHERE ip.play_count > 0",
+            &[],
+        )
+        .map_err(AppError::internal)?
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0);
 
     // --- Top artists (always returned, but capped to 3 for free tier) ---
     let artist_limit = if is_premium { limit } else { 3 };
@@ -97,6 +112,12 @@ async fn listening_stats(
             "total_hours": total_hours,
             "unique_tracks": unique_tracks,
             "unique_artists": unique_artists,
+            "imported_listens": imported_listens,
+        },
+        // #7777 : les écoutes importées comptent dans les totaux et les
+        // classements tous temps ; pas dans la durée ni les vues par période.
+        "imported_plays": {
+            "all_time_only": true,
         },
         "top_artists": top_artists,
         "top_albums": top_albums,
@@ -373,15 +394,37 @@ async fn wrapped(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// #7777 — les écoutes « tous temps » : l'historique (une ligne = une écoute)
+/// PLUS les écoutes importées d'un autre logiciel (`imported_plays`, #7763 :
+/// Roon, Plex, m3u), rattachées à leur piste par son titre, son interprète et
+/// son album. Colonnes : `title`, `artist_name`, `album_title`, `n` (nombre
+/// d'écoutes de la ligne), `duree` (ms écoutées).
+///
+/// Une écoute importée n'a ni date ni durée écoutée propres : elle compte dans
+/// les totaux et les classements tous temps, mais pas dans la durée totale ni
+/// dans les vues par période (heatmap, historique par jour, rétrospective
+/// annuelle), qui restent sur `listen_history` seul. La réponse le dit
+/// (`imported_plays`).
+const ECOUTES_TOUS_TEMPS: &str = "SELECT title, artist_name, album_title, 1 AS n, \
+     duration_ms AS duree FROM listen_history WHERE COALESCE(source, '') <> 'radio' \
+     UNION ALL \
+     SELECT t.title, a.name, al.title, ip.play_count, 0 \
+     FROM imported_plays ip JOIN tracks t ON t.id = ip.track_id \
+     LEFT JOIN artists a ON a.id = t.artist_id \
+     LEFT JOIN albums al ON al.id = t.album_id \
+     WHERE ip.play_count > 0";
+
 fn query_top_artists(
     b: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     limit: i64,
 ) -> Result<Vec<Value>, AppError> {
     let rows = b
         .query_many(
-            "SELECT artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE artist_name IS NOT NULL AND COALESCE(source, '') <> 'radio' \
-             GROUP BY artist_name ORDER BY plays DESC LIMIT ?",
+            &format!(
+                "SELECT e.artist_name, CAST(SUM(e.n) AS BIGINT) AS plays \
+                 FROM ({ECOUTES_TOUS_TEMPS}) e WHERE e.artist_name IS NOT NULL \
+                 GROUP BY e.artist_name ORDER BY plays DESC LIMIT ?"
+            ),
             &[&limit as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
@@ -403,9 +446,11 @@ fn query_top_albums(
 ) -> Result<Vec<Value>, AppError> {
     let rows = b
         .query_many(
-            "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE album_title IS NOT NULL AND COALESCE(source, '') <> 'radio' \
-             GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT ?",
+            &format!(
+                "SELECT e.album_title, e.artist_name, CAST(SUM(e.n) AS BIGINT) AS plays \
+                 FROM ({ECOUTES_TOUS_TEMPS}) e WHERE e.album_title IS NOT NULL \
+                 GROUP BY e.album_title, e.artist_name ORDER BY plays DESC LIMIT ?"
+            ),
             &[&limit as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
@@ -428,9 +473,11 @@ fn query_top_tracks(
 ) -> Result<Vec<Value>, AppError> {
     let rows = b
         .query_many(
-            "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE COALESCE(source, '') <> 'radio' \
-             GROUP BY title, artist_name ORDER BY plays DESC LIMIT ?",
+            &format!(
+                "SELECT e.title, e.artist_name, CAST(SUM(e.n) AS BIGINT) AS plays \
+                 FROM ({ECOUTES_TOUS_TEMPS}) e \
+                 GROUP BY e.title, e.artist_name ORDER BY plays DESC LIMIT ?"
+            ),
             &[&limit as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
@@ -453,12 +500,21 @@ fn query_top_genres(
 ) -> Result<Vec<Value>, AppError> {
     // Join listen_history with tracks to pull genre info.
     // Falls back gracefully if no tracks are linked.
+    // #7777 : les écoutes importées (`imported_plays`) comptent aussi, comme
+    // dans les autres classements tous temps ; elles portent un `track_id`
+    // réel, donc leur genre se lit directement sur la piste.
     let rows = b
         .query_many(
-            "SELECT t.genre, COUNT(*) as plays FROM listen_history lh \
-             INNER JOIN tracks t ON t.id = lh.track_id \
-             WHERE t.genre IS NOT NULL AND t.genre != '' AND COALESCE(lh.source, '') <> 'radio' \
-             GROUP BY t.genre ORDER BY plays DESC LIMIT ?",
+            "SELECT g.genre, CAST(SUM(g.n) AS BIGINT) AS plays FROM ( \
+               SELECT t.genre AS genre, 1 AS n FROM listen_history lh \
+               INNER JOIN tracks t ON t.id = lh.track_id \
+               WHERE COALESCE(lh.source, '') <> 'radio' \
+               UNION ALL \
+               SELECT t.genre, ip.play_count FROM imported_plays ip \
+               INNER JOIN tracks t ON t.id = ip.track_id \
+               WHERE ip.play_count > 0) g \
+             WHERE g.genre IS NOT NULL AND g.genre != '' \
+             GROUP BY g.genre ORDER BY plays DESC LIMIT ?",
             &[&limit as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;

@@ -134,11 +134,33 @@ pub mod sql {
             // était multipliée. Les rapprochements (piste, pochette, album)
             // se font maintenant APRÈS le regroupement, en sous-requêtes
             // scalaires (`MAX`), qui rendent au plus une valeur par groupe.
-            "WITH g AS (SELECT h.title AS title, h.artist_name AS artist_name, \
-                    COUNT(*) AS plays, MAX(h.track_id) AS tid, \
-                    MAX(h.album_title) AS alb, MAX(h.cover_url) AS cu, MAX(h.source) AS src \
+            //
+            // #7777 : les écoutes IMPORTÉES (`imported_plays`, #7763) comptent
+            // aussi, avec la même règle que `plays_for_tracks` — titre +
+            // interprète de la piste. Une piste qui n'a QUE des écoutes
+            // importées entre dans le classement ; une piste qui a les deux
+            // les additionne dans un seul groupe. `listen_history.track_id`
+            // étant toujours NULL, `MAX(tid)` y prend l'identifiant de la
+            // piste importée. `CAST … AS BIGINT` : `SUM` d'un BIGINT rend un
+            // NUMERIC sur PostgreSQL, que `as_i64` ne lit pas. Une écoute
+            // importée vaut `src = 'local'` : son `track_id` désigne une piste
+            // de la bibliothèque, donc `MAX(src)` d'un groupe mixte peut
+            // passer de « deezer » à « local », ce qui reste cohérent.
+            "WITH u AS (SELECT h.title AS title, h.artist_name AS artist_name, \
+                    1 AS n, h.track_id AS tid, h.album_title AS alb, \
+                    h.cover_url AS cu, h.source AS src \
                     FROM listen_history h WHERE h.source != 'radio' \
-                    GROUP BY h.title, h.artist_name) \
+                  UNION ALL \
+                  SELECT t.title, a.name, ip.play_count, ip.track_id, al.title, \
+                    NULL, 'local' \
+                    FROM imported_plays ip JOIN tracks t ON t.id = ip.track_id \
+                    LEFT JOIN artists a ON a.id = t.artist_id \
+                    LEFT JOIN albums al ON al.id = t.album_id \
+                    WHERE ip.play_count > 0), \
+             g AS (SELECT u.title AS title, u.artist_name AS artist_name, \
+                    CAST(SUM(u.n) AS BIGINT) AS plays, MAX(u.tid) AS tid, \
+                    MAX(u.alb) AS alb, MAX(u.cu) AS cu, MAX(u.src) AS src \
+                    FROM u GROUP BY u.title, u.artist_name) \
              SELECT g.title, g.artist_name, g.plays, \
              COALESCE((SELECT MAX(t.id) FROM tracks t WHERE t.id = g.tid), \
                       (SELECT MAX(t3.id) FROM tracks t3 WHERE t3.title = g.title), g.tid) AS track_id, \

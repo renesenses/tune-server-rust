@@ -5,7 +5,7 @@ mod timing;
 mod controle;
 
 #[path = "airplay_flux_progressif.rs"]
-mod flux_progressif;
+pub(crate) mod flux_progressif;
 
 use std::net::UdpSocket;
 use std::sync::Arc;

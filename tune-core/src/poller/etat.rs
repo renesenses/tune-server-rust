@@ -267,6 +267,13 @@ pub(super) struct ZonePollState {
     /// #5522 — octets servis relevés au tour précédent, pour dire si le flux
     /// avance encore (un renderer qui tamponne n'est pas figé).
     pub(super) octets_du_demarrage: Option<u64>,
+    /// #7922 — le temps de la piste en cours réellement rendu : la somme des
+    /// avances de position vues d'un tour à l'autre en lecture. Un
+    /// déplacement ne l'avance pas, contrairement au pic de position.
+    pub(super) tune_tested_rendu_ms: u64,
+    /// #7922 — la position et l'instant du dernier relevé compté ; `None`
+    /// après un déplacement, une pause ou un changement de piste.
+    pub(super) tune_tested_releve: Option<(u64, Instant)>,
 }
 
 impl ZonePollState {
@@ -330,6 +337,8 @@ impl ZonePollState {
             radio_source_annonce: (None, None),
             fige_a_zero_depuis: None,
             octets_du_demarrage: None,
+            tune_tested_rendu_ms: 0,
+            tune_tested_releve: None,
         }
     }
 
