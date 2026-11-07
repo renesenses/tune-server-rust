@@ -1775,13 +1775,9 @@ impl PlaybackOrchestrator {
         // radio auto-retry re-create the stream for a track that is already
         // playing (via play_without_history) and must not add duplicate rows.
         //
-        // Skip live radio entirely: the title/artist supplied at play time is a
-        // frozen snapshot (station name, or a stale song copied from a history
-        // line when replaying) and never describes what the station is actually
-        // streaming now, so recording it produces listen_history rows with no
-        // relation to what was heard, plus a fresh bogus row on every replay
-        // click (Bilou). Station plays are already tracked in the radio_stations
-        // table (record_play), so nothing is lost.
+        // Live radio is written once per launch under the STATION name, never
+        // the title supplied at play time (a frozen ICY snapshot, Bilou); see
+        // `historique_radio_podcast_7965` (#7965).
         // Ce que la sortie a refusé n'a été entendu nulle part.
         //
         // `output_sent` est établi juste au-dessus, et l'arrêt immédiat de la
@@ -1861,7 +1857,21 @@ impl PlaybackOrchestrator {
         // déclenché par le poller une fois le seuil des 50 % / 4 min franchi
         // (`dispatch_scrobble`, #1113), et une lecture qui n'a jamais démarré
         // ne l'atteint pas. C'est la seconde question ouverte du ticket.
-        if output_sent && record_history && resolved.source != "radio" {
+        if output_sent && record_history && resolved.source == "radio" {
+            let profil = self
+                .playback
+                .get_state(req.zone_id)
+                .await
+                .session_profile_id;
+            self.enregistrer_ecoute_radio(
+                req.zone_id,
+                req.source_id.as_deref(),
+                &resolved.title,
+                habillage.album.as_deref(),
+                habillage.cover_path.as_deref(),
+                profil,
+            );
+        } else if output_sent && record_history {
             // Owning profile = the zone's current session, set by the play
             // handler from X-Profile-Id and inherited by autoplay / gapless
             // advances (which reuse the zone without touching it). Resolved here
