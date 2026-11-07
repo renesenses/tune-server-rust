@@ -24,13 +24,26 @@
 use crate::db::settings_repo::SettingsRepo;
 /// #6044 — `channel-remap` (réaffectation des canaux) est GRATUIT et
 /// facultatif, comme l'égaliseur : décision de Bertrand du 10/10/2026.
-pub const IDS: [&str; 5] = [
+///
+/// #7614 — `upsampler` (suréchantillonnage) est PAYANT, comme le crossfeed
+/// (décision de Bertrand du 07/11/2026), mais FACULTATIF comme l'égaliseur :
+/// arrivé après la migration, il ne s'installe que depuis le catalogue, et
+/// le bandeau « Réinstaller » ne le propose jamais.
+pub const IDS: [&str; 6] = [
     "equalizer",
     "crossfeed",
     "converter",
     "declick",
     "channel-remap",
+    "upsampler",
 ];
+/// #7614 — l'identifiant du greffon de suréchantillonnage.
+pub const UPSAMPLER: &str = "upsampler";
+/// Les greffons payants arrivés après la migration : ni installés par elle,
+/// ni proposés à la réinstallation.
+fn facultatif(id: &str) -> bool {
+    id == UPSAMPLER
+}
 /// Les greffons gratuits : droit `DspEq`, jamais posés par la migration.
 pub fn gratuit(id: &str) -> bool {
     matches!(id, "equalizer" | "channel-remap")
@@ -52,7 +65,7 @@ pub fn requires_premium(id: &str) -> bool {
 /// Les greffons que la migration embarque-active elle-même. L'égaliseur n'en
 /// fait plus partie : il s'installe depuis le catalogue.
 fn installed_by_migration(id: &str) -> bool {
-    contains(id) && !gratuit(id)
+    contains(id) && !gratuit(id) && !facultatif(id)
 }
 fn flag(settings: &SettingsRepo, id: &str, suffix: &str) -> Option<String> {
     settings
@@ -219,7 +232,9 @@ pub fn reinstall_candidates(settings: &SettingsRepo) -> Result<Vec<&'static str>
     let dismissed = reinstall_dismissed(settings)?;
     Ok(IDS
         .into_iter()
-        .filter(|id| requires_premium(id) && !installed(settings, id) && !dismissed.contains(id))
+        .filter(|id| {
+            installed_by_migration(id) && !installed(settings, id) && !dismissed.contains(id)
+        })
         .collect())
 }
 /// « Ignorer » : mémorise le refus pour ces greffons payants. Les identifiants
@@ -485,6 +500,26 @@ mod tests {
                 assert!(!existing_configuration(&s, id));
             }
         }
+    }
+    /// #7614 — le suréchantillonneur est payant mais facultatif : la
+    /// migration ne l'installe pas, même pour un compte Premium, et le
+    /// bandeau « Réinstaller » ne le propose pas.
+    #[test]
+    fn surechantillonneur_payant_jamais_installe_par_la_migration() {
+        for premium in [false, true] {
+            let s = settings();
+            migrate_for_account(&s, premium).unwrap();
+            assert!(requires_premium(UPSAMPLER));
+            assert!(!installed(&s, UPSAMPLER), "premium={premium}");
+            assert!(!enabled(&s, UPSAMPLER), "premium={premium}");
+            assert!(s.get("plugin_upsampler_installed").unwrap().is_none());
+            assert!(!reinstall_candidates(&s).unwrap().contains(&UPSAMPLER));
+        }
+        // Fenêtre legacy : il n'y est pas actif non plus.
+        let s = settings();
+        assert!(!enabled(&s, UPSAMPLER));
+        installer_par_la_route(&s, UPSAMPLER);
+        assert!(enabled(&s, UPSAMPLER));
     }
     #[test]
     fn migration_idempotente_deux_appels_meme_etat() {

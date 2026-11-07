@@ -47,6 +47,8 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     include_str!("../../migrations/continue_listening.sql"),
     // #7856 — contrôle parental, sans script numéroté (voir `politique_parentale`).
     include_str!("../../migrations/politiques_parentales.sql"),
+    // #7974 — temps écouté des profils supervisés (voir `bail_d_ecoute`).
+    include_str!("../../migrations/ecoutes_parentales.sql"),
     // #7983 — trace des tentatives d'enrichissement, sans script numéroté
     // (voir `enrich_tentatives`).
     include_str!("../../migrations/enrich_tentatives.sql"),

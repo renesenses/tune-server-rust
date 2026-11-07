@@ -566,6 +566,7 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         spec,
         sortie: backend.format_ouvert(),
         needs_resample: false,
+        surechantillonneur: None,
     };
     let mut etage =
         etage_exclusif_observe_7093::EtageObserve::nouveau(etage, &transformations_reelles);

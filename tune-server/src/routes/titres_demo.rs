@@ -640,11 +640,14 @@ async fn ajouter(
     );
     // Même geste que l'ajout d'un dossier de musique : le scan part tout de
     // suite pour que les titres apparaissent sans redémarrage.
+    // #8083 — ciblé sur le dossier de démonstration : le reste de la
+    // bibliothèque n'a pas à être reparcouru pour quelques titres.
     let scan_lance = if r.dossier_ajoute {
+        crate::auto_scan::signaler_racines_modifiees();
         super::system::scan::spawn_library_scan_par(
             state.clone(),
             false,
-            None,
+            Some(r.dossier.clone()),
             super::system::scan::ORIGINE_AJOUT_DE_DOSSIER,
         )
         .await

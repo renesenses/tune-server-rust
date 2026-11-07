@@ -1838,6 +1838,10 @@ pub fn spawn_mdns_handler(
         // can list the discovered peers. AppState keeps it alive for the whole
         // process, so the returned handle is a convenience clone only.
         let mdns = std::sync::Arc::new(mdns);
+        // #8100 — réseau arrivé APRÈS Tune (DHCP lent) : relance des
+        // recherches et réannonce sur la vraie adresse, sur changement réel
+        // des adresses seulement. La tâche s'arrête avec le scanner.
+        mdns.surveiller_reseau();
         *state.mdns_scanner.lock().unwrap() = Some(mdns.clone());
         Some(mdns)
     } else {

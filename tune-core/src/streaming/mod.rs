@@ -26,6 +26,8 @@ pub mod qobuz_repli_qualite;
 pub mod quality;
 pub mod radiofrance;
 pub mod registry;
+/// #8066 — remplacer un titre de service devenu indisponible dans une playlist.
+pub mod remplacement_indisponibles;
 pub mod spotify;
 pub mod spotify_connect;
 /// #6018 — la lecture d'un titre Spotify par librespot, comme source PCM.
