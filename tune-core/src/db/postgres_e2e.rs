@@ -86,6 +86,11 @@ fn reset_schema(db: &Arc<dyn DbBackend>) {
         // #5049, `--test-threads=1`, ordre alphabétique).
         "album_metadata",
         "album_distinct_pairs",
+        // Même cas : sans clé étrangère, `hidden_items` survivait d'une
+        // épreuve à l'autre. L'album 7 masqué par `preparer_7619` (renuméroté
+        // 4 par une épreuve suivante) masquait la Bruckner 7 de
+        // `pg_4319_texte_libre_mot_a_mot` au passage suivant sur la même base.
+        "hidden_items",
     ];
     for table in tables {
         let sql = format!("TRUNCATE TABLE {table} RESTART IDENTITY CASCADE");
@@ -3706,6 +3711,14 @@ async fn pg_7619_revision_de_la_bibliotheque() {
     use crate::db::library_revision::{lire, sql_postgres};
     let db = pg_or_skip!();
     reset_schema(&db);
+    // Comme au démarrage : `PostgresDb::connect` pose `ENSURE_TABLES`
+    // (dont `streaming_hidden_items`, sans script numéroté) AVANT la passe
+    // qui pose la révision. Sans cela, l'épreuve jouée seule sur une base
+    // faite des seuls scripts échoue sur une table suivie absente.
+    let url = std::env::var("TUNE_TEST_PG_URL").expect("posée : pg_or_skip! est passé");
+    crate::db::postgres::PostgresDb::connect(&url)
+        .await
+        .expect("démarrage PostgreSQL (ENSURE_TABLES)");
     db.execute(&sql_postgres(), &[]).unwrap();
     db.execute(&sql_postgres(), &[]).unwrap();
     let (instance, avant) = lire(db.as_ref()).expect("révision posée");
