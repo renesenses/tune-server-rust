@@ -133,6 +133,7 @@ jobs:
           bash scripts/verifier-fermeture.sh --autotest
           bash scripts/verifier-refs-issues.sh --autotest
           python3 scripts/test-librespot-6872.py
+          python3 scripts/test-airplay-daemon-8112.py
           python3 scripts/test-assembler-notes-release.py
           python3 scripts/preflight-check.py --self-test
           python3 scripts/measure-compile.py --self-test
@@ -950,6 +951,7 @@ jobs:
 
   # #6872: compile the standalone helper on its actual release runners,
   # including cross's ring C/ASM build. No signing or publication in PR CI.
+  # #8112: airplay-daemon is built here too, by the release recipe.
   librespot:
     name: librespot (${{ matrix.target }})
     needs: impact
@@ -1005,6 +1007,30 @@ jobs:
           BIN=librespot
           if [ "$RUNNER_OS" = "Windows" ]; then BIN=librespot.exe; fi
           "$RUNNER_TEMP/lrs/bin/$BIN" --version
+
+      # #8112 : airplay-daemon sur les memes runners et par la meme recette
+      # que release.yml (cross pour les ARM Linux). Jusqu'a la rc10, les cibles
+      # ARM etaient sautees a la release et l'archive linux-aarch64 (celle de
+      # l'image Tune OS du Pi) partait sans AirPlay 2, sans qu'aucune porte ne
+      # rougisse. Un echec rougit le job sur toutes les cibles, musl comprise.
+      - name: Build airplay-daemon (#8112)
+        shell: bash
+        run: |
+          CROSS=()
+          if [ "${{ matrix.cross }}" = "true" ]; then CROSS=(--cross); fi
+          python scripts/build-airplay-daemon.py --target ${{ matrix.target }} \
+            --output "$RUNNER_TEMP/apd" --work "$RUNNER_TEMP/apd-src" "${CROSS[@]}"
+
+      - name: Verify airplay-daemon is an aarch64 ELF (#8112)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          BIN="$RUNNER_TEMP/apd/bin/airplay-daemon"
+          test -s "$BIN"
+          file "$BIN"
+          file "$BIN" | grep -q 'ARM aarch64'
+          ls -l "$BIN"
+          readelf -d "$BIN" | grep NEEDED || true
 
   # Check unique exige sur main. Les PR unitaires vers rc/* gardent le profil
   # rapide ; seule une RC peut atteindre main et elle doit rendre toute la
