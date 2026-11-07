@@ -2823,6 +2823,7 @@ impl DspDeLaRouteFlottanteWindows {
             spec,
             sortie: crate::outputs::traits::FormatOuvert::new(44_100, 2),
             needs_resample: false,
+            surechantillonneur: None,
         }
     }
 }

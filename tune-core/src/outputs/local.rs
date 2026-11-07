@@ -101,6 +101,11 @@ pub(super) enum MotifDeReouverture {
     /// source (liste de cadences MESURÉE, flux ouvert à la cadence de la
     /// source) : le rouvrir est ce qu'un double-clic sur la piste aurait fait.
     PeripheriqueSuitLaSource,
+    /// #7614 — le greffon de suréchantillonnage porte ce flux, ou le choix
+    /// de la zone a changé depuis l'ouverture : la piste suivante est jouée
+    /// sur une sortie rouverte, avec le choix du moment. Jamais de bascule
+    /// pendant une piste.
+    Surechantillonnage,
 }
 
 impl MotifDeReouverture {
@@ -110,6 +115,7 @@ impl MotifDeReouverture {
             Self::BitPerfectStrict => "bitperfect_strict",
             Self::Pure => "pure",
             Self::PeripheriqueSuitLaSource => "peripherique_suit_la_source",
+            Self::Surechantillonnage => "surechantillonnage",
         }
     }
 }
@@ -815,6 +821,14 @@ pub struct LocalOutput {
     /// PURE) and only when the stream is stereo. Set per-play by the
     /// orchestrator via `set_crossfeed`.
     crossfeed: Arc<std::sync::Mutex<Option<super::super::audio::crossfeed::CrossfeedProcessor>>>,
+    /// #7614 — le choix du greffon de suréchantillonnage pour la zone qui
+    /// joue, posé par l'orchestrateur avant chaque lecture et rafraîchi par
+    /// la route de réglage. Lu à l'OUVERTURE seulement : l'étage d'une piste
+    /// garde le choix de son ouverture, et un changement ne prend effet qu'à
+    /// la frontière de piste suivante (Bertrand, 07/11/2026).
+    surechantillonnage: Arc<
+        std::sync::Mutex<Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage>>,
+    >,
     /// Repli mono de la zone en cours de lecture sur cette sortie (#2362).
     ///
     /// Quand il est armé, la chaîne somme `M = (L + R) / 2` et réémet `M` sur
@@ -1396,6 +1410,7 @@ impl LocalOutput {
             // exactement comme avant #1590.
             soft_mute_ms: Arc::new(AtomicU32::new(0)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
+            surechantillonnage: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
             transformations_reelles: Arc::new(std::sync::Mutex::new(None)),
@@ -2194,6 +2209,26 @@ impl LocalOutput {
     pub fn set_crossfeed(&self, cf: Option<super::super::audio::crossfeed::CrossfeedProcessor>) {
         *self.crossfeed.lock().unwrap() = cf;
         self.recalculer_la_compensation();
+    }
+
+    /// #7614 — pose (ou retire avec `None`) le choix du greffon de
+    /// suréchantillonnage de la zone. Sans effet sur la piste en cours :
+    /// l'étage d'une piste garde le choix de son ouverture ; la frontière
+    /// suivante compare et rouvre la sortie si le choix a changé.
+    pub fn set_surechantillonnage(
+        &self,
+        choix: Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage>,
+    ) {
+        if let Ok(mut slot) = self.surechantillonnage.lock() {
+            *slot = choix;
+        }
+    }
+
+    /// #7614 — le choix posé, tel que la prochaine ouverture le lira.
+    pub fn surechantillonnage(
+        &self,
+    ) -> Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage> {
+        self.surechantillonnage.lock().ok().and_then(|c| c.clone())
     }
 
     /// Remplacer le crossfeed **pendant** la lecture, en emportant les lignes à
@@ -4990,6 +5025,57 @@ struct EtageDeConversion<'a> {
     /// Le format réellement OUVERT par le périphérique, à l'autre bout.
     sortie: FormatOuvert,
     needs_resample: bool,
+    /// #7614 — le greffon de suréchantillonnage, quand il porte la cadence
+    /// de ce flux. Exclusif de `needs_resample`.
+    surechantillonneur: Option<SurechDeLEtage<'a>>,
+}
+
+/// #7614 — l'étage du suréchantillonneur (quand il tourne) et le choix de la
+/// zone, relu à la frontière de piste seulement.
+pub(super) struct SurechDeLEtage<'a> {
+    pub(super) etage: Option<crate::audio::surechantillonnage::EtageSurechantillonneur>,
+    pub(super) choix_de_la_zone:
+        &'a std::sync::Mutex<Option<crate::audio::surechantillonnage::ChoixSurechantillonnage>>,
+    /// Les réglages lus à l'ouverture, que l'étage ait pu tourner ou non.
+    pub(super) reglages_a_l_ouverture: Option<crate::audio::surechantillonnage::UpsamplerSettings>,
+}
+
+impl SurechDeLEtage<'_> {
+    /// Le choix de la zone est-il encore celui de l'ouverture ? Faux dès que
+    /// le greffon a été activé, désactivé, retiré, ou que son filtre ou ses
+    /// plafonds ont changé : la frontière rouvre alors la sortie, et le
+    /// nouveau choix s'applique à la piste qui commence.
+    pub(super) fn choix_inchange(&self) -> bool {
+        let actuel = self
+            .choix_de_la_zone
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|c| c.reglages.clone()));
+        actuel == self.reglages_a_l_ouverture
+    }
+}
+
+/// #7614 — le greffon peut-il s'ouvrir sur ce flux ? Jamais sous PURE, jamais
+/// sur un porteur DoP : un flux 24 bits dont l'amorce est un porteur, ou trop
+/// courte pour l'écarter, garde son chemin.
+pub(super) fn surechantillonneur_admis_a_l_ouverture(
+    spec: AudioSpec,
+    amorce: &[u8],
+    pure: bool,
+    dop: bool,
+) -> bool {
+    if pure || dop {
+        return false;
+    }
+    let canaux = spec.canaux();
+    let bits = spec.profondeur().bits_declares();
+    if bits == 24 {
+        let sonde = DOP_DETECT_FRAMES * usize::from(canaux) * 3;
+        if amorce.len() < sonde || is_dop_pcm(amorce, bits, canaux) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Ce qu'une poussée vers le puits a produit.
@@ -5054,6 +5140,37 @@ impl EtageDeConversion<'_> {
         let new_ch = nouvelle_spec.canaux();
         let output_sr = self.sortie.cadence;
         let output_ch = self.sortie.canaux;
+        // #7614 — le suréchantillonneur ne change jamais de réglage pendant
+        // un flux : un choix de zone différent de celui de l'ouverture, PURE
+        // allumé, ou une piste d'un autre format, et la sortie est rouverte
+        // pour la piste suivante. À format et choix identiques, l'étage fait
+        // partie du flux continu : son état est conservé (gapless).
+        if let Some(surech) = &self.surechantillonneur {
+            if !surech.choix_inchange() {
+                journaliser_la_reouverture(
+                    MotifDeReouverture::Surechantillonnage,
+                    new_sr,
+                    output_sr,
+                    device_name,
+                );
+                return Err(MotifDeReouverture::Surechantillonnage);
+            }
+            if surech.etage.is_some() {
+                if regles.pure || new_sr != self.sample_rate() || new_ch != self.channels() {
+                    let motif = if regles.pure {
+                        MotifDeReouverture::Pure
+                    } else {
+                        MotifDeReouverture::Surechantillonnage
+                    };
+                    journaliser_la_reouverture(motif, new_sr, output_sr, device_name);
+                    return Err(motif);
+                }
+                self.spec = nouvelle_spec;
+                self.pcm_kind =
+                    LocalPcmKind::for_bit_depth(nouvelle_spec.profondeur().bits_declares());
+                return Ok(false);
+            }
+        }
         // #5416 — la piste qui se termine est DÉJÀ convertie (le périphérique
         // n'a pas suivi sa cadence à l'ouverture : WASAPI partagé à 192 kHz,
         // greffon…) et la suivante a la MÊME cadence source. Rouvrir
@@ -5154,6 +5271,13 @@ impl EtageDeConversion<'_> {
             .process_pcm_chunk(&mut self.en_attente, self.spec, &mut self.pcm_kind)
     }
 
+    /// #7614 — le greffon de suréchantillonnage porte-t-il ce flux ?
+    fn surechantillonneur_actif(&self) -> bool {
+        self.surechantillonneur
+            .as_ref()
+            .is_some_and(|s| s.etage.is_some())
+    }
+
     /// Adaptation de canaux puis rééchantillonnage, dans cet ordre et lui seul.
     fn convertir(&mut self, mut mots: Vec<f32>) -> Vec<f32> {
         let (source, sortie) = (self.spec.canaux(), self.sortie.canaux);
@@ -5186,7 +5310,14 @@ impl EtageDeConversion<'_> {
             // gardes #3233 et REF-7 lisent ici, même refus en silence.
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
-        if self.needs_resample {
+        if let Some(etage) = self
+            .surechantillonneur
+            .as_mut()
+            .and_then(|s| s.etage.as_mut())
+        {
+            // #7614 — le greffon porte la cadence ; rubato ne tourne pas.
+            mots = etage.traiter(&mots);
+        } else if self.needs_resample {
             mots = rubato_resample_chunk(
                 &mut self.resampler,
                 &mots,
@@ -5310,13 +5441,23 @@ impl Etage for EtageDeConversion<'_> {
     /// gapless qui change de cadence ; à cadence identique le rééchantillonneur
     /// fait partie du flux continu et ne se vide pas.
     fn vider(&mut self, puits: &mut (dyn PuitsDEchantillons + '_)) -> bool {
-        let flushed = rubato_resample_chunk(
-            &mut self.resampler,
-            &[],
-            self.sortie.canaux,
-            true,
-            &mut self.resample_leftover,
-        );
+        // #7614 — quand le greffon porte la cadence, la queue est celle de
+        // son noyau (exactement son délai) ; sinon celle de rubato. Un seul
+        // `livrer` dans les deux cas (garde REF-7 de #3233).
+        let flushed = match self
+            .surechantillonneur
+            .as_mut()
+            .and_then(|s| s.etage.as_mut())
+        {
+            Some(etage) => etage.vider(),
+            None => rubato_resample_chunk(
+                &mut self.resampler,
+                &[],
+                self.sortie.canaux,
+                true,
+                &mut self.resample_leftover,
+            ),
+        };
         if flushed.is_empty() {
             return true;
         }
@@ -5333,8 +5474,16 @@ impl Etage for EtageDeConversion<'_> {
             self.pcm.dop_active.load(Ordering::Relaxed),
             self.pcm.pure_bypass.load(Ordering::Relaxed),
         );
-        TransformationsReelles::nouvelles(self.spec, self.sortie, self.dsp_actif())
-            .avec_reorganisation_canaux(reordonne)
+        let t = TransformationsReelles::nouvelles(self.spec, self.sortie, self.dsp_actif())
+            .avec_reorganisation_canaux(reordonne);
+        match self
+            .surechantillonneur
+            .as_ref()
+            .and_then(|s| s.etage.as_ref())
+        {
+            Some(etage) => t.avec_surechantillonnage(etage.filtre(), etage.reserve_db()),
+            None => t,
+        }
     }
 }
 
@@ -6259,6 +6408,7 @@ impl OutputTarget for LocalOutput {
         #[cfg(all(target_os = "windows", feature = "asio"))]
         let canaux_de_carte = self.canaux_de_carte();
         let crossfeed = self.crossfeed.clone();
+        let surechantillonnage = self.surechantillonnage.clone();
         let dop_active = self.dop_active.clone();
         // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
         // plutôt que trois atomiques de plus dans des fermetures qui en portent
@@ -7546,7 +7696,32 @@ impl OutputTarget for LocalOutput {
                 soft_mute: soft_mute.clone(),
                 position_ms: &position_ms,
             };
-            let mut backend = match BackendCpal::ouvrir(&demande) {
+            // #7614 — le greffon de suréchantillonnage, lu UNE fois, à
+            // l'ouverture : ni sous PURE, ni pour un porteur DoP (l'amorce
+            // 24 bits le dit, même règle que la matrice de canaux), ni quand
+            // l'amorce est trop courte pour l'écarter. #6132 — ni quand la zone
+            // recopie A vers des sorties suiveuses : elles s'ouvrent à la
+            // cadence de A, qu'elles n'acceptent pas forcément.
+            let choix_du_surechantillonneur = surechantillonnage
+                .lock()
+                .ok()
+                .and_then(|c| c.clone())
+                .filter(|_| seconde_sortie.is_empty())
+                .filter(|_| {
+                    surechantillonneur_admis_a_l_ouverture(
+                        spec,
+                        header_buf.get(data_offset..).unwrap_or_default(),
+                        pure_bypass.load(Ordering::Relaxed),
+                        dop_active.load(Ordering::Relaxed),
+                    )
+                });
+            let ouverture = match choix_du_surechantillonneur.as_ref() {
+                Some(choix) => {
+                    BackendCpal::ouvrir_pour_le_surechantillonneur(&demande, Some(choix))
+                }
+                None => BackendCpal::ouvrir(&demande),
+            };
+            let mut backend = match ouverture {
                 Ok(backend) => backend,
                 Err(refus) => {
                     refus.rapporter(&device_name, &open_failure);
@@ -7616,7 +7791,43 @@ impl OutputTarget for LocalOutput {
                 0
             };
             let skipped_bytes: u64 = 0;
-            let needs_resample = output_sr != sample_rate;
+            // #7614 — le flux s'est ouvert à la cadence négociée par le greffon :
+            // c'est lui qui porte la cadence, rubato ne tourne pas.
+            let etage_du_surechantillonneur = backend
+                .cadence_du_surechantillonneur()
+                .zip(choix_du_surechantillonneur.as_ref())
+                .and_then(|(vers, choix)| {
+                    match crate::audio::surechantillonnage::EtageSurechantillonneur::nouveau(
+                        &choix.reglages,
+                        sample_rate,
+                        vers,
+                        output_ch,
+                    ) {
+                        Ok(etage) => {
+                            info!(
+                                from_sr = sample_rate,
+                                to_sr = vers,
+                                filter = etage.filtre(),
+                                headroom_db = etage.reserve_db(),
+                                "local_audio_upsampler_engaged"
+                            );
+                            Some(etage)
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "local_audio_upsampler_refused");
+                            None
+                        }
+                    }
+                });
+            if choix_du_surechantillonneur.is_some() && etage_du_surechantillonneur.is_none() {
+                info!(
+                    device = %device_name,
+                    source_sr = sample_rate,
+                    output_sr,
+                    "local_audio_upsampler_not_applied"
+                );
+            }
+            let needs_resample = output_sr != sample_rate && etage_du_surechantillonneur.is_none();
             // #3233 — Pierre M, fil 1043 : « DSD : le temps défile, pas de
             // son ». Un porteur DoP ne survit ni au sinc ni à l'adaptation de
             // canaux : le marqueur 0x05/0xFA alterne à CHAQUE trame, c'est un
@@ -7711,6 +7922,13 @@ impl OutputTarget for LocalOutput {
                 spec,
                 sortie: FormatOuvert::new(output_sr, output_ch),
                 needs_resample,
+                surechantillonneur: Some(SurechDeLEtage {
+                    etage: etage_du_surechantillonneur,
+                    choix_de_la_zone: &surechantillonnage,
+                    reglages_a_l_ouverture: choix_du_surechantillonneur
+                        .as_ref()
+                        .map(|c| c.reglages.clone()),
+                }),
             };
             // REF-6b : dès que l'étage existe, l'écran peut savoir ce qu'il fait.
             publier_les_transformations(&transformations_reelles, &etage);
@@ -8261,7 +8479,7 @@ impl OutputTarget for LocalOutput {
 
             // Flush the resampler: process any leftover frames + drain internal delay
             if http_eof
-                && etage.needs_resample
+                && (etage.needs_resample || etage.surechantillonneur_actif())
                 && !force_silent.load(Ordering::Relaxed)
                 && !device_gone.load(Ordering::Relaxed)
             {
@@ -9331,6 +9549,10 @@ mod empreinte_asio_f70496;
 /// REF-6b (#2219) — l'étage dit ce qu'il fait, et `LocalOutput` le publie.
 #[cfg(test)]
 mod transformations_reelles_de_l_etage_ref6b;
+
+/// #7614 — le greffon de suréchantillonnage dans l'étage de la sortie locale.
+#[cfg(test)]
+mod surechantillonnage_7614;
 
 /// #6057 — l'étage route par la disposition déclarée par le fichier.
 #[cfg(test)]

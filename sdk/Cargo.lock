@@ -744,6 +744,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-plugin-surechantillonnage"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-audio-support",
+ "tune-plugin-sdk",
+ "tune-plugin-testkit",
+]
+
+[[package]]
 name = "tune-plugin-testkit"
 version = "0.1.0"
 dependencies = [
