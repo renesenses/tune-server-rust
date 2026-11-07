@@ -11,6 +11,7 @@
 //! pochette et position (moins le recul réglé, #7819) ; sans reprise, la
 //! dernière écoute de l'historique donne les métadonnées.
 use super::{PlayEpisodeRequest, play_episode};
+use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 use axum::Json;
 use axum::extract::{Path, State};
@@ -63,11 +64,20 @@ pub(in crate::routes) fn demande_de_reprise(
 pub(in crate::routes) async fn jouer_et_rendre_la_zone(
     state: &AppState,
     zone_id: i64,
+    headers: axum::http::HeaderMap,
+    profile: ActiveProfile,
     demande: PlayEpisodeRequest,
 ) -> Response {
-    let reponse = play_episode(State(state.clone()), Path(zone_id), Json(demande))
-        .await
-        .into_response();
+    // #7974 — le profil du geste et la langue d'un éventuel refus du bail.
+    let reponse = play_episode(
+        State(state.clone()),
+        Path(zone_id),
+        headers,
+        profile,
+        Json(demande),
+    )
+    .await
+    .into_response();
     if reponse.status().is_success() {
         Json(crate::routes::playback::build_zone_json(state, zone_id).await).into_response()
     } else {
@@ -134,6 +144,8 @@ fn demande_sans_reprise(state: &AppState, e: &EpisodeParAdresse<'_>) -> PlayEpis
 pub(crate) async fn jouer_l_episode_par_son_adresse(
     state: &AppState,
     zone_id: i64,
+    headers: axum::http::HeaderMap,
+    profile: ActiveProfile,
     e: EpisodeParAdresse<'_>,
 ) -> Response {
     // Un nouveau geste : un seek récent ne doit pas survivre à la relance.
@@ -156,5 +168,5 @@ pub(crate) async fn jouer_l_episode_par_son_adresse(
         titre = demande.title.as_deref().unwrap_or(""),
         "podcast_episode_par_adresse"
     );
-    jouer_et_rendre_la_zone(state, zone_id, demande).await
+    jouer_et_rendre_la_zone(state, zone_id, headers, profile, demande).await
 }

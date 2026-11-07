@@ -3631,6 +3631,27 @@ pub(crate) fn ranger_la_piste_du_surveillant(
     rangee
 }
 
+/// #8083 — génération des racines configurées, avancée par chaque geste qui
+/// AJOUTE un dossier de musique (Réglages › Répertoires, `PUT /config`, titres
+/// de démonstration). La boucle du surveillant la compare à chaque tour et
+/// relit alors `music_dirs` : un dossier ajouté est suivi sans redémarrage.
+static GENERATION_DES_RACINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dire au surveillant que `music_dirs` a gagné une racine.
+pub(crate) fn signaler_racines_modifiees() {
+    GENERATION_DES_RACINES.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Les racines configurées, normalisées comme partout ailleurs.
+fn racines_configurees(db: &Arc<dyn DbBackend>) -> Vec<String> {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get("music_dirs")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
 /// `event_bus` est ce qui manquait : le surveillant importait, et ne le disait
 /// a personne. Voir l'emission de `library.updated` en fin de lot.
 pub fn spawn_file_watcher(
@@ -3666,7 +3687,7 @@ pub fn spawn_file_watcher(
 
     // Normalized roots for the delete guard below — same normalization the
     // watcher applies internally.
-    let guard_roots: Vec<String> = music_dirs
+    let mut guard_roots: Vec<String> = music_dirs
         .iter()
         .map(|d| tune_core::scanner::walker::normalize_path(d))
         .filter(|d| !d.is_empty())
@@ -3690,6 +3711,7 @@ pub fn spawn_file_watcher(
         // server looked hung after sqlite_cache_warmed). It must run here,
         // on the blocking thread AFTER the startup scan — never on the
         // startup path.
+        let mut generation_vue = GENERATION_DES_RACINES.load(Ordering::Acquire);
         let mut watcher = match tune_core::scanner::watcher::FileWatcher::new(music_dirs) {
             Ok(w) => w,
             Err(e) => {
@@ -3738,6 +3760,23 @@ pub fn spawn_file_watcher(
                 liveness_tick = liveness_tick.wrapping_add(1);
                 if liveness_tick % 60 == 0 {
                     watcher.ensure_watches();
+                }
+                // #8083 — un dossier ajouté depuis le démarrage : le suivre, et
+                // l'admettre dans la garde des racines du lot.
+                let generation = GENERATION_DES_RACINES.load(Ordering::Acquire);
+                if generation != generation_vue {
+                    generation_vue = generation;
+                    let racines = racines_configurees(&db);
+                    watcher.suivre_les_racines(&racines);
+                    for r in racines
+                        .iter()
+                        .map(|d| tune_core::scanner::walker::normalize_path(d))
+                        .filter(|d| !d.is_empty())
+                    {
+                        if !guard_roots.contains(&r) {
+                            guard_roots.push(r);
+                        }
+                    }
                 }
                 let mut changes = watcher.poll_debounced(
                     std::time::Duration::from_secs(2),

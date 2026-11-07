@@ -987,6 +987,43 @@ impl FileWatcher {
         Ok(this)
     }
 
+    /// #8083 — suivre les racines ajoutées APRÈS la création du surveillant.
+    ///
+    /// Le surveillant est créé une fois, au démarrage, avec la liste
+    /// `music_dirs` de ce moment : un dossier ajouté ensuite dans Réglages ›
+    /// Répertoires était scanné mais jamais surveillé avant un redémarrage.
+    /// Chaque racine de `dirs` que le surveillant ne connaît pas encore (ni
+    /// suivie, ni en attente, ni sondée) est mise en attente puis posée par
+    /// [`ensure_watches`](Self::ensure_watches). Rend les racines nouvelles.
+    /// Une racine retirée des réglages n'est pas lâchée ici : ses événements
+    /// passent toujours par la garde des racines de l'appelant.
+    pub fn suivre_les_racines(&mut self, dirs: &[String]) -> Vec<PathBuf> {
+        let mut connues: Vec<PathBuf> = self.dirs.clone();
+        connues.extend(self.pending.iter().cloned());
+        connues.extend(verrou(&self.sondage.pretes).iter().map(|(d, _)| d.clone()));
+        connues.extend(verrou(&self.sondage.en_amorce).iter().cloned());
+        connues.extend(verrou(&self.sondage.repli_natif).iter().cloned());
+        let mut nouvelles = Vec::new();
+        for d in dirs {
+            let normalise = super::walker::normalize_path(d);
+            if normalise.is_empty() {
+                continue;
+            }
+            let chemin = PathBuf::from(normalise);
+            if connues.contains(&chemin) || nouvelles.contains(&chemin) {
+                continue;
+            }
+            nouvelles.push(chemin);
+        }
+        if nouvelles.is_empty() {
+            return nouvelles;
+        }
+        info!(racines = ?nouvelles, "watcher_racines_ajoutees");
+        self.pending.extend(nouvelles.iter().cloned());
+        self.ensure_watches();
+        nouvelles
+    }
+
     /// Les racines réseau dont la sonde est prête (relevé initial terminé).
     pub fn racines_sondees(&self) -> Vec<PathBuf> {
         verrou(&self.sondage.pretes)
@@ -1667,6 +1704,39 @@ mod tests {
             vus.is_empty(),
             "🔴 fil 2207 — la sonde réseau remonte le contenu des corbeilles : {vus:?}"
         );
+    }
+
+    /// #8083 — une racine ajoutée après la création du surveillant est
+    /// suivie, une seule fois ; une racine déjà suivie n'est pas reprise.
+    #[test]
+    fn une_racine_ajoutee_apres_coup_est_suivie_8083() {
+        let racine = crate::test_scratch::scratch_dir("watcher-racine-ajoutee-8083");
+        let premiere = racine.join("premiere");
+        let ajoutee = racine.join("ajoutee");
+        fs::create_dir_all(&premiere).unwrap();
+        fs::create_dir_all(&ajoutee).unwrap();
+        let p = premiere.to_string_lossy().to_string();
+        let a = ajoutee.to_string_lossy().to_string();
+        let mut watcher = FileWatcher::new(vec![p.clone()]).unwrap();
+        assert!(!watcher.dirs.contains(&ajoutee));
+
+        let nouvelles = watcher.suivre_les_racines(&[p.clone(), a.clone()]);
+        assert_eq!(
+            nouvelles,
+            vec![ajoutee.clone()],
+            "#8083 : seule la racine ajoutée est nouvelle"
+        );
+        assert!(
+            watcher.dirs.contains(&ajoutee),
+            "#8083 : la racine ajoutée doit être suivie sans redémarrage : {:?}",
+            watcher.dirs
+        );
+        assert_eq!(watcher.dirs.iter().filter(|d| **d == premiere).count(), 1);
+        assert!(
+            watcher.suivre_les_racines(&[p, a]).is_empty(),
+            "#8083 : une racine déjà suivie ne se pose pas deux fois"
+        );
+        watcher.stop();
     }
 
     #[test]

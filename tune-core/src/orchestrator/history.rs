@@ -5,7 +5,11 @@ impl PlaybackOrchestrator {
     /// stream re-creations of a track that is *already* being played (seek,
     /// radio auto-retry, reconnect) so a single logical play is not counted
     /// multiple times in the "Historique de lecture".
+    ///
+    /// #7974 — elle saute les étapes d'entrée, pas le bail d'écoute : une
+    /// relance radio ou une reconnexion après la fin du bail est refusée.
     pub async fn play_without_history(&self, req: PlayRequest) -> Result<PlayResult, String> {
+        self.verifier_le_bail(req.zone_id).await?;
         self.play_inner(req, false).await
     }
 
