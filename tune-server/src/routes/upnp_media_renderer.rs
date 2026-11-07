@@ -248,7 +248,7 @@ async fn connection_manager_control(
 /// base à chaque sondage : un changement de réglage DSD vaut au sondage
 /// suivant du serveur principal. Une zone introuvable n'annonce rien.
 fn zone_pretee_accepte_le_dsd(state: &AppState, zone_id: i64) -> bool {
-    let zones = ZoneRepo::with_backend(state.db.clone());
+    let zones = ZoneRepo::with_backend(state.backend.clone());
     let Some(zone) = zones.get(zone_id).ok().flatten() else {
         return false;
     };
@@ -2037,6 +2037,10 @@ mod url_distante_de_jplay_5574_tests;
 #[cfg(test)]
 #[path = "upnp_media_renderer_tests_6335.rs"]
 mod enchainement_par_la_zone_6335_tests;
+
+#[cfg(test)]
+#[path = "upnp_media_renderer_tests_8052.rs"]
+mod sink_dsd_de_la_zone_8052_tests;
 
 #[cfg(test)]
 mod publication_de_zone_4626_tests {

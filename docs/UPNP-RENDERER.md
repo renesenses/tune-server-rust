@@ -124,6 +124,21 @@ JPlay retrouve la sortie qu'il avait mémorisée au lieu d'en créer une nouvell
 - **ConnectionManager:1** — `GetProtocolInfo` (le `Sink` liste les formats
   acceptés), `GetCurrentConnectionIDs`, `GetCurrentConnectionInfo`.
 
+### Le DSD (prêt de sorties, #8052)
+
+Le `Sink` dépend de la zone. Une zone dont la sortie est **locale** et dont le
+mode DSD est **« DoP »** ou **« natif »** y ajoute le DSD
+(`application/x-dsd` en tête, puis `audio/dsf`, `audio/x-dsf`, `audio/dff`,
+`audio/x-dff`). Un autre Tune qui joue sur cette zone lui envoie alors le
+`.dsf` tel quel, sans le convertir, et c'est la zone qui décide du format,
+comme pour un fichier de sa bibliothèque : DSD natif en ASIO quand le pilote
+le permet, DoP sinon, PCM si la sortie ne peut pas porter le DoP (#7265).
+
+Les autres zones gardent le `Sink` sans DSD : en « auto » ou « PCM », la
+sortie locale joue du PCM de toute façon, et le serveur qui envoie convertit
+lui-même, comme avant. Une zone dont la sortie est un renderer réseau n'est
+pas concernée (#8053).
+
 ### Ce qui se passe à la lecture
 
 Le flux reçu **traverse toute la chaîne Tune** : EQ, convolveur, trim de gain,
