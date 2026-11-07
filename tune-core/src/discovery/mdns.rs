@@ -431,15 +431,15 @@ impl MdnsScanner {
         for nom in noms {
             let _ = self.daemon.unregister(&nom);
         }
-        if let Some((port, version)) = tune {
-            if let Err(e) = self.annoncer_tune(port, &version, Some(ip)) {
-                warn!(error = %e, "mdns_reenregistrement_echec");
-            }
+        if let Some((port, version)) = tune
+            && let Err(e) = self.annoncer_tune(port, &version, Some(ip))
+        {
+            warn!(error = %e, "mdns_reenregistrement_echec");
         }
-        if let Some(port) = sendspin {
-            if let Err(e) = self.annoncer_sendspin(port, Some(ip)) {
-                warn!(error = %e, "mdns_sendspin_reenregistrement_echec");
-            }
+        if let Some(port) = sendspin
+            && let Err(e) = self.annoncer_sendspin(port, Some(ip))
+        {
+            warn!(error = %e, "mdns_sendspin_reenregistrement_echec");
         }
     }
 
