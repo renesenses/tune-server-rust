@@ -62,7 +62,12 @@ impl TunePlugin for PremiumAudio {
             "converter" => include_str!("../../sdk/tune-plugin-converter/manifest.json"),
             "declick" => include_str!("../../sdk/tune-plugin-declick/manifest.json"),
             "channel-remap" => include_str!("../../sdk/tune-plugin-channel-remap/manifest.json"),
-            "upsampler" => include_str!("../../sdk/tune-plugin-surechantillonnage/manifest.json"),
+            // #7614 — `manifest.embedded.json` et non `manifest.json` : ce nom-là
+            // désigne un greffon natif (ABI, `sdk/plugins.json`), ce que le
+            // suréchantillonneur n'est pas — il n'est qu'embarqué dans `tune-core`.
+            "upsampler" => {
+                include_str!("../../sdk/tune-plugin-surechantillonnage/manifest.embedded.json")
+            }
             _ => return Err("unknown premium audio plugin".into()),
         };
         let manifest: tune_plugin_sdk::manifest::Manifest =
