@@ -66,7 +66,8 @@ fn le_surveillant_garde_l_artiste_de_la_piste_sous_un_album_artist_generique_188
             "ALBUMARTIST = « {graphie} », COMPILATION=0"
         );
     }
-    // TÉMOIN — un vrai artiste d'album : inchangé.
+    // TÉMOIN — un vrai artiste d'album : l'album le garde, et la piste garde
+    // son ARTIST comme au scan complet (#3179, #7933).
     assert_eq!(
         ranger(&fichier(
             "/m/reiner/01.flac",
@@ -74,6 +75,10 @@ fn le_surveillant_garde_l_artiste_de_la_piste_sous_un_album_artist_generique_188
             "Fritz Reiner",
             Some(false)
         )),
-        ("Fritz Reiner".into(), false, "Fritz Reiner".into())
+        (
+            "Fritz Reiner".into(),
+            false,
+            "Chicago Symphony Orchestra".into()
+        )
     );
 }
