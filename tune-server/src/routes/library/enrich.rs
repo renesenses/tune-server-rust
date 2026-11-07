@@ -469,7 +469,7 @@ pub(crate) async fn demarrer_enrich_all(
             }
         };
         let releve_periodique = |enriched: i32, errors: i32, examined: usize, retry: i64| {
-            if examined % 50 == 0 {
+            if examined.is_multiple_of(50) {
                 tune_core::db::settings_repo::SettingsRepo::with_backend(backend2.clone())
                     .set(
                         "enrich_all_status",
