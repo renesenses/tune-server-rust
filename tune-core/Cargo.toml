@@ -580,6 +580,12 @@ windows = { version = "0.62", features = [
     # #5410 — la température des zones thermiques (compteurs PDH « Thermal
     # Zone Information »), pour la garde thermique des analyses.
     "Win32_System_Performance",
+    # #6450 — les sources de repli de la température : WMI (`ROOT\CIMV2`,
+    # `ROOT\WMI`), ses VARIANT et l'authentification du proxy COM.
+    "Win32_System_Wmi",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Rpc",
 ] }
 
 # #2219 — témoin de `resolve_streaming_url` par sa porte publique, avant que

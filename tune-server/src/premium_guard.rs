@@ -80,8 +80,8 @@ async fn require_premium_dans_la_langue(
 }
 
 /// Le refus d'un **module payant**, décrit dans `tune_core::license` pour
-/// être partagé avec les greffons qui refusent eux-mêmes (« Concerts »,
-/// #2363). Ré-exporté ici : tous les appelants gardent leur chemin.
+/// être partagé avec les greffons qui refusent eux-mêmes (#2363).
+/// Ré-exporté ici : tous les appelants gardent leur chemin.
 pub use tune_core::license::ModuleRefusal;
 
 #[cfg(test)]

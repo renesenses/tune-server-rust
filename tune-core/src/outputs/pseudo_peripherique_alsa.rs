@@ -182,6 +182,10 @@ pub fn capacites_a_l_inventaire<T>(
 }
 
 #[cfg(test)]
+#[path = "pseudo_peripherique_alsa_7625_tests.rs"]
+mod pseudo_peripherique_alsa_7625_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
