@@ -767,6 +767,13 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// #8074 — vrai dès qu'un volume a été POSÉ sur cette sortie (`set_volume`
+    /// ou la sourdine : la graine de zone, un geste, une restauration). Une
+    /// sortie naît à pleine échelle (`user_volume` à l'unité) ; tant que ce
+    /// drapeau est faux, `play_url` ne laisse partir aucun échantillon à ce
+    /// gain-là : il pose d'abord le niveau de départ sans repère
+    /// ([`crate::audio::reglages_de_volume::gain_de_depart_sans_repere_local`]).
+    volume_pose: AtomicBool,
     /// #7632 — la convolution par RI est un droit Premium (`RoomCorrection`,
     /// décision du 04/11/2026). Faux par défaut : une sortie à qui personne
     /// n'a dit que le droit est accordé ne convolue pas. Posé par
@@ -1381,6 +1388,7 @@ impl LocalOutput {
             convolver: Arc::new(std::sync::Mutex::new(None)),
             convolution_autorisee: Arc::new(AtomicBool::new(false)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            volume_pose: AtomicBool::new(false),
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
@@ -1942,6 +1950,41 @@ impl LocalOutput {
     /// groupe garde son volume.
     pub fn volume_utilisateur(&self) -> Arc<AtomicU32> {
         self.user_volume.clone()
+    }
+
+    /// #8074 — vrai si un volume a déjà été posé sur cette sortie.
+    pub fn volume_est_pose(&self) -> bool {
+        self.volume_pose.load(Ordering::SeqCst)
+    }
+
+    /// #8074 — la garde du premier échantillon, appelée par `play_url` avant
+    /// d'ouvrir quoi que ce soit.
+    ///
+    /// Une `LocalOutput` naît à pleine échelle. Les naissances connues posent
+    /// la graine de la zone (`orchestrator::ensemencer_la_sortie_locale_neuve`),
+    /// mais une naissance oubliée — c'était le balayage à chaud des sorties
+    /// WASAPI quand ASIO est choisi — jouait le premier morceau à 100 % du
+    /// gain, quel que soit le curseur affiché. Ici, la sortie qui n'a jamais
+    /// reçu de volume part au niveau de départ sans repère (30 % du curseur
+    /// `db60`, −42 dB), jamais à l'unité.
+    ///
+    /// PURE et bit-perfect strict n'y passent pas : leur contrat est de ne
+    /// pas toucher au signal, et leur volume (100 %) est posé par la graine.
+    /// Rend vrai quand la garde a abaissé le gain.
+    pub(crate) async fn partir_bas_si_aucun_volume_pose(&self) -> bool {
+        if self.volume_pose.load(Ordering::SeqCst)
+            || self.pure_bypass.load(Ordering::Relaxed)
+            || self.strict_bitperfect.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        let gain = crate::audio::reglages_de_volume::gain_de_depart_sans_repere_local();
+        warn!(
+            device = %self.device_name,
+            gain,
+            "local_output_volume_jamais_pose_depart_bas"
+        );
+        OutputTarget::set_volume(self, gain).await.is_ok()
     }
 
     pub fn secondes_sorties(&self) -> Vec<crate::outputs::sortie_double::SecondeSortieDemandee> {
@@ -2963,6 +3006,10 @@ mod quantification_finale_7703;
 // #7949 — une sortie locale retirée du registre rend son fil et son périphérique.
 #[cfg(test)]
 mod retrait_du_registre_7949;
+
+// #8074 — le premier morceau après le démarrage ne part jamais à pleine échelle.
+#[cfg(test)]
+mod premier_play_au_gain_de_zone_8074;
 
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
@@ -6064,6 +6111,11 @@ impl OutputTarget for LocalOutput {
         let chrono_demarrage = std::time::Instant::now();
         self.stop().await.ok();
 
+        // #8074 — aucun échantillon ne sort au gain de naissance (pleine
+        // échelle) : une sortie à qui personne n'a encore posé de volume part
+        // BAS, avant l'ouverture du flux et du périphérique.
+        self.partir_bas_si_aucun_volume_pose().await;
+
         // Frontière de piste : le convolveur vit aussi longtemps que la sortie,
         // il ne doit pas verser la queue de la piste précédente dans celle-ci
         // (JP Robbe, revue de #2268). `play_url` est le seul point par lequel
@@ -8544,6 +8596,8 @@ impl OutputTarget for LocalOutput {
             self.muted.store(false, Ordering::SeqCst);
         }
         self.reborner_le_preampli_garde();
+        // #8074 — un volume est posé : `play_url` ne le remplacera plus.
+        self.volume_pose.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -8573,6 +8627,8 @@ impl OutputTarget for LocalOutput {
         }
         self.recompute_effective_volume();
         self.reborner_le_preampli_garde();
+        // #8074 — la sourdine est un niveau posé, comme `set_volume`.
+        self.volume_pose.store(true, Ordering::SeqCst);
         Ok(())
     }
 
