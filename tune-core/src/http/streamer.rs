@@ -275,6 +275,63 @@ pub struct ContexteDeConversion {
     pub precedente: String,
 }
 
+/// #8076 — la VOIE d'une session : ce qui part réellement sur le fil.
+///
+/// Le journal du .18 (07/11, The Wall vers l'Eversolo DMP-A8 en PURE) portait
+/// `gapless_next_set … streaming=true` puis `gapless_levels_after_advance …
+/// decision=decodage_du_fichier`. Lus ensemble, ils faisaient croire à un FLAC
+/// décodé puis ré-encodé, alors que la session servait les trames du fichier
+/// à l'octet près : `streaming` dit seulement qu'une session HTTP existe
+/// (`stream_id.is_some()`, vrai aussi pour un fichier), et `decision` parle du
+/// décodage qui anime les VU-mètres, pas du flux. La ligne `gapless_next_set`
+/// porte désormais la voie, dite par la résolution qui l'a choisie.
+pub mod voie {
+    /// Le fichier source, octet pour octet.
+    pub const FICHIER_TEL_QUEL: &str = "fichier_tel_quel";
+    /// #4800 — FLAC : en-tête réécrit (STREAMINFO recopié, métadonnées
+    /// retirées), trames du fichier recopiées à l'octet près.
+    pub const ENTETE_FLAC_NEUF: &str = "entete_flac_neuf_trames_intactes";
+    /// M4A/ALAC : `moov` déplacé ou pochette retirée, `mdat` intact.
+    pub const ENTETE_M4A_REECRIT: &str = "entete_m4a_reecrit_audio_intact";
+    /// #6059 — départ natif à une position : en-tête réécrit, trames intactes.
+    pub const DEPART_NATIF: &str = "depart_natif_trames_intactes";
+    /// #6221 — DSF fabriqué depuis un DST.
+    pub const DSF_RECONSTRUIT: &str = "dsf_reconstruit";
+    /// Fichier issu d'un décodage puis d'un ré-encodage (temporaire ou cache).
+    pub const FICHIER_CONVERTI: &str = "fichier_converti";
+    /// Session de fichier dont la résolution n'a rien noté.
+    pub const FICHIER: &str = "fichier";
+    /// Canal alimenté au fil de l'eau par un décodeur.
+    pub const FLUX_CONVERTI: &str = "flux_converti";
+    /// Octets de l'amont recopiés (service, radio non transcodée).
+    pub const MANDATAIRE: &str = "mandataire";
+    pub const RADIO: &str = "radio";
+    pub const SESSION_ABSENTE: &str = "session_absente";
+
+    /// La voie d'une session : la note de la résolution d'abord, sinon la
+    /// forme de la session.
+    #[must_use]
+    pub fn classer(
+        notee: Option<&'static str>,
+        fichier: bool,
+        mandataire: bool,
+        radio: bool,
+    ) -> &'static str {
+        if let Some(v) = notee {
+            return v;
+        }
+        if fichier {
+            FICHIER
+        } else if mandataire {
+            MANDATAIRE
+        } else if radio {
+            RADIO
+        } else {
+            FLUX_CONVERTI
+        }
+    }
+}
+
 pub struct StreamSession {
     pub id: String,
     pub info: StreamInfo,
@@ -297,6 +354,9 @@ pub struct StreamSession {
     /// virtuel au lieu des octets de `file_path` (qui reste le fichier source,
     /// pour l'existence et le journal).
     pub source_virtuelle: std::sync::Mutex<Option<Arc<dyn SourceVirtuelle>>>,
+    /// #8076 — ce que la session sert RÉELLEMENT, noté par qui la crée
+    /// (voir [`voie`]). Vide : la voie se déduit de la forme de la session.
+    pub voie_notee: std::sync::OnceLock<&'static str>,
     pub proxy_url: Mutex<Option<String>>,
     /// Re-resolver for the proxied CDN URL. Set for streaming proxy sessions
     /// whose signed URL can expire (Qobuz/Tidal). When a proxied upstream
@@ -678,6 +738,7 @@ impl StreamSession {
             file_path: Mutex::new(None),
             faststart: std::sync::Mutex::new(None),
             source_virtuelle: std::sync::Mutex::new(None),
+            voie_notee: std::sync::OnceLock::new(),
             proxy_url: Mutex::new(None),
             reresolve: Mutex::new(None),
             track_title: None,
@@ -1767,6 +1828,38 @@ impl AudioStreamer {
         if let Some(s) = self.sessions.lock().await.get(id) {
             *s.faststart.lock().unwrap_or_else(|e| e.into_inner()) = Some(map);
         }
+    }
+
+    /// #8076 — note ce que la session sert (une constante de [`voie`]). La
+    /// première note fait foi.
+    pub async fn noter_la_voie(&self, id: &str, voie_servie: &'static str) {
+        if let Some(s) = self.sessions.lock().await.get(id) {
+            let _ = s.voie_notee.set(voie_servie);
+        }
+    }
+
+    /// Une carte d'en-tête (faststart M4A, conteneur FLAC neuf, départ
+    /// natif) est-elle posée sur cette session ?
+    pub async fn a_une_carte_d_entete(&self, id: &str) -> bool {
+        self.sessions.lock().await.get(id).is_some_and(|s| {
+            s.faststart
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        })
+    }
+
+    /// #8076 — ce que la session sert au renderer, dit en clair pour le
+    /// journal : `fichier_tel_quel`, `entete_flac_neuf_trames_intactes`,
+    /// `fichier_converti`, `flux_converti`… (voir [`voie`]).
+    pub async fn voie_servie(&self, id: &str) -> &'static str {
+        let session = self.sessions.lock().await.get(id).cloned();
+        let Some(s) = session else {
+            return voie::SESSION_ABSENTE;
+        };
+        let fichier = s.file_path.lock().await.is_some();
+        let mandataire = s.proxy_url.lock().await.is_some();
+        voie::classer(s.voie_notee.get().copied(), fichier, mandataire, s.is_radio)
     }
 
     /// #6221 — attache un fichier virtuel à une session de fichier : la
