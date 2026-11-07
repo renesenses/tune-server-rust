@@ -77,8 +77,10 @@ async fn premier_usage_mesure_la_machine_puis_le_reglage_s_applique() {
     let state = etat();
     state.license.set_account_premium(true, None).await;
     let s = settings(&state);
-    s.set("plugin_upsampler_installed", "true").unwrap();
-    s.set("plugin_upsampler_enabled", "true").unwrap();
+    s.set(&format!("plugin_{}_installed", su::ID), "true")
+        .unwrap();
+    s.set(&format!("plugin_{}_enabled", su::ID), "true")
+        .unwrap();
     assert!(su::verdict_enregistre(&s).is_none());
     let r = ecrire_zone(
         State(state.clone()),
