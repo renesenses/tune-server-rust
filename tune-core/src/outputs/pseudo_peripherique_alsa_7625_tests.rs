@@ -19,9 +19,9 @@
 
 use super::capacites_a_l_inventaire;
 
-/// L'inventaire, dans l'ordre où `aplay -L` et cpal le rendent sur une
-/// machine où le greffon jack d'alsa-plugins est installé. Le couple
-/// `speexrate` → `jack` est celui du journal.
+/// Un inventaire modèle d'une machine où le greffon jack d'alsa-plugins est
+/// installé. Seul l'enchaînement `speexrate` → `jack` vient du journal du
+/// 05/11 ; le reste de la liste et son ordre sont plausibles, pas relevés.
 const INVENTAIRE_DU_RELEVE: &[(&str, bool)] = &[
     // (endpoint_id, sortie à sonder ?)
     ("alsa:default", true),
