@@ -38,6 +38,14 @@ pub fn decoder(genre: Genre, texte: &str) -> Option<i64> {
     reste.parse::<i64>().ok().filter(|id| *id > 0)
 }
 
+/// Décode un identifiant de n'importe quel genre (`getCoverArt` reçoit
+/// celui d'un album, d'un artiste ou d'une piste, #7945).
+pub fn decoder_un(texte: &str) -> Option<(Genre, i64)> {
+    [Genre::Artiste, Genre::Album, Genre::Piste]
+        .into_iter()
+        .find_map(|g| decoder(g, texte).map(|id| (g, id)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +72,14 @@ mod tests {
         assert_eq!(decoder(Genre::Piste, "tr-0"), None);
         assert_eq!(decoder(Genre::Piste, "tr-7x"), None);
         assert_eq!(decoder(Genre::Piste, "tr-99999999999999999999"), None);
+    }
+
+    #[test]
+    fn un_identifiant_de_genre_quelconque_garde_son_genre_7945() {
+        assert_eq!(decoder_un("al-3"), Some((Genre::Album, 3)));
+        assert_eq!(decoder_un("ar-3"), Some((Genre::Artiste, 3)));
+        assert_eq!(decoder_un("tr-3"), Some((Genre::Piste, 3)));
+        assert_eq!(decoder_un("3"), None);
+        assert_eq!(decoder_un("pl-3"), None);
     }
 }

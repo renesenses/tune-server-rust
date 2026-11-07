@@ -293,6 +293,11 @@ path = "tests/agent_tune_4626.rs"
 name = "subsonic_socle_7855"
 path = "tests/subsonic_socle_7855.rs"
 
+# #7945 — Subsonic étape 2 : navigation, recherche, stream en Range.
+[[test]]
+name = "subsonic_navigation_7945"
+path = "tests/subsonic_navigation_7945.rs"
+
 # #7335 — les écritures des dossiers de collections refusées par la base ne
 # répondent plus 201/200. Cible propre (pas un `mod` de `server_contracts`) :
 # `autotests = false` plus haut, sans cette entrée le fichier n'est jamais
@@ -1935,6 +1940,12 @@ path = "tests/requete_textuelle_6287.rs"
 [[test]]
 name = "services_remplacables_6336"
 path = "tests/services_remplacables_6336.rs"
+
+# #7447 — le bouton « Pair » d'Audio / Network Devices contre un faux démon
+# AirPlay 2. Binaire à lui seul, pour la même raison que le banc #6336.
+[[test]]
+name = "jumelage_airplay2_7447"
+path = "tests/jumelage_airplay2_7447.rs"
 
 # #4681 — « ce qui tourne » (`GET /system/background-tasks/running`) par le
 # vrai routeur. Binaire à lui seul : le témoin de lecture et l'avancement de

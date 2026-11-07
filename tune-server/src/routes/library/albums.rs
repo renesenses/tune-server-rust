@@ -1129,6 +1129,7 @@ pub(super) async fn album_bio(
     // `Accept-Language`, puis `fr`. Cf. `super::artists::langue_demandee`.
     let lang = super::artists::langue_demandee(q.lang.as_deref(), &headers);
     let lang = lang.as_str();
+    super::artists::memoriser_langue_pour_bio_sync(&state.backend, q.lang.as_deref(), &headers);
 
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy.
@@ -1227,6 +1228,15 @@ pub(super) async fn album_bio(
         }
         _ => None,
     };
+    // #8022 : le site n'a rien dans la langue demandée — la note Qobuz, pour
+    // un compte connecté et un album retrouvé par code-barres ou ISRC.
+    let du_service = if super::artists::site_dans_la_langue(reponse_du_site.as_ref(), lang) {
+        None
+    } else {
+        super::editorial_service::note_d_album(&state, &album)
+            .await
+            .map(|e| super::editorial_service::corps("album", &album.title, &e))
+    };
     let autre_langue = super::artists::bio_stockee_dans_une_autre_langue(
         "album",
         &album.title,
@@ -1236,11 +1246,12 @@ pub(super) async fn album_bio(
     );
     // Ordre : bio stockee dans la langue, cache, site dans la langue, puis une
     // autre langue connue avec `repli` (#7027). Cf. `choisir_apres_le_site`.
-    match super::artists::choisir_apres_le_site(
+    match super::artists::choisir_apres_le_site_et_le_service(
         "album",
         &album.title,
         lang,
         reponse_du_site,
+        du_service,
         autre_langue,
         album.bio.as_deref(),
         prov.as_ref(),

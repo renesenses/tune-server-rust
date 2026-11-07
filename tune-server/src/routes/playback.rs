@@ -20,6 +20,9 @@ mod seek_en_double_193_tests;
 mod session_locale_tests;
 #[path = "playback/session_message.rs"]
 mod session_message;
+#[cfg(test)]
+#[path = "playback/titre_indisponible_7778_tests.rs"]
+mod titre_indisponible_7778_tests;
 // #6332 — le débit d'une piste locale dans l'état de zone.
 #[cfg(test)]
 #[path = "playback/debit_lecture_en_cours_6332_tests.rs"]
@@ -295,6 +298,21 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
                 "error": code_cadence,
                 "code": code_cadence,
                 "message": motif,
+            })),
+        )
+            .into_response();
+    }
+    // #7778 (point 3) — le service refuse CETTE piste (`no url` de Qobuz :
+    // aucune adresse de flux pour ce compte, cette région). 422 au code
+    // stable, phrase traduite : sans cette branche, « no url » ne contenait
+    // aucun mot du fourre-tout ci-dessous et finissait en 500 brut.
+    if tune_core::poller::refus_propre_a_la_piste(&e) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "track_unavailable",
+                "code": "track_unavailable",
+                "message": crate::i18n::t(lang, "playback.track_unavailable"),
             })),
         )
             .into_response();
@@ -3820,13 +3838,37 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
-        .pause(zone_id, device_id.as_deref())
+        .pause_avec_issue(zone_id, device_id.as_deref())
         .await
     {
-        Ok(()) => Json(build_zone_json(&state, zone_id).await).into_response(),
+        Ok(tune_core::orchestrator::IssueDePause::EnPause) => {
+            Json(build_zone_json(&state, zone_id).await).into_response()
+        }
+        // #7894 — l'appareil ne jouait rien : la zone est arrêtée (reprise
+        // possible), et on le dit au lieu d'un 502.
+        Ok(tune_core::orchestrator::IssueDePause::RienNeJouait) => {
+            let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .map(|z| z.name)
+                .unwrap_or_else(|| format!("#{zone_id}"));
+            let mut corps = build_zone_json(&state, zone_id).await;
+            corps["code"] = json!("nothing_playing_on_device");
+            Json(crate::message_api::avec_message(
+                corps,
+                "api.playback.nothingPlayingOnDevice",
+                &[("zone", zone)],
+            ))
+            .into_response()
+        }
         Err(error) => echec_de_sortie_7823::reponse_d_echec_de_zone(&state, zone_id, error),
     }
 }
+
+#[cfg(test)]
+#[path = "playback/pause_sans_media_7894_tests.rs"]
+mod pause_sans_media_7894_tests;
 
 async fn resume(
     State(state): State<AppState>,
@@ -3868,7 +3910,14 @@ async fn resume(
             temp_file_path: None,
             sample_rate: None,
             bit_depth: None,
-            media_format: None,
+            // #7894 — un épisode garde le type retenu à son lancement : sous
+            // une adresse sans extension, l'orchestrateur ne saurait que
+            // l'annoncer MP3, et l'appareil retomberait en silence.
+            media_format: if np.source == "podcast" {
+                np.format.clone()
+            } else {
+                None
+            },
             track_number: None,
             disc_number: None,
             album_ref: None,
@@ -4230,9 +4279,16 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
         .update_queue_info(zone_id, next_pos, current.queue_length)
         .await;
     drop(decision);
+    // #7895 — un titre refusé par le service est enjambé, comme en fin de
+    // piste : la lecture passe au prochain titre jouable.
+    let suivant = tune_core::orchestrator::SensDuGeste::Suivant;
     let s = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = s.orchestrator.play_from_queue(zone_id, next_pos).await {
+        if let Err(e) = s
+            .orchestrator
+            .jouer_en_enjambant_les_refus(zone_id, next_pos, suivant)
+            .await
+        {
             tracing::warn!(zone_id, error = %e, "next_play_failed");
             // #3270 (point 2) — la réponse HTTP est déjà partie en disant
             // « playing » ; c'est ici, et seulement ici, que l'échec devient
@@ -4411,9 +4467,15 @@ async fn previous(
 
     let prev_pos = position_precedente(&current);
 
+    // #7895 — même règle que « Suivant », en reculant.
+    let precedent = tune_core::orchestrator::SensDuGeste::Precedent;
     let s = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = s.orchestrator.play_from_queue(zone_id, prev_pos).await {
+        if let Err(e) = s
+            .orchestrator
+            .jouer_en_enjambant_les_refus(zone_id, prev_pos, precedent)
+            .await
+        {
             tracing::warn!(zone_id, error = %e, "prev_play_failed");
             // #3270 (point 2) — jumeau du site de `next`, ligne pour ligne.
             s.orchestrator
@@ -9365,6 +9427,17 @@ mod demarrage_detache_annonce_3270 {
         format!("play_from{}queue(", "_")
     }
 
+    /// #7895 — `next` et `previous` démarrent par ce second nom, qui enjambe
+    /// les titres refusés ; il compte comme un démarrage.
+    fn aiguille_demarrage_enjambant() -> String {
+        format!("jouer_en{}les_refus(", "_enjambant_")
+    }
+
+    /// Le bloc démarre-t-il une piste, par l'un ou l'autre nom ?
+    fn demarre_une_piste(bloc: &str) -> bool {
+        bloc.contains(&aiguille_demarrage()) || bloc.contains(&aiguille_demarrage_enjambant())
+    }
+
     /// Le nom de l'annonce, idem.
     fn aiguille_annonce() -> String {
         format!("dire_piste{}demarree(", "_non_")
@@ -9373,7 +9446,6 @@ mod demarrage_detache_annonce_3270 {
     /// Les blocs `tokio::spawn` de `source` qui démarrent une piste sans
     /// annoncer l'échec, rendus par numéro de ligne (1-indexé).
     fn demarrages_detaches_muets(source: &str) -> Vec<usize> {
-        let demarrage = aiguille_demarrage();
         let annonce = aiguille_annonce();
         let spawn = format!("tokio::{}(async move {{", "spawn");
 
@@ -9390,7 +9462,7 @@ mod demarrage_detache_annonce_3270 {
                 fin -= 1;
             }
             let bloc = &source[debut..fin];
-            if bloc.contains(&demarrage) && !bloc.contains(&annonce) {
+            if demarre_une_piste(bloc) && !bloc.contains(&annonce) {
                 muets.push(source[..debut].lines().count());
             }
             curseur = debut + spawn.len();
@@ -9400,7 +9472,6 @@ mod demarrage_detache_annonce_3270 {
 
     /// Combien de démarrages détachés ce fichier porte, muets ou non.
     fn nombre_de_demarrages_detaches(source: &str) -> usize {
-        let demarrage = aiguille_demarrage();
         let spawn = format!("tokio::{}(async move {{", "spawn");
         let mut total = 0usize;
         let mut curseur = 0usize;
@@ -9410,7 +9481,7 @@ mod demarrage_detache_annonce_3270 {
             while fin > debut && !source.is_char_boundary(fin) {
                 fin -= 1;
             }
-            if source[debut..fin].contains(&demarrage) {
+            if demarre_une_piste(&source[debut..fin]) {
                 total += 1;
             }
             curseur = debut + spawn.len();

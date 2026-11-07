@@ -393,6 +393,7 @@ pub(super) async fn artist_bio(
     };
     let lang = langue_demandee(q.lang.as_deref(), &headers);
     let lang = lang.as_str();
+    memoriser_langue_pour_bio_sync(&state.backend, q.lang.as_deref(), &headers);
 
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy — this surfaces the sourced Wikipedia/Last.fm/Qobuz/
@@ -469,6 +470,15 @@ pub(super) async fn artist_bio(
         }
         _ => None,
     };
+    // #8022 : le site n'a rien dans la langue demandée — le texte Qobuz, pour
+    // un compte connecté et une correspondance sûre, avant tout repli.
+    let du_service = if site_dans_la_langue(reponse_du_site.as_ref(), lang) {
+        None
+    } else {
+        super::editorial_service::bio_d_artiste(&state, &artist)
+            .await
+            .map(|e| super::editorial_service::corps("artist", &artist.name, &e))
+    };
     let autre_langue = bio_stockee_dans_une_autre_langue(
         "artist",
         &artist.name,
@@ -476,11 +486,12 @@ pub(super) async fn artist_bio(
         prov.as_ref(),
         lang,
     );
-    match choisir_apres_le_site(
+    match choisir_apres_le_site_et_le_service(
         "artist",
         &artist.name,
         lang,
         reponse_du_site,
+        du_service,
         autre_langue,
         artist.bio.as_deref(),
         prov.as_ref(),
@@ -568,6 +579,41 @@ pub(super) fn reponse_du_proxy(cle: &str, nom: &str, data: &Value) -> Value {
 /// #3089 : les notes de version la partagent, une seule implémentation.
 pub(super) fn langue_demandee(param: Option<&str>, headers: &HeaderMap) -> String {
     crate::i18n::lang_from_request(param, headers)
+}
+
+/// La langue que la requête DONNE explicitement : `?lang=` non vide, ou un
+/// `Accept-Language` présent, lisible et nommant une langue servie. Le repli
+/// `i18n::FALLBACK` (aucune information) n'est PAS une langue donnée : il ne
+/// doit jamais alimenter `bio_langue`.
+pub(super) fn langue_explicite(param: Option<&str>, headers: &HeaderMap) -> Option<String> {
+    let param_donne = param.is_some_and(|p| !p.trim().is_empty());
+    let entete_donne = headers
+        .get(axum::http::header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| {
+            crate::i18n::langues_acceptees(s)
+                .iter()
+                .any(|b| crate::i18n::SUPPORTED.contains(&b.as_str()))
+        });
+    (param_donne || entete_donne).then(|| langue_demandee(param, headers))
+}
+
+/// Mémorise la dernière langue d'interface EXPLICITE vue pour
+/// `cloud::bio_sync` (réglage `bio_langue`), sans retarder la réponse :
+/// lecture + écriture éventuelle sur un thread bloquant, jamais attendues.
+pub(super) fn memoriser_langue_pour_bio_sync(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    param: Option<&str>,
+    headers: &HeaderMap,
+) {
+    let Some(lang) = langue_explicite(param, headers) else {
+        return;
+    };
+    let backend = backend.clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend);
+        tune_core::cloud::bio_sync::memoriser_langue_interface(&settings, &lang);
+    });
 }
 
 /// La langue d'une bio stockée convient-elle à celle qu'on demande ?
@@ -718,11 +764,48 @@ pub(super) fn bio_stockee_dans_une_autre_langue(
 /// une autre langue CONNUE, la stockée d'abord, puis celle du site, servie avec
 /// sa vraie langue (`bio_provenance.lang`) et `repli` ; (d) rien (voir
 /// [`bio_stockee_dans_une_autre_langue`] pour les bios sans langue).
+// Les routes passent par `choisir_apres_le_site_et_le_service` (#8022) ;
+// cette forme sans service reste pour les témoins de #7027.
+#[cfg(test)]
 pub(super) fn choisir_apres_le_site(
     cle: &str,
     nom: &str,
     demandee: &str,
     site: Option<Value>,
+    autre_langue_stockee: Option<Value>,
+    bio_stockee: Option<&str>,
+    prov: Option<&Value>,
+) -> Issue {
+    choisir_apres_le_site_et_le_service(
+        cle,
+        nom,
+        demandee,
+        site,
+        None,
+        autre_langue_stockee,
+        bio_stockee,
+        prov,
+    )
+}
+
+/// Le site a-t-il rendu une bio dans la langue demandée ? Sinon, le service
+/// de streaming connecté est interrogé (#8022).
+pub(super) fn site_dans_la_langue(site: Option<&Value>, demandee: &str) -> bool {
+    site.is_some_and(|out| a_une_bio(out) && reponse_dans_la_langue(out, demandee))
+}
+
+/// [`choisir_apres_le_site`], avec le texte éditorial d'un service de
+/// streaming connecté (#8022, `service`, déjà sous la forme d'un corps de
+/// réponse) inséré dans l'ordre : (a) site dans la langue ; (b) service dans
+/// la langue ; (c) bio stockée dans une autre langue connue ; (d) site dans
+/// une autre langue ; (e) service dans une autre langue ; (f) rien.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn choisir_apres_le_site_et_le_service(
+    cle: &str,
+    nom: &str,
+    demandee: &str,
+    site: Option<Value>,
+    service: Option<Value>,
     autre_langue_stockee: Option<Value>,
     bio_stockee: Option<&str>,
     prov: Option<&Value>,
@@ -733,10 +816,21 @@ pub(super) fn choisir_apres_le_site(
     {
         return Issue::DansLaLangue(out.clone());
     }
+    let service = service.filter(a_une_bio);
+    if let Some(out) = &service
+        && reponse_dans_la_langue(out, demandee)
+    {
+        return Issue::DansLaLangue(out.clone());
+    }
     if let Some(corps) = autre_langue_stockee {
         return Issue::Repli(corps);
     }
     if let Some(out) = site
+        && let Some(langue) = langue_annoncee(&out)
+    {
+        return Issue::Repli(avec_repli(out, demandee, &langue));
+    }
+    if let Some(out) = service
         && let Some(langue) = langue_annoncee(&out)
     {
         return Issue::Repli(avec_repli(out, demandee, &langue));

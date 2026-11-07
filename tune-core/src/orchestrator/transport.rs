@@ -15,6 +15,16 @@ enum ResoluOuFini {
     Fini(PlayResult),
 }
 
+/// #7894 — ce que la pause a trouvé sur l'appareil.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueDePause {
+    /// L'appareil a pris la pause : la zone est en pause.
+    EnPause,
+    /// L'appareil ne jouait rien (aucun média chargé) : la zone est arrêtée,
+    /// sa piste et sa position gardées pour la reprise.
+    RienNeJouait,
+}
+
 /// Le nom d'appareil à MONTRER dans un refus, ou `None` s'il n'y en a pas.
 ///
 /// Un identifiant de sortie locale porte le nom que l'utilisateur voit dans son
@@ -2271,7 +2281,7 @@ impl PlaybackOrchestrator {
                     );
                     // #6522, #6524 — ce que PURE contourne, lu dans les
                     // réglages : la chaîne posée plus bas sera vide en PURE.
-                    self.poser_ce_que_pure_contourne(zone_id, local_output);
+                    self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
                     // ReplayGain, applied by the output itself for a local DAC.
                     // A PURE zone is left strictly alone: applying a gain would
                     // multiply every sample and the path would no longer be
@@ -2915,6 +2925,21 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn pause(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
+        self.pause_avec_issue(zone_id, device_id).await.map(|_| ())
+    }
+
+    /// [`Self::pause`], en disant ce que la pause a trouvé.
+    ///
+    /// #7894 — un renderer DLNA en `NO_MEDIA_PRESENT` ne jouait rien : il
+    /// refuse la Pause (701), et ce refus remontait en 502. Il n'y a pourtant
+    /// rien à mettre en pause. La zone est alors ARRÊTÉE (piste et position
+    /// gardées : `resume` la rejoue), et l'appelant apprend que rien ne jouait
+    /// sur l'appareil.
+    pub async fn pause_avec_issue(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<IssueDePause> {
         // #5476 — rend caduc un Seek de reprise détaché encore en attente.
         self.playback.marquer_commande_de_transport(zone_id).await;
         if let Some(did) = device_id {
@@ -2926,14 +2951,30 @@ impl PlaybackOrchestrator {
                     format!("output {did} is not registered"),
                 )
             })?;
-            output.lock().await.checked_pause().await?;
+            let rien_ne_jouait = {
+                let sortie = output.lock().await;
+                sortie.checked_pause().await?;
+                sortie.take_nothing_playing_on_pause()
+            };
+            if rien_ne_jouait {
+                warn!(
+                    zone_id,
+                    device_id = did,
+                    "pause_rien_ne_joue_sur_l_appareil"
+                );
+                // L'appareil n'a pas de média : aucun `Stop` à lui envoyer.
+                if let Some(sid) = self.arreter_l_etat_de_la_zone(zone_id).await {
+                    self.streamer.remove_session(&sid).await;
+                }
+                return Ok(IssueDePause::RienNeJouait);
+            }
         }
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "paused")
             .ok();
         self.playback.pause(zone_id).await;
-        Ok(())
+        Ok(IssueDePause::EnPause)
     }
 
     /// Dire à l'auditeur que la session n'a pas survécu à la pause — sur les
@@ -2981,7 +3022,16 @@ impl PlaybackOrchestrator {
     ///
     /// Associée mais sans `self`, comme `message_session_perdue` est libre : le
     /// texte se vérifie sans monter d'orchestrateur ni de bus.
+    ///
+    /// #7778 (points 3 et 4) — un refus que le service oppose à CETTE piste
+    /// (`no url` de Qobuz) se dit en clair : l'auditeur lisait « no url ».
     pub fn message_piste_non_demarree(geste: &str, cause: &str) -> String {
+        if crate::poller::refus_propre_a_la_piste(cause) {
+            return format!(
+                "Impossible de lire la piste {geste} : {}",
+                crate::poller::MESSAGE_TITRE_INDISPONIBLE
+            );
+        }
         format!("Impossible de lire la piste {geste} : {cause}")
     }
 

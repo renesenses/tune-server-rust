@@ -108,9 +108,28 @@ pub(super) fn mime_d_une_piste_upnp(
         .unwrap_or(MIME_PAR_DEFAUT)
 }
 
+/// #7894 — le MIME à annoncer pour un épisode de podcast rejoué par
+/// l'orchestrateur (Lecture après une pause sans média, notamment).
+///
+/// Au lancement, `play_episode` choisit le type (flux, extension, hébergeur)
+/// et le range dans `NowPlaying.format` ; la reprise le repasse dans
+/// `PlayRequest.media_format`. Ce format passe AVANT l'extension : c'est le
+/// même choix qu'au lancement, qui donne déjà le dernier mot au type déclaré
+/// par le flux. Sans format, l'extension puis le défaut, comme avant.
+pub(super) fn mime_d_un_episode(url: &str, format_retenu: Option<&str>) -> &'static str {
+    format_retenu
+        .and_then(|f| match f.trim().to_ascii_lowercase().as_str() {
+            // Un AAC brut (ADTS) n'est pas du MP4 : ne pas le requalifier.
+            "aac" => Some("audio/aac"),
+            autre => mime_depuis_le_format(autre),
+        })
+        .or_else(|| mime_depuis_l_extension(url))
+        .unwrap_or(MIME_PAR_DEFAUT)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{mime_d_une_piste_upnp, mime_depuis_le_format};
+    use super::{mime_d_un_episode, mime_d_une_piste_upnp, mime_depuis_le_format};
     use crate::orchestrator::bandcamp::{guess_mime_from_url, mime_depuis_l_extension};
 
     /// L'URL exacte que le serveur média de Tune publie dans son `<res>`.
@@ -193,6 +212,30 @@ mod tests {
             "audio/mpeg",
             "un format qu'on ne sait pas traduire ne doit pas fabriquer un MIME"
         );
+    }
+
+    /// #7894 — l'épisode : le format retenu au lancement passe avant
+    /// l'extension, et un format muet laisse l'extension puis le défaut.
+    #[test]
+    fn le_format_retenu_d_un_episode_passe_avant_l_extension() {
+        assert_eq!(
+            mime_d_un_episode(RES_SANS_EXTENSION, Some("mp4")),
+            "audio/mp4"
+        );
+        assert_eq!(
+            mime_d_un_episode("http://h/ep.mp3", Some("mp4")),
+            "audio/mp4"
+        );
+        assert_eq!(
+            mime_d_un_episode(RES_SANS_EXTENSION, Some("aac")),
+            "audio/aac"
+        );
+        assert_eq!(mime_d_un_episode("http://h/ep.ogg", None), "audio/ogg");
+        assert_eq!(
+            mime_d_un_episode("http://h/ep.ogg", Some("ape")),
+            "audio/ogg"
+        );
+        assert_eq!(mime_d_un_episode(RES_SANS_EXTENSION, None), "audio/mpeg");
     }
 
     /// Le tableau de traduction, et ce qu'il refuse.
@@ -401,5 +444,27 @@ mod temoins_du_chemin {
             "le codec lu dans le res@protocolInfo doit primer sur un défaut \
              qui n'affirme rien"
         );
+    }
+
+    /// #7894 — un épisode rejoué par l'orchestrateur (Lecture après une pause
+    /// sans média) garde le type retenu au lancement : un M4A servi sous une
+    /// adresse sans extension ne repart pas annoncé MP3.
+    #[tokio::test]
+    async fn un_episode_rejoue_garde_le_type_retenu_au_lancement() {
+        let orch = orchestrateur_avec_une_piste_upnp(None, RES);
+        let mut req = demande_par_track_id(1);
+        req.track_id = None;
+        req.source = Some("podcast".into());
+        req.source_id = Some("http://h.example/media/42".into());
+        req.media_format = Some("mp4".into());
+        let resolved = orch.resolve_stream(&req).await.unwrap();
+        assert_eq!(
+            resolved.mime_type, "audio/mp4",
+            "la reprise doit annoncer le type retenu au lancement, pas audio/mpeg"
+        );
+        // Sans format retenu, rien ne change : l'extension, puis le défaut.
+        req.media_format = None;
+        let resolved = orch.resolve_stream(&req).await.unwrap();
+        assert_eq!(resolved.mime_type, "audio/mpeg");
     }
 }

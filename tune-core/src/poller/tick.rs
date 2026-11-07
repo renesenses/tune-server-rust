@@ -223,12 +223,17 @@ impl PositionPoller {
             // saved volume. Skip during the first 30s after startup to let
             // restore_zone_volumes take precedence over device defaults.
             let in_startup_grace = startup_at.elapsed().as_secs() < 30;
-            let in_volume_grace = self
-                .playback
-                .get_state(zone_id)
-                .await
+            let etat_de_zone = self.playback.get_state(zone_id).await;
+            let in_volume_grace = etat_de_zone
                 .last_volume_set_at
                 .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+            // #8031 — pendant la sourdine et juste après, le relevé n'est pas
+            // un geste de l'auditeur : ni adopté, ni pris pour repère.
+            let sourdine = sourdine_8031::sourdine_en_jeu(
+                zone.muted || etat_de_zone.muted,
+                status.muted,
+                etat_de_zone.last_mute_set_at,
+            );
             // #5662 — le seuil < 0,999 ci-dessous écarte un renderer à 100 % :
             // le dire au journal, une fois par épisode.
             if !zone.fixed_volume
@@ -247,6 +252,7 @@ impl PositionPoller {
             if !zone.fixed_volume
                 && !in_startup_grace
                 && !in_volume_grace
+                && !sourdine
                 && status.volume > 0.001
                 && status.volume < 0.999
                 && status.state == TransportState::Playing
@@ -1411,9 +1417,17 @@ impl PositionPoller {
                         && !in_vol_grace
                         && self.volume_plafond_reimpose(zone_id, status.volume).await;
                     // #6739 — jamais à la hausse, et trim retiré.
+                    // #8031 — la radio n'écarte pas le 0 : une sourdine relue
+                    // à 0 sur l'appareil devenait la consigne de la zone.
+                    let sourdine = sourdine_8031::sourdine_en_jeu(
+                        zone_state.muted,
+                        status.muted,
+                        zone_state.last_mute_set_at,
+                    );
                     if !zone_fixed_volume
                         && !in_vol_grace
                         && !plafond_tenu
+                        && !sourdine
                         && status.volume < 0.999
                         && let Some(adopte) = self.releve_adoptable(
                             zone_id,
@@ -1439,7 +1453,9 @@ impl PositionPoller {
                             adopte,
                         );
                     }
-                    ps.last_device_volume = Some(status.volume);
+                    if !sourdine {
+                        ps.last_device_volume = Some(status.volume);
+                    }
                 }
 
                 // Le titre diffuse par une webradio NE DEPEND PAS de l'etat du
@@ -1795,9 +1811,16 @@ impl PositionPoller {
             let plafond_tenu = !zone_fixed_volume
                 && !in_vol_grace2
                 && self.volume_plafond_reimpose(zone_id, status.volume).await;
+            // #8031 — comme aux deux autres sites.
+            let sourdine = sourdine_8031::sourdine_en_jeu(
+                zone_state.muted,
+                status.muted,
+                zone_state.last_mute_set_at,
+            );
             if !zone_fixed_volume
                 && !in_vol_grace2
                 && !plafond_tenu
+                && !sourdine
                 && status.volume > 0.001
                 && status.volume < 0.999
                 // #6739 — jamais à la hausse, et trim retiré.
@@ -1831,7 +1854,11 @@ impl PositionPoller {
             // This normal-playing path was never migrated to the #358 predicate
             // and still used level-triggered adoption → auto-reset to 25%
             // (Philippe).
-            ps.last_device_volume = Some(status.volume);
+            // #8031 — pas pendant la sourdine : le repère reste le volume
+            // d'avant, et l'appareil qui le retrouve à la levée n'a pas « bougé ».
+            if !sourdine {
+                ps.last_device_volume = Some(status.volume);
+            }
 
             // --- Persist position to DB periodically ---
             ps.ticks_since_db_save += 1;
@@ -2378,7 +2405,14 @@ impl PositionPoller {
                         && ps.peak_position_ms < 5_000
                         // #7097 — une piste de 3,7 s a pu finir sans jamais
                         // atteindre 5 s : examiner alors sa fin normale.
-                        && !played_enough;
+                        && !played_enough
+                        // #7902 — un DLNA rend sa position à la seconde : un
+                        // titre de 4 s, vu à 3 s, reste sous les 80 %. Passé
+                        // la moitié, il a joué : examiner sa fin.
+                        && !decisions::titre_court_deja_avance(
+                            track_duration_ms,
+                            ps.peak_position_ms,
+                        );
                     // A DSD track on a DLNA renderer whose peak reached the end.
                     // Gapless is intentionally not armed for a DSD next on DLNA
                     // (prepare_gapless / #402) and DLNA never reports

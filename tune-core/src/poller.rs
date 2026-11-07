@@ -1111,6 +1111,7 @@ mod fin_navigateur_6932;
 /// #4382 — un `Next` acquitté que le transport déclare ignoré.
 mod next_ignore_4382;
 pub(crate) mod refus_de_piste;
+pub use refus_de_piste::{MESSAGE_TITRE_INDISPONIBLE, refus_propre_a_la_piste};
 /// #4382 — sondage accéléré dans la dernière seconde (renderer qui n'enchaîne pas seul).
 mod sondage_accelere_4382;
 
@@ -1153,6 +1154,11 @@ mod releve_ne_monte_pas_6739_tests;
 /// #6721 — le relevé de l'appareil devient le repère de la garde de hausse.
 #[cfg(test)]
 mod repere_de_hausse_6721_tests;
+/// #8031 — un relevé pendant la sourdine n'est ni adopté ni pris pour repère.
+mod sourdine_8031;
+/// #8031 — ses témoins, sur le vrai sondeur et le vrai orchestrateur.
+#[cfg(test)]
+mod sourdine_8031_tests;
 /// #5662 — un renderer à 100 % ignoré par l'adoption est signalé au journal.
 mod volume_100_ignore_5662;
 /// #6008 — l'adoption du volume du renderer est dite au journal.
@@ -1478,6 +1484,11 @@ pub(crate) mod suivante_bannie_5143;
 /// anti-double-appui de `play` ; un double appui de contrôleur reste coalescé.
 #[cfg(test)]
 mod repeter_piste_courte_6735;
+
+/// #7902 — une file de WAV de 4 s aux formats changeants va au bout sur un
+/// renderer DLNA qui rend sa position à la seconde.
+#[cfg(test)]
+mod file_courte_dlna_formats_7902;
 
 /// #5395 — la radio artiste se recharge par la vraie fin de file, et une file
 /// qui s'achève hors radio rend la main au réglage d'auto-lecture de la zone.
