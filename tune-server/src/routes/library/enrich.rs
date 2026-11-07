@@ -49,6 +49,15 @@ pub(super) struct EnrichAllBody {
 /// enrichit un répertoire.
 const COL_FILE_PATH: usize = 4;
 
+/// Index de la colonne « nouvelle tentative » (1) ou « jamais tentée » (0)
+/// dans la sélection de [`enrich_all_library`] (#7983).
+const COL_REESSAI: usize = 13;
+
+/// #7983 — la ligne de la sélection est-elle une nouvelle tentative ?
+fn est_un_reessai(row: &[tune_core::db::backend::SqlValue]) -> bool {
+    row.get(COL_REESSAI).and_then(|v| v.as_i64()) == Some(1)
+}
+
 /// La sélection des candidats de `POST /library/enrich-all`.
 ///
 /// Sortie de la fonction pour être EXÉCUTABLE par un témoin : c'est une
@@ -71,12 +80,28 @@ const COL_FILE_PATH: usize = 4;
 ///
 /// #7538 — une piste sous un dossier exclu de l'enrichissement n'est jamais
 /// candidate (clause vide si rien n'est réglé).
+///
+/// 🔴 #7983 — une piste déjà tentée sur ce fichier n'est plus candidate
+/// (`db::enrich_tentatives`), sauf un échec temporaire dont le délai est
+/// écoulé à `maintenant`. Sans ce filtre, toute piste à laquelle MusicBrainz
+/// ne donnait pas TOUS les champs revenait à chaque passe : au redémarrage, la
+/// sélection repartait des premiers identifiants et le reste à faire
+/// remontait. `ORDER BY t.id` : l'ordre ne dépend plus du plan du moteur.
+///
+/// 🔴 #7983 — les nouvelles tentatives (échecs temporaires au délai écoulé)
+/// passent APRÈS les pistes jamais tentées, et la colonne [`COL_REESSAI`] les
+/// désigne pour qu'elles ne comptent pas dans le total : triées par le seul
+/// identifiant, elles revenaient en tête après un redémarrage et faisaient
+/// remonter le reste à faire.
 fn sql_candidats_enrichissement(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    maintenant: i64,
 ) -> String {
     let chemin = tune_core::db::track_repo::sql::CHEMIN_OUVRABLE;
     let a_un_fichier = tune_core::db::track_repo::sql::A_UN_FICHIER;
     let exclus = tune_core::taches_de_fond::perimetre::clause_hors_enrichissement(backend, chemin);
+    let pas_deja_tentee = tune_core::db::enrich_tentatives::clause_pas_deja_tentee(maintenant);
+    let reessai = tune_core::db::enrich_tentatives::SQL_EST_UN_REESSAI;
     format!(
         // artist_name / album_title are NOT columns of `tracks` — they are
         // only derived via joins (artists.name / albums.title). Selecting
@@ -92,7 +117,7 @@ fn sql_candidats_enrichissement(
         // serait jamais parvenue (#1890).
         "SELECT t.id, t.title, a.name, al.title, {chemin}, \
          t.musicbrainz_recording_id, t.genre, t.year, t.label, t.composer, t.album_id, \
-         t.artist_id, a.musicbrainz_id \
+         t.artist_id, a.musicbrainz_id, {reessai} AS reessai \
          FROM tracks t \
          LEFT JOIN artists a ON a.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id \
@@ -103,8 +128,83 @@ fn sql_candidats_enrichissement(
            OR t.label IS NULL OR t.label = '' \
            OR t.composer IS NULL OR t.composer = '' \
            OR (t.artist_id IS NOT NULL AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')) \
-         ){exclus}"
+         ) AND {pas_deja_tentee}{exclus} \
+         ORDER BY reessai, t.id"
     )
+}
+
+/// #7983 — où en est une piste quand la passe la quitte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Etape {
+    /// MusicBrainz a répondu, sans enregistrement (ou rien à chercher).
+    RechercheIntrouvable,
+    /// La recherche a échoué : réseau, 503, 429…
+    RechercheEnEchec,
+    /// L'écriture a réussi ; `appel_en_echec` si une requête de détails ou
+    /// d'oeuvre a échoué en route (seul le MBID a pu être écrit).
+    Ecrite { appel_en_echec: bool },
+    /// L'écriture en base a échoué (contrainte, donnée invalide, base
+    /// occupée) : échec temporaire, retenté après un délai.
+    EcritureEnEchec,
+}
+
+/// #7983 — ce que la passe note pour une piste, d'après [`Etape`].
+///
+/// 🔴 Une requête de détails en échec (`mb_details_failed`, souvent un 503)
+/// n'est PAS un succès : la piste était comptée « enrichie » alors qu'elle
+/// n'avait reçu que son MBID, puis revenait à la passe suivante. Elle est
+/// maintenant un échec temporaire, retenté après un délai.
+fn issue_de_la_tentative(etape: Etape) -> Option<tune_core::db::enrich_tentatives::Issue> {
+    use tune_core::db::enrich_tentatives::Issue;
+    match etape {
+        Etape::RechercheIntrouvable => Some(Issue::Introuvable),
+        Etape::RechercheEnEchec => Some(Issue::EchecTemporaire),
+        Etape::Ecrite {
+            appel_en_echec: true,
+        } => Some(Issue::EchecTemporaire),
+        Etape::Ecrite {
+            appel_en_echec: false,
+        } => Some(Issue::Fait),
+        // Notée elle aussi : sans délai, une écriture qui échoue toujours
+        // était retentée à chaque passe.
+        Etape::EcritureEnEchec => Some(Issue::EchecTemporaire),
+    }
+}
+
+/// #7983 — le relevé `enrich_all_status`. `enriched` et `total` gardent leur
+/// sens (contrat du client web, #2870) ; s'y ajoutent `examined` (pistes
+/// quittées par la passe, quelle qu'en soit l'issue), `remaining`
+/// (`total - examined` : ne remonte jamais pendant la passe),
+/// `retry_pending` (échecs temporaires qui attendent leur délai : ni restants,
+/// ni abandonnés) et `retry_due` (nouvelles tentatives arrivées à échéance,
+/// faites après les restantes).
+///
+/// 🔴 `total`, `enriched`, `examined` et `remaining` ne portent que sur les
+/// pistes jamais tentées : une nouvelle tentative n'est pas une restante.
+/// Ainsi `enriched` ne dépasse jamais `total`, et le reste d'une passe
+/// relancée après un redémarrage ne dépasse pas celui d'avant.
+#[allow(clippy::too_many_arguments)]
+fn releve_enrichissement(
+    status: &str,
+    task_id: &str,
+    enriched: i32,
+    errors: i32,
+    total: usize,
+    examined: usize,
+    retry_pending: i64,
+    retry_due: usize,
+) -> Value {
+    json!({
+        "status": status,
+        "task_id": task_id,
+        "enriched": enriched,
+        "errors": errors,
+        "total": total,
+        "examined": examined,
+        "remaining": total.saturating_sub(examined),
+        "retry_pending": retry_pending,
+        "retry_due": retry_due,
+    })
 }
 
 /// Restreint les pistes candidates à celles qui vivent sous le répertoire
@@ -214,10 +314,24 @@ pub(crate) async fn demarrer_enrich_all(
     // si cette sélection échoue. Aucun appel MusicBrainz n'a lieu ici.
     let backend_selection = state.backend.clone();
     let selection = tokio::task::spawn_blocking(move || {
-        backend_selection.query_many(&sql_candidats_enrichissement(&backend_selection), &[])
+        let maintenant = chrono::Utc::now().timestamp();
+        // #7983 — la trace d'une piste supprimée ne passe pas à celle qui
+        // reprendrait son identifiant.
+        if let Err(e) = tune_core::db::enrich_tentatives::purger_orphelines(&backend_selection) {
+            debug!(error = %e, "enrich_tentatives_purge_failed");
+        }
+        let rows = backend_selection.query_many(
+            &sql_candidats_enrichissement(&backend_selection, maintenant),
+            &[],
+        )?;
+        // #7983 — une base sans la table de trace reste lisible : zéro.
+        let a_retenter =
+            tune_core::db::enrich_tentatives::compter_a_retenter(&backend_selection, maintenant)
+                .unwrap_or(0);
+        Ok::<_, String>((rows, a_retenter))
     })
     .await;
-    let track_rows = match selection {
+    let (track_rows, a_retenter_a_l_ouverture) = match selection {
         Ok(Ok(rows)) => rows,
         erreur => {
             warn!(error = ?erreur, "enrich_all_selection_failed");
@@ -288,7 +402,10 @@ pub(crate) async fn demarrer_enrich_all(
         // seules pistes du répertoire, et la boucle ne part sur MusicBrainz
         // pour aucune autre (#1660).
         let track_rows = restreindre_a_la_portee(track_rows, scope_tache.as_ref());
-        let total = track_rows.len();
+        // #7983 — les nouvelles tentatives arrivées à échéance sont en queue de
+        // sélection et hors du total : ce ne sont pas des restantes.
+        let reessais = track_rows.iter().filter(|r| est_un_reessai(r)).count();
+        let total = track_rows.len() - reessais;
         // #3810 — le compte de candidats, INCONDITIONNELLEMENT.
         //
         // Il n'était journalisé que sur une passe limitée à un répertoire : la
@@ -300,6 +417,8 @@ pub(crate) async fn demarrer_enrich_all(
         info!(
             task_id = %task_id_clone,
             candidats = total,
+            reessais,
+            a_retenter = a_retenter_a_l_ouverture,
             portee = ?scope_tache.as_ref().map(|s| s.dir.clone()),
             "enrich_all_candidats"
         );
@@ -314,13 +433,16 @@ pub(crate) async fn demarrer_enrich_all(
             settings
                 .set(
                     "enrich_all_status",
-                    &json!({
-                        "status": "running",
-                        "task_id": task_id_clone,
-                        "enriched": 0,
-                        "errors": 0,
-                        "total": total,
-                    })
+                    &releve_enrichissement(
+                        "running",
+                        &task_id_clone,
+                        0,
+                        0,
+                        total,
+                        0,
+                        a_retenter_a_l_ouverture,
+                        reessais,
+                    )
                     .to_string(),
                 )
                 .ok();
@@ -358,6 +480,67 @@ pub(crate) async fn demarrer_enrich_all(
 
         let mut enriched = 0i32;
         let mut errors = 0i32;
+        // #7983 — pistes quittées par la passe, et échecs à retenter.
+        let mut examined = 0usize;
+        let mut retry_pending = a_retenter_a_l_ouverture;
+        // Nouvelles tentatives quittées par la passe, et celles qui ont abouti.
+        let mut reessais_vus = 0usize;
+        let mut reessais_aboutis = 0usize;
+        // Note l'issue d'une piste, hors des fils de l'exécuteur (#4681).
+        let noter_l_issue = |track_id: i64, etape: Etape| {
+            let backend = backend2.clone();
+            async move {
+                let issue = issue_de_la_tentative(etape)?;
+                let ecrit = tune_core::taches_de_fond::priorite::hors_du_fil_async(
+                    tune_core::taches_de_fond::Tache::Enrichissement.id(),
+                    move || {
+                        tune_core::db::enrich_tentatives::noter(
+                            &backend,
+                            track_id,
+                            issue,
+                            chrono::Utc::now().timestamp(),
+                        )
+                    },
+                )
+                .await;
+                if let Some(Err(e)) = &ecrit {
+                    warn!(track_id, error = %e, "enrich_tentative_non_notee");
+                }
+                Some(issue)
+            }
+        };
+        // Relevé périodique, hors des fils de l'exécuteur (#4681). Le compte
+        // des échecs à retenter est relu de la base : un délai expiré en cours
+        // de passe en sort. Rend ce compte relu.
+        let releve_periodique =
+            |enriched: i32, errors: i32, examined: usize, retry: i64, retry_due: usize| {
+                let backend = backend2.clone();
+                let task_id = task_id_clone.clone();
+                async move {
+                    tune_core::taches_de_fond::priorite::hors_du_fil_async(
+                        tune_core::taches_de_fond::Tache::Enrichissement.id(),
+                        move || {
+                            let retry = tune_core::db::enrich_tentatives::compter_a_retenter(
+                                &backend,
+                                chrono::Utc::now().timestamp(),
+                            )
+                            .unwrap_or(retry);
+                            tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
+                                .set(
+                                    "enrich_all_status",
+                                    &releve_enrichissement(
+                                        "running", &task_id, enriched, errors, total, examined,
+                                        retry, retry_due,
+                                    )
+                                    .to_string(),
+                                )
+                                .ok();
+                            retry
+                        },
+                    )
+                    .await
+                }
+            };
         // Artists whose MBID we've already backfilled this run, so we don't
         // re-fetch recording details once per track for the same artist.
         let mut artists_mbid_done: std::collections::HashSet<i64> =
@@ -386,152 +569,168 @@ pub(crate) async fn demarrer_enrich_all(
             annonce(&mut cadence, enriched);
 
             let track_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
-            let title = row.get(1).and_then(|v| v.as_string()).unwrap_or_default();
-            let artist = row.get(2).and_then(|v| v.as_string());
-            let album = row.get(3).and_then(|v| v.as_string());
-            let _file_path = row.get(4).and_then(|v| v.as_string());
-            let existing_mb_id = row
-                .get(5)
-                .and_then(|v| v.as_string())
-                .filter(|s| !s.is_empty());
-            let existing_genre = row
-                .get(6)
-                .and_then(|v| v.as_string())
-                .filter(|s| !s.is_empty());
-            let existing_year = row.get(7).and_then(|v| v.as_i64());
-            let existing_label = row
-                .get(8)
-                .and_then(|v| v.as_string())
-                .filter(|s| !s.is_empty());
-            let existing_composer = row
-                .get(9)
-                .and_then(|v| v.as_string())
-                .filter(|s| !s.is_empty());
-            let artist_id = row.get(11).and_then(|v| v.as_i64());
-            let existing_artist_mbid = row
-                .get(12)
-                .and_then(|v| v.as_string())
-                .filter(|s| !s.is_empty());
-            // The artist row lacks a MusicBrainz ID and we haven't filled it yet
-            // this run — fetching it unlocks Wikipedia/Wikidata artist bios.
-            let artist_needs_mbid = match artist_id {
-                Some(aid) => existing_artist_mbid.is_none() && !artists_mbid_done.contains(&aid),
-                None => false,
-            };
+            let reessai = est_un_reessai(row);
+            // #7983 — le corps rend l'étape où la passe quitte la piste ;
+            // l'issue est notée en un seul point, juste après.
+            let etape: Option<Etape> = 'piste: {
+                let title = row.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+                let artist = row.get(2).and_then(|v| v.as_string());
+                let album = row.get(3).and_then(|v| v.as_string());
+                let _file_path = row.get(4).and_then(|v| v.as_string());
+                let existing_mb_id = row
+                    .get(5)
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.is_empty());
+                let existing_genre = row
+                    .get(6)
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.is_empty());
+                let existing_year = row.get(7).and_then(|v| v.as_i64());
+                let existing_label = row
+                    .get(8)
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.is_empty());
+                let existing_composer = row
+                    .get(9)
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.is_empty());
+                let artist_id = row.get(11).and_then(|v| v.as_i64());
+                let existing_artist_mbid = row
+                    .get(12)
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.is_empty());
+                // The artist row lacks a MusicBrainz ID and we haven't filled it yet
+                // this run — fetching it unlocks Wikipedia/Wikidata artist bios.
+                let artist_needs_mbid = match artist_id {
+                    Some(aid) => {
+                        existing_artist_mbid.is_none() && !artists_mbid_done.contains(&aid)
+                    }
+                    None => false,
+                };
 
-            // If track already has all fields (and the artist MBID too), skip.
-            // Le compositeur compte parmi ces champs : sans lui, une piste deja
-            // pourvue en genre/annee/label etait sautee AVANT toute requete, et
-            // une bibliotheque soigneusement taguee — le cas de la musique
-            // classique, ou le compositeur importe le plus — n'avait aucune
-            // chance d'en obtenir un (#1890).
-            if existing_mb_id.is_some()
-                && existing_genre.is_some()
-                && existing_year.is_some()
-                && existing_label.is_some()
-                && existing_composer.is_some()
-                && !artist_needs_mbid
-            {
-                continue;
-            }
-
-            let mb_id = if let Some(ref id) = existing_mb_id {
-                // Already have MB ID, just need to fetch details
-                id.clone()
-            } else {
-                // Need to look up MB ID first
-                if title.is_empty() {
-                    continue;
-                }
-                match mb_lookup_recording(&mb_client, &title, artist.as_deref(), album.as_deref())
-                    .await
+                // If track already has all fields (and the artist MBID too), skip.
+                // Le compositeur compte parmi ces champs : sans lui, une piste deja
+                // pourvue en genre/annee/label etait sautee AVANT toute requete, et
+                // une bibliotheque soigneusement taguee — le cas de la musique
+                // classique, ou le compositeur importe le plus — n'avait aucune
+                // chance d'en obtenir un (#1890).
+                if existing_mb_id.is_some()
+                    && existing_genre.is_some()
+                    && existing_year.is_some()
+                    && existing_label.is_some()
+                    && existing_composer.is_some()
+                    && !artist_needs_mbid
                 {
-                    Ok(Some(id)) => {
-                        tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
-                        id
-                    }
-                    Ok(None) => {
-                        tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!(track_id, error = %e, "mb_lookup_failed");
-                        errors += 1;
-                        tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
-                        continue;
-                    }
+                    break 'piste None;
                 }
-            };
 
-            // Fetch recording details if we're missing genre/year/label
-            let needs_details = existing_genre.is_none()
-                || existing_year.is_none()
-                || existing_label.is_none()
-                || existing_composer.is_none()
-                || artist_needs_mbid;
-
-            let details = if needs_details {
-                match mb_fetch_recording_details(&mb_client, &mb_id).await {
-                    Ok(d) => {
-                        tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
-                        d
-                    }
-                    Err(e) => {
-                        warn!(track_id, mb_id = %mb_id, error = %e, "mb_details_failed");
-                        errors += 1;
-                        tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
-                        RecordingDetails::default()
-                    }
-                }
-            } else {
-                RecordingDetails::default()
-            };
-
-            // Le compositeur coute un second aller-retour sur l'oeuvre. A
-            // MB_RATE_LIMIT_MS par requete, l'ajouter partout allongerait d'un
-            // tiers une passe qui se compte en heures — pour un champ que le
-            // COALESCE ci-dessous ignorerait si la piste en a deja un. On ne le
-            // paie donc que pour les pistes qui en manquent (#1890).
-            let composer_val: Option<String> =
-                match (existing_composer.as_deref(), details.work_id.as_deref()) {
-                    (None, Some(work_id)) => {
-                        let c = match mb_fetch_work_composer(&mb_client, work_id).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!(track_id, work_id, error = %e, "mb_work_composer_failed");
-                                errors += 1;
-                                None
-                            }
-                        };
-                        tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
-                        c
-                    }
-                    _ => details.composer.clone(),
-                };
-
-            // Toute l'ecriture en base tient dans `write_track_enrichment`
-            // (tune-core) : piste, album, et la remontee vers `albums.genre` /
-            // `albums.year` que les cartes de l'ecran Metadonnees comptent.
-            // Elle est sortie d'ici pour etre testable — la boucle qui l'entoure
-            // fait des allers-retours reseau, la partie base non (#2259).
-            //
-            // #4681 — et elle part HORS des fils de l'exécuteur, avec le report
-            // du MBID d'artiste : ces fils servent aussi la lecture, et une
-            // écriture SQLite qui y attend le verrou les tient.
-            let ecriture = {
-                let backend_ecriture = backend2.clone();
-                let album_id = row.get(10).and_then(|v| v.as_i64());
-                let mb_id = mb_id.clone();
-                // #6463 — l'enregistrement vient des balises (MBID de piste
-                // déjà là) : ses crédits valent un pressage identifié. Trouvé
-                // par une recherche titre + artiste : c'est le NOM qui l'a
-                // désigné, et la vérification de fond pourra le revoir.
-                let provenance_artiste = if existing_mb_id.is_some() {
-                    tune_core::db::artist_repo::ProvenanceMbid::Pressage
+                let mb_id = if let Some(ref id) = existing_mb_id {
+                    // Already have MB ID, just need to fetch details
+                    id.clone()
                 } else {
-                    tune_core::db::artist_repo::ProvenanceMbid::Nom
+                    // Need to look up MB ID first
+                    if title.is_empty() {
+                        break 'piste Some(Etape::RechercheIntrouvable);
+                    }
+                    match mb_lookup_recording(
+                        &mb_client,
+                        &title,
+                        artist.as_deref(),
+                        album.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(Some(id)) => {
+                            tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
+                            id
+                        }
+                        Ok(None) => {
+                            tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
+                            break 'piste Some(Etape::RechercheIntrouvable);
+                        }
+                        Err(e) => {
+                            warn!(track_id, error = %e, "mb_lookup_failed");
+                            errors += 1;
+                            tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
+                            break 'piste Some(Etape::RechercheEnEchec);
+                        }
+                    }
                 };
-                tune_core::taches_de_fond::priorite::hors_du_fil_async(
+
+                // Fetch recording details if we're missing genre/year/label
+                let needs_details = existing_genre.is_none()
+                    || existing_year.is_none()
+                    || existing_label.is_none()
+                    || existing_composer.is_none()
+                    || artist_needs_mbid;
+
+                // #7983 — une requête de détails ou d'oeuvre en échec : la piste
+                // n'est pas « faite », elle sera retentée après un délai.
+                let mut appel_en_echec = false;
+                let details = if needs_details {
+                    match mb_fetch_recording_details(&mb_client, &mb_id).await {
+                        Ok(d) => {
+                            tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
+                            d
+                        }
+                        Err(e) => {
+                            warn!(track_id, mb_id = %mb_id, error = %e, "mb_details_failed");
+                            errors += 1;
+                            appel_en_echec = true;
+                            tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
+                            RecordingDetails::default()
+                        }
+                    }
+                } else {
+                    RecordingDetails::default()
+                };
+
+                // Le compositeur coute un second aller-retour sur l'oeuvre. A
+                // MB_RATE_LIMIT_MS par requete, l'ajouter partout allongerait d'un
+                // tiers une passe qui se compte en heures — pour un champ que le
+                // COALESCE ci-dessous ignorerait si la piste en a deja un. On ne le
+                // paie donc que pour les pistes qui en manquent (#1890).
+                let composer_val: Option<String> =
+                    match (existing_composer.as_deref(), details.work_id.as_deref()) {
+                        (None, Some(work_id)) => {
+                            let c = match mb_fetch_work_composer(&mb_client, work_id).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    warn!(track_id, work_id, error = %e, "mb_work_composer_failed");
+                                    errors += 1;
+                                    appel_en_echec = true;
+                                    None
+                                }
+                            };
+                            tokio::time::sleep(Duration::from_millis(MB_RATE_LIMIT_MS)).await;
+                            c
+                        }
+                        _ => details.composer.clone(),
+                    };
+
+                // Toute l'ecriture en base tient dans `write_track_enrichment`
+                // (tune-core) : piste, album, et la remontee vers `albums.genre` /
+                // `albums.year` que les cartes de l'ecran Metadonnees comptent.
+                // Elle est sortie d'ici pour etre testable — la boucle qui l'entoure
+                // fait des allers-retours reseau, la partie base non (#2259).
+                //
+                // #4681 — et elle part HORS des fils de l'exécuteur, avec le report
+                // du MBID d'artiste : ces fils servent aussi la lecture, et une
+                // écriture SQLite qui y attend le verrou les tient.
+                let ecriture = {
+                    let backend_ecriture = backend2.clone();
+                    let album_id = row.get(10).and_then(|v| v.as_i64());
+                    let mb_id = mb_id.clone();
+                    // #6463 — l'enregistrement vient des balises (MBID de piste
+                    // déjà là) : ses crédits valent un pressage identifié. Trouvé
+                    // par une recherche titre + artiste : c'est le NOM qui l'a
+                    // désigné, et la vérification de fond pourra le revoir.
+                    let provenance_artiste = if existing_mb_id.is_some() {
+                        tune_core::db::artist_repo::ProvenanceMbid::Pressage
+                    } else {
+                        tune_core::db::artist_repo::ProvenanceMbid::Nom
+                    };
+                    tune_core::taches_de_fond::priorite::hors_du_fil_async(
                     tune_core::taches_de_fond::Tache::Enrichissement.id(),
                     move || {
                         let result = tune_core::metadata::enrichment::write_track_enrichment(
@@ -596,50 +795,67 @@ pub(crate) async fn demarrer_enrich_all(
                     },
                 )
                 .await
-            };
-            let Some((result, details, mbid_artiste_pose)) = ecriture else {
-                errors += 1;
-                continue;
-            };
-            if let Some(aid) = mbid_artiste_pose {
-                artists_mbid_done.insert(aid);
-            }
-
-            match result {
-                Ok(_) => {
-                    enriched += 1;
-                    debug!(
-                        track_id,
-                        mb_id = %mb_id,
-                        genre = ?details.genre,
-                        year = ?details.year,
-                        label = ?details.label,
-                        "track_enriched"
-                    );
-                }
-                Err(e) => {
-                    warn!(track_id, error = %e, "enrich_db_update_failed");
+                };
+                let Some((result, details, mbid_artiste_pose)) = ecriture else {
                     errors += 1;
+                    break 'piste Some(Etape::EcritureEnEchec);
+                };
+                if let Some(aid) = mbid_artiste_pose {
+                    artists_mbid_done.insert(aid);
+                }
+
+                match result {
+                    Ok(_) => {
+                        debug!(
+                            track_id,
+                            mb_id = %mb_id,
+                            genre = ?details.genre,
+                            year = ?details.year,
+                            label = ?details.label,
+                            appel_en_echec,
+                            "track_enriched"
+                        );
+                        Some(Etape::Ecrite { appel_en_echec })
+                    }
+                    Err(e) => {
+                        warn!(track_id, error = %e, "enrich_db_update_failed");
+                        errors += 1;
+                        Some(Etape::EcritureEnEchec)
+                    }
+                }
+            };
+
+            if reessai {
+                reessais_vus += 1;
+            } else {
+                examined += 1;
+            }
+            if let Some(etape) = etape {
+                match noter_l_issue(track_id, etape).await {
+                    Some(tune_core::db::enrich_tentatives::Issue::Fait) if reessai => {
+                        reessais_aboutis += 1
+                    }
+                    Some(tune_core::db::enrich_tentatives::Issue::Fait) => enriched += 1,
+                    Some(tune_core::db::enrich_tentatives::Issue::EchecTemporaire) => {
+                        retry_pending += 1
+                    }
+                    _ => {}
                 }
             }
-
-            // Update status periodically
-            if enriched % 50 == 0 {
-                let settings =
-                    tune_core::db::settings_repo::SettingsRepo::with_backend(backend2.clone());
-                settings
-                    .set(
-                        "enrich_all_status",
-                        &json!({
-                            "status": "running",
-                            "task_id": task_id_clone,
-                            "enriched": enriched,
-                            "errors": errors,
-                            "total": total,
-                        })
-                        .to_string(),
-                    )
-                    .ok();
+            // Relevé toutes les 50 pistes QUITTÉES, et non plus tous les 50
+            // enrichis : une suite de pistes ratées réécrivait l'état à chaque
+            // piste.
+            if (examined + reessais_vus).is_multiple_of(50)
+                && let Some(relu) = releve_periodique(
+                    enriched,
+                    errors,
+                    examined,
+                    retry_pending,
+                    reessais - reessais_vus,
+                )
+                .await
+            {
+                retry_pending = relu;
             }
         }
 
@@ -647,13 +863,16 @@ pub(crate) async fn demarrer_enrich_all(
         settings
             .set(
                 "enrich_all_status",
-                &json!({
-                    "status": "done",
-                    "task_id": task_id_clone,
-                    "enriched": enriched,
-                    "errors": errors,
-                    "total": total,
-                })
+                &releve_enrichissement(
+                    "done",
+                    &task_id_clone,
+                    enriched,
+                    errors,
+                    total,
+                    examined,
+                    retry_pending,
+                    reessais - reessais_vus,
+                )
                 .to_string(),
             )
             .ok();
@@ -674,7 +893,15 @@ pub(crate) async fn demarrer_enrich_all(
                 "total": total,
             }),
         );
-        info!(task_id = %task_id_clone, enriched, errors, total, "enrich_all_library done");
+        info!(
+            task_id = %task_id_clone,
+            enriched,
+            errors,
+            total,
+            reessais,
+            reessais_aboutis,
+            "enrich_all_library done"
+        );
         // #5469 — fin NORMALE, et seulement elle : le repère part. Un arrêt
         // n'arrive jamais ici, et c'est ce qui permet au démarrage suivant de
         // relancer la passe.
@@ -792,6 +1019,11 @@ async fn mb_get_with_retry(request: reqwest::RequestBuilder) -> Result<reqwest::
     }
 }
 
+/// #7983 — une réponse qui dit « reviens plus tard », pas « rien trouvé ».
+fn reponse_indisponible(status: StatusCode) -> bool {
+    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
+}
+
 /// Look up a recording on MusicBrainz by title + artist + album.
 /// Returns the recording ID if found.
 async fn mb_lookup_recording(
@@ -821,6 +1053,12 @@ async fn mb_lookup_recording(
     .await
     .map_err(|e| format!("mb lookup: {e}"))?;
 
+    // #7983 — un service indisponible (503 après les relances, 429, 5xx)
+    // n'est pas un « introuvable » : noté comme tel, la piste ne serait plus
+    // jamais retentée.
+    if reponse_indisponible(resp.status()) {
+        return Err(format!("mb lookup: HTTP {}", resp.status()));
+    }
     if !resp.status().is_success() {
         return Ok(None);
     }
@@ -1145,7 +1383,7 @@ mod tests_candidats_cue {
 
     fn candidats(backend: &Arc<dyn DbBackend>) -> Vec<Vec<tune_core::db::backend::SqlValue>> {
         backend
-            .query_many(&sql_candidats_enrichissement(backend), &[])
+            .query_many(&sql_candidats_enrichissement(backend, 0), &[])
             .expect("la requête de candidats doit s'exécuter sur les deux moteurs")
     }
 
@@ -1254,3 +1492,7 @@ mod tests_avancement_enrichissement {
 #[cfg(test)]
 #[path = "enrich_selection_tests_3810.rs"]
 mod enrich_selection_tests_3810;
+
+#[cfg(test)]
+#[path = "enrich_reprise_tests_7983.rs"]
+mod enrich_reprise_tests_7983;

@@ -14,7 +14,13 @@
 //! 3. **Artiste + titre normalisés**, comme les albums manquants (#6288) :
 //!    minuscules, sans accents ni ponctuation, sans les mentions entre
 //!    parenthèses (« (Remastered) »). L'artiste ET le titre doivent
-//!    concorder.
+//!    concorder. Faute d'album au titre identique, la clé assouplie de
+//!    #7981 ([`cle_de_titre`], [`cles_d_un_artiste`]) : sans la mention
+//!    d'édition après « - » ou « : » (« Abbey Road - Remastered 2009 »),
+//!    sans « The » en tête du titre, « & » et « and » équivalents,
+//!    « Beatles, The » lu « The Beatles », un artiste commun suffisant
+//!    (« Miles Davis; John Coltrane »). Si cette clé désigne PLUSIEURS albums
+//!    distincts, on ne choisit pas ([`Rapprochement::Plusieurs`]).
 //!
 //! Seuls les albums LOCAUX comptent (`source = local`) : un favori de service
 //! n'est pas « dans ma bibliothèque ».
@@ -23,8 +29,10 @@
 //!
 //! Qobuz et TIDAL, par code-barre (la recherche du service avec le code),
 //! sinon par artiste + titre. Un album de service n'est retenu que si son
-//! TITRE normalisé est celui du disque ; par artiste + titre, son artiste
-//! aussi. Mieux vaut « nulle part » qu'un mauvais album.
+//! TITRE normalisé est celui du disque (ou sa clé assouplie) ; par artiste +
+//! titre, son artiste aussi. Par code-barre, un titre qui CONTIENT celui du
+//! disque suffit (« Abbey Road (Super Deluxe Edition) 2019 Mix ») : le code
+//! a déjà désigné l'album. Mieux vaut « nulle part » qu'un mauvais album.
 
 use std::collections::{HashMap, HashSet};
 
@@ -80,6 +88,161 @@ pub fn artiste_normalise(nom: &str) -> String {
     }
 }
 
+/// Les mots qui, après « - » ou « : », font d'un bout de titre une mention
+/// d'édition (« Abbey Road - Remastered 2009 », « Rumours: Super Deluxe »).
+const MOTS_D_EDITION: &[&str] = &[
+    "remaster",
+    "remastered",
+    "remasterise",
+    "remasterisee",
+    "remasterises",
+    "deluxe",
+    "edition",
+    "anniversary",
+    "anniversaire",
+    "expanded",
+    "reissue",
+    "version",
+    "mix",
+    "mono",
+    "stereo",
+    "bonus",
+];
+
+/// En fin de titre SANS séparateur, seuls ces mots marquent une édition
+/// (« Abbey Road Remastered ») : « Dub Version » ou « Mono » peuvent être
+/// le titre même.
+const MOTS_D_EDITION_EN_FIN: &[&str] = &[
+    "remaster",
+    "remastered",
+    "remasterise",
+    "remasterisee",
+    "deluxe",
+    "edition",
+    "anniversary",
+    "anniversaire",
+    "expanded",
+    "reissue",
+];
+
+/// Les mots qui accompagnent une mention d'édition en fin de titre
+/// (« Super Deluxe Edition 2011 », « 30th Anniversary »).
+const MOTS_D_ACCOMPAGNEMENT: &[&str] = &[
+    "super",
+    "legacy",
+    "collector",
+    "collectors",
+    "special",
+    "limited",
+    "edt",
+    "ed",
+];
+
+fn est_annee_ou_rang(mot: &str) -> bool {
+    let chiffres: String = mot.chars().take_while(char::is_ascii_digit).collect();
+    let reste = &mot[chiffres.len()..];
+    !chiffres.is_empty()
+        && ((chiffres.len() == 4 && reste.is_empty())
+            || matches!(reste, "th" | "st" | "nd" | "rd" | "e" | "eme" | "er"))
+}
+
+/// Le titre sans sa mention d'édition après un séparateur (« - », « – »,
+/// « — », « : ») : « Abbey Road - Remastered 2009 » → « Abbey Road ». Un
+/// séparateur suivi d'autre chose (« The Haçienda - Play By 01/96 ») reste.
+pub fn titre_sans_edition(titre: &str) -> &str {
+    let mut debut = 0;
+    while let Some((i, sep)) = [" - ", " – ", " — ", ": "]
+        .iter()
+        .filter_map(|sep| titre[debut..].find(sep).map(|i| (debut + i, *sep)))
+        .min_by_key(|(i, _)| *i)
+    {
+        let reste = titre_normalise(&titre[i + sep.len()..]);
+        let tete = titre[..i].trim();
+        if !tete.is_empty() && reste.split(' ').any(|m| MOTS_D_EDITION.contains(&m)) {
+            return tete;
+        }
+        debut = i + sep.len();
+    }
+    titre
+}
+
+/// La clé de titre assouplie (#7981) : [`titre_sans_edition`], normalisé,
+/// sans mention d'édition en fin (« … Remastered 2009 ») ni « The » en tête
+/// (« The Wall » et « Wall »). Propre au greffon : `titre_normalise` de
+/// tune-core sert aussi aux albums manquants et n'est pas touché.
+pub fn cle_de_titre(titre: &str) -> String {
+    let n = titre_normalise(titre_sans_edition(titre));
+    let mut mots: Vec<&str> = n.split(' ').filter(|m| !m.is_empty()).collect();
+    // La fin : une suite de mots d'édition, d'accompagnement, d'années ou de
+    // rangs, qui contient au moins un vrai mot d'édition.
+    let mut coupe = mots.len();
+    let mut edition = false;
+    while coupe > 1 {
+        let m = mots[coupe - 1];
+        if MOTS_D_EDITION_EN_FIN.contains(&m) {
+            edition = true;
+        } else if !(MOTS_D_ACCOMPAGNEMENT.contains(&m) || est_annee_ou_rang(m)) {
+            break;
+        }
+        coupe -= 1;
+    }
+    if edition {
+        mots.truncate(coupe);
+    }
+    if mots.len() > 1 && mots[0] == "the" {
+        mots.remove(0);
+    }
+    mots.join(" ")
+}
+
+/// Les clés d'UN nom d'artiste (#7981) : le nom entier, puis chacun des
+/// artistes qu'il joint (« ; », « / », « feat. », « ft. », « featuring »,
+/// « with », « & The » / « And The » d'un groupe d'accompagnement). Chaque
+/// clé suit [`artiste_normalise`], « Beatles, The » lu « The Beatles », et
+/// « and » / « et » ignorés (« Simon & Garfunkel » = « Simon and
+/// Garfunkel »).
+pub fn cles_d_un_artiste(nom: &str) -> HashSet<String> {
+    fn cle(nom: &str) -> String {
+        let nom = nom.trim();
+        let nom = match nom.len().checked_sub(5) {
+            Some(i) if nom.is_char_boundary(i) && nom[i..].eq_ignore_ascii_case(", the") => {
+                format!("The {}", &nom[..i])
+            }
+            _ => nom.to_string(),
+        };
+        artiste_normalise(&nom)
+            .split(' ')
+            .filter(|m| !matches!(*m, "and" | "et"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    let bas = nom.to_lowercase();
+    let mut cles: HashSet<String> = HashSet::new();
+    cles.insert(cle(&bas));
+    let mut parties = vec![bas.clone()];
+    for sep in [
+        ";",
+        " / ",
+        " feat. ",
+        " feat ",
+        " ft. ",
+        " featuring ",
+        " with ",
+        " & the ",
+        " and the ",
+    ] {
+        parties = parties
+            .iter()
+            .flat_map(|p| p.split(sep).map(str::to_string).collect::<Vec<_>>())
+            .collect();
+    }
+    if parties.len() > 1 {
+        cles.extend(parties.iter().map(|p| cle(p)));
+    }
+    cles.retain(|k| !k.is_empty());
+    cles
+}
+
 fn mbid(m: &str) -> String {
     m.trim().to_ascii_lowercase()
 }
@@ -91,6 +254,28 @@ pub struct Index<'a> {
     par_groupe: HashMap<String, usize>,
     par_code: HashMap<String, usize>,
     par_titre: HashMap<String, Vec<usize>>,
+    /// Par [`cle_de_titre`] (#7981).
+    par_cle: HashMap<String, Vec<usize>>,
+}
+
+/// Ce que la bibliothèque répond pour un disque.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rapprochement<'a> {
+    Trouve(&'a AlbumLocal, Par),
+    /// Aucun album local ne répond.
+    Aucun,
+    /// La clé assouplie désigne plusieurs albums DISTINCTS (tant) : on ne
+    /// choisit pas.
+    Plusieurs(usize),
+}
+
+impl<'a> Rapprochement<'a> {
+    pub fn trouve(self) -> Option<(&'a AlbumLocal, Par)> {
+        match self {
+            Rapprochement::Trouve(a, p) => Some((a, p)),
+            _ => None,
+        }
+    }
 }
 
 impl<'a> Index<'a> {
@@ -99,6 +284,7 @@ impl<'a> Index<'a> {
         let mut par_groupe = HashMap::new();
         let mut par_code = HashMap::new();
         let mut par_titre: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut par_cle: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, a) in albums.iter().enumerate() {
             if let Some(r) = a.mb_release.as_deref().map(mbid).filter(|r| !r.is_empty()) {
                 par_release.entry(r).or_insert(i);
@@ -113,6 +299,10 @@ impl<'a> Index<'a> {
             if !t.is_empty() {
                 par_titre.entry(t).or_default().push(i);
             }
+            let k = cle_de_titre(&a.titre);
+            if !k.is_empty() {
+                par_cle.entry(k).or_default().push(i);
+            }
         }
         Self {
             albums,
@@ -120,6 +310,7 @@ impl<'a> Index<'a> {
             par_groupe,
             par_code,
             par_titre,
+            par_cle,
         }
     }
 
@@ -130,42 +321,78 @@ impl<'a> Index<'a> {
         codes: &[String],
         mb: Option<&LiensMusicBrainz>,
     ) -> Option<(&'a AlbumLocal, Par)> {
+        self.rapprocher(d, codes, mb).trouve()
+    }
+
+    /// Ce que la bibliothèque répond pour le disque : l'album et comment il
+    /// a été trouvé, aucun, ou plusieurs albums qu'on ne départage pas.
+    pub fn rapprocher(
+        &self,
+        d: &Disque,
+        codes: &[String],
+        mb: Option<&LiensMusicBrainz>,
+    ) -> Rapprochement<'a> {
         if let Some(mb) = mb {
             for r in &mb.releases {
                 if let Some(&i) = self.par_release.get(&mbid(r)) {
-                    return Some((&self.albums[i], Par::MusicbrainzPressage));
+                    return Rapprochement::Trouve(&self.albums[i], Par::MusicbrainzPressage);
                 }
             }
             for g in &mb.groupes {
                 if let Some(&i) = self.par_groupe.get(&mbid(g)) {
-                    return Some((&self.albums[i], Par::MusicbrainzAlbum));
+                    return Rapprochement::Trouve(&self.albums[i], Par::MusicbrainzAlbum);
                 }
             }
         }
         for c in codes.iter().filter_map(|c| code_barre_normalise(c)) {
             if let Some(&i) = self.par_code.get(&c) {
-                return Some((&self.albums[i], Par::CodeBarre));
+                return Rapprochement::Trouve(&self.albums[i], Par::CodeBarre);
             }
-        }
-        let t = titre_normalise(&d.titre);
-        if t.is_empty() {
-            return None;
         }
         let artistes = cles_d_artiste(d);
         if artistes.is_empty() {
-            return None;
+            return Rapprochement::Aucun;
         }
-        for &i in self.par_titre.get(&t).into_iter().flatten() {
-            let a = &self.albums[i];
-            if a.artiste
+        let meme_artiste = |a: &AlbumLocal| {
+            a.artiste
                 .as_deref()
-                .map(artiste_normalise)
-                .is_some_and(|k| artistes.contains(&k))
-            {
-                return Some((a, Par::ArtisteTitre));
+                .is_some_and(|n| !cles_d_un_artiste(n).is_disjoint(&artistes))
+        };
+        // Le titre identique d'abord : le premier album qui répond, comme
+        // avant #7981 (un même album importé deux fois n'est pas ambigu).
+        let t = titre_normalise(&d.titre);
+        if !t.is_empty() {
+            for &i in self.par_titre.get(&t).into_iter().flatten() {
+                if meme_artiste(&self.albums[i]) {
+                    return Rapprochement::Trouve(&self.albums[i], Par::ArtisteTitre);
+                }
             }
         }
-        None
+        // Puis la clé assouplie : un seul album distinct, ou on ne choisit pas.
+        let k = cle_de_titre(&d.titre);
+        if k.is_empty() {
+            return Rapprochement::Aucun;
+        }
+        let mut retenus: Vec<usize> = Vec::new();
+        let mut distincts: HashSet<(String, String)> = HashSet::new();
+        for &i in self.par_cle.get(&k).into_iter().flatten() {
+            let a = &self.albums[i];
+            if meme_artiste(a) {
+                retenus.push(i);
+                distincts.insert((
+                    titre_normalise(&a.titre),
+                    a.artiste
+                        .as_deref()
+                        .map(artiste_normalise)
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+        match (retenus.first(), distincts.len()) {
+            (None, _) => Rapprochement::Aucun,
+            (Some(&i), 1) => Rapprochement::Trouve(&self.albums[i], Par::ArtisteTitre),
+            (Some(_), n) => Rapprochement::Plusieurs(n),
+        }
     }
 }
 
@@ -174,6 +401,9 @@ impl<'a> Index<'a> {
 pub fn cles_d_artiste(d: &Disque) -> HashSet<String> {
     let mut cles: HashSet<String> = d.artistes.iter().map(|a| artiste_normalise(a)).collect();
     cles.insert(artiste_normalise(&d.artiste));
+    for a in d.artistes.iter().chain(std::iter::once(&d.artiste)) {
+        cles.extend(cles_d_un_artiste(a));
+    }
     cles.retain(|k| !k.is_empty());
     cles
 }
@@ -188,8 +418,10 @@ pub struct AlbumDeService {
 
 /// L'album d'un service retenu pour un disque, parmi les résultats d'une
 /// recherche. Par code-barre, le titre suffit (le code a déjà désigné le
-/// disque ; l'artiste s'écrit souvent autrement) ; par artiste + titre, les
-/// deux doivent concorder.
+/// disque ; l'artiste s'écrit souvent autrement), et un titre qui contient
+/// celui du disque aussi (« … - Remastered », « … OKNOTOK 1997 2017 ») ; par
+/// artiste + titre, les deux doivent concorder. Le titre identique passe
+/// avant la clé assouplie ([`cle_de_titre`]).
 pub fn choisir_sur_le_service<'a>(
     d: &Disque,
     candidats: &'a [AlbumDeService],
@@ -199,11 +431,35 @@ pub fn choisir_sur_le_service<'a>(
     if t.is_empty() {
         return None;
     }
+    let k = cle_de_titre(&d.titre);
     let artistes = cles_d_artiste(d);
-    candidats.iter().find(|c| {
-        titre_normalise(&c.titre) == t
-            && (par_code_barre || artistes.contains(&artiste_normalise(&c.artiste)))
-    })
+    let artiste_ok = |c: &AlbumDeService| {
+        par_code_barre || !cles_d_un_artiste(&c.artiste).is_disjoint(&artistes)
+    };
+    // `petit` en tête de `grand`, ou ailleurs s'il fait au moins deux mots :
+    // un mot seul (« Love ») se retrouve dans trop de titres.
+    let contient = |grand: &str, petit: &str| {
+        !petit.is_empty()
+            && (grand.starts_with(&format!("{petit} "))
+                || (petit.contains(' ') && format!(" {grand} ").contains(&format!(" {petit} "))))
+    };
+    candidats
+        .iter()
+        .find(|c| titre_normalise(&c.titre) == t && artiste_ok(c))
+        .or_else(|| {
+            candidats
+                .iter()
+                .find(|c| !k.is_empty() && cle_de_titre(&c.titre) == k && artiste_ok(c))
+        })
+        .or_else(|| {
+            if !par_code_barre {
+                return None;
+            }
+            candidats.iter().find(|c| {
+                let kc = cle_de_titre(&c.titre);
+                contient(&kc, &k) || contient(&k, &kc)
+            })
+        })
 }
 
 #[cfg(test)]
@@ -327,5 +583,169 @@ mod tests {
             Some("c"),
             "par code-barre, le titre suffit"
         );
+    }
+    /// #7981 : les disques que la comparaison stricte laissait « nulle
+    /// part » alors que l'album était dans la bibliothèque, sous une autre
+    /// écriture. Chaque ligne : le disque Discogs, l'album local.
+    #[test]
+    fn repli_artiste_titre_assoupli_7981() {
+        let cas = [
+            (
+                ("The Beatles", "Abbey Road - Remastered 2009"),
+                ("The Beatles", "Abbey Road"),
+            ),
+            (
+                ("Fleetwood Mac", "Rumours: Super Deluxe"),
+                ("Fleetwood Mac", "Rumours"),
+            ),
+            (
+                ("Nirvana", "Nevermind - 30th Anniversary Super Deluxe"),
+                ("Nirvana", "Nevermind"),
+            ),
+            (("Pink Floyd", "Wall"), ("Pink Floyd", "The Wall")),
+            (
+                ("Simon & Garfunkel", "Bookends"),
+                ("Simon and Garfunkel", "Bookends"),
+            ),
+            (
+                ("Miles Davis", "Kind of Blue"),
+                ("Miles Davis; John Coltrane", "Kind of Blue"),
+            ),
+            (
+                ("Miles Davis", "Kind of Blue"),
+                ("Miles Davis feat. John Coltrane", "Kind of Blue"),
+            ),
+            (
+                ("Prince And The Revolution", "Purple Rain"),
+                ("Prince", "Purple Rain"),
+            ),
+            (("Beatles, The", "Revolver"), ("The Beatles", "Revolver")),
+            (
+                ("Radiohead", "OK Computer Remastered"),
+                ("Radiohead", "OK Computer"),
+            ),
+        ];
+        for ((da, dt), (la, lt)) in cas {
+            let albums = vec![album(7, la, lt)];
+            let idx = Index::new(&albums);
+            assert_eq!(
+                idx.rapprocher(&disque(da, dt), &[], None),
+                Rapprochement::Trouve(&albums[0], Par::ArtisteTitre),
+                "« {da} — {dt} » devait retrouver « {la} — {lt} »"
+            );
+        }
+    }
+
+    /// Contre-épreuve du repli : ce qui n'est pas le même disque reste à part.
+    #[test]
+    fn le_repli_assoupli_ne_confond_pas_deux_disques_7981() {
+        let albums = vec![
+            album(1, "Miles Davis", "Kind of Blue Live"),
+            album(2, "Bill Evans", "Abbey Road"),
+            album(3, "Various", "The Haçienda"),
+        ];
+        let idx = Index::new(&albums);
+        for (a, t) in [
+            ("Miles Davis", "Kind of Blue"),
+            ("The Beatles", "Abbey Road - Remastered 2009"),
+            ("Various", "The Haçienda - Play By 01/96"),
+        ] {
+            assert_eq!(
+                idx.rapprocher(&disque(a, t), &[], None),
+                Rapprochement::Aucun,
+                "« {a} — {t} » ne devait rien retrouver"
+            );
+        }
+    }
+
+    /// Deux albums locaux distincts répondent à la clé assouplie : on ne
+    /// choisit pas. Le même album importé deux fois, si.
+    #[test]
+    fn plusieurs_candidats_distincts_on_ne_choisit_pas_7981() {
+        let albums = vec![
+            album(1, "Fleetwood Mac", "Rumours (Deluxe)"),
+            album(2, "Fleetwood Mac", "Rumours Super Deluxe Edition"),
+        ];
+        let idx = Index::new(&albums);
+        let d = disque("Fleetwood Mac", "Rumours: 35th Anniversary Edition");
+        assert_eq!(idx.rapprocher(&d, &[], None), Rapprochement::Plusieurs(2));
+        assert!(idx.trouver(&d, &[], None).is_none());
+
+        let doublon = vec![
+            album(1, "Fleetwood Mac", "Rumours - Remastered"),
+            album(2, "Fleetwood Mac", "Rumours - Remastered"),
+        ];
+        let idx = Index::new(&doublon);
+        assert_eq!(
+            idx.trouver(&d, &[], None).map(|(a, p)| (a.id, p)),
+            Some((1, Par::ArtisteTitre))
+        );
+        // Le titre identique passe avant : pas d'ambiguïté.
+        let exact = vec![
+            album(1, "Fleetwood Mac", "Rumours Super Deluxe Edition"),
+            album(2, "Fleetwood Mac", "Rumours"),
+        ];
+        let idx = Index::new(&exact);
+        assert_eq!(
+            idx.trouver(&disque("Fleetwood Mac", "Rumours"), &[], None)
+                .map(|(a, _)| a.id),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn la_mention_d_edition_se_coupe_seulement_si_c_en_est_une_7981() {
+        assert_eq!(
+            titre_sans_edition("Abbey Road - Remastered 2009"),
+            "Abbey Road"
+        );
+        assert_eq!(titre_sans_edition("Rumours: Super Deluxe"), "Rumours");
+        assert_eq!(
+            titre_sans_edition("The Haçienda - Play By 01/96"),
+            "The Haçienda - Play By 01/96"
+        );
+        assert_eq!(cle_de_titre("Abbey Road (Remastered 2009)"), "abbey road");
+        assert_eq!(cle_de_titre("Live 1975"), "live 1975");
+        assert_eq!(cle_de_titre("The The"), "the");
+        assert_eq!(cle_de_titre("Dub Version"), "dub version");
+    }
+
+    /// #7981, côté service : par code-barre, un titre qui CONTIENT celui du
+    /// disque ; par artiste + titre, la clé assouplie.
+    #[test]
+    fn un_service_retrouve_le_disque_sous_une_autre_ecriture_7981() {
+        let d = disque("The Beatles", "Abbey Road");
+        let qobuz = vec![AlbumDeService {
+            id: "q".into(),
+            titre: "Abbey Road (Super Deluxe Edition) 2019 Mix".into(),
+            artiste: "The Beatles".into(),
+        }];
+        assert_eq!(
+            choisir_sur_le_service(&d, &qobuz, true).map(|a| a.id.as_str()),
+            Some("q"),
+            "par code-barre, le titre qui contient celui du disque suffit"
+        );
+        assert!(
+            choisir_sur_le_service(&d, &qobuz, false).is_none(),
+            "par artiste + titre, « 2019 Mix » n'est pas une mention d'édition seule"
+        );
+        let d = disque("Simon & Garfunkel", "Bookends - Remastered");
+        let qobuz = vec![AlbumDeService {
+            id: "b".into(),
+            titre: "Bookends".into(),
+            artiste: "Simon and Garfunkel".into(),
+        }];
+        assert_eq!(
+            choisir_sur_le_service(&d, &qobuz, false).map(|a| a.id.as_str()),
+            Some("b")
+        );
+        // Un mot seul contenu dans un autre titre ne suffit pas.
+        let d = disque("X", "Love");
+        let autre = vec![AlbumDeService {
+            id: "z".into(),
+            titre: "Greatest Love Songs".into(),
+            artiste: "Y".into(),
+        }];
+        assert!(choisir_sur_le_service(&d, &autre, true).is_none());
     }
 }

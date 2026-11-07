@@ -55,7 +55,15 @@ async fn faux_site() -> FauxSite {
                         license_key: lire("x-license-key"),
                         accept: lire("accept"),
                     };
-                    axum::Json(json!({ "status": "pending", "proposal": { "id": 12 } }))
+                    // La réponse du site (`TuneTestedPropositionController::store`).
+                    (
+                        StatusCode::CREATED,
+                        axum::Json(json!({
+                            "status": "received",
+                            "replaced": false,
+                            "proposition": { "id": 12, "status": "pending" }
+                        })),
+                    )
                 }
             },
         ),
@@ -197,11 +205,12 @@ async fn tune_tested_7922_post_envoie_l_apercu_exact_sans_adresse_ni_nom_de_zone
         recu.corps, apercu,
         "le site reçoit exactement l'aperçu montré à l'utilisateur"
     );
-    assert_eq!(recu.corps["manufacturer"], "Test Audio");
+    assert_eq!(recu.corps["brand"], "Test Audio");
     assert_eq!(recu.corps["model"], "DAC 7922");
     assert_eq!(recu.corps["output_type"], "dlna");
     assert_eq!(recu.corps["error_free_seconds"], 3600);
-    assert_eq!(recu.corps["gapless_observed"], true);
+    assert_eq!(recu.corps["gapless"], true);
+    assert_eq!(recu.corps["bit_depth"], 24);
     assert_eq!(recu.corps["formats"][0]["sample_rate"], 192_000);
     assert_eq!(recu.corps["formats"][0]["bit_depth"], 24);
     assert_eq!(recu.corps["instance_id"], "instance-essai-7922");
@@ -298,4 +307,68 @@ async fn tune_tested_7922_zone_inconnue_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// #8084 — le catalogue Tune tested téléchargé, tel que le site le sert.
+fn ranger_catalogue(settings: &SettingsRepo, marque: &str, modele: &str) {
+    settings
+        .set(
+            tune_core::cloud::tune_tested::CLE_CATALOGUE,
+            &json!({
+                "version": 1_762_000_000,
+                "count": 1,
+                "settings_vocabulary": "tune.renderer.v1",
+                "devices": [{
+                    "brand": marque, "model": modele, "output_type": "dlna",
+                    "settings": { "dlna_native_flac": true }, "households": 3
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tune_tested_8084_un_appareil_deja_au_catalogue_se_propose_et_part() {
+    let site = faux_site().await;
+    let banc = banc(&site.base, &[("license_key", "CLE-ESSAI-8084")]);
+    ranger_catalogue(&banc.settings, "Test Audio", "DAC 7922");
+    banc.ecouter(60);
+
+    let (statut, etat) = banc.appeler("GET").await;
+    assert_eq!(statut, StatusCode::OK, "{etat}");
+    assert_eq!(etat["already_tune_tested"], true, "{etat}");
+    assert_eq!(etat["eligible"], true, "déjà Tune tested n'empêche rien");
+    assert_eq!(etat["reason"], Value::Null);
+
+    let apercu = etat["preview"].clone();
+    let (statut, corps) = banc
+        .appeler_avec("POST", Body::from(json!({ "preview": apercu }).to_string()))
+        .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["status"], "ok");
+    assert_eq!(corps["already_tune_tested"], true);
+    assert_eq!(
+        corps["proposal"]["id"], 12,
+        "la réponse du site (`proposition`) est relayée"
+    );
+    assert_eq!(site.appels.load(Ordering::SeqCst), 1);
+    assert_eq!(site.dernier.lock().await.corps, apercu);
+}
+
+#[tokio::test]
+async fn tune_tested_8084_contre_epreuve_hors_catalogue_rien_n_est_annonce() {
+    let site = faux_site().await;
+    let banc = banc(&site.base, &[("license_key", "CLE-ESSAI-8084")]);
+    ranger_catalogue(&banc.settings, "Autre Marque", "DAC 7922");
+    banc.ecouter(60);
+    let (_, etat) = banc.appeler("GET").await;
+    assert_eq!(etat["already_tune_tested"], false, "{etat}");
+    assert_eq!(etat["eligible"], true);
+}
+
+#[test]
+fn tune_tested_8084_le_chemin_est_celui_que_le_site_sert() {
+    // `routes/api.php` du site : `Route::post('v1/tune-tested/propositions', …)`.
+    assert_eq!(super::CHEMIN_DU_SITE, "/api/v1/tune-tested/propositions");
 }
