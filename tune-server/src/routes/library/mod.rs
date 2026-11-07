@@ -34,7 +34,10 @@ mod albums_manquants_mb;
 mod liens_et_genres_mb;
 mod passes_metarust;
 // #5469 — les passes que `crate::reprise_des_passes` sait relancer.
-pub(crate) use artwork::{demarrer_images_artistes, demarrer_pochettes_albums};
+pub(crate) use artwork::{
+    PochetteAlbum, demarrer_images_artistes, demarrer_pochettes_albums, pochette_de_l_album,
+    serve_artwork_from,
+};
 pub(crate) use enrich::demarrer_enrich_all;
 mod edition_par_filtre;
 mod etiquetage_par_filtre;
@@ -80,6 +83,7 @@ pub(crate) mod graver_dr;
 pub(crate) mod reparer_compilations;
 pub(crate) mod stats;
 mod tracks;
+pub(crate) use tracks::stream_track_audio;
 pub(crate) mod write_tags;
 
 /// Les versions d'un même album regroupées sous une fiche (#7617).
@@ -224,7 +228,7 @@ pub(super) fn now_iso_utc() -> String {
     format!("{y:04}-{:02}-{:02}T{h:02}:{m:02}:{s:02}Z", mo + 1, d + 1)
 }
 
-pub(super) fn artwork_is_hex_hash(s: &str) -> bool {
+pub(crate) fn artwork_is_hex_hash(s: &str) -> bool {
     (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 

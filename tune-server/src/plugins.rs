@@ -451,6 +451,19 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
         rendus
     }
 
+    /// « Chercher sur les services » (#7928) : tous les services du
+    /// registre UTILISABLES (activés et connectés), dans l'ordre du registre.
+    async fn services_de_recherche(&self) -> Vec<String> {
+        let noms = self.state.services.lock().await.list();
+        let mut rendus = Vec::new();
+        for nom in noms {
+            if self.service(&nom).await.is_some() {
+                rendus.push(nom);
+            }
+        }
+        rendus
+    }
+
     async fn chercher_albums(
         &self,
         service: &str,
@@ -571,7 +584,9 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
                 Ok(Image::Octets(octets.to_vec()))
             }
             200..=299 => Ok(Image::Introuvable),
-            404 | 403 | 410 => Ok(Image::Introuvable),
+            404 | 410 => Ok(Image::Introuvable),
+            // #7927 : un refus du CDN n'est pas une image disparue.
+            403 => Ok(Image::Refusee),
             429 | 503 => Ok(Image::Limite),
             statut => {
                 tracing::debug!(target: "plugin", statut, "collection_physique_pochette_statut");

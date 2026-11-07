@@ -1420,8 +1420,17 @@ async fn service_status(
         Err(e) => return e.into_response(),
     };
 
+    // #7760 — l'état se lit sous verrou de LECTURE. Un verrou d'écriture
+    // demandé ici se mettait en file derrière une lecture lente (favoris,
+    // playlists) et retenait toutes les lectures arrivées après lui : les
+    // widgets de l'accueil tombaient en « délai ». L'écriture n'est prise que
+    // pour une connexion par interrogation, que Qobuz n'a pas.
+    let mut status = svc.read().await.auth_status().await;
+    if status.authenticated || !connexion_par_interrogation(&service) {
+        return reponse_etat_du_service(&service, &status);
+    }
     let mut svc = svc.write().await;
-    let mut status = svc.auth_status().await;
+    status = svc.auth_status().await;
     if !status.authenticated
         && let Ok(poll_status) = svc.authenticate(&json!({"poll": true})).await
         && poll_status.authenticated
@@ -1431,6 +1440,22 @@ async fn service_status(
         state.save_tokens().await;
         purge_contenu_utilisateur(&service);
     }
+    reponse_etat_du_service(&service, &status)
+}
+
+/// Le service sait-il se connecter par interrogation (`{"poll": true}`) ?
+///
+/// Qobuz ne se connecte que par identifiant et mot de passe : sa tentative
+/// d'interrogation échoue aussitôt (« username required »), et prendre le
+/// verrou d'écriture pour elle ne fait que bloquer les lectures (#7760).
+fn connexion_par_interrogation(service: &str) -> bool {
+    service != "qobuz"
+}
+
+fn reponse_etat_du_service(
+    service: &str,
+    status: &tune_core::streaming::traits::AuthStatus,
+) -> Response {
     Json(json!({
         "service": service,
         "enabled": true,
@@ -4059,6 +4084,9 @@ mod mixes_du_compte_7822_tests;
 
 #[cfg(test)]
 mod youtube_decouverte_tests;
+
+#[cfg(test)]
+mod etat_sans_verrou_exclusif_7760_tests;
 
 /// #6480 — `GET /streaming/{service}/albums/{id}/description` : le texte de
 /// présentation d'un album de service (cpadiou77, fil forum 2327).
