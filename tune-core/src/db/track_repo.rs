@@ -833,11 +833,11 @@ pub mod sql {
         // whose files carry no ALBUMARTIST tag (Bilou). The column keeps its
         // position, so row parsing is unchanged.
         //
-        // `t.rating` (#6123) au rang 34, puis `t.bitrate_kbps` (#6332) qui ferme
-        // la liste au rang 35 : une projection qui s'arrête avant rend `None`,
-        // jamais un décalage.
+        // `t.rating` (#6123) au rang 34, `t.bitrate_kbps` (#6332) au rang 35,
+        // puis `t.explicit` (#8088) qui ferme la liste au rang 36 : une
+        // projection qui s'arrête avant rend `None`, jamais un décalage.
         format!(
-            "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments, t.cue_media_path, t.cue_start_ms, t.cue_end_ms, t.rating, t.bitrate_kbps{}",
+            "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments, t.cue_media_path, t.cue_start_ms, t.cue_end_ms, t.rating, t.bitrate_kbps, t.explicit{}",
             track_from()
         )
     }
@@ -908,11 +908,11 @@ pub mod sql {
         )
     }
 
-    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments, cover_path, cue_media_path, cue_start_ms, cue_end_ms, rating, bitrate_kbps";
+    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments, cover_path, cue_media_path, cue_start_ms, cue_end_ms, rating, bitrate_kbps, explicit";
 
     /// Combien de colonnes `INSERT_COLS` porte — la seule source de vérité du
     /// nombre de paramètres liés, pour les deux moteurs.
-    pub const NB_COLONNES_INSERT: usize = 33;
+    pub const NB_COLONNES_INSERT: usize = 34;
 
     pub fn insert<D: SqlDialect>(d: &D) -> String {
         let placeholders: Vec<String> =
@@ -947,8 +947,8 @@ pub mod sql {
     ];
 
     /// Le nombre de valeurs liées par [`update`] et [`update_du_scan`] : leurs
-    /// 27 colonnes, puis l'`id`.
-    pub const NB_PARAMS_UPDATE: usize = 28;
+    /// 28 colonnes, puis l'`id`.
+    pub const NB_PARAMS_UPDATE: usize = 29;
 
     /// `UPDATE tracks …` qui ÉCRASE tout, y compris ce que le scan ignore.
     ///
@@ -1104,6 +1104,15 @@ pub mod sql {
                     "bitrate_kbps = COALESCE({}, bitrate_kbps)",
                     d.placeholder(27)
                 )
+            },
+            // #8088 — le marquage explicite de la balise (`ITUNESADVISORY`) :
+            // même règle que la note. Le scan l'écrit tel que le fichier le
+            // dit (une balise retirée le retire) ; les autres écritures le
+            // gardent.
+            if conserver {
+                brut(28, "explicit")
+            } else {
+                format!("explicit = COALESCE({}, explicit)", d.placeholder(28))
             },
         ];
         format!(
@@ -2503,6 +2512,8 @@ impl TrackRepo {
 
     fn create_inner(&self, track: &Track) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::insert, sql::insert);
+        // #8088 — `tracks.explicit` est un entier (0/1) des deux côtés.
+        let explicite = track.explicit.map(i64::from);
         let params: [&dyn ToSqlValue; sql::NB_COLONNES_INSERT] = [
             &track.title,
             &track.album_id,
@@ -2537,6 +2548,7 @@ impl TrackRepo {
             &track.cue_end_ms,
             &track.rating,
             &track.bitrate_kbps,
+            &explicite,
         ];
         // Capture the new track id atomically, BEFORE the file_first_seen
         // insert below — otherwise `last_insert_rowid()` at the end returns that
@@ -2583,6 +2595,8 @@ impl TrackRepo {
             .id
             .ok_or_else(|| TuneError::NotFound("track has no id".into()))?;
         let sql = self.dialect_sql(sql::update, sql::update);
+        // #8088 — `tracks.explicit` est un entier (0/1) des deux côtés.
+        let explicite = track.explicit.map(i64::from);
         let params: [&dyn ToSqlValue; sql::NB_PARAMS_UPDATE] = [
             &track.title,
             &track.album_id,
@@ -2611,6 +2625,7 @@ impl TrackRepo {
             &track.isrc,
             &track.rating,
             &track.bitrate_kbps,
+            &explicite,
             &id,
         ];
         // #4546 : figer la date d'ajout AVANT que `file_mtime` ne soit récrit.
@@ -4010,6 +4025,8 @@ impl TrackRepo {
         let mut echecs = 0usize;
         let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
         for track in tracks {
+            // #8088 — `tracks.explicit` est un entier (0/1) des deux côtés.
+            let explicite = track.explicit.map(i64::from);
             let params: [&dyn ToSqlValue; sql::NB_COLONNES_INSERT] = [
                 &track.title,
                 &track.album_id,
@@ -4044,6 +4061,7 @@ impl TrackRepo {
                 &track.cue_end_ms,
                 &track.rating,
                 &track.bitrate_kbps,
+                &explicite,
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
         }
@@ -4181,6 +4199,8 @@ impl TrackRepo {
         let mut figer_params: Vec<Vec<SqlValue>> = Vec::new();
         for track in tracks {
             let Some(id) = track.id else { continue };
+            // #8088 — `tracks.explicit` est un entier (0/1) des deux côtés.
+            let explicite = track.explicit.map(i64::from);
             let params: [&dyn ToSqlValue; sql::NB_PARAMS_UPDATE] = [
                 &track.title,
                 &track.album_id,
@@ -4209,6 +4229,7 @@ impl TrackRepo {
                 &track.isrc,
                 &track.rating,
                 &track.bitrate_kbps,
+                &explicite,
                 &id,
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
@@ -4854,6 +4875,7 @@ fn row_to_track(cols: &[SqlValue]) -> Track {
         cue_end_ms: cols.get(33).and_then(|v| v.as_i64()),
         rating: cols.get(34).and_then(|v| v.as_i64()).map(|n| n as i32),
         bitrate_kbps: cols.get(35).and_then(|v| v.as_i64()).map(|n| n as i32),
+        explicit: cols.get(36).and_then(|v| v.as_i64()).map(|n| n != 0),
     }
 }
 
@@ -7099,8 +7121,16 @@ mod tests {
                     "le débit doit être la 27e valeur : {sql}"
                 );
                 assert!(
-                    sql.ends_with(&format!("WHERE id = {}", d.placeholder(28))),
-                    "l'id doit être la 28e valeur : {sql}"
+                    sql.contains(&format!("explicit = {}", d.placeholder(28)))
+                        || sql.contains(&format!(
+                            "explicit = COALESCE({}, explicit)",
+                            d.placeholder(28)
+                        )),
+                    "le marquage explicite doit être la 28e valeur (#8088) : {sql}"
+                );
+                assert!(
+                    sql.ends_with(&format!("WHERE id = {}", d.placeholder(29))),
+                    "l'id doit être la 29e valeur : {sql}"
                 );
             }
         }
@@ -7155,12 +7185,12 @@ mod tests {
         );
         // Les paramètres restent à leur rang, dans les deux formes : 26
         // depuis que `isrc` est écrit (#5463), 27 avec `rating` (#6123), 28
-        // avec `bitrate_kbps` (#6332).
+        // avec `bitrate_kbps` (#6332), 29 avec `explicit` (#8088).
         for forme in [sql::update(&SqliteDialect), sql] {
             assert_eq!(
                 forme.matches('?').count(),
                 sql::NB_PARAMS_UPDATE,
-                "28 paramètres liés, ni plus ni moins : {forme}"
+                "29 paramètres liés, ni plus ni moins : {forme}"
             );
         }
     }
@@ -7254,8 +7284,10 @@ mod tests {
             "{sql}"
         );
         // #6332 — et le débit tel que le fichier le dit.
-        assert!(sql.contains("bitrate_kbps = $27 "), "{sql}");
-        assert!(sql.ends_with("WHERE id = $28"), "{sql}");
+        assert!(sql.contains("bitrate_kbps = $27,"), "{sql}");
+        // #8088 — et le marquage explicite tel que le fichier le dit.
+        assert!(sql.contains("explicit = $28 "), "{sql}");
+        assert!(sql.ends_with("WHERE id = $29"), "{sql}");
     }
 }
 

@@ -448,7 +448,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     rating TEXT,
     -- Debit moyen du fichier (#6332). TEXT pour la copie, comme `rating` ;
     -- la migration 094 le convertit en BIGINT.
-    bitrate_kbps TEXT
+    bitrate_kbps TEXT,
+    -- Marquage explicite de la balise (#8088). TEXT pour la copie, comme
+    -- `rating` ; la migration 107 le convertit en BIGINT.
+    explicit TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -1389,6 +1392,9 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating TEXT;
 -- tracks: debit moyen du fichier en kbit/s (SQLite migration v130 / PG 094,
 -- #6332). TEXT pour la copie ; la 094, rejouee juste apres, le convertit.
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bitrate_kbps TEXT;
+-- tracks: marquage explicite de la balise (SQLite migration v141 / PG 107,
+-- #8088). TEXT pour la copie ; la 107, rejouee juste apres, le convertit.
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS explicit TEXT;
 -- tracks: cle de tri de la vue des pistes (#7619, L1, sans numero). Copiee
 -- telle quelle ; recalculee de toute facon par `assurer_les_cles_de_tri`.
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE "C";

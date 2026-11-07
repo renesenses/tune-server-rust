@@ -5809,6 +5809,7 @@ mod tests {
             cue_end_ms: None,
             rating: None,
             bitrate_kbps: None,
+            explicit: None,
         }
     }
 
