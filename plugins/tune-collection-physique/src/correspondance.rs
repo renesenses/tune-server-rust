@@ -228,6 +228,9 @@ mod tests {
             ajoute_le: None,
             vignette: None,
             pochette: None,
+            dossier: None,
+            genres: vec![],
+            styles: vec![],
         }
     }
 
