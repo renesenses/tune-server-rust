@@ -7129,6 +7129,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tune-core",
+ "tune-http-types",
 ]
 
 [[package]]
