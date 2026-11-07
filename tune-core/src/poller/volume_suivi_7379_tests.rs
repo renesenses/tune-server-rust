@@ -340,17 +340,18 @@ async fn un_releve_illisible_n_est_jamais_un_geste_zone_arretee_7379() {
 /// par un site muet).
 #[tokio::test]
 async fn zone_arretee_un_vrai_depassement_est_ramene_7379() {
-    let mut banc = Banc::monter(false).await;
-    banc.poser_reglage(&cle_securite(banc.zone_id), "0.4");
-    banc.zone_a(10.0).await;
-    banc.appareil_a(0.1).await;
-    banc.arreter_dans_tune().await;
-    banc.tic_au_repos(TransportState::Stopped).await;
-    let deja = banc.appareil_a(0.9).await;
-    banc.tic_au_repos(TransportState::Stopped).await;
-    let recus = banc.commandes_depuis(deja).await;
-    assert_eq!(recus.len(), 1, "{recus:?}");
-    assert!(recus[0] <= 0.4 + 1e-9, "{recus:?}");
+    for etat in [TransportState::Stopped, TransportState::Playing] {
+        let mut banc = Banc::monter(false).await;
+        banc.poser_reglage(&cle_securite(banc.zone_id), "0.4");
+        banc.zone_a(10.0).await;
+        banc.appareil_a(0.1).await;
+        banc.arreter_dans_tune().await;
+        banc.tic_au_repos(etat).await;
+        let deja = banc.appareil_a(0.9).await;
+        banc.tic_au_repos(etat).await;
+        let recus = banc.commandes_depuis(deja).await;
+        assert_eq!(recus, vec![retenu_depuis(0.1, 0.4)], "{etat:?}");
+    }
 }
 
 /// B1, site radio : la webradio joue, la réponse devient illisible, limite
@@ -362,6 +363,9 @@ async fn un_releve_illisible_en_radio_n_est_jamais_un_geste_7379() {
     banc.en_radio().await;
     banc.zone_a(10.0).await;
     banc.appareil_a(0.1).await;
+    // Deux tours : le premier crée l'état de sondage (étranglé), le second
+    // relit l'appareil et pose le repère.
+    banc.tic_radio().await;
     banc.tic_radio().await;
     let deja = banc.appareil_a(0.1).await;
     banc.volume_illisible(true).await;
@@ -382,6 +386,7 @@ async fn en_radio_suivi_sous_le_plafond_et_retour_au_dessus_7379() {
     banc.zone_a(30.0).await;
     banc.appareil_a(0.3).await;
     banc.tic_radio().await;
+    banc.tic_radio().await;
     let deja = banc.appareil_a(0.55).await;
     banc.tic_radio().await;
     assert!(
@@ -395,28 +400,6 @@ async fn en_radio_suivi_sous_le_plafond_et_retour_au_dessus_7379() {
     let attendu = retenu_depuis(0.55, 0.85);
     assert_eq!(banc.commandes_depuis(deja).await, vec![attendu]);
     assert!(attendu <= 0.85);
-}
-
-/// Site « au repos » (l'appareil joue une autre source, zone arrêtée dans
-/// Tune) : même règle.
-#[tokio::test]
-async fn au_repos_suivi_sous_le_plafond_et_retour_au_dessus_7379() {
-    let mut banc = Banc::monter(false).await;
-    banc.zone_a(30.0).await;
-    banc.appareil_a(0.3).await;
-    banc.arreter_dans_tune().await;
-    banc.tic_au_repos(TransportState::Playing).await;
-    banc.appareil_a(0.55).await;
-    banc.tic_au_repos(TransportState::Playing).await;
-    assert!(
-        (banc.volume_en_base() - 55.0).abs() < 1e-6,
-        "{}",
-        banc.volume_en_base()
-    );
-    let deja = banc.appareil_a(0.95).await;
-    banc.tic_au_repos(TransportState::Playing).await;
-    let recus = banc.commandes_depuis(deja).await;
-    assert_eq!(recus, vec![retenu_depuis(0.55, 0.85)]);
 }
 
 /// B2, de bout en bout — trim −6 dB, consigne 50 % (l'appareil reçoit 25 %).

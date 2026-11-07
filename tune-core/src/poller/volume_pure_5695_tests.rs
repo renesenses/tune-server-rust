@@ -322,6 +322,9 @@ impl Banc {
     /// grâce de démarrage du sondeur (30 s) échue.
     pub(super) async fn tic_au_repos(&mut self, etat: TransportState) {
         self.avec_mock(async |m| m.set_state(etat).await).await;
+        // Le recul de repos (`IDLE_REPOS_POLL_TICKS`) n'est pas l'objet des
+        // témoins : chaque tour relit l'appareil.
+        self.idle.clear();
         let demarrage = Instant::now()
             .checked_sub(std::time::Duration::from_secs(120))
             .unwrap();
