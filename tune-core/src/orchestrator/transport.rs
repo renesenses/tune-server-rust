@@ -2124,7 +2124,7 @@ impl PlaybackOrchestrator {
             // Producer always pre-seeked — see the comment in send_to_output.
             local_out.set_producer_seeked(true);
         }
-        // La sortie NAÎT ici, à `user_volume = 1000` : sans graine, elle jouait
+        // La sortie NAÎT ici, à `user_volume` plein : sans graine, elle jouait
         // à pleine échelle quel que soit le volume enregistré de la zone, trim
         // ignoré — un saut de volume après chaque recréation (appareil perdu
         // puis retrouvé, sortie absente du registre). Même graine qu'au

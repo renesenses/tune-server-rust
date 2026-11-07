@@ -1173,9 +1173,11 @@ impl WasapiExclusiveOutput {
         // #7264 — le gain du rendu, au repos à la consigne courante : ni
         // fondu d'ouverture, ni mot pondéré à 100 %.
         let mut gain = super::local::gain_au_rendu_7264::GainAuRendu::nouveau(
-            self.volume_au_rendu
-                .clone()
-                .unwrap_or_else(|| Arc::new(AtomicU32::new(1000))),
+            self.volume_au_rendu.clone().unwrap_or_else(|| {
+                Arc::new(AtomicU32::new(
+                    crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+                ))
+            }),
             self.sample_rate,
             self.channels,
         );

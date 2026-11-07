@@ -17,7 +17,7 @@ fn dop_i32(trames: usize) -> Vec<i32> {
 fn pause_famine_et_arret_rendent_des_trames_de_repos_dop_en_s32() {
     let anneau = NativePcmRing::new(1 << 16);
     anneau.push(&dop_i32(1_201));
-    let volume = AtomicU32::new(1000);
+    let volume = AtomicU32::new(UNITE_DU_GAIN_DE_RENDU);
     let paused = AtomicBool::new(false);
     let silent = AtomicBool::new(false);
     let data_started = AtomicBool::new(true);

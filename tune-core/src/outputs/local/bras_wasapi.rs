@@ -46,7 +46,7 @@ use crate::outputs::wasapi_exclusive::WasapiExclusiveOutput;
 /// #7264 — le volume que reçoit l'étage : l'unité. Le volume logiciel est
 /// appliqué par le fil de rendu, après l'anneau (`pop_pcm_bytes_au_gain`) ;
 /// appliqué aussi dans l'étage, il le serait deux fois.
-const VOLUME_A_L_UNITE: u32 = 1000;
+const VOLUME_A_L_UNITE: u32 = crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
 
 /// Ce que le bras lisait du contexte de `play_url` — toutes déjà possédées
 /// par le fil de lecture. Elles sont DÉPLACÉES, jamais empruntées (leçon de

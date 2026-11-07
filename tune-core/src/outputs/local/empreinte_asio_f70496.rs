@@ -121,7 +121,9 @@ struct Dsp {
 }
 
 impl Dsp {
+    /// `volume` en millièmes, converti dans l'unité de la sortie locale (#7968).
     fn au_repos(volume: u32) -> Self {
+        let volume = volume * (crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 1000);
         Self {
             eq: std::sync::Mutex::new(None),
             convolver: std::sync::Mutex::new(None),

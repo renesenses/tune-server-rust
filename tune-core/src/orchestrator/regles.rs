@@ -370,7 +370,7 @@ pub fn volume_de_graine(zone_volume: f64, fixed_volume: bool, trim_db: f64) -> f
 /// Pose sur une sortie locale qui vient de naître le niveau que la base dit
 /// de sa zone, trim compris (#1596, #5561).
 ///
-/// Une `LocalOutput` neuve naît à `user_volume = 1000` (pleine échelle) : sans
+/// Une `LocalOutput` neuve naît à `user_volume` plein (pleine échelle) : sans
 /// cette graine, elle joue à 100 % quel que soit le réglage de la zone. Les
 /// DEUX naissances passent par ici — l'énumération du démarrage
 /// (`tune-server::startup::register_local_outputs`) et la recréation à la
