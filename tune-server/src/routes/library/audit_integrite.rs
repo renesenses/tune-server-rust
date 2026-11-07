@@ -36,6 +36,7 @@ use tune_core::{
         engine::{Engine, PostgresDialect, SqliteDialect},
         settings_repo::{SettingsRepo, sql},
     },
+    library::local_path,
     taches_de_fond::{self, Tache, perimetre, priorite},
 };
 
@@ -453,7 +454,15 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
             }
             let id = ligne[0].as_i64().ok_or("Identifiant de fichier absent")?;
             let chemin = ligne[1].as_string().ok_or("Chemin absent")?;
-            let avant = std::fs::metadata(&chemin).ok();
+            // #8105 — le chemin enregistré est en NFC (le scan normalise) ; le
+            // disque peut porter le NFD (fichiers venus d'un Mac, d'un NAS),
+            // et NTFS comme ext4 les distinguent. L'audit ouvre la graphie
+            // que le disque reconnaît, comme la lecture ; le rapport garde le
+            // chemin enregistré.
+            let ouvrable = local_path::resolve_local_path(&chemin)
+                .found()
+                .unwrap_or_else(|| chemin.clone());
+            let avant = std::fs::metadata(&ouvrable).ok();
             let taille = avant.as_ref().map(|m| m.len());
             let date = avant.as_ref().and_then(|m| m.modified().ok());
             let taille_sans_nouvelle_date =
@@ -471,12 +480,12 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
                 continue;
             }
             let Some(mut resultat) =
-                audit_integrite::verifier_selon(etat.mode, Path::new(&chemin), continuer)
+                audit_integrite::verifier_selon(etat.mode, Path::new(&ouvrable), continuer)
             else {
                 etat.status = "paused".into();
                 return sauver(db, etat, None);
             };
-            let change = match std::fs::metadata(&chemin) {
+            let change = match std::fs::metadata(&ouvrable) {
                 Ok(apres) => Some(apres.len()) != taille || apres.modified().ok() != date,
                 Err(_) => avant.is_some(),
             };
