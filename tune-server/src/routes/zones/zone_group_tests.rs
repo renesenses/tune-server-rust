@@ -264,3 +264,91 @@ async fn les_groupes_d_avant_sont_recalcules_au_demarrage() {
         "le groupe n'est pas refait, seulement complété"
     );
 }
+
+/// #6132 × #7937 — un nouveau groupe prend une zone à un groupe plus ancien
+/// (le client web regroupe sans dégrouper d'abord). L'ancien groupe qui garde
+/// deux zones voit sa sortie double recalculée sur sa nouvelle composition ;
+/// celui qui tombe sous deux zones disparaît, et la sortie double de sa
+/// meneuse avec lui : elle ne doit pas continuer d'envoyer le flux vers une
+/// carte qui n'est plus groupée.
+#[tokio::test]
+async fn un_nouveau_groupe_refait_la_sortie_double_des_groupes_qu_il_ampute() {
+    use axum::Json;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::outputs::sortie_double::{cle_de_zone, secondes_sorties_de_zone};
+    let state =
+        crate::state::AppState::new(":memory:", 0, crate::config::TuneConfig::default()).unwrap();
+    state.license.set_account_premium(true, None).await;
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let salon = repo
+        .create("Salon", Some("local"), Some("local:DAC A"))
+        .unwrap();
+    let bureau = repo
+        .create("Bureau", Some("local"), Some("local:DAC B"))
+        .unwrap();
+    let atelier = repo
+        .create("Atelier", Some("local"), Some("local:DAC C"))
+        .unwrap();
+    let cuisine = repo
+        .create("Cuisine", Some("local"), Some("local:DAC D"))
+        .unwrap();
+    let chambre = repo
+        .create("Chambre", Some("local"), Some("local:DAC E"))
+        .unwrap();
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let grouper = |meneur: i64, zones: Vec<i64>| {
+        let state = state.clone();
+        async move {
+            let corps: CreateGroup = serde_json::from_value(
+                serde_json::json!({ "leader_id": meneur, "zone_ids": zones }),
+            )
+            .unwrap();
+            let rep = super::create_group(State(state), axum::http::HeaderMap::new(), Json(corps))
+                .await
+                .ok()
+                .unwrap()
+                .into_response();
+            assert_eq!(rep.status(), axum::http::StatusCode::CREATED);
+        }
+    };
+
+    grouper(salon, vec![salon, bureau, atelier]).await;
+    grouper(cuisine, vec![cuisine, chambre]).await;
+    assert_eq!(
+        secondes_sorties_de_zone(&state.backend, salon),
+        vec!["DAC B".to_string(), "DAC C".to_string()]
+    );
+    assert_eq!(
+        secondes_sorties_de_zone(&state.backend, cuisine),
+        vec!["DAC E".to_string()]
+    );
+
+    // Bureau et Chambre partent ensemble : « Salon + Atelier » reste un
+    // groupe, « Cuisine » seule n'en est plus un.
+    grouper(bureau, vec![bureau, chambre]).await;
+
+    assert_eq!(
+        secondes_sorties_de_zone(&state.backend, salon),
+        vec!["DAC C".to_string()],
+        "Salon ne doit plus envoyer vers DAC B, parti dans un autre groupe"
+    );
+    assert_eq!(
+        settings.get(&cle_de_zone(cuisine)).unwrap(),
+        None,
+        "le groupe de Cuisine est défait : sa sortie double doit partir avec lui"
+    );
+    assert_eq!(
+        secondes_sorties_de_zone(&state.backend, bureau),
+        vec!["DAC E".to_string()]
+    );
+    let groupes: Vec<serde_json::Value> =
+        serde_json::from_str(&settings.get("zone_groups").unwrap().unwrap()).unwrap();
+    assert_eq!(groupes.len(), 2, "{groupes:?}");
+    assert_eq!(
+        groupes[0]["sortie_double"]["suiveurs"],
+        serde_json::json!([{ "zone_id": atelier, "sortie": "local:DAC C" }])
+    );
+}
