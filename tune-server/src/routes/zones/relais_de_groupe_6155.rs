@@ -28,8 +28,25 @@
 //! un arrêt fugace de la meneuse entre deux pistes ne coupe pas les
 //! suiveuses ([`DELAI_AVANT_D_ARRETER`]).
 //!
-//! Seuls les gestes de la MENEUSE sont relayés : une commande donnée sur une
-//! suiveuse ne vaut que pour elle.
+//! Seuls les gestes de la MENEUSE sont relayés : une pause, une reprise, un
+//! arrêt, un suivant ou un précédent donnés sur une suiveuse ne valent que
+//! pour elle.
+//!
+//! #7717 — une exception : une NOUVELLE lecture lancée sur une zone du groupe,
+//! depuis n'importe quel client, fait de cette zone la meneuse
+//! ([`lancer_en_tete_du_groupe`]). Sont des lancements : `POST
+//! /zones/{id}/play` avec un corps (le corps vide, Lecture après Arrêt, est une
+//! reprise et n'y compte pas), le saut dans la file, la radio (« Mes radios »
+//! et l'annuaire, par `jouer_un_flux`), l'épisode de podcast, le préréglage
+//! épinglé, la radio d'artiste et la lecture aléatoire de la bibliothèque. Un
+//! lancement refusé (réponse d'échec, radio qui ne part pas) rend la tête à la
+//! meneuse d'avant. Le groupe
+//! formé depuis la fiche de la Chromecast suivait la Chromecast seule : une
+//! lecture lancée ensuite sur l'autre zone partait sur elle seule, et la
+//! Chromecast gardait son ancien titre. La meneuse change dans la route, avant
+//! le lancement, jamais sur l'événement `started` : la suiveuse qui rejoint
+//! émet elle aussi `started`, elle deviendrait meneuse à son tour et les deux
+//! zones se renverraient la lecture.
 
 use std::time::Duration;
 
@@ -95,15 +112,8 @@ impl Instantane {
 pub(crate) fn zones_suiveuses(groupes: &[Value], meneuse: i64) -> Vec<i64> {
     let mut suiveuses = Vec::new();
     for groupe in groupes {
-        let zones: Vec<i64> = groupe["zone_ids"]
-            .as_array()
-            .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
-            .unwrap_or_default();
-        let tete = groupe["leader_id"]
-            .as_i64()
-            .or_else(|| groupe["leader_zone_id"].as_i64())
-            .or_else(|| zones.first().copied());
-        if tete != Some(meneuse) {
+        let zones = zones_du_groupe(groupe);
+        if meneuse_du_groupe(groupe) != Some(meneuse) {
             continue;
         }
         for id in zones {
@@ -113,6 +123,20 @@ pub(crate) fn zones_suiveuses(groupes: &[Value], meneuse: i64) -> Vec<i64> {
         }
     }
     suiveuses
+}
+
+fn zones_du_groupe(groupe: &Value) -> Vec<i64> {
+    groupe["zone_ids"]
+        .as_array()
+        .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default()
+}
+
+fn meneuse_du_groupe(groupe: &Value) -> Option<i64> {
+    groupe["leader_id"]
+        .as_i64()
+        .or_else(|| groupe["leader_zone_id"].as_i64())
+        .or_else(|| zones_du_groupe(groupe).first().copied())
 }
 
 /// Le geste qui ramène `suiveuse` sur `meneuse`, ou `None` si elle y est déjà.
@@ -137,6 +161,158 @@ fn groupes_enregistres(state: &AppState) -> Vec<Value> {
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// #7717 — la meneuse qu'un groupe avait avant qu'une lecture lancée sur une
+/// autre de ses zones ne la remplace : de quoi la lui rendre si ce lancement
+/// est refusé.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeneuseRemplacee {
+    /// Les zones du groupe, qui le reconnaissent au moment de rendre la tête
+    /// (son `id` peut se répéter, voir `create_group`).
+    zones: Vec<i64>,
+    meneuse: i64,
+}
+
+/// #7717 — fait de `zone` la meneuse de chaque groupe qui la compte et qu'elle
+/// ne mène pas déjà. Rend les meneuses remplacées (vide : rien n'a changé).
+///
+/// `leader_id` est la clé que lit [`zones_suiveuses`] en premier ;
+/// `leader_zone_id` (forme de `/zone-manager/groups`) suit quand il existe,
+/// pour que les deux lectures du groupe disent la même meneuse.
+pub(crate) fn mener_les_groupes_de(groupes: &mut [Value], zone: i64) -> Vec<MeneuseRemplacee> {
+    let mut remplacees = Vec::new();
+    for groupe in groupes.iter_mut() {
+        let zones = zones_du_groupe(groupe);
+        let Some(meneuse) = meneuse_du_groupe(groupe) else {
+            continue;
+        };
+        if !zones.contains(&zone) || meneuse == zone {
+            continue;
+        }
+        if nommer_la_meneuse(groupe, zone) {
+            remplacees.push(MeneuseRemplacee { zones, meneuse });
+        }
+    }
+    remplacees
+}
+
+/// #7717 — le lancement sur `zone` a été refusé : chaque groupe qu'elle mène
+/// encore et dont elle avait pris la tête retrouve sa meneuse d'avant. Un
+/// groupe changé entre-temps (autre meneuse, autres zones) n'est pas touché.
+/// Rend `true` si un groupe a changé.
+pub(crate) fn rendre_les_groupes(
+    groupes: &mut [Value],
+    zone: i64,
+    remplacees: &[MeneuseRemplacee],
+) -> bool {
+    let mut change = false;
+    for groupe in groupes.iter_mut() {
+        if meneuse_du_groupe(groupe) != Some(zone) {
+            continue;
+        }
+        let zones = zones_du_groupe(groupe);
+        if let Some(avant) = remplacees.iter().find(|r| r.zones == zones) {
+            change |= nommer_la_meneuse(groupe, avant.meneuse);
+        }
+    }
+    change
+}
+
+fn nommer_la_meneuse(groupe: &mut Value, zone: i64) -> bool {
+    let Some(objet) = groupe.as_object_mut() else {
+        return false;
+    };
+    objet.insert("leader_id".into(), Value::from(zone));
+    if objet.contains_key("leader_zone_id") {
+        objet.insert("leader_zone_id".into(), Value::from(zone));
+    }
+    true
+}
+
+/// Sérialise les relectures-réécritures de `zone_groups` faites par les
+/// lancements : deux lectures simultanées sur deux zones ne s'écrasent pas.
+/// Les routes de `groupes.rs` et `zone_manager.rs` écrivent sans lui.
+static MENEUSES_EN_ECRITURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Relit les groupes, applique `changer`, et réécrit s'il a changé quelque
+/// chose, sous [`MENEUSES_EN_ECRITURE`].
+fn changer_les_groupes<R>(
+    state: &AppState,
+    changer: impl FnOnce(&mut [Value]) -> R,
+    a_change: impl Fn(&R) -> bool,
+) -> Option<R> {
+    let _garde = MENEUSES_EN_ECRITURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut groupes = groupes_enregistres(state);
+    let rendu = changer(&mut groupes);
+    if !a_change(&rendu) {
+        return Some(rendu);
+    }
+    let texte = serde_json::to_string(&groupes).ok()?;
+    match SettingsRepo::with_backend(state.backend.clone()).set("zone_groups", &texte) {
+        Ok(()) => Some(rendu),
+        Err(error) => {
+            warn!(%error, "zone_group_leader_change_failed");
+            None
+        }
+    }
+}
+
+/// #7717 — une lecture lancée par un utilisateur sur `zone` : si `zone` est
+/// dans un groupe qu'elle ne mène pas, elle en devient la meneuse, et le
+/// relais y fera suivre les autres zones au `started` qui vient.
+///
+/// Appelé par les routes de lancement AVANT de lancer (le relais réagit au
+/// `started`), jamais par le relais. Voir [`lancer_en_tete_du_groupe`].
+pub(crate) fn prendre_la_tete_du_groupe(state: &AppState, zone: i64) -> Vec<MeneuseRemplacee> {
+    let remplacees = changer_les_groupes(
+        state,
+        |groupes| mener_les_groupes_de(groupes, zone),
+        |r| !r.is_empty(),
+    )
+    .unwrap_or_default();
+    if !remplacees.is_empty() {
+        info!(
+            zone,
+            groupes = remplacees.len(),
+            "zone_group_leader_changed"
+        );
+    }
+    remplacees
+}
+
+/// #7717 — le lancement sur `zone` a échoué : rendre la tête aux meneuses
+/// qu'il avait remplacées.
+pub(crate) fn rendre_la_tete_du_groupe(
+    state: &AppState,
+    zone: i64,
+    remplacees: &[MeneuseRemplacee],
+) {
+    if remplacees.is_empty() {
+        return;
+    }
+    if changer_les_groupes(state, |g| rendre_les_groupes(g, zone, remplacees), |c| *c) == Some(true)
+    {
+        info!(zone, "zone_group_leader_restored");
+    }
+}
+
+/// #7717 — enveloppe d'une route de lancement : `zone` prend la tête de son
+/// groupe, puis la route lance ; une réponse d'échec (4xx, 5xx) rend la tête à
+/// la meneuse d'avant, puisqu'aucune lecture n'est partie.
+pub(crate) async fn lancer_en_tete_du_groupe<R: axum::response::IntoResponse>(
+    state: &AppState,
+    zone: i64,
+    lancement: impl std::future::Future<Output = R>,
+) -> axum::response::Response {
+    let remplacees = prendre_la_tete_du_groupe(state, zone);
+    let reponse = lancement.await.into_response();
+    if !reponse.status().is_success() {
+        rendre_la_tete_du_groupe(state, zone, &remplacees);
+    }
+    reponse
 }
 
 /// Ramène chaque suiveuse de `meneuse` sur ce que joue la meneuse, maintenant.
