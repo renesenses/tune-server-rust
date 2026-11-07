@@ -356,6 +356,26 @@ impl Banc {
             .await;
     }
 
+    /// #7379 — un pas « volume + / − » (`delta`, signé) depuis le volume que
+    /// la zone AFFICHE (mémoire), par `set_volume_au_pas`, comme les boutons
+    /// du client.
+    pub(super) async fn pas_de_volume(&self, delta: f64) {
+        let affiche = self.volume_en_memoire().await;
+        self.poller
+            .orchestrator
+            .set_volume_au_pas(
+                self.zone_id,
+                (affiche + delta).clamp(0.0, 1.0),
+                Some(self.appareil),
+            )
+            .await
+            .unwrap();
+        self.poller
+            .playback
+            .ecouler_la_grace_de_volume(self.zone_id)
+            .await;
+    }
+
     /// #7379 — une consigne de l'auditeur, la grâce de volume LAISSÉE ouverte
     /// (elle vient d'arriver).
     pub(super) async fn consigne_a_l_instant(&self, volume: f64) {

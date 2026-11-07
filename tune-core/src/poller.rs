@@ -68,12 +68,10 @@ static STATUS_POLL_TIMEOUT: LazyLock<Option<Duration>> = LazyLock::new(|| {
 /// prend jamais pour un geste au bouton (ni suivi, ni retour au plafond,
 /// ni repère du front #358).
 pub(crate) fn volume_releve_illisible(output: &dyn OutputTarget) -> bool {
-    let any = output.as_any();
-    if let Some(dlna) = any.downcast_ref::<crate::outputs::dlna::DlnaOutput>() {
-        return dlna.dernier_volume_illisible();
-    }
-    any.downcast_ref::<crate::outputs::mock::MockOutput>()
-        .is_some_and(|m| m.dernier_volume_illisible())
+    // Un seul mécanisme pour toutes les sorties : le trait le dit (seconde
+    // revue de #7702 : Squeezebox, BluOS, Chromecast et OpenHome sans
+    // service Volume rendaient le même repli sans le signaler).
+    output.volume_du_statut_illisible()
 }
 
 async fn get_status_with_signal_path_bounded(

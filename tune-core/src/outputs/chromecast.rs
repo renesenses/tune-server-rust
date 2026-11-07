@@ -587,6 +587,15 @@ pub struct ChromecastOutput {
     /// lecture qu'il en a rapportée, en attente du sondeur. Voir
     /// [`ChargementCast`].
     chargement: Arc<std::sync::Mutex<ChargementCast>>,
+    /// #7379 — le dernier statut du récepteur n'avait pas de `volume.level`.
+    volume_illisible: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// #7379 — le volume (0..1) d'un statut de récepteur Cast, ou `None` quand
+/// `volume.level` manque ou n'est pas un nombre fini : le sondeur ne doit
+/// pas prendre le repli pour une valeur lue.
+pub(crate) fn volume_du_recepteur(level: Option<f32>) -> Option<f64> {
+    level.map(f64::from).filter(|v| v.is_finite())
 }
 
 /// Fil 2121 — l'erreur de lecture d'un récepteur Cast remonte à la zone.
@@ -686,6 +695,7 @@ impl ChromecastOutput {
             play_retry_timeout_joint: CAST_PLAY_RETRY_TIMEOUT_APPAREIL_JOINT,
             command_slots: Arc::clone(&CAST_COMMAND_SLOTS),
             chargement: Arc::default(),
+            volume_illisible: Arc::default(),
         }
     }
 
@@ -707,6 +717,11 @@ impl ChromecastOutput {
 
 #[async_trait::async_trait]
 impl OutputTarget for ChromecastOutput {
+    fn volume_du_statut_illisible(&self) -> bool {
+        self.volume_illisible
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -1151,6 +1166,7 @@ impl OutputTarget for ChromecastOutput {
         let slots = Arc::clone(&self.command_slots);
         let chargement = Arc::clone(&self.chargement);
         let name = self.name.clone();
+        let volume_illisible = Arc::clone(&self.volume_illisible);
         run_cast_command(host, port, timeout, slots, move |device| {
             device
                 .connection
@@ -1162,7 +1178,11 @@ impl OutputTarget for ChromecastOutput {
                 .get_status()
                 .map_err(|e| format!("status: {e}"))?;
 
-            let volume = recv_status.volume.level.unwrap_or(0.5) as f64;
+            // #7379 — sans `volume.level`, le repli 0,5 reste dans le statut,
+            // mais la sortie dit que ce n'est pas une valeur lue.
+            let lu = volume_du_recepteur(recv_status.volume.level);
+            volume_illisible.store(lu.is_none(), std::sync::atomic::Ordering::Relaxed);
+            let volume = lu.unwrap_or(crate::outputs::dlna::volume_illisible_5662::REPLI_ILLISIBLE);
             let muted = recv_status.volume.muted.unwrap_or(false);
 
             // #2566 — le sondage interrogeait le canal média de la PREMIÈRE
@@ -1362,6 +1382,30 @@ mod deadline_tests {
             }
         });
         (port, active, maximum, task)
+    }
+
+    /// #7379 — `volume.level` absent ou non fini n'est pas une valeur lue :
+    /// `get_status` garde le repli 0,5 et lève `volume_du_statut_illisible`.
+    /// (Le récepteur Cast parle TLS/protobuf : pas de faux récepteur ici, le
+    /// témoin porte sur la conversion que `get_status` appelle, et sur l'état
+    /// de départ de la sortie.)
+    #[test]
+    fn un_volume_absent_du_recepteur_est_signale_7379() {
+        assert_eq!(volume_du_recepteur(None), None);
+        assert_eq!(volume_du_recepteur(Some(f32::NAN)), None);
+        assert_eq!(volume_du_recepteur(Some(f32::INFINITY)), None);
+        let lu = volume_du_recepteur(Some(0.4)).unwrap();
+        assert!((lu - 0.4).abs() < 1e-6, "{lu}");
+        let sortie =
+            ChromecastOutput::new("Cast".into(), "cast:7379".into(), "127.0.0.1".into(), 9);
+        assert!(!sortie.volume_du_statut_illisible());
+        sortie
+            .volume_illisible
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            sortie.volume_du_statut_illisible(),
+            "le trait lit le drapeau du statut"
+        );
     }
 
     fn test_output(port: u16, timeout: Duration, slots: Arc<Semaphore>) -> ChromecastOutput {

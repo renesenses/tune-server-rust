@@ -301,11 +301,15 @@ async fn un_releve_illisible_sans_limite_n_est_pas_suivi_7379() {
         "{}",
         banc.volume_en_base()
     );
-    banc.consigne_gardee(0.18).await;
+    // Seconde revue : un pas RELATIF depuis ce que la zone affiche. Si le
+    // repli avait été suivi, l'affichage serait à 50 % et ce pas enverrait
+    // 48 % à un appareil réellement à 20 %.
+    banc.pas_de_volume(-0.02).await;
     let recus = banc.commandes_depuis(deja).await;
+    assert_eq!(recus.len(), 1, "{recus:?}");
     assert!(
-        !recus.is_empty() && recus.iter().all(|v| *v <= 0.2 + 1e-9),
-        "B1 : après un repli suivi, « volume − » enverrait plus que 20 % : {recus:?}"
+        (recus[0] - 0.18).abs() < 1e-9,
+        "B1 : « volume − » depuis l'affichage doit envoyer 18 %, pas {recus:?}"
     );
 }
 

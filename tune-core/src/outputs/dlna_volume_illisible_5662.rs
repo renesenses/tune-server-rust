@@ -132,6 +132,67 @@ mod tests {
         (host, task)
     }
 
+    /// #7379 — le VRAI `get_status` d'un `DlnaOutput` lève l'illisibilité
+    /// (trait `volume_du_statut_illisible`) quand la réponse de volume est
+    /// vide ou sans `CurrentVolume`, et la baisse dès qu'un volume se lit.
+    #[tokio::test]
+    async fn le_statut_signale_un_volume_illisible_au_sondeur_7379() {
+        use crate::outputs::traits::OutputTarget;
+        let rc = Arc::new(Mutex::new(String::new()));
+        let rc_route = rc.clone();
+        let app = Router::new()
+            .route(
+                "/av/control",
+                post(|| async {
+                    "<s:Envelope><s:Body><CurrentTransportState>PLAYING</CurrentTransportState>\
+                     <RelTime>0:00:10</RelTime><TrackDuration>0:05:00</TrackDuration>\
+                     </s:Body></s:Envelope>"
+                }),
+            )
+            .route(
+                "/rc/control",
+                post(move || {
+                    let rc = rc_route.clone();
+                    async move { rc.lock().unwrap().clone() }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let out = DlnaOutput::new(
+            "Banc 7379".into(),
+            "uuid:7379".into(),
+            host.clone(),
+            format!("{host}/av/control"),
+            format!("{host}/rc/control"),
+            None,
+        );
+        for corps in [
+            "",
+            "<s:Envelope><s:Body><u:GetVolumeResponse/></s:Body></s:Envelope>",
+        ] {
+            *rc.lock().unwrap() = corps.into();
+            let statut = out.get_status().await.unwrap();
+            assert_eq!(
+                statut.volume, REPLI_ILLISIBLE,
+                "le repli reste dans le statut"
+            );
+            assert!(
+                out.volume_du_statut_illisible(),
+                "réponse {corps:?} : le repli doit être signalé au sondeur"
+            );
+        }
+        *rc.lock().unwrap() =
+            "<s:Envelope><s:Body><CurrentVolume>40</CurrentVolume></s:Body></s:Envelope>".into();
+        let statut = out.get_status().await.unwrap();
+        assert!((statut.volume - 0.4).abs() < 1e-9, "{}", statut.volume);
+        assert!(
+            !out.volume_du_statut_illisible(),
+            "un volume lu n'est pas un repli"
+        );
+        task.abort();
+    }
+
     /// Une réponse illisible donne UNE ligne WARN avec sa raison et son
     /// extrait, quel que soit le nombre de lectures ; le repli 0,5 est
     /// inchangé ; le retour à une réponse lisible écrit la fin d'épisode.

@@ -2470,6 +2470,10 @@ impl DlnaOutput {
 
 #[async_trait::async_trait]
 impl OutputTarget for DlnaOutput {
+    fn volume_du_statut_illisible(&self) -> bool {
+        self.dernier_volume_illisible()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

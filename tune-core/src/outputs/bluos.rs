@@ -17,6 +17,8 @@ pub struct BluosOutput {
     /// sans repayer l'échec, et l'enchaînement sans blanc par la file n'est
     /// plus armé (`supports_internal_gapless`).
     add_refuse: AtomicBool,
+    /// #7379 — le dernier `/Status` n'avait pas de `<volume>` lisible.
+    volume_illisible: AtomicBool,
 }
 
 impl BluosOutput {
@@ -31,6 +33,7 @@ impl BluosOutput {
                 .build()
                 .unwrap(),
             add_refuse: AtomicBool::new(false),
+            volume_illisible: AtomicBool::new(false),
         }
     }
 
@@ -290,6 +293,10 @@ fn truncate_body(body: &str) -> String {
 
 #[async_trait::async_trait]
 impl OutputTarget for BluosOutput {
+    fn volume_du_statut_illisible(&self) -> bool {
+        self.volume_illisible.load(Ordering::Relaxed)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -515,10 +522,14 @@ impl OutputTarget for BluosOutput {
             .map(|s| (s * 1000.0) as u64)
             .unwrap_or(0);
 
-        let volume = extract_tag(&xml, "volume")
+        // #7379 — sans `<volume>` lisible, le repli 0,5 reste dans le statut,
+        // mais la sortie dit que ce n'est pas une valeur lue.
+        let lu = extract_tag(&xml, "volume")
             .and_then(|v| v.parse::<f64>().ok())
-            .map(|v| v / 100.0)
-            .unwrap_or(0.5);
+            .filter(|v| v.is_finite())
+            .map(|v| v / 100.0);
+        self.volume_illisible.store(lu.is_none(), Ordering::Relaxed);
+        let volume = lu.unwrap_or(crate::outputs::dlna::volume_illisible_5662::REPLI_ILLISIBLE);
 
         let muted = extract_tag(&xml, "mute")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("on"))
@@ -649,6 +660,42 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #7379 — le VRAI `get_status` lève l'illisibilité quand `<volume>`
+    /// manque du `/Status`, et la baisse dès qu'un volume se lit.
+    #[tokio::test]
+    async fn le_statut_signale_un_volume_illisible_au_sondeur_7379() {
+        let corps = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let corps_route = corps.clone();
+        let app = axum::Router::new().route(
+            "/Status",
+            axum::routing::get(move || {
+                let c = corps_route.clone();
+                async move { c.lock().unwrap().clone() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let out = BluosOutput::new("Node".into(), "bluos-7379".into(), "127.0.0.1".into(), port);
+        for xml in [
+            "<status><state>play</state><secs>10</secs></status>",
+            "<status><state>play</state><volume>abc</volume></status>",
+        ] {
+            *corps.lock().unwrap() = xml.into();
+            let statut = out.get_status().await.unwrap();
+            assert_eq!(statut.volume, 0.5, "le repli reste dans le statut");
+            assert!(
+                out.volume_du_statut_illisible(),
+                "{xml} : repli non signalé"
+            );
+        }
+        *corps.lock().unwrap() = "<status><state>play</state><volume>40</volume></status>".into();
+        let statut = out.get_status().await.unwrap();
+        assert!((statut.volume - 0.4).abs() < 1e-9);
+        assert!(!out.volume_du_statut_illisible());
+        task.abort();
+    }
 
     #[test]
     fn parse_status_xml() {
