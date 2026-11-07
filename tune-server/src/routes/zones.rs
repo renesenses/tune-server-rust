@@ -1696,6 +1696,9 @@ mod signal_path_pure_replaygain_5633_tests;
 // #7632 — l'étape « Correction de pièce » dit si la RI de la zone est appliquée.
 #[cfg(test)]
 mod signal_path_correction_piece_7632_tests;
+// #7614 — le suréchantillonneur dans le chemin du signal.
+#[cfg(test)]
+mod signal_path_surechantillonnage_7614_tests;
 
 // #4384 — ReplayGain sans gain tagué, et où le gain s'applique.
 #[cfg(test)]

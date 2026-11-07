@@ -6767,6 +6767,7 @@ dependencies = [
  "tune-plugin-equalizer",
  "tune-plugin-native",
  "tune-plugin-sdk",
+ "tune-plugin-surechantillonnage",
  "unicode-normalization",
  "urlencoding",
  "uuid",
@@ -6987,6 +6988,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tune-plugin-surechantillonnage"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-audio-support",
+ "tune-plugin-sdk",
 ]
 
 [[package]]

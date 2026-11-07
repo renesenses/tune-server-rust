@@ -2197,10 +2197,17 @@ pub(super) async fn update_config(
     // lit avec la même fonction, arguments inversés.
     let ajoutees = racines_retirees(&racines_apres, &racines_avant);
     if !ajoutees.is_empty() {
+        crate::auto_scan::signaler_racines_modifiees();
+        // #8083 — une seule racine ajoutée : scan ciblé sur elle. Plusieurs à
+        // la fois : le scan ne sait viser qu'un dossier, il reste complet.
+        let cible = match ajoutees.as_slice() {
+            [une] => Some(tune_core::scanner::walker::normalize_path(une)),
+            _ => None,
+        };
         super::scan::spawn_library_scan_par(
             state.clone(),
             false,
-            None,
+            cible,
             super::scan::ORIGINE_AJOUT_DE_DOSSIER,
         )
         .await;
@@ -3416,7 +3423,7 @@ pub(super) async fn add_music_dir(
 
     let newly_added = !dirs.contains(&normalized);
     if newly_added {
-        dirs.push(normalized);
+        dirs.push(normalized.clone());
     }
 
     settings.set("music_dirs", &serde_json::to_string(&dirs)?)?;
@@ -3426,11 +3433,18 @@ pub(super) async fn add_music_dir(
     // file-watcher are both initialised once at boot with the old dir list, so a
     // folder added later was neither scanned nor watched — it only showed up
     // after a restart (Jean-Pierre).
+    //
+    // #8083 — le scan ne parcourt QUE le dossier ajouté. Avec `None`, ajouter
+    // 3 000 pistes faisait reparcourir une bibliothèque de 730 000. Le scan
+    // ciblé accepte la racine elle-même (`sous_le_dossier(p, p)`), et sa purge
+    // des pistes disparues reste bornée à ce sous-arbre : les autres racines
+    // ne sont ni relues ni élaguées.
     if newly_added {
+        crate::auto_scan::signaler_racines_modifiees();
         super::scan::spawn_library_scan_par(
             state.clone(),
             false,
-            None,
+            Some(normalized),
             super::scan::ORIGINE_AJOUT_DE_DOSSIER,
         )
         .await;
@@ -7053,6 +7067,10 @@ mod volume_6774_tests;
 #[cfg(test)]
 #[path = "racines_preservees_6175_tests.rs"]
 mod racines_preservees_6175_tests;
+
+#[cfg(test)]
+#[path = "ajout_dossier_scan_cible_8083_tests.rs"]
+mod ajout_dossier_scan_cible_8083_tests;
 
 /// #7538 — les dossiers exclus de l'enrichissement : publiés vides,
 /// normalisés comme les autres listes du périmètre, refusés sous une autre
