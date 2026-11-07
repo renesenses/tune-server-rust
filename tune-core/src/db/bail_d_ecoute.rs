@@ -182,7 +182,9 @@ pub fn ecoute_entre(
 ) -> Result<i64, String> {
     Ok(db
         .query_one_strong(
-            "SELECT COALESCE(SUM(secondes), 0) FROM ecoutes_parentales \
+            // PostgreSQL rend `SUM(BIGINT)` en NUMERIC, que `as_i64` ne lit
+            // pas : sans le CAST, le temps écouté y vaudrait toujours 0.
+            "SELECT CAST(COALESCE(SUM(secondes), 0) AS BIGINT) FROM ecoutes_parentales \
              WHERE profile_id = ? AND jour >= ? AND jour <= ?",
             &[
                 &profile_id as &dyn ToSqlValue,
