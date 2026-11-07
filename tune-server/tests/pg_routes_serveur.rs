@@ -368,3 +368,66 @@ async fn pg_7037_enregistrer_une_cle_listenbrainz_ou_lastfm() {
             .unwrap_or_else(|e| panic!("ménage de streaming_auth ({service}) : {e}"));
     }
 }
+
+/// #7288 — « Create backup » sur une VRAIE base PostgreSQL : un `pg_dump` réel
+/// de la base du serveur, au format custom (en-tête `PGDMP`), listé ensuite
+/// par `GET /system/backups`. Avant le correctif, la route répondait 400
+/// « file backups are SQLite-only ». Le `pg_dump` du `PATH` (ou `TUNE_PG_DUMP`)
+/// doit être de la même version majeure que le serveur.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_7288_creer_une_sauvegarde_sur_postgresql() {
+    let Some(url) = url_pg() else {
+        eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tune.db").to_string_lossy().into_owned();
+    let config = tune_server::config::TuneConfig {
+        database_url: Some(url),
+        db_path: db_path.clone(),
+        ..Default::default()
+    };
+    let state = AppState::new(&db_path, 0, config).expect("AppState sur PostgreSQL");
+    let app: Router = tune_server::routes::router(state);
+
+    let reponse = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/system/backups")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let statut = reponse.status();
+    let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&corps).unwrap_or_default();
+    assert_eq!(
+        statut,
+        axum::http::StatusCode::OK,
+        "POST /system/backups sur PostgreSQL : {json}"
+    );
+    assert_eq!(json["engine"], "postgres", "{json}");
+    let nom = json["filename"].as_str().expect("filename").to_string();
+    let octets = std::fs::read(tmp.path().join("backups").join(&nom)).expect("fichier du dump");
+    assert!(
+        octets.starts_with(b"PGDMP"),
+        "pas un dump custom de pg_dump"
+    );
+
+    let liste = app
+        .oneshot(
+            Request::get("/api/v1/system/backups")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let corps = axum::body::to_bytes(liste.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let liste: serde_json::Value = serde_json::from_slice(&corps).unwrap();
+    assert_eq!(liste[0]["filename"], nom.as_str(), "{liste}");
+}

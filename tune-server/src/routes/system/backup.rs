@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -6,7 +8,9 @@ use serde_json::{Value, json};
 
 use crate::state::AppState;
 
-/// These routes copy the **SQLite file** at `config.db_path`.
+/// The restore and encrypted-backup routes copy the **SQLite file** at
+/// `config.db_path`; `create_backup` and `list_backups` handle PostgreSQL
+/// with `pg_dump` instead (#7288).
 ///
 /// In PostgreSQL mode that file is not the live database — it may be stale or
 /// absent entirely, since the server no longer opens it. Backing it up would
@@ -35,10 +39,67 @@ fn require_sqlite_store(state: &AppState) -> Result<String, Response> {
     Ok(db_path)
 }
 
+/// Le dossier `backups` voisin du fichier de base configuré, comme pour SQLite.
+fn dossier_des_sauvegardes(db_path: &str) -> PathBuf {
+    Path::new(db_path)
+        .parent()
+        .map(|p| p.join("backups"))
+        .unwrap_or_else(|| PathBuf::from("backups"))
+}
+
+/// « Create backup » sur PostgreSQL (#7288) : un `pg_dump` de la base réelle
+/// dans le dossier `backups`, au lieu de l'ancien refus 400. Séparé du
+/// handler pour être testé sans serveur PostgreSQL, avec un faux `pg_dump`.
+async fn sauvegarder_postgres(
+    database_url: Option<String>,
+    db_path: &str,
+    pg_dump: PathBuf,
+) -> Response {
+    let Some(url) = database_url.filter(|u| !u.trim().is_empty()) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "PostgreSQL backup impossible: TUNE_DATABASE_URL is not set",
+                "code": "database_url_missing",
+            })),
+        )
+            .into_response();
+    };
+    let dossier = dossier_des_sauvegardes(db_path);
+    let resultat = tokio::task::spawn_blocking(move || {
+        tune_core::db_backup::postgres::create_pg_backup(&url, &dossier, &pg_dump)
+    })
+    .await;
+    match resultat {
+        Ok(Ok(info)) => Json(json!({
+            "filename": info.filename,
+            "size": info.size,
+            "created_at": info.created_at,
+            "engine": "postgres",
+            "restore_hint": "pg_restore --clean --if-exists --no-owner --dbname <TUNE_DATABASE_URL> <file>",
+        }))
+        .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string(), "code": e.code()})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("backup task failed: {e}"), "code": "backup_failed"})),
+        )
+            .into_response(),
+    }
+}
+
 pub(super) async fn list_backups(State(state): State<AppState>) -> Json<Value> {
     if state.db.is_none() {
-        // Nothing to list: the SQLite file is not this server's store.
-        return Json(json!([]));
+        // PostgreSQL : les dumps faits par « Create backup » (#7288), jamais
+        // les copies d'un fichier SQLite qui n'est pas la base du serveur.
+        let dossier = dossier_des_sauvegardes(&state.config.db_path);
+        return Json(json!(tune_core::db_backup::postgres::list_pg_backups(
+            &dossier
+        )));
     }
     let items = tune_core::db_backup::list_backups(&state.config.db_path);
     Json(json!(items))
@@ -48,6 +109,14 @@ pub(super) async fn create_backup(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    if state.db.is_none() {
+        return sauvegarder_postgres(
+            state.config.database_url.clone(),
+            &state.config.db_path,
+            tune_core::db_backup::postgres::programme_pg_dump(),
+        )
+        .await;
+    }
     let db_path = match require_sqlite_store(&state) {
         Ok(p) => p,
         Err(resp) => return resp,
@@ -149,3 +218,7 @@ pub(super) async fn create_encrypted_backup(
     }))
     .into_response()
 }
+
+#[cfg(test)]
+#[path = "backup_postgres_tests_7288.rs"]
+mod backup_postgres_tests_7288;
