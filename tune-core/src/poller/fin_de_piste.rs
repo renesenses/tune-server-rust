@@ -562,6 +562,28 @@ impl PositionPoller {
                     return true;
                 }
                 Err(e) => {
+                    // #7974 — le bail d'écoute est fini : ce n'est pas la piste
+                    // qui échoue, c'est la séance. Aucune piste n'est « sautée »,
+                    // aucune autre n'est essayée ; la zone s'arrête (appelant).
+                    if let Some(refus) =
+                        crate::db::bail_d_ecoute::Refus::depuis_sentinelle(&e.to_string())
+                    {
+                        info!(
+                            zone_id,
+                            pos = attempt_pos,
+                            raison = refus.code(),
+                            "auto_next_parental_lease_ended"
+                        );
+                        self.playback.emit_bail_parental(
+                            zone_id,
+                            "parental_lease_ended",
+                            serde_json::json!({
+                                "code": crate::db::bail_d_ecoute::CODE_REFUS,
+                                "reason": refus.code(),
+                            }),
+                        );
+                        break;
+                    }
                     warn!(zone_id, error = %e, pos = attempt_pos, "auto_next_failed");
                     // #5327 — la source dit que plus rien de cette file ne se
                     // jouera (serveur du contact éteint) : on s'arrête ici,
@@ -1015,6 +1037,19 @@ impl PositionPoller {
         let Some(next_pos) = Self::prochaine_position_jouable(&self.db, zone_id, zone_state) else {
             return GaplessPrep::NotArmed;
         };
+        // #7974 — armée, la suivante serait jouée par le renderer sans
+        // repasser par la garde du bail d'écoute : on ne l'arme pas si le
+        // bail finit avant elle. La fin de piste passe alors par la garde.
+        if !self
+            .orchestrator
+            .bail_couvre_l_enchainement(
+                zone_id,
+                fin_estimee.saturating_duration_since(Instant::now()),
+            )
+            .await
+        {
+            return GaplessPrep::NotArmed;
+        }
 
         // L'identite de ce qu'on s'apprete a armer, lue AVANT de le resoudre :
         // une ligne de file, pas une position (#3026). C'est la seule trace de

@@ -1359,6 +1359,11 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     ecoutes_en_attente: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEnAttente>>,
+    /// #7974 — le suivi du bail d'écoute de chaque zone en lecture. Voir
+    /// `bail_parental_7974`.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    suivis_de_bail: std::sync::Mutex<HashMap<i64, bail_parental_7974::SuiviDuBail>>,
     /// #6066 — ce que les LECTEURS des zones navigateur ont dit de leur
     /// lecture (`POST /zones/{id}/browser-playing`). Voir
     /// `confirmation_navigateur_6066`.
@@ -1965,6 +1970,7 @@ impl PlaybackOrchestrator {
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
+            suivis_de_bail: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
@@ -2035,6 +2041,9 @@ impl PlaybackOrchestrator {
     const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
 }
 
+pub mod bail_parental_7974;
+#[cfg(test)]
+mod bail_parental_7974_tests;
 mod commun;
 mod confirmation_navigateur_6066;
 pub mod ecoute_validee_7852;

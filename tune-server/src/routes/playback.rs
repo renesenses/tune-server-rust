@@ -149,7 +149,38 @@ fn refus_bitperfect_strict(
         .into_response()
 }
 
+/// #7974 — le refus du bail d'écoute d'un profil supervisé (hors plage,
+/// budget épuisé) : 403 au code stable `parental_lease_refused`, la raison en
+/// code et la phrase traduite. La requête est bien formée, la zone marche :
+/// c'est la politique du profil qui interdit, pas une panne.
+pub(crate) fn refus_du_bail_parental(e: &str, lang: &str) -> Option<axum::response::Response> {
+    corps_du_refus_parental(e, lang)
+        .map(|corps| (StatusCode::FORBIDDEN, Json(corps)).into_response())
+}
+
+/// Le corps du refus du bail d'écoute, pour les routes qui rendent leur
+/// propre forme de réponse ; `None` si l'erreur n'est pas ce refus.
+pub(crate) fn corps_du_refus_parental(e: &str, lang: &str) -> Option<Value> {
+    use tune_core::db::bail_d_ecoute::{CODE_REFUS, Refus};
+    let refus = Refus::depuis_sentinelle(e)?;
+    let cle = match refus {
+        Refus::HorsPlage => "parental.lease.outsideHours",
+        Refus::BudgetQuotidienEpuise => "parental.lease.dailyBudget",
+        Refus::BudgetHebdomadaireEpuise => "parental.lease.weeklyBudget",
+        Refus::PolitiqueIllisible => "parental.lease.unreadable",
+    };
+    Some(json!({
+        "error": CODE_REFUS,
+        "code": CODE_REFUS,
+        "reason": refus.code(),
+        "message": crate::i18n::t(lang, cle),
+    }))
+}
+
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
+    if let Some(reponse) = refus_du_bail_parental(&e, lang) {
+        return reponse;
+    }
     // Sentinelle « plafond de zones » de orchestrator.play() → 402 traduit,
     // avec le code stable et les deux nombres. Le format est
     // `free_zone_cap:<actives>:<limite>` : la phrase se compose ICI, pas dans
@@ -3897,6 +3928,10 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
 #[path = "playback/pause_sans_media_7894_tests.rs"]
 mod pause_sans_media_7894_tests;
 
+#[cfg(test)]
+#[path = "playback/bail_parental_7974_route_tests.rs"]
+mod bail_parental_7974_route_tests;
+
 async fn resume(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
@@ -4104,10 +4139,16 @@ async fn resume(
         .await
     {
         Ok(()) => Json(build_zone_json(&state, zone_id).await).into_response(),
-        Err(error) if session_perdue.load(std::sync::atomic::Ordering::Relaxed) => {
-            output_command_error_response(error)
+        Err(error) => {
+            // #7974 — la reprise après pause refusée par le bail d'écoute.
+            if let Some(reponse) = refus_du_bail_parental(&error.to_string(), &lang) {
+                reponse
+            } else if session_perdue.load(std::sync::atomic::Ordering::Relaxed) {
+                output_command_error_response(error)
+            } else {
+                echec_de_sortie_7823::reponse_d_echec_de_zone(&state, zone_id, error)
+            }
         }
-        Err(error) => echec_de_sortie_7823::reponse_d_echec_de_zone(&state, zone_id, error),
     }
 }
 
@@ -5823,10 +5864,13 @@ async fn queue_move(
 async fn queue_jump_en_tete_du_groupe(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    profile: ActiveProfile,
     headers: axum::http::HeaderMap,
     body: Json<QueueJumpRequest>,
 ) -> axum::response::Response {
-    let lancement = queue_jump(State(state.clone()), Path(zone_id), headers, body);
+    // #7974 — le profil du geste suit le relais : c'est lui que le bail
+    // d'écoute contrôle, pas celui du dernier profil qui a joué sur la zone.
+    let lancement = queue_jump(State(state.clone()), Path(zone_id), profile, headers, body);
     crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
         &state, zone_id, lancement,
     )
@@ -5836,6 +5880,7 @@ async fn queue_jump_en_tete_du_groupe(
 async fn queue_jump(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    profile: ActiveProfile,
     headers: axum::http::HeaderMap,
     Json(body): Json<QueueJumpRequest>,
 ) -> impl IntoResponse {
@@ -5845,6 +5890,13 @@ async fn queue_jump(
     if let Err(refus) = refuser_un_entier_negatif("position", body.position) {
         return refus;
     }
+    // #7974 — un geste de lecture : le profil qui le fait devient celui de la
+    // session, comme pour `play`. Sans cela, le bail d'écoute serait celui du
+    // dernier profil qui a joué sur la zone (contourné, ou opposé à tort).
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     match state
         .orchestrator
         .play_from_queue(zone_id, body.position)
@@ -7247,9 +7299,16 @@ async fn clear_zone_pin(
 async fn invoke_zone_pin_en_tete_du_groupe(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
+    profile: ActiveProfile,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    let lancement = invoke_zone_pin(State(state.clone()), Path((zone_id, index)), headers);
+    // #7974 — le profil du geste suit le relais, comme pour `queue_jump`.
+    let lancement = invoke_zone_pin(
+        State(state.clone()),
+        Path((zone_id, index)),
+        profile,
+        headers,
+    );
     crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
         &state, zone_id, lancement,
     )
@@ -7259,6 +7318,7 @@ async fn invoke_zone_pin_en_tete_du_groupe(
 async fn invoke_zone_pin(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
+    profile: ActiveProfile,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let lang = crate::i18n::lang_from_header(&headers);
@@ -7281,6 +7341,13 @@ async fn invoke_zone_pin(
     // #6465 — un préréglage est un nouveau geste : il ne garde pas le
     // contexte (album, playlist) de la lecture précédente.
     state.playback.effacer_contexte_de_session(zone_id).await;
+    // #7974 — un geste de lecture : le profil qui le fait devient celui de la
+    // session, comme pour `play`. Sans cela, le bail d'écoute serait celui du
+    // dernier profil qui a joué sur la zone (contourné, ou opposé à tort).
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
 
     // Build a play request from the pin
     let output_device_id = get_zone_device_id(&state, zone_id);
@@ -8067,6 +8134,13 @@ async fn shuffle_all_sans_groupe(
         disc_number: None,
         album_ref: None,
     };
+    // #7974 — un geste de lecture : le profil qui le fait devient celui de la
+    // session, comme pour `play`. Sans cela, le bail d'écoute serait celui du
+    // dernier profil qui a joué sur la zone (contourné, ou opposé à tort).
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
             state
@@ -8743,6 +8817,39 @@ mod tests {
             body["message"],
             "Output device error: renderer rejected stream"
         );
+    }
+
+    /// #7974 — le refus du bail d'écoute : 403, code dédié, raison et phrase
+    /// traduite, quelle que soit la forme sous laquelle l'erreur arrive (nue
+    /// depuis `play()`, enrobée par la commande de reprise).
+    #[tokio::test]
+    async fn refus_du_bail_parental_code_dedie_7974() {
+        for (erreur, raison) in [
+            ("parental_lease_refused:hors_plage", "hors_plage"),
+            (
+                "parental_lease_refused:budget_quotidien_epuise",
+                "budget_quotidien_epuise",
+            ),
+            (
+                "resume failed: parental_lease_refused:budget_hebdomadaire_epuise",
+                "budget_hebdomadaire_epuise",
+            ),
+            (
+                "parental_lease_refused:politique_illisible",
+                "politique_illisible",
+            ),
+        ] {
+            let (status, body) = parts(erreur).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{erreur}");
+            assert_eq!(body["error"], "parental_lease_refused");
+            assert_eq!(body["code"], "parental_lease_refused");
+            assert_eq!(body["reason"], raison);
+            let message = body["message"].as_str().unwrap();
+            assert!(
+                !message.starts_with("parental."),
+                "#7974 : la clé de traduction n'est pas dans la table : {message}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ pub(super) async fn resume_listening(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ResumeRequest>,
 ) -> Result<Response, AppError> {
     let _zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
@@ -58,6 +59,9 @@ pub(super) async fn resume_listening(
         let response = super::super::podcasts::play_episode(
             State(state.clone()),
             Path(zone_id),
+            // #7974 — la langue de la requête, celle d'un éventuel refus.
+            headers,
+            profile,
             Json(request),
         )
         .await
@@ -366,6 +370,7 @@ mod route_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
@@ -819,6 +824,7 @@ mod replay_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
@@ -926,6 +932,7 @@ mod replay_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
