@@ -361,7 +361,7 @@ async fn pure_sur_un_egaliseur_coupe_qui_garde_son_preampli_le_contourne_4176() 
         "prémisse : l'égaliseur coupé garde son préampli ({garde:?})"
     );
     assert!(
-        !orch.pure_contourne_un_reglage(zone_id),
+        !orch.pure_contourne_un_reglage(zone_id, None),
         "prémisse : les réglages disent l'égaliseur désactivé"
     );
 
@@ -377,7 +377,7 @@ async fn pure_sur_un_egaliseur_coupe_qui_garde_son_preampli_le_contourne_4176() 
     // Une piste suivante sous PURE (chaîne vide) ne l'oublie pas…
     avec_sortie_locale(&orch, |local| {
         local.set_pure_bypass(true);
-        orch.poser_ce_que_pure_contourne(zone_id, local);
+        orch.poser_ce_que_pure_contourne(zone_id, None, local);
         local.set_eq(orch.load_eq_processor(zone_id, 44_100, 2));
     })
     .await;
