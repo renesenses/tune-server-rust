@@ -10,6 +10,7 @@ pub mod auto_fix;
 pub mod balises_brutes;
 pub mod batch;
 pub mod bio_batch;
+pub mod bio_segments;
 pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod completude;
@@ -38,6 +39,10 @@ mod note_balises_6123_tests;
 pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;
+// La source d'un crédit de piste et ses témoins (#7765).
+#[cfg(test)]
+mod credits_source_7765_tests;
+pub mod source_des_credits;
 pub mod suggestions;
 // Le MBID des artistes par une recherche MusicBrainz confirmée (#4805, étape C).
 pub mod artistes_par_le_reseau;

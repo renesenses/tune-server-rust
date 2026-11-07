@@ -372,7 +372,56 @@ pub(super) async fn create_group(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let id = groups.len() as i64 + 1;
+    // #7937 — une zone n'appartient qu'à UN groupe : celles du nouveau
+    // quittent les précédents. Sans cela l'ancien groupe survivait au
+    // nouveau (le client web regroupe sans dégrouper d'abord), et défaire
+    // l'un laissait l'autre — le groupe « revenait ».
+    use tune_core::zones::groupes_enregistres::{prochain_numero, retirer_les_zones};
+    // #6132 — un groupe touché perd d'abord sa sortie double : celle de sa
+    // meneuse ne doit pas survivre à un groupe défait. Celui qui reste
+    // (encore deux zones ou plus) la retrouve, recalculée sur sa nouvelle
+    // composition, juste après.
+    let touches: Vec<i64> = groups
+        .iter_mut()
+        .filter(|g| {
+            g["zone_ids"].as_array().is_some_and(|a| {
+                a.iter()
+                    .filter_map(Value::as_i64)
+                    .any(|z| zone_ids.contains(&z))
+            })
+        })
+        .filter_map(|g| {
+            let gid = g.get("id").and_then(Value::as_i64);
+            if g.get("sortie_double").is_some()
+                && let Some(ancien_meneur) = g["leader_id"].as_i64()
+            {
+                poser_la_sortie_double(&settings, g, ancien_meneur, Vec::new());
+            }
+            gid
+        })
+        .collect();
+    retirer_les_zones(&mut groups, &zone_ids);
+    for g in groups.iter_mut().filter(|g| {
+        g.get("id")
+            .and_then(Value::as_i64)
+            .is_some_and(|gid| touches.contains(&gid))
+    }) {
+        let restants: Vec<i64> = g["zone_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_i64).collect())
+            .unwrap_or_default();
+        let Some(meneur) = g["leader_id"]
+            .as_i64()
+            .or_else(|| restants.first().copied())
+        else {
+            continue;
+        };
+        let choix = sorties_doubles_du_groupe(&state, meneur, &restants, &zones)
+            .await
+            .unwrap_or_default();
+        poser_la_sortie_double(&settings, g, meneur, choix);
+    }
+    let id = prochain_numero(&groups);
     let mut group = json!({
         "id": id,
         "group_id": id.to_string(),

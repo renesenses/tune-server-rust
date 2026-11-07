@@ -4,6 +4,8 @@ mod licence;
 mod morceau_binaire;
 mod protocol;
 #[cfg(test)]
+mod reinscription_7833_tests;
+#[cfg(test)]
 mod relais_par_url_tests;
 mod session_routes;
 mod sessions;

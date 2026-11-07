@@ -1,9 +1,11 @@
 //! La PASSE de fond de la détection des faux hi-res (#6285).
 //!
-//! Elle décode un EXTRAIT de chaque piste locale sans perte (30 s, à 30 s du
-//! début quand la piste est assez longue), le mesure
-//! ([`super::faux_hires::mesurer`]) et range le verdict dans
-//! `hires_verifications` (migration SQLite 129 / PG 093).
+//! Elle décode des TRANCHES réparties sur toute la durée de chaque piste
+//! locale sans perte (#7859 : [`TRANCHES`] tranches de [`TRANCHE_S`] s ; la
+//! piste entière quand elle est courte), les mesure par fenêtres
+//! ([`super::faux_hires::mesurer_des_tranches`]) et range le verdict dans
+//! `hires_verifications` (migration SQLite 129 / PG 093). Avant #7859, un
+//! seul extrait de 30 s était décodé.
 //!
 //! # Désactivée par défaut
 //!
@@ -32,7 +34,7 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
-use super::faux_hires::{Mesure, Verdict, juger, mesurer};
+use super::faux_hires::{Mesure, Verdict, juger, mesurer_des_tranches};
 use crate::audio::thermal::{LectureThermique, ThermalGate, largeur_selon_la_chaleur};
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
@@ -43,8 +45,13 @@ use crate::taches_de_fond::{Tache, est_en_pause, priorite, vitesse};
 /// la passe dort.
 pub const REGLAGE_ACTIF: &str = "analyse_faux_hires_active";
 
-/// Durée de l'extrait décodé, en secondes.
-pub const EXTRAIT_S: f64 = 30.0;
+/// #7859 — combien de tranches sont décodées, réparties sur toute la durée.
+pub const TRANCHES: usize = 12;
+
+/// #7859 — la durée d'une tranche, en secondes : 60 s décodées en tout pour
+/// un morceau long (30 s avant #7859), une seule tranche pour un morceau
+/// d'au plus une minute.
+pub const TRANCHE_S: f64 = 5.0;
 
 /// Les formats sans perte que la passe examine. Le DSD n'en fait pas partie :
 /// ses deux signatures (bits nuls, coupure spectrale) n'y ont pas de sens.
@@ -151,23 +158,64 @@ pub fn prochains_candidats(db: &Arc<dyn DbBackend>, n: usize) -> Vec<Candidat> {
     .collect()
 }
 
-/// Décode l'extrait d'un fichier, à sa fréquence et sa profondeur d'origine,
-/// et le mesure. Bloquant : à appeler hors de l'exécuteur asynchrone.
+/// #7859 — les tranches à décoder, `(départ, durée)` en secondes : une seule
+/// (le morceau entier, ou ses [`TRANCHES`] × [`TRANCHE_S`] premières secondes
+/// quand la durée est inconnue) pour un morceau court, sinon [`TRANCHES`]
+/// tranches centrées sur des points régulièrement espacés du morceau.
+pub fn tranches_a_decoder(duree_ms: i64) -> Vec<(f64, f64)> {
+    let total = TRANCHES as f64 * TRANCHE_S;
+    let duree_s = duree_ms as f64 / 1000.0;
+    if duree_ms <= 0 || duree_s <= total {
+        return vec![(0.0, total)];
+    }
+    let pas = duree_s / TRANCHES as f64;
+    (0..TRANCHES)
+        .map(|k| {
+            let depart = (k as f64 + 0.5) * pas - TRANCHE_S / 2.0;
+            (depart.clamp(0.0, duree_s - TRANCHE_S), TRANCHE_S)
+        })
+        .collect()
+}
+
+/// Décode les tranches d'un fichier ([`tranches_a_decoder`]), à sa fréquence
+/// et sa profondeur d'origine, et les mesure. Bloquant : à appeler hors de
+/// l'exécuteur asynchrone. Une tranche illisible est sautée ; aucune tranche
+/// lisible, et c'est l'erreur de la première.
 pub fn mesurer_un_fichier(chemin: &str, duree_ms: i64) -> Result<Mesure, String> {
-    // À 30 s du début quand la piste le permet : une introduction silencieuse
-    // ou un fondu ne dit rien de la bande.
-    let depart = if duree_ms >= ((EXTRAIT_S * 2.0 + 30.0) * 1000.0) as i64 {
-        30.0
-    } else {
-        0.0
+    let mut decodees = Vec::new();
+    let mut premiere_erreur = None;
+    for (depart, duree) in tranches_a_decoder(duree_ms) {
+        match crate::audio::decode::decode_to_pcm(chemin, None, None, depart, duree) {
+            Ok(pcm) => decodees.push((depart, pcm)),
+            Err(e) => {
+                premiere_erreur.get_or_insert(e);
+            }
+        }
+    }
+    let Some((_, premier)) = decodees.first() else {
+        return Err(premiere_erreur.unwrap_or_else(|| "aucune tranche décodée".into()));
     };
-    let pcm = crate::audio::decode::decode_to_pcm(chemin, None, None, depart, EXTRAIT_S)?;
-    Ok(mesurer(
-        &pcm.samples_i32,
-        pcm.channels,
-        pcm.sample_rate,
-        pcm.bit_depth as u32,
-    ))
+    let (canaux, sample_rate, bits) = (
+        premier.channels,
+        premier.sample_rate,
+        premier.bit_depth as u32,
+    );
+    let tranches: Vec<(f64, &[i32])> = decodees
+        .iter()
+        .filter(|(_, pcm)| pcm.channels == canaux && pcm.sample_rate == sample_rate)
+        .map(|(depart, pcm)| (*depart, pcm.samples_i32.as_slice()))
+        .collect();
+    let mesure = mesurer_des_tranches(&tranches, canaux, sample_rate, bits);
+    if !mesure.fenetres_coupees.is_empty() {
+        debug!(
+            chemin,
+            jugees = mesure.fenetres_jugees,
+            coupees = mesure.fenetres_coupees.len(),
+            premiere_s = mesure.fenetres_coupees[0].debut_s,
+            "faux_hires_fenetres_coupees"
+        );
+    }
+    Ok(mesure)
 }
 
 /// Range le verdict d'une piste. Une piste illisible est rangée aussi

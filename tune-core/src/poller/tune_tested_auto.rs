@@ -1,25 +1,120 @@
 use super::PositionPoller;
 use crate::cloud::tune_tested_auto::{AppareilObserve, FormatObserve};
+use crate::cloud::tune_tested_proposition as proposition;
 use crate::db::settings_repo::SettingsRepo;
 use crate::playback::ZoneState;
+use std::time::Instant;
+
+/// #7922 — tolérance d'un relevé à l'autre : un renderer arrondit sa position
+/// à la seconde, et un tour du sondeur ne tombe pas pile.
+const TOLERANCE_RELEVE_MS: u64 = 1_500;
+
+/// #7922 — la part d'un tour du sondeur réellement rendue : l'avance de
+/// position entre deux relevés, si l'horloge murale la permet. Une avance plus
+/// grande que le temps écoulé est un déplacement, un recul est un déplacement
+/// ou la piste suivante : ni l'un ni l'autre ne compte.
+pub(super) fn avance_rendue(precedente_ms: u64, position_ms: u64, ecoule_ms: u64) -> u64 {
+    let avance = position_ms.saturating_sub(precedente_ms);
+    if avance > ecoule_ms.saturating_add(TOLERANCE_RELEVE_MS) {
+        0
+    } else {
+        avance
+    }
+}
+
+impl super::ZonePollState {
+    /// #7922 — verse au temps rendu de la piste l'avance vue depuis le
+    /// relevé précédent, puis retient celui-ci.
+    pub(super) fn noter_releve_tune_tested(&mut self, position_ms: u64, maintenant: Instant) {
+        if let Some((precedente, a)) = self.tune_tested_releve {
+            let ecoule = maintenant.saturating_duration_since(a).as_millis() as u64;
+            self.tune_tested_rendu_ms = self.tune_tested_rendu_ms.saturating_add(avance_rendue(
+                precedente,
+                position_ms,
+                ecoule,
+            ));
+        }
+        self.tune_tested_releve = Some((position_ms, maintenant));
+    }
+}
 
 impl PositionPoller {
+    /// Avance gapless, transport resté en lecture : l'enchaînement est
+    /// constaté. `rendu_ms` est le temps réellement rendu de la piste finie.
     pub(super) async fn noter_fin_tune_tested(
         &self,
         etat: &ZoneState,
         device_id: &str,
         progression: u64,
+        rendu_ms: u64,
+    ) {
+        self.noter_fin_avec(etat, device_id, progression, rendu_ms, true)
+            .await;
+    }
+
+    /// Avance de l'appareil confirmée après un arrêt annoncé : la piste est
+    /// finie, mais aucun enchaînement sans coupure n'a été vu.
+    pub(super) async fn noter_fin_tune_tested_sans_gapless(
+        &self,
+        etat: &ZoneState,
+        device_id: &str,
+        progression: u64,
+        rendu_ms: u64,
+    ) {
+        self.noter_fin_avec(etat, device_id, progression, rendu_ms, false)
+            .await;
+    }
+
+    async fn noter_fin_avec(
+        &self,
+        etat: &ZoneState,
+        device_id: &str,
+        progression: u64,
+        rendu_ms: u64,
+        gapless: bool,
     ) {
         if etat.now_playing.as_ref().is_some_and(|np| {
             np.duration_ms > 0 && progression >= (np.duration_ms as u64).saturating_sub(1000).max(1)
         }) {
-            self.noter_tune_tested(etat, device_id, true).await;
+            self.noter_tune_tested_avec(etat, device_id, true, gapless, rendu_ms)
+                .await;
         }
     }
 
+    /// Fin de piste observée par le sondeur (hors enchaînement gapless).
+    pub(super) async fn noter_fin_observee_tune_tested(
+        &self,
+        etat: &ZoneState,
+        device_id: &str,
+        rendu_ms: u64,
+    ) {
+        self.noter_tune_tested_avec(etat, device_id, true, false, rendu_ms)
+            .await;
+    }
+
     pub(super) async fn noter_tune_tested(&self, etat: &ZoneState, device_id: &str, succes: bool) {
+        self.noter_tune_tested_avec(etat, device_id, succes, false, 0)
+            .await;
+    }
+
+    async fn noter_tune_tested_avec(
+        &self,
+        etat: &ZoneState,
+        device_id: &str,
+        succes: bool,
+        gapless: bool,
+        rendu_ms: u64,
+    ) {
         let settings = SettingsRepo::with_backend(self.db.clone());
-        if !crate::cloud::telemetry::TelemetryReporter::is_enabled_for(&settings) {
+        // #7922 — le compte sans erreur de la zone ne dépend pas du
+        // consentement à la télémétrie : il reste local jusqu'à l'envoi
+        // confirmé par l'utilisateur. Une erreur le remet à zéro avant toute
+        // lecture de la sortie, qui peut être occupée.
+        if !succes && proposition::noter_erreur(&settings, etat.zone_id, device_id).is_err() {
+            tracing::debug!("tune_tested_compteur_non_conserve");
+        }
+        let telemetrie = crate::cloud::telemetry::TelemetryReporter::is_enabled_for(&settings);
+        if !telemetrie && !succes {
             return;
         }
         let sortie = { self.outputs.lock().await.get(device_id) };
@@ -85,21 +180,50 @@ impl PositionPoller {
                     e["model"].as_str()?.to_owned(),
                 ))
             });
+        let cle_piste = (
+            etat.track_generation,
+            // L'avance gapless invalide les niveaux, y compris en
+            // répétition d'une piste, sans changer track_generation.
+            self.playback
+                .levels_gen(etat.zone_id)
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if succes
+            && proposition::noter_lecture(
+                &settings,
+                etat.zone_id,
+                proposition::LectureRendue {
+                    device_id,
+                    protocole_brut: &protocole,
+                    identite: identite
+                        .as_ref()
+                        .map(|(marque, modele)| (marque.as_str(), modele.as_str())),
+                    // Le temps réellement rendu, jamais la durée de la piste :
+                    // un déplacement près de la fin remplit la condition de
+                    // fin sans rien jouer. Borné par la durée connue.
+                    millisecondes: match etat.now_playing.as_ref() {
+                        Some(np) if np.duration_ms > 0 => rendu_ms.min(np.duration_ms as u64),
+                        _ => rendu_ms,
+                    },
+                    format: format.clone(),
+                    gapless,
+                    cle_piste,
+                },
+            )
+            .is_err()
+        {
+            tracing::debug!("tune_tested_compteur_non_conserve");
+        }
+        if !telemetrie {
+            return;
+        }
         let resultat = self
             .observateur_tune_tested
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .terminer_avec_identite(
                 &settings,
-                (
-                    etat.zone_id,
-                    etat.track_generation,
-                    // L'avance gapless invalide les niveaux, y compris en
-                    // répétition d'une piste, sans changer track_generation.
-                    self.playback
-                        .levels_gen(etat.zone_id)
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                ),
+                (etat.zone_id, cle_piste.0, cle_piste.1),
                 AppareilObserve {
                     protocole: &protocole,
                     identite_detectee: identite

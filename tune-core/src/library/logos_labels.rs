@@ -80,6 +80,19 @@ pub const DELAI_ABSENT_S: u64 = 30 * 24 * 3600;
 /// Une erreur (réseau, refus du service) n'est pas retentée avant un jour.
 pub const DELAI_ERREUR_S: u64 = 24 * 3600;
 
+/// #7414 — qui lance une passe de logos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relance {
+    /// L'ouverture de l'onglet Labels : la pause de l'Enrichissement et les
+    /// délais avant de redemander un label s'appliquent.
+    Ordinaire,
+    /// « Lancer la passe », demandé par l'utilisateur : la passe tourne même
+    /// Enrichissement en pause, et redemande les labels notés « sans logo »
+    /// (un label noté avant un correctif d'une source n'attend pas trente
+    /// jours). Les erreurs récentes restent écartées.
+    Demandee,
+}
+
 /// Une image de logo plus lourde que ceci est refusée.
 pub const TAILLE_MAX_IMAGE: usize = 5 * 1024 * 1024;
 
@@ -400,6 +413,23 @@ impl CacheLogosLabels {
     /// Les labels de `demandes` qu'une passe doit (re)demander à
     /// `maintenant`, au plus `max`, sans doublon de clé.
     pub fn a_resoudre(&self, demandes: &[Demande], maintenant: u64, max: usize) -> Vec<Demande> {
+        self.a_resoudre_selon(demandes, maintenant, max, Relance::Ordinaire)
+    }
+
+    /// Comme [`Self::a_resoudre`], selon qui lance la passe : une
+    /// [`Relance::Demandee`] redemande aussi les labels notés « sans logo »
+    /// depuis moins de [`DELAI_ABSENT_S`] (#7414).
+    pub fn a_resoudre_selon(
+        &self,
+        demandes: &[Demande],
+        maintenant: u64,
+        max: usize,
+        relance: Relance,
+    ) -> Vec<Demande> {
+        let delai_absent = match relance {
+            Relance::Ordinaire => DELAI_ABSENT_S,
+            Relance::Demandee => 0,
+        };
         let entrees = self.entrees();
         let mut vues = std::collections::HashSet::new();
         demandes
@@ -417,7 +447,7 @@ impl CacheLogosLabels {
                         Statut::Trouve => e.image.as_deref().is_none_or(|h| {
                             crate::library::artwork::find_cached(&self.dossier, h).is_none()
                         }),
-                        Statut::Absent => maintenant.saturating_sub(e.verifie_le) >= DELAI_ABSENT_S,
+                        Statut::Absent => maintenant.saturating_sub(e.verifie_le) >= delai_absent,
                         Statut::Erreur => maintenant.saturating_sub(e.verifie_le) >= DELAI_ERREUR_S,
                     },
                 }
@@ -480,7 +510,11 @@ impl CacheLogosLabels {
                 .await
             {
                 Err(e) => {
-                    tracing::debug!(label = %demande.nom, erreur = %e, "logo_label_erreur");
+                    // En `info` : la cause (code HTTP, panne réseau) doit se
+                    // lire dans le journal ; la requête des adresses est
+                    // masquée, elle peut porter un jeton (#7414).
+                    let cause = crate::orchestrator::sentinelle_streaming::masquer_les_requetes(&e);
+                    tracing::info!(label = %demande.nom, cause = %cause, "logo_label_erreur");
                     let id = precedent.as_ref().and_then(|p| self.id_de(p));
                     self.avec_id(Self::entree_nue(Statut::Erreur, None, maintenant()), id)
                 }
@@ -792,6 +826,55 @@ mod tests {
                 .a_resoudre(&demandes, 1_000 + DELAI_ERREUR_S, PASSE_MAX)
                 .len(),
             1
+        );
+    }
+
+    /// #7414 — « Lancer la passe » redemande un label noté « sans logo » il y
+    /// a une heure ; un logo en cache et une erreur récente restent écartés.
+    #[tokio::test]
+    async fn une_relance_demandee_redemande_les_labels_sans_logo_7414() {
+        let dossier = crate::test_scratch::scratch_dir("logos-labels-relance-7414");
+        let cache = CacheLogosLabels::ouvrir(dossier.path());
+        let faux = FauxCatalogue::default();
+        cache
+            .resoudre(
+                &faux,
+                vec![demande("Inconnu Records"), demande("Verve")],
+                || 1_000,
+                Duration::ZERO,
+            )
+            .await;
+        faux.en_panne.store(true, Ordering::SeqCst);
+        cache
+            .resoudre(&faux, vec![demande("En Panne")], || 1_000, Duration::ZERO)
+            .await;
+        assert_eq!(
+            cache.entree("Inconnu Records").unwrap().statut,
+            Statut::Absent
+        );
+        assert_eq!(cache.entree("Verve").unwrap().statut, Statut::Trouve);
+        assert_eq!(cache.entree("En Panne").unwrap().statut, Statut::Erreur);
+        let demandes = vec![
+            demande("Inconnu Records"),
+            demande("Verve"),
+            demande("En Panne"),
+        ];
+
+        assert!(
+            cache
+                .a_resoudre_selon(&demandes, 1_000 + 3600, PASSE_MAX, Relance::Ordinaire)
+                .is_empty()
+        );
+        let noms: Vec<String> = cache
+            .a_resoudre_selon(&demandes, 1_000 + 3600, PASSE_MAX, Relance::Demandee)
+            .into_iter()
+            .map(|d| d.nom)
+            .collect();
+        assert_eq!(
+            noms,
+            ["Inconnu Records"],
+            "🔴 « Lancer la passe » ne redemande pas un label noté « sans logo » \
+             depuis moins de trente jours (#7414)"
         );
     }
 

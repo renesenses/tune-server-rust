@@ -73,7 +73,10 @@ pub(super) fn signature_a_renouveler(url: &str, maintenant_secs: u64) -> bool {
 
 /// L'identifiant de piste Bandcamp d'une URL de flux : le dernier segment du
 /// chemin, requête retirée. `None` quand il n'y en a pas.
-pub(super) fn identifiant_de_piste(url: &str) -> Option<&str> {
+///
+/// Aussi lu par la reprise d'écoute (#7778) pour retrouver le dernier titre
+/// dans l'album relu, dont les URL portent une signature du jour.
+pub fn identifiant_de_piste(url: &str) -> Option<&str> {
     let chemin = url.split(['?', '#']).next().unwrap_or(url);
     let dernier = chemin.rsplit('/').next()?;
     (!dernier.is_empty() && !dernier.contains(':')).then_some(dernier)

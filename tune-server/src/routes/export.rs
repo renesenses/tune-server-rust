@@ -12,12 +12,15 @@ use tune_core::db::track_repo::TrackRepo;
 use crate::error::AppError;
 use crate::state::AppState;
 
+pub mod catalogue;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/tracks.csv", get(export_tracks_csv))
         .route("/albums.csv", get(export_albums_csv))
         .route("/artists.csv", get(export_artists_csv))
         .route("/library-audit.csv", get(export_library_audit_csv))
+        .route("/catalogue.html", get(catalogue::export_catalogue_html))
 }
 
 async fn export_tracks_csv(State(state): State<AppState>) -> impl IntoResponse {

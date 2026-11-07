@@ -322,6 +322,11 @@ pub struct ExemptionDidl;
 /// `MockConnectInfo` sous test. **Absente, la réponse est NON** : une couche
 /// qui oublierait de le poser doit fermer l'exemption, pas l'ouvrir.
 fn appelant_sur_le_reseau_local(request: &Request) -> bool {
+    // Rejouée par le relais ou l'écoute directe : vue de 127.0.0.1, mais
+    // émise ailleurs. Jamais locale.
+    if crate::garde_du_relais::requete_relayee(request.headers()) {
+        return false;
+    }
     request
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
@@ -830,7 +835,10 @@ async fn login(
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    if login_rate_limited(peer.ip()) {
+    // Une requête relayée est comptée sous une adresse qui n'est jamais en
+    // boucle locale : la limite de tentatives s'applique.
+    let ip = crate::garde_du_relais::adresse_de_l_appelant(peer.ip(), &headers);
+    if login_rate_limited(ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({"error": "too many login attempts, try again later"})),
@@ -861,7 +869,7 @@ async fn login(
     let (profile_id, old_hash, new_hash, is_admin) = match row {
         Some(r) => r,
         None => {
-            record_login_failure(peer.ip());
+            record_login_failure(ip);
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "invalid credentials"})),
@@ -882,7 +890,7 @@ async fn login(
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
-    let passwordless_default_allowed = !auth_enabled || peer.ip().is_loopback();
+    let passwordless_default_allowed = !auth_enabled || ip.is_loopback();
 
     // Try argon2 hash first (password_hash_v2), then fall back to SHA-256 (password_hash)
     let valid_v2 = if let Some(ref h) = new_hash {
@@ -912,14 +920,14 @@ async fn login(
     };
 
     if !valid {
-        record_login_failure(peer.ip());
+        record_login_failure(ip);
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),
         )
             .into_response();
     }
-    clear_login_failures(peer.ip());
+    clear_login_failures(ip);
 
     // If logged in with old SHA-256 hash, upgrade to argon2
     if !valid_v2

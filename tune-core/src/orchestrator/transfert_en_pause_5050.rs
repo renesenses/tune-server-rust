@@ -88,6 +88,16 @@ impl PlaybackOrchestrator {
         // #6466 (point 15) — la piste transférée a déjà son écoute, écrite
         // avec la zone d'origine : la relancer sur la cible ne la réécrit pas.
         // Les titres suivants, eux, s'écriront avec la zone cible.
+        // #7846 (fil 2648) — une sortie locale ou OAAT décode elle-même le
+        // flux : la piste y part UNE fois, directement à la position. Lancer
+        // à 0:00 puis chercher arrêtait et relançait le périphérique dans la
+        // même seconde (`replay_zone_at_position`), et le DAC USB restait muet
+        // jusqu'à Pause puis Lecture. Les renderers réseau gardent le
+        // lancement suivi du `Seek` d'après la pose (#4442).
+        let a_la_position = !direct
+            && source_position_ms > 3000
+            && np.source != "radio"
+            && (did.starts_with("local:") || did.starts_with("oaat:"));
         let lancement = if direct {
             self.play_transfere_sans_historique(super::PlayRequest {
                 zone_id,
@@ -101,6 +111,13 @@ impl PlaybackOrchestrator {
                 duration_ms: Some(np.duration_ms).filter(|d| *d > 0),
                 ..Default::default()
             })
+            .await
+        } else if a_la_position {
+            self.play_from_queue_transfere_a_la_position(
+                zone_id,
+                queue_position,
+                source_position_ms,
+            )
             .await
         } else {
             self.play_from_queue_sans_historique(zone_id, queue_position)
@@ -122,6 +139,7 @@ impl PlaybackOrchestrator {
                 // pas de position à reprendre.
                 if source_position_ms > 3000
                     && np.source != "radio"
+                    && !a_la_position
                     && let Err(error) = self
                         .reprendre_la_position_transferee(
                             zone_id,

@@ -27,12 +27,34 @@
 //! reprendre après un redémarrage), une passe en tâche de fond range les
 //! pochettes qui manquent. Une pochette demandée par l'écran avant son tour
 //! passe devant (même file).
+//!
+//! # Les refus du CDN (#7927, 05/11/2026)
+//!
+//! Avant : le recul d'un 429 se faisait EN TENANT le verrou de la file
+//! (jusqu'à 7 minutes par pochette avec la cadence par défaut), chaque
+//! demande de l'écran rejouait ensuite son propre cycle de refus, la passe
+//! de préremplissage s'arrêtait au premier refus jusqu'à la synchronisation
+//! du lendemain, et un 403 du CDN rangeait la release parmi les échecs
+//! jusqu'au redémarrage. L'écran restait sans pochette, sans rien dire.
+//!
+//! Maintenant :
+//! * le recul se fait HORS du verrou, et pose un « limité jusqu'à T »
+//!   partagé : pendant ce temps, une demande de l'écran est refusée tout de
+//!   suite (503 `pochettes_limitees`, `Retry-After`), sans appeler le CDN ;
+//! * un 403 (refus du CDN, souvent passager) ne condamne plus la release :
+//!   il fait reculer comme un 429 ;
+//! * la passe de préremplissage, arrêtée par un refus ou une panne, reprend
+//!   d'elle-même après le recul (doublé, jusqu'à `Cadence::attente_max`),
+//!   et non plus à la synchronisation suivante ;
+//! * `GET /etat` dit tout cela (`limitees`, `reprise_dans_s`, `echecs`,
+//!   `derniere_erreur`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -60,8 +82,30 @@ pub struct EtatPochettes {
     pub en_cours: bool,
     /// Les disques de la liste dont la vignette est rangée.
     pub en_cache: usize,
-    /// Ceux qui ont une image chez Discogs et pas encore de vignette ici.
+    /// Ceux qui ont une image chez Discogs, pas encore de vignette ici, et
+    /// qui seront encore demandés (les échecs durables n'en sont pas).
     pub restantes: usize,
+    /// Ceux dont l'image n'existe plus chez Discogs ou ne se lit pas : pas
+    /// redemandés avant le prochain démarrage ou effacement du cache.
+    pub echecs: usize,
+    /// Le CDN de Discogs freine ou refuse : les téléchargements attendent.
+    pub limitees: bool,
+    /// Dans combien de secondes les téléchargements reprennent.
+    pub reprise_dans_s: Option<u64>,
+    /// Le code du dernier refus ou de la dernière panne (`discogs_limite`,
+    /// `discogs_refuse`, `discogs_indisponible`), effacé par une pochette
+    /// rangée.
+    pub derniere_erreur: Option<&'static str>,
+}
+
+/// Pourquoi une pochette n'est pas servie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Absence {
+    /// Pas dans la liste, sans image chez Discogs, ou image disparue.
+    Introuvable,
+    /// Le CDN freine, refuse ou ne répond pas : réessayer plus tard
+    /// (dans tant de secondes, si on le sait).
+    EnAttente(Option<u64>),
 }
 
 /// L'état du cache, porté par le [`Moteur`].
@@ -74,6 +118,10 @@ pub struct Pochettes {
     /// pas redemandées avant le prochain démarrage ou effacement du cache.
     echecs: Mutex<HashSet<u64>>,
     en_cours: AtomicBool,
+    /// Après un refus du CDN : rien n'est demandé avant cet instant (hors
+    /// la demande qui recule elle-même).
+    limite_jusqu_a: Mutex<Option<Instant>>,
+    derniere_erreur: Mutex<Option<&'static str>>,
 }
 
 impl Pochettes {
@@ -83,6 +131,8 @@ impl Pochettes {
             file: tokio::sync::Mutex::new(()),
             echecs: Mutex::new(HashSet::new()),
             en_cours: AtomicBool::new(false),
+            limite_jusqu_a: Mutex::new(None),
+            derniere_erreur: Mutex::new(None),
         }
     }
 
@@ -110,9 +160,28 @@ impl Pochettes {
         self.en_cours.store(false, Ordering::SeqCst);
     }
 
+    /// Le temps qui reste avant la reprise des téléchargements, si le CDN
+    /// a freiné ou refusé.
+    pub fn limitee_pour(&self) -> Option<Duration> {
+        let fin = (*verrou(&self.limite_jusqu_a))?;
+        let reste = fin.saturating_duration_since(Instant::now());
+        (!reste.is_zero()).then_some(reste)
+    }
+
+    fn limiter(&self, recul: Duration, code: &'static str) {
+        *verrou(&self.limite_jusqu_a) = Some(Instant::now() + recul);
+        *verrou(&self.derniere_erreur) = Some(code);
+    }
+
+    fn rangee(&self) {
+        *verrou(&self.limite_jusqu_a) = None;
+        *verrou(&self.derniere_erreur) = None;
+    }
+
     /// Efface toutes les pochettes rangées.
     pub fn effacer(&self) -> Result<(), String> {
         verrou(&self.echecs).clear();
+        self.rangee();
         match std::fs::remove_dir_all(&self.dossier) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -174,12 +243,21 @@ impl Moteur {
     }
 
     /// Le fichier d'une pochette, téléchargé d'abord s'il manque (par la
-    /// file). `None` : pas dans la liste, sans image chez Discogs, ou le
-    /// téléchargement n'a pas abouti.
-    pub async fn pochette(&self, release: u64, taille: Taille) -> Option<PathBuf> {
+    /// file). Pendant un recul du CDN, rend tout de suite
+    /// [`Absence::EnAttente`] sans rien demander.
+    pub async fn pochette(&self, release: u64, taille: Taille) -> Result<PathBuf, Absence> {
         if !self.pochettes.a_la_vignette(release) {
-            let url = self.source_de_la_pochette(release)?;
-            self.telecharger(release, &url).await.ok()?;
+            let url = self
+                .source_de_la_pochette(release)
+                .ok_or(Absence::Introuvable)?;
+            match self.telecharger(release, &url).await {
+                Ok(()) => {}
+                Err(INTROUVABLE) => return Err(Absence::Introuvable),
+                Err(_) => {
+                    let reste = self.pochettes.limitee_pour().map(|d| d.as_secs().max(1));
+                    return Err(Absence::EnAttente(reste));
+                }
+            }
         }
         let chemin = match taille {
             Taille::Vignette => self.pochettes.chemin_vignette(release),
@@ -188,25 +266,44 @@ impl Moteur {
                 .chemin_originale(release)
                 .unwrap_or_else(|| self.pochettes.chemin_vignette(release)),
         };
-        chemin.is_file().then_some(chemin)
+        if chemin.is_file() {
+            Ok(chemin)
+        } else {
+            Err(Absence::Introuvable)
+        }
     }
 
-    /// Télécharge et range UNE pochette, par la file, avec le recul d'un
-    /// 429. `Err` : le code de l'échec (`discogs_limite` après les essais,
-    /// `discogs_indisponible`, ou `introuvable`).
+    /// Télécharge et range UNE pochette, par la file. Sur un 429 ou un 403
+    /// du CDN : recul doublé, fait HORS du verrou de la file, et partagé
+    /// (« limité jusqu'à T ») ; au plus [`Cadence::essais_limite`] nouveaux
+    /// essais. Une demande qui arrive pendant le recul d'une autre est
+    /// refusée tout de suite. `Err` : le code de l'échec (`discogs_limite`,
+    /// `discogs_refuse`, `discogs_indisponible`, ou `introuvable`).
+    ///
+    /// [`Cadence::essais_limite`]: crate::Cadence
     pub(crate) async fn telecharger(&self, release: u64, url: &str) -> Result<(), &'static str> {
-        let _tour = self.pochettes.file.lock().await;
-        if self.pochettes.a_la_vignette(release) {
-            return Ok(());
-        }
-        if verrou(&self.pochettes.echecs).contains(&release) {
-            return Err(INTROUVABLE);
-        }
         let mut refus = 0u32;
         let mut recul = self.cadence.attente_limite;
         loop {
-            attendre(self.cadence.image).await;
-            match self.hote.image_discogs(url).await {
+            let reponse = {
+                let _tour = self.pochettes.file.lock().await;
+                if self.pochettes.a_la_vignette(release) {
+                    return Ok(());
+                }
+                if verrou(&self.pochettes.echecs).contains(&release) {
+                    return Err(INTROUVABLE);
+                }
+                // Le recul d'une AUTRE demande : ne pas solliciter le CDN.
+                if refus == 0
+                    && self.pochettes.limitee_pour().is_some()
+                    && let Some(c) = *verrou(&self.pochettes.derniere_erreur)
+                {
+                    return Err(c);
+                }
+                attendre(self.cadence.image).await;
+                self.hote.image_discogs(url).await
+            };
+            let code_du_refus = match reponse {
                 Ok(Image::Octets(octets)) => {
                     let dossier = self.pochettes.dossier().to_path_buf();
                     let range =
@@ -214,32 +311,42 @@ impl Moteur {
                             .await
                             .unwrap_or_else(|e| Err(e.to_string()));
                     return match range {
-                        Ok(()) => Ok(()),
+                        Ok(()) => {
+                            self.pochettes.rangee();
+                            Ok(())
+                        }
                         Err(e) => {
-                            tracing::debug!(target: "plugin", release, erreur = %e, "collection_physique_pochette_illisible");
+                            tracing::info!(target: "plugin", release, erreur = %e, "collection_physique_pochette_illisible");
                             verrou(&self.pochettes.echecs).insert(release);
                             Err(INTROUVABLE)
                         }
                     };
                 }
                 Ok(Image::Introuvable) => {
+                    tracing::debug!(target: "plugin", release, "collection_physique_pochette_introuvable");
                     verrou(&self.pochettes.echecs).insert(release);
                     return Err(INTROUVABLE);
                 }
-                Ok(Image::Limite) => {
-                    refus += 1;
-                    if refus > self.cadence.essais_limite {
-                        tracing::info!(target: "plugin", release, "collection_physique_pochettes_limite");
-                        return Err(code::DISCOGS_LIMITE);
-                    }
-                    tracing::debug!(target: "plugin", recul_ms = recul.as_millis() as u64, "collection_physique_pochette_recul");
-                    tokio::task::yield_now().await;
-                    attendre(recul).await;
-                    recul =
-                        (recul * 2).min(self.cadence.attente_max.max(self.cadence.attente_limite));
+                Ok(Image::Limite) => code::DISCOGS_LIMITE,
+                // 403 : le CDN refuse (User-Agent, défi anti-robots…). Pas
+                // une image disparue : réessayée après le recul.
+                Ok(Image::Refusee) => code::DISCOGS_REFUSE,
+                Err(Panne) => {
+                    self.pochettes
+                        .limiter(self.cadence.attente_limite, code::DISCOGS_INDISPONIBLE);
+                    return Err(code::DISCOGS_INDISPONIBLE);
                 }
-                Err(Panne) => return Err(code::DISCOGS_INDISPONIBLE),
+            };
+            refus += 1;
+            self.pochettes.limiter(recul, code_du_refus);
+            if refus > self.cadence.essais_limite {
+                tracing::info!(target: "plugin", release, code = code_du_refus, "collection_physique_pochettes_limite");
+                return Err(code_du_refus);
             }
+            tracing::debug!(target: "plugin", recul_ms = recul.as_millis() as u64, code = code_du_refus, "collection_physique_pochette_recul");
+            tokio::task::yield_now().await;
+            attendre(recul).await;
+            recul = (recul * 2).min(self.cadence.attente_max.max(self.cadence.attente_limite));
         }
     }
 
@@ -261,7 +368,8 @@ impl Moteur {
 
     /// L'état du cache, pour l'écran.
     pub fn etat_pochettes(&self) -> EtatPochettes {
-        let (en_cache, avec_image) = {
+        let echecs = verrou(&self.pochettes.echecs).clone();
+        let (en_cache, restantes, en_echec) = {
             let m = verrou(&self.memoire);
             let releases = Moteur::releases(&m);
             let avec: Vec<u64> = releases
@@ -273,20 +381,33 @@ impl Moteur {
                 .iter()
                 .filter(|r| self.pochettes.a_la_vignette(**r))
                 .count();
-            (en_cache, avec.len())
+            let en_echec = avec
+                .iter()
+                .filter(|r| echecs.contains(r) && !self.pochettes.a_la_vignette(**r))
+                .count();
+            (
+                en_cache,
+                avec.len().saturating_sub(en_cache).saturating_sub(en_echec),
+                en_echec,
+            )
         };
-        let echecs = verrou(&self.pochettes.echecs).len();
+        let reste = self.pochettes.limitee_pour();
         EtatPochettes {
             en_cours: self.pochettes.en_cours.load(Ordering::SeqCst),
             en_cache,
-            restantes: avec_image.saturating_sub(en_cache).saturating_sub(echecs),
+            restantes,
+            echecs: en_echec,
+            limitees: reste.is_some(),
+            reprise_dans_s: reste.map(|d| d.as_secs().max(1)),
+            derniere_erreur: *verrou(&self.pochettes.derniere_erreur),
         }
     }
 
     /// Range, l'une après l'autre, les pochettes qui manquent. S'arrête au
-    /// premier refus durable (429 après les essais, panne) : la passe
-    /// suivante reprendra où celle-ci s'est arrêtée. Rend le nombre de
-    /// pochettes rangées.
+    /// premier refus durable (429 ou 403 après les essais, panne) : la passe
+    /// suivante reprendra où celle-ci s'est arrêtée ([`Self::lancer_pochettes`]
+    /// la relance d'elle-même après le recul). Rend le nombre de pochettes
+    /// rangées.
     pub async fn ranger_les_pochettes(&self) -> usize {
         let a_ranger = self.pochettes_a_ranger();
         if a_ranger.is_empty() {
@@ -309,7 +430,12 @@ impl Moteur {
     }
 
     /// Lance le préremplissage en tâche de fond. `false` s'il tourne déjà
-    /// ou s'il n'y a rien à ranger.
+    /// ou s'il n'y a rien à ranger. Une passe arrêtée par un refus ou une
+    /// panne du CDN reprend d'elle-même après le recul (doublé à chaque passe
+    /// sans progrès, jusqu'à [`Cadence::attente_max`]), tant qu'il reste des
+    /// pochettes à ranger.
+    ///
+    /// [`Cadence::attente_max`]: crate::Cadence
     pub fn lancer_pochettes(self: &Arc<Self>) -> bool {
         if self.pochettes_a_ranger().is_empty() {
             return false;
@@ -319,7 +445,26 @@ impl Moteur {
         }
         let moteur = self.clone();
         self.garder(tokio::spawn(async move {
-            moteur.ranger_les_pochettes().await;
+            let mut recul = moteur.cadence.attente_limite;
+            loop {
+                let rangees = moteur.ranger_les_pochettes().await;
+                if moteur.pochettes_a_ranger().is_empty() {
+                    break;
+                }
+                if rangees > 0 {
+                    recul = moteur.cadence.attente_limite;
+                }
+                let attente = moteur.pochettes.limitee_pour().unwrap_or(recul).max(recul);
+                // Sans recul (essais), une passe sans progrès ne se relance
+                // pas : elle tournerait à vide.
+                if attente.is_zero() && rangees == 0 {
+                    break;
+                }
+                tracing::info!(target: "plugin", reprise_dans_s = attente.as_secs(), "collection_physique_pochettes_reprise_prevue");
+                tokio::task::yield_now().await;
+                attendre(attente).await;
+                recul = (recul * 2).min(moteur.cadence.attente_max.max(moteur.cadence.attente_limite));
+            }
             moteur.pochettes.en_cours.store(false, Ordering::SeqCst);
         }));
         true

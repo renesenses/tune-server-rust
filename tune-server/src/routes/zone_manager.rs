@@ -422,6 +422,9 @@ async fn create_group(
 ) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut groups = load_json_setting(&settings, "zone_groups");
+    // #7937 — une zone n'appartient qu'à UN groupe (même règle que
+    // `POST /zones/group`).
+    tune_core::zones::groupes_enregistres::retirer_les_zones(&mut groups, &body.zone_ids);
     let id = next_id(&groups);
     let group = json!({
         "id": id,
@@ -1199,10 +1202,9 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
 async fn delete_oaat_group(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
     // Remove from registry
     let device_id = format!("oaat-group:{id}");
-    {
-        let mut outputs = state.outputs.lock().await;
-        outputs.remove(&device_id);
-    }
+    let retiree = state.outputs.lock().await.remove(&device_id);
+    // #7949 — un groupe supprimé pendant la lecture ne joue plus.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(retiree).await;
 
     // Remove from settings
     let settings = SettingsRepo::with_backend(state.backend.clone());

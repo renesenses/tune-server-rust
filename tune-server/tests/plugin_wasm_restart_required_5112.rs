@@ -30,7 +30,7 @@ fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugins/party")
 }
 
-async fn post(app: &axum::Router, path: &str) -> (StatusCode, Value) {
+pub(crate) async fn post(app: &axum::Router, path: &str) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("POST")
         .uri(path)
@@ -48,7 +48,7 @@ async fn post(app: &axum::Router, path: &str) -> (StatusCode, Value) {
 }
 
 /// Rend les variables d'environnement de l'essai à la sortie.
-struct Environnement(Vec<(&'static str, Option<std::ffi::OsString>)>);
+pub(crate) struct Environnement(Vec<(&'static str, Option<std::ffi::OsString>)>);
 impl Drop for Environnement {
     fn drop(&mut self) {
         for (k, v) in &self.0 {
@@ -64,7 +64,10 @@ impl Drop for Environnement {
 
 /// Démarre un serveur dont le dossier de greffons contient Party ; `active`
 /// pose `plugin_party_enabled` AVANT le chargement, comme une base existante.
-async fn demarrer(dossier: &Path, active: bool) -> (AppState, axum::Router, Environnement) {
+pub(crate) async fn demarrer(
+    dossier: &Path,
+    active: bool,
+) -> (AppState, axum::Router, Environnement) {
     let greffons = dossier.join("plugins");
     let cible = greffons.join(ID);
     std::fs::create_dir_all(&cible).unwrap();

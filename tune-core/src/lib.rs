@@ -72,6 +72,7 @@ pub mod radio_favorites;
 pub mod radio_hls;
 pub mod radio_metadata;
 pub mod radio_metadata_relais;
+pub mod reglages_proteges;
 pub mod remote_discovery;
 pub mod remote_proxy;
 pub mod room_correction;

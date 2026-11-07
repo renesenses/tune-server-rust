@@ -433,6 +433,7 @@ const CADENCE_DE_TEST: Cadence = Cadence {
     vidage_max: Duration::from_secs(2),
     attente_allumage: Duration::from_millis(800),
     attente_source: Duration::from_millis(500),
+    attente_premier_son: Duration::from_secs(1),
 };
 
 fn sinus(f: u32, n: usize) -> Vec<[i32; 2]> {
@@ -1072,3 +1073,6 @@ async fn air_le_fournisseur_n_ecoute_rien_tant_que_l_option_est_desactivee() {
 
 #[path = "volume_db_6918_tests.rs"]
 mod volume_db_6918;
+
+#[path = "demarrage_borne_6911_tests.rs"]
+mod demarrage_borne_6911;

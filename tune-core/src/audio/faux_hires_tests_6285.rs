@@ -56,7 +56,8 @@ pub(crate) fn quantifier(signal: &[f32], bits: u32) -> Vec<i32> {
 
 fn verdict(echantillons: &[i32], sample_rate: u32, bits: u32) -> (Mesure, Verdict) {
     let m = mesurer(echantillons, 1, sample_rate, bits);
-    (m, juger(&m))
+    let v = juger(&m);
+    (m, v)
 }
 
 fn coupure_vers(m: &Mesure, attendue: f64) {

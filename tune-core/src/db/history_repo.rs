@@ -43,7 +43,8 @@ pub mod sql {
     /// Sans `album_id` sur la ligne, on préfère ne rien résoudre.
     const RECORD_COLS_RESOLUS: &str = "h.id, COALESCE(h.track_id, t.id) as track_id, h.title, \
          h.artist_name, h.album_title, h.source, h.source_id, h.album_id, h.duration_ms, \
-         h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position, h.cover_url";
+         h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position, h.cover_url, \
+         h.context_source, h.album_ref";
 
     /// La jointure qui résout `track_id`, commune aux deux listes.
     const JOINTURE_PISTE: &str = " FROM listen_history h \
@@ -124,11 +125,33 @@ pub mod sql {
             // était multipliée. Les rapprochements (piste, pochette, album)
             // se font maintenant APRÈS le regroupement, en sous-requêtes
             // scalaires (`MAX`), qui rendent au plus une valeur par groupe.
-            "WITH g AS (SELECT h.title AS title, h.artist_name AS artist_name, \
-                    COUNT(*) AS plays, MAX(h.track_id) AS tid, \
-                    MAX(h.album_title) AS alb, MAX(h.cover_url) AS cu, MAX(h.source) AS src \
+            //
+            // #7777 : les écoutes IMPORTÉES (`imported_plays`, #7763) comptent
+            // aussi, avec la même règle que `plays_for_tracks` — titre +
+            // interprète de la piste. Une piste qui n'a QUE des écoutes
+            // importées entre dans le classement ; une piste qui a les deux
+            // les additionne dans un seul groupe. `listen_history.track_id`
+            // étant toujours NULL, `MAX(tid)` y prend l'identifiant de la
+            // piste importée. `CAST … AS BIGINT` : `SUM` d'un BIGINT rend un
+            // NUMERIC sur PostgreSQL, que `as_i64` ne lit pas. Une écoute
+            // importée vaut `src = 'local'` : son `track_id` désigne une piste
+            // de la bibliothèque, donc `MAX(src)` d'un groupe mixte peut
+            // passer de « deezer » à « local », ce qui reste cohérent.
+            "WITH u AS (SELECT h.title AS title, h.artist_name AS artist_name, \
+                    1 AS n, h.track_id AS tid, h.album_title AS alb, \
+                    h.cover_url AS cu, h.source AS src \
                     FROM listen_history h WHERE h.source != 'radio' \
-                    GROUP BY h.title, h.artist_name) \
+                  UNION ALL \
+                  SELECT t.title, a.name, ip.play_count, ip.track_id, al.title, \
+                    NULL, 'local' \
+                    FROM imported_plays ip JOIN tracks t ON t.id = ip.track_id \
+                    LEFT JOIN artists a ON a.id = t.artist_id \
+                    LEFT JOIN albums al ON al.id = t.album_id \
+                    WHERE ip.play_count > 0), \
+             g AS (SELECT u.title AS title, u.artist_name AS artist_name, \
+                    CAST(SUM(u.n) AS BIGINT) AS plays, MAX(u.tid) AS tid, \
+                    MAX(u.alb) AS alb, MAX(u.cu) AS cu, MAX(u.src) AS src \
+                    FROM u GROUP BY u.title, u.artist_name) \
              SELECT g.title, g.artist_name, g.plays, \
              COALESCE((SELECT MAX(t.id) FROM tracks t WHERE t.id = g.tid), \
                       (SELECT MAX(t3.id) FROM tracks t3 WHERE t3.title = g.title), g.tid) AS track_id, \
@@ -194,6 +217,69 @@ pub mod sql {
                         OR (h.artist_name IS NULL AND a.name IS NULL)) \
              WHERE t.id IN ({id_list}) \
              GROUP BY t.id"
+        )
+    }
+
+    /// La condition qui rattache une écoute `h` à une piste `t` (#7769) : la
+    /// règle de [`plays_for_tracks`], écrite pour servir DANS une autre
+    /// requête — les listes et collections intelligentes, qui comptaient par
+    /// `h.track_id = t.id`, une colonne toujours NULL. « = 0 » y rendait
+    /// toute la bibliothèque et « < 1 » rien du tout.
+    ///
+    /// Même règle, donc même nombre que la colonne de la Bibliothèque : hors
+    /// radio, même titre, et même interprète ou interprète absent des deux
+    /// côtés. L'interprète de la piste est relu par sous-requête pour ne
+    /// dépendre d'aucun alias de la requête englobante. `piste` et `ecoute`
+    /// sont des alias écrits par l'appelant, jamais une saisie.
+    ///
+    /// Une écoute dont `track_id` désigne la piste lui revient aussi, même
+    /// sans interprète enregistré : c'était la seule règle avant #7769, et
+    /// la retirer faisait perdre ces écoutes (`pg_date_relative_6122`). Une
+    /// seule ligne d'écoute ne compte qu'une fois : c'est un `OR` dans la
+    /// même condition. Sur les écoutes de la production, `track_id` vide, le
+    /// nombre reste celui de la Bibliothèque.
+    pub fn ecoute_de_la_piste(piste: &str, ecoute: &str) -> String {
+        let interprete =
+            format!("(SELECT ae.name FROM artists ae WHERE ae.id = {piste}.artist_id)");
+        format!(
+            "{ecoute}.source != 'radio' AND ({ecoute}.track_id = {piste}.id \
+             OR ({ecoute}.title = {piste}.title \
+                 AND ({ecoute}.artist_name = {interprete} \
+                      OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))))"
+        )
+    }
+
+    /// Le nombre d'écoutes de la piste `piste`, en sous-requête corrélée :
+    /// `0` pour une piste jamais écoutée, jamais NULL (#7769).
+    pub fn ecoutes_de_la_piste(piste: &str) -> String {
+        format!(
+            "(SELECT COUNT(*) FROM listen_history he WHERE {})",
+            ecoute_de_la_piste(piste, "he")
+        )
+    }
+
+    /// La dernière écoute de la piste `piste`, NULL si elle n'a jamais été
+    /// écoutée (#7769) — le `MAX(listened_at)` de [`plays_for_tracks`].
+    pub fn derniere_ecoute_de_la_piste(piste: &str) -> String {
+        format!(
+            "(SELECT MAX(he.listened_at) FROM listen_history he WHERE {})",
+            ecoute_de_la_piste(piste, "he")
+        )
+    }
+
+    /// Le nombre d'écoutes de chaque couple titre + interprète d'une page de
+    /// l'Historique (#7769). Grouper par `artist_name` met les interprètes
+    /// absents ensemble : c'est la règle « absent des deux côtés » de
+    /// [`plays_for_tracks`]. Placeholders : les `n_titres` titres.
+    pub fn ecoutes_par_titre<D: SqlDialect>(d: &D, n_titres: usize) -> String {
+        let titres = (1..=n_titres)
+            .map(|i| d.placeholder(i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT title, artist_name, COUNT(*) FROM listen_history \
+             WHERE source != 'radio' AND title IN ({titres}) \
+             GROUP BY title, artist_name"
         )
     }
 
@@ -421,12 +507,32 @@ pub struct ListenRecord {
     /// La référence d'album du service de la piste jouée
     /// (`StreamTrack.album_id`, migration 114 / PG 078) — pour Bandcamp,
     /// l'adresse de la page qui permet de resigner une URL de flux expirée
-    /// (fil 2121). ÉCRITE seulement : la liste de l'historique ne la relit pas
-    /// (elle n'a rien à en faire), et la clé n'apparaît JAMAIS dans son JSON :
-    /// référence interne de resignature, pas un changement de contrat.
-    /// C'est `db::reference_d_album` qui la retrouve au besoin.
+    /// (fil 2121). Référence INTERNE de resignature : la clé n'apparaît
+    /// JAMAIS dans le JSON bâti sur cette structure. La liste de l'historique
+    /// la relit depuis #7778 (point 6) et `GET /library/history` la pose
+    /// elle-même sous `album_id_service` ([`ListenRecord::album_id_service`]),
+    /// comme la file (fil 2143). C'est `db::reference_d_album` qui la
+    /// retrouve pour la resignature.
     #[serde(default, skip_serializing)]
     pub album_ref: Option<String>,
+}
+
+impl ListenRecord {
+    /// L'identifiant de l'album CHEZ SON SERVICE d'une écoute de service
+    /// (`album_ref`) ; `None` pour une écoute locale, et pour une référence
+    /// absente ou vide. Même règle que `QueueEntry::album_id_service`.
+    ///
+    /// #7778, point 6 (fil 2637) : sans lui, le client ne propose « Aller à
+    /// l'album » que pour une écoute lancée depuis cet album.
+    pub fn album_id_service(&self) -> Option<&str> {
+        if self.track_id.is_some() || self.source == "local" {
+            return None;
+        }
+        self.album_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+    }
 }
 
 pub struct HistoryRepo {
@@ -591,7 +697,67 @@ impl HistoryRepo {
             let derniere = cols.get(2).and_then(|v| v.as_string());
             map.insert(id, (compte, derniere));
         }
+        // #7763 — les écoutes importées (Roon, Plex, m3u) s'ajoutent à celles
+        // de l'historique, sans y figurer ; la dernière écoute est la plus
+        // récente des deux. Une table illisible (banc qui crée ses tables à
+        // la main) laisse les comptes de l'historique tels quels.
+        match crate::db::ecoutes_importees::EcoutesImporteesRepo::with_backend(self.db.clone())
+            .par_piste(track_ids)
+        {
+            Ok(importees) => {
+                for (id, (n, date)) in importees {
+                    let Some((compte, derniere)) = map.get_mut(&id) else {
+                        continue;
+                    };
+                    *compte += n;
+                    if let Some(date) = date
+                        && derniere.as_ref().is_none_or(|d| date > *d)
+                    {
+                        *derniere = Some(date);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "ecoutes_importees_illisibles"),
+        }
         Ok(map)
+    }
+
+    /// Le nombre d'écoutes de chaque écoute d'une page de l'Historique
+    /// (#7769), dans l'ordre de `ecoutes` : la colonne « # Plays » restait
+    /// vide parce que la liste n'envoyait aucun nombre.
+    ///
+    /// Même règle que [`Self::plays_for_tracks`] — hors radio, même titre,
+    /// même interprète ou absent des deux côtés — donc, pour une écoute de la
+    /// bibliothèque, le même nombre que la colonne de la Bibliothèque. Une
+    /// seule requête pour la page ; aucune sur une page vide.
+    pub fn plays_for_listens(&self, ecoutes: &[ListenRecord]) -> Result<Vec<i64>, String> {
+        if ecoutes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut titres: Vec<&str> = ecoutes.iter().map(|e| e.title.as_str()).collect();
+        titres.sort_unstable();
+        titres.dedup();
+        let sql = self.dialect_sql(
+            |d| sql::ecoutes_par_titre(d, titres.len()),
+            |d| sql::ecoutes_par_titre(d, titres.len()),
+        );
+        let params: Vec<&dyn ToSqlValue> = titres.iter().map(|t| t as &dyn ToSqlValue).collect();
+        let mut comptes: HashMap<(String, Option<String>), i64> = HashMap::new();
+        for cols in self.db.query_many(&sql, &params)? {
+            let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+            let artiste = cols.get(1).and_then(|v| v.as_string());
+            let compte = cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
+            comptes.insert((titre, artiste), compte);
+        }
+        Ok(ecoutes
+            .iter()
+            .map(|e| {
+                comptes
+                    .get(&(e.title.clone(), e.artist_name.clone()))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .collect())
     }
 
     /// Écoutes locales de pistes d'un service, tous profils (#7026) : pour
@@ -1090,6 +1256,22 @@ impl HistoryRepo {
             Engine::Sqlite => SqliteDialect.extract_hour(col),
             Engine::Postgres => PostgresDialect.extract_hour(col),
         };
+        // #7634 — `+colonne` interdit à SQLite de servir ce terme par un index.
+        //
+        // Sans lui, les classements et « Par zone » regroupaient par
+        // `idx_listen_history_artist` / `_album` / `_track` / `_zone` pour
+        // s'épargner un tri : le moteur parcourait alors TOUT l'historique
+        // dans l'ordre de l'index, une lecture de table par écoute, au lieu de
+        // ne lire que la période par `idx_listen_history_listened_at`.
+        // Banc de 500 000 écoutes, 7 jours : 1,3 à 1,7 s par classement,
+        // 0,36 à 0,59 s pour les zones ; 4 à 8 ms une fois l'index de date
+        // retenu. Le regroupement est le même (une valeur reste une valeur) ;
+        // PostgreSQL, qui n'a ni ce travers ni cet opérateur sur du texte,
+        // reçoit la colonne nue.
+        let sans_index = |col: &str| match self.db.engine() {
+            Engine::Sqlite => format!("+{col}"),
+            Engine::Postgres => col.to_string(),
+        };
 
         let mut simple_conditions: Vec<String> = Vec::new();
         if let Some(d) = days {
@@ -1190,8 +1372,9 @@ impl HistoryRepo {
         let artists_sql = format!(
             "SELECT lh.artist_name, COUNT(*) as plays, CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms
              FROM listen_history lh
-             {simple_where} {no_radio_and} lh.artist_name IS NOT NULL
-             GROUP BY lh.artist_name ORDER BY plays DESC LIMIT {top_n}",
+             {simple_where} {no_radio_and} {artiste} IS NOT NULL
+             GROUP BY {artiste} ORDER BY plays DESC, lh.artist_name LIMIT {top_n}",
+            artiste = sans_index("lh.artist_name"),
         );
         let artistes_bruts = self.db.query_many(&artists_sql, &[])?;
         let noms_artistes: Vec<String> = artistes_bruts
@@ -1237,9 +1420,11 @@ impl HistoryRepo {
             "SELECT h.album_title, h.artist_name, MAX(h.cover_url) as cover_url, COUNT(*) as plays,
                     MAX(h.source) as source, MAX(h.source_id) as source_id
              FROM listen_history h
-             {where_clause} {no_radio_and_h} h.album_title IS NOT NULL
-             GROUP BY h.album_title, h.artist_name
-             ORDER BY plays DESC LIMIT {top_n}",
+             {where_clause} {no_radio_and_h} {album} IS NOT NULL
+             GROUP BY {album}, {artiste}
+             ORDER BY plays DESC, h.album_title, h.artist_name LIMIT {top_n}",
+            album = sans_index("h.album_title"),
+            artiste = sans_index("h.artist_name"),
         );
         let albums_bruts = self.db.query_many(&albums_sql, &[])?;
         let titres_albums: Vec<String> = albums_bruts
@@ -1276,8 +1461,10 @@ impl HistoryRepo {
                     MAX(lh.cover_url) as cover_url,
                     MAX(lh.source) as source, MAX(lh.source_id) as source_id
              FROM listen_history lh
-             {simple_where} {no_radio_and} lh.title IS NOT NULL
-             GROUP BY lh.title, lh.artist_name ORDER BY plays DESC LIMIT {top_n}"
+             {simple_where} {no_radio_and} {titre} IS NOT NULL
+             GROUP BY {titre}, {artiste} ORDER BY plays DESC, lh.title, lh.artist_name LIMIT {top_n}",
+            titre = sans_index("lh.title"),
+            artiste = sans_index("lh.artist_name"),
         );
         // Ce bloc portait DEUX sous-requêtes corrélées sur `tracks` (47 118
         // lignes), l'une pour retrouver l'identifiant de piste, l'autre pour la
@@ -1418,7 +1605,8 @@ impl HistoryRepo {
              FROM listen_history h
              LEFT JOIN zones z ON z.id = h.zone_id
              {where_clause}
-             GROUP BY h.zone_id, z.name ORDER BY plays DESC"
+             GROUP BY {zone}, z.name ORDER BY plays DESC",
+            zone = sans_index("h.zone_id"),
         );
         let by_zone: Vec<ByZoneEntry> = self
             .db
@@ -1561,8 +1749,25 @@ impl HistoryRepo {
 
         // ── Streak ──
         let streak_day_expr = dialect_day("listened_at");
-        let streak_sql =
-            format!("SELECT DISTINCT {streak_day_expr} as d FROM listen_history ORDER BY 1");
+        // #7634 — sur SQLite, les jours d'écoute se lisent par SAUTS dans
+        // `idx_listen_history_listened_at` : un jour, puis la première écoute
+        // du lendemain ou après, et ainsi de suite. Une recherche d'index par
+        // jour écouté (1 096 sur trois ans) au lieu d'un `DISTINCT` qui
+        // parcourt tout l'historique : 0,3 à 0,5 s → 6 ms sur le banc de
+        // 500 000 écoutes, mêmes jours. PostgreSQL garde le `DISTINCT`.
+        let streak_sql = match self.db.engine() {
+            Engine::Sqlite => "WITH RECURSIVE jours(d) AS (
+                    SELECT DATE(MIN(listened_at)) FROM listen_history
+                    UNION ALL
+                    SELECT (SELECT DATE(MIN(listened_at)) FROM listen_history
+                             WHERE listened_at >= DATE(jours.d, '+1 day'))
+                      FROM jours WHERE jours.d IS NOT NULL)
+                 SELECT d FROM jours WHERE d IS NOT NULL"
+                .to_string(),
+            Engine::Postgres => {
+                format!("SELECT DISTINCT {streak_day_expr} as d FROM listen_history ORDER BY 1")
+            }
+        };
         let all_days: Vec<String> = self
             .db
             .query_many(&streak_sql, &[])
@@ -1610,15 +1815,60 @@ impl HistoryRepo {
             Engine::Sqlite => "CAST(strftime('%Y', listened_at) AS INTEGER)",
             Engine::Postgres => "EXTRACT(YEAR FROM listened_at::timestamp)::int",
         };
+        // #7634 — le `LIKE '%-MM-JJ%'` ne peut pas servir d'index : seul, il
+        // parcourait tout l'historique (et SQLite le faisait dans l'ordre de
+        // `idx_listen_history_track`, une lecture de table par écoute :
+        // 1,3 à 1,9 s sur le banc de 500 000 écoutes). Il est désormais
+        // précédé d'une plage de dates PAR ANNÉE passée, que l'index de
+        // `listened_at` sert directement (3 ms). Le `LIKE` reste : les lignes
+        // retenues sont exactement celles d'avant.
+        let annees_passees = self
+            .db
+            .query_one("SELECT MIN(listened_at) FROM listen_history", &[])
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+            .and_then(|premier| premier.get(0..4).and_then(|a| a.parse::<i32>().ok()))
+            .zip(current_year.parse::<i32>().ok())
+            .map(|(premiere, courante)| premiere.max(courante - 100)..courante);
+        let plages = match (annees_passees, today_md.len() == 5) {
+            (Some(annees), true) if !annees.is_empty() => {
+                let lendemain = chrono::NaiveDate::parse_from_str(
+                    &format!("2000-{today_md}"),
+                    "%Y-%m-%d",
+                )
+                .ok()
+                .and_then(|d| d.succ_opt())
+                .map(|d| d.format("%m-%d").to_string());
+                lendemain.map(|lendemain| {
+                    let annees: Vec<String> = annees
+                        .map(|a| {
+                            // 31/12 : le lendemain tombe l'année suivante.
+                            let fin = if lendemain == "01-01" { a + 1 } else { a };
+                            format!(
+                                "(listened_at >= '{a:04}-{today_md}' AND listened_at < '{fin:04}-{lendemain}')"
+                            )
+                        })
+                        .collect();
+                    format!("({}) AND", annees.join(" OR "))
+                })
+            }
+            // Aucune année passée dans l'historique : rien à montrer.
+            (Some(_), true) => Some("1 = 0 AND".to_string()),
+            _ => None,
+        }
+        .unwrap_or_default();
         // Agrégats hors du `GROUP BY` : même raison que `sql::top_tracks`
         // (PostgreSQL refuse une colonne nue, « Ce jour-là » revenait vide).
         let otd_sql = format!(
             "SELECT title, artist_name, MAX(album_title), NULL, MAX(listened_at),
                     MAX({yr_expr}) as yr
              FROM listen_history
-             WHERE listened_at LIKE {ph} AND {yr_expr} < {current_year}
-             GROUP BY title, artist_name
-             ORDER BY yr DESC LIMIT 10"
+             WHERE {plages} listened_at LIKE {ph} AND {yr_expr} < {current_year}
+             GROUP BY {titre}, {artiste}
+             ORDER BY yr DESC LIMIT 10",
+            titre = sans_index("title"),
+            artiste = sans_index("artist_name"),
         );
         let on_this_day: Vec<OnThisDayEntry> = self
             .db
@@ -1961,12 +2211,19 @@ fn row_to_listen(cols: &[SqlValue]) -> ListenRecord {
         context_type: cols.get(11).and_then(|v| v.as_string()),
         context_id: cols.get(12).and_then(|v| v.as_string()),
         context_position: cols.get(13).and_then(|v| v.as_i64()),
-        context_source: None,
+        // #7778 (point 6) — l'album d'un titre de service, et l'espace de
+        // noms du contexte : sans eux, le client ne pouvait proposer « Aller
+        // à l'album » que pour une écoute lancée depuis cet album.
+        context_source: cols.get(15).and_then(|v| v.as_string()),
         context_title: None,
         context_cover: None,
-        album_ref: None,
+        album_ref: cols.get(16).and_then(|v| v.as_string()),
     }
 }
+
+#[cfg(test)]
+#[path = "historique_album_de_service_7778_tests.rs"]
+mod historique_album_de_service_7778_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2516,6 +2773,19 @@ mod tests {
             "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
         ));
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
+        // #7778 (point 6) : `row_to_listen` lit `context_source` en 15 et
+        // `album_ref` en 16, dans les deux dialectes.
+        for liste in [
+            sql::recent(&s),
+            sql::recent(&p),
+            sql::recent_paginated(&s),
+            sql::recent_paginated(&p),
+        ] {
+            assert!(
+                liste.contains("h.cover_url, h.context_source, h.album_ref FROM"),
+                "colonnes 14 à 16 de la liste : {liste}"
+            );
+        }
         assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
         assert!(sql::listening_history(&s, 7).contains("'-7 days'"));
     }
