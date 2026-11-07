@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -45,7 +46,36 @@ pub struct MdnsScanner {
     configs: Vec<MdnsServiceConfig>,
     state: Arc<Mutex<MdnsState>>,
     event_tx: mpsc::Sender<MdnsEvent>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// `std::sync::Mutex` : la relance des recherches (#8100) part d'un
+    /// `Arc<MdnsScanner>` partagé, donc de `&self`.
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Ce que Tune annonce, pour le réannoncer quand l'adresse change (#8100).
+    annonces: std::sync::Mutex<Annonces>,
+    /// Adresses IPv4 locales relevées au lancement des recherches : le point
+    /// de départ du surveillant de réseau (#8100).
+    adresses_au_demarrage: std::sync::Mutex<BTreeSet<Ipv4Addr>>,
+}
+
+/// Les services que Tune annonce et l'adresse qu'ils portent.
+#[derive(Default)]
+struct Annonces {
+    /// `(port, version)` de `register_self`.
+    tune: Option<(u16, String)>,
+    /// Port de `register_sendspin_server`.
+    sendspin: Option<u16>,
+    /// Adresse annoncée ; `None` = `127.0.0.1` (aucune adresse au moment de
+    /// l'annonce).
+    ip: Option<Ipv4Addr>,
+    /// Noms complets enregistrés auprès du démon (tels qu'il les a
+    /// échappés), pour les retirer avant de réannoncer.
+    noms: Vec<String>,
+}
+
+/// L'adresse que Tune annonce : celle de SSDP, ou la boucle locale faute de
+/// mieux.
+fn texte_ip(ip: Option<Ipv4Addr>) -> String {
+    ip.map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".into())
 }
 
 struct MdnsState {
@@ -71,7 +101,9 @@ impl MdnsScanner {
             configs: Vec::new(),
             state: Arc::new(Mutex::new(MdnsState::new())),
             event_tx,
-            tasks: Vec::new(),
+            tasks: std::sync::Mutex::new(Vec::new()),
+            annonces: std::sync::Mutex::new(Annonces::default()),
+            adresses_au_demarrage: std::sync::Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -170,15 +202,22 @@ impl MdnsScanner {
     /// Announce this Tune server instance via mDNS so HomeAssistant
     /// and other clients can auto-discover it.
     pub fn register_self(&self, port: u16, version: &str) -> Result<(), String> {
+        let ip = crate::discovery::ssdp::get_local_ip();
+        {
+            let mut a = self.annonces.lock().unwrap();
+            a.tune = Some((port, version.to_owned()));
+            a.ip = ip;
+        }
+        self.annoncer_tune(port, version, ip)
+    }
+
+    fn annoncer_tune(&self, port: u16, version: &str, ip: Option<Ipv4Addr>) -> Result<(), String> {
         // Real OS hostname (not the env-only derivation that collapsed to
         // "tune-server" under systemd, colliding every instance — #1112).
         let hostname = crate::discovery::system_hostname();
         let service_name = format!("Tune ({hostname})");
         let host_label = crate::discovery::mdns_host_label(&hostname);
-
-        let local_ip = crate::discovery::ssdp::get_local_ip()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "127.0.0.1".into());
+        let local_ip = texte_ip(ip);
 
         let properties = [("version", version), ("path", "/api/v1")];
 
@@ -192,9 +231,11 @@ impl MdnsScanner {
         )
         .map_err(|e| format!("mDNS register: {e}"))?;
 
+        let nom = svc.get_fullname().to_owned();
         self.daemon
             .register(svc)
             .map_err(|e| format!("mDNS register: {e}"))?;
+        self.retenir_nom(nom);
 
         info!(
             service = TUNE_SERVICE,
@@ -219,13 +260,24 @@ impl MdnsScanner {
     /// est celui du serveur HTTP de Tune, où le point d'accès est réellement
     /// monté — et non le 8927 « recommandé », qui ne décrirait pas la réalité.
     pub fn register_sendspin_server(&self, port: u16) -> Result<(), String> {
+        let ip = crate::discovery::ssdp::get_local_ip();
+        {
+            let mut a = self.annonces.lock().unwrap();
+            a.sendspin = Some(port);
+            // `register_self` passe d'abord ; une adresse trouvée ici, plus
+            // tard, est la meilleure connue.
+            if ip.is_some() {
+                a.ip = ip;
+            }
+        }
+        self.annoncer_sendspin(port, ip)
+    }
+
+    fn annoncer_sendspin(&self, port: u16, ip: Option<Ipv4Addr>) -> Result<(), String> {
         let hostname = crate::discovery::system_hostname();
         let service_name = format!("Tune ({hostname})");
         let host_label = crate::discovery::mdns_host_label(&hostname);
-
-        let local_ip = crate::discovery::ssdp::get_local_ip()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "127.0.0.1".into());
+        let local_ip = texte_ip(ip);
 
         let properties = [
             ("path", crate::sendspin::CHEMIN_POINT_D_ACCES),
@@ -242,9 +294,11 @@ impl MdnsScanner {
         )
         .map_err(|e| format!("mDNS sendspin register: {e}"))?;
 
+        let nom = svc.get_fullname().to_owned();
         self.daemon
             .register(svc)
             .map_err(|e| format!("mDNS sendspin register: {e}"))?;
+        self.retenir_nom(nom);
 
         info!(
             service = SENDSPIN_SERVER_SERVICE,
@@ -257,36 +311,55 @@ impl MdnsScanner {
         Ok(())
     }
 
+    fn retenir_nom(&self, nom: String) {
+        let mut a = self.annonces.lock().unwrap();
+        if !a.noms.contains(&nom) {
+            a.noms.push(nom);
+        }
+    }
+
+    /// Lance la recherche d'un type et la tâche qui en lit les évènements.
+    fn lancer_recherche(&self, config: &MdnsServiceConfig) -> Result<(), String> {
+        let receiver = self
+            .daemon
+            .browse(&config.service_type)
+            .map_err(|e| format!("browse {}: {e}", config.service_type))?;
+
+        let state = self.state.clone();
+        let event_tx = self.event_tx.clone();
+        let output_type = config.output_type;
+        let default_port = config.default_port;
+        let service_type = config.service_type.clone();
+
+        let task = tokio::spawn(async move {
+            browse_loop(
+                receiver,
+                state,
+                event_tx,
+                output_type,
+                default_port,
+                &service_type,
+            )
+            .await;
+        });
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
+        Ok(())
+    }
+
     pub fn start(&mut self) -> Result<(), String> {
+        // Relevé AVANT les recherches : une adresse qui arrive ensuite est un
+        // changement que le surveillant verra (#8100).
+        *self.adresses_au_demarrage.lock().unwrap() = super::mdns_reprise::releve_systeme();
+
         let mut has_bluos = false;
         for config in &self.configs {
-            let receiver = self
-                .daemon
-                .browse(&config.service_type)
-                .map_err(|e| format!("browse {}: {e}", config.service_type))?;
+            self.lancer_recherche(config)?;
 
             if config.output_type == OutputType::Bluos {
                 has_bluos = true;
             }
-
-            let state = self.state.clone();
-            let event_tx = self.event_tx.clone();
-            let output_type = config.output_type;
-            let default_port = config.default_port;
-            let service_type = config.service_type.clone();
-
-            let task = tokio::spawn(async move {
-                browse_loop(
-                    receiver,
-                    state,
-                    event_tx,
-                    output_type,
-                    default_port,
-                    &service_type,
-                )
-                .await;
-            });
-            self.tasks.push(task);
 
             info!(service = %config.service_type, "mdns_browse_started");
         }
@@ -295,7 +368,7 @@ impl MdnsScanner {
         // Helps users diagnose mDNS issues (firewalls, VLANs, VPN blocking multicast).
         if has_bluos {
             let state = self.state.clone();
-            self.tasks.push(tokio::spawn(async move {
+            self.tasks.lock().unwrap().push(tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let st = state.lock().await;
                 let bluos_count = st
@@ -320,11 +393,86 @@ impl MdnsScanner {
         for config in &self.configs {
             let _ = self.daemon.stop_browse(&config.service_type);
         }
-        for task in self.tasks.drain(..) {
+        for task in self.tasks.lock().unwrap().drain(..) {
             task.abort();
         }
         let _ = self.daemon.shutdown();
         info!("mdns_scanner_stopped");
+    }
+
+    /// Relance les recherches de tous les types suivis (#8100).
+    ///
+    /// `stop_browse` retire la recherche et ses répétitions programmées, puis
+    /// ferme son canal (la tâche de lecture s'arrête d'elle-même) ; `browse`
+    /// la recrée avec un recul qui repart de 1 s, sur toutes les interfaces
+    /// connues du démon à cet instant. Le démon traite ses commandes dans
+    /// l'ordre : la nouvelle recherche suit bien l'arrêt de l'ancienne.
+    pub fn relancer_recherches(&self) {
+        for config in &self.configs {
+            let _ = self.daemon.stop_browse(&config.service_type);
+            match self.lancer_recherche(config) {
+                Ok(()) => info!(service = %config.service_type, "mdns_browse_relance"),
+                Err(e) => warn!(error = %e, "mdns_browse_relance_echec"),
+            }
+        }
+    }
+
+    /// Réannonce Tune (et le serveur Sendspin) sur `ip` (#8100).
+    ///
+    /// L'ancienne annonce porte une adresse FIXE que le démon ne corrige
+    /// jamais : on la retire (adieu RFC 6762 §10.1), puis on enregistre la
+    /// nouvelle. Seuls les services déjà annoncés sont réannoncés.
+    pub fn reenregistrer(&self, ip: Ipv4Addr) {
+        let (tune, sendspin, noms) = {
+            let mut a = self.annonces.lock().unwrap();
+            a.ip = Some(ip);
+            (a.tune.clone(), a.sendspin, std::mem::take(&mut a.noms))
+        };
+        for nom in noms {
+            let _ = self.daemon.unregister(&nom);
+        }
+        if let Some((port, version)) = tune {
+            if let Err(e) = self.annoncer_tune(port, &version, Some(ip)) {
+                warn!(error = %e, "mdns_reenregistrement_echec");
+            }
+        }
+        if let Some(port) = sendspin {
+            if let Err(e) = self.annoncer_sendspin(port, Some(ip)) {
+                warn!(error = %e, "mdns_sendspin_reenregistrement_echec");
+            }
+        }
+    }
+
+    /// Surveille les adresses IPv4 locales et reprend la découverte quand le
+    /// réseau arrive ou change (#8100). Voir [`super::mdns_reprise`].
+    ///
+    /// La tâche tient une référence FAIBLE : elle s'arrête avec le scanner.
+    pub fn surveiller_reseau(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let faible = Arc::downgrade(self);
+        let precedentes = self.adresses_au_demarrage.lock().unwrap().clone();
+        let annoncee = self.annonces.lock().unwrap().ip;
+        tokio::spawn(async move {
+            let mut surveillant = super::mdns_reprise::SurveillantReseau::new(
+                super::mdns_reprise::releve_systeme,
+                crate::discovery::ssdp::get_local_ip,
+                precedentes,
+                annoncee,
+            );
+            loop {
+                tokio::time::sleep(super::mdns_reprise::INTERVALLE_RELEVE).await;
+                let Some(scanner) = faible.upgrade() else {
+                    break;
+                };
+                let reprise = surveillant.pas(scanner.as_ref());
+                if !reprise.rien() {
+                    info!(
+                        relance = reprise.relancer_recherches,
+                        ip = ?reprise.reenregistrer,
+                        "mdns_reprise_reseau"
+                    );
+                }
+            }
+        })
     }
 
     pub async fn devices(&self) -> Vec<DiscoveredDevice> {
@@ -350,6 +498,15 @@ impl MdnsScanner {
     pub async fn device_count(&self) -> usize {
         let state = self.state.lock().await;
         state.devices.len()
+    }
+}
+
+impl super::mdns_reprise::ActionsReprise for MdnsScanner {
+    fn relancer_recherches(&self) {
+        MdnsScanner::relancer_recherches(self);
+    }
+    fn reenregistrer(&self, ip: Ipv4Addr) {
+        MdnsScanner::reenregistrer(self, ip);
     }
 }
 
