@@ -165,12 +165,14 @@ fn tune_tested_7922_le_contenu_ne_porte_ni_adresse_ni_nom_ni_identifiant() {
     assert_eq!(
         cles,
         [
+            "bit_depth",
+            "brand",
             "commercial_name",
             "device_key",
+            "dsd",
             "error_free_seconds",
             "formats",
-            "gapless_observed",
-            "manufacturer",
+            "gapless",
             "model",
             "output_type",
             "platform",
@@ -212,4 +214,126 @@ fn tune_tested_7922_une_proposition_par_appareil_et_par_installation() {
     // de l'appareil : deux exemplaires du même modèle ont la même clé.
     assert_eq!(cle, cle_appareil("test audio", "dac 7922", "dlna"));
     assert!(!cle.contains("123e4567"));
+}
+
+/// #8084 — le catalogue Tune tested tel que le site le sert, rangé comme le
+/// fait le téléchargement.
+fn ranger_catalogue(settings: &SettingsRepo, marque: &str, modele: &str) {
+    settings
+        .set(
+            crate::cloud::tune_tested::CLE_CATALOGUE,
+            &serde_json::json!({
+                "version": 1_762_000_000,
+                "count": 1,
+                "settings_vocabulary": "tune.renderer.v1",
+                "devices": [{
+                    "brand": marque,
+                    "model": modele,
+                    "output_type": "dlna",
+                    "settings": { "dlna_native_flac": true },
+                    "households": 3
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn tune_tested_8084_un_appareil_deja_au_catalogue_reste_proposable() {
+    let settings = settings();
+    // Graphie du catalogue différente de celle détectée : la comparaison est
+    // insensible à la casse, comme le reste de Tune tested.
+    ranger_catalogue(&settings, "TEST AUDIO", "dac 7922");
+    une_heure(&settings, APPAREIL);
+    let etat = etat(&settings, ZONE, Some(APPAREIL));
+    assert!(
+        etat.already_tune_tested,
+        "l'appareil est au catalogue : l'état doit le dire"
+    );
+    assert!(
+        etat.eligible,
+        "déjà Tune tested n'est pas un motif de refus : la proposition ajoute un foyer"
+    );
+    assert_eq!(etat.reason, None);
+    assert!(etat.preview.is_some());
+}
+
+#[test]
+fn tune_tested_8084_contre_epreuve_un_autre_appareil_n_est_pas_deja_tune_tested() {
+    let settings = settings();
+    ranger_catalogue(&settings, "Test Audio", "DAC 9000");
+    une_heure(&settings, APPAREIL);
+    let etat = etat(&settings, ZONE, Some(APPAREIL));
+    assert!(!etat.already_tune_tested);
+    assert!(etat.eligible);
+    // Sans catalogue rangé du tout : faux aussi.
+    let vierge = self::settings();
+    une_heure(&vierge, APPAREIL);
+    assert!(!super::etat(&vierge, ZONE, Some(APPAREIL)).already_tune_tested);
+}
+
+#[test]
+fn tune_tested_8084_le_corps_suit_le_schema_du_site() {
+    let settings = settings();
+    for (n, format) in [
+        flac(96_000, 24),
+        // Sans fréquence : le site la rend obligatoire, le format ne part pas.
+        FormatObserve {
+            codec: "flac".into(),
+            sample_rate: None,
+            bit_depth: Some(16),
+            dsd_mode: None,
+        },
+        FormatObserve {
+            codec: "dsd".into(),
+            sample_rate: Some(2_822_400),
+            bit_depth: Some(1),
+            dsd_mode: Some("dop".into()),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        noter_lecture(
+            &settings,
+            ZONE,
+            piste(APPAREIL, n as u64, 1_200_000, Some(format)),
+        )
+        .unwrap();
+    }
+    let apercu = etat(&settings, ZONE, Some(APPAREIL)).preview.unwrap();
+    let json = serde_json::to_value(&apercu).unwrap();
+    assert_eq!(json["brand"], "Test Audio");
+    assert_eq!(json["gapless"], false);
+    assert_eq!(json["bit_depth"], 24, "la plus grande profondeur PCM jouée");
+    assert_eq!(json["dsd"], "dop");
+    assert_eq!(json["formats"].as_array().unwrap().len(), 2);
+    assert!(
+        json["formats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["sample_rate"].is_u64())
+    );
+    assert!(json.get("manufacturer").is_none());
+    assert!(json.get("gapless_observed").is_none());
+}
+
+#[test]
+fn tune_tested_8084_airplay_1_part_sous_le_nom_du_site() {
+    let settings = settings();
+    for n in 0..15 {
+        let mut lecture = piste(APPAREIL, n, 240_000, Some(flac(44_100, 16)));
+        lecture.protocole_brut = "airplay";
+        noter_lecture(&settings, ZONE, lecture).unwrap();
+    }
+    let apercu = etat(&settings, ZONE, Some(APPAREIL)).preview.unwrap();
+    assert_eq!(apercu.output_type, "airplay");
+    // La clé locale garde la sortie de Tune : rien ne change pour
+    // `already_proposed` des propositions déjà parties.
+    assert_eq!(
+        apercu.device_key,
+        cle_appareil("Test Audio", "DAC 7922", "airplay1")
+    );
 }

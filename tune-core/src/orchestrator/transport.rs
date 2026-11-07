@@ -2133,11 +2133,8 @@ impl PlaybackOrchestrator {
         // puis retrouvé, sortie absente du registre). Même graine qu'au
         // démarrage (#1596, #5561) : volume de la zone × trim, « Volume fixe »
         // à 1.0, jamais au-delà de l'unité.
-        if let Ok(Some(zone)) = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-            .get_by_device_id(device_id)
-        {
-            ensemencer_le_volume_local(&self.db, &zone, device_id, &local_out).await;
-        }
+        // #8074 — sans zone en base, elle part BAS, jamais à pleine échelle.
+        ensemencer_la_sortie_locale_neuve(&self.db, device_id, &local_out).await;
         {
             let mut outputs = self.outputs.lock().await;
             outputs.register(Box::new(local_out));

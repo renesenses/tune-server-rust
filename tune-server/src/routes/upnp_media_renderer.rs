@@ -223,11 +223,50 @@ async fn connection_manager_scpd() -> Response {
     xml_response(tune_core::upnp_server::connection_manager_scpd().to_string())
 }
 
-async fn connection_manager_control(body: String) -> Response {
+async fn connection_manager_control(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    body: String,
+) -> Response {
     // Le ConnectionManager du renderer, PAS celui du media server : celui-ci
     // annonce en `Source` ce qu'un serveur sert et rend un `Sink` vide, ce qui
     // pour un renderer dit « je n'accepte aucun format ».
-    xml_response(tune_core::upnp_server::build_renderer_connection_manager_response(&body))
+    //
+    // #8052 — et le `Sink` de CETTE zone : une zone prêtée dont la sortie
+    // locale joue le DSD en DoP ou en natif l'annonce, pour que le serveur
+    // principal lui envoie le `.dsf` tel quel au lieu de le décimer en PCM.
+    let accepte_le_dsd = zone_pretee_accepte_le_dsd(&state, zone_id);
+    xml_response(
+        tune_core::upnp_server::build_renderer_connection_manager_response_pour(
+            &body,
+            accepte_le_dsd,
+        ),
+    )
+}
+
+/// #8052 — la zone `zone_id` annonce-t-elle le DSD dans son `Sink` ? Lue en
+/// base à chaque sondage. Le serveur principal, lui, garde la première
+/// réponse concluante jusqu'à son redémarrage (`sonder_dsd`) : un changement
+/// de réglage DSD ici ne vaut pour lui qu'après ce redémarrage. Une zone
+/// introuvable n'annonce rien.
+fn zone_pretee_accepte_le_dsd(state: &AppState, zone_id: i64) -> bool {
+    let zones = ZoneRepo::with_backend(state.backend.clone());
+    let Some(zone) = zones.get(zone_id).ok().flatten() else {
+        return false;
+    };
+    let dsd_mode = zones.get_dsd_mode(zone_id);
+    let accepte = tune_core::upnp_server::zone_pretee_accepte_le_dsd(
+        zone.output_device_id.as_deref(),
+        &dsd_mode,
+    );
+    debug!(
+        zone_id,
+        output_device_id = ?zone.output_device_id,
+        dsd_mode = %dsd_mode,
+        accepte,
+        "upnp_renderer_sink_dsd"
+    );
+    accepte
 }
 
 /// GENA minimal, identique au MediaServer : accepter l'abonnement suffit aux
@@ -2005,6 +2044,10 @@ mod url_distante_de_jplay_5574_tests;
 #[cfg(test)]
 #[path = "upnp_media_renderer_tests_6335.rs"]
 mod enchainement_par_la_zone_6335_tests;
+
+#[cfg(test)]
+#[path = "upnp_media_renderer_tests_8052.rs"]
+mod sink_dsd_de_la_zone_8052_tests;
 
 #[cfg(test)]
 mod publication_de_zone_4626_tests {

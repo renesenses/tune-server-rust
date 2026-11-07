@@ -2552,15 +2552,13 @@ pub(crate) async fn enregistrer_les_sorties_locales(
         // logiciel local, lui, n'appartient qu'à Tune, et sa valeur de départ
         // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
         // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
-        if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
-            tune_core::orchestrator::ensemencer_le_volume_local(
-                &state.backend,
-                &zone,
-                &device_id,
-                &local_out,
-            )
-            .await;
-        }
+        // #8074 — sans zone en base, la sortie part BAS, pas à pleine échelle.
+        tune_core::orchestrator::ensemencer_la_sortie_locale_neuve(
+            &state.backend,
+            &device_id,
+            &local_out,
+        )
+        .await;
         outputs.register(Box::new(local_out));
         info!(
             name = %dev.name,

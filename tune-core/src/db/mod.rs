@@ -24,6 +24,8 @@ pub mod dossiers_des_collections;
 pub mod ecoutes_importees;
 pub mod edition_album;
 pub mod engine;
+/// #7983 — la trace des tentatives de la passe d'enrichissement des métadonnées.
+pub mod enrich_tentatives;
 pub mod facet_filter;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;

@@ -2049,6 +2049,9 @@ mod confirmation_navigateur_6066;
 pub mod ecoute_validee_7852;
 #[cfg(test)]
 mod ecoute_validee_7852_tests;
+// #8076 — FLAC local vers DLNA en PURE : voie servie et échantillons exacts.
+#[cfg(test)]
+mod gapless_dlna_pure_8076_tests;
 // #7965 — radios (au nom de la station) et podcasts dans l'historique.
 mod historique_radio_podcast_7965;
 #[cfg(test)]
@@ -2355,6 +2358,11 @@ mod dsd_passthrough_tests;
 /// la zone (brut / DoP / PCM), comme un `.dsf` local — par la porte publique.
 #[cfg(test)]
 mod dsd_upnp_politique_de_zone_tests;
+
+/// #8052 — prêt de sorties : la façade annonce le DSD de sa sortie locale, et
+/// le prêteur sert le DSD reçu comme un `.dsf` de sa bibliothèque.
+#[cfg(test)]
+mod dsd_pret_de_sorties_8052_tests;
 
 /// Relevé par #5119 — les bras DSF UPnP et AAC n'appliquent pas l'égaliseur
 /// d'une zone LOCALE dans son flux : mesuré sur le PCM, une passe et non deux.

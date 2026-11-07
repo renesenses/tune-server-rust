@@ -3907,7 +3907,7 @@ pub struct DsdCapability {
 /// `dsf_mime` keeps the renderer's own spelling of the MIME (3rd colon-separated
 /// field of `http-get:*:audio/dsf:*`), because some renderers only accept the
 /// exact MIME they advertise rather than the generic `application/x-dsd`.
-fn parse_dsd_capability(protocols: &[String]) -> DsdCapability {
+pub(crate) fn parse_dsd_capability(protocols: &[String]) -> DsdCapability {
     let mut cap = DsdCapability::default();
     for proto in protocols {
         let lower = proto.to_lowercase();

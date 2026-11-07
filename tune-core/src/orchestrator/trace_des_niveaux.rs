@@ -100,6 +100,10 @@ pub(super) fn arret_du_forwarder(
 /// À l'enchaînement : la mesure de la piste devenue courante est-elle lancée ?
 /// `decision` nomme la branche prise (`decodage_du_fichier`,
 /// `sonde_du_service`, ou `non_lance_…` avec la raison).
+///
+/// #8076 — cette décision ne concerne QUE les VU-mètres : le flux servi au
+/// renderer n'en dépend pas (sa voie est sur `gapless_next_set`). Le champ
+/// `objet` le dit sur la ligne même.
 pub(super) fn niveaux_apres_avance(
     zone_id: i64,
     play_seq: u64,
@@ -113,7 +117,13 @@ pub(super) fn niveaux_apres_avance(
     }
     info!(
         zone_id,
-        play_seq, generation, track_id, format, decision, "gapless_levels_after_advance"
+        play_seq,
+        generation,
+        track_id,
+        format,
+        decision,
+        objet = "vu_metres",
+        "gapless_levels_after_advance"
     );
 }
 

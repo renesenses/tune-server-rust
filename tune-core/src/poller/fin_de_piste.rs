@@ -1424,11 +1424,19 @@ impl PositionPoller {
                         let t_verif = Instant::now();
                         let tenue = output.suivante_preparee(&resolved.url).await;
                         self.noter_le_suivant_arme(zone_id, device_id, dsd_arme, tenue);
+                        // #8076 — `streaming` ne dit que « une session HTTP
+                        // existe » (un fichier servi tel quel en a une) : la
+                        // voie dit ce qui part sur le fil.
+                        let voie = match resolved.stream_id.as_deref() {
+                            Some(sid) => self.orchestrator.streamer.voie_servie(sid).await,
+                            None => "url_directe",
+                        };
                         info!(
                             zone_id,
                             title = %resolved.title,
                             resolve_ms,
                             streaming = is_streaming,
+                            voie,
                             suivante = ?tenue,
                             verif_ms = t_verif.elapsed().as_millis() as u64,
                             "gapless_next_set"

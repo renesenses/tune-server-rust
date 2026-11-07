@@ -408,6 +408,40 @@ pub async fn ensemencer_le_volume_local(
     }
 }
 
+/// #8074 — la graine de TOUTE sortie locale qui vient de naître, d'après son
+/// `device_id` : celle de sa zone si la base en connaît une
+/// ([`ensemencer_le_volume_local`]), sinon le niveau de départ sans repère
+/// (30 % du curseur `db60`, −42 dB), jamais la pleine échelle de naissance.
+///
+/// Les TROIS naissances passent par ici : l'énumération du démarrage
+/// (`tune-server::startup::enregistrer_les_sorties_locales`), le balayage à
+/// chaud (`tune-server::background::appliquer_le_parc_local`) et la recréation
+/// à la volée (`recreate_local_and_play`). Le balayage à chaud n'ensemençait
+/// rien : avec ASIO choisi sous Windows, c'est lui qui enregistre les sorties
+/// WASAPI, et le premier morceau partait à 100 % du gain.
+pub async fn ensemencer_la_sortie_locale_neuve(
+    db: &Arc<dyn crate::db::backend::DbBackend>,
+    device_id: &str,
+    sortie: &dyn crate::outputs::OutputTarget,
+) {
+    match crate::db::zone_repo::ZoneRepo::with_backend(db.clone()).get_by_device_id(device_id) {
+        Ok(Some(zone)) => ensemencer_le_volume_local(db, &zone, device_id, sortie).await,
+        _ => {
+            let gain = crate::audio::reglages_de_volume::gain_de_depart_sans_repere_local();
+            match crate::outputs::OutputTarget::set_volume(sortie, gain).await {
+                Ok(()) => info!(
+                    device_id = %device_id,
+                    volume = gain,
+                    "local_output_volume_sans_zone_depart_bas"
+                ),
+                Err(e) => {
+                    warn!(device_id = %device_id, error = %e, "local_output_volume_seed_failed")
+                }
+            }
+        }
+    }
+}
+
 pub(super) fn dash_warm_cache_enabled() -> bool {
     std::env::var("TUNE_DASH_WARM_CACHE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
