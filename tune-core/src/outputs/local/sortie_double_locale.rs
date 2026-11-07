@@ -514,12 +514,13 @@ pub(super) fn ouvrir_la_seconde_sortie(
                     data.fill(0.0);
                     return;
                 }
-                let gain = gain_de_b(
+                // #7968 : `gain_de_b` rend des `UNITE_DU_GAIN_DE_RENDU`
+                // (millionièmes), comme le volume partagé de A.
+                let gain = crate::audio::volume_scale::gain_des_unites(gain_de_b(
                     volume_b.as_ref().map(|v| v.load(Ordering::Relaxed)),
                     facteur_de_rendu.load(Ordering::Relaxed),
                     volume_a.load(Ordering::Relaxed),
-                ) as f32
-                    / 1000.0;
+                )) as f32;
                 // Rampe sur la période : un curseur bougé ne claque pas.
                 let depart = gain_precedent.unwrap_or(gain);
                 gain_precedent = Some(gain);
