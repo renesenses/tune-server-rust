@@ -1,6 +1,6 @@
--- 107_apports_service.sql
+-- 108_apports_service.sql
 --
--- #8077 : jumelle de la migration SQLite 141 (même DDL,
+-- #8077 : jumelle de la migration SQLite 142 (même DDL,
 -- tune-core/migrations/apports_service.sql). Idempotent.
 
 BEGIN;
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS apports_service (
 CREATE INDEX IF NOT EXISTS idx_apports_service_piste ON apports_service(track_id)
 ;
 
-INSERT INTO schema_version (version, name) VALUES (107, 'apports_service')
+INSERT INTO schema_version (version, name) VALUES (108, 'apports_service')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

@@ -15,7 +15,7 @@
 -- `apports_service` : un champ repris, pour l'album (`track_id = 0`) ou pour
 -- une piste. `valeur` est du JSON.
 --
--- Même texte pour SQLite (141) et PostgreSQL (107).
+-- Même texte pour SQLite (142) et PostgreSQL (108).
 CREATE TABLE IF NOT EXISTS apports_service_albums (
  album_id BIGINT NOT NULL,
  source TEXT NOT NULL,

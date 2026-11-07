@@ -1,6 +1,6 @@
 //! #8077 — le stockage des apports d'un service (Qobuz) à un album LOCAL :
 //! `apports_service_albums` (le rapprochement) et `apports_service` (les
-//! champs repris). Migrations SQLite 141 / PostgreSQL 107.
+//! champs repris). Migrations SQLite 142 / PostgreSQL 108.
 //!
 //! Rien n'est écrit dans les fichiers ni dans les colonnes de l'album : la
 //! fiche lit ces tables à côté des siennes. Les crédits repris vont dans

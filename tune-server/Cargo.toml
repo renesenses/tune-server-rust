@@ -1724,7 +1724,7 @@ path = "tests/pg_requete_avancee_7872.rs"
 required-features = ["postgres"]
 
 # #8077 — les apports Qobuz d'un album local (rapprochement, garde « compléter
-# seulement », retrait), sur SQLite puis sur PostgreSQL (migration 107), par le
+# seulement », retrait), sur SQLite puis sur PostgreSQL (migration 108), par le
 # vrai routeur et une doublure de l'API Qobuz. `autotests = false` : sans ces
 # cibles, jamais compilés.
 [[test]]

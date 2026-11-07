@@ -4,8 +4,8 @@ Quand un album de la bibliothèque locale existe aussi sur Qobuz, Tune complète
 ses métadonnées depuis Qobuz, **sans jamais écraser une donnée locale**.
 Chaque donnée reprise porte sa source, `"qobuz"`. Rien n'est écrit dans les
 fichiers audio ni dans les colonnes de l'album : les apports vivent dans les
-tables `apports_service_albums` et `apports_service` (migrations SQLite 141,
-PostgreSQL 107), et les crédits repris dans `track_credits` avec
+tables `apports_service_albums` et `apports_service` (migrations SQLite 142,
+PostgreSQL 108), et les crédits repris dans `track_credits` avec
 `source = 'qobuz'`. Tout se retire d'un geste.
 
 Aucun appel sans compte Qobuz activé et connecté. Tous les appels passent par

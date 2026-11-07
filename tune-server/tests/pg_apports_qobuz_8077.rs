@@ -1,4 +1,4 @@
-//! #8077 — les apports Qobuz sur une VRAIE base PostgreSQL (migration 107),
+//! #8077 — les apports Qobuz sur une VRAIE base PostgreSQL (migration 108),
 //! mêmes scénarios que `apports_qobuz_8077.rs` (`apports_qobuz_8077/commun.rs`).
 //!
 //! Même doctrine que `pg_requete_avancee_7872.rs` : variable
@@ -58,8 +58,8 @@ async fn pg_apports_qobuz_8077() {
         .and_then(|r| r[0].as_i64())
         .unwrap();
     assert!(
-        version >= 107,
-        "la migration PG 107 n'est pas jouée (dernière : {version})"
+        version >= 108,
+        "la migration PG 108 n'est pas jouée (dernière : {version})"
     );
 
     for (marque, n) in [
