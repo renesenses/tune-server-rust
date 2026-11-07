@@ -85,12 +85,12 @@ const UPSERT_RAPPROCHEMENT: &str = "INSERT INTO apports_service_albums \
      pistes_locales = excluded.pistes_locales, pistes_rapprochees = excluded.pistes_rapprochees, \
      verifie_le = excluded.verifie_le";
 
+/// Un `execute` de backend ou de transaction.
+type Executer<'a> = &'a dyn Fn(&str, &[&dyn ToSqlValue]) -> Result<usize, String>;
+
 /// L'écriture du rapprochement, par `execute` d'un backend ou d'une
 /// transaction : un seul texte de paramètres pour les deux.
-fn upsert_rapprochement(
-    execute: &dyn Fn(&str, &[&dyn ToSqlValue]) -> Result<usize, String>,
-    r: &Rapprochement,
-) -> Result<(), String> {
+fn upsert_rapprochement(execute: Executer<'_>, r: &Rapprochement) -> Result<(), String> {
     let statut = r.statut.as_str();
     execute(
         UPSERT_RAPPROCHEMENT,
