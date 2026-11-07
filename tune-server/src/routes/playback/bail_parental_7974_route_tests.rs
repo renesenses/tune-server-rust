@@ -6,7 +6,8 @@
 //!   `parental_lease_refused`, sans rien envoyer à l'appareil ;
 //! - le profil qui fait le geste devient celui de la session : un adulte qui
 //!   saute dans la file ou lance un épisode après l'enfant n'hérite pas de
-//!   son bail, et l'enfant qui le fait après l'adulte ne passe pas.
+//!   son bail, et l'enfant qui le fait après l'adulte ne passe pas ;
+//! - un préréglage épinglé lancé dans un groupe suit la même règle.
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -225,5 +226,63 @@ async fn le_profil_du_geste_traverse_le_relais_de_groupe_7974() {
     assert!(
         !refuse(statut, &corps),
         "épisode de l'adulte après l'enfant dans un groupe : aucun refus, reçu {statut} {corps}"
+    );
+}
+
+/// Un préréglage épinglé (stocké par Tune, la zone n'est pas OpenHome).
+fn epingler(b: &Banc) {
+    let pins = json!([{
+        "index": 0,
+        "title": "Radio 7974",
+        "uri": "http://127.0.0.1:9/radio-7974.mp3",
+        "type": "radio"
+    }]);
+    tune_core::db::settings_repo::SettingsRepo::with_backend(b.state.backend.clone())
+        .set(&format!("zone_{}_pins", b.zone), &pins.to_string())
+        .unwrap();
+}
+
+async fn lancer_le_prereglage(b: &Banc, profil: Option<i64>) -> (StatusCode, Value) {
+    appel(
+        b,
+        format!("/api/v1/zones/{}/pins/0/invoke", b.zone),
+        profil,
+        json!({}),
+    )
+    .await
+}
+
+/// `invoke_zone_pin_en_tete_du_groupe` : dans un groupe, l'enfant qui lance
+/// un préréglage après l'adulte est refusé et la tête revient à la meneuse
+/// d'avant ; l'adulte qui le lance après l'enfant n'hérite pas de son bail.
+#[tokio::test]
+async fn prereglage_dans_un_groupe_suit_le_profil_du_geste_7974() {
+    let b = banc().await;
+    grouper(&b);
+    epingler(&b);
+
+    b.state
+        .playback
+        .set_session_profile(b.zone, Some(ADULTE))
+        .await;
+    let (statut, corps) = lancer_le_prereglage(&b, Some(b.enfant)).await;
+    assert!(
+        refuse(statut, &corps),
+        "préréglage de l'enfant dans un groupe : 403 attendu, reçu {statut} {corps}"
+    );
+    assert_eq!(
+        meneuse_du_groupe(&b),
+        json!(MENEUSE),
+        "refusé : la tête du groupe revient à la meneuse d'avant"
+    );
+
+    b.state
+        .playback
+        .set_session_profile(b.zone, Some(b.enfant))
+        .await;
+    let (statut, corps) = lancer_le_prereglage(&b, None).await;
+    assert!(
+        !refuse(statut, &corps),
+        "préréglage de l'adulte après l'enfant dans un groupe : aucun refus, reçu {statut} {corps}"
     );
 }
