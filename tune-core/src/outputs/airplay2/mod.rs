@@ -1103,12 +1103,13 @@ fn daemon_exe_name() -> String {
     format!("{DAEMON_BINARY}{}", std::env::consts::EXE_SUFFIX)
 }
 
-/// A daemon candidate counts only if it is a real, non-empty file. The arm64
-/// Docker image ships a **0-byte placeholder** (`touch dist/arm64/airplay-daemon`)
-/// so AirPlay 2 is meant to fall back to legacy AirPlay 1 there. An existence-only
+/// A daemon candidate counts only if it is a real, non-empty file. Until #8112
+/// the arm64 Docker image shipped a **0-byte placeholder** (`touch
+/// dist/arm64/airplay-daemon`), and a local `Dockerfile` build still touches one
+/// when the daemon fails to compile. An existence-only
 /// check would pick that empty file, then fail to exec it at playback time —
 /// breaking AirPlay with NO fallback (worse than legacy). Requiring a non-zero
-/// size makes `daemon_available()` correctly report "no daemon" on arm64. (#700)
+/// size makes `daemon_available()` correctly report "no daemon" there. (#700)
 fn is_usable_daemon(path: &std::path::Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.len() > 0)

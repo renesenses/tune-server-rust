@@ -248,35 +248,34 @@ jobs:
             cp "$RUNNER_TEMP/lrs-$arch/"LIBRESPOT-*.txt "dist/$arch/"
           done
 
-      # airplay-daemon (AirPlay 2 sender): real binary on amd64, empty placeholder
-      # on arm64 for now (AirPlay 2 falls back to legacy AirPlay 1 there). Fixes
-      # #700 — without this the Docker image has no AirPlay 2 path, so AirPlay-2-
-      # only speakers (Devialet Phantom) got no sound. GPL-2.0, built from a pinned
-      # rev of our fork and shipped as a standalone subprocess binary (mere
-      # aggregation). amd64 is a HARD requirement: if it fails to build, the
-      # release fails loudly rather than silently shipping a placeholder.
-      - name: Build airplay-daemon (amd64)
+      # airplay-daemon (AirPlay 2 sender), REAL binary on BOTH architectures.
+      # Fixes #700 — without it the image has no AirPlay 2 path, so
+      # AirPlay-2-only speakers (Devialet Phantom) got no sound. GPL-2.0, built
+      # from a pinned rev of our fork by scripts/build-airplay-daemon.py (the
+      # recipe release.yml uses) and shipped as a standalone subprocess binary
+      # (mere aggregation).
+      #
+      # #8112 : arm64 recevait jusqu'ici un fichier VIDE (`touch
+      # dist/arm64/airplay-daemon`) — l'image arm64 (NAS, Pi sous Docker) n'a
+      # donc jamais eu AirPlay 2. arm64 passe par `cross`, comme tune-server et
+      # librespot, dans son propre target dir (cf. « GLIBC_2.xx not found »
+      # plus haut). Les deux architectures sont OBLIGATOIRES : un echec fait
+      # echouer l'image plutot que de livrer un stub.
+      - name: Build airplay-daemon (amd64 and arm64)
+        shell: bash
         run: |
-          # Le `sudo apt-get update` NON BORNE qui precedait la boucle annulait
-          # tout le garde-fou : si le miroir pend, on pend la, avant d'avoir
-          # arme le moindre `timeout`. La boucle fait deja l'update, bornee.
-          for essai in 1 2 3; do
-            if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y --no-install-recommends cmake clang libasound2-dev pkg-config; then
-              break
-            fi
-            if [ "$essai" = "3" ]; then
-              echo "::error::apt injoignable apres 3 essais"
-              exit 1
-            fi
-            echo "::warning::apt a echoue ou depasse le delai (essai $essai/3)"
-            sudo rm -rf /var/lib/apt/lists/*
-            sleep 20
+          CARGO_TARGET_DIR="$PWD/target-apd-amd64" python scripts/build-airplay-daemon.py \
+            --target x86_64-unknown-linux-gnu --output "$RUNNER_TEMP/apd-amd64" --work "$RUNNER_TEMP/apd-src-amd64"
+          CARGO_TARGET_DIR="$PWD/target-apd-arm64" python scripts/build-airplay-daemon.py \
+            --target aarch64-unknown-linux-gnu --cross --output "$RUNNER_TEMP/apd-arm64" --work "$RUNNER_TEMP/apd-src-arm64"
+          for arch in amd64 arm64; do
+            cp "$RUNNER_TEMP/apd-$arch/bin/airplay-daemon" "dist/$arch/airplay-daemon"
           done
-          cargo install --git https://github.com/renesenses/airplay2-rs \
-            --rev 83a7def6ab39d3709fa47a40eb90993b64afe9b4 \
-            airplay-daemon --root /tmp/ap --locked
-          cp /tmp/ap/bin/airplay-daemon dist/amd64/airplay-daemon
-          touch dist/arm64/airplay-daemon
+          file dist/amd64/airplay-daemon | grep -q 'x86-64' \
+            || { echo "::error::dist/amd64/airplay-daemon n'est pas un ELF x86-64"; exit 1; }
+          file dist/arm64/airplay-daemon | grep -q 'ARM aarch64' \
+            || { echo "::error::dist/arm64/airplay-daemon n'est pas un ELF ARM aarch64 (#8112)"; exit 1; }
+          ls -l dist/*/airplay-daemon
 
       - id: image
         uses: docker/build-push-action@v6

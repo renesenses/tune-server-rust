@@ -66,7 +66,8 @@ RUN chmod 755 /usr/local/bin/tune-entrypoint
 
 # Prebuilt, arch-specific binaries staged by CI (dist/amd64, dist/arm64).
 # librespot is built for both architectures, with notices for each target.
-# airplay-daemon remains optional on arm64.
+# airplay-daemon is a real binary on both architectures since #8112 (arm64
+# used to get an empty placeholder, i.e. AirPlay 1 only).
 #
 # airplay-daemon is GPL-2.0, shipped as a standalone subprocess binary (mere
 # aggregation — no linking). Corresponding source:

@@ -481,33 +481,55 @@ jobs:
           VERIF_CLOUD_RELAY
       # AirPlay 2 sender daemon (GPL, spawned as a subprocess) bundled next to
       # tune-server so AirPlay 2 works on native installs, not just Docker
-      # (#700 / Bilou #1135). Built from a pinned rev of our fork.
+      # (#700 / Bilou #1135). Built from a pinned rev of our fork by
+      # scripts/build-airplay-daemon.py, the same recipe as docker.yml.
       #
-      # Best-effort PER TARGET: build the real binary or ship NOTHING — never a
-      # placeholder. An empty stub would make daemon_available() return true and
-      # route AirPlay to a broken daemon instead of falling back to AirPlay 1.
-      # If the build fails (e.g. the vendored C on a given toolchain) the artifact
-      # still ships, just without AirPlay 2. Cross targets (arm64 Linux) skipped.
+      # #8112 : les cibles ARM Linux etaient SAUTEES (`if: !matrix.cross`) et
+      # un echec ne levait qu'un avertissement. Mesure sur la rc10 publiee :
+      # `tune-server-v1.0.0-rc10-linux-aarch64.tar.gz` ne contient pas
+      # `airplay-daemon` (l'etape est « skipped » dans le run 41564878347),
+      # alors que l'archive linux-x86_64 le porte. L'image Tune OS du
+      # Raspberry Pi installe CETTE archive telle quelle : un Pi ne parlait
+      # qu'AirPlay 1, et une enceinte AirPlay 2 repondait 403
+      # `airplay2_pairing_required`.
+      #
+      # Desormais : construit sur TOUTES les cibles, `cross` pour les ARM
+      # Linux comme tune-server et librespot. Un echec fait ECHOUER le job sur
+      # toute plateforme livree avec AirPlay 2. Seule exception, la cible musl
+      # (NAS) : jamais livree avec AirPlay 2 jusqu'ici, elle le prend si la
+      # compilation passe et le signale en erreur (annotation + resume du run)
+      # sinon. Jamais de fichier vide : un stub ferait croire a
+      # daemon_available() qu'un daemon existe.
       - name: Build airplay-daemon
-        if: "!matrix.cross"
         shell: bash
         run: |
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            # Meme miroir, meme risque de blocage que « Install ALSA dev » —
-            # et ici l'echec n'est pas fatal, le daemon est optionnel. On borne
-            # donc sans reprise : si apt pend, on passe sans AirPlay 2 plutot
-            # que de retenir la release entiere.
-            timeout 200 sudo apt-get install -y --no-install-recommends cmake clang \
-              || echo "::warning::apt indisponible — airplay-daemon sera absent de cet artefact"
+          CROSS=()
+          if [ "${{ matrix.cross }}" = "true" ]; then CROSS=(--cross); fi
+          if python scripts/build-airplay-daemon.py --target ${{ matrix.target }} \
+               --output "$RUNNER_TEMP/apd" --work "$RUNNER_TEMP/apd-src" "${CROSS[@]}"; then
+            exit 0
           fi
-          if cargo install --git https://github.com/renesenses/airplay2-rs \
-               --rev 83a7def6ab39d3709fa47a40eb90993b64afe9b4 \
-               airplay-daemon --target ${{ matrix.target }} \
-               --root "$RUNNER_TEMP/apd" --locked; then
-            echo "airplay-daemon built for ${{ matrix.target }}"
-          else
-            echo "::warning::airplay-daemon failed to build for ${{ matrix.target }} — this artifact will fall back to AirPlay 1"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            echo "::error::airplay-daemon n'a pas compile pour aarch64-unknown-linux-musl : l'archive linux-aarch64-musl part SANS AirPlay 2 (#8112)."
+            echo "### ⚠️ airplay-daemon absent de linux-aarch64-musl (#8112)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
+          echo "::error::airplay-daemon n'a pas compile pour ${{ matrix.target }} : cette archive partirait sans AirPlay 2 (#8112)."
+          exit 1
+
+      # #8112 : l'archive aarch64 (celle de l'image Raspberry Pi) doit PORTER
+      # un airplay-daemon ARM 64 bits, pas seulement l'avoir construit. On lit
+      # l'en-tete ELF, sans l'executer.
+      - name: Verify airplay-daemon is an aarch64 binary
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          BIN="$RUNNER_TEMP/apd/bin/airplay-daemon"
+          test -s "$BIN" || { echo "::error::airplay-daemon absent ou vide pour linux-aarch64 (#8112)"; exit 1; }
+          file "$BIN"
+          file "$BIN" | grep -q 'ARM aarch64' \
+            || { echo "::error::airplay-daemon n'est pas un ELF ARM aarch64 (#8112)"; exit 1; }
+          ls -l "$BIN"
 
       # #6872: same pinned source, features and notices on every shipped target.
       - uses: taiki-e/install-action@v2

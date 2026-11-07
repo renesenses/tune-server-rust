@@ -1,0 +1,58 @@
+name: airplay-daemon (aarch64)
+
+# #8112 — compile airplay-daemon pour aarch64 avec la recette EXACTE de
+# release.yml et docker.yml (scripts/build-airplay-daemon.py --cross), sur
+# toute PR qui touche cette recette. Rien n'est publie : ni artefact, ni image,
+# ni release. Le binaire est seulement lu (`file`, taille) puis jete.
+#
+# Sans cette porte, la recette ARM ne tournerait qu'au tag, dans release.yml :
+# c'est exactement la ou l'absence d'airplay-daemon sur la rc10 est passee
+# inapercue.
+on:
+  pull_request:
+    paths:
+      - scripts/build-airplay-daemon.py
+      - packaging/airplay-daemon/**
+      - .github/workflows/airplay-daemon.yml
+  workflow_dispatch:
+
+concurrency:
+  group: airplay-daemon-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  aarch64:
+    name: Build airplay-daemon aarch64-unknown-linux-gnu (cross)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-unknown-linux-gnu
+          rustflags: ""
+          cache: false
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+      - name: Build airplay-daemon (aarch64, cross)
+        run: |
+          python3 scripts/build-airplay-daemon.py --target aarch64-unknown-linux-gnu --cross \
+            --output "$RUNNER_TEMP/apd" --work "$RUNNER_TEMP/apd-src"
+      - name: Verify the aarch64 ELF
+        run: |
+          BIN="$RUNNER_TEMP/apd/bin/airplay-daemon"
+          test -s "$BIN"
+          file "$BIN"
+          file "$BIN" | grep -q 'ARM aarch64'
+          readelf -d "$BIN" | grep NEEDED || true
+          ls -l "$BIN"
+          {
+            echo "### airplay-daemon aarch64"
+            echo '```'
+            file "$BIN"
+            ls -l "$BIN"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
