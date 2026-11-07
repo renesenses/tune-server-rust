@@ -163,6 +163,10 @@
 
 use std::collections::HashMap;
 
+/// #8051 — ce que rend la recherche d'un service : son bloc, `None` s'il n'est
+/// pas utilisable, ou le motif de son échec.
+type IssueDeRecherche = Result<Option<Value>, String>;
+
 /// Un service de streaming nommé, prêt à être interrogé hors du verrou du registre.
 type PoigneeDeService = (
     String,
@@ -206,7 +210,7 @@ async fn recherches_concurrentes<F>(
     serde_json::Map<String, Value>,
 )
 where
-    F: std::future::Future<Output = Result<Option<Value>, String>>,
+    F: std::future::Future<Output = IssueDeRecherche>,
 {
     let mut out = serde_json::Map::new();
     let mut echecs = serde_json::Map::new();
@@ -1320,10 +1324,7 @@ mod tests_services_en_parallele {
     const DELAI: Duration = Duration::from_millis(150);
     const NOMBRE: usize = 4;
 
-    fn travaux() -> Vec<(
-        String,
-        impl std::future::Future<Output = Result<Option<Value>, String>>,
-    )> {
+    fn travaux() -> Vec<(String, impl std::future::Future<Output = IssueDeRecherche>)> {
         (0..NOMBRE)
             .map(|i| {
                 let nom = format!("service{i}");
@@ -1390,7 +1391,7 @@ mod tests_services_en_parallele {
 
     #[tokio::test]
     async fn sans_service_demande_la_reponse_est_vide_pas_absente() {
-        let travaux: Vec<(String, std::future::Ready<Result<Option<Value>, String>>)> = vec![];
+        let travaux: Vec<(String, std::future::Ready<IssueDeRecherche>)> = vec![];
         let (out, echecs) = recherches_concurrentes(travaux).await;
         assert!(out.is_empty());
         assert!(echecs.is_empty());
