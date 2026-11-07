@@ -310,6 +310,15 @@ pub mod sql {
         format!("DELETE FROM artists WHERE id = {}", d.placeholder(1))
     }
 
+    /// #7979 — la graphie accentuée des balises remplace le nom de la fiche.
+    pub fn renommer<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET name = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     /// Les artistes dont le nom, sans accents ni casse, contient un fragment
     /// (BIB-C2). Préfiltre SQL seulement : la décision se prend en Rust sur
     /// [`super::cle_artiste`]. `ORDER BY id` : le plus ancien gagne.
@@ -668,6 +677,29 @@ pub fn cle_artiste(nom: &str) -> String {
     }
 }
 
+/// Nombre de diacritiques d'un nom : les marques combinantes de sa forme NFD,
+/// celles que [`fold_diacritics`] retire.
+fn nombre_d_accents(nom: &str) -> usize {
+    use unicode_normalization::UnicodeNormalization;
+    nom.nfd()
+        .filter(|c| matches!(*c, '\u{0300}'..='\u{036F}'))
+        .count()
+}
+
+/// #7979 — la balise donne-t-elle une graphie plus juste que la fiche ?
+///
+/// Vrai seulement si les deux noms ne diffèrent que par les accents (et la
+/// casse) et que la balise en porte strictement plus : « Bireli Lagrene »
+/// cède à « Biréli Lagrène », jamais l'inverse. La règle est à sens unique
+/// pour qu'une bibliothèque où cohabitent les deux graphies converge vers
+/// l'accentuée au lieu d'osciller au gré de l'ordre du scan. Les autres
+/// différences que [`cle_artiste`] rapproche (article, ponctuation) gardent
+/// la graphie de la fiche, comme le veut BIB-C2.
+pub fn graphie_plus_juste(fiche: &str, balise: &str) -> bool {
+    fold_diacritics(fiche).to_lowercase() == fold_diacritics(balise).to_lowercase()
+        && nombre_d_accents(balise) > nombre_d_accents(fiche)
+}
+
 /// Le mot le plus long de la clé (au moins trois lettres, ni « and » ni
 /// « the ») : c'est lui qu'on demande à SQL, la clé complète tranche ensuite.
 fn fragment_de_recherche(cle: &str) -> Option<&str> {
@@ -765,18 +797,21 @@ impl ArtistRepo {
             let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
             let params: [&dyn ToSqlValue; 1] = [&mbid];
             if let Some(row) = self.db.query_one_strong(&sql, &params)? {
-                return self.completer_sort_name(row_to_artist(&row), sort_name);
+                let artiste = self.reprendre_les_accents_de_la_balise(row_to_artist(&row), name)?;
+                return self.completer_sort_name(artiste, sort_name);
             }
         }
         {
             let sql = self.dialect_sql(sql::get_by_name, sql::get_by_name);
             let params: [&dyn ToSqlValue; 1] = [&name];
             if let Some(row) = self.db.query_one_strong(&sql, &params)? {
-                return self.completer_sort_name(row_to_artist(&row), sort_name);
+                let artiste = self.reprendre_les_accents_de_la_balise(row_to_artist(&row), name)?;
+                return self.completer_sort_name(artiste, sort_name);
             }
         }
         if let Some(existant) = self.meme_artiste_sous_une_autre_graphie(name)? {
-            return self.completer_sort_name(existant, sort_name);
+            let artiste = self.reprendre_les_accents_de_la_balise(existant, name)?;
+            return self.completer_sort_name(artiste, sort_name);
         }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
         // #6463 — un MBID reçu ici vient des balises du fichier.
@@ -793,6 +828,36 @@ impl ArtistRepo {
             image_path: None,
             image_source: None,
         })
+    }
+
+    /// #7979 — une fiche retrouvée sous une graphie sans accents prend celle,
+    /// accentuée, que le fichier porte (voir [`graphie_plus_juste`]). Avant,
+    /// « Bireli Lagrene » survivait à toutes les analyses une fois les balises
+    /// corrigées en « Biréli Lagrène » : la fiche était retrouvée par la clé
+    /// pliée et rendue telle quelle.
+    fn reprendre_les_accents_de_la_balise(
+        &self,
+        mut artiste: Artist,
+        name: &str,
+    ) -> Result<Artist, TuneError> {
+        let Some(id) = artiste.id else {
+            return Ok(artiste);
+        };
+        let name = name.trim();
+        if !graphie_plus_juste(&artiste.name, name) {
+            return Ok(artiste);
+        }
+        let sql = self.dialect_sql(sql::renommer, sql::renommer);
+        let params: [&dyn ToSqlValue; 2] = [&name, &id];
+        self.db.execute(&sql, &params)?;
+        tracing::info!(
+            artist_id = id,
+            old = %artiste.name,
+            new = %name,
+            "artist_renamed_to_accented_tag_spelling"
+        );
+        artiste.name = name.to_string();
+        Ok(artiste)
     }
 
     /// #6474 — un artiste DÉJÀ en base, retrouvé par le scan, qui n'a pas de

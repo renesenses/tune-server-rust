@@ -26,8 +26,11 @@ fn bloc_16(mot: i16, trames: usize) -> Vec<u8> {
     (0..trames * 2).flat_map(|_| mot.to_le_bytes()).collect()
 }
 
-/// Le puits : les mots 16 bits rendus, ramenés en LSB.
-fn au_puits_16(octets: &[u8], volume_units: u32) -> Vec<i32> {
+/// Le puits : les mots 16 bits rendus, ramenés en LSB. `volume_millemes` en
+/// millièmes, converti dans l'unité de la sortie locale (#7968).
+fn au_puits_16(octets: &[u8], volume_millemes: u32) -> Vec<i32> {
+    let volume_units =
+        volume_millemes * (crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 1000);
     let (eq, conv, cf, pure) = dsp_vide();
     let prepared = prepare_windows_native_pcm_a_voies_egales(
         octets,

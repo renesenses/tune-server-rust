@@ -863,6 +863,42 @@ impl PlaybackOrchestrator {
             }
         }
 
+        // Sur le tas (`Box::pin`), comme l'appel du prêt de sorties : le futur
+        // de la décision est gros, et le porter deux fois inclus faisait
+        // déborder la pile d'un fil de test en debug.
+        Box::pin(self.servir_la_piste_locale(
+            req,
+            track,
+            file_path,
+            fmt,
+            source_format,
+            is_dsd_source,
+            tranche_cue,
+        ))
+        .await
+    }
+
+    /// La fin de `resolve_local_track` : la décision (DoP ou natif anticipé,
+    /// forçages, transcodage, traitement), l'armement du flux et la
+    /// résolution rendue, pour une piste et son fichier déjà sur le disque.
+    ///
+    /// #8052 — appelée aussi par `resolve_direct` pour un DSD reçu d'un autre
+    /// serveur Tune (prêt de sorties) et téléchargé : `track` est alors bâtie
+    /// sur la demande et l'en-tête du fichier, pas lue en base. Le prêteur
+    /// fait ainsi EXACTEMENT ce que fait la lecture locale d'un `.dsf` : natif
+    /// ASIO, DoP vérifié, ou conversion en PCM par Tune quand le DoP est
+    /// écarté (#7265) ou que la zone joue le DSD en PCM.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn servir_la_piste_locale(
+        &self,
+        req: &PlayRequest,
+        track: crate::db::models::Track,
+        file_path: String,
+        fmt: String,
+        source_format: Option<AudioFormat>,
+        is_dsd_source: bool,
+        tranche_cue: Option<TrancheCue>,
+    ) -> Result<ResolvedStream, String> {
         let etape = super::dsp::EtapeDePreparation::debut(req.zone_id, "decision_de_lecture");
         let decision = match self
             .decider_la_lecture_locale(
@@ -1975,6 +2011,10 @@ impl PlaybackOrchestrator {
         voies: u16,
     ) -> crate::audio::dop_ecarte_7265::AccueilDuDop {
         use crate::audio::dop_ecarte_7265::AccueilDuDop;
+        #[cfg(test)]
+        if let Some(accueil) = device_id.and_then(accueil_du_dop_force_pour_test) {
+            return accueil;
+        }
         #[cfg(feature = "local-audio")]
         {
             let Some(device_id) = device_id else {
@@ -3185,6 +3225,9 @@ impl PlaybackOrchestrator {
                     .streamer
                     .create_file_session(file_info, cp.clone(), false)
                     .await;
+                self.streamer
+                    .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
+                    .await;
                 // The current track was a cache hit → warm the next one too,
                 // so an album keeps hitting the cache track after track.
                 self.spawn_warm_next_local(
@@ -3447,6 +3490,12 @@ impl PlaybackOrchestrator {
                         let session_id = self
                             .streamer
                             .create_file_session(file_info, serve_path, false)
+                            .await;
+                        self.streamer
+                            .noter_la_voie(
+                                &session_id,
+                                crate::http::streamer::voie::FICHIER_CONVERTI,
+                            )
                             .await;
 
                         // Current track just transcoded into the cache → warm
@@ -3993,6 +4042,8 @@ impl PlaybackOrchestrator {
                 ..Default::default()
             };
 
+            // #8076 — noté avant que `depart_natif` ne soit consommé.
+            let depart_natif_pose = depart_natif.is_some();
             let session_id = self
                 .streamer
                 .create_file_session(info, file_path.clone(), false)
@@ -4065,6 +4116,24 @@ impl PlaybackOrchestrator {
                     self.streamer.set_faststart(&session_id, map).await;
                 }
             }
+
+            // #8076 — ce que cette session sert, pour le journal de
+            // l'enchaînement : aucun bras de ce passthrough ne décode.
+            let voie_servie = {
+                use crate::http::streamer::voie;
+                if dsf_depuis_dst.is_some() {
+                    voie::DSF_RECONSTRUIT
+                } else if conteneur_flac_neuf.is_some() {
+                    voie::ENTETE_FLAC_NEUF
+                } else if depart_natif_pose {
+                    voie::DEPART_NATIF
+                } else if self.streamer.a_une_carte_d_entete(&session_id).await {
+                    voie::ENTETE_M4A_REECRIT
+                } else {
+                    voie::FICHIER_TEL_QUEL
+                }
+            };
+            self.streamer.noter_la_voie(&session_id, voie_servie).await;
 
             // Parallel decode-for-levels: decode the audio in the background
             // purely to emit VU-meter events for the web client. This does not
@@ -4237,11 +4306,51 @@ fn tranche_dop(
     }
 }
 
+/// #8052 — ce que la sonde DoP d'une sortie répond, imposé par un test.
+///
+/// La sonde n'existe que sous WASAPI (`LocalOutput::sonde_du_dop`) : sous
+/// Linux, `cargo test` ne peut pas faire écarter le DoP par la sortie. Un test
+/// pose ici la réponse d'un mixeur partagé ou d'un pilote exclusif pour SA
+/// sortie (identifiant propre au test), et `accueil_du_dop_local` la rend.
+#[cfg(test)]
+fn accueils_du_dop_forces() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, crate::audio::dop_ecarte_7265::AccueilDuDop>,
+> {
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::audio::dop_ecarte_7265::AccueilDuDop>,
+        >,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(super) fn forcer_l_accueil_du_dop_pour_test(
+    device_id: &str,
+    accueil: crate::audio::dop_ecarte_7265::AccueilDuDop,
+) {
+    accueils_du_dop_forces()
+        .lock()
+        .unwrap()
+        .insert(device_id.to_string(), accueil);
+}
+
+#[cfg(test)]
+fn accueil_du_dop_force_pour_test(
+    device_id: &str,
+) -> Option<crate::audio::dop_ecarte_7265::AccueilDuDop> {
+    accueils_du_dop_forces()
+        .lock()
+        .unwrap()
+        .get(device_id)
+        .cloned()
+}
+
 /// La cadence et le nombre de canaux d'une source DSD, lus DANS LE FICHIER
 /// (DSF, DFF, ISO SACD) — `None` si l'en-tête est illisible. Partagé par le
 /// DoP (`anticiper_le_dop`, #1894) et le DSD natif (#5643) : une seule
 /// lecture de la même vérité.
-fn sonder_l_entete_dsd(file_path: &str) -> Option<(u32, u32)> {
+pub(super) fn sonder_l_entete_dsd(file_path: &str) -> Option<(u32, u32)> {
     let ext = std::path::Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())

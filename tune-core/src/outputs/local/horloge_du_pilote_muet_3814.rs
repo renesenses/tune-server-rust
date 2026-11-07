@@ -73,7 +73,7 @@ impl Banc {
         Self {
             ring,
             famine,
-            volume: Arc::new(AtomicU32::new(1_000)),
+            volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
             paused: Arc::new(AtomicBool::new(false)),
             silent: Arc::new(AtomicBool::new(false)),
             // Le pré-remplissage est déjà franchi : ce banc mesure la

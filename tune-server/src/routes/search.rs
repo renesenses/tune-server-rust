@@ -163,6 +163,10 @@
 
 use std::collections::HashMap;
 
+/// #8051 — ce que rend la recherche d'un service : son bloc, `None` s'il n'est
+/// pas utilisable, ou le motif de son échec.
+type IssueDeRecherche = Result<Option<Value>, String>;
+
 /// Un service de streaming nommé, prêt à être interrogé hors du verrou du registre.
 type PoigneeDeService = (
     String,
@@ -195,13 +199,21 @@ use crate::state::AppState;
 /// qu'un `join_all`, simplement plus tard. Aucune assertion sur le contenu ne
 /// peut donc la voir — seul un banc qui chronomètre sait rougir.
 ///
-/// Un service qui rend `None` (non authentifié, ou en échec) n'entre pas dans
-/// la réponse : c'est la règle d'avant, et elle ne bouge pas.
-async fn recherches_concurrentes<F>(travaux: Vec<(String, F)>) -> serde_json::Map<String, Value>
+/// Un service qui rend `Ok(None)` (non authentifié) n'entre pas dans la
+/// réponse : c'est la règle d'avant, et elle ne bouge pas. Un service en
+/// échec (`Err`) n'y entre pas non plus, mais son motif est rangé à part, dans
+/// la seconde table (#8051).
+async fn recherches_concurrentes<F>(
+    travaux: Vec<(String, F)>,
+) -> (
+    serde_json::Map<String, Value>,
+    serde_json::Map<String, Value>,
+)
 where
-    F: std::future::Future<Output = Option<Value>>,
+    F: std::future::Future<Output = IssueDeRecherche>,
 {
     let mut out = serde_json::Map::new();
+    let mut echecs = serde_json::Map::new();
     for (nom, trouve) in futures_util::future::join_all(
         travaux
             .into_iter()
@@ -209,11 +221,17 @@ where
     )
     .await
     {
-        if let Some(v) = trouve {
-            out.insert(nom, v);
+        match trouve {
+            Ok(Some(v)) => {
+                out.insert(nom, v);
+            }
+            Ok(None) => {}
+            Err(motif) => {
+                echecs.insert(nom, Value::String(motif));
+            }
         }
     }
-    out
+    (out, echecs)
 }
 
 /// Plafond des `COUNT` de la bibliothèque locale.
@@ -791,7 +809,7 @@ async fn federated_search(
                 // #5103 — activé ET connecté : un service désactivé dans les
                 // Réglages ne répond plus, même si sa session reste ouverte.
                 if !svc.utilisable().await {
-                    return None;
+                    return Ok(None);
                 }
                 let Some((decalage, demandee)) = fenetre else {
                     // `limit` tel quel, sans `offset` : le chemin d'avant #4803,
@@ -802,14 +820,14 @@ async fn federated_search(
                     // [`limite_pour_les_services`] (#2160).
                     // #7659 — l'échec d'un service est écarté, mais journalisé :
                     // sans trace, un refus de Spotify ressemblait à « aucun
-                    // résultat ».
+                    // résultat ». #8051 — et remonté au client, dans
+                    // `services_errors`.
                     let mut results = svc
                         .search(&requete, limite)
                         .await
-                        .map_err(|e| journaliser_l_echec(&nom_log, &e))
-                        .ok()?;
+                        .map_err(|e| journaliser_l_echec(&nom_log, &e))?;
                     ecarter_hors_identite(&nom_log, &requete, &mut results);
-                    return Some(json!(results));
+                    return Ok(Some(json!(results)));
                 };
                 // #4803 — la page du service, par SON `search_page` : la
                 // pagination et le plafond sont les siens (Qobuz : 500 par
@@ -818,8 +836,7 @@ async fn federated_search(
                 let page = svc
                     .search_page(&requete, demandee, decalage)
                     .await
-                    .map_err(|e| journaliser_l_echec(&nom_log, &e))
-                    .ok()?;
+                    .map_err(|e| journaliser_l_echec(&nom_log, &e))?;
                 let servie = svc.limite_de_page_recherche(demandee);
                 let mut results = page.results;
                 ecarter_hors_identite(&nom_log, &requete, &mut results);
@@ -833,11 +850,11 @@ async fn federated_search(
                     o.insert("has_more".into(), json!(page.has_more));
                     o.insert("truncated".into(), json!(page.truncated));
                 }
-                Some(bloc)
+                Ok(Some(bloc))
             })
         })
         .collect();
-    let service_results: serde_json::Map<String, Value> = recherches_concurrentes(travaux).await;
+    let (service_results, service_errors) = recherches_concurrentes(travaux).await;
 
     // #4803 — la suite du résultat fusionné : chaque source qui a une suite,
     // à `offset + limit`. Calculé AVANT que le `json!` ne consomme les listes.
@@ -900,6 +917,15 @@ async fn federated_search(
         "radios_annuaire": radios_annuaire,
         "services": service_results,
     });
+    // #8051 — le service interrogé qui a échoué, avec son motif : sans cette
+    // clé, un Spotify en échec ne se distinguait pas d'un Spotify sans
+    // résultat. Absente quand tout a répondu : la réponse d'avant, au mot près
+    // (voir `sans_parametre_la_reponse_est_celle_d_avant`).
+    if !service_errors.is_empty()
+        && let Some(o) = reponse.as_object_mut()
+    {
+        o.insert("services_errors".into(), Value::Object(service_errors));
+    }
     if let (Some(suites), Some(o)) = (suites, reponse.as_object_mut()) {
         let suivant = ecrire_curseur(&suites);
         o.insert("has_more".into(), json!(suivant.is_some()));
@@ -909,9 +935,33 @@ async fn federated_search(
 }
 
 /// #7659 — la recherche d'un service a échoué : la réponse fédérée l'omet,
-/// le journal le dit.
-fn journaliser_l_echec(service: &str, erreur: &tune_core::TuneError) {
+/// le journal le dit. #8051 — rend le motif à remonter au client.
+fn journaliser_l_echec(service: &str, erreur: &tune_core::TuneError) -> String {
     tracing::warn!(service, error = %erreur, "streaming_search_failed");
+    motif_public(&erreur.to_string())
+}
+
+/// #8051 — le motif d'un échec tel que le client le reçoit : sans la partie
+/// requête des adresses (une erreur réseau cite l'URL appelée, et certains
+/// services y portent un jeton), borné à 200 caractères.
+fn motif_public(erreur: &str) -> String {
+    let mut motif = String::new();
+    let mut dans_la_requete = false;
+    for c in erreur.chars() {
+        if dans_la_requete {
+            if c.is_whitespace() || c == ')' {
+                dans_la_requete = false;
+            } else {
+                continue;
+            }
+        }
+        if c == '?' {
+            dans_la_requete = true;
+            continue;
+        }
+        motif.push(c);
+    }
+    motif.trim().chars().take(200).collect()
 }
 
 /// #4441 — voir `ne_garder_que_les_pistes_qui_repondent` : le filtre
@@ -952,6 +1002,10 @@ mod tests_radios_annuaire_i7045;
 #[cfg(test)]
 #[path = "service_desactive_i5103_tests.rs"]
 mod tests_service_desactive_i5103;
+
+#[cfg(test)]
+#[path = "search_deux_services_8051_tests.rs"]
+mod tests_deux_services_8051;
 
 #[cfg(test)]
 mod tests_date_d_ajout {
@@ -1270,13 +1324,13 @@ mod tests_services_en_parallele {
     const DELAI: Duration = Duration::from_millis(150);
     const NOMBRE: usize = 4;
 
-    fn travaux() -> Vec<(String, impl std::future::Future<Output = Option<Value>>)> {
+    fn travaux() -> Vec<(String, impl std::future::Future<Output = IssueDeRecherche>)> {
         (0..NOMBRE)
             .map(|i| {
                 let nom = format!("service{i}");
                 (nom.clone(), async move {
                     tokio::time::sleep(DELAI).await;
-                    Some(json!({ "nom": nom }))
+                    Ok(Some(json!({ "nom": nom })))
                 })
             })
             .collect()
@@ -1285,7 +1339,7 @@ mod tests_services_en_parallele {
     #[tokio::test]
     async fn les_quatre_partent_en_meme_temps() {
         let debut = Instant::now();
-        let out = recherches_concurrentes(travaux()).await;
+        let (out, _) = recherches_concurrentes(travaux()).await;
         let ecoule = debut.elapsed();
 
         assert_eq!(out.len(), NOMBRE, "les quatre réponses doivent être là");
@@ -1301,7 +1355,7 @@ mod tests_services_en_parallele {
     async fn chaque_reponse_est_rangee_sous_son_propre_service() {
         // Concurrent ne veut pas dire mélangé : `join_all` préserve
         // l'appariement, et c'est ce qui est vérifié ici.
-        let out = recherches_concurrentes(travaux()).await;
+        let (out, _) = recherches_concurrentes(travaux()).await;
         for i in 0..NOMBRE {
             let nom = format!("service{i}");
             assert_eq!(
@@ -1324,11 +1378,12 @@ mod tests_services_en_parallele {
             .into_iter()
             .map(|(nom, repond)| {
                 (nom.to_string(), async move {
-                    repond.then(|| json!({ "ok": true }))
+                    Ok(repond.then(|| json!({ "ok": true })))
                 })
             })
             .collect();
-        let out = recherches_concurrentes(travaux).await;
+        let (out, echecs) = recherches_concurrentes(travaux).await;
+        assert!(echecs.is_empty());
         assert_eq!(out.len(), 1);
         assert!(out.contains_key("qui_repond"));
         assert!(!out.contains_key("qui_se_tait"));
@@ -1336,7 +1391,9 @@ mod tests_services_en_parallele {
 
     #[tokio::test]
     async fn sans_service_demande_la_reponse_est_vide_pas_absente() {
-        let travaux: Vec<(String, std::future::Ready<Option<Value>>)> = vec![];
-        assert!(recherches_concurrentes(travaux).await.is_empty());
+        let travaux: Vec<(String, std::future::Ready<IssueDeRecherche>)> = vec![];
+        let (out, echecs) = recherches_concurrentes(travaux).await;
+        assert!(out.is_empty());
+        assert!(echecs.is_empty());
     }
 }

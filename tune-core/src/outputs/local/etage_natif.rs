@@ -332,7 +332,8 @@ impl<'a> EtageNatif<'a> {
         if queue.is_empty() {
             return true;
         }
-        let volume_factor = self.volume.load(Ordering::SeqCst) as f32 / 1000.0;
+        let volume_factor =
+            self.volume.load(Ordering::SeqCst) as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
         // #6230 — la queue sort aux canaux de la source : elle passe par la
         // même adaptation que le corps de la piste avant d'entrer au puits.
         let mut queue = if self.voies_pilotees() {
@@ -668,7 +669,7 @@ mod tests {
                 crossfeed: std::sync::Mutex::new(None),
                 pure_bypass: AtomicBool::new(false),
                 mono_downmix: AtomicBool::new(false),
-                volume: AtomicU32::new(1000),
+                volume: AtomicU32::new(UNITE_DU_GAIN_DE_RENDU),
             }
         }
 
@@ -769,7 +770,8 @@ mod tests {
     #[test]
     fn le_reliquat_24_bits_part_brut_et_a_l_unite() {
         let dsp = Dsp::au_repos();
-        dsp.volume.store(500, Ordering::SeqCst);
+        dsp.volume
+            .store(UNITE_DU_GAIN_DE_RENDU / 2, Ordering::SeqCst);
         let spec = stereo(ProfondeurPcm::Entier24);
         let mut capture = CaptureOutputNatif::ouvrir(spec_du_puits_natif(spec));
         let mut etage = dsp.etage(spec);
@@ -800,7 +802,8 @@ mod tests {
     #[test]
     fn le_volume_s_applique_dans_l_etage_et_le_verdict_le_dit() {
         let dsp = Dsp::au_repos();
-        dsp.volume.store(500, Ordering::SeqCst);
+        dsp.volume
+            .store(UNITE_DU_GAIN_DE_RENDU / 2, Ordering::SeqCst);
         let spec = stereo(ProfondeurPcm::Entier16);
         let source = octets(4 * 64);
         let mut capture = CaptureOutputNatif::ouvrir(spec_du_puits_natif(spec));

@@ -69,14 +69,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// bien sous le seuil où un geste paraît mou.
 pub(crate) const RAMPE_DU_VOLUME_MS: u32 = 20;
 
-/// Le volume effectif qui laisse les mots intacts (`1000` = 100 %).
-const UNITE: u32 = 1000;
+/// Le volume effectif qui laisse les mots intacts : 100 %, dans l'unité de
+/// la sortie locale (#7968).
+const UNITE: u32 = crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
 
 /// L'état du gain tenu par un fil de rendu natif. Ni allocation ni verrou :
 /// trois `f64`, un compteur de trames et deux drapeaux.
 pub(crate) struct GainAuRendu {
     /// Le volume effectif de la sortie (utilisateur × ReplayGain, plafonné à
-    /// l'unité par `effective_volume_units`), en millièmes. Relu à chaque
+    /// l'unité par `effective_volume_units`), en [`UNITE`]. Relu à chaque
     /// période.
     volume: Arc<AtomicU32>,
     /// La consigne courante, dans `[0, 1]`.
@@ -166,10 +167,11 @@ impl GainAuRendu {
     }
 }
 
-/// Les millièmes de volume en gain, bornés à `[0, 1]` : jamais plus fort que
-/// la pleine échelle, quel que soit ce qui est stocké.
+/// Les unités de volume (`UNITE`, #7968) en gain, bornées à `[0, 1]` :
+/// jamais plus fort que la pleine échelle, quel que soit ce qui est stocké.
+/// La conversion commune à tous les rappels de rendu.
 fn gain_de(volume_units: u32) -> f64 {
-    f64::from(volume_units.min(UNITE)) / f64::from(UNITE)
+    crate::audio::volume_scale::gain_des_unites(volume_units)
 }
 
 /// Pondère un mot aligné à gauche à sa profondeur déclarée : le mot utile est
@@ -257,14 +259,14 @@ mod tests {
         for trames_en_attente in [CADENCE as usize / 10, (CADENCE * 2) as usize] {
             let anneau = anneau_de_deux_secondes();
             remplir(&anneau, trames_en_attente);
-            let volume = Arc::new(AtomicU32::new(1000));
+            let volume = Arc::new(AtomicU32::new(UNITE));
             let mut gain = GainAuRendu::nouveau(volume.clone(), CADENCE, VOIES);
 
             let avant = rendre_une_periode(&anneau, &mut gain);
             assert!(avant.iter().all(|&m| m == 0x40_0000), "à 100 % : intact");
 
             // Le geste : 100 % → 50 %.
-            volume.store(500, Ordering::Relaxed);
+            volume.store(UNITE / 2, Ordering::Relaxed);
             let borne_trames = (CADENCE as usize * 50) / 1000;
             let mut rendues = 0usize;
             let mut premiere_periode = None;
@@ -304,7 +306,7 @@ mod tests {
     fn la_rampe_du_volume_glisse_sans_marche() {
         let anneau = anneau_de_deux_secondes();
         remplir(&anneau, CADENCE as usize);
-        let volume = Arc::new(AtomicU32::new(1000));
+        let volume = Arc::new(AtomicU32::new(UNITE));
         let mut gain = GainAuRendu::nouveau(volume.clone(), CADENCE, VOIES);
         volume.store(0, Ordering::Relaxed);
         let mut gauche = Vec::new();
@@ -356,7 +358,7 @@ mod tests {
             let mut attendu = vec![0u8; octets];
             let mut obtenu = vec![0u8; octets];
             assert_eq!(reference.pop_pcm_bytes(&mut attendu, bits), octets);
-            let mut gain = GainAuRendu::nouveau(Arc::new(AtomicU32::new(1000)), CADENCE, VOIES);
+            let mut gain = GainAuRendu::nouveau(Arc::new(AtomicU32::new(UNITE)), CADENCE, VOIES);
             assert_eq!(
                 au_gain.pop_pcm_bytes_au_gain(&mut obtenu, bits, &mut gain),
                 octets
@@ -387,7 +389,7 @@ mod tests {
         anneau.marquer_passage_intact(false);
         anneau.push(&pcm);
 
-        let volume = Arc::new(AtomicU32::new(300));
+        let volume = Arc::new(AtomicU32::new(UNITE / 1000 * 300));
         let mut gain = GainAuRendu::nouveau(volume, CADENCE, VOIES);
         let total = pcm.len() * 2 + dop.len();
         let mut octets = vec![0u8; total * 4];
@@ -421,7 +423,7 @@ mod tests {
         let anneau = anneau_de_deux_secondes();
         anneau.push(&vec![MOT_24; 8]);
         anneau.marquer_passage_intact(true);
-        let volume = Arc::new(AtomicU32::new(500));
+        let volume = Arc::new(AtomicU32::new(UNITE / 2));
         let mut gain = GainAuRendu::nouveau(volume, CADENCE, VOIES);
         let mut octets = vec![0u8; 4 * 4];
         anneau.pop_pcm_bytes_au_gain(&mut octets, 32, &mut gain);
@@ -442,18 +444,18 @@ mod tests {
     }
 
     /// Jamais plus fort que la pleine échelle ni que la consigne : un volume
-    /// stocké au-dessus de 1000 est rendu à l'unité, un mot pondéré reste
+    /// stocké au-dessus de l'unité est rendu à l'unité, un mot pondéré reste
     /// dans la pleine échelle et garde ses bits bas nuls.
     /// #7762 — témoin (vert avant comme après) : 50 % du curseur `db60`
     /// d'une sortie locale (gain 0,0316, −30 dB) est rendu par le fil WASAPI
-    /// UNE fois — le mot sort à −30 dB (au millième de volume près), pas à
-    /// −60 dB (gain appliqué deux fois) ni à −6 dB (position prise pour un
-    /// gain). Même conversion que `set_volume` et `effective_volume_units`.
+    /// UNE fois — le mot sort à −30 dB, pas à −60 dB (gain appliqué deux
+    /// fois) ni à −6 dB (position prise pour un gain). Même conversion que
+    /// `set_volume` et `effective_volume_units`.
     #[test]
     fn cinquante_pour_cent_du_curseur_db60_sont_rendus_une_seule_fois_a_moins_30_db_7762() {
         let gain = crate::audio::volume_scale::gain_perceptif(0.5);
-        // `LocalOutput::set_volume` : millièmes tronqués.
-        let utilisateur = (gain.clamp(0.0, 1.0) * 1000.0) as u32;
+        // `LocalOutput::set_volume`, même conversion (#7968).
+        let utilisateur = super::super::unites_de_gain(gain);
         let effectif = super::super::effective_volume_units(utilisateur, 1000, false);
         let anneau = anneau_de_deux_secondes();
         remplir(&anneau, PERIODE);
@@ -464,7 +466,7 @@ mod tests {
         assert!(
             (db + 30.0).abs() < 0.3,
             "50 % du curseur db60 doivent sortir à −30 dB, mesuré {db:.2} dB \
-             ({effectif} millièmes)"
+             ({effectif} unités)"
         );
         // #7703 : le mot pondéré porte le TPDF (±1 LSB) ; le gain, lui, est
         // constant.
@@ -480,7 +482,8 @@ mod tests {
     /// moyenne. Le silence numérique reste un zéro exact.
     #[test]
     fn a_volume_reduit_le_rendu_16_bits_est_dithere_7703() {
-        let mut gain = GainAuRendu::nouveau(Arc::new(AtomicU32::new(30)), CADENCE, VOIES);
+        let mut gain =
+            GainAuRendu::nouveau(Arc::new(AtomicU32::new(UNITE / 1000 * 30)), CADENCE, VOIES);
         let n = 20_000u64;
         let mut somme = 0i64;
         for position in 0..n {
@@ -506,7 +509,8 @@ mod tests {
 
     #[test]
     fn le_gain_est_borne_et_le_mot_reste_aligne() {
-        let mut gain = GainAuRendu::nouveau(Arc::new(AtomicU32::new(1500)), CADENCE, VOIES);
+        let mut gain =
+            GainAuRendu::nouveau(Arc::new(AtomicU32::new(UNITE / 2 * 3)), CADENCE, VOIES);
         assert_eq!(gain.courant(), 1.0);
         assert_eq!(gain.rendre(i32::MIN, 32, 0), i32::MIN);
         for bits in [16u16, 24, 32] {
