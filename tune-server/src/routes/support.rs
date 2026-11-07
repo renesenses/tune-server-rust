@@ -507,8 +507,9 @@ pub(crate) fn base_url(state: &AppState) -> Option<String> {
 /// ni l'un ni l'autre. Partagé avec l'installation de greffons audio depuis le
 /// catalogue (`catalogue_greffons_audio`), qui essaie la clé quand le compte
 /// SSO est refusé, et avec le rapport de bug envoyé au forum
-/// (`routes/system/diagnostics.rs::envoyer_le_rapport`, #5428), qui prend le
-/// premier et part aussi SANS identité.
+/// (`routes/system/diagnostics.rs::envoyer_le_rapport`, #5428), qui les
+/// envoie TOUS depuis #7920 (un jeton expiré ne masque plus la licence) et part
+/// aussi SANS identité.
 pub(crate) fn identifiants_mozaiklabs(settings: &SettingsRepo) -> Vec<support::SupportAuth> {
     let mut identifiants = Vec::new();
 

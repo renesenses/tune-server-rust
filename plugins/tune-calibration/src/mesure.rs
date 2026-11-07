@@ -281,6 +281,8 @@ pub struct Controleur {
     /// Vitesse du temps dans les essais : les attentes de capture sont en
     /// trames, pas en secondes ; ce délai borne seulement l'attente.
     pub delai_capture: Duration,
+    /// Les simulations de pièce sans micro (C5), gardées en mémoire.
+    pub simulations: crate::modes::Magasin,
 }
 
 impl Controleur {
@@ -299,6 +301,7 @@ impl Controleur {
             compteur: AtomicU64::new(0),
             delai_ouverture: Duration::from_secs(20),
             delai_capture: Duration::from_secs(60),
+            simulations: Default::default(),
         })
     }
 
