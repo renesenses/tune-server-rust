@@ -245,8 +245,10 @@ async fn connection_manager_control(
 }
 
 /// #8052 — la zone `zone_id` annonce-t-elle le DSD dans son `Sink` ? Lue en
-/// base à chaque sondage : un changement de réglage DSD vaut au sondage
-/// suivant du serveur principal. Une zone introuvable n'annonce rien.
+/// base à chaque sondage. Le serveur principal, lui, garde la première
+/// réponse concluante jusqu'à son redémarrage (`sonder_dsd`) : un changement
+/// de réglage DSD ici ne vaut pour lui qu'après ce redémarrage. Une zone
+/// introuvable n'annonce rien.
 fn zone_pretee_accepte_le_dsd(state: &AppState, zone_id: i64) -> bool {
     let zones = ZoneRepo::with_backend(state.backend.clone());
     let Some(zone) = zones.get(zone_id).ok().flatten() else {

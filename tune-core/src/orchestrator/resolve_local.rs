@@ -863,6 +863,42 @@ impl PlaybackOrchestrator {
             }
         }
 
+        // Sur le tas (`Box::pin`), comme l'appel du prêt de sorties : le futur
+        // de la décision est gros, et le porter deux fois inclus faisait
+        // déborder la pile d'un fil de test en debug.
+        Box::pin(self.servir_la_piste_locale(
+            req,
+            track,
+            file_path,
+            fmt,
+            source_format,
+            is_dsd_source,
+            tranche_cue,
+        ))
+        .await
+    }
+
+    /// La fin de `resolve_local_track` : la décision (DoP ou natif anticipé,
+    /// forçages, transcodage, traitement), l'armement du flux et la
+    /// résolution rendue, pour une piste et son fichier déjà sur le disque.
+    ///
+    /// #8052 — appelée aussi par `resolve_direct` pour un DSD reçu d'un autre
+    /// serveur Tune (prêt de sorties) et téléchargé : `track` est alors bâtie
+    /// sur la demande et l'en-tête du fichier, pas lue en base. Le prêteur
+    /// fait ainsi EXACTEMENT ce que fait la lecture locale d'un `.dsf` : natif
+    /// ASIO, DoP vérifié, ou conversion en PCM par Tune quand le DoP est
+    /// écarté (#7265) ou que la zone joue le DSD en PCM.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn servir_la_piste_locale(
+        &self,
+        req: &PlayRequest,
+        track: crate::db::models::Track,
+        file_path: String,
+        fmt: String,
+        source_format: Option<AudioFormat>,
+        is_dsd_source: bool,
+        tranche_cue: Option<TrancheCue>,
+    ) -> Result<ResolvedStream, String> {
         let etape = super::dsp::EtapeDePreparation::debut(req.zone_id, "decision_de_lecture");
         let decision = match self
             .decider_la_lecture_locale(
@@ -1026,8 +1062,8 @@ impl PlaybackOrchestrator {
                 track,
                 &file_path,
                 source_format,
-                source.zone_max_sample_rate,
-                (sorties.is_local_output, sorties.is_network_output),
+                &source,
+                &sorties,
                 tranche_cue,
             )
             .await?
@@ -1150,23 +1186,21 @@ impl PlaybackOrchestrator {
     /// en DoP est résolue ici même et court-circuite tout le reste ; les deux
     /// journaux qui expliquent un DSD parti en PCM vivent au même endroit,
     /// seul à connaître à la fois le format, la sortie et le mode réglé.
-    ///
-    /// #8052 — appelé aussi par `resolve_direct` pour un DSD reçu d'un autre
-    /// serveur Tune (prêt de sorties) : `track` est alors une ligne bâtie sur
-    /// la demande et l'en-tête du fichier téléchargé, pas une ligne en base.
-    /// C'est pourquoi la fonction ne reçoit que le plafond de la zone et les
-    /// deux familles de sortie (`(locale, réseau)`), pas tout `SourceEtZone`.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn decider_le_dop(
+    async fn decider_le_dop(
         &self,
         req: &PlayRequest,
         track: &crate::db::models::Track,
         file_path: &str,
         source_format: Option<AudioFormat>,
-        zone_max_sample_rate: Option<u32>,
-        (is_local_output, is_network_output): (bool, bool),
+        source: &SourceEtZone,
+        sorties: &Sorties,
         tranche_cue: Option<TrancheCue>,
     ) -> Result<Option<ResolvedStream>, String> {
+        let Sorties {
+            is_local_output,
+            is_network_output,
+            ..
+        } = *sorties;
         // DSD en DoP (DSD over PCM), c'est-à-dire du DSD transporté dans des
         // trames PCM 24 bits au seizième du débit.
         //
@@ -1208,7 +1242,7 @@ impl PlaybackOrchestrator {
             match decider_dsd_natif_local(
                 &sortie,
                 entete.map(|(cadence, _)| cadence),
-                zone_max_sample_rate,
+                source.zone_max_sample_rate,
                 crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
             ) {
                 Ok(()) => {
@@ -1350,7 +1384,7 @@ impl PlaybackOrchestrator {
                     req.zone_id,
                     track,
                     file_path.to_string(),
-                    zone_max_sample_rate,
+                    source.zone_max_sample_rate,
                     is_local_output,
                     crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
                     tranche,
@@ -1977,6 +2011,10 @@ impl PlaybackOrchestrator {
         voies: u16,
     ) -> crate::audio::dop_ecarte_7265::AccueilDuDop {
         use crate::audio::dop_ecarte_7265::AccueilDuDop;
+        #[cfg(test)]
+        if let Some(accueil) = device_id.and_then(accueil_du_dop_force_pour_test) {
+            return accueil;
+        }
         #[cfg(feature = "local-audio")]
         {
             let Some(device_id) = device_id else {
@@ -4224,6 +4262,46 @@ fn tranche_dop(
         )),
         None => (seek > 0).then_some((seek, None)),
     }
+}
+
+/// #8052 — ce que la sonde DoP d'une sortie répond, imposé par un test.
+///
+/// La sonde n'existe que sous WASAPI (`LocalOutput::sonde_du_dop`) : sous
+/// Linux, `cargo test` ne peut pas faire écarter le DoP par la sortie. Un test
+/// pose ici la réponse d'un mixeur partagé ou d'un pilote exclusif pour SA
+/// sortie (identifiant propre au test), et `accueil_du_dop_local` la rend.
+#[cfg(test)]
+fn accueils_du_dop_forces() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, crate::audio::dop_ecarte_7265::AccueilDuDop>,
+> {
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::audio::dop_ecarte_7265::AccueilDuDop>,
+        >,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(super) fn forcer_l_accueil_du_dop_pour_test(
+    device_id: &str,
+    accueil: crate::audio::dop_ecarte_7265::AccueilDuDop,
+) {
+    accueils_du_dop_forces()
+        .lock()
+        .unwrap()
+        .insert(device_id.to_string(), accueil);
+}
+
+#[cfg(test)]
+fn accueil_du_dop_force_pour_test(
+    device_id: &str,
+) -> Option<crate::audio::dop_ecarte_7265::AccueilDuDop> {
+    accueils_du_dop_forces()
+        .lock()
+        .unwrap()
+        .get(device_id)
+        .cloned()
 }
 
 /// La cadence et le nombre de canaux d'une source DSD, lus DANS LE FICHIER

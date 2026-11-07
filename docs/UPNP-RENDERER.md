@@ -139,6 +139,18 @@ sortie locale joue du PCM de toute façon, et le serveur qui envoie convertit
 lui-même, comme avant. Une zone dont la sortie est un renderer réseau n'est
 pas concernée (#8053).
 
+Si un `.dsf` arrive quand même à une zone locale (un serveur qui envoie
+plus ancien, ou dont le sondage date d'un autre réglage), la zone ne remet
+jamais l'adresse brute à sa sortie, qui ne saurait pas la lire : elle
+télécharge le fichier et le joue comme un fichier de sa bibliothèque, donc en
+PCM converti par elle quand la zone est en « auto » ou « PCM », ou quand la
+sortie écarte le DoP.
+
+Le serveur qui envoie garde en mémoire, **jusqu'à son redémarrage**, ce que la
+façade a répondu à son premier sondage. Après la mise à jour du prêteur, ou
+après un changement du mode DSD de la zone prêtée, il faut donc redémarrer le
+serveur qui envoie pour qu'il relise le `Sink`.
+
 ### Ce qui se passe à la lecture
 
 Le flux reçu **traverse toute la chaîne Tune** : EQ, convolveur, trim de gain,
