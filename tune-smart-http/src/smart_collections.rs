@@ -25,6 +25,10 @@ struct CreateCollection {
     description: Option<String>,
     icon: Option<String>,
     color: Option<String>,
+    /// #7872 — la requête avancée, par exemple
+    /// `composer:beethoven year:1960..1969 -genre:live`. Vide ou absente :
+    /// la collection n'a que ses règles.
+    expression: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +43,18 @@ struct UpdateCollection {
     description: Option<String>,
     icon: Option<String>,
     color: Option<String>,
+    /// #7872 — absente : inchangée ; `null` ou texte vide : effacée.
+    #[serde(default, deserialize_with = "champ_present")]
+    expression: Option<Option<String>>,
+}
+
+/// Distingue un champ ABSENT (`None`, ne rien changer) d'un champ `null`
+/// (`Some(None)`, effacer).
+fn champ_present<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -48,6 +64,112 @@ struct PreviewRequest {
     sort_by: Option<String>,
     sort_order: Option<String>,
     max_limit: Option<i64>,
+    /// #7872 — l'aperçu évalue la requête avancée comme la collection
+    /// enregistrée.
+    expression: Option<String>,
+}
+
+// ─── #7872 : la requête avancée d'une collection ─────────────────────────
+//
+// Une collection est à l'échelle de l'album : elle garde les albums dont AU
+// MOINS une piste répond à l'expression, en plus de ses règles (ET). La
+// condition vient du compilateur de `tune_core::library::requete`, avec ses
+// paramètres liés : aucune valeur tapée n'entre dans le SQL.
+//
+// Les albums de service (favoris, étiquettes, catalogue) n'ont pas de pistes
+// dans `tracks` : ils ne peuvent pas répondre à l'expression et ne
+// s'ajoutent donc pas à une collection qui en porte une.
+
+/// L'expression telle qu'on la range : sans blancs autour, `None` si vide.
+fn expression_normalisee(brute: Option<&str>) -> Option<String> {
+    brute
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+}
+
+/// Le 400 d'une expression mal formée : même corps que
+/// `GET /library/query` (`position`, `attendu`, `message`).
+fn refus_d_expression(
+    e: &tune_core::library::requete::ErreurDeRequete,
+) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": e.message,
+            "code": "requete_invalide",
+            "position": e.position,
+            "attendu": e.attendu,
+            "message": e.message,
+        })),
+    )
+        .into_response()
+}
+
+/// Refuse AVANT toute écriture une expression que l'analyseur rejette.
+fn verifier_expression(expression: Option<&str>) -> Result<(), axum::response::Response> {
+    match expression {
+        Some(e) => tune_core::library::requete::analyser(e)
+            .map(|_| ())
+            .map_err(|err| refus_d_expression(&err)),
+        None => Ok(()),
+    }
+}
+
+/// La condition SQL d'album de l'expression, ou `None` sans expression :
+/// `al.id IN (SELECT t.album_id FROM <pistes> WHERE <condition>)`.
+///
+/// Une expression enregistrée que l'analyseur ne lit plus (grammaire changée
+/// depuis l'écriture) ne rend AUCUN album, jamais toute la bibliothèque.
+pub(crate) fn condition_de_l_expression(
+    backend: &dyn tune_core::db::backend::DbBackend,
+    expression: Option<&str>,
+    profile_id: i64,
+) -> Option<tune_core::library::requete::Condition> {
+    use tune_core::library::requete::{self, Condition, Contexte, FROM_DES_PISTES};
+    let expression = expression_normalisee(expression)?;
+    let condition = match requete::analyser(&expression) {
+        Ok(arbre) => requete::compiler(
+            &arbre,
+            Contexte {
+                moteur: backend.engine(),
+                profil: profile_id,
+            },
+        ),
+        Err(e) => {
+            tracing::warn!(erreur = %e, "smart_collection_expression_illisible");
+            return Some(Condition {
+                sql: "(1 = 0)".to_string(),
+                parametres: Vec::new(),
+            });
+        }
+    };
+    Some(Condition {
+        sql: format!(
+            "al.id IN (SELECT t.album_id FROM {FROM_DES_PISTES} WHERE {})",
+            condition.sql
+        ),
+        parametres: condition.parametres,
+    })
+}
+
+/// La clause `WHERE` des règles, et en plus (ET) celle de l'expression.
+pub(crate) fn avec_l_expression(
+    where_clause: &str,
+    expression: Option<&tune_core::library::requete::Condition>,
+) -> String {
+    let Some(e) = expression else {
+        return where_clause.to_string();
+    };
+    match where_clause.trim().strip_prefix("WHERE ") {
+        Some(regles) => format!("WHERE ({regles}) AND {}", e.sql),
+        None => format!("WHERE {}", e.sql),
+    }
+}
+
+/// Les paramètres liés de l'expression, ou aucun.
+fn liens_de(expression: Option<&tune_core::library::requete::Condition>) -> Vec<&dyn ToSqlValue> {
+    expression.map(|e| e.liens()).unwrap_or_default()
 }
 
 pub fn router<S>() -> Router<S>
@@ -82,7 +204,8 @@ fn normalize_sort_order(raw: Option<String>) -> String {
 
 /// Decode a row from `smart_collections` into a JSON object.
 /// Column order: id(0), name(1), rules(2), match_mode(3), sort_by(4),
-/// sort_order(5), max_limit(6), description(7), icon(8), color(9), created_at(10).
+/// sort_order(5), max_limit(6), description(7), icon(8), color(9), created_at(10),
+/// expression(11).
 pub fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
     let rules_str = r
         .get(2)
@@ -103,6 +226,8 @@ pub fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
         "icon": r.get(8).and_then(|v| v.as_string()),
         "color": r.get(9).and_then(|v| v.as_string()),
         "created_at": r.get(10).and_then(|v| v.as_string()),
+        // #7872 — la requête avancée, `null` sans elle.
+        "expression": r.get(11).and_then(|v| v.as_string()),
     });
     // Les seize collections du semis sont nommées en français en base
     // (`tune-core/src/db/migrations.rs:546` et `:614`). Leur clé stable part
@@ -149,9 +274,11 @@ pub(crate) fn compte_albums(
     let (en_base, en_service) = compte_albums_ventile(
         backend,
         sql_bibliotheque,
+        &[],
         rules_json,
         match_mode,
         profile_id,
+        true,
     );
     en_base + en_service
 }
@@ -171,29 +298,37 @@ pub(crate) fn compte_albums(
 /// Le corps de l'issue tranchait déjà : « qu'ils passent par le même chemin
 /// complet que la vue — ou, à défaut, qu'ils ne soient pas rendus plutôt que
 /// rendus faux ». Il n'y a rien à additionner : reste à ne pas rendre.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compte_albums_ventile(
     backend: &dyn tune_core::db::backend::DbBackend,
     sql_bibliotheque: &str,
+    liens_bibliotheque: &[&dyn ToSqlValue],
     rules_json: &str,
     match_mode: &str,
     profile_id: i64,
+    // #7872 — faux quand la collection porte une expression : les albums de
+    // service n'y répondent jamais.
+    avec_les_services: bool,
 ) -> (i64, i64) {
-    let un = |sql: &str| {
+    let un = |sql: &str, liens: &[&dyn ToSqlValue]| {
         backend
-            .query_many(sql, &[])
+            .query_many(sql, liens)
             .ok()
             .and_then(|rs| rs.first().and_then(|r| r.first()).and_then(|v| v.as_i64()))
             .unwrap_or(0)
     };
-    let en_base = un(sql_bibliotheque);
+    let en_base = un(sql_bibliotheque, liens_bibliotheque);
+    if !avec_les_services {
+        return (en_base, 0);
+    }
     // #5026 — les albums de service ÉTIQUETÉS s'ajoutent aux favoris de
     // service ; `etiquettes_streaming` écarte ceux que les favoris rendent déjà.
     let en_service =
         source_streaming::requete_compte(rules_json, match_mode, Objet::Album, profile_id)
-            .map(|sql| un(&sql))
+            .map(|sql| un(&sql, &[]))
             .unwrap_or(0)
             + etiquettes_streaming::requete_compte(rules_json, match_mode, profile_id)
-                .map(|sql| un(&sql))
+                .map(|sql| un(&sql, &[]))
                 .unwrap_or(0);
     (en_base, en_service)
 }
@@ -239,7 +374,7 @@ fn lister_les_collections(state: &SmartHttpState, profile_id: i64) -> Result<Val
         .backend
         .query_many(
             "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
-         description, icon, color, created_at \
+         description, icon, color, created_at, expression \
          FROM smart_collections ORDER BY name",
             &[],
         )
@@ -275,10 +410,13 @@ fn lister_les_collections(state: &SmartHttpState, profile_id: i64) -> Result<Val
                     .unwrap_or_else(|| "asc".into()),
                 max_limit: r.get(6).and_then(|v| v.as_i64()),
             };
-            let cache = state
-                .comptes
-                .as_ref()
-                .filter(|_| crate::comptes::regles_cachables(&rules_str));
+            // #7872 — une expression peut lire les notes et les favoris du
+            // profil, que la génération du cache ne suit pas : pas de cache.
+            let expression = r.get(11).and_then(|v| v.as_string());
+            let cache = state.comptes.as_ref().filter(|_| {
+                expression_normalisee(expression.as_deref()).is_none()
+                    && crate::comptes::regles_cachables(&rules_str)
+            });
             let (en_cache, generation) = match cache {
                 Some(c) => c.lire(&criteres),
                 None => (None, 0),
@@ -286,7 +424,8 @@ fn lister_les_collections(state: &SmartHttpState, profile_id: i64) -> Result<Val
             let comptes = match en_cache {
                 Some(c) => c,
                 None => {
-                    let c = calculer_les_comptes(state, &ctx, &col, &criteres);
+                    let c =
+                        calculer_les_comptes(state, &ctx, &col, &criteres, expression.as_deref());
                     let complet = c.partiel || c.track_count.is_some();
                     if let Some(cache) = cache.filter(|_| complet) {
                         cache.poser(criteres.clone(), c.clone(), generation);
@@ -326,6 +465,7 @@ fn calculer_les_comptes(
     ctx: &RefCtx,
     col: &Value,
     criteres: &crate::comptes::Cle,
+    expression: Option<&str>,
 ) -> crate::comptes::Comptes {
     // Count with the SAME album-query engine as resolve_albums so the
     // count is always produced and matches the album view. The old
@@ -341,14 +481,19 @@ fn calculer_les_comptes(
     let sort_order = col["sort_order"].as_str().unwrap_or("asc");
     let (where_clause, _order, _limit) =
         build_album_query(rules_str, match_mode, sort_by, sort_order, None, ctx);
+    let filtre = condition_de_l_expression(&*state.backend, expression, criteres.profile_id);
+    let where_clause = avec_l_expression(&where_clause, filtre.as_ref());
+    let liens = liens_de(filtre.as_ref());
 
     let album_count_sql = sql_compte_de_collection("al.id", &where_clause);
     let (albums_en_base, albums_de_service) = compte_albums_ventile(
         &*state.backend,
         &album_count_sql,
+        &liens,
         rules_str,
         match_mode,
         criteres.profile_id,
+        filtre.is_none(),
     );
     // 🔴 #4466 — `track_count` ne compte QUE la base. Tant que les
     // favoris de service n'entrent pas dans la collection, c'est le
@@ -368,7 +513,7 @@ fn calculer_les_comptes(
         let track_count_sql = sql_compte_de_collection("t.id", &where_clause);
         state
             .backend
-            .query_many(&track_count_sql, &[])
+            .query_many(&track_count_sql, &liens)
             .ok()
             .map(|rs| {
                 rs.first()
@@ -383,7 +528,7 @@ fn calculer_les_comptes(
         album_count: albums_en_base + albums_de_service,
         track_count,
         partiel: !compte_complet,
-        covers: pochettes_de_la_liste(state, ctx, criteres),
+        covers: pochettes_de_la_liste(state, ctx, criteres, expression),
     }
 }
 
@@ -402,6 +547,7 @@ fn pochettes_de_la_liste(
     state: &SmartHttpState,
     ctx: &RefCtx,
     c: &crate::comptes::Cle,
+    expression: Option<&str>,
 ) -> Option<Vec<String>> {
     let fenetre = c
         .max_limit
@@ -415,28 +561,42 @@ fn pochettes_de_la_liste(
         Some(fenetre),
         ctx,
     );
-    let albums = execute_album_query(state, &where_clause, &order, &limit_clause).ok()?;
-    let albums = avec_albums_de_service(
+    let filtre = condition_de_l_expression(&*state.backend, expression, c.profile_id);
+    let where_clause = avec_l_expression(&where_clause, filtre.as_ref());
+    let albums = execute_album_query(
         state,
-        albums,
-        &c.rules,
-        &c.match_mode,
-        c.profile_id,
-        &c.sort_by,
-        &c.sort_order,
-        c.max_limit,
+        &where_clause,
+        &order,
+        &limit_clause,
+        &liens_de(filtre.as_ref()),
     )
     .ok()?;
+    let albums = if filtre.is_some() {
+        albums
+    } else {
+        avec_albums_de_service(
+            state,
+            albums,
+            &c.rules,
+            &c.match_mode,
+            c.profile_id,
+            &c.sort_by,
+            &c.sort_order,
+            c.max_limit,
+        )
+        .ok()?
+    };
     let covers = tune_core::library::mosaique::quatre_distinctes(
         albums
             .iter()
             .map(|a| (a["title"].as_str(), a["cover_path"].as_str())),
         4,
     );
-    let catalogue = !matches!(
-        catalogue::lire(&c.rules, catalogue::Objet::Album),
-        catalogue::Lecture::Aucune
-    );
+    let catalogue = filtre.is_none()
+        && !matches!(
+            catalogue::lire(&c.rules, catalogue::Objet::Album),
+            catalogue::Lecture::Aucune
+        );
     if catalogue && covers.len() < 4 {
         return None;
     }
@@ -478,6 +638,10 @@ async fn create_collection(
     Json(body): Json<CreateCollection>,
 ) -> Result<impl IntoResponse, AppError> {
     borne_valide(body.max_limit)?;
+    let expression = expression_normalisee(body.expression.as_deref());
+    if let Err(refus) = verifier_expression(expression.as_deref()) {
+        return Ok(refus);
+    }
     let rules_json = body.rules.to_string();
     let match_mode = body.match_mode.clone().unwrap_or_else(|| "all".into());
     let sort_by = body.sort_by.clone();
@@ -498,8 +662,9 @@ async fn create_collection(
         .backend
         .execute_returning_id(
             "INSERT INTO smart_collections \
-         (name, rules, match_mode, sort_by, sort_order, max_limit, description, icon, color) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+         (name, rules, match_mode, sort_by, sort_order, max_limit, description, icon, color, \
+         expression) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             &[
                 &body.name as &dyn ToSqlValue,
                 &rules_json as &dyn ToSqlValue,
@@ -510,6 +675,7 @@ async fn create_collection(
                 &body.description as &dyn ToSqlValue,
                 &body.icon as &dyn ToSqlValue,
                 &body.color as &dyn ToSqlValue,
+                &expression as &dyn ToSqlValue,
             ],
         )
         .map_err(AppError::internal)?;
@@ -521,7 +687,7 @@ async fn create_collection(
         .backend
         .query_one(
             "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
-         description, icon, color, created_at \
+         description, icon, color, created_at, expression \
          FROM smart_collections WHERE id = $1",
             &[&id as &dyn ToSqlValue],
         )
@@ -539,7 +705,7 @@ async fn get_collection(
         .backend
         .query_one(
             "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
-         description, icon, color, created_at \
+         description, icon, color, created_at, expression \
          FROM smart_collections WHERE id = $1",
             &[&id as &dyn ToSqlValue],
         )
@@ -560,6 +726,17 @@ async fn update_collection(
     // écrit champ par champ, un refus tardif laisserait la collection à
     // moitié modifiée (#2732).
     borne_valide(body.max_limit)?;
+    // #7872 — une expression illisible est refusée avant toute écriture, avec
+    // sa position.
+    let expression = body
+        .expression
+        .as_ref()
+        .map(|e| expression_normalisee(e.as_deref()));
+    if let Some(Some(ref e)) = expression {
+        if let Err(refus) = verifier_expression(Some(e)) {
+            return Ok(refus);
+        }
+    }
     // Refuse les références circulaires avant d'écrire quoi que ce soit.
     if let Some(ref rules) = body.rules {
         let self_name = body
@@ -636,13 +813,23 @@ async fn update_collection(
             &[color as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ).ok();
     }
+    if let Some(ref expression) = expression {
+        state
+            .backend
+            .execute(
+                "UPDATE smart_collections SET expression = $1, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = $2",
+                &[expression as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+            )
+            .map_err(AppError::internal)?;
+    }
 
     // Return the updated collection as JSON
     let row = state
         .backend
         .query_one(
             "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
-         description, icon, color, created_at \
+         description, icon, color, created_at, expression \
          FROM smart_collections WHERE id = $1",
             &[&id as &dyn ToSqlValue],
         )
@@ -1240,13 +1427,14 @@ fn execute_album_query(
     where_clause: &str,
     order: &str,
     limit_clause: &str,
+    liens: &[&dyn ToSqlValue],
 ) -> Result<Vec<Value>, AppError> {
     let sql = sql_albums_de_collection(where_clause, order, limit_clause);
     tracing::debug!(sql = %sql, "smart_collection_album_query");
 
     let rows = state
         .backend
-        .query_many(&sql, &[])
+        .query_many(&sql, liens)
         .map_err(AppError::internal)?;
 
     Ok(rows
@@ -1319,8 +1507,9 @@ fn avec_albums_de_service(
     Ok(albums)
 }
 
-/// Critères d'une collection : (rules, match_mode, sort_by, sort_order, max_limit).
-type CriteresDeCollection = (String, String, String, String, Option<i64>);
+/// Critères d'une collection : (rules, match_mode, sort_by, sort_order,
+/// max_limit, expression).
+type CriteresDeCollection = (String, String, String, String, Option<i64>, Option<String>);
 
 /// Load a smart collection's criteria from the DB.
 fn load_collection_criteria(
@@ -1330,7 +1519,7 @@ fn load_collection_criteria(
     let row = state
         .backend
         .query_one(
-            "SELECT rules, match_mode, sort_by, sort_order, max_limit \
+            "SELECT rules, match_mode, sort_by, sort_order, max_limit, expression \
          FROM smart_collections WHERE id = $1",
             &[&id as &dyn ToSqlValue],
         )
@@ -1351,6 +1540,7 @@ fn load_collection_criteria(
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "asc".into()),
             r.get(4).and_then(|v| v.as_i64()),
+            r.get(5).and_then(|v| v.as_string()),
         )
     }))
 }
@@ -1459,16 +1649,20 @@ async fn albums_de_la_collection(
         move || albums_de_la_bibliotheque(&state, id, profile_id)
     })
     .await??;
-    let Some((albums, rules_json, max_limit)) = lu else {
+    let Some((albums, rules_json, max_limit, avec_expression)) = lu else {
         return Ok(None);
     };
+    // #7872 — un album de catalogue ne répond jamais à une expression.
+    if avec_expression {
+        return Ok(Some(albums));
+    }
     let albums = avec_albums_de_catalogue(state, albums, &rules_json, max_limit).await?;
     Ok(Some(albums))
 }
 
-/// Albums locaux et de service, règles et borne — de quoi joindre ensuite le
-/// catalogue.
-type AlbumsDeLaBibliotheque = (Vec<Value>, String, Option<i64>);
+/// Albums locaux et de service, règles, borne et présence d'une expression —
+/// de quoi joindre ensuite le catalogue.
+type AlbumsDeLaBibliotheque = (Vec<Value>, String, Option<i64>, bool);
 
 /// Les albums locaux et de service de la collection `id`, et de quoi y
 /// joindre le catalogue (règles, borne). Synchrone : HORS de l'exécuteur.
@@ -1477,7 +1671,7 @@ fn albums_de_la_bibliotheque(
     id: i64,
     profile_id: i64,
 ) -> Result<Option<AlbumsDeLaBibliotheque>, AppError> {
-    let Some((rules_json, match_mode, sort_by, sort_order, max_limit)) =
+    let Some((rules_json, match_mode, sort_by, sort_order, max_limit, expression)) =
         load_collection_criteria(state, id)?
     else {
         return Ok(None);
@@ -1494,7 +1688,18 @@ fn albums_de_la_bibliotheque(
             &ctx,
         )
     };
-    let albums = execute_album_query(state, &where_clause, &order, &limit_clause)?;
+    let filtre = condition_de_l_expression(&*state.backend, expression.as_deref(), profile_id);
+    let where_clause = avec_l_expression(&where_clause, filtre.as_ref());
+    let albums = execute_album_query(
+        state,
+        &where_clause,
+        &order,
+        &limit_clause,
+        &liens_de(filtre.as_ref()),
+    )?;
+    if filtre.is_some() {
+        return Ok(Some((albums, rules_json, max_limit, true)));
+    }
     let albums = avec_albums_de_service(
         state,
         albums,
@@ -1505,7 +1710,7 @@ fn albums_de_la_bibliotheque(
         &sort_order,
         max_limit,
     )?;
-    Ok(Some((albums, rules_json, max_limit)))
+    Ok(Some((albums, rules_json, max_limit, false)))
 }
 
 /// Un album d'une collection intelligente, vu par qui la PARTAGE avec un
@@ -1586,11 +1791,31 @@ async fn preview_albums(
     State(state): State<SmartHttpState>,
     profile: ActiveProfile,
     Json(body): Json<PreviewRequest>,
+) -> Result<axum::response::Response, AppError> {
+    // #7872 — l'aperçu refuse la même expression que l'enregistrement : 400
+    // avec sa position.
+    if let Err(refus) =
+        verifier_expression(expression_normalisee(body.expression.as_deref()).as_deref())
+    {
+        return Ok(refus);
+    }
+    apercu_des_albums(State(state), profile, Json(body))
+        .await
+        .map(IntoResponse::into_response)
+}
+
+/// Le corps de l'aperçu, une fois l'expression vérifiée.
+async fn apercu_des_albums(
+    State(state): State<SmartHttpState>,
+    profile: ActiveProfile,
+    Json(body): Json<PreviewRequest>,
 ) -> Result<Json<Value>, AppError> {
     // La prévisualisation doit refuser la même borne que l'enregistrement :
     // sinon l'écran montrerait un aperçu que la collection enregistrée ne sait
     // pas reproduire (#2732).
     borne_valide(body.max_limit)?;
+    let expression = expression_normalisee(body.expression.as_deref());
+    let avec_expression = expression.is_some();
     let rules_json = body.rules.to_string();
     let max_limit = body.max_limit;
     let profile_id = profile.id();
@@ -1615,7 +1840,19 @@ async fn preview_albums(
                     &ctx,
                 )
             };
-            let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
+            let filtre =
+                condition_de_l_expression(&*state.backend, expression.as_deref(), profile_id);
+            let where_clause = avec_l_expression(&where_clause, filtre.as_ref());
+            let albums = execute_album_query(
+                &state,
+                &where_clause,
+                &order,
+                &limit_clause,
+                &liens_de(filtre.as_ref()),
+            )?;
+            if filtre.is_some() {
+                return Ok(albums);
+            }
             avec_albums_de_service(
                 &state,
                 albums,
@@ -1632,10 +1869,18 @@ async fn preview_albums(
     // 🔴 #4473 — l'aperçu de l'éditeur est ce que la collection rendra : sans
     // cet appel, une règle « catalogue » s'y montrait VIDE et sans refus, puis
     // la collection enregistrée rendait des albums, ou un 400.
-    let albums = avec_albums_de_catalogue(&state, albums, &rules_json, max_limit).await?;
+    let albums = if avec_expression {
+        albums
+    } else {
+        avec_albums_de_catalogue(&state, albums, &rules_json, max_limit).await?
+    };
 
     Ok(Json(json!({"albums": albums, "total": albums.len()})))
 }
+
+#[cfg(test)]
+#[path = "expression_7872_tests.rs"]
+mod expression_7872_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2167,7 +2412,8 @@ mod tests {
                 "CREATE TABLE IF NOT EXISTS smart_collections (
                      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, rules TEXT,
                      match_mode TEXT, sort_by TEXT, sort_order TEXT, max_limit INTEGER,
-                     description TEXT, icon TEXT, color TEXT, created_at TEXT);
+                     description TEXT, icon TEXT, color TEXT, created_at TEXT,
+                     expression TEXT);
                  CREATE TABLE IF NOT EXISTS streaming_favorites (
                      id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
                      item_type TEXT, service TEXT, service_id TEXT, title TEXT,
@@ -2251,7 +2497,8 @@ mod tests {
                 "CREATE TABLE IF NOT EXISTS smart_collections (
                      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, rules TEXT,
                      match_mode TEXT, sort_by TEXT, sort_order TEXT, max_limit INTEGER,
-                     description TEXT, icon TEXT, color TEXT, created_at TEXT);
+                     description TEXT, icon TEXT, color TEXT, created_at TEXT,
+                     expression TEXT);
                  CREATE TABLE IF NOT EXISTS streaming_favorites (
                      id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
                      item_type TEXT, service TEXT, service_id TEXT, title TEXT,
@@ -2452,7 +2699,7 @@ mod tests {
                     &[],
                 )
                 .expect("favoris");
-            super::super::preview_albums(
+            super::super::apercu_des_albums(
                 axum::extract::State(e),
                 tune_http_types::ActiveProfile(1),
                 axum::Json(super::super::PreviewRequest {
@@ -2461,6 +2708,7 @@ mod tests {
                     sort_by: None,
                     sort_order: None,
                     max_limit: None,
+                    expression: None,
                 }),
             )
             .await
@@ -2584,7 +2832,7 @@ mod tests {
         }
 
         async fn apercu(e: &SmartHttpState, regles: &str) -> Value {
-            let Ok(r) = super::super::preview_albums(
+            let Ok(r) = super::super::apercu_des_albums(
                 axum::extract::State(e.clone()),
                 ActiveProfile(1),
                 axum::Json(super::super::PreviewRequest {
@@ -2593,6 +2841,7 @@ mod tests {
                     sort_by: None,
                     sort_order: None,
                     max_limit: None,
+                    expression: None,
                 }),
             )
             .await
@@ -2715,7 +2964,8 @@ mod tests {
                 "CREATE TABLE IF NOT EXISTS smart_collections (
                      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, rules TEXT,
                      match_mode TEXT, sort_by TEXT, sort_order TEXT, max_limit INTEGER,
-                     description TEXT, icon TEXT, color TEXT, created_at TEXT);
+                     description TEXT, icon TEXT, color TEXT, created_at TEXT,
+                     expression TEXT);
                  CREATE TABLE IF NOT EXISTS streaming_favorites (
                      id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
                      item_type TEXT, service TEXT, service_id TEXT, title TEXT,
@@ -2806,7 +3056,7 @@ mod apercu_note_5547 {
     async fn apercu(regles: &str, profil: i64) -> serde_json::Value {
         let db = crate::criteres::tests::bibliotheque();
         let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
-        let r = super::preview_albums(
+        let r = super::apercu_des_albums(
             axum::extract::State(SmartHttpState::new(backend)),
             tune_http_types::ActiveProfile(profil),
             axum::Json(super::PreviewRequest {
@@ -2815,6 +3065,7 @@ mod apercu_note_5547 {
                 sort_by: None,
                 sort_order: None,
                 max_limit: None,
+                expression: None,
             }),
         )
         .await;
@@ -2963,7 +3214,8 @@ mod date_de_sortie_2206 {
         .unwrap();
         let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
         let etat = SmartHttpState::new(backend);
-        let Ok(lignes) = super::execute_album_query(&etat, "", "ORDER BY al.id ASC", "") else {
+        let Ok(lignes) = super::execute_album_query(&etat, "", "ORDER BY al.id ASC", "", &[])
+        else {
             panic!("la requête des albums de la collection échoue");
         };
         let kind = lignes.iter().find(|a| a["id"] == 1).expect("album 1");
