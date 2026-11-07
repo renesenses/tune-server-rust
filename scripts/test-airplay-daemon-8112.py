@@ -55,6 +55,14 @@ class AirplayDaemon8112(unittest.TestCase):
         self.assertIn("aarch64-unknown-linux-gnu", verify)
         self.assertIn("ARM aarch64", verify)
 
+    def test_pr_ci_builds_the_daemon_on_every_release_runner(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        helper = step(workflow, "python scripts/build-airplay-daemon.py")
+        self.assertTrue(helper, "la CI des PR ne compile plus airplay-daemon (#8112)")
+        self.assertIn("--cross", helper)
+        self.assertNotRegex(helper.split("run: |")[0], r"\n\s+if:",
+                            "la CI des PR saute airplay-daemon sur certaines cibles")
+
     def test_check_binary_reads_the_elf_machine(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "airplay-daemon"
