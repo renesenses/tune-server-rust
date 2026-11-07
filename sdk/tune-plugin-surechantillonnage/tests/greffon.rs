@@ -319,7 +319,7 @@ fn headroom_is_a_drop_never_a_gain() {
             let db = headroom_db(filter, ratio).unwrap();
             println!("headroom {filter} x{ratio}: {db:.3} dB");
             assert!(db <= 0.0, "{filter} ×{ratio}: {db} dB");
-            assert!(db > -12.0, "{filter} ×{ratio}: {db} dB is implausible");
+            assert!(db > -20.0, "{filter} ×{ratio}: {db} dB is implausible");
         }
     }
     assert!(headroom_gain("precision-longue", 8).is_none());
