@@ -7,14 +7,14 @@
 //! [`HistoryRepo::ecoutes_de_service_par_identifiant`] sur SQLite ET sur
 //! PostgreSQL (`pg_8062_…`, saute sans `TUNE_TEST_PG_URL`) :
 //!
-//! - une piste Qobuz écoutée deux fois par le profil 1 → `(2, Some(dernière))` ;
+//! - une piste Qobuz écoutée deux fois → `(2, Some(dernière))` ;
 //! - une piste jamais jouée → `(0, None)` ;
-//! - le profil 2 ne voit pas les écoutes du profil 1 ;
-//! - une écoute sans profil compte pour tous ;
+//! - le compte est GLOBAL, tous profils confondus (comme `plays_for_tracks`) :
+//!   les écoutes de deux profils et une écoute sans profil s'additionnent ;
 //! - le même identifiant chez un AUTRE service ne compte pas.
 //!
-//! Contre-épreuve : retirer la condition de profil de
-//! `sql::ecoutes_de_service_par_identifiant` fait tomber le témoin du profil 2.
+//! Contre-épreuve : retirer le filtre de service de
+//! `sql::ecoutes_de_service_par_identifiant` fait tomber le témoin TIDAL.
 
 use super::*;
 use crate::db::migrations;
@@ -46,6 +46,7 @@ fn enregistrer(repo: &HistoryRepo, db: &Arc<dyn DbBackend>, rec: &ListenRecord) 
 
 fn jeu_d_ecoutes(db: &Arc<dyn DbBackend>) -> HistoryRepo {
     let repo = HistoryRepo::with_backend(db.clone());
+    // Deux écoutes de la même piste, par deux profils différents.
     enregistrer(
         &repo,
         db,
@@ -54,21 +55,16 @@ fn jeu_d_ecoutes(db: &Arc<dyn DbBackend>) -> HistoryRepo {
     enregistrer(
         &repo,
         db,
-        &ecoute("qobuz", "8062001", Some(1), "2026-11-05T21:30:00Z"),
+        &ecoute("qobuz", "8062001", Some(2), "2026-11-05T21:30:00Z"),
     );
-    // Un autre profil écoute une autre piste : le profil 1 ne la voit pas.
-    enregistrer(
-        &repo,
-        db,
-        &ecoute("qobuz", "8062003", Some(2), "2026-11-02T08:00:00Z"),
-    );
-    // Une écoute sans profil : elle compte pour tous.
+    // Une écoute sans profil compte aussi.
     enregistrer(
         &repo,
         db,
         &ecoute("qobuz", "8062004", None, "2026-11-03T12:00:00Z"),
     );
-    // Le même identifiant chez TIDAL n'est pas la piste Qobuz.
+    // Le même identifiant chez TIDAL n'est pas la piste Qobuz : plus récent,
+    // il fausserait aussi la dernière écoute s'il était compté.
     enregistrer(
         &repo,
         db,
@@ -78,52 +74,35 @@ fn jeu_d_ecoutes(db: &Arc<dyn DbBackend>) -> HistoryRepo {
 }
 
 fn verifier(repo: &HistoryRepo) {
-    let ids = ["8062001", "8062002", "8062003", "8062004"];
-    let p1 = repo
-        .ecoutes_de_service_par_identifiant("qobuz", &ids, 1)
+    let ids = ["8062001", "8062002", "8062004"];
+    let ecoutes = repo
+        .ecoutes_de_service_par_identifiant("qobuz", &ids)
         .unwrap();
     assert_eq!(
-        p1.get("8062001"),
+        ecoutes.get("8062001"),
         Some(&(2, Some("2026-11-05T21:30:00Z".to_string()))),
-        "#8062 : une piste Qobuz écoutée deux fois doit rendre 2 et sa dernière écoute — \
-         l'écoute TIDAL de même identifiant ne compte pas"
+        "#8062 : une piste Qobuz écoutée deux fois (par deux profils) doit rendre 2 et sa \
+         dernière écoute — l'écoute TIDAL de même identifiant ne compte pas"
     );
     assert_eq!(
-        p1.get("8062002"),
+        ecoutes.get("8062002"),
         Some(&(0, None)),
         "#8062 : une piste jamais jouée rend 0 et null, pas une clé absente"
     );
     assert_eq!(
-        p1.get("8062003"),
-        Some(&(0, None)),
-        "#8062 : le profil 1 ne voit pas les écoutes du profil 2"
-    );
-    assert_eq!(
-        p1.get("8062004"),
+        ecoutes.get("8062004"),
         Some(&(1, Some("2026-11-03T12:00:00Z".to_string()))),
-        "#8062 : une écoute sans profil compte pour tous"
+        "#8062 : une écoute sans profil compte"
     );
-
-    let p2 = repo
-        .ecoutes_de_service_par_identifiant("qobuz", &ids, 2)
-        .unwrap();
-    assert_eq!(
-        p2.get("8062001"),
-        Some(&(0, None)),
-        "#8062 : le profil 2 ne doit pas voir les écoutes du profil 1"
-    );
-    assert_eq!(p2.get("8062003").map(|e| e.0), Some(1));
-    assert_eq!(p2.get("8062004").map(|e| e.0), Some(1));
-
     assert!(
-        repo.ecoutes_de_service_par_identifiant("qobuz", &[], 1)
+        repo.ecoutes_de_service_par_identifiant("qobuz", &[])
             .unwrap()
             .is_empty()
     );
 }
 
 #[test]
-fn sqlite_ecoutes_des_pistes_de_service_par_profil_8062() {
+fn sqlite_ecoutes_des_pistes_de_service_8062() {
     let base = SqliteDb::open_in_memory().unwrap();
     base.init_schema().unwrap();
     migrations::run_migrations(&base).unwrap();
@@ -134,7 +113,7 @@ fn sqlite_ecoutes_des_pistes_de_service_par_profil_8062() {
 
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
-async fn pg_8062_ecoutes_des_pistes_de_service_par_profil() {
+async fn pg_8062_ecoutes_des_pistes_de_service() {
     let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
         eprintln!("SAUT : TUNE_TEST_PG_URL non posée");
         return;

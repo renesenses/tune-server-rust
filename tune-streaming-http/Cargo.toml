@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 tune-core = { path = "../tune-core", default-features = false }
-tune-http-types = { path = "../tune-http-types" }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

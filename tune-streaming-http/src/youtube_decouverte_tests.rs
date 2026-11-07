@@ -294,15 +294,8 @@ async fn une_playlist_de_rayon_s_ouvre_sur_ses_titres() {
     assert_eq!(v["name"], "Coffee Shop Blend");
     assert!(v["cover_path"].as_str().unwrap().starts_with("https://"));
 
-    let (statut, v, _) = corps(
-        service_playlist_tracks(
-            State(etat),
-            tune_http_types::ActiveProfile(tune_http_types::DEFAULT_PROFILE_ID),
-            Path(("youtube".into(), id)),
-        )
-        .await,
-    )
-    .await;
+    let (statut, v, _) =
+        corps(service_playlist_tracks(State(etat), Path(("youtube".into(), id))).await).await;
     assert_eq!(statut, StatusCode::OK);
     let pistes = v.as_array().expect("tableau de titres");
     assert_eq!(pistes.len(), 4);

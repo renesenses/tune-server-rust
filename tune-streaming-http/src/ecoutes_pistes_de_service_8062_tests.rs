@@ -5,8 +5,9 @@
 //!
 //! Contrat (celui de la bibliothèque, `colonnesPistes.ts` côté web) :
 //! `play_count` = 0 et `last_played_at` = null pour une piste jamais jouée ;
-//! les écoutes sont celles du profil de la requête ; `year` et `genre` ne
-//! sont écrits que si le service les publie.
+//! les écoutes sont comptées tous profils confondus, comme dans la
+//! bibliothèque ; `year` et `genre` ne sont écrits que si le service les
+//! publie.
 //!
 //! Contre-épreuve : rendre les pistes sans `pistes_avec_ecoutes` fait tomber
 //! les deux témoins (clé `play_count` absente).
@@ -124,14 +125,14 @@ impl StreamingService for ServiceAPistes {
     }
 }
 
-/// Une base où le profil 1 a écouté la piste `8062001` deux fois.
+/// Une base où la piste `8062001` a été écoutée deux fois, par deux profils.
 fn app() -> Router {
     let base = SqliteDb::open_in_memory().expect("sqlite en memoire");
     base.init_schema().unwrap();
     tune_core::db::migrations::run_migrations(&base).unwrap();
     let backend: Arc<dyn DbBackend> = Arc::new(base);
     let historique = HistoryRepo::with_backend(backend.clone());
-    for _ in 0..2 {
+    for profil in [1, 2] {
         historique
             .record(&ListenRecord {
                 title: "Titre 8062001".into(),
@@ -139,7 +140,7 @@ fn app() -> Router {
                 source: SERVICE.into(),
                 source_id: Some("8062001".into()),
                 duration_ms: 200_000,
-                profile_id: Some(1),
+                profile_id: Some(profil),
                 ..Default::default()
             })
             .unwrap();
@@ -181,27 +182,19 @@ fn par_id<'a>(pistes: &'a [Value], id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("piste {id} absente : {pistes:?}"))
 }
 
-fn verifier_ecoutes(pistes: &[Value], profil: i64) {
+fn verifier_ecoutes(pistes: &[Value]) {
     let ecoutee = par_id(pistes, "8062001");
     let jamais = par_id(pistes, "8062002");
-    if profil == 1 {
-        assert_eq!(
-            ecoutee.get("play_count"),
-            Some(&json!(2)),
-            "#8062 : une piste Qobuz écoutée deux fois doit porter play_count = 2 : {ecoutee}"
-        );
-        assert!(
-            ecoutee["last_played_at"].is_string(),
-            "#8062 : last_played_at doit être renseigné : {ecoutee}"
-        );
-    } else {
-        assert_eq!(
-            ecoutee.get("play_count"),
-            Some(&json!(0)),
-            "#8062 : un autre profil ne doit pas voir ces écoutes : {ecoutee}"
-        );
-        assert_eq!(ecoutee.get("last_played_at"), Some(&Value::Null));
-    }
+    assert_eq!(
+        ecoutee.get("play_count"),
+        Some(&json!(2)),
+        "#8062 : une piste Qobuz écoutée deux fois doit porter play_count = 2, tous profils \
+         confondus : {ecoutee}"
+    );
+    assert!(
+        ecoutee["last_played_at"].is_string(),
+        "#8062 : last_played_at doit être renseigné : {ecoutee}"
+    );
     assert_eq!(
         jamais.get("play_count"),
         Some(&json!(0)),
@@ -215,12 +208,12 @@ fn verifier_ecoutes(pistes: &[Value], profil: i64) {
 }
 
 #[tokio::test]
-async fn la_playlist_de_service_porte_les_ecoutes_du_profil_8062() {
+async fn la_playlist_de_service_porte_les_ecoutes_8062() {
     let app = app();
     let uri = format!("/api/v1/streaming/{SERVICE}/playlists/pl-8062/tracks");
     for profil in [1, 2] {
         let pistes = lire(&app, &uri, profil).await;
-        verifier_ecoutes(&pistes, profil);
+        verifier_ecoutes(&pistes);
         // Le service ne publie ni année ni genre pour cette playlist : la
         // clé reste absente, jamais inventée.
         let p = par_id(&pistes, "8062001");
@@ -234,7 +227,7 @@ async fn l_album_de_service_porte_les_ecoutes_l_annee_et_le_genre_8062() {
     let uri = format!("/api/v1/streaming/{SERVICE}/albums/album-8062/tracks");
     for profil in [1, 2] {
         let pistes = lire(&app, &uri, profil).await;
-        verifier_ecoutes(&pistes, profil);
+        verifier_ecoutes(&pistes);
         for p in &pistes {
             assert_eq!(p.get("year"), Some(&json!(1999)), "#8062 : année : {p}");
             assert_eq!(p.get("genre"), Some(&json!("Jazz")), "#8062 : genre : {p}");

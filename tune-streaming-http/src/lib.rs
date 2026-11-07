@@ -61,31 +61,6 @@ impl StreamingHttpState {
     }
 }
 
-/// Le profil de la requête quand ce routeur est monté SEUL, sur son propre
-/// état — c'est-à-dire dans les essais de ce crate. En production le routeur
-/// est monté sous `AppState`, dont l'extracteur (dans `tune-server`) lie
-/// l'en-tête à l'appelant authentifié. Ici : `X-Profile-Id`, sinon le profil
-/// par défaut.
-#[cfg(test)]
-impl axum::extract::FromRequestParts<StreamingHttpState> for tune_http_types::ActiveProfile {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &StreamingHttpState,
-    ) -> Result<Self, Self::Rejection> {
-        Ok(tune_http_types::ActiveProfile(
-            parts
-                .headers
-                .get("X-Profile-Id")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .filter(|&id| id > 0)
-                .unwrap_or(tune_http_types::DEFAULT_PROFILE_ID),
-        ))
-    }
-}
-
 /// Look up a service by name. Locks the registry only long enough to clone
 /// the Arc, so callers never hold the registry lock across await points.
 async fn get_svc(
@@ -516,14 +491,10 @@ async fn contexte_diagnostic_streaming(
     response
 }
 
-/// `ActiveProfile` : le profil de la requête, résolu par `tune-server` (en-tête
-/// `X-Profile-Id` lié à l'appelant, sinon le profil actif). Les écoutes des
-/// pistes de service se lisent pour lui (#8062).
 pub fn router<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
     StreamingHttpState: axum::extract::FromRef<S>,
-    tune_http_types::ActiveProfile: axum::extract::FromRequestParts<S>,
 {
     Router::new()
         .route("/services", get(list_services))
@@ -751,7 +722,6 @@ fn ranger_le_marquage_ia(
 /// #8062 — même enrichissement que [`service_playlist_tracks`].
 async fn service_album_tracks(
     State(state): State<StreamingHttpState>,
-    profil: tune_http_types::ActiveProfile,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
     let arc = match get_svc_actif(&state, &service).await {
@@ -763,7 +733,7 @@ async fn service_album_tracks(
         .await
         .get_album_tracks_avec_annee_et_genre(&album_id)
         .await;
-    svc_response(pistes.map(|p| pistes_avec_ecoutes(&state.backend, &service, profil.id(), p)))
+    svc_response(pistes.map(|p| pistes_avec_ecoutes(&state.backend, &service, p)))
 }
 
 async fn service_artist(
@@ -990,7 +960,6 @@ async fn service_playlist(
 /// `year` / `genre` quand le service les publie. Voir [`pistes_avec_ecoutes`].
 async fn service_playlist_tracks(
     State(state): State<StreamingHttpState>,
-    profil: tune_http_types::ActiveProfile,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> Response {
     let arc = match get_svc_actif(&state, &service).await {
@@ -1002,7 +971,7 @@ async fn service_playlist_tracks(
         .await
         .get_playlist_tracks_avec_annee_et_genre(&playlist_id)
         .await;
-    svc_response(pistes.map(|p| pistes_avec_ecoutes(&state.backend, &service, profil.id(), p)))
+    svc_response(pistes.map(|p| pistes_avec_ecoutes(&state.backend, &service, p)))
 }
 
 /// #8062 — les colonnes d'un tableau de pistes, pour des pistes de SERVICE.
@@ -1013,8 +982,8 @@ async fn service_playlist_tracks(
 /// n'est posée — un zéro dû à une panne se lirait « jamais jouée ». Une piste
 /// sans identifiant n'a pas d'écoutes connaissables : pas de clé non plus.
 ///
-/// Les écoutes sont celles du profil `profile_id`, plus celles qu'aucun profil
-/// ne revendique ([`HistoryRepo::ecoutes_de_service_par_identifiant`]). Une
+/// Les écoutes sont comptées tous profils confondus, comme la colonne de la
+/// bibliothèque ([`HistoryRepo::ecoutes_de_service_par_identifiant`]). Une
 /// seule requête pour toute la liste.
 ///
 /// `year` et `genre` ne sont écrits que si le service les publie : absents,
@@ -1022,7 +991,6 @@ async fn service_playlist_tracks(
 fn pistes_avec_ecoutes(
     backend: &Arc<dyn DbBackend>,
     service: &str,
-    profile_id: i64,
     pistes: Vec<(
         tune_core::streaming::traits::StreamTrack,
         tune_core::streaming::traits::AnneeEtGenre,
@@ -1030,7 +998,7 @@ fn pistes_avec_ecoutes(
 ) -> Vec<Value> {
     let ids: Vec<&str> = pistes.iter().map(|(t, _)| t.id.as_str()).collect();
     let ecoutes = match HistoryRepo::with_backend(backend.clone())
-        .ecoutes_de_service_par_identifiant(service, &ids, profile_id)
+        .ecoutes_de_service_par_identifiant(service, &ids)
     {
         Ok(e) => Some(e),
         Err(e) => {
