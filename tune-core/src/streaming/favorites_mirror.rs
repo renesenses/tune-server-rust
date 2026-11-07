@@ -988,16 +988,21 @@ async fn pousser_en_attente(
 }
 
 /// Rafraîchit le miroir d'UN service : relit, réconcilie, pousse. Voir
-/// l'en-tête du module pour les règles. Le verrou de lecture du service n'est
-/// tenu que pendant les lectures, celui d'écriture que le temps d'un appel :
-/// la lecture en cours n'est pas bloquée par un rafraîchissement.
+/// l'en-tête du module pour les règles.
+///
+/// #7729 — le verrou de lecture du service est repris pour CHAQUE type de
+/// favori, pas tenu pendant les quatre lectures. Le verrou de tokio fait
+/// passer une écriture en attente (rafraîchissement du jeton) avant toute
+/// nouvelle lecture : tenu d'un bloc pendant des dizaines de requêtes, il
+/// faisait attendre l'écriture, et derrière elle la route des favoris,
+/// jusqu'à la fin du miroir.
 pub async fn rafraichir(
     arc: &ServiceArc,
     backend: &Arc<dyn DbBackend>,
     appelant: i64,
 ) -> BilanMiroir {
     let mut bilan = BilanMiroir::default();
-    let (service, lectures) = {
+    let service = {
         let svc = arc.read().await;
         let service = svc.name().to_string();
         if !svc.utilisable().await {
@@ -1008,24 +1013,30 @@ pub async fn rafraichir(
             noter_non_connecte(&service, bilan.en_attente);
             return bilan;
         }
-        let mut lectures = Vec::new();
-        for (fav_type, item_type) in [
-            ("tracks", "track"),
-            ("albums", "album"),
-            ("artists", "artist"),
-        ] {
-            lectures.push((
-                item_type,
-                lire_les_favoris(&**svc, fav_type)
-                    .await
-                    .map(|e| (e, Reserves::default())),
-            ));
-        }
+        service
+    };
+    let mut lectures = Vec::new();
+    for (fav_type, item_type) in [
+        ("tracks", "track"),
+        ("albums", "album"),
+        ("artists", "artist"),
+    ] {
+        // Tenu pendant toute la pagination de CE type (jusqu'à 100 pages),
+        // puis relâché : une écriture en attente passe entre deux types.
+        let svc = arc.read().await;
+        lectures.push((
+            item_type,
+            lire_les_favoris(&**svc, fav_type)
+                .await
+                .map(|e| (e, Reserves::default())),
+        ));
+    }
+    {
+        let svc = arc.read().await;
         if let Some(lecture) = svc.playlists_de_la_bibliotheque().await {
             lectures.push(("playlist", trier_les_playlists(lecture)));
         }
-        (service, lectures)
-    };
+    }
     // #6399 — des milliers d'écritures SQL synchrones ne doivent pas tenir
     // un fil de l'exécuteur, même si les appels réseau ont déjà rendu la main.
     // Aucun verrou de service ni transaction globale n'est emporté ici.

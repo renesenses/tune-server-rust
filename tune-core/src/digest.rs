@@ -72,7 +72,7 @@ pub fn generate_digest(backend: &Arc<dyn DbBackend>) -> Result<DigestReport, Str
     let totals = backend
         .query_one(
             "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0) FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ?",
+             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio'",
             &[&week_start as &dyn ToSqlValue, &week_end],
         )
         .map_err(|e| format!("digest totals: {e}"))?
@@ -86,7 +86,7 @@ pub fn generate_digest(backend: &Arc<dyn DbBackend>) -> Result<DigestReport, Str
     let artist_rows = backend
         .query_many(
             "SELECT artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? AND artist_name IS NOT NULL \
+             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' AND artist_name IS NOT NULL \
              GROUP BY artist_name ORDER BY plays DESC LIMIT 5",
             &[&week_start as &dyn ToSqlValue, &week_end],
         )
@@ -104,7 +104,7 @@ pub fn generate_digest(backend: &Arc<dyn DbBackend>) -> Result<DigestReport, Str
     let track_rows = backend
         .query_many(
             "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? \
+             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' \
              GROUP BY title, artist_name ORDER BY plays DESC LIMIT 5",
             &[&week_start as &dyn ToSqlValue, &week_end],
         )
@@ -123,7 +123,7 @@ pub fn generate_digest(backend: &Arc<dyn DbBackend>) -> Result<DigestReport, Str
     let new_rows = backend
         .query_many(
             "SELECT artist_name FROM listen_history \
-             WHERE artist_name IS NOT NULL \
+             WHERE artist_name IS NOT NULL AND COALESCE(source, '') <> 'radio' \
              GROUP BY artist_name \
              HAVING MIN(listened_at) >= ? AND MIN(listened_at) < ? \
              ORDER BY COUNT(*) DESC LIMIT 10",
@@ -140,7 +140,7 @@ pub fn generate_digest(backend: &Arc<dyn DbBackend>) -> Result<DigestReport, Str
     let prev_totals = backend
         .query_one(
             "SELECT COUNT(*) FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ?",
+             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio'",
             &[&prev_week_start as &dyn ToSqlValue, &week_start],
         )
         .map_err(|e| format!("digest prev week: {e}"))?

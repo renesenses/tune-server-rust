@@ -2762,6 +2762,17 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     // `batch/bugs-rc11-20261101` (dernière : 135 / PG 100) ; d'autres PR
     // ouvertes réclament aussi 136 / 101, la fusion groupée renumérote.
     Migration { version: 139, name: "cles_clients", up: include_str!("../../migrations/cles_clients.sql") },
+    // #7872 — la requête avancée d'une collection intelligente
+    // (`smart_collections.expression`), évaluée par le compilateur de
+    // `library::requete`. NULL : la collection n'a que ses règles. Colonne
+    // posée dans le bloc de version et reposée par la passe finale, même
+    // règle qu'à la 137. Jumelle PG : 106. Numéros libres dans le lot rc11
+    // au 07/11 (dernières : 139 / PG 105).
+    Migration {
+        version: 140,
+        name: "smart_collections_expression",
+        up: "",
+    },
 ];
 
 /// SQL de l'attribution unique de la migration 137 (#7765) — jouée une seule
@@ -4194,6 +4205,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
                 "INTEGER NOT NULL DEFAULT 0",
             );
         }
+        if migration.version == 140 {
+            // #7872 — la requête avancée d'une collection intelligente.
+            add_column_if_missing(db, "smart_collections", "expression", "TEXT");
+        }
         if migration.version == 137 {
             // #7765 — la source des crédits, puis l'attribution UNE fois des
             // lignes existantes. L'index vient APRES la colonne qu'il nomme.
@@ -4825,6 +4840,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // les écrivains de `track_credits` et les passes « à faire » la NOMMENT.
     // Pas d'attribution ici : elle ne se joue qu'une fois, à la 137. PG : 102.
     add_column_if_missing(db, "track_credits", "source", "TEXT");
+    // La requête avancée des collections intelligentes (migration 140,
+    // #7872) — posée ICI aussi : toute lecture de `smart_collections` par
+    // `tune-smart-http` la NOMME. PG : 106.
+    add_column_if_missing(db, "smart_collections", "expression", "TEXT");
     // Index de `listen_history.album_id` (migration 115, fil 2130) — posé ICI
     // aussi : une base arrivée sans lui reste juste, mais « Reprendre
     // l'écoute » y redevient lent. PG : migration 079.
@@ -5817,6 +5836,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         105,
         "tracks_cle_tri",
         include_str!("../../migrations/postgres/105_tracks_cle_tri.sql"),
+    ),
+    // Jumelle de la SQLite 140 (#7872) : `smart_collections.expression`, la
+    // requête avancée d'une collection intelligente.
+    (
+        106,
+        "smart_collections_expression",
+        include_str!("../../migrations/postgres/106_smart_collections_expression.sql"),
     ),
 ];
 
@@ -9379,7 +9405,10 @@ mod tests {
         // 104 : `cles_clients` (#7855), jumelle de la SQLite 139.
         // 105 : tracks.cle_tri et son index de curseur (#7619 / #7656), sans
         // jumelle numérotée côté SQLite (passe finale `add_column_if_missing`).
-        assert_eq!(pg_latest_version(), 105, "latest PG migration must be 105");
+        // 106 : `smart_collections_expression` (#7872), jumelle de la SQLite
+        // 140. Pose la requête avancée des collections intelligentes, que
+        // toutes leurs lectures NOMMENT.
+        assert_eq!(pg_latest_version(), 106, "latest PG migration must be 106");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
