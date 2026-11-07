@@ -99,12 +99,19 @@ pub fn build_track_from_metadata_opts(
         .as_deref()
         .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME);
 
+    // #7933 — même règle que le scan complet (#3179) : ARTIST désigne la
+    // piste, et le MBID d'un invité ne devient pas celui de l'artiste d'album.
+    let artiste_de_piste_tague = crate::scan_import::artiste_de_piste_tague(meta);
+    let meme_artiste = tune_core::db::artist_repo::cle_artiste(album_artist_name)
+        == tune_core::db::artist_repo::cle_artiste(track_artist_name);
+
     let album_artist_mbid = if is_compilation || artiste_d_album_neutre {
         None
     } else {
-        meta.musicbrainz_album_artist_id
+        meta.musicbrainz_album_artist_id.as_deref().or(meta
+            .musicbrainz_artist_id
             .as_deref()
-            .or(meta.musicbrainz_artist_id.as_deref())
+            .filter(|_| meme_artiste))
     };
     let album_artist_entry = match artist_repo.get_or_create(
         album_artist_name,
@@ -144,7 +151,7 @@ pub fn build_track_from_metadata_opts(
     };
     let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
-    let track_artist = if (is_compilation || artiste_d_album_neutre)
+    let track_artist = if (is_compilation || artiste_d_album_neutre || artiste_de_piste_tague)
         && track_artist_name != album_artist_name
     {
         match artist_repo.get_or_create(
@@ -3937,6 +3944,10 @@ mod scan_au_demarrage_reglage_tests;
 #[cfg(test)]
 #[path = "surveillant_artiste_generique_tests_1881.rs"]
 mod surveillant_artiste_generique_tests_1881;
+
+#[cfg(test)]
+#[path = "surveillant_artiste_de_piste_tests_7933.rs"]
+mod surveillant_artiste_de_piste_tests_7933;
 
 #[cfg(test)]
 #[path = "scan_artiste_montage_tests_6737.rs"]
