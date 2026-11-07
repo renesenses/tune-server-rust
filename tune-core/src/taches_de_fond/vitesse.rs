@@ -33,15 +33,13 @@ pub const CLE_REGLAGE: &str = "background_analysis_speed";
 
 /// #6713 — « Lever le bridage quand la température est illisible ».
 ///
-/// Sans température lisible (Windows sans zone thermique, zone figée, macOS,
-/// machine virtuelle), les analyses de fond passent à UN fichier à la fois
-/// (#5410, maintenu par #6450). Ce réglage, **désactivé par défaut**, rend la
-/// vitesse réglée à l'utilisateur qui le choisit en connaissance de cause. Il
-/// ne lève rien quand une température est lue : la garde thermique arrête
-/// toujours les analyses au-delà de 80 °C. La lecture n'est jamais bridée.
+/// SANS EFFET depuis #6450 : une température illisible ne bride plus les
+/// analyses, elles gardent la vitesse réglée. La clé reste lue et acceptée
+/// par `PATCH /system/config` pour les clients qui l'écrivent encore ; la
+/// garde thermique arrête toujours les analyses au-delà de 80 °C lus.
 pub const CLE_LEVER_LE_BRIDAGE: &str = "background_analysis_unthrottle_unreadable_temperature";
 
-/// Désactivé par défaut : le bridage reste la règle.
+/// Désactivé par défaut (sans effet depuis #6450).
 pub const LEVER_LE_BRIDAGE_DEFAUT: bool = false;
 
 /// L'utilisateur a-t-il levé le bridage ? Absent, illisible ou autre : non.
@@ -160,17 +158,14 @@ pub fn largeur_sur_la_machine(
 /// Combien de fichiers un lot décode à la fois, MAINTENANT. Relu à chaque lot :
 /// un changement de réglage agit au lot suivant, sans redémarrage.
 ///
-/// #5410 — sans température lisible (macOS, Windows sans zone thermique ou à
-/// zone figée, machine virtuelle), un fichier à la fois quelle que soit la
-/// vitesse : la garde thermique ne peut rien arrêter, la largeur se replie
-/// (`audio::thermal::brider_sans_thermometre`).
-///
-/// #6713 — sauf si l'utilisateur a levé ce bridage ([`bridage_leve`]).
+/// #6450 — la vitesse réglée, que la température soit lue ou non
+/// (`audio::thermal::largeur_selon_la_chaleur`) : une température illisible
+/// ne bride plus ; une température lue et trop haute arrête les passes par
+/// leur garde.
 pub fn largeur_courante(backend: &Arc<dyn DbBackend>) -> usize {
     crate::audio::thermal::largeur_selon_la_chaleur(
         largeur_sur_la_machine(vitesse(backend), coeurs(), memoire_totale()),
         &crate::audio::thermal::lecture_thermique(),
-        bridage_leve(backend),
     )
 }
 

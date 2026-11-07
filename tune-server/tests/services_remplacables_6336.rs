@@ -231,6 +231,39 @@ async fn un_code_sans_appairage_en_cours_est_refuse_6336() {
     );
 }
 
+/// #8060 — fenêtre du code fermée sans code : `pair-cancel` lève l'attente
+/// (la lecture repart alors en transitoire), et ne fait rien la seconde fois.
+#[tokio::test]
+async fn annuler_la_saisie_du_code_airplay2_leve_l_attente_8060() {
+    let _une_substitution_a_la_fois = SUBSTITUTIONS.lock().await;
+    let dossier = tune_core::test_scratch::scratch_dir("tune-8060-ap2-annule");
+    let app = tune_server::routes::router(etat_avec_recepteur_airplay2(&dossier).await);
+
+    let (statut, _) = appeler(
+        &app,
+        "POST",
+        &format!("/api/v1/outputs/{SORTIE_AP2}/airplay/pair-start"),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(
+        statut_d_appairage(&app, "pin_requested").await,
+        "pin_requested"
+    );
+
+    let annuler = format!("/api/v1/outputs/{SORTIE_AP2}/airplay/pair-cancel");
+    let (statut, corps) = appeler(&app, "POST", &annuler, None).await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["cancelled"], true, "{corps}");
+    assert_eq!(corps["status"], "idle", "{corps}");
+    assert_eq!(statut_d_appairage(&app, "idle").await, "idle");
+
+    let (statut, corps) = appeler(&app, "POST", &annuler, None).await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["cancelled"], false, "rien à annuler : {corps}");
+}
+
 // ── SMB : montage d'un partage ────────────────────────────────────────────
 
 /// Faux `mount.cifs` (service en root) ET faux `sudo` (service sous un autre

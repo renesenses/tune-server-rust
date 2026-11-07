@@ -60,7 +60,7 @@ impl DspAuRepos {
             crossfeed: std::sync::Mutex::new(None),
             pure_bypass: AtomicBool::new(false),
             mono_downmix: AtomicBool::new(false),
-            volume: AtomicU32::new(1000),
+            volume: AtomicU32::new(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU),
         }
     }
 
@@ -118,7 +118,7 @@ fn route_directe_d_avant(dsp: &DspAuRepos, octets: &[u8], bit_depth: u16) -> u64
         2,
         true,
         false,
-        1000,
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
         &dsp.eq,
         &dsp.convolver,
         &dsp.crossfeed,

@@ -44,7 +44,7 @@ impl Dsp {
             crossfeed: std::sync::Mutex::new(None),
             pure_bypass: AtomicBool::new(false),
             mono_downmix: AtomicBool::new(false),
-            volume: AtomicU32::new(1000),
+            volume: AtomicU32::new(UNITE_DU_GAIN_DE_RENDU),
         }
     }
 

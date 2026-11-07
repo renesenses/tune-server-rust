@@ -477,6 +477,134 @@ impl SpotifyService {
         resp.json().await.map_err(|e| format!("spotify json: {e}"))
     }
 
+    /// #8050 — taille d'une page des listes de l'utilisateur : le plafond
+    /// que Spotify accepte pour `/me/tracks`, `/me/albums`, `/me/playlists`
+    /// et `/me/following`.
+    const PAGE_UTILISATEUR: usize = 50;
+    /// #8050 — borne de sécurité : 200 pages de 50, soit 10 000 éléments par
+    /// liste. Au-delà, la lecture s'arrête et le dit, au lieu de tourner sans
+    /// fin sur un service qui annoncerait toujours une suite.
+    const PAGES_UTILISATEUR_MAX: usize = 200;
+
+    /// #8050 — tous les éléments d'une liste de l'utilisateur paginée par
+    /// `offset` (`/me/tracks`, `/me/albums`, `/me/playlists`).
+    ///
+    /// On ne lisait que la première page (`?limit=50`) : au-delà de 50
+    /// favoris, le reste n'apparaissait jamais dans Tune. Même modèle que la
+    /// lecture des favoris TIDAL : le décalage avance du nombre REÇU (#7250,
+    /// une page plafonnée sous la limite ne fait sauter personne), la lecture
+    /// s'arrête au `total` annoncé ou, sans total, à la première page sans
+    /// `next` ; une page qui n'apporte aucun élément neuf l'arrête aussi
+    /// (garde de #7729), comme la borne `PAGES_UTILISATEUR_MAX`.
+    async fn lire_toutes_les_pages(
+        &self,
+        chemin: &str,
+        cle: fn(&serde_json::Value) -> Option<String>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let separateur = if chemin.contains('?') { '&' } else { '?' };
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut offset = 0usize;
+        let mut total: Option<usize> = None;
+        let mut termine = false;
+        for _ in 0..Self::PAGES_UTILISATEUR_MAX {
+            let data = self
+                .api_get(&format!(
+                    "{chemin}{separateur}limit={}&offset={offset}",
+                    Self::PAGE_UTILISATEUR
+                ))
+                .await?;
+            let lot = data["items"].as_array().cloned().unwrap_or_default();
+            let recus = lot.len();
+            offset += recus;
+            let avant = items.len();
+            for element in lot {
+                let id = cle(&element).unwrap_or_else(|| element.to_string());
+                if vus.insert(id) {
+                    items.push(element);
+                }
+            }
+            total = data["total"].as_u64().and_then(|t| usize::try_from(t).ok());
+            let suite = data["next"].is_string();
+            let fini = match total {
+                Some(t) => offset >= t,
+                None => !suite,
+            };
+            if fini || recus == 0 {
+                termine = true;
+                break;
+            }
+            if items.len() == avant {
+                warn!(chemin, offset, "spotify_pagination_sans_progression");
+                termine = true;
+                break;
+            }
+        }
+        if !termine {
+            warn!(
+                chemin,
+                lus = items.len(),
+                "spotify_pagination_borne_atteinte"
+            );
+        } else if let Some(t) = total.filter(|t| items.len() < *t) {
+            warn!(
+                chemin,
+                lus = items.len(),
+                total = t,
+                "spotify_pagination_incomplete"
+            );
+        }
+        Ok(items)
+    }
+
+    /// #8050 — tous les artistes suivis. `/me/following` pagine par curseur
+    /// (`artists.cursors.after`), pas par décalage ; mêmes gardes que
+    /// [`Self::lire_toutes_les_pages`].
+    async fn lire_tous_les_artistes_suivis(&self) -> Result<Vec<serde_json::Value>, String> {
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut apres: Option<String> = None;
+        for _ in 0..Self::PAGES_UTILISATEUR_MAX {
+            let curseur = apres
+                .as_deref()
+                .map(|a| format!("&after={}", urlencoding::encode(a)))
+                .unwrap_or_default();
+            let data = self
+                .api_get(&format!(
+                    "/me/following?type=artist&limit={}{curseur}",
+                    Self::PAGE_UTILISATEUR
+                ))
+                .await?;
+            let page = &data["artists"];
+            let lot = page["items"].as_array().cloned().unwrap_or_default();
+            let recus = lot.len();
+            let avant = items.len();
+            for element in lot {
+                let id = element["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| element.to_string());
+                if vus.insert(id) {
+                    items.push(element);
+                }
+            }
+            let suivant = page["cursors"]["after"].as_str().map(str::to_owned);
+            if recus == 0 || !page["next"].is_string() || suivant.is_none() {
+                return Ok(items);
+            }
+            if items.len() == avant {
+                warn!(
+                    lus = items.len(),
+                    "spotify_artistes_suivis_sans_progression"
+                );
+                return Ok(items);
+            }
+            apres = suivant;
+        }
+        warn!(lus = items.len(), "spotify_artistes_suivis_borne_atteinte");
+        Ok(items)
+    }
+
     /// #7659 — la limite envoyée à `/v1/search` pour une `limit` demandée :
     /// le plafond accepté par cette application, `0` (« Tous ») compris.
     fn borne_de_recherche(&self, limit: usize) -> usize {
@@ -1084,11 +1212,11 @@ impl StreamingService for SpotifyService {
             .unwrap_or_default())
     }
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
-        let d = self.api_get("/me/playlists?limit=50").await?;
-        Ok(d["items"]
-            .as_array()
-            .map(|i| i.iter().map(Self::map_playlist).collect())
-            .unwrap_or_default())
+        // #8050 — toutes les pages, pas seulement les 50 premières.
+        let items = self
+            .lire_toutes_les_pages("/me/playlists", |p| p["id"].as_str().map(str::to_owned))
+            .await?;
+        Ok(items.iter().map(Self::map_playlist).collect())
     }
 
     async fn create_playlist(
@@ -1241,15 +1369,16 @@ impl StreamingService for SpotifyService {
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
-        let data = self.api_get("/me/tracks?limit=50").await?;
-        Ok(data["items"]
-            .as_array()
-            .map(|i| {
-                i.iter()
-                    .filter_map(|item| item.get("track").map(Self::map_track))
-                    .collect()
+        // #8050 — toutes les pages, pas seulement les 50 premières.
+        let items = self
+            .lire_toutes_les_pages("/me/tracks", |e| {
+                e["track"]["id"].as_str().map(str::to_owned)
             })
-            .unwrap_or_default())
+            .await?;
+        Ok(items
+            .iter()
+            .filter_map(|item| item.get("track").map(Self::map_track))
+            .collect())
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
@@ -1274,22 +1403,21 @@ impl StreamingService for SpotifyService {
         Ok(())
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
-        let d = self.api_get("/me/albums?limit=50").await?;
-        Ok(d["items"]
-            .as_array()
-            .map(|i| {
-                i.iter()
-                    .filter_map(|item| item.get("album").map(Self::map_album))
-                    .collect()
+        // #8050 — toutes les pages, pas seulement les 50 premières.
+        let items = self
+            .lire_toutes_les_pages("/me/albums", |e| {
+                e["album"]["id"].as_str().map(str::to_owned)
             })
-            .unwrap_or_default())
+            .await?;
+        Ok(items
+            .iter()
+            .filter_map(|item| item.get("album").map(Self::map_album))
+            .collect())
     }
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
-        let d = self.api_get("/me/following?type=artist&limit=50").await?;
-        Ok(d["artists"]["items"]
-            .as_array()
-            .map(|i| i.iter().map(Self::map_artist).collect())
-            .unwrap_or_default())
+        // #8050 — tous les curseurs, pas seulement les 50 premiers.
+        let items = self.lire_tous_les_artistes_suivis().await?;
+        Ok(items.iter().map(Self::map_artist).collect())
     }
 
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
@@ -2596,3 +2724,7 @@ mod tests {
 #[cfg(test)]
 #[path = "spotify_recherche_7659_tests.rs"]
 mod recherche_7659_tests;
+
+#[cfg(test)]
+#[path = "spotify_favoris_pagination_8050_tests.rs"]
+mod favoris_pagination_8050_tests;

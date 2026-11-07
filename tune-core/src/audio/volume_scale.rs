@@ -77,6 +77,26 @@ pub const PLAGE_PERCEPTIVE_DB: f64 = 60.0;
 /// jusqu'au silence : 0 reste le silence exact.
 pub const GENOU_PERCEPTIF: f64 = 0.1;
 
+/// #7968 — l'unité entière du gain que la sortie locale range et rend
+/// (`outputs::local`, volume utilisateur et volume effectif) : un millionième,
+/// `UNITE_DU_GAIN_DE_RENDU` valant 1,0.
+///
+/// En millièmes, la loi `db60` s'écrasait en bas de course : 1 % vaut un gain
+/// de 0,0002, tronqué à 0 — le silence jusqu'à 5 % du curseur, puis des
+/// paliers de quatre ou cinq positions au même niveau. Au millionième, 1 %
+/// vaut 200 unités et deux positions voisines sous le genou en séparent 200.
+/// Le produit est plafonné à l'unité : il tient toujours dans un `u32`.
+pub const UNITE_DU_GAIN_DE_RENDU: u32 = 1_000_000;
+
+/// #7968 — le gain linéaire (0..1) d'un volume rangé en
+/// [`UNITE_DU_GAIN_DE_RENDU`] : la seule conversion que les rappels de rendu
+/// (natif, CoreAudio exclusif, ASIO « Processed ») appliquent au volume
+/// partagé. Bornée à la pleine échelle, quel que soit ce qui est stocké.
+#[inline]
+pub fn gain_des_unites(volume_units: u32) -> f64 {
+    f64::from(volume_units.min(UNITE_DU_GAIN_DE_RENDU)) / f64::from(UNITE_DU_GAIN_DE_RENDU)
+}
+
 /// Gain linéaire de la loi en dB au genou : 10^(−54/20) ≈ 0,001995.
 fn gain_au_genou() -> f64 {
     10f64.powf(-PLAGE_PERCEPTIVE_DB * (1.0 - GENOU_PERCEPTIF) / 20.0)

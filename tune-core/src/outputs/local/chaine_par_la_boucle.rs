@@ -81,7 +81,7 @@ impl ContratDuSignal<'_> {
         // #7934 — l'étage natif est monté à l'unité et ne voit plus le
         // volume : le mot ne reste intact que si le rappel ne le pondère pas
         // (DoP, ou volume à 100 %). Même règle que le WASAPI exclusif (#7264).
-        let bit_perfect = bit_perfect && (dop || volume_units == 1000);
+        let bit_perfect = bit_perfect && (dop || volume_units == UNITE_DU_GAIN_DE_RENDU);
         let runtime = publish_windows_signal_path_status(
             self.signal_path_status,
             bit_perfect,

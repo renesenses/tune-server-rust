@@ -42,7 +42,7 @@ impl Banc {
     fn monter() -> Self {
         Self {
             ring: RingBuf::new(TAUX as usize * 2),
-            volume: AtomicU32::new(1000),
+            volume: AtomicU32::new(UNITE_DU_GAIN_DE_RENDU),
             paused: AtomicBool::new(false),
             silent: AtomicBool::new(false),
             data_started: AtomicBool::new(false),

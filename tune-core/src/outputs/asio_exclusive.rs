@@ -24,6 +24,8 @@ use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tracing::{debug, info, warn};
 
+use crate::audio::volume_scale::gain_des_unites;
+
 use super::canaux_de_carte_6171::{CanauxDeCarte, Dispersion, PlanDeCanaux, remplir_le_tampon};
 use super::local::gain_au_rendu_7264::GainAuRendu;
 use super::local::{NativePcmRing, RingBuf};
@@ -889,7 +891,7 @@ impl AsioExclusiveOutput {
                                 data.fill(0);
                                 return;
                             }
-                            let volume = volume.load(Ordering::Relaxed) as f64 / 1000.0;
+                            let volume = gain_des_unites(volume.load(Ordering::Relaxed));
                             if remplir_le_tampon(data, &mut dispersion, 0, |d| {
                                 float_ring.pop_mapped(d, |sample| {
                                     let scaled = (f64::from(sample) * volume * 2_147_483_648.0)
@@ -920,7 +922,7 @@ impl AsioExclusiveOutput {
                                 data.fill(zero);
                                 return;
                             }
-                            let volume = volume.load(Ordering::Relaxed) as f64 / 1000.0;
+                            let volume = gain_des_unites(volume.load(Ordering::Relaxed));
                             if remplir_le_tampon(data, &mut dispersion, zero, |d| {
                                 float_ring.pop_mapped(d, |sample| {
                                     let scaled = (f64::from(sample) * volume * 8_388_608.0)
@@ -951,7 +953,7 @@ impl AsioExclusiveOutput {
                                 data.fill(0);
                                 return;
                             }
-                            let volume = volume.load(Ordering::Relaxed) as f64 / 1000.0;
+                            let volume = gain_des_unites(volume.load(Ordering::Relaxed));
                             if remplir_le_tampon(data, &mut dispersion, 0, |d| {
                                 float_ring.pop_mapped(d, |sample| {
                                     let scaled = (f64::from(sample) * volume * 32_768.0)
@@ -987,7 +989,7 @@ impl AsioExclusiveOutput {
                             }
                             // Les zéros (fin de famine, canaux non visés)
                             // restent des zéros.
-                            let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+                            let v = gain_des_unites(volume.load(Ordering::Relaxed)) as f32;
                             for sample in data.iter_mut() {
                                 *sample *= v;
                             }
