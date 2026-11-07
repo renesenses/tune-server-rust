@@ -90,6 +90,30 @@ pub enum Image {
     Refusee,
 }
 
+/// Ce que l'hôte fait d'une réponse du CDN des images de Discogs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SuiteImage {
+    /// Succès sur une adresse d'image de Discogs : lire les octets.
+    Lire,
+    /// Rendre ce verdict sans lire le corps.
+    Rendre(Image),
+}
+
+/// Le verdict d'une réponse du CDN d'après son statut HTTP.
+/// `adresse_finale_discogs` dit si l'adresse, après redirections, est encore
+/// une image de Discogs. Un statut inattendu est une panne.
+pub fn suite_selon_statut(statut: u16, adresse_finale_discogs: bool) -> Result<SuiteImage, Panne> {
+    match statut {
+        200..=299 if adresse_finale_discogs => Ok(SuiteImage::Lire),
+        200..=299 => Ok(SuiteImage::Rendre(Image::Introuvable)),
+        404 | 410 => Ok(SuiteImage::Rendre(Image::Introuvable)),
+        // #7927 : un refus du CDN n'est pas une image disparue.
+        403 => Ok(SuiteImage::Rendre(Image::Refusee)),
+        429 | 503 => Ok(SuiteImage::Rendre(Image::Limite)),
+        _ => Err(Panne),
+    }
+}
+
 /// Le service n'a pas répondu (transport, délai, statut inattendu).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Panne;
