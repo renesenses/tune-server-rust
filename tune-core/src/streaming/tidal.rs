@@ -451,45 +451,63 @@ impl TidalService {
             return Ok(tmp_path);
         }
 
-        // Download media segments sequentially and append to file.
-        // Sequential to avoid overwhelming Tidal CDN and to maintain order.
-        // For a typical 3-4 min track at 96kHz/24bit, there are ~54 segments
-        // of ~4s each, total ~30-50MB. Each segment is ~500KB-1MB.
+        // Download media segments and append them to the file IN ORDER.
+        // For a typical 3-4 min track there are ~50-60 segments of ~4s each
+        // (FLAC CD ~10-30 MB, Hi-Res ~30-60 MB).
+        //
+        // #7266 — un segment après l'autre, l'attente jusqu'au Play valait la
+        // somme des allers-retours vers le CDN (60 segments × la latence du
+        // CDN) : 11 à 60 s sur un FLAC CD. Les requêtes partent désormais
+        // [`SEGMENTS_DASH_EN_VOL`] à la fois ; `buffered` rend les réponses
+        // dans l'ordre des numéros, donc le fichier est écrit dans l'ordre,
+        // et au plus `SEGMENTS_DASH_EN_VOL` segments attendent en mémoire.
         let mut total_bytes = init_data.len() as u64;
         let mut failed_segments = 0u32;
 
         {
+            use futures_util::StreamExt as _;
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&tmp_path)
                 .map_err(|e| format!("tmp reopen: {e}"))?;
 
-            for i in 0..total {
+            let requetes = (0..total).map(|i| {
                 let seg_number = segments.start_number + i;
                 let seg_url = segments
                     .media_template
                     .replace("$Number$", &seg_number.to_string());
+                let client = self.client.clone();
+                async move {
+                    let resultat = match client.get(&seg_url).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            resp.bytes().await.map_err(SegmentEnEchec::Lecture)
+                        }
+                        Ok(resp) => Err(SegmentEnEchec::Statut(resp.status().as_u16())),
+                        Err(e) => Err(SegmentEnEchec::Requete(e)),
+                    };
+                    (seg_number, resultat)
+                }
+            });
+            let mut en_ordre = futures_util::stream::iter(requetes).buffered(SEGMENTS_DASH_EN_VOL);
 
-                match self.client.get(&seg_url).send().await {
-                    Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                        Ok(data) => {
-                            file.write_all(&data)
-                                .map_err(|e| format!("tmp write seg {seg_number}: {e}"))?;
-                            total_bytes += data.len() as u64;
-                        }
-                        Err(e) => {
-                            warn!(
-                                track_id,
-                                segment = seg_number,
-                                error = %e,
-                                "tidal_dash_segment_read_failed"
-                            );
-                            failed_segments += 1;
-                        }
-                    },
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
+            while let Some((seg_number, resultat)) = en_ordre.next().await {
+                match resultat {
+                    Ok(data) => {
+                        file.write_all(&data)
+                            .map_err(|e| format!("tmp write seg {seg_number}: {e}"))?;
+                        total_bytes += data.len() as u64;
+                    }
+                    Err(SegmentEnEchec::Lecture(e)) => {
+                        warn!(
+                            track_id,
+                            segment = seg_number,
+                            error = %e,
+                            "tidal_dash_segment_read_failed"
+                        );
+                        failed_segments += 1;
+                    }
+                    Err(SegmentEnEchec::Statut(status)) => {
                         warn!(
                             track_id,
                             segment = seg_number,
@@ -498,7 +516,7 @@ impl TidalService {
                         );
                         failed_segments += 1;
                     }
-                    Err(e) => {
+                    Err(SegmentEnEchec::Requete(e)) => {
                         warn!(
                             track_id,
                             segment = seg_number,
@@ -1097,10 +1115,16 @@ impl TidalService {
         let mut items: Vec<serde_json::Value> = Vec::new();
         let mut total: Option<usize> = None;
         let mut derniere_page_pleine = false;
+        // #7729 — une page qui n'apporte aucun favori neuf (décalage ignoré
+        // ou qui stagne) arrête la lecture : sans cela, un service qui
+        // renvoie toujours la même page pleine, sans total, valait cent
+        // requêtes et dix mille doublons avant la première réponse.
+        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut offset = 0usize;
+        let mut stagne = false;
         for _ in 0..Self::PAGES_FAVORIS_MAX {
             // #7250 : le service peut plafonner la page sous la limite demandée.
             // Avancer du nombre reçu évite de sauter les favoris intermédiaires.
-            let offset = items.len();
             let data = self
                 .api_get(&format!(
                     "/users/{user_id}/favorites/{type_tidal}?limit={}&offset={offset}",
@@ -1109,7 +1133,26 @@ impl TidalService {
                 .await?;
             let lot = data["items"].as_array().cloned().unwrap_or_default();
             let recus = lot.len();
-            items.extend(lot);
+            offset += recus;
+            let avant = items.len();
+            for enveloppe in lot {
+                let cle = match &enveloppe["item"]["id"] {
+                    serde_json::Value::Null => enveloppe.to_string(),
+                    id => id.to_string(),
+                };
+                if vus.insert(cle) {
+                    items.push(enveloppe);
+                }
+            }
+            if recus > 0 && items.len() == avant {
+                stagne = true;
+                tracing::warn!(
+                    type_tidal,
+                    offset,
+                    "tidal_favoris_pagination_sans_progression"
+                );
+                break;
+            }
             total = data["totalNumberOfItems"].as_u64().map(|t| t as usize);
             let limite_servie = data["limit"]
                 .as_u64()
@@ -1126,6 +1169,10 @@ impl TidalService {
             }
         }
         let incomplete = match total {
+            _ if stagne => Some(format!(
+                "tidal: lecture des favoris « {type_tidal} » arrêtée, une page n'apportait aucun favori neuf ({} lus)",
+                items.len()
+            )),
             Some(t) if items.len() < t => Some(format!(
                 "tidal: lecture des favoris « {type_tidal} » incomplète ({} sur {t})",
                 items.len()
@@ -3257,6 +3304,19 @@ struct DashManifest {
     segments: Option<DashSegmentInfo>,
 }
 
+/// #7266 — segments DASH demandés en même temps au CDN. Six, comme un
+/// navigateur vers un même hôte : assez pour ne plus additionner les
+/// latences, assez peu pour ménager le CDN. C'est aussi le plafond de ce qui
+/// attend en mémoire avant d'être écrit (six segments de ~4 s).
+const SEGMENTS_DASH_EN_VOL: usize = 6;
+
+/// #7266 — pourquoi un segment DASH n'a pas été reçu (même journal qu'avant).
+enum SegmentEnEchec {
+    Lecture(reqwest::Error),
+    Statut(u16),
+    Requete(reqwest::Error),
+}
+
 /// Segment information extracted from DASH SegmentTemplate + SegmentTimeline.
 /// Tidal Hi-Res FLAC uses fMP4 with multiple segments that must all be
 /// downloaded and concatenated to reconstruct the full audio file.
@@ -5169,6 +5229,11 @@ mod manifeste_v2_6334_tests;
 #[path = "tidal_dash_entites_7106_tests.rs"]
 mod dash_entites_7106_tests;
 
+// #7266 — le FLAC CD DASH ne s'attend plus segment après segment.
+#[cfg(test)]
+#[path = "tidal_demarrage_dash_7266_tests.rs"]
+mod demarrage_dash_7266_tests;
+
 // #7106 — le MPD v2 RÉEL (relevé le 26/10 sur le .18) : `token` + `info`.
 #[cfg(test)]
 #[path = "tidal_dash_mpd_reel_7106_tests.rs"]
@@ -5322,6 +5387,102 @@ mod favoris_complets_5997 {
             .unwrap()
             .unwrap();
         assert_eq!(affichage.len(), 100);
+    }
+}
+
+/// #7729 — un TIDAL qui ignore le décalage renvoie toujours la même page
+/// pleine. La lecture des favoris doit s'arrêter dès la page sans favori
+/// neuf, sans doublons, et le miroir ne doit pas la prendre pour complète.
+#[cfg(test)]
+mod favoris_decalage_qui_stagne_7729 {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn faux_tidal_qui_stagne(
+        annoncer_total: Option<usize>,
+    ) -> (TidalService, Arc<AtomicUsize>) {
+        use axum::extract::State;
+        use axum::routing::get;
+        async fn favoris(
+            State((appels, total)): State<(Arc<AtomicUsize>, Option<usize>)>,
+        ) -> axum::Json<serde_json::Value> {
+            appels.fetch_add(1, Ordering::SeqCst);
+            // Toujours les 100 premiers, quel que soit `offset`.
+            let items: Vec<_> = (0..100)
+                .map(|i| {
+                    json!({"created": "2026-10-01T10:00:00.000+0000",
+                    "item": {"id": i + 1, "title": format!("piste {}", i + 1)}})
+                })
+                .collect();
+            let mut reponse = json!({"limit": 100, "offset": 0, "items": items});
+            if let Some(t) = total {
+                reponse["totalNumberOfItems"] = json!(t);
+            }
+            axum::Json(reponse)
+        }
+        let appels = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route("/users/7/favorites/tracks", get(favoris))
+            .with_state((appels.clone(), annoncer_total));
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let mut svc = TidalService::new();
+        svc.base_forcee = Some(format!("http://{adresse}"));
+        svc.user_id = Some(7);
+        svc.tokens = Mutex::new(TokenState {
+            access_token: Some("jeton-essai".into()),
+            refresh_token: None,
+            token_expires: None,
+        });
+        (svc, appels)
+    }
+
+    #[tokio::test]
+    async fn un_decalage_ignore_sans_total_arrete_la_lecture_7729() {
+        let (svc, appels) = faux_tidal_qui_stagne(None).await;
+        let affichage = svc
+            .get_user_favorites_dated("tracks")
+            .await
+            .expect("lecture des favoris")
+            .expect("favoris datés");
+        let requetes = appels.load(Ordering::SeqCst);
+        assert!(
+            requetes <= 2,
+            "#7729 : la pagination ne s'arrête pas sur un décalage qui stagne ({requetes} requêtes)"
+        );
+        assert_eq!(
+            affichage.len(),
+            100,
+            "#7729 : la même page relue a été empilée en doublons"
+        );
+        assert!(
+            svc.favoris_dates_complets("tracks").await.is_err(),
+            "#7729 : une lecture arrêtée faute de progression ne doit pas passer pour complète"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_decalage_ignore_avec_total_ne_rend_pas_de_doublons_7729() {
+        let (svc, appels) = faux_tidal_qui_stagne(Some(357)).await;
+        let types = svc.get_user_tracks().await.expect("favoris typés");
+        assert!(
+            appels.load(Ordering::SeqCst) <= 2,
+            "#7729 : la pagination continue sur une page déjà lue"
+        );
+        let mut ids: Vec<_> = types.iter().map(|t| t.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            types.len(),
+            "#7729 : des favoris en double ont été rendus"
+        );
     }
 }
 

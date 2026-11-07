@@ -370,7 +370,7 @@ pub fn volume_de_graine(zone_volume: f64, fixed_volume: bool, trim_db: f64) -> f
 /// Pose sur une sortie locale qui vient de naître le niveau que la base dit
 /// de sa zone, trim compris (#1596, #5561).
 ///
-/// Une `LocalOutput` neuve naît à `user_volume = 1000` (pleine échelle) : sans
+/// Une `LocalOutput` neuve naît à `user_volume` plein (pleine échelle) : sans
 /// cette graine, elle joue à 100 % quel que soit le réglage de la zone. Les
 /// DEUX naissances passent par ici — l'énumération du démarrage
 /// (`tune-server::startup::register_local_outputs`) et la recréation à la
@@ -1497,22 +1497,46 @@ pub(super) struct MotifsDeTranscodage {
     pub(super) dans_une_image_iso: bool,
 }
 
-/// La piste doit-elle être transcodée ? Un OU de tous les motifs, dans l'ordre
-/// où la méthode les additionnait.
+impl MotifsDeTranscodage {
+    /// #7986 — les NOMS des motifs vrais, dans l'ordre où `transcodage_requis`
+    /// les additionnait. C'est ce que la ligne `transcode_required` écrit sous
+    /// `motifs=` : un journal de testeur dit désormais POURQUOI un FLAC
+    /// compatible a été décodé et ré-encodé, au lieu de laisser deviner parmi
+    /// quatorze drapeaux. Les combinaisons (`dlna_cap_16bit` sur un fil FLAC,
+    /// `flac_ffmpeg_vers_le_reseau` sans en-tête neuf) sont les mêmes que
+    /// celles du OU d'origine : une liste vide veut dire passthrough.
+    pub(super) fn motifs_actifs(&self) -> Vec<&'static str> {
+        [
+            (
+                self.needs_transcode_for_output,
+                "needs_transcode_for_output",
+            ),
+            (self.oaat_needs_wav, "oaat_needs_wav"),
+            (self.local_needs_wav, "local_needs_wav"),
+            (self.browser_needs_wav, "browser_needs_wav"),
+            (self.needs_downsample, "needs_downsample"),
+            (self.dlna_needs_wav, "dlna_needs_wav"),
+            (self.eq_forces_transcode, "eq_forces_transcode"),
+            (self.dsp_progressif_wav, "dsp_progressif_wav"),
+            (self.dlna_cap_16bit && self.will_be_flac, "dlna_cap_16bit"),
+            (self.est_une_tranche_cue, "est_une_tranche_cue"),
+            (
+                self.flac_ffmpeg_vers_le_reseau && !self.conteneur_flac_neuf_pret,
+                "flac_ffmpeg_vers_le_reseau",
+            ),
+            (self.reduction_de_canaux, "reduction_de_canaux"),
+            (self.dans_une_image_iso, "dans_une_image_iso"),
+        ]
+        .into_iter()
+        .filter_map(|(vrai, nom)| vrai.then_some(nom))
+        .collect()
+    }
+}
+
+/// La piste doit-elle être transcodée ? Oui dès qu'un motif est vrai
+/// ([`MotifsDeTranscodage::motifs_actifs`]).
 pub(super) fn transcodage_requis(motifs: &MotifsDeTranscodage) -> bool {
-    motifs.needs_transcode_for_output
-        || motifs.oaat_needs_wav
-        || motifs.local_needs_wav
-        || motifs.browser_needs_wav
-        || motifs.needs_downsample
-        || motifs.dlna_needs_wav
-        || motifs.eq_forces_transcode
-        || motifs.dsp_progressif_wav
-        || (motifs.dlna_cap_16bit && motifs.will_be_flac)
-        || motifs.est_une_tranche_cue
-        || (motifs.flac_ffmpeg_vers_le_reseau && !motifs.conteneur_flac_neuf_pret)
-        || motifs.reduction_de_canaux
-        || motifs.dans_une_image_iso
+    !motifs.motifs_actifs().is_empty()
 }
 
 #[cfg(test)]
@@ -1807,7 +1831,7 @@ mod lecture_locale_tests {
                 },
             ),
             (
-                "tranche_cue",
+                "est_une_tranche_cue",
                 MotifsDeTranscodage {
                     est_une_tranche_cue: true,
                     ..aucun_motif()
@@ -1844,6 +1868,53 @@ mod lecture_locale_tests {
             assert!(
                 transcodage_requis(motif),
                 "{nom} seul doit forcer le transcodage"
+            );
+            // #7986 — et le journal le nomme, lui seul.
+            assert_eq!(motif.motifs_actifs(), vec![*nom], "motifs= de {nom} seul");
+        }
+    }
+
+    /// #7986 — `motifs_actifs` rend exactement la décision du OU d'origine,
+    /// sur les 2^15 combinaisons de drapeaux : nommer les motifs n'a changé
+    /// aucune décision de transcodage.
+    #[test]
+    fn les_motifs_nommes_rendent_la_decision_du_ou_d_origine() {
+        for masque in 0u32..(1 << 15) {
+            let b = |i: u32| masque & (1 << i) != 0;
+            let m = MotifsDeTranscodage {
+                needs_transcode_for_output: b(0),
+                oaat_needs_wav: b(1),
+                local_needs_wav: b(2),
+                browser_needs_wav: b(3),
+                needs_downsample: b(4),
+                dlna_needs_wav: b(5),
+                eq_forces_transcode: b(6),
+                dsp_progressif_wav: b(7),
+                dlna_cap_16bit: b(8),
+                will_be_flac: b(9),
+                est_une_tranche_cue: b(10),
+                flac_ffmpeg_vers_le_reseau: b(11),
+                conteneur_flac_neuf_pret: b(12),
+                reduction_de_canaux: b(13),
+                dans_une_image_iso: b(14),
+            };
+            let ou_d_origine = m.needs_transcode_for_output
+                || m.oaat_needs_wav
+                || m.local_needs_wav
+                || m.browser_needs_wav
+                || m.needs_downsample
+                || m.dlna_needs_wav
+                || m.eq_forces_transcode
+                || m.dsp_progressif_wav
+                || (m.dlna_cap_16bit && m.will_be_flac)
+                || m.est_une_tranche_cue
+                || (m.flac_ffmpeg_vers_le_reseau && !m.conteneur_flac_neuf_pret)
+                || m.reduction_de_canaux
+                || m.dans_une_image_iso;
+            assert_eq!(
+                transcodage_requis(&m),
+                ou_d_origine,
+                "masque {masque:#017b}"
             );
         }
     }

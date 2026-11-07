@@ -85,7 +85,9 @@ fn un_geste_sur_le_volume_asio_s_entend_en_moins_de_50_ms_quelle_que_soit_la_pro
         for trames_en_attente in [CADENCE as usize / 10, (CADENCE * 2) as usize] {
             let anneau = anneau_de_deux_secondes();
             remplir(&anneau, trames_en_attente);
-            let volume = Arc::new(AtomicU32::new(1000));
+            let volume = Arc::new(AtomicU32::new(
+                crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+            ));
             let mut gain = GainAuRendu::nouveau(volume.clone(), CADENCE, VOIES);
 
             let avant = rappel.rendre(&anneau, &mut gain);
@@ -95,7 +97,10 @@ fn un_geste_sur_le_volume_asio_s_entend_en_moins_de_50_ms_quelle_que_soit_la_pro
             );
 
             // Le geste : 100 % → 50 %.
-            volume.store(500, Ordering::Relaxed);
+            volume.store(
+                crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 2,
+                Ordering::Relaxed,
+            );
             let borne_trames = (CADENCE as usize * 50) / 1000;
             let mut rendues = 0usize;
             let mut atteint_a = None;
@@ -136,7 +141,9 @@ fn le_rendu_asio_ne_pondere_jamais_un_passage_intact() {
     remplir(&anneau, PERIODE);
     anneau.marquer_passage_intact(false);
     remplir(&anneau, PERIODE);
-    let volume = Arc::new(AtomicU32::new(250));
+    let volume = Arc::new(AtomicU32::new(
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 4,
+    ));
     let mut gain = GainAuRendu::nouveau(volume, CADENCE, VOIES);
 
     let intact = Rappel::I32.rendre(&anneau, &mut gain);
@@ -158,8 +165,8 @@ fn le_rendu_asio_ne_pondere_jamais_un_passage_intact() {
 fn le_contrat_asio_n_est_bit_perfect_qu_a_100_pour_cent_ou_en_dop() {
     let signal_path_status = std::sync::Mutex::new(None);
     let dop_active = AtomicBool::new(false);
-    let volume = AtomicU32::new(500);
-    let user_volume = AtomicU32::new(500);
+    let volume = AtomicU32::new(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 2);
+    let user_volume = AtomicU32::new(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 2);
     let rg_factor = AtomicU32::new(1000);
     let eq = std::sync::Mutex::new(None);
     let convolver = std::sync::Mutex::new(None);
@@ -196,11 +203,17 @@ fn le_contrat_asio_n_est_bit_perfect_qu_a_100_pour_cent_ou_en_dop() {
         "#7934 : une zone ASIO à 50 % ne doit pas se dire bit-perfect"
     );
 
-    volume.store(1000, Ordering::SeqCst);
+    volume.store(
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+        Ordering::SeqCst,
+    );
     contrat.publier(false, true);
     assert!(publie(), "à 100 % : bit-perfect");
 
-    volume.store(500, Ordering::SeqCst);
+    volume.store(
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 2,
+        Ordering::SeqCst,
+    );
     contrat.publier(true, true);
     assert!(
         publie(),

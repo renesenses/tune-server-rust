@@ -2797,6 +2797,10 @@ async fn spawn_library_scan_avec_lecteur_par(
                             Ok(()) => {
                                 ecritures = ecritures
                                     .avec_dr_des_rapports_voisins(meta_entries.iter().map(|(_, m)| m));
+                                // #7766 — les crédits des balises deviennent des
+                                // lignes `track_credits` (source `balises`), dans
+                                // la même transaction, sans rouvrir le fichier.
+                                tune_core::metadata::credits_balises::ecrire_lot(&db, &meta_entries);
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "scan_extended_metadata_insert_failed");

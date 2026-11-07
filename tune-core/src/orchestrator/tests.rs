@@ -614,8 +614,9 @@ async fn levels_chain_emits_audio_levels_on_bus() {
 /// Garde de COMPORTEMENT, pas de texte : une même fenêtre à PLEINE ÉCHELLE
 /// part deux fois dans la chaîne réelle (forwarder cadencé → bus), et c'est la
 /// valeur PUBLIÉE qui est lue.
-///   * sans gain branché — tout chemin non local — elle vaut 0 dBFS, surcharge
-///     allumée : la mesure d'avant, inchangée ;
+///   * sans gain branché — tout chemin non local — elle vaut 0 dBFS ; la
+///     surcharge reste ÉTEINTE (#7100) : rien n'a écrêté la sortie, seule la
+///     source touche le plein, ce que dit `source_over_left` ;
 ///   * avec le gain de la sortie à 0,5 (−6,02 dB), elle vaut −6 dBFS et la
 ///     surcharge S'ÉTEINT — ce que GgB attendait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -682,13 +683,19 @@ async fn le_cretemetre_suit_le_gain_de_la_sortie() {
         brut_db > -0.1,
         "une fenêtre à pleine échelle sans gain doit se lire à 0 dBFS, lu {brut_db}"
     );
-    assert!(brut_over, "pleine échelle sans gain ⇒ surcharge");
+    assert!(
+        !brut_over,
+        "#7100 — source à pleine échelle sans gain : rien n'écrête la sortie, pas d'OVER"
+    );
     assert_eq!(brut_gain_db, 0.0, "aucun gain déclaré ⇒ 0 dB annoncé");
 
     // La même fenêtre, avec la sortie qui atténue de 6 dB (préampli −6 dB à
     // volume plein, ou volume à 50 % : c'est le MÊME facteur, celui que les
     // rappels de rendu multiplient).
-    let gain = Arc::new(AtomicU32::new(500));
+    // #7968 — l'`Arc` partagé est dans l'unité de la sortie locale.
+    let gain = Arc::new(AtomicU32::new(
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 2,
+    ));
     let (attenue_db, attenue_over, attenue_gain_db) = mesurer(987_661, Some(gain.clone())).await;
     assert!(
         (attenue_db - (-6.02)).abs() < 0.2,
@@ -705,13 +712,19 @@ async fn le_cretemetre_suit_le_gain_de_la_sortie() {
 
     // Et il se lit à chaque fenêtre, pas au spawn : bouger le curseur en cours
     // de piste déplace l'aiguille sans attendre la piste suivante.
-    gain.store(1000, Ordering::SeqCst);
+    gain.store(
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+        Ordering::SeqCst,
+    );
     let (rendu_db, rendu_over, rendu_gain_db) = mesurer(987_662, Some(gain)).await;
     assert!(
         rendu_db > -0.1,
         "gain revenu à l'unité ⇒ 0 dBFS, lu {rendu_db}"
     );
-    assert!(rendu_over, "gain revenu à l'unité ⇒ surcharge de retour");
+    assert!(
+        !rendu_over,
+        "#7100 — gain revenu à l'unité : la source au plein n'est toujours pas un écrêtage"
+    );
     assert_eq!(rendu_gain_db, 0.0);
 }
 
@@ -767,7 +780,10 @@ async fn les_niveaux_disent_le_gain_demande_et_le_rabot_a_l_unite_4384() {
         }
     }
     let demande = |volume: u32, facteur: u32, dop: bool| crate::playback::GainDemande {
-        volume_utilisateur: Arc::new(AtomicU32::new(volume)),
+        // #7968 — `volume` en millièmes ici, l'`Arc` dans l'unité de la sortie.
+        volume_utilisateur: Arc::new(AtomicU32::new(
+            volume * (crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 1000),
+        )),
         facteur_de_rendu: Arc::new(AtomicU32::new(facteur)),
         dop: Arc::new(AtomicBool::new(dop)),
     };
@@ -6459,7 +6475,8 @@ async fn gain_de_la_sortie_recreee(volume: f64, fixe: bool, trim_db: &str) -> u3
 #[cfg(feature = "local-audio")]
 #[tokio::test]
 async fn la_sortie_locale_recreee_nait_au_volume_de_la_zone_trim_compris() {
-    let gain = gain_de_la_sortie_recreee(30.0, false, "-6").await as f64 / 1000.0;
+    let gain = gain_de_la_sortie_recreee(30.0, false, "-6").await as f64
+        / f64::from(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU);
     let attendu = super::volume_avec_trim(0.30, -6.0);
     assert!(
         (gain - attendu).abs() < 2e-3,
@@ -6476,11 +6493,12 @@ async fn la_sortie_locale_recreee_nait_au_volume_de_la_zone_trim_compris() {
 async fn la_sortie_locale_recreee_respecte_volume_fixe_et_plafond() {
     assert_eq!(
         gain_de_la_sortie_recreee(20.0, true, "-6").await,
-        1000,
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
         "zone « Volume fixe » recréée hors de la pleine échelle"
     );
     assert!(
-        gain_de_la_sortie_recreee(95.0, false, "12").await <= 1000,
+        gain_de_la_sortie_recreee(95.0, false, "12").await
+            <= crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
         "trim positif : plafond de l'unité franchi à la recréation"
     );
 }
@@ -7071,10 +7089,11 @@ async fn zone_navigateur_une_recreation_de_flux_ne_doublonne_pas_l_historique() 
     );
 }
 
-/// La radio n'entre pas dans l'historique local — même exclusion que le
-/// chemin nominal, pour la même raison (titre figé au démarrage).
+/// #7965 — la radio s'écrit une fois, au nom de la station (l'`album` que
+/// `jouer_un_flux` remplit), jamais au titre figé du démarrage — même règle
+/// que le chemin nominal.
 #[tokio::test]
-async fn zone_navigateur_la_radio_reste_hors_de_l_historique() {
+async fn zone_navigateur_la_radio_s_ecrit_au_nom_de_la_station() {
     let orch = test_orchestrator();
     let zone_id = ZoneRepo::with_backend(orch.db.clone())
         .create("Ce PC", Some("browser"), None)
@@ -7089,11 +7108,16 @@ async fn zone_navigateur_la_radio_reste_hors_de_l_historique() {
         .insert(zone_id, annonce_en_attente(&sid, true, "radio"));
 
     assert!(orch.confirmer_lecture_navigateur(zone_id, &sid).await);
+    let lignes = crate::db::history_repo::HistoryRepo::with_backend(orch.db.clone())
+        .recent(10)
+        .unwrap();
     assert_eq!(
-        lignes_historique(&orch),
-        0,
-        "la radio ne s'écrit pas dans listen_history"
+        lignes.len(),
+        1,
+        "une ligne par lancement de radio : {lignes:?}"
     );
+    assert_eq!(lignes[0].title, "Unholy Hymns", "le nom de la station");
+    assert_eq!(lignes[0].context_type.as_deref(), Some("radio"));
 }
 
 /// Une lecture abandonnée avant le premier octet ne s'annonce jamais, même

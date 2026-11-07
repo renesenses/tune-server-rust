@@ -69,6 +69,8 @@ mod query_multi;
 mod ratings;
 mod reidentify;
 mod reports;
+// #7872 — `GET /library/query`, la requête avancée (grammaire de #7848).
+pub(crate) mod requete_avancee;
 // tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
 // fichiers de CETTE machine.
 pub(crate) mod reveler;
@@ -696,6 +698,8 @@ pub fn router() -> Router<AppState> {
             get(lyrics_pass::couverture_rattrapage).post(lyrics_pass::rattraper_maintenant),
         )
         .route("/search", get(search::search))
+        // #7872 — la requête avancée : mêmes droits que `/search`.
+        .route("/query", get(requete_avancee::requete_avancee))
         .route("/search/acoustic", post(search::acoustic_search))
         .route("/search/acoustic/status", get(search::acoustic_status))
         // Ambiances enregistrées : du stockage, pas de la recherche — donc
@@ -1023,6 +1027,10 @@ mod filtre_qualite_7725_tests;
 #[cfg(test)]
 #[path = "notes_et_repartitions_7849_tests.rs"]
 mod notes_et_repartitions_7849_tests;
+
+#[cfg(test)]
+#[path = "requete_avancee_7872_tests.rs"]
+mod requete_avancee_7872_tests;
 
 #[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]
