@@ -3724,8 +3724,9 @@ fn installer_unix_et_designer_la_relance(
 /// Le neuf remplace `binaire`, qui ne tourne pas, sans sauvegarde.
 ///
 /// #7756 — rien ne touche à l'ancien binaire tant que le neuf n'est pas
-/// écrit sur le disque (`sync_all`) et validé ([`installation_sure`]) ; un
-/// échec après la mise de côté, `web/` compris, remet l'ancien en place.
+/// écrit sur le disque (`sync_all`) et validé ([`installation_sure`]), ni
+/// tant que chaque `web/` neuf n'est pas préparé et vérifié à côté de sa
+/// cible ; un échec après la mise de côté remet le binaire ET `web/`.
 fn install_unix(
     binaire: &std::path::Path,
     en_cours: &std::path::Path,
@@ -3746,12 +3747,14 @@ fn install_unix(
             .map_err(|e| format!("chmod: {e}"))?;
     }
 
-    // Place : le `.new` et la copie de `web/` s'écrivent à côté de l'ancien.
+    // Place : le `.new` et chaque copie de `web/` s'écrivent à côté de l'ancien.
+    let source_web = tmp_dir.join("web");
+    let cibles_web = (controles.cibles_web)(exe_dir);
     let taille_neuve = std::fs::metadata(new_binary)
         .map_err(|e| format!("read new binary: {e}"))?
         .len();
     let besoin = taille_neuve
-        + installation_sure::taille_du_dossier(&tmp_dir.join("web"))
+        + installation_sure::taille_du_dossier(&source_web) * cibles_web.len() as u64
         + installation_sure::MARGE_DE_PLACE;
     installation_sure::verifier_la_place(exe_dir, besoin, controles.place_libre)?;
 
@@ -3762,6 +3765,18 @@ fn install_unix(
         error!(error = %e, "update_new_binary_rejected");
         return Err(format!("{e} — previous binary kept"));
     }
+
+    // #7756 — `web/` est préparé et vérifié AVANT de toucher au binaire : une
+    // copie ratée ou vide laisse l'installation entière comme avant.
+    let webs_prepares =
+        match installation_sure::preparer_les_web(&source_web, &cibles_web, controles.copier) {
+            Ok(p) => p,
+            Err(e) => {
+                std::fs::remove_file(&staging).ok();
+                error!(error = %e, "update_new_web_rejected");
+                return Err(format!("{e} — previous binary and web/ kept"));
+            }
+        };
 
     let sauvegarde_en_cours = old_exe == en_cours;
     let sauvegarde_faite = if sauvegarde_en_cours || !binaire.exists() {
@@ -3775,22 +3790,43 @@ fn install_unix(
         if old_exe.exists() {
             std::fs::remove_file(&old_exe).ok();
         }
-        if let Err(e) = std::fs::rename(binaire, &old_exe) {
+        if let Err(e) = (controles.renommer)(binaire, &old_exe) {
             std::fs::remove_file(&staging).ok();
+            installation_sure::abandonner_les_web(&webs_prepares);
             return Err(format!("rename current to .old: {e}"));
         }
         true
     };
 
-    // Remet l'ancien sous le nom d'installation après un échec.
-    let restaurer = |cause: String| -> String {
+    // Remet l'ancien binaire ET les `web/` déjà basculés après un échec.
+    let restaurer = |cause: String, webs: &[installation_sure::WebBascule]| -> String {
+        let mut non_remis = Vec::new();
+        for b in webs.iter().rev() {
+            if let Err(e) = installation_sure::remettre_un_web(b) {
+                error!(dir = %b.cible.display(), error = %e, "update_web_rollback_failed");
+                non_remis.push(format!("web/ {} NOT restored ({e})", b.cible.display()));
+            }
+        }
+        let quoi = if webs.is_empty() {
+            "binary"
+        } else {
+            "binary and web/"
+        };
         if !sauvegarde_faite {
-            return cause;
+            return if non_remis.is_empty() {
+                cause
+            } else {
+                format!("{cause} — {}", non_remis.join(", "))
+            };
         }
         let retour = std::fs::rename(&old_exe, binaire);
         installation_sure::synchroniser_dossier(exe_dir);
         match retour {
-            Ok(()) => format!("{cause} — previous binary restored"),
+            Ok(()) if non_remis.is_empty() => format!("{cause} — previous {quoi} restored"),
+            Ok(()) => format!(
+                "{cause} — previous binary restored, {}",
+                non_remis.join(", ")
+            ),
             Err(e) => {
                 error!(error = %e, "update_rollback_failed");
                 format!(
@@ -3801,16 +3837,29 @@ fn install_unix(
         }
     };
 
-    if let Err(e) = std::fs::rename(&staging, binaire) {
+    if let Err(e) = (controles.renommer)(&staging, binaire) {
         error!(error = %e, "rename_new_to_current_failed, rolling back");
         std::fs::remove_file(&staging).ok();
-        return Err(restaurer(format!("rename .new to current: {e}")));
+        installation_sure::abandonner_les_web(&webs_prepares);
+        return Err(restaurer(format!("rename .new to current: {e}"), &[]));
     }
     installation_sure::synchroniser_dossier(exe_dir);
 
-    if let Err(e) = (controles.mettre_a_jour_web)(exe_dir, tmp_dir) {
-        error!(error = %e, "update_web_failed, rolling back binary");
-        return Err(restaurer(e));
+    // Chaque `web/` bascule par renommage du dossier entier ; l'ancien reste
+    // en `<cible>.old`, à côté de `tune-server.old`.
+    let mut webs_bascules = Vec::new();
+    for (i, cible) in webs_prepares.iter().enumerate() {
+        match installation_sure::basculer_un_web(cible, controles.renommer) {
+            Ok(b) => webs_bascules.push(b),
+            Err(e) => {
+                error!(error = %e, "update_web_failed, rolling back binary and web/");
+                installation_sure::abandonner_les_web(&webs_prepares[i..]);
+                return Err(restaurer(e, &webs_bascules));
+            }
+        }
+    }
+    if let Some(servi) = webs_prepares.first() {
+        info!(dir = %servi.display(), "web_directory_updated");
     }
 
     Ok(())
@@ -4155,34 +4204,6 @@ pub(super) fn file_contains_bytes(path: &std::path::Path, needle: &[u8]) -> bool
     false
 }
 
-/// Replace the web/ directory with the one from the archive.
-/// Writes to both CWD/web (where the server reads) and exe_dir/web (fallback).
-fn update_web_dir(exe_dir: &std::path::Path, tmp_dir: &std::path::Path) -> Result<(), String> {
-    let new_web = tmp_dir.join("web");
-    if !new_web.exists() {
-        info!("no web/ directory in archive, skipping web update");
-        return Ok(());
-    }
-
-    let cibles = cibles_web(exe_dir);
-    let target_web = &cibles[0];
-
-    // Atomic swap: the old remove-then-copy left a BROKEN web/ (missing
-    // index.html → no UI at all) whenever the copy failed partway — e.g.
-    // stale root-owned files from a manual deploy (Bertrand, .15, v0.9.2
-    // update). Stage a FULL copy next to the target, then swap via two
-    // renames: at every instant the target is either the complete old web
-    // or the complete new one. Rollback restores the old on a failed swap.
-    swap_dir_atomic(&new_web, target_web)?;
-
-    for exe_web in &cibles[1..] {
-        swap_dir_atomic(&new_web, exe_web).ok();
-    }
-
-    info!(dir = %target_web.display(), "web_directory_updated");
-    Ok(())
-}
-
 /// Les dossiers `web/` à remplacer : d'abord celui que le serveur sert
 /// (CWD/web ou `TUNE_WEB_DIR`), puis exe_dir/web s'il est distinct (repli).
 fn cibles_web(exe_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -4216,7 +4237,7 @@ fn cibles_web(exe_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 ///
 /// Rend les cibles effectivement préparées, la première étant celle servie.
 /// Un échec sur la cible servie arrête la mise à jour ; sur le repli, il est
-/// ignoré, comme dans `update_web_dir`.
+/// ignoré.
 fn preparer_le_web(
     new_web: &std::path::Path,
     cibles: &[std::path::PathBuf],
@@ -7945,7 +7966,9 @@ mod relance_apres_installation_5461 {
             place_libre: |_| Ok(u64::MAX),
             architecture: None,
             essai: |_| Ok(()),
-            mettre_a_jour_web: super::update_web_dir,
+            cibles_web: |exe_dir| vec![exe_dir.join("web")],
+            copier: super::installation_sure::copier_durablement,
+            renommer: |de, vers| std::fs::rename(de, vers),
         };
         installer_unix_et_designer_la_relance(&lire, &neuf, &extraction, &controles)
     }

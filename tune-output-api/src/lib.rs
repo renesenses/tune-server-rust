@@ -2022,6 +2022,10 @@ pub struct TransformationsReelles {
     /// tune-server-rust#6741 — un égaliseur COUPÉ applique encore son
     /// préampli : `(centièmes de dB, en retour)`. `None` hors de ce cas.
     preampli_garde: Option<(i32, bool)>,
+    /// tune-server-rust#7614 — le greffon de suréchantillonnage porte la
+    /// cadence de l'entrée vers celle ouverte : `(filtre, réserve en
+    /// centièmes de dB)`. `None` quand il ne tourne pas.
+    surechantillonnage: Option<(&'static str, i32)>,
 }
 
 impl TransformationsReelles {
@@ -2037,7 +2041,32 @@ impl TransformationsReelles {
             fondu_enchaine: false,
             reorganisation_canaux: false,
             preampli_garde: None,
+            surechantillonnage: None,
         }
+    }
+
+    /// tune-server-rust#7614 — la même déclaration, en disant que le
+    /// greffon de suréchantillonnage (filtre `filtre`, réserve `reserve_db`
+    /// ≤ 0) a porté la cadence de l'entrée à celle ouverte. Additif.
+    #[must_use]
+    pub fn avec_surechantillonnage(mut self, filtre: &'static str, reserve_db: f64) -> Self {
+        self.surechantillonnage = Some((
+            filtre,
+            if reserve_db.is_finite() {
+                (reserve_db * 100.0).round() as i32
+            } else {
+                0
+            },
+        ));
+        self
+    }
+
+    /// tune-server-rust#7614 — le filtre du suréchantillonneur et sa
+    /// réserve en dB, quand il tourne.
+    #[must_use]
+    pub fn surechantillonnage(&self) -> Option<(&'static str, f64)> {
+        self.surechantillonnage
+            .map(|(filtre, centiemes)| (filtre, f64::from(centiemes) / 100.0))
     }
 
     /// tune-server-rust#6741 — la même déclaration, en disant qu'un

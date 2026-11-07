@@ -9,6 +9,9 @@ impl PositionPoller {
     ) {
         let states = self.playback.all_states().await;
         for s in &states {
+            // #7974 — le temps écouté des profils supervisés (pause exclue) et
+            // l'arrêt annoncé en fin de bail.
+            self.orchestrator.decompter_le_bail(s).await;
             if s.state == PlayState::Playing && s.position_ms > 0 {
                 // #7852 — le point de décision unique de l'écoute validée :
                 // historique, compteur d'écoutes et « Reprendre l'écoute »
