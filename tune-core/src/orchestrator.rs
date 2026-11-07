@@ -2055,6 +2055,9 @@ mod verdict_pure_reglages_6522_tests;
 // #7632 — la convolution par RI est un droit Premium (RoomCorrection).
 #[cfg(test)]
 mod convolution_sous_licence_7632_tests;
+// #7986 — une RI que le convolveur refusera ne force pas le transcodage.
+#[cfg(test)]
+mod passthrough_sans_traitement_7986_tests;
 
 /// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
 mod duree_du_flux_2062;
