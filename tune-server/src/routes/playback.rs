@@ -5864,10 +5864,13 @@ async fn queue_move(
 async fn queue_jump_en_tete_du_groupe(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    profile: ActiveProfile,
     headers: axum::http::HeaderMap,
     body: Json<QueueJumpRequest>,
 ) -> axum::response::Response {
-    let lancement = queue_jump(State(state.clone()), Path(zone_id), headers, body);
+    // #7974 — le profil du geste suit le relais : c'est lui que le bail
+    // d'écoute contrôle, pas celui du dernier profil qui a joué sur la zone.
+    let lancement = queue_jump(State(state.clone()), Path(zone_id), profile, headers, body);
     crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
         &state, zone_id, lancement,
     )
@@ -7296,9 +7299,16 @@ async fn clear_zone_pin(
 async fn invoke_zone_pin_en_tete_du_groupe(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
+    profile: ActiveProfile,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    let lancement = invoke_zone_pin(State(state.clone()), Path((zone_id, index)), headers);
+    // #7974 — le profil du geste suit le relais, comme pour `queue_jump`.
+    let lancement = invoke_zone_pin(
+        State(state.clone()),
+        Path((zone_id, index)),
+        profile,
+        headers,
+    );
     crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
         &state, zone_id, lancement,
     )

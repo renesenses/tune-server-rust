@@ -814,9 +814,12 @@ async fn podcast_episodes(
 async fn play_episode_en_tete_du_groupe(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    profile: crate::routes::active_profile::ActiveProfile,
     body: Json<PlayEpisodeRequest>,
 ) -> axum::response::Response {
-    let lancement = play_episode(State(state.clone()), Path(zone_id), body);
+    // #7974 — le profil du geste et la langue du refus suivent le relais.
+    let lancement = play_episode(State(state.clone()), Path(zone_id), headers, profile, body);
     crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
         &state, zone_id, lancement,
     )

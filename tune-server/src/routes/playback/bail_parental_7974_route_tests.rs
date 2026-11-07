@@ -172,3 +172,58 @@ async fn saut_dans_la_file_suit_le_profil_du_geste_7974() {
         "l'adulte saute dans la file après l'enfant : aucun refus, reçu {statut} {corps}"
     );
 }
+
+/// La meneuse du groupe dont la zone du banc est suiveuse.
+const MENEUSE: i64 = 9_974;
+
+fn grouper(b: &Banc) {
+    let groupes = json!([{ "id": 1, "leader_id": MENEUSE, "zone_ids": [MENEUSE, b.zone] }]);
+    tune_core::db::settings_repo::SettingsRepo::with_backend(b.state.backend.clone())
+        .set("zone_groups", &groupes.to_string())
+        .unwrap();
+}
+
+fn meneuse_du_groupe(b: &Banc) -> Value {
+    let texte = tune_core::db::settings_repo::SettingsRepo::with_backend(b.state.backend.clone())
+        .get("zone_groups")
+        .unwrap()
+        .unwrap();
+    serde_json::from_str::<Value>(&texte).unwrap()[0]["leader_id"].clone()
+}
+
+/// Dans un groupe (#7717), les routes passent par le relais de groupe : le
+/// profil du geste doit le traverser. L'enfant est refusé sur l'épisode et le
+/// saut dans la file, et la tête revient à la meneuse d'avant ; l'adulte qui
+/// suit n'hérite pas du bail de l'enfant.
+#[tokio::test]
+async fn le_profil_du_geste_traverse_le_relais_de_groupe_7974() {
+    let b = banc().await;
+    grouper(&b);
+
+    let (statut, corps) = episode(&b, Some(b.enfant)).await;
+    assert!(
+        refuse(statut, &corps),
+        "épisode de l'enfant dans un groupe : 403 attendu, reçu {statut} {corps}"
+    );
+    assert_eq!(
+        meneuse_du_groupe(&b),
+        json!(MENEUSE),
+        "refusé : la tête du groupe revient à la meneuse d'avant"
+    );
+
+    b.state
+        .playback
+        .set_session_profile(b.zone, Some(ADULTE))
+        .await;
+    let (statut, corps) = sauter(&b, Some(b.enfant)).await;
+    assert!(
+        refuse(statut, &corps),
+        "saut de l'enfant dans un groupe : 403 attendu, reçu {statut} {corps}"
+    );
+
+    let (statut, corps) = episode(&b, None).await;
+    assert!(
+        !refuse(statut, &corps),
+        "épisode de l'adulte après l'enfant dans un groupe : aucun refus, reçu {statut} {corps}"
+    );
+}
