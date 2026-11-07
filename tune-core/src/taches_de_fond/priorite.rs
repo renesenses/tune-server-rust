@@ -285,6 +285,111 @@ where
     }
 }
 
+/// D'où vient un travail : d'une cascade automatique, ou d'un geste de
+/// l'utilisateur qui attend devant l'écran (#8086).
+///
+/// Le frein « lecture en cours » ne vaut que pour l'automatique : un
+/// spectrogramme demandé à la main avait mis 95,6 s (au lieu de quelques
+/// secondes) sur un serveur presque à vide, parce qu'il cédait cinq secondes à
+/// la lecture entre deux fenêtres, comme une analyse de fond.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origine {
+    /// Cascade, scan, enrichissement : freinée pendant la lecture.
+    Automatique,
+    /// Demandée par l'utilisateur : jamais freinée, jamais en pause.
+    Demandee,
+}
+
+/// Comme [`ceder_a_la_lecture_bloquant`], mais une demande de l'utilisateur
+/// ne cède jamais : rend `false` sans dormir ni noter de cession.
+pub fn ceder_pour_bloquant(origine: Origine, id: &'static str) -> bool {
+    match origine {
+        Origine::Automatique => ceder_a_la_lecture_bloquant(id),
+        Origine::Demandee => false,
+    }
+}
+
+/// Priorité de processus (nice) d'un travail demandé qui est lourd : assez
+/// basse pour ne pas disputer le CPU à la lecture, sans aucune pause.
+const NICE_DEMANDE: i32 = 5;
+
+/// Abaisse le nice du fil courant le temps du travail (Linux, fil seul), puis
+/// le rétablit : le pool bloquant réutilise ses fils.
+struct NiceTemporaire {
+    #[cfg(target_os = "linux")]
+    avant: Option<(libc::id_t, libc::c_int)>,
+}
+
+impl NiceTemporaire {
+    fn prendre(niveau: i32) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: appels système sans pointeur ; PRIO_PROCESS avec un tid
+            // ne vise que ce fil sous Linux.
+            unsafe {
+                let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+                let actuel = libc::getpriority(libc::PRIO_PROCESS as _, tid);
+                if actuel < niveau && libc::setpriority(libc::PRIO_PROCESS as _, tid, niveau) == 0 {
+                    return Self {
+                        avant: Some((tid, actuel)),
+                    };
+                }
+            }
+            Self { avant: None }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = niveau;
+            Self {}
+        }
+    }
+}
+
+impl Drop for NiceTemporaire {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some((tid, avant)) = self.avant {
+            // Remonter le nice peut être refusé sans privilège : le fil reste
+            // alors à NICE_DEMANDE, ce qui est sans danger.
+            // SAFETY: voir `prendre`.
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS as _, tid, avant);
+            }
+        }
+    }
+}
+
+/// Comme [`hors_du_fil_async`], selon l'origine. Une demande de l'utilisateur
+/// ne marque PAS le fil « de fond » (ses lectures SQLite ne sont pas
+/// différées) et ne cède pas : seul un nice modéré protège la lecture.
+pub async fn hors_du_fil_async_pour<T, F>(
+    origine: Origine,
+    id: &'static str,
+    travail: F,
+) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match origine {
+        Origine::Automatique => hors_du_fil_async(id, travail).await,
+        Origine::Demandee => {
+            let resultat = tokio::task::spawn_blocking(move || {
+                let _nice = NiceTemporaire::prendre(NICE_DEMANDE);
+                travail()
+            })
+            .await;
+            match resultat {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(tache = id, error = %e, "tache_demandee_travail_interrompu");
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Le relevé servi par `GET /system/background-tasks`, sous
 /// `playback_priority`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -5928,6 +5928,9 @@ mod bruit_suspect_de_bout_en_bout_6130;
 #[cfg(test)]
 mod bruit_suspect_reseau_de_bout_en_bout_6255;
 
+/// #8076 — la double requête `Lavf` sur un FLAC sous en-tête neuf.
+#[cfg(test)]
+mod conteneur_flac_neuf_8076;
 /// #6221 — un fichier virtuel (DSF fabriqué depuis un DST) servi avec le
 /// contrat fichier : Content-Length, Range, 416.
 #[cfg(test)]

@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 use tune_core::db::backend::DbBackend;
+use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::EventBus;
 use tune_core::favorites_sort::TriFavoris;
@@ -20,6 +21,8 @@ use tune_core::streaming::traits::StreamingService;
 mod connexion_spotify_distante;
 pub mod deezer_proxy_handler;
 pub mod etiquettes_langue;
+/// #8066 — remplacer un titre indisponible dans une playlist du service.
+mod remplacement_indisponibles_8066;
 
 /// Sous-ensemble de l'état serveur nécessaire aux routes des services de
 /// streaming. Cette frontière empêche ces routes de dépendre de tout le
@@ -539,6 +542,18 @@ where
             "/{service}/playlists/{playlist_id}/tracks/remove",
             post(service_remove_tracks),
         )
+        .route(
+            "/{service}/playlists/{playlist_id}/tracks/{index}/replacements",
+            get(remplacement_indisponibles_8066::candidats_du_titre),
+        )
+        .route(
+            "/{service}/playlists/{playlist_id}/tracks/{index}/replace",
+            post(remplacement_indisponibles_8066::remplacer_le_titre),
+        )
+        .route(
+            "/{service}/playlists/{playlist_id}/repair",
+            post(remplacement_indisponibles_8066::reparer_la_playlist),
+        )
         .route("/{service}/tracks/{track_id}", get(service_track))
         .route("/{service}/tracks/{track_id}/url", get(service_track_url))
         .route(
@@ -718,13 +733,21 @@ fn ranger_le_marquage_ia(
     }
 }
 
+/// #8062 — même enrichissement que [`service_playlist_tracks`].
 async fn service_album_tracks(
     State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
-        .get_album_tracks(&album_id)
-        .await)
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let pistes = arc
+        .read()
+        .await
+        .get_album_tracks_avec_annee_et_genre(&album_id)
+        .await;
+    svc_response(pistes.map(|p| pistes_avec_ecoutes(&state.backend, &service, p)))
 }
 
 async fn service_artist(
@@ -946,13 +969,79 @@ async fn service_playlist(
     with_svc!(&state, &service, |svc| svc.get_playlist(&playlist_id).await)
 }
 
+/// #8062 — les pistes d'une playlist de service, avec les colonnes du tableau
+/// que la bibliothèque remplit déjà : `play_count`, `last_played_at`, et
+/// `year` / `genre` quand le service les publie. Voir [`pistes_avec_ecoutes`].
 async fn service_playlist_tracks(
     State(state): State<StreamingHttpState>,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
-        .get_playlist_tracks(&playlist_id)
-        .await)
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let pistes = arc
+        .read()
+        .await
+        .get_playlist_tracks_avec_annee_et_genre(&playlist_id)
+        .await;
+    svc_response(pistes.map(|p| pistes_avec_ecoutes(&state.backend, &service, p)))
+}
+
+/// #8062 — les colonnes d'un tableau de pistes, pour des pistes de SERVICE.
+///
+/// Le contrat est celui de la bibliothèque (`attacher_ecoutes`, côté
+/// `tune-server`) : `play_count` vaut `0` et `last_played_at` `null` pour une
+/// piste jamais jouée ; quand l'historique est illisible, aucune des deux clés
+/// n'est posée — un zéro dû à une panne se lirait « jamais jouée ». Une piste
+/// sans identifiant n'a pas d'écoutes connaissables : pas de clé non plus.
+///
+/// Les écoutes sont comptées tous profils confondus, comme la colonne de la
+/// bibliothèque ([`HistoryRepo::ecoutes_de_service_par_identifiant`]). Une
+/// seule requête pour toute la liste.
+///
+/// `year` et `genre` ne sont écrits que si le service les publie : absents,
+/// la cellule reste vide.
+fn pistes_avec_ecoutes(
+    backend: &Arc<dyn DbBackend>,
+    service: &str,
+    pistes: Vec<(
+        tune_core::streaming::traits::StreamTrack,
+        tune_core::streaming::traits::AnneeEtGenre,
+    )>,
+) -> Vec<Value> {
+    let ids: Vec<&str> = pistes.iter().map(|(t, _)| t.id.as_str()).collect();
+    let ecoutes = match HistoryRepo::with_backend(backend.clone())
+        .ecoutes_de_service_par_identifiant(service, &ids)
+    {
+        Ok(e) => Some(e),
+        Err(e) => {
+            tracing::error!(service, error = %e, "ecoutes_pistes_de_service_illisibles");
+            None
+        }
+    };
+    pistes
+        .iter()
+        .map(|(piste, extras)| {
+            let mut v = json!(piste);
+            let Some(obj) = v.as_object_mut() else {
+                return v;
+            };
+            if let Some(annee) = extras.year {
+                obj.insert("year".into(), json!(annee));
+            }
+            if let Some(genre) = &extras.genre {
+                obj.insert("genre".into(), json!(genre));
+            }
+            let id = piste.id.trim();
+            if let (Some(ecoutes), false) = (&ecoutes, id.is_empty()) {
+                let (compte, derniere) = ecoutes.get(id).cloned().unwrap_or((0, None));
+                obj.insert("play_count".into(), json!(compte));
+                obj.insert("last_played_at".into(), json!(derniere));
+            }
+            v
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -2656,6 +2745,7 @@ mod tests_cache_utilisateur {
                         "Psychedelic Mongolian Trip Hop (\"Painted Yurts, Painted Souls\") AI Album"
                             .to_string(),
                     ai_generated: Some(true),
+                    explicit: None,
                     ..Default::default()
                 });
             }
@@ -4153,6 +4243,9 @@ mod youtube_decouverte_tests;
 #[cfg(test)]
 mod etat_sans_verrou_exclusif_7760_tests;
 
+#[cfg(test)]
+mod ecoutes_pistes_de_service_8062_tests;
+
 /// #6480 — `GET /streaming/{service}/albums/{id}/description` : le texte de
 /// présentation d'un album de service (cpadiou77, fil forum 2327).
 ///
@@ -4571,6 +4664,7 @@ mod tests_labels_6934 {
             released_at: None,
             release_type: None,
             ai_generated: None,
+            explicit: None,
         }
     }
 

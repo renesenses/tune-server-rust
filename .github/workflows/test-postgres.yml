@@ -229,6 +229,22 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7856 -- --nocapture --test-threads=1
 
+      # #7974 — bail d'écoute : temps écouté cumulé, budget du jour et de la
+      # semaine, remise à zéro quotidienne, sur un vrai PostgreSQL.
+      - name: Bail d'écoute du contrôle parental sur PostgreSQL (#7974)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7974 -- --nocapture --test-threads=1
+
+      # #8088 — contrôle parental : `tracks.explicit` (PG 107) sur une VRAIE
+      # base : écrit, relu, gardé hors scan, retiré par le scan, marques des
+      # pistes et albums, index partiel. Le témoin vide `tracks` : il tourne
+      # seul, dans sa propre étape.
+      - name: Contenus explicites sur PostgreSQL (#8088)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8088 -- --nocapture --test-threads=1
+
       # #7979 — un nom d'artiste corrigé dans les balises (accents ajoutés)
       # reprend la fiche, sans osciller ; un nom différent (espace ajouté)
       # obtient la sienne. Sans cette étape, l'épreuve prendrait son saut
@@ -237,6 +253,14 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7979 -- --nocapture --test-threads=1
+
+      # #8062 — écoutes des pistes de service (playlist, album) par
+      # identifiant du service, tous profils confondus. Sans cette étape, le
+      # témoin prendrait son saut annoncé.
+      - name: Écoutes des pistes de service sur PostgreSQL (#8062)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8062 -- --nocapture --test-threads=1
 
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
@@ -251,6 +275,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_group_by_strict_historique -- --nocapture --test-threads=1
+
+      # #8066 — remplacer un titre de service indisponible dans une playlist
+      # locale, à sa place (réécriture de la ligne `playlist_tracks`). Jumeau
+      # SQLite dans la suite ordinaire. Sans cette étape, l'épreuve prendrait
+      # son saut annoncé.
+      - name: Remplacement des titres indisponibles sur PostgreSQL (#8066)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test remplacer_indisponibles_8066 -- --nocapture --test-threads=1
 
       # #4956, suite — l'ordre alphabétique des listes REST paginées (artistes,
       # albums par titre et par artiste, listes de lecture) : le tri se fait en

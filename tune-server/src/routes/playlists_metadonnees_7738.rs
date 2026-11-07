@@ -12,11 +12,20 @@ use tune_core::streaming::traits::StreamTrack;
 pub(crate) struct Cache(Mutex<HashMap<String, (Instant, StreamTrack)>>);
 
 pub(super) async fn completer(state: &AppState, items: &mut [Value]) {
-    if !items.iter().any(|v| v["source"] == "qobuz") {
+    completer_service(state, items, "qobuz").await;
+    // #8066 — TIDAL : seule la disponibilité est reportée sur la ligne, pour
+    // que le client grise un titre indisponible (`disponible: false`) et
+    // propose « Remplacer l'indisponible ». Le reste de la ligne ne change
+    // pas.
+    completer_service(state, items, "tidal").await;
+}
+
+async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static str) {
+    if !items.iter().any(|v| v["source"] == nom) {
         return;
     }
     // Ne jamais tenir le registre pendant les échanges réseau.
-    let service = { state.services.lock().await.get("qobuz") };
+    let service = { state.services.lock().await.get(nom) };
     let Some(service) = service else { return };
     let service = service.read().await;
     if !service.enabled() || !service.auth_status().await.authenticated {
@@ -24,7 +33,7 @@ pub(super) async fn completer(state: &AppState, items: &mut [Value]) {
     }
     let mut ids = items
         .iter()
-        .filter(|v| v["source"] == "qobuz")
+        .filter(|v| v["source"] == nom)
         .filter_map(|v| v["source_id"].as_str().map(str::to_owned))
         .collect::<Vec<_>>();
     ids.sort();
@@ -34,7 +43,7 @@ pub(super) async fn completer(state: &AppState, items: &mut [Value]) {
         let mut cache = state.metadonnees_playlists.0.lock().await;
         cache.retain(|_, (date, _)| date.elapsed() < Duration::from_secs(300));
         ids.retain(|id| {
-            if let Some((_, piste)) = cache.get(id) {
+            if let Some((_, piste)) = cache.get(&cle(nom, id)) {
                 connus.insert(id.clone(), piste.clone());
                 false
             } else {
@@ -68,16 +77,22 @@ pub(super) async fn completer(state: &AppState, items: &mut [Value]) {
         {
             cache.remove(&ancienne);
         }
-        cache.insert(id.clone(), (Instant::now(), piste.clone()));
+        cache.insert(cle(nom, &id), (Instant::now(), piste.clone()));
         connus.insert(id, piste);
     }
     for ligne in items {
-        if ligne["source"] != "qobuz" {
+        if ligne["source"] != nom {
             continue;
         }
         let Some(piste) = ligne["source_id"].as_str().and_then(|id| connus.get(id)) else {
             continue;
         };
+        if nom != "qobuz" {
+            if let (Some(d), Some(objet)) = (piste.disponible, ligne.as_object_mut()) {
+                objet.insert("disponible".into(), serde_json::json!(d));
+            }
+            continue;
+        }
         let Ok(Value::Object(champs)) = serde_json::to_value(piste) else {
             continue;
         };
@@ -98,4 +113,10 @@ pub(super) async fn completer(state: &AppState, items: &mut [Value]) {
             }
         }
     }
+}
+
+/// La clé du cache : le service ET l'identifiant (#8066 — deux services
+/// peuvent avoir le même identifiant numérique).
+fn cle(service: &str, id: &str) -> String {
+    format!("{service}:{id}")
 }

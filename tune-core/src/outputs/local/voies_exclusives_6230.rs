@@ -199,6 +199,7 @@ impl Zone {
             spec,
             sortie: FormatOuvert::new(spec.cadence(), voies),
             needs_resample: false,
+            surechantillonneur: None,
         }
     }
 }

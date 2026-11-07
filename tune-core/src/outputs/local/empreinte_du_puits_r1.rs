@@ -135,6 +135,7 @@ pub(super) fn etage<'a>(
             .expect("format source hors du jeu fermé (0, 16, 24, 32 bits) ou sans canal"),
         sortie: FormatOuvert::new(output_sr, output_ch),
         needs_resample: output_sr != sample_rate,
+        surechantillonneur: None,
     }
 }
 

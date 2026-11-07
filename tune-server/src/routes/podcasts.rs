@@ -814,9 +814,12 @@ async fn podcast_episodes(
 async fn play_episode_en_tete_du_groupe(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    profile: crate::routes::active_profile::ActiveProfile,
     body: Json<PlayEpisodeRequest>,
 ) -> axum::response::Response {
-    let lancement = play_episode(State(state.clone()), Path(zone_id), body);
+    // #7974 — le profil du geste et la langue du refus suivent le relais.
+    let lancement = play_episode(State(state.clone()), Path(zone_id), headers, profile, body);
     crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
         &state, zone_id, lancement,
     )
@@ -826,8 +829,22 @@ async fn play_episode_en_tete_du_groupe(
 pub(super) async fn play_episode(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    profile: crate::routes::active_profile::ActiveProfile,
     Json(body): Json<PlayEpisodeRequest>,
 ) -> impl IntoResponse {
+    // #7974 — l'épisode sur une sortie réseau ne passe pas par `play()` : le
+    // bail d'écoute du profil qui le lance est demandé ici.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
+    if let Err(e) = state.orchestrator.verifier_le_bail(zone_id).await {
+        let lang = crate::i18n::lang_from_header(&headers);
+        if let Some(corps) = super::playback::corps_du_refus_parental(&e, &lang) {
+            return (StatusCode::FORBIDDEN, Json(corps));
+        }
+    }
     let title = body.title.as_deref().unwrap_or("Podcast Episode");
     let podcast_name = body.podcast_name.as_deref().unwrap_or("Podcast");
     let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
@@ -1051,6 +1068,12 @@ pub(super) async fn play_episode(
             }
         }
         if output_sent {
+            // #8085 — rien n'est décodé côté serveur sur ce chemin : sans
+            // sonde, les VU-mètres restaient à 0 pendant tout l'épisode.
+            state
+                .orchestrator
+                .sonder_les_niveaux_d_un_episode(zone_id, &body.audio_url, mime_type)
+                .await;
             let s = state.playback.get_state(zone_id).await;
             if let Some(np) = s.now_playing.as_ref() {
                 if let Err(e) = tune_core::db::listening_resume::podcast_started_in_context(
@@ -1582,6 +1605,10 @@ mod tests {
     }
 }
 
+#[path = "podcasts/reprise_par_adresse_8085.rs"]
+mod reprise_par_adresse_8085;
+pub(crate) use reprise_par_adresse_8085::{EpisodeParAdresse, jouer_l_episode_par_son_adresse};
+pub(super) use reprise_par_adresse_8085::{demande_de_reprise, jouer_et_rendre_la_zone};
 #[cfg(test)]
 #[path = "podcasts/palmares_indisponible_7778_tests.rs"]
 mod palmares_indisponible_7778_tests;
@@ -1593,6 +1620,9 @@ mod reprise_navigateur_7354_tests;
 #[path = "podcasts/historique_7965_tests.rs"]
 mod historique_7965_tests;
 
+#[cfg(test)]
+#[path = "podcasts/reprise_par_adresse_8085_tests.rs"]
+mod reprise_par_adresse_8085_tests;
 #[cfg(test)]
 #[path = "podcasts/type_de_l_episode_7894_tests.rs"]
 mod type_de_l_episode_7894_tests;

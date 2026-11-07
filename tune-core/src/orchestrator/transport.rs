@@ -314,6 +314,12 @@ impl PlaybackOrchestrator {
         // dormant auto-discovered zones filled the quota AND closes the "play a
         // few zones at a time to stay free" loophole.
         self.enforce_zone_cap(req.zone_id).await?;
+        // #7974 — le bail d'écoute d'un profil supervisé, au même point
+        // d'étranglement : hors plage ou budget épuisé, rien ne part.
+        self.verifier_le_bail(req.zone_id).await?;
+        // #8088 — un contenu marqué explicite, pour un profil dont la
+        // politique parentale le masque : rien ne part.
+        self.verifier_le_contenu_explicite(&req).await?;
 
         // Re-tap dedup (#1271): a controller (Flutter/web) can emit `play` TWICE
         // for the SAME track a few seconds apart. The first play already sent
@@ -2307,6 +2313,13 @@ impl PlaybackOrchestrator {
                     // stream sample rate so the delay line matches the DAC clock.
                     let cf_sr = media.sample_rate.unwrap_or(44100);
                     local_output.set_crossfeed(self.load_crossfeed_processor(zone_id, cf_sr));
+                    // #7614 — le greffon de suréchantillonnage de la zone :
+                    // `None` sous PURE, sans Premium, sans greffon installé,
+                    // désactivé (défaut) ou sans test de la machine. La sortie
+                    // le lit à l'ouverture de CETTE piste, jamais pendant.
+                    local_output.set_surechantillonnage(
+                        self.choix_du_surechantillonneur(zone_id, zone_audiophile),
+                    );
                     // Zone equalizer, applied by the output itself for a local
                     // DAC — exactly like the crossfeed above, and for the same
                     // reason: a local zone never goes through
@@ -3079,6 +3092,14 @@ impl PlaybackOrchestrator {
     /// #7778 (points 3 et 4) — un refus que le service oppose à CETTE piste
     /// (`no url` de Qobuz) se dit en clair : l'auditeur lisait « no url ».
     pub fn message_piste_non_demarree(geste: &str, cause: &str) -> String {
+        // #8088 — le refus du contrôle parental se dit comme tel, pas comme
+        // une indisponibilité chez le service.
+        if cause.contains(crate::db::politique_parentale::CODE_REFUS_EXPLICITE) {
+            return format!(
+                "Impossible de lire la piste {geste} : contenu marqué explicite, \
+                 interdit par le contrôle parental de ce profil"
+            );
+        }
         if crate::poller::refus_propre_a_la_piste(cause) {
             return format!(
                 "Impossible de lire la piste {geste} : {}",
@@ -3249,6 +3270,11 @@ impl PlaybackOrchestrator {
         device_id: Option<&str>,
         session_message: impl Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync,
     ) -> OutputCommandResult<()> {
+        // #7974 — mettre en pause avant la fin du bail puis reprendre après
+        // ne rouvre pas la lecture.
+        self.verifier_le_bail(zone_id)
+            .await
+            .map_err(|e| OutputCommandError::failed(OutputCommand::Resume, e))?;
         self.reprendre(zone_id, device_id, &session_message, false)
             .await
     }

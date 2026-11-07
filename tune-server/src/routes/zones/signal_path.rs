@@ -1335,6 +1335,20 @@ pub fn build_signal_path_lang(
         let apres_la_source = etapes.steps.len().min(1);
         etapes.steps.insert(apres_la_source, etape);
     }
+    // #7614 — le suréchantillonneur réglé mais écarté (PURE, non appliqué) :
+    // sa ligne, juste avant la sortie ; et son état, à la racine.
+    let surechantillonnage = etat_du_surechantillonneur_lang(
+        lang,
+        backend,
+        zone_id_courant,
+        pure,
+        output_type,
+        transformations_reelles,
+    );
+    if let Some((_, etape)) = surechantillonnage.as_ref().filter(|(_, e)| !e.is_null()) {
+        let avant_la_sortie = etapes.steps.len().saturating_sub(1);
+        etapes.steps.insert(avant_la_sortie, etape.clone());
+    }
     Some(json!({
         "bit_perfect": bit_perfect,
         // Whether the *source* is a lossless format (FLAC, ALAC, WAV, DSD, …).
@@ -1403,8 +1417,98 @@ pub fn build_signal_path_lang(
         if np.source == tune_core::streaming::spotify_lecture::SOURCE {
             annoter_la_qualite_spotify(lang, &mut v, qualite_spotify(np));
         }
+        // #7614 — clé ABSENTE quand le suréchantillonneur est désactivé.
+        if let Some((etat, _)) = surechantillonnage {
+            v["upsampling"] = etat;
+        }
         v
     })
+}
+
+/// #7614 — l'étape du greffon de suréchantillonnage quand il porte la
+/// cadence : jamais bit-perfect, filtre et réserve de niveau affichés.
+pub(super) fn etape_du_surechantillonneur_lang(
+    lang: &str,
+    de: u32,
+    vers: u32,
+    filtre: &str,
+    reserve_db: f64,
+) -> Value {
+    let khz = |hz: u32| {
+        let k = f64::from(hz) / 1000.0;
+        if k.fract() == 0.0 {
+            format!("{k:.0}")
+        } else {
+            format!("{k:.1}")
+        }
+    };
+    json!({
+        "name": "Upsampler",
+        "code": "upsampling",
+        "from_hz": de,
+        "to_hz": vers,
+        "filter": filtre,
+        "headroom_db": reserve_db,
+        "description": fs(
+            lang,
+            "upsampling",
+            &[
+                &format!("{} kHz \u{2192} {} kHz", khz(de), khz(vers)),
+                filtre,
+                &format!("{reserve_db:.2}"),
+            ],
+        ),
+        "bit_perfect": false,
+    })
+}
+
+/// #7614 — le greffon de suréchantillonnage RÉGLÉ sur la zone mais qui ne
+/// porte pas ce flux : sous PURE (« Suréchantillonnage inactif (mode PURE) »,
+/// § 7 de l'étude), ou non appliqué à cette piste (sortie, cadence, licence,
+/// test de la machine). Rien quand il est désactivé ou qu'il tourne.
+pub(super) fn etat_du_surechantillonneur_lang(
+    lang: &str,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    pure: bool,
+    output_type: &str,
+    transformations_reelles: Option<&TransformationsReelles>,
+) -> Option<(Value, Value)> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    let reglages = tune_core::audio::surechantillonnage::reglages_de_la_zone(&settings, zone_id);
+    if let Some((filtre, reserve_db)) = transformations_reelles.and_then(|t| t.surechantillonnage())
+    {
+        let t = transformations_reelles?;
+        return Some((
+            json!({
+                "active": true,
+                "from_hz": t.entree().cadence(),
+                "to_hz": t.ouvert().cadence,
+                "filter": filtre,
+                "headroom_db": reserve_db,
+            }),
+            Value::Null,
+        ));
+    }
+    if !reglages.enabled {
+        return None;
+    }
+    let (raison, cle) = if pure {
+        ("pure", "upsampling_pure")
+    } else if output_type != "local" {
+        ("output_not_supported", "upsampling_not_applied")
+    } else {
+        ("not_applied", "upsampling_not_applied")
+    };
+    Some((
+        json!({ "active": false, "reason": raison, "filter": reglages.filter }),
+        json!({
+            "name": "Upsampler",
+            "code": "upsampling",
+            "description": ts(lang, cle),
+            "bit_perfect": true,
+        }),
+    ))
 }
 
 /// #6946 — pose la raison du plafond de librespot sur l'étape Source et la
@@ -1892,7 +1996,21 @@ fn assembler_les_etapes_lang(
     // c'est elle que le client affiche « 192 → 96 kHz, pas bit-perfect », et
     // elle qui fait dire « PURE dégradé » (`pure_degraded`).
     let mut rate_conversion: Option<(u32, u32)> = None;
-    if let Some(t) = reel.filter(|t| t.reechantillonnage()) {
+    if let Some((t, (filtre, reserve_db))) = reel
+        .filter(|t| t.reechantillonnage())
+        .and_then(|t| t.surechantillonnage().map(|s| (t, s)))
+    {
+        // #7614 — c'est le greffon de suréchantillonnage qui porte la
+        // cadence : l'étape le nomme, avec son filtre et sa réserve.
+        rate_conversion = Some((t.entree().cadence(), t.ouvert().cadence));
+        steps.push(etape_du_surechantillonneur_lang(
+            lang,
+            t.entree().cadence(),
+            t.ouvert().cadence,
+            filtre,
+            reserve_db,
+        ));
+    } else if let Some(t) = reel.filter(|t| t.reechantillonnage()) {
         let src_khz = t.entree().cadence() / 1000;
         let dst_khz = t.ouvert().cadence / 1000;
         rate_conversion = Some((t.entree().cadence(), t.ouvert().cadence));

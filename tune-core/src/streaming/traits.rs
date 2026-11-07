@@ -120,6 +120,13 @@ pub struct StreamAlbum {
     /// autres services laissent `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_generated: Option<bool>,
+    /// #8088 — le service marque-t-il cet album comme EXPLICITE ? Qobuz
+    /// `parental_warning`, TIDAL `explicit` ; Spotify ne le dit que de ses
+    /// pistes. Même règle que `ai_generated` : `Some(true)` seul vaut
+    /// explicite, une absence n'est pas un marquage. Le contrôle parental
+    /// (`PolitiqueParentale::masquer_explicite`) retire ces albums des listes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -623,6 +630,20 @@ pub struct RechercheDansUnGenre {
     pub genre_filter: &'static str,
 }
 
+/// L'année et le genre d'une piste de service, quand le service les publie
+/// (#8062) : les colonnes « Year » et « Genre » du tableau d'une playlist de
+/// service restaient vides.
+///
+/// À côté de [`StreamTrack`] et non dedans : la structure se construit en
+/// littéral à près d'une centaine d'endroits, et un champ de plus les aurait
+/// tous touchés pour deux colonnes d'affichage. Un champ à `None` est une
+/// absence : la route n'écrit alors pas la clé (cellule vide).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnneeEtGenre {
+    pub year: Option<u32>,
+    pub genre: Option<String>,
+}
+
 #[async_trait::async_trait]
 pub trait StreamingService: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
@@ -717,6 +738,20 @@ pub trait StreamingService: Send + Sync {
     ) -> Result<StreamUrl, TuneError>;
     async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError>;
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
+    /// Les pistes d'un album, avec l'année et le genre de l'album quand le
+    /// service les publie (#8062) — même contrat que
+    /// [`Self::get_playlist_tracks_avec_annee_et_genre`].
+    async fn get_album_tracks_avec_annee_et_genre(
+        &self,
+        album_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
+        Ok(self
+            .get_album_tracks(album_id)
+            .await?
+            .into_iter()
+            .map(|t| (t, AnneeEtGenre::default()))
+            .collect())
+    }
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError>;
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let _ = artist_id;
@@ -780,6 +815,20 @@ pub trait StreamingService: Send + Sync {
     }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
+    /// Les pistes d'une playlist, chacune avec son année et son genre quand le
+    /// service les publie (#8062). Par défaut : [`Self::get_playlist_tracks`]
+    /// sans rien de plus — un service qui ne les connaît pas ne régresse pas.
+    async fn get_playlist_tracks_avec_annee_et_genre(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
+        Ok(self
+            .get_playlist_tracks(playlist_id)
+            .await?
+            .into_iter()
+            .map(|t| (t, AnneeEtGenre::default()))
+            .collect())
+    }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError>;
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError>;
@@ -819,6 +868,47 @@ pub trait StreamingService: Send + Sync {
     }
     fn supports_write(&self) -> bool {
         false
+    }
+
+    /// #8066 — l'utilisateur peut-il MODIFIER cette playlist du service ?
+    ///
+    /// `Some(true)` : elle est à lui ; `Some(false)` : non (suivie,
+    /// éditoriale, mix, ou service sans écriture) ; `None` : le service ne
+    /// permet pas de le dire. Seul `Some(true)` autorise une écriture.
+    ///
+    /// Par défaut : le drapeau `editable` de la playlist dans
+    /// [`Self::get_user_playlists`] (Qobuz le pose depuis
+    /// renesenses/tune-web-client#2097).
+    async fn playlist_modifiable(&self, playlist_id: &str) -> Result<Option<bool>, TuneError> {
+        if !self.supports_write() {
+            return Ok(Some(false));
+        }
+        Ok(self
+            .get_user_playlists()
+            .await?
+            .into_iter()
+            .find(|p| p.id == playlist_id)
+            .and_then(|p| p.editable))
+    }
+
+    /// #8066 — remplace, DANS la playlist du service, le titre au rang
+    /// `rang` (l'indice de [`Self::get_playlist_tracks`]) par `nouveau`, à la
+    /// même place.
+    ///
+    /// `ancien` est l'identifiant que l'appelant croit voir à ce rang : si la
+    /// playlist a changé entre-temps, rien n'est écrit et l'appel échoue.
+    /// L'implémentation relit la playlist à la fin et échoue si `nouveau`
+    /// n'est pas au rang `rang`.
+    async fn replace_playlist_track(
+        &self,
+        _playlist_id: &str,
+        _rang: usize,
+        _ancien: &str,
+        _nouveau: &str,
+    ) -> Result<(), TuneError> {
+        Err(TuneError::Unsupported(
+            "replace_playlist_track not supported by this service".into(),
+        ))
     }
 
     /// Le service sait-il SUPPRIMER une playlist chez lui ?
@@ -1247,6 +1337,7 @@ mod tests {
     fn stream_album_serialization() {
         let album = StreamAlbum {
             ai_generated: None,
+            explicit: None,
             release_type: None,
             id: "789".into(),
             title: "Kind of Blue".into(),
