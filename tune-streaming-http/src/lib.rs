@@ -2731,6 +2731,7 @@ mod tests_cache_utilisateur {
                         "Psychedelic Mongolian Trip Hop (\"Painted Yurts, Painted Souls\") AI Album"
                             .to_string(),
                     ai_generated: Some(true),
+                    explicit: None,
                     ..Default::default()
                 });
             }
@@ -4649,6 +4650,7 @@ mod tests_labels_6934 {
             released_at: None,
             release_type: None,
             ai_generated: None,
+            explicit: None,
         }
     }
 

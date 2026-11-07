@@ -2397,6 +2397,8 @@ impl QobuzService {
             // l'album, tel que `album/get` le rend (booléen). Une autre forme
             // ou l'absence : on ne conclut rien.
             ai_generated: item["ai_generated"].as_bool(),
+            // #8088 — le marquage explicite de l'album, comme celui des pistes.
+            explicit: item["parental_warning"].as_bool(),
         }
     }
 
@@ -5351,6 +5353,28 @@ mod tests {
             "ai_generated": true,
             "release_tags": [],
         })
+    }
+
+    #[test]
+    fn map_album_lit_le_marquage_explicite_de_qobuz_8088() {
+        let explicite = QobuzService::map_album(&json!({"id": "1", "parental_warning": true}));
+        assert_eq!(explicite.explicit, Some(true));
+        assert_eq!(
+            serde_json::to_value(&explicite).unwrap()["explicit"],
+            json!(true)
+        );
+        let propre = QobuzService::map_album(&json!({"id": "2", "parental_warning": false}));
+        assert_eq!(propre.explicit, Some(false));
+        let muet = QobuzService::map_album(&json!({"id": "3"}));
+        assert_eq!(muet.explicit, None);
+        assert!(
+            serde_json::to_value(&muet)
+                .unwrap()
+                .get("explicit")
+                .is_none()
+        );
+        let piste = QobuzService::map_track(&json!({"id": 4, "parental_warning": true}));
+        assert!(piste.explicit);
     }
 
     #[test]

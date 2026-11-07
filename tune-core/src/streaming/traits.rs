@@ -120,6 +120,13 @@ pub struct StreamAlbum {
     /// autres services laissent `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_generated: Option<bool>,
+    /// #8088 — le service marque-t-il cet album comme EXPLICITE ? Qobuz
+    /// `parental_warning`, TIDAL `explicit` ; Spotify ne le dit que de ses
+    /// pistes. Même règle que `ai_generated` : `Some(true)` seul vaut
+    /// explicite, une absence n'est pas un marquage. Le contrôle parental
+    /// (`PolitiqueParentale::masquer_explicite`) retire ces albums des listes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1289,6 +1296,7 @@ mod tests {
     fn stream_album_serialization() {
         let album = StreamAlbum {
             ai_generated: None,
+            explicit: None,
             release_type: None,
             id: "789".into(),
             title: "Kind of Blue".into(),

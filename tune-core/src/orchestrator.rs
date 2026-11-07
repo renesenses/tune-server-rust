@@ -2036,7 +2036,11 @@ impl PlaybackOrchestrator {
 }
 
 mod commun;
+// #8088 — contrôle parental : refus de lecture des contenus explicites.
 mod confirmation_navigateur_6066;
+pub mod contenu_explicite_8088;
+#[cfg(test)]
+mod contenu_explicite_8088_tests;
 pub mod ecoute_validee_7852;
 #[cfg(test)]
 mod ecoute_validee_7852_tests;

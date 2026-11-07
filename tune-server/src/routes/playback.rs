@@ -150,6 +150,11 @@ fn refus_bitperfect_strict(
 }
 
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
+    // #8088 — un contenu marqué explicite, refusé par la politique parentale
+    // du profil qui écoute : 403 au code stable, phrase traduite.
+    if e.contains(tune_core::db::politique_parentale::CODE_REFUS_EXPLICITE) {
+        return super::politique_parentale::refus_explicite(lang);
+    }
     // Sentinelle « plafond de zones » de orchestrator.play() → 402 traduit,
     // avec le code stable et les deux nombres. Le format est
     // `free_zone_cap:<actives>:<limite>` : la phrase se compose ICI, pas dans

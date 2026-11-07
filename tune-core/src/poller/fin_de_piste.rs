@@ -1015,6 +1015,13 @@ impl PositionPoller {
         let Some(next_pos) = Self::prochaine_position_jouable(&self.db, zone_id, zone_state) else {
             return GaplessPrep::NotArmed;
         };
+        // #8088 — armée, la suivante serait jouée par le renderer sans
+        // repasser par la garde des contenus explicites : pour un profil dont
+        // la politique les masque, rien n'est armé d'avance, la fin de piste
+        // passe par la garde.
+        if self.orchestrator.masque_l_explicite(zone_id).await {
+            return GaplessPrep::NotArmed;
+        }
 
         // L'identite de ce qu'on s'apprete a armer, lue AVANT de le resoudre :
         // une ligne de file, pas une position (#3026). C'est la seule trace de

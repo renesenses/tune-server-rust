@@ -390,6 +390,9 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // #6332 — le débit moyen du fichier (PG 094). Ici AUSSI, même raison que
     // `rating` : l'INSERT et l'UPDATE des pistes le NOMMENT.
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bitrate_kbps BIGINT",
+    // #8088 — le marquage explicite de la balise (PG 107). Ici AUSSI, même
+    // raison que `rating` : l'INSERT et l'UPDATE des pistes le NOMMENT.
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS explicit BIGINT",
     // #7619 (L1) — la clé de tri de la vue des pistes, sans numéro de
     // migration (passe rejouée au démarrage). `COLLATE "C"` : l'ordre des
     // octets, celui de SQLite. L'index JUSTE APRÈS la colonne.
