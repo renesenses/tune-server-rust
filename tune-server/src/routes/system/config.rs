@@ -606,11 +606,18 @@ pub(super) async fn get_config(
     // MACHINE : « Rapide » dépend des cœurs, et l'écran doit le dire plutôt
     // que de promettre quatre pistes à un double cœur.
     {
-        use tune_core::taches_de_fond::vitesse::{Vitesse, coeurs};
-        let n = coeurs();
+        use tune_core::taches_de_fond::vitesse::{
+            Vitesse, coeurs, largeur_sur_la_machine, memoire_totale,
+        };
+        let (n, memoire) = (coeurs(), memoire_totale());
         let largeurs: serde_json::Map<String, Value> = Vitesse::TOUTES
             .into_iter()
-            .map(|v| (v.id().to_string(), json!(v.largeur(n))))
+            .map(|v| {
+                (
+                    v.id().to_string(),
+                    json!(largeur_sur_la_machine(v, n, memoire)),
+                )
+            })
             .collect();
         config.insert(
             "background_analysis_speed_widths".to_string(),
@@ -6216,7 +6223,9 @@ mod vitesse_des_analyses_5519_tests {
     use axum::extract::State;
     use axum::http::HeaderMap;
     use serde_json::{Value, json};
-    use tune_core::taches_de_fond::vitesse::{CLE_REGLAGE, Vitesse, coeurs};
+    use tune_core::taches_de_fond::vitesse::{
+        CLE_REGLAGE, Vitesse, coeurs, largeur_sur_la_machine, memoire_totale,
+    };
 
     /// #5519 — le réglage est publié avec son défaut `normal`, avec la largeur
     /// réelle de chaque vitesse sur cette machine.
@@ -6236,7 +6245,11 @@ mod vitesse_des_analyses_5519_tests {
         assert_eq!(largeurs["discreet"], 1);
         assert_eq!(
             largeurs["normal"],
-            json!(Vitesse::Normale.largeur(coeurs()))
+            json!(largeur_sur_la_machine(
+                Vitesse::Normale,
+                coeurs(),
+                memoire_totale()
+            ))
         );
         assert_eq!(largeurs["fast"], json!(Vitesse::Rapide.largeur(coeurs())));
     }

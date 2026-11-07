@@ -2927,6 +2927,8 @@ fn spawn_replaygain_analysis(state: &AppState) {
     // `tune-core` et ne connaît pas l'API : c'est le démarrage du serveur qui
     // lui dépose le bus, comme il le fait pour l'orchestrateur.
     tune_core::audio::replaygain::progression::brancher_le_bus(state.event_bus.clone());
+    // #7915 — l'avancement des empreintes et de la plage dynamique.
+    tune_core::taches_de_fond::avancement::brancher_le_bus(state.event_bus.clone());
     tune_core::audio::replaygain::spawn(state.backend.clone());
     // #5882 — une remesure demandée avant un arrêt reprend où elle en était.
     tune_core::audio::replaygain::remesure::reprendre_si_demandee(state.backend.clone());
