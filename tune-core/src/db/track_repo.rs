@@ -4915,9 +4915,43 @@ impl TrackRepo {
 }
 
 /// #7619 (L3) — le rang de `COUNT(*) OVER ()` dans
-/// [`sql::search_avec_total`] : juste après les 36 colonnes de
-/// [`sql::select_track`] (0 à 35).
-const COLONNE_DU_TOTAL: usize = 36;
+/// [`sql::search_avec_total`] : juste après les 37 colonnes de
+/// [`sql::select_track`] (0 à 36, `t.explicit` de #8088 compris).
+/// Le témoin `colonne_du_total_suit_select_track` recompte les colonnes :
+/// une colonne ajoutée à `select_track` sans toucher ce rang le fait rougir.
+const COLONNE_DU_TOTAL: usize = 37;
+
+#[cfg(test)]
+mod colonne_du_total_tests {
+    /// Compte les colonnes d'une projection `SELECT a, f(b, c), d FROM …`
+    /// au premier niveau de parenthèses.
+    fn colonnes_projetees(sql: &str) -> usize {
+        let debut = sql.find("SELECT ").expect("SELECT") + "SELECT ".len();
+        let fin = sql.find(" FROM ").expect("FROM");
+        let mut profondeur = 0i32;
+        let mut n = 1;
+        for c in sql[debut..fin].chars() {
+            match c {
+                '(' => profondeur += 1,
+                ')' => profondeur -= 1,
+                ',' if profondeur == 0 => n += 1,
+                _ => {}
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn colonne_du_total_suit_select_track() {
+        let n = colonnes_projetees(&super::sql::select_track());
+        assert_eq!(
+            super::COLONNE_DU_TOTAL,
+            n,
+            "COLONNE_DU_TOTAL doit valoir le nombre de colonnes de select_track ({n}) : \
+             sinon le total de la recherche lit une autre colonne et retombe à 0"
+        );
+    }
+}
 
 fn row_to_track(cols: &[SqlValue]) -> Track {
     Track {
