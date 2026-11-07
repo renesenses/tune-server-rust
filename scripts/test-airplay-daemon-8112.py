@@ -36,14 +36,14 @@ class AirplayDaemon8112(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/docker.yml").read_text()
         self.assertNotIn("touch dist/arm64/airplay-daemon", workflow,
                          "Docker arm64 livre encore un airplay-daemon VIDE (#8112)")
-        helper = step(workflow, "scripts/build-airplay-daemon.py")
+        helper = step(workflow, "python scripts/build-airplay-daemon.py")
         for target in ("aarch64-unknown-linux-gnu --cross", "x86_64-unknown-linux-gnu"):
             self.assertIn(target, helper, f"Docker : airplay-daemon absent pour {target}")
         self.assertIn("ARM aarch64", helper, "Docker : l'ELF arm64 n'est pas verifie")
 
     def test_release_builds_the_daemon_on_cross_targets_and_fails_loudly(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        helper = step(workflow, "scripts/build-airplay-daemon.py")
+        helper = step(workflow, "python scripts/build-airplay-daemon.py")
         self.assertTrue(helper, "release.yml ne construit plus airplay-daemon")
         self.assertNotRegex(helper.split("run: |")[0], r"\n\s+if:",
                             "airplay-daemon exclut encore des cibles livrees (ARM sautees, #8112)")
