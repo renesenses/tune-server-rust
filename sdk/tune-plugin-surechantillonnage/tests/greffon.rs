@@ -2,7 +2,10 @@
 use serde_json::json;
 use tune_plugin_sdk::{Error, Settings, audio::*};
 use tune_plugin_surechantillonnage::conception::par_id;
+use tune_plugin_audio_support::limiteur::{PLAFOND, SEUIL};
+use tune_plugin_sdk::rate::{RateChanger, RateRequest};
 use tune_plugin_surechantillonnage::sdk::{
+    Instance, RESERVE_DB, l1_bound_db,
     OFFERED_FILTERS, Upsampler, choose_rate, choose_rate_for, headroom_db, headroom_gain,
     machine_reference_pair, settings as parse_settings, worst_case_gain,
 };
@@ -242,12 +245,86 @@ fn worst_case_full_scale_input_never_exceeds_full_scale() {
         let input: Vec<f32> = mono.iter().flat_map(|&x| [x, -x]).collect();
         let out = render(filter, json!({}), 44_100, &input);
         let p = peak(&out);
-        assert!(p <= 1.0, "{filter}: peak {p} above full scale");
-        if g > 1.0 {
-            assert!(
-                p > 0.999,
-                "{filter}: the worst case should reach full scale (peak {p}, bound {g})"
+        // Bertrand, 07/11 : réserve ≈ 3 dB + limiteur. Sans limiteur, ce
+        // signal sortirait à `g × réserve` (> 1 pour tous les filtres) ;
+        // avec lui, la crête reste sous le plafond du limiteur.
+        let sans_limiteur = g * headroom_gain(filter, 8).unwrap();
+        assert!(sans_limiteur > 1.0, "{filter}: {sans_limiteur}");
+        assert!(
+            f64::from(p) <= PLAFOND + 1e-6,
+            "{filter}: peak {p} above the limiter ceiling (would be {sans_limiteur:.3} without it)"
+        );
+        println!("pire cas {filter} ×8 : sans limiteur {sans_limiteur:.3}, avec {p:.4}");
+    }
+}
+
+/// Bertrand, 07/11 : sur une musique typique — un mélange de six partiels,
+/// masterisé jusqu'à 0 dBFS en crête d'échantillon — le limiteur ne fait
+/// RIEN : la réserve de 3 dB absorbe les crêtes entre les échantillons.
+#[test]
+fn typical_music_never_wakes_the_limiter() {
+    let partiels = [
+        (55.0, 0.50, 0.3),
+        (220.0, 0.40, 1.1),
+        (880.0, 0.30, 2.0),
+        (2_500.0, 0.20, 0.7),
+        (6_000.0, 0.15, 2.9),
+        (12_000.0, 0.10, 1.7),
+    ];
+    let trames = 44_100;
+    let brut: Vec<f64> = (0..trames)
+        .map(|n| {
+            let t = n as f64 / 44_100.0;
+            partiels
+                .iter()
+                .map(|(f, a, ph)| a * (std::f64::consts::TAU * f * t + ph).sin())
+                .sum::<f64>()
+        })
+        .collect();
+    let crete = brut.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    for niveau in [0.891f64, 1.0] {
+        let entree: Vec<f32> = brut
+            .iter()
+            .map(|x| (x / crete * niveau) as f32)
+            .flat_map(|x| [x, x])
+            .collect();
+        for filter in OFFERED_FILTERS {
+            let request = RateRequest::new(stereo(44_100), 352_800, 1024).unwrap();
+            let mut inst = Instance::new(request, filter).unwrap();
+            let mut sortie = vec![0f32; request.max_output_frames() * 2];
+            let mut haut = 0.0f32;
+            for bloc in entree.chunks(2048) {
+                let mut a = bloc.to_vec();
+                let n = a.len() / 2;
+                let input = AudioBlock::new(stereo(44_100), SamplesMut::F32(&mut a), 1024).unwrap();
+                let cap = sortie.len() / 2;
+                let mut output = AudioBlock::new(
+                    inst.output_format(),
+                    SamplesMut::F32(&mut sortie[..]),
+                    cap,
+                )
+                .unwrap();
+                let r = inst
+                    .process(
+                        &input,
+                        &mut output,
+                        BlockContext {
+                            zone_id: 0,
+                            generation: 0,
+                            position_frames: 0,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(r.frames_written, 8 * n);
+                haut = haut.max(peak(&sortie[..r.frames_written * 2]));
+            }
+            let c = inst.limiter_counter();
+            println!("musique {niveau} {filter} : crête {haut:.4}, trames limitées {}", c.trames_limitees);
+            assert_eq!(
+                c.trames_limitees, 0,
+                "{filter} à {niveau} : le limiteur a agi sur une musique typique (crête {haut})"
             );
+            assert!(f64::from(haut) < SEUIL, "{filter}: {haut}");
         }
     }
 }
@@ -327,9 +404,10 @@ fn headroom_is_a_drop_never_a_gain() {
     for filter in OFFERED_FILTERS {
         for ratio in [2u32, 4, 8, 16] {
             let db = headroom_db(filter, ratio).unwrap();
-            println!("headroom {filter} x{ratio}: {db:.3} dB");
+            let l1 = l1_bound_db(filter, ratio).unwrap();
+            println!("headroom {filter} x{ratio}: {db:.3} dB (borne L1 {l1:.3} dB)");
             assert!(db <= 0.0, "{filter} ×{ratio}: {db} dB");
-            assert!(db > -20.0, "{filter} ×{ratio}: {db} dB is implausible");
+            assert!(db >= RESERVE_DB - 0.01, "{filter} ×{ratio}: {db} dB, more than the 3 dB reserve");
         }
     }
     assert!(headroom_gain("precision-longue", 8).is_none());

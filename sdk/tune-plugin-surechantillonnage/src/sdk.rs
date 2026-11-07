@@ -20,6 +20,7 @@
 use crate::conception::{self, Conception};
 use crate::polyphase::Surechantillonneur;
 use serde::{Deserialize, Serialize};
+use tune_plugin_audio_support::limiteur::{CompteurDuLimiteur, Limiteur};
 use tune_plugin_sdk::audio::*;
 use tune_plugin_sdk::rate::*;
 use tune_plugin_sdk::{Error, Settings};
@@ -112,30 +113,43 @@ pub fn worst_case_gain(kernel: &[f64], l: usize) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// Safety factor between the exact L1 bound and the gain applied: it covers
-/// the f64 rounding of the dot product, so that `|out| ≤ max |in|` holds
-/// sample by sample (choice of Bertrand, 07/11: like the equalizer's Safe
-/// mode, no clipping is possible).
-const HEADROOM_SAFETY: f64 = 1.0 - 1e-9;
+/// The fixed level reserve, in dB (Bertrand, 07/11, second decision): about
+/// 3 dB, the inter-sample over of the classic worst musical case (fs/4 at
+/// 45°, +3.01 dB). The L1 bound of the polyphase (5.7 to 16.5 dB depending on
+/// the filter) is NOT applied any more: the safety limiter of the
+/// equalizer's Realistic mode (`tune_plugin_audio_support::limiteur`) takes
+/// the rarer, larger transients instead.
+pub const RESERVE_DB: f64 = -3.0;
 
-/// The gain the stage applies for `filter` at integer ratio `ratio`:
-/// `1 / max(1, worst_case_gain)`. Never above 1: the upsampler never raises
+/// The gain the stage applies before its limiter, for `filter` at integer
+/// ratio `ratio`: [`RESERVE_DB`], or less attenuation when the L1 bound of
+/// the polyphase itself is smaller. Never above 1: the upsampler never raises
 /// the level.
 pub fn headroom_gain(filter: &str, ratio: u32) -> Option<f64> {
+    l1_kernel(filter, ratio).map(|(kernel, l)| reserve_from_kernel(&kernel, l))
+}
+
+fn l1_kernel(filter: &str, ratio: u32) -> Option<(Vec<f64>, usize)> {
     if !OFFERED_FILTERS.contains(&filter) || !(2..=MAX_INTEGER_RATIO).contains(&ratio) {
         return None;
     }
-    let kernel = conception::par_id(filter)?.noyau(ratio as usize);
-    Some(headroom_from_kernel(&kernel, ratio as usize))
+    Some((conception::par_id(filter)?.noyau(ratio as usize), ratio as usize))
 }
 
-fn headroom_from_kernel(kernel: &[f64], l: usize) -> f64 {
-    HEADROOM_SAFETY / worst_case_gain(kernel, l).max(1.0)
+fn reserve_from_kernel(kernel: &[f64], l: usize) -> f64 {
+    let l1 = 1.0 / worst_case_gain(kernel, l).max(1.0);
+    l1.max(10f64.powf(RESERVE_DB / 20.0))
 }
 
 /// [`headroom_gain`] in dB (≤ 0).
 pub fn headroom_db(filter: &str, ratio: u32) -> Option<f64> {
     headroom_gain(filter, ratio).map(|g| 20.0 * g.log10())
+}
+
+/// The reserve the L1 bound alone would need (the first decision of 07/11),
+/// in dB, for comparison only.
+pub fn l1_bound_db(filter: &str, ratio: u32) -> Option<f64> {
+    l1_kernel(filter, ratio).map(|(kernel, l)| -20.0 * worst_case_gain(&kernel, l).max(1.0).log10())
 }
 
 /// The reference pair of the machine test (`machine::RAPPORTS`) whose
@@ -230,9 +244,12 @@ pub struct Instance {
     ratio: usize,
     channels: usize,
     latency: u32,
-    /// [`headroom_gain`], fixed for the life of the instance: the level
-    /// never moves within a stream.
+    /// [`headroom_gain`], fixed for the life of the instance.
     gain: f64,
+    /// The equalizer's safety limiter (Realistic mode), at the output rate:
+    /// exactly 1 below −0.2 dBFS, a linked gain above, never past
+    /// −0.01 dBFS. Zero latency.
+    limiter: Limiteur,
     input_f64: Vec<f64>,
     output_f64: Vec<f64>,
     /// Output frames still owed by `drain`.
@@ -267,7 +284,7 @@ impl Instance {
             .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
             .map_or(0, |(i, _)| i);
         let latency = u32::try_from(peak).map_err(|_| Error::UnsupportedFormat)?;
-        let gain = headroom_from_kernel(engine.noyau_etage1(), ratio);
+        let gain = reserve_from_kernel(engine.noyau_etage1(), ratio);
         let max_in = request.max_input_frames;
         Ok(Self {
             conception,
@@ -276,6 +293,7 @@ impl Instance {
             channels,
             latency,
             gain,
+            limiter: Limiteur::new(vers),
             input_f64: vec![0.0; max_in * channels],
             output_f64: Vec::with_capacity(max_in * ratio * channels),
             tail_left: u64::from(latency),
@@ -294,19 +312,37 @@ impl Instance {
         self.gain
     }
 
-    fn write_out(&self, from: usize, frames: usize, output: &mut AudioBlock<'_>) {
+    /// What the limiter did since the stream opened (or the last reset).
+    pub fn limiter_counter(&self) -> CompteurDuLimiteur {
+        self.limiter.compteur()
+    }
+
+    /// Reserve, then the linked limiter, frame by frame. With an attack in
+    /// one sample, `|out| ≤ courbe(e) < PLAFOND` for every frame.
+    fn write_out(&mut self, from: usize, frames: usize, output: &mut AudioBlock<'_>) {
         let ch = self.channels;
         let src = &self.output_f64[from * ch..(from + frames) * ch];
         let g = self.gain;
+        let limiter = &mut self.limiter;
+        let mut frame_gain = |frame: &[f64]| {
+            let crete = frame.iter().fold(0.0f64, |m, s| m.max((s * g).abs()));
+            g * limiter.gain(crete)
+        };
         match output.samples_mut() {
             SamplesMut::F32(dst) => {
-                for (d, s) in dst[..frames * ch].iter_mut().zip(src) {
-                    *d = (*s * g) as f32;
+                for (d, s) in dst[..frames * ch].chunks_exact_mut(ch).zip(src.chunks_exact(ch)) {
+                    let k = frame_gain(s);
+                    for (d, s) in d.iter_mut().zip(s) {
+                        *d = (*s * k) as f32;
+                    }
                 }
             }
             SamplesMut::F64(dst) => {
-                for (d, s) in dst[..frames * ch].iter_mut().zip(src) {
-                    *d = *s * g;
+                for (d, s) in dst[..frames * ch].chunks_exact_mut(ch).zip(src.chunks_exact(ch)) {
+                    let k = frame_gain(s);
+                    for (d, s) in d.iter_mut().zip(s) {
+                        *d = *s * k;
+                    }
                 }
             }
             _ => unreachable!("encoding checked in Instance::new"),
@@ -379,6 +415,7 @@ impl RateChanger for Instance {
         if let Ok(engine) = Surechantillonneur::nouveau(&self.conception, de, vers, self.channels) {
             self.engine = engine;
         }
+        self.limiter.oublier();
         self.tail_left = u64::from(self.latency);
         self.pending = 0;
         self.pending_offset = 0;
@@ -427,6 +464,8 @@ impl RateChanger for Instance {
             "latency_output_frames": self.latency,
             "latency_ms": f64::from(self.latency) * 1000.0 / f64::from(self.request.output_rate),
             "headroom_db": 20.0 * self.gain.log10(),
+            "limited_frames": self.limiter.compteur().trames_limitees,
+            "limiter_max_reduction_db": self.limiter.compteur().reduction_max_db,
         })
     }
 }

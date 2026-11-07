@@ -5411,22 +5411,23 @@ impl Etage for EtageDeConversion<'_> {
     /// gapless qui change de cadence ; à cadence identique le rééchantillonneur
     /// fait partie du flux continu et ne se vide pas.
     fn vider(&mut self, puits: &mut (dyn PuitsDEchantillons + '_)) -> bool {
-        if let Some(etage) = self
+        // #7614 — quand le greffon porte la cadence, la queue est celle de
+        // son noyau (exactement son délai) ; sinon celle de rubato. Un seul
+        // `livrer` dans les deux cas (garde REF-7 de #3233).
+        let flushed = match self
             .surechantillonneur
             .as_mut()
             .and_then(|s| s.etage.as_mut())
         {
-            // #7614 — la queue du noyau : exactement son délai.
-            let queue = etage.vider();
-            return queue.is_empty() || Self::livrer(puits, &queue);
-        }
-        let flushed = rubato_resample_chunk(
-            &mut self.resampler,
-            &[],
-            self.sortie.canaux,
-            true,
-            &mut self.resample_leftover,
-        );
+            Some(etage) => etage.vider(),
+            None => rubato_resample_chunk(
+                &mut self.resampler,
+                &[],
+                self.sortie.canaux,
+                true,
+                &mut self.resample_leftover,
+            ),
+        };
         if flushed.is_empty() {
             return true;
         }

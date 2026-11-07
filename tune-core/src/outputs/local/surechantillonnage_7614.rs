@@ -148,16 +148,15 @@ fn active_la_cadence_est_portee_sans_crete_et_declaree() {
         .fold(0.0f32, |m, x| m.max(x.abs()));
     // fs/4 à 45° : +3 dB entre les échantillons sans réserve.
     assert!(crete <= 1.0, "crête {crete} au-dessus de la pleine échelle");
-    // La reconstruction de fs/4 à 45° vaut 1,414 × la réserve du filtre :
-    // ni plus (écrêtage), ni moins (réserve appliquée deux fois).
-    let attendu = 1.414
-        * 10f64.powf(
-            crate::audio::surechantillonnage::greffon::headroom_db("polyvalent", 8).unwrap() / 20.0,
-        );
+    // Bertrand, 07/11 : réserve de 3 dB + limiteur du mode Réaliste de
+    // l'égaliseur. La reconstruction de fs/4 à 45° vaut 1,414 × 0,708 ≈
+    // 1,0005 : le limiteur la ramène sous son plafond (−0,01 dBFS), et le
+    // niveau reste celui de la lecture normale (pas 8,5 dB plus bas).
     assert!(
-        (f64::from(crete) - attendu).abs() < 0.02,
-        "crête {crete} : attendu {attendu:.3} (1,414 × réserve)"
+        f64::from(crete) <= tune_plugin_audio_support::limiteur::PLAFOND + 1e-6,
+        "crête {crete} au-dessus du plafond du limiteur"
     );
+    assert!(crete > 0.97, "crête {crete} : le niveau est trop bas");
     let t = e.transformations();
     assert!(t.reechantillonnage());
     let (filtre, reserve) = t.surechantillonnage().expect("déclaré au chemin du signal");

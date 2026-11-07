@@ -15,9 +15,11 @@
 //! - **DoP** : écarté à l'ouverture par la sortie (l'amorce le dit) ;
 //! - **test de la machine** : sans verdict, ou pour un filtre que la machine
 //!   ne tient pas à × 3 le temps réel, rien n'est appliqué ;
-//! - **niveau** : réserve par filtre sur la norme L1 du polyphase
-//!   (`headroom_gain`), constante pour la vie de l'étage — aucun écrêtage
-//!   possible, et le niveau ne bouge jamais pendant une piste ;
+//! - **niveau** : réserve fixe de 3 dB (`RESERVE_DB`, moins si la borne L1
+//!   du polyphase le permet), puis le limiteur de sécurité du mode Réaliste
+//!   de l'égaliseur (`tune_plugin_audio_support::limiteur`, inactif sous
+//!   −0,2 dBFS, plafond −0,01 dBFS) : aucun écrêtage, et le niveau reste
+//!   proche de la lecture normale (décision de Bertrand du 07/11) ;
 //! - **à la piste suivante** : l'étage garde les réglages de son ouverture ;
 //!   un changement (activation, désactivation, filtre, PURE) ne prend effet
 //!   qu'à la frontière suivante, où la sortie est rouverte.

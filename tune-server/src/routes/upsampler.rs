@@ -55,6 +55,8 @@ pub(crate) fn filtres() -> Value {
                 .collect();
             json!({
                 "id": id,
+                // #7614 — réserve fixe + limiteur du mode Réaliste de l'égaliseur.
+                "limiter": "realistic",
                 "minimum_phase": id.ends_with("-pm"),
                 "default": *id == greffon::DEFAULT_FILTER,
                 "headroom_db": reserves,
