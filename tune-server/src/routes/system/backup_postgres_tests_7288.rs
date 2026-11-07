@@ -13,7 +13,7 @@ use axum::response::Response;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use super::sauvegarder_postgres;
+use super::{restauration_postgres_a_faire_a_la_main, sauvegarder_postgres};
 
 const URL: &str = "postgres://tune:secret@db.example:5432/tune";
 
@@ -98,6 +98,32 @@ async fn sans_url_postgres_la_route_le_dit_7288() {
     .await;
     assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(json["code"], "database_url_missing");
+}
+
+/// « Restore » sur PostgreSQL : la réponse dit comment remettre le dump, et
+/// non plus que les sauvegardes seraient réservées à SQLite.
+#[tokio::test]
+async fn restaurer_sur_postgres_donne_la_commande_pg_restore_7288() {
+    let (statut, json) = corps(restauration_postgres_a_faire_a_la_main(
+        "tune_pg_20261107_120000.dump",
+    ))
+    .await;
+
+    assert_eq!(statut, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(json["code"], "restore_with_pg_restore");
+    let message = json["error"].as_str().unwrap();
+    assert!(
+        message.contains("tune_pg_20261107_120000.dump"),
+        "{message}"
+    );
+    assert!(!message.contains("SQLite-only"), "{message}");
+    assert!(
+        json["restore_hint"]
+            .as_str()
+            .unwrap()
+            .starts_with("pg_restore"),
+        "{json}"
+    );
 }
 
 /// Témoin SQLite : la route copie toujours le fichier de base, sans pg_dump.

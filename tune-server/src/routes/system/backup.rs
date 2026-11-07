@@ -10,7 +10,8 @@ use crate::state::AppState;
 
 /// The restore and encrypted-backup routes copy the **SQLite file** at
 /// `config.db_path`; `create_backup` and `list_backups` handle PostgreSQL
-/// with `pg_dump` instead (#7288).
+/// with `pg_dump` instead, and `restore_backup` answers with the
+/// `pg_restore` command (#7288).
 ///
 /// In PostgreSQL mode that file is not the live database — it may be stale or
 /// absent entirely, since the server no longer opens it. Backing it up would
@@ -47,6 +48,31 @@ fn dossier_des_sauvegardes(db_path: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("backups"))
 }
 
+/// Comment remettre un dump fait par « Create backup » sur PostgreSQL.
+const RESTAURER_UN_DUMP: &str =
+    "pg_restore --clean --if-exists --no-owner --dbname <TUNE_DATABASE_URL> <file>";
+
+/// « Restore » sur PostgreSQL : la liste montre les dumps de « Create backup »
+/// (#7288), que le serveur ne remet pas lui-même (#4983). La réponse le dit et
+/// donne la commande, au lieu du refus « SQLite-only » qui contredisait la
+/// sauvegarde qu'on venait de faire.
+fn restauration_postgres_a_faire_a_la_main(filename: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": format!(
+                "this server runs on PostgreSQL: restoring {filename} from Tune is not \
+                 supported yet. Stop Tune, then restore the file with pg_restore \
+                 (see restore_hint) and start Tune again."
+            ),
+            "code": "restore_with_pg_restore",
+            "engine": "postgres",
+            "restore_hint": RESTAURER_UN_DUMP,
+        })),
+    )
+        .into_response()
+}
+
 /// « Create backup » sur PostgreSQL (#7288) : un `pg_dump` de la base réelle
 /// dans le dossier `backups`, au lieu de l'ancien refus 400. Séparé du
 /// handler pour être testé sans serveur PostgreSQL, avec un faux `pg_dump`.
@@ -76,7 +102,7 @@ async fn sauvegarder_postgres(
             "size": info.size,
             "created_at": info.created_at,
             "engine": "postgres",
-            "restore_hint": "pg_restore --clean --if-exists --no-owner --dbname <TUNE_DATABASE_URL> <file>",
+            "restore_hint": RESTAURER_UN_DUMP,
         }))
         .into_response(),
         Ok(Err(e)) => (
@@ -137,6 +163,9 @@ pub(super) async fn restore_backup(
     State(state): State<AppState>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if state.db.is_none() {
+        return restauration_postgres_a_faire_a_la_main(&filename);
+    }
     let db_path = match require_sqlite_store(&state) {
         Ok(p) => p,
         Err(resp) => return resp,

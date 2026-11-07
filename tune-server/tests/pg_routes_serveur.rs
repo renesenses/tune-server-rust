@@ -418,6 +418,7 @@ async fn pg_7288_creer_une_sauvegarde_sur_postgresql() {
     );
 
     let liste = app
+        .clone()
         .oneshot(
             Request::get("/api/v1/system/backups")
                 .body(Body::empty())
@@ -430,4 +431,26 @@ async fn pg_7288_creer_une_sauvegarde_sur_postgresql() {
         .unwrap();
     let liste: serde_json::Value = serde_json::from_slice(&corps).unwrap();
     assert_eq!(liste[0]["filename"], nom.as_str(), "{liste}");
+
+    // « Restore » sur ce dump : la réponse donne la commande pg_restore, pas
+    // l'ancien refus « SQLite-only » qui contredisait la sauvegarde.
+    let restauration = app
+        .oneshot(
+            Request::post(format!("/api/v1/system/backups/{nom}/restore"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let corps = axum::body::to_bytes(restauration.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&corps).unwrap_or_default();
+    assert_eq!(json["code"], "restore_with_pg_restore", "{json}");
+    assert!(
+        json["restore_hint"]
+            .as_str()
+            .is_some_and(|h| h.starts_with("pg_restore")),
+        "{json}"
+    );
 }
