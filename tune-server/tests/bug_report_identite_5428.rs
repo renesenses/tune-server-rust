@@ -16,6 +16,16 @@
 //!    quand même (200) — pas de 412, contrairement au support ;
 //! 4. avec des captures (multipart), l'en-tête d'identité part aussi.
 //!
+//! # #7920 — la clé de licence part aussi avec le jeton
+//!
+//! Avant, seul le premier identifiant partait : un jeton de compte, même
+//! expiré, faisait disparaître la clé de licence du rapport. Désormais :
+//!
+//! 5. jeton ET licence : `Authorization` ET `X-License-Key` partent ensemble ;
+//! 6. jeton expiré + licence : le faux site refuse le jeton seul (401) mais
+//!    accepte le rapport quand la clé l'accompagne — le rapport passe ;
+//! 7. un journal joint (multipart) porte aussi les deux identités.
+//!
 //! ⚠️ `tune-server` porte `autotests = false` : ce fichier n'est compilé que
 //! parce qu'il est déclaré en cible `[[test]]` dans `tune-server/Cargo.toml`.
 
@@ -38,6 +48,10 @@ struct Recu {
     license_key: Option<String>,
     fingerprint: Option<String>,
 }
+
+/// Le jeton que le faux site tient pour expiré : seul, il vaut 401 ; avec une
+/// clé de licence, le site identifie le rapport par la licence.
+const JETON_EXPIRE: &str = "jeton-expire";
 
 struct FauxSite {
     base: String,
@@ -65,16 +79,29 @@ async fn faux_site() -> FauxSite {
                             .and_then(|v| v.to_str().ok())
                             .map(str::to_string)
                     };
-                    *d.lock().await = Recu {
+                    let recu = Recu {
                         content_type: lire("content-type").unwrap_or_default(),
                         authorization: lire("authorization"),
                         license_key: lire("x-license-key"),
                         fingerprint: lire("x-hardware-fingerprint"),
                     };
-                    axum::Json(json!({
-                        "status": "submitted",
-                        "thread": { "id": 7, "slug": "bug-essai", "url": "https://exemple/forum/threads/bug-essai" },
-                    }))
+                    let jeton_expire_seul = recu.authorization.as_deref()
+                        == Some(&format!("Bearer {JETON_EXPIRE}"))
+                        && recu.license_key.is_none();
+                    *d.lock().await = recu;
+                    if jeton_expire_seul {
+                        return (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            axum::Json(json!({ "message": "Unauthenticated." })),
+                        );
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({
+                            "status": "submitted",
+                            "thread": { "id": 7, "slug": "bug-essai", "url": "https://exemple/forum/threads/bug-essai" },
+                        })),
+                    )
                 }
             },
         ),
@@ -156,28 +183,64 @@ async fn avec_un_jeton_sso_le_rapport_porte_le_bearer() {
     assert_eq!(recu.license_key, None, "le jeton prime sur la licence");
 }
 
-/// Le jeton prime sur la licence, exactement comme pour le support.
+/// #7920 — jeton ET licence : les deux en-têtes partent, aucun n'écrase
+/// l'autre. Avant, le jeton seul partait et la licence disparaissait.
 #[tokio::test]
-async fn le_jeton_prime_sur_la_licence() {
+async fn avec_jeton_et_licence_les_deux_partent_7920() {
     let site = faux_site().await;
     let app = app(
         &site.base,
         &[
             ("mozaik_access_token", "jeton-sso-essai"),
             ("license_key", "TUNE-CLE-ESSAI"),
+            ("hardware_fingerprint", "empreinte-essai"),
         ],
     );
 
-    let (code, _) = poster_json(&app).await;
+    let (code, reponse) = poster_json(&app).await;
 
-    assert_eq!(code, StatusCode::OK);
+    assert_eq!(code, StatusCode::OK, "réponse : {reponse}");
     let recu = site.dernier.lock().await;
     assert_eq!(
         recu.authorization.as_deref(),
         Some("Bearer jeton-sso-essai")
     );
-    assert_eq!(recu.license_key, None);
-    assert_eq!(recu.fingerprint, None);
+    assert_eq!(
+        recu.license_key.as_deref(),
+        Some("TUNE-CLE-ESSAI"),
+        "#7920 : la clé de licence enregistrée doit partir AVEC le jeton de \
+         compte, pas seulement à sa place"
+    );
+    assert_eq!(recu.fingerprint.as_deref(), Some("empreinte-essai"));
+}
+
+/// #7920 — le cas du terrain : un jeton de compte expiré ne masque plus la
+/// licence. Le faux site refuse ce jeton seul ; avec la clé, il accepte.
+#[tokio::test]
+async fn un_jeton_expire_ne_masque_plus_la_licence_7920() {
+    let site = faux_site().await;
+    let app = app(
+        &site.base,
+        &[
+            ("mozaik_access_token", JETON_EXPIRE),
+            ("license_key", "TUNE-CLE-ESSAI"),
+        ],
+    );
+
+    let (code, reponse) = poster_json(&app).await;
+
+    let recu = site.dernier.lock().await;
+    assert_eq!(
+        recu.license_key.as_deref(),
+        Some("TUNE-CLE-ESSAI"),
+        "#7920 : avec un jeton expiré, la clé de licence doit quand même partir"
+    );
+    assert_eq!(
+        code,
+        StatusCode::OK,
+        "#7920 : un jeton expiré ne doit plus faire refuser le rapport d'un \
+         serveur sous licence : {reponse}"
+    );
 }
 
 // --- 2 : licence seule --------------------------------------------------
@@ -267,4 +330,45 @@ async fn avec_des_captures_le_multipart_porte_aussi_l_identite() {
         Some("Bearer jeton-sso-essai"),
         "la branche multipart doit porter la même identité que la branche JSON"
     );
+}
+
+/// #7920 — un journal joint (multipart, `attachments[]`) porte aussi le
+/// jeton et la clé de licence.
+#[tokio::test]
+async fn avec_un_journal_le_multipart_porte_jeton_et_licence_7920() {
+    let site = faux_site().await;
+    let app = app(
+        &site.base,
+        &[
+            ("mozaik_access_token", "jeton-sso-essai"),
+            ("license_key", "TUNE-CLE-ESSAI"),
+        ],
+    );
+
+    let limite = "----tune7920";
+    let mut corps: Vec<u8> = format!(
+        "--{limite}\r\nContent-Disposition: form-data; name=\"description\"\r\n\r\n\
+         Journal joint.\r\n--{limite}\r\nContent-Disposition: form-data; \
+         name=\"attachments[]\"; filename=\"tune.log\"\r\nContent-Type: \
+         application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    corps.extend_from_slice(b"INFO demarrage\n");
+    corps.extend_from_slice(format!("\r\n--{limite}--\r\n").as_bytes());
+
+    let (code, reponse) = poster(
+        &app,
+        &format!("multipart/form-data; boundary={limite}"),
+        corps,
+    )
+    .await;
+
+    assert_eq!(code, StatusCode::OK, "réponse : {reponse}");
+    let recu = site.dernier.lock().await;
+    assert!(recu.content_type.starts_with("multipart/form-data"));
+    assert_eq!(
+        recu.authorization.as_deref(),
+        Some("Bearer jeton-sso-essai")
+    );
+    assert_eq!(recu.license_key.as_deref(), Some("TUNE-CLE-ESSAI"));
 }
