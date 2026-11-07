@@ -82,6 +82,10 @@ pub mod sendspin;
 #[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
 pub(crate) mod silence_avant_liberation_6133;
 pub mod slimproto;
+/// #6132 — la sortie double : le même flux sur deux périphériques locaux,
+/// l'horloge du second asservie au premier. Hors `cfg` : la règle se juge par
+/// `cargo test` sous Linux, sur deux périphériques simulés.
+pub mod sortie_double;
 pub mod squeezebox;
 /// #3967 — ce que le protocole permet de VÉRIFIER d'une suivante préparée,
 /// éprouvé contre un vrai serveur SOAP.

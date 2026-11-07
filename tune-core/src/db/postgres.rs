@@ -393,6 +393,10 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // octets, celui de SQLite. L'index JUSTE APRÈS la colonne.
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE \"C\"",
     "CREATE INDEX IF NOT EXISTS idx_tracks_cle_tri ON tracks(cle_tri, id)",
+    // #7872 — la requête avancée d'une collection intelligente (PG 106). Ici
+    // AUSSI : une base de bascule ne rejoue pas la 106, et toutes les
+    // lectures de `smart_collections` la NOMMENT.
+    "ALTER TABLE smart_collections ADD COLUMN IF NOT EXISTS expression TEXT",
     // #6516 — le lien des radios avec l'annuaire (PG 090). Ici AUSSI : une
     // base de bascule ne rejoue pas la 090, et le rapprochement NOMME la
     // colonne. L'index JUSTE APRÈS la colonne.

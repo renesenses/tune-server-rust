@@ -568,6 +568,11 @@ pub async fn run_with(opts: RunOptions) {
     // Auto-resume network zones (waits for device.reconnected events)
     crate::auto_resume::spawn_auto_resume_listener(&state);
 
+    // #6132 — les groupes enregistrés avant la sortie double (ou dont une
+    // zone a changé de sortie) retrouvent leurs sorties suiveuses, sans geste
+    // de l'utilisateur.
+    crate::routes::zones::recalculer_les_sorties_doubles(&state).await;
+
     state.event_bus.emit(
         "system.started",
         serde_json::json!({

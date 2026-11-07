@@ -232,7 +232,7 @@ async fn wrapped(
 
     let row = b
         .query_one(
-            "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
+            "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0) FROM listen_history WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio'",
             &[&year_start as &dyn tune_core::db::backend::ToSqlValue, &year_end],
         )
         .map_err(AppError::internal)?
@@ -244,7 +244,7 @@ async fn wrapped(
     let top_artists: Vec<Value> = b
         .query_many(
             "SELECT artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? AND artist_name IS NOT NULL \
+             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' AND artist_name IS NOT NULL \
              GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
             &[
                 &year_start as &dyn tune_core::db::backend::ToSqlValue,
@@ -264,7 +264,7 @@ async fn wrapped(
     let top_tracks: Vec<Value> = b
         .query_many(
             "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? \
+             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' \
              GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10",
             &[
                 &year_start as &dyn tune_core::db::backend::ToSqlValue,
@@ -285,7 +285,7 @@ async fn wrapped(
     let day_expr = date_trunc_day("listened_at");
     let days_sql = format!(
         "SELECT DISTINCT {day_expr} as d FROM listen_history \
-         WHERE listened_at >= ? AND listened_at < ? ORDER BY 1"
+         WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' ORDER BY 1"
     );
     let days: Vec<String> = b
         .query_many(
@@ -315,7 +315,7 @@ async fn wrapped(
     let stats_row = b
         .query_one(
             "SELECT COUNT(DISTINCT artist_name), COUNT(DISTINCT COALESCE(title, '') || COALESCE(artist_name, '')) \
-             FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
+             FROM listen_history WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio'",
             &[&year_start as &dyn tune_core::db::backend::ToSqlValue, &year_end],
         )
         .unwrap_or(None)

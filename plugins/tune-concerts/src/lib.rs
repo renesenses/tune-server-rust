@@ -4,7 +4,7 @@
 //! FabienM et Didier (forum, fil 1540). Le greffon :
 //!
 //! - abonne, toutes les 24 h, les artistes de la bibliothèque auprès du nuage
-//!   (`mozaiklabs.fr/api/v1/premium/concerts/subscribe`) ;
+//!   (`mozaiklabs.fr/api/v1/concerts/subscribe`) ;
 //! - relaie la commune SAISIE par l'utilisateur et le périmètre voulu
 //!   (`…/concerts/location`, site-mozaiklabs#186) ;
 //! - lit les dates à venir dans ce périmètre (`…/concerts/upcoming`). Les
@@ -57,29 +57,21 @@
 //! ici. Une IP désigne la sortie du fournisseur d'accès — derrière un VPN, un
 //! autre pays.
 //!
-//! # Premium, décidé ICI et pas par l'hôte
+//! # Sans licence (#7865)
 //!
-//! « Concerts » est un module à lui, inclus dans Premium, sans achat séparé
-//! (Bertrand, 30/08 et 25/09/2026). Deux raccourcis sont interdits, parce
-//! qu'une version RÉDUITE gratuite viendra plus tard :
+//! « Concerts » n'est plus un module Premium (Bertrand, 04/11/2026) : les
+//! conditions de l'API Ticketmaster interdisent d'en tirer un revenu, et les
+//! autres sources (OpenAgenda, site-mozaiklabs#463, et les suivantes) suivent
+//! la même règle. Le greffon se charge, se synchronise et sert toutes ses
+//! dates sans licence ; il ne lit plus la licence du tout, et ne déclare
+//! aucun module requis ([`TunePlugin::required_feature`] reste au défaut) :
+//! le catalogue des extensions ne lui pose plus de cadenas.
 //!
-//! 1. pas de `require_premium` écrit en dur sur un chemin — le payant est une
-//!    propriété du GREFFON ([`ConcertsPlugin::required_feature`]) ;
-//! 2. pas de garde monté par l'hôte devant les routes — il ne saurait
-//!    qu'ouvrir ou fermer.
-//!
-//! La licence descend donc jusqu'ici (`PluginContext::license`) et la décision
-//! tient dans UNE fonction, [`acces`], qui rend [`Acces`]. Le jour de la
-//! version réduite, `Reduit` s'ajoute à l'énumération et aux `match` qui la
-//! lisent — le compilateur les désigne tous ; ni l'hôte ni le montage ne
-//! bougent.
-//!
-//! Le refus est un `ModuleRefusal` (402, `error: "module_required"`, `code`
-//! `module_account_not_linked` ou `module_not_owned`, `module: "concerts"`) :
-//! l'idiome des refus de module du serveur, que le client web reconnaît comme
-//! un refus d'offre et non comme une panne ([`refus_du_module`]). Il porte sur les ROUTES, jamais sur le chargement : un
-//! compte gratuit peut installer le greffon, et l'écran lui dit pourquoi il
-//! reste verrouillé.
+//! Le nuage sert ces routes sous `/api/v1/concerts` ([`CONCERTS_API`]), sans
+//! garde Premium. L'ancienne adresse `/api/v1/premium/concerts` y reste un
+//! alias pour les serveurs rc10, qui l'appellent encore. Les protections
+//! contre l'abus restent côté nuage : limiteur par `instance_id` et par
+//! adresse IP, et quota Ticketmaster.
 //!
 //! # L'extraction a été rebasée sur #2892, pas sur la version d'avant
 //!
@@ -116,10 +108,11 @@ use tune_core::db::backend::DbBackend;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::TuneEvent;
-use tune_core::license::{Feature, LicenseManager, ModuleRefusal};
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
-const CONCERTS_API: &str = "https://mozaiklabs.fr/api/v1/premium/concerts";
+/// La racine des routes de concerts du nuage, sans garde Premium (#7865).
+/// L'ancienne `…/api/v1/premium/concerts` n'y est plus qu'un alias pour rc10.
+pub const CONCERTS_API: &str = "https://mozaiklabs.fr/api/v1/concerts";
 
 /// Le réglage où la dernière localisation ACCEPTÉE par le nuage est gardée.
 ///
@@ -291,8 +284,8 @@ impl Page {
 /// Passés explicitement plutôt que tirés du [`PluginContext`], comme
 /// `tune-dj`, `tune-karaoke` et `tune-bandcamp` : la vraie dépendance du
 /// plugin — la base — est ainsi visible au point de câblage, dans
-/// `tune-server/src/plugins.rs`. La licence, elle, arrive par le contexte
-/// (`PluginContext::license`) : c'est le chemin commun à tout greffon payant.
+/// `tune-server/src/plugins.rs`. La licence n'en fait pas partie : le
+/// greffon n'est plus Premium (#7865).
 pub struct HostServices {
     pub backend: Arc<dyn DbBackend>,
 }
@@ -325,7 +318,7 @@ impl TunePlugin for ConcertsPlugin {
         tune_core::version()
     }
     fn description(&self) -> &str {
-        "Concerts (Premium) : les dates à venir des artistes de votre bibliothèque, autour de chez vous"
+        "Concerts : les dates à venir des artistes de votre bibliothèque, autour de chez vous"
     }
 
     /// Opt-in, comme `dj`, `karaoke` et `bandcamp`.
@@ -341,22 +334,13 @@ impl TunePlugin for ConcertsPlugin {
         true
     }
 
-    /// Le module Premium auquel ce greffon appartient. Le gestionnaire s'en
-    /// sert pour montrer le cadenas avant le clic ; le comportement réel se
-    /// décide dans [`acces`].
-    fn required_feature(&self) -> Option<Feature> {
-        Some(Feature::Concerts)
-    }
+    // `required_feature` reste au défaut (`None`) : le greffon n'appartient
+    // plus à aucun module Premium (#7865), et le catalogue ne lui pose plus
+    // de cadenas.
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
-        let license = ctx.license.clone();
-        if !ctx.feature_licensed(Feature::Concerts).await {
-            // Chargé quand même : le refus porte sur les routes, et l'écran
-            // doit pouvoir dire pourquoi il reste verrouillé.
-            info!("concerts_charge_sans_premium");
-        }
-        ctx.register_router(router(self.backend.clone(), license.clone()));
-        self.tache = Some(lancer_synchronisation(self.backend.clone(), license));
+        ctx.register_router(router(self.backend.clone()));
+        self.tache = Some(lancer_synchronisation(self.backend.clone()));
         Ok(())
     }
 
@@ -374,77 +358,12 @@ impl TunePlugin for ConcertsPlugin {
 }
 
 // ---------------------------------------------------------------------------
-// Le droit — la SEULE décision du payant
-// ---------------------------------------------------------------------------
-
-/// Ce que ce serveur a le droit de recevoir du module, selon sa licence.
-///
-/// La variante manquante est `Reduit` : la version limitée des comptes
-/// gratuits, prévue une fois le module abouti. Elle s'ajoutera ici, et le
-/// compilateur désignera les `match` à compléter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Acces {
-    Complet,
-    Refuse,
-}
-
-/// LE point de décision du payant. Publique pour être observable depuis
-/// `tune-server/tests/concerts_plugin.rs`.
-///
-/// ⚠️ Une licence ABSENTE ne vaut pas une autorisation. C'est le cas d'un hôte
-/// qui n'en fournit pas — tests, `tune-cli`, ou une construction future qui
-/// oublierait de la brancher. Interpréter l'absence en faveur du doute
-/// ouvrirait le module à tout le monde le jour où quelqu'un déplace une ligne.
-pub async fn acces(license: Option<&LicenseManager>) -> Acces {
-    match license {
-        Some(l) if l.check_feature(Feature::Concerts).await => Acces::Complet,
-        _ => Acces::Refuse,
-    }
-}
-
-/// Le nom du module dans les refus — le même que `name()` et que le chemin.
-pub const MODULE: &str = "concerts";
-
-/// Un compte mozaiklabs est-il lié à ce serveur ? Même lecture que
-/// `discovery_setup::compte_mozaik_lie` (tune-server) : un jeton stocké.
-pub fn compte_lie(backend: &Arc<dyn DbBackend>) -> bool {
-    SettingsRepo::with_backend(backend.clone())
-        .get("mozaik_access_token")
-        .ok()
-        .flatten()
-        .is_some_and(|t| !t.is_empty())
-}
-
-/// Le refus du module, dans la forme de [`ModuleRefusal`] — l'idiome des
-/// refus de module du serveur (#2392) : `error: "module_required"`, et un
-/// `code` qui nomme la raison et le geste attendu :
-///
-/// - `module_account_not_linked` (`action: link_account`) : aucun compte lié,
-///   le droit Premium ne peut pas parvenir au serveur ;
-/// - `module_not_owned` (`action: purchase_module`) : compte lié, sans Premium.
-///
-/// Statut **402** : celui de tous les refus d'offre du serveur. Le client web
-/// le reconnaît deux fois — par le corps (`module_required`) et par le
-/// statut (`estRefusPremium`) —, jamais comme une panne. `message` est le
-/// repli anglais de `ModuleRefusal`, jamais destiné à l'affichage : le client
-/// traduit le `code`.
-pub fn refus_du_module(raison: ModuleRefusal) -> Response {
-    let mut corps = raison.to_json(MODULE);
-    if let Some(objet) = corps.as_object_mut() {
-        // Le droit qui ouvre le module, pour l'écran qui voudrait le nommer.
-        objet.insert("feature".into(), json!(Feature::Concerts.code()));
-    }
-    (StatusCode::PAYMENT_REQUIRED, Json(corps)).into_response()
-}
-
-// ---------------------------------------------------------------------------
 // Routes — montées par l'hôte sous /api/v1/ext/concerts
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct EtatConcerts {
     backend: Arc<dyn DbBackend>,
-    license: Option<Arc<LicenseManager>>,
     /// La racine de l'API du nuage : [`CONCERTS_API`] en production, un banc
     /// local dans les essais ([`router_vers`]).
     racine: Arc<str>,
@@ -457,25 +376,6 @@ struct EtatConcerts {
 }
 
 impl EtatConcerts {
-    /// Le refus à rendre, ou `None` si la route peut servir.
-    ///
-    /// Toutes les routes passent par ici, et par rien d'autre : une route
-    /// ajoutée sans son portillon est l'erreur classique — la lecture refuse,
-    /// l'écriture passe.
-    async fn refus(&self) -> Option<Response> {
-        match acces(self.license.as_deref()).await {
-            Acces::Complet => None,
-            Acces::Refuse => {
-                // `evaluate(false, …)` rend toujours une raison ; `NotOwned` n'est
-                // qu'un filet si la règle venait à changer.
-                let raison = ModuleRefusal::evaluate(false, compte_lie(&self.backend))
-                    .unwrap_or(ModuleRefusal::NotOwned);
-                info!(code = raison.code(), "concerts_refuse_sans_premium");
-                Some(refus_du_module(raison))
-            }
-        }
-    }
-
     fn settings(&self) -> SettingsRepo {
         SettingsRepo::with_backend(self.backend.clone())
     }
@@ -573,24 +473,19 @@ pub fn parametres_du_lieu(lieu: &Value) -> Vec<(&'static str, String)> {
 }
 
 /// Le routeur de production, qui parle à `mozaiklabs.fr`.
-pub fn router(backend: Arc<dyn DbBackend>, license: Option<Arc<LicenseManager>>) -> Router<()> {
-    router_vers(CONCERTS_API, backend, license)
+pub fn router(backend: Arc<dyn DbBackend>) -> Router<()> {
+    router_vers(CONCERTS_API, backend)
 }
 
 /// Le même routeur, vers une autre racine d'API — le seul moyen d'exercer les
 /// routes de bout en bout sans appeler `mozaiklabs.fr` depuis un essai.
 /// L'unique appelant en production est [`router`], juste au-dessus.
-pub fn router_vers(
-    racine: &str,
-    backend: Arc<dyn DbBackend>,
-    license: Option<Arc<LicenseManager>>,
-) -> Router<()> {
+pub fn router_vers(racine: &str, backend: Arc<dyn DbBackend>) -> Router<()> {
     Router::new()
         .route("/upcoming", get(concerts_a_venir))
         .route("/location", get(lire_localisation).post(poser_localisation))
         .with_state(EtatConcerts {
             backend,
-            license,
             racine: Arc::from(racine),
             verrou_du_nuage: Arc::new(tokio::sync::Mutex::new(())),
         })
@@ -614,10 +509,6 @@ async fn concerts_a_venir(
     headers: HeaderMap,
     RawQuery(requete): RawQuery,
 ) -> Response {
-    if let Some(refus) = etat.refus().await {
-        return refus;
-    }
-
     let instance_id = etat.instance_id();
     if instance_id.is_empty() {
         return Json(json!({"concerts": [], "code": "concerts.no_instance_id"})).into_response();
@@ -671,9 +562,6 @@ async fn concerts_a_venir(
 /// Par profil (tune-web-client#1755) : celle du profil de `X-Profile-Id`, sinon
 /// la dernière acceptée par le nuage (la clé d'avant).
 async fn lire_localisation(State(etat): State<EtatConcerts>, headers: HeaderMap) -> Response {
-    if let Some(refus) = etat.refus().await {
-        return refus;
-    }
     match etat.localisation(etat.profil(&headers)) {
         Some(localisation) => Json(localisation).into_response(),
         None => Json(json!({
@@ -696,10 +584,9 @@ async fn lire_localisation(State(etat): State<EtatConcerts>, headers: HeaderMap)
 /// ne dirait pas quel champ est en cause.
 ///
 /// Le corps est lu brut, pas par l'extracteur `Json` : un corps illisible doit
-/// d'abord passer le portillon, puis finir en 422 à code — pas en rejet
-/// texte d'axum avant même la question du droit.
+/// finir en 422 à code — pas en rejet texte d'axum.
 ///
-/// Réponses : 200 (la réponse du nuage), 402 (sans Premium), 422
+/// Réponses : 200 (la réponse du nuage), 422
 /// `concerts.invalid_location` (+ `field`), 409 `concerts.no_instance_id`,
 /// 429 `concerts.rate_limited` (+ délai), 502 `concerts.unavailable`. Tout
 /// échec est un statut d'erreur : l'écran, qui ne regarde que les exceptions
@@ -712,10 +599,6 @@ async fn poser_localisation(
     headers: HeaderMap,
     corps: Bytes,
 ) -> Response {
-    if let Some(refus) = etat.refus().await {
-        return refus;
-    }
-
     let demande: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
     let demande = match valider_localisation(&demande) {
         Ok(d) => d,
@@ -1454,13 +1337,9 @@ pub async fn enregistrer_localisation_vers(
 
 /// Le greffon a-t-il le droit d'envoyer la liste des artistes au nuage ?
 ///
-/// Deux conditions, et plus `community_sync_enabled` :
-///
-/// 1. **Premium** — sans le module, l'abonnement ne servirait à rien : les
-///    routes refusent. Envoyer chaque jour la bibliothèque d'un compte gratuit
-///    serait un envoi sans usage.
-/// 2. **La télémétrie n'est pas refusée** (`TUNE_TELEMETRY`, ou le réglage de
-///    l'interface) — un refus, d'où qu'il vienne, reste souverain (#3383).
+/// Une seule condition, sans licence (#7865) : **la télémétrie n'est pas
+/// refusée** (`TUNE_TELEMETRY`, ou le réglage de l'interface) — un refus,
+/// d'où qu'il vienne, reste souverain (#3383).
 ///
 /// ⚠️ Pourquoi le greffon ne lit plus `community_sync_enabled`. Ce réglage est
 /// la bascule « Partage communautaire des métadonnées », désactivée par
@@ -1469,27 +1348,17 @@ pub async fn enregistrer_localisation_vers(
 /// liste toujours vide — ou obligeait à partager bien plus que ce qu'il
 /// demande. Installer « Concerts » est le consentement à SON envoi, borné à
 /// sa finalité : les noms d'artistes (et leur MBID quand on l'a), rien d'autre.
-///
-/// Le `match` sur [`Acces`] est exhaustif exprès : le jour où `Reduit` arrive,
-/// le compilateur demande ici ce que la version réduite synchronise.
-pub fn synchronisation_autorisee(settings: &SettingsRepo, acces: Acces) -> bool {
-    let premium = match acces {
-        Acces::Complet => true,
-        Acces::Refuse => false,
-    };
-    premium && tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(settings)
+pub fn synchronisation_autorisee(settings: &SettingsRepo) -> bool {
+    tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(settings)
 }
 
 /// La tâche périodique : abonnement toutes les 24 h, 2 min après le démarrage.
 ///
 /// Elle ne tourne que si le greffon est installé (sinon il n'est pas chargé),
 /// et n'envoie que si [`synchronisation_autorisee`] et un `instance_id` non
-/// vide le permettent — relus à chaque tour : un Premium qui arrive ou qui
-/// part est pris en compte au tour suivant, sans redémarrage.
-fn lancer_synchronisation(
-    backend: Arc<dyn DbBackend>,
-    license: Option<Arc<LicenseManager>>,
-) -> tokio::task::JoinHandle<()> {
+/// vide le permettent — relus à chaque tour : un refus de télémétrie posé
+/// en cours de route est pris en compte au tour suivant, sans redémarrage.
+fn lancer_synchronisation(backend: Arc<dyn DbBackend>) -> tokio::task::JoinHandle<()> {
     let client = match tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
@@ -1507,9 +1376,7 @@ fn lancer_synchronisation(
 
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
-            let droit = acces(license.as_deref()).await;
-
-            if synchronisation_autorisee(&settings, droit) {
+            if synchronisation_autorisee(&settings) {
                 let instance_id = settings
                     .get("instance_id")
                     .ok()
@@ -1525,7 +1392,7 @@ fn lancer_synchronisation(
                     debug!("concert_alerts_skipped_no_instance_id");
                 }
             } else {
-                debug!(acces = ?droit, "concert_alerts_skipped_not_allowed");
+                debug!("concert_alerts_skipped_not_allowed");
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
@@ -2659,53 +2526,159 @@ mod essais {
     }
 
     // -----------------------------------------------------------------------
-    // `acces` — la seule décision du payant
+    // Sans licence (#7865) — toutes les sources, toutes les routes
     // -----------------------------------------------------------------------
 
-    fn licence() -> Arc<LicenseManager> {
+    /// Une base neuve, migrée, avec l'identité d'instance que les routes
+    /// relaient au nuage. Aucune licence n'existe nulle part : le greffon n'en
+    /// reçoit plus.
+    fn base_sans_licence(instance: &str) -> Arc<dyn DbBackend> {
         let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         tune_core::db::migrations::run_migrations(&db).unwrap();
-        Arc::new(LicenseManager::new(Arc::new(db)))
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        SettingsRepo::with_backend(backend.clone())
+            .set("instance_id", instance)
+            .unwrap();
+        backend
     }
 
-    /// ⚠️ Une licence absente ne vaut PAS une autorisation — c'est la
-    /// contre-épreuve de tout le portillon.
+    /// Sert le routeur du greffon sur la boucle locale, comme l'hôte le
+    /// monte : la requête traverse les vrais gestionnaires de routes.
+    async fn servir(app: Router<()>) -> (String, tokio::task::JoinHandle<()>) {
+        let ecoute = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let racine = format!("http://{}", ecoute.local_addr().unwrap());
+        let tache = tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (racine, tache)
+    }
+
+    /// ⭐ #7865 — sans aucune licence, `/upcoming` sert les dates de TOUTES
+    /// les sources que le nuage rend (Ticketmaster et OpenAgenda ici), sans
+    /// en filtrer aucune. Avant, la route répondait 402 `module_required`.
     #[tokio::test]
-    async fn sans_licence_l_acces_est_refuse() {
-        assert_eq!(acces(None).await, Acces::Refuse);
+    async fn sans_licence_les_dates_de_toutes_les_sources_sont_servies() {
+        let nuage = banc(vec![(
+            200,
+            r#"{"concerts":[
+                {"id":1,"artist_name":"Bertrand Belin","source":"ticketmaster"},
+                {"id":2,"artist_name":"Bertrand Belin","source":"openagenda"}
+            ],"total":2}"#,
+            None,
+        )])
+        .await;
+        let app = router_vers(&nuage.racine, base_sans_licence("inst-7865"));
+        let (racine, serveur) = servir(app).await;
+
+        let reponse = tune_core::http::client::shared()
+            .get(format!("{racine}/upcoming"))
+            .send()
+            .await
+            .unwrap();
+        let statut = reponse.status();
+        let corps: Value = reponse.json().await.unwrap();
+        serveur.abort();
+
+        assert_eq!(
+            statut,
+            StatusCode::OK,
+            "sans licence, /upcoming doit servir les dates, pas un refus d'offre : {corps}"
+        );
+        let sources: Vec<&str> = corps["concerts"]
+            .as_array()
+            .expect("une liste de concerts")
+            .iter()
+            .filter_map(|c| c["source"].as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            ["ticketmaster", "openagenda"],
+            "toutes les sources sont servies, aucune n'est retirée faute de licence"
+        );
+        let recues = nuage.recues();
+        assert_eq!(recues.len(), 1, "la lecture a bien été demandée au nuage");
+        assert!(
+            recues[0]["cible"]
+                .as_str()
+                .unwrap()
+                .contains("instance_id=inst-7865")
+        );
     }
 
+    /// #7865 — les deux routes de localisation servent aussi sans licence :
+    /// la lecture rend « rien d'enregistré », l'écriture part au nuage.
     #[tokio::test]
-    async fn un_compte_gratuit_est_refuse_un_compte_premium_a_l_acces_complet() {
-        let l = licence();
+    async fn sans_licence_la_localisation_se_lit_et_s_enregistre() {
+        let nuage = banc(vec![(
+            200,
+            r#"{"scope":"country","city":"Dijon","country":"FR","radius_km":100,"located":false}"#,
+            None,
+        )])
+        .await;
+        let app = router_vers(&nuage.racine, base_sans_licence("inst-7865"));
+        let (racine, serveur) = servir(app).await;
+        let client = tune_core::http::client::shared();
+
+        let lue = client
+            .get(format!("{racine}/location"))
+            .send()
+            .await
+            .unwrap();
+        let statut_lu = lue.status();
+        let corps_lu: Value = lue.json().await.unwrap();
+
+        let posee = client
+            .post(format!("{racine}/location"))
+            .header("content-type", "application/json")
+            .body(r#"{"city":"Dijon","country":"FR","scope":"country"}"#)
+            .send()
+            .await
+            .unwrap();
+        let statut_pose = posee.status();
+        serveur.abort();
+
+        assert_eq!(statut_lu, StatusCode::OK, "{corps_lu}");
+        assert_eq!(corps_lu["code"], "concerts.no_location");
         assert_eq!(
-            acces(Some(l.as_ref())).await,
-            Acces::Refuse,
-            "compte neuf = gratuit"
+            statut_pose,
+            StatusCode::OK,
+            "sans licence, la commune s'enregistre auprès du nuage"
         );
-        l.set_account_premium(true, None).await;
-        assert_eq!(acces(Some(l.as_ref())).await, Acces::Complet);
-        l.set_account_premium(false, None).await;
-        assert_eq!(
-            acces(Some(l.as_ref())).await,
-            Acces::Refuse,
-            "un Premium qui s'en va referme le module"
+        assert!(
+            nuage.recues()[0]["cible"]
+                .as_str()
+                .unwrap()
+                .starts_with("POST /location"),
+            "{:?}",
+            nuage.recues()
         );
     }
 
-    /// Le greffon nomme son module (cadenas avant le clic) et entre au
-    /// catalogue : l'écran existe, le nuage a des dates.
+    /// #7865 — le greffon ne déclare plus de module requis (plus de cadenas
+    /// au catalogue), ne se dit plus Premium, et entre toujours au catalogue.
     #[test]
-    fn le_greffon_nomme_son_module_et_entre_au_catalogue() {
+    fn le_greffon_n_est_plus_premium_et_entre_au_catalogue() {
         let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         let greffon = ConcertsPlugin::new(HostServices {
             backend: Arc::new(db),
         });
-        assert_eq!(greffon.required_feature(), Some(Feature::Concerts));
+        assert_eq!(greffon.required_feature(), None);
+        assert!(
+            !greffon.description().contains("Premium"),
+            "{}",
+            greffon.description()
+        );
         assert!(greffon.catalogued());
         assert!(!greffon.default_enabled(), "toujours opt-in");
+    }
+
+    /// #7865 — le greffon parle à la route sans garde Premium du nuage ;
+    /// l'ancienne `…/premium/concerts` n'y reste qu'un alias pour rc10.
+    #[test]
+    fn le_greffon_appelle_la_route_sans_licence_du_nuage() {
+        assert_eq!(CONCERTS_API, "https://mozaiklabs.fr/api/v1/concerts");
     }
 
     // -----------------------------------------------------------------------
@@ -2719,18 +2692,11 @@ mod essais {
         SettingsRepo::with_backend(Arc::new(db))
     }
 
-    /// Un compte gratuit n'envoie pas sa bibliothèque : ses routes refusent,
-    /// l'abonnement ne servirait à rien.
+    /// ⭐ #7865 — sans licence, installation neuve : l'abonnement part, et
+    /// SANS que le « partage communautaire des métadonnées » soit coché.
+    /// Avant, il exigeait Premium, et avant encore ce partage.
     #[test]
-    fn sans_premium_la_bibliotheque_ne_part_pas() {
-        assert!(!synchronisation_autorisee(&reglages(), Acces::Refuse));
-    }
-
-    /// ⭐ Premium, installation neuve : l'abonnement part SANS que le
-    /// « partage communautaire des métadonnées » soit coché. Avant, il
-    /// l'exigeait, et la liste restait vide pour tout le monde par défaut.
-    #[test]
-    fn premium_l_abonnement_part_sans_le_partage_communautaire() {
+    fn sans_licence_l_abonnement_part_sans_le_partage_communautaire() {
         if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
             eprintln!("TUNE_TELEMETRY refuse dans cet environnement : cas non jouable ici");
             return;
@@ -2743,17 +2709,16 @@ mod essais {
                 .is_none(),
             "le partage communautaire n'est pas coche dans une base neuve"
         );
-        assert!(synchronisation_autorisee(&settings, Acces::Complet));
+        assert!(synchronisation_autorisee(&settings));
     }
 
-    /// Contre-épreuve : un refus de télémétrie reste souverain (#3383), même
-    /// Premium.
+    /// Contre-épreuve : un refus de télémétrie reste souverain (#3383).
     #[test]
     fn contre_epreuve_le_refus_de_telemetrie_arrete_l_abonnement() {
         let settings = reglages();
         settings
             .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "false")
             .unwrap();
-        assert!(!synchronisation_autorisee(&settings, Acces::Complet));
+        assert!(!synchronisation_autorisee(&settings));
     }
 }

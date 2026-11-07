@@ -2906,6 +2906,23 @@
     "pl": "Strefy „{a}” i „{b}” używają tego samego wyjścia audio: nie można ich grupować. Usuń jedną z nich lub przypisz jej inne wyjście.",
     "el": "Οι ζώνες «{a}» και «{b}» χρησιμοποιούν την ίδια έξοδο ήχου: δεν μπορούν να ομαδοποιηθούν. Διαγράψτε τη μία ή δώστε της άλλη έξοδο."
   },
+  "zonegroup.asioOneZone": {
+    "fr": "« {a} » et « {b} » sortent par ASIO : le pilote ASIO ne joue qu'une zone à la fois sur cette machine, elles ne peuvent pas jouer ensemble. Passez l'une des deux en WASAPI pour les grouper.",
+    "en": "“{a}” and “{b}” play through ASIO: the ASIO driver plays only one zone at a time on this machine, so they cannot play together. Switch one of them to WASAPI to group them.",
+    "de": "„{a}“ und „{b}“ geben über ASIO aus: Der ASIO-Treiber spielt auf diesem Rechner nur eine Zone gleichzeitig, sie können nicht zusammen spielen. Stellen Sie eine davon auf WASAPI um, um sie zu gruppieren.",
+    "es": "«{a}» y «{b}» salen por ASIO: el controlador ASIO solo reproduce una zona a la vez en este equipo, no pueden sonar juntas. Pase una de ellas a WASAPI para agruparlas.",
+    "it": "«{a}» e «{b}» escono tramite ASIO: il driver ASIO riproduce una sola zona alla volta su questo computer, quindi non possono suonare insieme. Passa una delle due a WASAPI per raggrupparle.",
+    "zh": "「{a}」和「{b}」通过 ASIO 输出：ASIO 驱动在这台机器上一次只能播放一个区域，它们无法同时播放。请将其中一个切换为 WASAPI 后再编组。",
+    "ja": "「{a}」と「{b}」は ASIO で出力されています。ASIO ドライバーはこのマシンで一度に 1 つのゾーンしか再生できないため、同時に再生できません。グループ化するには、どちらかを WASAPI に切り替えてください。",
+    "ko": "'{a}'와(과) '{b}'은(는) ASIO로 출력됩니다. ASIO 드라이버는 이 컴퓨터에서 한 번에 한 영역만 재생하므로 함께 재생할 수 없습니다. 그룹으로 묶으려면 둘 중 하나를 WASAPI로 바꾸세요.",
+    "ro": "„{a}” și „{b}” ies prin ASIO: driverul ASIO redă o singură zonă odată pe acest computer, deci nu pot reda împreună. Treceți una dintre ele pe WASAPI pentru a le grupa.",
+    "sv": "”{a}” och ”{b}” spelar via ASIO: ASIO-drivrutinen spelar bara en zon i taget på den här datorn, så de kan inte spela tillsammans. Byt en av dem till WASAPI för att gruppera dem.",
+    "hu": "„{a}” és „{b}” ASIO-n keresztül szól: az ASIO-illesztőprogram ezen a gépen egyszerre csak egy zónát játszik le, így nem szólhatnak együtt. Csoportosításukhoz állítsa át az egyiket WASAPI-ra.",
+    "vi": "“{a}” và “{b}” phát qua ASIO: trình điều khiển ASIO trên máy này chỉ phát một vùng mỗi lần, nên chúng không thể phát cùng nhau. Hãy chuyển một trong hai sang WASAPI để nhóm chúng.",
+    "nb": "«{a}» og «{b}» spiller via ASIO: ASIO-driveren spiller bare én sone om gangen på denne maskinen, så de kan ikke spille sammen. Bytt en av dem til WASAPI for å gruppere dem.",
+    "pl": "„{a}” i „{b}” grają przez ASIO: sterownik ASIO odtwarza na tym komputerze tylko jedną strefę naraz, więc nie mogą grać razem. Przełącz jedną z nich na WASAPI, aby je zgrupować.",
+    "el": "Οι «{a}» και «{b}» βγαίνουν μέσω ASIO: το πρόγραμμα οδήγησης ASIO αναπαράγει μόνο μία ζώνη τη φορά σε αυτόν τον υπολογιστή, οπότε δεν μπορούν να παίξουν μαζί. Αλλάξτε μία από τις δύο σε WASAPI για να τις ομαδοποιήσετε."
+  },
   "browse.hint.windowsMappedDrive": {
     "fr": "« {drive} » est un lecteur réseau mappé : sous Windows, une lettre de lecteur n'appartient qu'à la session qui l'a créée et reste invisible au service Tune. Indiquez le chemin UNC du partage (\\\\serveur\\partage) au lieu de la lettre.",
     "en": "“{drive}” is a mapped network drive: on Windows a drive letter belongs only to the session that created it and stays invisible to the Tune service. Use the share's UNC path (\\\\server\\share) instead of the letter.",
