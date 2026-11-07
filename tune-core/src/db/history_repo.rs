@@ -96,6 +96,18 @@ pub mod sql {
         )
     }
 
+    /// #8085 — la dernière écoute d'un flux désigné par `source` +
+    /// `source_id` (un épisode de podcast : son adresse), radios comprises.
+    pub fn derniere_ecoute_du_flux<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {RECORD_COLS_RESOLUS} FROM listen_history h \
+             LEFT JOIN tracks t ON t.title = h.title AND t.album_id = h.album_id \
+             WHERE h.source = {} AND h.source_id = {} \
+             ORDER BY h.listened_at DESC, h.id DESC LIMIT 1",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
     pub fn recent_paginated<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT {RECORD_COLS_RESOLUS}{JOINTURE_PISTE} LIMIT {} OFFSET {}",
@@ -617,6 +629,20 @@ impl HistoryRepo {
         Ok(rows.iter().map(|cols| row_to_listen(cols)).collect())
     }
 
+    /// #8085 — la dernière écoute du flux `source` + `source_id`, `None`
+    /// s'il n'a jamais été écouté. Voir [`sql::derniere_ecoute_du_flux`].
+    pub fn derniere_ecoute_du_flux(
+        &self,
+        source: &str,
+        source_id: &str,
+    ) -> Result<Option<ListenRecord>, String> {
+        let sql = self.dialect_sql(sql::derniere_ecoute_du_flux, sql::derniere_ecoute_du_flux);
+        let params: [&dyn ToSqlValue; 2] = [&source, &source_id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .map(|cols| row_to_listen(&cols)))
+    }
     pub fn recent_paginated(
         &self,
         limit: i64,

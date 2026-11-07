@@ -2725,6 +2725,38 @@ async fn play(
             .as_deref()
             .map_err(String::as_str),
     );
+    // #8085 — un épisode de podcast désigné par son adresse (carte
+    // « Récemment écoutés » de l'accueil, Historique) emprunte le chemin de
+    // l'écran Podcasts : titre, podcast, pochette et position de reprise.
+    // `resolve_streaming_queue_meta` ne le connaît pas (« podcast » n'est pas
+    // un service du registre) : il partait sous « Episode », à 0. La relance
+    // d'une ligne déjà dans la file garde, elle, le chemin de la file.
+    if !relance
+        && body.source.as_deref() == Some("podcast")
+        && body.track_id.is_none()
+        && body.track_ids.is_none()
+        && body.album_id.is_none()
+        && body.playlist_id.is_none()
+        && body.streaming_album_id.is_none()
+        && body.streaming_playlist_id.is_none()
+        && let Some(adresse) = body.source_id.as_deref().filter(|u| !u.trim().is_empty())
+    {
+        return crate::routes::podcasts::jouer_l_episode_par_son_adresse(
+            &state,
+            zone_id,
+            crate::routes::podcasts::EpisodeParAdresse {
+                audio_url: adresse,
+                title: body.title.as_deref(),
+                artist_name: body.artist_name.as_deref(),
+                album_title: body.album_title.as_deref(),
+                cover_path: body.cover_path.as_deref(),
+                duration_ms: body.duration_ms,
+                seek_ms: body.seek_ms,
+                context_id: body.context_id.as_deref(),
+            },
+        )
+        .await;
+    }
     if relance {
         info!(zone_id, "relance_dans_la_file_contexte_garde_6465");
     } else {
