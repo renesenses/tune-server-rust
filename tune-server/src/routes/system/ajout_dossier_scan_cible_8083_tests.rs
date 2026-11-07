@@ -54,8 +54,8 @@ fn chemin(p: &Path) -> String {
 // le droit de scanner est global au processus (voir `serialiser_les_scans_de_test`).
 #[allow(clippy::await_holding_lock)]
 async fn ajouter_un_dossier_ne_scanne_que_ce_dossier_8083() {
-    let _seul = super::scan::serialiser_les_scans_de_test_sans_bloquer().await;
-    super::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
 
     let base = tune_core::test_scratch::scratch_dir("ajout-dossier-8083-base");
     let r = tune_core::test_scratch::scratch_dir_in(
@@ -82,9 +82,9 @@ async fn ajouter_un_dossier_ne_scanne_que_ce_dossier_8083() {
 
     // 1. La première racine, scannée en entier.
     let mut rx = etat.event_bus.subscribe();
-    assert!(super::scan::spawn_library_scan(etat.clone(), false, None).await);
+    assert!(crate::routes::system::scan::spawn_library_scan(etat.clone(), false, None).await);
     let complet = fin_du_scan(&mut rx).await;
-    super::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
     let repo = TrackRepo::with_backend(etat.backend.clone());
     for p in &anciennes {
         assert!(
@@ -100,7 +100,8 @@ async fn ajouter_un_dossier_ne_scanne_que_ce_dossier_8083() {
 
     // 3. L'ajout, par la vraie route.
     let mut rx = etat.event_bus.subscribe();
-    let reponse = add_music_dir(
+    // `AppError` n'implémente pas `Debug` : pas d'`expect`, un `match`.
+    let reponse = match add_music_dir(
         RequireAdmin,
         State(etat.clone()),
         Json(AddMusicDir {
@@ -108,11 +109,13 @@ async fn ajouter_un_dossier_ne_scanne_que_ce_dossier_8083() {
         }),
     )
     .await
-    .map(IntoResponse::into_response)
-    .expect("l'ajout doit réussir");
+    {
+        Ok(r) => r.into_response(),
+        Err(e) => panic!("l'ajout doit réussir : {}", e.into_response().status()),
+    };
     assert_eq!(reponse.status(), StatusCode::OK);
     let rapport = fin_du_scan(&mut rx).await;
-    super::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
 
     assert_eq!(
         rapport["scope"], "folder",
