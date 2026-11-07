@@ -4884,6 +4884,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(super::politique_parentale::SQL_TABLE) {
         tracing::warn!(error = %e, "politiques_parentales_table_failed");
     }
+    // Trace des tentatives d'enrichissement (#7983) — même régime que la
+    // table ci-dessus. PG : `ENSURE_TABLES` et `PG_FULL_SCHEMA`.
+    for ddl in [
+        super::enrich_tentatives::SQL_TABLE,
+        super::enrich_tentatives::SQL_INDEX,
+    ] {
+        if let Err(e) = db.execute_batch(ddl) {
+            tracing::warn!(error = %e, "enrich_tentatives_table_failed");
+        }
+    }
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
