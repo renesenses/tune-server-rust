@@ -1290,6 +1290,8 @@ impl TidalService {
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
             ai_generated: None,
+            // #8088 — le marquage explicite de l'album, comme celui des pistes.
+            explicit: item["explicit"].as_bool(),
             // #4767 — Tidal porte le type dans `type` : `ALBUM`, `EP`,
             // `SINGLE`. Même décodeur que Qobuz, donc même vocabulaire de
             // sortie ; la casse est absorbée par `depuis_service`.
@@ -4013,6 +4015,16 @@ mod tests {
         let cover = track.cover_path.unwrap();
         assert!(cover.contains("resources.tidal.com"));
         assert!(cover.contains("abc/def/ghi"));
+    }
+
+    #[test]
+    fn map_album_lit_le_marquage_explicite_de_tidal_8088() {
+        let explicite = TidalService::map_album(&json!({"id": 1, "title": "A", "explicit": true}));
+        assert_eq!(explicite.explicit, Some(true));
+        let propre = TidalService::map_album(&json!({"id": 2, "title": "B", "explicit": false}));
+        assert_eq!(propre.explicit, Some(false));
+        let muet = TidalService::map_album(&json!({"id": 3, "title": "C"}));
+        assert_eq!(muet.explicit, None);
     }
 
     #[test]

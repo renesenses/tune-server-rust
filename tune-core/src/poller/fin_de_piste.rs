@@ -1037,16 +1037,20 @@ impl PositionPoller {
         let Some(next_pos) = Self::prochaine_position_jouable(&self.db, zone_id, zone_state) else {
             return GaplessPrep::NotArmed;
         };
-        // #7974 — armée, la suivante serait jouée par le renderer sans
-        // repasser par la garde du bail d'écoute : on ne l'arme pas si le
-        // bail finit avant elle. La fin de piste passe alors par la garde.
-        if !self
-            .orchestrator
-            .bail_couvre_l_enchainement(
-                zone_id,
-                fin_estimee.saturating_duration_since(Instant::now()),
-            )
-            .await
+        // #8088 — armée, la suivante serait jouée par le renderer sans
+        // repasser par la garde des contenus explicites : pour un profil dont
+        // la politique les masque, rien n'est armé d'avance, la fin de piste
+        // passe par la garde.
+        // #7974 — de même pour la garde du bail d'écoute : on n'arme pas la
+        // suivante si le bail finit avant elle.
+        if self.orchestrator.masque_l_explicite(zone_id).await
+            || !self
+                .orchestrator
+                .bail_couvre_l_enchainement(
+                    zone_id,
+                    fin_estimee.saturating_duration_since(Instant::now()),
+                )
+                .await
         {
             return GaplessPrep::NotArmed;
         }

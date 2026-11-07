@@ -20,6 +20,10 @@ use std::sync::Arc;
 /// Le DDL commun aux deux moteurs.
 pub const SQL_TABLE: &str = include_str!("../../migrations/politiques_parentales.sql");
 
+/// #8088 — le code stable du refus d'un contenu explicite, et la sentinelle
+/// que rend la lecture refusée (`orchestrator::play`).
+pub const CODE_REFUS_EXPLICITE: &str = "parental_explicit_refused";
+
 /// Plafonds de taille d'une politique : une liste plus longue est refusée.
 pub const ELEMENTS_MAX: usize = 5000;
 pub const PLAGES_MAX: usize = 64;
@@ -64,6 +68,13 @@ pub struct PolitiqueParentale {
     pub budget_quotidien_minutes: Option<u32>,
     #[serde(default)]
     pub budget_hebdomadaire_minutes: Option<u32>,
+    /// #8088 — masquer et refuser les contenus explicites : titres et albums
+    /// que le service (Qobuz `parental_warning`, TIDAL et Spotify
+    /// `explicit`) ou la balise du fichier (`ITUNESADVISORY` = 1, MP4
+    /// `rtng`) marque explicites. Une piste sans marquage n'est pas
+    /// explicite. `false` (défaut) : rien ne change.
+    #[serde(default)]
+    pub masquer_explicite: bool,
 }
 
 impl PolitiqueParentale {
@@ -357,7 +368,7 @@ impl Filtre {
 
     /// Une entrée de la bibliothèque locale (pas d'un service) : son `id`
     /// est un identifiant de bibliothèque.
-    fn est_locale(o: &serde_json::Map<String, Value>) -> bool {
+    pub(crate) fn est_locale(o: &serde_json::Map<String, Value>) -> bool {
         match o.get("source").and_then(Value::as_str) {
             None => true,
             Some(s) => s == "local" || s == "library",
@@ -480,6 +491,140 @@ impl Filtre {
     }
 }
 
+/// #8088 — l'objet porte-t-il le marquage explicite d'un service ou d'une
+/// balise ? `explicit` (pistes et albums des services, pistes locales) ou
+/// `parental_warning` (Qobuz brut), vrai ou 1. Une absence n'est pas un
+/// marquage.
+pub fn est_marque_explicite(o: &serde_json::Map<String, Value>) -> bool {
+    ["explicit", "parental_warning"]
+        .iter()
+        .any(|k| match o.get(*k) {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Number(n)) => n.as_i64() == Some(1),
+            Some(Value::String(s)) => {
+                matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true")
+            }
+            _ => false,
+        })
+}
+
+/// #8088 — les pistes locales marquées explicites par leur balise, et les
+/// albums locaux qui en contiennent au moins une.
+#[derive(Debug, Clone, Default)]
+pub struct MarquesLocales {
+    pub pistes: HashSet<i64>,
+    pub albums: HashSet<i64>,
+}
+
+/// #8088 — lit les marques explicites de la bibliothèque locale
+/// (`tracks.explicit = 1`, index partiel `idx_tracks_explicit`).
+pub fn marques_explicites_locales(db: &Arc<dyn DbBackend>) -> Result<MarquesLocales, String> {
+    let lignes = db.query_many("SELECT id, album_id FROM tracks WHERE explicit = 1", &[])?;
+    let mut m = MarquesLocales::default();
+    for l in lignes {
+        if let Some(id) = l.first().and_then(|v| v.as_i64()) {
+            m.pistes.insert(id);
+        }
+        if let Some(album) = l.get(1).and_then(|v| v.as_i64()) {
+            m.albums.insert(album);
+        }
+    }
+    Ok(m)
+}
+
+/// #8088 — la piste locale `track_id` est-elle marquée explicite ?
+pub fn piste_locale_explicite(db: &Arc<dyn DbBackend>, track_id: i64) -> Result<bool, String> {
+    Ok(db
+        .query_one_strong(
+            "SELECT explicit FROM tracks WHERE id = ?",
+            &[&track_id as &dyn ToSqlValue],
+        )?
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+        == Some(1))
+}
+
+impl MarquesLocales {
+    /// L'objet est-il un contenu explicite : marqué par son service ou sa
+    /// balise, ou piste ou album local que la base marque ? `cle` : la clé du
+    /// tableau qui le porte (« albums » désigne des albums).
+    pub fn objet_explicite(&self, o: &serde_json::Map<String, Value>, cle: Option<&str>) -> bool {
+        if est_marque_explicite(o) {
+            return true;
+        }
+        if !Filtre::est_locale(o) {
+            return false;
+        }
+        if o.get("track_id")
+            .and_then(Value::as_i64)
+            .is_some_and(|t| self.pistes.contains(&t))
+        {
+            return true;
+        }
+        let Some(id) = o.get("id").and_then(Value::as_i64) else {
+            return false;
+        };
+        let piste = ["album_id", "duration_ms", "file_path"]
+            .iter()
+            .any(|k| o.contains_key(*k));
+        if piste {
+            self.pistes.contains(&id)
+        } else if cle == Some("albums") || o.contains_key("track_count") {
+            self.albums.contains(&id)
+        } else {
+            false
+        }
+    }
+
+    /// Retire de `corps`, à toute profondeur, les contenus explicites, et
+    /// rend leur nombre. Un `total` à la racine est diminué d'autant. La
+    /// racine elle-même n'est jamais retirée : voir [`Self::racine_explicite`].
+    pub fn filtrer(&self, corps: &mut Value) -> usize {
+        let retires = self.parcourir(corps, None);
+        if retires > 0
+            && let Some(total) = corps.get_mut("total")
+            && let Some(n) = total.as_u64()
+        {
+            *total = Value::from(n.saturating_sub(retires as u64));
+        }
+        retires
+    }
+
+    /// La réponse entière est la fiche d'un contenu explicite (page d'un
+    /// album, d'une piste) : elle est refusée, pas vidée.
+    pub fn racine_explicite(&self, corps: &Value) -> bool {
+        corps
+            .as_object()
+            .is_some_and(|o| self.objet_explicite(o, None))
+    }
+
+    fn parcourir(&self, v: &mut Value, cle: Option<&str>) -> usize {
+        match v {
+            Value::Array(elements) => {
+                let avant = elements.len();
+                elements.retain(|e| match e {
+                    Value::Object(o) => !self.objet_explicite(o, cle),
+                    _ => true,
+                });
+                let mut retires = avant - elements.len();
+                for e in elements.iter_mut() {
+                    retires += self.parcourir(e, None);
+                }
+                retires
+            }
+            Value::Object(o) => o
+                .iter_mut()
+                .filter(|(_, e)| e.is_array() || e.is_object())
+                .map(|(k, e)| self.parcourir(e, Some(k.as_str())))
+                .sum(),
+            _ => 0,
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "politique_parentale_tests_7856.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "politique_parentale_tests_8088.rs"]
+mod tests_8088;

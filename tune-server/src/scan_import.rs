@@ -304,6 +304,8 @@ pub fn build_track_row(
     track.rating = meta.rating.map(i32::from);
     // #6332 — le débit moyen du fichier, lu au scan et jusqu'ici jeté.
     track.bitrate_kbps = meta.bitrate_kbps.and_then(|b| i32::try_from(b).ok());
+    // #8088 — le marquage explicite de la balise (`ITUNESADVISORY`, `rtng`).
+    track.explicit = meta.explicit;
     track.label = meta.label.clone();
     track.isrc = meta.isrc.clone();
     track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();

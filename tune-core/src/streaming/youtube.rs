@@ -809,6 +809,7 @@ impl YouTubeService {
                     "youtube#playlist" => {
                         albums.push(StreamAlbum {
                             ai_generated: None,
+                            explicit: None,
                             release_type: None,
                             id: item["id"]["playlistId"].as_str().unwrap_or("").into(),
                             title: title.into(),
@@ -1686,6 +1687,7 @@ impl YouTubeService {
 
         StreamAlbum {
             ai_generated: None,
+            explicit: None,
             release_type: None,
             id: item["id"].as_str().unwrap_or("").into(),
             title: snippet["title"].as_str().unwrap_or("").into(),
@@ -1864,6 +1866,7 @@ impl YouTubeService {
 
         StreamAlbum {
             ai_generated: None,
+            explicit: None,
             release_type: None,
             id: browse_id,
             title,
@@ -1986,6 +1989,7 @@ impl YouTubeService {
                 } else if page_type.contains("ALBUM") || subtitle.to_lowercase().contains("album") {
                     albums.push(StreamAlbum {
                         ai_generated: None,
+                        explicit: None,
                         release_type: None,
                         id: browse_id.to_string(),
                         title: title_text.to_string(),
@@ -2187,6 +2191,7 @@ impl YouTubeService {
 
                         albums.push(StreamAlbum {
                             ai_generated: None,
+                            explicit: None,
                             release_type: None,
                             id: browse_id.into(),
                             title: title.into(),
@@ -2691,6 +2696,7 @@ impl YouTubeService {
 
         Some(StreamAlbum {
             ai_generated: None,
+            explicit: None,
             release_type: None,
             id: String::new(), // Caller sets this
             title: title.into(),
@@ -2800,6 +2806,7 @@ impl YouTubeService {
 
                         albums.push(StreamAlbum {
                             ai_generated: None,
+                            explicit: None,
                             release_type: None,
                             id: browse_id.into(),
                             title: title.into(),
@@ -3026,6 +3033,7 @@ impl YouTubeService {
 
                         albums.push(StreamAlbum {
                             ai_generated: None,
+                            explicit: None,
                             release_type: None,
                             id: item_id.into(),
                             title: item_title.into(),
