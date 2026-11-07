@@ -1559,6 +1559,7 @@ mod tests {
     fn sa(id: &str, artiste: &str, an: u32) -> StreamAlbum {
         StreamAlbum {
             ai_generated: None,
+            explicit: None,
             release_type: None,
             id: id.into(),
             title: format!("T{id}"),

@@ -83,6 +83,9 @@ pub enum Feature {
     /// Subsonic / OpenSubsonic. Premium, désactivé par défaut (Bertrand,
     /// 04/11/2026).
     Subsonic,
+    /// « Suréchantillonnage » (#7614) : le greffon de suréchantillonnage de
+    /// la sortie locale. Premium, comme le crossfeed (Bertrand, 07/11/2026).
+    Upsampling,
 }
 
 impl Feature {
@@ -121,6 +124,7 @@ impl Feature {
             // variante reste pour lire les droits déjà enregistrés.
             Feature::Aes67,
             Feature::Subsonic,
+            Feature::Upsampling,
         ]
     }
 
@@ -148,6 +152,7 @@ impl Feature {
             Feature::Concerts => "Concerts",
             Feature::Aes67 => "AES67 Output",
             Feature::Subsonic => "Subsonic Access",
+            Feature::Upsampling => "Upsampling",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
@@ -192,6 +197,7 @@ impl Feature {
             Feature::Concerts => "concerts",
             Feature::Aes67 => "aes67_output",
             Feature::Subsonic => "subsonic",
+            Feature::Upsampling => "upsampling",
             Feature::PlaylistTransfer => "playlist_transfer",
             Feature::AdvancedAlarms => "advanced_alarms",
             Feature::MultiProfiles => "multi_profiles",
@@ -1463,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyeight_features() {
+    fn all_premium_has_twentynine_features() {
         // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
         // premium doit être un acte conscient, pas un effet de bord. Passé de
         // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
@@ -1473,8 +1479,9 @@ mod tests {
         // 30/08 et 25/09/2026) ; puis à 28 avec `Aes67` (#7336, Bertrand,
         // 30/10/2026) ; puis à 29 avec `Subsonic` (#7855, Bertrand,
         // 04/11/2026) ; puis revenu à 28 sans `Concerts` (#7865, Bertrand,
-        // 04/11/2026 : le module n'est plus Premium).
-        assert_eq!(Feature::all_premium().len(), 28);
+        // 04/11/2026 : le module n'est plus Premium) ; puis à 29 avec
+        // `Upsampling` (#7614, Bertrand, 07/11/2026).
+        assert_eq!(Feature::all_premium().len(), 29);
     }
 
     #[test]

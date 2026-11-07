@@ -174,26 +174,48 @@ pub fn noter_erreur(settings: &SettingsRepo, zone_id: i64, device_id: &str) -> R
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FormatJoue {
     pub codec: String,
+    /// Toujours renseignée : le site exige la fréquence de chaque format
+    /// (`formats.*.sample_rate`, de 8 kHz à 24,576 MHz).
     pub sample_rate: Option<u32>,
+    /// Absente au-delà de 32 bits, que le site refuse.
     pub bit_depth: Option<u16>,
     /// `native`, `dop`, ou absent quand le mode n'a pas été mesuré.
     pub dsd_mode: Option<String>,
 }
 
+/// Les bornes du schéma du site (`StoreTuneTestedPropositionRequest`).
+const FREQUENCE_MIN_SITE: u32 = 8_000;
+const FREQUENCE_MAX_SITE: u32 = 24_576_000;
+const PROFONDEUR_MAX_SITE: u16 = 32;
+
 /// Exactement ce qui part vers le site : l'aperçu montré à l'utilisateur et
 /// le corps de l'envoi sont cette même valeur.
+///
+/// #8084 — les noms des champs sont ceux que la route du site lit
+/// (`POST /api/v1/tune-tested/propositions`, renesenses/site-mozaiklabs
+/// `StoreTuneTestedPropositionRequest`) : `brand`, `gapless`, `bit_depth`,
+/// `dsd`. Avant, `manufacturer` et `gapless_observed` partaient vers une
+/// adresse que le site ne sert pas (#8033).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Proposition {
     pub schema_version: u8,
-    /// Clé stable de l'appareil (fabricant, modèle, type de sortie) : avec
-    /// l'identifiant d'instance, le site garde une proposition par appareil
-    /// et par installation, la nouvelle remplaçant l'ancienne.
+    /// Clé stable de l'appareil (fabricant, modèle, type de sortie), gardée
+    /// localement pour `already_proposed`. Le site, lui, garde une
+    /// proposition par fiche du catalogue et par identifiant d'instance.
     pub device_key: String,
+    #[serde(rename = "brand")]
     pub manufacturer: String,
     pub model: String,
     pub commercial_name: Option<String>,
+    /// Le type de sortie, dans le vocabulaire du site (`airplay` pour
+    /// AirPlay 1).
     pub output_type: String,
     pub formats: Vec<FormatJoue>,
+    /// La plus grande profondeur PCM jouée, si elle est connue.
+    pub bit_depth: Option<u16>,
+    /// `native` si du DSD natif a été joué, sinon `dop`, sinon absent.
+    pub dsd: Option<String>,
+    #[serde(rename = "gapless")]
     pub gapless_observed: bool,
     pub error_free_seconds: u64,
     pub tune_version: String,
@@ -208,6 +230,10 @@ pub struct EtatProposition {
     pub threshold_seconds: u64,
     pub remaining_seconds: u64,
     pub already_proposed: bool,
+    /// #8084 — l'appareil figure déjà au catalogue Tune tested téléchargé :
+    /// la proposition reste permise, elle ajoute le foyer de l'utilisateur
+    /// (et sa configuration, si elle diffère, est jointe pour examen).
+    pub already_tune_tested: bool,
     /// Pourquoi la proposition n'est pas possible : `below_threshold`,
     /// `no_device` ou `device_unidentified`.
     pub reason: Option<&'static str>,
@@ -231,31 +257,75 @@ fn nom_commercial(fabricant: &str, modele: &str) -> Option<String> {
     descriptif(&format!("{} {}", marque.name, modele.name))
 }
 
+/// Le type de sortie tel que le site le nomme : il dit `airplay` là où Tune
+/// distingue `airplay1`.
+fn sortie_du_site(protocole: &str) -> &str {
+    match protocole {
+        "airplay1" => "airplay",
+        autre => autre,
+    }
+}
+
 fn proposition(compteur: &CompteurZone) -> Option<Proposition> {
     let fabricant = compteur.fabricant.as_deref()?;
     let modele = compteur.modele.as_deref()?;
     let sortie = compteur.protocole.as_deref()?;
+    let formats: Vec<FormatJoue> = compteur
+        .formats
+        .iter()
+        // Le site exige une fréquence dans ses bornes : un format sans
+        // fréquence connue ne part pas, plutôt que de faire refuser le tout.
+        .filter(|f| {
+            f.sample_rate
+                .is_some_and(|n| (FREQUENCE_MIN_SITE..=FREQUENCE_MAX_SITE).contains(&n))
+        })
+        .map(|f| FormatJoue {
+            codec: f.codec.clone(),
+            sample_rate: f.sample_rate,
+            bit_depth: f.bit_depth.filter(|b| *b <= PROFONDEUR_MAX_SITE),
+            dsd_mode: f.dsd_mode.clone(),
+        })
+        .collect();
+    let bit_depth = formats
+        .iter()
+        .filter(|f| f.codec != "dsd")
+        .filter_map(|f| f.bit_depth)
+        .max();
+    let dsd = if formats
+        .iter()
+        .any(|f| f.dsd_mode.as_deref() == Some("native"))
+    {
+        Some("native".to_owned())
+    } else if formats.iter().any(|f| f.dsd_mode.as_deref() == Some("dop")) {
+        Some("dop".to_owned())
+    } else {
+        None
+    };
     Some(Proposition {
         schema_version: SCHEMA_VERSION,
         device_key: cle_appareil(fabricant, modele, sortie),
         manufacturer: fabricant.to_owned(),
         model: modele.to_owned(),
         commercial_name: nom_commercial(fabricant, modele),
-        output_type: sortie.to_owned(),
-        formats: compteur
-            .formats
-            .iter()
-            .map(|f| FormatJoue {
-                codec: f.codec.clone(),
-                sample_rate: f.sample_rate,
-                bit_depth: f.bit_depth,
-                dsd_mode: f.dsd_mode.clone(),
-            })
-            .collect(),
+        output_type: sortie_du_site(sortie).to_owned(),
+        formats,
+        bit_depth,
+        dsd,
         gapless_observed: compteur.gapless_constate,
         error_free_seconds: compteur.millisecondes_sans_erreur / 1000,
         tune_version: crate::version().to_owned(),
         platform: std::env::consts::OS.to_owned(),
+    })
+}
+
+/// #8084 — l'appareil est-il déjà au catalogue Tune tested téléchargé ?
+/// Par marque et modèle seulement : « déjà Tune tested » vaut pour
+/// l'appareil, quelle que soit la sortie par laquelle on l'écoute.
+fn deja_au_catalogue(settings: &SettingsRepo, apercu: &Proposition) -> bool {
+    super::tune_tested::catalogue_range(settings).is_some_and(|c| {
+        c.devices
+            .iter()
+            .any(|d| d.correspond(&apercu.manufacturer, &apercu.model))
     })
 }
 
@@ -286,12 +356,18 @@ pub fn etat(settings: &SettingsRepo, zone_id: i64, device_id: Option<&str>) -> E
     let already_proposed = apercu
         .as_ref()
         .is_some_and(|p| envoyees(settings).contains(&p.device_key));
+    // Jamais un motif de refus : un appareil déjà validé se propose encore,
+    // pour ajouter un foyer (#8084).
+    let already_tune_tested = apercu
+        .as_ref()
+        .is_some_and(|p| deja_au_catalogue(settings, p));
     EtatProposition {
         eligible: reason.is_none(),
         seconds_without_error: ms / 1000,
         threshold_seconds: SEUIL_MS / 1000,
         remaining_seconds: SEUIL_MS.saturating_sub(ms).div_ceil(1000),
         already_proposed,
+        already_tune_tested,
         reason,
         preview: apercu,
     }

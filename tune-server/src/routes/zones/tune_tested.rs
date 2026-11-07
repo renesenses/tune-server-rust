@@ -21,8 +21,12 @@ use tune_core::db::zone_repo::ZoneRepo;
 
 use crate::state::AppState;
 
-/// Chemin de la route du site qui reçoit les propositions.
-pub(crate) const CHEMIN_DU_SITE: &str = "/api/v1/community/tune-tested/proposals";
+/// Chemin de la route du site qui reçoit les propositions : celle que le site
+/// sert (`routes/api.php` de renesenses/site-mozaiklabs,
+/// `TuneTestedPropositionController::store`). L'ancien chemin
+/// `/api/v1/community/tune-tested/proposals` n'existait pas côté site : toute
+/// proposition revenait « refusée par le site » (#8033, #8084).
+pub(crate) const CHEMIN_DU_SITE: &str = "/api/v1/tune-tested/propositions";
 
 /// La racine est celle du catalogue Tune tested (`RACINE_PAR_DEFAUT`, ou
 /// `mozaik_base_url`), pour que les deux ne divergent pas.
@@ -77,6 +81,7 @@ fn vue(settings: &SettingsRepo, etat: &EtatProposition) -> Value {
         "threshold_seconds": etat.threshold_seconds,
         "remaining_seconds": etat.remaining_seconds,
         "already_proposed": etat.already_proposed,
+        "already_tune_tested": etat.already_tune_tested,
         "reason": etat.reason,
         "preview": etat.preview.as_ref().map(|p| corps_envoye(settings, p)),
     })
@@ -184,7 +189,13 @@ pub async fn proposer_tune_tested(
             Json(json!({
                 "status": "ok",
                 "already_proposed": true,
-                "proposal": data.get("proposal").cloned().unwrap_or(Value::Null),
+                "already_tune_tested": etat.already_tune_tested,
+                // Le site rend `proposition` ({id, status}).
+                "proposal": data
+                    .get("proposition")
+                    .or_else(|| data.get("proposal"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
             }))
             .into_response()
         }

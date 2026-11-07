@@ -163,6 +163,7 @@ impl StreamingService for Doublure {
     async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         Ok(vec![StreamAlbum {
             ai_generated: None,
+            explicit: None,
             release_type: None,
             id: format!("{}-nouveaute-1", self.0),
             title: format!("Inedits chez {}", self.0),

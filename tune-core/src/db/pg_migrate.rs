@@ -270,6 +270,10 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "tenue des versions du schema SQLite ; PostgreSQL a sa propre `schema_version`",
     ),
     (
+        "library_revision",
+        "compteur de révision de la bibliothèque (#7619) : une seule ligne, recréée par sa propre installation côté PostgreSQL ; une révision neuve invalide les caches clients, ce qui est voulu après une bascule",
+    ),
+    (
         "albums_fts",
         "index plein texte FTS5 de SQLite, sans equivalent a copier en PostgreSQL",
     ),
@@ -309,6 +313,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
     (
         "bpm_estimes",
         "BPM estimes (Wikidata ou signal, #4805) : se remesurent ; les balises BPM restent dans `tracks`",
+    ),
+    (
+        "ecoutes_parentales",
+        "temps ecoute des profils supervises (#7974) : compteurs du jour et de la semaine ISO, \
+         perdus au plus pour la semaine en cours ; les politiques, elles, sont copiees",
     ),
 ];
 
@@ -448,7 +457,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     rating TEXT,
     -- Debit moyen du fichier (#6332). TEXT pour la copie, comme `rating` ;
     -- la migration 094 le convertit en BIGINT.
-    bitrate_kbps TEXT
+    bitrate_kbps TEXT,
+    -- Marquage explicite de la balise (#8088). TEXT pour la copie, comme
+    -- `rating` ; la migration 107 le convertit en BIGINT.
+    explicit TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -1160,6 +1172,14 @@ CREATE TABLE IF NOT EXISTS politiques_parentales (
  politique_json TEXT NOT NULL,
  maj_le TEXT NOT NULL
 );
+-- Temps écouté des profils supervisés (#7974), mêmes types que
+-- migrations/ecoutes_parentales.sql. Non copiée à la bascule.
+CREATE TABLE IF NOT EXISTS ecoutes_parentales (
+ profile_id BIGINT NOT NULL,
+ jour TEXT NOT NULL,
+ secondes BIGINT NOT NULL DEFAULT 0,
+ PRIMARY KEY (profile_id, jour)
+);
 -- Trace des tentatives d'enrichissement (#7983). Sans script numéroté :
 -- présente ici ET dans `ENSURE_TABLES`, mêmes types
 -- (migrations/enrich_tentatives.sql). Non copiée (TABLES_NON_COPIEES).
@@ -1389,6 +1409,9 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating TEXT;
 -- tracks: debit moyen du fichier en kbit/s (SQLite migration v130 / PG 094,
 -- #6332). TEXT pour la copie ; la 094, rejouee juste apres, le convertit.
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bitrate_kbps TEXT;
+-- tracks: marquage explicite de la balise (SQLite migration v141 / PG 107,
+-- #8088). TEXT pour la copie ; la 107, rejouee juste apres, le convertit.
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS explicit TEXT;
 -- tracks: cle de tri de la vue des pistes (#7619, L1, sans numero). Copiee
 -- telle quelle ; recalculee de toute facon par `assurer_les_cles_de_tri`.
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE "C";

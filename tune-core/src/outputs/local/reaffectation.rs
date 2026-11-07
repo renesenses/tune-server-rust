@@ -342,6 +342,7 @@ mod tests {
             spec: AudioSpec::nouvelle(48_000, ProfondeurPcm::Entier24, 4).expect("spec"),
             sortie: FormatOuvert::new(48_000, 6),
             needs_resample: false,
+            surechantillonneur: None,
         };
         let quad = vec![0.125f32, 0.25, 0.375, 0.5];
         assert_eq!(
@@ -505,6 +506,7 @@ mod tests {
             spec: source,
             sortie: FormatOuvert::new(48_000, ouvert.channels),
             needs_resample: false,
+            surechantillonneur: None,
         };
         let cinq_un = vec![0.125f32, 0.25, 0.375, 0.5, 0.625, 0.75];
         assert_eq!(

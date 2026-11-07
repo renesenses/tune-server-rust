@@ -370,6 +370,13 @@ pub struct Track {
     /// au rescan suivant) ou débit inconnu.
     #[serde(default)]
     pub bitrate_kbps: Option<i32>,
+    /// #8088 — la piste est-elle marquée EXPLICITE par sa balise
+    /// (`ITUNESADVISORY` = 1 ou 4, MP4 `rtng`) — `tracks.explicit` ?
+    /// `Some(false)` : la balise dit « propre » ou « sans avertissement » ;
+    /// `None` : aucune balise, ou pas encore relue. Seul `Some(true)` vaut
+    /// explicite pour le contrôle parental.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit: Option<bool>,
     pub label: Option<String>,
     pub musicbrainz_recording_id: Option<String>,
     pub cover_path: Option<String>,
@@ -463,6 +470,7 @@ impl Track {
             bpm: None,
             rating: None,
             bitrate_kbps: None,
+            explicit: None,
             label: None,
             musicbrainz_recording_id: None,
             cover_path: None,
@@ -705,6 +713,7 @@ mod tests {
             cue_end_ms: None,
             rating: None,
             bitrate_kbps: None,
+            explicit: None,
         };
         let json = serde_json::to_value(&track).unwrap();
         assert_eq!(json["title"], "So What");

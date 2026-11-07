@@ -147,7 +147,8 @@ fn ph(engine: Engine, idx: usize) -> String {
 /// Aggregated home page: returns all sections in a single response.
 async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     // No zone filter for the aggregated home page — show all zones.
-    let continue_items = fetch_continue_listening(&state, 10, None)?;
+    let en_cours = lectures_en_cours(&state).await;
+    let continue_items = continuer_l_ecoute(&state, 10, None, &en_cours)?;
     // L'accueil agrege garde SA fenetre de 7 jours : c'est une vignette, pas
     // l'onglet. La fenetre choisie vit sur `/home/recently-added` (#3039).
     let recent_items = fetch_recently_added(&state, 20, borne_basse_de_fenetre(None)?)?;
@@ -216,7 +217,8 @@ async fn continue_listening(
     // that were played on that specific zone. This prevents zone mismatch:
     // the client sends the CURRENT active zone, not a stored zone from
     // history (DEvir QA B-09).
-    let items = fetch_continue_listening(&state, limit, p.zone_id)?;
+    let en_cours = lectures_en_cours(&state).await;
+    let items = continuer_l_ecoute(&state, limit, p.zone_id, &en_cours)?;
     Ok(Json(json!(items)))
 }
 
@@ -270,22 +272,164 @@ fn marge_de_contextes(limit: i64) -> i64 {
 /// quelle en second rang, et ses albums sont fusionnes avec les contextes —
 /// dedoublonnes par identifiant d'album, le contexte primant puisque lui seul
 /// porte le rang.
+#[cfg(test)]
 fn fetch_continue_listening(
     state: &AppState,
     limit: i64,
     zone_id: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
+    continuer_l_ecoute(state, limit, zone_id, &[])
+}
+
+/// #8085 — ce qu'une zone joue EN CE MOMENT : son contexte de session et
+/// la piste diffusée. « Reprendre l'écoute » ne propose pas ce qui joue déjà
+/// (Bertrand, 07/11 : le mix en cours figurait parmi les reprises).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LectureEnCours {
+    pub(crate) contexte_type: Option<String>,
+    pub(crate) contexte_id: Option<String>,
+    pub(crate) contexte_source: Option<String>,
+    pub(crate) source: String,
+    pub(crate) source_id: Option<String>,
+    pub(crate) track_id: Option<i64>,
+}
+
+/// Les lectures en cours de toutes les zones (état `playing`).
+pub(crate) async fn lectures_en_cours(state: &AppState) -> Vec<LectureEnCours> {
+    state
+        .playback
+        .all_states()
+        .await
+        .into_iter()
+        .filter(|z| matches!(z.state, tune_core::playback::PlayState::Playing))
+        .filter_map(|z| {
+            let np = z.now_playing?;
+            Some(LectureEnCours {
+                contexte_type: z.session_context_type,
+                contexte_id: z.session_context_id,
+                contexte_source: z.session_context_source,
+                source: np.source,
+                source_id: np.source_id,
+                track_id: np.track_id,
+            })
+        })
+        .collect()
+}
+
+/// La piste d'une reprise qu'on reprendrait : `(source, source_id, track_id)`.
+type PisteDeReprise<'a> = (&'a str, Option<&'a str>, Option<i64>);
+
+/// #8085 — cette entrée est-elle ce qui joue en ce moment ? Le même contexte
+/// (type + identifiant, service s'il est connu des deux côtés), ou, pour une
+/// piste seule et un épisode, la même piste.
+fn est_en_cours(
+    nature: &str,
+    contexte_id: &str,
+    source: &str,
+    piste: Option<PisteDeReprise<'_>>,
+    en_cours: &[LectureEnCours],
+) -> bool {
+    use tune_core::db::listening_resume::cle_d_episode;
+    en_cours.iter().any(|e| {
+        let meme_service = e
+            .contexte_source
+            .as_deref()
+            .is_none_or(|s| s == source || source.is_empty());
+        let meme_contexte = e.contexte_type.as_deref() == Some(nature)
+            && e.contexte_id.as_deref() == Some(contexte_id)
+            && meme_service;
+        let meme_piste = matches!(nature, "track" | "podcast")
+            && piste.is_some_and(|(src, sid, tid)| {
+                (tid.is_some() && tid == e.track_id)
+                    || (src == e.source
+                        && sid.is_some_and(|sid| {
+                            e.source_id
+                                .as_deref()
+                                .is_some_and(|x| cle_d_episode(x) == cle_d_episode(sid))
+                        }))
+            });
+        meme_contexte || meme_piste
+    })
+}
+
+/// #8085 — l'interprète et l'album de la piste qu'on reprendrait, pour que
+/// la carte dise ce qu'elle reprend (sous-titres absents sur le .18). Le
+/// service les a rangés dans la ligne ; une piste locale les relit.
+fn interprete_et_album(
+    state: &AppState,
+    r: &tune_core::db::listening_resume::Resume,
+) -> (Option<String>, Option<String>) {
+    use tune_core::db::play_queue_repo::QueueInput;
+    let non_vide = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    match r.items.get(r.position).or(r.items.first()) {
+        Some(QueueInput::Streaming { artist, album, .. }) => {
+            (non_vide(Some(artist.clone())), non_vide(album.clone()))
+        }
+        Some(QueueInput::Local { track_id }) => state
+            .backend
+            .query_one(
+                "SELECT ar.name, al.title FROM tracks t \
+                 LEFT JOIN artists ar ON ar.id = t.artist_id \
+                 LEFT JOIN albums al ON al.id = t.album_id WHERE t.id = ?",
+                &[track_id as &dyn ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .map(|row| {
+                (
+                    non_vide(row.first().and_then(|v| v.as_string())),
+                    non_vide(row.get(1).and_then(|v| v.as_string())),
+                )
+            })
+            .unwrap_or((None, None)),
+        None => (None, None),
+    }
+}
+
+fn piste_de_reprise(r: &tune_core::db::listening_resume::Resume) -> Option<PisteDeReprise<'_>> {
+    use tune_core::db::play_queue_repo::QueueInput;
+    match r.items.get(r.position).or(r.items.first())? {
+        QueueInput::Streaming {
+            source, source_id, ..
+        } => Some((source.as_str(), Some(source_id.as_str()), None)),
+        QueueInput::Local { track_id } => Some(("local", None, Some(*track_id))),
+    }
+}
+
+fn continuer_l_ecoute(
+    state: &AppState,
+    limit: i64,
+    zone_id: Option<i64>,
+    en_cours: &[LectureEnCours],
+) -> Result<Vec<Value>, AppError> {
     let limit = limit.clamp(1, 200);
     let fresh = tune_core::db::listening_resume::recent(&state.backend, zone_id, limit)
         .map_err(AppError::internal)?;
     let mut seen = std::collections::HashSet::new();
-    let mut items: Vec<Value> = fresh.into_iter().map(|r| {
-        seen.insert((r.context_type.clone(), r.context_id.clone(), r.source.clone()));
-        json!({"resume_key": r.resume_key, "context_type": r.context_type, "context_id": r.context_id,
+    let mut items: Vec<Value> = Vec::new();
+    for r in fresh {
+        // Vue, même écartée : le second rang ne doit pas la réintroduire.
+        seen.insert((
+            r.context_type.clone(),
+            r.context_id.clone(),
+            r.source.clone(),
+        ));
+        if est_en_cours(
+            &r.context_type,
+            &r.context_id,
+            &r.source,
+            piste_de_reprise(&r),
+            en_cours,
+        ) {
+            continue;
+        }
+        let (artist_name, album_title) = interprete_et_album(state, &r);
+        items.push(json!({"resume_key": r.resume_key, "context_type": r.context_type, "context_id": r.context_id,
             "source": r.source, "title": r.title, "last_track_title": r.last_track_title,
+            "artist_name": artist_name, "album_title": album_title,
             "cover_path": r.cover_path, "album_id": r.album_id, "id": r.album_id.unwrap_or(0),
-            "position": r.position, "position_ms": r.position_ms})
-    }).collect();
+            "position": r.position, "position_ms": r.position_ms}));
+    }
     for old in fetch_continue_listening_borne(state, limit, zone_id, BORNE_SECOND_RANG)? {
         let nature = old["context_type"].as_str().unwrap_or("album");
         if !matches!(nature, "album" | "playlist" | "track" | "podcast") {
@@ -296,6 +440,9 @@ fn fetch_continue_listening(
             old["context_id"].as_str().unwrap_or_default().to_string(),
             old["source"].as_str().unwrap_or("local").to_string(),
         );
+        if est_en_cours(&key.0, &key.1, &key.2, None, en_cours) {
+            continue;
+        }
         if seen.insert(key) {
             items.push(old);
         }
