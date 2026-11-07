@@ -614,8 +614,9 @@ async fn levels_chain_emits_audio_levels_on_bus() {
 /// Garde de COMPORTEMENT, pas de texte : une même fenêtre à PLEINE ÉCHELLE
 /// part deux fois dans la chaîne réelle (forwarder cadencé → bus), et c'est la
 /// valeur PUBLIÉE qui est lue.
-///   * sans gain branché — tout chemin non local — elle vaut 0 dBFS, surcharge
-///     allumée : la mesure d'avant, inchangée ;
+///   * sans gain branché — tout chemin non local — elle vaut 0 dBFS ; la
+///     surcharge reste ÉTEINTE (#7100) : rien n'a écrêté la sortie, seule la
+///     source touche le plein, ce que dit `source_over_left` ;
 ///   * avec le gain de la sortie à 0,5 (−6,02 dB), elle vaut −6 dBFS et la
 ///     surcharge S'ÉTEINT — ce que GgB attendait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -682,7 +683,10 @@ async fn le_cretemetre_suit_le_gain_de_la_sortie() {
         brut_db > -0.1,
         "une fenêtre à pleine échelle sans gain doit se lire à 0 dBFS, lu {brut_db}"
     );
-    assert!(brut_over, "pleine échelle sans gain ⇒ surcharge");
+    assert!(
+        !brut_over,
+        "#7100 — source à pleine échelle sans gain : rien n'écrête la sortie, pas d'OVER"
+    );
     assert_eq!(brut_gain_db, 0.0, "aucun gain déclaré ⇒ 0 dB annoncé");
 
     // La même fenêtre, avec la sortie qui atténue de 6 dB (préampli −6 dB à
@@ -711,7 +715,10 @@ async fn le_cretemetre_suit_le_gain_de_la_sortie() {
         rendu_db > -0.1,
         "gain revenu à l'unité ⇒ 0 dBFS, lu {rendu_db}"
     );
-    assert!(rendu_over, "gain revenu à l'unité ⇒ surcharge de retour");
+    assert!(
+        !rendu_over,
+        "#7100 — gain revenu à l'unité : la source au plein n'est toujours pas un écrêtage"
+    );
     assert_eq!(rendu_gain_db, 0.0);
 }
 
@@ -7071,10 +7078,11 @@ async fn zone_navigateur_une_recreation_de_flux_ne_doublonne_pas_l_historique() 
     );
 }
 
-/// La radio n'entre pas dans l'historique local — même exclusion que le
-/// chemin nominal, pour la même raison (titre figé au démarrage).
+/// #7965 — la radio s'écrit une fois, au nom de la station (l'`album` que
+/// `jouer_un_flux` remplit), jamais au titre figé du démarrage — même règle
+/// que le chemin nominal.
 #[tokio::test]
-async fn zone_navigateur_la_radio_reste_hors_de_l_historique() {
+async fn zone_navigateur_la_radio_s_ecrit_au_nom_de_la_station() {
     let orch = test_orchestrator();
     let zone_id = ZoneRepo::with_backend(orch.db.clone())
         .create("Ce PC", Some("browser"), None)
@@ -7089,11 +7097,16 @@ async fn zone_navigateur_la_radio_reste_hors_de_l_historique() {
         .insert(zone_id, annonce_en_attente(&sid, true, "radio"));
 
     assert!(orch.confirmer_lecture_navigateur(zone_id, &sid).await);
+    let lignes = crate::db::history_repo::HistoryRepo::with_backend(orch.db.clone())
+        .recent(10)
+        .unwrap();
     assert_eq!(
-        lignes_historique(&orch),
-        0,
-        "la radio ne s'écrit pas dans listen_history"
+        lignes.len(),
+        1,
+        "une ligne par lancement de radio : {lignes:?}"
     );
+    assert_eq!(lignes[0].title, "Unholy Hymns", "le nom de la station");
+    assert_eq!(lignes[0].context_type.as_deref(), Some("radio"));
 }
 
 /// Une lecture abandonnée avant le premier octet ne s'annonce jamais, même

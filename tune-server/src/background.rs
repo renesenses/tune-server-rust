@@ -1453,9 +1453,21 @@ fn spawn_token_refresher(state: &AppState) {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             ticker.tick().await;
-            let registry = services.lock().await;
-            for name in registry.list() {
-                if let Some(svc) = registry.get(&name) {
+            // #7729 — copier les services puis relâcher le registre AVANT
+            // d'attendre un verrou d'écriture ou le réseau. Tenu pendant le
+            // tour, il bloquait toutes les routes de streaming (`get_svc`)
+            // dès qu'un service était occupé en lecture : gel complet de
+            // Tune, sans une ligne de journal.
+            let a_rafraichir: Vec<_> = {
+                let registry = services.lock().await;
+                registry
+                    .list()
+                    .into_iter()
+                    .filter_map(|name| registry.get(&name).map(|svc| (name, svc)))
+                    .collect()
+            };
+            for (name, svc) in a_rafraichir {
+                {
                     let mut svc = svc.write().await;
                     match svc.refresh_if_needed().await {
                         Ok(true) => {
