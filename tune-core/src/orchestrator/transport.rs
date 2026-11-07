@@ -314,6 +314,9 @@ impl PlaybackOrchestrator {
         // dormant auto-discovered zones filled the quota AND closes the "play a
         // few zones at a time to stay free" loophole.
         self.enforce_zone_cap(req.zone_id).await?;
+        // #7974 — le bail d'écoute d'un profil supervisé, au même point
+        // d'étranglement : hors plage ou budget épuisé, rien ne part.
+        self.verifier_le_bail(req.zone_id).await?;
         // #8088 — un contenu marqué explicite, pour un profil dont la
         // politique parentale le masque : rien ne part.
         self.verifier_le_contenu_explicite(&req).await?;
@@ -3267,6 +3270,11 @@ impl PlaybackOrchestrator {
         device_id: Option<&str>,
         session_message: impl Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync,
     ) -> OutputCommandResult<()> {
+        // #7974 — mettre en pause avant la fin du bail puis reprendre après
+        // ne rouvre pas la lecture.
+        self.verifier_le_bail(zone_id)
+            .await
+            .map_err(|e| OutputCommandError::failed(OutputCommand::Resume, e))?;
         self.reprendre(zone_id, device_id, &session_message, false)
             .await
     }
