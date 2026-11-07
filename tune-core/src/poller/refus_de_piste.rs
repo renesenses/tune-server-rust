@@ -43,7 +43,20 @@
 /// (`crate::source_url`, Tune Circle #5327) dit que CETTE piste ne se joue
 /// pas — retirée du partage, introuvable. Le refus vient du greffon, par la
 /// marque qu'il pose lui-même : jamais d'une panne.
-const MOTIFS_PROPRES_A_LA_PISTE: [&str; 2] = ["no url", crate::source_url::MOTIF_PISTE_REFUSEE];
+///
+/// `parental_explicit_refused` (#8088) : la politique parentale du profil
+/// refuse CETTE piste, marquée explicite. La suivante, non marquée, se joue :
+/// un album qui compte des titres explicites continue sans eux.
+const MOTIFS_PROPRES_A_LA_PISTE: [&str; 3] = [
+    "no url",
+    crate::source_url::MOTIF_PISTE_REFUSEE,
+    crate::db::politique_parentale::CODE_REFUS_EXPLICITE,
+];
+
+/// #7778 (points 3 et 4) — ce que l'auditeur lit à la place du motif brut
+/// (« no url ») quand le service refuse cette piste seule.
+pub const MESSAGE_TITRE_INDISPONIBLE: &str =
+    "ce titre n'est pas disponible à la lecture chez le service (droits, région ou abonnement)";
 
 /// Ce refus ne vise-t-il QUE cette piste ?
 ///

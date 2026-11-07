@@ -50,7 +50,7 @@ pub fn depuis_etiquette(etiquette: &str) -> Option<&str> {
     }
 }
 
-/// Options passees a `mount.cifs` pour un essai.
+/// Options passees a `mount.cifs` pour un essai (service en root).
 ///
 /// `iocharset=utf8` est impose : sans lui, le noyau convertit les noms de
 /// fichiers avec le jeu de caracteres par defaut du systeme, qui n'est pas
@@ -60,31 +60,37 @@ pub fn depuis_etiquette(etiquette: &str) -> Option<&str> {
 /// `?` n'est pas son vrai nom : l'ouvrir echoue par `No such file or
 /// directory`, et la piste est perdue pour la bibliotheque.
 ///
+/// Les options sont TOUTES composees ici, a partir d'une liste fermee : aucune
+/// valeur venue du client n'entre dans la chaine. Les identifiants passent par
+/// `credentials=<fichier 0600>` ([`FichierIdentifiants`]) — ni sur la ligne de
+/// commande, ni dans une option ou une virgule les decouperait. `nosuid`,
+/// `nodev` et `noexec` : un partage de musique n'a rien a executer.
+///
 /// Les deux appelants (route interactive et remontage au demarrage) passent
 /// par ici : un partage monte en UTF-8 depuis l'assistant doit le rester au
 /// redemarrage.
-///
-/// La chaine porte le mot de passe : elle ne doit JAMAIS aller dans une trace.
-pub fn options_de_montage(user: &str, pass: &str, dialecte: Option<&str>) -> String {
-    let mut opts = format!("username={user},password={pass},iocharset=utf8");
-    if let Some(v) = dialecte {
+pub fn options_de_montage(fichier_identifiants: &str, dialecte: Option<&str>) -> String {
+    let mut opts = format!("credentials={fichier_identifiants},iocharset=utf8");
+    if let Some(v) = dialecte.filter(|v| DIALECTES.contains(&Some(*v))) {
         opts.push_str(&format!(",vers={v}"));
     }
+    opts.push_str(",nosuid,nodev,noexec");
     opts
 }
 
 /// La commande d'UN essai de montage Linux, selon le compte du service (#3206).
 ///
-/// - root : `mount.cifs <unc> <point> -o <options>`, comme toujours ;
+/// - root : `mount.cifs <unc> <point> -o <options>`, les identifiants dans
+///   `fichier_identifiants` (voir [`options_de_montage`]) ;
 /// - autre compte : `sudo -n tune-os-privilege smb-mount <unc> <point>
 ///   <utilisateur> <dialecte>`, le mot de passe sur l'entrée standard. C'est
-///   l'assistant qui compose les options, avec les MÊMES que
-///   [`options_de_montage`] plus `uid`/`gid` du compte appelant et
-///   `nosuid,nodev,noexec`.
+///   l'assistant qui compose les options, avec `uid`/`gid` du compte appelant
+///   et `nosuid,nodev,noexec`.
 ///
 /// Les deux appelants (route interactive, remontage au démarrage) passent par
-/// ici pour la même raison que l'échelle : ce qui monte d'un côté doit monter
-/// de l'autre.
+/// [`lancer_un_essai`] pour la même raison que l'échelle : ce qui monte d'un
+/// côté doit monter de l'autre.
+#[allow(clippy::too_many_arguments)]
 pub fn commande_de_montage(
     euid: u32,
     sudo: &str,
@@ -93,14 +99,204 @@ pub fn commande_de_montage(
     user: &str,
     pass: &str,
     dialecte: Option<&str>,
+    fichier_identifiants: &str,
 ) -> crate::privilege::Commande {
     use crate::privilege::Commande;
     if euid == 0 {
-        let opts = options_de_montage(user, pass, dialecte);
+        let opts = options_de_montage(fichier_identifiants, dialecte);
         Commande::directe("mount.cifs", &[unc, point, "-o", &opts])
     } else {
         Commande::par_l_assistant(sudo, "smb-mount", &[unc, point, user, etiquette(dialecte)])
             .avec_entree(pass)
+    }
+}
+
+/// Le fichier `credentials=` de `mount.cifs` : nom aléatoire, créé en
+/// exclusivité, droits 0600, supprimé à la fin de l'essai (`Drop`, panique et
+/// délai dépassé compris).
+pub struct FichierIdentifiants {
+    fichier: tempfile::NamedTempFile,
+}
+
+impl FichierIdentifiants {
+    pub fn creer(user: &str, pass: &str) -> std::io::Result<Self> {
+        use std::io::Write;
+        verifier_identifiants(user, pass)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let mut fichier = tempfile::Builder::new()
+            .prefix(".tune-smb-")
+            .rand_bytes(16)
+            .tempfile()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fichier
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        if fichier.path().to_string_lossy().contains(',') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "credentials file path contains a comma",
+            ));
+        }
+        write!(fichier, "username={user}\npassword={pass}\n")?;
+        fichier.as_file().sync_all()?;
+        Ok(Self { fichier })
+    }
+
+    pub fn chemin(&self) -> String {
+        self.fichier.path().to_string_lossy().into_owned()
+    }
+}
+
+/// Un essai de montage Linux, identifiants compris : la seule entrée des deux
+/// appelants. Le fichier d'identifiants ne vit que le temps de l'essai.
+pub async fn lancer_un_essai(
+    euid: u32,
+    sudo: &str,
+    unc: &str,
+    point: &str,
+    user: &str,
+    pass: &str,
+    dialecte: Option<&str>,
+) -> std::io::Result<std::process::Output> {
+    verifier_identifiants(user, pass)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if euid == 0 {
+        let identifiants = FichierIdentifiants::creer(user, pass)?;
+        let sortie = commande_de_montage(
+            euid,
+            sudo,
+            unc,
+            point,
+            user,
+            pass,
+            dialecte,
+            &identifiants.chemin(),
+        )
+        .lancer()
+        .await;
+        drop(identifiants);
+        sortie
+    } else {
+        commande_de_montage(euid, sudo, unc, point, user, pass, dialecte, "")
+            .lancer()
+            .await
+    }
+}
+
+/// Identifiants acceptables : aucun caractère de contrôle (un saut de ligne
+/// ajouterait une ligne au fichier `credentials=`), longueur bornée.
+pub fn verifier_identifiants(user: &str, pass: &str) -> Result<(), &'static str> {
+    if user.chars().any(char::is_control) || pass.chars().any(char::is_control) {
+        return Err("SMB credentials must not contain control characters");
+    }
+    if user.len() > 256 || pass.len() > 1024 {
+        return Err("SMB credentials are too long");
+    }
+    Ok(())
+}
+
+/// Un hôte SMB : nom, IPv4 ou IPv6 (zone `%` comprise), sans séparateur,
+/// sans espace, et qui ne commence pas par `-` (lu comme une option).
+pub fn verifier_hote(hote: &str) -> Result<(), &'static str> {
+    if hote.is_empty() || hote.len() > 253 || hote.starts_with('-') {
+        return Err("invalid SMB host");
+    }
+    if hote
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%' | '[' | ']'))
+    {
+        Ok(())
+    } else {
+        Err("invalid SMB host")
+    }
+}
+
+/// Un nom de partage : non vide, sans caractère de contrôle ni virgule, sans
+/// composant `..`.
+pub fn verifier_partage(partage: &str) -> Result<(), &'static str> {
+    if partage.trim().is_empty()
+        || partage.len() > 512
+        || partage.chars().any(|c| c.is_control() || c == ',')
+        || partage.split(['/', '\\']).any(|c| c == "..")
+        || partage.starts_with(['/', '\\'])
+    {
+        return Err("invalid SMB share name");
+    }
+    Ok(())
+}
+
+/// Le nom du point de montage d'un partage, sous la racine des montages :
+/// `<hôte>_<partage>`, chaque caractère hors de l'ensemble sûr remplacé par
+/// `_`. Un seul composant de chemin, jamais `.` ni `..`.
+pub fn nom_du_point(hote: &str, partage: &str) -> String {
+    let nettoyer = |s: &str, garde: &dyn Fn(char) -> bool| -> String {
+        s.chars().map(|c| if garde(c) { c } else { '_' }).collect()
+    };
+    let hote = nettoyer(hote, &|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%')
+    });
+    // Mêmes remplacements qu'avant pour le partage (`/`, `\`, espace) : les
+    // points déjà enregistrés gardent leur nom.
+    let partage = nettoyer(partage, &|c| {
+        !(c == '/' || c == '\\' || c == ' ' || c.is_control())
+    });
+    let nom = format!("{hote}_{partage}");
+    if nom.starts_with('.') {
+        format!("_{nom}")
+    } else {
+        nom
+    }
+}
+
+/// Le point de montage est-il un ENFANT DIRECT d'une des racines contrôlées
+/// par le serveur ?
+///
+/// Lexicalement d'abord (chemin absolu, aucun `.` ni `..`, parent égal à une
+/// racine) ; puis, sur disque, ni le point ni son parent ne doivent être un
+/// lien symbolique qui mènerait ailleurs. C'est la seule forme de chemin que
+/// la route de montage, le remontage au démarrage et l'oubli d'un partage
+/// acceptent : aucun chemin fourni par un client ne l'atteint.
+pub fn est_confine(point: &std::path::Path, racines: &[std::path::PathBuf]) -> bool {
+    use std::path::Component;
+    if !point.is_absolute()
+        || point
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return false;
+    }
+    let Some(nom) = point.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if nom.is_empty() || nom == "." || nom == ".." {
+        return false;
+    }
+    let Some(parent) = point.parent() else {
+        return false;
+    };
+    let normaliser = |p: &std::path::Path| -> std::path::PathBuf {
+        p.components().collect::<std::path::PathBuf>()
+    };
+    let Some(racine) = racines
+        .iter()
+        .find(|r| r.is_absolute() && normaliser(r) == normaliser(parent))
+    else {
+        return false;
+    };
+    if let Ok(meta) = std::fs::symlink_metadata(point)
+        && meta.file_type().is_symlink()
+    {
+        return false;
+    }
+    match (std::fs::canonicalize(parent), std::fs::canonicalize(racine)) {
+        (Ok(p), Ok(r)) => p == r,
+        // Racine absente : rien n'existe encore sous elle, le contrôle
+        // lexical suffit (le dossier sera créé par le serveur).
+        (Err(_), Err(_)) => true,
+        _ => false,
     }
 }
 
@@ -120,8 +316,17 @@ mod commande_de_montage_tests {
     use crate::privilege::{ASSISTANT, SUDO};
 
     #[test]
-    fn en_root_rien_ne_change() {
-        let c = commande_de_montage(0, SUDO, "//nas/m", "/mnt/nas_m", "u", "p", Some("2.0"));
+    fn en_root_les_identifiants_passent_par_un_fichier() {
+        let c = commande_de_montage(
+            0,
+            SUDO,
+            "//nas/m",
+            "/mnt/nas_m",
+            "u",
+            "p",
+            Some("2.0"),
+            "/run/f",
+        );
         assert_eq!(c.programme, "mount.cifs");
         assert_eq!(
             c.args,
@@ -129,7 +334,7 @@ mod commande_de_montage_tests {
                 "//nas/m",
                 "/mnt/nas_m",
                 "-o",
-                "username=u,password=p,iocharset=utf8,vers=2.0"
+                "credentials=/run/f,iocharset=utf8,vers=2.0,nosuid,nodev,noexec"
             ]
         );
         assert_eq!(c.entree, None);
@@ -140,11 +345,70 @@ mod commande_de_montage_tests {
         );
     }
 
+    /// Une virgule dans les identifiants n'ajoute aucune option : ils ne
+    /// figurent plus du tout dans la ligne de commande.
+    #[test]
+    fn aucune_option_ne_vient_des_identifiants() {
+        let hostile = "x,uid=0,setuids,file_mode=06777";
+        for dialecte in DIALECTES {
+            let c = commande_de_montage(
+                0,
+                SUDO,
+                "//nas/m",
+                "/mnt/nas_m",
+                hostile,
+                hostile,
+                dialecte,
+                "/run/f",
+            );
+            let opts = &c.args[3];
+            assert!(!opts.contains("uid="), "{opts}");
+            assert!(!opts.contains("setuids"), "{opts}");
+            assert!(!opts.contains("file_mode"), "{opts}");
+            assert!(
+                !opts.contains("username=") && !opts.contains("password="),
+                "{opts}"
+            );
+            for o in ["nosuid", "nodev", "noexec"] {
+                assert!(opts.split(',').any(|x| x == o), "{o} manque : {opts}");
+            }
+            assert!(!c.args.iter().any(|a| a.contains(hostile)), "{:?}", c.args);
+        }
+    }
+
+    #[test]
+    fn le_fichier_d_identifiants_est_prive_et_ephemere() {
+        let f = FichierIdentifiants::creer("temoin", "p,a=b").unwrap();
+        let chemin = std::path::PathBuf::from(f.chemin());
+        assert_eq!(
+            std::fs::read_to_string(&chemin).unwrap(),
+            "username=temoin\npassword=p,a=b\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&chemin).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "droits {mode:o}");
+        }
+        drop(f);
+        assert!(!chemin.exists(), "le fichier doit disparaître avec l'essai");
+        assert!(FichierIdentifiants::creer("u\nusername=root", "p").is_err());
+        assert!(FichierIdentifiants::creer("u", "p\ndomain=x").is_err());
+    }
+
     #[test]
     fn hors_root_l_assistant_recoit_le_mot_de_passe_sur_l_entree() {
         for dialecte in DIALECTES {
-            let c =
-                commande_de_montage(1000, SUDO, "//nas/m", "/mnt/nas_m", "u", "p@ss,1", dialecte);
+            let c = commande_de_montage(
+                1000,
+                SUDO,
+                "//nas/m",
+                "/mnt/nas_m",
+                "u",
+                "p@ss,1",
+                dialecte,
+                "",
+            );
             assert_eq!(c.programme, SUDO);
             assert_eq!(
                 c.args,
@@ -173,6 +437,57 @@ mod commande_de_montage_tests {
     fn un_refus_de_sudo_arrete_l_echelle() {
         assert!(arrete_l_echelle("sudo: a password is required"));
     }
+
+    #[test]
+    fn le_point_de_montage_reste_un_enfant_direct_de_la_racine() {
+        let racines = vec![std::path::PathBuf::from("/racine-inexistante-7a1/mnt")];
+        let ok = |p: &str| est_confine(std::path::Path::new(p), &racines);
+        assert!(ok("/racine-inexistante-7a1/mnt/192.168.1.10_Musique"));
+        assert!(!ok("/usr/bin"));
+        assert!(!ok("/etc/cron.d"));
+        assert!(!ok("/racine-inexistante-7a1/mnt"));
+        assert!(!ok("/racine-inexistante-7a1/mnt/a/b"));
+        assert!(!ok("/racine-inexistante-7a1/mnt/../etc"));
+        assert!(!ok("racine-inexistante-7a1/mnt/x"));
+        let nom = nom_du_point("../../etc", "a/../b");
+        assert!(!nom.contains('/'), "{nom}");
+        assert!(ok(&format!("/racine-inexistante-7a1/mnt/{nom}")), "{nom}");
+        assert_eq!(
+            nom_du_point("192.168.1.10", "Ma Musique"),
+            "192.168.1.10_Ma_Musique"
+        );
+        assert_eq!(nom_du_point("fd12::58d1", "Music"), "fd12::58d1_Music");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn un_lien_symbolique_ne_sort_pas_de_la_racine() {
+        let d = tune_core::test_scratch::scratch_dir("tune-smb-lien");
+        let racine = d.join("montages");
+        std::fs::create_dir_all(&racine).unwrap();
+        std::os::unix::fs::symlink("/etc", racine.join("nas_m")).unwrap();
+        assert!(!est_confine(
+            &racine.join("nas_m"),
+            std::slice::from_ref(&racine)
+        ));
+        std::fs::create_dir_all(racine.join("nas_n")).unwrap();
+        assert!(est_confine(&racine.join("nas_n"), &[racine]));
+    }
+
+    #[test]
+    fn hotes_et_partages_hostiles_refuses() {
+        assert!(verifier_hote("192.168.1.10").is_ok());
+        assert!(verifier_hote("fe80::1%eth0").is_ok());
+        assert!(verifier_hote("nas.local").is_ok());
+        for h in ["", "-o", "a b", "a/b", "a,b", "a\nb"] {
+            assert!(verifier_hote(h).is_err(), "{h:?}");
+        }
+        assert!(verifier_partage("Musique").is_ok());
+        assert!(verifier_partage("Ma Musique/Jazz").is_ok());
+        for p in ["", "a,b", "../x", "/x", "a\0b"] {
+            assert!(verifier_partage(p).is_err(), "{p:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -184,7 +499,7 @@ mod options_de_montage_tests {
     #[test]
     fn chaque_essai_monte_en_utf8() {
         for dialecte in super::DIALECTES {
-            let opts = options_de_montage("u", "p", dialecte);
+            let opts = options_de_montage("/run/f", dialecte);
             assert!(
                 opts.split(',').any(|o| o == "iocharset=utf8"),
                 "essai {dialecte:?} sans iocharset=utf8 : {opts}"
@@ -195,10 +510,12 @@ mod options_de_montage_tests {
     #[test]
     fn le_dialecte_reste_une_option_a_part() {
         assert_eq!(
-            options_de_montage("u", "p", Some("1.0")),
-            "username=u,password=p,iocharset=utf8,vers=1.0"
+            options_de_montage("/run/f", Some("1.0")),
+            "credentials=/run/f,iocharset=utf8,vers=1.0,nosuid,nodev,noexec"
         );
-        assert!(!options_de_montage("u", "p", None).contains("vers="));
+        assert!(!options_de_montage("/run/f", None).contains("vers="));
+        // Un dialecte hors de l'échelle n'entre pas dans les options.
+        assert!(!options_de_montage("/run/f", Some("3.0,uid=0")).contains("uid="));
     }
 }
 

@@ -1815,7 +1815,10 @@ pub(crate) fn marquer_scan_en_cours(
 /// gestes de RÉPARATION de bibliothèque. Aucun d'eux ne doit pouvoir autoriser
 /// une suppression de masse. Seul `trigger_scan`, qui porte une intention
 /// explicite de l'utilisateur, passe par `spawn_library_scan_confirmee`.
-pub(crate) async fn spawn_library_scan(
+///
+/// `pub` pour `tune-ffi` : l'hôte mobile (app iOS revenue au premier plan)
+/// relance un scan incrémental par `tune_server_scan`, sans passer par HTTP.
+pub async fn spawn_library_scan(
     state: AppState,
     force: bool,
     targeted_req: Option<String>,
@@ -2794,6 +2797,10 @@ async fn spawn_library_scan_avec_lecteur_par(
                             Ok(()) => {
                                 ecritures = ecritures
                                     .avec_dr_des_rapports_voisins(meta_entries.iter().map(|(_, m)| m));
+                                // #7766 — les crédits des balises deviennent des
+                                // lignes `track_credits` (source `balises`), dans
+                                // la même transaction, sans rouvrir le fichier.
+                                tune_core::metadata::credits_balises::ecrire_lot(&db, &meta_entries);
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "scan_extended_metadata_insert_failed");
@@ -2928,6 +2935,15 @@ async fn spawn_library_scan_avec_lecteur_par(
 
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted() as i64;
+
+        // #7915 — la durée de chaque étape de fin de scan, au journal.
+        tracing::info!(
+            travail = "scan",
+            etape = "parcours_et_import",
+            duree_ms = scan_timer_start.elapsed().as_millis() as u64,
+            "etape_terminee"
+        );
+        let mut etapes = tune_core::taches_de_fond::avancement::ChronoDesEtapes::demarrer("scan");
 
         // Prune tracks whose files no longer exist on disk.
         // SAFETY: skip tracks in missing directories — the volume/NAS may
@@ -3269,6 +3285,7 @@ async fn spawn_library_scan_avec_lecteur_par(
         }
         drop(sqlite_write_guard);
 
+        etapes.fin("purge_et_statistiques");
         // #5528 — APRÈS la purge et son COMMIT : les albums vidés ont disparu,
         // les dossiers « Collections » suivent ceux dont les pistes sont
         // passées dans un autre album. Hors de la transaction, qui ne doit pas
@@ -3312,6 +3329,7 @@ async fn spawn_library_scan_avec_lecteur_par(
             );
         }
 
+        etapes.fin("pochettes_et_collections");
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —
         // can leave album rows behind that no track references. Without this
@@ -3339,6 +3357,18 @@ async fn spawn_library_scan_avec_lecteur_par(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "post_scan_compilations_recalcul_echoue"),
+            }
+            // #6459 — un album rétrogradé sous « Unknown Artist » par une
+            // relecture passée reprend l'artiste que ses pistes portent en
+            // base : ses fichiers inchangés ne seront pas relus.
+            match tune_core::db::album_repo::AlbumRepo::with_backend(db.clone())
+                .rendre_leur_artiste_aux_albums_inconnus()
+            {
+                Ok(bilan) if bilan.rendus > 0 => {
+                    tracing::info!(?bilan, "post_scan_albums_inconnus_rendus")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_albums_inconnus_echoue"),
             }
         }
 
@@ -3521,6 +3551,7 @@ async fn spawn_library_scan_avec_lecteur_par(
             );
         }
 
+        etapes.fin("orphelins_et_favoris");
         // Rebuild FTS indexes so search reflects the current library state.
         // The FTS tables are contentless (content='') and rely on triggers,
         // but manual DB edits or batch operations can leave them stale.
@@ -3545,12 +3576,14 @@ async fn spawn_library_scan_avec_lecteur_par(
 
         }
 
+        etapes.fin("index_de_recherche");
         // Populate cloud sync changelog with all new/updated entities
         tune_core::cloud::library_sync::populate_changelog_after_scan(&db);
 
         // Turn any .m3u/.m3u8/.pls files found in the scanned dirs into local
         // playlists (Bertrand). Runs after import so every track is in the DB to
-        // match against; idempotent by playlist name so a re-scan never dupes.
+        // match against; a file already imported and unchanged is skipped, even
+        // if its playlist was deleted (#7723), so a re-scan never brings it back.
         if !scan_cancel_requested() {
             let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &scan_dirs);
             if pl.playlists_created > 0 {
@@ -3567,11 +3600,13 @@ async fn spawn_library_scan_avec_lecteur_par(
             }
         }
 
+        etapes.fin("listes_de_lecture");
         let settings = SettingsRepo::with_backend(db.clone());
         if let Err(e) = settings.set("scan_status", "idle") {
             tracing::warn!(error = %e, "scan_status_idle_failed");
         }
         tracing::info!(
+            duree_ms = scan_timer_start.elapsed().as_millis() as u64,
             discovered = total_discovered,
             parsed = scan_stats.total_files,
             timeout = scan_stats.metadata_timeout,
@@ -3706,6 +3741,20 @@ async fn spawn_library_scan_avec_lecteur_par(
                 motif = suite_du_scan.motif().unwrap_or("none"),
                 "auto_enrichment_after_scan_skipped (needs Premium + enrich_on_scan)"
             );
+            // #6077 — sans recherche en ligne, le dernier recours vient
+            // tout de suite : la plus grande image des dossiers des albums
+            // restés sans pochette. Avec elle, c'est `batch_enrich_artwork`
+            // qui l'applique, après la recherche.
+            if !scan_cancel_requested() {
+                let dernier_recours_db = db.clone();
+                let dernier_recours_cache = cache_dir.clone();
+                handle.spawn_blocking(move || {
+                    tune_core::library::pochette_disque::pochettes_de_dernier_recours(
+                        &dernier_recours_db,
+                        &dernier_recours_cache,
+                    );
+                });
+            }
         }
         }).await;
         if let Err(e) = result {

@@ -99,12 +99,19 @@ pub fn build_track_from_metadata_opts(
         .as_deref()
         .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME);
 
+    // #7933 — même règle que le scan complet (#3179) : ARTIST désigne la
+    // piste, et le MBID d'un invité ne devient pas celui de l'artiste d'album.
+    let artiste_de_piste_tague = crate::scan_import::artiste_de_piste_tague(meta);
+    let meme_artiste = tune_core::db::artist_repo::cle_artiste(album_artist_name)
+        == tune_core::db::artist_repo::cle_artiste(track_artist_name);
+
     let album_artist_mbid = if is_compilation || artiste_d_album_neutre {
         None
     } else {
-        meta.musicbrainz_album_artist_id
+        meta.musicbrainz_album_artist_id.as_deref().or(meta
+            .musicbrainz_artist_id
             .as_deref()
-            .or(meta.musicbrainz_artist_id.as_deref())
+            .filter(|_| meme_artiste))
     };
     let album_artist_entry = match artist_repo.get_or_create(
         album_artist_name,
@@ -144,7 +151,7 @@ pub fn build_track_from_metadata_opts(
     };
     let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
-    let track_artist = if (is_compilation || artiste_d_album_neutre)
+    let track_artist = if (is_compilation || artiste_d_album_neutre || artiste_de_piste_tague)
         && track_artist_name != album_artist_name
     {
         match artist_repo.get_or_create(
@@ -966,6 +973,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                                 ecritures = ecritures.avec_dr_des_rapports_voisins(
                                     meta_entries.iter().map(|(_, m)| m),
                                 );
+                                // #7766 — sœur exacte du scan manuel : les
+                                // crédits des balises, source `balises`.
+                                tune_core::metadata::credits_balises::ecrire_lot(
+                                    &db,
+                                    &meta_entries,
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "auto_scan_extended_metadata_insert_failed");
@@ -1419,8 +1432,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         );
 
         // Import any playlist files (.m3u/.m3u8/.pls) found in the library as
-        // local playlists — same as the manual scan (Bertrand). Idempotent by
-        // playlist name, so the startup scan re-running never duplicates them.
+        // local playlists — same as the manual scan (Bertrand). A file already
+        // imported and unchanged is skipped, even if its playlist was deleted
+        // (#7723), so the startup scan re-running never brings it back.
         let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &music_dirs);
         if pl.playlists_created > 0 {
             event_bus.emit(
@@ -2515,7 +2529,10 @@ pub(crate) fn reimporter_fichier_surveillant(
                     _ => return Err("la relecture des crédits a échoué".to_string()),
                 };
                 tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone())
-                    .set_batch(id, &ext)
+                    .set_batch(id, &ext)?;
+                // #7766 — les crédits des balises, comme les deux scans.
+                tune_core::metadata::credits_balises::ecrire_lot(db, &[(id, ext)]);
+                Ok(())
             })();
             if let Err(e) = metadonnees {
                 tracing::warn!(path = %sf.path, error = %e, "watcher_extended_metadata_failed");
@@ -3927,6 +3944,10 @@ mod scan_au_demarrage_reglage_tests;
 #[cfg(test)]
 #[path = "surveillant_artiste_generique_tests_1881.rs"]
 mod surveillant_artiste_generique_tests_1881;
+
+#[cfg(test)]
+#[path = "surveillant_artiste_de_piste_tests_7933.rs"]
+mod surveillant_artiste_de_piste_tests_7933;
 
 #[cfg(test)]
 #[path = "scan_artiste_montage_tests_6737.rs"]

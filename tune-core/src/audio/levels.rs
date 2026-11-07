@@ -23,6 +23,19 @@ pub struct AudioLevels {
     /// [`OVER_RUN_SAMPLES`].
     pub over_run_left: u32,
     pub over_run_right: u32,
+    /// #7100 — la même suite, mesurée sur la SOURCE telle que décodée, sans
+    /// aucun gain. Un master limité à 0 dBFS en a : c'est la crête du disque,
+    /// une information neutre, pas un écrêtage commis par Tune. Voir
+    /// [`Self::source_over_left`].
+    pub source_over_run_left: u32,
+    pub source_over_run_right: u32,
+    /// #7100 — le gain scalaire appliqué en aval pousse-t-il au moins un
+    /// échantillon STRICTEMENT au-delà de la pleine échelle ? C'est le seul
+    /// écrêtage que la mesure au décodeur sait établir seule. La pleine
+    /// échelle d'un PCM entier n'est jamais dépassée par la source : à gain
+    /// unité ou inférieur, ces drapeaux restent éteints.
+    pub depasse_left: bool,
+    pub depasse_right: bool,
     pub spectrum: Vec<f32>,
     /// Niveau ABSOLU de chaque bande, en dBFS.
     ///
@@ -241,6 +254,18 @@ impl AudioLevels {
     /// Surcharge constatée sur le canal droit dans cette fenêtre.
     pub fn over_right(&self) -> bool {
         self.over_run_right >= OVER_RUN_SAMPLES
+    }
+
+    /// #7100 — la SOURCE touche la pleine échelle sur le canal gauche
+    /// (au moins [`OVER_RUN_SAMPLES`] échantillons consécutifs), avant tout
+    /// gain. Information neutre : ce n'est pas un écrêtage de la sortie.
+    pub fn source_over_left(&self) -> bool {
+        self.source_over_run_left >= OVER_RUN_SAMPLES
+    }
+
+    /// #7100 — même chose, canal droit.
+    pub fn source_over_right(&self) -> bool {
+        self.source_over_run_right >= OVER_RUN_SAMPLES
     }
 
     pub fn rms_left_db(&self) -> f32 {
@@ -659,16 +684,40 @@ pub fn compute_levels_vers_la_sortie(
     let mut suite_r: u32 = 0;
     let mut over_l: u32 = 0;
     let mut over_r: u32 = 0;
+    // #7100 — la suite à pleine échelle de la SOURCE (sans gain), et le
+    // dépassement strict du plein par le gain.
+    let mut source_suite_l: u32 = 0;
+    let mut source_suite_r: u32 = 0;
+    let mut source_over_l: u32 = 0;
+    let mut source_over_r: u32 = 0;
+    let mut depasse_l = false;
+    let mut depasse_r = false;
 
     let stereo = channels >= 2;
 
     for frame in pcm.chunks_exact(frame_size) {
-        let left = read_sample(frame, 0, bytes_per_sample, bit_depth) * gain;
-        let right = if stereo {
-            read_sample(frame, bytes_per_sample, bytes_per_sample, bit_depth) * gain
+        let brut_l = read_sample(frame, 0, bytes_per_sample, bit_depth);
+        let brut_r = if stereo {
+            read_sample(frame, bytes_per_sample, bytes_per_sample, bit_depth)
         } else {
-            left
+            brut_l
         };
+        source_suite_l = if brut_l.abs() >= pleine_echelle {
+            source_suite_l + 1
+        } else {
+            0
+        };
+        source_suite_r = if brut_r.abs() >= pleine_echelle {
+            source_suite_r + 1
+        } else {
+            0
+        };
+        source_over_l = source_over_l.max(source_suite_l);
+        source_over_r = source_over_r.max(source_suite_r);
+        let left = brut_l * gain;
+        let right = brut_r * gain;
+        depasse_l |= left.abs() > 1.0;
+        depasse_r |= right.abs() > 1.0;
 
         sum_sq_l += left * left;
         sum_sq_r += right * right;
@@ -721,6 +770,10 @@ pub fn compute_levels_vers_la_sortie(
         peak_right: peak_r,
         over_run_left: over_l,
         over_run_right: over_r,
+        source_over_run_left: source_over_l,
+        source_over_run_right: source_over_r,
+        depasse_left: depasse_l,
+        depasse_right: depasse_r,
         spectrum_db: spectrum.db,
         spectrum_hz: spectrum.hz,
         spectrum_fft_size: spectrum.fft_size,

@@ -78,6 +78,10 @@ impl ContratDuSignal<'_> {
             sync_volume_to_dop(self.volume, self.user_volume, self.rg_factor, dop);
         }
         let volume_units = self.volume.load(Ordering::SeqCst);
+        // #7934 — l'étage natif est monté à l'unité et ne voit plus le
+        // volume : le mot ne reste intact que si le rappel ne le pondère pas
+        // (DoP, ou volume à 100 %). Même règle que le WASAPI exclusif (#7264).
+        let bit_perfect = bit_perfect && (dop || volume_units == UNITE_DU_GAIN_DE_RENDU);
         let runtime = publish_windows_signal_path_status(
             self.signal_path_status,
             bit_perfect,

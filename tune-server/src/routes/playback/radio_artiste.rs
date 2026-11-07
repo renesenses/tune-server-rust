@@ -30,6 +30,22 @@ pub(super) struct RadioArtisteRequest {
     artist_id: Option<String>,
 }
 
+/// #7717 — la radio d'artiste lancée sur une zone est un lancement.
+pub(super) async fn lancer_radio_artiste_en_tete_du_groupe(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    body: Json<RadioArtisteRequest>,
+) -> axum::response::Response {
+    let lancement =
+        lancer_radio_artiste(State(state.clone()), profile, Path(zone_id), headers, body);
+    crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
+        &state, zone_id, lancement,
+    )
+    .await
+}
+
 pub(super) async fn lancer_radio_artiste(
     State(state): State<AppState>,
     profile: ActiveProfile,

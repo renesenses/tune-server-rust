@@ -206,12 +206,11 @@ the `--features` lines in `release.yml` — and both keep their tests):
 
 `concerts` left this table on 2026-09-25: the cloud has real dates (Ticketmaster,
 since 2026-08-30) and the web client has its screen (`ConcertsView.svelte`,
-tune-web-client#695). It is catalogued as a **Premium** plugin: it declares
-`required_feature() = Some(Feature::Concerts)`, so the manager shows the lock
-before the click (`premium`, `required_feature` on its card), and it refuses
-its own routes with a 402 for a free account — the host mounts no guard in
-front of them, because a reduced free version is planned and only the plugin
-can serve it (`acces()` in `plugins/tune-concerts`).
+tune-web-client#695). Since #7865 (decision of 2026-11-04) it is **no longer
+Premium**: `required_feature()` is `None`, its card carries no lock, and all
+its routes serve every source without a licence. The mechanism stays available
+to other plugins: a plugin that declares `required_feature()` gets the lock
+before the click (`premium`, `required_feature` on its card).
 
 `PLUGIN_PROTOCOL_VERSION` is **enforced**: `setup_all` refuses a plugin whose
 major differs, or whose minor is newer than the server's.  With plugins

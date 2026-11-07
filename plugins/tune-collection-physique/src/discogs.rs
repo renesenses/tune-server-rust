@@ -120,6 +120,57 @@ pub struct Disque {
     /// sa vignette de 300 px ; l'écran ne la charge jamais lui-même.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pochette: Option<String>,
+    /// Le dossier de la collection où l'utilisateur a rangé l'exemplaire
+    /// (`folder_id` ; 1 = « Uncategorized ») (#7929). `serde(default)` : une
+    /// liste d'avant se relit, et se relit en entier à la synchronisation
+    /// suivante (`memoire::VERSION_LISTE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dossier: Option<u64>,
+    /// Les genres et les styles Discogs (`basic_information.genres`,
+    /// `.styles`) (#7929).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub styles: Vec<String>,
+}
+
+/// Un dossier de la collection (`GET /users/{nom}/collection/folders`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dossier {
+    pub id: u64,
+    pub nom: String,
+    /// Le nombre d'exemplaires que Discogs y annonce.
+    pub nombre: u64,
+}
+
+/// Les dossiers de la collection, sans « All » (id 0), qui les contient
+/// tous.
+pub fn dossiers_de_la_collection(v: &Value) -> Vec<Dossier> {
+    v["folders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| {
+            let id = f["id"].as_u64()?;
+            let nom = texte(&f["name"])?;
+            (id != 0).then(|| Dossier {
+                id,
+                nom,
+                nombre: f["count"].as_u64().unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+/// Une liste de noms (`genres`, `styles`), sans vide ni doublon.
+fn noms(v: &Value) -> Vec<String> {
+    let mut rendus: Vec<String> = Vec::new();
+    for n in v.as_array().into_iter().flatten().filter_map(texte) {
+        if !rendus.contains(&n) {
+            rendus.push(n);
+        }
+    }
+    rendus
 }
 
 impl Disque {
@@ -263,6 +314,9 @@ pub fn disque_de_l_entree(e: &Value) -> Option<Disque> {
             .and_then(vignette_discogs)
             .or_else(|| b["cover_image"].as_str().and_then(vignette_discogs)),
         pochette: b["cover_image"].as_str().and_then(vignette_discogs),
+        dossier: e["folder_id"].as_u64(),
+        genres: noms(&b["genres"]),
+        styles: noms(&b["styles"]),
     })
 }
 

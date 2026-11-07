@@ -68,6 +68,20 @@ impl PositionPoller {
             return true;
         }
         let consigne = self.playback.get_state(zone_id).await.volume;
+        // #7379, #8074 — sur une sortie à volume logiciel (pas de bouton
+        // d'ampli à suivre), ou un appareil qui se dit à 100 % (réveil à
+        // pleine échelle, #5662 : les sites d'adoption l'écartent aussi), la
+        // consigne ne monte jamais vers la limite : Tune recommande la
+        // consigne, bornée (règle d'avant le 02/11).
+        if !self.suivi_a_la_hausse_permis(zone_id) || rapporte >= 0.999 {
+            let cible = limites.borner_appareil(consigne);
+            warn!(
+                zone_id,
+                rapporte, consigne, cible, "volume_plafond_reimpose"
+            );
+            self.commander_le_plafond(zone_id, cible).await;
+            return true;
+        }
         let cible = (securite / facteur).min(1.0);
         // Le niveau réel de l'appareil, pour que la garde de hausse (#6721)
         // voie le retour au plafond comme la baisse qu'il est.

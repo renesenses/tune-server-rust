@@ -52,8 +52,10 @@ const EMPREINTE_NATIVE_24_BITS_IDENTITE: u64 = 0x1688_08b2_7642_8f1e;
 // le DoP force la branche brute, volume et DSP ne le touchent jamais.
 const EMPREINTE_NATIVE_DOP: u64 = 0x12e6_821d_877b_2aa5;
 // Route native, 16 bits, volume 500 : aller-retour flottant, quantifié UNE
-// fois (`f32_to_native_i32`), avant l'anneau (D3).
-const EMPREINTE_NATIVE_16_BITS_VOLUME_500: u64 = 0x9b8d_7155_baac_bb7c;
+// fois (`f32_to_native_i32`), avant l'anneau (D3). #7703 : relevé refait,
+// la quantification est désormais dithérée (TPDF déterministe) — l'ancien
+// relevé, arrondi nu, valait 0x9b8d_7155_baac_bb7c.
+const EMPREINTE_NATIVE_16_BITS_VOLUME_500: u64 = 0xbafb_2b5d_cb41_9dc7;
 // Route traitée, 16 et 24 bits, DSP au repos : les `f32` de
 // `pcm_bytes_to_f32`, sans volume — il est dans le rappel.
 const EMPREINTE_FLOTTANTE_16_BITS: u64 = 0xbb0a_b2e4_f3bd_af91;
@@ -119,7 +121,9 @@ struct Dsp {
 }
 
 impl Dsp {
+    /// `volume` en millièmes, converti dans l'unité de la sortie locale (#7968).
     fn au_repos(volume: u32) -> Self {
+        let volume = volume * (crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 1000);
         Self {
             eq: std::sync::Mutex::new(None),
             convolver: std::sync::Mutex::new(None),

@@ -2702,7 +2702,120 @@ CREATE INDEX IF NOT EXISTS idx_radio_ecoutes_jour ON radio_ecoutes(jour);
         up: "",
     },
     Migration { version: 135, name: "listening_resumes", up: include_str!("../../migrations/continue_listening.sql") },
+    // #7763 (go de Bertrand du 03/11) — les écoutes IMPORTÉES (Roon, Plex,
+    // liste m3u), une ligne par piste, à part de `listen_history` : un import
+    // ne fabrique aucune fausse entrée d'historique. Le nombre affiché d'une
+    // piste est la somme des deux (`HistoryRepo::plays_for_tracks`). Naît
+    // vide. Jumelle PG : 101.
+    Migration {
+        version: 136,
+        name: "imported_plays",
+        up: "
+CREATE TABLE IF NOT EXISTS imported_plays (
+    track_id INTEGER PRIMARY KEY,
+    play_count INTEGER NOT NULL DEFAULT 0,
+    last_played_at TEXT
+);
+",
+    },
+    // #7765 (lot 2, PR 1) — d'où vient un crédit de piste :
+    // `track_credits.source`, `'manuel'`, `'musicbrainz'`, `'balises'`,
+    // `'discogs'` ou `'roon'` (`metadata::source_des_credits`). NULL : ligne
+    // ancienne, source inconnue.
+    //
+    // Sans elle, la passe MusicBrainz purgeait TOUS les crédits d'une piste
+    // avant d'écrire, et les passes « à faire » tenaient toute ligne pour un
+    // crédit : dès que les balises rempliront la table (#7766), elles
+    // effaceraient les crédits des fichiers et sauteraient presque toutes les
+    // pistes.
+    //
+    // Attribution UNE fois des lignes existantes (décision du 03/11) : `roon`
+    // si la piste porte `track_metadata.credits_source = 'roon'`, sinon
+    // `musicbrainz` si `artist_mbid` est renseigné, sinon NULL.
+    //
+    // Numérotée 137 / PG 102 à sa fusion dans le lot rc11 (#7772 y a pris
+    // 136 / PG 101) : les gardes de contiguïté (`migration_count_matches`,
+    // `pg_migrations_are_contiguous_and_include_numeric_heals`) refusent un
+    // trou. #7772 (SQLite 136 / PG 101) et #7656 (PG 101) réclament les mêmes
+    // numéros : celle qui fusionne après l'autre se renumérote.
+    //
+    // Colonne, index et attribution posés dans le bloc de version, PAS dans
+    // `up` : même règle qu'à la 107. La colonne seule est reposée par la
+    // passe finale. Jumelle PG : 102.
+    Migration {
+        version: 137,
+        name: "credits_source",
+        up: "",
+    },
+    // #7849 — notes personnelles en Markdown (artiste, album, piste) par
+    // profil, avec la reprise des notes d'album de `album_ratings.note`, qui
+    // reste en place. Jumelle PG : 103. Numérotée 138 / PG 103 à sa fusion
+    // dans le lot rc11, après imported_plays (136 / 101) et credits_source (137 / 102).
+    Migration {
+        version: 138,
+        name: "notes_personnelles",
+        up: include_str!("../../migrations/notes_personnelles.sql"),
+    },
+    // #7855 — les clés des clients Subsonic : seule l'empreinte SHA-256 est
+    // stockée. Numérotée 136 / PG 101 le 04/11 depuis le lot, puis 139 / PG 104 à sa
+    // fusion groupée, après 136 à 138 / PG 101 à 103. Base d'origine :
+    // `batch/bugs-rc11-20261101` (dernière : 135 / PG 100) ; d'autres PR
+    // ouvertes réclament aussi 136 / 101, la fusion groupée renumérote.
+    Migration { version: 139, name: "cles_clients", up: include_str!("../../migrations/cles_clients.sql") },
+    // #7872 — la requête avancée d'une collection intelligente
+    // (`smart_collections.expression`), évaluée par le compilateur de
+    // `library::requete`. NULL : la collection n'a que ses règles. Colonne
+    // posée dans le bloc de version et reposée par la passe finale, même
+    // règle qu'à la 137. Jumelle PG : 106. Numéros libres dans le lot rc11
+    // au 07/11 (dernières : 139 / PG 105).
+    Migration {
+        version: 140,
+        name: "smart_collections_expression",
+        up: "",
+    },
+    // #8088 — contrôle parental : le MARQUAGE EXPLICITE de la balise du
+    // fichier (`ITUNESADVISORY` = 1 ou 4, MP4 `rtng`), lu au scan :
+    // `tracks.explicit`, 1 explicite, 0 propre, NULL sans balise ou pas
+    // encore relu. Index partiel `idx_tracks_explicit` : le contrôle parental
+    // lit les seules pistes marquées.
+    //
+    // Numérotée 141 / PG 107, numéros libres dans `batch/bugs-rc11-20261101`
+    // au 07/11 (dernières : 140 / PG 106). La PR de #8077 (apports_service)
+    // réclame AUSSI 141 / 107 : celle qui fusionne après l'autre se
+    // renumérote.
+    //
+    // Colonne posée par `add_column_if_missing` dans le bloc de version et
+    // dans la passe finale, PAS dans `up` : même règle qu'à la 130 — l'INSERT
+    // et l'UPDATE des pistes la NOMMENT. Jumelle PG : 107.
+    Migration {
+        version: 141,
+        name: "tracks_explicit",
+        up: "",
+    },
 ];
+
+/// L'index partiel des pistes marquées explicites (#8088), commun aux deux
+/// moteurs. Posé APRÈS la colonne qu'il nomme.
+pub(crate) const SQL_INDEX_PISTES_EXPLICITES: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_explicit ON tracks(id) WHERE explicit = 1";
+
+/// Pose `tracks.explicit` et son index (#8088) — bloc de version de la 141 et
+/// passe finale.
+fn marquage_explicite_des_pistes(db: &SqliteDb) {
+    add_column_if_missing(db, "tracks", "explicit", "INTEGER");
+    if let Err(e) = db.execute_batch(SQL_INDEX_PISTES_EXPLICITES) {
+        warn!(erreur = %e, "migration_141_index_explicite");
+    }
+}
+
+/// SQL de l'attribution unique de la migration 137 (#7765) — jouée une seule
+/// fois, dans le bloc de version. Même texte que la jumelle PG 102.
+pub(crate) const SQL_ATTRIBUTION_SOURCE_DES_CREDITS: &str = "UPDATE track_credits SET source = CASE \
+     WHEN EXISTS (SELECT 1 FROM track_metadata m WHERE m.track_id = track_credits.track_id \
+         AND m.key = 'credits_source' AND m.value = 'roon') THEN 'roon' \
+     WHEN artist_mbid IS NOT NULL AND artist_mbid <> '' THEN 'musicbrainz' \
+     ELSE NULL END \
+     WHERE source IS NULL";
 
 /// Migration 127 (#6257) : `tags.position`, 0 pour toutes les etiquettes
 /// existantes (« jamais placee ») — la liste reste alphabetique tant que
@@ -3829,6 +3942,24 @@ pub(crate) const UPNP_NUMEROS_ZERO_A_NULL: &str = "UPDATE tracks SET track_numbe
 pub(crate) const TRACKS_TITLE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title)";
 
+/// #7619 (volet L3, rc11) — deux index d'égalité sur les pistes.
+///
+/// `idx_tracks_composer` sert le texte libre d'Oxygen (`/library/tracks?q=`) :
+/// son `LIKE` sur le compositeur est posé sur le DICTIONNAIRE des valeurs
+/// distinctes (lu par l'index, sans la table), puis les pistes sont retrouvées
+/// par égalité — au lieu de rejouer `unaccent`, fonction Rust sous SQLite, sur
+/// chacune des 96 496 pistes du .18. `idx_tracks_genre` sert les égalités
+/// `t.genre = ?` de la radio d'artiste et des recommandations.
+///
+/// La recherche `/search`, elle, ne s'en sert plus : depuis la décision du
+/// 01/11/2026 (début de mot), elle passe tout entière par l'index plein texte.
+///
+/// Même texte sur les deux moteurs. Rejoué à chaque démarrage, sans numéro
+/// de migration — même raison que [`TRACKS_SOURCE_ID_INDEX`].
+pub(crate) const TRACKS_GENRE_COMPOSER_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_genre ON tracks(genre);
+     CREATE INDEX IF NOT EXISTS idx_tracks_composer ON tracks(composer);";
+
 pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_metadata_dr \
      ON track_metadata(key, track_id, value) WHERE key IN ('dr_album', 'dr_track');
      CREATE INDEX IF NOT EXISTS idx_tracks_id_album ON tracks(id, album_id);";
@@ -4124,6 +4255,28 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
                 "manual_order",
                 "INTEGER NOT NULL DEFAULT 0",
             );
+        }
+        if migration.version == 140 {
+            // #7872 — la requête avancée d'une collection intelligente.
+            add_column_if_missing(db, "smart_collections", "expression", "TEXT");
+        }
+        if migration.version == 141 {
+            // #8088 — le marquage explicite de la balise, et son index.
+            marquage_explicite_des_pistes(db);
+        }
+        if migration.version == 137 {
+            // #7765 — la source des crédits, puis l'attribution UNE fois des
+            // lignes existantes. L'index vient APRES la colonne qu'il nomme.
+            add_column_if_missing(db, "track_credits", "source", "TEXT");
+            if let Err(e) = db.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_track_credits_track_source \
+                 ON track_credits(track_id, source)",
+            ) {
+                warn!(erreur = %e, "migration_136_index_source");
+            }
+            if let Err(e) = db.execute_batch(SQL_ATTRIBUTION_SOURCE_DES_CREDITS) {
+                warn!(erreur = %e, "migration_136_attribution_source");
+            }
         }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
@@ -4717,6 +4870,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // raison que la note : l'INSERT et l'UPDATE des pistes le NOMMENT.
     // PG : migration 094.
     add_column_if_missing(db, "tracks", "bitrate_kbps", "INTEGER");
+    // Le marquage explicite de la balise (migration 141, #8088) — posé ICI
+    // aussi, même raison que le débit. PG : migration 107.
+    marquage_explicite_des_pistes(db);
     // Le lien des radios avec l'annuaire (migration 126, #6516) — posé ICI
     // aussi : le rapprochement le NOMME. PG : migration 090.
     lien_des_radios_avec_l_annuaire(db);
@@ -4738,6 +4894,14 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         "manual_order",
         "INTEGER NOT NULL DEFAULT 0",
     );
+    // La source des crédits (migration 137, #7765) — posée ICI aussi : tous
+    // les écrivains de `track_credits` et les passes « à faire » la NOMMENT.
+    // Pas d'attribution ici : elle ne se joue qu'une fois, à la 137. PG : 102.
+    add_column_if_missing(db, "track_credits", "source", "TEXT");
+    // La requête avancée des collections intelligentes (migration 140,
+    // #7872) — posée ICI aussi : toute lecture de `smart_collections` par
+    // `tune-smart-http` la NOMME. PG : 106.
+    add_column_if_missing(db, "smart_collections", "expression", "TEXT");
     // Index de `listen_history.album_id` (migration 115, fil 2130) — posé ICI
     // aussi : une base arrivée sans lui reste juste, mais « Reprendre
     // l'écoute » y redevient lent. PG : migration 079.
@@ -4771,6 +4935,23 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // ICI aussi : le regroupement des versions et la règle de lecture les
     // interrogent à chaque lancement. PG : migration 086.
     index_des_identifiants_d_enregistrement(db);
+
+    // Politiques du contrôle parental (#7856) — SANS numéro de migration, sur
+    // le modèle du miroir des favoris : la 136 est demandée par plusieurs PR
+    // du même lot. Idempotent. PG : `ENSURE_TABLES` et `PG_FULL_SCHEMA`.
+    if let Err(e) = db.execute_batch(super::politique_parentale::SQL_TABLE) {
+        tracing::warn!(error = %e, "politiques_parentales_table_failed");
+    }
+    // Trace des tentatives d'enrichissement (#7983) — même régime que la
+    // table ci-dessus. PG : `ENSURE_TABLES` et `PG_FULL_SCHEMA`.
+    for ddl in [
+        super::enrich_tentatives::SQL_TABLE,
+        super::enrich_tentatives::SQL_INDEX,
+    ] {
+        if let Err(e) = db.execute_batch(ddl) {
+            tracing::warn!(error = %e, "enrich_tentatives_table_failed");
+        }
+    }
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -4823,6 +5004,24 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // la constante.
     if let Err(e) = db.execute_batch(TRACKS_TITLE_INDEX) {
         warn!(error = %e, "sqlite_tracks_title_index_failed");
+    }
+    // #7619 (L3) — index d'égalité du genre et du compositeur : même passe —
+    // voir la constante.
+    if let Err(e) = db.execute_batch(TRACKS_GENRE_COMPOSER_INDEX) {
+        warn!(error = %e, "sqlite_tracks_genre_composer_index_failed");
+    }
+    // #7619 (L4/L5) — la révision de la bibliothèque : table, déclencheurs et
+    // ligne en une transaction ; un échec la laisse absente (caches muets).
+    if let Err(e) = db.execute_batch(&super::library_revision::sql_sqlite()) {
+        db.execute_batch("ROLLBACK").ok();
+        warn!(error = %e, "sqlite_library_revision_failed");
+    }
+    // #7619 (L1) — la clé de tri des pistes et son index : même passe, sans
+    // numéro de migration (aucune collision possible avec un lot voisin).
+    // La colonne naît NULL ; `TrackRepo::assurer_les_cles_de_tri` la remplit.
+    add_column_if_missing(db, "tracks", "cle_tri", "TEXT");
+    if let Err(e) = db.execute_batch(crate::db::track_repo::cle_de_tri::INDEX_CLE_TRI) {
+        warn!(error = %e, "sqlite_tracks_cle_tri_index_failed");
     }
     // #2149 — collections à règle de genre : même passe — voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_ALBUM_GENRE_INDEX) {
@@ -5683,6 +5882,54 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "listening_resumes",
         include_str!("../../migrations/postgres/100_listening_resumes.sql"),
     ),
+    // Jumelle de la SQLite 136 (#7763) : `imported_plays`, les écoutes
+    // importées par piste. Naît vide.
+    (
+        101,
+        "imported_plays",
+        include_str!("../../migrations/postgres/101_imported_plays.sql"),
+    ),
+    // Jumelle de la SQLite 137 (#7765) : `track_credits.source`, la source
+    // d'un crédit, avec l'attribution unique des lignes existantes.
+    (
+        102,
+        "credits_source",
+        include_str!("../../migrations/postgres/102_credits_source.sql"),
+    ),
+    // Jumelle de la SQLite 138 (#7849) : `notes_personnelles`, avec la
+    // reprise des notes d'album de `album_ratings.note`.
+    (
+        103,
+        "notes_personnelles",
+        include_str!("../../migrations/postgres/103_notes_personnelles.sql"),
+    ),
+    // Jumelle de la SQLite 139 (#7855) : les clés des clients Subsonic.
+    (
+        104,
+        "cles_clients",
+        include_str!("../../migrations/postgres/104_cles_clients.sql"),
+    ),
+    // #7619 / #7656 : la clé de curseur existe aussi dans la chaîne migrée.
+    // Numéro 105 (décision de Bertrand du 06/11) : 101 à 104 sont pris.
+    (
+        105,
+        "tracks_cle_tri",
+        include_str!("../../migrations/postgres/105_tracks_cle_tri.sql"),
+    ),
+    // Jumelle de la SQLite 140 (#7872) : `smart_collections.expression`, la
+    // requête avancée d'une collection intelligente.
+    (
+        106,
+        "smart_collections_expression",
+        include_str!("../../migrations/postgres/106_smart_collections_expression.sql"),
+    ),
+    // Jumelle de la SQLite 141 (#8088) : `tracks.explicit`, le marquage
+    // explicite de la balise, et l'index partiel des pistes marquées.
+    (
+        107,
+        "tracks_explicit",
+        include_str!("../../migrations/postgres/107_tracks_explicit.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -5902,6 +6149,32 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // finale SQLite.
     if let Err(e) = sqlx::raw_sql(TRACKS_TITLE_INDEX).execute(pool).await {
         warn!(error = %e, "pg_tracks_title_index_failed");
+    }
+    // #7619 (L4/L5) — la révision de la bibliothèque, un bloc `DO`.
+    // Texte bâti par le code, sur les seuls noms de `TABLES_SUIVIES` (des
+    // constantes) : aucune saisie n'y entre.
+    if let Err(e) = sqlx::raw_sql(sqlx::AssertSqlSafe(super::library_revision::sql_postgres()))
+        .execute(pool)
+        .await
+    {
+        warn!(error = %e, "pg_library_revision_failed");
+    }
+    // #7619 (L3) — même index, même texte que la passe finale SQLite.
+    if let Err(e) = sqlx::raw_sql(TRACKS_GENRE_COMPOSER_INDEX)
+        .execute(pool)
+        .await
+    {
+        warn!(error = %e, "pg_tracks_genre_composer_index_failed");
+    }
+    // #7619 (L1) — même colonne et même index que la passe finale SQLite ;
+    // `COLLATE "C"` : l'ordre des octets, celui de SQLite et de la clé.
+    for sql in [
+        crate::db::track_repo::cle_de_tri::COLONNE_CLE_TRI_PG,
+        crate::db::track_repo::cle_de_tri::INDEX_CLE_TRI,
+    ] {
+        if let Err(e) = sqlx::raw_sql(sql).execute(pool).await {
+            warn!(error = %e, "pg_tracks_cle_tri_failed");
+        }
     }
     // #5998 — même passe que la passe finale SQLite, même raison.
     if let Err(e) = sqlx::raw_sql(crate::db::track_repo::INDEX_CHEMIN_DOSSIER_PG)
@@ -7913,6 +8186,102 @@ mod tests {
         );
     }
 
+    /// #8088 — la migration 141 pose `tracks.explicit` et son index partiel,
+    /// sur une base NEUVE comme sur une base MONTÉE en 140 avec une piste ;
+    /// l'existant reste NULL (aucun marquage inventé) ; la jumelle PG 107
+    /// existe, est enregistrée, marque le bon numéro et convertit une colonne
+    /// TEXT de bascule ; le schéma de bascule et `ENSURE_COLUMNS` la portent.
+    #[test]
+    fn la_migration_141_pose_le_marquage_explicite_8088() {
+        let colonne = |db: &SqliteDb| -> Option<(String, bool)> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(tracks)").unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap())
+                .find(|(nom, _, _)| nom == "explicit")
+                .map(|(_, ty, non_nul)| (ty, non_nul != 0))
+        };
+        let index = |db: &SqliteDb| -> i64 {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_tracks_explicit'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let attendu = Some(("INTEGER".to_string(), false));
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(colonne(&neuve), attendu, "base neuve : `tracks.explicit`");
+        assert_eq!(index(&neuve), 1, "base neuve : index partiel absent");
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "DROP INDEX idx_tracks_explicit;
+                 ALTER TABLE tracks DROP COLUMN explicit;
+                 DELETE FROM _migrations WHERE version >= 141;
+                 INSERT INTO tracks (title, file_path) VALUES ('Piste', '/m/a.flac');",
+            )
+            .unwrap();
+        assert_eq!(colonne(&montee), None, "préparation : colonne retirée");
+        assert_eq!(current_version(&montee).unwrap(), 140);
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert!(latest_version() >= 141);
+        assert_eq!(colonne(&montee), attendu, "base montée : `tracks.explicit`");
+        assert_eq!(index(&montee), 1, "base montée : index partiel absent");
+        {
+            let conn = montee.connection().lock().unwrap();
+            let (lignes, avec): (i64, i64) = conn
+                .query_row("SELECT COUNT(*), COUNT(explicit) FROM tracks", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(
+                (lignes, avec),
+                (1, 0),
+                "la piste survit, sans marquage inventé"
+            );
+        }
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "107_tracks_explicit.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(sql_pg.contains("VALUES (107, 'tracks_explicit')"));
+        assert!(
+            sql_pg.contains("ADD COLUMN IF NOT EXISTS explicit BIGINT")
+                && sql_pg.contains("TYPE BIGINT USING")
+                && sql_pg.contains("idx_tracks_explicit"),
+            "la jumelle PG ne pose pas `tracks.explicit` en BIGINT, ne convertit pas \
+             la colonne TEXT d'une bascule, ou oublie l'index"
+        );
+        assert!(include_str!("migrations.rs").contains(fichier));
+        assert!(
+            include_str!("pg_migrate.rs")
+                .contains("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS explicit TEXT")
+        );
+        assert!(
+            include_str!("postgres.rs")
+                .contains("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS explicit BIGINT")
+        );
+    }
+
     /// #6332 — la migration 130 pose `tracks.bitrate_kbps` (le débit moyen du
     /// fichier), sur une base NEUVE comme sur une base MONTÉE en 129 avec une
     /// piste ; NULLABLE, l'existant reste NULL (le rescan le complète) ; la
@@ -9223,7 +9592,23 @@ mod tests {
         // 99 reste réservée à la sentinelle des anciennes bascules : entrée
         // sans effet pour garder la chaîne contiguë, jamais un changement DDL.
         // 100 : listening_resumes (#7280), jumelle de la SQLite 135.
-        assert_eq!(pg_latest_version(), 100, "latest PG migration must be 100");
+        // 101 : imported_plays (#7763), 102 : credits_source (#7765), 103 :
+        // notes_personnelles (#7849), 104 : cles_clients (#7855), jumelle de la SQLite 139.
+        // 101 : `imported_plays` (#7763), jumelle de la SQLite 136. Crée la
+        // table des écoutes importées, que le compte d'écoutes NOMME.
+        // 102 : `credits_source` (#7765), jumelle de la SQLite 137. Pose la
+        // source des crédits de piste, que tous leurs écrivains NOMMENT.
+        // 103 : `notes_personnelles` (#7849), jumelle de la SQLite 138. Crée
+        // la table des notes, que les routes `/library/notes` NOMMENT.
+        // 104 : `cles_clients` (#7855), jumelle de la SQLite 139.
+        // 105 : tracks.cle_tri et son index de curseur (#7619 / #7656), sans
+        // jumelle numérotée côté SQLite (passe finale `add_column_if_missing`).
+        // 106 : `smart_collections_expression` (#7872), jumelle de la SQLite
+        // 140. Pose la requête avancée des collections intelligentes, que
+        // toutes leurs lectures NOMMENT.
+        // 107 : `tracks_explicit` (#8088), jumelle de la SQLite 141. Pose
+        // `tracks.explicit`, que l'INSERT et l'UPDATE des pistes NOMMENT.
+        assert_eq!(pg_latest_version(), 107, "latest PG migration must be 107");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
@@ -10414,11 +10799,18 @@ mod tests_playlist_titres_de_service_4889 {
         assert_eq!(
             objets(&db, "trigger"),
             vec![
+                // #7619 (L4) — la révision de la bibliothèque suit aussi
+                // `playlist_tracks` : la passe de démarrage les repose
+                // après la reconstruction de la table.
+                "library_revision_playlist_tracks_del".to_string(),
+                "library_revision_playlist_tracks_ins".to_string(),
+                "library_revision_playlist_tracks_upd".to_string(),
                 "upnp_revision_playlist_tracks_delete".to_string(),
                 "upnp_revision_playlist_tracks_insert".to_string(),
                 "upnp_revision_playlist_tracks_update".to_string()
             ],
-            "les déclencheurs du compteur UPnP (#4201) sont reposés"
+            "les déclencheurs du compteur UPnP (#4201) et de la révision \
+             de la bibliothèque (#7619) sont reposés"
         );
 
         let conn = db.connection().lock().unwrap();

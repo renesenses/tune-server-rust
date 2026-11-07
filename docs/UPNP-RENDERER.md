@@ -124,6 +124,33 @@ JPlay retrouve la sortie qu'il avait mémorisée au lieu d'en créer une nouvell
 - **ConnectionManager:1** — `GetProtocolInfo` (le `Sink` liste les formats
   acceptés), `GetCurrentConnectionIDs`, `GetCurrentConnectionInfo`.
 
+### Le DSD (prêt de sorties, #8052)
+
+Le `Sink` dépend de la zone. Une zone dont la sortie est **locale** et dont le
+mode DSD est **« DoP »** ou **« natif »** y ajoute le DSD
+(`application/x-dsd` en tête, puis `audio/dsf`, `audio/x-dsf`, `audio/dff`,
+`audio/x-dff`). Un autre Tune qui joue sur cette zone lui envoie alors le
+`.dsf` tel quel, sans le convertir, et c'est la zone qui décide du format,
+comme pour un fichier de sa bibliothèque : DSD natif en ASIO quand le pilote
+le permet, DoP sinon, PCM si la sortie ne peut pas porter le DoP (#7265).
+
+Les autres zones gardent le `Sink` sans DSD : en « auto » ou « PCM », la
+sortie locale joue du PCM de toute façon, et le serveur qui envoie convertit
+lui-même, comme avant. Une zone dont la sortie est un renderer réseau n'est
+pas concernée (#8053).
+
+Si un `.dsf` arrive quand même à une zone locale (un serveur qui envoie
+plus ancien, ou dont le sondage date d'un autre réglage), la zone ne remet
+jamais l'adresse brute à sa sortie, qui ne saurait pas la lire : elle
+télécharge le fichier et le joue comme un fichier de sa bibliothèque, donc en
+PCM converti par elle quand la zone est en « auto » ou « PCM », ou quand la
+sortie écarte le DoP.
+
+Le serveur qui envoie garde en mémoire, **jusqu'à son redémarrage**, ce que la
+façade a répondu à son premier sondage. Après la mise à jour du prêteur, ou
+après un changement du mode DSD de la zone prêtée, il faut donc redémarrer le
+serveur qui envoie pour qu'il relise le `Sink`.
+
 ### Ce qui se passe à la lecture
 
 Le flux reçu **traverse toute la chaîne Tune** : EQ, convolveur, trim de gain,

@@ -1,4 +1,4 @@
-//! #6285 — la passe de fond : candidats, périmètre, bridage thermique, et un
+//! #6285 — la passe de fond : candidats, périmètre, largeur selon la chaleur, et un
 //! lot de bout en bout sur de VRAIS fichiers WAV écrits par le test à partir
 //! de signaux synthétiques. Aucun son joué.
 
@@ -56,57 +56,32 @@ fn wav_24(chemin: &std::path::Path, sample_rate: u32, echantillons: &[i32]) {
     std::fs::write(chemin, f).unwrap();
 }
 
-/// 🔴 #6450 (décision de Bertrand du 20/10/2026) : sans température lisible,
-/// la passe décode UN fichier à la fois, quelle que soit la vitesse réglée.
+/// 🔴 #6450 : sans température lisible, la passe garde la vitesse réglée
+/// (le bridage à un fichier de #5410 est retiré), et le réglage de #6713
+/// n'y change rien.
 #[test]
-fn sans_temperature_lisible_la_passe_est_bridee_a_un_fichier_6285() {
-    let db = base();
-    SettingsRepo::with_backend(db.clone())
-        .set(vitesse::CLE_REGLAGE, vitesse::Vitesse::Rapide.id())
-        .unwrap();
-    for motif in [MotifIllisible::AucunCapteur, MotifIllisible::Figee] {
-        assert_eq!(
-            largeur_de_la_passe(&db, &LectureThermique::Illisible(motif)),
-            1,
-            "température illisible ({motif:?}) : un fichier à la fois, même en vitesse rapide"
-        );
-    }
-    assert_eq!(
-        largeur_de_la_passe(&db, &LectureThermique::Lisible(45.0)),
-        vitesse::Vitesse::Rapide.largeur(vitesse::coeurs()),
-        "température lisible : la vitesse réglée"
-    );
-}
-
-/// #6713 — le réglage « lever le bridage » rend la vitesse réglée à la passe
-/// quand la température est illisible ; désactivé (le défaut), elle reste
-/// bridée à un fichier.
-#[test]
-fn le_bridage_leve_par_le_reglage_rend_la_vitesse_reglee_6713() {
+fn sans_temperature_lisible_la_passe_garde_la_vitesse_reglee_6450() {
     let db = base();
     let reglages = SettingsRepo::with_backend(db.clone());
     reglages
         .set(vitesse::CLE_REGLAGE, vitesse::Vitesse::Rapide.id())
         .unwrap();
-    let illisible = LectureThermique::Illisible(MotifIllisible::AucunCapteur);
-    assert!(!vitesse::bridage_leve(&db), "désactivé par défaut");
-    assert_eq!(largeur_de_la_passe(&db, &illisible), 1);
-
-    reglages.set(vitesse::CLE_LEVER_LE_BRIDAGE, "true").unwrap();
-    assert!(vitesse::bridage_leve(&db));
+    let rapide = vitesse::Vitesse::Rapide.largeur(vitesse::coeurs());
+    for leve in ["false", "true"] {
+        reglages.set(vitesse::CLE_LEVER_LE_BRIDAGE, leve).unwrap();
+        for motif in [MotifIllisible::AucunCapteur, MotifIllisible::Figee] {
+            assert_eq!(
+                largeur_de_la_passe(&db, &LectureThermique::Illisible(motif)),
+                rapide,
+                "température illisible ({motif:?}, réglage #6713 = {leve}) : \
+                 la passe est bridée au lieu de garder la vitesse réglée"
+            );
+        }
+    }
     assert_eq!(
-        largeur_de_la_passe(&db, &illisible),
-        vitesse::Vitesse::Rapide.largeur(vitesse::coeurs()),
-        "bridage levé : la vitesse réglée"
-    );
-
-    reglages
-        .set(vitesse::CLE_LEVER_LE_BRIDAGE, "false")
-        .unwrap();
-    assert_eq!(
-        largeur_de_la_passe(&db, &illisible),
-        1,
-        "réglage retiré : bridé"
+        largeur_de_la_passe(&db, &LectureThermique::Lisible(45.0)),
+        rapide,
+        "température lisible : la vitesse réglée"
     );
 }
 
@@ -206,6 +181,126 @@ async fn un_lot_range_les_verdicts_des_vrais_fichiers_6285() {
         "le vrai 24/96 vérifié, le CD gonflé douteux, l'illisible rangé sans verdict"
     );
     assert_eq!(compter_les_candidats(&db), 0);
+}
+
+/// 🔴 #7859 — de bout en bout, sur toute la durée : un 24/96 de 72 s dont
+/// les 24 premières secondes sont coupées à 20 kHz et le reste monte à
+/// 47 kHz. L'ancienne passe ne décodait que 30 s à partir de 30 s, en pleine
+/// bande ; les tranches couvrent tout le morceau, et la ligne rangée garde
+/// les colonnes de `hires_verifications` (verdict, raison, coupure, bits).
+#[tokio::test]
+async fn la_passe_mesure_toute_la_duree_et_range_dans_la_meme_table_7859() {
+    let db = base();
+    let dossier = crate::test_scratch::scratch_dir("faux-hires-7859");
+    let pleine = quantifier(&rose(96_000, 47_000.0, 81), 24);
+    let coupee = quantifier(&rose(96_000, 20_000.0, 82), 24);
+    let total = 72 * 96_000;
+    let bascule = 24 * 96_000;
+    let pcm: Vec<i32> = (0..total)
+        .map(|i| {
+            let source = if i < bascule { &coupee } else { &pleine };
+            source[i % source.len()]
+        })
+        .collect();
+    let chemin = dossier.join("coupe_au_debut.wav");
+    wav_24(&chemin, 96_000, &pcm);
+    piste(&db, 1, &chemin.to_string_lossy(), "wav", "local");
+    db.execute("UPDATE tracks SET duration_ms = 72000 WHERE id = 1", &[])
+        .unwrap();
+
+    let debut = std::time::Instant::now();
+    assert_eq!(un_lot(&db, 1).await, 1);
+    eprintln!(
+        "faux_hires_7859 : 72 s en 24/96 mesurées en {:?}",
+        debut.elapsed()
+    );
+    let r = db
+        .query_one(
+            "SELECT verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares \
+             FROM hires_verifications WHERE track_id = 1",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        r[0].as_string().as_deref(),
+        Some("douteux"),
+        "les 24 premières secondes sont coupées à 20 kHz : la passe doit les voir — {r:?}"
+    );
+    assert_eq!(r[1].as_string().as_deref(), Some("bande_de_cd"), "{r:?}");
+    let f = r[2].as_f64().unwrap();
+    assert!((f - 20_000.0).abs() < 400.0, "coupure rangée {f}");
+    assert_eq!(r[3].as_i64(), Some(24));
+    assert_eq!(r[4].as_i64(), Some(96_000));
+    assert_eq!(r[5].as_i64(), Some(24));
+
+    // Le détail par fenêtres : les fenêtres en cause sont toutes avant 24 s.
+    let m = mesurer_un_fichier(&chemin.to_string_lossy(), 72_000).unwrap();
+    assert!(!m.fenetres_coupees.is_empty(), "{m:?}");
+    assert!(m.fenetres_coupees.iter().all(|c| c.debut_s < 24.0), "{m:?}");
+    let tranches = tranches_a_decoder(72_000);
+    assert_eq!(tranches.len(), TRANCHES);
+    assert!(
+        tranches[0].0 < 6.0 && tranches[TRANCHES - 1].0 + TRANCHE_S > 66.0,
+        "{tranches:?}"
+    );
+}
+
+/// #7859 — MESURE, pas un témoin : le temps d'analyse d'un morceau de 5 min
+/// en 24/96, avant (un extrait de 30 s, spectre moyen) et après (tranches sur
+/// toute la durée, par fenêtres). À lancer à la main :
+/// `cargo test -p tune-core --lib -- --ignored temps_d_analyse_7859 --nocapture`.
+#[test]
+#[ignore]
+fn temps_d_analyse_7859() {
+    let dossier = crate::test_scratch::scratch_dir("faux-hires-7859-temps");
+    let segment = quantifier(&rose(96_000, 47_000.0, 91), 24);
+    let pcm: Vec<i32> = (0..300 * 96_000)
+        .map(|i| segment[i % segment.len()])
+        .collect();
+    let chemin = dossier.join("cinq_minutes.wav");
+    wav_24(&chemin, 96_000, &pcm);
+    let chemin = chemin.to_string_lossy().to_string();
+
+    let debut = std::time::Instant::now();
+    let pcm = crate::audio::decode::decode_to_pcm(&chemin, None, None, 30.0, 30.0).unwrap();
+    let avant = super::super::faux_hires::coupure_du_spectre_moyen(
+        &pcm.samples_i32,
+        pcm.channels,
+        pcm.sample_rate,
+        24,
+    );
+    let duree_avant = debut.elapsed();
+
+    let debut = std::time::Instant::now();
+    let m = mesurer_un_fichier(&chemin, 300_000).unwrap();
+    let duree_apres = debut.elapsed();
+    eprintln!(
+        "faux_hires_7859 temps : avant (30 s, spectre moyen) {duree_avant:?} -> {avant:?} ; \
+         après ({} tranches de {} s, {} fenêtres) {duree_apres:?} -> {:?}",
+        TRANCHES,
+        TRANCHE_S,
+        m.fenetres_jugees,
+        juger(&m)
+    );
+}
+
+/// #7859 — une piste courte ou de durée inconnue : une seule tranche, depuis
+/// le début.
+#[test]
+fn une_piste_courte_se_decode_en_une_tranche_7859() {
+    assert_eq!(
+        tranches_a_decoder(0),
+        vec![(0.0, TRANCHES as f64 * TRANCHE_S)]
+    );
+    assert_eq!(
+        tranches_a_decoder(45_000),
+        vec![(0.0, TRANCHES as f64 * TRANCHE_S)]
+    );
+    let longue = tranches_a_decoder(300_000);
+    assert_eq!(longue.len(), TRANCHES);
+    assert!(longue.iter().all(|&(d, l)| d >= 0.0 && d + l <= 300.0));
+    assert!(longue.windows(2).all(|w| w[0].0 < w[1].0));
 }
 
 #[test]

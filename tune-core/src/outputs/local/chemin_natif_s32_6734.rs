@@ -95,7 +95,7 @@ fn traverser_le_chemin_natif(zone: &Zone, mots: &[i32], volume_units: u32) -> (V
     let paused = AtomicBool::new(false);
     let force_silent = AtomicBool::new(false);
     // Comme le bras : l'étage voit l'unité, le volume est au rappel.
-    let unite = AtomicU32::new(1000);
+    let unite = AtomicU32::new(UNITE_DU_GAIN_DE_RENDU);
     let mut etage = EtageNatif::monter(
         spec,
         FormatOuvert::new(CADENCE, 2),
@@ -148,7 +148,7 @@ fn un_wav_32_bits_traverse_le_chemin_natif_bit_a_bit_6734() {
         mots.iter().all(|m| m & 0xFF != 0 || *m == i32::MIN),
         "le témoin n'a de sens que si les 8 bits bas portent quelque chose"
     );
-    let (au_pilote, etage_intact) = traverser_le_chemin_natif(&zone, &mots, 1000);
+    let (au_pilote, etage_intact) = traverser_le_chemin_natif(&zone, &mots, UNITE_DU_GAIN_DE_RENDU);
     let premier_ecart = mots.iter().zip(&au_pilote).position(|(a, b)| a != b);
     assert_eq!(
         premier_ecart,
@@ -195,7 +195,7 @@ fn le_contrat_natif_ne_dit_bit_perfect_qu_a_l_unite_sans_dsp_6734() {
         )
     };
 
-    let intact = publier(true, 1000);
+    let intact = publier(true, UNITE_DU_GAIN_DE_RENDU);
     assert!(
         intact.bit_perfect,
         "chemin natif à l'unité sans DSP : le contrat doit dire bit-perfect ({:?})",
@@ -215,7 +215,7 @@ fn le_contrat_natif_ne_dit_bit_perfect_qu_a_l_unite_sans_dsp_6734() {
     );
     assert!(volume.reasons.contains(&OutputSignalReason::SoftwareVolume));
 
-    let dsp = publier(false, 1000);
+    let dsp = publier(false, UNITE_DU_GAIN_DE_RENDU);
     assert!(!dsp.bit_perfect, "DSP appliqué : pas de bit-perfect");
 }
 
@@ -225,10 +225,13 @@ fn le_contrat_natif_ne_dit_bit_perfect_qu_a_l_unite_sans_dsp_6734() {
 fn le_chemin_partage_reste_pris_hors_du_cas_natif_6734() {
     let zone = Zone::au_repos();
     let s32 = spec(ProfondeurPcm::Entier32);
-    assert_eq!(chemin_natif_s32(&zone.conditions(s32, 1000)), Ok(()));
+    assert_eq!(
+        chemin_natif_s32(&zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU)),
+        Ok(())
+    );
 
     assert_eq!(
-        chemin_natif_s32(&zone.conditions(s32, 999)),
+        chemin_natif_s32(&zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU - 1)),
         Err(MotifDuCheminPartage::VolumeLogiciel),
         "volume à 99,9 % : le chemin natif ne doit pas être pris (#6734)"
     );
@@ -241,13 +244,16 @@ fn le_chemin_partage_reste_pris_hors_du_cas_natif_6734() {
     // `local_dsp_is_identity`, comme dans `play_url`.
     zone.mono_downmix.store(true, Ordering::SeqCst);
     assert_eq!(
-        chemin_natif_s32(&zone.conditions(s32, 1000)),
+        chemin_natif_s32(&zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU)),
         Err(MotifDuCheminPartage::DspActif),
         "DSP actif : le chemin natif ne doit pas être pris (#6734)"
     );
     // PURE contourne le DSP : le natif redevient possible.
     zone.pure_bypass.store(true, Ordering::SeqCst);
-    assert_eq!(chemin_natif_s32(&zone.conditions(s32, 1000)), Ok(()));
+    assert_eq!(
+        chemin_natif_s32(&zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU)),
+        Ok(())
+    );
     zone.pure_bypass.store(false, Ordering::SeqCst);
     zone.mono_downmix.store(false, Ordering::SeqCst);
 
@@ -257,13 +263,13 @@ fn le_chemin_partage_reste_pris_hors_du_cas_natif_6734() {
         ProfondeurPcm::FlottantIeee32,
     ] {
         assert_eq!(
-            chemin_natif_s32(&zone.conditions(spec(profondeur), 1000)),
+            chemin_natif_s32(&zone.conditions(spec(profondeur), UNITE_DU_GAIN_DE_RENDU)),
             Err(MotifDuCheminPartage::SourcePasEntiere32Bits),
             "{profondeur:?} : l'anneau f32 le porte intact, rien ne change"
         );
     }
 
-    let base = zone.conditions(s32, 1000);
+    let base = zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU);
     for (conditions, motif) in [
         (
             ConditionsDuNatif {
@@ -290,7 +296,7 @@ fn le_chemin_partage_reste_pris_hors_du_cas_natif_6734() {
 fn le_volume_du_rappel_natif_reste_dans_la_pleine_echelle_6734() {
     let zone = Zone::au_repos();
     let mots = mots_de_test();
-    let (au_pilote, _) = traverser_le_chemin_natif(&zone, &mots, 500);
+    let (au_pilote, _) = traverser_le_chemin_natif(&zone, &mots, UNITE_DU_GAIN_DE_RENDU / 2);
     for (source, rendu) in mots.iter().zip(&au_pilote) {
         let attendu = (f64::from(*source) * 0.5).round() as i32;
         assert_eq!(*rendu, attendu, "source {source:#010x}");
@@ -332,7 +338,7 @@ fn la_pause_rend_du_silence_sans_vider_l_anneau_natif_6734() {
     let mut tampon = [1i32; 16];
     let lus = rendre_une_periode_native_s32(
         &anneau,
-        &AtomicU32::new(1000),
+        &AtomicU32::new(UNITE_DU_GAIN_DE_RENDU),
         &AtomicBool::new(true),
         &AtomicBool::new(false),
         &AtomicBool::new(true),

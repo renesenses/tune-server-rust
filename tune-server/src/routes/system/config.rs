@@ -336,6 +336,17 @@ pub(super) async fn get_config(
             config.insert(k, Value::String(v));
         }
     }
+    // #7840 — une valeur enregistrée sous l'ancienne borne (jusqu'à 300 s)
+    // se relit comme le recul réellement appliqué : 60 s au plus.
+    if let Some(v) = config.get_mut(tune_core::db::listening_resume::REWIND_KEY) {
+        let brut = match &*v {
+            Value::String(s) => s.clone(),
+            autre => autre.to_string(),
+        };
+        *v = json!(tune_core::db::listening_resume::effective_rewind(Some(
+            &brut
+        )));
+    }
     let defaults: Vec<(&str, Value)> = vec![
         ("api_port", json!(state.port)),
         ("stream_port", json!(state.port)),
@@ -367,6 +378,10 @@ pub(super) async fn get_config(
         // TCP du même port (#2938, #2349). Voir
         // `background::annonce_slimproto_activee`.
         (crate::background::CLE_ANNONCE_SLIMPROTO, json!(true)),
+        // #7374 — « Serveur Squeezebox de Tune » : vrai par défaut, le
+        // comportement d'avant. Un `false` explicite ferme 3483 TCP/UDP et
+        // 9090, pour laisser ces ports à un Lyrion/LMS de la même machine.
+        (crate::background::CLE_SERVEUR_SQUEEZEBOX, json!(true)),
         ("db_engine", json!(state.backend.engine().as_str())),
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),
@@ -495,8 +510,9 @@ pub(super) async fn get_config(
             json!(tune_core::taches_de_fond::vitesse::Vitesse::default().id()),
         ),
         // #6713 — lever le bridage des analyses quand la température est
-        // illisible. Désactivé par défaut, publié avec son défaut pour que le
-        // client distingue « éteint » de « pas lu ».
+        // illisible. Sans effet depuis #6450 (plus de bridage sur une
+        // température illisible) ; publié avec son défaut pour les clients
+        // qui le lisent encore.
         (
             tune_core::taches_de_fond::vitesse::CLE_LEVER_LE_BRIDAGE,
             json!(tune_core::taches_de_fond::vitesse::LEVER_LE_BRIDAGE_DEFAUT),
@@ -595,11 +611,18 @@ pub(super) async fn get_config(
     // MACHINE : « Rapide » dépend des cœurs, et l'écran doit le dire plutôt
     // que de promettre quatre pistes à un double cœur.
     {
-        use tune_core::taches_de_fond::vitesse::{Vitesse, coeurs};
-        let n = coeurs();
+        use tune_core::taches_de_fond::vitesse::{
+            Vitesse, coeurs, largeur_sur_la_machine, memoire_totale,
+        };
+        let (n, memoire) = (coeurs(), memoire_totale());
         let largeurs: serde_json::Map<String, Value> = Vitesse::TOUTES
             .into_iter()
-            .map(|v| (v.id().to_string(), json!(v.largeur(n))))
+            .map(|v| {
+                (
+                    v.id().to_string(),
+                    json!(largeur_sur_la_machine(v, n, memoire)),
+                )
+            })
             .collect();
         config.insert(
             "background_analysis_speed_widths".to_string(),
@@ -1373,12 +1396,8 @@ fn normaliser_levee_du_bridage(
             )));
         }
     };
-    if valeur {
-        tracing::warn!(
-            "analyses_bridage_leve_par_reglage — sans température lisible, les analyses de fond \
-             tourneront à la vitesse réglée (choix de l'utilisateur, #6713)"
-        );
-    }
+    // #6450 : sans effet, une température illisible ne bride plus. La
+    // valeur reste acceptée et gardée pour les clients qui l'écrivent.
     values.insert(CLE_LEVER_LE_BRIDAGE.to_string(), json!(valeur));
     Ok(())
 }
@@ -1750,6 +1769,70 @@ fn prendre_reponse_ecoutes(
     }
 }
 
+/// L'authentification est-elle ACTIVE ? Seul ce cas rend `RequireAdmin`
+/// effectif (un jeton admin valide a été exigé) ; désactivée, la garde laisse
+/// passer tout appelant.
+pub(super) fn authentification_admin_effective(state: &AppState) -> bool {
+    SettingsRepo::with_backend(state.backend.clone())
+        .get("auth_enabled")
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == "true")
+}
+
+/// `403` qui nomme les clés protégées d'une écriture générique, ou `None`
+/// quand l'écriture peut avoir lieu (aucune clé protégée, ou admin effectif).
+pub(super) fn refus_des_cles_protegees<'a>(
+    state: &AppState,
+    cles: impl IntoIterator<Item = &'a str>,
+) -> Option<axum::response::Response> {
+    let refusees = tune_core::reglages_proteges::cles_protegees(cles);
+    if refusees.is_empty() || authentification_admin_effective(state) {
+        return None;
+    }
+    tracing::warn!(cles = %refusees.join(","), "reglages_proteges_refuses");
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "protected_settings",
+                "message": "These settings can only be changed by an authenticated administrator.",
+                "refused_keys": refusees,
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// Retire d'un import les clés protégées quand l'admin n'est pas effectif, et
+/// rend les avertissements à joindre à la réponse.
+pub(super) fn ecarter_les_cles_protegees<T>(
+    state: &AppState,
+    reglages: &mut Vec<(String, T)>,
+) -> Vec<String> {
+    if authentification_admin_effective(state) {
+        return Vec::new();
+    }
+    let mut avertissements = Vec::new();
+    reglages.retain(|(cle, _)| {
+        if tune_core::reglages_proteges::est_protege(cle) {
+            avertissements.push(format!(
+                "setting '{cle}' is protected (authenticated administrator required); skipped"
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    if !avertissements.is_empty() {
+        tracing::warn!(
+            nombre = avertissements.len(),
+            "import_reglages_proteges_ecartes"
+        );
+    }
+    avertissements
+}
+
 fn touche_le_replaygain(cles_posees: &[String]) -> bool {
     cles_posees.iter().any(|c| c.starts_with("replaygain_"))
 }
@@ -1761,10 +1844,21 @@ pub(super) async fn update_config(
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut values = body.0;
+    // Les clés qui changent qui contrôle le serveur, ce qu'il exécute ou à
+    // qui il parle (`tune_core::reglages_proteges`) ne passent par cette route
+    // qu'avec une authentification admin EFFECTIVE. Authentification
+    // désactivée, `RequireAdmin` laisse passer tout appelant : ces clés-là sont
+    // alors refusées, en bloc, avant toute écriture.
+    if let Some(refus) = refus_des_cles_protegees(&state, values.keys().map(String::as_str)) {
+        return Ok(refus);
+    }
     if let Some(value) = values.get(tune_core::db::listening_resume::REWIND_KEY) {
-        if value.as_u64().is_none_or(|n| n > 300) {
+        if value
+            .as_u64()
+            .is_none_or(|n| n > tune_core::db::listening_resume::REWIND_MAX)
+        {
             return Err(AppError::bad_request(
-                "continue_listening_rewind_seconds : entier de 0 à 300 attendu",
+                "continue_listening_rewind_seconds : entier de 0 à 60 attendu",
             ));
         }
     }
@@ -1873,6 +1967,17 @@ pub(super) async fn update_config(
                 .map(str::to_string)
                 .unwrap_or_else(|| v.to_string());
             crate::background::annonce_slimproto_activee(Some(&texte))
+        });
+
+    // #7374 — le serveur Squeezebox, lu au même endroit et de la même façon.
+    let serveur_demande = values
+        .get(crate::background::CLE_SERVEUR_SQUEEZEBOX)
+        .map(|v| {
+            let texte = v
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
+            crate::background::serveur_squeezebox_actif(Some(&texte))
         });
 
     let patch_music_dirs = values.get("music_dirs").and_then(dirs_depuis_valeur);
@@ -2026,8 +2131,24 @@ pub(super) async fn update_config(
         tune_core::http::bruit_reseau::regler(actif);
         tracing::info!(actif, "network_noise_watch_applied");
     }
-    // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
-    let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
+    // #7374 — le serveur d'abord, sans redémarrage : l'annonce n'a de sens
+    // que s'il tourne. Deux PATCH simultanés passent l'un après l'autre :
+    // sinon un « rallumer » arrivé pendant l'attente d'une extinction armerait
+    // un serveur dont l'extinction effacerait ensuite l'état d'écoute.
+    let _bascule = if serveur_demande.is_some() || annonce_demandee.is_some() {
+        Some(BASCULE_SQUEEZEBOX.lock().await)
+    } else {
+        None
+    };
+    let serveur_applique = match serveur_demande {
+        Some(actif) => Some(appliquer_serveur_squeezebox(&state, actif).await),
+        None => None,
+    };
+    // #3809 — appliquer MAINTENANT, pas au prochain démarrage. Un serveur
+    // coupé garde son annonce muette, quelle que soit la valeur demandée.
+    let serveur_actif = crate::background::serveur_squeezebox_regle(&state.backend);
+    let annonce_appliquee =
+        annonce_demandee.map(|a| appliquer_annonce_slimproto(a && serveur_actif, state.port));
     // Fil 2148 (#5792) — le délai des partages réseau vaut dès l'attente en
     // cours des sondes, sans redémarrage.
     if let Some(secs) = intervalle_reseau_demande {
@@ -2055,6 +2176,11 @@ pub(super) async fn update_config(
     // effet tout de suite, et n'a pas à supposer qu'un redémarrage l'attend.
     if let Some(applique) = annonce_appliquee {
         reponse["slimproto_discovery_applied"] = json!(applique);
+    }
+    // #7374 — appliqué à chaud : aucun redémarrage n'est demandé.
+    if let Some(applique) = serveur_applique {
+        reponse["slimproto_server_applied"] = json!(applique);
+        reponse["slimproto_server_restart_required"] = json!(false);
     }
     // Écho du mode réellement posé : le client n'a pas à relire `GET /config`
     // pour savoir si sa demande a été comprise.
@@ -2182,6 +2308,81 @@ fn appliquer_annonce_slimproto(annonce: bool, port_http: u16) -> bool {
             eteinte
         }
         ActionAnnonce::Rien => false,
+    }
+}
+
+/// Ce qu'il faut faire du serveur Squeezebox de Tune (#7374), sachant l'état
+/// demandé et l'état réel. Fonction PURE, comme [`action_annonce`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActionServeur {
+    /// Le réglage est vrai et l'écoute TCP ne tourne pas (jamais armée, ou
+    /// bind refusé parce qu'un LMS tenait le port) : armer, ce qui retente
+    /// aussi les volets en échec.
+    Armer,
+    /// Le réglage est faux et un volet au moins tourne : tout éteindre.
+    Eteindre,
+    /// L'état demandé est déjà l'état réel.
+    Rien,
+}
+
+pub(crate) fn action_serveur(demande: bool, tcp_arme: bool, un_volet_arme: bool) -> ActionServeur {
+    match (demande, tcp_arme, un_volet_arme) {
+        (true, false, _) => ActionServeur::Armer,
+        (false, _, true) | (false, true, _) => ActionServeur::Eteindre,
+        _ => ActionServeur::Rien,
+    }
+}
+
+/// Une seule bascule du serveur Squeezebox ou de son annonce à la fois (#7374).
+static BASCULE_SQUEEZEBOX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Applique le réglage « Serveur Squeezebox de Tune » sans redémarrage (#7374).
+/// Vrai si l'état a changé.
+///
+/// L'extinction attend la fermeture des écoutes : quand la réponse part, 3483
+/// et 9090 sont libres pour un Lyrion/LMS de la même machine.
+async fn appliquer_serveur_squeezebox(state: &crate::state::AppState, actif: bool) -> bool {
+    use tune_core::slimproto::{cli_server, discovery};
+    let tcp = tune_core::slimproto::serveur_tcp_arme();
+    let un_volet = tcp || cli_server::est_arme() || discovery::est_armee();
+    match action_serveur(actif, tcp, un_volet) {
+        ActionServeur::Armer => {
+            crate::background::armer_serveur_squeezebox(state, &state.config);
+            tracing::info!(
+                reglage = crate::background::CLE_SERVEUR_SQUEEZEBOX,
+                "slimproto_serveur_rallume_a_chaud"
+            );
+            true
+        }
+        ActionServeur::Eteindre => {
+            let eteint = crate::background::eteindre_serveur_squeezebox().await;
+            tracing::info!(
+                reglage = crate::background::CLE_SERVEUR_SQUEEZEBOX,
+                "slimproto_serveur_eteint_a_chaud — ni 3483 TCP/UDP ni 9090 ouverts"
+            );
+            eteint
+        }
+        ActionServeur::Rien => false,
+    }
+}
+
+#[cfg(test)]
+mod serveur_squeezebox_a_chaud_tests_7374 {
+    use super::{ActionServeur, action_serveur};
+
+    #[test]
+    fn rallumer_arme_quand_l_ecoute_tcp_ne_tourne_pas() {
+        assert_eq!(action_serveur(true, false, false), ActionServeur::Armer);
+        // Le pont 9090 replié tourne, mais le TCP a échoué : on retente.
+        assert_eq!(action_serveur(true, false, true), ActionServeur::Armer);
+        assert_eq!(action_serveur(true, true, true), ActionServeur::Rien);
+    }
+
+    #[test]
+    fn couper_eteint_des_qu_un_volet_tourne() {
+        assert_eq!(action_serveur(false, true, true), ActionServeur::Eteindre);
+        assert_eq!(action_serveur(false, false, true), ActionServeur::Eteindre);
+        assert_eq!(action_serveur(false, false, false), ActionServeur::Rien);
     }
 }
 
@@ -2817,8 +3018,12 @@ pub(super) async fn import_config(
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
     use tune_core::config_export as ce;
-    let fichier = ce::lire(body).map_err(AppError::bad_request)?;
-    let plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
+    let mut fichier = ce::lire(body).map_err(AppError::bad_request)?;
+    // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
+    // elles sont écartées de l'import et nommées dans `warnings`.
+    let ecartees = ecarter_les_cles_protegees(&state, &mut fichier.settings);
+    let mut plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
+    plan.avertissements.extend(ecartees.iter().cloned());
     let mut reponse = ce::rapport(&plan);
     if q.dry_run {
         reponse["dry_run"] = json!(true);
@@ -2841,7 +3046,13 @@ pub(super) async fn import_config(
     reponse["imported"] = json!(bilan.reglages_ecrits);
     reponse["zones_added"] = json!(bilan.zones_creees.len());
     reponse["zones_modified"] = json!(bilan.zones_modifiees.len());
-    reponse["warnings"] = json!(bilan.avertissements);
+    let mut avertissements = bilan.avertissements.clone();
+    for a in ecartees {
+        if !avertissements.contains(&a) {
+            avertissements.push(a);
+        }
+    }
+    reponse["warnings"] = json!(avertissements);
     Ok(Json(reponse))
 }
 
@@ -4549,8 +4760,11 @@ pub(super) async fn set_license(
 }
 
 pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
-    state.license.clear_license().await;
-    Json(json!({ "status": "ok", "tier": "free" }))
+    let remote_released = crate::routes::cloud::retirer_la_licence(&state).await;
+    Json(crate::routes::cloud::reponse_de_retrait(
+        json!({ "status": "ok", "tier": "free" }),
+        remote_released,
+    ))
 }
 
 /// Nom convivial de CETTE machine — la réponse à « à quel serveur je parle ? ».
@@ -6117,7 +6331,9 @@ mod vitesse_des_analyses_5519_tests {
     use axum::extract::State;
     use axum::http::HeaderMap;
     use serde_json::{Value, json};
-    use tune_core::taches_de_fond::vitesse::{CLE_REGLAGE, Vitesse, coeurs};
+    use tune_core::taches_de_fond::vitesse::{
+        CLE_REGLAGE, Vitesse, coeurs, largeur_sur_la_machine, memoire_totale,
+    };
 
     /// #5519 — le réglage est publié avec son défaut `normal`, avec la largeur
     /// réelle de chaque vitesse sur cette machine.
@@ -6137,7 +6353,11 @@ mod vitesse_des_analyses_5519_tests {
         assert_eq!(largeurs["discreet"], 1);
         assert_eq!(
             largeurs["normal"],
-            json!(Vitesse::Normale.largeur(coeurs()))
+            json!(largeur_sur_la_machine(
+                Vitesse::Normale,
+                coeurs(),
+                memoire_totale()
+            ))
         );
         assert_eq!(largeurs["fast"], json!(Vitesse::Rapide.largeur(coeurs())));
     }

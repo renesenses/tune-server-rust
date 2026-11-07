@@ -77,7 +77,24 @@ impl PositionPoller {
         // Tune commande lui-même).
         let plafond = crate::audio::volume_limites::lire_effectives(&self.db, zone_id)
             .plafond_de_suivi(consigne * facteur);
-        match juger_le_releve_de_volume(precedent, rapporte, consigne, trim_db, plafond) {
+        let mut jugement =
+            juger_le_releve_de_volume(precedent, rapporte, consigne, trim_db, plafond);
+        // #7379, #8074 — une sortie à volume LOGICIEL (locale, navigateur) n'a
+        // pas de bouton d'ampli : son volume relu est le gain que Tune lui a
+        // posé lui-même (gain de départ, sourdine rendue). Plus haut que la
+        // consigne, il n'est jamais suivi ni « ramené » vers le haut.
+        if !self.suivi_a_la_hausse_permis(zone_id) {
+            jugement = match jugement {
+                JugementDuReleve::Adopter(v) if v > consigne => {
+                    JugementDuReleve::PlusHautNonAdopte(v)
+                }
+                JugementDuReleve::RamenerAuPlafond(_) => {
+                    JugementDuReleve::PlusHautNonAdopte(rapporte / facteur)
+                }
+                autre => autre,
+            };
+        }
+        match jugement {
             JugementDuReleve::Adopter(v) => {
                 if v > consigne {
                     info!(
@@ -120,6 +137,19 @@ impl PositionPoller {
             }
             JugementDuReleve::Ignorer => None,
         }
+    }
+
+    /// #7379 — le suivi à la HAUSSE ne vaut que pour un appareil à volume
+    /// matériel (DLNA, OpenHome, AirPlay…) : un geste au bouton de l'ampli.
+    /// Une sortie à volume logiciel (`local`, `browser` : échelle `db60`) n'a
+    /// pas de bouton hors de Tune ; sa consigne ne monte que par Tune.
+    pub(super) fn suivi_a_la_hausse_permis(&self, zone_id: i64) -> bool {
+        let output_type = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_type);
+        suivi_a_la_hausse_pour(output_type.as_deref())
     }
 
     /// Applique `suite` : la consigne de la zone en mémoire (évènement
@@ -170,4 +200,12 @@ impl PositionPoller {
             Err(e) => warn!(zone_id, cible, error = %e, "volume_ramene_au_plafond_echec"),
         }
     }
+}
+
+/// #7379 — `true` pour une sortie à volume matériel, `false` pour une sortie
+/// à volume logiciel (même partage que
+/// [`crate::audio::volume_scale::EchelleDeVolume::de_la_sortie`]).
+pub(super) fn suivi_a_la_hausse_pour(output_type: Option<&str>) -> bool {
+    crate::audio::volume_scale::EchelleDeVolume::de_la_sortie(output_type)
+        != crate::audio::volume_scale::EchelleDeVolume::Perceptive
 }

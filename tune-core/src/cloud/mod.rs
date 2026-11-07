@@ -28,6 +28,8 @@ pub mod support;
 pub mod telemetry;
 pub mod tune_tested;
 pub mod tune_tested_auto;
+// #7922 — proposer un appareil après une heure d'écoute sans erreur.
+pub mod tune_tested_proposition;
 
 /// Posé par le relais (`relay`) sur CHAQUE requête qu'il rejoue en local,
 /// après les en-têtes venus du distant : un appelant distant peut ajouter des

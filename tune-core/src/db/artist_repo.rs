@@ -310,6 +310,15 @@ pub mod sql {
         format!("DELETE FROM artists WHERE id = {}", d.placeholder(1))
     }
 
+    /// #7979 — la graphie accentuée des balises remplace le nom de la fiche.
+    pub fn renommer<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET name = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     /// Les artistes dont le nom, sans accents ni casse, contient un fragment
     /// (BIB-C2). Préfiltre SQL seulement : la décision se prend en Rust sur
     /// [`super::cle_artiste`]. `ORDER BY id` : le plus ancien gagne.
@@ -546,36 +555,36 @@ pub mod sql {
         )
     }
 
-    /// Le PRÉDICAT de la recherche d'artistes (emplacements 1 et 2), extrait
-    /// pour que la liste rendue et le total annoncé portent le même filtre
+    /// Le PRÉDICAT de la recherche d'artistes (emplacement 1), extrait pour
+    /// que la liste rendue et le total annoncé portent le même filtre
     /// (#3189).
+    ///
+    /// #7619 (L3), décision de Bertrand du 01/11/2026 : en DÉBUT DE MOT, par
+    /// l'index plein texte seul (`name`, `sort_name`). Le `LIKE '%…%'` en OU,
+    /// qui trouvait aussi le milieu d'un mot, est retiré.
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
-        format!(
-            "{} OR LOWER(unaccent(a.name)) LIKE LOWER(unaccent({}))",
-            d.fts_where("artists", "a", &d.placeholder(1)),
-            d.placeholder(2)
-        )
+        d.fts_where("artists", "a", &d.placeholder(1))
     }
 
     /// Engine-agnostic full-text search, PAGINÉE. `ORDER BY a.id` est un
     /// ordre total : sans lui, deux pages successives peuvent se recouvrir.
-    /// Emplacements 3 et 4 : `LIMIT` et `OFFSET`.
+    /// Emplacements 2 et 3 : `LIMIT` et `OFFSET`.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT {COLS} FROM artists a WHERE {} ORDER BY a.id LIMIT {} OFFSET {}",
             search_where(d),
-            d.placeholder(3),
-            d.placeholder(4)
+            d.placeholder(2),
+            d.placeholder(3)
         )
     }
 
-    /// Le NOMBRE d'artistes correspondants, borné (emplacement 3). La borne
+    /// Le NOMBRE d'artistes correspondants, borné (emplacement 2). La borne
     /// est DANS la sous-requête, sinon elle ne borne rien.
     pub fn search_count<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT COUNT(*) FROM (SELECT a.id FROM artists a WHERE {} LIMIT {}) AS borne",
             search_where(d),
-            d.placeholder(3)
+            d.placeholder(2)
         )
     }
 }
@@ -666,6 +675,29 @@ pub fn cle_artiste(nom: &str) -> String {
     } else {
         sans_article.to_string()
     }
+}
+
+/// Nombre de diacritiques d'un nom : les marques combinantes de sa forme NFD,
+/// celles que [`fold_diacritics`] retire.
+fn nombre_d_accents(nom: &str) -> usize {
+    use unicode_normalization::UnicodeNormalization;
+    nom.nfd()
+        .filter(|c| matches!(*c, '\u{0300}'..='\u{036F}'))
+        .count()
+}
+
+/// #7979 — la balise donne-t-elle une graphie plus juste que la fiche ?
+///
+/// Vrai seulement si les deux noms ne diffèrent que par les accents (et la
+/// casse) et que la balise en porte strictement plus : « Bireli Lagrene »
+/// cède à « Biréli Lagrène », jamais l'inverse. La règle est à sens unique
+/// pour qu'une bibliothèque où cohabitent les deux graphies converge vers
+/// l'accentuée au lieu d'osciller au gré de l'ordre du scan. Les autres
+/// différences que [`cle_artiste`] rapproche (article, ponctuation) gardent
+/// la graphie de la fiche, comme le veut BIB-C2.
+pub fn graphie_plus_juste(fiche: &str, balise: &str) -> bool {
+    fold_diacritics(fiche).to_lowercase() == fold_diacritics(balise).to_lowercase()
+        && nombre_d_accents(balise) > nombre_d_accents(fiche)
 }
 
 /// Le mot le plus long de la clé (au moins trois lettres, ni « and » ni
@@ -765,18 +797,21 @@ impl ArtistRepo {
             let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
             let params: [&dyn ToSqlValue; 1] = [&mbid];
             if let Some(row) = self.db.query_one_strong(&sql, &params)? {
-                return self.completer_sort_name(row_to_artist(&row), sort_name);
+                let artiste = self.reprendre_les_accents_de_la_balise(row_to_artist(&row), name)?;
+                return self.completer_sort_name(artiste, sort_name);
             }
         }
         {
             let sql = self.dialect_sql(sql::get_by_name, sql::get_by_name);
             let params: [&dyn ToSqlValue; 1] = [&name];
             if let Some(row) = self.db.query_one_strong(&sql, &params)? {
-                return self.completer_sort_name(row_to_artist(&row), sort_name);
+                let artiste = self.reprendre_les_accents_de_la_balise(row_to_artist(&row), name)?;
+                return self.completer_sort_name(artiste, sort_name);
             }
         }
         if let Some(existant) = self.meme_artiste_sous_une_autre_graphie(name)? {
-            return self.completer_sort_name(existant, sort_name);
+            let artiste = self.reprendre_les_accents_de_la_balise(existant, name)?;
+            return self.completer_sort_name(artiste, sort_name);
         }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
         // #6463 — un MBID reçu ici vient des balises du fichier.
@@ -793,6 +828,36 @@ impl ArtistRepo {
             image_path: None,
             image_source: None,
         })
+    }
+
+    /// #7979 — une fiche retrouvée sous une graphie sans accents prend celle,
+    /// accentuée, que le fichier porte (voir [`graphie_plus_juste`]). Avant,
+    /// « Bireli Lagrene » survivait à toutes les analyses une fois les balises
+    /// corrigées en « Biréli Lagrène » : la fiche était retrouvée par la clé
+    /// pliée et rendue telle quelle.
+    fn reprendre_les_accents_de_la_balise(
+        &self,
+        mut artiste: Artist,
+        name: &str,
+    ) -> Result<Artist, TuneError> {
+        let Some(id) = artiste.id else {
+            return Ok(artiste);
+        };
+        let name = name.trim();
+        if !graphie_plus_juste(&artiste.name, name) {
+            return Ok(artiste);
+        }
+        let sql = self.dialect_sql(sql::renommer, sql::renommer);
+        let params: [&dyn ToSqlValue; 2] = [&name, &id];
+        self.db.execute(&sql, &params)?;
+        tracing::info!(
+            artist_id = id,
+            old = %artiste.name,
+            new = %name,
+            "artist_renamed_to_accented_tag_spelling"
+        );
+        artiste.name = name.to_string();
+        Ok(artiste)
     }
 
     /// #6474 — un artiste DÉJÀ en base, retrouvé par le scan, qui n'a pas de
@@ -1693,10 +1758,13 @@ impl ArtistRepo {
         offset: i64,
     ) -> Result<Vec<Artist>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = crate::db::engine::motif_like(query);
+        // #7619 : début de mot seulement — sans mot utilisable, rien à chercher.
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
         let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 4] = [&fts_query, &like, &limit, &offset];
+        let params: [&dyn ToSqlValue; 3] = [&fts_query, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(|cols| row_to_artist(cols)).collect())
     }
@@ -1705,9 +1773,11 @@ impl ArtistRepo {
     /// de `limit`. Rendre `plafond` signifie « au moins `plafond` ».
     pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = crate::db::engine::motif_like(query);
+        if fts_query.is_empty() {
+            return Ok(0);
+        }
         let sql = self.dialect_sql(sql::search_count, sql::search_count);
-        let params: [&dyn ToSqlValue; 3] = [&fts_query, &like, &plafond];
+        let params: [&dyn ToSqlValue; 2] = [&fts_query, &plafond];
         Ok(self
             .db
             .query_one(&sql, &params)?
@@ -2309,8 +2379,9 @@ mod tests {
         );
         let p_sql = sql::search(&PostgresDialect);
         assert!(p_sql.contains("a.search_tsv @@ to_tsquery('simple', unaccent($1))"));
-        assert!(s_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent(?))"));
-        assert!(p_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent($2))"));
+        // #7619 — début de mot : plus aucun `LIKE` en sous-chaîne.
+        assert!(!s_sql.contains("LIKE"), "{s_sql}");
+        assert!(!p_sql.contains("LIKE"), "{p_sql}");
         // #3189 — ordre TOTAL et pagination, plus le prédicat partagé avec le
         // compte. Garde de texte : sur SQLite, l'ordre des rowid masque la
         // disparition d'un `ORDER BY`.

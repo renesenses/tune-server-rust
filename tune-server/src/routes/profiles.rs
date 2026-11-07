@@ -25,6 +25,9 @@ use tune_core::license::Feature;
 
 use crate::state::AppState;
 
+#[path = "profiles_bibliotheque_etendue.rs"]
+mod bibliotheque_etendue;
+
 #[derive(Deserialize)]
 struct CreateProfile {
     #[serde(alias = "username")]
@@ -58,6 +61,9 @@ struct FavoritesQuery {
     item_type: Option<String>,
     sort: Option<String>,
     order: Option<String>,
+    /// `bibliotheque` quand la Bibliothèque élargie demande les favoris
+    /// (#7780) : la liste est alors vide si le réglage est désactivé.
+    pour: Option<String>,
 }
 
 /// Favori de FACETTE (#2442) : un label n'a pas d'identifiant entier, il est
@@ -176,6 +182,13 @@ pub fn router() -> Router<AppState> {
             get(get_profile).put(update_profile).delete(delete_profile),
         )
         .route("/{id}/activate", post(activate_profile))
+        // #7856 — la politique du contrôle parental, réservée au superviseur.
+        .route(
+            "/{id}/politique-parentale",
+            get(super::politique_parentale::lire)
+                .put(super::politique_parentale::poser)
+                .delete(super::politique_parentale::retirer),
+        )
         .route("/{id}/favorites", get(list_favorites))
         .route("/{id}/favorites/add", post(add_favorite))
         .route("/{id}/favorites/remove", post(remove_favorite))
@@ -212,6 +225,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/{id}/settings",
             get(profile_settings).post(update_profile_settings),
+        )
+        // Bibliothèque élargie aux favoris des services (#7780).
+        .route(
+            "/{id}/settings/bibliotheque-etendue",
+            get(bibliotheque_etendue::lire).put(bibliotheque_etendue::ecrire),
         )
         .route("/{id}/stats", get(profile_stats))
         .route("/{id}/history", get(profile_history))
@@ -504,6 +522,14 @@ async fn list_streaming_favorites(
 ) -> Response {
     if let Err(r) = profil_du_chemin_ou_404(id, profil) {
         return r;
+    }
+    // #7780 — la Bibliothèque ne reçoit rien quand le profil a désactivé la
+    // bibliothèque élargie ; l'écran Favoris, qui n'envoie pas `pour`, garde
+    // toute sa liste.
+    if q.pour.as_deref() == Some(bibliotheque_etendue::POUR_LA_BIBLIOTHEQUE)
+        && !bibliotheque_etendue::est_activee(&state, id)
+    {
+        return Json(json!([])).into_response();
     }
     // #5997 — l'ouverture des Favoris rafraîchit les services en miroir dont
     // le cache court est périmé, puis donne à ce profil les favoris communs
@@ -1018,6 +1044,9 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
     } else {
         format!("profile_id = {id}")
     };
+    // #7965 — l'historique contient les radios (une ligne par station
+    // lancée) : les statistiques du profil les excluent.
+    let profile_filter = format!("{profile_filter} AND COALESCE(source, '') <> 'radio'");
 
     let listens_row = b
         .query_one(

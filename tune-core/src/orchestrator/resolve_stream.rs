@@ -89,6 +89,64 @@ pub(crate) fn format_dash_impose(
     }
 }
 
+/// #7266 — le fMP4 DASH se remuxe-t-il sans perte (trames FLAC recopiées
+/// telles quelles) au lieu d'être décodé puis ré-encodé ? Oui pour une
+/// source FLAC servie telle quelle : ni WAV, ni traitement de zone
+/// (égaliseur, convolveur, ReplayGain, crossfeed), ni plafond 16 bits, ni
+/// plafond de cadence — ce sont eux qui exigent le PCM, et ils gardent le
+/// décodage. Un AAC DASH (qualité « Haute ») n'a pas de trames FLAC à
+/// recopier : il garde le décodage. Par défaut depuis #7266 ;
+/// `TUNE_DASH_REMUX=0` (ou `false`) le coupe.
+pub(crate) fn remux_dash_sans_perte(
+    source_flac: bool,
+    servi_en_wav: bool,
+    traitement_de_zone: bool,
+    plafond_16: bool,
+    cadence_plafonnee: bool,
+) -> bool {
+    let coupe = std::env::var("TUNE_DASH_REMUX")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    !coupe
+        && source_flac
+        && !servi_en_wav
+        && !traitement_de_zone
+        && !plafond_16
+        && !cadence_plafonnee
+}
+
+/// #7266 — le codec annoncé par le service est-il du FLAC ? `FLAC` pour le
+/// CD et le Hi-Res TIDAL (le MQA arrive aussi en FLAC), `AAC` pour HIGH/LOW.
+pub(crate) fn source_dash_en_flac(codec: &str) -> bool {
+    codec.eq_ignore_ascii_case("flac")
+}
+
+/// #7266 — les VU-mètres d'un FLAC DASH remuxé : un décodage à côté, sur un
+/// lien dur du fichier servi, après coup. Sans lien (système de fichiers qui
+/// n'en fait pas), les aiguilles restent figées et le journal le dit.
+fn nourrir_les_vu_apres_le_remux(
+    servi: &str,
+    ltx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+) {
+    let lien = format!("{servi}.niveaux");
+    if let Err(e) = std::fs::hard_link(servi, &lien) {
+        debug!(error = %e, "streaming_dash_remux_vu_sans_lien");
+        return;
+    }
+    std::thread::spawn(move || {
+        if let Ok(d) = crate::audio::decode::decode_to_pcm(&lien, None, None, 0.0, 0.0) {
+            crate::audio::tap::send_windowed_pcm(
+                &ltx,
+                &d.pcm_bytes(),
+                d.bit_depth,
+                d.channels as u16,
+                d.sample_rate,
+            );
+        }
+        let _ = std::fs::remove_file(&lien);
+    });
+}
+
 /// La profondeur servie par le pré-transcodage DASH : 16 bits en WAV (profil
 /// `DLNA.ORG_PN=LPCM`, #1137) et sous plafond 16 bits, sinon celle de la
 /// source.
@@ -118,6 +176,8 @@ struct DashPret<'a> {
     /// #5524 — la cadence servie est celle du plafond de zone, pas celle du
     /// service : le remux (sans décodage) ne peut pas la servir.
     plafonnee: bool,
+    /// #7266 — la source est du FLAC : seule elle se remuxe.
+    source_flac: bool,
 }
 
 /// Issue du premier temps : tout est prêt pour transcoder, ou la piste est
@@ -150,6 +210,9 @@ struct TranscodageEnTache {
     seek_s: f64,
     is_dash_local: bool,
     use_http_range: bool,
+    /// #7100 — l'écrêtage relevé par le relais DSP de cette session, que le
+    /// forwarder de niveaux lit pour allumer `over_*`. `None` sans relais.
+    ecretages: Option<Arc<crate::audio::ecretage_de_traitement::EcretagesDeTraitement>>,
 }
 
 /// Rejoue sur une requête les en-têtes rendus par le résolveur (#4366).
@@ -696,9 +759,14 @@ impl PlaybackOrchestrator {
         // `is_some()` check served that empty title verbatim, wiping Now Playing
         // (DEvir: `auto_next title=Shine...` followed by `orchestrator_play
         // title=`). Falling through to get_track() refetches the real metadata
-        // from the service. The network call only fires when the title is
-        // missing, so the happy path is unchanged.
-        let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+        // from the service. #7738 : un titre Qobuz importé peut avoir un titre
+        // et une durée, mais aucun artiste, album ni pochette. Compléter aussi
+        // ce cas ; une fiche Qobuz complète garde le chemin sans requête.
+        let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
+            && (service_name != "qobuz"
+                || [&req.artist_name, &req.album_title, &req.cover_url]
+                    .into_iter()
+                    .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
         let (title, artist, album, mut duration_ms, cover_path) = if has_title {
             (
                 req.title.clone().unwrap_or_default(),
@@ -1146,6 +1214,7 @@ impl PlaybackOrchestrator {
             seek_s,
             is_dash_local,
             use_http_range,
+            ecretages: None,
         }
     }
 
@@ -1172,6 +1241,7 @@ impl PlaybackOrchestrator {
             seek_s,
             is_dash_local,
             use_http_range,
+            ecretages,
         } = tache;
         // Audio-levels channel so the web client VU-meter works for
         // streaming-service content played through local/OAAT outputs.
@@ -1180,12 +1250,13 @@ impl PlaybackOrchestrator {
         let levels_tx = match ev_bus.filter(|_| attach_levels) {
             Some(bus) => {
                 let play_seq = playback.current_play_seq(zone_id).await;
-                spawn_paced_levels_forwarder(
+                spawn_paced_levels_forwarder_avec_ecretages(
                     bus,
                     playback,
                     zone_id,
                     play_seq,
                     (seek_s * 1000.0) as i64,
+                    ecretages,
                 )
             }
             None => tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0,
@@ -1595,7 +1666,11 @@ impl PlaybackOrchestrator {
                 // device → same FLAC/WAV decision, so inherit it).
                 self.spawn_warm_next_streaming(req.zone_id, source_id.to_string(), w.enc_format);
 
-                let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+                let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
+                    && (service_name != "qobuz"
+                        || [&req.artist_name, &req.album_title, &req.cover_url]
+                            .into_iter()
+                            .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
                 let (title, artist, album, duration_ms, cover_path) = if has_title {
                     (
                         req.title.clone().unwrap_or_default(),
@@ -1700,6 +1775,7 @@ impl PlaybackOrchestrator {
             dash_did,
             reglages,
             plafonnee: cadence_plafonnee.is_some(),
+            source_flac: source_dash_en_flac(&stream_data.quality.codec),
         }))
     }
 
@@ -1827,7 +1903,11 @@ impl PlaybackOrchestrator {
                 .streamer
                 .get_stream_url(&session_id, &server_ip, "flac");
 
-            let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+            let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
+                && (service_name != "qobuz"
+                    || [&req.artist_name, &req.album_title, &req.cover_url]
+                        .into_iter()
+                        .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
             let (title, artist, album, duration_ms, cover_path) = if has_title {
                 (
                     req.title.clone().unwrap_or_default(),
@@ -1896,6 +1976,8 @@ impl PlaybackOrchestrator {
             sr,
             tmp_path,
             reglages,
+            plafonnee,
+            source_flac,
             ..
         } = p;
         // #5114 — lu avant que le porteur parte dans la tâche de décodage :
@@ -1917,8 +1999,9 @@ impl PlaybackOrchestrator {
             // VU-mètres : le PCM décodé de ce pré-transcode part aussi vers le
             // forwarder de niveaux (cadencé par lui — voir #1105). Sans ça,
             // une piste DASH (Tidal HI-RES) sur DLNA/browser laissait les
-            // aiguilles figées. Le chemin remux (opt-in TUNE_DASH_REMUX) ne
-            // décode rien : VU légitimement muets dans ce cas.
+            // aiguilles figées. Le chemin remux (par défaut depuis #7266) ne
+            // décode rien pour le renderer : il nourrit les VU par un décodage
+            // à côté, après coup.
             let dash_levels_tx = self.levels_forwarder_if_allowed(req.zone_id, 0).await;
             // Durée du pré-transcode, sur la ligne de FIN.
             //
@@ -1938,19 +2021,39 @@ impl PlaybackOrchestrator {
                 // fMP4). If the renderer takes FLAC and no zone EQ is active, REMUX
                 // (copy the FLAC frames + STREAMINFO into a .flac) instead of
                 // decode→PCM→re-encode — a ~59s CPU transcode becomes a sub-second
-                // I/O copy, bit-identical (#1146). Opt-in via TUNE_DASH_REMUX;
-                // WAV renderers and EQ zones fall through to the decode path.
-                let remux = !dash_is_wav
-                    && !dash_dsp_active
-                    && !dash_plafond_16
-                    && std::env::var("TUNE_DASH_REMUX")
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
-                if remux {
-                    return crate::audio::decode::remux_flac_dash(
-                        &unique_path_clone,
-                        &tmp_path_clone,
-                    );
+                // I/O copy, bit-identical (#1146). WAV renderers, zone DSP and
+                // capped zones fall through to the decode path.
+                //
+                // #7266 — c'est désormais le chemin par défaut : le FLAC CD de
+                // TIDAL arrive par ce bras depuis la rc8 (#6334), et le
+                // ré-encodage FLAC→FLAC de la piste entière retenait le Play.
+                // `TUNE_DASH_REMUX=0` rend l'ancien comportement.
+                if remux_dash_sans_perte(
+                    source_flac,
+                    dash_is_wav,
+                    dash_dsp_active,
+                    dash_plafond_16,
+                    plafonnee,
+                ) {
+                    match crate::audio::decode::remux_flac_dash(&unique_path_clone, &tmp_path_clone)
+                    {
+                        Ok(remuxe) => {
+                            // Les VU-mètres décrivaient le PCM du transcodage.
+                            // Le remux n'en produit pas : un décodage À CÔTÉ,
+                            // après coup, les nourrit sans retarder le Play (le
+                            // forwarder se cale sur la position de lecture). Il
+                            // lit son propre lien du fichier : le service peut
+                            // renommer ou effacer l'original.
+                            if let Some(ltx) = dash_levels_tx {
+                                nourrir_les_vu_apres_le_remux(&tmp_path_clone, ltx);
+                            }
+                            return Ok(remuxe);
+                        }
+                        // #7266 — un fMP4 qui n'a pas les trames FLAC attendues
+                        // (codec mal annoncé, STREAMINFO absent) se décode
+                        // comme avant : la piste joue, plus lentement.
+                        Err(e) => warn!(error = %e, "streaming_dash_remux_echec_decodage"),
+                    }
                 }
 
                 let decoded = crate::audio::decode::decode_to_pcm(
@@ -2027,7 +2130,10 @@ impl PlaybackOrchestrator {
                     let file_info = StreamInfo {
                         format: dash_enc_format.into(),
                         mime_type: dash_mime.into(),
-                        sample_rate: sr,
+                        // #7266 — la cadence du fichier servi : celle de `sr`
+                        // après décodage (rééchantillonné vers elle), celle de
+                        // la source après un remux, qui n'y touche pas.
+                        sample_rate: actual_sr,
                         // Use the *encoded* depth (`actual_bd`), which the WAV
                         // fallback caps at 16-bit — otherwise DIDL/WAV would
                         // advertise 24-bit LPCM and the renderer plays silence.
@@ -2717,8 +2823,11 @@ impl PlaybackOrchestrator {
                         let source_id = source_id.clone();
                         let provider_quality = provider_quality.clone();
                         Box::pin(async move {
-                            let registry = services.lock().await;
-                            let svc = registry
+                            // #7729 — le registre n'est tenu que le temps de
+                            // copier le service, jamais pendant le réseau.
+                            let svc = services
+                                .lock()
+                                .await
                                 .get(&service_name)
                                 .ok_or_else(|| format!("unknown service: {service_name}"))?;
                             let mut svc = svc.write().await;
@@ -2888,8 +2997,19 @@ impl PlaybackOrchestrator {
         };
         self.poser_le_contexte_de_conversion(&session_id, contexte)
             .await;
-        let tx = spawn_streaming_dsp_relay(dsp, bd, true, tx);
-        let tache = self.capturer_pour_le_transcodage(
+        // #7100 — le relais relève où sa chaîne écrête, au référentiel des
+        // fenêtres du forwarder (seek compris).
+        let ecretages =
+            Arc::new(crate::audio::ecretage_de_traitement::EcretagesDeTraitement::new());
+        let releve = crate::audio::ecretage_de_traitement::ReleveDEcretage::new(
+            ecretages.clone(),
+            req.seek_ms.unwrap_or(0) as f64,
+            sr,
+            2,
+            bd,
+        );
+        let tx = spawn_streaming_dsp_relay_releve(dsp, bd, true, tx, Some(releve));
+        let mut tache = self.capturer_pour_le_transcodage(
             req,
             service_name,
             stream_data.url.clone(),
@@ -2899,6 +3019,7 @@ impl PlaybackOrchestrator {
             bd,
             &session_id,
         );
+        tache.ecretages = Some(ecretages);
         tokio::spawn(Self::transcoder_le_flux_en_wav(tache, tx, data_ready));
         let server_ip = self.server_ip();
         let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
@@ -2985,5 +3106,59 @@ mod decodage_progressif_3568_tests {
             "Deezer chiffre ses blocs"
         );
         assert!(!progressif("amazon", "flac", CDN));
+    }
+}
+
+/// #7266 — le FLAC DASH (TIDAL CD et Hi-Res) se remuxe par défaut au lieu
+/// d'un décodage puis d'un ré-encodage de la piste entière avant le Play ;
+/// chaque traitement qui exige le PCM garde le décodage.
+#[cfg(test)]
+mod remux_par_defaut_7266_tests {
+    use super::remux_dash_sans_perte as remux;
+    use super::source_dash_en_flac;
+
+    #[test]
+    fn un_flac_dash_sans_traitement_se_remuxe_par_defaut_7266() {
+        // Aucun test ne pose TUNE_DASH_REMUX : le défaut est mesuré tel quel.
+        assert!(
+            std::env::var("TUNE_DASH_REMUX").is_err(),
+            "banc pollué par TUNE_DASH_REMUX"
+        );
+        assert!(
+            remux(true, false, false, false, false),
+            "FLAC servi tel quel : le fMP4 est encore décodé puis ré-encodé en entier avant le Play"
+        );
+    }
+
+    #[test]
+    fn les_protections_qui_exigent_le_pcm_gardent_le_decodage_7266() {
+        assert!(
+            !remux(true, true, false, false, false),
+            "renderer servi en WAV"
+        );
+        assert!(
+            !remux(true, false, true, false, false),
+            "égaliseur, convolveur, ReplayGain ou crossfeed de zone"
+        );
+        assert!(
+            !remux(true, false, false, true, false),
+            "plafond 16 bits de zone"
+        );
+        assert!(
+            !remux(true, false, false, false, true),
+            "plafond de cadence de zone"
+        );
+    }
+
+    /// Relecture de la PR #7924 (B1) : un AAC DASH (qualité « Haute »)
+    /// n'a pas de trames FLAC à recopier ; il garde le décodage.
+    #[test]
+    fn un_aac_dash_garde_le_decodage_7266() {
+        assert!(source_dash_en_flac("FLAC") && source_dash_en_flac("flac"));
+        assert!(!source_dash_en_flac("AAC"), "AAC annoncé FLAC");
+        assert!(
+            !remux(source_dash_en_flac("AAC"), false, false, false, false),
+            "un AAC DASH sans traitement prend le remux FLAC, qui échoue"
+        );
     }
 }

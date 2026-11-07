@@ -77,7 +77,17 @@ pub struct EventState {
     /// de lecture paisible il n'a plus rien à dire, et `is_fresh` le
     /// déclarerait mort à tort.
     pub alive: bool,
+    /// #7841 — le dernier `SetVolume` accepté par le renderer OpenHome, en
+    /// niveau de l'appareil, et l'instant de son acceptation. Un évènement
+    /// `Volume` qui en diffère pendant [`GRACE_CONSIGNE_VOLUME`] est un avis
+    /// en retard sur la consigne : il ne remet pas l'ancien niveau.
+    pub consigne_volume: Option<(u32, Instant)>,
 }
+
+/// #7841 — durée pendant laquelle un évènement `Volume` qui contredit la
+/// dernière consigne acceptée est tenu pour un avis en retard. Même grâce que
+/// celle du sondeur après un geste de volume (`poller/tick.rs`).
+pub const GRACE_CONSIGNE_VOLUME: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl EventState {
     /// Un évènement est arrivé il y a moins de `EVENT_STALE_SECS`.
@@ -136,8 +146,8 @@ impl EventState {
             });
         }
 
-        if let Some(vol) = lu("Volume").and_then(|v| v.parse().ok()) {
-            self.volume = Some(vol);
+        if let Some(vol) = lu("Volume").and_then(|v| v.parse::<u32>().ok()) {
+            self.appliquer_volume_annonce(vol);
         }
 
         if let Some(mute) = lu("Mute") {
@@ -188,6 +198,31 @@ impl EventState {
         }
 
         self.last_update = Some(Instant::now());
+    }
+
+    /// #7841 — retient un niveau annoncé par le renderer, sauf s'il contredit
+    /// la consigne que le renderer vient d'accepter : c'est alors l'avis en
+    /// retard d'un niveau précédent (70 → 50 : un `Volume 70` arrivé après
+    /// le `SetVolume 50`), qui remettait 70 dans ce que Tune affiche.
+    ///
+    /// Le premier avis qui confirme la consigne la lève : la suite (télécommande,
+    /// Kazoo, bouton de l'appareil) est de nouveau prise telle quelle, comme
+    /// tout avis passé la grâce.
+    fn appliquer_volume_annonce(&mut self, niveau: u32) {
+        if let Some((consigne, depuis)) = self.consigne_volume {
+            if depuis.elapsed() < GRACE_CONSIGNE_VOLUME && niveau != consigne {
+                debug!(niveau, consigne, "oh_volume_avis_en_retard_ignore");
+                return;
+            }
+            self.consigne_volume = None;
+        }
+        self.volume = Some(niveau);
+    }
+
+    /// #7841 — le renderer a accepté `SetVolume niveau` à l'instant.
+    pub fn noter_consigne_volume(&mut self, niveau: u32) {
+        self.volume = Some(niveau);
+        self.consigne_volume = Some((niveau, Instant::now()));
     }
 }
 
@@ -926,5 +961,57 @@ mod tests {
             ..Default::default()
         };
         assert!(!st.is_live());
+    }
+
+    fn avis_volume(niveau: u32) -> HashMap<String, String> {
+        HashMap::from([("Volume".to_string(), niveau.to_string())])
+    }
+
+    /// 🔴 #7841 — 70 puis 50 : le `Volume 70` que le Linn émet en retard,
+    /// après avoir accepté `SetVolume 50`, ne remet pas 70 dans l'état que
+    /// Tune affiche. Rouge avant : l'avis réécrivait le niveau sans condition.
+    #[test]
+    fn un_avis_de_volume_en_retard_ne_remet_pas_l_ancien_niveau() {
+        let mut st = EventState::default();
+        st.apply_properties(&avis_volume(70));
+        st.noter_consigne_volume(50);
+
+        st.apply_properties(&avis_volume(70));
+
+        assert_eq!(
+            st.volume,
+            Some(50),
+            "#7841 : l'avis en retard du niveau 70 a remis l'ancien niveau après SetVolume 50"
+        );
+    }
+
+    /// L'avis qui confirme la consigne la lève : un changement venu ensuite
+    /// d'ailleurs (Kazoo, télécommande) est pris tel quel.
+    #[test]
+    fn l_avis_qui_confirme_la_consigne_rend_la_main_aux_autres_points_de_controle() {
+        let mut st = EventState::default();
+        st.noter_consigne_volume(50);
+        st.apply_properties(&avis_volume(50));
+        assert!(st.consigne_volume.is_none());
+
+        st.apply_properties(&avis_volume(62));
+
+        assert_eq!(st.volume, Some(62));
+    }
+
+    /// Passé la grâce, un avis qui diffère de la consigne est pris : le niveau
+    /// a changé ailleurs, ce n'est plus un retard.
+    #[test]
+    fn passe_la_grace_un_avis_different_est_pris() {
+        let mut st = EventState::default();
+        st.noter_consigne_volume(50);
+        st.consigne_volume = Some((
+            50,
+            Instant::now() - GRACE_CONSIGNE_VOLUME - std::time::Duration::from_millis(10),
+        ));
+
+        st.apply_properties(&avis_volume(70));
+
+        assert_eq!(st.volume, Some(70));
     }
 }

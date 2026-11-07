@@ -1,6 +1,7 @@
 mod album_order;
 mod albums;
 mod audit_integrite;
+mod bio_liens;
 /// #4806 — le drapeau `banned` des listes de pistes, partagé avec les
 /// playlists et la recherche fédérée qui vivent hors de ce module.
 pub(crate) use albums::attacher_banni;
@@ -21,6 +22,7 @@ pub(crate) mod credits_mb;
 // #4805 — les crédits d'un album lus juste après son identification.
 mod credits_apres_identification;
 mod duplicates;
+mod editorial_service;
 // Le mode « Modifier » de la fiche album (GO du 25/09/2026).
 mod edition;
 mod edition_balises;
@@ -33,7 +35,10 @@ mod albums_manquants_mb;
 mod liens_et_genres_mb;
 mod passes_metarust;
 // #5469 — les passes que `crate::reprise_des_passes` sait relancer.
-pub(crate) use artwork::{demarrer_images_artistes, demarrer_pochettes_albums};
+pub(crate) use artwork::{
+    PochetteAlbum, demarrer_images_artistes, demarrer_pochettes_albums, pochette_de_l_album,
+    serve_artwork_from,
+};
 pub(crate) use enrich::demarrer_enrich_all;
 mod edition_par_filtre;
 mod etiquetage_par_filtre;
@@ -57,15 +62,21 @@ mod labels;
 /// #6481 — le livret PDF rangé dans le dossier d'un album.
 mod livrets;
 mod lyrics_pass;
+/// #7849 — notes personnelles en Markdown (artiste, album, piste).
+mod notes;
 mod proposals;
 mod query_multi;
 mod ratings;
 mod reidentify;
 mod reports;
+// #7872 — `GET /library/query`, la requête avancée (grammaire de #7848).
+pub(crate) mod requete_avancee;
 // tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
 // fichiers de CETTE machine.
 pub(crate) mod reveler;
 mod search;
+/// #7857 — le spectrogramme d'une piste, en PNG, généré à la demande.
+mod spectrogramme;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
 // source de la même façon. Un seul point de vérité, partagé (#2147).
@@ -75,8 +86,11 @@ pub(crate) mod graver_dr;
 pub(crate) mod reparer_compilations;
 pub(crate) mod stats;
 mod tracks;
+pub(crate) use tracks::stream_track_audio;
 pub(crate) mod write_tags;
 
+/// Les versions d'un même album regroupées sous une fiche (#7617).
+mod oeuvres;
 /// Les versions d'une piste regroupées par enregistrement (#2264).
 mod versions_groupes;
 use axum::Router;
@@ -120,6 +134,15 @@ pub(super) fn api_cache_get(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     key: &str,
 ) -> Option<Value> {
+    api_cache_get_ttl(backend, key, API_CACHE_TTL_SECS)
+}
+
+/// Comme [`api_cache_get`], avec une durée de vie choisie par l'appelant.
+pub(super) fn api_cache_get_ttl(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    key: &str,
+    ttl_secs: i64,
+) -> Option<Value> {
     use tune_core::db::backend::ToSqlValue;
     use tune_core::db::engine::Engine;
     // `strftime` n'existe pas sur PostgreSQL : la requête SQLite y tombait
@@ -135,13 +158,13 @@ pub(super) fn api_cache_get(
         Engine::Sqlite => backend.query_one(
             "SELECT value FROM settings WHERE key = ? AND \
              CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) < ?",
-            &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
+            &[&key as &dyn ToSqlValue, &ttl_secs as &dyn ToSqlValue],
         ),
         Engine::Postgres => backend.query_one(
             "SELECT value FROM settings WHERE key = $1 AND updated_at > \
              to_char((now() - make_interval(secs => CAST($2 AS DOUBLE PRECISION))) \
              AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
-            &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
+            &[&key as &dyn ToSqlValue, &ttl_secs as &dyn ToSqlValue],
         ),
     }
     .ok()?
@@ -208,7 +231,7 @@ pub(super) fn now_iso_utc() -> String {
     format!("{y:04}-{:02}-{:02}T{h:02}:{m:02}:{s:02}Z", mo + 1, d + 1)
 }
 
-pub(super) fn artwork_is_hex_hash(s: &str) -> bool {
+pub(crate) fn artwork_is_hex_hash(s: &str) -> bool {
     (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -320,7 +343,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/artists/{id}/albums", get(artists::artist_albums))
         .route("/artists/{id}/tracks", get(artists::artist_tracks))
-        .route("/artists/{id}/bio", get(artists::artist_bio))
+        // #7910 : `bio_liens` appelle (artists::artist_bio) et ajoute `bio_segments`.
+        .route("/artists/{id}/bio", get(bio_liens::artist_bio))
         .route("/artists/{id}/similar", get(artists::artist_similar))
         .route("/artists/{id}/metadata", get(artists::artist_metadata))
         // #6463 — « Détacher l'identité » : retire le MBID, provenance `manuel`.
@@ -382,6 +406,18 @@ pub fn router() -> Router<AppState> {
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
+        // #7617 — les œuvres : segments statiques AVANT `/albums/{id}`.
+        .route("/albums/works", get(oeuvres::lister_oeuvres))
+        .route("/albums/works/members", get(oeuvres::membres_des_oeuvres))
+        .route(
+            "/albums/works/settings",
+            get(oeuvres::lire_reglage).put(oeuvres::ecrire_reglage),
+        )
+        .route(
+            "/albums/works/preferred",
+            axum::routing::put(oeuvres::ecrire_preferee),
+        )
+        .route("/albums/{id}/versions", get(oeuvres::versions_de_l_album))
         // tune-web-client#1875 — admin, depuis cette machine seulement.
         .route("/reveal/available", get(reveler::revelation_disponible))
         .route("/albums/{id}/reveal", post(reveler::reveler_album))
@@ -496,6 +532,7 @@ pub fn router() -> Router<AppState> {
         // la demande (lecture seule, plafonnée, sans image).
         .route("/tracks/{id}/file-tags", get(tracks::track_file_tags))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
+        .route("/tracks/{id}/spectrogramme.png", get(spectrogramme::png))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
         // #2264 — les mêmes candidats, regroupés par enregistrement, avec la
@@ -661,6 +698,8 @@ pub fn router() -> Router<AppState> {
             get(lyrics_pass::couverture_rattrapage).post(lyrics_pass::rattraper_maintenant),
         )
         .route("/search", get(search::search))
+        // #7872 — la requête avancée : mêmes droits que `/search`.
+        .route("/query", get(requete_avancee::requete_avancee))
         .route("/search/acoustic", post(search::acoustic_search))
         .route("/search/acoustic/status", get(search::acoustic_status))
         // Ambiances enregistrées : du stockage, pas de la recherche — donc
@@ -676,6 +715,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/stats", get(stats::library_stats))
         .route("/labels", get(labels::list_labels))
+        // Écran « État du serveur » (01/11/2026) : avant `/labels/{nom}/…`,
+        // qui ne capture de toute façon pas ces chemins (segment `artists`).
+        .route("/labels/logos/enrich", post(labels::lancer_logos))
+        .route("/labels/logos/status", get(labels::statut_logos))
         .route("/labels/{nom}/artists", get(labels::artistes_du_label))
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))
@@ -732,7 +775,8 @@ pub fn router() -> Router<AppState> {
             post(duplicates::retirer_album_doublon),
         )
         .route("/activity", get(stats::library_activity))
-        .route("/albums/{id}/bio", get(albums::album_bio))
+        // #7910 : `bio_liens` appelle (albums::album_bio) et ajoute `bio_segments`.
+        .route("/albums/{id}/bio", get(bio_liens::album_bio))
         .route("/albums/{id}/similar", get(albums::album_similar))
         .route(
             "/albums/{id}/artwork/rescan",
@@ -761,6 +805,14 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/lyrics", get(tracks::track_lyrics))
         .route("/ratings/export", get(ratings::export_ratings))
         .route("/ratings/import", post(ratings::import_ratings))
+        // #7849 — notes personnelles, privées au profil de l'appelant.
+        .route("/notes", get(notes::list_notes))
+        .route(
+            "/notes/{item_type}/{item_id}",
+            get(notes::get_note)
+                .put(notes::put_note)
+                .delete(notes::delete_note),
+        )
         // Lot 2 de l'enrichissement d'après MetaRust (#4805) : les passes de
         // lot, à la main. Suspendues par la tâche de fond `enrichment`.
         .route("/bpm-all", post(passes_metarust::bpm_lot_start))
@@ -797,6 +849,8 @@ pub fn router() -> Router<AppState> {
             "/dr/gravure",
             get(graver_dr::statut).post(graver_dr::lancer),
         )
+        // #7719 — arrêter la gravure en cours, entre deux fichiers.
+        .route("/dr/gravure/cancel", post(graver_dr::annuler))
         // 25/09/2026 — le compositeur des CRÉDITS descend dans la colonne ET
         // dans la balise du fichier. La balise est indispensable : `update_batch`
         // reconstruit `tracks.composer` à partir du fichier seul dès qu'un scan
@@ -946,9 +1000,18 @@ mod routage_tests {
 }
 
 #[cfg(test)]
+#[path = "banc_l3l4_7619.rs"]
+mod banc_l3l4_7619;
+#[cfg(test)]
 #[path = "banc_rail_5993.rs"]
 mod banc_rail_5993;
+#[cfg(test)]
+#[path = "facets_cache_7619_tests.rs"]
+mod facets_cache_7619_tests;
 
+#[cfg(test)]
+#[path = "curseur_7619_tests.rs"]
+mod curseur_7619_tests;
 #[cfg(test)]
 #[path = "facettes_lentes_2144_tests.rs"]
 mod facettes_lentes_2144_tests;
@@ -956,6 +1019,18 @@ mod facettes_lentes_2144_tests;
 #[cfg(test)]
 #[path = "liste_dr_7580_tests.rs"]
 mod liste_dr_7580_tests;
+
+#[cfg(test)]
+#[path = "filtre_qualite_7725_tests.rs"]
+mod filtre_qualite_7725_tests;
+
+#[cfg(test)]
+#[path = "notes_et_repartitions_7849_tests.rs"]
+mod notes_et_repartitions_7849_tests;
+
+#[cfg(test)]
+#[path = "requete_avancee_7872_tests.rs"]
+mod requete_avancee_7872_tests;
 
 #[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]

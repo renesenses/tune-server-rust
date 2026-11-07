@@ -33,18 +33,30 @@ pub(super) struct Banc {
     idle: HashMap<i64, IdlePollBackoff>,
     position_ms: u64,
     recu: tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+    /// L'identifiant de la sortie factice (#7379 : DLNA ou locale).
+    appareil: &'static str,
 }
 
 impl Banc {
     /// Une zone DLNA qui joue, volume 100 % en base et en mémoire, PURE
     /// verrouillé ou non.
     pub(super) async fn monter(pure_verrouille: bool) -> Self {
+        Self::monter_sur(pure_verrouille, APPAREIL, "dlna").await
+    }
+
+    /// #7379 — le même banc sur la sortie factice `appareil` de type
+    /// `output_type` (`dlna`, ou `local` pour une sortie à volume logiciel).
+    pub(super) async fn monter_sur(
+        pure_verrouille: bool,
+        appareil: &'static str,
+        output_type: &str,
+    ) -> Self {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
         let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
         let zone_id = ZoneRepo::with_backend(db.clone())
-            .create("My Devialet", Some("dlna"), Some(APPAREIL))
+            .create("My Devialet", Some(output_type), Some(appareil))
             .unwrap();
         ZoneRepo::with_backend(db.clone())
             .update_volume(zone_id, 100.0)
@@ -59,7 +71,7 @@ impl Banc {
         }
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
         outputs.lock().await.register(Box::new(
-            MockOutput::new(APPAREIL, "My Devialet").with_type("dlna"),
+            MockOutput::new(appareil, "My Devialet").with_type(output_type),
         ));
         let playback = Arc::new(PlaybackManager::new());
         let orchestrator = Arc::new(PlaybackOrchestrator::new(
@@ -103,6 +115,7 @@ impl Banc {
             idle: HashMap::new(),
             position_ms: 10_000,
             recu,
+            appareil,
         };
         // Sous PURE verrouillé, l'appareil part à 100 %, comme après un
         // armement confirmé : la baisse que ces tests provoquent ensuite est
@@ -114,7 +127,7 @@ impl Banc {
 
     async fn avec_mock<R>(&self, f: impl AsyncFnOnce(&MockOutput) -> R) -> R {
         let reg = self.outputs.lock().await;
-        let arc = reg.get(APPAREIL).unwrap();
+        let arc = reg.get(self.appareil).unwrap();
         let sortie = arc.lock().await;
         f(sortie.as_any().downcast_ref::<MockOutput>().unwrap()).await
     }
@@ -140,7 +153,7 @@ impl Banc {
             .set_volume_avec_garde(
                 self.zone_id,
                 volume,
-                Some(APPAREIL),
+                Some(self.appareil),
                 crate::audio::garde_de_hausse::Hausse::Confirmee,
             )
             .await
@@ -156,13 +169,38 @@ impl Banc {
     pub(super) async fn consigne_gardee(&self, volume: f64) {
         self.poller
             .orchestrator
-            .set_volume(self.zone_id, volume, Some(APPAREIL))
+            .set_volume(self.zone_id, volume, Some(self.appareil))
             .await
             .unwrap();
         self.poller
             .playback
             .ecouler_la_grace_de_volume(self.zone_id)
             .await;
+    }
+
+    /// #8031 — la sourdine par le VRAI orchestrateur (`SetMute`, #6700).
+    pub(super) async fn sourdine(&self, muted: bool) {
+        self.poller
+            .orchestrator
+            .set_mute(self.zone_id, muted, Some(self.appareil))
+            .await
+            .unwrap();
+    }
+
+    /// #8031 — la grâce qui suit un changement de sourdine, écoulée.
+    pub(super) async fn ecouler_la_grace_de_sourdine(&self) {
+        self.poller
+            .playback
+            .ecouler_la_grace_de_sourdine(self.zone_id)
+            .await;
+    }
+
+    /// #8031 — les évènements du gestionnaire de lecture (ce que les clients
+    /// reçoivent : `playback.volume`, `playback.muted`).
+    pub(super) fn evenements(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::playback::PlaybackEvent> {
+        self.poller.playback.subscribe()
     }
 
     pub(super) async fn commandes_depuis(&self, deja: usize) -> Vec<f64> {
@@ -173,8 +211,10 @@ impl Banc {
     /// Pause puis reprise par le VRAI orchestrateur, sur la sortie factice.
     pub(super) async fn pause_puis_reprise(&self) {
         let orch = self.poller.orchestrator.clone();
-        orch.pause(self.zone_id, Some(APPAREIL)).await.unwrap();
-        orch.resume(self.zone_id, Some(APPAREIL)).await.unwrap();
+        orch.pause(self.zone_id, Some(self.appareil)).await.unwrap();
+        orch.resume(self.zone_id, Some(self.appareil))
+            .await
+            .unwrap();
     }
 
     /// Le volume de la zone en mémoire (celui que le client lit).
@@ -196,6 +236,37 @@ impl Banc {
             m.set_position(position);
         })
         .await;
+        self.poller
+            .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
+            .await;
+    }
+
+    /// #8031 — la zone joue une webradio (site d'adoption « radio »).
+    pub(super) async fn en_radio(&self) {
+        self.poller
+            .playback
+            .play(
+                self.zone_id,
+                NowPlaying {
+                    title: "FIP".into(),
+                    source: "radio".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
+
+    /// #8031 — un tour sur une zone radio : l'étranglement du sondage radio
+    /// (`RADIO_POLL_INTERVAL_SECS`) est échu, l'appareil est relu.
+    pub(super) async fn tic_radio(&mut self) {
+        if let Some(ps) = self.poll_states.get_mut(&self.zone_id)
+            && let Some(avant) = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS + 1))
+        {
+            ps.last_radio_poll = avant;
+        }
+        self.avec_mock(async |m| m.set_state(TransportState::Playing).await)
+            .await;
         self.poller
             .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
             .await;

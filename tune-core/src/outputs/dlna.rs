@@ -691,6 +691,10 @@ pub struct DlnaOutput {
     /// la piste à la position de la pause. Retombe au `play_media` et au
     /// `stop` suivants.
     arrete_au_lieu_de_pause: AtomicBool,
+    /// #7894 — la dernière `Pause` a été refusée (701) par un renderer en
+    /// `NO_MEDIA_PRESENT` : il ne jouait rien. Lu une fois par
+    /// `take_nothing_playing_on_pause()`.
+    rien_ne_joue_a_la_pause: AtomicBool,
     /// La position rendue par le dernier `get_status` était-elle extrapolée ?
     /// Lu par `GET /api/devices/{id}/status` pour que l'estimation ne se fasse
     /// jamais passer pour une mesure.
@@ -849,6 +853,7 @@ impl DlnaOutput {
             niveau_acquitte: Arc::default(),
             dernier_diag_701: std::sync::Mutex::new(None),
             arrete_au_lieu_de_pause: AtomicBool::new(false),
+            rien_ne_joue_a_la_pause: AtomicBool::new(false),
             position_extrapolee: AtomicBool::new(false),
             duree_annoncee: tokio::sync::Mutex::new(None),
             pose_courante: std::sync::Mutex::new(None),
@@ -1071,6 +1076,15 @@ impl DlnaOutput {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = url.filter(|u| !u.trim().is_empty());
         self
+    }
+
+    /// #6910 — ce que le SCPD a dit de `SetNextAVTransportURI`, s'il a déjà
+    /// été lu, SANS jamais aller sur le réseau ; `Inconnue` sinon.
+    pub fn annonce_suivante_retenue(&self) -> AnnonceSuivante {
+        self.annonce_suivante
+            .get()
+            .copied()
+            .unwrap_or(AnnonceSuivante::Inconnue)
     }
 
     /// #3967 — ce que le SCPD d'`AVTransport` dit de `SetNextAVTransportURI`,
@@ -1702,6 +1716,15 @@ impl DlnaOutput {
             let budget_epuise = debut.elapsed() >= budget;
             match conduite {
                 ConduiteApresRefusPause::DejaEnPause => return Ok(()),
+                ConduiteApresRefusPause::RienNeJoue => {
+                    info!(
+                        device = %self.name,
+                        attente_ms,
+                        "dlna_pause_sans_media"
+                    );
+                    self.rien_ne_joue_a_la_pause.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
                 ConduiteApresRefusPause::Abandonner => {}
                 _ if budget_epuise => {}
                 ConduiteApresRefusPause::Attendre => {
@@ -2470,6 +2493,11 @@ impl OutputTarget for DlnaOutput {
         self.arrete_au_lieu_de_pause.load(Ordering::SeqCst)
     }
 
+    /// #7894 — la pause a trouvé le renderer sans média : rien ne jouait.
+    fn take_nothing_playing_on_pause(&self) -> bool {
+        self.rien_ne_joue_a_la_pause.swap(false, Ordering::SeqCst)
+    }
+
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         self.arrete_au_lieu_de_pause.store(false, Ordering::SeqCst);
         // #6059 — le départ que porte l'URL (flux natif relancé à la position).
@@ -3117,6 +3145,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
+        self.rien_ne_joue_a_la_pause.store(false, Ordering::SeqCst);
         let response = self
             .av_action("Pause", "<InstanceID>0</InstanceID>")
             .await?;
@@ -3878,7 +3907,7 @@ pub struct DsdCapability {
 /// `dsf_mime` keeps the renderer's own spelling of the MIME (3rd colon-separated
 /// field of `http-get:*:audio/dsf:*`), because some renderers only accept the
 /// exact MIME they advertise rather than the generic `application/x-dsd`.
-fn parse_dsd_capability(protocols: &[String]) -> DsdCapability {
+pub(crate) fn parse_dsd_capability(protocols: &[String]) -> DsdCapability {
     let mut cap = DsdCapability::default();
     for proto in protocols {
         let lower = proto.to_lowercase();
@@ -4628,8 +4657,12 @@ enum ConduiteApresRefusPause {
     Attendre,
     /// Il joue : la transition PLAYING→PAUSED existe, redemander `Pause`.
     RenvoyerPause,
-    /// Arrêté, sans média, ou muet : rien qu'une attente change, le refus
-    /// remonte tel quel.
+    /// #7894 — sans média (`NO_MEDIA_PRESENT`) : l'appareil ne joue rien, il
+    /// n'y a rien à mettre en pause. Ce n'est pas un échec de la commande :
+    /// la sortie le signale (`take_nothing_playing_on_pause`) et l'hôte arrête
+    /// la zone.
+    RienNeJoue,
+    /// Arrêté ou muet : rien qu'une attente change, le refus remonte tel quel.
     Abandonner,
 }
 
@@ -4638,6 +4671,7 @@ fn conduite_apres_refus_pause(etat_transport: Option<&str>) -> ConduiteApresRefu
         Some(e) if e.starts_with("PAUSED") => ConduiteApresRefusPause::DejaEnPause,
         Some(e) if e == "TRANSITIONING" => ConduiteApresRefusPause::Attendre,
         Some(e) if e == "PLAYING" => ConduiteApresRefusPause::RenvoyerPause,
+        Some(e) if e == "NO_MEDIA_PRESENT" => ConduiteApresRefusPause::RienNeJoue,
         _ => ConduiteApresRefusPause::Abandonner,
     }
 }

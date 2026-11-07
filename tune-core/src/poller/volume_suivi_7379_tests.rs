@@ -162,3 +162,62 @@ async fn l_abyss_a_80_est_suivie_sous_le_plafond_par_defaut_7379() {
     assert_eq!(volumes_publies(&mut recu, banc.zone_id), vec![0.8]);
     assert!(banc.commandes_depuis(deja).await.is_empty());
 }
+
+/// #7379, #8074 — une sortie LOCALE (volume logiciel, pas de bouton d'ampli)
+/// relue plus haut que la consigne : son gain est celui que Tune lui a posé,
+/// jamais un geste à suivre. La consigne reste à 30 %, rien n'est commandé,
+/// et le curseur ne bouge pas.
+#[tokio::test]
+async fn une_sortie_locale_relue_plus_haut_n_est_pas_suivie_7379() {
+    let mut banc = Banc::monter_sur(false, "local:test-dac", "local").await;
+    banc.zone_a(30.0).await;
+    banc.appareil_a(0.3).await;
+    banc.tic().await;
+    let mut recu = banc.evenements_de_lecture();
+    let deja = banc.appareil_a(0.6).await;
+    for _ in 0..3 {
+        banc.tic().await;
+    }
+    assert!(
+        (banc.volume_en_base() - 30.0).abs() < 1e-6,
+        "#7379 : une sortie locale ne fait jamais monter la consigne ({} %)",
+        banc.volume_en_base()
+    );
+    assert!((banc.volume_en_memoire().await - 0.3).abs() < 1e-9);
+    assert!(volumes_publies(&mut recu, banc.zone_id).is_empty());
+    assert!(banc.commandes_depuis(deja).await.is_empty());
+    // Une baisse relue reste adoptée, comme avant (#6008).
+    let deja = banc.appareil_a(0.2).await;
+    banc.tic().await;
+    assert!((banc.volume_en_base() - 20.0).abs() < 1e-6);
+    assert!(banc.commandes_depuis(deja).await.is_empty());
+}
+
+/// #7379, #8074 — une sortie locale relue au-dessus de la limite de sécurité
+/// est ramenée à SA consigne (bornée), jamais montée vers la limite.
+#[tokio::test]
+async fn une_sortie_locale_au_dessus_de_la_limite_revient_a_sa_consigne_7379() {
+    let mut banc = Banc::monter_sur(false, "local:test-dac", "local").await;
+    banc.poser_reglage(&cle_securite(banc.zone_id), "0.5");
+    banc.zone_a(30.0).await;
+    banc.appareil_a(0.3).await;
+    banc.tic().await;
+    let deja = banc.appareil_a(0.9).await;
+    for _ in 0..3 {
+        banc.tic().await;
+    }
+    let recus = banc.commandes_depuis(deja).await;
+    assert_eq!(recus.len(), 1, "{recus:?}");
+    assert!(recus[0] <= 0.3 + 1e-9, "{recus:?}");
+    assert!((banc.volume_en_base() - 30.0).abs() < 1e-6);
+}
+
+#[test]
+fn le_suivi_a_la_hausse_ne_vaut_que_pour_un_volume_materiel_7379() {
+    use super::releve_ne_monte_pas_6739::suivi_a_la_hausse_pour;
+    for t in ["dlna", "openhome", "airplay", "bluos", "chromecast"] {
+        assert!(suivi_a_la_hausse_pour(Some(t)), "{t}");
+    }
+    assert!(!suivi_a_la_hausse_pour(Some("local")));
+    assert!(!suivi_a_la_hausse_pour(Some("browser")));
+}

@@ -39,6 +39,16 @@
 //! 4. le nombre de captures rendu au client est celui que le SITE dit avoir
 //!    rangé, pas celui qu'on a envoyé.
 //!
+//! # #7920 — les journaux
+//!
+//! Le site range désormais des fichiers joints au fil (PR site-mozaiklabs#471) :
+//!
+//! 5. un `.log`, `.txt`, `.json` ou `.zip` part sous **`attachments[]`**, les
+//!    images restent sous `images[]` — y compris quand un client web ancien
+//!    envoie le journal sous `images[]` ;
+//! 6. un type interdit (`.exe`) est refusé nommément, sans appel ;
+//! 7. bornes des journaux : 3 fichiers, 10 Mo chacun, en plus des 3 images.
+//!
 //! ⚠️ `tune-server` porte `autotests = false` : ce fichier n'est compilé que
 //! parce qu'il est déclaré en cible `[[test]]` dans `tune-server/Cargo.toml`.
 
@@ -92,6 +102,7 @@ async fn faux_forum() -> FauxForum {
                     // Combien de parties `images[]` ? Compté sur les octets.
                     let texte = String::from_utf8_lossy(&corps).to_string();
                     let n = texte.matches("name=\"images[]\"").count();
+                    let nj = texte.matches("name=\"attachments[]\"").count();
                     let accept = headers
                         .get(axum::http::header::ACCEPT)
                         .and_then(|v| v.to_str().ok())
@@ -105,6 +116,7 @@ async fn faux_forum() -> FauxForum {
                     axum::Json(json!({
                         "status": "submitted",
                         "images": n,
+                        "attachments": nj,
                         "thread": { "id": 42, "slug": "bug-essai", "url": "https://exemple/forum/threads/bug-essai" },
                     }))
                 }
@@ -154,6 +166,19 @@ fn png(taille: usize) -> Vec<u8> {
 /// exactement ce que le navigateur produit, sans passer par une bibliothèque
 /// qui « arrangerait » le corps.
 fn corps_multipart(description: &str, fichiers: &[(&str, Vec<u8>)]) -> (String, Vec<u8>) {
+    let fichiers: Vec<(&str, &str, Vec<u8>)> = fichiers
+        .iter()
+        .map(|(nom, octets)| ("images[]", *nom, octets.clone()))
+        .collect();
+    corps_multipart_champs(description, &fichiers)
+}
+
+/// Comme [`corps_multipart`], avec le nom du champ de chaque fichier
+/// (`images[]` ou `attachments[]`, #7920).
+fn corps_multipart_champs(
+    description: &str,
+    fichiers: &[(&str, &str, Vec<u8>)],
+) -> (String, Vec<u8>) {
     let limite = "----tune4564";
     let mut corps: Vec<u8> = Vec::new();
     corps.extend_from_slice(
@@ -162,10 +187,10 @@ fn corps_multipart(description: &str, fichiers: &[(&str, Vec<u8>)]) -> (String, 
         )
         .as_bytes(),
     );
-    for (nom, octets) in fichiers {
+    for (champ, nom, octets) in fichiers {
         corps.extend_from_slice(
             format!(
-                "--{limite}\r\nContent-Disposition: form-data; name=\"images[]\"; \
+                "--{limite}\r\nContent-Disposition: form-data; name=\"{champ}\"; \
                  filename=\"{nom}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
             )
             .as_bytes(),
@@ -319,21 +344,25 @@ async fn trop_de_captures_refuse_avant_tout_appel() {
     );
 }
 
+/// #7920 — un type ni image ni journal est refusé nommément, sans appel.
 #[tokio::test]
-async fn un_fichier_qui_nest_pas_une_image_est_refuse_nommement() {
+async fn un_type_interdit_est_refuse_nommement_7920() {
     let forum = faux_forum().await;
     let (app, _state) = app_et_etat(&forum.base);
 
-    let (ct, corps) = corps_multipart("Un journal.", &[("serveur.log", b"INFO ...".to_vec())]);
+    let (ct, corps) = corps_multipart_champs(
+        "Un exécutable.",
+        &[("attachments[]", "outil.exe", b"MZ...".to_vec())],
+    );
     let (code, reponse) = poster(&app, &ct, corps).await;
 
-    assert_eq!(code, StatusCode::BAD_REQUEST);
-    assert_eq!(reponse["error"].as_str(), Some("image_type"));
+    assert_eq!(code, StatusCode::BAD_REQUEST, "réponse : {reponse}");
+    assert_eq!(reponse["error"].as_str(), Some("file_type"));
     assert!(
         reponse["message"]
             .as_str()
-            .is_some_and(|m| m.contains("serveur.log")),
-        "le refus doit NOMMER le fichier en cause ; il porte : {reponse}"
+            .is_some_and(|m| m.contains("outil.exe") && m.contains("log")),
+        "le refus doit NOMMER le fichier et dire ce qui est accepté ; il porte : {reponse}"
     );
     assert_eq!(forum.appels.load(Ordering::SeqCst), 0);
 }
@@ -375,4 +404,170 @@ async fn contre_epreuve_une_image_dans_les_bornes_passe() {
     assert_eq!(code, StatusCode::OK, "réponse : {reponse}");
     assert_eq!(forum.appels.load(Ordering::SeqCst), 1);
     assert_eq!(reponse["images"].as_u64(), Some(1));
+}
+
+// --- 5 : #7920, les journaux partent sous `attachments[]` ---------------
+
+/// Ce que le faux site a reçu sous `attachments[]` : le bloc de la partie
+/// (en-têtes et contenu) pour chaque journal.
+fn parties_attachments(corps: &[u8]) -> Vec<String> {
+    let texte = String::from_utf8_lossy(corps).to_string();
+    texte
+        .split("name=\"attachments[]\"")
+        .skip(1)
+        .map(|bloc| bloc.chars().take(400).collect())
+        .collect()
+}
+
+#[tokio::test]
+async fn un_journal_part_au_site_sous_attachments_7920() {
+    let forum = faux_forum().await;
+    let (app, _state) = app_et_etat(&forum.base);
+
+    let (ct, corps) = corps_multipart_champs(
+        "La lecture s'arrête, journal joint.",
+        &[
+            ("images[]", "capture.png", png(64)),
+            (
+                "attachments[]",
+                "tune.log",
+                b"INFO lecture arretee\n".to_vec(),
+            ),
+        ],
+    );
+    let (code, reponse) = poster(&app, &ct, corps).await;
+
+    assert_eq!(code, StatusCode::OK, "réponse : {reponse}");
+    assert_eq!(forum.appels.load(Ordering::SeqCst), 1);
+    let recu = forum.dernier.lock().await;
+    let texte = String::from_utf8_lossy(&recu.corps);
+    assert_eq!(
+        texte.matches("name=\"images[]\"").count(),
+        1,
+        "la capture reste sous `images[]`"
+    );
+    let journaux = parties_attachments(&recu.corps);
+    assert_eq!(
+        journaux.len(),
+        1,
+        "#7920 : le journal doit partir au site sous `attachments[]`"
+    );
+    assert!(
+        journaux[0].contains("filename=\"tune.log\""),
+        "{}",
+        journaux[0]
+    );
+    assert!(
+        journaux[0].contains("Content-Type: text/plain"),
+        "un `.log` part en text/plain, pas en octet-stream : {}",
+        journaux[0]
+    );
+    assert!(journaux[0].contains("INFO lecture arretee"));
+    assert_eq!(reponse["images"].as_u64(), Some(1));
+    assert_eq!(
+        reponse["attachments"].as_u64(),
+        Some(1),
+        "l'écran annonce les journaux que le site dit avoir rangés"
+    );
+}
+
+/// Un client web antérieur à #7920 envoie tout sous `images[]` : son journal
+/// est rangé d'après l'extension et part quand même sous `attachments[]`.
+#[tokio::test]
+async fn un_journal_venu_sous_images_part_sous_attachments_7920() {
+    let forum = faux_forum().await;
+    let (app, _state) = app_et_etat(&forum.base);
+
+    let (ct, corps) = corps_multipart(
+        "Ancien client.",
+        &[
+            ("serveur.log", b"INFO ...".to_vec()),
+            ("etat.json", b"{}".to_vec()),
+            ("journaux.zip", b"PK\x03\x04".to_vec()),
+        ],
+    );
+    let (code, reponse) = poster(&app, &ct, corps).await;
+
+    assert_eq!(code, StatusCode::OK, "réponse : {reponse}");
+    let recu = forum.dernier.lock().await;
+    let texte = String::from_utf8_lossy(&recu.corps);
+    assert_eq!(texte.matches("name=\"images[]\"").count(), 0);
+    let journaux = parties_attachments(&recu.corps);
+    assert_eq!(journaux.len(), 3, "les trois journaux sous `attachments[]`");
+    assert!(journaux[1].contains("Content-Type: application/json"));
+    assert!(journaux[2].contains("Content-Type: application/zip"));
+}
+
+#[tokio::test]
+async fn trop_de_journaux_refuse_avant_tout_appel_7920() {
+    let forum = faux_forum().await;
+    let (app, _state) = app_et_etat(&forum.base);
+
+    let (ct, corps) = corps_multipart_champs(
+        "Quatre journaux.",
+        &[
+            ("attachments[]", "a.log", b"a".to_vec()),
+            ("attachments[]", "b.txt", b"b".to_vec()),
+            ("attachments[]", "c.json", b"{}".to_vec()),
+            ("attachments[]", "d.log", b"d".to_vec()),
+        ],
+    );
+    let (code, reponse) = poster(&app, &ct, corps).await;
+
+    assert_eq!(code, StatusCode::BAD_REQUEST, "réponse : {reponse}");
+    assert_eq!(reponse["error"].as_str(), Some("too_many_attachments"));
+    assert!(reponse["message"].as_str().is_some_and(|m| m.contains("3")));
+    assert_eq!(forum.appels.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn un_journal_trop_lourd_est_refuse_nommement_7920() {
+    let forum = faux_forum().await;
+    let (app, _state) = app_et_etat(&forum.base);
+
+    let (ct, corps) = corps_multipart_champs(
+        "Journal lourd.",
+        &[(
+            "attachments[]",
+            "enorme.log",
+            vec![b'x'; 10 * 1024 * 1024 + 1],
+        )],
+    );
+    let (code, reponse) = poster(&app, &ct, corps).await;
+
+    assert_eq!(code, StatusCode::BAD_REQUEST, "réponse : {reponse}");
+    assert_eq!(reponse["error"].as_str(), Some("attachment_too_large"));
+    assert!(
+        reponse["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("enorme.log") && m.contains("10")),
+        "le refus doit NOMMER le fichier et la borne ; il porte : {reponse}"
+    );
+    assert_eq!(forum.appels.load(Ordering::SeqCst), 0);
+}
+
+/// CONTRE-ÉPREUVE des bornes des journaux : trois images ET trois journaux,
+/// dont un de 10 Mo tout juste, passent ensemble.
+#[tokio::test]
+async fn contre_epreuve_trois_images_et_trois_journaux_passent_7920() {
+    let forum = faux_forum().await;
+    let (app, _state) = app_et_etat(&forum.base);
+
+    let (ct, corps) = corps_multipart_champs(
+        "Tout dans les bornes.",
+        &[
+            ("images[]", "a.png", png(16)),
+            ("images[]", "b.png", png(16)),
+            ("images[]", "c.png", png(16)),
+            ("attachments[]", "juste.log", vec![b'x'; 10 * 1024 * 1024]),
+            ("attachments[]", "b.txt", b"b".to_vec()),
+            ("attachments[]", "c.json", b"{}".to_vec()),
+        ],
+    );
+    let (code, reponse) = poster(&app, &ct, corps).await;
+
+    assert_eq!(code, StatusCode::OK, "réponse : {reponse}");
+    assert_eq!(forum.appels.load(Ordering::SeqCst), 1);
+    assert_eq!(reponse["images"].as_u64(), Some(3));
+    assert_eq!(reponse["attachments"].as_u64(), Some(3));
 }

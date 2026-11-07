@@ -428,6 +428,7 @@ fn gapless_cooldown_suppresses_stopped() {
         depassement_duree_ticks: 0,
         depassement_duree_signale: false,
         stall_declines: 0,
+        pause_appareil_ticks: 0,
         radio_stopped_ticks: 0,
         last_radio_position_ms: 0,
         last_device_volume: None,
@@ -445,6 +446,8 @@ fn gapless_cooldown_suppresses_stopped() {
         radio_source_annonce: (None, None),
         fige_a_zero_depuis: None,
         octets_du_demarrage: None,
+        tune_tested_rendu_ms: 0,
+        tune_tested_releve: None,
     };
 
     // While cooldown > 0, stopped_ticks must not accumulate
@@ -503,6 +506,7 @@ fn playing_state_resets_cooldown() {
         depassement_duree_ticks: 0,
         depassement_duree_signale: false,
         stall_declines: 0,
+        pause_appareil_ticks: 0,
         radio_stopped_ticks: 0,
         last_radio_position_ms: 0,
         last_device_volume: None,
@@ -520,6 +524,8 @@ fn playing_state_resets_cooldown() {
         radio_source_annonce: (None, None),
         fige_a_zero_depuis: None,
         octets_du_demarrage: None,
+        tune_tested_rendu_ms: 0,
+        tune_tested_releve: None,
     };
 
     // Simulates entering Playing state
@@ -823,6 +829,7 @@ fn backoff_exponential() {
         depassement_duree_ticks: 0,
         depassement_duree_signale: false,
         stall_declines: 0,
+        pause_appareil_ticks: 0,
         radio_stopped_ticks: 0,
         last_radio_position_ms: 0,
         last_device_volume: None,
@@ -840,6 +847,8 @@ fn backoff_exponential() {
         radio_source_annonce: (None, None),
         fige_a_zero_depuis: None,
         octets_du_demarrage: None,
+        tune_tested_rendu_ms: 0,
+        tune_tested_releve: None,
     };
 
     // Simulate consecutive errors with exponential backoff
@@ -1813,6 +1822,7 @@ fn gapless_stuck_forces_track_end() {
         depassement_duree_ticks: 0,
         depassement_duree_signale: false,
         stall_declines: 0,
+        pause_appareil_ticks: 0,
         radio_stopped_ticks: 0,
         last_radio_position_ms: 0,
         last_device_volume: None,
@@ -1830,6 +1840,8 @@ fn gapless_stuck_forces_track_end() {
         radio_source_annonce: (None, None),
         fige_a_zero_depuis: None,
         octets_du_demarrage: None,
+        tune_tested_rendu_ms: 0,
+        tune_tested_releve: None,
     };
 
     // Simulate renderer staying Stopped after cooldown expired.
@@ -2157,6 +2169,7 @@ fn gapless_stuck_cleared_on_playing() {
         depassement_duree_ticks: 0,
         depassement_duree_signale: false,
         stall_declines: 0,
+        pause_appareil_ticks: 0,
         radio_stopped_ticks: 0,
         last_radio_position_ms: 0,
         last_device_volume: None,
@@ -2174,6 +2187,8 @@ fn gapless_stuck_cleared_on_playing() {
         radio_source_annonce: (None, None),
         fige_a_zero_depuis: None,
         octets_du_demarrage: None,
+        tune_tested_rendu_ms: 0,
+        tune_tested_releve: None,
     };
 
     // Simulate entering Playing state (renderer auto-transitioned)

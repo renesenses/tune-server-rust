@@ -103,7 +103,7 @@ impl DeviceDescription {
     }
 }
 
-fn service_key(service_type: &str) -> String {
+pub(crate) fn service_key(service_type: &str) -> String {
     let lower = service_type.to_lowercase();
     for name in [
         "avtransport",

@@ -86,6 +86,12 @@ pub mod vitesse;
 /// La clé du signal PCM des FLAC, lue dans l'en-tête, sans décodage (#5594).
 pub mod cle_pcm;
 
+/// L'avancement des empreintes et de la plage dynamique (#7915).
+pub mod avancement;
+
+/// Les décodages des analyses en priorité processeur basse (#7915).
+pub mod basse_priorite;
+
 /// Un traitement de fond que l'utilisateur peut suspendre.
 ///
 /// ⚠️ **Le scan n'en est pas**, et ce n'est pas un oubli : voir

@@ -35,13 +35,20 @@ async fn au_dessus_de_la_limite_le_sondeur_ramene_au_plafond_6541_7379() {
 }
 
 /// Un renderer qui se réveille à 100 % : #5662 l'ignore sans rien imposer ;
-/// sous une limite posée, il est ramené.
+/// sous une limite posée, il est ramené. #7379 : à la CONSIGNE (40 %), pas
+/// à la limite — un réveil à pleine échelle n'est pas un geste au bouton, et
+/// la consigne ne monte pas.
 #[tokio::test]
 async fn un_renderer_a_100_est_ramene_sous_la_limite_6541() {
     let mut banc = banc_limite().await;
     let deja = banc.appareil_a(1.0).await;
     banc.tic().await;
-    assert_eq!(banc.commandes_depuis(deja).await, vec![0.7]);
+    assert_eq!(banc.commandes_depuis(deja).await, vec![0.4]);
+    assert!(
+        (banc.volume_en_base() - 40.0).abs() < 1e-6,
+        "#7379 : un réveil à 100 % ne monte pas la consigne vers la limite ({} %)",
+        banc.volume_en_base()
+    );
 }
 
 /// Sous la limite, l'adoption historique (#6008) reste pour une BAISSE :

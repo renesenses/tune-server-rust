@@ -1,0 +1,33 @@
+Tune 1.0.0-rc10, dziesiąta wersja kandydująca Tune 1.0.
+
+- **Moja kolekcja fizyczna**: nowa wtyczka porównuje Twoją kolekcję Discogs z biblioteką i serwisami streamingowymi, w siatce okładek przechowywanych w pamięci podręcznej serwera. Osobna pozycja pojawia się na pasku bocznym, tuż po Tune Circle.
+- **Mój motyw**: wybierz wszystkie kolory interfejsu, osobno dla każdego profilu. Motyw może też dostarczyć wtyczka, a swój możesz wysłać kontaktowi w Tune Circle, który zastosuje go jednym kliknięciem.
+- **Crosstalk**: wtyczka ograniczająca przesłuch między głośnikami trafia do katalogu rozszerzeń wraz z ekranem ustawień; w tej samej strefie wyłącza crossfeed i to sygnalizuje.
+- **Foldery**: odtwarzaj folder ze wszystkimi podfolderami lub dodawaj go do kolejki, po kolei; filtr Katalog w Bibliotece schodzi do podfolderów i proponuje powrót do całej biblioteki.
+- **Radio**: pasek „Więcej filtrów” w Moich stacjach i w Katalogu pozwala wyszukiwać według kryteriów; w katalogu pojawiają się cztery nowe gatunki.
+- **Radio podczas odtwarzania**: strumienie stacji są uporządkowane według jakości; ekran Teraz odtwarzane pokazuje logo stacji i przycisk „Moje stacje”; kraj słuchania ustawia się w Ustawienia › Ogólne.
+- **Wytwórnie**: wyświetlane są loga wytwórni płytowych, udostępniane przez mozaiklabs.fr; stan serwera pokazuje postęp pobierania okładek albumów i logo wytwórni.
+- **Głośność**: suwak ma podziałkę w dB, granice komfortu i bezpieczeństwa są oznaczone kolorem, a granica komfortu powyżej granicy bezpieczeństwa jest odrzucana.
+- **Oxygen i metadane**: zmieniaj jedno pole w całym przefiltrowanym wyniku; wykluczaj foldery z automatycznego uzupełniania metadanych.
+- **Tune Circle**: przybliżanie wybranego obszaru globu w widoku Świat; playlisty Tune Circle mają własny znacznik w filtrach Playlist; playlistę serwisu można udostępnić z jej karty.
+- **Widżet na pulpit**: mini okno korzysta z widoku mini interfejsu webowego i zyskuje wyszukiwanie wykonawców, Qobuz i TIDAL, z miniaturami i obsługą klawiaturą.
+- **Wyjście AES67**: eksperymentalne wyjście do sieci audio Dante i Ravenna zgodnych z AES67, domyślnie wyłączone, znajduje się w Ustawienia › Eksperymentalne.
+- **Ta przeglądarka**: następny utwór jest przygotowywany przed końcem dla płynniejszych przejść, a strefa „Ta przeglądarka” na serwerze gra bez wcześniejszej konfiguracji.
+- **Wznów słuchanie**: karta podaje nazwę wznawianego albumu, playlisty lub odcinka, a zakończone słuchanie znika z listy.
+- **Historia i popularne utwory**: utwory otwartego albumu lub playlisty są ułożone od najnowszego do najstarszego; popularne utwory wykonawcy uzupełniają te, których słuchasz najczęściej, ze wszystkich źródeł.
+- **Biblioteka**: filtry według DR i roku pierwszego wydania są znacznie szybsze w dużych bibliotekach; kolumny listy utworów można zmieniać, a każdy ekran zapamiętuje ich szerokość; analiza akustyczna wyjaśnia swoje tempo i pokazuje postęp.
+- **Korektor**: swobodne wpisywanie częstotliwości i dobroci Q, zatwierdzane po zakończeniu wpisywania; usunięcie zaimportowanych ustawień wymaga potwierdzenia; korekcja pomieszczenia i kalibracja DAC stosują pełny profil korektora.
+- **Playlisty**: import .m3u, .m3u8 i .dpl znajduje się w Menedżerze playlist i podaje rzeczywistą liczbę utworów; Importuj, Przenieś i Porównaj mówią, dlaczego się nie udało.
+- **Okładki**: osadzona okładka jest odczytywana ze wszystkich tagów, najpierw przód; wyszukiwanie w sieci następuje po ponownym odczycie pliku; prostokątna grafika playlisty Qobuz jest wyświetlana w całości.
+- **Komunikaty**: ostatnie komunikaty o błędach, które pozostały po francusku, są przetłumaczone na język interfejsu; głośnik AirPlay 2 odrzucający połączenie informuje o braku parowania; identyfikator aplikacji odrzucony przez Qobuz nie jest już przedstawiany jako błędne hasło.
+- **Licencja**: ekran informuje, że Premium pochodzi z Twojego konta Mozaiklabs, bez żądania klucza.
+- **Strona główna**: „Inne wersje” nie zawiesza się już w oczekiwaniu na serwisy streamingowe.
+- **ASIO**: gdy nie da się sprawdzić obsługi DSD, Tune to zgłasza i wyjaśnia możliwości wyjścia.
+- **Poprawki odtwarzania**: przełączanie między PURE a korektorem nie uruchamia już ponownie zatrzymanej strefy; odznaczenie „Domyślnie powtarzaj” naprawdę wyłącza powtarzanie w strefie; przejścia między zgodnymi utworami pozostają ciągłe.
+- **Poprawki OpenHome**: pauza i zatrzymanie usuwają z odtwarzacza przygotowany następny utwór, a pozycja końcowa jest zachowywana podczas przejścia do następnego.
+- **Poprawki radia**: przy nieznanym kraju słuchania wybrany strumień nie jest już zastępowany strumieniem 96 kbit/s; stacja dodana z konsoli zachowuje powiązanie ze swoją kartą; pojedynczy błąd nie wstrzymuje już metadanych radia; „Ostatnio słuchane” pokazuje właściwą datę; playlista Qobuz utworzona z ulubionych stacji pojawia się od razu.
+- **Poprawki biblioteki i profili**: filtry ulubionych i ocen podążają za aktywnym profilem; „Najczęściej słuchane” nie liczy już jednego odsłuchu kilka razy; uzupełnianie nie zastępuje już istniejącego gatunku; utwory UPnP zachowują rok i gatunki; identyfikator MusicBrainz, który jest już w użyciu, nie jest przypisywany ponownie.
+- **Poprawki kolekcji i playlist**: odrzucony zapis jest zgłaszany, błędny folder nie opróżnia już listy, a wszystkie strony playlist są odczytywane.
+- **Poprawki wtyczek i konta**: odinstalowanie aktywnej wtyczki natywnej trwale ją wyłącza; pierwsze połączenie z kontem Mozaiklabs wiąże się z jedynym profilem nawet bez adresu e-mail.
+- **Poprawki różne**: import playlist podczas skanowania mówi, dlaczego nie importuje; błąd odczytu ustawień jest zgłaszany zamiast powrotu do wartości domyślnych; uśpienie komputera nie jest już zgłaszane jako zawieszenie; stary interfejs nie przetrwa już aktualizacji serwera; pasek wskaźników VU nie wychodzi już poza ekran między 1280 a 1800 px; tryb WASAPI pozostaje widoczny przy domyślnym ustawieniu Windows; dźwięk nie jest już kompresowany podczas wysyłania.
+- **Bezpieczeństwo**: poprawki wzmacniające.

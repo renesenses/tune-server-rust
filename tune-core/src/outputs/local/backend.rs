@@ -395,9 +395,81 @@ pub(super) struct BackendCpal<'a> {
     device_gone: Arc<AtomicBool>,
     starvation: Arc<RingStarvation>,
     position_ms: &'a AtomicU64,
+    /// #6132 — l'hôte ouvert, pour ouvrir la seconde sortie sur le même.
+    host: cpal::Host,
+    /// #6132 — ce que le rappel `f32` de A consulte à chaque période.
+    recopie: super::sortie_double_locale::EmplacementDeRecopie,
+    /// #6132 — A a-t-il été ouvert par le rappel `f32` qui recopie ? Faux
+    /// après la cascade entière (i32/i16).
+    recopie_possible: bool,
+    /// #6132 — les sorties suiveuses, vivantes tant que le backend l'est.
+    secondes: Option<super::sortie_double_locale::SecondesSorties>,
 }
 
 impl BackendCpal<'_> {
+    /// #6132 — ouvrir les sorties suiveuses et y recopier ce que A joue,
+    /// chacune corrigée de sa dérive, le retard commun réglé sur la plus
+    /// lente.
+    ///
+    /// Appelé par `play_url` après l'ouverture et avant le démarrage de A :
+    /// la ligne à retard de A est en place avant sa première période. Une
+    /// suiveuse refusée est journalisée et les autres jouent — jamais de
+    /// silence sur A pour cause de suiveuse.
+    /// #6132 — la piste suivante commence : le retard commun des sorties
+    /// suiveuses pourra se réajuster au prochain silence.
+    pub(super) fn demander_un_reajustement(&self) {
+        self.recopie.demander_un_reajustement();
+    }
+
+    pub(super) fn brancher_les_secondes_sorties(
+        &mut self,
+        demandes: &[crate::outputs::sortie_double::SecondeSortieDemandee],
+        strict_bitperfect: bool,
+        reglages_a: super::sortie_double_locale::ReglagesDeA,
+    ) {
+        use super::sortie_double_locale::{
+            installer_les_secondes_sorties, ouvrir_la_seconde_sortie, refus_prealable,
+        };
+        let hote = self.host.id().name();
+        let mut ouvertes = Vec::new();
+        for demande in demandes {
+            let nom = demande.nom.as_str();
+            let resultat = match refus_prealable(
+                hote,
+                strict_bitperfect,
+                self.recopie_possible,
+                &self.device_name,
+                nom,
+            ) {
+                Some(r) => Err(r),
+                None => ouvrir_la_seconde_sortie(
+                    &self.host,
+                    demande,
+                    self.sortie.cadence,
+                    self.sortie.canaux,
+                    reglages_a.clone(),
+                ),
+            };
+            match resultat {
+                Ok(ouverte) => ouvertes.push(ouverte),
+                Err(refus) => warn!(
+                    device = %self.device_name,
+                    seconde_sortie = %nom,
+                    backend = hote,
+                    motif = refus.code(),
+                    detail = ?refus,
+                    "sortie_double_refusee — la zone joue sans cette sortie"
+                ),
+            }
+        }
+        self.secondes = installer_les_secondes_sorties(
+            &self.recopie,
+            self.sortie.canaux,
+            self.sortie.cadence,
+            ouvertes,
+        );
+    }
+
     /// #4953 — le périphérique a-t-il prouvé, à cette ouverture, qu'il suit
     /// la cadence de la source ? Vrai seulement quand sa liste de cadences est
     /// une MESURE (ALSA `hw:`, ASIO, CoreAudio, JACK — jamais un greffon qui
@@ -698,6 +770,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
         // has been buffered in the ring buffer.  This prevents stale or
         // garbage audio from reaching the DAC during track transitions.
         let data_started_shared = Arc::new(AtomicBool::new(false));
+        let recopie = super::sortie_double_locale::emplacement_vide();
         let build_stream =
             |cfg: &cpal::StreamConfig,
              ring_cb: Arc<RingBuf>,
@@ -711,15 +784,21 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                 // Prélevé AVANT la fermeture de rendu (#3205).
                 let famine_cb = ring_cb.starvation();
                 let mut promotion = PromotionDuFilDeRendu::nouvelle();
+                let recopie_cb = recopie.clone();
+                let unite_cb = AtomicU32::new(1000);
                 device.build_output_stream(
                     cfg,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                         promotion.a_la_premiere_periode();
                         // Le corps est partagé avec le chemin compressé
                         // (`render_local_shared_f32_callback`) : c'était deux
                         // copies identiques, et le faux rouge de #3814 vivait
-                        // dans les deux.
-                        render_local_shared_f32_callback(
+                        // dans les deux. #6132 — sans seconde sortie,
+                        // `rendre_la_periode_de_a` l'appelle tel quel ; avec,
+                        // au volume unité, puis recopie, puis volume de A.
+                        super::sortie_double_locale::rendre_la_periode_de_a(
+                            &recopie_cb,
+                            &unite_cb,
                             &ring_cb,
                             &vol_cb,
                             &paused_cb,
@@ -729,6 +808,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                             soft_mute_cb.armed_ms(),
                             min_buf,
                             data,
+                            info,
                         );
                     },
                     make_stream_error_cb(device_gone.clone(), famine_cb),
@@ -793,6 +873,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             }
         };
 
+        let mut recopie_possible = true;
         let (stream, actual_config, ring) = match stream_result {
             Ok(s) => (s, output_config, ring_buf),
             Err(first_err) => {
@@ -928,7 +1009,10 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                             },
                         );
                         match built {
-                            Some(Ok(t)) => t,
+                            Some(Ok(t)) => {
+                                recopie_possible = false;
+                                t
+                            }
                             None => return Err(RefusDOuverture::Cancelled),
                             Some(Err(last_error)) => {
                                 // Every format was refused, so the fault is
@@ -980,6 +1064,10 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             device_gone,
             starvation,
             position_ms: demande.position_ms,
+            host,
+            recopie,
+            recopie_possible,
+            secondes: None,
         })
     }
 

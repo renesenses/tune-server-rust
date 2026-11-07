@@ -385,6 +385,12 @@ pub struct ZoneState {
     /// the slider from bouncing back on slow DLNA renderers.
     #[serde(skip)]
     pub last_volume_set_at: Option<Instant>,
+    /// #8031 — instant du dernier changement de sourdine (posée ou levée).
+    /// Le sondeur n'adopte aucun volume relu sur l'appareil pendant la
+    /// sourdine ni juste après : l'appareil peut alors remonter 0 ou une
+    /// valeur transitoire, qui remplaçait la consigne de la zone.
+    #[serde(skip)]
+    pub last_mute_set_at: Option<Instant>,
     /// #6912 — observation distincte de la consigne, absente sans annonce fraîche.
     #[serde(default)]
     pub device_volume_observation: Option<ObservationVolumeAppareil>,
@@ -644,6 +650,7 @@ impl Default for ZoneState {
             paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
+            last_mute_set_at: None,
             device_volume_observation: None,
             last_restart_at: None,
             last_play_started_at: None,
@@ -961,7 +968,8 @@ impl HorlogeDeSortie {
 /// l'écran ne pouvait pas le dire.
 #[derive(Clone)]
 pub struct GainDemande {
-    /// Volume réglé par l'utilisateur, en millièmes.
+    /// Volume réglé par l'utilisateur, en
+    /// [`crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU`] (#7968).
     pub volume_utilisateur: Arc<std::sync::atomic::AtomicU32>,
     /// Facteur ReplayGain × compensation empaqueté par
     /// `outputs::local::composer_le_facteur_de_rendu` : les 16 bits bas
@@ -979,10 +987,20 @@ impl GainDemande {
         if self.dop.load(Ordering::Relaxed) {
             return None;
         }
+        let unite = u64::from(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU);
         let volume = u64::from(self.volume_utilisateur.load(Ordering::SeqCst));
         let facteur = u64::from(self.facteur_de_rendu.load(Ordering::SeqCst) & 0xFFFF);
-        Some(((volume * facteur + 500) / 1000).min(u64::from(u32::MAX)) as u32)
+        Some(((volume * facteur + unite / 2) / unite).min(u64::from(u32::MAX)) as u32)
     }
+}
+
+/// #7968 — le gain de rendu partagé par la sortie locale
+/// (`LocalOutput::gain_de_rendu`, en
+/// [`crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU`]) ramené aux
+/// millièmes des mesures de niveau, arrondi au plus proche.
+fn gain_de_rendu_en_millemes(unites: u32) -> u32 {
+    let pas = u64::from(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 1000);
+    ((u64::from(unites) + pas / 2) / pas) as u32
 }
 
 pub struct PlaybackManager {
@@ -1072,7 +1090,8 @@ impl PlaybackManager {
     }
 
     /// Partage l'`AtomicU32` de gain de la sortie locale qui va jouer cette
-    /// zone (#4384). Voir [`Self::gain_de_sortie_units`].
+    /// zone (#4384), en [`crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU`]
+    /// (#7968). Voir [`Self::gain_de_sortie_units`].
     pub fn brancher_le_gain_de_sortie(
         &self,
         zone_id: i64,
@@ -1193,7 +1212,9 @@ impl PlaybackManager {
             .lock()
             .expect("gains lock")
             .get(&zone_id)
-            .map_or(1000, |g| g.load(std::sync::atomic::Ordering::SeqCst))
+            .map_or(1000, |g| {
+                gain_de_rendu_en_millemes(g.load(std::sync::atomic::Ordering::SeqCst))
+            })
     }
 
     /// Fil 1908 — partage l'horloge de la sortie locale qui va jouer cette
@@ -1254,7 +1275,7 @@ impl PlaybackManager {
                 .get(&zone_id)
                 .map(|g| g.load(std::sync::atomic::Ordering::SeqCst))
         };
-        let rendu = lire(&self.gains_de_sortie).unwrap_or(1000);
+        let rendu = lire(&self.gains_de_sortie).map_or(1000, gain_de_rendu_en_millemes);
         match lire(&self.gains_moyens_du_dsp) {
             Some(dsp) if dsp != 1000 => {
                 ((u64::from(rendu) * u64::from(dsp) + 500) / 1000).min(u64::from(u32::MAX)) as u32
@@ -2050,16 +2071,41 @@ impl PlaybackManager {
         }
     }
 
-    pub async fn set_mute(&self, zone_id: i64, muted: bool) {
+    /// Bancs seulement (#8031) : la grâce qui suit un changement de sourdine
+    /// est écoulée.
+    #[cfg(test)]
+    pub async fn ecouler_la_grace_de_sourdine(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
-            state.muted = muted;
+            state.last_mute_set_at = None;
         }
+    }
+
+    pub async fn set_mute(&self, zone_id: i64, muted: bool) {
+        let volume = {
+            let mut zones = self.zones.lock().await;
+            zones.get_mut(&zone_id).map(|state| {
+                state.muted = muted;
+                state.last_mute_set_at = Some(Instant::now());
+                state.volume
+            })
+        };
         self.emit(PlaybackEvent {
             event: "muted".into(),
             zone_id,
             data: serde_json::json!({ "muted": muted }),
         });
+        // #8031 — à la levée, le volume de la zone est repoussé à tous les
+        // clients : un curseur qui aurait reçu entre-temps une valeur
+        // transitoire revient au volume d'avant la sourdine. Ce n'est qu'un
+        // évènement : aucune commande ne part vers l'appareil.
+        if !muted && let Some(volume) = volume {
+            self.emit(PlaybackEvent {
+                event: "volume".into(),
+                zone_id,
+                data: serde_json::json!({ "volume": volume }),
+            });
+        }
     }
 
     /// `entry` pour la même raison que [`Self::update_queue_info`] : les trois
@@ -2553,6 +2599,7 @@ mod tests {
             paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
+            last_mute_set_at: None,
             device_volume_observation: None,
             last_restart_at: None,
             last_play_started_at: None,

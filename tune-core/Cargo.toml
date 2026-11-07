@@ -222,6 +222,12 @@ path = "tests/journal_par_greffon_5370.rs"
 name = "pause_taches_de_fond"
 path = "tests/pause_taches_de_fond.rs"
 
+# #7915 — l'avancement des empreintes, ReplayGain coupé. Binaire à lui seul :
+# l'avancement est un état de processus.
+[[test]]
+name = "avancement_cascade_7915"
+path = "tests/avancement_cascade_7915.rs"
+
 # Meme raison : `autotests = false`. Binaire a lui seul : le temoin de lecture
 # des taches de fond est un etat de PROCESSUS ; un voisin qui mettrait une zone
 # en lecture dans le meme binaire rendrait ces temoins intermittents (#4681).
@@ -284,6 +290,12 @@ path = "tests/terminologie_eq.rs"
 [[test]]
 name = "autoeq_profils_reels"
 path = "tests/autoeq_profils_reels.rs"
+
+# #6385 : fichiers d'égaliseur réels (Equalizer APO, OPRA) et erreurs nommées.
+# `autotests = false` : sans cette cible, le banc ne serait jamais compilé.
+[[test]]
+name = "import_egaliseur_6385"
+path = "tests/import_egaliseur_6385.rs"
 
 # Binaire de test a lui seul, DELIBEREMENT (#2665). `tracing` met en cache pour
 # tout le processus la decision « ce point d appel interesse-t-il quelqu un ? »
@@ -566,6 +578,12 @@ windows = { version = "0.62", features = [
     # #5410 — la température des zones thermiques (compteurs PDH « Thermal
     # Zone Information »), pour la garde thermique des analyses.
     "Win32_System_Performance",
+    # #6450 — les sources de repli de la température : WMI (`ROOT\CIMV2`,
+    # `ROOT\WMI`), ses VARIANT et l'authentification du proxy COM.
+    "Win32_System_Wmi",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Rpc",
 ] }
 
 # #2219 — témoin de `resolve_streaming_url` par sa porte publique, avant que

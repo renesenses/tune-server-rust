@@ -913,8 +913,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
             // dans le greffon ALSA de PipeWire ne doit pas figer le serveur.
             // #6119 — jamais pendant qu'une sortie locale joue : la page Zones
             // charge cette fiche, et sonder ASIO y coupait la lecture WASAPI.
+            // #7263 — et pas un inventaire complet par appel : l'écran « État du
+            // serveur » interroge cette fiche toutes les 5 s ; le parc publié de
+            // moins de 5 min suffit pour en donner les noms.
             let devs: Vec<String> =
-                crate::background::parc_local_sans_couper_la_lecture(&state, || {
+                crate::background::parc_local_pour_le_diagnostic(&state, || {
                     tune_core::outputs::local::list_audio_devices_with_backend_bounded(
                         audio_backend_pref,
                     )
@@ -960,14 +963,9 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let rss_mb = get_rss_mb();
     // #5189 — température du processeur pour l'écran « État du serveur ».
     let cpu_temp_c = temperature_processeur().await;
-    // #5410 — sans température lisible, les analyses de fond sont bridées à
-    // un fichier à la fois : l'écran doit le dire.
-    // #6713 — sauf si l'utilisateur a levé ce bridage : le motif passe alors
-    // dans `analyses_bridage_leve`, et `analyses_bridees` est nul.
-    let (analyses_bridees, analyses_bridage_leve) = repartir_le_bridage(
-        bridage_des_analyses().await,
-        tune_core::taches_de_fond::vitesse::bridage_leve(&state.backend),
-    );
+    // #6450 — sans température lisible, les analyses de fond gardent leur
+    // vitesse, sans garde thermique : l'écran doit l'avertir.
+    let temperature_illisible = motif_de_temperature_illisible().await;
 
     // #3205 — le seul chiffre qui dise si l'audio a réellement sauté.
     let ring_starvation = releve_famine_anneau(&state).await;
@@ -1004,16 +1002,12 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // Windows sans zone thermique, conteneur, machine virtuelle) ou si la
         // lecture tarde. #5410 : Windows lit ses zones thermiques ACPI.
         "cpu_temp_c": cpu_temp_c,
-        // #5410 — `null` quand la garde thermique mesure ; sinon le motif
-        // (`temperature_illisible`, `temperature_figee`) : les analyses de
-        // fond tournent alors à `analyses_bridees_largeur` fichier à la fois.
-        "analyses_bridees": analyses_bridees,
-        "analyses_bridees_largeur": analyses_bridees
-            .map(|_| tune_core::audio::thermal::LARGEUR_SANS_THERMOMETRE),
-        // #6713 — le motif quand la température est illisible MAIS que
-        // l'utilisateur a levé le bridage (Réglages, niveau Expert) : les
-        // analyses tournent à la vitesse réglée. `null` sinon.
-        "analyses_bridage_leve": analyses_bridage_leve,
+        // #6450 — `null` quand la garde thermique mesure ; sinon le motif
+        // (`temperature_illisible`, `temperature_figee`) : un avertissement,
+        // les analyses de fond tournent à la vitesse réglée sans garde
+        // thermique. Remplace `analyses_bridees` et `analyses_bridage_leve`
+        // (#5410, #6713) : une température illisible ne bride plus.
+        "temperature_illisible": temperature_illisible,
         "db_backend": db_backend,
         "active_zones": zone_count,
         "zone_poller_metrics": zone_poller_metrics,
@@ -1133,30 +1127,16 @@ async fn temperature_processeur() -> Option<f64> {
     }
 }
 
-/// #6713 — `(analyses_bridees, analyses_bridage_leve)` : le motif d'une
-/// température illisible va au premier quand le bridage s'applique (le
-/// défaut), au second quand l'utilisateur l'a levé. Jamais aux deux.
-fn repartir_le_bridage(
-    motif: Option<&'static str>,
-    bridage_leve: bool,
-) -> (Option<&'static str>, Option<&'static str>) {
-    if bridage_leve {
-        (None, motif)
-    } else {
-        (motif, None)
-    }
-}
-
-/// #5410 — le motif du bridage des analyses de fond, ou `None` quand la
-/// température est lisible. Même lecture que celle des analyses
+/// #5410, #6450 — pourquoi la température manque, ou `None` quand elle est
+/// lisible. Même lecture que celle des analyses
 /// (`tune_core::audio::thermal::lecture_thermique`, relue au plus toutes les
 /// 15 s), passée hors de l'exécuteur et abandonnée au-delà de 300 ms comme
 /// la température : un capteur lent ne retient pas le rapport. Un abandon
 /// rend `None` (rien n'est affirmé).
-async fn bridage_des_analyses() -> Option<&'static str> {
+async fn motif_de_temperature_illisible() -> Option<&'static str> {
     let lecture = tokio::task::spawn_blocking(|| {
         tune_core::audio::thermal::lecture_thermique()
-            .motif_du_bridage()
+            .motif_illisible()
             .map(|m| m.id())
     });
     match tokio::time::timeout(std::time::Duration::from_millis(300), lecture).await {
@@ -1265,6 +1245,10 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
         "slimproto": tune_core::slimproto::etat_ecoute(),
         "lms_cli": tune_core::slimproto::cli_server::etat_ecoute(),
         "slimproto_udp": tune_core::slimproto::discovery::etat_ecoute(),
+        // #7374 — le réglage « Serveur Squeezebox de Tune ». Faux : les trois
+        // états ci-dessus sont `null` parce que rien n'est ouvert, pas parce
+        // qu'une écoute a échoué.
+        "slimproto_server_enabled": crate::background::serveur_squeezebox_regle(&state.backend),
         // L'etat de l'ecouteur SSDP (port 1900) et le nombre de reponses
         // M-SEARCH emises. Sans ce champ, « Tune repond-il aux M-SEARCH ? » ne
         // se mesurait qu'au tcpdump, chez le testeur — c'est exactement ce
@@ -2333,6 +2317,9 @@ fn lignes_zones_masquees(
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
+    tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    ));
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
@@ -2367,11 +2354,32 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let zone_count = zone_repo.count().unwrap_or(0);
     let zone_settings_ignored = tune_core::db::zone_repo::zone_settings_ignored();
     let asio_warm_scan = crate::startup::asio_warm_status();
+    // #7841 — la ligne Markdown du volume de chaque zone, dans l'ordre de
+    // `zones`.
+    let mut zones_volume_md: Vec<Option<String>> = Vec::new();
     let zones: Vec<Value> = zone_repo
         .list()
         .unwrap_or_default()
         .iter()
-        .map(|z| json!({ "id": z.id, "name": z.name, "output_type": z.output_type }))
+        .map(|z| {
+            // #7841 — le trim et les limites de la zone, pour qu'un rapport
+            // suffise à dire pourquoi un volume de 30 ne s'entend plus.
+            let volume = z.id.map(|id| {
+                tune_core::audio::volume_au_rapport::lire(
+                    &state.backend,
+                    id,
+                    z.volume / 100.0,
+                    z.output_type.as_deref().unwrap_or(""),
+                )
+            });
+            zones_volume_md.push(volume.as_ref().map(|v| v.ligne_markdown()));
+            json!({
+                "id": z.id,
+                "name": z.name,
+                "output_type": z.output_type,
+                "volume": volume,
+            })
+        })
         .collect();
     // #6378 — `count()` et `list()` ignorent les zones masquées : sans cette
     // lecture, « Zones (0) » ne distingue pas « aucune zone » de « la seule
@@ -2571,12 +2579,15 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push('\n');
 
     md.push_str(&format!("## Zones ({zone_count})\n"));
-    for z in &zones {
+    for (i, z) in zones.iter().enumerate() {
         md.push_str(&format!(
             "- {} ({})\n",
             z["name"].as_str().unwrap_or("?"),
             z["output_type"].as_str().unwrap_or("?")
         ));
+        if let Some(Some(volume)) = zones_volume_md.get(i) {
+            md.push_str(&format!("  - {volume}\n"));
+        }
     }
     md.push_str(&lignes_zones_masquees(&zones_masquees));
     md.push_str(&format!(
@@ -2652,6 +2663,12 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
                 "- SlimProto (Squeezebox): en ecoute sur {}\n",
                 etat.port
             ));
+        }
+        None if !crate::background::serveur_squeezebox_regle(&state.backend) => {
+            // #7374 — coupé par le réglage, ce n'est pas une panne.
+            md.push_str(
+                "- SlimProto (Squeezebox): serveur desactive par le reglage — ni 3483 TCP/UDP ni 9090 ouverts\n",
+            );
         }
         None => {
             md.push_str("- SlimProto (Squeezebox): aucune tentative d'ecoute\n");
@@ -3048,14 +3065,23 @@ const BUG_REPORT_MAX_IMAGES: usize = 3;
 /// une session authentifiée.
 const BUG_REPORT_MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Des IMAGES, et rien d'autre.
-///
-/// Ce n'est pas une prudence de principe : les captures sont posées **en ligne**
-/// dans le corps du fil, en `<img>`. Un `.log` ou un `.zip` n'y a aucune forme
-/// d'existence — la table `forum_attachments` a été SUPPRIMÉE côté site
-/// (migration `2026_03_07_100001`). Accepter un journal ici reviendrait à le
-/// ranger sur le disque sans que rien ne le montre jamais.
+/// Les images, posées **en ligne** dans le corps du fil, en `<img>`.
 const BUG_REPORT_IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
+
+/// #7920 — les journaux et archives, relayés sous `attachments[]`.
+///
+/// Le site range désormais ces fichiers avec le fil (PR site-mozaiklabs#471),
+/// ce qui rend caduque la raison du refus de #4564 : la table
+/// `forum_attachments` supprimée ne laissait aucune place à un `.log`. Mêmes
+/// bornes que le site : 3 fichiers, 10 Mo chacun.
+const BUG_REPORT_ATTACHMENT_EXT: &[&str] = &["log", "txt", "json", "zip"];
+
+/// Au plus trois journaux, en plus des trois captures.
+const BUG_REPORT_MAX_ATTACHMENTS: usize = 3;
+
+/// 10 Mio par journal, la règle `max:10240` du site. Au pire 3 × 10 + 3 × 4 =
+/// 42 Mio : sous le plafond de corps de 50 Mio des routes (`routes/mod.rs`).
+const BUG_REPORT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 
 /// Une capture reçue du navigateur, déjà bornée.
 struct CaptureJointe {
@@ -3068,6 +3094,16 @@ fn extension_de(nom: &str) -> String {
     nom.rsplit_once('.')
         .map(|(_, e)| e.to_ascii_lowercase())
         .unwrap_or_default()
+}
+
+/// Le type d'un journal, déduit de l'extension : le navigateur déclare souvent
+/// `application/octet-stream` pour un `.log`, que le site n'a pas à deviner.
+fn mime_journal(ext: &str) -> &'static str {
+    match ext {
+        "json" => "application/json",
+        "zip" => "application/zip",
+        _ => "text/plain",
+    }
 }
 
 fn mime_image(ext: &str) -> &'static str {
@@ -3091,8 +3127,21 @@ fn refus_de_capture(code: &str, message: &str) -> axum::response::Response {
         .into_response()
 }
 
-/// Lit le `multipart/form-data` du signalement : la `description`, et les
-/// captures sous `images[]`.
+/// Ce que le navigateur joint au signalement, trié par famille.
+#[derive(Default)]
+struct PiecesJointes {
+    /// Relayées sous `images[]`.
+    images: Vec<CaptureJointe>,
+    /// #7920 — relayées sous `attachments[]`.
+    journaux: Vec<CaptureJointe>,
+}
+
+/// Lit le `multipart/form-data` du signalement : la `description`, les
+/// captures et les journaux.
+///
+/// Chaque fichier est rangé d'après son **extension**, quel que soit le nom du
+/// champ qui l'apporte : un client web antérieur à #7920 envoie tout sous
+/// `images[]`, et son `.log` doit partir quand même sous `attachments[]`.
 ///
 /// Nombre, taille et type sont vérifiés **ici**, avant tout relais, pour que le
 /// refus soit une phrase et non un 422 amont. Le nombre et le type sont jugés
@@ -3100,11 +3149,11 @@ fn refus_de_capture(code: &str, message: &str) -> axum::response::Response {
 /// mémoire.
 async fn lire_captures(
     mut multipart: axum::extract::Multipart,
-) -> Result<(String, Vec<CaptureJointe>), axum::response::Response> {
+) -> Result<(String, PiecesJointes), axum::response::Response> {
     let mut description = String::new();
     let mut resume_ia: Option<String> = None;
     let mut joindre_resume_ia = false;
-    let mut images: Vec<CaptureJointe> = Vec::new();
+    let mut pieces = PiecesJointes::default();
 
     loop {
         let field = match multipart.next_field().await {
@@ -3119,19 +3168,30 @@ async fn lire_captures(
 
         match file_name {
             Some(fname) if !fname.is_empty() => {
-                if images.len() >= BUG_REPORT_MAX_IMAGES {
+                let ext = extension_de(&fname);
+                let est_image = BUG_REPORT_IMAGE_EXT.contains(&ext.as_str());
+                let est_journal = BUG_REPORT_ATTACHMENT_EXT.contains(&ext.as_str());
+                if !est_image && !est_journal {
+                    return Err(refus_de_capture(
+                        "file_type",
+                        &format!(
+                            "« {fname} » n'est pas accepté. Images : {} ; journaux : {}.",
+                            BUG_REPORT_IMAGE_EXT.join(", "),
+                            BUG_REPORT_ATTACHMENT_EXT.join(", ")
+                        ),
+                    ));
+                }
+                if est_image && pieces.images.len() >= BUG_REPORT_MAX_IMAGES {
                     return Err(refus_de_capture(
                         "too_many_images",
                         &format!("Trop de captures : {BUG_REPORT_MAX_IMAGES} images au maximum."),
                     ));
                 }
-                let ext = extension_de(&fname);
-                if !BUG_REPORT_IMAGE_EXT.contains(&ext.as_str()) {
+                if est_journal && pieces.journaux.len() >= BUG_REPORT_MAX_ATTACHMENTS {
                     return Err(refus_de_capture(
-                        "image_type",
+                        "too_many_attachments",
                         &format!(
-                            "« {fname} » n'est pas une image. Formats acceptés : {}.",
-                            BUG_REPORT_IMAGE_EXT.join(", ")
+                            "Trop de journaux : {BUG_REPORT_MAX_ATTACHMENTS} fichiers au maximum."
                         ),
                     ));
                 }
@@ -3139,20 +3199,37 @@ async fn lire_captures(
                     Ok(b) => b,
                     Err(e) => return Err(refus_de_capture("image_read", &e.to_string())),
                 };
-                if bytes.len() > BUG_REPORT_MAX_IMAGE_BYTES {
-                    return Err(refus_de_capture(
-                        "image_too_large",
-                        &format!(
-                            "« {fname} » dépasse {} Mo.",
-                            BUG_REPORT_MAX_IMAGE_BYTES / (1024 * 1024)
-                        ),
-                    ));
+                if est_image {
+                    if bytes.len() > BUG_REPORT_MAX_IMAGE_BYTES {
+                        return Err(refus_de_capture(
+                            "image_too_large",
+                            &format!(
+                                "« {fname} » dépasse {} Mo.",
+                                BUG_REPORT_MAX_IMAGE_BYTES / (1024 * 1024)
+                            ),
+                        ));
+                    }
+                    pieces.images.push(CaptureJointe {
+                        content_type: declared_ct.unwrap_or_else(|| mime_image(&ext).to_string()),
+                        file_name: fname,
+                        bytes: bytes.to_vec(),
+                    });
+                } else {
+                    if bytes.len() > BUG_REPORT_MAX_ATTACHMENT_BYTES {
+                        return Err(refus_de_capture(
+                            "attachment_too_large",
+                            &format!(
+                                "« {fname} » dépasse {} Mo.",
+                                BUG_REPORT_MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                            ),
+                        ));
+                    }
+                    pieces.journaux.push(CaptureJointe {
+                        content_type: mime_journal(&ext).to_string(),
+                        file_name: fname,
+                        bytes: bytes.to_vec(),
+                    });
                 }
-                images.push(CaptureJointe {
-                    content_type: declared_ct.unwrap_or_else(|| mime_image(&ext).to_string()),
-                    file_name: fname,
-                    bytes: bytes.to_vec(),
-                });
             }
             _ => {
                 let value = match field.text().await {
@@ -3175,7 +3252,7 @@ async fn lire_captures(
             resume_ia.as_deref(),
             joindre_resume_ia,
         ),
-        images,
+        pieces,
     ))
 }
 
@@ -3206,10 +3283,15 @@ async fn lire_captures(
 /// `ThreadController::uploadImage` — qui exige une session authentifiée, donc
 /// inatteignable depuis ce relais serveur-à-serveur sans jeton.
 ///
-/// Le champ s'appelle donc `images[]` et non `attachments[]`, et le point
-/// d'entrée communautaire a été étendu pour l'accepter (PR site-mozaiklabs
-/// jumelle). Sans elle, ce code enverrait des fichiers que le site jetterait
-/// sans le dire.
+/// Les captures partent donc sous `images[]`, et le point d'entrée
+/// communautaire a été étendu pour l'accepter (PR site-mozaiklabs jumelle).
+///
+/// # #7920 — les journaux
+///
+/// Le site range désormais aussi des fichiers joints au fil
+/// (PR site-mozaiklabs#471) : `.log`, `.txt`, `.json` et `.zip` partent sous
+/// `attachments[]`, les images restent sous `images[]`. Sous un autre nom, le
+/// site jetterait les fichiers sans le dire.
 pub(super) async fn submit_bug_report(
     State(state): State<AppState>,
     req: axum::extract::Request,
@@ -3231,7 +3313,7 @@ pub(super) async fn submit_bug_report(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| s.starts_with("multipart/form-data"));
 
-    let (description, images) = if est_multipart {
+    let (description, pieces) = if est_multipart {
         let multipart = match req.extract::<axum::extract::Multipart, _>().await {
             Ok(m) => m,
             Err(rej) => return rej.into_response(),
@@ -3248,13 +3330,13 @@ pub(super) async fn submit_bug_report(
                     b.resume_ia.as_deref(),
                     b.joindre_resume_ia,
                 ),
-                Vec::new(),
+                PiecesJointes::default(),
             ),
             Err(rej) => return rej.into_response(),
         }
     };
 
-    let (code, corps) = envoyer_le_rapport(state, description, images, navigateur).await;
+    let (code, corps) = envoyer_le_rapport(state, description, pieces, navigateur).await;
     let mut resp = (code, Json(&corps)).into_response();
     // #5068 — le délai du site, aussi sous sa forme standard.
     if let Some(secs) = corps.get("retry_after").and_then(Value::as_u64) {
@@ -3275,7 +3357,7 @@ pub(super) async fn submit_bug_report(
 async fn envoyer_le_rapport(
     state: AppState,
     description: String,
-    images: Vec<CaptureJointe>,
+    pieces: PiecesJointes,
     navigateur: Option<String>,
 ) -> (axum::http::StatusCode, Value) {
     use axum::http::StatusCode;
@@ -3285,15 +3367,15 @@ async fn envoyer_le_rapport(
     // Build the diagnostics + logs report (same content as the preview/markdown).
     let backend = state.backend.clone();
     let url = bug_report_url(&state);
-    // #5428 — l'identité du compte (jeton SSO, sinon clé de licence), lue
-    // AVANT que l'état ne soit consommé. Absente, le rapport part quand même,
-    // sans en-tête, comme avant : pas de 412 ici, contrairement au support.
-    // Forme du catalogue (`identifiants_mozaiklabs`) : le premier identifiant.
-    let identite = crate::routes::support::identifiants_mozaiklabs(&SettingsRepo::with_backend(
+    // #5428 — l'identité du compte, lue AVANT que l'état ne soit consommé.
+    // Absente, le rapport part quand même, sans en-tête, comme avant : pas de
+    // 412 ici, contrairement au support.
+    // #7920 — TOUS les identifiants, pas seulement le premier : le jeton de
+    // compte s'il existe, ET la clé de licence si elle est enregistrée. Un
+    // jeton expiré ne fait plus disparaître la licence du rapport.
+    let identites = crate::routes::support::identifiants_mozaiklabs(&SettingsRepo::with_backend(
         state.backend.clone(),
-    ))
-    .into_iter()
-    .next();
+    ));
     let Json(report) = generate_bug_report(State(state)).await;
     let report_md = report["markdown"].as_str().unwrap_or("").to_string();
     if report_md.trim().is_empty() {
@@ -3327,6 +3409,11 @@ async fn envoyer_le_rapport(
 
     // The site caps the body at 50k chars. On retire les lignes de journal les
     // plus ANCIENNES (#7468) : le défaut est dans les dernières minutes.
+    // Le diagnostic est déjà nettoyé (`generate_bug_report`). Les mots du
+    // testeur, le résumé joint et le titre passent par la porte commune des
+    // identifiants d'accès distant : un lien ou un journal collé y passe aussi.
+    let full_markdown = tune_core::confidentialite::masquer_acces_distant(&full_markdown);
+    let title = tune_core::confidentialite::masquer_acces_distant(&title);
     let body_md = couper_le_rapport(&full_markdown, BUG_REPORT_MAX_BODY_CHARS);
 
     let instance_id = tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
@@ -3336,7 +3423,8 @@ async fn envoyer_le_rapport(
         .unwrap_or_default();
 
     // Contract of the community bug-report endpoint: { title?, body, os?,
-    // version?, instance_id? } — plus `images[]` depuis #4564.
+    // version?, instance_id? } — plus `images[]` depuis #4564 et
+    // `attachments[]` depuis #7920.
     let champs: [(&str, String); 5] = [
         ("title", title),
         ("body", body_md),
@@ -3358,16 +3446,19 @@ async fn envoyer_le_rapport(
         }
     };
 
-    // Sans capture, le fil part EXACTEMENT comme avant : un corps JSON. #4564
-    // n'ajoute un multipart que lorsqu'il y a quelque chose à transporter — un
-    // serveur qui ne joint rien ne change donc rien à ce qu'il émettait.
+    // Sans pièce jointe, le fil part EXACTEMENT comme avant : un corps JSON.
+    // #4564 n'ajoute un multipart que lorsqu'il y a quelque chose à
+    // transporter — un serveur qui ne joint rien ne change donc rien à ce qu'il
+    // émettait.
+    let PiecesJointes { images, journaux } = pieces;
     let nb_images = images.len();
+    let nb_journaux = journaux.len();
     // `Accept: application/json`, et ce n'est pas décoratif : sans lui, Laravel
     // répond à un refus de validation par une REDIRECTION 302 vers la page
     // précédente au lieu d'un 422. `reqwest` la suit, tombe sur une page HTML
     // en 200, et le refus se lirait « envoyé » — le testeur croirait sa capture
     // partie. Mesuré sur le banc Pest de la PR jumelle `site-mozaiklabs`.
-    let requete = if images.is_empty() {
+    let requete = if images.is_empty() && journaux.is_empty() {
         let payload: serde_json::Map<String, Value> = champs
             .into_iter()
             .map(|(k, v)| (k.to_string(), Value::String(v)))
@@ -3381,10 +3472,18 @@ async fn envoyer_le_rapport(
         for (k, v) in champs {
             form = form.text(k, v);
         }
-        for image in images {
-            let part = match reqwest::multipart::Part::bytes(image.bytes)
-                .file_name(image.file_name)
-                .mime_str(&image.content_type)
+        // `images[]` — le nom exact qu'attend la règle Laravel `images.*` ;
+        // `attachments[]` (#7920) celui de `attachments.*`. Sous un autre nom,
+        // le site accepterait la requête et jetterait les fichiers EN SILENCE :
+        // le testeur croirait sa pièce partie.
+        let fichiers = images
+            .into_iter()
+            .map(|f| ("images[]", f))
+            .chain(journaux.into_iter().map(|f| ("attachments[]", f)));
+        for (champ, fichier) in fichiers {
+            let part = match reqwest::multipart::Part::bytes(fichier.bytes)
+                .file_name(fichier.file_name)
+                .mime_str(&fichier.content_type)
             {
                 Ok(p) => p,
                 Err(e) => {
@@ -3394,10 +3493,7 @@ async fn envoyer_le_rapport(
                     );
                 }
             };
-            // `images[]` — le nom exact qu'attend la règle Laravel `images.*`.
-            // Sous un autre nom, le site accepterait la requête et jetterait
-            // les fichiers EN SILENCE : le testeur croirait sa capture partie.
-            form = form.part("images[]", part);
+            form = form.part(champ, part);
         }
         client
             .post(&url)
@@ -3405,13 +3501,14 @@ async fn envoyer_le_rapport(
             .multipart(form)
     };
 
-    // #5428 — les DEUX branches (JSON et multipart) passent ici : l'en-tête
-    // d'identité est posé une fois, par la fonction du support. Ni jeton ni
-    // clé ne sont journalisés.
-    let requete = match &identite {
-        Some(auth) => auth.apply(requete),
-        None => requete,
-    };
+    // #5428 — les DEUX branches (JSON et multipart) passent ici : les en-têtes
+    // d'identité sont posés par la fonction du support. Ni jeton ni clé ne
+    // sont journalisés.
+    // #7920 — chacun des identifiants : `Authorization` pour le jeton,
+    // `X-License-Key` pour la licence ; ils ne s'écrasent pas.
+    let requete = identites
+        .iter()
+        .fold(requete, |requete, auth| auth.apply(requete));
 
     match requete.send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -3430,6 +3527,15 @@ async fn envoyer_le_rapport(
                     "bug_report_captures_partielles"
                 );
             }
+            // #7920 — même règle pour les journaux, si le site rend leur compte.
+            let journaux_ranges = data.get("attachments").and_then(Value::as_u64);
+            if journaux_ranges.is_some_and(|n| n as usize != nb_journaux) {
+                tracing::warn!(
+                    envoyes = nb_journaux,
+                    ranges = journaux_ranges,
+                    "bug_report_journaux_partiels"
+                );
+            }
             (
                 StatusCode::OK,
                 json!({
@@ -3437,12 +3543,13 @@ async fn envoyer_le_rapport(
                     "url": thread.get("url").and_then(|v| v.as_str()).unwrap_or(""),
                     "slug": thread.get("slug").and_then(|v| v.as_str()).unwrap_or(""),
                     "images": images_rangees,
+                    "attachments": journaux_ranges,
                 }),
             )
         }
         Ok(resp) => {
             let status = resp.status().as_u16();
-            journaliser_le_refus(status, nb_images, resp.headers());
+            journaliser_le_refus(status, nb_images, nb_journaux, resp.headers());
             // #5068 — la limite d'envoi du site garde son 429 : ce n'est pas
             // une panne, et un 5xx ferait lever à l'interface un bandeau
             // « Server error » en plus de la phrase de l'écran.
@@ -3470,15 +3577,26 @@ async fn envoyer_le_rapport(
 /// dans 43 minutes » lu à l'écran ne se rapprochait d'aucun autre refus du
 /// journal, sinon de mémoire et à la minute près. Sans en-tête exploitable, le
 /// champ est absent : on n'invente aucun délai.
-fn journaliser_le_refus(status: u16, nb_images: usize, headers: &reqwest::header::HeaderMap) {
+fn journaliser_le_refus(
+    status: u16,
+    nb_images: usize,
+    nb_journaux: usize,
+    headers: &reqwest::header::HeaderMap,
+) {
     match tune_core::cloud::rate_limit::retry_after_secs(headers) {
         Some(retry_after_seconds) => tracing::warn!(
             status,
             images = nb_images,
+            attachments = nb_journaux,
             retry_after_seconds,
             "bug_report_submit_rejected"
         ),
-        None => tracing::warn!(status, images = nb_images, "bug_report_submit_rejected"),
+        None => tracing::warn!(
+            status,
+            images = nb_images,
+            attachments = nb_journaux,
+            "bug_report_submit_rejected"
+        ),
     }
 }
 
@@ -3782,6 +3900,11 @@ pub(super) async fn api_docs() -> Json<Value> {
         ("POST", "/system/import/roon", "Import from Roon"),
         ("POST", "/system/import/jriver", "Import from JRiver XML"),
         ("POST", "/system/import/plex", "Import from Plex"),
+        (
+            "POST",
+            "/system/import/m3u-plays",
+            "Add N plays to every track of an m3u list (?plays=N, ?preview=true)",
+        ),
         // Library
         (
             "GET",
@@ -5327,7 +5450,7 @@ mod tests_refus_du_rapport_5590 {
     fn le_refus_dit_le_delai_impose_par_le_site() {
         let mut entetes = reqwest::header::HeaderMap::new();
         entetes.insert(reqwest::header::RETRY_AFTER, "2556".parse().unwrap());
-        let ligne = capter(|| journaliser_le_refus(429, 0, &entetes));
+        let ligne = capter(|| journaliser_le_refus(429, 0, 0, &entetes));
         assert!(ligne.contains("bug_report_submit_rejected"), "{ligne}");
         assert!(ligne.contains("status=429"), "{ligne}");
         assert!(
@@ -5340,7 +5463,7 @@ mod tests_refus_du_rapport_5590 {
     #[test]
     fn sans_retry_after_aucun_delai_n_est_invente() {
         let entetes = reqwest::header::HeaderMap::new();
-        let ligne = capter(|| journaliser_le_refus(502, 1, &entetes));
+        let ligne = capter(|| journaliser_le_refus(502, 1, 0, &entetes));
         assert!(ligne.contains("bug_report_submit_rejected"), "{ligne}");
         assert!(
             ligne.contains("status=502") && ligne.contains("images=1"),
@@ -5403,24 +5526,56 @@ mod zones_masquees_au_rapport_6378 {
     }
 }
 
+/// #7841 — Linn Klimax en OpenHome : « à 30, plus de son ». Le rapport ne
+/// disait de chaque zone que son nom et son type ; un trim de −12 dB ou une
+/// limite de sécurité, qui font partir 30 % bien plus bas, n'y paraissaient
+/// pas. L'épreuve lit le rapport tel que le testeur le colle (Markdown) et
+/// son JSON.
 #[cfg(test)]
-mod tests_bridage_leve_6713 {
-    use super::repartir_le_bridage;
+mod volume_des_zones_au_rapport_7841 {
+    use super::*;
+    use tune_core::db::zone_repo::ZoneRepo;
 
-    /// #6713 — par défaut, le motif reste dans `analyses_bridees` (#6450) ;
-    /// bridage levé, il passe dans `analyses_bridage_leve`, jamais aux deux.
-    #[test]
-    fn le_motif_va_a_un_seul_champ_selon_le_reglage() {
-        assert_eq!(
-            repartir_le_bridage(Some("temperature_illisible"), false),
-            (Some("temperature_illisible"), None)
-        );
-        assert_eq!(
-            repartir_le_bridage(Some("temperature_figee"), true),
-            (None, Some("temperature_figee"))
-        );
-        // Température lisible : rien à dire, réglage ou non.
-        assert_eq!(repartir_le_bridage(None, true), (None, None));
-        assert_eq!(repartir_le_bridage(None, false), (None, None));
+    #[tokio::test]
+    async fn le_rapport_dit_le_trim_et_la_limite_de_chaque_zone() {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("AppState");
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = repo
+            .create("Klimax", Some("openhome"), Some("uuid:linn-7841"))
+            .unwrap();
+        repo.update_volume(zone_id, 30.0).unwrap();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .set(&format!("zone_{zone_id}_gain_trim_db"), "-12")
+            .unwrap();
+        settings
+            .set(
+                &tune_core::audio::volume_limites::cle_securite(zone_id),
+                "0.25",
+            )
+            .unwrap();
+
+        let Json(rapport) = generate_bug_report(State(state)).await;
+
+        let md = rapport["markdown"].as_str().unwrap_or_default();
+        let ligne = md
+            .lines()
+            .find(|l| l.contains("gain trim"))
+            .unwrap_or_else(|| panic!("#7841 : aucune ligne de trim dans le rapport :\n{md}"));
+        for attendu in [
+            "volume 30 %",
+            "gain trim -12.0 dB",
+            "safety limit 25 %",
+            "device setpoint 7.5 %",
+        ] {
+            assert!(ligne.contains(attendu), "{attendu} absent de : {ligne}");
+        }
+        let zone = rapport["zones"]["items"]
+            .as_array()
+            .and_then(|z| z.iter().find(|z| z["id"] == json!(zone_id)))
+            .cloned()
+            .expect("la zone dans le JSON du rapport");
+        assert_eq!(zone["volume"]["gain_trim_db"], json!(-12.0));
+        assert_eq!(zone["volume"]["limite_securite"], json!(0.25));
     }
 }

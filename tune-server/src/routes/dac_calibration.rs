@@ -9,7 +9,7 @@ use serde_json::json;
 use tune_core::dac_calibration::{self, DacProfile};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::license::Feature;
-use tune_core::room_correction::FilterType;
+use tune_core::room_correction::profil_eq_de_correction;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -184,32 +184,8 @@ async fn apply_profile_handler(
     // Apply correction filters to the zone's EQ (same key the playback DSP
     // reads, consistent with room_correction).
     if !body.profile.corrections.is_empty() {
-        let bands: Vec<serde_json::Value> = body
-            .profile
-            .corrections
-            .iter()
-            .map(|f| {
-                json!({
-                    "freq": f.frequency_hz,
-                    "gain": f.gain_db,
-                    "q": f.q_factor,
-                    "type": match f.filter_type {
-                        FilterType::Peaking => "peak",
-                        FilterType::LowShelf => "low_shelf",
-                        FilterType::HighShelf => "high_shelf",
-                        FilterType::Notch => "notch",
-                    },
-                })
-            })
-            .collect();
-
-        let eq_profile = json!({
-            "enabled": true,
-            "source": "dac_calibration",
-            "profile_name": format!("{} {}", body.profile.manufacturer, body.profile.model),
-            "bands": bands,
-            "preamp_db": 0.0,
-        });
+        // #7642 — un `EqProfile` COMPLET, typé (voir `profil_eq_de_correction`).
+        let eq_profile = profil_eq_de_correction(&body.profile.corrections);
 
         let settings = SettingsRepo::with_backend(state.backend.clone());
         settings

@@ -157,7 +157,7 @@ impl Peripheriques for Systeme {
         let entree = entree.to_string();
         let (pret_tx, pret_rx) = mpsc::channel::<Result<(String, FormatPcm), String>>();
         let (arret_tx, arret_rx) = mpsc::channel::<()>();
-        std::thread::Builder::new()
+        let fil = std::thread::Builder::new()
             .name("entree-audio-capture".into())
             .spawn(move || {
                 let r = (|| {
@@ -253,7 +253,10 @@ impl Peripheriques for Systeme {
         Ok(CaptureDemarree {
             nom,
             format,
-            arret: Box::new(ArretCpal(arret_tx)),
+            arret: Box::new(ArretCpal {
+                arret: arret_tx,
+                fil: Some(fil),
+            }),
         })
     }
 
@@ -269,11 +272,37 @@ impl Peripheriques for Systeme {
     }
 }
 
-struct ArretCpal(mpsc::Sender<()>);
+/// #7949 — échéance de la fin du fil de capture à l'arrêt : au-delà, il est
+/// détaché et le journal le dit.
+const ECHEANCE_FIL_DE_CAPTURE: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Arrête la capture ET attend la fin de son fil : c'est la fin du fil qui
+/// rend le flux cpal, donc le périphérique. Sans cette attente, une relance
+/// immédiate sur la même entrée (`changement_de_frequence`) pouvait trouver
+/// une entrée `hw:` encore tenue (EBUSY), #7949.
+struct ArretCpal {
+    arret: mpsc::Sender<()>,
+    fil: Option<std::thread::JoinHandle<()>>,
+}
 
 impl Arret for ArretCpal {
-    fn arreter(self: Box<Self>) {
-        let _ = self.0.send(());
+    fn arreter(mut self: Box<Self>) {
+        let _ = self.arret.send(());
+        let Some(fil) = self.fil.take() else {
+            return;
+        };
+        let echeance = std::time::Instant::now() + ECHEANCE_FIL_DE_CAPTURE;
+        while !fil.is_finished() {
+            if std::time::Instant::now() >= echeance {
+                tracing::warn!(
+                    attente_ms = ECHEANCE_FIL_DE_CAPTURE.as_millis() as u64,
+                    "entree_audio_capture_thread_detached"
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = fil.join();
     }
 }
 
@@ -405,5 +434,52 @@ mod physique {
     }
     pub fn frequence_nominale(_: &str) -> Option<u32> {
         None
+    }
+}
+
+#[cfg(test)]
+mod arret_du_fil_de_capture_7949 {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::ArretCpal;
+    use crate::peripheriques::Arret;
+
+    /// Rend le « périphérique » en se détruisant, comme le flux cpal.
+    struct FluxFactice(Arc<AtomicBool>);
+
+    impl Drop for FluxFactice {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn arreter_rend_le_peripherique_avant_de_revenir() {
+        let tenu = Arc::new(AtomicBool::new(true));
+        let (arret_tx, arret_rx) = mpsc::channel::<()>();
+        let flux = FluxFactice(tenu.clone());
+        // Même fin de fil que la capture réelle : attendre l'arrêt, puis
+        // rendre le flux. La fermeture d'un flux cpal prend du temps : le fil
+        // la simule avant de rendre le périphérique.
+        let fil = std::thread::spawn(move || {
+            let _ = arret_rx.recv();
+            std::thread::sleep(Duration::from_millis(150));
+            drop(flux);
+        });
+
+        Box::new(ArretCpal {
+            arret: arret_tx,
+            fil: Some(fil),
+        })
+        .arreter();
+
+        assert!(
+            !tenu.load(Ordering::SeqCst),
+            "#7949 : l'arrêt de la capture est revenu alors que son fil tient encore \
+             le périphérique ; une relance immédiate sur la même entrée prendrait EBUSY"
+        );
     }
 }

@@ -6,10 +6,10 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "collection-physique", "mon-theme", "aes67"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia", "collection-physique", "mon-theme", "aes67", "calibration"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
-local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
+local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture", "tune-calibration-greffon?/capture"]
 asio = ["tune-core/asio"]
 # #4378 : lecture des DSDIFF compressés DST. Hors `default`, mais livrée par
 # toutes les lignes de build publiées (licence de `dst-decoder` acceptée le
@@ -56,8 +56,8 @@ karaoke = ["dep:tune-karaoke"]
 # écran ne les atteint. Voir docs/plugins/README.md.
 bandcamp = ["dep:tune-bandcamp"]
 # Concerts (#2363) : la tache d'abonnement, la lecture et la localisation,
-# sorties du coeur toujours-compile. Au catalogue, Premium (`Feature::Concerts`,
-# refus porte par le greffon lui-meme). Compile par les lignes de release.
+# sorties du coeur toujours-compile. Au catalogue, sans licence depuis #7865
+# (plus de `Feature::Concerts`). Compile par les lignes de release.
 concerts = ["dep:tune-concerts"]
 # Pont Roon (#3914) — Premium : importer l'archive du moissonneur (crédits,
 # images). Dans `default` comme Bandcamp : le greffon est opt-in à l'exécution
@@ -78,6 +78,10 @@ circle = ["dep:tune-circle"]
 # l'exécution (`default_enabled = false`), au catalogue depuis #5296 (la
 # rubrique Sources du client web le consomme, #5065).
 entree-audio = ["dep:tune-entree-audio"]
+# Calibration de la pièce (#7632, C1) : mesure par balayage avec un micro
+# USB. Opt-in à l'exécution (`default_enabled = false`), au catalogue. Tire
+# `tune-entree-audio` pour la capture et la caisse pure `tune-calibration`.
+calibration = ["dep:tune-calibration-greffon"]
 # Assistant IA, étape 1 (chantier assistant-ia) : playlists par phrase et
 # suggestions d'album, avec la clé de l'UTILISATEUR. Gratuit, dans `default`
 # et chargé par défaut (`default_enabled`) : rien ne part tant qu'aucun
@@ -129,6 +133,7 @@ tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
 tune-cd = { path = "../plugins/tune-cd", optional = true }
 tune-circle = { path = "../plugins/tune-circle", optional = true }
 tune-entree-audio = { path = "../plugins/tune-entree-audio", optional = true }
+tune-calibration-greffon = { path = "../plugins/tune-calibration", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
 tune-assistant-ia = { path = "../plugins/tune-assistant-ia", optional = true }
@@ -236,6 +241,11 @@ tune-core = { path = "../tune-core", default-features = false, features = [
     "services-factices",
 ] }
 
+# #7642 — un profil de correction de pièce appliqué atteint le DSP de la zone.
+[[test]]
+name = "correction_de_piece_appliquee_7642"
+path = "tests/correction_de_piece_appliquee_7642.rs"
+
 # Purge à froid de la mémoire libre gardée par la glibc : binaire à part, le
 # RSS mesure tout le processus.
 [[test]]
@@ -260,6 +270,12 @@ path = "tests/pont_lien_d_acces.rs"
 name = "pont_administration"
 path = "tests/pont_administration.rs"
 
+# Une requête relayée n'est pas locale et n'atteint que les routes d'écoute.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "relais_routes_relayables"
+path = "tests/relais_routes_relayables.rs"
+
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
 # la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
@@ -271,6 +287,24 @@ path = "tests/sendspin_mode_transition.rs"
 [[test]]
 name = "agent_tune_4626"
 path = "tests/agent_tune_4626.rs"
+# #7855 — le socle Subsonic : réglage, licence, clés, garde de `/rest`.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "subsonic_socle_7855"
+path = "tests/subsonic_socle_7855.rs"
+
+# #7945 — Subsonic étape 2 : navigation, recherche, stream en Range.
+[[test]]
+name = "subsonic_navigation_7945"
+path = "tests/subsonic_navigation_7945.rs"
+
+# #7335 — les écritures des dossiers de collections refusées par la base ne
+# répondent plus 201/200. Cible propre (pas un `mod` de `server_contracts`) :
+# `autotests = false` plus haut, sans cette entrée le fichier n'est jamais
+# compilé.
+[[test]]
+name = "collections_ecriture_7335"
+path = "tests/collections_ecriture_7335.rs"
 
 [[test]]
 name = "server_contracts"
@@ -465,6 +499,10 @@ name = "radios_upnp_hors_des_pistes_6500"
 path = "tests/radios_upnp_hors_des_pistes_6500.rs"
 
 [[test]]
+name = "photos_upnp_hors_des_pistes_7695"
+path = "tests/photos_upnp_hors_des_pistes_7695.rs"
+
+[[test]]
 name = "plugin_contracts"
 path = "tests/plugin_contracts.rs"
 
@@ -613,6 +651,13 @@ path = "tests/dossier_cue_4625.rs"
 name = "pg_group_by_strict_historique"
 path = "tests/pg_group_by_strict_historique.rs"
 
+# #8066 — remplacer un titre de service indisponible dans une playlist
+# locale : SQLite dans la suite ordinaire, PostgreSQL sous `TUNE_TEST_PG_URL`
+# (test-postgres.yml).
+[[test]]
+name = "remplacer_indisponibles_8066"
+path = "tests/remplacer_indisponibles_8066.rs"
+
 # #7128 — étiqueter tout le résultat d'un filtre d'Oxygen : SQLite dans la
 # suite ordinaire, PostgreSQL sous `TUNE_TEST_PG_URL` (test-postgres.yml).
 # `autotests = false` en tête de ce manifeste : sans cette cible, jamais compilé.
@@ -705,6 +750,14 @@ required-features = ["assistant-ia"]
 [[test]]
 name = "portee_audit_repertoire_3101"
 path = "tests/portee_audit_repertoire_3101.rs"
+
+# #7671 : le catalogue imprimable de la bibliothèque (`GET
+# /export/catalogue.html`) — filtres, tri, pochette intégrée et AUCUN chemin
+# de fichier dans le document. Voisine de l'autre route d'export ci-dessus ;
+# sans cette cible (`autotests = false`), le témoin ne serait jamais compilé.
+[[test]]
+name = "catalogue_imprimable_7671"
+path = "tests/catalogue_imprimable_7671.rs"
 
 # #4101 : la vue Oxygen listait chaque piste de Led Zeppelin IV deux fois. Le
 # repli des copies de moindre qualite (#1362) etait pose sur la fiche d'album,
@@ -872,6 +925,13 @@ path = "tests/comptes_par_source_2147.rs"
 name = "podcasts_abonnement_identifiant_3542"
 path = "tests/podcasts_abonnement_identifiant_3542.rs"
 
+# #7819 : ajouter un podcast par la seule adresse de son flux. Le banc sert un
+# flux RSS et une page HTML sur la boucle locale. `autotests = false` : sans
+# cette entrée, le fichier ne serait jamais compilé.
+[[test]]
+name = "podcast_ajout_par_adresse_7819"
+path = "tests/podcast_ajout_par_adresse_7819.rs"
+
 # #3226 generalise : `sources` gouverne desormais AUSSI le bloc local de
 # `/home/other-versions`, `/home/artist-releases` et
 # `/library/tracks/{id}/versions`, la ou il ne filtrait que la boucle des
@@ -972,6 +1032,12 @@ path = "tests/dispositions_de_canaux_3322.rs"
 [[test]]
 name = "sante_slimproto_i3462"
 path = "tests/sante_slimproto_i3462.rs"
+
+# #7374 — le reglage « Serveur Squeezebox de Tune » ouvre et rend 3483 TCP/UDP
+# et 9090 sans redemarrage. Cible separee : etats d'ecoute et ports globaux.
+[[test]]
+name = "serveur_squeezebox_reglage_7374"
+path = "tests/serveur_squeezebox_reglage_7374.rs"
 
 # #4361 — le pont de commande LMS face a un port deja pris (Cockpit sur Tune OS
 # Fedora). Cible separee pour deux raisons : `cli_server::etat_ecoute()` est un
@@ -1636,11 +1702,32 @@ name = "pg_credits_4984"
 path = "tests/pg_credits_4984.rs"
 required-features = ["postgres"]
 
+# #7765 — la source des crédits de piste sur PostgreSQL : migration 102 et son
+# attribution, écriture MusicBrainz qui garde les balises, filtres « à faire ».
+[[test]]
+name = "pg_credits_source_7765"
+path = "tests/pg_credits_source_7765.rs"
+required-features = ["postgres"]
+
+# #7027 — une bio rangée sans langue (`bio_lang` vide ou NULL) n'est jamais
+# servie comme de l'anglais, sur PostgreSQL.
+[[test]]
+name = "pg_bio_langue_7027"
+path = "tests/pg_bio_langue_7027.rs"
+required-features = ["postgres"]
+
 # #5026 — la règle « Étiquette » élargie (pistes étiquetées, albums de service
 # étiquetés) sur PostgreSQL : aperçu, collection et compteur par le vrai routeur.
 [[test]]
 name = "pg_etiquette_collection_5026"
 path = "tests/pg_etiquette_collection_5026.rs"
+required-features = ["postgres"]
+
+# #7872 — la requête avancée sur PostgreSQL : `GET /library/query` (200, 400,
+# pagination) et une collection intelligente qui porte une `expression`.
+[[test]]
+name = "pg_requete_avancee_7872"
+path = "tests/pg_requete_avancee_7872.rs"
 required-features = ["postgres"]
 
 # #6257 — l'ordre des étiquettes sur PostgreSQL : la 091 pose `tags.position`
@@ -1663,6 +1750,12 @@ path = "tests/artiste_par_nom_6245.rs"
 [[test]]
 name = "album_par_titre_6270"
 path = "tests/album_par_titre_6270.rs"
+
+# #7769 — listes intelligentes et Historique comptent les écoutes comme la
+# Bibliothèque (titre + interprète ; `listen_history.track_id` reste vide).
+[[test]]
+name = "ecoutes_listes_et_historique_7769"
+path = "tests/ecoutes_listes_et_historique_7769.rs"
 
 # #2574 — `tests/piste_artiste_par_id.rs` existait sans cible : jamais
 # compilé (`autotests = false`). Rattaché avec #6245, son voisin direct.
@@ -1868,6 +1961,12 @@ path = "tests/requete_textuelle_6287.rs"
 name = "services_remplacables_6336"
 path = "tests/services_remplacables_6336.rs"
 
+# #7447 — le bouton « Pair » d'Audio / Network Devices contre un faux démon
+# AirPlay 2. Binaire à lui seul, pour la même raison que le banc #6336.
+[[test]]
+name = "jumelage_airplay2_7447"
+path = "tests/jumelage_airplay2_7447.rs"
+
 # #4681 — « ce qui tourne » (`GET /system/background-tasks/running`) par le
 # vrai routeur. Binaire à lui seul : le témoin de lecture et l'avancement de
 # la cascade sont des états de PROCESSUS.
@@ -1891,6 +1990,15 @@ path = "tests/licence_sso_remplacables_6336.rs"
 name = "profils_panne_de_base_6454"
 path = "tests/profils_panne_de_base_6454.rs"
 
+[[test]]
+name = "politique_parentale_7856"
+path = "tests/politique_parentale_7856.rs"
+
+# #8088 — contrôle parental : masquer et refuser les contenus explicites.
+[[test]]
+name = "politique_parentale_explicite_8088"
+path = "tests/politique_parentale_explicite_8088.rs"
+
 # #6212 / #6634 — la gravure du Dynamic Range cède à la lecture et n'écrit pas
 # dans le fichier joué, par la route montée. Binaire à lui seul : le témoin de
 # lecture et la politique des freins sont des états de PROCESSUS. `autotests =
@@ -1913,9 +2021,43 @@ path = "tests/ecoutes_communaute_6738.rs"
 name = "groupe_dlna_joue_sur_les_deux_6155"
 path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
 
+# #7717 — une lecture lancée sur une zone d'un groupe, par n'importe quel
+# client, part sur toutes ses zones (Chromecast comprise).
+[[test]]
+name = "groupe_suit_la_zone_lancee_7717"
+path = "tests/groupe_suit_la_zone_lancee_7717.rs"
+
+# #7937 — un groupe défait ne revient ni par une zone recréée, ni par un
+# regroupement, ni au redémarrage.
+[[test]]
+name = "degrouper_zones_7937"
+path = "tests/degrouper_zones_7937.rs"
+
 # #7077, seconde passe — un refus jadis composé en français suit la langue de
 # l'interface (code stable + phrase traduite). `autotests = false` plus haut :
 # sans cette cible, le témoin ne serait JAMAIS compilé.
 [[test]]
 name = "messages_seconde_passe_7077"
 path = "tests/messages_seconde_passe_7077.rs"
+
+# #7637 — l'entrée principale du menu Démarrer et le raccourci du Bureau
+# lancent le serveur sans console (relu dans le script NSIS de release.yml).
+# `autotests = false` plus haut : sans cette cible, le témoin ne serait
+# JAMAIS compilé.
+[[test]]
+name = "raccourcis_windows_sans_console_7637"
+path = "tests/raccourcis_windows_sans_console_7637.rs"
+
+# #7726 — retirer la licence libère la machine auprès du site de licences
+# (faux site local), et efface la clé même quand le site ne répond pas.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "licence_retrait_libere_la_machine_7726"
+path = "tests/licence_retrait_libere_la_machine_7726.rs"
+
+# Durcissement de la configuration : écritures génériques de `settings` et
+# contrôle d'origine, par le vrai routeur. `autotests = false` plus haut : sans
+# cette cible, le banc ne serait JAMAIS compilé.
+[[test]]
+name = "durcissement_configuration"
+path = "tests/durcissement_configuration.rs"

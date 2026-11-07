@@ -91,6 +91,23 @@ async fn cible_recue(state: &AppState) -> (u64, TransportState, u64) {
 /// Une zone source qui joue une piste WAV réelle à 80 s, et une zone cible
 /// DLNA dont le renderer se comporte comme le Rygel du Devialet.
 async fn source_a_80_s() -> (axum::Router, AppState, i64, i64, tempfile::TempDir) {
+    source_a_80_s_vers(
+        "dlna",
+        "dlna-salon",
+        MockOutput::new("dlna-salon", "Phantom 108db")
+            .with_type("dlna")
+            .with_seek_qui_laisse_en_pause(),
+    )
+    .await
+}
+
+/// La même source, vers la zone cible de type `type_cible` servie par
+/// `cible`, enregistrée sous `id_cible`.
+async fn source_a_80_s_vers(
+    type_cible: &str,
+    id_cible: &str,
+    cible: MockOutput,
+) -> (axum::Router, AppState, i64, i64, tempfile::TempDir) {
     // `do_transfer` persiste la file de la cible à côté de `config.db_path`
     // (`queue_state/`) : on la pose dans le dossier jetable, sinon ce dossier
     // atterrirait dans le répertoire de la caisse.
@@ -120,19 +137,15 @@ async fn source_a_80_s() -> (axum::Router, AppState, i64, i64, tempfile::TempDir
     let source = zones
         .create("Parents", Some("dlna"), Some("dlna-parents"))
         .unwrap();
-    let cible = zones
-        .create("Salon", Some("dlna"), Some("dlna-salon"))
+    let cible_zone = zones
+        .create("Salon", Some(type_cible), Some(id_cible))
         .unwrap();
     {
         let mut registre = state.outputs.lock().await;
         registre.register(Box::new(
             MockOutput::new("dlna-parents", "Beosound Stage").with_type("dlna"),
         ));
-        registre.register(Box::new(
-            MockOutput::new("dlna-salon", "Phantom 108db")
-                .with_type("dlna")
-                .with_seek_qui_laisse_en_pause(),
-        ));
+        registre.register(Box::new(cible));
     }
 
     let (status, corps) = poster(
@@ -152,7 +165,7 @@ async fn source_a_80_s() -> (axum::Router, AppState, i64, i64, tempfile::TempDir
         .update_position(source, POSITION_SOURCE_MS)
         .await;
 
-    (app, state, source, cible, dir)
+    (app, state, source, cible_zone, dir)
 }
 
 #[tokio::test]
@@ -210,4 +223,67 @@ async fn une_source_en_pause_reste_en_pause_sans_relance() {
     let zone = state.playback.get_state(cible).await;
     assert_eq!(zone.state, tune_core::playback::PlayState::Paused);
     assert_eq!(zone.position_ms, POSITION_SOURCE_MS as i64);
+}
+
+/// #7846 (fil 2648, rc10 Linux) — de DLNA vers une sortie LOCALE (DAC USB),
+/// la lecture ne reprenait pas d'elle-même : il fallait Pause puis Lecture.
+///
+/// Le transfert lançait la piste à 0:00 sur la sortie locale, puis le
+/// `seek` à la position passait par `replay_zone_at_position` : `stop()` de
+/// la sortie, 300 ms, second lancement — le périphérique rouvert dans la
+/// même seconde. La sortie doit recevoir UN lancement, déjà à la position,
+/// et aucun arrêt.
+///
+/// Contre-épreuve : forcer `a_la_position` à faux dans
+/// `transferer_sur_l_appareil` (tune-core, transfert_en_pause_5050.rs) fait
+/// rougir ce test sur « 2 lancement(s), 1 arrêt(s) ».
+#[tokio::test]
+async fn vers_une_sortie_locale_la_piste_part_une_fois_a_la_position_7846() {
+    let (app, state, source, cible, _dir) = source_a_80_s_vers(
+        "local",
+        "local:usb-dac",
+        MockOutput::new("local:usb-dac", "DAC USB").with_type("local"),
+    )
+    .await;
+
+    let (status, corps) = poster(
+        &app,
+        &format!("/api/v1/zones/{source}/transfer/{cible}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "transfert : {corps}");
+
+    let (lancements, arrets, etat_sortie) = {
+        let registre = state.outputs.lock().await;
+        let sortie = registre.get("local:usb-dac").expect("sortie enregistree");
+        let garde = sortie.lock().await;
+        let statut = garde.get_status().await.expect("statut de la cible");
+        let mock = garde
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("la sortie factice");
+        (
+            mock.play_call_count().await,
+            mock.stop_call_count(),
+            statut.state,
+        )
+    };
+    assert_eq!(
+        (lancements, arrets),
+        (1, 0),
+        "la sortie locale doit recevoir un seul lancement, sans arrêt-relance \
+         (#7846) : {lancements} lancement(s), {arrets} arrêt(s)"
+    );
+    assert_eq!(
+        etat_sortie,
+        TransportState::Playing,
+        "la sortie locale joue"
+    );
+    let zone = state.playback.get_state(cible).await;
+    assert_eq!(zone.state, tune_core::playback::PlayState::Playing);
+    assert_eq!(
+        zone.position_ms, POSITION_SOURCE_MS,
+        "la zone cible reprend à la position de la source"
+    );
 }

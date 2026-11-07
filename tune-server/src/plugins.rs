@@ -46,8 +46,7 @@ pub fn build_loader(
 ) -> PluginLoader {
     // La licence descend jusqu'aux greffons (`PluginContext::license`) pour
     // qu'un greffon payant ADAPTE sa réponse au lieu de se voir fermer la porte
-    // par l'hôte : « Concerts » servira un jour une version réduite aux comptes
-    // gratuits, et cette décision doit tenir chez lui, en un seul endroit.
+    // par l'hôte : la décision doit tenir chez lui, en un seul endroit.
     PluginLoader::new(plugins_data_root())
         .with_event_bus(event_bus.clone())
         .with_db(backend)
@@ -142,8 +141,8 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
     // sorties du cœur toujours-compilé. Elle y était démarrée SANS condition
     // par `background.rs` — elle ne tourne désormais que chez ceux qui ont
     // installé le plugin. Sa dépendance explicite est la base : lire les artistes
-    // de la bibliothèque et `instance_id`. La licence lui arrive par le contexte
-    // (`PluginContext::license`) : c'est lui qui décide ce qu'il sert (Premium).
+    // de la bibliothèque et `instance_id`. Il ne lit pas la licence : il n'est
+    // plus Premium (#7865).
     #[cfg(feature = "concerts")]
     loader
         .register(Box::new(tune_concerts::ConcertsPlugin::new(
@@ -205,6 +204,21 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
     loader
         .register(Box::new(tune_entree_audio::EntreeAudioPlugin::new(
             tune_entree_audio::HostServices {
+                backend: state.backend.clone(),
+                orchestrator: state.orchestrator.clone(),
+                playback: state.playback.clone(),
+            },
+        )))
+        .await;
+
+    // Calibration de la pièce (#7632, C1). Comme `entree-audio` : l'orchestrateur
+    // pour y inscrire la source PCM FINIE « calibration » (le balayage de
+    // mesure), régler le volume et lancer la zone ; le gestionnaire de lecture
+    // pour la file. Opt-in : rien ne joue tant qu'il n'est pas installé.
+    #[cfg(feature = "calibration")]
+    loader
+        .register(Box::new(tune_calibration_greffon::CalibrationPlugin::new(
+            tune_calibration_greffon::HostServices {
                 backend: state.backend.clone(),
                 orchestrator: state.orchestrator.clone(),
                 playback: state.playback.clone(),
@@ -437,6 +451,19 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
         rendus
     }
 
+    /// « Chercher sur les services » (#7928) : tous les services du
+    /// registre UTILISABLES (activés et connectés), dans l'ordre du registre.
+    async fn services_de_recherche(&self) -> Vec<String> {
+        let noms = self.state.services.lock().await.list();
+        let mut rendus = Vec::new();
+        for nom in noms {
+            if self.service(&nom).await.is_some() {
+                rendus.push(nom);
+            }
+        }
+        rendus
+    }
+
     async fn chercher_albums(
         &self,
         service: &str,
@@ -557,7 +584,9 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
                 Ok(Image::Octets(octets.to_vec()))
             }
             200..=299 => Ok(Image::Introuvable),
-            404 | 403 | 410 => Ok(Image::Introuvable),
+            404 | 410 => Ok(Image::Introuvable),
+            // #7927 : un refus du CDN n'est pas une image disparue.
+            403 => Ok(Image::Refusee),
             429 | 503 => Ok(Image::Limite),
             statut => {
                 tracing::debug!(target: "plugin", statut, "collection_physique_pochette_statut");
