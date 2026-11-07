@@ -1961,7 +1961,14 @@ async fn delete_radio(State(state): State<AppState>, Path(id): Path<i64>) -> imp
 async fn play_radio(
     State(state): State<AppState>,
     Path((id, zone_id)): Path<(i64, i64)>,
+    profile: crate::routes::active_profile::ActiveProfile,
 ) -> impl IntoResponse {
+    // #7974 — le profil qui lance la station est celui dont le bail d'écoute
+    // s'applique.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     let repo = RadioRepo::with_backend(state.backend.clone());
     let Some(radio) = repo.get(id).ok().flatten() else {
         return (StatusCode::NOT_FOUND, "radio not found").into_response();
@@ -2041,14 +2048,22 @@ pub(crate) async fn jouer_un_flux(
         .filter(|_| crate::routes::zones::zone_recoit_l_adresse_du_flux(output_type.as_deref()));
 
     let zone_state = state.playback.get_state(zone_id).await;
-    json!({
+    let mut corps = json!({
         "zone_id": zone_id,
         "radio": nom,
         "output_sent": output_sent,
         "error": output_error,
         "state": zone_state,
         "stream_url": stream_url,
-    })
+    });
+    // #7974 — le refus du bail d'écoute garde ce corps, avec son code dédié.
+    if let Some(e) = output_error.as_deref()
+        && let Some(refus) = tune_core::db::bail_d_ecoute::Refus::depuis_sentinelle(e)
+    {
+        corps["code"] = json!(tune_core::db::bail_d_ecoute::CODE_REFUS);
+        corps["reason"] = json!(refus.code());
+    }
+    corps
 }
 
 /// Cherche une station dans le catalogue local **et dans l'annuaire relevé**,

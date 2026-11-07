@@ -1170,8 +1170,14 @@ async fn choisir_le_flux(
 async fn jouer(
     State(state): State<AppState>,
     Path((external_id, zone_id)): Path<(String, i64)>,
+    profile: crate::routes::active_profile::ActiveProfile,
     corps: axum::body::Bytes,
 ) -> Response {
+    // #7974 — le profil qui lance la station porte le bail d'écoute.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     let choisi = if corps.iter().all(u8::is_ascii_whitespace) {
         None
     } else {

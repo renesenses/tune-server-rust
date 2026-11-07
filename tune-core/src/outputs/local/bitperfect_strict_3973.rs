@@ -64,7 +64,9 @@ fn ouverture_3973_ouvrir_refuse_avant_de_construire_le_flux() {
     let src = compact(include_str!("backend.rs"));
     let debut = src
         .find(
-            "fnouvrir(demande:&DemandeDOuverture<'a>)->Result<Self,RefusDOuverture>{letdevice_name",
+            // #7614 — le corps de `BackendCpal::ouvrir` vit dans
+            // `ouvrir_pour_le_surechantillonneur`, que `ouvrir` appelle.
+            "fnouvrir_pour_le_surechantillonneur(demande:&DemandeDOuverture<'a>,",
         )
         .expect("`BackendCpal::ouvrir`");
     let ouvrir = &src[debut..];

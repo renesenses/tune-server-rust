@@ -4942,6 +4942,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(super::politique_parentale::SQL_TABLE) {
         tracing::warn!(error = %e, "politiques_parentales_table_failed");
     }
+    // Temps écouté des profils supervisés (#7974), même modèle.
+    if let Err(e) = db.execute_batch(super::bail_d_ecoute::SQL_TABLE) {
+        tracing::warn!(error = %e, "ecoutes_parentales_table_failed");
+    }
     // Trace des tentatives d'enrichissement (#7983) — même régime que la
     // table ci-dessus. PG : `ENSURE_TABLES` et `PG_FULL_SCHEMA`.
     for ddl in [
