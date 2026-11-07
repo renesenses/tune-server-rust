@@ -10,6 +10,7 @@ pub mod auto_fix;
 pub mod balises_brutes;
 pub mod batch;
 pub mod bio_batch;
+pub mod bio_segments;
 pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod completude;
