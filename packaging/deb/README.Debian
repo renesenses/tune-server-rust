@@ -5,7 +5,8 @@ Ce que le paquet pose
 ---------------------
 
   /opt/tune/                    programme (binaire, client web, plugins,
-                                airplay-daemon, ffmpeg minimal)
+                                airplay-daemon, ffmpeg minimal, librespot
+                                pour la lecture Spotify)
   /usr/bin/tune-server          lien symbolique vers /opt/tune/tune-server
   /lib/systemd/system/tune-server.service
   /etc/default/tune-server      configuration (conffile : conservé aux MAJ)

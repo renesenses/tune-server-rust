@@ -32,12 +32,19 @@ pub mod chemin_inaccessible;
 /// #5513 — les chemins de données retenus au démarrage.
 pub mod chemins_de_donnees;
 pub mod config;
+pub mod conteneur;
 pub mod discovery_setup;
 /// Dossiers de données inscriptibles, contrôlés avant la base (`EX_CONFIG`).
 pub mod dossiers_inscriptibles;
 /// Plancher de fils de travail du moteur tokio (fil 2124, #5677).
 pub mod fils_de_travail;
+/// Ce qu'une requête rejouée par le relais ou l'écoute directe peut atteindre.
+pub mod garde_du_relais;
+/// #7077 — garde : aucune phrase française dans les champs exposés de l'API.
+#[cfg(test)]
+mod garde_francais_api;
 /// Détecteur de gel de l'exécuteur et relevé automatique (#4924).
+pub mod garde_origine;
 pub mod gel_executeur;
 mod instance_existante;
 /// #6253 — `--sans-console` : relance sans fenêtre de terminal (Windows).
@@ -49,6 +56,8 @@ mod lecture_bornee;
 pub mod lien_de_partage;
 /// Rendre au système, à froid, la mémoire libre que garde l'allocateur.
 pub mod memoire_a_froid;
+/// #7077 — code stable + phrase traduite pour les corps de l'API.
+pub mod message_api;
 /// #4677 — relevé, au démarrage, des règles du pare-feu Windows pour
 /// `tune-server.exe` (lecture seule, une ligne de journal).
 pub mod pare_feu_windows;
@@ -79,6 +88,9 @@ pub mod windows_migrate;
 
 #[cfg(test)]
 mod pauses_de_fond_tests;
+
+#[cfg(test)]
+mod scan_cue_heritage_6459_tests;
 
 #[cfg(test)]
 mod aleatoire_selection_5526_tests;

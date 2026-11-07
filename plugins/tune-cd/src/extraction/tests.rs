@@ -173,6 +173,14 @@ struct Banc {
 
 impl Banc {
     fn new(lecteur: Arc<dyn LecteurDisque>, c: Arc<dyn Consultation>) -> Banc {
+        Banc::avec_espace_libre(lecteur, c, super::destination::espace_libre)
+    }
+
+    fn avec_espace_libre(
+        lecteur: Arc<dyn LecteurDisque>,
+        c: Arc<dyn Consultation>,
+        libre: fn(&Path) -> Option<u64>,
+    ) -> Banc {
         let bib = tempfile::tempdir().unwrap();
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
@@ -188,7 +196,8 @@ impl Banc {
         let bus = tune_core::event_bus::EventBus::new();
         let ex = Arc::new(
             Extractions::new(backend.clone(), Some(bus.clone()), Some(scan.clone()))
-                .avec_pochettes(Arc::new(PochetteFixe)),
+                .avec_pochettes(Arc::new(PochetteFixe))
+                .avec_espace_libre(libre),
         );
         let hote = Arc::new(HoteTemoin::default());
         let routes = EtatRoutes {
@@ -794,4 +803,295 @@ async fn les_routes_d_extraction_exigent_un_administrateur() {
 
     assert!(verdict_admin(false, None).is_ok());
     assert!(verdict_admin(true, admin().as_ref()).is_ok());
+}
+
+#[tokio::test]
+async fn le_cd_arrete_s_extrait_sans_detour_et_la_pause_le_reserve_encore_7104() {
+    use crate::hote::HoteOrchestrateur;
+    use tune_core::http::streamer::AudioStreamer;
+    use tune_core::orchestrator::PlaybackOrchestrator;
+    use tune_core::outputs::registry::OutputRegistry;
+    use tune_core::playback::{NowPlaying, PlayState, PlaybackManager};
+    use tune_core::streaming::registry::ServiceRegistry;
+
+    let lecteur = Arc::new(LecteurSimule::new(petite_toc()));
+    let mut banc = Banc::new(lecteur, Arc::new(SansReseau));
+    let playback = Arc::new(PlaybackManager::new());
+    let orch = Arc::new(PlaybackOrchestrator::new(
+        banc.backend.clone(),
+        playback.clone(),
+        Arc::new(AudioStreamer::new(0)),
+        Arc::new(tokio::sync::Mutex::new(ServiceRegistry::new())),
+        Arc::new(tokio::sync::Mutex::new(OutputRegistry::new())),
+        None,
+    ));
+    banc.routes.hote = Arc::new(HoteOrchestrateur {
+        backend: banc.backend.clone(),
+        orchestrator: orch,
+        playback: playback.clone(),
+    });
+    let zone = 7104;
+    banc.routes.zones.lock().await.insert(zone);
+    // Le vrai gestionnaire conserve ce CD dans now_playing après Stop.
+    // Aucune sortie n'est ouverte : seule l'extraction du lecteur simulé
+    // écrit des octets dans la bibliothèque temporaire du banc.
+    playback
+        .play(
+            zone,
+            NowPlaying {
+                source: SOURCE.into(),
+                source_id: Some("disque-7104/1".into()),
+                title: "CD arrêté".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    let demande = json!({"format":"wav", "pistes":[1]});
+    for pause in [false, true] {
+        if pause {
+            playback.pause(zone).await;
+        }
+        let (code, refus) = banc
+            .appel("POST", "/extractions", Some(demande.clone()))
+            .await;
+        assert_eq!(
+            code,
+            StatusCode::CONFLICT,
+            "le CD actif ou en pause doit rester réservé : {refus}"
+        );
+        assert_eq!(refus["error"], "lecture_en_cours");
+        assert!(banc.ex.liste().is_empty());
+    }
+    playback.stop(zone).await;
+    let arrete = playback.get_state(zone).await;
+    assert_eq!(arrete.state, PlayState::Stopped);
+    assert_eq!(
+        arrete.now_playing.unwrap().source,
+        SOURCE,
+        "la reprise garde bien le morceau après Stop"
+    );
+    let (code, extraction) = banc.appel("POST", "/extractions", Some(demande)).await;
+    assert_eq!(
+        code,
+        StatusCode::ACCEPTED,
+        "#7104 : après Stop, le CD conservé pour la reprise ne doit plus bloquer l'extraction : {extraction}"
+    );
+    let fin = banc.attendre(extraction["id"].as_str().unwrap()).await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+    assert_eq!(fin["pistes"][0]["statut"], "terminee");
+    assert!(Path::new(fin["pistes"][0]["fichier"].as_str().unwrap()).is_file());
+}
+
+// ─── #7105 : écrire dans un dossier local, ou dire pourquoi c'est impossible ─
+
+/// `true` si le compte qui lance les tests passe outre les droits (root) :
+/// un dossier en 0o555 ne lui refuse rien, le témoin ne prouverait rien.
+#[cfg(unix)]
+fn passe_outre_les_droits(dossier: &Path) -> bool {
+    let essai = dossier.join(".essai-root");
+    let ok = std::fs::write(&essai, b"x").is_ok();
+    let _ = std::fs::remove_file(&essai);
+    ok
+}
+
+/// #7105 — un dossier local où le serveur n'a pas le droit d'écrire : la
+/// demande est refusée AVANT toute lecture, et la réponse nomme la cause et
+/// le chemin (plus de 202 suivi de « vérifiez l'espace disque et les
+/// droits »). Le même dossier rendu inscriptible : l'extraction aboutit.
+#[cfg(unix)]
+#[tokio::test]
+async fn un_dossier_local_sans_droit_d_ecriture_est_refuse_en_nommant_la_cause_7105() {
+    use std::os::unix::fs::PermissionsExt;
+    let lecteur = simule();
+    let banc = Banc::new(lecteur.clone(), Arc::new(SansReseau));
+    let media = banc.racine().join("media");
+    std::fs::create_dir(&media).unwrap();
+    std::fs::set_permissions(&media, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if passe_outre_les_droits(&media) {
+        std::fs::set_permissions(&media, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("témoin #7105 sans objet : le compte des tests passe outre les droits (root)");
+        return;
+    }
+    let dest = media.to_string_lossy().to_string();
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "destination": dest, "pistes": [1] })),
+        )
+        .await;
+    std::fs::set_permissions(&media, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["error"], "ecriture", "{v}");
+    assert_eq!(v["cause"], "droits_refuses", "{v}");
+    assert_eq!(v["chemin"], dest.as_str(), "{v}");
+    let message = v["message"].as_str().unwrap();
+    assert!(
+        message.contains(&dest),
+        "le message nomme le chemin : {message}"
+    );
+    assert!(message.contains("n'a pas le droit d'écrire"), "{message}");
+    assert_eq!(lecteur.appels(), 0, "aucun secteur lu");
+    let (_, l) = banc.appel("GET", "/extractions", None).await;
+    assert_eq!(l["extractions"], json!([]), "rien n'est lancé");
+    assert_eq!(
+        std::fs::read_dir(&media).unwrap().count(),
+        0,
+        "le contrôle ne laisse rien"
+    );
+
+    // Le même dossier local, inscriptible : l'extraction aboutit.
+    let fin = banc
+        .extraire(json!({ "destination": dest, "pistes": [1] }))
+        .await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+    assert!(
+        media
+            .join("Artiste inconnu/Album inconnu/01 - Piste 01.flac")
+            .exists()
+    );
+    assert!(
+        std::fs::read_dir(media.join("Artiste inconnu/Album inconnu"))
+            .unwrap()
+            .all(|f| !f
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tune-essai")),
+        "aucun fichier témoin oublié"
+    );
+}
+
+/// #7105 — un disque sans assez de place : refus avant de lancer, qui dit
+/// la place nécessaire, la place libre et le chemin.
+#[tokio::test]
+async fn un_disque_sans_assez_de_place_est_refuse_en_nommant_la_cause_7105() {
+    let lecteur = simule();
+    let banc = Banc::avec_espace_libre(lecteur.clone(), Arc::new(SansReseau), |_| Some(2_000_000));
+    let (code, v) = banc.appel("POST", "/extractions", Some(json!({}))).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["error"], "ecriture", "{v}");
+    assert_eq!(v["cause"], "espace_insuffisant", "{v}");
+    let racine = banc.racine().to_string_lossy().to_string();
+    assert_eq!(v["chemin"], racine.as_str(), "{v}");
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains(&racine), "{message}");
+    assert!(message.contains("il en reste 2 Mo"), "{message}");
+    assert_eq!(lecteur.appels(), 0, "aucun secteur lu");
+
+    // Assez de place : l'extraction part.
+    let banc = Banc::avec_espace_libre(simule(), Arc::new(SansReseau), |_| Some(u64::MAX));
+    let fin = banc.extraire(json!({ "pistes": [1] })).await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+}
+
+/// #7105 — une écriture qui échoue PENDANT l'extraction (droits retirés
+/// après le contrôle) : l'erreur de l'extraction porte la cause et le
+/// chemin, plus seulement le texte du système.
+#[cfg(unix)]
+#[test]
+fn une_ecriture_refusee_pendant_l_extraction_nomme_sa_cause_et_son_chemin_7105() {
+    use super::travail::{Plan, executer};
+    use super::{EtatTravail, Format, StatutTravail, Travail, Verification};
+    use std::os::unix::fs::PermissionsExt;
+    let bib = tempfile::tempdir().unwrap();
+    let media = bib.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    std::fs::set_permissions(&media, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if passe_outre_les_droits(&media) {
+        std::fs::set_permissions(&media, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("témoin #7105 sans objet : le compte des tests passe outre les droits (root)");
+        return;
+    }
+    let dossier = media.join("Artiste").join("Album");
+    let plan = Plan {
+        lecteur: simule(),
+        generation: 0,
+        format: Format::Flac,
+        verification: Verification::default(),
+        ecraser: false,
+        dossier: dossier.clone(),
+        pistes: Vec::new(),
+        pochette: None,
+    };
+    let travail = Travail::new(EtatTravail {
+        id: "t7105".into(),
+        statut: StatutTravail::EnCours,
+        format: Format::Flac,
+        verification: Verification::default(),
+        lecteur: String::new(),
+        disc_id: String::new(),
+        metadonnees: "repli",
+        artiste: String::new(),
+        album: String::new(),
+        disque: 1,
+        disques: 1,
+        destination: media.to_string_lossy().to_string(),
+        dossier: dossier.to_string_lossy().to_string(),
+        pistes: Vec::new(),
+        piste_courante: None,
+        pourcentage: 0.0,
+        debut: 0,
+        fin: None,
+        erreur: None,
+        scan: None,
+    });
+    let err = executer(&plan, &travail, &|| {}).unwrap_err();
+    std::fs::set_permissions(&media, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(err.code, "ecriture");
+    assert_eq!(err.cause, Some("droits_refuses"), "{err:?}");
+    assert_eq!(err.chemin.as_deref(), Some(dossier.to_str().unwrap()));
+    assert!(
+        err.message.contains(dossier.to_str().unwrap()),
+        "{}",
+        err.message
+    );
+    let json = serde_json::to_value(&err).unwrap();
+    assert_eq!(json["cause"], "droits_refuses");
+}
+
+/// #7105 — chaque erreur du système reçoit sa cause : droit refusé,
+/// lecture seule, disque ou quota plein, dossier absent.
+#[test]
+fn les_erreurs_d_ecriture_sont_classees_par_cause_7105() {
+    use super::destination::{cause_d_ecriture, message_d_ecriture};
+    use std::io::{Error, ErrorKind};
+    assert_eq!(
+        cause_d_ecriture(&Error::from(ErrorKind::PermissionDenied)),
+        "droits_refuses"
+    );
+    assert_eq!(
+        cause_d_ecriture(&Error::from(ErrorKind::NotFound)),
+        "dossier_introuvable"
+    );
+    assert_eq!(cause_d_ecriture(&Error::other("x")), "autre");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(
+            cause_d_ecriture(&Error::from_raw_os_error(13)),
+            "droits_refuses"
+        );
+        assert_eq!(
+            cause_d_ecriture(&Error::from_raw_os_error(30)),
+            "lecture_seule"
+        );
+        assert_eq!(
+            cause_d_ecriture(&Error::from_raw_os_error(28)),
+            "espace_insuffisant"
+        );
+        assert_eq!(
+            cause_d_ecriture(&Error::from_raw_os_error(122)),
+            "espace_insuffisant"
+        );
+    }
+    let chemin = Path::new("/media/Artiste/Album");
+    let m = message_d_ecriture(
+        "espace_insuffisant",
+        chemin,
+        &Error::from(ErrorKind::StorageFull),
+    );
+    assert!(
+        m.contains("/media/Artiste/Album") && m.contains("plus de place"),
+        "{m}"
+    );
 }

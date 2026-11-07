@@ -136,7 +136,7 @@ tar xzf "$TARBALL" -C "${STAGE}/opt/tune"
 [[ -f "${STAGE}/opt/tune/web/index.html" ]] || die "web/index.html absent de l'archive"
 
 chmod 0755 "${STAGE}/opt/tune/tune-server"
-for extra in airplay-daemon ffmpeg; do
+for extra in airplay-daemon ffmpeg librespot; do
     if [[ -f "${STAGE}/opt/tune/${extra}" ]]; then
         chmod 0755 "${STAGE}/opt/tune/${extra}"
     fi

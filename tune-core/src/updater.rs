@@ -297,10 +297,10 @@ impl UpdateChecker {
                 self.fetch_releases_json(GITHUB_RELEASES_URL).await
             }
         };
-        if let Ok(releases) = &liste {
-            if let Some(data) = release_par_version(releases, version) {
-                return Ok(Some(release_info_depuis_json(data)));
-            }
+        if let Ok(releases) = &liste
+            && let Some(data) = release_par_version(releases, version)
+        {
+            return Ok(Some(release_info_depuis_json(data)));
         }
         let url = format!(
             "https://api.github.com/repos/renesenses/tune-server-rust/releases/tags/v{}",

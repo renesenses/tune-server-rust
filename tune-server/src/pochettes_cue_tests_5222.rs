@@ -111,7 +111,13 @@ impl Banc {
 
     /// `cover` : le geste a touché `cover.jpg` (le surveillant en reçoit
     /// l'événement).
+    #[allow(clippy::await_holding_lock)]
     async fn passer_avec(&self, passe: Passe, cover: bool) {
+        // Ces aides #5034 supposent que l'appelant tient le verrou des scans.
+        // Sans lui, les passes CUE prennent le droit global pendant que #6729
+        // vérifie que son scan ciblé a fini. Garder le verrou jusqu'au retour
+        // de la passe, qui attend aussi la restitution du droit de scanner.
+        let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
         match passe {
             Passe::Rapide => scan_manuel(&self.etat, false, None).await,
             Passe::Repertoires => scan_manuel(&self.etat, false, self.image.parent()).await,
@@ -208,6 +214,50 @@ async fn cue_pochette_televersee_reste_protegee_5222() {
             COVER,
             SourcePochette::Televersee,
             "une pochette téléversée doit rester protégée",
+        );
+    }
+}
+
+/// L'interférence de #6729, sans ordonnanceur favorable ni délai : un autre
+/// témoin tient le verrou des scans, puis on sonde UNE fois la vraie passe
+/// CUE. Elle doit attendre le verrou avant de démarrer son scan global.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn les_passes_cue_attendent_le_verrou_des_scans_6729() {
+    use std::task::Poll;
+    for passe in [
+        Passe::Rapide,
+        Passe::Repertoires,
+        Passe::Complete,
+        Passe::Demarrage,
+    ] {
+        let seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+        crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+        let b = Banc::nouveau(&format!("cue-isolement-{passe:?}-6729"), Some(JAQUETTE));
+        // Même si le scan est très rapide, il ne peut pas finir entre le
+        // sondage de la future et le constat du droit : sa transaction attend
+        // cette porte. On force un entrelacement, jamais une fenêtre de temps.
+        let ecriture = crate::sqlite_write_gate::user_queue().await;
+        let mut travail = std::pin::pin!(b.passer(passe));
+        let en_attente = std::future::poll_fn(|cx| {
+            Poll::Ready(std::future::Future::poll(travail.as_mut(), cx).is_pending())
+        })
+        .await;
+        let droit_pris = crate::routes::system::scan::droit_de_scanner_tenu();
+        drop(ecriture);
+        drop(seul);
+        // Toujours terminer la tâche lancée, même quand la contre-épreuve
+        // constate l'interférence : aucun scan ne fuit vers le test suivant.
+        if en_attente {
+            travail.await;
+        }
+        assert!(
+            en_attente,
+            "#6729 : la passe {passe:?} doit attendre le verrou du témoin voisin"
+        );
+        assert!(
+            !droit_pris,
+            "#6729 : la passe CUE {passe:?} a pris le droit de scanner sous le verrou du témoin voisin"
         );
     }
 }

@@ -128,3 +128,8 @@ pub const SINK_DENON: &str = "http-get:*:audio/L16;rate=44100;channels=1:*,\
 pub const SINK_MUET_SUR_LES_CANAUX: &str = "http-get:*:audio/flac:*,\
                                         http-get:*:audio/wav:*,\
                                         http-get:*:audio/mpeg:*";
+
+/// Annonce synthétique : contrairement au relevé Denon, le FLAC lui-même
+/// déclare une limite stéréo. Elle éprouve le repli et son journal.
+pub const SINK_FLAC_STEREO: &str = "http-get:*:audio/L16;rate=44100;channels=2:*,\
+http-get:*:audio/flac;channels=2:*";

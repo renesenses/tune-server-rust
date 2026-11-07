@@ -1256,13 +1256,19 @@ pub struct PlaybackOrchestrator {
     /// left None in tests → no gating). Enforced at zone activation in `play`.
     pub license: Option<Arc<crate::license::LicenseManager>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
+    browser_next: navigateur_suivante_5975::PreparationsNavigateur,
     /// #3365 — la qualité annoncée de la piste pré-armée, rangée à côté de
     /// `gapless_sessions` et reprise par `advance_queue_metadata` quand la
     /// zone adopte ce flux. Carte annexe plutôt qu'un changement de forme de
     /// `gapless_sessions`, dont vit l'épreuve de #3442.
     qualites_pre_armees: Mutex<HashMap<i64, QualitePreArmee>>,
     pub prefetch: Arc<PrefetchEngine>,
+    preparations_fichiers: std::sync::Mutex<HashMap<i64, preparation_fichier_7247::Preparation>>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
+    /// #6910 — renderers DLNA qui ont lâché un suivant DSD armé (acquitté,
+    /// jamais suivi : HiFi Rose RS130, #402). La garde DSD leur est rendue
+    /// pour la vie du processus.
+    appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Cache of MIME types that each DLNA renderer does NOT support.
     /// Key: device_id, Value: set of unsupported MIME types (e.g. "audio/flac").
     /// Only negative results are cached — if a MIME is not in the set, it's
@@ -1272,20 +1278,20 @@ pub struct PlaybackOrchestrator {
     /// `device_id|profondeur`. Les sondes inconcluantes n'y entrent pas.
     dlna_lpcm_accepte: Mutex<HashMap<String, bool>>,
     /// #4573 — ce que le Sink du renderer ANNONCE en nombre de canaux, par
-    /// `device_id`. `Some(None)` veut dire « le Sink a été lu, il ne porte
+    /// `(device_id, mime)`. `Some(None)` veut dire « le Sink a été lu, il ne porte
     /// aucun `channels=` » : une ignorance MESURÉE, qui ne fait rien réduire
     /// mais qu'il est inutile de re-sonder à chaque piste. Une sonde
     /// INCONCLUANTE (SOAP en échec, Sink vide) n'entre jamais dans cette
     /// table — même règle que `dlna_lpcm_accepte` : un renderer endormi au
     /// démarrage ne doit pas se voir coller un verdict pour la session.
-    dlna_canaux_max: Mutex<HashMap<String, Option<u16>>>,
+    dlna_canaux_max: Mutex<HashMap<(String, String), Option<u16>>>,
     /// Zones dont une résolution gapless est en cours : les sessions créées
     /// pendant cette fenêtre pré-chargent la piste SUIVANTE — leur attacher
     /// un forwarder de niveaux daterait les fenêtres avec l'horloge de la
     /// piste courante (stamps d'une piste sur la position d'une autre). Les
     /// niveaux de la piste suivante démarrent à l'avance gapless, voir
     /// [`Self::advance_queue_metadata`]. Verrou std : accès courts.
-    levels_prewarm: std::sync::Mutex<std::collections::HashSet<i64>>,
+    levels_prewarm: std::sync::Mutex<std::collections::HashMap<i64, usize>>,
     /// #5050 (fil 2236) — zones posées en pause par un transfert, sans que
     /// rien n'ait été envoyé à leur appareil : leur reprise rétablit la piste
     /// à la position (voir `transfert_en_pause_5050`). Verrou std : accès
@@ -1348,6 +1354,11 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+    /// #7852 — l'écoute armée au démarrage du titre de chaque zone, écrite
+    /// par le sondeur au seuil min(30 s, 50 %). Voir `ecoute_validee_7852`.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    ecoutes_en_attente: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEnAttente>>,
     /// #6066 — ce que les LECTEURS des zones navigateur ont dit de leur
     /// lecture (`POST /zones/{id}/browser-playing`). Voir
     /// `confirmation_navigateur_6066`.
@@ -1409,6 +1420,10 @@ pub struct PlaybackOrchestrator {
     pub(crate) sources_physiques: Arc<crate::sources_physiques::RegistreSources>,
     /// #5662 — les files de volume par (sortie, zone) : voir `volume_coalescent`.
     pub(crate) volume_coalesceur: volume_coalescent::CoalesceurDeVolume,
+    /// #6721 — le dernier niveau connu de l'appareil de chaque zone : le
+    /// repère de la garde contre les montées brusques ne le dépasse jamais.
+    /// Voir `repere_de_hausse_6721`.
+    pub(crate) niveaux_des_appareils: repere_de_hausse_6721::NiveauxDesAppareils,
     /// #2264 — la mémoire de la règle de version : choix explicites en
     /// attente, réponses des services. Voir `version_de_lecture`.
     pub(crate) versions: version_de_lecture::EtatDesVersions,
@@ -1443,16 +1458,19 @@ struct AnnonceNavigateurDifferee {
 
 /// Portée RAII de la résolution gapless d'une zone (voir `levels_prewarm`).
 struct LevelsPrewarmScope<'a> {
-    set: &'a std::sync::Mutex<std::collections::HashSet<i64>>,
+    set: &'a std::sync::Mutex<std::collections::HashMap<i64, usize>>,
     zone_id: i64,
 }
 
 impl Drop for LevelsPrewarmScope<'_> {
     fn drop(&mut self) {
-        self.set
-            .lock()
-            .expect("levels_prewarm lock")
-            .remove(&self.zone_id);
+        let mut comptes = self.set.lock().expect("levels_prewarm lock");
+        if let Some(nombre) = comptes.get_mut(&self.zone_id) {
+            *nombre -= 1;
+            if *nombre == 0 {
+                comptes.remove(&self.zone_id);
+            }
+        }
     }
 }
 
@@ -1520,6 +1538,7 @@ impl PlayResult {
     }
 }
 
+#[derive(Clone)]
 pub struct ResolvedStream {
     pub url: String,
     pub mime_type: String,
@@ -1562,6 +1581,7 @@ pub struct ResolvedStream {
     pub format_source: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ResolvedQueueItem {
     pub url: String,
     pub mime_type: String,
@@ -1638,6 +1658,10 @@ struct StreamingDsp {
     /// #4407 — le poste où la route dépose un nouvel égaliseur, relevé au
     /// bloc suivant (voir [`eq_en_vol::EqEnVol`]). `None` : aucun.
     en_vol: Option<std::sync::Arc<eq_en_vol::EqEnVol>>,
+    /// #7642 — trames de l'amorce de latence du convolveur encore à retirer
+    /// du flux ([`Self::process_flux`]). `None` tant que le flux n'a pas
+    /// commencé : la première trame est armée à `latency_frames()`.
+    convolveur_reste_a_jeter: Option<usize>,
 }
 
 impl StreamingDsp {
@@ -1737,6 +1761,11 @@ impl StreamingDsp {
         if let Some(conv) = self.convolver.as_mut() {
             conv.process_pcm(pcm, bit_depth);
         }
+        self.etages_apres_convolveur(pcm, bit_depth);
+    }
+
+    /// Les étages qui suivent le convolveur, dans l'ordre de [`Self::process`].
+    fn etages_apres_convolveur(&mut self, pcm: &mut [u8], bit_depth: u16) {
         // Le crossfeed en DERNIER, comme sur la sortie locale, où il est
         // appliqué après le convolveur (`local.rs`) : il élargit ou resserre
         // l'image d'un signal déjà corrigé, il ne corrige pas.
@@ -1748,6 +1777,53 @@ impl StreamingDsp {
         if let Some(comp) = self.compensation.as_mut() {
             comp.process_pcm(pcm, bit_depth);
         }
+    }
+
+    /// #7642 — [`Self::process`] pour un flux livré en tampons SUCCESSIFS
+    /// (relais du bras progressif).
+    ///
+    /// `process` convient à un appel unique sur la piste entière (bras DASH
+    /// et HTTPS) ; enchaîné tampon après tampon, son convolveur, traité comme
+    /// une piste entière à chaque appel, coupait la queue de l'IR à chaque
+    /// frontière (voir `Convolver::process_pcm_en_flux`). Ici le convolveur
+    /// garde son état d'un tampon à l'autre ; le tampon peut raccourcir au
+    /// début du flux, et [`Self::terminer_flux`] rend la fin retenue. Sans
+    /// convolveur, identique à `process` octet pour octet.
+    fn process_flux(&mut self, pcm: &mut Vec<u8>, bit_depth: u16) {
+        let Some(conv) = self.convolver.as_mut() else {
+            self.process(pcm, bit_depth);
+            return;
+        };
+        let reste = self
+            .convolveur_reste_a_jeter
+            .get_or_insert_with(|| conv.latency_frames());
+        // Les étages d'avant le convolveur, dans l'ordre de `process`.
+        if let Some(poste) = self.en_vol.as_ref() {
+            poste.relever(&mut self.eq, self.sample_rate, self.channels);
+        }
+        if let Some(factor) = self.replaygain {
+            crate::audio::replaygain::apply_gain_pcm(pcm, bit_depth, factor);
+        }
+        if let Some(eq) = self.eq.as_mut() {
+            eq.process_pcm(pcm, bit_depth);
+        }
+        conv.process_pcm_en_flux(pcm, bit_depth, reste);
+        self.etages_apres_convolveur(pcm, bit_depth);
+    }
+
+    /// #7642 — fin du flux de [`Self::process_flux`] : les trames que la
+    /// latence du convolveur retenait encore, passées par les étages qui le
+    /// suivent. Vide sans convolveur.
+    fn terminer_flux(&mut self, bit_depth: u16) -> Vec<u8> {
+        let Some(conv) = self.convolver.as_mut() else {
+            return Vec::new();
+        };
+        let reste = self
+            .convolveur_reste_a_jeter
+            .get_or_insert_with(|| conv.latency_frames());
+        let mut queue = conv.terminer_pcm_en_flux(bit_depth, reste);
+        self.etages_apres_convolveur(&mut queue, bit_depth);
+        queue
     }
 }
 
@@ -1791,6 +1867,7 @@ fn spawn_streaming_dsp_relay_releve(
     let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     tokio::spawn(async move {
         let mut header_pending = skip_header;
+        let mut complet = true;
         while let Some(mut chunk) = up_rx.recv().await {
             if header_pending {
                 header_pending = false;
@@ -1802,10 +1879,24 @@ fn spawn_streaming_dsp_relay_releve(
                     None => r.relever(&chunk, &chunk),
                 }
             } else {
-                dsp.process(&mut chunk, bit_depth);
+                // #7642 — tampons SUCCESSIFS d'un même flux : l'état du
+                // convolveur doit passer d'un tampon à l'autre.
+                dsp.process_flux(&mut chunk, bit_depth);
+                if chunk.is_empty() {
+                    // Tout le tampon était l'amorce de latence du convolveur.
+                    continue;
+                }
             }
             if downstream.send(chunk).await.is_err() {
+                complet = false;
                 break;
+            }
+        }
+        // Fin du flux amont : rendre ce que le convolveur retenait encore.
+        if complet && !header_pending {
+            let queue = dsp.terminer_flux(bit_depth);
+            if !queue.is_empty() {
+                let _ = downstream.send(queue).await;
             }
         }
     });
@@ -1831,13 +1922,18 @@ impl PlaybackOrchestrator {
             event_bus: None,
             license: None,
             gapless_sessions: Mutex::new(HashMap::new()),
+            browser_next: Mutex::new(HashMap::new()),
             qualites_pre_armees: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
+            preparations_fichiers: Default::default(),
             dsd_capabilities: Mutex::new(HashMap::new()),
+            appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            ),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
             dlna_canaux_max: Mutex::new(HashMap::new()),
-            levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
+            levels_prewarm: std::sync::Mutex::new(std::collections::HashMap::new()),
             transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
             reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1846,6 +1942,7 @@ impl PlaybackOrchestrator {
             eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
+            ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
@@ -1855,6 +1952,7 @@ impl PlaybackOrchestrator {
             sources_url: crate::source_url::SourcesUrl::default(),
             sources_physiques: Arc::default(),
             volume_coalesceur: volume_coalescent::CoalesceurDeVolume::default(),
+            niveaux_des_appareils: Default::default(),
             versions: Default::default(),
         }
     }
@@ -1917,16 +2015,24 @@ impl PlaybackOrchestrator {
 
 mod commun;
 mod confirmation_navigateur_6066;
+pub mod ecoute_validee_7852;
+#[cfg(test)]
+mod ecoute_validee_7852_tests;
 pub use confirmation_navigateur_6066::SignalDuLecteur;
 
 /// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
 mod reenumeration_avant_refus;
 mod transport;
+pub use transport::IssueDePause;
+#[cfg(test)]
+mod pause_sans_media_7894_tests;
 // #2269 — le repli silencieux de la sortie locale, rendu audible.
 #[cfg(feature = "local-audio")]
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #7148 — la sentinelle de streaming : résolution et décodage réels, sans son.
+pub mod sentinelle_streaming;
 // #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.
 mod sortie_de_radio_dlna_6130;
 // #6130 — le contexte d'un flux de conversion, pour son journal.
@@ -1952,6 +2058,8 @@ mod crossfeed_bibliotheque_reseau;
 // #5071 — témoins de bout en bout de la compensation de niveau réseau.
 #[cfg(test)]
 mod compensation_reseau_5071_tests;
+#[cfg(test)]
+mod convolveur_en_flux_7642_tests;
 
 // #4354 — repli à 176,4 kHz d'un DSD décimé qui manque son pré-tampon.
 #[cfg(test)]
@@ -1975,9 +2083,18 @@ mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+mod repere_de_hausse_6721;
+#[cfg(test)]
+mod repere_de_hausse_6721_tests;
 mod volume_coalescent;
 #[cfg(test)]
 mod volume_coalescent_5662_tests;
+// #7633 — le volume OpenHome n'attend plus le relevé du sondeur.
+#[cfg(test)]
+mod volume_openhome_sans_attendre_7633_tests;
+// #7841 — l'échelle de volume OpenHome lue, la sourdine sans le verrou.
+#[cfg(test)]
+mod volume_openhome_echelle_7841_tests;
 pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]
@@ -2000,9 +2117,16 @@ mod eq_en_vol_4407_tests;
 // bibliothèque native de test.
 #[cfg(test)]
 mod greffon_natif_tiers_tests;
+// #7616 — un étage tiers sur zone RÉSEAU : relais `StreamingDsp` et
+// ré-encodage des pistes de la bibliothèque (#2742, cas 1 à 3).
+#[cfg(test)]
+mod greffon_natif_tiers_reseau_7616_tests;
 // #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_6780_tests;
+// #7932 — PURE contourne aussi la réaffectation des canaux de l'album joué.
+#[cfg(all(test, feature = "local-audio"))]
+mod pure_reaffectation_album_7932_tests;
 // #6256 — la désinstallation d'un greffon natif tiers ne rebâtit que les
 // zones qui l'utilisent.
 #[cfg(all(test, feature = "local-audio"))]
@@ -2011,6 +2135,12 @@ mod purge_greffon_tiers_6256_tests;
 // enregistrés, dans l'état que la vraie bascule produit.
 #[cfg(all(test, feature = "local-audio"))]
 mod verdict_pure_reglages_6522_tests;
+// #7632 — la convolution par RI est un droit Premium (RoomCorrection).
+#[cfg(test)]
+mod convolution_sous_licence_7632_tests;
+// #7986 — une RI que le convolveur refusera ne force pas le transcodage.
+#[cfg(test)]
+mod passthrough_sans_traitement_7986_tests;
 
 /// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
 mod duree_du_flux_2062;
@@ -2035,8 +2165,14 @@ mod serveur_source_absent_4362;
 /// `resolve_direct`, pour que les deux ne puissent pas diverger.
 pub mod verdict_upnp;
 
+mod navigateur_suivante_5975;
 mod queue;
 pub use queue::{Enjambee, lignes_bannies_a_enjamber};
+// #7895 — « Suivant » et « Précédent » enjambent les titres refusés par le service.
+mod enjamber_les_refus;
+pub use enjamber_les_refus::{SensDuGeste, message_titres_sautes};
+#[cfg(test)]
+mod enjamber_les_refus_7895_tests;
 
 mod history;
 
@@ -2045,6 +2181,7 @@ pub use bandcamp::*;
 
 /// Fil 2121 — resigner une URL de flux Bandcamp expirée depuis sa page.
 mod bandcamp_resignature;
+pub use bandcamp_resignature::identifiant_de_piste as identifiant_de_piste_bandcamp;
 
 mod qualite_pre_armee;
 pub(crate) use qualite_pre_armee::{
@@ -2207,6 +2344,10 @@ mod mesure_saut_cd_5079;
 mod qobuz_cadence_nulle_5283_tests;
 #[cfg(test)]
 mod tidal_aac_annonce_6334_tests;
+/// #7266 — de bout en bout, un FLAC CD TIDAL en DASH jusqu'au Play reçu par
+/// un faux renderer DLNA : durée de chaque étape et borne du démarrage.
+#[cfg(test)]
+mod tidal_cd_dash_jusqu_au_play_7266;
 
 /// #6401 — le préchargement sans blanc et la sonde de niveaux après une
 /// avance sans blanc passent par le même repli Qobuz en 16/44,1 que la
@@ -2378,6 +2519,10 @@ mod seek_de_reprise_caduc_5476;
 /// renderer qui n'est pas à la position de la pause.
 #[cfg(test)]
 mod seek_de_reprise_conditionnel_5050;
+/// #7422 — fil 2535 : avancer dans un titre Qobuz converti (canal sans
+/// `Range`) sur une zone DLNA recrée le flux à la position.
+#[cfg(test)]
+mod seek_service_sans_range_7422;
 // #5050 (fil 2236) — transfert depuis une zone en pause : la cible est posée
 // en pause sans rien recevoir.
 /// #6466 — l'historique par conteneurs : le conteneur de chaque élément de
@@ -2389,6 +2534,7 @@ mod historique_conteneurs_tests_6466;
 #[cfg(test)]
 mod sortie_de_radio_dlna_6130_tests;
 mod transfert_en_pause_5050;
+pub use transfert_en_pause_5050::ErreurDeTransfert;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).
@@ -2449,3 +2595,8 @@ mod refus_asio_bloque_4556;
 /// ont ete rejoues sur la requete qui l'a pris.
 #[cfg(test)]
 mod refus_amont_4366;
+
+mod preparation_fichier_7247;
+
+#[cfg(test)]
+mod deplacement_qobuz_6982_tests;

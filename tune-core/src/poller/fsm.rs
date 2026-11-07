@@ -140,6 +140,10 @@ pub enum StoppedOutcome {
     /// atteint jusque-là : il joue. Le tour ne compte pas comme un arrêt et
     /// la série en cours est effacée ; voir [`arret_dementi_par_la_position`].
     SuppressPositionAdvancing,
+    /// #7700 — l'appareil DLNA a quitté notre piste en milieu de lecture
+    /// avec de l'audio en main : « suivant » à sa télécommande. Absent de
+    /// [`classify_stopped`], qui ne mesure pas le flux.
+    SuivantDeLAppareil,
 }
 
 impl StoppedOutcome {
@@ -151,6 +155,7 @@ impl StoppedOutcome {
                 | StoppedOutcome::LocalEndedNaturally
                 | StoppedOutcome::DsdDlnaReachedEnd
                 | StoppedOutcome::NaturalEndAdvance
+                | StoppedOutcome::SuivantDeLAppareil
         )
     }
 
@@ -1274,6 +1279,10 @@ use super::{ArmedNext, ZonePollState};
 /// Ce qui fait passer [`EtatDeLecture`] d'une variante à l'autre. Le numéro
 /// est celui de la ligne dans la table du document ; la ligne `tick.rs:`
 /// est le site où `tick` l'appelle.
+// `TransitionDetectee` répète le nom de l'enum, mais ce nom est écrit tel quel
+// dans le journal (`transition_inattendue … transition={t:?}`) et dans la table
+// de docs/refonte/ref9-etats-du-sondeur.md : le renommer changerait les deux.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Transition {
     /// 1 — génération changée : tout est rabattu (bloc

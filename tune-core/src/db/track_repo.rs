@@ -190,6 +190,10 @@ pub fn plage_du_dossier(engine: Engine, expr: &str, p_bas: &str, p_haut: &str) -
 /// Le repli de clé n'est pas cosmétique : il est ce qui rend le résultat
 /// **identique** à la boucle de `COUNT(*) … LIKE` qu'il remplace, moteur par
 /// moteur. Voir la note « La casse » de [`compter_pistes_par_sous_dossier`].
+/// `(file_path, album_artist, artiste de la piste)` d'une piste voisine
+/// (voir [`TrackRepo::siblings_album_artists`]).
+pub type ArtistesDeVoisin = (String, Option<String>, Option<String>);
+
 #[derive(Debug, Default, Clone)]
 pub struct ComptesParSousDossier {
     comptes: HashMap<String, i64>,
@@ -618,6 +622,39 @@ pub fn derive_common_root(backend: &dyn DbBackend) -> Option<String> {
     (!root.is_empty()).then(|| root.to_string())
 }
 
+/// #7597 — l'ordre de lecture d'un dossier lu en entier : `(chemin, disque,
+/// piste)` de deux pistes. Le dossier parent d'abord, composant par composant
+/// en tri naturel (celui de la vue Répertoires), puis le disque, la piste, et
+/// le nom de fichier en tri naturel. Les deux séparateurs sont reconnus : le
+/// chemin est celui qu'a écrit l'hôte qui a scanné.
+pub fn ordre_de_lecture_du_dossier(
+    a: (&str, Option<i64>, Option<i64>),
+    b: (&str, Option<i64>, Option<i64>),
+) -> std::cmp::Ordering {
+    fn decouper(chemin: &str) -> (Vec<&str>, &str) {
+        let mut morceaux: Vec<&str> = chemin
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty())
+            .collect();
+        let fichier = morceaux.pop().unwrap_or("");
+        (morceaux, fichier)
+    }
+    let (dossier_a, fichier_a) = decouper(a.0);
+    let (dossier_b, fichier_b) = decouper(b.0);
+    let mut ordre = std::cmp::Ordering::Equal;
+    for (x, y) in dossier_a.iter().zip(dossier_b.iter()) {
+        ordre = crate::upnp_server::comparer_naturel(x, y);
+        if ordre.is_ne() {
+            break;
+        }
+    }
+    ordre
+        .then_with(|| dossier_a.len().cmp(&dossier_b.len()))
+        .then_with(|| a.1.cmp(&b.1))
+        .then_with(|| a.2.cmp(&b.2))
+        .then_with(|| crate::upnp_server::comparer_naturel(fichier_a, fichier_b))
+}
+
 /// Longest common (char-boundary-safe) prefix of two strings.
 pub(crate) fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
     let mut end = 0;
@@ -681,6 +718,13 @@ mod like_escape_tests {
     }
 }
 
+/// #7619 (L1) — la clé de tri pré-calculée et le curseur de la liste.
+pub mod cle_de_tri;
+/// Modifier un champ sur tout le résultat d'un filtre d'Oxygen (#7539).
+mod edition_par_filtre;
+/// Poser ou retirer une étiquette sur tout le résultat d'un filtre d'Oxygen
+/// (#7128).
+mod etiquetage_par_filtre;
 /// Engine-agnostic SQL builders for track_repo.
 ///
 /// Complex dynamic queries (search() FTS5, list_doubtful() aggregate,
@@ -690,6 +734,13 @@ mod like_escape_tests {
 /// La liste des pistes paginée côté serveur, triée et comptée par
 /// provenance (tune-web-client#1716).
 mod page_de_pistes;
+pub use edition_par_filtre::{
+    ChampDeMasse, Exemple, FichierAEcrire, PLAFOND_EDITION_PAR_FILTRE, PlanEdition, RefusEdition,
+    ValeurDeMasse, valider_valeur,
+};
+pub use etiquetage_par_filtre::{
+    BilanEtiquetage, CibleDuFiltre, PLAFOND_ETIQUETAGE_PAR_FILTRE, RefusEtiquetage,
+};
 pub use page_de_pistes::{
     COLONNES_TRIABLES, ColonneDeTri, ComptesParProvenance, DemandeDePistes, PageDePistes,
     expression_provenance, expression_provenance_de,
@@ -2076,11 +2127,13 @@ fn maintenant_epoch() -> f64 {
 ///
 /// #4546 tient : la ligne n'est écrite QU'UNE fois (`INSERT OR IGNORE` /
 /// `ON CONFLICT DO NOTHING`), une retouche ultérieure ne la change plus.
+// Seuls les témoins la lisent seule ; la production passe par `dates_du_fichier`.
+#[cfg(test)]
 fn premiere_vue_du_fichier(chemin: &str, mtime_du_scan: Option<f64>, maintenant: f64) -> f64 {
     dates_du_fichier(chemin, mtime_du_scan, maintenant).0
 }
 
-/// La première vue ([`premiere_vue_du_fichier`]) et la date de CRÉATION d'un
+/// La première vue (`premiere_vue_du_fichier`) et la date de CRÉATION d'un
 /// fichier, d'une seule lecture du disque (#5402).
 ///
 /// La création est le btime tel quel, borné à `maintenant` ; `None` quand le
@@ -2168,17 +2221,21 @@ impl TrackRepo {
             .query_one(&sql, &params)
             .map_err(TuneError::Db)?
             .as_ref()
-            .map(row_to_track))
+            .map(|cols| row_to_track(cols)))
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Track>, TuneError> {
-        self.get_inner(id).map_err(TuneError::from)
+        self.get_inner(id)
     }
 
     pub fn get_by_path(&self, file_path: &str) -> Result<Option<Track>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
         let params: [&dyn ToSqlValue; 1] = [&file_path];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_track(cols)))
     }
 
     /// Le dossier `dossier` contient-il au moins une piste, à n'importe quelle
@@ -2359,7 +2416,7 @@ impl TrackRepo {
         );
         let params: [&dyn ToSqlValue; 3] = [&d.motif, &d.separateur, &d.prefixe];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     fn marqueurs2(&self) -> (&'static str, &'static str) {
@@ -2397,7 +2454,11 @@ impl TrackRepo {
     ) -> Result<Option<Track>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_cue_identity, sql::get_by_cue_identity);
         let params: [&dyn ToSqlValue; 2] = [&cue_media_path, &cue_start_ms];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_track(cols)))
     }
 
     /// Les fichiers image que les pistes CUE de la base référencent.
@@ -2502,7 +2563,7 @@ impl TrackRepo {
     }
 
     pub fn create(&self, track: &Track) -> Result<i64, TuneError> {
-        self.create_inner(track).map_err(TuneError::from)
+        self.create_inner(track)
     }
 
     fn update_inner(&self, track: &Track) -> Result<(), TuneError> {
@@ -2564,7 +2625,7 @@ impl TrackRepo {
     }
 
     pub fn update(&self, track: &Track) -> Result<(), TuneError> {
-        self.update_inner(track).map_err(TuneError::from)
+        self.update_inner(track)
     }
 
     /// [`Self::update`] d'une piste DISTANTE (b209) : les numéros de disque et
@@ -2713,7 +2774,7 @@ impl TrackRepo {
         );
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// Chemin NON facetté de `GET /library/tracks` : mêmes lignes et même
@@ -2727,7 +2788,7 @@ impl TrackRepo {
         let sql = self.sql_list_visible(&sql::select_track());
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// #5138 — [`Self::list_visible`] ET son total, le `WHERE` évalué UNE fois.
@@ -2778,7 +2839,7 @@ impl TrackRepo {
         )?;
         let mut par_id: HashMap<i64, Track> = hydratees
             .iter()
-            .map(row_to_track)
+            .map(|cols| row_to_track(cols))
             .filter_map(|t| t.id.map(|id| (id, t)))
             .collect();
         Ok(ids.iter().filter_map(|id| par_id.remove(id)).collect())
@@ -2958,12 +3019,10 @@ impl TrackRepo {
             owned_params.push(SqlValue::Text(folder_like_pattern(fld)));
         }
 
-        // Album rating (profile 1): tracks inherit their album's rating.
+        // Note d'album du profil de la requête (#7594) : les pistes héritent
+        // de la note de leur album.
         if let Some(c) = ph.in_list("arr.rating", f.ratings.len()) {
-            conditions.push(format!(
-                "EXISTS (SELECT 1 FROM album_ratings arr \
-                 WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND {c})"
-            ));
+            conditions.push(crate::db::facet_filter::rating_condition(&c, f.profile_id));
             for v in &f.ratings {
                 owned_params.push(SqlValue::Int(*v));
             }
@@ -3016,7 +3075,18 @@ impl TrackRepo {
         // La règle de lecture est celle de la grille d'albums, mot pour mot —
         // voir `facet_filter::dr_album_in`. Le JUMEAU de ce prédicat est dans
         // `facets::build_facet_conditions`.
-        if let Some(c) = ph.in_list(
+        //
+        // #7580 — posé en liste d'albums résolue (carte DR gardée sous le jeton
+        // des données) : la sous-requête relisait tous les tags DR à chaque
+        // page. Même ensemble ; si la carte ne se lit pas, la sous-requête.
+        let dr_resolu = if f.dynamic_ranges.is_empty() {
+            None
+        } else {
+            crate::db::facet_filter::condition_dr_par_albums(self.db.as_ref(), &f.dynamic_ranges)
+        };
+        if let Some(c) = dr_resolu {
+            conditions.push(c);
+        } else if let Some(c) = ph.in_list(
             crate::db::facet_filter::DR_ALBUM_VALUE,
             f.dynamic_ranges.len(),
         ) {
@@ -3026,9 +3096,14 @@ impl TrackRepo {
             }
         }
 
-        // Favoris du profil 1 : la piste elle-même, ou son album. Vocabulaire
+        // Favoris du profil de la requête (#7569) : la piste elle-même, ou son album. Vocabulaire
         // FERMÉ — le SQL est un littéral, jamais l'entrée de la requête.
-        if let Some((c, _)) = combiner(ph, &f.favorites, f.est_en_et("favorite"), bloc_favoris) {
+        if let Some((c, _)) = combiner(
+            ph,
+            &f.favorites,
+            f.est_en_et("favorite"),
+            bloc_favoris(f.profile_id),
+        ) {
             conditions.push(c);
         }
 
@@ -3096,6 +3171,30 @@ impl TrackRepo {
         (conditions, owned_params)
     }
 
+    /// [`Self::conditions_du_filtre`] avec le socle ENSEMBLISTE
+    /// ([`crate::db::facet_filter::socle_ensembliste_de_la_vue_des_pistes`]) au
+    /// lieu des sous-requêtes corrélées — #7619 (L1). Mêmes pistes, et une
+    /// page qui lit l'index de la clé de tri s'arrête à `limit` au lieu
+    /// d'évaluer le socle sur toute la table.
+    pub(crate) fn conditions_du_filtre_ensemblistes(
+        &self,
+        f: &TrackFilter,
+        ph: &mut Placeholders,
+    ) -> (Vec<String>, Vec<SqlValue>) {
+        let engine = self.db.engine();
+        let (mut conditions, valeurs) = self.conditions_du_filtre(f, ph);
+        // Le socle ferme TOUJOURS la liste, et il n'a aucun marqueur : le
+        // remplacer ne décale aucune valeur liée.
+        let socle = crate::db::facet_filter::socle_de_la_vue_des_pistes(engine);
+        let n = conditions.len();
+        if n >= socle.len() && conditions[n - socle.len()..] == socle[..] {
+            conditions.truncate(n - socle.len());
+            conditions
+                .extend(crate::db::facet_filter::socle_ensembliste_de_la_vue_des_pistes(engine));
+        }
+        (conditions, valeurs)
+    }
+
     /// Filtered track listing with optional WHERE clauses.
     ///
     /// **Sémantique des facettes (#2168)** : plusieurs valeurs DANS une facette
@@ -3155,7 +3254,7 @@ impl TrackRepo {
         let all_refs: Vec<&dyn ToSqlValue> =
             all_params.iter().map(|v| v as &dyn ToSqlValue).collect();
         let rows = self.db.query_many(&data_sql, &all_refs)?;
-        Ok((rows.iter().map(row_to_track).collect(), total))
+        Ok((rows.iter().map(|cols| row_to_track(cols)).collect(), total))
     }
 
     pub fn update_mtime_and_size(
@@ -3203,7 +3302,7 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::list_by_album, sql::list_by_album);
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         let rows = self.db.query_many_strong(&sql, &params)?;
-        let mut pistes: Vec<Track> = rows.iter().map(row_to_track).collect();
+        let mut pistes: Vec<Track> = rows.iter().map(|cols| row_to_track(cols)).collect();
         ordonner_pistes_d_un_album(&mut pistes);
         Ok(pistes)
     }
@@ -3255,7 +3354,7 @@ impl TrackRepo {
             .join(",");
         let sql = format!("{} WHERE t.id IN ({id_list})", sql::select_track());
         let rows = self.db.query_many_strong(&sql, &[])?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// Les identifiants de TOUTES les pistes, croissants — l'ensemble exact
@@ -3376,7 +3475,11 @@ impl TrackRepo {
         // Sans elle, un album que la grille rend sous « CD » (FLAC 48 kHz /
         // 16 bits, badge `cd`) s'ouvrirait VIDE sous ce même filtre, l'ancien
         // prédicat exigeant 44,1 kHz pile.
-        if let Some(pred) = quality.and_then(|q| super::models::Album::quality_sql(q, "t")) {
+        // #7725 : sous « Multicanal », seules les pistes de plus de deux canaux.
+        if quality == Some(super::models::Album::QUALITE_MULTICANAL) {
+            let pred = super::models::Album::multicanal_sql_piste("t");
+            extra.push_str(&format!(" AND {pred}"));
+        } else if let Some(pred) = quality.and_then(|q| super::models::Album::quality_sql(q, "t")) {
             extra.push_str(&format!(" AND {pred}"));
         }
         if extra.is_empty() {
@@ -3386,7 +3489,7 @@ impl TrackRepo {
         let sql = base.replacen(" ORDER BY", &format!("{extra} ORDER BY"), 1);
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         let rows = self.db.query_many_strong(&sql, &params)?;
-        let mut pistes: Vec<Track> = rows.iter().map(row_to_track).collect();
+        let mut pistes: Vec<Track> = rows.iter().map(|cols| row_to_track(cols)).collect();
         // #6222 — la décision se prend sur l'album ENTIER : la fiche filtrée
         // est une sous-suite de la fiche, dans le même ordre.
         if pistes.len() > 1 && self.album_entier_en_ordre_de_fichiers(album_id)? {
@@ -3399,7 +3502,7 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
         let params: [&dyn ToSqlValue; 1] = [&artist_id];
         let rows = self.db.query_many_strong(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, TuneError> {
@@ -3445,7 +3548,7 @@ impl TrackRepo {
             &offset,
         ];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// Le nombre de pistes que [`Self::search_page`] parcourrait, borné à
@@ -3475,7 +3578,11 @@ impl TrackRepo {
     pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
         let params: [&dyn ToSqlValue; 1] = [&path];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_track(cols)))
     }
 
     /// `(file_path, album_artist, artiste de la piste)` of every track whose
@@ -3487,7 +3594,7 @@ impl TrackRepo {
     pub fn siblings_album_artists(
         &self,
         dir_prefix: &str,
-    ) -> Result<Vec<(String, Option<String>, Option<String>)>, TuneError> {
+    ) -> Result<Vec<ArtistesDeVoisin>, TuneError> {
         let ph = match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
@@ -3541,7 +3648,7 @@ impl TrackRepo {
         );
         let params: [&dyn ToSqlValue; 2] = [&like, &limit];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     pub fn exists_by_audio_hash_and_album(
@@ -3700,6 +3807,87 @@ impl TrackRepo {
         Ok((ids, total))
     }
 
+    /// #7597 — TOUTES les pistes d'un répertoire et de ses sous-dossiers, dans
+    /// l'ordre de lecture, pour « Tout lire » et « Ajouter à la file » d'un
+    /// dossier : `(ids, total)`.
+    ///
+    /// Ordre : le dossier de la piste (composant par composant, tri naturel,
+    /// celui de la vue Répertoires — un dossier passe donc avant ses
+    /// sous-dossiers, et « CD2 » avant « CD10 »), puis le numéro de disque, le
+    /// numéro de piste, et le nom de fichier. Un numéro absent passe avant un
+    /// numéro présent.
+    ///
+    /// Le sous-arbre est celui de la vue Répertoires : le chemin de la piste
+    /// est [`CHEMIN_DE_LA_PISTE`], pour que les tranches d'une feuille CUE
+    /// (`file_path` NULL, #4625) — que Répertoires affiche — soient lues aussi.
+    /// Le motif est le [`folder_like_pattern`] de `/library/tracks?folder=` et de
+    /// la lecture aléatoire par répertoire, derrière la plage indexée de #5998.
+    ///
+    /// Exclusions : les albums masqués (#1391) et les titres bannis par ce
+    /// profil (#4806), comme le tirage par répertoire.
+    ///
+    /// **Jamais de troncature** : `total` est compté d'abord ; au-delà de
+    /// `plafond`, `ids` est VIDE et c'est à l'appelant de refuser en disant le
+    /// total. Une liste partielle ne sort jamais d'ici.
+    pub fn pistes_du_dossier_dans_l_ordre(
+        &self,
+        profile_id: i64,
+        folder: &str,
+        plafond: i64,
+    ) -> Result<(Vec<i64>, i64), TuneError> {
+        let engine = self.db.engine();
+        let mut ph = Placeholders::new(engine);
+        let chemin = "COALESCE(t.file_path, t.cue_media_path)";
+        let (bas, haut) = bornes_du_dossier(folder);
+        let (p_bas, p_haut) = (ph.take(), ph.take());
+        let p_motif = ph.take();
+        let where_clause = format!(
+            " WHERE {plage} AND {chemin} LIKE {p_motif}{esc} AND {masques} AND {bannis}",
+            plage = plage_du_dossier(engine, chemin, &p_bas, &p_haut),
+            esc = like_escape_clause(),
+            masques = hidden_tracks_excluded(),
+            bannis = banned_tracks_excluded(profile_id),
+        );
+        let params: Vec<SqlValue> = vec![
+            SqlValue::Text(bas),
+            SqlValue::Text(haut),
+            SqlValue::Text(folder_like_pattern(folder)),
+        ];
+        let refs: Vec<&dyn ToSqlValue> = params.iter().map(|v| v as &dyn ToSqlValue).collect();
+        let total = self
+            .db
+            .query_one(
+                &format!("SELECT COUNT(*) FROM tracks t{where_clause}"),
+                &refs,
+            )?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        if total > plafond || total == 0 {
+            return Ok((Vec::new(), total));
+        }
+        let rows = self.db.query_many(
+            &format!(
+                "SELECT t.id, {chemin}, CAST(t.disc_number AS INTEGER), \
+                 CAST(t.track_number AS INTEGER) FROM tracks t{where_clause}"
+            ),
+            &refs,
+        )?;
+        let mut pistes: Vec<(i64, String, Option<i64>, Option<i64>)> = rows
+            .into_iter()
+            .filter_map(|cols| {
+                Some((
+                    cols.first()?.as_i64()?,
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_i64()),
+                    cols.get(3).and_then(|v| v.as_i64()),
+                ))
+            })
+            .collect();
+        pistes.sort_by(|a, b| ordre_de_lecture_du_dossier((&a.1, a.2, a.3), (&b.1, b.2, b.3)));
+        Ok((pistes.into_iter().map(|p| p.0).collect(), total))
+    }
+
     /// Le PRÉDICAT « cette piste est douteuse », partagé par le compte et la
     /// liste — sans quoi la barre de l'écran métadonnées annoncerait un total
     /// que la liste ne peut pas rendre.
@@ -3755,7 +3943,7 @@ impl TrackRepo {
         );
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// Hydrate tracks for `ids`, **in the caller's order**, duplicates kept.
@@ -4239,7 +4427,7 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::list_unidentified, sql::list_unidentified);
         let params: [&dyn ToSqlValue; 1] = [&limit];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     pub fn get_waveform(&self, track_id: i64) -> Result<Option<String>, TuneError> {
@@ -4408,7 +4596,7 @@ impl TrackRepo {
             sql::select_track()
         );
         let rows = self.db.query_many(&sql, &[])?;
-        Ok(rows.iter().map(row_to_track).collect())
+        Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
 
     /// #6168 — la sélection à part qu'annonçait le commentaire ci-dessus :
@@ -4557,7 +4745,13 @@ impl TrackRepo {
     /// clefant sur `(condensat, Option<cue_start_ms>)` (#3998). Cette
     /// fonction-ci n'a pas cette clef ; tant qu'elle ne l'a pas, elle ne doit
     /// pas voir les pistes CUE.
+    ///
+    /// #6917 — option `library_dedup_same_root_only` allumée, une copie ne se
+    /// replie que sur une copie de la MÊME racine de musique
+    /// ([`crate::library::dedoublonnage_par_racine`]) : le disque et le NAS
+    /// gardent chacun leur entrée. Éteinte, rien ne change.
     pub fn deduplicate(&self) -> Result<i64, TuneError> {
+        let racines = crate::library::dedoublonnage_par_racine::racines_si_active(&*self.db);
         let rows = self.db.query_many(
             "SELECT id, audio_hash, file_path FROM tracks \
              WHERE source = 'local' AND audio_hash IS NOT NULL AND file_path IS NOT NULL \
@@ -4583,7 +4777,11 @@ impl TrackRepo {
             let mut representatives: Vec<(i64, String)> = Vec::new();
             for candidate in group {
                 let is_exact_duplicate = representatives.iter().any(|(_, representative)| {
-                    crate::scanner::hasher::files_are_byte_identical(
+                    crate::library::dedoublonnage_par_racine::repliable(
+                        &candidate.1,
+                        representative,
+                        racines.as_deref(),
+                    ) && crate::scanner::hasher::files_are_byte_identical(
                         std::path::Path::new(&candidate.1),
                         std::path::Path::new(representative),
                     )
@@ -4615,7 +4813,7 @@ impl TrackRepo {
     }
 }
 
-fn row_to_track(cols: &Vec<SqlValue>) -> Track {
+fn row_to_track(cols: &[SqlValue]) -> Track {
     Track {
         id: cols.first().and_then(|v| v.as_i64()),
         title: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
@@ -7176,9 +7374,12 @@ pub(crate) mod tests_b209_ordre_dans_l_album {
     use crate::db::sqlite::SqliteDb;
     use crate::db::track_repo::TrackRepo;
 
+    /// `(id, titre, disque, numéro, source)`.
+    pub(crate) type Piste = (i64, &'static str, Option<i64>, Option<i64>, &'static str);
+
     /// `(id, titre, disque, numéro, source)` — un album où disque et numéro
     /// sont tantôt dits, tantôt NULL, tantôt 0.
-    pub(crate) const PISTES: [(i64, &str, Option<i64>, Option<i64>, &str); 6] = [
+    pub(crate) const PISTES: [Piste; 6] = [
         (1, "Alive", Some(1), Some(3), "upnp"),
         (2, "Believer", Some(1), Some(1), "upnp"),
         (3, "Aaa sans numéro", None, None, "upnp"),
@@ -7437,6 +7638,107 @@ mod tests_facettes_en_et_2108 {
             }),
             ["Deux"]
         );
+    }
+}
+
+/// #7569 — le filtre « favoris » de la liste lit les favoris du profil de la
+/// REQUÊTE, pas toujours ceux du profil 1.
+#[cfg(test)]
+mod tests_favoris_du_profil_7569 {
+    use crate::db::facet_filter::TrackFilter;
+    use crate::db::models::Track;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    #[test]
+    fn le_filtre_favoris_lit_les_favoris_du_profil_demande() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // La table `favorites` vit dans les migrations, pas dans le schéma initial.
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let repo = TrackRepo::new(db.clone());
+        let mut ids = Vec::new();
+        for titre in ["Alpha", "Beta", "Gamma"] {
+            let mut t = Track::new(titre.into());
+            t.file_path = Some(format!("/m/{titre}.flac"));
+            ids.push(repo.create(&t).unwrap());
+        }
+        // Profil 1 : Alpha. Profil 2 : Beta. Gamma n'est à personne.
+        db.execute_batch(&format!(
+            "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'track', {a}); \
+             INSERT INTO favorites (profile_id, item_type, item_id) VALUES (2, 'track', {b});",
+            a = ids[0],
+            b = ids[1]
+        ))
+        .unwrap();
+
+        let titres = |profil: i64| -> Vec<String> {
+            let f = TrackFilter {
+                favorites: vec!["track".into()],
+                profile_id: profil,
+                ..Default::default()
+            };
+            let (pistes, total) = repo.list_filtered(&f, 50, 0).unwrap();
+            let t: Vec<String> = pistes.into_iter().map(|p| p.title).collect();
+            assert_eq!(total as usize, t.len(), "le total suit la liste");
+            t
+        };
+        assert_eq!(titres(1), ["Alpha"]);
+        assert_eq!(titres(2), ["Beta"], "le profil 2 ne voit que les siens");
+        assert_eq!(
+            titres(0),
+            ["Alpha"],
+            "sans profil : le profil 1, comme avant"
+        );
+        assert!(titres(3).is_empty(), "un profil sans favori ne voit rien");
+    }
+}
+
+/// #7594 — le filtre de notes d'album lit les notes du profil de la REQUÊTE,
+/// pas toujours celles du profil 1.
+#[cfg(test)]
+mod tests_notes_du_profil_7594 {
+    use crate::db::facet_filter::TrackFilter;
+    use crate::db::models::Track;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    #[test]
+    fn le_filtre_de_notes_lit_les_notes_du_profil_demande() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("INSERT INTO albums (id, title) VALUES (101, 'A'), (102, 'B');")
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        for (titre, album) in [("Alpha", 101), ("Beta", 102)] {
+            let mut t = Track::new(titre.into());
+            t.file_path = Some(format!("/m/{titre}.flac"));
+            t.album_id = Some(album);
+            repo.create(&t).unwrap();
+        }
+        // Profil 1 : A=5, B=2. Profil 2 : A=2, B=5.
+        db.execute_batch(
+            "INSERT INTO album_ratings (album_id, profile_id, rating) VALUES \
+             (101, 1, 5), (102, 1, 2), (101, 2, 2), (102, 2, 5);",
+        )
+        .unwrap();
+
+        let titres = |profil: i64| -> Vec<String> {
+            let f = TrackFilter {
+                ratings: vec![5],
+                profile_id: profil,
+                ..Default::default()
+            };
+            let (pistes, total) = repo.list_filtered(&f, 50, 0).unwrap();
+            let t: Vec<String> = pistes.into_iter().map(|p| p.title).collect();
+            assert_eq!(total as usize, t.len(), "le total suit la liste");
+            t
+        };
+        assert_eq!(titres(1), ["Alpha"]);
+        assert_eq!(titres(2), ["Beta"], "le profil 2 ne voit que ses notes");
+        assert_eq!(titres(0), ["Alpha"], "sans profil : le profil 1");
+        assert!(titres(3).is_empty(), "un profil sans note ne voit rien");
     }
 }
 

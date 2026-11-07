@@ -195,6 +195,16 @@ pub fn dedup_devices(devices: Vec<DiscoveredDevice>) -> Vec<DiscoveredDevice> {
     for mut group in groups {
         group.sort_by_key(|b| std::cmp::Reverse(b.device_type.priority()));
         let mut primary = group.remove(0);
+        // #7371 — DLNA (entrée NET) et AirPlay restent deux choix explicites.
+        // Le même nom/hôte ne signifie pas que ces transports sont interchangeables.
+        // Les doublons SSDP et les protocoles préférés (OpenHome/BluOS…) gardent
+        // leur regroupement historique.
+        let mut sorties_airplay = Vec::new();
+        if primary.device_type == OutputType::Dlna {
+            (sorties_airplay, group) = group
+                .into_iter()
+                .partition(|d| d.device_type == OutputType::Airplay);
+        }
         if !group.is_empty() {
             let alts: Vec<Alternative> = group
                 .iter()
@@ -210,6 +220,7 @@ pub fn dedup_devices(devices: Vec<DiscoveredDevice>) -> Vec<DiscoveredDevice> {
             );
         }
         result.push(primary);
+        result.extend(sorties_airplay);
     }
     result
 }

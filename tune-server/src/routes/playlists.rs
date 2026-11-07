@@ -1,3 +1,6 @@
+#[path = "playlists_metadonnees_7738.rs"]
+pub(crate) mod metadonnees_7738;
+
 use std::collections::HashSet;
 
 use axum::extract::{Multipart, Path, Query, State};
@@ -414,6 +417,7 @@ async fn get_tracks(
             v
         })
         .collect();
+    metadonnees_7738::completer(&state, &mut items).await;
     // #4806 — un titre banni reste DANS la playlist, grisé : `banned` le dit.
     // Une ligne de service (`id` nul) n'est jamais bannie : le bannissement
     // désigne un `tracks.id`.
@@ -458,16 +462,12 @@ async fn add_tracks(
             incomplets,
             "playlist_add_tracks_refused_incomplete_streaming"
         );
-        return (
+        return crate::message_api::refus(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "Cette demande ne porte que des titres de service incomplets \
-                 ({incomplets}) : il leur faut une source (autre que « local »), \
-                 un identifiant chez le service et un titre pour entrer dans \
-                 une playlist."
-            ),
-        )
-            .into_response();
+            "playlist_incomplete_service_tracks",
+            "api.playlists.incompleteServiceTracks",
+            &[("count", incomplets.to_string())],
+        );
     }
 
     let lignes: Vec<EntryContent> = body
@@ -530,20 +530,22 @@ async fn remove_track(
         (Some(entry_id), _) => repo.remove_entry(id, entry_id),
         (None, Some(rang)) => repo.remove_track(id, rang),
         (None, None) => {
-            return (
+            return crate::message_api::refus(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "Il faut désigner la ligne à retirer : `entry_id` (préféré) ou `position` (rang).",
-            )
-                .into_response();
+                "playlist_entry_required",
+                "api.playlists.entryRequired",
+                &[],
+            );
         }
     };
     match retire {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (
+        Ok(false) => crate::message_api::refus(
             StatusCode::NOT_FOUND,
-            "Aucune ligne de cette playlist ne correspond : rien n'a été retiré.",
-        )
-            .into_response(),
+            "playlist_entry_not_found",
+            "api.playlists.noMatchingEntry",
+            &[],
+        ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -566,11 +568,12 @@ async fn remove_tracks_batch(
     // #6687 — tout ou rien : un rang hors bornes n'efface rien, et un lot
     // qui n'a rien effacé est un `404`, pas un succès.
     match repo.remove_tracks_at_positions(id, &body.positions) {
-        Ok(0) => (
+        Ok(0) => crate::message_api::refus(
             StatusCode::NOT_FOUND,
-            "Aucune ligne retirée : un rang au moins est hors de la playlist.",
-        )
-            .into_response(),
+            "playlist_position_out_of_range",
+            "api.playlists.positionOutOfRange",
+            &[],
+        ),
         Ok(removed) => Json(json!({"removed": removed})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -592,12 +595,12 @@ async fn reorder_tracks(
             // Une liste qui n'est pas une permutation exacte des rangs actuels
             // (liste périmée côté client) n'écrit RIEN : réécrire quand même
             // perdrait ou dupliquerait des lignes.
-            Ok(false) => (
+            Ok(false) => crate::message_api::refus(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "`positions` doit être une permutation exacte des rangs actuels \
-                 de la playlist (0..n-1) ; rien n'a été modifié.",
-            )
-                .into_response(),
+                "playlist_positions_not_permutation",
+                "api.playlists.positionsNotPermutation",
+                &[],
+            ),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
     }
@@ -932,6 +935,81 @@ async fn export_multi_format(
     Ok((axum::http::StatusCode::OK, headers, content))
 }
 
+/// Ce qu'une ligne de .m3u désigne dans la bibliothèque LOCALE.
+pub(crate) enum LigneM3u {
+    Trouvee(i64),
+    Absente,
+    /// La recherche a échoué (base) : ce n'est pas « absente » (#2798).
+    ErreurDeRecherche(String),
+}
+
+/// Le rapprochement d'une ligne de .m3u avec une piste locale, partagé par
+/// l'import de liste de lecture (`import_m3u_file`) et l'import d'écoutes
+/// (#7763, `system::import`), pour qu'une ligne « trouvée » veuille dire la
+/// même chose dans les deux.
+///
+/// Chemin exact d'abord, dans un index chargé UNE fois (une seule requête,
+/// toutes sources : `file_path` est unique) ; puis une recherche plein texte
+/// par nom de fichier, BORNÉE : une liste géante qui ne correspond pas aux
+/// chemins de la bibliothèque ne lance pas une recherche coûteuse par ligne
+/// (Dominique : grosse .m3u qui fige l'écran).
+pub(crate) struct RapprochementLocalM3u<'a> {
+    track_repo: &'a TrackRepo,
+    path_to_id: std::collections::HashMap<String, tune_core::db::track_repo::InfoFichier>,
+    recherches: u32,
+    /// Vrai dès qu'une ligne n'a pas été cherchée faute de budget.
+    pub(crate) recherche_plafonnee: bool,
+    /// Lignes trouvées par la recherche par nom de fichier, et non par leur
+    /// chemin exact : le premier résultat, qui peut être une autre piste.
+    /// L'import d'écoutes les compte à part (#7763).
+    pub(crate) trouvees_par_recherche: u32,
+}
+
+impl<'a> RapprochementLocalM3u<'a> {
+    pub(crate) const MAX_SEARCH_FALLBACKS: u32 = 500;
+
+    /// NOT `unwrap_or_default()` on the index: an index we failed to read used
+    /// to become an empty map, so EVERY line fell through to "not found"
+    /// (#2798). The caller refuses before writing anything.
+    pub(crate) fn nouveau(track_repo: &'a TrackRepo) -> Result<Self, String> {
+        let path_to_id = track_repo
+            .get_all_file_info_by_path()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            track_repo,
+            path_to_id,
+            recherches: 0,
+            recherche_plafonnee: false,
+            trouvees_par_recherche: 0,
+        })
+    }
+
+    pub(crate) fn piste(&mut self, line: &str) -> LigneM3u {
+        if let Some(info) = self.path_to_id.get(line) {
+            return LigneM3u::Trouvee(info.id);
+        }
+        if self.recherches >= Self::MAX_SEARCH_FALLBACKS {
+            self.recherche_plafonnee = true;
+            return LigneM3u::Absente;
+        }
+        self.recherches += 1;
+        let filename = std::path::Path::new(line)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(line);
+        match self.track_repo.search(filename, 1) {
+            Ok(results) => match results.first().and_then(|t| t.id) {
+                Some(id) => {
+                    self.trouvees_par_recherche += 1;
+                    LigneM3u::Trouvee(id)
+                }
+                None => LigneM3u::Absente,
+            },
+            Err(e) => LigneM3u::ErreurDeRecherche(e.to_string()),
+        }
+    }
+}
+
 async fn import_m3u_file(
     State(state): State<AppState>,
     profile: ActiveProfile,
@@ -983,7 +1061,7 @@ async fn import_m3u_file(
     tracing::info!(name = %name, bytes = file_content.len(), "m3u_import_file_received");
 
     // Parse M3U and match tracks
-    let mut track_ids: Vec<i64> = Vec::new();
+    let mut entrees: Vec<EntryContent> = Vec::new();
     let mut total_entries = 0u32;
     let mut matched = 0u32;
     // Keep only a small SAMPLE of not-found paths for the response; count the
@@ -1011,8 +1089,8 @@ async fn import_m3u_file(
     // (`file_path TEXT UNIQUE`). Restreindre à `source = 'local'` faisait
     // retomber sur la recherche FTS — ou sur « introuvable » — une piste que la
     // base tenait pourtant sous une source d'importation (#2939).
-    let path_to_id = match track_repo.get_all_file_info_by_path() {
-        Ok(map) => map,
+    let mut locales = match RapprochementLocalM3u::nouveau(&track_repo) {
+        Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "m3u_import_file_index_unavailable");
             return (
@@ -1023,61 +1101,50 @@ async fn import_m3u_file(
         }
     };
 
-    // The FTS fallback (filename→search) stays for paths that don't match
-    // exactly, but is BOUNDED: a fully-mismatched huge playlist can't run an
-    // unbounded number of costly searches. Beyond the cap, unmatched lines are
-    // recorded as not-found without searching (logged once).
-    const MAX_SEARCH_FALLBACKS: u32 = 500;
-    let mut search_fallbacks = 0u32;
-    let mut fallback_capped = false;
     // A search that ERRORS is not a line "absent from the library" — counting
     // it as not-found told the user their file was wrong when the database had
     // failed (#2798). Its own bucket, so total = matched + not_found +
     // lookup_errors always holds.
     let mut lookup_errors = 0u32;
 
-    for line in file_content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
+    for entree in tune_core::library::m3u_parser::parse_m3u_content(file_content.as_bytes(), true) {
+        let line = entree.path.as_str();
         total_entries += 1;
-
-        // Exact path match (O(1) map lookup).
-        if let Some(info) = path_to_id.get(line) {
-            track_ids.push(info.id);
+        if let Some(qobuz) = tune_core::library::m3u_parser::entree_qobuz_audirvana(
+            line,
+            entree.title.as_deref(),
+            entree.artist.as_deref(),
+            (entree.duration_s >= 0).then_some(i64::from(entree.duration_s) * 1000),
+        ) {
+            entrees.push(EntryContent::Service(qobuz));
             matched += 1;
             continue;
         }
-
-        // Filename-stem FTS fallback, bounded.
-        if search_fallbacks < MAX_SEARCH_FALLBACKS {
-            search_fallbacks += 1;
-            let filename = std::path::Path::new(line)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(line);
-            match track_repo.search(filename, 1) {
-                Ok(results) => {
-                    if let Some(track) = results.first()
-                        && let Some(id) = track.id
-                    {
-                        track_ids.push(id);
-                        matched += 1;
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    if lookup_errors == 0 {
-                        tracing::warn!(error = %e, "m3u_import_file_lookup_error");
-                    }
-                    lookup_errors += 1;
-                    continue;
-                }
+        if line
+            .split_once("://")
+            .is_some_and(|(s, _)| s.eq_ignore_ascii_case("qobuz"))
+        {
+            not_found_count += 1;
+            if not_found_paths.len() < MAX_NOT_FOUND_SAMPLE {
+                not_found_paths.push(line.to_string());
             }
-        } else {
-            fallback_capped = true;
+            continue;
+        }
+
+        match locales.piste(line) {
+            LigneM3u::Trouvee(id) => {
+                entrees.push(EntryContent::Local(id));
+                matched += 1;
+                continue;
+            }
+            LigneM3u::ErreurDeRecherche(e) => {
+                if lookup_errors == 0 {
+                    tracing::warn!(error = %e, "m3u_import_file_lookup_error");
+                }
+                lookup_errors += 1;
+                continue;
+            }
+            LigneM3u::Absente => {}
         }
 
         not_found_count += 1;
@@ -1086,11 +1153,12 @@ async fn import_m3u_file(
         }
     }
 
+    let fallback_capped = locales.recherche_plafonnee;
     if fallback_capped {
         tracing::warn!(
             total_entries,
             matched,
-            search_cap = MAX_SEARCH_FALLBACKS,
+            search_cap = RapprochementLocalM3u::MAX_SEARCH_FALLBACKS,
             "m3u_import_search_fallback_capped — many entries don't match library paths; \
              fuzzy search skipped past the cap to avoid a long-running import"
         );
@@ -1100,9 +1168,9 @@ async fn import_m3u_file(
     // track insert dropped with `.ok()`, so a failed insert left an empty
     // playlist behind AND answered 201 (#2798).
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.create_with_tracks(&name, None, profile.id(), &track_ids) {
+    match repo.create_with_entries(&name, None, profile.id(), &entrees) {
         Ok((playlist_id, imported)) => {
-            let duplicates_skipped = track_ids.len() - imported.len();
+            let duplicates_skipped = entrees.len() - imported.len();
             tracing::info!(
                 playlist_id,
                 name = %name,
@@ -2483,3 +2551,7 @@ mod badge_de_cercle_6688 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "playlists/import_audirvana_6998_tests.rs"]
+mod import_audirvana_6998_tests;

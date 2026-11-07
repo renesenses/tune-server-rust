@@ -42,6 +42,7 @@ pub struct AppState {
     pub streamer: Arc<AudioStreamer>,
     pub playback: Arc<PlaybackManager>,
     pub services: Arc<Mutex<ServiceRegistry>>,
+    pub(crate) metadonnees_playlists: Arc<crate::routes::playlists::metadonnees_7738::Cache>,
     pub outputs: Arc<Mutex<OutputRegistry>>,
     pub orchestrator: Arc<PlaybackOrchestrator>,
     /// Scanner SSDP partagé SANS mutex englobant : `rescan()` ne prend que
@@ -82,6 +83,14 @@ pub struct AppState {
     /// correction), lue par le SERVEUR et copiée dans `<données>/cache/autoeq`.
     /// Champ public : un banc d'essai y pose un catalogue à faux réseau.
     pub autoeq: Arc<tune_core::audio::autoeq_base::CatalogueAutoEq>,
+    /// #7858 — le dossier des titres de démonstration, `<données>/demo-tracks`.
+    /// `None` pour une base en mémoire. Champ public : un banc y pose un
+    /// dossier temporaire.
+    pub dossier_titres_demo: Option<std::path::PathBuf>,
+    /// #7858 — un seul ajout ou retrait des titres de démo à la fois, par
+    /// serveur : propre à cet état, pour que deux bancs d'essai parallèles ne
+    /// se refusent pas l'un l'autre (409).
+    pub verrou_titres_demo: Arc<tokio::sync::Mutex<()>>,
     pub port: u16,
     /// Origine du compteur `uptime_seconds` : un `Instant` capturé à la
     /// construction de l'état, donc AU DÉMARRAGE DU PROCESSUS. Il repart
@@ -109,6 +118,9 @@ pub struct AppState {
     pub api_analytics: Arc<tune_core::api_analytics::ApiAnalytics>,
     pub poller_metrics: tune_core::poller::PollerMetricsMap,
     pub update_phase: Arc<std::sync::Mutex<Option<String>>>,
+    /// La raison de la dernière mise à jour qui n'a rien installé (#7600),
+    /// rendue par `GET /system/update/status`.
+    pub update_issue: Arc<crate::routes::system::suivi_de_mise_a_jour_7600::Issue>,
     pub rooms: Arc<Mutex<tune_core::collaborative::RoomManager>>,
     pub upnp_index_lock: Arc<Mutex<()>>,
     pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
@@ -250,6 +262,22 @@ fn dossier_autoeq(db_path: &str) -> Option<std::path::PathBuf> {
         &cwd,
     );
     Some(donnees.join("cache").join("autoeq"))
+}
+
+/// #6933 — le dossier où librespot garde SA connexion au compte Spotify
+/// (`<données>/librespot`, résolu comme la base). Aucun pour une base en
+/// mémoire (essais).
+fn dossier_librespot(db_path: &str) -> Option<std::path::PathBuf> {
+    if db_path.is_empty() || db_path == ":memory:" {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let donnees = crate::gel_executeur::dossier_de_donnees(
+        std::env::var("TUNE_DATA_DIR").ok().as_deref(),
+        db_path,
+        &cwd,
+    );
+    Some(donnees.join("librespot"))
 }
 
 impl AppState {
@@ -566,7 +594,10 @@ impl AppState {
         orch.license = Some(license.clone());
         // #6018 — la lecture d'un titre Spotify : le PCM du récepteur
         // librespot entre par la porte des sources PCM, comme un CD.
-        let spotify_connect = Arc::new(SpotifyConnectManager::new("Tune".into(), port));
+        let spotify_connect = Arc::new(
+            SpotifyConnectManager::new("Tune".into(), port)
+                .avec_dossier_identifiants(dossier_librespot(db_path)),
+        );
         orch.sources_pcm().inscrire(
             tune_core::streaming::spotify_lecture::SOURCE,
             Arc::new(
@@ -633,6 +664,7 @@ impl AppState {
             streamer,
             playback,
             services,
+            metadonnees_playlists: Arc::new(Default::default()),
             outputs,
             orchestrator,
             scanner,
@@ -653,6 +685,8 @@ impl AppState {
             autoeq: Arc::new(tune_core::audio::autoeq_base::CatalogueAutoEq::production(
                 dossier_autoeq(db_path),
             )),
+            dossier_titres_demo: crate::routes::titres_demo::dossier_par_defaut(db_path),
+            verrou_titres_demo: Arc::new(tokio::sync::Mutex::new(())),
             port,
             started_at: Instant::now(),
             process_started_at: time::OffsetDateTime::now_utc(),
@@ -663,6 +697,7 @@ impl AppState {
             api_analytics: Arc::new(tune_core::api_analytics::ApiAnalytics::default()),
             poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
             update_phase: Arc::new(std::sync::Mutex::new(None)),
+            update_issue: Arc::new(std::sync::Mutex::new(None)),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             upnp_index_lock: Arc::new(Mutex::new(())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),

@@ -366,15 +366,14 @@ async fn transferer_par_le_greffon(
     _body: &TransferRequest,
     _profil: i64,
 ) -> axum::response::Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "greffon_requis",
-            "detail": "Le transfert de playlists passe par le greffon « Playlists converter », \
-                       et ce serveur est compilé sans greffons WASM (`plugins-wasm`).",
-        })),
-    )
-        .into_response()
+    // `detail` : les clients d'avant le lisaient ; il porte la même phrase.
+    let mut corps = crate::message_api::corps_refus(
+        "greffon_requis",
+        "api.playlists.transferPluginNotCompiled",
+        &[],
+    );
+    corps["detail"] = corps["message"].clone();
+    (StatusCode::NOT_IMPLEMENTED, Json(corps)).into_response()
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -427,16 +426,13 @@ async fn transferer_par_le_greffon(
 #[cfg(feature = "plugins-wasm")]
 fn refus_du_greffon(statut: StatusCode, corps: Value) -> axum::response::Response {
     if corps["error"] == "plugin not found" {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "greffon_requis",
-                "detail": "Le transfert de playlists passe par le greffon « Playlists converter », \
-                           qui n'est pas chargé sur ce serveur (désactivé, ou absent du dossier \
-                           des greffons).",
-            })),
-        )
-            .into_response();
+        let mut corps = crate::message_api::corps_refus(
+            "greffon_requis",
+            "api.playlists.transferPluginNotLoaded",
+            &[],
+        );
+        corps["detail"] = corps["message"].clone();
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(corps)).into_response();
     }
     let detail = corps["error"]
         .as_str()

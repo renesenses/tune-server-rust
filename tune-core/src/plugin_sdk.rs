@@ -26,7 +26,10 @@ use crate::outputs::traits::{OutputProvider, OutputTarget};
 /// The Python host had the same constant (`PROTOCOL_VERSION`) but only
 /// *warned* on mismatch — here it is enforced, because a Rust plugin that
 /// disagrees about the trait layout is a crash, not a degraded feature.
-pub const PLUGIN_PROTOCOL_VERSION: (u32, u32) = (1, 0);
+///
+/// 1.1 (tune-web-client#2527) : [`TunePlugin::theme_web`], un crochet à valeur
+/// par défaut — compatible, les greffons 1.0 se chargent toujours.
+pub const PLUGIN_PROTOCOL_VERSION: (u32, u32) = (1, 1);
 
 /// A zone a plugin wants the host to create on its behalf.
 ///
@@ -97,6 +100,16 @@ pub struct PluginInfo {
     /// [`TunePlugin::required_feature`]. Absent pour un greffon libre.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_feature: Option<String>,
+    /// Greffon qui reste dormant tant que l'utilisateur ne l'a pas installé
+    /// (`default_enabled() == false`, DJ, Karaoke). Faux pour un greffon actif
+    /// d'office comme l'Assistant IA : il n'y a rien à « installer », donc
+    /// « désinstaller » veut dire le désactiver et le retirer de la vue (#7470).
+    #[serde(default)]
+    pub opt_in: bool,
+    /// La route du thème que ce greffon fournit au client web, relative à son
+    /// préfixe — voir [`TunePlugin::theme_web`]. Absente le plus souvent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_theme: Option<String>,
 }
 
 /// A compiled-in plugin that `setup_all` did not load — either an opt-in
@@ -414,6 +427,20 @@ pub trait TunePlugin: Send + Sync {
     /// payant se charge quand même, sinon le gestionnaire ne pourrait pas
     /// l'annoncer à qui n'a pas encore Premium.
     fn required_feature(&self) -> Option<Feature> {
+        None
+    }
+
+    /// La route, RELATIVE au préfixe du greffon (`/api/v1/ext/<nom>`), qui
+    /// sert un thème au client web — `None` (le défaut) : ce greffon n'en
+    /// fournit pas.
+    ///
+    /// Le gestionnaire la publie dans la fiche du greffon chargé
+    /// (`GET /api/v1/plugins` › `provides.web_theme`, chemin complet). Le
+    /// client web applique le thème de tout greffon actif qui en déclare un,
+    /// sans connaître son nom (tune-web-client#2527, « Mon thème »). La route
+    /// rend `{profile_id, actif, theme}` pour le profil de la requête ; le
+    /// format de `theme` est celui de `tune-mon-theme` (`format: tune-theme`).
+    fn theme_web(&self) -> Option<&str> {
         None
     }
 
@@ -1185,6 +1212,8 @@ fn plugin_info_of(p: &dyn TunePlugin) -> PluginInfo {
         enabled: true,
         config_schema: p.config_schema(),
         required_feature: p.required_feature().map(|f| f.display_name().to_string()),
+        opt_in: !p.default_enabled(),
+        web_theme: p.theme_web().map(str::to_string),
     }
 }
 

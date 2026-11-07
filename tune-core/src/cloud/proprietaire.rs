@@ -127,6 +127,47 @@ pub fn profil_du_courriel(backend: &Arc<dyn DbBackend>, courriel: &str) -> Optio
         .and_then(|row| row.first().and_then(|v| v.as_i64()))
 }
 
+/// Le profil auquel rattacher une première liaison SSO (#7082).
+///
+/// Sans correspondance de courriel, la liaison créait un NOUVEAU profil et la
+/// session basculait dessus : sur une installation à un seul profil (le
+/// `default`, sans courriel), le testeur perdait photo et thème d'un coup — ils
+/// restaient sur le profil 1, que plus rien ne sélectionnait.
+///
+/// Règle : s'il n'existe qu'UN profil et qu'il n'a pas de courriel, le compte
+/// cloud s'y rattache (le courriel y est enregistré). Avec plusieurs profils,
+/// rien n'est deviné : `None`, et l'appelant crée un profil comme avant. Ne
+/// touche ni au propriétaire de licence ni au nom, ni à la couleur d'avatar.
+pub fn rattacher_au_profil_unique(backend: &Arc<dyn DbBackend>, courriel: &str) -> Option<i64> {
+    if courriel.trim().is_empty() {
+        return None;
+    }
+    let nombre = backend
+        .query_one("SELECT COUNT(*) FROM profiles", &[])
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))?;
+    if nombre != 1 {
+        return None;
+    }
+    let id = backend
+        .query_one(
+            "SELECT id FROM profiles WHERE email IS NULL OR TRIM(email) = ''",
+            &[],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))?;
+    backend
+        .execute(
+            "UPDATE profiles SET email = ? WHERE id = ?",
+            &[&courriel as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        )
+        .ok()?;
+    tracing::info!(profil = id, "sso_rattache_au_profil_unique");
+    Some(id)
+}
+
 /// Adopte le compte **déjà lié** comme propriétaire, sur une installation qui
 /// en portait un avant que ce réglage n'existe.
 ///
@@ -344,5 +385,40 @@ mod tests {
             s.set(CLE_PROPRIETAIRE, brut).unwrap();
             assert_eq!(proprietaire(&s), None, "valeur brute : {brut:?}");
         }
+    }
+    /// #7082 : un seul profil, sans courriel -> la liaison s'y rattache.
+    #[test]
+    fn profil_unique_sans_courriel_est_rattache() {
+        let db = base();
+        let defaut: i64 = db
+            .query_one("SELECT id FROM profiles ORDER BY id LIMIT 1", &[])
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .expect("profil par defaut");
+        assert_eq!(rattacher_au_profil_unique(&db, "a@b.fr"), Some(defaut));
+        assert_eq!(profil_du_courriel(&db, "a@b.fr"), Some(defaut));
+        let n = db
+            .query_one("SELECT COUNT(*) FROM profiles", &[])
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()));
+        assert_eq!(n, Some(1), "aucun nouveau profil");
+    }
+
+    /// Deux profils : on ne devine pas, comportement d'avant.
+    #[test]
+    fn deux_profils_ne_rattachent_rien() {
+        let db = base();
+        profil(&db, "autre@b.fr");
+        assert_eq!(rattacher_au_profil_unique(&db, "a@b.fr"), None);
+        assert_eq!(profil_du_courriel(&db, "a@b.fr"), None);
+    }
+
+    /// Le profil unique porte deja un courriel : un autre compte n'y entre pas.
+    #[test]
+    fn profil_unique_deja_lie_n_est_pas_rattache() {
+        let db = base();
+        db.execute("UPDATE profiles SET email = 'x@b.fr'", &[])
+            .unwrap();
+        assert_eq!(rattacher_au_profil_unique(&db, "a@b.fr"), None);
     }
 }

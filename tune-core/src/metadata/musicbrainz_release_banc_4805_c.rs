@@ -151,7 +151,7 @@ async fn bibliotheque() -> (Arc<dyn DbBackend>, BTreeMap<i64, &'static str>) {
             .unwrap_or(0)
     };
     let mut prochaine_fiche = un("SELECT MAX(id) FROM artists") + 1;
-    let mut album_id = un("SELECT MAX(id) FROM albums") + 1;
+    let premier_album = un("SELECT MAX(id) FROM albums") + 1;
     let mut piste_id = un("SELECT MAX(id) FROM tracks") + 1;
     let mut classes = BTreeMap::new();
 
@@ -179,7 +179,7 @@ async fn bibliotheque() -> (Arc<dyn DbBackend>, BTreeMap<i64, &'static str>) {
         id
     };
 
-    for &(classe, titre, artiste_album, pistes) in EXTENSION {
+    for (album_id, &(classe, titre, artiste_album, pistes)) in (premier_album..).zip(EXTENSION) {
         let aid = fiche(artiste_album, classe);
         backend
             .execute(
@@ -208,7 +208,6 @@ async fn bibliotheque() -> (Arc<dyn DbBackend>, BTreeMap<i64, &'static str>) {
                 .unwrap();
             piste_id += 1;
         }
-        album_id += 1;
     }
     (backend, classes)
 }

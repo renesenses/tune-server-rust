@@ -494,7 +494,7 @@ impl EncodeurTramesFlac {
     /// plus `taille_bloc` trames) en UNE trame FLAC.
     pub fn trame(&mut self, pcm: &[u8]) -> Result<Vec<u8>, String> {
         let octets_trame = (self.bit_depth / 8 * self.channels) as usize;
-        if pcm.is_empty() || pcm.len() % octets_trame != 0 {
+        if pcm.is_empty() || !pcm.len().is_multiple_of(octets_trame) {
             return Err("flac: PCM vide ou trame incomplete".into());
         }
         let n = pcm.len() / octets_trame;

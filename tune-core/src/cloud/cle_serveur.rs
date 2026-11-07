@@ -113,6 +113,7 @@ pub trait InscriptionDeCle: Send + Sync {
         &self,
         server_id: &str,
         jeton_du_compte: &str,
+        jeton_de_liaison: &str,
         corps: &CorpsInscription,
     ) -> Result<(), String>;
 }
@@ -140,6 +141,7 @@ impl InscriptionDeCle for InscriptionHttp {
         &self,
         server_id: &str,
         jeton_du_compte: &str,
+        jeton_de_liaison: &str,
         corps: &CorpsInscription,
     ) -> Result<(), String> {
         let reponse = self
@@ -149,6 +151,10 @@ impl InscriptionDeCle for InscriptionHttp {
                 self.base
             ))
             .bearer_auth(jeton_du_compte)
+            .header(
+                crate::cloud::library_sync::EN_TETE_JETON_DE_SERVEUR,
+                jeton_de_liaison,
+            )
             .header(reqwest::header::ACCEPT, "application/json")
             .timeout(std::time::Duration::from_secs(15))
             .json(corps)
@@ -196,9 +202,9 @@ pub async fn inscrire_si_besoin(
     let (Some(server_id), Some(jeton)) = (lire("server_id"), lire("mozaik_access_token")) else {
         return Ok(false);
     };
-    if !crate::cloud::library_sync::serveur_lie(&reglages) {
+    let Some(jeton_de_liaison) = lire(crate::cloud::library_sync::CLE_JETON_DE_LIAISON) else {
         return Ok(false);
-    }
+    };
     let public_key = cle.cle_publique();
     if lire(CLE_INSCRITE).as_deref() == Some(public_key.as_str()) {
         return Ok(false);
@@ -212,7 +218,10 @@ pub async fn inscrire_si_besoin(
         alg: "Ed25519",
         preuve,
     };
-    if let Err(e) = site.inscrire(&server_id, &jeton, &corps).await {
+    if let Err(e) = site
+        .inscrire(&server_id, &jeton, &jeton_de_liaison, &corps)
+        .await
+    {
         warn!(erreur = %e, "ecoute_distante_cle_serveur_non_inscrite");
         return Err(e);
     }

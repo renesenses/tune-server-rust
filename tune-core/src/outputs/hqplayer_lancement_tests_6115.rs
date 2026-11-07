@@ -91,35 +91,44 @@ async fn le_lancement_attend_que_status_rapporte_l_arret() {
         faux.recu()
     );
     let recu = faux.recu();
-    let apres_le_premier_status: Vec<&str> = recu.iter().skip(1).map(String::as_str).collect();
-    let pos = |prefixe: &str| {
-        apres_le_premier_status
-            .iter()
-            .position(|c| c.starts_with(prefixe))
-            .unwrap_or_else(|| panic!("pas de {prefixe} : {apres_le_premier_status:?}"))
-    };
-    assert_eq!(pos("<Stop"), 0, "{apres_le_premier_status:?}");
-    let statuts = apres_le_premier_status
+    let stop = recu.iter().position(|c| c.starts_with("<Stop")).unwrap();
+    let ajout = recu
         .iter()
-        .filter(|c| c.starts_with("<Status"))
-        .count();
-    assert_eq!(
-        statuts, 4,
-        "trois Status en STOPREQ puis un à l'arrêt : {apres_le_premier_status:?}"
+        .position(|c| c.starts_with("<PlaylistAdd"))
+        .unwrap();
+    let play = recu.iter().position(|c| c.starts_with("<Play ")).unwrap();
+    assert!(
+        recu[..stop].iter().all(|c| c.starts_with("<Status")),
+        "{recu:?}"
     );
-    assert!(pos("<Status") < pos("<PlaylistAdd"));
-    assert!(pos("<PlaylistAdd") < pos("<Play "));
+    assert_eq!(
+        recu[stop + 1..ajout]
+            .iter()
+            .filter(|c| c.starts_with("<Status"))
+            .count(),
+        4,
+        "trois Status en STOPREQ puis un à l'arrêt : {recu:?}"
+    );
+    assert!(stop < ajout && ajout < play, "{recu:?}");
+    assert!(
+        recu[play + 1..].iter().any(|c| c.starts_with("<Status")),
+        "#7244 : le moteur doit être vérifié après Play : {recu:?}"
+    );
 }
 
 /// Un HQPlayer qui ne rapporte jamais l'arrêt : l'attente est bornée (2 s),
-/// et le lancement part quand même, sans erreur.
+/// et #7244 refuse le lancement plutôt que de charger pendant cet arrêt incertain.
 #[tokio::test]
 async fn l_attente_de_l_arret_est_bornee() {
     let (faux, sortie) = faux_qui_ignore_clear(2, 0).await;
     faux.regler(|e| e.n_arrete_jamais = true);
 
     let debut = std::time::Instant::now();
-    sortie.play_media(&media(AUTRE)).await.unwrap();
+    let erreur = sortie
+        .play_media(&media(AUTRE))
+        .await
+        .expect_err("#7244 : ne pas charger une piste sans arrêt confirmé");
+    assert!(erreur.contains("hqplayer_stop_not_confirmed"), "{erreur}");
     let duree = debut.elapsed();
 
     assert!(
@@ -128,9 +137,10 @@ async fn l_attente_de_l_arret_est_bornee() {
     );
     let recu = faux.recu();
     assert!(
-        recu.iter().any(|c| c.starts_with("<PlaylistAdd"))
-            && recu.iter().any(|c| c.starts_with("<Play ")),
-        "le lancement part après la borne : {recu:?}"
+        !recu.iter().any(|c| c.starts_with("<PlaylistAdd")
+            || c.starts_with("<PlaylistClear")
+            || c.starts_with("<Play ")),
+        "#7244 : aucun chargement ni Play après un arrêt non confirmé : {recu:?}"
     );
 }
 
@@ -288,7 +298,7 @@ async fn la_lecture_et_la_suivante_portent_les_etiquettes_6177() {
                 r#"<PlaylistAdd uri="{AUTRE}" queued="0" clear="1">{etiquettes}</PlaylistAdd>"#
             ),
             format!(
-                r#"<PlaylistAdd uri="{SUIVANTE}" queued="0" clear="0">{etiquettes}</PlaylistAdd>"#
+                r#"<PlaylistAdd uri="{SUIVANTE}" queued="1" clear="0">{etiquettes}</PlaylistAdd>"#
             ),
         ],
         "#6177 : HQPlayer ne reçoit que l'URI et affiche « HTTP stream »"

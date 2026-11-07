@@ -1,0 +1,183 @@
+{
+ "pagination": {
+  "page": 1,
+  "pages": 2,
+  "per_page": 3,
+  "items": 5,
+  "urls": {
+   "last": "https://api.discogs.com/users/exemple/collection/folders/0/releases?page=2&per_page=3&sort=added&sort_order=desc",
+   "next": "https://api.discogs.com/users/exemple/collection/folders/0/releases?page=2&per_page=3&sort=added&sort_order=desc"
+  }
+ },
+ "releases": [
+  {
+   "id": 249504,
+   "instance_id": 900001,
+   "date_added": "2026-10-01T10:00:00-07:00",
+   "rating": 0,
+   "basic_information": {
+    "id": 249504,
+    "master_id": 96559,
+    "master_url": "https://api.discogs.com/masters/96559",
+    "resource_url": "https://api.discogs.com/releases/249504",
+    "thumb": "",
+    "cover_image": "",
+    "title": "Never Gonna Give You Up",
+    "year": 1987,
+    "formats": [
+     {
+      "name": "Vinyl",
+      "qty": "1",
+      "descriptions": [
+       "7\"",
+       "45 RPM",
+       "Single",
+       "Stereo"
+      ]
+     }
+    ],
+    "labels": [
+     {
+      "name": "RCA",
+      "catno": "PB 41447",
+      "entity_type": "1",
+      "entity_type_name": "Label",
+      "id": 895,
+      "resource_url": "https://api.discogs.com/labels/895"
+     }
+    ],
+    "artists": [
+     {
+      "name": "Rick Astley",
+      "anv": "",
+      "join": "",
+      "role": "",
+      "tracks": "",
+      "id": 72872,
+      "resource_url": "https://api.discogs.com/artists/72872"
+     }
+    ],
+    "genres": [
+     "Electronic",
+     "Pop"
+    ],
+    "styles": [
+     "Synth-pop"
+    ]
+   }
+  },
+  {
+   "id": 1050,
+   "instance_id": 900002,
+   "date_added": "2026-09-01T10:00:00-07:00",
+   "rating": 0,
+   "basic_information": {
+    "id": 1050,
+    "master_id": 458546,
+    "master_url": "https://api.discogs.com/masters/458546",
+    "resource_url": "https://api.discogs.com/releases/1050",
+    "thumb": "",
+    "cover_image": "",
+    "title": "Montreal Mix Sessions Vol. 4",
+    "year": 2000,
+    "formats": [
+     {
+      "name": "CD",
+      "qty": "1",
+      "descriptions": [
+       "Mixed"
+      ]
+     }
+    ],
+    "labels": [
+     {
+      "name": "Turbo",
+      "catno": "MARCD-009",
+      "entity_type": "1",
+      "entity_type_name": "Label",
+      "id": 242,
+      "resource_url": "https://api.discogs.com/labels/242"
+     },
+     {
+      "name": "Turbo",
+      "catno": "MARCD00092",
+      "entity_type": "1",
+      "entity_type_name": "Label",
+      "id": 242,
+      "resource_url": "https://api.discogs.com/labels/242"
+     }
+    ],
+    "artists": [
+     {
+      "name": "Lafleche",
+      "anv": "Laflèche",
+      "join": "",
+      "role": "",
+      "tracks": "",
+      "id": 1495,
+      "resource_url": "https://api.discogs.com/artists/1495"
+     }
+    ],
+    "genres": [
+     "Electronic"
+    ],
+    "styles": [
+     "House"
+    ]
+   }
+  },
+  {
+   "id": 7024,
+   "instance_id": 900003,
+   "date_added": "2026-08-01T10:00:00-07:00",
+   "rating": 0,
+   "basic_information": {
+    "id": 7024,
+    "master_id": 82134,
+    "master_url": "https://api.discogs.com/masters/82134",
+    "resource_url": "https://api.discogs.com/releases/7024",
+    "thumb": "",
+    "cover_image": "",
+    "title": "The Haçienda - Play By 01/96",
+    "year": 1995,
+    "formats": [
+     {
+      "name": "CD",
+      "qty": "2",
+      "descriptions": [
+       "Mixed"
+      ]
+     }
+    ],
+    "labels": [
+     {
+      "name": "A&M Records",
+      "catno": "540 441-2",
+      "entity_type": "1",
+      "entity_type_name": "Label",
+      "id": 904,
+      "resource_url": "https://api.discogs.com/labels/904"
+     }
+    ],
+    "artists": [
+     {
+      "name": "Various",
+      "anv": "",
+      "join": "",
+      "role": "",
+      "tracks": "",
+      "id": 194,
+      "resource_url": "https://api.discogs.com/artists/194"
+     }
+    ],
+    "genres": [
+     "Electronic"
+    ],
+    "styles": [
+     "House",
+     "Garage House"
+    ]
+   }
+  }
+ ]
+}

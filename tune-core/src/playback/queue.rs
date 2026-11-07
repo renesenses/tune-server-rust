@@ -308,6 +308,10 @@ impl PlayQueue {
         self.repeat = mode;
     }
 
+    // Pas `Iterator::next` : rend une référence EMPRUNTÉE à la file, et
+    // l'avance obéit à repeat/shuffle (elle peut rendre la même piste). Le
+    // renommer toucherait tous les appelants, dont l'orchestrateur en PR ouverte.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<&QueueTrack> {
         if self.tracks.is_empty() {
             return None;
@@ -712,10 +716,13 @@ mod plafond_aleatoire_reglage_tests {
             resolve_shuffle_max_tracks(Some("-30000")),
             SHUFFLE_MAX_TRACKS_FLOOR
         );
-        assert!(
-            SHUFFLE_MAX_TRACKS_FLOOR >= 1,
-            "le plancher doit laisser AU MOINS une piste : c'est ce qui              distingue « une file courte » de « le bouton ne marche plus »"
-        );
+        // Constante : vérifiée à la compilation (#7154).
+        const {
+            assert!(
+                SHUFFLE_MAX_TRACKS_FLOOR >= 1,
+                "le plancher doit laisser AU MOINS une piste : c'est ce qui              distingue « une file courte » de « le bouton ne marche plus »"
+            );
+        }
     }
 
     /// Au-dessus du maximum mesuré : ramené au maximum, jamais accepté.
@@ -823,8 +830,11 @@ mod plafond_aleatoire_reglage_tests {
     /// silencieusement réécrit, et le « 500 par défaut » deviendrait faux.
     #[test]
     fn le_defaut_est_lui_meme_dans_les_bornes() {
-        assert!(SHUFFLE_MAX_TRACKS_FLOOR <= SHUFFLE_MAX_TRACKS_DEFAULT);
-        assert!(SHUFFLE_MAX_TRACKS_DEFAULT <= SHUFFLE_MAX_TRACKS_CEILING);
+        // Constantes : vérifiées à la compilation (#7154).
+        const {
+            assert!(SHUFFLE_MAX_TRACKS_FLOOR <= SHUFFLE_MAX_TRACKS_DEFAULT);
+            assert!(SHUFFLE_MAX_TRACKS_DEFAULT <= SHUFFLE_MAX_TRACKS_CEILING);
+        }
         assert_eq!(
             resolve_shuffle_max_tracks(Some(&SHUFFLE_MAX_TRACKS_DEFAULT.to_string())),
             SHUFFLE_MAX_TRACKS_DEFAULT

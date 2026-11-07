@@ -95,6 +95,8 @@ pub struct Faux {
     pub prochain_id: i64,
     /// Les cercles du détenteur du jeton.
     pub circles: Vec<Value>,
+    /// #7124 : les cercles des AUTRES où je suis rangé (`member_of`).
+    pub member_of: Vec<Value>,
     pub prochain_cercle_id: i64,
     /// Le `circle_id` porté par chaque invitation envoyée (id → circle_id).
     pub rangement_des_invitations: Vec<(i64, Value)>,
@@ -215,6 +217,7 @@ impl Faux {
             dernier_corps: None,
             prochain_id: 12,
             circles: c["circles"].as_array().unwrap().clone(),
+            member_of: Vec::new(),
             prochain_cercle_id: 3,
             rangement_des_invitations: Vec::new(),
             t2: false,
@@ -268,6 +271,10 @@ impl Faux {
                 }
             }
             c["circles"] = json!(cercles);
+        }
+        // Comme site-mozaiklabs#380 : la clé n'existe que si je suis rangé chez un autre.
+        if !self.member_of.is_empty() {
+            c["member_of"] = json!(self.member_of);
         }
         c
     }

@@ -15,6 +15,21 @@ on:
         required: true
         default: true
         type: boolean
+      sentinelle_sha:
+        description: "Facultatif : SHA serveur teste par la sentinelle du .18, s'il differe du candidat (meme arbre exige)"
+        required: false
+        default: ""
+        type: string
+      contourner_sentinelle:
+        description: "RESERVE A BERTRAND : poser les tags sans le vert de sentinelle/streaming (journalise)"
+        required: false
+        default: false
+        type: boolean
+      motif_contournement:
+        description: "Obligatoire si contournement : pourquoi la preuve reelle manque"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: release-controller
@@ -146,6 +161,59 @@ jobs:
             echo '|---|---|---|---|'
             jq -r '.components | to_entries[] | "| \(.key) | `\(.value.repository)` | `\(.value.sha)` | `\(.value.tag)` |"' /tmp/release-manifest.json
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # #7148 — aucun tag sans preuve REELLE que les services de streaming
+      # jouent avec un binaire construit depuis le SHA serveur candidat. Le
+      # 26/10/2026, la rc8.1 a ete taguee avec un correctif TIDAL prouve contre
+      # un faux CDN : 403 partout sur le .18. La preuve est le statut de commit
+      # `sentinelle/streaming` que publie le .18 (scripts/sentinelle-streaming/).
+      # Le detail des conditions et ses contre-epreuves sont dans
+      # scripts/porte-sentinelle-streaming.sh (`--autotest`, joue ici d'abord).
+      - name: Exiger le vert de la sentinelle de streaming
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN }}
+          SENTINELLE_SHA: ${{ inputs.sentinelle_sha }}
+          CONTOURNER: ${{ inputs.contourner_sentinelle }}
+          MOTIF: ${{ inputs.motif_contournement }}
+          ACTEUR: ${{ github.actor }}
+          DECLENCHEUR: ${{ github.triggering_actor }}
+          SENTINELLE_AUTEURS: ${{ vars.SENTINELLE_STATUT_AUTEURS || 'renesenses' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/porte-sentinelle-streaming.sh --autotest
+          if [ "$CONTOURNER" = true ]; then
+            # Contournement : Bertrand seul, un motif ecrit, et une trace qui
+            # survit au run (resume, avertissement, manifeste televerse).
+            if [ "$ACTEUR" != renesenses ] || [ "$DECLENCHEUR" != renesenses ]; then
+              echo "::error::contournement de la sentinelle reserve a Bertrand (renesenses), demande par $ACTEUR/$DECLENCHEUR"
+              exit 1
+            fi
+            if [ "${#MOTIF}" -lt 10 ]; then
+              echo "::error::contournement sans motif : remplir motif_contournement (10 caracteres au moins)"
+              exit 1
+            fi
+            echo "::warning::SENTINELLE CONTOURNEE par $ACTEUR : $MOTIF"
+            {
+              echo "## ⚠️ Sentinelle de streaming CONTOURNEE"
+              echo
+              echo "- par : \`$ACTEUR\`"
+              echo "- motif : $MOTIF"
+              echo "- SHA serveur : \`$GITHUB_SHA\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            jq --arg par "$ACTEUR" --arg motif "$MOTIF" --arg quand "$(date -u +%FT%TZ)" \
+              '.sentinelle = {contournee: true, par: $par, motif: $motif, quand: $quand}' \
+              /tmp/release-manifest.json > /tmp/release-manifest.json.tmp
+            mv /tmp/release-manifest.json.tmp /tmp/release-manifest.json
+            exit 0
+          fi
+          verdict="$(bash scripts/porte-sentinelle-streaming.sh renesenses/tune-server-rust "$GITHUB_SHA" "$SENTINELLE_SHA")"
+          echo "$verdict"
+          echo "- $verdict" >> "$GITHUB_STEP_SUMMARY"
+          jq --arg v "$verdict" --arg sha "${SENTINELLE_SHA:-$GITHUB_SHA}" \
+            '.sentinelle = {contournee: false, sha: $sha, verdict: $v}' \
+            /tmp/release-manifest.json > /tmp/release-manifest.json.tmp
+          mv /tmp/release-manifest.json.tmp /tmp/release-manifest.json
 
       - name: Refuser un controleur non arme
         if: ${{ !inputs.dry_run }}

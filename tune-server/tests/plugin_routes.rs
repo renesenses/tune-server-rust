@@ -696,25 +696,25 @@ async fn la_fiche_d_un_greffon_installe_non_charge_annonce_le_redemarrage() {
         .find(|p| p["name"] == "optin")
         .expect("le greffon dormant reste listé");
     assert_eq!(entry["installed"], true);
-    assert_eq!(entry["enabled"], false);
+    // rc11 : voulu actif (case cochée), pas encore monté.
+    assert_eq!(entry["enabled"], true);
+    assert_eq!(entry["loaded"], false);
     assert_eq!(
         entry["restart_required"], true,
         "installé et pas chargé : la fiche doit l'annoncer comme la fiche wasm — {entry}"
     );
 }
 
-/// `dj` et `karaoke` sont compilés dans TOUS les binaires publiés — les six
-/// lignes de build de `release.yml` les listent avec `bandcamp`. Ils ne
-/// doivent pourtant plus figurer dans le gestionnaire : aucun écran du client
-/// ne sait les atteindre, et proposer « Installer » sur une fonction que rien
-/// n'expose ne rend rien à l'utilisateur (#2090).
+/// `dj` est compilé dans TOUS les binaires publiés mais ne doit pas figurer
+/// dans le gestionnaire : 11 routes sur 13 sont inopérantes, et proposer
+/// « Installer » sur une fonction qui ne fait rien ne rend rien à l'utilisateur
+/// (#2090). Décision de Bertrand du 01/11/2026 : DJ reste en brouillon.
+/// (Karaoké, lui, est proposé depuis la rc11 : `activation_dj_karaoke_b209.rs`.)
 ///
-/// Le test s'exécute sous le jeu de fonctionnalités livré. Sans `--features
-/// dj,karaoke` les deux greffons ne sont pas enregistrés du tout, et le test
-/// passerait sans rien prouver : on l'annonce dans le message d'échec plutôt
-/// que de laisser croire à une preuve.
+/// Sans `--features dj` le greffon n'est pas enregistré et le test ne prouve
+/// rien : `activation_dj_karaoke_b209` porte le témoin gardé par la feature.
 #[tokio::test]
-async fn dj_and_karaoke_are_not_offered_in_the_plugin_manager() {
+async fn dj_is_not_offered_in_the_plugin_manager() {
     use_scratch_plugin_data_dir();
 
     let state = new_state();
@@ -730,21 +730,12 @@ async fn dj_and_karaoke_are_not_offered_in_the_plugin_manager() {
         .iter()
         .filter_map(|p| p["name"].as_str())
         .collect();
-
-    for hidden in ["dj", "karaoke"] {
-        assert!(
-            !names.contains(&hidden),
-            "« {hidden} » ne doit plus être proposé par le gestionnaire (listés : {names:?})"
-        );
-    }
-
-    // Contre-épreuve dans le même souffle : le filtre retire les greffons hors
-    // catalogue, pas les greffons dormants en général. Un opt-in ordinaire,
-    // dormant pour exactement la même raison, reste proposé.
     assert!(
-        names.contains(&"optin"),
-        "un opt-in catalogué doit rester proposé (listés : {names:?})"
+        !names.contains(&"dj"),
+        "« dj » ne doit pas être proposé par le gestionnaire (listés : {names:?})"
     );
+    // Contre-épreuve : un opt-in ordinaire, dormant pour la même raison, reste proposé.
+    assert!(names.contains(&"optin"), "listés : {names:?}");
 }
 
 /// Retiré du catalogue n'est pas retiré du binaire : DJ se charge encore si on
@@ -1114,14 +1105,52 @@ async fn aucune_fiche_de_la_liste_ne_sort_sans_compatible() {
         );
     }
 
-    // Et nommément les deux familles du relevé de Querite : l'intégrée
-    // (xtune) et une SDK (bandcamp chez lui, `loads` ici).
-    for attendu in ["xtune", "loads", "optin", "horscatalogue"] {
+    // Et nommément la famille SDK du relevé de Querite (bandcamp chez lui,
+    // `loads` ici). L'intégrée qu'il citait, xTune, n'est plus annoncée
+    // (#4908).
+    for attendu in ["loads", "optin", "horscatalogue"] {
         let fiche = entrees
             .iter()
             .find(|f| f["name"] == attendu)
             .unwrap_or_else(|| panic!("« {attendu} » doit figurer dans la liste"));
         assert_eq!(fiche["compatible"], true, "{fiche}");
+    }
+}
+
+/// #4908 — `GET /plugins` n'annonce plus xTune.
+///
+/// La fiche intégrée « xtune » renvoyait vers `/xtune/`, une route que le
+/// serveur ne sert pas : l'écran Extensions proposait un lien mort. Le besoin
+/// qu'elle portait (commandes d'écran verrouillé sur téléphone) est livré par
+/// le client web. Ce témoin rougit si la fiche, ou n'importe quelle entrée
+/// pointant vers `/xtune`, revient dans la liste.
+///
+/// Contre-épreuve : remettre le bloc `plugins.push(json!({"name": "xtune", …}))`
+/// dans `list_plugins_brut` fait rougir ce test sur «xtune».
+#[tokio::test]
+async fn la_liste_n_annonce_plus_xtune_4908() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Loads)]).await;
+    semer_les_fiches_heritees(&state);
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = body_of(&app, "/api/v1/plugins").await;
+    assert_eq!(status, StatusCode::OK);
+    let liste: Value = serde_json::from_str(&body).unwrap();
+    let entrees = liste.as_array().expect("un tableau");
+    assert!(
+        entrees.iter().any(|f| f["name"] == "loads"),
+        "la liste doit montrer le greffon chargé : {liste}"
+    );
+
+    for fiche in entrees {
+        let nom = fiche["name"].as_str().unwrap_or("<sans nom>");
+        let url = fiche["url"].as_str().unwrap_or("");
+        assert!(
+            !nom.eq_ignore_ascii_case("xtune") && !url.starts_with("/xtune"),
+            "« {nom} » annonce xTune, vers une route que rien ne sert ({fiche})"
+        );
     }
 }
 

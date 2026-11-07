@@ -202,3 +202,101 @@ async fn le_double_appui_d_un_controleur_reste_coalesce() {
         );
     }
 }
+
+/// #7097 — passer par tick(), pas seulement handle_track_end : la grâce
+/// de chargement ne doit pas avaler la fin d'un fichier plus court que 5 s.
+async fn la_fin_courte_est_examinee_avant_45_secondes_7097(pic: u64, doit_avancer: bool) {
+    use crate::outputs::traits::OutputTarget;
+    use std::sync::atomic::Ordering;
+    let b = Banc::monter("openhome", "mock-openhome-7097").await;
+    // Deux pistes distinctes, fichier et durée connus ; la sortie est factice.
+    let db = b.orchestrator.db.clone();
+    let premier = PlayQueueRepo::with_backend(db.clone())
+        .get_queue(b.zone_id)
+        .unwrap()[0]
+        .track_id;
+    let second_fichier = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+    ecrire_wav(second_fichier.path());
+    let mut seconde = crate::db::models::Track::new("Deuxième WAV court 7097".into());
+    seconde.file_path = Some(second_fichier.path().to_string_lossy().into_owned());
+    seconde.format = Some("wav".into());
+    seconde.duration_ms = DUREE_MS;
+    seconde.sample_rate = Some(44_100);
+    seconde.bit_depth = Some(16);
+    let suivant = TrackRepo::with_backend(db.clone())
+        .create(&seconde)
+        .unwrap();
+    PlayQueueRepo::with_backend(db)
+        .set_queue(b.zone_id, &[premier, suivant])
+        .unwrap();
+    b.playback.set_repeat(b.zone_id, RepeatMode::Off).await;
+    b.lancer().await;
+    let etat = b.playback.get_state(b.zone_id).await;
+    let sid = etat
+        .now_playing
+        .as_ref()
+        .unwrap()
+        .stream_id
+        .as_ref()
+        .unwrap();
+    {
+        let sessions = b.orchestrator.streamer.sessions_state();
+        let sessions = sessions.lock().await;
+        let session = sessions.get(sid).unwrap();
+        session
+            .bytes_sent
+            .store(session.info.file_size.unwrap(), Ordering::Relaxed);
+    }
+    {
+        let outputs = b.outputs.lock().await;
+        let arc = outputs.get(&b.appareil).unwrap();
+        let sortie = arc.lock().await;
+        let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
+        mock.stop().await.unwrap();
+        mock.set_position(pic);
+        // Comme le rapport : OpenHome ne donne pas sa durée, la file la porte.
+        mock.set_duration(0);
+    }
+    let mut ps = ZonePollState::new(etat.track_generation);
+    ps.track_started_at = Instant::now().checked_sub(Duration::from_secs(4));
+    ps.track_loaded_at = Instant::now() - Duration::from_secs(4);
+    ps.peak_position_ms = pic;
+    ps.last_position_ms = pic;
+    let mut polls = HashMap::from([(b.zone_id, ps)]);
+    let mut idle = HashMap::new();
+    // Cinq arrêts de la sortie, seuil normal inchangé ; le banc reste bien
+    // dans la fenêtre des 45 s et ne provoque aucune attente réelle.
+    for _ in 0..STOPPED_TICKS_THRESHOLD {
+        b.poller.tick(&mut polls, &mut idle, &Instant::now()).await;
+    }
+    let apres = b.playback.get_state(b.zone_id).await;
+    if doit_avancer {
+        assert_eq!(
+            apres.now_playing.as_ref().and_then(|p| p.track_id),
+            Some(suivant),
+            "#7097 : la fin d'un WAV de moins de cinq secondes ne doit pas attendre toute la grâce de 45 s"
+        );
+        assert_eq!(
+            b.play_recus().await,
+            2,
+            "la sortie reçoit vraiment le titre suivant"
+        );
+    } else {
+        assert_eq!(
+            apres.now_playing.as_ref().and_then(|p| p.track_id),
+            Some(premier),
+            "démarrage sans progression : conserver sa grâce, ne pas sauter la piste"
+        );
+        assert_eq!(b.play_recus().await, 1);
+    }
+}
+
+#[tokio::test]
+async fn le_sondeur_avance_apres_un_wav_court_sans_attendre_45_secondes_7097() {
+    la_fin_courte_est_examinee_avant_45_secondes_7097(3_500, true).await;
+}
+
+#[tokio::test]
+async fn le_sondeur_garde_la_grace_d_un_wav_qui_n_a_pas_demarre_7097() {
+    la_fin_courte_est_examinee_avant_45_secondes_7097(0, false).await;
+}

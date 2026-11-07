@@ -10,6 +10,7 @@ pub mod ecoutes_au_compte;
 pub mod ecoutes_communaute;
 pub mod library_reconcile;
 pub mod library_sync;
+pub mod logos_labels_partages;
 pub mod mesures_communautaires;
 pub mod metadata_proposals;
 pub mod notes_communautaires;
@@ -26,6 +27,9 @@ pub mod sso;
 pub mod support;
 pub mod telemetry;
 pub mod tune_tested;
+pub mod tune_tested_auto;
+// #7922 — proposer un appareil après une heure d'écoute sans erreur.
+pub mod tune_tested_proposition;
 
 /// Posé par le relais (`relay`) sur CHAQUE requête qu'il rejoue en local,
 /// après les en-têtes venus du distant : un appelant distant peut ajouter des

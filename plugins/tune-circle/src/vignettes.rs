@@ -221,7 +221,11 @@ impl Vignettes {
     /// La boucle de fond : un passage toutes les [`INTERVALLE`], ou plus tôt
     /// sur [`Self::reveiller`].
     pub async fn tourner(self: Arc<Self>) {
-        tokio::time::sleep(Duration::from_secs(180)).await;
+        // #6733 : une activation explicite interrompt aussi le délai initial.
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(180)) => {}
+            _ = self.reveil.notified() => {}
+        }
         loop {
             let bilan = self.passage().await;
             if !bilan.rien {

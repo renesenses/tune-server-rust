@@ -179,7 +179,7 @@ async fn radio_locale_conserve_les_octets_et_les_bits_faibles_5217() {
     lecture.arreter().await;
     let attendu = &pcm_de_reference()[..pcm.len()];
     assert!(
-        attendu.chunks_exact(3).any(|s| s[0] != 0),
+        attendu.as_chunks::<3>().0.iter().any(|s| s[0] != 0),
         "la référence doit porter des bits sous le seizième"
     );
     assert!(
@@ -203,7 +203,9 @@ async fn radio_oaat_conserve_le_format_compatible_16_bits_5217() {
         "le correctif local ne relève pas la profondeur réseau"
     );
     let attendu: Vec<u8> = pcm_de_reference()
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .take(pcm.len() / 2)
         .flat_map(|s| {
             let entier =

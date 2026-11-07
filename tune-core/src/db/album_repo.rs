@@ -244,11 +244,47 @@ pub mod sql {
          ORDER BY a.id, t.id"
     }
 
+    /// #6459 — les albums locaux rangés sous « Unknown Artist » (ou sans
+    /// artiste), hors compilations, avec la balise `album_artist` et l'artiste
+    /// de chacune de leurs pistes.
+    pub fn albums_inconnus_a_reprendre() -> &'static str {
+        "SELECT a.id, a.title, t.album_artist, t.artist_id, tar.name \
+         FROM albums a \
+         JOIN tracks t ON t.album_id = a.id \
+         LEFT JOIN artists ar ON ar.id = a.artist_id \
+         LEFT JOIN artists tar ON tar.id = t.artist_id \
+         WHERE (ar.id IS NULL OR LOWER(TRIM(ar.name)) IN ('', 'unknown artist')) \
+           AND COALESCE(a.is_compilation, 0) = 0 \
+           AND COALESCE(a.source, 'local') = 'local' \
+         ORDER BY a.id, t.id"
+    }
+
+    /// #6459 — chemin, balise `album_artist` et artiste de chaque piste d'un
+    /// album.
+    pub fn balises_d_artiste_des_pistes<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT t.file_path, t.album_artist, tar.name FROM tracks t \
+             LEFT JOIN artists tar ON tar.id = t.artist_id \
+             WHERE t.album_id = {}",
+            d.placeholder(1)
+        )
+    }
+
     /// Les numéros de disque distincts déjà rangés sous un album (C4).
     pub fn disc_numbers_of<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT DISTINCT disc_number FROM tracks \
              WHERE album_id = {} AND disc_number IS NOT NULL",
+            d.placeholder(1)
+        )
+    }
+
+    /// #7694 — chemin et qualité de chaque piste d'un album, pour la règle
+    /// des dossiers miroirs.
+    pub fn qualites_des_pistes_de_l_album<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT file_path, format, sample_rate, bit_depth FROM tracks \
+             WHERE album_id = {} AND file_path IS NOT NULL",
             d.placeholder(1)
         )
     }
@@ -652,6 +688,13 @@ pub mod sql {
         "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.bio IS NULL OR a.bio = '') AND a.source = 'local' ORDER BY a.id"
     }
 
+    /// Écran « État du serveur » (01/11/2026) : les albums LOCAUX et ceux
+    /// d'entre eux sans pochette, en une lecture. Même filtre que
+    /// [`list_without_cover`] : les deux nombres ne divergent pas.
+    pub fn compter_pochettes_locales() -> &'static str {
+        "SELECT COUNT(*), COUNT(CASE WHEN a.cover_path IS NULL OR a.cover_path = '' THEN 1 END) FROM albums a WHERE a.source = 'local'"
+    }
+
     pub fn count_with_bio() -> &'static str {
         "SELECT COUNT(*) FROM albums WHERE bio IS NOT NULL AND bio != ''"
     }
@@ -799,7 +842,8 @@ pub mod sql {
     pub fn labels_de_la_bibliotheque<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT TRIM(a.label) AS nom, COUNT(*) AS n, \
-             MAX(CASE WHEN a.source = 'qobuz' THEN a.source_id END) AS qobuz \
+             MAX(CASE WHEN a.source = 'qobuz' THEN a.source_id END) AS qobuz, \
+             MAX(CASE WHEN a.musicbrainz_release_id <> '' THEN a.musicbrainz_release_id END) AS release_mb \
              FROM albums a \
              WHERE a.label IS NOT NULL AND TRIM(a.label) <> '' AND {} AND {} \
              GROUP BY TRIM(a.label) ORDER BY TRIM(a.label)",
@@ -843,6 +887,9 @@ pub struct LabelDeBibliotheque {
     pub album_count: i64,
     /// L'identifiant Qobuz d'un album Qobuz de la bibliothèque qui le porte.
     pub album_qobuz: Option<String>,
+    /// Le MBID de release d'un album de la bibliothèque qui le porte (#7089) :
+    /// sa `label-info` rapproche le label sans ambiguïté.
+    pub release_mb: Option<String>,
 }
 
 /// Une tranche de Dynamic Range, bornes **incluses** (#2144).
@@ -1133,17 +1180,65 @@ pub struct BilanRecalculCompilations {
     pub erreurs: usize,
 }
 
+/// Bilan de [`AlbumRepo::rendre_leur_artiste_aux_albums_inconnus`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BilanArtistesRendus {
+    /// Albums sous « Unknown Artist » examinés.
+    pub examines: usize,
+    /// Albums rendus à leur artiste.
+    pub rendus: usize,
+    /// Laissés tels quels : artiste tenu à la main (C3).
+    pub manuels: usize,
+    /// Laissés tels quels : pas d'artiste unique et nommé dans la base.
+    pub indecis: usize,
+    pub erreurs: usize,
+}
+
+/// #7694 — la qualité du fichier que le scan range, pour la règle des
+/// dossiers miroirs (#4907) : un dossier recopié sous une autre racine n'est
+/// la même parution que s'il porte la même qualité. L'édition DSD et
+/// l'édition CD d'un album, rangées `…/DSD/Artiste/Album` et
+/// `…/CD/Artiste/Album`, restent deux albums, chacun avec sa pochette.
+pub struct QualiteDuFichier<'a> {
+    /// [`crate::library::quality::score_qualite`] du fichier en cours.
+    pub score: (bool, i64),
+    /// Les scores que le scan en cours a déjà vus sous un dossier et qu'il
+    /// n'a pas encore écrits en base : les pistes d'un lot ne sont écrites
+    /// qu'à sa fin, et les deux éditions tiennent souvent dans le même lot.
+    pub vues_dans_le_scan: &'a dyn Fn(&str) -> Vec<(bool, i64)>,
+}
+
 pub struct AlbumRepo {
     db: Arc<dyn DbBackend>,
+    /// #6285 — le filtre du verdict hi-res de la liste (`?hires_verdict=`),
+    /// posé par [`Self::avec_filtre_hires`]. `None` : le SQL d'avant.
+    filtre_hires: Option<crate::audio::faux_hires_publie::FiltreHires>,
 }
 
 impl AlbumRepo {
     pub fn new(db: SqliteDb) -> Self {
-        Self { db: Arc::new(db) }
+        Self {
+            db: Arc::new(db),
+            filtre_hires: None,
+        }
     }
 
     pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
-        Self { db }
+        Self {
+            db,
+            filtre_hires: None,
+        }
+    }
+
+    /// #6285 — restreint les listages filtrés (`list_filtered*`) aux albums
+    /// dont le verdict hi-res PUBLIÉ est celui du filtre. Un réglage du dépôt
+    /// plutôt qu'un paramètre de plus aux trois listages et à leurs appelants.
+    pub fn avec_filtre_hires(
+        mut self,
+        filtre: Option<crate::audio::faux_hires_publie::FiltreHires>,
+    ) -> Self {
+        self.filtre_hires = filtre;
+        self
     }
 
     fn marque(&self, n: usize) -> String {
@@ -1749,6 +1844,36 @@ impl AlbumRepo {
         track_number: Option<i32>,
         disc_number: Option<i32>,
     ) -> Result<Album, TuneError> {
+        self.get_or_create_for_folder_de_qualite(
+            folder,
+            title,
+            artist_id,
+            year,
+            mbid,
+            track_number,
+            disc_number,
+            None,
+        )
+    }
+
+    /// #7694 — [`Self::get_or_create_for_folder_with_track`] qui connaît aussi
+    /// la QUALITÉ du fichier en cours. Elle ne sert qu'à la règle des dossiers
+    /// miroirs (#4907) : l'édition DSD et l'édition CD d'un album, rangées
+    /// sous le même chemin relatif de deux racines (`…/DSD/Artiste/Album` et
+    /// `…/CD/Artiste/Album`), sont deux parutions, pas une copie de
+    /// sauvegarde. `None` garde la règle telle qu'elle était.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_or_create_for_folder_de_qualite(
+        &self,
+        folder: &str,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+        mbid: Option<&str>,
+        track_number: Option<i32>,
+        disc_number: Option<i32>,
+        qualite: Option<QualiteDuFichier<'_>>,
+    ) -> Result<Album, TuneError> {
         if folder.is_empty() {
             return self.get_or_create_with_mbid(title, artist_id, year, mbid);
         }
@@ -1758,7 +1883,7 @@ impl AlbumRepo {
         // édition de plus : sans ce rattrapage, chaque copie d'une racine à
         // l'autre dédoublait l'album dans toutes les vues.
         if self.find_id_by_folder(folder)?.is_none() {
-            if let Some(album) = self.album_du_dossier_miroir(folder, title)? {
+            if let Some(album) = self.album_du_dossier_miroir(folder, title, qualite)? {
                 return Ok(album);
             }
         }
@@ -1915,10 +2040,14 @@ impl AlbumRepo {
     /// ([`crate::library::exemplaires::dossiers_miroirs`]) — quand il porte le
     /// même titre (#4907). Le titre est exigé en plus du chemin : un dossier
     /// homonyme qui contiendrait une autre parution reste un autre album.
+    ///
+    /// #7694 — quand la qualité du fichier est connue, le miroir doit aussi
+    /// porter cette qualité : voir [`QualiteDuFichier`].
     fn album_du_dossier_miroir(
         &self,
         folder: &str,
         title: &str,
+        qualite: Option<QualiteDuFichier<'_>>,
     ) -> Result<Option<Album>, TuneError> {
         let racines = crate::library::exemplaires::dossiers_de_musique(&*self.db);
         let titre = title.trim().to_lowercase();
@@ -1932,17 +2061,68 @@ impl AlbumRepo {
                 continue;
             };
             let album = row_to_album(&row);
-            if album.title.trim().to_lowercase() == titre {
+            if album.title.trim().to_lowercase() != titre {
+                continue;
+            }
+            if let Some(q) = qualite.as_ref()
+                && !self.miroir_de_meme_qualite(id, &miroir, q)?
+            {
                 tracing::info!(
                     album_id = id,
                     dossier = folder,
                     miroir = %miroir,
-                    "album_miroir_rattache — même dossier sous une autre racine : même album"
+                    "album_miroir_ecarte — même dossier sous une autre racine, autre qualité : autre édition"
                 );
-                return Ok(Some(album));
+                continue;
             }
+            tracing::info!(
+                album_id = id,
+                dossier = folder,
+                miroir = %miroir,
+                "album_miroir_rattache — même dossier sous une autre racine : même album"
+            );
+            return Ok(Some(album));
         }
         Ok(None)
+    }
+
+    /// #7694 — le dossier `miroir` de l'album `album_id` porte-t-il la qualité
+    /// du fichier en cours ? On compare aux pistes rangées SOUS ce dossier, en
+    /// base et vues par le scan en cours, pas à tout l'album : un album déjà
+    /// réuni à tort (DSD + CD) se sépare ainsi au scan suivant. Une qualité
+    /// présente parmi celles du miroir suffit, pour qu'une édition aux disques
+    /// de cadences différentes reste une copie. Rien de connu sous le miroir :
+    /// la règle #4907 joue comme avant.
+    fn miroir_de_meme_qualite(
+        &self,
+        album_id: i64,
+        miroir: &str,
+        qualite: &QualiteDuFichier<'_>,
+    ) -> Result<bool, TuneError> {
+        let sql = self.dialect_sql(
+            sql::qualites_des_pistes_de_l_album,
+            sql::qualites_des_pistes_de_l_album,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        let mut connues: Vec<(bool, i64)> = self
+            .db
+            .query_many_strong(&sql, &params)?
+            .iter()
+            .filter(|r| {
+                r.first().and_then(|v| v.as_str()).is_some_and(|chemin| {
+                    crate::library::local_path::sous_le_dossier_stocke(chemin, miroir)
+                })
+            })
+            .map(|r| {
+                crate::library::quality::score_qualite(
+                    r.get(1).and_then(|v| v.as_str()),
+                    r.get(2).and_then(|v| v.as_i64()),
+                    r.get(3).and_then(|v| v.as_i64()),
+                )
+            })
+            .collect();
+        connues.extend((qualite.vues_dans_le_scan)(miroir));
+        Ok(connues.is_empty() || connues.contains(&qualite.score))
     }
 
     /// Rend à l'album son vrai artiste quand il est resté sur « Unknown Artist ».
@@ -2311,6 +2491,224 @@ impl AlbumRepo {
         self.mark_compilation(album_id)
     }
 
+    /// #6459 — vrai si donner `artist_id` à `album` remplacerait un artiste
+    /// NOMMÉ par « Unknown Artist » (ou un nom vide, ou un artiste disparu).
+    ///
+    /// C'est la règle de [`Self::reclaim_unknown_artist`], lue dans l'autre
+    /// sens : un fichier relu sans balise d'artiste ne rétrograde jamais un
+    /// album déjà résolu. « Various Artists » n'est pas concerné : il vient du
+    /// verdict compilation, qui a ses propres règles.
+    ///
+    /// La garde se fonde sur l'artiste ACTUEL de l'album, pas sur ce que ses
+    /// pistes portent en base : la relecture gardée réécrit ces pistes sans
+    /// balise d'artiste, et une preuve tirée d'elles ne tiendrait qu'un
+    /// passage — la relecture suivante rétrogradait l'album pour de bon.
+    ///
+    /// Une seule exception : quand `lu_depuis_le_chemin` (le fichier relu n'a
+    /// pas de balises lisibles) et que l'artiste actuel est le nom d'un
+    /// dossier du chemin d'une piste, sans qu'aucune piste ne le porte en
+    /// balise `album_artist`. C'est le faux artiste tiré d'un nom de dossier
+    /// ou de montage par une version antérieure (#6737), que la relecture
+    /// doit pouvoir effacer.
+    pub fn retrograderait_l_artiste(
+        &self,
+        album: &Album,
+        artist_id: i64,
+        lu_depuis_le_chemin: bool,
+    ) -> bool {
+        fn inconnu(nom: Option<&str>) -> bool {
+            nom.map(str::trim).is_none_or(|n| {
+                n.is_empty() || n.eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME)
+            })
+        }
+        let (Some(album_id), Some(actuel)) = (album.id, album.artist_name.as_deref()) else {
+            return false;
+        };
+        if album.artist_id == Some(artist_id) || inconnu(Some(actuel)) {
+            return false;
+        }
+        let sql = self.dialect_sql(sql::get_artist_name, sql::get_artist_name);
+        let params: [&dyn ToSqlValue; 1] = [&artist_id];
+        let demande = self
+            .db
+            .query_one_strong(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|row| row.first()?.as_string());
+        if !inconnu(demande.as_deref()) {
+            return false;
+        }
+        if !lu_depuis_le_chemin {
+            return true;
+        }
+        let actuel = actuel.trim();
+        let sql = self.dialect_sql(
+            sql::balises_d_artiste_des_pistes,
+            sql::balises_d_artiste_des_pistes,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        let pistes = self.db.query_many_strong(&sql, &params).unwrap_or_default();
+        let balise = pistes.iter().any(|r| {
+            r.get(1)
+                .and_then(|v| v.as_string())
+                .is_some_and(|n| n.trim().eq_ignore_ascii_case(actuel))
+        });
+        let dossier_du_chemin = pistes.iter().any(|r| {
+            r.first()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default()
+                .split(['/', '\\'])
+                .any(|d| d.trim().eq_ignore_ascii_case(actuel))
+        });
+        balise || !dossier_du_chemin
+    }
+
+    /// [`Self::retrograderait_l_artiste`] pour un album désigné par son
+    /// identifiant, lu par la connexion d'écriture (le scan tient sa
+    /// transaction de lot).
+    fn retrograderait_l_artiste_de(
+        &self,
+        album_id: i64,
+        artist_id: i64,
+        lu_depuis_le_chemin: bool,
+    ) -> bool {
+        let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        self.db
+            .query_one_strong(&sql, &params)
+            .ok()
+            .flatten()
+            .is_some_and(|row| {
+                self.retrograderait_l_artiste(&row_to_album(&row), artist_id, lu_depuis_le_chemin)
+            })
+    }
+
+    /// #6459 — rend son artiste, SANS relire un fichier, à un album local
+    /// rangé sous « Unknown Artist » alors que la base sait qui il est.
+    ///
+    /// Un scan ordinaire saute les fichiers inchangés : un album rétrogradé
+    /// par une relecture passée le restait jusqu'à ce que ses fichiers
+    /// changent. La base garde ce qu'il faut : la balise `album_artist` et
+    /// l'artiste propre de chaque piste. Un album est repris si :
+    ///
+    /// - son artiste n'est pas tenu à la main (C3) ;
+    /// - il n'est pas marqué compilation ;
+    /// - ses pistes portent toutes la même balise `album_artist` non vide
+    ///   (aucune autre), ou, sans aucune balise, toutes le même artiste de
+    ///   piste nommé ;
+    /// - cet artiste n'est ni « Unknown Artist » ni « Various Artists ».
+    ///
+    /// Sinon il est laissé tel quel (`indecis`). Idempotente : jouée au
+    /// démarrage et après chaque scan, comme
+    /// [`Self::recalculer_les_compilations`].
+    pub fn rendre_leur_artiste_aux_albums_inconnus(
+        &self,
+    ) -> Result<BilanArtistesRendus, TuneError> {
+        use crate::library::regle_compilation::est_artistes_divers;
+        use std::collections::BTreeMap;
+
+        fn nomme(nom: &str) -> bool {
+            let n = nom.trim();
+            !n.is_empty()
+                && !n.eq_ignore_ascii_case(crate::db::artist_repo::UNKNOWN_ARTIST_NAME)
+                && !est_artistes_divers(n)
+        }
+
+        struct Ligne {
+            id: i64,
+            titre: String,
+            balises: BTreeMap<String, String>,
+            artistes_de_piste: BTreeMap<i64, String>,
+            piste_sans_artiste_nomme: bool,
+        }
+
+        let rows = self
+            .db
+            .query_many_strong(sql::albums_inconnus_a_reprendre(), &[])?;
+        let mut albums: Vec<Ligne> = Vec::new();
+        for r in &rows {
+            let Some(id) = r.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            if albums.last().is_none_or(|a| a.id != id) {
+                albums.push(Ligne {
+                    id,
+                    titre: r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    balises: BTreeMap::new(),
+                    artistes_de_piste: BTreeMap::new(),
+                    piste_sans_artiste_nomme: false,
+                });
+            }
+            let Some(a) = albums.last_mut() else { continue };
+            if let Some(b) = r
+                .get(2)
+                .and_then(|v| v.as_string())
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty())
+            {
+                a.balises.entry(b.to_lowercase()).or_insert(b);
+            }
+            match (
+                r.get(3).and_then(|v| v.as_i64()),
+                r.get(4).and_then(|v| v.as_string()),
+            ) {
+                (Some(aid), Some(nom)) if nomme(&nom) => {
+                    a.artistes_de_piste.insert(aid, nom);
+                }
+                _ => a.piste_sans_artiste_nomme = true,
+            }
+        }
+
+        let meta = crate::db::album_metadata_repo::AlbumMetadataRepo::with_backend(self.db.clone());
+        let artistes = crate::db::artist_repo::ArtistRepo::with_backend(self.db.clone());
+        let update_sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
+        let mut bilan = BilanArtistesRendus {
+            examines: albums.len(),
+            ..Default::default()
+        };
+        for a in &albums {
+            let tenus = meta.champs_edites_a_la_main(a.id).unwrap_or_default();
+            if tenus.iter().any(|c| c == "artist") {
+                bilan.manuels += 1;
+                continue;
+            }
+            let balises: Vec<&String> = a.balises.values().collect();
+            let pistes: Vec<(&i64, &String)> = a.artistes_de_piste.iter().collect();
+            let nouvel_artiste = match (balises.as_slice(), pistes.as_slice()) {
+                ([b], _) if nomme(b) => artistes
+                    .get_or_create(b, None, None)
+                    .ok()
+                    .and_then(|x| x.id),
+                ([], [(aid, _)]) if !a.piste_sans_artiste_nomme => Some(**aid),
+                _ => None,
+            };
+            let Some(nouvel_artiste) = nouvel_artiste else {
+                bilan.indecis += 1;
+                continue;
+            };
+            let params: [&dyn ToSqlValue; 2] = [&nouvel_artiste, &a.id];
+            match self.db.execute(&update_sql, &params) {
+                Ok(_) => {
+                    bilan.rendus += 1;
+                    tracing::info!(
+                        album_id = a.id,
+                        album = %a.titre,
+                        nouvel_artiste_id = nouvel_artiste,
+                        "album_artist_rendu_depuis_unknown"
+                    );
+                }
+                Err(e) => {
+                    bilan.erreurs += 1;
+                    tracing::warn!(album_id = a.id, error = %e, "album_artist_rendu_echoue");
+                }
+            }
+        }
+        if bilan.rendus > 0 || bilan.erreurs > 0 {
+            tracing::info!(?bilan, "albums_inconnus_rendus_a_leur_artiste");
+        }
+        Ok(bilan)
+    }
+
     /// #4896 — reprend le titre et/ou l'artiste d'une ligne album d'après les
     /// balises de ses pistes, que le surveillant de fichiers vient de relire
     /// (voir `auto_scan::realigner_albums_sur_les_balises`, qui décide).
@@ -2318,11 +2716,30 @@ impl AlbumRepo {
     /// Écriture ciblée, comme [`Self::reclasser_en_compilation`] : la pochette
     /// et les dates restent. Chaque champ tenu par une édition manuelle
     /// (C3) est laissé tel quel. Rend `true` si quelque chose a été écrit.
+    ///
+    /// #6459 — n'écrit jamais « Unknown Artist » sur un album nommé. Le
+    /// surveillant ne propose qu'un artiste balisé de façon unanime, jamais un
+    /// nom tiré du chemin : la garde la plus protectrice s'applique
+    /// (`lu_depuis_le_chemin = false`), même pour un artiste égal au nom du
+    /// dossier de l'album.
     pub fn realigner_sur_les_balises(
         &self,
         album_id: i64,
         titre: Option<&str>,
         artist_id: Option<i64>,
+    ) -> Result<bool, TuneError> {
+        self.realigner_sur_les_balises_relues(album_id, titre, artist_id, false)
+    }
+
+    /// [`Self::realigner_sur_les_balises`] pour la reprise du scan, qui sait
+    /// si le fichier relu n'avait pas de balises lisibles
+    /// (`lu_depuis_le_chemin`) : voir [`Self::retrograderait_l_artiste`].
+    pub fn realigner_sur_les_balises_relues(
+        &self,
+        album_id: i64,
+        titre: Option<&str>,
+        artist_id: Option<i64>,
+        lu_depuis_le_chemin: bool,
     ) -> Result<bool, TuneError> {
         let mut ecrit = false;
         if let Some(titre) = titre
@@ -2333,6 +2750,7 @@ impl AlbumRepo {
         }
         if let Some(artist_id) = artist_id
             && !self.tenu_a_la_main(album_id, "artist")
+            && !self.retrograderait_l_artiste_de(album_id, artist_id, lu_depuis_le_chemin)
         {
             let sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
             let params: [&dyn ToSqlValue; 2] = [&artist_id, &album_id];
@@ -2959,6 +3377,18 @@ impl AlbumRepo {
         }
     }
 
+    /// `(albums locaux, albums locaux sans pochette)` — voir
+    /// [`sql::compter_pochettes_locales`].
+    pub fn compter_pochettes_locales(&self) -> Result<(i64, i64), TuneError> {
+        match self.db.query_one(sql::compter_pochettes_locales(), &[])? {
+            None => Ok((0, 0)),
+            Some(cols) => Ok((
+                cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+            )),
+        }
+    }
+
     pub fn count_with_bio(&self) -> Result<i64, TuneError> {
         match self.db.query_one(sql::count_with_bio(), &[])? {
             None => Ok(0),
@@ -3241,8 +3671,17 @@ impl AlbumRepo {
     /// partagent l'expression AU CARACTÈRE PRÈS (#3397). Recopiée, elle
     /// dériverait, et le tri « Ajout récent » cesserait de correspondre à la
     /// date rendue.
+    ///
+    /// #7722 — la date mesurée est celle d'« Ajouts récents › Date de
+    /// création » ([`super::home_queries::DATE_DE_CREATION`]) : le btime du
+    /// fichier, sinon la première vue, sinon le mtime. La première vue seule
+    /// vaut le mtime d'origine d'un fichier recopié (#2138) : 3 000 pistes
+    /// déposées la veille se rangeaient parmi les vieux albums. Le texte de
+    /// la constante doit contenir `MAX(DATE_DE_CREATION)` au caractère près,
+    /// ce que garde un test.
     pub(crate) const ADDED_AT_SOURCE: &'static str = "SELECT t.album_id, \
-                MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))) AS added_at \
+                MAX(COALESCE(ffs.created_at, COALESCE(ffs.first_seen_at, \
+     CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION)))) AS added_at \
            FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path";
 
     /// La date d'ajout des albums de la PAGE, en une requête groupée (#3397).
@@ -3590,6 +4029,37 @@ impl AlbumRepo {
                     row.get(1).and_then(|v| v.as_i64()),
                 ) {
                     par_id.insert(id, dr);
+                }
+            }
+        }
+        Ok(par_id)
+    }
+
+    /// #7725 — le plus grand nombre de canaux des pistes de chaque album de
+    /// `ids`, en une requête groupée par paquet. Un album absent de la table
+    /// rendue n'a aucune piste dont le nombre de canaux soit connu.
+    pub fn canaux_max_par_album(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, i64>, TuneError> {
+        let mut par_id = std::collections::HashMap::new();
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT album_id, MAX(channels) FROM tracks \
+                  WHERE album_id IN ({id_list}) AND channels IS NOT NULL \
+                  GROUP BY album_id"
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                if let (Some(id), Some(n)) = (
+                    row.first().and_then(|v| v.as_i64()),
+                    row.get(1).and_then(|v| v.as_i64()),
+                ) {
+                    par_id.insert(id, n);
                 }
             }
         }
@@ -4022,7 +4492,10 @@ impl AlbumRepo {
         // de `Album::quality()`, sur les mêmes champs d'album. Avant, `hires`
         // gardait tout album dont UNE piste dépassait 44,1 kHz (DSD compris)
         // et `cd` exigeait 44,1 kHz / 16 bits pile.
-        if let Some(pred) = quality.and_then(|q| Album::quality_sql(q, "a")) {
+        // #7725 : Multicanal se lit sur les pistes, l'album n'a pas de canaux.
+        if quality == Some(Album::QUALITE_MULTICANAL) {
+            wheres.push(Album::multicanal_sql_album("a"));
+        } else if let Some(pred) = quality.and_then(|q| Album::quality_sql(q, "a")) {
             wheres.push(pred);
         }
         // `COALESCE` : une base migrée depuis SQLite peut porter des NULL, et
@@ -4032,6 +4505,11 @@ impl AlbumRepo {
             Some(true) => wheres.push("COALESCE(a.is_compilation, 0) <> 0".to_string()),
             Some(false) => wheres.push("COALESCE(a.is_compilation, 0) = 0".to_string()),
             None => {}
+        }
+        // #6285 — le verdict hi-res publié : sans valeur liée, le prédicat
+        // n'ajoute aucun marqueur à la séquence.
+        if let Some(filtre) = self.filtre_hires {
+            wheres.push(filtre.predicat("a.id"));
         }
         // Albums masqués (#1391) : exclus par défaut. Le prédicat passe par
         // `wheres` — jamais par le `replacen` de `base_select` plus bas, qui
@@ -4733,6 +5211,10 @@ impl AlbumRepo {
                     album_count: r.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
                     album_qobuz: r
                         .get(2)
+                        .and_then(|v| v.as_string())
+                        .filter(|s| !s.trim().is_empty()),
+                    release_mb: r
+                        .get(3)
                         .and_then(|v| v.as_string())
                         .filter(|s| !s.trim().is_empty()),
                 })
@@ -8394,6 +8876,72 @@ pub(crate) mod tests {
         let asc = arepo.list_sorted(100, 0, "added_at", "asc").unwrap();
         assert_eq!(asc[0].title, "C");
         assert_eq!(asc[2].title, "A");
+    }
+
+    /// #7722 — un album ajouté après les autres passe en tête de « Derniers
+    /// ajouts », même si ses fichiers ont gardé un mtime ancien.
+    ///
+    /// Le scan date la première vue par le mtime (#2138) ; une copie qui le
+    /// conserve range donc l'album parmi les vieux. Sa date de création, elle,
+    /// dit le jour du dépôt, comme « Ajouts récents › Date de création ».
+    #[test]
+    fn derniers_ajouts_suit_la_date_de_creation_7722() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let ancien = arepo.create(&Album::new("Ancien".into())).unwrap();
+        let nouveau = arepo.create(&Album::new("Nouveau".into())).unwrap();
+        for (album_id, path) in [(ancien, "/ancien.flac"), (nouveau, "/nouveau.flac")] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album_id);
+            t.file_path = Some(path.into());
+            t.file_mtime = Some(500.0);
+            trepo.create(&t).unwrap();
+        }
+        // « Ancien » : vu et créé il y a longtemps. « Nouveau » : déposé
+        // après, mais la première vue a repris son mtime d'origine (500).
+        for (path, seen, created) in [
+            ("/ancien.flac", 1000.0f64, 1000.0f64),
+            ("/nouveau.flac", 500.0, 3000.0),
+        ] {
+            db.execute_batch(&format!(
+                "UPDATE file_first_seen SET first_seen_at = {seen}, created_at = {created} \
+                 WHERE file_path = '{path}';"
+            ))
+            .unwrap();
+        }
+
+        for tri in ["added_at", "added_date", "added"] {
+            let desc = arepo.list_sorted(100, 0, tri, "desc").unwrap();
+            assert_eq!(
+                desc.iter().map(|a| a.title.as_str()).collect::<Vec<_>>(),
+                vec!["Nouveau", "Ancien"],
+                "tri {tri} : l'album ajouté le dernier doit être en tête (#7722)"
+            );
+            assert_eq!(
+                desc[0].added_at,
+                Some(3000.0),
+                "tri {tri} : la date rendue doit être la date de création"
+            );
+        }
+    }
+
+    /// #7722 — « Derniers ajouts » des albums et « Ajouts récents › Date de
+    /// création » lisent la même expression : recopiée, elle dériverait.
+    #[test]
+    fn derniers_ajouts_partage_l_expression_de_creation_7722() {
+        let attendu = format!(
+            "MAX({}) AS added_at",
+            crate::db::home_queries::DATE_DE_CREATION
+        );
+        assert!(
+            AlbumRepo::ADDED_AT_SOURCE.contains(&attendu),
+            "ADDED_AT_SOURCE doit mesurer MAX(DATE_DE_CREATION) : {}",
+            AlbumRepo::ADDED_AT_SOURCE
+        );
     }
 
     /// #3397 — la date d'ajout ne dépend PAS du tri demandé.

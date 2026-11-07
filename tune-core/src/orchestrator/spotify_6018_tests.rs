@@ -124,3 +124,43 @@ async fn spotify_6018_le_titre_suivant_n_est_pas_lance_par_le_pre_armement() {
         "le pré-armement a lancé un titre sur l'appareil Spotify"
     );
 }
+
+/// #6946 (Belkadi Yacine, fil 2423) — librespot ne reçoit de Spotify que de
+/// l'Ogg Vorbis, 320 kbit/s au plus, quel que soit le compte. Son PCM passait
+/// pourtant pour la source : le titre s'annonçait « wav » 44,1 kHz / 16 bits,
+/// sans débit, c'est-à-dire comme un CD sans perte. La lecture en cours dit
+/// désormais ce qui a été reçu ; le fil, lui, reste le WAV 16 bits d'avant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spotify_6946_le_titre_s_annonce_ogg_vorbis_320_et_non_wav_cd() {
+    let orch = orchestrateur();
+    let b = banc(1000, OCTETS_PAR_SECONDE as u64);
+    orch.sources_pcm()
+        .inscrire("spotify", Arc::new(b.fournisseur()));
+    // Une zone à soi : l'arrêt des pompes d'une zone est global, et la zone 1
+    // du test voisin, lancé en parallèle, verrait la sienne coupée.
+    let req = demande(6946);
+
+    let r = orch.resolve_stream(&req).await.expect("lecture Spotify");
+    assert_eq!(
+        (r.format_source.as_deref(), r.bitrate_kbps),
+        (Some("ogg"), Some(320)),
+        "le flux résolu doit porter ce que librespot a reçu (Ogg Vorbis 320), \
+         pas seulement le WAV qu'il en a fait"
+    );
+    assert_eq!(
+        (r.mime_type.as_str(), r.bit_depth),
+        ("audio/wav", Some(16)),
+        "le fil ne change pas : même WAV 16 bits qu'avant #6946"
+    );
+
+    let habillage = super::transport::Habillage {
+        album: None,
+        cover_path: None,
+    };
+    let np = orch.composer_le_now_playing(&req, &r, &habillage);
+    assert_eq!(
+        (np.format.as_deref(), np.bitrate_kbps),
+        (Some("ogg"), Some(320)),
+        "la lecture en cours annonçait « wav » sans débit, comme un CD"
+    );
+}

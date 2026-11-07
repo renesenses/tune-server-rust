@@ -36,6 +36,12 @@ pub struct Host {
 }
 
 impl Host {
+    /// Names registered in the ASIO catalog, without loading a driver.
+    /// A driver held by another process remains present in this catalog.
+    pub fn registered_driver_names(&self) -> Vec<String> {
+        self.asio.driver_names()
+    }
+
     pub fn new() -> Result<Self, crate::HostUnavailable> {
         let asio = GLOBAL_ASIO
             .get_or_init(|| Arc::new(sys::Asio::new()))

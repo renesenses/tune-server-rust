@@ -10,6 +10,8 @@ pub mod autoeq;
 pub mod autoeq_base;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
+/// #6385 — les profils d'égaliseur OPRA (JSON), lus vers le même modèle.
+pub mod opra;
 
 pub mod bitperfect_strict;
 /// #4969 — la carte des canaux de SORTIE (réaffectation, disposition,
@@ -37,6 +39,10 @@ pub mod disposition_canaux;
 /// Dither TPDF — UNE implémentation, partagée par tous les étages qui
 /// repassent du flottant à l'entier (#4075, #4076).
 pub mod dither;
+/// #7704 — continuité du porteur DoP dans les rappels de rendu.
+pub mod dop_continu;
+/// #7265 — un DSD que la sortie WASAPI ne peut pas porter en DoP part en PCM.
+pub mod dop_ecarte_7265;
 #[cfg(test)]
 mod dop_porteur_bout_en_bout;
 /// #5643 — le flux « DSD brut » (DsdU8, MSB-first) de la sortie ASIO native.
@@ -73,6 +79,8 @@ pub mod faststart;
 pub mod faux_hires;
 /// La passe de fond des faux hi-res (#6285).
 pub mod faux_hires_passe;
+/// Le verdict des faux hi-res tel qu'il se publie : liste, filtre, règles (#6285).
+pub mod faux_hires_publie;
 /// Mémoire du volume d'avant l'armement du mode bit-perfect (#2395).
 pub mod fixed_volume;
 pub mod flac_vendeur;
@@ -138,6 +146,8 @@ pub mod sacd;
 mod sacd_lecture_5297_tests;
 /// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
 pub mod soft_mute;
+/// Le spectrogramme d'une piste en PNG, calculé sur le PCM décodé (#7857).
+pub mod spectrogramme;
 pub mod staged_growth;
 pub mod support;
 pub mod tap;
@@ -146,6 +156,10 @@ pub mod tempo;
 #[cfg(feature = "audio-embedding")]
 pub mod text_embedding;
 pub mod thermal;
+/// #6918 — le volume en dB d'une sortie qui règle son volume en décibels.
+pub mod volume_appareil_db;
+/// #7841 — trim et limites de chaque zone, tels que le rapport de diagnostic les montre.
+pub mod volume_au_rapport;
 /// #6541 — limites de sécurité et de confort du volume d'une zone.
 pub mod volume_limites;
 /// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).

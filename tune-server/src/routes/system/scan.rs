@@ -492,17 +492,62 @@ mod scan_gate_tests {
         drop(jeton);
 
         // Plus aucun détenteur : l'annonce est tombée avec le droit, et le
-        // « scanning » qui reste au réglage est dit résiduel.
-        let r = super::scan_status(axum::extract::State(state.clone())).await;
-        assert_eq!(
-            r.0["current"]["stale"], true,
-            "#6729 : l'annonce du scan a survécu à son droit : {}",
-            r.0
-        );
+        // « scanning » qui reste au réglage est dit résiduel (diagnostic).
         assert!(super::ligne_du_scan_en_cours("scanning").contains("résiduel"));
+        // #7305 : `scan/status` ne le publie plus, il le remet au repos.
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert!(r.0["current"].is_null(), "{}", r.0);
         reglages.set("scan_status", "idle").unwrap();
         let r = super::scan_status(axum::extract::State(state)).await;
         assert!(r.0["current"].is_null(), "{}", r.0);
+    }
+
+    /// #7305 (Tades, fil 2504) — LE DÉFAUT : le réglage dit « scanning »,
+    /// aucun scan ne tient le droit (processus tué en plein scan). Le rapport
+    /// le disait « résiduel », et `scan/status` le publiait quand même comme
+    /// un scan en cours : l'écran restait sur « scan en cours » et il fallait
+    /// trouver « Arrêter ». Le serveur le remet au repos tout seul, et le dit
+    /// sur le bus pour faire tomber le bandeau.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn un_statut_residuel_est_remis_au_repos_par_scan_status_7305() {
+        let _serialise = serialiser();
+        super::attendre_que_le_droit_de_scanner_soit_libre().await;
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reglages =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        reglages.set("scan_status", "scanning").unwrap();
+        let mut bus = state.event_bus.subscribe();
+
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert_eq!(
+            r.0["status"], "idle",
+            "#7305 : un « scanning » qu'aucun scan ne tient est publié comme un scan en cours : {}",
+            r.0
+        );
+        assert_eq!(r.0["scanning"], false);
+        assert!(r.0["current"].is_null(), "{}", r.0);
+        assert_eq!(
+            reglages.get("scan_status").unwrap().as_deref(),
+            Some("idle"),
+            "#7305 : le reste doit être effacé du réglage, pas seulement masqué"
+        );
+        let evt = bus.try_recv().expect("library.scan.completed attendu");
+        assert_eq!(evt.event_type, "library.scan.completed");
+        assert_eq!(evt.data["stale"], true);
+
+        // Le droit est rendu : un vrai scan peut repartir aussitôt.
+        let jeton = super::try_begin_scan().expect("le droit de scanner doit être rendu");
+        // Et un scan VIVANT n'est jamais remis au repos par la lecture.
+        reglages.set("scan_status", "scanning").unwrap();
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert_eq!(r.0["status"], "scanning", "{}", r.0);
+        assert_eq!(
+            reglages.get("scan_status").unwrap().as_deref(),
+            Some("scanning")
+        );
+        drop(jeton);
+        reglages.set("scan_status", "idle").unwrap();
     }
 
     /// Le verrou COMMUN aux épreuves de scan réel
@@ -1339,9 +1384,20 @@ pub(crate) struct ExemplairesDuLot {
     /// son original peuvent tomber dans le même lot, avant que l'index des
     /// hachages connus ne les voie.
     chemins_du_lot: std::collections::HashMap<(String, i64), Vec<String>>,
+    /// #6917 — les racines qui bornent le repli, quand l'option « même
+    /// racine seulement » est allumée ; `None` : le comportement d'avant.
+    racines: Option<Vec<String>>,
 }
 
 impl ExemplairesDuLot {
+    /// Le lot, avec la borne de racine que le réglage pose (#6917).
+    pub(crate) fn pour(db: &dyn tune_core::db::backend::DbBackend) -> Self {
+        Self {
+            racines: tune_core::library::dedoublonnage_par_racine::racines_si_active(db),
+            ..Self::default()
+        }
+    }
+
     /// La piste que l'importateur vient de lire est-elle la copie exacte
     /// d'une piste déjà connue (base ou lot) du même album ? Si oui, elle est
     /// notée comme exemplaire et le chemin du propriétaire est rendu ; sinon
@@ -1362,6 +1418,13 @@ impl ExemplairesDuLot {
         let key = (hash.clone(), aid);
         let mut candidates = connus.get(&key).cloned().unwrap_or_default();
         candidates.extend(self.chemins_du_lot.get(&key).cloned().unwrap_or_default());
+        // #6917 — option allumée, une copie d'une AUTRE racine n'est pas un
+        // exemplaire : elle entre comme sa propre piste.
+        let candidates = tune_core::library::dedoublonnage_par_racine::candidats_repliables(
+            chemin,
+            candidates,
+            self.racines.as_deref(),
+        );
         if let Some(existant) = tune_core::scanner::hasher::find_byte_identical_path(
             std::path::Path::new(chemin),
             &candidates,
@@ -1752,7 +1815,10 @@ pub(crate) fn marquer_scan_en_cours(
 /// gestes de RÉPARATION de bibliothèque. Aucun d'eux ne doit pouvoir autoriser
 /// une suppression de masse. Seul `trigger_scan`, qui porte une intention
 /// explicite de l'utilisateur, passe par `spawn_library_scan_confirmee`.
-pub(crate) async fn spawn_library_scan(
+///
+/// `pub` pour `tune-ffi` : l'hôte mobile (app iOS revenue au premier plan)
+/// relance un scan incrémental par `tune_server_scan`, sans passer par HTTP.
+pub async fn spawn_library_scan(
     state: AppState,
     force: bool,
     targeted_req: Option<String>,
@@ -2440,7 +2506,7 @@ async fn spawn_library_scan_avec_lecteur_par(
                 // Lignes de ce lot qui existaient sous une source d'importation
                 // et que le scan reprend à son compte (#2939).
                 let mut a_adopter: Vec<i64> = Vec::new();
-                let mut exemplaires_du_lot = ExemplairesDuLot::default();
+                let mut exemplaires_du_lot = ExemplairesDuLot::pour(&*db);
 
                 // Collect extended metadata for tracks in this batch.
                 //
@@ -2731,6 +2797,10 @@ async fn spawn_library_scan_avec_lecteur_par(
                             Ok(()) => {
                                 ecritures = ecritures
                                     .avec_dr_des_rapports_voisins(meta_entries.iter().map(|(_, m)| m));
+                                // #7766 — les crédits des balises deviennent des
+                                // lignes `track_credits` (source `balises`), dans
+                                // la même transaction, sans rouvrir le fichier.
+                                tune_core::metadata::credits_balises::ecrire_lot(&db, &meta_entries);
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "scan_extended_metadata_insert_failed");
@@ -2865,6 +2935,15 @@ async fn spawn_library_scan_avec_lecteur_par(
 
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted() as i64;
+
+        // #7915 — la durée de chaque étape de fin de scan, au journal.
+        tracing::info!(
+            travail = "scan",
+            etape = "parcours_et_import",
+            duree_ms = scan_timer_start.elapsed().as_millis() as u64,
+            "etape_terminee"
+        );
+        let mut etapes = tune_core::taches_de_fond::avancement::ChronoDesEtapes::demarrer("scan");
 
         // Prune tracks whose files no longer exist on disk.
         // SAFETY: skip tracks in missing directories — the volume/NAS may
@@ -3206,6 +3285,7 @@ async fn spawn_library_scan_avec_lecteur_par(
         }
         drop(sqlite_write_guard);
 
+        etapes.fin("purge_et_statistiques");
         // #5528 — APRÈS la purge et son COMMIT : les albums vidés ont disparu,
         // les dossiers « Collections » suivent ceux dont les pistes sont
         // passées dans un autre album. Hors de la transaction, qui ne doit pas
@@ -3249,6 +3329,7 @@ async fn spawn_library_scan_avec_lecteur_par(
             );
         }
 
+        etapes.fin("pochettes_et_collections");
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —
         // can leave album rows behind that no track references. Without this
@@ -3276,6 +3357,18 @@ async fn spawn_library_scan_avec_lecteur_par(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "post_scan_compilations_recalcul_echoue"),
+            }
+            // #6459 — un album rétrogradé sous « Unknown Artist » par une
+            // relecture passée reprend l'artiste que ses pistes portent en
+            // base : ses fichiers inchangés ne seront pas relus.
+            match tune_core::db::album_repo::AlbumRepo::with_backend(db.clone())
+                .rendre_leur_artiste_aux_albums_inconnus()
+            {
+                Ok(bilan) if bilan.rendus > 0 => {
+                    tracing::info!(?bilan, "post_scan_albums_inconnus_rendus")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_albums_inconnus_echoue"),
             }
         }
 
@@ -3458,6 +3551,7 @@ async fn spawn_library_scan_avec_lecteur_par(
             );
         }
 
+        etapes.fin("orphelins_et_favoris");
         // Rebuild FTS indexes so search reflects the current library state.
         // The FTS tables are contentless (content='') and rely on triggers,
         // but manual DB edits or batch operations can leave them stale.
@@ -3482,12 +3576,14 @@ async fn spawn_library_scan_avec_lecteur_par(
 
         }
 
+        etapes.fin("index_de_recherche");
         // Populate cloud sync changelog with all new/updated entities
         tune_core::cloud::library_sync::populate_changelog_after_scan(&db);
 
         // Turn any .m3u/.m3u8/.pls files found in the scanned dirs into local
         // playlists (Bertrand). Runs after import so every track is in the DB to
-        // match against; idempotent by playlist name so a re-scan never dupes.
+        // match against; a file already imported and unchanged is skipped, even
+        // if its playlist was deleted (#7723), so a re-scan never brings it back.
         if !scan_cancel_requested() {
             let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &scan_dirs);
             if pl.playlists_created > 0 {
@@ -3504,11 +3600,13 @@ async fn spawn_library_scan_avec_lecteur_par(
             }
         }
 
+        etapes.fin("listes_de_lecture");
         let settings = SettingsRepo::with_backend(db.clone());
         if let Err(e) = settings.set("scan_status", "idle") {
             tracing::warn!(error = %e, "scan_status_idle_failed");
         }
         tracing::info!(
+            duree_ms = scan_timer_start.elapsed().as_millis() as u64,
             discovered = total_discovered,
             parsed = scan_stats.total_files,
             timeout = scan_stats.metadata_timeout,
@@ -3643,6 +3741,20 @@ async fn spawn_library_scan_avec_lecteur_par(
                 motif = suite_du_scan.motif().unwrap_or("none"),
                 "auto_enrichment_after_scan_skipped (needs Premium + enrich_on_scan)"
             );
+            // #6077 — sans recherche en ligne, le dernier recours vient
+            // tout de suite : la plus grande image des dossiers des albums
+            // restés sans pochette. Avec elle, c'est `batch_enrich_artwork`
+            // qui l'applique, après la recherche.
+            if !scan_cancel_requested() {
+                let dernier_recours_db = db.clone();
+                let dernier_recours_cache = cache_dir.clone();
+                handle.spawn_blocking(move || {
+                    tune_core::library::pochette_disque::pochettes_de_dernier_recours(
+                        &dernier_recours_db,
+                        &dernier_recours_cache,
+                    );
+                });
+            }
         }
         }).await;
         if let Err(e) = result {
@@ -3700,6 +3812,45 @@ fn statut_publie(stocke: String, droit_tenu: bool) -> String {
     }
 }
 
+/// #7305 — remet au repos un `scan_status = "scanning"` qu'AUCUN scan ne
+/// tient : le même effet que « Arrêter » sur un reste (`scan_cancel`, branche
+/// sans détenteur), sans demander le geste à l'utilisateur.
+///
+/// Le droit de scanner est PRIS le temps de la remise au repos. C'est ce qui
+/// rend l'écriture sûre : tout scan prend ce droit AVANT d'écrire
+/// « scanning » (`marquer_scan_en_cours`), et l'écrit au repos AVANT de le
+/// rendre. Tant que ce jeton est tenu, aucun scan ne peut donc démarrer entre
+/// la relecture du réglage et l'écriture de `idle` — sans lui, un scan parti
+/// dans cet intervalle se verrait déclaré au repos en pleine lecture.
+///
+/// `true` : le réglage est (désormais) au repos. `false` : un scan tient le
+/// droit (le statut n'est pas un reste), ou l'écriture a échoué.
+fn remettre_au_repos_un_statut_residuel(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    event_bus: &tune_core::event_bus::EventBus,
+) -> bool {
+    let Some(_jeton) = try_begin_scan() else {
+        return false;
+    };
+    let settings = SettingsRepo::with_backend(backend.clone());
+    if settings.get("scan_status").ok().flatten().as_deref() != Some("scanning") {
+        // Remis au repos entre-temps (fin de scan, « Arrêter ») : rien à dire.
+        return true;
+    }
+    if let Err(e) = settings.set("scan_status", "idle") {
+        tracing::warn!(error = %e, "scan_status_residuel_reset_failed");
+        return false;
+    }
+    tracing::info!("scan_status_residuel_remis_au_repos");
+    // Fait tomber le bandeau d'un client qui l'affiche encore, comme
+    // « Arrêter » sur un reste.
+    event_bus.emit(
+        "library.scan.completed",
+        json!({ "cancelled": true, "stale": true }),
+    );
+    true
+}
+
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     // #5086 — lu par le pool, pas par l'écrivain : un statut PUBLIÉ n'a pas à
     // attendre la fin d'une écriture, et c'est `SCAN_GATE`, plus bas, qui fait
@@ -3716,6 +3867,19 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     // `trigger_scan` refuse aussitôt en 409 `already_scanning` — vu trois fois
     // le 24/09/2026 dans `pg_scan_converge_4602`, et atteignable par un
     // utilisateur. Tant que le droit est tenu, le statut est donc « scanning ».
+    // #7305 (Tades, fil 2504) : un « scanning » qu'aucun scan ne tient est un
+    // reste (processus tué en plein scan). Le publier tel quel laissait
+    // l'écran sur « scan en cours » et demandait à l'utilisateur un geste
+    // (« Arrêter ») qu'il ne trouvait pas. Le serveur le sait faux : il le
+    // remet au repos lui-même, ici, à la première lecture du statut.
+    let status = if status == "scanning"
+        && !SCAN_GATE.is_active()
+        && remettre_au_repos_un_statut_residuel(&state.backend, &state.event_bus)
+    {
+        "idle".to_string()
+    } else {
+        status
+    };
     let status = statut_publie(status, SCAN_GATE.is_active());
     let scanning = status == "scanning";
     let result = settings

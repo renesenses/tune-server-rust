@@ -1,0 +1,10 @@
+28/10/2026, Shrek, relevé réseau sans lecture audio, aucun accès .18.
+GET https://rss.marketingtools.apple.com/api/v2/fr/podcasts/top/50/podcasts.json : 50 entrées.
+GET https://itunes.apple.com/lookup?id=<les 50 identifiants>&country=fr : 50 résultats.
+Deux collectionId : 6813632977, 6813632603 ; collectionName identique : UNBX, le podcast de la réussite.
+feedUrl identique : https://feeds.acast.com/public/shows/6aaba7448577b7eb504cf325
+
+Pièce jointe du 27/10 : 12:59:46.272Z apple_top_podcasts_parsed count=50, puis 12:59:46.510Z podcasts_du_palmares_sans_flux_public country=fr restants=5.
+Capture du fil 2468 / réponse9228 : écran Podcasts, France, erreur https://svelte.dev/e/each_key_duplicate.
+Web tag v1.0.0-rc8, PodcastsV2.svelte : liste populaires clé (feedOf(p) ?? `d${i}`), feedOf rend l'URL RSS non vide.
+Limite : relevé Apple du 28/10, pas la réponse exacte du 27/10. Capture et journal privé non ajoutés au dépôt public.

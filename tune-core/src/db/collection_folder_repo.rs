@@ -26,12 +26,33 @@
 //! Dans un parent, les sous-dossiers ont leur ordre et les collections le
 //! leur (`position`, 0..n). Toute écriture renumérote la fratrie touchée, de
 //! sorte qu'aucun trou ni doublon de position ne survive.
+//!
+//! # Ordre des rayons : alphabétique, sauf rangement à la main (#6779)
+//!
+//! Didier, fil 1907 : les rayons restaient dans leur ordre de CRÉATION, et
+//! aucun ne pouvait descendre (« Artistes Rock »). Décision de Bertrand du
+//! 19/10/2026 : l'alphabétique par défaut, le manuel en option.
+//!
+//! Une fratrie de dossiers (les sous-dossiers d'un même parent, ou ceux de la
+//! racine) est donc ALPHABÉTIQUE (ordre naturel, sans casse ni accents :
+//! [`ordre_naturel`]) tant qu'aucun de ses dossiers n'a été placé à une
+//! position choisie ; elle est MANUELLE (`position`) dès qu'un déplacement
+//! a donné une position. `manual_order` le marque sur chacun de ses dossiers,
+//! de sorte qu'un dossier rangé dans une fratrie manuelle (création,
+//! déplacement sans position) en prend la fin, et un dossier rangé dans une
+//! fratrie alphabétique y prend sa place de nom.
+//!
+//! Les positions LUES ([`CollectionFolderRepo::list_folders`]) sont le RANG
+//! affiché dans la fratrie, 0..n, celui qu'attend
+//! [`CollectionFolderRepo::move_folder`] : un client qui descend d'un cran le
+//! dossier de rang `r` demande `r + 1`, quel que soit l'ordre de la fratrie.
 
 use std::sync::Arc;
 
 use serde::Serialize;
 
 use super::backend::{DbBackend, DbTxHandle, SqlValue, ToSqlValue};
+use super::disques_par_dossier::ordre_naturel;
 use super::sqlite::SqliteDb;
 
 /// Profondeur maximale de l'arbre de DOSSIERS : un dossier de la racine est
@@ -51,7 +72,10 @@ pub struct CollectionFolder {
     pub id: i64,
     pub name: String,
     pub parent_id: Option<i64>,
+    /// Rang dans la fratrie affichée, 0..n (voir l'en-tête du module).
     pub position: i64,
+    /// Vrai si la fratrie de ce dossier est rangée à la main (#6779).
+    pub manual_order: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -87,8 +111,8 @@ impl std::fmt::Display for FolderError {
     }
 }
 
-const SELECT_FOLDERS: &str =
-    "SELECT id, name, parent_id, position FROM collection_folders ORDER BY position, id";
+const SELECT_FOLDERS: &str = "SELECT id, name, parent_id, position, manual_order \
+     FROM collection_folders ORDER BY position, id";
 const SELECT_ITEMS: &str = "SELECT kind, collection_id, folder_id, position \
      FROM collection_folder_items ORDER BY position, kind, collection_id";
 
@@ -98,6 +122,7 @@ fn row_to_folder(r: &[SqlValue]) -> CollectionFolder {
         name: r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
         parent_id: r.get(2).and_then(|v| v.as_i64()),
         position: r.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+        manual_order: r.get(4).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
     }
 }
 
@@ -212,20 +237,83 @@ fn lire_rangements(tx: &dyn DbTxHandle) -> Result<Vec<FolderItem>, String> {
         .collect())
 }
 
-/// Renumérote les sous-dossiers de `parent` dans l'ordre `ordre`.
+/// Renumérote les sous-dossiers de `parent` dans l'ordre `ordre`, et marque
+/// la fratrie manuelle ou alphabétique (#6779).
 fn ecrire_fratrie_dossiers(
     tx: &dyn DbTxHandle,
     parent: Option<i64>,
     ordre: &[i64],
+    manuelle: bool,
 ) -> Result<(), String> {
+    let manuelle = manuelle as i64;
     for (pos, id) in ordre.iter().enumerate() {
         let pos = pos as i64;
         tx.execute(
-            "UPDATE collection_folders SET parent_id = ?, position = ? WHERE id = ?",
-            &[&parent as &dyn ToSqlValue, &pos, id],
+            "UPDATE collection_folders SET parent_id = ?, position = ?, manual_order = ? \
+             WHERE id = ?",
+            &[&parent as &dyn ToSqlValue, &pos, &manuelle, id],
         )?;
     }
     Ok(())
+}
+
+/// Vrai si la fratrie de `parent`, `sauf` mis à part, est rangée à la main.
+fn fratrie_manuelle(folders: &[CollectionFolder], parent: Option<i64>, sauf: i64) -> bool {
+    folders
+        .iter()
+        .any(|f| f.parent_id == parent && f.id != sauf && f.manual_order)
+}
+
+/// Les sous-dossiers de `parent` dans l'ordre AFFICHÉ (#6779) : par position
+/// si la fratrie est rangée à la main, sinon par nom ([`ordre_naturel`]),
+/// l'id départageant. Dans une fratrie manuelle, un dossier non marqué (ligne
+/// écrite hors du dépôt) passe après les rangés, par nom.
+pub fn ordre_de_la_fratrie(folders: &[CollectionFolder], parent: Option<i64>) -> Vec<i64> {
+    let mut fratrie: Vec<&CollectionFolder> =
+        folders.iter().filter(|f| f.parent_id == parent).collect();
+    let par_nom = |a: &CollectionFolder, b: &CollectionFolder| {
+        ordre_naturel(&a.name, &b.name).then(a.id.cmp(&b.id))
+    };
+    if fratrie.iter().any(|f| f.manual_order) {
+        fratrie.sort_by(|a, b| {
+            b.manual_order
+                .cmp(&a.manual_order)
+                .then(a.position.cmp(&b.position))
+                .then_with(|| par_nom(a, b))
+        });
+    } else {
+        fratrie.sort_by(|a, b| par_nom(a, b));
+    }
+    fratrie.into_iter().map(|f| f.id).collect()
+}
+
+/// Les dossiers tels qu'ils sont LUS : `position` devient le rang affiché
+/// dans la fratrie, et la liste suit ce rang.
+fn avec_rangs(mut folders: Vec<CollectionFolder>) -> Vec<CollectionFolder> {
+    let parents: std::collections::BTreeSet<Option<i64>> =
+        folders.iter().map(|f| f.parent_id).collect();
+    let mut rangs: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for parent in parents {
+        for (rang, id) in ordre_de_la_fratrie(&folders, parent)
+            .into_iter()
+            .enumerate()
+        {
+            rangs.insert(id, rang as i64);
+        }
+    }
+    for f in &mut folders {
+        f.position = rangs.get(&f.id).copied().unwrap_or(0);
+    }
+    folders.sort_by_key(|f| (f.position, f.id));
+    folders
+}
+
+/// Le rang de `id` dans la fratrie de `parent`.
+fn rang(folders: &[CollectionFolder], parent: Option<i64>, id: i64) -> i64 {
+    ordre_de_la_fratrie(folders, parent)
+        .iter()
+        .position(|&x| x == id)
+        .unwrap_or(0) as i64
 }
 
 /// Renumérote les collections rangées dans `folder` dans l'ordre `ordre`.
@@ -245,11 +333,11 @@ fn ecrire_fratrie_rangements(
     Ok(())
 }
 
+/// La fratrie de `parent` dans l'ordre affiché, `sauf` mis à part.
 fn fratrie_dossiers(folders: &[CollectionFolder], parent: Option<i64>, sauf: i64) -> Vec<i64> {
-    folders
-        .iter()
-        .filter(|f| f.parent_id == parent && f.id != sauf)
-        .map(|f| f.id)
+    ordre_de_la_fratrie(folders, parent)
+        .into_iter()
+        .filter(|&id| id != sauf)
         .collect()
 }
 
@@ -266,13 +354,15 @@ impl CollectionFolderRepo {
         Self { db }
     }
 
+    /// Tous les dossiers, `position` au rang affiché (voir l'en-tête).
     pub fn list_folders(&self) -> Result<Vec<CollectionFolder>, String> {
-        Ok(self
-            .db
-            .query_many(SELECT_FOLDERS, &[])?
-            .iter()
-            .map(|r| row_to_folder(r))
-            .collect())
+        Ok(avec_rangs(
+            self.db
+                .query_many(SELECT_FOLDERS, &[])?
+                .iter()
+                .map(|r| row_to_folder(r))
+                .collect(),
+        ))
     }
 
     pub fn list_items(&self) -> Result<Vec<FolderItem>, String> {
@@ -284,15 +374,10 @@ impl CollectionFolderRepo {
             .collect())
     }
 
+    /// Le dossier `id`, `position` au rang affiché : le rang dépend de toute
+    /// sa fratrie, d'où la lecture entière.
     pub fn get_folder(&self, id: i64) -> Result<Option<CollectionFolder>, String> {
-        Ok(self
-            .db
-            .query_one(
-                "SELECT id, name, parent_id, position FROM collection_folders WHERE id = ?",
-                &[&id],
-            )?
-            .as_ref()
-            .map(|r| row_to_folder(r)))
+        Ok(self.list_folders()?.into_iter().find(|f| f.id == id))
     }
 
     /// Lance `f` dans une transaction ; un refus typé annule la transaction
@@ -320,7 +405,8 @@ impl CollectionFolderRepo {
         }
     }
 
-    /// Crée un dossier à la fin de la fratrie de `parent_id`.
+    /// Crée un dossier dans la fratrie de `parent_id` : à sa fin si elle est
+    /// rangée à la main, à sa place de nom sinon (#6779).
     pub fn create_folder(
         &self,
         name: &str,
@@ -339,16 +425,29 @@ impl CollectionFolderRepo {
             }
             let id = folders.iter().map(|f| f.id).max().unwrap_or(0) + 1;
             let position = folders.iter().filter(|f| f.parent_id == parent_id).count() as i64;
+            let manuelle = fratrie_manuelle(&folders, parent_id, id);
             tx.execute(
-                "INSERT INTO collection_folders (id, name, parent_id, position) VALUES (?, ?, ?, ?)",
-                &[&id as &dyn ToSqlValue, &name, &parent_id, &position],
+                "INSERT INTO collection_folders (id, name, parent_id, position, manual_order) \
+                 VALUES (?, ?, ?, ?, ?)",
+                &[
+                    &id as &dyn ToSqlValue,
+                    &name,
+                    &parent_id,
+                    &position,
+                    &(manuelle as i64),
+                ],
             )?;
-            Ok(Ok(CollectionFolder {
+            let mut cree = CollectionFolder {
                 id,
                 name: name.clone(),
                 parent_id,
                 position,
-            }))
+                manual_order: manuelle,
+            };
+            let mut apres = folders;
+            apres.push(cree.clone());
+            cree.position = rang(&apres, parent_id, id);
+            Ok(Ok(cree))
         })
     }
 
@@ -373,6 +472,11 @@ impl CollectionFolderRepo {
     /// dans sa nouvelle fratrie (à la fin si absente). Refuse le cycle et
     /// tout déplacement qui porterait un dossier du sous-arbre au-delà de
     /// [`MAX_DEPTH`].
+    ///
+    /// `position` est un rang de l'ordre AFFICHÉ, le dossier mis à part :
+    /// monter d'un cran le dossier de rang `r`, c'est demander `r - 1` ; le
+    /// descendre, `r + 1`. Elle range la fratrie à la main (#6779) ; sans
+    /// elle, une fratrie alphabétique le reste.
     pub fn move_folder(
         &self,
         id: i64,
@@ -402,20 +506,37 @@ impl CollectionFolderRepo {
             if profondeur_parent + height_of(&folders, id) > MAX_DEPTH {
                 return Ok(Err(trop_profond()));
             }
-            // L'ancienne fratrie se resserre, la nouvelle reçoit le dossier.
+            // L'ancienne fratrie se resserre, dans son ordre et sous sa marque.
             if courant.parent_id != parent_id {
                 let ancienne = fratrie_dossiers(&folders, courant.parent_id, id);
-                ecrire_fratrie_dossiers(tx, courant.parent_id, &ancienne)?;
+                let manuelle = fratrie_manuelle(&folders, courant.parent_id, id);
+                ecrire_fratrie_dossiers(tx, courant.parent_id, &ancienne, manuelle)?;
             }
-            let mut nouvelle = fratrie_dossiers(&folders, parent_id, id);
-            inserer(&mut nouvelle, id, position);
-            ecrire_fratrie_dossiers(tx, parent_id, &nouvelle)?;
-            let pos = nouvelle.iter().position(|&x| x == id).unwrap_or(0) as i64;
-            Ok(Ok(CollectionFolder {
+            // La nouvelle reçoit le dossier (#6779) : une position choisie
+            // range TOUTE la fratrie à la main, en partant de l'ordre affiché
+            // (l'alphabétique si elle l'était) ; sans position, une fratrie
+            // manuelle le prend à sa fin, une alphabétique à sa place de nom.
+            let manuelle = position.is_some() || fratrie_manuelle(&folders, parent_id, id);
+            let mut deplace = CollectionFolder {
                 parent_id,
-                position: pos,
+                manual_order: manuelle,
                 ..courant
-            }))
+            };
+            if manuelle {
+                let mut nouvelle = fratrie_dossiers(&folders, parent_id, id);
+                inserer(&mut nouvelle, id, position);
+                ecrire_fratrie_dossiers(tx, parent_id, &nouvelle, true)?;
+                deplace.position = nouvelle.iter().position(|&x| x == id).unwrap_or(0) as i64;
+            } else {
+                // Une fratrie alphabétique ne se renumérote pas : son ordre
+                // vient des noms, seul le dossier déplacé y entre.
+                ecrire_fratrie_dossiers(tx, parent_id, &[id], false)?;
+                let mut apres: Vec<CollectionFolder> =
+                    folders.into_iter().filter(|f| f.id != id).collect();
+                apres.push(deplace.clone());
+                deplace.position = rang(&apres, parent_id, id);
+            }
+            Ok(Ok(deplace))
         })
     }
 
@@ -433,15 +554,12 @@ impl CollectionFolderRepo {
             let parent = courant.parent_id;
 
             // Sous-dossiers : la fratrie du parent, sans le dossier supprimé,
-            // puis ses enfants à sa suite.
+            // puis ses enfants à sa suite, dans leur ordre affiché. Ils
+            // prennent la marque de la fratrie qui les reçoit (#6779).
             let mut ordre = fratrie_dossiers(&folders, parent, id);
-            ordre.extend(
-                folders
-                    .iter()
-                    .filter(|f| f.parent_id == Some(id))
-                    .map(|f| f.id),
-            );
-            ecrire_fratrie_dossiers(tx, parent, &ordre)?;
+            ordre.extend(ordre_de_la_fratrie(&folders, Some(id)));
+            let manuelle = fratrie_manuelle(&folders, parent, id);
+            ecrire_fratrie_dossiers(tx, parent, &ordre, manuelle)?;
 
             // Collections : celles du parent, puis celles du dossier supprimé.
             let items = lire_rangements(tx)?;
@@ -567,16 +685,18 @@ mod tests {
         let rock = r.create_folder("Rock", None).unwrap();
         let jazz = r.create_folder("  Jazz ", None).unwrap();
         assert_eq!(jazz.name, "Jazz", "le nom est rogné");
-        assert_eq!((rock.position, jazz.position), (0, 1));
+        // #6779 : rang de l'ordre des noms, pas de l'ordre de création.
+        assert_eq!((rock.position, jazz.position), (0, 0));
         let r2 = r.rename_folder(rock.id, "Rock & Blues").unwrap();
         assert_eq!(r2.name, "Rock & Blues");
+        assert_eq!(r2.position, 1);
         let noms: Vec<String> = r
             .list_folders()
             .unwrap()
             .into_iter()
             .map(|f| f.name)
             .collect();
-        assert_eq!(noms, ["Rock & Blues", "Jazz"]);
+        assert_eq!(noms, ["Jazz", "Rock & Blues"]);
     }
 
     #[test]
@@ -716,6 +836,170 @@ mod tests {
         ));
     }
 
+    /// Les noms d'une fratrie, dans l'ordre LU, avec leur rang.
+    fn fratrie(r: &CollectionFolderRepo, parent: Option<i64>) -> Vec<(String, i64)> {
+        r.list_folders()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.parent_id == parent)
+            .map(|f| (f.name, f.position))
+            .collect()
+    }
+
+    fn noms(r: &CollectionFolderRepo, parent: Option<i64>) -> Vec<String> {
+        fratrie(r, parent).into_iter().map(|(n, _)| n).collect()
+    }
+
+    /// #6779 — sans rangement à la main, une fratrie de rayons suit l'ordre
+    /// naturel des noms (sans casse ni accents, « 2 » avant « 10 »), pas
+    /// l'ordre de création ; le rang lu est 0..n dans cet ordre.
+    #[test]
+    fn rayons_alphabetiques_par_defaut_6779() {
+        let r = repo();
+        let rock = r.create_folder("Rock", None).unwrap();
+        assert_eq!(rock.position, 0);
+        r.create_folder("jazz", None).unwrap();
+        let electro = r.create_folder("Électro", None).unwrap();
+        assert_eq!(
+            electro.position, 0,
+            "le rang rendu est celui de l'ordre des noms, pas celui de création"
+        );
+        r.create_folder("Blues 10", None).unwrap();
+        r.create_folder("Blues 2", None).unwrap();
+        assert_eq!(
+            fratrie(&r, None),
+            [
+                ("Blues 2".to_string(), 0),
+                ("Blues 10".to_string(), 1),
+                ("Électro".to_string(), 2),
+                ("jazz".to_string(), 3),
+                ("Rock".to_string(), 4),
+            ],
+            "une fratrie jamais rangée doit sortir par nom, pas par ordre de création"
+        );
+        assert!(r.list_folders().unwrap().iter().all(|f| !f.manual_order));
+        // Un renommage la re-trie ; un dossier déplacé SANS position y prend
+        // sa place de nom : elle reste alphabétique.
+        r.rename_folder(rock.id, "Ambient").unwrap();
+        let sous = r.create_folder("Ballades", Some(electro.id)).unwrap();
+        r.move_folder(sous.id, None, None).unwrap();
+        assert_eq!(
+            noms(&r, None),
+            [
+                "Ambient", "Ballades", "Blues 2", "Blues 10", "Électro", "jazz"
+            ]
+        );
+        assert!(r.list_folders().unwrap().iter().all(|f| !f.manual_order));
+    }
+
+    /// #6779 — « impossible de déplacer un rayon (« Artistes Rock ») vers le
+    /// bas » : un déplacement à une position, rang affiché + 1, le descend
+    /// d'un cran ; - 1 le remonte. La fratrie entière passe alors à l'ordre
+    /// manuel, en partant de l'alphabétique affiché ; un dossier créé ou
+    /// rangé ensuite sans position en prend la fin.
+    #[test]
+    fn descendre_et_remonter_un_rayon_6779() {
+        let r = repo();
+        let musique = r.create_folder("Musique", None).unwrap();
+        let rock = r.create_folder("Artistes Rock", Some(musique.id)).unwrap();
+        r.create_folder("Classique", Some(musique.id)).unwrap();
+        r.create_folder("Baroque", Some(musique.id)).unwrap();
+        assert_eq!(
+            noms(&r, Some(musique.id)),
+            ["Artistes Rock", "Baroque", "Classique"]
+        );
+
+        let descendu = r
+            .move_folder(rock.id, Some(musique.id), Some(rock.position + 1))
+            .unwrap();
+        assert_eq!(
+            descendu.position, 1,
+            "une position demandée doit faire descendre le rayon d'un cran"
+        );
+        assert!(descendu.manual_order);
+        assert_eq!(
+            noms(&r, Some(musique.id)),
+            ["Baroque", "Artistes Rock", "Classique"],
+            "« Artistes Rock » doit descendre d'un cran"
+        );
+        let descendu = r
+            .move_folder(rock.id, Some(musique.id), Some(descendu.position + 1))
+            .unwrap();
+        assert_eq!(descendu.position, 2);
+        assert_eq!(
+            noms(&r, Some(musique.id)),
+            ["Baroque", "Classique", "Artistes Rock"]
+        );
+        r.move_folder(rock.id, Some(musique.id), Some(1)).unwrap();
+        assert_eq!(
+            fratrie(&r, Some(musique.id)),
+            [
+                ("Baroque".to_string(), 0),
+                ("Artistes Rock".to_string(), 1),
+                ("Classique".to_string(), 2),
+            ],
+            "remonté d'un cran"
+        );
+
+        // Fratrie manuelle : un nouveau venu va à la fin, pas à sa place de nom.
+        r.create_folder("Ambient", Some(musique.id)).unwrap();
+        let jazz = r.create_folder("Jazz", None).unwrap();
+        r.move_folder(jazz.id, Some(musique.id), None).unwrap();
+        assert_eq!(
+            noms(&r, Some(musique.id)),
+            ["Baroque", "Artistes Rock", "Classique", "Ambient", "Jazz"]
+        );
+        // La racine, elle, n'a pas été touchée : toujours alphabétique.
+        assert!(
+            r.list_folders()
+                .unwrap()
+                .iter()
+                .filter(|f| f.parent_id.is_none())
+                .all(|f| !f.manual_order)
+        );
+    }
+
+    /// #6779 — l'ordre manuel survit à la fermeture de la base (redémarrage
+    /// du serveur), et la suppression d'un dossier y fait entrer ses
+    /// sous-dossiers à la suite, rangés à la main eux aussi.
+    #[test]
+    fn l_ordre_des_rayons_tient_apres_redemarrage_6779() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("tune.db");
+        let chemin = chemin.to_str().unwrap();
+        let ouvrir = || {
+            let db = SqliteDb::open(chemin).unwrap();
+            db.init_schema().unwrap();
+            crate::db::migrations::run_migrations(&db).unwrap();
+            CollectionFolderRepo::new(db)
+        };
+        {
+            let r = ouvrir();
+            let a = r.create_folder("A", None).unwrap();
+            let b = r.create_folder("B", None).unwrap();
+            r.create_folder("C", None).unwrap();
+            r.create_folder("Z1", Some(b.id)).unwrap();
+            r.create_folder("Y1", Some(b.id)).unwrap();
+            r.move_folder(a.id, None, Some(2)).unwrap();
+            assert_eq!(noms(&r, None), ["B", "C", "A"]);
+        }
+        let r = ouvrir();
+        assert_eq!(
+            noms(&r, None),
+            ["B", "C", "A"],
+            "l'ordre choisi à la main doit tenir après réouverture"
+        );
+        let b = r
+            .list_folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "B")
+            .unwrap();
+        r.delete_folder(b.id).unwrap();
+        assert_eq!(noms(&r, None), ["C", "A", "Y1", "Z1"]);
+        assert!(r.list_folders().unwrap().iter().all(|f| f.manual_order));
+    }
+
     /// Le même dépôt sur un VRAI PostgreSQL, par les DEUX naissances d'une
     /// base : installation native (la 071 sur une base nue) et bascule depuis
     /// SQLite (`PG_FULL_SCHEMA` tout-TEXT, puis la 071 qui convertit). SQLite
@@ -729,6 +1013,10 @@ mod tests {
         };
         const MIGRATION: &str =
             include_str!("../../migrations/postgres/071_collection_folders.sql");
+        // #6779 — la marque de la fratrie rangée à la main, que toute lecture
+        // NOMME : jouée après la 071 sur les deux naissances.
+        const MIGRATION_098: &str =
+            include_str!("../../migrations/postgres/098_collection_folders_manual_order.sql");
         const SCHEMA_VERSION: &str = "CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER PRIMARY KEY, name TEXT, applied_at TIMESTAMPTZ DEFAULT now())";
 
@@ -762,7 +1050,8 @@ mod tests {
                  FROM information_schema.columns \
                  WHERE table_schema = current_schema() \
                    AND table_name IN ('collection_folders', 'collection_folder_items') \
-                   AND column_name IN ('id', 'parent_id', 'position', 'collection_id', 'folder_id') \
+                   AND column_name IN ('id', 'parent_id', 'position', 'collection_id', 'folder_id', \
+                                       'manual_order') \
                  ORDER BY 1, 2",
             )
             .fetch_all(pool)
@@ -794,6 +1083,7 @@ mod tests {
         let pool = base(&url, "rayons_4853_natif").await;
         sqlx::raw_sql(SCHEMA_VERSION).execute(&pool).await.unwrap();
         sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_098).execute(&pool).await.unwrap();
         assert!(
             types(&pool).await.iter().all(|(_, _, t)| t == "bigint"),
             "{:?}",
@@ -822,8 +1112,10 @@ mod tests {
             "prémisse : tout-TEXT"
         );
         sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap();
-        // Rejouée : strict no-op.
+        sqlx::raw_sql(MIGRATION_098).execute(&pool).await.unwrap();
+        // Rejouées : strict no-op.
         sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_098).execute(&pool).await.unwrap();
         assert!(
             types(&pool).await.iter().all(|(_, _, t)| t == "bigint"),
             "{:?}",

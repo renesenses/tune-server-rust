@@ -117,10 +117,10 @@ async fn chaque_reduction_dit_d_ou_vient_sa_cible() {
     la_disposition_declaree_le_dit().await;
 }
 
-/// Le cas de l'A6 : la seconde lecture répond depuis le cache. Avant #6599,
-/// elle ne laissait que la ligne de réduction, sans origine.
+/// Un lecteur annonçant le FLAC stéréo : la seconde lecture doit dire
+/// qu’elle répond depuis le cache et préciser le format concerné.
 async fn le_cache_dit_son_origine_et_le_sink_est_au_journal() {
-    let c = deux_lectures_journalisees(SINK_DENON, None).await;
+    let c = deux_lectures_journalisees(SINK_FLAC_STEREO, None).await;
     let sinks = c.lignes("dlna_sink_sonde");
     assert_eq!(
         sinks.len(),
@@ -140,6 +140,7 @@ async fn le_cache_dit_son_origine_et_le_sink_est_au_journal() {
         "la seconde lecture répond depuis le cache et doit le dire : {cache:?}"
     );
     assert!(cache[0].contains("canaux_max=Some(2)"), "{}", cache[0]);
+    assert!(cache[0].contains("mime=\"audio/flac\""), "{}", cache[0]);
     let reductions = c.lignes("reduction_de_canaux_pour_le_renderer");
     assert_eq!(reductions.len(), 2, "{reductions:?}");
     for l in &reductions {

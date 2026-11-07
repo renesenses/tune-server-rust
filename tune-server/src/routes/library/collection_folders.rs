@@ -139,12 +139,26 @@ fn dossier_json(f: &CollectionFolder) -> Value {
     })
 }
 
+/// L'ordre des sous-dossiers de `parent` (#6779) : `manual` dès que la
+/// fratrie a été rangée à la main, `alphabetical` sinon.
+fn ordre_des_dossiers(folders: &[CollectionFolder], parent: Option<i64>) -> &'static str {
+    if folders
+        .iter()
+        .any(|f| f.parent_id == parent && f.manual_order)
+    {
+        "manual"
+    } else {
+        "alphabetical"
+    }
+}
+
 /// `GET /library/collection-folders` — l'arbre entier.
 ///
 /// ```json
 /// { "max_depth": 3,
+///   "folders_order": "alphabetical" | "manual",
 ///   "folders": [ { "id", "name", "parent_id", "position", "depth",
-///                  "folders": [...], "collections": [...] } ],
+///                  "folders_order", "folders": [...], "collections": [...] } ],
 ///   "collections": [ { "kind", "id", "name", "description", "icon", "color",
 ///                      "folder_id", "position" } ] }
 /// ```
@@ -152,6 +166,12 @@ fn dossier_json(f: &CollectionFolder) -> Value {
 /// La racine rend TOUTES les collections non rangées dans un dossier : celles
 /// rangées explicitement à la racine d'abord (dans leur ordre), puis les
 /// autres dans l'ordre de leurs listes plates, `position: null`.
+///
+/// Les dossiers de chaque niveau sortent dans leur ordre (#6779) : par nom
+/// tant que la fratrie n'a pas été rangée à la main, par position ensuite.
+/// `folders_order` le dit pour les sous-dossiers de chaque dossier, et pour
+/// ceux de la racine ; `position` est le rang affiché, celui qu'attend
+/// `POST /library/collection-folders/{id}/move`.
 pub(super) async fn tree(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let r = repo(&state);
     let folders = r.list_folders().map_err(erreur_base)?;
@@ -220,6 +240,7 @@ pub(super) async fn tree(State(state): State<AppState>) -> Result<Json<Value>, A
                     .map(|(_, c)| c)
                     .collect();
                 d["depth"] = json!(depth);
+                d["folders_order"] = json!(ordre_des_dossiers(folders, Some(f.id)));
                 d["folders"] = json!(sous);
                 d["collections"] = json!(cols);
                 d
@@ -237,6 +258,7 @@ pub(super) async fn tree(State(state): State<AppState>) -> Result<Json<Value>, A
 
     Ok(Json(json!({
         "max_depth": MAX_DEPTH,
+        "folders_order": ordre_des_dossiers(&folders, None),
         "folders": arbre,
         "collections": racine,
     })))
@@ -286,6 +308,11 @@ pub(super) struct MoveFolderBody {
 }
 
 /// `POST /library/collection-folders/{id}/move` — `{parent_id: n|null, position?}`.
+///
+/// Monter ou descendre un rayon parmi ses frères (#6779) : le parent actuel
+/// et le rang voulu (`position` lue dans l'arbre, moins ou plus un). Une
+/// position range la fratrie à la main ; sans elle, une fratrie
+/// alphabétique le reste.
 pub(super) async fn move_folder(
     State(state): State<AppState>,
     Path(id): Path<i64>,

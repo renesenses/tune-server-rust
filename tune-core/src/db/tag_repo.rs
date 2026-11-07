@@ -444,20 +444,24 @@ impl TagRepo {
 
     pub fn list(&self) -> Result<Vec<Tag>, String> {
         let rows = self.db.query_many(sql::list_all(), &[])?;
-        Ok(rows.iter().map(row_to_tag).collect())
+        Ok(rows.iter().map(|cols| row_to_tag(cols)).collect())
     }
 
     pub fn create(&self, name: &str, color: Option<&str>) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::create_tag, sql::create_tag);
         let color_val = color.unwrap_or("#808080");
         let params: [&dyn ToSqlValue; 2] = [&name, &color_val];
-        Ok(self.db.execute_returning_id(&sql, &params)?)
+        self.db.execute_returning_id(&sql, &params)
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Tag>, String> {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_tag))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_tag(cols)))
     }
 
     pub fn update(&self, id: i64, name: Option<&str>, color: Option<&str>) -> Result<(), String> {
@@ -596,13 +600,17 @@ impl TagRepo {
         let sql = self.dialect_sql(sql::tags_for_item, sql::tags_for_item);
         let params: [&dyn ToSqlValue; 2] = [&item_type, &item_id];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_tag).collect())
+        Ok(rows.iter().map(|cols| row_to_tag(cols)).collect())
     }
 
     pub fn get_by_name(&self, name: &str) -> Result<Option<Tag>, String> {
         let sql = self.dialect_sql(sql::get_by_name, sql::get_by_name);
         let params: [&dyn ToSqlValue; 1] = [&name];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_tag))
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(|cols| row_to_tag(cols)))
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<Tag>, String> {
@@ -610,7 +618,7 @@ impl TagRepo {
         let pattern = format!("%{query}%");
         let params: [&dyn ToSqlValue; 1] = [&pattern as &dyn ToSqlValue];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_tag).collect())
+        Ok(rows.iter().map(|cols| row_to_tag(cols)).collect())
     }
 
     pub fn list_with_counts(&self, item_type: Option<&str>) -> Result<Vec<TagWithCount>, String> {
@@ -761,7 +769,10 @@ impl TagRepo {
         let sql = self.dialect_sql(sql::streaming_items_by_tag, sql::streaming_items_by_tag);
         let params: [&dyn ToSqlValue; 2] = [&tag_id, &item_type];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_streaming_tag_item).collect())
+        Ok(rows
+            .iter()
+            .map(|cols| row_to_streaming_tag_item(cols))
+            .collect())
     }
 
     /// Tous les objets de streaming d'une etiquette, tous types confondus.
@@ -772,7 +783,10 @@ impl TagRepo {
         );
         let params: [&dyn ToSqlValue; 1] = [&tag_id];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_streaming_tag_item).collect())
+        Ok(rows
+            .iter()
+            .map(|cols| row_to_streaming_tag_item(cols))
+            .collect())
     }
 
     /// Les etiquettes posees sur un objet de streaming.
@@ -785,7 +799,7 @@ impl TagRepo {
         let sql = self.dialect_sql(sql::tags_for_streaming_item, sql::tags_for_streaming_item);
         let params: [&dyn ToSqlValue; 3] = [&item_type, &source, &source_id];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_tag).collect())
+        Ok(rows.iter().map(|cols| row_to_tag(cols)).collect())
     }
 
     pub fn items_by_all_tags(&self, tag_ids: &[i64], item_type: &str) -> Result<Vec<i64>, String> {
@@ -827,7 +841,7 @@ pub fn ordre_complet(actuelles: &[i64], demandes: &[i64]) -> Vec<i64> {
     ordre
 }
 
-fn row_to_streaming_tag_item(cols: &Vec<SqlValue>) -> StreamingTagItem {
+fn row_to_streaming_tag_item(cols: &[SqlValue]) -> StreamingTagItem {
     StreamingTagItem {
         item_type: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
         source: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
@@ -840,7 +854,7 @@ fn row_to_streaming_tag_item(cols: &Vec<SqlValue>) -> StreamingTagItem {
     }
 }
 
-fn row_to_tag(cols: &Vec<SqlValue>) -> Tag {
+fn row_to_tag(cols: &[SqlValue]) -> Tag {
     Tag {
         id: cols.first().and_then(|v| v.as_i64()),
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),

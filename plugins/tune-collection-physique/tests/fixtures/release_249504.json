@@ -1,0 +1,177 @@
+{
+ "id": 249504,
+ "status": "Accepted",
+ "year": 1987,
+ "uri": "https://www.discogs.com/release/249504-Rick-Astley-Never-Gonna-Give-You-Up",
+ "artists": [
+  {
+   "name": "Rick Astley",
+   "anv": "",
+   "join": "",
+   "role": "",
+   "tracks": "",
+   "id": 72872,
+   "resource_url": "https://api.discogs.com/artists/72872"
+  }
+ ],
+ "labels": [
+  {
+   "name": "RCA",
+   "catno": "PB 41447",
+   "entity_type": "1",
+   "entity_type_name": "Label",
+   "id": 895,
+   "resource_url": "https://api.discogs.com/labels/895"
+  }
+ ],
+ "formats": [
+  {
+   "name": "Vinyl",
+   "qty": "1",
+   "descriptions": [
+    "7\"",
+    "45 RPM",
+    "Single",
+    "Stereo"
+   ]
+  }
+ ],
+ "title": "Never Gonna Give You Up",
+ "country": "UK",
+ "released": "1987-07-00",
+ "identifiers": [
+  {
+   "type": "Barcode",
+   "value": "5012394144777"
+  },
+  {
+   "type": "Label Code",
+   "value": "LC 0316"
+  },
+  {
+   "type": "Price Code",
+   "value": "AC",
+   "description": "D:"
+  },
+  {
+   "type": "Price Code",
+   "value": "RC110",
+   "description": "F:"
+  },
+  {
+   "type": "Price Code",
+   "value": "AA",
+   "description": "UK:"
+  },
+  {
+   "type": "Matrix / Runout",
+   "value": "PB 41447 A‡",
+   "description": "A side label"
+  },
+  {
+   "type": "Matrix / Runout",
+   "value": "PB 41447 B‡",
+   "description": "B side label"
+  },
+  {
+   "type": "Matrix / Runout",
+   "value": "PB 41447 A2 UTOPIA MS",
+   "description": "A side runout, variant 1"
+  },
+  {
+   "type": "Matrix / Runout",
+   "value": "PB 41447-B.2 UTOPIA MS",
+   "description": "B side runout, variant 1"
+  },
+  {
+   "type": "Matrix / Runout",
+   "value": "PB 41447 A4 UTOPIA MS.",
+   "description": "A side runout, variant 2"
+  },
+  {
+   "type": "Matrix / Runout",
+   "value": "PB 41447 B4 UTOPIA MS ♥ RD.",
+   "description": "B side runout, variant 2"
+  },
+  {
+   "type": "Matrix / Runout",
+   "value": "PB 41447 A2 UTOPIA MS B",
+   "description": "A side runout, variant 3"
+  },
+  {
+   "type": "Matrix / Runout",
+   "value": "PB 41447-B.2 B UTOPIA MS",
+   "description": "B side runout, variant 3"
+  }
+ ],
+ "tracklist": [
+  {
+   "position": "A",
+   "type_": "track",
+   "title": "Never Gonna Give You Up",
+   "duration": "3:32"
+  },
+  {
+   "position": "B",
+   "type_": "track",
+   "title": "Never Gonna Give You Up (Instrumental)",
+   "duration": "3:30"
+  }
+ ],
+ "extraartists": [
+  {
+   "name": "Me Company",
+   "anv": "Me Co",
+   "join": "",
+   "role": "Design",
+   "tracks": "",
+   "id": 547352,
+   "resource_url": "https://api.discogs.com/artists/547352"
+  },
+  {
+   "name": "Mark McGuire",
+   "anv": "",
+   "join": "",
+   "role": "Engineer",
+   "tracks": "",
+   "id": 78275,
+   "resource_url": "https://api.discogs.com/artists/78275"
+  },
+  {
+   "name": "Mike Duffy",
+   "anv": "",
+   "join": "",
+   "role": "Engineer",
+   "tracks": "",
+   "id": 95941,
+   "resource_url": "https://api.discogs.com/artists/95941"
+  },
+  {
+   "name": "Miles Showell",
+   "anv": "MS",
+   "join": "",
+   "role": "Lacquer Cut By",
+   "tracks": "",
+   "id": 383408,
+   "resource_url": "https://api.discogs.com/artists/383408"
+  },
+  {
+   "name": "Pete Hammond",
+   "anv": "Mixmaster Pete Hammond",
+   "join": "",
+   "role": "Mixed By",
+   "tracks": "",
+   "id": 34067,
+   "resource_url": "https://api.discogs.com/artists/34067"
+  },
+  {
+   "name": "Stock, Aitken & Waterman",
+   "anv": "Stock / Aitken / Waterman",
+   "join": "",
+   "role": "Producer, Written-By",
+   "tracks": "",
+   "id": 20942,
+   "resource_url": "https://api.discogs.com/artists/20942"
+  }
+ ]
+}

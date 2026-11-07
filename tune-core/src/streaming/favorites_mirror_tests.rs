@@ -16,10 +16,137 @@ use crate::streaming::traits::{
     AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack, StreamUrl,
 };
 
+/// #6399 — 7 000 favoris, trois profils : une confirmation ne doit pas
+/// parcourir les 21 000 lignes. Le compteur SQLite mesure le travail réel de
+/// la requête de production, indépendamment de la charge de la machine.
+#[test]
+fn confirmer_un_favori_ne_balaie_pas_tout_le_miroir_6399() {
+    use rusqlite::{StatementStatus, params};
+
+    let db = SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    db.execute_batch(
+        "WITH RECURSIVE numeros(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM numeros WHERE n < 7000),
+         profils(p) AS (VALUES (1), (2), (3))
+         INSERT INTO streaming_favorites(profile_id, item_type, service, service_id, miroir_etat)
+         SELECT p, 'track', 'qobuz', CAST(n AS TEXT), 'ajout_en_attente' FROM numeros CROSS JOIN profils;
+         INSERT INTO streaming_favorites(profile_id, item_type, service, service_id, miroir_etat)
+         VALUES (1, 'track', 'tidal', '3500', 'ajout_en_attente'),
+                (1, 'album', 'qobuz', '3500', 'ajout_en_attente');",
+    )
+    .unwrap();
+    let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+    let sql = sql_poser_etat(&backend);
+    let conn = db.connection().lock().unwrap();
+    let mut stmt = conn.prepare(&sql).unwrap();
+    assert_eq!(
+        stmt.execute(params![
+            ETAT_SYNCHRO,
+            Option::<String>::None,
+            "qobuz",
+            "track",
+            "3500"
+        ])
+        .unwrap(),
+        3,
+        "la confirmation doit atteindre chaque profil du même favori"
+    );
+    let balayages = stmt.get_status(StatementStatus::FullscanStep);
+    assert_eq!(
+        balayages, 0,
+        "confirmer un favori ne doit pas balayer tout le miroir (#6399)"
+    );
+    assert!(
+        stmt.get_status(StatementStatus::VmStep) < 500,
+        "la confirmation doit rester bornée au favori des trois profils"
+    );
+    let autres: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM streaming_favorites WHERE service_id = '3500' AND miroir_etat = 'ajout_en_attente'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(autres, 2, "autre service et autre type restent intacts");
+    drop(stmt);
+    drop(conn);
+
+    // Une base déjà à la dernière version récupère aussi l'index au démarrage.
+    db.execute_batch("DROP INDEX idx_streaming_favorites_miroir")
+        .unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    let conn = db.connection().lock().unwrap();
+    let mut stmt = conn.prepare(&sql).unwrap();
+    assert_eq!(
+        stmt.execute(params![
+            ETAT_SYNCHRO,
+            Option::<String>::None,
+            "qobuz",
+            "track",
+            "3501"
+        ])
+        .unwrap(),
+        3
+    );
+    assert_eq!(stmt.get_status(StatementStatus::FullscanStep), 0);
+}
+
+/// #6399 — un vrai déclencheur SQLite observe le fil qui écrit. Aucune
+/// hypothèse sur la vitesse du processeur ni délai d'ordonnancement : une
+/// écriture sur le fil de l'exécuteur est refusée par la base elle-même.
+#[tokio::test(flavor = "current_thread")]
+async fn la_reconciliation_sql_quitte_le_fil_asynchrone_6399() {
+    let dir = tempfile::tempdir().unwrap();
+    let chemin = dir.path().join("miroir.db");
+    let db = SqliteDb::open(chemin.to_str().unwrap()).unwrap();
+    db.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+    let (arc, compte) = ServiceSimule::nouveau("temoin-fil-6399");
+    poser_chez_le_service(&compte, "tracks", "71");
+
+    let fil_asynchrone = std::thread::current().id();
+    db.connection()
+        .lock()
+        .unwrap()
+        .create_scalar_function(
+            "hors_executeur_6399",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |_| Ok(i64::from(std::thread::current().id() != fil_asynchrone)),
+        )
+        .unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER verifier_fil_miroir_6399 BEFORE INSERT ON streaming_favorites
+         BEGIN
+           SELECT CASE WHEN hors_executeur_6399() = 0
+             THEN RAISE(FAIL, 'le miroir ecrit sur le fil asynchrone (#6399)') END;
+         END;",
+    )
+    .unwrap();
+
+    let bilan = rafraichir(&arc, &backend, 1).await;
+    assert_eq!(
+        bilan.echecs, 0,
+        "la reconciliation SQL doit quitter le fil asynchrone : {:?}",
+        bilan.erreur
+    );
+    assert_eq!(bilan.ajoutes, 1, "le favori a réellement été écrit");
+    assert!(
+        StreamingFavoritesRepo::with_backend(backend)
+            .is_favorite(1, "track", "temoin-fil-6399", "71")
+            .unwrap()
+    );
+}
+
+/// Un favori chez le service : (titre, artiste, album, isrc).
+type Favori = (String, String, String, Option<String>);
+
 /// Le compte chez le service : `type pluriel → id → (titre, artiste, album, isrc)`.
 #[derive(Default)]
 struct Compte {
-    favoris: BTreeMap<String, BTreeMap<String, (String, String, String, Option<String>)>>,
+    favoris: BTreeMap<String, BTreeMap<String, Favori>>,
     /// Panne réseau : toute lecture et toute écriture échouent.
     panne: bool,
     /// Journal des écritures reçues : `"add tracks 71"`, `"remove albums 9"`.
@@ -37,6 +164,10 @@ struct Compte {
     /// partie : la lecture datée d'affichage rend le PREMIER seulement, comme
     /// un connecteur réel rend la coupe ; la lecture complète le dit (`Err`).
     favoris_tronques: bool,
+    /// Identifiants dont le service refuse l'ajout en 401 (radio-qobuz,
+    /// 01/11/2026) — en plus des playlists possédées, que Qobuz refuse
+    /// toujours à l'abonnement.
+    refusees: std::collections::HashSet<String>,
 }
 
 struct ServiceSimule {
@@ -232,6 +363,15 @@ impl StreamingService for ServiceSimule {
             return Err("panne réseau simulée".into());
         }
         c.appels.push(format!("add {fav_type} {item_id}"));
+        // Le refus réel relevé sur le .18 : s'abonner à SA playlist.
+        if c.refusees.contains(item_id)
+            || (fav_type == "playlists" && c.playlists.get(item_id) == Some(&Some(true)))
+        {
+            return Err(format!(
+                "simule /playlist/subscribe: 401 {{\"status\":\"error\",\"code\":401,\"message\":\"Current authenticated user is not authorized to perform this request\"}}"
+            )
+            .into());
+        }
         if fav_type == "playlists" {
             c.playlists.insert(item_id.into(), Some(false));
         }
@@ -1163,5 +1303,197 @@ async fn le_miroir_range_l_annee_et_la_qualite_des_albums_6482() {
     assert_eq!(
         lignes, attendu,
         "l'année et la qualité de l'album favori doivent être rangées pour chaque profil"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Radio → Qobuz (01/11/2026) — jamais d'abonnement à sa propre playlist,
+// jamais de 401 en boucle.
+// ---------------------------------------------------------------------------
+
+/// Les lignes d'un favori, tous profils : `(profile_id, miroir_etat)`.
+fn etats_de(backend: &Arc<dyn DbBackend>, service: &str, id: &str) -> Vec<Option<String>> {
+    backend
+        .query_many_strong(
+            "SELECT miroir_etat FROM streaming_favorites WHERE service = ?1 AND service_id = ?2 ORDER BY profile_id",
+            &[&service, &id],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r.first().and_then(|v| v.as_string()))
+        .collect()
+}
+
+fn appels(compte: &Arc<Mutex<Compte>>) -> Vec<String> {
+    compte.lock().unwrap().appels.clone()
+}
+
+#[test]
+fn un_refus_401_ou_403_se_reconnait_dans_le_motif_radio_qobuz() {
+    assert!(est_un_refus_du_service(
+        r#"qobuz /playlist/subscribe: 401 {"status":"error","code":401}"#
+    ));
+    assert!(est_un_refus_du_service("tidal favorites: 403 Forbidden"));
+    // Contre-épreuves : une panne, un 404, un identifiant qui CONTIENT 401.
+    assert!(!est_un_refus_du_service("panne réseau simulée"));
+    assert!(!est_un_refus_du_service(
+        "qobuz /playlist/subscribe: 404 not found"
+    ));
+    assert!(!est_un_refus_du_service(
+        "qobuz /favorite/create: 500 playlist 58698401x"
+    ));
+    assert!(!est_un_refus_du_service(
+        "qobuz /favorite/create: 500 id 4013"
+    ));
+}
+
+/// Témoin 1 — un cœur posé dans Tune sur SA playlist ne s'abonne pas : elle
+/// est `synchro` d'emblée, aucun appel d'écriture. Contre-épreuve : une
+/// playlist suivie (d'un autre) est bien abonnée.
+#[tokio::test]
+async fn un_coeur_sur_sa_propre_playlist_ne_s_abonne_pas_radio_qobuz() {
+    let (backend, profils, _dir) = base(2);
+    let (arc, compte) = ServiceSimule::nouveau("miroir-rq1");
+    bibliotheque_de_playlists(&compte, &[("58698591", Some(true))]);
+
+    let p = ajouter(&arc, &backend, profils[0], &favori("playlist", "58698591"))
+        .await
+        .unwrap();
+    assert_eq!(p, Propagation::Propage);
+    assert!(
+        appels(&compte).is_empty(),
+        "abonnement tenté : {:?}",
+        appels(&compte)
+    );
+    assert_eq!(
+        etats_de(&backend, "miroir-rq1", "58698591"),
+        vec![Some(ETAT_SYNCHRO.to_string()); 2]
+    );
+
+    // Contre-épreuve : la playlist d'un autre, elle, est abonnée.
+    let p = ajouter(&arc, &backend, profils[0], &favori("playlist", "edito"))
+        .await
+        .unwrap();
+    assert_eq!(p, Propagation::Propage);
+    assert_eq!(appels(&compte), vec!["add playlists edito".to_string()]);
+
+    // Retirer le cœur de SA playlist : local, aucun désabonnement.
+    compte.lock().unwrap().appels.clear();
+    retirer(&arc, &backend, "playlist", "58698591")
+        .await
+        .unwrap();
+    assert!(appels(&compte).is_empty(), "{:?}", appels(&compte));
+    assert!(etats_de(&backend, "miroir-rq1", "58698591").is_empty());
+}
+
+/// Témoin 2 — l'état exact relevé sur le .18 : trois playlists du compte en
+/// `ajout_en_attente`. Le rafraîchissement les règle SANS appel ; les
+/// suivants n'appellent rien non plus. Contre-épreuve : sans la règle, le
+/// simulé répondait 401 à chaque passage (le journal en compte 12 360).
+#[tokio::test]
+async fn les_playlists_possedees_en_attente_ne_bouclent_plus_en_401_radio_qobuz() {
+    let (backend, profils, _dir) = base(2);
+    let (arc, compte) = ServiceSimule::nouveau("miroir-rq2");
+    bibliotheque_de_playlists(
+        &compte,
+        &[
+            ("58698591", Some(true)),
+            ("58698592", Some(true)),
+            ("58698595", Some(true)),
+        ],
+    );
+    let repo = StreamingFavoritesRepo::with_backend(backend.clone());
+    for id in ["58698591", "58698592", "58698595"] {
+        for &pid in &profils {
+            repo.add(pid, "playlist", "miroir-rq2", id, None, None, None, None)
+                .unwrap();
+        }
+        poser_etat(
+            &backend,
+            "miroir-rq2",
+            "playlist",
+            id,
+            ETAT_AJOUT_EN_ATTENTE,
+            Some("qobuz /playlist/subscribe: 401"),
+        )
+        .unwrap();
+    }
+    assert_eq!(compter_en_attente(&backend, "miroir-rq2"), 3);
+
+    for passage in 0..3 {
+        let bilan = rafraichir(&arc, &backend, profils[0]).await;
+        assert_eq!(bilan.echecs, 0, "passage {passage} : {bilan:?}");
+        assert_eq!(bilan.en_attente, 0, "passage {passage} : {bilan:?}");
+        assert!(
+            appels(&compte).is_empty(),
+            "passage {passage} : abonnement à sa propre playlist : {:?}",
+            appels(&compte)
+        );
+    }
+    for id in ["58698591", "58698592", "58698595"] {
+        assert_eq!(
+            etats_de(&backend, "miroir-rq2", id),
+            vec![Some(ETAT_SYNCHRO.to_string()); 2],
+            "{id} doit rester un cœur, confirmé"
+        );
+    }
+}
+
+/// Témoin 3 — un 401 sur un identifiant que le compte ne possède pas, la
+/// session venant de lire le compte sans erreur : UN appel, la ligne passe
+/// `refuse_par_le_service`, plus aucun appel ensuite. Contre-épreuve : si
+/// la lecture a échoué (session douteuse), le 401 reste en attente et est
+/// retenté — on ne condamne pas un favori sur une session expirée.
+#[tokio::test]
+async fn un_refus_401_est_memorise_et_n_est_plus_retente_radio_qobuz() {
+    let (backend, profils, _dir) = base(1);
+    let pid = profils[0];
+    let (arc, compte) = ServiceSimule::nouveau("miroir-rq3");
+    compte.lock().unwrap().refusees.insert("privee".into());
+    bibliotheque_de_playlists(&compte, &[]);
+
+    let p = ajouter(&arc, &backend, pid, &favori("playlist", "privee"))
+        .await
+        .unwrap();
+    assert!(matches!(p, Propagation::EnAttente(_)), "{p:?}");
+    compte.lock().unwrap().appels.clear();
+
+    let bilan = rafraichir(&arc, &backend, pid).await;
+    assert_eq!(bilan.refuses, 1, "{bilan:?}");
+    assert_eq!(bilan.en_attente, 0, "{bilan:?}");
+    assert_eq!(appels(&compte), vec!["add playlists privee".to_string()]);
+    assert_eq!(
+        etats_de(&backend, "miroir-rq3", "privee"),
+        vec![Some(ETAT_REFUSE.to_string())]
+    );
+
+    for _ in 0..3 {
+        rafraichir(&arc, &backend, pid).await;
+    }
+    assert_eq!(
+        appels(&compte),
+        vec!["add playlists privee".to_string()],
+        "le refus a été retenté"
+    );
+
+    // Retirer le cœur d'un ajout refusé : local, aucun appel.
+    retirer(&arc, &backend, "playlist", "privee").await.unwrap();
+    assert_eq!(appels(&compte).len(), 1);
+    assert!(etats_de(&backend, "miroir-rq3", "privee").is_empty());
+
+    // Contre-épreuve : lecture du compte en échec → le 401 reste en attente.
+    let (arc, compte) = ServiceSimule::nouveau("miroir-rq3b");
+    compte.lock().unwrap().refusees.insert("71".into());
+    ajouter(&arc, &backend, pid, &favori("track", "71"))
+        .await
+        .unwrap();
+    compte.lock().unwrap().favoris_tronques = true;
+    let bilan = rafraichir(&arc, &backend, pid).await;
+    assert!(bilan.echecs > 0, "{bilan:?}");
+    assert_eq!(bilan.refuses, 0, "{bilan:?}");
+    assert_eq!(bilan.en_attente, 1, "{bilan:?}");
+    assert_eq!(
+        etats_de(&backend, "miroir-rq3b", "71"),
+        vec![Some(ETAT_AJOUT_EN_ATTENTE.to_string())]
     );
 }

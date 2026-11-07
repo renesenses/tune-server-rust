@@ -26,6 +26,7 @@ fn appareil(nom: &str, hote: &str) -> AudioDevice {
         max_channels: 2,
         sample_rates: vec![44100, 48000],
         sample_rates_measured: true,
+        availability: None,
         backend: hote.into(),
         hardware_detail: None,
     }

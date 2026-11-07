@@ -136,11 +136,13 @@ impl HoteLecture for HoteOrchestrateur {
     }
 
     async fn source_en_cours(&self, zone_id: i64) -> Option<String> {
-        self.playback
-            .get_state(zone_id)
-            .await
-            .now_playing
-            .map(|np| np.source)
+        let etat = self.playback.get_state(zone_id).await;
+        // #7104 — Stop conserve now_playing pour la reprise, mais ne tient
+        // plus le disque. Une pause le réserve encore, comme une lecture.
+        if etat.state == tune_core::playback::PlayState::Stopped {
+            return None;
+        }
+        etat.now_playing.map(|np| np.source)
     }
 
     async fn lit_le_disque(&self, zone_id: i64) -> bool {

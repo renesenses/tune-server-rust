@@ -12,6 +12,59 @@ mod tests {
     use crate::outputs::traits::{OutputTarget, PlayMedia};
     #[tokio::test]
     async fn oaat_connect_and_stream() {
+        verifier_demarrage_7331(0, false).await;
+    }
+
+    #[tokio::test]
+    async fn demarrage_7331_preparation_lente() {
+        verifier_demarrage_7331(3000, false).await;
+    }
+
+    #[tokio::test]
+    async fn demarrage_7331_endpoint_ancien_sans_horloge() {
+        verifier_demarrage_7331(0, true).await;
+    }
+
+    #[tokio::test]
+    async fn demarrage_7331_stop_pendant_negociation_lente() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let output = OaatOutput::new(
+            "lent".into(),
+            "127.0.0.1".into(),
+            tcp.local_addr().unwrap().port(),
+            "lent-7331".into(),
+        );
+        output
+            .play_media(&PlayMedia {
+                url: "http://127.0.0.1:9/absent",
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (mut connexion, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), tcp.accept())
+                .await
+                .expect("aucune connexion au faux endpoint")
+                .unwrap();
+        let mut buf = [0; 8192];
+        let n = connexion.read(&mut buf).await.unwrap();
+        assert!(n > 0, "Hello absent");
+        // Le faux endpoint ne répond pas : stop doit annuler la négociation,
+        // fermer la socket, et empêcher les tentatives suivantes.
+        output.stop().await.unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), connexion.read(&mut buf))
+            .await
+            .expect("stop n'a pas interrompu la négociation")
+            .unwrap();
+        assert_eq!(n, 0, "la connexion OAAT reste active après stop");
+        assert!(
+            !output.diagnostics_snapshot()["connected"]
+                .as_bool()
+                .unwrap()
+        );
+    }
+
+    async fn verifier_demarrage_7331(preparation_ms: u64, sans_horloge: bool) {
         // Bind control (TCP), audio (UDP), clock (UDP) on random ports
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let control_port = tcp.local_addr().unwrap().port();
@@ -68,8 +121,19 @@ mod tests {
                 loop {
                     match clock_udp.recv_from(&mut buf).await {
                         Ok((n, peer)) if n >= 28 => {
-                            // Echo back as response (simplified)
-                            let _ = clock_udp.send_to(&buf[..n], peer).await;
+                            if !sans_horloge {
+                                use oaat_core::wire::{ClockSyncPacket, ClockSyncType};
+                                let t2 = oaat_core::time::now_ns();
+                                let requete: [u8; ClockSyncPacket::SIZE] =
+                                    buf[..ClockSyncPacket::SIZE].try_into().unwrap();
+                                let mut reponse = ClockSyncPacket::decode(&requete).unwrap();
+                                reponse.kind = ClockSyncType::Response;
+                                reponse.t2 = t2;
+                                reponse.t3 = oaat_core::time::now_ns();
+                                let mut paquet = [0; ClockSyncPacket::SIZE];
+                                reponse.encode(&mut paquet);
+                                let _ = clock_udp.send_to(&paquet, peer).await;
+                            }
                         }
                         _ => break,
                     }
@@ -110,7 +174,7 @@ mod tests {
                             },
                             audio_port,
                             clock_port,
-                            buffer_size_ms: 100,
+                            buffer_size_ms: if sans_horloge { 10_000 } else { 100 },
                             features: vec![],
                         });
                         let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
@@ -131,6 +195,10 @@ mod tests {
                                 match msg {
                                     Message::FormatPropose(fp) => {
                                         got_format = true;
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            preparation_ms,
+                                        ))
+                                        .await;
                                         let accept = Message::FormatAccept(FormatAccept {
                                             stream_id: fp.stream_id,
                                         });
@@ -187,23 +255,42 @@ mod tests {
 
         // Wait for mock to finish
         let (got_format, got_play, audio_packets, premier) =
-            tokio::time::timeout(std::time::Duration::from_secs(8), mock_handle)
+            tokio::time::timeout(std::time::Duration::from_secs(12), mock_handle)
                 .await
                 .expect("mock timed out")
                 .expect("mock panicked");
 
         // L'heure de départ envoyée à l'endpoint (PTS du premier paquet,
-        // `stream_start_ns` = maintenant + 500 ms) est datée dans l'horloge
+        // ancré après préparation, avec avance réseau) est datée dans l'horloge
         // monotone d'oaat, celle de la synchro d'horloge : elle tombe entre
         // « avant play » et « réception » lus sur `oaat_core::time::now_ns()`,
-        // décalés des 500 ms d'avance.
+        // décalés des bornes de l'avance compatible (500 ms à 4 s).
         let (pts_premier, recu_ns) = premier.expect("aucun en-tête audio décodable reçu");
+        let commande_premier_paquet_ns = recu_ns.saturating_sub(avant_play_ns);
+        let avance_ns = pts_premier.saturating_sub(recu_ns);
+        eprintln!(
+            "7331 préparation={preparation_ms}ms ancien={sans_horloge}: commande→paquet={commande_premier_paquet_ns}ns avance_PTS={avance_ns}ns"
+        );
+        if preparation_ms == 0 && !sans_horloge {
+            assert!(
+                commande_premier_paquet_ns < 2_000_000_000,
+                "un endpoint rapide subit encore le plancher de deux secondes"
+            );
+        }
         assert!(
-            avant_play_ns + 500_000_000 <= pts_premier && pts_premier <= recu_ns + 500_000_000,
+            commande_premier_paquet_ns >= preparation_ms * 1_000_000,
+            "le paquet est parti avant la fin de la préparation"
+        );
+        assert!(
+            avance_ns > 300_000_000,
+            "la préparation lente a consommé l'avance PTS avant le premier paquet"
+        );
+        assert!(
+            avant_play_ns + 500_000_000 <= pts_premier && pts_premier <= recu_ns + 4_000_000_000,
             "PTS du premier paquet {pts_premier} hors de [{}, {}] : l'heure de départ \
              n'est pas dans le domaine d'horloge d'oaat",
             avant_play_ns + 500_000_000,
-            recu_ns + 500_000_000
+            recu_ns + 4_000_000_000
         );
 
         assert!(got_format, "endpoint should receive FormatPropose");

@@ -42,6 +42,8 @@ use serde_json::{Value, json};
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 
+pub use super::musicbrainz_release::SansReponse;
+
 /// Groupes par page (le plafond de MusicBrainz).
 pub const PAGE: u32 = 100;
 /// Au plus 1 500 groupes — un quart de minute au premier passage.
@@ -118,7 +120,7 @@ pub enum Lecture {
 
 /// Une page brute : `Ok(Some)`, `Ok(None)` (artiste inconnu), `Err` (pas de
 /// réponse).
-pub type Page = Result<Option<Value>, ()>;
+pub type Page = Result<Option<Value>, SansReponse>;
 
 /// La discographie Album + EP d'un artiste, page par page, par le transport
 /// injecté `lire_page(mbid, offset)`. Une page manquante en cours de route
@@ -141,7 +143,7 @@ where
         let page = match lire_page(mbid.to_string(), n * PAGE).await {
             Ok(Some(p)) => p,
             Ok(None) if n == 0 => return Lecture::Inconnu,
-            Ok(None) | Err(()) => return Lecture::Indisponible,
+            Ok(None) | Err(_) => return Lecture::Indisponible,
         };
         let (groupes, total) = groupes_de_la_page(&page);
         let vide = groupes.is_empty();
@@ -176,7 +178,7 @@ pub async fn lire_page_de_discographie(mbid: String, offset: u32) -> Page {
     {
         Ok(v) => Ok(Some(v)),
         Err(RefusMusicBrainz::Statut(400 | 404)) => Ok(None),
-        Err(_) => Err(()),
+        Err(_) => Err(SansReponse),
     }
 }
 

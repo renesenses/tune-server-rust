@@ -26,9 +26,12 @@ use crate::state::AppState;
 /// Une station sérialisée, enrichie de ses repères stables dans la langue de
 /// la requête. Toutes les routes qui rendent UNE station passent par ici : un
 /// point de sortie oublié est exactement le défaut corrigé ici.
-fn station_localisee(station: &RadioStation, headers: &HeaderMap) -> Value {
+///
+/// #7721 — le débit annoncé y est aussi celui du flux que la lecture prendra.
+fn station_localisee(state: &AppState, station: &RadioStation, headers: &HeaderMap) -> Value {
     let mut corps = json!(station);
     radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(headers));
+    geofencing::annoncer_le_debit_ecoute(state, &mut corps);
     corps
 }
 
@@ -497,14 +500,75 @@ fn favicon_from_url(url: &str) -> Option<String> {
     if host.is_empty() || !host.contains('.') {
         return None;
     }
-    Some(format!(
-        "https://www.google.com/s2/favicons?domain={host}&sz=128"
-    ))
+    Some(format!("{FAVICON_CALCULEE}domain={host}&sz=128"))
 }
 
-#[derive(Deserialize)]
+/// Le début des favicons que Tune CALCULE ([`favicon_from_url`]) pour une
+/// station arrivée sans logo. Ce n'est pas un choix de l'utilisateur, et le
+/// relais de pochettes refuse son hôte (`www.google.com` hors de
+/// `HOTES_AUTORISES`) : à l'écran, elle donne un fond gris.
+pub(crate) const FAVICON_CALCULEE: &str = "https://www.google.com/s2/favicons?";
+
+/// #7051 — Le logo d'une station qu'on crée.
+///
+/// Radio Bergeijk (fil forum 2443) : radio-browser publie la variante FLAC
+/// avec une favicon VIDE. Ajoutée par son adresse, la station recevait la
+/// favicon calculée, alors que la fiche de l'annuaire au MÊME flux a un logo.
+///
+/// Dans l'ordre : le logo saisi s'il est renseigné ; sinon celui de la fiche
+/// dont une adresse de flux est celle-ci (jamais par le nom) ; sinon le repli
+/// d'avant (`favicon` quand aucun logo n'était donné, le logo vide sinon).
+pub(crate) fn logo_a_la_creation(
+    annuaire: &[StationAnnuaire],
+    url: &str,
+    saisi: Option<String>,
+    favicon: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if saisi.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        return saisi;
+    }
+    let de_la_fiche = annuaire
+        .iter()
+        .find(|f| super::radios_annuaire::flux_de_la_fiche(f, url))
+        .and_then(|f| f.logo_url.clone())
+        .filter(|l| !l.trim().is_empty());
+    de_la_fiche.or(saisi).or_else(favicon)
+}
+
+/// `GET /radios/search`. `q` reste la recherche par nom ; les critères de
+/// #7466 s'y ajoutent, tous facultatifs et combinables. Sans aucun critère,
+/// rien ne change : `q` reste exigé et la réponse est celle d'avant.
+#[derive(Deserialize, Default)]
 struct SearchQuery {
-    q: String,
+    q: Option<String>,
+    genre: Option<String>,
+    country: Option<String>,
+    codec: Option<String>,
+    bitrate_min: Option<i32>,
+    /// #7718 — le niveau de qualité minimal d'au moins un flux.
+    quality_min: Option<String>,
+    lossless: Option<bool>,
+    hires: Option<bool>,
+    favorites_only: Option<bool>,
+    rated_min: Option<f64>,
+    metadata_plus: Option<bool>,
+}
+
+impl SearchQuery {
+    fn criteres(&self) -> super::radios_criteres_7466::Criteres {
+        super::radios_criteres_7466::Criteres::depuis(
+            self.genre.as_deref(),
+            self.country.as_deref(),
+            self.codec.as_deref(),
+            self.bitrate_min,
+            self.lossless,
+            self.hires,
+            self.favorites_only,
+            self.rated_min,
+            self.metadata_plus,
+        )
+        .avec_qualite_min(self.quality_min.as_deref())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -623,13 +687,22 @@ pub struct StationAnnuaire {
     pub logo_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
+    /// Le genre v1 de la fiche : celui de sa PREMIÈRE catégorie.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub genre: Option<String>,
+    /// #7215 — TOUS les genres de la fiche (un par catégorie, dans l'ordre,
+    /// sans doublon), servis par l'annuaire v2 depuis le 27/10/2026 : « OuiFM
+    /// Blues & Rock » est blues ET rock. Un site plus ancien ne les sert pas :
+    /// la lecture se replie alors sur `[genre]` ([`annuaire_depuis_json`]).
+    /// Lire de préférence [`StationAnnuaire::genres_ou_genre`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub website_url: Option<String>,
-    /// L'identifiant de la fiche dans l'annuaire (`S000973`).
+    /// Clé adressable de la fiche : identifiant externe (`S000973`) ou,
+    /// pour une station du portail sans identifiant externe, `mozaiklabs:ID`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
     /// La clé radio-metadata.fr (`fip`) : la station a un titre en cours.
@@ -654,6 +727,101 @@ pub struct StationAnnuaire {
     pub codec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate: Option<i32>,
+    /// #7177 (web#2443) — le détail des flux publiés de la fiche v2 (format,
+    /// débit), pour que l'écran propose de choisir son flux préféré. Vide pour
+    /// une entrée v1. [`StationAnnuaire::flux_proposes`] en fait la liste
+    /// rendue par l'API.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flux: Vec<FluxAnnuaire>,
+    /// Une liste v2 vide ne doit pas réactiver les adresses historiques v1.
+    #[serde(skip)]
+    pub streams_declared: bool,
+    /// #7500 — l'ancienne clé `mozaiklabs:ID` (id interne de la v2), gardée
+    /// même quand la fiche porte un `external_id`. Une station du portail qui
+    /// reçoit un numéro radio-metadata (`S…`, site du 30/10/2026) change de
+    /// clé : « Mes radios » l'a enregistrée sous `mozaiklabs:ID`, et c'est par
+    /// cette clé qu'elle retrouve sa fiche, puis que son lien est réécrit
+    /// ([`super::radios_annuaire::lier_les_stations`]).
+    #[serde(skip)]
+    pub cle_locale: Option<String>,
+    /// #7466 — la note moyenne de la fiche sur radio-metadata.fr
+    /// (`avg_rating`, de 0 à 5), en CENTIÈMES pour garder `Eq` : 4,7 → 470.
+    /// `None` tant que personne n'a noté la station (`rating_count` à 0).
+    #[serde(skip)]
+    pub note_centiemes: Option<i32>,
+    /// #7466 — le nombre de notes (`rating_count`).
+    #[serde(skip)]
+    pub nombre_de_notes: i64,
+}
+
+/// #7177 — un flux publié d'une fiche de l'annuaire, tel que l'API le rend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct FluxAnnuaire {
+    pub url: String,
+    /// Pays autorisés (ISO alpha-2). Vide : aucune restriction publiée.
+    pub restricted_to_countries: Vec<String>,
+    /// `AAC`, `MP3`, `FLAC`… tel que l'annuaire l'écrit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<i32>,
+    /// Flux HLS (`.m3u8`).
+    pub hls: bool,
+    /// Le flux principal de la fiche (son `stream_url`).
+    pub primary: bool,
+}
+
+#[path = "radios_geofencing_7199.rs"]
+pub(crate) mod geofencing;
+
+impl StationAnnuaire {
+    /// #7500 — la fiche porte-t-elle cette clé : son `external_id`, ou son
+    /// ancienne clé `mozaiklabs:ID` ([`StationAnnuaire::cle_locale`]) ?
+    pub fn porte_la_cle(&self, cle: &str) -> bool {
+        self.external_id.as_deref() == Some(cle) || self.cle_locale.as_deref() == Some(cle)
+    }
+
+    /// #7215 — les genres de la fiche : `genres`, sinon le seul `genre` (une
+    /// fiche construite sans `genres`, ou relevée sur un site plus ancien).
+    pub fn genres_ou_genre(&self) -> Vec<&str> {
+        if self.genres.is_empty() {
+            self.genre.as_deref().into_iter().collect()
+        } else {
+            self.genres.iter().map(String::as_str).collect()
+        }
+    }
+
+    /// #7177 — les flux que l'on peut choisir pour cette fiche : chacune de
+    /// ses adresses publiées (`stream_urls`, la principale d'abord), avec le
+    /// format et le débit que la v2 en donne. Une adresse sans détail (une
+    /// entrée v1) est rendue quand même, sans format.
+    pub fn flux_proposes(&self) -> Vec<FluxAnnuaire> {
+        let mut adresses: Vec<&str> = vec![self.stream_url.as_str()];
+        for u in &self.stream_urls {
+            if !adresses.contains(&u.as_str()) {
+                adresses.push(u);
+            }
+        }
+        adresses
+            .into_iter()
+            .map(|url| {
+                let detail = self.flux.iter().find(|f| f.url == url);
+                FluxAnnuaire {
+                    url: url.to_string(),
+                    restricted_to_countries: detail
+                        .map(|f| f.restricted_to_countries.clone())
+                        .unwrap_or_default(),
+                    codec: detail.and_then(|f| f.codec.clone()),
+                    bitrate: detail.and_then(|f| f.bitrate),
+                    sample_rate: detail.and_then(|f| f.sample_rate),
+                    hls: detail.is_some_and(|f| f.hls),
+                    primary: url == self.stream_url,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Racine des adresses relatives de l'annuaire (les `logo_url` en `/storage/…`).
@@ -729,6 +897,26 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                 .and_then(Value::as_array)
                 .map(|c| c.iter().filter_map(|c| texte(c, "slug")).collect())
                 .unwrap_or_default();
+            let genre = texte(item, "genre");
+            // #7215 — `genres` (site du 27/10/2026), sans vide ni doublon ;
+            // un site plus ancien n'a que `genre` : repli sur `[genre]`.
+            let mut genres: Vec<String> = Vec::new();
+            for g in item
+                .get("genres")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+            {
+                if !genres.iter().any(|x| x.eq_ignore_ascii_case(g)) {
+                    genres.push(g.to_string());
+                }
+            }
+            if genres.is_empty() {
+                genres.extend(genre.clone());
+            }
             let keywords = item
                 .get("keywords")
                 .and_then(Value::as_array)
@@ -741,14 +929,47 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // #7500 — l'id interne de la v2 : la clé `mozaiklabs:ID`, gardée
+            // même quand un `external_id` la remplace.
+            let cle_locale = item
+                .get("id")
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0)
+                .map(|id| format!("mozaiklabs:{id}"));
+            let entier = |v: Option<&Value>| {
+                v.and_then(Value::as_i64)
+                    .and_then(|b| i32::try_from(b).ok())
+            };
+            let flux = flux_publies
+                .iter()
+                .filter_map(|s| {
+                    Some(FluxAnnuaire {
+                        url: texte(s, "url")?,
+                        restricted_to_countries: geofencing::restrictions(
+                            s.get("restricted_to_countries"),
+                        ),
+                        codec: texte(s, "format"),
+                        bitrate: entier(s.get("bitrate")),
+                        sample_rate: entier(s.get("sample_rate")),
+                        hls: s.get("is_hls").and_then(Value::as_bool) == Some(true),
+                        primary: texte(s, "url").as_deref() == Some(stream_url.as_str()),
+                    })
+                })
+                .collect();
             Some(StationAnnuaire {
                 name,
                 logo_url: texte(item, "logo_url").map(absolue),
                 country: texte(item, "country"),
-                genre: texte(item, "genre"),
+                genre,
+                genres,
                 quality: texte(item, "quality"),
                 website_url: texte(item, "website_url"),
-                external_id: texte(item, "external_id"),
+                // #7011 : une station proposée sur le portail n'a pas de
+                // station_id radio-metadata. Son id local reste stable quand
+                // son nom ou son flux change. Sans ce repli, l'annuaire rend
+                // null et les gestes du client visent /directory/null/…,
+                // rejeté avant même une tentative de lecture.
+                external_id: texte(item, "external_id").or_else(|| cle_locale.clone()),
                 radio_metadata_key: texte(item, "radio_metadata_key"),
                 description: texte(item, "description"),
                 categories,
@@ -760,6 +981,15 @@ pub fn annuaire_depuis_json(brut: &[Value]) -> Vec<StationAnnuaire> {
                     .and_then(|b| i32::try_from(b).ok()),
                 stream_urls,
                 stream_url,
+                flux,
+                streams_declared: item.get("streams").is_some_and(Value::is_array),
+                cle_locale,
+                note_centiemes: super::radios_criteres_7466::note_centiemes(item),
+                nombre_de_notes: item
+                    .get("rating_count")
+                    .and_then(super::radios_criteres_7466::nombre)
+                    .map(|n| n as i64)
+                    .unwrap_or(0),
             })
         })
         .collect()
@@ -793,6 +1023,8 @@ pub(crate) fn annuaire_correspond(station: &StationAnnuaire, requete: &str) -> b
     ]
     .into_iter()
     .flatten()
+    // #7215 — tous les genres de la fiche, pas seulement le premier.
+    .chain(station.genres.iter().map(String::as_str))
     .chain(station.keywords.iter().map(String::as_str))
     .any(|champ| repli(champ).contains(&motif))
 }
@@ -847,13 +1079,23 @@ pub(crate) fn stations_annuaire_absentes(
     requete: &str,
     catalogue: &[RadioStation],
 ) -> Vec<StationAnnuaire> {
+    hors_du_catalogue(
+        annuaire.iter().filter(|s| annuaire_correspond(s, requete)),
+        catalogue,
+    )
+}
+
+/// Les fiches de `fiches` que le catalogue local n'a pas (même adresse de flux
+/// ou même nom) — l'exclusion de [`stations_annuaire_absentes`], sans requête.
+pub(crate) fn hors_du_catalogue<'a>(
+    fiches: impl Iterator<Item = &'a StationAnnuaire>,
+    catalogue: &[RadioStation],
+) -> Vec<StationAnnuaire> {
     let urls: std::collections::HashSet<String> =
         catalogue.iter().map(|s| flux_normalise(&s.url)).collect();
     let noms: std::collections::HashSet<String> =
         catalogue.iter().map(|s| repli(&s.name)).collect();
-    annuaire
-        .iter()
-        .filter(|s| annuaire_correspond(s, requete))
+    fiches
         .filter(|s| {
             !std::iter::once(&s.stream_url)
                 .chain(s.stream_urls.iter())
@@ -968,6 +1210,8 @@ pub struct RattrapageLogos {
     /// #6516 — l'annuaire a été relevé sur le réseau à cette passe (200, ou
     /// 304 : rien n'a changé). Faux quand la passe a servi le cache local.
     pub annuaire_a_jour: bool,
+    /// #7043 — stations de l'annuaire dont l'adresse du flux a suivi leur fiche.
+    pub flux_updated: usize,
 }
 
 impl RattrapageLogos {
@@ -1001,11 +1245,27 @@ impl RattrapageLogos {
 /// la conserver ne coûte pas une requête de plus, et c'est ce qui permet à
 /// `/radios/search` d'interroger l'annuaire sans jamais toucher au réseau.
 pub async fn refresh_radio_logos(state: &AppState) -> RattrapageLogos {
+    refresh_radio_logos_depuis(
+        state,
+        super::radios_annuaire::ANNUAIRE_V2_URL,
+        &super::radios_annuaire::chemin_du_cache(),
+    )
+    .await
+}
+
+/// [`refresh_radio_logos`] sur l'annuaire `url` et le cache `chemin` (#7043) :
+/// la même passe, l'adresse et le cache en paramètres pour que les essais
+/// montent leur propre annuaire.
+pub async fn refresh_radio_logos_depuis(
+    state: &AppState,
+    url: &str,
+    chemin: &std::path::Path,
+) -> RattrapageLogos {
     // #6516 — l'annuaire n'est plus téléchargé ici : il est relevé en v2 par
     // `radios_annuaire`, qui le garde en cache local (`ETag`, hors ligne) et le
     // publie dans `state.annuaire_radios`. Les logos se tirent ensuite de CE
     // relevé — y compris hors ligne, depuis le cache.
-    let releve = super::radios_annuaire::rafraichir(state).await;
+    let releve = super::radios_annuaire::rafraichir_depuis(state, url, chemin).await;
     let annuaire: Vec<StationAnnuaire> = state
         .annuaire_radios
         .read()
@@ -1028,8 +1288,15 @@ pub async fn refresh_radio_logos(state: &AppState) -> RattrapageLogos {
             json!({"action": "logos_refreshed", "updated": bilan.updated}),
         );
     }
+    if bilan.flux_updated > 0 {
+        state.event_bus.emit(
+            "library.radios_changed",
+            json!({"action": "flux_refreshed", "updated": bilan.flux_updated}),
+        );
+    }
     tracing::info!(
         updated = bilan.updated,
+        flux_updated = bilan.flux_updated,
         sans_logo = bilan.sans_logo,
         annuaire_a_jour = bilan.annuaire_a_jour,
         "radio_logos_refreshed_from_directory"
@@ -1053,6 +1320,7 @@ pub(crate) fn rattraper_les_logos(
     let liens = repo.liens_annuaire().unwrap_or_default();
     for mut st in repo.list().unwrap_or_default() {
         let lien = st.id.and_then(|id| liens.get(&id)).map(String::as_str);
+        let mut logo_change = false;
         match logo_a_poser(annuaire, &st, lien) {
             DecisionLogo::Garder => {
                 if st.logo_url.as_deref().is_none_or(|s| s.trim().is_empty()) {
@@ -1061,14 +1329,63 @@ pub(crate) fn rattraper_les_logos(
             }
             DecisionLogo::Poser(logo) => {
                 st.logo_url = logo;
-                if repo.update(&st).is_ok() {
-                    bilan.updated += 1;
-                } else {
-                    bilan.sans_logo += 1;
-                }
+                logo_change = true;
             }
         }
+        // #7043 — l'adresse du flux suit la fiche, sans popup.
+        let flux_change = flux_a_poser(annuaire, &mut st, lien);
+        if !logo_change && !flux_change {
+            continue;
+        }
+        if repo.update(&st).is_ok() {
+            bilan.updated += usize::from(logo_change);
+            bilan.flux_updated += usize::from(flux_change);
+        } else if logo_change {
+            bilan.sans_logo += 1;
+        }
     }
+}
+
+/// #7043 — Rémi (rapport RC7) : une station venue de l'annuaire est gérée en
+/// central, flux compris ; la popup « mettre à jour le flux » n'a plus lieu
+/// d'être. Si `st` est LIÉE à une fiche (`external_id`) et que son adresse n'est
+/// plus aucune de celles que la fiche publie, elle prend l'adresse principale
+/// de la fiche (et son format, son débit). Rend `true` si `st` a changé.
+///
+/// Garde-fous :
+/// * sans lien enregistré (station saisie à la main), RIEN ne change : le
+///   rapprochement par l'adresse, lui, ne touche jamais à l'adresse ;
+/// * une adresse qui reste l'une des adresses publiées de la fiche (même
+///   secondaire) est gardée : ce n'est pas un flux périmé ;
+/// * une fiche sortie de l'annuaire (retirée, refusée) n'est plus dans le
+///   relevé : la station garde son adresse.
+pub(crate) fn flux_a_poser(
+    annuaire: &[StationAnnuaire],
+    st: &mut RadioStation,
+    lien: Option<&str>,
+) -> bool {
+    let Some(ext) = lien else {
+        return false;
+    };
+    let Some(fiche) = annuaire
+        .iter()
+        .find(|f| f.external_id.as_deref() == Some(ext))
+    else {
+        return false;
+    };
+    if fiche.stream_url.trim().is_empty()
+        || super::radios_annuaire::flux_de_la_fiche(fiche, &st.url)
+    {
+        return false;
+    }
+    st.url = fiche.stream_url.clone();
+    if let Some(c) = fiche.codec.as_deref() {
+        st.codec = Some(c.to_ascii_lowercase());
+    }
+    if fiche.bitrate.is_some() {
+        st.bitrate = fiche.bitrate;
+    }
+    true
 }
 
 /// Ce que le rattrapage fait du logo d'une station.
@@ -1099,7 +1416,9 @@ pub(crate) enum DecisionLogo {
 ///   normalisation près, celle de la station. Pas de nom, pas d'approximation :
 ///   sans adresse commune, aucun logo n'est posé ;
 /// * un logo choisi par l'utilisateur (toute adresse hors du dossier des logos
-///   de l'annuaire, image téléversée, favicon…) n'est jamais touché ;
+///   de l'annuaire, image téléversée…) n'est jamais touché ;
+/// * #7051 — une favicon CALCULÉE par Tune ([`FAVICON_CALCULEE`]) n'est pas un
+///   choix : le logo de la fiche la remplace ; sans fiche, elle reste ;
 /// * un logo de l'ANNUAIRE déjà posé suit sa fiche : si la fiche rapprochée par
 ///   l'adresse porte un autre logo, il est remplacé ; s'il est le logo d'une
 ///   AUTRE fiche, d'une autre adresse et d'un autre nom, alors que la station
@@ -1132,6 +1451,12 @@ pub(crate) fn logo_a_poser(
             Some(logo) => DecisionLogo::Poser(Some(logo)),
             None => DecisionLogo::Garder,
         },
+        Some(logo) if logo.starts_with(FAVICON_CALCULEE) => {
+            match sa_fiche.and_then(|f| f.logo_url.clone()) {
+                Some(neuf) => DecisionLogo::Poser(Some(neuf)),
+                None => DecisionLogo::Garder,
+            }
+        }
         Some(logo) if !logo.starts_with(LOGOS_DE_L_ANNUAIRE) => DecisionLogo::Garder,
         Some(logo) => match sa_fiche {
             Some(f) => match f.logo_url.as_deref() {
@@ -1305,12 +1630,16 @@ async fn media_server_radio_audio(
 
     // Le Browse et le HEAD sont sans effet. Seul un renderer qui demande
     // réellement le corps compte comme une tentative d'écoute.
+    let url = match geofencing::stream_for_saved(&state, &radio) {
+        Ok(url) => url,
+        Err(response) => return response.into_response(),
+    };
     if let Err(error) = repo.record_play(id) {
         tracing::warn!(radio_id = id, error = %error, "media_server_radio_play_not_recorded");
     }
     let stream_id = state
         .orchestrator
-        .create_media_server_radio_session(radio.url.clone())
+        .create_media_server_radio_session(url.clone())
         .await;
     // `amont` : l'URL du diffuseur que Tune va chercher pour le compte du
     // renderer. C'est la trace que #1800 réclame — station, URL amont, statut —
@@ -1320,7 +1649,7 @@ async fn media_server_radio_audio(
     tracing::info!(
         radio_id = id,
         radio = %radio.name,
-        amont = %radio.url,
+        amont = %url,
         stream_id = %stream_id,
         "media_server_radio_stream_started"
     );
@@ -1334,7 +1663,7 @@ async fn media_server_radio_audio(
     tracing::info!(
         radio_id = id,
         radio = %radio.name,
-        amont = %radio.url,
+        amont = %url,
         statut = response.status().as_u16(),
         "media_server_radio_stream_reponse"
     );
@@ -1382,6 +1711,8 @@ async fn list_radios(
     // d'annuaire la porte sous `annuaire` (logo, clé radio-metadata…). Rien
     // n'est écrit en base, et une station absente de l'annuaire reste là.
     super::radios_annuaire::rattacher_a_l_annuaire(&state, &mut corps);
+    // #7721 — le débit annoncé est celui du flux que la lecture prendra.
+    geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
     Json(corps)
 }
 
@@ -1392,7 +1723,7 @@ async fn get_radio(
 ) -> impl IntoResponse {
     let repo = RadioRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(r)) => Json(station_localisee(&r, &headers)).into_response(),
+        Ok(Some(r)) => Json(station_localisee(&state, &r, &headers)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -1435,17 +1766,23 @@ async fn create_radio(
             &suggestions,
         );
     }
-    let auto_logo = if body.logo_url.is_none() {
-        favicon_from_url(body.homepage.as_deref().unwrap_or(&url))
-    } else {
-        None
+    // #7051 — sans logo saisi, celui de la fiche au même flux passe avant la
+    // favicon calculée.
+    let logo_url = {
+        let annuaire = state.annuaire_radios.read().ok();
+        logo_a_la_creation(
+            annuaire.as_deref().map(Vec::as_slice).unwrap_or(&[]),
+            &url,
+            body.logo_url,
+            || favicon_from_url(body.homepage.as_deref().unwrap_or(&url)),
+        )
     };
     let station = RadioStation {
         id: None,
         name: body.name,
         url,
         homepage: body.homepage,
-        logo_url: body.logo_url.or(auto_logo),
+        logo_url,
         country: body.country,
         language: body.language,
         genre: body.genre,
@@ -1468,7 +1805,7 @@ async fn create_radio(
             });
             (
                 StatusCode::CREATED,
-                Json(station_localisee(&created, &headers)),
+                Json(station_localisee(&state, &created, &headers)),
             )
                 .into_response()
         }
@@ -1589,7 +1926,7 @@ async fn update_radio(
                 "library.radios_changed",
                 json!({"action": "updated", "id": id}),
             );
-            Json(station_localisee(&station, &headers)).into_response()
+            Json(station_localisee(&state, &station, &headers)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -1617,14 +1954,11 @@ async fn play_radio(
     let Some(radio) = repo.get(id).ok().flatten() else {
         return (StatusCode::NOT_FOUND, "radio not found").into_response();
     };
-    let corps = jouer_un_flux(
-        &state,
-        zone_id,
-        &radio.name,
-        &radio.url,
-        radio.logo_url.clone(),
-    )
-    .await;
+    let url = match geofencing::stream_for_saved(&state, &radio) {
+        Ok(url) => url,
+        Err(response) => return response.into_response(),
+    };
+    let corps = jouer_un_flux(&state, zone_id, &radio.name, &url, radio.logo_url.clone()).await;
     repo.record_play(id).ok();
     Json(corps).into_response()
 }
@@ -1644,6 +1978,9 @@ pub(crate) async fn jouer_un_flux(
 ) -> Value {
     // #6465 — une station n'appartient à aucun album ni playlist joué avant.
     state.playback.effacer_contexte_de_session(zone_id).await;
+    // #7051 — une station de l'annuaire n'est pas en base : le sondeur, qui y
+    // cherche le logo, le retrouvera ici quand le premier titre arrivera.
+    tune_core::poller::logo_de_lancement::retenir_le_logo_de_lancement(url, logo_url.as_deref());
     let play_req = tune_core::orchestrator::PlayRequest {
         zone_id,
         output_device_id: None,
@@ -1658,7 +1995,24 @@ pub(crate) async fn jouer_un_flux(
         ..Default::default()
     };
 
-    let (output_sent, output_error, stream_url) = match state.orchestrator.play(play_req).await {
+    // #7717 — une radio lancée sur une zone d'un groupe en fait la meneuse
+    // (« Mes radios » comme l'annuaire). La réponse est un 200 même quand la
+    // radio ne part pas : la tête se rend ici, sur l'échec ou le refus de la
+    // sortie.
+    let remplacees =
+        crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe(state, zone_id);
+    let lancement = state.orchestrator.play(play_req).await;
+    let partie = lancement
+        .as_ref()
+        .is_ok_and(|result| result.sortie_refusee().is_none());
+    if !partie {
+        crate::routes::zones::relais_de_groupe_6155::rendre_la_tete_du_groupe(
+            state,
+            zone_id,
+            &remplacees,
+        );
+    }
+    let (output_sent, output_error, stream_url) = match lancement {
         Ok(result) => (result.output_sent, result.error, result.stream_url),
         Err(e) => (false, Some(e), None),
     };
@@ -1704,15 +2058,35 @@ async fn search_radios(
     Query(q): Query<SearchQuery>,
 ) -> Response {
     let lang = crate::i18n::lang_from_header(&headers);
+    let criteres = q.criteres();
+    // #7466 — sans critère, `q` reste exigé, comme avant (400).
+    let Some(texte) =
+        q.q.clone()
+            .or_else(|| (!criteres.est_vide()).then(String::new))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Failed to deserialize query string: missing field `q`",
+        )
+            .into_response();
+    };
+    // #7466 — des critères sans texte : on parcourt TOUT le catalogue local
+    // (la recherche par nom plafonne à 50) et l'annuaire entier.
+    let par_criteres_seuls = texte.trim().is_empty() && !criteres.est_vide();
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let (issue, mut items) = match repo.search(&q.q) {
+    let lecture = if par_criteres_seuls {
+        repo.list()
+    } else {
+        repo.search(&texte)
+    };
+    let (issue, mut items) = match lecture {
         Ok(items) if items.is_empty() => (IssueRecherche::Aucune, items),
         Ok(items) => (IssueRecherche::Resultats, items),
         Err(erreur) => {
             // Tracé, parce qu'une recherche qui échoue en silence est
             // exactement ce que ce correctif supprime côté client : elle ne
             // doit pas non plus disparaître côté serveur.
-            tracing::warn!(query = %q.q, erreur = %erreur, "radio_search_failed");
+            tracing::warn!(query = %texte, erreur = %erreur, "radio_search_failed");
             (IssueRecherche::Echec(erreur), Vec::new())
         }
     };
@@ -1751,13 +2125,33 @@ async fn search_radios(
         // #6964 — « ARD » trouve aussi le WDR 2 déjà dans « Mes radios » :
         // le diffuseur est un mot-clé de sa fiche, pas de la station en base.
         let liens = repo.liens_annuaire().unwrap_or_default();
-        let par_mot_cle =
-            stations_locales_par_mot_cle(&annuaire_releve, &q.q, &catalogue, &liens, &items);
-        items.extend(par_mot_cle);
-        (
-            PorteeRecherche::CatalogueEtAnnuaire,
-            stations_annuaire_absentes(&annuaire_releve, &q.q, &catalogue),
-        )
+        let mut suggestions = if par_criteres_seuls {
+            hors_du_catalogue(annuaire_releve.iter(), &catalogue)
+        } else {
+            let par_mot_cle =
+                stations_locales_par_mot_cle(&annuaire_releve, &texte, &catalogue, &liens, &items);
+            items.extend(par_mot_cle);
+            stations_annuaire_absentes(&annuaire_releve, &texte, &catalogue)
+        };
+        if !criteres.est_vide() {
+            // #7466 — les critères s'appliquent aux deux volets : les stations
+            // de « Mes radios » ET les suggestions de l'annuaire.
+            suggestions.retain(|f| criteres.retient_la_fiche(f, None));
+            if par_criteres_seuls {
+                suggestions.truncate(super::radios_criteres_7466::SUGGESTIONS_MAX);
+            }
+        }
+        (PorteeRecherche::CatalogueEtAnnuaire, suggestions)
+    };
+    if !criteres.est_vide() {
+        let liens = repo.liens_annuaire().unwrap_or_default();
+        items = criteres.filtrer_les_stations(items, &annuaire_releve, &liens);
+    }
+    // Des résultats que les critères ont tous écartés ne sont plus des
+    // résultats : la réponse le dit comme pour une recherche vide.
+    let issue = match issue {
+        IssueRecherche::Resultats if items.is_empty() => IssueRecherche::Aucune,
+        autre => autre,
     };
 
     // « Rien chez vous, mais l'annuaire connaît » n'est pas « rien nulle
@@ -1769,11 +2163,11 @@ async fn search_radios(
         autre => autre,
     };
 
-    (
-        issue.statut_http(),
-        Json(corps_recherche(&issue, &items, &suggestions, portee, &lang)),
-    )
-        .into_response()
+    let mut corps = corps_recherche(&issue, &items, &suggestions, portee, &lang);
+    // #7721 — les stations de « Mes radios » trouvées annoncent, comme dans
+    // `GET /radios`, le débit du flux que la lecture prendra.
+    geofencing::annoncer_le_debit_ecoute(&state, &mut corps["items"]);
+    (issue.statut_http(), Json(corps)).into_response()
 }
 
 async fn list_favorites(headers: HeaderMap, State(state): State<AppState>) -> Json<Value> {
@@ -1785,6 +2179,8 @@ async fn list_favorites(headers: HeaderMap, State(state): State<AppState>) -> Js
     // d'annuaire la porte sous `annuaire` (logo, clé radio-metadata…). Rien
     // n'est écrit en base, et une station absente de l'annuaire reste là.
     super::radios_annuaire::rattacher_a_l_annuaire(&state, &mut corps);
+    // #7721 — le débit annoncé est celui du flux que la lecture prendra.
+    geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
     Json(corps)
 }
 
@@ -1868,13 +2264,23 @@ async fn add_from_web(
             &crate::i18n::t(&lang, "radio.canCloseTab"),
         ));
     }
+    // Fall back to the stream host favicon so a web-added radio shows art.
+    // #7051 — le logo de la fiche au même flux passe avant cette favicon.
+    let logo_url = {
+        let annuaire = state.annuaire_radios.read().ok();
+        logo_a_la_creation(
+            annuaire.as_deref().map(Vec::as_slice).unwrap_or(&[]),
+            &url,
+            q.logo_url.clone(),
+            || favicon_from_url(&url),
+        )
+    };
     let station = RadioStation {
         id: None,
         name: q.name.clone(),
         url: url.clone(),
         homepage: None,
-        // Fall back to the stream host favicon so a web-added radio shows art.
-        logo_url: q.logo_url.clone().or_else(|| favicon_from_url(&url)),
+        logo_url,
         country: q.country,
         language: None,
         genre: q.genre,
@@ -2030,7 +2436,7 @@ async fn set_radio_artwork(
 
     radio.logo_url = Some(hash.clone());
     repo.update(&radio).ok();
-    Json(station_localisee(&radio, &headers)).into_response()
+    Json(station_localisee(&state, &radio, &headers)).into_response()
 }
 
 async fn export_radios_m3u(State(state): State<AppState>) -> impl IntoResponse {
@@ -2891,14 +3297,26 @@ async fn create_streaming_playlist_from_favorites(
     );
 
     let mut remote_playlist_id: Option<String> = None;
+    let mut add_error: Option<String> = None;
     if !matched_ids.is_empty() {
-        match svc
+        let creation = svc
             .create_playlist(name, Some("Created by Tune from radio favorites"))
-            .await
-        {
+            .await;
+        // Voir `creer_playlist_depuis_titres_retenus` : sans purge, « Mes
+        // playlists » sert la liste mémorisée pendant 120 s.
+        tune_streaming_http::purge_contenu_utilisateur(service);
+        match creation {
             Ok(pid) => {
-                if let Err(e) = svc.add_tracks_to_playlist(&pid, &matched_ids).await {
-                    tracing::warn!(error = %e, "radio_fav_add_tracks_failed");
+                // L'échec de l'ajout était journalisé puis AVALÉ : la réponse
+                // annonçait `matched_tracks` titres dans une playlist vide.
+                match svc.add_tracks_to_playlist(&pid, &matched_ids).await {
+                    Ok(n) => {
+                        tracing::info!(service = %service, playlist_id = %pid, ajoutes = n, "radio_fav_playlist_created")
+                    }
+                    Err(e) => {
+                        tracing::warn!(service = %service, playlist_id = %pid, error = %e, "radio_fav_add_tracks_failed");
+                        add_error = Some(e.to_string());
+                    }
                 }
                 remote_playlist_id = Some(pid);
             }
@@ -2928,9 +3346,7 @@ async fn create_streaming_playlist_from_favorites(
 
     let (nb_matched, nb_approx, nb_not_found) = compter_par_statut(&details);
 
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({
+    let corps = json!({
             "service": service,
             "name": name,
             "favorites_count": favorites.len(),
@@ -2943,12 +3359,24 @@ async fn create_streaming_playlist_from_favorites(
             "approximate": nb_approx,
             "not_found": nb_not_found,
             "remote_playlist_id": remote_playlist_id.clone(),
-            "playlist_id": remote_playlist_id,
+            "add_error": add_error,
+            "message": Value::Null,
+            "playlist_id": remote_playlist_id.clone(),
             "details": details.clone(),
             "results": details,
-        })),
-    )
-        .into_response())
+    });
+    // Aucune correspondance : rien n'a été créé, et on le DIT — phrase
+    // traduite par clé (#7077), jamais du français en dur.
+    let corps = if remote_playlist_id.is_none() {
+        crate::message_api::avec_message(
+            corps,
+            "api.radioFavorites.noFavoriteFound",
+            &[("service", nom_du_service(service))],
+        )
+    } else {
+        corps
+    };
+    Ok((StatusCode::CREATED, Json(corps)).into_response())
 }
 
 /// Le service visé, s'il peut recevoir une playlist : inscrit, connecté, et
@@ -3144,6 +3572,15 @@ async fn apercu_appariement_favoris(
         .into_response())
 }
 
+/// « Qobuz », « Tidal »… pour les phrases montrées à l'utilisateur.
+fn nom_du_service(service: &str) -> String {
+    let mut c = service.chars();
+    match c.next() {
+        Some(p) => p.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 /// `create-playlist` avec `track_ids` : la playlist reçoit EXACTEMENT les
 /// titres validés à l'aperçu, sans nouvel appariement — une nouvelle
 /// playlist, ou `target_playlist_id` (une playlist existante du compte, sans
@@ -3159,18 +3596,35 @@ async fn creer_playlist_depuis_titres_retenus(
         .map(str::trim)
         .filter(|id| !id.is_empty());
     let service = service.unwrap_or("qobuz");
-    let erreur =
-        |code: StatusCode, err: &str| Ok((code, Json(json!({ "error": err }))).into_response());
+    // `error` = `code` : le code stable que le client teste ; `message` : la
+    // phrase à montrer, traduite depuis `i18n_server.json` (#7077) — jamais
+    // un code brut à l'écran.
+    let erreur = |code: StatusCode, err: &str, cle: &str| {
+        tracing::warn!(service = %service, erreur = err, "radio_fav_create_playlist_refusee");
+        Ok(crate::message_api::refus(code, err, cle, &[]))
+    };
     if service == "local" {
         // Les identifiants rendus par l'aperçu sont ceux d'un SERVICE : la
         // bibliothèque locale garde la création « en un geste ».
-        return erreur(StatusCode::BAD_REQUEST, "track_ids_service_seulement");
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "track_ids_service_seulement",
+            "api.radioFavorites.tracksAreServiceOnly",
+        );
     }
     if cible.is_none() && name.trim().is_empty() {
-        return erreur(StatusCode::BAD_REQUEST, "nom_vide");
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "nom_vide",
+            "api.radioFavorites.playlistNameRequired",
+        );
     }
     if dedoublonner_titres(track_ids).is_empty() {
-        return erreur(StatusCode::BAD_REQUEST, "aucun_titre_retenu");
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            "aucun_titre_retenu",
+            "api.radioFavorites.noTrackSelected",
+        );
     }
     let arc = match service_pour_playlist(state, service).await {
         Ok(a) => a,
@@ -3181,10 +3635,20 @@ async fn creer_playlist_depuis_titres_retenus(
         Some(id) => ajouter_a_playlist_existante(&**svc, id, track_ids).await,
         None => creer_playlist_avec_titres(&**svc, name.trim(), track_ids).await,
     };
+    drop(svc);
+    // Radio → Qobuz, 01/11/2026 : la playlist existait chez Qobuz mais « Mes
+    // playlists » ne la montrait pas. La modale lit `GET /streaming/qobuz/
+    // playlists` À L'OUVERTURE (choix de la cible), ce qui remplit le cache
+    // du contenu utilisateur (120 s) juste AVANT la création ; rien ne le
+    // purgeait ensuite. Même motif que la fusion de playlists (21/09). Purge
+    // sans condition : un échec côté HTTP peut avoir abouti chez le service.
+    tune_streaming_http::purge_contenu_utilisateur(service);
     match verse {
         Ok(p) => {
             tracing::info!(
                 service = %service,
+                playlist_id = %p.playlist_id,
+                nom = %name.trim(),
                 retenus = track_ids.len(),
                 ajoutes = p.ajoutes,
                 doublons = p.doublons,
@@ -3211,17 +3675,26 @@ async fn creer_playlist_depuis_titres_retenus(
                 .into_response())
         }
         Err(e) => {
-            tracing::warn!(service = %service, error = %e, "radio_fav_create_playlist_failed");
-            Ok((
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
+            tracing::warn!(service = %service, error = %e, existante = cible.is_some(), "radio_fav_create_playlist_failed");
+            // Code stable + phrase traduite (#7077) ; le texte brut du service
+            // part dans `cause`, le détail replié, jamais dans `message`.
+            let mut corps = crate::message_api::avec_message(
+                json!({
                     "error": match cible {
                         Some(id) => format!("could not add to playlist '{id}' on '{service}': {e}"),
                         None => format!("could not create playlist on '{service}': {e}"),
                     },
-                })),
-            )
-                .into_response())
+                    "code": if cible.is_some() { "ajout_playlist_refuse" } else { "creation_playlist_refusee" },
+                }),
+                if cible.is_some() {
+                    "api.radioFavorites.addToPlaylistRefused"
+                } else {
+                    "api.radioFavorites.createPlaylistRefused"
+                },
+                &[("service", nom_du_service(service))],
+            );
+            corps["cause"] = json!(e.to_string());
+            Ok((StatusCode::BAD_GATEWAY, Json(corps)).into_response())
         }
     }
 }
@@ -3670,11 +4143,15 @@ async fn test_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
             if zones.sonnees.is_empty() && !zones.sautees.is_empty() {
                 return (
                     StatusCode::CONFLICT,
-                    Json(json!({
-                        "error": "zone_en_lecture",
-                        "message": "La zone joue déjà : le test n'a pas été lancé",
-                        "zones": zones.sautees,
-                    })),
+                    Json(crate::message_api::avec_message(
+                        json!({
+                            "error": "zone_en_lecture",
+                            "code": "zone_en_lecture",
+                            "zones": zones.sautees,
+                        }),
+                        "api.alarm.zoneBusy",
+                        &[],
+                    )),
                 )
                     .into_response();
             }
@@ -3947,9 +4424,17 @@ mod tests_validation_url_flux {
 }
 
 #[cfg(test)]
+#[path = "radios_flux_auto_7043_tests.rs"]
+mod tests_flux_auto_7043;
+
+#[cfg(test)]
 #[path = "radios_logos_exacts_tests.rs"]
 mod tests_logos_exacts;
 
 #[cfg(test)]
 #[path = "radios_recherche_diffuseur_6964_tests.rs"]
 mod tests_recherche_diffuseur_6964;
+
+#[cfg(test)]
+#[path = "radios_logo_de_lancement_7051_tests.rs"]
+mod tests_logo_de_lancement_7051;

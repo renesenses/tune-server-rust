@@ -287,3 +287,225 @@ async fn un_refus_bitperfect_strict_part_avec_son_code_et_ses_frequences_3973() 
         "la phrase de repli doit nommer les deux fréquences : {texte}"
     );
 }
+
+#[tokio::test]
+async fn tune_tested_auto_sondeur_compte_la_panne_reelle_une_fois_et_respecte_le_refus() {
+    for consentement in [false, true] {
+        let banc = Banc::monter(Some("échec de sortie synthétique")).await;
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(banc.poller.db.clone());
+        settings
+            .set(
+                "telemetry_enabled",
+                if consentement { "true" } else { "false" },
+            )
+            .unwrap();
+        settings
+            .set(&format!("zone_{}_brand", banc.zone_id), "Test Audio")
+            .unwrap();
+        settings
+            .set(&format!("zone_{}_model", banc.zone_id), "DAC 7291")
+            .unwrap();
+        banc.un_tick().await;
+        if consentement {
+            let contribution = crate::cloud::tune_tested_auto::contribution(&settings).unwrap();
+            assert_eq!(contribution.devices.len(), 1);
+            assert_eq!(contribution.devices[0].successful_plays, 0);
+            assert_eq!(contribution.devices[0].failed_plays, 1);
+            assert!(contribution.devices[0].best_format.is_none());
+            banc.un_tick().await;
+            assert_eq!(
+                crate::cloud::tune_tested_auto::contribution(&settings)
+                    .unwrap()
+                    .devices[0]
+                    .failed_plays,
+                1
+            );
+        } else {
+            assert!(settings.get("telemetry_tune_tested_v1").unwrap().is_none());
+            assert!(crate::cloud::tune_tested_auto::contribution(&settings).is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn tune_tested_auto_fin_observee_et_repetition_gapless_sans_compter_un_simple_demarrage() {
+    let banc = Banc::monter(None).await;
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(banc.poller.db.clone());
+    settings.set("telemetry_enabled", "true").unwrap();
+    settings
+        .set(&format!("zone_{}_brand", banc.zone_id), "Test Audio")
+        .unwrap();
+    settings
+        .set(&format!("zone_{}_model", banc.zone_id), "DAC 7291")
+        .unwrap();
+    let etat = banc.playback.get_state(banc.zone_id).await;
+    banc.poller
+        .noter_fin_tune_tested(&etat, DEVICE_ID, 2_000, 2_000)
+        .await;
+    assert!(settings.get("telemetry_tune_tested_v1").unwrap().is_none());
+    for _ in 0..3 {
+        banc.poller
+            .noter_fin_tune_tested(&etat, DEVICE_ID, 240_000, 240_000)
+            .await;
+        banc.poller
+            .noter_fin_tune_tested(&etat, DEVICE_ID, 240_000, 240_000)
+            .await;
+        // Même invalidation faite par advance_queue_metadata, sans changement
+        // de track_generation, y compris si la même piste est répétée.
+        banc.playback.bump_levels_gen(banc.zone_id);
+    }
+    let appareil = &crate::cloud::tune_tested_auto::contribution(&settings)
+        .unwrap()
+        .devices[0];
+    assert_eq!(appareil.successful_plays, 3);
+    assert_eq!(appareil.failed_plays, 0);
+    assert!(
+        appareil.best_format.is_none(),
+        "la sortie locale sans format mesuré ne prouve pas le format source"
+    );
+}
+
+#[tokio::test]
+async fn tune_tested_auto_identite_decouverte_sans_adresse_ni_nom_convivial() {
+    let banc = Banc::monter(None).await;
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(banc.poller.db.clone());
+    settings.set("telemetry_enabled", "true").unwrap();
+    settings
+        .set(
+            crate::device_catalog::KNOWN_RENDERERS_KEY,
+            &serde_json::json!([{
+                "device_id": DEVICE_ID,
+                "manufacturer": "Test Audio",
+                "model": "DAC 7291",
+                "location": "http://192.0.2.7/private.xml",
+                "mac": "00:11:22:33:44:55",
+                "name": "PRIVATE kitchen",
+                "serial": "PRIVATE SERIAL"
+            }])
+            .to_string(),
+        )
+        .unwrap();
+    let etat = banc.playback.get_state(banc.zone_id).await;
+    banc.poller
+        .noter_fin_tune_tested(&etat, DEVICE_ID, 240_000, 240_000)
+        .await;
+    let contribution = crate::cloud::tune_tested_auto::contribution(&settings).unwrap();
+    assert_eq!(contribution.devices[0].manufacturer, "Test Audio");
+    assert_eq!(contribution.devices[0].model, "DAC 7291");
+    let json = serde_json::to_string(&contribution).unwrap();
+    for interdit in [
+        "192.0.2.7",
+        "00:11:22",
+        "PRIVATE",
+        DEVICE_ID,
+        "device_id",
+        "location",
+        "serial",
+    ] {
+        assert!(
+            !json.contains(interdit),
+            "champ interdit présent : {interdit}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tune_tested_7922_sondeur_compte_sans_telemetrie_puis_remet_a_zero_sur_panne() {
+    let banc = Banc::monter(Some("échec de sortie synthétique")).await;
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(banc.poller.db.clone());
+    settings.set("telemetry_enabled", "false").unwrap();
+    settings
+        .set(&format!("zone_{}_brand", banc.zone_id), "Test Audio")
+        .unwrap();
+    settings
+        .set(&format!("zone_{}_model", banc.zone_id), "DAC 7922")
+        .unwrap();
+    let etat = banc.playback.get_state(banc.zone_id).await;
+    // Quinze pistes de 4 minutes enchaînées : une heure sans erreur.
+    for _ in 0..15 {
+        banc.poller
+            .noter_fin_tune_tested(&etat, DEVICE_ID, 240_000, 240_000)
+            .await;
+        banc.playback.bump_levels_gen(banc.zone_id);
+    }
+    let compte =
+        crate::cloud::tune_tested_proposition::etat(&settings, banc.zone_id, Some(DEVICE_ID));
+    assert_eq!(
+        compte.seconds_without_error, 3600,
+        "le compte sans erreur ne dépend pas du consentement à la télémétrie"
+    );
+    assert!(compte.eligible);
+    let apercu = compte.preview.unwrap();
+    assert_eq!(apercu.output_type, "local");
+    assert!(apercu.gapless_observed);
+    assert!(
+        settings.get("telemetry_tune_tested_v1").unwrap().is_none(),
+        "sans consentement, aucune télémétrie n'est écrite"
+    );
+    // La panne réelle de la sortie, relevée par le sondeur.
+    banc.un_tick().await;
+    assert_eq!(
+        crate::cloud::tune_tested_proposition::etat(&settings, banc.zone_id, Some(DEVICE_ID))
+            .seconds_without_error,
+        0,
+        "l'échec de transport relevé par le sondeur doit remettre le compte à zéro"
+    );
+}
+
+#[test]
+fn tune_tested_7922_avance_rendue_ignore_un_saut_et_un_recul() {
+    use super::tune_tested_auto::avance_rendue;
+    assert_eq!(avance_rendue(10_000, 11_000, 1_000), 1_000);
+    // Arrondi du renderer à la seconde sur un tour plus court.
+    assert_eq!(avance_rendue(10_000, 11_000, 600), 1_000);
+    // Déplacement vers la fin : 228 s en une seconde ne sont pas rendues.
+    assert_eq!(avance_rendue(10_000, 238_000, 1_000), 0);
+    // Recul ou piste suivante.
+    assert_eq!(avance_rendue(238_000, 1_000, 1_000), 0);
+}
+
+/// Le relevé du sondeur pour une piste de 4 minutes : vingt secondes jouées,
+/// un déplacement à la dernière seconde, puis la fin.
+fn rendu_d_une_piste_deplacee_a_la_fin() -> u64 {
+    let mut ps = ZonePollState::new(1);
+    let depart = Instant::now();
+    let a = |s: u64| depart + std::time::Duration::from_secs(s);
+    for s in 0..=20 {
+        ps.noter_releve_tune_tested(s * 1_000, a(s));
+    }
+    ps.noter_releve_tune_tested(239_000, a(21));
+    ps.noter_releve_tune_tested(240_000, a(22));
+    ps.tune_tested_rendu_ms
+}
+
+#[tokio::test]
+async fn tune_tested_7922_deplacement_en_fin_de_piste_ne_compte_que_le_temps_joue() {
+    let banc = Banc::monter(None).await;
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(banc.poller.db.clone());
+    settings
+        .set(&format!("zone_{}_brand", banc.zone_id), "Test Audio")
+        .unwrap();
+    settings
+        .set(&format!("zone_{}_model", banc.zone_id), "DAC 7922")
+        .unwrap();
+    let rendu = rendu_d_une_piste_deplacee_a_la_fin();
+    assert_eq!(rendu, 21_000, "seules les secondes jouées sont rendues");
+    let etat = banc.playback.get_state(banc.zone_id).await;
+    // Quinze pistes de 4 minutes, chacune avancée à sa dernière seconde : la
+    // condition de fin est remplie, mais moins de six minutes ont été jouées.
+    for _ in 0..15 {
+        banc.poller
+            .noter_fin_tune_tested(&etat, DEVICE_ID, 240_000, rendu)
+            .await;
+        banc.playback.bump_levels_gen(banc.zone_id);
+    }
+    let compte =
+        crate::cloud::tune_tested_proposition::etat(&settings, banc.zone_id, Some(DEVICE_ID));
+    assert_eq!(
+        compte.seconds_without_error,
+        15 * 21,
+        "le compte sans erreur doit être le temps joué, pas la durée des pistes"
+    );
+    assert!(!compte.eligible, "le seuil d'une heure ne se contourne pas");
+    assert_eq!(compte.reason, Some("below_threshold"));
+}

@@ -1,4 +1,4 @@
-const LASTFM_API: &str = "https://ws.audioscrobbler.com/2.0/";
+pub const LASTFM_API: &str = "https://ws.audioscrobbler.com/2.0/";
 
 #[derive(Debug, Clone, Default)]
 pub struct LastfmTags {
@@ -136,6 +136,57 @@ impl LastfmEnricher {
             })
             .unwrap_or_default()
     }
+}
+
+/// #7107 — `artist.getTopTracks` : les titres les plus écoutés d'un artiste
+/// sur Last.fm, du plus au moins populaire (l'ordre de la réponse).
+///
+/// Rend les NOMS seuls : Last.fm ne donne ni durée ni ISRC dans cette
+/// réponse. `base` est l'URL de l'API (celle de Last.fm en production, un
+/// faux site dans les tests). `Err` pour tout échec réseau, HTTP ou de
+/// lecture, y compris l'erreur JSON `{"error": …}` que Last.fm rend avec un
+/// statut 200 ; l'appelant se replie, il ne remonte rien à l'utilisateur.
+pub async fn top_tracks_artiste(
+    client: &reqwest::Client,
+    base: &str,
+    artist: &str,
+    api_key: &str,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    if api_key.trim().is_empty() || artist.trim().is_empty() {
+        return Err("clé ou artiste absent".into());
+    }
+    let limit = limit.to_string();
+    let resp = client
+        .get(base)
+        .query(&[
+            ("method", "artist.getTopTracks"),
+            ("artist", artist),
+            ("api_key", api_key),
+            ("limit", limit.as_str()),
+            ("autocorrect", "1"),
+            ("format", "json"),
+        ])
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("statut {}", resp.status()));
+    }
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if let Some(e) = data.get("error") {
+        return Err(format!("erreur Last.fm {e}"));
+    }
+    Ok(data
+        .pointer("/toptracks/track")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 #[cfg(test)]

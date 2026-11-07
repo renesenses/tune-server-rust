@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use tune_core::cloud::plugins::PluginMarketplace;
 use tune_core::cloud::rate_limit::{self, CloudScope};
-use tune_core::cloud::sso::{MozaikAuth, PkceSession, ProfilCloud};
+use tune_core::cloud::sso::{MozaikAuth, PageConnexion, PkceSession, ProfilCloud};
 use tune_core::cloud::telemetry::TelemetryReporter;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -179,7 +179,28 @@ fn page_echec_compte(
     page_connexion_compte(headers, statut, &message, None)
 }
 
-async fn sso_authorize(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// Langue et thème de l'interface que le client web transmet (`ui_locales`,
+/// `theme`), ou rien. Lus à la main dans la requête : une valeur répétée ou
+/// illisible ne doit JAMAIS faire refuser la connexion, elle est ignorée.
+pub(crate) fn page_connexion_demandee(requete: &[(String, String)]) -> PageConnexion {
+    let premiere = |cle: &str| {
+        requete
+            .iter()
+            .find(|(k, _)| k == cle)
+            .map(|(_, v)| v.as_str())
+    };
+    PageConnexion::valider(
+        premiere("ui_locales"),
+        premiere("theme"),
+        crate::i18n::SUPPORTED,
+    )
+}
+
+async fn sso_authorize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(requete): Query<Vec<(String, String)>>,
+) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
         // sso_authorize is a full browser navigation, so degrade to a friendly
@@ -223,7 +244,8 @@ async fn sso_authorize(State(state): State<AppState>, headers: HeaderMap) -> imp
     // Persist the exact redirect_uri: OAuth requires the token exchange in the
     // callback to present an identical value.
     settings.set("mozaik_redirect_uri_pending", &uri).ok();
-    let url = auth.authorize_url(&uri, &pkce.challenge, &pkce.state);
+    let page = page_connexion_demandee(&requete);
+    let url = auth.authorize_url_avec_page(&uri, &pkce.challenge, &pkce.state, &page);
     Redirect::temporary(&url).into_response()
 }
 
@@ -396,7 +418,12 @@ async fn sso_callback(
         )
         .ok()
         .flatten()
-        .and_then(|row| row.first().and_then(|v| v.as_i64()));
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+        // #7082 : installation a un seul profil sans courriel -> la liaison s'y
+        // rattache au lieu de basculer la session sur un profil vierge.
+        .or_else(|| {
+            tune_core::cloud::proprietaire::rattacher_au_profil_unique(&state.backend, &user.email)
+        });
 
     let profile_id = if let Some(id) = existing_id {
         // Update display name from the cloud profile — but NOT avatar_path.
@@ -1279,8 +1306,15 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
     // question ne se pose pas (Free, ou abonnement réellement échu).
     let offline_grace = tune_core::license::offline_grace(&ls);
 
+    // #7419 — D'OÙ vient le Premium : « key » (clé de licence) ou « account »
+    // (compte Mozaiklabs lié, sans clé). `null` hors Premium. Sans ce champ,
+    // un serveur neuf devenu Premium par la seule connexion au compte montrait
+    // un champ de clé vide, et l'auditeur allait recopier une clé inutile.
+    let premium_source = state.license.source_du_premium().await;
+
     Json(json!({
         "tier": ls.tier,
+        "premium_source": premium_source,
         "license_key": ls.license_key,
         "expires_at": ls.expires_at,
         "last_validated": ls.last_validated,
@@ -1356,12 +1390,79 @@ async fn license_activate(
 }
 
 async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
+    let remote_released = retirer_la_licence(&state).await;
+    Json(reponse_de_retrait(
+        json!({"status": "deactivated", "tier": "free"}),
+        remote_released,
+    ))
+}
+
+/// Retire la licence de ce serveur (#7726) : prévient d'abord mozaiklabs.fr
+/// que cette machine rend sa licence, puis efface la clé locale.
+///
+/// L'effacement local seul laissait la machine détentrice de la licence côté
+/// site : l'activation sur un autre serveur était refusée (« License active on
+/// another server »). La clé est effacée **dans tous les cas**, même quand le
+/// site ne répond pas — le retrait ne doit jamais dépendre du réseau. Rend
+/// `true` quand le site a confirmé la libération de la machine.
+///
+/// Partagée par `DELETE /system/license` et `POST /cloud/license/deactivate`.
+pub(crate) async fn retirer_la_licence(state: &AppState) -> bool {
+    let ls = state.license.license_state().await;
+    let remote_released = match ls.license_key.as_deref() {
+        Some(key) => {
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
+            let payload = json!({
+                "license_key": key,
+                "hardware_fingerprint": ls.hardware_fingerprint,
+                "server_id": server_id,
+            });
+            let resp = state
+                .http_client
+                .post(license_deactivate_url(&settings))
+                .timeout(std::time::Duration::from_secs(5))
+                .json(&payload)
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => true,
+                Ok(r) => {
+                    warn!(status = %r.status(), "license_remote_release_refused");
+                    false
+                }
+                Err(e) => {
+                    warn!(error = %e, "license_remote_release_unreachable");
+                    false
+                }
+            }
+        }
+        // Aucune clé : rien à libérer côté site.
+        None => true,
+    };
     state.license.clear_license().await;
     state.event_bus.emit(
         "license.updated",
         json!({"tier": "free", "expires_at": null}),
     );
-    Json(json!({"status": "deactivated", "tier": "free"}))
+    remote_released
+}
+
+/// Ajoute à la réponse d'un retrait de licence le champ `remote_released`, et
+/// le message qui dit à l'utilisateur que le site n'a pas pu être prévenu.
+pub(crate) fn reponse_de_retrait(mut corps: Value, remote_released: bool) -> Value {
+    corps["remote_released"] = json!(remote_released);
+    if remote_released {
+        corps
+    } else {
+        crate::message_api::avec_message(corps, "api.license.removed_offline", &[])
+    }
+}
+
+/// URL du point de mozaiklabs.fr qui libère la machine détentrice d'une
+/// licence, redirigée par `mozaik_base_url` comme la validation.
+pub(crate) fn license_deactivate_url(settings: &SettingsRepo) -> String {
+    format!("{}/api/v1/license/deactivate", mozaik_base(settings))
 }
 
 /// URL du point de validation de licence chez mozaiklabs.fr.
@@ -1826,6 +1927,18 @@ mod tests_licence_proprietaire {
             adoption < ecrasement,
             "l'adoption lit `mozaik_user` APRES sa reecriture : elle adopterait \
              le compte qui vient de se connecter au lieu de celui deja en place"
+        );
+    }
+
+    /// #7082 : le rattachement au profil unique doit etre CABLE dans le callback.
+    #[test]
+    fn la_liaison_se_rattache_au_profil_unique() {
+        let source = include_str!("cloud.rs");
+        assert!(
+            source
+                .contains("proprietaire::rattacher_au_profil_unique(&state.backend, &user.email)"),
+            "le callback SSO ne rattache plus au profil unique : la session \
+             rebascule sur un profil vierge (photo et theme perdus, #7082)"
         );
     }
 
@@ -2497,5 +2610,52 @@ mod reconcile_tests {
             Mode::Appliquer,
             "seule une demande EXPLICITE doit mettre en file"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_page_connexion_b209sso {
+    use super::page_connexion_demandee;
+
+    fn q(paires: &[(&str, &str)]) -> Vec<(String, String)> {
+        paires
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn valeur_valide_prise_telle_quelle() {
+        let p = page_connexion_demandee(&q(&[("ui_locales", "de"), ("theme", "clear-grey")]));
+        assert_eq!(p.langue.as_deref(), Some("de"));
+        assert_eq!(p.theme.as_deref(), Some("clear-grey"));
+    }
+
+    #[test]
+    fn valeur_absente_donne_rien() {
+        let p = page_connexion_demandee(&q(&[("autre", "x")]));
+        assert_eq!((p.langue, p.theme), (None, None));
+    }
+
+    #[test]
+    fn injection_ignoree_sans_erreur() {
+        let p = page_connexion_demandee(&q(&[
+            ("ui_locales", "fr&redirect_uri=https://evil.example"),
+            ("theme", "brown&state=x"),
+        ]));
+        assert_eq!((p.langue, p.theme), (None, None));
+    }
+
+    #[test]
+    fn langue_hors_du_serveur_ignoree() {
+        // « pt » n'est pas une langue du serveur (le polonais l'est depuis la rc9).
+        let p = page_connexion_demandee(&q(&[("ui_locales", "pt")]));
+        assert_eq!(p.langue, None);
+    }
+
+    #[test]
+    fn valeur_repetee_premiere_retenue() {
+        let p = page_connexion_demandee(&q(&[("theme", "brown"), ("theme", "evil")]));
+        assert_eq!(p.theme.as_deref(), Some("brown"));
     }
 }

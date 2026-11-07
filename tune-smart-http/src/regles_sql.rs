@@ -635,6 +635,33 @@ pub(crate) fn condition_note(
 /// La condition à poser quand rien ne se traduit : FAUX.
 pub(crate) const FAUX: &str = "1 = 0";
 
+/// #6285 — « Verdict hi-res » : le verdict PUBLIÉ de l'album
+/// (`de_l_album`, collections, colonne `al.id`) ou de la piste (playlists,
+/// colonne `t.id`), `verifie`, `conforme`, `douteux` ou `non_analyse`.
+/// « Douteux » suit le réglage de la liste des albums : masqué, il ne retient
+/// rien et « non analysé » le retient (`faux_hires_publie`). `None` : un
+/// opérateur ou un verdict que le moteur ne connaît pas.
+pub(crate) fn condition_verdict_hires(
+    id: &str,
+    de_l_album: bool,
+    op: &str,
+    valeur: &str,
+    douteux_visible: bool,
+) -> Option<String> {
+    use tune_core::audio::faux_hires_publie::{VerdictPublie, predicat_album, predicat_piste};
+    let verdict = VerdictPublie::lire(valeur)?;
+    let p = if de_l_album {
+        predicat_album(id, verdict, douteux_visible)
+    } else {
+        predicat_piste(id, verdict, douteux_visible)
+    };
+    match op {
+        "=" => Some(p),
+        "!=" => Some(format!("NOT ({p})")),
+        _ => None,
+    }
+}
+
 /// #5530 — « Généré par IA » sur une ligne de la BIBLIOTHÈQUE.
 ///
 /// Le marquage est celui que Qobuz pose sur un album de son catalogue ; un

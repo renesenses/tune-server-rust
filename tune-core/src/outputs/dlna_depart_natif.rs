@@ -65,6 +65,22 @@ pub fn depart_de_session(session_id: &str) -> Option<u64> {
         .map(|(_, d)| *d)
 }
 
+/// La durée de la PISTE, quand la session est un flux qui commence au milieu.
+///
+/// La DIDL d'un tel flux annonce ce qui reste (le renderer compte depuis ce
+/// flux) ; les clients, eux, doivent voir la piste entière. Sans quoi la barre
+/// de défilement se calait sur le reste, et l'avance suivante, bornée à cette
+/// durée par `seek`, ne pouvait plus dépasser l'endroit déjà atteint
+/// (Cyrille, fil 2194, 13/10). Une durée inconnue reste inconnue.
+pub fn duree_de_la_piste(duree_servie_ms: i64, session_id: Option<&str>) -> i64 {
+    match session_id.and_then(depart_de_session) {
+        Some(depart) if duree_servie_ms > 0 => {
+            duree_servie_ms.saturating_add(i64::try_from(depart).unwrap_or(i64::MAX))
+        }
+        _ => duree_servie_ms,
+    }
+}
+
 /// À chaque URL posée sur l'appareil (`play_media`) : retient le départ
 /// qu'elle porte, ou l'oublie si elle n'en porte pas.
 pub fn noter_url_posee(device_id: &str, url: &str) {
@@ -183,5 +199,18 @@ mod tests {
         inscrire_session("sess-6059-a", 42_000);
         assert_eq!(depart_de_session("sess-6059-a"), Some(42_000));
         assert_eq!(depart_de_session("sess-6059-inconnue"), None);
+    }
+
+    #[test]
+    fn la_duree_annoncee_est_celle_de_la_piste_6059() {
+        inscrire_session("sess-6059-duree", 120_000);
+        assert_eq!(
+            duree_de_la_piste(180_000, Some("sess-6059-duree")),
+            300_000,
+            "reste servi + départ = durée de la piste"
+        );
+        assert_eq!(duree_de_la_piste(0, Some("sess-6059-duree")), 0);
+        assert_eq!(duree_de_la_piste(180_000, Some("sess-6059-autre")), 180_000);
+        assert_eq!(duree_de_la_piste(180_000, None), 180_000);
     }
 }

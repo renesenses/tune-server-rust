@@ -257,13 +257,174 @@ fn type_mime(chemin: &Path) -> &'static str {
     }
 }
 
+/// Politique de contenu de la page, sans les empreintes des scripts en ligne.
+///
+/// - `style-src 'unsafe-inline'` : Svelte pose des attributs `style` et ses
+///   transitions injectent des `<style>` ; Google Fonts sert la feuille.
+/// - `img-src https:` / `media-src https:` : pochettes des services
+///   (Qobuz, TIDAL, Bandcamp…), logos de radios et radios lues en direct.
+///   `data:` (son de deverrouillage, icones CSS), `blob:` (avatar local).
+/// - `connect-src` : le relais (`'self'`, et `wss://` ecrit pour les
+///   navigateurs qui ne l'y rangent pas), le site du compte, l'API GitHub
+///   des notes de version.
+const CSP_PAGE: &str = "default-src 'self'; \
+style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+font-src 'self' data: https://fonts.gstatic.com; \
+img-src 'self' data: blob: https:; \
+media-src 'self' data: blob: https:; \
+connect-src 'self' https://mozaiklabs.fr wss://bridge.mozaiklabs.fr https://api.github.com; \
+worker-src 'self'; manifest-src 'self'; object-src 'none'; \
+frame-ancestors 'none'; base-uri 'none'";
+
+/// La politique d'un fichier servi : celle de la page, avec `script-src`
+/// limite a `'self'` et aux empreintes des scripts en ligne du HTML (le
+/// theme pose avant le rendu, l'enregistrement du service worker) et de ses
+/// gestionnaires `on…=` (chargement differe des polices).
+fn politique_de_contenu(html: Option<&str>) -> String {
+    let mut scripts = String::from("script-src 'self'");
+    if let Some(html) = html {
+        let (en_ligne, gestionnaires) = scripts_en_ligne(html);
+        if !gestionnaires.is_empty() {
+            scripts.push_str(" 'unsafe-hashes'");
+        }
+        for code in en_ligne.iter().chain(gestionnaires.iter()) {
+            scripts.push_str(&format!(" 'sha256-{}'", empreinte(code)));
+        }
+    }
+    format!("{CSP_PAGE}; {scripts}")
+}
+
+fn empreinte(code: &str) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(code.as_bytes()))
+}
+
+/// Le texte des `<script>` sans `src`, et la valeur des attributs `on…`, tels
+/// que le navigateur les hache.
+fn scripts_en_ligne(html: &str) -> (Vec<String>, Vec<String>) {
+    let octets = html.as_bytes();
+    let minuscule = html.to_ascii_lowercase();
+    let mut scripts = Vec::new();
+    let mut gestionnaires = Vec::new();
+    let mut i = 0;
+    while let Some(p) = minuscule[i..].find('<') {
+        i += p;
+        if minuscule[i..].starts_with("<!--") {
+            i = minuscule[i..].find("-->").map_or(html.len(), |f| i + f + 3);
+            continue;
+        }
+        if !octets.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+            i += 1;
+            continue;
+        }
+        // Nom de la balise.
+        let mut j = i + 1;
+        while j < octets.len() && (octets[j].is_ascii_alphanumeric() || octets[j] == b'-') {
+            j += 1;
+        }
+        let balise = &minuscule[i + 1..j];
+        let mut avec_src = false;
+        // Attributs, guillemets respectes, jusqu'au `>`.
+        loop {
+            while j < octets.len() && (octets[j].is_ascii_whitespace() || octets[j] == b'/') {
+                j += 1;
+            }
+            if j >= octets.len() || octets[j] == b'>' {
+                break;
+            }
+            let debut_nom = j;
+            while j < octets.len()
+                && !octets[j].is_ascii_whitespace()
+                && !matches!(octets[j], b'=' | b'>' | b'/')
+            {
+                j += 1;
+            }
+            let nom = &minuscule[debut_nom..j];
+            let mut valeur = None;
+            if j < octets.len() && octets[j] == b'=' {
+                j += 1;
+                match octets.get(j) {
+                    Some(&q @ (b'"' | b'\'')) => {
+                        let fin = html[j + 1..]
+                            .find(q as char)
+                            .map_or(html.len(), |f| j + 1 + f);
+                        valeur = Some(&html[j + 1..fin]);
+                        j = (fin + 1).min(html.len());
+                    }
+                    _ => {
+                        let debut = j;
+                        while j < octets.len()
+                            && !octets[j].is_ascii_whitespace()
+                            && octets[j] != b'>'
+                        {
+                            j += 1;
+                        }
+                        valeur = Some(&html[debut..j]);
+                    }
+                }
+            }
+            if nom == "src" {
+                avec_src = true;
+            }
+            if let (true, Some(v)) = (nom.len() > 2 && nom.starts_with("on"), valeur) {
+                gestionnaires.push(decoder_entites(v));
+            }
+            if nom.is_empty() {
+                j += 1;
+            }
+        }
+        let fin_balise = (j + 1).min(html.len());
+        if balise == "script" {
+            let fin = minuscule[fin_balise..]
+                .find("</script")
+                .map_or(html.len(), |f| fin_balise + f);
+            if !avec_src {
+                scripts.push(html[fin_balise..fin].to_string());
+            }
+            i = fin;
+        } else {
+            i = fin_balise;
+        }
+    }
+    (scripts, gestionnaires)
+}
+
+/// Les references de caracteres courantes d'une valeur d'attribut.
+fn decoder_entites(v: &str) -> String {
+    v.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 async fn servir(fichier: &Path) -> Response {
+    use axum::http::{HeaderValue, header};
     match tokio::fs::read(fichier).await {
-        Ok(octets) => (
-            [(axum::http::header::CONTENT_TYPE, type_mime(fichier))],
-            octets,
-        )
-            .into_response(),
+        Ok(octets) => {
+            let type_ = type_mime(fichier);
+            let html = type_
+                .starts_with("text/html")
+                .then(|| String::from_utf8_lossy(&octets).into_owned());
+            let politique = politique_de_contenu(html.as_deref());
+            let mut r = ([(header::CONTENT_TYPE, type_)], octets).into_response();
+            let entetes = r.headers_mut();
+            entetes.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
+            entetes.insert(
+                header::REFERRER_POLICY,
+                HeaderValue::from_static("no-referrer"),
+            );
+            if let Ok(v) = HeaderValue::from_str(&politique) {
+                entetes.insert(header::CONTENT_SECURITY_POLICY, v);
+            }
+            r
+        }
         Err(e) => {
             warn!(fichier = %fichier.display(), error = %e, "bridge_web_fichier_illisible");
             StatusCode::NOT_FOUND.into_response()
@@ -462,5 +623,97 @@ mod tests {
         assert_eq!((statut, corps.as_str()), (200, INDEX));
         let (statut, _, _) = obtenir(&format!("{base}/health")).await;
         assert_eq!(statut, 200);
+    }
+
+    /// L'index et les fichiers du client portent la politique de contenu.
+    /// `servir` est appele directement : les gestionnaires lisent
+    /// `TUNE_BRIDGE_WEB_DIR`, que les tests voisins modifient.
+    #[tokio::test]
+    async fn l_index_et_les_fichiers_du_client_portent_la_politique_de_contenu() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("index.html"),
+            "<!doctype html><title>Tune</title><script>var t=1;</script>\
+             <script type=module src=/assets/index-abc.js></script>",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("index-abc.js"), "console.log('tune')").unwrap();
+        for fichier in ["index.html", "index-abc.js"] {
+            let r = servir(&tmp.path().join(fichier)).await;
+            assert_eq!(r.status(), StatusCode::OK, "{fichier}");
+            let h = r.headers();
+            let csp = h
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_else(|| panic!("{fichier} : pas de Content-Security-Policy"));
+            for directive in [
+                "default-src 'self'",
+                "script-src 'self'",
+                "object-src 'none'",
+                "frame-ancestors 'none'",
+                "base-uri 'none'",
+                "connect-src 'self' https://mozaiklabs.fr wss://bridge.mozaiklabs.fr",
+            ] {
+                assert!(
+                    csp.contains(directive),
+                    "{fichier} : {directive} absent de {csp}"
+                );
+            }
+            assert!(!csp.contains("'unsafe-eval'"), "{fichier} : {csp}");
+            let scripts = csp
+                .split(';')
+                .find(|d| d.trim_start().starts_with("script-src"))
+                .unwrap();
+            assert!(
+                !scripts.contains("'unsafe-inline'"),
+                "{fichier} : {scripts}"
+            );
+            assert_eq!(
+                h.get("x-content-type-options")
+                    .and_then(|v| v.to_str().ok()),
+                Some("nosniff"),
+                "{fichier}"
+            );
+            assert_eq!(
+                h.get("referrer-policy").and_then(|v| v.to_str().ok()),
+                Some("no-referrer"),
+                "{fichier}"
+            );
+            // Seul l'index porte l'empreinte de son script en ligne.
+            assert_eq!(
+                csp.contains(&format!("'sha256-{}'", empreinte("var t=1;"))),
+                fichier == "index.html",
+                "{fichier} : {csp}"
+            );
+        }
+    }
+
+    /// Les scripts en ligne de l'index reel (theme, service worker) et son
+    /// gestionnaire `onload` des polices sont autorises par empreinte, et
+    /// eux seuls.
+    #[test]
+    fn les_scripts_en_ligne_de_l_index_sont_autorises_par_empreinte() {
+        let index = "<!DOCTYPE html><html><head>\n\
+            <!-- commentaire <script>non</script> -->\n\
+            <link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2\" media=\"print\" onload=\"this.media='all'\" />\n\
+            </head><body>\n<script>\n  var t=1;\n</script>\n\
+            <script type=\"module\" crossorigin src=\"/assets/index-abc.js\"></script>\n\
+            <SCRIPT>b()</SCRIPT></body></html>";
+        let (scripts, gestionnaires) = scripts_en_ligne(index);
+        assert_eq!(
+            scripts,
+            vec!["\n  var t=1;\n".to_string(), "b()".to_string()]
+        );
+        assert_eq!(gestionnaires, vec!["this.media='all'".to_string()]);
+        let csp = politique_de_contenu(Some(index));
+        assert!(csp.contains("'unsafe-hashes'"), "{csp}");
+        // Empreinte connue de `this.media='all'`.
+        assert!(
+            csp.contains("'sha256-MhtPZXr7+LpJUY5qtMutB+qWfQtMaPccfe7QXtCcEYc='"),
+            "{csp}"
+        );
+        assert_eq!(csp.matches("'sha256-").count(), 3, "{csp}");
+        // Sans HTML, aucune empreinte.
+        assert!(!politique_de_contenu(None).contains("sha256"));
     }
 }

@@ -199,12 +199,12 @@ pub fn planifier(
     }
     let cible: Vec<usize> = visees[..n].iter().map(|&i| usize::from(i)).collect();
     let largeur = cible.iter().copied().max().map_or(0, |m| m + 1);
-    if let Some(sorties) = sorties_de_la_carte {
-        if largeur > usize::from(sorties) {
-            return Err(format!(
-                "la zone vise le canal {largeur} de la carte, qui n'a que {sorties} sorties"
-            ));
-        }
+    if let Some(sorties) = sorties_de_la_carte
+        && largeur > usize::from(sorties)
+    {
+        return Err(format!(
+            "la zone vise le canal {largeur} de la carte, qui n'a que {sorties} sorties"
+        ));
     }
     if largeur == n && cible.iter().enumerate().all(|(c, &p)| c == p) {
         return Ok(None);

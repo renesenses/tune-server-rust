@@ -211,6 +211,11 @@ struct BalisesImage {
     note: Option<i32>,
     commentaire: Option<String>,
 
+    /// #7751 — le disque du coffret, en dernier recours : la feuille, son
+    /// dossier ou le nom de l'image le disent d'abord
+    /// ([`super::cue_album::PisteCue::disque`]).
+    disque: Option<u32>,
+
     // #6459 — titre, interprète, album et artiste de l'album du fichier. Ils
     // ne servent QUE là où la feuille ne dit rien (ou ne dit qu'une valeur de
     // remplissage d'EAC) : voir [`combler_par_les_balises_ce_que_la_feuille_tait`].
@@ -250,6 +255,8 @@ impl BalisesImage {
             bpm: m.bpm.filter(|b| *b > 0.0),
             note: m.rating.map(i32::from),
             commentaire: texte(m.comment),
+
+            disque: m.disc_number.filter(|d| *d > 0),
 
             titre: texte(m.title),
             artiste: texte(m.artist),
@@ -777,6 +784,84 @@ struct Imposition<'a> {
     retoucher: &'a dyn Fn(&PisteCue, &mut Track),
 }
 
+/// #7751 — l'album d'un coffret que les pistes de cette feuille occupent déjà,
+/// quand il appartient à un dossier de disque FRÈRE (`CD01/` pour `CD02/`).
+///
+/// Seule la première piste est consultée : c'est elle que le premier scan a
+/// rattachée avec les autres. Un album d'un autre dossier qui ne serait pas
+/// un disque frère n'est jamais repris : la règle « autre dossier = autre
+/// édition » vaut toujours.
+fn album_du_coffret_deja_occupe(
+    album_repo: &AlbumRepo,
+    track_repo: &TrackRepo,
+    dossier: &Path,
+    album: &AlbumCue,
+) -> Option<crate::db::models::Album> {
+    let premiere = album.pistes.first()?;
+    let existante = track_repo
+        .get_by_cue_identity(&premiere.media.to_string_lossy(), premiere.debut_ms as i64)
+        .ok()??;
+    let id = existante.album_id?;
+    let dossier_de_l_album = album_repo.folder_path_of(id).ok()??;
+    crate::scanner::compilation::sont_des_disques_du_meme_coffret(
+        &dossier_de_l_album,
+        &dossier.to_string_lossy(),
+    )
+    .then(|| album_repo.get(id).ok().flatten())
+    .flatten()
+}
+
+/// #7751 — l'album du coffret qu'un dossier de disque doit rejoindre alors
+/// qu'il a DÉJÀ sa propre ligne d'album : c'est l'état que laissent les scans
+/// d'avant le correctif, un album par dossier `CDn`. Sans cette reprise,
+/// `get_or_create_for_folder_with_track` rend la ligne du dossier avant même
+/// la règle C4, et le coffret reste en autant d'albums que de disques.
+///
+/// L'album du coffret est le plus ancien (plus petit identifiant) des albums
+/// de même titre et même artiste que portent ce dossier et ses dossiers de
+/// disques frères : tous les disques désignent ainsi le même. La feuille ne
+/// le rejoint que si son disque n'y est pas encore — deux extractions du
+/// disque 1 restent deux albums, comme dans C4. La ligne du dossier, vidée,
+/// est purgée après le scan avec les autres albums sans piste
+/// (`AlbumRepo::delete_orphans`).
+fn album_du_coffret_a_rejoindre(
+    album_repo: &AlbumRepo,
+    dossier: &Path,
+    titre: &str,
+    artist_id: i64,
+    disque: u32,
+) -> Option<crate::db::models::Album> {
+    let propre = album_repo
+        .find_id_by_folder(&dossier.to_string_lossy())
+        .ok()??;
+    let meme_album = |id: i64| {
+        album_repo.get(id).ok().flatten().filter(|a| {
+            a.artist_id == Some(artist_id) && a.title.trim().eq_ignore_ascii_case(titre.trim())
+        })
+    };
+    meme_album(propre)?;
+    let soi = dossier.to_string_lossy();
+    let freres = std::fs::read_dir(dossier.parent()?).ok()?;
+    let coffret = freres
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| crate::scanner::compilation::sont_des_disques_du_meme_coffret(p, &soi))
+        .filter_map(|p| album_repo.find_id_by_folder(&p).ok().flatten())
+        .filter(|id| meme_album(*id).is_some())
+        .min()?;
+    if coffret >= propre
+        || album_repo
+            .disc_numbers_of(coffret)
+            .unwrap_or_default()
+            .contains(&(disque as i32))
+    {
+        return None;
+    }
+    album_repo.get(coffret).ok().flatten()
+}
+
 /// Écrit un album CUE : artiste, album, puis ses pistes virtuelles.
 fn ecrire_album(
     dossier: &Path,
@@ -868,7 +953,23 @@ fn ecrire_album_avec(
                 )
             }),
     };
+    let dossier_de_la_parution = dossier_album.is_some();
     let dossier = dossier_album.as_deref().unwrap_or(dossier);
+
+    // #7751 — le disque du coffret que décrit la feuille : c'est lui qui
+    // permet à la règle C4 de rattacher `CD02/` à l'album que `CD01/` a
+    // ouvert, comme au scan ordinaire. Sans lui, chaque CD d'un coffret
+    // FLAC + CUE restait un album. Pas pour une image SACD : son identité
+    // vient de son Master TOC.
+    let disque_de = |piste: &PisteCue| {
+        piste
+            .disque
+            .or_else(|| balises.get(&piste.media).and_then(|b| b.disque))
+    };
+    let disque_du_coffret = match imposition {
+        Some(_) => None,
+        None => album.pistes.first().and_then(disque_de),
+    };
 
     // Le titre d'album manquant retombe sur le nom du dossier : une feuille
     // sans `TITLE` reste un album, et un album sans nom est introuvable.
@@ -904,15 +1005,38 @@ fn ecrire_album_avec(
                 .and_then(|p| balises.get(&p.media))
                 .and_then(|b| b.annee)
         });
+    // Au rescan, le disque 2 est DÉJÀ dans l'album du coffret : la règle C4,
+    // qui refuse un numéro déjà pris, en ferait un second album. La feuille
+    // reprend donc l'album que ses pistes occupent déjà quand c'est celui
+    // d'un dossier de disque frère.
+    //
+    // Une bibliothèque scannée AVANT le correctif a, elle, une ligne d'album
+    // par dossier `CDn` : la feuille rejoint alors l'album du coffret
+    // (`album_du_coffret_a_rejoindre`).
+    let deja_rattache = match (imposition, dossier_de_la_parution, disque_du_coffret) {
+        (None, false, Some(d)) => {
+            album_du_coffret_deja_occupe(album_repo, track_repo, dossier, album).or_else(|| {
+                artist_id.and_then(|a| {
+                    album_du_coffret_a_rejoindre(album_repo, dossier, &titre_album, a, d)
+                })
+            })
+        }
+        _ => None,
+    };
     let ligne = match (
         artist_id,
-        album_repo.get_or_create_for_folder(
-            &dossier.to_string_lossy(),
-            &titre_album,
-            artist_id.unwrap_or(0),
-            annee,
-            None,
-        ),
+        match deja_rattache {
+            Some(a) => Ok(a),
+            None => album_repo.get_or_create_for_folder_with_track(
+                &dossier.to_string_lossy(),
+                &titre_album,
+                artist_id.unwrap_or(0),
+                annee,
+                None,
+                None,
+                disque_du_coffret.map(|d| d as i32),
+            ),
+        },
     ) {
         (Some(_), Ok(a)) => a,
         (_, Err(e)) => {
@@ -1062,6 +1186,13 @@ fn ecrire_album_avec(
             sonde,
             fichier_entier,
         );
+        // #7751 — chaque CD d'un coffret garde son numéro : sans lui, les
+        // pistes 01 des dix disques se marchaient dessus sous le disque 1.
+        if imposition.is_none()
+            && let Some(d) = disque_de(piste)
+        {
+            ligne.disc_number = d as i32;
+        }
         if let Some(i) = imposition {
             (i.retoucher)(piste, &mut ligne);
         }
@@ -1428,6 +1559,9 @@ fn album_de_l_iso(
                 isrc: None,
                 compositeur: None,
                 commentaire: None,
+                // Le disque d'une image SACD vient de son Master TOC : c'est
+                // `ecrire_les_iso_sacd` qui le pose.
+                disque: None,
                 // La piste est une tranche de la zone, sur son horloge :
                 // c'est ce que la lecture rejoue (`audio::sacd::ouvrir_lecture`).
                 debut_ms: p.debut_ms(),
@@ -2089,8 +2223,11 @@ mod tests {
         let (dossier, _) = album_simple(d.path());
         let db = base();
 
-        let (_, premier, _) =
-            inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        let (_, premier, _) = inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         let (_, second, _) = inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
 
         assert_eq!(premier.pistes_creees, 2);
@@ -2108,7 +2245,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         assert_eq!(TrackRepo::with_backend(db.clone()).count().unwrap(), 2);
 
         fs::remove_file(&image).unwrap();
@@ -2136,7 +2277,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, _) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         let repo = TrackRepo::with_backend(db.clone());
         assert_eq!(repo.count().unwrap(), 2);
 
@@ -2165,7 +2310,7 @@ mod tests {
         let (dossier, _) = album_simple(&racine);
         let db = base();
         let rac = vec![racine.to_string_lossy().into_owned()];
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &rac);
+        inventorier_et_ecrire(db.clone(), std::slice::from_ref(&dossier), &rac);
         let repo = TrackRepo::with_backend(db.clone());
         assert_eq!(repo.count().unwrap(), 2);
 
@@ -2191,7 +2336,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base();
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         let repo = TrackRepo::with_backend(db.clone());
         assert_eq!(repo.count().unwrap(), 2);
 
@@ -2250,7 +2399,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base_fichier(d.path());
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         assert_eq!(debuts(&db, &image), vec![0, 1_000], "montage");
 
         fs::write(
@@ -2261,7 +2414,7 @@ mod tests {
         let vus = vec![image.clone()];
         let (_, refuse, _) = inventorier_ecrire_et_confronter(
             db.clone(),
-            &[dossier.clone()],
+            std::slice::from_ref(&dossier),
             &racines(d.path()),
             &ConfrontationDuScan {
                 fichiers_vus: &vus,
@@ -2297,7 +2450,11 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let (dossier, image) = album_simple(d.path());
         let db = base_fichier(d.path());
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
         fs::remove_file(dossier.join("album.cue")).unwrap();
 
         let rien: Vec<PathBuf> = Vec::new();
@@ -3124,10 +3281,14 @@ mod tests {
     }
 
     /// #6459, la limite — sans album de la parution en base, la feuille d'un
-    /// dossier `CD1/` ne remonte pas : chaque disque reste un album à part,
-    /// que la passe des coffrets automatiques (#5317/#6554) réunit ou non.
+    /// dossier `CD1/` ne remonte pas : aucun album ne naît sous le dossier de
+    /// la parution.
+    ///
+    /// #7751 — et les disques ne restent plus un album chacun : le dossier
+    /// `CD2/` dit son disque, la règle C4 le rattache à l'album que `CD1/` a
+    /// ouvert (voir `un_coffret_en_dossiers_de_disques_fait_un_album_7751`).
     #[test]
-    fn sans_album_de_la_parution_chaque_disque_reste_un_album_6459() {
+    fn sans_album_de_la_parution_la_feuille_d_un_disque_ne_remonte_pas_6459() {
         const DISQUE: &str = "TITLE \"Ouvertures\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Rienzi\"\n    INDEX 01 00:00:00\n";
         let d = tempfile::TempDir::new().unwrap();
         let parution = d.path().join("Wagner - Ouvertures");
@@ -3150,14 +3311,279 @@ mod tests {
             None,
             "la passe CUE a créé un album sous le dossier de la parution"
         );
-        for disque in &disques {
-            assert!(
+        let images: Vec<PathBuf> = disques.iter().map(|d| d.join("image.wav")).collect();
+        let lignes = tranches_7751(&db, &images);
+        assert_eq!(lignes.len(), 2, "{lignes:?}");
+        assert_eq!(albums_7751(&lignes), 1, "{lignes:?}");
+    }
+
+    /// `(album, disque, piste)` de chaque tranche des images, dans l'ordre.
+    fn tranches_7751(db: &Arc<dyn DbBackend>, images: &[PathBuf]) -> Vec<(i64, i32, i32)> {
+        let repo = TrackRepo::with_backend(db.clone());
+        let mut lignes = Vec::new();
+        for image in images {
+            let media = image.to_string_lossy().to_string();
+            for (_, debut) in repo.tranches_cue_du_media(&media).unwrap() {
+                let t = repo.get_by_cue_identity(&media, debut).unwrap().unwrap();
+                lignes.push((t.album_id.unwrap(), t.disc_number, t.track_number));
+            }
+        }
+        lignes.sort();
+        lignes
+    }
+
+    fn albums_7751(lignes: &[(i64, i32, i32)]) -> usize {
+        lignes.iter().map(|l| l.0).collect::<HashSet<_>>().len()
+    }
+
+    /// Une feuille de coffret : même titre, deux pistes 01-02.
+    fn feuille_7751(interprete: &str, image: &str) -> String {
+        format!(
+            "PERFORMER \"{interprete}\"\nTITLE \"Der Ring des Nibelungen\"\nFILE \"{image}\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:01:00\n"
+        )
+    }
+
+    /// #7751 — le coffret du forum rangé dans UN dossier : dix FLAC + dix
+    /// CUE, même album et même artiste sur chaque feuille, le numéro du CD
+    /// dans le nom du fichier. En base : UN album, chaque piste sous SON
+    /// disque — avant, toutes les pistes étaient au disque 1 et les 01 des
+    /// différents CD se marchaient dessus. Un second scan n'y change rien.
+    #[test]
+    fn un_coffret_flac_cue_dans_un_dossier_fait_un_album_a_plusieurs_disques_7751() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = d.path().join("Solti - Der Ring");
+        fs::create_dir_all(&dossier).unwrap();
+        let mut images = Vec::new();
+        for n in 1..=3 {
+            let image = dossier.join(format!("Der Ring CD{n:02}.wav"));
+            ecrire_wav(&image, 4_000);
+            fs::write(
+                dossier.join(format!("Der Ring CD{n:02}.cue")),
+                feuille_7751("Georg Solti", &format!("Der Ring CD{n:02}.wav")),
+            )
+            .unwrap();
+            images.push(image);
+        }
+
+        let db = base();
+        for passe in 1..=2 {
+            let (_, bilan, _) = inventorier_et_ecrire(
+                db.clone(),
+                std::slice::from_ref(&dossier),
+                &racines(d.path()),
+            );
+            assert_eq!(bilan.echecs, 0, "passe {passe} : {bilan:?}");
+            let lignes = tranches_7751(&db, &images);
+            assert_eq!(lignes.len(), 6, "passe {passe} : {lignes:?}");
+            assert_eq!(albums_7751(&lignes), 1, "passe {passe} : {lignes:?}");
+            let disques: Vec<(i32, i32)> = lignes.iter().map(|l| (l.1, l.2)).collect();
+            assert_eq!(
+                disques,
+                vec![(1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (3, 2)],
+                "passe {passe} : les CD du coffret ne gardent pas leur numéro de disque"
+            );
+        }
+    }
+
+    /// #7751 — le même coffret rangé un dossier par CD (`CD1/`, `CD2/`…),
+    /// toutes les feuilles au même titre. Avant : un album par dossier, et la
+    /// passe des coffrets ne les réunissait pas (le titre ne porte aucun
+    /// marqueur). Le dossier dit le disque, la règle C4 rattache chaque CD à
+    /// l'album du premier — et le RESCAN l'y laisse, alors que son disque est
+    /// désormais « déjà pris » dans cet album.
+    #[test]
+    fn un_coffret_en_dossiers_de_disques_fait_un_album_7751() {
+        let d = tempfile::TempDir::new().unwrap();
+        let coffret = d.path().join("Solti - Der Ring");
+        let mut disques = Vec::new();
+        let mut images = Vec::new();
+        for n in 1..=3 {
+            let disque = coffret.join(format!("CD{n}"));
+            fs::create_dir_all(&disque).unwrap();
+            let image = disque.join(format!("Der Ring CD{n:02}.wav"));
+            ecrire_wav(&image, 4_000);
+            fs::write(
+                disque.join(format!("Der Ring CD{n:02}.cue")),
+                feuille_7751("Georg Solti", &format!("Der Ring CD{n:02}.wav")),
+            )
+            .unwrap();
+            disques.push(disque);
+            images.push(image);
+        }
+
+        let db = base();
+        for passe in 1..=2 {
+            let (_, bilan, _) = inventorier_et_ecrire(db.clone(), &disques, &racines(d.path()));
+            assert_eq!(bilan.echecs, 0, "passe {passe} : {bilan:?}");
+            let lignes = tranches_7751(&db, &images);
+            assert_eq!(lignes.len(), 6, "passe {passe} : {lignes:?}");
+            assert_eq!(
+                albums_7751(&lignes),
+                1,
+                "passe {passe} : chaque CD du coffret est vu comme un album séparé : {lignes:?}"
+            );
+            let disques: Vec<i32> = lignes.iter().map(|l| l.1).collect();
+            assert_eq!(disques, vec![1, 1, 2, 2, 3, 3], "passe {passe}");
+        }
+    }
+
+    /// #7751 — la bibliothèque DÉJÀ scannée avant le correctif : chaque
+    /// dossier `CDn` du coffret a sa propre ligne d'album. Le scan suivant
+    /// doit réunir les disques sous un seul album, puis le garder ainsi ; les
+    /// lignes vidées partent avec la purge des albums sans piste qui suit
+    /// chaque scan. Deux états de départ : le disque 1 déjà rangé avec ses
+    /// pistes, et des lignes vides créées dans l'ordre inverse des disques.
+    #[test]
+    fn un_coffret_deja_scanne_en_dossiers_de_disques_se_repare_7751() {
+        for ordre in ["disque 1 déjà rangé", "lignes en ordre inverse"] {
+            let d = tempfile::TempDir::new().unwrap();
+            let coffret = d.path().join("Solti - Der Ring");
+            let mut disques = Vec::new();
+            let mut images = Vec::new();
+            for n in 1..=3 {
+                let disque = coffret.join(format!("CD{n}"));
+                fs::create_dir_all(&disque).unwrap();
+                let image = disque.join(format!("Der Ring CD{n:02}.wav"));
+                ecrire_wav(&image, 4_000);
+                fs::write(
+                    disque.join(format!("Der Ring CD{n:02}.cue")),
+                    feuille_7751("Georg Solti", &format!("Der Ring CD{n:02}.wav")),
+                )
+                .unwrap();
+                disques.push(disque);
+                images.push(image);
+            }
+
+            let db = base();
+            let album_repo = AlbumRepo::with_backend(db.clone());
+            let solti = ArtistRepo::with_backend(db.clone())
+                .get_or_create("Georg Solti", None, None)
+                .unwrap()
+                .id
+                .unwrap();
+            // L'état laissé par l'ancien code : une ligne d'album par dossier.
+            let a_creer: Vec<&PathBuf> = if ordre == "disque 1 déjà rangé" {
+                inventorier_et_ecrire(db.clone(), &disques[..1], &racines(d.path()));
+                disques[1..].iter().collect()
+            } else {
+                disques.iter().rev().collect()
+            };
+            for disque in a_creer {
                 album_repo
-                    .find_id_by_folder(&disque.to_string_lossy())
-                    .unwrap()
-                    .is_some(),
-                "le disque {} n'a pas son album",
-                disque.display()
+                    .get_or_create_for_folder(
+                        &disque.to_string_lossy(),
+                        "Der Ring des Nibelungen",
+                        solti,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            for disque in &disques {
+                assert!(
+                    album_repo
+                        .find_id_by_folder(&disque.to_string_lossy())
+                        .unwrap()
+                        .is_some(),
+                    "{ordre} : état de départ sans ligne pour {}",
+                    disque.display()
+                );
+            }
+
+            for passe in 1..=2 {
+                let (_, bilan, _) = inventorier_et_ecrire(db.clone(), &disques, &racines(d.path()));
+                assert_eq!(bilan.echecs, 0, "{ordre}, passe {passe} : {bilan:?}");
+                let lignes = tranches_7751(&db, &images);
+                assert_eq!(lignes.len(), 6, "{ordre}, passe {passe} : {lignes:?}");
+                assert_eq!(
+                    albums_7751(&lignes),
+                    1,
+                    "{ordre}, passe {passe} : bibliothèque déjà scannée non réparée, \
+                     chaque CD du coffret reste un album séparé : {lignes:?}"
+                );
+                let disques: Vec<i32> = lignes.iter().map(|l| l.1).collect();
+                assert_eq!(disques, vec![1, 1, 2, 2, 3, 3], "{ordre}, passe {passe}");
+                album_repo.delete_orphans().unwrap();
+                let restants: HashSet<i64> = (1..=3)
+                    .filter_map(|n| {
+                        album_repo
+                            .find_id_by_folder(&coffret.join(format!("CD{n}")).to_string_lossy())
+                            .unwrap()
+                    })
+                    .collect();
+                assert_eq!(
+                    restants,
+                    HashSet::from([lignes[0].0]),
+                    "{ordre}, passe {passe} : une ligne vidée survit à la purge"
+                );
+            }
+        }
+    }
+
+    /// #7751, CONTRE-POIDS — deux albums différents de même titre, rangés
+    /// en dossiers de disques frères, restent deux albums :
+    /// - un autre interprète : c'est un autre album ;
+    /// - deux extractions du même disque 1 : le disque est déjà pris.
+    ///
+    /// Sur deux scans : le second part d'une base où chaque dossier a déjà sa
+    /// ligne d'album.
+    #[test]
+    fn deux_albums_differents_de_meme_titre_restent_deux_albums_7751() {
+        let d = tempfile::TempDir::new().unwrap();
+        let parent = d.path().join("Der Ring");
+        let cas = [
+            ("CD1", "Der Ring CD01.wav", "Georg Solti"),
+            ("CD2", "Der Ring CD02.wav", "Herbert von Karajan"),
+        ];
+        let mut dossiers = Vec::new();
+        let mut images = Vec::new();
+        for (dossier, image, interprete) in cas {
+            let dossier = parent.join(dossier);
+            fs::create_dir_all(&dossier).unwrap();
+            ecrire_wav(&dossier.join(image), 4_000);
+            fs::write(dossier.join("album.cue"), feuille_7751(interprete, image)).unwrap();
+            images.push(dossier.join(image));
+            dossiers.push(dossier);
+        }
+        let db = base();
+        for passe in 1..=2 {
+            inventorier_et_ecrire(db.clone(), &dossiers, &racines(d.path()));
+            let lignes = tranches_7751(&db, &images);
+            assert_eq!(lignes.len(), 4, "passe {passe} : {lignes:?}");
+            assert_eq!(
+                albums_7751(&lignes),
+                2,
+                "passe {passe} : deux interprètes fusionnés : {lignes:?}"
+            );
+        }
+
+        let d = tempfile::TempDir::new().unwrap();
+        let parent = d.path().join("Der Ring");
+        let mut dossiers = Vec::new();
+        let mut images = Vec::new();
+        for dossier in ["CD1", "CD1 (copie)"] {
+            let dossier = parent.join(dossier);
+            fs::create_dir_all(&dossier).unwrap();
+            ecrire_wav(&dossier.join("Der Ring CD01.wav"), 4_000);
+            fs::write(
+                dossier.join("album.cue"),
+                feuille_7751("Georg Solti", "Der Ring CD01.wav"),
+            )
+            .unwrap();
+            images.push(dossier.join("Der Ring CD01.wav"));
+            dossiers.push(dossier);
+        }
+        // Le second scan éprouve aussi la reprise d'une bibliothèque déjà
+        // scannée : la copie a sa ligne, mais le disque 1 est déjà pris.
+        let db = base();
+        for passe in 1..=2 {
+            inventorier_et_ecrire(db.clone(), &dossiers, &racines(d.path()));
+            let lignes = tranches_7751(&db, &images);
+            assert_eq!(lignes.len(), 4, "passe {passe} : {lignes:?}");
+            assert_eq!(
+                albums_7751(&lignes),
+                2,
+                "passe {passe} : deux extractions du disque 1 fusionnées : {lignes:?}"
             );
         }
     }

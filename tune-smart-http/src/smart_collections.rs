@@ -843,38 +843,50 @@ pub fn build_album_query(
         }
 
         if field == "play_count" || field == "last_played_at" {
-            let int_v = value.parse::<i64>().unwrap_or(0);
-            let cond = match (field, op) {
-                ("play_count", "=" | "==") if int_v == 0 => {
-                    "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON lh.track_id = t3.id)"
-                        .to_string()
+            // 🔴 #7769 — les écoutes d'une piste de l'album par la règle de la
+            // Bibliothèque (titre + interprète) : `lh.track_id`, toujours NULL,
+            // ne rattachait aucune écoute à aucun album.
+            let on = tune_core::db::history_repo::sql::ecoute_de_la_piste("t3", "lh");
+            // Un nombre d'écoutes illisible ne vaut plus 0 : la règle rend
+            // FAUX (#1231), comme côté pistes.
+            let int_v = match value.trim().parse::<i64>() {
+                Ok(n) => n,
+                Err(_) if field == "play_count" && op != "between" => {
+                    conditions.push(crate::regles_sql::FAUX.to_string());
+                    continue;
                 }
+                Err(_) => 0,
+            };
+            let cond = match (field, op) {
+                ("play_count", "=" | "==") if int_v == 0 => format!(
+                    "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
+                     JOIN listen_history lh ON {on})"
+                ),
                 ("play_count", "=") => format!(
                     "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON lh.track_id = t3.id \
+                     JOIN listen_history lh ON {on} \
                      GROUP BY t3.album_id HAVING COUNT(*) = {int_v})"
                 ),
                 ("play_count", ">=") => format!(
                     "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON lh.track_id = t3.id \
+                     JOIN listen_history lh ON {on} \
                      GROUP BY t3.album_id HAVING COUNT(*) >= {int_v})"
                 ),
                 ("play_count", ">") => format!(
                     "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON lh.track_id = t3.id \
+                     JOIN listen_history lh ON {on} \
                      GROUP BY t3.album_id HAVING COUNT(*) > {int_v})"
                 ),
                 ("play_count", "<") => format!(
                     "al.id NOT IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON lh.track_id = t3.id \
+                     JOIN listen_history lh ON {on} \
                      GROUP BY t3.album_id HAVING COUNT(*) >= {int_v})"
                 ),
                 ("last_played_at", ">" | ">=") => {
                     let ts = resolve_timestamp_sql(&value);
                     format!(
                         "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON lh.track_id = t3.id \
+                         JOIN listen_history lh ON {on} \
                          WHERE lh.listened_at {op} {ts} GROUP BY t3.album_id)"
                     )
                 }
@@ -882,7 +894,7 @@ pub fn build_album_query(
                     let ts = resolve_timestamp_sql(&value);
                     format!(
                         "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON lh.track_id = t3.id \
+                         JOIN listen_history lh ON {on} \
                          GROUP BY t3.album_id HAVING MAX(lh.listened_at) {op} {ts})"
                     )
                 }
@@ -895,7 +907,7 @@ pub fn build_album_query(
                     };
                     let dans = format!(
                         "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON lh.track_id = t3.id \
+                         JOIN listen_history lh ON {on} \
                          GROUP BY t3.album_id HAVING COUNT(*) BETWEEN {lo} AND {hi})"
                     );
                     if lo <= 0 {
@@ -903,7 +915,7 @@ pub fn build_album_query(
                         // doit garder les albums jamais écoutés.
                         format!(
                             "(al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
-                             JOIN listen_history lh ON lh.track_id = t3.id) OR {dans})"
+                             JOIN listen_history lh ON {on}) OR {dans})"
                         )
                     } else {
                         dans
@@ -915,7 +927,7 @@ pub fn build_album_query(
                     };
                     format!(
                         "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON lh.track_id = t3.id \
+                         JOIN listen_history lh ON {on} \
                          GROUP BY t3.album_id HAVING MAX(lh.listened_at) BETWEEN {lo} AND {hi})"
                     )
                 }
@@ -925,18 +937,17 @@ pub fn build_album_query(
                     match crate::regles_sql::seuil_de(value_raw) {
                         Some(s) => format!(
                             "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                             JOIN listen_history lh ON lh.track_id = t3.id \
+                             JOIN listen_history lh ON {on} \
                              WHERE lh.listened_at >= {} GROUP BY t3.album_id)",
                             s.iso
                         ),
                         None => crate::regles_sql::FAUX.to_string(),
                     }
                 }
-                ("last_played_at", "is_null") => {
+                ("last_played_at", "is_null") => format!(
                     "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON lh.track_id = t3.id)"
-                        .to_string()
-                }
+                     JOIN listen_history lh ON {on})"
+                ),
                 _ => continue,
             };
             conditions.push(cond);
@@ -951,6 +962,22 @@ pub fn build_album_query(
             if let Some(c) = crate::regles_sql::condition_marquage_ia_bibliotheque(op) {
                 conditions.push(c.to_string());
             }
+            continue;
+        }
+
+        // #6285 — le verdict hi-res PUBLIÉ de l'album, celui de son badge
+        // dans la liste. Un verdict ou un opérateur inconnu rend FAUX.
+        if field == "hires_verdict" {
+            conditions.push(
+                crate::regles_sql::condition_verdict_hires(
+                    "al.id",
+                    true,
+                    op,
+                    &value,
+                    ctx.resolver.hires_douteux_visible(),
+                )
+                .unwrap_or_else(|| crate::regles_sql::FAUX.to_string()),
+            );
             continue;
         }
 

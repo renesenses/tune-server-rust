@@ -4,6 +4,7 @@
 // la logique audio pour un gain de forme (clippy 1.98).
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
+use crate::taches_de_fond::basse_priorite::en_priorite_basse;
 use lofty::file::AudioFile;
 
 use tracing::{debug, info, warn};
@@ -770,9 +771,7 @@ async fn mesurer_a_partir_de(
     premier: Option<super::decode::DecodedAudio>,
 ) -> Option<(f64, f64, f64, Option<u32>)> {
     let mesure = parcourir_les_segments(file_path, premier, MesureEnCours::default()).await?;
-    tokio::task::spawn_blocking(move || mesure.finir())
-        .await
-        .ok()?
+    en_priorite_basse(move || mesure.finir()).await.ok()?
 }
 
 /// La SEULE crête vraie d'un fichier (#2713), linéaire : la valeur que
@@ -826,7 +825,9 @@ async fn parcourir_les_segments(
         }
         let path = file_path.to_string();
         let deja_decode = premier.take();
-        let (rendue, segment) = tokio::task::spawn_blocking(move || {
+        // #7915 — décodage et calcul sur un fil en priorité processeur
+        // basse : ce sont eux qui tenaient le processeur toute la nuit.
+        let (rendue, segment) = en_priorite_basse(move || {
             // #4681 — E/S basses si une zone joue (segment déjà parti).
             let _basse = crate::taches_de_fond::priorite::politique::baisser_pendant_la_lecture();
             let decoded = match deja_decode {
@@ -1970,9 +1971,7 @@ mod tests {
         f.write_all(b"RIFF").unwrap();
         f.write_all(&((36 + data) as u32).to_le_bytes()).unwrap();
         f.write_all(b"WAVEfmt ").unwrap();
-        for v in [16u32] {
-            f.write_all(&v.to_le_bytes()).unwrap();
-        }
+        f.write_all(&16u32.to_le_bytes()).unwrap();
         for v in [1u16, 2] {
             f.write_all(&v.to_le_bytes()).unwrap();
         }

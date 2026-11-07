@@ -116,3 +116,38 @@ pub fn write_channel(
     }
     written
 }
+
+/// Probe native rates without confusing an unavailable probe with a negative
+/// capability. Kept independent of the SDK so the exact driver-call sequence
+/// can be tested without opening hardware.
+pub fn probe_dsd_rates(
+    busy: bool,
+    can_format: impl FnOnce() -> Option<bool>,
+    prepare: impl FnOnce() -> Option<()>,
+    mut can_rate: impl FnMut(u32) -> Option<bool>,
+    restore_pcm: impl FnOnce() -> Option<()>,
+) -> Option<Vec<u32>> {
+    if busy {
+        return None;
+    }
+    if !can_format()? {
+        return Some(Vec::new());
+    }
+    if prepare().is_none() {
+        let _ = restore_pcm();
+        return None;
+    }
+    let mut rates = Some(Vec::new());
+    for rate in DSD_RATES {
+        match can_rate(rate) {
+            Some(true) => rates.as_mut().unwrap().push(rate),
+            Some(false) => {}
+            None => {
+                rates = None;
+                break;
+            }
+        }
+    }
+    restore_pcm()?;
+    rates
+}

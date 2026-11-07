@@ -414,10 +414,9 @@ impl FavoritesReconciler {
             if let Some(row) = self
                 .db
                 .query_one("SELECT id FROM tracks WHERE file_path = ?", &params)?
+                && let Some(id) = row.first().and_then(|v| v.as_i64())
             {
-                if let Some(id) = row.first().and_then(|v| v.as_i64()) {
-                    return Ok(Some(id));
-                }
+                return Ok(Some(id));
             }
         }
         if ident.name.is_empty() {

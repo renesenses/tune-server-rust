@@ -155,6 +155,8 @@ impl SuiviDesReveils {
         self.ecart_max_ticks
     }
 
+    /// Lu par le seul journal de `wasapi_exclusive` (Windows).
+    #[cfg(target_os = "windows")]
     pub(crate) fn periode_ticks(&self) -> u64 {
         self.periode_ticks
     }

@@ -175,3 +175,44 @@ async fn sources_radios_rend_les_radios_sans_la_bibliotheque() {
     assert_eq!(r["local"]["tracks"], serde_json::json!([]), "{r}");
     assert_eq!(r["services"], serde_json::json!({}), "{r}");
 }
+
+/// La recherche globale emprunte le même filtre multi-mots que l'annuaire.
+#[tokio::test]
+async fn recherche_7198_globale_trouve_tous_les_mots_sans_ordre() {
+    let state = etat();
+    poser_l_annuaire(
+        &state,
+        vec![
+            fiche("S1", "BBC Radio 3 Unwind", "https://bbc.example/unwind"),
+            fiche("S2", "BBC Radio 3", "https://bbc.example/radio3"),
+            fiche("S3", "FIP Groove", "https://fip.example/groove"),
+            fiche("S4", "FIP", "https://fip.example/flux"),
+            fiche("S5", "Café del Mar", "https://cafe.example/flux"),
+        ],
+    );
+    for (q, attendus) in [
+        ("BBC unwind", vec!["BBC Radio 3 Unwind"]),
+        ("uNwInD BBC", vec!["BBC Radio 3 Unwind"]),
+        ("  BBC\t unwind  ", vec!["BBC Radio 3 Unwind"]),
+        ("groove FIP", vec!["FIP Groove"]),
+        ("MAR cafe", vec!["Café del Mar"]),
+        ("mar CAFE\u{301}", vec!["Café del Mar"]),
+        ("BBC groove", vec![]),
+        ("BBC unwind absent", vec![]),
+        ("bbc", vec!["BBC Radio 3 Unwind", "BBC Radio 3"]),
+        ("fip", vec!["FIP Groove", "FIP"]),
+        ("cafE", vec!["Café del Mar"]),
+    ] {
+        for source in ["", "&sources=radios", "&sources=local"] {
+            let r = chercher(&state, &format!("q={}{source}", urlencoding::encode(q))).await;
+            let bloc = &r["radios_annuaire"];
+            assert_eq!(
+                noms(bloc),
+                attendus,
+                "La recherche globale {q:?} ({source}) doit retrouver tous les mots du nom : {bloc}"
+            );
+            assert_eq!(bloc["total"], attendus.len(), "{bloc}");
+            assert_eq!(bloc["has_more"], false, "{bloc}");
+        }
+    }
+}

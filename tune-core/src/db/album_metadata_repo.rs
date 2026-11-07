@@ -240,7 +240,7 @@ mod tests {
 
         let meta = repo.get_all(1).unwrap();
         assert_eq!(meta.len(), 1);
-        assert!(meta.get("conductor").is_none());
+        assert!(!meta.contains_key("conductor"));
 
         repo.delete_all(1).unwrap();
         assert!(repo.get_all(1).unwrap().is_empty());

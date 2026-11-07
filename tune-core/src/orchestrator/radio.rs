@@ -688,6 +688,25 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
     })
 }
 
+/// #7148 — la sentinelle de streaming sonde une station par le chemin EXACT de
+/// la lecture (le GET, les contrôles de type, le HLS, la sonde Symphonia, le
+/// décodeur), jusqu'à la première trame décodée, puis s'arrête. Aucune
+/// session, aucune sortie : rien n'est joué.
+///
+/// Rend la cadence et le nombre de canaux de la source.
+pub(super) fn sonder_une_station_sans_sortie(url: &str) -> Result<(u32, u16), String> {
+    let mut sonde = sonder_la_station(url)?;
+    if sonde
+        .pcm_en_attente
+        .as_ref()
+        .is_some_and(|(pcm, _)| !pcm.is_empty())
+    {
+        return Ok((sonde.source_sample_rate, sonde.source_channels));
+    }
+    premiere_trame(&mut *sonde.format, sonde.track_id, &mut sonde.decoder)?;
+    Ok((sonde.source_sample_rate, sonde.source_channels))
+}
+
 /// Les types que les serveurs donnent aux listes `.m3u` comme aux `.m3u8`.
 fn type_mpegurl(content_type: &str) -> bool {
     let essence = content_type

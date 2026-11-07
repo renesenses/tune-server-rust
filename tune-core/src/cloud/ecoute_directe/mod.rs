@@ -341,10 +341,10 @@ impl EcouteDirecte {
             local,
             local_port: p.local_port,
         });
-        if let Some(publication) = p.jeu_initial {
-            if let Err(r) = moteur.accepter_jeu(&publication) {
-                warn!(refus = %r, "ecoute_directe_jeu_initial_refuse");
-            }
+        if let Some(publication) = p.jeu_initial
+            && let Err(r) = moteur.accepter_jeu(&publication)
+        {
+            warn!(refus = %r, "ecoute_directe_jeu_initial_refuse");
         }
         Ok(moteur)
     }

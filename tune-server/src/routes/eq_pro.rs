@@ -21,6 +21,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/presets/{id}/activate", post(activate_preset))
         .route("/import/autoeq", post(import_autoeq))
+        // #6385 — le même fichier analysé, rendu sans rien enregistrer.
+        .route("/import/preview", post(import_preview))
         // #6388 — la base AutoEq en ligne, lue par le serveur.
         .route("/autoeq/search", get(autoeq_search))
         .route("/autoeq/import", post(autoeq_import))
@@ -423,16 +425,13 @@ async fn activate_preset(
             let Some(zone_id) =
                 resolve_activation_zone(params.get("zone_id").map(|s| s.as_str()), p)
             else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": "zone_id required",
-                        "detail": "Ce preset n'est lié à aucune zone : préciser \
-                                   ?zone_id=N. Sans zone, l'égaliseur ne saurait \
-                                   pas quelle sortie régler.",
-                    })),
-                )
-                    .into_response();
+                // `error` garde sa valeur historique ; `detail`, que lisaient
+                // les clients d'avant, porte la phrase traduite.
+                let mut corps =
+                    crate::message_api::corps_refus("zone_id required", "api.eq.presetNoZone", &[]);
+                corps["code"] = json!("zone_id_required");
+                corps["detail"] = corps["message"].clone();
+                return (StatusCode::BAD_REQUEST, Json(corps)).into_response();
             };
 
             let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -605,69 +604,85 @@ async fn portes_de_l_import(
     crate::premium_audio_plugins::require_installed(state, "equalizer", headers).err()
 }
 
-/// Analyse le texte ParametricEQ et l'enregistre comme préréglage.
-fn enregistrer_profil_autoeq(
-    state: &AppState,
-    body: ImportAutoEqBody,
-) -> Result<axum::response::Response, AppError> {
-    if body.text.len() > TAILLE_MAX_PROFIL {
-        return Err(AppError::bad_request(format!(
-            "profil trop volumineux ({} octets) : un fichier AutoEq ParametricEQ \
-             en fait quelques centaines",
-            body.text.len()
-        )));
+/// #6385 — un refus d'import NOMMÉ : `code` est une clé stable que le client
+/// traduit, `error` la phrase de repli, `line` ou `band` désigne l'endroit
+/// fautif du fichier. Même corps que `AppError` (`error`, `code`) : un client
+/// qui n'affiche que `error` continue de marcher.
+fn refus_import(code: &str, message: String, extra: Value) -> axum::response::Response {
+    tracing::warn!(error = %message, code, "eq_import_refused");
+    let mut corps = json!({ "error": message, "code": code });
+    if let (Some(corps), Some(extra)) = (corps.as_object_mut(), extra.as_object()) {
+        corps.extend(extra.clone());
+    }
+    (StatusCode::BAD_REQUEST, Json(corps)).into_response()
+}
+
+/// Analyse le fichier et fait respecter les bornes de l'import. Commun à
+/// l'aperçu et à l'enregistrement : ce que l'aperçu montre est exactement ce
+/// que l'import enregistrera, ou le même refus.
+#[allow(clippy::result_large_err)]
+fn analyser_import(
+    texte: &str,
+) -> Result<tune_core::audio::autoeq::ProfilAutoEq, axum::response::Response> {
+    if texte.len() > TAILLE_MAX_PROFIL {
+        return Err(refus_import(
+            "profile_too_large",
+            format!(
+                "fichier trop volumineux ({} octets) : un fichier d'égaliseur \
+                 (AutoEq, Equalizer APO ou OPRA) en fait quelques kilo-octets",
+                texte.len()
+            ),
+            json!({ "max_bytes": TAILLE_MAX_PROFIL }),
+        ));
     }
 
-    // Un fichier malformé est REFUSÉ, et l'erreur nomme la ligne fautive
-    // (`ErreurAutoEq`). Jamais de préréglage à moitié construit : rien n'est
+    // Un fichier malformé est REFUSÉ, et l'erreur nomme la ligne (ou la bande
+    // OPRA) fautive. Jamais de préréglage à moitié construit : rien n'est
     // écrit avant que le fichier entier soit lu sans faute.
-    let profil = tune_core::audio::autoeq::analyser(&body.text)
-        .map_err(|e| AppError::bad_request(format!("profil AutoEq illisible — {e}")))?;
+    let profil = tune_core::audio::autoeq::analyser_fichier(texte).map_err(|e| {
+        // Seule la clé qui désigne un endroit part : `line` pour un texte,
+        // `band` pour un profil OPRA, rien quand l'erreur vise le fichier entier.
+        let mut endroit = serde_json::Map::new();
+        if let Some(ligne) = e.ligne() {
+            endroit.insert("line".into(), json!(ligne));
+        }
+        if let Some(bande) = e.bande() {
+            endroit.insert("band".into(), json!(bande));
+        }
+        refus_import(
+            e.cle(),
+            format!("fichier d'égaliseur illisible — {e}"),
+            Value::Object(endroit),
+        )
+    })?;
 
     // Dépassement : un refus chiffré, jamais une troncature silencieuse. Perdre
     // les dernières bandes d'une correction, c'est en changer le timbre sans
     // le dire.
     if profil.bandes.len() > MAX_BANDS {
-        return Err(AppError::bad_request(format!(
-            "{} bandes actives : l'égaliseur en accepte {MAX_BANDS} au plus. \
-             Aucune bande n'a été tronquée et rien n'a été enregistré — \
-             désactivez des filtres dans le fichier (« OFF ») et réimportez.",
-            profil.bandes.len()
-        )));
+        return Err(refus_import(
+            "too_many_bands",
+            format!(
+                "{} bandes actives : l'égaliseur en accepte {MAX_BANDS} au plus. \
+                 Aucune bande n'a été tronquée et rien n'a été enregistré — \
+                 désactivez des filtres dans le fichier (« OFF ») et réimportez.",
+                profil.bandes.len()
+            ),
+            json!({ "band_count": profil.bandes.len(), "max_bands": MAX_BANDS }),
+        ));
     }
+    Ok(profil)
+}
 
-    let bands_json: Vec<Value> = profil
-        .bandes
-        .iter()
-        .map(|b| {
-            json!({
-                "freq": b.freq,
-                "gain": b.gain,
-                "q": b.q,
-                "type": b.band_type,
-            })
-        })
-        .collect();
-
-    let mut presets = load_presets(state);
-    let id = uuid::Uuid::new_v4().to_string();
-    let preset = json!({
-        "id": id,
-        "name": body.name.unwrap_or_else(|| "AutoEq".into()),
-        "eq_type": "parametric",
-        "zone_id": body.zone_id,
-        "bands": bands_json,
-        "created_at": epoch_secs(),
-        "source": "autoeq",
-    });
-    presets.push(preset.clone());
-    save_presets(state, &presets)?;
-
+/// Le compte rendu d'un import, commun à l'aperçu et à l'enregistrement.
+fn compte_rendu_import(profil: &tune_core::audio::autoeq::ProfilAutoEq, format: &str) -> Value {
     let reserved = profil.marge_reservee_db();
     let couvert = profil.marge_de_tune_couvre_le_preamp();
     let mut corps = json!({
-        "preset": preset,
+        "format": format,
         "band_count": profil.bandes.len(),
+        "max_bands": MAX_BANDS,
+        "reserved_headroom_db_per_channel": profil.marges_reservees_db(),
         // Écartés, mais NOMMÉS : l'écart entre le fichier et le préréglage
         // s'explique dans la réponse, pas à l'oreille. Le compte reste — un
         // client qui n'affiche qu'un chiffre continue de marcher — et la liste
@@ -682,23 +697,82 @@ fn enregistrer_profil_autoeq(
         "reserved_headroom_db": reserved,
         "preamp_applied": false,
         "preamp_covered_by_headroom": couvert,
-        "detail": format!(
-            "Le pré-gain automatique de l'égaliseur réserve {reserved:.1} dB, \
-             soit au moins la marge du Preamp AutoEq ({:.1} dB) : celui-ci \
-             n'est donc pas appliqué en plus. Le préréglage joue plus bas \
-             qu'un lecteur qui suit le Preamp ; rattraper au volume.",
-            profil.preamp_db
+        "detail": crate::message_api::texte(
+            "api.eq.preampCoveredByHeadroom",
+            &[
+                ("reserved", format!("{reserved:.1}")),
+                ("preamp", format!("{:.1}", profil.preamp_db)),
+            ],
         ),
+        "detail_key": "api.eq.preampCoveredByHeadroom",
     });
     if !couvert {
-        corps["warning"] = json!(format!(
-            "Ce fichier demande un Preamp de {:.1} dB alors que la somme de ses \
-             gains positifs n'en justifie que {reserved:.1} : ce n'est pas un \
-             export AutoEq standard. Le préréglage est importé tel quel ; \
-             baissez le volume avant de l'activer.",
-            profil.preamp_db
+        corps["warning"] = json!(crate::message_api::texte(
+            "api.eq.preampNotStandard",
+            &[
+                ("reserved", format!("{reserved:.1}")),
+                ("preamp", format!("{:.1}", profil.preamp_db)),
+            ],
         ));
+        corps["warning_key"] = json!("api.eq.preampNotStandard");
     }
+    corps
+}
+
+/// #6385 — `POST /eq/import/preview` : le fichier analysé, ses bandes et son
+/// compte rendu, SANS rien enregistrer. L'écran montre ainsi les bandes avant
+/// que l'utilisateur décide de les appliquer ; `POST /eq/import/autoeq` reste
+/// le geste qui crée le préréglage, inchangé pour les clients existants.
+async fn import_preview(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ImportAutoEqBody>,
+) -> Result<axum::response::Response, AppError> {
+    if let Some(refus) = portes_de_l_import(&state, &headers).await {
+        return Ok(refus);
+    }
+    let profil = match analyser_import(&body.text) {
+        Ok(p) => p,
+        Err(refus) => return Ok(refus),
+    };
+    let mut corps = compte_rendu_import(
+        &profil,
+        tune_core::audio::autoeq::format_du_fichier(&body.text),
+    );
+    corps["bands"] = json!(bandes_autoeq_json(&profil));
+    corps["name"] = json!(body.name);
+    Ok(Json(corps).into_response())
+}
+
+/// Analyse le fichier d'égaliseur et l'enregistre comme préréglage.
+fn enregistrer_profil_autoeq(
+    state: &AppState,
+    body: ImportAutoEqBody,
+) -> Result<axum::response::Response, AppError> {
+    let profil = match analyser_import(&body.text) {
+        Ok(p) => p,
+        Err(refus) => return Ok(refus),
+    };
+    let format = tune_core::audio::autoeq::format_du_fichier(&body.text);
+
+    let bands_json = bandes_autoeq_json(&profil);
+
+    let mut presets = load_presets(state);
+    let id = uuid::Uuid::new_v4().to_string();
+    let preset = json!({
+        "id": id,
+        "name": body.name.unwrap_or_else(|| "AutoEq".into()),
+        "eq_type": "parametric",
+        "zone_id": body.zone_id,
+        "bands": bands_json,
+        "created_at": epoch_secs(),
+        "source": if format == "opra" { "opra" } else { "autoeq" },
+    });
+    presets.push(preset.clone());
+    save_presets(state, &presets)?;
+
+    let mut corps = compte_rendu_import(&profil, format);
+    corps["preset"] = preset;
     Ok((StatusCode::CREATED, Json(corps)).into_response())
 }
 
@@ -819,6 +893,24 @@ async fn get_bands(State(state): State<AppState>) -> Json<Value> {
 
 // --- Advanced EQ routes ---
 
+/// Même sérialisation que la création manuelle, y compris le canal ciblé.
+fn bandes_autoeq_json(profil: &tune_core::audio::autoeq::ProfilAutoEq) -> Vec<Value> {
+    profil
+        .bandes
+        .iter()
+        .map(|b| {
+            EqBand {
+                freq: b.freq,
+                gain: b.gain,
+                q: Some(b.q),
+                band_type: b.band_type.clone(),
+                channel: b.channel,
+            }
+            .to_json()
+        })
+        .collect()
+}
+
 fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -828,7 +920,7 @@ fn epoch_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{EqBand, filtres_ignores_json, resolve_activation_zone};
+    use super::{EqBand, bandes_autoeq_json, filtres_ignores_json, resolve_activation_zone};
     use serde_json::json;
 
     #[test]
@@ -846,6 +938,26 @@ mod tests {
 
         let audio_band: tune_core::audio::eq::EqBandSpec = serde_json::from_value(stored).unwrap();
         assert_eq!(audio_band.channel, Some(1));
+    }
+
+    #[test]
+    fn import_7340_conserve_gauche_droite_et_global_dans_le_stockage() {
+        let profil = tune_core::audio::autoeq::analyser(
+            "Channel: L\nFilter 1: ON PK Fc 100 Hz Gain -3 dB Q 1\nChannel: R\nFilter 1: ON PK Fc 200 Hz Gain -4 dB Q 1\nChannel: all\nFilter 1: ON PK Fc 300 Hz Gain -2 dB Q 1\n"
+        ).unwrap();
+        let stockees = bandes_autoeq_json(&profil);
+        let relues: Vec<tune_core::audio::eq::EqBandSpec> = stockees
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        assert_eq!(
+            relues.iter().map(|b| b.channel).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), None]
+        );
+        assert_eq!(
+            relues.iter().map(|b| b.freq).collect::<Vec<_>>(),
+            vec![100.0, 200.0, 300.0]
+        );
     }
 
     #[test]
@@ -878,13 +990,7 @@ mod tests {
         )
         .expect("profil AutoEq valide");
 
-        // Exactement la forme que `import_autoeq` persiste.
-        let stocke = json!({
-            "freq": profil.bandes[0].freq,
-            "gain": profil.bandes[0].gain,
-            "q": profil.bandes[0].q,
-            "type": profil.bandes[0].band_type,
-        });
+        let stocke = bandes_autoeq_json(&profil).remove(0);
 
         let relue: tune_core::audio::eq::EqBandSpec =
             serde_json::from_value(stocke).expect("la bande stockee doit se relire");

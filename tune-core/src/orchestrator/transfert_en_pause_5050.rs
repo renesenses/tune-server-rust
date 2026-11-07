@@ -26,17 +26,42 @@
 //! le rétablissement n'aurait rien à rejouer, et le transfert garde
 //! l'ancienne conduite.
 use super::PlaybackOrchestrator;
-use crate::outputs::OutputCommandResult;
+use crate::outputs::OutputCommandError;
 use crate::playback::{NowPlaying, PlayState};
 use tracing::{info, warn};
+
+/// Le lancement de la cible peut échouer avant une commande de transport.
+/// Le distinguer garde les refus Pause/Seek existants sans inventer une
+/// commande « Play » dans le contrat des sorties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErreurDeTransfert {
+    Lancement(String),
+    Commande(OutputCommandError),
+}
+
+impl From<OutputCommandError> for ErreurDeTransfert {
+    fn from(erreur: OutputCommandError) -> Self {
+        Self::Commande(erreur)
+    }
+}
+impl std::fmt::Display for ErreurDeTransfert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lancement(message) => f.write_str(message),
+            Self::Commande(erreur) => std::fmt::Display::fmt(erreur, f),
+        }
+    }
+}
+impl std::error::Error for ErreurDeTransfert {}
 
 impl PlaybackOrchestrator {
     /// Lance un transfert sur l'appareil `did` de la zone cible.
     ///
     /// `queue_position` : l'index de la piste dans la file (déjà copiée).
     /// `source_position_ms` et `source_en_pause` : l'état de la source au
-    /// moment du transfert. Un échec de lancement n'est que journalisé (la
-    /// file est copiée, l'auditeur relance) ; un `Seek` refusé aussi.
+    /// moment du transfert. Un échec de lancement remonte à l'appelant :
+    /// celui-ci ne doit ni annoncer le transfert ni arrêter sa source.
+    /// Un Seek refusé garde la lecture de la cible depuis le début.
     pub async fn transferer_sur_l_appareil(
         &self,
         zone_id: i64,
@@ -45,7 +70,7 @@ impl PlaybackOrchestrator {
         np: &NowPlaying,
         source_position_ms: u64,
         source_en_pause: bool,
-    ) -> OutputCommandResult<()> {
+    ) -> Result<(), ErreurDeTransfert> {
         if source_en_pause
             && self
                 .poser_le_transfert_en_pause(zone_id, did, np, source_position_ms)
@@ -63,6 +88,16 @@ impl PlaybackOrchestrator {
         // #6466 (point 15) — la piste transférée a déjà son écoute, écrite
         // avec la zone d'origine : la relancer sur la cible ne la réécrit pas.
         // Les titres suivants, eux, s'écriront avec la zone cible.
+        // #7846 (fil 2648) — une sortie locale ou OAAT décode elle-même le
+        // flux : la piste y part UNE fois, directement à la position. Lancer
+        // à 0:00 puis chercher arrêtait et relançait le périphérique dans la
+        // même seconde (`replay_zone_at_position`), et le DAC USB restait muet
+        // jusqu'à Pause puis Lecture. Les renderers réseau gardent le
+        // lancement suivi du `Seek` d'après la pose (#4442).
+        let a_la_position = !direct
+            && source_position_ms > 3000
+            && np.source != "radio"
+            && (did.starts_with("local:") || did.starts_with("oaat:"));
         let lancement = if direct {
             self.play_transfere_sans_historique(super::PlayRequest {
                 zone_id,
@@ -77,12 +112,23 @@ impl PlaybackOrchestrator {
                 ..Default::default()
             })
             .await
-            .map(|_| ())
+        } else if a_la_position {
+            self.play_from_queue_transfere_a_la_position(
+                zone_id,
+                queue_position,
+                source_position_ms,
+            )
+            .await
         } else {
             self.play_from_queue_sans_historique(zone_id, queue_position)
                 .await
-                .map(|_| ())
         };
+        // `play` peut rendre Ok avec un refus porté par PlayResult : ne pas
+        // le perdre, pas plus qu'un Err (cible absente/ignorée, par exemple).
+        let lancement = lancement.and_then(|resultat| match resultat.sortie_refusee() {
+            Some(message) => Err(message.to_owned()),
+            None => Ok(()),
+        });
         match lancement {
             Ok(()) => {
                 // Reprendre à la position de la source. Sous 3 s on repart du
@@ -93,6 +139,7 @@ impl PlaybackOrchestrator {
                 // pas de position à reprendre.
                 if source_position_ms > 3000
                     && np.source != "radio"
+                    && !a_la_position
                     && let Err(error) = self
                         .reprendre_la_position_transferee(
                             zone_id,
@@ -107,7 +154,7 @@ impl PlaybackOrchestrator {
                     // déjà, depuis le début de la piste. Tout autre échec
                     // remonte.
                     if Self::message_deplacement_refuse(&error).is_none() {
-                        return Err(error);
+                        return Err(error.into());
                     }
                     warn!(
                         target_zone = zone_id,
@@ -125,6 +172,7 @@ impl PlaybackOrchestrator {
             }
             Err(e) => {
                 warn!(target_zone = zone_id, error = %e, "transfer_play_on_target_failed");
+                return Err(ErreurDeTransfert::Lancement(e));
             }
         }
         Ok(())

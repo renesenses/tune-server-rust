@@ -118,7 +118,8 @@ pub struct ProfilAutoEq {
     pub ignores: Vec<FiltreIgnore>,
 }
 
-/// Une ligne `Filter …` comprise mais qui ne produit pas de bande.
+/// Une ligne `Filter …` (ou l'en-tête `Device:` d'Equalizer APO) comprise
+/// mais qui ne produit pas de bande.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FiltreIgnore {
     /// Le numéro de la ligne dans le texte, à partir de 1 comme dans un
@@ -140,6 +141,10 @@ pub struct FiltreIgnore {
 pub enum RaisonIgnore {
     /// `Filter n: OFF` — le filtre est désactivé dans le fichier.
     Desactive,
+    /// #6385 — `Device: …` en tête d'une configuration Equalizer APO : le
+    /// périphérique Windows auquel APO l'appliquait. Tune applique le profil à
+    /// la zone choisie ; la ligne est écartée, et NOMMÉE.
+    Peripherique,
 }
 
 impl RaisonIgnore {
@@ -148,6 +153,7 @@ impl RaisonIgnore {
     pub fn cle(self) -> &'static str {
         match self {
             Self::Desactive => "disabled",
+            Self::Peripherique => "device_selection",
         }
     }
 }
@@ -156,23 +162,36 @@ impl std::fmt::Display for RaisonIgnore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Desactive => write!(f, "filtre désactivé dans le fichier (« OFF »)"),
+            Self::Peripherique => write!(
+                f,
+                "périphérique d'Equalizer APO (« Device: ») : le profil s'applique à la zone choisie"
+            ),
         }
     }
 }
 
 impl ProfilAutoEq {
-    /// La marge que Tune réservera pour ces bandes, en dB (négative ou nulle).
-    ///
-    /// C'est exactement ce que le chemin audio appliquera :
-    /// [`super::eq::EqProfile::automatic_headroom_db`] sur le même jeu de
-    /// bandes. Les bandes importées ne visant aucun canal en particulier, la
-    /// valeur est la même à gauche et à droite.
-    pub fn marge_reservee_db(&self) -> f64 {
+    /// Marges stéréo réellement réservées, gauche puis droite. Les directives
+    /// Channel de l'import stéréo ne doivent pas faire annoncer celle de gauche
+    /// comme si elle valait aussi à droite.
+    pub fn marges_reservees_db(&self) -> [f64; 2] {
         let profil = super::eq::EqProfile {
             bands: self.bandes.clone(),
             ..Default::default()
         };
-        profil.automatic_headroom_db(0)
+        [
+            profil.automatic_headroom_db(0),
+            profil.automatic_headroom_db(1),
+        ]
+    }
+
+    /// Atténuation minimale garantie sur les deux canaux (valeur la moins
+    /// négative). Inchangée pour les anciens profils globaux ; le détail par
+    /// canal est disponible dans marges_reservees_db.
+    pub fn marge_reservee_db(&self) -> f64 {
+        self.marges_reservees_db()
+            .into_iter()
+            .fold(f64::NEG_INFINITY, f64::max)
     }
 
     /// La marge de Tune est-elle au moins aussi protectrice que le `Preamp` ?
@@ -198,6 +217,10 @@ impl ProfilAutoEq {
 pub enum ErreurAutoEq {
     /// Aucune ligne `Filter … ON` exploitable.
     AucuneBande,
+    /// Une sélection stéréo inconnue ou vide.
+    CanauxInvalides { ligne: usize, valeur: String },
+    /// Le préampli par canal ne peut pas être représenté par ce profil.
+    PreampParCanal { ligne: usize },
     /// Une ligne qui n'est ni un `Preamp`, ni un `Filter`, ni un commentaire.
     LigneIncomprise { ligne: usize },
     /// `Filter n:` sans le `ON`/`OFF` qui doit suivre.
@@ -220,6 +243,59 @@ pub enum ErreurAutoEq {
         borne_basse: f64,
         borne_haute: f64,
     },
+    /// #6385 — un profil OPRA (JSON) mal formé, ou qui demande ce que
+    /// l'égaliseur ne joue pas. Un fichier JSON n'a pas de ligne utile à
+    /// montrer : l'erreur nomme la bande (à partir de 1) quand elle en vise
+    /// une, et porte la même clé stable que son équivalent texte.
+    Opra {
+        bande: Option<usize>,
+        cle: &'static str,
+        detail: String,
+    },
+}
+
+impl ErreurAutoEq {
+    /// La clé stable que porte la réponse HTTP (`code`), à traduire côté
+    /// client — sur le modèle de [`RaisonIgnore::cle`]. Une phrase française
+    /// figée par le serveur ne se traduit pas ; une clé, si.
+    pub fn cle(&self) -> &'static str {
+        match self {
+            Self::AucuneBande => "no_active_filter",
+            Self::CanauxInvalides { .. } => "unsupported_channel",
+            Self::PreampParCanal { .. } => "per_channel_preamp",
+            Self::LigneIncomprise { .. } => "unrecognized_line",
+            Self::EtatManquant { .. } => "missing_on_off",
+            Self::TypeInconnu { .. } => "unknown_filter_type",
+            Self::ChampManquant { .. } => "missing_field",
+            Self::NombreInvalide { .. } => "invalid_number",
+            Self::ValeurHorsDomaine { .. } => "value_out_of_range",
+            Self::Opra { cle, .. } => cle,
+        }
+    }
+
+    /// La ligne fautive du texte (à partir de 1), quand l'erreur en vise une.
+    pub fn ligne(&self) -> Option<usize> {
+        match self {
+            Self::AucuneBande | Self::Opra { .. } => None,
+            Self::CanauxInvalides { ligne, .. }
+            | Self::PreampParCanal { ligne }
+            | Self::LigneIncomprise { ligne }
+            | Self::EtatManquant { ligne }
+            | Self::TypeInconnu { ligne, .. }
+            | Self::ChampManquant { ligne, .. }
+            | Self::NombreInvalide { ligne, .. }
+            | Self::ValeurHorsDomaine { ligne, .. } => Some(*ligne),
+        }
+    }
+
+    /// La bande fautive d'un profil OPRA (à partir de 1), quand l'erreur en
+    /// vise une.
+    pub fn bande(&self) -> Option<usize> {
+        match self {
+            Self::Opra { bande, .. } => *bande,
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ErreurAutoEq {
@@ -227,11 +303,19 @@ impl std::fmt::Display for ErreurAutoEq {
         match self {
             Self::AucuneBande => write!(
                 f,
-                "aucun filtre actif : ce texte n'est pas un profil AutoEq au format ParametricEQ"
+                "aucun filtre actif : ce fichier n'est ni un profil AutoEq ParametricEQ, ni une configuration Equalizer APO, ni un profil OPRA"
+            ),
+            Self::CanauxInvalides { ligne, valeur } => write!(
+                f,
+                "ligne {ligne} : Channel « {valeur} » non pris en charge (attendu L, R, 1, 2 ou all, séparés par des espaces)"
+            ),
+            Self::PreampParCanal { ligne } => write!(
+                f,
+                "ligne {ligne} : Preamp par canal non pris en charge ; aucun profil n'a été importé"
             ),
             Self::LigneIncomprise { ligne } => write!(
                 f,
-                "ligne {ligne} : attendu « Preamp: … » ou « Filter n: … »"
+                "ligne {ligne} : attendu « Preamp: … », « Channel: … » ou « Filter n: … »"
             ),
             Self::EtatManquant { ligne } => {
                 write!(
@@ -241,7 +325,7 @@ impl std::fmt::Display for ErreurAutoEq {
             }
             Self::TypeInconnu { ligne, type_filtre } => write!(
                 f,
-                "ligne {ligne} : type de filtre « {type_filtre} » inconnu (attendu PK, LS, LSC, LSQ, HS, HSC ou HSQ)"
+                "ligne {ligne} : type de filtre « {type_filtre} » inconnu (attendu PK, PEQ, LS, LSC, LSQ, HS, HSC, HSQ, LP, LPQ, HP, HPQ ou NO)"
             ),
             Self::ChampManquant { ligne, champ } => {
                 write!(f, "ligne {ligne} : champ « {champ} » absent")
@@ -264,6 +348,16 @@ impl std::fmt::Display for ErreurAutoEq {
                 f,
                 "ligne {ligne} : « {champ} » vaut {valeur}, hors du domaine reproductible [{borne_basse} ; {borne_haute}]"
             ),
+            Self::Opra {
+                bande: Some(bande),
+                detail,
+                ..
+            } => write!(f, "profil OPRA, bande {bande} : {detail}"),
+            Self::Opra {
+                bande: None,
+                detail,
+                ..
+            } => write!(f, "profil OPRA : {detail}"),
         }
     }
 }
@@ -275,20 +369,49 @@ impl std::error::Error for ErreurAutoEq {}
 /// Elles sont recopiées ici pour REFUSER ce qui les dépasse plutôt que de le
 /// rogner en silence : un fichier qui demande +40 dB ne serait pas reproduit,
 /// et l'utilisateur mérite de l'apprendre à l'import, pas à l'oreille.
-const GAIN_MAX_DB: f64 = 24.0;
-const Q_MIN: f64 = 0.1;
-const Q_MAX: f64 = 30.0;
+pub(crate) const GAIN_MAX_DB: f64 = 24.0;
+pub(crate) const Q_MIN: f64 = 0.1;
+pub(crate) const Q_MAX: f64 = 30.0;
 /// Au-delà, aucune fréquence d'échantillonnage ne place le filtre sous Nyquist.
-const FREQ_MAX_HZ: f64 = 192_000.0;
+pub(crate) const FREQ_MAX_HZ: f64 = 192_000.0;
+
+/// #6385 — le format d'un fichier d'égaliseur importé, reconnu à son contenu.
+///
+/// Un profil OPRA est un objet JSON ; AutoEq ParametricEQ et Equalizer APO
+/// partagent la même grammaire texte, lue par [`analyser`].
+pub fn format_du_fichier(texte: &str) -> &'static str {
+    if texte.trim_start().starts_with('{') {
+        "opra"
+    } else {
+        "parametric_eq"
+    }
+}
+
+/// #6385 — analyse un fichier d'égaliseur, quel que soit son format :
+/// AutoEq ParametricEQ, Equalizer APO ([`analyser`]) ou OPRA
+/// ([`super::opra::analyser`]).
+pub fn analyser_fichier(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
+    match format_du_fichier(texte) {
+        "opra" => super::opra::analyser(texte),
+        _ => analyser(texte),
+    }
+}
 
 /// Analyse un profil AutoEq au format ParametricEQ.
 ///
 /// Accepte les fins de ligne `\n` et `\r\n`, les lignes vides, et les
-/// commentaires `#`. Tout le reste doit être une ligne `Preamp` ou `Filter`.
+/// commentaires `#`, Preamp, Filter et les sélections stéréo Channel L/R/all,
+/// ainsi qu'UNE ligne `Device:` en tête d'une configuration Equalizer APO
+/// (écartée et nommée, #6385). Un second `Device:`, ou un `Device:` après un
+/// réglage, découperait le fichier par périphérique : il reste refusé. Les
+/// autres configurations APO restent refusées, jamais ignorées.
 pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
     let mut preamp_db = 0.0;
     let mut bandes = Vec::new();
     let mut ignores: Vec<FiltreIgnore> = Vec::new();
+    let mut canaux: Option<Vec<u16>> = None;
+    // Vrai dès qu'une ligne utile (ou un premier `Device:`) a été lue.
+    let mut entete_passee = false;
 
     for (index, brute) in texte.lines().enumerate() {
         let ligne = index + 1;
@@ -298,11 +421,39 @@ pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
         }
 
         let minuscules = contenu.to_ascii_lowercase();
-        if minuscules.starts_with("preamp") {
+        let commande = contenu.split_once(':').map(|(c, _)| c.trim());
+        if commande.is_some_and(|c| c.eq_ignore_ascii_case("device")) && !entete_passee {
+            entete_passee = true;
+            ignores.push(FiltreIgnore {
+                ligne,
+                type_filtre: None,
+                raison: RaisonIgnore::Peripherique,
+            });
+            continue;
+        }
+        entete_passee = true;
+        if let Some((commande, valeur)) = contenu.split_once(':')
+            && commande.trim().eq_ignore_ascii_case("channel")
+        {
+            canaux = analyser_canaux(valeur, ligne)?;
+        } else if minuscules.starts_with("preamp") {
+            if canaux.is_some() {
+                return Err(ErreurAutoEq::PreampParCanal { ligne });
+            }
             preamp_db = analyser_preamp(contenu, ligne)?;
         } else if minuscules.starts_with("filter") {
             match analyser_filtre(contenu, ligne)? {
-                Ok(bande) => bandes.push(bande),
+                Ok(bande) => {
+                    if let Some(canaux) = &canaux {
+                        for &canal in canaux {
+                            let mut ciblee = bande.clone();
+                            ciblee.channel = Some(canal);
+                            bandes.push(ciblee);
+                        }
+                    } else {
+                        bandes.push(bande);
+                    }
+                }
                 // Écarté, mais NOMMÉ : voir `ProfilAutoEq::ignores`.
                 Err(ignore) => ignores.push(ignore),
             }
@@ -320,6 +471,38 @@ pub fn analyser(texte: &str) -> Result<ProfilAutoEq, ErreurAutoEq> {
         bandes,
         ignores,
     })
+}
+
+/// APO utilise des positions à partir de 1 ; EqBandSpec utilise des indices
+/// à partir de 0. Seuls les identifiants stéréo non ambigus sont acceptés ici.
+fn analyser_canaux(valeur: &str, ligne: usize) -> Result<Option<Vec<u16>>, ErreurAutoEq> {
+    let valeur = valeur.split('#').next().unwrap_or("").trim();
+    if valeur.eq_ignore_ascii_case("all") {
+        return Ok(None);
+    }
+    let mut canaux = Vec::new();
+    for mot in valeur.split_whitespace() {
+        let canal = match mot.to_ascii_uppercase().as_str() {
+            "L" | "1" => 0,
+            "R" | "2" => 1,
+            _ => {
+                return Err(ErreurAutoEq::CanauxInvalides {
+                    ligne,
+                    valeur: valeur.into(),
+                });
+            }
+        };
+        if !canaux.contains(&canal) {
+            canaux.push(canal);
+        }
+    }
+    if canaux.is_empty() {
+        return Err(ErreurAutoEq::CanauxInvalides {
+            ligne,
+            valeur: valeur.into(),
+        });
+    }
+    Ok(Some(canaux))
 }
 
 /// `Preamp: -6.1 dB` → `-6.1`.

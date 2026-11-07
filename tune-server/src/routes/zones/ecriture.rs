@@ -39,11 +39,13 @@ pub(super) fn echec_ecriture(
         erreur = %erreur,
         "zone_patch_write_failed"
     );
-    (
+    crate::message_api::refus_avec_cause(
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("écriture impossible du champ « {champ} » : {erreur}"),
+        "zone_field_write_failed",
+        "api.zones.fieldWriteFailed",
+        &[("field", champ.to_string())],
+        erreur,
     )
-        .into_response()
 }
 
 /// La requête elle-même est fautive : **journaliser**, puis 400.
@@ -58,11 +60,13 @@ pub(super) fn refus_de_valeur(
     raison: &str,
 ) -> axum::response::Response {
     warn!(zone_id, champ, valeur, raison, "zone_patch_rejected");
-    (
+    crate::message_api::refus_avec_cause(
         StatusCode::BAD_REQUEST,
-        format!("champ « {champ} » : {raison} (reçu : « {valeur} »)"),
+        "zone_field_invalid",
+        "api.zones.fieldInvalid",
+        &[("field", champ.to_string()), ("value", valeur.to_string())],
+        raison,
     )
-        .into_response()
 }
 
 pub(super) async fn patch_zone(
@@ -107,6 +111,17 @@ pub(super) async fn patch_zone(
         persister_le_patch(&state, &repo, id, &zone_before, command_device_id, &body).await
     {
         return reponse;
+    }
+    // #7133 — la zone a changé d'appareil : celui qu'elle quitte se tait,
+    // sans quoi il continue de jouer à côté du nouveau.
+    if let Some(ref nouvelle) = body.output_device_id {
+        couper_l_ancienne_sortie(
+            &state,
+            id,
+            zone_before.output_device_id.as_deref(),
+            Some(nouvelle),
+        )
+        .await;
     }
 
     if body.brand.is_some() || body.model.is_some() {
@@ -1008,16 +1023,18 @@ pub(super) async fn create_zone(
             output_type = ?output_type,
             "create_zone_sans_appareil_refuse"
         );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "detail": format!(
-                    "zone_sans_appareil:La zone « {} » n'aurait aucune sortie : choisissez un appareil découvert avant de la créer.",
-                    body.name
-                )
-            })),
-        )
-            .into_response();
+        // `detail` garde sa forme historique `zone_sans_appareil:<phrase>`,
+        // que lisaient les clients d'avant ; la phrase est désormais traduite.
+        let mut corps = crate::message_api::corps_refus(
+            "zone_sans_appareil",
+            "api.zones.noOutputDevice",
+            &[("name", body.name.clone())],
+        );
+        corps["detail"] = json!(format!(
+            "zone_sans_appareil:{}",
+            corps["message"].as_str().unwrap_or_default()
+        ));
+        return (StatusCode::BAD_REQUEST, Json(corps)).into_response();
     }
 
     // If device already has a zone (visible OR hidden), return it (no premium check needed).
@@ -1041,6 +1058,10 @@ pub(super) async fn create_zone(
                     // nulle part et croira l'avoir créée.
                     return echec_ecriture(id, "is_hidden", "0", e);
                 }
+                // #7937 — la zone recréée n'hérite d'aucun groupe. Sa
+                // suppression l'en retire désormais ; ceci répare celles
+                // supprimées avant ce correctif.
+                sortir_la_zone_recreee_des_groupes(&state, id);
                 if let Some(ref ot) = body.output_type {
                     let _ = repo.update_output_type(id, ot);
                 }
@@ -1229,6 +1250,7 @@ pub(super) async fn create_zone(
             if let Err(e) = repo.unhide(id) {
                 return echec_ecriture(id, "is_hidden", "0", e);
             }
+            sortir_la_zone_recreee_des_groupes(&state, id);
             if let Err(e) = repo.update_name(id, &body.name) {
                 return echec_ecriture(id, "name", &body.name, e);
             }
@@ -1291,6 +1313,26 @@ pub(super) async fn delete_all_zones(State(state): State<AppState>) -> impl Into
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// #7937 — une zone ressuscitée par `POST /zones` (même appareil, même
+/// numéro) repart sans groupe de lecture. Un échec d'écriture est journalisé
+/// et ne fait pas échouer la création : la zone est bien revenue.
+fn sortir_la_zone_recreee_des_groupes(state: &AppState, id: i64) {
+    match tune_core::zones::groupes_enregistres::retirer_des_groupes_enregistres(
+        &state.backend,
+        &[id],
+    ) {
+        Ok(true) => {
+            info!(zone_id = id, "zone_recreee_retiree_de_son_ancien_groupe");
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::GroupUpdated,
+                json!({ "zone_id": id }),
+            );
+        }
+        Ok(false) => {}
+        Err(e) => warn!(zone_id = id, error = %e, "zone_recreee_groupes_non_reecrits"),
     }
 }
 
@@ -1399,7 +1441,11 @@ pub(super) async fn fusionner_zones(
     if doublon == cible {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "meme_zone", "message": "une zone ne se fusionne pas dans elle-même"})),
+            Json(crate::message_api::corps_refus(
+                "meme_zone",
+                "api.zones.mergeSelf",
+                &[],
+            )),
         )
             .into_response();
     }
@@ -1418,11 +1464,15 @@ pub(super) async fn fusionner_zones(
     if cle_doublon.is_none() || cle_doublon != cle_cible {
         return (
             StatusCode::CONFLICT,
-            Json(json!({
-                "error": "zones_distinctes",
-                "message": "les deux zones ne désignent pas le même appareil : la fusion est refusée",
-                "cles": [cle_doublon, cle_cible],
-            })),
+            Json(crate::message_api::avec_message(
+                json!({
+                    "error": "zones_distinctes",
+                    "code": "zones_distinctes",
+                    "cles": [cle_doublon, cle_cible],
+                }),
+                "api.zones.mergeDifferentDevices",
+                &[],
+            )),
         )
             .into_response();
     }
@@ -1466,19 +1516,44 @@ pub(super) async fn update_volume(
     // #1274 — l'arbitrage `volume` / `volume_db` et la conversion des dB
     // vivent dans `volume_scale`, pas ici. Cette route ne fait que ramener sa
     // convention historique sur 0..1 avant de la lui passer.
-    let volume_f = match tune_core::audio::volume_scale::demande_lineaire(lineaire, body.volume_db)
-    {
-        Ok(v) => v,
-        Err(motif) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_volume", "message": motif })),
-            )
-                .into_response();
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let zone = repo.get(id).ok().flatten();
+    // #6918 — la course en dB de la sortie, si elle en a une.
+    let course = tune_core::audio::volume_appareil_db::course_de_la_sortie(
+        &state.backend,
+        zone.as_ref().and_then(|z| z.output_type.as_deref()),
+    );
+    let volume_f = if let Some(device_db) = body.device_volume_db {
+        // #6918 — des dB d'appareil ramenés à la fraction, qui suit ensuite
+        // le chemin de toute consigne : limites #6541, garde #6721, trim.
+        match tune_core::audio::volume_appareil_db::demande_de_la_requete(
+            course,
+            lineaire,
+            body.volume_db,
+            device_db,
+        ) {
+            Ok(v) => v,
+            Err(motif) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_device_volume_db", "message": motif })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match tune_core::audio::volume_scale::demande_lineaire(lineaire, body.volume_db) {
+            Ok(v) => v,
+            Err(motif) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_volume", "message": motif })),
+                )
+                    .into_response();
+            }
         }
     };
-    let repo = ZoneRepo::with_backend(state.backend.clone());
-    let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
+    let device_id = zone.and_then(|z| z.output_device_id);
     // #1274 — la consigne en dB doit avoir un endroit où arriver. Si la
     // sortie de la zone ne parle au périphérique qu'en entiers, un dB sous son
     // premier pas ne baisse pas le son : il l'éteint. On le refuse en le
@@ -1519,6 +1594,7 @@ pub(super) async fn update_volume(
                     tune_core::audio::volume_scale::echelle_de_la_zone(&state.backend, id).code()
                 ),
             );
+            tune_core::audio::volume_appareil_db::inserer(&mut corps, course, retenu.retenu);
             (StatusCode::OK, Json(serde_json::Value::Object(corps))).into_response()
         }
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -1558,5 +1634,64 @@ pub(super) async fn rename_zone(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod teac_7371 {
+    use super::*;
+
+    #[tokio::test]
+    async fn la_zone_demandee_en_dlna_reste_attachee_a_la_sortie_dlna() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let airplay = repo
+            .create("TEAC NT-505X", Some("airplay"), Some("airplay-teac"))
+            .unwrap();
+        repo.set_host(airplay, "192.0.2.50").unwrap();
+        let dlna = tune_core::outputs::dlna::DlnaOutput::new(
+            "TEAC NT-505X".into(),
+            "uuid:teac-dlna".into(),
+            "192.0.2.50".into(),
+            "http://192.0.2.50/av".into(),
+            "http://192.0.2.50/rc".into(),
+            None,
+        );
+        state.outputs.lock().await.register(Box::new(dlna));
+        let response = create_zone(
+            State(state.clone()),
+            Json(CreateZone {
+                name: "TEAC DLNA".into(),
+                output_type: Some("dlna".into()),
+                output_device_id: Some("uuid:teac-dlna".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert!(response.status().is_success());
+        let zone = repo
+            .get_by_device_id("uuid:teac-dlna")
+            .unwrap()
+            .expect("la zone DLNA demandée doit exister");
+        assert_ne!(zone.id, Some(airplay));
+        assert_eq!(zone.output_type.as_deref(), Some("dlna"));
+        assert_eq!(
+            state
+                .outputs
+                .lock()
+                .await
+                .type_of(zone.output_device_id.as_deref().unwrap())
+                .as_deref(),
+            Some("dlna"),
+            "le routage de cette zone doit résoudre la sortie DLNA"
+        );
+        assert_eq!(
+            repo.get(airplay)
+                .unwrap()
+                .unwrap()
+                .output_device_id
+                .as_deref(),
+            Some("airplay-teac")
+        );
     }
 }

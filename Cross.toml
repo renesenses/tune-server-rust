@@ -129,6 +129,8 @@ pre-build = [
 passthrough = [
     "PKG_CONFIG_ALLOW_CROSS=1",
     "TUNE_VERSION",
+    # #7148 — le SHA du commit construit, que la sentinelle de streaming publie.
+    "TUNE_GIT_SHA",
 ]
 [target.aarch64-unknown-linux-musl.env]
 passthrough = [
@@ -144,4 +146,5 @@ passthrough = [
     "CMAKE_POLICY_VERSION_MINIMUM=3.5",
     # Cf. la cible gnu ci-dessus : la version du tag, pas celle de Cargo.toml.
     "TUNE_VERSION",
+    "TUNE_GIT_SHA",
 ]

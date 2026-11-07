@@ -113,7 +113,7 @@ impl SourceLinkRepo {
         let sql = self.dialect_sql(sql::get_by_track, sql::get_by_track);
         let params: [&dyn ToSqlValue; 1] = [&track_id];
         let rows = self.db.query_many(&sql, &params)?;
-        rows.iter().map(row_to_link).collect()
+        rows.iter().map(|cols| row_to_link(cols)).collect()
     }
 
     pub fn count_by_service(&self, service: &str) -> Result<i64, String> {
@@ -126,7 +126,7 @@ impl SourceLinkRepo {
     }
 }
 
-fn row_to_link(cols: &Vec<super::backend::SqlValue>) -> Result<SourceLink, String> {
+fn row_to_link(cols: &[super::backend::SqlValue]) -> Result<SourceLink, String> {
     if cols.len() < 7 {
         return Err(format!(
             "source_link row: expected 7 cols, got {}",

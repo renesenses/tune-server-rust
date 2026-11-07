@@ -99,12 +99,19 @@ pub fn build_track_from_metadata_opts(
         .as_deref()
         .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME);
 
+    // #7933 — même règle que le scan complet (#3179) : ARTIST désigne la
+    // piste, et le MBID d'un invité ne devient pas celui de l'artiste d'album.
+    let artiste_de_piste_tague = crate::scan_import::artiste_de_piste_tague(meta);
+    let meme_artiste = tune_core::db::artist_repo::cle_artiste(album_artist_name)
+        == tune_core::db::artist_repo::cle_artiste(track_artist_name);
+
     let album_artist_mbid = if is_compilation || artiste_d_album_neutre {
         None
     } else {
-        meta.musicbrainz_album_artist_id
+        meta.musicbrainz_album_artist_id.as_deref().or(meta
+            .musicbrainz_artist_id
             .as_deref()
-            .or(meta.musicbrainz_artist_id.as_deref())
+            .filter(|_| meme_artiste))
     };
     let album_artist_entry = match artist_repo.get_or_create(
         album_artist_name,
@@ -144,7 +151,7 @@ pub fn build_track_from_metadata_opts(
     };
     let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
-    let track_artist = if (is_compilation || artiste_d_album_neutre)
+    let track_artist = if (is_compilation || artiste_d_album_neutre || artiste_de_piste_tague)
         && track_artist_name != album_artist_name
     {
         match artist_repo.get_or_create(
@@ -707,7 +714,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // Lignes posées par un importateur que ce lot reprend (#2939).
                 let mut a_adopter: Vec<i64> = Vec::new();
                 let mut exemplaires_du_lot =
-                    crate::routes::system::scan::ExemplairesDuLot::default();
+                    crate::routes::system::scan::ExemplairesDuLot::pour(&*db);
 
                 // #5202 — relues HORS transaction, sous délai : un fichier qui
                 // ne rend pas la main est sauté et journalisé, il ne fige plus
@@ -965,6 +972,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                             Ok(()) => {
                                 ecritures = ecritures.avec_dr_des_rapports_voisins(
                                     meta_entries.iter().map(|(_, m)| m),
+                                );
+                                // #7766 — sœur exacte du scan manuel : les
+                                // crédits des balises, source `balises`.
+                                tune_core::metadata::credits_balises::ecrire_lot(
+                                    &db,
+                                    &meta_entries,
                                 );
                             }
                             Err(e) => {
@@ -1419,8 +1432,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         );
 
         // Import any playlist files (.m3u/.m3u8/.pls) found in the library as
-        // local playlists — same as the manual scan (Bertrand). Idempotent by
-        // playlist name, so the startup scan re-running never duplicates them.
+        // local playlists — same as the manual scan (Bertrand). A file already
+        // imported and unchanged is skipped, even if its playlist was deleted
+        // (#7723), so the startup scan re-running never brings it back.
         let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &music_dirs);
         if pl.playlists_created > 0 {
             event_bus.emit(
@@ -1579,7 +1593,28 @@ fn scan_de_demarrage_arrete(event_bus: &EventBus, etape: &str) {
 /// demande (`auto_scan`), et aussi, seule exception, quand une mise à jour
 /// forcée a arrêté un scan : il reprend alors en incrémental
 /// (`file_needs_scan` saute les fichiers inchangés).
+///
+/// #7169 — sauf si l'utilisateur a éteint « Analyser la bibliothèque au
+/// démarrage » : son choix explicite prime sur la reprise. Le repère est
+/// alors levé, sans quoi il relancerait le scan à chaque démarrage (seul un
+/// scan allé au bout l'efface).
 pub fn scan_au_demarrage(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    if choix_utilisateur_lu(db) == Some(false) {
+        if crate::routes::system::scan::reprise_du_scan_demandee(db) {
+            info!(
+                "auto_scan_reprise_abandonnee — « library_scan_on_startup » vaut false : le scan arrêté par une mise à jour n'est pas repris"
+            );
+            crate::routes::system::scan::effacer_reprise_du_scan(db);
+        }
+        if auto_scan {
+            info!(
+                voulu = false,
+                deploiement = auto_scan,
+                "auto_scan_regle_par_l_utilisateur — le réglage « library_scan_on_startup » prime sur la configuration de déploiement"
+            );
+        }
+        return false;
+    }
     let voulu = scan_au_demarrage_voulu(auto_scan, db);
     if voulu != auto_scan {
         info!(
@@ -1621,11 +1656,16 @@ pub fn choix_utilisateur_scan_au_demarrage(brut: Option<&str>) -> Option<bool> {
 /// Le scan de démarrage voulu, selon l'ordre de précédence de
 /// [`CLE_SCAN_AU_DEMARRAGE`]. `auto_scan` est la valeur de déploiement.
 pub fn scan_au_demarrage_voulu(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    choix_utilisateur_lu(db).unwrap_or(auto_scan)
+}
+
+/// Le choix de l'utilisateur tel que rangé dans `settings`.
+fn choix_utilisateur_lu(db: &Arc<dyn DbBackend>) -> Option<bool> {
     let brut = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
         .get(CLE_SCAN_AU_DEMARRAGE)
         .ok()
         .flatten();
-    choix_utilisateur_scan_au_demarrage(brut.as_deref()).unwrap_or(auto_scan)
+    choix_utilisateur_scan_au_demarrage(brut.as_deref())
 }
 
 /// Le scan voulu, ou la reprise d'un scan arrêté par une mise à jour (#5531).
@@ -2347,6 +2387,13 @@ pub(crate) fn reimporter_fichier_surveillant(
             let candidates = track_repo
                 .paths_by_audio_hash_and_album(hash, aid)
                 .unwrap_or_default();
+            // #6917 — la règle du scan : option allumée, une copie d'une
+            // AUTRE racine entre comme sa propre piste.
+            let candidates = tune_core::library::dedoublonnage_par_racine::candidats_repliables(
+                &sf.path,
+                candidates,
+                tune_core::library::dedoublonnage_par_racine::racines_si_active(&**db).as_deref(),
+            );
             if let Some(existing_path) = tune_core::scanner::hasher::find_byte_identical_path(
                 std::path::Path::new(&sf.path),
                 &candidates,
@@ -2482,7 +2529,10 @@ pub(crate) fn reimporter_fichier_surveillant(
                     _ => return Err("la relecture des crédits a échoué".to_string()),
                 };
                 tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone())
-                    .set_batch(id, &ext)
+                    .set_batch(id, &ext)?;
+                // #7766 — les crédits des balises, comme les deux scans.
+                tune_core::metadata::credits_balises::ecrire_lot(db, &[(id, ext)]);
+                Ok(())
             })();
             if let Err(e) = metadonnees {
                 tracing::warn!(path = %sf.path, error = %e, "watcher_extended_metadata_failed");
@@ -3894,3 +3944,11 @@ mod scan_au_demarrage_reglage_tests;
 #[cfg(test)]
 #[path = "surveillant_artiste_generique_tests_1881.rs"]
 mod surveillant_artiste_generique_tests_1881;
+
+#[cfg(test)]
+#[path = "surveillant_artiste_de_piste_tests_7933.rs"]
+mod surveillant_artiste_de_piste_tests_7933;
+
+#[cfg(test)]
+#[path = "scan_artiste_montage_tests_6737.rs"]
+mod scan_artiste_montage_tests_6737;

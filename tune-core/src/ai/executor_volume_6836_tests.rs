@@ -103,6 +103,43 @@ async fn un_saut_de_20_a_100_pour_cent_est_refuse() {
     assert_eq!(r["error"], "volume_raise_too_large", "{r}");
 }
 
+/// Le plein volume doit rester inaccessible même quand il tient dans le
+/// pas autorisé. DLNA/OpenHome arrondissent aussi 0,995 à SetVolume 100.
+#[tokio::test]
+async fn le_plein_volume_ne_part_pas_meme_dans_un_petit_pas() {
+    for (initial, pas) in [
+        (0.97, None),
+        (0.98, None),
+        (0.99, None),
+        (0.90, Some("0.10")),
+        (0.20, Some("1.0")),
+    ] {
+        for demande in [0.995, 0.999, 1.0] {
+            let (mut ex, orch, zone_id) = banc(initial).await;
+            let s = SettingsRepo::with_backend(ex.db.clone());
+            s.set(&format!("zone_{zone_id}_volume_limit_safety"), "1.0")
+                .unwrap();
+            s.set(&format!("zone_{zone_id}_volume_limit_comfort"), "1.0")
+                .unwrap();
+            if let Some(pas) = pas {
+                s.set(REGLAGE_HAUSSE_MAXIMALE, pas).unwrap();
+            }
+            let r = demander(&mut ex, json!({ "volume": demande })).await;
+            let envoyes = recus(&orch).await;
+            assert!(
+                envoyes.iter().all(|v| (v * 100.0).round() < 100.0),
+                "#6836 : commande de plein volume 100 envoyée depuis {initial} \
+                 pour {demande}, pas {pas:?} : {envoyes:?}, réponse {r}"
+            );
+            assert!(
+                r["error"].is_string() && envoyes.is_empty(),
+                "une demande de plein volume doit être refusée sans commande : {r}, {envoyes:?}"
+            );
+            assert_eq!(ex.playback.get_state(zone_id).await.volume, initial);
+        }
+    }
+}
+
 /// Une hausse dans le pas passe ; une baisse passe toujours, même grande.
 #[tokio::test]
 async fn une_petite_hausse_et_toute_baisse_passent() {
@@ -178,4 +215,30 @@ async fn limites_pure_et_volume_fixe_s_appliquent_toujours() {
         "volume fixe : rien n'est envoyé"
     );
     assert_eq!(ex.playback.get_state(zone_id).await.volume, 1.0);
+}
+
+#[tokio::test]
+async fn un_volume_absent_ne_devient_pas_50_meme_si_le_pas_le_permet_6836() {
+    let (mut ex, orch, zone_id) = banc(0.48).await;
+    let r = demander(&mut ex, json!({})).await;
+    let envoyes = recus(&orch).await;
+    assert!(
+        envoyes.is_empty(),
+        "#6836 : argument absent devenu commande par défaut à 50 % : {envoyes:?}, {r}"
+    );
+    assert_eq!(r["error"], "invalid_volume", "{r}");
+    assert_eq!(ex.playback.get_state(zone_id).await.volume, 0.48);
+}
+
+#[tokio::test]
+async fn un_pas_de_quatre_points_ne_part_pas_6836() {
+    let (mut ex, orch, zone_id) = banc(0.20).await;
+    let r = demander(&mut ex, json!({"volume":0.24})).await;
+    let envoyes = recus(&orch).await;
+    assert!(
+        envoyes.is_empty(),
+        "#6836 : hausse de quatre points envoyée au-delà du pas de trois : {envoyes:?}, {r}"
+    );
+    assert_eq!(r["error"], "volume_raise_too_large", "{r}");
+    assert_eq!(ex.playback.get_state(zone_id).await.volume, 0.20);
 }

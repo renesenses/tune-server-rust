@@ -169,7 +169,7 @@ impl EmetteurRaop {
 }
 
 impl SortieRtp for EmetteurRaop {
-    async fn envoyer(&self, pkt: &[u8]) {
+    async fn envoyer(&self, pkt: &[u8]) -> Result<(), String> {
         if pkt.len() >= RTP_HEADER_SIZE
             && let Some(controle) = &self.controle
         {
@@ -186,9 +186,11 @@ impl SortieRtp for EmetteurRaop {
             }
             controle.historique.garder(sequence, pkt);
         }
-        if let Err(e) = self.audio.send(pkt).await {
-            debug!(error = %e, "airplay_rtp_send_error");
-        }
+        self.audio
+            .send(pkt)
+            .await
+            .map_err(|e| format!("AirPlay : envoi audio RTP interrompu : {e}"))?;
+        Ok(())
     }
 }
 

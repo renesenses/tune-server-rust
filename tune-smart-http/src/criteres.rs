@@ -50,6 +50,9 @@ pub(crate) enum Famille {
     /// Un marquage du SERVICE, oui ou non, sans valeur à saisir — #5530,
     /// « généré par IA » (Qobuz).
     Marquage,
+    /// #6285 — un verdict hi-res choisi dans une liste fermée : `verifie`,
+    /// `conforme`, `douteux`, `non_analyse`.
+    VerdictHiRes,
 }
 
 impl Famille {
@@ -81,6 +84,7 @@ impl Famille {
             // « non » d'abord : c'est la règle demandée (« pas d'IA »), et
             // l'éditeur part sur le premier opérateur.
             Famille::Marquage => &["is_false", "is_true"],
+            Famille::VerdictHiRes => &["=", "!="],
         }
     }
 }
@@ -175,6 +179,9 @@ pub(crate) const CRITERES: &[Critere] = &[
     // la piste. Seuls les contenus de SERVICE le portent : une piste de la
     // bibliothèque n'est jamais marquée.
     deux("ai_generated", Famille::Marquage),
+    // #6285 — « Verdict hi-res » : celui du badge de l'album dans une
+    // collection, celui de la piste dans une playlist (`hires_verifications`).
+    deux("hires_verdict", Famille::VerdictHiRes),
     // --- Propres aux PISTES ---
     Critere {
         collection: None,
@@ -210,6 +217,7 @@ impl Famille {
             Famille::Favori => "favorite",
             Famille::Etiquette => "tag_ref",
             Famille::Marquage => "marquage",
+            Famille::VerdictHiRes => "hires_verdict",
         }
     }
 }
@@ -277,6 +285,7 @@ pub(crate) mod tests {
             (Famille::Favori, _) => json!("track"),
             (Famille::Etiquette, _) => json!("7"),
             (Famille::Marquage, _) => Value::Null,
+            (Famille::VerdictHiRes, _) => json!("verifie"),
             (Famille::Texte | Famille::Vide, _) => json!("x"),
         }
     }
@@ -290,6 +299,10 @@ pub(crate) mod tests {
     /// | 2 `So What` | 1 | 1 | 1 écoute, 2019-03 |
     /// | 3 `Giant Steps` | 2 Giant Steps (1, Atlantic, non) | 2 Coltrane | album étiqueté 8 ; fichier 2019-01 |
     /// | 4 `Solo` | 3 Seul (1, —, non) | 3 Autre | artiste étiqueté 9 ; genre Rock |
+    ///
+    /// Les écoutes sont écrites comme en production : titre et interprète,
+    /// `track_id` vide (#7769). Le remplir cachait que les règles d'écoutes
+    /// ne retenaient rien.
     pub(crate) fn bibliotheque() -> SqliteDb {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
@@ -311,11 +324,11 @@ pub(crate) mod tests {
              INSERT INTO album_ratings (album_id, profile_id, rating) VALUES \
                (1,1,5),(2,1,2),(2,2,5); \
              INSERT INTO track_credits (track_id, artist_name, role) VALUES (1,'Teo Macero','producer'); \
-             INSERT INTO listen_history (track_id, title, listened_at) VALUES \
-               (1,'Blue in Green','2024-06-01T10:00:00Z'), \
-               (1,'Blue in Green','2024-06-02T10:00:00Z'), \
-               (1,'Blue in Green','2024-06-03T10:00:00Z'), \
-               (2,'So What','2019-03-01T10:00:00Z');",
+             INSERT INTO listen_history (title, artist_name, listened_at) VALUES \
+               ('Blue in Green','Miles Davis','2024-06-01T10:00:00Z'), \
+               ('Blue in Green','Miles Davis','2024-06-02T10:00:00Z'), \
+               ('Blue in Green','Miles Davis','2024-06-03T10:00:00Z'), \
+               ('So What','Miles Davis','2019-03-01T10:00:00Z');",
         )
         .unwrap();
         db
@@ -670,17 +683,18 @@ pub(crate) mod tests {
         );
     }
 
-    /// Le compte du client : trente-quatre définitions, dont trente-deux aux
+    /// Le compte du client : trente-cinq définitions, dont trente-trois aux
     /// collections (#5530 : « Généré par IA » ; #6123 : « Note de la piste » ;
     /// #6121 : « Artiste de l'album » ; #6124 : « Année de sortie originale »
-    /// et « Version » ; #6232 : « Interprète »). Si ce nombre bouge,
+    /// et « Version » ; #6232 : « Interprète » ; #6285 : « Verdict hi-res »,
+    /// que `smartRegles.ts` n'a pas encore). Si ce nombre bouge,
     /// `smartRegles.ts` doit bouger aussi.
     #[test]
     fn le_tableau_a_la_taille_de_celui_du_client() {
-        assert_eq!(CRITERES.len(), 34);
+        assert_eq!(CRITERES.len(), 35);
         assert_eq!(
             CRITERES.iter().filter(|c| c.collection.is_some()).count(),
-            32
+            33
         );
     }
     // ---------------------------------------------------------------------
@@ -1174,8 +1188,8 @@ pub(crate) mod tests {
             "INSERT INTO albums (id, title, artist_id, track_count) VALUES (4,'Récent',3,1); \
              INSERT INTO tracks (id, album_id, artist_id, title, file_path, file_mtime) VALUES \
                (5,4,3,'Neuf','/m/neuf/5.flac',{mtime}); \
-             INSERT INTO listen_history (track_id, title, listened_at) VALUES \
-               (3,'Giant Steps','{deux}'), (4,'Solo','{quarante}');",
+             INSERT INTO listen_history (title, artist_name, listened_at) VALUES \
+               ('Giant Steps','John Coltrane','{deux}'), ('Solo','Autre','{quarante}');",
             mtime = il_y_a(5).timestamp(),
             deux = iso(2),
             quarante = iso(40),
@@ -1262,7 +1276,10 @@ pub(crate) mod tests {
 ///
 /// Seule retouche voulue depuis : la clause « Favori · est · Piste » (#5997,
 /// forum #2127) départage désormais les éditions par l'album et l'ISRC — la
-/// ligne gelée correspondante a été mise à jour avec elle.
+/// ligne gelée correspondante a été mise à jour avec elle. De même les deux
+/// lignes « nombre d'écoutes » (#7769) : elles comptaient par
+/// `listen_history.track_id` seul, toujours NULL, et comptent désormais comme
+/// la Bibliothèque, `track_id` ne servant plus qu'en plus quand il est rempli.
 #[cfg(test)]
 mod anciennes_regles {
     use crate::smart_playlists::build_smart_query_rapport;
@@ -1287,3 +1304,11 @@ mod anciennes_regles {
         assert_eq!(vus, 16, "le gel ne porte plus ses seize jeux de règles");
     }
 }
+
+#[cfg(test)]
+#[path = "criteres_hires_6285_tests.rs"]
+mod hires_6285;
+
+#[cfg(test)]
+#[path = "criteres_ecoutes_7769_tests.rs"]
+mod ecoutes_7769;

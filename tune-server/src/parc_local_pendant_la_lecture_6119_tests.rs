@@ -55,3 +55,126 @@ async fn a_l_arret_le_parc_est_bien_sonde_6119() {
          n'apparaîtrait jamais"
     );
 }
+
+/// #7263 : FIP joue sur le réseau, aucune sortie locale ne joue. Le rescan
+/// périodique Linux évite déjà ALSA ; les lectures API du parc doivent aussi
+/// s'en tenir au cache, puis retrouver le hotplug après l'arrêt.
+#[tokio::test]
+async fn une_radio_reseau_suspend_les_sondes_du_parc_sous_linux_7263() {
+    let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+    state
+        .playback
+        .play(
+            10,
+            tune_core::playback::NowPlaying {
+                source: "radio".into(),
+                title: "FIP".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    let attendu = usize::from(!cfg!(target_os = "linux"));
+    assert_eq!(
+        enumerations_pendant(&state).await,
+        attendu,
+        "#7263 : FIP réseau joue ; sous Linux la lecture du parc sonde encore ALSA au lieu de servir le cache"
+    );
+    state.playback.stop(10).await;
+    assert_eq!(
+        enumerations_pendant(&state).await,
+        1,
+        "#7263 : à l'arrêt, le hotplug doit pouvoir reprendre"
+    );
+}
+
+/// Même décision de production, système injecté : la règle Linux reste
+/// vérifiable sur le Mac, sans prétendre y exécuter un pilote ALSA.
+#[tokio::test]
+async fn la_garde_reseau_linux_est_verifiee_sur_tous_les_hotes_7263() {
+    let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+    state
+        .playback
+        .play(
+            10,
+            tune_core::playback::NowPlaying {
+                source: "radio".into(),
+                title: "FIP".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    for (os, attendu) in [("linux", 0), ("windows", 1), ("macos", 1)] {
+        let compteur = Arc::new(AtomicUsize::new(0));
+        let appels = compteur.clone();
+        parc_local_sans_couper_la_lecture_selon_os(&state, os, || async move {
+            appels.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        })
+        .await;
+        assert_eq!(
+            compteur.load(Ordering::SeqCst),
+            attendu,
+            "#7263 : sous {os}, une lecture réseau laisse une sonde ALSA inutile contourner la garde du rescan"
+        );
+    }
+    state.playback.stop(10).await;
+    let compteur = Arc::new(AtomicUsize::new(0));
+    let appels = compteur.clone();
+    parc_local_sans_couper_la_lecture_selon_os(&state, "linux", || async move {
+        appels.fetch_add(1, Ordering::SeqCst);
+        Vec::new()
+    })
+    .await;
+    assert_eq!(
+        compteur.load(Ordering::SeqCst),
+        1,
+        "#7263 : le hotplug reprend à l'arrêt sous Linux"
+    );
+}
+
+/// Énumérations déclenchées par la fiche de diagnostic, pour un âge de parc
+/// publié donné.
+async fn enumerations_du_diagnostic(
+    state: &AppState,
+    age_du_parc: Option<std::time::Duration>,
+) -> usize {
+    let compteur = Arc::new(AtomicUsize::new(0));
+    let appels = compteur.clone();
+    parc_local_pour_le_diagnostic_selon(state, "linux", age_du_parc, || async move {
+        appels.fetch_add(1, Ordering::SeqCst);
+        Vec::new()
+    })
+    .await;
+    compteur.load(Ordering::SeqCst)
+}
+
+/// #7263 (fils 2517, 2525) : arrêts pendant un scan SANS lecture, l'écran
+/// « État du serveur » ouvert. Il interroge `/system/diagnostics` toutes les
+/// 5 s ; chaque appel relançait un inventaire ALSA complet.
+#[tokio::test]
+async fn la_fiche_de_diagnostic_ne_rebalaye_pas_un_parc_recent_7263() {
+    let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+    // Rien ne joue : seule la fraîcheur du parc peut éviter la sonde.
+    for secondes in [0, 5, 10, 60, 299] {
+        assert_eq!(
+            enumerations_du_diagnostic(&state, Some(std::time::Duration::from_secs(secondes)))
+                .await,
+            0,
+            "#7263 : un parc publié il y a {secondes} s suffit à la fiche ; la rebalayer \
+             toutes les 5 s rouvrait les greffons ALSA ~500 fois par heure"
+        );
+    }
+}
+
+/// Contre-épreuve : sans parc publié, ou avec un parc trop vieux, la fiche
+/// sonde bien — sinon un DAC branché n'y apparaîtrait jamais.
+#[tokio::test]
+async fn la_fiche_de_diagnostic_sonde_sans_parc_ou_parc_perime_7263() {
+    let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+    assert_eq!(enumerations_du_diagnostic(&state, None).await, 1);
+    assert_eq!(
+        enumerations_du_diagnostic(&state, Some(DUREE_DU_PARC_POUR_LE_DIAGNOSTIC)).await,
+        1
+    );
+    assert!(DUREE_DU_PARC_POUR_LE_DIAGNOSTIC >= std::time::Duration::from_secs(60));
+}

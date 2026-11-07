@@ -25,6 +25,8 @@ mod bios_bilan_visible;
 mod bios_langue_album;
 #[path = "bios_langue_entete.rs"]
 mod bios_langue_entete;
+#[path = "bios_qobuz_8022.rs"]
+mod bios_qobuz_8022;
 #[path = "bit_perfect_sortie_pull_2189.rs"]
 mod bit_perfect_sortie_pull_2189;
 #[path = "bump_natifs_android.rs"]
@@ -63,6 +65,8 @@ mod enrich_artiste_langue_entete;
 mod enrichissement_repertoire;
 #[path = "eq_refus_premium_localise.rs"]
 mod eq_refus_premium_localise;
+#[path = "import_egaliseur_6385.rs"]
+mod import_egaliseur_6385;
 // Etiqueter un album de STREAMING : les deux espaces d'identifiants (#3699).
 #[path = "etiquettes_streaming_3699.rs"]
 mod etiquettes_streaming_3699;

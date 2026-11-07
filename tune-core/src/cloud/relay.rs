@@ -34,7 +34,15 @@ pub struct RelayClient {
     pub relay_url: String,
     pub local_port: u16,
     connected: Arc<AtomicBool>,
+    /// Voie prioritaire vers le relais : réponses d'API entières, débuts de
+    /// flux, pong. Voir [`VoiesVersLeRelais`].
     ws_tx: CanalVersLeRelais,
+    /// Voie du vrac (#7799) : morceaux et fins de flux. `None` hors connexion ;
+    /// tant qu'elle n'est pas ouverte, le vrac passe par `ws_tx`.
+    ws_vrac: CanalVersLeRelais,
+    /// Places des `relay.request` lues en même temps sur le serveur local
+    /// (#7799) : voir [`PLAFOND_DE_REQUETES_LOCALES`].
+    places_de_requetes: Arc<tokio::sync::Semaphore>,
     http_client: reqwest::Client,
     /// Client des FLUX relayés (`/stream/…`, audio d'une piste de cercle) :
     /// sans délai total, voir [`client_de_flux`].
@@ -68,6 +76,8 @@ impl RelayClient {
             local_port,
             connected: Arc::new(AtomicBool::new(false)),
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            ws_vrac: Arc::new(tokio::sync::Mutex::new(None)),
+            places_de_requetes: Arc::new(tokio::sync::Semaphore::new(PLAFOND_DE_REQUETES_LOCALES)),
             http_client,
             http_flux,
             reglages: None,
@@ -133,6 +143,7 @@ impl RelayClient {
 
                 client.connected.store(false, Ordering::Relaxed);
                 *client.ws_tx.lock().await = None;
+                *client.ws_vrac.lock().await = None;
 
                 if matches!(fin, Ok(FinDeSession::JetonRenouvele)) {
                     // Pas d'attente croissante : la coupure est voulue. Le court
@@ -186,13 +197,17 @@ impl RelayClient {
         );
         self.connected.store(true, Ordering::Relaxed);
 
-        let (msg_tx, mut msg_rx) = mpsc::channel::<Trame>(256);
+        let (msg_tx, msg_rx) = mpsc::channel::<Trame>(256);
+        let (vrac_tx, vrac_rx) = mpsc::channel::<Trame>(256);
         *self.ws_tx.lock().await = Some(msg_tx);
+        *self.ws_vrac.lock().await = Some(vrac_tx);
 
-        // Writer: forward outbound messages to WS
+        // Writer: forward outbound messages to WS, la voie prioritaire d'abord
+        // (#7799).
         let writer_connected = self.connected.clone();
         let writer_handle = tokio::spawn(async move {
-            while let Some(trame) = msg_rx.recv().await {
+            let mut voies = VoiesVersLeRelais::new(msg_rx, vrac_rx);
+            while let Some(trame) = voies.suivante().await {
                 if ws_tx
                     .send(trame.sur_le_fil(morceaux_binaires))
                     .await
@@ -234,6 +249,17 @@ impl RelayClient {
         Ok(fin)
     }
 
+    /// Le nom du serveur annoncé au relais (#7044).
+    fn nom_annonce(&self) -> String {
+        let configure = self.reglages.as_ref().and_then(|b| {
+            SettingsRepo::with_backend(b.clone())
+                .get("server_name")
+                .ok()
+                .flatten()
+        });
+        choisir_le_nom(configure.as_deref(), hostname())
+    }
+
     /// `relay.register`, puis l'accusé du relais.
     ///
     /// Le serveur annonce sa clé publique (`server_pk`, #6603). Le relais lui
@@ -260,7 +286,7 @@ impl RelayClient {
         let register = serde_json::json!({
             "type": "relay.register",
             "server_id": self.server_id,
-            "server_name": hostname(),
+            "server_name": self.nom_annonce(),
             "version": crate::version(),
             "bridge_token": bridge_token,
             "server_pk": self.cle.as_ref().map(|c| c.cle_publique()),
@@ -355,22 +381,48 @@ impl RelayClient {
                     .map(|s| s.to_string());
                 let headers = v.get("headers").and_then(|h| h.as_object()).cloned();
 
-                let url = format!("http://127.0.0.1:{}{}", self.local_port, path);
+                // Le chemin est normalisé, PUIS jugé : il doit rester une
+                // route de l'API de CE serveur. Le serveur applique ensuite
+                // sa propre liste des routes relayables (`garde_du_relais`).
+                let Some(url) = url_locale_d_api(self.local_port, path) else {
+                    warn!(id = %id, "relay_request_chemin_refuse");
+                    let mut hdrs = serde_json::Map::new();
+                    hdrs.insert(
+                        "content-type".to_string(),
+                        serde_json::Value::String("application/json".into()),
+                    );
+                    let refus =
+                        reponse_dapi(&id, 403, hdrs, br#"{"error":"not_available_remotely"}"#);
+                    emettre_vers_le_relais(&self.ws_tx, refus.to_string()).await;
+                    return;
+                };
                 let mut req = match method {
-                    "POST" => self.http_client.post(&url),
-                    "PUT" => self.http_client.put(&url),
-                    "DELETE" => self.http_client.delete(&url),
-                    "PATCH" => self.http_client.patch(&url),
-                    _ => self.http_client.get(&url),
+                    "POST" => self.http_client.post(url),
+                    "PUT" => self.http_client.put(url),
+                    "DELETE" => self.http_client.delete(url),
+                    "PATCH" => self.http_client.patch(url),
+                    _ => self.http_client.get(url),
                 };
 
+                let mut encodages = None;
                 if let Some(hdrs) = headers {
                     for (k, val) in &hdrs {
                         if let Some(v) = val.as_str() {
+                            if k.eq_ignore_ascii_case(ENTETE_ENCODAGES_ACCEPTES) {
+                                encodages = Some(v.to_string());
+                                continue;
+                            }
+                            if k.eq_ignore_ascii_case("accept-encoding") {
+                                continue;
+                            }
                             req = req.header(k.as_str(), v);
                         }
                     }
                 }
+                req = req.header(
+                    "accept-encoding",
+                    encodages.as_deref().unwrap_or("identity"),
+                );
                 // APRÈS les en-têtes du distant : voir `ENTETE_RELAIS`.
                 req = req.header(ENTETE_RELAIS, "1");
                 if let Some(b) = body {
@@ -378,14 +430,31 @@ impl RelayClient {
                 }
 
                 let ws_tx = self.ws_tx.clone();
+                let ws_vrac = self.ws_vrac.clone();
+                let places = self.places_de_requetes.clone();
                 let id_clone = id.clone();
                 tokio::spawn(async move {
-                    let resp = match req.send().await {
-                        Ok(resp) => {
-                            let status = resp.status().as_u16();
-                            let hdrs = entetes_de_reponse_dapi(resp.headers());
-                            let octets = resp.bytes().await.unwrap_or_default();
-                            reponse_dapi(&id_clone, status, hdrs, &octets)
+                    // #7799 — la place est prise pour la lecture LOCALE
+                    // seulement, et rendue avant l'émission : une liaison
+                    // montante lente ne retient pas les places des requêtes
+                    // suivantes.
+                    let lue = {
+                        let _place = places.acquire().await;
+                        match req.send().await {
+                            Ok(resp) => {
+                                let status = resp.status().as_u16();
+                                let hdrs = entetes_de_reponse_dapi(resp.headers());
+                                let octets = resp.bytes().await.unwrap_or_default();
+                                Ok((status, hdrs, octets))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    };
+                    let resp = match lue {
+                        Ok((status, hdrs, octets)) => {
+                            emettre_reponse_dapi(&ws_tx, &ws_vrac, &id_clone, status, hdrs, octets)
+                                .await;
+                            return;
                         }
                         Err(e) => {
                             warn!(id = %id_clone, error = %e, "relay local dispatch failed");
@@ -427,12 +496,26 @@ impl RelayClient {
                     .and_then(|r| r.as_str())
                     .map(|s| s.to_string());
 
+                // Un identifiant de flux est UN segment : ni `/`, ni `..`, ni
+                // encodage. Sinon, rien n'est appelé en local.
+                if !identifiant_de_flux_valide(&stream_id) {
+                    warn!(id = %id, "relay_stream_id_refuse");
+                    let refus = serde_json::json!({
+                        "type": "relay.stream_start",
+                        "id": id,
+                        "status": 404,
+                        "headers": {},
+                    });
+                    emettre_vers_le_relais(&self.ws_tx, refus.to_string()).await;
+                    return;
+                }
                 let url = format!("http://127.0.0.1:{}/stream/{}", self.local_port, stream_id);
                 let ws_tx = self.ws_tx.clone();
+                let ws_vrac = self.ws_vrac.clone();
                 let http = self.http_flux.clone();
 
                 tokio::spawn(async move {
-                    pomper_le_flux(&http, &url, range, user_agent, &id, &ws_tx).await;
+                    pomper_le_flux(&http, &url, range, user_agent, &id, &ws_tx, &ws_vrac).await;
                 });
             }
             MESSAGE_FLUX_DE_CERCLE => {
@@ -441,6 +524,35 @@ impl RelayClient {
             _ => {}
         }
     }
+}
+
+/// L'URL locale d'un `relay.request`, si le chemin désigne bien une route de
+/// l'API de ce serveur. Normalisé d'abord (points, `%2e`), jugé ensuite : un
+/// chemin qui ne commence pas par `/`, qui change d'hôte (`@`, `//`) ou qui
+/// sort de `/api/v1/` après normalisation est refusé.
+pub(crate) fn url_locale_d_api(port: u16, chemin: &str) -> Option<reqwest::Url> {
+    if !chemin.starts_with('/') || chemin.starts_with("//") || chemin.contains('\\') {
+        return None;
+    }
+    let url = reqwest::Url::parse(&format!("http://127.0.0.1:{port}{chemin}")).ok()?;
+    if url.host_str() != Some("127.0.0.1") || url.port() != Some(port) {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    url.path().starts_with("/api/v1/").then_some(url)
+}
+
+/// Un identifiant de flux reçu du pont : un seul segment de chemin.
+pub(crate) fn identifiant_de_flux_valide(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 200
+        && !id.starts_with('.')
+        && !id.contains("..")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
 /// Message du pont : un contact écoute une piste de CE serveur (Tune Circle
@@ -543,10 +655,11 @@ impl RelayClient {
             self.local_port, track_id
         );
         let ws_tx = self.ws_tx.clone();
+        let ws_vrac = self.ws_vrac.clone();
         let http = self.http_flux.clone();
         tokio::spawn(async move {
             let debut = std::time::Instant::now();
-            let bilan = pomper_le_flux(&http, &url, range, None, &id, &ws_tx).await;
+            let bilan = pomper_le_flux(&http, &url, range, None, &id, &ws_tx, &ws_vrac).await;
             info!(
                 track_id,
                 statut = bilan.statut,
@@ -617,6 +730,7 @@ pub(crate) async fn pomper_le_flux(
     user_agent: Option<String>,
     id: &str,
     ws_tx: &CanalVersLeRelais,
+    ws_vrac: &CanalVersLeRelais,
 ) -> BilanDuFlux {
     let mut req = flux.http.get(url);
     if let Some(r) = range {
@@ -680,8 +794,9 @@ pub(crate) async fn pomper_le_flux(
                         // `send` attend que le relais ait de la place. Il
                         // attend sans le verrou, sinon le `relay.pong` ne
                         // partirait plus et la session entiere serait coupee.
-                        emettre_vers_le_relais(
+                        emettre_en_vrac(
                             ws_tx,
+                            ws_vrac,
                             Trame::Morceau {
                                 id: id.to_string(),
                                 seq,
@@ -698,8 +813,9 @@ pub(crate) async fn pomper_le_flux(
                 }
             }
 
+            // Par le vrac : derrière le dernier morceau, jamais devant (#7799).
             let end_msg = serde_json::json!({"type": "relay.stream_end", "id": id});
-            emettre_vers_le_relais(ws_tx, end_msg.to_string()).await;
+            emettre_en_vrac(ws_tx, ws_vrac, end_msg.to_string()).await;
             BilanDuFlux {
                 statut: status,
                 octets,
@@ -765,11 +881,169 @@ pub(crate) async fn emettre_vers_le_relais(
 /// [`emettre_vers_le_relais`]). `None` tant que la connexion n'est pas établie.
 pub(crate) type CanalVersLeRelais = Arc<tokio::sync::Mutex<Option<mpsc::Sender<Trame>>>>;
 
+/// Au-delà de ce corps, une réponse d'API réussie part en morceaux (#7799).
+///
+/// Une liste de dossiers, un état de lecture tiennent en dessous ; une
+/// pochette, une grande liste d'albums le dépassent.
+pub(crate) const SEUIL_DE_DECOUPAGE: usize = 64 * 1024;
+
+/// Taille des morceaux d'une réponse d'API découpée (#7799) : le plus long
+/// qu'une petite réponse puisse attendre sur la liaison montante.
+pub(crate) const TAILLE_DES_MORCEAUX_DAPI: usize = 64 * 1024;
+
+/// `relay.request` lues en même temps sur le serveur local (#7799).
+///
+/// Au premier affichage à distance, le téléphone envoie tout d'un coup (HTTP/2
+/// vers le pont) : des dizaines de pochettes et de listes. Sans plafond,
+/// autant de lectures lourdes démarraient ensemble et ralentissaient aussi la
+/// liste des dossiers. Six à huit, c'est ce qu'un navigateur ouvre en local.
+pub(crate) const PLAFOND_DE_REQUETES_LOCALES: usize = 8;
+
+/// Émet par la voie du vrac (morceaux, fins de flux), ou par `ws_tx` si cette
+/// voie n'est pas ouverte : l'ordre reste alors celui d'une seule file.
+pub(crate) async fn emettre_en_vrac(
+    ws_tx: &CanalVersLeRelais,
+    ws_vrac: &CanalVersLeRelais,
+    trame: impl Into<Trame>,
+) -> bool {
+    let vrac = { ws_vrac.lock().await.clone() };
+    match vrac {
+        Some(tx) => tx.send(trame.into()).await.is_ok(),
+        None => emettre_vers_le_relais(ws_tx, trame).await,
+    }
+}
+
+/// Les deux voies vers le relais, telles que l'écrivain de la connexion les
+/// vide (#7799).
+///
+/// Une seule file, dans l'ordre d'arrivée, faisait attendre la petite liste
+/// des dossiers derrière chaque grosse réponse entière (pochettes, listes) :
+/// sur une liaison montante lente, elle arrivait au pont après son délai de
+/// 30 s. Désormais :
+///
+/// * la voie **prioritaire** porte ce qui est court et attendu : réponses
+///   d'API entières, `relay.stream_start`, `relay.pong` ;
+/// * la voie du **vrac** porte les morceaux et les `relay.stream_end` ;
+/// * l'écrivain vide toujours la prioritaire d'abord. Une petite réponse
+///   attend au plus le morceau en cours d'écriture.
+///
+/// L'ordre d'un flux reste exact : ses morceaux et sa fin suivent la même
+/// file. Son début, prioritaire, passe avant son premier morceau : la tâche
+/// du flux l'a mis en file avant ce morceau, et l'écrivain, qui reçoit un
+/// morceau, regarde encore la prioritaire avant de l'écrire.
+pub(crate) struct VoiesVersLeRelais {
+    prioritaire: mpsc::Receiver<Trame>,
+    vrac: mpsc::Receiver<Trame>,
+    /// Un morceau reçu alors qu'une trame prioritaire venait d'arriver.
+    retenue: Option<Trame>,
+}
+
+impl VoiesVersLeRelais {
+    pub(crate) fn new(prioritaire: mpsc::Receiver<Trame>, vrac: mpsc::Receiver<Trame>) -> Self {
+        Self {
+            prioritaire,
+            vrac,
+            retenue: None,
+        }
+    }
+
+    /// La prochaine trame à écrire ; `None` quand les deux voies sont fermées.
+    pub(crate) async fn suivante(&mut self) -> Option<Trame> {
+        if let Some(retenue) = self.retenue.take() {
+            return Some(self.avant(retenue));
+        }
+        tokio::select! {
+            biased;
+            Some(trame) = self.prioritaire.recv() => Some(trame),
+            Some(trame) = self.vrac.recv() => Some(self.avant(trame)),
+            else => None,
+        }
+    }
+
+    /// Une trame du vrac vient d'être reçue : ce qui est déjà dans la voie
+    /// prioritaire passe devant (le début d'un flux avant son premier
+    /// morceau, même mis en file entre deux regards de `select!`).
+    fn avant(&mut self, vrac: Trame) -> Trame {
+        match self.prioritaire.try_recv() {
+            Ok(prioritaire) => {
+                self.retenue = Some(vrac);
+                prioritaire
+            }
+            Err(_) => vrac,
+        }
+    }
+}
+
+/// Émet la réponse d'API d'un `relay.request` (#7799).
+///
+/// Une petite réponse, ou une réponse en erreur, part entière par la voie
+/// prioritaire ([`reponse_dapi`]) : le pont rend une erreur sans corps quand
+/// elle arrive en flux, son message JSON serait perdu.
+///
+/// Une réponse réussie de plus de [`SEUIL_DE_DECOUPAGE`] part comme un flux :
+/// `relay.stream_start` (prioritaire, avec les en-têtes de
+/// [`entetes_de_reponse_dapi`]), puis des morceaux de
+/// [`TAILLE_DES_MORCEAUX_DAPI`] et `relay.stream_end` par le vrac. Le pont
+/// accepte ce `stream_start` comme réponse d'une requête d'API, et son délai
+/// de 30 s s'arrête là : le transfert du corps n'y est plus compté.
+pub(crate) async fn emettre_reponse_dapi(
+    ws_tx: &CanalVersLeRelais,
+    ws_vrac: &CanalVersLeRelais,
+    id: &str,
+    status: u16,
+    entetes: serde_json::Map<String, serde_json::Value>,
+    octets: bytes::Bytes,
+) {
+    if status >= 400 || octets.len() <= SEUIL_DE_DECOUPAGE {
+        let entiere = reponse_dapi(id, status, entetes, &octets);
+        emettre_vers_le_relais(ws_tx, entiere.to_string()).await;
+        return;
+    }
+
+    let debut = serde_json::json!({
+        "type": "relay.stream_start",
+        "id": id,
+        "status": status,
+        "headers": entetes,
+        "content_length": octets.len(),
+    });
+    if !emettre_vers_le_relais(ws_tx, debut.to_string()).await {
+        return;
+    }
+    let mut seq: u64 = 0;
+    let mut debut_du_morceau = 0;
+    while debut_du_morceau < octets.len() {
+        let fin_du_morceau = (debut_du_morceau + TAILLE_DES_MORCEAUX_DAPI).min(octets.len());
+        let morceau = Trame::Morceau {
+            id: id.to_string(),
+            seq,
+            octets: octets.slice(debut_du_morceau..fin_du_morceau),
+        };
+        if !emettre_en_vrac(ws_tx, ws_vrac, morceau).await {
+            return;
+        }
+        seq += 1;
+        debut_du_morceau = fin_du_morceau;
+    }
+    let fin = serde_json::json!({"type": "relay.stream_end", "id": id});
+    emettre_en_vrac(ws_tx, ws_vrac, fin.to_string()).await;
+}
+
 /// Capacité annoncée par le pont dans `relay.registered` (`capabilities`) :
 /// il lit les morceaux de flux en trames WebSocket binaires (#6564).
 ///
 /// Même chaîne que `tune-bridge/src/protocol.rs`.
 pub(crate) const CAPACITE_MORCEAUX_BINAIRES: &str = "binary_stream_chunks_v1";
+
+/// Les compressions qu'accepte le navigateur distant, que le pont relaie sous
+/// ce nom (#7602). Même chaîne que `tune-bridge/src/api_proxy.rs`.
+///
+/// Le serveur le pose en `accept-encoding` sur sa requête locale : la route
+/// compresse alors comme pour un navigateur du réseau local, et
+/// `content-encoding` revient au pont avec la réponse. Sans lui, la requête
+/// locale part en `identity` : un pont antérieur ne rend pas
+/// `content-encoding`, une réponse compressée serait illisible au bout.
+pub(crate) const ENTETE_ENCODAGES_ACCEPTES: &str = "x-tune-accept-encoding";
 
 /// Premier octet d'une trame binaire de morceau : la version du format. Un
 /// pont qui reçoit une autre valeur jette la trame au lieu de la deviner.
@@ -990,6 +1264,11 @@ mod emission_vers_le_relais_tests {
 /// export (`content-disposition`) et les validateurs de cache d'une pochette
 /// (`cache-control`, `etag`, `last-modified`). Pas `content-length` : le pont
 /// le recalcule sur le corps qu'il rend.
+///
+/// Et `content-encoding` avec `vary` (#7602) : une réponse compressée parce
+/// que le pont a relayé [`ENTETE_ENCODAGES_ACCEPTES`]. Son corps, binaire,
+/// part en `body_base64` ; sans cet en-tête, le navigateur ne saurait pas
+/// qu'il doit le décompresser.
 pub(crate) fn entetes_de_reponse_dapi(
     entetes: &reqwest::header::HeaderMap,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -1007,6 +1286,8 @@ pub(crate) fn entetes_de_reponse_dapi(
         "cache-control",
         "etag",
         "last-modified",
+        "content-encoding",
+        "vary",
     ] {
         if let Some(valeur) = entetes.get(nom).and_then(|v| v.to_str().ok()) {
             sortie.insert(
@@ -1138,6 +1419,17 @@ fn base64_encode(data: &[u8]) -> String {
     result
 }
 
+/// #7044 — le nom annoncé au relais : celui que l'utilisateur a donné à son
+/// serveur (réglage `server_name`), sinon le nom d'hôte. Un nom vide ne vaut pas
+/// un nom.
+fn choisir_le_nom(configure: Option<&str>, hote: String) -> String {
+    configure
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(hote)
+}
+
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -1211,6 +1503,14 @@ pub fn spawn_relay_client(
 #[cfg(test)]
 #[path = "relay_renouvellement_tests.rs"]
 mod renouvellement_tests;
+
+#[cfg(test)]
+#[path = "relay_compression_7602_tests.rs"]
+mod compression_7602_tests;
+
+#[cfg(test)]
+#[path = "relay_file_prioritaire_7799_tests.rs"]
+mod file_prioritaire_7799_tests;
 
 /// Tune Circle T4 (#5327) : `relay.circle_stream_request`, contre un faux
 /// serveur local qui note chaque chemin demandé.
@@ -1618,6 +1918,76 @@ mod reponse_dapi_tests {
             )]
         );
     }
+
+    /// Un chemin qui sort de l'API de ce serveur, ou qui change d'hôte, n'est
+    /// jamais appelé en local : 403 au pont, journal local vide.
+    #[tokio::test]
+    async fn un_chemin_hors_de_l_api_n_atteint_rien() {
+        let (port, journal) = serveur_local().await;
+        for chemin in [
+            "/api/v1/../system/config",
+            "/api/v1/%2e%2e/agent-tune/pair",
+            "/api/v1/../../stream/x",
+            "@exemple.invalid/api/v1/library",
+            "//exemple.invalid/api/v1/library",
+            "/ws/bridge",
+        ] {
+            let r = reponse_a(port, chemin).await;
+            assert_eq!(r["status"], 403, "{chemin} : {r}");
+        }
+        assert!(
+            journal.lock().unwrap().is_empty(),
+            "{:?}",
+            journal.lock().unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod chemins_du_relais_tests {
+    use super::{identifiant_de_flux_valide, url_locale_d_api};
+
+    #[test]
+    fn url_locale_d_api_normalise_puis_juge() {
+        assert_eq!(
+            url_locale_d_api(8888, "/api/v1/library/albums?x=1")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8888/api/v1/library/albums?x=1"
+        );
+        for refuse in [
+            "/api/v1/../system/config",
+            "/api/v1/%2E%2E/%2e%2e/stream/x",
+            "api/v1/library",
+            "@h.invalid/api/v1/library",
+            ":1@h.invalid/api/v1/x",
+            "//h.invalid/api/v1/x",
+            "/\\h.invalid/api/v1/x",
+            "/upnp/renderer/x",
+        ] {
+            assert!(url_locale_d_api(8888, refuse).is_none(), "{refuse}");
+        }
+    }
+
+    #[test]
+    fn identifiant_de_flux_un_seul_segment() {
+        for bon in ["abc", "2338763c.flac", "radio.flac", "a_b-c.wav"] {
+            assert!(identifiant_de_flux_valide(bon), "{bon}");
+        }
+        for mauvais in [
+            "",
+            "..",
+            "../api/v1/system/config",
+            "a/b",
+            "%2e%2e",
+            ".cache",
+            "a?b",
+            "a#b",
+            "a\\b",
+        ] {
+            assert!(!identifiant_de_flux_valide(mauvais), "{mauvais}");
+        }
+    }
 }
 
 /// #6453 — un flux relayé vers l'iPhone : l'agent du lecteur arrive jusqu'à la
@@ -1780,7 +2150,8 @@ mod flux_relaye_6453_tests {
             http,
             patience: Duration::from_secs(10),
         };
-        let bilan = pomper_le_flux(&flux, &url, None, None, "t", &ws_tx).await;
+        let sans_vrac = Arc::new(tokio::sync::Mutex::new(None));
+        let bilan = pomper_le_flux(&flux, &url, None, None, "t", &ws_tx, &sans_vrac).await;
         assert!(
             (bilan.octets as usize) < MORCEAUX * TAILLE,
             "le délai total aurait dû couper le direct ({} octets)",
@@ -2390,5 +2761,31 @@ mod poignee_de_main_6603_tests {
             .await
             .unwrap_err();
         assert!(e.contains("cle du serveur requise"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod nom_annonce_7044_tests {
+    use super::choisir_le_nom;
+
+    #[test]
+    fn le_nom_donne_par_l_utilisateur_prime_sur_le_nom_d_hote() {
+        assert_eq!(
+            choisir_le_nom(Some("Alec-server"), "MacBook-Pro".into()),
+            "Alec-server"
+        );
+        assert_eq!(
+            choisir_le_nom(Some("  Salon  "), "MacBook-Pro".into()),
+            "Salon"
+        );
+    }
+
+    #[test]
+    fn sans_nom_ou_nom_vide_le_nom_d_hote_reprend_sa_place() {
+        assert_eq!(choisir_le_nom(None, "MacBook-Pro".into()), "MacBook-Pro");
+        assert_eq!(
+            choisir_le_nom(Some("   "), "MacBook-Pro".into()),
+            "MacBook-Pro"
+        );
     }
 }

@@ -196,6 +196,15 @@ impl VolumeResolution {
     }
 }
 
+/// Plage de commandes en pour-cent réellement annoncée par une sortie.
+/// Le pas est compté depuis `min`, sans imposer une grille partant de zéro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumePercentRange {
+    pub min: u8,
+    pub max: u8,
+    pub step: u8,
+}
+
 /// Capacités déclarées par une sortie.
 ///
 /// `version == 0` signifie « plugin ancien, contrat inconnu ». Le serveur le
@@ -222,6 +231,9 @@ pub struct OutputCapabilities {
     /// et rien ne change pour la sortie qui ne le déclare pas.
     #[serde(default)]
     pub volume_resolution: VolumeResolution,
+    /// `None` : plage non annoncée, sans inventer les limites de l'appareil.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_percent_range: Option<VolumePercentRange>,
 }
 
 impl OutputCapabilities {
@@ -244,6 +256,7 @@ impl OutputCapabilities {
             formats: Vec::new(),
             channel_layouts: Vec::new(),
             volume_resolution: VolumeResolution::Continuous,
+            volume_percent_range: None,
         }
     }
 
@@ -2300,6 +2313,19 @@ pub trait OutputTarget: Send + Sync {
     /// place qui ne rouvrirait rien. Défaut `false` : toutes les autres sorties
     /// reprennent comme avant.
     fn device_released_on_pause(&self) -> bool {
+        false
+    }
+
+    /// #7894 — la dernière `pause()` a trouvé l'appareil SANS média : il ne
+    /// jouait rien (renderer UPnP en `NO_MEDIA_PRESENT`), il n'y avait donc
+    /// rien à mettre en pause.
+    ///
+    /// La sortie rend alors `Ok(())` et répond `true` ici ; l'hôte arrête la
+    /// zone (piste et position gardées, reprise possible) et le dit, au lieu
+    /// d'annoncer une pause qui n'existe pas ou de rendre un échec de sortie.
+    ///
+    /// Rendu **une fois** : l'implémentation l'efface. Défaut `false`.
+    fn take_nothing_playing_on_pause(&self) -> bool {
         false
     }
 

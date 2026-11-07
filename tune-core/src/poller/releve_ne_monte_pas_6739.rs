@@ -26,11 +26,32 @@ impl PositionPoller {
         rapporte: f64,
         consigne: f64,
     ) -> Option<f64> {
-        // Le trim ne se lit en base que quand l'appareil a bougé.
-        if !precedent.is_some_and(|p| (rapporte - p).abs() > 1e-9) {
+        // #6912 — AIR est suivi par son annonce fraîche, même arrêté.
+        // Le repli get_status sur volume_voulu n'est pas une observation.
+        if appareil.starts_with("devialet-air:") {
+            return None;
+        }
+        let a_bouge = precedent.is_some_and(|p| (rapporte - p).abs() > 1e-9);
+        // Le trim ne se lit en base qu'au premier relevé et quand l'appareil
+        // a bougé.
+        if !a_bouge && precedent.is_some() {
             return None;
         }
         let trim_db = crate::orchestrator::gain_trim_db_enregistre(&self.db, zone_id);
+        // #6721 — le niveau réel de l'appareil devient le repère de la garde
+        // contre les montées brusques (jamais adopté ici, jamais plus haut que
+        // la mémoire) : au PREMIER relevé aussi, qui n'est jamais adopté (#358).
+        if rapporte.is_finite() && rapporte > 0.001 {
+            let facteur = super::decisions::facteur_de_releve(trim_db);
+            if facteur > 0.0 {
+                self.orchestrator
+                    .niveaux_des_appareils
+                    .noter(zone_id, rapporte / facteur);
+            }
+        }
+        if !a_bouge {
+            return None;
+        }
         match juger_le_releve_de_volume(precedent, rapporte, consigne, trim_db) {
             JugementDuReleve::Adopter(v) => Some(v),
             JugementDuReleve::PlusHautNonAdopte(releve) => {

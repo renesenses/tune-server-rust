@@ -26,7 +26,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::source_pcm::{FluxPcm, FormatPcm, FournisseurPcm};
+use crate::source_pcm::{FluxPcm, FormatPcm, FournisseurPcm, QualiteRecue};
 use crate::streaming::registry::ServiceRegistry;
 use crate::streaming::spotify::SpotifyService;
 use crate::streaming::spotify_connect::{
@@ -63,48 +63,76 @@ pub trait PiloteSpotify: Send + Sync {
     }
 }
 
-/// #6933 — le motif d'échec quand librespot n'a pas pu se connecter au
-/// compte. « Reconnecter Spotify » n'est conseillé QUE si c'est la liaison
-/// elle-même qui est en défaut : Spotify a refusé les identifiants ET la
-/// liaison ne porte pas la portée `streaming` (compte relié avant la lecture
-/// Spotify). Avec une liaison complète, le jeton vient d'être accepté par
-/// l'API Web (l'appareil a été cherché avec) : se reconnecter n'y change
-/// rien, le message le dit et nomme le binaire lancé.
-pub fn motif_echec_librespot(
-    erreur: &str,
-    porte_la_lecture: Option<bool>,
-    binaire: &str,
-) -> String {
-    let refus_d_identifiants = [
+/// #6933 — l'erreur de librespot est-elle un refus d'identifiants ?
+pub fn est_un_refus_d_identifiants(erreur: &str) -> bool {
+    [
         "INVALID_CREDENTIALS",
         "BadCredentials",
         "Login request was denied",
     ]
     .iter()
-    .any(|m| erreur.contains(m));
-    if !refus_d_identifiants {
+    .any(|m| erreur.contains(m))
+}
+
+/// #6933 — ce que le motif d'échec doit savoir du récepteur.
+pub struct ContexteDeLibrespot<'a> {
+    /// Le binaire lancé, décrit (chemin, origine, version).
+    pub binaire: &'a str,
+    /// Le nom de l'appareil Spotify Connect.
+    pub appareil: &'a str,
+    /// Le dossier où librespot garde sa connexion, s'il y en a un.
+    pub dossier_identifiants: Option<&'a str>,
+}
+
+/// #6933 — le motif d'échec quand librespot n'a pas pu se connecter au
+/// compte.
+///
+/// La cause établie (sources de librespot 0.8.0) : le jeton de Tune est émis
+/// pour le Client ID de Tune ; librespot s'en sert pour le point d'accès,
+/// puis ouvre sa session Spotify Connect par login5 au nom de SON propre
+/// client, qui refuse cette connexion (`INVALID_CREDENTIALS`). Se reconnecter
+/// dans Tune ne change donc rien ; ce qui marche, c'est une connexion émise
+/// pour librespot lui-même, qu'il garde ensuite.
+///
+/// « Reconnecter Spotify » reste conseillé dans un seul cas : la liaison ne
+/// porte pas la portée `streaming` (compte relié avant la lecture Spotify).
+pub fn motif_echec_librespot(
+    erreur: &str,
+    porte_la_lecture: Option<bool>,
+    ctx: &ContexteDeLibrespot<'_>,
+) -> String {
+    let binaire = ctx.binaire;
+    if !est_un_refus_d_identifiants(erreur) {
         return format!(
             "librespot ({binaire}) s'est arrêté sans se connecter au compte Spotify : « {erreur} »."
         );
     }
-    match porte_la_lecture {
-        Some(false) => format!(
+    if porte_la_lecture == Some(false) {
+        return format!(
             "Spotify a refusé la connexion de librespot : la liaison du compte dans Tune ne porte \
              pas le droit de lecture (« streaming »), elle date d'avant la lecture Spotify. \
              Reconnecter Spotify une fois dans Réglages → Services → Spotify. (librespot : « {erreur} »)"
-        ),
-        Some(true) => format!(
-            "Spotify a refusé la connexion de librespot (« {erreur} ») alors que la liaison du \
-             compte est complète et que son jeton vient d'être accepté par l'API Web : se \
-             reconnecter n'y changera rien. Binaire lancé : {binaire}."
-        ),
-        None => format!(
-            "Spotify a refusé la connexion de librespot (« {erreur} »), alors que le jeton de Tune \
-             vient d'être accepté par l'API Web. Binaire lancé : {binaire}. Si le compte a été \
-             relié avant la lecture Spotify, le reconnecter une fois dans Réglages → Services → \
-             Spotify."
-        ),
+        );
     }
+    let garde = ctx
+        .dossier_identifiants
+        .map(|d| format!(" (dans {d})"))
+        .unwrap_or_default();
+    let appareil = ctx.appareil;
+    let reconnexion = match porte_la_lecture {
+        Some(true) => "La liaison du compte est complète : se reconnecter n'y changera rien.",
+        _ => {
+            "Se reconnecter dans Tune n'y changera rien, sauf si le compte a été relié avant la \
+             lecture Spotify."
+        }
+    };
+    format!(
+        "Spotify a refusé la connexion de librespot (« {erreur} »). {reconnexion} librespot \
+         n'ouvre sa session Spotify Connect qu'avec une connexion émise pour lui, pas avec le \
+         jeton de Tune. À faire une fois : dans l'application Spotify (téléphone ou ordinateur, \
+         même réseau, même compte), choisir l'appareil « {appareil} » ; librespot garde cette \
+         connexion{garde} et Tune s'en sert ensuite. Binaire lancé : {binaire}."
+    )
 }
 
 /// Le pilote de production : le `SpotifyService` inscrit dans le registre.
@@ -263,16 +291,40 @@ impl FournisseurPcm for FournisseurSpotify {
             // c'est SA raison qui est rendue, pas un « reconnecter » générique.
             if let Some(erreur) = self.recepteur.derniere_erreur_librespot() {
                 let portee = rt.block_on(self.pilote.porte_la_lecture());
+                let lance = self.recepteur.librespot_lance();
+                let binaire = lance
+                    .as_ref()
+                    .map(|l| l.decrire())
+                    .unwrap_or_else(|| self.recepteur.binaire_librespot());
+                let dossier = self
+                    .recepteur
+                    .dossier_identifiants_librespot()
+                    .map(|d| d.display().to_string());
                 tracing::warn!(
                     erreur_librespot = %erreur,
                     porte_la_lecture = ?portee,
+                    binaire = %binaire,
                     echec = %e,
                     "spotify_lecture_librespot_non_connecte"
                 );
+                // Refus du jeton de Tune : librespot repart en Spotify Connect
+                // seul, pour recevoir de l'application Spotify une connexion
+                // à lui. Une connexion déjà gardée qui est refusée, elle, ne
+                // relance rien : le message le dit.
+                if est_un_refus_d_identifiants(&erreur)
+                    && portee != Some(false)
+                    && !self.recepteur.librespot_a_sa_connexion()
+                {
+                    rt.block_on(self.recepteur.relancer_pour_la_liaison());
+                }
                 return Err(motif_echec_librespot(
                     &erreur,
                     portee,
-                    &self.recepteur.binaire_librespot(),
+                    &ContexteDeLibrespot {
+                        binaire: &binaire,
+                        appareil: self.recepteur.device_name(),
+                        dossier_identifiants: dossier.as_deref(),
+                    },
                 ));
             }
             return Err(e);
@@ -298,6 +350,16 @@ impl FournisseurPcm for FournisseurSpotify {
     /// pré-armement gapless couperait le titre qui joue.
     fn pre_armable(&self) -> bool {
         false
+    }
+
+    /// #6946 — librespot reçoit de l'Ogg Vorbis, au plus 320 kbit/s : le PCM
+    /// qu'il rend n'est pas une source sans perte.
+    fn qualite_recue(&self) -> Option<QualiteRecue> {
+        let q = self.recepteur.qualite_recue();
+        Some(QualiteRecue {
+            codec: q.codec.to_string(),
+            debit_kbps: Some(q.bitrate_kbps),
+        })
     }
 }
 
@@ -429,15 +491,37 @@ done
     /// `duree_ms` : ce que l'API Web annonce ; `octets_joues` : ce que le
     /// faux librespot écrit vraiment.
     pub(crate) fn banc(duree_ms: u64, octets_joues: u64) -> Banc {
+        banc_avec_identifiants(duree_ms, octets_joues, false)
+    }
+
+    /// `identifiants` : librespot a déjà, dans son dossier, une connexion
+    /// à lui (`credentials.json`).
+    pub(crate) fn banc_avec_identifiants(
+        duree_ms: u64,
+        octets_joues: u64,
+        identifiants: bool,
+    ) -> Banc {
         let dossier = tempfile::tempdir().unwrap();
         let bin = dossier.path().join("librespot");
         std::fs::write(&bin, FAUX_LIBRESPOT).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let recepteur = Arc::new(SpotifyConnectManager::avec_binaire(
-            "Tune".into(),
-            0,
-            Some(bin.to_string_lossy().into_owned()),
-        ));
+        let cache = dossier.path().join("identifiants");
+        if identifiants {
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(
+                cache.join(crate::streaming::spotify_connect::FICHIER_IDENTIFIANTS),
+                "{}",
+            )
+            .unwrap();
+        }
+        let recepteur = Arc::new(
+            SpotifyConnectManager::avec_binaire(
+                "Tune".into(),
+                0,
+                Some(bin.to_string_lossy().into_owned()),
+            )
+            .avec_dossier_identifiants(Some(cache)),
+        );
         let pilote = Arc::new(FauxPilote {
             dossier: dossier.path().to_path_buf(),
             duree_ms,
@@ -560,6 +644,48 @@ done
             b.jeton_recu(),
             "jeton-essai",
             "librespot doit recevoir le jeton par LIBRESPOT_ACCESS_TOKEN"
+        );
+    }
+
+    /// #6933 — LA cause du fil 2419. librespot 0.8 fait passer le jeton
+    /// (`LIBRESPOT_ACCESS_TOKEN`) avant sa connexion gardée en cache, et
+    /// Spotify refuse ce jeton à sa session Connect. Quand librespot a une
+    /// connexion à lui, Tune ne doit PAS lui passer son jeton, et lui donne
+    /// son dossier ; sans connexion gardée, le jeton passe, et le dossier
+    /// n'est PAS donné (librespot y écrirait une connexion inutilisable).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_6933_la_connexion_de_librespot_passe_avant_le_jeton_de_tune() {
+        let b = banc_avec_identifiants(1000, OCTETS_PAR_SECONDE as u64, true);
+        let f = b.fournisseur();
+        tokio::task::spawn_blocking(move || ouvrir(f, "piste", 0))
+            .await
+            .unwrap();
+        let args = b.args();
+        assert!(!args.is_empty(), "le faux librespot n'a pas été lancé");
+        assert_eq!(
+            b.jeton_recu(),
+            "",
+            "librespot a une connexion à lui : le jeton de Tune la supplanterait (fil 2419)"
+        );
+        assert!(
+            args.contains("--system-cache") && args.contains("identifiants"),
+            "librespot doit recevoir le dossier de sa connexion : {args}"
+        );
+
+        let sans = banc_avec_identifiants(1000, OCTETS_PAR_SECONDE as u64, false);
+        let f = sans.fournisseur();
+        tokio::task::spawn_blocking(move || ouvrir(f, "piste", 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            sans.jeton_recu(),
+            "jeton-essai",
+            "sans connexion gardée, le jeton passe"
+        );
+        assert!(
+            !sans.args().contains("--system-cache"),
+            "avec le jeton de Tune, librespot ne doit pas écrire son cache : {}",
+            sans.args()
         );
     }
 
@@ -743,7 +869,11 @@ exit 1
         let m = motif_echec_librespot(
             "Invalid `--password` / `-p`: Password authentication no longer supported, use OAuth",
             Some(true),
-            "/usr/local/bin/librespot",
+            &ContexteDeLibrespot {
+                binaire: "/usr/local/bin/librespot",
+                appareil: "Tune",
+                dossier_identifiants: None,
+            },
         );
         assert!(
             m.contains("Password authentication") && m.contains("/usr/local/bin/librespot"),

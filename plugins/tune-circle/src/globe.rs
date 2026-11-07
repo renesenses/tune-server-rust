@@ -7,6 +7,8 @@
 //! | `PUT /me/location` `{ label, country_code?, lat, lon }` | idem                     |
 //! | `DELETE /me/location`                    | idem                                    |
 //! | `GET /contacts/locations`                | idem                                    |
+//! | `GET /world/points` (rc9, #7122)          | idem                                    |
+//! | `GET\|PUT\|DELETE /me/public-map-opt-out` (rc9, #7122) | idem                    |
 //!
 //! Même relais que les autres routes du cercle ([`crate::relais::Relais`]) :
 //! session SSO relue à chaque appel, réponses du cloud relayées à l'octet près
@@ -36,6 +38,17 @@
 //!   le gabarit de la route, le statut et la durée.
 //! * Les réponses des routes de lieu portent `Cache-Control: no-store`, comme
 //!   celles du cloud (que le relais ne recopie pas).
+//!
+//! ## Carte publique (rc9, #7122, décision de Bertrand du 26/10/2026)
+//!
+//! La vue Monde montre aussi, en points anonymes, tous les comptes qui ont
+//! posé leur lieu, sauf ceux qui s'en retirent. Le cloud fait l'anonymisation
+//! (case de 1°, un point par case, seuil de comptes par case, aucun nom ni
+//! identifiant) ; le greffon relaie `GET /world/points` tel quel et relaie
+//! l'interrupteur « Me retirer de la carte publique » (`PUT` = me retirer,
+//! `DELETE` = revenir, `GET` = l'état), sans corps envoyé. Mêmes états que les
+//! autres routes : `412`, `503`, et `404` sur un serveur plus ancien.
+//! `Cache-Control: no-store` partout.
 
 use std::sync::Arc;
 
@@ -202,6 +215,36 @@ pub(crate) async fn lieux_des_contacts(State(relais): State<Arc<Relais>>) -> Res
             )
             .await,
     ))
+}
+
+/// rc9 (#7122) : les points anonymes de la carte publique, `[{lat, lon}]`.
+pub(crate) async fn points_du_monde(State(relais): State<Arc<Relais>>) -> Response {
+    sans_cache(en_reponse(
+        relais
+            .appeler("GET /world/points", Method::GET, &["world", "points"], None)
+            .await,
+    ))
+}
+
+/// rc9 (#7122) : l'interrupteur « Me retirer de la carte publique ».
+async fn retrait_de_la_carte(relais: &Relais, route: &'static str, methode: Method) -> Response {
+    sans_cache(en_reponse(
+        relais
+            .appeler(route, methode, &["me", "public-map-opt-out"], None)
+            .await,
+    ))
+}
+
+pub(crate) async fn mon_retrait_de_la_carte(State(relais): State<Arc<Relais>>) -> Response {
+    retrait_de_la_carte(&relais, "GET /me/public-map-opt-out", Method::GET).await
+}
+
+pub(crate) async fn me_retirer_de_la_carte(State(relais): State<Arc<Relais>>) -> Response {
+    retrait_de_la_carte(&relais, "PUT /me/public-map-opt-out", Method::PUT).await
+}
+
+pub(crate) async fn revenir_sur_la_carte(State(relais): State<Arc<Relais>>) -> Response {
+    retrait_de_la_carte(&relais, "DELETE /me/public-map-opt-out", Method::DELETE).await
 }
 
 #[cfg(test)]

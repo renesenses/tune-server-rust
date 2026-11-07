@@ -25,15 +25,6 @@ impl Engine {
         }
     }
 
-    /// Parses an engine name. Accepts "sqlite", "postgres", "postgresql".
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "sqlite" => Some(Engine::Sqlite),
-            "postgres" | "postgresql" => Some(Engine::Postgres),
-            _ => None,
-        }
-    }
-
     /// Detects the engine from a connection string.
     ///
     /// - `postgresql://...` or `postgres://...` → Postgres
@@ -43,6 +34,20 @@ impl Engine {
             Engine::Postgres
         } else {
             Engine::Sqlite
+        }
+    }
+}
+
+/// Parses an engine name. Accepts "sqlite", "postgres", "postgresql"
+/// (#7154 : c'était une méthode `from_str` homonyme du trait standard).
+impl std::str::FromStr for Engine {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sqlite" => Ok(Engine::Sqlite),
+            "postgres" | "postgresql" => Ok(Engine::Postgres),
+            _ => Err(format!("moteur de base inconnu : {s}")),
         }
     }
 }
@@ -702,11 +707,11 @@ mod tests {
 
     #[test]
     fn engine_from_str_accepts_aliases() {
-        assert_eq!(Engine::from_str("sqlite"), Some(Engine::Sqlite));
-        assert_eq!(Engine::from_str("SQLITE"), Some(Engine::Sqlite));
-        assert_eq!(Engine::from_str("postgres"), Some(Engine::Postgres));
-        assert_eq!(Engine::from_str("postgresql"), Some(Engine::Postgres));
-        assert_eq!(Engine::from_str("mysql"), None);
+        assert_eq!("sqlite".parse::<Engine>().ok(), Some(Engine::Sqlite));
+        assert_eq!("SQLITE".parse::<Engine>().ok(), Some(Engine::Sqlite));
+        assert_eq!("postgres".parse::<Engine>().ok(), Some(Engine::Postgres));
+        assert_eq!("postgresql".parse::<Engine>().ok(), Some(Engine::Postgres));
+        assert_eq!("mysql".parse::<Engine>().ok(), None);
     }
 
     #[test]

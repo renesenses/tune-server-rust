@@ -418,6 +418,9 @@ pub struct StreamSession {
     /// la dernière fois. `0` = jamais : l'inactivité se confond alors avec
     /// l'âge, et une session orpheline est reprise exactement comme avant.
     pub gc_active_at_ms: std::sync::atomic::AtomicU64,
+    /// Une suivante complète attend son tour : son propriétaire garde un
+    /// bail RAII, distinct d'une lecture et borné par le plafond absolu.
+    fichiers_prepares: std::sync::atomic::AtomicU32,
     /// Number of HTTP requests currently streaming this session. The radio→WAV
     /// channel is single-consumer (`rx` behind a Mutex): a second concurrent
     /// reader would race the first for each PCM chunk and split the stream. This
@@ -596,7 +599,7 @@ impl StreamSession {
             .unwrap_or_else(|e| e.into_inner()) = Some(observateur);
     }
 
-    fn effective_output_info(&self) -> StreamInfo {
+    pub(crate) fn effective_output_info(&self) -> StreamInfo {
         let mut info = self.info.clone();
         if self.is_radio {
             info.radio_source = *self
@@ -700,6 +703,7 @@ impl StreamSession {
             plage_hors_fichier_a_ms: std::sync::atomic::AtomicU64::new(0),
             gc_seen_bytes: std::sync::atomic::AtomicU64::new(0),
             gc_active_at_ms: std::sync::atomic::AtomicU64::new(0),
+            fichiers_prepares: std::sync::atomic::AtomicU32::new(0),
             active_consumers: std::sync::atomic::AtomicU32::new(0),
             consumer_watch_armed: std::sync::atomic::AtomicBool::new(false),
             consumer_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -1918,6 +1922,17 @@ impl AudioStreamer {
             .map(|s| s.effective_output_info())
     }
 
+    pub(crate) async fn retenir_fichier_prepare(&self, sid: &str) -> Option<BailFichierPrepare> {
+        let session = self.sessions.lock().await.get(sid).cloned()?;
+        if session.file_path.lock().await.is_none() {
+            return None;
+        }
+        session
+            .fichiers_prepares
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(BailFichierPrepare(session))
+    }
+
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {
         self.sessions.clone()
     }
@@ -1941,6 +1956,28 @@ impl AudioStreamer {
         }
         let path = session.file_path.lock().await.clone()?;
         tokio::fs::metadata(path).await.ok().map(|m| m.len())
+    }
+
+    /// #6932 — le flux a-t-il été servi JUSQU'AU BOUT à son lecteur ?
+    ///
+    /// Une session fichier : les octets servis atteignent la taille du
+    /// fichier ([`Self::stream_total_bytes`]). Un flux décodé à la volée (WAV
+    /// chunké d'une conversion) n'a pas de taille : une connexion en a atteint
+    /// la fin du canal ([`StreamSession::fin_du_canal`]). Une radio, jamais.
+    pub async fn stream_servi_jusqu_au_bout(&self, stream_id: &str) -> bool {
+        let Some(session) = ({ self.sessions.lock().await.get(stream_id).cloned() }) else {
+            return false;
+        };
+        if session.is_radio {
+            return false;
+        }
+        if session.fin_du_canal().is_some() {
+            return true;
+        }
+        let servis = session
+            .bytes_sent
+            .load(std::sync::atomic::Ordering::Relaxed);
+        matches!(self.stream_total_bytes(stream_id).await, Some(total) if total > 0 && servis >= total)
     }
 
     pub async fn stream_bytes_sent(&self, stream_id: &str) -> Option<u64> {
@@ -2046,6 +2083,9 @@ impl AudioStreamer {
                 return true;
             }
             let age = s.created_at.elapsed();
+            if s.fichiers_prepares.load(Relaxed) > 0 && age <= absolute_cap {
+                return true;
+            }
             // Relire l'activité : `bytes_sent` est monotone, donc « la valeur
             // a bougé depuis le balayage précédent » suffit à dater la
             // dernière fois que des octets sont partis.
@@ -2241,6 +2281,16 @@ pub fn build_icy_metadata(
     block.push(len_byte);
     block.extend_from_slice(&payload);
     block
+}
+
+/// La suppression du propriétaire rend immédiatement la session au GC.
+pub(crate) struct BailFichierPrepare(Arc<StreamSession>);
+impl Drop for BailFichierPrepare {
+    fn drop(&mut self) {
+        self.0
+            .fichiers_prepares
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

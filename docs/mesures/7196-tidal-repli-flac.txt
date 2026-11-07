@@ -1,0 +1,70 @@
+#7196 — un repli FLAC v2 ne doit pas masquer le Hi-Res v1
+Bertrand Clech / OpenAI Codex / bertrand-20261027-7196-m4b7
+Base : batch/bugs-rc9-20261025 @ 21908e489f3e811e19969b09940484e99d5e9c4b
+
+Correction
+La v2 tentait FLAC_HIRES, puis FLAC. Toute réponse sans perte terminait ensuite
+la recherche, même si elle était inférieure au HI_RES_LOSSLESS demandé. La v1
+n'était donc jamais consultée après ce repli, même si elle pouvait faire mieux.
+La réponse v2 ne termine maintenant la recherche que si son rang atteint la
+demande. Sinon elle reste le meilleur repli et la cascade v1 est tentée aux
+rangs supérieurs seulement. Si la v1 ne rend que de l'AAC ou échoue, le FLAC v2
+est conservé. Une demande CD satisfaite par la v2 ne fait pas d'appel v1 en plus.
+Aucun changement d'authentification, de client OAuth, de décodeur ou de compte.
+
+Contre-épreuve sur Shrek, compilable, test intact
+cargo test -p tune-core --lib --no-default-features
+  le_flac_cd_v2_ne_masque_pas_le_hires_v1_7196
+Seule l'ancienne condition « rang >= 2 || demande avec perte » est remise.
+Le témoin HTTP reproduit : FLAC_HIRES v2 refusé 403 CLIENT_NOT_ENTITLED,
+FLAC v2 servi en 16/44,1, et HI_RES_LOSSLESS v1 disponible en 24/88,2.
+Compilation réussie, puis 1 rouge :
+  le repli FLAC CD v2 ne doit pas masquer le Hi-Res disponible en v1 (#7196)
+  left: (44100, 16), right: (88200, 24)
+Restauration du fichier de production par copie. Retour au vert : 125/125
+sur le filtre streaming::tidal:: (--lib --no-default-features, 4 fils de test).
+Le témoin existant « CD demandé en max » vérifie désormais les deux tentatives
+v1 supérieures : ses assertions FLAC et 16 bits restent inchangées.
+Garde cargo test -p tune-core --test integration_contracts
+  aucune_fuite_de_temporaires : 3/3 ; formatage ciblé et diff-check propres.
+
+Vrai TIDAL sur le .18, 27/10/2026, 11:41:45 UTC
+Banc construit sur Shrek, même TidalService/get_track_url que la production.
+Session du .18 lue en lecture seule et utilisée sur place, sans renouvellement
+ni copie de jeton sur Shrek. Aucun lecteur/sortie audio n'est initialisé.
+Le banc demande HI_RES_LOSSLESS, récupère les fichiers, puis les sonde avec
+ffprobe ; les temporaires sont retirés. Toutes les sondes passent :
+  165842025 : FLAC, 24 bits, 44 100 Hz, 2 canaux
+  225405487 : FLAC, 24 bits, 44 100 Hz, 2 canaux
+   29113109 : FLAC, 16 bits, 44 100 Hz, 2 canaux
+   29113110 : FLAC, 16 bits, 44 100 Hz, 2 canaux
+   68714461 : FLAC, 24 bits, 96 000 Hz, 2 canaux
+Le format annoncé par StreamUrl correspond à ces cinq fichiers.
+Banc et répertoire isolé retirés du .18 ; service/binaire de production intacts.
+
+Comparaison des réponses, même session du .18
+165842025 et 225405487 : v2 FLAC_HIRES = 24/44,1 ; v1 HI_RES_LOSSLESS
+et HI_RES = 24/44,1 aussi. Le 24/88,2 observé chez le testeur britannique
+N'EST PAS reproduit avec ce compte ; aucun gain de cadence réel n'est annoncé.
+68714461 : v2 FLAC_HIRES et v1 HI_RES_LOSSLESS = 24/96.
+29113109 et 29113110 : v2 FLAC_HIRES = 403 CLIENT_NOT_ENTITLED, v2 FLAC
+= FLAC 16/44,1, v1 HI_RES_LOSSLESS et LOSSLESS = HIGH, AAC mp4a.40.2.
+Ces deux cas vérifient la conservation du FLAC v2 lorsque la recherche
+supplémentaire par la v1 ne trouve que de l'AAC.
+
+Rapport avec #6334
+Le refus AAC de la v1 et le court-circuit de recherche v2 sont distincts.
+Le passage v2 déjà livré par #6908 fonctionne sur les deux anciens titres CD
+ci-dessus (format confirmé dans les octets). Cette PR n'invente pas une autre
+cause au HIGH rendu par TIDAL et ne modifie pas la connexion.
+
+Limites
+Le correctif prouve la poursuite de la recherche quand la v2 ne satisfait pas
+la qualité demandée, et préserve les formats réellement disponibles sur .18.
+Il ne prouve pas que le compte du testeur britannique recevra du 24/88,2 ou
+24/96 : une comparaison sur ce compte reste nécessaire. L'issue reste ouverte.
+Aucun essai de renderer physique, aucune garantie de disponibilité du catalogue
+par pays, aucune CI complète annoncée verte. Aucun son ni fusion.
+
+Preuves brutes : coordination/preuves-7196-m4b7 (scripts, journaux Rust,
+réponses réduites aux formats et sondes ffprobe ; aucun jeton ni URL signée).

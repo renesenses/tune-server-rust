@@ -46,6 +46,19 @@
 //! dans les fichiers est relue avant CHAQUE gravure : retirée en cours de
 //! passe, elle l'arrête (`interrupted`, `raison`). Sans lecture, rien ne
 //! change.
+//!
+//! ## Arrêter la passe (#7719)
+//!
+//! Sur une bibliothèque de 500 000 pistes, la passe dure des heures :
+//! `POST /library/dr/gravure/cancel` la fait s'arrêter. L'arrêt est lu avant
+//! CHAQUE fichier, y compris pendant l'attente des fichiers reportés : le
+//! fichier en cours d'écriture finit, rien n'est écrit après. Ce qui est déjà
+//! gravé reste gravé (`dr_source = tag`) ; le reste garde `analysis`, si bien
+//! qu'une nouvelle passe reprend là où celle-ci s'est arrêtée. L'état final
+//! est `cancelled`, compteurs gardés.
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -173,6 +186,43 @@ fn ecrire_statut(state_backend: &std::sync::Arc<dyn tune_core::db::backend::DbBa
 /// `skipped`, `errors`) sont gardés : ce sont ceux du dernier jalon écrit.
 const ETAT_INTERROMPU: &str = "interrupted";
 
+/// #7719 — état « la passe a été arrêtée à la demande de l'utilisateur ».
+/// Il n'est ni `running` ni réécrit `interrupted` : le bouton « Graver » est
+/// de nouveau disponible, et la relance reprend les pistes restantes.
+const ETAT_ANNULE: &str = "cancelled";
+
+/// #7719 — le drapeau d'arrêt de la passe en cours, un par base : chaque
+/// `AppState` (et donc chaque test) a sa passe, comme son registre.
+static ARRETS: Mutex<Vec<(usize, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
+
+fn cle_de_la_base(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> usize {
+    Arc::as_ptr(backend) as *const () as usize
+}
+
+/// Arme un drapeau neuf pour la passe qui démarre sur cette base.
+fn armer_l_arret(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Arc<AtomicBool> {
+    let cle = cle_de_la_base(backend);
+    let drapeau = Arc::new(AtomicBool::new(false));
+    if let Ok(mut arrets) = ARRETS.lock() {
+        arrets.retain(|(c, _)| *c != cle);
+        arrets.push((cle, drapeau.clone()));
+    }
+    drapeau
+}
+
+/// Retire le drapeau de la passe qui finit — le sien seulement.
+fn desarmer_l_arret(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    drapeau: &Arc<AtomicBool>,
+) {
+    let cle = cle_de_la_base(backend);
+    if let Ok(mut arrets) = ARRETS.lock() {
+        arrets.retain(|(c, d)| !(*c == cle && Arc::ptr_eq(d, drapeau)));
+    }
+}
+
 /// Le dernier état enregistré, corrigé par le registre de CE processus.
 ///
 /// * tâche au registre → `running`, quoi que dise la base ;
@@ -230,8 +280,8 @@ pub(crate) fn marquer_passe_interrompue_au_demarrage(
 /// l'écran a besoin des deux pour dire « 1 234 à graver » avant, et
 /// « 1 234 gravées, 3 déjà présentes, 0 erreur » après.
 ///
-/// `status` vaut `idle`, `running`, `done` ou `interrupted` (voir
-/// [`ETAT_INTERROMPU`]).
+/// `status` vaut `idle`, `running`, `done`, `interrupted` (voir
+/// [`ETAT_INTERROMPU`]) ou `cancelled` (voir [`ETAT_ANNULE`]).
 pub(crate) async fn statut(State(state): State<AppState>) -> Json<Value> {
     let (inv, _) = inventaire(&state);
     let mut v = statut_courant(&state);
@@ -416,15 +466,37 @@ const ATTENTE_MAX_DES_REPORTEES: std::time::Duration = std::time::Duration::from
 /// Pourquoi la passe s'arrête avant la fin de sa liste.
 const RAISON_ECRITURE_DESACTIVEE: &str = "ecriture_fichiers_desactivee";
 
+/// Entre deux relectures de l'arrêt pendant l'attente des fichiers
+/// reportés (#7719) : un arrêt ne doit pas attendre la pause entière.
+const RELECTURE_DE_L_ARRET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// La pause d'attente des fichiers reportés, coupée dès que l'arrêt est
+/// demandé (#7719).
+async fn patienter_sauf_arret(
+    duree: std::time::Duration,
+    arret_demande: &(dyn Fn() -> bool + Sync),
+) {
+    let debut = std::time::Instant::now();
+    while !arret_demande() {
+        let reste = duree.saturating_sub(debut.elapsed());
+        if reste.is_zero() {
+            return;
+        }
+        tokio::time::sleep(reste.min(RELECTURE_DE_L_ARRET)).await;
+    }
+}
+
 /// La passe elle-même : toutes les candidates, les fichiers tenus par une
 /// zone reportés puis repris (au plus `attente_max`), et l'écriture dans les
-/// fichiers relue avant chaque fichier.
+/// fichiers relue avant chaque fichier, comme l'arrêt demandé
+/// (`arret_demande`, #7719).
 async fn derouler_la_passe(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     taches: &crate::background_tasks::BackgroundTasks,
     playback: &tune_core::playback::PlaybackManager,
     candidates: &[(i64, String, String)],
     attente_max: std::time::Duration,
+    arret_demande: &(dyn Fn() -> bool + Sync),
 ) {
     let total = candidates.len();
     let repo = TrackMetadataRepo::with_backend(backend.clone());
@@ -442,6 +514,17 @@ async fn derouler_la_passe(
             total,
             written = c.written,
             "graver_dr_abandonnee_ecriture_fichiers_desactivee"
+        );
+    };
+    // #7719 — arrêtée à la demande : ce qui est gravé le reste, rien d'autre
+    // n'est écrit.
+    let arret = |c: &Compteurs| {
+        ecrire_statut(backend, &c.statut(ETAT_ANNULE, total));
+        info!(
+            total,
+            written = c.written,
+            traitees = c.traitees(),
+            "graver_dr_arretee_a_la_demande"
         );
     };
 
@@ -463,6 +546,10 @@ async fn derouler_la_passe(
         // freinées (#4681) : pendant qu'une zone joue, une pause entre
         // deux fichiers, et la passe nommée au relevé.
         priorite::ceder_a_la_lecture(priorite::ID_GRAVER_DR).await;
+        if arret_demande() {
+            arret(&c);
+            return;
+        }
         if let Some(motif) = fichier_tenu(playback, backend, &pistes, &candidate.1).await {
             info!(
                 track_id = candidate.0,
@@ -494,10 +581,18 @@ async fn derouler_la_passe(
             }
             break;
         }
-        tokio::time::sleep(attente_du_fichier_en_lecture().min(attente_max)).await;
+        patienter_sauf_arret(
+            attente_du_fichier_en_lecture().min(attente_max),
+            arret_demande,
+        )
+        .await;
         let mut encore = Vec::with_capacity(reportees.len());
         for candidate in reportees {
             priorite::ceder_a_la_lecture(priorite::ID_GRAVER_DR).await;
+            if arret_demande() {
+                arret(&c);
+                return;
+            }
             if fichier_tenu(playback, backend, &pistes, &candidate.1)
                 .await
                 .is_some()
@@ -610,16 +705,22 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> axum::response::Res
     ecrire_statut(&backend, &Compteurs::default().statut("running", total));
 
     let playback = state.playback.clone();
+    let drapeau = armer_l_arret(&backend);
     tokio::spawn(async move {
         let _garde = garde;
+        let arret_demande = || drapeau.load(Ordering::SeqCst);
         derouler_la_passe(
             &backend,
             &taches,
             &playback,
             &candidates,
             ATTENTE_MAX_DES_REPORTEES,
+            &arret_demande,
         )
         .await;
+        // Avant la garde : l'état final est déjà écrit, et un arrêt demandé
+        // à partir d'ici ne vise plus rien.
+        desarmer_l_arret(&backend, &drapeau);
     });
 
     (
@@ -627,6 +728,29 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> axum::response::Res
         Json(json!({"status": "accepted", "total": total, "hors_format": inv.hors_format})),
     )
         .into_response()
+}
+
+/// POST /library/dr/gravure/cancel (#7719)
+///
+/// Demande l'arrêt de la passe en cours. Il est lu avant le fichier suivant :
+/// celui en cours d'écriture finit, rien n'est écrit après, et la passe finit
+/// `cancelled`. `{"cancelled": false}` quand aucune passe ne tourne.
+pub(crate) async fn annuler(State(state): State<AppState>) -> Json<Value> {
+    let cle = cle_de_la_base(&state.backend);
+    let demande = ARRETS
+        .lock()
+        .ok()
+        .and_then(|arrets| {
+            arrets
+                .iter()
+                .find(|(c, _)| *c == cle)
+                .map(|(_, d)| d.store(true, Ordering::SeqCst))
+        })
+        .is_some();
+    if demande {
+        info!("graver_dr_arret_demande");
+    }
+    Json(json!({"cancelled": demande}))
 }
 
 #[cfg(test)]
@@ -1054,6 +1178,7 @@ mod tests_attente_bornee_6212 {
                 &s.playback,
                 &candidates,
                 Duration::from_millis(300),
+                &|| false,
             ),
         )
         .await
@@ -1089,6 +1214,7 @@ mod tests_attente_bornee_6212 {
                     &s.playback,
                     &candidates,
                     Duration::from_secs(60),
+                    &|| false,
                 )
                 .await
             })
@@ -1134,6 +1260,7 @@ mod tests_attente_bornee_6212 {
                 &s.playback,
                 &candidates,
                 Duration::from_millis(300),
+                &|| false,
             ),
         )
         .await
@@ -1147,5 +1274,174 @@ mod tests_attente_bornee_6212 {
         let statut = lire_statut(&s);
         assert_eq!(statut["skipped"], 1, "{statut}");
         assert_eq!(statut["written"], 0, "{statut}");
+    }
+}
+
+/// #7719 — arrêter la gravure en cours : entre deux fichiers, ce qui est
+/// gravé le reste, rien n'est écrit après, et l'état le dit.
+#[cfg(test)]
+mod tests_arret_7719 {
+    use super::*;
+    use std::time::Duration;
+    use tune_core::db::backend::ToSqlValue;
+
+    const ZONE: i64 = 77;
+
+    /// `n` copies de la fixture FLAC, chacune indexée avec un DR calculé.
+    fn banc(n: i64) -> (tune_core::test_scratch::ScratchDir, Vec<String>, AppState) {
+        let dir = tune_core::test_scratch::scratch_dir("gravure-dr-arret-7719");
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        crate::routes::ecriture_fichiers::activer_pour_test(&s.backend);
+        let repo = TrackMetadataRepo::with_backend(s.backend.clone());
+        let mut chemins = Vec::new();
+        for id in 1..=n {
+            let cible = dir.path().join(format!("p{id}.flac"));
+            std::fs::copy(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../tune-core/tests/fixtures/test.flac"),
+                &cible,
+            )
+            .unwrap();
+            let chemin = cible.to_string_lossy().into_owned();
+            s.backend
+                .execute(
+                    "INSERT INTO tracks (id, title, file_path) VALUES (?1, ?2, ?3)",
+                    &[&id as &dyn ToSqlValue, &format!("p{id}"), &chemin],
+                )
+                .unwrap();
+            repo.set(id, "dr_track", "12").unwrap();
+            repo.set(id, "dr_source", "analysis").unwrap();
+            chemins.push(chemin);
+        }
+        (dir, chemins, s)
+    }
+
+    fn grave(chemin: &str) -> bool {
+        tune_core::metadata::read_extended_metadata(std::path::Path::new(chemin))
+            .get("dr_track")
+            .is_some()
+    }
+
+    fn source_en_base(s: &AppState, id: i64) -> Option<String> {
+        TrackMetadataRepo::with_backend(s.backend.clone())
+            .get_all(id)
+            .unwrap()
+            .get("dr_source")
+            .cloned()
+    }
+
+    /// L'utilisateur arrête la passe dès que la première piste est gravée :
+    /// la seconde n'est pas touchée, octet pour octet, et reste à graver.
+    #[tokio::test]
+    async fn l_arret_demande_apres_la_premiere_piste_epargne_la_seconde_7719() {
+        let (_dir, chemins, s) = banc(2);
+        let seconde_avant = std::fs::read(&chemins[1]).unwrap();
+        let (_, candidates) = inventaire(&s);
+        assert_eq!(candidates.len(), 2);
+        let premiere = chemins[0].clone();
+        // L'arrêt est « demandé » au moment exact où le premier fichier porte
+        // sa valeur : ni avant, ni après la seconde gravure.
+        let arret_demande = move || grave(&premiere);
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            derouler_la_passe(
+                &s.backend,
+                &s.background_tasks,
+                &s.playback,
+                &candidates,
+                Duration::from_secs(60),
+                &arret_demande,
+            ),
+        )
+        .await
+        .expect("la passe doit s'arrêter");
+
+        assert!(grave(&chemins[0]), "la première piste doit rester gravée");
+        assert_eq!(source_en_base(&s, 1).as_deref(), Some("tag"));
+        assert!(
+            std::fs::read(&chemins[1]).unwrap() == seconde_avant,
+            "arrêt demandé : la seconde piste a été écrite après l'arrêt ({})",
+            lire_statut(&s)
+        );
+        assert_eq!(source_en_base(&s, 2).as_deref(), Some("analysis"));
+        let statut = lire_statut(&s);
+        assert_eq!(statut["status"], ETAT_ANNULE, "{statut}");
+        assert_eq!(statut["written"], 1, "{statut}");
+        assert_eq!(statut["total"], 2, "{statut}");
+        assert_eq!(inventaire(&s).0.a_graver, 1, "la seconde reste à graver");
+    }
+
+    /// Par la route : la passe attend un fichier qu'une zone tient ;
+    /// `POST …/cancel` l'arrête sans attendre la fin de la pause, le fichier
+    /// n'est pas écrit, l'état est `cancelled` et la relance est acceptée.
+    #[tokio::test]
+    async fn la_route_d_arret_coupe_l_attente_d_un_fichier_tenu_7719() {
+        let (_dir, chemins, s) = banc(1);
+        let avant = std::fs::read(&chemins[0]).unwrap();
+        s.playback
+            .play(
+                ZONE,
+                tune_core::playback::NowPlaying {
+                    track_id: Some(1),
+                    title: "p1".into(),
+                    source: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let r = lancer(State(s.clone())).await.into_response();
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(en_cours(&s), "la passe doit attendre le fichier tenu");
+
+        let Json(v) = annuler(State(s.clone())).await;
+        assert_eq!(v["cancelled"], true, "{v}");
+        // La zone tient toujours la piste : seule la demande d'arrêt peut
+        // finir la passe avant la borne de 30 minutes.
+        for _ in 0..200 {
+            if !en_cours(&s) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!en_cours(&s), "la passe ne s'est pas arrêtée");
+
+        assert!(
+            std::fs::read(&chemins[0]).unwrap() == avant,
+            "arrêt demandé : le fichier tenu a été écrit"
+        );
+        let Json(v) = statut(State(s.clone())).await;
+        assert_eq!(v["status"], ETAT_ANNULE, "{v}");
+        assert_eq!(v["written"], 0, "{v}");
+        assert_eq!(v["a_graver"], 1, "{v}");
+        // Une nouvelle demande ne vise plus rien.
+        let Json(v) = annuler(State(s.clone())).await;
+        assert_eq!(v["cancelled"], false, "{v}");
+        s.playback.stop(ZONE).await;
+        let r = lancer(State(s.clone())).await.into_response();
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+    }
+
+    /// Aucune passe : la demande d'arrêt répond `false`, rien ne change.
+    #[tokio::test]
+    async fn l_arret_sans_passe_ne_vise_rien_7719() {
+        let (_dir, _, s) = banc(0);
+        let Json(v) = annuler(State(s.clone())).await;
+        assert_eq!(v, json!({"cancelled": false}));
+        assert_eq!(lire_statut(&s), json!({"status": "idle"}));
+    }
+
+    /// `cancelled` n'est réécrit `interrupted` ni par la lecture de l'état
+    /// ni au démarrage.
+    #[test]
+    fn cancelled_n_est_pas_reecrit_interrupted_7719() {
+        let (_dir, _, s) = banc(0);
+        let arretee = json!({"status": "cancelled", "total": 9, "written": 4,
+                             "already": 0, "skipped": 0, "errors": 0});
+        ecrire_statut(&s.backend, &arretee);
+        assert_eq!(statut_courant(&s), arretee);
+        marquer_passe_interrompue_au_demarrage(&s.backend);
+        assert_eq!(lire_statut(&s), arretee);
     }
 }

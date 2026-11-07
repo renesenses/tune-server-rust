@@ -85,6 +85,14 @@ pub(super) fn langue_courante() -> &'static str {
     LANGUE.try_with(|lang| *lang).unwrap_or("fr")
 }
 
+/// La langue de la requête en cours, posée par [`avec_langue`] ; `None` hors
+/// d'une requête (tâche détachée, test qui appelle un gestionnaire en direct).
+/// Lue par `crate::message_api` pour rendre ses phrases dans la langue de
+/// l'interface sans que chaque route ait à extraire ses en-têtes.
+pub(crate) fn langue_de_la_requete() -> Option<&'static str> {
+    LANGUE.try_with(|lang| *lang).ok()
+}
+
 pub(crate) async fn avec_langue(
     request: axum::extract::Request,
     next: axum::middleware::Next,

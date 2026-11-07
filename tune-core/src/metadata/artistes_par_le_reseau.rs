@@ -386,7 +386,7 @@ where
     // Un même MBID rendu deux fois ne fait pas deux candidats.
     let mut vus = BTreeSet::new();
     candidats.retain(|c| vus.insert(c.mbid.clone()));
-    candidats.sort_by(|a, b| b.score.cmp(&a.score));
+    candidats.sort_by_key(|a| std::cmp::Reverse(a.score));
     if candidats.is_empty() {
         return fin(Verdict::SansCorrespondance, requetes);
     }

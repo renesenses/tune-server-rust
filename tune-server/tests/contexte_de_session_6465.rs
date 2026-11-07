@@ -87,15 +87,28 @@ async fn un_podcast_joue_apres_un_album_n_en_herite_pas_le_contexte() {
     let status = poster(
         &app,
         "/api/v1/podcasts/play/1",
-        json!({"audio_url": "http://127.0.0.1:9/episode.mp3", "title": "Épisode"}),
+        json!({"audio_url": "http://127.0.0.1:9/episode.mp3", "title": "Épisode", "podcast_id": "podcast-sans-album", "podcast_name": "Podcast"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         contexte(&state).await,
-        (None, None),
+        (Some("podcast".into()), Some("podcast-sans-album".into())),
         "le podcast a gardé le contexte de l'album 101 : l'Historique le range dans l'album"
     );
+    // Ancien client sans identifiant : aucun album ni podcast précédent ne fuit.
+    assert_eq!(
+        poster(
+            &app,
+            "/api/v1/podcasts/play/1",
+            json!({
+                "audio_url": "http://127.0.0.1:9/autre-episode.mp3", "title": "Autre épisode"
+            })
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(contexte(&state).await, (Some("podcast".into()), None));
 }
 
 #[tokio::test]
@@ -182,5 +195,287 @@ async fn la_bibliotheque_lue_en_aleatoire_n_herite_pas_de_l_album() {
         contexte(&state).await,
         (None, None),
         "un tirage de la bibliothèque s'est rangé dans l'album 101"
+    );
+}
+
+// ─── « Lecture » après Stop : la relance garde le conteneur ──────────────────
+//
+// Fil 2559, point 2 (FabienM) : « l'historique ne garde plus les conteneurs ».
+// Après Stop, la barre de transport et le mini-lecteur relancent par
+// `{track_id}` (bibliothèque) ou `{source, source_id}` (service). Le serveur
+// gardait la file de l'album ou de la playlist (#4298, #2569), mais
+// remplaçait le conteneur de la session par « track » : le titre relancé et
+// toute la suite s'inscrivaient comme des titres isolés dans l'Historique.
+//
+// Banc de bout en bout : vraie base, vrais fichiers WAV, routes HTTP ; seule
+// la sortie audio est factice (`MockOutput`, modèle `relance_locale_file_4298.rs`).
+
+struct BancDeLecture {
+    state: tune_server::state::AppState,
+    app: axum::Router,
+    zone: i64,
+    _dir: tempfile::TempDir,
+}
+
+impl BancDeLecture {
+    /// L'album 1 (pistes 1 à 3), une piste 4 hors album, la playlist 55
+    /// (pistes 3 puis 1).
+    async fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+            .create("Salon 6465", Some("mock"), Some("mock-6465"))
+            .unwrap();
+        state
+            .outputs
+            .lock()
+            .await
+            .register(Box::new(tune_core::outputs::mock::MockOutput::new(
+                "mock-6465",
+                "Sortie de banc",
+            )));
+        state
+            .backend
+            .execute_batch(
+                "INSERT INTO albums (id, title) VALUES (1, 'Album 6465');
+                 INSERT INTO playlists (id, name, profile_id) VALUES (55, 'Liste 6465', 1);",
+            )
+            .unwrap();
+        for id in 1..=4i64 {
+            let path = dir.path().join(format!("{id}.wav"));
+            let pcm = vec![0u8; 44100 * 4];
+            let mut wav = Vec::new();
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&44100u32.to_le_bytes());
+            wav.extend_from_slice(&176400u32.to_le_bytes());
+            wav.extend_from_slice(&4u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+            wav.extend_from_slice(&pcm);
+            std::fs::write(&path, wav).unwrap();
+            let mut track = tune_core::db::models::Track::new(format!("Titre {id}"));
+            track.file_path = Some(path.to_string_lossy().into_owned());
+            track.format = Some("wav".into());
+            track.duration_ms = 1000;
+            track.sample_rate = Some(44100);
+            track.bit_depth = Some(16);
+            track.album_id = (id <= 3).then_some(1);
+            track.track_number = id as i32;
+            assert_eq!(
+                tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
+                    .create(&track)
+                    .unwrap(),
+                id
+            );
+        }
+        state
+            .backend
+            .execute_batch(
+                "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (55, 3, 0), (55, 1, 1);",
+            )
+            .unwrap();
+        let app = tune_server::routes::router(state.clone());
+        Self {
+            state,
+            app,
+            zone,
+            _dir: dir,
+        }
+    }
+
+    async fn play(&self, corps: Value) -> StatusCode {
+        poster(
+            &self.app,
+            &format!("/api/v1/zones/{}/play", self.zone),
+            corps,
+        )
+        .await
+    }
+
+    async fn stop(&self) {
+        let status = poster(
+            &self.app,
+            &format!("/api/v1/zones/{}/stop", self.zone),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "Stop refusé");
+    }
+
+    async fn contexte(&self) -> (Option<String>, Option<String>) {
+        let etat = self.state.playback.get_state(self.zone).await;
+        (etat.session_context_type, etat.session_context_id)
+    }
+
+    fn file(&self) -> Vec<Option<i64>> {
+        tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(self.state.backend.clone())
+            .get_ordered(self.zone)
+            .unwrap()
+            .iter()
+            .map(|e| e.track_id)
+            .collect()
+    }
+
+    /// Les écoutes écrites pour une piste : (nature, identifiant) du
+    /// conteneur. Le MOMENT de l'écriture relève de la règle d'écoute validée
+    /// (#7852) ; ce banc ne regarde que le conteneur de ce qui est écrit.
+    fn ecoutes(&self, titre: &str) -> Vec<(Option<String>, Option<String>)> {
+        self.state
+            .backend
+            .query_many(
+                "SELECT context_type, context_id FROM listen_history WHERE title = ? ORDER BY id",
+                &[&titre as &dyn tune_core::db::backend::ToSqlValue],
+            )
+            .unwrap()
+            .iter()
+            .map(|ligne| (ligne[0].as_string(), ligne[1].as_string()))
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn la_relance_apres_stop_d_un_titre_d_album_garde_l_album() {
+    let banc = BancDeLecture::new().await;
+    assert_eq!(banc.play(json!({"album_id": 1})).await, StatusCode::OK);
+    assert_eq!(
+        banc.contexte().await,
+        (Some("album".into()), Some("1".into()))
+    );
+    banc.stop().await;
+
+    // La barre de transport, zone arrêtée : `{track_id}` seul.
+    assert_eq!(banc.play(json!({"track_id": 2})).await, StatusCode::OK);
+    assert_eq!(
+        banc.file(),
+        vec![Some(1), Some(2), Some(3)],
+        "file de l'album gardée (#4298)"
+    );
+    assert_eq!(
+        banc.contexte().await,
+        (Some("album".into()), Some("1".into())),
+        "la relance nue a gardé la file de l'album mais remplacé son conteneur"
+    );
+    for ecoute in banc.ecoutes("Titre 2") {
+        assert_eq!(
+            ecoute,
+            (Some("album".into()), Some("1".into())),
+            "l'écoute du titre relancé s'est inscrite hors de son album"
+        );
+    }
+}
+
+#[tokio::test]
+async fn la_relance_apres_stop_d_un_titre_de_playlist_garde_la_playlist() {
+    let banc = BancDeLecture::new().await;
+    assert_eq!(banc.play(json!({"playlist_id": 55})).await, StatusCode::OK);
+    assert_eq!(
+        banc.contexte().await,
+        (Some("playlist".into()), Some("55".into()))
+    );
+    banc.stop().await;
+
+    assert_eq!(banc.play(json!({"track_id": 1})).await, StatusCode::OK);
+    assert_eq!(
+        banc.file(),
+        vec![Some(3), Some(1)],
+        "file de la playlist gardée"
+    );
+    assert_eq!(
+        banc.contexte().await,
+        (Some("playlist".into()), Some("55".into())),
+        "la relance nue a gardé la file de la playlist mais remplacé son conteneur"
+    );
+    for ecoute in banc.ecoutes("Titre 1") {
+        assert_eq!(
+            ecoute,
+            (Some("playlist".into()), Some("55".into())),
+            "l'écoute du titre relancé s'est inscrite hors de sa playlist"
+        );
+    }
+}
+
+/// Garde-fou : un titre ABSENT de la file est un nouveau geste. Il remplace
+/// la file et devient « track », comme avant.
+#[tokio::test]
+async fn un_titre_absent_de_la_file_devient_un_titre_isole() {
+    let banc = BancDeLecture::new().await;
+    assert_eq!(banc.play(json!({"album_id": 1})).await, StatusCode::OK);
+    banc.stop().await;
+
+    assert_eq!(banc.play(json!({"track_id": 4})).await, StatusCode::OK);
+    assert_eq!(banc.file(), vec![Some(4)]);
+    assert_eq!(
+        banc.contexte().await,
+        (Some("track".into()), Some("4".into())),
+        "un titre hors de la file a hérité de l'album d'avant"
+    );
+}
+
+/// Garde-fou : « Lire » l'album depuis sa fiche avec un départ choisi reste
+/// un nouveau geste, même si la piste est déjà dans la file.
+#[tokio::test]
+async fn un_contenant_designe_reste_un_nouveau_geste() {
+    let banc = BancDeLecture::new().await;
+    assert_eq!(banc.play(json!({"playlist_id": 55})).await, StatusCode::OK);
+    banc.stop().await;
+
+    assert_eq!(
+        banc.play(json!({"album_id": 1, "start_index": 0})).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        banc.contexte().await,
+        (Some("album".into()), Some("1".into()))
+    );
+}
+
+/// Titre de service déjà dans la file (Stop puis Lecture sur une playlist
+/// Qobuz) : `{source, source_id}` garde la file (#2569) et doit garder la
+/// playlist. Les lignes de file sont écrites directement : le banc n'a pas
+/// de service connecté, la lecture elle-même peut échouer après la décision.
+#[tokio::test]
+async fn la_relance_d_un_titre_de_service_deja_en_file_garde_la_playlist() {
+    let banc = BancDeLecture::new().await;
+    let ligne = |id: &str| tune_core::db::play_queue_repo::QueueInput::Streaming {
+        source: "qobuz".into(),
+        source_id: id.into(),
+        title: format!("Service {id}"),
+        artist: "Artiste".into(),
+        album: None,
+        cover_url: None,
+        duration_ms: 1000,
+        track_number: None,
+        disc_number: None,
+        album_ref: None,
+        artist_ref: None,
+    };
+    tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(banc.state.backend.clone())
+        .append(banc.zone, &[ligne("q-1"), ligne("q-2")])
+        .unwrap();
+    banc.state
+        .playback
+        .set_session_context(
+            banc.zone,
+            Some("playlist".into()),
+            Some("pl-qobuz".into()),
+            Some("qobuz".into()),
+            Some("Liste Qobuz".into()),
+            None,
+        )
+        .await;
+
+    let _ = banc
+        .play(json!({"source": "qobuz", "source_id": "q-2"}))
+        .await;
+    assert_eq!(
+        banc.contexte().await,
+        (Some("playlist".into()), Some("pl-qobuz".into())),
+        "la relance d'un titre de service déjà en file a remplacé le conteneur de la playlist"
     );
 }

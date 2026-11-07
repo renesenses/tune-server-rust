@@ -19,14 +19,15 @@
 //! ```
 //!
 //! Un fichier SANS `format_version` est l'ancien export : la table `settings`
-//! à plat. Il se restaure exactement comme avant.
+//! à plat. Sans identité d'appareil, ses réglages de volume de zone sont
+//! écartés ; les autres préférences restent restaurables.
 //!
 //! # Règles de la restauration
 //!
 //! - Une zone du fichier est rapprochée d'une zone de la machine par son
-//!   **identifiant d'appareil** (`output_device_id`), jamais par son numéro ni
-//!   par son nom : le numéro ne désigne pas la même zone d'une machine à
-//!   l'autre, et deux appareils peuvent porter le même nom.
+//!   **identifiant d'appareil** (`output_device_id`) ou par une MAC unique
+//!   de même type. Le nom seul ne permet de restaurer aucun réglage de volume.
+//!   Une même MAC garde l'identifiant actuel de sa zone.
 //! - Une zone dont l'appareil n'a aucune zone ici est CRÉÉE **hors ligne** : la
 //!   découverte la remettra en ligne si l'appareil répond.
 //! - Une zone de la machine absente du fichier n'est jamais touchée, et aucune
@@ -152,8 +153,10 @@ fn zones_exportees(
         }
     }
 
+    let mut toutes = crate::config_backup::export_zones(backend)?;
+    crate::config_backup::ajouter_les_mac(backend, &mut toutes);
     let mut zones = Vec::new();
-    for mut zone in crate::config_backup::export_zones(backend)? {
+    for mut zone in toutes {
         let Some(id) = zone.get("id").and_then(Value::as_i64) else {
             continue;
         };
@@ -332,6 +335,7 @@ pub struct ZonePlanifiee {
     /// Champs (et réglages de zone, sous leur gabarit) qui changent.
     pub changements: Vec<String>,
     cible: Cible,
+    identite_sure: bool,
     source_id: Option<i64>,
     donnees: Map<String, Value>,
 }
@@ -543,13 +547,55 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
             // d'identité stable : on ne la rapproche que d'une zone visible
             // sans appareil et de même nom, pour qu'un second import ne la
             // duplique pas.
-            let existante = match &appareil {
+            let par_appareil = match &appareil {
                 Some(a) => repo.get_by_device_id(a)?.and_then(|z| z.id),
-                None => visibles
-                    .iter()
-                    .find(|z| z.output_device_id.is_none() && z.name == nom)
-                    .and_then(|z| z.id),
+                None => None,
             };
+            let par_mac = if par_appareil.is_none() {
+                zone.get("mac")
+                    .and_then(Value::as_str)
+                    .and_then(crate::discovery::mac::normalize_mac)
+                    .and_then(|mac| {
+                        crate::config_backup::zone_par_mac(
+                            backend,
+                            &mac,
+                            zone.get("output_type").and_then(Value::as_str),
+                        )
+                    })
+            } else {
+                None
+            };
+            let existante = par_appareil.or(par_mac).or_else(|| {
+                appareil
+                    .is_none()
+                    .then(|| {
+                        visibles
+                            .iter()
+                            .find(|z| z.output_device_id.is_none() && z.name == nom)
+                            .and_then(|z| z.id)
+                    })
+                    .flatten()
+            });
+            let identite_sure = appareil.is_some() || par_mac.is_some();
+            let appareil_cible = match par_mac {
+                Some(id) => repo.get(id)?.and_then(|z| z.output_device_id),
+                None => appareil.clone(),
+            };
+            // Sans appareil prouvé, ni le volume ni les réglages qui le
+            // gouvernent ne traversent une correspondance de nom (#6774).
+            let mut donnees = zone.clone();
+            if !identite_sure {
+                donnees.remove("volume");
+                if let Some(r) = donnees.get_mut("settings").and_then(Value::as_object_mut) {
+                    r.retain(|gabarit, _| {
+                        !crate::audio::reglages_de_volume::est_un_reglage_de_volume(gabarit)
+                    });
+                }
+                avertissements.push(format!(
+                    "zone '{nom}': no device identity; volume settings were not restored"
+                ));
+            }
+            let zone = &donnees;
             if let Some(id) = existante
                 && !cibles_vues.insert(id)
             {
@@ -592,6 +638,16 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
                             }
                         }
                     }
+                    if !identite_sure {
+                        // L'aperçu annonce aussi ce que l'application retire.
+                        for gabarit in crate::audio::reglages_de_volume::GABARITS_DE_VOLUME {
+                            if leurs.contains_key(*gabarit)
+                                && !changements.iter().any(|c| c.as_str() == *gabarit)
+                            {
+                                changements.push((*gabarit).to_string());
+                            }
+                        }
+                    }
                     let statut = if changements.is_empty() {
                         Statut::Inchange
                     } else {
@@ -614,12 +670,13 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
 
             zones.push(ZonePlanifiee {
                 nom,
-                output_device_id: appareil,
+                output_device_id: appareil_cible,
                 statut,
                 hors_ligne: matches!(cible, Cible::Nouvelle(_)),
                 masquee,
                 changements,
                 cible,
+                identite_sure,
                 source_id,
                 donnees: zone.clone(),
             });
@@ -643,6 +700,15 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
     let mut reglages = Vec::new();
     let mut ignores_de_zone = 0usize;
     for (cle, brute) in &fichier.settings {
+        // L'ancien format à plat ne porte aucune identité d'appareil.
+        if fichier.format_version < 2
+            && gabarit_de_cle_de_zone(cle).is_some_and(|(_, gabarit)| {
+                crate::audio::reglages_de_volume::est_un_reglage_de_volume(&gabarit)
+            })
+        {
+            ignores_de_zone += 1;
+            continue;
+        }
         let valeur = if fichier.format_version >= 2 {
             // Dans le nouveau format, un réglage de zone voyage dans sa zone.
             // Un `zone_7_…` resté dans `settings` désigne un numéro de la
@@ -853,6 +919,11 @@ pub fn appliquer(backend: &Arc<dyn DbBackend>, plan: &Plan) -> Result<Bilan, Str
             }
         };
 
+        if !zone.identite_sure {
+            let retirees = crate::audio::reglages_de_volume::neutraliser(backend, id);
+            tracing::warn!(zone_id = id, retirees = ?retirees,
+                "config_import_zone_sans_identite_reglages_de_volume_neutres");
+        }
         for champ in CHAMPS_DE_ZONE {
             if !nouvelle && !zone.changements.iter().any(|c| c == champ) {
                 continue;
@@ -875,7 +946,7 @@ pub fn appliquer(backend: &Arc<dyn DbBackend>, plan: &Plan) -> Result<Bilan, Str
         }
         if let Some(r) = zone.donnees.get("settings").and_then(Value::as_object) {
             for (gabarit, v) in r {
-                if !nouvelle && !zone.changements.iter().any(|c| c == gabarit) {
+                if !nouvelle && !zone.changements.iter().any(|c| c.as_str() == *gabarit) {
                     continue;
                 }
                 let Some(cle) = cle_de_zone_valide(gabarit, id) else {
@@ -1019,3 +1090,7 @@ mod tests {
         assert_eq!(traduire_reglage("default_zone_id", &json!(9), &vers), None);
     }
 }
+
+#[cfg(test)]
+#[path = "config_export/volume_6774_tests.rs"]
+mod volume_6774_tests;

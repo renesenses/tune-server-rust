@@ -290,7 +290,10 @@ impl MediaServerRepo {
 
     pub fn lister(&self) -> Result<Vec<ServeurEnregistre>, String> {
         let rows = self.db.query_many(&sql::lister(), &[])?;
-        Ok(rows.iter().filter_map(ligne_vers_serveur).collect())
+        Ok(rows
+            .iter()
+            .filter_map(|cols| ligne_vers_serveur(cols))
+            .collect())
     }
 
     pub fn compter(&self) -> Result<i64, String> {
@@ -306,7 +309,7 @@ fn maintenant_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-fn ligne_vers_serveur(cols: &Vec<super::backend::SqlValue>) -> Option<ServeurEnregistre> {
+fn ligne_vers_serveur(cols: &[super::backend::SqlValue]) -> Option<ServeurEnregistre> {
     if cols.len() < 15 {
         return None;
     }

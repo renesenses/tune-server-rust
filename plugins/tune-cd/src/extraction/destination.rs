@@ -181,6 +181,118 @@ pub fn verifier(demande: &str, emplacements: &[String]) -> Result<PathBuf, Refus
     Ok(chemin)
 }
 
+/// #7105 — la cause d'une écriture refusée, en un motif stable.
+pub fn cause_d_ecriture(e: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::PermissionDenied => "droits_refuses",
+        ErrorKind::ReadOnlyFilesystem => "lecture_seule",
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "espace_insuffisant",
+        ErrorKind::NotFound => "dossier_introuvable",
+        _ => "autre",
+    }
+}
+
+/// #7105 — la phrase qui nomme la cause et le chemin, suivie du détail
+/// donné par le système.
+pub fn message_d_ecriture(cause: &str, chemin: &Path, e: &std::io::Error) -> String {
+    let c = chemin.display();
+    let phrase = match cause {
+        "droits_refuses" => format!(
+            "Le serveur Tune n'a pas le droit d'écrire dans {c} : donnez ce droit au compte \
+             qui fait tourner le serveur, ou choisissez un autre dossier."
+        ),
+        "lecture_seule" => format!("{c} est sur un disque en lecture seule."),
+        "espace_insuffisant" => format!("Il n'y a plus de place sur le disque de {c}."),
+        "dossier_introuvable" => format!("{c} n'existe pas ou a disparu."),
+        _ => format!("Écriture impossible dans {c}."),
+    };
+    format!("{phrase} ({e})")
+}
+
+/// #7105 — le dossier existant le plus proche de `chemin` (lui-même s'il
+/// existe) : celui où le serveur devra créer le reste.
+fn plus_proche_existant(chemin: &Path) -> Option<&Path> {
+    let mut p = Some(chemin);
+    while let Some(c) = p {
+        if c.is_dir() {
+            return Some(c);
+        }
+        p = c.parent();
+    }
+    None
+}
+
+/// #7105 — la place libre, en octets, du disque qui porte `chemin`
+/// (`None` : inconnue sur ce système).
+pub fn espace_libre(chemin: &Path) -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(chemin.as_os_str().as_bytes()).ok()?;
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY : `c` est une chaîne C valide, `s` une structure à remplir.
+        if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+            return None;
+        }
+        #[allow(clippy::unnecessary_cast)]
+        Some(s.f_bavail as u64 * s.f_frsize as u64)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = chemin;
+        None
+    }
+}
+
+/// #7105 — avant de lancer : le serveur peut-il écrire dans `dossier`, et
+/// reste-t-il `octets` sur son disque ? Un fichier témoin est créé puis
+/// effacé dans le dossier existant le plus proche, sans rien laisser (les
+/// dossiers de l'album sont créés par l'extraction). `libre` donne la place
+/// libre (injectable : un disque plein ne se provoque pas en test).
+pub fn verifier_ecriture(
+    dossier: &Path,
+    octets: u64,
+    libre: impl Fn(&Path) -> Option<u64>,
+) -> Result<(), super::ErreurTravail> {
+    let Some(existant) = plus_proche_existant(dossier) else {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        return Err(super::ErreurTravail::ecriture(dossier, &e));
+    };
+    if let Err(e) = tempfile::Builder::new()
+        .prefix(".tune-essai-ecriture-")
+        .tempfile_in(existant)
+    {
+        return Err(super::ErreurTravail::ecriture(existant, &e));
+    }
+    if let Some(disponible) = libre(existant)
+        && disponible < octets
+    {
+        return Err(super::ErreurTravail {
+            code: "ecriture",
+            message: format!(
+                "Il n'y a pas assez de place sur le disque de {} : il faut environ {} Mo, \
+                 il en reste {} Mo.",
+                existant.display(),
+                octets.div_ceil(1_000_000),
+                disponible / 1_000_000
+            ),
+            cause: Some("espace_insuffisant"),
+            chemin: Some(existant.to_string_lossy().to_string()),
+        });
+    }
+    Ok(())
+}
+
+/// #7105 — la place que demande l'extraction de `secteurs` secteurs : le
+/// PCM entier en WAV ; en FLAC, les trois quarts (un CD se compresse en
+/// général de 40 à 60 %), plus une marge pour les balises et la pochette.
+pub fn octets_necessaires(secteurs: u64, flac: bool) -> u64 {
+    let pcm = secteurs * crate::toc::OCTETS_PAR_SECTEUR as u64;
+    let donnees = if flac { pcm / 4 * 3 } else { pcm };
+    donnees + 10_000_000
+}
+
 /// La destination à employer sans demande explicite : le réglage s'il est
 /// encore valide, sinon le premier emplacement de la bibliothèque. `None` :
 /// la bibliothèque n'a aucun emplacement.

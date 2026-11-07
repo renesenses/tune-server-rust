@@ -9,6 +9,10 @@ services:
     volumes:
       - /chemin/vers/musique:/music:ro
       - tune-data:/data
+      # Synology : cache des modeles accessible en ecriture au compte Tune.
+      # Creer ce dossier et adapter les droits avant de retirer le commentaire.
+      # Voir docs/INSTALL-SYNOLOGY.md (adapter volume2 a votre NAS).
+      # - /volume2/docker/tune/embedding_models:/app/embedding_models
     # Sortie audio locale vers un DAC USB de cette machine (#5968) : les
     # peripheriques son de l'hote, et le groupe qui les ouvre. A retirer si
     # l'hote n'a pas de /dev/snd. Podman/Fedora : voir « Podman » du README.

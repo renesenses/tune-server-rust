@@ -237,10 +237,11 @@ fn dossier_racine_ou_sep(r: &Racine) -> String {
     }
 }
 
-/// Un enfant d'un dossier.
+/// Un enfant d'un dossier. La piste est en `Box` : une `Track` pèse plus de
+/// 600 octets, un dossier quelques mots (#7154, `clippy::large_enum_variant`).
 enum Enfant {
     Dossier { nom: String, nb_enfants: u64 },
-    Piste(Track),
+    Piste(Box<Track>),
 }
 
 /// Le nom de fichier d'une piste — sa clef de tri dans le dossier.
@@ -271,7 +272,7 @@ fn enfants(state: &UpnpState, chemin: &str) -> Vec<Enfant> {
         .into_iter()
         .filter(|(nom, _)| segment_valide(nom))
         .map(|(nom, nb_enfants)| Enfant::Dossier { nom, nb_enfants })
-        .chain(pistes.into_iter().map(|(_, t)| Enfant::Piste(t)))
+        .chain(pistes.into_iter().map(|(_, t)| Enfant::Piste(Box::new(t))))
         .collect()
 }
 

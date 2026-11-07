@@ -355,6 +355,15 @@ impl ToolExecutor {
             });
         }
 
+        // DLNA et OpenHome arrondissent au pourcentage entier : 0,995
+        // devient déjà 100 %. Même un petit pas ne doit pas y conduire.
+        if (volume * 100.0).round() >= 100.0 {
+            return json!({
+                "error": "full_volume_refused",
+                "message": "The assistant cannot set full volume. Nothing was changed.",
+            });
+        }
+
         let device_id = self.get_zone_device_id();
         match self
             .orchestrator

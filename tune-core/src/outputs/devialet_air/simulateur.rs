@@ -68,11 +68,14 @@ pub fn annonce_de_test() -> Annonce {
     }
 }
 
+/// Un paquet audio reçu : son en-tête, ses trames, ses deux octets de fin.
+pub type PaquetRecu = (EnteteAudio, Vec<[i32; 2]>, [u8; 2]);
+
 #[derive(Default)]
 pub struct EtatSimule {
     pub annonce: Option<Annonce>,
     /// Paquets audio reçus et valides, par flux puis par position.
-    pub paquets: BTreeMap<u32, BTreeMap<u64, (EnteteAudio, Vec<[i32; 2]>, [u8; 2])>>,
+    pub paquets: BTreeMap<u32, BTreeMap<u64, PaquetRecu>>,
     pub arrets: Vec<u32>,
     pub commandes: Vec<CommandeLue>,
     /// Datagrammes refusés (CRC faux, format incohérent).
@@ -178,7 +181,8 @@ impl Simulateur {
                         let mut e = verrou(&etat);
                         avancer(&mut e);
                         let df = retour_a_envoyer(&e);
-                        let da = (n % 2 == 0)
+                        let da = n
+                            .is_multiple_of(2)
                             .then(|| e.annonce.as_ref().map(protocole::annonce))
                             .flatten();
                         (df, da)

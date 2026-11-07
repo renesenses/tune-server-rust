@@ -302,6 +302,11 @@ pub(super) enum Avant {
     /// Ligne d'avant #1444 : adresse dérivée du CHEMIN de la première piste,
     /// source inconnue.
     AdresseHeritee,
+    /// La même, dérivée du chemin de la DERNIÈRE piste : l'ancien scan
+    /// hachait la piste qu'il avait lue la première, et le parcours
+    /// (`readdir`) ne rend pas les pistes dans l'ordre de leur nom. Le
+    /// verdict ne doit pas dépendre de la piste relue la première (#5034).
+    AdresseHeriteeDerniere,
 }
 
 pub(super) struct Cas {
@@ -388,8 +393,13 @@ pub(super) async fn jouer_le_tableau(table: &str, cas: &[Cas], passe: Passe) {
                 )
                 .unwrap();
             }
-            Avant::AdresseHeritee => {
-                let heritee = artwork_hash(&pistes[0].to_string_lossy());
+            Avant::AdresseHeritee | Avant::AdresseHeriteeDerniere => {
+                let piste = if c.pochette == Avant::AdresseHeritee {
+                    &pistes[0]
+                } else {
+                    &pistes[pistes.len() - 1]
+                };
+                let heritee = artwork_hash(&piste.to_string_lossy());
                 db.execute(
                     "UPDATE albums SET cover_path = ?, cover_source = NULL, \
                      cover_source_path = NULL, cover_source_stamp = NULL WHERE id = ?",
@@ -528,14 +538,24 @@ pub(super) const RETRAITS: &[Cas] = &[
 ///
 /// Ne vaut que pour les passes qui RELISENT la piste : le surveillant (piste
 /// modifiée), les scans (piste plus récente que la ligne) — toutes.
-const RETRAIT_PROUVE: &[Cas] = &[Cas {
-    nom: "adresse heritee puis jaquette retiree",
-    avant: (Some(JAQUETTE), None),
-    pochette: Avant::AdresseHeritee,
-    apres: (None, None),
-    attendu: None,
-    complet: None,
-}];
+const RETRAIT_PROUVE: &[Cas] = &[
+    Cas {
+        nom: "adresse heritee puis jaquette retiree",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::AdresseHeritee,
+        apres: (None, None),
+        attendu: None,
+        complet: None,
+    },
+    Cas {
+        nom: "adresse heritee (derniere piste) puis jaquette retiree",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::AdresseHeriteeDerniere,
+        apres: (None, None),
+        attendu: None,
+        complet: None,
+    },
+];
 
 /// Les gestes de CHANGEMENT (points 7 et 9 de Didier) et leurs contre-témoins.
 /// Décision de Bertrand du 25/09/2026 : les passes automatiques suivent une
@@ -616,6 +636,14 @@ pub(super) const CHANGEMENTS: &[Cas] = &[
         nom: "adresse heritee puis jaquette changee",
         avant: (Some(JAQUETTE), None),
         pochette: Avant::AdresseHeritee,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(JAQUETTE_2),
+        complet: None,
+    },
+    Cas {
+        nom: "adresse heritee (derniere piste) puis jaquette changee",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::AdresseHeriteeDerniere,
         apres: (Some(JAQUETTE_2), None),
         attendu: Some(JAQUETTE_2),
         complet: None,

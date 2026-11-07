@@ -745,7 +745,11 @@ CREATE TABLE IF NOT EXISTS tracks (
     rating INTEGER,
     -- Debit moyen du fichier en kbit/s, lu au scan (#6332, migration 130).
     -- NULL = pas encore lu (complete au rescan) ou inconnu.
-    bitrate_kbps INTEGER
+    bitrate_kbps INTEGER,
+    -- Cle de tri de la vue des pistes (#7619, L1) : artiste, album, disque,
+    -- numero, plies. Calculee en Rust (`track_repo::cle_de_tri`), NULL tant
+    -- qu'elle ne l'a pas ete. Index `idx_tracks_cle_tri (cle_tri, id)`.
+    cle_tri TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -757,7 +761,10 @@ CREATE TABLE IF NOT EXISTS track_credits (
     instrument TEXT,
     position INTEGER DEFAULT 0,
     -- Identifiant MusicBrainz de l'artiste credite (migration 107, #4767).
-    artist_mbid TEXT
+    artist_mbid TEXT,
+    -- D'ou vient le credit (migration 137, #7765) : manuel, musicbrainz,
+    -- balises, discogs ou roon. NULL = ligne ancienne, source inconnue.
+    source TEXT
 );
 
 -- Persistent per-file first-seen-in-library timestamp, keyed by path.
@@ -1102,13 +1109,15 @@ CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
 
 -- Dossiers de collections (#4853) — miroir de la migration SQLite 108. Voir
 -- la migration pour la doctrine : `(kind, collection_id)` en clef primaire,
--- une collection dans UN SEUL dossier, `NULL` = racine.
+-- une collection dans UN SEUL dossier, `NULL` = racine. `manual_order`
+-- (migration 134, #6779) : fratrie rangée à la main ; 0 = alphabétique.
 CREATE TABLE IF NOT EXISTS collection_folders (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     parent_id INTEGER,
     position INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    manual_order INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_collection_folders_parent ON collection_folders(parent_id);
 CREATE TABLE IF NOT EXISTS collection_folder_items (

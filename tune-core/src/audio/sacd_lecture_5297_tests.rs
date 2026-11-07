@@ -245,7 +245,9 @@ async fn le_bras_progressif_lit_la_tranche_iso_comme_le_dff() {
     assert_eq!(&iso[..44], &dff[..44], "même en-tête WAV");
     let en_i32 = |octets: &[u8]| -> Vec<i32> {
         octets[44..]
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8)
             .collect()
     };

@@ -178,3 +178,60 @@ async fn la_route_publie_ecrit_et_efface_le_reglage() {
         json!("deployment")
     );
 }
+
+/// #7169 (repère de reprise #5531 posé par une mise à jour forcée) — un choix
+/// explicite « false » prime sur la reprise : pas de scan, et le repère est
+/// levé, sans quoi il relancerait le scan à chaque démarrage.
+#[test]
+fn reglage_false_prime_sur_la_reprise_et_leve_le_repere_7169() {
+    for deploiement in [true, false] {
+        let state = etat(deploiement);
+        poser(&state, "false");
+        crate::routes::system::scan::poser_reprise_du_scan(&state.backend);
+        assert!(
+            !scan_au_demarrage(deploiement, &state.backend),
+            "#7169 : réglage « false » avec repère de reprise posé : le démarrage ne doit pas scanner (déploiement = {deploiement})"
+        );
+        assert!(
+            !crate::routes::system::scan::reprise_du_scan_demandee(&state.backend),
+            "#7169 : réglage « false » : le repère de reprise doit être levé"
+        );
+        assert!(
+            !scan_au_demarrage(deploiement, &state.backend),
+            "#7169 : le démarrage suivant ne doit pas scanner non plus"
+        );
+    }
+}
+
+/// Sans choix de l'utilisateur, la reprise #5531 reste inchangée : le repère
+/// relance le scan, même sans `auto_scan`, et reste posé jusqu'à un scan
+/// allé au bout.
+#[test]
+fn sans_reglage_le_repere_reprend_le_scan_7169() {
+    let state = etat(false);
+    crate::routes::system::scan::poser_reprise_du_scan(&state.backend);
+    assert!(
+        scan_au_demarrage(false, &state.backend),
+        "#5531 : sans réglage, le repère doit relancer le scan au démarrage"
+    );
+    assert!(
+        crate::routes::system::scan::reprise_du_scan_demandee(&state.backend),
+        "#5531 : seul un scan allé au bout lève le repère"
+    );
+}
+
+/// Choix « true » : le scan part, repère ou non.
+#[test]
+fn reglage_true_scanne_au_demarrage_7169() {
+    let state = etat(false);
+    poser(&state, "true");
+    assert!(
+        scan_au_demarrage(false, &state.backend),
+        "#7169 : réglage « true » : le démarrage doit scanner"
+    );
+    crate::routes::system::scan::poser_reprise_du_scan(&state.backend);
+    assert!(
+        scan_au_demarrage(false, &state.backend),
+        "#7169 : réglage « true » avec repère : le démarrage doit scanner"
+    );
+}

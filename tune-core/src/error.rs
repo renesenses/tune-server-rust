@@ -46,6 +46,35 @@ pub enum TuneError {
     #[error("{0}")]
     Unsupported(String),
 
+    /// Le service a répondu en REFUSANT les identifiants saisis.
+    ///
+    /// **Ce n'est ni une panne ni un texte libre** (renesenses/tune-server-rust#7068).
+    /// Un mauvais mot de passe Qobuz sortait en
+    /// `qobuz login: 401 {"status":"error","code":401,"message":"Invalid
+    /// username\/email and password combination"}` : le corps JSON du service,
+    /// recopié tel quel dans la réponse, puis affiché brut par le client. Le
+    /// message est libre et traduit côté client ; la frontière HTTP doit donc
+    /// décider sur la VARIANTE (`code: "invalid_credentials"`), pas sur le texte.
+    ///
+    /// Le texte porté est court et sans JSON du service — le détail brut va au
+    /// journal, jamais dans la réponse.
+    #[error("{0}")]
+    Credentials(String),
+
+    /// Le service a répondu en refusant **l'application Tune**, pas le compte.
+    ///
+    /// Mesuré le 01/11/2026 (rc9, deux testeurs macOS) : le fichier de
+    /// configuration distant servait un `app_id` Qobuz que `user/login` refuse
+    /// par `401 {"message":"User authentication is required"}`. Tune rangeait
+    /// ce 401 avec les mauvais mots de passe ([`TuneError::Credentials`]) et
+    /// l'écran disait « mot de passe incorrect » à des testeurs dont le mot de
+    /// passe était bon. Ressaisir son mot de passe n'y peut rien : c'est la
+    /// configuration de l'application qu'il faut corriger.
+    ///
+    /// Le texte porté est court et sans JSON du service.
+    #[error("{0}")]
+    AppRefused(String),
+
     #[error("{0}")]
     Other(String),
 }

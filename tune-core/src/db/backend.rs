@@ -1103,7 +1103,7 @@ impl PostgresBackend {
                 result.push_str(&idx.to_string());
             } else if c == '\'' {
                 result.push(c);
-                while let Some(sc) = chars.next() {
+                for sc in chars.by_ref() {
                     result.push(sc);
                     if sc == '\'' {
                         break;
@@ -1399,7 +1399,7 @@ impl DbBackend for PostgresBackend {
                     .await
                     .map_err(|e| format!("pg begin tx: {e}"))?;
 
-                let tx_cell = std::cell::RefCell::new(tx);
+                let tx_cell = tokio::sync::Mutex::new(tx);
                 let handle = PgTxHandle {
                     tx: &tx_cell,
                     last_id: last_id_handle.clone(),
@@ -1426,20 +1426,31 @@ impl DbBackend for PostgresBackend {
     }
 }
 
-/// Postgres-backed transaction handle. Wraps a `RefCell`-guarded
+/// Postgres-backed transaction handle. Wraps a mutex-guarded
 /// reference to a `sqlx::Transaction` for the duration of the
 /// `write_tx` closure.
 ///
 /// Each operation inside the closure runs via `block_in_place` +
 /// `block_on` to bridge async sqlx into the sync `DbTxHandle` trait.
-/// The `RefCell` provides interior mutability so the `&self` methods
+/// The mutex provides interior mutability so the `&self` methods
 /// on `DbTxHandle` can borrow the transaction mutably (sqlx requires
 /// `&mut Transaction` for execute/fetch). Single-threaded access is
 /// guaranteed because `write_tx` is synchronous and the handle never
 /// escapes the closure.
+///
+/// #7154 — c'était un `RefCell` dont l'emprunt restait tenu pendant les
+/// `await` de sqlx (`clippy::await_holding_refcell_ref`). Le verrou de tokio
+/// est fait pour être tenu à travers un `await`, et il est pris par
+/// `try_lock` : un appel réentrant (impossible aujourd'hui) rendrait une
+/// erreur au lieu d'attendre — aucun interblocage possible — ou de paniquer
+/// comme le faisait `borrow_mut`.
+/// Erreur d'un emprunt réentrant de la transaction (voir [`PgTxHandle`]).
+#[cfg(feature = "postgres")]
+const PG_TX_REENTRANTE: &str = "pg tx: transaction déjà empruntée (appel réentrant)";
+
 #[cfg(feature = "postgres")]
 struct PgTxHandle<'a> {
-    tx: &'a std::cell::RefCell<sqlx::Transaction<'static, sqlx::Postgres>>,
+    tx: &'a tokio::sync::Mutex<sqlx::Transaction<'static, sqlx::Postgres>>,
     last_id: std::sync::Arc<std::sync::Mutex<i64>>,
     /// Même `Arc` que [`PostgresBackend::tables_avec_id`] : une table déjà
     /// sondée hors transaction ne l'est pas une seconde fois dedans.
@@ -1505,7 +1516,10 @@ impl DbTxHandle for PgTxHandle<'_> {
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut tx_guard = self.tx.borrow_mut();
+                let mut tx_guard = self
+                    .tx
+                    .try_lock()
+                    .map_err(|_| PG_TX_REENTRANTE.to_string())?;
                 // La sonde tourne SUR la transaction : c'est une lecture, elle
                 // ne peut pas l'avorter, et elle voit le schéma tel que la
                 // transaction le voit (une migration DDL en cours comprise).
@@ -1577,7 +1591,10 @@ impl DbTxHandle for PgTxHandle<'_> {
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut tx_guard = self.tx.borrow_mut();
+                let mut tx_guard = self
+                    .tx
+                    .try_lock()
+                    .map_err(|_| PG_TX_REENTRANTE.to_string())?;
                 let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
                 for v in &owned {
                     q = bind_sqlvalue(q, v);
@@ -1607,7 +1624,10 @@ impl DbTxHandle for PgTxHandle<'_> {
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut tx_guard = self.tx.borrow_mut();
+                let mut tx_guard = self
+                    .tx
+                    .try_lock()
+                    .map_err(|_| PG_TX_REENTRANTE.to_string())?;
                 let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
                 for v in &owned {
                     q = bind_sqlvalue(q, v);

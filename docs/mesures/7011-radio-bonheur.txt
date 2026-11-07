@@ -1,0 +1,68 @@
+#7011 — Radio Bonheur : fiche du portail sans identifiant externe
+
+Bertrand Clech / OpenAI Codex / bertrand-20261027-7011-c4d8
+Base batch/bugs-rc9-20261025 : 4e982576bd8d9e358a24a61c60f9fa9b29d3361b.
+
+Cause
+Le cache réel annuaire-v2.json du .18 et la réponse réelle de l'annuaire
+contiennent Radio Bonheur, id=1644, external_id=null, source=mozaiklabs,
+status=active. Ce null est légitime : les fiches créées dans le portail ont
+un id local ; external_id est réservé à l'identifiant radio-metadata importé.
+RadioStation et RadioPresenter::v2 du portail confirment ce contrat.
+Le parseur Tune perdait id ; le client emploie external_id pour jouer et
+ajouter. Son clic construisait donc /directory/null/play/ZONE : 404 avant
+l'orchestrateur, ce qui explique l'absence de tentative de lecture au journal.
+
+Correctif
+Conserver l'identifiant externe existant ; sinon utiliser mozaiklabs:ID
+pour un id entier strictement positif. La clé reste stable après renommage
+ou changement de flux. Aucun identifiant n'est inventé sans id valide.
+La clé des titres en cours reste distincte et inchangée.
+Le fixture vient de la fiche réelle du cache du .18 ; id, nom et URLs sont
+anonymisés, structure et valeurs nulles conservées. Aucun accès à son URL.
+
+Preuves Rust (Shrek uniquement, quatre jobs, admission charge/stockage)
+cargo test -p tune-server --no-default-features --test radios_annuaire_6516 7011
+  2/2 : adressage, ajout idempotent, renommage, préférence de l'id existant,
+  absence de repli pour id invalide. État d'annuaire isolé par test.
+Contre-épreuve : retirer uniquement le repli du parseur, conserver les tests :
+cargo test -p tune-server --no-default-features --test radios_annuaire_6516 une_fiche_portail_sans_id_externe
+  Compilation réussie, test rouge : « une fiche publiée du portail sans id
+  radio-metadata doit garder une clé de lecture », None au lieu de Some.
+  Restauration par copie puis retour au vert 2/2.
+cargo test -p tune-core --test integration_contracts aucune_fuite_de_temporaires
+  3/3 avant push. Formatage ciblé et diff-check verts.
+cargo build -p tune-server --bin tune-server --no-default-features : réussi.
+SHA-256 du candidat testé :
+05e2b338014f0104df36fac3b7f5cca5ac5e0f4a44e888e4ce5b564d6b426522
+
+Preuve réelle, sans son, le 27/10/2026 (heures UTC)
+Deux instances Tune isolées sur le .18, ports 17011/17012, cache réel et
+client web réellement installé, chacune avec sa propre base et seulement une
+zone navigateur. Aucun faux serveur de flux ni réponse HTTP simulée.
+Le service de production n'a été ni remplacé ni redémarré.
+08:49:45.183 : clic client avec binaire installé non corrigé :
+  POST /api/v1/radios/directory/null/play/5 -> 404 radio_annuaire_inconnue.
+09:04:54.111 : même clic client avec candidat corrigé :
+  POST /api/v1/radios/directory/mozaiklabs%3A1644/play/5 -> 200.
+  Revendication réelle du navigateur via « Play it on this device ».
+  Audio réel : currentTime=2.465593, readyState=4, paused=false,
+  muted=true, volume=0. Le flux a donc été décodé par le client.
+Journal candidat, numéros de lignes du journal brut (extraits filtrés archivés) :
+  229, 09:04:54.219 : radio_stream_session_created.
+  234, 09:04:54.223 : orchestrator_play zone_id=5 title=Radio Bonheur
+       source=radio output_sent=false (normal pour le navigateur qui tire).
+  237, 09:04:54.701 : radio_local_decode_stream_connected, audio/mpeg,
+       vrai flux radiobonheur.ice.infomaniak.ch/radiobonheur-128-1.mp3.
+  238, 09:04:54.702 : radio_local_decode_started, stéréo, 44100 Hz,
+       sortie 16 bits, resampled=false, reconnect=0.
+Chrome --mute-audio, volume nul, ALSA null ; aucune sortie physique utilisée.
+Une tentative complémentaire sur l'UI de production : navigation bloquée
+avant le clic Radio (bouton anglais absent), aucune preuve supplémentaire
+revendiquée ; zone navigateur temporaire id27 supprimée, HTTP 204.
+
+Limites
+Pas d'écoute audible, de test renderer physique ni de mesure de stabilité
+longue durée/publicités. La preuve porte sur le lancement et le décodage
+réels, pas sur une livraison en production. Pas de Clippy global relancé,
+ni de revendication de CI complète verte. Aucun changement de version.

@@ -381,23 +381,9 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut plugins: Vec<Value> = fiches_locales_honorables(&state).await;
 
-    // Built-in plugins
-    let xtune_dir = std::env::var("TUNE_XTUNE_DIR").unwrap_or_else(|_| "xtune-web".into());
-    let xtune_installed = std::path::Path::new(&xtune_dir).exists();
-    plugins.push(serde_json::json!({
-        "name": "xtune",
-        "display_name": "xTune",
-        "description": "Vinyl turntable player — interface platine vinyle immersive",
-        "version": "1.0.0",
-        "author": "MozAIk Labs",
-        "type": "built-in",
-        "installed": xtune_installed,
-        "enabled": xtune_installed,
-        "url": "/xtune/",
-        "icon": "vinyl",
-        // Livré AVEC ce serveur : il n'y a pas de version à confronter.
-        "compatible": true,
-    }));
+    // #4908 — plus de fiche « xTune » : elle annonçait `/xtune/`, une route
+    // que ce serveur ne sert pas. Le besoin (commandes d'écran verrouillé sur
+    // téléphone) est porté par le client web.
 
     // Plugins actually loaded through the SDK. These are the only entries
     // backed by running code — everything above is settings bookkeeping.
@@ -438,6 +424,15 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
             "activation_error": tune_plugin_native::failure(&info.name),
             "compatible": true,
         });
+        // tune-web-client#2527 — ce que le greffon CHARGÉ fournit au client
+        // web. Seul `web_theme` existe : le chemin complet de son thème, que
+        // le client applique sans connaître le nom du greffon. Jamais sur une
+        // fiche dormante (plus bas) : ses routes ne sont pas montées.
+        if let Some(route) = info.web_theme.as_deref() {
+            card["provides"] = json!({
+                "web_theme": format!("/api/v1/ext/{}{}", info.name, route),
+            });
+        }
         // Greffons audio premium : `installed`, `install_proposed`,
         // `existing_configuration` à la racine, lus en base à chaque appel.
         crate::premium_audio_plugins::annotate(&settings, &info.name, &mut card);
@@ -458,7 +453,9 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
                 .as_deref()
                 == Some("true")
         } else {
-            true
+            // #7470 — un greffon actif d'office qu'on a désinstallé se
+            // présente comme disponible (« Installer »), pas comme installé.
+            !crate::plugins::greffon_masque(&settings, &info.name)
         };
         let mut card = serde_json::json!({
             "name": info.name,
@@ -467,7 +464,11 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
             "version": info.version,
             "type": "sdk",
             "installed": installed,
-            "enabled": false,
+            // Un opt-in installé mais pas encore chargé est VOULU actif : la
+            // case de Réglages › Extensions reste cochée et `restart_required`
+            // dit que le serveur ne l'a pas encore monté. Un greffon actif
+            // d'office qu'on a désactivé reste `false`.
+            "enabled": installed && info.opt_in && enabled_voulu(&settings, &info.name),
             "loaded": false,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
@@ -551,7 +552,9 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
                     "installed": true,
                     "enabled": enabled,
                     "loaded": loaded,
-                    "restart_required": enabled && !loaded,
+                    // Activé et pas chargé : à monter ; désactivé et encore chargé :
+                    // à décharger (le registre wasm ne bouge qu'au démarrage).
+                    "restart_required": enabled != loaded,
                     "url": format!("/api/v1/plugins/{id}/"),
                     "compatible": compatible,
                     "min_server_version": info.manifest.min_server_version,
@@ -564,6 +567,17 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
     }
 
     plugins
+}
+
+/// `plugin_{name}_enabled` n'est pas explicitement `false` (l'absence vaut
+/// « activé », comme à la porte de `setup_all`).
+fn enabled_voulu(settings: &SettingsRepo, name: &str) -> bool {
+    settings
+        .get(&format!("plugin_{name}_enabled"))
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("false")
 }
 
 /// Les `setup()` en erreur et les greffons chargés par un nouvel essai
@@ -1084,12 +1098,56 @@ async fn update_plugin(
     Json(json!({ "name": name, "status": "updated" })).into_response()
 }
 
+/// Ce greffon est-il compilé dans le binaire ET actif d'office (Assistant IA…) ?
+///
+/// Le répertoire n'existe pas : il n'y a rien à supprimer, et le nettoyage
+/// générique des réglages (`installed`, `enabled`) le laissait ACTIF, l'absence
+/// de `enabled` valant « activé » : après redémarrage du conteneur, le greffon
+/// était toujours là (#7470).
+pub(crate) fn natif_actif_par_defaut(state: &AppState, name: &str) -> bool {
+    plugin_snapshot(state)
+        .iter()
+        .chain(setup_report_snapshot(state).loaded_after_retry.iter())
+        .any(|p| p.name == name && !p.opt_in)
+        || plugin_available_snapshot(state)
+            .iter()
+            .any(|p| p.name == name && !p.opt_in)
+}
+
+/// « Désinstaller » un greffon natif actif d'office : le désactiver durablement
+/// (`enabled=false`, `hidden=true`), sans toucher à un fichier. La fiche repasse
+/// en « disponible » ; « Installer » le rétablit.
+pub(crate) fn desinstaller_natif(
+    state: &AppState,
+    name: &str,
+    lang: &str,
+) -> axum::response::Response {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    tune_core::audio::premium_plugins::forget_withheld(&settings, name).ok();
+    settings.delete(&format!("plugin_{name}_installed")).ok();
+    crate::plugins::masquer_greffon(&settings, name);
+    Json(json!({
+        "status": "uninstalled",
+        "name": name,
+        "slug": name,
+        "disabled": true,
+        // Il tourne jusqu'au prochain démarrage ; s'il ne tourne déjà plus,
+        // rien à redémarrer.
+        "restart_required": greffon_charge(state, name),
+        "message": crate::i18n::t(lang, "plugin.uninstall.native_disabled"),
+    }))
+    .into_response()
+}
+
 async fn delete_plugin(
     Path(name): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     let lang = crate::i18n::lang_from_header(&headers);
+    if natif_actif_par_defaut(&state, &name) {
+        return desinstaller_natif(&state, &name, &lang);
+    }
     // A wasm plugin lives on disk: uninstalling means removing its directory
     // (the flags alone would leave it re-loaded at every startup). One shipped
     // with the installation (Docker image, locked-down Tune OS…) is read-only

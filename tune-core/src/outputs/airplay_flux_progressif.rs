@@ -34,11 +34,13 @@ const TAILLE_DES_BLOCS: usize = 32_768;
 /// Blocs en attente entre le décodeur et la boucle RTP : ~6 s de 44,1 kHz
 /// stéréo 32 bits. Le décodeur prend de l'avance sans charger la piste.
 const CAPACITE_DU_CANAL: usize = 64;
-/// L'en-tête WAV que toutes les branches du décodeur envoient en tête.
-const TAILLE_ENTETE_WAV: usize = 44;
+/// L'en-tête WAV que toutes les branches du décodeur envoient en tête. Aussi
+/// lu par la sortie Devialet AIR (#6911).
+pub(crate) const TAILLE_ENTETE_WAV: usize = 44;
 
-/// Le corps HTTP lu en continu, pour un serveur qui ignore `Range`.
-struct CorpsEnContinu(Mutex<reqwest::blocking::Response>);
+/// Le corps HTTP lu en continu, pour un serveur qui ignore `Range`. Aussi lu
+/// par la sortie Devialet AIR (#6911).
+pub(crate) struct CorpsEnContinu(pub(crate) Mutex<reqwest::blocking::Response>);
 
 impl Read for CorpsEnContinu {
     fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
@@ -69,7 +71,7 @@ impl MediaSource for CorpsEnContinu {
 
 /// L'extension du chemin d'une URL (`/stream/<id>.wav?x=1` → `wav`), qui sert
 /// d'indice de format au décodeur.
-pub(super) fn extension_de_l_url(url: &str) -> String {
+pub(crate) fn extension_de_l_url(url: &str) -> String {
     let chemin = url.split(['?', '#']).next().unwrap_or(url);
     let dernier = chemin.rsplit('/').next().unwrap_or(chemin);
     dernier
@@ -192,7 +194,9 @@ impl FluxPcmAirplay {
                 continue;
             }
             let echantillons: Vec<i32> = self.reste[..complets]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|o| i32::from_le_bytes([o[0], o[1], o[2], o[3]]))
                 .collect();
             self.reste.drain(..complets);

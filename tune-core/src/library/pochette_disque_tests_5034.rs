@@ -27,15 +27,16 @@ fn la_regle_retire_seulement_ce_qui_vient_du_disque_5034() {
     use SourcePochette::*;
     let a = lue("aaa", Integree);
     // (pochette en place, source, lue, complet, du_disque, source partie) → geste
-    let cas: Vec<(
-        Option<&str>,
+    type Cas<'a> = (
+        Option<&'a str>,
         Option<SourcePochette>,
-        Option<&PochetteLue>,
+        Option<&'a PochetteLue>,
         bool,
         bool,
         bool,
         Geste,
-    )> = vec![
+    );
+    let cas: Vec<Cas> = vec![
         (
             None,
             None,

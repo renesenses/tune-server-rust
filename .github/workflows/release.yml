@@ -48,6 +48,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Refuser les traductions absentes avant toute compilation du train.
+      - name: Vérifier les notes multilingues du tag (#6856)
+        run: python3 scripts/assembler-notes-release.py --tag "$GITHUB_REF_NAME" --output "$RUNNER_TEMP/RELEASE_NOTES.md"
+
       - name: Verify generated plugin lists
         run: python scripts/plugin-catalog.py --check
       # Symetrique de « Verify web-client version matches release tag », plus
@@ -173,7 +177,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding","dst"]}
-            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
+            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -184,7 +188,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding","dst"]}
-            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -233,7 +237,11 @@ jobs:
 
       - name: Set TUNE_VERSION from git tag
         shell: bash
-        run: echo "TUNE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        run: |
+          echo "TUNE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          # #7148 — le binaire nomme le commit dont il est construit
+          # (`binaire.sha` de la sentinelle de streaming).
+          echo "TUNE_GIT_SHA=${GITHUB_SHA}" >> "$GITHUB_ENV"
 
       # ffmpeg minimal audio-only (#1524) : produit par ffmpeg-minimal.yml,
       # publié sur la release `ffmpeg-minimal` du dépôt, livré à côté de
@@ -372,7 +380,7 @@ jobs:
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -386,12 +394,12 @@ jobs:
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
         # plugin-catalog: {"features":"all","base":["postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
 
       # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
       # pas seulement dans la ligne `--features` qui l'a construit.
@@ -493,13 +501,35 @@ jobs:
               || echo "::warning::apt indisponible — airplay-daemon sera absent de cet artefact"
           fi
           if cargo install --git https://github.com/renesenses/airplay2-rs \
-               --rev a7d7ad6637507eaedd61de7461574adfb7b0a987 \
+               --rev 83a7def6ab39d3709fa47a40eb90993b64afe9b4 \
                airplay-daemon --target ${{ matrix.target }} \
                --root "$RUNNER_TEMP/apd" --locked; then
             echo "airplay-daemon built for ${{ matrix.target }}"
           else
             echo "::warning::airplay-daemon failed to build for ${{ matrix.target }} — this artifact will fall back to AirPlay 1"
           fi
+
+      # #6872: same pinned source, features and notices on every shipped target.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
+      - name: Ensure the cargo-about CLI (#6872)
+        shell: bash
+        run: |
+          # install-action has no prebuilt cargo-about 0.9.3 for Intel macOS;
+          # its cargo-binstall fallback then compiles it without the `cli`
+          # feature and `cargo about` does not exist.
+          if ! cargo about --version >/dev/null 2>&1; then
+            cargo install cargo-about --version 0.9.3 --locked --features cli
+          fi
+          cargo about --version
+      - name: Build librespot (all targets)
+        shell: bash
+        run: |
+          CROSS=()
+          if [ "${{ matrix.cross }}" = "true" ]; then CROSS=(--cross); fi
+          python scripts/build-librespot.py --target ${{ matrix.target }} \
+            --output "$RUNNER_TEMP/lrs" --work "$RUNNER_TEMP/lrs-source" "${CROSS[@]}"
 
       - name: Import signing certificate
         if: runner.os == 'macOS'
@@ -541,6 +571,14 @@ jobs:
           if [ -f "$RUNNER_TEMP/apd/bin/airplay-daemon" ]; then
             cp "$RUNNER_TEMP/apd/bin/airplay-daemon" package/
             DAEMON="airplay-daemon"
+          fi
+          # librespot (#6872) : à côté de tune-server, avec sa licence MIT.
+          LIBRESPOT=""
+          if [ -f "$RUNNER_TEMP/lrs/bin/librespot" ] && [ -f "$RUNNER_TEMP/lrs/LIBRESPOT-LICENSE.txt" ]; then
+            cp "$RUNNER_TEMP/lrs/bin/librespot" package/
+            chmod 755 package/librespot
+            cp "$RUNNER_TEMP/lrs/"LIBRESPOT-*.txt package/
+            LIBRESPOT="librespot LIBRESPOT-LICENSE.txt LIBRESPOT-THIRD-PARTY.txt"
           fi
           # ffmpeg minimal (#1524) : à côté de tune-server, là où resolve_tool()
           # regarde en premier. Sa licence LGPL voyage avec lui.
@@ -611,6 +649,8 @@ jobs:
               echo "::error::codesign --timestamp a echoue 5 fois sur $cible — serveur d'horodatage Apple injoignable"
               return 1
             }
+            sign_horodate package/librespot fr.mozaiklabs.librespot ""
+            codesign --verify --strict --verbose=2 package/librespot
             sign_horodate package/tune-server fr.mozaiklabs.tune-server "$DROITS"
             if [ -n "$DAEMON" ]; then
               sign_horodate "package/$DAEMON" fr.mozaiklabs.airplay-daemon ""
@@ -649,7 +689,7 @@ jobs:
             cp packaging/linux/README.txt package/README.txt
             INSTRUCTIONS="README.txt"
           fi
-          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON $FFMPEG web/ plugins/ $INSTRUCTIONS
+          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON $FFMPEG $LIBRESPOT web/ plugins/ $INSTRUCTIONS
           cd ..
 
       # ── Signature Authenticode (Windows) ───────────────────────────────────
@@ -709,6 +749,7 @@ jobs:
             $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
           }
 
+          $targets += "$env:RUNNER_TEMP\lrs\bin\librespot.exe"
           foreach ($t in $targets) {
             # /tr = horodatage : c'est lui qui fait qu'une signature reste
             # valide APRÈS l'expiration du certificat. Sans lui, tout ce qui a
@@ -726,6 +767,8 @@ jobs:
         shell: pwsh
         run: |
           mkdir package\web
+          copy "$env:RUNNER_TEMP\lrs\bin\librespot.exe" package\
+          copy "$env:RUNNER_TEMP\lrs\LIBRESPOT-*.txt" package\
           copy target\${{ matrix.target }}\release\tune-server.exe package\
           # Bundle airplay-daemon.exe next to tune-server.exe if it built.
           if (Test-Path "$env:RUNNER_TEMP\apd\bin\airplay-daemon.exe") {
@@ -749,6 +792,7 @@ jobs:
           copy tune-server\tests\fixtures\plugins\playlists-converter\manifest.json package\plugins\playlists-converter\
           cd package
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\ plugins\
+          7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} librespot.exe LIBRESPOT-LICENSE.txt LIBRESPOT-THIRD-PARTY.txt
           if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
           if (Test-Path "ffmpeg.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} ffmpeg.exe FFMPEG-LICENSE.txt }
           cd ..
@@ -816,6 +860,9 @@ jobs:
             SetOverwrite on
             SetOutPath "`$INSTDIR"
             File "target\${{ matrix.target }}\release\tune-server.exe"
+            File "package\librespot.exe"
+            File "package\LIBRESPOT-LICENSE.txt"
+            File "package\LIBRESPOT-THIRD-PARTY.txt"
             $daemonFile
             $ffmpegFile
             SetOutPath "`$INSTDIR\web"
@@ -856,15 +903,53 @@ jobs:
             FileClose `$0
 
             ; Start menu
+            ; #7637 - l'entree principale « Tune Server » et le raccourci du
+            ; Bureau lancent le serveur SANS fenetre de terminal (l'interface
+            ; se pilote par le navigateur). La console reste disponible, pour
+            ; le depannage, par une entree distincte.
             CreateDirectory "`$SMPROGRAMS\Tune Server"
-            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server.lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server.lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server (avec console, depannage).lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
             CreateShortcut "`$SMPROGRAMS\Tune Server\Uninstall.lnk" "`$INSTDIR\uninstall.exe"
-            ; #6253 - console reduite le temps du detachement, puis fermee.
-            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server (sans console).lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
             CreateShortcut "`$SMPROGRAMS\Tune Server\Quitter Tune Server.lnk" "`$SYSDIR\taskkill.exe" "/F /IM tune-server.exe" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
-            CreateShortcut "`$DESKTOP\Tune Server.lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
+            ; Journal du serveur (pas de console a rouvrir une fois cache).
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Journal de Tune Server.lnk" "`$WINDIR\notepad.exe" '"`$LOCALAPPDATA\TuneServer\tune-server.log"'
+            ; Ancien raccourci de la rc7 a la rc9, devenu l'entree principale.
+            Delete "`$SMPROGRAMS\Tune Server\Tune Server (sans console).lnk"
+            CreateShortcut "`$DESKTOP\Tune Server.lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
 
             WriteUninstaller "`$INSTDIR\uninstall.exe"
+
+            ; #7371 - regle de pare-feu ENTRANTE "Tune" pour tune-server.exe,
+            ; profil PRIVE seulement (decision de Bertrand du 30/10/2026).
+            ; L'installeur reste par utilisateur, sans droits administrateur :
+            ; seule cette etape est elevee (UAC, une fois). Une regle par
+            ; programme couvre TCP et UDP sur tous les ports que Tune ouvre :
+            ; HTTP 8888 (interface, flux servis aux renderers DLNA), SSDP 1900
+            ; (reponses aux M-SEARCH, NOTIFY), mDNS 5353, SlimProto 3483 et CLI
+            ; 9090, canaux AirPlay, OAAT... Sans elle, Windows filtre les
+            ; reponses SSDP au-dela de 3 s et un renderer DLNA n'est jamais vu.
+            ; Deja presente (mise a jour) : rien a demander. Refusee ou en echec :
+            ; Tune s'installe quand meme, et le dit.
+            nsExec::ExecToStack '"`$SYSDIR\netsh.exe" advfirewall firewall show rule name="Tune"'
+            Pop `$0
+            Pop `$1
+            StrCmp `$0 "0" pf_regle_presente
+            ClearErrors
+            ExecShellWait "runas" "`$SYSDIR\netsh.exe" 'advfirewall firewall add rule name="Tune" dir=in action=allow program="`$INSTDIR\tune-server.exe" enable=yes profile=private' SW_HIDE
+            nsExec::ExecToStack '"`$SYSDIR\netsh.exe" advfirewall firewall show rule name="Tune"'
+            Pop `$0
+            Pop `$1
+            StrCmp `$0 "0" pf_regle_creee
+            DetailPrint "Pare-feu : regle Tune non creee (autorisation refusee ou echec)."
+            MessageBox MB_OK|MB_ICONINFORMATION "Tune est installe, mais la regle du pare-feu Windows n'a pas ete creee.$\r$\n$\r$\nSans elle, certains lecteurs reseau (DLNA/UPnP, AirPlay) peuvent rester invisibles ou muets. Au premier lancement, autorisez tune-server.exe sur les reseaux prives, ou relancez cet installeur." /SD IDOK
+            Goto pf_fin
+          pf_regle_creee:
+            DetailPrint "Pare-feu : regle entrante Tune creee (reseaux prives)."
+            Goto pf_fin
+          pf_regle_presente:
+            DetailPrint "Pare-feu : regle entrante Tune deja presente."
+          pf_fin:
 
             ; Registry for Add/Remove Programs
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "DisplayName" "Tune Server"
@@ -881,6 +966,14 @@ jobs:
             Delete "`$DESKTOP\Tune Server.lnk"
             RMDir /r "`$SMPROGRAMS\Tune Server"
             DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer"
+            ; #7371 - retirer la regle de pare-feu "Tune" posee a l'installation
+            ; (elevation demandee seulement si elle existe).
+            nsExec::ExecToStack '"`$SYSDIR\netsh.exe" advfirewall firewall show rule name="Tune"'
+            Pop `$0
+            Pop `$1
+            StrCmp `$0 "0" 0 pf_desinstallation_fin
+            ExecShellWait "runas" "`$SYSDIR\netsh.exe" 'advfirewall firewall delete rule name="Tune"' SW_HIDE
+          pf_desinstallation_fin:
           SectionEnd
           "@ | Out-File -Encoding ASCII installer.nsi
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi
@@ -939,6 +1032,8 @@ jobs:
               cp "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" "$APP/Contents/Resources/"
             fi
           fi
+          cp package/librespot "$APP/Contents/Resources/"
+          cp package/LIBRESPOT-*.txt "$APP/Contents/Resources/"
           cp -r web/* "$APP/Contents/Resources/web/"
           # Bundle the Party (WASM) plugin beside tune-server inside the .app so
           # the plugins-wasm runtime discovers it (plugins/ resolves exe-relative,
@@ -1128,6 +1223,8 @@ jobs:
                 exit 1
               fi
             }
+            codesign --verify --strict --verbose=2 "$APP/Contents/Resources/librespot"
+            verifie_identifiant "$APP/Contents/Resources/librespot" fr.mozaiklabs.librespot
             verifie_identifiant "$APP/Contents/Resources/tune-server" fr.mozaiklabs.tune-server
             verifie_identifiant "$APP" fr.mozaiklabs.tune-server
             if [ -f "$APP/Contents/Resources/airplay-daemon" ]; then
@@ -1458,12 +1555,39 @@ jobs:
   # ANNULÉ ne crée donc rien non plus. Les deux égalités suffiraient à elles
   # seules ; elles sont écrites en clair pour que la porte se lise sans
   # connaître cette règle.
+  # ─── Le mini-lecteur de bureau (tune-widget) ──────────────────────────
+  #
+  # Go de Bertrand du 31/10/2026 : le mini-lecteur part avec la release. Il
+  # n'est PAS dans la matrice `build` : c'est un workspace Tauri isole
+  # (`tune-widget/`, exclu du workspace racine), avec sa propre recette
+  # signee et notarisee, `widget.yml`, qu'on appelle telle quelle plutot que
+  # de la recopier ici — deux recettes divergeraient au premier correctif.
+  #
+  # Ses artefacts (`tune-widget-<tag>-macos-*.dmg`,
+  # `tune-widget-<tag>-windows-x86_64-setup.exe`) sont ramasses par le job
+  # `release` avec les autres `*.dmg` / `*.exe`, et entrent donc dans
+  # SHA256SUMS et sa signature minisign. Leur prefixe les tient hors de la
+  # liste blanche `tune-server-` du client de mise a jour
+  # (`find_archive_asset`) et de la page /download.
+  #
+  # Il est dans les `needs` de `release` : une release qui annonce le
+  # mini-lecteur ne part pas sans lui. Le plafond de duree vit dans
+  # widget.yml (GitHub refuse `timeout-minutes` sur un job `uses:`).
+  widget:
+    name: Build desktop mini-player
+    needs: preflight
+    uses: ./.github/workflows/widget.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+    secrets: inherit
+
   release:
     name: Create Release
-    needs: [preflight, build]
+    needs: [preflight, build, widget]
     if: >-
       needs.preflight.result == 'success'
       && needs.build.result == 'success'
+      && needs.widget.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # Create Release — 1 min ; marge pour les 3 essais minisign (10 min 40 au pire)
     steps:
@@ -1472,6 +1596,9 @@ jobs:
           sparse-checkout: |
             scripts/creer-alias-actifs-release.sh
             scripts/canal-de-release.sh
+            scripts/assembler-notes-release.py
+            .github/scripts/forme-des-notes.awk
+            tune-server/src/i18n.rs
             .release/
           sparse-checkout-cone-mode: false
 
@@ -1482,6 +1609,9 @@ jobs:
       # par un tag n'a pas d'entree ; c'est donc le MANIFESTE du train, fige
       # sur le commit tague et revu en PR, qui porte le choix :
       # `"prerelease": false`. Sans ce champ, la regle d'avant s'applique.
+      - name: Assembler les notes relues dans toutes les langues (#6856)
+        run: python3 scripts/assembler-notes-release.py --tag "$GITHUB_REF_NAME" --output RELEASE_NOTES.md
+
       - name: Pre-version ou Latest (manifeste du train)
         id: canal
         shell: bash
@@ -1620,7 +1750,8 @@ jobs:
             artifacts/**/*.dmg
             artifacts/**/*.exe
             SHA256SUMS*
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false
           # Tranche par `scripts/canal-de-release.sh` (etape « canal » plus
           # haut) : le champ `prerelease` du manifeste s'il existe, sinon un
           # `-` dans le tag. Une pre-version reste hors du creneau Latest, pour

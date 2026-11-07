@@ -870,3 +870,95 @@ async fn rien_ne_part_sans_activation_ni_compte() {
         Issue::Rien("account_not_linked")
     );
 }
+
+#[test]
+fn les_caches_http_ne_gonflent_pas_la_sauvegarde_des_personnalisations_7286() {
+    let b = base_neuve();
+    let s = reglages(&b);
+    s.set("audio_backend", "alsa").unwrap();
+    s.set("cache_audio_enabled", "true").unwrap();
+    let avant = construire(&b).unwrap();
+    // Formes réellement utilisées par les routes artistes et albums :
+    // aucun suffixe numérique que le filtre des identifiants locaux écarte.
+    for cle in [
+        "cache:artistbio:Artiste exemple:fr",
+        "cache:albumbio:Album exemple:Artiste exemple:fr",
+        "cache:meta:a74b1b7f-71a5-4011-9441-d0b5e4122711",
+        "cache:meta-nom:artiste exemple",
+    ] {
+        s.set(
+            cle,
+            &json!({"data":{"bio":"contenu régénérable ".repeat(4096)}}).to_string(),
+        )
+        .unwrap();
+    }
+    let apres = construire(&b).unwrap();
+    assert_eq!(
+        apres, avant,
+        "#7286 : les réponses HTTP mises en cache ne doivent pas devenir des réglages à sauvegarder"
+    );
+    assert_eq!(apres["settings"]["audio_backend"], "alsa");
+    assert_eq!(
+        apres["settings"]["cache_audio_enabled"], true,
+        "le choix utilisateur du cache audio reste une personnalisation"
+    );
+    assert!(
+        s.get("cache:meta-nom:artiste exemple").unwrap().is_some(),
+        "exclure de la sauvegarde ne supprime pas le cache local"
+    );
+}
+
+// #7286 : exercer le véritable dépôt HTTP, y compris un refus de proxy HTML.
+async fn depot_refuse_413(corps: &'static str) -> String {
+    use axum::{Router, http::StatusCode, routing::post};
+    let app = Router::new().route(
+        "/api/v1/config-backups",
+        post(move || async move { (StatusCode::PAYLOAD_TOO_LARGE, corps) }),
+    );
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    let serveur = tokio::spawn(async move {
+        axum::serve(ecoute, app).await.unwrap();
+    });
+    let b = base_neuve();
+    relier(&b, &format!("http://{adresse}"), "serveur-test");
+    // 6 octets UTF-8, mais seulement 4 caractères.
+    let erreur = deposer(
+        &reglages(&b),
+        crate::http::client::shared(),
+        "cle",
+        "été!",
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    serveur.abort();
+    erreur
+}
+
+#[tokio::test]
+async fn refus_413_donne_taille_et_limite_du_site() {
+    let message = depot_refuse_413(r#"{"error":"payload_too_large","max_bytes":4}"#).await;
+    assert!(
+        message.contains("6 octets"),
+        "taille du blob absente : {message}"
+    );
+    assert!(
+        message.contains("limite : 4 octets"),
+        "limite du site perdue : {message}"
+    );
+}
+
+#[tokio::test]
+async fn refus_413_proxy_donne_taille_sans_inventer_la_limite() {
+    let message = depot_refuse_413("<html>413 Request Entity Too Large</html>").await;
+    assert!(
+        message.contains("6 octets"),
+        "taille du blob absente : {message}"
+    );
+    assert!(
+        message.contains("limite non communiquée"),
+        "limite inconnue non explicitée : {message}"
+    );
+}

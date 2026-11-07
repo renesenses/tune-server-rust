@@ -11,6 +11,7 @@ use tune_core::db::engine::Engine;
 use crate::SmartHttpState;
 use crate::catalogue;
 use crate::regles_sql;
+use crate::requete_enregistree;
 use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::source_streaming::{self, Objet};
 use tune_http_types::{ActiveProfile, AppError};
@@ -139,6 +140,11 @@ async fn create_smart_playlist(
 
     // Refuse les références circulaires (A ⊂ B ⊂ A) entre entités smart.
     let resolver = DbRefResolver::new(&state.backend);
+    // #6287, étape 4 — une requête imbriquée fautive est refusée avant d'être
+    // écrite, avec le corps de la route `/requete`.
+    if let Err(refus) = requete_enregistree::valider(&body.rules, &RefCtx::root(&resolver, None)) {
+        return Ok((StatusCode::BAD_REQUEST, Json(refus.corps())).into_response());
+    }
     smart_refs::check_no_cycle(
         &resolver,
         RefKind::SmartPlaylist,
@@ -242,6 +248,10 @@ async fn update_smart_playlist(
             })
             .unwrap_or_else(|| format!("#{id}"));
         let resolver = DbRefResolver::new(&state.backend);
+        // #6287, étape 4 — comme à la création.
+        if let Err(refus) = requete_enregistree::valider(rules, &RefCtx::root(&resolver, None)) {
+            return Ok((StatusCode::BAD_REQUEST, Json(refus.corps())).into_response());
+        }
         smart_refs::check_no_cycle(
             &resolver,
             RefKind::SmartPlaylist,
@@ -437,6 +447,22 @@ pub(crate) fn build_smart_query_rapport(
         let value_txt = regles_sql::texte_de(value_raw);
         let value = value_txt.as_str();
 
+        // #6287, étape 4 — une requête imbriquée enregistrée : sa condition
+        // entière, ou FAUX et nommée si elle ne s'évalue plus.
+        if field == requete_enregistree::CHAMP {
+            match requete_enregistree::condition(rule, ctx) {
+                Ok((c, refus)) => {
+                    refusees.extend(refus);
+                    conditions.push(c);
+                }
+                Err(_) => {
+                    refusees.push(format!("{field} {op}"));
+                    conditions.push(regles_sql::FAUX.to_string());
+                }
+            }
+            continue;
+        }
+
         // --- règles « référence » (collection / playlist / favori) ---
         if smart_refs::is_ref_field(field) {
             conditions.push(smart_refs::track_ref_condition(field, raw_op, value, ctx));
@@ -461,6 +487,21 @@ pub(crate) fn build_smart_query_rapport(
                     regles_sql::FAUX.to_string()
                 }
             }
+        } else if field == "hires_verdict" {
+            // #6285 — le verdict hi-res PUBLIÉ de la piste.
+            match regles_sql::condition_verdict_hires(
+                "t.id",
+                false,
+                op,
+                value,
+                ctx.resolver.hires_douteux_visible(),
+            ) {
+                Some(c) => c,
+                None => {
+                    refusees.push(format!("{field} {op}"));
+                    regles_sql::FAUX.to_string()
+                }
+            }
         } else if field == "rating" {
             // #5547 — la note de l'album de la piste, pour le profil actif.
             match regles_sql::condition_note("t.album_id", op, value_raw, ctx.profile_id) {
@@ -475,49 +516,17 @@ pub(crate) fn build_smart_query_rapport(
                 refusees.push(format!("{field} {op}"));
             }
             c
-        } else if field == "play_count" && op == "between" {
-            // `None` : « entre » sans deux bornes — refusé plus bas.
-            match regles_sql::bornes_de_nombres(value_raw) {
-                Some((lo, hi)) => {
-                    let dans = format!(
-                        "t.id IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL \
-                         GROUP BY track_id HAVING COUNT(*) BETWEEN {lo} AND {hi})"
-                    );
-                    if lo <= 0 {
-                        // Zéro écoute n'a pas de ligne : « entre 0 et N »
-                        // garde les pistes jamais écoutées.
-                        format!(
-                            "(t.id NOT IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL) \
-                             OR {dans})"
-                        )
-                    } else {
-                        dans
-                    }
-                }
+        } else if field == "play_count" {
+            // 🔴 #7769 — le compte de la Bibliothèque (titre + interprète),
+            // pas `listen_history.track_id`, toujours NULL : « = 0 » rendait
+            // toute la bibliothèque et « < 1 » rien. Une valeur qui n'est pas
+            // un entier est refusée et nommée, au lieu de valoir 0.
+            match condition_nombre_d_ecoutes(op, value, value_raw) {
+                Some(c) => c,
                 None => {
                     refusees.push(format!("{field} {op}"));
                     regles_sql::FAUX.to_string()
                 }
-            }
-        } else if field == "play_count" {
-            let n = value.parse::<i64>().unwrap_or(0);
-            let comparateur = match op {
-                "=" => "=",
-                ">=" => ">=",
-                ">" => ">",
-                "<=" => "<=",
-                "<" => "<",
-                _ => "=",
-            };
-            if n == 0 && comparateur == "=" {
-                // « Jamais écoutée » : l'absence de ligne, pas un compte nul.
-                "t.id NOT IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL)"
-                    .to_string()
-            } else {
-                format!(
-                    "t.id IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL \
-                     GROUP BY track_id HAVING COUNT(*) {comparateur} {n})"
-                )
             }
         } else {
             // 🔴 #1231 — une règle qu'on ne sait pas traduire rend FAUX, jamais
@@ -576,6 +585,27 @@ pub(crate) fn build_smart_query_rapport(
     (where_clause, order, limit_clause, refusees)
 }
 
+/// La règle « nombre d'écoutes » d'une piste (#7769) : le compte de la
+/// Bibliothèque ([`tune_core::db::history_repo::sql::ecoutes_de_la_piste`]),
+/// `0` pour une piste jamais écoutée, comparé par chacun des opérateurs.
+///
+/// La valeur doit être un entier (`i64`) : elle n'entre dans le SQL que
+/// reformatée depuis ce nombre, jamais telle que saisie. `None` : opérateur
+/// inconnu, valeur ou bornes illisibles — l'appelant refuse et le dit.
+fn condition_nombre_d_ecoutes(op: &str, value: &str, value_raw: Option<&Value>) -> Option<String> {
+    let compte = tune_core::db::history_repo::sql::ecoutes_de_la_piste("t");
+    if op == "between" {
+        let (lo, hi) = regles_sql::bornes_de_nombres(value_raw)?;
+        return Some(format!("{compte} BETWEEN {lo} AND {hi}"));
+    }
+    let comparateur = match op {
+        "=" | "!=" | "<" | "<=" | ">" | ">=" => op,
+        _ => return None,
+    };
+    let n = value.trim().parse::<i64>().ok()?;
+    Some(format!("{compte} {comparateur} {n}"))
+}
+
 /// Les critères des collections qui ne sont pas une colonne, traduits au
 /// niveau de la PISTE — #5547.
 ///
@@ -602,7 +632,17 @@ fn condition_hors_colonne(
     value: &str,
     value_raw: Option<&Value>,
 ) -> Option<String> {
-    let ecoutes = "SELECT track_id FROM listen_history WHERE track_id IS NOT NULL";
+    // 🔴 #7769 — les écoutes de la piste par la règle de la Bibliothèque
+    // (titre + interprète), et non par `listen_history.track_id` seul, toujours
+    // NULL : ces règles ne retenaient aucune piste, « jamais » les retenait
+    // toutes.
+    let ecoute = tune_core::db::history_repo::sql::ecoute_de_la_piste("t", "he");
+    let ecoutee_depuis = |seuil: String| {
+        format!(
+            "EXISTS (SELECT 1 FROM listen_history he WHERE {ecoute} AND he.listened_at {seuil})"
+        )
+    };
+    let derniere = tune_core::db::history_repo::sql::derniere_ecoute_de_la_piste("t");
     Some(match (field, op) {
         // #6143 — la date du fichier se compare en SECONDES à une borne
         // calculée en Rust : `DATETIME(t.file_mtime, 'unixepoch')` et
@@ -629,25 +669,21 @@ fn condition_hors_colonne(
         }
         ("last_played_at", regles_sql::DANS_LES_DERNIERS_JOURS) => {
             match regles_sql::seuil_de(value_raw) {
-                Some(s) => format!("t.id IN ({ecoutes} AND listened_at >= {})", s.iso),
+                Some(s) => ecoutee_depuis(format!(">= {}", s.iso)),
                 None => regles_sql::FAUX.to_string(),
             }
         }
-        ("last_played_at", ">" | ">=") => format!(
-            "t.id IN ({ecoutes} AND listened_at {op} {})",
-            regles_sql::horodatage_sql(value)
-        ),
-        ("last_played_at", "<" | "<=") => format!(
-            "t.id IN ({ecoutes} GROUP BY track_id HAVING MAX(listened_at) {op} {})",
-            regles_sql::horodatage_sql(value)
-        ),
+        ("last_played_at", ">" | ">=") => {
+            ecoutee_depuis(format!("{op} {}", regles_sql::horodatage_sql(value)))
+        }
+        ("last_played_at", "<" | "<=") => {
+            format!("{derniere} {op} {}", regles_sql::horodatage_sql(value))
+        }
         ("last_played_at", "between") => match regles_sql::bornes_de_dates(value_raw) {
-            Some((lo, hi)) => format!(
-                "t.id IN ({ecoutes} GROUP BY track_id HAVING MAX(listened_at) BETWEEN {lo} AND {hi})"
-            ),
+            Some((lo, hi)) => format!("{derniere} BETWEEN {lo} AND {hi}"),
             None => regles_sql::FAUX.to_string(),
         },
-        ("last_played_at", "is_null") => format!("t.id NOT IN ({ecoutes})"),
+        ("last_played_at", "is_null") => format!("{derniere} IS NULL"),
         ("credit", "has") => {
             let sous = value_raw
                 .and_then(|v| v.as_object())
@@ -686,7 +722,7 @@ fn avec_le_socle_des_bannis(where_clause: &str, profile_id: i64) -> String {
 }
 
 /// Execute a smart query and return track rows as JSON values.
-fn execute_smart_track_query(
+pub(crate) fn execute_smart_track_query(
     state: &SmartHttpState,
     profile_id: i64,
     where_clause: &str,
@@ -694,18 +730,13 @@ fn execute_smart_track_query(
     limit_clause: &str,
 ) -> Result<Vec<Value>, AppError> {
     let where_clause = avec_le_socle_des_bannis(where_clause, profile_id);
-    let needs_play_count = order.contains("play_count");
-    let play_count_join = if needs_play_count {
-        "LEFT JOIN (SELECT track_id, COUNT(*) AS play_count FROM listen_history WHERE track_id IS NOT NULL GROUP BY track_id) lh ON t.id = lh.track_id"
-    } else {
-        ""
-    };
-    // Replace play_count reference with the computed column (COALESCE for never-played)
-    let order = if needs_play_count {
-        order.replace("t.play_count", "COALESCE(lh.play_count, 0)")
-    } else {
-        order.to_string()
-    };
+    // #7769 — le tri par nombre d'écoutes compte comme la Bibliothèque ; la
+    // jointure par `listen_history.track_id` (toujours NULL) rangeait toutes
+    // les pistes à zéro.
+    let order = order.replace(
+        "t.play_count",
+        &tune_core::db::history_repo::sql::ecoutes_de_la_piste("t"),
+    );
     let sql = format!(
         // `al.is_compilation` en 10 (#1957) : la ligne porte déjà quatre
         // colonnes d'album (`al.title`, `al.id`, `al.cover_path`, l'année),
@@ -714,8 +745,8 @@ fn execute_smart_track_query(
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
-         {} {} {} {}",
-        play_count_join, where_clause, order, limit_clause
+         {} {} {}",
+        where_clause, order, limit_clause
     );
 
     let rows = state
@@ -1120,7 +1151,9 @@ struct RequeteTextuelle {
 ///
 /// - 200 : `tracks`, `total`, `regles_refusees` (comme l'aperçu), `rules` et
 ///   `match_mode` (ou `null` : requête imbriquée ou niée, sans forme
-///   visuelle) ;
+///   visuelle), et `enregistrement` (`{rules, match_mode}`, jamais `null`) :
+///   ce que `POST /library/smart-playlists` enregistre (étape 4, voir
+///   `crate::requete_enregistree`) ;
 /// - 400 : `{"error": "requete_invalide", "message", "position"}`, la position
 ///   en caractères depuis le début de la requête. La requête est bornée
 ///   (`LONGUEUR_MAX` caractères, `PROFONDEUR_MAX` imbrications). Un critère
@@ -1189,12 +1222,16 @@ async fn requete_textuelle(
         Some((r, m)) => (Value::Array(r), json!(m)),
         None => (Value::Null, Value::Null),
     };
+    // #6287, étape 4 — ce que l'éditeur enregistre tel quel : les règles de
+    // l'éditeur d'une requête plate, ou la règle `requete` d'une imbriquée.
+    let (a_enregistrer, mode_a_enregistrer) = requete_enregistree::enregistrement(&body.q, &arbre);
     Json(json!({
         "tracks": items,
         "total": items.len(),
         "regles_refusees": refusees,
         "rules": rules,
         "match_mode": match_mode,
+        "enregistrement": {"rules": a_enregistrer, "match_mode": mode_a_enregistrer},
     }))
     .into_response()
 }
@@ -1482,15 +1519,16 @@ mod tests {
         assert!(a.contains("ar.name"), "{a}");
     }
 
-    /// « Jamais écoutée » reste l'absence de ligne d'historique, pas un
-    /// compte nul — la remise à plat ne devait pas l'emporter.
+    /// « Jamais écoutée » : un compte nul des écoutes rattachées à la piste
+    /// par titre + interprète (#7769), ou par `track_id` quand il est
+    /// renseigné — jamais par `track_id` seul, toujours NULL en production.
+    /// Le comportement est tenu par `ecoutes_7769_tests`.
     #[test]
-    fn jamais_ecoutee_reste_l_absence_d_historique() {
+    fn jamais_ecoutee_compte_les_ecoutes_de_la_piste() {
         let w = where_of(r#"[{"field":"play_count","op":"equals","value":"0"}]"#);
-        assert!(
-            w.contains("NOT IN (SELECT track_id FROM listen_history"),
-            "{w}"
-        );
+        assert!(w.contains("FROM listen_history he"), "{w}");
+        assert!(w.contains("OR (he.title = t.title"), "{w}");
+        assert!(w.ends_with("= 0"), "{w}");
     }
 
     // #1008: "Album/Année/Format contient X" produced no WHERE at all (the

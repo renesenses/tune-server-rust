@@ -175,11 +175,36 @@ pub const ENTETES_RELAYES: [&str; 9] = [
     "x-profile-id",
 ];
 
+/// Les compressions que le navigateur accepte (son `accept-encoding`), sous
+/// le nom que le serveur lit (#7602). Meme chaine que
+/// `tune-core/src/cloud/relay.rs`.
+///
+/// Sans elles, le serveur repondait en clair par le relais : la liste des
+/// dossiers, les pages d'albums, 5 a 10 fois plus lourdes qu'en local, sur le
+/// debit montant de la box, au point de passer les 30 s du relais au premier
+/// chargement.
+///
+/// Pas sous `accept-encoding` lui-meme : un serveur anterieur recopie tous les
+/// en-tetes recus vers sa route locale, qui compresserait alors, mais il ne
+/// rend pas `content-encoding` : le navigateur recevrait du gzip sans le
+/// savoir. Ce nom-ci, un serveur anterieur le passe a une route qui l'ignore,
+/// et sa reponse reste en clair, comme avant.
+pub const ENTETE_ENCODAGES_ACCEPTES: &str = "x-tune-accept-encoding";
+
 /// Les en-tetes de la requete du navigateur a transmettre au serveur.
 pub fn entetes_a_relayer(headers: &HeaderMap) -> serde_json::Map<String, serde_json::Value> {
     let mut relayes = serde_json::Map::new();
     for (name, value) in headers.iter() {
         let key = name.as_str();
+        if key == "accept-encoding" {
+            if let Ok(v) = value.to_str() {
+                relayes.insert(
+                    ENTETE_ENCODAGES_ACCEPTES.to_string(),
+                    serde_json::Value::String(v.to_string()),
+                );
+            }
+            continue;
+        }
         if !ENTETES_RELAYES.contains(&key) {
             continue;
         }

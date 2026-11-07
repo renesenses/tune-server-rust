@@ -32,6 +32,8 @@ struct Globe {
     panne: bool,
     lieu: Option<Value>,
     corps_recus: Vec<Value>,
+    retire_de_la_carte: bool,
+    corps_du_retrait: Vec<Bytes>,
 }
 
 type Etat = Arc<Mutex<Globe>>;
@@ -117,6 +119,46 @@ async fn lieux(State(e): State<Etat>, h: HeaderMap) -> Response {
     Json(lieux_attendus()).into_response()
 }
 
+/// rc9 (#7122) : la carte publique, telle que le cloud l'anonymise.
+fn points_attendus() -> Value {
+    json!([{ "lat": 46.0, "lon": 5.0 }, { "lat": 48.0, "lon": 2.0 }])
+}
+
+async fn points(State(e): State<Etat>, h: HeaderMap) -> Response {
+    if let Some(r) = autorise(&e, &h) {
+        return r;
+    }
+    Json(points_attendus()).into_response()
+}
+
+async fn lire_retrait(State(e): State<Etat>, h: HeaderMap) -> Response {
+    if let Some(r) = autorise(&e, &h) {
+        return r;
+    }
+    let v = e.lock().unwrap().retire_de_la_carte;
+    Json(json!({ "public_map_opt_out": v })).into_response()
+}
+
+async fn poser_retrait(State(e): State<Etat>, h: HeaderMap, corps: Bytes) -> Response {
+    if let Some(r) = autorise(&e, &h) {
+        return r;
+    }
+    let mut g = e.lock().unwrap();
+    g.corps_du_retrait.push(corps);
+    g.retire_de_la_carte = true;
+    Json(json!({ "public_map_opt_out": true })).into_response()
+}
+
+async fn lever_retrait(State(e): State<Etat>, h: HeaderMap, corps: Bytes) -> Response {
+    if let Some(r) = autorise(&e, &h) {
+        return r;
+    }
+    let mut g = e.lock().unwrap();
+    g.corps_du_retrait.push(corps);
+    g.retire_de_la_carte = false;
+    Json(json!({ "public_map_opt_out": false })).into_response()
+}
+
 async fn demarrer() -> (String, Etat) {
     let etat: Etat = Arc::default();
     let app = Router::new()
@@ -129,6 +171,11 @@ async fn demarrer() -> (String, Etat) {
             get(lire_lieu).put(poser_lieu).delete(retirer_lieu),
         )
         .route("/api/v1/circle/contacts/locations", get(lieux))
+        .route("/api/v1/circle/world/points", get(points))
+        .route(
+            "/api/v1/circle/me/public-map-opt-out",
+            get(lire_retrait).put(poser_retrait).delete(lever_retrait),
+        )
         .with_state(etat.clone());
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let adresse = ecoute.local_addr().unwrap();
@@ -138,12 +185,16 @@ async fn demarrer() -> (String, Etat) {
     (format!("http://{adresse}"), etat)
 }
 
-const ROUTES: [(&str, &str); 5] = [
+const ROUTES: [(&str, &str); 9] = [
     ("GET", "/contacts/7/library/summary"),
     ("GET", "/me/location"),
     ("PUT", "/me/location"),
     ("DELETE", "/me/location"),
     ("GET", "/contacts/locations"),
+    ("GET", "/world/points"),
+    ("GET", "/me/public-map-opt-out"),
+    ("PUT", "/me/public-map-opt-out"),
+    ("DELETE", "/me/public-map-opt-out"),
 ];
 
 fn lieu_valide() -> Value {
@@ -155,7 +206,7 @@ async fn sans_session_les_routes_rendent_412_et_rien_ne_part() {
     let (url, etat) = demarrer().await;
     let app = app(base(&url, None));
     for (m, chemin) in ROUTES {
-        let corps = (m == "PUT").then(lieu_valide);
+        let corps = (m == "PUT" && chemin == "/me/location").then(lieu_valide);
         let r = appel(&app, m, chemin, corps).await;
         assert_eq!(r.statut, StatusCode::PRECONDITION_FAILED, "{m} {chemin}");
         assert_eq!(
@@ -295,7 +346,7 @@ async fn cloud_en_panne_ou_injoignable_rend_503() {
     let morte = app(base(&adresse_morte().await, Some(JETON)));
     for (app, amont) in [(&en_panne, json!(500)), (&morte, Value::Null)] {
         for (m, chemin) in ROUTES {
-            let corps = (m == "PUT").then(lieu_valide);
+            let corps = (m == "PUT" && chemin == "/me/location").then(lieu_valide);
             let r = appel(app, m, chemin, corps).await;
             assert_eq!(r.statut, StatusCode::SERVICE_UNAVAILABLE, "{m} {chemin}");
             assert_eq!(
@@ -310,4 +361,57 @@ async fn cloud_en_panne_ou_injoignable_rend_503() {
         }
     }
     assert_eq!(etat.lock().unwrap().appels, ROUTES.len());
+}
+
+#[tokio::test]
+async fn la_carte_publique_est_relayee_telle_quelle_et_sans_cache() {
+    let (url, _etat) = demarrer().await;
+    let app = app(base(&url, Some(JETON)));
+    let r = appel(&app, "GET", "/world/points", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.json(), points_attendus());
+    assert_eq!(
+        r.entetes.get(header::CACHE_CONTROL).unwrap(),
+        "no-store",
+        "la carte publique ne reste dans aucun cache"
+    );
+}
+
+#[tokio::test]
+async fn l_interrupteur_de_retrait_est_relaye_sans_corps() {
+    let (url, etat) = demarrer().await;
+    let app = app(base(&url, Some(JETON)));
+
+    let r = appel(&app, "GET", "/me/public-map-opt-out", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.json(), json!({ "public_map_opt_out": false }));
+
+    // Le client pourrait envoyer n'importe quoi : rien n'en part.
+    let r = appel(
+        &app,
+        "PUT",
+        "/me/public-map-opt-out",
+        Some(json!({ "lat": 47.3, "nom": "Alice" })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.json(), json!({ "public_map_opt_out": true }));
+    assert_eq!(r.entetes.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    let r = appel(&app, "GET", "/me/public-map-opt-out", None).await;
+    assert_eq!(
+        r.json(),
+        json!({ "public_map_opt_out": true }),
+        "effectif tout de suite"
+    );
+
+    let r = appel(&app, "DELETE", "/me/public-map-opt-out", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.json(), json!({ "public_map_opt_out": false }));
+
+    let recus = etat.lock().unwrap().corps_du_retrait.clone();
+    assert_eq!(recus.len(), 2);
+    assert!(
+        recus.iter().all(|c| c.is_empty()),
+        "aucun corps ne part vers le cloud : {recus:?}"
+    );
 }

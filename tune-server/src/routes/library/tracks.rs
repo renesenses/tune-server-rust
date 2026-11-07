@@ -345,6 +345,9 @@ pub(super) struct TrackFilterQuery {
     pub provenance: Option<String>,
     /// `sources` : rendre aussi les comptes par provenance.
     pub counts: Option<String>,
+    /// #7619 (L1) — le curseur `next_cursor` d'une page précédente : la page
+    /// suivante part de là au lieu de `offset`, sans relire ce qui précède.
+    pub after: Option<String>,
 }
 
 /// Ce que les paramètres de la page triée demandent, validé.
@@ -354,6 +357,7 @@ struct PageTriee {
     recherche: Option<String>,
     provenance: Option<String>,
     avec_comptes: bool,
+    apres: Option<tune_core::db::track_repo::cle_de_tri::Curseur>,
 }
 
 impl PageTriee {
@@ -369,18 +373,20 @@ impl PageTriee {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
-        let (sort, order, search, provenance, counts) = (
+        let (sort, order, search, provenance, counts, after) = (
             posee(&p.sort),
             posee(&p.order),
             posee(&p.search),
             posee(&p.provenance),
             posee(&p.counts),
+            posee(&p.after),
         );
         if sort.is_none()
             && order.is_none()
             && search.is_none()
             && provenance.is_none()
             && counts.is_none()
+            && after.is_none()
         {
             return Ok(None);
         }
@@ -410,12 +416,29 @@ impl PageTriee {
                 ));
             }
         };
+        // #7619 — un curseur illisible, ou rendu pour un AUTRE ordre, rend
+        // 400 : il désignerait une position qui n'existe pas dans celui-ci.
+        let apres = match after.as_deref() {
+            None => None,
+            Some(brut) => {
+                let c = tune_core::db::track_repo::cle_de_tri::Curseur::decoder(brut)
+                    .map_err(|e| AppError::bad_request(format!("parametre `after` : {e}")))?;
+                let cle = tri.map_or("", |t| t.cle());
+                if c.s != cle || (tri.is_some() && c.d != descendant) {
+                    return Err(AppError::bad_request(
+                        "parametre `after` : curseur rendu pour un autre tri",
+                    ));
+                }
+                Some(c)
+            }
+        };
         Ok(Some(Self {
             tri,
             descendant,
             recherche: search,
             provenance,
             avec_comptes,
+            apres,
         }))
     }
 }
@@ -429,7 +452,8 @@ pub(super) async fn list_tracks(
     // Facettes à plusieurs valeurs : la clé répétée (`?format=aiff&format=flac`)
     // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
     // et qu'il refuse même en double.
-    let filter = track_filter_from_raw(raw.as_deref())?;
+    let mut filter = track_filter_from_raw(raw.as_deref())?;
+    filter.profile_id = profile.id();
     let page_triee = PageTriee::depuis(&p)?;
     // #5138 — TOUTES les lectures de cette route sont synchrones (rusqlite).
     // Posées sur un fil de l'exécuteur, les 7 à 9,7 s de la liste et du
@@ -526,6 +550,9 @@ fn lire_la_page_de_pistes(
         // #5138 — la page et son total en UNE requête : le `WHERE` n'est plus
         // évalué deux fois par page. Seule une page vide (décalage au-delà de
         // la fin) ou une erreur recompte.
+        // Le curseur exige un paramètre de page triée (par exemple
+        // `order=asc`). Sans lui, conserver aussi l'ordre historique et
+        // les quatre champs attendus par les clients existants.
         let (items, total) = match repo.list_visible_avec_total(limit, offset) {
             Ok((tracks, Some(total))) => (tracks, total),
             Ok((tracks, None)) => (tracks, repo.count_visible().unwrap_or(0)),
@@ -568,6 +595,7 @@ fn lire_la_page_triee(
         limit,
         offset,
         avec_comptes: pt.avec_comptes,
+        apres: pt.apres,
     };
     let sort = pt.tri.map(|c| c.cle());
     let order = if pt.descendant { "desc" } else { "asc" };
@@ -581,6 +609,7 @@ fn lire_la_page_triee(
                 "offset": offset,
                 "sort": sort,
                 "order": order,
+                "next_cursor": page.curseur_suivant,
             });
             if let Some(c) = page.comptes {
                 let comptes: serde_json::Map<String, Value> =
@@ -772,7 +801,7 @@ fn poser_le_contrat_dlna(
 ///
 /// La trace est posée d'abord : elle vaut indépendamment de la cause, et sans
 /// elle le prochain relevé serait aussi muet que celui-ci.
-pub(super) async fn stream_track_audio(
+pub(crate) async fn stream_track_audio(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     req_headers: HeaderMap,
@@ -3739,6 +3768,7 @@ mod tests_termes_de_chemin_5192 {
 
         // Le rail compte la MÊME sélection que la liste.
         let Json(f) = super::super::facets::library_facets(
+            crate::routes::active_profile::ActiveProfile(1),
             Query(Default::default()),
             RawQuery(Some("fields=label&q=mahler%20kondrashin".into())),
             State(state.clone()),

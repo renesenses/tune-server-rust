@@ -26,6 +26,7 @@ use super::emetteur::{
 };
 use super::protocole::{self, Annonce, PORT_AMPLI, PORT_ANNONCES, PORT_AUDIO_LOCAL, opcode};
 use super::reglages;
+use crate::outputs::airplay::flux_progressif::TAILLE_ENTETE_WAV;
 use crate::outputs::traits::{
     AudioSpec, FormatOuvert, OutputCapabilities, OutputStatus, OutputTarget, PlayMedia,
     TransformationsReelles, TransportState,
@@ -68,6 +69,9 @@ pub struct ContexteAir {
     pub activee: Arc<dyn Fn() -> bool + Send + Sync>,
     /// L'indice de la source AIR de l'ampli.
     pub indice_source: Arc<dyn Fn() -> u8 + Send + Sync>,
+    /// #6918 — la course du curseur en dB. Relue à chaque consigne : une
+    /// course changée vaut pour le geste suivant et n'envoie rien.
+    pub bornes_db: Arc<dyn Fn() -> reglages::BornesDb + Send + Sync>,
     pub ports: Ports,
     pub cadence: Cadence,
 }
@@ -78,9 +82,11 @@ impl ContexteAir {
     #[must_use]
     pub fn depuis_la_base(db: Arc<dyn crate::db::backend::DbBackend>) -> Self {
         let db2 = db.clone();
+        let db3 = db.clone();
         Self {
             activee: Arc::new(move || reglages::activee(&db)),
             indice_source: Arc::new(move || reglages::indice_source(&db2)),
+            bornes_db: Arc::new(move || reglages::BornesDb::lues(&db3)),
             ports: Ports::AIR,
             cadence: Cadence::AIR,
         }
@@ -203,6 +209,21 @@ impl DevialetAirOutput {
 
     fn ampli(&self) -> Option<AmpliVu> {
         self.ecoute.ampli(&self.mac)
+    }
+
+    /// #6912 — seulement une annonce encore présente, jamais volume_voulu.
+    pub(crate) fn observation_volume(&self) -> Option<crate::playback::ObservationVolumeAppareil> {
+        if !(self.contexte.activee)() {
+            return None;
+        }
+        let ampli = self.ampli()?;
+        let volume_db = ampli.annonce.volume_db();
+        Some(crate::playback::ObservationVolumeAppareil {
+            device_id: self.device_id.clone(),
+            volume: (self.contexte.bornes_db)().db_vers_volume(volume_db),
+            volume_db,
+            muted: ampli.annonce.sourdine,
+        })
     }
 
     fn adresse_ampli(&self, a: &AmpliVu) -> SocketAddr {
@@ -343,13 +364,21 @@ impl DevialetAirOutput {
     async fn lancer(&self, phase: &mut Phase, media: Media, debut_ms: u64) -> Result<(), String> {
         self.exiger_l_option()?;
         let (ampli, indice) = self.preparer_l_ampli().await?;
-        let (chemin, garde_fichier) =
-            crate::outputs::airplay::url_to_local_path(&media.source).await?;
+        // #6911 — la source est décodée au fil de l'eau, jamais téléchargée
+        // en entier : une radio (`/stream/<id>.wav` sans fin) tenait ici la
+        // sortie, et la zone avec elle, jusqu'au délai de 600 s du client.
         let SourceOuverte {
             trames,
             cadence_source,
             cadence_envoyee,
-        } = ouvrir_la_source(chemin, debut_ms, garde_fichier).await?;
+        } = ouvrir_la_source(
+            media.source.clone(),
+            debut_ms,
+            media.duree_ms == 0,
+            self.contexte.cadence.attente_premier_son,
+        )
+        .await
+        .map_err(|e| format!("{} : {e}", self.nom))?;
         let socket = Arc::new(
             UdpSocket::bind(SocketAddr::new(
                 IpAddr::V4(self.contexte.ports.adresse_locale),
@@ -537,18 +566,37 @@ struct SourceOuverte {
     cadence_envoyee: u32,
 }
 
-fn ouvrir_decodeur(
-    chemin: &str,
-    cadence: Option<u32>,
-    depuis_s: f64,
-) -> (
+/// Octets d'une trame du décodeur : stéréo, 24 bits (3 octets par canal).
+const OCTETS_PAR_TRAME: usize = 6;
+
+/// Les octets PCM du décodeur, et la tâche qui les produit (profondeur, débit).
+type DecodeurOuvert = (
     mpsc::Receiver<Vec<u8>>,
     JoinHandle<Result<(u16, u32), String>>,
-) {
+);
+
+fn est_distante(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
+}
+
+/// Le décodeur progressif en PCM stéréo 24 bits, sur un fichier ou sur une
+/// source HTTP lue au fil de l'eau.
+fn ouvrir_decodeur(
+    source: &str,
+    cadence: Option<u32>,
+    depuis_s: f64,
+    en_direct: bool,
+) -> DecodeurOuvert {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+    let source = source.to_owned();
+    if est_distante(&source) {
+        return ouvrir_decodeur_distant(source, cadence, depuis_s, en_direct, tx, rx);
+    }
+    let chemin = source
+        .strip_prefix("file://")
+        .map_or(source.clone(), str::to_owned);
     let (niveaux, niveaux_rx) = mpsc::unbounded_channel();
     drop(niveaux_rx);
-    let chemin = chemin.to_owned();
     let decodeur = tokio::task::spawn_blocking(move || {
         crate::audio::decode::decode_to_pcm_streaming_seeked(
             &chemin,
@@ -565,27 +613,156 @@ fn ouvrir_decodeur(
     (rx, decodeur)
 }
 
+/// #6911 — une source HTTP : lue par `Range` si le serveur le permet (le saut
+/// est alors celui du décodeur), sinon en continu. En continu, rien ne se
+/// saute dans le corps : le PCM d'avant `depuis_s` est écarté à la sortie du
+/// décodeur, sauf pour un flux en direct (radio), qui reprend où il en est.
+fn ouvrir_decodeur_distant(
+    url: String,
+    cadence: Option<u32>,
+    depuis_s: f64,
+    en_direct: bool,
+    tx: mpsc::Sender<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
+) -> DecodeurOuvert {
+    let indice = format!(
+        "flux-distant.{}",
+        crate::outputs::airplay::flux_progressif::extension_de_l_url(&url)
+    );
+    let (tx_decodeur, mut rx_decodeur) = mpsc::channel::<Vec<u8>>(8);
+    let a_ecarter = Arc::new(Mutex::new(None::<f64>));
+    let decodeur = {
+        let a_ecarter = a_ecarter.clone();
+        tokio::task::spawn_blocking(move || {
+            let (source, depuis_s): (Box<dyn symphonia::core::io::MediaSource>, f64) =
+                match crate::audio::http_range::HttpRangeSource::open(&url) {
+                    Ok(source) => (Box::new(source), depuis_s),
+                    Err(_) => {
+                        let reponse = crate::http::client::blocking_builder()
+                            .timeout(None)
+                            .connect_timeout(Duration::from_secs(10))
+                            .build()
+                            .map_err(|e| format!("client http : {e}"))?
+                            .get(&url)
+                            .send()
+                            .map_err(|e| {
+                                format!(
+                                    "source injoignable ({})",
+                                    crate::http::client::decrire_erreur_http(&e)
+                                )
+                            })?;
+                        if !reponse.status().is_success() {
+                            return Err(format!("la source a répondu HTTP {}", reponse.status()));
+                        }
+                        if !en_direct && depuis_s > 0.0 {
+                            *a_ecarter
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(depuis_s);
+                        }
+                        (
+                            Box::new(crate::outputs::airplay::flux_progressif::CorpsEnContinu(
+                                Mutex::new(reponse),
+                            )),
+                            0.0,
+                        )
+                    }
+                };
+            crate::audio::decode::decode_vers_pcm_en_continu_depuis(
+                &indice,
+                Some(source),
+                cadence,
+                Some(2),
+                Some(24),
+                tx_decodeur,
+                32 * 1024,
+                depuis_s,
+            )
+        })
+    };
+    // Le relais : l'en-tête WAV passe tel quel, puis le PCM d'avant la
+    // position voulue est écarté quand la source n'a pas pu sauter.
+    tokio::spawn(async move {
+        let mut entete: Vec<u8> = Vec::with_capacity(TAILLE_ENTETE_WAV);
+        // Octets de PCM encore à écarter ; `None` tant que l'en-tête n'est
+        // pas passé.
+        let mut a_ecarter_octets: Option<usize> = None;
+        while let Some(bloc) = rx_decodeur.recv().await {
+            let mut bloc = &bloc[..];
+            if a_ecarter_octets.is_none() {
+                let n = (TAILLE_ENTETE_WAV - entete.len()).min(bloc.len());
+                entete.extend_from_slice(&bloc[..n]);
+                bloc = &bloc[n..];
+                if entete.len() < TAILLE_ENTETE_WAV {
+                    continue;
+                }
+                let depuis = *a_ecarter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                a_ecarter_octets = Some(match (depuis, cadence_de_l_entete(&entete)) {
+                    (Some(s), Some(c)) => (s * f64::from(c)) as usize * OCTETS_PAR_TRAME,
+                    _ => 0,
+                });
+                if tx.send(std::mem::take(&mut entete)).await.is_err() {
+                    return;
+                }
+            }
+            if let Some(reste) = a_ecarter_octets.as_mut() {
+                let n = (*reste).min(bloc.len());
+                *reste -= n;
+                bloc = &bloc[n..];
+            }
+            if !bloc.is_empty() && tx.send(bloc.to_vec()).await.is_err() {
+                return;
+            }
+        }
+    });
+    (rx, decodeur)
+}
+
 /// La cadence décrite par l'en-tête WAV que le décodeur émet en premier.
 fn cadence_de_l_entete(entete: &[u8]) -> Option<u32> {
     crate::outputs::sendspin::est_entete_wav(entete)
         .then(|| u32::from_le_bytes([entete[24], entete[25], entete[26], entete[27]]))
 }
 
+/// Attend le premier bloc du décodeur, au plus `attente` (#6911).
+async fn premier_bloc(
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    attente: Duration,
+) -> Result<Option<Vec<u8>>, String> {
+    tokio::time::timeout(attente, rx.recv()).await.map_err(|_| {
+        warn!(
+            attente_s = attente.as_secs_f64(),
+            "devialet_air_source_muette"
+        );
+        format!(
+            "la source de la piste ne livre aucun son en {} s : lecture abandonnée",
+            attente.as_secs()
+        )
+    })
+}
+
 /// Ouvre le décodage progressif en PCM stéréo 24 bits. La cadence native se
 /// lit dans l'en-tête ; si AIR ne la transporte pas sans perte, le décodage
-/// est rouvert à la cadence de [`reglages::cadence_envoyee`].
+/// est rouvert à la cadence de [`reglages::cadence_envoyee`]. Chaque attente
+/// du décodeur est bornée par `attente` (#6911).
 async fn ouvrir_la_source(
-    chemin: String,
+    source: String,
     debut_ms: u64,
-    garde_fichier: Option<crate::outputs::airplay::TempFileGuard>,
+    en_direct: bool,
+    attente: Duration,
 ) -> Result<SourceOuverte, String> {
     let depuis_s = debut_ms as f64 / 1_000.0;
-    let (mut rx, decodeur) = ouvrir_decodeur(&chemin, None, depuis_s);
-    let entete = rx.recv().await;
+    let (mut rx, decodeur) = ouvrir_decodeur(&source, None, depuis_s, en_direct);
+    let entete = premier_bloc(&mut rx, attente).await?;
     let Some(cadence_source) = entete.as_deref().and_then(cadence_de_l_entete) else {
         drop(rx);
-        return Err(match decodeur.await {
-            Ok(Err(e)) => format!("devialet_air: décodage : {e}"),
+        // La raison du décodeur, attendue au plus `attente` : un décodeur qui
+        // a livré autre chose qu'un en-tête peut encore lire une source qui
+        // cale.
+        return Err(match tokio::time::timeout(attente, decodeur).await {
+            Ok(Ok(Err(e))) => format!("décodage impossible : {e}"),
             _ => "devialet_air: le décodeur n'a pas annoncé son format".into(),
         });
     };
@@ -593,10 +770,18 @@ async fn ouvrir_la_source(
     let (mut rx, decodeur) = if cadence_envoyee == cadence_source {
         (rx, decodeur)
     } else {
-        drop(rx);
-        let _ = decodeur.await;
-        let (mut rx, decodeur) = ouvrir_decodeur(&chemin, Some(cadence_envoyee), depuis_s);
-        match rx.recv().await.as_deref().and_then(cadence_de_l_entete) {
+        // Le premier décodeur n'est pas attendu : sur une source distante
+        // qui a livré son en-tête puis cale, son fil reste en lecture sans
+        // fin, sortie verrouillée. Privé de récepteur, il s'arrête seul au
+        // prochain bloc ou quand la source ferme.
+        drop((rx, decodeur));
+        let (mut rx, decodeur) =
+            ouvrir_decodeur(&source, Some(cadence_envoyee), depuis_s, en_direct);
+        match premier_bloc(&mut rx, attente)
+            .await?
+            .as_deref()
+            .and_then(cadence_de_l_entete)
+        {
             Some(c) if c == cadence_envoyee => {}
             autre => {
                 return Err(format!(
@@ -609,14 +794,15 @@ async fn ouvrir_la_source(
     };
     let (tx, trames) = mpsc::channel::<LotDeTrames>(4);
     tokio::spawn(async move {
-        let _garde = garde_fichier;
         let mut reste: Vec<u8> = Vec::new();
         let mut envoye = false;
         while let Some(bloc) = rx.recv().await {
             reste.extend_from_slice(&bloc);
-            let complets = reste.len() / 6 * 6;
+            let complets = reste.len() / OCTETS_PAR_TRAME * OCTETS_PAR_TRAME;
             let lot: Vec<[i32; 2]> = reste[..complets]
-                .chunks_exact(6)
+                .as_chunks::<6>()
+                .0
+                .iter()
                 .map(|t| [lire_24_le(&t[0..3]), lire_24_le(&t[3..6])])
                 .collect();
             reste.drain(..complets);
@@ -670,7 +856,11 @@ impl OutputTarget for DevialetAirOutput {
         let mut phase = self.phase.lock().await;
         self.interrompre(&mut phase).await;
         *phase = Phase::Arret;
-        self.lancer(&mut phase, Media::depuis(media), 0).await
+        let lancement = self.lancer(&mut phase, Media::depuis(media), 0).await;
+        if let Err(e) = &lancement {
+            warn!(sortie = %self.nom, erreur = %e, "devialet_air_demarrage_echoue");
+        }
+        lancement
     }
 
     async fn pause(&self) -> Result<(), String> {
@@ -740,12 +930,15 @@ impl OutputTarget for DevialetAirOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        let db = reglages::volume_vers_db(volume);
+        let bornes = (self.contexte.bornes_db)();
+        // #6918 — la course réglée, puis le plafond en dernier mot : aucune
+        // consigne au-dessus de −10 dB ne part, quelle que soit la course.
+        let db = bornes.volume_vers_db(volume).min(reglages::PLAFOND_DB);
         self.commander(opcode::VOLUME, db as f32).await?;
         *self
             .volume_voulu
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = reglages::db_vers_volume(db);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = bornes.db_vers_volume(db);
         Ok(())
     }
 
@@ -791,7 +984,7 @@ impl OutputTarget for DevialetAirOutput {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
             },
-            |a| reglages::db_vers_volume(a.annonce.volume_db()),
+            |a| (self.contexte.bornes_db)().db_vers_volume(a.annonce.volume_db()),
         );
         Ok(OutputStatus {
             state,
@@ -847,6 +1040,7 @@ impl OutputTarget for DevialetAirOutput {
             "source_choisie": ampli.as_ref().map(|a| a.annonce.source_choisie),
             "source_air": (self.contexte.indice_source)(),
             "volume_db": ampli.as_ref().map(|a| a.annonce.volume_db()),
+            "volume_range_db": (self.contexte.bornes_db)().json(),
             "sourdine": ampli.as_ref().map(|a| a.annonce.sourdine),
             "graves_db": ampli.as_ref().map(|a| f64::from(a.annonce.graves_demi_db) / 2.0),
             "aigus_db": ampli.as_ref().map(|a| f64::from(a.annonce.aigus_demi_db) / 2.0),

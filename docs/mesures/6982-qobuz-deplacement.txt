@@ -1,0 +1,49 @@
+#6982 — Qobuz Hi-Res, nouveau flux après avance sur le renderer Devialet ciblé
+
+Le proxy Qobuz servait encore le début du fichier puis recevait un Seek SOAP.
+Le Devialet acquittait le Seek mais restait muet (rapport du fil 2268).
+La règle du renderer #6333 est réutilisée : reconnaissance de son adresse
+ou réglage de zone deplacement_hi_res_nouveau_flux, et profondeur >16 bits.
+
+Une avance Qobuz sur cette sortie DLNA relance maintenant la piste avec une
+nouvelle adresse qui commence à la position. Sans DSP ni plafond de cadence,
+le FLAC est téléchargé, puis servi en natif par la mécanique #6059 : en-tête
+réécrit et trames d'origine à partir de la position (frontière avant la cible).
+La carte virtuelle et le fichier temporaire suivent la vie de la session.
+Aucun second Seek n'est envoyé au flux déjà décalé. La DIDL annonce le reste ;
+la position et la durée de piste sont reconstituées comme pour #6059.
+
+Quand un traitement ou un rééchantillonnage est demandé, le pré-transcodage
+existant les applique et décode à seek_ms ; son nouveau FLAC porte aussi le
+départ. Le prototype qui employait ce pré-transcodage même sans traitement
+conservait le PCM ; son banc complet a duré 132,5 s sur le vrai Qobuz
+32597024 (24/96, 597 s), comparaison PCM incluse. Ce chiffre n’isole PAS
+le seek serveur. La voie native évite le décodage et le ré-encodage complets.
+
+Limite : le FLAC amont est encore téléchargé en entier avant le départ natif ;
+aucune avance instantanée n'est promise sur un lien lent. Le chemin traité
+garde le coût et les tampons PCM de son pré-transcodage existant. Qobuz CD,
+autres renderers, autres services et démarrage ordinaire gardent leur chemin.
+Aucun nouveau codec n'est imposé au renderer.
+
+Banc automatisé : vrai relais, FLAC 24/48 non uniforme, carte virtuelle réellement
+assemblée puis décodée ; le PCM doit être une tranche de la source et le départ
+inscrit doit correspondre à sa position. Qualité et absence de second Seek,
+plus témoins CD et renderer non ciblé. Validation finale en cours.
+
+Validation finale Shrek : contre-épreuve compilable sur les deux fichiers de
+production remis au SHA du lot, tests conservés : 1 rouge (proxy au lieu de
+FLAC décalé), 2 verts. Restauration par copie ; 30 tests de déplacement,
+3 WAV progressif, 8 natifs verts ; garde temporaires 3/3, rustfmt et diff-check.
+
+Vrai Qobuz sur .18, 27/10/2026 14:15:26 UTC, QobuzService actuel, banc isolé
+avec sortie DLNA factice et vraie commande play puis seek(20 000).
+Piste 32597024, 597 s, 24 bits/96 kHz : nouvelle session FLAC native,
+départ 19 968 ms (frontière avant la cible), 2 play_media, 0 Seek SOAP.
+1 152 000 octets PCM (2 s) identiques à la fenêtre source à 19 968 ms.
+La durée publique reste 597 000 ms. Seek seul : 2 750 ms ; vérification incluse :
+5 518 ms ; banc complet (incluant la référence téléchargée avant play) :
+10,85 s ; RSS max du banc 51 592 Ko. Source temporaire retirée par la fin
+de session, banc et bases temporaires retirés ; service de production intact,
+session lue sur place en lecture seule, aucun son ni test sur l'enceinte réelle.
+La validation physique chez Fabien reste nécessaire ; issue non fermée.

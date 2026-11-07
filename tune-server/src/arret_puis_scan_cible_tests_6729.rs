@@ -108,7 +108,6 @@ async fn arreter_puis_scanner_un_dossier_laisse_le_statut_au_repos_6729() {
         crate::routes::system::scan::decrire_le_scan_en_cours("idle").is_null(),
         "#6729 : un scan est encore annoncé après la fin du scan ciblé"
     );
-    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         reglages.get("scan_status").unwrap().as_deref(),
         Some("idle"),

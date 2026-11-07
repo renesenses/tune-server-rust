@@ -10,9 +10,13 @@ pub mod auto_fix;
 pub mod balises_brutes;
 pub mod batch;
 pub mod bio_batch;
+pub mod bio_segments;
 pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod completude;
+pub mod credits_balises;
+#[cfg(test)]
+mod credits_balises_tests_7766;
 pub mod credits_mb;
 pub mod credits_release;
 pub mod discogs_propositions;
@@ -38,6 +42,10 @@ mod note_balises_6123_tests;
 pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;
+// La source d'un crédit de piste et ses témoins (#7765).
+#[cfg(test)]
+mod credits_source_7765_tests;
+pub mod source_des_credits;
 pub mod suggestions;
 // Le MBID des artistes par une recherche MusicBrainz confirmée (#4805, étape C).
 pub mod artistes_par_le_reseau;
@@ -4367,20 +4375,29 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     }
 
     // Credits / personnel
-    if let Some(v) = get(ItemKey::Composer) {
-        meta.insert("composer".into(), v);
-    }
-    if let Some(v) = get(ItemKey::Conductor) {
-        meta.insert("conductor".into(), v);
-    }
-    if let Some(v) = get(ItemKey::Lyricist) {
-        meta.insert("lyricist".into(), v);
+    // #7766 — chaque clé de crédit garde TOUTES ses trames : deux COMPOSER
+    // Vorbis, ou un TCOM ID3v2.4 à deux valeurs, donnaient un seul
+    // compositeur. Les clés `arranger` à `writer` sont nouvelles ; ID3 range
+    // la TIPL (producer, arranger, engineer, mix, DJ-mix) sous les mêmes
+    // `ItemKey`, MP4 ses atomes `----:com.apple.iTunes:*`. Elles deviennent
+    // des lignes `track_credits` au scan (`credits_balises`).
+    for (cle, item) in [
+        ("composer", ItemKey::Composer),
+        ("conductor", ItemKey::Conductor),
+        ("lyricist", ItemKey::Lyricist),
+        ("writer", ItemKey::Writer),
+        ("arranger", ItemKey::Arranger),
+        ("engineer", ItemKey::Engineer),
+        ("mixer", ItemKey::MixEngineer),
+        ("djmixer", ItemKey::MixDj),
+        ("remixer", ItemKey::Remixer),
+    ] {
+        if let Some(v) = toutes(item) {
+            meta.insert(cle.into(), v);
+        }
     }
     if let Some(v) = toutes(ItemKey::Performer) {
         meta.insert("performer".into(), v);
-    }
-    if let Some(v) = get(ItemKey::Remixer) {
-        meta.insert("remixer".into(), v);
     }
     if let Some(v) = label_du_tag(&get) {
         meta.insert("label".into(), v);
@@ -4467,6 +4484,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
                 .iter()
                 .chain(balises_brutes::CLES_ANNEE_ORIGINALE.iter())
                 .chain(std::iter::once(&balises_brutes::CLE_VERSION))
+                .chain(credits_balises::CLES_ENSEMBLE.iter())
                 .filter_map(|k| find_vorbis_comment(h, k).map(|v| (k.to_string(), v)))
                 .collect(),
             None => balises_brutes::lire_balises_du_fichier(path)
@@ -4481,6 +4499,11 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         if let Some(v) = balises_brutes::version_parmi(&brutes) {
             meta.insert("version".into(), v);
         }
+        // #7766 — ce que lofty ne range sous aucun `ItemKey` : l'ensemble ou
+        // l'orchestre (ENSEMBLE, ORCHESTRA), la liste des musiciens ID3v2.4
+        // (TMCL, « instrument: nom »), et l'arrangeur d'un MP4. Lu dans les
+        // mêmes clés brutes, sans E/S de plus.
+        credits_balises::completer_par_les_cles_brutes(&mut meta, &brutes);
     }
     if let Some(v) = get(ItemKey::OriginalMediaType)
         .or_else(|| find_vorbis_comment(header.as_deref()?, "SOURCE"))
@@ -4820,14 +4843,10 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
         if item.key() == ItemKey::Performer
             && let Some(val) = item.value().text()
         {
-            let (name, instrument) = if let Some((n, i)) = val.split_once('(') {
-                (
-                    n.trim().to_string(),
-                    Some(i.trim_end_matches(')').trim().to_string()),
-                )
-            } else {
-                (val.to_string(), None)
-            };
+            // #7766 — le découpage « Nom (instrument) » des crédits de balise,
+            // à la dernière parenthèse : « Orchestre (de chambre) de Paris
+            // (violon) » garde son nom entier.
+            let (name, instrument) = credits_balises::nom_et_instrument(val);
             credits.push(TrackCredit {
                 name,
                 role: "performer".into(),

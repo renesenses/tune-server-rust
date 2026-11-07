@@ -113,6 +113,35 @@ struct HeartbeatPayload {
     albums_with_bio: i64,
     os: String,
     arch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tune_tested: Option<super::tune_tested_auto::Contribution>,
+}
+
+fn charge_utile(
+    settings: &SettingsRepo,
+    services: Vec<String>,
+    tracks_count: i64,
+    artists_with_bio: i64,
+    albums_with_bio: i64,
+    web_dir: &std::path::Path,
+) -> Option<HeartbeatPayload> {
+    if !TelemetryReporter::is_enabled_for(settings) {
+        return None;
+    }
+    Some(HeartbeatPayload {
+        server_id: super::tune_tested_auto::pseudonyme_serveur(
+            &TelemetryReporter::get_or_create_server_id(settings),
+        ),
+        version: crate::version().to_string(),
+        ui_version: crate::interface_web::version_interface(web_dir),
+        services,
+        tracks_count,
+        artists_with_bio,
+        albums_with_bio,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        tune_tested: super::tune_tested_auto::contribution(settings),
+    })
 }
 
 pub struct TelemetryReporter;
@@ -191,8 +220,6 @@ impl TelemetryReporter {
             return;
         }
 
-        let server_id = Self::get_or_create_server_id(&settings);
-
         // Collect connected service names (authenticated == true)
         let connected_services = {
             let registry = services.lock().await;
@@ -220,16 +247,15 @@ impl TelemetryReporter {
             .count_with_bio()
             .unwrap_or(0);
 
-        let payload = HeartbeatPayload {
-            server_id,
-            version: crate::version().to_string(),
-            ui_version: crate::interface_web::version_interface(web_dir),
-            services: connected_services,
+        let Some(payload) = charge_utile(
+            &settings,
+            connected_services,
             tracks_count,
             artists_with_bio,
             albums_with_bio,
-            os: std::env::consts::OS.to_string(),
-            arch: std::env::consts::ARCH.to_string(),
+            web_dir,
+        ) else {
+            return;
         };
 
         let client = match crate::http::client::builder()
@@ -308,6 +334,30 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         std::sync::Arc::new(db)
+    }
+
+    #[test]
+    fn tune_tested_auto_battement_reel_ne_contient_pas_le_serveur_brut() {
+        let settings = SettingsRepo::with_backend(fresh_db());
+        let brut = "123e4567-e89b-12d3-a456-426614174000";
+        settings.set("server_id", brut).unwrap();
+        settings.set(TELEMETRY_SETTING_KEY, "true").unwrap();
+        let web_dir = tempfile::tempdir().unwrap();
+        let payload = charge_utile(&settings, Vec::new(), 0, 0, 0, web_dir.path()).unwrap();
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(
+            json["server_id"],
+            super::super::tune_tested_auto::pseudonyme_serveur(brut)
+        );
+        assert!(
+            !json.to_string().contains(brut),
+            "le battement ne doit jamais exporter l'identité brute"
+        );
+        settings.set(TELEMETRY_SETTING_KEY, "false").unwrap();
+        assert!(
+            charge_utile(&settings, Vec::new(), 0, 0, 0, web_dir.path()).is_none(),
+            "refus : aucune charge utile"
+        );
     }
 
     #[test]

@@ -237,7 +237,9 @@ mod tests {
     }
 
     fn voie_gauche(pcm: &[u8]) -> Vec<i32> {
-        pcm.chunks_exact(4)
+        pcm.as_chunks::<4>()
+            .0
+            .iter()
             .map(|t| i32::from(i16::from_le_bytes([t[0], t[1]])))
             .collect()
     }

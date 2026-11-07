@@ -423,16 +423,16 @@ async fn handle_event(
                             enrichi = enrichir_appareil_airplay(d, &device);
                         }
                         debug!(id = %dev_id, name = %device.name, host = %device.host, service = service_type, "mdns_dup_skipped");
-                        if enrichi {
-                            if let Some(d) = st.devices.values().find(|d| {
+                        if enrichi
+                            && let Some(d) = st.devices.values().find(|d| {
                                 d.device_type == OutputType::Airplay
                                     && meme_appareil_airplay(d, &device)
-                            }) {
-                                let d_clone = d.clone();
-                                drop(st);
-                                let _ = event_tx.send(MdnsEvent::DeviceUpdated(d_clone)).await;
-                                return;
-                            }
+                            })
+                        {
+                            let d_clone = d.clone();
+                            drop(st);
+                            let _ = event_tx.send(MdnsEvent::DeviceUpdated(d_clone)).await;
+                            return;
                         }
                         drop(st);
                         return;
@@ -778,6 +778,12 @@ fn service_to_device(
         }
         if let Some(fw) = info.get_property_val_str("fw") {
             caps.insert("firmware".into(), serde_json::Value::String(fw.to_string()));
+        }
+        if let Some(volume) = info.get_property_val_str("vol") {
+            caps.insert(
+                "oaat_volume_type".into(),
+                serde_json::Value::String(volume.into()),
+            );
         }
         caps.insert("oaat".into(), serde_json::Value::Bool(true));
         if let Some(ip) = info.get_property_val_str("ip") {
@@ -1753,5 +1759,42 @@ mod tests {
             legacy_device_id(OutputType::Bluos, "192.168.1.23", 11000),
             format!("{}-192.168.1.23-11000", OutputType::Bluos),
         );
+    }
+}
+
+#[cfg(all(test, feature = "oaat"))]
+mod volume_7333_tests {
+    use super::*;
+    use crate::outputs::{OutputTarget, oaat::OaatOutput};
+
+    #[test]
+    fn le_txt_du_service_oaat_parvient_aux_capacites_de_sortie_7333() {
+        for volume in ["fixed", "none"] {
+            let properties = [
+                ("id", "7333-fictif"),
+                ("name", "Banc 7333"),
+                ("vol", volume),
+            ];
+            let info = ServiceInfo::new(
+                OAAT_SERVICE,
+                "Banc7333",
+                "banc7333.local.",
+                "127.0.0.1",
+                9740,
+                &properties[..],
+            )
+            .unwrap()
+            .as_resolved_service();
+            let dev = service_to_device(&info, OutputType::Oaat, 9740);
+            let output = OaatOutput::new(dev.name, dev.host, dev.port, dev.id).avec_volume_annonce(
+                dev.capabilities
+                    .get("oaat_volume_type")
+                    .and_then(|v| v.as_str()),
+            );
+            assert!(
+                !output.capabilities().can_set_volume,
+                "#7333 : le TXT {volume} s'est perdu pendant la découverte"
+            );
+        }
     }
 }

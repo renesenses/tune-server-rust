@@ -268,6 +268,7 @@ fn champ_de(nom: &str) -> Option<&'static str> {
         ("titre", "title"),
         ("commentaire", "comments"),
         ("ia", "ai_generated"),
+        ("hires", "hires_verdict"),
         ("favori", "favorite"),
         ("collection", "in_collection"),
         ("playlist", "in_playlist"),
@@ -485,6 +486,21 @@ fn regle(
             }
         }
         Famille::Credit => refus("un crédit s'écrit credit(artiste: …, role: …, instrument: …)"),
+        // #6285 — `hires:verifie`, `hires!=douteux`.
+        Famille::VerdictHiRes => {
+            let verdict = match simplifier(valeur).as_str() {
+                "verifie" => "verifie",
+                "conforme" => "conforme",
+                "douteux" => "douteux",
+                "non_analyse" => "non_analyse",
+                _ => return refus("« verifie », « conforme », « douteux » ou « non_analyse »"),
+            };
+            match op {
+                ":" | "=" => r("=", json!(verdict)),
+                "!=" => r("!=", json!(verdict)),
+                _ => refus("un verdict hi-res se compare par « : » ou « != »"),
+            }
+        }
     }
 }
 

@@ -10,6 +10,8 @@ pub mod audit;
 pub mod cover_fetcher;
 /// #6332 — compléter au rescan le débit des pistes déjà en base.
 pub mod debit_des_pistes;
+/// #6917 — ne dédoublonner que les copies d'une même racine de musique.
+pub mod dedoublonnage_par_racine;
 pub mod duplicate_detector;
 /// Les exemplaires d'une piste dans plusieurs répertoires (#4907).
 pub mod exemplaires;
@@ -21,11 +23,15 @@ pub mod genres_equivalents;
 /// Regrouper les exemplaires d'un même enregistrement entre sources, et
 /// choisir celui qu'on joue (#2264).
 pub mod groupes_versions;
+/// #7089 — les logos de labels pris sur le web ouvert (Commons, Wikipédia,
+/// site officiel, Discogs), après un rapprochement MusicBrainz sûr.
+pub mod images_rapides;
 pub mod importer;
 pub mod ingest;
 pub mod local_path;
 /// Le logo d'un label de la bibliothèque, lu chez Qobuz (#6736).
 pub mod logos_labels;
+pub mod logos_web;
 pub mod lyrics_pass;
 pub mod m3u_parser;
 pub mod mosaique;
@@ -42,6 +48,8 @@ pub mod quality;
 pub mod regle_compilation;
 /// Où vit la règle de choix des versions : par profil, puis globale (#2264).
 pub mod regle_de_version;
+/// La grammaire de requêtes de la bibliothèque et son compilateur SQL (#7848).
+pub mod requete;
 pub mod smart_collections;
 pub mod track_matcher;
 /// Les exemplaires d'un enregistrement qui sont en base (#2264).

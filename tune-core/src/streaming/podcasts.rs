@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use quick_xml::escape::unescape;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -6,12 +7,40 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+use super::podcast_annuaires::{Annuaires, RelaisPodcastIndex};
+
 const ITUNES_SEARCH_URL: &str = "https://itunes.apple.com/search";
 const ITUNES_LOOKUP_URL: &str = "https://itunes.apple.com/lookup";
 const APPLE_TOP_BASE: &str = "https://rss.marketingtools.apple.com/api/v2";
 const USER_AGENT: &str = "Tune/2.0 (https://mozaiklabs.fr)";
+/// #7152 — résolutions de flux menées en parallèle pour une même recherche.
+const RESOLUTIONS_EN_PARALLELE: usize = 6;
+/// #7152 — au-delà, la recherche rend ce qui est résolu ; le reste (non mis
+/// en cache) se résoudra à la recherche suivante.
+const DELAI_DES_RESOLUTIONS: Duration = Duration::from_secs(12);
 /// Cache TTL for top podcasts (1 hour).
 const TOP_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+/// Un même flux public n'apparaît qu'une fois, au meilleur rang Apple.
+/// Les fiches sans flux restent distinctes par leur identifiant de catalogue.
+fn dedoublonner_le_palmares(podcasts: &mut Vec<Podcast>) {
+    let mut flux = std::collections::HashSet::new();
+    let mut identifiants = std::collections::HashSet::new();
+    podcasts.retain(|p| {
+        if (!p.feed_url.is_empty() && flux.contains(&p.feed_url))
+            || (!p.source_id.is_empty() && identifiants.contains(&p.source_id))
+        {
+            return false;
+        }
+        if !p.feed_url.is_empty() {
+            flux.insert(p.feed_url.clone());
+        }
+        if !p.source_id.is_empty() {
+            identifiants.insert(p.source_id.clone());
+        }
+        true
+    });
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Podcast {
@@ -131,6 +160,12 @@ pub struct PodcastEpisode {
     pub duration_ms: u64,
     pub published: String,
     pub cover_url: String,
+    /// #7894 — le type que le flux DÉCLARE pour l'audio (`enclosure@type`,
+    /// ou `type` du lien `enclosure` en Atom). L'extension de l'adresse ne le
+    /// dit pas toujours : un M4A servi sous une adresse sans extension était
+    /// annoncé `audio/mpeg` à l'appareil de rendu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 /// Un flux lu : l'image de la chaîne (vide si le flux n'en déclare pas) et
@@ -143,6 +178,12 @@ pub struct FluxPodcast {
 
 pub struct PodcastService {
     client: Client,
+    /// Adresse de la recherche Apple. Fixe en production ; un banc la pointe
+    /// vers un faux Apple local (#7152).
+    search_base: String,
+    /// Les annuaires qui résolvent le flux d'une fiche Apple sans `feedUrl`
+    /// (#7152).
+    annuaires: Annuaires,
     /// Adresse de la recherche Apple par identifiant. Fixe en production ;
     /// un banc la pointe vers un faux Apple local (#6770).
     lookup_base: String,
@@ -203,43 +244,88 @@ impl EchecResolution {
 
 impl PodcastService {
     pub fn new() -> Self {
-        Self {
-            client: crate::http::client::builder()
+        Self::with_client(
+            crate::http::client::builder()
                 .timeout(Duration::from_secs(10))
                 .user_agent(USER_AGENT)
                 .redirect(reqwest::redirect::Policy::limited(10))
                 .build()
                 .unwrap(),
-            lookup_base: ITUNES_LOOKUP_URL.to_string(),
-            top_base: APPLE_TOP_BASE.to_string(),
-        }
+        )
     }
 
     /// Create a PodcastService reusing an existing reqwest client.
     pub fn with_client(client: Client) -> Self {
-        Self {
-            client,
-            lookup_base: ITUNES_LOOKUP_URL.to_string(),
-            top_base: APPLE_TOP_BASE.to_string(),
-        }
+        Self::with_apple_bases(client, APPLE_TOP_BASE, ITUNES_LOOKUP_URL)
     }
 
     /// Comme [`Self::with_client`], avec une autre adresse de `lookup` :
     /// réservé aux bancs, qui servent un faux Apple local.
     pub fn with_lookup_base(client: Client, lookup_base: &str) -> Self {
-        Self {
-            client,
-            lookup_base: lookup_base.to_string(),
-            top_base: APPLE_TOP_BASE.to_string(),
-        }
+        Self::with_apple_bases(client, APPLE_TOP_BASE, lookup_base)
     }
 
     /// Comme [`Self::with_lookup_base`], palmarès compris : réservé aux bancs.
     pub fn with_apple_bases(client: Client, top_base: &str, lookup_base: &str) -> Self {
         Self {
+            annuaires: Annuaires::new(client.clone()),
             client,
+            search_base: ITUNES_SEARCH_URL.to_string(),
             lookup_base: lookup_base.to_string(),
             top_base: top_base.to_string(),
+        }
+    }
+
+    /// Réservé aux bancs (#7152) : recherche Apple et annuaires pointés vers
+    /// un faux serveur local.
+    pub fn with_bases_de_banc(client: Client, search_base: &str, annuaires: Annuaires) -> Self {
+        let mut svc = Self::with_client(client);
+        svc.search_base = search_base.to_string();
+        svc.annuaires = annuaires;
+        svc
+    }
+
+    /// Podcast Index en troisième annuaire, par le relais de mozaiklabs.fr
+    /// (#7152). `None` : pas de compte relié, la source est sautée.
+    pub fn avec_relais_podcast_index(mut self, relais: Option<RelaisPodcastIndex>) -> Self {
+        self.annuaires = self.annuaires.avec_relais(relais);
+        self
+    }
+
+    /// #7152 — résout, par les annuaires, le flux des podcasts de `podcasts`
+    /// dont le `feed_url` est vide. `apple_id` lit l'identifiant Apple d'une
+    /// fiche. Borné par [`DELAI_DES_RESOLUTIONS`] : ce qui n'est pas résolu à
+    /// temps garde un flux vide.
+    async fn resoudre_par_les_annuaires(
+        &self,
+        podcasts: &mut [Podcast],
+        apple_id: impl Fn(&Podcast) -> Option<String>,
+    ) {
+        let demandes: Vec<(usize, Option<String>, String, String)> = podcasts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.feed_url.is_empty())
+            .map(|(i, p)| (i, apple_id(p), p.name.clone(), p.artist.clone()))
+            .collect();
+        if demandes.is_empty() {
+            return;
+        }
+        let annuaires = &self.annuaires;
+        let resolus: Vec<(usize, Option<super::podcast_annuaires::FluxResolu>)> =
+            futures_util::stream::iter(demandes)
+                .map(|(i, id, titre, auteur)| async move {
+                    (i, annuaires.resoudre(id.as_deref(), &titre, &auteur).await)
+                })
+                .buffer_unordered(RESOLUTIONS_EN_PARALLELE)
+                .take_until(tokio::time::sleep(DELAI_DES_RESOLUTIONS))
+                .collect()
+                .await;
+        for (i, flux) in resolus {
+            if let Some(f) = flux
+                && let Some(p) = podcasts.get_mut(i)
+            {
+                p.feed_url = f.url;
+            }
         }
     }
 
@@ -287,7 +373,7 @@ impl PodcastService {
 
         let resp = self
             .client
-            .get(ITUNES_SEARCH_URL)
+            .get(&self.search_base)
             .query(&params)
             .send()
             .await
@@ -297,10 +383,16 @@ impl PodcastService {
             .await
             .map_err(|e| format!("podcast parse: {e}"))?;
         let results = data["results"].as_array().cloned().unwrap_or_default();
-        let podcasts: Vec<Podcast> = results
+        // #7152 — une fiche SANS `feedUrl` n'est plus jetée ici : son flux est
+        // résolu par les annuaires juste après. Seule celle qui reste sans
+        // flux est écartée, plus bas.
+        let mut podcasts: Vec<Podcast> = results
             .iter()
             .filter_map(|r| {
-                let feed_url = r["feedUrl"].as_str()?.to_string();
+                let feed_url = r["feedUrl"].as_str().unwrap_or("").trim().to_string();
+                if feed_url.is_empty() && r["trackId"].as_u64().is_none() {
+                    return None;
+                }
                 let source_id = r["trackId"]
                     .as_u64()
                     .map(|id| id.to_string())
@@ -331,6 +423,13 @@ impl PodcastService {
                 })
             })
             .collect();
+        self.resoudre_par_les_annuaires(&mut podcasts, |p| Some(p.source_id.clone()))
+            .await;
+        // Choix (#7152) : une fiche dont aucun annuaire ne donne le flux par
+        // concordance stricte n'est PAS proposée. Sans flux, elle ne peut être
+        // ni écoutée ni suivie dans Tune, et aucun client ne sait aujourd'hui
+        // dire « non lisible » : la montrer serait une impasse.
+        podcasts.retain(|p| !p.feed_url.is_empty());
 
         // Update cache.
         {
@@ -902,6 +1001,12 @@ impl PodcastService {
                 }
             }
         }
+        // #7152 — ceux qu'Apple connaît sans flux public (Radio France…) : les
+        // annuaires, par titre et auteur, avec la même concordance stricte.
+        self.resoudre_par_les_annuaires(podcasts, |p| {
+            p.source_id.strip_prefix("apple-").map(String::from)
+        })
+        .await;
         let restants = ids_manquants(podcasts).len();
         if restants > 0 {
             debug!(
@@ -999,6 +1104,11 @@ impl PodcastService {
         debug!(count = podcasts.len(), "apple_top_podcasts_parsed");
         let mut podcasts = podcasts;
         self.completer_les_flux(&mut podcasts, &cc).await;
+        // #7225 — deux fiches Apple peuvent pointer vers le même RSS.
+        // Le web clé ses cartes par flux : garder les deux fait échouer tout
+        // l'écran (each_key_duplicate). Garder le meilleur rang, après la
+        // résolution des flux, avant de remplir le cache.
+        dedoublonner_le_palmares(&mut podcasts);
 
         // Update cache.
         {
@@ -1032,19 +1142,39 @@ impl Default for PodcastService {
 fn parse_rss(xml: &str, limit: usize) -> Result<Vec<PodcastEpisode>, String> {
     let mut episodes = Vec::new();
     let channel_cover = extract_channel_image(xml);
+    // #7819 — un flux Atom porte ses épisodes dans `<entry>`, et leur audio
+    // dans `<link rel="enclosure" href="…">`.
+    let atom = !xml.contains("<item") && xml.contains("<entry");
+    let (open, close) = if atom {
+        ("<entry", "</entry>")
+    } else {
+        ("<item", "</item>")
+    };
     let mut search_from = 0;
     while episodes.len() < limit {
-        let item_start = match xml[search_from..].find("<item") {
+        let item_start = match xml[search_from..].find(open) {
             Some(pos) => search_from + pos,
             None => break,
         };
-        let item_end = match xml[item_start..].find("</item>") {
-            Some(pos) => item_start + pos + 7,
+        let item_end = match xml[item_start..].find(close) {
+            Some(pos) => item_start + pos + close.len(),
             None => break,
         };
         let item = &xml[item_start..item_end];
         let title = extract_tag(item, "title").unwrap_or_default();
-        let audio_url = extract_attr(item, "enclosure", "url").unwrap_or_default();
+        let audio_url = if atom {
+            atom_enclosure(item)
+        } else {
+            extract_attr(item, "enclosure", "url")
+        }
+        .unwrap_or_default();
+        let mime_type = if atom {
+            atom_enclosure_type(item)
+        } else {
+            extract_attr(item, "enclosure", "type")
+        }
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
         if audio_url.is_empty() {
             search_from = item_end;
             continue;
@@ -1052,10 +1182,15 @@ fn parse_rss(xml: &str, limit: usize) -> Result<Vec<PodcastEpisode>, String> {
         let duration_text = extract_tag(item, "itunes:duration").unwrap_or_default();
         let duration_ms = parse_duration(&duration_text);
         let description = extract_tag(item, "itunes:summary")
-            .or_else(|| extract_tag(item, "description"))
+            .or_else(|| extract_tag(item, if atom { "summary" } else { "description" }))
             .map(|d| strip_html_tags(&d))
             .unwrap_or_default();
-        let published = extract_tag(item, "pubDate").unwrap_or_default();
+        let published = if atom {
+            extract_tag(item, "published").or_else(|| extract_tag(item, "updated"))
+        } else {
+            extract_tag(item, "pubDate")
+        }
+        .unwrap_or_default();
         let cover_url =
             extract_attr(item, "itunes:image", "href").unwrap_or_else(|| channel_cover.clone());
         episodes.push(PodcastEpisode {
@@ -1065,10 +1200,57 @@ fn parse_rss(xml: &str, limit: usize) -> Result<Vec<PodcastEpisode>, String> {
             duration_ms,
             published,
             cover_url,
+            mime_type,
         });
         search_from = item_end;
     }
     Ok(episodes)
+}
+
+/// L'audio d'une entrée Atom : le `href` de son `<link rel="enclosure">`
+/// (#7819).
+fn atom_enclosure(entry: &str) -> Option<String> {
+    let mut rest = entry;
+    while let Some(start) = rest.find("<link ") {
+        let tag = &rest[start..];
+        let end = tag.find('>')?;
+        let link = &tag[..=end];
+        if link.contains("rel=\"enclosure\"") {
+            return extract_attr(link, "link", "href");
+        }
+        rest = &tag[end..];
+    }
+    None
+}
+
+/// #7894 — le `type` du lien `enclosure` d'une entrée Atom.
+fn atom_enclosure_type(entry: &str) -> Option<String> {
+    let mut rest = entry;
+    while let Some(start) = rest.find("<link ") {
+        let tag = &rest[start..];
+        let end = tag.find('>')?;
+        let link = &tag[..=end];
+        if link.contains("rel=\"enclosure\"") {
+            return extract_attr(link, "link", "type");
+        }
+        rest = &tag[end..];
+    }
+    None
+}
+
+/// [`extract_tag`] pour les annuaires (#7152).
+pub(crate) fn extraire_balise(xml: &str, tag: &str) -> Option<String> {
+    extract_tag(xml, tag)
+}
+
+/// [`extract_channel_image`] pour l'ajout par adresse (#7819).
+pub(crate) fn image_de_la_chaine(xml: &str) -> String {
+    extract_channel_image(xml)
+}
+
+/// [`strip_html_tags`] pour l'ajout par adresse (#7819).
+pub(crate) fn texte_sans_balises(html: &str) -> String {
+    strip_html_tags(html)
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
@@ -1211,6 +1393,19 @@ mod tests {
         assert_eq!(episodes.len(), 2);
         assert_eq!(episodes[0].title, "Ep 1");
         assert_eq!(episodes[0].duration_ms, 1800000);
+    }
+    /// #7894 — le type déclaré par le flux est gardé avec l'épisode, en RSS
+    /// comme en Atom : c'est lui, et non l'extension de l'adresse, qui dit à
+    /// l'appareil de rendu ce qu'il va recevoir.
+    #[test]
+    fn le_type_declare_par_le_flux_suit_l_episode_7894() {
+        let rss = r#"<rss><channel><item><title>Ep</title><enclosure url="https://h.example/media/42" length="1" type="audio/x-m4a"/></item><item><title>Sans type</title><enclosure url="https://h.example/b.mp3"/></item></channel></rss>"#;
+        let episodes = parse_rss(rss, 10).unwrap();
+        assert_eq!(episodes[0].mime_type.as_deref(), Some("audio/x-m4a"));
+        assert_eq!(episodes[1].mime_type, None);
+        let atom = r#"<feed><entry><title>A</title><link rel="enclosure" type="audio/mp4" href="https://h.example/a"/></entry></feed>"#;
+        let episodes = parse_rss(atom, 10).unwrap();
+        assert_eq!(episodes[0].mime_type.as_deref(), Some("audio/mp4"));
     }
     #[test]
     fn curated_french_podcasts() {
@@ -1486,6 +1681,104 @@ mod tests {
         assert!(
             premiere.contains("id=333&") && premiere.contains("country=zz"),
             "sans pays du client, le pays retenu du palmarès doit partir : {premiere}"
+        );
+    }
+
+    /// #7819 — les épisodes d'un flux Atom se lisent comme ceux d'un RSS.
+    #[test]
+    fn un_flux_atom_donne_ses_episodes() {
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>P</title>
+<entry><title>E1</title><published>2026-11-01T08:00:00Z</published>
+<link rel="alternate" href="https://ex.test/page1"/>
+<link rel="enclosure" type="audio/mpeg" href="https://ex.test/e1.mp3"/>
+<summary>Résumé 1</summary></entry>
+<entry><title>Sans audio</title><link rel="alternate" href="https://ex.test/p2"/></entry>
+</feed>"#;
+        let episodes = parse_rss(xml, 10).unwrap();
+        assert_eq!(episodes.len(), 1, "{episodes:?}");
+        assert_eq!(episodes[0].title, "E1");
+        assert_eq!(episodes[0].audio_url, "https://ex.test/e1.mp3");
+        assert_eq!(episodes[0].published, "2026-11-01T08:00:00Z");
+        assert_eq!(episodes[0].description, "Résumé 1");
+    }
+}
+
+#[cfg(test)]
+mod palmares_doublons_7225 {
+    use super::*;
+
+    #[tokio::test]
+    async fn deux_identifiants_apple_un_seul_flux_ne_cassent_pas_le_palmares_7225() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let serveur = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0; 8192];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let body = if request.contains("/podcasts/top/") {
+                    // Même forme que le vrai palmarès FR relevé le 28/10 :
+                    // deux identifiants UNBX, un seul flux (voir mesure).
+                    r#"{"feed":{"results":[
+                      {"id":"6813632977","name":"UNBX","artistName":"A"},
+                      {"id":"6813632603","name":"UNBX","artistName":"A"},
+                      {"id":"3","name":"Autre podcast","artistName":"B"}]}}"#
+                } else {
+                    r#"{"results":[
+                      {"collectionId":6813632977,"feedUrl":"https://flux.example.test/unbx.xml"},
+                      {"collectionId":6813632603,"feedUrl":"https://flux.example.test/unbx.xml"},
+                      {"collectionId":3,"feedUrl":"https://flux.example.test/autre.xml"}]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let service = PodcastService::with_apple_bases(
+            crate::http::client::shared().clone(),
+            &base,
+            &format!("{base}/lookup"),
+        );
+        for _ in 0..2 {
+            let podcasts = service.top_podcasts(Some(7225), "xq").await.unwrap();
+            assert_eq!(
+                podcasts.len(),
+                2,
+                "#7225 : le palmarès expose deux cartes avec la même clé RSS, ce qui fait échouer tout l'écran Svelte"
+            );
+            assert_eq!(
+                podcasts[0].source_id, "apple-6813632977",
+                "le premier rang doit être conservé"
+            );
+            assert_eq!(podcasts[1].source_id, "apple-3");
+        }
+        serveur.abort();
+    }
+
+    #[test]
+    fn sans_flux_les_podcasts_distincts_restent_visibles_7225() {
+        let podcast = |id: &str| Podcast {
+            name: "Homonyme".into(),
+            artist: "Auteur".into(),
+            feed_url: String::new(),
+            cover_url: String::new(),
+            description: String::new(),
+            episode_count: 0,
+            source_id: id.into(),
+            category: None,
+        };
+        let mut podcasts = vec![podcast("apple-1"), podcast("apple-2"), podcast("apple-1")];
+        dedoublonner_le_palmares(&mut podcasts);
+        assert_eq!(
+            podcasts
+                .iter()
+                .map(|p| p.source_id.as_str())
+                .collect::<Vec<_>>(),
+            ["apple-1", "apple-2"]
         );
     }
 }

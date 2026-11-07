@@ -52,8 +52,10 @@ const EMPREINTE_NATIVE_24_BITS_IDENTITE: u64 = 0x1688_08b2_7642_8f1e;
 // le DoP force la branche brute, volume et DSP ne le touchent jamais.
 const EMPREINTE_NATIVE_DOP: u64 = 0x12e6_821d_877b_2aa5;
 // Route native, 16 bits, volume 500 : aller-retour flottant, quantifié UNE
-// fois (`f32_to_native_i32`), avant l'anneau (D3).
-const EMPREINTE_NATIVE_16_BITS_VOLUME_500: u64 = 0x9b8d_7155_baac_bb7c;
+// fois (`f32_to_native_i32`), avant l'anneau (D3). #7703 : relevé refait,
+// la quantification est désormais dithérée (TPDF déterministe) — l'ancien
+// relevé, arrondi nu, valait 0x9b8d_7155_baac_bb7c.
+const EMPREINTE_NATIVE_16_BITS_VOLUME_500: u64 = 0xbafb_2b5d_cb41_9dc7;
 // Route traitée, 16 et 24 bits, DSP au repos : les `f32` de
 // `pcm_bytes_to_f32`, sans volume — il est dans le rappel.
 const EMPREINTE_FLOTTANTE_16_BITS: u64 = 0xbb0a_b2e4_f3bd_af91;
@@ -305,7 +307,7 @@ fn route_native_porte_le_dop_intact_meme_a_volume_reduit() {
     // Et les octets sont bien ceux de la source, marqueurs compris : le mot
     // natif d'un échantillon 24 bits est son octet haut en bits 31..24.
     let mots = pcm_bytes_to_native_i32(&octets, 24);
-    for (trame, paire) in mots.chunks_exact(2).enumerate() {
+    for (trame, paire) in mots.as_chunks::<2>().0.iter().enumerate() {
         let marqueur = if trame % 2 == 0 { 0x05 } else { 0xFA };
         assert_eq!((paire[0] >> 24) as u8, marqueur);
         assert_eq!((paire[1] >> 24) as u8, marqueur);
