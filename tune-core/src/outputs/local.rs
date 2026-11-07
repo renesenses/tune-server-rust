@@ -20,6 +20,7 @@ use super::traits::{
 };
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
+use crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
 use crate::poller::TRACK_END_NOTIFY;
 
 /// Why a device refused to open, as far as the backend string lets us tell.
@@ -510,6 +511,9 @@ pub(crate) mod gain_au_rendu_7264;
 // #7934 — le même remède sur les rappels natifs ASIO : témoins portables.
 #[cfg(test)]
 mod gain_au_rendu_asio_7934;
+// #7968 — le bas de la course `db60` : un niveau distinct par position.
+#[cfg(test)]
+mod bas_de_course_db60_7968_tests;
 
 // #5204 — l'enchaînement sans blanc en mode exclusif : quel bras enchaîne, la
 // règle de la frontière à format égal, et la lecture de l'en-tête suivant
@@ -608,7 +612,8 @@ pub struct LocalOutput {
     /// scaled by the ReplayGain factor. Composing here means the dozen places
     /// that read a volume in the render loops need no knowledge of ReplayGain.
     volume: Arc<AtomicU32>,
-    /// The volume the user asked for, in milli-units — what the UI shows and
+    /// The volume the user asked for, in [`UNITE_DU_GAIN_DE_RENDU`] (#7968) —
+    /// what the UI shows and
     /// what mute restores. Kept apart from `volume` so a ReplayGain
     /// attenuation never looks like the slider moved on its own.
     user_volume: Arc<AtomicU32>,
@@ -909,7 +914,9 @@ pub struct LocalOutput {
     fondu_actif: Arc<AtomicBool>,
 }
 
-/// What the render callbacks multiply every sample by, in thousandths.
+/// What the render callbacks multiply every sample by, in
+/// [`UNITE_DU_GAIN_DE_RENDU`] (#7968: millionths, no longer thousandths).
+/// `user_units` is in the same unit; `rg_units` stays in thousandths.
 ///
 /// `dop` is not one more attenuation to fold in — it *replaces* the whole
 /// computation with unity, and that is the point. A DoP stream is a DSD
@@ -928,10 +935,10 @@ pub struct LocalOutput {
 /// than silently mute, but it is still a failure until the interface says so.
 fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
     if dop {
-        return 1000;
+        return UNITE_DU_GAIN_DE_RENDU;
     }
     let (rg_units, porte_par_l_eq) = decomposer_le_facteur_de_rendu(rg_units);
-    let user = user_units as f64 / 1000.0;
+    let user = user_units as f64 / f64::from(UNITE_DU_GAIN_DE_RENDU);
     let rg = rg_units as f64 / 1000.0;
     // Clamped to unity: above it, a ReplayGain boost would push peaks past
     // full scale and the user, who never touched the slider, would hear
@@ -940,7 +947,29 @@ fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
     // #5227 — puis divisé par la part de compensation que l'égaliseur porte
     // déjà dans ses échantillons : le produit rendu reste le même, rabot
     // compris, mais cette part-là traverse l'anneau avec le filtre.
-    ((user * rg).clamp(0.0, 1.0) * 1000.0 * 1000.0 / porte_par_l_eq as f64).round() as u32
+    let produit = (user * rg).clamp(0.0, 1.0) * f64::from(UNITE_DU_GAIN_DE_RENDU) * 1000.0
+        / porte_par_l_eq as f64;
+    // #7968 — un gain demandé non nul n'est jamais rendu muet par l'arrondi.
+    jamais_nul_s_il_est_demande(produit)
+}
+
+/// #7968 — le gain linéaire demandé par le curseur, en
+/// [`UNITE_DU_GAIN_DE_RENDU`]. Arrondi au plus proche, et jamais nul pour un
+/// gain strictement positif : seule la position 0 du curseur est muette.
+///
+/// `set_volume` tronquait en millièmes (`as u32`) : sur la loi `db60`, tout le
+/// bas de la course jusqu'à 5 % valait 0.
+pub(crate) fn unites_de_gain(volume: f64) -> u32 {
+    jamais_nul_s_il_est_demande(volume.clamp(0.0, 1.0) * f64::from(UNITE_DU_GAIN_DE_RENDU))
+}
+
+// `!(x > 0.0)` n'est pas `x <= 0.0` : seul le premier écarte `NaN`.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+fn jamais_nul_s_il_est_demande(unites: f64) -> u32 {
+    if !(unites > 0.0) {
+        return 0;
+    }
+    (unites.round() as u32).max(1)
 }
 
 /// #5227 — `rg_factor` porte DEUX nombres, en millièmes : le facteur
@@ -989,7 +1018,8 @@ fn dire_le_clamp_a_l_unite(device: &str, user_units: u32, rg_units: u32, dop: bo
         return;
     }
     let rg_units = decomposer_le_facteur_de_rendu(rg_units).0;
-    let demande = (user_units as f64 / 1000.0) * (rg_units as f64 / 1000.0);
+    let demande =
+        (user_units as f64 / f64::from(UNITE_DU_GAIN_DE_RENDU)) * (rg_units as f64 / 1000.0);
     if demande <= 1.0 {
         return;
     }
@@ -998,7 +1028,7 @@ fn dire_le_clamp_a_l_unite(device: &str, user_units: u32, rg_units: u32, dop: bo
         volume_units = user_units,
         replaygain_units = rg_units,
         demande_db = 20.0 * demande.log10(),
-        applique_db = 20.0 * (applique as f64 / 1000.0).log10(),
+        applique_db = 20.0 * (applique as f64 / f64::from(UNITE_DU_GAIN_DE_RENDU)).log10(),
         "local_gain_rabote_a_l_unite"
     );
 }
@@ -1306,8 +1336,8 @@ impl LocalOutput {
             origin_host: None,
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
-            volume: Arc::new(AtomicU32::new(1000)),
-            user_volume: Arc::new(AtomicU32::new(1000)),
+            volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
+            user_volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
             rg_factor: Arc::new(AtomicU32::new(1000)),
             replaygain_seul: AtomicU32::new(1000),
             // Même défaut que le réglage de zone : une sortie construite hors
@@ -1315,7 +1345,7 @@ impl LocalOutput {
             // facteur vaut 1 et rien ne change.
             compensation_de_niveau: AtomicBool::new(true),
             gain_moyen_dsp: Arc::new(AtomicU32::new(1000)),
-            pre_mute_volume: Arc::new(AtomicU32::new(1000)),
+            pre_mute_volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
             muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
             seek_offset_ms: Arc::new(AtomicU64::new(0)),
@@ -1539,7 +1569,7 @@ impl LocalOutput {
             .and_then(|c| c.as_ref().map(|p| p.gain_moyen_db()))
             .filter(|db| db.is_finite())
             .unwrap_or(0.0);
-        let produit = f64::from(volume) / 1000.0
+        let produit = f64::from(volume) / f64::from(UNITE_DU_GAIN_DE_RENDU)
             * f64::from(self.replaygain_seul.load(Ordering::SeqCst))
             / 1000.0
             * 10.0_f64.powf(-crossfeed_db / 20.0);
@@ -1869,7 +1899,7 @@ impl LocalOutput {
             true,
             true,
             false,
-            1000,
+            UNITE_DU_GAIN_DE_RENDU,
             &self.eq,
             &self.convolver,
             &self.crossfeed,
@@ -3686,7 +3716,7 @@ fn render_local_shared_f32_callback(
     let read = ring.pop(&mut output[debut..]);
     let fin = debut + read;
     ramp.dop.observer(&output[debut..fin], haut_f32);
-    let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+    let v = volume.load(Ordering::Relaxed) as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
     ramp.apply(&mut output[debut..fin], v);
     if fin < output.len() {
         ramp.dop.combler(&mut output[fin..], 0.0, repos_f32);
@@ -3742,7 +3772,7 @@ where
         }
         data_started.store(true, Ordering::Release);
     }
-    let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+    let v = volume.load(Ordering::Relaxed) as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
     let read = ramp.apply_mapped(v, |s| s.into_sample(), |map| ring.pop_mapped(output, map));
     output[read..].fill(zero);
     read
@@ -4580,7 +4610,7 @@ fn windows_signal_path_status(
     let dsp = local_dsp_runtime_state(eq, convolver, crossfeed, pure_bypass, mono_downmix, dop);
     let volume = if dop {
         OutputVolumeState::BypassedDop
-    } else if volume_units == 1000 {
+    } else if volume_units == UNITE_DU_GAIN_DE_RENDU {
         OutputVolumeState::Unity
     } else {
         OutputVolumeState::Applied
@@ -4777,7 +4807,7 @@ fn prepare_windows_native_pcm(
     };
     let canaux_adaptes = matrice.is_some() || declaree.is_some() || sortie != channels;
     let bit_perfect = dop
-        || (volume_units == 1000
+        || (volume_units == UNITE_DU_GAIN_DE_RENDU
             && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass, mono_downmix)
             && !canaux_adaptes);
     if dop && sortie != channels {
@@ -4815,7 +4845,7 @@ fn prepare_windows_native_pcm(
                 declaree.as_deref(),
             );
         }
-        let volume = volume_units as f32 / 1000.0;
+        let volume = volume_units as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
         if volume != 1.0 {
             for sample in &mut float {
                 *sample *= volume;
@@ -8419,7 +8449,7 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        let v = (volume.clamp(0.0, 1.0) * 1000.0) as u32;
+        let v = unites_de_gain(volume);
         self.user_volume.store(v, Ordering::SeqCst);
         self.recompute_effective_volume();
         if v > 0 {
@@ -8443,8 +8473,14 @@ impl OutputTarget for LocalOutput {
             self.muted.store(true, Ordering::SeqCst);
         } else {
             let restored = self.pre_mute_volume.load(Ordering::SeqCst);
-            self.user_volume
-                .store(if restored > 0 { restored } else { 1000 }, Ordering::SeqCst);
+            self.user_volume.store(
+                if restored > 0 {
+                    restored
+                } else {
+                    UNITE_DU_GAIN_DE_RENDU
+                },
+                Ordering::SeqCst,
+            );
             self.muted.store(false, Ordering::SeqCst);
         }
         self.recompute_effective_volume();
@@ -8480,7 +8516,8 @@ impl OutputTarget for LocalOutput {
                 state: TransportState::Playing,
                 position_ms: duration_ms.saturating_add(5000),
                 duration_ms,
-                volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
+                volume: self.user_volume.load(Ordering::Relaxed) as f64
+                    / f64::from(UNITE_DU_GAIN_DE_RENDU),
                 muted: self.muted.load(Ordering::Relaxed),
                 current_uri: self.current_uri.lock().unwrap().clone(),
                 track_title: self.track_title.lock().unwrap().clone(),
@@ -8517,7 +8554,8 @@ impl OutputTarget for LocalOutput {
                 .load(Ordering::Relaxed)
                 .saturating_sub(self.fondu_retenue_ms.load(Ordering::Relaxed)),
             duration_ms,
-            volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
+            volume: self.user_volume.load(Ordering::Relaxed) as f64
+                / f64::from(UNITE_DU_GAIN_DE_RENDU),
             muted: self.muted.load(Ordering::Relaxed),
             current_uri: self.current_uri.lock().unwrap().clone(),
             track_title: self.track_title.lock().unwrap().clone(),

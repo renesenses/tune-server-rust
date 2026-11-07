@@ -65,7 +65,13 @@ async fn mesurer(
     releve: Option<Arc<CretesDeSortie>>,
 ) -> (f64, f64) {
     let playback = Arc::new(PlaybackManager::new());
-    playback.brancher_le_gain_de_sortie(zone_id, Arc::new(AtomicU32::new(rendu)));
+    // #7968 — `rendu` en millièmes ici, l'`Arc` dans l'unité de la sortie.
+    playback.brancher_le_gain_de_sortie(
+        zone_id,
+        Arc::new(AtomicU32::new(
+            rendu * (crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 1000),
+        )),
+    );
     playback.brancher_le_gain_moyen_du_dsp(zone_id, Arc::new(AtomicU32::new(gain_moyen_dsp)));
     if let Some(cretes) = releve {
         playback.brancher_les_cretes_de_sortie(zone_id, cretes);
