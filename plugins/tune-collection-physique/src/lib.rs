@@ -319,7 +319,7 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
     } else {
         EtatDisque::AVerifier
     };
-    let raison = (etat == EtatDisque::NullePart).then(|| match rapprochement {
+    let raison = (etat == EtatDisque::NullePart).then_some(match rapprochement {
         Rapprochement::Plusieurs(_) => Raison::PlusieursCandidats,
         _ if services.is_empty() => Raison::ServiceNonInterroge,
         _ => Raison::AucunCandidat,
