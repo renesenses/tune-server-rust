@@ -2865,6 +2865,55 @@ impl PlaybackOrchestrator {
             .is_some_and(|p| std::path::Path::new(&p).exists())
     }
 
+    /// #7986 — la réponse impulsionnelle de la zone S'APPLIQUERAIT-elle à un
+    /// flux de `cadence` Hz et `canaux` canaux ? Mêmes refus que le convolveur
+    /// du bras fichier (`load_convolver` → `ConvolverConfig::build_for`) :
+    /// fichier illisible, cadence différente, nombre de canaux incompatible.
+    ///
+    /// [`Self::zone_has_active_ir`] ne regarde que l'existence du fichier.
+    /// Un filtre exporté à 48 kHz forçait donc le transcodage d'un FLAC
+    /// 44,1 kHz, puis `load_convolver` le refusait : le fichier temporaire et
+    /// le cache étaient payés pour un flux `convolution=false`, identique à
+    /// l'original. `cadence` à `None` ne vérifie que la lisibilité (la cadence
+    /// servie n'est pas encore connue, et un autre motif transcode déjà).
+    pub(super) fn zone_ir_s_appliquerait(
+        &self,
+        zone_id: i64,
+        cadence: Option<u32>,
+        canaux: u16,
+    ) -> bool {
+        if !self.zone_has_active_ir(zone_id) {
+            return false;
+        }
+        let Some(chemin) = self.chemin_ir(zone_id) else {
+            return false;
+        };
+        let refus = match crate::audio::convolver::ConvolverConfig::from_wav(&chemin) {
+            Err(e) => Some(e),
+            Ok(ri) if cadence.is_some_and(|c| c != ri.sample_rate()) => Some(format!(
+                "réponse impulsionnelle à {} Hz, flux à {} Hz",
+                ri.sample_rate(),
+                cadence.unwrap_or_default()
+            )),
+            Ok(ri) if ri.source_channels() != 1 && ri.source_channels() != usize::from(canaux) => {
+                Some(format!(
+                    "réponse impulsionnelle à {} canaux, flux à {canaux} canaux",
+                    ri.source_channels()
+                ))
+            }
+            Ok(_) => None,
+        };
+        if let Some(raison) = &refus {
+            warn!(
+                zone_id,
+                path = chemin,
+                raison,
+                "room_correction_ir_inapplicable_passthrough_garde"
+            );
+        }
+        refus.is_none()
+    }
+
     /// Durée de la rampe anti-« ploc » à la pause, à la reprise et à l'arrêt
     /// pour cette zone, en millisecondes (#1590).
     ///
