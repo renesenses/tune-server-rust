@@ -489,7 +489,11 @@ mod tests {
     /// l'horloge (paquet dont l'échéance est déjà là : départ, reprise).
     fn attendre_paquets(stats: &Statistiques, n: u64) {
         attendre_que(&format!("{n} paquets émis"), || paquets(stats) >= n);
-        assert_eq!(paquets(stats), n, "paquets émis");
+        assert_eq!(
+            paquets(stats),
+            n,
+            "paquets émis : un paquet est parti avant son échéance"
+        );
     }
 
     /// Avance l'horloge d'une durée de paquet (1 ms) et attend le paquet qui
@@ -616,7 +620,11 @@ mod tests {
         }
         // Tampon vide, mais l'échéance du paquet suivant n'est pas passée :
         // rien à compter.
-        assert_eq!(stats.releve().sous_alimentations, 0);
+        assert_eq!(
+            stats.releve().sous_alimentations,
+            0,
+            "sous-alimentation comptée avant l'échéance"
+        );
         // 50 ms sans PCM : une sous-alimentation, une seule.
         horloge.avancer_ns(50 * MS_NS);
         attendre_que("sous-alimentation comptée", || {
