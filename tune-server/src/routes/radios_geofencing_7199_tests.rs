@@ -540,3 +540,177 @@ async fn pays_inconnu_deux_chemins_de_lecture_gardent_le_choix_7658() {
         "https://radio.example/uk/master.m3u8"
     );
 }
+
+/// #7515 — BBC Radio 6 Music telle que le testeur l'a vue depuis la France :
+/// le principal 320 kbit/s réservé au Royaume-Uni, puis un 96 kbit/s et un
+/// 320 kbit/s qui jouent hors du Royaume-Uni, dans cet ordre de fiche.
+fn document_bbc_6music_7515() -> Value {
+    json!({
+        "external_id": "S7515", "name": "BBC Radio 6 Music témoin", "country": "GB",
+        "stream_url": "https://radio.example/ww/6music-320.m3u8",
+        "streams": [
+            {"url": "https://radio.example/ww/6music-320.m3u8", "format": "AAC", "bitrate": 320,
+             "is_hls": true, "is_primary": true, "is_published": true,
+             "restricted_to_countries": ["GB"]},
+            {"url": "https://radio.example/ms6/6music-96.m3u8", "format": "AAC", "bitrate": 96,
+             "is_hls": true, "is_published": true, "restricted_to_countries": null},
+            {"url": "https://radio.example/ms6/6music-320.m3u8", "format": "AAC", "bitrate": 320,
+             "is_hls": true, "is_published": true, "restricted_to_countries": null}
+        ]
+    })
+}
+
+const BBC6_PRINCIPAL: &str = "https://radio.example/ww/6music-320.m3u8";
+const BBC6_96: &str = "https://radio.example/ms6/6music-96.m3u8";
+const BBC6_320: &str = "https://radio.example/ms6/6music-320.m3u8";
+
+#[test]
+fn les_flux_proposes_sont_ranges_par_qualite_decroissante_7515() {
+    let f = fiche(document_bbc_6music_7515());
+    let urls: Vec<String> = f.flux_proposes().into_iter().map(|f| f.url).collect();
+    assert_eq!(
+        urls,
+        [BBC6_PRINCIPAL, BBC6_320, BBC6_96],
+        "#7515 : les flux doivent venir du meilleur au moins bon (le principal \
+         ne départage que deux flux de même débit), pas dans l'ordre de la fiche"
+    );
+    // Sans perte avant tout débit, le débit avant le principal, puis la
+    // fréquence d'échantillonnage.
+    let f = fiche(json!({
+        "external_id": "Q7515", "name": "Qualité", "stream_url": "https://q.example/a.mp3",
+        "streams": [
+            {"url": "https://q.example/a.mp3", "format": "MP3", "bitrate": 128, "is_primary": true,
+             "is_published": true},
+            {"url": "https://q.example/b.aac", "format": "AAC", "bitrate": 320, "sample_rate": 44100,
+             "is_published": true},
+            {"url": "https://q.example/d.aac", "format": "AAC", "bitrate": 320, "sample_rate": 48000,
+             "is_published": true},
+            {"url": "https://q.example/c.flac", "format": "FLAC", "bitrate": 0, "is_published": true}
+        ]
+    }));
+    let urls: Vec<String> = f.flux_proposes().into_iter().map(|f| f.url).collect();
+    assert_eq!(
+        urls,
+        [
+            "https://q.example/c.flac",
+            "https://q.example/d.aac",
+            "https://q.example/b.aac",
+            "https://q.example/a.mp3"
+        ]
+    );
+}
+
+#[test]
+fn le_flux_par_defaut_est_le_meilleur_autorise_pas_le_principal_7515() {
+    // Un principal moins bon qu'un autre flux autorisé ne passe plus devant.
+    let f = fiche(json!({
+        "external_id": "P7515", "name": "Principal faible", "stream_url": "https://p.example/128.mp3",
+        "streams": [
+            {"url": "https://p.example/128.mp3", "format": "MP3", "bitrate": 128, "is_primary": true,
+             "is_published": true},
+            {"url": "https://p.example/320.aac", "format": "AAC", "bitrate": 320, "is_published": true}
+        ]
+    }));
+    for country in [None, Some("FR")] {
+        assert_eq!(
+            select_stream(&f, country, None).unwrap().url,
+            "https://p.example/320.aac",
+            "#7515 ({country:?}) : sans choix, le meilleur flux autorisé est joué, pas le principal"
+        );
+    }
+    // Un choix explicite autorisé reste le sien.
+    assert_eq!(
+        select_stream(&f, Some("FR"), Some("https://p.example/128.mp3"))
+            .unwrap()
+            .url,
+        "https://p.example/128.mp3"
+    );
+    // BBC Radio 6 Music : depuis la France comme pays inconnu, le principal
+    // réservé au Royaume-Uni n'est jamais le flux par défaut.
+    let f = fiche(document_bbc_6music_7515());
+    for country in [None, Some("FR")] {
+        assert_eq!(select_stream(&f, country, None).unwrap().url, BBC6_320);
+    }
+    assert_eq!(
+        select_stream(&f, Some("FR"), Some(BBC6_PRINCIPAL))
+            .unwrap()
+            .url,
+        BBC6_320,
+        "le principal choisi mais interdit en France cède au meilleur flux autorisé"
+    );
+    assert_eq!(
+        select_stream(&f, Some("GB"), None).unwrap().url,
+        BBC6_PRINCIPAL
+    );
+}
+
+fn flux_de_l_annuaire(corps: &Value) -> Vec<(String, Value, Value)> {
+    corps["items"][0]["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["url"].as_str().unwrap().to_string(),
+                s["par_defaut"].clone(),
+                s["autorise"].clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn l_annuaire_marque_le_flux_par_defaut_jouable_dans_le_pays_7515() {
+    let state = state(document_bbc_6music_7515());
+    let f = state.annuaire_radios.read().unwrap()[0].clone();
+    let corps = || json!({"items": [{"external_id": "S7515", "streams": f.flux_proposes()}]});
+
+    // Pays d'écoute inconnu : le principal restreint n'est pas proposé par
+    // défaut, et le serveur ne prétend pas savoir s'il joue.
+    let mut c = corps();
+    marquer_le_flux_par_defaut(&state, &mut c);
+    assert_eq!(
+        flux_de_l_annuaire(&c),
+        [
+            (BBC6_PRINCIPAL.to_string(), json!(false), Value::Null),
+            (BBC6_320.to_string(), json!(true), json!(true)),
+            (BBC6_96.to_string(), json!(false), json!(true)),
+        ],
+        "#7515 : le flux par défaut doit être jouable ({c})"
+    );
+
+    // Depuis la France : le principal est dit interdit.
+    set_country(&state, "FR");
+    let mut c = corps();
+    marquer_le_flux_par_defaut(&state, &mut c);
+    assert_eq!(
+        flux_de_l_annuaire(&c),
+        [
+            (BBC6_PRINCIPAL.to_string(), json!(false), json!(false)),
+            (BBC6_320.to_string(), json!(true), json!(true)),
+            (BBC6_96.to_string(), json!(false), json!(true)),
+        ]
+    );
+
+    // Depuis le Royaume-Uni : le principal redevient le flux par défaut.
+    set_country(&state, "GB");
+    let mut c = corps();
+    marquer_le_flux_par_defaut(&state, &mut c);
+    assert_eq!(
+        flux_de_l_annuaire(&c)[0],
+        (BBC6_PRINCIPAL.to_string(), json!(true), json!(true))
+    );
+}
+
+#[test]
+fn le_debit_annonce_suit_le_flux_jouable_7515() {
+    // « Mes radios » a gardé le principal réservé au Royaume-Uni : depuis la
+    // France, l'écran annonce le flux réellement joué (320 kbit/s autorisé).
+    let state = state(document_bbc_6music_7515());
+    set_country(&state, "FR");
+    let mut station = json!({"stream_url": BBC6_PRINCIPAL, "bitrate": 320, "codec": "aac"});
+    annoncer_le_debit_ecoute(&state, &mut station);
+    assert_eq!(station["flux_ecoute"]["url"], BBC6_320, "{station}");
+    assert_eq!(station["flux_ecoute"]["raison"], "restreint_au_pays");
+    assert_eq!(station["bitrate"], 320);
+}

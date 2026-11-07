@@ -74,8 +74,24 @@ fn listener_country(state: &AppState) -> Option<String> {
         .and_then(country_code)
 }
 
-/// Garde le choix explicite autorisé, sinon le principal autorisé, puis le
-/// meilleur débit (sans perte d'abord). L'ordre publié départage les ex æquo.
+/// #7515 — le rang d'un flux, du meilleur au moins bon : sans perte d'abord,
+/// puis le débit ; à qualité égale le principal de la fiche, puis la
+/// fréquence d'échantillonnage, que l'annuaire omet souvent (FIP : le principal
+/// sans fréquence et son alias à 48 kHz sont le même 192 kbit/s).
+pub(crate) fn rang(f: &FluxAnnuaire) -> (bool, i32, bool, i32) {
+    (
+        f.codec
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case("flac") || c.eq_ignore_ascii_case("alac")),
+        f.bitrate.unwrap_or(0),
+        f.primary,
+        f.sample_rate.unwrap_or(0),
+    )
+}
+
+/// Garde le choix explicite autorisé, sinon le meilleur flux autorisé selon
+/// [`rang`]. #7515 : le principal ne fait plus que départager deux flux de
+/// même qualité ; l'ordre publié départage le reste.
 /// Les alias v1 restent utiles au rapprochement, mais ne contournent jamais
 /// les restrictions de la liste détaillée v2.
 pub(super) fn select_stream(
@@ -121,17 +137,62 @@ pub(super) fn select_stream(
                     }
                 }
         })
-        .max_by_key(|f| {
-            (
-                choisi(f),
-                f.primary,
-                f.codec.as_deref().is_some_and(|c| {
-                    c.eq_ignore_ascii_case("flac") || c.eq_ignore_ascii_case("alac")
-                }),
-                f.bitrate.unwrap_or(0),
-                f.sample_rate.unwrap_or(0),
-            )
-        })
+        .max_by_key(|f| (choisi(f), rang(f)))
+}
+
+/// #7515 — le flux que la lecture prendra sans choix de l'auditeur, et ce que
+/// le serveur sait de chaque flux pour le pays d'écoute, posés sur les flux
+/// (`streams`) de chaque fiche de `corps` (le corps de `GET /radios/directory`) :
+/// - `par_defaut` : c'est le flux joué si l'auditeur n'en choisit aucun ;
+///   un flux réservé à d'autres pays ne l'est jamais ;
+/// - `autorise` : `true` ou `false` selon le pays d'écoute, `null` pour un
+///   flux restreint quand ce pays n'est pas renseigné.
+///
+/// L'écran peut ainsi présélectionner un flux jouable plutôt que le principal
+/// de la fiche (BBC Radio 6 Music : le principal est refusé hors de sa zone).
+pub(crate) fn marquer_le_flux_par_defaut(state: &AppState, corps: &mut Value) {
+    let Ok(fiches) = state.annuaire_radios.read() else {
+        return;
+    };
+    let country = listener_country(state);
+    let Some(items) = corps.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        let fiche = item
+            .get("external_id")
+            .and_then(Value::as_str)
+            .and_then(|id| fiches.iter().find(|f| f.porte_la_cle(id)));
+        let Some(fiche) = fiche else {
+            continue;
+        };
+        let defaut = select_stream(fiche, country.as_deref(), None).map(|f| f.url);
+        let Some(streams) = item.get_mut("streams").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for s in streams {
+            let Some(o) = s.as_object_mut() else {
+                continue;
+            };
+            let url = o.get("url").and_then(Value::as_str).unwrap_or_default();
+            let par_defaut = defaut.as_deref() == Some(url);
+            let pays: Vec<&str> = o
+                .get("restricted_to_countries")
+                .and_then(Value::as_array)
+                .map(|p| p.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let autorise = if pays.is_empty() {
+                json!(true)
+            } else {
+                match country.as_deref() {
+                    Some(c) => json!(pays.iter().any(|p| p.eq_ignore_ascii_case(c))),
+                    None => Value::Null,
+                }
+            };
+            o.insert("par_defaut".into(), json!(par_defaut));
+            o.insert("autorise".into(), autorise);
+        }
+    }
 }
 
 #[derive(Debug)]

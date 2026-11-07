@@ -822,13 +822,10 @@ async fn lister(
     let repo = RadioRepo::with_backend(state.backend.clone());
     let mes_radios = repo.list().unwrap_or_default();
     let liens = repo.liens_annuaire().unwrap_or_default();
-    Json(corps_annuaire_avec_liens(
-        &fiches,
-        &mes_radios,
-        &liens,
-        &filtres,
-        &etat,
-    ))
+    let mut corps = corps_annuaire_avec_liens(&fiches, &mes_radios, &liens, &filtres, &etat);
+    // #7515 — le flux par défaut jouable dans le pays d'écoute.
+    super::radios::geofencing::marquer_le_flux_par_defaut(&state, &mut corps);
+    Json(corps)
 }
 
 async fn forcer_le_releve(State(state): State<AppState>) -> Json<Value> {
