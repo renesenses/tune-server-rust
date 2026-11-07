@@ -3901,6 +3901,10 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
 #[path = "playback/pause_sans_media_7894_tests.rs"]
 mod pause_sans_media_7894_tests;
 
+#[cfg(test)]
+#[path = "playback/bail_parental_7974_route_tests.rs"]
+mod bail_parental_7974_route_tests;
+
 async fn resume(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
@@ -5832,6 +5836,7 @@ async fn queue_move(
 async fn queue_jump(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    profile: ActiveProfile,
     headers: axum::http::HeaderMap,
     Json(body): Json<QueueJumpRequest>,
 ) -> impl IntoResponse {
@@ -5841,6 +5846,13 @@ async fn queue_jump(
     if let Err(refus) = refuser_un_entier_negatif("position", body.position) {
         return refus;
     }
+    // #7974 — un geste de lecture : le profil qui le fait devient celui de la
+    // session, comme pour `play`. Sans cela, le bail d'écoute serait celui du
+    // dernier profil qui a joué sur la zone (contourné, ou opposé à tort).
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     match state
         .orchestrator
         .play_from_queue(zone_id, body.position)
@@ -7242,6 +7254,7 @@ async fn clear_zone_pin(
 async fn invoke_zone_pin(
     State(state): State<AppState>,
     Path((zone_id, index)): Path<(i64, usize)>,
+    profile: ActiveProfile,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let lang = crate::i18n::lang_from_header(&headers);
@@ -7264,6 +7277,13 @@ async fn invoke_zone_pin(
     // #6465 — un préréglage est un nouveau geste : il ne garde pas le
     // contexte (album, playlist) de la lecture précédente.
     state.playback.effacer_contexte_de_session(zone_id).await;
+    // #7974 — un geste de lecture : le profil qui le fait devient celui de la
+    // session, comme pour `play`. Sans cela, le bail d'écoute serait celui du
+    // dernier profil qui a joué sur la zone (contourné, ou opposé à tort).
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
 
     // Build a play request from the pin
     let output_device_id = get_zone_device_id(&state, zone_id);
@@ -8035,6 +8055,13 @@ pub async fn shuffle_all(
         disc_number: None,
         album_ref: None,
     };
+    // #7974 — un geste de lecture : le profil qui le fait devient celui de la
+    // session, comme pour `play`. Sans cela, le bail d'écoute serait celui du
+    // dernier profil qui a joué sur la zone (contourné, ou opposé à tort).
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
             state

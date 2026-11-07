@@ -451,6 +451,11 @@ async fn avtransport_control(
                         duration_ms: session.duration_ms,
                         ..Default::default()
                     };
+                    // #7974 — un point de contrôle UPnP n'a pas de profil
+                    // Tune : sa lecture n'hérite pas de celui qui a joué avant
+                    // lui sur la zone (ni son bail d'écoute) ; le profil actif
+                    // du serveur s'applique.
+                    state.playback.set_session_profile(zone_id, None).await;
                     match state.orchestrator.play(req).await {
                         // #5574 — la sortie a REFUSÉ (renderer qui acquitte
                         // Play et garde l'ancien flux, URL injoignable…) :

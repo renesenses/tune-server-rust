@@ -562,6 +562,28 @@ impl PositionPoller {
                     return true;
                 }
                 Err(e) => {
+                    // #7974 — le bail d'écoute est fini : ce n'est pas la piste
+                    // qui échoue, c'est la séance. Aucune piste n'est « sautée »,
+                    // aucune autre n'est essayée ; la zone s'arrête (appelant).
+                    if let Some(refus) =
+                        crate::db::bail_d_ecoute::Refus::depuis_sentinelle(&e.to_string())
+                    {
+                        info!(
+                            zone_id,
+                            pos = attempt_pos,
+                            raison = refus.code(),
+                            "auto_next_parental_lease_ended"
+                        );
+                        self.playback.emit_bail_parental(
+                            zone_id,
+                            "parental_lease_ended",
+                            serde_json::json!({
+                                "code": crate::db::bail_d_ecoute::CODE_REFUS,
+                                "reason": refus.code(),
+                            }),
+                        );
+                        break;
+                    }
                     warn!(zone_id, error = %e, pos = attempt_pos, "auto_next_failed");
                     // #5327 — la source dit que plus rien de cette file ne se
                     // jouera (serveur du contact éteint) : on s'arrête ici,

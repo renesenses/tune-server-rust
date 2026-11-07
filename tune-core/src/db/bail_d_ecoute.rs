@@ -15,6 +15,13 @@
 //! - Le refus voyage en sentinelle structurée, comme `free_zone_cap:` :
 //!   `parental_lease_refused:<raison>`. La couche HTTP en fait le code
 //!   d'erreur dédié et la phrase traduite.
+//! - Deux lectures en échec, deux choix opposés : une **politique** illisible
+//!   refuse la lecture (on ne sait pas ce qui est permis) ; un **compteur**
+//!   illisible vaut 0 seconde et laisse jouer (la plage horaire s'applique
+//!   toujours, seul le budget est rendu le temps de la panne).
+//! - Pendant les 30 s d'annonce d'une fin de bail, l'écoute est encore
+//!   comptée : le budget est dépassé d'autant, pour ne pas couper sans
+//!   prévenir.
 //!
 //! Table sans numéro de migration, comme `politiques_parentales` : passe
 //! finale de `run_migrations` (SQLite), `ENSURE_TABLES` et `PG_FULL_SCHEMA`
