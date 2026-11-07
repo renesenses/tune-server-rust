@@ -1,13 +1,13 @@
 //! #7614 — the upsampler through the SDK's rate-changing stage contract.
 use serde_json::json;
-use tune_plugin_sdk::{Error, Settings, audio::*};
-use tune_plugin_surechantillonnage::conception::par_id;
 use tune_plugin_audio_support::limiteur::{PLAFOND, SEUIL};
 use tune_plugin_sdk::rate::{RateChanger, RateRequest};
+use tune_plugin_sdk::{Error, Settings, audio::*};
+use tune_plugin_surechantillonnage::conception::par_id;
 use tune_plugin_surechantillonnage::sdk::{
-    Instance, RESERVE_DB, l1_bound_db,
-    OFFERED_FILTERS, Upsampler, choose_rate, choose_rate_for, headroom_db, headroom_gain,
-    machine_reference_pair, settings as parse_settings, worst_case_gain,
+    Instance, OFFERED_FILTERS, RESERVE_DB, Upsampler, choose_rate, choose_rate_for, headroom_db,
+    headroom_gain, l1_bound_db, machine_reference_pair, settings as parse_settings,
+    worst_case_gain,
 };
 use tune_plugin_testkit::render_rate_f32;
 
@@ -298,12 +298,9 @@ fn typical_music_never_wakes_the_limiter() {
                 let n = a.len() / 2;
                 let input = AudioBlock::new(stereo(44_100), SamplesMut::F32(&mut a), 1024).unwrap();
                 let cap = sortie.len() / 2;
-                let mut output = AudioBlock::new(
-                    inst.output_format(),
-                    SamplesMut::F32(&mut sortie[..]),
-                    cap,
-                )
-                .unwrap();
+                let mut output =
+                    AudioBlock::new(inst.output_format(), SamplesMut::F32(&mut sortie[..]), cap)
+                        .unwrap();
                 let r = inst
                     .process(
                         &input,
@@ -319,7 +316,10 @@ fn typical_music_never_wakes_the_limiter() {
                 haut = haut.max(peak(&sortie[..r.frames_written * 2]));
             }
             let c = inst.limiter_counter();
-            println!("musique {niveau} {filter} : crête {haut:.4}, trames limitées {}", c.trames_limitees);
+            println!(
+                "musique {niveau} {filter} : crête {haut:.4}, trames limitées {}",
+                c.trames_limitees
+            );
             assert_eq!(
                 c.trames_limitees, 0,
                 "{filter} à {niveau} : le limiteur a agi sur une musique typique (crête {haut})"
@@ -407,7 +407,10 @@ fn headroom_is_a_drop_never_a_gain() {
             let l1 = l1_bound_db(filter, ratio).unwrap();
             println!("headroom {filter} x{ratio}: {db:.3} dB (borne L1 {l1:.3} dB)");
             assert!(db <= 0.0, "{filter} ×{ratio}: {db} dB");
-            assert!(db >= RESERVE_DB - 0.01, "{filter} ×{ratio}: {db} dB, more than the 3 dB reserve");
+            assert!(
+                db >= RESERVE_DB - 0.01,
+                "{filter} ×{ratio}: {db} dB, more than the 3 dB reserve"
+            );
         }
     }
     assert!(headroom_gain("precision-longue", 8).is_none());

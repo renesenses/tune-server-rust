@@ -133,7 +133,10 @@ fn l1_kernel(filter: &str, ratio: u32) -> Option<(Vec<f64>, usize)> {
     if !OFFERED_FILTERS.contains(&filter) || !(2..=MAX_INTEGER_RATIO).contains(&ratio) {
         return None;
     }
-    Some((conception::par_id(filter)?.noyau(ratio as usize), ratio as usize))
+    Some((
+        conception::par_id(filter)?.noyau(ratio as usize),
+        ratio as usize,
+    ))
 }
 
 fn reserve_from_kernel(kernel: &[f64], l: usize) -> f64 {
@@ -330,7 +333,10 @@ impl Instance {
         };
         match output.samples_mut() {
             SamplesMut::F32(dst) => {
-                for (d, s) in dst[..frames * ch].chunks_exact_mut(ch).zip(src.chunks_exact(ch)) {
+                for (d, s) in dst[..frames * ch]
+                    .chunks_exact_mut(ch)
+                    .zip(src.chunks_exact(ch))
+                {
                     let k = frame_gain(s);
                     for (d, s) in d.iter_mut().zip(s) {
                         *d = (*s * k) as f32;
@@ -338,7 +344,10 @@ impl Instance {
                 }
             }
             SamplesMut::F64(dst) => {
-                for (d, s) in dst[..frames * ch].chunks_exact_mut(ch).zip(src.chunks_exact(ch)) {
+                for (d, s) in dst[..frames * ch]
+                    .chunks_exact_mut(ch)
+                    .zip(src.chunks_exact(ch))
+                {
                     let k = frame_gain(s);
                     for (d, s) in d.iter_mut().zip(s) {
                         *d = *s * k;
