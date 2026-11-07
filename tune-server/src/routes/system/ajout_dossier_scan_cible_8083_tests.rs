@@ -17,12 +17,37 @@ fn gabarit() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../tune-core/tests/fixtures/test.flac")
 }
 
+/// `n` vrais FLAC, chacun avec ses balises : des copies octet pour octet du
+/// même gabarit deviendraient des EXEMPLAIRES d'une seule piste (#4907), sans
+/// ligne `tracks` propre.
 fn pistes(dossier: &Path, n: usize) -> Vec<PathBuf> {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::VorbisComments;
     std::fs::create_dir_all(dossier).unwrap();
+    let album = dossier.file_name().unwrap().to_string_lossy().into_owned();
     (0..n)
         .map(|i| {
             let p = dossier.join(format!("{i:02} - piste.flac"));
             std::fs::copy(gabarit(), &p).unwrap();
+            let mut f = std::fs::File::open(&p).unwrap();
+            let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+            drop(f);
+            let mut vc = VorbisComments::default();
+            let titre = format!("{album} {i}");
+            let numero = (i + 1).to_string();
+            for (k, v) in [
+                ("TITLE", titre.as_str()),
+                ("ARTIST", "Essai 8083"),
+                ("ALBUMARTIST", "Essai 8083"),
+                ("ALBUM", album.as_str()),
+                ("TRACKNUMBER", numero.as_str()),
+            ] {
+                vc.insert(k.to_string(), v.to_string());
+            }
+            flac.set_vorbis_comments(vc);
+            flac.save_to_path(&p, WriteOptions::default()).unwrap();
             p
         })
         .collect()
