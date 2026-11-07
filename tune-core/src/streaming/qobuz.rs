@@ -4382,6 +4382,119 @@ impl StreamingService for QobuzService {
         Ok(ptids.len())
     }
 
+    /// #8066 — remplacer le titre au rang `rang` sans le déplacer.
+    ///
+    /// Qobuz n'a pas d'écriture « remplacer » : on AJOUTE le nouveau titre
+    /// (`/playlist/addTracks`, en fin de liste), on le place AVANT l'ancien
+    /// (`/playlist/updateTracksPosition`, `insert_before` = rang), on relit
+    /// pour vérifier qu'il est bien au rang dit, l'ancien juste après, et
+    /// seulement alors on retire l'ancien par son `playlist_track_id`. Si le
+    /// déplacement n'a pas pris, c'est le titre AJOUTÉ qui est retiré : la
+    /// playlist reste celle d'avant, rien n'est perdu.
+    async fn replace_playlist_track(
+        &self,
+        playlist_id: &str,
+        rang: usize,
+        ancien: &str,
+        nouveau: &str,
+    ) -> Result<(), TuneError> {
+        let lire = || async {
+            let data = self
+                .detail_pagine(
+                    "/playlist/get",
+                    &[("playlist_id", playlist_id), ("extra", "tracks")],
+                    "tracks",
+                )
+                .await?;
+            Ok::<Vec<(String, Option<u64>)>, TuneError>(
+                data["tracks"]["items"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|it| {
+                                let id = it["id"]
+                                    .as_u64()
+                                    .map(|n| n.to_string())
+                                    .or_else(|| it["id"].as_str().map(Into::into))
+                                    .unwrap_or_default();
+                                (id, it["playlist_track_id"].as_u64())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        };
+        let avant = lire().await?;
+        let Some((id_vu, Some(ptid_ancien))) = avant.get(rang).cloned() else {
+            return Err(TuneError::NotFound(format!(
+                "qobuz: aucun titre au rang {rang} de la playlist {playlist_id}"
+            )));
+        };
+        if id_vu != ancien {
+            return Err(TuneError::Other(format!(
+                "qobuz: la playlist a changé (rang {rang} : {id_vu}, attendu {ancien})"
+            )));
+        }
+        let connus: std::collections::HashSet<u64> = avant.iter().filter_map(|(_, p)| *p).collect();
+        self.api_post(
+            "/playlist/addTracks",
+            &[("playlist_id", playlist_id), ("track_ids", nouveau)],
+        )
+        .await?;
+        let ptid_nouveau = lire()
+            .await?
+            .into_iter()
+            .find_map(|(id, p)| p.filter(|p| id == nouveau && !connus.contains(p)))
+            .ok_or_else(|| {
+                TuneError::Other(format!("qobuz: le titre {nouveau} n'a pas été ajouté"))
+            })?;
+        self.api_post(
+            "/playlist/updateTracksPosition",
+            &[
+                ("playlist_id", playlist_id),
+                ("playlist_track_ids", &ptid_nouveau.to_string()),
+                ("insert_before", &rang.to_string()),
+            ],
+        )
+        .await?;
+        // Le déplacement est VÉRIFIÉ avant de retirer l'ancien : s'il n'a pas
+        // pris, on retire le titre ajouté et la playlist reste celle d'avant.
+        let deplace = lire().await?;
+        let confirme = deplace
+            .get(rang)
+            .is_some_and(|(id, p)| id == nouveau && *p == Some(ptid_nouveau))
+            && deplace
+                .get(rang + 1)
+                .is_some_and(|(_, p)| *p == Some(ptid_ancien));
+        let (a_retirer, issue) = if confirme {
+            (ptid_ancien, Ok(()))
+        } else {
+            (
+                ptid_nouveau,
+                Err(TuneError::Other(format!(
+                    "qobuz: position non confirmée au rang {rang} ; ajout annulé, playlist inchangée"
+                ))),
+            )
+        };
+        self.api_post(
+            "/playlist/deleteTracks",
+            &[
+                ("playlist_id", playlist_id),
+                ("playlist_track_ids", &a_retirer.to_string()),
+            ],
+        )
+        .await?;
+        issue?;
+        let apres = lire().await?;
+        match apres.get(rang) {
+            Some((id, _)) if id == nouveau => Ok(()),
+            autre => Err(TuneError::Other(format!(
+                "qobuz: remplacement écrit mais position non confirmée (rang {rang} : {autre:?})"
+            ))),
+        }
+    }
+
     fn supports_write(&self) -> bool {
         self.user_auth_token.is_some()
     }
@@ -8504,6 +8617,10 @@ mod tests_favoris_en_vol {
 /// renesenses/tune-web-client#2097 — `/playlist/getUserPlaylists` mélange les
 /// playlists de l'utilisateur et celles qu'il suit ; seules les premières
 /// acceptent un ajout (Qobuz refuse les autres en 401).
+#[cfg(test)]
+#[path = "qobuz_remplacement_8066_tests.rs"]
+mod remplacement_8066_tests;
+
 #[cfg(test)]
 mod tests_playlists_proprietaire_2097 {
     use super::*;

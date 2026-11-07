@@ -252,6 +252,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_group_by_strict_historique -- --nocapture --test-threads=1
 
+      # #8066 — remplacer un titre de service indisponible dans une playlist
+      # locale, à sa place (réécriture de la ligne `playlist_tracks`). Jumeau
+      # SQLite dans la suite ordinaire. Sans cette étape, l'épreuve prendrait
+      # son saut annoncé.
+      - name: Remplacement des titres indisponibles sur PostgreSQL (#8066)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test remplacer_indisponibles_8066 -- --nocapture --test-threads=1
+
       # #4956, suite — l'ordre alphabétique des listes REST paginées (artistes,
       # albums par titre et par artiste, listes de lecture) : le tri se fait en
       # Rust, et doit rendre le même ordre, les mêmes pages et le même saut par

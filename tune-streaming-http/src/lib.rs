@@ -20,6 +20,8 @@ use tune_core::streaming::traits::StreamingService;
 mod connexion_spotify_distante;
 pub mod deezer_proxy_handler;
 pub mod etiquettes_langue;
+/// #8066 — remplacer un titre indisponible dans une playlist du service.
+mod remplacement_indisponibles_8066;
 
 /// Sous-ensemble de l'état serveur nécessaire aux routes des services de
 /// streaming. Cette frontière empêche ces routes de dépendre de tout le
@@ -538,6 +540,18 @@ where
         .route(
             "/{service}/playlists/{playlist_id}/tracks/remove",
             post(service_remove_tracks),
+        )
+        .route(
+            "/{service}/playlists/{playlist_id}/tracks/{index}/replacements",
+            get(remplacement_indisponibles_8066::candidats_du_titre),
+        )
+        .route(
+            "/{service}/playlists/{playlist_id}/tracks/{index}/replace",
+            post(remplacement_indisponibles_8066::remplacer_le_titre),
+        )
+        .route(
+            "/{service}/playlists/{playlist_id}/repair",
+            post(remplacement_indisponibles_8066::reparer_la_playlist),
         )
         .route("/{service}/tracks/{track_id}", get(service_track))
         .route("/{service}/tracks/{track_id}/url", get(service_track_url))
