@@ -1012,22 +1012,14 @@ jobs:
       # que release.yml (cross pour les ARM Linux). Jusqu'a la rc10, les cibles
       # ARM etaient sautees a la release et l'archive linux-aarch64 (celle de
       # l'image Tune OS du Pi) partait sans AirPlay 2, sans qu'aucune porte ne
-      # rougisse. musl : jamais livree avec AirPlay 2, tolere comme a la
-      # release, mais signale.
+      # rougisse. Un echec rougit le job sur toutes les cibles, musl comprise.
       - name: Build airplay-daemon (#8112)
         shell: bash
         run: |
           CROSS=()
           if [ "${{ matrix.cross }}" = "true" ]; then CROSS=(--cross); fi
-          if python scripts/build-airplay-daemon.py --target ${{ matrix.target }} \
-               --output "$RUNNER_TEMP/apd" --work "$RUNNER_TEMP/apd-src" "${CROSS[@]}"; then
-            exit 0
-          fi
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            echo "::error::airplay-daemon ne compile pas pour aarch64-unknown-linux-musl (tolere, #8112)"
-            exit 0
-          fi
-          exit 1
+          python scripts/build-airplay-daemon.py --target ${{ matrix.target }} \
+            --output "$RUNNER_TEMP/apd" --work "$RUNNER_TEMP/apd-src" "${CROSS[@]}"
 
       - name: Verify airplay-daemon is an aarch64 ELF (#8112)
         if: matrix.target == 'aarch64-unknown-linux-gnu'

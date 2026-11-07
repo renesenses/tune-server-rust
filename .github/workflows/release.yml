@@ -494,11 +494,9 @@ jobs:
       # `airplay2_pairing_required`.
       #
       # Desormais : construit sur TOUTES les cibles, `cross` pour les ARM
-      # Linux comme tune-server et librespot. Un echec fait ECHOUER le job sur
-      # toute plateforme livree avec AirPlay 2. Seule exception, la cible musl
-      # (NAS) : jamais livree avec AirPlay 2 jusqu'ici, elle le prend si la
-      # compilation passe et le signale en erreur (annotation + resume du run)
-      # sinon. Jamais de fichier vide : un stub ferait croire a
+      # Linux comme tune-server et librespot. Un echec fait ECHOUER le job, sur
+      # toutes les cibles, musl comprise (compilee dans la CI de la PR #8114 :
+      # 10 183 464 octets). Jamais de fichier vide : un stub ferait croire a
       # daemon_available() qu'un daemon existe.
       - name: Build airplay-daemon
         shell: bash
@@ -507,11 +505,6 @@ jobs:
           if [ "${{ matrix.cross }}" = "true" ]; then CROSS=(--cross); fi
           if python scripts/build-airplay-daemon.py --target ${{ matrix.target }} \
                --output "$RUNNER_TEMP/apd" --work "$RUNNER_TEMP/apd-src" "${CROSS[@]}"; then
-            exit 0
-          fi
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            echo "::error::airplay-daemon n'a pas compile pour aarch64-unknown-linux-musl : l'archive linux-aarch64-musl part SANS AirPlay 2 (#8112)."
-            echo "### ⚠️ airplay-daemon absent de linux-aarch64-musl (#8112)" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           echo "::error::airplay-daemon n'a pas compile pour ${{ matrix.target }} : cette archive partirait sans AirPlay 2 (#8112)."
