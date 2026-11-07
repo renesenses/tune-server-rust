@@ -3225,6 +3225,9 @@ impl PlaybackOrchestrator {
                     .streamer
                     .create_file_session(file_info, cp.clone(), false)
                     .await;
+                self.streamer
+                    .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
+                    .await;
                 // The current track was a cache hit → warm the next one too,
                 // so an album keeps hitting the cache track after track.
                 self.spawn_warm_next_local(
@@ -3487,6 +3490,12 @@ impl PlaybackOrchestrator {
                         let session_id = self
                             .streamer
                             .create_file_session(file_info, serve_path, false)
+                            .await;
+                        self.streamer
+                            .noter_la_voie(
+                                &session_id,
+                                crate::http::streamer::voie::FICHIER_CONVERTI,
+                            )
                             .await;
 
                         // Current track just transcoded into the cache → warm
@@ -4033,6 +4042,8 @@ impl PlaybackOrchestrator {
                 ..Default::default()
             };
 
+            // #8076 — noté avant que `depart_natif` ne soit consommé.
+            let depart_natif_pose = depart_natif.is_some();
             let session_id = self
                 .streamer
                 .create_file_session(info, file_path.clone(), false)
@@ -4105,6 +4116,24 @@ impl PlaybackOrchestrator {
                     self.streamer.set_faststart(&session_id, map).await;
                 }
             }
+
+            // #8076 — ce que cette session sert, pour le journal de
+            // l'enchaînement : aucun bras de ce passthrough ne décode.
+            let voie_servie = {
+                use crate::http::streamer::voie;
+                if dsf_depuis_dst.is_some() {
+                    voie::DSF_RECONSTRUIT
+                } else if conteneur_flac_neuf.is_some() {
+                    voie::ENTETE_FLAC_NEUF
+                } else if depart_natif_pose {
+                    voie::DEPART_NATIF
+                } else if self.streamer.a_une_carte_d_entete(&session_id).await {
+                    voie::ENTETE_M4A_REECRIT
+                } else {
+                    voie::FICHIER_TEL_QUEL
+                }
+            };
+            self.streamer.noter_la_voie(&session_id, voie_servie).await;
 
             // Parallel decode-for-levels: decode the audio in the background
             // purely to emit VU-meter events for the web client. This does not

@@ -2040,6 +2040,9 @@ mod confirmation_navigateur_6066;
 pub mod ecoute_validee_7852;
 #[cfg(test)]
 mod ecoute_validee_7852_tests;
+// #8076 — FLAC local vers DLNA en PURE : voie servie et échantillons exacts.
+#[cfg(test)]
+mod gapless_dlna_pure_8076_tests;
 // #7965 — radios (au nom de la station) et podcasts dans l'historique.
 mod historique_radio_podcast_7965;
 #[cfg(test)]
