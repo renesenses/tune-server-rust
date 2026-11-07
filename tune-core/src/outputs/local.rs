@@ -714,6 +714,13 @@ pub struct LocalOutput {
     /// sous PURE la chaîne dit toujours « rien d'armé ». Seuls les réglages
     /// disent ce que PURE contourne. Lu par `signal_path_status`.
     pure_contourne_un_reglage: Arc<AtomicBool>,
+    /// #4176 — PURE a contourné le préampli GARDÉ d'un égaliseur coupé
+    /// (#5215). Les réglages ne le voient pas (l'égaliseur y est désactivé),
+    /// mais le gain gardé changeait le niveau et PURE le retire. Posé par
+    /// `set_pure_bypass(true)` d'après la chaîne d'avant la bascule, effacé à
+    /// la sortie de PURE. Lu par `signal_path_status`, avec le drapeau
+    /// ci-dessus.
+    pure_contourne_un_gain_garde: Arc<AtomicBool>,
     /// #6211 — la lecture en cours est-elle un flux SANS FIN (radio) ? Posé
     /// par l'orchestrateur à chaque lecture, d'après `live_stream`. Armé, le
     /// préampli gardé d'un égaliseur coupé s'éteint en fondu au lieu de
@@ -1279,6 +1286,7 @@ impl LocalOutput {
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
+            pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
@@ -1394,6 +1402,18 @@ impl LocalOutput {
     fn reborner_le_preampli_garde(&self) {
         if let Ok(mut eq) = self.eq.lock() {
             self.borner_la_remontee(&mut eq);
+        }
+    }
+
+    /// #4176 — « Remettre à plat » : le gain gardé d'un égaliseur coupé
+    /// remonte, progressivement, jusqu'au niveau sans égaliseur, sans la borne
+    /// de volume de #6741 (voir `EqProcessor::liberer_le_gain_garde`). Sans
+    /// effet si la chaîne ne porte pas d'égaliseur coupé.
+    pub fn liberer_le_preampli_garde(&self) {
+        if let Ok(mut eq) = self.eq.lock()
+            && let Some(p) = eq.as_mut()
+        {
+            p.liberer_le_gain_garde();
         }
     }
 
@@ -1598,6 +1618,33 @@ impl LocalOutput {
         self.chain_exhausted.store(exhausted, Ordering::SeqCst);
     }
 
+    /// #4176 — faire passer `secondes` de silence stéréo par la chaîne DSP,
+    /// au format déclaré, par la fonction de la boucle de lecture
+    /// (`apply_local_dsp`) : fondus et rampes du gain gardé avancent, et un
+    /// égaliseur coupé revenu au repos est retiré, comme en lecture.
+    #[cfg(test)]
+    pub(crate) fn jouer_du_pcm_pour_test(&self, secondes: f64) {
+        let (taux, canaux) = self.current_format().expect("format déclaré");
+        let trames = (f64::from(taux) * secondes) as usize;
+        let paquet = (taux / 10) as usize;
+        let mut faites = 0;
+        while faites < trames {
+            let n = paquet.min(trames - faites);
+            let mut pcm = vec![0.0_f32; n * usize::from(canaux)];
+            apply_local_dsp(
+                &mut pcm,
+                &self.eq,
+                &self.convolver,
+                &self.crossfeed,
+                &self.pure_bypass,
+                &self.mono_downmix,
+                canaux,
+                false,
+            );
+            faites += n;
+        }
+    }
+
     /// Lecture du drapeau PURE, pour les tests : c'est lui que `apply_local_dsp`
     /// consulte, donc lui qui dit si l'égaliseur installé travaille encore.
     #[cfg(test)]
@@ -1693,6 +1740,23 @@ impl LocalOutput {
     /// orchestrator so a bit-perfect (PURE) zone skips convolution while other
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
+        // #4176 — relevé AVANT la bascule : sous PURE, `preampli_garde` ne
+        // dit plus rien, et la chaîne va être vidée. Un début de piste sous
+        // PURE (chaîne déjà vide) n'efface pas ce qu'une bascule a relevé ;
+        // seule la sortie de PURE le fait.
+        if bypass {
+            let garde = self
+                .eq
+                .lock()
+                .is_ok_and(|e| e.as_ref().is_some_and(|p| p.preampli_garde().is_some()));
+            if garde {
+                self.pure_contourne_un_gain_garde
+                    .store(true, Ordering::Relaxed);
+            }
+        } else {
+            self.pure_contourne_un_gain_garde
+                .store(false, Ordering::Relaxed);
+        }
         self.pure_bypass.store(bypass, Ordering::Relaxed);
         // #4685 — un DSP contourné ne change aucun niveau : sa compensation
         // doit tomber avec lui.
@@ -8390,7 +8454,8 @@ impl OutputTarget for LocalOutput {
             .and_then(|status| status.clone())?;
         status.dsp = verdict_pure_selon_les_reglages(
             status.dsp,
-            self.pure_contourne_un_reglage.load(Ordering::Relaxed),
+            self.pure_contourne_un_reglage.load(Ordering::Relaxed)
+                || self.pure_contourne_un_gain_garde.load(Ordering::Relaxed),
         );
         Some(status)
     }
