@@ -143,13 +143,13 @@ pub fn headroom_db(filter: &str, ratio: u32) -> Option<f64> {
 /// polyphase is the kernel span whatever the ratio, so the pair with the
 /// same or the next higher output rate of the same family is the bound.
 pub fn machine_reference_pair(output_rate: u32) -> Option<(u32, u32)> {
-    if output_rate % 44_100 == 0 {
+    if output_rate.is_multiple_of(44_100) {
         Some(if output_rate <= 352_800 {
             (44_100, 352_800)
         } else {
             (44_100, 705_600)
         })
-    } else if output_rate % 48_000 == 0 {
+    } else if output_rate.is_multiple_of(48_000) {
         Some(if output_rate <= 384_000 {
             (48_000, 384_000)
         } else {
