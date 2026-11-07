@@ -85,7 +85,7 @@ passe de fond ne les remettent. Réponse :
 
 Corps facultatif `{"service_album_id": "…"}` (sinon l'album Qobuz du
 rapprochement rangé). Applique ce rapprochement (`methode = "confirme"`), y
-compris après un retrait. 400 : rien à confirmer ; 409 : Qobuz non connecté.
+compris après un retrait. Refus : `{"error": "<code>"}` — 400 `rien_a_confirmer`, 409 `qobuz_non_connecte`, 404 `album_qobuz_introuvable`.
 
 ### `POST /apports-qobuz/passe`
 

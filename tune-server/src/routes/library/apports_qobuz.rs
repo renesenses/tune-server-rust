@@ -457,7 +457,7 @@ pub(crate) async fn lancer_si_jamais_examine(state: &AppState, album_id: i64) {
     tokio::spawn(async move {
         if let Err(e) = tokio::time::timeout(DELAI, calculer(&state, album_id, false))
             .await
-            .unwrap_or_else(|_| Err("délai dépassé".into()))
+            .unwrap_or_else(|_| Err("delai_depasse".into()))
         {
             tracing::info!(album_id, error = %e, "apports_qobuz_echec");
         }
@@ -543,6 +543,9 @@ pub(super) struct Rafraichir {
     rafraichir: bool,
 }
 
+/// Le corps d'un refus : `{"error": <code stable>}` (`rien_a_confirmer`,
+/// `qobuz_non_connecte`, `album_qobuz_introuvable`) ou le message d'une panne.
+/// Le client traduit le code (#7077 : jamais de phrase dans l'API).
 fn erreur(code: StatusCode, message: impl Into<String>) -> Response {
     (code, Json(json!({"error": message.into()}))).into_response()
 }
@@ -632,14 +635,14 @@ pub(super) async fn confirmer(
         .ok()
         .flatten();
     let Some(cible) = demande.or_else(|| range.and_then(|r| r.service_album_id)) else {
-        return erreur(StatusCode::BAD_REQUEST, "aucun album Qobuz à confirmer");
+        return erreur(StatusCode::BAD_REQUEST, "rien_a_confirmer");
     };
     let Some(svc) = service(&state).await else {
-        return erreur(StatusCode::CONFLICT, "Qobuz n'est pas connecté");
+        return erreur(StatusCode::CONFLICT, "qobuz_non_connecte");
     };
     let f = match fiche(&svc, &cible).await {
         Ok(Some(f)) => f,
-        Ok(None) => return erreur(StatusCode::NOT_FOUND, "album Qobuz introuvable"),
+        Ok(None) => return erreur(StatusCode::NOT_FOUND, "album_qobuz_introuvable"),
         Err(e) => return erreur(StatusCode::BAD_GATEWAY, e),
     };
     let t = Trouve {
