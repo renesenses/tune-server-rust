@@ -43,7 +43,8 @@ pub mod sql {
     /// Sans `album_id` sur la ligne, on préfère ne rien résoudre.
     const RECORD_COLS_RESOLUS: &str = "h.id, COALESCE(h.track_id, t.id) as track_id, h.title, \
          h.artist_name, h.album_title, h.source, h.source_id, h.album_id, h.duration_ms, \
-         h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position, h.cover_url";
+         h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position, h.cover_url, \
+         h.context_source, h.album_ref";
 
     /// La jointure qui résout `track_id`, commune aux deux listes.
     const JOINTURE_PISTE: &str = " FROM listen_history h \
@@ -484,12 +485,32 @@ pub struct ListenRecord {
     /// La référence d'album du service de la piste jouée
     /// (`StreamTrack.album_id`, migration 114 / PG 078) — pour Bandcamp,
     /// l'adresse de la page qui permet de resigner une URL de flux expirée
-    /// (fil 2121). ÉCRITE seulement : la liste de l'historique ne la relit pas
-    /// (elle n'a rien à en faire), et la clé n'apparaît JAMAIS dans son JSON :
-    /// référence interne de resignature, pas un changement de contrat.
-    /// C'est `db::reference_d_album` qui la retrouve au besoin.
+    /// (fil 2121). Référence INTERNE de resignature : la clé n'apparaît
+    /// JAMAIS dans le JSON bâti sur cette structure. La liste de l'historique
+    /// la relit depuis #7778 (point 6) et `GET /library/history` la pose
+    /// elle-même sous `album_id_service` ([`ListenRecord::album_id_service`]),
+    /// comme la file (fil 2143). C'est `db::reference_d_album` qui la
+    /// retrouve pour la resignature.
     #[serde(default, skip_serializing)]
     pub album_ref: Option<String>,
+}
+
+impl ListenRecord {
+    /// L'identifiant de l'album CHEZ SON SERVICE d'une écoute de service
+    /// (`album_ref`) ; `None` pour une écoute locale, et pour une référence
+    /// absente ou vide. Même règle que `QueueEntry::album_id_service`.
+    ///
+    /// #7778, point 6 (fil 2637) : sans lui, le client ne propose « Aller à
+    /// l'album » que pour une écoute lancée depuis cet album.
+    pub fn album_id_service(&self) -> Option<&str> {
+        if self.track_id.is_some() || self.source == "local" {
+            return None;
+        }
+        self.album_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+    }
 }
 
 pub struct HistoryRepo {
@@ -2168,12 +2189,19 @@ fn row_to_listen(cols: &[SqlValue]) -> ListenRecord {
         context_type: cols.get(11).and_then(|v| v.as_string()),
         context_id: cols.get(12).and_then(|v| v.as_string()),
         context_position: cols.get(13).and_then(|v| v.as_i64()),
-        context_source: None,
+        // #7778 (point 6) — l'album d'un titre de service, et l'espace de
+        // noms du contexte : sans eux, le client ne pouvait proposer « Aller
+        // à l'album » que pour une écoute lancée depuis cet album.
+        context_source: cols.get(15).and_then(|v| v.as_string()),
         context_title: None,
         context_cover: None,
-        album_ref: None,
+        album_ref: cols.get(16).and_then(|v| v.as_string()),
     }
 }
+
+#[cfg(test)]
+#[path = "historique_album_de_service_7778_tests.rs"]
+mod historique_album_de_service_7778_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2723,6 +2751,19 @@ mod tests {
             "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
         ));
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
+        // #7778 (point 6) : `row_to_listen` lit `context_source` en 15 et
+        // `album_ref` en 16, dans les deux dialectes.
+        for liste in [
+            sql::recent(&s),
+            sql::recent(&p),
+            sql::recent_paginated(&s),
+            sql::recent_paginated(&p),
+        ] {
+            assert!(
+                liste.contains("h.cover_url, h.context_source, h.album_ref FROM"),
+                "colonnes 14 à 16 de la liste : {liste}"
+            );
+        }
         assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
         assert!(sql::listening_history(&s, 7).contains("'-7 days'"));
     }
