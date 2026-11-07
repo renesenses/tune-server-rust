@@ -2,20 +2,28 @@
 //! l'album LOCAL du même nom : le rapprochement titre + interprète de
 //! [`sql::plays_for_tracks`] n'écartait que la radio.
 //!
-//! Ces témoins tiennent la règle « une piste de la bibliothèque ne compte que
-//! ses écoutes locales » sur SQLite ET sur PostgreSQL (`pg_7980_…`, saute
-//! sans `TUNE_TEST_PG_URL`), aux quatre endroits qui la recopient :
+//! Ces témoins tiennent la règle « une écoute ne compte que pour une piste de
+//! la même provenance » ([`sql::meme_provenance`]) sur SQLite ET sur
+//! PostgreSQL (`pg_7980_…`, saute sans `TUNE_TEST_PG_URL`), aux quatre
+//! endroits qui l'appliquent :
 //!
 //! - `plays_for_tracks` (colonne « # Plays » de la fiche d'un album) ;
 //! - `track_plays` (`GET /library/history/tracks/{id}/plays`) ;
 //! - `ecoutes_de_la_piste` et `derniere_ecoute_de_la_piste` (listes et
 //!   collections intelligentes).
 //!
+//! Trois pistes de même titre et même interprète, une par provenance : un
+//! fichier local, une piste UPnP de la bibliothèque, une piste Qobuz de
+//! `tracks`. Chacune ne compte que ses propres écoutes : la piste UPnP garde
+//! ses écoutes UPnP, la piste Qobuz ne reçoit pas les écoutes locales.
+//!
 //! Le tri « # écoutes » de la table des titres (`JOINTURE_ECOUTES`) est gardé
 //! dans `track_repo/page_de_pistes.rs` (`i1470_…`, `i7980_…`).
 //!
-//! Contre-épreuve : remettre `h.source != 'radio'` dans
-//! `sql::plays_for_tracks` fait rougir le témoin Qobuz (1 au lieu de 0).
+//! Contre-épreuves : remettre `h.source != 'radio'` dans
+//! `sql::plays_for_tracks` fait rougir le témoin Qobuz (1 au lieu de 0) ;
+//! remettre `COALESCE(h.source, 'local') = 'local'` y fait rougir le témoin
+//! UPnP (0 au lieu de 1).
 
 use super::*;
 use crate::db::migrations;
@@ -23,29 +31,39 @@ use crate::db::migrations;
 const TITRE: &str = "Titre 7980";
 const INTERPRETE: &str = "Interprète 7980";
 
-/// La piste locale `id` « Titre 7980 » d'« Interprète 7980 ».
-fn poser_la_piste_locale(db: &Arc<dyn DbBackend>, id: i64) {
+/// Les trois pistes « Titre 7980 » d'« Interprète 7980 » : `base` locale,
+/// `base + 1` UPnP, `base + 2` Qobuz.
+fn poser_les_pistes(db: &Arc<dyn DbBackend>, base: i64) {
     db.execute(
-        &format!("INSERT INTO artists (id, name) VALUES ({id}, '{INTERPRETE}')"),
+        &format!("INSERT INTO artists (id, name) VALUES ({base}, '{INTERPRETE}')"),
         &[],
     )
     .unwrap();
     db.execute(
         &format!(
             "INSERT INTO albums (id, title, artist_id, track_count) \
-             VALUES ({id}, 'Album 7980', {id}, 1)"
+             VALUES ({base}, 'Album 7980', {base}, 3)"
         ),
         &[],
     )
     .unwrap();
-    db.execute(
-        &format!(
-            "INSERT INTO tracks (id, title, artist_id, album_id, file_path, source) \
-             VALUES ({id}, '{TITRE}', {id}, {id}, '/musique/7980.flac', 'local')"
-        ),
-        &[],
-    )
-    .unwrap();
+    for (decalage, chemin, source, source_id) in [
+        (0, "'/musique/7980.flac'", "local", "NULL"),
+        (1, "NULL", "upnp", "'uuid-nas|7980'"),
+        (2, "NULL", "qobuz", "'7980001'"),
+    ] {
+        let id = base + decalage;
+        db.execute(
+            &format!(
+                "INSERT INTO tracks (id, title, artist_id, album_id, track_number, \
+                 file_path, source, source_id) \
+                 VALUES ({id}, '{TITRE}', {base}, {base}, {}, {chemin}, '{source}', {source_id})",
+                decalage + 1
+            ),
+            &[],
+        )
+        .unwrap();
+    }
 }
 
 /// Une écoute écrite par le vrai chemin (`record`, `track_id` NULL), datée
@@ -56,7 +74,7 @@ fn ecouter(repo: &HistoryRepo, db: &Arc<dyn DbBackend>, source: &str, quand: &st
             title: TITRE.into(),
             artist_name: Some(INTERPRETE.into()),
             source: source.into(),
-            source_id: (source != "local").then(|| "7980001".to_string()),
+            source_id: (source == "qobuz").then(|| "7980001".to_string()),
             duration_ms: 240_000,
             ..Default::default()
         })
@@ -69,13 +87,11 @@ fn ecouter(repo: &HistoryRepo, db: &Arc<dyn DbBackend>, source: &str, quand: &st
     id
 }
 
-fn plays(repo: &HistoryRepo, piste: i64) -> (i64, Option<String>) {
-    repo.plays_for_tracks(&[piste]).unwrap()[&piste].clone()
-}
-
-/// Le compte et la date que lisent les listes intelligentes, par les
-/// sous-requêtes corrélées de `ecoutes_de_la_piste`.
-fn intelligentes(db: &Arc<dyn DbBackend>, piste: i64) -> (i64, Option<String>) {
+/// Le compte et la dernière écoute de la piste `piste`, de provenance
+/// `source`, lus par les trois chemins, qui doivent s'accorder.
+fn comptes(db: &Arc<dyn DbBackend>, piste: i64, source: &str) -> (i64, Option<String>) {
+    let repo = HistoryRepo::with_backend(db.clone());
+    let colonne = repo.plays_for_tracks(&[piste]).unwrap()[&piste].clone();
     let ligne = db
         .query_one(
             &format!(
@@ -87,64 +103,100 @@ fn intelligentes(db: &Arc<dyn DbBackend>, piste: i64) -> (i64, Option<String>) {
         )
         .unwrap()
         .unwrap();
-    (
+    let intelligentes = (
         ligne[0].as_i64().unwrap(),
         ligne.get(1).and_then(|v| v.as_string()),
-    )
+    );
+    assert_eq!(
+        intelligentes, colonne,
+        "#7980 : les listes intelligentes comptent comme la fiche ({source})"
+    );
+    assert_eq!(
+        repo.track_plays(TITRE, Some(INTERPRETE), source).unwrap(),
+        colonne.0,
+        "#7980 : track_plays compte comme la fiche ({source})"
+    );
+    colonne
 }
 
-fn verifier(db: &Arc<dyn DbBackend>, piste: i64) {
+fn verifier(db: &Arc<dyn DbBackend>, base: i64) {
     let repo = HistoryRepo::with_backend(db.clone());
+    let (locale, upnp, qobuz) = (base, base + 1, base + 2);
+    let date = |d: &str| Some(d.to_string());
 
     // 1. Une écoute Qobuz du même titre, du même interprète.
     ecouter(&repo, db, "qobuz", "2026-11-02T10:00:00Z");
     assert_eq!(
-        plays(&repo, piste),
+        comptes(db, locale, "local"),
         (0, None),
         "#7980 : une écoute Qobuz ne doit pas compter pour la piste locale du même nom"
     );
+    assert_eq!(comptes(db, upnp, "upnp"), (0, None));
     assert_eq!(
-        repo.track_plays(TITRE, Some(INTERPRETE)).unwrap(),
-        0,
-        "#7980 : track_plays ne compte pas l'écoute Qobuz"
-    );
-    assert_eq!(
-        intelligentes(db, piste),
-        (0, None),
-        "#7980 : les listes intelligentes ne comptent pas l'écoute Qobuz"
+        comptes(db, qobuz, "qobuz"),
+        (1, date("2026-11-02T10:00:00Z")),
+        "#7980 : l'écoute Qobuz compte pour la piste Qobuz de la bibliothèque"
     );
 
-    // 2. Une écoute locale : +1, et c'est sa date, pas celle de Qobuz.
+    // 2. Une écoute locale : +1 pour le fichier local, datée d'elle-même, et
+    //    rien pour la piste Qobuz du même nom.
     ecouter(&repo, db, "local", "2026-11-01T09:00:00Z");
-    let une_locale = (1, Some("2026-11-01T09:00:00Z".to_string()));
     assert_eq!(
-        plays(&repo, piste),
-        une_locale,
+        comptes(db, locale, "local"),
+        (1, date("2026-11-01T09:00:00Z")),
         "#7980 : une écoute locale compte +1, datée d'elle-même"
     );
-    assert_eq!(repo.track_plays(TITRE, Some(INTERPRETE)).unwrap(), 1);
-    assert_eq!(intelligentes(db, piste), une_locale);
+    assert_eq!(
+        comptes(db, qobuz, "qobuz").0,
+        1,
+        "#7980 : une écoute locale ne doit pas compter pour la piste Qobuz du même nom"
+    );
+    assert_eq!(
+        comptes(db, upnp, "upnp"),
+        (0, None),
+        "#7980 : une écoute locale ne doit pas compter pour la piste UPnP du même nom"
+    );
 
-    // 3. Une ligne ancienne, écrite avant le défaut de la colonne : source
-    //    NULL, locale pour la bibliothèque (`track_repo::est_local`).
-    let ancienne = ecouter(&repo, db, "local", "2026-10-01T08:00:00Z");
+    // 3. Une écoute UPnP : la piste UPnP de la bibliothèque la garde.
+    ecouter(&repo, db, "upnp", "2026-11-04T10:00:00Z");
+    assert_eq!(
+        comptes(db, upnp, "upnp"),
+        (1, date("2026-11-04T10:00:00Z")),
+        "#7980 : une piste UPnP de la bibliothèque compte ses écoutes UPnP"
+    );
+    assert_eq!(comptes(db, locale, "local").0, 1);
+    assert_eq!(comptes(db, qobuz, "qobuz").0, 1);
+
+    // 4. Des lignes anciennes, source NULL ou vide : locales.
+    for quand in ["2026-10-01T08:00:00Z", "2026-10-02T08:00:00Z"] {
+        ecouter(&repo, db, "local", quand);
+    }
     db.execute(
-        &format!("UPDATE listen_history SET source = NULL WHERE id = {ancienne}"),
+        "UPDATE listen_history SET source = NULL \
+         WHERE listened_at = '2026-10-01T08:00:00Z'",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE listen_history SET source = '' \
+         WHERE listened_at = '2026-10-02T08:00:00Z'",
         &[],
     )
     .unwrap();
     assert_eq!(
-        plays(&repo, piste).0,
-        2,
-        "#7980 : une écoute ancienne à source NULL reste une écoute locale"
+        comptes(db, locale, "local").0,
+        3,
+        "#7980 : une écoute ancienne à source NULL ou vide reste une écoute locale"
     );
-    assert_eq!(repo.track_plays(TITRE, Some(INTERPRETE)).unwrap(), 2);
-    assert_eq!(intelligentes(db, piste).0, 2);
+    assert_eq!(comptes(db, qobuz, "qobuz").0, 1);
+    assert_eq!(comptes(db, upnp, "upnp").0, 1);
 
-    // 4. La radio reste exclue, et l'écoute Qobuz garde son propre compte
-    //    par service et identifiant (#8062).
+    // 5. La radio reste exclue partout, et l'écoute Qobuz garde son propre
+    //    compte par service et identifiant (#8062).
     ecouter(&repo, db, "radio", "2026-11-03T10:00:00Z");
-    assert_eq!(plays(&repo, piste).0, 2, "la radio ne compte pas");
+    assert_eq!(comptes(db, locale, "local").0, 3, "la radio ne compte pas");
+    assert_eq!(comptes(db, upnp, "upnp").0, 1);
+    assert_eq!(comptes(db, qobuz, "qobuz").0, 1);
     assert_eq!(
         repo.ecoutes_de_service_par_identifiant("qobuz", &["7980001"])
             .unwrap()
@@ -156,18 +208,18 @@ fn verifier(db: &Arc<dyn DbBackend>, piste: i64) {
 }
 
 #[test]
-fn sqlite_seules_les_ecoutes_locales_comptent_pour_une_piste_locale_7980() {
+fn sqlite_chaque_piste_ne_compte_que_les_ecoutes_de_sa_provenance_7980() {
     let base = SqliteDb::open_in_memory().unwrap();
     base.init_schema().unwrap();
     migrations::run_migrations(&base).unwrap();
     let db: Arc<dyn DbBackend> = Arc::new(base);
-    poser_la_piste_locale(&db, 1);
+    poser_les_pistes(&db, 1);
     verifier(&db, 1);
 }
 
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
-async fn pg_7980_seules_les_ecoutes_locales_comptent_pour_une_piste_locale() {
+async fn pg_7980_chaque_piste_ne_compte_que_les_ecoutes_de_sa_provenance() {
     let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
         eprintln!("SAUT : TUNE_TEST_PG_URL non posée");
         return;
@@ -186,7 +238,7 @@ async fn pg_7980_seules_les_ecoutes_locales_comptent_pour_une_piste_locale() {
     let nettoyer = |db: &Arc<dyn DbBackend>| {
         for sql in [
             format!("DELETE FROM listen_history WHERE title = '{TITRE}'"),
-            "DELETE FROM tracks WHERE id = 7980".to_string(),
+            "DELETE FROM tracks WHERE id BETWEEN 7980 AND 7982".to_string(),
             "DELETE FROM albums WHERE id = 7980".to_string(),
             "DELETE FROM artists WHERE id = 7980".to_string(),
         ] {
@@ -194,7 +246,7 @@ async fn pg_7980_seules_les_ecoutes_locales_comptent_pour_une_piste_locale() {
         }
     };
     nettoyer(&db);
-    poser_la_piste_locale(&db, 7980);
+    poser_les_pistes(&db, 7980);
     verifier(&db, 7980);
     nettoyer(&db);
 }

@@ -1280,9 +1280,9 @@ pub(crate) mod tests {
 /// lignes « nombre d'écoutes » (#7769) : elles comptaient par
 /// `listen_history.track_id` seul, toujours NULL, et comptent désormais comme
 /// la Bibliothèque, `track_id` ne servant plus qu'en plus quand il est rempli.
-/// Puis, avec la Bibliothèque, elles ne comptent plus que les écoutes locales
-/// (#7980) : `COALESCE(he.source, 'local') = 'local'` au lieu de
-/// `he.source != 'radio'`.
+/// Puis, avec la Bibliothèque, elles ne comptent plus que les écoutes de la
+/// provenance de la piste (#7980, `history_repo::sql::meme_provenance`) au
+/// lieu de toutes les écoutes hors radio.
 #[cfg(test)]
 mod anciennes_regles {
     use crate::smart_playlists::build_smart_query_rapport;
