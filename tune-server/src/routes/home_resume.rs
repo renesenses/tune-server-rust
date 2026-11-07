@@ -58,6 +58,8 @@ pub(super) async fn resume_listening(
         let response = super::super::podcasts::play_episode(
             State(state.clone()),
             Path(zone_id),
+            axum::http::HeaderMap::new(),
+            profile,
             Json(request),
         )
         .await
