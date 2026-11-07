@@ -145,9 +145,15 @@ fn active_la_cadence_est_portee_sans_crete_et_declaree() {
         .fold(0.0f32, |m, x| m.max(x.abs()));
     // fs/4 à 45° : +3 dB entre les échantillons sans réserve.
     assert!(crete <= 1.0, "crête {crete} au-dessus de la pleine échelle");
+    // La reconstruction de fs/4 à 45° vaut 1,414 × la réserve du filtre :
+    // ni plus (écrêtage), ni moins (réserve appliquée deux fois).
+    let attendu = 1.414
+        * 10f64.powf(
+            crate::audio::surechantillonnage::greffon::headroom_db("polyvalent", 8).unwrap() / 20.0,
+        );
     assert!(
-        crete > 0.9,
-        "crête {crete} : la réserve est-elle excessive ?"
+        (f64::from(crete) - attendu).abs() < 0.02,
+        "crête {crete} : attendu {attendu:.3} (1,414 × réserve)"
     );
     let t = e.transformations();
     assert!(t.reechantillonnage());
