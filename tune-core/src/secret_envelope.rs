@@ -358,6 +358,43 @@ impl Envelope {
         })
     }
 
+    /// Comme [`Envelope::sceller_avec`], mais rend le chiffré BRUT à part :
+    /// l'appelant choisit son encodage (base64 pour la sauvegarde en ligne,
+    /// #7286, où l'hexadécimal doublait la taille envoyée). Le `ciphertext`
+    /// de l'enveloppe rendue est vide.
+    pub fn sceller_a_part(
+        dek: &[u8; 32],
+        passphrase_slot: &KeySlot,
+        recovery_slot: &KeySlot,
+        plaintext: &[u8],
+    ) -> Result<(Self, Vec<u8>), String> {
+        let nonce = random_bytes(NONCE_LEN)?;
+        let ciphertext = seal(dek, &nonce, plaintext)?;
+        Ok((
+            Envelope {
+                version: ENVELOPE_VERSION,
+                passphrase_slot: passphrase_slot.clone(),
+                recovery_slot: recovery_slot.clone(),
+                nonce: hex_encode(&nonce),
+                ciphertext: String::new(),
+            },
+            ciphertext,
+        ))
+    }
+
+    /// Ouvre, avec la DEK, un chiffré rangé hors de l'enveloppe
+    /// ([`Envelope::sceller_a_part`]).
+    pub fn ouvrir_a_part(&self, dek: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+        if self.version != ENVELOPE_VERSION {
+            return Err(format!(
+                "unsupported envelope version {} (this build understands {ENVELOPE_VERSION})",
+                self.version
+            ));
+        }
+        let nonce = hex_decode(&self.nonce)?;
+        unseal(dek, &nonce, ciphertext)
+    }
+
     /// La DEK, rouverte par la phrase de passe OU la clé de secours.
     pub fn cle_de_donnees(&self, secret: &str) -> Result<[u8; 32], String> {
         self.unwrap_with(secret)
