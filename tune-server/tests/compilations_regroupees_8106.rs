@@ -410,5 +410,77 @@ async fn une_compilation_faite_main_reste_un_seul_album_8106() {
     attendus.sort();
     assert_eq!(tries, attendus, "chaque piste garde son ARTIST");
 
+    // 7. Réparation d'une bibliothèque DÉJÀ éclatée par la version fautive :
+    //    la base est remise dans l'état qu'elle laissait (une ligne album par
+    //    piste, sous l'album d'origine et l'artiste de la piste, toutes du
+    //    même dossier), les fichiers ne changent pas. Le « Scan complet »
+    //    (`?full=true`, le bouton des clients) doit les regrouper.
+    let db = s.backend.as_ref();
+    let dossier: String = db
+        .query_one("SELECT folder_path FROM albums LIMIT 1", &[])
+        .unwrap()
+        .and_then(|r| r.first()?.as_string())
+        .expect("le dossier de l'album");
+    let pistes: Vec<(i64, i64, String)> = db
+        .query_many(
+            "SELECT t.id, t.artist_id, ar.name FROM tracks t JOIN artists ar ON ar.id = t.artist_id",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            (
+                r[0].as_i64().unwrap(),
+                r[1].as_i64().unwrap(),
+                r[2].as_string().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(pistes.len(), 5);
+    for (id, artiste, nom) in &pistes {
+        let titre = format!("Disque d'origine de {nom}").replace('\'', "''");
+        let dossier_sql = dossier.replace('\'', "''");
+        db.execute_batch(&format!(
+            "INSERT INTO albums (title, artist_id, folder_path, source) \
+               VALUES ('{titre}', {artiste}, '{dossier_sql}', 'local'); \
+             UPDATE tracks SET album_id = (SELECT MAX(id) FROM albums) WHERE id = {id};"
+        ))
+        .unwrap();
+    }
+    db.execute_batch(
+        "DELETE FROM albums WHERE NOT EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id)",
+    )
+    .unwrap();
+    let eclatee = albums(db);
+    eprintln!("[réparation] bibliothèque éclatée : {eclatee:?}");
+    assert_eq!(eclatee.len(), 5, "l'état de départ doit être éclaté");
+
+    // Un scan ordinaire : rien n'a changé sur le disque, aucun fichier n'est
+    // relu. Constaté, pas exigé : c'est le « Scan complet » qui répare.
+    scanner(&s).await;
+    eprintln!("[réparation] après un scan ordinaire : {:?}", albums(db));
+
+    let (st, v) = requete(&s, "POST", "/api/v1/system/scan?full=true").await;
+    assert!(st.is_success(), "POST /system/scan?full=true → {st} : {v}");
+    for _ in 0..600 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, v) = requete(&s, "GET", "/api/v1/system/scan/status").await;
+        if v["status"] != "scanning" {
+            break;
+        }
+    }
+    let repare = albums(db);
+    eprintln!("[réparation] après le scan complet : {repare:?}");
+    assert_eq!(
+        repare,
+        vec![(
+            "Soul du dimanche".to_string(),
+            "Various Artists".to_string(),
+            true,
+            5
+        )],
+        "le « Scan complet » doit regrouper une compilation déjà éclatée (#8106)"
+    );
+
     let _ = std::fs::remove_dir_all(&base);
 }
