@@ -2797,6 +2797,10 @@ async fn spawn_library_scan_avec_lecteur_par(
                             Ok(()) => {
                                 ecritures = ecritures
                                     .avec_dr_des_rapports_voisins(meta_entries.iter().map(|(_, m)| m));
+                                // #7766 — les crédits des balises deviennent des
+                                // lignes `track_credits` (source `balises`), dans
+                                // la même transaction, sans rouvrir le fichier.
+                                tune_core::metadata::credits_balises::ecrire_lot(&db, &meta_entries);
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "scan_extended_metadata_insert_failed");
@@ -2931,6 +2935,15 @@ async fn spawn_library_scan_avec_lecteur_par(
 
         // Album covers extracted during the scan (owned by the importer).
         let artwork_extracted = importer.artwork_extracted() as i64;
+
+        // #7915 — la durée de chaque étape de fin de scan, au journal.
+        tracing::info!(
+            travail = "scan",
+            etape = "parcours_et_import",
+            duree_ms = scan_timer_start.elapsed().as_millis() as u64,
+            "etape_terminee"
+        );
+        let mut etapes = tune_core::taches_de_fond::avancement::ChronoDesEtapes::demarrer("scan");
 
         // Prune tracks whose files no longer exist on disk.
         // SAFETY: skip tracks in missing directories — the volume/NAS may
@@ -3272,6 +3285,7 @@ async fn spawn_library_scan_avec_lecteur_par(
         }
         drop(sqlite_write_guard);
 
+        etapes.fin("purge_et_statistiques");
         // #5528 — APRÈS la purge et son COMMIT : les albums vidés ont disparu,
         // les dossiers « Collections » suivent ceux dont les pistes sont
         // passées dans un autre album. Hors de la transaction, qui ne doit pas
@@ -3315,6 +3329,7 @@ async fn spawn_library_scan_avec_lecteur_par(
             );
         }
 
+        etapes.fin("pochettes_et_collections");
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —
         // can leave album rows behind that no track references. Without this
@@ -3342,6 +3357,18 @@ async fn spawn_library_scan_avec_lecteur_par(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "post_scan_compilations_recalcul_echoue"),
+            }
+            // #6459 — un album rétrogradé sous « Unknown Artist » par une
+            // relecture passée reprend l'artiste que ses pistes portent en
+            // base : ses fichiers inchangés ne seront pas relus.
+            match tune_core::db::album_repo::AlbumRepo::with_backend(db.clone())
+                .rendre_leur_artiste_aux_albums_inconnus()
+            {
+                Ok(bilan) if bilan.rendus > 0 => {
+                    tracing::info!(?bilan, "post_scan_albums_inconnus_rendus")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_albums_inconnus_echoue"),
             }
         }
 
@@ -3524,6 +3551,7 @@ async fn spawn_library_scan_avec_lecteur_par(
             );
         }
 
+        etapes.fin("orphelins_et_favoris");
         // Rebuild FTS indexes so search reflects the current library state.
         // The FTS tables are contentless (content='') and rely on triggers,
         // but manual DB edits or batch operations can leave them stale.
@@ -3548,6 +3576,7 @@ async fn spawn_library_scan_avec_lecteur_par(
 
         }
 
+        etapes.fin("index_de_recherche");
         // Populate cloud sync changelog with all new/updated entities
         tune_core::cloud::library_sync::populate_changelog_after_scan(&db);
 
@@ -3571,11 +3600,13 @@ async fn spawn_library_scan_avec_lecteur_par(
             }
         }
 
+        etapes.fin("listes_de_lecture");
         let settings = SettingsRepo::with_backend(db.clone());
         if let Err(e) = settings.set("scan_status", "idle") {
             tracing::warn!(error = %e, "scan_status_idle_failed");
         }
         tracing::info!(
+            duree_ms = scan_timer_start.elapsed().as_millis() as u64,
             discovered = total_discovered,
             parsed = scan_stats.total_files,
             timeout = scan_stats.metadata_timeout,

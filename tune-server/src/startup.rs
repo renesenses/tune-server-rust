@@ -1083,6 +1083,17 @@ fn recalculer_les_compilations(state: &AppState) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "compilations_recalcul_impossible"),
     }
+    // #6459 — meme principe pour les albums retrogrades sous « Unknown
+    // Artist » : la base garde l'artiste de leurs pistes.
+    match tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+        .rendre_leur_artiste_aux_albums_inconnus()
+    {
+        Ok(bilan) if bilan.rendus > 0 => {
+            info!(?bilan, "albums_inconnus_rendus_au_demarrage");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "albums_inconnus_reprise_impossible"),
+    }
 }
 
 /// Re-rattache les favoris orphelins aux items vivants retrouvés par identité
@@ -2785,6 +2796,7 @@ pub(crate) async fn remplacer_le_repli_wasapi(
         enregistrees: enregistrees.clone(),
         ..Default::default()
     };
+    let mut sorties_retirees = Vec::new();
     {
         let mut outputs = state.outputs.lock().await;
         for id in repli {
@@ -2804,10 +2816,13 @@ pub(crate) async fn remplacer_le_repli_wasapi(
                 rapport.gardees_en_lecture.push(id.clone());
                 continue;
             }
-            outputs.remove(id);
+            sorties_retirees.extend(outputs.remove(id));
             rapport.retirees.push(id.clone());
         }
     }
+    // #7949 — arrêtées hors du verrou du registre : une sortie WASAPI en
+    // pause gardait son fil et son périphérique.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(sorties_retirees).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     for id in &rapport.retirees {
         let _ = zone_repo.set_online_by_device(id, false);

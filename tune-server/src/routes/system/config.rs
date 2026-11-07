@@ -378,6 +378,10 @@ pub(super) async fn get_config(
         // TCP du même port (#2938, #2349). Voir
         // `background::annonce_slimproto_activee`.
         (crate::background::CLE_ANNONCE_SLIMPROTO, json!(true)),
+        // #7374 — « Serveur Squeezebox de Tune » : vrai par défaut, le
+        // comportement d'avant. Un `false` explicite ferme 3483 TCP/UDP et
+        // 9090, pour laisser ces ports à un Lyrion/LMS de la même machine.
+        (crate::background::CLE_SERVEUR_SQUEEZEBOX, json!(true)),
         ("db_engine", json!(state.backend.engine().as_str())),
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),
@@ -506,8 +510,9 @@ pub(super) async fn get_config(
             json!(tune_core::taches_de_fond::vitesse::Vitesse::default().id()),
         ),
         // #6713 — lever le bridage des analyses quand la température est
-        // illisible. Désactivé par défaut, publié avec son défaut pour que le
-        // client distingue « éteint » de « pas lu ».
+        // illisible. Sans effet depuis #6450 (plus de bridage sur une
+        // température illisible) ; publié avec son défaut pour les clients
+        // qui le lisent encore.
         (
             tune_core::taches_de_fond::vitesse::CLE_LEVER_LE_BRIDAGE,
             json!(tune_core::taches_de_fond::vitesse::LEVER_LE_BRIDAGE_DEFAUT),
@@ -606,11 +611,18 @@ pub(super) async fn get_config(
     // MACHINE : « Rapide » dépend des cœurs, et l'écran doit le dire plutôt
     // que de promettre quatre pistes à un double cœur.
     {
-        use tune_core::taches_de_fond::vitesse::{Vitesse, coeurs};
-        let n = coeurs();
+        use tune_core::taches_de_fond::vitesse::{
+            Vitesse, coeurs, largeur_sur_la_machine, memoire_totale,
+        };
+        let (n, memoire) = (coeurs(), memoire_totale());
         let largeurs: serde_json::Map<String, Value> = Vitesse::TOUTES
             .into_iter()
-            .map(|v| (v.id().to_string(), json!(v.largeur(n))))
+            .map(|v| {
+                (
+                    v.id().to_string(),
+                    json!(largeur_sur_la_machine(v, n, memoire)),
+                )
+            })
             .collect();
         config.insert(
             "background_analysis_speed_widths".to_string(),
@@ -1384,12 +1396,8 @@ fn normaliser_levee_du_bridage(
             )));
         }
     };
-    if valeur {
-        tracing::warn!(
-            "analyses_bridage_leve_par_reglage — sans température lisible, les analyses de fond \
-             tourneront à la vitesse réglée (choix de l'utilisateur, #6713)"
-        );
-    }
+    // #6450 : sans effet, une température illisible ne bride plus. La
+    // valeur reste acceptée et gardée pour les clients qui l'écrivent.
     values.insert(CLE_LEVER_LE_BRIDAGE.to_string(), json!(valeur));
     Ok(())
 }
@@ -1961,6 +1969,17 @@ pub(super) async fn update_config(
             crate::background::annonce_slimproto_activee(Some(&texte))
         });
 
+    // #7374 — le serveur Squeezebox, lu au même endroit et de la même façon.
+    let serveur_demande = values
+        .get(crate::background::CLE_SERVEUR_SQUEEZEBOX)
+        .map(|v| {
+            let texte = v
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
+            crate::background::serveur_squeezebox_actif(Some(&texte))
+        });
+
     let patch_music_dirs = values.get("music_dirs").and_then(dirs_depuis_valeur);
     let racines_avant = if patch_music_dirs.is_some() {
         super::get_music_dirs_list(&state.backend)
@@ -2112,8 +2131,24 @@ pub(super) async fn update_config(
         tune_core::http::bruit_reseau::regler(actif);
         tracing::info!(actif, "network_noise_watch_applied");
     }
-    // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
-    let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
+    // #7374 — le serveur d'abord, sans redémarrage : l'annonce n'a de sens
+    // que s'il tourne. Deux PATCH simultanés passent l'un après l'autre :
+    // sinon un « rallumer » arrivé pendant l'attente d'une extinction armerait
+    // un serveur dont l'extinction effacerait ensuite l'état d'écoute.
+    let _bascule = if serveur_demande.is_some() || annonce_demandee.is_some() {
+        Some(BASCULE_SQUEEZEBOX.lock().await)
+    } else {
+        None
+    };
+    let serveur_applique = match serveur_demande {
+        Some(actif) => Some(appliquer_serveur_squeezebox(&state, actif).await),
+        None => None,
+    };
+    // #3809 — appliquer MAINTENANT, pas au prochain démarrage. Un serveur
+    // coupé garde son annonce muette, quelle que soit la valeur demandée.
+    let serveur_actif = crate::background::serveur_squeezebox_regle(&state.backend);
+    let annonce_appliquee =
+        annonce_demandee.map(|a| appliquer_annonce_slimproto(a && serveur_actif, state.port));
     // Fil 2148 (#5792) — le délai des partages réseau vaut dès l'attente en
     // cours des sondes, sans redémarrage.
     if let Some(secs) = intervalle_reseau_demande {
@@ -2141,6 +2176,11 @@ pub(super) async fn update_config(
     // effet tout de suite, et n'a pas à supposer qu'un redémarrage l'attend.
     if let Some(applique) = annonce_appliquee {
         reponse["slimproto_discovery_applied"] = json!(applique);
+    }
+    // #7374 — appliqué à chaud : aucun redémarrage n'est demandé.
+    if let Some(applique) = serveur_applique {
+        reponse["slimproto_server_applied"] = json!(applique);
+        reponse["slimproto_server_restart_required"] = json!(false);
     }
     // Écho du mode réellement posé : le client n'a pas à relire `GET /config`
     // pour savoir si sa demande a été comprise.
@@ -2268,6 +2308,81 @@ fn appliquer_annonce_slimproto(annonce: bool, port_http: u16) -> bool {
             eteinte
         }
         ActionAnnonce::Rien => false,
+    }
+}
+
+/// Ce qu'il faut faire du serveur Squeezebox de Tune (#7374), sachant l'état
+/// demandé et l'état réel. Fonction PURE, comme [`action_annonce`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActionServeur {
+    /// Le réglage est vrai et l'écoute TCP ne tourne pas (jamais armée, ou
+    /// bind refusé parce qu'un LMS tenait le port) : armer, ce qui retente
+    /// aussi les volets en échec.
+    Armer,
+    /// Le réglage est faux et un volet au moins tourne : tout éteindre.
+    Eteindre,
+    /// L'état demandé est déjà l'état réel.
+    Rien,
+}
+
+pub(crate) fn action_serveur(demande: bool, tcp_arme: bool, un_volet_arme: bool) -> ActionServeur {
+    match (demande, tcp_arme, un_volet_arme) {
+        (true, false, _) => ActionServeur::Armer,
+        (false, _, true) | (false, true, _) => ActionServeur::Eteindre,
+        _ => ActionServeur::Rien,
+    }
+}
+
+/// Une seule bascule du serveur Squeezebox ou de son annonce à la fois (#7374).
+static BASCULE_SQUEEZEBOX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Applique le réglage « Serveur Squeezebox de Tune » sans redémarrage (#7374).
+/// Vrai si l'état a changé.
+///
+/// L'extinction attend la fermeture des écoutes : quand la réponse part, 3483
+/// et 9090 sont libres pour un Lyrion/LMS de la même machine.
+async fn appliquer_serveur_squeezebox(state: &crate::state::AppState, actif: bool) -> bool {
+    use tune_core::slimproto::{cli_server, discovery};
+    let tcp = tune_core::slimproto::serveur_tcp_arme();
+    let un_volet = tcp || cli_server::est_arme() || discovery::est_armee();
+    match action_serveur(actif, tcp, un_volet) {
+        ActionServeur::Armer => {
+            crate::background::armer_serveur_squeezebox(state, &state.config);
+            tracing::info!(
+                reglage = crate::background::CLE_SERVEUR_SQUEEZEBOX,
+                "slimproto_serveur_rallume_a_chaud"
+            );
+            true
+        }
+        ActionServeur::Eteindre => {
+            let eteint = crate::background::eteindre_serveur_squeezebox().await;
+            tracing::info!(
+                reglage = crate::background::CLE_SERVEUR_SQUEEZEBOX,
+                "slimproto_serveur_eteint_a_chaud — ni 3483 TCP/UDP ni 9090 ouverts"
+            );
+            eteint
+        }
+        ActionServeur::Rien => false,
+    }
+}
+
+#[cfg(test)]
+mod serveur_squeezebox_a_chaud_tests_7374 {
+    use super::{ActionServeur, action_serveur};
+
+    #[test]
+    fn rallumer_arme_quand_l_ecoute_tcp_ne_tourne_pas() {
+        assert_eq!(action_serveur(true, false, false), ActionServeur::Armer);
+        // Le pont 9090 replié tourne, mais le TCP a échoué : on retente.
+        assert_eq!(action_serveur(true, false, true), ActionServeur::Armer);
+        assert_eq!(action_serveur(true, true, true), ActionServeur::Rien);
+    }
+
+    #[test]
+    fn couper_eteint_des_qu_un_volet_tourne() {
+        assert_eq!(action_serveur(false, true, true), ActionServeur::Eteindre);
+        assert_eq!(action_serveur(false, false, true), ActionServeur::Eteindre);
+        assert_eq!(action_serveur(false, false, false), ActionServeur::Rien);
     }
 }
 
@@ -6216,7 +6331,9 @@ mod vitesse_des_analyses_5519_tests {
     use axum::extract::State;
     use axum::http::HeaderMap;
     use serde_json::{Value, json};
-    use tune_core::taches_de_fond::vitesse::{CLE_REGLAGE, Vitesse, coeurs};
+    use tune_core::taches_de_fond::vitesse::{
+        CLE_REGLAGE, Vitesse, coeurs, largeur_sur_la_machine, memoire_totale,
+    };
 
     /// #5519 — le réglage est publié avec son défaut `normal`, avec la largeur
     /// réelle de chaque vitesse sur cette machine.
@@ -6236,7 +6353,11 @@ mod vitesse_des_analyses_5519_tests {
         assert_eq!(largeurs["discreet"], 1);
         assert_eq!(
             largeurs["normal"],
-            json!(Vitesse::Normale.largeur(coeurs()))
+            json!(largeur_sur_la_machine(
+                Vitesse::Normale,
+                coeurs(),
+                memoire_totale()
+            ))
         );
         assert_eq!(largeurs["fast"], json!(Vitesse::Rapide.largeur(coeurs())));
     }

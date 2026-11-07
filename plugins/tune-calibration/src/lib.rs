@@ -12,6 +12,8 @@
 //!        │       capture par tune-entree-audio::tampon (cpal, vers tampon)
 //! correction.rs  C2 : cible, zone bornée, égaliseur qui ne fait que couper,
 //!        │       profil de pièce de la zone (appliqué par la route existante)
+//! modes.rs       C5 : modes de basse d'une pièce rectangulaire sans micro,
+//!        │       réponse estimée, correction C2 plus prudente
 //! routes.rs      /api/v1/ext/calibration/…
 //! ```
 //!
@@ -31,6 +33,7 @@ pub mod fournisseur;
 pub mod generateur;
 pub mod hote;
 pub mod mesure;
+pub mod modes;
 pub mod routes;
 pub mod simulation;
 
