@@ -6,86 +6,78 @@
 //! 70 °C » ne protégeait rien, et les analyses tournaient à pleine largeur.
 //!
 //! Ces témoins portent sur la DÉCISION, en logique pure, testable partout :
-//! * sans température lisible, les analyses de fond passent à UN fichier à la
-//!   fois, quelle que soit la vitesse réglée ;
-//! * une température lisible laisse la vitesse réglée intacte (Linux, ou
-//!   Windows avec une zone thermique) ;
+//! * sans température lisible, les analyses de fond gardent la vitesse
+//!   réglée (#6450 : une température illisible n'est pas trop haute ; le
+//!   bridage à un fichier de #5410 est retiré) ;
+//! * une température lisible laisse la vitesse réglée intacte, et sa garde
+//!   arrête toujours les analyses au-delà de 80 °C ;
 //! * une zone thermique FIGÉE (même valeur pendant longtemps : la zone ACPI de
-//!   beaucoup de cartes de bureau) ne vaut pas une mesure — repli aussi ;
+//!   beaucoup de cartes de bureau) ne vaut pas une mesure ;
 //! * la conversion des compteurs Windows (dixièmes de kelvin, kelvins).
 //!
-//! La lecture Windows elle-même (PDH) ne se teste pas ici : elle se compile
-//! pour `x86_64-pc-windows-msvc`, son comportement reste à mesurer sur une
-//! machine Windows.
+//! La lecture Windows elle-même (PDH, WMI) ne se teste pas ici : le choix
+//! entre ses sources est éprouvé avec des sources simulées
+//! (`thermal_sources_6450_tests.rs`).
 
 use std::time::{Duration, Instant};
 
 use super::{
-    LectureThermique, MotifIllisible, SuiviDeStabilite, brider_sans_thermometre,
+    LectureThermique, MotifIllisible, PAUSE_ABOVE_C, SuiviDeStabilite, ThermalGate, Verdict,
     celsius_depuis_dixiemes_de_kelvin, celsius_depuis_kelvins, largeur_selon_la_chaleur,
 };
 
+/// 🔴 #6450 — Windows 11, Ryzen 7 3800X : aucune zone thermique lisible, et
+/// les analyses passaient à UN fichier à la fois pour toujours. Une
+/// température illisible (aucun capteur ou zone figée) garde désormais la
+/// vitesse réglée.
 #[test]
-fn sans_temperature_lisible_les_analyses_passent_a_un_fichier() {
-    let illisible = LectureThermique::Illisible(MotifIllisible::AucunCapteur);
-    assert_eq!(brider_sans_thermometre(2, &illisible), 1, "normal (2) → 1");
-    assert_eq!(brider_sans_thermometre(4, &illisible), 1, "rapide (4) → 1");
-    assert_eq!(
-        brider_sans_thermometre(1, &illisible),
-        1,
-        "discret reste à 1"
-    );
-    let figee = LectureThermique::Illisible(MotifIllisible::Figee);
-    assert_eq!(
-        brider_sans_thermometre(4, &figee),
-        1,
-        "une zone figée bride aussi"
-    );
-}
-
-/// #6713 — le bridage levé par l'utilisateur rend la vitesse réglée quand la
-/// température est ILLISIBLE (aucun capteur ou zone figée), et seulement
-/// alors. Sans le réglage, c'est le bridage de #5410 (#6450).
-#[test]
-fn le_bridage_leve_rend_la_vitesse_reglee_sans_temperature_6713() {
+fn une_temperature_illisible_ne_bride_plus_les_analyses_6450() {
     for motif in [MotifIllisible::AucunCapteur, MotifIllisible::Figee] {
         let illisible = LectureThermique::Illisible(motif);
         assert_eq!(
-            largeur_selon_la_chaleur(4, &illisible, true),
+            largeur_selon_la_chaleur(4, &illisible),
             4,
-            "{motif:?}"
+            "{motif:?} : température illisible, la vitesse rapide (4) est bridée"
         );
         assert_eq!(
-            largeur_selon_la_chaleur(2, &illisible, true),
+            largeur_selon_la_chaleur(2, &illisible),
             2,
-            "{motif:?}"
+            "{motif:?} : température illisible, la vitesse normale (2) est bridée"
         );
-        assert_eq!(
-            largeur_selon_la_chaleur(0, &illisible, true),
-            1,
-            "jamais zéro"
-        );
-        assert_eq!(
-            largeur_selon_la_chaleur(4, &illisible, false),
-            1,
-            "{motif:?} : sans le réglage, le bridage par défaut reste"
-        );
+        assert_eq!(largeur_selon_la_chaleur(0, &illisible), 1, "jamais zéro");
     }
-    // Une température LUE ne dépend pas du réglage : la largeur réglée, et
-    // c'est la garde chaude (`ThermalGate`) qui arrête au-delà de 80 °C.
+}
+
+/// Une température LUE et trop haute arrête toujours les analyses : c'est la
+/// garde chaude, pas la largeur, qui les retient, et #6450 n'y touche pas.
+#[test]
+fn une_temperature_lue_trop_haute_arrete_toujours_les_analyses_6450() {
     let chaude = LectureThermique::Lisible(85.0);
-    assert_eq!(largeur_selon_la_chaleur(4, &chaude, true), 4);
-    assert_eq!(largeur_selon_la_chaleur(4, &chaude, false), 4);
+    assert_eq!(largeur_selon_la_chaleur(4, &chaude), 4);
+    let mut garde = ThermalGate::new();
+    assert!(
+        matches!(
+            garde.decide(chaude.celsius()),
+            Verdict::Hold { entering: true, .. }
+        ),
+        "85 °C lus : la garde doit suspendre (seuil {PAUSE_ABOVE_C} °C)"
+    );
+    // Et une température illisible ne suspend rien.
+    let mut garde = ThermalGate::new();
+    assert!(matches!(
+        garde.decide(LectureThermique::Illisible(MotifIllisible::AucunCapteur).celsius()),
+        Verdict::Go { temp_c: None, .. }
+    ));
 }
 
 #[test]
 fn une_temperature_lisible_laisse_la_vitesse_reglee() {
     let lisible = LectureThermique::Lisible(55.0);
-    assert_eq!(brider_sans_thermometre(2, &lisible), 2);
-    assert_eq!(brider_sans_thermometre(4, &lisible), 4);
-    assert_eq!(brider_sans_thermometre(1, &lisible), 1);
+    assert_eq!(largeur_selon_la_chaleur(2, &lisible), 2);
+    assert_eq!(largeur_selon_la_chaleur(4, &lisible), 4);
+    assert_eq!(largeur_selon_la_chaleur(1, &lisible), 1);
     // Jamais zéro, même sur une entrée dégénérée.
-    assert_eq!(brider_sans_thermometre(0, &lisible), 1);
+    assert_eq!(largeur_selon_la_chaleur(0, &lisible), 1);
 }
 
 #[test]
