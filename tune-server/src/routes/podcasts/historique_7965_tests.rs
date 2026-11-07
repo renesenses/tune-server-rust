@@ -166,6 +166,18 @@ async fn les_statistiques_d_ecoute_ignorent_la_station_7965() {
     let ds = appel(&app, "/dashboard/stats", None).await;
     let p = appel(&app, "/profiles/1/stats", None).await;
     assert_eq!(p["listening"]["total_listens"], 1, "{p}");
+    // Le résumé lit `listened_at < maintenant` à la seconde : une heure plus
+    // tôt, les deux lignes sont dans sa semaine.
+    let il_y_a_une_heure = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    state
+        .backend
+        .execute(
+            "UPDATE listen_history SET listened_at = ?",
+            &[&il_y_a_une_heure as &dyn tune_core::db::backend::ToSqlValue],
+        )
+        .unwrap();
     let r = tune_core::digest::generate_digest(&state.backend).unwrap();
     assert_eq!(r.total_plays, 1, "{r:?}");
 
