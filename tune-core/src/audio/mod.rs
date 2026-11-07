@@ -149,6 +149,8 @@ pub mod soft_mute;
 pub mod spectrogramme;
 pub mod staged_growth;
 pub mod support;
+/// #7614 — le côté hôte du greffon de suréchantillonnage.
+pub mod surechantillonnage;
 pub mod tap;
 pub mod tempo;
 /// CLAP text tower for natural-language acoustic search (Phase 3).

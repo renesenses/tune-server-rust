@@ -2234,6 +2234,59 @@ impl PlaybackOrchestrator {
     /// Config lives in the settings key `zone_{id}_crossfeed` as JSON
     /// `{ "enabled": bool, "amount": f32, "delay_ms": f32 }`. Values are clamped
     /// defensively (amount 0..0.5, delay_ms 0..5) mirroring the route validation.
+    /// #7614 — le choix du greffon de suréchantillonnage de la zone, licence
+    /// comprise (Premium, comme le crossfeed). `None` sous PURE. Sans
+    /// gestionnaire de licence (les tests), aucune garde de licence, comme
+    /// [`Self::crossfeed_configure_sous_licence`].
+    pub fn choix_du_surechantillonneur(
+        &self,
+        zone_id: i64,
+        pure: bool,
+    ) -> Option<crate::audio::surechantillonnage::ChoixSurechantillonnage> {
+        let premium = self
+            .license
+            .as_ref()
+            .is_none_or(|license| license.premium_snapshot());
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        match crate::audio::surechantillonnage::choix_de_la_zone(&settings, premium, pure, zone_id)
+        {
+            Ok(choix) => Some(choix),
+            Err(ecarte) => {
+                if ecarte != crate::audio::surechantillonnage::Ecarte::Desactive {
+                    tracing::info!(zone_id, reason = ecarte.code(), "upsampler_not_engaged");
+                }
+                None
+            }
+        }
+    }
+
+    /// #7614 — repose le choix du suréchantillonneur sur la sortie locale de
+    /// la zone après un changement de réglage. La piste en cours n'en est
+    /// pas affectée : la sortie le compare à la frontière suivante.
+    pub async fn refresh_zone_upsampler(&self, zone_id: i64) {
+        #[cfg(not(feature = "local-audio"))]
+        let _ = zone_id;
+        #[cfg(feature = "local-audio")]
+        {
+            let device_id = self.peripherique_de_la_zone(zone_id);
+            if !device_id.starts_with("local:") {
+                return;
+            }
+            let pure = self.zone_audiophile(zone_id);
+            let choix = self.choix_du_surechantillonneur(zone_id, pure);
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return;
+            };
+            let output = output_arc.lock().await;
+            if let Some(local) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            {
+                local.set_surechantillonnage(choix);
+            }
+        }
+    }
+
     pub(super) fn load_crossfeed_processor(
         &self,
         zone_id: i64,

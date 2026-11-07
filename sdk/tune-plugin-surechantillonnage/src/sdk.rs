@@ -45,6 +45,9 @@ pub struct UpsamplerSettings {
     pub filter: String,
     /// Ceiling on the output rate, in Hz; `None` = highest the sink accepts.
     pub max_rate_hz: Option<u32>,
+    /// Study § 7, « cadence cible » : ×2, ×4, ×8 or ×16 at most; `None` =
+    /// the highest the sink accepts (« maximum du périphérique »).
+    pub max_ratio: Option<u32>,
 }
 
 impl Default for UpsamplerSettings {
@@ -53,6 +56,7 @@ impl Default for UpsamplerSettings {
             enabled: false,
             filter: DEFAULT_FILTER.to_string(),
             max_rate_hz: None,
+            max_ratio: None,
         }
     }
 }
@@ -69,8 +73,102 @@ pub fn settings(s: &Settings) -> Result<UpsamplerSettings, Error> {
     if s.max_rate_hz.is_some_and(|r| !(1..=768_000).contains(&r)) {
         return Err(Error::InvalidSettings);
     }
+    if s.max_ratio.is_some_and(|r| !OFFERED_RATIOS.contains(&r)) {
+        return Err(Error::InvalidSettings);
+    }
     Ok(s)
 }
+
+/// The « cadence cible » choices of the study (§ 7), as integer ratios.
+pub const OFFERED_RATIOS: [u32; 4] = [2, 4, 8, 16];
+
+/// [`choose_rate`] with every ceiling the settings carry.
+pub fn choose_rate_for(input_rate: u32, accepted: &[u32], s: &UpsamplerSettings) -> Option<u32> {
+    let ratio_cap = s.max_ratio.and_then(|r| input_rate.checked_mul(r));
+    let cap = match (s.max_rate_hz, ratio_cap) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    choose_rate(input_rate, accepted, cap)
+}
+
+/// Worst-case gain of an `l`-phase interpolator built on `kernel`: the
+/// largest L1 norm among its phases, `max_p Σ_q |h[p + l·q]|`. No input
+/// bounded by 1 can produce an output above this value, and some input
+/// (the signs of the worst phase, reversed in time) reaches it.
+pub fn worst_case_gain(kernel: &[f64], l: usize) -> f64 {
+    if l == 0 {
+        return 1.0;
+    }
+    (0..l)
+        .map(|p| kernel.iter().skip(p).step_by(l).map(|c| c.abs()).sum::<f64>())
+        .fold(0.0, f64::max)
+}
+
+/// Safety factor between the exact L1 bound and the gain applied: it covers
+/// the f64 rounding of the dot product, so that `|out| ≤ max |in|` holds
+/// sample by sample (choice of Bertrand, 07/11: like the equalizer's Safe
+/// mode, no clipping is possible).
+const HEADROOM_SAFETY: f64 = 1.0 - 1e-9;
+
+/// The gain the stage applies for `filter` at integer ratio `ratio`:
+/// `1 / max(1, worst_case_gain)`. Never above 1: the upsampler never raises
+/// the level.
+pub fn headroom_gain(filter: &str, ratio: u32) -> Option<f64> {
+    if !OFFERED_FILTERS.contains(&filter) || !(2..=MAX_INTEGER_RATIO).contains(&ratio) {
+        return None;
+    }
+    let kernel = conception::par_id(filter)?.noyau(ratio as usize);
+    Some(headroom_from_kernel(&kernel, ratio as usize))
+}
+
+fn headroom_from_kernel(kernel: &[f64], l: usize) -> f64 {
+    HEADROOM_SAFETY / worst_case_gain(kernel, l).max(1.0)
+}
+
+/// [`headroom_gain`] in dB (≤ 0).
+pub fn headroom_db(filter: &str, ratio: u32) -> Option<f64> {
+    headroom_gain(filter, ratio).map(|g| 20.0 * g.log10())
+}
+
+/// The reference pair of the machine test (`machine::RAPPORTS`) whose
+/// admission covers an output rate: the cost per output frame of an integer
+/// polyphase is the kernel span whatever the ratio, so the pair with the
+/// same or the next higher output rate of the same family is the bound.
+pub fn machine_reference_pair(output_rate: u32) -> Option<(u32, u32)> {
+    if output_rate % 44_100 == 0 {
+        Some(if output_rate <= 352_800 {
+            (44_100, 352_800)
+        } else {
+            (44_100, 705_600)
+        })
+    } else if output_rate % 48_000 == 0 {
+        Some(if output_rate <= 384_000 {
+            (48_000, 384_000)
+        } else {
+            (48_000, 768_000)
+        })
+    } else {
+        None
+    }
+}
+
+/// The machine test of the offered filters, on the four integer pairs.
+pub fn machine_test(duration_s: f64, margin: f64) -> crate::machine::RapportMachine {
+    let conceptions: Vec<_> = OFFERED_FILTERS
+        .iter()
+        .filter_map(|id| conception::par_id(id))
+        .collect();
+    let pairs: Vec<(u32, u32)> = crate::machine::RAPPORTS
+        .iter()
+        .copied()
+        .filter(|(de, vers)| vers % de == 0)
+        .collect();
+    crate::machine::tester_la_machine_sur(&conceptions, &pairs, 2, duration_s, margin)
+}
+
+/// Admission margin of the study (§ 5): × 3 real time.
+pub const MACHINE_MARGIN: f64 = 3.0;
 
 /// The output rate chosen for `input_rate` among `accepted`, or `None`.
 pub fn choose_rate(input_rate: u32, accepted: &[u32], max_rate_hz: Option<u32>) -> Option<u32> {
@@ -107,7 +205,7 @@ impl RateChangerFactory for Upsampler {
         if !s.enabled || !matches!(input.encoding(), SampleEncoding::F32 | SampleEncoding::F64) {
             return Ok(None);
         }
-        Ok(choose_rate(input.sample_rate(), accepted, s.max_rate_hz))
+        Ok(choose_rate_for(input.sample_rate(), accepted, &s))
     }
 
     fn prepare(&self, request: RateRequest, s: &Settings) -> Result<Box<dyn RateChanger>, Error> {
@@ -125,6 +223,9 @@ pub struct Instance {
     ratio: usize,
     channels: usize,
     latency: u32,
+    /// [`headroom_gain`], fixed for the life of the instance: the level
+    /// never moves within a stream.
+    gain: f64,
     input_f64: Vec<f64>,
     output_f64: Vec<f64>,
     /// Output frames still owed by `drain`.
@@ -159,6 +260,7 @@ impl Instance {
             .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
             .map_or(0, |(i, _)| i);
         let latency = u32::try_from(peak).map_err(|_| Error::UnsupportedFormat)?;
+        let gain = headroom_from_kernel(engine.noyau_etage1(), ratio);
         let max_in = request.max_input_frames;
         Ok(Self {
             conception,
@@ -166,6 +268,7 @@ impl Instance {
             ratio,
             channels,
             latency,
+            gain,
             input_f64: vec![0.0; max_in * channels],
             output_f64: Vec::with_capacity(max_in * ratio * channels),
             tail_left: u64::from(latency),
@@ -179,16 +282,26 @@ impl Instance {
         self.conception.id
     }
 
+    /// The constant gain applied to every output sample (≤ 1).
+    pub fn gain(&self) -> f64 {
+        self.gain
+    }
+
     fn write_out(&self, from: usize, frames: usize, output: &mut AudioBlock<'_>) {
         let ch = self.channels;
         let src = &self.output_f64[from * ch..(from + frames) * ch];
+        let g = self.gain;
         match output.samples_mut() {
             SamplesMut::F32(dst) => {
                 for (d, s) in dst[..frames * ch].iter_mut().zip(src) {
-                    *d = *s as f32;
+                    *d = (*s * g) as f32;
                 }
             }
-            SamplesMut::F64(dst) => dst[..frames * ch].copy_from_slice(src),
+            SamplesMut::F64(dst) => {
+                for (d, s) in dst[..frames * ch].iter_mut().zip(src) {
+                    *d = *s * g;
+                }
+            }
             _ => unreachable!("encoding checked in Instance::new"),
         }
     }
@@ -306,6 +419,7 @@ impl RateChanger for Instance {
             "to_hz": self.request.output_rate,
             "latency_output_frames": self.latency,
             "latency_ms": f64::from(self.latency) * 1000.0 / f64::from(self.request.output_rate),
+            "headroom_db": 20.0 * self.gain.log10(),
         })
     }
 }

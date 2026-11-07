@@ -395,9 +395,21 @@ pub(super) struct BackendCpal<'a> {
     device_gone: Arc<AtomicBool>,
     starvation: Arc<RingStarvation>,
     position_ms: &'a AtomicU64,
+    /// #7614 — la cadence ouverte POUR le greffon de suréchantillonnage,
+    /// quand il a négocié une cadence et que le flux s'y est ouvert.
+    cadence_du_surechantillonneur: Option<u32>,
 }
 
 impl BackendCpal<'_> {
+    /// #7614 — la cadence que ce flux a ouverte pour le suréchantillonneur.
+    /// `None` : le greffon ne tourne pas sur ce flux (désactivé, PURE, DoP,
+    /// cadences non mesurées, aucun multiple entier accepté, ou le flux
+    /// flottant n'a pas pu s'ouvrir à cette cadence).
+    pub(super) fn cadence_du_surechantillonneur(&self) -> Option<u32> {
+        self.cadence_du_surechantillonneur
+            .filter(|&c| c == self.sortie.cadence)
+    }
+
     /// #4953 — le périphérique a-t-il prouvé, à cette ouverture, qu'il suit
     /// la cadence de la source ? Vrai seulement quand sa liste de cadences est
     /// une MESURE (ALSA `hw:`, ASIO, CoreAudio, JACK — jamais un greffon qui
@@ -420,12 +432,44 @@ pub(super) fn suit_la_cadence_source(
     cadences_mesurees && source_sr != 0 && source_sr == ouverte_sr
 }
 
-impl<'a> BackendLocal<'a> for BackendCpal<'a> {
+/// #7614 — la cadence que le greffon de suréchantillonnage obtient de ce
+/// périphérique, sans cpal : `None` sans choix, en bit-perfect strict, ou
+/// quand la liste de cadences n'est pas une MESURE (WASAPI partagé, ALSA
+/// `default`) — une liste supposée ne prouve pas que le DAC tourne à la
+/// cadence demandée. `accepte(r)` interroge l'énumération pour `r`.
+pub(super) fn cadence_pour_le_surechantillonneur(
+    choix: Option<&crate::audio::surechantillonnage::ChoixSurechantillonnage>,
+    evidence: super::resolution::SampleRateEvidence,
+    strict_bitperfect: bool,
+    source_sr: u32,
+    accepte: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    let choix = choix?;
+    if strict_bitperfect || !evidence.is_measured() || source_sr == 0 {
+        return None;
+    }
+    let acceptees: Vec<u32> = crate::audio::surechantillonnage::CADENCES_CANDIDATES
+        .iter()
+        .copied()
+        .filter(|&r| r > source_sr && r % source_sr == 0 && accepte(r))
+        .collect();
+    choix.negocier(source_sr, &acceptees)
+}
+
+impl<'a> BackendCpal<'a> {
     /// La cascade d'ouverture du chemin partagé, telle qu'elle vivait dans
     /// `play_url` : résolution du périphérique, décision de cadence, flux f32
     /// à la cadence choisie, repli à la cadence source, puis i32 et i16 aux
     /// deux cadences. Le premier format accepté gagne.
-    fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
+    ///
+    /// [`BackendLocal::ouvrir`], plus le choix du greffon de
+    /// suréchantillonnage (#7614) : quand il négocie une cadence MESURÉE
+    /// acceptée, le flux s'ouvre à cette cadence au lieu de celle que
+    /// `decide_local_rate_opening` aurait retenue.
+    pub(super) fn ouvrir_pour_le_surechantillonneur(
+        demande: &DemandeDOuverture<'a>,
+        surechantillonnage: Option<&crate::audio::surechantillonnage::ChoixSurechantillonnage>,
+    ) -> Result<Self, RefusDOuverture> {
         let device_name = demande.device_name.to_string();
         let sample_rate = demande.spec.cadence();
         let channels = demande.spec.canaux();
@@ -492,7 +536,8 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
         // #4953 — la liste de cadences de CE périphérique est-elle une mesure ?
         // Retenu hors du bloc de décision, comme `pcm_ouvert`.
         let cadences_mesurees: bool;
-        let output_config = {
+        let mut cadence_du_surechantillonneur: Option<u32> = None;
+        let output_config = 'decision: {
             // First, get the device's default config (reflects actual
             // operating rate on most platforms).
             let default_cfg = match device.default_output_config() {
@@ -547,6 +592,43 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             let rate_evidence =
                 sample_rate_evidence_for_device(host_id_name, &opened_endpoint_id, true);
             cadences_mesurees = rate_evidence.is_measured();
+            // #7614 — le greffon de suréchantillonnage a négocié une cadence
+            // que la liste MESURÉE du périphérique accepte : le flux s'ouvre
+            // à cette cadence, c'est lui qui la porte (rubato ne tourne pas).
+            let pour_le_greffon = cadence_pour_le_surechantillonneur(
+                surechantillonnage,
+                rate_evidence,
+                demande.strict_bitperfect,
+                sample_rate,
+                |r| find_matching_config(&device, channels, r).is_some_and(|c| c.sample_rate == r),
+            )
+            .and_then(|r| {
+                find_matching_config(&device, channels, r)
+                    .filter(|c| c.sample_rate == r)
+                    .map(|c| (r, c))
+            });
+            if let Some((cible, cfg)) = pour_le_greffon {
+                info!(
+                    source_sr = sample_rate,
+                    upsampler_sr = cible,
+                    backend = %host_id_name,
+                    endpoint_id = %opened_endpoint_id,
+                    "local_audio_open_at_upsampler_rate"
+                );
+                #[cfg(target_os = "macos")]
+                super::cadence_du_flux_compresse::caler_la_cadence_nominale_coreaudio(
+                    &device_name,
+                    cible,
+                );
+                note_rate_decision(ObservedRate {
+                    source_sample_rate: sample_rate,
+                    opened_sample_rate: cible,
+                    reason: None,
+                    evidence_measured: true,
+                });
+                cadence_du_surechantillonneur = Some(cible);
+                break 'decision cfg;
+            }
             let decision = decide_local_rate_opening(
                 sample_rate,
                 default_sr,
@@ -980,7 +1062,14 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             device_gone,
             starvation,
             position_ms: demande.position_ms,
+            cadence_du_surechantillonneur,
         })
+    }
+}
+
+impl<'a> BackendLocal<'a> for BackendCpal<'a> {
+    fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
+        Self::ouvrir_pour_le_surechantillonneur(demande, None)
     }
 
     fn nom(&self) -> &'static str {

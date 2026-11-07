@@ -2293,6 +2293,13 @@ impl PlaybackOrchestrator {
                     // stream sample rate so the delay line matches the DAC clock.
                     let cf_sr = media.sample_rate.unwrap_or(44100);
                     local_output.set_crossfeed(self.load_crossfeed_processor(zone_id, cf_sr));
+                    // #7614 — le greffon de suréchantillonnage de la zone :
+                    // `None` sous PURE, sans Premium, sans greffon installé,
+                    // désactivé (défaut) ou sans test de la machine. La sortie
+                    // le lit à l'ouverture de CETTE piste, jamais pendant.
+                    local_output.set_surechantillonnage(
+                        self.choix_du_surechantillonneur(zone_id, zone_audiophile),
+                    );
                     // Zone equalizer, applied by the output itself for a local
                     // DAC — exactly like the crossfeed above, and for the same
                     // reason: a local zone never goes through

@@ -202,6 +202,7 @@ impl Dsp {
             spec,
             sortie: FormatOuvert::new(spec.cadence(), spec.canaux()),
             needs_resample: false,
+            surechantillonneur: None,
         }
     }
 }

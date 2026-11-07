@@ -26,6 +26,8 @@ pub mod declick;
 mod premium_audio_host;
 /// #6044 — le greffon « Réaffectation des canaux » (`/channel-remap`).
 pub mod reaffectation_canaux;
+/// #7614 — le greffon de suréchantillonnage (`/upsampler`).
+pub mod upsampler;
 pub use tune_streaming_http::deezer_proxy_handler;
 pub mod developer_api;
 pub mod devialet_air;
@@ -563,6 +565,8 @@ pub fn router_with_plugins(
         .nest("/crossfeed", crossfeed::router())
         // #6044 — réaffectation des canaux : préréglages, réglage de zone, règle d'album.
         .nest("/channel-remap", reaffectation_canaux::router())
+        // #7614 — suréchantillonnage : catalogue, test de la machine, réglage de zone.
+        .nest("/upsampler", upsampler::router())
         // #6171 — canaux de la carte d'une zone ASIO.
         .nest("/output-channels", canaux_de_carte::router())
         .nest("/siri", siri::router())
@@ -1084,6 +1088,9 @@ mod eq_refresh_guard {
         ("_crossfeed", "refresh_zone_crossfeed"),
         ("_audiophile", "apply_audiophile_change"),
         ("_mono_downmix", "refresh_zone_mono_downmix"),
+        // #7614 — le choix du suréchantillonneur ; la sortie ne l'applique
+        // qu'à la frontière de piste suivante, mais elle doit le recevoir.
+        ("_upsampler", "refresh_zone_upsampler"),
     ];
 
     /// REF-T (#2219) : un module de test sorti de son fichier en module enfant

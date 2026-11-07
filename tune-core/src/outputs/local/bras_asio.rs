@@ -866,6 +866,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
                     spec,
                     sortie: FormatOuvert::new(sample_rate, voies_de_l_etage),
                     needs_resample: false,
+                    surechantillonneur: None,
                 },
                 &transformations_reelles,
             ),
