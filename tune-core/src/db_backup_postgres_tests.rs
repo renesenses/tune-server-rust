@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::*;
 
@@ -164,6 +165,91 @@ fn elagage_garde_cinq_dumps_et_ne_touche_pas_aux_sauvegardes_sqlite_7288() {
     assert_eq!(liste[0].filename, info.filename, "la plus récente en tête");
     assert!(backups.join("tune_20200101_000000.db").exists());
     assert!(!backups.join("tune_pg_20200100_000000.dump").exists());
+}
+
+#[test]
+fn mot_de_passe_en_parametre_retire_de_l_url_7288() {
+    let (sans, mdp) = separer_mot_de_passe(
+        "postgres://tune@db.example/tune?sslmode=require&password=p%26ss&connect_timeout=5",
+    );
+    assert_eq!(
+        sans,
+        "postgres://tune@db.example/tune?sslmode=require&connect_timeout=5"
+    );
+    assert_eq!(mdp.as_deref(), Some("p&ss"));
+
+    let (sans, mdp) = separer_mot_de_passe("postgres://tune@db.example/tune?password=seul");
+    assert_eq!(sans, "postgres://tune@db.example/tune");
+    assert_eq!(mdp.as_deref(), Some("seul"));
+}
+
+#[cfg(unix)]
+#[test]
+fn pg_dump_bloque_est_arrete_au_delai_sans_laisser_de_fichier_7288() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backups = tmp.path().join("backups");
+    let pg_dump = faux_pg_dump(
+        tmp.path(),
+        r#"while [ $# -gt 0 ]; do
+  if [ "$1" = "--file" ]; then shift; printf 'debut' > "$1"; fi
+  shift
+done
+exec sleep 30"#,
+    );
+
+    let debut = std::time::Instant::now();
+    let err = create_pg_backup_avec_delai(URL, &backups, &pg_dump, Duration::from_millis(300))
+        .unwrap_err();
+
+    assert!(
+        debut.elapsed() < Duration::from_secs(10),
+        "pg_dump bloqué doit être arrêté au délai, pas attendu : {:?}",
+        debut.elapsed()
+    );
+    assert_eq!(err.code(), "pg_dump_timeout");
+    assert!(err.to_string().contains(VARIABLE_DELAI_PG_DUMP), "{err}");
+    assert!(
+        noms(&backups).is_empty(),
+        "le .partial d'un pg_dump arrêté doit être retiré : {:?}",
+        noms(&backups)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pg_dump_sans_droit_d_execution_le_dit_7288() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backups = tmp.path().join("backups");
+    let script = faux_pg_dump(tmp.path(), "exit 0");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let err = create_pg_backup(URL, &backups, &script).unwrap_err();
+
+    assert_eq!(err.code(), "pg_dump_not_executable", "{err}");
+    assert!(err.to_string().contains("permission denied"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn deux_sauvegardes_dans_la_meme_seconde_gardent_deux_fichiers_7288() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backups = tmp.path().join("backups");
+    let journal = tmp.path().join("journal.txt");
+    let pg_dump = faux_pg_dump_qui_reussit(tmp.path(), &journal);
+
+    let mut fichiers = Vec::new();
+    for _ in 0..3 {
+        fichiers.push(create_pg_backup(URL, &backups, &pg_dump).unwrap().filename);
+    }
+
+    let mut distincts = fichiers.clone();
+    distincts.sort();
+    distincts.dedup();
+    assert_eq!(distincts.len(), 3, "noms en collision : {fichiers:?}");
+    assert_eq!(list_pg_backups(&backups).len(), 3, "{:?}", noms(&backups));
 }
 
 /// Le vrai `pg_dump` contre une vraie base : le fichier produit est un dump
