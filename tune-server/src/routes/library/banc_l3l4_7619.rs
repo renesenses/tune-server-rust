@@ -47,10 +47,10 @@ const BIBLIO6: &str = "genre,year,format,label,composer,artist";
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "banc manuel sur une copie de base, --release"]
 async fn banc_l3l4_7619() {
-    let Ok(chemin) = std::env::var("TUNE_BANC_DB") else {
-        eprintln!("TUNE_BANC_DB absent : banc sauté");
-        return;
-    };
+    // Banc manuel (`#[ignore]`) : sans copie désignée, il échoue au lieu de
+    // passer pour vert (garde #2816 des témoins sous variable).
+    let chemin = std::env::var("TUNE_BANC_DB")
+        .expect("TUNE_BANC_DB : chemin d'une COPIE de base, jamais la production");
     let state = AppState::new(&chemin, 0, Default::default()).unwrap();
     let app = crate::routes::router(state.clone());
     let p = "/api/v1";

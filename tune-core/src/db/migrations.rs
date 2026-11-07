@@ -10615,11 +10615,18 @@ mod tests_playlist_titres_de_service_4889 {
         assert_eq!(
             objets(&db, "trigger"),
             vec![
+                // #7619 (L4) — la révision de la bibliothèque suit aussi
+                // `playlist_tracks` : la passe de démarrage les repose
+                // après la reconstruction de la table.
+                "library_revision_playlist_tracks_del".to_string(),
+                "library_revision_playlist_tracks_ins".to_string(),
+                "library_revision_playlist_tracks_upd".to_string(),
                 "upnp_revision_playlist_tracks_delete".to_string(),
                 "upnp_revision_playlist_tracks_insert".to_string(),
                 "upnp_revision_playlist_tracks_update".to_string()
             ],
-            "les déclencheurs du compteur UPnP (#4201) sont reposés"
+            "les déclencheurs du compteur UPnP (#4201) et de la révision \
+             de la bibliothèque (#7619) sont reposés"
         );
 
         let conn = db.connection().lock().unwrap();

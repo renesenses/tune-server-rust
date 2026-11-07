@@ -294,20 +294,25 @@ fn la_recherche_ne_parcourt_plus_la_table_des_pistes() {
 #[test]
 #[ignore = "banc manuel sur une copie de base, --release"]
 fn banc_recherche_7619_sur_copie() {
-    use std::time::Instant;
-    let Ok(chemin) = std::env::var("TUNE_BANC_DB") else {
-        eprintln!("TUNE_BANC_DB absent : banc sauté");
-        return;
-    };
+    // Banc manuel (`#[ignore]`) : sans copie désignée, il échoue au lieu de
+    // passer pour vert (garde #2816 des témoins sous variable).
+    let chemin = std::env::var("TUNE_BANC_DB")
+        .expect("TUNE_BANC_DB : chemin d'une COPIE de base, jamais la production");
     let db = SqliteDb::open(&chemin).expect("copie de base");
-    // `TUNE_BANC_INIT=1` : base NEUVE (synthétique), schéma posé puis arrêt.
-    if std::env::var("TUNE_BANC_INIT").is_ok() {
+    // `TUNE_BANC_INIT=1` : base NEUVE (synthétique), schéma posé, rien mesuré.
+    let neuve = std::env::var("TUNE_BANC_INIT").is_ok();
+    if neuve {
         db.init_schema().unwrap();
-        crate::db::migrations::run_migrations(&db).unwrap();
-        return;
     }
     crate::db::migrations::run_migrations(&db).unwrap();
-    let db = Arc::new(db);
+    if !neuve {
+        mesurer_la_recherche_7619(Arc::new(db));
+    }
+}
+
+/// Le corps du banc ci-dessus : la base est migrée.
+fn mesurer_la_recherche_7619(db: Arc<SqliteDb>) {
+    use std::time::Instant;
     let repo = TrackRepo::with_backend(db.clone());
     let albums = AlbumRepo::with_backend(db.clone());
     let artistes = ArtistRepo::with_backend(db.clone());
