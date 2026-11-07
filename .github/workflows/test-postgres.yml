@@ -229,6 +229,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7856 -- --nocapture --test-threads=1
 
+      # #7979 — un nom d'artiste corrigé dans les balises (accents ajoutés)
+      # reprend la fiche, sans osciller ; un nom différent (espace ajouté)
+      # obtient la sienne. Sans cette étape, l'épreuve prendrait son saut
+      # annoncé.
+      - name: Nom d'artiste corrigé dans les balises sur PostgreSQL (#7979)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7979 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -979,3 +988,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_5341 -- --nocapture --test-threads=1
+
+      # #7983 — la passe « Enrichir les métadonnées » reprend où elle en était :
+      # trace des tentatives notée (ON CONFLICT), pistes faites, introuvables
+      # et 503 en attente écartées, 503 au délai écoulé en queue et hors des
+      # restantes, fichier modifié de nouveau candidat. Dans un schéma à elle ;
+      # sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Reprise de l'enrichissement sur PostgreSQL (#7983)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_7983 -- --nocapture --test-threads=1

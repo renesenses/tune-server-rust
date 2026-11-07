@@ -692,7 +692,10 @@ async fn le_cretemetre_suit_le_gain_de_la_sortie() {
     // La même fenêtre, avec la sortie qui atténue de 6 dB (préampli −6 dB à
     // volume plein, ou volume à 50 % : c'est le MÊME facteur, celui que les
     // rappels de rendu multiplient).
-    let gain = Arc::new(AtomicU32::new(500));
+    // #7968 — l'`Arc` partagé est dans l'unité de la sortie locale.
+    let gain = Arc::new(AtomicU32::new(
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 2,
+    ));
     let (attenue_db, attenue_over, attenue_gain_db) = mesurer(987_661, Some(gain.clone())).await;
     assert!(
         (attenue_db - (-6.02)).abs() < 0.2,
@@ -709,7 +712,10 @@ async fn le_cretemetre_suit_le_gain_de_la_sortie() {
 
     // Et il se lit à chaque fenêtre, pas au spawn : bouger le curseur en cours
     // de piste déplace l'aiguille sans attendre la piste suivante.
-    gain.store(1000, Ordering::SeqCst);
+    gain.store(
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+        Ordering::SeqCst,
+    );
     let (rendu_db, rendu_over, rendu_gain_db) = mesurer(987_662, Some(gain)).await;
     assert!(
         rendu_db > -0.1,
@@ -774,7 +780,10 @@ async fn les_niveaux_disent_le_gain_demande_et_le_rabot_a_l_unite_4384() {
         }
     }
     let demande = |volume: u32, facteur: u32, dop: bool| crate::playback::GainDemande {
-        volume_utilisateur: Arc::new(AtomicU32::new(volume)),
+        // #7968 — `volume` en millièmes ici, l'`Arc` dans l'unité de la sortie.
+        volume_utilisateur: Arc::new(AtomicU32::new(
+            volume * (crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 1000),
+        )),
         facteur_de_rendu: Arc::new(AtomicU32::new(facteur)),
         dop: Arc::new(AtomicBool::new(dop)),
     };
@@ -6466,7 +6475,8 @@ async fn gain_de_la_sortie_recreee(volume: f64, fixe: bool, trim_db: &str) -> u3
 #[cfg(feature = "local-audio")]
 #[tokio::test]
 async fn la_sortie_locale_recreee_nait_au_volume_de_la_zone_trim_compris() {
-    let gain = gain_de_la_sortie_recreee(30.0, false, "-6").await as f64 / 1000.0;
+    let gain = gain_de_la_sortie_recreee(30.0, false, "-6").await as f64
+        / f64::from(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU);
     let attendu = super::volume_avec_trim(0.30, -6.0);
     assert!(
         (gain - attendu).abs() < 2e-3,
@@ -6483,11 +6493,12 @@ async fn la_sortie_locale_recreee_nait_au_volume_de_la_zone_trim_compris() {
 async fn la_sortie_locale_recreee_respecte_volume_fixe_et_plafond() {
     assert_eq!(
         gain_de_la_sortie_recreee(20.0, true, "-6").await,
-        1000,
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
         "zone « Volume fixe » recréée hors de la pleine échelle"
     );
     assert!(
-        gain_de_la_sortie_recreee(95.0, false, "12").await <= 1000,
+        gain_de_la_sortie_recreee(95.0, false, "12").await
+            <= crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
         "trim positif : plafond de l'unité franchi à la recréation"
     );
 }

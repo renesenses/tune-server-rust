@@ -22,6 +22,8 @@ pub mod dossiers_des_collections;
 pub mod ecoutes_importees;
 pub mod edition_album;
 pub mod engine;
+/// #7983 — la trace des tentatives de la passe d'enrichissement des métadonnées.
+pub mod enrich_tentatives;
 pub mod facet_filter;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
@@ -109,6 +111,9 @@ mod album_dr_provenance_tests;
 mod ecrivains_pendant_un_lot_de_scan_tests;
 #[cfg(test)]
 mod filtre_dr_190_tests;
+/// #7979 — la graphie accentuée des balises reprend la fiche artiste.
+#[cfg(test)]
+mod graphie_artiste_tests_7979;
 #[cfg(test)]
 mod lenteur_albums_4800_tests;
 #[cfg(test)]

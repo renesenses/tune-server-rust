@@ -109,8 +109,8 @@ struct Zone {
 impl Zone {
     fn au_repos() -> Self {
         Self {
-            volume: AtomicU32::new(1000),
-            user_volume: AtomicU32::new(1000),
+            volume: AtomicU32::new(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU),
+            user_volume: AtomicU32::new(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU),
             rg_factor: AtomicU32::new(1000),
             eq: std::sync::Mutex::new(None),
             convolver: std::sync::Mutex::new(None),
