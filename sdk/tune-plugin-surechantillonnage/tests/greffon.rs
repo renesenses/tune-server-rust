@@ -221,7 +221,14 @@ fn worst_case_full_scale_input_never_exceeds_full_scale() {
         let g = worst_case_gain(&kernel, l);
         let worst_phase = (0..l)
             .max_by(|&a, &b| {
-                let s = |p: usize| kernel.iter().skip(p).step_by(l).map(|c| c.abs()).sum::<f64>();
+                let s = |p: usize| {
+                    kernel
+                        .iter()
+                        .skip(p)
+                        .step_by(l)
+                        .map(|c| c.abs())
+                        .sum::<f64>()
+                };
                 s(a).total_cmp(&s(b))
             })
             .unwrap();
@@ -300,7 +307,10 @@ fn images_of_an_in_band_sine_are_rejected() {
         };
         let fundamental = level(1000.0);
         for k in 1..=4u32 {
-            for f in [f64::from(k) * 44_100.0 - 1000.0, f64::from(k) * 44_100.0 + 1000.0] {
+            for f in [
+                f64::from(k) * 44_100.0 - 1000.0,
+                f64::from(k) * 44_100.0 + 1000.0,
+            ] {
                 let rel = 20.0 * (level(f) / fundamental).log10();
                 assert!(
                     rel < limit_db,

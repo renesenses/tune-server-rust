@@ -101,7 +101,14 @@ pub fn worst_case_gain(kernel: &[f64], l: usize) -> f64 {
         return 1.0;
     }
     (0..l)
-        .map(|p| kernel.iter().skip(p).step_by(l).map(|c| c.abs()).sum::<f64>())
+        .map(|p| {
+            kernel
+                .iter()
+                .skip(p)
+                .step_by(l)
+                .map(|c| c.abs())
+                .sum::<f64>()
+        })
         .fold(0.0, f64::max)
 }
 
