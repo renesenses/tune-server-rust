@@ -169,8 +169,9 @@ impl GainAuRendu {
 
 /// Les unités de volume (`UNITE`, #7968) en gain, bornées à `[0, 1]` :
 /// jamais plus fort que la pleine échelle, quel que soit ce qui est stocké.
+/// La conversion commune à tous les rappels de rendu.
 fn gain_de(volume_units: u32) -> f64 {
-    f64::from(volume_units.min(UNITE)) / f64::from(UNITE)
+    crate::audio::volume_scale::gain_des_unites(volume_units)
 }
 
 /// Pondère un mot aligné à gauche à sa profondeur déclarée : le mot utile est
@@ -448,7 +449,8 @@ mod tests {
     /// #7762 — témoin (vert avant comme après) : 50 % du curseur `db60`
     /// d'une sortie locale (gain 0,0316, −30 dB) est rendu par le fil WASAPI
     /// UNE fois — le mot sort à −30 dB, pas à −60 dB (gain appliqué deux
-    /// fois) ni à −6 dB (position prise pour un gain). Même conversion que `set_volume` et `effective_volume_units`.
+    /// fois) ni à −6 dB (position prise pour un gain). Même conversion que
+    /// `set_volume` et `effective_volume_units`.
     #[test]
     fn cinquante_pour_cent_du_curseur_db60_sont_rendus_une_seule_fois_a_moins_30_db_7762() {
         let gain = crate::audio::volume_scale::gain_perceptif(0.5);
