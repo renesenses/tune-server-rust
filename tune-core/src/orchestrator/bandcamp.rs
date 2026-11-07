@@ -104,7 +104,7 @@ pub(super) const MIME_PAR_DEFAUT: &str = "audio/mpeg";
 /// manquait. [`guess_mime_from_url`] confondait « l'URL dit MP3 » et « l'URL
 /// ne dit rien », les deux rendant `"audio/mpeg"` ; un appelant qui sait autre
 /// chose sur la piste ne pouvait donc pas savoir s'il avait le droit de parler.
-pub(super) fn mime_depuis_l_extension(url: &str) -> Option<&'static str> {
+pub fn mime_depuis_l_extension(url: &str) -> Option<&'static str> {
     let lower = url.to_lowercase();
     let path = lower.split('?').next().unwrap_or(&lower);
     if path.ends_with(".mp3") {

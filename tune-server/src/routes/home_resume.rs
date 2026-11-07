@@ -52,6 +52,8 @@ pub(super) async fn resume_listening(
             cover_url: cover_url.clone(),
             duration_ms: Some((*duration_ms).max(0) as u64),
             seek_ms: Some(resumes::rewind(r.position_ms, seconds)),
+            // Sans type gardé, l'extension puis l'hébergeur le disent (#7894).
+            mime_type: None,
         };
         let response = super::super::podcasts::play_episode(
             State(state.clone()),
@@ -485,7 +487,7 @@ async fn complete_single_container(
                 source_id: bi,
                 ..
             },
-        ) => a == b && ai == bi,
+        ) => a == b && (ai == bi || meme_piste_bandcamp(a, ai, bi)),
         _ => false,
     };
     // Une playlist peut contenir deux fois le même titre : conserver le
@@ -500,6 +502,20 @@ async fn complete_single_container(
     r.position = position;
     Ok(())
 }
+
+/// #7778 — l'identifiant d'un titre Bandcamp est son URL de flux signée, dont
+/// `ts`, `t` et `token` changent à chaque lecture de la page (#4577) : deux
+/// signatures du même titre se reconnaissent à leur numéro de piste.
+fn meme_piste_bandcamp(source: &str, a: &str, b: &str) -> bool {
+    use tune_core::orchestrator::identifiant_de_piste_bandcamp;
+    source == "bandcamp"
+        && identifiant_de_piste_bandcamp(a)
+            .is_some_and(|id| identifiant_de_piste_bandcamp(b) == Some(id))
+}
+
+#[cfg(test)]
+#[path = "home_resume_bandcamp_7778_tests.rs"]
+mod bandcamp_7778_tests;
 
 #[cfg(test)]
 mod config_tests {

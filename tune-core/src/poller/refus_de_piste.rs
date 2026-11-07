@@ -45,6 +45,11 @@
 /// marque qu'il pose lui-même : jamais d'une panne.
 const MOTIFS_PROPRES_A_LA_PISTE: [&str; 2] = ["no url", crate::source_url::MOTIF_PISTE_REFUSEE];
 
+/// #7778 (points 3 et 4) — ce que l'auditeur lit à la place du motif brut
+/// (« no url ») quand le service refuse cette piste seule.
+pub const MESSAGE_TITRE_INDISPONIBLE: &str =
+    "ce titre n'est pas disponible à la lecture chez le service (droits, région ou abonnement)";
+
 /// Ce refus ne vise-t-il QUE cette piste ?
 ///
 /// Comparaison en minuscules et par inclusion : le motif remonte enveloppé

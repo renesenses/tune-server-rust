@@ -20,6 +20,9 @@ mod seek_en_double_193_tests;
 mod session_locale_tests;
 #[path = "playback/session_message.rs"]
 mod session_message;
+#[cfg(test)]
+#[path = "playback/titre_indisponible_7778_tests.rs"]
+mod titre_indisponible_7778_tests;
 // #6332 — le débit d'une piste locale dans l'état de zone.
 #[cfg(test)]
 #[path = "playback/debit_lecture_en_cours_6332_tests.rs"]
@@ -295,6 +298,21 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
                 "error": code_cadence,
                 "code": code_cadence,
                 "message": motif,
+            })),
+        )
+            .into_response();
+    }
+    // #7778 (point 3) — le service refuse CETTE piste (`no url` de Qobuz :
+    // aucune adresse de flux pour ce compte, cette région). 422 au code
+    // stable, phrase traduite : sans cette branche, « no url » ne contenait
+    // aucun mot du fourre-tout ci-dessous et finissait en 500 brut.
+    if tune_core::poller::refus_propre_a_la_piste(&e) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "track_unavailable",
+                "code": "track_unavailable",
+                "message": crate::i18n::t(lang, "playback.track_unavailable"),
             })),
         )
             .into_response();
@@ -3820,13 +3838,37 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
-        .pause(zone_id, device_id.as_deref())
+        .pause_avec_issue(zone_id, device_id.as_deref())
         .await
     {
-        Ok(()) => Json(build_zone_json(&state, zone_id).await).into_response(),
+        Ok(tune_core::orchestrator::IssueDePause::EnPause) => {
+            Json(build_zone_json(&state, zone_id).await).into_response()
+        }
+        // #7894 — l'appareil ne jouait rien : la zone est arrêtée (reprise
+        // possible), et on le dit au lieu d'un 502.
+        Ok(tune_core::orchestrator::IssueDePause::RienNeJouait) => {
+            let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .map(|z| z.name)
+                .unwrap_or_else(|| format!("#{zone_id}"));
+            let mut corps = build_zone_json(&state, zone_id).await;
+            corps["code"] = json!("nothing_playing_on_device");
+            Json(crate::message_api::avec_message(
+                corps,
+                "api.playback.nothingPlayingOnDevice",
+                &[("zone", zone)],
+            ))
+            .into_response()
+        }
         Err(error) => echec_de_sortie_7823::reponse_d_echec_de_zone(&state, zone_id, error),
     }
 }
+
+#[cfg(test)]
+#[path = "playback/pause_sans_media_7894_tests.rs"]
+mod pause_sans_media_7894_tests;
 
 async fn resume(
     State(state): State<AppState>,
@@ -3868,7 +3910,14 @@ async fn resume(
             temp_file_path: None,
             sample_rate: None,
             bit_depth: None,
-            media_format: None,
+            // #7894 — un épisode garde le type retenu à son lancement : sous
+            // une adresse sans extension, l'orchestrateur ne saurait que
+            // l'annoncer MP3, et l'appareil retomberait en silence.
+            media_format: if np.source == "podcast" {
+                np.format.clone()
+            } else {
+                None
+            },
             track_number: None,
             disc_number: None,
             album_ref: None,

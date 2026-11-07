@@ -801,7 +801,7 @@ fn poser_le_contrat_dlna(
 ///
 /// La trace est posée d'abord : elle vaut indépendamment de la cause, et sans
 /// elle le prochain relevé serait aussi muet que celui-ci.
-pub(super) async fn stream_track_audio(
+pub(crate) async fn stream_track_audio(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     req_headers: HeaderMap,
