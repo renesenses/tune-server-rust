@@ -1026,6 +1026,12 @@ path = "tests/dispositions_de_canaux_3322.rs"
 name = "sante_slimproto_i3462"
 path = "tests/sante_slimproto_i3462.rs"
 
+# #7374 — le reglage « Serveur Squeezebox de Tune » ouvre et rend 3483 TCP/UDP
+# et 9090 sans redemarrage. Cible separee : etats d'ecoute et ports globaux.
+[[test]]
+name = "serveur_squeezebox_reglage_7374"
+path = "tests/serveur_squeezebox_reglage_7374.rs"
+
 # #4361 — le pont de commande LMS face a un port deja pris (Cockpit sur Tune OS
 # Fedora). Cible separee pour deux raisons : `cli_server::etat_ecoute()` est un
 # etat global au processus, et ce banc ecrit `TUNE_CLI_PORT` pour interroger
