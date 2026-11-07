@@ -1126,10 +1126,9 @@ fn ecrire_album_avec(
     // lecture des balises peut alors deviner l'artiste d'après le nom du
     // dossier). Avec les mêmes réserves que le titre : album disposé, coffret
     // automatique, artiste tenu à la main (`realigner_sur_les_balises`). Ni
-    // sur un album de
-    // parution ou un coffret déjà occupé : une seule feuille n'y décrit pas
-    // l'album entier, et deux disques d'interprètes différents le feraient
-    // osciller d'une analyse à l'autre.
+    // sur un album de parution ou un coffret déjà occupé : une seule feuille
+    // n'y décrit pas l'album entier, et deux disques d'interprètes différents
+    // le feraient osciller d'une analyse à l'autre.
     let artiste_de_la_feuille = artist_id.filter(|_| la_feuille_nomme_l_interprete);
     if let (Some(id), Some(artiste_feuille)) = (ligne_album, artiste_de_la_feuille)
         && ligne.artist_id != Some(artiste_feuille)

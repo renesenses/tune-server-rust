@@ -128,3 +128,48 @@ fn cue_7979_une_feuille_sans_interprete_ne_touche_pas_l_album() {
     inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
     assert_eq!(noms(&db).0, "Biréli Lagrène");
 }
+
+/// Un artiste d'album corrigé à la main (C3) reste tel quel quand la feuille
+/// relue nomme un autre interprète : le réalignement passe par
+/// `realigner_sur_les_balises`, qui respecte l'édition manuelle. Les pistes,
+/// elles, prennent le nom de la feuille.
+#[test]
+fn cue_7979_un_artiste_tenu_a_la_main_reste() {
+    let d = tempfile::TempDir::new().unwrap();
+    let dossier = d.path().join("Lagrene - Gipsy Project");
+    fs::create_dir_all(&dossier).unwrap();
+    ecrire_wav(&dossier.join("image.wav"), 4_000);
+    let db = base();
+    fs::write(dossier.join("album.cue"), feuille("BireliLagrene")).unwrap();
+    inventorier_et_ecrire(
+        db.clone(),
+        std::slice::from_ref(&dossier),
+        &racines(d.path()),
+    );
+    let album_id = db
+        .query_one("SELECT id FROM albums", &[])
+        .unwrap()
+        .expect("un album")[0]
+        .as_i64()
+        .unwrap();
+    // `album_metadata` naît d'une migration (v68), pas du schéma de base :
+    // la base d'épreuve ne l'a pas, une base réelle l'a toujours.
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS album_metadata (album_id INTEGER NOT NULL, \
+         key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (album_id, key))",
+        &[],
+    )
+    .unwrap();
+    crate::db::album_metadata_repo::AlbumMetadataRepo::with_backend(db.clone())
+        .marquer_edition_manuelle(album_id, &["artist"])
+        .unwrap();
+
+    fs::write(dossier.join("album.cue"), feuille("Bireli Lagrene")).unwrap();
+    inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
+    let (album, pistes) = noms(&db);
+    assert_eq!(pistes, vec!["Bireli Lagrene".to_string()]);
+    assert_eq!(
+        album, "BireliLagrene",
+        "#7979 : la relecture de la feuille a écrasé un artiste d'album corrigé à la main"
+    );
+}
