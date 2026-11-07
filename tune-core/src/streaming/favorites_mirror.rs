@@ -1021,6 +1021,8 @@ pub async fn rafraichir(
         ("albums", "album"),
         ("artists", "artist"),
     ] {
+        // Tenu pendant toute la pagination de CE type (jusqu'à 100 pages),
+        // puis relâché : une écriture en attente passe entre deux types.
         let svc = arc.read().await;
         lectures.push((
             item_type,

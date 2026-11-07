@@ -1890,14 +1890,49 @@ fn poser_le_tri(mut donnees: Value, q: &TriQuery) -> Value {
     donnees
 }
 
-/// #7729 — attente maximale de la route des favoris : verrous du registre et
-/// du service, puis lecture chez le service. Au-delà, la route répond 503
-/// avec un motif au lieu de laisser l'écran sur « Chargement… ».
+/// #7729 — attente maximale de la route des favoris pour les VERROUS : celui
+/// du registre des services, puis celui du service. Au-delà, la route répond
+/// 503 avec un motif au lieu de laisser l'écran sur « Chargement… ».
+///
+/// La lecture chez le service, elle, n'est pas coupée : une grande liste ou
+/// un réseau lent la font durer, mais elle finit (requêtes bornées, pages
+/// bornées) et remplit le cache. La couper rendait 503 à chaque essai, sans
+/// jamais remplir le cache (revue de la PR #8041).
 #[cfg(not(test))]
 const DELAI_FAVORIS: std::time::Duration = std::time::Duration::from_secs(20);
 /// Plus court en test, pour que le témoin du gel (#7729) reste rapide.
 #[cfg(test)]
 const DELAI_FAVORIS: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Attend `attente` (un verrou) au plus jusqu'à `echeance`. `None` = délai
+/// dépassé.
+async fn verrou_borne<F: std::future::Future>(
+    echeance: tokio::time::Instant,
+    attente: F,
+) -> Option<F::Output> {
+    tokio::time::timeout_at(echeance, attente).await.ok()
+}
+
+/// La réponse 503 de la route des favoris quand un verrou n'a pas été obtenu
+/// dans le délai.
+fn favoris_service_occupe(service: &str, fav_type: &str) -> Response {
+    tracing::warn!(
+        service = %service,
+        fav_type = %fav_type,
+        delai_s = DELAI_FAVORIS.as_secs(),
+        "streaming_favorites_delai_depasse"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "service_occupe",
+            "message": format!(
+                "{service} n'a pas répondu à temps pour les favoris ; réessayez dans un instant"
+            ),
+        })),
+    )
+        .into_response()
+}
 
 async fn service_favorites(
     State(state): State<StreamingHttpState>,
@@ -1907,44 +1942,16 @@ async fn service_favorites(
     // #7729 — journalisé AVANT toute attente : un gel ne laissait aucune
     // ligne, la route attendant un verrou avant la première.
     tracing::debug!(service = %service, fav_type = %fav_type, "streaming_favorites_demande");
-    let lecture = favoris_du_service(state, service.clone(), fav_type.clone(), tri);
-    match tokio::time::timeout(DELAI_FAVORIS, lecture).await {
-        Ok(reponse) => reponse,
-        Err(_) => {
-            tracing::warn!(
-                service = %service,
-                fav_type = %fav_type,
-                delai_s = DELAI_FAVORIS.as_secs(),
-                "streaming_favorites_delai_depasse"
-            );
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": "service_occupe",
-                    "message": format!(
-                        "{service} n'a pas répondu à temps pour les favoris ; réessayez dans un instant"
-                    ),
-                })),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn favoris_du_service(
-    state: StreamingHttpState,
-    service: String,
-    fav_type: String,
-    tri: TriQuery,
-) -> Response {
-    let arc = match get_svc_actif(&state, &service).await {
-        Ok(s) => s,
+    let echeance = tokio::time::Instant::now() + DELAI_FAVORIS;
+    let arc = match verrou_borne(echeance, get_svc_actif(&state, &service)).await {
+        None => return favoris_service_occupe(&service, &fav_type),
+        Some(Ok(s)) => s,
         // A non-streaming source (e.g. "upnp"/"radio"/"podcast" media-server
         // items) has no streaming favorites. Return an empty list (200) rather
         // than a plain-text 404 so the web client's `.json()` doesn't blow up
         // with "TypeError: (void 0) is not a function" (Yacine, DevTools console:
         // GET /streaming/upnp/favorites/tracks 404).
-        Err(_) => {
+        Some(Err(_)) => {
             let cle = TypeFavori::parse(&fav_type)
                 .map(TypeFavori::cle)
                 .unwrap_or("tracks");
@@ -1961,7 +1968,9 @@ async fn favoris_du_service(
     // pas le max (#1621). Le dispatch n'appelle que des méthodes `&self` ;
     // seul le rafraîchissement de jeton, plus bas, exige l'écriture.
     let result = {
-        let svc = arc.read().await;
+        let Some(svc) = verrou_borne(echeance, arc.read()).await else {
+            return favoris_service_occupe(&service, &fav_type);
+        };
         lire_favoris(&**svc, &fav_type).await
     };
     match result {
@@ -1978,17 +1987,28 @@ async fn favoris_du_service(
             } =>
         {
             // Token expired — attempt refresh and retry
+            // Délai neuf : la lecture qui précède a pu consommer le premier.
+            let echeance = tokio::time::Instant::now() + DELAI_FAVORIS;
             let rafraichi = {
-                let mut svc = arc.write().await;
+                let Some(mut svc) = verrou_borne(echeance, arc.write()).await else {
+                    return favoris_service_occupe(&service, &fav_type);
+                };
                 svc.refresh_if_needed().await.unwrap_or(false)
             };
             if rafraichi {
-                state.save_tokens().await;
-                let arc = match get_svc_actif(&state, &service).await {
-                    Ok(s) => s,
-                    Err(e) => return e.into_response(),
+                // Enregistrés à part : l'enregistrement attend le registre,
+                // et l'interrompre en cours d'écriture laisserait des jetons
+                // à moitié écrits.
+                let a_enregistrer = state.clone();
+                tokio::spawn(async move { a_enregistrer.save_tokens().await });
+                let arc = match verrou_borne(echeance, get_svc_actif(&state, &service)).await {
+                    None => return favoris_service_occupe(&service, &fav_type),
+                    Some(Ok(s)) => s,
+                    Some(Err(e)) => return e.into_response(),
                 };
-                let svc = arc.read().await;
+                let Some(svc) = verrou_borne(echeance, arc.read()).await else {
+                    return favoris_service_occupe(&service, &fav_type);
+                };
                 match lire_favoris(&**svc, &fav_type).await {
                     Ok(data) => {
                         memoriser_contenu_utilisateur(&service, &ressource, data.clone());
