@@ -767,7 +767,7 @@ mod tests {
             "web/ mêle ancien et neuf"
         );
         assert_eq!(
-            std::fs::read_to_string(inst.opt().join("web.old/index.html")).unwrap(),
+            std::fs::read_to_string(inst.opt().join("web.old/index.html")).unwrap_or_default(),
             ANCIEN_INDEX,
             "l'ancien web/ n'est pas gardé en web.old pour le retour en arrière"
         );
