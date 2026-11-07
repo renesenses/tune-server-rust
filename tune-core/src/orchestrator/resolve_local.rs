@@ -1026,8 +1026,8 @@ impl PlaybackOrchestrator {
                 track,
                 &file_path,
                 source_format,
-                &source,
-                &sorties,
+                source.zone_max_sample_rate,
+                (sorties.is_local_output, sorties.is_network_output),
                 tranche_cue,
             )
             .await?
@@ -1150,21 +1150,23 @@ impl PlaybackOrchestrator {
     /// en DoP est résolue ici même et court-circuite tout le reste ; les deux
     /// journaux qui expliquent un DSD parti en PCM vivent au même endroit,
     /// seul à connaître à la fois le format, la sortie et le mode réglé.
-    async fn decider_le_dop(
+    ///
+    /// #8052 — appelé aussi par `resolve_direct` pour un DSD reçu d'un autre
+    /// serveur Tune (prêt de sorties) : `track` est alors une ligne bâtie sur
+    /// la demande et l'en-tête du fichier téléchargé, pas une ligne en base.
+    /// C'est pourquoi la fonction ne reçoit que le plafond de la zone et les
+    /// deux familles de sortie (`(locale, réseau)`), pas tout `SourceEtZone`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn decider_le_dop(
         &self,
         req: &PlayRequest,
         track: &crate::db::models::Track,
         file_path: &str,
         source_format: Option<AudioFormat>,
-        source: &SourceEtZone,
-        sorties: &Sorties,
+        zone_max_sample_rate: Option<u32>,
+        (is_local_output, is_network_output): (bool, bool),
         tranche_cue: Option<TrancheCue>,
     ) -> Result<Option<ResolvedStream>, String> {
-        let Sorties {
-            is_local_output,
-            is_network_output,
-            ..
-        } = *sorties;
         // DSD en DoP (DSD over PCM), c'est-à-dire du DSD transporté dans des
         // trames PCM 24 bits au seizième du débit.
         //
@@ -1206,7 +1208,7 @@ impl PlaybackOrchestrator {
             match decider_dsd_natif_local(
                 &sortie,
                 entete.map(|(cadence, _)| cadence),
-                source.zone_max_sample_rate,
+                zone_max_sample_rate,
                 crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
             ) {
                 Ok(()) => {
@@ -1348,7 +1350,7 @@ impl PlaybackOrchestrator {
                     req.zone_id,
                     track,
                     file_path.to_string(),
-                    source.zone_max_sample_rate,
+                    zone_max_sample_rate,
                     is_local_output,
                     crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
                     tranche,
@@ -4228,7 +4230,7 @@ fn tranche_dop(
 /// (DSF, DFF, ISO SACD) — `None` si l'en-tête est illisible. Partagé par le
 /// DoP (`anticiper_le_dop`, #1894) et le DSD natif (#5643) : une seule
 /// lecture de la même vérité.
-fn sonder_l_entete_dsd(file_path: &str) -> Option<(u32, u32)> {
+pub(super) fn sonder_l_entete_dsd(file_path: &str) -> Option<(u32, u32)> {
     let ext = std::path::Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
