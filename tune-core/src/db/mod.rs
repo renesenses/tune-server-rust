@@ -21,6 +21,8 @@ pub mod dossiers_des_collections;
 /// #7763 — les écoutes importées (Roon, Plex, m3u), à part de l'historique.
 pub mod ecoutes_importees;
 pub mod edition_album;
+/// #7983 — la trace des tentatives de la passe d'enrichissement des métadonnées.
+pub mod enrich_tentatives;
 pub mod engine;
 pub mod facet_filter;
 pub mod favorite_facets_repo;
