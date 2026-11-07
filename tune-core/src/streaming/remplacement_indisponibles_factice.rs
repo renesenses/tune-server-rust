@@ -1,7 +1,8 @@
 //! #8066 — un FAUX service (Qobuz, TIDAL…) pour éprouver les routes de
 //! remplacement sans réseau ni compte réel. N'existe qu'en test ou sous la
-//! feature `services-factices` (cibles de test de `tune-server` et
-//! `tune-streaming-http`).
+//! feature `services-factices`, que seules les dev-dependencies de
+//! `tune-server` allument (garde `services_remplacables_6336`) ; les essais de
+//! `tune-streaming-http` en portent une copie.
 //!
 //! * `catalogue` : ce que la recherche rend et ce que `get_track` connaît ;
 //! * `playlist` : la playlist du service, que `replace_playlist_track`
