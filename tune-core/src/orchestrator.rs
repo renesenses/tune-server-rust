@@ -1868,15 +1868,32 @@ fn spawn_streaming_dsp_relay_releve(
     tokio::spawn(async move {
         let mut header_pending = skip_header;
         let mut complet = true;
+        // #7100 — l'entrée pas encore ressortie de la chaîne (la latence du
+        // convolveur), pour comparer chaque échantillon à sa propre source.
+        let mut entrees_en_attente: std::collections::VecDeque<u8> =
+            std::collections::VecDeque::new();
         while let Some(mut chunk) = up_rx.recv().await {
             if header_pending {
                 header_pending = false;
             } else if let Some(r) = releve.as_mut() {
-                let avant = (dsp.is_active() || dsp.en_vol.is_some()).then(|| chunk.clone());
-                dsp.process(&mut chunk, bit_depth);
-                match avant {
-                    Some(avant) => r.relever(&avant, &chunk),
-                    None => r.relever(&chunk, &chunk),
+                // #7100 × #7642 — le relevé passe, lui aussi, par
+                // `process_flux` : l'état du convolveur doit survivre d'un
+                // tampon à l'autre. Le convolveur rend sa sortie ALIGNÉE sur
+                // la piste (sa latence est jetée en tête) mais décalée par
+                // rapport au tampon d'entrée : on garde donc l'entrée en file
+                // et chaque octet sorti est comparé à l'octet d'entrée de la
+                // même position dans la piste, pas à celui du même tampon.
+                if dsp.is_active() || dsp.en_vol.is_some() {
+                    entrees_en_attente.extend(chunk.iter().copied());
+                    dsp.process_flux(&mut chunk, bit_depth);
+                    let n = chunk.len().min(entrees_en_attente.len());
+                    let avant: Vec<u8> = entrees_en_attente.drain(..n).collect();
+                    r.relever(&avant, &chunk[..n]);
+                } else {
+                    r.relever(&chunk, &chunk);
+                }
+                if chunk.is_empty() {
+                    continue;
                 }
             } else {
                 // #7642 — tampons SUCCESSIFS d'un même flux : l'état du
@@ -1895,6 +1912,11 @@ fn spawn_streaming_dsp_relay_releve(
         // Fin du flux amont : rendre ce que le convolveur retenait encore.
         if complet && !header_pending {
             let queue = dsp.terminer_flux(bit_depth);
+            if let Some(r) = releve.as_mut() {
+                let n = queue.len().min(entrees_en_attente.len());
+                let avant: Vec<u8> = entrees_en_attente.drain(..n).collect();
+                r.relever(&avant, &queue[..n]);
+            }
             if !queue.is_empty() {
                 let _ = downstream.send(queue).await;
             }
