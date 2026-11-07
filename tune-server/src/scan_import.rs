@@ -167,10 +167,11 @@ pub(crate) struct PreuvesDuDossier {
     /// vu sous ce numéro dans le dossier. Une entrée par numéro, pas par
     /// fichier.
     numeros: HashMap<(u32, u32), String>,
-    /// #6460 — deux titres d'album du dossier partagent un numéro de piste :
-    /// ce sont deux parutions distinctes rangées ensemble, pas une
-    /// compilation faite main (dont les numéros ne se répètent pas).
-    parutions_distinctes: bool,
+    /// #6460 — deux titres d'album du dossier partagent un numéro de piste.
+    /// Ce n'est qu'un indice : voir [`Self::parutions_distinctes`].
+    numeros_en_commun: bool,
+    /// #8106 — le nombre de pistes notées par titre d'album (en minuscules).
+    pistes_par_titre: HashMap<String, usize>,
 }
 
 impl PreuvesDuDossier {
@@ -179,24 +180,39 @@ impl PreuvesDuDossier {
     /// distinctes. Une piste sans numéro (absent ou 0) ne prouve rien.
     fn noter_numero(&mut self, album: &str, disque: Option<u32>, piste: Option<u32>) -> bool {
         let album = album.trim().to_lowercase();
-        let Some(piste) = piste.filter(|n| *n > 0) else {
-            return false;
-        };
-        if self.parutions_distinctes || album.is_empty() {
+        if album.is_empty() {
             return false;
         }
-        let cle = (disque.filter(|d| *d > 0).unwrap_or(1), piste);
-        match self.numeros.get(&cle) {
-            Some(deja) if *deja != album => {
-                self.parutions_distinctes = true;
-                true
-            }
-            Some(_) => false,
-            None => {
-                self.numeros.insert(cle, album);
-                false
+        let avant = self.parutions_distinctes();
+        *self.pistes_par_titre.entry(album.clone()).or_default() += 1;
+        if let Some(piste) = piste.filter(|n| *n > 0) {
+            let cle = (disque.filter(|d| *d > 0).unwrap_or(1), piste);
+            match self.numeros.get(&cle) {
+                Some(deja) if *deja != album => self.numeros_en_commun = true,
+                Some(_) => {}
+                None => {
+                    self.numeros.insert(cle, album);
+                }
             }
         }
+        !avant && self.parutions_distinctes()
+    }
+
+    /// #6460, resserré par #8106 — le dossier range-t-il des parutions
+    /// DISTINCTES (« MoonDial » et un album de Lyle Mays) plutôt qu'une
+    /// compilation faite main ?
+    ///
+    /// Des numéros en commun ne suffisent pas : une compilation personnelle
+    /// dont chaque piste a gardé l'album et le numéro de son disque d'origine
+    /// en a forcément (fil 2697, JeanPitre, 18 compilations éclatées en un
+    /// album et une pochette par morceau). Ce qui sépare les deux, c'est que
+    /// des parutions rangées ensemble sont des albums ENTIERS : au moins deux
+    /// pistes par titre d'album en moyenne. Une compilation faite main en a
+    /// une, rarement deux.
+    fn parutions_distinctes(&self) -> bool {
+        let titres = self.pistes_par_titre.len();
+        let pistes: usize = self.pistes_par_titre.values().sum();
+        self.numeros_en_commun && titres >= 2 && titres * 2 <= pistes
     }
 }
 
@@ -913,7 +929,7 @@ impl TrackImporter {
         // et garde son artiste. Une anthologie faite main, numérotée sans
         // doublon, reste une compilation sous le nom de son dossier.
         for (dir, p) in &self.preuves {
-            if p.parutions_distinctes
+            if p.parutions_distinctes()
                 && let Some(verdict) = self.folder_comp.get_mut(dir)
             {
                 *verdict = (false, false);
@@ -1874,7 +1890,7 @@ impl TrackImporter {
                 let parutions_distinctes = self
                     .preuves
                     .get(&album_dir)
-                    .is_some_and(|p| p.parutions_distinctes);
+                    .is_some_and(|p| p.parutions_distinctes());
                 let result = if parutions_distinctes {
                     self.album_repo.get_or_create_for_folder_and_title(
                         &key.0,
