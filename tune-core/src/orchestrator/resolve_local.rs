@@ -261,6 +261,31 @@ fn reconnaitre_les_sorties(
     }
 }
 
+/// #5975 — la durée qui fixe la longueur annoncée d'une conversion.
+///
+/// Une base qui n'a pas su lire la durée (0) laisse la conversion WAV sans
+/// longueur : chunkée, sans `Content-Range`, ce que Safari refuse et qui prive
+/// tout renderer de la taille du fichier (#2189). On la relit alors dans le
+/// fichier. Une tranche CUE garde la sienne (le fichier est l'image entière),
+/// une image ISO aussi (le chemin n'est pas ouvrable tel quel).
+fn duree_de_la_piste_ms(duree_en_base: i64, file_path: &str, tranche: bool) -> i64 {
+    if duree_en_base > 0 || tranche || crate::audio::iso9660::est_chemin_virtuel(file_path) {
+        return duree_en_base;
+    }
+    match crate::metadata::probe_duration_ms(std::path::Path::new(file_path)) {
+        Some(ms) => {
+            info!(
+                file = %file_path,
+                duree_ms = ms,
+                "duree_relue_dans_le_fichier — la base ignore la durée de la piste ; \
+                 relue dans le fichier pour annoncer la longueur de la conversion (#5975)"
+            );
+            ms as i64
+        }
+        None => duree_en_base,
+    }
+}
+
 /// Septième temps de `decider_la_lecture_locale` : le transcodage requis, son
 /// journal, et la `DecisionLocale` remplie champ par champ comme avant.
 #[allow(clippy::too_many_arguments)]
@@ -376,7 +401,8 @@ fn assembler_la_decision(
         info!(zone_id = req.zone_id, "eq_active_forcing_network_transcode");
     }
 
-    let track_duration_ms = track.duration_ms;
+    let track_duration_ms =
+        duree_de_la_piste_ms(track.duration_ms, &file_path, tranche_cue.is_some());
     let track_file_size = track.file_size;
     DecisionLocale {
         bit_depth,
@@ -4271,3 +4297,7 @@ mod duree_convertie_6630_tests;
 #[cfg(test)]
 #[path = "fin_apres_relance_7551_tests.rs"]
 mod fin_apres_relance_7551_tests;
+
+#[cfg(test)]
+#[path = "duree_relue_5975_tests.rs"]
+mod duree_relue_5975_tests;
