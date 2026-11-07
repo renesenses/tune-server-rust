@@ -1029,7 +1029,6 @@ pub fn natural_end(
     track_duration_ms: u64,
     realtime: bool,
 ) -> bool {
-    let is_short_track = track_duration_ms > 0 && track_duration_ms < MIN_TRACK_WALL_SECS * 1000;
     let repeat_end = repeat_active && peak_position_ms > 5_000;
     played_enough
         // Le pic a atteint la fin : la piste est finie, quoi qu'en dise
@@ -1039,7 +1038,22 @@ pub fn natural_end(
         || repeat_end
         || (ended_naturally
             && (!realtime || ended_naturally_wall_ok(wall_elapsed, track_duration_ms)))
-        || (is_short_track && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5)
+        || titre_court_deja_avance(track_duration_ms, peak_position_ms)
+}
+
+/// #7902 — un titre de moins de [`MIN_TRACK_WALL_SECS`] dont le plus haut
+/// point vu a passé la moitié de sa durée a réellement joué.
+///
+/// Un renderer DLNA rend sa position à la seconde (`RelTime 0:00:03`) : un
+/// WAV de 4,0 s n'est jamais vu au-delà de 3 000 ms, soit 75 %, sous les
+/// 80 % de [`played_enough`]. La grâce de chargement de `tick.rs` retenait
+/// alors chaque arrêt du renderer pendant 45 s et la file semblait arrêtée.
+/// C'est la règle des titres courts que [`natural_end`] applique déjà : la
+/// grâce la laisse désormais examiner.
+pub fn titre_court_deja_avance(track_duration_ms: u64, peak_position_ms: u64) -> bool {
+    track_duration_ms > 0
+        && track_duration_ms < MIN_TRACK_WALL_SECS * 1000
+        && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5
 }
 
 /// Should the poller adopt the renderer-reported volume into the saved

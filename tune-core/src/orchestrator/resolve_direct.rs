@@ -724,6 +724,8 @@ impl PlaybackOrchestrator {
                 req.media_format.as_deref(),
                 format_indexe.as_deref(),
             )
+        } else if source == "podcast" {
+            super::mime_upnp::mime_d_un_episode(audio_url, req.media_format.as_deref())
         } else {
             guess_mime_from_url(audio_url)
         };

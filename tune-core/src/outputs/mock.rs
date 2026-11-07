@@ -16,6 +16,8 @@ pub struct PlayCall {
     pub bit_depth: Option<u32>,
     /// La durée annoncée à la sortie (`PlayMedia::duration_ms`), #7551.
     pub duration_ms: Option<u64>,
+    /// Le type annoncé à la sortie (`PlayMedia::mime_type`), #7894.
+    pub mime_type: String,
 }
 
 /// A mock OutputTarget for testing playback flows.
@@ -48,6 +50,12 @@ pub struct MockOutput {
     /// en pause laisse l'appareil EN PAUSE — contrat UPnP. Armé, `seek`
     /// repasse l'état à `Paused`.
     seek_laisse_en_pause: Arc<AtomicBool>,
+    /// #7894 — armé, l'appareil n'a aucun média (`NO_MEDIA_PRESENT`) : la
+    /// pause n'a rien à suspendre, et la sortie le signale par
+    /// `take_nothing_playing_on_pause()`.
+    sans_media: Arc<AtomicBool>,
+    /// #7894 — posé par une pause reçue sans média ; lu une fois.
+    rien_ne_jouait: Arc<AtomicBool>,
     /// Chaque `resume` reçu, pour compter les relances.
     resume_calls: Arc<AtomicU64>,
     /// Le contrat de signal que la sortie PUBLIE (#4559).
@@ -125,6 +133,8 @@ impl MockOutput {
             set_next_calls: Arc::new(Mutex::new(Vec::new())),
             volume_calls: Arc::new(Mutex::new(Vec::new())),
             seek_laisse_en_pause: Arc::new(AtomicBool::new(false)),
+            sans_media: Arc::new(AtomicBool::new(false)),
+            rien_ne_jouait: Arc::new(AtomicBool::new(false)),
             resume_calls: Arc::new(AtomicU64::new(0)),
             signal_path: Arc::new(std::sync::Mutex::new(None)),
             suivante_preparee: Arc::new(std::sync::Mutex::new(SuivantePreparee::Inconnue)),
@@ -235,6 +245,12 @@ impl MockOutput {
         self
     }
 
+    /// #7894 — un renderer sans média, qui ne joue rien.
+    pub fn with_sans_media(self) -> Self {
+        self.sans_media.store(true, Ordering::Relaxed);
+        self
+    }
+
     pub fn resume_call_count(&self) -> u64 {
         self.resume_calls.load(Ordering::Relaxed)
     }
@@ -310,6 +326,16 @@ impl MockOutput {
             .await
             .iter()
             .map(|c| c.title.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// Les types annoncés à `play_media`, DANS L'ORDRE (#7894).
+    pub async fn play_mime_types(&self) -> Vec<String> {
+        self.play_calls
+            .lock()
+            .await
+            .iter()
+            .map(|c| c.mime_type.clone())
             .collect()
     }
 
@@ -441,6 +467,7 @@ impl OutputTarget for MockOutput {
                 title: media.title.map(String::from),
                 bit_depth: media.bit_depth,
                 duration_ms: media.duration_ms,
+                mime_type: media.mime_type.to_string(),
             });
             return Err(motif);
         }
@@ -457,13 +484,23 @@ impl OutputTarget for MockOutput {
             title: media.title.map(String::from),
             bit_depth: media.bit_depth,
             duration_ms: media.duration_ms,
+            mime_type: media.mime_type.to_string(),
         });
         Ok(())
     }
 
     async fn pause(&self) -> Result<(), String> {
+        if self.sans_media.load(Ordering::Relaxed) {
+            *self.state.lock().await = TransportState::Stopped;
+            self.rien_ne_jouait.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         *self.state.lock().await = TransportState::Paused;
         Ok(())
+    }
+
+    fn take_nothing_playing_on_pause(&self) -> bool {
+        self.rien_ne_jouait.swap(false, Ordering::Relaxed)
     }
 
     async fn resume(&self) -> Result<(), String> {
@@ -558,6 +595,7 @@ impl OutputTarget for MockOutput {
             title: media.title.map(String::from),
             bit_depth: media.bit_depth,
             duration_ms: media.duration_ms,
+            mime_type: media.mime_type.to_string(),
         });
         let refus = self.refus_de_set_next.lock().unwrap().clone();
         if let Some(motif) = refus {

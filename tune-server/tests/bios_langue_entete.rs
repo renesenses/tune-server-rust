@@ -693,3 +693,84 @@ async fn artiste_et_album_en_francais_rien_ne_change() {
         assert!(body.get("repli").is_none(), "{body}");
     }
 }
+
+// === 5. `bio_langue` : seule une langue EXPLICITE est mémorisée ===========
+
+async fn reglage_bio_langue_apres(state: &Etat) -> Option<String> {
+    // L'écriture part sur un thread bloquant : laisser le temps de se faire.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    SettingsRepo::with_backend(state.backend.clone())
+        .get("bio_langue")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn artiste_une_visite_en_anglais_memorise_en() {
+    let (app, state) = app_et_etat();
+    artiste_avec_bio(&state, 1, "en", BIO_EN);
+    bio_artiste(&app, "", Some("en")).await;
+    assert_eq!(
+        reglage_bio_langue_apres(&state).await.as_deref(),
+        Some("en")
+    );
+}
+
+#[tokio::test]
+async fn artiste_un_parametre_lang_explicite_est_memorise() {
+    let (app, state) = app_et_etat();
+    artiste_avec_bio(&state, 1, "en", BIO_EN);
+    bio_artiste(&app, "?lang=de", None).await;
+    assert_eq!(
+        reglage_bio_langue_apres(&state).await.as_deref(),
+        Some("de")
+    );
+}
+
+/// Distinguant : sans `?lang` ni `Accept-Language`, le repli `en` ne doit PAS
+/// écraser un serveur réglé en français (application mobile, appel nu).
+#[tokio::test]
+async fn artiste_sans_langue_donnee_ne_touche_pas_au_reglage() {
+    let (app, state) = app_et_etat();
+    artiste_avec_bio(&state, 1, "en", BIO_EN);
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("bio_langue", "fr")
+        .unwrap();
+    bio_artiste(&app, "", None).await;
+    assert_eq!(
+        reglage_bio_langue_apres(&state).await.as_deref(),
+        Some("fr")
+    );
+}
+
+#[tokio::test]
+async fn artiste_sans_langue_donnee_n_ecrit_rien_sans_reglage() {
+    let (app, state) = app_et_etat();
+    artiste_avec_bio(&state, 1, "en", BIO_EN);
+    bio_artiste(&app, "", None).await;
+    assert_eq!(reglage_bio_langue_apres(&state).await, None);
+}
+
+#[tokio::test]
+async fn album_sans_langue_donnee_ne_touche_pas_au_reglage() {
+    let (app, state) = app_et_etat();
+    album_avec_bio(&state, 1, "en", BIO_EN);
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("bio_langue", "fr")
+        .unwrap();
+    bio_album(&app, "", None).await;
+    assert_eq!(
+        reglage_bio_langue_apres(&state).await.as_deref(),
+        Some("fr")
+    );
+}
+
+#[tokio::test]
+async fn album_une_visite_en_anglais_memorise_en() {
+    let (app, state) = app_et_etat();
+    album_avec_bio(&state, 1, "en", BIO_EN);
+    bio_album(&app, "", Some("en")).await;
+    assert_eq!(
+        reglage_bio_langue_apres(&state).await.as_deref(),
+        Some("en")
+    );
+}

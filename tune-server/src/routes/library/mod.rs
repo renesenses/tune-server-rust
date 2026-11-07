@@ -1,6 +1,7 @@
 mod album_order;
 mod albums;
 mod audit_integrite;
+mod bio_liens;
 /// #4806 — le drapeau `banned` des listes de pistes, partagé avec les
 /// playlists et la recherche fédérée qui vivent hors de ce module.
 pub(crate) use albums::attacher_banni;
@@ -34,7 +35,10 @@ mod albums_manquants_mb;
 mod liens_et_genres_mb;
 mod passes_metarust;
 // #5469 — les passes que `crate::reprise_des_passes` sait relancer.
-pub(crate) use artwork::{demarrer_images_artistes, demarrer_pochettes_albums};
+pub(crate) use artwork::{
+    PochetteAlbum, demarrer_images_artistes, demarrer_pochettes_albums, pochette_de_l_album,
+    serve_artwork_from,
+};
 pub(crate) use enrich::demarrer_enrich_all;
 mod edition_par_filtre;
 mod etiquetage_par_filtre;
@@ -80,6 +84,7 @@ pub(crate) mod graver_dr;
 pub(crate) mod reparer_compilations;
 pub(crate) mod stats;
 mod tracks;
+pub(crate) use tracks::stream_track_audio;
 pub(crate) mod write_tags;
 
 /// Les versions d'un même album regroupées sous une fiche (#7617).
@@ -224,7 +229,7 @@ pub(super) fn now_iso_utc() -> String {
     format!("{y:04}-{:02}-{:02}T{h:02}:{m:02}:{s:02}Z", mo + 1, d + 1)
 }
 
-pub(super) fn artwork_is_hex_hash(s: &str) -> bool {
+pub(crate) fn artwork_is_hex_hash(s: &str) -> bool {
     (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -336,7 +341,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/artists/{id}/albums", get(artists::artist_albums))
         .route("/artists/{id}/tracks", get(artists::artist_tracks))
-        .route("/artists/{id}/bio", get(artists::artist_bio))
+        // #7910 : `bio_liens` appelle (artists::artist_bio) et ajoute `bio_segments`.
+        .route("/artists/{id}/bio", get(bio_liens::artist_bio))
         .route("/artists/{id}/similar", get(artists::artist_similar))
         .route("/artists/{id}/metadata", get(artists::artist_metadata))
         // #6463 — « Détacher l'identité » : retire le MBID, provenance `manuel`.
@@ -765,7 +771,8 @@ pub fn router() -> Router<AppState> {
             post(duplicates::retirer_album_doublon),
         )
         .route("/activity", get(stats::library_activity))
-        .route("/albums/{id}/bio", get(albums::album_bio))
+        // #7910 : `bio_liens` appelle (albums::album_bio) et ajoute `bio_segments`.
+        .route("/albums/{id}/bio", get(bio_liens::album_bio))
         .route("/albums/{id}/similar", get(albums::album_similar))
         .route(
             "/albums/{id}/artwork/rescan",
