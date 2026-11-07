@@ -305,6 +305,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "bpm_estimes",
         "BPM estimes (Wikidata ou signal, #4805) : se remesurent ; les balises BPM restent dans `tracks`",
     ),
+    (
+        "ecoutes_parentales",
+        "temps ecoute des profils supervises (#7974) : compteurs du jour et de la semaine ISO, \
+         perdus au plus pour la semaine en cours ; les politiques, elles, sont copiees",
+    ),
 ];
 
 /// The complete PG schema DDL. Creates all tables that exist in SQLite.
