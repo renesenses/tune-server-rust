@@ -314,6 +314,9 @@ impl PlaybackOrchestrator {
         // dormant auto-discovered zones filled the quota AND closes the "play a
         // few zones at a time to stay free" loophole.
         self.enforce_zone_cap(req.zone_id).await?;
+        // #8088 — un contenu marqué explicite, pour un profil dont la
+        // politique parentale le masque : rien ne part.
+        self.verifier_le_contenu_explicite(&req).await?;
 
         // Re-tap dedup (#1271): a controller (Flutter/web) can emit `play` TWICE
         // for the SAME track a few seconds apart. The first play already sent
@@ -2130,11 +2133,8 @@ impl PlaybackOrchestrator {
         // puis retrouvé, sortie absente du registre). Même graine qu'au
         // démarrage (#1596, #5561) : volume de la zone × trim, « Volume fixe »
         // à 1.0, jamais au-delà de l'unité.
-        if let Ok(Some(zone)) = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-            .get_by_device_id(device_id)
-        {
-            ensemencer_le_volume_local(&self.db, &zone, device_id, &local_out).await;
-        }
+        // #8074 — sans zone en base, elle part BAS, jamais à pleine échelle.
+        ensemencer_la_sortie_locale_neuve(&self.db, device_id, &local_out).await;
         {
             let mut outputs = self.outputs.lock().await;
             outputs.register(Box::new(local_out));
@@ -3082,6 +3082,14 @@ impl PlaybackOrchestrator {
     /// #7778 (points 3 et 4) — un refus que le service oppose à CETTE piste
     /// (`no url` de Qobuz) se dit en clair : l'auditeur lisait « no url ».
     pub fn message_piste_non_demarree(geste: &str, cause: &str) -> String {
+        // #8088 — le refus du contrôle parental se dit comme tel, pas comme
+        // une indisponibilité chez le service.
+        if cause.contains(crate::db::politique_parentale::CODE_REFUS_EXPLICITE) {
+            return format!(
+                "Impossible de lire la piste {geste} : contenu marqué explicite, \
+                 interdit par le contrôle parental de ce profil"
+            );
+        }
         if crate::poller::refus_propre_a_la_piste(cause) {
             return format!(
                 "Impossible de lire la piste {geste} : {}",

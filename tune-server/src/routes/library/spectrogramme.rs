@@ -37,6 +37,8 @@ use crate::state::AppState;
 pub(crate) const PLAFOND_DEFAUT_OCTETS: u64 = 256 * 1024 * 1024;
 
 const TACHE: &str = "spectrogramme";
+/// Toujours demandé à la main (menu d'une piste) : jamais freiné (#8086).
+const ORIGINE: priorite::Origine = priorite::Origine::Demandee;
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct Taille {
@@ -162,9 +164,12 @@ async fn generer(
         .map_err(|e| format!("semaphore: {e}"))?;
     let duree_s = (duree_ms > 0).then(|| duree_ms as f64 / 1000.0);
     let debut = std::time::Instant::now();
-    let resultat = priorite::hors_du_fil_async(TACHE, move || {
+    // Un geste de l'utilisateur, pas une analyse de fond : aucune cession à
+    // la lecture entre deux fenêtres (#8086), une seule génération à la fois
+    // par piste et deux au plus au total, un nice modéré.
+    let resultat = priorite::hors_du_fil_async_pour(ORIGINE, TACHE, move || {
         spectrogramme::generer_png(&chemin, largeur, hauteur, duree_s, &|| {
-            priorite::ceder_a_la_lecture_bloquant(TACHE);
+            priorite::ceder_pour_bloquant(ORIGINE, TACHE);
         })
     })
     .await

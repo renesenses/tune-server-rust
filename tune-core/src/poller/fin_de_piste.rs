@@ -1015,6 +1015,13 @@ impl PositionPoller {
         let Some(next_pos) = Self::prochaine_position_jouable(&self.db, zone_id, zone_state) else {
             return GaplessPrep::NotArmed;
         };
+        // #8088 — armée, la suivante serait jouée par le renderer sans
+        // repasser par la garde des contenus explicites : pour un profil dont
+        // la politique les masque, rien n'est armé d'avance, la fin de piste
+        // passe par la garde.
+        if self.orchestrator.masque_l_explicite(zone_id).await {
+            return GaplessPrep::NotArmed;
+        }
 
         // L'identite de ce qu'on s'apprete a armer, lue AVANT de le resoudre :
         // une ligne de file, pas une position (#3026). C'est la seule trace de
@@ -1389,11 +1396,19 @@ impl PositionPoller {
                         let t_verif = Instant::now();
                         let tenue = output.suivante_preparee(&resolved.url).await;
                         self.noter_le_suivant_arme(zone_id, device_id, dsd_arme, tenue);
+                        // #8076 — `streaming` ne dit que « une session HTTP
+                        // existe » (un fichier servi tel quel en a une) : la
+                        // voie dit ce qui part sur le fil.
+                        let voie = match resolved.stream_id.as_deref() {
+                            Some(sid) => self.orchestrator.streamer.voie_servie(sid).await,
+                            None => "url_directe",
+                        };
                         info!(
                             zone_id,
                             title = %resolved.title,
                             resolve_ms,
                             streaming = is_streaming,
+                            voie,
                             suivante = ?tenue,
                             verif_ms = t_verif.elapsed().as_millis() as u64,
                             "gapless_next_set"

@@ -33,6 +33,7 @@ fn politique() -> PolitiqueParentale {
         }],
         budget_quotidien_minutes: Some(90),
         budget_hebdomadaire_minutes: Some(600),
+        masquer_explicite: false,
     }
 }
 

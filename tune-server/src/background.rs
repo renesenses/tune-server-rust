@@ -3325,6 +3325,11 @@ where
 #[path = "sortie_locale_disparue_6551_tests.rs"]
 mod sortie_locale_disparue_6551_tests;
 
+// #8074 — la graine de zone posée sur une sortie née au balayage à chaud.
+#[cfg(all(test, feature = "local-audio"))]
+#[path = "premier_play_au_gain_de_zone_8074_tests.rs"]
+mod premier_play_au_gain_de_zone_8074_tests;
+
 /// Whether ANY zone (local or network) is currently playing, read from the
 /// in-memory playback state — no device or network probing. Used on Linux to
 /// suppress the periodic audio re-enumeration during a listening session:
@@ -3619,6 +3624,16 @@ pub(crate) async fn appliquer_le_parc_local(
                 configured_backend,
             )
             .with_origin_host(&dev.backend);
+            // #8074 — la graine de la zone AVANT l'enregistrement, comme au
+            // démarrage. Sans elle, une sortie née ici (avec ASIO choisi, ce
+            // sont toutes les sorties WASAPI) jouait le premier morceau à
+            // pleine échelle quel que soit le volume enregistré de sa zone.
+            tune_core::orchestrator::ensemencer_la_sortie_locale_neuve(
+                &state.backend,
+                &device_id,
+                &local_out,
+            )
+            .await;
             outputs.register(Box::new(local_out));
             registered_count += 1;
 

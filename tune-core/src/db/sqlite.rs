@@ -746,6 +746,9 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- Debit moyen du fichier en kbit/s, lu au scan (#6332, migration 130).
     -- NULL = pas encore lu (complete au rescan) ou inconnu.
     bitrate_kbps INTEGER,
+    -- Marquage explicite de la balise (#8088, migration 141) : 1 explicite,
+    -- 0 propre, NULL sans balise. Index partiel `idx_tracks_explicit`.
+    explicit INTEGER,
     -- Cle de tri de la vue des pistes (#7619, L1) : artiste, album, disque,
     -- numero, plies. Calculee en Rust (`track_repo::cle_de_tri`), NULL tant
     -- qu'elle ne l'a pas ete. Index `idx_tracks_cle_tri (cle_tri, id)`.

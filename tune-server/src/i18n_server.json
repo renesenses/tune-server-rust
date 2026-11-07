@@ -1,4 +1,21 @@
 {
+  "parental.explicit.refused": {
+    "fr": "Ce contenu est marqué explicite : le contrôle parental de ce profil en interdit l'affichage et la lecture.",
+    "en": "This content is marked explicit: this profile's parental controls do not allow it to be shown or played.",
+    "de": "Dieser Inhalt ist als explizit gekennzeichnet: Die Kindersicherung dieses Profils erlaubt weder Anzeige noch Wiedergabe.",
+    "es": "Este contenido está marcado como explícito: el control parental de este perfil no permite mostrarlo ni reproducirlo.",
+    "it": "Questo contenuto è contrassegnato come esplicito: il controllo parentale di questo profilo non ne consente la visualizzazione né la riproduzione.",
+    "zh": "此内容被标记为露骨内容：此配置文件的家长控制不允许显示或播放。",
+    "ja": "このコンテンツは露骨な表現を含むとマークされています。このプロフィールのペアレンタルコントロールにより、表示も再生もできません。",
+    "ko": "이 콘텐츠는 청소년 유해(Explicit)로 표시되어 있습니다. 이 프로필의 자녀 보호 설정으로 표시와 재생이 허용되지 않습니다.",
+    "ro": "Acest conținut este marcat ca explicit: controlul parental al acestui profil nu permite afișarea sau redarea lui.",
+    "sv": "Det här innehållet är markerat som explicit: profilens föräldrakontroll tillåter inte att det visas eller spelas upp.",
+    "hu": "Ez a tartalom kifejezettként van megjelölve: a profil szülői felügyelete nem engedi megjeleníteni vagy lejátszani.",
+    "vi": "Nội dung này được đánh dấu là nhạy cảm (explicit): kiểm soát của phụ huynh trên hồ sơ này không cho phép hiển thị hoặc phát.",
+    "nb": "Dette innholdet er merket som eksplisitt: foreldrekontrollen for denne profilen tillater ikke at det vises eller spilles av.",
+    "pl": "Ta treść jest oznaczona jako dosadna: kontrola rodzicielska tego profilu nie pozwala jej wyświetlać ani odtwarzać.",
+    "el": "Αυτό το περιεχόμενο έχει σημανθεί ως ακατάλληλο: ο γονικός έλεγχος αυτού του προφίλ δεν επιτρέπει την εμφάνιση ή την αναπαραγωγή του."
+  },
   "plugin.unavailable": {
     "fr": "Ce plugin doit être installé et activé.",
     "en": "This plugin must be installed and enabled.",

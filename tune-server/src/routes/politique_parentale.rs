@@ -21,6 +21,15 @@
 //! sa lecture rend 500, mais son superviseur peut encore la retirer (DELETE)
 //! ou la remplacer (PUT), la règle d'accès ne lisant pas son contenu.
 //!
+//! #8088 — « Masquer les contenus explicites » (`masquer_explicite`) : sur
+//! les routes de contenus (bibliothèque, recherche, pages des services,
+//! playlists, voir [`route_a_contenus`]), les pistes et albums marqués
+//! explicites sont retirés à toute profondeur — marquage du service
+//! (`explicit`, `parental_warning`) ou de la balise du fichier
+//! (`tracks.explicit`, lu en base une fois par requête). La fiche d'un album
+//! ou d'une piste explicite est refusée (403, `parental_explicit_refused`).
+//! Sans la case, ces routes ne relisent rien de plus qu'avant.
+//!
 //! Le profil appelant est celui d'[`ActiveProfile`] : avec l'authentification
 //! active, celui du compte connecté.
 
@@ -184,18 +193,49 @@ fn liste_de_la_route(chemin: &str) -> Option<Liste> {
     }
 }
 
+/// #8088 — les routes dont les contenus explicites sont retirés pour un
+/// profil dont la politique les masque : bibliothèque, recherche, pages des
+/// services, playlists. Plus large que [`liste_de_la_route`] : le marquage
+/// explicite se lit sur l'objet lui-même, il ne dépend pas de la forme de la
+/// liste.
+fn route_a_contenus(chemin: &str) -> bool {
+    let chemin = chemin.strip_prefix("/api/v1").unwrap_or(chemin);
+    ["/library", "/search", "/streaming", "/playlists"]
+        .iter()
+        .any(|p| chemin == *p || chemin.strip_prefix(p).is_some_and(|r| r.starts_with('/')))
+}
+
+/// #8088 — le corps du refus d'un contenu explicite (fiche d'album ou de
+/// piste, lecture) : code stable et phrase traduite.
+pub(crate) fn corps_du_refus_explicite(lang: &str) -> Value {
+    json!({
+        "error": pp::CODE_REFUS_EXPLICITE,
+        "code": pp::CODE_REFUS_EXPLICITE,
+        "message": crate::i18n::t(lang, "parental.explicit.refused"),
+    })
+}
+
+/// #8088 — le refus d'un contenu explicite : 403, la politique du profil
+/// interdit, ce n'est pas une panne.
+pub(crate) fn refus_explicite(lang: &str) -> Response {
+    (StatusCode::FORBIDDEN, Json(corps_du_refus_explicite(lang))).into_response()
+}
+
 /// La couche de filtrage des listes (voir l'en-tête du module).
 pub(crate) async fn filtrer_les_listes(
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Response {
-    let Some(liste) = (req.method() == Method::GET)
-        .then(|| liste_de_la_route(req.uri().path()))
-        .flatten()
-    else {
+    if req.method() != Method::GET {
         return next.run(req).await;
-    };
+    }
+    let liste = liste_de_la_route(req.uri().path());
+    let contenus = route_a_contenus(req.uri().path());
+    if liste.is_none() && !contenus {
+        return next.run(req).await;
+    }
+    let lang = crate::i18n::lang_from_header(req.headers());
     let (mut parts, body) = req.into_parts();
     let ActiveProfile(profil) = match ActiveProfile::from_request_parts(&mut parts, &state).await {
         Ok(p) => p,
@@ -212,6 +252,20 @@ pub(crate) async fn filtrer_les_listes(
         }
         // Une politique illisible ne doit pas laisser passer la liste entière.
         Err(e) => return interne(e),
+    };
+    if liste.is_none() && !politique.masquer_explicite {
+        return next.run(req).await;
+    }
+    // #8088 — les marques explicites de la bibliothèque locale, lues une
+    // fois par requête. Une erreur refuse la liste plutôt que de la laisser
+    // passer entière.
+    let marques = if politique.masquer_explicite {
+        match pp::marques_explicites_locales(&state.backend) {
+            Ok(m) => Some(m),
+            Err(e) => return interne(e),
+        }
+    } else {
+        None
     };
     let reponse = next.run(req).await;
     let est_json = reponse
@@ -230,11 +284,49 @@ pub(crate) async fn filtrer_les_listes(
     let Ok(mut valeur) = serde_json::from_slice::<Value>(&octets) else {
         return Response::from_parts(parts, Body::from(octets));
     };
-    let retires = Filtre::depuis(&politique).filtrer(&mut valeur, liste);
+    let mut retires = liste.map_or(0, |l| Filtre::depuis(&politique).filtrer(&mut valeur, l));
+    if let Some(m) = &marques {
+        // La fiche d'un album ou d'une piste explicite : refusée, pas vidée.
+        if m.racine_explicite(&valeur) {
+            tracing::debug!(profil, "politique_parentale_fiche_explicite_refusee");
+            return refus_explicite(&lang);
+        }
+        retires += m.filtrer(&mut valeur);
+    }
     if retires == 0 {
         return Response::from_parts(parts, Body::from(octets));
     }
     tracing::debug!(profil, retires, "politique_parentale_liste_filtree");
     parts.headers.remove(header::CONTENT_LENGTH);
     Response::from_parts(parts, Body::from(valeur.to_string()))
+}
+
+#[cfg(test)]
+mod tests_8088 {
+    use super::route_a_contenus;
+
+    #[test]
+    fn les_routes_de_contenus_8088() {
+        for c in [
+            "/api/v1/library/albums",
+            "/api/v1/library/albums/12",
+            "/api/v1/search",
+            "/api/v1/streaming/qobuz/search",
+            "/api/v1/streaming/tidal/albums/9/tracks",
+            "/api/v1/playlists/3/tracks",
+            "/api/v1/playlists",
+        ] {
+            assert!(route_a_contenus(c), "{c}");
+        }
+        for c in [
+            "/api/v1/radios",
+            "/api/v1/podcasts/search",
+            "/api/v1/zones",
+            "/api/v1/libraryx",
+            "/api/v1/streamingfoo/x",
+            "/api/v1/profiles/2/politique-parentale",
+        ] {
+            assert!(!route_a_contenus(c), "{c}");
+        }
+    }
 }

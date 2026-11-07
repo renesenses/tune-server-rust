@@ -2000,6 +2000,11 @@ path = "tests/profils_panne_de_base_6454.rs"
 name = "politique_parentale_7856"
 path = "tests/politique_parentale_7856.rs"
 
+# #8088 — contrôle parental : masquer et refuser les contenus explicites.
+[[test]]
+name = "politique_parentale_explicite_8088"
+path = "tests/politique_parentale_explicite_8088.rs"
+
 # #6212 / #6634 — la gravure du Dynamic Range cède à la lecture et n'écrit pas
 # dans le fichier joué, par la route montée. Binaire à lui seul : le témoin de
 # lecture et la politique des freins sont des états de PROCESSUS. `autotests =
