@@ -613,13 +613,19 @@ async fn federated_search(
                     .search_page(&p.q, limit, offset)
                     .unwrap_or_default(),
             ),
+            // #7619 (L3) — la page et son total en une seule requête : le
+            // prédicat n'est plus évalué deux fois.
             track_repo
-                .search_page(&p.q, limit, offset)
-                .unwrap_or_default(),
+                .search_page_et_total(&p.q, limit, offset, PLAFOND_DE_COMPTAGE)
+                .ok(),
         )
     } else {
         // Pas « calculer puis jeter » : les requêtes ne partent pas.
-        (Vec::new(), Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), None)
+    };
+    let (tracks, total_tracks_lu) = match tracks {
+        Some((pistes, total)) => (pistes, Some(total)),
+        None => (Vec::new(), None),
     };
 
     // #7045 — l'annuaire des radios, à côté de « Mes radios » (`radios`). Même
@@ -664,9 +670,7 @@ async fn federated_search(
             album_repo
                 .search_count(&p.q, PLAFOND_DE_COMPTAGE)
                 .unwrap_or_else(|_| plancher(albums.len())),
-            track_repo
-                .search_count(&p.q, PLAFOND_DE_COMPTAGE)
-                .unwrap_or_else(|_| plancher(tracks.len())),
+            total_tracks_lu.unwrap_or_else(|| plancher(tracks.len())),
         )
     } else {
         // Zéro, et non « le plancher » : rien n'a été cherché, donc rien n'est
