@@ -1657,7 +1657,12 @@ impl OutputTarget for OaatOutput {
                                 let expected = std::time::Duration::from_nanos(
                                     (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
                                 );
-                                if !super::horloge::cadencer(start, expected).await {
+                                if !super::horloge::cadencer(
+                                    start,
+                                    super::horloge::echeance_avec_avance(expected),
+                                )
+                                .await
+                                {
                                     error!(device = %device_name, "oaat: cadence DSD non representable");
                                     playing.store(false, Ordering::SeqCst);
                                     return;
@@ -2401,7 +2406,12 @@ impl OutputTarget for OaatOutput {
                                 / cur_sample_rate as f64
                                 * 1e9) as u64,
                         );
-                        if !super::horloge::cadencer(start, expected).await {
+                        if !super::horloge::cadencer(
+                            start,
+                            super::horloge::echeance_avec_avance(expected),
+                        )
+                        .await
+                        {
                             error!(device = %device_name, "oaat: cadence PCM non representable");
                             playing.store(false, Ordering::SeqCst);
                             return;
@@ -3533,14 +3543,12 @@ impl OutputTarget for OaatOutput {
                                 Ordering::Relaxed,
                             );
 
-                            // Real-time pacing — skip for first 50 packets to pre-fill endpoint buffer
-                            let packet_num = if uses_byte_offset {
-                                byte_offset / packet_size as u64
-                            } else {
-                                direct_pcm_elapsed_samples(sample_offset, origine_flux)
-                                    / PCM_SAMPLES_PER_PACKET as u64
-                            };
-                            if packet_num > 50 {
+                            // Cadence temps réel, avec une avance fixe en
+                            // durée (`AVANCE_TAMPON_ENDPOINT`) : 50 paquets
+                            // ne remplissaient qu'une partie du tampon de
+                            // l'endpoint, qui attendait le reste en temps
+                            // réel avant de démarrer.
+                            {
                                 // Le cadencement aussi : caler l'envoi FLAC sur
                                 // les octets compressés envoyait un morceau très
                                 // compressé trop vite, et un peu compressé trop
@@ -3551,13 +3559,13 @@ impl OutputTarget for OaatOutput {
                                 } else {
                                     BaseDeTempsOaat::Samples
                                 };
-                                let expected = duree_audio_envoyee(
+                                let expected = super::horloge::echeance_avec_avance(duree_audio_envoyee(
                                     base_de_temps,
                                     direct_pcm_elapsed_samples(sample_offset, origine_flux),
                                     byte_offset,
                                     cur_sample_rate,
                                     bytes_per_frame,
-                                );
+                                ));
                                 let elapsed = start.elapsed();
                                 // #4567 — conserver la mesure du retard. Le
                                 // cadencement utilise une échéance absolue,
