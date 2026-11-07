@@ -270,6 +270,10 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "tenue des versions du schema SQLite ; PostgreSQL a sa propre `schema_version`",
     ),
     (
+        "library_revision",
+        "compteur de révision de la bibliothèque (#7619) : une seule ligne, recréée par sa propre installation côté PostgreSQL ; une révision neuve invalide les caches clients, ce qui est voulu après une bascule",
+    ),
+    (
         "albums_fts",
         "index plein texte FTS5 de SQLite, sans equivalent a copier en PostgreSQL",
     ),

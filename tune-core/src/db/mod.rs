@@ -37,6 +37,8 @@ pub mod home_queries;
 pub mod ignored_device_repo;
 /// Lectures SQLite en cours, pour le relevé d'un gel de l'exécuteur (#5677).
 pub mod lectures_en_cours;
+/// #7619 — la révision de la bibliothèque, clé des caches de lecture (L4, L5).
+pub mod library_revision;
 pub mod listening_resume;
 /// Registre DURABLE des serveurs multimédia (#2219, phase 1) — sur le modèle
 /// de `network_mounts` : l'intention d'un côté, le constat de l'autre.
@@ -131,6 +133,8 @@ mod miroirs_de_qualite_7694_tests;
 mod notes_et_repartitions_7849_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
+#[cfg(test)]
+mod recherche_debut_de_mot_7619_tests;
 #[cfg(test)]
 mod replieur_wal_tests;
 /// Fil 2130 — « Reprendre l'écoute » : jointure en UNION ALL et index de
