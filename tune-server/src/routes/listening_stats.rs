@@ -62,7 +62,7 @@ async fn listening_stats(
             "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0), \
              COUNT(DISTINCT COALESCE(title,'') || '::' || COALESCE(artist_name,'')), \
              COUNT(DISTINCT artist_name) \
-             FROM listen_history",
+             FROM listen_history WHERE COALESCE(source, '') <> 'radio'",
             &[],
         )
         .map_err(AppError::internal)?
@@ -134,7 +134,7 @@ async fn heatmap(State(state): State<AppState>) -> Result<Json<Value>, AppError>
     let sql = format!(
         "SELECT {dow_expr} as dow, {hour_expr} as hour, COUNT(*) as plays \
          FROM listen_history \
-         WHERE listened_at IS NOT NULL \
+         WHERE listened_at IS NOT NULL AND COALESCE(source, '') <> 'radio' \
          GROUP BY dow, hour \
          ORDER BY dow, hour"
     );
@@ -195,7 +195,7 @@ async fn history_daily(
     let sql = format!(
         "SELECT {day_expr} as day, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as total_ms \
          FROM listen_history \
-         WHERE listened_at >= {cutoff_expr} \
+         WHERE listened_at >= {cutoff_expr} AND COALESCE(source, '') <> 'radio' \
          GROUP BY day \
          ORDER BY day"
     );
@@ -249,7 +249,7 @@ async fn wrapped(
             "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0), \
              COUNT(DISTINCT artist_name), \
              COUNT(DISTINCT COALESCE(title,'') || '::' || COALESCE(artist_name,'')) \
-             FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
+             FROM listen_history WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio'",
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
         .map_err(AppError::internal)?
@@ -265,7 +265,7 @@ async fn wrapped(
     let top_artists: Vec<Value> = b
         .query_many(
             "SELECT artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? AND artist_name IS NOT NULL \
+             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' AND artist_name IS NOT NULL \
              GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
@@ -283,7 +283,7 @@ async fn wrapped(
     let top_tracks: Vec<Value> = b
         .query_many(
             "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? \
+             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' \
              GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10",
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
@@ -302,7 +302,7 @@ async fn wrapped(
     let top_albums: Vec<Value> = b
         .query_many(
             "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? AND album_title IS NOT NULL \
+             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' AND album_title IS NOT NULL \
              GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT 10",
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
@@ -324,7 +324,7 @@ async fn wrapped(
     };
     let days_sql = format!(
         "SELECT DISTINCT {day_expr} as d FROM listen_history \
-         WHERE listened_at >= ? AND listened_at < ? ORDER BY 1"
+         WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' ORDER BY 1"
     );
     let days: Vec<String> = b
         .query_many(&days_sql, &[&year_start as &dyn ToSqlValue, &year_end])
@@ -338,7 +338,7 @@ async fn wrapped(
     // --- Busiest day ---
     let busiest_sql = format!(
         "SELECT {day_expr} as d, COUNT(*) as plays FROM listen_history \
-         WHERE listened_at >= ? AND listened_at < ? \
+         WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' \
          GROUP BY d ORDER BY plays DESC LIMIT 1"
     );
     let busiest = b
@@ -380,7 +380,7 @@ fn query_top_artists(
     let rows = b
         .query_many(
             "SELECT artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE artist_name IS NOT NULL \
+             WHERE artist_name IS NOT NULL AND COALESCE(source, '') <> 'radio' \
              GROUP BY artist_name ORDER BY plays DESC LIMIT ?",
             &[&limit as &dyn ToSqlValue],
         )
@@ -404,7 +404,7 @@ fn query_top_albums(
     let rows = b
         .query_many(
             "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE album_title IS NOT NULL \
+             WHERE album_title IS NOT NULL AND COALESCE(source, '') <> 'radio' \
              GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT ?",
             &[&limit as &dyn ToSqlValue],
         )
@@ -429,6 +429,7 @@ fn query_top_tracks(
     let rows = b
         .query_many(
             "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
+             WHERE COALESCE(source, '') <> 'radio' \
              GROUP BY title, artist_name ORDER BY plays DESC LIMIT ?",
             &[&limit as &dyn ToSqlValue],
         )
@@ -456,7 +457,7 @@ fn query_top_genres(
         .query_many(
             "SELECT t.genre, COUNT(*) as plays FROM listen_history lh \
              INNER JOIN tracks t ON t.id = lh.track_id \
-             WHERE t.genre IS NOT NULL AND t.genre != '' \
+             WHERE t.genre IS NOT NULL AND t.genre != '' AND COALESCE(lh.source, '') <> 'radio' \
              GROUP BY t.genre ORDER BY plays DESC LIMIT ?",
             &[&limit as &dyn ToSqlValue],
         )

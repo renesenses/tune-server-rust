@@ -290,3 +290,43 @@ fn les_statistiques_excluent_toujours_la_radio_7965() {
     assert_eq!(json["totals"]["plays"], 1, "{texte}");
     assert_eq!(json["totals"]["listening_ms"], 60000, "{texte}");
 }
+
+/// La série de jours d'écoute ne compte pas un jour où l'on n'a écouté que la
+/// radio : deux jours de radio seule avant un jour de musique laissent une
+/// série de un jour, pas de trois.
+#[test]
+fn la_serie_de_jours_ignore_les_jours_de_radio_seule_7965() {
+    let orch = orchestrateur();
+    let jour = |n: i64| {
+        (chrono::Utc::now() - chrono::Duration::days(n))
+            .format("%Y-%m-%dT12:00:00Z")
+            .to_string()
+    };
+    for (titre, source, contexte, quand) in [
+        ("FIP", "radio", Some("radio"), jour(2)),
+        ("FIP", "radio", Some("radio"), jour(1)),
+        ("So What", "local", None, jour(0)),
+    ] {
+        orch.db
+            .execute(
+                "INSERT INTO listen_history (title, source, duration_ms, context_type, \
+                 listened_at) VALUES (?, ?, 60000, ?, ?)",
+                &[
+                    &titre as &dyn crate::db::backend::ToSqlValue,
+                    &source,
+                    &contexte,
+                    &quand,
+                ],
+            )
+            .unwrap();
+    }
+    let d = HistoryRepo::with_backend(orch.db.clone())
+        .full_dashboard("all", None, None, 10)
+        .unwrap();
+    let serie = d.streak.expect("un jour de musique fait une série");
+    assert_eq!(
+        (serie.best, serie.current),
+        (1, 1),
+        "les jours de radio seule ne comptent pas dans la série"
+    );
+}
