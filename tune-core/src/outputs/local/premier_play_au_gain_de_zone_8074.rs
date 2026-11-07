@@ -183,3 +183,31 @@ fn le_depart_sans_repere_est_bas_8074() {
         en_db(g)
     );
 }
+
+/// Le bras ASIO : une sortie ASIO neuve naît, elle aussi, à l'unité, et le
+/// bras ASIO (`bras_asio.rs`, Windows seulement) pondère au rendu par le même
+/// gain partagé (#7934). La garde de `play_url` passe AVANT l'aiguillage vers
+/// le bras : sans graine, la sortie ASIO part bas, comme la WASAPI.
+#[tokio::test]
+async fn premier_play_sur_une_sortie_asio_sans_graine_ne_sort_pas_a_pleine_echelle_8074() {
+    let sortie = LocalOutput::with_options("HoloAudio ASIO Driver".into(), true, "asio");
+    assert!(
+        !sortie.volume_est_pose(),
+        "une sortie ASIO neuve n'a reçu aucun volume"
+    );
+    sortie
+        .play_url(URL_MORTE, "audio/wav", None, None)
+        .await
+        .ok();
+    sortie.stop().await.ok();
+    let gain = gain_des_premiers_tampons(&sortie, 4096);
+    let attendu = trente_pour_cent_db60();
+    assert!(
+        (en_db(gain) - en_db(attendu)).abs() < 0.1,
+        "#8074 : premier Play sur une sortie ASIO sans graine, les premiers tampons \
+         sortent à {:.1} dB ({gain:.4}) au lieu de {:.1} dB : le gain de naissance (1.0, \
+         pleine échelle) n'a pas été remplacé avant le bras ASIO",
+        en_db(gain),
+        en_db(attendu),
+    );
+}
