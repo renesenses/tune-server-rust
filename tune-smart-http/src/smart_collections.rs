@@ -106,14 +106,13 @@ fn refus_d_expression(
         .into_response()
 }
 
-/// Refuse AVANT toute écriture une expression que l'analyseur rejette.
-fn verifier_expression(expression: Option<&str>) -> Result<(), axum::response::Response> {
-    match expression {
-        Some(e) => tune_core::library::requete::analyser(e)
-            .map(|_| ())
-            .map_err(|err| refus_d_expression(&err)),
-        None => Ok(()),
-    }
+/// Refuse AVANT toute écriture une expression que l'analyseur rejette : le
+/// 400 de [`refus_d_expression`], ou `None`.
+fn verifier_expression(expression: Option<&str>) -> Option<axum::response::Response> {
+    let e = expression?;
+    tune_core::library::requete::analyser(e)
+        .err()
+        .map(|err| refus_d_expression(&err))
 }
 
 /// La condition SQL d'album de l'expression, ou `None` sans expression :
@@ -639,7 +638,7 @@ async fn create_collection(
 ) -> Result<impl IntoResponse, AppError> {
     borne_valide(body.max_limit)?;
     let expression = expression_normalisee(body.expression.as_deref());
-    if let Err(refus) = verifier_expression(expression.as_deref()) {
+    if let Some(refus) = verifier_expression(expression.as_deref()) {
         return Ok(refus);
     }
     let rules_json = body.rules.to_string();
@@ -732,10 +731,10 @@ async fn update_collection(
         .expression
         .as_ref()
         .map(|e| expression_normalisee(e.as_deref()));
-    if let Some(Some(ref e)) = expression {
-        if let Err(refus) = verifier_expression(Some(e)) {
-            return Ok(refus);
-        }
+    if let Some(Some(ref e)) = expression
+        && let Some(refus) = verifier_expression(Some(e))
+    {
+        return Ok(refus);
     }
     // Refuse les références circulaires avant d'écrire quoi que ce soit.
     if let Some(ref rules) = body.rules {
@@ -1794,7 +1793,7 @@ async fn preview_albums(
 ) -> Result<axum::response::Response, AppError> {
     // #7872 — l'aperçu refuse la même expression que l'enregistrement : 400
     // avec sa position.
-    if let Err(refus) =
+    if let Some(refus) =
         verifier_expression(expression_normalisee(body.expression.as_deref()).as_deref())
     {
         return Ok(refus);
