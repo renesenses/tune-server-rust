@@ -2347,6 +2347,11 @@ mod dsd_passthrough_tests;
 #[cfg(test)]
 mod dsd_upnp_politique_de_zone_tests;
 
+/// #8052 — prêt de sorties : la façade annonce le DSD de sa sortie locale, et
+/// le prêteur sert le DSD reçu comme un `.dsf` de sa bibliothèque.
+#[cfg(test)]
+mod dsd_pret_de_sorties_8052_tests;
+
 /// Relevé par #5119 — les bras DSF UPnP et AAC n'appliquent pas l'égaliseur
 /// d'une zone LOCALE dans son flux : mesuré sur le PCM, une passe et non deux.
 #[cfg(test)]

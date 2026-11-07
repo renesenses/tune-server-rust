@@ -27,7 +27,7 @@
 //! | `POST /reglages/identite` | le nom du compte du jeton personnel, retenu |
 //! | `POST /synchroniser` | lance la synchronisation (202) |
 //! | `GET /etat` | l'avancement (liste, streaming, bibliothèque), l'affinage MusicBrainz `{en_cours, restants}`, la dernière synchronisation, la dernière erreur |
-//! | `GET /collection[?format=&etat=&dossier=&genre=&style=]` | les disques, leur état, les compteurs (par état, format, dossier, genre, style) |
+//! | `GET /collection[?format=&etat=&dossier=&genre=&style=]` | les disques, leur état (et pour « nulle part » sa `raison`, #7981), les compteurs (par état, raison, format, dossier, genre, style) |
 //! | `GET /parcourir` | les dossiers Discogs, les genres et les styles de la collection, avec leurs compteurs (#7929) |
 //! | `GET /disques/{release}/services` | « Chercher sur les services » : les albums les plus proches chez chaque service connecté (#7928) |
 //! | `GET /cd?mb_release=&code_barre=` | un CD inséré est-il dans la collection, et copié ? |
@@ -75,7 +75,7 @@ use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
-use crate::correspondance::{AlbumLocal, Index};
+use crate::correspondance::{AlbumLocal, Index, Rapprochement};
 use crate::discogs::{Disque, Famille, code_barre_normalise, nom_utilisateur_valide};
 use crate::memoire::Memoire;
 use crate::synchro::code;
@@ -269,6 +269,35 @@ impl EtatDisque {
     }
 }
 
+/// Pourquoi un disque est « nulle part » (#7981), pour que l'écran le dise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Raison {
+    /// Ni la bibliothèque ni les services interrogés n'ont d'album qui
+    /// réponde.
+    AucunCandidat,
+    /// Plusieurs albums de la bibliothèque répondent : on ne choisit pas.
+    PlusieursCandidats,
+    /// Aucun service de streaming connecté : seule la bibliothèque a été
+    /// regardée.
+    ServiceNonInterroge,
+}
+
+impl Raison {
+    const TOUTES: [Raison; 3] = [
+        Raison::AucunCandidat,
+        Raison::PlusieursCandidats,
+        Raison::ServiceNonInterroge,
+    ];
+
+    fn code(self) -> &'static str {
+        match self {
+            Raison::AucunCandidat => "aucun_candidat",
+            Raison::PlusieursCandidats => "plusieurs_candidats",
+            Raison::ServiceNonInterroge => "service_non_interroge",
+        }
+    }
+}
+
 /// Un disque tel que l'écran le lit, et son état.
 fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Value, EtatDisque) {
     let codes = m
@@ -277,7 +306,8 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
         .map(|f| f.codes_barres.clone())
         .unwrap_or_default();
     let mb = m.liens_mb.get(&d.release_id).map(|l| &l.liens);
-    let local = index.trouver(d, &codes, mb);
+    let rapprochement = index.rapprocher(d, &codes, mb);
+    let local = rapprochement.trouve();
     let streaming = m.streaming.get(&d.release_id);
     let trouves = streaming.map(|s| s.trouves.clone()).unwrap_or_default();
     let etat = if local.is_some() {
@@ -289,6 +319,11 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
     } else {
         EtatDisque::AVerifier
     };
+    let raison = (etat == EtatDisque::NullePart).then_some(match rapprochement {
+        Rapprochement::Plusieurs(_) => Raison::PlusieursCandidats,
+        _ if services.is_empty() => Raison::ServiceNonInterroge,
+        _ => Raison::AucunCandidat,
+    });
     let copie = d.famille.se_copie().then_some(local.is_some());
     let bibliotheque = local.map(|(a, par)| {
         json!({
@@ -324,6 +359,12 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
         "bibliotheque": bibliotheque,
         "streaming": trouves,
         "etat": etat.code(),
+        // « nulle part » seulement : pourquoi (#7981) ; `null` sinon.
+        "raison": raison.map(Raison::code),
+        "candidats_locaux": match rapprochement {
+            Rapprochement::Plusieurs(n) => Some(n),
+            _ => None,
+        },
         "copie": copie,
         "proposer_extraction": copie == Some(false),
         "dossier": d.dossier,
@@ -471,6 +512,10 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
     for fam in Famille::TOUTES {
         par_format.insert(fam.code().into(), json!(0));
     }
+    let mut par_raison = serde_json::Map::new();
+    for r in Raison::TOUTES {
+        par_raison.insert(r.code().into(), json!(0));
+    }
     let mut cd_non_copies = 0u64;
     let navigation = compteurs_de_navigation(&m);
     let mut disques = Vec::new();
@@ -478,6 +523,9 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
         let (v, e) = vue(d, &m, &index, &services);
         incrementer(&mut par_etat, e.code());
         incrementer(&mut par_format, d.famille.code());
+        if let Some(r) = v["raison"].as_str() {
+            incrementer(&mut par_raison, r);
+        }
         if v["proposer_extraction"] == true {
             cd_non_copies += 1;
         }
@@ -503,6 +551,7 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
             "total": m.disques.len(),
             "par_etat": par_etat,
             "par_format": par_format,
+            "par_raison": par_raison,
             "cd_non_copies": cd_non_copies,
             "par_dossier": navigation["par_dossier"],
             "par_genre": navigation["par_genre"],
