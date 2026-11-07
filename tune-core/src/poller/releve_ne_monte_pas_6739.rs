@@ -152,9 +152,19 @@ impl PositionPoller {
         suivi_a_la_hausse_pour(output_type.as_deref())
     }
 
-    /// Applique `suite` : la consigne de la zone en mémoire (évènement
-    /// `volume` vers les clients : le curseur suit) et en base, puis, pour
-    /// un retour au plafond, la commande à l'appareil.
+    /// Applique `suite`.
+    ///
+    /// - `Adopter` : la consigne de la zone en mémoire (évènement `volume`
+    ///   vers les clients : le curseur suit) et en base. Rien n'est commandé.
+    /// - `RamenerAuPlafond` : la commande part D'ABORD, la consigne d'avant
+    ///   le relevé (`ancien`) restant le repère de la garde de hausse
+    ///   (#6919, #6721) ; la consigne devient ce que la garde a retenu
+    ///   (`VolumeRetenu::retenu`). L'appareil finit au plafond, ou plus bas,
+    ///   jamais plus haut que la consigne d'avant augmentée du seuil.
+    ///
+    /// Rien n'est fait si une consigne de Tune est arrivée depuis le relevé
+    /// (grâce de volume ouverte, ou mémoire qui n'est plus `ancien`) : le
+    /// geste de l'auditeur l'emporte sur un relevé déjà périmé.
     pub(super) async fn appliquer_la_suite_du_releve(
         &self,
         zone_id: i64,
@@ -162,15 +172,39 @@ impl PositionPoller {
         ancien: f64,
         suite: SuiteDuReleve,
     ) {
-        let nouveau = match suite {
-            SuiteDuReleve::Adopter(v) | SuiteDuReleve::RamenerAuPlafond(v) => v,
-        };
-        self.adopter_la_consigne(zone_id, nouveau).await;
-        // #6008 — l'adoption se dit au journal.
-        volume_adopte_6008::journaliser_volume_adopte(zone_id, appareil, ancien, nouveau);
-        if let SuiteDuReleve::RamenerAuPlafond(cible) = suite {
-            self.commander_le_plafond(zone_id, cible).await;
+        if self.consigne_posee_depuis_le_releve(zone_id, ancien).await {
+            info!(
+                zone_id,
+                appareil,
+                ancien,
+                ?suite,
+                "volume_releve_perime_ecarte"
+            );
+            return;
         }
+        match suite {
+            SuiteDuReleve::Adopter(nouveau) => {
+                self.adopter_la_consigne(zone_id, nouveau).await;
+                // #6008 — l'adoption se dit au journal.
+                volume_adopte_6008::journaliser_volume_adopte(zone_id, appareil, ancien, nouveau);
+            }
+            SuiteDuReleve::RamenerAuPlafond(cible) => {
+                if let Some(retenu) = self.commander_le_plafond(zone_id, cible).await {
+                    volume_adopte_6008::journaliser_volume_adopte(
+                        zone_id, appareil, ancien, retenu,
+                    );
+                }
+            }
+        }
+    }
+
+    /// #7379 — vrai quand une consigne a été posée depuis le relevé : la
+    /// grâce de volume est ouverte, ou la mémoire n'est plus `ancien`.
+    pub(super) async fn consigne_posee_depuis_le_releve(&self, zone_id: i64, ancien: f64) -> bool {
+        let etat = self.playback.get_state(zone_id).await;
+        etat.last_volume_set_at
+            .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS)
+            || (etat.volume - ancien).abs() > 1e-3
     }
 
     /// La consigne de la zone devient `volume`, en mémoire (évènement
@@ -184,28 +218,48 @@ impl PositionPoller {
             .ok();
     }
 
-    /// #7379 — ramène l'appareil au plafond `cible` (échelle de consigne),
-    /// déjà adopté comme consigne. Par le point de passage unique
-    /// (`set_volume`) : la limite de sécurité borne la valeur envoyée, trim
-    /// compris. La garde de hausse (#6919, #6721) ne retient rien : la
-    /// mémoire est déjà à `cible` et l'appareil plus haut, c'est une baisse.
-    pub(super) async fn commander_le_plafond(&self, zone_id: i64, cible: f64) {
+    /// #7379 — ramène l'appareil vers `cible` (échelle de consigne) par le
+    /// point de passage unique, SOUS la garde de hausse : son repère est la
+    /// consigne en mémoire, celle d'avant le relevé, jamais le relevé. La
+    /// limite de sécurité borne la valeur envoyée, trim compris. En cas de
+    /// succès, l'orchestrateur a déjà écrit la valeur retenue en mémoire et
+    /// en base ; elle est rendue. `None` en cas d'échec : rien n'est adopté.
+    pub(super) async fn commander_le_plafond(&self, zone_id: i64, cible: f64) -> Option<f64> {
         let device_id = self.get_zone_device_id(zone_id);
         match self
             .orchestrator
-            .set_volume(zone_id, cible, device_id.as_deref())
+            .set_volume_avec_garde(
+                zone_id,
+                cible,
+                device_id.as_deref(),
+                crate::audio::garde_de_hausse::Hausse::Gardee,
+            )
             .await
         {
-            Ok(()) => info!(zone_id, cible, "volume_ramene_au_plafond_ok"),
-            Err(e) => warn!(zone_id, cible, error = %e, "volume_ramene_au_plafond_echec"),
+            Ok(r) => {
+                info!(
+                    zone_id,
+                    cible,
+                    retenu = r.retenu,
+                    "volume_ramene_au_plafond_ok"
+                );
+                Some(r.retenu)
+            }
+            Err(e) => {
+                warn!(zone_id, cible, error = %e, "volume_ramene_au_plafond_echec");
+                None
+            }
         }
     }
 }
 
-/// #7379 — `true` pour une sortie à volume matériel, `false` pour une sortie
-/// à volume logiciel (même partage que
+/// #7379 — `true` pour une sortie à volume matériel connue, `false` pour une
+/// sortie à volume logiciel (même partage que
 /// [`crate::audio::volume_scale::EchelleDeVolume::de_la_sortie`]).
+/// Un type de sortie inconnu (`NULL` en base) n'est pas suivi vers le haut :
+/// la prudence.
 pub(super) fn suivi_a_la_hausse_pour(output_type: Option<&str>) -> bool {
-    crate::audio::volume_scale::EchelleDeVolume::de_la_sortie(output_type)
-        != crate::audio::volume_scale::EchelleDeVolume::Perceptive
+    output_type.is_some()
+        && crate::audio::volume_scale::EchelleDeVolume::de_la_sortie(output_type)
+            != crate::audio::volume_scale::EchelleDeVolume::Perceptive
 }

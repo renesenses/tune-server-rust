@@ -60,41 +60,34 @@ impl PositionPoller {
         let Some(securite) = limites.securite else {
             return true;
         };
-        // #7379 — la consigne qui fait recevoir la limite à l'appareil, trim
-        // compris : jamais au-dessus de la consigne la plus haute (1).
-        let trim_db = crate::orchestrator::gain_trim_db_enregistre(&self.db, zone_id);
-        let facteur = super::decisions::facteur_de_releve(trim_db);
-        if facteur <= 0.0 {
+        let consigne = self.playback.get_state(zone_id).await.volume;
+        // #7379 — une consigne posée depuis le relevé l'emporte.
+        if self
+            .consigne_posee_depuis_le_releve(zone_id, consigne)
+            .await
+        {
             return true;
         }
-        let consigne = self.playback.get_state(zone_id).await.volume;
         // #7379, #8074 — sur une sortie à volume logiciel (pas de bouton
         // d'ampli à suivre), ou un appareil qui se dit à 100 % (réveil à
         // pleine échelle, #5662 : les sites d'adoption l'écartent aussi), la
         // consigne ne monte jamais vers la limite : Tune recommande la
         // consigne, bornée (règle d'avant le 02/11).
-        if !self.suivi_a_la_hausse_permis(zone_id) || rapporte >= 0.999 {
-            let cible = limites.borner_appareil(consigne);
-            warn!(
-                zone_id,
-                rapporte, consigne, cible, "volume_plafond_reimpose"
-            );
-            self.commander_le_plafond(zone_id, cible).await;
-            return true;
-        }
-        let cible = (securite / facteur).min(1.0);
-        // Le niveau réel de l'appareil, pour que la garde de hausse (#6721)
-        // voie le retour au plafond comme la baisse qu'il est.
-        if rapporte.is_finite() {
-            self.orchestrator
-                .niveaux_des_appareils
-                .noter(zone_id, rapporte / facteur);
-        }
+        //
+        // Sinon, la cible est la limite en échelle de consigne SANS trim
+        // (B2 de la revue : `limite / facteur` enregistrait 100 % avec un trim
+        // négatif, que la remise du trim à 0 envoyait ensuite). Elle part sous
+        // la garde de hausse, la consigne d'avant restant le repère
+        // (`commander_le_plafond`) : l'appareil finit à la limite ou plus bas.
+        let cible = if !self.suivi_a_la_hausse_permis(zone_id) || rapporte >= 0.999 {
+            limites.borner_appareil(consigne)
+        } else {
+            securite.clamp(0.0, 1.0)
+        };
         warn!(
             zone_id,
             rapporte, consigne, cible, "volume_plafond_reimpose"
         );
-        self.adopter_la_consigne(zone_id, cible).await;
         self.commander_le_plafond(zone_id, cible).await;
         true
     }

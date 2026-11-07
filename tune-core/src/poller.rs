@@ -62,6 +62,20 @@ static STATUS_POLL_TIMEOUT: LazyLock<Option<Duration>> = LazyLock::new(|| {
 /// concurrence avec l'orchestrateur pour ne rien gagner. Une sortie qui ne
 /// tient pas d'anneau — tout renderer réseau — rend `None` par défaut de
 /// trait.
+/// #7379 — vrai quand le volume que `output` vient de rendre est le repli de
+/// #5662 (0,5 sur une réponse DLNA illisible) et non une valeur lue. Le repli
+/// reste dans le statut pour les autres lecteurs ; le sondeur, lui, ne le
+/// prend jamais pour un geste au bouton (ni suivi, ni retour au plafond,
+/// ni repère du front #358).
+pub(crate) fn volume_releve_illisible(output: &dyn OutputTarget) -> bool {
+    let any = output.as_any();
+    if let Some(dlna) = any.downcast_ref::<crate::outputs::dlna::DlnaOutput>() {
+        return dlna.dernier_volume_illisible();
+    }
+    any.downcast_ref::<crate::outputs::mock::MockOutput>()
+        .is_some_and(|m| m.dernier_volume_illisible())
+}
+
 async fn get_status_with_signal_path_bounded(
     output_arc: &Arc<Mutex<Box<dyn OutputTarget>>>,
     timeout: Option<Duration>,
@@ -73,6 +87,7 @@ async fn get_status_with_signal_path_bounded(
         Option<OutputRingStarvation>,
         Option<TransformationsReelles>,
         Option<u64>,
+        bool,
     ),
     String,
 > {
@@ -96,6 +111,9 @@ async fn get_status_with_signal_path_bounded(
             // réellement fait au flux se relève à côté de sa sonde.
             output.transformations_reelles(),
             progress,
+            // #7379 — le volume du statut est-il le repli d'une réponse
+            // illisible (#5662) ? Le sondeur ne le juge jamais.
+            volume_releve_illisible(&**output),
         ))
     };
     match timeout {

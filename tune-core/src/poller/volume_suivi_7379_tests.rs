@@ -9,6 +9,18 @@
 //! sortie factice de type `dlna`. Aucun son, aucun appareil réel.
 use super::volume_pure_5695_tests::Banc;
 use crate::audio::volume_limites::cle_securite;
+use crate::outputs::traits::TransportState;
+
+/// Ce que la garde de hausse laisse passer vers `cible` depuis la consigne
+/// d'avant le relevé `avant` (échelle linéaire d'un DLNA) : le retour au
+/// plafond part SOUS la garde (suggestion 3 de la revue de #7702).
+pub(super) fn retenu_depuis(avant: f64, cible: f64) -> f64 {
+    crate::audio::garde_de_hausse::plafond(
+        avant,
+        crate::audio::volume_scale::EchelleDeVolume::Lineaire,
+    )
+    .min(cible)
+}
 
 /// La zone à 30 %, l'appareil conforme, première observation faite.
 async fn banc_a_30(limite: Option<&str>) -> Banc {
@@ -64,8 +76,10 @@ async fn un_geste_au_bouton_sous_le_plafond_est_suivi_7379() {
 }
 
 /// Geste au bouton vers 95 % sans limite réglée : au-dessus du plafond par
-/// défaut (85 %). Tune ramène l'appareil AU plafond, une fois, et la consigne
-/// et le curseur s'y alignent. Jamais « illimité ».
+/// défaut (85 %). Tune ramène l'appareil vers le plafond, une fois, SOUS la
+/// garde de hausse dont le repère reste la consigne d'avant (30 %) :
+/// l'appareil finit au plus à 30 % + 10 dB de garde, jamais au-dessus du
+/// plafond. La consigne et le curseur s'alignent sur ce qui est parti.
 #[tokio::test]
 async fn sans_limite_au_dessus_du_plafond_par_defaut_l_appareil_est_ramene_7379() {
     let mut banc = banc_a_30(None).await;
@@ -74,18 +88,20 @@ async fn sans_limite_au_dessus_du_plafond_par_defaut_l_appareil_est_ramene_7379(
     for _ in 0..3 {
         banc.tic().await;
     }
+    let attendu = retenu_depuis(0.3, 0.85);
+    assert!(attendu < 0.85, "la garde doit mordre ici : {attendu}");
     let recus = banc.commandes_depuis(deja).await;
     assert_eq!(
         recus,
-        vec![0.85],
-        "#7379 : l'appareil à 95 % doit être ramené au plafond par défaut (85 %), une fois"
+        vec![attendu],
+        "#7379 : l'appareil à 95 % doit être ramené une fois, sous la garde"
     );
-    assert!((banc.volume_en_base() - 85.0).abs() < 1e-6);
+    assert!((banc.volume_en_base() - attendu * 100.0).abs() < 1e-6);
     let publies = volumes_publies(&mut recu, banc.zone_id);
     assert_eq!(
         publies.last().copied(),
-        Some(0.85),
-        "le curseur doit afficher le plafond : {publies:?}"
+        Some(attendu),
+        "le curseur doit afficher ce qui est parti : {publies:?}"
     );
     assert!(publies.iter().all(|v| *v <= 0.85 + 1e-12), "{publies:?}");
 }
@@ -220,4 +236,298 @@ fn le_suivi_a_la_hausse_ne_vaut_que_pour_un_volume_materiel_7379() {
     }
     assert!(!suivi_a_la_hausse_pour(Some("local")));
     assert!(!suivi_a_la_hausse_pour(Some("browser")));
+}
+
+// ── Revue de #7702 (07/11) ────────────────────────────────────────────────
+
+/// B1 — limite 40 %, consigne 10 %, appareil réellement à 10 %. La réponse
+/// de volume devient illisible : le statut rend le repli 0,5 de #5662. Ce
+/// n'est pas un geste : rien n'est ramené à la limite, rien n'est suivi, et
+/// aucune commande ne part au-dessus de 10 %, zone en lecture.
+#[tokio::test]
+async fn un_releve_illisible_n_est_jamais_un_geste_zone_en_lecture_7379() {
+    let mut banc = Banc::monter(false).await;
+    banc.poser_reglage(&cle_securite(banc.zone_id), "0.4");
+    banc.zone_a(10.0).await;
+    banc.appareil_a(0.1).await;
+    banc.tic().await;
+    let mut recu = banc.evenements_de_lecture();
+    let deja = banc.appareil_a(0.1).await;
+    banc.volume_illisible(true).await;
+    for _ in 0..4 {
+        banc.tic().await;
+    }
+    let recus = banc.commandes_depuis(deja).await;
+    assert!(
+        recus.iter().all(|v| *v <= 0.1 + 1e-9),
+        "B1 : un relevé illisible a commandé {recus:?} (repli 0,5 pris pour un geste)"
+    );
+    assert!(
+        (banc.volume_en_base() - 10.0).abs() < 1e-6,
+        "{}",
+        banc.volume_en_base()
+    );
+    assert!((banc.volume_en_memoire().await - 0.1).abs() < 1e-9);
+    assert!(volumes_publies(&mut recu, banc.zone_id).is_empty());
+    // Redevenu lisible, toujours à 10 % : rien ne bouge non plus (le repli
+    // n'est pas devenu le repère du front #358).
+    banc.volume_illisible(false).await;
+    banc.tic().await;
+    assert!((banc.volume_en_base() - 10.0).abs() < 1e-6);
+    assert!(
+        banc.commandes_depuis(deja)
+            .await
+            .iter()
+            .all(|v| *v <= 0.1 + 1e-9)
+    );
+}
+
+/// B1 — même chose sans limite : consigne 20 %, repli 0,5 sous le plafond
+/// par défaut. Rien n'est suivi ; le curseur reste à 20, et le « volume − »
+/// suivant ne part jamais au-dessus de 20.
+#[tokio::test]
+async fn un_releve_illisible_sans_limite_n_est_pas_suivi_7379() {
+    let mut banc = Banc::monter(false).await;
+    banc.zone_a(20.0).await;
+    banc.appareil_a(0.2).await;
+    banc.tic().await;
+    let deja = banc.appareil_a(0.2).await;
+    banc.volume_illisible(true).await;
+    for _ in 0..3 {
+        banc.tic().await;
+    }
+    assert!(
+        (banc.volume_en_base() - 20.0).abs() < 1e-6,
+        "{}",
+        banc.volume_en_base()
+    );
+    banc.consigne_gardee(0.18).await;
+    let recus = banc.commandes_depuis(deja).await;
+    assert!(
+        !recus.is_empty() && recus.iter().all(|v| *v <= 0.2 + 1e-9),
+        "B1 : après un repli suivi, « volume − » enverrait plus que 20 % : {recus:?}"
+    );
+}
+
+/// B1 — zone ARRÊTÉE dans Tune (site « au repos »), appareil arrêté ou en
+/// lecture d'une autre source, limite 40 %, consigne 10 % : le repli 0,5 ne
+/// déclenche aucun retour à la limite.
+#[tokio::test]
+async fn un_releve_illisible_n_est_jamais_un_geste_zone_arretee_7379() {
+    for etat in [TransportState::Stopped, TransportState::Playing] {
+        let mut banc = Banc::monter(false).await;
+        banc.poser_reglage(&cle_securite(banc.zone_id), "0.4");
+        banc.zone_a(10.0).await;
+        banc.appareil_a(0.1).await;
+        banc.arreter_dans_tune().await;
+        banc.tic_au_repos(etat).await;
+        let deja = banc.appareil_a(0.1).await;
+        banc.volume_illisible(true).await;
+        for _ in 0..3 {
+            banc.tic_au_repos(etat).await;
+        }
+        let recus = banc.commandes_depuis(deja).await;
+        assert!(
+            recus.iter().all(|v| *v <= 0.1 + 1e-9),
+            "B1 ({etat:?}) : zone arrêtée, le repli a commandé {recus:?}"
+        );
+        assert!((banc.volume_en_base() - 10.0).abs() < 1e-6);
+    }
+}
+
+/// Contrôle du banc « au repos » : un VRAI dépassement de la limite, zone
+/// arrêtée dans Tune, est bien ramené (le témoin précédent n'est pas vert
+/// par un site muet).
+#[tokio::test]
+async fn zone_arretee_un_vrai_depassement_est_ramene_7379() {
+    let mut banc = Banc::monter(false).await;
+    banc.poser_reglage(&cle_securite(banc.zone_id), "0.4");
+    banc.zone_a(10.0).await;
+    banc.appareil_a(0.1).await;
+    banc.arreter_dans_tune().await;
+    banc.tic_au_repos(TransportState::Stopped).await;
+    let deja = banc.appareil_a(0.9).await;
+    banc.tic_au_repos(TransportState::Stopped).await;
+    let recus = banc.commandes_depuis(deja).await;
+    assert_eq!(recus.len(), 1, "{recus:?}");
+    assert!(recus[0] <= 0.4 + 1e-9, "{recus:?}");
+}
+
+/// B1, site radio : la webradio joue, la réponse devient illisible, limite
+/// 40 %, consigne 10 % : rien ne part au-dessus de 10 %.
+#[tokio::test]
+async fn un_releve_illisible_en_radio_n_est_jamais_un_geste_7379() {
+    let mut banc = Banc::monter(false).await;
+    banc.poser_reglage(&cle_securite(banc.zone_id), "0.4");
+    banc.en_radio().await;
+    banc.zone_a(10.0).await;
+    banc.appareil_a(0.1).await;
+    banc.tic_radio().await;
+    let deja = banc.appareil_a(0.1).await;
+    banc.volume_illisible(true).await;
+    for _ in 0..3 {
+        banc.tic_radio().await;
+    }
+    let recus = banc.commandes_depuis(deja).await;
+    assert!(recus.iter().all(|v| *v <= 0.1 + 1e-9), "{recus:?}");
+    assert!((banc.volume_en_base() - 10.0).abs() < 1e-6);
+}
+
+/// Site radio : un geste au bouton sous le plafond est suivi, au-dessus il
+/// est ramené sous la garde, comme au site de lecture.
+#[tokio::test]
+async fn en_radio_suivi_sous_le_plafond_et_retour_au_dessus_7379() {
+    let mut banc = Banc::monter(false).await;
+    banc.en_radio().await;
+    banc.zone_a(30.0).await;
+    banc.appareil_a(0.3).await;
+    banc.tic_radio().await;
+    let deja = banc.appareil_a(0.55).await;
+    banc.tic_radio().await;
+    assert!(
+        (banc.volume_en_base() - 55.0).abs() < 1e-6,
+        "{}",
+        banc.volume_en_base()
+    );
+    assert!(banc.commandes_depuis(deja).await.is_empty());
+    let deja = banc.appareil_a(0.95).await;
+    banc.tic_radio().await;
+    let attendu = retenu_depuis(0.55, 0.85);
+    assert_eq!(banc.commandes_depuis(deja).await, vec![attendu]);
+    assert!(attendu <= 0.85);
+}
+
+/// Site « au repos » (l'appareil joue une autre source, zone arrêtée dans
+/// Tune) : même règle.
+#[tokio::test]
+async fn au_repos_suivi_sous_le_plafond_et_retour_au_dessus_7379() {
+    let mut banc = Banc::monter(false).await;
+    banc.zone_a(30.0).await;
+    banc.appareil_a(0.3).await;
+    banc.arreter_dans_tune().await;
+    banc.tic_au_repos(TransportState::Playing).await;
+    banc.appareil_a(0.55).await;
+    banc.tic_au_repos(TransportState::Playing).await;
+    assert!(
+        (banc.volume_en_base() - 55.0).abs() < 1e-6,
+        "{}",
+        banc.volume_en_base()
+    );
+    let deja = banc.appareil_a(0.95).await;
+    banc.tic_au_repos(TransportState::Playing).await;
+    let recus = banc.commandes_depuis(deja).await;
+    assert_eq!(recus, vec![retenu_depuis(0.55, 0.85)]);
+}
+
+/// B2, de bout en bout — trim −6 dB, consigne 50 % (l'appareil reçoit 25 %).
+/// Geste au bouton vers 60 % : la consigne suit le niveau RÉEL (60), jamais
+/// 100. Puis l'auditeur remet le trim à 0 (`PATCH /zones`, « Effet
+/// immédiat ») : l'appareil ne reçoit jamais plus que 60 %, ni que 85 %.
+#[tokio::test]
+async fn trim_negatif_suivi_puis_trim_remis_a_zero_7379() {
+    let mut banc = banc_a_30(None).await;
+    banc.changer_le_trim(-6.0).await;
+    banc.consigne(0.5).await;
+    let compose = banc.commandes_depuis(0).await.last().copied().unwrap();
+    assert!(
+        (compose - 0.5 * 10f64.powf(-6.0 / 20.0)).abs() < 1e-9,
+        "{compose}"
+    );
+    banc.appareil_a(compose).await;
+    banc.tic().await;
+    banc.appareil_a(0.6).await;
+    banc.tic().await;
+    assert!(
+        (banc.volume_en_base() - 60.0).abs() < 1e-6,
+        "B2 : trim −6 dB, geste à 60 % : consigne {} % (jamais 100)",
+        banc.volume_en_base()
+    );
+    let deja = banc.appareil_a(0.6).await;
+    banc.changer_le_trim(0.0).await;
+    let recus = banc.commandes_depuis(deja).await;
+    assert!(
+        !recus.is_empty() && recus.iter().all(|v| *v <= 0.6 + 1e-9),
+        "B2 : trim remis à 0, l'appareil à 60 % a reçu {recus:?}"
+    );
+}
+
+/// B2 — trim −6 dB au-dessus du plafond : la consigne passe au plafond sans
+/// trim (ou plus bas, sous la garde), jamais 100 %.
+#[tokio::test]
+async fn trim_negatif_au_dessus_du_plafond_jamais_100_7379() {
+    let mut banc = banc_a_30(None).await;
+    banc.changer_le_trim(-6.0).await;
+    banc.consigne(0.5).await;
+    let compose = banc.commandes_depuis(0).await.last().copied().unwrap();
+    banc.appareil_a(compose).await;
+    banc.tic().await;
+    banc.appareil_a(0.95).await;
+    for _ in 0..3 {
+        banc.tic().await;
+    }
+    assert!(
+        banc.volume_en_base() <= 85.0 + 1e-6,
+        "B2 : consigne {} % au-dessus du plafond",
+        banc.volume_en_base()
+    );
+    let deja = banc.appareil_a(0.5).await;
+    banc.changer_le_trim(0.0).await;
+    assert!(
+        banc.commandes_depuis(deja)
+            .await
+            .iter()
+            .all(|v| *v <= 0.85 + 1e-9)
+    );
+}
+
+/// Non bloquant 2 — un relevé jugé AVANT une consigne de l'auditeur n'est
+/// pas appliqué après : ni retour au plafond, ni suivi.
+#[tokio::test]
+async fn un_releve_perime_par_un_set_volume_concurrent_n_est_pas_applique_7379() {
+    use super::releve_ne_monte_pas_6739::SuiteDuReleve;
+    let banc = banc_a_30(None).await;
+    let deja = banc.appareil_a(0.95).await;
+    banc.consigne_a_l_instant(0.2).await;
+    let apres_baisse = banc.commandes_depuis(deja).await;
+    banc.appliquer_un_releve(0.3, SuiteDuReleve::RamenerAuPlafond(0.85))
+        .await;
+    banc.appliquer_un_releve(0.3, SuiteDuReleve::Adopter(0.6))
+        .await;
+    assert_eq!(
+        banc.commandes_depuis(deja).await,
+        apres_baisse,
+        "rien ne doit partir après la baisse de l'auditeur"
+    );
+    assert!((banc.volume_en_memoire().await - 0.2).abs() < 1e-9);
+    assert!((banc.volume_en_base() - 20.0).abs() < 1e-6);
+}
+
+/// Zones groupées : un geste au bouton sur l'appareil d'une zone du groupe
+/// n'aligne que CETTE zone, et rien ne part vers l'autre appareil.
+#[tokio::test]
+async fn zones_groupees_le_suivi_reste_a_la_zone_du_geste_7379() {
+    let mut banc = banc_a_30(None).await;
+    let b = banc.grouper_avec("dlna-salon-b", "groupe-7379").await;
+    banc.tic().await;
+    let deja_a = banc.appareil_a(0.3).await;
+    let deja_b = banc.appareil_de("dlna-salon-b", 0.6).await;
+    banc.tic().await;
+    assert!(
+        (banc.volume_en_base_de(b) - 60.0).abs() < 1e-6,
+        "{}",
+        banc.volume_en_base_de(b)
+    );
+    assert!(
+        (banc.volume_en_base() - 30.0).abs() < 1e-6,
+        "{}",
+        banc.volume_en_base()
+    );
+    assert!(banc.commandes_depuis(deja_a).await.is_empty());
+    assert!(banc.commandes_de("dlna-salon-b", deja_b).await.is_empty());
+}
+
+#[test]
+fn un_type_de_sortie_inconnu_n_est_pas_suivi_vers_le_haut_7379() {
+    use super::releve_ne_monte_pas_6739::suivi_a_la_hausse_pour;
+    assert!(!suivi_a_la_hausse_pour(None));
 }

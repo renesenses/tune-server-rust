@@ -46,6 +46,9 @@ pub struct MockOutput {
     /// C'est pourtant exactement la question du mode bit-perfect, où le défaut
     /// était de RENVOYER 100 % à chaque piste à un appareil déjà à 100 %.
     volume_calls: Arc<Mutex<Vec<f64>>>,
+    /// #7379 — armé, `get_status` rend le repli de #5662 (0,5) comme un DLNA
+    /// dont la réponse de volume est illisible.
+    volume_illisible: Arc<AtomicBool>,
     /// Le comportement du Devialet (renderer Rygel, fil 1780) : un Seek reçu
     /// en pause laisse l'appareil EN PAUSE — contrat UPnP. Armé, `seek`
     /// repasse l'état à `Paused`.
@@ -132,6 +135,7 @@ impl MockOutput {
             stop_calls: Arc::new(AtomicU64::new(0)),
             set_next_calls: Arc::new(Mutex::new(Vec::new())),
             volume_calls: Arc::new(Mutex::new(Vec::new())),
+            volume_illisible: Arc::new(AtomicBool::new(false)),
             seek_laisse_en_pause: Arc::new(AtomicBool::new(false)),
             sans_media: Arc::new(AtomicBool::new(false)),
             rien_ne_jouait: Arc::new(AtomicBool::new(false)),
@@ -215,6 +219,16 @@ impl MockOutput {
 
     /// Override the reported `output_type` (default "mock"), so tests can model
     /// a specific protocol (e.g. "dlna" vs "squeezebox").
+    /// #7379 — la réponse de volume devient illisible (`true`) ou lisible.
+    pub fn rendre_le_volume_illisible(&self, illisible: bool) {
+        self.volume_illisible.store(illisible, Ordering::SeqCst);
+    }
+
+    /// #7379 — vrai quand le volume du statut est le repli de #5662.
+    pub fn dernier_volume_illisible(&self) -> bool {
+        self.volume_illisible.load(Ordering::SeqCst)
+    }
+
     pub fn with_type(mut self, output_type: &str) -> Self {
         self.output_type = output_type.into();
         self
@@ -563,7 +577,11 @@ impl OutputTarget for MockOutput {
             state: *self.state.lock().await,
             position_ms: self.position_ms.load(Ordering::Relaxed),
             duration_ms: self.duration_ms.load(Ordering::Relaxed),
-            volume: *self.volume.lock().await,
+            volume: if self.volume_illisible.load(Ordering::SeqCst) {
+                crate::outputs::dlna::volume_illisible_5662::REPLI_ILLISIBLE
+            } else {
+                *self.volume.lock().await
+            },
             muted: *self.muted.lock().await,
             current_uri: self.current_uri.lock().await.clone(),
             track_title: None,

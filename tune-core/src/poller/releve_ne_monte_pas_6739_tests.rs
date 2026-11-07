@@ -89,30 +89,33 @@ async fn un_releve_a_96_est_ramene_au_plafond_sans_cliquet_6739() {
     for _ in 0..3 {
         banc.tic().await;
     }
+    // Retour sous la garde de hausse, repère la consigne d'avant (36 %) :
+    // jamais au-dessus du plafond par défaut (85 %).
+    let attendu = super::volume_suivi_7379_tests::retenu_depuis(0.36, 0.85);
     assert!(
-        (banc.volume_en_base() - 85.0).abs() < 1e-6,
-        "#6739/#7379 : le relevé de l'appareil (96 %) doit faire passer la consigne AU \
-         plafond de suivi par défaut (85 %), pas {} %",
+        (banc.volume_en_base() - attendu * 100.0).abs() < 1e-6,
+        "#6739/#7379 : le relevé de l'appareil (96 %) doit faire passer la consigne à \
+         {attendu} (sous le plafond, sous la garde), pas {} %",
         banc.volume_en_base()
     );
     let affiche = banc.volume_en_memoire().await;
     assert!(
-        (affiche - 0.85).abs() < 1e-9,
-        "#7379 : le curseur doit afficher le plafond, pas {affiche}"
+        (affiche - attendu).abs() < 1e-9,
+        "#7379 : le curseur doit afficher ce qui est parti, pas {affiche}"
     );
     let ramene = banc.commandes_depuis(deja).await;
     assert_eq!(
-        ramene.iter().map(|v| en_pour_cent(*v)).collect::<Vec<_>>(),
-        vec![85],
-        "#7379 : l'appareil à 96 % doit être ramené une fois au plafond (85) : {ramene:?}"
+        ramene,
+        vec![attendu],
+        "#7379 : l'appareil à 96 % doit être ramené une fois : {ramene:?}"
     );
     // Le geste suivant : « volume − » d'un pas depuis ce que la zone affiche.
-    let deja = banc.appareil_a(0.85).await;
+    let deja = banc.appareil_a(attendu).await;
     banc.tic().await;
     banc.consigne(affiche - 0.05).await;
     let recus = banc.commandes_depuis(deja).await;
     assert!(
-        !recus.is_empty() && recus.iter().all(|v| en_pour_cent(*v) <= 80),
+        !recus.is_empty() && recus.iter().all(|v| *v <= affiche - 0.05 + 1e-9),
         "#6739 : après un relevé à 96, un pas de « volume − » a envoyé {recus:?} — la \
          consigne suivante a MONTÉ"
     );
@@ -203,12 +206,26 @@ fn la_regle_du_releve_suit_sous_le_plafond_6739_7379() {
         JugementDuReleve::Adopter(v) => assert!((v - 0.1 / facteur).abs() < 1e-9),
         autre => panic!("baisse sur l'appareil non adoptée : {autre:?}"),
     }
-    // Trim −6 dB, appareil monté à 0,6 (sous 0,7) : consigne 0,6 / 0,501,
-    // bornée à 1.
+    // B2 de la revue de #7702 — trim −6 dB, appareil monté à 0,6 : la
+    // consigne suit le niveau RÉEL de l'appareil (0,6), jamais 0,6 / 0,501
+    // borné à 1 : remettre le trim à 0 n'enverra jamais plus que 0,6.
     match juger_le_releve_de_volume(Some(compose), 0.6, 0.5, -6.0, DEFAUT) {
-        JugementDuReleve::Adopter(v) => assert!((v - 1.0).abs() < 1e-9, "{v}"),
+        JugementDuReleve::Adopter(v) => assert!((v - 0.6).abs() < 1e-9, "{v}"),
         autre => panic!("{autre:?}"),
     }
+    // Trim −6 dB, appareil monté à 0,4 : plus haut que ce que Tune lui
+    // envoyait (0,25), mais sous la consigne (0,5) une fois le trim retiré
+    // de l'équation : rien n'est suivi vers le haut.
+    assert_eq!(
+        juger_le_releve_de_volume(Some(compose), 0.4, 0.5, -6.0, DEFAUT),
+        JugementDuReleve::Ignorer
+    );
+    // Trim −6 dB au-dessus du plafond : retour au plafond SANS trim (0,85),
+    // jamais 0,85 / 0,501 borné à 1.
+    assert_eq!(
+        juger_le_releve_de_volume(Some(compose), 0.9, 0.5, -6.0, DEFAUT),
+        JugementDuReleve::RamenerAuPlafond(DEFAUT)
+    );
     // Consigne de silence : jamais rouverte, même sous le plafond.
     assert!(matches!(
         juger_le_releve_de_volume(Some(0.0), 0.4, 0.0, 0.0, DEFAUT),

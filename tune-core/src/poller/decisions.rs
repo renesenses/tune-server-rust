@@ -1155,13 +1155,21 @@ pub fn juger_le_releve_de_volume(
     if releve < db_vol {
         return JugementDuReleve::Adopter(releve.clamp(0.0, db_vol.clamp(0.0, 1.0)));
     }
-    // Le plafond en échelle de consigne : ce que `set_volume` doit recevoir
-    // pour que l'appareil reçoive le plafond, trim compris.
-    let plafond_consigne = (plafond_appareil.clamp(0.0, 1.0) / facteur).min(1.0);
+    // B2 de la revue de #7702 — à la HAUSSE, la consigne se compte SANS
+    // trim : jamais au-delà du plafond, ni du niveau RÉEL de l'appareil
+    // (`device_vol`). Avec un trim négatif, `releve = device_vol / facteur`
+    // dépasse ce que l'appareil joue (−6 dB : un geste à 60 % donnait une
+    // consigne à 100 %), et la remise du trim à 0 envoyait cette consigne
+    // telle quelle. Le facteur ne dépasse jamais 1 : `device_vol <= releve`.
+    let plafond_consigne = plafond_appareil.clamp(0.0, 1.0);
     if device_vol > plafond_appareil + crate::audio::volume_limites::TOLERANCE_RENDERER {
         return JugementDuReleve::RamenerAuPlafond(plafond_consigne);
     }
-    JugementDuReleve::Adopter(releve.clamp(0.0, plafond_consigne))
+    let suivi = releve.min(device_vol).clamp(0.0, plafond_consigne);
+    if suivi <= db_vol + 0.02 {
+        return JugementDuReleve::Ignorer;
+    }
+    JugementDuReleve::Adopter(suivi)
 }
 
 /// Plus haut volume de zone tenu pour une consigne de silence : la

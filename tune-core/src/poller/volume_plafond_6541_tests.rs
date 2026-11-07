@@ -22,15 +22,18 @@ async fn au_dessus_de_la_limite_le_sondeur_ramene_au_plafond_6541_7379() {
     let mut banc = banc_limite().await;
     let deja = banc.appareil_a(0.95).await;
     banc.tic().await;
+    // Suggestion 3 de la revue de #7702 : sous la garde de hausse, repère la
+    // consigne d'avant (40 %) — à la limite ou plus bas.
+    let attendu = super::volume_suivi_7379_tests::retenu_depuis(0.4, 0.7);
     assert!(
-        (banc.volume_en_base() - 70.0).abs() < 1e-6,
-        "limite de sécurité 70 % : la consigne s'aligne sur la limite, pas {}",
+        (banc.volume_en_base() - attendu * 100.0).abs() < 1e-6,
+        "limite de sécurité 70 % : la consigne s'aligne sur ce qui est parti ({attendu}), pas {}",
         banc.volume_en_base()
     );
     assert_eq!(
         banc.commandes_depuis(deja).await,
-        vec![0.7],
-        "le sondeur doit ramener l'appareil à la limite, jamais plus haut"
+        vec![attendu],
+        "le sondeur doit ramener l'appareil sous la limite, jamais plus haut"
     );
 }
 

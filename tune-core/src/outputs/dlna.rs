@@ -582,6 +582,10 @@ pub struct DlnaOutput {
     /// #5662 — un épisode de réponses `GetVolume` illisibles est en cours :
     /// la ligne `dlna_volume_illisible` a déjà été écrite.
     volume_illisible: AtomicBool,
+    /// #7379 — le volume du DERNIER `get_status` est le repli de #5662 (réponse
+    /// illisible), pas une valeur lue sur l'appareil. Le sondeur ne le prend
+    /// jamais pour un geste : ni suivi, ni retour au plafond.
+    dernier_releve_illisible: AtomicBool,
     /// #5575 — `modelName` du descriptif UPnP, quand l'enregistrement le connaît.
     modele: Option<String>,
     /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
@@ -830,6 +834,7 @@ impl DlnaOutput {
             budget_reveil_ms: AtomicU64::new(BUDGET_REVEIL_STANDBY.as_millis() as u64),
             item_id_seq: AtomicU64::new(1),
             volume_illisible: AtomicBool::new(false),
+            dernier_releve_illisible: AtomicBool::new(false),
             modele: None,
             didl_niveau_appris: NiveauDidlAppris::neuf(),
             muted: AtomicBool::new(false),
@@ -1602,6 +1607,24 @@ impl DlnaOutput {
     /// répond que sur `GroupRenderingControl` : la distinction existait déjà
     /// dans `get_status`, elle est ici pour que les DEUX régimes de lecture
     /// l'appliquent, pas seulement celui qui sonde.
+    /// #7379 — [`Self::lire_volume`] pour `get_status` : note en plus si la
+    /// valeur rendue est le repli de #5662 ([`Self::dernier_volume_illisible`]).
+    async fn lire_volume_du_statut(&self) -> Result<f64, String> {
+        let volume = self.lire_volume().await?;
+        self.dernier_releve_illisible.store(
+            self.volume_illisible.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        Ok(volume)
+    }
+
+    /// #7379 — vrai quand le volume du dernier `get_status` est le repli de
+    /// #5662 (corps vide, `CurrentVolume` absent, échec SOAP d'un Sonos), et
+    /// non une valeur lue.
+    pub(crate) fn dernier_volume_illisible(&self) -> bool {
+        self.dernier_releve_illisible.load(Ordering::Relaxed)
+    }
+
     async fn lire_volume(&self) -> Result<f64, String> {
         let sonos = self.device_id.contains("RINCON");
         let volume_resp = if sonos {
@@ -3501,11 +3524,15 @@ impl OutputTarget for DlnaOutput {
             self.position_extrapolee.store(false, Ordering::Relaxed);
 
             let volume = match evt_volume {
-                Some(v) => self.fraction_du_niveau(v),
+                Some(v) => {
+                    self.dernier_releve_illisible
+                        .store(false, Ordering::Relaxed);
+                    self.fraction_du_niveau(v)
+                }
                 // Le RenderingControl n'a rien poussé : on ne devine pas, on
                 // demande — comme avant. Un abonnement AVTransport tenu ne
                 // dispense pas d'avoir un volume juste.
-                None => self.lire_volume().await?,
+                None => self.lire_volume_du_statut().await?,
             };
             let de_tune = self.lecture_de_tune(etat, current_uri.as_deref());
             let volume = self.volume_apres_controle_d_uri(volume, de_tune).await;
@@ -3533,7 +3560,7 @@ impl OutputTarget for DlnaOutput {
         // par seconde et par zone pendant TOUTE la lecture : l'action valait
         // un quart du trafic SOAP envoyé au renderer, pour une valeur que
         // personne ne lisait (#2263). L'état coupé se lit maintenant en local.
-        let volume = self.lire_volume().await?;
+        let volume = self.lire_volume_du_statut().await?;
         let state = etat_du_transport(&transport_resp);
         let de_tune =
             self.lecture_de_tune(state, extract_tag(&position_resp, "TrackURI").as_deref());
