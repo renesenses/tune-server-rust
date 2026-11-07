@@ -1051,6 +1051,12 @@ pub(super) async fn play_episode(
             }
         }
         if output_sent {
+            // #8085 — rien n'est décodé côté serveur sur ce chemin : sans
+            // sonde, les VU-mètres restaient à 0 pendant tout l'épisode.
+            state
+                .orchestrator
+                .sonder_les_niveaux_d_un_episode(zone_id, &body.audio_url, mime_type)
+                .await;
             let s = state.playback.get_state(zone_id).await;
             if let Some(np) = s.now_playing.as_ref() {
                 if let Err(e) = tune_core::db::listening_resume::podcast_started_in_context(
@@ -1582,6 +1588,10 @@ mod tests {
     }
 }
 
+#[path = "podcasts/reprise_par_adresse_8085.rs"]
+mod reprise_par_adresse_8085;
+pub(crate) use reprise_par_adresse_8085::{EpisodeParAdresse, jouer_l_episode_par_son_adresse};
+pub(super) use reprise_par_adresse_8085::{demande_de_reprise, jouer_et_rendre_la_zone};
 #[cfg(test)]
 #[path = "podcasts/palmares_indisponible_7778_tests.rs"]
 mod palmares_indisponible_7778_tests;
@@ -1593,6 +1603,9 @@ mod reprise_navigateur_7354_tests;
 #[path = "podcasts/historique_7965_tests.rs"]
 mod historique_7965_tests;
 
+#[cfg(test)]
+#[path = "podcasts/reprise_par_adresse_8085_tests.rs"]
+mod reprise_par_adresse_8085_tests;
 #[cfg(test)]
 #[path = "podcasts/type_de_l_episode_7894_tests.rs"]
 mod type_de_l_episode_7894_tests;

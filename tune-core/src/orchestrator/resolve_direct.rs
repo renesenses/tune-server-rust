@@ -1658,6 +1658,26 @@ impl PlaybackOrchestrator {
         (stream_url, session_id)
     }
 
+    /// #8085 — VU-mètres d'un épisode de podcast. `play_episode` relaie les
+    /// octets de l'hébergeur VERBATIM au renderer réseau (#6468), ou confie
+    /// l'adresse à la sortie locale, qui décode sans rien mesurer : rien
+    /// n'est décodé côté serveur, aucun `playback.audio_levels` ne partait,
+    /// les aiguilles restaient à 0 sur toute la durée de l'épisode. Même
+    /// geste que Bandcamp (#4311) et Qobuz/Tidal (#1106) : une seconde
+    /// connexion décodée pour les seuls niveaux, bridée au rythme de lecture ;
+    /// le flux joué n'est pas touché. À appeler une fois la lecture lancée
+    /// (et l'éventuelle reprise posée) : la sonde s'attache à la piste en
+    /// cours de la zone.
+    pub async fn sonder_les_niveaux_d_un_episode(
+        &self,
+        zone_id: i64,
+        audio_url: &str,
+        mime_type: &str,
+    ) {
+        let codec = conteneur_depuis_url(audio_url, mime_type);
+        self.spawn_proxy_levels_probe(zone_id, audio_url.to_string(), codec.to_string())
+            .await;
+    }
     async fn relayer_direct_au_navigateur(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
         let Directe {
             audio_url,
