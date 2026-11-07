@@ -285,6 +285,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
          les clients UPnP relisent le catalogue",
     ),
     (
+        "enrich_tentatives",
+        "trace des tentatives d'enrichissement (#7983) : la passe la reconstitue ; \
+         perdue, elle retente seulement les pistes déjà vues",
+    ),
+    (
         "musicbrainz_release_cache",
         "reponses MusicBrainz gardees (#4805) : un cache de 90 jours, que la passe \
          des credits reconstitue",
@@ -1158,6 +1163,18 @@ CREATE TABLE IF NOT EXISTS politiques_parentales (
  politique_json TEXT NOT NULL,
  maj_le TEXT NOT NULL
 );
+-- Trace des tentatives d'enrichissement (#7983). Sans script numéroté :
+-- présente ici ET dans `ENSURE_TABLES`, mêmes types
+-- (migrations/enrich_tentatives.sql). Non copiée (TABLES_NON_COPIEES).
+CREATE TABLE IF NOT EXISTS enrich_tentatives (
+ track_id BIGINT PRIMARY KEY,
+ issue TEXT NOT NULL,
+ echecs BIGINT NOT NULL DEFAULT 0,
+ tente_le BIGINT NOT NULL,
+ reessai_apres BIGINT NOT NULL DEFAULT 0,
+ mtime_vu TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_enrich_tentatives_issue ON enrich_tentatives(issue, reessai_apres);
 -- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3 de
 -- MetaRust). Sans script numéroté : présente ici (bascule) ET dans
 -- `ENSURE_TABLES` (toute base, à chaque démarrage). Non copiée à la bascule :

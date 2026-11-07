@@ -122,6 +122,11 @@ pub fn mime_depuis_l_extension(url: &str) -> Option<&'static str> {
         Some("audio/wav")
     } else if path.ends_with(".aif") || path.ends_with(".aiff") {
         Some("audio/aiff")
+    } else if path.ends_with(".dsf") || path.ends_with(".dff") {
+        // #8052 — le `.dsf` brut qu'un serveur Tune envoie à la façade d'un
+        // autre (`/stream/<id>.dsf`, prêt de sorties) tombait sur le défaut
+        // `audio/mpeg` : le prêteur ne le reconnaissait pas comme DSD.
+        Some("application/x-dsd")
     } else {
         None
     }

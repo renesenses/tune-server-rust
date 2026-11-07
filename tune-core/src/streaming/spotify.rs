@@ -89,6 +89,12 @@ pub struct SpotifyService {
     /// [`PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT`] après un refus de limite.
     /// Atomique pour la même raison que `token_rejected`.
     plafond_recherche: AtomicUsize,
+    /// #8051 — Spotify a refusé pour de bon le renouvellement du jeton
+    /// (`400 invalid_grant`, `401`) : la session en mémoire est effacée et
+    /// [`StreamingService::session_expired`] le dit au rafraîchisseur, qui
+    /// supprime la ligne de jetons. Sans cela, le service restait annoncé
+    /// « Connecté » avec un jeton mort, et chaque recherche échouait.
+    session_refusee: bool,
 }
 
 impl Default for SpotifyService {
@@ -371,6 +377,7 @@ impl SpotifyService {
             token_rejected: AtomicBool::new(false),
             portees: None,
             plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
+            session_refusee: false,
         }
     }
 
@@ -1115,6 +1122,7 @@ impl StreamingService for SpotifyService {
         self.token_expires = None;
         self.portees = None;
         self.token_rejected.store(false, Ordering::Relaxed);
+        self.session_refusee = false;
         Ok(())
     }
 
@@ -1452,6 +1460,29 @@ impl StreamingService for SpotifyService {
             .await
             .map_err(|e| format!("refresh: {e}"))?;
 
+        // #8051 — le refus se lit : statut et motif. Un refus définitif
+        // efface la session au lieu de la laisser « Connectée » avec un jeton
+        // que Spotify n'accepte plus ; un refus passager (429, 5xx) la garde
+        // pour le prochain tic.
+        let status = resp.status().as_u16();
+        if !resp.status().is_success() {
+            let corps = resp.text().await.unwrap_or_default();
+            let code: serde_json::Value = serde_json::from_str(&corps).unwrap_or_default();
+            let code = code["error"].as_str().unwrap_or_default().to_owned();
+            let message = motif_du_refus(&corps);
+            if refus_de_renouvellement_definitif(status, &code) {
+                warn!(status, code = %code, message = %message, "spotify_session_refusee");
+                self.access_token = None;
+                self.refresh_token = None;
+                self.token_expires = None;
+                self.token_rejected.store(false, Ordering::Relaxed);
+                self.session_refusee = true;
+                return Ok(true);
+            }
+            warn!(status, code = %code, message = %message, "spotify_token_refresh_refused");
+            return Err(format!("spotify refresh: HTTP {status} — {message}").into());
+        }
+
         let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
         if let Some(at) = data["access_token"].as_str() {
             self.access_token = Some(at.into());
@@ -1468,8 +1499,12 @@ impl StreamingService for SpotifyService {
             info!("spotify_token_refreshed");
             Ok(true)
         } else {
-            Err("refresh failed".into())
+            Err(format!("spotify refresh: HTTP {status} sans access_token").into())
         }
+    }
+
+    fn session_expired(&self) -> bool {
+        self.session_refusee && self.access_token.is_none()
     }
 
     fn save_tokens(&self) -> Option<serde_json::Value> {
@@ -1500,6 +1535,7 @@ impl StreamingService for SpotifyService {
             // même convention que Tidal et YouTube.
             self.token_expires = None;
             self.token_rejected.store(false, Ordering::Relaxed);
+            self.session_refusee = false;
             true
         } else {
             false
@@ -1590,6 +1626,13 @@ fn motif_refus_403(detail: &str) -> String {
             }
         )
     }
+}
+
+/// #8051 — le refus de renouvellement est-il définitif ? `invalid_grant`
+/// (jeton de renouvellement révoqué ou expiré), ou un 400/401 : ni l'un ni
+/// l'autre ne se règle en réessayant. Un 429 ou un 5xx est passager.
+fn refus_de_renouvellement_definitif(status: u16, code: &str) -> bool {
+    code == "invalid_grant" || status == 400 || status == 401
 }
 
 /// #6825 — le motif d'un refus de l'API Web, borné : `error.message` du
@@ -2726,6 +2769,10 @@ mod tests {
 #[cfg(test)]
 #[path = "spotify_recherche_7659_tests.rs"]
 mod recherche_7659_tests;
+
+#[cfg(test)]
+#[path = "spotify_session_refusee_8051_tests.rs"]
+mod session_refusee_8051_tests;
 
 #[cfg(test)]
 #[path = "spotify_favoris_pagination_8050_tests.rs"]
