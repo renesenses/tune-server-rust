@@ -626,7 +626,9 @@ fn le_flux_par_defaut_est_le_meilleur_autorise_pas_le_principal_7515() {
         "https://p.example/128.mp3"
     );
     // BBC Radio 6 Music : depuis la France comme pays inconnu, le principal
-    // réservé au Royaume-Uni n'est jamais le flux par défaut.
+    // réservé au Royaume-Uni n'est jamais le flux par défaut. Garde de
+    // non-régression seulement : sans choix, ce principal était déjà écarté
+    // avant #7515 ; le témoin du correctif est la fiche « Principal faible ».
     let f = fiche(document_bbc_6music_7515());
     for country in [None, Some("FR")] {
         assert_eq!(select_stream(&f, country, None).unwrap().url, BBC6_320);
@@ -713,4 +715,18 @@ fn le_debit_annonce_suit_le_flux_jouable_7515() {
     assert_eq!(station["flux_ecoute"]["url"], BBC6_320, "{station}");
     assert_eq!(station["flux_ecoute"]["raison"], "restreint_au_pays");
     assert_eq!(station["bitrate"], 320);
+}
+
+#[test]
+fn autorise_et_choix_du_flux_suivent_la_meme_regle_de_pays_7515() {
+    let aucun: [&str; 0] = [];
+    assert_eq!(permis_dans_le_pays(&aucun, None), Some(true));
+    assert_eq!(permis_dans_le_pays(&["GB"], Some("gb")), Some(true));
+    assert_eq!(permis_dans_le_pays(&["GB"], Some("FR")), Some(false));
+    assert_eq!(permis_dans_le_pays(&["GB"], None), None);
+    assert_eq!(
+        permis_dans_le_pays(&["invalid"], None),
+        Some(false),
+        "#7515 : un flux marqué invalid n'est jamais annoncé jouable, même pays inconnu"
+    );
 }

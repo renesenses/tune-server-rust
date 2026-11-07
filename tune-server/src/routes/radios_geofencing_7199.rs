@@ -89,6 +89,26 @@ pub(crate) fn rang(f: &FluxAnnuaire) -> (bool, i32, bool, i32) {
     )
 }
 
+/// #7515 — ce qu'une restriction de pays permet, commun au choix du flux
+/// ([`select_stream`]) et à ce que l'annuaire en annonce
+/// ([`marquer_le_flux_par_defaut`]) : `Some(true)` pour un flux libre ou ouvert
+/// au pays d'écoute, `Some(false)` pour un flux réservé à d'autres pays ou
+/// marqué `invalid`, `None` pour un flux restreint quand ce pays n'est pas
+/// renseigné.
+pub(crate) fn permis_dans_le_pays<S: AsRef<str>>(
+    pays: &[S],
+    country: Option<&str>,
+) -> Option<bool> {
+    if pays.is_empty() {
+        return Some(true);
+    }
+    match country {
+        Some(c) => Some(pays.iter().any(|p| p.as_ref().eq_ignore_ascii_case(c))),
+        None if pays.iter().any(|p| p.as_ref() == "invalid") => Some(false),
+        None => None,
+    }
+}
+
 /// Garde le choix explicite autorisé, sinon le meilleur flux autorisé selon
 /// [`rang`]. #7515 : le principal ne fait plus que départager deux flux de
 /// même qualité ; l'ordre publié départage le reste.
@@ -118,24 +138,16 @@ pub(super) fn select_stream(
         .into_iter()
         .rev()
         .filter(|f| {
-            f.restricted_to_countries.is_empty()
-                || match country.as_deref() {
-                    Some(c) => f
-                        .restricted_to_countries
-                        .iter()
-                        .any(|allowed| allowed.eq_ignore_ascii_case(c)),
-                    // #7658/#7660 : pays d'écoute non renseigné. Le flux que
-                    // l'auditeur a choisi lui-même reste le sien : on ne le
-                    // remplace pas en silence par le seul flux sans
-                    // restriction (BBC : « nonuk » HE-AAC 96 kbit/s au lieu
-                    // du 320 kbit/s choisi). S'il est vraiment bloqué chez
-                    // lui, la lecture échoue et il en choisit un autre.
-                    None => {
-                        flux_libre
-                            && choisi(f)
-                            && !f.restricted_to_countries.iter().any(|c| c == "invalid")
-                    }
-                }
+            match permis_dans_le_pays(&f.restricted_to_countries, country.as_deref()) {
+                Some(permis) => permis,
+                // #7658/#7660 : pays d'écoute non renseigné. Le flux que
+                // l'auditeur a choisi lui-même reste le sien : on ne le
+                // remplace pas en silence par le seul flux sans
+                // restriction (BBC : « nonuk » HE-AAC 96 kbit/s au lieu
+                // du 320 kbit/s choisi). S'il est vraiment bloqué chez
+                // lui, la lecture échoue et il en choisit un autre.
+                None => flux_libre && choisi(f),
+            }
         })
         .max_by_key(|f| (choisi(f), rang(f)))
 }
@@ -175,20 +187,15 @@ pub(crate) fn marquer_le_flux_par_defaut(state: &AppState, corps: &mut Value) {
                 continue;
             };
             let url = o.get("url").and_then(Value::as_str).unwrap_or_default();
-            let par_defaut = defaut.as_deref() == Some(url);
+            let par_defaut = defaut
+                .as_deref()
+                .is_some_and(|d| super::flux_normalise(d) == super::flux_normalise(url));
             let pays: Vec<&str> = o
                 .get("restricted_to_countries")
                 .and_then(Value::as_array)
                 .map(|p| p.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            let autorise = if pays.is_empty() {
-                json!(true)
-            } else {
-                match country.as_deref() {
-                    Some(c) => json!(pays.iter().any(|p| p.eq_ignore_ascii_case(c))),
-                    None => Value::Null,
-                }
-            };
+            let autorise = json!(permis_dans_le_pays(&pays, country.as_deref()));
             o.insert("par_defaut".into(), json!(par_defaut));
             o.insert("autorise".into(), autorise);
         }
