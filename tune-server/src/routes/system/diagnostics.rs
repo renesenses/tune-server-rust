@@ -1268,6 +1268,10 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
         "slimproto": tune_core::slimproto::etat_ecoute(),
         "lms_cli": tune_core::slimproto::cli_server::etat_ecoute(),
         "slimproto_udp": tune_core::slimproto::discovery::etat_ecoute(),
+        // #7374 — le réglage « Serveur Squeezebox de Tune ». Faux : les trois
+        // états ci-dessus sont `null` parce que rien n'est ouvert, pas parce
+        // qu'une écoute a échoué.
+        "slimproto_server_enabled": crate::background::serveur_squeezebox_regle(&state.backend),
         // L'etat de l'ecouteur SSDP (port 1900) et le nombre de reponses
         // M-SEARCH emises. Sans ce champ, « Tune repond-il aux M-SEARCH ? » ne
         // se mesurait qu'au tcpdump, chez le testeur — c'est exactement ce
@@ -2682,6 +2686,12 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
                 "- SlimProto (Squeezebox): en ecoute sur {}\n",
                 etat.port
             ));
+        }
+        None if !crate::background::serveur_squeezebox_regle(&state.backend) => {
+            // #7374 — coupé par le réglage, ce n'est pas une panne.
+            md.push_str(
+                "- SlimProto (Squeezebox): serveur desactive par le reglage — ni 3483 TCP/UDP ni 9090 ouverts\n",
+            );
         }
         None => {
             md.push_str("- SlimProto (Squeezebox): aucune tentative d'ecoute\n");

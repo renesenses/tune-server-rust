@@ -117,6 +117,12 @@ declarer_evenements! {
     /// `audio::replaygain::progression`, jamais par piste : 50 000 titres
     /// feraient 50 000 messages sur un bus de 256 entrees.
     ReplayGainProgress => "library.replaygain.progress", Emis;
+    /// Avancement des analyses de la cascade autres que le ReplayGain
+    /// (empreintes, plage dynamique) : `task`, `processed` / `total`,
+    /// `eta_seconds`, `active` (#7915). ReplayGain coupé, ce qui est le
+    /// defaut, ces passes decodaient toute la bibliotheque sans rien publier.
+    /// Emis a la cadence du scan depuis `taches_de_fond::avancement`.
+    BackgroundAnalysisProgress => "library.analysis.progress", Emis;
     /// Avancement de la reprise des pochettes (`POST /library/artwork/rescan`).
     /// `SettingsView.svelte` en lit `current`, `total` et `found` — les trois
     /// champs de `settings.coversProgress` (#2870).
@@ -373,7 +379,7 @@ mod tests {
     fn toutes_couvre_l_enumeration_entiere() {
         assert_eq!(
             EventType::TOUTES.len(),
-            40,
+            41,
             "une variante a ete ajoutee ou retiree : mettre ce compte a jour APRES \
              avoir verifie son statut d'emission"
         );

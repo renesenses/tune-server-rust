@@ -706,6 +706,12 @@ impl PositionPoller {
                 // d'avant, ou au flux que le déplacement vient de recréer :
                 // rien à réexaminer (#4682).
                 ps.chute_en_grace = false;
+                // #7922 — le temps rendu appartient à la piste d'avant, sauf
+                // quand le déplacement a seulement recréé le flux.
+                if !is_seek {
+                    ps.tune_tested_rendu_ms = 0;
+                }
+                ps.tune_tested_releve = None;
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -1701,6 +1707,9 @@ impl PositionPoller {
                     // alors que la piste courante jouait encore.
                     ps.peak_position_ms = target.as_millis() as u64;
                     ps.cible_du_deplacement_ms = target.as_millis() as u64;
+                    // #7922 — le saut n'est pas du temps rendu : le compte
+                    // reprend au premier relevé après la cible.
+                    ps.tune_tested_releve = None;
                 }
             }
 
@@ -2174,6 +2183,13 @@ impl PositionPoller {
             if !chute_differee {
                 ps.last_position_ms = status.position_ms;
             }
+            // #7922 — le temps rendu, hors grâce de déplacement et hors chute :
+            // une chute de position est la piste suivante ou un recul.
+            if status.state == TransportState::Playing && !in_seek_grace && !position_reset {
+                ps.noter_releve_tune_tested(status.position_ms, Instant::now());
+            } else {
+                ps.tune_tested_releve = None;
+            }
 
             if position_reset {
                 // #6477 — un renderer qui lâche la piste en cours dès le
@@ -2305,8 +2321,13 @@ impl PositionPoller {
                                 track_duration_ms,
                             )
                             .await;
-                        self.noter_fin_tune_tested(zone_state, &device_id, pic)
-                            .await;
+                        self.noter_fin_tune_tested(
+                            zone_state,
+                            &device_id,
+                            pic,
+                            std::mem::take(&mut ps.tune_tested_rendu_ms),
+                        )
+                        .await;
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
                         let avance = self
                             .orchestrator
@@ -3337,8 +3358,15 @@ impl PositionPoller {
                                     track_duration_ms,
                                 )
                                 .await;
-                            self.noter_fin_tune_tested(zone_state, &device_id, ps.peak_position_ms)
-                                .await;
+                            // #7922 — l'appareil a enchaîné de lui-même, mais
+                            // après s'être dit arrêté : pas de gapless constaté.
+                            self.noter_fin_tune_tested_sans_gapless(
+                                zone_state,
+                                &device_id,
+                                ps.peak_position_ms,
+                                std::mem::take(&mut ps.tune_tested_rendu_ms),
+                            )
+                            .await;
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
                             let avance = self
                                 .orchestrator
@@ -3434,6 +3462,7 @@ impl PositionPoller {
                             .map(|t| t.elapsed().as_millis() as u64)
                             .unwrap_or(0);
                         let pic = ps.peak_position_ms;
+                        let rendu = std::mem::take(&mut ps.tune_tested_rendu_ms);
                         info!(
                             zone_id,
                             renderer_dur = status.duration_ms,
@@ -3465,7 +3494,7 @@ impl PositionPoller {
                             .position_a_avancer(zone_id, zone_state, arme_avant)
                             .await
                         {
-                            self.noter_fin_tune_tested(zone_state, &device_id, pic)
+                            self.noter_fin_tune_tested(zone_state, &device_id, pic, rendu)
                                 .await;
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
@@ -4461,13 +4490,16 @@ impl PositionPoller {
             } else if track_ended {
                 // Une fin avec progression réellement observée, pas un play
                 // acquitté ni une prédiction de fin depuis la durée seule.
+                // #7922 — la piste compte pour le temps rendu, jamais pour sa
+                // durée : un déplacement près de la fin remplit le pic.
                 if let Some(np) = zone_state.now_playing.as_ref()
                     && np.duration_ms > 0
-                    && poll_states.get(&zone_id).is_some_and(|ps| {
-                        ps.peak_position_ms >= (np.duration_ms as u64).saturating_sub(1000).max(1)
-                    })
+                    && let Some(ps) = poll_states.get_mut(&zone_id)
+                    && ps.peak_position_ms >= (np.duration_ms as u64).saturating_sub(1000).max(1)
                 {
-                    self.noter_tune_tested(zone_state, &device_id, true).await;
+                    let rendu = std::mem::take(&mut ps.tune_tested_rendu_ms);
+                    self.noter_fin_observee_tune_tested(zone_state, &device_id, rendu)
+                        .await;
                 }
                 // #2488 — la moitié invisible du blanc entre deux pistes.
                 //

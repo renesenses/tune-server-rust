@@ -156,6 +156,9 @@ pub(crate) fn instantane(state: &AppState) -> Value {
                 // arrêtée jusqu'à l'arrêt de la lecture pour les passes qui
                 // décodent.
                 "throttled_for_playback": priorite.throttled.contains(&tache.id()),
+                // #7915 — le même avancement que « ce qui tourne », pour que
+                // la carte dise combien il reste et quand ce sera fini.
+                "progress": super::ce_qui_tourne::avancement(state, tache),
             })
         })
         .collect();

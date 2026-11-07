@@ -110,9 +110,22 @@ fn le_bras_dash_consulte_les_reglages_de_la_zone() {
         site.contains("(dash_is_wav || dash_plafond_16) && actual_bd > 16"),
         "le plafond 16 bits doit s'appliquer au FLAC pré-transcodé"
     );
+    // #7266 — le remux du fichier passe par `remux_dash_sans_perte`, qui
+    // refuse le plafond (`&& !plafond_16`). Ce motif est satisfait par le
+    // corps même du prédicat, pas par un appel : c'est l'assertion suivante
+    // qui garde l'appel, en exigeant qu'il reçoive `dash_plafond_16`. Le
+    // témoin de fond du prédicat est `remux_par_defaut_7266_tests`.
     assert!(
-        appels("!reglages.plafond_16") + appels("!dash_plafond_16") >= 2,
+        appels("!reglages.plafond_16") + appels("&& !plafond_16") >= 2,
         "les deux remux (copie des trames 24 bits) doivent céder au plafond"
+    );
+    // Espaces ramenés à un seul : la garde ne dépend pas de la mise en page.
+    let site_compact = site.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        site_compact.contains(
+            "remux_dash_sans_perte( source_flac, dash_is_wav, dash_dsp_active, dash_plafond_16, plafonnee, )"
+        ),
+        "le remux du fichier doit recevoir le plafond 16 bits de la zone"
     );
     let file = include_str!("queue.rs");
     assert!(

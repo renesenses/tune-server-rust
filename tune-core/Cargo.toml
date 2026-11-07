@@ -222,6 +222,12 @@ path = "tests/journal_par_greffon_5370.rs"
 name = "pause_taches_de_fond"
 path = "tests/pause_taches_de_fond.rs"
 
+# #7915 — l'avancement des empreintes, ReplayGain coupé. Binaire à lui seul :
+# l'avancement est un état de processus.
+[[test]]
+name = "avancement_cascade_7915"
+path = "tests/avancement_cascade_7915.rs"
+
 # Meme raison : `autotests = false`. Binaire a lui seul : le temoin de lecture
 # des taches de fond est un etat de PROCESSUS ; un voisin qui mettrait une zone
 # en lecture dans le meme binaire rendrait ces temoins intermittents (#4681).

@@ -534,6 +534,22 @@ pub async fn handle_stream(
     if is_radio && !bounded_live {
         headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
     }
+    // ── #5975 — une PISTE convertie sans durée connue, sous Safari ──
+    //
+    // Zone navigateur, Safari 18.6 : la radio joue depuis #6669, pas une piste
+    // de la bibliothèque. Une conversion WAV (AIFF, ALAC, DSD… ou égaliseur
+    // actif) dont la base ignore la durée n'a pas de `wav_length` : la sonde
+    // `Range: bytes=0-1` de CoreMedia recevait un 200 chunké, sans longueur
+    // ni plage — le contrat même que Safari refusait sur la radio. On lui sert
+    // le contrat « fichier borné » de la radio : 206 exact, total fini,
+    // `Accept-Ranges`. Le corps reste la conversion, reprises et retenue
+    // comprises ; les autres agents gardent le chunké.
+    let piste_bornee_coremedia = is_wav
+        && !is_radio
+        && wav_length.is_none()
+        && user_agent
+            .as_deref()
+            .is_some_and(|ua| lit_par_coremedia(&ua.to_ascii_lowercase()));
 
     // DLNA renderers (Marantz SR7009, Eversolo DMP-A8) send Range: bytes=0-
     // even for the initial request and expect a 206 Partial Content response
@@ -782,6 +798,35 @@ pub async fn handle_stream(
             );
         }
     }
+    if piste_bornee_coremedia {
+        // Le canal fini, sa longueur VRAIE est connue : une reprise au-delà
+        // reçoit le 416 d'un fichier, pas un 206 vide (#5426).
+        if let (Some(n), Some(fin)) = (reprise_candidate, session.fin_du_canal())
+            && n >= fin
+        {
+            info!(
+                stream_id,
+                reprise = n,
+                fin,
+                "reprise_au_dela_de_la_fin — 416 : piste bornée pour CoreMedia, le canal est fini (#5975)"
+            );
+            let mut h = HeaderMap::new();
+            h.insert(
+                "Content-Range",
+                HeaderValue::from_str(&format!("bytes */{fin}")).unwrap(),
+            );
+            return (StatusCode::RANGE_NOT_SATISFIABLE, h).into_response();
+        }
+        longueur = Some(tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN);
+        headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+        info!(
+            stream_id,
+            range = range_hdr,
+            total = tune_core::http::streamer::LIVE_BOUNDED_TOTAL_LEN,
+            "piste_bornee_pour_coremedia — conversion sans durée connue servie en fichier \
+             borné à Safari / iOS : 206 exact à la sonde, au lieu du chunké refusé (#5975)"
+        );
+    }
     let finite_range_start = range_demande.filter(|s| longueur.is_none_or(|len| *s < len));
     let use_partial = finite_range_start.is_some() && longueur.is_some();
     // ── La borne de fin d'un `Range: bytes=N-M` ──
@@ -821,18 +866,27 @@ pub async fn handle_stream(
                 "DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000",
             ),
         );
+        // #5975 — le total d'une piste bornée pour CoreMedia est un plafond,
+        // pas sa longueur : un `Content-Length` jusqu'au plafond ferait couper
+        // la connexion par hyper à la fin de la piste, dernier bloc perdu.
+        // Seule une tranche fermée qui tient dans la piste (la sonde) a une
+        // longueur exacte ; le reste part en 206 chunké, `Content-Range` en tête.
+        let longueur_exacte = !piste_bornee_coremedia || fin_de_tranche.is_some();
         match finite_range_start {
             Some(start) => {
                 let fin = fin_de_tranche.unwrap_or(len - 1);
-                headers.insert("Content-Length", HeaderValue::from(fin - start + 1));
+                if longueur_exacte {
+                    headers.insert("Content-Length", HeaderValue::from(fin - start + 1));
+                }
                 headers.insert(
                     "Content-Range",
                     HeaderValue::from_str(&format!("bytes {start}-{fin}/{len}")).unwrap(),
                 );
             }
-            None => {
+            None if longueur_exacte => {
                 headers.insert("Content-Length", HeaderValue::from(len));
             }
+            None => {}
         }
     }
 
@@ -5852,6 +5906,9 @@ mod long_wav_4016;
 
 #[cfg(test)]
 mod reprise_navigateur_5426;
+
+#[cfg(test)]
+mod safari_piste_sans_duree_5975;
 
 #[cfg(test)]
 mod reprise_hors_trame_6254;

@@ -27,7 +27,9 @@
 //! | `POST /reglages/identite` | le nom du compte du jeton personnel, retenu |
 //! | `POST /synchroniser` | lance la synchronisation (202) |
 //! | `GET /etat` | l'avancement (liste, streaming, bibliothèque), l'affinage MusicBrainz `{en_cours, restants}`, la dernière synchronisation, la dernière erreur |
-//! | `GET /collection[?format=&etat=]` | les disques, leur état, les compteurs |
+//! | `GET /collection[?format=&etat=&dossier=&genre=&style=]` | les disques, leur état, les compteurs (par état, format, dossier, genre, style) |
+//! | `GET /parcourir` | les dossiers Discogs, les genres et les styles de la collection, avec leurs compteurs (#7929) |
+//! | `GET /disques/{release}/services` | « Chercher sur les services » : les albums les plus proches chez chaque service connecté (#7928) |
 //! | `GET /cd?mb_release=&code_barre=` | un CD inséré est-il dans la collection, et copié ? |
 //! | `GET /pochettes/{release}[?taille=originale]` | la pochette, servie depuis le cache local (`ETag`, 304) |
 //! | `DELETE /cache[?quoi=pochettes]` | efface le cache : pochettes et mémoire, ou les pochettes seules |
@@ -51,6 +53,7 @@ pub mod correspondance;
 pub mod discogs;
 pub mod memoire;
 pub mod pochettes;
+pub mod recherche;
 pub mod synchro;
 
 use std::path::PathBuf;
@@ -323,6 +326,9 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
         "etat": etat.code(),
         "copie": copie,
         "proposer_extraction": copie == Some(false),
+        "dossier": d.dossier,
+        "genres": d.genres,
+        "styles": d.styles,
     });
     (v, etat)
 }
@@ -335,6 +341,70 @@ fn attribution() -> Value {
 struct FiltresCollection {
     format: Option<String>,
     etat: Option<String>,
+    /// L'identifiant d'un dossier Discogs (#7929).
+    dossier: Option<u64>,
+    genre: Option<String>,
+    style: Option<String>,
+}
+
+/// Le disque est-il dans ce genre / ce style ? Sans filtre, oui.
+fn porte(noms: &[String], filtre: Option<&str>) -> bool {
+    filtre.is_none_or(|f| noms.iter().any(|n| n.eq_ignore_ascii_case(f)))
+}
+
+/// Les compteurs de navigation (#7929) : par dossier (avec son nom), par
+/// genre et par style, comptés sur les EXEMPLAIRES de la liste comme les
+/// autres compteurs, du plus fourni au moins fourni.
+fn compteurs_de_navigation(m: &Memoire) -> Value {
+    let mut dossiers: std::collections::BTreeMap<u64, u64> = Default::default();
+    let mut genres: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut styles: std::collections::BTreeMap<String, u64> = Default::default();
+    for d in &m.disques {
+        if let Some(id) = d.dossier {
+            *dossiers.entry(id).or_default() += 1;
+        }
+        for g in &d.genres {
+            *genres.entry(g.clone()).or_default() += 1;
+        }
+        for s in &d.styles {
+            *styles.entry(s.clone()).or_default() += 1;
+        }
+    }
+    let mut par_dossier: Vec<Value> = dossiers
+        .iter()
+        .map(|(id, n)| {
+            let nom = m
+                .dossiers
+                .iter()
+                .find(|f| f.id == *id)
+                .map(|f| f.nom.clone());
+            json!({"id": id, "nom": nom, "nombre": n})
+        })
+        .collect();
+    // Un dossier vide chez Discogs reste montré (0) : l'utilisateur l'a créé.
+    for f in &m.dossiers {
+        if !dossiers.contains_key(&f.id) {
+            par_dossier.push(json!({"id": f.id, "nom": f.nom, "nombre": 0}));
+        }
+    }
+    par_dossier.sort_by(|a, b| {
+        b["nombre"]
+            .as_u64()
+            .cmp(&a["nombre"].as_u64())
+            .then_with(|| a["id"].as_u64().cmp(&b["id"].as_u64()))
+    });
+    let liste = |t: std::collections::BTreeMap<String, u64>| {
+        let mut v: Vec<(String, u64)> = t.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.into_iter()
+            .map(|(nom, n)| json!({"nom": nom, "nombre": n}))
+            .collect::<Vec<_>>()
+    };
+    json!({
+        "par_dossier": par_dossier,
+        "par_genre": liste(genres),
+        "par_style": liste(styles),
+    })
 }
 
 async fn albums_et_services(etat: &Etat) -> Result<(Vec<AlbumLocal>, Vec<String>), Refus> {
@@ -369,6 +439,8 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
             None => return refus(StatusCode::UNPROCESSABLE_ENTITY, "etat_inconnu"),
         },
     };
+    let genre = f.genre.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let style = f.style.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let nom = nom_suivi(&etat.backend);
     let m = etat.moteur.memoire();
     let statut = match &nom {
@@ -400,6 +472,7 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
         par_format.insert(fam.code().into(), json!(0));
     }
     let mut cd_non_copies = 0u64;
+    let navigation = compteurs_de_navigation(&m);
     let mut disques = Vec::new();
     for d in &m.disques {
         let (v, e) = vue(d, &m, &index, &services);
@@ -408,7 +481,12 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
         if v["proposer_extraction"] == true {
             cd_non_copies += 1;
         }
-        if famille.is_some_and(|fam| fam != d.famille) || filtre_etat.is_some_and(|fe| fe != e) {
+        if famille.is_some_and(|fam| fam != d.famille)
+            || filtre_etat.is_some_and(|fe| fe != e)
+            || f.dossier.is_some_and(|id| d.dossier != Some(id))
+            || !porte(&d.genres, genre)
+            || !porte(&d.styles, style)
+        {
             continue;
         }
         disques.push(v);
@@ -426,9 +504,43 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
             "par_etat": par_etat,
             "par_format": par_format,
             "cd_non_copies": cd_non_copies,
+            "par_dossier": navigation["par_dossier"],
+            "par_genre": navigation["par_genre"],
+            "par_style": navigation["par_style"],
         },
         "disques": disques,
         "attribution": attribution(),
+    }))
+    .into_response()
+}
+
+/// `GET /parcourir` (#7929) : les dossiers, genres et styles de la
+/// collection, avec leurs compteurs, pour les filtres de l'écran.
+async fn parcourir(State(etat): State<Etat>) -> Response {
+    let nom = nom_suivi(&etat.backend);
+    let m = etat.moteur.memoire();
+    if nom.is_none() || m.nom_utilisateur != nom {
+        return Json(json!({"par_dossier": [], "par_genre": [], "par_style": []})).into_response();
+    }
+    Json(compteurs_de_navigation(&m)).into_response()
+}
+
+/// `GET /disques/{release}/services` (#7928) : « Chercher sur les
+/// services ». 404 `disque_inconnu` pour une release hors de la liste.
+async fn chercher_sur_les_services(State(etat): State<Etat>, Path(release): Path<u64>) -> Response {
+    let nom = nom_suivi(&etat.backend);
+    if nom.is_none() || etat.moteur.memoire().nom_utilisateur != nom {
+        return refus(StatusCode::NOT_FOUND, "disque_inconnu");
+    }
+    let Some(r) = etat.moteur.chercher_sur_les_services(release).await else {
+        return refus(StatusCode::NOT_FOUND, "disque_inconnu");
+    };
+    Json(json!({
+        "release_id": release,
+        "services": r.services,
+        "sans_reponse": r.sans_reponse,
+        "meilleure": r.meilleure(),
+        "propositions": r.propositions,
     }))
     .into_response()
 }
@@ -539,8 +651,22 @@ async fn pochette(
         Some("originale") => pochettes::Taille::Originale,
         Some(_) => return refus(StatusCode::UNPROCESSABLE_ENTITY, "taille_inconnue"),
     };
-    let Some(chemin) = etat.moteur.pochette(release, taille).await else {
-        return refus(StatusCode::NOT_FOUND, "pochette_absente");
+    let chemin = match etat.moteur.pochette(release, taille).await {
+        Ok(c) => c,
+        Err(pochettes::Absence::Introuvable) => {
+            return refus(StatusCode::NOT_FOUND, "pochette_absente");
+        }
+        // #7927 : le CDN freine ou refuse. L'écran le dit et réessaie
+        // après `Retry-After`, au lieu de garder une case vide.
+        Err(pochettes::Absence::EnAttente(reste)) => {
+            let mut r = refus(StatusCode::SERVICE_UNAVAILABLE, "pochettes_limitees");
+            if let Some(s) = reste
+                && let Ok(v) = HeaderValue::from_str(&s.to_string())
+            {
+                r.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            return r;
+        }
     };
     let Ok(meta) = tokio::fs::metadata(&chemin).await else {
         return refus(StatusCode::NOT_FOUND, "pochette_absente");
@@ -614,6 +740,11 @@ pub fn router(backend: Arc<dyn DbBackend>, moteur: Arc<Moteur>) -> Router<()> {
         .route("/etat", get(lire_etat))
         .route("/collection", get(collection))
         .route("/cd", get(cd))
+        .route("/parcourir", get(parcourir))
+        .route(
+            "/disques/{release}/services",
+            get(chercher_sur_les_services),
+        )
         .route("/pochettes/{release}", get(pochette))
         .route("/cache", delete(effacer_cache))
         .layer(middleware::map_response(sans_cache))
