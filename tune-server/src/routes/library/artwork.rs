@@ -65,7 +65,7 @@ pub(super) async fn serve_artwork(
 /// [`tune_core::library::artwork::CACHE_EXTENSIONS`], la même que celle sous
 /// laquelle l'écriture dépose ses fichiers. Deux listes séparées, c'était la
 /// porte ouverte à un condensat annoncé en base et introuvable ici (#2567).
-pub(super) async fn serve_artwork_from(
+pub(crate) async fn serve_artwork_from(
     cache_dir: &std::path::Path,
     hash: &str,
     size: Option<u32>,
@@ -186,44 +186,56 @@ fn journaliser_absence(cache_dir: &std::path::Path, hash: &str) {
     }
 }
 
-pub(super) async fn album_artwork(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+/// Où se trouve la pochette d'un album : une adresse distante, ou une entrée
+/// du cache de pochettes.
+pub(crate) enum PochetteAlbum {
+    Distante(String),
+    EnCache(String),
+}
+
+/// La pochette d'un album, telle que la route `/albums/{id}/artwork` la
+/// sert ; partagée avec `getCoverArt` de Subsonic (#7945), qui ne peut pas
+/// suivre une redirection vers `/api/v1` (authentifiée).
+pub(crate) fn pochette_de_l_album(state: &AppState, id: i64) -> Option<PochetteAlbum> {
     let repo = AlbumRepo::with_backend(state.backend.clone());
-    let album = match repo.get(id) {
-        Ok(Some(a)) => a,
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
+    let album = repo.get(id).ok().flatten()?;
 
     if let Some(ref cover_path) = album.cover_path {
         if cover_path.starts_with("http") {
-            return axum::response::Redirect::temporary(cover_path).into_response();
+            return Some(PochetteAlbum::Distante(cover_path.clone()));
         }
         let hash = if is_hex_hash(cover_path) {
             cover_path.to_string()
         } else {
             tune_core::library::artwork::artwork_hash(cover_path)
         };
-        return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}"))
-            .into_response();
+        return Some(PochetteAlbum::EnCache(hash));
     }
 
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let tracks = track_repo.list_by_album(id).unwrap_or_default();
-    if let Some(track) = tracks.first()
-        && let Some(ref file_path) = track.file_path
-    {
-        let cache_dir = artwork_cache_dir();
-        if let Some(hash) =
-            tune_core::library::artwork::get_or_extract(std::path::Path::new(file_path), &cache_dir)
-        {
-            return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}"))
-                .into_response();
-        }
-    }
+    let file_path = tracks.first()?.file_path.as_ref()?;
+    tune_core::library::artwork::get_or_extract(
+        std::path::Path::new(file_path),
+        &artwork_cache_dir(),
+    )
+    .map(PochetteAlbum::EnCache)
+}
 
-    StatusCode::NOT_FOUND.into_response()
+pub(super) async fn album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match pochette_de_l_album(&state, id) {
+        Some(PochetteAlbum::Distante(url)) => {
+            axum::response::Redirect::temporary(&url).into_response()
+        }
+        Some(PochetteAlbum::EnCache(hash)) => {
+            axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}"))
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 pub(super) async fn upload_album_artwork(

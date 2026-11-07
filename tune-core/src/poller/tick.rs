@@ -2405,7 +2405,14 @@ impl PositionPoller {
                         && ps.peak_position_ms < 5_000
                         // #7097 — une piste de 3,7 s a pu finir sans jamais
                         // atteindre 5 s : examiner alors sa fin normale.
-                        && !played_enough;
+                        && !played_enough
+                        // #7902 — un DLNA rend sa position à la seconde : un
+                        // titre de 4 s, vu à 3 s, reste sous les 80 %. Passé
+                        // la moitié, il a joué : examiner sa fin.
+                        && !decisions::titre_court_deja_avance(
+                            track_duration_ms,
+                            ps.peak_position_ms,
+                        );
                     // A DSD track on a DLNA renderer whose peak reached the end.
                     // Gapless is intentionally not armed for a DSD next on DLNA
                     // (prepare_gapless / #402) and DLNA never reports
