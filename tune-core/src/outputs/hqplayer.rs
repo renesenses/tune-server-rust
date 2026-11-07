@@ -82,6 +82,36 @@ pub struct HqplayerOutput {
 pub(crate) const CODE_ECHEC_DE_SORTIE: &str = "hqplayer_output_start_failed";
 pub(crate) const MESSAGE_ECHEC_DE_SORTIE: &str = "HQPlayer n'a pas pu ouvrir sa sortie. Vérifiez que le DAC n'est pas utilisé par une autre application.";
 
+pub(crate) const CODE_OCTETS_NON_SOLLICITES: &str = "hqplayer_control_unsolicited_response";
+pub(crate) const MESSAGE_OCTETS_NON_SOLLICITES: &str = "HQPlayer envoie sur sa connexion de contrôle des messages que Tune n'a pas demandés ; la commande n'a pas pu être envoyée, même après reconnexion.";
+
+/// #7869 — combien de temps une connexion rouverte après des octets non
+/// sollicités attend d'éventuels octets poussés à l'ouverture, avant d'écrire.
+const ECOUTE_APRES_RECONNEXION: std::time::Duration = std::time::Duration::from_millis(100);
+/// #7869 — combien d'octets non sollicités le journal reproduit.
+const DEBUT_JOURNALISE: usize = 120;
+
+/// #7869 — ajoute à `pending` ce qui est déjà arrivé sur la socket sans être
+/// lu, sans attendre. Un message poussé par HQPlayer entre deux commandes est
+/// ainsi vu avant d'écrire la suivante, au lieu d'être lu comme sa réponse.
+fn recueillir_les_octets_arrives(control: &mut Control) {
+    let mut buf = [0u8; 8192];
+    while control.pending.len() < 1024 * 1024 {
+        match control.stream.try_read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => control.pending.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
+/// #7869 — le début des octets non sollicités, lisible dans un journal : les
+/// octets hors UTF-8 sont remplacés, les caractères de contrôle échappés.
+fn debut_des_octets(octets: &[u8]) -> String {
+    String::from_utf8_lossy(&octets[..octets.len().min(DEBUT_JOURNALISE)])
+        .escape_debug()
+        .to_string()
+}
+
 /// #6115 — la borne d'attente de l'arrêt avant de lancer un autre titre.
 const ATTENTE_ARRET: std::time::Duration = std::time::Duration::from_secs(2);
 /// #6115 — l'intervalle entre deux `Status` pendant cette attente.
@@ -337,9 +367,34 @@ impl HqplayerOutput {
                 });
             }
             let control = conn.as_mut().expect("connected");
+            // #7869 — la connexion rouverte pour cause d'octets non sollicités
+            // écoute un court instant : un HQPlayer qui en pousse dès
+            // l'ouverture est reconnu ici, avant d'écrire, et non pris pour la
+            // réponse de la commande.
+            if attempt == 1 {
+                let _ =
+                    tokio::time::timeout(ECOUTE_APRES_RECONNEXION, control.stream.readable()).await;
+            }
+            recueillir_les_octets_arrives(control);
             if !control.pending.iter().all(u8::is_ascii_whitespace) {
+                warn!(
+                    device = %self.name,
+                    cmd = xml_body,
+                    attempt,
+                    len = control.pending.len(),
+                    debut = %debut_des_octets(&control.pending),
+                    "hqplayer_control_unsolicited_bytes"
+                );
+                // La commande n'est pas encore écrite : la renvoyer sur une
+                // connexion neuve ne l'exécute pas deux fois. Les octets en
+                // trop restent sur l'ancienne socket, jamais lus comme réponse.
                 *conn = None;
-                return Err("hqplayer_control_unsolicited_response: reconnect required".into());
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(format!(
+                    "{CODE_OCTETS_NON_SOLLICITES}: {MESSAGE_OCTETS_NON_SOLLICITES}"
+                ));
             }
             let message = frame_message(xml_body, control.header_sent);
             debug!(device = %self.name, raw = %message.replace('\n', "\\n"), "hqplayer_send");

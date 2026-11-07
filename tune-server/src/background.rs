@@ -925,7 +925,10 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     }
                 }
             }
+            let sortie_locale = crate::discovery_setup::sortie_locale_inscrite(&outputs);
             drop(outputs);
+            let nos_adresses =
+                crate::discovery_setup::nos_adresses(state.config.advertised_ip.as_deref());
 
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
             for d in &devices {
@@ -1007,6 +1010,22 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 // ligne (`online` vaut `DEFAULT 1` au schéma). D'où « elles
                 // apparaissent ET s'activent toutes seules », chez Fabien, sur
                 // une installation où la case est décochée.
+                //
+                // #7875 — même règle que la découverte vivante : un renderer
+                // DLNA tiers de cette machine ne reçoit pas de zone NEUVE en
+                // double de la sortie locale ; une zone existante se rattache.
+                if !possede_deja_sa_zone
+                    && let Some(loc) = crate::discovery_setup::zone_auto_retenue_sur_cette_machine(
+                        "dlna",
+                        &d.host,
+                        d.location.as_deref(),
+                        &nos_adresses,
+                        sortie_locale,
+                    )
+                {
+                    crate::discovery_setup::journaliser_zone_auto_retenue(&d.id, &d.name, loc);
+                    continue;
+                }
                 match zone_repo.get_or_create_si_autorise(
                     &d.name,
                     Some("dlna"),
@@ -1754,6 +1773,9 @@ pub fn spawn_heartbeat(state: &AppState) {
         // connait.
         let server_id =
             tune_core::cloud::telemetry::TelemetryReporter::get_or_create_server_id(&settings);
+        // Ces identifiants ne sortent jamais dans un rapport ou un journal
+        // exporté : retenus dès qu'ils existent.
+        tune_core::confidentialite::retenir_identifiants_du_serveur(&settings);
 
         let hostname = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -2547,7 +2569,60 @@ pub(crate) fn annonce_slimproto_activee(valeur: Option<&str>) -> bool {
     !matches!(valeur.map(str::trim), Some("false") | Some("0"))
 }
 
+/// La clé du réglage « Serveur Squeezebox de Tune » (#7374).
+///
+/// Distincte des deux autres clés du même protocole : `squeezebox_enabled`
+/// gouverne Tune CLIENT d'un Lyrion/LMS, [`CLE_ANNONCE_SLIMPROTO`] la seule
+/// annonce UDP. Celle-ci gouverne tout Tune SERVEUR : TCP et UDP 3483, et le
+/// pont de commande 9090.
+pub(crate) const CLE_SERVEUR_SQUEEZEBOX: &str = "slimproto_server_enabled";
+
+/// Tune doit-il être serveur Squeezebox (#7374) ?
+///
+/// Un Lyrion/LMS installé sur la même machine veut les ports 3483 et 9090 :
+/// tant que Tune les ouvrait sans condition, les deux ne pouvaient pas tourner
+/// ensemble. Vrai par défaut, pour ne rien changer aux installations
+/// existantes (#2938, #2349) ; seul un `false` explicite coupe le serveur —
+/// même lecture que [`annonce_slimproto_activee`].
+pub(crate) fn serveur_squeezebox_actif(valeur: Option<&str>) -> bool {
+    annonce_slimproto_activee(valeur)
+}
+
+/// Le réglage « Serveur Squeezebox de Tune » tel qu'il est enregistré.
+pub(crate) fn serveur_squeezebox_regle(
+    backend: &Arc<dyn tune_core::db::backend::DbBackend>,
+) -> bool {
+    serveur_squeezebox_actif(
+        tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .get(CLE_SERVEUR_SQUEEZEBOX)
+            .ok()
+            .flatten()
+            .as_deref(),
+    )
+}
+
 fn spawn_slimproto_server(state: &AppState, config: &TuneConfig) {
+    // #7374 — le serveur coupé n'ouvre AUCUN port : ni 3483 TCP/UDP, ni 9090,
+    // repli de #4361 compris. Un LMS de la même machine peut alors les prendre.
+    let serveur = serveur_squeezebox_regle(&state.backend);
+    if !serveur {
+        info!(
+            reglage = CLE_SERVEUR_SQUEEZEBOX,
+            "slimproto_serveur_desactive — Tune n'ouvre ni 3483 TCP/UDP ni 9090"
+        );
+        return;
+    }
+    armer_serveur_squeezebox(state, config);
+}
+
+/// Arme le serveur Squeezebox de Tune : TCP 3483, pont 9090, puis l'annonce UDP
+/// si son propre réglage le permet. Chaque volet déjà armé est laissé tel quel.
+///
+/// Appelée au démarrage et par `PATCH /system/config` quand le réglage
+/// « Serveur Squeezebox de Tune » est rallumé (#7374). Un port déjà pris ne
+/// fait jamais échouer Tune : la cause est journalisée et retenue dans l'état
+/// d'écoute de chaque volet (#2938).
+pub(crate) fn armer_serveur_squeezebox(state: &AppState, config: &TuneConfig) {
     // DEUX adresses, et non plus une — elles ne répondent pas à la même
     // question (#3867).
     //
@@ -2578,23 +2653,16 @@ fn spawn_slimproto_server(state: &AppState, config: &TuneConfig) {
     let event_bus = state.event_bus.clone();
     let outputs = state.outputs.clone();
     let server_ip = ip_sondee_localement;
-    tokio::spawn(async move {
-        let server = Arc::new(tune_core::slimproto::SlimProtoServer::new_with_state(
-            db, event_bus, outputs, server_ip,
-        ));
-        if let Err(e) = server.spawn().await {
-            error!(error = %e, "slimproto_server_failed");
-        }
-    });
+    tune_core::slimproto::armer_serveur_tcp(Arc::new(
+        tune_core::slimproto::SlimProtoServer::new_with_state(db, event_bus, outputs, server_ip),
+    ));
     let cli_state = Arc::new(tune_core::slimproto::cli_server::CliState {
         players: tune_core::slimproto::new_player_registry(),
         server_name: "Tune".to_string(),
         server_version: tune_core::version().to_string(),
         local_ip: adresse_remise,
     });
-    tokio::spawn(tune_core::slimproto::cli_server::start_cli_server(
-        cli_state,
-    ));
+    tune_core::slimproto::cli_server::armer(cli_state);
 
     // Le volet UDP du port 3483 : sans lui, une Squeezebox ou un squeezelite
     // en decouverte automatique ne trouve jamais Tune — il fallait donner
@@ -2621,6 +2689,18 @@ fn spawn_slimproto_server(state: &AppState, config: &TuneConfig) {
         return;
     }
     tune_core::slimproto::discovery::spawn(identite_slimproto(config.port));
+}
+
+/// Éteint tout le serveur Squeezebox de Tune et rend ses ports : annonce UDP,
+/// TCP 3483 et pont 9090 (#7374). Vrai si un volet tournait.
+///
+/// Au retour, les ports TCP sont libres : un Lyrion/LMS de la même machine peut
+/// les reprendre sans que Tune redémarre.
+pub(crate) async fn eteindre_serveur_squeezebox() -> bool {
+    let udp = tune_core::slimproto::discovery::eteindre_avec_le_serveur();
+    let tcp = tune_core::slimproto::eteindre_serveur_tcp().await;
+    let cli = tune_core::slimproto::cli_server::eteindre().await;
+    udp || tcp || cli
 }
 
 /// L'identité que Tune annonce sur le réseau — UNE seule définition.
@@ -2905,6 +2985,8 @@ fn spawn_replaygain_analysis(state: &AppState) {
     // `tune-core` et ne connaît pas l'API : c'est le démarrage du serveur qui
     // lui dépose le bus, comme il le fait pour l'orchestrateur.
     tune_core::audio::replaygain::progression::brancher_le_bus(state.event_bus.clone());
+    // #7915 — l'avancement des empreintes et de la plage dynamique.
+    tune_core::taches_de_fond::avancement::brancher_le_bus(state.event_bus.clone());
     tune_core::audio::replaygain::spawn(state.backend.clone());
     // #5882 — une remesure demandée avant un arrêt reprend où elle en était.
     tune_core::audio::replaygain::remesure::reprendre_si_demandee(state.backend.clone());
@@ -3171,6 +3253,60 @@ where
 #[path = "parc_local_pendant_la_lecture_6119_tests.rs"]
 mod parc_local_pendant_la_lecture_6119_tests;
 
+/// #7263 — combien de temps la fiche de diagnostic se contente du parc déjà
+/// publié avant de rebalayer le matériel.
+///
+/// L'écran « État du serveur » du client web interroge `GET
+/// /system/diagnostics` toutes les 5 s, et le cache du balayage
+/// (`SCAN_COOLDOWN_SECS`) ne dure que 5 s : la fiche relançait donc un
+/// inventaire ALSA complet toutes les 5 à 10 s (31 dans un extrait du journal
+/// de JeromeQ), soit environ 500 ouvertures du greffon `jack` par heure, sans
+/// la moindre lecture en cours. La fiche n'a besoin que des NOMS : le parc
+/// publié par le rescan périodique ou par `GET /devices/audio` suffit tant
+/// qu'il a moins de cinq minutes.
+#[cfg(feature = "local-audio")]
+pub const DUREE_DU_PARC_POUR_LE_DIAGNOSTIC: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// #7263 — le parc local de la fiche de diagnostic : le parc publié s'il est
+/// assez récent, sinon la même règle que [`parc_local_sans_couper_la_lecture`].
+#[cfg(feature = "local-audio")]
+pub async fn parc_local_pour_le_diagnostic<F, Fut>(
+    state: &AppState,
+    enumerer: F,
+) -> Vec<tune_core::outputs::local::AudioDevice>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
+{
+    parc_local_pour_le_diagnostic_selon(
+        state,
+        std::env::consts::OS,
+        tune_core::outputs::local::age_du_parc_publie(),
+        enumerer,
+    )
+    .await
+}
+
+/// L'âge du parc est explicite pour juger la règle sans dépendre du dépôt
+/// global que les autres témoins remplissent en parallèle.
+#[cfg(feature = "local-audio")]
+async fn parc_local_pour_le_diagnostic_selon<F, Fut>(
+    state: &AppState,
+    os: &str,
+    age_du_parc: Option<std::time::Duration>,
+    enumerer: F,
+) -> Vec<tune_core::outputs::local::AudioDevice>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
+{
+    if age_du_parc.is_some_and(|age| age < DUREE_DU_PARC_POUR_LE_DIAGNOSTIC) {
+        return tune_core::outputs::local::cached_audio_devices();
+    }
+    parc_local_sans_couper_la_lecture_selon_os(state, os, enumerer).await
+}
+
 #[cfg(all(test, feature = "local-audio"))]
 #[path = "sortie_locale_disparue_6551_tests.rs"]
 mod sortie_locale_disparue_6551_tests;
@@ -3421,6 +3557,8 @@ pub(crate) async fn appliquer_le_parc_local(
     // Phase 1: Register new devices and remove stale ones (hold lock briefly)
     let mut new_devices_to_zone: Vec<(String, String, bool)> = Vec::new();
     let mut removed_device_ids: Vec<String> = Vec::new();
+    // #7949 — les sorties retirées, arrêtées une fois le registre relâché.
+    let mut sorties_retirees = Vec::new();
     {
         let mut outputs = state.outputs.lock().await;
         let existing_ids: std::collections::HashSet<String> = outputs
@@ -3525,7 +3663,7 @@ pub(crate) async fn appliquer_le_parc_local(
             }
 
             if !is_playing {
-                outputs.remove(old_id);
+                sorties_retirees.extend(outputs.remove(old_id));
                 info!(device_id = %old_id, "local_audio_device_removed");
                 removed_device_ids.push(old_id.clone());
             }
@@ -3539,6 +3677,9 @@ pub(crate) async fn appliquer_le_parc_local(
             );
         }
     } // outputs lock released here
+    // #7949 — une sortie en pause retirée garde sinon son fil et son
+    // périphérique : le DAC rebranché le trouverait occupé.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(sorties_retirees).await;
 
     // Phase 2a: Mark zones of unplugged devices offline and tell the clients
     // (no lock held). Without this the zone stayed listed as playable after a
@@ -4972,12 +5113,14 @@ mod annonce_slimproto_tests {
         );
     }
 
-    /// Le réglage ne doit toucher QUE l'annonce.
+    /// Le réglage de l'annonce ne doit toucher QUE l'annonce.
     ///
     /// `SlimProtoServer::spawn` (TCP 3483) et le serveur CLI 9090 sont armés
     /// plus haut dans la même fonction, avant le `return` du refus : les
     /// déplacer sous la garde couperait la joignabilité des platines, ce que
-    /// #2938 et #2349 interdisent.
+    /// #2938 et #2349 interdisent. Depuis #7374, c'est le réglage « Serveur
+    /// Squeezebox de Tune », lu par `spawn_slimproto_server`, qui peut couper
+    /// le TCP — jamais celui de l'annonce.
     #[test]
     fn l_ecoute_tcp_reste_armee_meme_quand_l_annonce_se_tait() {
         // ⚠️ Le corps est borné à la FONCTION, et chaque marqueur épelé en deux
@@ -4985,22 +5128,75 @@ mod annonce_slimproto_tests {
         // ses propres marqueurs — et restait VERT sur son propre sabotage :
         // mesuré le 11/09, la garde retirée de la fonction ne le faisait pas
         // rougir.
-        let source = include_str!("background.rs");
-        let debut = source
-            .find(concat!("fn spawn_slimproto_", "server(state: &AppState"))
-            .expect("la fonction doit exister");
-        let corps = &source[debut..];
-        let corps = &corps[..corps.find("\n}\n").expect("la fonction doit se fermer")];
+        let corps = corps_de(concat!("fn armer_serveur_", "squeezebox(state: &AppState"));
         let pos_tcp = corps
             .find(concat!("SlimProtoServer::", "new_with_state"))
             .expect("le serveur TCP doit être armé dans cette fonction (#2938)");
+        let pos_cli = corps
+            .find(concat!("cli_server::", "armer("))
+            .expect("le pont 9090 doit être armé dans cette fonction");
         let pos_garde = corps
             .find(concat!("if !", "annonce {"))
             .expect("la garde de l'annonce doit exister dans cette fonction (#3809)");
         assert!(
-            pos_tcp < pos_garde,
-            "l'écoute TCP 3483 doit être armée AVANT la garde : sans elle, \
-             aucune platine Squeezebox ne peut plus piloter Tune (#2938, #2349)"
+            pos_tcp < pos_garde && pos_cli < pos_garde,
+            "l'écoute TCP 3483 et le pont 9090 doivent être armés AVANT la garde \
+             de l'annonce : sans eux, aucune platine Squeezebox ne peut plus \
+             piloter Tune (#2938, #2349)"
+        );
+    }
+
+    /// Le corps d'une fonction de ce fichier, borné à sa fermeture.
+    fn corps_de(signature: &str) -> &'static str {
+        let source = include_str!("background.rs");
+        let debut = source.find(signature).expect("la fonction doit exister");
+        let corps = &source[debut..];
+        &corps[..corps.find("\n}\n").expect("la fonction doit se fermer")]
+    }
+
+    /// #7374 — vrai par défaut : une installation existante, qui n'a jamais
+    /// écrit ce réglage, reste serveur Squeezebox comme avant.
+    #[test]
+    fn le_serveur_squeezebox_reste_actif_par_defaut() {
+        assert!(serveur_squeezebox_actif(None));
+        for valeur in ["true", "1", "", "oui"] {
+            assert!(serveur_squeezebox_actif(Some(valeur)), "« {valeur} »");
+        }
+        assert!(!serveur_squeezebox_actif(Some("false")));
+        assert!(!serveur_squeezebox_actif(Some("0")));
+    }
+
+    /// #7374 — trois réglages, trois clés : le serveur, l'annonce et Tune
+    /// client d'un LMS ne se confondent pas.
+    #[test]
+    fn le_serveur_a_sa_propre_cle() {
+        assert_ne!(CLE_SERVEUR_SQUEEZEBOX, CLE_ANNONCE_SLIMPROTO);
+        assert_ne!(CLE_SERVEUR_SQUEEZEBOX, "squeezebox_enabled");
+    }
+
+    /// #7374 — garde de câblage : au démarrage, le réglage du serveur est lu
+    /// AVANT tout armement, et un refus rend la main avant d'armer quoi que ce
+    /// soit. Sans cette garde, le réglage serait une ligne en base qui ne
+    /// gouverne rien.
+    #[test]
+    fn le_demarrage_lit_le_reglage_du_serveur_avant_d_armer() {
+        let corps = corps_de(concat!("fn spawn_slimproto_", "server(state: &AppState"));
+        let pos_lecture = corps
+            .find(concat!("serveur_squeezebox_", "regle(&state.backend)"))
+            .expect("le réglage du serveur doit être lu au démarrage (#7374)");
+        let pos_refus = corps
+            .find(concat!("if !", "serveur {"))
+            .expect("un serveur coupé doit rendre la main (#7374)");
+        let pos_armement = corps
+            .find(concat!("armer_serveur_", "squeezebox(state, config)"))
+            .expect("un serveur actif doit être armé (#7374)");
+        assert!(pos_lecture < pos_refus && pos_refus < pos_armement);
+        assert!(
+            !corps.contains(concat!("SlimProtoServer::", "new_with_state"))
+                && !corps.contains(concat!("cli_server::", "armer("))
+                && !corps.contains(concat!("discovery::", "spawn(")),
+            "aucun port ne doit être armé hors de `armer_serveur_squeezebox` : \
+             il échapperait au réglage (#7374)"
         );
     }
 }

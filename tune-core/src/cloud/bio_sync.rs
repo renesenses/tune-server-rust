@@ -12,6 +12,10 @@ use crate::db::settings_repo::SettingsRepo;
 const UPLOAD_URL: &str = "https://mozaiklabs.fr/api/v1/community/bios";
 const DOWNLOAD_ARTIST_URL: &str = "https://mozaiklabs.fr/api/v1/community/bios/artists";
 const DOWNLOAD_ALBUM_URL: &str = "https://mozaiklabs.fr/api/v1/community/bios/albums";
+/// Réglage du serveur : langue de l'interface, demandée au fonds communautaire
+/// (`lang=`, site-mozaiklabs#485). Absent ou invalide : rien n'est envoyé et le
+/// fonds répond comme avant (#7027).
+pub const REGLAGE_LANGUE_BIOS: &str = "bio_langue";
 const BATCH_SIZE: usize = 100;
 // The by-title phase packs a URL-encoded JSON array of {title, artist_name}
 // into a GET query string, which is far longer per item than the 36-char MBIDs
@@ -186,6 +190,30 @@ pub fn bio_source(source: &Option<String>) -> &str {
     }
 }
 
+/// Les sources dont une bio n'est JAMAIS envoyée au fonds communautaire
+/// (#8022) : les textes éditoriaux des services de streaming. Ils restent la
+/// propriété du service (ou de ses auteurs) ; la bibliothèque de l'utilisateur
+/// les garde pour lui, elle ne les republie pas.
+pub const SOURCES_JAMAIS_ENVOYEES: &[&str] = &[
+    "qobuz",
+    "tidal",
+    "deezer",
+    "spotify",
+    "amazon",
+    "apple_music",
+    "youtube",
+    "soundcloud",
+    "bandcamp",
+];
+
+/// Une bio de cette source peut-elle partir vers le fonds communautaire ?
+/// Non pour une source de [`SOURCES_JAMAIS_ENVOYEES`], casse et espaces mis
+/// à part.
+pub fn source_envoyable_au_fonds(source: Option<&str>) -> bool {
+    let s = source.unwrap_or("").trim().to_ascii_lowercase();
+    !SOURCES_JAMAIS_ENVOYEES.contains(&s.as_str())
+}
+
 #[derive(Debug, Deserialize)]
 struct AlbumByTitleBiosWrapper {
     #[serde(default)]
@@ -229,7 +257,7 @@ async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
     let artist_repo = ArtistRepo::with_backend(db.clone());
     let album_repo = AlbumRepo::with_backend(db.clone());
 
-    let artists = match artist_repo.artists_with_bio_and_mbid() {
+    let mut artists = match artist_repo.artists_with_bio_and_mbid() {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "bio_sync_artist_query_failed");
@@ -237,13 +265,16 @@ async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
         }
     };
 
-    let albums = match album_repo.albums_with_bio() {
+    let mut albums = match album_repo.albums_with_bio() {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "bio_sync_album_query_failed");
             return;
         }
     };
+    // #8022 : jamais une bio d'un service de streaming vers le fonds.
+    artists.retain(|(_, _, _, source, ..)| source_envoyable_au_fonds(source.as_deref()));
+    albums.retain(|(_, _, _, _, source, ..)| source_envoyable_au_fonds(source.as_deref()));
 
     if artists.is_empty() && albums.is_empty() {
         return;
@@ -388,13 +419,56 @@ pub async fn download_bios(db: &Arc<dyn DbBackend>) {
     };
 
     download_artist_bios(db, &client, DOWNLOAD_ARTIST_URL).await;
-    download_album_bios(db, &client).await;
+    download_album_bios(db, &client, DOWNLOAD_ALBUM_URL).await;
+}
+
+/// Ramène une langue à sa base minuscule (`fr-CA` -> `fr`). `None` si elle
+/// n'a pas la forme d'une langue (2 ou 3 lettres).
+pub fn normaliser_langue(brut: &str) -> Option<String> {
+    let base = brut
+        .trim()
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let valide = (2..=3).contains(&base.len()) && base.chars().all(|c| c.is_ascii_lowercase());
+    valide.then_some(base)
+}
+
+/// Langue réglée pour les bios. `None` si le réglage est absent, vide ou invalide.
+fn langue_des_bios(settings: &SettingsRepo) -> Option<String> {
+    let brut = settings.get(REGLAGE_LANGUE_BIOS).ok().flatten()?;
+    normaliser_langue(&brut)
+}
+
+/// Mémorise la dernière langue d'interface vue sur les routes de bio (artiste,
+/// notes d'album) dans `bio_langue`. Lecture d'abord : aucune écriture si la
+/// base de langue est inchangée ; langue invalide : réglage inchangé.
+/// Rend `true` si une écriture a eu lieu.
+pub fn memoriser_langue_interface(settings: &SettingsRepo, lang: &str) -> bool {
+    let Some(base) = normaliser_langue(lang) else {
+        return false;
+    };
+    if langue_des_bios(settings).as_deref() == Some(base.as_str()) {
+        return false;
+    }
+    settings.set(REGLAGE_LANGUE_BIOS, &base).is_ok()
+}
+
+/// Ajoute `&lang=<langue>` à l'URL quand une langue est réglée.
+fn avec_langue(mut url: String, lang: Option<&str>) -> String {
+    if let Some(l) = lang {
+        url.push_str("&lang=");
+        url.push_str(&urlencoding::encode(l));
+    }
+    url
 }
 
 async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client, artist_url: &str) {
     let settings = SettingsRepo::with_backend(db.clone());
     let artist_repo = ArtistRepo::with_backend(db.clone());
 
+    let lang = langue_des_bios(&settings);
     let candidates = match artist_repo.artists_without_bio_with_mbid() {
         Ok(v) => v,
         Err(e) => {
@@ -414,9 +488,12 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client,
         let ids: Vec<&str> = chunk.iter().map(|(_, mbid)| mbid.as_str()).collect();
         let query = ids.join(",");
 
-        let url = format!(
-            "{artist_url}?musicbrainz_ids={}",
-            urlencoding::encode(&query)
+        let url = avec_langue(
+            format!(
+                "{artist_url}?musicbrainz_ids={}",
+                urlencoding::encode(&query)
+            ),
+            lang.as_deref(),
         );
 
         // CLD-2 : le même chemin borné que l'envoi.
@@ -491,9 +568,10 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client,
     }
 }
 
-async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) {
+async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client, album_url: &str) {
     let settings = SettingsRepo::with_backend(db.clone());
     let album_repo = AlbumRepo::with_backend(db.clone());
+    let lang = langue_des_bios(&settings);
 
     // Phase 1: download by MBID (existing path, for albums that have one)
     let mbid_candidates = match album_repo.albums_without_bio_with_mbid() {
@@ -510,9 +588,12 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         let ids: Vec<&str> = chunk.iter().map(|(_, mbid)| mbid.as_str()).collect();
         let query = ids.join(",");
 
-        let url = format!(
-            "{DOWNLOAD_ALBUM_URL}?musicbrainz_ids={}",
-            urlencoding::encode(&query)
+        let url = avec_langue(
+            format!(
+                "{album_url}?musicbrainz_ids={}",
+                urlencoding::encode(&query)
+            ),
+            lang.as_deref(),
         );
 
         // CLD-2 : le même chemin borné que l'envoi.
@@ -617,9 +698,9 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
             .collect();
 
         let titles_param = serde_json::to_string(&titles_json).unwrap_or_default();
-        let url = format!(
-            "{DOWNLOAD_ALBUM_URL}?titles={}",
-            urlencoding::encode(&titles_param)
+        let url = avec_langue(
+            format!("{album_url}?titles={}", urlencoding::encode(&titles_param)),
+            lang.as_deref(),
         );
 
         // CLD-2 : le même chemin borné que l'envoi.
@@ -1062,6 +1143,97 @@ mod tests {
         );
     }
 
+    /// Serveur de test qui accepte les envois et garde chaque corps reçu.
+    async fn mock_qui_garde_les_corps() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::Router;
+        use axum::routing::post;
+
+        let corps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let etat = corps.clone();
+        let app = Router::new()
+            .route(
+                "/upload",
+                post(
+                    move |axum::extract::State(c): axum::extract::State<
+                        Arc<std::sync::Mutex<Vec<String>>>,
+                    >,
+                          recu: String| async move {
+                        c.lock().unwrap().push(recu);
+                        axum::http::StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(etat);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://127.0.0.1:{port}"), corps)
+    }
+
+    /// #8022 — témoin dédié : une bio de source `qobuz` (ou d'un autre service
+    /// de streaming) ne part JAMAIS vers le fonds communautaire ; une bio
+    /// Wikipédia de la même base part. Textes factices.
+    #[tokio::test]
+    async fn une_bio_de_service_de_streaming_ne_part_jamais_vers_le_fonds_8022() {
+        use crate::db::models::{Album, Artist};
+
+        let db = fresh_db();
+        let artistes = ArtistRepo::with_backend(db.clone());
+        let mut libre = Artist::new("Artiste Libre".into());
+        libre.musicbrainz_id = Some("mbid-libre".into());
+        let id_libre = artistes.create(&libre).unwrap();
+        artistes
+            .update_bio_full(
+                id_libre,
+                "BIO-LIBRE-TEMOIN",
+                "wikipedia",
+                None,
+                "CC-BY-SA-4.0",
+                "fr",
+            )
+            .unwrap();
+        for (i, source) in ["qobuz", "Qobuz", "tidal"].iter().enumerate() {
+            let mut a = Artist::new(format!("Artiste Service {i}"));
+            a.musicbrainz_id = Some(format!("mbid-service-{i}"));
+            let id = artistes.create(&a).unwrap();
+            artistes
+                .update_bio_full(id, "BIO-SERVICE-TEMOIN", source, None, "", "fr")
+                .unwrap();
+        }
+        let albums = AlbumRepo::with_backend(db.clone());
+        let mut album = Album::new("Album Service".into());
+        album.artist_id = Some(id_libre);
+        let id_album = albums.create(&album).unwrap();
+        albums
+            .update_bio_full(id_album, "NOTE-SERVICE-TEMOIN", "qobuz", None, "", "fr")
+            .unwrap();
+
+        let (base, corps) = mock_qui_garde_les_corps().await;
+        upload_bios_to(&db, &format!("{base}/upload")).await;
+
+        let recus = corps.lock().unwrap().join("\n");
+        assert!(
+            recus.contains("BIO-LIBRE-TEMOIN"),
+            "la bio Wikipédia doit partir : le banc doit voir un envoi ({recus})"
+        );
+        assert!(
+            !recus.contains("BIO-SERVICE-TEMOIN") && !recus.contains("NOTE-SERVICE-TEMOIN"),
+            "une bio de source qobuz/tidal est partie vers le fonds communautaire : {recus}"
+        );
+    }
+
+    #[test]
+    fn source_envoyable_au_fonds_refuse_les_services() {
+        assert!(source_envoyable_au_fonds(Some("wikipedia")));
+        assert!(source_envoyable_au_fonds(None));
+        assert!(!source_envoyable_au_fonds(Some("qobuz")));
+        assert!(!source_envoyable_au_fonds(Some(" QOBUZ ")));
+        assert!(!source_envoyable_au_fonds(Some("tidal")));
+    }
+
     #[tokio::test]
     async fn televersement_un_429_persiste_le_delai_et_survit_au_redemarrage() {
         use crate::db::models::Artist;
@@ -1089,5 +1261,161 @@ mod tests {
         );
         let settings = SettingsRepo::with_backend(db);
         assert!(rate_limit::active(&settings, CloudScope::BiosWrite).is_some());
+    }
+
+    /// Doublure du site : consigne les requêtes reçues et répond avec `lang`.
+    async fn doublure_site(
+        lang_repondu: &'static str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::Router;
+        use axum::extract::RawQuery;
+        use axum::routing::get;
+        let vues = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (a, b, c) = (vues.clone(), vues.clone(), vues.clone());
+        let app = Router::new()
+            .route(
+                "/artists",
+                get(move |RawQuery(q): RawQuery| async move {
+                    a.lock()
+                        .unwrap()
+                        .push(format!("artists?{}", q.unwrap_or_default()));
+                    axum::Json(serde_json::json!({"bios": [{
+                        "musicbrainz_id": "mbid-00042", "name": "A",
+                        "bio": "Bio d'artiste.", "source": "wikipedia", "lang": lang_repondu}]}))
+                }),
+            )
+            .route(
+                "/albums",
+                get(move |RawQuery(q): RawQuery| async move {
+                    let q = q.unwrap_or_default();
+                    b.lock().unwrap().push(format!("albums?{q}"));
+                    if q.starts_with("titles=") {
+                        axum::Json(serde_json::json!({"albums": [{
+                            "title": "Titre", "artist_name": "A",
+                            "bio": "Bio d'album.", "source": "wikipedia", "lang": lang_repondu}]}))
+                    } else {
+                        axum::Json(serde_json::json!({"albums": []}))
+                    }
+                }),
+            )
+            .fallback(move || async move {
+                c.lock().unwrap().push("autre".into());
+                axum::http::StatusCode::NOT_FOUND
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://127.0.0.1:{port}"), vues)
+    }
+
+    fn semer_trois_candidats(db: &Arc<dyn DbBackend>) -> (i64, i64) {
+        use crate::db::models::{Album, Artist};
+        let ar = ArtistRepo::with_backend(db.clone());
+        let mut a = Artist::new("A".into());
+        a.musicbrainz_id = Some("mbid-00042".into());
+        let artiste = ar.create(&a).unwrap();
+        let al = AlbumRepo::with_backend(db.clone());
+        let mut m = Album::new("AvecMbid".into());
+        m.musicbrainz_release_group_id = Some("rg-alb-1".into());
+        al.create(&m).unwrap();
+        let mut t = Album::new("Titre".into());
+        t.artist_id = Some(artiste);
+        let album = al.create(&t).unwrap();
+        (artiste, album)
+    }
+
+    #[tokio::test]
+    async fn lang_envoye_aux_trois_requetes_quand_la_langue_est_reglee() {
+        let db = fresh_db();
+        semer_trois_candidats(&db);
+        SettingsRepo::with_backend(db.clone())
+            .set(REGLAGE_LANGUE_BIOS, "fr-CA")
+            .unwrap();
+        let (base, vues) = doublure_site("fr").await;
+        download_artist_bios(&db, &client_de_test(), &format!("{base}/artists")).await;
+        download_album_bios(&db, &client_de_test(), &format!("{base}/albums")).await;
+        let v = vues.lock().unwrap().clone();
+        assert_eq!(v.len(), 3, "{v:?}");
+        for r in &v {
+            assert!(r.ends_with("&lang=fr"), "lang manquant : {r}");
+        }
+    }
+
+    #[tokio::test]
+    async fn aucun_lang_envoye_sans_reglage_ou_avec_reglage_invalide() {
+        for reglage in [None, Some(""), Some("fr&x=1"), Some("français")] {
+            let db = fresh_db();
+            semer_trois_candidats(&db);
+            if let Some(r) = reglage {
+                SettingsRepo::with_backend(db.clone())
+                    .set(REGLAGE_LANGUE_BIOS, r)
+                    .unwrap();
+            }
+            let (base, vues) = doublure_site("fr").await;
+            download_artist_bios(&db, &client_de_test(), &format!("{base}/artists")).await;
+            download_album_bios(&db, &client_de_test(), &format!("{base}/albums")).await;
+            let v = vues.lock().unwrap().clone();
+            assert_eq!(v.len(), 3, "{v:?}");
+            for r in &v {
+                assert!(!r.contains("lang"), "lang envoyé ({reglage:?}) : {r}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn une_reponse_lang_en_est_rangee_en_en() {
+        let db = fresh_db();
+        let (artiste, album) = semer_trois_candidats(&db);
+        SettingsRepo::with_backend(db.clone())
+            .set(REGLAGE_LANGUE_BIOS, "fr")
+            .unwrap();
+        // Le site replie sur l'anglais : la bio est rangée avec SA langue.
+        let (base, _) = doublure_site("en").await;
+        download_artist_bios(&db, &client_de_test(), &format!("{base}/artists")).await;
+        download_album_bios(&db, &client_de_test(), &format!("{base}/albums")).await;
+        let pa = ArtistRepo::with_backend(db.clone())
+            .bio_provenance(artiste)
+            .unwrap()
+            .unwrap();
+        let pb = AlbumRepo::with_backend(db.clone())
+            .bio_provenance(album)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pa["lang"], "en", "{pa}");
+        assert_eq!(pb["lang"], "en", "{pb}");
+    }
+
+    #[test]
+    fn la_derniere_langue_vue_alimente_le_reglage() {
+        let db = fresh_db();
+        let st = SettingsRepo::with_backend(db);
+        assert!(memoriser_langue_interface(&st, "en"), "première visite");
+        assert_eq!(st.get(REGLAGE_LANGUE_BIOS).unwrap().as_deref(), Some("en"));
+        assert!(!memoriser_langue_interface(&st, "en"), "répétition");
+        assert!(!memoriser_langue_interface(&st, "en-GB"), "même base");
+        assert!(memoriser_langue_interface(&st, "fr"), "passage à fr");
+        assert_eq!(st.get(REGLAGE_LANGUE_BIOS).unwrap().as_deref(), Some("fr"));
+        for faux in ["", "x", "fr&x=1", "français", "123"] {
+            assert!(!memoriser_langue_interface(&st, faux), "{faux}");
+        }
+        assert_eq!(st.get(REGLAGE_LANGUE_BIOS).unwrap().as_deref(), Some("fr"));
+    }
+
+    #[tokio::test]
+    async fn bio_sync_envoie_lang_en_apres_une_visite_en_anglais() {
+        let db = fresh_db();
+        semer_trois_candidats(&db);
+        memoriser_langue_interface(&SettingsRepo::with_backend(db.clone()), "en");
+        let (base, vues) = doublure_site("en").await;
+        download_artist_bios(&db, &client_de_test(), &format!("{base}/artists")).await;
+        download_album_bios(&db, &client_de_test(), &format!("{base}/albums")).await;
+        let v = vues.lock().unwrap().clone();
+        assert_eq!(v.len(), 3, "{v:?}");
+        for r in &v {
+            assert!(r.ends_with("&lang=en"), "{r}");
+        }
     }
 }

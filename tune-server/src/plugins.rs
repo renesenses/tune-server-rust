@@ -212,6 +212,21 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
         )))
         .await;
 
+    // Calibration de la pièce (#7632, C1). Comme `entree-audio` : l'orchestrateur
+    // pour y inscrire la source PCM FINIE « calibration » (le balayage de
+    // mesure), régler le volume et lancer la zone ; le gestionnaire de lecture
+    // pour la file. Opt-in : rien ne joue tant qu'il n'est pas installé.
+    #[cfg(feature = "calibration")]
+    loader
+        .register(Box::new(tune_calibration_greffon::CalibrationPlugin::new(
+            tune_calibration_greffon::HostServices {
+                backend: state.backend.clone(),
+                orchestrator: state.orchestrator.clone(),
+                playback: state.playback.clone(),
+            },
+        )))
+        .await;
+
     // Assistant IA, étape 1 (chantier assistant-ia). Toujours compilé, gratuit.
     // La base ; le DOSSIER de la base, où vit la clé maîtresse qui scelle la
     // clé d'API de l'utilisateur (hors de la base elle-même) ; et les critères
@@ -437,6 +452,19 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
         rendus
     }
 
+    /// « Chercher sur les services » (#7928) : tous les services du
+    /// registre UTILISABLES (activés et connectés), dans l'ordre du registre.
+    async fn services_de_recherche(&self) -> Vec<String> {
+        let noms = self.state.services.lock().await.list();
+        let mut rendus = Vec::new();
+        for nom in noms {
+            if self.service(&nom).await.is_some() {
+                rendus.push(nom);
+            }
+        }
+        rendus
+    }
+
     async fn chercher_albums(
         &self,
         service: &str,
@@ -557,7 +585,9 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
                 Ok(Image::Octets(octets.to_vec()))
             }
             200..=299 => Ok(Image::Introuvable),
-            404 | 403 | 410 => Ok(Image::Introuvable),
+            404 | 410 => Ok(Image::Introuvable),
+            // #7927 : un refus du CDN n'est pas une image disparue.
+            403 => Ok(Image::Refusee),
             429 | 503 => Ok(Image::Limite),
             statut => {
                 tracing::debug!(target: "plugin", statut, "collection_physique_pochette_statut");

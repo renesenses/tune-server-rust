@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "tracks": [
+    {
+      "title": "Exemple CD 16/44,1",
+      "artist": "Artiste d'exemple",
+      "format": "cd_16_44",
+      "license": "CC BY 4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/",
+      "url": "https://mozaiklabs.fr/tune/demo-tracks/01-exemple-cd.flac",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 31457280,
+      "file_name": "01 - Exemple CD 16-44.flac"
+    },
+    {
+      "title": "Exemple Hi-Res 24/96",
+      "artist": "Artiste d'exemple",
+      "format": "hires_24_96",
+      "license": "Accord écrit du label (exemple)",
+      "url": "https://mozaiklabs.fr/tune/demo-tracks/02-exemple-24-96.flac",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "file_name": "02 - Exemple Hi-Res 24-96.flac"
+    },
+    {
+      "title": "Exemple Hi-Res 24/192",
+      "format": "hires_24_192",
+      "license": "CC BY 4.0",
+      "url": "https://mozaiklabs.fr/tune/demo-tracks/03-exemple-24-192.flac",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "file_name": "03 - Exemple Hi-Res 24-192.flac"
+    },
+    {
+      "title": "Exemple DSD64",
+      "format": "dsd64",
+      "license": "CC BY 4.0",
+      "url": "https://mozaiklabs.fr/tune/demo-tracks/04-exemple-dsd64.dsf",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "file_name": "04 - Exemple DSD64.dsf"
+    }
+  ]
+}

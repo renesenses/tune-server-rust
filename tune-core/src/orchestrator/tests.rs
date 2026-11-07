@@ -2904,6 +2904,9 @@ async fn avance_gapless_ecrit_la_piste_atteinte_dans_l_historique() {
     orch.advance_queue_metadata(zone_id, 1)
         .await
         .expect("l'avance gapless doit aboutir");
+    // #7852 : l'avance arme l'écoute de la piste atteinte, écrite au seuil.
+    assert_eq!(lignes_historique(&orch), 0);
+    assert!(orch.amener_au_seuil(zone_id).await);
 
     let history = crate::db::history_repo::HistoryRepo::with_backend(orch.db.clone())
         .recent(10)
@@ -6178,7 +6181,9 @@ async fn bascule_pure_avec_egaliseur_sur_dlna_refabrique_le_flux() {
 /// lui.
 #[tokio::test]
 async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
-    let orch = test_orchestrator();
+    let mut orch = test_orchestrator();
+    // #7632 — la correction de pièce n'est un traitement que sous Premium.
+    orch.license = Some(crate::license::licence_premium_pour_test(orch.db.clone()));
     let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
     let zr = ZoneRepo::with_backend(orch.db.clone());
     let zone_vide = zr.create("Vide", Some("dlna"), Some("dlna:vide")).unwrap();
@@ -6746,7 +6751,9 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
             None,
             crate::orchestrator::ContexteEcoute::default(),
             album_ref,
-        )
+        );
+        // #7852 : l'écoute armée est écrite au seuil, réputé franchi ici.
+        assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
     };
     let derniere = || {
         orch.db
@@ -6827,6 +6834,10 @@ async fn test_record_listen() {
         },
         None,
     );
+    // #7852 : rien n'est écrit avant le seuil ; réputé franchi ici, le test
+    // porte sur les colonnes écrites.
+    assert_eq!(lignes_historique(&orch), 0);
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
 
     let repo = HistoryRepo::with_backend(orch.db.clone());
     let history = repo.recent(10).unwrap();
@@ -7010,6 +7021,9 @@ async fn zone_navigateur_l_annonce_attend_que_l_onglet_tire_le_flux() {
         orch.confirmer_lecture_navigateur(zone_id, &sid).await,
         "l'onglet consomme le flux : l'annonce doit partir"
     );
+    // #7852 : la confirmation arme l'écoute, le seuil l'écrit.
+    assert!(orch.ecoute_en_attente(zone_id));
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
     assert_eq!(
         lignes_historique(&orch),
         1,
@@ -7216,6 +7230,8 @@ async fn zone_navigateur_le_lecteur_qui_joue_confirme_6066() {
         crate::orchestrator::SignalDuLecteur::Confirmee,
         "le lecteur de la zone dit jouer ce flux : l'annonce part"
     );
+    // #7852 : la confirmation arme l'écoute, le seuil l'écrit.
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
     assert_eq!(lignes_historique(&orch), 1);
 
     assert_eq!(
@@ -7473,6 +7489,30 @@ async fn une_piste_qui_ne_demarre_pas_est_annoncee_a_l_auditeur() {
     assert!(
         msg.contains("track not found"),
         "le message doit porter la cause remontée par l'orchestrateur : {msg}"
+    );
+}
+
+/// #7778 (point 4) — fil 2637 : « Titre suivant » sur un album Qobuz dont le
+/// service refuse l'adresse de flux. Le journal disait `piste_non_demarree
+/// geste="suivante" cause="no url"` et l'auditeur lisait « no url ».
+///
+/// Contre-épreuve : retirer la branche `refus_propre_a_la_piste` de
+/// `message_piste_non_demarree` fait tomber ce test.
+#[test]
+fn un_titre_refuse_par_le_service_est_nomme_et_non_dit_no_url_7778() {
+    let msg = super::PlaybackOrchestrator::message_piste_non_demarree("suivante", "no url");
+    assert!(
+        !msg.contains("no url"),
+        "#7778 : le motif brut « no url » ne doit pas être montré à l'auditeur : {msg}"
+    );
+    assert!(
+        msg.contains("suivante") && msg.contains("pas disponible"),
+        "#7778 : le message doit nommer le geste et dire que le titre est indisponible : {msg}"
+    );
+    // Une autre cause reste dite telle quelle.
+    assert!(
+        super::PlaybackOrchestrator::message_piste_non_demarree("suivante", "track not found")
+            .contains("track not found")
     );
 }
 
@@ -9081,6 +9121,8 @@ async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
     );
 
     // L'historique — l'autre moitié du fil : la rangée « Récemment joué ».
+    // #7852 : écrit au seuil de l'écoute.
+    assert!(orch.amener_au_seuil(zone_id).await);
     let titre_historise = orch
         .db
         .query_one(

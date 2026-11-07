@@ -4736,6 +4736,9 @@ fn decode_dsd_to_dop_streaming_inner(
         }
     }
 
+    // #7704 — compte de trames pair : la piste suivante, enchaînée sur le
+    // même flux, reprend l'alternance des marqueurs sans rupture.
+    pcm_buf.extend_from_slice(&encoder.terminer());
     if !pcm_buf.is_empty() {
         send_dop_chunk(&tx, pcm_buf, first_chunk_sent, data_ready, rt, send_timeout)?;
     }
@@ -5790,6 +5793,26 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert!(!result.samples_i32.is_empty(), "MP3 should produce samples");
         assert_eq!(result.sample_rate, 44100);
         assert_eq!(result.channels, 2);
+    }
+
+    /// #7854 — un MP3 LAME décodé ne garde que ses échantillons utiles : le
+    /// délai du codeur en tête et le remplissage en fin sont rognés, sinon un
+    /// album enchaîné entend un blanc entre deux pistes. `test.mp3` porte
+    /// 40 trames de 1152 échantillons (46 080) et son en-tête LAME déclare
+    /// 576 de délai et 1404 de remplissage : il reste 44 100 échantillons par
+    /// canal, exactement 1 s à 44,1 kHz.
+    #[test]
+    fn decode_mp3_rogne_delai_et_remplissage_lame_7854() {
+        let path = fixture_path("test.mp3");
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert_eq!(result.sample_rate, 44100);
+        assert_eq!(result.channels, 2);
+        let trames = result.samples_i32.len() / result.channels as usize;
+        assert_eq!(
+            trames, 44_100,
+            "MP3 sans blanc : 44 100 échantillons utiles par canal attendus, \
+             {trames} décodés (46 080 = délai codeur et remplissage LAME non rognés)"
+        );
     }
 
     #[test]

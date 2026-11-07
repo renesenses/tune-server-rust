@@ -365,6 +365,66 @@ impl Drop for SentinelleDuFilDeLecture {
     }
 }
 
+/// #7949 — échéance de la sortie du fil de lecture quand la sortie est
+/// détruite. La même que celle de `stop()`.
+const ECHEANCE_FIL_A_LA_DESTRUCTION: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// #7949 — une sortie locale détruite arrête son fil de lecture.
+///
+/// Sans ce `Drop`, retirer la sortie du registre (débranchement, balayage à
+/// chaud, « ignorer », bascule ASIO) fermait `stop_tx` et détachait le fil :
+/// le fil ne prend pas un canal fermé pour un arrêt, et en pause il attendait
+/// `paused` ou `force_silent`, que plus personne ne pouvait changer. Il
+/// gardait le flux cpal, donc le PCM `hw:` ou le pilote ASIO, jusqu'à l'arrêt
+/// du serveur (EBUSY / DeviceBusy au rebranchement), ou continuait de jouer
+/// sur une zone qui n'existait plus.
+///
+/// Même procédure que `stop()`, en synchrone : faire taire le rappel, envoyer
+/// l'arrêt, lever la pause, puis attendre le fil avec une échéance. Après un
+/// `stop()`, il n'y a plus ni canal ni fil : rien à faire.
+impl Drop for LocalOutput {
+    fn drop(&mut self) {
+        let fil = self
+            .play_thread
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let stop_tx = self
+            .stop_tx
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if fil.is_none() && stop_tx.is_none() {
+            return;
+        }
+        self.force_silent
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .store(true, Ordering::SeqCst);
+        if let Some(tx) = stop_tx {
+            let _ = tx.send(());
+        }
+        self.paused.store(false, Ordering::SeqCst);
+        let Some(fil) = fil else {
+            return;
+        };
+        let echeance = std::time::Instant::now() + ECHEANCE_FIL_A_LA_DESTRUCTION;
+        while !fil.is_finished() {
+            if std::time::Instant::now() >= echeance {
+                warn!(
+                    device_id = %self.device_id,
+                    attente_ms = ECHEANCE_FIL_A_LA_DESTRUCTION.as_millis() as u64,
+                    "local_audio_drop_thread_detached — le fil de lecture de la sortie \
+                     détruite n'a pas rendu la main : il tient peut-être encore le périphérique"
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = fil.join();
+    }
+}
+
 /// #3575 — dire QUI tient le PCM, au moment exact où nous n'arrivons pas à
 /// l'ouvrir.
 ///
@@ -442,6 +502,14 @@ mod bras_alsa_natif;
 // `NativePcmRing`. Même `cfg` que les aides qu'il appelle : jugé sur Shrek.
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod etage_natif;
+
+// #7264 — le volume logiciel du WASAPI exclusif appliqué au RENDU, après
+// l'anneau natif, et non plus dans le producteur deux secondes en amont.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+pub(crate) mod gain_au_rendu_7264;
+// #7934 — le même remède sur les rappels natifs ASIO : témoins portables.
+#[cfg(test)]
+mod gain_au_rendu_asio_7934;
 
 // #5204 — l'enchaînement sans blanc en mode exclusif : quel bras enchaîne, la
 // règle de la frontière à format égal, et la lecture de l'en-tête suivant
@@ -690,6 +758,13 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// #7632 — la convolution par RI est un droit Premium (`RoomCorrection`,
+    /// décision du 04/11/2026). Faux par défaut : une sortie à qui personne
+    /// n'a dit que le droit est accordé ne convolue pas. Posé par
+    /// l'orchestrateur à chaque lecture et quand la licence change
+    /// ([`Self::set_convolution_autorisee`]). Faux, la configuration reste
+    /// mémorisée mais aucun moteur n'est construit.
+    convolution_autorisee: Arc<AtomicBool>,
     /// #6522, #6524 — un traitement est-il ARMÉ dans les réglages enregistrés
     /// de la zone qui joue (égaliseur, correction de pièce, crossfeed, greffon
     /// natif, repli mono) ? Posé par l'orchestrateur à côté de `pure_bypass`.
@@ -699,6 +774,13 @@ pub struct LocalOutput {
     /// sous PURE la chaîne dit toujours « rien d'armé ». Seuls les réglages
     /// disent ce que PURE contourne. Lu par `signal_path_status`.
     pure_contourne_un_reglage: Arc<AtomicBool>,
+    /// #4176 — PURE a contourné le préampli GARDÉ d'un égaliseur coupé
+    /// (#5215). Les réglages ne le voient pas (l'égaliseur y est désactivé),
+    /// mais le gain gardé changeait le niveau et PURE le retire. Posé par
+    /// `set_pure_bypass(true)` d'après la chaîne d'avant la bascule, effacé à
+    /// la sortie de PURE. Lu par `signal_path_status`, avec le drapeau
+    /// ci-dessus.
+    pure_contourne_un_gain_garde: Arc<AtomicBool>,
     /// #6211 — la lecture en cours est-elle un flux SANS FIN (radio) ? Posé
     /// par l'orchestrateur à chaque lecture, d'après `live_stream`. Armé, le
     /// préampli gardé d'un égaliseur coupé s'éteint en fondu au lieu de
@@ -1259,10 +1341,12 @@ impl LocalOutput {
             current_format: Arc::new(AtomicU32::new(0)),
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
+            convolution_autorisee: Arc::new(AtomicBool::new(false)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
+            pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
@@ -1378,6 +1462,18 @@ impl LocalOutput {
     fn reborner_le_preampli_garde(&self) {
         if let Ok(mut eq) = self.eq.lock() {
             self.borner_la_remontee(&mut eq);
+        }
+    }
+
+    /// #4176 — « Remettre à plat » : le gain gardé d'un égaliseur coupé
+    /// remonte, progressivement, jusqu'au niveau sans égaliseur, sans la borne
+    /// de volume de #6741 (voir `EqProcessor::liberer_le_gain_garde`). Sans
+    /// effet si la chaîne ne porte pas d'égaliseur coupé.
+    pub fn liberer_le_preampli_garde(&self) {
+        if let Ok(mut eq) = self.eq.lock()
+            && let Some(p) = eq.as_mut()
+        {
+            p.liberer_le_gain_garde();
         }
     }
 
@@ -1574,12 +1670,65 @@ impl LocalOutput {
             .store(Self::pack_format(taux, canaux), Ordering::Relaxed);
     }
 
+    /// #7949 — installe un fil de lecture factice, sans carte son, à la place
+    /// de celui que lance `play_url` : même canal d'arrêt, même `paused`, même
+    /// `force_silent`, même sentinelle déclarée en premier. Rend la sentinelle,
+    /// qui retombe quand le fil a fini (« périphérique rendu »).
+    #[cfg(test)]
+    pub(crate) fn lancer_un_fil_factice_for_test<F>(&self, corps: F) -> Arc<AtomicBool>
+    where
+        F: FnOnce(std::sync::mpsc::Receiver<()>, Arc<AtomicBool>, Arc<AtomicBool>) + Send + 'static,
+    {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        *self.stop_tx.lock().unwrap() = Some(stop_tx);
+        let force_silent = Arc::new(AtomicBool::new(false));
+        *self.force_silent.lock().unwrap() = force_silent.clone();
+        let paused = self.paused.clone();
+        self.playing.store(true, Ordering::SeqCst);
+        let sentinelle = Arc::new(AtomicBool::new(true));
+        *self.sentinelle_du_fil.lock().unwrap() = Some(sentinelle.clone());
+        let sentinelle_du_fil = sentinelle.clone();
+        let fil = std::thread::spawn(move || {
+            let _sentinelle_du_fil = SentinelleDuFilDeLecture(sentinelle_du_fil);
+            corps(stop_rx, paused, force_silent);
+        });
+        *self.play_thread.lock().unwrap() = Some(fil);
+        sentinelle
+    }
+
     /// Force l'état de la boucle d'enchaînement, pour les tests : c'est la
     /// seule façon d'atteindre la sonde sans carte son. Même point d'entrée que
     /// `OaatOutput::set_chain_exhausted_for_test` (#1323).
     #[cfg(test)]
     pub(crate) fn set_chain_exhausted_for_test(&self, exhausted: bool) {
         self.chain_exhausted.store(exhausted, Ordering::SeqCst);
+    }
+
+    /// #4176 — faire passer `secondes` de silence stéréo par la chaîne DSP,
+    /// au format déclaré, par la fonction de la boucle de lecture
+    /// (`apply_local_dsp`) : fondus et rampes du gain gardé avancent, et un
+    /// égaliseur coupé revenu au repos est retiré, comme en lecture.
+    #[cfg(test)]
+    pub(crate) fn jouer_du_pcm_pour_test(&self, secondes: f64) {
+        let (taux, canaux) = self.current_format().expect("format déclaré");
+        let trames = (f64::from(taux) * secondes) as usize;
+        let paquet = (taux / 10) as usize;
+        let mut faites = 0;
+        while faites < trames {
+            let n = paquet.min(trames - faites);
+            let mut pcm = vec![0.0_f32; n * usize::from(canaux)];
+            apply_local_dsp(
+                &mut pcm,
+                &self.eq,
+                &self.convolver,
+                &self.crossfeed,
+                &self.pure_bypass,
+                &self.mono_downmix,
+                canaux,
+                false,
+            );
+            faites += n;
+        }
     }
 
     /// Lecture du drapeau PURE, pour les tests : c'est lui que `apply_local_dsp`
@@ -1610,7 +1759,9 @@ impl LocalOutput {
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
         let config = super::super::audio::convolver::ConvolverConfig::from_wav(path)?;
         *self.convolver_config.lock().unwrap() = Some(config.clone());
-        let current_format = self.current_format();
+        let current_format = self
+            .current_format()
+            .filter(|_| self.convolution_autorisee.load(Ordering::Relaxed));
         let active = match current_format {
             Some((sample_rate, channels)) => {
                 match config.build_for(1024, sample_rate, channels as usize) {
@@ -1644,11 +1795,54 @@ impl LocalOutput {
         tracing::info!(device = %self.device_name, "convolver_cleared");
     }
 
+    /// #7632 — accorder ou retirer le droit de convoluer (Premium
+    /// `RoomCorrection`). Retiré pendant la lecture, le moteur en place
+    /// s'éteint EN FONDU ([`Convolver::eteindre_en_fondu`], 20 ms) : pas de
+    /// clic, et plus aucune convolution ensuite ; à la piste suivante il n'est
+    /// pas reconstruit. Accordé, il le sera à la prochaine lecture (le faire
+    /// flux en cours ferait sauter le temps de sa latence). Rend vrai si
+    /// l'état a changé.
+    pub fn set_convolution_autorisee(&self, autorisee: bool) -> bool {
+        let avant = self
+            .convolution_autorisee
+            .swap(autorisee, Ordering::Relaxed);
+        if avant && !autorisee {
+            let trames = self
+                .current_format()
+                .map(|(taux, _)| (taux as usize / 50).max(1))
+                .unwrap_or(0);
+            if let Ok(mut c) = self.convolver.lock()
+                && let Some(conv) = c.as_mut()
+            {
+                conv.eteindre_en_fondu(trames);
+                tracing::info!(device = %self.device_name, trames, "convolution_eteinte_sans_licence");
+            }
+        }
+        avant != autorisee
+    }
+
     /// Enable/disable PURE (audiophile) bypass of the room-correction convolver
     /// for the zone currently playing on this output. Set per-play by the
     /// orchestrator so a bit-perfect (PURE) zone skips convolution while other
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
+        // #4176 — relevé AVANT la bascule : sous PURE, `preampli_garde` ne
+        // dit plus rien, et la chaîne va être vidée. Un début de piste sous
+        // PURE (chaîne déjà vide) n'efface pas ce qu'une bascule a relevé ;
+        // seule la sortie de PURE le fait.
+        if bypass {
+            let garde = self
+                .eq
+                .lock()
+                .is_ok_and(|e| e.as_ref().is_some_and(|p| p.preampli_garde().is_some()));
+            if garde {
+                self.pure_contourne_un_gain_garde
+                    .store(true, Ordering::Relaxed);
+            }
+        } else {
+            self.pure_contourne_un_gain_garde
+                .store(false, Ordering::Relaxed);
+        }
         self.pure_bypass.store(bypass, Ordering::Relaxed);
         // #4685 — un DSP contourné ne change aucun niveau : sa compensation
         // doit tomber avec lui.
@@ -1698,6 +1892,42 @@ impl LocalOutput {
     pub fn sort_par_asio_exclusif(&self) -> bool {
         enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
             == enchainement_exclusif::BrasDeLecture::AsioExclusif
+    }
+
+    /// #7265 — de quoi demander à cette sortie si elle peut porter un DoP,
+    /// relevé sous le verrou de la sortie ; la sonde elle-même
+    /// ([`SondeDuDop::sonder`]) se fait ensuite SANS lui, car elle parle au
+    /// pilote (COM) et un pilote bloqué ne doit pas geler la zone.
+    ///
+    /// La question ne vaut que pour WASAPI — partagé (format du mixeur) ou
+    /// exclusif (`IsFormatSupported`) : ASIO, CoreAudio, ALSA et un backend
+    /// « asio » rendent `None`, donc le comportement d'avant.
+    pub fn sonde_du_dop(&self) -> Option<SondeDuDop> {
+        #[cfg(target_os = "windows")]
+        {
+            let exclusif = match enchainement_exclusif::bras_de_cette_plateforme(
+                self.exclusive_mode,
+                &self.audio_backend,
+            ) {
+                enchainement_exclusif::BrasDeLecture::WasapiExclusif => true,
+                // Le partagé ne passe par le mixeur de Windows qu'hors ASIO.
+                enchainement_exclusif::BrasDeLecture::CpalPartage
+                    if !self.audio_backend.eq_ignore_ascii_case("asio") =>
+                {
+                    false
+                }
+                _ => return None,
+            };
+            Some(SondeDuDop {
+                device_name: self.device_name.clone(),
+                endpoint_id: self.endpoint_id.clone(),
+                exclusif,
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
     }
 
     /// #5643 — le nom du périphérique, tel que la sortie l'ouvrira (la clé de
@@ -2028,6 +2258,56 @@ pub struct RingBuf {
     starvation: Arc<RingStarvation>,
 }
 
+/// #7265 — une question « ce DoP passe-t-il ? » prête à poser à une sortie
+/// WASAPI, détachée de la sortie (voir [`LocalOutput::sonde_du_dop`]).
+#[derive(Debug, Clone)]
+pub struct SondeDuDop {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    device_name: String,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    endpoint_id: Option<String>,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    exclusif: bool,
+}
+
+impl SondeDuDop {
+    /// Bloquant, borné à deux secondes : au-delà, `Inconnu` (le DoP est tenté
+    /// comme avant). En exclusif, une réponse concluante est retenue par
+    /// périphérique et par format (`dop_ecarte_7265`).
+    pub fn sonder(
+        &self,
+        cadence_dop: u32,
+        voies: u16,
+    ) -> crate::audio::dop_ecarte_7265::AccueilDuDop {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::audio::dop_ecarte_7265 as ecart;
+            if self.exclusif
+                && let Some(connu) =
+                    ecart::accueil_exclusif_connu(&self.device_name, cadence_dop, voies)
+            {
+                return connu;
+            }
+            let accueil = super::wasapi_exclusive::sonder_l_accueil_du_dop(
+                &self.device_name,
+                self.endpoint_id.as_deref(),
+                cadence_dop,
+                voies,
+                self.exclusif,
+            );
+            if self.exclusif {
+                ecart::retenir_accueil_exclusif(&self.device_name, cadence_dop, voies, &accueil);
+            }
+            accueil
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (cadence_dop, voies);
+            crate::audio::dop_ecarte_7265::AccueilDuDop::Inconnu
+        }
+    }
+}
+
 /// Integer SPSC ring used by Windows exclusive backends when the source must
 /// cross the callback boundary without touching floating point.
 ///
@@ -2043,7 +2323,22 @@ pub(crate) struct NativePcmRing {
     /// Même compteur de famine que `RingBuf` (#3205) : les backends exclusifs
     /// Windows drainent cet anneau-ci.
     starvation: Arc<RingStarvation>,
+    /// #7264 — les débuts et fins de passages intacts (DoP, reliquat brut)
+    /// posés par le producteur, à la position d'écriture : `position << 1 |
+    /// intact`. File SPSC bornée, lue par le rendu au gain
+    /// ([`Self::pop_pcm_bytes_au_gain`]).
+    marques: [AtomicU64; MARQUES_DE_PASSAGE],
+    marques_ecrites: AtomicU64,
+    marques_lues: AtomicU64,
+    /// Le dernier état marqué — lu et écrit par le seul producteur.
+    dernier_passage_intact: AtomicBool,
 }
+
+/// #7264 — places de la file des marques de passage. Une marque par
+/// changement DoP ↔ PCM dans le même flux (une frontière de piste) : 64 dans
+/// les deux secondes de l'anneau supposeraient des pistes de 30 ms.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+const MARQUES_DE_PASSAGE: usize = 64;
 
 // SAFETY: same strict SPSC contract and Acquire/Release cursor discipline as
 // `RingBuf`; the only difference is the `i32` cell payload.
@@ -2069,6 +2364,10 @@ impl NativePcmRing {
             write: AtomicU64::new(0),
             read: AtomicU64::new(0),
             starvation,
+            marques: std::array::from_fn(|_| AtomicU64::new(0)),
+            marques_ecrites: AtomicU64::new(0),
+            marques_lues: AtomicU64::new(0),
+            dernier_passage_intact: AtomicBool::new(false),
         }
     }
 
@@ -2090,6 +2389,58 @@ impl NativePcmRing {
             // freshly-created ring.
             unsafe { *cell.get() = 0 };
         }
+        self.marques_ecrites.store(0, Ordering::SeqCst);
+        self.marques_lues.store(0, Ordering::SeqCst);
+        self.dernier_passage_intact.store(false, Ordering::SeqCst);
+    }
+
+    /// #7264 — **le producteur** dit si les mots qu'il va pousser forment un
+    /// passage intact (DoP, reliquat forcé brut) que le rendu au gain ne doit
+    /// jamais pondérer. La marque prend la position d'écriture courante : elle
+    /// vaut pour tout ce qui sera poussé ensuite, jusqu'à la marque suivante.
+    /// Sans changement d'état, rien n'est écrit.
+    ///
+    /// File pleine (64 changements en attente, impossible à une frontière de
+    /// piste par marque) : le producteur attend que le rendu en consomme, au
+    /// plus trois secondes — l'anneau entier en dure deux. Passé ce délai, le
+    /// rendu est mort ; la marque est abandonnée et l'étage s'arrêtera sur sa
+    /// propre famine (#6842).
+    pub(crate) fn marquer_passage_intact(&self, intact: bool) {
+        if self.dernier_passage_intact.load(Ordering::Relaxed) == intact {
+            return;
+        }
+        let ecrites = self.marques_ecrites.load(Ordering::Relaxed);
+        let debut = std::time::Instant::now();
+        while ecrites.wrapping_sub(self.marques_lues.load(Ordering::Acquire))
+            >= MARQUES_DE_PASSAGE as u64
+        {
+            if debut.elapsed() > std::time::Duration::from_secs(3) {
+                warn!("native_ring_marque_de_passage_abandonnee (#7264)");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let position = self.write.load(Ordering::Acquire);
+        self.marques[(ecrites % MARQUES_DE_PASSAGE as u64) as usize]
+            .store(position << 1 | u64::from(intact), Ordering::Relaxed);
+        self.marques_ecrites.store(ecrites + 1, Ordering::Release);
+        self.dernier_passage_intact.store(intact, Ordering::Relaxed);
+    }
+
+    /// La prochaine marque non lue, `(position, intact)`.
+    fn prochaine_marque(&self) -> Option<(u64, bool)> {
+        let lues = self.marques_lues.load(Ordering::Relaxed);
+        if lues == self.marques_ecrites.load(Ordering::Acquire) {
+            return None;
+        }
+        let marque =
+            self.marques[(lues % MARQUES_DE_PASSAGE as u64) as usize].load(Ordering::Relaxed);
+        Some((marque >> 1, marque & 1 == 1))
+    }
+
+    fn consommer_la_marque(&self) {
+        let lues = self.marques_lues.load(Ordering::Relaxed);
+        self.marques_lues.store(lues + 1, Ordering::Release);
     }
 
     pub(crate) fn push(&self, samples: &[i32]) -> usize {
@@ -2113,6 +2464,17 @@ impl NativePcmRing {
 
     pub(crate) fn pop(&self, out: &mut [i32]) -> usize {
         self.pop_mapped(out, |sample| sample)
+    }
+
+    /// #7704 — le prochain mot à tirer, SANS le consommer (consommateur seul).
+    pub(crate) fn premier_en_attente(&self) -> Option<i32> {
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        (w != r).then(|| {
+            let idx = r as usize % self.capacity();
+            // SAFETY: même contrat SPSC que `pop_mapped` : case publiée.
+            unsafe { *self.buf[idx].get() }
+        })
     }
 
     /// Drain directly into a backend-owned callback buffer while converting
@@ -2165,6 +2527,118 @@ impl NativePcmRing {
         // Fil 1908 — ce qui reste pour le pilote, en échantillons.
         self.starvation.noter_en_attente(available - count);
         count * bytes_per_sample
+    }
+
+    /// #7264 — [`Self::pop_pcm_bytes`] avec le volume logiciel appliqué ICI,
+    /// au rendu, et non dans le producteur deux secondes plus tôt. Même
+    /// sérialisation par les octets hauts, mêmes compteurs ; un mot n'est
+    /// pondéré que hors passage intact et quand le gain n'est pas l'unité —
+    /// à 100 %, rampe au repos, la sortie est celle de `pop_pcm_bytes` au
+    /// bit près. Aucune allocation : le fil de rendu l'appelle à chaque
+    /// période.
+    pub(crate) fn pop_pcm_bytes_au_gain(
+        &self,
+        out: &mut [u8],
+        bit_depth: u16,
+        gain: &mut gain_au_rendu_7264::GainAuRendu,
+    ) -> usize {
+        let bytes_per_sample = usize::from(bit_depth / 8);
+        if !matches!(bit_depth, 16 | 24 | 32) {
+            return 0;
+        }
+        gain.relire_la_consigne();
+
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        let available = w.wrapping_sub(r) as usize;
+        let count = available.min(out.len() / bytes_per_sample);
+        let cap = self.capacity();
+        // Les marques déjà dépassées, puis la position de la suivante (un
+        // seul test par mot tant qu'elle n'est pas atteinte).
+        let mut prochaine = u64::MAX;
+        while let Some((position, intact)) = self.prochaine_marque() {
+            if position > r {
+                prochaine = position;
+                break;
+            }
+            gain.entrer_dans_le_passage(intact);
+            self.consommer_la_marque();
+        }
+        for i in 0..count {
+            let position = r + i as u64;
+            while position >= prochaine {
+                if let Some((_, intact)) = self.prochaine_marque() {
+                    gain.entrer_dans_le_passage(intact);
+                    self.consommer_la_marque();
+                }
+                prochaine = match self.prochaine_marque() {
+                    Some((suivante, _)) => suivante,
+                    None => u64::MAX,
+                };
+            }
+            let idx = (r as usize + i) % cap;
+            // SAFETY: same SPSC publication contract as `pop_mapped`.
+            let mot = unsafe { *self.buf[idx].get() };
+            let native = gain.rendre(mot, bit_depth, position).to_le_bytes();
+            let offset = i * bytes_per_sample;
+            out[offset..offset + bytes_per_sample].copy_from_slice(&native[4 - bytes_per_sample..]);
+        }
+        self.read.store(r + count as u64, Ordering::Release);
+        self.starvation.record(out.len() / bytes_per_sample, count);
+        self.starvation.noter_en_attente(available - count);
+        count * bytes_per_sample
+    }
+
+    /// #7934 — [`Self::pop_mapped`] avec le volume logiciel appliqué au
+    /// rendu, pour les rappels natifs ASIO (I32, I24, I16) : le même défaut
+    /// que #7264 sur WASAPI, l'étage ASIO pondérait dans le producteur avant
+    /// l'anneau de deux secondes. `bits` est la profondeur à laquelle le mot
+    /// est pondéré puis borné ; mêmes marques de passage intact, mêmes
+    /// compteurs, aucune allocation.
+    pub(crate) fn pop_mapped_au_gain<T>(
+        &self,
+        out: &mut [T],
+        bits: u16,
+        gain: &mut gain_au_rendu_7264::GainAuRendu,
+        mut map: impl FnMut(i32) -> T,
+    ) -> usize {
+        gain.relire_la_consigne();
+
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        let n = out.len().min(w.wrapping_sub(r) as usize);
+        let cap = self.capacity();
+        let mut prochaine = u64::MAX;
+        while let Some((position, intact)) = self.prochaine_marque() {
+            if position > r {
+                prochaine = position;
+                break;
+            }
+            gain.entrer_dans_le_passage(intact);
+            self.consommer_la_marque();
+        }
+        for (i, target) in out[..n].iter_mut().enumerate() {
+            let position = r + i as u64;
+            while position >= prochaine {
+                if let Some((_, intact)) = self.prochaine_marque() {
+                    gain.entrer_dans_le_passage(intact);
+                    self.consommer_la_marque();
+                }
+                prochaine = match self.prochaine_marque() {
+                    Some((suivante, _)) => suivante,
+                    None => u64::MAX,
+                };
+            }
+            let idx = (r as usize + i) % cap;
+            // SAFETY: same SPSC publication contract as `pop_mapped`.
+            let mot = unsafe { *self.buf[idx].get() };
+            *target = map(gain.rendre(mot, bits, position));
+        }
+        self.read.store(r + n as u64, Ordering::Release);
+        self.starvation.record(out.len(), n);
+        self.starvation
+            .noter_en_attente(w.wrapping_sub(r) as usize - n);
+        n
     }
 }
 
@@ -2360,6 +2834,18 @@ impl RingBuf {
         self.pop_mapped(out, |sample| sample)
     }
 
+    /// #7704 — le prochain échantillon à tirer, SANS le consommer
+    /// (consommateur seul).
+    pub(crate) fn premier_en_attente(&self) -> Option<f32> {
+        let w = self.write.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        (w != r).then(|| {
+            let idx = r as usize % self.capacity();
+            // SAFETY: consommateur unique, case publiée par le Release de `push`.
+            unsafe { *self.buf[idx].get() }
+        })
+    }
+
     /// Drain and transform directly into the device callback's native slice.
     /// This is deliberately generic and allocation-free so integer ASIO
     /// callbacks do not need a floating-point scratch `Vec` per period.
@@ -2395,6 +2881,18 @@ mod ringbuf_tests;
 // juger le résultat par le `SuiviFamine` du sondeur.
 #[cfg(test)]
 mod horloge_du_pilote_muet_3814;
+
+// #7704 — le rappel partagé garde le porteur DoP continu.
+#[cfg(test)]
+mod dop_continu_7704;
+
+// #7703 — la quantification finale native est dithérée, après le volume.
+#[cfg(test)]
+mod quantification_finale_7703;
+
+// #7949 — une sortie locale retirée du registre rend son fil et son périphérique.
+#[cfg(test)]
+mod retrait_du_registre_7949;
 
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
@@ -3156,10 +3654,14 @@ fn render_local_shared_f32_callback(
     // à zéro, le gain glisse sur quelques dizaines de millisecondes. `arm(0)`
     // — DoP, PURE, sortie exclusive — rend exactement la coupure franche
     // d'avant.
+    use crate::audio::dop_continu::{haut_f32, repos_f32};
     ramp.arm(armed_ms);
     let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
+    // #7704 — sur un porteur DoP, chaque période muette est faite de trames
+    // de repos (0x69, marqueurs alternés), jamais de zéros.
     if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-        periode_muette(ring, output, 0.0);
+        ramp.dop.combler(output, 0.0, repos_f32);
+        ring.starvation().record_silent_period(output.len());
         return 0;
     }
     // Wait for a minimum amount of data before starting to read from the ring
@@ -3167,16 +3669,27 @@ fn render_local_shared_f32_callback(
     // samples during track transitions.
     if !data_started.load(Ordering::Acquire) {
         if ring.available() < min_buffer_samples {
-            periode_muette(ring, output, 0.0);
+            ramp.dop.combler(output, 0.0, repos_f32);
+            ring.starvation().record_silent_period(output.len());
             return 0;
         }
         data_started.store(true, Ordering::Release);
     }
-    let read = ring.pop(output);
+    // #7704 — à la reprise, une trame de repos si la première trame réelle
+    // répéterait le dernier marqueur émis.
+    let debut = ramp
+        .dop
+        .raccorder(ring.premier_en_attente(), output, haut_f32, repos_f32);
+    if debut > 0 {
+        ring.starvation().record_silent_period(debut);
+    }
+    let read = ring.pop(&mut output[debut..]);
+    let fin = debut + read;
+    ramp.dop.observer(&output[debut..fin], haut_f32);
     let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
-    ramp.apply(&mut output[..read], v);
-    if read < output.len() {
-        output[read..].fill(0.0);
+    ramp.apply(&mut output[debut..fin], v);
+    if fin < output.len() {
+        ramp.dop.combler(&mut output[fin..], 0.0, repos_f32);
     }
     read
 }
@@ -3595,13 +4108,16 @@ fn finish_windows_exclusive_probe(
 fn rebuild_local_convolver(
     config: &std::sync::Mutex<Option<crate::audio::convolver::ConvolverConfig>>,
     active: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    autorisee: &AtomicBool,
     sample_rate: u32,
     channels: u16,
 ) -> Result<bool, String> {
     let config = config
         .lock()
         .map_err(|_| "verrou de configuration du convolveur empoisonné".to_string())?
-        .clone();
+        .clone()
+        // #7632 — sans le droit Premium, aucun moteur : l'IR reste mémorisée.
+        .filter(|_| autorisee.load(Ordering::Relaxed));
     let next = match config {
         Some(config) => match config.build_for(1024, sample_rate, channels as usize) {
             Ok(convolver) => Some(convolver),
@@ -3870,6 +4386,27 @@ pub(crate) fn native_i32_to_pcm_bytes(samples: &[i32], bit_depth: u16, out: &mut
     count * bytes_per_sample
 }
 
+/// La quantification FINALE des chemins natifs exclusifs (WASAPI, route native
+/// ASIO, queue du DSP et reliquat de l'étage natif) : les flottants y arrivent
+/// après le DSP et après le volume logiciel, et repartent en mots de la
+/// profondeur de la source.
+///
+/// #7703 — c'était un arrondi nu. À volume réduit, une piste 16 bits
+/// requantifiée à 16 bits sans dither garde une erreur CORRÉLÉE au signal :
+/// à −30 dB il ne reste que quelques bits utiles, et la distorsion de
+/// quantification s'entend dans les fins de notes (prérequis 1 de la note
+/// « Upsampler Pro », #7614 : le gain en flottant, puis le dither comme
+/// dernière opération avant le puits). Le TPDF ±1 LSB du dépôt
+/// (`audio::dither`) s'ajoute désormais AVANT l'arrondi, à 16 et 24 bits.
+///
+/// À 32 bits, rien : un `f32` n'a que 24 bits de mantisse, le mot 32 bits est
+/// déjà plus fin que le signal qu'il porte (réponse Q6 de la note : TPDF seul,
+/// et à 24 bits).
+///
+/// Le chemin bit-perfect ne passe jamais ici (`pcm_bytes_to_native_i32`), le
+/// DoP non plus : aucun bruit n'est ajouté à un flux que Tune ne modifie pas.
+/// La graine dérive du contenu du bloc (même règle que `Dither::depuis_contenu`) :
+/// même bloc, même bruit, et aucune raie à la période du bloc.
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
     let (scale, max, shift) = match bit_depth {
@@ -3879,13 +4416,45 @@ fn f32_to_native_i32(samples: &[f32], bit_depth: u16) -> Vec<i32> {
         _ => return Vec::new(),
     };
     let min = -scale;
+    // « Pas de requantification, pas de dither » (règle de `audio::dither`) :
+    // un bloc dont chaque échantillon tombe déjà sur un mot exact — gain
+    // unité, matrice qui choisit ou coupe des voies, reliquat porté tel quel —
+    // sort à l'identité, sans bruit. Décidé par BLOC, pas par échantillon :
+    // dans un bloc réellement requantifié, tous les échantillons reçoivent le
+    // même bruit, et sa puissance ne dépend pas du signal.
+    let exact = samples
+        .iter()
+        .all(|s| (f64::from(*s) * scale).fract() == 0.0);
+    let mut dither = (bit_depth < 32 && !exact)
+        .then(|| crate::audio::dither::Dither::depuis_graine(graine_du_bloc_flottant(samples)));
     samples
         .iter()
         .map(|sample| {
-            let word = (f64::from(*sample) * scale).round().clamp(min, max) as i64;
+            let ideal = f64::from(*sample) * scale;
+            let bruit = dither.as_mut().map_or(0.0, |d| d.tirer());
+            let word = crate::audio::dither::quantifier_avec(ideal, bruit, min, max);
             (word << shift) as i32
         })
         .collect()
+}
+
+/// #7703 — graine du dither de [`f32_to_native_i32`] : FNV-1a sur la longueur
+/// et au plus 256 échantillons prélevés à pas constant. Bornée : le rendu ne
+/// lit pas tout le bloc pour tirer une graine.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+fn graine_du_bloc_flottant(samples: &[f32]) -> u64 {
+    const PREMIER: u64 = 0x0000_0100_0000_01b3;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ 0x4e41_5449_4600_7703;
+    for octet in (samples.len() as u64).to_le_bytes() {
+        h = (h ^ u64::from(octet)).wrapping_mul(PREMIER);
+    }
+    let pas = samples.len().div_ceil(256).max(1);
+    for s in samples.iter().step_by(pas) {
+        for octet in s.to_bits().to_le_bytes() {
+            h = (h ^ u64::from(octet)).wrapping_mul(PREMIER);
+        }
+    }
+    h
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
@@ -5606,6 +6175,7 @@ impl OutputTarget for LocalOutput {
         let current_format = self.current_format.clone();
         let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
+        let convolution_autorisee = self.convolution_autorisee.clone();
         let pure_bypass = self.pure_bypass.clone();
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
@@ -6285,7 +6855,13 @@ impl OutputTarget for LocalOutput {
                 // forme de f32 — `is_dop_pcm`, qui inspecte des octets PCM
                 // bruts, n'a rien a y examiner.
                 current_format.store(LocalOutput::pack_format(dec_sr, dec_ch), Ordering::Relaxed);
-                match rebuild_local_convolver(&convolver_config, &convolver, dec_sr, dec_ch) {
+                match rebuild_local_convolver(
+                    &convolver_config,
+                    &convolver,
+                    &convolution_autorisee,
+                    dec_sr,
+                    dec_ch,
+                ) {
                     Ok(true) => info!(
                         sample_rate = dec_sr,
                         channels = dec_ch,
@@ -6466,7 +7042,13 @@ impl OutputTarget for LocalOutput {
                 LocalOutput::pack_format(sample_rate, channels),
                 Ordering::Relaxed,
             );
-            match rebuild_local_convolver(&convolver_config, &convolver, sample_rate, channels) {
+            match rebuild_local_convolver(
+                &convolver_config,
+                &convolver,
+                &convolution_autorisee,
+                sample_rate,
+                channels,
+            ) {
                 Ok(true) => info!(sample_rate, channels, "local_convolver_built_for_stream"),
                 Ok(false) => {}
                 Err(error) => warn!(
@@ -7379,6 +7961,7 @@ impl OutputTarget for LocalOutput {
                     match rebuild_local_convolver(
                         &convolver_config,
                         &convolver,
+                        &convolution_autorisee,
                         sample_rate,
                         channels,
                     ) {
@@ -7961,7 +8544,8 @@ impl OutputTarget for LocalOutput {
             .and_then(|status| status.clone())?;
         status.dsp = verdict_pure_selon_les_reglages(
             status.dsp,
-            self.pure_contourne_un_reglage.load(Ordering::Relaxed),
+            self.pure_contourne_un_reglage.load(Ordering::Relaxed)
+                || self.pure_contourne_un_gain_garde.load(Ordering::Relaxed),
         );
         Some(status)
     }
@@ -8307,6 +8891,9 @@ pub(crate) use crate::audio::resample::{rubato_resample_chunk, rubato_resample_t
 
 #[cfg(test)]
 mod tests;
+// #7632 — la convolution par RI est un droit Premium, éteinte sans clic.
+#[cfg(test)]
+mod convolution_sous_licence_7632;
 
 #[cfg(test)]
 mod open_failure_tests;

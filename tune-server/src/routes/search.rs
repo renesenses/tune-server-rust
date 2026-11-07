@@ -804,7 +804,14 @@ async fn federated_search(
                     //
                     // « Tel quel » s'arrête au SIGNE : voir
                     // [`limite_pour_les_services`] (#2160).
-                    let mut results = svc.search(&requete, limite).await.ok()?;
+                    // #7659 — l'échec d'un service est écarté, mais journalisé :
+                    // sans trace, un refus de Spotify ressemblait à « aucun
+                    // résultat ».
+                    let mut results = svc
+                        .search(&requete, limite)
+                        .await
+                        .map_err(|e| journaliser_l_echec(&nom_log, &e))
+                        .ok()?;
                     ecarter_hors_identite(&nom_log, &requete, &mut results);
                     return Some(json!(results));
                 };
@@ -812,7 +819,11 @@ async fn federated_search(
                 // pagination et le plafond sont les siens (Qobuz : 500 par
                 // catégorie ; un service sans pagination : une page à la
                 // limite du chemin non paginé, puis rien).
-                let page = svc.search_page(&requete, demandee, decalage).await.ok()?;
+                let page = svc
+                    .search_page(&requete, demandee, decalage)
+                    .await
+                    .map_err(|e| journaliser_l_echec(&nom_log, &e))
+                    .ok()?;
                 let servie = svc.limite_de_page_recherche(demandee);
                 let mut results = page.results;
                 ecarter_hors_identite(&nom_log, &requete, &mut results);
@@ -899,6 +910,12 @@ async fn federated_search(
         o.insert("next_cursor".into(), json!(suivant));
     }
     Json(reponse)
+}
+
+/// #7659 — la recherche d'un service a échoué : la réponse fédérée l'omet,
+/// le journal le dit.
+fn journaliser_l_echec(service: &str, erreur: &tune_core::TuneError) {
+    tracing::warn!(service, error = %erreur, "streaming_search_failed");
 }
 
 /// #4441 — voir `ne_garder_que_les_pistes_qui_repondent` : le filtre

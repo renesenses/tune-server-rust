@@ -231,6 +231,7 @@ fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) ->
                 tune_core::TuneError::Config(_) => "config",
                 tune_core::TuneError::Unsupported(_) => "unsupported",
                 tune_core::TuneError::Credentials(_) => "credentials",
+                tune_core::TuneError::AppRefused(_) => "app_refused",
                 tune_core::TuneError::Other(_) => "other",
             };
             let message = e.to_string();
@@ -545,6 +546,8 @@ where
             get(service_track_similar),
         )
         .route("/{service}/featured", get(service_featured))
+        // #7822 — les mixes personnels du compte, lisibles comme des playlists.
+        .route("/{service}/mixes", get(service_mixes))
         .route(
             "/{service}/featured/sections",
             get(service_featured_sections),
@@ -740,24 +743,53 @@ async fn service_artist(
     // Best-effort: persist a streaming editorial bio (e.g. Qobuz) into a
     // name-matched local artist that has none yet, so the library keeps it.
     // Fire-and-forget so the browse response is never delayed.
-    if let Ok(ref artist) = result {
-        if let Some(bio) = artist.bio.clone() {
-            if bio.len() > 50 {
-                let backend = state.backend.clone();
-                let name = artist.name.clone();
-                let svc_name = service.clone();
-                tokio::spawn(async move {
-                    let repo = tune_core::db::artist_repo::ArtistRepo::with_backend(backend);
-                    if let Ok(Some(local)) = repo.get_by_name(&name) {
-                        if let Some(id) = local.id {
-                            if local.bio.as_deref().unwrap_or("").is_empty() {
-                                let _ = repo.update_bio_full(id, &bio, &svc_name, None, "", "");
-                            }
-                        }
-                    }
-                });
+    //
+    // #8022 : la bio est rangée AVEC sa langue (celle que le service annonce,
+    // sinon celle du magasin du compte) et le lien vers la page du service.
+    // Elle était rangée sans langue, donc jamais servie depuis #7027 — et,
+    // tenant la place, elle empêchait la fiche locale d'en recevoir une
+    // autre. Langue inconnue : rien n'est rangé.
+    if let Ok(ref artist) = result
+        && artist.bio.as_deref().is_some_and(|b| b.len() > 50)
+    {
+        let backend = state.backend.clone();
+        let name = artist.name.clone();
+        let artist_id = artist.id.clone();
+        let svc_name = service.clone();
+        let arc = arc.clone();
+        tokio::spawn(async move {
+            let repo = tune_core::db::artist_repo::ArtistRepo::with_backend(backend);
+            let Ok(Some(local)) = repo.get_by_name(&name) else {
+                return;
+            };
+            let Some(id) = local.id else { return };
+            if !local.bio.as_deref().unwrap_or("").is_empty() {
+                return;
             }
-        }
+            let (texte, magasin) = {
+                let svc = arc.read().await;
+                (
+                    svc.bio_editoriale_artiste(&artist_id).await,
+                    svc.langue_du_magasin(),
+                )
+            };
+            let Ok(Some(texte)) = texte else { return };
+            let langue = texte
+                .langue
+                .as_deref()
+                .and_then(tune_core::streaming::editorial_bibliotheque::langue_de_base)
+                .or_else(|| {
+                    magasin
+                        .as_deref()
+                        .and_then(tune_core::streaming::editorial_bibliotheque::langue_de_base)
+                });
+            let Some(langue) = langue else {
+                tracing::debug!(id, "bio_de_service_sans_langue_non_rangee");
+                return;
+            };
+            let bio = tune_core::streaming::editorial_bibliotheque::borner(&texte.texte);
+            let _ = repo.update_bio_full(id, &bio, &svc_name, texte.url, "", &langue);
+        });
     }
 
     svc_response(result)
@@ -997,6 +1029,16 @@ async fn service_featured(
     Path(service): Path<String>,
 ) -> Response {
     with_svc_editorial!(&state, &service, |svc| svc.get_featured().await)
+}
+
+/// #7822 — `GET /streaming/{service}/mixes` : les mixes du compte, liste
+/// vide pour un service qui n'en a pas. Contenu personnel : pas de cache
+/// navigateur (`with_svc!`, pas `with_svc_editorial!`).
+async fn service_mixes(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_user_mixes().await)
 }
 
 async fn service_new_releases(
@@ -1378,8 +1420,17 @@ async fn service_status(
         Err(e) => return e.into_response(),
     };
 
+    // #7760 — l'état se lit sous verrou de LECTURE. Un verrou d'écriture
+    // demandé ici se mettait en file derrière une lecture lente (favoris,
+    // playlists) et retenait toutes les lectures arrivées après lui : les
+    // widgets de l'accueil tombaient en « délai ». L'écriture n'est prise que
+    // pour une connexion par interrogation, que Qobuz n'a pas.
+    let mut status = svc.read().await.auth_status().await;
+    if status.authenticated || !connexion_par_interrogation(&service) {
+        return reponse_etat_du_service(&service, &status);
+    }
     let mut svc = svc.write().await;
-    let mut status = svc.auth_status().await;
+    status = svc.auth_status().await;
     if !status.authenticated
         && let Ok(poll_status) = svc.authenticate(&json!({"poll": true})).await
         && poll_status.authenticated
@@ -1389,6 +1440,22 @@ async fn service_status(
         state.save_tokens().await;
         purge_contenu_utilisateur(&service);
     }
+    reponse_etat_du_service(&service, &status)
+}
+
+/// Le service sait-il se connecter par interrogation (`{"poll": true}`) ?
+///
+/// Qobuz ne se connecte que par identifiant et mot de passe : sa tentative
+/// d'interrogation échoue aussitôt (« username required »), et prendre le
+/// verrou d'écriture pour elle ne fait que bloquer les lectures (#7760).
+fn connexion_par_interrogation(service: &str) -> bool {
+    service != "qobuz"
+}
+
+fn reponse_etat_du_service(
+    service: &str,
+    status: &tune_core::streaming::traits::AuthStatus,
+) -> Response {
     Json(json!({
         "service": service,
         "enabled": true,
@@ -1530,6 +1597,13 @@ async fn service_auth(
 /// identifiants (renesenses/tune-server-rust#7068). Le client le traduit.
 pub const CODE_IDENTIFIANTS_REFUSES: &str = "invalid_credentials";
 
+/// Code rendu par `POST /streaming/{service}/auth` quand le service refuse
+/// l'APPLICATION Tune et non le compte (01/11/2026, `app_id` Qobuz refusé) :
+/// ressaisir le mot de passe n'y change rien. Distinct de
+/// [`CODE_IDENTIFIANTS_REFUSES`], que le client traduit en « mot de passe
+/// incorrect ».
+pub const CODE_APPLICATION_REFUSEE: &str = "service_app_refused";
+
 /// La réponse d'un échec de connexion.
 ///
 /// Un refus d'identifiants ([`tune_core::TuneError::Credentials`]) rend un
@@ -1544,6 +1618,15 @@ fn reponse_echec_auth(service: &str, e: &tune_core::TuneError) -> Response {
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": CODE_IDENTIFIANTS_REFUSES,
+                "service": service,
+                "error": message,
+            })),
+        )
+            .into_response(),
+        tune_core::TuneError::AppRefused(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": CODE_APPLICATION_REFUSEE,
                 "service": service,
                 "error": message,
             })),
@@ -3997,7 +4080,13 @@ mod temoin_rubriques_dans_la_langue_demandee {
 mod service_desactive_jamais_appele_tests;
 
 #[cfg(test)]
+mod mixes_du_compte_7822_tests;
+
+#[cfg(test)]
 mod youtube_decouverte_tests;
+
+#[cfg(test)]
+mod etat_sans_verrou_exclusif_7760_tests;
 
 /// #6480 — `GET /streaming/{service}/albums/{id}/description` : le texte de
 /// présentation d'un album de service (cpadiou77, fil forum 2327).
@@ -4646,6 +4735,22 @@ mod tests_echec_de_connexion_7068 {
         assert_eq!(v["code"], CODE_IDENTIFIANTS_REFUSES);
         assert_eq!(v["service"], "qobuz");
         assert!(!texte.contains("Invalid username"), "{texte}");
+    }
+
+    /// 01/11/2026 — Qobuz refuse l'`app_id` : le client ne doit PAS lire
+    /// `invalid_credentials` (« mot de passe incorrect »).
+    #[tokio::test]
+    async fn refus_de_l_application_n_est_pas_un_refus_d_identifiants() {
+        let e = tune_core::TuneError::AppRefused("qobuz login: app refused".into());
+        let (statut, texte) = corps(reponse_echec_auth("qobuz", &e)).await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST);
+        let v: Value = serde_json::from_str(&texte).expect("le corps doit être du JSON structuré");
+        assert_eq!(
+            v["code"], CODE_APPLICATION_REFUSEE,
+            "un refus de l'application doit porter son propre code : {texte}"
+        );
+        assert_ne!(v["code"], CODE_IDENTIFIANTS_REFUSES, "{texte}");
+        assert_eq!(v["service"], "qobuz");
     }
 
     #[tokio::test]

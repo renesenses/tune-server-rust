@@ -55,6 +55,10 @@ pub struct TrendDetail {
 // generate_digest — compute the weekly report from listen_history
 // ---------------------------------------------------------------------------
 
+/// #7777 : les écoutes importées (`imported_plays`) n'entrent pas dans ce
+/// résumé, à dessein : il compte la semaine écoulée, et une écoute importée
+/// n'a pas de date propre. Elles comptent dans les chiffres « tous temps »
+/// (titres les plus écoutés, statistiques d'écoute).
 pub fn generate_digest(backend: &Arc<dyn DbBackend>) -> Result<DigestReport, String> {
     // Date boundaries: this week = last 7 days, prev week = 14..7 days ago
     let now = chrono::Utc::now();

@@ -31,6 +31,18 @@
 //!   déclarés réuniraient B et C sous A) ;
 //! * deux albums identifiés sous deux releases MusicBrainz différentes ne sont
 //!   pas fusionnés : l'identification les a déjà dits distincts ;
+//! * avec « Split albums by quality » (`quality_split`, actif par défaut),
+//!   deux éditions que l'IMPORT a séparées ne sont pas réunies (#7839) :
+//!   qualités connues sans rien en commun (DSD et CD, #7694), ou années
+//!   connues différentes — sauf dans le MÊME dossier, où l'année seule ne
+//!   sépare pas (l'enrichissement a pu la changer sur une des deux lignes).
+//!   L'import tient aussi compte de l'année sans `quality_split` ; la fusion ne
+//!   la regarde qu'avec, pour ne rien changer au réglage coupé. Le dossier ne
+//!   sépare PAS à lui seul : l'import réunit les dossiers miroirs (#4907), les
+//!   compilations éparpillées et les disques d'un coffret, que la fusion doit
+//!   continuer à réparer. Les éditions laissées à part forment leur propre
+//!   groupe : leurs vrais doublons fusionnent entre eux. Réglage coupé, rien
+//!   ne change ;
 //! * un album tenu par une édition manuelle (`album_metadata.edition_manuelle`,
 //!   C3) n'est jamais le PERDANT : il devient l'album conservé. Deux albums
 //!   édités à la main dans le même groupe : le groupe est laissé tel quel ;
@@ -42,6 +54,7 @@
 //! Chaque absorption est journalisée (`album_doublon_fusionne`, avec le
 //! déclencheur et le titre), en plus du bilan `album_absorbe` d'`absorber`.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::absorption::table_absente;
@@ -50,6 +63,7 @@ use super::album_metadata_repo::AlbumMetadataRepo;
 use super::album_repo::AlbumRepo;
 use super::backend::{DbBackend, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+use super::settings_repo::SettingsRepo;
 use crate::TuneError;
 
 /// Au-delà de ce nombre de fusions prévues, un chemin AUTOMATIQUE s'abstient.
@@ -96,6 +110,9 @@ pub struct BilanDesDoublons {
     pub identifies_ailleurs: usize,
     /// Albums laissés à part : groupe à plusieurs éditions manuelles.
     pub edites_a_la_main: usize,
+    /// Éditions gardées en plus de la première : séparées à l'import
+    /// (qualité ou année, avec `quality_split`) — #7839.
+    pub editions_separees: usize,
     /// Fusions prévues mais non faites : plafond automatique dépassé.
     pub suspendus: usize,
     /// Absorptions tentées qui ont échoué (journalisées).
@@ -109,6 +126,12 @@ struct Membre {
     pistes: i64,
     release: Option<String>,
     edite: bool,
+    /// `albums.folder_path` : dans le même dossier, l'année seule ne sépare pas.
+    dossier: Option<String>,
+    annee: Option<i64>,
+    /// Les scores [`score_qualite`](crate::library::quality::score_qualite)
+    /// de ses pistes dont la qualité est connue. Vide sans `quality_split`.
+    qualites: BTreeSet<(bool, i64)>,
 }
 
 /// Une fusion décidée : `cible` absorbe `doublon`.
@@ -161,11 +184,19 @@ impl FusionDesDoublons {
             return Ok(bilan);
         }
         let distinctes = self.paires_distinctes()?;
+        let quality_split = self.quality_split();
 
         let mut plan: Vec<Fusion> = Vec::new();
         for (titre, ids) in &groupes {
-            let membres = self.membres(ids)?;
-            self.decider(titre, &membres, &distinctes, &mut plan, &mut bilan);
+            let membres = self.membres(ids, quality_split)?;
+            self.decider(
+                titre,
+                &membres,
+                &distinctes,
+                quality_split,
+                &mut plan,
+                &mut bilan,
+            );
         }
 
         if let Some(plafond) = declencheur.plafond()
@@ -224,6 +255,7 @@ impl FusionDesDoublons {
                 proteges = bilan.proteges,
                 identifies_ailleurs = bilan.identifies_ailleurs,
                 edites_a_la_main = bilan.edites_a_la_main,
+                editions_separees = bilan.editions_separees,
                 echecs = bilan.echecs,
                 "albums_doublons_bilan"
             );
@@ -266,10 +298,30 @@ impl FusionDesDoublons {
         }
     }
 
-    fn membres(&self, ids: &[i64]) -> Result<Vec<Membre>, TuneError> {
+    /// « Split albums by quality », lu comme l'import le lit
+    /// (`routes/system/scan.rs`) : actif sauf `false` ou `0`, actif par défaut.
+    fn quality_split(&self) -> bool {
+        SettingsRepo::with_backend(self.db.clone())
+            .get("quality_split")
+            .ok()
+            .flatten()
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true)
+    }
+
+    fn membres(&self, ids: &[i64], quality_split: bool) -> Result<Vec<Membre>, TuneError> {
         let p1 = marque(&*self.db, 1);
         let sql_pistes = format!("SELECT COUNT(id) FROM tracks WHERE album_id = {p1}");
-        let sql_release = format!("SELECT musicbrainz_release_id FROM albums WHERE id = {p1}");
+        let sql_release =
+            format!("SELECT musicbrainz_release_id, folder_path, year FROM albums WHERE id = {p1}");
+        let sql_qualites = match self.db.engine() {
+            Engine::Sqlite => {
+                super::album_repo::sql::qualites_des_pistes_de_l_album(&SqliteDialect)
+            }
+            Engine::Postgres => {
+                super::album_repo::sql::qualites_des_pistes_de_l_album(&PostgresDialect)
+            }
+        };
         let meta = AlbumMetadataRepo::with_backend(self.db.clone());
         let mut membres = Vec::with_capacity(ids.len());
         for &id in ids {
@@ -279,12 +331,38 @@ impl FusionDesDoublons {
                 .query_one(&sql_pistes, &params)?
                 .and_then(|r| r.first().and_then(|v| v.as_i64()))
                 .unwrap_or(0);
-            let release = self
-                .db
-                .query_one(&sql_release, &params)?
-                .and_then(|r| r.first().and_then(|v| v.as_string()))
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
+            let ligne = self.db.query_one(&sql_release, &params)?;
+            let texte = |i: usize| {
+                ligne
+                    .as_ref()
+                    .and_then(|r| r.get(i).and_then(|v| v.as_string()))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            };
+            let release = texte(0);
+            let dossier = texte(1);
+            let annee = ligne
+                .as_ref()
+                .and_then(|r| r.get(2).and_then(|v| v.as_i64()))
+                .filter(|&a| a > 0);
+            // Une piste sans format, cadence ni profondeur n'a pas de qualité
+            // connue : l'import ne la compte pas non plus (`scan_import`).
+            let qualites = if quality_split {
+                self.db
+                    .query_many(&sql_qualites, &params)?
+                    .iter()
+                    .filter_map(|r| {
+                        let format = r.get(1).and_then(|v| v.as_str());
+                        let cadence = r.get(2).and_then(|v| v.as_i64());
+                        let profondeur = r.get(3).and_then(|v| v.as_i64());
+                        (format.is_some() || cadence.is_some() || profondeur.is_some()).then(|| {
+                            crate::library::quality::score_qualite(format, cadence, profondeur)
+                        })
+                    })
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
             let edite = !meta
                 .champs_edites_a_la_main(id)
                 .unwrap_or_default()
@@ -294,6 +372,9 @@ impl FusionDesDoublons {
                 pistes,
                 release,
                 edite,
+                dossier,
+                annee,
+                qualites,
             });
         }
         Ok(membres)
@@ -305,6 +386,7 @@ impl FusionDesDoublons {
         titre: &str,
         membres: &[Membre],
         distinctes: &DistinctPairSet,
+        quality_split: bool,
         plan: &mut Vec<Fusion>,
         bilan: &mut BilanDesDoublons,
     ) {
@@ -334,6 +416,16 @@ impl FusionDesDoublons {
         };
         let mut release = cible.release.clone();
         let mut reunis: Vec<i64> = vec![cible.id];
+        // Ce que l'ensemble réuni sous la cible porte déjà : un membre est
+        // comparé à chacun, pas seulement à la cible (sinon A, B, C avec B
+        // DSD et C CD réuniraient B et C sous A).
+        let mut reunis_membres: Vec<&Membre> = vec![
+            membres
+                .iter()
+                .find(|m| m.id == cible.id)
+                .expect("la cible est un membre"),
+        ];
+        let mut a_part: Vec<Membre> = Vec::new();
         for m in membres.iter().filter(|m| m.id != cible.id) {
             if let Some(&contre) = reunis.iter().find(|&&r| distinctes.contains(r, m.id)) {
                 bilan.proteges += 1;
@@ -358,19 +450,72 @@ impl FusionDesDoublons {
                 );
                 continue;
             }
+            if quality_split
+                && let Some((contre, raison)) = reunis_membres
+                    .iter()
+                    .find_map(|r| separes_a_l_import(r, m).map(|raison| (r.id, raison)))
+            {
+                tracing::info!(
+                    titre,
+                    conserve = cible.id,
+                    separe_de = contre,
+                    protege = m.id,
+                    raison,
+                    "album_merge_ignoree_edition_separee_a_l_import"
+                );
+                a_part.push(m.clone());
+                continue;
+            }
             // `absorber` reprend les champs vides de la cible : la release du
             // doublon devient la sienne pour les membres suivants.
             if release.is_none() {
                 release = m.release.clone();
             }
             reunis.push(m.id);
+            reunis_membres.push(m);
             plan.push(Fusion {
                 cible: cible.id,
                 doublon: m.id,
                 titre: titre.to_string(),
             });
         }
+        // Les éditions laissées à part forment leur propre groupe : deux
+        // copies de l'édition CD fusionnent encore entre elles, à part de la
+        // DSD. Chaque passe en retire au moins la cible : la récursion finit.
+        if !a_part.is_empty() {
+            bilan.editions_separees += 1;
+            if a_part.len() > 1 {
+                self.decider(titre, &a_part, distinctes, quality_split, plan, bilan);
+            }
+        }
     }
+}
+
+/// Pourquoi l'import a fait de `a` et `b` deux éditions, avec
+/// `quality_split` actif — `None` s'il les aurait réunis (#7839).
+///
+/// La qualité (règle des dossiers miroirs, #7694) et l'année, deux clés de
+/// `scan_import`. Le dossier n'en est pas une ici : l'import réunit des
+/// dossiers différents (miroirs, compilations éparpillées, coffrets), et deux
+/// lignes du même dossier sont un vrai doublon même si l'enrichissement a
+/// donné une autre année à l'une. Une valeur inconnue d'un côté ne sépare
+/// jamais : un album indexé avant que la qualité soit relevée reste
+/// fusionnable, comme avant.
+fn separes_a_l_import(a: &Membre, b: &Membre) -> Option<&'static str> {
+    if !a.qualites.is_empty() && !b.qualites.is_empty() && a.qualites.is_disjoint(&b.qualites) {
+        return Some("qualites_sans_rien_en_commun");
+    }
+    if let (Some(x), Some(y)) = (&a.dossier, &b.dossier)
+        && x.trim_end_matches('/') == y.trim_end_matches('/')
+    {
+        return None;
+    }
+    if let (Some(x), Some(y)) = (a.annee, b.annee)
+        && x != y
+    {
+        return Some("annees_differentes");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -511,5 +656,275 @@ mod tests {
         assert_eq!(auto.suspendus, PLAFOND_AUTOMATIQUE + 1);
         let manuel = f.fusionner(Declencheur::Manuel).unwrap();
         assert_eq!(manuel.fusionnes, PLAFOND_AUTOMATIQUE + 1);
+    }
+
+    // ── #7839 : la fusion respecte les clés de séparation de l'import ──
+
+    const DSD: (&str, i64, i64) = ("dsf", 11_289_600, 1);
+    const CD: (&str, i64, i64) = ("flac", 44_100, 16);
+
+    /// Un album comme l'import le laisse avec `quality_split` : son dossier,
+    /// son année, et des pistes d'une qualité connue rangées dans le dossier.
+    fn edition(
+        db: &Arc<dyn DbBackend>,
+        titre: &str,
+        artiste: i64,
+        dossier: &str,
+        annee: Option<i64>,
+        (format, cadence, profondeur): (&str, i64, i64),
+        pistes: usize,
+    ) -> i64 {
+        db.execute(
+            "INSERT INTO albums (title, artist_id, source, track_count, folder_path, year) \
+             VALUES (?, ?, 'local', 0, ?, ?)",
+            &[&titre as &dyn ToSqlValue, &artiste, &dossier, &annee],
+        )
+        .unwrap();
+        let id = db.last_insert_rowid();
+        for i in 0..pistes {
+            let chemin = format!("{dossier}/{id}-{i:02}.{format}");
+            db.execute(
+                "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path, source, \
+                 format, sample_rate, bit_depth) VALUES ('p', ?, ?, 1000, ?, 'local', ?, ?, ?)",
+                &[
+                    &id as &dyn ToSqlValue,
+                    &artiste,
+                    &chemin,
+                    &format,
+                    &cadence,
+                    &profondeur,
+                ],
+            )
+            .unwrap();
+        }
+        id
+    }
+
+    fn quality_split(db: &Arc<dyn DbBackend>, actif: bool) {
+        SettingsRepo::with_backend(db.clone())
+            .set("quality_split", if actif { "true" } else { "false" })
+            .unwrap();
+    }
+
+    /// Le cas du fil 2564 : l'édition DSD et l'édition CD de « The African
+    /// Beat », rangées côte à côte sous le dossier de l'artiste. Les dossiers
+    /// sont frères : seule la qualité dit qu'il s'agit de deux éditions.
+    #[test]
+    fn dsd_et_cd_restent_deux_albums_avec_quality_split_7839() {
+        let db = base();
+        quality_split(&db, true);
+        let x = artiste(&db, "Art Blakey & The Afro-Drum Ensemble");
+        let dsd = edition(
+            &db,
+            "The African Beat",
+            x,
+            "/m/Art Blakey/The African Beat [DSD]",
+            Some(1962),
+            DSD,
+            7,
+        );
+        let cd = edition(
+            &db,
+            "The African Beat",
+            x,
+            "/m/Art Blakey/The African Beat [CD]",
+            Some(1962),
+            CD,
+            7,
+        );
+        let bilan = FusionDesDoublons::with_backend(db.clone())
+            .fusionner(Declencheur::FinDeScan)
+            .unwrap();
+        assert!(
+            existe(&db, dsd) && existe(&db, cd),
+            "#7839 : la fusion de fin de scan a réuni l'édition DSD et l'édition CD \
+             que l'import avait séparées (quality_split actif) — {bilan:?}"
+        );
+        assert_eq!(
+            (bilan.fusionnes, bilan.editions_separees),
+            (0, 1),
+            "{bilan:?}"
+        );
+    }
+
+    /// Les deux éditions sous deux racines (`/m/DSD/…`, `/m/CD/…`) : le
+    /// chemin du diagnostic, avec le bouton « Fusionner les doublons ».
+    #[test]
+    fn dsd_et_cd_sous_deux_racines_restent_deux_albums_au_manuel_7839() {
+        let db = base();
+        let x = artiste(&db, "Art Blakey");
+        let dsd = edition(
+            &db,
+            "The African Beat",
+            x,
+            "/m/DSD/Art Blakey/The African Beat",
+            None,
+            DSD,
+            7,
+        );
+        let cd = edition(
+            &db,
+            "The African Beat",
+            x,
+            "/m/CD/Art Blakey/The African Beat",
+            None,
+            CD,
+            7,
+        );
+        // Réglage absent : actif par défaut, comme à l'import.
+        let bilan = FusionDesDoublons::with_backend(db.clone())
+            .fusionner(Declencheur::Manuel)
+            .unwrap();
+        assert!(existe(&db, dsd) && existe(&db, cd), "{bilan:?}");
+    }
+
+    /// De vrais doublons — même dossier, même qualité, deux lignes — sont
+    /// toujours fusionnés.
+    #[test]
+    fn les_vrais_doublons_meme_dossier_meme_qualite_fusionnent_7839() {
+        let db = base();
+        quality_split(&db, true);
+        let x = artiste(&db, "X");
+        let a = edition(&db, "Blue Train", x, "/m/X/Blue Train", Some(1957), CD, 5);
+        let b = edition(&db, "blue train", x, "/m/X/Blue Train", Some(1957), CD, 1);
+        let bilan = FusionDesDoublons::with_backend(db.clone())
+            .fusionner(Declencheur::FinDeScan)
+            .unwrap();
+        assert_eq!(
+            (bilan.fusionnes, bilan.editions_separees),
+            (1, 0),
+            "{bilan:?}"
+        );
+        assert!(existe(&db, a) && !existe(&db, b));
+    }
+
+    /// Le même album, même qualité, sous deux racines (règle des dossiers
+    /// miroirs, #4907) : l'import en fait UN album ; deux lignes nées avant
+    /// cette règle sont toujours réunies par la fusion.
+    #[test]
+    fn deux_dossiers_miroirs_de_meme_qualite_fusionnent_7839() {
+        let db = base();
+        quality_split(&db, true);
+        let x = artiste(&db, "X");
+        let a = edition(
+            &db,
+            "Blue Train",
+            x,
+            "/nas/Musique/X/Blue Train",
+            Some(1957),
+            CD,
+            5,
+        );
+        let b = edition(
+            &db,
+            "Blue Train",
+            x,
+            "/mnt/sauvegarde/X/Blue Train",
+            Some(1957),
+            CD,
+            5,
+        );
+        let bilan = FusionDesDoublons::with_backend(db.clone())
+            .fusionner(Declencheur::Nettoyage)
+            .unwrap();
+        assert_eq!(
+            (bilan.fusionnes, bilan.editions_separees),
+            (1, 0),
+            "#7839 : deux dossiers miroirs de même qualité laissés à part — {bilan:?}"
+        );
+        assert!(existe(&db, a) && !existe(&db, b));
+    }
+
+    /// Deux lignes du même dossier, même qualité, dont l'une a reçu une autre
+    /// année : un vrai doublon, le dossier prime sur l'année.
+    #[test]
+    fn le_meme_dossier_prime_sur_une_annee_differente_7839() {
+        let db = base();
+        quality_split(&db, true);
+        let x = artiste(&db, "X");
+        let a = edition(&db, "Blue Train", x, "/m/X/Blue Train", Some(1957), CD, 5);
+        let b = edition(&db, "Blue Train", x, "/m/X/Blue Train/", Some(1997), CD, 1);
+        let bilan = FusionDesDoublons::with_backend(db.clone())
+            .fusionner(Declencheur::FinDeScan)
+            .unwrap();
+        assert_eq!(
+            bilan.fusionnes, 1,
+            "#7839 : deux lignes du même dossier et de même qualité laissées à part \
+             pour une année différente — {bilan:?}"
+        );
+        assert!(existe(&db, a) && !existe(&db, b));
+    }
+
+    /// Deux années connues et différentes, dossiers frères de même qualité :
+    /// seule l'année les sépare, comme à l'import.
+    #[test]
+    fn deux_annees_differentes_restent_deux_albums_7839() {
+        let db = base();
+        quality_split(&db, true);
+        let x = artiste(&db, "X");
+        let a = edition(&db, "Live", x, "/m/X/Live 1970", Some(1970), CD, 3);
+        let b = edition(&db, "Live", x, "/m/X/Live 1985", Some(1985), CD, 3);
+        let bilan = FusionDesDoublons::with_backend(db.clone())
+            .fusionner(Declencheur::FinDeScan)
+            .unwrap();
+        assert!(existe(&db, a) && existe(&db, b), "{bilan:?}");
+    }
+
+    /// Deux copies de l'édition CD et une édition DSD : les copies CD
+    /// fusionnent entre elles, la DSD reste à part — la comparaison se fait
+    /// contre tout ce qui est réuni, et les éditions écartées forment leur
+    /// propre groupe.
+    #[test]
+    fn les_doublons_d_une_edition_ecartee_fusionnent_entre_eux_7839() {
+        let db = base();
+        quality_split(&db, true);
+        let x = artiste(&db, "X");
+        let dsd = edition(&db, "Sketches", x, "/m/X/Sketches [DSD]", None, DSD, 9);
+        let cd1 = edition(&db, "Sketches", x, "/m/X/Sketches [CD]", None, CD, 4);
+        let cd2 = edition(&db, "Sketches", x, "/m/X/Sketches [CD]", None, CD, 1);
+        let bilan = FusionDesDoublons::with_backend(db.clone())
+            .fusionner(Declencheur::FinDeScan)
+            .unwrap();
+        assert!(
+            existe(&db, dsd) && existe(&db, cd1) && !existe(&db, cd2),
+            "{bilan:?}"
+        );
+        assert_eq!((bilan.fusionnes, bilan.editions_separees), (1, 1));
+    }
+
+    /// Réglage coupé : l'import ne sépare pas, la fusion non plus — le
+    /// comportement d'avant, inchangé.
+    #[test]
+    fn sans_quality_split_dsd_et_cd_fusionnent_comme_avant_7839() {
+        let db = base();
+        quality_split(&db, false);
+        let x = artiste(&db, "X");
+        let dsd = edition(
+            &db,
+            "The African Beat",
+            x,
+            "/m/DSD/X/The African Beat",
+            Some(1962),
+            DSD,
+            7,
+        );
+        let cd = edition(
+            &db,
+            "The African Beat",
+            x,
+            "/m/CD/X/The African Beat",
+            Some(1962),
+            CD,
+            6,
+        );
+        let bilan = FusionDesDoublons::with_backend(db.clone())
+            .fusionner(Declencheur::FinDeScan)
+            .unwrap();
+        assert_eq!(
+            (bilan.fusionnes, bilan.editions_separees),
+            (1, 0),
+            "{bilan:?}"
+        );
+        assert!(existe(&db, dsd) && !existe(&db, cd));
     }
 }

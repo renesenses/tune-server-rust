@@ -51,6 +51,24 @@ Three ways in:
 Bump the widget version (`tauri.conf.json`, `Cargo.toml`, `Cargo.lock`)
 whenever its interface changes: the web-cache purge below keys on it.
 
+## Mini view = the web client's phone layout (rc10)
+
+When the server's web client announces it (`GET /vue-mini.json` →
+`{"vue_mini":1}`), the widget shows ONE window that loads
+`http://<server>/?vue=mini&hote=widget`: the phone layout of the web client
+(mockup A "remote", approved 31 Oct 2026). Older servers keep the bundled
+interface below. Sizes: 360 × 560, resizable up to 760 px wide; collapsed
+360 × 140 (mockup C).
+
+That window loads the configured server and nothing else
+(`vue_mini::decider_navigation`): other http(s) links open in the system
+browser, other schemes are refused. The page drives the window only through
+four same-origin addresses that are intercepted and never loaded:
+`/__widget/epingle` (always on top), `/__widget/replier`,
+`/__widget/deplier`, `/__widget/complet`. No Tauri command is exposed to the
+remote page. Pin and collapse states persist in `config.json`
+(`mini_epingle`, `mini_replie`).
+
 ## Server contract
 
 `src/contrat.js` holds everything the interface reads from or sends to the

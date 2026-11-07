@@ -765,7 +765,11 @@ CREATE TABLE IF NOT EXISTS tracks (
     rating INTEGER,
     -- Debit moyen du fichier en kbit/s, lu au scan (#6332, migration 130).
     -- NULL = pas encore lu (complete au rescan) ou inconnu.
-    bitrate_kbps INTEGER
+    bitrate_kbps INTEGER,
+    -- Cle de tri de la vue des pistes (#7619, L1) : artiste, album, disque,
+    -- numero, plies. Calculee en Rust (`track_repo::cle_de_tri`), NULL tant
+    -- qu'elle ne l'a pas ete. Index `idx_tracks_cle_tri (cle_tri, id)`.
+    cle_tri TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -777,7 +781,10 @@ CREATE TABLE IF NOT EXISTS track_credits (
     instrument TEXT,
     position INTEGER DEFAULT 0,
     -- Identifiant MusicBrainz de l'artiste credite (migration 107, #4767).
-    artist_mbid TEXT
+    artist_mbid TEXT,
+    -- D'ou vient le credit (migration 137, #7765) : manuel, musicbrainz,
+    -- balises, discogs ou roon. NULL = ligne ancienne, source inconnue.
+    source TEXT
 );
 
 -- Persistent per-file first-seen-in-library timestamp, keyed by path.

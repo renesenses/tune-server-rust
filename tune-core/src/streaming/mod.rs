@@ -4,6 +4,7 @@ pub mod appariement_favoris_radio;
 pub mod cadence_du_flux;
 pub mod deezer;
 pub mod deezer_decrypt;
+pub mod editorial_bibliotheque;
 pub mod favorites_date;
 pub mod favorites_identity;
 pub mod favorites_import;
@@ -11,6 +12,7 @@ pub mod favorites_mirror;
 pub mod matching;
 pub mod podcast_annuaires;
 pub mod podcast_catalogue;
+pub mod podcast_par_adresse;
 pub mod podcasts;
 /// #6480 — le texte de présentation d'un album de service, HTML ramené à du texte.
 pub mod presentation_album;

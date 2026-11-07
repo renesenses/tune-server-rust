@@ -103,6 +103,16 @@ impl RatingRepo {
         let sql = self.dialect_sql(sql::upsert_rating, sql::upsert_rating);
         let params: [&dyn ToSqlValue; 4] = [&album_id, &profile_id, &rating, &note];
         self.db.execute(&sql, &params)?;
+        // #7849 — la note d'album rejoint aussi `notes_personnelles`. La note
+        // sur cinq est déjà écrite : un échec ici ne la défait pas.
+        if let Err(e) = super::notes_personnelles::recevoir_note_d_album(
+            self.db.as_ref(),
+            profile_id,
+            album_id,
+            note,
+        ) {
+            tracing::warn!(album_id, profile_id, erreur = %e, "note_d_album_non_recopiee");
+        }
         Ok(())
     }
 
