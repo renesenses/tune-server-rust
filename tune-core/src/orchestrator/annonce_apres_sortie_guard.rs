@@ -306,9 +306,12 @@ fn l_annonce_navigateur_suit_la_preuve_de_lecture() {
 /// piste déjà en cours (recherche de position) ne doit pas doublonner.
 #[test]
 fn l_historique_navigateur_garde_record_history() {
+    // #7965 : deux branches, la radio (au nom de la station) et le reste ;
+    // chacune consulte `record_history`.
+    let corps = corps_de("pub async fn confirmer_lecture_navigateur(");
     assert!(
-        corps_de("pub async fn confirmer_lecture_navigateur(")
-            .contains("if attente.record_history && attente.source != \"radio\" {"),
+        corps.contains("if attente.record_history && attente.source == \"radio\" {")
+            && corps.contains("} else if attente.record_history {"),
         "l'historique de zone navigateur ne consulte plus `record_history` : \
          déplacer le curseur ajouterait une ligne à chaque fois (#1998)."
     );

@@ -979,7 +979,9 @@ CREATE TABLE IF NOT EXISTS smart_collections (
     updated_at TEXT,
     description TEXT,
     icon TEXT,
-    color TEXT
+    color TEXT,
+    -- #7872 — la requête avancée de la collection (PG 106, SQLite 140).
+    expression TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bookmarks (
