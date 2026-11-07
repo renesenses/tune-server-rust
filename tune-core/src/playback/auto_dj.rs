@@ -1192,6 +1192,10 @@ pub struct GraineRecente {
 /// la cuisine et le salon n'écoutent pas la même chose. On complète toutefois
 /// avec la maison si la zone n'a pas de quoi remplir la liste — mieux vaut une
 /// radio un peu plus large que pas de radio.
+///
+/// #7777 : les écoutes importées (`imported_plays`) n'entrent pas ici, à
+/// dessein : elles n'ont ni date propre ni zone, et cette graine est un ordre
+/// d'écoute récente.
 pub fn artistes_recents(
     db: &std::sync::Arc<dyn DbBackend>,
     zone_id: i64,

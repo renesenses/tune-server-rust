@@ -172,6 +172,35 @@ pub fn est_armee() -> bool {
 /// testeurs sur ce point exact, et la doctrine de #3809 est que le réglage ne
 /// gouverne que l'annonce.
 pub fn eteindre() -> bool {
+    if arreter() {
+        info!(
+            "slimproto_discovery_stopped — l'annonce se tait et le port UDP est rendu ; \
+             l'écoute TCP 3483 reste armée (#3809)"
+        );
+        return true;
+    }
+    false
+}
+
+/// Fait taire l'annonce dans l'extinction de TOUT le serveur Squeezebox de
+/// Tune (#7374). Vrai si quelque chose tournait.
+///
+/// Même geste que [`eteindre`], mais le TCP 3483 s'éteint juste après : le
+/// journal ne peut donc pas dire qu'il reste armé. Un message faux sur ce port
+/// exact a déjà égaré des diagnostics (#2938).
+pub fn eteindre_avec_le_serveur() -> bool {
+    if arreter() {
+        info!(
+            "slimproto_discovery_stopped — l'annonce se tait et le port UDP est rendu ; \
+             le serveur TCP 3483 s'éteint avec elle (#7374)"
+        );
+        return true;
+    }
+    false
+}
+
+/// Abandonne la tâche du répondeur et efface son état. Vrai si elle tournait.
+fn arreter() -> bool {
     let mut place = verrou();
     ETAT.effacer();
     let Some(tache) = place.take() else {
@@ -179,12 +208,6 @@ pub fn eteindre() -> bool {
     };
     let tournait = !tache.is_finished();
     tache.abort();
-    if tournait {
-        info!(
-            "slimproto_discovery_stopped — l'annonce se tait et le port UDP est rendu ; \
-             l'écoute TCP 3483 reste armée (#3809)"
-        );
-    }
     tournait
 }
 

@@ -76,6 +76,23 @@ fn corps<'a>(source: &'a str, entete: &str) -> &'a str {
     &reste[..fin]
 }
 
+/// Le site où le serveur SlimProto est armé.
+///
+/// Depuis #7374, `spawn_slimproto_server` lit le réglage « Serveur Squeezebox
+/// de Tune » puis délègue à `armer_serveur_squeezebox`, que
+/// `PATCH /system/config` appelle aussi pour rallumer le serveur à chaud. Les
+/// deux adresses se décident donc là ; le témoin vérifie d'abord que le
+/// démarrage y passe bien, sans quoi il garderait une fonction morte.
+fn site_slimproto() -> &'static str {
+    let demarrage = corps(BACKGROUND, "\nfn spawn_slimproto_server(");
+    assert!(
+        demarrage.contains("armer_serveur_squeezebox(state, config);"),
+        "spawn_slimproto_server doit armer le serveur par `armer_serveur_squeezebox`, \
+         le site que ce témoin garde (#7374)"
+    );
+    corps(BACKGROUND, "\npub(crate) fn armer_serveur_squeezebox(")
+}
+
 // --- Étage 1 : la décision est BRANCHÉE -------------------------------------
 
 #[test]
@@ -98,10 +115,10 @@ fn le_proxy_deezer_est_cable_sur_l_adresse_annoncee() {
 
 #[test]
 fn le_serveur_slimproto_remet_l_adresse_annoncee_a_ses_controleurs() {
-    let site = corps(BACKGROUND, "\nfn spawn_slimproto_server(");
+    let site = site_slimproto();
     assert!(
         site.contains("let adresse_remise = adresse_slimproto_remise_aux_controleurs(config);"),
-        "spawn_slimproto_server doit APPELER `adresse_slimproto_remise_aux_controleurs` \
+        "armer_serveur_squeezebox doit APPELER `adresse_slimproto_remise_aux_controleurs` \
          pour l'adresse qu'il REMET a un tiers (#3867)"
     );
     assert!(
@@ -161,7 +178,7 @@ fn sans_adresse_annoncee_l_autodetection_reste_en_place() {
 
 #[test]
 fn la_sonde_de_bind_slimproto_reste_sur_l_autodetection() {
-    let site = corps(BACKGROUND, "\nfn spawn_slimproto_server(");
+    let site = site_slimproto();
     assert!(
         site.contains("let ip_sondee_localement = tune_core::discovery::ssdp::get_local_ip()"),
         "`SlimProtoState::server_ip` doit rester sur l'autodetection : son unique \
