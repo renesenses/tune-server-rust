@@ -2040,6 +2040,10 @@ mod confirmation_navigateur_6066;
 pub mod ecoute_validee_7852;
 #[cfg(test)]
 mod ecoute_validee_7852_tests;
+// #7965 — radios (au nom de la station) et podcasts dans l'historique.
+mod historique_radio_podcast_7965;
+#[cfg(test)]
+mod historique_radio_podcast_7965_tests;
 pub use confirmation_navigateur_6066::SignalDuLecteur;
 
 /// #4598 — ré-énumérer le parc local avant de refuser une zone locale.

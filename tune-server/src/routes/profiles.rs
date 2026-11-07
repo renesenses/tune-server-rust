@@ -1044,6 +1044,9 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
     } else {
         format!("profile_id = {id}")
     };
+    // #7965 — l'historique contient les radios (une ligne par station
+    // lancée) : les statistiques du profil les excluent.
+    let profile_filter = format!("{profile_filter} AND COALESCE(source, '') <> 'radio'");
 
     let listens_row = b
         .query_one(

@@ -7078,10 +7078,11 @@ async fn zone_navigateur_une_recreation_de_flux_ne_doublonne_pas_l_historique() 
     );
 }
 
-/// La radio n'entre pas dans l'historique local — même exclusion que le
-/// chemin nominal, pour la même raison (titre figé au démarrage).
+/// #7965 — la radio s'écrit une fois, au nom de la station (l'`album` que
+/// `jouer_un_flux` remplit), jamais au titre figé du démarrage — même règle
+/// que le chemin nominal.
 #[tokio::test]
-async fn zone_navigateur_la_radio_reste_hors_de_l_historique() {
+async fn zone_navigateur_la_radio_s_ecrit_au_nom_de_la_station() {
     let orch = test_orchestrator();
     let zone_id = ZoneRepo::with_backend(orch.db.clone())
         .create("Ce PC", Some("browser"), None)
@@ -7096,11 +7097,16 @@ async fn zone_navigateur_la_radio_reste_hors_de_l_historique() {
         .insert(zone_id, annonce_en_attente(&sid, true, "radio"));
 
     assert!(orch.confirmer_lecture_navigateur(zone_id, &sid).await);
+    let lignes = crate::db::history_repo::HistoryRepo::with_backend(orch.db.clone())
+        .recent(10)
+        .unwrap();
     assert_eq!(
-        lignes_historique(&orch),
-        0,
-        "la radio ne s'écrit pas dans listen_history"
+        lignes.len(),
+        1,
+        "une ligne par lancement de radio : {lignes:?}"
     );
+    assert_eq!(lignes[0].title, "Unholy Hymns", "le nom de la station");
+    assert_eq!(lignes[0].context_type.as_deref(), Some("radio"));
 }
 
 /// Une lecture abandonnée avant le premier octet ne s'annonce jamais, même

@@ -18,8 +18,8 @@
 //!   zappé ne laisse rien, et un album dont on zappe tout ne laisse aucun
 //!   conteneur fantôme. Le conteneur naît avec son premier titre validé.
 //! - Titre sans durée connue (flux) : on garde la règle d'aujourd'hui,
-//!   l'écoute est écrite au démarrage. Les radios, elles, n'entrent toujours
-//!   pas dans l'historique (leur compteur vit dans `radio_stations`).
+//!   l'écoute est écrite au démarrage. Les radios aussi : une ligne par
+//!   lancement, au nom de la station (#7965, `historique_radio_podcast_7965`).
 //! - Podcasts : la position de reprise d'un épisode reste écrite à part
 //!   (`podcast_started_in_context`, recul de #7280/#7840) ; seule sa ligne
 //!   d'historique attend le seuil.
