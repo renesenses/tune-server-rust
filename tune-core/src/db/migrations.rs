@@ -4865,6 +4865,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(super::politique_parentale::SQL_TABLE) {
         tracing::warn!(error = %e, "politiques_parentales_table_failed");
     }
+    // Temps écouté des profils supervisés (#7974), même modèle.
+    if let Err(e) = db.execute_batch(super::bail_d_ecoute::SQL_TABLE) {
+        tracing::warn!(error = %e, "ecoutes_parentales_table_failed");
+    }
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables

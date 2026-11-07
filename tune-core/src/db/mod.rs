@@ -8,6 +8,8 @@ pub mod album_metadata_repo;
 pub mod album_repo;
 pub mod artist_repo;
 pub mod backend;
+/// Contrôle parental, étape 2 (#7974) : bail d'écoute et temps écouté.
+pub mod bail_d_ecoute;
 pub mod champs_tenus;
 pub mod cles_clients;
 pub mod coffrets_auto;

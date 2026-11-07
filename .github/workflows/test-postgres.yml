@@ -229,6 +229,13 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7856 -- --nocapture --test-threads=1
 
+      # #7974 — bail d'écoute : temps écouté cumulé, budget du jour et de la
+      # semaine, remise à zéro quotidienne, sur un vrai PostgreSQL.
+      - name: Bail d'écoute du contrôle parental sur PostgreSQL (#7974)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7974 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

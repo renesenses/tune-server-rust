@@ -1153,6 +1153,14 @@ CREATE TABLE IF NOT EXISTS politiques_parentales (
  politique_json TEXT NOT NULL,
  maj_le TEXT NOT NULL
 );
+-- Temps écouté des profils supervisés (#7974), mêmes types que
+-- migrations/ecoutes_parentales.sql. Non copiée à la bascule.
+CREATE TABLE IF NOT EXISTS ecoutes_parentales (
+ profile_id BIGINT NOT NULL,
+ jour TEXT NOT NULL,
+ secondes BIGINT NOT NULL DEFAULT 0,
+ PRIMARY KEY (profile_id, jour)
+);
 -- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3 de
 -- MetaRust). Sans script numéroté : présente ici (bascule) ET dans
 -- `ENSURE_TABLES` (toute base, à chaque démarrage). Non copiée à la bascule :

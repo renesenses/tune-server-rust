@@ -813,8 +813,22 @@ async fn podcast_episodes(
 pub(super) async fn play_episode(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    profile: crate::routes::active_profile::ActiveProfile,
     Json(body): Json<PlayEpisodeRequest>,
 ) -> impl IntoResponse {
+    // #7974 — l'épisode sur une sortie réseau ne passe pas par `play()` : le
+    // bail d'écoute du profil qui le lance est demandé ici.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
+    if let Err(e) = state.orchestrator.verifier_le_bail(zone_id).await {
+        let lang = crate::i18n::lang_from_header(&headers);
+        if let Some(corps) = super::playback::corps_du_refus_parental(&e, &lang) {
+            return (StatusCode::FORBIDDEN, Json(corps));
+        }
+    }
     let title = body.title.as_deref().unwrap_or("Podcast Episode");
     let podcast_name = body.podcast_name.as_deref().unwrap_or("Podcast");
     let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())

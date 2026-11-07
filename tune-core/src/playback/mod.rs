@@ -2446,6 +2446,16 @@ impl PlaybackManager {
         });
     }
 
+    /// #7974 — un évènement du contrôle parental (fin de bail annoncée,
+    /// lecture arrêtée), diffusé tel quel aux clients.
+    pub fn emit_bail_parental(&self, zone_id: i64, event: &str, data: serde_json::Value) {
+        self.emit(PlaybackEvent {
+            event: event.into(),
+            zone_id,
+            data,
+        });
+    }
+
     /// Fil 2062 / #5550 — pose une durée sur la piste en cours qui n'en avait
     /// pas, et l'annonce (`track_changed`) pour que l'interface l'affiche.
     /// Sans effet sur une piste dont la durée est déjà connue.
