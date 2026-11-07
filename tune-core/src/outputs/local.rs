@@ -537,6 +537,10 @@ mod chaine_par_la_boucle;
 mod backend;
 use backend::{BackendCpal, BackendLocal, DemandeDOuverture, Puits};
 
+// #6132 — la seconde sortie d'une zone (sortie double) : ouverture de B sur
+// le chemin partagé, et la recopie que le rappel f32 de A consulte.
+mod sortie_double_locale;
+
 // #3208 — la période demandée au pilote, et la garde de préchargement qui s'en
 // déduit. `cpal::BufferSize` n'est plus écrit à la main nulle part ailleurs
 // dans ce fichier ni dans ses modules.
@@ -797,6 +801,10 @@ pub struct LocalOutput {
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
     /// piste par l'orchestrateur, comme `pure_bypass`. Défaut désarmé.
     strict_bitperfect: Arc<AtomicBool>,
+    /// #6132 — la seconde sortie de la zone qui joue ici (nom du périphérique
+    /// B), ou `None`. Posée par piste par l'orchestrateur depuis
+    /// `zone_{id}_sortie_double`, lue une fois par `play_url`.
+    seconde_sortie: std::sync::Mutex<Vec<crate::outputs::sortie_double::SecondeSortieDemandee>>,
     /// Optional headphone crossfeed effect, applied AFTER the convolver on the
     /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
     /// PURE) and only when the stream is stereo. Set per-play by the
@@ -1348,6 +1356,7 @@ impl LocalOutput {
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
             pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
+            seconde_sortie: std::sync::Mutex::new(Vec::new()),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
             disposition: Arc::new(std::sync::Mutex::new(None)),
@@ -1881,6 +1890,37 @@ impl LocalOutput {
     /// #3973 — armer (ou désarmer) « bit-perfect strict » pour la zone qui
     /// joue sur cette sortie. Posé par l'orchestrateur à chaque lecture, à
     /// côté de `set_pure_bypass`.
+    /// #6132 — la seconde sortie (sortie double) de la zone qui va jouer :
+    /// le nom d'un autre périphérique local, ou `None`. Prise en compte à la
+    /// prochaine ouverture du périphérique.
+    pub fn set_secondes_sorties(
+        &self,
+        demandes: Vec<crate::outputs::sortie_double::SecondeSortieDemandee>,
+    ) {
+        *self
+            .seconde_sortie
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = demandes
+            .into_iter()
+            .filter(|d| !d.nom.trim().is_empty())
+            .collect();
+    }
+
+    /// #6132 — le curseur de volume de cette sortie (millièmes), celui que
+    /// `set_volume` et la sourdine écrivent. Partagé avec la sortie double
+    /// d'une AUTRE zone qui recopie vers ce périphérique : chaque membre d'un
+    /// groupe garde son volume.
+    pub fn volume_utilisateur(&self) -> Arc<AtomicU32> {
+        self.user_volume.clone()
+    }
+
+    pub fn secondes_sorties(&self) -> Vec<crate::outputs::sortie_double::SecondeSortieDemandee> {
+        self.seconde_sortie
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn set_strict_bitperfect(&self, strict: bool) {
         self.strict_bitperfect.store(strict, Ordering::Relaxed);
     }
@@ -6180,6 +6220,8 @@ impl OutputTarget for LocalOutput {
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
+        // #6132 — lue UNE fois par piste, comme `strict_bitperfect`.
+        let seconde_sortie = self.secondes_sorties();
         let mono_downmix = self.mono_downmix.clone();
         let reaffectation = self.reaffectation.clone();
         let disposition = self.disposition.clone();
@@ -6418,6 +6460,16 @@ impl OutputTarget for LocalOutput {
                 // No WAV header — this is a compressed stream (FLAC, MP3, AAC).
                 // Read the rest of the stream, decode with symphonia, and play.
                 info!("local_audio_non_wav_stream_detected_decoding");
+                // #6132 — la sortie double n'est branchée que sur le chemin
+                // PCM partagé (`BackendCpal`) ; dit plutôt que tu.
+                for nom in seconde_sortie.iter().map(|d| d.nom.as_str()) {
+                    warn!(
+                        device = %device_name,
+                        seconde_sortie = %nom,
+                        motif = "chemin_compresse",
+                        "sortie_double_refusee — la zone joue sur sa sortie seule"
+                    );
+                }
 
                 // Read the entire remaining stream
                 let mut all_data = header_buf.clone();
@@ -7128,6 +7180,23 @@ impl OutputTarget for LocalOutput {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let bras =
                 enchainement_exclusif::bras_de_cette_plateforme(exclusive_mode, &audio_backend);
+            // #6132 — la sortie double n'existe que sur le chemin partagé.
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if bras != enchainement_exclusif::BrasDeLecture::CpalPartage
+                && !seconde_sortie.is_empty()
+            {
+                let nom = seconde_sortie
+                    .iter()
+                    .map(|d| d.nom.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                warn!(
+                    device = %device_name,
+                    seconde_sortie = %nom,
+                    motif = "mode_exclusif",
+                    "sortie_double_refusee — la zone joue sur sa sortie seule"
+                );
+            }
 
             #[cfg(target_os = "macos")]
             if bras == enchainement_exclusif::BrasDeLecture::CoreAudioExclusif {
@@ -7455,6 +7524,20 @@ impl OutputTarget for LocalOutput {
                     return;
                 }
             };
+            // #6132 — la sortie double : B s'ouvre et la recopie s'installe
+            // AVANT le démarrage de A, pour que la ligne à retard de A soit
+            // en place dès sa première période.
+            if !seconde_sortie.is_empty() {
+                backend.brancher_les_secondes_sorties(
+                    &seconde_sortie,
+                    strict_bitperfect,
+                    sortie_double_locale::ReglagesDeA {
+                        volume: volume.clone(),
+                        facteur_de_rendu: rg_factor_ref.clone(),
+                        dop: dop_active.clone(),
+                    },
+                );
+            }
             let sortie = backend.format_ouvert();
             // #4953 — le périphérique vient-il de prouver qu'il suit la
             // cadence de la source ? Lu UNE fois, à l'ouverture : c'est ce
@@ -7870,6 +7953,11 @@ impl OutputTarget for LocalOutput {
                     next_url = %next.url,
                     "local_audio_gapless_chaining_next_track"
                 );
+                // #6132 — piste suivante : le retard commun des sorties
+                // suiveuses se réajustera au premier silence, jamais pendant
+                // le son. (Une piste rouverte, sans enchaînement, le recalcule
+                // d'office à l'ouverture.)
+                backend.demander_un_reajustement();
 
                 // La bascule des métadonnées et de la position a lieu PLUS BAS,
                 // une fois le flux suivant confirmé chaînable (en-tête WAV lu).
