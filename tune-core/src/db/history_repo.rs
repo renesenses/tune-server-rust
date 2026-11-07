@@ -104,8 +104,10 @@ pub mod sql {
         )
     }
 
+    /// Le nombre d'écoutes affiché (Bibliothèque, administration, profil
+    /// partagé) : comme les autres statistiques, sans la radio (#7965).
     pub fn count_all() -> &'static str {
-        "SELECT COUNT(*) FROM listen_history"
+        "SELECT COUNT(*) FROM listen_history WHERE COALESCE(source, '') <> 'radio'"
     }
 
     /// Le total de pagination de la liste : exactement les lignes qu'elle
@@ -1560,8 +1562,9 @@ impl HistoryRepo {
 
         // ── #6682 — temps d'écoute radio, par station, sur la période ──
         // À part des classements : les statistiques de `listen_history`
-        // excluent la radio (#7965), ces lignes viennent de la veille d'écoute (`radio_ecoute`). Un échec de
-        // lecture ne coûte que ce champ, pas le tableau de bord.
+        // excluent la radio (#7965), ces lignes viennent de la veille
+        // d'écoute (`radio_ecoute`). Un échec de lecture ne coûte que ce
+        // champ, pas le tableau de bord.
         let premier_jour =
             days.map(|d| crate::db::radio_ecoute::premier_jour(chrono::Utc::now(), d));
         let radio_listening =

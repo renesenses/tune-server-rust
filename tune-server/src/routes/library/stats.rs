@@ -143,7 +143,7 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
     let total_size_bytes = row.get(5).and_then(|v| v.as_i64()).unwrap_or(0);
 
     let listens = b
-        .query_one("SELECT COUNT(*) FROM listen_history", &[])
+        .query_one(tune_core::db::history_repo::sql::count_all(), &[])
         .ok()
         .flatten()
         .and_then(|r| r.first().and_then(|v| v.as_i64()))

@@ -166,6 +166,13 @@ async fn les_statistiques_d_ecoute_ignorent_la_station_7965() {
     let ds = appel(&app, "/dashboard/stats", None).await;
     let p = appel(&app, "/profiles/1/stats", None).await;
     assert_eq!(p["listening"]["total_listens"], 1, "{p}");
+    // Le compteur « écoutes » de la Bibliothèque (le même que Réglages →
+    // Bibliothèque, l'administration et le profil partagé).
+    let lib = appel(&app, "/library/stats", None).await;
+    assert_eq!(
+        lib["listens"], 1,
+        "/library/stats compte la station : {lib}"
+    );
     // Le résumé lit `listened_at < maintenant` à la seconde : une heure plus
     // tôt, les deux lignes sont dans sa semaine.
     let il_y_a_une_heure = (chrono::Utc::now() - chrono::Duration::hours(1))
