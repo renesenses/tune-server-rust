@@ -350,3 +350,44 @@ fn moondial_et_un_intrus_tiennent_au_scan_partiel_6460() {
         );
     }
 }
+
+/// #8106 (fil 2697) — la règle du cas 1 ne doit pas prendre une compilation
+/// faite main pour des parutions distinctes. Chaque piste a gardé l'album et
+/// le numéro de son disque d'origine : cinq titres, cinq artistes, des numéros
+/// qui se répètent (3, 1, 3, 1, 3), une piste par titre. Avant le correctif :
+/// cinq albums d'une piste, chacun sous son artiste et avec la pochette du
+/// dossier.
+#[test]
+fn une_compilation_aux_numeros_d_origine_reste_une_compilation_8106() {
+    for (quality_split, rendu) in les_deux_reglages(|r| {
+        let d = r.join(DOSSIER);
+        std::fs::create_dir_all(&d).unwrap();
+        (1..=5u32)
+            .map(|i| {
+                let chemin = d.join(format!("0{i}.flac"));
+                let artiste: &'static str = [
+                    "Nina Simone",
+                    "Otis Redding",
+                    "Aretha Franklin",
+                    "Sam Cooke",
+                    "Etta James",
+                ][i as usize - 1];
+                fichier(
+                    &chemin.to_string_lossy(),
+                    None,
+                    artiste,
+                    &format!("Disque d'origine {i}"),
+                    if i % 2 == 1 { 3 } else { 1 },
+                    None,
+                )
+            })
+            .collect()
+    }) {
+        assert_eq!(
+            rendu,
+            vec![(DOSSIER.to_string(), "Various Artists".to_string(), true)],
+            "quality_split={quality_split} : une compilation faite main aux numéros \
+             d'origine est éclatée en un album par piste (#8106)"
+        );
+    }
+}
