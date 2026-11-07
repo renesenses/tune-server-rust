@@ -3900,7 +3900,8 @@ mod restore_zone_volumes_tests {
         let sortie = tune_core::outputs::local::LocalOutput::new("Test".into());
         ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
 
-        let gain = sortie.gain_de_rendu().load(Ordering::SeqCst) as f64 / 1000.0;
+        let gain = sortie.gain_de_rendu().load(Ordering::SeqCst) as f64
+            / f64::from(tune_core::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU);
         let attendu = tune_core::orchestrator::volume_avec_trim(0.8, -6.0);
         assert!(
             (gain - attendu).abs() < 2e-3,
@@ -3929,7 +3930,10 @@ mod restore_zone_volumes_tests {
         ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
 
         let gain = sortie.gain_de_rendu().load(Ordering::SeqCst);
-        assert!(gain <= 1000, "gain de rendu {gain}/1000 : plafond franchi");
+        assert!(
+            gain <= tune_core::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+            "gain de rendu {gain} : plafond de l'unité franchi"
+        );
     }
 
     /// #5695 — la graine d'une sortie locale sous PURE forcé : 100 %, SANS
@@ -3960,8 +3964,9 @@ mod restore_zone_volumes_tests {
         ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
         let gain = sortie.gain_de_rendu().load(Ordering::SeqCst);
         assert_eq!(
-            gain, 1000,
-            "gain de rendu {gain}/1000 sous PURE forcé : le trim a été composé"
+            gain,
+            tune_core::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+            "gain de rendu {gain} sous PURE forcé : le trim a été composé"
         );
     }
     /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.
