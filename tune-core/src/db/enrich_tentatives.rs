@@ -76,6 +76,30 @@ pub fn clause_pas_deja_tentee(maintenant: i64) -> String {
     )
 }
 
+/// Sur une piste d'alias `t` déjà passée par [`clause_pas_deja_tentee`] :
+/// 1 si c'est une nouvelle tentative (échec temporaire dont le délai est
+/// écoulé), 0 si la piste n'a jamais été tentée sur ce fichier.
+///
+/// 🔴 Une nouvelle tentative n'est pas une piste restante. Triées en tête par
+/// leur petit identifiant et comptées dans le total, les pistes en 503 d'avant
+/// un redémarrage refaisaient remonter le reste à faire et repartir la passe
+/// des premiers `track_id` dès que leur délai (1 h) était écoulé.
+pub const SQL_EST_UN_REESSAI: &str = "CASE WHEN EXISTS (SELECT 1 FROM enrich_tentatives e \
+     WHERE e.track_id = t.id \
+     AND COALESCE(e.mtime_vu, '') = COALESCE(CAST(t.file_mtime AS TEXT), '')) \
+     THEN 1 ELSE 0 END";
+
+/// Retire la trace des pistes qui n'existent plus : un identifiant réutilisé
+/// n'hérite pas de la marque d'une piste supprimée. Rend le nombre de lignes
+/// retirées.
+pub fn purger_orphelines(db: &Arc<dyn DbBackend>) -> Result<usize, String> {
+    db.execute(
+        "DELETE FROM enrich_tentatives WHERE NOT EXISTS \
+         (SELECT 1 FROM tracks WHERE tracks.id = enrich_tentatives.track_id)",
+        &[],
+    )
+}
+
 /// Note l'issue d'une tentative. Un échec temporaire augmente le compte
 /// d'échecs et repousse la prochaine tentative ; toute autre issue le remet à
 /// zéro. Rend l'instant de la prochaine tentative (0 hors échec temporaire).

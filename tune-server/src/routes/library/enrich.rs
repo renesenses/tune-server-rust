@@ -49,6 +49,15 @@ pub(super) struct EnrichAllBody {
 /// enrichit un répertoire.
 const COL_FILE_PATH: usize = 4;
 
+/// Index de la colonne « nouvelle tentative » (1) ou « jamais tentée » (0)
+/// dans la sélection de [`enrich_all_library`] (#7983).
+const COL_REESSAI: usize = 13;
+
+/// #7983 — la ligne de la sélection est-elle une nouvelle tentative ?
+fn est_un_reessai(row: &[tune_core::db::backend::SqlValue]) -> bool {
+    row.get(COL_REESSAI).and_then(|v| v.as_i64()) == Some(1)
+}
+
 /// La sélection des candidats de `POST /library/enrich-all`.
 ///
 /// Sortie de la fonction pour être EXÉCUTABLE par un témoin : c'est une
@@ -78,6 +87,12 @@ const COL_FILE_PATH: usize = 4;
 /// ne donnait pas TOUS les champs revenait à chaque passe : au redémarrage, la
 /// sélection repartait des premiers identifiants et le reste à faire
 /// remontait. `ORDER BY t.id` : l'ordre ne dépend plus du plan du moteur.
+///
+/// 🔴 #7983 — les nouvelles tentatives (échecs temporaires au délai écoulé)
+/// passent APRÈS les pistes jamais tentées, et la colonne [`COL_REESSAI`] les
+/// désigne pour qu'elles ne comptent pas dans le total : triées par le seul
+/// identifiant, elles revenaient en tête après un redémarrage et faisaient
+/// remonter le reste à faire.
 fn sql_candidats_enrichissement(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     maintenant: i64,
@@ -86,6 +101,7 @@ fn sql_candidats_enrichissement(
     let a_un_fichier = tune_core::db::track_repo::sql::A_UN_FICHIER;
     let exclus = tune_core::taches_de_fond::perimetre::clause_hors_enrichissement(backend, chemin);
     let pas_deja_tentee = tune_core::db::enrich_tentatives::clause_pas_deja_tentee(maintenant);
+    let reessai = tune_core::db::enrich_tentatives::SQL_EST_UN_REESSAI;
     format!(
         // artist_name / album_title are NOT columns of `tracks` — they are
         // only derived via joins (artists.name / albums.title). Selecting
@@ -101,7 +117,7 @@ fn sql_candidats_enrichissement(
         // serait jamais parvenue (#1890).
         "SELECT t.id, t.title, a.name, al.title, {chemin}, \
          t.musicbrainz_recording_id, t.genre, t.year, t.label, t.composer, t.album_id, \
-         t.artist_id, a.musicbrainz_id \
+         t.artist_id, a.musicbrainz_id, {reessai} AS reessai \
          FROM tracks t \
          LEFT JOIN artists a ON a.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id \
@@ -113,7 +129,7 @@ fn sql_candidats_enrichissement(
            OR t.composer IS NULL OR t.composer = '' \
            OR (t.artist_id IS NOT NULL AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')) \
          ) AND {pas_deja_tentee}{exclus} \
-         ORDER BY t.id"
+         ORDER BY reessai, t.id"
     )
 }
 
@@ -127,7 +143,8 @@ enum Etape {
     /// L'écriture a réussi ; `appel_en_echec` si une requête de détails ou
     /// d'oeuvre a échoué en route (seul le MBID a pu être écrit).
     Ecrite { appel_en_echec: bool },
-    /// L'écriture en base a échoué : rien n'est noté, la piste reste candidate.
+    /// L'écriture en base a échoué (contrainte, donnée invalide, base
+    /// occupée) : échec temporaire, retenté après un délai.
     EcritureEnEchec,
 }
 
@@ -148,16 +165,25 @@ fn issue_de_la_tentative(etape: Etape) -> Option<tune_core::db::enrich_tentative
         Etape::Ecrite {
             appel_en_echec: false,
         } => Some(Issue::Fait),
-        Etape::EcritureEnEchec => None,
+        // Notée elle aussi : sans délai, une écriture qui échoue toujours
+        // était retentée à chaque passe.
+        Etape::EcritureEnEchec => Some(Issue::EchecTemporaire),
     }
 }
 
 /// #7983 — le relevé `enrich_all_status`. `enriched` et `total` gardent leur
 /// sens (contrat du client web, #2870) ; s'y ajoutent `examined` (pistes
 /// quittées par la passe, quelle qu'en soit l'issue), `remaining`
-/// (`total - examined` : ne remonte jamais pendant la passe) et
+/// (`total - examined` : ne remonte jamais pendant la passe),
 /// `retry_pending` (échecs temporaires qui attendent leur délai : ni restants,
-/// ni abandonnés).
+/// ni abandonnés) et `retry_due` (nouvelles tentatives arrivées à échéance,
+/// faites après les restantes).
+///
+/// 🔴 `total`, `enriched`, `examined` et `remaining` ne portent que sur les
+/// pistes jamais tentées : une nouvelle tentative n'est pas une restante.
+/// Ainsi `enriched` ne dépasse jamais `total`, et le reste d'une passe
+/// relancée après un redémarrage ne dépasse pas celui d'avant.
+#[allow(clippy::too_many_arguments)]
 fn releve_enrichissement(
     status: &str,
     task_id: &str,
@@ -166,6 +192,7 @@ fn releve_enrichissement(
     total: usize,
     examined: usize,
     retry_pending: i64,
+    retry_due: usize,
 ) -> Value {
     json!({
         "status": status,
@@ -176,6 +203,7 @@ fn releve_enrichissement(
         "examined": examined,
         "remaining": total.saturating_sub(examined),
         "retry_pending": retry_pending,
+        "retry_due": retry_due,
     })
 }
 
@@ -287,6 +315,11 @@ pub(crate) async fn demarrer_enrich_all(
     let backend_selection = state.backend.clone();
     let selection = tokio::task::spawn_blocking(move || {
         let maintenant = chrono::Utc::now().timestamp();
+        // #7983 — la trace d'une piste supprimée ne passe pas à celle qui
+        // reprendrait son identifiant.
+        if let Err(e) = tune_core::db::enrich_tentatives::purger_orphelines(&backend_selection) {
+            debug!(error = %e, "enrich_tentatives_purge_failed");
+        }
         let rows = backend_selection.query_many(
             &sql_candidats_enrichissement(&backend_selection, maintenant),
             &[],
@@ -369,7 +402,10 @@ pub(crate) async fn demarrer_enrich_all(
         // seules pistes du répertoire, et la boucle ne part sur MusicBrainz
         // pour aucune autre (#1660).
         let track_rows = restreindre_a_la_portee(track_rows, scope_tache.as_ref());
-        let total = track_rows.len();
+        // #7983 — les nouvelles tentatives arrivées à échéance sont en queue de
+        // sélection et hors du total : ce ne sont pas des restantes.
+        let reessais = track_rows.iter().filter(|r| est_un_reessai(r)).count();
+        let total = track_rows.len() - reessais;
         // #3810 — le compte de candidats, INCONDITIONNELLEMENT.
         //
         // Il n'était journalisé que sur une passe limitée à un répertoire : la
@@ -381,6 +417,7 @@ pub(crate) async fn demarrer_enrich_all(
         info!(
             task_id = %task_id_clone,
             candidats = total,
+            reessais,
             a_retenter = a_retenter_a_l_ouverture,
             portee = ?scope_tache.as_ref().map(|s| s.dir.clone()),
             "enrich_all_candidats"
@@ -404,6 +441,7 @@ pub(crate) async fn demarrer_enrich_all(
                         total,
                         0,
                         a_retenter_a_l_ouverture,
+                        reessais,
                     )
                     .to_string(),
                 )
@@ -445,6 +483,9 @@ pub(crate) async fn demarrer_enrich_all(
         // #7983 — pistes quittées par la passe, et échecs à retenter.
         let mut examined = 0usize;
         let mut retry_pending = a_retenter_a_l_ouverture;
+        // Nouvelles tentatives quittées par la passe, et celles qui ont abouti.
+        let mut reessais_vus = 0usize;
+        let mut reessais_aboutis = 0usize;
         // Note l'issue d'une piste, hors des fils de l'exécuteur (#4681).
         let noter_l_issue = |track_id: i64, etape: Etape| {
             let backend = backend2.clone();
@@ -468,25 +509,38 @@ pub(crate) async fn demarrer_enrich_all(
                 Some(issue)
             }
         };
-        let releve_periodique = |enriched: i32, errors: i32, examined: usize, retry: i64| {
-            if examined.is_multiple_of(50) {
-                tune_core::db::settings_repo::SettingsRepo::with_backend(backend2.clone())
-                    .set(
-                        "enrich_all_status",
-                        &releve_enrichissement(
-                            "running",
-                            &task_id_clone,
-                            enriched,
-                            errors,
-                            total,
-                            examined,
-                            retry,
-                        )
-                        .to_string(),
+        // Relevé périodique, hors des fils de l'exécuteur (#4681). Le compte
+        // des échecs à retenter est relu de la base : un délai expiré en cours
+        // de passe en sort. Rend ce compte relu.
+        let releve_periodique =
+            |enriched: i32, errors: i32, examined: usize, retry: i64, retry_due: usize| {
+                let backend = backend2.clone();
+                let task_id = task_id_clone.clone();
+                async move {
+                    tune_core::taches_de_fond::priorite::hors_du_fil_async(
+                        tune_core::taches_de_fond::Tache::Enrichissement.id(),
+                        move || {
+                            let retry = tune_core::db::enrich_tentatives::compter_a_retenter(
+                                &backend,
+                                chrono::Utc::now().timestamp(),
+                            )
+                            .unwrap_or(retry);
+                            tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
+                                .set(
+                                    "enrich_all_status",
+                                    &releve_enrichissement(
+                                        "running", &task_id, enriched, errors, total, examined,
+                                        retry, retry_due,
+                                    )
+                                    .to_string(),
+                                )
+                                .ok();
+                            retry
+                        },
                     )
-                    .ok();
-            }
-        };
+                    .await
+                }
+            };
         // Artists whose MBID we've already backfilled this run, so we don't
         // re-fetch recording details once per track for the same artist.
         let mut artists_mbid_done: std::collections::HashSet<i64> =
@@ -515,6 +569,7 @@ pub(crate) async fn demarrer_enrich_all(
             annonce(&mut cadence, enriched);
 
             let track_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let reessai = est_un_reessai(row);
             // #7983 — le corps rend l'étape où la passe quitte la piste ;
             // l'issue est notée en un seul point, juste après.
             let etape: Option<Etape> = 'piste: {
@@ -770,9 +825,16 @@ pub(crate) async fn demarrer_enrich_all(
                 }
             };
 
-            examined += 1;
+            if reessai {
+                reessais_vus += 1;
+            } else {
+                examined += 1;
+            }
             if let Some(etape) = etape {
                 match noter_l_issue(track_id, etape).await {
+                    Some(tune_core::db::enrich_tentatives::Issue::Fait) if reessai => {
+                        reessais_aboutis += 1
+                    }
                     Some(tune_core::db::enrich_tentatives::Issue::Fait) => enriched += 1,
                     Some(tune_core::db::enrich_tentatives::Issue::EchecTemporaire) => {
                         retry_pending += 1
@@ -780,9 +842,21 @@ pub(crate) async fn demarrer_enrich_all(
                     _ => {}
                 }
             }
-            // Relevé tous les 50 EXAMINÉS, et non plus tous les 50 enrichis :
-            // une suite de pistes ratées réécrivait l'état à chaque piste.
-            releve_periodique(enriched, errors, examined, retry_pending);
+            // Relevé toutes les 50 pistes QUITTÉES, et non plus tous les 50
+            // enrichis : une suite de pistes ratées réécrivait l'état à chaque
+            // piste.
+            if (examined + reessais_vus).is_multiple_of(50)
+                && let Some(relu) = releve_periodique(
+                    enriched,
+                    errors,
+                    examined,
+                    retry_pending,
+                    reessais - reessais_vus,
+                )
+                .await
+            {
+                retry_pending = relu;
+            }
         }
 
         let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend2.clone());
@@ -797,6 +871,7 @@ pub(crate) async fn demarrer_enrich_all(
                     total,
                     examined,
                     retry_pending,
+                    reessais - reessais_vus,
                 )
                 .to_string(),
             )
@@ -818,7 +893,15 @@ pub(crate) async fn demarrer_enrich_all(
                 "total": total,
             }),
         );
-        info!(task_id = %task_id_clone, enriched, errors, total, "enrich_all_library done");
+        info!(
+            task_id = %task_id_clone,
+            enriched,
+            errors,
+            total,
+            reessais,
+            reessais_aboutis,
+            "enrich_all_library done"
+        );
         // #5469 — fin NORMALE, et seulement elle : le repère part. Un arrêt
         // n'arrive jamais ici, et c'est ce qui permet au démarrage suivant de
         // relancer la passe.
