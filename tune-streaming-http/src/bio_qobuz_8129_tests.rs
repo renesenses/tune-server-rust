@@ -110,8 +110,9 @@ impl StreamingService for FauxQobuz {
 }
 
 async fn appel(nom: &str, chemin: &str) -> Value {
-    let backend: Arc<dyn DbBackend> =
-        Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+    let base = SqliteDb::open_in_memory().expect("sqlite en memoire");
+    base.init_schema().expect("schema");
+    let backend: Arc<dyn DbBackend> = Arc::new(base);
     backend
         .execute(
             "INSERT INTO artists (id, name) VALUES (3, 'Bill Evans'), (1, 'Miles Davis')",
