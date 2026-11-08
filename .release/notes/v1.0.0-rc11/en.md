@@ -24,7 +24,7 @@ Tune 1.0.0-rc11, the eleventh release candidate of Tune 1.0.
 - **Tune tested**: Tune offers to add a device after an hour of listening without errors, from a dedicated button; a device already in the catalog adds a household.
 - **Library**: "Library extended to service favorites" setting, on by default; faster search by word start; grid search requires all words; From / To period on the years timeline; smoother scrolling of tracks.
 - **Track lists**: columns can be reordered and each screen remembers it; a playlist screen gains covers, thumbnail size and a compact header; source badges in the Playlist Manager.
-- **Home and resume**: choose the panels of the listening overview; "Resume listening" shows one subtitle per kind, resumes a podcast with title, cover and position, and without duplicates.
+- **Home and resume**: choose the panels of the listening overview; "Resume listening" shows one subtitle per kind, resumes a podcast with title and cover (resuming at the saved position on a DLNA zone comes in the next version), and without duplicates.
 - **History**: a listen counts only after 30 s or half the track; "Play" after Stop keeps the current album or playlist; podcast episodes and radios carry the station name.
 - **Listening statistics**: imported listens (Roon, Plex, m3u) count in the most played; smart lists and History count like the Library; a Qobuz listen no longer counts for the local album of the same name.
 - **Crosstalk and equalizer**: separation / coloration curve and speaker response in the settings screen, separation target from 1 dB; parametric graph frozen by default (Edit / Done) and a color per channel.
@@ -38,7 +38,7 @@ Tune 1.0.0-rc11, the eleventh release candidate of Tune 1.0.
 
 - **AirPlay 2**: the "Pair" button pairs through the AirPlay 2 component or names its cause; waiting for the PIN no longer blocks playback and closing its window cancels it; the session reopens after a pause; the position advances and a pause no longer loops; the component exists for 64-bit Raspberry Pi.
 - **DLNA and OpenHome**: gapless DSD tracks, faster "next", a pause made on the device is respected, the machine's own output no longer appears twice, OpenHome volume without waiting, the list loaded by Kazoo is kept, faster Play for TIDAL CD.
-- **Volume**: a new local output no longer starts at full scale; mute no longer lets a re-read volume through; each slider position gives a distinct level; WASAPI and ASIO volume is heard immediately; Tune follows the device below the safety ceiling.
+- **Volume**: a new local output no longer starts at full scale; after unmuting, the slider returns to the previous volume; each slider position gives a distinct level; WASAPI and ASIO volume is heard immediately; Tune follows the device below the safety ceiling.
 - **Windows**: the shortcut opens without a console window; a DoP the output cannot carry goes out as PCM; network discovery passes the firewall; an unreadable temperature no longer throttles analyses; the update starts its switch script at exit.
 - **Updates and license**: on Unix, the new binary and web interface are validated before replacing the old one, and a failure is explicit; removing the license also frees the machine on the site.
 - **Library**: photos and videos of a UPnP server no longer come in; a FLAC + CUE box set forms a single album; DSD and CD editions stay two albums; a hand-made compilation is no longer split; a deleted playlist is no longer recreated at scan; a rescan without an artist tag no longer moves the album to "Unknown Artist"; adding a folder scans only that folder.
@@ -47,4 +47,10 @@ Tune 1.0.0-rc11, the eleventh release candidate of Tune 1.0.
 - **Network and storage**: discovery resumes when the network arrives after Tune; a failing SMB mount says why, including under Docker; backup succeeds on PostgreSQL; CD extraction refuses a full or non-writable destination; Tune leaves the Squeezebox ports to a Lyrion server on the same machine.
 - **Screens**: the Concerts screen opens without a license; "Ungroup all" reappears; Now playing follows the album change; an expired streaming session keeps its "Reconnect" tab; New alarm stays visible.
 - **Raspberry Pi 5**: the Active Cooler fan spins again (new Tune OS image).
-- **Security**: hardening fixes.
+- **Security**: hardening fixes; on a server without authentication, exporting the configuration with secrets in clear text is refused (use the backup encrypted with a passphrase).
+
+## Known issues
+
+- **Mute on a DLNA zone**: a muted zone may restart with sound when a new track is started. Lower the volume instead of muting until the fix (next version).
+- **Podcast episode resume**: on a DLNA zone, a resumed episode restarts from the beginning (next version).
+- **Tune Circle**: circles you are a member of, or invited to, do not yet appear in the list like the ones you created (next version).

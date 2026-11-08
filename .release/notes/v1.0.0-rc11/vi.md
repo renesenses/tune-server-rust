@@ -19,7 +19,7 @@ Tune 1.0.0-rc11, bản ứng viên phát hành thứ mười một của Tune 1.
 - **Tune tested**: Tune đề xuất thêm một thiết bị sau một giờ nghe không lỗi, bằng một nút riêng; thiết bị đã có trong danh mục sẽ thêm một hộ gia đình.
 - **Thư viện**: thiết lập “Thư viện mở rộng đến mục yêu thích của dịch vụ”, bật theo mặc định; tìm theo đầu từ nhanh hơn; tìm trên lưới yêu cầu đủ mọi từ; khoảng thời gian Từ / Đến trên dòng thời gian theo năm; cuộn bài mượt hơn.
 - **Danh sách bài**: có thể đổi thứ tự cột và mỗi màn hình ghi nhớ; màn hình danh sách phát có ảnh bìa, cỡ hình thu nhỏ và tiêu đề gọn; huy hiệu nguồn trong Trình quản lý danh sách phát.
-- **Trang chủ và tiếp tục nghe**: chọn các bảng trong tổng quan lượt nghe; “Tiếp tục nghe” hiện một phụ đề cho mỗi loại, tiếp tục podcast với tiêu đề, ảnh bìa và vị trí, và không trùng lặp.
+- **Trang chủ và tiếp tục nghe**: chọn các bảng trong tổng quan lượt nghe; “Tiếp tục nghe” hiện một phụ đề cho mỗi loại, tiếp tục podcast với tiêu đề và ảnh bìa (tiếp tục từ vị trí đã lưu trên vùng DLNA sẽ có trong phiên bản tiếp theo), và không trùng lặp.
 - **Lịch sử**: một lượt nghe chỉ được tính sau 30 giây hoặc một nửa bài; “Phát” sau khi Dừng giữ nguyên album hoặc danh sách phát đang dùng; tập podcast và radio mang tên đài.
 - **Thống kê lượt nghe**: các lượt nghe đã nhập (Roon, Plex, m3u) được tính vào mục nghe nhiều nhất; danh sách thông minh và Lịch sử tính như Thư viện; một lượt nghe Qobuz không còn được tính cho album cục bộ cùng tên.
 - **Crosstalk và bộ cân bằng**: đường cong tách / nhuộm màu và đáp ứng loa trong màn hình thiết lập, mục tiêu tách từ 1 dB; đồ thị tham số được cố định theo mặc định (Sửa / Xong) và mỗi kênh một màu.
@@ -30,7 +30,7 @@ Tune 1.0.0-rc11, bản ứng viên phát hành thứ mười một của Tune 1.
 - **Phát nhạc**: các lý do chuyển mã được nêu tên, và FLAC được phát nguyên trạng khi không có gì áp dụng; Tiếp theo và Trước đó bỏ qua các bài mà dịch vụ từ chối.
 - **Sửa lỗi AirPlay 2**: nút “Pair” ghép đôi qua thành phần AirPlay 2 hoặc nêu nguyên nhân; việc chờ mã PIN không còn chặn phát nhạc và đóng cửa sổ sẽ hủy việc chờ; phiên mở lại sau khi tạm dừng; vị trí chạy tiếp và tạm dừng không còn lặp; thành phần này có cho Raspberry Pi 64 bit.
 - **Sửa lỗi DLNA và OpenHome**: các bài DSD phát liền mạch, “tiếp theo” nhanh hơn, tạm dừng thực hiện trên thiết bị được tôn trọng, đầu ra của chính máy không còn hiện đôi, âm lượng OpenHome không phải chờ, danh sách Kazoo đã nạp được giữ lại, Play nhanh hơn với TIDAL CD.
-- **Sửa lỗi âm lượng**: đầu ra cục bộ mới không còn khởi động ở mức tối đa; tắt tiếng không còn để lọt một âm lượng vừa đọc lại; mỗi vị trí của thanh trượt cho một mức khác nhau; âm lượng WASAPI và ASIO nghe thấy ngay; Tune theo thiết bị dưới trần an toàn.
+- **Sửa lỗi âm lượng**: đầu ra cục bộ mới không còn khởi động ở mức tối đa; khi bỏ tắt tiếng, thanh trượt trở về âm lượng trước đó; mỗi vị trí của thanh trượt cho một mức khác nhau; âm lượng WASAPI và ASIO nghe thấy ngay; Tune theo thiết bị dưới trần an toàn.
 - **Sửa lỗi Windows**: lối tắt mở không có cửa sổ console; DoP mà đầu ra không tải được sẽ đi dưới dạng PCM; việc dò tìm mạng vượt qua tường lửa; nhiệt độ không đọc được không còn làm chậm các phân tích; bản cập nhật chạy tập lệnh chuyển đổi khi thoát.
 - **Sửa lỗi cập nhật và giấy phép**: trên Unix, tệp nhị phân mới và giao diện web được kiểm tra trước khi thay bản cũ, và lỗi được báo rõ; gỡ giấy phép cũng giải phóng máy trên trang web.
 - **Sửa lỗi thư viện**: ảnh và video của máy chủ UPnP không còn được đưa vào; bộ hộp FLAC + CUE tạo thành một album duy nhất; bản DSD và bản CD vẫn là hai album; bộ tuyển tập làm thủ công không còn bị tách rời; danh sách phát đã xóa không còn bị tạo lại khi quét; đọc lại không có thẻ nghệ sĩ không còn chuyển album sang “Unknown Artist”; thêm một thư mục chỉ quét thư mục đó.
@@ -39,4 +39,10 @@ Tune 1.0.0-rc11, bản ứng viên phát hành thứ mười một của Tune 1.
 - **Sửa lỗi mạng và lưu trữ**: việc dò tìm tiếp tục khi mạng xuất hiện sau Tune; kết nối SMB thất bại cho biết lý do, kể cả trong Docker; sao lưu thành công trên PostgreSQL; trích xuất CD từ chối nơi lưu đã đầy hoặc không ghi được; Tune nhường các cổng Squeezebox cho máy chủ Lyrion trên cùng máy.
 - **Sửa lỗi màn hình**: màn hình Hòa nhạc mở được mà không cần giấy phép; “Bỏ nhóm tất cả” hiện lại; Đang phát theo kịp việc đổi album; phiên phát trực tuyến hết hạn giữ lại thẻ “Kết nối lại”; Báo thức mới luôn hiển thị.
 - **Sửa lỗi Raspberry Pi 5**: quạt của Active Cooler quay trở lại (ảnh Tune OS mới).
-- **Bảo mật**: các bản sửa lỗi gia cố.
+- **Bảo mật**: các bản sửa lỗi gia cố; trên máy chủ không bật xác thực, việc xuất cấu hình kèm bí mật ở dạng văn bản thô bị từ chối (hãy dùng bản sao lưu được mã hóa bằng cụm mật khẩu).
+
+## Vấn đề đã biết
+
+- **Tắt tiếng trên vùng DLNA**: một vùng đang tắt tiếng có thể phát lại có tiếng khi bắt đầu một bản nhạc mới. Cho đến khi được khắc phục, hãy giảm âm lượng thay vì tắt tiếng (phiên bản tiếp theo).
+- **Tiếp tục một tập podcast**: trên vùng DLNA, tập được tiếp tục sẽ phát lại từ đầu (phiên bản tiếp theo).
+- **Tune Circle**: các vòng tròn mà bạn là thành viên hoặc được mời vào chưa hiện trong danh sách như các vòng tròn bạn đã tạo (phiên bản tiếp theo).
