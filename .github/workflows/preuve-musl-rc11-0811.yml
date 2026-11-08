@@ -33,6 +33,12 @@ jobs:
       - uses: taiki-e/install-action@cross
       - name: Build (cross) — ligne identique à release.yml
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
+      - name: airplay-daemon (meme recette que release.yml, #8112)
+        run: |
+          CROSS=(--cross)
+          python scripts/build-airplay-daemon.py --target ${{ matrix.target }} --output "$RUNNER_TEMP/apd" --work "$RUNNER_TEMP/apd-src" "${CROSS[@]}"
+          file "$RUNNER_TEMP/apd/bin/airplay-daemon"
+          file "$RUNNER_TEMP/apd/bin/airplay-daemon" | grep -q 'ARM aarch64'
       - run: file target/${{ matrix.target }}/release/tune-server
       - name: Sortie locale dans l'ELF (garde #3621)
         run: strings target/${{ matrix.target }}/release/tune-server | grep -q snd_pcm_open
