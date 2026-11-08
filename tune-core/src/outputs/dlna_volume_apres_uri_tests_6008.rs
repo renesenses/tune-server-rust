@@ -408,39 +408,57 @@ async fn abyss_hors_fenetre(
     (sortie, etat, vie)
 }
 
-/// 🔴 #6008 (pissa7, fil 2401, rc7) — la séquence du journal. Consigne 22 %,
-/// piste lancée, saut à 80 corrigé dans les 15 s ; puis, 33 s après le début
-/// de la piste et sans aucun `SetVolume` de Tune, l'Abyss rapporte de nouveau
-/// 80 (`volume_adopte_du_renderer ancien=22.0 nouveau=80.0`). Hors de la
-/// fenêtre, Tune laissait l'appareil à 80. Désormais il le ramène à 22, le
-/// sondeur reçoit 22, et aucun ordre au-dessus de 22 ne part jamais.
+/// #6008 (pissa7, fil 2401, rc7), révisé par #7379 (décision du 02/11, fin
+/// de la règle stricte de #6871). Consigne 22 %, piste lancée, saut à 80
+/// corrigé dans les 15 s (#6207, inchangé) ; puis, hors de la fenêtre, sans
+/// aucun `SetVolume` de Tune, l'Abyss rapporte de nouveau 80. La sortie DLNA
+/// ne le ramène plus à la consigne : elle rend 80 au sondeur, qui suit sous
+/// le plafond de suivi et ramène au plafond au-dessus
+/// (`poller::volume_suivi_7379_tests`).
 #[tokio::test]
-async fn hors_fenetre_un_80_de_l_abyss_est_ramene_a_la_consigne() {
+async fn hors_fenetre_la_sortie_rend_le_releve_au_sondeur_7379() {
     let udn = "uuid:banc-6008-2401-hors-fenetre";
     let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.22).await;
+    let avant = etat.set_volume.lock().await.len();
 
-    // L'appareil remonte seul, hors de la fenêtre.
+    // L'appareil remonte, hors de la fenêtre.
     *etat.volume.lock().await = 80;
     let statut = sortie.get_status().await.unwrap();
     let tenu = *etat.volume.lock().await;
-    let envoyes = etat.set_volume.lock().await.clone();
+    let apres = etat.set_volume.lock().await[avant..].to_vec();
     compat::reinitialiser_compatibilite(udn).unwrap();
     vie.abort();
 
     assert_eq!(
-        tenu, 22,
-        "#6008 (fil 2401) : l'Abyss a remonté son volume à 80 % hors de la fenêtre d'après pose, \
-         et Tune l'y a laissé ; il doit le ramener à la consigne de l'auditeur (22 %)"
+        tenu, 80,
+        "#7379 : la sortie ne corrige plus hors de la fenêtre"
     );
     assert!(
-        (statut.volume - 0.22).abs() < 0.005,
-        "#6008 : le sondeur doit recevoir la consigne réimposée, pas les 80 % ({})",
+        (statut.volume - 0.80).abs() < 0.005,
+        "#7379 : le sondeur doit recevoir le relevé (80 %), pas {}",
         statut.volume
     );
     assert!(
-        envoyes.iter().all(|&v| v <= 22),
-        "#6008 : aucun SetVolume au-dessus de la consigne de l'auditeur (22) ; envoyés : {envoyes:?}"
+        apres.is_empty(),
+        "#7379 : aucun SetVolume de la sortie hors de la fenêtre : {apres:?}"
     );
+}
+
+/// #7379 — un DLNA ex-« strict » (règle « volume remonté à l'URI » apprise)
+/// suit aussi un geste au bouton : hors de la fenêtre, une hausse de 22 à 40 %
+/// passe telle quelle au sondeur, sans être ramenée à la consigne.
+#[tokio::test]
+async fn un_dlna_ex_strict_rend_un_geste_au_bouton_7379() {
+    let udn = "uuid:banc-7379-ex-strict";
+    let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.22).await;
+    let avant = etat.set_volume.lock().await.len();
+    *etat.volume.lock().await = 40;
+    let statut = sortie.get_status().await.unwrap();
+    let apres = etat.set_volume.lock().await[avant..].to_vec();
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+    assert!((statut.volume - 0.40).abs() < 0.005, "{}", statut.volume);
+    assert!(apres.is_empty(), "aucun SetVolume : {apres:?}");
 }
 
 /// Contre-épreuve : la piste en cours n'est pas celle de Tune (source propre de

@@ -132,6 +132,120 @@ mod tests {
         (host, task)
     }
 
+    /// #7379 — le VRAI `get_status` d'un `DlnaOutput` lève l'illisibilité
+    /// (trait `volume_du_statut_illisible`) quand la réponse de volume est
+    /// vide ou sans `CurrentVolume`, et la baisse dès qu'un volume se lit.
+    #[tokio::test]
+    async fn le_statut_signale_un_volume_illisible_au_sondeur_7379() {
+        use crate::outputs::traits::OutputTarget;
+        let rc = Arc::new(Mutex::new(String::new()));
+        let rc_route = rc.clone();
+        let app = Router::new()
+            .route(
+                "/av/control",
+                post(|| async {
+                    "<s:Envelope><s:Body><CurrentTransportState>PLAYING</CurrentTransportState>\
+                     <RelTime>0:00:10</RelTime><TrackDuration>0:05:00</TrackDuration>\
+                     </s:Body></s:Envelope>"
+                }),
+            )
+            .route(
+                "/rc/control",
+                post(move || {
+                    let rc = rc_route.clone();
+                    async move { rc.lock().unwrap().clone() }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let out = DlnaOutput::new(
+            "Banc 7379".into(),
+            "uuid:7379".into(),
+            host.clone(),
+            format!("{host}/av/control"),
+            format!("{host}/rc/control"),
+            None,
+        );
+        for corps in [
+            "",
+            "<s:Envelope><s:Body><u:GetVolumeResponse/></s:Body></s:Envelope>",
+        ] {
+            *rc.lock().unwrap() = corps.into();
+            let statut = out.get_status().await.unwrap();
+            assert_eq!(
+                statut.volume, REPLI_ILLISIBLE,
+                "le repli reste dans le statut"
+            );
+            assert!(
+                out.volume_du_statut_illisible(),
+                "réponse {corps:?} : le repli doit être signalé au sondeur"
+            );
+        }
+        *rc.lock().unwrap() =
+            "<s:Envelope><s:Body><CurrentVolume>40</CurrentVolume></s:Body></s:Envelope>".into();
+        let statut = out.get_status().await.unwrap();
+        assert!((statut.volume - 0.4).abs() < 1e-9, "{}", statut.volume);
+        assert!(
+            !out.volume_du_statut_illisible(),
+            "un volume lu n'est pas un repli"
+        );
+        task.abort();
+    }
+
+    /// #7379 (troisième revue, B3a) — en « silence UPnP », évènements
+    /// vivants : tant que l'appareil n'a poussé AUCUN `Volume`, le volume
+    /// rendu (repli, ou dernier volume posé par Tune) est signalé au sondeur ;
+    /// dès qu'un `Volume` est poussé, le drapeau retombe — y compris après un
+    /// sondage illisible (sinon les vrais volumes seraient ignorés, #6541).
+    #[tokio::test]
+    async fn en_silence_upnp_sans_volume_pousse_le_statut_le_signale_7379() {
+        use crate::outputs::traits::OutputTarget;
+        // Aucune requête ne part en silence : un hôte injoignable suffit.
+        let host = "http://127.0.0.1:9".to_string();
+        let out = DlnaOutput::new(
+            "Silence 7379".into(),
+            "uuid:silence-7379".into(),
+            host.clone(),
+            format!("{host}/av/control"),
+            format!("{host}/rc/control"),
+            None,
+        )
+        .with_upnp_silence(true);
+        // Un sondage illisible a laissé le drapeau levé.
+        out.dernier_releve_illisible.store(true, Ordering::Relaxed);
+        {
+            let mut es = out.event_state.lock().await;
+            es.alive = true;
+            es.last_update = Some(std::time::Instant::now());
+            es.transport_state = Some(TransportState::Stopped);
+            es.volume = None;
+        }
+        let statut = out.get_status().await.unwrap();
+        assert_eq!(statut.volume, REPLI_ILLISIBLE);
+        assert!(
+            out.volume_du_statut_illisible(),
+            "silence, aucun Volume poussé, rien de posé : repli à signaler"
+        );
+        // Tune a posé 30 % : la valeur rendue reste la sienne, pas une
+        // observation.
+        out.dernier_volume_pct.store(30, Ordering::Relaxed);
+        let statut = out.get_status().await.unwrap();
+        assert!((statut.volume - 0.3).abs() < 1e-9);
+        assert!(
+            out.volume_du_statut_illisible(),
+            "le dernier volume posé n'est pas lu"
+        );
+        // L'appareil pousse son volume : drapeau baissé, vrai volume rendu.
+        out.event_state.lock().await.volume = Some(40);
+        let statut = out.get_status().await.unwrap();
+        assert!((statut.volume - 0.4).abs() < 1e-9, "{}", statut.volume);
+        assert!(
+            !out.volume_du_statut_illisible(),
+            "un Volume poussé est une observation : le drapeau doit retomber"
+        );
+    }
+
     /// Une réponse illisible donne UNE ligne WARN avec sa raison et son
     /// extrait, quel que soit le nombre de lectures ; le repli 0,5 est
     /// inchangé ; le retour à une réponse lisible écrit la fin d'épisode.

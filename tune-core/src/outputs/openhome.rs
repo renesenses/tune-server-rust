@@ -36,6 +36,9 @@ pub struct OpenHomeOutput {
     /// #7841 — l'échelle de volume du renderer, partagée avec son
     /// [`EnvoiDeVolume`] (voir [`EnvoiDeVolume::echelle`]).
     echelle_de_volume: Arc<tokio::sync::OnceCell<Option<EchelleDeVolume>>>,
+    /// #7379 — le dernier `get_status` n'a pas de volume lu (pas de service
+    /// Volume) : le 0,5 rendu est un repli.
+    volume_illisible: std::sync::atomic::AtomicBool,
 }
 
 impl OpenHomeOutput {
@@ -74,6 +77,7 @@ impl OpenHomeOutput {
             current_oh_id: tokio::sync::Mutex::new(None),
             pending_next_oh_ids: tokio::sync::Mutex::new(Vec::new()),
             echelle_de_volume: Arc::new(tokio::sync::OnceCell::new()),
+            volume_illisible: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -437,6 +441,11 @@ impl OpenHomeOutput {
 
 #[async_trait::async_trait]
 impl OutputTarget for OpenHomeOutput {
+    fn volume_du_statut_illisible(&self) -> bool {
+        self.volume_illisible
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -624,9 +633,14 @@ impl OutputTarget for OpenHomeOutput {
                     .parse::<u32>()
                     .map_err(|e| format!("invalid OpenHome Volume value: {e}"))?
             };
+            self.volume_illisible
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             envoi.echelle().await.depuis_niveau(level)
         } else {
-            0.5
+            // #7379 — pas de service Volume : repli, signalé au sondeur.
+            self.volume_illisible
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::outputs::dlna::volume_illisible_5662::REPLI_ILLISIBLE
         };
 
         let muted = if let Some(m) = cached_muted.filter(|_| eventing) {
@@ -1038,6 +1052,25 @@ fn playlist_source_index(source_xml_value: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #7379 — une sortie OpenHome SANS service Volume : son `get_status`
+    /// rend le repli 0,5 et le signale au sondeur (trait
+    /// `volume_du_statut_illisible`).
+    #[tokio::test]
+    async fn sans_service_volume_le_statut_signale_le_repli_7379() {
+        let out = OpenHomeOutput::new(
+            "Sans volume".into(),
+            "oh-7379".into(),
+            "127.0.0.1".into(),
+            9,
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        let statut = out.get_status().await.unwrap();
+        assert_eq!(statut.volume, 0.5);
+        assert!(out.volume_du_statut_illisible());
+    }
 
     #[test]
     fn didl_with_all_fields() {

@@ -2473,6 +2473,16 @@ pub trait OutputTarget: Send + Sync {
         None
     }
 
+    /// #7379 — vrai quand le `volume` rendu par le DERNIER `get_status` est
+    /// un repli (réponse sans volume lisible : 0,5 par convention, #5662) et
+    /// non une valeur lue sur l'appareil. Le sondeur ne prend jamais un tel
+    /// relevé pour un geste au bouton (ni suivi, ni retour au plafond). Le
+    /// repli reste dans le statut pour les autres lecteurs. Défaut `false` :
+    /// une sortie qui lit toujours un vrai volume n'a rien à faire.
+    fn volume_du_statut_illisible(&self) -> bool {
+        false
+    }
+
     /// Les transformations que cette sortie a RÉELLEMENT appliquées au flux
     /// en cours (REF-6b, #2219), ou `None` quand elle ne sait pas les dire.
     /// Défaut `None` : une sortie existante compile et s'affiche exactement

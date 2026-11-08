@@ -161,7 +161,7 @@ impl PositionPoller {
                 continue;
             }
 
-            let status = {
+            let (status, volume_illisible) = {
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
                     match outputs.get(&device_id) {
@@ -173,7 +173,15 @@ impl PositionPoller {
                     // Chemin « zone au repos » : rien ne joue, donc rien ne
                     // peut manquer à l'anneau. Le relevé de famine n'a de sens
                     // que sur le chemin de lecture, plus bas.
-                    Ok((s, signal_path, dsp_metrics, _famine, transformations, _progress)) => {
+                    Ok((
+                        s,
+                        signal_path,
+                        dsp_metrics,
+                        _famine,
+                        transformations,
+                        _progress,
+                        illisible,
+                    )) => {
                         let b = idle_backoff.entry(zone_id).or_default();
                         b.record_success(s.state);
                         // Clôture de panne (#2566) : muette si le sondage
@@ -197,7 +205,7 @@ impl PositionPoller {
                         self.playback
                             .set_transformations_reelles(zone_id, transformations)
                             .await;
-                        s
+                        (s, illisible)
                     }
                     Err(e) => {
                         let b = idle_backoff.entry(zone_id).or_default();
@@ -247,14 +255,19 @@ impl PositionPoller {
                 self.volume_100_ignore_constate(zone_id, zone.volume / 100.0, status.volume);
             }
             // #6541 — au-dessus de la limite de sécurité de la zone, le volume
-            // de l'appareil est ramené, jamais adopté (`volume_plafond_6541`).
+            // de l'appareil est ramené à la limite (#7379), qui devient la
+            // consigne (`volume_plafond_6541`).
+            // #7379 — un relevé illisible (repli 0,5 de #5662) n'est jamais
+            // un geste : ni retour au plafond, ni suivi, ni repère du front.
             let plafond_tenu = !zone.fixed_volume
                 && !in_startup_grace
                 && !in_volume_grace
+                && !volume_illisible
                 && self.volume_plafond_reimpose(zone_id, status.volume).await;
             if !zone.fixed_volume
                 && !in_startup_grace
                 && !in_volume_grace
+                && !volume_illisible
                 && !sourdine
                 && status.volume > 0.001
                 && status.volume < 0.999
@@ -266,9 +279,10 @@ impl PositionPoller {
                 // actually moved since the last poll (see decisions::
                 // should_adopt_device_volume), so a stale default (Fabien's
                 // Devialet stuck at 50%) can't overwrite the saved volume.
-                // #6739 — jamais à la hausse, et trim retiré.
+                // #6739 — trim retiré ; #7379 — suivi sous le plafond de
+                // suivi, retour au plafond au-dessus.
                 if !plafond_tenu
-                    && let Some(adopte) = self.releve_adoptable(
+                    && let Some(suite) = self.releve_adoptable(
                         zone_id,
                         &device_id,
                         prev_device_vol,
@@ -276,17 +290,8 @@ impl PositionPoller {
                         db_vol,
                     )
                 {
-                    self.playback.set_volume(zone_id, adopte).await;
-                    // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
-                    // tombait a 0 sous 0,01 lineaire (-40 dB).
-                    let vol_pct = adopte * 100.0;
-                    crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-                        .update_volume(zone_id, vol_pct)
-                        .ok();
-                    // #6008 — l'adoption se dit au journal.
-                    volume_adopte_6008::journaliser_volume_adopte(
-                        zone_id, &device_id, db_vol, adopte,
-                    );
+                    self.appliquer_la_suite_du_releve(zone_id, &device_id, db_vol, suite)
+                        .await;
                 }
                 // Remember what the renderer reported so the next tick can
                 // detect a genuine change.
@@ -974,7 +979,7 @@ impl PositionPoller {
                 }
             }
 
-            let (status, famine_anneau, progression_octets) = {
+            let (status, famine_anneau, progression_octets, volume_illisible) = {
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
                     match outputs.get(&device_id) {
@@ -983,7 +988,15 @@ impl PositionPoller {
                     }
                 };
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok((s, signal_path, dsp_metrics, famine, transformations, progress)) => {
+                    Ok((
+                        s,
+                        signal_path,
+                        dsp_metrics,
+                        famine,
+                        transformations,
+                        progress,
+                        illisible,
+                    )) => {
                         self.playback
                             .observe_processing_progress(
                                 zone_id,
@@ -1047,7 +1060,7 @@ impl PositionPoller {
                                 bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
                             }
                         }
-                        (s, famine, progress)
+                        (s, famine, progress, illisible)
                     }
                     Err(e) => {
                         ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);
@@ -1422,10 +1435,12 @@ impl PositionPoller {
                     // renderer reporting a stale default can't keep resetting the
                     // saved volume (Fabien's Devialet Salon reverting to 50).
                     // #6541 — la limite de sécurité, comme au site principal.
+                    // #7379 — jamais sur un relevé illisible (#5662).
                     let plafond_tenu = !zone_fixed_volume
                         && !in_vol_grace
+                        && !volume_illisible
                         && self.volume_plafond_reimpose(zone_id, status.volume).await;
-                    // #6739 — jamais à la hausse, et trim retiré.
+                    // #6739 — trim retiré ; #7379 — suivi sous le plafond.
                     // #8031 — la radio n'écarte pas le 0 : une sourdine relue
                     // à 0 sur l'appareil devenait la consigne de la zone.
                     let sourdine = sourdine_8031::sourdine_en_jeu(
@@ -1437,8 +1452,9 @@ impl PositionPoller {
                         && !in_vol_grace
                         && !plafond_tenu
                         && !sourdine
+                        && !volume_illisible
                         && status.volume < 0.999
-                        && let Some(adopte) = self.releve_adoptable(
+                        && let Some(suite) = self.releve_adoptable(
                             zone_id,
                             &device_id,
                             ps.last_device_volume,
@@ -1446,23 +1462,15 @@ impl PositionPoller {
                             zone_state.volume,
                         )
                     {
-                        self.playback.set_volume(zone_id, adopte).await;
-                        // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
-                        // tombait a 0 sous 0,01 lineaire (-40 dB).
-                        let vol_pct = adopte * 100.0;
-                        let db = self.db.clone();
-                        crate::db::zone_repo::ZoneRepo::with_backend(db)
-                            .update_volume(zone_id, vol_pct)
-                            .ok();
-                        // #6008 — l'adoption se dit au journal.
-                        volume_adopte_6008::journaliser_volume_adopte(
+                        self.appliquer_la_suite_du_releve(
                             zone_id,
                             &device_id,
                             zone_state.volume,
-                            adopte,
-                        );
+                            suite,
+                        )
+                        .await;
                     }
-                    if !sourdine {
+                    if !sourdine && !volume_illisible {
                         ps.last_device_volume = Some(status.volume);
                     }
                 }
@@ -1820,8 +1828,10 @@ impl PositionPoller {
                 self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
             }
             // #6541 — la limite de sécurité, comme au site principal.
+            // #7379 — jamais sur un relevé illisible (#5662).
             let plafond_tenu = !zone_fixed_volume
                 && !in_vol_grace2
+                && !volume_illisible
                 && self.volume_plafond_reimpose(zone_id, status.volume).await;
             // #8031 — comme aux deux autres sites.
             let sourdine = sourdine_8031::sourdine_en_jeu(
@@ -1833,10 +1843,11 @@ impl PositionPoller {
                 && !in_vol_grace2
                 && !plafond_tenu
                 && !sourdine
+                && !volume_illisible
                 && status.volume > 0.001
                 && status.volume < 0.999
-                // #6739 — jamais à la hausse, et trim retiré.
-                && let Some(adopte) = self.releve_adoptable(
+                // #6739 — trim retiré ; #7379 — suivi sous le plafond.
+                && let Some(suite) = self.releve_adoptable(
                     zone_id,
                     &device_id,
                     ps.last_device_volume,
@@ -1844,21 +1855,8 @@ impl PositionPoller {
                     zone_state.volume,
                 )
             {
-                self.playback.set_volume(zone_id, adopte).await;
-                // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
-                // tombait a 0 sous 0,01 lineaire (-40 dB).
-                let vol_pct = adopte * 100.0;
-                let db = self.db.clone();
-                crate::db::zone_repo::ZoneRepo::with_backend(db)
-                    .update_volume(zone_id, vol_pct)
-                    .ok();
-                // #6008 — l'adoption se dit au journal.
-                volume_adopte_6008::journaliser_volume_adopte(
-                    zone_id,
-                    &device_id,
-                    zone_state.volume,
-                    adopte,
-                );
+                self.appliquer_la_suite_du_releve(zone_id, &device_id, zone_state.volume, suite)
+                    .await;
             }
             // Edge-triggered like the stopped/radio paths: record the reported
             // volume so a renderer stuck at a persistent default (HiFi Rose
@@ -1868,7 +1866,8 @@ impl PositionPoller {
             // (Philippe).
             // #8031 — pas pendant la sourdine : le repère reste le volume
             // d'avant, et l'appareil qui le retrouve à la levée n'a pas « bougé ».
-            if !sourdine {
+            // #7379 — un relevé illisible ne devient pas le repère du front.
+            if !sourdine && !volume_illisible {
                 ps.last_device_volume = Some(status.volume);
             }
 

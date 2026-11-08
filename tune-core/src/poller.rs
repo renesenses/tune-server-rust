@@ -62,6 +62,18 @@ static STATUS_POLL_TIMEOUT: LazyLock<Option<Duration>> = LazyLock::new(|| {
 /// concurrence avec l'orchestrateur pour ne rien gagner. Une sortie qui ne
 /// tient pas d'anneau — tout renderer réseau — rend `None` par défaut de
 /// trait.
+/// #7379 — vrai quand le volume que `output` vient de rendre est le repli de
+/// #5662 (0,5 sur une réponse DLNA illisible) et non une valeur lue. Le repli
+/// reste dans le statut pour les autres lecteurs ; le sondeur, lui, ne le
+/// prend jamais pour un geste au bouton (ni suivi, ni retour au plafond,
+/// ni repère du front #358).
+pub(crate) fn volume_releve_illisible(output: &dyn OutputTarget) -> bool {
+    // Un seul mécanisme pour toutes les sorties : le trait le dit (seconde
+    // revue de #7702 : Squeezebox, BluOS, Chromecast et OpenHome sans
+    // service Volume rendaient le même repli sans le signaler).
+    output.volume_du_statut_illisible()
+}
+
 async fn get_status_with_signal_path_bounded(
     output_arc: &Arc<Mutex<Box<dyn OutputTarget>>>,
     timeout: Option<Duration>,
@@ -73,6 +85,7 @@ async fn get_status_with_signal_path_bounded(
         Option<OutputRingStarvation>,
         Option<TransformationsReelles>,
         Option<u64>,
+        bool,
     ),
     String,
 > {
@@ -96,6 +109,9 @@ async fn get_status_with_signal_path_bounded(
             // réellement fait au flux se relève à côté de sa sonde.
             output.transformations_reelles(),
             progress,
+            // #7379 — le volume du statut est-il le repli d'une réponse
+            // illisible (#5662) ? Le sondeur ne le juge jamais.
+            volume_releve_illisible(&**output),
         ))
     };
     match timeout {
@@ -1131,7 +1147,7 @@ mod demarrage_fige_5522_tests;
 mod liste_d_un_autre_point_de_controle_7636_tests;
 
 /// #6541 — au-dessus de la limite de sécurité, le volume du renderer n'est
-/// pas adopté : il est ramené sous la limite.
+/// pas adopté : il est ramené à la limite (#7379).
 mod volume_plafond_6541;
 #[cfg(test)]
 mod volume_plafond_6541_tests;
@@ -1146,7 +1162,8 @@ mod contrat_radio_locale_6233;
 mod etat_air_6912;
 #[cfg(test)]
 mod etat_air_6912_tests;
-/// #6739 — un relevé du volume de l'appareil ne remonte jamais la consigne.
+/// #6739 — un relevé du volume de l'appareil ne fait jamais grimper la
+/// consigne par cliquet ; #7379 — il est suivi sous le plafond de suivi.
 mod releve_ne_monte_pas_6739;
 /// #6739 — ses témoins, sur le vrai sondeur et le vrai orchestrateur.
 #[cfg(test)]
@@ -1166,6 +1183,10 @@ mod volume_adopte_6008;
 /// #6008 — son banc, sur le vrai sondeur.
 #[cfg(test)]
 mod volume_adopte_6008_tests;
+/// #7379 — témoins du suivi de l'appareil sous le plafond, sur le vrai
+/// sondeur et le vrai orchestrateur (sortie factice, aucun son).
+#[cfg(test)]
+mod volume_suivi_7379_tests;
 
 #[cfg(test)]
 mod tests;

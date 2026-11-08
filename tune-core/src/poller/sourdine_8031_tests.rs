@@ -190,9 +190,11 @@ async fn la_sourdine_ne_commande_aucun_volume() {
 }
 
 /// Hors sourdine, rien ne change : une vraie baisse sur l'appareil est
-/// adoptée (#6008, #6739), une hausse ne l'est pas.
+/// adoptée (#6008, #6739). #7379 (décision du 02/11) : une hausse sous le
+/// plafond de suivi (85 % sans limite réglée) est suivie ; au-dessus, Tune
+/// ramène l'appareil au plafond.
 #[tokio::test]
-async fn hors_sourdine_une_baisse_reste_adoptee_et_une_hausse_refusee() {
+async fn hors_sourdine_une_baisse_reste_adoptee_et_une_hausse_suivie_sous_le_plafond() {
     let mut banc = Banc::monter(false).await;
     zone_a_50(&mut banc).await;
     banc.appareil_a(0.3).await;
@@ -200,7 +202,11 @@ async fn hors_sourdine_une_baisse_reste_adoptee_et_une_hausse_refusee() {
     assert!((banc.volume_en_memoire().await - 0.3).abs() < 1e-9);
     banc.appareil_a(0.8).await;
     banc.tic().await;
-    assert!((banc.volume_en_memoire().await - 0.3).abs() < 1e-9);
+    assert!((banc.volume_en_memoire().await - 0.8).abs() < 1e-9);
+    let deja = banc.appareil_a(0.95).await;
+    banc.tic().await;
+    assert!((banc.volume_en_memoire().await - 0.85).abs() < 1e-9);
+    assert_eq!(banc.commandes_depuis(deja).await, vec![0.85]);
 }
 
 /// Une baisse faite sur l'appareil PENDANT la sourdine (télécommande) est
