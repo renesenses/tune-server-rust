@@ -28,8 +28,16 @@ services:
     # l'hote n'a pas de /dev/snd. Podman/Fedora : voir « Podman » du README.
     devices:
       - /dev/snd:/dev/snd
+      # Lecteur CD de cette machine, pour l'extraction (#8141). Retirer le
+      # commentaire si l'hote a un lecteur (`ls -ln /dev/sr0`). L'image
+      # ajoute d'elle-meme le compte Tune au groupe du lecteur, quel que soit
+      # son numero (11 sous ZimaOS, 24 `cdrom` sous Debian, Synology, Unraid).
+      # - /dev/sr0:/dev/sr0
     group_add:
       - audio
+      # Seulement si le conteneur demarre avec `user:` (sans root) : le numero
+      # de groupe du lecteur sur l'hote, 4e colonne de `ls -ln /dev/sr0`.
+      # - "11"
     environment:
       # Mettre `[]` pour demarrer SANS aucun dossier de bibliotheque et
       # les choisir depuis Reglages. Un `/music` non monte est un volume
