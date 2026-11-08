@@ -400,6 +400,7 @@ async fn wifi_scan(headers: HeaderMap) -> Result<Json<Value>, AppError> {
 }
 
 async fn wifi_connect(
+    _admin: crate::auth::RequireAdmin,
     headers: HeaderMap,
     Json(body): Json<WifiConnect>,
 ) -> Result<Json<Value>, AppError> {
@@ -425,6 +426,7 @@ async fn wifi_connect(
 }
 
 async fn wifi_forget(
+    _admin: crate::auth::RequireAdmin,
     headers: HeaderMap,
     Json(body): Json<WifiForget>,
 ) -> Result<Json<Value>, AppError> {

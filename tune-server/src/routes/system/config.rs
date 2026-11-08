@@ -2987,10 +2987,22 @@ pub(super) async fn export_config(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Query(q): Query<ExportConfigQuery>,
-) -> Result<Json<Value>, AppError> {
-    tune_core::config_export::exporter(&state.backend, q.include_secrets)
-        .map(Json)
-        .map_err(|e| AppError::internal(format!("configuration export failed: {e}")))
+) -> axum::response::Response {
+    // A2 : sans authentification, n'importe quel appelant du réseau passe
+    // `RequireAdmin`. Les secrets en clair ne sortent alors jamais : seul
+    // l'export scellé par phrase de passe (`POST /system/config-backup/export`)
+    // les emporte.
+    if q.include_secrets && !crate::auth::authentification_active(&state) {
+        return crate::auth::refus_sans_authentification(
+            "Exporting secrets in clear requires authentication. \
+             Use the sealed export (POST /api/v1/system/config-backup/export).",
+        )
+        .into_response();
+    }
+    match tune_core::config_export::exporter(&state.backend, q.include_secrets) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => AppError::internal(format!("configuration export failed: {e}")).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

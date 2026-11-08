@@ -715,7 +715,55 @@ fn restart_after_migration() {
     });
 }
 
+/// A3 — l'hôte d'une URL PostgreSQL est-il cette machine ou le réseau local ?
+/// (adresse de bouclage, privée, de lien local, `localhost`, nom sans point ou
+/// en `.local`). Un socket Unix (`host=/run/postgresql`) est local.
+pub(crate) fn base_cible_locale(pg_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(pg_url) else {
+        return false;
+    };
+    // `?host=` / `?hostaddr=` remplacent l'hôte de l'URL : seul un socket
+    // Unix y est admis.
+    if url
+        .query_pairs()
+        .any(|(k, v)| (k == "host" || k == "hostaddr") && !v.starts_with('/'))
+    {
+        return false;
+    }
+    let hote = match url.host_str().filter(|h| !h.is_empty()) {
+        Some(h) => h
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase(),
+        None => {
+            // `postgresql:///base?host=/run/postgresql` : socket Unix.
+            return true;
+        }
+    };
+    // Liste d'hôtes (`a,b`) : refusée, un seul hôte est jugé.
+    if hote.contains(',') {
+        return false;
+    }
+    match hote.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V6(ip)) => {
+            let s = ip.segments()[0];
+            ip.is_loopback() || (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80
+        }
+        Err(_) => {
+            let hote = hote.trim_end_matches('.');
+            hote == "localhost"
+                || hote.ends_with(".localhost")
+                || hote.ends_with(".local")
+                || hote.ends_with(".lan")
+                || hote.ends_with(".home.arpa")
+                || !hote.contains('.')
+        }
+    }
+}
+
 pub(super) async fn migrate_database(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Query(q): Query<MigrateQuery>,
     body: Option<Json<MigrateRequest>>,
@@ -753,6 +801,17 @@ pub(super) async fn migrate_database(
             })),
         )
             .into_response();
+    }
+
+    // A3 : la copie emporte toute la table `settings`, secrets compris. Sans
+    // authentification, `RequireAdmin` laisse passer tout appelant : la base
+    // cible doit alors être sur cette machine ou sur le réseau local.
+    if !crate::auth::authentification_active(&state) && !base_cible_locale(pg_url) {
+        return crate::auth::refus_sans_authentification(
+            "Migrating to a PostgreSQL server outside the local network requires \
+             authentication.",
+        )
+        .into_response();
     }
 
     // Pre-flight: count rows to report in the response
@@ -934,5 +993,38 @@ mod tests_import {
         let motif = inspect_import_candidate(&etrangere).unwrap_err();
         assert!(motif.contains("not a Tune one"), "motif inattendu: {motif}");
         assert!(motif.contains("tracks"), "le motif doit nommer la table");
+    }
+}
+
+/// A3 : la base cible d'une migration sans authentification.
+#[cfg(test)]
+mod base_cible_locale_tests {
+    use super::base_cible_locale;
+
+    #[test]
+    fn seules_les_bases_locales_sont_admises() {
+        for ok in [
+            "postgresql://tune:x@localhost:5432/tune",
+            "postgresql://tune@127.0.0.1/tune",
+            "postgres://tune@192.168.1.20/tune",
+            "postgresql://tune@10.0.0.4/tune",
+            "postgresql://tune@[::1]/tune",
+            "postgresql://tune@[fd00::4]/tune",
+            "postgresql://tune@nas.local/tune",
+            "postgresql://tune@nas/tune",
+            "postgresql:///tune?host=/run/postgresql",
+        ] {
+            assert!(base_cible_locale(ok), "{ok}");
+        }
+        for ko in [
+            "postgresql://tune@203.0.113.5/tune",
+            "postgresql://tune@pg.example.com/tune",
+            "postgresql://tune@192.168.1.20/tune?host=203.0.113.5",
+            "postgresql://tune@192.168.1.20/tune?hostaddr=203.0.113.5",
+            "postgresql://tune@[2001:db8::1]/tune",
+            "pas une url",
+        ] {
+            assert!(!base_cible_locale(ko), "{ko}");
+        }
     }
 }

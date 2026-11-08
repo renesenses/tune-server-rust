@@ -507,7 +507,10 @@ struct MountVolumeBody {
 /// Monte une partition (par UUID, chemin stable) pour l'utiliser comme source
 /// musique — le client enchaîne ensuite sur POST /system/music-dirs/add avec
 /// le mount_path retourné (validation + scan immédiat déjà en place là-bas).
-async fn mount_volume(Json(body): Json<MountVolumeBody>) -> Result<Json<Value>, AppError> {
+async fn mount_volume(
+    _admin: crate::auth::RequireAdmin,
+    Json(body): Json<MountVolumeBody>,
+) -> Result<Json<Value>, AppError> {
     require_appliance()?;
     let inv = block_inventory().await;
     let part = inv
@@ -589,7 +592,10 @@ async fn install_status() -> Result<Json<Value>, AppError> {
     })))
 }
 
-async fn install_to_disk(Json(body): Json<InstallBody>) -> Result<Json<Value>, AppError> {
+async fn install_to_disk(
+    _admin: crate::auth::RequireAdmin,
+    Json(body): Json<InstallBody>,
+) -> Result<Json<Value>, AppError> {
     require_appliance()?;
     if body.confirm != "EFFACER" {
         return Err(AppError::bad_request("confirmation manquante (EFFACER)"));
@@ -739,6 +745,7 @@ struct RelocateBody {
 }
 
 async fn relocate(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<RelocateBody>,
 ) -> Result<Json<Value>, AppError> {
