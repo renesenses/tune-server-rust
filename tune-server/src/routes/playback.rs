@@ -1965,6 +1965,9 @@ mod saut_hors_file_4283;
 /// #4283 — `queue/jump` valide la position avant que le curseur ne bouge.
 #[cfg(test)]
 mod sortie_de_pure_recompose_le_trim_6213;
+// #8137 — la bascule PURE d'une zone en volume fixe ne commande aucun volume.
+#[cfg(test)]
+mod bascule_pure_sans_commande_de_volume_8137;
 
 /// #6526 — l'aléatoire mélange réellement la file.
 #[cfg(test)]
@@ -7592,14 +7595,23 @@ async fn set_audiophile(
     if was_full_volume && !will_be_full_volume {
         let device_id = get_zone_device_id(&state, zone_id);
         let consigne = state.playback.get_state(zone_id).await.volume;
+        // #8137 — sans commande quand la zone est en volume fixe ou que
+        // l'appareil a été relu à cette valeur : la ligne « recompose » ne
+        // s'écrit que si une commande est vraiment partie.
         match state
             .orchestrator
-            .set_volume(zone_id, consigne, device_id.as_deref())
+            .set_volume_sortie_de_pure(zone_id, consigne, device_id.as_deref())
             .await
         {
-            Ok(()) => info!(
+            Ok(envoi) if envoi.envoye() => info!(
                 zone_id,
                 consigne, "audiophile_sortie_du_verrou_volume_recompose"
+            ),
+            Ok(envoi) => info!(
+                zone_id,
+                consigne,
+                ?envoi,
+                "audiophile_sortie_du_verrou_volume_sans_commande"
             ),
             Err(error) => warn!(
                 zone_id,

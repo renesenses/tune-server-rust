@@ -1429,6 +1429,9 @@ pub struct PlaybackOrchestrator {
     /// repère de la garde contre les montées brusques ne le dépasse jamais.
     /// Voir `repere_de_hausse_6721`.
     pub(crate) niveaux_des_appareils: repere_de_hausse_6721::NiveauxDesAppareils,
+    /// #8137 — le dernier volume relu sur l'appareil de chaque zone, effacé
+    /// à chaque commande. Voir `bascule_pure_8137`.
+    pub(crate) volumes_relus: bascule_pure_8137::VolumesRelus,
     /// #2264 — la mémoire de la règle de version : choix explicites en
     /// attente, réponses des services. Voir `version_de_lecture`.
     pub(crate) versions: version_de_lecture::EtatDesVersions,
@@ -1981,6 +1984,7 @@ impl PlaybackOrchestrator {
             sources_physiques: Arc::default(),
             volume_coalesceur: volume_coalescent::CoalesceurDeVolume::default(),
             niveaux_des_appareils: Default::default(),
+            volumes_relus: Default::default(),
             versions: Default::default(),
         }
     }
@@ -2130,6 +2134,11 @@ mod dsp;
 mod repere_de_hausse_6721;
 #[cfg(test)]
 mod repere_de_hausse_6721_tests;
+// #8137 — la bascule PURE ne commande le volume que si elle change quelque chose.
+mod bascule_pure_8137;
+pub use bascule_pure_8137::{BasculePure, EnvoiDeVolume};
+#[cfg(test)]
+mod bascule_pure_8137_tests;
 mod volume_coalescent;
 #[cfg(test)]
 mod volume_coalescent_5662_tests;

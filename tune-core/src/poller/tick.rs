@@ -245,6 +245,12 @@ impl PositionPoller {
                 status.muted,
                 etat_de_zone.last_mute_set_at,
             );
+            // #8137 — le volume relu, repère de la bascule PURE (aucune
+            // commande quand l'appareil est déjà à la valeur visée).
+            if !in_startup_grace && !in_volume_grace && !sourdine && !volume_illisible {
+                self.orchestrator
+                    .noter_le_volume_relu(zone_id, status.volume);
+            }
             // #5662 — le seuil < 0,999 ci-dessous écarte un renderer à 100 % :
             // le dire au journal, une fois par épisode.
             if !zone.fixed_volume
@@ -1427,6 +1433,18 @@ impl PositionPoller {
                     let in_vol_grace = zone_state
                         .last_volume_set_at
                         .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+                    // #8137 — le volume relu, repère de la bascule PURE.
+                    if !in_vol_grace
+                        && !volume_illisible
+                        && !sourdine_8031::sourdine_en_jeu(
+                            zone_state.muted,
+                            status.muted,
+                            zone_state.last_mute_set_at,
+                        )
+                    {
+                        self.orchestrator
+                            .noter_le_volume_relu(zone_id, status.volume);
+                    }
                     // #5662 — un renderer à 100 % ignoré est dit une fois.
                     if !zone_fixed_volume && !in_vol_grace {
                         self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
@@ -1823,6 +1841,18 @@ impl PositionPoller {
             let in_vol_grace2 = zone_state
                 .last_volume_set_at
                 .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+            // #8137 — le volume relu, repère de la bascule PURE.
+            if !in_vol_grace2
+                && !volume_illisible
+                && !sourdine_8031::sourdine_en_jeu(
+                    zone_state.muted,
+                    status.muted,
+                    zone_state.last_mute_set_at,
+                )
+            {
+                self.orchestrator
+                    .noter_le_volume_relu(zone_id, status.volume);
+            }
             // #5662 — un renderer à 100 % ignoré est dit une fois.
             if !zone_fixed_volume && !in_vol_grace2 {
                 self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
