@@ -2085,6 +2085,7 @@ impl PlaybackOrchestrator {
     #[cfg(feature = "local-audio")]
     pub(super) async fn recreate_local_and_play(
         &self,
+        zone_id: i64,
         device_id: &str,
         media: &crate::outputs::traits::PlayMedia<'_>,
         start_position_ms: Option<u64>,
@@ -2144,6 +2145,14 @@ impl PlaybackOrchestrator {
         }
         let arc = { self.outputs.lock().await.get(device_id) };
         if let Some(arc) = arc {
+            // #8151 — la sortie NAÎT sans sourdine : celle de la zone lui est
+            // donnée avant la piste.
+            self.reimposer_la_sourdine_de_la_zone(
+                zone_id,
+                &arc,
+                super::sourdine_a_la_piste_8151::MomentDeLaSourdine::AvantLaPiste,
+            )
+            .await;
             let output = arc.lock().await;
             match output.play_media(media).await {
                 Ok(()) => {
@@ -2165,6 +2174,7 @@ impl PlaybackOrchestrator {
     #[cfg(not(feature = "local-audio"))]
     pub(super) async fn recreate_local_and_play(
         &self,
+        _zone_id: i64,
         device_id: &str,
         _media: &crate::outputs::traits::PlayMedia<'_>,
         _start_position_ms: Option<u64>,
@@ -2392,11 +2402,24 @@ impl PlaybackOrchestrator {
                 }
                 drop(output);
             }
+            // #8151 — la sortie connaît la sourdine de la zone avant la piste.
+            self.reimposer_la_sourdine_de_la_zone(
+                zone_id,
+                &output_arc,
+                super::sourdine_a_la_piste_8151::MomentDeLaSourdine::AvantLaPiste,
+            )
+            .await;
             let output = output_arc.lock().await;
             match output.play_media(media).await {
                 Ok(()) => {
                     drop(output);
                     info!(device_id = %used_device_id, "output_play_sent");
+                    self.reimposer_la_sourdine_de_la_zone(
+                        zone_id,
+                        &output_arc,
+                        super::sourdine_a_la_piste_8151::MomentDeLaSourdine::ApresLeDemarrage,
+                    )
+                    .await;
                     (true, None)
                 }
                 Err(e) => {
@@ -2421,7 +2444,7 @@ impl PlaybackOrchestrator {
             }
         } else if device_id.starts_with("local:") {
             let issue = self
-                .recreate_local_and_play(device_id, media, start_position_ms)
+                .recreate_local_and_play(zone_id, device_id, media, start_position_ms)
                 .await;
             // La sortie vient de NAÎTRE : le branchement fait plus haut n'avait
             // rien trouvé à brancher (#4384).

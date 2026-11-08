@@ -2137,6 +2137,10 @@ mod volume_openhome_sans_attendre_7633_tests;
 // #7841 — l'échelle de volume OpenHome lue, la sourdine sans le verrou.
 #[cfg(test)]
 mod volume_openhome_echelle_7841_tests;
+// #8151 — la sourdine de la zone tient au démarrage de chaque piste.
+mod sourdine_a_la_piste_8151;
+#[cfg(test)]
+mod sourdine_a_la_piste_8151_tests;
 pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]
