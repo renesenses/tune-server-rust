@@ -89,6 +89,8 @@ pub(super) async fn import_roon(
 
     tokio::spawn(async move {
         let track_repo = TrackRepo::with_backend(backend.clone());
+        // C1 : aucun chemin hors des dossiers de musique.
+        let racines = racines_admises(&backend);
         let artist_repo = ArtistRepo::with_backend(backend.clone());
         let album_repo = AlbumRepo::with_backend(backend.clone());
         let settings = SettingsRepo::with_backend(backend.clone());
@@ -145,6 +147,12 @@ pub(super) async fn import_roon(
 
                                     if let Some(ref fp) = file_path
                                         && track_repo.get_by_path(fp).ok().flatten().is_some()
+                                    {
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                    if let Some(ref fp) = file_path
+                                        && !chemin_admis(fp, &racines)
                                     {
                                         skipped += 1;
                                         continue;
@@ -269,6 +277,8 @@ pub(super) async fn import_plex(
         let client = tune_core::http::client::shared();
         let settings = SettingsRepo::with_backend(backend.clone());
         let track_repo = TrackRepo::with_backend(backend.clone());
+        // C1 : aucun chemin hors des dossiers de musique.
+        let racines = racines_admises(&backend);
         let artist_repo = ArtistRepo::with_backend(backend.clone());
         let album_repo = AlbumRepo::with_backend(backend.clone());
 
@@ -354,6 +364,12 @@ pub(super) async fn import_plex(
                 // Skip if we already have this track by file_path
                 if let Some(ref fp) = file_path
                     && track_repo.get_by_path(fp).ok().flatten().is_some()
+                {
+                    skipped += 1;
+                    continue;
+                }
+                if let Some(ref fp) = file_path
+                    && !chemin_admis(fp, &racines)
                 {
                     skipped += 1;
                     continue;
@@ -1029,7 +1045,11 @@ async fn lancer_import_de_pistes(
 /// aucun export CSV réel de Roon n'a encore été recoupé contre elles. C'est
 /// pourquoi un en-tête non reconnu sort ici en **422 nommé, avec l'en-tête
 /// reçu** — et non en import silencieux de zéro piste.
-pub(super) async fn import_roon_entree(State(state): State<AppState>, req: Request) -> Response {
+pub(super) async fn import_roon_entree(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    req: Request,
+) -> Response {
     let options = match options_dimport(&req) {
         Ok(options) => options,
         Err(refus) => return refus,
@@ -1082,7 +1102,11 @@ pub(super) async fn import_roon_entree(State(state): State<AppState>, req: Reque
 ///
 /// Même défaut, même correctif que Roon : l'écran y téléverse aussi un fichier.
 /// Le chemin JSON (interrogation d'un serveur Plex par son jeton) est inchangé.
-pub(super) async fn import_plex_entree(State(state): State<AppState>, req: Request) -> Response {
+pub(super) async fn import_plex_entree(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    req: Request,
+) -> Response {
     let options = match options_dimport(&req) {
         Ok(options) => options,
         Err(refus) => return refus,
@@ -1171,7 +1195,11 @@ pub(super) struct OptionsEcoutesM3u {
 /// `fuzzy_matched_truncated`). Refus nommés : `400 plays_hors_bornes`,
 /// `400 requete_illisible`, `400 fichier_absent`, `415 televersement_attendu`,
 /// `500 index_bibliotheque_illisible`.
-pub(super) async fn import_m3u_plays(State(state): State<AppState>, req: Request) -> Response {
+pub(super) async fn import_m3u_plays(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    req: Request,
+) -> Response {
     let options = match Query::<OptionsEcoutesM3u>::try_from_uri(req.uri()) {
         Ok(Query(o)) => o,
         Err(e) => {
@@ -1323,6 +1351,38 @@ fn ecoutes_depuis_m3u(
     }))
 }
 
+/// C1 — les dossiers de musique, sous leur forme canonique quand elle existe.
+fn racines_admises(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Vec<std::path::PathBuf> {
+    super::get_music_dirs_list(backend)
+        .iter()
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            let p = std::path::PathBuf::from(d);
+            std::fs::canonicalize(&p).unwrap_or(p)
+        })
+        .collect()
+}
+
+/// C1 — un chemin importé n'est admis que s'il est absolu, sans `..`, et
+/// sous l'un des dossiers de musique (forme canonique s'il existe : un lien
+/// symbolique qui sort de la bibliothèque est refusé). Sans dossier de
+/// musique, aucun chemin n'est admis.
+pub(crate) fn chemin_admis(chemin: &str, racines: &[std::path::PathBuf]) -> bool {
+    use std::path::{Component, Path};
+    let p = Path::new(chemin);
+    if !p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return false;
+    }
+    let reel = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    racines.iter().any(|r| reel.starts_with(r))
+}
+
 /// Écrire des pistes importées : artiste, album, puis la piste.
 ///
 /// Partagée par le chemin JSON de `import_roon` et par les deux téléversements,
@@ -1337,6 +1397,8 @@ fn ecrire_les_pistes(
     entrees: &[ImportTrackEntry],
 ) -> (i32, i32, Vec<String>) {
     let track_repo = TrackRepo::with_backend(backend.clone());
+    // C1 : aucun chemin hors des dossiers de musique.
+    let racines = racines_admises(backend);
     let artist_repo = ArtistRepo::with_backend(backend.clone());
     let album_repo = AlbumRepo::with_backend(backend.clone());
 
@@ -1348,6 +1410,12 @@ fn ecrire_les_pistes(
         // Skip if file_path exists and already in DB
         if let Some(ref fp) = entry.file_path
             && track_repo.get_by_path(fp).ok().flatten().is_some()
+        {
+            skipped += 1;
+            continue;
+        }
+        if let Some(ref fp) = entry.file_path
+            && !chemin_admis(fp, &racines)
         {
             skipped += 1;
             continue;
@@ -1386,7 +1454,7 @@ fn ecrire_les_pistes(
     (imported, skipped, errors)
 }
 
-pub(super) async fn import_playlists_file() -> Json<Value> {
+pub(super) async fn import_playlists_file(_admin: crate::auth::RequireAdmin) -> Json<Value> {
     let task_id = uuid_v4();
     Json(json!({
         "status": "accepted",
@@ -1407,6 +1475,7 @@ pub(super) async fn import_playlists_file() -> Json<Value> {
 /// ÉCRIT, là où `ImportReport` dit ce qui a été RECONNU. Les deux réponses à
 /// deux questions différentes, aucune ne remplace l'autre.
 pub(super) async fn import_status(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Json<Value> {
@@ -1464,6 +1533,7 @@ pub(super) struct ImportJriverRequest {
 }
 
 pub(super) async fn import_jriver(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<ImportJriverRequest>,
 ) -> impl IntoResponse {
@@ -1523,6 +1593,8 @@ fn parse_jriver_xml(
     let artist_repo = ArtistRepo::with_backend(backend.clone());
     let album_repo = AlbumRepo::with_backend(backend.clone());
     let track_repo = TrackRepo::with_backend(backend.clone());
+    // C1 : aucun chemin hors des dossiers de musique.
+    let racines = racines_admises(backend);
 
     let mut imported = 0;
     let mut skipped = 0;
@@ -1578,6 +1650,12 @@ fn parse_jriver_xml(
                         skipped += 1;
                         continue;
                     }
+                    if let Some(ref fp) = file_path
+                        && !chemin_admis(fp, &racines)
+                    {
+                        skipped += 1;
+                        continue;
+                    }
 
                     let artist_id = artist_repo
                         .get_or_create(&artist_name, None, None)
@@ -1620,7 +1698,12 @@ mod tests {
     use tune_core::event_bus::TuneEvent;
 
     fn etat() -> AppState {
-        AppState::new(":memory:", 0, Default::default()).unwrap()
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        // C1 : les pistes de ces témoins sont sous `/music`.
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("music_dirs", r#"["/music"]"#)
+            .unwrap();
+        state
     }
 
     /// Attendre `library.updated` sur le bus, ou renoncer.
@@ -1709,7 +1792,11 @@ mod tests {
         let body = ImportJriverRequest {
             xml_path: xml.to_string_lossy().to_string(),
         };
-        let _ = import_jriver(State(state.clone()), Json(body)).await;
+        // C1 : la piste est sous un dossier de musique déclaré.
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("music_dirs", r#"["/music"]"#)
+            .unwrap();
+        let _ = import_jriver(crate::auth::RequireAdmin, State(state.clone()), Json(body)).await;
 
         let ev = attendre_library_updated(&mut rx).await.expect(
             "l'import JRiver doit annoncer `library.updated` : `import.completed` \
@@ -1834,3 +1921,73 @@ mod tests {
 #[cfg(test)]
 #[path = "import_ecoutes_tests_7763.rs"]
 mod ecoutes_tests_7763;
+
+/// C1 : aucun chemin importé hors des dossiers de musique.
+#[cfg(test)]
+mod chemins_admis_tests {
+    use super::*;
+
+    #[test]
+    fn un_chemin_hors_des_dossiers_de_musique_est_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let racines = vec![std::fs::canonicalize(dir.path()).unwrap()];
+        let dedans = dir.path().join("album/01.flac");
+        std::fs::create_dir_all(dedans.parent().unwrap()).unwrap();
+        std::fs::write(&dedans, b"x").unwrap();
+        assert!(chemin_admis(dedans.to_str().unwrap(), &racines));
+        // Un fichier absent mais sous la racine reste admis (import Roon).
+        let absent = dir.path().join("album/02.flac");
+        assert!(chemin_admis(absent.to_str().unwrap(), &racines));
+        for refuse in [
+            "/etc/passwd".to_string(),
+            "relatif/01.flac".to_string(),
+            format!("{}/../../etc/passwd", dir.path().display()),
+        ] {
+            assert!(!chemin_admis(&refuse, &racines), "{refuse}");
+        }
+        // Sans dossier de musique, rien n'est admis.
+        assert!(!chemin_admis(dedans.to_str().unwrap(), &[]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn un_lien_symbolique_qui_sort_de_la_bibliotheque_est_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let racines = vec![std::fs::canonicalize(dir.path()).unwrap()];
+        let lien = dir.path().join("piege.flac");
+        std::os::unix::fs::symlink("/etc/hostname", &lien).unwrap();
+        assert!(!chemin_admis(lien.to_str().unwrap(), &racines));
+    }
+
+    #[test]
+    fn l_import_saute_les_pistes_hors_bibliotheque() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let racine = dir.path().to_string_lossy().to_string();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&vec![&racine]).unwrap(),
+            )
+            .unwrap();
+        let entree = |titre: &str, chemin: &str| ImportTrackEntry {
+            title: titre.into(),
+            artist: None,
+            album: None,
+            file_path: Some(chemin.into()),
+            duration_ms: None,
+            track_number: None,
+            genre: None,
+        };
+        let dedans = format!("{racine}/a/01.flac");
+        let (ecrites, sautees, echecs) = ecrire_les_pistes(
+            &state.backend,
+            "roon_import",
+            &[entree("dedans", &dedans), entree("dehors", "/etc/passwd")],
+        );
+        assert_eq!((ecrites, sautees), (1, 1), "{echecs:?}");
+        let pistes = TrackRepo::with_backend(state.backend.clone());
+        assert!(pistes.get_by_path("/etc/passwd").unwrap().is_none());
+        assert!(pistes.get_by_path(&dedans).unwrap().is_some());
+    }
+}

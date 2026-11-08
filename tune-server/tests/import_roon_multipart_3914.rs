@@ -62,6 +62,11 @@ const XML_PLEX: &str = r#"<MediaContainer><Track title="Time" grandparentTitle="
 
 async fn app() -> axum::Router {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    // Les pistes du CSV sont sous `/music` : un dossier de musique déclaré,
+    // sans quoi l'import les saute (chemins hors bibliothèque refusés).
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("music_dirs", r#"["/music"]"#)
+        .unwrap();
     tune_server::routes::router(state)
 }
 

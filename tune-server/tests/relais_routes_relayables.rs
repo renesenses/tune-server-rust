@@ -82,7 +82,9 @@ async fn sans_authentification_le_relais_ne_sert_que_l_ecoute() {
         ),
         (
             Method::GET,
-            "/api/v1/system/config/export?include_secrets=true",
+            // Sans `include_secrets` : en clair, il est refusé à tout appelant
+            // quand l'authentification est coupée, relais ou non.
+            "/api/v1/system/config/export",
             None,
         ),
         (Method::GET, "/api/v1/cloud/bridge/status", None),

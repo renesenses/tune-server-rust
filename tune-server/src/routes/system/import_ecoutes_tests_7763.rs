@@ -24,7 +24,12 @@ use tune_core::db::track_repo::TrackRepo;
 use crate::state::AppState;
 
 fn etat() -> AppState {
-    AppState::new(":memory:", 0, Default::default()).unwrap()
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    // C1 : les pistes de ces témoins sont sous `/music`.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("music_dirs", r#"["/music"]"#)
+        .unwrap();
+    state
 }
 
 /// Une piste de la bibliothèque, sans artiste (l'historique la rapproche par

@@ -2080,3 +2080,9 @@ path = "tests/licence_retrait_libere_la_machine_7726.rs"
 [[test]]
 name = "durcissement_configuration"
 path = "tests/durcissement_configuration.rs"
+
+# Routes d'administration : un témoin par route, authentification active et
+# coupée. `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "durcissement_routes_admin"
+path = "tests/durcissement_routes_admin.rs"
