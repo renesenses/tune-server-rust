@@ -63,6 +63,9 @@ pub mod openhome;
 pub mod openhome_pins;
 #[cfg(any(target_os = "windows", test))]
 pub(crate) mod periode_exclusive_4357;
+/// #8171 — la conduite du chemin partagé quand le périphérique d'une zone est
+/// introuvable. Hors de `local-audio`, même raison que le module suivant.
+pub mod peripherique_introuvable;
 /// Les pseudo-périphériques ALSA (le PCM `null`, la carte `snd-dummy`). Hors
 /// de `local-audio` à dessein : la porte `test` de la CI ne compile pas cette
 /// feature pour `tune-core`, et cette décision-ci doit pouvoir y être jugée.

@@ -3707,12 +3707,13 @@ fn record_exclusive_open_failure(
 
 /// Pourquoi le chemin cpal PARTAGÉ n'a ouvert aucun périphérique.
 ///
-/// `find_device_with_fallback` ne rend `None` que dans UN cas : le
-/// périphérique réglé sur la zone est introuvable ET l'hôte n'expose aucune
-/// sortie par défaut sur laquelle se rabattre — c'est
-/// `audio_device_not_found_no_default_available`, la seule des quatre issues
-/// de cette fonction qui n'ouvre rien. Dès qu'un repli existe on passe par
-/// `audio_device_not_found_falling_back_to_default` et la lecture continue.
+/// `find_device_with_fallback` rend `None` quand le périphérique réglé sur la
+/// zone est introuvable et que rien ne doit le remplacer : sous Windows, par
+/// décision (#8171, `audio_device_not_found_refused`) ; ailleurs, quand l'hôte
+/// n'expose aucune sortie par défaut sur laquelle se rabattre
+/// (`audio_device_not_found_no_default_available`). Hors Windows, dès qu'un
+/// repli existe on passe par `audio_device_not_found_falling_back_to_default`
+/// et la lecture continue.
 ///
 /// Les deux consommateurs de ce `None` — le flux WAV, donc la bibliothèque
 /// locale, et le flux compressé décodé — s'arrêtaient sans rien dire, alors
@@ -3746,9 +3747,10 @@ impl SharedDeviceResolution {
             Self::WavStreamNotFound => "le flux PCM",
             Self::CompressedStreamNotFound => "le flux décodé",
         };
-        format!(
-            "Sortie « {device} » : le périphérique est introuvable et le système n'expose aucune sortie par défaut sur laquelle se rabattre ; {flux} n'a été envoyé nulle part. Rebranchez le périphérique ou choisissez une autre sortie pour cette zone"
-        )
+        // #8171 — un seul message pour les deux refus : sous Windows (aucun
+        // repli, par décision) et ailleurs quand le système n'expose aucune
+        // sortie par défaut.
+        crate::outputs::peripherique_introuvable::message_peripherique_introuvable(device, flux)
     }
 }
 
@@ -9404,6 +9406,11 @@ mod backend_display_tests;
 /// la FAMILLE entière testable ailleurs que sur la machine du testeur.
 #[cfg(test)]
 mod backend_fallback_tests;
+
+/// #8171 — DAC introuvable sous Windows : re-liaison par identifiant, sinon
+/// refus, jamais la sortie par défaut. Listes de périphériques fictives.
+#[cfg(test)]
+mod peripherique_introuvable_8171_tests;
 
 #[cfg(test)]
 mod backends_supportes_tests;
