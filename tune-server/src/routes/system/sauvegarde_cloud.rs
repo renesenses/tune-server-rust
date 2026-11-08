@@ -132,7 +132,42 @@ fn issue_json(i: &sc::Issue) -> Value {
         sc::Issue::Rien(raison) => json!({ "done": false, "reason": raison }),
         sc::Issue::Deposee(m) => json!({ "done": true, "backup": m }),
         sc::Issue::Echec(e) => json!({ "done": false, "error": e }),
+        sc::Issue::TropVolumineux {
+            octets,
+            max_octets,
+            plus_longues_playlists,
+        } => json!({
+            "done": false,
+            "error": "payload_too_large",
+            "payload_bytes": octets,
+            "max_bytes": max_octets,
+            "detail": sc::Issue::conseil_taille(*octets, *max_octets, plus_longues_playlists),
+        }),
     }
+}
+
+/// #7286 : un refus pour taille dit quelle limite, de combien elle est
+/// dépassée et quoi alléger, au lieu d'un 502 `backup_failed`.
+fn trop_volumineux(
+    octets: usize,
+    max_octets: Option<u64>,
+    plus_longues_playlists: &[(String, usize)],
+) -> Response {
+    let playlists: Vec<Value> = plus_longues_playlists
+        .iter()
+        .map(|(nom, n)| json!({ "name": nom, "tracks": n }))
+        .collect();
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({
+            "error": "payload_too_large",
+            "payload_bytes": octets,
+            "max_bytes": max_octets,
+            "largest_playlists": playlists,
+            "detail": sc::Issue::conseil_taille(octets, max_octets, plus_longues_playlists),
+        })),
+    )
+        .into_response()
 }
 
 // ── POST /system/config-backup/cloud/disable ────────────────────────
@@ -173,6 +208,11 @@ pub(super) async fn backup_now(_admin: RequireAdmin, State(state): State<AppStat
         .into_response(),
         sc::Issue::Rien("no_key") => erreur(StatusCode::CONFLICT, "not_enabled"),
         sc::Issue::Rien(r) => erreur(StatusCode::CONFLICT, r),
+        sc::Issue::TropVolumineux {
+            octets,
+            max_octets,
+            plus_longues_playlists,
+        } => trop_volumineux(octets, max_octets, &plus_longues_playlists),
         sc::Issue::Echec(e) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({ "error": "backup_failed", "detail": e })),
@@ -324,8 +364,15 @@ pub fn spawn(state: &AppState) {
                 sc::Issue::Echec(e) => {
                     tracing::debug!(error = %e, "sauvegarde_cloud_automatique_echec")
                 }
+                sc::Issue::TropVolumineux { octets, .. } => {
+                    tracing::debug!(octets, "sauvegarde_cloud_automatique_trop_volumineuse")
+                }
                 sc::Issue::Rien(_) => {}
             }
         }
     });
 }
+
+#[cfg(test)]
+#[path = "sauvegarde_cloud_tests_7286.rs"]
+mod sauvegarde_cloud_tests_7286;

@@ -6,6 +6,10 @@ use tracing::{info, warn};
 
 const MAX_BACKUPS: usize = 5;
 
+/// Sauvegarde locale d'une base PostgreSQL par `pg_dump` (#7288).
+#[path = "db_backup_postgres.rs"]
+pub mod postgres;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupInfo {
     pub filename: String,
@@ -173,20 +177,24 @@ pub fn list_backups(db_path: &str) -> Vec<BackupInfo> {
         Some(p) => p.join("backups"),
         None => return vec![],
     };
-    if !backup_dir.exists() {
-        return vec![];
-    }
-
     let stem = db_file
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("tune_server");
     let ext = db_file.extension().and_then(|s| s.to_str()).unwrap_or("db");
+    list_backups_in(&backup_dir, stem, ext)
+}
+
+/// Les fichiers `<stem>_*.<ext>` de `backup_dir`, du plus récent au plus ancien.
+fn list_backups_in(backup_dir: &Path, stem: &str, ext: &str) -> Vec<BackupInfo> {
+    if !backup_dir.exists() {
+        return vec![];
+    }
 
     let pattern = format!("{stem}_");
     let suffix = format!(".{ext}");
 
-    let mut backups: Vec<(PathBuf, BackupInfo)> = fs::read_dir(&backup_dir)
+    let mut backups: Vec<(PathBuf, BackupInfo)> = fs::read_dir(backup_dir)
         .ok()
         .into_iter()
         .flatten()
