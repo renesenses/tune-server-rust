@@ -517,4 +517,6 @@ async fn zones_groupees_le_suivi_reste_a_la_zone_du_geste_7379() {
 fn un_type_de_sortie_inconnu_n_est_pas_suivi_vers_le_haut_7379() {
     use super::releve_ne_monte_pas_6739::suivi_a_la_hausse_pour;
     assert!(!suivi_a_la_hausse_pour(None));
+    // Troisième revue : la sortie locale d'un agent Tune est logicielle.
+    assert!(!suivi_a_la_hausse_pour(Some("tune_agent")));
 }

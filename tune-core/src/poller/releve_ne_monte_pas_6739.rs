@@ -258,8 +258,11 @@ impl PositionPoller {
 /// [`crate::audio::volume_scale::EchelleDeVolume::de_la_sortie`]).
 /// Un type de sortie inconnu (`NULL` en base) n'est pas suivi vers le haut :
 /// la prudence.
+/// La sortie locale d'un agent Tune (`tune_agent`) est elle aussi à volume
+/// logiciel : jamais suivie vers le haut (troisième revue de #7702).
 pub(super) fn suivi_a_la_hausse_pour(output_type: Option<&str>) -> bool {
     output_type.is_some()
+        && output_type != Some(crate::orchestrator::TYPE_SORTIE_AGENT_TUNE)
         && crate::audio::volume_scale::EchelleDeVolume::de_la_sortie(output_type)
             != crate::audio::volume_scale::EchelleDeVolume::Perceptive
 }

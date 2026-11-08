@@ -193,6 +193,59 @@ mod tests {
         task.abort();
     }
 
+    /// #7379 (troisième revue, B3a) — en « silence UPnP », évènements
+    /// vivants : tant que l'appareil n'a poussé AUCUN `Volume`, le volume
+    /// rendu (repli, ou dernier volume posé par Tune) est signalé au sondeur ;
+    /// dès qu'un `Volume` est poussé, le drapeau retombe — y compris après un
+    /// sondage illisible (sinon les vrais volumes seraient ignorés, #6541).
+    #[tokio::test]
+    async fn en_silence_upnp_sans_volume_pousse_le_statut_le_signale_7379() {
+        use crate::outputs::traits::OutputTarget;
+        // Aucune requête ne part en silence : un hôte injoignable suffit.
+        let host = "http://127.0.0.1:9".to_string();
+        let out = DlnaOutput::new(
+            "Silence 7379".into(),
+            "uuid:silence-7379".into(),
+            host.clone(),
+            format!("{host}/av/control"),
+            format!("{host}/rc/control"),
+            None,
+        )
+        .with_upnp_silence(true);
+        // Un sondage illisible a laissé le drapeau levé.
+        out.dernier_releve_illisible.store(true, Ordering::Relaxed);
+        {
+            let mut es = out.event_state.lock().await;
+            es.alive = true;
+            es.last_update = Some(std::time::Instant::now());
+            es.transport_state = Some(TransportState::Stopped);
+            es.volume = None;
+        }
+        let statut = out.get_status().await.unwrap();
+        assert_eq!(statut.volume, REPLI_ILLISIBLE);
+        assert!(
+            out.volume_du_statut_illisible(),
+            "silence, aucun Volume poussé, rien de posé : repli à signaler"
+        );
+        // Tune a posé 30 % : la valeur rendue reste la sienne, pas une
+        // observation.
+        out.dernier_volume_pct.store(30, Ordering::Relaxed);
+        let statut = out.get_status().await.unwrap();
+        assert!((statut.volume - 0.3).abs() < 1e-9);
+        assert!(
+            out.volume_du_statut_illisible(),
+            "le dernier volume posé n'est pas lu"
+        );
+        // L'appareil pousse son volume : drapeau baissé, vrai volume rendu.
+        out.event_state.lock().await.volume = Some(40);
+        let statut = out.get_status().await.unwrap();
+        assert!((statut.volume - 0.4).abs() < 1e-9, "{}", statut.volume);
+        assert!(
+            !out.volume_du_statut_illisible(),
+            "un Volume poussé est une observation : le drapeau doit retomber"
+        );
+    }
+
     /// Une réponse illisible donne UNE ligne WARN avec sa raison et son
     /// extrait, quel que soit le nombre de lectures ; le repli 0,5 est
     /// inchangé ; le retour à une réponse lisible écrit la fin d'épisode.

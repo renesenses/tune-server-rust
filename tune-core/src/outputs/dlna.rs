@@ -3440,10 +3440,17 @@ impl OutputTarget for DlnaOutput {
                 // la réponse est illisible. Interroger l'appareil ici
                 // trahirait le silence promis.
                 None => match self.dernier_volume_pct.load(Ordering::Relaxed) {
-                    u64::MAX => 0.5,
+                    u64::MAX => volume_illisible_5662::REPLI_ILLISIBLE,
                     v => v as f64 / 100.0,
                 },
             };
+            // #7379 (troisième revue, B3a) — sans `Volume` poussé par
+            // l'appareil, la valeur rendue n'est pas une observation (repli,
+            // ou dernier volume posé par Tune) : le sondeur ne la juge pas.
+            // Dès qu'un `Volume` est poussé, le drapeau retombe — un drapeau
+            // resté levé ferait ignorer les vrais volumes (#6541).
+            self.dernier_releve_illisible
+                .store(evt_volume.is_none(), Ordering::Relaxed);
             // #6008 — même en silence : un saut de volume se corrige. Aucune
             // action ne part tant que l'appareil ne remonte pas son volume.
             let volume = match evt_volume {
