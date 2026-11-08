@@ -1698,7 +1698,12 @@ mod tests {
     use tune_core::event_bus::TuneEvent;
 
     fn etat() -> AppState {
-        AppState::new(":memory:", 0, Default::default()).unwrap()
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        // C1 : les pistes de ces témoins sont sous `/music`.
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("music_dirs", r#"["/music"]"#)
+            .unwrap();
+        state
     }
 
     /// Attendre `library.updated` sur le bus, ou renoncer.
