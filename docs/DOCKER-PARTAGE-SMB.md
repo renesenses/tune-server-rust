@@ -76,16 +76,33 @@ un dossier de musique de l'image : relancez une analyse de la bibliothèque. Si
 vous liez le partage ailleurs, ajoutez ce dossier aux dossiers de musique dans
 les réglages de Tune.
 
+## Si le conteneur ne démarre plus après l'ajout de `rslave`
+
+Avec `rslave` (ou `rshared`), Docker vérifie que le dossier de l'hôte est
+monté en propagation partagée. Sinon, il **refuse de démarrer le conteneur**,
+avec un message du type :
+
+```
+path /volume1/music is mounted on /volume1 but it is not a shared or slave mount
+```
+
+C'est probablement le premier obstacle sur un NAS. Pour le lever :
+
+- `findmnt -o TARGET,PROPAGATION --target /volume1/music` affiche la
+  propagation du montage qui porte le dossier ; il faut `shared`.
+- Sinon, `mount --make-rshared /volume1` (en root sur l'hôte) le rend partagé,
+  jusqu'au prochain redémarrage de l'hôte. Il faut donc le refaire à chaque
+  démarrage, par exemple par une tâche planifiée au démarrage. Sur DSM, ce
+  comportement n'a pas été vérifié pour chaque version.
+- Relancez ensuite le conteneur.
+
 ## Si le dossier reste vide
 
 - **Redémarrez le conteneur** une fois le partage monté sur l'hôte. Docker
   reprend au démarrage les montages déjà présents sous le dossier lié, même
   sans `rslave`.
-- La propagation ne passe que si le montage du dossier source est lui-même
-  partagé sur l'hôte. `findmnt -o TARGET,PROPAGATION --target /volume1/music`
-  doit afficher `shared`. Sinon, `mount --make-rshared /volume1` (en root sur
-  l'hôte) le rend partagé jusqu'au prochain redémarrage. Sur DSM, ce
-  comportement n'a pas été vérifié pour chaque version.
+- Vérifiez que le volume porte bien `rslave` : sans lui, un partage monté sur
+  l'hôte après le démarrage du conteneur n'y apparaît pas.
 - Vérifiez depuis le conteneur : `docker exec tune-server ls /music`.
 
 ## Et `--cap-add SYS_ADMIN` ?
