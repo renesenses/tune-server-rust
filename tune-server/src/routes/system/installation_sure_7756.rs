@@ -693,9 +693,7 @@ mod tests {
                 0o755,
                 "l'ancien binaire n'est plus exécutable"
             );
-            let sortie = std::process::Command::new(&self.binaire)
-                .output()
-                .expect("l'ancien binaire ne s'exécute plus");
+            let sortie = executer_quand_libre(&self.binaire);
             assert_eq!(
                 String::from_utf8_lossy(&sortie.stdout),
                 "tune-server 1.0.0-rc9\n"
@@ -704,6 +702,25 @@ mod tests {
                 !self.binaire.with_extension("new").exists(),
                 "le .new refusé est resté sur le disque"
             );
+        }
+    }
+
+    /// Exécute l'ancien binaire comme `lancer_quand_libre` exécute le `.new` :
+    /// en relançant sur `ETXTBSY`. Écrit par `Installation::nouvelle`, il peut
+    /// lui aussi être tenu en écriture par le `fork` d'un test voisin (#8012).
+    /// Toute autre erreur fait échouer le test.
+    fn executer_quand_libre(chemin: &Path) -> std::process::Output {
+        let debut = std::time::Instant::now();
+        loop {
+            match std::process::Command::new(chemin).output() {
+                Err(e)
+                    if e.kind() == io::ErrorKind::ExecutableFileBusy
+                        && debut.elapsed() < DELAI_FICHIER_OCCUPE =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                autre => return autre.expect("l'ancien binaire ne s'exécute plus"),
+            }
         }
     }
 
@@ -851,7 +868,10 @@ mod tests {
     }
 
     /// L'essai `--version` réel : un binaire qui échoue est refusé, un
-    /// binaire qui répond comme le serveur est accepté.
+    /// binaire qui répond comme le serveur est accepté. Le `.new` est exécuté
+    /// par `lancer_quand_libre`, l'ancien par `executer_quand_libre` : un
+    /// descripteur d'écriture hérité par le `fork` d'un test voisin ne fait
+    /// plus échouer ce test par « Text file busy » (#8012).
     #[test]
     fn l_essai_version_refuse_un_binaire_qui_ne_repond_pas() {
         let inst = Installation::nouvelle();
