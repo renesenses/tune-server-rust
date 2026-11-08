@@ -66,9 +66,13 @@ pub fn tache_suspendable(id: &str) -> Option<Tache> {
         // des crédits, le type de sortie (#4767) et les crédits par disque
         // (`TACHE_CREDITS_RELEASES`, #4862) : `attendre_la_reprise` /
         // `attendre_son_tour` sur `Tache::Enrichissement`.
-        "enrich_all" | "bios" | "credits_enrich_auto" | "types_de_sortie" | "credits_releases" => {
-            Some(Tache::Enrichissement)
-        }
+        // #8077 — `apports_qobuz` : la passe des apports Qobuz, même frontière.
+        "enrich_all"
+        | "bios"
+        | "credits_enrich_auto"
+        | "types_de_sortie"
+        | "credits_releases"
+        | "apports_qobuz" => Some(Tache::Enrichissement),
         // `album_artwork` : la passe des pochettes d'albums (inscrite sous
         // `artwork` avant l'écran des images, 01/11/2026) ; elle attend son
         // tour sur `Tache::ImagesArtistes`, comme les portraits.

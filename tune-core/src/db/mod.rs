@@ -6,6 +6,8 @@ pub mod album_distinct_repo;
 pub mod album_doublons;
 pub mod album_metadata_repo;
 pub mod album_repo;
+/// #8077 — les apports d'un service à un album local (SQLite 142 / PG 108).
+pub mod apports_service;
 pub mod artist_repo;
 pub mod backend;
 /// Contrôle parental, étape 2 (#7974) : bail d'écoute et temps écouté.
