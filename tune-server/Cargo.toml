@@ -1495,6 +1495,12 @@ path = "tests/pg_pochette_lecture_bornee.rs"
 name = "exemplaires_par_repertoire_4907"
 path = "tests/exemplaires_par_repertoire_4907.rs"
 
+# #8106 — une compilation faite main (un dossier, un titre, des artistes de
+# piste différents, sans ALBUMARTIST) reste un album, par le vrai scan.
+[[test]]
+name = "compilations_regroupees_8106"
+path = "tests/compilations_regroupees_8106.rs"
+
 # #6917 — ne dédoublonner que les copies d'une même racine de musique : le
 # vrai scan et le nettoyage, option allumée et éteinte, SQLite et PostgreSQL.
 [[test]]
@@ -1728,6 +1734,19 @@ required-features = ["postgres"]
 [[test]]
 name = "pg_requete_avancee_7872"
 path = "tests/pg_requete_avancee_7872.rs"
+required-features = ["postgres"]
+
+# #8077 — les apports Qobuz d'un album local (rapprochement, garde « compléter
+# seulement », retrait), sur SQLite puis sur PostgreSQL (migration 108), par le
+# vrai routeur et une doublure de l'API Qobuz. `autotests = false` : sans ces
+# cibles, jamais compilés.
+[[test]]
+name = "apports_qobuz_8077"
+path = "tests/apports_qobuz_8077.rs"
+
+[[test]]
+name = "pg_apports_qobuz_8077"
+path = "tests/pg_apports_qobuz_8077.rs"
 required-features = ["postgres"]
 
 # #6257 — l'ordre des étiquettes sur PostgreSQL : la 091 pose `tags.position`

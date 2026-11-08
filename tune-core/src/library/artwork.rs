@@ -379,7 +379,7 @@ pub(crate) fn plus_grande_image_des_dossiers(dossiers: &[&Path]) -> Option<PathB
 }
 
 /// Largeur et hauteur d'une image, lues dans son seul en-tête.
-fn dimensions_de_l_image(chemin: &Path) -> Option<(u32, u32)> {
+pub fn dimensions_de_l_image(chemin: &Path) -> Option<(u32, u32)> {
     let fichier = std::fs::File::open(&*extended_path(chemin)).ok()?;
     image::ImageReader::new(std::io::BufReader::new(fichier))
         .with_guessed_format()
