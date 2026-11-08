@@ -2064,6 +2064,8 @@ pub use confirmation_navigateur_6066::SignalDuLecteur;
 
 /// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
 mod reenumeration_avant_refus;
+// #8152 — l'épisode repris sur un renderer réseau : Seek une fois en lecture.
+mod reprise_d_episode_8152;
 mod transport;
 pub use transport::IssueDePause;
 #[cfg(test)]

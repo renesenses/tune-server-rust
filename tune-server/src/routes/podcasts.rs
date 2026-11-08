@@ -1054,10 +1054,29 @@ pub(super) async fn play_episode(
         "podcast_episode_play"
     );
     if echec.is_none() {
-        if let Some(seek_ms) = body.seek_ms.filter(|v| *v > 0) {
+        // #8152 — un épisode terminé, ou une position nulle, repart du début.
+        let reprise = body.seek_ms.filter(|v| {
+            *v > 0
+                && !tune_core::db::listening_resume::episode_fini(
+                    (*v).min(i64::MAX as u64) as i64,
+                    body.duration_ms.unwrap_or(0).min(i64::MAX as u64) as i64,
+                )
+        });
+        if let Some(seek_ms) = reprise {
+            info!(
+                zone_id,
+                position_ms = seek_ms,
+                reseau,
+                "podcast_reprise_position"
+            );
+            // #8152 — sur un renderer réseau, le Seek envoyé dans la foulée du
+            // Play partait avant que l'appareil ouvre le flux (Eversolo, .18) :
+            // il l'acquittait puis lisait depuis l'octet 0. L'orchestrateur
+            // l'envoie désormais une fois le transport en lecture ; la sortie
+            // locale garde `seek` (recréation du flux à la position).
             if let Err(e) = state
                 .orchestrator
-                .seek(zone_id, seek_ms, device_id.as_deref())
+                .reprendre_l_episode_a_sa_position(zone_id, device_id.as_deref(), seek_ms)
                 .await
             {
                 state.playback.stop(zone_id).await;
@@ -1620,6 +1639,9 @@ mod reprise_navigateur_7354_tests;
 #[path = "podcasts/historique_7965_tests.rs"]
 mod historique_7965_tests;
 
+#[cfg(test)]
+#[path = "podcasts/reprise_dlna_8152_tests.rs"]
+mod reprise_dlna_8152_tests;
 #[cfg(test)]
 #[path = "podcasts/reprise_par_adresse_8085_tests.rs"]
 mod reprise_par_adresse_8085_tests;
