@@ -1,0 +1,43 @@
+# Branche jetable : prouve que les cibles ARM « cross » de release.yml compilent
+# sur le lot gelé rc11 (2e6ab6f7e, versé par #8163) avant de taguer v1.0.0-rc11.
+# La CI des PR ne construit pas musl. À supprimer après le tag.
+name: Preuve musl v1.0.0-rc11
+on:
+  push:
+    branches: ["test/preuve-musl-rc11-0811"]
+permissions:
+  contents: read
+jobs:
+  cross:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
+          - target: aarch64-unknown-linux-gnu
+            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
+    env:
+      TUNE_VERSION: 1.0.0-rc11
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-ubuntu-22.04-${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+      - name: Build (cross) — ligne identique à release.yml
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
+      - run: file target/${{ matrix.target }}/release/tune-server
+      - name: Sortie locale dans l'ELF (garde #3621)
+        run: strings target/${{ matrix.target }}/release/tune-server | grep -q snd_pcm_open
+      - name: Le binaire se declare 1.0.0-rc11
+        run: |
+          n=$(strings target/${{ matrix.target }}/release/tune-server | grep -c '1\.0\.0-rc11' || true)
+          echo "occurrences de 1.0.0-rc11 : $n"
+          test "$n" -gt 0
