@@ -231,11 +231,16 @@ async fn export_sans_secrets_ne_laisse_rien_passer() {
 async fn export_avec_secrets_reste_complet_pour_l_administrateur() {
     let state = new_state();
     semer_les_reglages(&state);
-    enable_auth(&state);
+    // Authentification active SANS remplacer le secret semé : le jeton de
+    // l'administrateur est signé avec lui.
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("auth_enabled", "true")
+        .unwrap();
+    let admin = tune_server::auth::sign_jwt(1, "admin", FAUX_JWT).unwrap();
     let (st, corps) = get_body(
         &state,
         "/api/v1/system/config/export?include_secrets=true",
-        Some(&tok("admin", 1)),
+        Some(&admin),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
