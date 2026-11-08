@@ -46,4 +46,5 @@ Tune 1.0.0-rc11, undécima versión candidata de Tune 1.0.
 - **Servicios de streaming**: la búsqueda de Spotify devuelve resultados, un rechazo ya no es mudo y los favoritos superan las 50 pistas; TIDAL › Favoritos ya no congela Tune; una cuenta de Qobuz sin favoritos devuelve rápido su lista vacía; una pista convertida arranca en Safari.
 - **Red y almacenamiento**: el descubrimiento se reanuda cuando la red llega después de Tune; un montaje SMB que falla dice por qué, también en Docker; la copia de seguridad culmina en PostgreSQL; la extracción de CD rechaza un destino lleno o no escribible; Tune deja los puertos Squeezebox a un servidor Lyrion de la misma máquina.
 - **Pantallas**: la pantalla Conciertos se abre sin licencia; «Desagrupar todo» reaparece; Reproduciendo ahora sigue el cambio de álbum; una sesión de streaming caducada conserva su pestaña «Reconectar»; Nueva alarma sigue visible.
+- **Raspberry Pi 5**: el ventilador del Active Cooler vuelve a girar (nueva imagen de Tune OS).
 - **Seguridad**: correcciones de refuerzo.

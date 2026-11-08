@@ -46,4 +46,5 @@ Tune 1.0.0-rc11, den elfte versionskandidaten av Tune 1.0.
 - **Streamingtjänster**: Spotify-sökningen ger resultat, ett avslag är inte längre tyst och favoriterna går förbi 50 spår; TIDAL › Favoriter fryser inte längre Tune; ett Qobuz-konto utan favoriter ger snabbt en tom lista; ett konverterat spår startar i Safari.
 - **Nätverk och lagring**: upptäckten återupptas när nätverket dyker upp efter Tune; en SMB-montering som misslyckas anger varför, även under Docker; säkerhetskopian lyckas på PostgreSQL; CD-extraktionen avvisar en full eller icke skrivbar destination; Tune lämnar Squeezebox-portarna till en Lyrion-server på samma maskin.
 - **Vyer**: Konserter öppnas utan licens; ”Avgruppera alla” visas igen; Spelas nu följer albumbyte; en utgången streamingsession behåller fliken ”Återanslut”; Nytt alarm förblir synligt.
+- **Raspberry Pi 5**: fläkten i Active Cooler snurrar igen (ny Tune OS-avbildning).
 - **Säkerhet**: härdningsrättelser.

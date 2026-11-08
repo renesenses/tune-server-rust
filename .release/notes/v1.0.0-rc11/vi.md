@@ -38,4 +38,5 @@ Tune 1.0.0-rc11, bản ứng viên phát hành thứ mười một của Tune 1.
 - **Sửa lỗi dịch vụ phát trực tuyến**: tìm kiếm Spotify trả về kết quả, việc bị từ chối không còn im lặng và mục yêu thích vượt quá 50 bài; TIDAL › Yêu thích không còn làm Tune đơ; tài khoản Qobuz không có mục yêu thích trả về danh sách rỗng nhanh chóng; bài đã chuyển đổi bắt đầu phát trong Safari.
 - **Sửa lỗi mạng và lưu trữ**: việc dò tìm tiếp tục khi mạng xuất hiện sau Tune; kết nối SMB thất bại cho biết lý do, kể cả trong Docker; sao lưu thành công trên PostgreSQL; trích xuất CD từ chối nơi lưu đã đầy hoặc không ghi được; Tune nhường các cổng Squeezebox cho máy chủ Lyrion trên cùng máy.
 - **Sửa lỗi màn hình**: màn hình Hòa nhạc mở được mà không cần giấy phép; “Bỏ nhóm tất cả” hiện lại; Đang phát theo kịp việc đổi album; phiên phát trực tuyến hết hạn giữ lại thẻ “Kết nối lại”; Báo thức mới luôn hiển thị.
+- **Sửa lỗi Raspberry Pi 5**: quạt của Active Cooler quay trở lại (ảnh Tune OS mới).
 - **Bảo mật**: các bản sửa lỗi gia cố.

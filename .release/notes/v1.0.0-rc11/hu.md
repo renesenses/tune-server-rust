@@ -38,4 +38,5 @@ Tune 1.0.0-rc11, a Tune 1.0 tizenegyedik kiadásjelöltje.
 - **Hibajavítás, streamingszolgáltatások**: a Spotify-keresés találatot ad, az elutasítás már nem néma, a kedvencek átlépik az 50 számot; a TIDAL › Kedvencek már nem fagyasztja le a Tune-t; a kedvencek nélküli Qobuz-fiók gyorsan adja vissza az üres listát; az átalakított szám elindul Safariban.
 - **Hibajavítás, hálózat és tárolás**: a felderítés folytatódik, ha a hálózat a Tune után érkezik; a sikertelen SMB-csatolás megmondja az okot, Dockerben is; a biztonsági mentés sikerül PostgreSQL-en; a CD-kimásolás elutasít egy megtelt vagy nem írható célt; a Tune a Squeezebox-portokat a gépen futó Lyrion-szervernek hagyja.
 - **Hibajavítás, képernyők**: a Koncertek képernyő licenc nélkül nyílik; a „Csoportosítás megszüntetése” újra megjelenik; a Most szól követi az albumváltást; a lejárt streaming-munkamenet megtartja az „Újracsatlakozás” fület; az Új ébresztő látható marad.
+- **Hibajavítás, Raspberry Pi 5**: az Active Cooler ventilátora újra forog (új Tune OS-lemezkép).
 - **Biztonság**: megerősítő javítások.
