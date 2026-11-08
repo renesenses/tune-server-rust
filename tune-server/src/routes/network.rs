@@ -1633,16 +1633,22 @@ fn obstacle_du_lancement(
     euid: u32,
     conteneur: Option<&str>,
 ) -> (&'static str, String) {
+    if let Some(moteur) = conteneur {
+        // En conteneur, quelle que soit la raison du lancement raté, le
+        // remède est le même : monter sur l'hôte. Le détail reste lisible
+        // quand ce n'est pas un simple « introuvable ».
+        let conseil = conseil_en_conteneur(moteur);
+        let message = if e.kind() == std::io::ErrorKind::NotFound {
+            conseil
+        } else {
+            format!("{conseil} (Détail : {e})")
+        };
+        return ("montage_impossible_en_conteneur", message);
+    }
     if e.kind() != std::io::ErrorKind::NotFound {
         return (
             "lancement_impossible",
             format!("Impossible de lancer la commande de montage : {e}"),
-        );
-    }
-    if let Some(moteur) = conteneur {
-        return (
-            "montage_impossible_en_conteneur",
-            conseil_en_conteneur(moteur),
         );
     }
     if euid != 0 {
@@ -1683,6 +1689,18 @@ fn obstacle_du_systeme(stderr: &str, conteneur: Option<&str>) -> (&'static str, 
         return (
             "privileges_insuffisants",
             format!("{conseil} (Détail : {stderr})"),
+        );
+    }
+    // `mount error(13): Permission denied` : le partage a refusé le nom
+    // d'utilisateur ou le mot de passe (fil 6336) ; la réponse du système
+    // reste citée, c'est la vraie cause.
+    if smb::est_refus_d_authentification(stderr) {
+        return (
+            "identifiants_refuses",
+            format!(
+                "Le partage a refusé le nom d'utilisateur ou le mot de passe. Vérifiez-les \
+                 (et le domaine s'il en faut un), puis réessayez. (Détail : {stderr})"
+            ),
         );
     }
     let detail = if stderr.is_empty() {
@@ -4261,6 +4279,40 @@ mod tests_echec_du_montage_8069 {
         // Sans rien sur stderr, le message n'est pas vide pour autant.
         let (_, v) = corps(Ok(Ok(sortie(32, ""))), 0, None).await;
         assert!(affichable(&v).contains("aucun détail"));
+    }
+
+    #[tokio::test]
+    async fn un_refus_d_identifiants_le_dit_et_garde_la_cause() {
+        let (statut, v) = corps(
+            Ok(Ok(sortie(32, "mount error(13): Permission denied"))),
+            0,
+            None,
+        )
+        .await;
+        assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(v["error"], "identifiants_refuses");
+        let m = affichable(&v);
+        assert!(m.contains("mot de passe"), "{m}");
+        assert!(m.contains("Permission denied"), "la vraie cause : {m}");
+    }
+
+    #[tokio::test]
+    async fn en_conteneur_un_autre_echec_de_lancement_donne_aussi_le_conseil() {
+        // Par exemple un TUNE_SUDO_BIN qui pointe vers un fichier non exécutable.
+        let refuse = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let (_, v) = corps(Ok(Err(refuse)), 1000, Some("docker")).await;
+        assert_eq!(v["error"], "montage_impossible_en_conteneur");
+        let m = affichable(&v);
+        assert!(m.contains("rslave"), "{m}");
+        assert!(
+            m.contains("Détail"),
+            "le détail du système reste lisible : {m}"
+        );
+
+        // Hors conteneur, le cas reste celui d'avant.
+        let refuse = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let (_, v) = corps(Ok(Err(refuse)), 1000, None).await;
+        assert_eq!(v["error"], "lancement_impossible");
     }
 
     #[tokio::test]
