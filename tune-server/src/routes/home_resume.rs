@@ -341,14 +341,25 @@ mod route_tests {
             response.status().is_success(),
             "la reprise podcast doit réussir sans son"
         );
-        let output = state.outputs.lock().await.get("mock-reprise").unwrap();
-        let output = output.lock().await;
-        let mock = output
-            .as_any()
-            .downcast_ref::<tune_core::outputs::mock::MockOutput>()
-            .unwrap();
+        // #8152 — sur un renderer réseau, le Seek de reprise d'un épisode part
+        // d'une tâche détachée, une fois le transport en lecture : on l'attend.
+        let arc = state.outputs.lock().await.get("mock-reprise").unwrap();
+        let mut seeks = Vec::new();
+        for _ in 0..60 {
+            seeks = arc
+                .lock()
+                .await
+                .as_any()
+                .downcast_ref::<tune_core::outputs::mock::MockOutput>()
+                .unwrap()
+                .seek_calls();
+            if !seeks.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert_eq!(
-            mock.seek_calls(),
+            seeks,
             vec![39000],
             "la route doit reprendre 17 secondes avant la position mémorisée"
         );
