@@ -810,6 +810,36 @@ pub(crate) fn bio_editoriale_de(
     })
 }
 
+/// #8129 — le HTML de la bio d'une réponse `/artist/get` (le même champ que
+/// [`bio_editoriale_de`]).
+pub(crate) fn html_de_bio(data: &serde_json::Value) -> Option<String> {
+    let bio = &data["biography"];
+    bio["content"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| bio["summary"].as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// #8129 — le HTML de la présentation d'une réponse `album/get`, avec le
+/// titre de l'album et le nom de son artiste.
+pub(crate) fn html_de_presentation(data: &serde_json::Value) -> Option<HtmlEditorial> {
+    let html = data["description"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())?;
+    let noms = [data["title"].as_str(), data["artist"]["name"].as_str()]
+        .into_iter()
+        .flatten()
+        .filter(|n| !n.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    Some(HtmlEditorial {
+        html: html.to_string(),
+        noms,
+    })
+}
+
 /// La langue du magasin d'un compte, depuis l'objet `user` de la connexion :
 /// `language_code` s'il y est, sinon la partie langue de `store`
 /// (`fr-fr`, `gb-en` : pays puis langue).
@@ -3468,11 +3498,32 @@ impl StreamingService for QobuzService {
     /// name-matched local artist ») est gardée par `if let Ok(…)` — elle n'a
     /// donc JAMAIS tourné.
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
+        Ok(self.get_artist_avec_bio_html(artist_id).await?.0)
+    }
+
+    /// #8129 — la même fiche, avec le HTML de sa bio : ses liens deviennent
+    /// des segments (`bio_qobuz`).
+    async fn get_artist_avec_bio_html(
+        &self,
+        artist_id: &str,
+    ) -> Result<(StreamArtist, Option<String>), TuneError> {
         let data = self
             .api_get_avec_statut("/artist/get", &[("artist_id", artist_id)])
             .await
             .map_err(erreur_de_fiche)?;
-        Ok(Self::map_artist(&data))
+        Ok((Self::map_artist(&data), html_de_bio(&data)))
+    }
+
+    /// #8129 — `album/get` sort du cache rempli par la fiche.
+    async fn presentation_album_html(
+        &self,
+        album_id: &str,
+    ) -> Result<Option<HtmlEditorial>, TuneError> {
+        let data = self
+            .detail_album(album_id)
+            .await
+            .map_err(TuneError::Other)?;
+        Ok(html_de_presentation(&data))
     }
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {

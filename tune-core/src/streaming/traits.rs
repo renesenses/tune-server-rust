@@ -545,6 +545,14 @@ pub struct StreamCredit {
 /// ([`crate::streaming::presentation_album::texte_de_presentation`]). Aucun
 /// client n'a donc de balisage à interpréter. `language` est la langue que le
 /// service annonce pour ce texte (`fr`, `en`…), quand il la donne.
+/// #8129 — un texte éditorial de service en HTML d'origine, avec les noms de
+/// la page qui le montre (titre de l'album, nom de l'artiste).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlEditorial {
+    pub html: String,
+    pub noms: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamAlbumDescription {
     pub description: String,
@@ -1164,6 +1172,25 @@ pub trait StreamingService: Send + Sync {
     /// L'identifiant de l'UNIQUE artiste du service qui porte exactement ce
     /// nom. Zéro ou plusieurs : `Ok(None)`.
     async fn artiste_par_nom_exact(&self, _nom: &str) -> Result<Option<String>, TuneError> {
+        Ok(None)
+    }
+
+    /// #8129 — la fiche d'un artiste ET le HTML d'origine de sa bio, pour en
+    /// garder les liens (`bio` reste le texte). Un seul appel au service.
+    /// Par défaut : la fiche, sans HTML.
+    async fn get_artist_avec_bio_html(
+        &self,
+        artist_id: &str,
+    ) -> Result<(StreamArtist, Option<String>), TuneError> {
+        Ok((self.get_artist(artist_id).await?, None))
+    }
+
+    /// #8129 — le HTML d'origine de la présentation d'un album et les noms de
+    /// la page (titre, artiste). Par défaut : rien.
+    async fn presentation_album_html(
+        &self,
+        _album_id: &str,
+    ) -> Result<Option<HtmlEditorial>, TuneError> {
         Ok(None)
     }
 

@@ -203,13 +203,28 @@ pub struct LienInterne {
     pub id: i64,
 }
 
+/// #8129 — un lien vers la page d'un artiste ou d'un album CHEZ UN SERVICE
+/// (Qobuz), que Tune ouvre dans sa propre fiche de service. `id` est
+/// l'identifiant du service, en texte (un album Qobuz a un identifiant
+/// alphanumérique).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct LienDeService {
+    pub service: String,
+    #[serde(rename = "type")]
+    pub genre: GenreDeLien,
+    pub id: String,
+}
+
 /// Un morceau de la bio : du texte seul, du texte avec un lien interne
-/// (`lien`), ou du texte avec un lien externe (`url`), jamais les deux.
+/// (`lien`), avec un lien vers une fiche de service (`lien_service`, #8129),
+/// ou avec un lien externe (`url`) ; jamais deux à la fois.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BioSegment {
     pub texte: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lien: Option<LienInterne>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lien_service: Option<LienDeService>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
@@ -243,32 +258,45 @@ pub fn url_autorisee(brute: &str) -> Option<String> {
 /// retirées, entités non décodées) : c'est ce texte qu'on retrouvera ensuite
 /// dans la bio en texte brut.
 pub fn liens_depuis_html(html: &str) -> Vec<LienExterne> {
-    let ancre = regex::Regex::new(
-        r#"(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>(.*?)</a\s*>"#,
-    )
-    .expect("regex des ancres");
     let balise = regex::Regex::new(r"<[^>]+>").expect("regex des balises");
     let mut vus = HashSet::new();
     let mut liens = Vec::new();
-    for c in ancre.captures_iter(html) {
-        let href = c
-            .get(1)
-            .or_else(|| c.get(2))
-            .map(|m| m.as_str())
-            .unwrap_or("");
-        let Some(url) = url_autorisee(&href.replace("&amp;", "&")) else {
+    for (href, contenu) in ancres(html) {
+        let Some(url) = url_autorisee(&href) else {
             continue;
         };
-        let texte = balise
-            .replace_all(c.get(3).map(|m| m.as_str()).unwrap_or(""), "")
-            .trim()
-            .to_string();
+        let texte = balise.replace_all(contenu, "").trim().to_string();
         if texte.is_empty() || !vus.insert(url.clone()) {
             continue;
         }
         liens.push(LienExterne { texte, url });
     }
     liens
+}
+
+/// Les ancres `<a href>` d'un HTML de source : (`href` avec `&amp;` décodé,
+/// contenu HTML de l'ancre), dans l'ordre du texte.
+pub(crate) fn ancres(html: &str) -> Vec<(String, &str)> {
+    static ANCRE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>(.*?)</a\s*>"#,
+        )
+        .expect("regex des ancres")
+    });
+    ANCRE
+        .captures_iter(html)
+        .map(|c| {
+            let href = c
+                .get(1)
+                .or_else(|| c.get(2))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            (
+                href.replace("&amp;", "&"),
+                c.get(3).map(|m| m.as_str()).unwrap_or(""),
+            )
+        })
+        .collect()
 }
 
 /// Minuscules, sans diacritiques : « Björk » et « bjork » se rejoignent.
@@ -416,6 +444,14 @@ impl IndexDesNoms {
         }
     }
 
+    /// L'entité de la bibliothèque que ce nom désignerait dans une bio, s'il
+    /// y en a une seule (#8129 : sur une fiche de service, l'artiste ou
+    /// l'album de la page n'est pas lié vers son homonyme local).
+    pub fn lien_du_nom(&self, nom: &str) -> Option<LienInterne> {
+        let (cle, _) = cle_retenue(nom)?;
+        *self.noms.get(&cle)?
+    }
+
     pub fn len(&self) -> usize {
         self.noms.len()
     }
@@ -486,15 +522,53 @@ pub fn segments_de_la_bio(
     exclus: &[LienInterne],
     externes: &[LienExterne],
 ) -> Vec<BioSegment> {
+    segments_avec_liens_de_service(texte, index, exclus, &[], externes)
+}
+
+/// #8129 — [`segments_de_la_bio`], avec en plus les liens du HTML d'origine
+/// qui désignent une fiche de service (texte du lien, cible). Ils passent en
+/// premier — c'est la source qui les a posés —, à la première occurrence
+/// libre de leur texte, une fois par cible ; les noms de la bibliothèque et
+/// les liens externes se placent ensuite, hors de leurs zones.
+pub fn segments_avec_liens_de_service(
+    texte: &str,
+    index: &IndexDesNoms,
+    exclus: &[LienInterne],
+    de_service: &[(String, LienDeService)],
+    externes: &[LienExterne],
+) -> Vec<BioSegment> {
     enum Cible {
         Interne(LienInterne),
+        Service(LienDeService),
         Externe(String),
     }
-    let mut zones: Vec<(usize, usize, Cible)> = index
+    fn libre<T>(zones: &[(usize, usize, T)], d: usize, f: usize) -> bool {
+        zones.iter().all(|(zd, zf, _)| f <= *zd || d >= *zf)
+    }
+    let mut zones: Vec<(usize, usize, Cible)> = Vec::new();
+    let mut cibles = HashSet::new();
+    for (t, lien) in de_service {
+        if t.is_empty() || cibles.contains(lien) {
+            continue;
+        }
+        if let Some((d, t)) = texte
+            .match_indices(t.as_str())
+            .find(|(d, t)| libre(&zones, *d, d + t.len()))
+        {
+            cibles.insert(lien.clone());
+            zones.push((d, d + t.len(), Cible::Service(lien.clone())));
+        }
+    }
+    let internes: Vec<_> = index
         .liens_internes(texte, exclus)
         .into_iter()
-        .map(|(d, f, l)| (d, f, Cible::Interne(l)))
+        .filter(|(d, f, _)| libre(&zones, *d, *f))
         .collect();
+    zones.extend(
+        internes
+            .into_iter()
+            .map(|(d, f, l)| (d, f, Cible::Interne(l))),
+    );
     let mut urls = HashSet::new();
     for e in externes {
         let Some(url) = url_autorisee(&e.url) else {
@@ -503,11 +577,10 @@ pub fn segments_de_la_bio(
         if e.texte.is_empty() || urls.contains(&url) {
             continue;
         }
-        let libre = texte.match_indices(e.texte.as_str()).find(|(d, t)| {
-            let f = d + t.len();
-            zones.iter().all(|(zd, zf, _)| f <= *zd || *d >= *zf)
-        });
-        if let Some((d, t)) = libre {
+        let place = texte
+            .match_indices(e.texte.as_str())
+            .find(|(d, t)| libre(&zones, *d, d + t.len()));
+        if let Some((d, t)) = place {
             urls.insert(url.clone());
             zones.push((d, d + t.len(), Cible::Externe(url)));
         }
@@ -521,16 +594,19 @@ pub fn segments_de_la_bio(
             segments.push(BioSegment {
                 texte: texte[curseur..d].to_string(),
                 lien: None,
+                lien_service: None,
                 url: None,
             });
         }
-        let (lien, url) = match cible {
-            Cible::Interne(l) => (Some(l), None),
-            Cible::Externe(u) => (None, Some(u)),
+        let (lien, lien_service, url) = match cible {
+            Cible::Interne(l) => (Some(l), None, None),
+            Cible::Service(l) => (None, Some(l), None),
+            Cible::Externe(u) => (None, None, Some(u)),
         };
         segments.push(BioSegment {
             texte: texte[d..f].to_string(),
             lien,
+            lien_service,
             url,
         });
         curseur = f;
@@ -539,6 +615,7 @@ pub fn segments_de_la_bio(
         segments.push(BioSegment {
             texte: texte[curseur..].to_string(),
             lien: None,
+            lien_service: None,
             url: None,
         });
     }
@@ -557,6 +634,62 @@ pub fn charger_index(db: &Arc<dyn DbBackend>) -> Result<IndexDesNoms, String> {
     let artistes = paires("SELECT id, name FROM artists")?;
     let albums = paires("SELECT id, title FROM albums")?;
     Ok(IndexDesNoms::construire(artistes, albums))
+}
+
+/// Au-delà, l'index partagé est relu même si la bibliothèque n'a ni gagné ni
+/// perdu d'entrée (un artiste renommé).
+const DUREE_DE_L_INDEX: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Ce qui change quand on ajoute ou retire un artiste ou un album.
+fn signature_de_la_bibliotheque(db: &Arc<dyn DbBackend>) -> Vec<i64> {
+    db.query_one(
+        "SELECT (SELECT COUNT(*) FROM artists), (SELECT COALESCE(MAX(id), 0) FROM artists), \
+         (SELECT COUNT(*) FROM albums), (SELECT COALESCE(MAX(id), 0) FROM albums)",
+        &[],
+    )
+    .ok()
+    .flatten()
+    .map(|cols| cols.iter().map(|c| c.as_i64().unwrap_or(-1)).collect())
+    .unwrap_or_default()
+}
+
+/// L'index d'une base, gardé tant que la bibliothèque n'a pas changé (nombre
+/// et plus grand identifiant des artistes et des albums) et au plus
+/// [`DUREE_DE_L_INDEX`]. Partagé par les bios de la bibliothèque (#7910) et
+/// celles des services (#8129) : un `Arc` neuf veut dire « index rebâti ».
+pub fn index_partage(db: &Arc<dyn DbBackend>) -> Arc<IndexDesNoms> {
+    use std::sync::{Mutex, OnceLock, Weak};
+    use std::time::Instant;
+    /// Un `Weak` garde l'allocation : l'adresse ne peut pas être reprise par
+    /// une autre base tant que l'entrée existe (bases de test successives).
+    type Entree = (Weak<dyn DbBackend>, Vec<i64>, Instant, Arc<IndexDesNoms>);
+    static INDEX: OnceLock<Mutex<Vec<Entree>>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| Mutex::new(Vec::new()));
+    let signature = signature_de_la_bibliotheque(db);
+    let ici = Arc::downgrade(db);
+    {
+        let mut entrees = index.lock().unwrap_or_else(|e| e.into_inner());
+        entrees.retain(|(base, ..)| base.strong_count() > 0);
+        if let Some((_, sig, bati, i)) = entrees.iter().find(|(b, ..)| Weak::ptr_eq(b, &ici))
+            && *sig == signature
+            && bati.elapsed() < DUREE_DE_L_INDEX
+        {
+            return i.clone();
+        }
+    }
+    // Le verrou n'est jamais tenu pendant la lecture de la bibliothèque : une
+    // grosse base ferait attendre toutes les bios, de toutes les bases.
+    let neuf = Arc::new(charger_index(db).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "bio_segments_index_failed");
+        IndexDesNoms::default()
+    }));
+    let mut entrees = index.lock().unwrap_or_else(|e| e.into_inner());
+    let entree = (ici.clone(), signature, Instant::now(), neuf.clone());
+    match entrees.iter().position(|(b, ..)| Weak::ptr_eq(b, &ici)) {
+        Some(p) => entrees[p] = entree,
+        None => entrees.push(entree),
+    }
+    neuf
 }
 
 /// Empreinte stable (FNV-1a 64 bits) d'un texte de bio.
