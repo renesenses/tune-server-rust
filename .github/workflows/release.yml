@@ -177,7 +177,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding","dst"]}
-            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
+            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -188,7 +188,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding","dst"]}
-            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -380,7 +380,7 @@ jobs:
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -394,12 +394,12 @@ jobs:
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
         # plugin-catalog: {"features":"all","base":["postgres","plugins-wasm","audio-embedding","dst"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,assistant-ia,collection-physique,aes67,mon-theme
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
 
       # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
       # pas seulement dans la ligne `--features` qui l'a construit.
@@ -481,33 +481,48 @@ jobs:
           VERIF_CLOUD_RELAY
       # AirPlay 2 sender daemon (GPL, spawned as a subprocess) bundled next to
       # tune-server so AirPlay 2 works on native installs, not just Docker
-      # (#700 / Bilou #1135). Built from a pinned rev of our fork.
+      # (#700 / Bilou #1135). Built from a pinned rev of our fork by
+      # scripts/build-airplay-daemon.py, the same recipe as docker.yml.
       #
-      # Best-effort PER TARGET: build the real binary or ship NOTHING — never a
-      # placeholder. An empty stub would make daemon_available() return true and
-      # route AirPlay to a broken daemon instead of falling back to AirPlay 1.
-      # If the build fails (e.g. the vendored C on a given toolchain) the artifact
-      # still ships, just without AirPlay 2. Cross targets (arm64 Linux) skipped.
+      # #8112 : les cibles ARM Linux etaient SAUTEES (`if: !matrix.cross`) et
+      # un echec ne levait qu'un avertissement. Mesure sur la rc10 publiee :
+      # `tune-server-v1.0.0-rc10-linux-aarch64.tar.gz` ne contient pas
+      # `airplay-daemon` (l'etape est « skipped » dans le run 41564878347),
+      # alors que l'archive linux-x86_64 le porte. L'image Tune OS du
+      # Raspberry Pi installe CETTE archive telle quelle : un Pi ne parlait
+      # qu'AirPlay 1, et une enceinte AirPlay 2 repondait 403
+      # `airplay2_pairing_required`.
+      #
+      # Desormais : construit sur TOUTES les cibles, `cross` pour les ARM
+      # Linux comme tune-server et librespot. Un echec fait ECHOUER le job, sur
+      # toutes les cibles, musl comprise (compilee dans la CI de la PR #8114 :
+      # 10 183 464 octets). Jamais de fichier vide : un stub ferait croire a
+      # daemon_available() qu'un daemon existe.
       - name: Build airplay-daemon
-        if: "!matrix.cross"
         shell: bash
         run: |
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            # Meme miroir, meme risque de blocage que « Install ALSA dev » —
-            # et ici l'echec n'est pas fatal, le daemon est optionnel. On borne
-            # donc sans reprise : si apt pend, on passe sans AirPlay 2 plutot
-            # que de retenir la release entiere.
-            timeout 200 sudo apt-get install -y --no-install-recommends cmake clang \
-              || echo "::warning::apt indisponible — airplay-daemon sera absent de cet artefact"
+          CROSS=()
+          if [ "${{ matrix.cross }}" = "true" ]; then CROSS=(--cross); fi
+          if python scripts/build-airplay-daemon.py --target ${{ matrix.target }} \
+               --output "$RUNNER_TEMP/apd" --work "$RUNNER_TEMP/apd-src" "${CROSS[@]}"; then
+            exit 0
           fi
-          if cargo install --git https://github.com/renesenses/airplay2-rs \
-               --rev 83a7def6ab39d3709fa47a40eb90993b64afe9b4 \
-               airplay-daemon --target ${{ matrix.target }} \
-               --root "$RUNNER_TEMP/apd" --locked; then
-            echo "airplay-daemon built for ${{ matrix.target }}"
-          else
-            echo "::warning::airplay-daemon failed to build for ${{ matrix.target }} — this artifact will fall back to AirPlay 1"
-          fi
+          echo "::error::airplay-daemon n'a pas compile pour ${{ matrix.target }} : cette archive partirait sans AirPlay 2 (#8112)."
+          exit 1
+
+      # #8112 : l'archive aarch64 (celle de l'image Raspberry Pi) doit PORTER
+      # un airplay-daemon ARM 64 bits, pas seulement l'avoir construit. On lit
+      # l'en-tete ELF, sans l'executer.
+      - name: Verify airplay-daemon is an aarch64 binary
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          BIN="$RUNNER_TEMP/apd/bin/airplay-daemon"
+          test -s "$BIN" || { echo "::error::airplay-daemon absent ou vide pour linux-aarch64 (#8112)"; exit 1; }
+          file "$BIN"
+          file "$BIN" | grep -q 'ARM aarch64' \
+            || { echo "::error::airplay-daemon n'est pas un ELF ARM aarch64 (#8112)"; exit 1; }
+          ls -l "$BIN"
 
       # #6872: same pinned source, features and notices on every shipped target.
       - uses: taiki-e/install-action@v2
@@ -903,15 +918,53 @@ jobs:
             FileClose `$0
 
             ; Start menu
+            ; #7637 - l'entree principale « Tune Server » et le raccourci du
+            ; Bureau lancent le serveur SANS fenetre de terminal (l'interface
+            ; se pilote par le navigateur). La console reste disponible, pour
+            ; le depannage, par une entree distincte.
             CreateDirectory "`$SMPROGRAMS\Tune Server"
-            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server.lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server.lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server (avec console, depannage).lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
             CreateShortcut "`$SMPROGRAMS\Tune Server\Uninstall.lnk" "`$INSTDIR\uninstall.exe"
-            ; #6253 - console reduite le temps du detachement, puis fermee.
-            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server (sans console).lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
             CreateShortcut "`$SMPROGRAMS\Tune Server\Quitter Tune Server.lnk" "`$SYSDIR\taskkill.exe" "/F /IM tune-server.exe" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
-            CreateShortcut "`$DESKTOP\Tune Server.lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
+            ; Journal du serveur (pas de console a rouvrir une fois cache).
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Journal de Tune Server.lnk" "`$WINDIR\notepad.exe" '"`$LOCALAPPDATA\TuneServer\tune-server.log"'
+            ; Ancien raccourci de la rc7 a la rc9, devenu l'entree principale.
+            Delete "`$SMPROGRAMS\Tune Server\Tune Server (sans console).lnk"
+            CreateShortcut "`$DESKTOP\Tune Server.lnk" "`$INSTDIR\start-tune-server-sans-console.bat" "" "`$INSTDIR\tune-server.exe" 0 SW_SHOWMINIMIZED
 
             WriteUninstaller "`$INSTDIR\uninstall.exe"
+
+            ; #7371 - regle de pare-feu ENTRANTE "Tune" pour tune-server.exe,
+            ; profil PRIVE seulement (decision de Bertrand du 30/10/2026).
+            ; L'installeur reste par utilisateur, sans droits administrateur :
+            ; seule cette etape est elevee (UAC, une fois). Une regle par
+            ; programme couvre TCP et UDP sur tous les ports que Tune ouvre :
+            ; HTTP 8888 (interface, flux servis aux renderers DLNA), SSDP 1900
+            ; (reponses aux M-SEARCH, NOTIFY), mDNS 5353, SlimProto 3483 et CLI
+            ; 9090, canaux AirPlay, OAAT... Sans elle, Windows filtre les
+            ; reponses SSDP au-dela de 3 s et un renderer DLNA n'est jamais vu.
+            ; Deja presente (mise a jour) : rien a demander. Refusee ou en echec :
+            ; Tune s'installe quand meme, et le dit.
+            nsExec::ExecToStack '"`$SYSDIR\netsh.exe" advfirewall firewall show rule name="Tune"'
+            Pop `$0
+            Pop `$1
+            StrCmp `$0 "0" pf_regle_presente
+            ClearErrors
+            ExecShellWait "runas" "`$SYSDIR\netsh.exe" 'advfirewall firewall add rule name="Tune" dir=in action=allow program="`$INSTDIR\tune-server.exe" enable=yes profile=private' SW_HIDE
+            nsExec::ExecToStack '"`$SYSDIR\netsh.exe" advfirewall firewall show rule name="Tune"'
+            Pop `$0
+            Pop `$1
+            StrCmp `$0 "0" pf_regle_creee
+            DetailPrint "Pare-feu : regle Tune non creee (autorisation refusee ou echec)."
+            MessageBox MB_OK|MB_ICONINFORMATION "Tune est installe, mais la regle du pare-feu Windows n'a pas ete creee.$\r$\n$\r$\nSans elle, certains lecteurs reseau (DLNA/UPnP, AirPlay) peuvent rester invisibles ou muets. Au premier lancement, autorisez tune-server.exe sur les reseaux prives, ou relancez cet installeur." /SD IDOK
+            Goto pf_fin
+          pf_regle_creee:
+            DetailPrint "Pare-feu : regle entrante Tune creee (reseaux prives)."
+            Goto pf_fin
+          pf_regle_presente:
+            DetailPrint "Pare-feu : regle entrante Tune deja presente."
+          pf_fin:
 
             ; Registry for Add/Remove Programs
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "DisplayName" "Tune Server"
@@ -928,6 +981,14 @@ jobs:
             Delete "`$DESKTOP\Tune Server.lnk"
             RMDir /r "`$SMPROGRAMS\Tune Server"
             DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer"
+            ; #7371 - retirer la regle de pare-feu "Tune" posee a l'installation
+            ; (elevation demandee seulement si elle existe).
+            nsExec::ExecToStack '"`$SYSDIR\netsh.exe" advfirewall firewall show rule name="Tune"'
+            Pop `$0
+            Pop `$1
+            StrCmp `$0 "0" 0 pf_desinstallation_fin
+            ExecShellWait "runas" "`$SYSDIR\netsh.exe" 'advfirewall firewall delete rule name="Tune"' SW_HIDE
+          pf_desinstallation_fin:
           SectionEnd
           "@ | Out-File -Encoding ASCII installer.nsi
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi

@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 use tune_core::playback::NowPlaying;
 use tune_core::streaming::podcast_annuaires::RelaisPodcastIndex;
+use tune_core::streaming::podcast_par_adresse::{self, EchecAjoutParAdresse};
 use tune_core::streaming::podcasts::{EchecResolution, PodcastService};
 use tune_core::streaming::radiofrance::{RadioFranceApi, RfStation};
 use tune_core::streaming::vignette_podcast;
@@ -197,7 +198,10 @@ fn default_episode_limit() -> usize {
 struct Subscribe {
     #[serde(default)]
     feed_url: String,
-    title: String,
+    /// #7819 — facultatif : sans titre, le flux est lu et c'est lui qui
+    /// donne le titre, l'auteur, l'image et la description.
+    #[serde(default)]
+    title: Option<String>,
     author: Option<String>,
     image_url: Option<String>,
     description: Option<String>,
@@ -220,6 +224,49 @@ fn echec_de_resolution(e: &EchecResolution) -> AppError {
         code: Some(e.code().to_string()),
     }
 }
+/// L'échec d'un ajout par adresse (#7819) : un code stable et une phrase
+/// dans la langue de l'interface.
+fn echec_d_ajout_par_adresse(lang: &str, e: &EchecAjoutParAdresse) -> AppError {
+    let status = match e {
+        EchecAjoutParAdresse::AdresseInvalide => StatusCode::BAD_REQUEST,
+        EchecAjoutParAdresse::Injoignable(_) => StatusCode::BAD_GATEWAY,
+        EchecAjoutParAdresse::PasUnFlux => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    AppError {
+        status,
+        message: crate::i18n::t(lang, &format!("podcasts.ajoutParAdresse.{}", e.code())),
+        code: Some(e.code().to_string()),
+    }
+}
+
+/// L'abonnement déjà enregistré pour `feed_url`, tel que la route le rend
+/// (#7819).
+fn abonnement_existant(state: &AppState, feed_url: &str) -> Option<Value> {
+    use tune_core::db::backend::ToSqlValue;
+    let r = state
+        .backend
+        .query_one(
+            "SELECT id, title, author, image_url, description FROM podcast_subscriptions WHERE feed_url = ?",
+            &[&feed_url as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()?;
+    let image_url = r.get(3).and_then(|v| v.as_string());
+    let cover_url = image_url
+        .as_deref()
+        .and_then(|u| vignette_podcast::en_cache(&crate::routes::library::artwork_cache_dir(), u));
+    Some(json!({
+        "id": r.first().and_then(|v| v.as_i64()),
+        "created": false,
+        "title": r.get(1).and_then(|v| v.as_string()),
+        "author": r.get(2).and_then(|v| v.as_string()),
+        "image_url": image_url,
+        "description": r.get(4).and_then(|v| v.as_string()),
+        "feed_url": feed_url,
+        "cover_url": cover_url,
+    }))
+}
+
 #[derive(Deserialize)]
 pub(super) struct PlayEpisodeRequest {
     pub(super) audio_url: String,
@@ -230,6 +277,11 @@ pub(super) struct PlayEpisodeRequest {
     pub(super) duration_ms: Option<u64>,
     #[serde(default)]
     pub(super) seek_ms: Option<u64>,
+    /// #7894 — le type que le flux déclare pour l'épisode (`mime_type` des
+    /// épisodes listés). Facultatif : sans lui, l'extension de l'adresse, puis
+    /// l'hébergeur, le disent.
+    #[serde(default)]
+    pub(super) mime_type: Option<String>,
 }
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -247,7 +299,7 @@ pub fn router() -> Router<AppState> {
         .route("/catalogue", get(catalogue_podcasts))
         .route("/episodes/{podcast_id}", get(podcast_episodes))
         .route("/episodes", get(episodes_by_feed_url))
-        .route("/play/{zone_id}", post(play_episode))
+        .route("/play/{zone_id}", post(play_episode_en_tete_du_groupe))
 }
 async fn search_podcasts(
     State(state): State<AppState>,
@@ -318,11 +370,13 @@ async fn list_subscriptions(State(state): State<AppState>) -> Result<Json<Value>
 }
 async fn subscribe(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<Subscribe>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
 
-    let feed_url = if body.feed_url.is_empty() {
+    let lang = crate::i18n::lang_from_header(&headers);
+    let feed_url = if body.feed_url.trim().is_empty() {
         // Top chart podcasts have no feed URL — resolve via iTunes lookup.
         let apple_id = body
             .source_id
@@ -345,8 +399,37 @@ async fn subscribe(
             Err(e) => return echec_de_resolution(&e).into_response(),
         }
     } else {
-        body.feed_url.clone()
+        // #7819 — `feed://`, espaces, schéma ou hôte en majuscules : une même
+        // adresse ne s'enregistre que sous une seule forme.
+        match podcast_par_adresse::normaliser_adresse_de_flux(&body.feed_url) {
+            Ok(url) => url,
+            Err(e) => return echec_d_ajout_par_adresse(&lang, &e).into_response(),
+        }
     };
+
+    let mut title = body.title.clone().filter(|t| !t.trim().is_empty());
+    let mut author = body.author.clone();
+    let mut image_url = body.image_url.clone();
+    let mut description = body.description.clone();
+    if title.is_none() {
+        // #7819 — ajout par adresse : un flux déjà suivi n'est ni relu ni
+        // abonné une seconde fois.
+        if let Some(existant) = abonnement_existant(&state, &feed_url) {
+            return (StatusCode::OK, Json(existant)).into_response();
+        }
+        let entete = match podcast_par_adresse::lire_le_flux(&state.http_client, &feed_url).await {
+            Ok(entete) => entete,
+            Err(e) => {
+                warn!(feed_url = %feed_url, code = e.code(), error = ?e, "podcast_ajout_par_adresse_refuse");
+                return echec_d_ajout_par_adresse(&lang, &e).into_response();
+            }
+        };
+        title = Some(entete.titre.unwrap_or_else(|| feed_url.clone()));
+        author = author.or(entete.auteur);
+        image_url = image_url.or(entete.image_url);
+        description = description.or(entete.description);
+    }
+    let title = title.unwrap_or_default();
 
     let sql = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
         "INSERT INTO podcast_subscriptions (feed_url, title, author, image_url, description, source_id) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (feed_url) DO NOTHING"
@@ -357,10 +440,10 @@ async fn subscribe(
         sql,
         &[
             &feed_url as &dyn ToSqlValue,
-            &body.title as &dyn ToSqlValue,
-            &body.author as &dyn ToSqlValue,
-            &body.image_url as &dyn ToSqlValue,
-            &body.description as &dyn ToSqlValue,
+            &title as &dyn ToSqlValue,
+            &author as &dyn ToSqlValue,
+            &image_url as &dyn ToSqlValue,
+            &description as &dyn ToSqlValue,
             &body.source_id as &dyn ToSqlValue,
         ],
     ) {
@@ -387,7 +470,7 @@ async fn subscribe(
                 .flatten()
                 .and_then(|r| r.first().and_then(|v| v.as_i64()));
             info!(
-                title = %body.title,
+                title = %title,
                 feed_url = %feed_url,
                 creation,
                 id,
@@ -397,7 +480,7 @@ async fn subscribe(
             // temps : un hébergeur lent ne retient pas l'abonnement. Un échec
             // ne fait pas échouer l'abonnement ; le rattrapage du démarrage et
             // le prochain rafraîchissement du flux réessaient.
-            let cover_url = match body.image_url.as_deref().filter(|u| !u.trim().is_empty()) {
+            let cover_url = match image_url.as_deref().filter(|u| !u.trim().is_empty()) {
                 Some(image) => tokio::time::timeout(
                     DELAI_VIGNETTE_ABONNEMENT,
                     mettre_vignette_en_cache(&state, image),
@@ -421,7 +504,10 @@ async fn subscribe(
                 Json(json!({
                     "id": id,
                     "created": creation,
-                    "title": body.title,
+                    "title": title,
+                    "author": author,
+                    "image_url": image_url,
+                    "description": description,
                     "feed_url": feed_url,
                     "cover_url": cover_url,
                 })),
@@ -491,18 +577,40 @@ async fn discover_podcasts(
 async fn top_podcasts(
     State(state): State<AppState>,
     Query(q): Query<TopQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let svc = PodcastService::with_client(state.http_client.clone())
         .avec_relais_podcast_index(RelaisPodcastIndex::du_compte(&state.backend));
-    match svc.top_podcasts(q.genre, &q.country).await {
+    let lang = crate::i18n::lang_from_header(&headers);
+    reponse_du_top(&svc, q.genre, &q.country, &lang).await
+}
+
+/// #7778 (point 9) — un palmarès qu'Apple ne rend pas (502 Bad Gateway du
+/// fil 2637) n'est pas une panne de Tune : la liste s'affiche vide, avec
+/// `unavailable` et une phrase traduite. Avant, `AppError::internal` en
+/// faisait une erreur 500.
+async fn reponse_du_top(
+    svc: &PodcastService,
+    genre: Option<u32>,
+    country: &str,
+    lang: &str,
+) -> Result<Json<Value>, AppError> {
+    match svc.top_podcasts(genre, country).await {
         Ok(podcasts) => Ok(Json(json!({
-            "genre": q.genre,
+            "genre": genre,
             "count": podcasts.len(),
             "items": podcasts,
         }))),
         Err(e) => {
-            warn!(genre = ?q.genre, error = %e, "top_podcasts_failed");
-            Err(AppError::internal(e))
+            warn!(genre = ?genre, error = %e, "top_podcasts_failed");
+            Ok(Json(json!({
+                "genre": genre,
+                "count": 0,
+                "items": [],
+                "unavailable": true,
+                "code": "top_podcasts_unavailable",
+                "message": crate::i18n::t(lang, "podcasts.top.unavailable"),
+            })))
         }
     }
 }
@@ -702,19 +810,69 @@ async fn podcast_episodes(
         ),
     }
 }
+/// #7717 — un épisode lancé sur une zone est un lancement.
+async fn play_episode_en_tete_du_groupe(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    profile: crate::routes::active_profile::ActiveProfile,
+    body: Json<PlayEpisodeRequest>,
+) -> axum::response::Response {
+    // #7974 — le profil du geste et la langue du refus suivent le relais.
+    let lancement = play_episode(State(state.clone()), Path(zone_id), headers, profile, body);
+    crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
+        &state, zone_id, lancement,
+    )
+    .await
+}
+
 pub(super) async fn play_episode(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    profile: crate::routes::active_profile::ActiveProfile,
     Json(body): Json<PlayEpisodeRequest>,
 ) -> impl IntoResponse {
+    // #7974 — l'épisode sur une sortie réseau ne passe pas par `play()` : le
+    // bail d'écoute du profil qui le lance est demandé ici.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
+    if let Err(e) = state.orchestrator.verifier_le_bail(zone_id).await {
+        let lang = crate::i18n::lang_from_header(&headers);
+        if let Some(corps) = super::playback::corps_du_refus_parental(&e, &lang) {
+            return (StatusCode::FORBIDDEN, Json(corps));
+        }
+    }
     let title = body.title.as_deref().unwrap_or("Podcast Episode");
     let podcast_name = body.podcast_name.as_deref().unwrap_or("Podcast");
-    let device_id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
-        .flatten()
-        .and_then(|z| z.output_device_id);
-    let mime_type = guess_audio_mime(&body.audio_url);
+        .flatten();
+    let navigateur = zone
+        .as_ref()
+        .is_some_and(|z| z.output_type.as_deref() == Some("browser"));
+    let device_id = zone.and_then(|z| z.output_device_id);
+    let reseau = match device_id.as_deref() {
+        Some(did) => match { state.outputs.lock().await.get(did) } {
+            Some(arc) => tune_core::orchestrator::is_network_output_type(Some(
+                arc.lock().await.output_type(),
+            )),
+            None => false,
+        },
+        None => false,
+    };
+    let (mime_type, origine_du_type) =
+        type_de_l_episode(&state, body.mime_type.as_deref(), &body.audio_url, reseau).await;
+    info!(
+        zone_id,
+        mime_type = %mime_type,
+        origine = origine_du_type,
+        "podcast_type_annonce"
+    );
+    let mime_type = mime_type.as_str();
     // #5214 — la pochette « en cours », que Lecture en cours et l'Historique
     // du client reprennent : la vignette en cache quand elle existe. La sortie
     // (`PlayMedia` plus bas) garde l'URL distante, qu'un appareil de rendu va
@@ -773,6 +931,10 @@ pub(super) async fn play_episode(
         source: "podcast".into(),
         source_id: Some(body.audio_url.clone()),
         stream_id: relais.as_ref().map(|(_, session)| session.clone()),
+        // #7894 — le type retenu voyage avec l'épisode : Lecture après une
+        // pause sans média le rejoue par l'orchestrateur, qui ne le
+        // retrouverait pas dans une adresse sans extension.
+        format: format_de_l_episode(mime_type),
         ..Default::default()
     };
     // #6465 — un épisode n'appartient à aucun album ni playlist joué avant.
@@ -789,6 +951,62 @@ pub(super) async fn play_episode(
             np.cover_path.clone(),
         )
         .await;
+    if navigateur {
+        // Le chemin commun fournit une session Tune et attend la parole du
+        // lecteur avant l'historique et la reprise. playback.play seul ne
+        // créait ni flux confirmable, ni annonce de démarrage navigateur.
+        let demande = tune_core::orchestrator::PlayRequest {
+            zone_id,
+            source: Some("podcast".into()),
+            source_id: Some(body.audio_url.clone()),
+            title: Some(title.into()),
+            artist_name: Some(podcast_name.into()),
+            album_title: Some(podcast_name.into()),
+            cover_url: np.cover_path.clone(),
+            duration_ms: Some(body.duration_ms.unwrap_or(0) as i64),
+            media_format: np.format.clone(),
+            ..Default::default()
+        };
+        let resultat = if body.seek_ms.is_some() {
+            state.orchestrator.play_context_resume(demande).await
+        } else {
+            state.orchestrator.play(demande).await
+        };
+        let resultat = match resultat {
+            Ok(r) if r.sortie_refusee().is_none() => r,
+            Ok(r) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":r.error,"code":"podcast_sortie_refuse"})),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":e,"code":"podcast_preparation_refusee"})),
+                );
+            }
+        };
+        if resultat.stream_url.is_some() {
+            if let Some(ms) = body.seek_ms {
+                // L'élément du navigateur applique cet offset au média complet.
+                state
+                    .playback
+                    .seek(zone_id, ms.min(i64::MAX as u64) as i64)
+                    .await;
+            }
+        }
+        let zone_state = state.playback.get_state(zone_id).await;
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "zone_id":zone_id,"title":title,"podcast":podcast_name,
+                "audio_url":resultat.stream_url.clone().unwrap_or(body.audio_url.clone()),
+                "stream_url":resultat.stream_url,"mime_type":mime_type,
+                "output_sent":false,"error":null,"code":null,"state":zone_state
+            })),
+        );
+    }
     state.playback.play(zone_id, np).await;
     // #6468 — un échec n'est plus un `200` : la réponse porte un vrai code
     // HTTP et un `code` stable, que le client peut afficher.
@@ -846,11 +1064,16 @@ pub(super) async fn play_episode(
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(json!({"error": e.to_string(), "code": "podcast_resume_seek_failed"})),
-                )
-                    .into_response();
+                );
             }
         }
         if output_sent {
+            // #8085 — rien n'est décodé côté serveur sur ce chemin : sans
+            // sonde, les VU-mètres restaient à 0 pendant tout l'épisode.
+            state
+                .orchestrator
+                .sonder_les_niveaux_d_un_episode(zone_id, &body.audio_url, mime_type)
+                .await;
             let s = state.playback.get_state(zone_id).await;
             if let Some(np) = s.now_playing.as_ref() {
                 if let Err(e) = tune_core::db::listening_resume::podcast_started_in_context(
@@ -863,6 +1086,22 @@ pub(super) async fn play_episode(
                     warn!(zone_id, error = %e, "reprise_podcast_non_enregistree");
                 }
             }
+            // #7965 — l'épisode entre dans l'historique partagé, au seuil
+            // des pistes (#7852) : ce chemin ne passe pas par `play`.
+            state
+                .orchestrator
+                .enregistrer_ecoute_podcast(
+                    zone_id,
+                    title,
+                    podcast_name,
+                    s.now_playing
+                        .as_ref()
+                        .and_then(|np| np.cover_path.as_deref()),
+                    &body.audio_url,
+                    body.duration_ms.unwrap_or(0) as i64,
+                    body.podcast_id.as_deref(),
+                )
+                .await;
         }
     }
     let zone_state = state.playback.get_state(zone_id).await;
@@ -871,9 +1110,10 @@ pub(super) async fn play_episode(
     let output_error = echec.map(|(_, _, e)| e);
     (
         statut,
-        Json(json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "code": code, "state": zone_state})),
+        Json(
+            json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "code": code, "state": zone_state}),
+        ),
     )
-        .into_response()
 }
 // ─── Vignette mise en cache (#5214) ─────────────────────────────────
 
@@ -1141,20 +1381,127 @@ async fn rf_episodes(
 }
 
 fn guess_audio_mime(url: &str) -> &'static str {
-    let lower = url.to_lowercase();
-    let path = lower.split('?').next().unwrap_or(&lower);
-    if path.ends_with(".mp3") {
-        "audio/mpeg"
-    } else if path.ends_with(".m4a") || path.ends_with(".aac") || path.ends_with(".mp4") {
-        "audio/mp4"
-    } else if path.ends_with(".ogg") || path.ends_with(".opus") {
-        "audio/ogg"
-    } else if path.ends_with(".flac") {
-        "audio/flac"
-    } else if path.ends_with(".wav") {
-        "audio/wav"
-    } else {
-        "audio/mpeg"
+    mime_par_extension(url).unwrap_or("audio/mpeg")
+}
+
+/// Le type que dit l'extension de l'adresse, ou `None` si elle ne dit rien.
+/// La règle est celle de l'orchestrateur, qui rejoue l'épisode à la reprise :
+/// les deux chemins lisent la même extension de la même façon.
+fn mime_par_extension(url: &str) -> Option<&'static str> {
+    tune_core::orchestrator::mime_depuis_l_extension(url)
+}
+
+/// #7894 — le format rangé dans `NowPlaying.format` pour un épisode : la forme
+/// réduite que la reprise repasse en `PlayRequest.media_format`, et que
+/// l'orchestrateur retraduit en ce même type (`mime_d_un_episode`).
+fn format_de_l_episode(mime_type: &str) -> Option<String> {
+    match mime_type.strip_prefix("audio/")? {
+        "" => None,
+        "mpeg" => Some("mp3".into()),
+        autre => Some(autre.to_string()),
+    }
+}
+
+/// #7894 — un type audio déclaré (flux RSS, hébergeur), ramené à
+/// l'orthographe qu'un appareil de rendu DLNA reconnaît ; `None` s'il ne
+/// désigne pas de l'audio.
+fn normaliser_type_audio(declare: &str) -> Option<String> {
+    let t = declare
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let t = match t.as_str() {
+        "audio/x-m4a" | "audio/m4a" | "audio/x-mp4" | "audio/aac-mp4" => "audio/mp4",
+        "audio/mp3" | "audio/x-mp3" | "audio/x-mpeg" | "audio/mpeg3" | "audio/x-mpeg-3" => {
+            "audio/mpeg"
+        }
+        "audio/x-wav" | "audio/wave" => "audio/wav",
+        "audio/x-flac" => "audio/flac",
+        autre if autre.starts_with("audio/") && autre.len() > "audio/".len() => autre,
+        _ => return None,
+    };
+    Some(t.to_string())
+}
+
+/// Délai borné de la question posée à l'hébergeur : elle retarde le départ.
+const DELAI_TYPE_DE_L_HEBERGEUR: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// #7894 — le type de l'épisode à annoncer à la sortie, et d'où il vient.
+///
+/// Le point 9 de #7778 : un épisode lancé sur un appareil DLNA « démarrait »
+/// sans un son, l'appareil retombait en `NO_MEDIA_PRESENT`. Le type était
+/// déduit de l'extension seule, `audio/mpeg` par défaut : un M4A servi sous
+/// une adresse sans extension partait annoncé MP3, et un renderer strict
+/// lâche une URI dont le type annoncé ne correspond pas. Ordre retenu :
+/// 1. le type que le flux déclare (`enclosure@type`), passé par le client ;
+/// 2. l'extension de l'adresse ;
+/// 3. pour un appareil réseau, le `Content-Type` que l'hébergeur rend, demandé
+///    une fois avec un délai borné ;
+/// 4. `audio/mpeg`, comme avant.
+async fn type_de_l_episode(
+    state: &AppState,
+    declare: Option<&str>,
+    url: &str,
+    reseau: bool,
+) -> (String, &'static str) {
+    if let Some(t) = declare.and_then(normaliser_type_audio) {
+        return (t, "flux");
+    }
+    if let Some(t) = mime_par_extension(url) {
+        return (t.to_string(), "extension");
+    }
+    if reseau && let Some(t) = type_de_l_hebergeur(&state.http_client, url).await {
+        return (t, "hebergeur");
+    }
+    // Ni le flux, ni l'adresse, ni l'hébergeur : le repli d'avant.
+    (guess_audio_mime(url).to_string(), "defaut")
+}
+
+/// Le `Content-Type` audio que l'hébergeur rend pour `url` : un `HEAD`, puis
+/// un `GET` du premier octet si le `HEAD` est refusé. `None` sur échec, délai
+/// dépassé ou type qui n'est pas de l'audio.
+async fn type_de_l_hebergeur(client: &reqwest::Client, url: &str) -> Option<String> {
+    // Un seul budget pour les deux questions : un hébergeur qui ne répond pas
+    // retarde le départ de 3 s, pas de 3 s par requête.
+    match tokio::time::timeout(DELAI_TYPE_DE_L_HEBERGEUR, demander_le_type(client, url)).await {
+        Ok(t) => t,
+        Err(_) => {
+            warn!(url, "podcast_type_hebergeur_delai_depasse");
+            None
+        }
+    }
+}
+
+async fn demander_le_type(client: &reqwest::Client, url: &str) -> Option<String> {
+    let lire = |r: reqwest::Response| {
+        r.status()
+            .is_success()
+            .then(|| {
+                r.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(normaliser_type_audio)
+            })
+            .flatten()
+    };
+    if let Ok(r) = client.head(url).send().await
+        && let Some(t) = lire(r)
+    {
+        return Some(t);
+    }
+    match client
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .await
+    {
+        Ok(r) => lire(r),
+        Err(e) => {
+            warn!(error = %e, "podcast_type_hebergeur_illisible");
+            None
+        }
     }
 }
 #[cfg(test)]
@@ -1257,3 +1604,25 @@ mod tests {
         assert_eq!(PodcastService::CURATED_COUNTRY, "fr");
     }
 }
+
+#[path = "podcasts/reprise_par_adresse_8085.rs"]
+mod reprise_par_adresse_8085;
+pub(crate) use reprise_par_adresse_8085::{EpisodeParAdresse, jouer_l_episode_par_son_adresse};
+pub(super) use reprise_par_adresse_8085::{demande_de_reprise, jouer_et_rendre_la_zone};
+#[cfg(test)]
+#[path = "podcasts/palmares_indisponible_7778_tests.rs"]
+mod palmares_indisponible_7778_tests;
+#[cfg(test)]
+#[path = "podcasts/reprise_navigateur_7354_tests.rs"]
+mod reprise_navigateur_7354_tests;
+
+#[cfg(test)]
+#[path = "podcasts/historique_7965_tests.rs"]
+mod historique_7965_tests;
+
+#[cfg(test)]
+#[path = "podcasts/reprise_par_adresse_8085_tests.rs"]
+mod reprise_par_adresse_8085_tests;
+#[cfg(test)]
+#[path = "podcasts/type_de_l_episode_7894_tests.rs"]
+mod type_de_l_episode_7894_tests;

@@ -37,7 +37,7 @@ impl PositionPoller {
         let Some(output_arc) = ({ self.outputs.lock().await.get(device_id) }) else {
             return;
         };
-        let Ok((_, signal_path, dsp_metrics, _, transformations, _)) =
+        let Ok((_, signal_path, dsp_metrics, _, transformations, _, _)) =
             get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await
         else {
             // Une sonde en échec est l'affaire du sondage complet, qui compte

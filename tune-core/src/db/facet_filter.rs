@@ -245,12 +245,17 @@ pub const CHAMPS_DU_TEXTE_LIBRE: [&str; 10] = [
     "album_conductor",
 ];
 
-/// Les mots du texte libre (#4319) : la saisie, doubles guillemets ôtés
-/// (`motif_like`), découpée aux blancs. Une saisie sans mot n'en rend aucun.
+/// Les mots du texte libre (#4319) : la saisie découpée à tout ce qui n'est
+/// ni lettre ni chiffre (blancs, ponctuation, guillemets), comme l'index plein
+/// texte découpe les siens. Une saisie sans mot n'en rend aucun.
+///
+/// #7619 (L3), décision de Bertrand du 01/11/2026 : le texte libre trouve par
+/// DÉBUT DE MOT, comme `/search`. « ac/dc » cherche donc « ac » et « dc »,
+/// chacun au début d'un mot.
 pub fn mots_du_texte_libre(query: &str) -> Vec<String> {
     query
-        .replace('"', "")
-        .split_whitespace()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|m| !m.is_empty())
         .map(str::to_string)
         .collect()
 }
@@ -258,8 +263,9 @@ pub fn mots_du_texte_libre(query: &str) -> Vec<String> {
 /// Le prédicat du texte libre d'Oxygen et de la Bibliothèque, pour la piste
 /// d'alias `t`.
 ///
-/// 🔴 #4319 — CHAQUE MOT de la saisie doit se trouver, en sous-chaîne
-/// insensible à la casse et aux accents, dans AU MOINS UN des
+/// 🔴 #4319 — CHAQUE MOT de la saisie doit se trouver, au DÉBUT d'un mot
+/// (#7619, décision du 01/11/2026 ; en sous-chaîne avant), insensible à la
+/// casse et aux accents, dans AU MOINS UN des
 /// [`CHAMPS_DU_TEXTE_LIBRE`] : ET entre les mots, OU entre les champs. Avant,
 /// la saisie entière était cherchée d'un seul tenant, dans un seul champ :
 /// « mahler mehta » ne trouvait que l'album dont UN champ contenait les deux
@@ -275,8 +281,7 @@ pub fn mots_du_texte_libre(query: &str) -> Vec<String> {
 /// passent par sous-requête NON corrélée : le compteur du rail n'a aucune
 /// jointure, et chaque sous-requête n'est évaluée qu'une fois.
 ///
-/// Chaque mot est LITTÉRAL : ses `%` et `_` sont échappés, comme le
-/// navigateur qui fait un `includes`. Rend le prédicat et les valeurs à lier,
+/// Chaque mot est LITTÉRAL : ses `%` et `_` sont échappés. Rend le prédicat et les valeurs à lier,
 /// dans l'ordre des marqueurs : `CHAMPS_DU_TEXTE_LIBRE.len()` par mot.
 pub fn condition_texte_libre(
     ph: &mut Placeholders,
@@ -324,28 +329,59 @@ pub fn condition_texte_libre(
         let chef = like(ph);
         let chef_credit = like(ph);
         let chef_album = like(ph);
+        let engine = ph.engine();
+        let champ = |expr: &str| super::engine::expr_mots_debut(engine, expr);
         clauses.push(format!(
-            "(LOWER(unaccent(t.title)) {titre} \
-             OR t.artist_id IN (SELECT id FROM artists WHERE LOWER(unaccent(name)) {artiste}) \
-             OR t.album_id IN (SELECT id FROM albums WHERE LOWER(unaccent(title)) {titre_album}) \
-             OR LOWER(unaccent(t.label)) {label} \
-             OR LOWER(unaccent({termes})) {chemin} \
-             OR LOWER(unaccent(t.composer)) {compositeur} \
+            "({} {titre} \
+             OR t.artist_id IN (SELECT id FROM artists WHERE {} {artiste}) \
+             OR t.album_id IN (SELECT id FROM albums WHERE {} {titre_album}) \
+             OR {} \
+             OR {} {chemin} \
+             OR {} \
              OR t.album_id IN (SELECT al.id FROM albums al JOIN artists ar ON ar.id = al.artist_id \
-                WHERE LOWER(unaccent(ar.name)) {artiste_album}) \
+                WHERE {} {artiste_album}) \
              OR {piste} IN (SELECT {magasin_piste} FROM track_metadata \
-                WHERE key = 'conductor' AND LOWER(unaccent(value)) {chef}) \
+                WHERE key = 'conductor' AND {} {chef}) \
              OR {piste} IN (SELECT {magasin_piste} FROM track_credits \
-                WHERE LOWER(role) = 'conductor' AND LOWER(unaccent(artist_name)) {chef_credit}) \
+                WHERE LOWER(role) = 'conductor' AND {} {chef_credit}) \
              OR {album} IN (SELECT {magasin_album} FROM album_metadata \
-                WHERE key = 'conductor' AND LOWER(unaccent(value)) {chef_album}))"
+                WHERE key = 'conductor' AND {} {chef_album}))",
+            champ("t.title"),
+            champ("name"),
+            champ("title"),
+            // #7619 (L3) — label et compositeur : le `LIKE` sur les valeurs
+            // DISTINCTES, la piste par égalité. Même ensemble (une valeur NULL
+            // n'est ni `LIKE` ni `IN`), sans la fonction `unaccent` rejouée
+            // sur chaque piste.
+            valeur_distincte_like(engine, "label", &label),
+            champ(&termes),
+            valeur_distincte_like(engine, "composer", &compositeur),
+            champ("ar.name"),
+            champ("value"),
+            champ("artist_name"),
+            champ("value"),
         ));
-        let motif = format!("%{}%", super::track_repo::echapper_jokers_like(mot));
+        // #7619 : début de mot — le champ réduit commence par une espace.
+        let motif = format!("% {}%", super::track_repo::echapper_jokers_like(mot));
         valeurs.extend(
             (0..CHAMPS_DU_TEXTE_LIBRE.len()).map(|_| super::backend::SqlValue::Text(motif.clone())),
         );
     }
     (format!("({})", clauses.join(" AND ")), valeurs)
+}
+
+/// `t.{colonne}` vaut l'une des valeurs DISTINCTES de la colonne dont
+/// la forme [`super::engine::expr_mots_debut`] satisfait `motif` (`LIKE …`, échappement
+/// compris) — #7619 (L3). Le dictionnaire est MATÉRIALISÉ : sans cela, SQLite
+/// pousse le filtre dans le `SELECT DISTINCT` et rejoue `unaccent` sur chaque
+/// piste. `colonne` est un nom écrit par le code, jamais une saisie.
+fn valeur_distincte_like(engine: Engine, colonne: &str, motif: &str) -> String {
+    format!(
+        "t.{colonne} IN (WITH dico AS MATERIALIZED \
+         (SELECT DISTINCT {colonne} AS v FROM tracks WHERE {colonne} IS NOT NULL) \
+         SELECT dico.v FROM dico WHERE {} {motif})",
+        super::engine::expr_mots_debut(engine, "dico.v")
+    )
 }
 
 /// Générateur de marqueurs positionnels, partagé par les DEUX constructeurs de
@@ -693,13 +729,15 @@ pub fn dr_album_in(engine: Engine, having: &str) -> String {
 
 /// #2144 (rc10) — le DR de chaque album porteur d'un tag DR, sous le jeton de
 /// la base qui l'a rendu ([`super::backend::DbBackend::jeton_des_donnees`]).
-/// Une entrée PAR INSTANCE de base (l'instance est la première moitié du
-/// jeton) : un serveur n'ouvre qu'une base, donc une entrée — mais deux bases
-/// ouvertes dans le même processus (les tests, qui tournent en parallèle) ne
-/// s'évincent plus l'une l'autre. Avant, l'entrée unique faisait relire les
-/// tags DR à la première base dès qu'une seconde lisait sa carte (#7675 : le
-/// témoin de #7580 rougissait selon l'ordre des tests). Borné à
-/// [`DR_EN_CACHE_MAX`] entrées : les bases refermées ne s'accumulent pas.
+///
+/// #7675 puis #7817 — UNE ENTRÉE PAR INSTANCE de base (l'instance est la
+/// première moitié du jeton) : la lecture d'une autre base ne chasse plus la
+/// carte de celle-ci. Avec une seule case, deux bases ouvertes dans le même
+/// processus (les tests en parallèle) se chassaient l'une l'autre, et le
+/// témoin du #7580 comptait des relectures au hasard, selon l'ordre des tests.
+/// Un serveur n'a qu'une base, donc une entrée ; les tests en ouvrent des
+/// milliers : au-delà de [`DR_EN_CACHE_MAX`] bases, celle qui a été lue le
+/// moins récemment est oubliée (les bases refermées ne s'accumulent pas).
 type DrEnCache = Vec<(
     (u64, i64),
     std::sync::Arc<std::collections::HashMap<i64, i64>>,
@@ -724,10 +762,15 @@ pub fn dr_par_album(
     // jeton neuf.
     let jeton = db.jeton_des_donnees();
     if let Some(j) = jeton
-        && let Ok(cache) = DR_PAR_ALBUM_EN_CACHE.lock()
-        && let Some((_, carte)) = cache.iter().find(|(garde, _)| *garde == j)
+        && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
+        && let Some(i) = cache.iter().position(|(garde, _)| *garde == j)
     {
-        return Ok(carte.clone());
+        // Servie : remise en dernier, la plus récemment lue est oubliée en
+        // dernier.
+        let entree = cache.remove(i);
+        let carte = entree.1.clone();
+        cache.push(entree);
+        return Ok(carte);
     }
     let sql = format!(
         "SELECT dr.album_id, dr.dr FROM ({}) dr",
@@ -745,8 +788,8 @@ pub fn dr_par_album(
     if let Some(j) = jeton
         && let Ok(mut cache) = DR_PAR_ALBUM_EN_CACHE.lock()
     {
-        // La carte précédente de CETTE base est périmée ; celles des autres
-        // bases restent servables sous leur propre jeton.
+        // La carte précédente de CETTE base est périmée ; les autres bases
+        // gardent la leur, servable sous leur propre jeton.
         cache.retain(|(garde, _)| garde.0 != j.0);
         if cache.len() >= DR_EN_CACHE_MAX {
             cache.remove(0);
@@ -1088,6 +1131,26 @@ pub fn socle_de_la_vue_des_pistes(engine: Engine) -> [String; 3] {
         hidden_tracks_excluded().to_string(),
         pistes_album_distant_double_exclu(engine),
         copie_de_moindre_qualite_exclue(),
+    ]
+}
+
+/// #7619 (L1) — le MÊME socle que [`socle_de_la_vue_des_pistes`], écrit en
+/// ensembles NON corrélés : le moteur les évalue une fois par requête au lieu
+/// de trois sous-requêtes par piste.
+///
+/// - albums masqués : `NOT IN` sur `hidden_items`. Une piste sans album reste
+///   visible (`t.album_id IS NULL OR …`), exactement comme le `NOT EXISTS`
+///   d'origine ; `item_id IS NOT NULL` garde le `NOT IN` d'un NULL qui le
+///   rendrait faux partout ;
+/// - doublon distant et copie de moindre qualité :
+///   [`sql_pistes_ecartees_par_le_socle`], bâti sur les mêmes fragments et
+///   exact par construction (#5977).
+pub fn socle_ensembliste_de_la_vue_des_pistes(engine: Engine) -> [String; 2] {
+    [
+        "(t.album_id IS NULL OR t.album_id NOT IN (SELECT h.item_id FROM hidden_items h \
+         WHERE h.item_type = 'album' AND h.item_id IS NOT NULL))"
+            .to_string(),
+        format!("t.id NOT IN ({})", sql_pistes_ecartees_par_le_socle(engine)),
     ]
 }
 
@@ -1678,14 +1741,20 @@ mod tests {
                 Engine::Postgres => "$8",
             };
             assert!(
+                // #7619 (L3) : sur le dictionnaire des compositeurs distincts.
                 sql.contains(&format!(
-                    "OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({sixieme})){esc} OR"
+                    "OR t.composer IN (WITH dico AS MATERIALIZED \
+                     (SELECT DISTINCT composer AS v FROM tracks WHERE composer IS NOT NULL) \
+                     SELECT dico.v FROM dico WHERE {} \
+                     LIKE LOWER(unaccent({sixieme})){esc}) OR",
+                    crate::db::engine::expr_mots_debut(engine, "dico.v")
                 )),
                 "{engine:?} : le compositeur, sixième : {sql}"
             );
+            // #7619 : début de mot ; « % » sépare deux mots, comme l'index.
             let motif = format!(
-                "%{}%",
-                super::super::track_repo::echapper_jokers_like("Ravél50%")
+                "% {}%",
+                super::super::track_repo::echapper_jokers_like("Ravél50")
             );
             for v in &valeurs {
                 assert!(

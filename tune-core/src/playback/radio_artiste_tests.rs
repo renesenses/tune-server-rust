@@ -546,6 +546,7 @@ impl StreamingService for ServiceSimule {
         }
         let album = |id: &str, artiste: &str, artiste_id: Option<&str>| StreamAlbum {
             ai_generated: None,
+            explicit: None,
             id: id.into(),
             title: format!("Titre {id}"),
             artist: artiste.into(),

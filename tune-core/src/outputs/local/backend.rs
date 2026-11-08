@@ -395,9 +395,93 @@ pub(super) struct BackendCpal<'a> {
     device_gone: Arc<AtomicBool>,
     starvation: Arc<RingStarvation>,
     position_ms: &'a AtomicU64,
+    /// #7614 — la cadence ouverte POUR le greffon de suréchantillonnage,
+    /// quand il a négocié une cadence et que le flux s'y est ouvert.
+    cadence_du_surechantillonneur: Option<u32>,
+    /// #6132 — l'hôte ouvert, pour ouvrir la seconde sortie sur le même.
+    host: cpal::Host,
+    /// #6132 — ce que le rappel `f32` de A consulte à chaque période.
+    recopie: super::sortie_double_locale::EmplacementDeRecopie,
+    /// #6132 — A a-t-il été ouvert par le rappel `f32` qui recopie ? Faux
+    /// après la cascade entière (i32/i16).
+    recopie_possible: bool,
+    /// #6132 — les sorties suiveuses, vivantes tant que le backend l'est.
+    secondes: Option<super::sortie_double_locale::SecondesSorties>,
 }
 
 impl BackendCpal<'_> {
+    /// #7614 — la cadence que ce flux a ouverte pour le suréchantillonneur.
+    /// `None` : le greffon ne tourne pas sur ce flux (désactivé, PURE, DoP,
+    /// cadences non mesurées, aucun multiple entier accepté, ou le flux
+    /// flottant n'a pas pu s'ouvrir à cette cadence).
+    pub(super) fn cadence_du_surechantillonneur(&self) -> Option<u32> {
+        self.cadence_du_surechantillonneur
+            .filter(|&c| c == self.sortie.cadence)
+    }
+
+    /// #6132 — ouvrir les sorties suiveuses et y recopier ce que A joue,
+    /// chacune corrigée de sa dérive, le retard commun réglé sur la plus
+    /// lente.
+    ///
+    /// Appelé par `play_url` après l'ouverture et avant le démarrage de A :
+    /// la ligne à retard de A est en place avant sa première période. Une
+    /// suiveuse refusée est journalisée et les autres jouent — jamais de
+    /// silence sur A pour cause de suiveuse.
+    /// #6132 — la piste suivante commence : le retard commun des sorties
+    /// suiveuses pourra se réajuster au prochain silence.
+    pub(super) fn demander_un_reajustement(&self) {
+        self.recopie.demander_un_reajustement();
+    }
+
+    pub(super) fn brancher_les_secondes_sorties(
+        &mut self,
+        demandes: &[crate::outputs::sortie_double::SecondeSortieDemandee],
+        strict_bitperfect: bool,
+        reglages_a: super::sortie_double_locale::ReglagesDeA,
+    ) {
+        use super::sortie_double_locale::{
+            installer_les_secondes_sorties, ouvrir_la_seconde_sortie, refus_prealable,
+        };
+        let hote = self.host.id().name();
+        let mut ouvertes = Vec::new();
+        for demande in demandes {
+            let nom = demande.nom.as_str();
+            let resultat = match refus_prealable(
+                hote,
+                strict_bitperfect,
+                self.recopie_possible,
+                &self.device_name,
+                nom,
+            ) {
+                Some(r) => Err(r),
+                None => ouvrir_la_seconde_sortie(
+                    &self.host,
+                    demande,
+                    self.sortie.cadence,
+                    self.sortie.canaux,
+                    reglages_a.clone(),
+                ),
+            };
+            match resultat {
+                Ok(ouverte) => ouvertes.push(ouverte),
+                Err(refus) => warn!(
+                    device = %self.device_name,
+                    seconde_sortie = %nom,
+                    backend = hote,
+                    motif = refus.code(),
+                    detail = ?refus,
+                    "sortie_double_refusee — la zone joue sans cette sortie"
+                ),
+            }
+        }
+        self.secondes = installer_les_secondes_sorties(
+            &self.recopie,
+            self.sortie.canaux,
+            self.sortie.cadence,
+            ouvertes,
+        );
+    }
+
     /// #4953 — le périphérique a-t-il prouvé, à cette ouverture, qu'il suit
     /// la cadence de la source ? Vrai seulement quand sa liste de cadences est
     /// une MESURE (ALSA `hw:`, ASIO, CoreAudio, JACK — jamais un greffon qui
@@ -420,12 +504,44 @@ pub(super) fn suit_la_cadence_source(
     cadences_mesurees && source_sr != 0 && source_sr == ouverte_sr
 }
 
-impl<'a> BackendLocal<'a> for BackendCpal<'a> {
+/// #7614 — la cadence que le greffon de suréchantillonnage obtient de ce
+/// périphérique, sans cpal : `None` sans choix, en bit-perfect strict, ou
+/// quand la liste de cadences n'est pas une MESURE (WASAPI partagé, ALSA
+/// `default`) — une liste supposée ne prouve pas que le DAC tourne à la
+/// cadence demandée. `accepte(r)` interroge l'énumération pour `r`.
+pub(super) fn cadence_pour_le_surechantillonneur(
+    choix: Option<&crate::audio::surechantillonnage::ChoixSurechantillonnage>,
+    evidence: super::resolution::SampleRateEvidence,
+    strict_bitperfect: bool,
+    source_sr: u32,
+    accepte: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    let choix = choix?;
+    if strict_bitperfect || !evidence.is_measured() || source_sr == 0 {
+        return None;
+    }
+    let acceptees: Vec<u32> = crate::audio::surechantillonnage::CADENCES_CANDIDATES
+        .iter()
+        .copied()
+        .filter(|&r| r > source_sr && r % source_sr == 0 && accepte(r))
+        .collect();
+    choix.negocier(source_sr, &acceptees)
+}
+
+impl<'a> BackendCpal<'a> {
     /// La cascade d'ouverture du chemin partagé, telle qu'elle vivait dans
     /// `play_url` : résolution du périphérique, décision de cadence, flux f32
     /// à la cadence choisie, repli à la cadence source, puis i32 et i16 aux
     /// deux cadences. Le premier format accepté gagne.
-    fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
+    ///
+    /// [`BackendLocal::ouvrir`], plus le choix du greffon de
+    /// suréchantillonnage (#7614) : quand il négocie une cadence MESURÉE
+    /// acceptée, le flux s'ouvre à cette cadence au lieu de celle que
+    /// `decide_local_rate_opening` aurait retenue.
+    pub(super) fn ouvrir_pour_le_surechantillonneur(
+        demande: &DemandeDOuverture<'a>,
+        surechantillonnage: Option<&crate::audio::surechantillonnage::ChoixSurechantillonnage>,
+    ) -> Result<Self, RefusDOuverture> {
         let device_name = demande.device_name.to_string();
         let sample_rate = demande.spec.cadence();
         let channels = demande.spec.canaux();
@@ -492,7 +608,8 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
         // #4953 — la liste de cadences de CE périphérique est-elle une mesure ?
         // Retenu hors du bloc de décision, comme `pcm_ouvert`.
         let cadences_mesurees: bool;
-        let output_config = {
+        let mut cadence_du_surechantillonneur: Option<u32> = None;
+        let output_config = 'decision: {
             // First, get the device's default config (reflects actual
             // operating rate on most platforms).
             let default_cfg = match device.default_output_config() {
@@ -547,6 +664,43 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             let rate_evidence =
                 sample_rate_evidence_for_device(host_id_name, &opened_endpoint_id, true);
             cadences_mesurees = rate_evidence.is_measured();
+            // #7614 — le greffon de suréchantillonnage a négocié une cadence
+            // que la liste MESURÉE du périphérique accepte : le flux s'ouvre
+            // à cette cadence, c'est lui qui la porte (rubato ne tourne pas).
+            let pour_le_greffon = cadence_pour_le_surechantillonneur(
+                surechantillonnage,
+                rate_evidence,
+                demande.strict_bitperfect,
+                sample_rate,
+                |r| find_matching_config(&device, channels, r).is_some_and(|c| c.sample_rate == r),
+            )
+            .and_then(|r| {
+                find_matching_config(&device, channels, r)
+                    .filter(|c| c.sample_rate == r)
+                    .map(|c| (r, c))
+            });
+            if let Some((cible, cfg)) = pour_le_greffon {
+                info!(
+                    source_sr = sample_rate,
+                    upsampler_sr = cible,
+                    backend = %host_id_name,
+                    endpoint_id = %opened_endpoint_id,
+                    "local_audio_open_at_upsampler_rate"
+                );
+                #[cfg(target_os = "macos")]
+                super::cadence_du_flux_compresse::caler_la_cadence_nominale_coreaudio(
+                    &device_name,
+                    cible,
+                );
+                note_rate_decision(ObservedRate {
+                    source_sample_rate: sample_rate,
+                    opened_sample_rate: cible,
+                    reason: None,
+                    evidence_measured: true,
+                });
+                cadence_du_surechantillonneur = Some(cible);
+                break 'decision cfg;
+            }
             let decision = decide_local_rate_opening(
                 sample_rate,
                 default_sr,
@@ -698,6 +852,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
         // has been buffered in the ring buffer.  This prevents stale or
         // garbage audio from reaching the DAC during track transitions.
         let data_started_shared = Arc::new(AtomicBool::new(false));
+        let recopie = super::sortie_double_locale::emplacement_vide();
         let build_stream =
             |cfg: &cpal::StreamConfig,
              ring_cb: Arc<RingBuf>,
@@ -711,15 +866,21 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                 // Prélevé AVANT la fermeture de rendu (#3205).
                 let famine_cb = ring_cb.starvation();
                 let mut promotion = PromotionDuFilDeRendu::nouvelle();
+                let recopie_cb = recopie.clone();
+                let unite_cb = AtomicU32::new(1000);
                 device.build_output_stream(
                     cfg,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                         promotion.a_la_premiere_periode();
                         // Le corps est partagé avec le chemin compressé
                         // (`render_local_shared_f32_callback`) : c'était deux
                         // copies identiques, et le faux rouge de #3814 vivait
-                        // dans les deux.
-                        render_local_shared_f32_callback(
+                        // dans les deux. #6132 — sans seconde sortie,
+                        // `rendre_la_periode_de_a` l'appelle tel quel ; avec,
+                        // au volume unité, puis recopie, puis volume de A.
+                        super::sortie_double_locale::rendre_la_periode_de_a(
+                            &recopie_cb,
+                            &unite_cb,
                             &ring_cb,
                             &vol_cb,
                             &paused_cb,
@@ -729,6 +890,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                             soft_mute_cb.armed_ms(),
                             min_buf,
                             data,
+                            info,
                         );
                     },
                     make_stream_error_cb(device_gone.clone(), famine_cb),
@@ -793,6 +955,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             }
         };
 
+        let mut recopie_possible = true;
         let (stream, actual_config, ring) = match stream_result {
             Ok(s) => (s, output_config, ring_buf),
             Err(first_err) => {
@@ -928,7 +1091,10 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                             },
                         );
                         match built {
-                            Some(Ok(t)) => t,
+                            Some(Ok(t)) => {
+                                recopie_possible = false;
+                                t
+                            }
                             None => return Err(RefusDOuverture::Cancelled),
                             Some(Err(last_error)) => {
                                 // Every format was refused, so the fault is
@@ -980,7 +1146,18 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             device_gone,
             starvation,
             position_ms: demande.position_ms,
+            cadence_du_surechantillonneur,
+            host,
+            recopie,
+            recopie_possible,
+            secondes: None,
         })
+    }
+}
+
+impl<'a> BackendLocal<'a> for BackendCpal<'a> {
+    fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
+        Self::ouvrir_pour_le_surechantillonneur(demande, None)
     }
 
     fn nom(&self) -> &'static str {

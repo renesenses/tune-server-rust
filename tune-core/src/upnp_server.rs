@@ -26,6 +26,10 @@ mod dossiers;
 #[cfg(test)]
 mod grande_bibliotheque_5885_tests;
 
+/// #7636 — « Playlists » sur 2 000 listes : pages bornées, temps mesuré.
+#[cfg(test)]
+mod listes_par_pages_7636_tests;
+
 /// L'ordre alphabétique du serveur média, partagé avec les listes paginées de
 /// l'API REST de la bibliothèque (#4956) : un même rayon se lit dans le même
 /// ordre sur un lecteur DLNA et dans le client web.
@@ -1926,6 +1930,57 @@ const RENDERER_SINK_PROTOCOL_INFO: &str = concat!(
     "http-get:*:audio/opus:*",
 );
 
+/// #8052 — les types DSD qu'une zone prêtée ajoute à son `Sink` quand sa
+/// sortie locale sait recevoir le DSD (voir [`zone_pretee_accepte_le_dsd`]).
+///
+/// `application/x-dsd` vient EN TÊTE : le client DLNA de Tune retient la
+/// première orthographe DSD du `Sink` (`parse_dsd_capability`, `dsf_mime`) et
+/// l'annonce telle quelle au `SetAVTransportURI` ; c'est aussi le MIME que la
+/// façade reconnaît au retour (`mime_upnp`, extension `.dsf`).
+const RENDERER_SINK_DSD_PROTOCOL_INFO: &str = concat!(
+    "http-get:*:application/x-dsd:*,",
+    "http-get:*:audio/dsf:*,",
+    "http-get:*:audio/x-dsf:*,",
+    "http-get:*:audio/dff:*,",
+    "http-get:*:audio/x-dff:*",
+);
+
+/// #8052 — la zone publiée en façade (prêt de sorties) doit-elle annoncer le
+/// DSD dans son `Sink` ?
+///
+/// Le `Sink` était FIXE, sans un seul type DSD : le serveur principal qui
+/// sondait la façade concluait « ce renderer ne fait pas de DSD » et décimait
+/// lui-même le `.dsf` en PCM 176,4 kHz, comme vers n'importe quel renderer
+/// DLNA — alors que la zone du prêteur, en lecture locale, le jouait en DoP ou
+/// en natif ASIO (Gustard X16, fil ASR).
+///
+/// Oui seulement quand le prêteur, recevant le DSD, en ferait AUTRE CHOSE que
+/// du PCM : sortie locale (`local:`) et transport DSD local non PCM
+/// (`native` ou `dop`, la même [`transport_dsd`] que la lecture d'un `.dsf`
+/// de la bibliothèque). En `auto` comme en `pcm`, la sortie locale joue du PCM
+/// de toute façon : la façade garde le `Sink` historique et le principal
+/// décime, ce qui donne le même son qu'avant. Une zone réseau prêtée garde
+/// aussi le `Sink` historique : ses capacités DSD sont celles d'un autre
+/// appareil (#8053), hors de ce correctif.
+///
+/// [`transport_dsd`]: crate::orchestrator::transport_dsd
+pub fn zone_pretee_accepte_le_dsd(output_device_id: Option<&str>, dsd_mode: &str) -> bool {
+    let est_locale = output_device_id.is_some_and(|id| id.starts_with("local:"));
+    est_locale
+        && crate::orchestrator::transport_dsd(true, false, dsd_mode)
+            != crate::orchestrator::TransportDsd::Pcm
+}
+
+/// Le `Sink` du renderer d'une zone : le `Sink` historique, plus les types DSD
+/// quand la zone les accepte (#8052).
+pub fn renderer_sink_protocol_info(accepte_le_dsd: bool) -> String {
+    if accepte_le_dsd {
+        format!("{RENDERER_SINK_PROTOCOL_INFO},{RENDERER_SINK_DSD_PROTOCOL_INFO}")
+    } else {
+        RENDERER_SINK_PROTOCOL_INFO.to_string()
+    }
+}
+
 /// ConnectionManager du **MediaRenderer** (`/upnp/renderer/{zone}/`).
 ///
 /// Le renderer répondait avec le ConnectionManager du media server : `Source`
@@ -1935,16 +1990,28 @@ const RENDERER_SINK_PROTOCOL_INFO: &str = concat!(
 /// dans nos propres journaux (`renderer_caps_probe_empty_sink`) : le client
 /// DLNA de Tune sondait le renderer de Tune et n'en tirait rien.
 pub fn build_renderer_connection_manager_response(soap_body: &str) -> String {
+    build_renderer_connection_manager_response_pour(soap_body, false)
+}
+
+/// Comme [`build_renderer_connection_manager_response`], avec le `Sink` de la
+/// zone : DSD compris quand `accepte_le_dsd` (#8052).
+pub fn build_renderer_connection_manager_response_pour(
+    soap_body: &str,
+    accepte_le_dsd: bool,
+) -> String {
     debug!(
         body_len = soap_body.len(),
-        "upnp_renderer_connection_manager_request"
+        accepte_le_dsd, "upnp_renderer_connection_manager_request"
     );
 
     match parse_soap_action(soap_body).as_deref() {
         None | Some("GetProtocolInfo") => soap_action_response(
             CONNECTION_MANAGER_URN,
             "GetProtocolInfo",
-            &format!("<Source></Source><Sink>{RENDERER_SINK_PROTOCOL_INFO}</Sink>"),
+            &format!(
+                "<Source></Source><Sink>{}</Sink>",
+                renderer_sink_protocol_info(accepte_le_dsd)
+            ),
         ),
         Some("GetCurrentConnectionIDs") => soap_action_response(
             CONNECTION_MANAGER_URN,
@@ -2456,6 +2523,10 @@ const UPNP_PROFILE_ID: i64 = 1;
 /// largement au-delà de toute bibliothèque réelle, et bornent la mémoire.
 const PLAYLIST_FETCH_CAP: i64 = 10_000;
 
+/// #7636 — taille maximale d'une page de « Playlists », la même que celle des
+/// pistes d'une liste (`browse_playlist_tracks`).
+const PAGE_MAX_DES_LISTES: u64 = 500;
+
 /// Les listes de lecture du profil par défaut, triées par nom.
 ///
 /// **Une liste vide n'est pas publiée.** C'est la règle de `ROOT_CONTAINERS`
@@ -2466,12 +2537,21 @@ const PLAYLIST_FETCH_CAP: i64 = 10_000;
 ///
 /// `total` est le nombre RÉEL de listes publiables, pas la taille de la page :
 /// c'est lui que le point de contrôle lit pour savoir s'il reste des pages.
+///
+/// #7636 — la page est bornée à [`PAGE_MAX_DES_LISTES`], comme celle des
+/// pistes d'une liste : `RequestedCount=0` (« tout ») sur deux mille listes
+/// bâtissait un DIDL de près de 400 Ko en une seule réponse, que Kazoo doit
+/// lire en entier avant d'afficher quoi que ce soit.
 fn browse_playlists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let listes = lire_listes_publiables(state);
 
     let total = listes.len();
     let debut = usize::try_from(start).unwrap_or(usize::MAX).min(total);
-    let demande = usize::try_from(count).unwrap_or(usize::MAX);
+    let demande = match count {
+        0 => PAGE_MAX_DES_LISTES,
+        n => n.min(PAGE_MAX_DES_LISTES),
+    };
+    let demande = usize::try_from(demande).unwrap_or(usize::MAX);
     let fin = debut.saturating_add(demande).min(total);
     let mut didl = didl_listes(&listes[debut..fin]);
     didl.total = total as u64;
@@ -5729,6 +5809,7 @@ mod tests {
             cue_end_ms: None,
             rating: None,
             bitrate_kbps: None,
+            explicit: None,
         }
     }
 

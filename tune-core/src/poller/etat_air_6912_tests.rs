@@ -315,6 +315,6 @@ async fn le_repli_du_statut_air_n_est_pas_adopte_comme_une_annonce_6912() {
     assert_eq!(
         b.poller
             .releve_adoptable(b.id, "dlna-autre", Some(0.5), 0.2, 0.5),
-        Some(0.2)
+        Some(super::releve_ne_monte_pas_6739::SuiteDuReleve::Adopter(0.2))
     );
 }

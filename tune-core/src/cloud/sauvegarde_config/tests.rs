@@ -15,6 +15,18 @@ use crate::db::settings_repo::SettingsRepo;
 
 const PHRASE: &str = "une phrase de passe longue";
 
+fn base64_encode(octets: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(octets)
+}
+
+fn base64_decode(texte: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(texte)
+        .unwrap()
+}
+
 fn base_neuve() -> Arc<dyn DbBackend> {
     use crate::db::migrations;
     use crate::db::sqlite::SqliteDb;
@@ -331,7 +343,7 @@ fn le_blob_est_chiffre() {
         assert!(!blob.contains(clair), "le blob porte en clair : {clair}");
     }
     let v: Value = serde_json::from_str(&blob).unwrap();
-    let chiffre = hex_decode(v["envelope"]["ciphertext"].as_str().unwrap()).unwrap();
+    let chiffre = base64_decode(v["ciphertext_b64"].as_str().unwrap());
     let mut sortie = Vec::new();
     let lu = flate2::read::GzDecoder::new(&chiffre[..]).read_to_end(&mut sortie);
     assert!(
@@ -389,10 +401,10 @@ fn une_alteration_est_detectee() {
     let cle = cle_locale(&s).unwrap().unwrap();
     let blob = chiffrer(&cle, &construire(&b).unwrap()).unwrap();
     let mut v: Value = serde_json::from_str(&blob).unwrap();
-    let mut octets = hex_decode(v["envelope"]["ciphertext"].as_str().unwrap()).unwrap();
+    let mut octets = base64_decode(v["ciphertext_b64"].as_str().unwrap());
     let n = octets.len() - 1;
     octets[n] ^= 1;
-    v["envelope"]["ciphertext"] = json!(hex_encode(&octets));
+    v["ciphertext_b64"] = json!(base64_encode(&octets));
     assert!(matches!(
         dechiffrer(&v.to_string(), Some(&cle), None),
         Err(ErreurOuverture::Illisible(_))
@@ -906,4 +918,250 @@ fn les_caches_http_ne_gonflent_pas_la_sauvegarde_des_personnalisations_7286() {
         s.get("cache:meta-nom:artiste exemple").unwrap().is_some(),
         "exclure de la sauvegarde ne supprime pas le cache local"
     );
+}
+
+// #7286 : exercer le véritable dépôt HTTP, y compris un refus de proxy HTML.
+async fn depot_refuse_413(corps: &'static str) -> String {
+    use axum::{Router, http::StatusCode, routing::post};
+    let app = Router::new().route(
+        "/api/v1/config-backups",
+        post(move || async move { (StatusCode::PAYLOAD_TOO_LARGE, corps) }),
+    );
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    let serveur = tokio::spawn(async move {
+        axum::serve(ecoute, app).await.unwrap();
+    });
+    let b = base_neuve();
+    relier(&b, &format!("http://{adresse}"), "serveur-test");
+    // 6 octets UTF-8, mais seulement 4 caractères.
+    let erreur = deposer(
+        &reglages(&b),
+        crate::http::client::shared(),
+        "cle",
+        "été!",
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    serveur.abort();
+    erreur
+}
+
+#[tokio::test]
+async fn refus_413_donne_taille_et_limite_du_site() {
+    let message = depot_refuse_413(r#"{"error":"payload_too_large","max_bytes":4}"#).await;
+    assert!(
+        message.contains("6 octets"),
+        "taille du blob absente : {message}"
+    );
+    assert!(
+        message.contains("limite : 4 octets"),
+        "limite du site perdue : {message}"
+    );
+}
+
+#[tokio::test]
+async fn refus_413_proxy_donne_taille_sans_inventer_la_limite() {
+    let message = depot_refuse_413("<html>413 Request Entity Too Large</html>").await;
+    assert!(
+        message.contains("6 octets"),
+        "taille du blob absente : {message}"
+    );
+    assert!(
+        message.contains("limite non communiquée"),
+        "limite inconnue non explicitée : {message}"
+    );
+}
+
+// ── #7286 : un envoi plus léger, et un refus de taille qui dit quoi faire ──
+
+/// Un instantané v1 tel que l'écrivait un serveur rc10 : chiffré en
+/// hexadécimal dans l'enveloppe.
+fn blob_v1(cle: &CleLocale, contenu: &Value) -> String {
+    use std::io::Write as _;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&serde_json::to_vec(contenu).unwrap()).unwrap();
+    let envelope = Envelope::sceller_avec(
+        &cle.dek,
+        &cle.passphrase_slot,
+        &cle.recovery_slot,
+        &gz.finish().unwrap(),
+    )
+    .unwrap();
+    json!({
+        "format": FORMAT_BLOB,
+        "format_version": 1,
+        "key_id": cle.key_id,
+        "envelope": envelope,
+    })
+    .to_string()
+}
+
+/// Une playlist de `n` titres aux chemins tous différents, comme une vraie
+/// bibliothèque : la compression n'en fait pas disparaître le poids.
+fn grosse_playlist(b: &Arc<dyn DbBackend>, nom: &str, n: usize) {
+    exec(b, "INSERT INTO artists (name) VALUES ('Artiste du banc')");
+    let ar = un_entier(b, "SELECT MAX(id) FROM artists");
+    exec(
+        b,
+        &format!("INSERT INTO albums (title, artist_id) VALUES ('Album du banc', {ar})"),
+    );
+    let al = un_entier(b, "SELECT MAX(id) FROM albums");
+    exec(
+        b,
+        &format!("INSERT INTO playlists (name, description) VALUES ('{nom}', NULL)"),
+    );
+    let pl = un_entier(b, "SELECT MAX(id) FROM playlists");
+    for i in 0..n {
+        let empreinte = format!("{:x}", Sha256::digest(format!("{nom}-{i}").as_bytes()));
+        exec(
+            b,
+            &format!(
+                "INSERT INTO tracks (title, album_id, artist_id, file_path, audio_hash) \
+                 VALUES ('Titre {i}', {al}, {ar}, '/musique/{nom}/{empreinte}.flac', '{empreinte}')"
+            ),
+        );
+        let t = un_entier(b, "SELECT MAX(id) FROM tracks");
+        exec(
+            b,
+            &format!(
+                "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES ({pl}, {t}, {i})"
+            ),
+        );
+    }
+}
+
+/// Les instantanés déjà déposés par un serveur plus ancien (v1, en
+/// hexadécimal) s'ouvrent toujours, par la clé locale comme par la phrase de
+/// passe.
+#[test]
+fn un_instantane_v1_en_hexadecimal_s_ouvre_toujours_7286() {
+    let b = machine_configuree();
+    let s = reglages(&b);
+    let (_, secours) = creer_la_cle(&s, PHRASE).unwrap();
+    let cle = cle_locale(&s).unwrap().unwrap();
+    let contenu = construire(&b).unwrap();
+    let ancien = blob_v1(&cle, &contenu);
+
+    let (c0, _) = dechiffrer(&ancien, Some(&cle), None).unwrap();
+    assert_eq!(
+        c0, contenu,
+        "#7286 : la clé locale n'ouvre plus un instantané v1"
+    );
+    let (c1, _) = dechiffrer(&ancien, None, Some(PHRASE)).unwrap();
+    assert_eq!(c1, contenu);
+    let (c2, _) = dechiffrer(&ancien, None, Some(secours.display())).unwrap();
+    assert_eq!(c2, contenu);
+}
+
+/// Le blob déposé est sensiblement plus léger qu'en v1 : l'hexadécimal
+/// doublait le chiffré, le base64 n'y ajoute qu'un tiers.
+#[test]
+fn le_blob_depose_est_plus_leger_que_l_ancien_format_7286() {
+    let b = machine_configuree();
+    grosse_playlist(&b, "Tout le catalogue", 3000);
+    let s = reglages(&b);
+    creer_la_cle(&s, PHRASE).unwrap();
+    let cle = cle_locale(&s).unwrap().unwrap();
+    let contenu = construire(&b).unwrap();
+
+    let ancien = blob_v1(&cle, &contenu).len();
+    let nouveau = chiffrer(&cle, &contenu).unwrap();
+    assert!(
+        nouveau.len() * 4 <= ancien * 3,
+        "#7286 : le blob déposé pèse {} octets, l'ancien format {ancien} : \
+         il devrait peser au plus les trois quarts",
+        nouveau.len()
+    );
+    let v: Value = serde_json::from_str(&nouveau).unwrap();
+    assert_eq!(v["format_version"], json!(2));
+    assert_eq!(
+        v["envelope"]["ciphertext"],
+        json!(""),
+        "le chiffré part deux fois"
+    );
+    let (relu, _) = dechiffrer(&nouveau, Some(&cle), None).unwrap();
+    assert_eq!(relu, contenu);
+}
+
+/// Un blob v2 dont le chiffré manque, ou v1 qui en porte un en base64, est
+/// illisible : rien n'est deviné.
+#[test]
+fn un_blob_incoherent_est_illisible_7286() {
+    let b = machine_configuree();
+    let s = reglages(&b);
+    creer_la_cle(&s, PHRASE).unwrap();
+    let cle = cle_locale(&s).unwrap().unwrap();
+    let blob = chiffrer(&cle, &construire(&b).unwrap()).unwrap();
+    let mut sans: Value = serde_json::from_str(&blob).unwrap();
+    sans.as_object_mut().unwrap().remove("ciphertext_b64");
+    assert!(matches!(
+        dechiffrer(&sans.to_string(), Some(&cle), None),
+        Err(ErreurOuverture::Illisible(_))
+    ));
+    let mut v1: Value = serde_json::from_str(&blob).unwrap();
+    v1["format_version"] = json!(1);
+    assert!(matches!(
+        dechiffrer(&v1.to_string(), Some(&cle), None),
+        Err(ErreurOuverture::Illisible(_))
+    ));
+}
+
+/// Un faux site qui refuse tout dépôt : 413, avec ou sans plafond.
+async fn site_qui_refuse(corps: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Router, http::StatusCode, routing::post};
+    let app = Router::new().route(
+        "/api/v1/config-backups",
+        post(move || async move { (StatusCode::PAYLOAD_TOO_LARGE, corps) }),
+    );
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    let serveur = tokio::spawn(async move {
+        axum::serve(ecoute, app).await.unwrap();
+    });
+    (format!("http://{adresse}"), serveur)
+}
+
+/// « Sauvegarder maintenant » refusé pour sa taille : la passe le dit comme
+/// tel (taille, limite, playlists à alléger), pas comme un échec opaque, et
+/// l'écran d'état garde ce message.
+#[tokio::test]
+async fn un_refus_pour_taille_dit_la_limite_et_quoi_alleger_7286() {
+    let (base, serveur) =
+        site_qui_refuse(r#"{"error":"payload_too_large","max_bytes":16777216}"#).await;
+    let http = crate::http::client::shared().clone();
+    let b = machine_configuree();
+    grosse_playlist(&b, "Tout le catalogue", 50);
+    relier(&b, &base, "serveur-a");
+    let s = reglages(&b);
+    creer_la_cle(&s, PHRASE).unwrap();
+
+    let issue = passe(&b, &http, true, t(12, 0)).await;
+    serveur.abort();
+    let Issue::TropVolumineux {
+        octets,
+        max_octets,
+        plus_longues_playlists,
+    } = issue
+    else {
+        panic!("#7286 : un refus 413 doit rester un refus de taille, pas {issue:?}");
+    };
+    assert!(octets > 0);
+    assert_eq!(max_octets, Some(16_777_216));
+    assert_eq!(
+        plus_longues_playlists.first(),
+        Some(&("Tout le catalogue".to_string(), 50)),
+        "la playlist la plus longue doit être nommée en premier"
+    );
+    let note = s.get(CLE_DERNIERE_ERREUR).unwrap().unwrap();
+    for attendu in [
+        "limite : 16777216 octets",
+        "« Tout le catalogue » (50 titres)",
+        "Allégez-les",
+        "export local",
+    ] {
+        assert!(note.contains(attendu), "« {attendu} » absent de : {note}");
+    }
 }

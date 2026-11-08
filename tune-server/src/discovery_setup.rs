@@ -24,6 +24,10 @@ mod media_server_tests_3786;
 #[path = "renderer_allume_avant_le_serveur_tests_6961.rs"]
 mod renderer_allume_avant_le_serveur_tests_6961;
 
+#[cfg(test)]
+#[path = "discovery_setup/renderer_sans_services_de_rendu_tests_7279.rs"]
+mod renderer_sans_services_de_rendu_tests_7279;
+
 #[cfg(all(test, feature = "oaat"))]
 #[path = "deux_pi_verox_oaat_airplay_tests_6947.rs"]
 mod deux_pi_verox_oaat_airplay_tests_6947;
@@ -43,6 +47,10 @@ mod deux_pi_verox_oaat_airplay_tests_6947;
 /// intéresse — s'y abonner coûterait un renouvellement toutes les 250 s pour
 /// rien.
 pub(crate) const SERVICES_EVENEMENTS_DLNA: [&str; 2] = ["avtransport", "renderingcontrol"];
+
+/// Les deux services sans lesquels une sortie DLNA ne s'enregistre pas
+/// (`handle_ssdp_discovered`) ; `GET /zones` publie ceux qui manquent (#7279).
+pub(crate) const SERVICES_DE_RENDU: [&str; 2] = ["avtransport", "renderingcontrol"];
 
 /// `eventSubURL` absolues des services abonnables, à partir des chemins bruts
 /// du descripteur.
@@ -100,6 +108,21 @@ pub(crate) fn scpd_av_transport(
     urls.get("avtransport")
         .filter(|p| !p.trim().is_empty())
         .map(|p| resolve_control_url(&dev.host, dev.port, p))
+}
+
+/// #6335 — la même URL, lue dans un descriptif relu par HTTP (ajout manuel,
+/// nouveau sondage, balayage, création de zone). Sans elle, la sortie rend
+/// `AnnonceSuivante::Inconnue` jusqu'à la prochaine découverte SSDP, et aucun
+/// suivant DSD n'est armé sur un renderer qui sait pourtant enchaîner.
+pub(crate) fn scpd_av_transport_du_descriptif(
+    host: &str,
+    port: u16,
+    desc: &tune_core::discovery::xml_parser::DeviceDescription,
+) -> Option<String> {
+    desc.scpd_urls()
+        .get("avtransport")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| resolve_control_url(host, port, p))
 }
 
 pub(crate) fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
@@ -614,13 +637,116 @@ fn est_notre_propre_renderer(
     if !location.contains(tune_core::upnp_renderer::RENDERER_MOUNT) {
         return false;
     }
-    let hote = location
+    let hote = hote_de_location(location);
+    !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
+}
+
+/// L'hôte d'une LOCATION SSDP, sans schéma, port ni chemin.
+fn hote_de_location(location: &str) -> &str {
+    location
         .split("://")
         .nth(1)
         .and_then(|reste| reste.split('/').next())
         .map(|hp| hp.split(':').next().unwrap_or(hp))
-        .unwrap_or_default();
-    !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
+        .unwrap_or_default()
+}
+
+/// #7875 — un renderer UPnP tiers qui tourne sur CETTE machine.
+///
+/// Rend la LOCATION (ou l'hôte) à journaliser quand l'annonce porte une de
+/// nos adresses, par l'hôte de l'appareil ou par celui de sa LOCATION, sans
+/// être une façade Tune (`/upnp/renderer/`). Les façades restent l'affaire
+/// d'[`est_notre_propre_renderer`] et de l'UDN : la nôtre est écartée, celle
+/// d'un autre Tune lancé sur la même machine reste une zone.
+///
+/// Un renderer d'une autre adresse du réseau n'est jamais concerné. La boucle
+/// locale (`127.x`, `localhost`) non plus : un renderer tiers de la machine
+/// s'annonce en multicast sous l'adresse de son interface réseau, et une
+/// LOCATION en boucle locale est celle d'un faux renderer de banc d'essai,
+/// qui doit rester une zone.
+fn renderer_tiers_sur_cette_machine<'a>(
+    hote: &'a str,
+    location: Option<&'a str>,
+    nos_adresses: &[String],
+) -> Option<&'a str> {
+    if location.is_some_and(|loc| loc.contains(tune_core::upnp_renderer::RENDERER_MOUNT)) {
+        return None;
+    }
+    let boucle_locale = |h: &str| {
+        h.eq_ignore_ascii_case("localhost")
+            || h.parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    };
+    let est_a_nous =
+        |h: &str| !h.is_empty() && !boucle_locale(h) && nos_adresses.iter().any(|a| a == h);
+    let par_location = location.filter(|loc| est_a_nous(hote_de_location(loc)));
+    if par_location.is_some() {
+        return par_location;
+    }
+    est_a_nous(hote).then_some(location.unwrap_or(hote))
+}
+
+/// #7875 — retenir la création AUTOMATIQUE d'une zone pour ce renderer ?
+///
+/// Rend la LOCATION (ou l'hôte) à journaliser quand les trois conditions sont
+/// réunies, `None` sinon :
+/// - la zone à créer serait une zone `dlna` : un renderer OpenHome de la
+///   machine est le plus souvent un mandataire (BubbleUPnP Server) qui joue
+///   sur un AUTRE appareil, il ne double rien ;
+/// - le renderer tourne sur cette machine ([`renderer_tiers_sur_cette_machine`]) ;
+/// - une sortie locale est inscrite : c'est elle que la zone DLNA doublerait,
+///   avec un chemin du signal réseau au lieu du chemin local.
+///
+/// La règle ne retire RIEN : la sortie du renderer reste inscrite (une zone
+/// se crée encore à la main depuis la liste des appareils), et une zone déjà
+/// liée à ce renderer se rattache comme avant. Seule la zone neuve que la
+/// découverte aurait créée d'elle-même, en double, ne l'est plus.
+pub(crate) fn zone_auto_retenue_sur_cette_machine<'a>(
+    type_de_zone: &str,
+    hote: &'a str,
+    location: Option<&'a str>,
+    nos_adresses: &[String],
+    sortie_locale_inscrite: bool,
+) -> Option<&'a str> {
+    if type_de_zone != "dlna" || !sortie_locale_inscrite {
+        return None;
+    }
+    renderer_tiers_sur_cette_machine(hote, location, nos_adresses)
+}
+
+/// Une sortie locale (carte de la machine) est-elle inscrite au registre ?
+pub(crate) fn sortie_locale_inscrite(registre: &OutputRegistry) -> bool {
+    registre
+        .list()
+        .iter()
+        .any(|id| registre.type_of(id).as_deref() == Some("local"))
+}
+
+/// Journal de [`zone_auto_retenue_sur_cette_machine`] : une ligne `info` à la
+/// première annonce de l'appareil, `debug` ensuite. Le renderer se réannonce
+/// toutes les quelques minutes ; le journal n'a pas à le redire à chaque fois.
+pub(crate) fn journaliser_zone_auto_retenue(id: &str, name: &str, location: &str) {
+    static DEJA_DIT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let premiere_fois = DEJA_DIT
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut dits| dits.insert(id.to_string()))
+        .unwrap_or(true);
+    if premiere_fois {
+        info!(
+            id,
+            name,
+            location,
+            "ssdp_renderer_sur_cette_machine_sans_zone_auto — renderer de cette machine, \
+             la sortie locale est à utiliser ; une zone se crée à la main si besoin"
+        );
+    } else {
+        debug!(
+            id,
+            name, location, "ssdp_renderer_sur_cette_machine_sans_zone_auto"
+        );
+    }
 }
 
 /// Les UDN de nos propres façades (`upnp_renderer_udn_<zone>`), tels que
@@ -673,7 +799,7 @@ fn est_notre_propre_serveur_multimedia(
 /// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et
 /// les formes locales, qu'un M-SEARCH émis depuis la machine elle-même peut
 /// nous renvoyer.
-fn nos_adresses(annoncee: Option<&str>) -> Vec<String> {
+pub(crate) fn nos_adresses(annoncee: Option<&str>) -> Vec<String> {
     nos_adresses_depuis(
         &tune_core::discovery::ssdp::local_ipv4_addresses(),
         tune_core::discovery::ssdp::get_local_ip(),
@@ -954,6 +1080,28 @@ async fn handle_ssdp_discovered(
         );
     }
 
+    // #7279 — sans sortie enregistrée, pas de zone. La chaîne de rattachement
+    // et de création ci-dessous ne regardait pas `registered` : un renderer
+    // sans AVTransport ou sans RenderingControl recevait une zone « en ligne »
+    // qui ne pouvait rien jouer, absente de la liste des appareils de lecture,
+    // et sans un mot dans le journal (Innuos Zenith, fil 2495).
+    if !registered {
+        let manquants: Vec<&str> = SERVICES_DE_RENDU
+            .into_iter()
+            .filter(|cle| !svc_urls.contains_key(*cle))
+            .collect();
+        let annonces: Vec<&String> = svc_urls.keys().collect();
+        warn!(
+            id = %dev.id,
+            name = %dev.name,
+            host = %dev.host,
+            manquants = ?manquants,
+            annonces = ?annonces,
+            "ssdp_renderer_sans_services_de_rendu"
+        );
+        return;
+    }
+
     let skip_keywords = [
         "tv",
         "décodeur",
@@ -1108,6 +1256,23 @@ async fn handle_ssdp_discovered(
             "ssdp_zone_reancree_par_mac"
         );
     } else if !is_tv {
+        // #7875 — un renderer DLNA tiers qui tourne sur cette machine
+        // (upmpdcli, gmediarender… sur un NUC Tune OS) doublerait la sortie
+        // locale. Placé ICI, après les trois barreaux de rattachement : une
+        // zone déjà liée à ce renderer se rattache comme avant, et sa sortie
+        // reste inscrite plus haut. Seule la zone NEUVE n'est pas créée.
+        let sortie_locale = sortie_locale_inscrite(&*outputs.lock().await);
+        if let Some(loc) = zone_auto_retenue_sur_cette_machine(
+            type_str,
+            &dev.host,
+            dev.location.as_deref(),
+            &nos_adresses(config.advertised_ip.as_deref()),
+            sortie_locale,
+        ) {
+            journaliser_zone_auto_retenue(&dev.id, &dev.name, loc);
+            return;
+        }
+
         // Check zone_auto_create setting — #3529 : lecture unique, portée par
         // `ZoneRepo`. Elle était recopiée mot pour mot en cinq endroits, ce
         // qui a permis à cinq autres chemins de ne jamais la recopier.
@@ -1398,7 +1563,107 @@ async fn reregister_known_renderers_avec(state: &AppState, recours: RecoursUnica
         save_known_renderers(&state.backend, &renderers);
     }
     info!(count = renderers.len(), "reregistering_known_renderers");
+    let recovered = rattacher_les_renderers_connus(state, renderers, recours, true).await;
+    info!(recovered, "known_renderers_reregister_complete");
+}
 
+/// #6961 — échéancier de la réévaluation des zones DLNA/OpenHome hors ligne :
+/// rapprochée juste après le démarrage (le réseau de la machine peut ne pas
+/// être prêt quand la resonde unique de démarrage part), puis lente.
+const REEVALUATION_HORS_LIGNE_PREMIERS_DELAIS_S: [u64; 4] = [15, 30, 60, 120];
+const REEVALUATION_HORS_LIGNE_PERIODE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// #6961 — un renderer allumé AVANT le serveur ne doit pas rester hors ligne.
+///
+/// Au démarrage, `reset_zones_offline` met toutes les zones hors ligne ; seule
+/// une découverte les remet en ligne. Or un renderer déjà allumé n'émet pas de
+/// `NOTIFY` tant qu'il ne change pas d'état, et ceux qui ne répondent pas au
+/// `M-SEARCH` multicast (#1126) n'avaient qu'une chance : la resonde UNIQUE de
+/// [`reregister_known_renderers`], lancée dans les premières secondes. Si elle
+/// échouait — réseau de la machine pas encore prêt, appareil occupé, réponse
+/// perdue —, plus rien ne réévaluait la zone : elle restait hors ligne
+/// jusqu'au redémarrage de l'appareil, seul geste qui lui fait émettre un
+/// `NOTIFY` (Silviu, NanoPlayer, rc7).
+///
+/// Cette tâche reprend, à intervalles, la même sonde pour les seules zones
+/// DLNA/OpenHome encore hors ligne dont l'appareil est au magasin des
+/// renderers connus. Une zone en ligne n'est jamais sondée.
+pub fn spawn_reevaluation_des_zones_hors_ligne(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut delais = REEVALUATION_HORS_LIGNE_PREMIERS_DELAIS_S
+            .into_iter()
+            .map(std::time::Duration::from_secs);
+        loop {
+            let delai = delais.next().unwrap_or(REEVALUATION_HORS_LIGNE_PERIODE);
+            tokio::time::sleep(delai).await;
+            reevaluer_les_zones_hors_ligne_avec(&state, RecoursUnicast::PRODUCTION).await;
+        }
+    });
+}
+
+/// Les renderers connus dont la zone DLNA/OpenHome est hors ligne (et non
+/// masquée). Fonction sans réseau : c'est elle qui décide qui est sondé.
+fn renderers_des_zones_hors_ligne(state: &AppState) -> Vec<KnownRenderer> {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let hors_ligne: std::collections::HashSet<String> = zone_repo
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|z| !z.online)
+        .filter(|z| matches!(z.output_type.as_deref(), Some("dlna") | Some("openhome")))
+        .filter_map(|z| z.output_device_id)
+        .filter(|id| !id.is_empty() && !zone_repo.is_device_hidden(id))
+        .collect();
+    if hors_ligne.is_empty() {
+        return Vec::new();
+    }
+    let a_nous = nos_adresses(state.config.advertised_ip.as_deref());
+    let port_api = state.config.port;
+    dedup_renderers_by_location(
+        load_known_renderers(&state.backend)
+            .into_iter()
+            .filter(|kr| hors_ligne.contains(&kr.device_id))
+            .filter(|kr| !est_notre_propre_renderer(&kr.location, port_api, port_api, &a_nous))
+            .collect(),
+    )
+}
+
+/// Un passage de la réévaluation. Rend le nombre de zones rattachées.
+async fn reevaluer_les_zones_hors_ligne_avec(state: &AppState, recours: RecoursUnicast) -> usize {
+    let renderers = renderers_des_zones_hors_ligne(state);
+    if renderers.is_empty() {
+        return 0;
+    }
+    let sondes = renderers.len();
+    let rattaches = rattacher_les_renderers_connus(state, renderers, recours, false).await;
+    if rattaches > 0 {
+        info!(
+            sondes,
+            rattaches, "zones_hors_ligne_reevaluees_renderer_retrouve"
+        );
+    } else {
+        debug!(
+            sondes,
+            "zones_hors_ligne_reevaluees_aucun_renderer_retrouve"
+        );
+    }
+    rattaches
+}
+
+/// Sonde les renderers connus donnés et rattache ceux qui répondent, par le
+/// MÊME chemin qu'une découverte vivante. Rend le nombre de rattachés.
+///
+/// Partagé par la resonde de démarrage et par la réévaluation des zones hors
+/// ligne (#6961) : `au_demarrage` ne règle que le niveau de la ligne d'échec,
+/// pour qu'un appareil éteint ne remplisse pas le journal toutes les cinq
+/// minutes.
+async fn rattacher_les_renderers_connus(
+    state: &AppState,
+    renderers: Vec<KnownRenderer>,
+    recours: RecoursUnicast,
+    au_demarrage: bool,
+) -> usize {
     // LE récepteur du processus, pas un second.
     //
     // Ce chemin s'en passait : celui du gestionnaire SSDP n'était pas
@@ -1511,16 +1776,23 @@ async fn reregister_known_renderers_avec(state: &AppState, recours: RecoursUnica
                     }
                 }
             }
-            None => {
+            None if au_demarrage => {
                 warn!(
                     id = %kr.device_id,
                     location = %kr.location,
                     "known_renderer_probe_failed"
                 );
             }
+            None => {
+                debug!(
+                    id = %kr.device_id,
+                    location = %kr.location,
+                    "zone_hors_ligne_renderer_toujours_injoignable"
+                );
+            }
         }
     }
-    info!(recovered, "known_renderers_reregister_complete");
+    recovered
 }
 
 /// Spawn the mDNS handler that registers Chromecast/AirPlay/BluOS/OAAT/Squeezebox outputs.
@@ -1566,6 +1838,10 @@ pub fn spawn_mdns_handler(
         // can list the discovered peers. AppState keeps it alive for the whole
         // process, so the returned handle is a convenience clone only.
         let mdns = std::sync::Arc::new(mdns);
+        // #8100 — réseau arrivé APRÈS Tune (DHCP lent) : relance des
+        // recherches et réannonce sur la vraie adresse, sur changement réel
+        // des adresses seulement. La tâche s'arrête avec le scanner.
+        mdns.surveiller_reseau();
         *state.mdns_scanner.lock().unwrap() = Some(mdns.clone());
         Some(mdns)
     } else {
@@ -1650,6 +1926,9 @@ pub fn spawn_mdns_handler(
                                     dev.id.clone(),
                                     ap_dev_id,
                                 );
+                                tune_core::outputs::airplay2::composant_manquant_7084::retablir(
+                                    &dev.id,
+                                );
                                 info!(name = %dev.name, "airplay2_output_registered");
                                 (Some(Box::new(ap2)), "airplay2")
                             } else {
@@ -1676,6 +1955,19 @@ pub fn spawn_mdns_handler(
                                         .get("airplay_requires_pairing")
                                         .and_then(|v| v.as_bool())
                                         .unwrap_or(false);
+                                // #7084 — servie ici FAUTE de composant AirPlay 2
+                                // (antivirus) : la zone et la lecture le disent.
+                                let composant_manquant =
+                                    is_v2 && !tune_core::outputs::airplay2::daemon_available();
+                                if composant_manquant {
+                                    tune_core::outputs::airplay2::composant_manquant_7084::signaler(
+                                        &dev.id,
+                                    );
+                                } else {
+                                    tune_core::outputs::airplay2::composant_manquant_7084::retablir(
+                                        &dev.id,
+                                    );
+                                }
                                 if appairage_requis {
                                     warn!(
                                         name = %dev.name,
@@ -1690,7 +1982,8 @@ pub fn spawn_mdns_handler(
                                     dev.host.clone(),
                                     dev.port,
                                 )
-                                .avec_appairage_airplay2_requis(appairage_requis);
+                                .avec_appairage_airplay2_requis(appairage_requis)
+                                .avec_composant_airplay2_manquant(composant_manquant);
                                 (Some(Box::new(ap)), "airplay")
                             }
                         }
@@ -5336,3 +5629,7 @@ mod volume_7333_mdns_tests {
 #[cfg(test)]
 #[path = "discovery_setup/decouverte_volume_6774_tests.rs"]
 mod decouverte_volume_6774_tests;
+
+#[cfg(test)]
+#[path = "discovery_setup/renderer_sur_cette_machine_7875_tests.rs"]
+mod renderer_sur_cette_machine_7875_tests;

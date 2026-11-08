@@ -1,6 +1,10 @@
 //! Messagerie privée (#6902) : relais sans copie locale vers le contrat cloud.
 //! Le cloud juge les contacts, les cartes, les limites et les droits. Le
 //! journal ne reçoit que les gabarits des routes ; jamais texte ni curseur.
+//!
+//! [rc11] Message à tout un cercle (site-mozaiklabs#454) : trois routes de
+//! plus, relayées de même. Lecture, « lu », suppression et signalement d'une
+//! conversation de cercle passent par les routes `/conversations/{id}/…`.
 
 use crate::{
     relais::Relais,
@@ -13,7 +17,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     middleware,
     response::Response,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -21,12 +25,28 @@ use std::sync::Arc;
 
 pub fn router(relais: Arc<Relais>) -> Router<()> {
     Router::new()
+        .route("/general-circles", get(cercles_generaux))
+        .route(
+            "/general-circles/{id}/membership",
+            post(rejoindre).delete(quitter),
+        )
+        .route("/general-circles/{id}/conversation", post(ouvrir_cercle))
+        .route("/conversations/{id}/name-consent", post(consentir))
         .route("/conversations", get(liste))
         .route("/contacts/{id}/conversation", post(ouvrir))
         .route("/conversations/{id}/messages", get(messages).post(envoyer))
         .route("/conversations/{id}/read", post(lire))
         .route("/conversations/{id}/messages/{message}", delete(effacer))
         .route("/conversations/{id}/reports", post(signaler))
+        .route(
+            "/circles/{id}/conversation",
+            post(ouvrir_conversation_du_cercle),
+        )
+        .route(
+            "/circles/{id}/conversation/messages",
+            post(ecrire_au_cercle),
+        )
+        .route("/circles/{id}/messaging", put(regler_cercle))
         .layer(middleware::map_response(sans_cache))
         .with_state(relais)
 }
@@ -173,6 +193,149 @@ async fn signaler(State(r): State<Arc<Relais>>, Path(id): Path<String>, corps: B
             "POST /conversations/{id}/reports",
             Method::POST,
             &["conversations", &id, "reports"],
+            Some(&corps),
+        )
+        .await,
+    )
+}
+
+async fn cercles_generaux(State(r): State<Arc<Relais>>) -> Response {
+    en_reponse(
+        r.appeler(
+            "GET /general-circles",
+            Method::GET,
+            &["general-circles"],
+            None,
+        )
+        .await,
+    )
+}
+
+async fn rejoindre(State(r): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    en_reponse(
+        r.appeler(
+            "POST /general-circles/{id}/membership",
+            Method::POST,
+            &["general-circles", &id, "membership"],
+            None,
+        )
+        .await,
+    )
+}
+
+async fn quitter(State(r): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    en_reponse(
+        r.appeler(
+            "DELETE /general-circles/{id}/membership",
+            Method::DELETE,
+            &["general-circles", &id, "membership"],
+            None,
+        )
+        .await,
+    )
+}
+
+async fn ouvrir_cercle(State(r): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    en_reponse(
+        r.appeler(
+            "POST /general-circles/{id}/conversation",
+            Method::POST,
+            &["general-circles", &id, "conversation"],
+            None,
+        )
+        .await,
+    )
+}
+
+async fn consentir(State(r): State<Arc<Relais>>, Path(id): Path<String>, corps: Bytes) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    let corps = match corps_json(&corps, false) {
+        Ok(c) => c,
+        Err(()) => return corps_invalide(),
+    };
+    en_reponse(
+        r.appeler(
+            "POST /conversations/{id}/name-consent",
+            Method::POST,
+            &["conversations", &id, "name-consent"],
+            Some(&corps),
+        )
+        .await,
+    )
+}
+
+/// [rc11] Ouvre (ou retrouve) la conversation d'un cercle dont on est membre.
+async fn ouvrir_conversation_du_cercle(
+    State(r): State<Arc<Relais>>,
+    Path(id): Path<String>,
+) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    en_reponse(
+        r.appeler(
+            "POST /circles/{id}/conversation",
+            Method::POST,
+            &["circles", &id, "conversation"],
+            None,
+        )
+        .await,
+    )
+}
+
+/// [rc11] Écrit à tout le cercle ; le site tient les droits et les seaux.
+async fn ecrire_au_cercle(
+    State(r): State<Arc<Relais>>,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    let corps = match corps_json(&corps, false) {
+        Ok(c) => c,
+        Err(()) => return corps_invalide(),
+    };
+    en_reponse(
+        r.appeler(
+            "POST /circles/{id}/conversation/messages",
+            Method::POST,
+            &["circles", &id, "conversation", "messages"],
+            Some(&corps),
+        )
+        .await,
+    )
+}
+
+/// [rc11] « Seul le créateur peut écrire » ou « tout le monde » : `{ write }`.
+async fn regler_cercle(
+    State(r): State<Arc<Relais>>,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if !id_valide(&id) {
+        return introuvable();
+    }
+    let corps = match corps_json(&corps, false) {
+        Ok(c) => c,
+        Err(()) => return corps_invalide(),
+    };
+    en_reponse(
+        r.appeler(
+            "PUT /circles/{id}/messaging",
+            Method::PUT,
+            &["circles", &id, "messaging"],
             Some(&corps),
         )
         .await,

@@ -55,6 +55,8 @@ pub struct SqueezeboxOutput {
     lms_host: String,
     lms_port: u16,
     muted: AtomicBool,
+    /// #7379 — le dernier `status` n'avait pas de volume lisible.
+    volume_illisible: AtomicBool,
 }
 
 impl SqueezeboxOutput {
@@ -70,6 +72,7 @@ impl SqueezeboxOutput {
             lms_host,
             lms_port,
             muted: AtomicBool::new(false),
+            volume_illisible: AtomicBool::new(false),
         }
     }
 
@@ -173,6 +176,11 @@ impl SqueezeboxOutput {
 
 #[async_trait::async_trait]
 impl OutputTarget for SqueezeboxOutput {
+    fn volume_du_statut_illisible(&self) -> bool {
+        self.volume_illisible
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -281,11 +289,16 @@ impl OutputTarget for SqueezeboxOutput {
             .map(|s| (s * 1000.0) as u64)
             .unwrap_or(0);
 
-        let volume = Self::get_status_value(&pairs, "mixer volume")
+        // #7379 — sans `mixer volume` lisible, le repli 0,5 reste dans le
+        // statut, mais la sortie dit que ce n'est pas une valeur lue.
+        let lu = Self::get_status_value(&pairs, "mixer volume")
             .or_else(|| Self::get_status_value(&pairs, "mixer_volume"))
             .and_then(|s| s.parse::<f64>().ok())
-            .map(|v| v / 100.0)
-            .unwrap_or(0.5);
+            .filter(|v| v.is_finite())
+            .map(|v| v / 100.0);
+        self.volume_illisible
+            .store(lu.is_none(), std::sync::atomic::Ordering::Relaxed);
+        let volume = lu.unwrap_or(crate::outputs::dlna::volume_illisible_5662::REPLI_ILLISIBLE);
 
         let current_uri = Self::get_status_value(&pairs, "current_title");
         let track_title = Self::get_status_value(&pairs, "title");
@@ -329,6 +342,54 @@ impl OutputTarget for SqueezeboxOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #7379 — faux LMS : chaque connexion lit une ligne et rend `reponse`.
+    fn faux_lms(reponse: std::sync::Arc<std::sync::Mutex<String>>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for flux in listener.incoming() {
+                let Ok(mut flux) = flux else { break };
+                let mut ligne = String::new();
+                let _ = BufReader::new(flux.try_clone().unwrap()).read_line(&mut ligne);
+                let r = reponse.lock().unwrap().clone();
+                let _ = flux.write_all(format!("{r}\n").as_bytes());
+            }
+        });
+        port
+    }
+
+    /// #7379 — le VRAI `get_status` lève l'illisibilité quand `mixer volume`
+    /// manque du `status` LMS, et la baisse dès qu'un volume se lit.
+    #[tokio::test]
+    async fn le_statut_signale_un_volume_illisible_au_sondeur_7379() {
+        let mac = "00%3A04%3A20%3Aaa%3Abb%3Acc";
+        let reponse = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let port = faux_lms(reponse.clone());
+        let out = SqueezeboxOutput::new(
+            "Cuisine".into(),
+            "squeezebox-00:04:20:aa:bb:cc".into(),
+            "127.0.0.1".into(),
+            port,
+        );
+        for corps in [
+            format!("{mac} status 0 100 tags%3AadlNJ mode%3Aplay time%3A10"),
+            format!("{mac} status 0 100 tags%3AadlNJ mode%3Aplay mixer%20volume%3Aabc"),
+        ] {
+            *reponse.lock().unwrap() = corps.clone();
+            let statut = out.get_status().await.unwrap();
+            assert_eq!(statut.volume, 0.5, "le repli reste dans le statut");
+            assert!(
+                out.volume_du_statut_illisible(),
+                "{corps} : repli non signalé"
+            );
+        }
+        *reponse.lock().unwrap() =
+            format!("{mac} status 0 100 tags%3AadlNJ mode%3Aplay mixer%20volume%3A40");
+        let statut = out.get_status().await.unwrap();
+        assert!((statut.volume - 0.4).abs() < 1e-9, "{}", statut.volume);
+        assert!(!out.volume_du_statut_illisible());
+    }
 
     #[test]
     fn cli_port_constant() {

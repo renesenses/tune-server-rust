@@ -11,15 +11,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 use tune_core::db::backend::DbBackend;
+use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::EventBus;
 use tune_core::favorites_sort::TriFavoris;
+use tune_core::metadata::bio_segments::GenreDeLien;
 use tune_core::streaming::ServiceRegistry;
+use tune_core::streaming::bio_qobuz;
 use tune_core::streaming::traits::StreamingService;
 
 mod connexion_spotify_distante;
 pub mod deezer_proxy_handler;
 pub mod etiquettes_langue;
+/// #8066 — remplacer un titre indisponible dans une playlist du service.
+mod remplacement_indisponibles_8066;
 
 /// Sous-ensemble de l'état serveur nécessaire aux routes des services de
 /// streaming. Cette frontière empêche ces routes de dépendre de tout le
@@ -539,6 +544,18 @@ where
             "/{service}/playlists/{playlist_id}/tracks/remove",
             post(service_remove_tracks),
         )
+        .route(
+            "/{service}/playlists/{playlist_id}/tracks/{index}/replacements",
+            get(remplacement_indisponibles_8066::candidats_du_titre),
+        )
+        .route(
+            "/{service}/playlists/{playlist_id}/tracks/{index}/replace",
+            post(remplacement_indisponibles_8066::remplacer_le_titre),
+        )
+        .route(
+            "/{service}/playlists/{playlist_id}/repair",
+            post(remplacement_indisponibles_8066::reparer_la_playlist),
+        )
         .route("/{service}/tracks/{track_id}", get(service_track))
         .route("/{service}/tracks/{track_id}/url", get(service_track_url))
         .route(
@@ -546,6 +563,8 @@ where
             get(service_track_similar),
         )
         .route("/{service}/featured", get(service_featured))
+        // #7822 — les mixes personnels du compte, lisibles comme des playlists.
+        .route("/{service}/mixes", get(service_mixes))
         .route(
             "/{service}/featured/sections",
             get(service_featured_sections),
@@ -716,13 +735,21 @@ fn ranger_le_marquage_ia(
     }
 }
 
+/// #8062 — même enrichissement que [`service_playlist_tracks`].
 async fn service_album_tracks(
     State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
-        .get_album_tracks(&album_id)
-        .await)
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let pistes = arc
+        .read()
+        .await
+        .get_album_tracks_avec_annee_et_genre(&album_id)
+        .await;
+    svc_response(pistes.map(|p| pistes_avec_ecoutes(&state.backend, &service, p)))
 }
 
 async fn service_artist(
@@ -733,35 +760,97 @@ async fn service_artist(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let result = {
+    let (result, bio_html) = {
         let svc = arc.read().await;
-        svc.get_artist(&artist_id).await
+        match svc.get_artist_avec_bio_html(&artist_id).await {
+            Ok((artiste, html)) => (Ok(artiste), html),
+            Err(e) => (Err(e), None),
+        }
     };
 
     // Best-effort: persist a streaming editorial bio (e.g. Qobuz) into a
     // name-matched local artist that has none yet, so the library keeps it.
     // Fire-and-forget so the browse response is never delayed.
-    if let Ok(ref artist) = result {
-        if let Some(bio) = artist.bio.clone() {
-            if bio.len() > 50 {
-                let backend = state.backend.clone();
-                let name = artist.name.clone();
-                let svc_name = service.clone();
-                tokio::spawn(async move {
-                    let repo = tune_core::db::artist_repo::ArtistRepo::with_backend(backend);
-                    if let Ok(Some(local)) = repo.get_by_name(&name) {
-                        if let Some(id) = local.id {
-                            if local.bio.as_deref().unwrap_or("").is_empty() {
-                                let _ = repo.update_bio_full(id, &bio, &svc_name, None, "", "");
-                            }
-                        }
-                    }
-                });
+    //
+    // #8022 : la bio est rangée AVEC sa langue (celle que le service annonce,
+    // sinon celle du magasin du compte) et le lien vers la page du service.
+    // Elle était rangée sans langue, donc jamais servie depuis #7027 — et,
+    // tenant la place, elle empêchait la fiche locale d'en recevoir une
+    // autre. Langue inconnue : rien n'est rangé.
+    if let Ok(ref artist) = result
+        && artist.bio.as_deref().is_some_and(|b| b.len() > 50)
+    {
+        let backend = state.backend.clone();
+        let name = artist.name.clone();
+        let artist_id = artist.id.clone();
+        let svc_name = service.clone();
+        let arc = arc.clone();
+        tokio::spawn(async move {
+            let repo = tune_core::db::artist_repo::ArtistRepo::with_backend(backend);
+            let Ok(Some(local)) = repo.get_by_name(&name) else {
+                return;
+            };
+            let Some(id) = local.id else { return };
+            if !local.bio.as_deref().unwrap_or("").is_empty() {
+                return;
             }
-        }
+            let (texte, magasin) = {
+                let svc = arc.read().await;
+                (
+                    svc.bio_editoriale_artiste(&artist_id).await,
+                    svc.langue_du_magasin(),
+                )
+            };
+            let Ok(Some(texte)) = texte else { return };
+            let langue = texte
+                .langue
+                .as_deref()
+                .and_then(tune_core::streaming::editorial_bibliotheque::langue_de_base)
+                .or_else(|| {
+                    magasin
+                        .as_deref()
+                        .and_then(tune_core::streaming::editorial_bibliotheque::langue_de_base)
+                });
+            let Some(langue) = langue else {
+                tracing::debug!(id, "bio_de_service_sans_langue_non_rangee");
+                return;
+            };
+            let bio = tune_core::streaming::editorial_bibliotheque::borner(&texte.texte);
+            let _ = repo.update_bio_full(id, &bio, &svc_name, texte.url, "", &langue);
+        });
     }
 
-    svc_response(result)
+    // #8129 — la bio garde ses liens : `bio_segments` à côté de `bio`.
+    match (result, bio_html) {
+        (Ok(artiste), Some(html)) if service == bio_qobuz::SERVICE => {
+            let mut corps = json!(artiste);
+            let page = bio_qobuz::PageDeLaBio {
+                genre: GenreDeLien::Artiste,
+                id: &artiste.id,
+                noms: &[artiste.name.as_str()],
+            };
+            avec_bio_segments(&state.backend, &mut corps, "bio", &html, &page);
+            Json(corps).into_response()
+        }
+        (result, _) => svc_response(result),
+    }
+}
+
+/// #8129 — pose `bio_segments` dans `corps`, et remplace `champ` par le texte
+/// que ces segments recomposent (le même texte brut, entités décodées et
+/// paragraphes gardés) : un client les compare avant de les dessiner.
+fn avec_bio_segments(
+    backend: &Arc<dyn DbBackend>,
+    corps: &mut Value,
+    champ: &str,
+    html: &str,
+    page: &bio_qobuz::PageDeLaBio<'_>,
+) {
+    let index = tune_core::metadata::bio_segments::index_partage(backend);
+    if let Some((texte, segments)) = bio_qobuz::bio_qobuz_segmentee(html, &index, page) {
+        corps[champ] = Value::String(texte);
+        corps["bio_segments"] = serde_json::to_value(segments).unwrap_or(Value::Null);
+    }
 }
 
 /// `?offset=` pour un « voir plus » : la discographie s'arrêtait au
@@ -915,13 +1004,79 @@ async fn service_playlist(
     with_svc!(&state, &service, |svc| svc.get_playlist(&playlist_id).await)
 }
 
+/// #8062 — les pistes d'une playlist de service, avec les colonnes du tableau
+/// que la bibliothèque remplit déjà : `play_count`, `last_played_at`, et
+/// `year` / `genre` quand le service les publie. Voir [`pistes_avec_ecoutes`].
 async fn service_playlist_tracks(
     State(state): State<StreamingHttpState>,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
-        .get_playlist_tracks(&playlist_id)
-        .await)
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let pistes = arc
+        .read()
+        .await
+        .get_playlist_tracks_avec_annee_et_genre(&playlist_id)
+        .await;
+    svc_response(pistes.map(|p| pistes_avec_ecoutes(&state.backend, &service, p)))
+}
+
+/// #8062 — les colonnes d'un tableau de pistes, pour des pistes de SERVICE.
+///
+/// Le contrat est celui de la bibliothèque (`attacher_ecoutes`, côté
+/// `tune-server`) : `play_count` vaut `0` et `last_played_at` `null` pour une
+/// piste jamais jouée ; quand l'historique est illisible, aucune des deux clés
+/// n'est posée — un zéro dû à une panne se lirait « jamais jouée ». Une piste
+/// sans identifiant n'a pas d'écoutes connaissables : pas de clé non plus.
+///
+/// Les écoutes sont comptées tous profils confondus, comme la colonne de la
+/// bibliothèque ([`HistoryRepo::ecoutes_de_service_par_identifiant`]). Une
+/// seule requête pour toute la liste.
+///
+/// `year` et `genre` ne sont écrits que si le service les publie : absents,
+/// la cellule reste vide.
+fn pistes_avec_ecoutes(
+    backend: &Arc<dyn DbBackend>,
+    service: &str,
+    pistes: Vec<(
+        tune_core::streaming::traits::StreamTrack,
+        tune_core::streaming::traits::AnneeEtGenre,
+    )>,
+) -> Vec<Value> {
+    let ids: Vec<&str> = pistes.iter().map(|(t, _)| t.id.as_str()).collect();
+    let ecoutes = match HistoryRepo::with_backend(backend.clone())
+        .ecoutes_de_service_par_identifiant(service, &ids)
+    {
+        Ok(e) => Some(e),
+        Err(e) => {
+            tracing::error!(service, error = %e, "ecoutes_pistes_de_service_illisibles");
+            None
+        }
+    };
+    pistes
+        .iter()
+        .map(|(piste, extras)| {
+            let mut v = json!(piste);
+            let Some(obj) = v.as_object_mut() else {
+                return v;
+            };
+            if let Some(annee) = extras.year {
+                obj.insert("year".into(), json!(annee));
+            }
+            if let Some(genre) = &extras.genre {
+                obj.insert("genre".into(), json!(genre));
+            }
+            let id = piste.id.trim();
+            if let (Some(ecoutes), false) = (&ecoutes, id.is_empty()) {
+                let (compte, derniere) = ecoutes.get(id).cloned().unwrap_or((0, None));
+                obj.insert("play_count".into(), json!(compte));
+                obj.insert("last_played_at".into(), json!(derniere));
+            }
+            v
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -998,6 +1153,16 @@ async fn service_featured(
     Path(service): Path<String>,
 ) -> Response {
     with_svc_editorial!(&state, &service, |svc| svc.get_featured().await)
+}
+
+/// #7822 — `GET /streaming/{service}/mixes` : les mixes du compte, liste
+/// vide pour un service qui n'en a pas. Contenu personnel : pas de cache
+/// navigateur (`with_svc!`, pas `with_svc_editorial!`).
+async fn service_mixes(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_user_mixes().await)
 }
 
 async fn service_new_releases(
@@ -1278,9 +1443,35 @@ async fn service_album_description(
     State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
-        .get_album_description(&album_id)
-        .await)
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = arc.read().await;
+    let description = svc.get_album_description(&album_id).await;
+    // #8129 — les liens de la présentation : `bio_segments` à côté de
+    // `description`. `album/get` sort du cache que la ligne du dessus remplit.
+    let html = match &description {
+        Ok(Some(_)) if service == bio_qobuz::SERVICE => {
+            svc.presentation_album_html(&album_id).await.ok().flatten()
+        }
+        _ => None,
+    };
+    drop(svc);
+    match (description, html) {
+        (Ok(Some(d)), Some(h)) => {
+            let mut corps = json!(d);
+            let noms: Vec<&str> = h.noms.iter().map(String::as_str).collect();
+            let page = bio_qobuz::PageDeLaBio {
+                genre: GenreDeLien::Album,
+                id: &album_id,
+                noms: &noms,
+            };
+            avec_bio_segments(&state.backend, &mut corps, "description", &h.html, &page);
+            Json(corps).into_response()
+        }
+        (description, _) => svc_response(description),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,8 +1570,17 @@ async fn service_status(
         Err(e) => return e.into_response(),
     };
 
+    // #7760 — l'état se lit sous verrou de LECTURE. Un verrou d'écriture
+    // demandé ici se mettait en file derrière une lecture lente (favoris,
+    // playlists) et retenait toutes les lectures arrivées après lui : les
+    // widgets de l'accueil tombaient en « délai ». L'écriture n'est prise que
+    // pour une connexion par interrogation, que Qobuz n'a pas.
+    let mut status = svc.read().await.auth_status().await;
+    if status.authenticated || !connexion_par_interrogation(&service) {
+        return reponse_etat_du_service(&service, &status);
+    }
     let mut svc = svc.write().await;
-    let mut status = svc.auth_status().await;
+    status = svc.auth_status().await;
     if !status.authenticated
         && let Ok(poll_status) = svc.authenticate(&json!({"poll": true})).await
         && poll_status.authenticated
@@ -1390,6 +1590,22 @@ async fn service_status(
         state.save_tokens().await;
         purge_contenu_utilisateur(&service);
     }
+    reponse_etat_du_service(&service, &status)
+}
+
+/// Le service sait-il se connecter par interrogation (`{"poll": true}`) ?
+///
+/// Qobuz ne se connecte que par identifiant et mot de passe : sa tentative
+/// d'interrogation échoue aussitôt (« username required »), et prendre le
+/// verrou d'écriture pour elle ne fait que bloquer les lectures (#7760).
+fn connexion_par_interrogation(service: &str) -> bool {
+    service != "qobuz"
+}
+
+fn reponse_etat_du_service(
+    service: &str,
+    status: &tune_core::streaming::traits::AuthStatus,
+) -> Response {
     Json(json!({
         "service": service,
         "enabled": true,
@@ -1849,19 +2065,68 @@ fn poser_le_tri(mut donnees: Value, q: &TriQuery) -> Value {
     donnees
 }
 
+/// #7729 — attente maximale de la route des favoris pour les VERROUS : celui
+/// du registre des services, puis celui du service. Au-delà, la route répond
+/// 503 avec un motif au lieu de laisser l'écran sur « Chargement… ».
+///
+/// La lecture chez le service, elle, n'est pas coupée : une grande liste ou
+/// un réseau lent la font durer, mais elle finit (requêtes bornées, pages
+/// bornées) et remplit le cache. La couper rendait 503 à chaque essai, sans
+/// jamais remplir le cache (revue de la PR #8041).
+#[cfg(not(test))]
+const DELAI_FAVORIS: std::time::Duration = std::time::Duration::from_secs(20);
+/// Plus court en test, pour que le témoin du gel (#7729) reste rapide.
+#[cfg(test)]
+const DELAI_FAVORIS: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Attend `attente` (un verrou) au plus jusqu'à `echeance`. `None` = délai
+/// dépassé.
+async fn verrou_borne<F: std::future::Future>(
+    echeance: tokio::time::Instant,
+    attente: F,
+) -> Option<F::Output> {
+    tokio::time::timeout_at(echeance, attente).await.ok()
+}
+
+/// La réponse 503 de la route des favoris quand un verrou n'a pas été obtenu
+/// dans le délai.
+fn favoris_service_occupe(service: &str, fav_type: &str) -> Response {
+    tracing::warn!(
+        service = %service,
+        fav_type = %fav_type,
+        delai_s = DELAI_FAVORIS.as_secs(),
+        "streaming_favorites_delai_depasse"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "service_occupe",
+            "message": format!(
+                "{service} n'a pas répondu à temps pour les favoris ; réessayez dans un instant"
+            ),
+        })),
+    )
+        .into_response()
+}
+
 async fn service_favorites(
     State(state): State<StreamingHttpState>,
     Path((service, fav_type)): Path<(String, String)>,
     Query(tri): Query<TriQuery>,
 ) -> Response {
-    let arc = match get_svc_actif(&state, &service).await {
-        Ok(s) => s,
+    // #7729 — journalisé AVANT toute attente : un gel ne laissait aucune
+    // ligne, la route attendant un verrou avant la première.
+    tracing::debug!(service = %service, fav_type = %fav_type, "streaming_favorites_demande");
+    let echeance = tokio::time::Instant::now() + DELAI_FAVORIS;
+    let arc = match verrou_borne(echeance, get_svc_actif(&state, &service)).await {
+        None => return favoris_service_occupe(&service, &fav_type),
+        Some(Ok(s)) => s,
         // A non-streaming source (e.g. "upnp"/"radio"/"podcast" media-server
         // items) has no streaming favorites. Return an empty list (200) rather
         // than a plain-text 404 so the web client's `.json()` doesn't blow up
         // with "TypeError: (void 0) is not a function" (Yacine, DevTools console:
         // GET /streaming/upnp/favorites/tracks 404).
-        Err(_) => {
+        Some(Err(_)) => {
             let cle = TypeFavori::parse(&fav_type)
                 .map(TypeFavori::cle)
                 .unwrap_or("tracks");
@@ -1878,7 +2143,9 @@ async fn service_favorites(
     // pas le max (#1621). Le dispatch n'appelle que des méthodes `&self` ;
     // seul le rafraîchissement de jeton, plus bas, exige l'écriture.
     let result = {
-        let svc = arc.read().await;
+        let Some(svc) = verrou_borne(echeance, arc.read()).await else {
+            return favoris_service_occupe(&service, &fav_type);
+        };
         lire_favoris(&**svc, &fav_type).await
     };
     match result {
@@ -1895,17 +2162,28 @@ async fn service_favorites(
             } =>
         {
             // Token expired — attempt refresh and retry
+            // Délai neuf : la lecture qui précède a pu consommer le premier.
+            let echeance = tokio::time::Instant::now() + DELAI_FAVORIS;
             let rafraichi = {
-                let mut svc = arc.write().await;
+                let Some(mut svc) = verrou_borne(echeance, arc.write()).await else {
+                    return favoris_service_occupe(&service, &fav_type);
+                };
                 svc.refresh_if_needed().await.unwrap_or(false)
             };
             if rafraichi {
-                state.save_tokens().await;
-                let arc = match get_svc_actif(&state, &service).await {
-                    Ok(s) => s,
-                    Err(e) => return e.into_response(),
+                // Enregistrés à part : l'enregistrement attend le registre,
+                // et l'interrompre en cours d'écriture laisserait des jetons
+                // à moitié écrits.
+                let a_enregistrer = state.clone();
+                tokio::spawn(async move { a_enregistrer.save_tokens().await });
+                let arc = match verrou_borne(echeance, get_svc_actif(&state, &service)).await {
+                    None => return favoris_service_occupe(&service, &fav_type),
+                    Some(Ok(s)) => s,
+                    Some(Err(e)) => return e.into_response(),
                 };
-                let svc = arc.read().await;
+                let Some(svc) = verrou_borne(echeance, arc.read()).await else {
+                    return favoris_service_occupe(&service, &fav_type);
+                };
                 match lire_favoris(&**svc, &fav_type).await {
                     Ok(data) => {
                         memoriser_contenu_utilisateur(&service, &ressource, data.clone());
@@ -2528,6 +2806,7 @@ mod tests_cache_utilisateur {
                         "Psychedelic Mongolian Trip Hop (\"Painted Yurts, Painted Souls\") AI Album"
                             .to_string(),
                     ai_generated: Some(true),
+                    explicit: None,
                     ..Default::default()
                 });
             }
@@ -4014,7 +4293,19 @@ mod temoin_rubriques_dans_la_langue_demandee {
 mod service_desactive_jamais_appele_tests;
 
 #[cfg(test)]
+mod favoris_sans_gel_7729_tests;
+
+#[cfg(test)]
+mod mixes_du_compte_7822_tests;
+
+#[cfg(test)]
 mod youtube_decouverte_tests;
+
+#[cfg(test)]
+mod etat_sans_verrou_exclusif_7760_tests;
+
+#[cfg(test)]
+mod ecoutes_pistes_de_service_8062_tests;
 
 /// #6480 — `GET /streaming/{service}/albums/{id}/description` : le texte de
 /// présentation d'un album de service (cpadiou77, fil forum 2327).
@@ -4434,6 +4725,7 @@ mod tests_labels_6934 {
             released_at: None,
             release_type: None,
             ai_generated: None,
+            explicit: None,
         }
     }
 
@@ -4689,3 +4981,6 @@ mod tests_echec_de_connexion_7068 {
         assert_eq!(texte, "qobuz login: 500 boom");
     }
 }
+
+#[cfg(test)]
+mod bio_qobuz_8129_tests;

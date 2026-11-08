@@ -8,6 +8,19 @@ use std::sync::Arc;
 
 pub const REWIND_KEY: &str = "continue_listening_rewind_seconds";
 pub const DEFAULT_REWIND: u64 = 10;
+/// #7840 — recul maximal (décision du 04/11) : au-delà, la reprise d'un
+/// épisode ferait réentendre une minute ou plus de ce qui vient d'être écouté.
+pub const REWIND_MAX: u64 = 60;
+
+/// Recul réellement appliqué pour la valeur enregistrée du réglage : 10 s si
+/// elle est absente ou illisible, ramenée à 60 s si elle a été enregistrée
+/// au-dessus (l'ancienne borne acceptait jusqu'à 300 s).
+pub fn effective_rewind(stored: Option<&str>) -> u64 {
+    stored
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REWIND)
+        .min(REWIND_MAX)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resume {
@@ -86,11 +99,21 @@ pub fn recent(
         .map(|rows| {
             rows.into_iter()
                 .filter(|r| {
-                    seen.insert((
-                        r.context_type.clone(),
-                        r.context_id.clone(),
-                        r.source.clone(),
-                    ))
+                    // #8085 — un épisode est UNE carte, quel que soit le
+                    // contexte sous lequel ses reprises ont été écrites (fil
+                    // d'abonnement, identifiant du podcast, adresse du média,
+                    // ligne « track » de la route générique). Les lignes
+                    // arrivent de la plus récente à la plus ancienne : la
+                    // position la plus récente gagne. Rien n'est effacé.
+                    let cle = match episode_de_la_reprise(r) {
+                        Some(url) => ("episode".to_string(), cle_d_episode(url), String::new()),
+                        None => (
+                            r.context_type.clone(),
+                            r.context_id.clone(),
+                            r.source.clone(),
+                        ),
+                    };
+                    seen.insert(cle)
                 })
                 .collect()
         })
@@ -110,6 +133,11 @@ pub fn started(
 ) -> Result<(), String> {
     let nature = c.nature.unwrap_or("track");
     if !matches!(nature, "album" | "playlist" | "track") {
+        return Ok(());
+    }
+    // #8085 — un épisode a sa propre reprise (`podcast_started_in_context`) ;
+    // l'écrire aussi ici en « track » en faisait une seconde carte.
+    if source == "podcast" {
         return Ok(());
     }
     let queue = PlayQueueRepo::with_backend(db.clone()).get_ordered(zone_id)?;
@@ -169,7 +197,27 @@ pub fn started(
             ) && x[2].as_string().is_none_or(|v| v == id)
                 && x[3].as_string().is_none_or(|v| v == service)
         });
-        if !belongs || (nature == "track" && e.id != current.id) {
+        // #7401 — un « titre » n'est pas forcément joué seul. Une tête de
+        // liste lancée par /play (titre d'une playlist de service, « Tout
+        // lire » de favoris, titre joué dans son album, #5372) laisse sa
+        // suite en lignes SANS contexte explicite : elles suivent la session,
+        // donc ce titre. Les garder, sinon la reprise rejoue le titre à sa
+        // position puis s'arrête. Une ligne explicite n'entre que si elle
+        // nomme CE titre (file déjà restaurée) : un titre ajouté seul
+        // (`titre_seul`, sans identifiant) reste un autre geste.
+        let belongs = if nature == "track" && e.id != current.id {
+            explicit.is_some_and(|x| match x[1].as_string() {
+                Some(n) => {
+                    n == "track"
+                        && x[2].as_string().as_deref() == Some(id)
+                        && x[3].as_string().is_none_or(|v| v == service)
+                }
+                None => !current_explicit || inherited_rows.contains(&e.id),
+            })
+        } else {
+            belongs
+        };
+        if !belongs {
             continue;
         }
         if e.id == current.id {
@@ -280,7 +328,7 @@ pub fn mark_current_shuffled(db: &Arc<dyn DbBackend>, zone_id: i64) -> Result<()
 }
 
 pub fn rewind(position_ms: i64, seconds: u64) -> u64 {
-    (position_ms.max(0) as u64).saturating_sub(seconds.min(300) * 1000)
+    (position_ms.max(0) as u64).saturating_sub(seconds.min(REWIND_MAX) * 1000)
 }
 
 /// Ne met à jour qu'un titre seul réellement démarré et encore courant.
@@ -329,7 +377,12 @@ pub fn track_position(
         if r.context_type != "track" || !r.queue_row_ids.contains(&current.id) {
             continue;
         }
-        let matches = r.items.first().is_some_and(|i| match i {
+        // #7401 — un titre suivi de sa suite : c'est le titre au rang
+        // mémorisé qui joue, pas forcément le premier de l'instantané.
+        if r.queue_row_ids.get(r.position) != Some(&current.id) {
+            continue;
+        }
+        let matches = r.items.get(r.position).is_some_and(|i| match i {
             QueueInput::Local { track_id } => {
                 np.source == "local" && np.track_id == Some(*track_id)
             }
@@ -358,15 +411,89 @@ pub fn episode_fini(position_ms: i64, duree_ms: i64) -> bool {
             || position_ms.saturating_mul(100) >= duree_ms.saturating_mul(FIN_EPISODE_POURCENT))
 }
 
+/// La reprise est-elle celle de l'épisode dont le média est à `url` ?
+fn est_l_episode(r: &Resume, url: &str) -> bool {
+    episode_de_la_reprise(r).is_some_and(|u| cle_d_episode(u) == cle_d_episode(url))
+}
+/// L'adresse de l'épisode qu'une reprise porte, `None` si elle n'en porte
+/// pas : une ligne de podcast, ou une ligne « track » d'un média de podcast
+/// écrite avant #8085.
+fn episode_de_la_reprise(r: &Resume) -> Option<&str> {
+    match r.items.first() {
+        Some(QueueInput::Streaming {
+            source, source_id, ..
+        }) if (r.context_type == "podcast" || r.source == "podcast" || source == "podcast")
+            && !source_id.trim().is_empty() =>
+        {
+            Some(source_id.as_str())
+        }
+        _ => None,
+    }
+}
+/// #8085 — la clé stable d'un épisode : l'adresse de son média, sans
+/// espaces autour ni fragment (`#…`, jamais envoyé au serveur). La requête
+/// reste : certains hébergeurs y désignent l'épisode.
+pub fn cle_d_episode(url: &str) -> String {
+    let u = url.trim();
+    u.split('#').next().unwrap_or(u).to_string()
+}
+/// Toutes les reprises d'épisode d'une zone (`None` : toutes zones), de la
+/// plus récente à la plus ancienne, SANS dédoublonnage, avec leur zone.
+fn reprises_d_episodes(
+    db: &Arc<dyn DbBackend>,
+    zone_id: Option<i64>,
+) -> Result<Vec<(Resume, Option<i64>)>, String> {
+    let rows = match zone_id {
+        Some(z) => db.query_many(
+            "SELECT payload, resume_key, zone_id FROM listening_resumes WHERE zone_id = ? \
+             ORDER BY updated_at DESC, resume_key DESC",
+            &[&z as &dyn ToSqlValue],
+        )?,
+        None => db.query_many(
+            "SELECT payload, resume_key, zone_id FROM listening_resumes \
+             ORDER BY updated_at DESC, resume_key DESC",
+            &[],
+        )?,
+    };
+    let mut out = Vec::new();
+    for row in &rows {
+        let r = decode(row)?;
+        if episode_de_la_reprise(&r).is_some() {
+            out.push((r, row.get(2).and_then(|v| v.as_i64())));
+        }
+    }
+    Ok(out)
+}
+/// #8085 — la reprise enregistrée de l'épisode `url`, pour le relancer
+/// depuis une carte qui ne connaît que son adresse (accueil « Récemment
+/// écoutés », Historique). Celle de la zone d'abord, sinon la plus récente
+/// des autres zones. Pas de dédoublonnage par podcast, contrairement à
+/// [`recent`] : il garderait la reprise d'un autre épisode du même podcast
+/// et cacherait celle-ci.
+pub fn podcast_de_l_adresse(
+    db: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    url: &str,
+) -> Result<Option<Resume>, String> {
+    let mut ailleurs = None;
+    for (r, zone) in reprises_d_episodes(db, None)? {
+        if !est_l_episode(&r, url) {
+            continue;
+        }
+        if zone == Some(zone_id) {
+            return Ok(Some(r));
+        }
+        ailleurs.get_or_insert(r);
+    }
+    Ok(ailleurs)
+}
 /// Retire la reprise de l'épisode `url` sur cette zone (épisode écouté).
 pub fn podcast_termine(db: &Arc<dyn DbBackend>, zone_id: i64, url: &str) -> Result<usize, String> {
     let mut retirees = 0;
-    for r in recent(db, Some(zone_id), 80)?.into_iter().filter(|r| {
-        r.context_type == "podcast"
-            && r.items.first().is_some_and(
-                |i| matches!(i, QueueInput::Streaming { source_id, .. } if source_id == url),
-            )
-    }) {
+    for (r, _) in reprises_d_episodes(db, Some(zone_id))?
+        .into_iter()
+        .filter(|(r, _)| est_l_episode(r, url))
+    {
         db.execute(
             "DELETE FROM listening_resumes WHERE resume_key = ?",
             &[&r.resume_key as &dyn ToSqlValue],
@@ -399,18 +526,14 @@ pub fn podcast_position_avec_duree(
         podcast_termine(db, zone_id, url)?;
         return Ok(());
     }
-    let rows = recent(db, Some(zone_id), 80)?;
-    if let Some(mut r) = rows.into_iter().find(|r| {
-        r.context_type == "podcast"
-            && r.items.first().is_some_and(
-                |i| matches!(i, QueueInput::Streaming { source_id, .. } if source_id == url),
-            )
-    }) {
-        if r.position_ms / 1000 != position_ms.max(0) / 1000 {
-            r.position_ms = position_ms.max(0);
-            r.updated_at = chrono::Utc::now().to_rfc3339();
-            save(db, zone_id, &r)?;
-        }
+    if let Some((mut r, _)) = reprises_d_episodes(db, Some(zone_id))?
+        .into_iter()
+        .find(|(r, _)| est_l_episode(r, url))
+        && r.position_ms / 1000 != position_ms.max(0) / 1000
+    {
+        r.position_ms = position_ms.max(0);
+        r.updated_at = chrono::Utc::now().to_rfc3339();
+        save(db, zone_id, &r)?;
     }
     Ok(())
 }
@@ -439,11 +562,23 @@ pub fn podcast_started_in_context(
         podcast_termine(db, zone_id, url)?;
         return Ok(());
     }
+    // #8085 — la clé de la reprise ne dépend plus du contexte de session,
+    // qui change selon la route qui a lancé l'épisode (fil d'abonnement,
+    // identifiant du podcast, adresse du média, voire un identifiant resté
+    // d'une lecture précédente) : chaque route écrivait SA ligne, et
+    // « Reprendre l'écoute » montrait l'épisode quatre fois sur le .18. La
+    // reprise de l'épisode déjà écrite sur cette zone garde son contexte, et
+    // c'est elle que l'upsert met à jour.
+    let existante = reprises_d_episodes(db, Some(zone_id))?
+        .into_iter()
+        .map(|(r, _)| r)
+        .find(|r| r.context_type == "podcast" && est_l_episode(r, url));
     let r = Resume {
         resume_key: uuid::Uuid::new_v4().to_string(),
         context_type: "podcast".into(),
-        context_id: context_id
-            .map(str::to_string)
+        context_id: existante
+            .map(|r| r.context_id)
+            .or_else(|| context_id.map(str::to_string))
             .or_else(|| np.album_title.clone())
             .or_else(|| np.artist_name.clone())
             .unwrap_or_else(|| url.into()),

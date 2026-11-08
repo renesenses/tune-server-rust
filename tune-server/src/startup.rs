@@ -642,12 +642,16 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // lecture et rien d'écrit sur une base déjà passée. Avant la boucle de
     // synchronisation, qui ne les ramènera plus.
     tune_core::db::radios_indexees_upnp_6500::passe_journalisee(&state.backend);
+    // #7695 — de même pour les photos et vidéos d'un partage multimédia
+    // (DNG d'un portable Windows), rangées dans `tracks` avant le correctif.
+    tune_core::db::photos_indexees_upnp_7695::passe_journalisee(&state.backend);
     restore_zone_volumes(state).await;
     restaurer_la_lecture(state, config).await;
     restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
     resolve_ytdlp(state).await;
     restore_convolvers(state).await;
+    surveiller_le_droit_de_convoluer(state);
     warm_sqlite_cache(state);
     crate::routes::synchronisation_upnp::start(state.clone());
 
@@ -663,6 +667,11 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
         // #4626 — les sorties prêtées par les agents Tune appairés.
         crate::agent_tune::maitre::reinscrire_les_agents(&state_clone).await;
     });
+    // #6961 — la resonde ci-dessus ne part qu'UNE fois. Une zone DLNA/OpenHome
+    // restée hors ligne (appareil injoignable à cet instant précis, réseau de
+    // la machine pas encore prêt) est réévaluée ensuite, à intervalles, au
+    // lieu d'attendre un `NOTIFY` qu'un renderer déjà allumé n'émet pas.
+    crate::discovery_setup::spawn_reevaluation_des_zones_hors_ligne(state);
 
     // Re-probe auto-discovered DLNA renderers from their persisted LOCATION,
     // so one with a lazy SSDP responder (Cyrus Stream X2) comes back online
@@ -1074,6 +1083,17 @@ fn recalculer_les_compilations(state: &AppState) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "compilations_recalcul_impossible"),
     }
+    // #6459 — meme principe pour les albums retrogrades sous « Unknown
+    // Artist » : la base garde l'artiste de leurs pistes.
+    match tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+        .rendre_leur_artiste_aux_albums_inconnus()
+    {
+        Ok(bilan) if bilan.rendus > 0 => {
+            info!(?bilan, "albums_inconnus_rendus_au_demarrage");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "albums_inconnus_reprise_impossible"),
+    }
 }
 
 /// Re-rattache les favoris orphelins aux items vivants retrouvés par identité
@@ -1371,6 +1391,34 @@ async fn restore_convolvers(state: &AppState) {
             }
         }
     }
+}
+
+/// #7632 — la convolution par RI est un droit Premium (`RoomCorrection`).
+/// Le droit change hors de toute lecture (validation de licence, compte SSO,
+/// expiration) : cette tâche le relit toutes les deux secondes et, quand il
+/// bascule, le rend aux sorties (`appliquer_le_droit_de_convoluer`) — la
+/// convolution s'éteint en fondu sur une sortie locale, un flux réseau qui la
+/// portait est relancé à sa position. Relecture `premium_snapshot`, sans
+/// verrou bloquant.
+fn surveiller_le_droit_de_convoluer(state: &AppState) {
+    let orchestrateur = state.orchestrator.clone();
+    tokio::spawn(async move {
+        let mut avant = orchestrateur.correction_ir_autorisee();
+        let mut intervalle = tokio::time::interval(std::time::Duration::from_secs(2));
+        intervalle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            intervalle.tick().await;
+            let maintenant = orchestrateur.correction_ir_autorisee();
+            if maintenant != avant {
+                avant = maintenant;
+                let relances = orchestrateur.appliquer_le_droit_de_convoluer().await;
+                info!(
+                    autorisee = maintenant,
+                    relances, "droit_de_convoluer_change"
+                );
+            }
+        }
+    });
 }
 
 /// Touch key tables so SQLite page cache is warm for the first UI load.
@@ -2504,15 +2552,13 @@ pub(crate) async fn enregistrer_les_sorties_locales(
         // logiciel local, lui, n'appartient qu'à Tune, et sa valeur de départ
         // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
         // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
-        if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
-            tune_core::orchestrator::ensemencer_le_volume_local(
-                &state.backend,
-                &zone,
-                &device_id,
-                &local_out,
-            )
-            .await;
-        }
+        // #8074 — sans zone en base, la sortie part BAS, pas à pleine échelle.
+        tune_core::orchestrator::ensemencer_la_sortie_locale_neuve(
+            &state.backend,
+            &device_id,
+            &local_out,
+        )
+        .await;
         outputs.register(Box::new(local_out));
         info!(
             name = %dev.name,
@@ -2748,6 +2794,7 @@ pub(crate) async fn remplacer_le_repli_wasapi(
         enregistrees: enregistrees.clone(),
         ..Default::default()
     };
+    let mut sorties_retirees = Vec::new();
     {
         let mut outputs = state.outputs.lock().await;
         for id in repli {
@@ -2767,10 +2814,13 @@ pub(crate) async fn remplacer_le_repli_wasapi(
                 rapport.gardees_en_lecture.push(id.clone());
                 continue;
             }
-            outputs.remove(id);
+            sorties_retirees.extend(outputs.remove(id));
             rapport.retirees.push(id.clone());
         }
     }
+    // #7949 — arrêtées hors du verrou du registre : une sortie WASAPI en
+    // pause gardait son fil et son périphérique.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(sorties_retirees).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     for id in &rapport.retirees {
         let _ = zone_repo.set_online_by_device(id, false);
@@ -3848,7 +3898,8 @@ mod restore_zone_volumes_tests {
         let sortie = tune_core::outputs::local::LocalOutput::new("Test".into());
         ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
 
-        let gain = sortie.gain_de_rendu().load(Ordering::SeqCst) as f64 / 1000.0;
+        let gain = sortie.gain_de_rendu().load(Ordering::SeqCst) as f64
+            / f64::from(tune_core::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU);
         let attendu = tune_core::orchestrator::volume_avec_trim(0.8, -6.0);
         assert!(
             (gain - attendu).abs() < 2e-3,
@@ -3877,7 +3928,10 @@ mod restore_zone_volumes_tests {
         ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
 
         let gain = sortie.gain_de_rendu().load(Ordering::SeqCst);
-        assert!(gain <= 1000, "gain de rendu {gain}/1000 : plafond franchi");
+        assert!(
+            gain <= tune_core::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+            "gain de rendu {gain} : plafond de l'unité franchi"
+        );
     }
 
     /// #5695 — la graine d'une sortie locale sous PURE forcé : 100 %, SANS
@@ -3908,8 +3962,9 @@ mod restore_zone_volumes_tests {
         ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
         let gain = sortie.gain_de_rendu().load(Ordering::SeqCst);
         assert_eq!(
-            gain, 1000,
-            "gain de rendu {gain}/1000 sous PURE forcé : le trim a été composé"
+            gain,
+            tune_core::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+            "gain de rendu {gain} sous PURE forcé : le trim a été composé"
         );
     }
     /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.

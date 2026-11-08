@@ -140,6 +140,10 @@ pub enum StoppedOutcome {
     /// atteint jusque-là : il joue. Le tour ne compte pas comme un arrêt et
     /// la série en cours est effacée ; voir [`arret_dementi_par_la_position`].
     SuppressPositionAdvancing,
+    /// #7700 — l'appareil DLNA a quitté notre piste en milieu de lecture
+    /// avec de l'audio en main : « suivant » à sa télécommande. Absent de
+    /// [`classify_stopped`], qui ne mesure pas le flux.
+    SuivantDeLAppareil,
 }
 
 impl StoppedOutcome {
@@ -151,6 +155,7 @@ impl StoppedOutcome {
                 | StoppedOutcome::LocalEndedNaturally
                 | StoppedOutcome::DsdDlnaReachedEnd
                 | StoppedOutcome::NaturalEndAdvance
+                | StoppedOutcome::SuivantDeLAppareil
         )
     }
 
@@ -661,15 +666,21 @@ mod tests {
     #[test]
     fn volume_adopted_on_real_device_change() {
         // The knob moved DOWN on the device (0.50 -> 0.20) and now differs
-        // from the saved volume — adopt it. #6739 : jamais à la hausse.
+        // from the saved volume — adopt it. #7379 : à la hausse, sous le
+        // plafond de suivi seulement (0,85 par défaut).
         assert!(super::super::decisions::should_adopt_device_volume(
             Some(0.5),
             0.2,
             0.3
         ));
-        assert!(!super::super::decisions::should_adopt_device_volume(
+        assert!(super::super::decisions::should_adopt_device_volume(
             Some(0.5),
             0.62,
+            0.3
+        ));
+        assert!(!super::super::decisions::should_adopt_device_volume(
+            Some(0.5),
+            0.95,
             0.3
         ));
     }

@@ -1,0 +1,559 @@
+//! #7264 — **le volume logiciel appliqué au moment du rendu**, après l'anneau
+//! natif, pour le WASAPI exclusif.
+//!
+//! # Le défaut
+//!
+//! Sous Windows, en WASAPI exclusif avec un volume logiciel (rc8.1, JeanPitre,
+//! fil « le curseur de volume est bizarre »), un geste sur le curseur ne
+//! s'entendait qu'environ **deux secondes** après. Le curseur et la commande
+//! (`device_set_volume_sending`) partaient tout de suite ; c'était le SON qui
+//! suivait en retard.
+//!
+//! La cause : l'étage natif ([`super::etage_natif::EtageNatif`]) pondérait les
+//! mots par le volume **dans le producteur**, AVANT l'anneau natif
+//! ([`super::NativePcmRing`]), et l'anneau du bras WASAPI
+//! (`bras_wasapi.rs`, `anneau_pour`) contient `cadence × voies × 2`
+//! échantillons, soit **deux secondes**. Le fil de rendu WASAPI ne faisait que
+//! resérialiser des mots déjà pondérés : le nouveau gain attendait que les deux
+//! secondes déjà pondérées à l'ancien gain soient jouées. Le tampon du pilote
+//! (448 trames, ~10 ms dans le rapport du 27/10) n'y est pour rien.
+//!
+//! # Le remède
+//!
+//! Le même que celui du chemin natif ALSA S32 (#6734, `bras_alsa_natif.rs`) :
+//! l'étage reçoit un volume constant à l'unité, et le **fil de rendu** pondère
+//! les mots qu'il tire de l'anneau, période par période, avec le volume relu
+//! à chaque réveil. Un geste prend effet à la période suivante du pilote, puis
+//! glisse vers la nouvelle consigne en [`RAMPE_DU_VOLUME_MS`] — sans marche,
+//! donc sans clic. Délai audible borné : une ou deux périodes de pilote
+//! (~10 à 20 ms) plus la rampe, quelle que soit la profondeur de l'anneau.
+//!
+//! # Ce qui reste intact, au bit près
+//!
+//! * **Volume à 100 % et rampe au repos** : les mots sont resérialisés tels
+//!   quels, exactement comme `pop_pcm_bytes` — le bit-perfect est entier.
+//! * **DoP et reliquat forcé brut** : un porteur DoP ne supporte aucun facteur
+//!   autre que 1. Le volume y est déjà à l'unité (`sync_volume_to_dop`), mais
+//!   l'état DoP de la zone change au moment où le PRODUCTEUR le découvre,
+//!   jusqu'à deux secondes avant que ces mots soient rendus : à un
+//!   enchaînement DoP ↔ PCM dans le même flux, le rendu appliquerait le gain
+//!   de l'un aux mots de l'autre. Le producteur **marque** donc dans l'anneau
+//!   la position exacte où commence un passage intact (DoP) et celle où il
+//!   finit ([`super::NativePcmRing::marquer_passage_intact`]) ; le rendu ne
+//!   touche jamais un mot d'un passage intact, et reprend le PCM qui suit
+//!   directement à la consigne courante (aucune rampe depuis l'unité).
+//! * **Jamais plus fort que la consigne** : le gain est borné à `[0, 1]`, et
+//!   chaque mot pondéré est arrondi à la profondeur déclarée puis borné à sa
+//!   pleine échelle.
+//!
+//! # #7703 — la pondération est dithérée
+//!
+//! Ce rendu est la DERNIÈRE quantification du WASAPI exclusif : depuis #7264,
+//! l'étage natif travaille à l'unité, et c'est ici que le volume réduit la
+//! piste. Un arrondi nu y gardait l'erreur corrélée au signal que #7703
+//! retire de `f32_to_native_i32`. Le mot pondéré reçoit donc le TPDF ±1 LSB
+//! du dépôt (`audio::dither`) avant l'arrondi, à 16 et 24 bits ; rien à
+//! 32 bits. Un produit qui tombe déjà sur un mot exact (silence numérique,
+//! gain qui divise juste) sort sans bruit : le silence reste un zéro.
+
+// Seul le fil de rendu WASAPI s'en sert hors des témoins.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Durée de la rampe d'un changement de volume au rendu. 20 ms : la même
+/// durée que la rampe anti-« ploc » par défaut (#1590,
+/// [`crate::audio::soft_mute::SOFT_MUTE_DEFAULT_MS`]) — à 44,1 kHz, 882
+/// trames, soit un pas de gain sous −58 dB même pour un saut de 0 à 100 %, et
+/// bien sous le seuil où un geste paraît mou.
+pub(crate) const RAMPE_DU_VOLUME_MS: u32 = 20;
+
+/// Le volume effectif qui laisse les mots intacts : 100 %, dans l'unité de
+/// la sortie locale (#7968).
+const UNITE: u32 = crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
+
+/// L'état du gain tenu par un fil de rendu natif. Ni allocation ni verrou :
+/// trois `f64`, un compteur de trames et deux drapeaux.
+pub(crate) struct GainAuRendu {
+    /// Le volume effectif de la sortie (utilisateur × ReplayGain, plafonné à
+    /// l'unité par `effective_volume_units`), en [`UNITE`]. Relu à chaque
+    /// période.
+    volume: Arc<AtomicU32>,
+    /// La consigne courante, dans `[0, 1]`.
+    cible: f64,
+    /// Le gain appliqué à la trame en cours.
+    courant: f64,
+    /// L'incrément par trame de la rampe en cours (toujours positif).
+    pas: f64,
+    trames_de_rampe: f64,
+    canaux: u64,
+    /// Le passage en cours de rendu est-il intact (DoP, reliquat brut) ?
+    intact: bool,
+    /// #7703 — le TPDF de la pondération (état de 64 bits, sans allocation).
+    dither: crate::audio::dither::Dither,
+}
+
+impl GainAuRendu {
+    /// Un gain au repos à la consigne courante : l'ouverture d'un flux ne
+    /// fond jamais depuis l'unité (ce serait un éclat de la durée de la
+    /// rampe à 100 %).
+    pub(crate) fn nouveau(volume: Arc<AtomicU32>, cadence: u32, canaux: u32) -> Self {
+        let cible = gain_de(volume.load(Ordering::Relaxed));
+        let trames_de_rampe =
+            (f64::from(cadence.max(1)) * f64::from(RAMPE_DU_VOLUME_MS) / 1000.0).max(1.0);
+        Self {
+            volume,
+            cible,
+            courant: cible,
+            pas: 0.0,
+            trames_de_rampe,
+            canaux: u64::from(canaux.max(1)),
+            intact: false,
+            dither: crate::audio::dither::Dither::depuis_graine(GRAINE_DU_RENDU),
+        }
+    }
+
+    /// Le gain appliqué en ce moment (pour les témoins).
+    #[cfg(test)]
+    pub(crate) fn courant(&self) -> f64 {
+        self.courant
+    }
+
+    /// Relit la consigne ; une consigne nouvelle arme une rampe de
+    /// [`RAMPE_DU_VOLUME_MS`] depuis le gain atteint.
+    pub(crate) fn relire_la_consigne(&mut self) {
+        let cible = gain_de(self.volume.load(Ordering::Relaxed));
+        if cible != self.cible {
+            self.cible = cible;
+            self.pas = (cible - self.courant).abs() / self.trames_de_rampe;
+        }
+    }
+
+    /// Entrée dans un passage marqué par le producteur. Sortir d'un passage
+    /// intact reprend directement à la consigne : le PCM qui suit un DoP
+    /// n'est jamais rendu, même 20 ms, au-dessus de ce que l'utilisateur a
+    /// demandé.
+    pub(crate) fn entrer_dans_le_passage(&mut self, intact: bool) {
+        if self.intact && !intact {
+            self.courant = self.cible;
+            self.pas = 0.0;
+        }
+        self.intact = intact;
+    }
+
+    /// Le mot rendu pour `mot` (aligné à gauche, `bits` déclarés), à la
+    /// position absolue `position` de l'anneau. La rampe avance aux
+    /// frontières de trame : tous les canaux d'une trame reçoivent le même
+    /// facteur.
+    #[inline]
+    pub(crate) fn rendre(&mut self, mot: i32, bits: u16, position: u64) -> i32 {
+        if self.intact {
+            return mot;
+        }
+        let rendu = if self.courant == 1.0 {
+            mot
+        } else {
+            ponderer_avec_dither(mot, bits, self.courant, &mut self.dither)
+        };
+        if position % self.canaux == self.canaux - 1 && self.courant != self.cible {
+            self.courant = if self.cible > self.courant {
+                (self.courant + self.pas).min(self.cible)
+            } else {
+                (self.courant - self.pas).max(self.cible)
+            };
+        }
+        rendu
+    }
+}
+
+/// Les unités de volume (`UNITE`, #7968) en gain, bornées à `[0, 1]` :
+/// jamais plus fort que la pleine échelle, quel que soit ce qui est stocké.
+/// La conversion commune à tous les rappels de rendu.
+fn gain_de(volume_units: u32) -> f64 {
+    crate::audio::volume_scale::gain_des_unites(volume_units)
+}
+
+/// Pondère un mot aligné à gauche à sa profondeur déclarée : le mot utile est
+/// multiplié en `f64` (exact pour 32 bits), arrondi, borné à la pleine
+/// échelle de `bits`, puis réaligné à gauche — les bits bas inoccupés restent
+/// nuls, comme `pop_pcm_bytes` l'attend.
+#[cfg(test)]
+#[inline]
+fn ponderer(mot: i32, bits: u16, gain: f64) -> i32 {
+    let bits = u32::from(bits.clamp(8, 32));
+    let decalage = 32 - bits;
+    let utile = f64::from(mot >> decalage);
+    let max = ((1i64 << (bits - 1)) - 1) as f64;
+    let min = -max - 1.0;
+    let v = (utile * gain).round().clamp(min, max) as i32;
+    v << decalage
+}
+
+/// Graine fixe du TPDF du rendu : le bruit ne dépend pas du signal.
+const GRAINE_DU_RENDU: u64 = 0x7703_7264_d17e_0001;
+
+/// #7703 — [`ponderer`], avec le TPDF ±1 LSB de la profondeur déclarée avant
+/// l'arrondi (16 et 24 bits). Un produit exact sort sans bruit.
+#[inline]
+fn ponderer_avec_dither(
+    mot: i32,
+    bits: u16,
+    gain: f64,
+    dither: &mut crate::audio::dither::Dither,
+) -> i32 {
+    let bits = u32::from(bits.clamp(8, 32));
+    let decalage = 32 - bits;
+    let ideal = f64::from(mot >> decalage) * gain;
+    let max = ((1i64 << (bits - 1)) - 1) as f64;
+    let min = -max - 1.0;
+    let bruit = if bits < 32 && ideal.fract() != 0.0 {
+        dither.tirer()
+    } else {
+        0.0
+    };
+    let v = crate::audio::dither::quantifier_avec(ideal, bruit, min, max) as i32;
+    v << decalage
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::NativePcmRing;
+    use super::*;
+
+    const CADENCE: u32 = 44_100;
+    const VOIES: u32 = 2;
+    /// Une période du pilote WASAPI du rapport du 27/10 : 448 trames.
+    const PERIODE: usize = 448;
+
+    /// Un mot 24 bits constant, aligné à gauche : `0x40_0000` (−6 dBFS).
+    const MOT_24: i32 = 0x40_0000 << 8;
+
+    fn anneau_de_deux_secondes() -> NativePcmRing {
+        NativePcmRing::new((CADENCE * VOIES * 2) as usize)
+    }
+
+    /// Remplit l'anneau de `trames` trames du mot constant.
+    fn remplir(anneau: &NativePcmRing, trames: usize) {
+        let mots = vec![MOT_24; trames * VOIES as usize];
+        assert_eq!(anneau.push(&mots), mots.len(), "l'anneau doit tout prendre");
+    }
+
+    /// Rend une période et la relit en mots 24 bits signés (valeur utile).
+    fn rendre_une_periode(anneau: &NativePcmRing, gain: &mut GainAuRendu) -> Vec<i32> {
+        let mut octets = vec![0xAAu8; PERIODE * VOIES as usize * 3];
+        let ecrits = anneau.pop_pcm_bytes_au_gain(&mut octets, 24, gain);
+        octets[ecrits..].fill(0);
+        octets
+            .chunks_exact(3)
+            .map(|o| i32::from_le_bytes([0, o[0], o[1], o[2]]) >> 8)
+            .collect()
+    }
+
+    /// LE contrat de #7264 : un geste sur le volume s'entend en 50 ms au plus
+    /// — le gain demandé est atteint sur les échantillons rendus — que
+    /// l'anneau soit presque vide ou plein de ses deux secondes.
+    #[test]
+    fn un_geste_sur_le_volume_s_entend_en_moins_de_50_ms_quelle_que_soit_la_profondeur_de_l_anneau()
+    {
+        for trames_en_attente in [CADENCE as usize / 10, (CADENCE * 2) as usize] {
+            let anneau = anneau_de_deux_secondes();
+            remplir(&anneau, trames_en_attente);
+            let volume = Arc::new(AtomicU32::new(UNITE));
+            let mut gain = GainAuRendu::nouveau(volume.clone(), CADENCE, VOIES);
+
+            let avant = rendre_une_periode(&anneau, &mut gain);
+            assert!(avant.iter().all(|&m| m == 0x40_0000), "à 100 % : intact");
+
+            // Le geste : 100 % → 50 %.
+            volume.store(UNITE / 2, Ordering::Relaxed);
+            let borne_trames = (CADENCE as usize * 50) / 1000;
+            let mut rendues = 0usize;
+            let mut premiere_periode = None;
+            let mut atteint_a = None;
+            while rendues < borne_trames + PERIODE {
+                let periode = rendre_une_periode(&anneau, &mut gain);
+                if premiere_periode.is_none() {
+                    premiere_periode = Some(periode.clone());
+                }
+                for (trame, voies) in periode.chunks_exact(VOIES as usize).enumerate() {
+                    if atteint_a.is_none() && voies.iter().all(|&m| m == 0x20_0000) {
+                        atteint_a = Some(rendues + trame);
+                    }
+                }
+                rendues += PERIODE;
+            }
+            let premiere = premiere_periode.expect("une période rendue");
+            assert!(
+                premiere[premiere.len() - 1] < 0x40_0000,
+                "anneau de {trames_en_attente} trames : la baisse commence dès la période suivante"
+            );
+            let atteint_a = atteint_a.unwrap_or_else(|| {
+                panic!("anneau de {trames_en_attente} trames : 50 % jamais atteint en 50 ms")
+            });
+            assert!(
+                atteint_a <= borne_trames,
+                "anneau de {trames_en_attente} trames : 50 % atteint après {atteint_a} trames \
+                 (> {borne_trames}, soit 50 ms)"
+            );
+        }
+    }
+
+    /// La rampe ne fait jamais de marche : d'une trame à la suivante, l'écart
+    /// est d'au plus un pas de rampe (+1 d'arrondi, +2 du TPDF de #7703),
+    /// monotone vers la cible.
+    #[test]
+    fn la_rampe_du_volume_glisse_sans_marche() {
+        let anneau = anneau_de_deux_secondes();
+        remplir(&anneau, CADENCE as usize);
+        let volume = Arc::new(AtomicU32::new(UNITE));
+        let mut gain = GainAuRendu::nouveau(volume.clone(), CADENCE, VOIES);
+        volume.store(0, Ordering::Relaxed);
+        let mut gauche = Vec::new();
+        for _ in 0..4 {
+            gauche.extend(
+                rendre_une_periode(&anneau, &mut gain)
+                    .chunks_exact(2)
+                    .map(|t| {
+                        // #7703 : chaque voie reçoit son tirage TPDF (±1 LSB).
+                        assert!(
+                            (t[0] - t[1]).abs() <= 2,
+                            "même facteur pour les voies d'une trame : {t:?}"
+                        );
+                        t[0]
+                    }),
+            );
+        }
+        let trames_de_rampe = (CADENCE * RAMPE_DU_VOLUME_MS / 1000) as f64;
+        let pas_max = (f64::from(0x40_0000) / trames_de_rampe).ceil() as i32 + 3;
+        for fenetre in gauche.windows(2) {
+            assert!(fenetre[1] <= fenetre[0], "monotone vers le silence");
+            assert!(
+                fenetre[0] - fenetre[1] <= pas_max,
+                "marche de {} > {pas_max}",
+                fenetre[0] - fenetre[1]
+            );
+        }
+        assert_eq!(*gauche.last().unwrap(), 0, "le silence est atteint");
+    }
+
+    /// Bit-perfect : à 100 %, le rendu au gain est octet pour octet celui de
+    /// `pop_pcm_bytes`, en 16, 24 et 32 bits, sur des mots quelconques.
+    #[test]
+    fn a_cent_pour_cent_le_rendu_est_celui_de_pop_pcm_bytes_au_bit_pres() {
+        for bits in [16u16, 24, 32] {
+            let mut etat: u32 = 0x2545_f491;
+            let decalage = 32 - u32::from(bits);
+            let mots: Vec<i32> = (0..4096)
+                .map(|_| {
+                    etat = etat.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((etat as i32) >> decalage) << decalage
+                })
+                .collect();
+            let reference = NativePcmRing::new(mots.len());
+            let au_gain = NativePcmRing::new(mots.len());
+            reference.push(&mots);
+            au_gain.push(&mots);
+            let octets = mots.len() * usize::from(bits / 8);
+            let mut attendu = vec![0u8; octets];
+            let mut obtenu = vec![0u8; octets];
+            assert_eq!(reference.pop_pcm_bytes(&mut attendu, bits), octets);
+            let mut gain = GainAuRendu::nouveau(Arc::new(AtomicU32::new(UNITE)), CADENCE, VOIES);
+            assert_eq!(
+                au_gain.pop_pcm_bytes_au_gain(&mut obtenu, bits, &mut gain),
+                octets
+            );
+            assert_eq!(obtenu, attendu, "{bits} bits : un octet a changé à 100 %");
+        }
+    }
+
+    /// Un passage DoP marqué intact n'est jamais pondéré, même avec un volume
+    /// bas ; le PCM qui le précède et celui qui le suit le sont, à la
+    /// consigne, à la position exacte de la marque — sans rampe depuis
+    /// l'unité.
+    #[test]
+    fn un_passage_intact_n_est_jamais_pondere_et_le_pcm_autour_l_est_au_mot_pres() {
+        let anneau = anneau_de_deux_secondes();
+        let pcm = vec![MOT_24; 10 * VOIES as usize];
+        let dop = vec![0x05_1234 << 8, 0x05_5678 << 8, (0xFA_1234_u32 << 8) as i32];
+        let dop: Vec<i32> = dop
+            .iter()
+            .cycle()
+            .take(6 * VOIES as usize)
+            .copied()
+            .collect();
+        anneau.marquer_passage_intact(false);
+        anneau.push(&pcm);
+        anneau.marquer_passage_intact(true);
+        anneau.push(&dop);
+        anneau.marquer_passage_intact(false);
+        anneau.push(&pcm);
+
+        let volume = Arc::new(AtomicU32::new(UNITE / 1000 * 300));
+        let mut gain = GainAuRendu::nouveau(volume, CADENCE, VOIES);
+        let total = pcm.len() * 2 + dop.len();
+        let mut octets = vec![0u8; total * 4];
+        assert_eq!(
+            anneau.pop_pcm_bytes_au_gain(&mut octets, 32, &mut gain),
+            total * 4
+        );
+        let rendus: Vec<i32> = octets
+            .chunks_exact(4)
+            .map(|o| i32::from_le_bytes([o[0], o[1], o[2], o[3]]))
+            .collect();
+        let pondere = ponderer(MOT_24, 32, 0.3);
+        assert!(rendus[..pcm.len()].iter().all(|&m| m == pondere));
+        assert_eq!(
+            &rendus[pcm.len()..pcm.len() + dop.len()],
+            &dop[..],
+            "DoP intact"
+        );
+        assert!(
+            rendus[pcm.len() + dop.len()..]
+                .iter()
+                .all(|&m| m == pondere),
+            "le PCM après le DoP reprend à 30 %, pas à 100 %"
+        );
+    }
+
+    /// Une marque posée pendant qu'une période est déjà en cours de rendu
+    /// (position future) n'agit qu'à sa position.
+    #[test]
+    fn une_marque_au_dela_de_la_periode_attend_sa_position() {
+        let anneau = anneau_de_deux_secondes();
+        anneau.push(&vec![MOT_24; 8]);
+        anneau.marquer_passage_intact(true);
+        let volume = Arc::new(AtomicU32::new(UNITE / 2));
+        let mut gain = GainAuRendu::nouveau(volume, CADENCE, VOIES);
+        let mut octets = vec![0u8; 4 * 4];
+        anneau.pop_pcm_bytes_au_gain(&mut octets, 32, &mut gain);
+        anneau.push(&vec![MOT_24; 4]);
+        let mut suite = vec![0u8; 8 * 4];
+        anneau.pop_pcm_bytes_au_gain(&mut suite, 32, &mut gain);
+        let mots = |o: &[u8]| -> Vec<i32> {
+            o.chunks_exact(4)
+                .map(|o| i32::from_le_bytes([o[0], o[1], o[2], o[3]]))
+                .collect()
+        };
+        let demi = ponderer(MOT_24, 32, 0.5);
+        assert_eq!(mots(&octets), vec![demi; 4]);
+        assert_eq!(
+            mots(&suite),
+            vec![demi, demi, demi, demi, MOT_24, MOT_24, MOT_24, MOT_24]
+        );
+    }
+
+    /// Jamais plus fort que la pleine échelle ni que la consigne : un volume
+    /// stocké au-dessus de l'unité est rendu à l'unité, un mot pondéré reste
+    /// dans la pleine échelle et garde ses bits bas nuls.
+    /// #7762 — témoin (vert avant comme après) : 50 % du curseur `db60`
+    /// d'une sortie locale (gain 0,0316, −30 dB) est rendu par le fil WASAPI
+    /// UNE fois — le mot sort à −30 dB, pas à −60 dB (gain appliqué deux
+    /// fois) ni à −6 dB (position prise pour un gain). Même conversion que
+    /// `set_volume` et `effective_volume_units`.
+    #[test]
+    fn cinquante_pour_cent_du_curseur_db60_sont_rendus_une_seule_fois_a_moins_30_db_7762() {
+        let gain = crate::audio::volume_scale::gain_perceptif(0.5);
+        // `LocalOutput::set_volume`, même conversion (#7968).
+        let utilisateur = super::super::unites_de_gain(gain);
+        let effectif = super::super::effective_volume_units(utilisateur, 1000, false);
+        let anneau = anneau_de_deux_secondes();
+        remplir(&anneau, PERIODE);
+        let volume = Arc::new(AtomicU32::new(effectif));
+        let mut gain_au_rendu = GainAuRendu::nouveau(volume, CADENCE, VOIES);
+        let rendu = rendre_une_periode(&anneau, &mut gain_au_rendu);
+        let db = 20.0 * (f64::from(rendu[0]) / f64::from(0x40_0000)).log10();
+        assert!(
+            (db + 30.0).abs() < 0.3,
+            "50 % du curseur db60 doivent sortir à −30 dB, mesuré {db:.2} dB \
+             ({effectif} unités)"
+        );
+        // #7703 : le mot pondéré porte le TPDF (±1 LSB) ; le gain, lui, est
+        // constant.
+        assert!(
+            rendu.iter().all(|&m| (m - rendu[0]).abs() <= 2),
+            "gain constant, sans rampe"
+        );
+    }
+    /// #7703 — le rendu WASAPI est la dernière quantification depuis #7264 :
+    /// à volume réduit, le mot 16 bits est dithéré, pas arrondi à nu. Un mot
+    /// de 10 LSB à 3 % vaut 0,3 LSB : l'arrondi nu rend toujours 0 (le
+    /// signal disparaît, l'erreur lui est corrélée) ; le TPDF garde la
+    /// moyenne. Le silence numérique reste un zéro exact.
+    #[test]
+    fn a_volume_reduit_le_rendu_16_bits_est_dithere_7703() {
+        let mut gain =
+            GainAuRendu::nouveau(Arc::new(AtomicU32::new(UNITE / 1000 * 30)), CADENCE, VOIES);
+        let n = 20_000u64;
+        let mut somme = 0i64;
+        for position in 0..n {
+            let rendu = gain.rendre(10 << 16, 16, position);
+            assert_eq!(rendu & 0xFFFF, 0, "bits bas nuls");
+            let utile = rendu >> 16;
+            assert!((-1..=2).contains(&utile), "±1 LSB au plus : {utile}");
+            somme += i64::from(utile);
+        }
+        let moyenne = somme as f64 / n as f64;
+        assert!(
+            (moyenne - 0.3).abs() < 0.05,
+            "rendu WASAPI sans dither après le volume (#7703) : moyenne au puits {moyenne:+.4} \
+             LSB pour 0,3 LSB attendus — le mot atténué est arrondi à nu, l'erreur est \
+             corrélée au signal"
+        );
+        for position in 0..64 {
+            assert_eq!(gain.rendre(0, 16, position), 0, "le silence reste un zéro");
+        }
+        // 32 bits : aucun bruit ajouté.
+        assert_eq!(gain.rendre(10, 32, 0), 0);
+    }
+
+    #[test]
+    fn le_gain_est_borne_et_le_mot_reste_aligne() {
+        let mut gain =
+            GainAuRendu::nouveau(Arc::new(AtomicU32::new(UNITE / 2 * 3)), CADENCE, VOIES);
+        assert_eq!(gain.courant(), 1.0);
+        assert_eq!(gain.rendre(i32::MIN, 32, 0), i32::MIN);
+        for bits in [16u16, 24, 32] {
+            let decalage = 32 - u32::from(bits);
+            let max = i32::MAX >> decalage << decalage;
+            for g in [0.0, 0.1, 0.5, 0.999] {
+                for mot in [max, i32::MIN, 0, 1 << decalage, -(1 << decalage)] {
+                    let p = ponderer(mot, bits, g);
+                    assert_eq!(p & ((1i64 << decalage) - 1) as i32, 0, "bits bas nuls");
+                    assert!(
+                        i64::from(p).abs() <= i64::from(mot).abs(),
+                        "jamais plus fort"
+                    );
+                }
+            }
+        }
+        assert_eq!(ponderer(MOT_24, 24, 0.5), 0x20_0000 << 8);
+    }
+
+    /// Le défaut, tenu pour qu'il ne revienne pas : le bras WASAPI monte son
+    /// étage à l'UNITÉ et le fil de rendu applique le volume par
+    /// `pop_pcm_bytes_au_gain`, sur le tampon amorcé comme dans la boucle.
+    /// `bras_wasapi.rs` et le fil de rendu ne compilent que sous Windows :
+    /// leur texte est la seule chose que Shrek puisse juger.
+    #[test]
+    fn le_bras_wasapi_monte_l_etage_a_l_unite_et_rend_le_volume_au_rendu() {
+        let bras = include_str!("bras_wasapi.rs");
+        assert!(
+            bras.contains("let volume_de_l_etage = AtomicU32::new(VOLUME_A_L_UNITE);"),
+            "l'étage WASAPI doit recevoir l'unité, sinon le volume attend l'anneau"
+        );
+        assert!(bras.contains("&volume_de_l_etage,"));
+        assert!(bras.contains(".avec_le_gain_au_rendu(backend.anneau())"));
+        assert!(bras.contains("regler_le_volume_au_rendu(demande.volume.clone())"));
+        let rendu = include_str!("../wasapi_exclusive.rs");
+        assert_eq!(
+            rendu.matches("pop_pcm_bytes_au_gain(").count(),
+            2,
+            "l'amorce et la boucle de rendu passent par le gain au rendu"
+        );
+        assert!(
+            !rendu.contains(".pop_pcm_bytes(out"),
+            "plus de resérialisation sans gain"
+        );
+    }
+}

@@ -326,7 +326,12 @@ pub async fn sonder_un_flux(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> 
             ));
         }
         let mut decode = decoder_le_fichier(chemin.to_string()).await?;
-        decode.octets_lus = taille;
+        // #7805 — avec `TUNE_DASH_STREAM_DECODE`, TIDAL rend le chemin dès le
+        // segment d'initialisation écrit (623 octets) et ajoute les segments
+        // pendant le décodage : la taille se relève APRÈS, quand le décodeur
+        // a lu ce qu'il a décodé.
+        let apres = std::fs::metadata(chemin).map(|m| m.len()).unwrap_or(0);
+        decode.octets_lus = taille.max(apres);
         return Ok(decode);
     }
     if !(flux.url.starts_with("https://") || flux.url.starts_with("http://")) {
@@ -335,7 +340,42 @@ pub async fn sonder_un_flux(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> 
             format!("adresse de flux inattendue : {}", flux.url),
         ));
     }
+    // #7805 — Qobuz passe d'« ok » à « echec » sur la même piste, en
+    // `probe: … no suitable format reader found` sur un 2xx audio. La lecture
+    // reprend une fois un décodeur qui échoue à la sonde du format
+    // (`echec_avant_le_premier_octet`) : la sentinelle refait un essai de même.
+    match sonder_en_http(flux).await {
+        Err(e)
+            if e.cause == Cause::Decodage
+                && crate::audio::decode::echec_avant_le_premier_octet(&e.detail) =>
+        {
+            warn!(detail = %e.detail, "sentinelle_streaming_second_essai");
+            sonder_en_http(flux).await
+        }
+        autre => autre,
+    }
+}
 
+/// Ce qui est arrivé, pour un échec de décodage : les 16 premiers octets en
+/// hexadécimal, les en-têtes de type et de longueur, le nombre d'octets lus.
+/// Jamais l'adresse : signée, elle est un secret le temps de sa validité.
+fn constat_des_octets(octets: &[u8], type_recu: &str, longueur: Option<u64>) -> String {
+    let tete: Vec<String> = octets.iter().take(16).map(|o| format!("{o:02x}")).collect();
+    let longueur = longueur.map_or_else(|| "absent".to_string(), |l| l.to_string());
+    let type_recu = if type_recu.is_empty() {
+        "absent"
+    } else {
+        type_recu
+    };
+    format!(
+        "premiers octets : {} ; Content-Type : {type_recu} ; Content-Length : {longueur} ; octets lus : {}",
+        tete.join(" "),
+        octets.len()
+    )
+}
+
+/// Un essai HTTP : le GET de la tête, puis son décodage.
+async fn sonder_en_http(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> {
     let extension = extension_du_codec(&flux.quality.codec, &flux.mime_type);
     let borne = if est_un_mp4(extension) {
         OCTETS_MP4_MAX
@@ -368,6 +408,7 @@ pub async fn sonder_un_flux(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> 
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let longueur = reponse.content_length();
         if let Some(mauvais) = super::non_audio_content_type(&type_recu) {
             return Err(EchecSonde::new(
                 Cause::Http,
@@ -391,9 +432,9 @@ pub async fn sonder_un_flux(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> 
             }
         }
         octets.truncate(borne);
-        Ok(octets)
+        Ok((octets, type_recu, longueur))
     };
-    let octets = tokio::time::timeout(DELAI_TELECHARGEMENT, telechargement)
+    let (octets, type_recu, longueur) = tokio::time::timeout(DELAI_TELECHARGEMENT, telechargement)
         .await
         .map_err(|_| EchecSonde::new(Cause::Delai, "téléchargement de la tête du flux"))??;
     if octets.is_empty() {
@@ -407,7 +448,18 @@ pub async fn sonder_un_flux(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> 
         .map_err(|e| EchecSonde::new(Cause::Resolution, format!("fichier temporaire : {e}")))?;
     std::fs::write(fichier.path(), &octets)
         .map_err(|e| EchecSonde::new(Cause::Resolution, format!("écriture temporaire : {e}")))?;
-    let mut decode = decoder_le_fichier(fichier.path().to_string_lossy().into_owned()).await?;
+    let mut decode = decoder_le_fichier(fichier.path().to_string_lossy().into_owned())
+        .await
+        .map_err(|e| {
+            EchecSonde::new(
+                e.cause,
+                format!(
+                    "{} ({})",
+                    e.detail,
+                    constat_des_octets(&octets, &type_recu, longueur)
+                ),
+            )
+        })?;
     decode.octets_lus = lus;
     drop(fichier);
     Ok(decode)
@@ -424,6 +476,24 @@ async fn decoder_le_fichier(chemin: String) -> Result<FluxDecode, EchecSonde> {
         return Err(EchecSonde::new(
             Cause::Decodage,
             "le décodeur n'a rendu aucun échantillon",
+        ));
+    }
+    // #7805 — un en-tête seul, ou quelques trames, ne prouvent pas qu'un flux
+    // se lit : au moins une seconde d'audio, et pas du silence numérique.
+    let trames = decode.samples_i32.len() / decode.channels as usize;
+    if trames < decode.sample_rate as usize {
+        return Err(EchecSonde::new(
+            Cause::Decodage,
+            format!(
+                "audio décodé trop court : {trames} trames à {} Hz, moins d'une seconde (en-tête seul ?)",
+                decode.sample_rate
+            ),
+        ));
+    }
+    if decode.samples_i32.iter().all(|&s| s == 0) {
+        return Err(EchecSonde::new(
+            Cause::Decodage,
+            "audio décodé silencieux : aucun échantillon non nul",
         ));
     }
     Ok(FluxDecode {
@@ -504,23 +574,42 @@ pub async fn sonder_le_service(
     decoder_le_flux_resolu(flux).await
 }
 
-/// Les transitions d'un tour qui compte, face au dernier tour qui a compté.
+/// Les transitions d'un tour qui compte, face aux deux derniers tours qui ont
+/// compté (`precedent` le plus récent).
+///
+/// #7805 — un passage `ok → echec` ne se publie qu'au SECOND tour raté de
+/// suite : un raté isolé (Qobuz qui alterne sur la même piste) ne prévient
+/// personne, et le retour à `ok` qui le suit ne se publie pas non plus,
+/// puisque l'échec n'a jamais été annoncé.
 pub fn transitions(
     precedent: Option<&RapportSentinelle>,
+    avant_precedent: Option<&RapportSentinelle>,
     courant: &[ResultatSonde],
 ) -> Vec<Transition> {
+    let etat_dans = |rapport: Option<&RapportSentinelle>, r: &ResultatSonde| {
+        rapport.and_then(|p| {
+            p.resultats
+                .iter()
+                .find(|q| q.service == r.service && q.nature == r.nature)
+                .map(|q| q.etat)
+        })
+    };
     courant
         .iter()
         .filter_map(|r| {
-            let avant = precedent.and_then(|p| {
-                p.resultats
-                    .iter()
-                    .find(|q| q.service == r.service && q.nature == r.nature)
-                    .map(|q| q.etat)
-            });
-            (avant != Some(r.etat)).then(|| Transition {
+            let avant = etat_dans(precedent, r);
+            let avant_avant = etat_dans(avant_precedent, r);
+            // L'état déjà annoncé : un échec isolé après un `ok` ne l'a pas été.
+            let annonce = if avant == Some(Etat::Echec) && avant_avant == Some(Etat::Ok) {
+                Some(Etat::Ok)
+            } else {
+                avant
+            };
+            let premier_rate =
+                r.etat == Etat::Echec && annonce == Some(Etat::Ok) && avant != Some(Etat::Echec);
+            (annonce != Some(r.etat) && !premier_rate).then(|| Transition {
                 service: format!("{}:{}", r.nature, r.service),
-                avant,
+                avant: annonce,
                 apres: r.etat,
             })
         })
@@ -716,13 +805,14 @@ impl PlaybackOrchestrator {
         }
 
         let mut historique = lire_l_historique(&settings);
-        let precedent = historique.iter().find(|r| r.statut != "passe");
+        let mut comptes = historique.iter().filter(|r| r.statut != "passe");
+        let (precedent, avant_precedent) = (comptes.next(), comptes.next());
         let statut = RapportSentinelle::statut_des_resultats(&resultats);
         let rapport = RapportSentinelle {
             horodatage: debut_du_tour,
             statut: statut.into(),
             raison: None,
-            transitions: transitions(precedent, &resultats),
+            transitions: transitions(precedent, avant_precedent, &resultats),
             resultats,
         };
         for r in &rapport.resultats {

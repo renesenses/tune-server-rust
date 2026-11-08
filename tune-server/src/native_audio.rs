@@ -128,6 +128,10 @@ pub fn router() -> Router<AppState> {
                 .put(crate::routes::greffons_natifs_tiers::regler_la_zone),
         )
         .route(
+            "/{id}/diagnostics",
+            post(crate::routes::greffons_natifs_tiers::diagnostics_du_reglage),
+        )
+        .route(
             "/{id}/profiles",
             get(crate::routes::greffons_natifs_tiers::lister_les_profils)
                 .post(crate::routes::greffons_natifs_tiers::enregistrer_un_profil),
@@ -292,6 +296,7 @@ pub(crate) fn feature(id: &str) -> tune_core::license::Feature {
         "crossfeed" => tune_core::license::Feature::Crossfeed,
         "converter" => tune_core::license::Feature::BatchConverter,
         "declick" => tune_core::license::Feature::Declick,
+        "upsampler" => tune_core::license::Feature::Upsampling,
         _ => THIRD_PARTY_FEATURE,
     }
 }

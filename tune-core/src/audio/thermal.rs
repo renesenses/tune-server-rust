@@ -18,17 +18,18 @@
 //! | Système | Source | Droits |
 //! |---|---|---|
 //! | Linux | `/sys/class/hwmon`, `/sys/class/thermal` (paquet CPU d'abord) | aucun |
-//! | Windows | compteurs PDH « Thermal Zone Information » (zones ACPI) | aucun en principe, NON MESURÉ |
+//! | Windows | zones ACPI : PDH « Thermal Zone Information », puis WMI (`ROOT\CIMV2`, `ROOT\WMI`) | aucun en principe, NON MESURÉ |
 //! | macOS | aucune | — |
 //!
-//! **Windows.** Les compteurs de performance `\Thermal Zone Information(*)\
-//! High Precision Temperature` (dixièmes de kelvin), à défaut `…\Temperature`
-//! (kelvins), lus par l'API PDH. Ce sont les mêmes données que la classe WMI
-//! `Win32_PerfFormattedData_Counters_ThermalZoneInformation` ; lire un compteur
-//! LOCAL ne demande pas de droits d'administrateur selon la documentation —
-//! à vérifier sur une vraie machine. `MSAcpi_ThermalZoneTemperature` (WMI
-//! `root\WMI`), l'autre piste, exige l'administrateur : écartée. Une zone ACPI
-//! n'est pas le paquet CPU — le paquet n'est lisible sans pilote noyau tiers
+//! **Windows.** Plusieurs sources, essayées dans l'ordre jusqu'à la première
+//! lisible, chacune journalisée avec le motif de son échec (#6450, module
+//! [`sources`]) : les compteurs de performance `\Thermal Zone Information(*)\
+//! High Precision Temperature` (dixièmes de kelvin), `…\Temperature`
+//! (kelvins), puis les mêmes zones par WMI
+//! (`Win32_PerfFormattedData_Counters_ThermalZoneInformation`) et enfin
+//! `MSAcpi_ThermalZoneTemperature` (WMI `root\WMI`, documentée comme réservée
+//! à l'administrateur : un refus se lit au journal). Une zone ACPI n'est pas
+//! le paquet CPU — le paquet n'est lisible sans pilote noyau tiers
 //! (le chemin de LibreHardwareMonitor) ni sur Intel ni sur AMD. Sur beaucoup
 //! de cartes de bureau la zone rend une valeur FIXE (27,85 °C, 301 K) : une
 //! valeur qui ne bouge pas de 0,5 °C en dix minutes est déclarée figée
@@ -39,15 +40,18 @@
 //! par l'API privée `IOHIDEventSystemClient`, et `powermetrics` exige `root`.
 //! Rien n'est tenté.
 //!
-//! ## Sans température lisible : analyses BRIDÉES
+//! ## Sans température lisible : vitesse réglée, avec un avertissement
 //!
-//! Un garde qui ne peut pas mesurer ne bloque pas (il ne doit pas inventer une
-//! raison de s'arrêter), mais il ne laisse plus la machine à pleine largeur
-//! sans surveillance : les analyses de fond passent à UN fichier à la fois
-//! ([`brider_sans_thermometre`]), quelle que soit la vitesse réglée, et l'écran
-//! « État du serveur » le dit (`analyses_bridees` du diagnostic). Didier, fil
-//! 2239 : un Ryzen 7 3800X arrêté en surchauffe pendant le calcul de la plage
-//! dynamique, deux fichiers à la fois, sous Windows, sans aucune garde.
+//! Un garde qui ne peut pas mesurer ne bloque pas et ne ralentit pas (#6450) :
+//! une température qu'on ne lit pas n'est pas une température trop haute. Les
+//! analyses tournent à la vitesse réglée ([`largeur_selon_la_chaleur`]), le
+//! journal l'avertit (`temperature_illisible`) et l'écran « État du serveur »
+//! le dit (`temperature_illisible` du diagnostic). Seule une température LUE
+//! au-delà de [`PAUSE_ABOVE_C`] arrête les analyses ([`ThermalGate`]).
+//!
+//! Le bridage à un fichier à la fois de #5410 (maintenu le 20/10/2026) est
+//! retiré par la demande du 05/11/2026 : sur un poste Windows sans zone
+//! thermique lisible, il ralentissait toutes les analyses pour toujours.
 
 // Hors Linux, la lecture sysfs et ses sélecteurs ne servent qu'aux tests.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -56,6 +60,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
+
+#[path = "thermal_sources.rs"]
+pub mod sources;
 
 /// Au-dessus de cette température, les analyses s'arrêtent.
 ///
@@ -96,8 +103,7 @@ impl ThermalGate {
     /// Lit la température et tranche. Sans capteur lisible (macOS, zone
     /// Windows absente ou figée, conteneur sans `/sys` monté), renvoie
     /// toujours `Go` : un garde qui ne peut pas mesurer ne doit pas inventer
-    /// une raison de bloquer. C'est la LARGEUR des lots qui se replie alors
-    /// ([`brider_sans_thermometre`], #5410).
+    /// une raison de bloquer, ni de ralentir (#6450).
     pub fn check(&mut self) -> Verdict {
         self.decide(lecture_thermique().celsius())
     }
@@ -196,8 +202,7 @@ fn noter_la_retenue(sweep: &str, retenue: bool) {
 
 /// Les passes arrêtées par la chaleur (au-delà de [`PAUSE_ABOVE_C`], jusqu'au
 /// retour sous [`RESUME_BELOW_C`]), triées. Vide au frais, et vide quand la
-/// température n'est pas lisible : c'est alors la largeur qui se replie
-/// ([`brider_sans_thermometre`]), pas une garde qui retient.
+/// température n'est pas lisible : rien ne retient alors les passes (#6450).
 pub fn passes_retenues_par_la_chaleur() -> Vec<String> {
     RETENUES
         .lock()
@@ -386,7 +391,7 @@ const RELEVES_PAR_FENETRE: usize = 9;
 
 /// Au-delà de cet âge, le dernier relevé ne vaut plus mesure : un
 /// échantillonneur bloqué sur un pilote `hwmon` lent ne doit pas figer une
-/// valeur rassurante. La température redevient alors inconnue, donc bridée.
+/// valeur rassurante. La température redevient alors inconnue.
 const PEREMPTION_DES_RELEVES: Duration = Duration::from_secs(30);
 
 /// La médiane d'une série ; `None` si elle est vide.
@@ -422,9 +427,8 @@ impl FenetreGlissante {
 
     /// La médiane des relevés lisibles de la fenêtre.
     ///
-    /// Jamais moins prudente que la lecture instantanée sur l'inconnu
-    /// (#6450) : sans relevé, avec un dernier relevé illisible ou périmé, la
-    /// valeur est `None`, et la garde bride comme avant.
+    /// Jamais plus affirmative que la lecture instantanée : sans relevé, avec
+    /// un dernier relevé illisible ou périmé, la valeur est `None` (inconnue).
     fn lissee(&self, maintenant: Instant) -> Option<f64> {
         let dernier = self.dernier?;
         if maintenant.saturating_duration_since(dernier) > PEREMPTION_DES_RELEVES {
@@ -522,12 +526,11 @@ fn cpu_temp_celsius() -> Option<f64> {
     )
 }
 
-/// Windows (#5410) : la plus chaude des zones thermiques ACPI lisibles.
+/// Windows (#5410, #6450) : la plus chaude des zones thermiques ACPI de la
+/// première source lisible, chaque source essayée journalisée.
 #[cfg(target_os = "windows")]
 fn cpu_temp_celsius() -> Option<f64> {
-    windows_pdh::zones_thermiques_celsius()
-        .into_iter()
-        .reduce(f64::max)
+    sources::windows_sources::temperature_celsius()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -549,7 +552,7 @@ pub enum MotifIllisible {
 }
 
 impl MotifIllisible {
-    /// Le mot publié par le diagnostic (`analyses_bridees`).
+    /// Le mot publié par le diagnostic (`temperature_illisible`).
     pub fn id(self) -> &'static str {
         match self {
             MotifIllisible::AucunCapteur => "temperature_illisible",
@@ -574,8 +577,8 @@ impl LectureThermique {
         }
     }
 
-    /// Le motif du bridage, `None` quand la température est lisible.
-    pub fn motif_du_bridage(self) -> Option<MotifIllisible> {
+    /// Pourquoi la température manque, `None` quand elle est lisible.
+    pub fn motif_illisible(self) -> Option<MotifIllisible> {
         match self {
             LectureThermique::Lisible(_) => None,
             LectureThermique::Illisible(m) => Some(m),
@@ -583,43 +586,19 @@ impl LectureThermique {
     }
 }
 
-/// La largeur des lots d'analyse SANS température lisible : un fichier.
+/// La largeur des lots d'analyse : la vitesse réglée (`taches_de_fond::vitesse`),
+/// au moins 1, que la température soit lue ou non (#6450).
 ///
-/// Deux fichiers à la fois tenaient deux cœurs pleins pendant des heures
-/// (12,5 % d'un Ryzen 16 fils chez Didier, fil 2239) ; un seul divise la
-/// chaleur produite par deux, et la passe finit quand même — en retard, ce
-/// qui ne coûte rien.
-pub const LARGEUR_SANS_THERMOMETRE: usize = 1;
-
-/// La largeur réglée (`taches_de_fond::vitesse`), bornée à
-/// [`LARGEUR_SANS_THERMOMETRE`] quand la température n'est pas lisible.
-/// Toujours au moins 1.
-pub fn brider_sans_thermometre(largeur: usize, lecture: &LectureThermique) -> usize {
-    let largeur = largeur.max(1);
-    match lecture {
-        LectureThermique::Lisible(_) => largeur,
-        LectureThermique::Illisible(_) => largeur.min(LARGEUR_SANS_THERMOMETRE),
-    }
-}
-
-/// #6713 — la largeur des lots, avec le choix de l'utilisateur de LEVER le
-/// bridage quand la température est illisible (réglage
-/// `taches_de_fond::vitesse::CLE_LEVER_LE_BRIDAGE`, désactivé par défaut).
+/// Une température illisible (aucun capteur, zone figée) ne bride plus : ce
+/// n'est pas une température trop haute. Une température lue et trop haute,
+/// elle, arrête toujours les analyses par leur garde ([`ThermalGate`], au-delà
+/// de [`PAUSE_ABOVE_C`]) ; rien ici ne la contourne.
 ///
-/// Le choix ne porte QUE sur le cas « illisible » (aucun capteur, zone
-/// figée) : une température lisible garde la largeur réglée, et sa garde
-/// ([`ThermalGate`]) arrête toujours les analyses au-delà de
-/// [`PAUSE_ABOVE_C`] — rien ici ne la contourne. Sans le choix, c'est le
-/// bridage de #5410, maintenu par la décision du 20/10/2026 (#6450).
-pub fn largeur_selon_la_chaleur(
-    largeur: usize,
-    lecture: &LectureThermique,
-    bridage_leve: bool,
-) -> usize {
-    match lecture {
-        LectureThermique::Illisible(_) if bridage_leve => largeur.max(1),
-        _ => brider_sans_thermometre(largeur, lecture),
-    }
+/// La lecture reste en paramètre exprès : les appelants (`vitesse`,
+/// `faux_hires_passe`) et leurs témoins disent ainsi sur quelle lecture la
+/// largeur est décidée, et une règle future n'aura pas à les retoucher.
+pub fn largeur_selon_la_chaleur(largeur: usize, _lecture: &LectureThermique) -> usize {
+    largeur.max(1)
 }
 
 /// Lectures nécessaires avant de déclarer une zone figée.
@@ -703,8 +682,8 @@ static ETAT: Mutex<EtatThermique> = Mutex::new(EtatThermique {
     derniere: None,
 });
 
-/// Une température (lissée ou non) devenue décision : inconnue, elle bride
-/// les analyses (#5410, maintenu par #6450).
+/// Une température (lissée ou non) devenue lecture : inconnue, elle est
+/// illisible (sans brider, #6450).
 fn lecture_de(temp_c: Option<f64>) -> LectureThermique {
     match temp_c {
         Some(c) => LectureThermique::Lisible(c),
@@ -735,21 +714,19 @@ pub fn lecture_thermique() -> LectureThermique {
     } else {
         lecture_de(brute)
     };
-    let precedente = etat.derniere.map(|(_, l)| l.motif_du_bridage());
+    let precedente = etat.derniere.map(|(_, l)| l.motif_illisible());
     etat.derniere = Some((maintenant, lecture));
     drop(etat);
     // Les TRANSITIONS seulement, comme le garde.
-    if precedente != Some(lecture.motif_du_bridage()) {
-        match lecture.motif_du_bridage() {
+    if precedente != Some(lecture.motif_illisible()) {
+        match lecture.motif_illisible() {
             Some(m) => warn!(
                 motif = m.id(),
-                largeur = LARGEUR_SANS_THERMOMETRE,
-                "analyses_bridees_sans_thermometre — température non lisible sur cette machine : \
-                 les analyses de fond passent à un fichier à la fois, sauf si le bridage est \
-                 levé dans les réglages (#6713)"
+                "temperature_illisible — température non lisible sur cette machine : les \
+                 analyses de fond tournent à la vitesse réglée, sans garde thermique (#6450)"
             ),
             None if precedente.is_some() => {
-                info!("analyses_debridees — la température est de nouveau lisible")
+                info!("temperature_lisible — la garde thermique mesure de nouveau")
             }
             None => {}
         }
@@ -767,107 +744,6 @@ pub fn celsius_depuis_dixiemes_de_kelvin(dixiemes: f64) -> Option<f64> {
 pub fn celsius_depuis_kelvins(kelvins: f64) -> Option<f64> {
     let c = kelvins - 273.15;
     (c.is_finite() && (5.0..=125.0).contains(&c)).then_some(c)
-}
-
-/// Lecture des zones thermiques par l'API PDH (#5410). Aucune dépendance
-/// nouvelle : le crate `windows` est déjà tiré par cpal, il ne gagne qu'une
-/// fonctionnalité (`Win32_System_Performance`).
-///
-/// ⚠️ Compilé pour `x86_64-pc-windows-msvc` (porte de Shrek, CI Windows),
-/// jamais exécuté par les épreuves : son comportement sur une vraie machine
-/// — valeurs, droits — reste à mesurer.
-#[cfg(target_os = "windows")]
-mod windows_pdh {
-    use windows::Win32::System::Performance::{
-        PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA,
-        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-        PdhOpenQueryW,
-    };
-    use windows::core::{PCWSTR, w};
-
-    /// `PDH_CSTATUS_VALID_DATA` et `PDH_CSTATUS_NEW_DATA`.
-    const VALEUR_VALIDE: [u32; 2] = [0, 1];
-
-    /// Les zones thermiques lisibles, en °C (vide si aucune).
-    pub(super) fn zones_thermiques_celsius() -> Vec<f64> {
-        // Dixièmes de kelvin d'abord (Windows 10 1809+), kelvins sinon.
-        let precises = lire(w!(
-            "\\Thermal Zone Information(*)\\High Precision Temperature"
-        ));
-        if !precises.is_empty() {
-            return precises
-                .into_iter()
-                .filter_map(super::celsius_depuis_dixiemes_de_kelvin)
-                .collect();
-        }
-        lire(w!("\\Thermal Zone Information(*)\\Temperature"))
-            .into_iter()
-            .filter_map(super::celsius_depuis_kelvins)
-            .collect()
-    }
-
-    /// Les valeurs brutes de toutes les instances d'un compteur.
-    fn lire(chemin: PCWSTR) -> Vec<f64> {
-        let mut requete = PDH_HQUERY::default();
-        // SAFETY : appels PDH documentés ; chaque sortie pointe une variable
-        // locale vivante, le tampon est dimensionné par l'appel de sondage et
-        // aligné sur `PDH_FMT_COUNTERVALUE_ITEM_W`, la requête est fermée sur
-        // tous les chemins.
-        unsafe {
-            if PdhOpenQueryW(PCWSTR::null(), 0, &mut requete) != 0 {
-                return Vec::new();
-            }
-            let valeurs = lire_dans(requete, chemin);
-            let _ = PdhCloseQuery(requete);
-            valeurs
-        }
-    }
-
-    unsafe fn lire_dans(requete: PDH_HQUERY, chemin: PCWSTR) -> Vec<f64> {
-        let mut compteur = PDH_HCOUNTER::default();
-        unsafe {
-            if PdhAddEnglishCounterW(requete, chemin, 0, &mut compteur) != 0 {
-                return Vec::new();
-            }
-            // Une température est une valeur instantanée : une collecte suffit.
-            if PdhCollectQueryData(requete) != 0 {
-                return Vec::new();
-            }
-            let mut octets = 0u32;
-            let mut nombre = 0u32;
-            if PdhGetFormattedCounterArrayW(
-                compteur,
-                PDH_FMT_DOUBLE,
-                &mut octets,
-                &mut nombre,
-                None,
-            ) != PDH_MORE_DATA
-                || octets == 0
-            {
-                return Vec::new();
-            }
-            let taille = std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
-            let cases = (octets as usize).div_ceil(taille) + 1;
-            let mut tampon = vec![PDH_FMT_COUNTERVALUE_ITEM_W::default(); cases];
-            if PdhGetFormattedCounterArrayW(
-                compteur,
-                PDH_FMT_DOUBLE,
-                &mut octets,
-                &mut nombre,
-                Some(tampon.as_mut_ptr()),
-            ) != 0
-            {
-                return Vec::new();
-            }
-            tampon
-                .iter()
-                .take(nombre as usize)
-                .filter(|i| VALEUR_VALIDE.contains(&i.FmtValue.CStatus))
-                .map(|i| i.FmtValue.Anonymous.doubleValue)
-                .filter(|v| v.is_finite())
-                .collect()
-        }
-    }
 }
 
 /// Température du processeur à AFFICHER (#5189, écran « État du serveur »).
@@ -891,6 +767,9 @@ pub fn cpu_package_temp_celsius() -> Option<f64> {
     )
 }
 
+/// Windows (#6450) : la même lecture que la garde, gardée 15 s par
+/// `sources::windows_sources` ; le rapport ne relance pas les quatre sources
+/// (connexions WMI comprises) à chaque requête.
 #[cfg(target_os = "windows")]
 pub fn cpu_package_temp_celsius() -> Option<f64> {
     cpu_temp_celsius()
@@ -1250,12 +1129,12 @@ mod tests {
         assert!(matches!(g.decide(Some(lissee)), Verdict::Hold { .. }));
     }
 
-    /// #6450 : sans température lisible, la garde bride. Le lissage ne doit
-    /// jamais rendre lisible ce que la sonde ne lit plus : des relevés
-    /// anciens à 45 °C ne couvrent pas une sonde devenue muette, ni un
-    /// échantillonneur arrêté.
+    /// Le lissage ne doit jamais rendre lisible ce que la sonde ne lit
+    /// plus : des relevés anciens à 45 °C ne couvrent pas une sonde devenue
+    /// muette, ni un échantillonneur arrêté. Inconnue, la température ne
+    /// bride pas pour autant les analyses (#6450).
     #[test]
-    fn une_temperature_inconnue_reste_inconnue_et_bridee() {
+    fn une_temperature_inconnue_reste_inconnue_sans_brider() {
         let t0 = Instant::now();
         let cas: [(&str, FenetreGlissante, Instant); 3] = [
             ("aucun relevé", FenetreGlissante::default(), t0),
@@ -1280,9 +1159,9 @@ mod tests {
                 "{nom}"
             );
             assert_eq!(
-                brider_sans_thermometre(4, &lecture),
-                LARGEUR_SANS_THERMOMETRE,
-                "{nom} : les analyses doivent rester bridées"
+                largeur_selon_la_chaleur(4, &lecture),
+                4,
+                "{nom} : une température inconnue ne doit pas brider les analyses"
             );
             assert_eq!(
                 ThermalGate::new().decide(lissee),

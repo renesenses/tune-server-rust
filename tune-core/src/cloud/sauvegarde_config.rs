@@ -92,7 +92,15 @@ pub const FORMAT_VERSION: u64 = 1;
 /// `format` de l'enveloppe chiffrée déposée au site.
 pub const FORMAT_BLOB: &str = "tune-config-cloud";
 /// Version de l'enveloppe.
-pub const FORMAT_BLOB_VERSION: u64 = 1;
+///
+/// - v1 : chiffré en hexadécimal dans `envelope.ciphertext` ;
+/// - v2 (#7286) : chiffré en base64 dans `ciphertext_b64`, un tiers de plus
+///   que le binaire au lieu du double. Ce serveur lit les deux.
+pub const FORMAT_BLOB_VERSION: u64 = 2;
+/// `format_version` du CORPS de dépôt au site. La forme de la requête n'a
+/// pas changé avec la v2 du blob, qui reste un texte opaque pour le site :
+/// ce numéro reste celui que le site a toujours reçu.
+const VERSION_DEPOT_SITE: u64 = 1;
 
 /// Instantanés gardés par MACHINE (la rotation est faite par le site).
 pub const MAX_INSTANTANES: usize = 3;
@@ -463,15 +471,34 @@ struct Blob {
     format_version: u64,
     key_id: String,
     envelope: Envelope,
+    /// v2 : le chiffré, en base64 (`envelope.ciphertext` est alors vide).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ciphertext_b64: Option<String>,
+}
+
+impl Blob {
+    /// Le chiffré brut, selon la version.
+    fn chiffre(&self) -> Result<Vec<u8>, String> {
+        use base64::Engine as _;
+        match &self.ciphertext_b64 {
+            Some(b64) if self.format_version >= 2 => base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("base64 decode: {e}")),
+            Some(_) => Err("v1 backup carries a v2 ciphertext".into()),
+            None if self.format_version >= 2 => Err("v2 backup without ciphertext".into()),
+            None => hex_decode(&self.envelope.ciphertext),
+        }
+    }
 }
 
 /// Compresse et scelle un contenu. Rend le texte opaque déposé au site.
 pub fn chiffrer(cle: &CleLocale, contenu: &Value) -> Result<String, String> {
+    use base64::Engine as _;
     let clair = serde_json::to_vec(contenu).map_err(|e| e.to_string())?;
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     gz.write_all(&clair).map_err(|e| e.to_string())?;
     let compresse = gz.finish().map_err(|e| e.to_string())?;
-    let envelope = Envelope::sceller_avec(
+    let (envelope, chiffre) = Envelope::sceller_a_part(
         &cle.dek,
         &cle.passphrase_slot,
         &cle.recovery_slot,
@@ -482,6 +509,7 @@ pub fn chiffrer(cle: &CleLocale, contenu: &Value) -> Result<String, String> {
         format_version: FORMAT_BLOB_VERSION,
         key_id: cle.key_id.clone(),
         envelope,
+        ciphertext_b64: Some(base64::engine::general_purpose::STANDARD.encode(chiffre)),
     })
     .map_err(|e| e.to_string())
 }
@@ -521,10 +549,13 @@ pub fn dechiffrer(
             b.format, b.format_version
         )));
     }
+    // v1 (hexadécimal) comme v2 (base64) : un instantané déjà déposé par un
+    // serveur plus ancien s'ouvre toujours.
+    let chiffre = b.chiffre().map_err(ErreurOuverture::Illisible)?;
     let (compresse, retrouvee) = match locale.filter(|c| c.key_id == b.key_id) {
         Some(c) => (
             b.envelope
-                .ouvrir_avec(&c.dek)
+                .ouvrir_a_part(&c.dek, &chiffre)
                 .map_err(ErreurOuverture::Illisible)?,
             None,
         ),
@@ -539,7 +570,7 @@ pub fn dechiffrer(
                 .map_err(|_| ErreurOuverture::MauvaisSecret)?;
             let compresse = b
                 .envelope
-                .ouvrir_avec(&dek)
+                .ouvrir_a_part(&dek, &chiffre)
                 .map_err(ErreurOuverture::Illisible)?;
             (
                 compresse,
@@ -1043,6 +1074,11 @@ pub enum ErreurSite {
         statut: u16,
         code: Option<String>,
     },
+    /// Refus du dépôt : taille UTF-8 du blob et plafond annoncé par le site.
+    TropVolumineux {
+        octets: usize,
+        max_octets: Option<u64>,
+    },
     Reseau(String),
     Illisible,
 }
@@ -1055,6 +1091,13 @@ impl std::fmt::Display for ErreurSite {
                 Some(c) => write!(f, "HTTP {statut} {c}"),
                 None => write!(f, "HTTP {statut}"),
             },
+            ErreurSite::TropVolumineux { octets, max_octets } => {
+                write!(f, "HTTP 413 : sauvegarde de {octets} octets ; ")?;
+                match max_octets {
+                    Some(max) => write!(f, "limite : {max} octets"),
+                    None => write!(f, "limite non communiquée par le site ou le proxy"),
+                }
+            }
             ErreurSite::Reseau(e) => write!(f, "network: {e}"),
             ErreurSite::Illisible => write!(f, "unreadable response"),
         }
@@ -1211,7 +1254,7 @@ pub async fn deposer(
                 "server_id": c.server_id,
                 "server_label": label,
                 "key_id": key_id,
-                "format_version": FORMAT_BLOB_VERSION,
+                "format_version": VERSION_DEPOT_SITE,
                 "replaces": remplace,
                 "payload": blob,
             }));
@@ -1221,6 +1264,18 @@ pub async fn deposer(
         req
     })
     .await?;
+    if r.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        let max_octets = r
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("max_bytes").and_then(Value::as_u64))
+            .filter(|max| *max > 0);
+        return Err(ErreurSite::TropVolumineux {
+            octets: blob.len(),
+            max_octets,
+        });
+    }
     if !r.status().is_success() {
         return Err(erreur_de(r).await);
     }
@@ -1267,6 +1322,66 @@ pub enum Issue {
     Deposee(Meta),
     /// Échec, noté dans l'état.
     Echec(String),
+    /// Le site refuse l'instantané pour sa taille (#7286) : la taille, la
+    /// limite si elle est connue, et les playlists qui pèsent le plus, pour
+    /// dire quoi alléger.
+    TropVolumineux {
+        octets: usize,
+        max_octets: Option<u64>,
+        plus_longues_playlists: Vec<(String, usize)>,
+    },
+}
+
+impl Issue {
+    /// Le message d'un refus pour taille : quelle limite, et quoi faire.
+    pub fn conseil_taille(
+        octets: usize,
+        max_octets: Option<u64>,
+        plus_longues_playlists: &[(String, usize)],
+    ) -> String {
+        let mut m = ErreurSite::TropVolumineux { octets, max_octets }.to_string();
+        m.push_str(". Les playlists font l'essentiel d'une sauvegarde en ligne");
+        if !plus_longues_playlists.is_empty() {
+            let liste: Vec<String> = plus_longues_playlists
+                .iter()
+                .map(|(nom, n)| format!("« {nom} » ({n} titres)"))
+                .collect();
+            m.push_str(" ; les plus longues : ");
+            m.push_str(&liste.join(", "));
+        }
+        m.push_str(
+            ". Allégez-les ou scindez-les, puis relancez la sauvegarde ; \
+             l'export local de la configuration n'a pas cette limite.",
+        );
+        m
+    }
+}
+
+/// Les playlists du contenu qui portent le plus de titres, les `n` premières.
+fn plus_longues_playlists(contenu: &Value, n: usize) -> Vec<(String, usize)> {
+    let mut v: Vec<(String, usize)> = contenu
+        .get("playlists")
+        .and_then(Value::as_array)
+        .map(|pls| {
+            pls.iter()
+                .map(|pl| {
+                    (
+                        pl.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        pl.get("tracks")
+                            .and_then(Value::as_array)
+                            .map_or(0, Vec::len),
+                    )
+                })
+                .filter(|(_, n)| *n > 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(n);
+    v
 }
 
 /// Une passe : automatique (`manuelle = false`, soumise au délai d'attente
@@ -1364,6 +1479,17 @@ pub async fn passe(
                 "sauvegarde_cloud_deposee"
             );
             Issue::Deposee(meta)
+        }
+        Err(ErreurSite::TropVolumineux { octets, max_octets }) => {
+            let plus_longues = plus_longues_playlists(&contenu, 3);
+            let msg = Issue::conseil_taille(octets, max_octets, &plus_longues);
+            settings.set(CLE_DERNIERE_ERREUR, &msg).ok();
+            warn!(octets, ?max_octets, "sauvegarde_cloud_trop_volumineuse");
+            Issue::TropVolumineux {
+                octets,
+                max_octets,
+                plus_longues_playlists: plus_longues,
+            }
         }
         Err(e) => {
             let msg = e.to_string();

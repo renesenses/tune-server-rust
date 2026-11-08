@@ -33,18 +33,30 @@ pub(super) struct Banc {
     idle: HashMap<i64, IdlePollBackoff>,
     position_ms: u64,
     recu: tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+    /// L'identifiant de la sortie factice (#7379 : DLNA ou locale).
+    appareil: &'static str,
 }
 
 impl Banc {
     /// Une zone DLNA qui joue, volume 100 % en base et en mémoire, PURE
     /// verrouillé ou non.
     pub(super) async fn monter(pure_verrouille: bool) -> Self {
+        Self::monter_sur(pure_verrouille, APPAREIL, "dlna").await
+    }
+
+    /// #7379 — le même banc sur la sortie factice `appareil` de type
+    /// `output_type` (`dlna`, ou `local` pour une sortie à volume logiciel).
+    pub(super) async fn monter_sur(
+        pure_verrouille: bool,
+        appareil: &'static str,
+        output_type: &str,
+    ) -> Self {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
         let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
         let zone_id = ZoneRepo::with_backend(db.clone())
-            .create("My Devialet", Some("dlna"), Some(APPAREIL))
+            .create("My Devialet", Some(output_type), Some(appareil))
             .unwrap();
         ZoneRepo::with_backend(db.clone())
             .update_volume(zone_id, 100.0)
@@ -59,7 +71,7 @@ impl Banc {
         }
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
         outputs.lock().await.register(Box::new(
-            MockOutput::new(APPAREIL, "My Devialet").with_type("dlna"),
+            MockOutput::new(appareil, "My Devialet").with_type(output_type),
         ));
         let playback = Arc::new(PlaybackManager::new());
         let orchestrator = Arc::new(PlaybackOrchestrator::new(
@@ -103,6 +115,7 @@ impl Banc {
             idle: HashMap::new(),
             position_ms: 10_000,
             recu,
+            appareil,
         };
         // Sous PURE verrouillé, l'appareil part à 100 %, comme après un
         // armement confirmé : la baisse que ces tests provoquent ensuite est
@@ -114,7 +127,7 @@ impl Banc {
 
     async fn avec_mock<R>(&self, f: impl AsyncFnOnce(&MockOutput) -> R) -> R {
         let reg = self.outputs.lock().await;
-        let arc = reg.get(APPAREIL).unwrap();
+        let arc = reg.get(self.appareil).unwrap();
         let sortie = arc.lock().await;
         f(sortie.as_any().downcast_ref::<MockOutput>().unwrap()).await
     }
@@ -140,7 +153,7 @@ impl Banc {
             .set_volume_avec_garde(
                 self.zone_id,
                 volume,
-                Some(APPAREIL),
+                Some(self.appareil),
                 crate::audio::garde_de_hausse::Hausse::Confirmee,
             )
             .await
@@ -151,6 +164,45 @@ impl Banc {
             .await;
     }
 
+    /// #6721 — un geste NON confirmé (curseur, pas) par le VRAI orchestrateur,
+    /// puis la grâce de volume écoulée.
+    pub(super) async fn consigne_gardee(&self, volume: f64) {
+        self.poller
+            .orchestrator
+            .set_volume(self.zone_id, volume, Some(self.appareil))
+            .await
+            .unwrap();
+        self.poller
+            .playback
+            .ecouler_la_grace_de_volume(self.zone_id)
+            .await;
+    }
+
+    /// #8031 — la sourdine par le VRAI orchestrateur (`SetMute`, #6700).
+    pub(super) async fn sourdine(&self, muted: bool) {
+        self.poller
+            .orchestrator
+            .set_mute(self.zone_id, muted, Some(self.appareil))
+            .await
+            .unwrap();
+    }
+
+    /// #8031 — la grâce qui suit un changement de sourdine, écoulée.
+    pub(super) async fn ecouler_la_grace_de_sourdine(&self) {
+        self.poller
+            .playback
+            .ecouler_la_grace_de_sourdine(self.zone_id)
+            .await;
+    }
+
+    /// #8031 — les évènements du gestionnaire de lecture (ce que les clients
+    /// reçoivent : `playback.volume`, `playback.muted`).
+    pub(super) fn evenements(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::playback::PlaybackEvent> {
+        self.poller.playback.subscribe()
+    }
+
     pub(super) async fn commandes_depuis(&self, deja: usize) -> Vec<f64> {
         self.avec_mock(async |m| m.volume_calls().await[deja..].to_vec())
             .await
@@ -159,8 +211,10 @@ impl Banc {
     /// Pause puis reprise par le VRAI orchestrateur, sur la sortie factice.
     pub(super) async fn pause_puis_reprise(&self) {
         let orch = self.poller.orchestrator.clone();
-        orch.pause(self.zone_id, Some(APPAREIL)).await.unwrap();
-        orch.resume(self.zone_id, Some(APPAREIL)).await.unwrap();
+        orch.pause(self.zone_id, Some(self.appareil)).await.unwrap();
+        orch.resume(self.zone_id, Some(self.appareil))
+            .await
+            .unwrap();
     }
 
     /// Le volume de la zone en mémoire (celui que le client lit).
@@ -187,6 +241,37 @@ impl Banc {
             .await;
     }
 
+    /// #8031 — la zone joue une webradio (site d'adoption « radio »).
+    pub(super) async fn en_radio(&self) {
+        self.poller
+            .playback
+            .play(
+                self.zone_id,
+                NowPlaying {
+                    title: "FIP".into(),
+                    source: "radio".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
+
+    /// #8031 — un tour sur une zone radio : l'étranglement du sondage radio
+    /// (`RADIO_POLL_INTERVAL_SECS`) est échu, l'appareil est relu.
+    pub(super) async fn tic_radio(&mut self) {
+        if let Some(ps) = self.poll_states.get_mut(&self.zone_id)
+            && let Some(avant) = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS + 1))
+        {
+            ps.last_radio_poll = avant;
+        }
+        self.avec_mock(async |m| m.set_state(TransportState::Playing).await)
+            .await;
+        self.poller
+            .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
+            .await;
+    }
+
     /// La zone à `pour_cent` en base ET en mémoire, sans grâce de volume.
     pub(super) async fn zone_a(&self, pour_cent: f64) {
         ZoneRepo::with_backend(self.db.clone())
@@ -196,6 +281,14 @@ impl Banc {
             .playback
             .set_volume(self.zone_id, pour_cent / 100.0)
             .await;
+    }
+
+    /// #7379 — les évènements de lecture, tels que le serveur les relaie aux
+    /// clients (`volume` : le curseur).
+    pub(super) fn evenements_de_lecture(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::playback::PlaybackEvent> {
+        self.poller.playback.subscribe()
     }
 
     /// Pose un réglage clé/valeur (#6541 : les limites de volume).
@@ -208,6 +301,160 @@ impl Banc {
     pub(super) fn volume_en_base(&self) -> f64 {
         ZoneRepo::with_backend(self.db.clone())
             .get(self.zone_id)
+            .unwrap()
+            .unwrap()
+            .volume
+    }
+
+    /// #7379 — la réponse de volume de l'appareil devient illisible (repli
+    /// 0,5 de #5662) ou redevient lisible.
+    pub(super) async fn volume_illisible(&self, illisible: bool) {
+        self.avec_mock(async |m| m.rendre_le_volume_illisible(illisible))
+            .await;
+    }
+
+    /// #7379 — la zone ne joue plus dans Tune (site « zone au repos »).
+    pub(super) async fn arreter_dans_tune(&self) {
+        self.poller.playback.stop(self.zone_id).await;
+    }
+
+    /// #7379 — un tour sur une zone au repos, l'appareil dans `etat`, la
+    /// grâce de démarrage du sondeur (30 s) échue.
+    pub(super) async fn tic_au_repos(&mut self, etat: TransportState) {
+        self.avec_mock(async |m| m.set_state(etat).await).await;
+        // Le recul de repos (`IDLE_REPOS_POLL_TICKS`) n'est pas l'objet des
+        // témoins : chaque tour relit l'appareil.
+        self.idle.clear();
+        let demarrage = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .unwrap();
+        self.poller
+            .tick(&mut self.poll_states, &mut self.idle, &demarrage)
+            .await;
+    }
+
+    /// #7379 (B2) — ce que fait `PATCH /zones/{id}` quand le trim change : le
+    /// trim posé (effacé à 0), puis la consigne courante repoussée par
+    /// `set_volume` (« Effet immédiat »), grâce de volume écoulée ensuite.
+    pub(super) async fn changer_le_trim(&self, trim_db: f64) {
+        let cle = format!("zone_{}_gain_trim_db", self.zone_id);
+        let reglages = SettingsRepo::with_backend(self.db.clone());
+        if trim_db == 0.0 {
+            reglages.delete(&cle).unwrap();
+        } else {
+            reglages.set(&cle, &format!("{trim_db}")).unwrap();
+        }
+        let consigne = self.volume_en_base() / 100.0;
+        self.poller
+            .orchestrator
+            .set_volume(self.zone_id, consigne, Some(self.appareil))
+            .await
+            .unwrap();
+        self.poller
+            .playback
+            .ecouler_la_grace_de_volume(self.zone_id)
+            .await;
+    }
+
+    /// #7379 — un pas « volume + / − » (`delta`, signé) depuis le volume que
+    /// la zone AFFICHE (mémoire), par `set_volume_au_pas`, comme les boutons
+    /// du client.
+    pub(super) async fn pas_de_volume(&self, delta: f64) {
+        let affiche = self.volume_en_memoire().await;
+        self.poller
+            .orchestrator
+            .set_volume_au_pas(
+                self.zone_id,
+                (affiche + delta).clamp(0.0, 1.0),
+                Some(self.appareil),
+            )
+            .await
+            .unwrap();
+        self.poller
+            .playback
+            .ecouler_la_grace_de_volume(self.zone_id)
+            .await;
+    }
+
+    /// #7379 — une consigne de l'auditeur, la grâce de volume LAISSÉE ouverte
+    /// (elle vient d'arriver).
+    pub(super) async fn consigne_a_l_instant(&self, volume: f64) {
+        self.poller
+            .orchestrator
+            .set_volume(self.zone_id, volume, Some(self.appareil))
+            .await
+            .unwrap();
+    }
+
+    /// #7379 — applique un relevé jugé AVANT une consigne concurrente
+    /// (`ancien` : la consigne vue au relevé).
+    pub(super) async fn appliquer_un_releve(
+        &self,
+        ancien: f64,
+        suite: super::releve_ne_monte_pas_6739::SuiteDuReleve,
+    ) {
+        self.poller
+            .appliquer_la_suite_du_releve(self.zone_id, self.appareil, ancien, suite)
+            .await;
+    }
+
+    /// #7379 — une seconde zone en lecture, sur sa propre sortie factice
+    /// `dlna`, dans la même base ; elle rejoint le groupe `groupe` avec la
+    /// première. Rend son identifiant.
+    pub(super) async fn grouper_avec(&self, appareil: &'static str, groupe: &str) -> i64 {
+        let repo = ZoneRepo::with_backend(self.db.clone());
+        let zone = repo
+            .create("Salon B", Some("dlna"), Some(appareil))
+            .unwrap();
+        repo.update_volume(zone, 40.0).unwrap();
+        repo.update_group(zone, Some(groupe)).unwrap();
+        repo.update_group(self.zone_id, Some(groupe)).unwrap();
+        self.outputs.lock().await.register(Box::new(
+            MockOutput::new(appareil, "Salon B").with_type("dlna"),
+        ));
+        self.poller
+            .playback
+            .play(
+                zone,
+                NowPlaying {
+                    title: "O Fortuna".into(),
+                    source: "upnp".into(),
+                    duration_ms: DUREE_MS as i64,
+                    ..Default::default()
+                },
+            )
+            .await;
+        self.poller.playback.set_volume(zone, 0.4).await;
+        self.appareil_de(appareil, 0.4).await;
+        zone
+    }
+
+    /// #7379 — le volume de la sortie factice `appareil`, changé hors de Tune.
+    pub(super) async fn appareil_de(&self, appareil: &str, volume: f64) -> usize {
+        let reg = self.outputs.lock().await;
+        let arc = reg.get(appareil).unwrap();
+        let sortie = arc.lock().await;
+        let m = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
+        m.set_volume(volume).await.unwrap();
+        m.set_state(TransportState::Playing).await;
+        m.set_duration(DUREE_MS);
+        m.set_position(self.position_ms);
+        m.volume_call_count().await
+    }
+
+    /// #7379 — les commandes de volume reçues par `appareil` depuis `deja`.
+    pub(super) async fn commandes_de(&self, appareil: &str, deja: usize) -> Vec<f64> {
+        let reg = self.outputs.lock().await;
+        let arc = reg.get(appareil).unwrap();
+        let sortie = arc.lock().await;
+        let m = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
+        m.volume_calls().await[deja..].to_vec()
+    }
+
+    /// #7379 — le volume en base de la zone `zone`.
+    pub(super) fn volume_en_base_de(&self, zone: i64) -> f64 {
+        ZoneRepo::with_backend(self.db.clone())
+            .get(zone)
             .unwrap()
             .unwrap()
             .volume

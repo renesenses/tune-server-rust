@@ -166,7 +166,7 @@ fn drains_temps_reel_ne_font_aucune_allocation() {
 #[test]
 fn le_rappel_entier_local_partage_rend_une_periode_sans_allouer() {
     let ring = RingBuf::new(64);
-    let volume = AtomicU32::new(1000);
+    let volume = AtomicU32::new(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU);
     let paused = AtomicBool::new(false);
     let silent = AtomicBool::new(false);
     let data_started = AtomicBool::new(false);
@@ -218,7 +218,10 @@ fn le_rappel_entier_local_partage_rend_une_periode_sans_allouer() {
 
     // La période QUADRUPLE et le volume change : c'est le cas qui faisait
     // grandir l'ancien scratch. Le reliquat est comblé de zéros.
-    volume.store(500, Ordering::Relaxed);
+    volume.store(
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 2,
+        Ordering::Relaxed,
+    );
     let mut grande = [7i16; 8];
     let lus = assert_no_allocation(|| {
         render_local_shared_integer_callback(
@@ -239,7 +242,10 @@ fn le_rappel_entier_local_partage_rend_une_periode_sans_allouer() {
 
     // Rampe ARMÉE et descendante : le facteur bouge à chaque trame, toujours
     // sans allouer, et il s'applique AVANT la conversion.
-    volume.store(1000, Ordering::Relaxed);
+    volume.store(
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+        Ordering::Relaxed,
+    );
     paused.store(true, Ordering::Relaxed);
     assert_eq!(ring.push(&[0.5f32; 32]), 32);
     let mut periode_rampee = [0i16; 32];
@@ -394,7 +400,7 @@ impl DspAuReposNatif {
             crossfeed: std::sync::Mutex::new(None),
             pure_bypass: AtomicBool::new(false),
             mono_downmix: AtomicBool::new(false),
-            volume: AtomicU32::new(1000),
+            volume: AtomicU32::new(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU),
         }
     }
 

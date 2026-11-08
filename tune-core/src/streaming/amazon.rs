@@ -218,6 +218,7 @@ impl AmazonMusicService {
             .to_string();
         StreamAlbum {
             ai_generated: None,
+            explicit: None,
             release_type: None,
             id: data["id"]
                 .as_str()

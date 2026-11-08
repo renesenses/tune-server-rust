@@ -215,10 +215,30 @@ fn register_functions(conn: &Connection) -> Result<(), String> {
             // `LOWER(unaccent(col)) LIKE …` skip rows with a NULL genre/
             // composer instead of erroring). Only TEXT columns are wrapped.
             let s: Option<String> = ctx.get(0)?;
-            Ok(s.map(|v| crate::db::engine::fold_diacritics(&v)))
+            // #7619 — l'ASCII rendu tel quel, sans seconde allocation (voir
+            // `fold_diacritics`) : appelée sur chaque titre par la recherche.
+            Ok(s.map(|v| {
+                if v.is_ascii() {
+                    v
+                } else {
+                    crate::db::engine::fold_diacritics(&v)
+                }
+            }))
         },
     )
     .map_err(|e| format!("register unaccent: {e}"))?;
+    // #7619 — le texte libre d'Oxygen en début de mot : voir
+    // `engine::mots_pour_debut_de_mot`. NULL rend NULL, comme `unaccent`.
+    conn.create_scalar_function(
+        "tune_mots_debut",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let s: Option<String> = ctx.get(0)?;
+            Ok(s.map(|v| crate::db::engine::mots_pour_debut_de_mot(&v)))
+        },
+    )
+    .map_err(|e| format!("register tune_mots_debut: {e}"))?;
     // #5192 — les termes de chemin, en Rust, pour les passes EN MASSE
     // (reconstruction de `tracks_fts`, texte libre d'Oxygen). Les
     // déclencheurs, eux, gardent l'expression SQL pure : une base éditée au
@@ -745,7 +765,14 @@ CREATE TABLE IF NOT EXISTS tracks (
     rating INTEGER,
     -- Debit moyen du fichier en kbit/s, lu au scan (#6332, migration 130).
     -- NULL = pas encore lu (complete au rescan) ou inconnu.
-    bitrate_kbps INTEGER
+    bitrate_kbps INTEGER,
+    -- Marquage explicite de la balise (#8088, migration 141) : 1 explicite,
+    -- 0 propre, NULL sans balise. Index partiel `idx_tracks_explicit`.
+    explicit INTEGER,
+    -- Cle de tri de la vue des pistes (#7619, L1) : artiste, album, disque,
+    -- numero, plies. Calculee en Rust (`track_repo::cle_de_tri`), NULL tant
+    -- qu'elle ne l'a pas ete. Index `idx_tracks_cle_tri (cle_tri, id)`.
+    cle_tri TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -757,7 +784,10 @@ CREATE TABLE IF NOT EXISTS track_credits (
     instrument TEXT,
     position INTEGER DEFAULT 0,
     -- Identifiant MusicBrainz de l'artiste credite (migration 107, #4767).
-    artist_mbid TEXT
+    artist_mbid TEXT,
+    -- D'ou vient le credit (migration 137, #7765) : manuel, musicbrainz,
+    -- balises, discogs ou roon. NULL = ligne ancienne, source inconnue.
+    source TEXT
 );
 
 -- Persistent per-file first-seen-in-library timestamp, keyed by path.

@@ -1,6 +1,6 @@
 use reqwest::Client;
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{info, warn};
 
 use super::traits::*;
@@ -10,6 +10,17 @@ const AUTH_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const API_BASE: &str = "https://api.spotify.com/v1";
 const DEFAULT_CLIENT_ID: &str = "placeholder";
+/// #7659 — le plus grand `limit` que `/v1/search` accepte d'une application
+/// en quota étendu. Au-delà, Spotify répond `400 Invalid limit` : la limite
+/// du client web (100, `SEARCH_FEDEREE_LIMIT`) partait telle quelle et la
+/// recherche ne rendait rien.
+const PLAFOND_RECHERCHE: usize = 50;
+/// #7659 — le plafond d'une application en mode développement, celle que
+/// chaque utilisateur crée pour coller son Client ID (fil 221), depuis les
+/// changements de l'API Web de février 2026. Il n'est pas supposé d'avance :
+/// le service l'adopte au premier `400 Invalid limit` qu'il reçoit à 50
+/// (voir [`SpotifyService::recherche`]).
+const PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT: usize = 10;
 // Spotify n'accepte plus l'alias `localhost` : le HTTP en clair n'est admis
 // que pour un LITTERAL de boucle locale. C'est acquis depuis #2680 et ce
 // n'est pas ce qui change ici.
@@ -73,6 +84,17 @@ pub struct SpotifyService {
     /// `None` : inconnues (liaison restaurée d'une version qui ne les gardait
     /// pas, pas encore rafraîchie).
     portees: Option<String>,
+    /// #7659 — le `limit` de recherche que Spotify accepte de CETTE
+    /// application : [`PLAFOND_RECHERCHE`], ramené à
+    /// [`PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT`] après un refus de limite.
+    /// Atomique pour la même raison que `token_rejected`.
+    plafond_recherche: AtomicUsize,
+    /// #8051 — Spotify a refusé pour de bon le renouvellement du jeton
+    /// (`400 invalid_grant`, `401`) : la session en mémoire est effacée et
+    /// [`StreamingService::session_expired`] le dit au rafraîchisseur, qui
+    /// supprime la ligne de jetons. Sans cela, le service restait annoncé
+    /// « Connecté » avec un jeton mort, et chaque recherche échouait.
+    session_refusee: bool,
 }
 
 impl Default for SpotifyService {
@@ -354,6 +376,8 @@ impl SpotifyService {
             enabled_override: None,
             token_rejected: AtomicBool::new(false),
             portees: None,
+            plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
+            session_refusee: false,
         }
     }
 
@@ -443,7 +467,222 @@ impl SpotifyService {
             self.note_token_rejected();
             return Err("token expired".into());
         }
+        // #7659 et #6825 — un refus (400, 403, 404, 429…) porte un corps JSON
+        // valide, `{"error":{"status":400,"message":"Invalid limit"}}` : le
+        // lire comme une réponse faisait passer le refus pour une recherche
+        // sans résultat ou un onglet Éditorial vide (mis en cache 30 min).
+        // C'est une erreur, journalisée avec son statut ; le chemin est
+        // journalisé sans sa requête, le motif borné à 200 caractères.
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let corps = resp.text().await.unwrap_or_default();
+            let message = motif_du_refus(&corps);
+            let route = path.split('?').next().unwrap_or(path);
+            warn!(status, route, message = %message, "spotify_api_error");
+            return Err(format!("spotify GET {route}: HTTP {status} — {message}"));
+        }
         resp.json().await.map_err(|e| format!("spotify json: {e}"))
+    }
+
+    /// #8050 — taille d'une page des listes de l'utilisateur : le plafond
+    /// que Spotify accepte pour `/me/tracks`, `/me/albums`, `/me/playlists`
+    /// et `/me/following`.
+    const PAGE_UTILISATEUR: usize = 50;
+    /// #8050 — borne de sécurité : 200 pages de 50, soit 10 000 éléments par
+    /// liste. Au-delà, la lecture s'arrête et le dit, au lieu de tourner sans
+    /// fin sur un service qui annoncerait toujours une suite.
+    const PAGES_UTILISATEUR_MAX: usize = 200;
+
+    /// #8050 — tous les éléments d'une liste de l'utilisateur paginée par
+    /// `offset` (`/me/tracks`, `/me/albums`, `/me/playlists`).
+    ///
+    /// On ne lisait que la première page (`?limit=50`) : au-delà de 50
+    /// favoris, le reste n'apparaissait jamais dans Tune. Même modèle que la
+    /// lecture des favoris TIDAL : le décalage avance du nombre REÇU (#7250,
+    /// une page plafonnée sous la limite ne fait sauter personne), la lecture
+    /// s'arrête au `total` annoncé ou, sans total, à la première page sans
+    /// `next` ; une page qui n'apporte aucun élément neuf l'arrête aussi
+    /// (garde de #7729), comme la borne `PAGES_UTILISATEUR_MAX`.
+    async fn lire_toutes_les_pages(
+        &self,
+        chemin: &str,
+        cle: fn(&serde_json::Value) -> Option<String>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let separateur = if chemin.contains('?') { '&' } else { '?' };
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut offset = 0usize;
+        let mut total: Option<usize> = None;
+        let mut termine = false;
+        for _ in 0..Self::PAGES_UTILISATEUR_MAX {
+            let data = self
+                .api_get(&format!(
+                    "{chemin}{separateur}limit={}&offset={offset}",
+                    Self::PAGE_UTILISATEUR
+                ))
+                .await?;
+            let lot = data["items"].as_array().cloned().unwrap_or_default();
+            let recus = lot.len();
+            offset += recus;
+            let avant = items.len();
+            for element in lot {
+                let id = cle(&element).unwrap_or_else(|| element.to_string());
+                if vus.insert(id) {
+                    items.push(element);
+                }
+            }
+            total = data["total"].as_u64().and_then(|t| usize::try_from(t).ok());
+            let suite = data["next"].is_string();
+            let fini = match total {
+                Some(t) => offset >= t,
+                None => !suite,
+            };
+            if fini || recus == 0 {
+                termine = true;
+                break;
+            }
+            if items.len() == avant {
+                warn!(chemin, offset, "spotify_pagination_sans_progression");
+                termine = true;
+                break;
+            }
+        }
+        if !termine {
+            warn!(
+                chemin,
+                lus = items.len(),
+                "spotify_pagination_borne_atteinte"
+            );
+        } else if let Some(t) = total.filter(|t| items.len() < *t) {
+            warn!(
+                chemin,
+                lus = items.len(),
+                total = t,
+                "spotify_pagination_incomplete"
+            );
+        }
+        Ok(items)
+    }
+
+    /// #8050 — tous les artistes suivis. `/me/following` pagine par curseur
+    /// (`artists.cursors.after`), pas par décalage ; mêmes gardes que
+    /// [`Self::lire_toutes_les_pages`].
+    async fn lire_tous_les_artistes_suivis(&self) -> Result<Vec<serde_json::Value>, String> {
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut apres: Option<String> = None;
+        for _ in 0..Self::PAGES_UTILISATEUR_MAX {
+            let curseur = apres
+                .as_deref()
+                .map(|a| format!("&after={}", urlencoding::encode(a)))
+                .unwrap_or_default();
+            let data = self
+                .api_get(&format!(
+                    "/me/following?type=artist&limit={}{curseur}",
+                    Self::PAGE_UTILISATEUR
+                ))
+                .await?;
+            let page = &data["artists"];
+            let lot = page["items"].as_array().cloned().unwrap_or_default();
+            let recus = lot.len();
+            let avant = items.len();
+            for element in lot {
+                let id = element["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| element.to_string());
+                if vus.insert(id) {
+                    items.push(element);
+                }
+            }
+            let suivant = page["cursors"]["after"].as_str().map(str::to_owned);
+            if recus == 0 || !page["next"].is_string() || suivant.is_none() {
+                return Ok(items);
+            }
+            if items.len() == avant {
+                warn!(
+                    lus = items.len(),
+                    "spotify_artistes_suivis_sans_progression"
+                );
+                return Ok(items);
+            }
+            apres = suivant;
+        }
+        warn!(lus = items.len(), "spotify_artistes_suivis_borne_atteinte");
+        Ok(items)
+    }
+
+    /// #7659 — la limite envoyée à `/v1/search` pour une `limit` demandée :
+    /// le plafond accepté par cette application, `0` (« Tous ») compris.
+    fn borne_de_recherche(&self, limit: usize) -> usize {
+        let plafond = self.plafond_recherche.load(Ordering::Relaxed);
+        if limit == 0 {
+            plafond
+        } else {
+            limit.min(plafond)
+        }
+    }
+
+    /// #7659 — une page brute de `/v1/search`, et la limite réellement servie.
+    ///
+    /// Un `400 Invalid limit` reçu au-dessus du plafond du mode développement
+    /// fait adopter ce plafond, puis la même page est redemandée UNE fois :
+    /// la recherche aboutit pour les deux sortes d'applications, sans deviner
+    /// laquelle est configurée.
+    async fn recherche(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(serde_json::Value, usize), String> {
+        let borne = self.borne_de_recherche(limit);
+        match self.page_brute(query, borne, offset).await {
+            Err(e) if refus_de_limite(&e) && borne > PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT => {
+                self.plafond_recherche
+                    .store(PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT, Ordering::Relaxed);
+                warn!(
+                    refusee = borne,
+                    adoptee = PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT,
+                    "spotify_search_limit_lowered"
+                );
+                let borne = self.borne_de_recherche(limit);
+                self.page_brute(query, borne, offset)
+                    .await
+                    .map(|data| (data, borne))
+            }
+            r => r.map(|data| (data, borne)),
+        }
+    }
+
+    async fn page_brute(
+        &self,
+        query: &str,
+        borne: usize,
+        offset: usize,
+    ) -> Result<serde_json::Value, String> {
+        self.api_get(&format!(
+            "/search?q={}&type=track,album,artist&limit={borne}&offset={offset}",
+            urlencoding::encode(query)
+        ))
+        .await
+    }
+
+    fn resultats_de_recherche(data: &serde_json::Value) -> SearchResults {
+        SearchResults {
+            tracks: data["tracks"]["items"]
+                .as_array()
+                .map(|i| i.iter().map(Self::map_track).collect())
+                .unwrap_or_default(),
+            albums: data["albums"]["items"]
+                .as_array()
+                .map(|i| i.iter().map(Self::map_album).collect())
+                .unwrap_or_default(),
+            artists: data["artists"]["items"]
+                .as_array()
+                .map(|i| i.iter().map(Self::map_artist).collect())
+                .unwrap_or_default(),
+            playlists: vec![],
+        }
     }
 
     /// #6018 — le jeton d'accès courant, que librespot reçoit pour se
@@ -487,16 +726,31 @@ impl SpotifyService {
             .clone()
             .ok_or("Spotify n'est pas connecté")?;
         let mut appareil = None;
+        let mut derniere_erreur = None;
         for essai in 0..20 {
             if essai > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
-            appareil = self.appareil_par_nom(nom).await?;
+            // #7659 — `api_get` rend désormais un refus (429, 5xx…) en erreur :
+            // un refus passager vaut « appareil pas encore visible », seul le
+            // jeton rejeté arrête l'attente.
+            match self.appareil_par_nom(nom).await {
+                Ok(trouve) => {
+                    derniere_erreur = None;
+                    appareil = trouve;
+                }
+                Err(e) if e == "token expired" => return Err(e),
+                Err(e) => derniere_erreur = Some(e),
+            }
             if appareil.is_some() {
                 break;
             }
         }
-        let appareil = appareil.ok_or_else(|| motif_appareil_absent(nom))?;
+        let appareil = match (appareil, derniere_erreur) {
+            (Some(appareil), _) => appareil,
+            (None, Some(e)) => return Err(e),
+            (None, None) => return Err(motif_appareil_absent(nom)),
+        };
         let resp = self
             .client
             .put(format!(
@@ -574,6 +828,7 @@ impl SpotifyService {
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
             ai_generated: None,
+            explicit: None,
             release_type: None,
             id: item["id"].as_str().unwrap_or("").into(),
             title: item["name"].as_str().unwrap_or("").into(),
@@ -867,30 +1122,47 @@ impl StreamingService for SpotifyService {
         self.token_expires = None;
         self.portees = None;
         self.token_rejected.store(false, Ordering::Relaxed);
+        self.session_refusee = false;
         Ok(())
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
-        let data = self
-            .api_get(&format!(
-                "/search?q={}&type=track,album,artist&limit={limit}",
-                urlencoding::encode(query)
-            ))
-            .await?;
-        Ok(SearchResults {
-            tracks: data["tracks"]["items"]
-                .as_array()
-                .map(|i| i.iter().map(Self::map_track).collect())
-                .unwrap_or_default(),
-            albums: data["albums"]["items"]
-                .as_array()
-                .map(|i| i.iter().map(Self::map_album).collect())
-                .unwrap_or_default(),
-            artists: data["artists"]["items"]
-                .as_array()
-                .map(|i| i.iter().map(Self::map_artist).collect())
-                .unwrap_or_default(),
-            playlists: vec![],
+        let (data, _) = self.recherche(query, limit, 0).await?;
+        Ok(Self::resultats_de_recherche(&data))
+    }
+
+    /// #7659 — la limite servie est celle de [`Self::borne_de_recherche`] :
+    /// le curseur de la route avance de ce que Spotify a vraiment rendu.
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        self.borne_de_recherche(limit)
+    }
+
+    /// #7659 — une PAGE de la recherche Spotify : `/v1/search` sait paginer
+    /// (`offset`), et chaque catégorie annonce son `total` et, tant qu'il en
+    /// reste, `next`. Avec un plafond de 10 par page, c'est « Charger plus »
+    /// qui donne la suite.
+    async fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchPage, TuneError> {
+        let (data, _) = self.recherche(query, limit, offset).await?;
+        let total = |cat: &str| data[cat]["total"].as_u64().unwrap_or(0) as usize;
+        let has_more = ["tracks", "albums", "artists"]
+            .iter()
+            .any(|cat| data[*cat]["next"].is_string());
+        Ok(SearchPage {
+            results: Self::resultats_de_recherche(&data),
+            offset,
+            totals: SearchTotals {
+                tracks: total("tracks"),
+                albums: total("albums"),
+                artists: total("artists"),
+                playlists: 0,
+            },
+            has_more,
+            truncated: false,
         })
     }
 
@@ -949,11 +1221,11 @@ impl StreamingService for SpotifyService {
             .unwrap_or_default())
     }
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
-        let d = self.api_get("/me/playlists?limit=50").await?;
-        Ok(d["items"]
-            .as_array()
-            .map(|i| i.iter().map(Self::map_playlist).collect())
-            .unwrap_or_default())
+        // #8050 — toutes les pages, pas seulement les 50 premières.
+        let items = self
+            .lire_toutes_les_pages("/me/playlists", |p| p["id"].as_str().map(str::to_owned))
+            .await?;
+        Ok(items.iter().map(Self::map_playlist).collect())
     }
 
     async fn create_playlist(
@@ -1081,6 +1353,7 @@ impl StreamingService for SpotifyService {
                     {
                         albums.push(StreamAlbum {
                             ai_generated: None,
+                            explicit: None,
                             release_type: None,
                             id: album_id.clone(),
                             title: album_title.clone(),
@@ -1106,15 +1379,16 @@ impl StreamingService for SpotifyService {
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
-        let data = self.api_get("/me/tracks?limit=50").await?;
-        Ok(data["items"]
-            .as_array()
-            .map(|i| {
-                i.iter()
-                    .filter_map(|item| item.get("track").map(Self::map_track))
-                    .collect()
+        // #8050 — toutes les pages, pas seulement les 50 premières.
+        let items = self
+            .lire_toutes_les_pages("/me/tracks", |e| {
+                e["track"]["id"].as_str().map(str::to_owned)
             })
-            .unwrap_or_default())
+            .await?;
+        Ok(items
+            .iter()
+            .filter_map(|item| item.get("track").map(Self::map_track))
+            .collect())
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
@@ -1139,22 +1413,21 @@ impl StreamingService for SpotifyService {
         Ok(())
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
-        let d = self.api_get("/me/albums?limit=50").await?;
-        Ok(d["items"]
-            .as_array()
-            .map(|i| {
-                i.iter()
-                    .filter_map(|item| item.get("album").map(Self::map_album))
-                    .collect()
+        // #8050 — toutes les pages, pas seulement les 50 premières.
+        let items = self
+            .lire_toutes_les_pages("/me/albums", |e| {
+                e["album"]["id"].as_str().map(str::to_owned)
             })
-            .unwrap_or_default())
+            .await?;
+        Ok(items
+            .iter()
+            .filter_map(|item| item.get("album").map(Self::map_album))
+            .collect())
     }
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
-        let d = self.api_get("/me/following?type=artist&limit=50").await?;
-        Ok(d["artists"]["items"]
-            .as_array()
-            .map(|i| i.iter().map(Self::map_artist).collect())
-            .unwrap_or_default())
+        // #8050 — tous les curseurs, pas seulement les 50 premiers.
+        let items = self.lire_tous_les_artistes_suivis().await?;
+        Ok(items.iter().map(Self::map_artist).collect())
     }
 
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
@@ -1187,6 +1460,29 @@ impl StreamingService for SpotifyService {
             .await
             .map_err(|e| format!("refresh: {e}"))?;
 
+        // #8051 — le refus se lit : statut et motif. Un refus définitif
+        // efface la session au lieu de la laisser « Connectée » avec un jeton
+        // que Spotify n'accepte plus ; un refus passager (429, 5xx) la garde
+        // pour le prochain tic.
+        let status = resp.status().as_u16();
+        if !resp.status().is_success() {
+            let corps = resp.text().await.unwrap_or_default();
+            let code: serde_json::Value = serde_json::from_str(&corps).unwrap_or_default();
+            let code = code["error"].as_str().unwrap_or_default().to_owned();
+            let message = motif_du_refus(&corps);
+            if refus_de_renouvellement_definitif(status, &code) {
+                warn!(status, code = %code, message = %message, "spotify_session_refusee");
+                self.access_token = None;
+                self.refresh_token = None;
+                self.token_expires = None;
+                self.token_rejected.store(false, Ordering::Relaxed);
+                self.session_refusee = true;
+                return Ok(true);
+            }
+            warn!(status, code = %code, message = %message, "spotify_token_refresh_refused");
+            return Err(format!("spotify refresh: HTTP {status} — {message}").into());
+        }
+
         let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
         if let Some(at) = data["access_token"].as_str() {
             self.access_token = Some(at.into());
@@ -1203,8 +1499,12 @@ impl StreamingService for SpotifyService {
             info!("spotify_token_refreshed");
             Ok(true)
         } else {
-            Err("refresh failed".into())
+            Err(format!("spotify refresh: HTTP {status} sans access_token").into())
         }
+    }
+
+    fn session_expired(&self) -> bool {
+        self.session_refusee && self.access_token.is_none()
     }
 
     fn save_tokens(&self) -> Option<serde_json::Value> {
@@ -1235,6 +1535,7 @@ impl StreamingService for SpotifyService {
             // même convention que Tidal et YouTube.
             self.token_expires = None;
             self.token_rejected.store(false, Ordering::Relaxed);
+            self.session_refusee = false;
             true
         } else {
             false
@@ -1280,6 +1581,14 @@ fn spotify_needs_refresh(
     }
 }
 
+/// #7659 — le message d'un refus de l'API Web (`error.message`), ou le corps
+/// brut s'il n'en porte pas.
+/// #7659 — l'erreur d'[`SpotifyService::api_get`] est-elle le refus de la
+/// limite de recherche (`400 Invalid limit`) ?
+fn refus_de_limite(erreur: &str) -> bool {
+    erreur.contains("HTTP 400") && erreur.to_lowercase().contains("invalid limit")
+}
+
 /// #6933 — l'appareil librespot n'apparaît pas dans `/me/player/devices`.
 /// La raison est celle que librespot a écrite (voir
 /// `spotify_lecture::motif_echec_librespot`) ; ce motif-ci ne présume pas
@@ -1319,6 +1628,25 @@ fn motif_refus_403(detail: &str) -> String {
     }
 }
 
+/// #8051 — le refus de renouvellement est-il définitif ? `invalid_grant`
+/// (jeton de renouvellement révoqué ou expiré), ou un 400/401 : ni l'un ni
+/// l'autre ne se règle en réessayant. Un 429 ou un 5xx est passager.
+fn refus_de_renouvellement_definitif(status: u16, code: &str) -> bool {
+    code == "invalid_grant" || status == 400 || status == 401
+}
+
+/// #6825 — le motif d'un refus de l'API Web, borné : `error.message` du
+/// corps JSON de Spotify (`{"error": {"status", "message"}}`), sinon le début
+/// du texte brut. Jamais plus de 200 caractères dans le journal.
+fn motif_du_refus(corps: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(corps).unwrap_or_default();
+    let message = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error_description"].as_str())
+        .unwrap_or(corps)
+        .trim();
+    message.chars().take(200).collect()
+}
 fn base64url_encode(data: &[u8]) -> String {
     let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut output = String::new();
@@ -2244,6 +2572,76 @@ mod tests {
         );
     }
 
+    /// #6825 — un refus de l'API Web sur une rubrique éditoriale est une
+    /// erreur, avec son statut et le motif de Spotify, et non une liste vide.
+    /// Une réponse 200 garde son contenu.
+    #[tokio::test]
+    async fn spotify_6825_un_refus_editorial_est_une_erreur_et_non_une_liste_vide() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/browse/featured-playlists",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(json!({"error": {"status": 404, "message": "Not Found"}})),
+                    )
+                }),
+            )
+            .route(
+                "/v1/browse/new-releases",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        axum::Json(json!({"error": {"status": 403, "message": "Forbidden"}})),
+                    )
+                }),
+            )
+            .route(
+                "/v1/browse/categories",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"categories": {"items": [
+                        {"id": "jazz", "name": "Jazz", "icons": []}
+                    ]}}))
+                }),
+            );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", ecoute.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+        let mut svc =
+            SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(&base);
+        svc.access_token = Some("jeton".into());
+
+        let err = svc
+            .get_new_releases()
+            .await
+            .expect_err("#6825 : un 403 de /browse/new-releases rendait une liste vide")
+            .to_string();
+        assert!(err.contains("403") && err.contains("Forbidden"), "{err}");
+        assert!(!err.contains("jeton"), "le jeton ne sort jamais : {err}");
+        let err = svc
+            .get_featured()
+            .await
+            .expect_err("#6825 : un 404 de /browse/featured-playlists rendait une liste vide")
+            .to_string();
+        assert!(err.contains("404"), "{err}");
+        let genres = svc.get_genres(None).await.expect("200");
+        assert_eq!(genres.len(), 1);
+    }
+
+    #[test]
+    fn spotify_6825_motif_du_refus_borne() {
+        assert_eq!(
+            motif_du_refus(r#"{"error": {"status": 403, "message": "Forbidden"}}"#),
+            "Forbidden"
+        );
+        assert_eq!(
+            motif_du_refus("  <html>bad gateway</html> "),
+            "<html>bad gateway</html>"
+        );
+        assert_eq!(motif_du_refus(&"x".repeat(500)).chars().count(), 200);
+        assert_eq!(motif_du_refus(""), "");
+    }
+
     /// Sans Premium, Spotify répond 403 : Tune le dit en clair.
     #[tokio::test]
     async fn spotify_6018_un_refus_403_parle_de_premium() {
@@ -2367,3 +2765,15 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "spotify_recherche_7659_tests.rs"]
+mod recherche_7659_tests;
+
+#[cfg(test)]
+#[path = "spotify_session_refusee_8051_tests.rs"]
+mod session_refusee_8051_tests;
+
+#[cfg(test)]
+#[path = "spotify_favoris_pagination_8050_tests.rs"]
+mod favoris_pagination_8050_tests;

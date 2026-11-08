@@ -14,13 +14,22 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tune_core::db::album_repo::AlbumRepo;
+use tune_core::db::album_repo::{AlbumRepo, QualiteDuFichier};
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::DbBackend;
 use tune_core::db::models::{Album, Artist, Track};
 use tune_core::library::regle_compilation::{IndicesCompilation, Jugement, MotifCompilation};
 use tune_core::metadata::TrackMetadata;
 use tune_core::scanner::walker::ScannedFile;
+
+/// #3179 — ARTIST désigne la piste, ALBUMARTIST l'album : une piste dont la
+/// balise ARTIST est posée garde cet artiste. Un nom déduit du chemin n'est
+/// pas une balise et ne crée pas un invité. Partagé par le scan
+/// (`TrackImporter::import`) et le surveillant
+/// (`auto_scan::build_track_from_metadata_opts`), qui divergeaient (#7933).
+pub(crate) fn artiste_de_piste_tague(meta: &TrackMetadata) -> bool {
+    !meta.artist_from_path && meta.artist.as_deref().is_some_and(|a| !a.trim().is_empty())
+}
 
 /// True when an `album_artist` value denotes a various-artists compilation.
 /// Le vocabulaire est celui de LA règle
@@ -158,10 +167,11 @@ pub(crate) struct PreuvesDuDossier {
     /// vu sous ce numéro dans le dossier. Une entrée par numéro, pas par
     /// fichier.
     numeros: HashMap<(u32, u32), String>,
-    /// #6460 — deux titres d'album du dossier partagent un numéro de piste :
-    /// ce sont deux parutions distinctes rangées ensemble, pas une
-    /// compilation faite main (dont les numéros ne se répètent pas).
-    parutions_distinctes: bool,
+    /// #6460 — deux titres d'album du dossier partagent un numéro de piste.
+    /// Ce n'est qu'un indice : voir [`Self::parutions_distinctes`].
+    numeros_en_commun: bool,
+    /// #8106 — le nombre de pistes notées par titre d'album (en minuscules).
+    pistes_par_titre: HashMap<String, usize>,
 }
 
 impl PreuvesDuDossier {
@@ -170,24 +180,39 @@ impl PreuvesDuDossier {
     /// distinctes. Une piste sans numéro (absent ou 0) ne prouve rien.
     fn noter_numero(&mut self, album: &str, disque: Option<u32>, piste: Option<u32>) -> bool {
         let album = album.trim().to_lowercase();
-        let Some(piste) = piste.filter(|n| *n > 0) else {
-            return false;
-        };
-        if self.parutions_distinctes || album.is_empty() {
+        if album.is_empty() {
             return false;
         }
-        let cle = (disque.filter(|d| *d > 0).unwrap_or(1), piste);
-        match self.numeros.get(&cle) {
-            Some(deja) if *deja != album => {
-                self.parutions_distinctes = true;
-                true
-            }
-            Some(_) => false,
-            None => {
-                self.numeros.insert(cle, album);
-                false
+        let avant = self.parutions_distinctes();
+        *self.pistes_par_titre.entry(album.clone()).or_default() += 1;
+        if let Some(piste) = piste.filter(|n| *n > 0) {
+            let cle = (disque.filter(|d| *d > 0).unwrap_or(1), piste);
+            match self.numeros.get(&cle) {
+                Some(deja) if *deja != album => self.numeros_en_commun = true,
+                Some(_) => {}
+                None => {
+                    self.numeros.insert(cle, album);
+                }
             }
         }
+        !avant && self.parutions_distinctes()
+    }
+
+    /// #6460, resserré par #8106 — le dossier range-t-il des parutions
+    /// DISTINCTES (« MoonDial » et un album de Lyle Mays) plutôt qu'une
+    /// compilation faite main ?
+    ///
+    /// Des numéros en commun ne suffisent pas : une compilation personnelle
+    /// dont chaque piste a gardé l'album et le numéro de son disque d'origine
+    /// en a forcément (fil 2697, JeanPitre, 18 compilations éclatées en un
+    /// album et une pochette par morceau). Ce qui sépare les deux, c'est que
+    /// des parutions rangées ensemble sont des albums ENTIERS : au moins deux
+    /// pistes par titre d'album en moyenne. Une compilation faite main en a
+    /// une, rarement deux.
+    fn parutions_distinctes(&self) -> bool {
+        let titres = self.pistes_par_titre.len();
+        let pistes: usize = self.pistes_par_titre.values().sum();
+        self.numeros_en_commun && titres >= 2 && titres * 2 <= pistes
     }
 }
 
@@ -295,6 +320,8 @@ pub fn build_track_row(
     track.rating = meta.rating.map(i32::from);
     // #6332 — le débit moyen du fichier, lu au scan et jusqu'ici jeté.
     track.bitrate_kbps = meta.bitrate_kbps.and_then(|b| i32::try_from(b).ok());
+    // #8088 — le marquage explicite de la balise (`ITUNESADVISORY`, `rtng`).
+    track.explicit = meta.explicit;
     track.label = meta.label.clone();
     track.isrc = meta.isrc.clone();
     track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
@@ -466,6 +493,14 @@ pub struct TrackImporter {
     /// pendant ce scan. Une ligne reprise pour une clé ne l'est jamais pour
     /// une autre : ce serait fondre deux parutions en une.
     albums_en_cache: HashSet<i64>,
+    /// #6459 — lignes album reprises AVEC leur artiste nommé pour un fichier
+    /// relu sans balise d'artiste : leur clé dit « Unknown Artist », la ligne
+    /// garde le sien. Ce n'est pas un défaut du cache.
+    albums_gardes_sous_leur_artiste: HashSet<i64>,
+    /// #7694 — les qualités (`score_qualite`) des fichiers lus pendant ce
+    /// scan, par dossier d'album. La règle des dossiers miroirs les compare
+    /// avant que le lot n'écrive ses pistes en base.
+    qualites_par_dossier: HashMap<String, HashSet<(bool, i64)>>,
     /// `(dossier, album)` dont la décision « compilation » a déjà été
     /// journalisée pendant ce scan. Sans cette marque, un album de 63 CD
     /// écrirait la même ligne huit cents fois.
@@ -612,6 +647,8 @@ impl TrackImporter {
             types_de_sortie_poses: HashSet::new(),
             types_secondaires_poses: HashSet::new(),
             albums_en_cache: HashSet::new(),
+            albums_gardes_sous_leur_artiste: HashSet::new(),
+            qualites_par_dossier: HashMap::new(),
             decisions_journalisees: HashSet::new(),
             comp_decision: HashMap::new(),
             folder_comp: HashMap::new(),
@@ -892,7 +929,7 @@ impl TrackImporter {
         // et garde son artiste. Une anthologie faite main, numérotée sans
         // doublon, reste une compilation sous le nom de son dossier.
         for (dir, p) in &self.preuves {
-            if p.parutions_distinctes
+            if p.parutions_distinctes()
                 && let Some(verdict) = self.folder_comp.get_mut(dir)
             {
                 *verdict = (false, false);
@@ -971,7 +1008,19 @@ impl TrackImporter {
     ///   l'identité (`quality_split`) ;
     /// - aucune autre clé ne la tient déjà pendant ce scan ;
     /// - son artiste n'est pas tenu à la main (C3) : alors rien ne change.
-    fn album_du_fichier_a_reprendre(&mut self, chemin: &str, cle: &CleDAlbum) -> Option<Album> {
+    ///
+    /// #6459 — un fichier relu sans balise d'artiste (clé « Unknown
+    /// Artist ») ne rétrograde jamais une ligne qui a un artiste nommé : elle
+    /// est reprise TELLE QUELLE, sans écriture, quel que soit
+    /// `quality_split`. Sans quoi l'album entier passait sous « Unknown
+    /// Artist » et aucun scan suivant ne le réparait, ses fichiers étant
+    /// inchangés.
+    fn album_du_fichier_a_reprendre(
+        &mut self,
+        chemin: &str,
+        cle: &CleDAlbum,
+        lu_depuis_le_chemin: bool,
+    ) -> Option<Album> {
         let (dossier, titre, artiste, annee, mbid) = cle;
         let mut ancien = self.album_repo.album_du_fichier(chemin).ok().flatten()?;
         let id = ancien.id?;
@@ -992,10 +1041,24 @@ impl TrackImporter {
         {
             return None;
         }
+        if self
+            .album_repo
+            .retrograderait_l_artiste(&ancien, *artiste, lu_depuis_le_chemin)
+        {
+            tracing::info!(
+                album_id = id,
+                album = %titre,
+                artiste_garde = ?ancien.artist_name,
+                demande_artiste_id = artiste,
+                "album_garde_son_artiste_fichier_sans_artiste"
+            );
+            self.albums_gardes_sous_leur_artiste.insert(id);
+            return Some(ancien);
+        }
         // `false` : l'artiste est tenu à la main, la ligne ne bouge pas.
         if !self
             .album_repo
-            .realigner_sur_les_balises(id, None, Some(*artiste))
+            .realigner_sur_les_balises_relues(id, None, Some(*artiste), lu_depuis_le_chemin)
             .unwrap_or(false)
         {
             return None;
@@ -1623,8 +1686,7 @@ impl TrackImporter {
 
         // #3179 — ARTIST désigne la piste, ALBUMARTIST l'album. Un nom
         // déduit du chemin n'est pas une balise et ne crée pas un invité.
-        let artiste_de_piste_tague =
-            !meta.artist_from_path && meta.artist.as_deref().is_some_and(|a| !a.trim().is_empty());
+        let artiste_de_piste_tague = artiste_de_piste_tague(meta);
         let meme_artiste = tune_core::db::artist_repo::cle_artiste(&album_artist_name)
             == tune_core::db::artist_repo::cle_artiste(&track_artist_name);
 
@@ -1738,6 +1800,29 @@ impl TrackImporter {
         } else {
             String::new()
         };
+        // #7694 — la qualité de ce fichier, pour que la règle des dossiers
+        // miroirs (#4907) ne fonde pas l'édition DSD et l'édition CD rangées
+        // sous deux racines. Inconnue (aucune des trois valeurs lue) : la
+        // règle joue comme avant. Sans `quality_split`, le dossier est vide et
+        // la règle ne joue pas.
+        let qualite_du_fichier = (meta.format.is_some()
+            || meta.sample_rate.is_some()
+            || meta.bit_depth.is_some())
+        .then(|| {
+            tune_core::library::quality::score_qualite(
+                meta.format.as_deref(),
+                meta.sample_rate.map(i64::from),
+                meta.bit_depth.map(i64::from),
+            )
+        });
+        if let Some(score) = qualite_du_fichier
+            && !album_folder.is_empty()
+        {
+            self.qualites_par_dossier
+                .entry(album_folder.clone())
+                .or_default()
+                .insert(score);
+        }
         let album_key = if use_folder_title {
             // Mixed compilation: one album per folder, named after the folder and
             // keyed on folder + Various-Artists id. The per-track album / year /
@@ -1773,7 +1858,11 @@ impl TrackImporter {
         let album = if let Some(ref key) = album_key {
             if let Some(cached) = self.album_cache.get(key) {
                 let c = Arc::clone(cached);
-                if c.artist_id != Some(key.2) {
+                if c.artist_id != Some(key.2)
+                    && !c
+                        .id
+                        .is_some_and(|id| self.albums_gardes_sous_leur_artiste.contains(&id))
+                {
                     tracing::warn!(
                         album = %key.1,
                         cache_key_artist_id = key.2,
@@ -1784,7 +1873,9 @@ impl TrackImporter {
                     );
                 }
                 Some(c)
-            } else if let Some(reprise) = self.album_du_fichier_a_reprendre(&sf.path, key) {
+            } else if let Some(reprise) =
+                self.album_du_fichier_a_reprendre(&sf.path, key, meta.artist_from_path)
+            {
                 // #5837 — la ligne que ce fichier occupe déjà, reprise sous
                 // son nouvel artiste : voir `album_du_fichier_a_reprendre`.
                 let a = Arc::new(reprise);
@@ -1799,7 +1890,7 @@ impl TrackImporter {
                 let parutions_distinctes = self
                     .preuves
                     .get(&album_dir)
-                    .is_some_and(|p| p.parutions_distinctes);
+                    .is_some_and(|p| p.parutions_distinctes());
                 let result = if parutions_distinctes {
                     self.album_repo.get_or_create_for_folder_and_title(
                         &key.0,
@@ -1809,7 +1900,14 @@ impl TrackImporter {
                         meta.musicbrainz_release_id.as_deref(),
                     )
                 } else {
-                    self.album_repo.get_or_create_for_folder_with_track(
+                    let qualites_par_dossier = &self.qualites_par_dossier;
+                    let vues_dans_le_scan = |dossier: &str| -> Vec<(bool, i64)> {
+                        qualites_par_dossier
+                            .get(dossier)
+                            .map(|q| q.iter().copied().collect())
+                            .unwrap_or_default()
+                    };
+                    self.album_repo.get_or_create_for_folder_de_qualite(
                         &key.0,
                         &key.1,
                         key.2,
@@ -1824,6 +1922,10 @@ impl TrackImporter {
                         // un numéro déjà pris ⇒ seconde extraction, pas second
                         // disque.
                         meta.disc_number.map(|n| n as i32),
+                        qualite_du_fichier.map(|score| QualiteDuFichier {
+                            score,
+                            vues_dans_le_scan: &vues_dans_le_scan,
+                        }),
                     )
                 };
                 if let Err(ref e) = result {
@@ -4067,5 +4169,13 @@ mod nom_de_tri_tests_6474;
 mod moondial_tests_6460;
 
 #[cfg(test)]
+#[path = "scan_import_editions_miroirs_tests_7694.rs"]
+mod editions_miroirs_tests_7694;
+
+#[cfg(test)]
 #[path = "scan_import_artistes_piste_tests_3179.rs"]
 mod artistes_piste_tests_3179;
+
+#[cfg(test)]
+#[path = "scan_import_artiste_garde_tests_6459.rs"]
+mod artiste_garde_tests_6459;

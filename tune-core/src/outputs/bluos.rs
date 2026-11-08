@@ -17,6 +17,8 @@ pub struct BluosOutput {
     /// sans repayer l'échec, et l'enchaînement sans blanc par la file n'est
     /// plus armé (`supports_internal_gapless`).
     add_refuse: AtomicBool,
+    /// #7379 — le dernier `/Status` n'avait pas de `<volume>` lisible.
+    volume_illisible: AtomicBool,
 }
 
 impl BluosOutput {
@@ -31,6 +33,7 @@ impl BluosOutput {
                 .build()
                 .unwrap(),
             add_refuse: AtomicBool::new(false),
+            volume_illisible: AtomicBool::new(false),
         }
     }
 
@@ -42,7 +45,47 @@ impl BluosOutput {
     ///
     /// Même règle que pour `/Add` : on ne conclut à l'échec que sur un signal
     /// compris — le Node reste en `pause`.
+    ///
+    /// #7699 — l'URL seule faisait jouer le son sans rien afficher : ni
+    /// titre, ni artiste, ni pochette (NAD C399, `/Status` en `service=http`
+    /// sans `title1`). Le Node lit ces textes dans les mêmes paramètres que
+    /// pour `/Add` ; la v0.9.28 les envoyait déjà sur `/Play?url=` et le son
+    /// passait (#1022). Filet : si le Node refuse la forme complète (erreur
+    /// HTTP ou pause), on renvoie une fois l'URL seule, comme avant.
     async fn jouer_par_play_url(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        let requete = requete_play_url(media);
+        if requete.contains('&') {
+            match self.api_get_requete("Play", &requete).await {
+                Ok(corps) if xml_text(&corps, "state") != Some("pause") => {
+                    info!(
+                        device = %self.name,
+                        reply = %truncate_body(&corps),
+                        "bluos_play_url_reply"
+                    );
+                    info!(
+                        device = %self.name,
+                        url = media.url,
+                        title = media.title.unwrap_or(""),
+                        artist = media.artist.unwrap_or(""),
+                        album = media.album.unwrap_or(""),
+                        image = media.cover_url.unwrap_or(""),
+                        mode = "play_url",
+                        "bluos_play"
+                    );
+                    return Ok(());
+                }
+                Ok(corps) => warn!(
+                    device = %self.name,
+                    reply = %truncate_body(&corps),
+                    "bluos_play_url_metadonnees_refusees"
+                ),
+                Err(e) => warn!(
+                    device = %self.name,
+                    erreur = %e,
+                    "bluos_play_url_metadonnees_refusees"
+                ),
+            }
+        }
         let corps = self.api_get("Play", &[("url", media.url)]).await?;
         info!(
             device = %self.name,
@@ -114,10 +157,24 @@ impl BluosOutput {
 
     async fn api_get(&self, path: &str, params: &[(&str, &str)]) -> Result<String, String> {
         let url = format!("{}/{}", self.base_url(), path);
-        let resp = self
-            .client
-            .get(&url)
-            .query(params)
+        self.envoyer(path, self.client.get(&url).query(params))
+            .await
+    }
+
+    /// #7699 — même envoi que `api_get`, la requête déjà encodée par
+    /// l'appelant (`%20` pour une espace, comme `build_add_url`, là où
+    /// `.query()` écrirait `+`).
+    async fn api_get_requete(&self, path: &str, requete: &str) -> Result<String, String> {
+        let url = format!("{}/{}?{}", self.base_url(), path, requete);
+        self.envoyer(path, self.client.get(&url)).await
+    }
+
+    async fn envoyer(
+        &self,
+        path: &str,
+        requete: reqwest::RequestBuilder,
+    ) -> Result<String, String> {
+        let resp = requete
             .send()
             .await
             .map_err(|e| format!("bluos {path}: {e}"))?;
@@ -202,6 +259,27 @@ fn add_play_rejected(add_body: &str, play_body: &str) -> bool {
     queue_empty && still_paused
 }
 
+/// #7699 — la requête de `/Play?url=` : `url` en tête, puis les textes et la
+/// pochette, même correspondance que `build_add_url` (title1=titre,
+/// title2=artiste, title3=album). Un champ absent ou vide n'est pas envoyé.
+/// `url` reste encodée comme depuis #6248 : c'est la forme qui fait jouer ce
+/// chemin.
+fn requete_play_url(media: &PlayMedia<'_>) -> String {
+    let mut requete = format!("url={}", urlencoding::encode(media.url));
+    let champs = [
+        ("title1", media.title),
+        ("title2", media.artist),
+        ("title3", media.album),
+        ("image", media.cover_url),
+    ];
+    for (nom, valeur) in champs {
+        if let Some(v) = valeur.filter(|v| !v.is_empty()) {
+            requete.push_str(&format!("&{nom}={}", urlencoding::encode(v)));
+        }
+    }
+    requete
+}
+
 /// Keep a Node reply short enough to log without flooding the journal.
 fn truncate_body(body: &str) -> String {
     let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -215,6 +293,10 @@ fn truncate_body(body: &str) -> String {
 
 #[async_trait::async_trait]
 impl OutputTarget for BluosOutput {
+    fn volume_du_statut_illisible(&self) -> bool {
+        self.volume_illisible.load(Ordering::Relaxed)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -440,10 +522,14 @@ impl OutputTarget for BluosOutput {
             .map(|s| (s * 1000.0) as u64)
             .unwrap_or(0);
 
-        let volume = extract_tag(&xml, "volume")
+        // #7379 — sans `<volume>` lisible, le repli 0,5 reste dans le statut,
+        // mais la sortie dit que ce n'est pas une valeur lue.
+        let lu = extract_tag(&xml, "volume")
             .and_then(|v| v.parse::<f64>().ok())
-            .map(|v| v / 100.0)
-            .unwrap_or(0.5);
+            .filter(|v| v.is_finite())
+            .map(|v| v / 100.0);
+        self.volume_illisible.store(lu.is_none(), Ordering::Relaxed);
+        let volume = lu.unwrap_or(crate::outputs::dlna::volume_illisible_5662::REPLI_ILLISIBLE);
 
         let muted = extract_tag(&xml, "mute")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("on"))
@@ -574,6 +660,42 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #7379 — le VRAI `get_status` lève l'illisibilité quand `<volume>`
+    /// manque du `/Status`, et la baisse dès qu'un volume se lit.
+    #[tokio::test]
+    async fn le_statut_signale_un_volume_illisible_au_sondeur_7379() {
+        let corps = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let corps_route = corps.clone();
+        let app = axum::Router::new().route(
+            "/Status",
+            axum::routing::get(move || {
+                let c = corps_route.clone();
+                async move { c.lock().unwrap().clone() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let out = BluosOutput::new("Node".into(), "bluos-7379".into(), "127.0.0.1".into(), port);
+        for xml in [
+            "<status><state>play</state><secs>10</secs></status>",
+            "<status><state>play</state><volume>abc</volume></status>",
+        ] {
+            *corps.lock().unwrap() = xml.into();
+            let statut = out.get_status().await.unwrap();
+            assert_eq!(statut.volume, 0.5, "le repli reste dans le statut");
+            assert!(
+                out.volume_du_statut_illisible(),
+                "{xml} : repli non signalé"
+            );
+        }
+        *corps.lock().unwrap() = "<status><state>play</state><volume>40</volume></status>".into();
+        let statut = out.get_status().await.unwrap();
+        assert!((statut.volume - 0.4).abs() < 1e-9);
+        assert!(!out.volume_du_statut_illisible());
+        task.abort();
+    }
 
     #[test]
     fn parse_status_xml() {
@@ -828,6 +950,9 @@ mod tests {
         corps_play: String,
         /// #6248 — la réponse à `/Play?url=` (flux « custom »).
         corps_play_url: String,
+        /// #7699 — la réponse à `/Play?url=` quand l'appel porte `title1` :
+        /// `None`, le Node répond comme à l'URL seule (`corps_play_url`).
+        corps_play_url_avec_textes: Option<String>,
         /// Le temps que le Node met a repondre au `/Clear`. Le bouchon
         /// n'inscrit l'appel qu'APRES cette latence : un `Add` lance sans
         /// attendre s'inscrirait donc AVANT lui.
@@ -845,6 +970,7 @@ mod tests {
                 corps_clear: CLEAR_OK.to_string(),
                 corps_play: PLAY_STREAM.to_string(),
                 corps_play_url: PLAY_STREAM.to_string(),
+                corps_play_url_avec_textes: None,
                 latence_clear: std::time::Duration::ZERO,
             }
         }
@@ -872,8 +998,12 @@ mod tests {
         uri: axum::http::Uri,
     ) -> (axum::http::StatusCode, String) {
         etat.recues.lock().unwrap().push(uri.to_string());
-        let corps = if uri.query().is_some_and(|q| q.starts_with("url=")) {
-            etat.corps_play_url.clone()
+        let requete = uri.query().unwrap_or("");
+        let corps = if requete.starts_with("url=") {
+            match &etat.corps_play_url_avec_textes {
+                Some(corps) if requete.contains("&title1=") => corps.clone(),
+                _ => etat.corps_play_url.clone(),
+            }
         } else {
             etat.corps_play.clone()
         };
@@ -1124,14 +1254,22 @@ mod tests {
              au lieu d'arrêter la zone — {issue:?}"
         );
         let appels = recues.lock().unwrap().clone();
-        let flux_encode = format!("/Play?url={}", urlencoding::encode(FLUX_BILOU));
+        // #7699 — le repli porte aussi titre, artiste, album et pochette : sans
+        // eux, le Node joue le son et n'affiche rien.
+        let flux_encode = format!(
+            "/Play?url={}&title1=Come%20on%20In&title2=Bridge%20City%20Sinners\
+             &title3=Bridge%20City%20Sinners&image={}",
+            urlencoding::encode(FLUX_BILOU),
+            urlencoding::encode(POCHETTE_BILOU)
+        );
         assert_eq!(appels.len(), 4, "{appels:?}");
         assert!(appels[0].starts_with("/Clear"), "{appels:?}");
         assert!(appels[1].starts_with("/Add?"), "{appels:?}");
         assert_eq!(appels[2], "/Play?id=0", "{appels:?}");
         assert_eq!(
             appels[3], flux_encode,
-            "repli par l'URL encodée : {appels:?}"
+            "repli par l'URL encodée, avec titre, artiste, album et pochette \
+             (#7699) : {appels:?}"
         );
         assert!(
             !node.supports_internal_gapless(),
@@ -1166,7 +1304,65 @@ mod tests {
         assert!(log.contains("bluos_add_rejected_empty_queue"), "{log}");
         assert!(log.contains("bluos_repli_play_url"), "{log}");
         assert!(log.contains("bluos_play_url_rejected"), "{log}");
-        assert_eq!(appels.len(), 4, "{appels:?}");
+        // Clear, Add, Play?id=0, puis `/Play?url=` avec les textes et sans.
+        assert_eq!(appels.len(), 5, "{appels:?}");
+    }
+
+    // ── #7699 : le repli `/Play?url=` transmet titre, artiste et pochette ──
+
+    /// Un Node qui refuserait les textes sur `/Play?url=` (il reste en pause
+    /// quand l'appel porte `title1`) : la piste part quand même, par l'URL
+    /// seule renvoyée une fois — le son d'avant #7699, pas le silence.
+    #[tokio::test]
+    async fn un_node_qui_refuse_les_textes_sur_play_url_joue_par_l_url_seule_7699() {
+        crate::journal_de_test::fiabiliser_la_capture();
+        let (issue, log, appels) = jouer_sur_bouchon(NodeBouchon {
+            corps_add: ADD_EMPTY.to_string(),
+            corps_play: PLAY_PAUSE.to_string(),
+            corps_play_url: PLAY_STREAM.to_string(),
+            corps_play_url_avec_textes: Some(PLAY_PAUSE.to_string()),
+            ..Default::default()
+        })
+        .await;
+        assert!(issue.is_ok(), "l'URL seule fait jouer la piste : {issue:?}");
+        assert!(log.contains("bluos_play_url_metadonnees_refusees"), "{log}");
+        assert!(!log.contains("bluos_play_url_rejected"), "{log}");
+        assert_eq!(appels.len(), 5, "{appels:?}");
+        assert!(appels[3].contains("&title1=Come%20on%20In"), "{appels:?}");
+        assert_eq!(
+            appels[4],
+            format!("/Play?url={}", urlencoding::encode(FLUX_BILOU)),
+            "{appels:?}"
+        );
+    }
+
+    /// Un champ vide ou absent n'est pas envoyé au Node ; une piste sans
+    /// aucun texte ni pochette part par l'URL seule, en un seul appel.
+    #[test]
+    fn la_requete_play_url_n_envoie_pas_de_champ_vide_7699() {
+        let media = PlayMedia {
+            url: FLUX_BILOU,
+            mime_type: "audio/flac",
+            title: Some(""),
+            artist: Some("Bridge City Sinners"),
+            ..Default::default()
+        };
+        assert_eq!(
+            requete_play_url(&media),
+            format!(
+                "url={}&title2=Bridge%20City%20Sinners",
+                urlencoding::encode(FLUX_BILOU)
+            )
+        );
+        let nu = PlayMedia {
+            url: FLUX_BILOU,
+            mime_type: "audio/flac",
+            ..Default::default()
+        };
+        assert_eq!(
+            requete_play_url(&nu),
+            format!("url={}", urlencoding::encode(FLUX_BILOU))
+        );
     }
 
     // ── Garde de site : plus aucune commande du Node jetee en silence ──────
