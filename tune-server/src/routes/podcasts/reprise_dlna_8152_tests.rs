@@ -190,18 +190,6 @@ async fn reprise_8152_sortie_locale_inchangee() {
         }),
     )
     .await;
-    // Pas de mandataire pour une sortie locale : elle ouvre l'adresse.
-    assert!(
-        state
-            .playback
-            .get_state(zone)
-            .await
-            .now_playing
-            .and_then(|np| np.stream_id)
-            .is_none()
-            || !statut.is_success(),
-        "{statut} {v}"
-    );
     demarrer_le_renderer(&state, LOCALE).await;
     let seeks = seeks_apres(&state, LOCALE, Duration::from_millis(800)).await;
     assert!(

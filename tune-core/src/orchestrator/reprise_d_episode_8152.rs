@@ -103,8 +103,7 @@ async fn seek_d_episode_une_fois_en_lecture(
     attente_max: Duration,
 ) {
     let debut = std::time::Instant::now();
-    let mut dernier_etat = None;
-    loop {
+    let dernier_etat = loop {
         let seq_courante = playback.current_transport_seq(zone_id).await;
         if !reprise_toujours_la_notre(seq_au_depart, seq_courante) {
             info!(
@@ -118,9 +117,8 @@ async fn seek_d_episode_une_fois_en_lecture(
             return;
         };
         let etat = output.lock().await.get_status().await.ok().map(|s| s.state);
-        dernier_etat = etat;
         if etat == Some(TransportState::Playing) {
-            break;
+            break etat;
         }
         if debut.elapsed() >= attente_max {
             warn!(
@@ -130,10 +128,10 @@ async fn seek_d_episode_une_fois_en_lecture(
                 attente_ms = debut.elapsed().as_millis() as u64,
                 "podcast_reprise_position_sans_lecture_confirmee"
             );
-            break;
+            break etat;
         }
         tokio::time::sleep(SONDE_DE_LECTURE).await;
-    }
+    };
     let Some(output) = ({ outputs.lock().await.get(&device_id) }) else {
         return;
     };
