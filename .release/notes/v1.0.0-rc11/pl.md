@@ -1,0 +1,41 @@
+Tune 1.0.0-rc11, jedenasta wersja kandydująca Tune 1.0.
+
+- **Korekcja pomieszczenia**: wtyczka, domyślnie wyłączona, mierzy pomieszczenie mikrofonem (sweep, odpowiedź impulsowa, RT60) albo symuluje jego mody basowe bez mikrofonu, a następnie proponuje cel i automatyczny korektor, który tylko tłumi, z jednym profilem na strefę; bez Premium splot z odpowiedzią impulsową wygasza się płynnie.
+- **Kontrola rodzicielska**: reguły dla każdego profilu w Ustawienia › Profile, ukrywanie treści dla dorosłych, przedziały czasowe i budżet słuchania.
+- **Upsampling**: wtyczka Premium do upsamplingu wysokiej jakości podłącza się do wyjścia lokalnego, z ustawieniem dla każdej strefy.
+- **Zaawansowane zapytanie**: odpytuj bibliotekę wyrażeniem, tym samym, które definiuje inteligentne kolekcje.
+- **Jedna strona na album**: wersje albumu są zgrupowane i wybiera się je na stronie albumu; pojawiają się nowe filtry jakości DSD i wielokanałowości oraz liczba kanałów.
+- **Notatki i statystyki**: osobiste notatki w Markdown i statystyki biblioteki według podziałów.
+- **Katalog i spektrogram**: wyeksportuj bibliotekę jako drukowalny katalog HTML z bieżącymi filtrami; pokaż spektrogram utworu z jego menu; przycisk zatrzymuje analizę DR między dwoma utworami.
+- **Mapy świata**: mapa państw i filtr państw w Bibliotece; globus rysuje granice, wybrzeża i duże rzeki, a po najechaniu podaje nazwę kraju.
+- **Podcasty**: dodaj podcast przez adres jego kanału RSS.
+- **Miksy TIDAL**: rząd „Twoje miksy” w Streaming › TIDAL pokazuje i odtwarza osobiste miksy konta.
+- **Import korektora**: zaimportuj plik korektora (AutoEq, Equalizer APO, OPRA) z podglądem pasm przed zastosowaniem.
+- **Biografie**: odnośniki do wykonawców i albumów Tune oraz do źródła; biografie i notatki albumów uzupełniane na żądanie z Qobuz, bez nadpisywania czegokolwiek i z możliwością cofnięcia.
+- **Playlisty**: zastąp niedostępny utwór usługi w tym samym miejscu i napraw playlistę.
+- **Tune Circle**: napisz do całego kręgu w Wiadomościach; kręgi ogólne i zgoda wątku przechodzą przez przekaźnik.
+- **Kolekcja fizyczna**: okładka każdej płyty, wyszukiwanie w usługach streamingowych, przeglądanie według folderów, gatunków i stylów.
+- **Radio**: filtr minimalnej jakości strumienia w „Więcej filtrów”, „Moje radia” oddzielone od „Ostatnio słuchane”, domyślny strumień zawsze odtwarzalny w kraju słuchania.
+- **Tune tested**: Tune proponuje dodanie urządzenia po godzinie słuchania bez błędów, osobnym przyciskiem; urządzenie już w katalogu dodaje gospodarstwo.
+- **Biblioteka**: ustawienie „Biblioteka rozszerzona o ulubione z usług”, domyślnie włączone; szybsze wyszukiwanie po początku słowa; wyszukiwanie w siatce wymaga wszystkich słów; okres Od / Do na osi lat; płynniejsze przewijanie utworów.
+- **Listy utworów**: kolejność kolumn można zmienić i każdy ekran ją zapamiętuje; ekran playlisty zyskuje okładki, rozmiar miniatur i zwarty nagłówek; znaczniki źródła w Menedżerze playlist.
+- **Start i wznawianie**: wybierz panele przeglądu słuchania; „Wznów słuchanie” pokazuje podtytuł dla każdego rodzaju, wznawia podcast z tytułem, okładką i pozycją, i bez duplikatów.
+- **Historia**: odsłuch jest zaliczany dopiero po 30 s lub połowie utworu; „Odtwarzaj” po Stopie zachowuje bieżący album lub playlistę; odcinki podcastów i radia noszą nazwę stacji.
+- **Statystyki słuchania**: zaimportowane odsłuchy (Roon, Plex, m3u) liczą się do najczęściej słuchanych; listy inteligentne i Historia liczą jak Biblioteka; odsłuch w Qobuz nie liczy się już dla lokalnego albumu o tej samej nazwie.
+- **Crosstalk i korektor**: krzywa separacji / koloryzacji i odpowiedź głośników na ekranie ustawień, docelowa separacja od 1 dB; wykres parametryczny domyślnie zablokowany (Edytuj / Gotowe) i kolor dla każdego kanału.
+- **Rozszerzenia**: panel „Stan wtyczek” dla administratora; karta katalogu i jej lokalna wtyczka to teraz jedno rozszerzenie.
+- **Powiadomienia**: błędy pozostają, wstrzymują się po najechaniu i są grupowane; ostatnie wpisane na stałe komunikaty błędów są przetłumaczone; surowy tekst wyjątku jest zwinięty w „Szczegóły”.
+- **Analizy w tle**: pokazywany jest postęp, priorytet jest niski, a domyślne ustawienie ostrożne po skanowaniu; wzbogacanie wznawia od miejsca przerwania i ponawia po błędzie 503; „Uruchom przebieg” dla logo wytwórni działa także podczas pauzy.
+- **Wsparcie i dostęp zdalny**: zgłoszenie błędu dołącza logi; link, kod QR i przycisk kopiowania wracają do Ustawienia › Dostęp zdalny.
+- **Odtwarzanie**: powody transkodowania są nazywane, a FLAC jest podawany bez zmian, gdy nic się nie stosuje; Następny i Poprzedni pomijają utwory odrzucone przez usługę.
+- **Poprawki AirPlay 2**: przycisk „Pair” paruje przez komponent AirPlay 2 albo podaje przyczynę; oczekiwanie na PIN nie blokuje już odtwarzania, a zamknięcie okna je anuluje; sesja otwiera się ponownie po pauzie; pozycja postępuje, a pauza nie zapętla się; komponent istnieje dla 64-bitowego Raspberry Pi.
+- **Poprawki DLNA i OpenHome**: bezprzerwowe utwory DSD, szybsze „następny”, pauza wykonana na urządzeniu jest respektowana, własne wyjście maszyny nie pojawia się już podwójnie, głośność OpenHome bez czekania, lista załadowana przez Kazoo zostaje zachowana, szybsze Play dla TIDAL CD.
+- **Poprawki głośności**: nowe wyjście lokalne nie startuje już z pełną skalą; wyciszenie nie przepuszcza już ponownie odczytanej głośności; każda pozycja suwaka daje inny poziom; głośność WASAPI i ASIO słychać od razu; Tune podąża za urządzeniem poniżej limitu bezpieczeństwa.
+- **Poprawki Windows**: skrót otwiera się bez okna konsoli; DoP, którego wyjście nie udźwignie, idzie jako PCM; wykrywanie sieci przechodzi przez zaporę; nieczytelna temperatura nie spowalnia już analiz; aktualizacja uruchamia skrypt przełączenia przy wyjściu.
+- **Poprawki aktualizacji i licencji**: w systemie Unix nowy plik binarny i interfejs webowy są sprawdzane przed zastąpieniem starych, a błąd jest jawny; usunięcie licencji zwalnia też maszynę w serwisie.
+- **Poprawki biblioteki**: zdjęcia i filmy z serwera UPnP nie trafiają już do biblioteki; box FLAC + CUE tworzy jeden album; wydania DSD i CD pozostają dwoma albumami; ręcznie złożona kompilacja nie jest już rozbijana; usunięta playlista nie jest odtwarzana przy skanowaniu; ponowny odczyt bez tagu wykonawcy nie przenosi już albumu do „Unknown Artist”; dodanie folderu skanuje tylko ten folder.
+- **Poprawki okładek i analiz**: w ostateczności największy obraz w folderze; analiza fałszywego Hi-Res na całej długości utworu; bezprzerwowe MP3; audyt integralności nie uznaje już nienaruszonych plików FLAC za obcięte.
+- **Poprawki usług streamingowych**: wyszukiwanie Spotify zwraca wyniki, odmowa nie jest już niema, a ulubione przekraczają 50 utworów; TIDAL › Ulubione nie zawiesza już Tune; konto Qobuz bez ulubionych szybko zwraca pustą listę; przekonwertowany utwór startuje w Safari.
+- **Poprawki sieci i przechowywania**: wykrywanie wznawia się, gdy sieć pojawi się po Tune; nieudane montowanie SMB mówi dlaczego, także w Dockerze; kopia zapasowa udaje się w PostgreSQL; ekstrakcja CD odrzuca pełny lub niezapisywalny cel; Tune zostawia porty Squeezebox serwerowi Lyrion na tej samej maszynie.
+- **Poprawki ekranów**: ekran Koncerty otwiera się bez licencji; „Rozgrupuj wszystko” wraca; Teraz odtwarzane podąża za zmianą albumu; wygasła sesja streamingu zachowuje kartę „Połącz ponownie”; Nowy budzik pozostaje widoczny.
+- **Bezpieczeństwo**: poprawki wzmacniające.
