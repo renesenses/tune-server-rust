@@ -131,7 +131,7 @@ pub mod sql {
     pub fn top_tracks<D: SqlDialect>(d: &D) -> String {
         format!(
             // track_id: many history rows have a null track_id, so resolve it by
-            // title (t3) as a fallback. Without this the client can't play a top
+            // title + artist (t3, #8140) as a fallback. Without this the client can't play a top
             // track directly (it fell back to a fragile title search that failed),
             // so tapping a track on the home screen did nothing.
             //
@@ -156,39 +156,77 @@ pub mod sql {
             // les additionne dans un seul groupe. `listen_history.track_id`
             // étant toujours NULL, `MAX(tid)` y prend l'identifiant de la
             // piste importée. `CAST … AS BIGINT` : `SUM` d'un BIGINT rend un
-            // NUMERIC sur PostgreSQL, que `as_i64` ne lit pas. Une écoute
-            // importée vaut `src = 'local'` : son `track_id` désigne une piste
-            // de la bibliothèque, donc `MAX(src)` d'un groupe mixte peut
-            // passer de « deezer » à « local », ce qui reste cohérent.
+            // NUMERIC sur PostgreSQL, que `as_i64` ne lit pas.
+            //
+            // #8140 : `listen_history.track_id` étant toujours NULL, la piste
+            // locale se retrouvait par le TITRE SEUL (`t3.title = g.title`) :
+            // l'écoute Deezer de « Marianne » d'un artiste A rendait la piste
+            // homonyme d'un artiste B, et le client ouvrait l'album de B. Le
+            // rapprochement exige maintenant le titre ET l'interprète de la
+            // piste, comparé casse et accents ignorés (`LOWER(unaccent(…))`,
+            // la règle de la recherche) ; sans interprète, rien n'est résolu
+            // — un bouton absent vaut mieux que le mauvais morceau. Le titre
+            // reste comparé tel quel : c'est lui qui lit `idx_tracks_title`
+            // (`top_titres_index_tests`). Parmi plusieurs pistes du même titre
+            // et du même interprète, celle de l'album écouté passe d'abord.
+            //
+            // #8140 : `source`, `source_id`, l'album et la pochette du service
+            // viennent d'UNE ligne du groupe, la dernière écoute
+            // (`MAX(u.hid)`), et non plus de `MAX(u.src)` calculé à part (qui
+            // pouvait marier la source d'une écoute au titre d'album d'une
+            // autre). Un groupe fait seulement d'écoutes importées n'a pas de
+            // ligne d'historique : il est `local`.
             "WITH u AS (SELECT h.title AS title, h.artist_name AS artist_name, \
                     1 AS n, h.track_id AS tid, h.album_title AS alb, \
-                    h.cover_url AS cu, h.source AS src \
+                    h.cover_url AS cu, h.id AS hid \
                     FROM listen_history h WHERE h.source != 'radio' \
                   UNION ALL \
                   SELECT t.title, a.name, ip.play_count, ip.track_id, al.title, \
-                    NULL, 'local' \
+                    NULL, NULL \
                     FROM imported_plays ip JOIN tracks t ON t.id = ip.track_id \
                     LEFT JOIN artists a ON a.id = t.artist_id \
                     LEFT JOIN albums al ON al.id = t.album_id \
                     WHERE ip.play_count > 0), \
              g AS (SELECT u.title AS title, u.artist_name AS artist_name, \
                     CAST(SUM(u.n) AS BIGINT) AS plays, MAX(u.tid) AS tid, \
-                    MAX(u.alb) AS alb, MAX(u.cu) AS cu, MAX(u.src) AS src \
-                    FROM u GROUP BY u.title, u.artist_name) \
-             SELECT g.title, g.artist_name, g.plays, \
-             COALESCE((SELECT MAX(t.id) FROM tracks t WHERE t.id = g.tid), \
-                      (SELECT MAX(t3.id) FROM tracks t3 WHERE t3.title = g.title), g.tid) AS track_id, \
-             COALESCE((SELECT MAX(al.cover_path) FROM albums al \
-                          JOIN tracks t ON t.album_id = al.id WHERE t.id = g.tid), \
+                    MAX(u.alb) AS alb, MAX(u.cu) AS cu, MAX(u.hid) AS hid \
+                    FROM u GROUP BY u.title, u.artist_name), \
+             k AS (SELECT g.title AS title, g.artist_name AS artist_name, \
+                    g.plays AS plays, g.tid AS gtid, g.alb AS alb, g.cu AS cu, \
+                    COALESCE(NULLIF(r.source, ''), 'local') AS src, \
+                    r.source_id AS sid, r.album_title AS ralb, r.cover_url AS rcu, \
+                    r.album_ref AS aref \
+                    FROM g LEFT JOIN listen_history r ON r.id = g.hid), \
+             m AS (SELECT k.*, \
+                    COALESCE((SELECT MAX(t.id) FROM tracks t WHERE t.id = k.gtid), \
+                             (SELECT MAX(t3.id) FROM tracks t3 \
+                                JOIN artists a3 ON a3.id = t3.artist_id \
+                                JOIN albums al3 ON al3.id = t3.album_id \
+                                WHERE t3.title = k.title \
+                                  AND LOWER(unaccent(a3.name)) = LOWER(unaccent(k.artist_name)) \
+                                  AND LOWER(unaccent(al3.title)) = LOWER(unaccent(COALESCE(k.ralb, k.alb)))), \
+                             (SELECT MAX(t3.id) FROM tracks t3 \
+                                JOIN artists a3 ON a3.id = t3.artist_id \
+                                WHERE t3.title = k.title \
+                                  AND LOWER(unaccent(a3.name)) = LOWER(unaccent(k.artist_name))), \
+                             k.gtid) AS tid \
+                    FROM k) \
+             SELECT m.title, m.artist_name, m.plays, m.tid AS track_id, \
+             COALESCE(CASE WHEN m.src <> 'local' THEN m.rcu END, \
+                      (SELECT MAX(al.cover_path) FROM albums al \
+                          JOIN tracks t ON t.album_id = al.id WHERE t.id = m.tid), \
                       (SELECT MAX(al2.cover_path) FROM albums al2 \
-                          WHERE al2.title = g.alb AND al2.cover_path IS NOT NULL), \
-                      g.cu) AS cover_path, \
-             COALESCE((SELECT MAX(al.title) FROM albums al \
-                          JOIN tracks t ON t.album_id = al.id WHERE t.id = g.tid), \
-                      g.alb) AS album_title, \
-             g.src \
-             FROM g \
-             ORDER BY g.plays DESC LIMIT {}",
+                          WHERE al2.title = m.alb AND al2.cover_path IS NOT NULL), \
+                      m.cu) AS cover_path, \
+             COALESCE(CASE WHEN m.src <> 'local' THEN m.ralb END, \
+                      (SELECT MAX(al.title) FROM albums al \
+                          JOIN tracks t ON t.album_id = al.id WHERE t.id = m.tid), \
+                      m.ralb, m.alb) AS album_title, \
+             m.src, \
+             CASE WHEN m.src <> 'local' THEN m.sid END AS source_id, \
+             CASE WHEN m.src <> 'local' THEN m.aref END AS album_ref \
+             FROM m \
+             ORDER BY m.plays DESC LIMIT {}",
             d.placeholder(1)
         )
     }
@@ -796,6 +834,14 @@ impl HistoryRepo {
                     "cover_path": cols.get(4).and_then(|v| v.as_string()),
                     "album_title": cols.get(5).and_then(|v| v.as_string()),
                     "source": cols.get(6).and_then(|v| v.as_string()),
+                    // #8140 : de la même ligne que `source` ; `null` pour
+                    // une écoute locale. `album_id_service` suit la règle de
+                    // `ListenRecord::album_id_service` (référence vide = rien).
+                    "source_id": cols.get(7).and_then(|v| v.as_string())
+                        .filter(|s| !s.trim().is_empty()),
+                    "album_id_service": cols.get(8).and_then(|v| v.as_string())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
                 })
             })
             .collect())
