@@ -32,6 +32,7 @@ use super::cle_de_tri::{Curseur, valeur_json, valeur_sql};
 use super::{Placeholders, SqlValue, ToSqlValue, Track, TrackFilter, TrackRepo, sql};
 use crate::TuneError;
 use crate::db::engine::Engine;
+use crate::db::history_repo::sql::provenance;
 
 /// Une colonne du tableau des pistes par laquelle le serveur sait trier.
 ///
@@ -115,24 +116,32 @@ pub const COLONNES_TRIABLES: [(&str, ColonneDeTri); 27] = [
 /// (alias `ec`) pour les tris `plays` et `lastPlayed` — tune-web-client#1470.
 ///
 /// Le rapprochement est CELUI de `HistoryRepo::plays_for_tracks`, qui remplit
-/// `play_count` et `last_played_at` dans la réponse : radio exclue, égalité
-/// stricte du titre, interprète égal ou absent des deux côtés
-/// (`listen_history.track_id` est toujours NULL, voir ce module). L'ordre suit
-/// donc exactement les nombres que la colonne affiche.
+/// `play_count` et `last_played_at` dans la réponse : même provenance que la
+/// piste, radio exclue (#7980, [`provenance!`], les lignes anciennes à source
+/// NULL étant locales), égalité stricte du titre, interprète égal ou absent
+/// des deux côtés (`listen_history.track_id` est toujours NULL, voir ce
+/// module). L'ordre suit donc exactement les nombres que la colonne affiche.
 ///
 /// Agrégé UNE fois puis joint, plutôt qu'une sous-requête corrélée par piste :
 /// le tri porte sur toute la bibliothèque filtrée, et PostgreSQL n'a pas
 /// d'index `(title, artist_name)` sur l'historique. L'égalité sur le titre
 /// est la clé de hachage ; la condition sur l'interprète filtre ensuite.
-/// `GROUP BY title, artist_name` : une piste rencontre AU PLUS une ligne,
-/// le `COUNT(*) OVER ()` de la page n'est pas multiplié.
-const JOINTURE_ECOUTES: &str = " LEFT JOIN (SELECT title, artist_name, \
-       COUNT(*) AS n, MAX(listened_at) AS derniere \
-       FROM listen_history WHERE source != 'radio' \
-       GROUP BY title, artist_name) ec \
-     ON ec.title = t.title \
-    AND (ec.artist_name = ar.name OR (ec.artist_name IS NULL AND ar.name IS NULL)) \
-     LEFT JOIN imported_plays ip ON ip.track_id = t.id";
+/// `GROUP BY title, artist_name, provenance` et la provenance dans la
+/// jointure : une piste rencontre AU PLUS une ligne, le `COUNT(*) OVER ()` de
+/// la page n'est pas multiplié.
+const JOINTURE_ECOUTES: &str = concat!(
+    " LEFT JOIN (SELECT lh.title, lh.artist_name, ",
+    provenance!("lh"),
+    " AS provenance, COUNT(*) AS n, MAX(lh.listened_at) AS derniere \
+       FROM listen_history lh WHERE ",
+    provenance!("lh"),
+    " <> 'radio' GROUP BY lh.title, lh.artist_name, ",
+    provenance!("lh"),
+    ") ec ON ec.title = t.title AND ec.provenance = ",
+    provenance!("t"),
+    " AND (ec.artist_name = ar.name OR (ec.artist_name IS NULL AND ar.name IS NULL)) \
+     LEFT JOIN imported_plays ip ON ip.track_id = t.id"
+);
 
 /// Comment une valeur « vide » se reconnaît, pour la ranger en FIN de liste
 /// dans les deux sens : une cellule vide en tête d'un tri descendant cacherait
@@ -1024,7 +1033,7 @@ mod tests {
         assert_eq!(
             titres(&page)[..2],
             ["Orphelin", "Dancing Queen"],
-            "10 écoutes importées passent devant 3 écoutes d'historique"
+            "10 écoutes importées passent devant 2 écoutes locales d'historique"
         );
         d.tri = Some(ColonneDeTri::DerniereEcoute);
         assert_eq!(
@@ -1064,7 +1073,8 @@ mod tests {
             .plays_for_tracks(&ids)
             .unwrap();
         let affiches: Vec<i64> = ids.iter().map(|id| comptes[id].0).collect();
-        assert_eq!(affiches, [3, 1, 0, 0, 0, 0, 0]);
+        // #7980 : l'écoute Qobuz de « Dancing Queen » ne compte pas, 2 et non 3.
+        assert_eq!(affiches, [2, 1, 0, 0, 0, 0, 0]);
         // Croissant : les zéros d'abord (un compte, pas une cellule vide).
         d.descendant = false;
         let asc = titres(&repo.page_de_pistes(&d).unwrap());
@@ -1106,6 +1116,78 @@ mod tests {
         assert_eq!(p2.total, 7);
         assert_eq!(p2.pistes.len(), 3);
         assert!(titres(&p2).iter().all(|t| !p1.contains(t)));
+    }
+
+    /// #7980 — le tri « # écoutes » ne compte que les écoutes locales, comme
+    /// la colonne : trois écoutes Qobuz d'« Été indien » ne la font pas
+    /// passer devant « Dancing Queen » et ses deux écoutes locales.
+    #[test]
+    fn i7980_le_tri_par_ecoutes_ignore_les_ecoutes_de_service() {
+        let (repo, ar, al) = base();
+        bibliotheque(&repo, &ar, &al);
+        historique(repo.db.as_ref());
+        for quand in [
+            "2026-07-01T10:00:00Z",
+            "2026-07-02T10:00:00Z",
+            "2026-07-03T10:00:00Z",
+        ] {
+            repo.db
+                .execute(
+                    "INSERT INTO listen_history (title, artist_name, source, listened_at) \
+                     VALUES ('Été indien', 'Éla Ferré', 'qobuz', ?)",
+                    &[&quand],
+                )
+                .unwrap();
+        }
+        let mut d = demande();
+        d.tri = Some(ColonneDeTri::Ecoutes);
+        d.descendant = true;
+        assert_eq!(
+            titres(&repo.page_de_pistes(&d).unwrap())[..2],
+            ["Dancing Queen", "Été indien"],
+            "#7980 : les écoutes Qobuz ne comptent pas dans le tri d'une piste locale"
+        );
+    }
+
+    /// #7980 — le tri « # écoutes » rapproche l'écoute de la provenance de
+    /// la piste, comme la colonne : la piste UPnP « Azur distant » garde ses
+    /// trois écoutes UPnP et passe en tête ; la piste Qobuz « Azur qobuz » ne
+    /// reçoit pas les cinq écoutes LOCALES de même titre et même interprète.
+    #[test]
+    fn i7980_le_tri_par_ecoutes_suit_la_provenance_de_la_piste() {
+        let (repo, ar, al) = base();
+        bibliotheque(&repo, &ar, &al);
+        historique(repo.db.as_ref());
+        let ecouter = |titre: &str, artiste: &str, source: &str, n: i64| {
+            for i in 0..n {
+                let quand = format!("2026-07-0{}T10:00:00Z", i + 1);
+                repo.db
+                    .execute(
+                        "INSERT INTO listen_history (title, artist_name, source, listened_at) \
+                         VALUES (?, ?, ?, ?)",
+                        &[&titre, &artiste, &source, &quand.as_str()],
+                    )
+                    .unwrap();
+            }
+        };
+        ecouter("Azur distant", "Éla Ferré", "upnp", 3);
+        ecouter("Azur qobuz", "ABBA", "local", 5);
+        let mut d = demande();
+        d.tri = Some(ColonneDeTri::Ecoutes);
+        d.descendant = true;
+        let page = repo.page_de_pistes(&d).unwrap();
+        assert_eq!(page.total, 7, "la jointure ne multiplie pas les lignes");
+        assert_eq!(
+            titres(&page)[..3],
+            ["Azur distant", "Dancing Queen", "Été indien"],
+            "#7980 : une piste UPnP compte ses écoutes UPnP, une piste Qobuz pas les écoutes locales"
+        );
+        let ids: Vec<i64> = page.pistes.iter().filter_map(|t| t.id).collect();
+        let comptes = crate::db::history_repo::HistoryRepo::with_backend(repo.db.clone())
+            .plays_for_tracks(&ids)
+            .unwrap();
+        let affiches: Vec<i64> = ids.iter().map(|id| comptes[id].0).collect();
+        assert_eq!(affiches, [3, 2, 1, 0, 0, 0, 0], "l'ordre suit la colonne");
     }
 
     /// La recherche de l'onglet : titre OU artiste, pliée, littérale.

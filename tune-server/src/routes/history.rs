@@ -47,16 +47,18 @@ pub fn router() -> Router<AppState> {
 }
 
 /// GET /library/history/tracks/{id}/plays — how many times this track was
-/// played (non-radio), so the UI can show a play count on a track (Progman,
-/// feature #1056). Matched by title + artist, like the dashboard top tracks.
+/// played, so the UI can show a play count on a track (Progman, feature
+/// #1056). Matched by title + artist. Seules les écoutes de la provenance de
+/// la piste comptent (#7980) : une écoute Qobuz n'est pas une écoute du
+/// fichier local du même nom.
 async fn track_plays(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let track_repo = TrackRepo::with_backend(state.backend.clone());
-    let (title, artist) = match track_repo.get(id) {
-        Ok(Some(t)) => (t.title, t.artist_name),
+    let (title, artist, source) = match track_repo.get(id) {
+        Ok(Some(t)) => (t.title, t.artist_name, t.source),
         _ => return Json(json!({ "track_id": id, "plays": 0 })),
     };
     let plays = HistoryRepo::with_backend(state.backend.clone())
-        .track_plays(&title, artist.as_deref())
+        .track_plays(&title, artist.as_deref(), &source)
         .unwrap_or(0);
     Json(json!({ "track_id": id, "plays": plays }))
 }

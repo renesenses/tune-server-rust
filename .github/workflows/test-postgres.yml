@@ -262,6 +262,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8062 -- --nocapture --test-threads=1
 
+      # #7980 — une écoute ne compte que pour la piste de sa provenance
+      # (locale, UPnP, service). Sans cette étape, le témoin prendrait son
+      # saut annoncé.
+      - name: Écoutes d'une piste selon sa provenance sur PostgreSQL (#7980)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7980 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
