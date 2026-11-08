@@ -387,10 +387,13 @@ async fn un_refus_d_identifiants_smb_arrete_l_echelle_et_le_dit_6336() {
     )
     .await;
     assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR, "{corps}");
+    // #8069 : `error` porte un code, la phrase affichée est dans `message`
+    // (le client n'affiche que `message`) — la vraie cause y reste citée.
+    assert_eq!(corps["error"], "identifiants_refuses", "{corps}");
     assert!(
-        corps["error"]
+        corps["message"]
             .as_str()
-            .is_some_and(|e| e.contains("Permission denied")),
+            .is_some_and(|m| m.contains("Permission denied")),
         "la vraie cause doit être rendue : {corps}"
     );
     // Un refus d'identifiants ne se répare pas en changeant de dialecte.
