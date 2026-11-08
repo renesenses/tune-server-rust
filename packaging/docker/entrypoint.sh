@@ -21,12 +21,19 @@
 # server keeps, besides the groups of `tune` in the image (`audio` among
 # them), the group owning /dev/snd and every `--group-add` of the container.
 # `setpriv --init-groups` alone would drop the last two.
+#
+# CD drive (#8141): an optical drive passed with `--device /dev/sr0` keeps
+# its HOST group too (11 on ZimaOS, 24 `cdrom` on Debian...), unknown to the
+# image. The group owning each /dev/sr* block device is kept the same way,
+# so that the extractor (cdparanoia) can open it. No named group is needed:
+# setpriv takes numeric gids.
 set -eu
 
 TUNE_BIN="${TUNE_ENTRYPOINT_BIN:-/app/tune-server}"
 TUNE_USER=tune
 DATA_DIR="${TUNE_ENTRYPOINT_DATA_DIR:-/data}"
 SND_DIR="${TUNE_ENTRYPOINT_SND_DIR:-/dev/snd}"
+CD_DIR="${TUNE_ENTRYPOINT_CD_DIR:-/dev}"
 
 die() {
     echo "FATAL: $*" >&2
@@ -83,8 +90,9 @@ fi
 HOME="$(getent passwd "$TUNE_USER" | cut -d: -f6)"
 export HOME
 
-# Supplementary groups (#5968): those of `tune`, then the owner of the sound
-# devices and the container's `--group-add` (root's own 0 and the unmapped
+# Supplementary groups (#5968, #8141): those of `tune`, then the owner of the
+# sound devices and of the CD drives, and the container's `--group-add`
+# (root's own 0 and the unmapped
 # 65534 of a rootless user namespace excluded: neither can be granted).
 groups=""
 add_group() {
@@ -97,6 +105,11 @@ for g in $(id -G "$TUNE_USER"); do
 done
 for node in "$SND_DIR"/*; do
     if [ -c "$node" ]; then
+        add_group "$(stat -L -c %g "$node")"
+    fi
+done
+for node in "$CD_DIR"/sr*; do
+    if [ -b "$node" ]; then
         add_group "$(stat -L -c %g "$node")"
     fi
 done

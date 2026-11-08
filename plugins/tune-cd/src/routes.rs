@@ -1,6 +1,7 @@
 //! Les routes du greffon, montées par l'hôte sous `/api/v1/ext/cd`.
 //!
-//! * `GET  /etat`   — le lecteur et le disque ;
+//! * `GET  /etat`   — le lecteur et le disque ; #8141 : `acces_refuse`
+//!   (lecteur, groupe, message) quand un `/dev/sr*` branché est interdit ;
 //! * `GET  /disque` — la TOC, l'identifiant et les métadonnées ;
 //! * `POST /jouer`  — `{ "zone_id": 3, "piste": 5 }` : pose le disque entier
 //!   en file sur la zone et joue la piste demandée (la 1ʳᵉ sans `piste`) ;
@@ -151,10 +152,20 @@ async fn etat_du_lecteur(State(etat): State<EtatRoutes>) -> Json<Value> {
         }
         None => (None, Presence::AucunLecteur),
     };
+    // #8141 : « aucun lecteur » alors qu'un /dev/sr* est là, mais interdit.
+    let acces_refuse = if presence == Presence::AucunLecteur {
+        tokio::task::spawn_blocking(crate::lecteur::lecteur_refuse_du_systeme)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     Json(json!({
         "plateforme_prise_en_charge": plateforme_prise_en_charge(),
         "lecteur": chemin,
         "presence": presence,
+        "acces_refuse": acces_refuse,
         "chargement": etat.memoire.as_ref().and_then(|m| m.progression()),
     }))
 }
@@ -1031,6 +1042,8 @@ mod tests {
         assert_eq!(v["presence"], "disque");
         assert_eq!(v["lecteur"], "simulé");
         assert!(v["plateforme_prise_en_charge"].is_boolean());
+        // #8141 : un lecteur qui lit n'a pas d'accès refusé.
+        assert!(v["acces_refuse"].is_null(), "{v}");
 
         let (e, _) = etat(None, Arc::new(SansReseau));
         let (_, v) = appel(router(e), "GET", "/etat", None).await;
