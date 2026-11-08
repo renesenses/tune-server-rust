@@ -5,15 +5,111 @@ mod crc;
 mod priorite;
 pub mod rappel;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, path::Path};
+use std::{
+    fs::File,
+    io::{self, Read, Seek, SeekFrom},
+    path::Path,
+};
 use symphonia::core::{
     codecs::{CodecParameters, audio::AudioDecoderOptions},
     errors::Error,
     formats::probe::Hint,
     formats::{FormatOptions, TrackType},
-    io::MediaSourceStream,
+    io::{MediaSource, MediaSourceStream},
     meta::MetadataOptions,
 };
+
+/// #8105 — fin des données audio d'un FLAC : la taille du fichier moins les
+/// étiquettes que des tagueurs ajoutent APRÈS la dernière trame (ID3v1,
+/// Lyrics3v2, APEv2, dans n'importe quel ordre). Le démultiplexeur FLAC de
+/// symphonia ne les connaît pas : il les colle à la dernière trame, dont le
+/// CRC-16 devient faux, la perd, puis rend « unexpected end of file » au
+/// dernier multiple de la taille de bloc. Un FLAC intact était ainsi déclaré
+/// corrompu, avec un nombre d'échantillons pris pour une position.
+fn fin_des_donnees<R: Read + Seek>(source: &mut R, taille: u64) -> io::Result<u64> {
+    let mut lire = |pos: u64, n: usize| -> io::Result<Vec<u8>> {
+        let mut o = vec![0u8; n];
+        source.seek(SeekFrom::Start(pos))?;
+        source.read_exact(&mut o)?;
+        Ok(o)
+    };
+    let mut fin = taille;
+    loop {
+        if fin >= 128 && lire(fin - 128, 3)? == b"TAG" {
+            fin -= 128;
+            continue;
+        }
+        if fin >= 32 {
+            let pied = lire(fin - 32, 32)?;
+            if &pied[..8] == b"APETAGEX" {
+                // Taille des éléments et du pied ; l'en-tête, s'il est
+                // annoncé (bit 31 des drapeaux), s'y ajoute.
+                let corps = u64::from(u32::from_le_bytes(pied[12..16].try_into().unwrap()));
+                let drapeaux = u32::from_le_bytes(pied[20..24].try_into().unwrap());
+                let total = corps + if drapeaux & (1 << 31) != 0 { 32 } else { 0 };
+                if total >= 32 && total <= fin {
+                    fin -= total;
+                    continue;
+                }
+            }
+        }
+        if fin >= 15 && lire(fin - 9, 9)? == b"LYRICS200" {
+            let chiffres = lire(fin - 15, 6)?;
+            if let Some(corps) = std::str::from_utf8(&chiffres)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                && corps + 15 <= fin
+            {
+                fin -= corps + 15;
+                continue;
+            }
+        }
+        return Ok(fin);
+    }
+}
+
+/// Une source bornée à `[0, fin)` : ce qui suit la dernière trame n'est pas
+/// donné au démultiplexeur.
+struct Borne<R> {
+    source: R,
+    fin: u64,
+    pos: u64,
+}
+
+impl<R: Read> Read for Borne<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let reste = self.fin.saturating_sub(self.pos);
+        let n = buf.len().min(usize::try_from(reste).unwrap_or(usize::MAX));
+        if n == 0 {
+            return Ok(0);
+        }
+        let lus = self.source.read(&mut buf[..n])?;
+        self.pos += lus as u64;
+        Ok(lus)
+    }
+}
+
+impl<R: Seek> Seek for Borne<R> {
+    fn seek(&mut self, vers: SeekFrom) -> io::Result<u64> {
+        let cible = match vers {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::End(d) => self.fin.checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "position invalide"))?;
+        self.pos = self.source.seek(SeekFrom::Start(cible))?;
+        Ok(self.pos)
+    }
+}
+
+impl<R: Read + Seek + Send + Sync> MediaSource for Borne<R> {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.fin)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -160,11 +256,22 @@ pub fn verifier_rapide(chemin: &Path, mut continuer: impl FnMut() -> bool) -> Op
     if !continuer() {
         return None;
     }
-    let fichier = match ouvrir(chemin) {
+    let mut fichier = match ouvrir(chemin) {
         Ok(f) => f,
         Err(r) => return Some(r),
     };
-    let constat = match crc::analyser(fichier, continuer) {
+    // Les étiquettes finales ne sont pas des trames (#8105).
+    let taille = match fichier.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => return Some(Resultat::defaut("illisible", e, None, 0)),
+    };
+    let fin = match fin_des_donnees(&mut fichier, taille)
+        .and_then(|fin| fichier.seek(SeekFrom::Start(0)).map(|_| fin))
+    {
+        Ok(fin) => fin,
+        Err(e) => return Some(Resultat::defaut("illisible", e, None, 0)),
+    };
+    let constat = match crc::analyser(fichier.take(fin), continuer) {
         Ok(crc::Analyse::Constat(c)) => c,
         Ok(crc::Analyse::NonApplicable) => {
             return Some(Resultat::non_verifiable("mode_rapide_non_applicable", 0));
@@ -219,7 +326,7 @@ pub fn verifier_rapide(chemin: &Path, mut continuer: impl FnMut() -> bool) -> Op
         resultat.verdict = Verdict::Corrompu;
         resultat.code = "tronque".into();
         resultat.erreur = Some(format!(
-            "Fichier tronqué : coupé à la {nom} n° {}, octet {}",
+            "Fichier tronqué : coupé à la {nom} n° {}, octet {} ; taille réelle : {taille} octets",
             lieu.numero, lieu.octet
         ));
         resultat.position_trames = lieu.echantillon;
@@ -259,12 +366,12 @@ pub fn verifier(chemin: &Path, mut continuer: impl FnMut() -> bool) -> Option<Re
         }
         Err(e) => return Some(Resultat::defaut("illisible", e, None, 0)),
     }
-    let mut fichier = match File::open(chemin) {
+    let fichier = match File::open(chemin) {
         Ok(f) => f,
         Err(e) => return Some(Resultat::defaut("illisible", e, None, 0)),
     };
-    match fichier.metadata() {
-        Ok(m) if m.is_file() => {}
+    let taille = match fichier.metadata() {
+        Ok(m) if m.is_file() => m.len(),
         _ => {
             return Some(Resultat::defaut(
                 "illisible",
@@ -273,33 +380,61 @@ pub fn verifier(chemin: &Path, mut continuer: impl FnMut() -> bool) -> Option<Re
                 0,
             ));
         }
-    }
-    let flac = super::flac_vendeur::entete_flac(&mut fichier);
-    use std::io::{Seek, SeekFrom};
-    if let Err(e) = fichier.seek(SeekFrom::Start(0)) {
-        return Some(Resultat::defaut("illisible", e, None, 0));
-    }
+    };
+    verifier_source(
+        fichier,
+        taille,
+        chemin.extension().and_then(|e| e.to_str()),
+        || File::open(chemin),
+        continuer,
+    )
+}
+
+/// Le décodage complet d'une source de `taille` octets. `rouvrir` donne une
+/// seconde lecture de la même source, pour situer une fin de flux
+/// inattendue. Séparé de [`verifier`] pour que les témoins puissent donner
+/// une source aux lectures courtes, comme `ReadFile` sous Windows (#8105).
+fn verifier_source<R: Read + Seek + Send + Sync + 'static>(
+    mut source: R,
+    taille: u64,
+    extension: Option<&str>,
+    rouvrir: impl FnOnce() -> io::Result<R>,
+    mut continuer: impl FnMut() -> bool,
+) -> Option<Resultat> {
+    let flac = super::flac_vendeur::entete_flac(&mut source);
+    let fin = match flac {
+        Some(_) => fin_des_donnees(&mut source, taille),
+        None => Ok(taille),
+    };
+    let fin = match fin.and_then(|fin| source.seek(SeekFrom::Start(0)).map(|_| fin)) {
+        Ok(fin) => fin,
+        Err(e) => return Some(Resultat::defaut("illisible", e, None, 0)),
+    };
     let mut hint = Hint::new();
-    if let Some(extension) = chemin.extension().and_then(|e| e.to_str()) {
+    if let Some(extension) = extension {
         hint.with_extension(extension);
     }
     let mut format = match symphonia::default::get_probe().probe(
         &hint,
-        MediaSourceStream::new(Box::new(fichier), Default::default()),
+        MediaSourceStream::new(
+            Box::new(Borne {
+                source,
+                fin,
+                pos: 0,
+            }),
+            Default::default(),
+        ),
         FormatOptions::default(),
         MetadataOptions::default(),
     ) {
         Ok(f) => f,
         Err(Error::Unsupported(e)) => {
-            let connu = chemin
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| {
-                    matches!(
-                        s.to_ascii_lowercase().as_str(),
-                        "flac" | "wav" | "mp3" | "ogg" | "oga" | "m4a" | "mp4" | "aac"
-                    )
-                });
+            let connu = extension.is_some_and(|s| {
+                matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "flac" | "wav" | "mp3" | "ogg" | "oga" | "m4a" | "mp4" | "aac"
+                )
+            });
             return Some(if connu {
                 Resultat::defaut("entete_illisible", e, Some(0), 0)
             } else {
@@ -371,6 +506,11 @@ pub fn verifier(chemin: &Path, mut continuer: impl FnMut() -> bool) -> Option<Re
                 trames_lien = 0;
                 continue;
             }
+            Err(Error::IoError(e))
+                if flac.is_some() && e.kind() == io::ErrorKind::UnexpectedEof =>
+            {
+                return fin_de_flux_inattendue(rouvrir, fin, taille, trames, attendues, continuer);
+            }
             Err(e) => return Some(Resultat::defaut("decodage", e, Some(trames), trames)),
         };
         if paquet.track_id != id {
@@ -436,6 +576,73 @@ pub fn verifier(chemin: &Path, mut continuer: impl FnMut() -> bool) -> Option<Re
     })
 }
 
+/// Le décodeur FLAC a rencontré la fin du flux avant le dernier échantillon
+/// annoncé (#8105). « Tronqué » n'est rendu que si le parcours des trames
+/// le confirme : le fichier est réellement plus court que ce qu'il annonce.
+/// Sinon c'est la dernière trame qui est fautive (abîmée, ou suivie de
+/// données inconnues). Le message donne la position et la taille réelle.
+fn fin_de_flux_inattendue<R: Read>(
+    rouvrir: impl FnOnce() -> io::Result<R>,
+    fin: u64,
+    taille: u64,
+    trames: u64,
+    attendues: Option<u64>,
+    continuer: impl FnMut() -> bool,
+) -> Option<Resultat> {
+    let annonce = attendues
+        .map(|n| format!(" sur {n} annoncés"))
+        .unwrap_or_default();
+    let tailles = if fin == taille {
+        format!("taille réelle : {taille} octets")
+    } else {
+        format!("taille réelle : {taille} octets, dont {fin} de données audio")
+    };
+    let constat = match rouvrir().and_then(|s| crc::analyser(s.take(fin), continuer)) {
+        Ok(crc::Analyse::Constat(c)) => Some(c),
+        Ok(crc::Analyse::Interrompu) => return None,
+        Ok(crc::Analyse::NonApplicable) | Err(_) => None,
+    };
+    let (code, position, detail) = match constat {
+        Some(crc::Constat {
+            tronque: Some(lieu),
+            ..
+        }) => (
+            "tronque",
+            lieu.echantillon,
+            format!(
+                "Fichier tronqué : coupé à la trame n° {}, octet {}",
+                lieu.numero, lieu.octet
+            ),
+        ),
+        Some(crc::Constat {
+            premiere_faute: Some(faute),
+            ..
+        }) => (
+            faute.code,
+            faute.lieu.echantillon,
+            format!(
+                "Fin de flux illisible : {} (trame n° {}, octet {})",
+                faute.detail, faute.lieu.numero, faute.lieu.octet
+            ),
+        ),
+        _ => (
+            "decodage",
+            None,
+            "Fin de flux inattendue, toutes les trames lues sont pourtant justes".to_string(),
+        ),
+    };
+    Some(Resultat::defaut(
+        code,
+        format!("{detail} ; {trames} échantillons décodés{annonce} ; {tailles}"),
+        position.or(Some(trames)),
+        trames,
+    ))
+}
+
+#[cfg(test)]
+#[path = "audit_integrite_tests_8105.rs"]
+mod tests_8105;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,7 +693,10 @@ mod tests {
         let r = auditer(&fichier);
         assert_eq!(r.verdict, Verdict::Corrompu, "troncature ignorée : {r:?}");
         assert!(
-            matches!(r.code.as_str(), "decodage" | "longueur_incorrecte"),
+            matches!(
+                r.code.as_str(),
+                "tronque" | "decodage" | "longueur_incorrecte"
+            ),
             "troncature non décodée : {r:?}"
         );
         assert!(r.position_trames.is_some());

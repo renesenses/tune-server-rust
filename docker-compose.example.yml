@@ -8,6 +8,16 @@ services:
     restart: unless-stopped
     volumes:
       - /chemin/vers/musique:/music:ro
+      # Partage SMB monte sur l'hote (NAS) : Tune ne peut pas le monter
+      # lui-meme dans le conteneur. Remplacer la ligne ci-dessus par la forme
+      # longue, en propagation rslave, pour qu'un partage monte APRES le
+      # demarrage du conteneur y apparaisse. Voir docs/DOCKER-PARTAGE-SMB.md.
+      # - type: bind
+      #   source: /chemin/vers/musique
+      #   target: /music
+      #   read_only: true
+      #   bind:
+      #     propagation: rslave
       - tune-data:/data
       # Synology : cache des modeles accessible en ecriture au compte Tune.
       # Creer ce dossier et adapter les droits avant de retirer le commentaire.

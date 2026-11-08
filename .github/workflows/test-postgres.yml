@@ -920,6 +920,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_requete_avancee_7872 -- --nocapture --test-threads=1
 
+      # #8077 — les apports Qobuz d'un album local (PG 108) : rapprochement,
+      # garde « compléter seulement », retrait, par le vrai routeur et une
+      # doublure de l'API Qobuz. Sans cette étape, l'épreuve prendrait son
+      # « saut annoncé ».
+      - name: Apports Qobuz des albums locaux sur PostgreSQL (#8077)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_apports_qobuz_8077 -- --nocapture --test-threads=1
+
       # #6257 — l'ordre des étiquettes : la 091 pose `tags.position` en
       # BIGINT, `PUT /tags/order` l'écrit, les listes le suivent ; une neuve
       # se range par nom tant que rien n'est réordonné. Sans cette étape,

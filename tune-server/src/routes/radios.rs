@@ -794,10 +794,22 @@ impl StationAnnuaire {
     }
 
     /// #7177 — les flux que l'on peut choisir pour cette fiche : chacune de
-    /// ses adresses publiées (`stream_urls`, la principale d'abord), avec le
-    /// format et le débit que la v2 en donne. Une adresse sans détail (une
-    /// entrée v1) est rendue quand même, sans format.
+    /// ses adresses publiées (`stream_urls`), avec le format et le débit que
+    /// la v2 en donne. Une adresse sans détail (une entrée v1) est rendue
+    /// quand même, sans format.
+    ///
+    /// #7515 — rangés par qualité décroissante ([`geofencing::rang`] : sans
+    /// perte, débit, puis le principal et la fréquence d'échantillonnage) ;
+    /// l'ordre de la fiche départage les ex æquo. Avant, le principal venait toujours en tête : BBC Radio 6
+    /// Music proposait son 320 kbit/s, puis le 96, puis l'autre 320.
     pub fn flux_proposes(&self) -> Vec<FluxAnnuaire> {
+        let mut flux = self.flux_dans_l_ordre_de_la_fiche();
+        // Tri stable : l'ordre de la fiche reste le dernier critère.
+        flux.sort_by_key(|f| std::cmp::Reverse(geofencing::rang(f)));
+        flux
+    }
+
+    fn flux_dans_l_ordre_de_la_fiche(&self) -> Vec<FluxAnnuaire> {
         let mut adresses: Vec<&str> = vec![self.stream_url.as_str()];
         for u in &self.stream_urls {
             if !adresses.contains(&u.as_str()) {

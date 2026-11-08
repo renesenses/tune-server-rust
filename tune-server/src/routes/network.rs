@@ -1538,47 +1538,14 @@ async fn mount_smb_share(
         dernier.expect("DIALECTES n'est jamais vide")
     };
 
-    match mount_result {
-        Ok(Ok(out)) if out.status.success() => {}
-        Ok(Ok(out)) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            // La vraie cause, et non l'erreur du dernier dialecte essaye.
-            if smb::est_deja_monte(&stderr) {
-                return point_occupe(&mount_path, None);
-            }
-            if crate::privilege::est_un_refus_d_elevation(&stderr) {
-                // Deja journalise par l'echelle (`smb_mount_failed`) ; ici,
-                // le message dit a l'utilisateur ce qui manque.
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "error": "elevation_refusee",
-                        "message": crate::privilege::message_de_refus(&stderr),
-                    })),
-                )
-                    .into_response();
-            }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("mount failed: {stderr}") })),
-            )
-                .into_response();
-        }
-        Ok(Err(e)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("mount command failed: {e}") })),
-            )
-                .into_response();
-        }
-        Err(_) => {
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(json!({ "error": "mount timed out" })),
-            )
-                .into_response();
-        }
-    };
+    if let Some(echec) = reponse_d_echec_du_montage(
+        &mount_result,
+        &mount_path,
+        crate::privilege::euid(),
+        crate::conteneur::detecter(),
+    ) {
+        return echec;
+    }
 
     persister_le_montage(
         &state,
@@ -1587,6 +1554,163 @@ async fn mount_smb_share(
         &mount_path,
         dialecte_retenu,
         false,
+    )
+}
+
+/// #8069 — la réponse d'un montage qui n'a pas abouti, ou `None` s'il a monté.
+///
+/// Les trois réponses d'échec d'avant portaient leur phrase dans `error`
+/// (`mount command failed: No such file or directory (os error 2)`,
+/// `mount failed: …`, `mount timed out`) et aucun `message` : le client, qui
+/// n'affiche que `message` ou `detail`, montrait donc une erreur inconnue.
+/// Vécu dans un conteneur Docker sur un NAS Synology : le serveur n'y tourne
+/// pas en root, et l'image n'a ni sudo, ni l'assistant de Tune OS, ni
+/// `mount.cifs` — le montage ne pouvait pas réussir, et rien ne le disait.
+///
+/// Chaque échec rend désormais un CODE dans `error` et un TEXTE qui dit quoi
+/// faire dans `message`, comme `obstacle_de_montage`. Fonction pure sur ce
+/// qu'elle reçoit (identité, conteneur) pour se tester sans système.
+fn reponse_d_echec_du_montage(
+    resultat: &Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
+    mount_path: &str,
+    euid: u32,
+    conteneur: Option<&str>,
+) -> Option<axum::response::Response> {
+    let (statut, code, message) = match resultat {
+        Ok(Ok(out)) if out.status.success() => return None,
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // La vraie cause, et non l'erreur du dernier dialecte essaye.
+            if smb::est_deja_monte(&stderr) {
+                return Some(point_occupe(mount_path, None));
+            }
+            if crate::privilege::est_un_refus_d_elevation(&stderr) {
+                // Deja journalise par l'echelle (`smb_mount_failed`) ; ici,
+                // le message dit a l'utilisateur ce qui manque.
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "elevation_refusee",
+                    crate::privilege::message_de_refus(&stderr),
+                )
+            } else {
+                let (code, message) = obstacle_du_systeme(stderr.trim(), conteneur);
+                (StatusCode::INTERNAL_SERVER_ERROR, code, message)
+            }
+        }
+        Ok(Err(e)) => {
+            let (code, message) = obstacle_du_lancement(e, euid, conteneur);
+            (StatusCode::INTERNAL_SERVER_ERROR, code, message)
+        }
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "delai_depasse",
+            "Le serveur SMB n'a pas répondu à temps. Vérifiez que l'appareil est allumé \
+             et joignable depuis le serveur Tune, puis réessayez."
+                .to_string(),
+        ),
+    };
+    Some((statut, Json(json!({ "error": code, "message": message }))).into_response())
+}
+
+/// #8069 — ce qu'il faut faire quand Tune tourne dans un conteneur : y monter
+/// un partage demande des outils et des privilèges que l'image n'a pas.
+fn conseil_en_conteneur(moteur: &str) -> String {
+    format!(
+        "Tune tourne dans un conteneur ({moteur}) : il ne peut pas y monter lui-même \
+         un partage SMB, car le serveur n'y a ni les privilèges système (root et la \
+         capacité CAP_SYS_ADMIN) ni l'outil de montage (cifs-utils). Montez plutôt le \
+         partage sur la machine hôte (votre NAS), puis rendez-le visible dans le \
+         conteneur par un volume en propagation « rslave », par exemple \
+         -v /volume1/music:/music:ro,rslave, et ajoutez le dossier obtenu aux \
+         dossiers de musique. Sans « rslave », un partage monté sur l'hôte après la \
+         création du conteneur n'y apparaît pas."
+    )
+}
+
+/// #8069 — le programme de montage n'a pas pu être lancé.
+fn obstacle_du_lancement(
+    e: &std::io::Error,
+    euid: u32,
+    conteneur: Option<&str>,
+) -> (&'static str, String) {
+    if let Some(moteur) = conteneur {
+        // En conteneur, quelle que soit la raison du lancement raté, le
+        // remède est le même : monter sur l'hôte. Le détail reste lisible
+        // quand ce n'est pas un simple « introuvable ».
+        let conseil = conseil_en_conteneur(moteur);
+        let message = if e.kind() == std::io::ErrorKind::NotFound {
+            conseil
+        } else {
+            format!("{conseil} (Détail : {e})")
+        };
+        return ("montage_impossible_en_conteneur", message);
+    }
+    if e.kind() != std::io::ErrorKind::NotFound {
+        return (
+            "lancement_impossible",
+            format!("Impossible de lancer la commande de montage : {e}"),
+        );
+    }
+    if euid != 0 {
+        (
+            "assistant_de_montage_absent",
+            format!(
+                "Le serveur ne tourne pas en root et l'assistant de montage de Tune OS \
+                 ({}) est introuvable, ou sudo est absent. Donnez au service les \
+                 privilèges système, ou montez le partage par le système (/etc/fstab) \
+                 et ajoutez le dossier obtenu aux dossiers de musique.",
+                crate::privilege::ASSISTANT
+            ),
+        )
+    } else {
+        (
+            "outil_de_montage_absent",
+            "L'outil de montage SMB est introuvable sur ce serveur. Sous Linux, \
+             installez le paquet cifs-utils (qui fournit mount.cifs), puis réessayez."
+                .to_string(),
+        )
+    }
+}
+
+/// #8069 — le système a refusé le montage ; `stderr` est sa réponse.
+fn obstacle_du_systeme(stderr: &str, conteneur: Option<&str>) -> (&'static str, String) {
+    let bas = stderr.to_lowercase();
+    // `mount error(1): Operation not permitted` : le noyau refuse le montage
+    // à un processus sans CAP_SYS_ADMIN — typiquement un conteneur.
+    if bas.contains("error(1)") || bas.contains("operation not permitted") {
+        let conseil = match conteneur {
+            Some(moteur) => conseil_en_conteneur(moteur),
+            None => "Le serveur n'a pas les privilèges système pour monter un partage \
+                     (root et la capacité CAP_SYS_ADMIN). Donnez-les au service, ou \
+                     montez le partage par le système (/etc/fstab) et ajoutez le \
+                     dossier obtenu aux dossiers de musique."
+                .to_string(),
+        };
+        return (
+            "privileges_insuffisants",
+            format!("{conseil} (Détail : {stderr})"),
+        );
+    }
+    // `mount error(13): Permission denied` : le partage a refusé le nom
+    // d'utilisateur ou le mot de passe (fil 6336) ; la réponse du système
+    // reste citée, c'est la vraie cause.
+    if smb::est_refus_d_authentification(stderr) {
+        return (
+            "identifiants_refuses",
+            format!(
+                "Le partage a refusé le nom d'utilisateur ou le mot de passe. Vérifiez-les \
+                 (et le domaine s'il en faut un), puis réessayez. (Détail : {stderr})"
+            ),
+        );
+    }
+    let detail = if stderr.is_empty() {
+        "le système n'a donné aucun détail"
+    } else {
+        stderr
+    };
+    (
+        "montage_refuse",
+        format!("Le montage du partage a échoué : {detail}"),
     )
 }
 
@@ -4034,5 +4158,192 @@ mod tests_oubli_2145 {
             point.join("residu.flac").exists(),
             "aucun fichier ne doit etre efface"
         );
+    }
+}
+
+/// #8069 — un montage qui échoue le DIT à l'écran : un code dans `error`, un
+/// texte qui dit quoi faire dans `message`. Le client n'affiche que `message`.
+#[cfg(all(test, unix))]
+mod tests_echec_du_montage_8069 {
+    use super::reponse_d_echec_du_montage;
+    use axum::http::StatusCode;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    fn sortie(code: i32, stderr: &str) -> Output {
+        Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    fn introuvable() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::NotFound)
+    }
+
+    async fn corps(
+        resultat: Result<std::io::Result<Output>, tokio::time::error::Elapsed>,
+        euid: u32,
+        conteneur: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let rep = reponse_d_echec_du_montage(&resultat, "/mnt/nas_music", euid, conteneur)
+            .expect("un echec doit rendre une reponse");
+        let statut = rep.status();
+        let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (statut, serde_json::from_slice(&octets).unwrap())
+    }
+
+    /// Le contrat que lit le client : `message` non vide, `error` un code.
+    fn affichable(v: &serde_json::Value) -> String {
+        let code = v["error"].as_str().expect("error doit etre un code");
+        assert!(
+            !code.is_empty() && !code.contains(' '),
+            "error doit rester un code machine, pas une phrase : {code:?}"
+        );
+        let message = v["message"]
+            .as_str()
+            .expect("message absent : le client afficherait une erreur inconnue");
+        assert!(!message.trim().is_empty(), "message vide");
+        message.to_string()
+    }
+
+    #[tokio::test]
+    async fn un_montage_reussi_ne_rend_pas_d_echec() {
+        assert!(reponse_d_echec_du_montage(&Ok(Ok(sortie(0, ""))), "/mnt/x", 1000, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn en_conteneur_sans_sudo_le_message_dit_de_monter_sur_l_hote() {
+        // Le cas du NAS Synology : `tune` (uid 1000), image sans sudo.
+        let (statut, v) = corps(Ok(Err(introuvable())), 1000, Some("docker")).await;
+        assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(v["error"], "montage_impossible_en_conteneur");
+        let m = affichable(&v);
+        assert!(m.contains("conteneur"), "{m}");
+        assert!(
+            m.contains("rslave"),
+            "le message doit donner la propagation : {m}"
+        );
+        assert!(m.contains("CAP_SYS_ADMIN"), "{m}");
+    }
+
+    #[tokio::test]
+    async fn en_conteneur_en_root_sans_mount_cifs_meme_conseil() {
+        let (_, v) = corps(Ok(Err(introuvable())), 0, Some("docker")).await;
+        assert_eq!(v["error"], "montage_impossible_en_conteneur");
+        assert!(affichable(&v).contains("rslave"));
+    }
+
+    #[tokio::test]
+    async fn hors_conteneur_l_outil_ou_l_assistant_absent_est_nomme() {
+        let (_, v) = corps(Ok(Err(introuvable())), 0, None).await;
+        assert_eq!(v["error"], "outil_de_montage_absent");
+        assert!(affichable(&v).contains("cifs-utils"));
+
+        let (_, v) = corps(Ok(Err(introuvable())), 1000, None).await;
+        assert_eq!(v["error"], "assistant_de_montage_absent");
+        assert!(affichable(&v).contains(crate::privilege::ASSISTANT));
+    }
+
+    #[tokio::test]
+    async fn un_refus_du_noyau_sans_capacite_renvoie_aux_privileges() {
+        let refus =
+            "mount error(1): Operation not permitted\nRefer to the mount.cifs(8) manual page";
+        let (_, v) = corps(Ok(Ok(sortie(32, refus))), 0, Some("docker")).await;
+        assert_eq!(v["error"], "privileges_insuffisants");
+        let m = affichable(&v);
+        assert!(m.contains("rslave") && m.contains("CAP_SYS_ADMIN"), "{m}");
+        assert!(
+            m.contains("Operation not permitted"),
+            "le detail reste lisible : {m}"
+        );
+
+        let (_, v) = corps(Ok(Ok(sortie(32, refus))), 0, None).await;
+        assert_eq!(v["error"], "privileges_insuffisants");
+        assert!(affichable(&v).contains("/etc/fstab"));
+    }
+
+    #[tokio::test]
+    async fn un_autre_refus_porte_la_reponse_du_systeme_dans_message() {
+        let (_, v) = corps(
+            Ok(Ok(sortie(32, "mount error(112): Host is down"))),
+            0,
+            None,
+        )
+        .await;
+        assert_eq!(v["error"], "montage_refuse");
+        assert!(affichable(&v).contains("Host is down"));
+        // Sans rien sur stderr, le message n'est pas vide pour autant.
+        let (_, v) = corps(Ok(Ok(sortie(32, ""))), 0, None).await;
+        assert!(affichable(&v).contains("aucun détail"));
+    }
+
+    #[tokio::test]
+    async fn un_refus_d_identifiants_le_dit_et_garde_la_cause() {
+        let (statut, v) = corps(
+            Ok(Ok(sortie(32, "mount error(13): Permission denied"))),
+            0,
+            None,
+        )
+        .await;
+        assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(v["error"], "identifiants_refuses");
+        let m = affichable(&v);
+        assert!(m.contains("mot de passe"), "{m}");
+        assert!(m.contains("Permission denied"), "la vraie cause : {m}");
+    }
+
+    #[tokio::test]
+    async fn en_conteneur_un_autre_echec_de_lancement_donne_aussi_le_conseil() {
+        // Par exemple un TUNE_SUDO_BIN qui pointe vers un fichier non exécutable.
+        let refuse = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let (_, v) = corps(Ok(Err(refuse)), 1000, Some("docker")).await;
+        assert_eq!(v["error"], "montage_impossible_en_conteneur");
+        let m = affichable(&v);
+        assert!(m.contains("rslave"), "{m}");
+        assert!(
+            m.contains("Détail"),
+            "le détail du système reste lisible : {m}"
+        );
+
+        // Hors conteneur, le cas reste celui d'avant.
+        let refuse = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let (_, v) = corps(Ok(Err(refuse)), 1000, None).await;
+        assert_eq!(v["error"], "lancement_impossible");
+    }
+
+    #[tokio::test]
+    async fn un_delai_depasse_se_lit_a_l_ecran() {
+        let ecoule = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            std::future::pending::<std::io::Result<Output>>(),
+        )
+        .await;
+        let (statut, v) = corps(ecoule, 1000, None).await;
+        assert_eq!(statut, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(v["error"], "delai_depasse");
+        affichable(&v);
+    }
+
+    #[tokio::test]
+    async fn le_refus_de_sudo_et_le_point_occupe_restent_ce_qu_ils_etaient() {
+        let (_, v) = corps(
+            Ok(Ok(sortie(1, "sudo: a password is required"))),
+            1000,
+            None,
+        )
+        .await;
+        assert_eq!(v["error"], "elevation_refusee");
+        affichable(&v);
+        let (statut, _) = corps(
+            Ok(Ok(sortie(32, "mount error(16): Device or resource busy"))),
+            0,
+            None,
+        )
+        .await;
+        assert_eq!(statut, StatusCode::CONFLICT);
     }
 }

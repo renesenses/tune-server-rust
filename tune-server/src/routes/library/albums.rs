@@ -670,6 +670,10 @@ pub(super) async fn get_album(
                 }
                 Err(e) => tracing::warn!(album_id = id, error = %e, "album_exemplaires_illisibles"),
             }
+            // #8077 — les apports Qobuz (base seulement), et leur calcul en
+            // arrière-plan si l'album n'a jamais été examiné.
+            super::apports_qobuz::annoter_album(&state, id, &mut j);
+            super::apports_qobuz::lancer_si_jamais_examine(&state, id).await;
             // #6738 — le total des écoutes de la communauté, absent sous le seuil.
             ecoutes_communaute::annoter_un(
                 &state.backend,
@@ -755,6 +759,8 @@ pub(super) async fn album_tracks(
     // #4806 — le titre banni RESTE dans la liste de l'album, grisé par
     // l'écran : c'est ce drapeau qui le dit, jamais un filtre.
     attacher_banni(&state, profile.id(), &mut items);
+    // #8077 — l'ISRC repris de Qobuz, avec sa source.
+    super::apports_qobuz::annoter_pistes(&state, id, &mut items);
     // #6738 — « So What (128) » : les écoutes de la communauté.
     ecoutes_communaute::annoter(&state.backend, &state.http_client, Genre::Piste, &mut items).await;
     Json(json!(items))

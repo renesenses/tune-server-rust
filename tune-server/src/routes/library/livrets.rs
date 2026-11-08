@@ -156,7 +156,7 @@ pub(crate) fn livret_a_servir(dossiers: &BTreeSet<PathBuf>, nom: &str) -> Option
 
 /// Les chemins de fichier des pistes de l'album (`cue_media_path` pour une
 /// piste d'image CUE).
-fn chemins_des_pistes(state: &AppState, album_id: i64) -> Vec<String> {
+pub(crate) fn chemins_des_pistes(state: &AppState, album_id: i64) -> Vec<String> {
     let p1 = match state.backend.engine() {
         Engine::Postgres => PostgresDialect.placeholder(1),
         Engine::Sqlite => SqliteDialect.placeholder(1),
