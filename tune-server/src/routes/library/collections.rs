@@ -308,11 +308,98 @@ fn conserver_etiquettes(
         obj.insert(ETIQUETTES.into(), Value::Object(etiquettes));
     }
     match serde_json::to_string(&collections) {
-        Ok(s) => settings.set("collections", &s).is_ok(),
+        Ok(s) => match settings.set("collections", &s) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(
+                    "dossier {collection_id}: étiquettes non conservées, écriture refusée: {e} (#901, #7335)"
+                );
+                false
+            }
+        },
         Err(e) => {
             tracing::warn!("dossier {collection_id}: étiquettes non conservées: {e} (#901)");
             false
         }
+    }
+}
+
+/// #7335 (laguespa, fil 2510) — lit le réglage `collections` AVANT de le
+/// réécrire.
+///
+/// Les lectures d'écran retombent sur une liste vide quand la base ne répond
+/// pas : c'est sans danger, rien n'est écrit. Ici, au contraire, la liste lue
+/// est réécrite en entier juste après. Une erreur de lecture prise pour « aucun
+/// dossier » ferait donc ÉCRASER tous les dossiers par le seul qu'on ajoute.
+/// L'erreur est rendue, rien n'est écrit.
+fn dossiers_a_reecrire(
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+) -> Result<Vec<Value>, AppError> {
+    let brut = settings.get("collections").map_err(|e| {
+        tracing::error!("dossiers: réglage `collections` illisible, rien n'est écrit: {e} (#7335)");
+        AppError::internal(format!("Lecture des collections impossible : {e}"))
+    })?;
+    Ok(brut
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default())
+}
+
+/// #7335 (laguespa, fil 2510) — écrit le réglage `collections`, et le DIT
+/// quand l'écriture échoue.
+///
+/// C'était `settings.set(…).ok()` dans chaque route : la base refusait
+/// l'écriture, la route répondait quand même `201 Created` avec le dossier
+/// dans le corps, et l'écran Collections, relu ensuite, ne le montrait pas.
+/// « Créer ne fait rien », sans un mot nulle part. L'échec est désormais
+/// journalisé et rendu en `500` avec un message lisible.
+fn ecrire_dossiers(
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    collections: &[Value],
+    operation: &str,
+) -> Result<(), AppError> {
+    let texte = serde_json::to_string(collections)?;
+    settings.set("collections", &texte).map_err(|e| {
+        tracing::error!(
+            "dossiers: {operation}: écriture du réglage `collections` refusée: {e} (#7335)"
+        );
+        AppError::internal(format!(
+            "Collections ({operation}) : la base a refusé l'écriture, rien n'a été enregistré ({e})"
+        ))
+    })
+}
+
+/// #7335 — sert la liste des dossiers en ÉCARTANT celui qui ne peut pas
+/// l'être, au lieu de faire tomber toute la liste.
+///
+/// C'était un `collect::<Result<Vec<_>, _>>()` : une seule collection dont
+/// la lecture des albums échouait rendait `500` pour la liste entière, et
+/// l'écran Collections restait vide — y compris pour le dossier qu'on venait
+/// de créer. Le dossier fautif est journalisé avec son identifiant. Si AUCUN
+/// dossier ne peut être servi alors qu'il y en a, c'est la base qui ne répond
+/// pas : l'erreur est rendue telle quelle plutôt qu'une liste vide qui
+/// mentirait.
+fn servir_en_ecartant(
+    collections: &[Value],
+    servir: impl Fn(&Value) -> Result<Value, AppError>,
+) -> Result<Vec<Value>, AppError> {
+    let mut servis = Vec::with_capacity(collections.len());
+    let mut premiere_erreur = None;
+    for collection in collections {
+        match servir(collection) {
+            Ok(servi) => servis.push(servi),
+            Err(e) => {
+                tracing::error!(
+                    "dossier {:?} écarté de la liste: {} (#7335)",
+                    collection.get("id"),
+                    e.message
+                );
+                premiere_erreur.get_or_insert(e);
+            }
+        }
+    }
+    match premiere_erreur {
+        Some(e) if servis.is_empty() => Err(e),
+        _ => Ok(servis),
     }
 }
 
@@ -365,9 +452,7 @@ pub(super) async fn list_collections(
     let servis = super::facets::hors_executeur("list_collections", move || {
         let data = dossiers_stockes(&state);
         let album_repo = AlbumRepo::with_backend(state.backend.clone());
-        data.iter()
-            .map(|c| dossier_servi(&album_repo, c))
-            .collect::<Result<Vec<Value>, AppError>>()
+        servir_en_ecartant(&data, |c| dossier_servi(&album_repo, c))
     })
     .await??;
     Ok(Json(json!(servis)))
@@ -379,12 +464,7 @@ pub(super) async fn create_collection(
 ) -> Result<impl IntoResponse, AppError> {
     verifier_couleur(&body.color)?;
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let mut collections: Vec<Value> = settings
-        .get("collections")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut collections: Vec<Value> = dossiers_a_reecrire(&settings)?;
 
     let id = collections
         .iter()
@@ -403,9 +483,7 @@ pub(super) async fn create_collection(
         "created_at": now_iso_utc(),
     });
     collections.push(collection.clone());
-    settings
-        .set("collections", &serde_json::to_string(&collections)?)
-        .ok();
+    ecrire_dossiers(&settings, &collections, "création")?;
 
     Ok((StatusCode::CREATED, Json(collection)))
 }
@@ -448,12 +526,7 @@ pub(super) async fn update_collection(
 ) -> Result<impl IntoResponse, AppError> {
     verifier_couleur(&body.color)?;
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let mut collections: Vec<Value> = settings
-        .get("collections")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut collections: Vec<Value> = dossiers_a_reecrire(&settings)?;
     let found = collections
         .iter_mut()
         .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(id));
@@ -476,9 +549,7 @@ pub(super) async fn update_collection(
         obj.insert("color".into(), json!(color));
     }
     let mise_a_jour = collection.clone();
-    settings
-        .set("collections", &serde_json::to_string(&collections)?)
-        .ok();
+    ecrire_dossiers(&settings, &collections, "modification")?;
     Ok(Json(mise_a_jour))
 }
 
@@ -487,20 +558,13 @@ pub(super) async fn delete_collection(
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let mut collections: Vec<Value> = settings
-        .get("collections")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut collections: Vec<Value> = dossiers_a_reecrire(&settings)?;
     let before = collections.len();
     collections.retain(|c| c.get("id").and_then(|v| v.as_i64()) != Some(id));
     if collections.len() == before {
         return Err(AppError::not_found("collection not found"));
     }
-    settings
-        .set("collections", &serde_json::to_string(&collections)?)
-        .ok();
+    ecrire_dossiers(&settings, &collections, "suppression")?;
     // #4853 — l'id d'un dossier est `max + 1`, donc réutilisé : sans ceci, la
     // collection créée ensuite hériterait du rangement de celle-ci.
     super::collection_folders::oublier_collection_simple(&state, id);
@@ -627,12 +691,7 @@ pub(super) async fn add_album_to_collection(
     Path(path): Path<CollectionAlbumPath>,
 ) -> Result<impl IntoResponse, AppError> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let mut collections: Vec<Value> = settings
-        .get("collections")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut collections: Vec<Value> = dossiers_a_reecrire(&settings)?;
     let found = collections
         .iter_mut()
         .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(path.id));
@@ -684,9 +743,7 @@ pub(super) async fn add_album_to_collection(
             obj.insert(ETIQUETTES.into(), Value::Object(etiquettes));
         }
     }
-    settings
-        .set("collections", &serde_json::to_string(&collections)?)
-        .ok();
+    ecrire_dossiers(&settings, &collections, "rangement d'un album")?;
     Ok(Json(json!({
         "added": true,
         "collection_id": path.id,
@@ -840,12 +897,7 @@ pub(super) async fn remove_album_from_collection(
     Path(path): Path<CollectionAlbumPath>,
 ) -> Result<impl IntoResponse, AppError> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let mut collections: Vec<Value> = settings
-        .get("collections")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut collections: Vec<Value> = dossiers_a_reecrire(&settings)?;
     let found = collections
         .iter_mut()
         .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(path.id));
@@ -866,10 +918,12 @@ pub(super) async fn remove_album_from_collection(
     {
         etiquettes.remove(&path.album_id.to_string());
     }
-    settings
-        .set("collections", &serde_json::to_string(&collections)?)
-        .ok();
+    ecrire_dossiers(&settings, &collections, "retrait d'un album")?;
     Ok(Json(
         json!({"removed": true, "collection_id": path.id, "album_id": path.album_id}),
     ))
 }
+
+#[cfg(test)]
+#[path = "collections_liste_7335_tests.rs"]
+mod collections_liste_7335_tests;

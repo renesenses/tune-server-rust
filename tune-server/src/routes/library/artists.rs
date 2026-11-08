@@ -11,7 +11,7 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
 
-use super::{api_cache_get, api_cache_set, artwork_cache_dir, now_iso_utc};
+use super::{api_cache_get, api_cache_get_ttl, api_cache_set, artwork_cache_dir, now_iso_utc};
 
 #[derive(Deserialize)]
 pub(super) struct LangQuery {
@@ -393,6 +393,7 @@ pub(super) async fn artist_bio(
     };
     let lang = langue_demandee(q.lang.as_deref(), &headers);
     let lang = lang.as_str();
+    memoriser_langue_pour_bio_sync(&state.backend, q.lang.as_deref(), &headers);
 
     // Prefer a locally-enriched bio (with provenance/attribution) over the
     // community proxy — this surfaces the sourced Wikipedia/Last.fm/Qobuz/
@@ -407,11 +408,19 @@ pub(super) async fn artist_bio(
     // `lang_from_header`) : une bibliothèque enrichie depuis une interface en
     // français stocke tout en français, et le sert ensuite à tout le monde.
     // C'est exactement ce que voit Dimitri.
-    let prov = repo.bio_provenance(id).ok().flatten();
-    let bio_lang = prov
-        .as_ref()
-        .and_then(|p| p.get("lang").and_then(|v| v.as_str()));
-    let stored_ok = langue_convient(bio_lang, lang);
+    // #7027 : une provenance absente veut dire « écrite à la main » et reste
+    // servie. Une erreur de lecture n'est pas une absence : la langue est
+    // alors inconnue, et la bio stockée ne passe pas pour celle demandée.
+    let (prov, stored_ok) = match repo.bio_provenance(id) {
+        Ok(prov) => {
+            let ok = bio_stockee_convient(prov.as_ref(), lang);
+            (prov, ok)
+        }
+        Err(e) => {
+            tracing::warn!(id, error = %e, "artist_bio_provenance_illisible");
+            (None, false)
+        }
+    };
 
     if let Some(ref bio) = artist.bio
         && !bio.is_empty()
@@ -428,10 +437,22 @@ pub(super) async fn artist_bio(
     // MusicBrainz id required, so it works for the whole library, most of which
     // has no MBID. Mirrors the album path.
     let cache_key = format!("cache:artistbio:{}:{lang}", artist.name);
-    if let Some(cached) = api_cache_get(&state.backend, &cache_key) {
+    // #7027 : une entrée de cache dans une autre langue (rangée sous `:{lang}`
+    // avant que la réponse du site ne soit contrôlée) n'est plus resservie.
+    if let Some(cached) = api_cache_get(&state.backend, &cache_key)
+        && reponse_dans_la_langue(&cached, lang)
+    {
         return Json(cached).into_response();
     }
-    match state
+    // Un repli (autre langue) déjà rendu il y a moins d'une heure : le site n'est
+    // pas rappelé à chaque ouverture de la fiche.
+    let cle_repli = cle_du_repli(&cache_key);
+    if let Some(cached) = api_cache_get_ttl(&state.backend, &cle_repli, TTL_REPLI_SECS)
+        && a_une_bio(&cached)
+    {
+        return Json(cached).into_response();
+    }
+    let reponse_du_site = state
         .http_client
         .get("https://mozaiklabs.fr/api/v1/artists/bio")
         // `lang` est transmis au site, qui ne le recevait pas : il ne servait
@@ -441,17 +462,49 @@ pub(super) async fn artist_bio(
         // vérifier là-bas avant d'annoncer #1849 comme réglé.
         .query(&[("name", artist.name.as_str()), ("lang", lang)])
         .send()
-        .await
-    {
+        .await;
+    let reponse_du_site = match reponse_du_site {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
-            let out = reponse_du_proxy("artist", &artist.name, &data);
-            if out.get("bio").map(|b| !b.is_null()).unwrap_or(false) {
-                api_cache_set(&state.backend, &cache_key, &out);
-            }
+            Some(reponse_du_proxy("artist", &artist.name, &data))
+        }
+        _ => None,
+    };
+    // #8022 : le site n'a rien dans la langue demandée — le texte Qobuz, pour
+    // un compte connecté et une correspondance sûre, avant tout repli.
+    let du_service = if site_dans_la_langue(reponse_du_site.as_ref(), lang) {
+        None
+    } else {
+        super::editorial_service::bio_d_artiste(&state, &artist)
+            .await
+            .map(|e| super::editorial_service::corps("artist", &artist.name, &e))
+    };
+    let autre_langue = bio_stockee_dans_une_autre_langue(
+        "artist",
+        &artist.name,
+        artist.bio.as_deref(),
+        prov.as_ref(),
+        lang,
+    );
+    match choisir_apres_le_site_et_le_service(
+        "artist",
+        &artist.name,
+        lang,
+        reponse_du_site,
+        du_service,
+        autre_langue,
+        artist.bio.as_deref(),
+        prov.as_ref(),
+    ) {
+        Issue::DansLaLangue(out) => {
+            api_cache_set(&state.backend, &cache_key, &out);
             Json(out).into_response()
         }
-        _ => repli_sur_la_bio_stockee(&artist.name, artist.bio.as_deref(), prov),
+        Issue::Repli(out) => {
+            api_cache_set(&state.backend, &cle_repli, &out);
+            Json(out).into_response()
+        }
+        Issue::Vide(out) => Json(out).into_response(),
     }
 }
 
@@ -528,21 +581,57 @@ pub(super) fn langue_demandee(param: Option<&str>, headers: &HeaderMap) -> Strin
     crate::i18n::lang_from_request(param, headers)
 }
 
+/// La langue que la requête DONNE explicitement : `?lang=` non vide, ou un
+/// `Accept-Language` présent, lisible et nommant une langue servie. Le repli
+/// `i18n::FALLBACK` (aucune information) n'est PAS une langue donnée : il ne
+/// doit jamais alimenter `bio_langue`.
+pub(super) fn langue_explicite(param: Option<&str>, headers: &HeaderMap) -> Option<String> {
+    let param_donne = param.is_some_and(|p| !p.trim().is_empty());
+    let entete_donne = headers
+        .get(axum::http::header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| {
+            crate::i18n::langues_acceptees(s)
+                .iter()
+                .any(|b| crate::i18n::SUPPORTED.contains(&b.as_str()))
+        });
+    (param_donne || entete_donne).then(|| langue_demandee(param, headers))
+}
+
+/// Mémorise la dernière langue d'interface EXPLICITE vue pour
+/// `cloud::bio_sync` (réglage `bio_langue`), sans retarder la réponse :
+/// lecture + écriture éventuelle sur un thread bloquant, jamais attendues.
+pub(super) fn memoriser_langue_pour_bio_sync(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    param: Option<&str>,
+    headers: &HeaderMap,
+) {
+    let Some(lang) = langue_explicite(param, headers) else {
+        return;
+    };
+    let backend = backend.clone();
+    tokio::task::spawn_blocking(move || {
+        let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend);
+        tune_core::cloud::bio_sync::memoriser_langue_interface(&settings, &lang);
+    });
+}
+
 /// La langue d'une bio stockée convient-elle à celle qu'on demande ?
 ///
 /// Comparaison sur la base seule : `fr` et `fr-FR` désignent la même chose, et
 /// une bio Wikipédia française n'est pas moins française parce qu'un client
 /// annonce `fr-CA`.
 ///
-/// ⚠️ Une langue INCONNUE — colonne vide sur une ligne ancienne — est acceptée.
-/// C'est délibéré : refuser déclencherait un appel réseau pour chaque artiste
-/// dont la provenance n'a jamais été renseignée, à la première ouverture de
-/// chaque fiche. On ne dispose d'aucune preuve que ces bios soient dans la
-/// mauvaise langue ; un ré-enrichissement renseignera `bio_lang` et la
-/// comparaison redeviendra exacte.
+/// Une langue INCONNUE — colonne vide ou NULL — ne convient à AUCUNE demande
+/// (#7027). #2126 l'acceptait, sur l'idée qu'aucune écriture récente ne
+/// laissait la langue vide. C'est faux : la bio éditoriale d'un service de
+/// streaming (`tune-streaming-http`, fiche artiste d'un service) et le fonds
+/// communautaire (`cloud::bio_sync`) rangent des bios sans langue, souvent en
+/// français. Une interface anglaise recevait alors du français, présenté sans
+/// langue. Le prix est un passage par le cache ou le site pour ces bios.
 pub(super) fn langue_convient(stockee: Option<&str>, demandee: &str) -> bool {
     let Some(stockee) = stockee.map(str::trim).filter(|s| !s.is_empty()) else {
-        return true;
+        return false;
     };
     let base = |s: &str| {
         s.split(['-', '_'])
@@ -553,26 +642,239 @@ pub(super) fn langue_convient(stockee: Option<&str>, demandee: &str) -> bool {
     base(stockee) == base(demandee)
 }
 
-/// Ressert la bio stockée quand la langue demandée n'a rien donné.
+/// La bio stockée peut-elle être servie à la langue demandée ?
 ///
-/// « Une biographie en français vaut mieux qu'un panneau vide » — le ticket le
-/// dit, et c'est juste : refuser une bio dans la mauvaise langue serait
-/// remplacer un défaut par un pire. La provenance part avec elle, donc le
-/// client sait dans quelle langue elle est et peut le signaler.
-fn repli_sur_la_bio_stockee(
+/// - Sans provenance (`bio_source` nul) : c'est un texte écrit à la main dans
+///   la fiche, qui efface la provenance (`oublier_provenance_si_bio_reecrite`).
+///   Il est servi tel quel : c'est le texte de l'utilisateur, et aucune source
+///   ne peut le remplacer.
+/// - Avec provenance : sa langue doit être connue et convenir
+///   ([`langue_convient`]). Une source sans langue (bio éditoriale d'un
+///   service de streaming, fonds communautaire) ne convient plus (#7027).
+pub(super) fn bio_stockee_convient(prov: Option<&Value>, demandee: &str) -> bool {
+    match prov {
+        None => true,
+        Some(p) => langue_convient(p.get("lang").and_then(Value::as_str), demandee),
+    }
+}
+
+/// La réponse du site, ou une entrée de cache, est-elle dans la langue
+/// demandée (#7027) ?
+///
+/// Elle porte sa langue dans `bio_provenance.lang` (cf. [`reponse_du_proxy`]).
+/// Une langue annoncée et différente est refusée : sinon le français rendu par
+/// le site était rangé 24 h sous la clé anglaise. Une réponse qui n'annonce
+/// aucune langue est acceptée : le site a reçu `lang` et rien ne dit qu'il l'a
+/// ignoré.
+pub(super) fn reponse_dans_la_langue(reponse: &Value, demandee: &str) -> bool {
+    match reponse
+        .pointer("/bio_provenance/lang")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(langue) => langue_convient(Some(langue), demandee),
+        None => true,
+    }
+}
+
+/// Le corps porte-t-il une bio non vide ?
+pub(super) fn a_une_bio(reponse: &Value) -> bool {
+    reponse
+        .get("bio")
+        .and_then(Value::as_str)
+        .is_some_and(|b| !b.trim().is_empty())
+}
+
+/// Durée de vie du repli dans une autre langue : une heure, contre 24 h pour
+/// une bio dans la langue demandée. Un repli (le français quand le site n'a
+/// pas d'anglais) est rangé sous une clé DISTINCTE `…:{lang}:repli` : il ne
+/// fige donc jamais la clé `:{lang}`, et une bio anglaise qui apparaît ensuite
+/// sur le site est reprise au plus tard une heure après (#7027).
+pub(super) const TTL_REPLI_SECS: i64 = 3600;
+
+pub(super) fn cle_du_repli(cle_cache: &str) -> String {
+    format!("{cle_cache}:repli")
+}
+
+/// Ce que la route rend après avoir interrogé le site.
+pub(super) enum Issue {
+    /// Une bio dans la langue demandée : rendue et rangée 24 h sous `:{lang}`.
+    DansLaLangue(Value),
+    /// Une bio dans une AUTRE langue connue, avec `repli` : rendue et rangée
+    /// une heure sous la clé du repli.
+    Repli(Value),
+    /// Rien d'utilisable : `bio` nul (et `repli` si un texte existe).
+    Vide(Value),
+}
+
+/// Ajoute `repli: {raison, langue_demandee, langue_disponible}` à un corps qui
+/// porte une bio dans une AUTRE langue. `langue_disponible` est la langue
+/// réellement servie.
+pub(super) fn avec_repli(mut corps: Value, demandee: &str, servie: &str) -> Value {
+    corps["repli"] = json!({
+        "raison": "langue_indisponible",
+        "langue_demandee": demandee,
+        "langue_disponible": servie,
+    });
+    corps
+}
+
+fn langue_annoncee(reponse: &Value) -> Option<String> {
+    reponse
+        .pointer("/bio_provenance/lang")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// La bio stockée, si sa langue est CONNUE et différente de la demandée, sous
+/// la forme du corps rendu pour une bio stockée, avec son `repli`. Une bio sans
+/// langue (ou sans provenance) n'est jamais un repli : on ne sait pas dans
+/// quelle langue elle est, et c'est le défaut de #7027 de la présenter comme
+/// celle de l'interface. Elle reste écartée, et `sans_bio_dans_la_langue` dit
+/// qu'elle existe (`langue_disponible` nul).
+pub(super) fn bio_stockee_dans_une_autre_langue(
+    cle: &str,
     nom: &str,
     bio: Option<&str>,
-    prov: Option<Value>,
-) -> axum::response::Response {
-    match bio.filter(|b| !b.is_empty()) {
-        Some(b) => Json(json!({
-            "artist": nom,
-            "bio": b,
-            "bio_provenance": prov,
-        }))
-        .into_response(),
-        None => Json(json!({"artist": nom, "bio": null})).into_response(),
+    prov: Option<&Value>,
+    demandee: &str,
+) -> Option<Value> {
+    let bio = bio.filter(|b| !b.trim().is_empty())?;
+    let prov = prov?;
+    let langue = prov
+        .get("lang")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    if langue_convient(Some(langue), demandee) {
+        return None;
     }
+    let mut corps = json!({ cle: nom, "bio": bio, "bio_provenance": prov });
+    if cle == "album" {
+        corps["source"] = prov.get("source").cloned().unwrap_or(Value::Null);
+    }
+    Some(avec_repli(corps, demandee, langue))
+}
+
+/// Ordre de préférence une fois la bio stockée, puis le cache, écartés :
+/// (b) la réponse du site dans la langue demandée ; (c) à défaut une bio dans
+/// une autre langue CONNUE, la stockée d'abord, puis celle du site, servie avec
+/// sa vraie langue (`bio_provenance.lang`) et `repli` ; (d) rien (voir
+/// [`bio_stockee_dans_une_autre_langue`] pour les bios sans langue).
+// Les routes passent par `choisir_apres_le_site_et_le_service` (#8022) ;
+// cette forme sans service reste pour les témoins de #7027.
+#[cfg(test)]
+pub(super) fn choisir_apres_le_site(
+    cle: &str,
+    nom: &str,
+    demandee: &str,
+    site: Option<Value>,
+    autre_langue_stockee: Option<Value>,
+    bio_stockee: Option<&str>,
+    prov: Option<&Value>,
+) -> Issue {
+    choisir_apres_le_site_et_le_service(
+        cle,
+        nom,
+        demandee,
+        site,
+        None,
+        autre_langue_stockee,
+        bio_stockee,
+        prov,
+    )
+}
+
+/// Le site a-t-il rendu une bio dans la langue demandée ? Sinon, le service
+/// de streaming connecté est interrogé (#8022).
+pub(super) fn site_dans_la_langue(site: Option<&Value>, demandee: &str) -> bool {
+    site.is_some_and(|out| a_une_bio(out) && reponse_dans_la_langue(out, demandee))
+}
+
+/// [`choisir_apres_le_site`], avec le texte éditorial d'un service de
+/// streaming connecté (#8022, `service`, déjà sous la forme d'un corps de
+/// réponse) inséré dans l'ordre : (a) site dans la langue ; (b) service dans
+/// la langue ; (c) bio stockée dans une autre langue connue ; (d) site dans
+/// une autre langue ; (e) service dans une autre langue ; (f) rien.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn choisir_apres_le_site_et_le_service(
+    cle: &str,
+    nom: &str,
+    demandee: &str,
+    site: Option<Value>,
+    service: Option<Value>,
+    autre_langue_stockee: Option<Value>,
+    bio_stockee: Option<&str>,
+    prov: Option<&Value>,
+) -> Issue {
+    let site = site.filter(a_une_bio);
+    if let Some(out) = &site
+        && reponse_dans_la_langue(out, demandee)
+    {
+        return Issue::DansLaLangue(out.clone());
+    }
+    let service = service.filter(a_une_bio);
+    if let Some(out) = &service
+        && reponse_dans_la_langue(out, demandee)
+    {
+        return Issue::DansLaLangue(out.clone());
+    }
+    if let Some(corps) = autre_langue_stockee {
+        return Issue::Repli(corps);
+    }
+    if let Some(out) = site
+        && let Some(langue) = langue_annoncee(&out)
+    {
+        return Issue::Repli(avec_repli(out, demandee, &langue));
+    }
+    if let Some(out) = service
+        && let Some(langue) = langue_annoncee(&out)
+    {
+        return Issue::Repli(avec_repli(out, demandee, &langue));
+    }
+    Issue::Vide(sans_bio_dans_la_langue(
+        cle,
+        nom,
+        demandee,
+        bio_stockee,
+        prov,
+    ))
+}
+
+/// Le corps rendu quand aucune bio n'existe dans la langue demandée (#7027).
+///
+/// Avant, le repli ressortait la bio stockée quelle que soit sa langue : une
+/// interface anglaise recevait du français dans `bio`, au même titre qu'une
+/// bio anglaise. Désormais `bio` reste nul et, si une bio existe dans une
+/// autre langue (ou une langue inconnue), `repli` le dit :
+/// `{raison: "langue_indisponible", langue_demandee, langue_disponible}`.
+/// `langue_disponible` est nul quand la langue de la bio stockée est inconnue.
+/// Le texte lui-même n'est pas rendu : rien ne peut le présenter comme la
+/// bonne langue.
+pub(super) fn sans_bio_dans_la_langue(
+    cle: &str,
+    nom: &str,
+    demandee: &str,
+    bio_stockee: Option<&str>,
+    prov: Option<&Value>,
+) -> Value {
+    let mut out = json!({ cle: nom, "bio": null });
+    if bio_stockee.is_some_and(|b| !b.trim().is_empty()) {
+        let disponible = prov
+            .and_then(|p| p.get("lang"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        out["repli"] = json!({
+            "raison": "langue_indisponible",
+            "langue_demandee": demandee,
+            "langue_disponible": disponible,
+        });
+    }
+    out
 }
 
 // ── #6555 — les similaires d'un artiste de la BIBLIOTHÈQUE (fil 2341) ──────
@@ -747,12 +1049,15 @@ pub(super) async fn artist_albums(
         tracing::warn!(error = %e, "types_secondaires_par_album a échoué — fiche sans section Live");
         Default::default()
     });
+    // #7725 — `max_channels` de chaque album, pour le filtre Multicanal.
+    let canaux = super::albums::canaux_max_par_album(&repo, &ids);
     let items: Vec<(bool, Value)> = items
         .iter()
         .map(|a| {
             let mut v = a.to_json();
             let types = a.id.and_then(|id| secondaires.get(&id));
             if let Some(o) = v.as_object_mut() {
+                super::albums::inserer_max_channels(o, a, &canaux);
                 if let Some(t) = a.id.and_then(|id| deduits.get(&id)) {
                     o.insert("inferred_release_type".into(), json!(t.as_str()));
                 }
@@ -826,7 +1131,18 @@ pub(super) async fn artist_albums(
         }
         let mut albums = albums;
         repo.attacher_added_at(&mut albums);
-        let albums: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
+        let ids: Vec<i64> = albums.iter().filter_map(|a| a.id).collect();
+        let canaux = super::albums::canaux_max_par_album(&repo, &ids);
+        let albums: Vec<Value> = albums
+            .iter()
+            .map(|a| {
+                let mut v = a.to_json();
+                if let Some(o) = v.as_object_mut() {
+                    super::albums::inserer_max_channels(o, a, &canaux);
+                }
+                v
+            })
+            .collect();
         obj.insert(cle.to_string(), json!(albums));
     }
     inserer_sections_de_credits(&repo, &state, id, obj);
@@ -1482,7 +1798,8 @@ mod tests_proxy_bio {
 
 #[cfg(test)]
 mod tests_langue_bio {
-    use super::langue_convient;
+    use super::{Issue, bio_stockee_dans_une_autre_langue, choisir_apres_le_site, langue_convient};
+    use serde_json::{Value, json};
 
     /// Le cas de Dimitri (#1849) : bibliothèque enrichie en français, lecteur
     /// anglophone. La bio stockée ne doit PAS être resservie telle quelle.
@@ -1508,15 +1825,136 @@ mod tests_langue_bio {
         assert!(!langue_convient(Some("fr-FR"), "en-GB"));
     }
 
-    /// Une langue inconnue est ACCEPTÉE, délibérément. Refuser déclencherait un
-    /// appel réseau pour chaque artiste dont la provenance n'a jamais été
-    /// renseignée, à la première ouverture de chaque fiche — et rien ne dit que
-    /// ces bios soient dans la mauvaise langue.
+    /// #7027 : une langue inconnue ne convient à aucune demande. Une bio
+    /// éditoriale de streaming rangée sans langue était servie en français à
+    /// une interface anglaise.
     #[test]
-    fn une_langue_inconnue_est_acceptee() {
-        assert!(langue_convient(None, "en"));
-        assert!(langue_convient(Some(""), "en"));
-        assert!(langue_convient(Some("   "), "en"));
+    fn une_langue_inconnue_ne_convient_a_aucune_demande_7027() {
+        assert!(!langue_convient(None, "en"));
+        assert!(!langue_convient(Some(""), "en"));
+        assert!(!langue_convient(Some("   "), "en"));
+        assert!(!langue_convient(None, "fr"));
+    }
+    fn rep(bio: &str, lang: Option<&str>) -> Value {
+        let mut v = json!({"artist": "A", "bio": bio, "source": "community"});
+        if let Some(l) = lang {
+            v["bio_provenance"] = json!({"source": "community", "lang": l});
+        }
+        v
+    }
+
+    fn stocke_fr() -> Option<Value> {
+        let prov = json!({"source": "wikipedia", "lang": "fr"});
+        bio_stockee_dans_une_autre_langue("artist", "A", Some("Texte fr."), Some(&prov), "en")
+    }
+
+    /// Le site n'a que du français (annoncé `fr`), rien en local : repli français.
+    #[test]
+    fn le_site_n_a_que_du_francais_repli_francais_dit() {
+        let Issue::Repli(out) = choisir_apres_le_site(
+            "artist",
+            "A",
+            "en",
+            Some(rep("Texte fr.", Some("fr"))),
+            None,
+            None,
+            None,
+        ) else {
+            panic!("repli attendu")
+        };
+        assert_eq!(out["bio"], "Texte fr.");
+        assert_eq!(out["bio_provenance"]["lang"], "fr");
+        assert_eq!(out["repli"]["langue_disponible"], "fr");
+        assert_eq!(out["repli"]["langue_demandee"], "en");
+    }
+
+    /// Le site a l'anglais : il est choisi, même si une bio française est stockée.
+    #[test]
+    fn l_anglais_du_site_est_prefere_a_une_bio_stockee_francaise() {
+        let Issue::DansLaLangue(out) = choisir_apres_le_site(
+            "artist",
+            "A",
+            "en",
+            Some(rep("Text.", Some("en"))),
+            stocke_fr(),
+            Some("Texte fr."),
+            None,
+        ) else {
+            panic!("anglais attendu")
+        };
+        assert_eq!(out["bio"], "Text.");
+        assert!(out.get("repli").is_none());
+    }
+
+    /// Site muet : la bio stockée en français connu sert de repli, avec `repli`.
+    #[test]
+    fn site_muet_la_bio_locale_francaise_sert_de_repli() {
+        let Issue::Repli(out) = choisir_apres_le_site(
+            "artist",
+            "A",
+            "en",
+            None,
+            stocke_fr(),
+            Some("Texte fr."),
+            None,
+        ) else {
+            panic!("repli attendu")
+        };
+        assert_eq!(out["bio"], "Texte fr.");
+        assert_eq!(out["repli"]["langue_disponible"], "fr");
+    }
+
+    /// Une bio SANS langue n'est jamais servie : ni comme anglaise, ni en repli.
+    #[test]
+    fn une_bio_sans_langue_n_est_jamais_un_repli() {
+        let prov = json!({"source": "qobuz", "lang": ""});
+        assert!(
+            bio_stockee_dans_une_autre_langue("artist", "A", Some("?"), Some(&prov), "en")
+                .is_none()
+        );
+        let Issue::Vide(out) =
+            choisir_apres_le_site("artist", "A", "en", None, None, Some("?"), Some(&prov))
+        else {
+            panic!("vide attendu")
+        };
+        assert!(out["bio"].is_null());
+        assert!(out["repli"]["langue_disponible"].is_null());
+    }
+
+    /// Bio sans langue en local mais le site, lui, annonce le français : le
+    /// français annoncé sert de repli, la bio sans langue reste écartée.
+    #[test]
+    fn site_francais_annonce_prime_sur_une_bio_locale_sans_langue() {
+        let prov = json!({"source": "qobuz", "lang": ""});
+        let Issue::Repli(out) = choisir_apres_le_site(
+            "artist",
+            "A",
+            "en",
+            Some(rep("Texte fr.", Some("fr"))),
+            None,
+            Some("?"),
+            Some(&prov),
+        ) else {
+            panic!("repli attendu")
+        };
+        assert_eq!(out["bio"], "Texte fr.");
+    }
+
+    /// Interface française : le français du site reste une bio « dans la langue ».
+    #[test]
+    fn interface_francaise_le_francais_du_site_n_est_pas_un_repli() {
+        assert!(matches!(
+            choisir_apres_le_site(
+                "artist",
+                "A",
+                "fr",
+                Some(rep("Texte fr.", Some("fr"))),
+                None,
+                None,
+                None
+            ),
+            Issue::DansLaLangue(_)
+        ));
     }
 }
 

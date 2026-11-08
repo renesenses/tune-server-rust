@@ -142,6 +142,10 @@ pub(super) struct ZonePollState {
     /// que le flux servi était manifestement incomplet (voir
     /// STALL_DECLINE_MAX_TICKS). Remis à zéro à chaque changement de piste.
     pub(super) stall_declines: u8,
+    /// #7418 — tours consécutifs où l'appareil s'est dit `Paused` alors que la
+    /// zone joue : une pause faite sur l'appareil (télécommande WiiM, autre
+    /// entrée). Voir `pause_de_l_appareil_7418`.
+    pub(super) pause_appareil_ticks: u8,
     pub(super) radio_stopped_ticks: u8,
     /// Last position (ms) the renderer reported on the previous radio poll.
     /// An advancing position means the renderer is actually streaming even
@@ -263,6 +267,13 @@ pub(super) struct ZonePollState {
     /// #5522 — octets servis relevés au tour précédent, pour dire si le flux
     /// avance encore (un renderer qui tamponne n'est pas figé).
     pub(super) octets_du_demarrage: Option<u64>,
+    /// #7922 — le temps de la piste en cours réellement rendu : la somme des
+    /// avances de position vues d'un tour à l'autre en lecture. Un
+    /// déplacement ne l'avance pas, contrairement au pic de position.
+    pub(super) tune_tested_rendu_ms: u64,
+    /// #7922 — la position et l'instant du dernier relevé compté ; `None`
+    /// après un déplacement, une pause ou un changement de piste.
+    pub(super) tune_tested_releve: Option<(u64, Instant)>,
 }
 
 impl ZonePollState {
@@ -308,6 +319,7 @@ impl ZonePollState {
             depassement_duree_ticks: 0,
             depassement_duree_signale: false,
             stall_declines: 0,
+            pause_appareil_ticks: 0,
             radio_stopped_ticks: 0,
             last_radio_position_ms: 0,
             last_device_volume: None,
@@ -325,6 +337,8 @@ impl ZonePollState {
             radio_source_annonce: (None, None),
             fige_a_zero_depuis: None,
             octets_du_demarrage: None,
+            tune_tested_rendu_ms: 0,
+            tune_tested_releve: None,
         }
     }
 
@@ -518,6 +532,8 @@ pub(super) enum MotifFin {
     FinNaturelleLocale,
     DsdDlnaPicAtteint,
     HorlogeMuraleSurSondeEnEchec,
+    /// #7700 — « suivant » pressé sur l'appareil DLNA.
+    SuivantDeLAppareil,
 }
 
 #[cfg(test)]
@@ -532,6 +548,7 @@ impl MotifFin {
             MotifFin::FinNaturelleLocale => decisions::motif_fin::FIN_NATURELLE_LOCALE,
             MotifFin::DsdDlnaPicAtteint => decisions::motif_fin::DSD_DLNA_PIC_ATTEINT,
             MotifFin::HorlogeMuraleSurSondeEnEchec => "dlna_poll_failed_wall_clock",
+            MotifFin::SuivantDeLAppareil => decisions::motif_fin::SUIVANT_DE_L_APPAREIL,
         }
     }
 }

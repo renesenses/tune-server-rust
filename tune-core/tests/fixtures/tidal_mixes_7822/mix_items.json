@@ -1,0 +1,22 @@
+{
+  "limit": 100,
+  "offset": 0,
+  "totalNumberOfItems": 2,
+  "items": [
+    {
+      "type": "track",
+      "item": {
+        "id": 900000003,
+        "title": "Eden",
+        "duration": 312,
+        "audioQuality": "LOSSLESS",
+        "artist": {"id": 800000003, "name": "Hania Rani"},
+        "album": {"id": 700000003, "title": "Esja", "cover": "2222-3333"}
+      }
+    },
+    {
+      "type": "video",
+      "item": {"id": 600000001, "title": "Live session", "duration": 240}
+    }
+  ]
+}

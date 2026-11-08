@@ -8,6 +8,7 @@ use crate::db::sqlite::SqliteDb;
 fn album(id: &str, titre: &str, artiste: &str, artiste_id: Option<&str>, an: u32) -> StreamAlbum {
     StreamAlbum {
         ai_generated: None,
+        explicit: None,
         release_type: None,
         id: id.into(),
         title: titre.into(),

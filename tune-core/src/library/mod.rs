@@ -1,6 +1,8 @@
 /// Apparier un titre connu sur la bibliothèque LOCALE (#4716) — le pendant de
 /// `streaming::matching` pour le sens service → bibliothèque.
 pub mod appariement_bibliotheque;
+/// #8077 — compléter un album local depuis Qobuz, sans rien écraser.
+pub mod apports_service;
 /// Les artistes du même label : bibliothèque, puis catalogue Qobuz (#6782).
 pub mod artistes_du_label;
 pub mod artwork;
@@ -23,13 +25,14 @@ pub mod genres_equivalents;
 /// Regrouper les exemplaires d'un même enregistrement entre sources, et
 /// choisir celui qu'on joue (#2264).
 pub mod groupes_versions;
+/// #7089 — les logos de labels pris sur le web ouvert (Commons, Wikipédia,
+/// site officiel, Discogs), après un rapprochement MusicBrainz sûr.
+pub mod images_rapides;
 pub mod importer;
 pub mod ingest;
 pub mod local_path;
 /// Le logo d'un label de la bibliothèque, lu chez Qobuz (#6736).
 pub mod logos_labels;
-/// #7089 — les logos de labels pris sur le web ouvert (Commons, Wikipédia,
-/// site officiel, Discogs), après un rapprochement MusicBrainz sûr.
 pub mod logos_web;
 pub mod lyrics_pass;
 pub mod m3u_parser;
@@ -47,6 +50,8 @@ pub mod quality;
 pub mod regle_compilation;
 /// Où vit la règle de choix des versions : par profil, puis globale (#2264).
 pub mod regle_de_version;
+/// La grammaire de requêtes de la bibliothèque et son compilateur SQL (#7848).
+pub mod requete;
 pub mod smart_collections;
 pub mod track_matcher;
 /// Les exemplaires d'un enregistrement qui sont en base (#2264).

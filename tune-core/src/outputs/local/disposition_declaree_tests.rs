@@ -51,6 +51,7 @@ fn convertir(
         spec: AudioSpec::nouvelle(48_000, ProfondeurPcm::Entier24, 4).expect("spec"),
         sortie: FormatOuvert::new(48_000, sortie),
         needs_resample: false,
+        surechantillonneur: None,
     };
     etage.convertir(entree)
 }
@@ -138,6 +139,7 @@ fn etage_6_vers_6(
         spec: AudioSpec::nouvelle(48_000, ProfondeurPcm::Entier24, 6).expect("spec"),
         sortie: FormatOuvert::new(48_000, 6),
         needs_resample: false,
+        surechantillonneur: None,
     };
     let t = super::Etage::transformations(&etage);
     let rendu = etage.convertir(vec![0.125, 0.25, 0.375, 0.5, 0.625, 0.75]);

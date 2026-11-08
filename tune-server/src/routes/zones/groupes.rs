@@ -32,6 +32,189 @@ pub(super) enum GroupRefusal {
     /// twice to a single device. Both names travel with the refusal so the
     /// message can say *which* zones clash.
     SameOutput(String, String),
+    /// #6132 — deux zones locales de la machine, sous ASIO : le pilote ne
+    /// tient qu'un flux par machine, « une zone à la fois ».
+    AsioOneZoneAtATime(String, String),
+}
+
+/// #6132 — les sorties suiveuses d'un groupe : le meneur est une zone locale,
+/// et CHAQUE autre membre local de la machine (sortie distincte) reçoit le
+/// même flux, corrigé de sa propre dérive. Rend `(zone suiveuse, sortie)`,
+/// dans l'ordre du groupe.
+pub(super) fn choisir_les_sorties_doubles(
+    leader_id: i64,
+    zone_ids: &[i64],
+    zones: &[Zone],
+) -> Vec<(i64, String)> {
+    let local = |id: i64| {
+        zones
+            .iter()
+            .find(|z| z.id == Some(id))
+            .and_then(|z| z.output_device_id.clone())
+            .filter(|d| d.starts_with("local:") && d.len() > "local:".len())
+    };
+    let Some(sortie_meneur) = local(leader_id) else {
+        return Vec::new();
+    };
+    let mut choisies: Vec<(i64, String)> = Vec::new();
+    for id in zone_ids.iter().copied().filter(|id| *id != leader_id) {
+        if let Some(d) = local(id)
+            && d != sortie_meneur
+            && !choisies.iter().any(|(_, c)| *c == d)
+        {
+            choisies.push((id, d));
+        }
+    }
+    choisies
+}
+
+/// #6132 — refuser la sortie double sous ASIO. `backend_meneur` et
+/// `backend_suiveur` sont les backends ouvrables des deux sorties
+/// ([`crate::routes::zones::backend_de_la_sortie_de_la_zone`]).
+pub(super) fn refus_asio(
+    backend_meneur: Option<&str>,
+    backend_suiveur: Option<&str>,
+    nom_meneur: &str,
+    nom_suiveur: &str,
+) -> Option<GroupRefusal> {
+    let asio = |b: Option<&str>| b.is_some_and(|b| b.eq_ignore_ascii_case("asio"));
+    (asio(backend_meneur) || asio(backend_suiveur))
+        .then(|| GroupRefusal::AsioOneZoneAtATime(nom_meneur.to_string(), nom_suiveur.to_string()))
+}
+
+/// Le nom d'une zone, pour un message.
+fn nom_de_zone(zones: &[Zone], id: i64) -> String {
+    zones
+        .iter()
+        .find(|z| z.id == Some(id))
+        .map(|z| z.name.clone())
+        .unwrap_or_else(|| format!("Zone {id}"))
+}
+
+/// Le backend ouvrable d'une sortie locale, et à défaut (sortie pas encore
+/// enregistrée, au démarrage) le backend local réglé pour la machine.
+async fn backend_de_la_sortie(state: &AppState, sortie: Option<&str>) -> Option<String> {
+    if let Some(b) = crate::routes::zones::backend_de_la_sortie_de_la_zone(state, sortie).await {
+        return Some(b);
+    }
+    sortie.filter(|s| s.starts_with("local:"))?;
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get("local_audio_backend")
+        .ok()
+        .flatten()
+}
+
+/// #6132 — choisir les sorties suiveuses du groupe et vérifier qu'ASIO les
+/// permet : une seule zone locale sous ASIO, ni meneuse ni suiveuse.
+async fn sorties_doubles_du_groupe(
+    state: &AppState,
+    leader_id: i64,
+    zone_ids: &[i64],
+    zones: &[Zone],
+) -> Result<Vec<(i64, String)>, GroupRefusal> {
+    let choisies = choisir_les_sorties_doubles(leader_id, zone_ids, zones);
+    if choisies.is_empty() {
+        return Ok(choisies);
+    }
+    let sortie_meneur = zones
+        .iter()
+        .find(|z| z.id == Some(leader_id))
+        .and_then(|z| z.output_device_id.clone());
+    let backend_meneur = backend_de_la_sortie(state, sortie_meneur.as_deref()).await;
+    for (suiveur, sortie) in &choisies {
+        let backend_suiveur = backend_de_la_sortie(state, Some(sortie)).await;
+        if let Some(refus) = refus_asio(
+            backend_meneur.as_deref(),
+            backend_suiveur.as_deref(),
+            &nom_de_zone(zones, leader_id),
+            &nom_de_zone(zones, *suiveur),
+        ) {
+            return Err(refus);
+        }
+    }
+    Ok(choisies)
+}
+
+/// #6132 — poser (ou retirer) le réglage interne que la lecture du meneur
+/// lit, et le dire dans le groupe enregistré.
+fn poser_la_sortie_double(
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    group: &mut Value,
+    leader_id: i64,
+    choisies: Vec<(i64, String)>,
+) {
+    let cle = tune_core::outputs::sortie_double::cle_de_zone(leader_id);
+    if choisies.is_empty() {
+        settings.delete(&cle).ok();
+        if let Some(obj) = group.as_object_mut() {
+            obj.remove("sortie_double");
+        }
+        return;
+    }
+    let sorties: Vec<String> = choisies.iter().map(|(_, s)| s.clone()).collect();
+    settings
+        .set(
+            &cle,
+            &tune_core::outputs::sortie_double::ecrire_la_valeur(&sorties),
+        )
+        .ok();
+    group["sortie_double"] = json!({
+        "suiveurs": choisies
+            .iter()
+            .map(|(id, sortie)| json!({ "zone_id": id, "sortie": sortie }))
+            .collect::<Vec<_>>(),
+    });
+}
+
+/// #6132 — au démarrage : recalculer la sortie double de chaque groupe
+/// enregistré, pour que les groupes faits avant cette version (ou avant
+/// qu'une zone ne change de sortie) jouent ensemble sans geste de
+/// l'utilisateur. Un groupe qu'ASIO interdit perd sa sortie double, sans
+/// être supprimé : il reste un groupe de volume, comme avant.
+pub async fn recalculer_les_sorties_doubles(state: &AppState) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let mut groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if groups.is_empty() {
+        return;
+    }
+    let zones = ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap_or_default();
+    let mut poses = 0usize;
+    for group in groups.iter_mut() {
+        let zone_ids: Vec<i64> = group["zone_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+            .unwrap_or_default();
+        let Some(leader_id) = group["leader_id"]
+            .as_i64()
+            .or_else(|| zone_ids.first().copied())
+        else {
+            continue;
+        };
+        let choisies = match sorties_doubles_du_groupe(state, leader_id, &zone_ids, &zones).await {
+            Ok(choisies) => choisies,
+            Err(refus) => {
+                warn!(?refus, leader_id, "sortie_double_recalcul_refusee");
+                Vec::new()
+            }
+        };
+        poses += usize::from(!choisies.is_empty());
+        poser_la_sortie_double(&settings, group, leader_id, choisies);
+    }
+    if let Ok(texte) = serde_json::to_string(&groups) {
+        settings.set("zone_groups", &texte).ok();
+    }
+    info!(
+        groupes = groups.len(),
+        avec_sortie_double = poses,
+        "sortie_double_recalculee_au_demarrage"
+    );
 }
 
 /// Check a grouping request against the zones that actually exist.
@@ -93,6 +276,13 @@ pub(super) fn group_refusal_response(
             StatusCode::CONFLICT,
             "group_same_output",
             crate::i18n::t(lang, "zonegroup.sameOutput")
+                .replace("{a}", a)
+                .replace("{b}", b),
+        ),
+        GroupRefusal::AsioOneZoneAtATime(a, b) => (
+            StatusCode::CONFLICT,
+            "group_asio_one_zone",
+            crate::i18n::t(lang, "zonegroup.asioOneZone")
                 .replace("{a}", a)
                 .replace("{b}", b),
         ),
@@ -168,6 +358,11 @@ pub(super) async fn create_group(
         .leader_id
         .filter(|id| zone_ids.contains(id))
         .unwrap_or(zone_ids[0]);
+    let sortie_double = match sorties_doubles_du_groupe(&state, leader_id, &zone_ids, &zones).await
+    {
+        Ok(choix) => choix,
+        Err(refusal) => return Ok(group_refusal_response(&refusal, &lang)),
+    };
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
@@ -177,14 +372,64 @@ pub(super) async fn create_group(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let id = groups.len() as i64 + 1;
-    let group = json!({
+    // #7937 — une zone n'appartient qu'à UN groupe : celles du nouveau
+    // quittent les précédents. Sans cela l'ancien groupe survivait au
+    // nouveau (le client web regroupe sans dégrouper d'abord), et défaire
+    // l'un laissait l'autre — le groupe « revenait ».
+    use tune_core::zones::groupes_enregistres::{prochain_numero, retirer_les_zones};
+    // #6132 — un groupe touché perd d'abord sa sortie double : celle de sa
+    // meneuse ne doit pas survivre à un groupe défait. Celui qui reste
+    // (encore deux zones ou plus) la retrouve, recalculée sur sa nouvelle
+    // composition, juste après.
+    let touches: Vec<i64> = groups
+        .iter_mut()
+        .filter(|g| {
+            g["zone_ids"].as_array().is_some_and(|a| {
+                a.iter()
+                    .filter_map(Value::as_i64)
+                    .any(|z| zone_ids.contains(&z))
+            })
+        })
+        .filter_map(|g| {
+            let gid = g.get("id").and_then(Value::as_i64);
+            if g.get("sortie_double").is_some()
+                && let Some(ancien_meneur) = g["leader_id"].as_i64()
+            {
+                poser_la_sortie_double(&settings, g, ancien_meneur, Vec::new());
+            }
+            gid
+        })
+        .collect();
+    retirer_les_zones(&mut groups, &zone_ids);
+    for g in groups.iter_mut().filter(|g| {
+        g.get("id")
+            .and_then(Value::as_i64)
+            .is_some_and(|gid| touches.contains(&gid))
+    }) {
+        let restants: Vec<i64> = g["zone_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_i64).collect())
+            .unwrap_or_default();
+        let Some(meneur) = g["leader_id"]
+            .as_i64()
+            .or_else(|| restants.first().copied())
+        else {
+            continue;
+        };
+        let choix = sorties_doubles_du_groupe(&state, meneur, &restants, &zones)
+            .await
+            .unwrap_or_default();
+        poser_la_sortie_double(&settings, g, meneur, choix);
+    }
+    let id = prochain_numero(&groups);
+    let mut group = json!({
         "id": id,
         "group_id": id.to_string(),
         "name": name,
         "leader_id": leader_id,
         "zone_ids": zone_ids,
     });
+    poser_la_sortie_double(&settings, &mut group, leader_id, sortie_double);
     groups.push(group.clone());
 
     settings
@@ -225,8 +470,10 @@ pub(super) struct GroupVolumeRequest {
 pub(super) async fn patch_group(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<PatchGroup>,
 ) -> Result<impl IntoResponse, AppError> {
+    let lang = crate::i18n::lang_from_header(&headers);
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -244,7 +491,21 @@ pub(super) async fn patch_group(
                 groups[i]["name"] = json!(name);
             }
             if let Some(ref zone_ids) = body.zone_ids {
+                // #6132 — la sortie double suit la composition du groupe.
+                let zones = ZoneRepo::with_backend(state.backend.clone())
+                    .list()
+                    .unwrap_or_default();
+                let leader_id = groups[i]["leader_id"]
+                    .as_i64()
+                    .or_else(|| zone_ids.first().copied())
+                    .unwrap_or_default();
+                let choix =
+                    match sorties_doubles_du_groupe(&state, leader_id, zone_ids, &zones).await {
+                        Ok(choix) => choix,
+                        Err(refusal) => return Ok(group_refusal_response(&refusal, &lang)),
+                    };
                 groups[i]["zone_ids"] = json!(zone_ids);
+                poser_la_sortie_double(&settings, &mut groups[i], leader_id, choix);
             }
             let result = groups[i].clone();
             settings
@@ -398,6 +659,17 @@ pub(super) async fn delete_group(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
+    // #6132 — dégrouper retire la sortie double du meneur.
+    for group in groups
+        .iter_mut()
+        .filter(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id))
+    {
+        if group.get("sortie_double").is_some()
+            && let Some(leader_id) = group["leader_id"].as_i64()
+        {
+            poser_la_sortie_double(&settings, group, leader_id, Vec::new());
+        }
+    }
     groups.retain(|g| g.get("id").and_then(|v| v.as_i64()) != Some(group_id));
     settings
         .set("zone_groups", &serde_json::to_string(&groups)?)

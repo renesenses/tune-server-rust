@@ -74,6 +74,10 @@ impl Banc {
     /// Écrit le fichier et l'inscrit à la bibliothèque, comme le scan.
     fn piste(&mut self, relatif: &str, octets: &[u8], le: SystemTime) {
         self.ecrire(relatif, octets, le);
+        self.inscrire(relatif, octets.len(), le);
+    }
+    /// Inscrit à la bibliothèque un chemin, sans rien écrire sur le disque.
+    fn inscrire(&mut self, relatif: &str, taille: usize, le: SystemTime) {
         let date_scan = le
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -84,7 +88,7 @@ impl Banc {
                 &[
                     &self.suivant,
                     &self.chemin(relatif).to_string_lossy().into_owned(),
-                    &(octets.len() as i64),
+                    &(taille as i64),
                     &date_scan,
                 ],
             )
@@ -101,11 +105,15 @@ impl Banc {
             .unwrap();
     }
     fn auditer(&self, changed_only: bool) -> Etat {
+        self.auditer_en(changed_only, Mode::Complet)
+    }
+    fn auditer_en(&self, changed_only: bool, mode: Mode) -> Etat {
         let mut etat = preparer(
             &self.db,
             &Lancement {
                 resume: false,
                 changed_only,
+                mode,
             },
         )
         .unwrap();
@@ -311,4 +319,114 @@ fn le_rappel_est_eteint_par_defaut_puis_du_apres_l_intervalle() {
     let du_pendant = vue(&banc.db, en_cours).rappel.du;
     ACTIF.store(false, Ordering::Release);
     assert!(!du_pendant, "un audit en cours n'a pas à être rappelé");
+}
+
+/// #7847 — le mode rapide passe par la route et la tâche de fond : il nomme
+/// la trame abîmée, distingue un fichier tronqué, et un audit complet
+/// « fichiers changés seulement » ne reprend jamais ses résultats, qui n'ont
+/// pas vérifié le MD5. Un audit rapide reprend en revanche ceux du complet.
+#[tokio::test]
+async fn le_mode_rapide_nomme_la_trame_et_ne_sert_pas_de_preuve_au_complet() {
+    let _pauses = crate::pauses_de_fond_tests::isoler().await;
+    let mut banc = Banc::new();
+    let le = date(1_700_000_000);
+    let mut altere = flac();
+    let milieu = altere.len() / 2;
+    altere[milieu] ^= 1;
+    banc.piste("sain.flac", &flac(), le);
+    banc.piste("altere.flac", &altere, le);
+    banc.piste("tronque.flac", &tronque(), le);
+    banc.piste("octet.flac", &octet_modifie(), le);
+
+    let rapide = banc.auditer_en(false, Mode::Rapide);
+    assert_eq!(rapide.mode, Mode::Rapide);
+    assert_eq!(
+        rapide.dernier_audit_termine, None,
+        "un audit rapide, sans MD5, a repoussé le rappel"
+    );
+    let rapport = banc.rapport(&rapide);
+    assert_eq!(rapport["sain.flac"].resultat.verdict, Verdict::Sain);
+    assert_eq!(rapport["sain.flac"].mode, Mode::Rapide);
+    let fautif = &rapport["altere.flac"].resultat;
+    assert_eq!(
+        fautif.code, "crc_trame",
+        "trame abîmée ignorée : {fautif:?}"
+    );
+    let lieu = fautif
+        .localisation
+        .as_ref()
+        .expect("trame fautive non nommée");
+    assert!(lieu.octet as usize <= milieu);
+    assert_eq!(rapport["tronque.flac"].resultat.code, "tronque");
+    // Le MD5 de STREAMINFO n'est pas lu en mode rapide.
+    assert_eq!(rapport["octet.flac"].resultat.verdict, Verdict::Sain);
+    let csv = ligne_csv(&rapport["altere.flac"]);
+    assert!(csv.contains("\"rapide\",\"trame\""), "{csv}");
+
+    // Complet « fichiers changés seulement » : rien n'est repris du rapide.
+    let complet = banc.auditer_en(true, Mode::Complet);
+    assert_eq!(
+        complet.reutilises, 0,
+        "un résultat rapide a servi au complet"
+    );
+    let rapport = banc.rapport(&complet);
+    assert_eq!(rapport["octet.flac"].resultat.code, "md5_incorrect");
+
+    // Rapide « fichiers changés seulement » : tout est repris du complet.
+    assert!(complet.dernier_audit_termine.is_some());
+    let reprise = banc.auditer_en(true, Mode::Rapide);
+    assert_eq!(reprise.reutilises, 4);
+    assert_eq!(
+        reprise.dernier_audit_termine, complet.dernier_audit_termine,
+        "le rappel part du dernier audit complet"
+    );
+    assert_eq!(banc.rapport(&reprise)["octet.flac"].mode, Mode::Complet);
+}
+
+/// #8105 — un chemin accentué est enregistré en NFC (le scan normalise), mais
+/// le disque peut porter le NFD : NTFS et ext4 distinguent les deux graphies.
+/// Le fichier présent est trouvé dans les deux sens, et le rapport garde le
+/// chemin enregistré.
+#[tokio::test]
+async fn un_chemin_accentue_est_trouve_en_nfc_comme_en_nfd() {
+    let _pauses = crate::pauses_de_fond_tests::isoler().await;
+    let mut banc = Banc::new();
+    let le = date(1_700_000_000);
+    let nfc = "Beh\u{f6}lder - Album/08 - BEH\u{d6}LDER - I Magus.flac";
+    let nfd = "Beho\u{308}lder - Album/08 - BEHO\u{308}LDER - I Magus.flac";
+    let f = flac();
+    for (dossier, disque, base) in [
+        ("nfc", nfc, nfc),
+        ("disque_nfd", nfd, nfc),
+        ("base_nfd", nfc, nfd),
+    ] {
+        banc.ecrire(&format!("{dossier}/{disque}"), &f, le);
+        banc.inscrire(&format!("{dossier}/{base}"), f.len(), le);
+    }
+    let etat = banc.auditer(false);
+    let lignes = lignes(&banc.db, &etat, 0, 1000, None).unwrap();
+    assert_eq!(lignes.len(), 3);
+    for l in &lignes {
+        assert_eq!(
+            (l.resultat.verdict.clone(), l.resultat.code.as_str()),
+            (Verdict::Sain, "sain"),
+            "fichier présent déclaré introuvable : {} ({:?})",
+            l.chemin.escape_unicode(),
+            l.resultat.erreur
+        );
+        assert_eq!(
+            l.taille,
+            Some(f.len() as u64),
+            "taille non lue : {}",
+            l.chemin
+        );
+    }
+    let base_nfd = banc
+        .chemin(&format!("base_nfd/{nfd}"))
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        lignes.iter().any(|l| l.chemin == base_nfd),
+        "le rapport doit garder le chemin enregistré"
+    );
 }

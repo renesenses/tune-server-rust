@@ -13,6 +13,8 @@ pub mod canaux_de_carte;
 pub mod cd_rip;
 pub mod cloud;
 pub mod cloud_error;
+#[cfg(test)]
+mod compression_tests_7619;
 pub mod connect;
 pub(crate) mod convert_destination;
 pub mod converter;
@@ -24,6 +26,8 @@ pub mod declick;
 mod premium_audio_host;
 /// #6044 — le greffon « Réaffectation des canaux » (`/channel-remap`).
 pub mod reaffectation_canaux;
+/// #7614 — le greffon de suréchantillonnage (`/upsampler`).
+pub mod upsampler;
 pub use tune_streaming_http::deezer_proxy_handler;
 pub mod developer_api;
 pub mod devialet_air;
@@ -63,6 +67,8 @@ mod pochettes_upnp;
 // Retrait d'une bibliotheque UPnP par serveur media (#4624).
 pub mod retrait_upnp;
 pub mod synchronisation_upnp;
+// Titres de démonstration proposés au premier démarrage (#7858).
+pub mod titres_demo;
 // `panne_sql` a demenage dans `tune-http-types` : les caisses de routes
 // extraites (`tune-smart-http`…) l'empruntent aussi, et une caisse extraite ne
 // peut pas dependre de `tune-server` sans fabriquer un cycle.
@@ -73,6 +79,8 @@ pub mod playlist_manager;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
+/// Contrôle parental, étape 1 (#7856).
+pub mod politique_parentale;
 pub mod profil_par_appareil;
 pub mod profiles;
 pub mod radios;
@@ -100,6 +108,7 @@ pub mod sonos;
 pub mod soundcloud;
 pub mod spotify_connect;
 pub mod squeezebox;
+pub mod subsonic;
 // Le transport HTTP des flux ne depend d'aucun etat propre au serveur. Il vit
 // dans une branche soeur du graphe de compilation, tout en gardant le chemin
 // historique `routes::stream_handler` pour les appelants internes et externes.
@@ -128,7 +137,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::state::AppState;
@@ -222,6 +230,41 @@ async fn demo_library(
         "albums": albums,
     }))
     .into_response()
+}
+
+/// Ce que la couche de compression gzip a le droit de compresser — #7619, L5.
+///
+/// Le prédicat par défaut de `tower-http` écarte déjà les images, le SSE, le
+/// gRPC et les corps de moins de 32 octets. Il laissait passer **l'audio** :
+/// `/library/tracks/{id}/audio` (et tout flux servi par ce routeur) était
+/// gzippé dès que le client envoyait `Accept-Encoding: gzip`, ce que fait tout
+/// `fetch()` de navigateur. Compresser du FLAC ou du MP3 coûte du processeur
+/// pour un gain nul, et une réponse partielle (`206`, `Content-Range`) dont on
+/// compresse les octets n'a plus les bornes qu'elle annonce.
+///
+/// Le JSON de la Bibliothèque, lui, reste compressé : c'est l'essentiel du
+/// poids d'une page d'albums.
+pub(crate) fn predicat_de_compression() -> impl tower_http::compression::Predicate {
+    use tower_http::compression::Predicate;
+    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType};
+    DefaultPredicate::new()
+        .and(NotForContentType::const_new("audio/"))
+        .and(NotForContentType::const_new("video/"))
+        .and(NotForContentType::const_new("application/octet-stream"))
+        .and(NotForContentType::const_new("application/ogg"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apple.mpegurl",
+        ))
+        .and(NotForContentType::const_new("application/x-mpegurl"))
+        .and(
+            |status: StatusCode,
+             _: axum::http::Version,
+             headers: &axum::http::HeaderMap,
+             _: &axum::http::Extensions| {
+                status != StatusCode::PARTIAL_CONTENT
+                    && !headers.contains_key(axum::http::header::CONTENT_RANGE)
+            },
+        )
 }
 
 async fn cache_control_middleware(
@@ -522,6 +565,8 @@ pub fn router_with_plugins(
         .nest("/crossfeed", crossfeed::router())
         // #6044 — réaffectation des canaux : préréglages, réglage de zone, règle d'album.
         .nest("/channel-remap", reaffectation_canaux::router())
+        // #7614 — suréchantillonnage : catalogue, test de la machine, réglage de zone.
+        .nest("/upsampler", upsampler::router())
         // #6171 — canaux de la carte d'une zone ASIO.
         .nest("/output-channels", canaux_de_carte::router())
         .nest("/siri", siri::router())
@@ -548,6 +593,8 @@ pub fn router_with_plugins(
         .nest("/smart-ai", smart_ai::router())
         .nest("/ai", ai::router())
         .nest("/developer", developer_api::router())
+        // #7855 — le réglage « Accès Subsonic » et les clés des clients.
+        .nest("/subsonic", subsonic::gestion::router())
         .nest("/skins", skins::router())
         .route(
             "/services/tokens",
@@ -608,6 +655,11 @@ pub fn router_with_plugins(
         });
 
     let api = api
+        // #7856 — sous l'authentification : le profil appelant est connu.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            politique_parentale::filtrer_les_listes,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,
@@ -699,6 +751,12 @@ pub fn router_with_plugins(
         "/agent-tune",
         agent_tune::router_entre_serveurs().with_state(state.clone()),
     );
+    // #7855 — l'API Subsonic / OpenSubsonic. À la RACINE, hors de la couche
+    // d'authentification : un client Subsonic n'a pas de session Tune. Sa
+    // propre garde contrôle le réglage (404 s'il est éteint), la licence et
+    // la clé. Toujours montée : sinon `/rest/…` tomberait dans le repli
+    // statique et répondrait `index.html` en 200.
+    app = app.nest("/rest", subsonic::router_rest(state.clone()));
 
     // Mount all installed skins on /{skin_id}
     for (skin_id, skin_path) in mountable_skins {
@@ -732,11 +790,22 @@ pub fn router_with_plugins(
         }),
     )
     .fallback_service(service_statique_spa(std::path::Path::new(&web_dir)))
+    // Une requête rejouée par le relais ou l'écoute directe n'atteint que les
+    // routes d'écoute : voir `garde_du_relais`. Sur TOUT le routeur, `/stream`
+    // et `/ws` compris, avant tout gestionnaire.
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::garde_du_relais::garde_du_relais,
+    ))
     .layer(axum::middleware::from_fn(zones::textes_signal::avec_langue))
     .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(axum::Extension(contexte_sendspin))
-    .layer(CompressionLayer::new())
-    .layer(CorsLayer::permissive())
+    .layer(CompressionLayer::new().compress_when(predicat_de_compression()))
+    // Contrôle d'origine (`crate::garde_origine`) : une page d'un autre site
+    // ne peut ni changer l'état du serveur, ni lire ses réponses. La couche
+    // CORS est la plus externe : elle répond seule aux préflights.
+    .layer(axum::middleware::from_fn(crate::garde_origine::garde))
+    .layer(crate::garde_origine::couche_cors())
 }
 
 #[cfg(test)]
@@ -1019,6 +1088,9 @@ mod eq_refresh_guard {
         ("_crossfeed", "refresh_zone_crossfeed"),
         ("_audiophile", "apply_audiophile_change"),
         ("_mono_downmix", "refresh_zone_mono_downmix"),
+        // #7614 — le choix du suréchantillonneur ; la sortie ne l'applique
+        // qu'à la frontière de piste suivante, mais elle doit le recevoir.
+        ("_upsampler", "refresh_zone_upsampler"),
     ];
 
     /// REF-T (#2219) : un module de test sorti de son fichier en module enfant

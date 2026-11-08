@@ -99,12 +99,19 @@ pub fn build_track_from_metadata_opts(
         .as_deref()
         .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME);
 
+    // #7933 — même règle que le scan complet (#3179) : ARTIST désigne la
+    // piste, et le MBID d'un invité ne devient pas celui de l'artiste d'album.
+    let artiste_de_piste_tague = crate::scan_import::artiste_de_piste_tague(meta);
+    let meme_artiste = tune_core::db::artist_repo::cle_artiste(album_artist_name)
+        == tune_core::db::artist_repo::cle_artiste(track_artist_name);
+
     let album_artist_mbid = if is_compilation || artiste_d_album_neutre {
         None
     } else {
-        meta.musicbrainz_album_artist_id
+        meta.musicbrainz_album_artist_id.as_deref().or(meta
+            .musicbrainz_artist_id
             .as_deref()
-            .or(meta.musicbrainz_artist_id.as_deref())
+            .filter(|_| meme_artiste))
     };
     let album_artist_entry = match artist_repo.get_or_create(
         album_artist_name,
@@ -144,7 +151,7 @@ pub fn build_track_from_metadata_opts(
     };
     let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
-    let track_artist = if (is_compilation || artiste_d_album_neutre)
+    let track_artist = if (is_compilation || artiste_d_album_neutre || artiste_de_piste_tague)
         && track_artist_name != album_artist_name
     {
         match artist_repo.get_or_create(
@@ -966,6 +973,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                                 ecritures = ecritures.avec_dr_des_rapports_voisins(
                                     meta_entries.iter().map(|(_, m)| m),
                                 );
+                                // #7766 — sœur exacte du scan manuel : les
+                                // crédits des balises, source `balises`.
+                                tune_core::metadata::credits_balises::ecrire_lot(
+                                    &db,
+                                    &meta_entries,
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "auto_scan_extended_metadata_insert_failed");
@@ -1419,8 +1432,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         );
 
         // Import any playlist files (.m3u/.m3u8/.pls) found in the library as
-        // local playlists — same as the manual scan (Bertrand). Idempotent by
-        // playlist name, so the startup scan re-running never duplicates them.
+        // local playlists — same as the manual scan (Bertrand). A file already
+        // imported and unchanged is skipped, even if its playlist was deleted
+        // (#7723), so the startup scan re-running never brings it back.
         let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &music_dirs);
         if pl.playlists_created > 0 {
             event_bus.emit(
@@ -2515,7 +2529,10 @@ pub(crate) fn reimporter_fichier_surveillant(
                     _ => return Err("la relecture des crédits a échoué".to_string()),
                 };
                 tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone())
-                    .set_batch(id, &ext)
+                    .set_batch(id, &ext)?;
+                // #7766 — les crédits des balises, comme les deux scans.
+                tune_core::metadata::credits_balises::ecrire_lot(db, &[(id, ext)]);
+                Ok(())
             })();
             if let Err(e) = metadonnees {
                 tracing::warn!(path = %sf.path, error = %e, "watcher_extended_metadata_failed");
@@ -3614,6 +3631,27 @@ pub(crate) fn ranger_la_piste_du_surveillant(
     rangee
 }
 
+/// #8083 — génération des racines configurées, avancée par chaque geste qui
+/// AJOUTE un dossier de musique (Réglages › Répertoires, `PUT /config`, titres
+/// de démonstration). La boucle du surveillant la compare à chaque tour et
+/// relit alors `music_dirs` : un dossier ajouté est suivi sans redémarrage.
+static GENERATION_DES_RACINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dire au surveillant que `music_dirs` a gagné une racine.
+pub(crate) fn signaler_racines_modifiees() {
+    GENERATION_DES_RACINES.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Les racines configurées, normalisées comme partout ailleurs.
+fn racines_configurees(db: &Arc<dyn DbBackend>) -> Vec<String> {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get("music_dirs")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
 /// `event_bus` est ce qui manquait : le surveillant importait, et ne le disait
 /// a personne. Voir l'emission de `library.updated` en fin de lot.
 pub fn spawn_file_watcher(
@@ -3649,7 +3687,7 @@ pub fn spawn_file_watcher(
 
     // Normalized roots for the delete guard below — same normalization the
     // watcher applies internally.
-    let guard_roots: Vec<String> = music_dirs
+    let mut guard_roots: Vec<String> = music_dirs
         .iter()
         .map(|d| tune_core::scanner::walker::normalize_path(d))
         .filter(|d| !d.is_empty())
@@ -3673,6 +3711,7 @@ pub fn spawn_file_watcher(
         // server looked hung after sqlite_cache_warmed). It must run here,
         // on the blocking thread AFTER the startup scan — never on the
         // startup path.
+        let mut generation_vue = GENERATION_DES_RACINES.load(Ordering::Acquire);
         let mut watcher = match tune_core::scanner::watcher::FileWatcher::new(music_dirs) {
             Ok(w) => w,
             Err(e) => {
@@ -3721,6 +3760,23 @@ pub fn spawn_file_watcher(
                 liveness_tick = liveness_tick.wrapping_add(1);
                 if liveness_tick % 60 == 0 {
                     watcher.ensure_watches();
+                }
+                // #8083 — un dossier ajouté depuis le démarrage : le suivre, et
+                // l'admettre dans la garde des racines du lot.
+                let generation = GENERATION_DES_RACINES.load(Ordering::Acquire);
+                if generation != generation_vue {
+                    generation_vue = generation;
+                    let racines = racines_configurees(&db);
+                    watcher.suivre_les_racines(&racines);
+                    for r in racines
+                        .iter()
+                        .map(|d| tune_core::scanner::walker::normalize_path(d))
+                        .filter(|d| !d.is_empty())
+                    {
+                        if !guard_roots.contains(&r) {
+                            guard_roots.push(r);
+                        }
+                    }
                 }
                 let mut changes = watcher.poll_debounced(
                     std::time::Duration::from_secs(2),
@@ -3927,6 +3983,10 @@ mod scan_au_demarrage_reglage_tests;
 #[cfg(test)]
 #[path = "surveillant_artiste_generique_tests_1881.rs"]
 mod surveillant_artiste_generique_tests_1881;
+
+#[cfg(test)]
+#[path = "surveillant_artiste_de_piste_tests_7933.rs"]
+mod surveillant_artiste_de_piste_tests_7933;
 
 #[cfg(test)]
 #[path = "scan_artiste_montage_tests_6737.rs"]

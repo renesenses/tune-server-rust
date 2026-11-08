@@ -43,7 +43,7 @@ pub fn pseudonyme_serveur(identite: &str) -> String {
     format!("{:x}", hash.finalize())
 }
 
-fn descriptif(valeur: &str) -> Option<String> {
+pub(crate) fn descriptif(valeur: &str) -> Option<String> {
     static IPV4: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}").expect("expression IPv4 constante")
     });
@@ -79,7 +79,7 @@ fn descriptif(valeur: &str) -> Option<String> {
     Some(valeur.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-fn protocole(brut: &str) -> Option<&'static str> {
+pub(crate) fn protocole(brut: &str) -> Option<&'static str> {
     Some(match brut {
         "local" | "alsa" | "asio" | "wasapi" | "coreaudio" => "local",
         "airplay" | "airplay1" => "airplay1",
@@ -238,7 +238,7 @@ impl Observateur {
     }
 }
 
-fn format_valide(format: &FormatObserve) -> bool {
+pub(crate) fn format_valide(format: &FormatObserve) -> bool {
     [
         "pcm", "wav", "aiff", "flac", "alac", "mp3", "aac", "ogg", "opus", "dsd",
     ]

@@ -47,16 +47,18 @@ pub fn router() -> Router<AppState> {
 }
 
 /// GET /library/history/tracks/{id}/plays — how many times this track was
-/// played (non-radio), so the UI can show a play count on a track (Progman,
-/// feature #1056). Matched by title + artist, like the dashboard top tracks.
+/// played, so the UI can show a play count on a track (Progman, feature
+/// #1056). Matched by title + artist. Seules les écoutes de la provenance de
+/// la piste comptent (#7980) : une écoute Qobuz n'est pas une écoute du
+/// fichier local du même nom.
 async fn track_plays(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let track_repo = TrackRepo::with_backend(state.backend.clone());
-    let (title, artist) = match track_repo.get(id) {
-        Ok(Some(t)) => (t.title, t.artist_name),
+    let (title, artist, source) = match track_repo.get(id) {
+        Ok(Some(t)) => (t.title, t.artist_name, t.source),
         _ => return Json(json!({ "track_id": id, "plays": 0 })),
     };
     let plays = HistoryRepo::with_backend(state.backend.clone())
-        .track_plays(&title, artist.as_deref())
+        .track_plays(&title, artist.as_deref(), &source)
         .unwrap_or(0);
     Json(json!({ "track_id": id, "plays": plays }))
 }
@@ -90,12 +92,29 @@ async fn recent_history(
     let (items, total) = repo.recent_paginated(limit, offset).unwrap_or_default();
     let ids: Vec<i64> = items.iter().filter_map(|item| item.id).collect();
     let names = repo.playlist_context_names(&ids).ou_defaut_journalise();
+    // #7769 — le nombre d'écoutes, compté comme la Bibliothèque. Si la base
+    // échoue, la clé n'est pas posée : un zéro dû à une panne se lirait
+    // « jamais jouée » (même choix que `attacher_ecoutes`).
+    let plays = match repo.plays_for_listens(&items) {
+        Ok(plays) => Some(plays),
+        Err(e) => {
+            tracing::error!(error = %e, "ecoutes_de_l_historique_illisibles");
+            None
+        }
+    };
     let items: Vec<Value> = items
         .into_iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(i, item)| {
             let name = item.id.and_then(|id| names.get(&id));
             let mut value = json!(item);
             value["context_name"] = json!(name);
+            if let Some(compte) = plays.as_ref().and_then(|p| p.get(i)) {
+                value["play_count"] = json!(compte);
+            }
+            // #7778 (point 6) : l'album du service, sous la clé que le client
+            // lit déjà sur la file ; `album_ref` reste hors du JSON.
+            value["album_id_service"] = json!(item.album_id_service());
             value
         })
         .collect();
@@ -421,7 +440,16 @@ async fn dashboard(State(state): State<AppState>, Query(p): Query<DashboardParam
     let period = p.period.as_deref().unwrap_or("30d");
     let top_n = p.top_n.unwrap_or(10);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    match repo.full_dashboard(period, p.zone_id, p.profile_id, top_n) {
+    // #7634 — une quinzaine d'agrégats synchrones sur l'historique : hors de
+    // l'exécuteur async, pour ne pas immobiliser un fil de travail pendant
+    // tout le calcul (les autres requêtes de la page attendaient derrière).
+    let (periode, zone_id, profile_id) = (period.to_string(), p.zone_id, p.profile_id);
+    let calcul = tokio::task::spawn_blocking(move || {
+        repo.full_dashboard(&periode, zone_id, profile_id, top_n)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("full_dashboard interrompu : {e}")));
+    match calcul {
         Ok(data) => Json(json!(data)),
         Err(e) => {
             tracing::error!(error = %e, period, "full_dashboard_failed");
@@ -476,6 +504,10 @@ async fn export_csv(
         csv,
     )
 }
+
+#[cfg(test)]
+#[path = "historique_album_de_service_7778_tests.rs"]
+mod historique_album_de_service_7778_tests;
 
 #[cfg(test)]
 #[path = "top_artistes_image_i5165_tests.rs"]

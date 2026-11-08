@@ -151,10 +151,30 @@ fn montage_existant(
 }
 
 async fn create_mount(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<CreateMount>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
+    // Une ligne enregistrée est remontée au démarrage : mêmes règles que le
+    // montage interactif (hôte, partage, identifiants, point sous la racine).
+    if let Err(refus) = verifier_la_demande(
+        &body.server,
+        &body.share,
+        body.username.as_deref(),
+        body.password.as_deref(),
+    ) {
+        return refus;
+    }
+    if !smb::est_confine(
+        std::path::Path::new(&body.mount_path),
+        &racines_des_montages(&state),
+    ) {
+        return montage_refuse(
+            "mount_point_outside_root",
+            "The mount point is outside the server's mount directory.",
+        );
+    }
     let mount_type = body.mount_type.unwrap_or_else(|| "smb".into());
     if let Some(id) = montage_existant(
         &state.backend,
@@ -177,7 +197,11 @@ async fn create_mount(
     }
 }
 
-async fn delete_mount(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+async fn delete_mount(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
     let p1 = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
         "$1".to_string()
@@ -296,8 +320,14 @@ async fn oublier_un_partage(
     }
 
     let chemin = std::path::Path::new(&mount_path);
+    // Seul un point sous une racine du serveur se démonte ou se retire : une
+    // ligne qui nommerait un autre chemin est oubliée sans toucher au système.
+    let confine = smb::est_confine(chemin, &racines_des_montages(&state));
+    if !confine {
+        warn!(id, path = %mount_path, "smb_oubli_point_hors_racine");
+    }
     let mut demonte = false;
-    if smb::est_un_point_de_montage(chemin) {
+    if confine && smb::est_un_point_de_montage(chemin) {
         // Hors root (Tune OS sous `tune`, #3206) : par l'assistant, via sudo.
         let res = tokio::time::timeout(
             Duration::from_secs(15),
@@ -348,7 +378,7 @@ async fn oublier_un_partage(
             .into_response();
     }
     // `remove_dir` ne retire qu'un dossier VIDE : jamais de la musique.
-    if !smb::est_un_point_de_montage(chemin) {
+    if confine && !smb::est_un_point_de_montage(chemin) {
         let _ = std::fs::remove_dir(chemin);
     }
     // Les racines ne partent qu'APRES le demontage et la suppression reussis :
@@ -1125,23 +1155,89 @@ fn dossier_de_donnees_du_serveur(db_path: &str) -> std::path::PathBuf {
     )
 }
 
+/// Variable d'environnement (exploitant seulement) qui remplace la racine
+/// principale des points de montage SMB.
+pub const VARIABLE_RACINE_DES_MONTAGES: &str = "TUNE_SMB_MOUNT_ROOT";
+
+/// La racine principale des points de montage de ce serveur.
+fn racine_principale_des_montages(state: &AppState) -> std::path::PathBuf {
+    if let Some(r) = std::env::var_os(VARIABLE_RACINE_DES_MONTAGES)
+        .map(std::path::PathBuf::from)
+        .filter(|r| r.is_absolute())
+    {
+        return r;
+    }
+    racine_des_montages(
+        crate::chemins_de_donnees::Plateforme::courante(),
+        std::env::var_os("HOME").as_deref(),
+        &dossier_de_donnees_du_serveur(&state.config.db_path),
+    )
+}
+
+/// Les SEULES racines sous lesquelles un partage SMB se monte ou se démonte :
+/// la principale et son repli sous les données (#6345). Un point de montage
+/// est toujours un enfant direct de l'une d'elles (`smb::est_confine`).
+pub(crate) fn racines_des_montages(state: &AppState) -> Vec<std::path::PathBuf> {
+    vec![
+        racine_principale_des_montages(state),
+        racine_de_repli_des_montages(&dossier_de_donnees_du_serveur(&state.config.db_path)),
+    ]
+}
+
+/// `400` d'une demande de montage refusée, avec son code.
+fn montage_refuse(code: &str, message: &str) -> axum::response::Response {
+    warn!(code, "smb_mount_refuse");
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": code, "message": message })),
+    )
+        .into_response()
+}
+
+/// Les entrées d'une demande de montage : hôte, partage, identifiants.
+fn verifier_la_demande(
+    host: &str,
+    share: &str,
+    user: Option<&str>,
+    pass: Option<&str>,
+) -> Result<(), axum::response::Response> {
+    smb::verifier_hote(host).map_err(|m| montage_refuse("invalid_host", m))?;
+    smb::verifier_partage(share).map_err(|m| montage_refuse("invalid_share", m))?;
+    smb::verifier_identifiants(user.unwrap_or(""), pass.unwrap_or(""))
+        .map_err(|m| montage_refuse("invalid_credentials", m))?;
+    Ok(())
+}
+
+/// `POST /network/smb/mount`.
+///
+/// Le point de montage est TOUJOURS choisi par le serveur : un enfant direct
+/// de [`racines_des_montages`], nommé d'après l'hôte et le partage
+/// ([`smb::nom_du_point`]). Une demande qui porte `mount_path` est refusée.
 async fn mount_smb_share(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<MountRequest>,
 ) -> impl IntoResponse {
-    let share_safe = body.share_name.replace(['/', '\\', ' '], "_");
-    let chemin_impose = body.mount_path.is_some();
-    let nom_du_point = format!("{}_{}", body.host, share_safe);
-    let mut mount_path = body.mount_path.clone().unwrap_or_else(|| {
-        racine_des_montages(
-            crate::chemins_de_donnees::Plateforme::courante(),
-            std::env::var_os("HOME").as_deref(),
-            &dossier_de_donnees_du_serveur(&state.config.db_path),
-        )
+    if body.mount_path.is_some() {
+        return montage_refuse(
+            "mount_path_not_allowed",
+            "The mount point is chosen by the server.",
+        );
+    }
+    if let Err(refus) = verifier_la_demande(
+        &body.host,
+        &body.share_name,
+        body.username.as_deref(),
+        body.password.as_deref(),
+    ) {
+        return refus;
+    }
+    let racines = racines_des_montages(&state);
+    let nom_du_point = smb::nom_du_point(&body.host, &body.share_name);
+    let mut mount_path = racine_principale_des_montages(&state)
         .join(&nom_du_point)
         .to_string_lossy()
-        .into_owned()
-    });
+        .into_owned();
 
     // Dry run: just test reachability without mounting
     if body.dry_run {
@@ -1180,7 +1276,7 @@ async fn mount_smb_share(
     // celui de l'utilisateur.
     let mut ligne_cible = None;
     let mut serveur_du_jumeau = None;
-    if !chemin_impose {
+    {
         let lignes = lignes_smb(&state.backend);
         if let Some(j) = jumeau_parmi(&body.host, &body.share_name, lignes, |h| async move {
             smb::guid_du_serveur(&h, 445).await
@@ -1218,6 +1314,16 @@ async fn mount_smb_share(
         }
     }
 
+    // Le point (calculé, ou repris d'une ligne enregistrée) doit rester un
+    // enfant direct d'une racine du serveur : une ligne ancienne ou écrite à
+    // la main ne fait pas monter un partage ailleurs.
+    if !smb::est_confine(std::path::Path::new(&mount_path), &racines) {
+        return montage_refuse(
+            "mount_point_outside_root",
+            "The mount point is outside the server's mount directory.",
+        );
+    }
+
     // Create mount directory
     //
     // Hors root (Tune OS sous `tune`, #3206), /mnt appartient a root et le
@@ -1235,11 +1341,7 @@ async fn mount_smb_share(
         // #6345 — racine par défaut en lecture seule (conteneur, image
         // immuable) : un dossier de Tune sous ses données, s'il se crée. Un
         // chemin imposé, ou repris d'un jumeau, reste celui qu'il est.
-        Err(e)
-            if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem
-                && !chemin_impose
-                && ligne_cible.is_none() =>
-        {
+        Err(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem && ligne_cible.is_none() => {
             let repli =
                 racine_de_repli_des_montages(&dossier_de_donnees_du_serveur(&state.config.db_path))
                     .join(&nom_du_point);
@@ -1273,6 +1375,12 @@ async fn mount_smb_share(
             Json(json!({ "message": message, "error": motif })),
         )
             .into_response();
+    }
+    if !smb::est_confine(std::path::Path::new(&mount_path), &racines) {
+        return montage_refuse(
+            "mount_point_outside_root",
+            "The mount point is outside the server's mount directory.",
+        );
     }
 
     // Fil 2145 : le point est DEJA monte. Lancer `mount.cifs` par-dessus
@@ -1363,7 +1471,7 @@ async fn mount_smb_share(
             // mot de passe sur son entree (#3206).
             let res = tokio::time::timeout(
                 smb::ESSAI_TIMEOUT,
-                smb::commande_de_montage(
+                smb::lancer_un_essai(
                     crate::privilege::euid(),
                     &crate::privilege::sudo(),
                     &unc,
@@ -1371,8 +1479,7 @@ async fn mount_smb_share(
                     user,
                     pass,
                     dialecte,
-                )
-                .lancer(),
+                ),
             )
             .await;
 
@@ -1431,47 +1538,14 @@ async fn mount_smb_share(
         dernier.expect("DIALECTES n'est jamais vide")
     };
 
-    match mount_result {
-        Ok(Ok(out)) if out.status.success() => {}
-        Ok(Ok(out)) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            // La vraie cause, et non l'erreur du dernier dialecte essaye.
-            if smb::est_deja_monte(&stderr) {
-                return point_occupe(&mount_path, None);
-            }
-            if crate::privilege::est_un_refus_d_elevation(&stderr) {
-                // Deja journalise par l'echelle (`smb_mount_failed`) ; ici,
-                // le message dit a l'utilisateur ce qui manque.
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "error": "elevation_refusee",
-                        "message": crate::privilege::message_de_refus(&stderr),
-                    })),
-                )
-                    .into_response();
-            }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("mount failed: {stderr}") })),
-            )
-                .into_response();
-        }
-        Ok(Err(e)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("mount command failed: {e}") })),
-            )
-                .into_response();
-        }
-        Err(_) => {
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(json!({ "error": "mount timed out" })),
-            )
-                .into_response();
-        }
-    };
+    if let Some(echec) = reponse_d_echec_du_montage(
+        &mount_result,
+        &mount_path,
+        crate::privilege::euid(),
+        crate::conteneur::detecter(),
+    ) {
+        return echec;
+    }
 
     persister_le_montage(
         &state,
@@ -1480,6 +1554,163 @@ async fn mount_smb_share(
         &mount_path,
         dialecte_retenu,
         false,
+    )
+}
+
+/// #8069 — la réponse d'un montage qui n'a pas abouti, ou `None` s'il a monté.
+///
+/// Les trois réponses d'échec d'avant portaient leur phrase dans `error`
+/// (`mount command failed: No such file or directory (os error 2)`,
+/// `mount failed: …`, `mount timed out`) et aucun `message` : le client, qui
+/// n'affiche que `message` ou `detail`, montrait donc une erreur inconnue.
+/// Vécu dans un conteneur Docker sur un NAS Synology : le serveur n'y tourne
+/// pas en root, et l'image n'a ni sudo, ni l'assistant de Tune OS, ni
+/// `mount.cifs` — le montage ne pouvait pas réussir, et rien ne le disait.
+///
+/// Chaque échec rend désormais un CODE dans `error` et un TEXTE qui dit quoi
+/// faire dans `message`, comme `obstacle_de_montage`. Fonction pure sur ce
+/// qu'elle reçoit (identité, conteneur) pour se tester sans système.
+fn reponse_d_echec_du_montage(
+    resultat: &Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
+    mount_path: &str,
+    euid: u32,
+    conteneur: Option<&str>,
+) -> Option<axum::response::Response> {
+    let (statut, code, message) = match resultat {
+        Ok(Ok(out)) if out.status.success() => return None,
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // La vraie cause, et non l'erreur du dernier dialecte essaye.
+            if smb::est_deja_monte(&stderr) {
+                return Some(point_occupe(mount_path, None));
+            }
+            if crate::privilege::est_un_refus_d_elevation(&stderr) {
+                // Deja journalise par l'echelle (`smb_mount_failed`) ; ici,
+                // le message dit a l'utilisateur ce qui manque.
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "elevation_refusee",
+                    crate::privilege::message_de_refus(&stderr),
+                )
+            } else {
+                let (code, message) = obstacle_du_systeme(stderr.trim(), conteneur);
+                (StatusCode::INTERNAL_SERVER_ERROR, code, message)
+            }
+        }
+        Ok(Err(e)) => {
+            let (code, message) = obstacle_du_lancement(e, euid, conteneur);
+            (StatusCode::INTERNAL_SERVER_ERROR, code, message)
+        }
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "delai_depasse",
+            "Le serveur SMB n'a pas répondu à temps. Vérifiez que l'appareil est allumé \
+             et joignable depuis le serveur Tune, puis réessayez."
+                .to_string(),
+        ),
+    };
+    Some((statut, Json(json!({ "error": code, "message": message }))).into_response())
+}
+
+/// #8069 — ce qu'il faut faire quand Tune tourne dans un conteneur : y monter
+/// un partage demande des outils et des privilèges que l'image n'a pas.
+fn conseil_en_conteneur(moteur: &str) -> String {
+    format!(
+        "Tune tourne dans un conteneur ({moteur}) : il ne peut pas y monter lui-même \
+         un partage SMB, car le serveur n'y a ni les privilèges système (root et la \
+         capacité CAP_SYS_ADMIN) ni l'outil de montage (cifs-utils). Montez plutôt le \
+         partage sur la machine hôte (votre NAS), puis rendez-le visible dans le \
+         conteneur par un volume en propagation « rslave », par exemple \
+         -v /volume1/music:/music:ro,rslave, et ajoutez le dossier obtenu aux \
+         dossiers de musique. Sans « rslave », un partage monté sur l'hôte après la \
+         création du conteneur n'y apparaît pas."
+    )
+}
+
+/// #8069 — le programme de montage n'a pas pu être lancé.
+fn obstacle_du_lancement(
+    e: &std::io::Error,
+    euid: u32,
+    conteneur: Option<&str>,
+) -> (&'static str, String) {
+    if let Some(moteur) = conteneur {
+        // En conteneur, quelle que soit la raison du lancement raté, le
+        // remède est le même : monter sur l'hôte. Le détail reste lisible
+        // quand ce n'est pas un simple « introuvable ».
+        let conseil = conseil_en_conteneur(moteur);
+        let message = if e.kind() == std::io::ErrorKind::NotFound {
+            conseil
+        } else {
+            format!("{conseil} (Détail : {e})")
+        };
+        return ("montage_impossible_en_conteneur", message);
+    }
+    if e.kind() != std::io::ErrorKind::NotFound {
+        return (
+            "lancement_impossible",
+            format!("Impossible de lancer la commande de montage : {e}"),
+        );
+    }
+    if euid != 0 {
+        (
+            "assistant_de_montage_absent",
+            format!(
+                "Le serveur ne tourne pas en root et l'assistant de montage de Tune OS \
+                 ({}) est introuvable, ou sudo est absent. Donnez au service les \
+                 privilèges système, ou montez le partage par le système (/etc/fstab) \
+                 et ajoutez le dossier obtenu aux dossiers de musique.",
+                crate::privilege::ASSISTANT
+            ),
+        )
+    } else {
+        (
+            "outil_de_montage_absent",
+            "L'outil de montage SMB est introuvable sur ce serveur. Sous Linux, \
+             installez le paquet cifs-utils (qui fournit mount.cifs), puis réessayez."
+                .to_string(),
+        )
+    }
+}
+
+/// #8069 — le système a refusé le montage ; `stderr` est sa réponse.
+fn obstacle_du_systeme(stderr: &str, conteneur: Option<&str>) -> (&'static str, String) {
+    let bas = stderr.to_lowercase();
+    // `mount error(1): Operation not permitted` : le noyau refuse le montage
+    // à un processus sans CAP_SYS_ADMIN — typiquement un conteneur.
+    if bas.contains("error(1)") || bas.contains("operation not permitted") {
+        let conseil = match conteneur {
+            Some(moteur) => conseil_en_conteneur(moteur),
+            None => "Le serveur n'a pas les privilèges système pour monter un partage \
+                     (root et la capacité CAP_SYS_ADMIN). Donnez-les au service, ou \
+                     montez le partage par le système (/etc/fstab) et ajoutez le \
+                     dossier obtenu aux dossiers de musique."
+                .to_string(),
+        };
+        return (
+            "privileges_insuffisants",
+            format!("{conseil} (Détail : {stderr})"),
+        );
+    }
+    // `mount error(13): Permission denied` : le partage a refusé le nom
+    // d'utilisateur ou le mot de passe (fil 6336) ; la réponse du système
+    // reste citée, c'est la vraie cause.
+    if smb::est_refus_d_authentification(stderr) {
+        return (
+            "identifiants_refuses",
+            format!(
+                "Le partage a refusé le nom d'utilisateur ou le mot de passe. Vérifiez-les \
+                 (et le domaine s'il en faut un), puis réessayez. (Détail : {stderr})"
+            ),
+        );
+    }
+    let detail = if stderr.is_empty() {
+        "le système n'a donné aucun détail"
+    } else {
+        stderr
+    };
+    (
+        "montage_refuse",
+        format!("Le montage du partage a échoué : {detail}"),
     )
 }
 
@@ -2907,7 +3138,10 @@ struct TestMountRequest {
     path: String,
 }
 
-async fn test_mount(Json(body): Json<TestMountRequest>) -> impl IntoResponse {
+async fn test_mount(
+    _admin: crate::auth::RequireAdmin,
+    Json(body): Json<TestMountRequest>,
+) -> impl IntoResponse {
     let path = std::path::Path::new(&body.path);
     let exists = path.exists();
     let is_dir = path.is_dir();
@@ -3562,13 +3796,13 @@ mod tests_montage_2145 {
     }
 
     /// Un point de montage occupe par AUTRE CHOSE que le partage demande :
-    /// `/proc`, toujours monte sur Linux. Avant le correctif, la route lancait
-    /// `mount.cifs` par-dessus (EBUSY, ou commande absente) et rendait 500 avec
-    /// l'erreur du dernier dialecte ; elle doit rendre 409 et nommer la cause,
-    /// sans lancer de montage ni ecrire de ligne.
-    #[cfg(target_os = "linux")]
+    /// Le point de montage est choisi par le serveur : une demande qui en
+    /// impose un (`/proc`, `/usr/bin`…) est refusée en 400, sans lancer de
+    /// montage, sans créer de dossier, sans écrire de ligne. Une virgule ou un
+    /// saut de ligne dans les identifiants, un hôte qui commence par `-` :
+    /// refusés de même.
     #[tokio::test]
-    async fn un_point_occupe_par_autre_chose_rend_409_et_sa_cause() {
+    async fn un_point_de_montage_impose_par_le_client_est_refuse() {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
@@ -3576,37 +3810,90 @@ mod tests_montage_2145 {
         let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
         let backend = etat.backend.clone();
         let app = crate::routes::router(etat);
-        let corps = serde_json::json!({
-            "host": "192.168.10.69",
-            "share_name": "Music",
-            "mount_path": "/proc",
-        });
-        let rep = app
-            .oneshot(
-                Request::post("/api/v1/network/smb/mount")
-                    .header("content-type", "application/json")
-                    .body(Body::from(corps.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let statut = rep.status();
-        let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&octets).unwrap_or_default();
-        assert_eq!(statut, StatusCode::CONFLICT, "{v}");
-        assert_eq!(v["error"], "point_de_montage_occupe", "{v}");
-        let message = v["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("/proc") && message.contains("proc"),
-            "{message}"
-        );
+        for (corps, code) in [
+            (
+                serde_json::json!({
+                    "host": "192.168.10.69",
+                    "share_name": "Music",
+                    "mount_path": "/proc",
+                }),
+                "mount_path_not_allowed",
+            ),
+            (
+                serde_json::json!({
+                    "host": "192.168.10.69",
+                    "share_name": "Music",
+                    "mount_path": "/usr/local/bin",
+                    "dry_run": true,
+                }),
+                "mount_path_not_allowed",
+            ),
+            (
+                serde_json::json!({
+                    "host": "-oX",
+                    "share_name": "Music",
+                }),
+                "invalid_host",
+            ),
+            (
+                serde_json::json!({
+                    "host": "192.168.10.69",
+                    "share_name": "Music",
+                    "username": "u",
+                    "password": "p\nusername=root",
+                }),
+                "invalid_credentials",
+            ),
+        ] {
+            let rep = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/network/smb/mount")
+                        .header("content-type", "application/json")
+                        .body(Body::from(corps.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let statut = rep.status();
+            let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&octets).unwrap_or_default();
+            assert_eq!(statut, StatusCode::BAD_REQUEST, "{corps} -> {v}");
+            assert_eq!(v["error"], code, "{corps} -> {v}");
+        }
+        assert!(!std::path::Path::new("/usr/local/bin/192.168.10.69_Music").exists());
         let n = backend
             .query_many("SELECT id FROM network_mounts", &[])
             .unwrap()
             .len();
         assert_eq!(n, 0, "aucune ligne ne doit etre ecrite");
+
+        // Et une ligne enregistrée à la main ne peut pas viser hors racine.
+        let rep = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/network/mounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "server": "192.168.10.69",
+                            "share": "Music",
+                            "mount_path": "/etc/cron.d",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rep.status(), StatusCode::BAD_REQUEST);
+        let n = backend
+            .query_many("SELECT id FROM network_mounts", &[])
+            .unwrap()
+            .len();
+        assert_eq!(n, 0, "aucune ligne hors racine ne doit etre ecrite");
     }
 }
 
@@ -3660,9 +3947,17 @@ mod tests_oubli_2145 {
     #[tokio::test]
     async fn oublier_un_partage_demande_confirmation_puis_supprime() {
         use tune_core::db::backend::ToSqlValue;
-        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        // La base dans le dossier jetable : sa racine de repli
+        // `<données>/montages` est une racine du serveur, et le point y vit.
+        let dossier = tune_core::test_scratch::scratch_dir("tune_oubli_2145");
+        let db = dossier.join("tune.db");
+        let config = crate::config::TuneConfig {
+            db_path: db.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let etat = crate::state::AppState::new(db.to_str().unwrap(), 0, config).unwrap();
         let backend = etat.backend.clone();
-        let point = tune_core::test_scratch::scratch_dir("tune_oubli_2145").join("nas_Music");
+        let point = dossier.join("montages").join("nas_Music");
         std::fs::create_dir_all(&point).unwrap();
         let point_s = point.to_string_lossy().to_string();
         let id = backend
@@ -3799,6 +4094,41 @@ mod tests_oubli_2145 {
 
     /// Sans racine dependante, l'oubli se fait sans confirmation. Un point qui
     /// porte des fichiers n'est jamais efface.
+    /// Une ligne dont le point n'est pas sous une racine du serveur s'oublie
+    /// sans que le serveur ne démonte ni ne retire quoi que ce soit à cet
+    /// endroit.
+    #[tokio::test]
+    async fn un_point_hors_racine_n_est_ni_demonte_ni_retire() {
+        use tune_core::db::backend::ToSqlValue;
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let backend = etat.backend.clone();
+        let dossier = tune_core::test_scratch::scratch_dir("tune_oubli_hors_racine");
+        let point = dossier.join("systeme_vide");
+        std::fs::create_dir_all(&point).unwrap();
+        let point_s = point.to_string_lossy().to_string();
+        let id = backend
+            .execute_returning_id(
+                "INSERT INTO network_mounts (mount_type, server, share, mount_path) VALUES ('smb', ?, ?, ?)",
+                &[&"192.168.10.69" as &dyn ToSqlValue, &"Music" as &dyn ToSqlValue, &point_s as &dyn ToSqlValue],
+            )
+            .unwrap();
+        let app = crate::routes::router(etat);
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(v["demonte"], false, "{v}");
+        assert_eq!(lignes(&backend), 0, "la ligne est oubliée");
+        assert!(
+            point.is_dir(),
+            "un dossier hors des racines du serveur ne doit pas etre retire"
+        );
+    }
+
     #[tokio::test]
     async fn sans_racine_l_oubli_est_direct_et_ne_touche_pas_aux_fichiers() {
         use tune_core::db::backend::ToSqlValue;
@@ -3828,5 +4158,192 @@ mod tests_oubli_2145 {
             point.join("residu.flac").exists(),
             "aucun fichier ne doit etre efface"
         );
+    }
+}
+
+/// #8069 — un montage qui échoue le DIT à l'écran : un code dans `error`, un
+/// texte qui dit quoi faire dans `message`. Le client n'affiche que `message`.
+#[cfg(all(test, unix))]
+mod tests_echec_du_montage_8069 {
+    use super::reponse_d_echec_du_montage;
+    use axum::http::StatusCode;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    fn sortie(code: i32, stderr: &str) -> Output {
+        Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    fn introuvable() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::NotFound)
+    }
+
+    async fn corps(
+        resultat: Result<std::io::Result<Output>, tokio::time::error::Elapsed>,
+        euid: u32,
+        conteneur: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let rep = reponse_d_echec_du_montage(&resultat, "/mnt/nas_music", euid, conteneur)
+            .expect("un echec doit rendre une reponse");
+        let statut = rep.status();
+        let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (statut, serde_json::from_slice(&octets).unwrap())
+    }
+
+    /// Le contrat que lit le client : `message` non vide, `error` un code.
+    fn affichable(v: &serde_json::Value) -> String {
+        let code = v["error"].as_str().expect("error doit etre un code");
+        assert!(
+            !code.is_empty() && !code.contains(' '),
+            "error doit rester un code machine, pas une phrase : {code:?}"
+        );
+        let message = v["message"]
+            .as_str()
+            .expect("message absent : le client afficherait une erreur inconnue");
+        assert!(!message.trim().is_empty(), "message vide");
+        message.to_string()
+    }
+
+    #[tokio::test]
+    async fn un_montage_reussi_ne_rend_pas_d_echec() {
+        assert!(reponse_d_echec_du_montage(&Ok(Ok(sortie(0, ""))), "/mnt/x", 1000, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn en_conteneur_sans_sudo_le_message_dit_de_monter_sur_l_hote() {
+        // Le cas du NAS Synology : `tune` (uid 1000), image sans sudo.
+        let (statut, v) = corps(Ok(Err(introuvable())), 1000, Some("docker")).await;
+        assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(v["error"], "montage_impossible_en_conteneur");
+        let m = affichable(&v);
+        assert!(m.contains("conteneur"), "{m}");
+        assert!(
+            m.contains("rslave"),
+            "le message doit donner la propagation : {m}"
+        );
+        assert!(m.contains("CAP_SYS_ADMIN"), "{m}");
+    }
+
+    #[tokio::test]
+    async fn en_conteneur_en_root_sans_mount_cifs_meme_conseil() {
+        let (_, v) = corps(Ok(Err(introuvable())), 0, Some("docker")).await;
+        assert_eq!(v["error"], "montage_impossible_en_conteneur");
+        assert!(affichable(&v).contains("rslave"));
+    }
+
+    #[tokio::test]
+    async fn hors_conteneur_l_outil_ou_l_assistant_absent_est_nomme() {
+        let (_, v) = corps(Ok(Err(introuvable())), 0, None).await;
+        assert_eq!(v["error"], "outil_de_montage_absent");
+        assert!(affichable(&v).contains("cifs-utils"));
+
+        let (_, v) = corps(Ok(Err(introuvable())), 1000, None).await;
+        assert_eq!(v["error"], "assistant_de_montage_absent");
+        assert!(affichable(&v).contains(crate::privilege::ASSISTANT));
+    }
+
+    #[tokio::test]
+    async fn un_refus_du_noyau_sans_capacite_renvoie_aux_privileges() {
+        let refus =
+            "mount error(1): Operation not permitted\nRefer to the mount.cifs(8) manual page";
+        let (_, v) = corps(Ok(Ok(sortie(32, refus))), 0, Some("docker")).await;
+        assert_eq!(v["error"], "privileges_insuffisants");
+        let m = affichable(&v);
+        assert!(m.contains("rslave") && m.contains("CAP_SYS_ADMIN"), "{m}");
+        assert!(
+            m.contains("Operation not permitted"),
+            "le detail reste lisible : {m}"
+        );
+
+        let (_, v) = corps(Ok(Ok(sortie(32, refus))), 0, None).await;
+        assert_eq!(v["error"], "privileges_insuffisants");
+        assert!(affichable(&v).contains("/etc/fstab"));
+    }
+
+    #[tokio::test]
+    async fn un_autre_refus_porte_la_reponse_du_systeme_dans_message() {
+        let (_, v) = corps(
+            Ok(Ok(sortie(32, "mount error(112): Host is down"))),
+            0,
+            None,
+        )
+        .await;
+        assert_eq!(v["error"], "montage_refuse");
+        assert!(affichable(&v).contains("Host is down"));
+        // Sans rien sur stderr, le message n'est pas vide pour autant.
+        let (_, v) = corps(Ok(Ok(sortie(32, ""))), 0, None).await;
+        assert!(affichable(&v).contains("aucun détail"));
+    }
+
+    #[tokio::test]
+    async fn un_refus_d_identifiants_le_dit_et_garde_la_cause() {
+        let (statut, v) = corps(
+            Ok(Ok(sortie(32, "mount error(13): Permission denied"))),
+            0,
+            None,
+        )
+        .await;
+        assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(v["error"], "identifiants_refuses");
+        let m = affichable(&v);
+        assert!(m.contains("mot de passe"), "{m}");
+        assert!(m.contains("Permission denied"), "la vraie cause : {m}");
+    }
+
+    #[tokio::test]
+    async fn en_conteneur_un_autre_echec_de_lancement_donne_aussi_le_conseil() {
+        // Par exemple un TUNE_SUDO_BIN qui pointe vers un fichier non exécutable.
+        let refuse = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let (_, v) = corps(Ok(Err(refuse)), 1000, Some("docker")).await;
+        assert_eq!(v["error"], "montage_impossible_en_conteneur");
+        let m = affichable(&v);
+        assert!(m.contains("rslave"), "{m}");
+        assert!(
+            m.contains("Détail"),
+            "le détail du système reste lisible : {m}"
+        );
+
+        // Hors conteneur, le cas reste celui d'avant.
+        let refuse = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let (_, v) = corps(Ok(Err(refuse)), 1000, None).await;
+        assert_eq!(v["error"], "lancement_impossible");
+    }
+
+    #[tokio::test]
+    async fn un_delai_depasse_se_lit_a_l_ecran() {
+        let ecoule = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            std::future::pending::<std::io::Result<Output>>(),
+        )
+        .await;
+        let (statut, v) = corps(ecoule, 1000, None).await;
+        assert_eq!(statut, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(v["error"], "delai_depasse");
+        affichable(&v);
+    }
+
+    #[tokio::test]
+    async fn le_refus_de_sudo_et_le_point_occupe_restent_ce_qu_ils_etaient() {
+        let (_, v) = corps(
+            Ok(Ok(sortie(1, "sudo: a password is required"))),
+            1000,
+            None,
+        )
+        .await;
+        assert_eq!(v["error"], "elevation_refusee");
+        affichable(&v);
+        let (statut, _) = corps(
+            Ok(Ok(sortie(32, "mount error(16): Device or resource busy"))),
+            0,
+            None,
+        )
+        .await;
+        assert_eq!(statut, StatusCode::CONFLICT);
     }
 }

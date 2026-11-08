@@ -2022,6 +2022,10 @@ pub struct TransformationsReelles {
     /// tune-server-rust#6741 — un égaliseur COUPÉ applique encore son
     /// préampli : `(centièmes de dB, en retour)`. `None` hors de ce cas.
     preampli_garde: Option<(i32, bool)>,
+    /// tune-server-rust#7614 — le greffon de suréchantillonnage porte la
+    /// cadence de l'entrée vers celle ouverte : `(filtre, réserve en
+    /// centièmes de dB)`. `None` quand il ne tourne pas.
+    surechantillonnage: Option<(&'static str, i32)>,
 }
 
 impl TransformationsReelles {
@@ -2037,7 +2041,32 @@ impl TransformationsReelles {
             fondu_enchaine: false,
             reorganisation_canaux: false,
             preampli_garde: None,
+            surechantillonnage: None,
         }
+    }
+
+    /// tune-server-rust#7614 — la même déclaration, en disant que le
+    /// greffon de suréchantillonnage (filtre `filtre`, réserve `reserve_db`
+    /// ≤ 0) a porté la cadence de l'entrée à celle ouverte. Additif.
+    #[must_use]
+    pub fn avec_surechantillonnage(mut self, filtre: &'static str, reserve_db: f64) -> Self {
+        self.surechantillonnage = Some((
+            filtre,
+            if reserve_db.is_finite() {
+                (reserve_db * 100.0).round() as i32
+            } else {
+                0
+            },
+        ));
+        self
+    }
+
+    /// tune-server-rust#7614 — le filtre du suréchantillonneur et sa
+    /// réserve en dB, quand il tourne.
+    #[must_use]
+    pub fn surechantillonnage(&self) -> Option<(&'static str, f64)> {
+        self.surechantillonnage
+            .map(|(filtre, centiemes)| (filtre, f64::from(centiemes) / 100.0))
     }
 
     /// tune-server-rust#6741 — la même déclaration, en disant qu'un
@@ -2313,6 +2342,19 @@ pub trait OutputTarget: Send + Sync {
     /// place qui ne rouvrirait rien. Défaut `false` : toutes les autres sorties
     /// reprennent comme avant.
     fn device_released_on_pause(&self) -> bool {
+        false
+    }
+
+    /// #7894 — la dernière `pause()` a trouvé l'appareil SANS média : il ne
+    /// jouait rien (renderer UPnP en `NO_MEDIA_PRESENT`), il n'y avait donc
+    /// rien à mettre en pause.
+    ///
+    /// La sortie rend alors `Ok(())` et répond `true` ici ; l'hôte arrête la
+    /// zone (piste et position gardées, reprise possible) et le dit, au lieu
+    /// d'annoncer une pause qui n'existe pas ou de rendre un échec de sortie.
+    ///
+    /// Rendu **une fois** : l'implémentation l'efface. Défaut `false`.
+    fn take_nothing_playing_on_pause(&self) -> bool {
         false
     }
 

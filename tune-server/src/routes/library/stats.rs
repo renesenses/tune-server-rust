@@ -143,7 +143,7 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
     let total_size_bytes = row.get(5).and_then(|v| v.as_i64()).unwrap_or(0);
 
     let listens = b
-        .query_one("SELECT COUNT(*) FROM listen_history", &[])
+        .query_one(tune_core::db::history_repo::sql::count_all(), &[])
         .ok()
         .flatten()
         .and_then(|r| r.first().and_then(|v| v.as_i64()))
@@ -170,6 +170,17 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
     // change de valeur ; le client l'affichera à côté du compte.
     corps["upnp_import"] =
         crate::routes::synchronisation_upnp::etat_d_import(state.backend.as_ref());
+    // #7849 — répartitions par codec, fréquence, décennie et rôle de crédit.
+    // Clé ADDITIVE : aucune clé existante ne change. Une lecture qui échoue
+    // est journalisée et rend `null`, la route répond quand même.
+    corps["distributions"] =
+        match tune_core::db::repartitions_bibliotheque::lire(state.backend.as_ref()) {
+            Ok(r) => json!(r),
+            Err(e) => {
+                tracing::warn!(erreur = %e, "library_stats_distributions");
+                Value::Null
+            }
+        };
     Ok(Json(corps))
 }
 

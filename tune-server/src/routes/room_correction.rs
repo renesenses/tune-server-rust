@@ -4,13 +4,14 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::license::Feature;
 use tune_core::room_correction::{
     CorrectionFilter, FilterType, FrequencyPoint, RoomProfile, delete_profile,
-    generate_correction_from_measurements, list_profiles, load_profile, save_profile,
+    generate_correction_from_measurements, list_profiles, load_profile, profil_eq_de_correction,
+    save_profile,
 };
 
 use crate::error::AppError;
@@ -238,35 +239,10 @@ async fn apply_profile_handler(
         .into_response());
     }
 
-    // Convert correction filters to the EQ band format used by the existing
-    // parametric EQ system (eq_pro / zone DSP).
-    let bands: Vec<Value> = profile
-        .filters
-        .iter()
-        .map(|f| {
-            json!({
-                "freq": f.frequency_hz,
-                "gain": f.gain_db,
-                "q": f.q_factor,
-                "type": match f.filter_type {
-                    FilterType::Peaking => "peak",
-                    FilterType::LowShelf => "low_shelf",
-                    FilterType::HighShelf => "high_shelf",
-                    FilterType::Notch => "notch",
-                },
-            })
-        })
-        .collect();
-
-    // Write to the zone's EQ profile key (same key the playback DSP reads).
+    // #7642 — un `EqProfile` COMPLET, typé : l'ancien JSON fait main n'avait
+    // pas les champs obligatoires et la chaîne audio ne le relisait jamais.
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let eq_profile = json!({
-        "enabled": true,
-        "source": "room_correction",
-        "profile_name": profile.name,
-        "bands": bands,
-        "preamp_db": 0.0,
-    });
+    let eq_profile = profil_eq_de_correction(&profile.filters);
 
     settings
         .set(

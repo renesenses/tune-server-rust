@@ -284,6 +284,14 @@ pub fn ajuster_au_changement_d_appareil(
 /// fixe ne dit plus bas.
 pub const CURSEUR_SANS_REPERE: f64 = 0.30;
 
+/// #8074 — le gain (0..1) où part une sortie LOCALE dont aucun volume n'est
+/// connu : pas de zone en base pour l'appareil, ou aucune graine posée avant la
+/// première lecture. [`CURSEUR_SANS_REPERE`] lu sur le curseur `db60` d'une
+/// sortie logicielle : −42 dB, et non 30 % de gain (−10,5 dB). Jamais l'unité.
+pub fn gain_de_depart_sans_repere_local() -> f64 {
+    crate::audio::volume_scale::EchelleDeVolume::Perceptive.gain(CURSEUR_SANS_REPERE)
+}
+
 /// Le gain (0..1) de [`CURSEUR_SANS_REPERE`] pour une zone qui passe de la
 /// sortie `ancien_output_type` à l'appareil `nouveau_device_id`.
 ///

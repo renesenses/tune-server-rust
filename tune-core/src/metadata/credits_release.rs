@@ -249,9 +249,15 @@ pub fn apparier(mb: &[PisteMb], locales: &[PisteLocale]) -> Vec<(i64, usize)> {
 ///
 /// Idempotente : rejouée avec les mêmes lignes, elle laisse exactement les
 /// mêmes lignes en base.
+///
+/// #7765 — `source` (voir [`super::source_des_credits`]) est posée sur chaque
+/// ligne écrite, et la purge ne prend que les lignes de CETTE source et les
+/// lignes de source inconnue : les crédits lus dans les fichiers, importés de
+/// Roon ou venus d'une autre passe restent en place.
 pub fn ecrire_credits_piste(
     backend: &Arc<dyn DbBackend>,
     track_id: i64,
+    source: &str,
     lignes: &[LigneCredit],
 ) -> usize {
     // #4984 — l'entier, pas sa chaîne : sur PostgreSQL `track_id` est BIGINT,
@@ -259,10 +265,25 @@ pub fn ecrire_credits_piste(
     // purge n'avait jamais lieu : chaque réécriture AJOUTAIT ses crédits.
     backend
         .execute(
-            "DELETE FROM track_credits WHERE track_id = ?",
-            &[&track_id as &dyn ToSqlValue],
+            "DELETE FROM track_credits WHERE track_id = ? AND (source = ? OR source IS NULL)",
+            &[&track_id as &dyn ToSqlValue, &source as &dyn ToSqlValue],
         )
         .ok();
+    inserer_credits_piste(backend, track_id, source, lignes)
+}
+
+/// L'insertion seule de [`ecrire_credits_piste`], sans purge : positions
+/// numérotées depuis 0, fiche artiste LIÉE (MBID puis nom), jamais créée,
+/// `source` posée sur chaque ligne. Rend le nombre de lignes écrites.
+///
+/// #8077 — les apports Qobuz purgent leurs SEULES lignes (`source =
+/// 'qobuz'`), jamais les lignes de source inconnue : ils passent par ici.
+pub fn inserer_credits_piste(
+    backend: &Arc<dyn DbBackend>,
+    track_id: i64,
+    source: &str,
+    lignes: &[LigneCredit],
+) -> usize {
     let artistes = crate::db::artist_repo::ArtistRepo::with_backend(backend.clone());
     let mut ecrites = 0usize;
     for (pos, ligne) in lignes.iter().enumerate() {
@@ -279,8 +300,8 @@ pub fn ecrire_credits_piste(
         let artist_id: Option<i64> = fiche.and_then(|a| a.id);
         let ok = backend
             .execute(
-                "INSERT INTO track_credits (track_id, artist_id, artist_name, role, instrument, position, artist_mbid) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO track_credits (track_id, artist_id, artist_name, role, instrument, position, artist_mbid, source) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 &[
                     &track_id as &dyn ToSqlValue,
                     &artist_id as &dyn ToSqlValue,
@@ -289,6 +310,7 @@ pub fn ecrire_credits_piste(
                     &ligne.instrument as &dyn ToSqlValue,
                     &pos as &dyn ToSqlValue,
                     &ligne.artist_mbid as &dyn ToSqlValue,
+                    &source as &dyn ToSqlValue,
                 ],
             )
             .is_ok();
@@ -363,7 +385,13 @@ pub fn appliquer_release(
         if lignes.is_empty() {
             continue;
         }
-        if ecrire_credits_piste(backend, track_id, lignes) > 0 {
+        if ecrire_credits_piste(
+            backend,
+            track_id,
+            super::source_des_credits::MUSICBRAINZ,
+            lignes,
+        ) > 0
+        {
             bilan.pistes_creditees += 1;
         }
     }
@@ -1025,14 +1053,23 @@ mod tests {
             debut.elapsed()
         );
 
-        // Et par les sources : les pochettes utilisent CETTE clé, et cette
-        // passe n'a ni `sleep` ni limiteur à elle.
+        // Et les pochettes : depuis #7667, leurs requêtes MusicBrainz passent
+        // par la porte `images_rapides` (plus d'`acquire` en ligne dans
+        // `artwork.rs`). Le contrat déménage avec elles : la porte de
+        // l'hôte MusicBrainz est CE limiteur sous CETTE clé, et `artwork.rs`
+        // n'interroge MusicBrainz que par elle.
+        let (limiteur, cle) = crate::library::images_rapides::Hote::MusicBrainz.limiteur();
+        assert!(
+            std::ptr::eq(limiteur, &*crate::http::fetch::MUSICBRAINZ)
+                && cle == CLE_LIMITEUR_MUSICBRAINZ,
+            "les pochettes ont changé de limiteur ou de clé : la passe des crédits ne partage plus leur créneau"
+        );
         let pochettes = include_str!("../library/artwork.rs");
         assert!(
-            pochettes.contains(&format!(
-                "MUSICBRAINZ.acquire(\"{CLE_LIMITEUR_MUSICBRAINZ}\")"
-            )),
-            "les pochettes ont changé de clé : la passe des crédits ne partage plus leur créneau"
+            pochettes.contains("images_rapides::json(")
+                && !pochettes.contains("MUSICBRAINZ.acquire(")
+                && !pochettes.contains("RateLimiter::"),
+            "les pochettes interrogent MusicBrainz hors de la porte partagée"
         );
         let ici = include_str!("credits_release.rs");
         let corps = &ici[..ici.find("#[cfg(test)]").unwrap()];

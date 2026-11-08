@@ -84,6 +84,10 @@ mod concerts_plugin;
 mod dj_plugin;
 #[path = "plugin_routes.rs"]
 mod plugin_routes;
+// rc11 — DJ et Karaoké s'activent depuis Réglages › Extensions (cases).
+#[cfg(all(feature = "dj", feature = "karaoke"))]
+#[path = "activation_dj_karaoke_b209.rs"]
+mod activation_dj_karaoke_b209;
 // #5403 — le greffon coupé à la borne reste visible, et se réessaie.
 #[path = "greffon_coupe_reessayer_5403.rs"]
 mod greffon_coupe_reessayer_5403;
@@ -100,6 +104,12 @@ mod sources_physiques_5065;
 #[cfg(feature = "entree-audio")]
 #[path = "entree_audio_catalogue_5296.rs"]
 mod entree_audio_catalogue_5296;
+// #7195 — « Ma collection physique » au catalogue (feature
+// `collection-physique`, dans `default`) : proposé, installé, actif, et le
+// jeton Discogs ne sort par aucune de ses routes.
+#[cfg(feature = "collection-physique")]
+#[path = "collection_physique_catalogue_7195.rs"]
+mod collection_physique_catalogue_7195;
 // Garde de la couture des FOURNISSEURS de sorties declares par un plugin.
 // Rattachee ici plutot qu en cible propre : `autotests = false` sur ce paquet,
 // donc un fichier non declare n est JAMAIS compile — vert contre rien. Et une

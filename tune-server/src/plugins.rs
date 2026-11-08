@@ -46,8 +46,7 @@ pub fn build_loader(
 ) -> PluginLoader {
     // La licence descend jusqu'aux greffons (`PluginContext::license`) pour
     // qu'un greffon payant ADAPTE sa réponse au lieu de se voir fermer la porte
-    // par l'hôte : « Concerts » servira un jour une version réduite aux comptes
-    // gratuits, et cette décision doit tenir chez lui, en un seul endroit.
+    // par l'hôte : la décision doit tenir chez lui, en un seul endroit.
     PluginLoader::new(plugins_data_root())
         .with_event_bus(event_bus.clone())
         .with_db(backend)
@@ -142,8 +141,8 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
     // sorties du cœur toujours-compilé. Elle y était démarrée SANS condition
     // par `background.rs` — elle ne tourne désormais que chez ceux qui ont
     // installé le plugin. Sa dépendance explicite est la base : lire les artistes
-    // de la bibliothèque et `instance_id`. La licence lui arrive par le contexte
-    // (`PluginContext::license`) : c'est lui qui décide ce qu'il sert (Premium).
+    // de la bibliothèque et `instance_id`. Il ne lit pas la licence : il n'est
+    // plus Premium (#7865).
     #[cfg(feature = "concerts")]
     loader
         .register(Box::new(tune_concerts::ConcertsPlugin::new(
@@ -212,6 +211,21 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
         )))
         .await;
 
+    // Calibration de la pièce (#7632, C1). Comme `entree-audio` : l'orchestrateur
+    // pour y inscrire la source PCM FINIE « calibration » (le balayage de
+    // mesure), régler le volume et lancer la zone ; le gestionnaire de lecture
+    // pour la file. Opt-in : rien ne joue tant qu'il n'est pas installé.
+    #[cfg(feature = "calibration")]
+    loader
+        .register(Box::new(tune_calibration_greffon::CalibrationPlugin::new(
+            tune_calibration_greffon::HostServices {
+                backend: state.backend.clone(),
+                orchestrator: state.orchestrator.clone(),
+                playback: state.playback.clone(),
+            },
+        )))
+        .await;
+
     // Assistant IA, étape 1 (chantier assistant-ia). Toujours compilé, gratuit.
     // La base ; le DOSSIER de la base, où vit la clé maîtresse qui scelle la
     // clé d'API de l'utilisateur (hors de la base elle-même) ; et les critères
@@ -227,6 +241,23 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
                 diagnostic: Some(collecte_diagnostic(state.clone())),
             },
         )))
+        .await;
+
+    // « Ma collection physique » (#7195). Le greffon ne parle à aucun tiers
+    // lui-même : Discogs (jeton résolu ici, jamais remis au greffon),
+    // MusicBrainz, les services et la bibliothèque passent par son hôte.
+    #[cfg(feature = "collection-physique")]
+    loader
+        .register(Box::new(
+            tune_collection_physique::CollectionPhysiquePlugin::new(
+                tune_collection_physique::HostServices {
+                    backend: state.backend.clone(),
+                    hote: std::sync::Arc::new(HoteDeLaCollection {
+                        state: state.clone(),
+                    }),
+                },
+            ),
+        ))
         .await;
 
     // Sortie AES67 (#7336) — Premium, Linux seul (Bertrand, 30/10/2026),
@@ -289,6 +320,278 @@ impl tune_mon_theme::Hote for HoteDuTheme {
         match tune_http_types::ActiveProfile::from_request_parts(parts, &self.state).await {
             Ok(p) => p.id(),
             Err(never) => match never {},
+        }
+    }
+}
+
+/// L'hôte de « Ma collection physique » (#7195).
+///
+/// * Discogs : le jeton est résolu ICI, à chaque appel, par le juge des Clés
+///   d'API (`cles_api::cle` : le personnel, scellé dans le coffre, avant
+///   l'intégré). Il part dans l'en-tête `Authorization` et nulle part
+///   ailleurs : ni dans l'URL, ni dans un journal, ni dans une réponse au
+///   greffon. Chaque appel attend le limiteur Discogs PARTAGÉ et lui rend
+///   compte de la réponse (un 429 le ralentit pour tout le serveur).
+/// * MusicBrainz : le transport et le limiteur partagés.
+/// * Services : Qobuz et TIDAL s'ils sont UTILISABLES (activés et
+///   connectés), par leur recherche ordinaire.
+/// * Bibliothèque : les albums LOCAUX, masqués exclus.
+#[cfg(feature = "collection-physique")]
+struct HoteDeLaCollection {
+    state: AppState,
+}
+
+#[cfg(feature = "collection-physique")]
+impl HoteDeLaCollection {
+    async fn service(
+        &self,
+        nom: &str,
+    ) -> Option<Arc<tokio::sync::RwLock<Box<dyn tune_core::streaming::traits::StreamingService>>>>
+    {
+        let service = self.state.services.lock().await.get(nom)?;
+        let utilisable = service.read().await.utilisable().await;
+        utilisable.then_some(service)
+    }
+}
+
+#[cfg(feature = "collection-physique")]
+#[async_trait::async_trait]
+impl tune_collection_physique::Hote for HoteDeLaCollection {
+    fn jeton_discogs(&self) -> tune_collection_physique::Jeton {
+        use tune_collection_physique::Jeton;
+        use tune_core::cles_api::{Origine, Service};
+        match crate::routes::system::cles_api::cle(&self.state, Service::Discogs) {
+            None => Jeton::Aucun,
+            Some(c) if c.origine == Origine::Personnelle => Jeton::Personnel,
+            Some(_) => Jeton::Integre,
+        }
+    }
+
+    async fn discogs(
+        &self,
+        chemin: &str,
+        params: &[(&str, String)],
+    ) -> Result<tune_collection_physique::Reponse, tune_collection_physique::Panne> {
+        use tune_collection_physique::{Panne, Reponse};
+        use tune_core::http::fetch::{CLE_DISCOGS, DISCOGS};
+        let jeton = crate::routes::system::cles_api::cle(
+            &self.state,
+            tune_core::cles_api::Service::Discogs,
+        );
+        DISCOGS.acquire(CLE_DISCOGS).await;
+        let mut req = self
+            .state
+            .http_client
+            .get(format!(
+                "{}{chemin}",
+                tune_core::metadata::discogs_propositions::BASE_DISCOGS
+            ))
+            .query(params)
+            .header(
+                reqwest::header::USER_AGENT,
+                tune_core::metadata::musicbrainz_release::MB_UA,
+            )
+            .timeout(std::time::Duration::from_secs(20));
+        if let Some(j) = &jeton {
+            req = req.header(
+                reqwest::header::AUTHORIZATION,
+                format!("Discogs token={}", j.valeur()),
+            );
+        }
+        let r = req.send().await.map_err(|e| {
+            tracing::debug!(
+                target: "plugin",
+                erreur = %tune_core::http::client::decrire_erreur_http(&e),
+                "collection_physique_discogs_sans_reponse"
+            );
+            Panne
+        })?;
+        DISCOGS.constater_reponse(CLE_DISCOGS, &r);
+        match r.status().as_u16() {
+            200..=299 => r
+                .json::<serde_json::Value>()
+                .await
+                .map(Reponse::Json)
+                .map_err(|_| Panne),
+            404 => Ok(Reponse::Introuvable),
+            401 | 403 => Ok(Reponse::Refusee),
+            429 => Ok(Reponse::Limite),
+            statut => {
+                tracing::debug!(target: "plugin", statut, "collection_physique_discogs_statut");
+                Err(Panne)
+            }
+        }
+    }
+
+    async fn musicbrainz(
+        &self,
+        chemin: &str,
+        params: &[(&str, String)],
+    ) -> Result<tune_collection_physique::Reponse, tune_collection_physique::Panne> {
+        use tune_collection_physique::{Panne, Reponse};
+        use tune_core::metadata::musicbrainz_release::{
+            RefusMusicBrainz, parcourir_sur_musicbrainz, rate_limit_delay,
+        };
+        rate_limit_delay().await;
+        match parcourir_sur_musicbrainz(chemin, params).await {
+            Ok(v) => Ok(Reponse::Json(v)),
+            Err(RefusMusicBrainz::Statut(400 | 404)) => Ok(Reponse::Introuvable),
+            Err(RefusMusicBrainz::Statut(429 | 503)) => Ok(Reponse::Limite),
+            Err(_) => Err(Panne),
+        }
+    }
+
+    async fn services_connectes(&self) -> Vec<String> {
+        let mut rendus = Vec::new();
+        for nom in tune_collection_physique::synchro::SERVICES {
+            if self.service(nom).await.is_some() {
+                rendus.push(nom.to_string());
+            }
+        }
+        rendus
+    }
+
+    /// « Chercher sur les services » (#7928) : tous les services du
+    /// registre UTILISABLES (activés et connectés), dans l'ordre du registre.
+    async fn services_de_recherche(&self) -> Vec<String> {
+        let noms = self.state.services.lock().await.list();
+        let mut rendus = Vec::new();
+        for nom in noms {
+            if self.service(&nom).await.is_some() {
+                rendus.push(nom);
+            }
+        }
+        rendus
+    }
+
+    async fn chercher_albums(
+        &self,
+        service: &str,
+        requete: &str,
+    ) -> Result<
+        Vec<tune_collection_physique::correspondance::AlbumDeService>,
+        tune_collection_physique::Panne,
+    > {
+        let Some(s) = self.service(service).await else {
+            return Ok(Vec::new());
+        };
+        let resultats = s.read().await.search(requete, 10).await.map_err(|e| {
+            tracing::debug!(target: "plugin", service, erreur = %e, "collection_physique_recherche_echouee");
+            tune_collection_physique::Panne
+        })?;
+        Ok(resultats
+            .albums
+            .into_iter()
+            .map(
+                |a| tune_collection_physique::correspondance::AlbumDeService {
+                    id: a.id,
+                    titre: a.title,
+                    artiste: a.artist,
+                },
+            )
+            .collect())
+    }
+
+    async fn albums_locaux(
+        &self,
+    ) -> Result<Vec<tune_collection_physique::correspondance::AlbumLocal>, String> {
+        let repo = tune_core::db::album_repo::AlbumRepo::with_backend(self.state.backend.clone());
+        const PAGE: i64 = 1_000;
+        let mut rendus = Vec::new();
+        let mut offset = 0;
+        loop {
+            // `include_hidden = false` : un album masqué n'est pas « dans ma
+            // bibliothèque » pour l'écran.
+            let page = repo
+                .list_filtered(PAGE, offset, "title", "asc", None, None, None, false, None)
+                .map_err(|e| e.to_string())?;
+            let n = page.len() as i64;
+            for a in page {
+                let local = a.source.is_empty() || a.source == "local";
+                if !local {
+                    continue;
+                }
+                let qualite = a.quality();
+                rendus.push(tune_collection_physique::correspondance::AlbumLocal {
+                    id: a.id.unwrap_or_default(),
+                    titre: a.title,
+                    artiste: a.artist_name,
+                    code_barre: a.barcode,
+                    mb_release: a.musicbrainz_release_id,
+                    mb_groupe: a.musicbrainz_release_group_id,
+                    qualite,
+                    format: a.format,
+                    sample_rate: a.sample_rate,
+                    bit_depth: a.bit_depth,
+                    pochette: a.cover_path,
+                });
+            }
+            if n < PAGE {
+                return Ok(rendus);
+            }
+            offset += PAGE;
+        }
+    }
+
+    /// Une pochette du CDN de Discogs, pour le cache du greffon (01/11/2026).
+    /// L'adresse est revérifiée ici (`https`, hôte d'images de Discogs) : le
+    /// serveur ne va chercher rien d'autre. User-Agent du serveur, aucun
+    /// jeton (il ne sort pas vers le CDN), aucune redirection suivie hors de
+    /// ces hôtes, et 8 Mo au plus.
+    async fn image_discogs(
+        &self,
+        url: &str,
+    ) -> Result<tune_collection_physique::Image, tune_collection_physique::Panne> {
+        use tune_collection_physique::{Image, Panne};
+        const IMAGE_MAX: usize = 8 * 1024 * 1024;
+        if tune_collection_physique::discogs::vignette_discogs(url).as_deref() != Some(url) {
+            return Ok(Image::Introuvable);
+        }
+        let r = self
+            .state
+            .http_client
+            .get(url)
+            .header(
+                reqwest::header::USER_AGENT,
+                tune_core::metadata::musicbrainz_release::MB_UA,
+            )
+            .header(
+                reqwest::header::ACCEPT,
+                "image/jpeg,image/png,image/webp;q=0.8",
+            )
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::debug!(
+                    target: "plugin",
+                    erreur = %tune_core::http::client::decrire_erreur_http(&e),
+                    "collection_physique_pochette_sans_reponse"
+                );
+                Panne
+            })?;
+        let final_ok =
+            tune_collection_physique::discogs::vignette_discogs(r.url().as_str()).is_some();
+        match r.status().as_u16() {
+            200..=299 if final_ok => {
+                if r.content_length().is_some_and(|n| n as usize > IMAGE_MAX) {
+                    return Ok(Image::Introuvable);
+                }
+                let octets = r.bytes().await.map_err(|_| Panne)?;
+                if octets.len() > IMAGE_MAX {
+                    return Ok(Image::Introuvable);
+                }
+                Ok(Image::Octets(octets.to_vec()))
+            }
+            200..=299 => Ok(Image::Introuvable),
+            404 | 410 => Ok(Image::Introuvable),
+            // #7927 : un refus du CDN n'est pas une image disparue.
+            403 => Ok(Image::Refusee),
+            429 | 503 => Ok(Image::Limite),
+            statut => {
+                tracing::debug!(target: "plugin", statut, "collection_physique_pochette_statut");
+                Err(Panne)
+            }
         }
     }
 }
@@ -866,3 +1169,7 @@ fn membres_de_collection(
     }
     m
 }
+
+#[cfg(all(test, feature = "collection-physique"))]
+#[path = "plugins_tests_jeton_discogs_7195.rs"]
+mod tests_jeton_discogs_7195;

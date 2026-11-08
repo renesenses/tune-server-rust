@@ -86,6 +86,11 @@ fn reset_schema(db: &Arc<dyn DbBackend>) {
         // #5049, `--test-threads=1`, ordre alphabétique).
         "album_metadata",
         "album_distinct_pairs",
+        // Même cas : sans clé étrangère, `hidden_items` survivait d'une
+        // épreuve à l'autre. L'album 7 masqué par `preparer_7619` (renuméroté
+        // 4 par une épreuve suivante) masquait la Bruckner 7 de
+        // `pg_4319_texte_libre_mot_a_mot` au passage suivant sur la même base.
+        "hidden_items",
     ];
     for table in tables {
         let sql = format!("TRUNCATE TABLE {table} RESTART IDENTITY CASCADE");
@@ -1182,8 +1187,9 @@ async fn pg_6285_les_verdicts_des_faux_hires() {
         bits_effectifs: Some(16),
         coupure_hz: Some(20_000.0),
         silencieux: false,
+        ..Default::default()
     };
-    enregistrer(&db, 1, &Ok(mesure)).unwrap();
+    enregistrer(&db, 1, &Ok(mesure.clone())).unwrap();
     enregistrer(&db, 1, &Ok(mesure)).unwrap();
     enregistrer(&db, 3, &Err("illisible".into())).unwrap();
     assert_eq!(compter_les_candidats(&db), 0);
@@ -3663,5 +3669,69 @@ async fn pg_b209_ordre_dans_l_album_et_rattrapage_des_zeros_upnp() {
     crate::db::track_repo::tests_b209_ordre_dans_l_album::regle_d_idempotence_upnp(
         db.clone(),
         ids[&3],
+    );
+}
+
+/// #7619 (L3) — la recherche en DÉBUT DE MOT (décision du 01/11/2026) sur le
+/// VRAI moteur : `to_tsquery` avec `:*` sur chaque mot, `unaccent`, la
+/// restriction d'identité (#4367), le titre de piste pour les albums, les
+/// labels et le texte libre d'Oxygen. Mêmes scénarios que les témoins SQLite.
+fn preparer_7619(db: &Arc<dyn DbBackend>) {
+    reset_schema(db);
+    db.execute("DELETE FROM hidden_items", &[]).unwrap();
+    crate::db::recherche_debut_de_mot_7619_tests::peupler(db.as_ref());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_7619_pistes_par_debut_de_mot() {
+    let db = pg_or_skip!();
+    preparer_7619(&db);
+    crate::db::recherche_debut_de_mot_7619_tests::scenario_pistes_7619(db);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_7619_albums_artistes_labels_par_debut_de_mot() {
+    let db = pg_or_skip!();
+    preparer_7619(&db);
+    crate::db::recherche_debut_de_mot_7619_tests::scenario_albums_artistes_labels_7619(db);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_7619_texte_libre_par_debut_de_mot() {
+    let db = pg_or_skip!();
+    preparer_7619(&db);
+    crate::db::recherche_debut_de_mot_7619_tests::scenario_texte_libre_7619(db);
+}
+
+/// #7619 (L4) — la révision de la bibliothèque sur le VRAI moteur : le bloc
+/// `DO` de la passe de démarrage se pose, se rejoue sans rien casser, et une
+/// écriture dans une table suivie change la révision, l'historique non.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_7619_revision_de_la_bibliotheque() {
+    use crate::db::library_revision::{lire, sql_postgres};
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    // Comme au démarrage : `PostgresDb::connect` pose `ENSURE_TABLES`
+    // (dont `streaming_hidden_items`, sans script numéroté) AVANT la passe
+    // qui pose la révision. Sans cela, l'épreuve jouée seule sur une base
+    // faite des seuls scripts échoue sur une table suivie absente.
+    let url = std::env::var("TUNE_TEST_PG_URL").expect("posée : pg_or_skip! est passé");
+    crate::db::postgres::PostgresDb::connect(&url)
+        .await
+        .expect("démarrage PostgreSQL (ENSURE_TABLES)");
+    db.execute(&sql_postgres(), &[]).unwrap();
+    db.execute(&sql_postgres(), &[]).unwrap();
+    let (instance, avant) = lire(db.as_ref()).expect("révision posée");
+    db.execute("INSERT INTO artists (id, name) VALUES (1, 'Révision')", &[])
+        .unwrap();
+    let (instance2, apres) = lire(db.as_ref()).unwrap();
+    assert_eq!(instance, instance2, "même base, même instance");
+    assert!(apres > avant, "une écriture d'artistes change la révision");
+    db.execute("INSERT INTO listen_history (title) VALUES ('Écoute')", &[])
+        .unwrap();
+    assert_eq!(
+        lire(db.as_ref()).unwrap().1,
+        apres,
+        "l'historique ne la change pas"
     );
 }

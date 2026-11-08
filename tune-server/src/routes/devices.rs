@@ -21,6 +21,8 @@ use tune_core::outputs::dlna::DlnaOutput;
 
 use crate::state::AppState;
 
+mod jumelage_airplay_7447;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_devices))
@@ -686,7 +688,11 @@ pub async fn register_manual_device(
             .with_upnp_silence(crate::config::resolve_upnp_silence(
                 &state.backend,
                 &device_id,
-            ));
+            ))
+            // #6335 — l'annonce de `SetNextAVTransportURI`.
+            .with_av_transport_scpd(
+                crate::discovery_setup::scpd_av_transport_du_descriptif(&dev.host, dev.port, &desc),
+            );
             state.outputs.lock().await.register(Box::new(dlna));
 
             let zone_id = ensure_zone(state, &device_name, "dlna", &device_id);
@@ -922,7 +928,7 @@ pub fn persist_discovered_dlna(backend: &Arc<dyn DbBackend>, entry: &DiscoveredD
 /// Le type porte maintenant la decision, pas le texte : ajouter une cause
 /// oblige a dire ce qu'on en fait, et un message ne peut plus en couvrir deux.
 #[derive(Debug)]
-enum ReprobeFailure {
+pub(crate) enum ReprobeFailure {
     /// L'appareil n'a pas repondu, ou mal : la panne peut etre passagere, on
     /// retente avec le backoff.
     Unreachable(String),
@@ -1128,7 +1134,7 @@ async fn reprobe_dlna_with_backoff(state: &AppState, dev: DiscoveredDlnaDevice) 
 
 /// Probe a persisted DLNA renderer at its stored LOCATION and, if the
 /// descriptor's UUID still matches, register the output + re-attach its zone.
-async fn register_discovered_dlna(
+pub(crate) async fn register_discovered_dlna(
     state: &AppState,
     dev: &DiscoveredDlnaDevice,
 ) -> Result<String, ReprobeFailure> {
@@ -1263,6 +1269,10 @@ async fn register_discovered_dlna(
     .with_upnp_silence(crate::config::resolve_upnp_silence(
         &state.backend,
         &dev.uuid,
+    ))
+    // #6335 — l'annonce de `SetNextAVTransportURI`.
+    .with_av_transport_scpd(crate::discovery_setup::scpd_av_transport_du_descriptif(
+        &dev.host, dev.port, &desc,
     ));
     // Registry is keyed by device_id (the uuid): a later multicast discovery
     // replaces this entry rather than duplicating it.
@@ -1415,7 +1425,13 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
                             &desc.event_sub_urls(),
                         ),
                     )
-                    .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &d.id));
+                    .with_upnp_silence(crate::config::resolve_upnp_silence(&state.backend, &d.id))
+                    // #6335 — l'annonce de `SetNextAVTransportURI`.
+                    .with_av_transport_scpd(
+                        crate::discovery_setup::scpd_av_transport_du_descriptif(
+                            &d.host, d.port, &desc,
+                        ),
+                    );
                     outputs.register(Box::new(dlna));
                     registered += 1;
                 }
@@ -1809,8 +1825,9 @@ async fn clear_devices(State(state): State<AppState>) -> impl IntoResponse {
     drop(outputs);
     let mut removed = 0;
     for id in ids {
-        let mut outputs = state.outputs.lock().await;
-        outputs.remove(&id);
+        let retiree = state.outputs.lock().await.remove(&id);
+        // #7949 — une sortie retirée en lecture continuait de jouer.
+        tune_core::outputs::registry::arreter_les_sorties_retirees(retiree).await;
         removed += 1;
     }
     // Forget all persisted manual devices too, so a clear is durable.
@@ -1829,9 +1846,9 @@ async fn delete_device(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
 ) -> impl IntoResponse {
-    let mut outputs = state.outputs.lock().await;
-    outputs.remove(&device_id);
-    drop(outputs);
+    let retiree = state.outputs.lock().await.remove(&device_id);
+    // #7949 — arrêtée hors du verrou : elle jouait encore, sans zone.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(retiree).await;
     // Also drop it from persistence so it isn't re-registered on next startup.
     forget_manual_device(&state, &device_id);
     // #6299 — un renderer DLNA decouvert aussi : il etait re-sonde a chaque
@@ -1954,9 +1971,10 @@ async fn ignore_device(
     // Les identifiants jumeaux retirés du registre avec lui : leurs zones
     // sont les siennes (#4957).
     let mut jumelles: Vec<String> = Vec::new();
+    let mut sorties_retirees = Vec::new();
     {
         let mut outputs = state.outputs.lock().await;
-        outputs.remove(&device_id);
+        sorties_retirees.extend(outputs.remove(&device_id));
         // Les identités JUMELLES du même appareil, enregistrées sous un autre
         // identifiant : c'est par elles que le Sonos revenait.
         for info in &infos {
@@ -1971,11 +1989,14 @@ async fn ignore_device(
                 tune_core::db::ignored_device_repo::DeviceIdentity::new(id, s("host"), s("name"))
                     .with_protocol(Some(s("type")));
             if tune_core::db::ignored_device_repo::identity_matches(&snapshot, identite) {
-                outputs.remove(id);
+                sorties_retirees.extend(outputs.remove(id));
                 jumelles.push(id.to_string());
             }
         }
     }
+    // #7949 — un appareil ignoré se tait : ses sorties sont arrêtées, pas
+    // seulement oubliées.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(sorties_retirees).await;
     forget_manual_device(&state, &device_id);
 
     // La zone de l'appareil, s'il en a une : masquée, au motif `appareil_ignore`
@@ -2117,85 +2138,21 @@ async fn list_ignored_devices(State(state): State<AppState>) -> impl IntoRespons
 // Device Pairing
 // ---------------------------------------------------------------------------
 
+/// Corps facultatif : le client web envoie `POST /pair` sans corps (#7447).
+/// `friendly_name` reste accepté, sans effet sur le jumelage.
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct PairRequest {
     friendly_name: Option<String>,
 }
 
+/// `POST /devices/{id}/pair` — voir `jumelage_airplay_7447`.
 async fn pair_device(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
-    Json(body): Json<PairRequest>,
+    _body: Option<Json<PairRequest>>,
 ) -> impl IntoResponse {
-    // Check if this is an AirPlay 2 device — trigger PIN display
-    let is_airplay2 = device_id.starts_with("airplay2:");
-    let host = if is_airplay2 {
-        let outputs = state.outputs.lock().await;
-        if let Some(arc) = outputs.get(&device_id) {
-            let o = arc.lock().await;
-            o.host().map(|h| h.to_string())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    if is_airplay2 {
-        if let Some(host) = host {
-            let url = format!("http://{}:7000/pair-pin-start", host);
-            let client = tune_core::http::client::shared();
-            match client
-                .post(&url)
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::info!(device = %device_id, "airplay2_pair_pin_start_triggered");
-                    return Json(json!({
-                        "status": "awaiting_pin",
-                        "device_id": device_id,
-                        "message": "Enter the 4-digit PIN shown on the device screen",
-                    }))
-                    .into_response();
-                }
-                Ok(resp) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(json!({
-                            "error": format!("device returned HTTP {}", resp.status()),
-                        })),
-                    )
-                        .into_response();
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(json!({
-                            "error": format!("failed to reach device: {e}"),
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    }
-
-    // Non-AirPlay 2: simple pair registration
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let key = format!("device_pair_{device_id}");
-    let data = json!({
-        "device_id": device_id,
-        "friendly_name": body.friendly_name,
-        "paired_at": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        "status": "paired",
-    });
-    settings.set(&key, &data.to_string()).ok();
-    (StatusCode::CREATED, Json(data)).into_response()
+    jumelage_airplay_7447::jumeler(&state, &device_id).await
 }
 
 #[derive(Deserialize)]
@@ -2203,97 +2160,22 @@ struct PairPinRequest {
     pin: String,
 }
 
+/// `POST /devices/{id}/pair/pin` — le code parvient au récepteur (#7447).
 async fn pair_device_pin(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
     Json(body): Json<PairPinRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    // Check if there's a pending pin
-    let pending_key = format!("device_pair_pin_{device_id}");
-    let expected = settings.get(&pending_key).ok().flatten();
-    if let Some(ref expected_pin) = expected {
-        if expected_pin != &body.pin {
-            return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid PIN"}))).into_response();
-        }
-    }
-    // Mark device as paired
-    let key = format!("device_pair_{device_id}");
-    let data = json!({
-        "device_id": device_id,
-        "paired_at": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        "status": "paired",
-        "pin_verified": true,
-    });
-    settings.set(&key, &data.to_string()).ok();
-    settings.delete(&pending_key).ok();
-    Json(data).into_response()
+    jumelage_airplay_7447::confier_le_code(&state, &device_id, &body.pin).await
 }
 
-/// Trigger AirPlay 2 PIN display on an Apple TV.
-/// The device shows a 4-digit PIN that the user enters via POST /pair/pin.
+/// Demande au récepteur AirPlay 2 d'afficher son code, par le composant
+/// AirPlay 2 (#7447) ; le code se saisit ensuite par `POST /pair/pin`.
 async fn airplay2_pair_pin_start(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
 ) -> impl IntoResponse {
-    // Find the device's host from the output registry
-    let host = {
-        let outputs = state.outputs.lock().await;
-        if let Some(arc) = outputs.get(&device_id) {
-            let o = arc.lock().await;
-            o.host().map(|h| h.to_string())
-        } else {
-            None
-        }
-    };
-    let host = match host {
-        Some(h) => h,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "device not found or not connected"})),
-            )
-                .into_response();
-        }
-    };
-    let port = 7000u16;
-
-    // POST /pair-pin-start to the Apple TV
-    let url = format!("http://{}:{}/pair-pin-start", host, port);
-    let client = tune_core::http::client::shared();
-    match client
-        .post(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            tracing::info!(device = %device_id, host = %host, "airplay2_pair_pin_start_sent");
-            Json(json!({
-                "status": "pin_requested",
-                "device_id": device_id,
-                "message": "Check the device screen for a 4-digit PIN",
-            }))
-            .into_response()
-        }
-        Ok(resp) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "error": format!("device returned HTTP {}", resp.status()),
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "error": format!("failed to reach device: {e}"),
-            })),
-        )
-            .into_response(),
-    }
+    jumelage_airplay_7447::demander_le_code(&state, &device_id).await
 }
 
 #[cfg(test)]
@@ -3298,6 +3180,84 @@ mod oubli_des_dlna_decouverts_6299 {
         assert!(
             uuids_dlna_decouverts(&state.backend).is_empty(),
             "apres « effacer », aucun renderer decouvert ne doit rester a re-sonder"
+        );
+    }
+}
+
+/// #7949 — une sortie retirée du registre par une route est arrêtée : sans
+/// cela, elle continuait de jouer sur une zone qui n'existait plus.
+#[cfg(test)]
+mod sortie_retiree_arretee_7949 {
+    use super::*;
+    use tune_core::outputs::mock::MockOutput;
+    use tune_core::outputs::traits::OutputTarget;
+
+    type Sortie = Arc<tokio::sync::Mutex<Box<dyn OutputTarget>>>;
+
+    /// Une sortie factice en lecture dans le registre, et sa poignée gardée
+    /// pour relire ses `stop()` après le retrait.
+    async fn banc(id: &str) -> (tempfile::TempDir, AppState, Sortie) {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("tune.db");
+        let state = AppState::new(chemin.to_str().unwrap(), 0, Default::default()).unwrap();
+        let mut outputs = state.outputs.lock().await;
+        outputs.register(Box::new(MockOutput::new(id, "Factice 7949")));
+        let sortie = outputs.get(id).unwrap();
+        drop(outputs);
+        sortie
+            .lock()
+            .await
+            .play_url("http://127.0.0.1:9/7949.flac", "audio/flac", None, None)
+            .await
+            .unwrap();
+        (dossier, state, sortie)
+    }
+
+    async fn arrets(sortie: &Sortie) -> u64 {
+        let sortie = sortie.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .unwrap()
+            .stop_call_count()
+    }
+
+    #[tokio::test]
+    async fn supprimer_l_appareil_arrete_sa_sortie() {
+        let (_dossier, state, sortie) = banc("dlna:factice-7949").await;
+        let _ = delete_device(State(state.clone()), Path("dlna:factice-7949".into()))
+            .await
+            .into_response();
+        assert!(!state.outputs.lock().await.contains("dlna:factice-7949"));
+        assert_eq!(
+            arrets(&sortie).await,
+            1,
+            "#7949 : l'appareil supprimé n'a pas été arrêté, il joue encore sans zone"
+        );
+    }
+
+    #[tokio::test]
+    async fn tout_effacer_arrete_chaque_sortie() {
+        let (_dossier, state, sortie) = banc("dlna:factice-7949").await;
+        let _ = clear_devices(State(state.clone())).await.into_response();
+        assert_eq!(
+            arrets(&sortie).await,
+            1,
+            "#7949 : « effacer les appareils » a laissé jouer une sortie retirée"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignorer_l_appareil_arrete_sa_sortie() {
+        let (_dossier, state, sortie) = banc("dlna:factice-7949").await;
+        let _ = ignore_device(State(state.clone()), Path("dlna:factice-7949".into()))
+            .await
+            .into_response();
+        assert!(!state.outputs.lock().await.contains("dlna:factice-7949"));
+        assert_eq!(
+            arrets(&sortie).await,
+            1,
+            "#7949 : l'appareil ignoré a été retiré sans être arrêté"
         );
     }
 }

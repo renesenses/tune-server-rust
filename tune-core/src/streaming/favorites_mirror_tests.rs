@@ -164,6 +164,10 @@ struct Compte {
     /// partie : la lecture datée d'affichage rend le PREMIER seulement, comme
     /// un connecteur réel rend la coupe ; la lecture complète le dit (`Err`).
     favoris_tronques: bool,
+    /// Identifiants dont le service refuse l'ajout en 401 (radio-qobuz,
+    /// 01/11/2026) — en plus des playlists possédées, que Qobuz refuse
+    /// toujours à l'abonnement.
+    refusees: std::collections::HashSet<String>,
 }
 
 struct ServiceSimule {
@@ -359,6 +363,15 @@ impl StreamingService for ServiceSimule {
             return Err("panne réseau simulée".into());
         }
         c.appels.push(format!("add {fav_type} {item_id}"));
+        // Le refus réel relevé sur le .18 : s'abonner à SA playlist.
+        if c.refusees.contains(item_id)
+            || (fav_type == "playlists" && c.playlists.get(item_id) == Some(&Some(true)))
+        {
+            return Err(format!(
+                "simule /playlist/subscribe: 401 {{\"status\":\"error\",\"code\":401,\"message\":\"Current authenticated user is not authorized to perform this request\"}}"
+            )
+            .into());
+        }
         if fav_type == "playlists" {
             c.playlists.insert(item_id.into(), Some(false));
         }
@@ -1290,5 +1303,339 @@ async fn le_miroir_range_l_annee_et_la_qualite_des_albums_6482() {
     assert_eq!(
         lignes, attendu,
         "l'année et la qualité de l'album favori doivent être rangées pour chaque profil"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Radio → Qobuz (01/11/2026) — jamais d'abonnement à sa propre playlist,
+// jamais de 401 en boucle.
+// ---------------------------------------------------------------------------
+
+/// Les lignes d'un favori, tous profils : `(profile_id, miroir_etat)`.
+fn etats_de(backend: &Arc<dyn DbBackend>, service: &str, id: &str) -> Vec<Option<String>> {
+    backend
+        .query_many_strong(
+            "SELECT miroir_etat FROM streaming_favorites WHERE service = ?1 AND service_id = ?2 ORDER BY profile_id",
+            &[&service, &id],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r.first().and_then(|v| v.as_string()))
+        .collect()
+}
+
+fn appels(compte: &Arc<Mutex<Compte>>) -> Vec<String> {
+    compte.lock().unwrap().appels.clone()
+}
+
+#[test]
+fn un_refus_401_ou_403_se_reconnait_dans_le_motif_radio_qobuz() {
+    assert!(est_un_refus_du_service(
+        r#"qobuz /playlist/subscribe: 401 {"status":"error","code":401}"#
+    ));
+    assert!(est_un_refus_du_service("tidal favorites: 403 Forbidden"));
+    // Contre-épreuves : une panne, un 404, un identifiant qui CONTIENT 401.
+    assert!(!est_un_refus_du_service("panne réseau simulée"));
+    assert!(!est_un_refus_du_service(
+        "qobuz /playlist/subscribe: 404 not found"
+    ));
+    assert!(!est_un_refus_du_service(
+        "qobuz /favorite/create: 500 playlist 58698401x"
+    ));
+    assert!(!est_un_refus_du_service(
+        "qobuz /favorite/create: 500 id 4013"
+    ));
+}
+
+/// Témoin 1 — un cœur posé dans Tune sur SA playlist ne s'abonne pas : elle
+/// est `synchro` d'emblée, aucun appel d'écriture. Contre-épreuve : une
+/// playlist suivie (d'un autre) est bien abonnée.
+#[tokio::test]
+async fn un_coeur_sur_sa_propre_playlist_ne_s_abonne_pas_radio_qobuz() {
+    let (backend, profils, _dir) = base(2);
+    let (arc, compte) = ServiceSimule::nouveau("miroir-rq1");
+    bibliotheque_de_playlists(&compte, &[("58698591", Some(true))]);
+
+    let p = ajouter(&arc, &backend, profils[0], &favori("playlist", "58698591"))
+        .await
+        .unwrap();
+    assert_eq!(p, Propagation::Propage);
+    assert!(
+        appels(&compte).is_empty(),
+        "abonnement tenté : {:?}",
+        appels(&compte)
+    );
+    assert_eq!(
+        etats_de(&backend, "miroir-rq1", "58698591"),
+        vec![Some(ETAT_SYNCHRO.to_string()); 2]
+    );
+
+    // Contre-épreuve : la playlist d'un autre, elle, est abonnée.
+    let p = ajouter(&arc, &backend, profils[0], &favori("playlist", "edito"))
+        .await
+        .unwrap();
+    assert_eq!(p, Propagation::Propage);
+    assert_eq!(appels(&compte), vec!["add playlists edito".to_string()]);
+
+    // Retirer le cœur de SA playlist : local, aucun désabonnement.
+    compte.lock().unwrap().appels.clear();
+    retirer(&arc, &backend, "playlist", "58698591")
+        .await
+        .unwrap();
+    assert!(appels(&compte).is_empty(), "{:?}", appels(&compte));
+    assert!(etats_de(&backend, "miroir-rq1", "58698591").is_empty());
+}
+
+/// Témoin 2 — l'état exact relevé sur le .18 : trois playlists du compte en
+/// `ajout_en_attente`. Le rafraîchissement les règle SANS appel ; les
+/// suivants n'appellent rien non plus. Contre-épreuve : sans la règle, le
+/// simulé répondait 401 à chaque passage (le journal en compte 12 360).
+#[tokio::test]
+async fn les_playlists_possedees_en_attente_ne_bouclent_plus_en_401_radio_qobuz() {
+    let (backend, profils, _dir) = base(2);
+    let (arc, compte) = ServiceSimule::nouveau("miroir-rq2");
+    bibliotheque_de_playlists(
+        &compte,
+        &[
+            ("58698591", Some(true)),
+            ("58698592", Some(true)),
+            ("58698595", Some(true)),
+        ],
+    );
+    let repo = StreamingFavoritesRepo::with_backend(backend.clone());
+    for id in ["58698591", "58698592", "58698595"] {
+        for &pid in &profils {
+            repo.add(pid, "playlist", "miroir-rq2", id, None, None, None, None)
+                .unwrap();
+        }
+        poser_etat(
+            &backend,
+            "miroir-rq2",
+            "playlist",
+            id,
+            ETAT_AJOUT_EN_ATTENTE,
+            Some("qobuz /playlist/subscribe: 401"),
+        )
+        .unwrap();
+    }
+    assert_eq!(compter_en_attente(&backend, "miroir-rq2"), 3);
+
+    for passage in 0..3 {
+        let bilan = rafraichir(&arc, &backend, profils[0]).await;
+        assert_eq!(bilan.echecs, 0, "passage {passage} : {bilan:?}");
+        assert_eq!(bilan.en_attente, 0, "passage {passage} : {bilan:?}");
+        assert!(
+            appels(&compte).is_empty(),
+            "passage {passage} : abonnement à sa propre playlist : {:?}",
+            appels(&compte)
+        );
+    }
+    for id in ["58698591", "58698592", "58698595"] {
+        assert_eq!(
+            etats_de(&backend, "miroir-rq2", id),
+            vec![Some(ETAT_SYNCHRO.to_string()); 2],
+            "{id} doit rester un cœur, confirmé"
+        );
+    }
+}
+
+/// Témoin 3 — un 401 sur un identifiant que le compte ne possède pas, la
+/// session venant de lire le compte sans erreur : UN appel, la ligne passe
+/// `refuse_par_le_service`, plus aucun appel ensuite. Contre-épreuve : si
+/// la lecture a échoué (session douteuse), le 401 reste en attente et est
+/// retenté — on ne condamne pas un favori sur une session expirée.
+#[tokio::test]
+async fn un_refus_401_est_memorise_et_n_est_plus_retente_radio_qobuz() {
+    let (backend, profils, _dir) = base(1);
+    let pid = profils[0];
+    let (arc, compte) = ServiceSimule::nouveau("miroir-rq3");
+    compte.lock().unwrap().refusees.insert("privee".into());
+    bibliotheque_de_playlists(&compte, &[]);
+
+    let p = ajouter(&arc, &backend, pid, &favori("playlist", "privee"))
+        .await
+        .unwrap();
+    assert!(matches!(p, Propagation::EnAttente(_)), "{p:?}");
+    compte.lock().unwrap().appels.clear();
+
+    let bilan = rafraichir(&arc, &backend, pid).await;
+    assert_eq!(bilan.refuses, 1, "{bilan:?}");
+    assert_eq!(bilan.en_attente, 0, "{bilan:?}");
+    assert_eq!(appels(&compte), vec!["add playlists privee".to_string()]);
+    assert_eq!(
+        etats_de(&backend, "miroir-rq3", "privee"),
+        vec![Some(ETAT_REFUSE.to_string())]
+    );
+
+    for _ in 0..3 {
+        rafraichir(&arc, &backend, pid).await;
+    }
+    assert_eq!(
+        appels(&compte),
+        vec!["add playlists privee".to_string()],
+        "le refus a été retenté"
+    );
+
+    // Retirer le cœur d'un ajout refusé : local, aucun appel.
+    retirer(&arc, &backend, "playlist", "privee").await.unwrap();
+    assert_eq!(appels(&compte).len(), 1);
+    assert!(etats_de(&backend, "miroir-rq3", "privee").is_empty());
+
+    // Contre-épreuve : lecture du compte en échec → le 401 reste en attente.
+    let (arc, compte) = ServiceSimule::nouveau("miroir-rq3b");
+    compte.lock().unwrap().refusees.insert("71".into());
+    ajouter(&arc, &backend, pid, &favori("track", "71"))
+        .await
+        .unwrap();
+    compte.lock().unwrap().favoris_tronques = true;
+    let bilan = rafraichir(&arc, &backend, pid).await;
+    assert!(bilan.echecs > 0, "{bilan:?}");
+    assert_eq!(bilan.refuses, 0, "{bilan:?}");
+    assert_eq!(bilan.en_attente, 1, "{bilan:?}");
+    assert_eq!(
+        etats_de(&backend, "miroir-rq3b", "71"),
+        vec![Some(ETAT_AJOUT_EN_ATTENTE.to_string())]
+    );
+}
+
+/// #7729 — un service dont chaque lecture de favoris prend du temps, et qui
+/// note dans un journal partagé le début et la fin de chaque lecture.
+struct ServiceLent {
+    journal: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl StreamingService for ServiceLent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "miroir-lent-7729"
+    }
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn set_enabled(&mut self, _enabled: bool) {}
+    fn favoris_miroir(&self) -> bool {
+        true
+    }
+    async fn authenticate(&mut self, _c: &serde_json::Value) -> Result<AuthStatus, TuneError> {
+        Ok(Default::default())
+    }
+    async fn auth_status(&self) -> AuthStatus {
+        AuthStatus {
+            authenticated: true,
+            ..Default::default()
+        }
+    }
+    async fn logout(&mut self) -> Result<(), TuneError> {
+        Ok(())
+    }
+    async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_track(&self, _id: &str) -> Result<StreamTrack, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_track_url(&self, _id: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_album(&self, _id: &str) -> Result<StreamAlbum, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_album_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_artist(&self, _id: &str) -> Result<StreamArtist, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_playlist(&self, _id: &str) -> Result<StreamPlaylist, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_playlist_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        Ok(Vec::new())
+    }
+    async fn get_user_favorites_dated(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        self.journal
+            .lock()
+            .unwrap()
+            .push(format!("lecture {fav_type}"));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        Ok(Some(Vec::new()))
+    }
+    async fn favoris_dates_complets(
+        &self,
+        fav_type: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
+        self.get_user_favorites_dated(fav_type).await
+    }
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
+        Ok(Vec::new())
+    }
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+        Ok(Vec::new())
+    }
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+        Ok(Vec::new())
+    }
+}
+
+/// #7729 — pendant un rafraîchissement du miroir, une écriture demandée
+/// sur le service (le rafraîchissement du jeton, qui tient en même temps le
+/// registre des services) passe entre deux types de favoris, au lieu
+/// d'attendre la fin de toutes les lectures. C'est cette attente qui gelait
+/// la route des favoris, et toutes les routes de streaming derrière elle.
+#[tokio::test]
+async fn une_ecriture_en_attente_passe_entre_deux_types_du_miroir_7729() {
+    let (backend, profils, _dir) = base(1);
+    let journal = Arc::new(Mutex::new(Vec::new()));
+    let svc: Box<dyn StreamingService> = Box::new(ServiceLent {
+        journal: journal.clone(),
+    });
+    let arc: ServiceArc = Arc::new(RwLock::new(svc));
+
+    let miroir = {
+        let arc = arc.clone();
+        let backend = backend.clone();
+        let appelant = profils[0];
+        tokio::spawn(async move { rafraichir(&arc, &backend, appelant).await })
+    };
+    // Attendre que la première lecture (les titres) ait commencé.
+    while !journal
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.starts_with("lecture tracks"))
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let ecriture = {
+        let arc = arc.clone();
+        let journal = journal.clone();
+        tokio::spawn(async move {
+            let _ecriture = arc.write().await;
+            journal.lock().unwrap().push("ecriture".into());
+        })
+    };
+    ecriture.await.unwrap();
+    miroir.await.unwrap();
+
+    let journal = journal.lock().unwrap().clone();
+    let position = |motif: &str| journal.iter().position(|l| l.starts_with(motif));
+    let ecrit = position("ecriture").expect("l'écriture a eu lieu");
+    let albums = position("lecture albums").expect("les albums ont été lus");
+    assert!(
+        ecrit < albums,
+        "#7729 : le miroir garde le verrou de lecture pendant toutes ses lectures, \
+         l'écriture en attente passe après elles : {journal:?}"
     );
 }

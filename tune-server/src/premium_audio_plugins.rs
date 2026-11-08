@@ -43,6 +43,9 @@ impl TunePlugin for PremiumAudio {
             "channel-remap" => {
                 "Réaffectation des canaux : matrice en dB par zone et par album (4.0, 5.1…)"
             }
+            "upsampler" => {
+                "Suréchantillonnage : filtres polyphases vers la plus haute cadence du DAC, sortie locale"
+            }
             _ => "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
         }
     }
@@ -59,11 +62,26 @@ impl TunePlugin for PremiumAudio {
             "converter" => include_str!("../../sdk/tune-plugin-converter/manifest.json"),
             "declick" => include_str!("../../sdk/tune-plugin-declick/manifest.json"),
             "channel-remap" => include_str!("../../sdk/tune-plugin-channel-remap/manifest.json"),
+            // #7614 — `manifest.embedded.json` et non `manifest.json` : ce nom-là
+            // désigne un greffon natif (ABI, `sdk/plugins.json`), ce que le
+            // suréchantillonneur n'est pas — il n'est qu'embarqué dans `tune-core`.
+            "upsampler" => {
+                include_str!("../../sdk/tune-plugin-surechantillonnage/manifest.embedded.json")
+            }
             _ => return Err("unknown premium audio plugin".into()),
         };
         let manifest: tune_plugin_sdk::manifest::Manifest =
             serde_json::from_str(raw).map_err(|e| e.to_string())?;
-        let capabilities = tune_plugin_sdk::manifest::reference_host_capabilities();
+        let mut capabilities = tune_plugin_sdk::manifest::reference_host_capabilities();
+        // #7614 — l'hôte EMBARQUÉ (`tune-core`, sortie locale) porte l'étage
+        // de changement de cadence ; l'hôte natif (ABI) ne le porte pas, et la
+        // capacité reste absente de `reference_host_capabilities`.
+        if self.id == "upsampler" {
+            capabilities.insert(
+                tune_plugin_sdk::rate::AUDIO_RATE_CHANGE.to_string(),
+                tune_plugin_sdk::manifest::SDK_VERSION,
+            );
+        }
         manifest
             .negotiate(&capabilities)
             .map_err(|e| format!("SDK negotiation: {e:?}"))?;
@@ -110,6 +128,13 @@ pub fn descriptor(id: &str) -> Value {
             "batch",
         ),
         "declick" => ("declick", vec!["/api/v1/declick"], "declick", "batch"),
+        // #7614 — payant comme le crossfeed, facultatif comme l'égaliseur.
+        "upsampler" => (
+            "upsampler",
+            vec!["/api/v1/upsampler", "/api/v1/upsampler/zones/{zone}"],
+            "upsampling",
+            "dsp",
+        ),
         // #6044 — gratuit, comme l'égaliseur (même droit `dsp_eq`).
         "channel-remap" => (
             "reaffectation",
@@ -951,6 +976,24 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{reponse}");
+        // Ni diagnostics : le greffon n'est pas chargé.
+        let (status, reponse) = appel_avec_corps(
+            &app,
+            "POST",
+            &format!("/api/v1/audio-plugins/{tiers}/diagnostics"),
+            json!({"enabled": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{reponse}");
+        assert_eq!(reponse["error"], "plugin_not_loaded", "{reponse}");
+        let (status, _) = appel_avec_corps(
+            &app,
+            "POST",
+            "/api/v1/audio-plugins/absent-du-disque/diagnostics",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, reponse) = appel(&app, "GET", "/api/v1/audio-plugins").await;
         assert_eq!(status, StatusCode::OK, "état : {status} {reponse}");
         assert!(

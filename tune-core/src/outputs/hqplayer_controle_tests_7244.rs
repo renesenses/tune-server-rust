@@ -16,6 +16,12 @@ struct Options {
     sortie_refusee: bool,
     stop_lent: bool,
     fragment_et_reponse_en_trop: bool,
+    /// #7869 — octets non sollicités collés à une réponse : après la première
+    /// seulement, ou après chacune (`toujours`).
+    octets_apres_reponse: Option<(&'static [u8], bool)>,
+    /// #7869 — octets poussés dès l'ouverture, sur chaque connexion après la
+    /// première.
+    octets_a_l_ouverture: Option<&'static [u8]>,
 }
 #[derive(Default)]
 struct Etat {
@@ -52,6 +58,12 @@ impl Banc {
                         clients.spawn(async move {
                             let mut socket = BufReader::new(socket);
                             let mut acquittement_retarde = false;
+                            if let Some(octets) = options.octets_a_l_ouverture
+                                && id > 1
+                                && socket.get_mut().write_all(octets).await.is_err()
+                            {
+                                return;
+                            }
                             loop {
                                 let mut line = String::new();
                                 if socket.read_line(&mut line).await.unwrap_or(0) == 0 { return; }
@@ -92,6 +104,11 @@ impl Banc {
                                     tokio::task::yield_now().await;
                                     if socket.get_mut().write_all(&bytes[coupe..]).await.is_err() { return; }
                                     if socket.get_mut().write_all(b"<Pause result=\"OK\"/>").await.is_err() { return; }
+                                } else if let Some((octets, toujours)) = options.octets_apres_reponse {
+                                    let premiere = etat.lock().unwrap().commandes.len() == 1;
+                                    let mut trame = reponse.into_bytes();
+                                    if toujours || premiere { trame.extend_from_slice(octets); }
+                                    if socket.get_mut().write_all(&trame).await.is_err() { return; }
                                 } else if socket.get_mut().write_all(reponse.as_bytes()).await.is_err() { return; }
                             }
                         });
@@ -276,15 +293,22 @@ async fn une_reponse_supplementaire_ne_devient_pas_celle_de_la_requete_suivante_
         !a.contains("<Pause"),
         "#7244 : une réponse n'en avale pas deux"
     );
-    let erreur = sortie
+    // #7869 : le Status suivant n'échoue plus, il est renvoyé sur une
+    // connexion neuve ; le Pause en trop n'en devient toujours pas la réponse.
+    let b2 = sortie
         .command("<Status subscribe=\"0\" />")
         .await
-        .expect_err("#7244 : le Pause supplémentaire n'acquitte pas un Status");
-    assert!(erreur.contains("hqplayer_control_"), "{erreur}");
-    sortie
-        .command("<Status subscribe=\"0\" />")
-        .await
-        .expect("une requête suivante ouvre une connexion propre");
+        .expect("#7869 : la commande suivante réussit après reconnexion");
+    assert!(
+        b2.starts_with("<Status") && !b2.contains("<Pause"),
+        "#7244 : le Pause supplémentaire n'acquitte pas un Status : {b2}"
+    );
+    let e = b.etat.lock().unwrap();
+    assert_eq!(e.connexions, 2, "#7244 : l'ancienne socket est abandonnée");
+    assert_eq!(
+        e.commandes[1].0, 2,
+        "le second Status part sur la connexion neuve"
+    );
 }
 
 #[tokio::test]
@@ -303,4 +327,106 @@ async fn status_ne_peut_pas_acquitter_playlistclear_7244() {
         erreur.contains("hqplayer_control_reply_mismatch"),
         "{erreur}"
     );
+}
+
+// #7869 — HQPlayer 3 Desktop (testeur, rc10) : la zone reste hors ligne et
+// chaque lecture échoue sur `hqplayer_control_unsolicited_response`. Ce que
+// HQPlayer 3 envoie en trop n'est pas encore connu (pas de journal) : les
+// formes ci-dessous sont des hypothèses compatibles avec ce message, qui ne
+// naît que d'octets restés après une réponse ou arrivés entre deux commandes.
+
+const STATUS_POUSSE: &[u8] = br#"<Status state="2" position="12" length="300"/>"#;
+
+#[tokio::test]
+async fn octets_non_sollicites_une_fois_la_commande_reussit_apres_reconnexion_7869() {
+    let b = Banc::nouveau(Options {
+        octets_apres_reponse: Some((STATUS_POUSSE, false)),
+        ..Default::default()
+    })
+    .await;
+    let sortie = b.sortie();
+    sortie.action("<Pause />").await.unwrap();
+    let statut = sortie
+        .get_status()
+        .await
+        .expect("#7869 : des octets non sollicités ne doivent plus faire échouer la commande");
+    assert_eq!(
+        statut.state,
+        TransportState::Paused,
+        "#7244 : le Status poussé (state=2) ne devient pas la réponse"
+    );
+    let e = b.etat.lock().unwrap();
+    assert_eq!(e.connexions, 2, "une seule reconnexion");
+    assert_eq!(
+        e.commandes.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![1, 2],
+        "le Status n'est écrit qu'une fois, sur la connexion neuve"
+    );
+}
+
+#[tokio::test]
+async fn octets_non_sollicites_a_chaque_fois_erreur_nommee_apres_la_seconde_tentative_7869() {
+    let b = Banc::nouveau(Options {
+        octets_apres_reponse: Some((STATUS_POUSSE, true)),
+        octets_a_l_ouverture: Some(STATUS_POUSSE),
+        ..Default::default()
+    })
+    .await;
+    let sortie = b.sortie();
+    sortie.action("<Pause />").await.unwrap();
+    let erreur = sortie
+        .get_status()
+        .await
+        .expect_err("#7869 : la seconde connexion est aussi encombrée");
+    assert_eq!(
+        erreur,
+        format!("{CODE_OCTETS_NON_SOLLICITES}: {MESSAGE_OCTETS_NON_SOLLICITES}")
+    );
+    assert_eq!(
+        crate::orchestrator::PlaybackOrchestrator::message_echec_sortie(
+            &erreur,
+            "auto",
+            None,
+            "audio/flac"
+        ),
+        MESSAGE_OCTETS_NON_SOLLICITES,
+        "le message montré ne contient pas le code interne"
+    );
+    let e = b.etat.lock().unwrap();
+    assert_eq!(e.connexions, 2, "deux tentatives, pas plus");
+    assert_eq!(e.commandes.len(), 1, "le Status n'est jamais écrit");
+}
+
+/// Hypothèse HQPlayer 3 : chaque réponse est suivie d'octets en trop, un
+/// octet nul ou un second document. La lecture complète doit aboutir.
+#[tokio::test]
+async fn hqplayer_3_octets_apres_chaque_reponse_la_lecture_aboutit_7869() {
+    for octets in [&b"\0"[..], STATUS_POUSSE] {
+        let b = Banc::nouveau(Options {
+            octets_apres_reponse: Some((octets, true)),
+            ..Default::default()
+        })
+        .await;
+        let sortie = b.sortie();
+        sortie
+            .play_media(&media())
+            .await
+            .unwrap_or_else(|e| panic!("#7869 : lecture refusée avec {octets:?} : {e}"));
+        assert_eq!(
+            b.commandes("Play"),
+            1,
+            "le Play n'est jamais envoyé deux fois"
+        );
+        assert_eq!(
+            sortie.get_status().await.unwrap().state,
+            TransportState::Playing
+        );
+    }
+}
+
+#[test]
+fn le_debut_des_octets_journalises_est_lisible_et_borne_7869() {
+    assert_eq!(debut_des_octets(b"\0<Status/>"), "\\0<Status/>");
+    assert_eq!(debut_des_octets(&[b'x'; 500]).len(), DEBUT_JOURNALISE);
+    assert_eq!(debut_des_octets(&[0xff, b'a']), "\u{fffd}a");
 }

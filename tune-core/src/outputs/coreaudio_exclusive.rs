@@ -555,8 +555,11 @@ impl ExclusiveOutput {
                 let buffer = data.buffer;
                 let read = ring_for_callback.pop(buffer);
 
-                // Apply volume
-                let v = vol_for_callback.load(Ordering::Relaxed) as f32 / 1000.0;
+                // Apply volume — #7968 : le volume partagé est rangé en
+                // `UNITE_DU_GAIN_DE_RENDU` (millionièmes), plus en millièmes.
+                let v = crate::audio::volume_scale::gain_des_unites(
+                    vol_for_callback.load(Ordering::Relaxed),
+                ) as f32;
                 for sample in &mut buffer[..read] {
                     *sample *= v;
                 }
