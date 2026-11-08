@@ -76,6 +76,11 @@ pub struct QobuzService {
     /// Set when Qobuz rejected the token and no relogin was possible — the
     /// session is over and the persisted row is worthless.
     session_expired: bool,
+    /// #8134 — l'application `(app_id, app_secret)` avec laquelle la dernière
+    /// session a été ouverte (connexion réussie) ou restaurée. Une application
+    /// servie par la configuration distante n'est adoptée qu'après une
+    /// connexion réussie ; tant qu'elle ne l'est pas, celle-ci reste le repli.
+    app_validee: Option<(String, String)>,
     /// Cache du contenu ÉDITORIAL uniquement — sélections, nouveautés, genres,
     /// playlists mises en avant. Jamais les favoris ni les playlists de
     /// l'utilisateur : ceux-là changent quand il clique, et une réponse
@@ -1172,6 +1177,7 @@ impl QobuzService {
             last_relogin_attempt: None,
             needs_token_rewrite: false,
             session_expired: false,
+            app_validee: None,
             cache_editorial: Mutex::new(HashMap::new()),
             cache_album: Mutex::new(HashMap::new()),
             favoris_en_vol: Mutex::new(HashMap::new()),
@@ -1243,36 +1249,66 @@ impl QobuzService {
         self.proxy_first = proxy_first;
     }
 
-    async fn refresh_credentials(&mut self) {
+    /// L'application `(app_id, app_secret)` que sert la configuration distante,
+    /// sans l'adopter : voir [`Self::applications_a_essayer`].
+    async fn application_distante(&self) -> Option<(String, String)> {
         let url = self
             .bases_de_test
             .as_ref()
             .map_or(REMOTE_CONFIG_URL, |b| b.config_distante.as_str());
         match self.client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                if let Ok(data) = resp.json::<serde_json::Value>().await {
-                    let qobuz = &data["qobuz"];
-                    if let (Some(id), Some(secret)) =
-                        (qobuz["app_id"].as_str(), qobuz["app_secret"].as_str())
-                    {
-                        info!(old_id = %&self.app_id, new_id = %id, "qobuz_credentials_refreshed");
-                        // 01/11/2026 : un changement d'app_id distant fait
-                        // tomber les sessions et refuser les connexions ; il
-                        // doit se voir au premier coup d'œil dans le journal.
-                        if !self.app_id.is_empty() && self.app_id != id {
-                            warn!(
-                                ancien = %prefixe_app_id(&self.app_id),
-                                nouveau = %prefixe_app_id(id),
-                                "qobuz_app_id_distant_change"
-                            );
-                        }
-                        self.app_id = id.to_string();
-                        self.app_secret = secret.to_string();
-                    }
+                let data = resp.json::<serde_json::Value>().await.ok()?;
+                let qobuz = &data["qobuz"];
+                let (Some(id), Some(secret)) =
+                    (qobuz["app_id"].as_str(), qobuz["app_secret"].as_str())
+                else {
+                    return None;
+                };
+                info!(
+                    actuel = %prefixe_app_id(&self.app_id),
+                    distant = %prefixe_app_id(id),
+                    "qobuz_credentials_refreshed"
+                );
+                // 01/11/2026 : un changement d'app_id distant fait
+                // tomber les sessions et refuser les connexions ; il
+                // doit se voir au premier coup d'œil dans le journal.
+                if !self.app_id.is_empty() && self.app_id != id {
+                    warn!(
+                        ancien = %prefixe_app_id(&self.app_id),
+                        nouveau = %prefixe_app_id(id),
+                        "qobuz_app_id_distant_change"
+                    );
                 }
+                Some((id.to_string(), secret.to_string()))
             }
-            _ => info!("qobuz_remote_config_unavailable"),
+            _ => {
+                info!("qobuz_remote_config_unavailable");
+                None
+            }
         }
+    }
+
+    /// #8134 — (candidate, repli) pour une connexion.
+    ///
+    /// La candidate est l'application distante quand il y en a une, sinon
+    /// l'application actuelle. Le repli est l'application qui a ouvert la
+    /// dernière session (à défaut, l'actuelle), quand elle diffère de la
+    /// candidate : un refus de la candidate est alors réessayé une fois avec
+    /// elle, au lieu d'être présenté comme un refus du mot de passe.
+    async fn applications_a_essayer(&self) -> ((String, String), Option<(String, String)>) {
+        let actuelle = (self.app_id.clone(), self.app_secret.clone());
+        let precedente = self
+            .app_validee
+            .clone()
+            .or_else(|| (!actuelle.0.is_empty()).then(|| actuelle.clone()));
+        let candidate = self
+            .application_distante()
+            .await
+            .or_else(|| precedente.clone())
+            .unwrap_or(actuelle);
+        let repli = precedente.filter(|p| !p.0.is_empty() && p.0 != candidate.0);
+        (candidate, repli)
     }
 
     /// GET against the primary endpoint for the configured order, falling back
@@ -2828,17 +2864,18 @@ impl QobuzService {
         }
     }
 
-    /// One login attempt against a specific API base.
+    /// One login attempt against a specific API base, for one application.
     async fn login_at(
         &self,
         base: &str,
+        app_id: &str,
         username: &str,
         password: &str,
     ) -> Result<serde_json::Value, AttemptError> {
         let resp = self
             .client
             .post(format!("{base}/user/login"))
-            .query(&[("app_id", self.app_id.as_str())])
+            .query(&[("app_id", app_id)])
             .form(&[("username", username), ("password", password)])
             .send()
             .await
@@ -2863,25 +2900,42 @@ impl QobuzService {
         username: &str,
         password: &str,
     ) -> Result<AuthStatus, TuneError> {
-        self.refresh_credentials().await;
+        let (candidate, repli) = self.applications_a_essayer().await;
+        // Sans session antérieure, rien de mieux à garder : la candidate est
+        // adoptée d'emblée, comme avant #8134.
+        if self.app_validee.is_none() {
+            (self.app_id, self.app_secret) = candidate.clone();
+        }
 
-        let (primary, fallback) = self.bases_ordonnees();
-        let data = match self.login_at(primary, username, password).await {
-            Ok(d) => d,
-            Err(err) if err.transient() => {
-                log_fallback(self.proxy_first, "/user/login", &err);
-                self.login_at(fallback, username, password)
-                    .await
-                    .map_err(|e| {
-                        self.journaliser_echec_connexion(&e);
-                        erreur_de_connexion(&e)
-                    })?
-            }
+        let (data, retenue) = match self.connexion_avec(&candidate.0, username, password).await {
+            Ok(d) => (d, candidate),
             Err(err) => {
-                self.journaliser_echec_connexion(&err);
-                return Err(erreur_de_connexion(&err));
+                self.journaliser_echec_connexion(&candidate.0, &err);
+                // #8134 — Qobuz peut refuser une application avec le message
+                // d'un mauvais mot de passe : seule la comparaison avec
+                // l'application précédente, même mot de passe, les distingue.
+                let refus = matches!(err.statut_http(), Some(400 | 401));
+                let Some(repli) = repli.filter(|_| refus) else {
+                    return Err(erreur_de_connexion(&err));
+                };
+                match self.connexion_avec(&repli.0, username, password).await {
+                    Ok(d) => {
+                        warn!(
+                            refusee = %prefixe_app_id(&candidate.0),
+                            conservee = %prefixe_app_id(&repli.0),
+                            "qobuz_app_id_distant_refuse_precedent_conserve"
+                        );
+                        (d, repli)
+                    }
+                    Err(e) => {
+                        self.journaliser_echec_connexion(&repli.0, &e);
+                        return Err(erreur_de_connexion(&e));
+                    }
+                }
             }
         };
+        (self.app_id, self.app_secret) = retenue.clone();
+        self.app_validee = Some(retenue);
 
         self.user_auth_token = data["user_auth_token"].as_str().map(Into::into);
         self.username = data["user"]["display_name"].as_str().map(Into::into);
@@ -2895,11 +2949,28 @@ impl QobuzService {
         Ok(self.auth_status_internal())
     }
 
+    /// `user/login` pour une application, dans l'ordre direct/relais configuré.
+    async fn connexion_avec(
+        &self,
+        app_id: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<serde_json::Value, AttemptError> {
+        let (primary, fallback) = self.bases_ordonnees();
+        match self.login_at(primary, app_id, username, password).await {
+            Err(err) if err.transient() => {
+                log_fallback(self.proxy_first, "/user/login", &err);
+                self.login_at(fallback, app_id, username, password).await
+            }
+            autre => autre,
+        }
+    }
+
     /// Une ligne qui dit, sans relire le corps de Qobuz, si c'est le compte ou
     /// l'application qui est refusé, et avec quel `app_id` (six caractères).
-    fn journaliser_echec_connexion(&self, err: &AttemptError) {
+    fn journaliser_echec_connexion(&self, app_id: &str, err: &AttemptError) {
         let nature = nature_echec_connexion(err);
-        let app_id = prefixe_app_id(&self.app_id);
+        let app_id = prefixe_app_id(app_id);
         if nature == "application_refusee" {
             warn!(
                 nature,
@@ -4722,6 +4793,13 @@ impl StreamingService for QobuzService {
             if let Some(secret) = tokens["app_secret"].as_str() {
                 self.app_secret = secret.into();
             }
+            // #8134 — la session enregistrée a été ouverte avec cette application.
+            if let (Some(id), Some(secret)) =
+                (tokens["app_id"].as_str(), tokens["app_secret"].as_str())
+                && !id.is_empty()
+            {
+                self.app_validee = Some((id.into(), secret.into()));
+            }
             self.stored_username = tokens["stored_username"].as_str().map(Into::into);
             // A row written before this field was dropped still carries the
             // plaintext password. Do not load it into the session — flag the row
@@ -4741,8 +4819,23 @@ impl StreamingService for QobuzService {
         self.needs_token_rewrite
     }
 
+    /// #8134 — la session restaurée est éprouvée avec l'application qui l'a
+    /// ouverte. Une autre application servie entre-temps par la configuration
+    /// distante n'est adoptée qu'à la prochaine connexion, et seulement si
+    /// Qobuz l'accepte ; jusque-là elle ne peut pas faire tomber la session.
     async fn post_restore(&mut self) {
-        self.refresh_credentials().await;
+        if let Some(distante) = self.application_distante().await
+            && self
+                .app_validee
+                .as_ref()
+                .is_none_or(|(id, _)| *id == distante.0)
+        {
+            // Même application : son secret distant, s'il a changé, est repris.
+            if self.app_validee.is_some() {
+                self.app_validee = Some(distante.clone());
+            }
+            (self.app_id, self.app_secret) = distante;
+        }
         let _ = self.refresh_if_needed().await;
     }
 }
@@ -9012,6 +9105,12 @@ mod page_du_label_tests;
 #[cfg(test)]
 #[path = "qobuz_delai_favoris_7760_tests.rs"]
 mod delai_favoris_7760_tests;
+
+/// #8134 — une application distante refusée ne fait ni tomber la session, ni
+/// passer le refus pour un mauvais mot de passe.
+#[cfg(test)]
+#[path = "qobuz_application_distante_8134_tests.rs"]
+mod application_distante_8134_tests;
 
 /// renesenses/tune-server-rust#7068 — un mauvais mot de passe Qobuz sortait en
 /// `qobuz login: 401 {"status":"error","code":401,"message":"Invalid
