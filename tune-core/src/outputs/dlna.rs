@@ -1453,10 +1453,15 @@ impl DlnaOutput {
                 "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>1</DesiredMute>",
             )
             .await;
+        // Seule une RÉPONSE de refus de l'appareil (défaut UPnP, ou statut
+        // d'échec sans corps) fait passer au volume nul : une panne réseau
+        // (délai dépassé) ne dit rien de sa sourdine, et basculer en repli
+        // durerait jusqu'à la levée.
         let refus = match reponse {
             Ok(r) if !r.contains("UPnPError") && !r.contains("<errorCode>") => None,
             Ok(r) => Some(r),
-            Err(e) => Some(e),
+            Err(e) if e.starts_with(SOAP_HTTP_SANS_CORPS_PREFIX) => Some(e),
+            Err(e) => return Err(e),
         };
         let Some(refus) = refus else {
             self.sourdine_par_volume_nul.store(false, Ordering::Relaxed);
@@ -1475,7 +1480,17 @@ impl DlnaOutput {
         // `set_volume` a retenu 0 comme consigne : la consigne d'avant est
         // celle que l'auditeur retrouvera.
         self.dernier_volume_pct.store(consigne, Ordering::Relaxed);
-        pose?;
+        if let Err(e) = pose {
+            // Un appareil à volume décoratif (#5575) refuse aussi le volume
+            // nul : ni sourdine ni volume, Tune ne peut pas le faire taire.
+            warn!(
+                device = %self.name,
+                device_id = %self.device_id,
+                error = %e,
+                "dlna_sourdine_impossible_ni_mute_ni_volume_nul"
+            );
+            return Err(e);
+        }
         self.sourdine_par_volume_nul.store(true, Ordering::Relaxed);
         Ok("volume_nul")
     }
@@ -1585,11 +1600,18 @@ impl DlnaOutput {
             );
             super::dlna_repli_set_uri::memoriser_volume_remonte_a_l_uri(&self.device_id);
         }
-        // #8151 — sans sourdine sur l'appareil, rendre la consigne serait
-        // rendre le son : c'est le volume nul qui est reposé.
-        if self.en_sourdine() && self.sourdine_par_volume_nul.load(Ordering::Relaxed) {
+        // #8151 — en sourdine, seule la sourdine est reposée, jamais un
+        // `SetVolume` : un firmware qui lève sa sourdine sur `SetVolume`
+        // jouerait la consigne le temps d'un aller-retour. La consigne reste
+        // dans `dernier_volume_pct`, et `set_mute(false)` la repose avant de
+        // lever la sourdine. Sans sourdine sur l'appareil, c'est le volume
+        // nul qui est reposé.
+        if self.en_sourdine() {
             self.reimposer_la_sourdine("apres_saut").await;
-            return 0.0;
+            if self.sourdine_par_volume_nul.load(Ordering::Relaxed) {
+                return 0.0;
+            }
+            return connu;
         }
         match self.set_volume(connu).await {
             Ok(()) => {
@@ -1600,8 +1622,6 @@ impl DlnaOutput {
                     volume_pct = (connu * 100.0).round() as u64,
                     "dlna_volume_reimpose_apres_saut"
                 );
-                // #8151 — un `SetVolume` peut lever la sourdine d'un firmware.
-                self.reimposer_la_sourdine("apres_saut").await;
                 connu
             }
             Err(e) => {
