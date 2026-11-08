@@ -237,6 +237,7 @@ fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) ->
                 tune_core::TuneError::Unsupported(_) => "unsupported",
                 tune_core::TuneError::Credentials(_) => "credentials",
                 tune_core::TuneError::AppRefused(_) => "app_refused",
+                tune_core::TuneError::Refused { .. } => "refused",
                 tune_core::TuneError::Other(_) => "other",
             };
             let message = e.to_string();
@@ -1777,6 +1778,18 @@ fn reponse_echec_auth(service: &str, e: &tune_core::TuneError) -> Response {
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": CODE_APPLICATION_REFUSEE,
+                "service": service,
+                "error": message,
+            })),
+        )
+            .into_response(),
+        // #8142 — un refus qui porte son propre code (`spotify_callback_sans_code`,
+        // `spotify_autorisation_refusee`, `spotify_state_inconnu`) : sans lui,
+        // le client n'avait qu'un texte brut et affichait son message générique.
+        tune_core::TuneError::Refused { code, message } => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": code,
                 "service": service,
                 "error": message,
             })),
@@ -4981,6 +4994,9 @@ mod tests_echec_de_connexion_7068 {
         assert_eq!(texte, "qobuz login: 500 boom");
     }
 }
+
+#[cfg(test)]
+mod spotify_rappel_colle_8142_tests;
 
 #[cfg(test)]
 mod bio_qobuz_8129_tests;
