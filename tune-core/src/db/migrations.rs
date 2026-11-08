@@ -2792,6 +2792,11 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "tracks_explicit",
         up: "",
     },
+    // #8077 — les apports d'un service (Qobuz) à un album LOCAL : le
+    // rapprochement (`apports_service_albums`) et les champs repris
+    // (`apports_service`), en base seulement, réversibles. Jumelle PG : 108.
+    // Numérotée 142 / PG 108 après #8093 (141 / PG 107, contenus explicites).
+    Migration { version: 142, name: "apports_service", up: include_str!("../../migrations/apports_service.sql") },
 ];
 
 /// L'index partiel des pistes marquées explicites (#8088), commun aux deux
@@ -5933,6 +5938,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         107,
         "tracks_explicit",
         include_str!("../../migrations/postgres/107_tracks_explicit.sql"),
+    ),
+    // Jumelle de la SQLite 142 (#8077) : les apports d'un service à un album
+    // local, même DDL (`migrations/apports_service.sql`).
+    (
+        108,
+        "apports_service",
+        include_str!("../../migrations/postgres/108_apports_service.sql"),
     ),
 ];
 
@@ -9612,7 +9624,9 @@ mod tests {
         // toutes leurs lectures NOMMENT.
         // 107 : `tracks_explicit` (#8088), jumelle de la SQLite 141. Pose
         // `tracks.explicit`, que l'INSERT et l'UPDATE des pistes NOMMENT.
-        assert_eq!(pg_latest_version(), 107, "latest PG migration must be 107");
+        // 108 : `apports_service` (#8077), jumelle de la SQLite 142. Crée les
+        // tables des apports Qobuz, que la fiche album NOMME.
+        assert_eq!(pg_latest_version(), 108, "latest PG migration must be 108");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

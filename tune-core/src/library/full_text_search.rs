@@ -1416,7 +1416,14 @@ mod tests {
         };
         assert_eq!(liste("mahler kondrashin"), 2);
         assert_eq!(liste("Langsam"), 1);
-        assert_eq!(liste("mahler_kondrashin"), 0, "`_` littéral");
+        // #7619 (décision du 01/11/2026) : début de mot ; `_` sépare deux
+        // mots, comme dans l'index, et n'est jamais un joker — même attente
+        // que le jumeau SQLite (`track_repo`, jeu #5192). « ahler » prouve
+        // que le motif reste un début de mot : un `_` ou un `%` non échappé
+        // le laisserait trouver « Mahler ».
+        assert_eq!(liste("mahler_kondrashin"), 2, "`_` sépare deux mots");
+        assert_eq!(liste("mahler%kondrashin"), 2, "`%` sépare deux mots");
+        assert_eq!(liste("ahler"), 0, "milieu de mot");
         // Fil 1684 : le compositeur, casse et accents repliés, sixième champ
         // — les marqueurs `$n` suivent jusqu'au bout.
         assert_eq!(liste("roger waters"), 1, "compositeur");

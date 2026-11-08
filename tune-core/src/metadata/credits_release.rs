@@ -269,6 +269,21 @@ pub fn ecrire_credits_piste(
             &[&track_id as &dyn ToSqlValue, &source as &dyn ToSqlValue],
         )
         .ok();
+    inserer_credits_piste(backend, track_id, source, lignes)
+}
+
+/// L'insertion seule de [`ecrire_credits_piste`], sans purge : positions
+/// numérotées depuis 0, fiche artiste LIÉE (MBID puis nom), jamais créée,
+/// `source` posée sur chaque ligne. Rend le nombre de lignes écrites.
+///
+/// #8077 — les apports Qobuz purgent leurs SEULES lignes (`source =
+/// 'qobuz'`), jamais les lignes de source inconnue : ils passent par ici.
+pub fn inserer_credits_piste(
+    backend: &Arc<dyn DbBackend>,
+    track_id: i64,
+    source: &str,
+    lignes: &[LigneCredit],
+) -> usize {
     let artistes = crate::db::artist_repo::ArtistRepo::with_backend(backend.clone());
     let mut ecrites = 0usize;
     for (pos, ligne) in lignes.iter().enumerate() {

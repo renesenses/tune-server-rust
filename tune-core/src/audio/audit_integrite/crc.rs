@@ -201,18 +201,25 @@ impl<R: Read> Lecteur<R> {
             }
             let avant = self.tampon.len();
             self.tampon.resize(avant + BLOC, 0);
-            let lus = loop {
-                match self.source.read(&mut self.tampon[avant..]) {
-                    Ok(n) => break n,
+            // Remplir le bloc entier : une lecture courte (`ReadFile` sous
+            // Windows, partage réseau) n'est pas une fin de fichier, et ne
+            // doit pas coûter un nouveau bloc remis à zéro (#8105).
+            let mut lus = 0;
+            while lus < BLOC {
+                match self.source.read(&mut self.tampon[avant + lus..]) {
+                    Ok(0) => {
+                        self.epuise = true;
+                        break;
+                    }
+                    Ok(n) => lus += n,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(e) => {
                         self.tampon.truncate(avant);
                         return Err(e);
                     }
                 }
-            };
+            }
             self.tampon.truncate(avant + lus);
-            self.epuise = lus == 0;
         }
         Ok(true)
     }
