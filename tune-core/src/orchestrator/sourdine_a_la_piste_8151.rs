@@ -70,4 +70,53 @@ impl PlaybackOrchestrator {
             ),
         }
     }
+
+    /// Réaffirme la sourdine de la zone sur sa sortie à l'avance sans blanc.
+    /// L'envoi part dans une tâche : l'avance est appelée par le sondeur, qui
+    /// peut tenir le verrou de la sortie pendant ses relevés. Un renderer
+    /// OpenHome la reçoit sans ce verrou, comme `set_mute` (#7841).
+    pub(super) async fn reimposer_la_sourdine_a_l_enchainement(&self, zone_id: i64) {
+        if !self.zone_en_sourdine(zone_id).await {
+            return;
+        }
+        let Some(device_id) = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id)
+        else {
+            return;
+        };
+        let (sortie, envoi_direct) = {
+            let registre = self.outputs.lock().await;
+            (
+                registre.get(&device_id),
+                registre.envoi_de_volume(&device_id),
+            )
+        };
+        let Some(sortie) = sortie else {
+            return;
+        };
+        tokio::spawn(async move {
+            let issue = match envoi_direct {
+                Some(envoi) => envoi.set_mute(true).await,
+                None => sortie.lock().await.set_mute(true).await,
+            };
+            match issue {
+                Ok(()) => info!(
+                    zone_id,
+                    device_id = %device_id,
+                    moment = "a_l_enchainement",
+                    "zone_sourdine_reimposee"
+                ),
+                Err(e) => warn!(
+                    zone_id,
+                    device_id = %device_id,
+                    moment = "a_l_enchainement",
+                    error = %e,
+                    "zone_sourdine_reimposee_echoue"
+                ),
+            }
+        });
+    }
 }

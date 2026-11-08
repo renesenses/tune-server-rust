@@ -135,3 +135,101 @@ async fn une_zone_hors_sourdine_ne_recoit_aucune_sourdine() {
     compat::reinitialiser_compatibilite(udn).unwrap();
     vie.abort();
 }
+
+/// Monte une file de deux pistes de bibliothèque sur la zone, la première en
+/// lecture.
+async fn file_de_deux_pistes(orch: &PlaybackOrchestrator, zone_id: i64) {
+    let pistes = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone());
+    let mut ids = Vec::new();
+    for n in 1..=2 {
+        let mut fiche = crate::db::models::Track::new(format!("Piste 8151-{n}"));
+        fiche.file_path = Some(format!("/aucun/chemin/8151/piste{n}.flac"));
+        fiche.track_number = n;
+        fiche.duration_ms = 179_000;
+        ids.push(pistes.create(&fiche).unwrap());
+    }
+    crate::db::play_queue_repo::PlayQueueRepo::with_backend(orch.db.clone())
+        .set_queue(zone_id, &ids)
+        .unwrap();
+    orch.playback
+        .play(
+            zone_id,
+            crate::playback::NowPlaying {
+                track_id: Some(ids[0]),
+                title: "Piste 8151-1".into(),
+                duration_ms: 179_000,
+                source: "local".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+}
+
+/// Renvoi de relecture : la piste suivante armée (`SetNextAVTransportURI`,
+/// enchaînement sans blanc) prend la main sans passer par `send_to_output`.
+/// L'appareil a levé sa sourdine à la transition : l'avance doit la reposer.
+#[tokio::test]
+async fn l_enchainement_sans_blanc_repose_la_sourdine_de_la_zone() {
+    let udn = "uuid:banc-8151-enchainement";
+    let (orch, zone_id, etat, vie) = banc(udn, true).await;
+    file_de_deux_pistes(&orch, zone_id).await;
+    // Le firmware vient de passer à la piste suivante, son ouvert.
+    *etat.muet.lock().await = false;
+
+    orch.advance_queue_metadata(zone_id, 1)
+        .await
+        .expect("l'avance sans blanc doit aboutir");
+    let mut reposee = false;
+    for _ in 0..100 {
+        if *etat.muet.lock().await {
+            reposee = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        reposee,
+        "#8151 : à l'enchaînement sans blanc, la sourdine de la zone n'a pas été reposée ; reçu : {:?}",
+        etat.commandes.lock().await
+    );
+    assert!(
+        !etat
+            .commandes
+            .lock()
+            .await
+            .iter()
+            .any(|c| c.starts_with("SetVolume")),
+        "aucun volume ne doit partir en sourdine : {:?}",
+        etat.commandes.lock().await
+    );
+
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+}
+
+/// Contre-épreuve : hors sourdine, l'avance sans blanc n'envoie aucun
+/// `SetMute`.
+#[tokio::test]
+async fn l_enchainement_hors_sourdine_n_envoie_aucune_sourdine() {
+    let udn = "uuid:banc-8151-enchainement-sonore";
+    let (orch, zone_id, etat, vie) = banc(udn, false).await;
+    file_de_deux_pistes(&orch, zone_id).await;
+
+    orch.advance_queue_metadata(zone_id, 1)
+        .await
+        .expect("l'avance sans blanc doit aboutir");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !etat
+            .commandes
+            .lock()
+            .await
+            .iter()
+            .any(|c| c.starts_with("SetMute")),
+        "hors sourdine, aucun SetMute : {:?}",
+        etat.commandes.lock().await
+    );
+
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+}

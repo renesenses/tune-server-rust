@@ -992,6 +992,10 @@ impl PlaybackOrchestrator {
             stream_id = flux_adopte.as_deref().unwrap_or("absent"),
             "avance_gapless_flux_adopte"
         );
+        // #8151 — la piste suivante armée prend la main sans `send_to_output` :
+        // un firmware qui lève sa sourdine à la transition repartirait au
+        // volume. La sourdine de la zone est réaffirmée dès l'avance.
+        self.reimposer_la_sourdine_a_l_enchainement(zone_id).await;
 
         let np = if let Some(track_id) = entry.track_id {
             let track_repo = crate::db::track_repo::TrackRepo::with_backend(self.db.clone());
