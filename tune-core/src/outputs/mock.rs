@@ -14,6 +14,10 @@ pub struct PlayCall {
     pub title: Option<String>,
     /// La profondeur annoncée à la sortie (`PlayMedia::bit_depth`), #6334.
     pub bit_depth: Option<u32>,
+    /// La durée annoncée à la sortie (`PlayMedia::duration_ms`), #7551.
+    pub duration_ms: Option<u64>,
+    /// Le type annoncé à la sortie (`PlayMedia::mime_type`), #7894.
+    pub mime_type: String,
 }
 
 /// A mock OutputTarget for testing playback flows.
@@ -42,10 +46,19 @@ pub struct MockOutput {
     /// C'est pourtant exactement la question du mode bit-perfect, où le défaut
     /// était de RENVOYER 100 % à chaque piste à un appareil déjà à 100 %.
     volume_calls: Arc<Mutex<Vec<f64>>>,
+    /// #7379 — armé, `get_status` rend le repli de #5662 (0,5) comme un DLNA
+    /// dont la réponse de volume est illisible.
+    volume_illisible: Arc<AtomicBool>,
     /// Le comportement du Devialet (renderer Rygel, fil 1780) : un Seek reçu
     /// en pause laisse l'appareil EN PAUSE — contrat UPnP. Armé, `seek`
     /// repasse l'état à `Paused`.
     seek_laisse_en_pause: Arc<AtomicBool>,
+    /// #7894 — armé, l'appareil n'a aucun média (`NO_MEDIA_PRESENT`) : la
+    /// pause n'a rien à suspendre, et la sortie le signale par
+    /// `take_nothing_playing_on_pause()`.
+    sans_media: Arc<AtomicBool>,
+    /// #7894 — posé par une pause reçue sans média ; lu une fois.
+    rien_ne_jouait: Arc<AtomicBool>,
     /// Chaque `resume` reçu, pour compter les relances.
     resume_calls: Arc<AtomicU64>,
     /// Le contrat de signal que la sortie PUBLIE (#4559).
@@ -122,7 +135,10 @@ impl MockOutput {
             stop_calls: Arc::new(AtomicU64::new(0)),
             set_next_calls: Arc::new(Mutex::new(Vec::new())),
             volume_calls: Arc::new(Mutex::new(Vec::new())),
+            volume_illisible: Arc::new(AtomicBool::new(false)),
             seek_laisse_en_pause: Arc::new(AtomicBool::new(false)),
+            sans_media: Arc::new(AtomicBool::new(false)),
+            rien_ne_jouait: Arc::new(AtomicBool::new(false)),
             resume_calls: Arc::new(AtomicU64::new(0)),
             signal_path: Arc::new(std::sync::Mutex::new(None)),
             suivante_preparee: Arc::new(std::sync::Mutex::new(SuivantePreparee::Inconnue)),
@@ -203,6 +219,16 @@ impl MockOutput {
 
     /// Override the reported `output_type` (default "mock"), so tests can model
     /// a specific protocol (e.g. "dlna" vs "squeezebox").
+    /// #7379 — la réponse de volume devient illisible (`true`) ou lisible.
+    pub fn rendre_le_volume_illisible(&self, illisible: bool) {
+        self.volume_illisible.store(illisible, Ordering::SeqCst);
+    }
+
+    /// #7379 — vrai quand le volume du statut est le repli de #5662.
+    pub fn dernier_volume_illisible(&self) -> bool {
+        self.volume_illisible.load(Ordering::SeqCst)
+    }
+
     pub fn with_type(mut self, output_type: &str) -> Self {
         self.output_type = output_type.into();
         self
@@ -230,6 +256,12 @@ impl MockOutput {
     /// Reproduit un renderer qui reste en pause après un Seek (Devialet).
     pub fn with_seek_qui_laisse_en_pause(self) -> Self {
         self.seek_laisse_en_pause.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// #7894 — un renderer sans média, qui ne joue rien.
+    pub fn with_sans_media(self) -> Self {
+        self.sans_media.store(true, Ordering::Relaxed);
         self
     }
 
@@ -276,6 +308,15 @@ impl MockOutput {
             .and_then(|c| c.bit_depth)
     }
 
+    /// La durée du dernier `play_media` (#7551).
+    pub async fn last_play_duration_ms(&self) -> Option<u64> {
+        self.play_calls
+            .lock()
+            .await
+            .last()
+            .and_then(|c| c.duration_ms)
+    }
+
     /// Les titres passes a `set_next_media`, DANS L'ORDRE (#3026).
     ///
     /// Le COMPTE d'appels ne dit pas *quelle* piste a ete armee, et l'URL d'un
@@ -299,6 +340,16 @@ impl MockOutput {
             .await
             .iter()
             .map(|c| c.title.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// Les types annoncés à `play_media`, DANS L'ORDRE (#7894).
+    pub async fn play_mime_types(&self) -> Vec<String> {
+        self.play_calls
+            .lock()
+            .await
+            .iter()
+            .map(|c| c.mime_type.clone())
             .collect()
     }
 
@@ -398,6 +449,10 @@ impl MockOutput {
 
 #[async_trait::async_trait]
 impl OutputTarget for MockOutput {
+    fn volume_du_statut_illisible(&self) -> bool {
+        self.dernier_volume_illisible()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -429,6 +484,8 @@ impl OutputTarget for MockOutput {
                 url: media.url.to_string(),
                 title: media.title.map(String::from),
                 bit_depth: media.bit_depth,
+                duration_ms: media.duration_ms,
+                mime_type: media.mime_type.to_string(),
             });
             return Err(motif);
         }
@@ -444,13 +501,24 @@ impl OutputTarget for MockOutput {
             url: media.url.to_string(),
             title: media.title.map(String::from),
             bit_depth: media.bit_depth,
+            duration_ms: media.duration_ms,
+            mime_type: media.mime_type.to_string(),
         });
         Ok(())
     }
 
     async fn pause(&self) -> Result<(), String> {
+        if self.sans_media.load(Ordering::Relaxed) {
+            *self.state.lock().await = TransportState::Stopped;
+            self.rien_ne_jouait.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         *self.state.lock().await = TransportState::Paused;
         Ok(())
+    }
+
+    fn take_nothing_playing_on_pause(&self) -> bool {
+        self.rien_ne_jouait.swap(false, Ordering::Relaxed)
     }
 
     async fn resume(&self) -> Result<(), String> {
@@ -513,7 +581,11 @@ impl OutputTarget for MockOutput {
             state: *self.state.lock().await,
             position_ms: self.position_ms.load(Ordering::Relaxed),
             duration_ms: self.duration_ms.load(Ordering::Relaxed),
-            volume: *self.volume.lock().await,
+            volume: if self.volume_illisible.load(Ordering::SeqCst) {
+                crate::outputs::dlna::volume_illisible_5662::REPLI_ILLISIBLE
+            } else {
+                *self.volume.lock().await
+            },
             muted: *self.muted.lock().await,
             current_uri: self.current_uri.lock().await.clone(),
             track_title: None,
@@ -544,6 +616,8 @@ impl OutputTarget for MockOutput {
             url: media.url.to_string(),
             title: media.title.map(String::from),
             bit_depth: media.bit_depth,
+            duration_ms: media.duration_ms,
+            mime_type: media.mime_type.to_string(),
         });
         let refus = self.refus_de_set_next.lock().unwrap().clone();
         if let Some(motif) = refus {

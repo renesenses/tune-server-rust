@@ -1,0 +1,48 @@
+Tune 1.0.0-rc11, den ellevte utgivelseskandidaten av Tune 1.0.
+
+- **Romkorrigering**: et tillegg, avslått som standard, måler rommet med mikrofon (sveip, impulsrespons, RT60) eller simulerer bassmodusene uten mikrofon, og foreslår deretter et mål og en automatisk equalizer som bare demper, med én profil per sone; uten Premium tones konvolusjonen med impulsrespons ut.
+- **Foreldrekontroll**: regler per profil i Innstillinger › Profiler, skjuling av eksplisitt innhold, tidsvinduer og lyttebudsjett.
+- **Oppsampling**: et Premium-tillegg for oppsampling av høy kvalitet kobles til den lokale utgangen, med innstilling per sone.
+- **Avansert spørring**: spør biblioteket med et uttrykk, det samme som definerer de smarte samlingene.
+- **Én side per album**: versjonene av et album grupperes og velges på albumsiden; nye filtre for DSD-kvalitet og flerkanal og antall kanaler vises.
+- **Notater og statistikk**: personlige notater i Markdown og bibliotekstatistikk etter fordeling.
+- **Katalog og spektrogram**: eksporter biblioteket som en utskrivbar HTML-katalog med gjeldende filtre; vis et sporets spektrogram fra menyen; en knapp stopper DR-analysen mellom to spor.
+- **Verdenskart**: landkart og landfilter i Biblioteket; globusen tegner grenser, kyster og store elver og navngir landet når du peker på det.
+- **Podkaster**: legg til en podkast med adressen til RSS-strømmen.
+- **TIDAL-miks**: raden «Dine miks» i Streaming › TIDAL viser og spiller kontoens personlige miks.
+- **Equalizer-import**: importer en equalizer-fil (AutoEq, Equalizer APO, OPRA) med forhåndsvisning av båndene før bruk.
+- **Biografier**: lenker til Tune-artister og -album og til kilden; biografier og albumnotater kompletteres ved behov fra Qobuz, uten å overskrive noe og med mulighet til å angre.
+- **Spillelister**: bytt ut et utilgjengelig tjenestespor på stedet og reparer spillelisten.
+- **Tune Circle**: skriv til en hel krets i Meldinger; generelle kretser og trådens samtykke går via reléet.
+- **Fysisk samling**: omslag for hver plate, søk i strømmetjenestene, bla etter mapper, sjangre og stiler.
+- **Radio**: filter på laveste strømkvalitet i «Flere filtre», «Mine radioer» skilt fra «Sist spilt», standardstrømmen alltid spillbar i lyttelandet.
+- **Tune tested**: Tune foreslår å legge til en enhet etter en times lytting uten feil, fra en egen knapp; en enhet som allerede er i katalogen legger til en husholdning.
+- **Bibliotek**: innstillingen «Bibliotek utvidet med tjenestenes favoritter», på som standard; raskere søk på ordstart; rutenettsøket krever alle ordene; periode Fra / Til på årstidslinjen; jevnere rulling av spor.
+- **Sporlister**: kolonnerekkefølgen kan endres og hver visning husker den; en spilleliste-visning får omslag, miniatyrstørrelse og kompakt topp; kildemerker i Spilleliste-behandleren.
+- **Hjem og fortsett**: velg panelene i lytteoversikten; «Fortsett å lytte» viser én undertittel per type, gjenopptar en podkast med tittel og omslag (gjenopptak fra lagret posisjon i en DLNA-sone kommer i neste versjon), og uten duplikater.
+- **Historikk**: en lytting regnes først etter 30 s eller halve sporet; «Spill» etter Stopp beholder pågående album eller spilleliste; podkastepisoder og radio bærer stasjonens navn.
+- **Lyttestatistikk**: importerte lyttinger (Roon, Plex, m3u) telles blant de mest spilte; smarte lister og Historikken teller som Biblioteket; en Qobuz-lytting teller ikke lenger for det lokale albumet med samme navn.
+- **Crosstalk og equalizer**: kurve for separasjon / farging og høyttalerrespons i innstillingsbildet, målseparasjon fra 1 dB; parametrisk graf låst som standard (Rediger / Ferdig) og én farge per kanal.
+- **Tillegg**: et panel «Tilleggenes status» for administratoren; et katalogkort og det lokale tillegget er nå ett enkelt tillegg.
+- **Varsler**: feil blir stående, pauses når du peker på dem og grupperes; de siste innebygde feilmeldingene er oversatt; unntakets råtekst er brettet sammen under «Detaljer».
+- **Bakgrunnsanalyser**: fremdriften vises, prioriteten er lav og standardverdien forsiktig etter skanningen; berikelsen fortsetter der den stoppet og prøver på nytt etter en 503; «Kjør gjennomgang» for plateselskapenes logoer virker også i pause.
+- **Støtte og fjerntilgang**: feilrapporten legger ved logger; lenken, QR-koden og kopieringsknappen er tilbake i Innstillinger › Fjerntilgang.
+- **Avspilling**: årsakene til omkoding navngis og FLAC leveres uendret når ingenting gjelder; Neste og Forrige hopper over spor som tjenesten avviser.
+- **Rettet, AirPlay 2**: «Pair»-knappen parer via AirPlay 2-komponenten eller navngir årsaken; ventingen på PIN-koden blokkerer ikke lenger avspillingen og lukking av vinduet avbryter den; økten åpnes på nytt etter en pause; posisjonen går fremover og en pause går ikke lenger i løkke; komponenten finnes for 64-bits Raspberry Pi.
+- **Rettet, DLNA og OpenHome**: gapless DSD-spor, raskere «neste», en pause gjort på enheten respekteres, maskinens egen utgang vises ikke lenger dobbelt, OpenHome-volum uten venting, listen Kazoo har lastet beholdes, raskere Play på TIDAL CD.
+- **Rettet, volum**: en ny lokal utgang starter ikke lenger på full styrke; når dempingen oppheves, går glidebryteren tilbake til forrige volum; hver posisjon på glidebryteren gir et eget nivå; WASAPI- og ASIO-volum høres umiddelbart; Tune følger enheten under sikkerhetstaket.
+- **Rettet, Windows**: snarveien åpnes uten konsollvindu; en DoP som utgangen ikke kan bære sendes som PCM; nettverksoppdagelsen passerer brannmuren; en uleselig temperatur bremser ikke lenger analysene; oppdateringen starter byttescriptet ved avslutning.
+- **Rettet, oppdateringer og lisens**: på Unix valideres den nye binærfilen og webgrensesnittet før de gamle erstattes, og en feil meldes tydelig; å fjerne lisensen frigjør også maskinen på nettstedet.
+- **Rettet, bibliotek**: bilder og videoer fra en UPnP-server kommer ikke lenger inn; en FLAC- + CUE-eske blir ett album; DSD- og CD-utgaver forblir to album; en håndlaget samling splittes ikke lenger; en slettet spilleliste gjenskapes ikke ved skanning; en ny innlesing uten artistkode flytter ikke lenger albumet til «Unknown Artist»; å legge til en mappe skanner bare den mappen.
+- **Rettet, omslag og analyser**: som siste utvei det største bildet i mappen; analyse av falsk Hi-Res over hele sporets lengde; gapless MP3; integritetskontrollen erklærer ikke lenger hele FLAC-filer for avkortet.
+- **Rettet, strømmetjenester**: Spotify-søket gir resultater, et avslag er ikke lenger stille og favorittene går forbi 50 spor; TIDAL › Favoritter fryser ikke lenger Tune; en Qobuz-konto uten favoritter gir raskt en tom liste; et konvertert spor starter i Safari.
+- **Rettet, nettverk og lagring**: oppdagelsen gjenopptas når nettverket dukker opp etter Tune; en SMB-montering som feiler sier hvorfor, også under Docker; sikkerhetskopien lykkes på PostgreSQL; CD-uttrekk avviser en full eller ikke-skrivbar destinasjon; Tune overlater Squeezebox-portene til en Lyrion-server på samme maskin.
+- **Rettet, visninger**: Konserter åpnes uten lisens; «Fjern all gruppering» vises igjen; Spilles nå følger albumbytte; en utløpt strømmeøkt beholder fanen «Koble til igjen»; Ny alarm forblir synlig.
+- **Rettet, Raspberry Pi 5**: viften i Active Cooler går igjen (nytt Tune OS-bilde).
+- **Sikkerhet**: herdingsrettelser; på en server uten autentisering avvises eksport av konfigurasjonen med hemmeligheter i klartekst (bruk sikkerhetskopien kryptert med en passfrase).
+
+## Kjente problemer
+
+- **Demping i en DLNA-sone**: en dempet sone kan starte igjen med lyd når et nytt spor startes. Senk volumet i stedet for å dempe til dette er løst (neste versjon).
+- **Gjenopptak av en podkastepisode**: i en DLNA-sone starter en gjenopptatt episode fra begynnelsen (neste versjon).
+- **Tune Circle**: sirkler du er medlem av eller invitert til, vises ennå ikke i listen slik som de du har opprettet (neste versjon).

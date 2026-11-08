@@ -1,5 +1,8 @@
 use super::*;
 
+/// #7968 — un millième de gain dans l'unité de la sortie locale.
+const MILLIEME: u32 = UNITE_DU_GAIN_DE_RENDU / 1000;
+
 /// Le format source de ces témoins, monté comme `play_url` le monte.
 ///
 /// R5 (#2219) : `process_pcm_chunk` ne prend plus `(frame_bytes, bit_depth,
@@ -410,10 +413,10 @@ fn un_changement_de_format_gapless_rebat_ou_desactive_le_convolveur() {
     ));
     let active = std::sync::Mutex::new(None);
 
-    assert!(rebuild_local_convolver(&config, &active, 48_000, 2).unwrap());
+    assert!(rebuild_local_convolver(&config, &active, &AtomicBool::new(true), 48_000, 2).unwrap());
     assert_eq!(active.lock().unwrap().as_ref().unwrap().channels(), 2);
 
-    let error = rebuild_local_convolver(&config, &active, 96_000, 2)
+    let error = rebuild_local_convolver(&config, &active, &AtomicBool::new(true), 96_000, 2)
         .expect_err("l'IR 48 kHz ne doit jamais corriger un flux 96 kHz");
     assert!(
         error.contains("48000") && error.contains("96000"),
@@ -424,7 +427,7 @@ fn un_changement_de_format_gapless_rebat_ou_desactive_le_convolveur() {
         "l'ancien moteur ne doit pas survivre au changement de cadence"
     );
 
-    assert!(rebuild_local_convolver(&config, &active, 48_000, 6).unwrap());
+    assert!(rebuild_local_convolver(&config, &active, &AtomicBool::new(true), 48_000, 6).unwrap());
     assert_eq!(
         active.lock().unwrap().as_ref().unwrap().channels(),
         6,
@@ -639,7 +642,7 @@ fn runtime_contract(
 
 #[test]
 fn native_unity_without_dsp_is_reported_bit_perfect() {
-    let status = runtime_contract(true, false, 1000, None, false);
+    let status = runtime_contract(true, false, UNITE_DU_GAIN_DE_RENDU, None, false);
     assert!(status.bit_perfect);
     assert_eq!(
         status.sample_transport,
@@ -652,7 +655,7 @@ fn native_unity_without_dsp_is_reported_bit_perfect() {
 
 #[test]
 fn float_transport_names_why_it_is_not_bit_perfect() {
-    let status = runtime_contract(false, false, 1000, None, false);
+    let status = runtime_contract(false, false, UNITE_DU_GAIN_DE_RENDU, None, false);
     assert!(!status.bit_perfect);
     assert_eq!(status.sample_transport, OutputSampleTransport::Float);
     assert_eq!(status.reasons, vec![OutputSignalReason::FloatTransport]);
@@ -660,7 +663,13 @@ fn float_transport_names_why_it_is_not_bit_perfect() {
 
 #[test]
 fn native_transport_names_volume_and_dsp_when_they_modify_pcm() {
-    let status = runtime_contract(true, false, 420, Some(test_eq()), false);
+    let status = runtime_contract(
+        true,
+        false,
+        UNITE_DU_GAIN_DE_RENDU / 1000 * 420,
+        Some(test_eq()),
+        false,
+    );
     assert!(!status.bit_perfect);
     assert_eq!(status.dsp, OutputDspState::Applied);
     assert_eq!(status.volume, OutputVolumeState::Applied);
@@ -687,7 +696,7 @@ fn dop_reports_both_safety_bypasses_and_keeps_native_bits() {
 /// `reasons=[]` des deux côtés, aucun changement visible).
 #[test]
 fn pure_sans_traitement_arme_dit_qu_il_n_y_a_rien_a_contourner() {
-    let status = runtime_contract(true, false, 1000, None, true);
+    let status = runtime_contract(true, false, UNITE_DU_GAIN_DE_RENDU, None, true);
     assert!(status.bit_perfect);
     assert_eq!(status.dsp, OutputDspState::PureSansObjet);
     assert!(status.reasons.is_empty());
@@ -702,7 +711,7 @@ fn pure_sans_traitement_arme_dit_qu_il_n_y_a_rien_a_contourner() {
 /// `orchestrator/verdict_pure_reglages_6522_tests.rs`.
 #[test]
 fn pure_avec_un_egaliseur_arme_le_contourne_toujours() {
-    let status = runtime_contract(true, false, 1000, Some(test_eq()), true);
+    let status = runtime_contract(true, false, UNITE_DU_GAIN_DE_RENDU, Some(test_eq()), true);
     assert!(status.bit_perfect);
     assert_eq!(status.dsp, OutputDspState::BypassedPure);
 }
@@ -715,7 +724,7 @@ fn producer_verdict_cannot_be_upgraded_by_a_later_state_snapshot() {
         false,
         true,
         false,
-        1000,
+        UNITE_DU_GAIN_DE_RENDU,
         &std::sync::Mutex::new(None),
         &std::sync::Mutex::new(None),
         &std::sync::Mutex::new(None),
@@ -2676,7 +2685,7 @@ fn native_windows_preparation_keeps_identity_pcm_out_of_float() {
             2,
             true,
             false,
-            1000,
+            UNITE_DU_GAIN_DE_RENDU,
             &eq,
             &convolver,
             &crossfeed,
@@ -2782,8 +2791,8 @@ impl DspDeLaRouteFlottanteWindows {
             pure_bypass: AtomicBool::new(false),
             mono_downmix: AtomicBool::new(false),
             dop_active: AtomicBool::new(false),
-            volume: AtomicU32::new(1000),
-            user_volume: AtomicU32::new(1000),
+            volume: AtomicU32::new(UNITE_DU_GAIN_DE_RENDU),
+            user_volume: AtomicU32::new(UNITE_DU_GAIN_DE_RENDU),
             rg_factor: AtomicU32::new(1000),
         }
     }
@@ -2814,6 +2823,7 @@ impl DspDeLaRouteFlottanteWindows {
             spec,
             sortie: crate::outputs::traits::FormatOuvert::new(44_100, 2),
             needs_resample: false,
+            surechantillonneur: None,
         }
     }
 }
@@ -2999,8 +3009,8 @@ fn local_pcm_processing_is_identical_across_the_header_boundary() {
     let baseline_pure = AtomicBool::new(false);
     let baseline_mono = AtomicBool::new(false);
     let baseline_dop = AtomicBool::new(false);
-    let baseline_volume = AtomicU32::new(500);
-    let baseline_user = AtomicU32::new(500);
+    let baseline_volume = AtomicU32::new(UNITE_DU_GAIN_DE_RENDU / 2);
+    let baseline_user = AtomicU32::new(UNITE_DU_GAIN_DE_RENDU / 2);
     let baseline_rg = AtomicU32::new(1000);
     let baseline_processor = LocalPcmProcessor {
         eq: &baseline_eq,
@@ -3032,8 +3042,8 @@ fn local_pcm_processing_is_identical_across_the_header_boundary() {
     let split_pure = AtomicBool::new(false);
     let split_mono = AtomicBool::new(false);
     let split_dop = AtomicBool::new(false);
-    let split_volume = AtomicU32::new(500);
-    let split_user = AtomicU32::new(500);
+    let split_volume = AtomicU32::new(UNITE_DU_GAIN_DE_RENDU / 2);
+    let split_user = AtomicU32::new(UNITE_DU_GAIN_DE_RENDU / 2);
     let split_rg = AtomicU32::new(1000);
     let split_processor = LocalPcmProcessor {
         eq: &split_eq,
@@ -3077,8 +3087,8 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
     let pure = AtomicBool::new(false);
     let mono = AtomicBool::new(false);
     let dop_active = AtomicBool::new(false);
-    let volume = AtomicU32::new(400);
-    let user = AtomicU32::new(500);
+    let volume = AtomicU32::new(400 * MILLIEME);
+    let user = AtomicU32::new(UNITE_DU_GAIN_DE_RENDU / 2);
     let rg = AtomicU32::new(800);
     let processor = LocalPcmProcessor {
         eq: &eq,
@@ -3102,7 +3112,7 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
     assert!(pending.is_none());
     assert_eq!(staged.len(), first_31_frames);
     assert_eq!(ring.available(), 0);
-    assert_eq!(volume.load(Ordering::SeqCst), 400);
+    assert_eq!(volume.load(Ordering::SeqCst), 400 * MILLIEME);
 
     staged.extend_from_slice(&fixture[first_31_frames..]);
     let prepared = processor
@@ -3111,7 +3121,7 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
     assert!(prepared.dop);
     assert_eq!(kind, LocalPcmKind::Dop);
     assert!(dop_active.load(Ordering::SeqCst));
-    assert_eq!(volume.load(Ordering::SeqCst), 1000);
+    assert_eq!(volume.load(Ordering::SeqCst), UNITE_DU_GAIN_DE_RENDU);
     assert_eq!(prepared.samples, pcm_bytes_to_f32(&fixture, 24));
     assert_eq!(ring.available(), 0, "le caller n'a encore rien publié");
     assert_eq!(ring.push(&prepared.samples), prepared.samples.len());
@@ -3127,7 +3137,7 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
     assert!(continued.dop);
     assert_eq!(continued.samples, pcm_bytes_to_f32(&continuation, 24));
     assert!(dop_active.load(Ordering::SeqCst));
-    assert_eq!(volume.load(Ordering::SeqCst), 1000);
+    assert_eq!(volume.load(Ordering::SeqCst), UNITE_DU_GAIN_DE_RENDU);
 }
 
 #[test]
@@ -3187,19 +3197,19 @@ fn sync_volume_to_dop_writes_what_the_callbacks_read() {
     // Le bras ASIO n'est pas compilé hors Windows : ce test couvre le corps
     // qu'il appelle, pour qu'une faute à cet endroit ne se découvre pas au
     // build Windows de la release.
-    let volume = AtomicU32::new(1000);
-    let user = AtomicU32::new(600);
+    let volume = AtomicU32::new(UNITE_DU_GAIN_DE_RENDU);
+    let user = AtomicU32::new(600 * MILLIEME);
     let rg = AtomicU32::new(708);
 
     sync_volume_to_dop(&volume, &user, &rg, false);
-    assert_eq!(volume.load(Ordering::SeqCst), 425);
+    assert_eq!(volume.load(Ordering::SeqCst), 424_800);
 
     sync_volume_to_dop(&volume, &user, &rg, true);
-    assert_eq!(volume.load(Ordering::SeqCst), 1000);
+    assert_eq!(volume.load(Ordering::SeqCst), UNITE_DU_GAIN_DE_RENDU);
 
     // Et le retour au PCM rend la main au curseur.
     sync_volume_to_dop(&volume, &user, &rg, false);
-    assert_eq!(volume.load(Ordering::SeqCst), 425);
+    assert_eq!(volume.load(Ordering::SeqCst), 424_800);
 }
 
 #[test]
@@ -3207,38 +3217,46 @@ fn dop_pins_the_effective_volume_to_unity() {
     // #1735, moitié « volume » : sur un flux DoP, tout facteur autre que
     // l'unité réécrit l'octet de marqueur et le DAC se coupe. Ni le curseur
     // ni le ReplayGain ne doivent pouvoir en sortir.
-    assert_eq!(effective_volume_units(500, 1000, true), 1000);
-    assert_eq!(effective_volume_units(0, 1000, true), 1000);
-    assert_eq!(effective_volume_units(1000, 300, true), 1000);
-    assert_eq!(effective_volume_units(120, 450, true), 1000);
+    let unite = UNITE_DU_GAIN_DE_RENDU;
+    assert_eq!(effective_volume_units(500 * MILLIEME, 1000, true), unite);
+    assert_eq!(effective_volume_units(0, 1000, true), unite);
+    assert_eq!(effective_volume_units(unite, 300, true), unite);
+    assert_eq!(effective_volume_units(120 * MILLIEME, 450, true), unite);
 }
 
 #[test]
 fn ordinary_pcm_keeps_the_volume_it_had_before() {
     // Non-régression : hors DoP, le calcul est exactement celui d'avant —
     // produit volume × ReplayGain, borné à l'unité.
-    assert_eq!(effective_volume_units(1000, 1000, false), 1000);
-    assert_eq!(effective_volume_units(500, 1000, false), 500);
+    let unite = UNITE_DU_GAIN_DE_RENDU;
+    assert_eq!(effective_volume_units(unite, 1000, false), unite);
+    assert_eq!(effective_volume_units(unite / 2, 1000, false), unite / 2);
     assert_eq!(effective_volume_units(0, 1000, false), 0);
-    assert_eq!(effective_volume_units(800, 500, false), 400);
+    assert_eq!(
+        effective_volume_units(800 * MILLIEME, 500, false),
+        400 * MILLIEME
+    );
     // Le plafond à l'unité protège des pics d'un ReplayGain qui pousse.
-    assert_eq!(effective_volume_units(1000, 4000, false), 1000);
-    assert_eq!(effective_volume_units(900, 2000, false), 1000);
+    assert_eq!(effective_volume_units(unite, 4000, false), unite);
+    assert_eq!(effective_volume_units(900 * MILLIEME, 2000, false), unite);
 }
 
 #[test]
 fn a_dop_track_survives_a_volume_that_would_have_muted_it() {
     // Le cas de Tades, bout à bout : volume à 60 %, ReplayGain à -3 dB.
     // Avant, le produit (0,42) réécrivait le marqueur et le DAC se taisait.
-    let user = 600;
+    let user = 600 * MILLIEME;
     let rg = 708; // ~ -3 dB
-    assert_eq!(effective_volume_units(user, rg, false), 425);
-    assert_eq!(effective_volume_units(user, rg, true), 1000);
+    assert_eq!(effective_volume_units(user, rg, false), 424_800);
+    assert_eq!(
+        effective_volume_units(user, rg, true),
+        UNITE_DU_GAIN_DE_RENDU
+    );
 
     // Et l'unité doit être EXACTE, pas approchée : c'est ce qui rend la
     // multiplication inoffensive sur un échantillon 24 bits, exactement
     // représentable dans une mantisse f32.
-    let v = effective_volume_units(user, rg, true) as f32 / 1000.0;
+    let v = effective_volume_units(user, rg, true) as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
     assert_eq!(v, 1.0f32);
     let sample = 0x05A3C7 as f32; // un échantillon 24 bits porteur du marqueur
     assert_eq!((sample * v) as i32, 0x05A3C7);
@@ -3850,13 +3868,17 @@ async fn le_gain_de_rendu_partage_l_atomique_des_rappels() {
 
     let sortie = LocalOutput::new("DAC test".to_string());
     let gain = sortie.gain_de_rendu();
-    assert_eq!(gain.load(Ordering::SeqCst), 1000, "volume plein au départ");
+    assert_eq!(
+        gain.load(Ordering::SeqCst),
+        UNITE_DU_GAIN_DE_RENDU,
+        "volume plein au départ"
+    );
 
     // Le curseur bouge : l'atomique DÉJÀ distribué doit suivre.
     sortie.set_volume(0.5).await.expect("set_volume");
     assert_eq!(
         gain.load(Ordering::SeqCst),
-        500,
+        UNITE_DU_GAIN_DE_RENDU / 2,
         "l'atomique partagé doit suivre le curseur, sans nouvel appel"
     );
 
@@ -3864,7 +3886,7 @@ async fn le_gain_de_rendu_partage_l_atomique_des_rappels() {
     sortie.set_replaygain_factor(0.5);
     assert_eq!(
         gain.load(Ordering::SeqCst),
-        250,
+        UNITE_DU_GAIN_DE_RENDU / 4,
         "volume × ReplayGain, comme les rappels le calculent"
     );
 
@@ -3895,7 +3917,7 @@ async fn un_preampli_positif_est_rabote_a_volume_plein_mais_pas_a_mi_course() {
     sortie.set_replaygain_factor(1.995);
     assert_eq!(
         gain.load(Ordering::SeqCst),
-        1000,
+        UNITE_DU_GAIN_DE_RENDU,
         "à volume plein, un préampli positif est raboté à l'unité"
     );
 
@@ -3903,7 +3925,7 @@ async fn un_preampli_positif_est_rabote_a_volume_plein_mais_pas_a_mi_course() {
     sortie.set_volume(0.5).await.expect("set_volume");
     assert_eq!(
         gain.load(Ordering::SeqCst),
-        998,
+        997_500,
         "à mi-course, le même +6 dB est appliqué (0,5 × 1,995)"
     );
 }
@@ -3968,6 +3990,11 @@ fn millemes(db: f64) -> i64 {
     (10.0_f64.powf(db / 20.0) * 1000.0).round() as i64
 }
 
+/// #7968 — le gain de rendu partagé, ramené aux millièmes de ces témoins.
+fn millemes_rendus(gain: &AtomicU32) -> i64 {
+    (f64::from(gain.load(Ordering::SeqCst)) / f64::from(MILLIEME)).round() as i64
+}
+
 /// Égaliseur « Rock » + crossfeed 30 % sans retard sur une sortie locale, curseur
 /// à −20 dB : le volume effectif doit rendre exactement ce que le DSP retire
 /// en moyenne, le crête-mètre doit retomber sur le seul curseur, et
@@ -3985,7 +4012,11 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
     mesure.brancher_le_gain_moyen_du_dsp(7, sortie.gain_moyen_du_dsp());
 
     sortie.set_volume(0.1).await.expect("set_volume");
-    assert_eq!(gain.load(Ordering::SeqCst), 100, "−20 dB, sans DSP");
+    assert_eq!(
+        gain.load(Ordering::SeqCst),
+        100 * MILLIEME,
+        "−20 dB, sans DSP"
+    );
     assert_eq!(
         dsp.load(Ordering::SeqCst),
         1000,
@@ -4013,7 +4044,7 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
         (20.0 * porte.log10() + eq_db).abs() < 0.01,
         "l'égaliseur porte sa propre compensation : {porte}"
     );
-    let rendu = gain.load(Ordering::SeqCst) as i64;
+    let rendu = millemes_rendus(&gain);
     assert!(
         (rendu - millemes(-20.0 - cf_db)).abs() <= 1,
         "volume effectif {rendu} ‰, attendu {} ‰ (−20 dB + {:.2} dB rendus par le volume)",
@@ -4033,7 +4064,7 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
     sortie.set_compensation_de_niveau(false);
     // Ce que l'égaliseur porte déjà est retiré du volume : rendu total =
     // le curseur seul.
-    let rendu = gain.load(Ordering::SeqCst) as i64;
+    let rendu = millemes_rendus(&gain);
     assert!((rendu - millemes(-20.0 + eq_db)).abs() <= 1, "{rendu} ‰");
     let aiguille = i64::from(mesure.gain_de_sortie_units(7));
     assert!(
@@ -4044,7 +4075,7 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
     // Volume plein : la compensation est rabotée à l'unité, jamais au-delà.
     sortie.set_compensation_de_niveau(true);
     sortie.set_volume(1.0).await.expect("set_volume");
-    let rendu = gain.load(Ordering::SeqCst) as i64;
+    let rendu = millemes_rendus(&gain);
     assert!(
         (rendu - millemes(eq_db)).abs() <= 1,
         "raboté à l'unité, part portée par l'égaliseur retirée : {rendu} ‰"
@@ -4053,18 +4084,18 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
     // PURE : DSP contourné, rien à compenser ni à retrancher de la mesure.
     sortie.set_volume(0.1).await.expect("set_volume");
     sortie.set_pure_bypass(true);
-    assert_eq!(gain.load(Ordering::SeqCst), 100);
+    assert_eq!(gain.load(Ordering::SeqCst), 100 * MILLIEME);
     assert_eq!(dsp.load(Ordering::SeqCst), 1000);
     sortie.set_pure_bypass(false);
 
     // Retirer l'égaliseur en cours de lecture recompose sans lui.
     sortie.replace_eq_live(None);
-    let rendu = gain.load(Ordering::SeqCst) as i64;
+    let rendu = millemes_rendus(&gain);
     assert!((rendu - millemes(-20.0 - cf_db)).abs() <= 1, "{rendu} ‰");
 
     // Et le ReplayGain se compose toujours, compensation comprise.
     sortie.set_replaygain_factor(0.5);
-    let rendu = gain.load(Ordering::SeqCst) as i64;
+    let rendu = millemes_rendus(&gain);
     assert!(
         (rendu - millemes(-20.0 - cf_db + 20.0 * 0.5_f64.log10())).abs() <= 1,
         "{rendu} ‰"
@@ -4566,7 +4597,8 @@ fn jouer_avec_anneau_5227(
         anneau.push_back(jouer_5215(sortie, trame, 1));
         if anneau.len() > LATENCE_5227 {
             let paquet = anneau.pop_front().unwrap();
-            let v = sortie.gain_de_rendu().load(Ordering::SeqCst) as f32 / 1000.0;
+            let v = sortie.gain_de_rendu().load(Ordering::SeqCst) as f32
+                / UNITE_DU_GAIN_DE_RENDU as f32;
             dac.extend(paquet.iter().map(|s| s * v));
         }
     }
@@ -4753,7 +4785,8 @@ async fn porter_moins_ne_change_pas_le_niveau_rendu_5215() {
         let comp = 10f64.powf(-eq.gain_moyen_db() / 20.0);
         sortie.set_eq(Some(eq));
         let porte = sortie.compensation_portee_par_l_eq();
-        let rendu = sortie.gain_de_rendu().load(Ordering::SeqCst) as f64 / 1000.0;
+        let rendu = sortie.gain_de_rendu().load(Ordering::SeqCst) as f64
+            / f64::from(UNITE_DU_GAIN_DE_RENDU);
         let total = porte * rendu;
         let attendu = (volume * comp).min(1.0);
         assert!(
@@ -4772,7 +4805,8 @@ async fn porter_moins_ne_change_pas_le_niveau_rendu_5215() {
 /// Niveau RENDU d'un bloc : crête après la chaîne DSP × volume effectif de la
 /// sortie (la compensation est coupée dans ces témoins, le ReplayGain vaut 1).
 fn niveau_rendu_6741(sortie: &LocalOutput, bloc: &[f32]) -> f64 {
-    f64::from(crete_5215(bloc)) * f64::from(sortie.volume.load(Ordering::SeqCst)) / 1000.0
+    f64::from(crete_5215(bloc)) * f64::from(sortie.volume.load(Ordering::SeqCst))
+        / f64::from(UNITE_DU_GAIN_DE_RENDU)
 }
 
 /// Joue `paquets` paquets et vérifie, fenêtre de 0,1 s par fenêtre, que le

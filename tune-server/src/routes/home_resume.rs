@@ -13,6 +13,7 @@ pub(super) async fn resume_listening(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ResumeRequest>,
 ) -> Result<Response, AppError> {
     let _zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
@@ -25,48 +26,16 @@ pub(super) async fn resume_listening(
     // C'est un nouveau geste : un seek récent du même titre ne doit pas
     // conserver son ancienne position lors du rejeu depuis le début.
     state.playback.oublier_le_deplacement(zone_id).await;
-    if r.context_type == "podcast" {
-        let Some(tune_core::db::play_queue_repo::QueueInput::Streaming {
-            source_id,
-            title,
-            artist,
-            cover_url,
-            duration_ms,
-            ..
-        }) = r.items.first()
-        else {
+    if r.context_type == "podcast" || r.source == "podcast" {
+        // #8085 — même demande que la relance par adresse (accueil,
+        // Historique) : position moins le recul réglé, par `play_episode`.
+        let Some(demande) = super::super::podcasts::demande_de_reprise(&state, &r) else {
             return Err(AppError::bad_request("épisode de reprise absent"));
         };
-        let seconds = SettingsRepo::with_backend(state.backend.clone())
-            .get(resumes::REWIND_KEY)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(resumes::DEFAULT_REWIND);
-        let request = super::super::podcasts::PlayEpisodeRequest {
-            audio_url: source_id.clone(),
-            title: Some(title.clone()),
-            podcast_name: Some(artist.clone()),
-            podcast_id: Some(r.context_id.clone()),
-            cover_url: cover_url.clone(),
-            duration_ms: Some((*duration_ms).max(0) as u64),
-            seek_ms: Some(resumes::rewind(r.position_ms, seconds)),
-        };
-        let response = super::super::podcasts::play_episode(
-            State(state.clone()),
-            Path(zone_id),
-            Json(request),
+        return Ok(super::super::podcasts::jouer_et_rendre_la_zone(
+            &state, zone_id, headers, profile, demande,
         )
-        .await
-        .into_response();
-        return if response.status().is_success() {
-            Ok(
-                Json(super::super::playback::build_zone_json(&state, zone_id).await)
-                    .into_response(),
-            )
-        } else {
-            Ok(response)
-        };
+        .await);
     }
     if r.context_type == "playlist" && r.source == "local" {
         let id = r
@@ -363,6 +332,7 @@ mod route_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
@@ -484,7 +454,7 @@ async fn complete_single_container(
                 source_id: bi,
                 ..
             },
-        ) => a == b && ai == bi,
+        ) => a == b && (ai == bi || meme_piste_bandcamp(a, ai, bi)),
         _ => false,
     };
     // Une playlist peut contenir deux fois le même titre : conserver le
@@ -499,6 +469,20 @@ async fn complete_single_container(
     r.position = position;
     Ok(())
 }
+
+/// #7778 — l'identifiant d'un titre Bandcamp est son URL de flux signée, dont
+/// `ts`, `t` et `token` changent à chaque lecture de la page (#4577) : deux
+/// signatures du même titre se reconnaissent à leur numéro de piste.
+fn meme_piste_bandcamp(source: &str, a: &str, b: &str) -> bool {
+    use tune_core::orchestrator::identifiant_de_piste_bandcamp;
+    source == "bandcamp"
+        && identifiant_de_piste_bandcamp(a)
+            .is_some_and(|id| identifiant_de_piste_bandcamp(b) == Some(id))
+}
+
+#[cfg(test)]
+#[path = "home_resume_bandcamp_7778_tests.rs"]
+mod bandcamp_7778_tests;
 
 #[cfg(test)]
 mod config_tests {
@@ -529,9 +513,10 @@ mod config_tests {
         for (value, ok) in [
             (json!(17), true),
             (json!(0), true),
-            (json!(300), true),
+            (json!(60), true),
             (json!(-1), false),
-            (json!(301), false),
+            (json!(61), false),
+            (json!(300), false),
             (json!(1.5), false),
             (json!("10"), false),
         ] {
@@ -559,9 +544,40 @@ mod config_tests {
                 .get(resumes::REWIND_KEY)
                 .unwrap()
                 .as_deref(),
-            Some("300"),
+            Some("60"),
             "un réglage refusé ne doit pas être écrit"
         );
+    }
+
+    /// #7840 — une valeur enregistrée sous l'ancienne borne (0–300 s) est
+    /// relue à 60 s, et la reprise d'un épisode ne recule pas plus.
+    #[tokio::test]
+    async fn recul_podcast_7840_une_valeur_enregistree_a_300_est_relue_a_60() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(resumes::REWIND_KEY, "300")
+            .unwrap();
+        let get = crate::routes::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(get.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(
+            body[resumes::REWIND_KEY],
+            60,
+            "un recul enregistré à 300 s doit être relu à 60 s"
+        );
+        assert_eq!(resumes::effective_rewind(Some("300")), 60);
+        assert_eq!(resumes::effective_rewind(Some("60")), 60);
+        assert_eq!(resumes::effective_rewind(Some("0")), 0);
+        assert_eq!(resumes::effective_rewind(None), 10);
+        assert_eq!(resumes::effective_rewind(Some("n'importe quoi")), 10);
     }
 }
 
@@ -770,6 +786,7 @@ mod replay_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
@@ -865,16 +882,19 @@ mod replay_tests {
             saved.position_ms, 42000,
             "la position du titre seul doit être persistée"
         );
+        // #7401 — les voisins sans contexte explicite viennent du même
+        // geste (/play puis sa suite) : la reprise les garde.
         assert_eq!(
             saved.items.len(),
-            1,
-            "le titre seul ne reprend pas les voisins"
+            2,
+            "un titre joué dans sa file garde la file de son geste (#7401)"
         );
         state.playback.seek(zone, 17000).await;
         let response = resume_listening(
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
@@ -890,11 +910,11 @@ mod replay_tests {
             Some("deux"),
             "la reprise doit rejouer le dernier titre démarré, pas la tête de la file"
         );
-        assert_eq!(s.queue_position, 0);
+        assert_eq!(s.queue_position, 1);
         assert_eq!(
             q.get_ordered(zone).unwrap().len(),
-            1,
-            "la reprise du titre seul exclut les titres voisins"
+            2,
+            "la reprise ne s'arrête pas après le titre : la file du geste suit (#7401)"
         );
     }
 }

@@ -26,9 +26,12 @@ use crate::state::AppState;
 /// Une station sérialisée, enrichie de ses repères stables dans la langue de
 /// la requête. Toutes les routes qui rendent UNE station passent par ici : un
 /// point de sortie oublié est exactement le défaut corrigé ici.
-fn station_localisee(station: &RadioStation, headers: &HeaderMap) -> Value {
+///
+/// #7721 — le débit annoncé y est aussi celui du flux que la lecture prendra.
+fn station_localisee(state: &AppState, station: &RadioStation, headers: &HeaderMap) -> Value {
     let mut corps = json!(station);
     radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(headers));
+    geofencing::annoncer_le_debit_ecoute(state, &mut corps);
     corps
 }
 
@@ -542,6 +545,8 @@ struct SearchQuery {
     country: Option<String>,
     codec: Option<String>,
     bitrate_min: Option<i32>,
+    /// #7718 — le niveau de qualité minimal d'au moins un flux.
+    quality_min: Option<String>,
     lossless: Option<bool>,
     hires: Option<bool>,
     favorites_only: Option<bool>,
@@ -562,6 +567,7 @@ impl SearchQuery {
             self.rated_min,
             self.metadata_plus,
         )
+        .avec_qualite_min(self.quality_min.as_deref())
     }
 }
 
@@ -788,10 +794,22 @@ impl StationAnnuaire {
     }
 
     /// #7177 — les flux que l'on peut choisir pour cette fiche : chacune de
-    /// ses adresses publiées (`stream_urls`, la principale d'abord), avec le
-    /// format et le débit que la v2 en donne. Une adresse sans détail (une
-    /// entrée v1) est rendue quand même, sans format.
+    /// ses adresses publiées (`stream_urls`), avec le format et le débit que
+    /// la v2 en donne. Une adresse sans détail (une entrée v1) est rendue
+    /// quand même, sans format.
+    ///
+    /// #7515 — rangés par qualité décroissante ([`geofencing::rang`] : sans
+    /// perte, débit, puis le principal et la fréquence d'échantillonnage) ;
+    /// l'ordre de la fiche départage les ex æquo. Avant, le principal venait toujours en tête : BBC Radio 6
+    /// Music proposait son 320 kbit/s, puis le 96, puis l'autre 320.
     pub fn flux_proposes(&self) -> Vec<FluxAnnuaire> {
+        let mut flux = self.flux_dans_l_ordre_de_la_fiche();
+        // Tri stable : l'ordre de la fiche reste le dernier critère.
+        flux.sort_by_key(|f| std::cmp::Reverse(geofencing::rang(f)));
+        flux
+    }
+
+    fn flux_dans_l_ordre_de_la_fiche(&self) -> Vec<FluxAnnuaire> {
         let mut adresses: Vec<&str> = vec![self.stream_url.as_str()];
         for u in &self.stream_urls {
             if !adresses.contains(&u.as_str()) {
@@ -1705,6 +1723,8 @@ async fn list_radios(
     // d'annuaire la porte sous `annuaire` (logo, clé radio-metadata…). Rien
     // n'est écrit en base, et une station absente de l'annuaire reste là.
     super::radios_annuaire::rattacher_a_l_annuaire(&state, &mut corps);
+    // #7721 — le débit annoncé est celui du flux que la lecture prendra.
+    geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
     Json(corps)
 }
 
@@ -1715,7 +1735,7 @@ async fn get_radio(
 ) -> impl IntoResponse {
     let repo = RadioRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(r)) => Json(station_localisee(&r, &headers)).into_response(),
+        Ok(Some(r)) => Json(station_localisee(&state, &r, &headers)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -1797,7 +1817,7 @@ async fn create_radio(
             });
             (
                 StatusCode::CREATED,
-                Json(station_localisee(&created, &headers)),
+                Json(station_localisee(&state, &created, &headers)),
             )
                 .into_response()
         }
@@ -1918,7 +1938,7 @@ async fn update_radio(
                 "library.radios_changed",
                 json!({"action": "updated", "id": id}),
             );
-            Json(station_localisee(&station, &headers)).into_response()
+            Json(station_localisee(&state, &station, &headers)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -1941,7 +1961,14 @@ async fn delete_radio(State(state): State<AppState>, Path(id): Path<i64>) -> imp
 async fn play_radio(
     State(state): State<AppState>,
     Path((id, zone_id)): Path<(i64, i64)>,
+    profile: crate::routes::active_profile::ActiveProfile,
 ) -> impl IntoResponse {
+    // #7974 — le profil qui lance la station est celui dont le bail d'écoute
+    // s'applique.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     let repo = RadioRepo::with_backend(state.backend.clone());
     let Some(radio) = repo.get(id).ok().flatten() else {
         return (StatusCode::NOT_FOUND, "radio not found").into_response();
@@ -1987,7 +2014,24 @@ pub(crate) async fn jouer_un_flux(
         ..Default::default()
     };
 
-    let (output_sent, output_error, stream_url) = match state.orchestrator.play(play_req).await {
+    // #7717 — une radio lancée sur une zone d'un groupe en fait la meneuse
+    // (« Mes radios » comme l'annuaire). La réponse est un 200 même quand la
+    // radio ne part pas : la tête se rend ici, sur l'échec ou le refus de la
+    // sortie.
+    let remplacees =
+        crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe(state, zone_id);
+    let lancement = state.orchestrator.play(play_req).await;
+    let partie = lancement
+        .as_ref()
+        .is_ok_and(|result| result.sortie_refusee().is_none());
+    if !partie {
+        crate::routes::zones::relais_de_groupe_6155::rendre_la_tete_du_groupe(
+            state,
+            zone_id,
+            &remplacees,
+        );
+    }
+    let (output_sent, output_error, stream_url) = match lancement {
         Ok(result) => (result.output_sent, result.error, result.stream_url),
         Err(e) => (false, Some(e), None),
     };
@@ -2004,14 +2048,22 @@ pub(crate) async fn jouer_un_flux(
         .filter(|_| crate::routes::zones::zone_recoit_l_adresse_du_flux(output_type.as_deref()));
 
     let zone_state = state.playback.get_state(zone_id).await;
-    json!({
+    let mut corps = json!({
         "zone_id": zone_id,
         "radio": nom,
         "output_sent": output_sent,
         "error": output_error,
         "state": zone_state,
         "stream_url": stream_url,
-    })
+    });
+    // #7974 — le refus du bail d'écoute garde ce corps, avec son code dédié.
+    if let Some(e) = output_error.as_deref()
+        && let Some(refus) = tune_core::db::bail_d_ecoute::Refus::depuis_sentinelle(e)
+    {
+        corps["code"] = json!(tune_core::db::bail_d_ecoute::CODE_REFUS);
+        corps["reason"] = json!(refus.code());
+    }
+    corps
 }
 
 /// Cherche une station dans le catalogue local **et dans l'annuaire relevé**,
@@ -2138,11 +2190,11 @@ async fn search_radios(
         autre => autre,
     };
 
-    (
-        issue.statut_http(),
-        Json(corps_recherche(&issue, &items, &suggestions, portee, &lang)),
-    )
-        .into_response()
+    let mut corps = corps_recherche(&issue, &items, &suggestions, portee, &lang);
+    // #7721 — les stations de « Mes radios » trouvées annoncent, comme dans
+    // `GET /radios`, le débit du flux que la lecture prendra.
+    geofencing::annoncer_le_debit_ecoute(&state, &mut corps["items"]);
+    (issue.statut_http(), Json(corps)).into_response()
 }
 
 async fn list_favorites(headers: HeaderMap, State(state): State<AppState>) -> Json<Value> {
@@ -2154,6 +2206,8 @@ async fn list_favorites(headers: HeaderMap, State(state): State<AppState>) -> Js
     // d'annuaire la porte sous `annuaire` (logo, clé radio-metadata…). Rien
     // n'est écrit en base, et une station absente de l'annuaire reste là.
     super::radios_annuaire::rattacher_a_l_annuaire(&state, &mut corps);
+    // #7721 — le débit annoncé est celui du flux que la lecture prendra.
+    geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
     Json(corps)
 }
 
@@ -2409,7 +2463,7 @@ async fn set_radio_artwork(
 
     radio.logo_url = Some(hash.clone());
     repo.update(&radio).ok();
-    Json(station_localisee(&radio, &headers)).into_response()
+    Json(station_localisee(&state, &radio, &headers)).into_response()
 }
 
 async fn export_radios_m3u(State(state): State<AppState>) -> impl IntoResponse {

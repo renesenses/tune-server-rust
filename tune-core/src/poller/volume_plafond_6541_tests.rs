@@ -1,6 +1,6 @@
 //! #6541 — le banc du sondeur (celui de #5695) avec une limite de sécurité :
 //! un appareil monté hors de Tune au-dessus de la limite n'est pas adopté,
-//! il est ramené.
+//! il est ramené AU plafond, qui devient la consigne (#7379).
 use super::volume_pure_5695_tests::Banc;
 use crate::audio::volume_limites::cle_securite;
 
@@ -15,46 +15,57 @@ async fn banc_limite() -> Banc {
 }
 
 /// LE besoin du fil 2335 côté renderer : la molette de l'appareil le pousse à
-/// 95 %. Le sondeur adoptait 95 en base ; il recommande désormais la
-/// consigne de la zone (40 %) et n'écrit rien.
+/// 95 %. Le sondeur adoptait 95 en base ; #7379 (décision du 02/11) : il
+/// ramène l'appareil AU plafond (70 %), et la consigne s'y aligne.
 #[tokio::test]
-async fn au_dessus_de_la_limite_le_sondeur_ramene_au_lieu_d_adopter_6541() {
+async fn au_dessus_de_la_limite_le_sondeur_ramene_au_plafond_6541_7379() {
     let mut banc = banc_limite().await;
     let deja = banc.appareil_a(0.95).await;
     banc.tic().await;
-    assert_eq!(
-        banc.volume_en_base(),
-        40.0,
-        "limite de sécurité 70 % : le 95 % de l'appareil ne doit pas devenir le volume de la zone"
+    // Suggestion 3 de la revue de #7702 : sous la garde de hausse, repère la
+    // consigne d'avant (40 %) — à la limite ou plus bas.
+    let attendu = super::volume_suivi_7379_tests::retenu_depuis(0.4, 0.7);
+    assert!(
+        (banc.volume_en_base() - attendu * 100.0).abs() < 1e-6,
+        "limite de sécurité 70 % : la consigne s'aligne sur ce qui est parti ({attendu}), pas {}",
+        banc.volume_en_base()
     );
     assert_eq!(
         banc.commandes_depuis(deja).await,
-        vec![0.4],
-        "le sondeur doit recommander la consigne de la zone à l'appareil"
+        vec![attendu],
+        "le sondeur doit ramener l'appareil sous la limite, jamais plus haut"
     );
 }
 
 /// Un renderer qui se réveille à 100 % : #5662 l'ignore sans rien imposer ;
-/// sous une limite posée, il est ramené.
+/// sous une limite posée, il est ramené. #7379 : à la CONSIGNE (40 %), pas
+/// à la limite — un réveil à pleine échelle n'est pas un geste au bouton, et
+/// la consigne ne monte pas.
 #[tokio::test]
 async fn un_renderer_a_100_est_ramene_sous_la_limite_6541() {
     let mut banc = banc_limite().await;
     let deja = banc.appareil_a(1.0).await;
     banc.tic().await;
     assert_eq!(banc.commandes_depuis(deja).await, vec![0.4]);
+    assert!(
+        (banc.volume_en_base() - 40.0).abs() < 1e-6,
+        "#7379 : un réveil à 100 % ne monte pas la consigne vers la limite ({} %)",
+        banc.volume_en_base()
+    );
 }
 
 /// Sous la limite, l'adoption historique (#6008) reste pour une BAISSE :
-/// 25 % < 40 %. #6739 (décision du 22/10) : une montée sous la limite
-/// (60 % > 40 %) n'est plus adoptée, et rien n'est commandé.
+/// 25 % < 40 %. #7379 (décision du 02/11) : une montée sous la limite
+/// (60 % > 40 %) est suivie, et rien n'est commandé.
 #[tokio::test]
 async fn sous_la_limite_le_volume_de_l_appareil_est_adopte_6541() {
     let mut banc = banc_limite().await;
     let deja = banc.appareil_a(0.6).await;
     banc.tic().await;
     assert!(
-        (banc.volume_en_base() - 40.0).abs() < 1e-6,
-        "#6739 : un relevé plus haut que la consigne ne remonte jamais la zone"
+        (banc.volume_en_base() - 60.0).abs() < 1e-6,
+        "#7379 : un relevé plus haut que la consigne, sous la limite, est suivi ({})",
+        banc.volume_en_base()
     );
     assert!(banc.commandes_depuis(deja).await.is_empty());
     let deja = banc.appareil_a(0.25).await;

@@ -9,9 +9,10 @@
 //!   [`super::etage_natif::EtageNatif`] (#4011) décode vers des mots `i32`
 //!   alignés à gauche et écrit dans un [`super::etage_natif::PuitsAnneauNatif`]
 //!   posé sur l'anneau natif du backend (`Puits::Natif`). La décision DoP
-//!   reste dans le producteur, le DoP est porté tel quel, le volume s'applique
-//!   dans l'étage — exactement ce que `feed_windows_native_exclusive_leftover`
-//!   faisait. [`EtageNatifAsio`] est l'enveloppe qui le présente au trait
+//!   reste dans le producteur, le DoP est porté tel quel. L'étage est monté à
+//!   l'unité : le volume s'applique au rendu, dans le rappel
+//!   (`pop_mapped_au_gain`), et non plus avant l'anneau de 2 s (#7934).
+//!   [`EtageNatifAsio`] est l'enveloppe qui le présente au trait
 //!   `Etage` et qui publie le contrat du signal après chaque bloc ;
 //! * **route traitée** (`Processed*` : le pilote n'accepte qu'un mot qui ne
 //!   tient pas tous les bits de la source) — l'étage de R1
@@ -57,6 +58,10 @@ use super::{
 };
 use crate::outputs::asio_exclusive::AsioExclusiveOutput;
 use crate::outputs::traits::PuitsNatif;
+
+/// #7934 — le volume que reçoit l'étage natif : l'unité. Le volume de la
+/// zone est appliqué par le rappel ASIO, après l'anneau.
+const VOLUME_A_L_UNITE: u32 = crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
 
 /// Ce que le bras lisait du contexte de `play_url` — trente-quatre valeurs,
 /// toutes déjà possédées par le fil de lecture. Elles sont DÉPLACÉES, jamais
@@ -793,6 +798,13 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         mono_downmix: &mono_downmix,
         bit_perfect_state: None,
     };
+    // #7934 — sur la route native, l'étage reçoit l'UNITÉ : le volume de la
+    // zone est appliqué par le rappel ASIO aux mots tirés de l'anneau de deux
+    // secondes (`pop_mapped_au_gain`), comme le WASAPI exclusif depuis #7264.
+    // L'étage marque ses passages intacts (DoP) dans l'anneau pour que le
+    // rendu ne les pondère jamais.
+    let volume_de_l_etage = AtomicU32::new(VOLUME_A_L_UNITE);
+    let anneau_natif = backend.sortie.native_ring().clone();
     // D1 : le backend dit quel puits il fournit ; la route suit.
     let mut route = match backend.puits() {
         Puits::Natif(puits) => Route::Native {
@@ -808,7 +820,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
                 etage: EtageNatif::monter(
                     spec,
                     FormatOuvert::new(backend.format_ouvert().cadence, voies_de_l_etage),
-                    &volume,
+                    &volume_de_l_etage,
                     &eq,
                     &convolver,
                     &crossfeed,
@@ -816,7 +828,8 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
                     &mono_downmix,
                 )
                 .avec_l_adaptation_des_canaux(&reaffectation, &disposition)
-                .avec_publication(&transformations_reelles),
+                .avec_publication(&transformations_reelles)
+                .avec_le_gain_au_rendu(anneau_natif),
                 recu: Vec::new(),
                 contrat: contrat(),
                 reliquat_force_brut: None,
@@ -853,6 +866,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
                     spec,
                     sortie: FormatOuvert::new(sample_rate, voies_de_l_etage),
                     needs_resample: false,
+                    surechantillonneur: None,
                 },
                 &transformations_reelles,
             ),

@@ -28,9 +28,11 @@
 //! le `WHERE` est celui de `list_filtered`, partagé
 //! ([`TrackRepo::conditions_du_filtre`]), socle de la vue compris.
 
+use super::cle_de_tri::{Curseur, valeur_json, valeur_sql};
 use super::{Placeholders, SqlValue, ToSqlValue, Track, TrackFilter, TrackRepo, sql};
 use crate::TuneError;
 use crate::db::engine::Engine;
+use crate::db::history_repo::sql::provenance;
 
 /// Une colonne du tableau des pistes par laquelle le serveur sait trier.
 ///
@@ -114,23 +116,32 @@ pub const COLONNES_TRIABLES: [(&str, ColonneDeTri); 27] = [
 /// (alias `ec`) pour les tris `plays` et `lastPlayed` — tune-web-client#1470.
 ///
 /// Le rapprochement est CELUI de `HistoryRepo::plays_for_tracks`, qui remplit
-/// `play_count` et `last_played_at` dans la réponse : radio exclue, égalité
-/// stricte du titre, interprète égal ou absent des deux côtés
-/// (`listen_history.track_id` est toujours NULL, voir ce module). L'ordre suit
-/// donc exactement les nombres que la colonne affiche.
+/// `play_count` et `last_played_at` dans la réponse : même provenance que la
+/// piste, radio exclue (#7980, [`provenance!`], les lignes anciennes à source
+/// NULL étant locales), égalité stricte du titre, interprète égal ou absent
+/// des deux côtés (`listen_history.track_id` est toujours NULL, voir ce
+/// module). L'ordre suit donc exactement les nombres que la colonne affiche.
 ///
 /// Agrégé UNE fois puis joint, plutôt qu'une sous-requête corrélée par piste :
 /// le tri porte sur toute la bibliothèque filtrée, et PostgreSQL n'a pas
 /// d'index `(title, artist_name)` sur l'historique. L'égalité sur le titre
 /// est la clé de hachage ; la condition sur l'interprète filtre ensuite.
-/// `GROUP BY title, artist_name` : une piste rencontre AU PLUS une ligne,
-/// le `COUNT(*) OVER ()` de la page n'est pas multiplié.
-const JOINTURE_ECOUTES: &str = " LEFT JOIN (SELECT title, artist_name, \
-       COUNT(*) AS n, MAX(listened_at) AS derniere \
-       FROM listen_history WHERE source != 'radio' \
-       GROUP BY title, artist_name) ec \
-     ON ec.title = t.title \
-    AND (ec.artist_name = ar.name OR (ec.artist_name IS NULL AND ar.name IS NULL))";
+/// `GROUP BY title, artist_name, provenance` et la provenance dans la
+/// jointure : une piste rencontre AU PLUS une ligne, le `COUNT(*) OVER ()` de
+/// la page n'est pas multiplié.
+const JOINTURE_ECOUTES: &str = concat!(
+    " LEFT JOIN (SELECT lh.title, lh.artist_name, ",
+    provenance!("lh"),
+    " AS provenance, COUNT(*) AS n, MAX(lh.listened_at) AS derniere \
+       FROM listen_history lh WHERE ",
+    provenance!("lh"),
+    " <> 'radio' GROUP BY lh.title, lh.artist_name, ",
+    provenance!("lh"),
+    ") ec ON ec.title = t.title AND ec.provenance = ",
+    provenance!("t"),
+    " AND (ec.artist_name = ar.name OR (ec.artist_name IS NULL AND ar.name IS NULL)) \
+     LEFT JOIN imported_plays ip ON ip.track_id = t.id"
+);
 
 /// Comment une valeur « vide » se reconnaît, pour la ranger en FIN de liste
 /// dans les deux sens : une cellule vide en tête d'un tri descendant cacherait
@@ -201,9 +212,21 @@ impl ColonneDeTri {
             Self::Modifie => ("t.file_mtime".into(), Vide::Nul),
             // 0 écoute est un compte, pas une cellule vide : rien ne va en fin
             // de liste, une piste jamais jouée se range avec les zéros.
-            Self::Ecoutes => ("COALESCE(ec.n, 0)".into(), Vide::Nul),
+            // #7763 : plus les écoutes importées (`imported_plays`), comme
+            // `plays_for_tracks`.
+            Self::Ecoutes => (
+                "(COALESCE(ec.n, 0) + COALESCE(ip.play_count, 0))".into(),
+                Vide::Nul,
+            ),
             // Jamais jouée : pas de date, en fin de liste dans les deux sens.
-            Self::DerniereEcoute => ("ec.derniere".into(), Vide::Nul),
+            // La plus récente de l'historique et de l'import (#7763).
+            Self::DerniereEcoute => (
+                "(CASE WHEN ip.last_played_at IS NOT NULL \
+                   AND (ec.derniere IS NULL OR ip.last_played_at > ec.derniere) \
+                 THEN ip.last_played_at ELSE ec.derniere END)"
+                    .into(),
+                Vide::Nul,
+            ),
         }
     }
 
@@ -276,6 +299,9 @@ pub struct DemandeDePistes {
     /// Rendre aussi les comptes par provenance (sous la recherche et les
     /// facettes, SANS la provenance : ce sont les choix du menu Source).
     pub avec_comptes: bool,
+    /// #7619 (L1) — reprendre APRÈS ce curseur (`after`), au lieu de
+    /// `offset`. Il doit avoir été rendu pour le même tri.
+    pub apres: Option<Curseur>,
 }
 
 /// Les comptes par provenance que rend une page qui les demande.
@@ -296,6 +322,8 @@ pub struct PageDePistes {
     /// Effectif de l'ensemble filtré, avant LIMIT/OFFSET.
     pub total: i64,
     pub comptes: Option<ComptesParProvenance>,
+    /// #7619 (L1) — le curseur de la page suivante ; `None` en fin de liste.
+    pub curseur_suivant: Option<String>,
 }
 
 /// La recherche de l'onglet Titres : sous-chaîne du titre ou du nom de
@@ -343,6 +371,24 @@ impl TrackRepo {
     /// de la page avec `COUNT(*) OVER ()` (le tri ne porte que des lignes
     /// étroites), puis les pistes de ces identifiants dans cet ordre.
     pub fn page_de_pistes(&self, d: &DemandeDePistes) -> Result<PageDePistes, TuneError> {
+        // #7619 (L1) — la page par la clé de tri indexée, quand les clés sont
+        // prêtes ; sinon le chemin d'avant (un curseur y vaut son rang).
+        if self.assurer_les_cles_de_tri() {
+            return self.page_par_la_cle_de_tri(d);
+        }
+        let mut repli = d.clone();
+        if let Some(c) = repli.apres.take() {
+            repli.offset = c.o;
+        }
+        self.page_de_pistes_par_decalage(&repli)
+    }
+
+    /// Le chemin d'avant #7619 : tri complet, `OFFSET`, `COUNT(*) OVER ()`.
+    /// Sert tant que les clés de tri ne sont pas prêtes.
+    pub fn page_de_pistes_par_decalage(
+        &self,
+        d: &DemandeDePistes,
+    ) -> Result<PageDePistes, TuneError> {
         let engine = self.db.engine();
         let mut ph = Placeholders::new(engine);
         let (mut conditions, mut valeurs) = self.conditions_du_filtre(&d.filtre, &mut ph);
@@ -431,7 +477,329 @@ impl TrackRepo {
             pistes: self.hydrater_dans_l_ordre(&ids)?,
             total,
             comptes,
+            curseur_suivant: None,
         })
+    }
+
+    /// #7619 (L1) — la page lue dans l'ordre de `idx_tracks_cle_tri`.
+    ///
+    /// - ordre par défaut : `ORDER BY t.cle_tri, t.id`, que l'index rend sans
+    ///   tri ; la page s'arrête à `limit` lignes VISIBLES ;
+    /// - tri par colonne : `vide, valeur, cle_tri, id` — le tri reste complet
+    ///   (aucun index par colonne), mais l'ordre est total et le curseur exact ;
+    /// - le socle est ensembliste (non corrélé, évalué une fois) ;
+    /// - le total est compté à part, sans `COUNT(*) OVER ()` qui forcerait
+    ///   l'évaluation de toute la liste, et gardé sous le jeton des données.
+    fn page_par_la_cle_de_tri(&self, d: &DemandeDePistes) -> Result<PageDePistes, TuneError> {
+        let engine = self.db.engine();
+        let mut ph = Placeholders::new(engine);
+        let (mut conditions, mut valeurs) =
+            self.conditions_du_filtre_ensemblistes(&d.filtre, &mut ph);
+        if let Some(saisie) = d
+            .recherche
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let (c, v) = condition_titre_ou_artiste(&mut ph, saisie);
+            conditions.push(c);
+            valeurs.extend(v);
+        }
+        let comptes = if d.avec_comptes {
+            Some(self.comptes_par_provenance(&conditions, &valeurs)?)
+        } else {
+            None
+        };
+        if let Some(cle) = d
+            .provenance
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let (c, v) = condition_provenance(&mut ph, engine, cle);
+            conditions.push(c);
+            valeurs.extend(v);
+        }
+        let jointure = d.tri.map_or("", ColonneDeTri::jointure);
+        let where_total = conditions.join(" AND ");
+        let sql_total = format!(
+            "SELECT COUNT(*){}{jointure} WHERE {where_total}",
+            sql::track_from()
+        );
+
+        // L'ordre, et ce que la page relit pour fabriquer le curseur.
+        let sens = if d.descendant { "DESC" } else { "ASC" };
+        let (projection, ordre, vide_et_valeur) = match d.tri {
+            None => (String::new(), "t.cle_tri, t.id".to_string(), None),
+            Some(col) => {
+                let (expr, vide) = col.expression(engine);
+                let test_vide = match vide {
+                    Vide::Texte => format!("NULLIF(TRIM({expr}), '') IS NULL"),
+                    Vide::Nul => format!("{expr} IS NULL"),
+                    Vide::NulOuZero => format!("({expr} IS NULL OR {expr} = 0)"),
+                };
+                let v = format!("(CASE WHEN {test_vide} THEN 1 ELSE 0 END)");
+                let e = format!("(CASE WHEN {test_vide} THEN NULL ELSE {expr} END)");
+                (
+                    format!(", {v}, {e}"),
+                    format!("{v}, {e} {sens}, t.cle_tri, t.id"),
+                    Some((v, e)),
+                )
+            }
+        };
+
+        // Reprise après le curseur. Un curseur d'un autre tri désignerait une
+        // position qui n'existe pas dans cet ordre : refusé plus haut (route),
+        // ignoré ici par prudence (première page).
+        let cle_du_tri = d.tri.map_or("", ColonneDeTri::cle);
+        let apres = d
+            .apres
+            .as_ref()
+            .filter(|c| c.s == cle_du_tri && (d.tri.is_none() || c.d == d.descendant));
+        let mut page_conditions = conditions.clone();
+        let mut page_valeurs = valeurs.clone();
+        if let Some(c) = apres {
+            let suite_par_cle = |ph: &mut Placeholders, vals: &mut Vec<SqlValue>| {
+                let (k, i) = (ph.take(), ph.take());
+                vals.push(SqlValue::Text(c.k.clone()));
+                vals.push(SqlValue::Int(c.i));
+                format!("(t.cle_tri, t.id) > ({k}, {i})")
+            };
+            match &vide_et_valeur {
+                None => {
+                    let cond = suite_par_cle(&mut ph, &mut page_valeurs);
+                    page_conditions.push(cond);
+                }
+                Some((v, e)) => {
+                    if c.e == Some(1) {
+                        let cond = suite_par_cle(&mut ph, &mut page_valeurs);
+                        page_conditions.push(format!("({v} = 1 AND {cond})"));
+                    } else {
+                        let op = if d.descendant { "<" } else { ">" };
+                        let x = c.x.as_ref().map(valeur_sql).unwrap_or(SqlValue::Null);
+                        let (x1, x2) = (ph.take(), ph.take());
+                        page_valeurs.push(x.clone());
+                        page_valeurs.push(x);
+                        let cond = suite_par_cle(&mut ph, &mut page_valeurs);
+                        page_conditions.push(format!(
+                            "({v} = 1 OR ({v} = 0 AND ({e} {op} {x1} OR ({e} = {x2} AND {cond}))))"
+                        ));
+                    }
+                }
+            }
+        }
+        // Ordre par défaut : l'index de la clé est lu dans l'ordre, et les
+        // pistes que le socle écarte (doublons distants, copies de moindre
+        // qualité) sont retirées EN MÉMOIRE, d'après leur ensemble gardé sous
+        // le jeton des données. La sous-requête ensembliste se rejouait
+        // sinon à CHAQUE page (≈ 100 ms sur la copie du .18).
+        if vide_et_valeur.is_none()
+            && let Some(ecartees) = super::cle_de_tri::pistes_ecartees_gardees(self.db.as_ref())
+        {
+            let en_sql =
+                crate::db::facet_filter::socle_ensembliste_de_la_vue_des_pistes(engine)[1].clone();
+            let base: Vec<String> = conditions.into_iter().filter(|c| *c != en_sql).collect();
+            // Le total sans rejouer le socle en SQL : les identifiants de la
+            // base (lus par l'index), moins ceux de l'ensemble écarté.
+            let sql_ids = format!(
+                "SELECT t.id{}{jointure}{}",
+                sql::track_from(),
+                if base.is_empty() {
+                    String::new()
+                } else {
+                    format!(" WHERE {}", base.join(" AND "))
+                }
+            );
+            let total = self.total_garde(&sql_ids, &valeurs, &|| {
+                Ok(self
+                    .db
+                    .query_many(&sql_ids, &refs(&valeurs))?
+                    .iter()
+                    .filter_map(|l| l.first().and_then(SqlValue::as_i64))
+                    .filter(|id| !ecartees.contains(id))
+                    .count() as i64)
+            })?;
+            return self.page_par_l_index(
+                d, &base, &valeurs, &ecartees, apres, jointure, total, comptes,
+            );
+        }
+        let total = self.total_garde(&sql_total, &valeurs, &|| {
+            Ok(self
+                .db
+                .query_one(&sql_total, &refs(&valeurs))?
+                .as_ref()
+                .and_then(|c| c.first().and_then(|v| v.as_i64()))
+                .unwrap_or(0))
+        })?;
+        let decalage = if apres.is_some() { 0 } else { d.offset.max(0) };
+        let (limite, offset_ph) = (ph.take(), ph.take());
+        page_valeurs.push(SqlValue::Int(d.limit));
+        page_valeurs.push(SqlValue::Int(decalage));
+        let sql_page = format!(
+            "SELECT t.id, t.cle_tri{projection}{}{jointure} WHERE {} ORDER BY {ordre} \
+             LIMIT {limite} OFFSET {offset_ph}",
+            sql::track_from(),
+            page_conditions.join(" AND ")
+        );
+        let lignes = self.db.query_many(&sql_page, &refs(&page_valeurs))?;
+        let ids: Vec<i64> = lignes
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        let rang_depart = apres.map_or(decalage, |c| c.o);
+        let curseur_suivant = match lignes.last() {
+            Some(der) if (lignes.len() as i64) >= d.limit && d.limit > 0 => Some(
+                Curseur {
+                    v: 1,
+                    s: cle_du_tri.to_string(),
+                    d: d.descendant,
+                    e: vide_et_valeur
+                        .as_ref()
+                        .and_then(|_| der.get(2).and_then(SqlValue::as_i64)),
+                    x: vide_et_valeur
+                        .as_ref()
+                        .map(|_| der.get(3).map(valeur_json).unwrap_or_default()),
+                    k: der.get(1).and_then(SqlValue::as_string).unwrap_or_default(),
+                    i: der.first().and_then(SqlValue::as_i64).unwrap_or(0),
+                    o: rang_depart + lignes.len() as i64,
+                }
+                .encoder(),
+            ),
+            _ => None,
+        };
+        Ok(PageDePistes {
+            pistes: self.hydrater_dans_l_ordre(&ids)?,
+            total,
+            comptes,
+            curseur_suivant,
+        })
+    }
+
+    /// #7619 — la page de l'ordre par défaut, par lots lus dans l'ordre de
+    /// `idx_tracks_cle_tri`, les pistes écartées par le socle retirées en
+    /// mémoire. `offset` compte des pistes VISIBLES, comme avant.
+    #[allow(clippy::too_many_arguments)]
+    fn page_par_l_index(
+        &self,
+        d: &DemandeDePistes,
+        base: &[String],
+        valeurs: &[SqlValue],
+        ecartees: &std::collections::HashSet<i64>,
+        apres: Option<&Curseur>,
+        jointure: &str,
+        total: i64,
+        comptes: Option<ComptesParProvenance>,
+    ) -> Result<PageDePistes, TuneError> {
+        let engine = self.db.engine();
+        let limite = d.limit.max(0);
+        let mut a_sauter = if apres.is_some() { 0 } else { d.offset.max(0) };
+        let lot = (limite * 2).clamp(512, 20_000);
+        let mut depart: Option<(String, i64)> = apres.map(|c| (c.k.clone(), c.i));
+        let mut retenues: Vec<(i64, String)> = Vec::new();
+        while (retenues.len() as i64) < limite {
+            let mut ph = Placeholders::resuming_at(engine, valeurs.len() + 1);
+            let mut conds = base.to_vec();
+            let mut vals = valeurs.to_vec();
+            if let Some((k, i)) = &depart {
+                conds.push(format!(
+                    "(t.cle_tri, t.id) > ({}, {})",
+                    ph.take(),
+                    ph.take()
+                ));
+                vals.push(SqlValue::Text(k.clone()));
+                vals.push(SqlValue::Int(*i));
+            }
+            let lim = ph.take();
+            vals.push(SqlValue::Int(lot));
+            let where_ = if conds.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", conds.join(" AND "))
+            };
+            let lignes = self.db.query_many(
+                &format!(
+                    "SELECT t.id, t.cle_tri{}{jointure}{where_} ORDER BY t.cle_tri, t.id LIMIT {lim}",
+                    sql::track_from()
+                ),
+                &refs(&vals),
+            )?;
+            let n = lignes.len() as i64;
+            for l in &lignes {
+                let id = l.first().and_then(SqlValue::as_i64).unwrap_or(0);
+                let cle = l.get(1).and_then(SqlValue::as_string).unwrap_or_default();
+                depart = Some((cle.clone(), id));
+                if ecartees.contains(&id) {
+                    continue;
+                }
+                if a_sauter > 0 {
+                    a_sauter -= 1;
+                    continue;
+                }
+                retenues.push((id, cle));
+                if retenues.len() as i64 >= limite {
+                    break;
+                }
+            }
+            if n < lot {
+                break;
+            }
+        }
+        let rang_depart = apres.map_or(d.offset.max(0), |c| c.o);
+        let curseur_suivant = match retenues.last() {
+            Some((id, cle)) if limite > 0 && retenues.len() as i64 >= limite => Some(
+                Curseur {
+                    v: 1,
+                    s: String::new(),
+                    d: d.descendant,
+                    e: None,
+                    x: None,
+                    k: cle.clone(),
+                    i: *id,
+                    o: rang_depart + retenues.len() as i64,
+                }
+                .encoder(),
+            ),
+            _ => None,
+        };
+        let ids: Vec<i64> = retenues.into_iter().map(|(id, _)| id).collect();
+        Ok(PageDePistes {
+            pistes: self.hydrater_dans_l_ordre(&ids)?,
+            total,
+            comptes,
+            curseur_suivant,
+        })
+    }
+
+    /// Le total d'une liste, gardé sous le jeton des données : tant que rien
+    /// n'est écrit, les pages suivantes d'une même requête ne recomptent pas.
+    fn total_garde(
+        &self,
+        sql_total: &str,
+        valeurs: &[SqlValue],
+        compter: &dyn Fn() -> Result<i64, TuneError>,
+    ) -> Result<i64, TuneError> {
+        type Entree = ((u64, i64), String, i64);
+        static TOTAUX: std::sync::Mutex<Vec<Entree>> = std::sync::Mutex::new(Vec::new());
+        const ENTREES: usize = 8;
+        let jeton = self.db.jeton_des_donnees();
+        let cle = format!("{sql_total}\u{0}{valeurs:?}");
+        if let Some(j) = jeton
+            && let Ok(t) = TOTAUX.lock()
+            && let Some((_, _, n)) = t.iter().find(|(jj, c, _)| *jj == j && *c == cle)
+        {
+            return Ok(*n);
+        }
+        let n = compter()?;
+        if let Some(j) = jeton
+            && let Ok(mut t) = TOTAUX.lock()
+        {
+            t.retain(|(jj, _, _)| *jj == j);
+            if t.len() >= ENTREES {
+                t.remove(0);
+            }
+            t.push((j, cle, n));
+        }
+        Ok(n)
     }
 
     fn comptes_par_provenance(
@@ -637,6 +1005,44 @@ mod tests {
         assert_eq!(desc.last().map(String::as_str), Some("Été indien"));
     }
 
+    /// #7763 — les écoutes importées comptent dans les tris « # écoutes » et
+    /// « Dernière écoute », comme dans les nombres affichés.
+    #[test]
+    fn i7763_le_tri_par_ecoutes_compte_les_ecoutes_importees() {
+        let (repo, ar, al) = base();
+        bibliotheque(&repo, &ar, &al);
+        historique(repo.db.as_ref());
+        // « Orphelin » (Éla Ferré) n'a aucune écoute d'historique.
+        let orphelin = repo
+            .page_de_pistes(&demande())
+            .unwrap()
+            .pistes
+            .into_iter()
+            .find(|t| t.title == "Orphelin")
+            .and_then(|t| t.id)
+            .unwrap();
+        crate::db::ecoutes_importees::EcoutesImporteesRepo::with_backend(repo.db.clone())
+            .ajouter(orphelin, 10, Some("2026-12-01T00:00:00Z"))
+            .unwrap();
+
+        let mut d = demande();
+        d.descendant = true;
+        d.tri = Some(ColonneDeTri::Ecoutes);
+        let page = repo.page_de_pistes(&d).unwrap();
+        assert_eq!(page.total, 7, "la jointure ne multiplie pas les lignes");
+        assert_eq!(
+            titres(&page)[..2],
+            ["Orphelin", "Dancing Queen"],
+            "10 écoutes importées passent devant 2 écoutes locales d'historique"
+        );
+        d.tri = Some(ColonneDeTri::DerniereEcoute);
+        assert_eq!(
+            titres(&repo.page_de_pistes(&d).unwrap())[..3],
+            ["Orphelin", "Été indien", "Dancing Queen"],
+            "la date importée la plus récente passe en tête"
+        );
+    }
+
     /// tune-web-client#1470 — « # écoutes » et « Dernière écoute » : l'ordre
     /// suit les nombres que la réponse affiche (`plays_for_tracks`), 0 est un
     /// compte, une piste jamais jouée n'a pas de date et va en fin de liste.
@@ -667,7 +1073,8 @@ mod tests {
             .plays_for_tracks(&ids)
             .unwrap();
         let affiches: Vec<i64> = ids.iter().map(|id| comptes[id].0).collect();
-        assert_eq!(affiches, [3, 1, 0, 0, 0, 0, 0]);
+        // #7980 : l'écoute Qobuz de « Dancing Queen » ne compte pas, 2 et non 3.
+        assert_eq!(affiches, [2, 1, 0, 0, 0, 0, 0]);
         // Croissant : les zéros d'abord (un compte, pas une cellule vide).
         d.descendant = false;
         let asc = titres(&repo.page_de_pistes(&d).unwrap());
@@ -709,6 +1116,78 @@ mod tests {
         assert_eq!(p2.total, 7);
         assert_eq!(p2.pistes.len(), 3);
         assert!(titres(&p2).iter().all(|t| !p1.contains(t)));
+    }
+
+    /// #7980 — le tri « # écoutes » ne compte que les écoutes locales, comme
+    /// la colonne : trois écoutes Qobuz d'« Été indien » ne la font pas
+    /// passer devant « Dancing Queen » et ses deux écoutes locales.
+    #[test]
+    fn i7980_le_tri_par_ecoutes_ignore_les_ecoutes_de_service() {
+        let (repo, ar, al) = base();
+        bibliotheque(&repo, &ar, &al);
+        historique(repo.db.as_ref());
+        for quand in [
+            "2026-07-01T10:00:00Z",
+            "2026-07-02T10:00:00Z",
+            "2026-07-03T10:00:00Z",
+        ] {
+            repo.db
+                .execute(
+                    "INSERT INTO listen_history (title, artist_name, source, listened_at) \
+                     VALUES ('Été indien', 'Éla Ferré', 'qobuz', ?)",
+                    &[&quand],
+                )
+                .unwrap();
+        }
+        let mut d = demande();
+        d.tri = Some(ColonneDeTri::Ecoutes);
+        d.descendant = true;
+        assert_eq!(
+            titres(&repo.page_de_pistes(&d).unwrap())[..2],
+            ["Dancing Queen", "Été indien"],
+            "#7980 : les écoutes Qobuz ne comptent pas dans le tri d'une piste locale"
+        );
+    }
+
+    /// #7980 — le tri « # écoutes » rapproche l'écoute de la provenance de
+    /// la piste, comme la colonne : la piste UPnP « Azur distant » garde ses
+    /// trois écoutes UPnP et passe en tête ; la piste Qobuz « Azur qobuz » ne
+    /// reçoit pas les cinq écoutes LOCALES de même titre et même interprète.
+    #[test]
+    fn i7980_le_tri_par_ecoutes_suit_la_provenance_de_la_piste() {
+        let (repo, ar, al) = base();
+        bibliotheque(&repo, &ar, &al);
+        historique(repo.db.as_ref());
+        let ecouter = |titre: &str, artiste: &str, source: &str, n: i64| {
+            for i in 0..n {
+                let quand = format!("2026-07-0{}T10:00:00Z", i + 1);
+                repo.db
+                    .execute(
+                        "INSERT INTO listen_history (title, artist_name, source, listened_at) \
+                         VALUES (?, ?, ?, ?)",
+                        &[&titre, &artiste, &source, &quand.as_str()],
+                    )
+                    .unwrap();
+            }
+        };
+        ecouter("Azur distant", "Éla Ferré", "upnp", 3);
+        ecouter("Azur qobuz", "ABBA", "local", 5);
+        let mut d = demande();
+        d.tri = Some(ColonneDeTri::Ecoutes);
+        d.descendant = true;
+        let page = repo.page_de_pistes(&d).unwrap();
+        assert_eq!(page.total, 7, "la jointure ne multiplie pas les lignes");
+        assert_eq!(
+            titres(&page)[..3],
+            ["Azur distant", "Dancing Queen", "Été indien"],
+            "#7980 : une piste UPnP compte ses écoutes UPnP, une piste Qobuz pas les écoutes locales"
+        );
+        let ids: Vec<i64> = page.pistes.iter().filter_map(|t| t.id).collect();
+        let comptes = crate::db::history_repo::HistoryRepo::with_backend(repo.db.clone())
+            .plays_for_tracks(&ids)
+            .unwrap();
+        let affiches: Vec<i64> = ids.iter().map(|id| comptes[id].0).collect();
+        assert_eq!(affiches, [3, 2, 1, 0, 0, 0, 0], "l'ordre suit la colonne");
     }
 
     /// La recherche de l'onglet : titre OU artiste, pliée, littérale.

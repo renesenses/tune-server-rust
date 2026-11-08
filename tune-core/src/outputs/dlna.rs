@@ -50,8 +50,8 @@ pub(crate) mod volume_illisible_5662;
 #[path = "dlna_volume_decoratif_5575.rs"]
 pub(crate) mod volume_decoratif_5575;
 
-/// #6008 (rc7, fil 2401) — une hausse de l'appareil corrigée aussi hors de la
-/// fenêtre d'après pose, sur un appareil qui porte la règle.
+/// #6008 (rc7, fil 2401) — hors de la fenêtre d'après pose. Depuis #7379, la
+/// hausse n'y est plus corrigée par la sortie : le sondeur en décide.
 #[path = "dlna_volume_hors_fenetre_6008.rs"]
 pub(crate) mod hors_fenetre_6008;
 
@@ -582,6 +582,10 @@ pub struct DlnaOutput {
     /// #5662 — un épisode de réponses `GetVolume` illisibles est en cours :
     /// la ligne `dlna_volume_illisible` a déjà été écrite.
     volume_illisible: AtomicBool,
+    /// #7379 — le volume du DERNIER `get_status` est le repli de #5662 (réponse
+    /// illisible), pas une valeur lue sur l'appareil. Le sondeur ne le prend
+    /// jamais pour un geste : ni suivi, ni retour au plafond.
+    dernier_releve_illisible: AtomicBool,
     /// #5575 — `modelName` du descriptif UPnP, quand l'enregistrement le connaît.
     modele: Option<String>,
     /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
@@ -691,6 +695,10 @@ pub struct DlnaOutput {
     /// la piste à la position de la pause. Retombe au `play_media` et au
     /// `stop` suivants.
     arrete_au_lieu_de_pause: AtomicBool,
+    /// #7894 — la dernière `Pause` a été refusée (701) par un renderer en
+    /// `NO_MEDIA_PRESENT` : il ne jouait rien. Lu une fois par
+    /// `take_nothing_playing_on_pause()`.
+    rien_ne_joue_a_la_pause: AtomicBool,
     /// La position rendue par le dernier `get_status` était-elle extrapolée ?
     /// Lu par `GET /api/devices/{id}/status` pour que l'estimation ne se fasse
     /// jamais passer pour une mesure.
@@ -826,6 +834,7 @@ impl DlnaOutput {
             budget_reveil_ms: AtomicU64::new(BUDGET_REVEIL_STANDBY.as_millis() as u64),
             item_id_seq: AtomicU64::new(1),
             volume_illisible: AtomicBool::new(false),
+            dernier_releve_illisible: AtomicBool::new(false),
             modele: None,
             didl_niveau_appris: NiveauDidlAppris::neuf(),
             muted: AtomicBool::new(false),
@@ -849,6 +858,7 @@ impl DlnaOutput {
             niveau_acquitte: Arc::default(),
             dernier_diag_701: std::sync::Mutex::new(None),
             arrete_au_lieu_de_pause: AtomicBool::new(false),
+            rien_ne_joue_a_la_pause: AtomicBool::new(false),
             position_extrapolee: AtomicBool::new(false),
             duree_annoncee: tokio::sync::Mutex::new(None),
             pose_courante: std::sync::Mutex::new(None),
@@ -1071,6 +1081,15 @@ impl DlnaOutput {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = url.filter(|u| !u.trim().is_empty());
         self
+    }
+
+    /// #6910 — ce que le SCPD a dit de `SetNextAVTransportURI`, s'il a déjà
+    /// été lu, SANS jamais aller sur le réseau ; `Inconnue` sinon.
+    pub fn annonce_suivante_retenue(&self) -> AnnonceSuivante {
+        self.annonce_suivante
+            .get()
+            .copied()
+            .unwrap_or(AnnonceSuivante::Inconnue)
     }
 
     /// #3967 — ce que le SCPD d'`AVTransport` dit de `SetNextAVTransportURI`,
@@ -1446,9 +1465,9 @@ impl DlnaOutput {
     /// toute hausse de plus de 2 points corrigée sur-le-champ, et le sondeur
     /// reçoit le volume réimposé, pas le saut.
     ///
-    /// #6008 (rc7, fil 2401) — sur un appareil qui PORTE déjà la règle, la
-    /// hausse se corrige aussi hors de la fenêtre, tant que Tune lit : voir
-    /// [`hors_fenetre_6008`].
+    /// #7379 — hors de la fenêtre, plus aucune correction (fin de la règle
+    /// stricte de #6008/#6871) : le sondeur suit l'appareil sous le plafond
+    /// de suivi et le ramène au plafond au-dessus. Voir [`hors_fenetre_6008`].
     async fn volume_apres_controle_d_uri(&self, lu: f64, lecture_de_tune: bool) -> f64 {
         let dans_la_fenetre = self
             .uri_posee_a
@@ -1588,6 +1607,24 @@ impl DlnaOutput {
     /// répond que sur `GroupRenderingControl` : la distinction existait déjà
     /// dans `get_status`, elle est ici pour que les DEUX régimes de lecture
     /// l'appliquent, pas seulement celui qui sonde.
+    /// #7379 — [`Self::lire_volume`] pour `get_status` : note en plus si la
+    /// valeur rendue est le repli de #5662 ([`Self::dernier_volume_illisible`]).
+    async fn lire_volume_du_statut(&self) -> Result<f64, String> {
+        let volume = self.lire_volume().await?;
+        self.dernier_releve_illisible.store(
+            self.volume_illisible.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        Ok(volume)
+    }
+
+    /// #7379 — vrai quand le volume du dernier `get_status` est le repli de
+    /// #5662 (corps vide, `CurrentVolume` absent, échec SOAP d'un Sonos), et
+    /// non une valeur lue.
+    pub(crate) fn dernier_volume_illisible(&self) -> bool {
+        self.dernier_releve_illisible.load(Ordering::Relaxed)
+    }
+
     async fn lire_volume(&self) -> Result<f64, String> {
         let sonos = self.device_id.contains("RINCON");
         let volume_resp = if sonos {
@@ -1702,6 +1739,15 @@ impl DlnaOutput {
             let budget_epuise = debut.elapsed() >= budget;
             match conduite {
                 ConduiteApresRefusPause::DejaEnPause => return Ok(()),
+                ConduiteApresRefusPause::RienNeJoue => {
+                    info!(
+                        device = %self.name,
+                        attente_ms,
+                        "dlna_pause_sans_media"
+                    );
+                    self.rien_ne_joue_a_la_pause.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
                 ConduiteApresRefusPause::Abandonner => {}
                 _ if budget_epuise => {}
                 ConduiteApresRefusPause::Attendre => {
@@ -2424,6 +2470,10 @@ impl DlnaOutput {
 
 #[async_trait::async_trait]
 impl OutputTarget for DlnaOutput {
+    fn volume_du_statut_illisible(&self) -> bool {
+        self.dernier_volume_illisible()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -2468,6 +2518,11 @@ impl OutputTarget for DlnaOutput {
     /// `arreter_faute_de_pause`) : rien à reprendre « sur place ».
     fn device_released_on_pause(&self) -> bool {
         self.arrete_au_lieu_de_pause.load(Ordering::SeqCst)
+    }
+
+    /// #7894 — la pause a trouvé le renderer sans média : rien ne jouait.
+    fn take_nothing_playing_on_pause(&self) -> bool {
+        self.rien_ne_joue_a_la_pause.swap(false, Ordering::SeqCst)
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
@@ -3117,6 +3172,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
+        self.rien_ne_joue_a_la_pause.store(false, Ordering::SeqCst);
         let response = self
             .av_action("Pause", "<InstanceID>0</InstanceID>")
             .await?;
@@ -3384,10 +3440,17 @@ impl OutputTarget for DlnaOutput {
                 // la réponse est illisible. Interroger l'appareil ici
                 // trahirait le silence promis.
                 None => match self.dernier_volume_pct.load(Ordering::Relaxed) {
-                    u64::MAX => 0.5,
+                    u64::MAX => volume_illisible_5662::REPLI_ILLISIBLE,
                     v => v as f64 / 100.0,
                 },
             };
+            // #7379 (troisième revue, B3a) — sans `Volume` poussé par
+            // l'appareil, la valeur rendue n'est pas une observation (repli,
+            // ou dernier volume posé par Tune) : le sondeur ne la juge pas.
+            // Dès qu'un `Volume` est poussé, le drapeau retombe — un drapeau
+            // resté levé ferait ignorer les vrais volumes (#6541).
+            self.dernier_releve_illisible
+                .store(evt_volume.is_none(), Ordering::Relaxed);
             // #6008 — même en silence : un saut de volume se corrige. Aucune
             // action ne part tant que l'appareil ne remonte pas son volume.
             let volume = match evt_volume {
@@ -3472,11 +3535,15 @@ impl OutputTarget for DlnaOutput {
             self.position_extrapolee.store(false, Ordering::Relaxed);
 
             let volume = match evt_volume {
-                Some(v) => self.fraction_du_niveau(v),
+                Some(v) => {
+                    self.dernier_releve_illisible
+                        .store(false, Ordering::Relaxed);
+                    self.fraction_du_niveau(v)
+                }
                 // Le RenderingControl n'a rien poussé : on ne devine pas, on
                 // demande — comme avant. Un abonnement AVTransport tenu ne
                 // dispense pas d'avoir un volume juste.
-                None => self.lire_volume().await?,
+                None => self.lire_volume_du_statut().await?,
             };
             let de_tune = self.lecture_de_tune(etat, current_uri.as_deref());
             let volume = self.volume_apres_controle_d_uri(volume, de_tune).await;
@@ -3504,7 +3571,7 @@ impl OutputTarget for DlnaOutput {
         // par seconde et par zone pendant TOUTE la lecture : l'action valait
         // un quart du trafic SOAP envoyé au renderer, pour une valeur que
         // personne ne lisait (#2263). L'état coupé se lit maintenant en local.
-        let volume = self.lire_volume().await?;
+        let volume = self.lire_volume_du_statut().await?;
         let state = etat_du_transport(&transport_resp);
         let de_tune =
             self.lecture_de_tune(state, extract_tag(&position_resp, "TrackURI").as_deref());
@@ -3878,7 +3945,7 @@ pub struct DsdCapability {
 /// `dsf_mime` keeps the renderer's own spelling of the MIME (3rd colon-separated
 /// field of `http-get:*:audio/dsf:*`), because some renderers only accept the
 /// exact MIME they advertise rather than the generic `application/x-dsd`.
-fn parse_dsd_capability(protocols: &[String]) -> DsdCapability {
+pub(crate) fn parse_dsd_capability(protocols: &[String]) -> DsdCapability {
     let mut cap = DsdCapability::default();
     for proto in protocols {
         let lower = proto.to_lowercase();
@@ -4628,8 +4695,12 @@ enum ConduiteApresRefusPause {
     Attendre,
     /// Il joue : la transition PLAYING→PAUSED existe, redemander `Pause`.
     RenvoyerPause,
-    /// Arrêté, sans média, ou muet : rien qu'une attente change, le refus
-    /// remonte tel quel.
+    /// #7894 — sans média (`NO_MEDIA_PRESENT`) : l'appareil ne joue rien, il
+    /// n'y a rien à mettre en pause. Ce n'est pas un échec de la commande :
+    /// la sortie le signale (`take_nothing_playing_on_pause`) et l'hôte arrête
+    /// la zone.
+    RienNeJoue,
+    /// Arrêté ou muet : rien qu'une attente change, le refus remonte tel quel.
     Abandonner,
 }
 
@@ -4638,6 +4709,7 @@ fn conduite_apres_refus_pause(etat_transport: Option<&str>) -> ConduiteApresRefu
         Some(e) if e.starts_with("PAUSED") => ConduiteApresRefusPause::DejaEnPause,
         Some(e) if e == "TRANSITIONING" => ConduiteApresRefusPause::Attendre,
         Some(e) if e == "PLAYING" => ConduiteApresRefusPause::RenvoyerPause,
+        Some(e) if e == "NO_MEDIA_PRESENT" => ConduiteApresRefusPause::RienNeJoue,
         _ => ConduiteApresRefusPause::Abandonner,
     }
 }

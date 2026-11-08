@@ -84,6 +84,10 @@ mod concerts_plugin;
 mod dj_plugin;
 #[path = "plugin_routes.rs"]
 mod plugin_routes;
+// rc11 — DJ et Karaoké s'activent depuis Réglages › Extensions (cases).
+#[cfg(all(feature = "dj", feature = "karaoke"))]
+#[path = "activation_dj_karaoke_b209.rs"]
+mod activation_dj_karaoke_b209;
 // #5403 — le greffon coupé à la borne reste visible, et se réessaie.
 #[path = "greffon_coupe_reessayer_5403.rs"]
 mod greffon_coupe_reessayer_5403;

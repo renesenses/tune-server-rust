@@ -156,8 +156,13 @@ pub(crate) fn scenario_texte_libre_mot_a_mot_4319(db: Arc<dyn DbBackend>) {
         "Abbado ne dirige que Bruckner"
     );
     assert!(trouve("mehta stravinsky").is_empty());
-    // Un mot n'est pas un joker : `%` est littéral.
-    assert!(trouve("mahler %").is_empty());
+    // #7619 (décision du 01/11/2026) : DÉBUT de mot, plus sous-chaîne.
+    assert_eq!(trouve("mahl meht"), trouve("mahler mehta"));
+    assert!(!trouve("mahl meht").is_empty());
+    assert!(trouve("ahler").is_empty(), "milieu de mot");
+    assert!(trouve("mahler ehta").is_empty(), "milieu de mot du chef");
+    // Ponctuation : un séparateur, pas un joker.
+    assert_eq!(trouve("mahler %"), trouve("mahler"));
 }
 
 #[test]

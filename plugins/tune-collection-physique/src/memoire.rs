@@ -17,7 +17,8 @@
 //!   disque sans entrée ici est un disque que l'affinage n'a pas encore lu :
 //!   c'est ainsi qu'il reprend après un redémarrage ;
 //! * le STREAMING : [`REVOIR_APRES_JOURS`] jours, ou dès que la liste des
-//!   services connectés change. N'y sont notés que les services qui ont
+//!   services connectés change, ou que la règle de comparaison change
+//!   ([`REGLE_DE_COMPARAISON`]). N'y sont notés que les services qui ont
 //!   RÉPONDU : un service muet laisse le disque à revoir.
 //!
 //! L'écriture passe par un fichier temporaire renommé : un arrêt brutal
@@ -34,12 +35,19 @@ use crate::discogs::Disque;
 pub const FICHIER: &str = "collection.json";
 pub const VERSION: u32 = 1;
 pub const REVOIR_APRES_JOURS: i64 = 30;
+/// La règle de comparaison avec les services ([`Streaming::regle`]). 1 :
+/// titre identique (et artiste). 2 : clé assouplie et code-barre qui
+/// contient le titre (#7981). Une réponse d'une règle plus ancienne se
+/// redemande à la synchronisation suivante, sans attendre trente jours.
+pub const REGLE_DE_COMPARAISON: u32 = 2;
 /// La forme des disques de la liste. 2 : avec la grande image
 /// (`Disque::pochette`, cache de pochettes du 01/11/2026). Une liste d'une
 /// forme plus ancienne se relit en ENTIER à la synchronisation suivante
 /// (sans rien refaire d'autre) ; une liste à jour se relit par le haut
 /// seulement (`crate::synchro`, relecture partielle).
-pub const VERSION_LISTE: u32 = 2;
+/// 3 : avec le dossier, les genres et les styles de chaque exemplaire
+/// (#7929, 05/11/2026).
+pub const VERSION_LISTE: u32 = 3;
 /// La liste se relit en entier au moins tous les tant de jours, même quand
 /// la relecture partielle suffit : c'est ainsi qu'une fiche corrigée chez
 /// Discogs (titre, label) finit par arriver.
@@ -80,6 +88,10 @@ pub struct Streaming {
     /// refaire, et le disque n'est pas « nulle part ».
     pub services: Vec<String>,
     pub lu_le: i64,
+    /// [`REGLE_DE_COMPARAISON`] de la réponse ; 0 (`serde(default)`) pour
+    /// une réponse d'avant #7981.
+    #[serde(default)]
+    pub regle: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +120,11 @@ pub struct Memoire {
     /// [`VERSION_LISTE`] de la liste rangée ; 0 pour une mémoire d'avant.
     #[serde(default)]
     pub version_liste: u32,
+    /// Les dossiers de la collection, lus avec la liste (#7929). Vide si
+    /// Discogs ne les montre pas (collection d'un autre compte : seul
+    /// « All » est visible).
+    #[serde(default)]
+    pub dossiers: Vec<crate::discogs::Dossier>,
 }
 
 impl Memoire {
@@ -153,6 +170,7 @@ impl Memoire {
             self.derniere_erreur = None;
             self.liste_complete_le = None;
             self.version_liste = 0;
+            self.dossiers.clear();
         }
     }
 
@@ -181,7 +199,11 @@ impl Memoire {
     pub fn streaming_a_revoir(&self, release: u64, services: &[String], maintenant: i64) -> bool {
         match self.streaming.get(&release) {
             None => true,
-            Some(s) => s.services != services || maintenant - s.lu_le > REVOIR_APRES_JOURS * 86_400,
+            Some(s) => {
+                s.services != services
+                    || s.regle != REGLE_DE_COMPARAISON
+                    || maintenant - s.lu_le > REVOIR_APRES_JOURS * 86_400
+            }
         }
     }
 }

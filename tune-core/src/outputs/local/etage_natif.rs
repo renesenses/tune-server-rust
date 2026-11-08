@@ -111,6 +111,11 @@ pub(super) struct EtageNatif<'a> {
     /// déplacement de voie, comme avant.
     adaptation: Option<AdaptationNative<'a>>,
     publication: Option<&'a std::sync::Mutex<Option<TransformationsReelles>>>,
+    /// #7264 — l'anneau d'un bras qui applique le volume AU RENDU (WASAPI
+    /// exclusif) : l'étage y marque les passages intacts (DoP, reliquat
+    /// brut) que le rendu ne doit jamais pondérer. `None` : aucun marquage,
+    /// comme avant.
+    gain_au_rendu: Option<Arc<NativePcmRing>>,
 }
 
 impl<'a> EtageNatif<'a> {
@@ -142,12 +147,23 @@ impl<'a> EtageNatif<'a> {
             mono_downmix,
             adaptation: None,
             publication: None,
+            gain_au_rendu: None,
         }
     }
 
     /// #7093 — le format réellement ouvert, puis le verdict PCM/DoP de
     /// chaque bloc, sont publiés vers la zone sans changer les mots rendus.
     #[cfg(any(target_os = "windows", test))]
+    /// #7264 — le volume de ce bras est appliqué par son fil de rendu, après
+    /// `anneau` : l'étage, monté à l'unité, y marque devant chaque bloc s'il
+    /// est un passage intact (DoP, reliquat forcé brut) ou du PCM que le
+    /// rendu pondère.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(super) fn avec_le_gain_au_rendu(mut self, anneau: Arc<NativePcmRing>) -> Self {
+        self.gain_au_rendu = Some(anneau);
+        self
+    }
+
     pub(super) fn avec_publication(
         mut self,
         creneau: &'a std::sync::Mutex<Option<TransformationsReelles>>,
@@ -227,7 +243,10 @@ impl<'a> EtageNatif<'a> {
 
     /// Range `mots` dans le puits, sous l'étiquette `Entier32`. Rend le verdict
     /// du puits (`false` = puits mort).
-    fn pousser_les_mots(&self, mots: &[i32], puits: &mut dyn PuitsNatif) -> bool {
+    fn pousser_les_mots(&self, mots: &[i32], intact: bool, puits: &mut dyn PuitsNatif) -> bool {
+        if let Some(anneau) = &self.gain_au_rendu {
+            anneau.marquer_passage_intact(intact);
+        }
         let octets: Vec<u8> = mots.iter().flat_map(|mot| mot.to_le_bytes()).collect();
         puits.ecrire(self.spec_du_puits().bloc(&octets))
     }
@@ -275,7 +294,7 @@ impl<'a> EtageNatif<'a> {
         self.must_classify_24_bit = false;
         self.dop_latched = prepared.dop;
         self.publier();
-        let vivant = self.pousser_les_mots(&prepared.samples, puits);
+        let vivant = self.pousser_les_mots(&prepared.samples, prepared.dop, puits);
         self.en_attente.drain(..aligned_len);
         let trames_source = (aligned_len / frame_bytes) as u64;
         if vivant {
@@ -313,7 +332,8 @@ impl<'a> EtageNatif<'a> {
         if queue.is_empty() {
             return true;
         }
-        let volume_factor = self.volume.load(Ordering::SeqCst) as f32 / 1000.0;
+        let volume_factor =
+            self.volume.load(Ordering::SeqCst) as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
         // #6230 — la queue sort aux canaux de la source : elle passe par la
         // même adaptation que le corps de la piste avant d'entrer au puits.
         let mut queue = if self.voies_pilotees() {
@@ -327,7 +347,7 @@ impl<'a> EtageNatif<'a> {
             }
         }
         let native = f32_to_native_i32(&queue, self.bit_depth());
-        self.pousser_les_mots(&native, puits)
+        self.pousser_les_mots(&native, false, puits)
     }
 
     /// Le reliquat de fin de flux : moins de 32 trames 24 bits initiales ne se
@@ -351,7 +371,7 @@ impl<'a> EtageNatif<'a> {
         } else {
             pcm_bytes_to_native_i32(&self.en_attente[..aligned], self.bit_depth())
         };
-        let _ = self.pousser_les_mots(&native, puits);
+        let _ = self.pousser_les_mots(&native, true, puits);
         self.en_attente.drain(..aligned);
         Some(ReliquatForceBrut {
             octets: aligned,
@@ -649,7 +669,7 @@ mod tests {
                 crossfeed: std::sync::Mutex::new(None),
                 pure_bypass: AtomicBool::new(false),
                 mono_downmix: AtomicBool::new(false),
-                volume: AtomicU32::new(1000),
+                volume: AtomicU32::new(UNITE_DU_GAIN_DE_RENDU),
             }
         }
 
@@ -750,7 +770,8 @@ mod tests {
     #[test]
     fn le_reliquat_24_bits_part_brut_et_a_l_unite() {
         let dsp = Dsp::au_repos();
-        dsp.volume.store(500, Ordering::SeqCst);
+        dsp.volume
+            .store(UNITE_DU_GAIN_DE_RENDU / 2, Ordering::SeqCst);
         let spec = stereo(ProfondeurPcm::Entier24);
         let mut capture = CaptureOutputNatif::ouvrir(spec_du_puits_natif(spec));
         let mut etage = dsp.etage(spec);
@@ -781,7 +802,8 @@ mod tests {
     #[test]
     fn le_volume_s_applique_dans_l_etage_et_le_verdict_le_dit() {
         let dsp = Dsp::au_repos();
-        dsp.volume.store(500, Ordering::SeqCst);
+        dsp.volume
+            .store(UNITE_DU_GAIN_DE_RENDU / 2, Ordering::SeqCst);
         let spec = stereo(ProfondeurPcm::Entier16);
         let source = octets(4 * 64);
         let mut capture = CaptureOutputNatif::ouvrir(spec_du_puits_natif(spec));

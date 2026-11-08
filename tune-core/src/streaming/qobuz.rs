@@ -55,6 +55,9 @@ pub struct QobuzService {
     user_auth_token: Option<String>,
     username: Option<String>,
     subscription: Option<String>,
+    /// #8022 — la langue du magasin du compte (`fr`, `en`…), lue à la
+    /// connexion : celle d'un texte éditorial qui n'annonce pas la sienne.
+    langue_magasin: Option<String>,
     /// Endpoint order: `false` (default) = direct Qobuz API first with the
     /// mozaiklabs proxy as fallback; `true` = proxy first with direct as
     /// fallback (founder accounts, signalled by the cloud license via the
@@ -188,6 +191,26 @@ const TTL_ALBUM: Duration = Duration::from_secs(300);
 /// Une liste de pistes pèse, et une navigation d'une heure traverse facilement
 /// des centaines d'albums : ici on évince la plus ancienne.
 const MAX_ALBUMS_CACHE: usize = 32;
+
+/// Attente maximale de la réponse de Qobuz pour UNE tentative de lecture
+/// d'une liste du COMPTE (connexion comprise), avant de passer à l'autre
+/// adresse — #7760.
+///
+/// Le client garde sa limite de 45 s, mais elle valait par tentative : une
+/// adresse qui accepte la connexion sans jamais répondre retenait chaque
+/// lecture 45 s avant le repli, et les widgets de l'accueil abandonnent à
+/// 8 s (`DELAI_MS` du client web). Un compte SANS favoris tombait ainsi en
+/// « délai » au lieu d'afficher sa liste vide. Deux tentatives de 3 s tiennent
+/// nettement sous ces 8 s.
+///
+/// Ne sont bornées QUE les deux lectures de ces widgets : les favoris
+/// (`lecture_des_favoris`, `/favorite/getUserFavorites`) et les playlists
+/// du compte (`get_user_playlists`, `/playlist/getUserPlaylists`). Tout le
+/// reste garde la limite du client : l'adresse de lecture des pistes
+/// (`/track/getFileUrl`, dont un échec ferait descendre l'échelle de
+/// qualité), la recherche, les fiches, l'éditorial, la connexion et les
+/// écritures.
+const DELAI_REPONSE_LISTE_DU_COMPTE: Duration = Duration::from_secs(3);
 
 /// (primary, fallback) API bases for the given endpoint order.
 ///
@@ -628,6 +651,328 @@ fn secondes_d_epoque() -> u64 {
         .unwrap_or(0)
 }
 
+// ── #8022 — correspondance d'un album ou d'un artiste LOCAL ──────────────
+
+/// ISRC interrogés au plus pour retrouver un album sans code-barres.
+const ISRC_EXAMINES: usize = 2;
+
+/// Un code-barres réduit à ses chiffres, sans les zéros de tête : l'UPC-A à 12
+/// chiffres et l'EAN-13 qui le prolonge d'un `0` désignent le même disque.
+/// Moins de 8 chiffres, ou un caractère qui n'est ni chiffre ni espace ni
+/// tiret : pas un code-barres.
+pub(crate) fn code_barres_normalise(brut: &str) -> Option<String> {
+    let brut = brut.trim();
+    if brut.is_empty()
+        || !brut
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ' ' || c == '-')
+    {
+        return None;
+    }
+    let chiffres: String = brut.chars().filter(char::is_ascii_digit).collect();
+    if chiffres.len() < 8 {
+        return None;
+    }
+    let sans_zeros = chiffres.trim_start_matches('0');
+    (!sans_zeros.is_empty()).then(|| sans_zeros.to_string())
+}
+
+/// Les ISRC valides (12 caractères alphanumériques), en majuscules, sans
+/// doublon, dans l'ordre reçu.
+pub(crate) fn isrcs_normalises(isrcs: &[String]) -> Vec<String> {
+    let mut vus: Vec<String> = Vec::new();
+    for i in isrcs {
+        let i: String = i
+            .trim()
+            .chars()
+            .filter(|c| *c != '-')
+            .collect::<String>()
+            .to_ascii_uppercase();
+        if i.len() == 12 && i.chars().all(|c| c.is_ascii_alphanumeric()) && !vus.contains(&i) {
+            vus.push(i);
+        }
+    }
+    vus
+}
+
+pub(crate) fn id_qobuz(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn album_retrouve(album: &serde_json::Value) -> Option<AlbumRetrouve> {
+    Some(AlbumRetrouve {
+        id: id_qobuz(&album["id"])?,
+        artist_id: id_qobuz(&album["artist"]["id"]),
+        artist_name: album["artist"]["name"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    })
+}
+
+fn sans_doublon(mut v: Vec<AlbumRetrouve>) -> Vec<AlbumRetrouve> {
+    let mut vus = std::collections::HashSet::new();
+    v.retain(|a| vus.insert(a.id.clone()));
+    v
+}
+
+/// Les albums de `/album/search` dont le code-barres est EXACTEMENT `upc`
+/// (normalisé). La recherche plein texte rend aussi des voisins : seul le
+/// champ `upc` fait foi.
+pub(crate) fn albums_par_upc(data: &serde_json::Value, upc: &str) -> Vec<AlbumRetrouve> {
+    let items = data["albums"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    sans_doublon(
+        items
+            .iter()
+            .filter(|a| {
+                a["upc"]
+                    .as_str()
+                    .and_then(code_barres_normalise)
+                    .is_some_and(|u| u == upc)
+            })
+            .filter_map(album_retrouve)
+            .collect(),
+    )
+}
+
+/// Les albums des titres de `/track/search` dont l'ISRC est EXACTEMENT `isrc`.
+pub(crate) fn albums_par_isrc(data: &serde_json::Value, isrc: &str) -> Vec<AlbumRetrouve> {
+    let items = data["tracks"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    sans_doublon(
+        items
+            .iter()
+            .filter(|t| {
+                t["isrc"]
+                    .as_str()
+                    .is_some_and(|i| i.trim().eq_ignore_ascii_case(isrc))
+            })
+            .filter_map(|t| album_retrouve(&t["album"]))
+            .collect(),
+    )
+}
+
+/// L'identifiant de l'UNIQUE artiste de `/artist/search` qui porte ce nom,
+/// casse et espaces de bord mis à part. Deux homonymes : rien.
+pub(crate) fn artiste_unique_du_nom(data: &serde_json::Value, nom: &str) -> Option<String> {
+    let voulu = nom.trim().to_lowercase();
+    let items = data["artists"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut ids: Vec<String> = items
+        .iter()
+        .filter(|a| {
+            a["name"]
+                .as_str()
+                .is_some_and(|n| n.trim().to_lowercase() == voulu)
+        })
+        .filter_map(|a| id_qobuz(&a["id"]))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    (ids.len() == 1).then(|| ids.remove(0))
+}
+
+/// La biographie d'une réponse `/artist/get`, en texte (même nettoyage que la
+/// note d'album, [`super::presentation_album::texte_de_presentation`] : il
+/// décode aussi les entités, ce que `strip_html_tags` ne fait pas), avec la
+/// langue que Qobuz annonce (`biography.language`).
+pub(crate) fn bio_editoriale_de(
+    data: &serde_json::Value,
+    artist_id: &str,
+) -> Option<TexteEditorial> {
+    let bio = &data["biography"];
+    let html = bio["content"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| bio["summary"].as_str())?;
+    let texte = super::presentation_album::texte_de_presentation(html)?;
+    let langue = bio["language"]
+        .as_str()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string);
+    Some(TexteEditorial {
+        texte,
+        langue,
+        url: Some(format!("https://open.qobuz.com/artist/{artist_id}")),
+    })
+}
+
+/// #8129 — le HTML de la bio d'une réponse `/artist/get` (le même champ que
+/// [`bio_editoriale_de`]).
+pub(crate) fn html_de_bio(data: &serde_json::Value) -> Option<String> {
+    let bio = &data["biography"];
+    bio["content"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| bio["summary"].as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// #8129 — le HTML de la présentation d'une réponse `album/get`, avec le
+/// titre de l'album et le nom de son artiste.
+pub(crate) fn html_de_presentation(data: &serde_json::Value) -> Option<HtmlEditorial> {
+    let html = data["description"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())?;
+    let noms = [data["title"].as_str(), data["artist"]["name"].as_str()]
+        .into_iter()
+        .flatten()
+        .filter(|n| !n.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    Some(HtmlEditorial {
+        html: html.to_string(),
+        noms,
+    })
+}
+
+/// La langue du magasin d'un compte, depuis l'objet `user` de la connexion :
+/// `language_code` s'il y est, sinon la partie langue de `store`
+/// (`fr-fr`, `gb-en` : pays puis langue).
+pub(crate) fn langue_du_magasin_de(user: &serde_json::Value) -> Option<String> {
+    let propre = |s: &str| {
+        let s = s.trim().to_ascii_lowercase();
+        (s.len() == 2 && s.chars().all(|c| c.is_ascii_alphabetic())).then_some(s)
+    };
+    if let Some(l) = user["language_code"].as_str().and_then(propre) {
+        return Some(l);
+    }
+    user["store"]
+        .as_str()
+        .and_then(|s| s.split(['-', '_']).nth(1))
+        .and_then(propre)
+}
+
+#[cfg(test)]
+mod tests_editorial_8022 {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn le_code_barres_ignore_les_zeros_de_tete() {
+        assert_eq!(
+            code_barres_normalise("0123456789012"),
+            code_barres_normalise("123456789012")
+        );
+        assert_eq!(code_barres_normalise("12-34 5678"), Some("12345678".into()));
+        assert_eq!(code_barres_normalise("ABC12345678"), None);
+        assert_eq!(code_barres_normalise("1234"), None);
+    }
+
+    #[test]
+    fn deux_albums_au_meme_code_barres_ne_sont_pas_une_correspondance_sure() {
+        let data = json!({"albums": {"items": [
+            {"id": "a", "upc": "0123456789012", "artist": {"id": 1, "name": "X"}},
+            {"id": "b", "upc": "123456789012", "artist": {"id": 2, "name": "Y"}},
+            {"id": "c", "upc": "999999999999", "artist": {"id": 3, "name": "Z"}},
+        ]}});
+        let upc = code_barres_normalise("0123456789012").unwrap();
+        assert_eq!(albums_par_upc(&data, &upc).len(), 2);
+    }
+
+    #[test]
+    fn un_seul_artiste_du_nom_exact() {
+        let data = json!({"artists": {"items": [
+            {"id": 1, "name": "Nom Factice"},
+            {"id": 2, "name": "Nom Factice Trio"},
+        ]}});
+        assert_eq!(
+            artiste_unique_du_nom(&data, "nom factice"),
+            Some("1".into())
+        );
+        let deux = json!({"artists": {"items": [
+            {"id": 1, "name": "Nom Factice"},
+            {"id": 2, "name": "NOM FACTICE"},
+        ]}});
+        assert_eq!(artiste_unique_du_nom(&deux, "Nom Factice"), None);
+    }
+
+    #[test]
+    fn langue_du_magasin_depuis_l_utilisateur() {
+        assert_eq!(
+            langue_du_magasin_de(&json!({"store": "fr-fr"})).as_deref(),
+            Some("fr")
+        );
+        assert_eq!(
+            langue_du_magasin_de(&json!({"store": "gb-en"})).as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            langue_du_magasin_de(&json!({"language_code": "de", "store": "fr-fr"})).as_deref(),
+            Some("de")
+        );
+        assert_eq!(langue_du_magasin_de(&json!({})), None);
+    }
+
+    #[test]
+    fn la_bio_est_du_texte_avec_sa_langue_et_son_lien() {
+        let data = json!({"biography": {"content": "<p>Un &amp; deux</p>", "language": "fr"}});
+        let b = bio_editoriale_de(&data, "42").unwrap();
+        assert_eq!(b.texte, "Un & deux");
+        assert_eq!(b.langue.as_deref(), Some("fr"));
+        assert_eq!(b.url.as_deref(), Some("https://open.qobuz.com/artist/42"));
+        assert_eq!(bio_editoriale_de(&json!({}), "42"), None);
+    }
+
+    /// ISRC : l'album doit porter TOUS les ISRC interrogés ; deux albums
+    /// communs, rien.
+    #[tokio::test]
+    async fn par_isrc_l_album_commun_a_tous_les_titres() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::collections::HashMap;
+
+        let app = Router::new().route(
+            "/track/search",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                let isrc = q.get("query").cloned().unwrap_or_default();
+                let albums: &[&str] = match isrc.as_str() {
+                    "XXA0D2600001" => &["compil", "studio"],
+                    "XXA0D2600002" => &["studio", "live"],
+                    "XXA0D2600003" => &["compil", "studio", "live"],
+                    _ => &[],
+                };
+                let items: Vec<_> = albums
+                    .iter()
+                    .map(|a| json!({"isrc": isrc, "album": {"id": a, "artist": {"id": 1, "name": "X"}}}))
+                    .collect();
+                Json(json!({"tracks": {"items": items}}))
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = ecoute.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let svc = QobuzService::avec_base_forcee(format!("http://{adresse}"));
+
+        let deux = vec!["XXA0D2600001".to_string(), "xxa0d2600002".to_string()];
+        let r = svc.album_par_codes(None, &deux).await.unwrap();
+        assert_eq!(r.map(|a| a.id).as_deref(), Some("studio"));
+
+        let ambigu = vec!["XXA0D2600001".to_string(), "XXA0D2600003".to_string()];
+        assert_eq!(svc.album_par_codes(None, &ambigu).await.unwrap(), None);
+
+        let inconnu = vec!["XXA0D2600009".to_string()];
+        assert_eq!(svc.album_par_codes(None, &inconnu).await.unwrap(), None);
+    }
+}
+
 impl QobuzService {
     /// #6934 — UNE page du catalogue d'un label, par son identifiant : un
     /// seul `label/get` (`extra=albums`, `limit`, `offset`). Le nom et le logo
@@ -819,6 +1164,7 @@ impl QobuzService {
             user_auth_token: None,
             username: None,
             subscription: None,
+            langue_magasin: None,
             proxy_first: false,
             stored_username: None,
             stored_password: None,
@@ -941,6 +1287,20 @@ impl QobuzService {
             .map_err(|(_, message)| message)
     }
 
+    /// Comme [`Self::api_get`], mais chaque tentative attend sa réponse au
+    /// plus `borne` (`None` : la limite du client). Voir
+    /// [`DELAI_REPONSE_LISTE_DU_COMPTE`] pour les seuls appelants bornés.
+    async fn api_get_borne(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        borne: Option<Duration>,
+    ) -> Result<serde_json::Value, String> {
+        self.api_get_avec_statut_borne(path, params, borne)
+            .await
+            .map_err(|(_, message)| message)
+    }
+
     /// Comme [`Self::api_get`], mais rend AUSSI le code HTTP du refus — le
     /// jumeau de [`Self::api_post_avec_statut`], pour la même raison : la
     /// logique de repli n'est écrite qu'une fois, et le code est lu sur
@@ -954,15 +1314,28 @@ impl QobuzService {
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, (Option<u16>, String)> {
+        self.api_get_avec_statut_borne(path, params, None).await
+    }
+
+    /// [`Self::api_get_avec_statut`] avec une attente de réponse bornée par
+    /// tentative (`None` : la limite du client).
+    async fn api_get_avec_statut_borne(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        borne: Option<Duration>,
+    ) -> Result<serde_json::Value, (Option<u16>, String)> {
         let (primary, fallback) = self.bases_api();
-        match self.api_get_at(primary, path, params).await {
+        match self.api_get_at(primary, path, params, borne).await {
             Ok(v) => Ok(v),
             Err(err) if err.transient() => {
                 log_fallback(self.proxy_first, path, &err);
-                self.api_get_at(fallback, path, params).await.map_err(|e| {
-                    info!(path, error = %e, "qobuz_fallback_api_error");
-                    (e.statut_http(), format!("qobuz {path}: {e}"))
-                })
+                self.api_get_at(fallback, path, params, borne)
+                    .await
+                    .map_err(|e| {
+                        info!(path, error = %e, "qobuz_fallback_api_error");
+                        (e.statut_http(), format!("qobuz {path}: {e}"))
+                    })
             }
             Err(err) => {
                 info!(path, error = %err, "qobuz_api_error");
@@ -971,12 +1344,14 @@ impl QobuzService {
         }
     }
 
-    /// One GET attempt against a specific API base.
+    /// One GET attempt against a specific API base. `borne` caps the wait for
+    /// the response headers (`None`: the client's own limit).
     async fn api_get_at(
         &self,
         base: &str,
         path: &str,
         params: &[(&str, &str)],
+        borne: Option<Duration>,
     ) -> Result<serde_json::Value, AttemptError> {
         let url = format!("{base}{path}");
         let app_id = self.app_id.as_str();
@@ -993,10 +1368,22 @@ impl QobuzService {
             req = req.header("X-User-Auth-Token", token.as_str());
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| AttemptError::Network(e.to_string()))?;
+        // #7760 — pour les seules listes du compte, l'attente de la RÉPONSE
+        // est bornée par tentative ; le corps, lui, garde la limite du client
+        // (une longue liste peut peser).
+        let envoi = match borne {
+            None => req.send().await,
+            Some(borne) => tokio::time::timeout(borne, req.send()).await.map_err(|_| {
+                warn!(
+                    base,
+                    path,
+                    delai_ms = borne.as_millis() as u64,
+                    "qobuz_api_no_response_in_time"
+                );
+                AttemptError::Network(format!("no response within {} ms", borne.as_millis()))
+            })?,
+        };
+        let resp = envoi.map_err(|e| AttemptError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -1016,12 +1403,25 @@ impl QobuzService {
         offset: usize,
         limit: usize,
     ) -> Result<serde_json::Value, String> {
+        self.api_get_page_borne(path, base_params, offset, limit, None)
+            .await
+    }
+
+    /// [`Self::api_get_page`] avec une attente de réponse bornée (#7760).
+    async fn api_get_page_borne(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        offset: usize,
+        limit: usize,
+        borne: Option<Duration>,
+    ) -> Result<serde_json::Value, String> {
         let offset_str = offset.to_string();
         let limit_str = limit.to_string();
         let mut params: Vec<(&str, &str)> = base_params.to_vec();
         params.push(("limit", &limit_str));
         params.push(("offset", &offset_str));
-        self.api_get(path, &params).await
+        self.api_get_borne(path, &params, borne).await
     }
 
     /// Fetch all pages from a paginated Qobuz endpoint.
@@ -1322,11 +1722,23 @@ impl QobuzService {
         base_params: &[(&str, &str)],
         cle: &str,
     ) -> Result<serde_json::Value, String> {
+        self.detail_pagine_borne(path, base_params, cle, None).await
+    }
+
+    /// [`Self::detail_pagine`] dont chaque page attend sa réponse au plus
+    /// `borne` par tentative (#7760, voir [`DELAI_REPONSE_LISTE_DU_COMPTE`]).
+    async fn detail_pagine_borne(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        cle: &str,
+        borne: Option<Duration>,
+    ) -> Result<serde_json::Value, String> {
         use futures_util::StreamExt;
         const MAX_PAGES_CONCURRENTES: usize = 4;
 
         let mut data = self
-            .api_get_page(path, base_params, 0, TAILLE_PAGE_DETAIL)
+            .api_get_page_borne(path, base_params, 0, TAILLE_PAGE_DETAIL, borne)
             .await?;
         let compte = data[cle]["items"].as_array().map(Vec::len).unwrap_or(0);
         let total = data[cle]["total"].as_u64().unwrap_or(0) as usize;
@@ -1363,7 +1775,7 @@ impl QobuzService {
         let pages: Vec<Result<Vec<serde_json::Value>, String>> =
             futures_util::stream::iter(offsets.into_iter().map(|offset| async move {
                 let page = self
-                    .api_get_page(path, base_params, offset, TAILLE_PAGE_DETAIL)
+                    .api_get_page_borne(path, base_params, offset, TAILLE_PAGE_DETAIL, borne)
                     .await?;
                 Ok(page[cle]["items"].as_array().cloned().unwrap_or_default())
             }))
@@ -1414,12 +1826,28 @@ impl QobuzService {
         items_key: &str,
         plafond: usize,
     ) -> Result<ListePaginee, String> {
+        self.liste_paginee_borne(path, base_params, items_key, plafond, None)
+            .await
+    }
+
+    /// [`Self::liste_paginee`] dont chaque page attend sa réponse au plus
+    /// `borne` par tentative (#7760, voir [`DELAI_REPONSE_LISTE_DU_COMPTE`]).
+    async fn liste_paginee_borne(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        items_key: &str,
+        plafond: usize,
+        borne: Option<Duration>,
+    ) -> Result<ListePaginee, String> {
         use futures_util::StreamExt;
         const PAGE_SIZE: usize = 50;
         const MAX_CONCURRENT_PAGES: usize = 4;
 
         // First page: learn `total` and keep the first-page diagnostics.
-        let data = self.api_get_page(path, base_params, 0, PAGE_SIZE).await?;
+        let data = self
+            .api_get_page_borne(path, base_params, 0, PAGE_SIZE, borne)
+            .await?;
 
         let mut all_items: Vec<serde_json::Value> = data[items_key]["items"]
             .as_array()
@@ -1499,7 +1927,7 @@ impl QobuzService {
         let pages: Vec<Result<Vec<serde_json::Value>, String>> =
             futures_util::stream::iter(offsets.into_iter().map(|offset| async move {
                 let data = self
-                    .api_get_page(path, base_params, offset, PAGE_SIZE)
+                    .api_get_page_borne(path, base_params, offset, PAGE_SIZE, borne)
                     .await?;
                 let items = data[items_key]["items"]
                     .as_array()
@@ -1725,11 +2153,13 @@ impl QobuzService {
         };
         let reponse = vol
             .get_or_init(|| async {
-                self.liste_paginee(
+                // #7760 — liste du compte : réponse bornée par tentative.
+                self.liste_paginee_borne(
                     "/favorite/getUserFavorites",
                     &[("type", type_qobuz)],
                     type_qobuz,
                     usize::MAX,
+                    Some(DELAI_REPONSE_LISTE_DU_COMPTE),
                 )
                 .await
             })
@@ -1873,6 +2303,33 @@ impl QobuzService {
         }
     }
 
+    /// L'année d'un album Qobuz : `released_at`, à défaut
+    /// `release_date_original`. Partagée par la fiche d'album et par l'année
+    /// des pistes (#8062), pour que les deux écrans disent la même année.
+    fn annee_d_album(item: &serde_json::Value) -> Option<u32> {
+        item["released_at"]
+            .as_u64()
+            .map(|ts| 1970 + (ts / 31_536_000) as u32)
+            .or_else(|| {
+                item["release_date_original"]
+                    .as_str()
+                    .and_then(|d| d.get(..4)?.parse().ok())
+            })
+    }
+
+    /// #8062 — l'année et le genre qu'un objet album Qobuz publie : le
+    /// sous-objet `album` d'une piste de playlist, ou la réponse d'`album/get`.
+    fn annee_et_genre(album: &serde_json::Value) -> AnneeEtGenre {
+        AnneeEtGenre {
+            year: Self::annee_d_album(album),
+            genre: album["genre"]["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+                .map(Into::into),
+        }
+    }
+
     /// #6063 — le type de sortie d'un album Qobuz : celui que Qobuz annonce
     /// (`release_type`), corrigé par le titre et la règle des pistes quand
     /// Qobuz dit « album » ou ne dit rien
@@ -1949,14 +2406,7 @@ impl QobuzService {
             artist: item["artist"]["name"].as_str().unwrap_or("").into(),
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
             cover_path: Self::pochette(item),
-            year: item["released_at"]
-                .as_u64()
-                .map(|ts| 1970 + (ts / 31_536_000) as u32)
-                .or_else(|| {
-                    item["release_date_original"]
-                        .as_str()
-                        .and_then(|d| d.get(..4)?.parse().ok())
-                }),
+            year: Self::annee_d_album(item),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
             quality: item["maximum_bit_depth"].as_u64().map(|bd| StreamQuality {
                 codec: "FLAC".into(),
@@ -1977,6 +2427,8 @@ impl QobuzService {
             // l'album, tel que `album/get` le rend (booléen). Une autre forme
             // ou l'absence : on ne conclut rien.
             ai_generated: item["ai_generated"].as_bool(),
+            // #8088 — le marquage explicite de l'album, comme celui des pistes.
+            explicit: item["parental_warning"].as_bool(),
         }
     }
 
@@ -2434,6 +2886,7 @@ impl QobuzService {
         self.user_auth_token = data["user_auth_token"].as_str().map(Into::into);
         self.username = data["user"]["display_name"].as_str().map(Into::into);
         self.subscription = data["user"]["credential"]["label"].as_str().map(Into::into);
+        self.langue_magasin = langue_du_magasin_de(&data["user"]);
         // A fresh session clears the expiry flag, whether this login came from
         // the user or from `auto_relogin`.
         self.session_expired = false;
@@ -2941,6 +3394,18 @@ impl StreamingService for QobuzService {
         Ok(Self::map_album(&data))
     }
 
+    /// #8062 — l'année et le genre sont ceux de l'album, au niveau supérieur
+    /// d'`album/get`. Le second `detail_album` sort du cache que le premier
+    /// vient de remplir : pas de second appel à Qobuz.
+    async fn get_album_tracks_avec_annee_et_genre(
+        &self,
+        album_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
+        let pistes = self.get_album_tracks(album_id).await?;
+        let extras = Self::annee_et_genre(&self.detail_album(album_id).await?);
+        Ok(pistes.into_iter().map(|t| (t, extras.clone())).collect())
+    }
+
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self.detail_album(album_id).await?;
         // Qobuz album/get returns album metadata at the top level while
@@ -3033,11 +3498,32 @@ impl StreamingService for QobuzService {
     /// name-matched local artist ») est gardée par `if let Ok(…)` — elle n'a
     /// donc JAMAIS tourné.
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
+        Ok(self.get_artist_avec_bio_html(artist_id).await?.0)
+    }
+
+    /// #8129 — la même fiche, avec le HTML de sa bio : ses liens deviennent
+    /// des segments (`bio_qobuz`).
+    async fn get_artist_avec_bio_html(
+        &self,
+        artist_id: &str,
+    ) -> Result<(StreamArtist, Option<String>), TuneError> {
         let data = self
             .api_get_avec_statut("/artist/get", &[("artist_id", artist_id)])
             .await
             .map_err(erreur_de_fiche)?;
-        Ok(Self::map_artist(&data))
+        Ok((Self::map_artist(&data), html_de_bio(&data)))
+    }
+
+    /// #8129 — `album/get` sort du cache rempli par la fiche.
+    async fn presentation_album_html(
+        &self,
+        album_id: &str,
+    ) -> Result<Option<HtmlEditorial>, TuneError> {
+        let data = self
+            .detail_album(album_id)
+            .await
+            .map_err(TuneError::Other)?;
+        Ok(html_de_presentation(&data))
     }
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
@@ -3057,6 +3543,20 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Ok(self
+            .get_playlist_tracks_avec_annee_et_genre(playlist_id)
+            .await?
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect())
+    }
+
+    /// #8062 — chaque piste de `playlist/get` porte son sous-objet `album`, avec
+    /// `released_at` et `genre` : la même réponse donne l'année et le genre.
+    async fn get_playlist_tracks_avec_annee_et_genre(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
         // La JUMELLE de `/album/get` (#2867). Le `limit=500` écrit ici n'était
         // pas une marge confortable : c'est le PLAFOND DUR de Qobuz, mesuré —
         // `limit=1000` en rend 500. Une playlist de plus de 500 titres était
@@ -3070,7 +3570,12 @@ impl StreamingService for QobuzService {
             .await?;
         let tracks = data["tracks"]["items"]
             .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| (Self::map_track(item), Self::annee_et_genre(&item["album"])))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(tracks)
     }
@@ -3571,6 +4076,117 @@ impl StreamingService for QobuzService {
         Ok(super::presentation_album::presentation_qobuz(&data))
     }
 
+    /// #8022 — voir [`albums_par_upc`] et [`albums_par_isrc`] : une seule
+    /// réponse possible, sinon rien.
+    async fn album_par_codes(
+        &self,
+        upc: Option<&str>,
+        isrcs: &[String],
+    ) -> Result<Option<AlbumRetrouve>, TuneError> {
+        if let Some(upc) = upc.and_then(code_barres_normalise) {
+            let data = self
+                .api_get("/album/search", &[("query", upc.as_str()), ("limit", "10")])
+                .await?;
+            let trouves = albums_par_upc(&data, &upc);
+            if trouves.len() == 1 {
+                return Ok(trouves.into_iter().next());
+            }
+        }
+        let mut communs: Option<Vec<AlbumRetrouve>> = None;
+        for isrc in isrcs_normalises(isrcs).iter().take(ISRC_EXAMINES) {
+            let data = self
+                .api_get(
+                    "/track/search",
+                    &[("query", isrc.as_str()), ("limit", "25")],
+                )
+                .await?;
+            let ici = albums_par_isrc(&data, isrc);
+            communs = Some(match communs {
+                None => ici,
+                Some(avant) => avant
+                    .into_iter()
+                    .filter(|a| ici.iter().any(|b| b.id == a.id))
+                    .collect(),
+            });
+            if communs.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(None);
+            }
+        }
+        Ok(communs
+            .filter(|c| c.len() == 1)
+            .and_then(|c| c.into_iter().next()))
+    }
+
+    async fn artiste_par_nom_exact(&self, nom: &str) -> Result<Option<String>, TuneError> {
+        let nom = nom.trim();
+        if nom.is_empty() {
+            return Ok(None);
+        }
+        let data = self
+            .api_get("/artist/search", &[("query", nom), ("limit", "25")])
+            .await?;
+        Ok(artiste_unique_du_nom(&data, nom))
+    }
+
+    async fn bio_editoriale_artiste(
+        &self,
+        artist_id: &str,
+    ) -> Result<Option<TexteEditorial>, TuneError> {
+        let data = self
+            .api_get_avec_statut("/artist/get", &[("artist_id", artist_id)])
+            .await
+            .map_err(erreur_de_fiche)?;
+        Ok(bio_editoriale_de(&data, artist_id))
+    }
+
+    async fn note_editoriale_album(
+        &self,
+        album_id: &str,
+    ) -> Result<Option<TexteEditorial>, TuneError> {
+        Ok(self
+            .get_album_description(album_id)
+            .await?
+            .map(|d| TexteEditorial {
+                texte: d.description,
+                langue: d.language,
+                url: Some(format!("https://open.qobuz.com/album/{album_id}")),
+            }))
+    }
+
+    fn langue_du_magasin(&self) -> Option<String> {
+        self.langue_magasin.clone()
+    }
+
+    /// #8077 — `album/search` sur « artiste titre ». Le jugement est fait
+    /// par `library::apports_service`.
+    async fn albums_par_titre(
+        &self,
+        artiste: &str,
+        titre: &str,
+    ) -> Result<Vec<CandidatAlbum>, TuneError> {
+        let requete = format!("{} {}", artiste.trim(), titre.trim());
+        if requete.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let data = self
+            .api_get(
+                "/album/search",
+                &[("query", requete.trim()), ("limit", "25")],
+            )
+            .await?;
+        Ok(super::qobuz_apports::candidats_de_la_recherche(&data))
+    }
+
+    /// #8077 — la fiche complète, depuis `detail_album` (cache de 5 min,
+    /// pistes paginées).
+    async fn fiche_album_service(
+        &self,
+        album_id: &str,
+    ) -> Result<Option<FicheAlbumService>, TuneError> {
+        let data = self.detail_album(album_id).await?;
+        Ok(super::qobuz_apports::fiche_de_l_album(&data))
+    }
+
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         let items = self.favoris_bruts("tracks").await?;
         Ok(items.iter().map(Self::map_track).collect())
@@ -3680,8 +4296,14 @@ impl StreamingService for QobuzService {
         // est plus rare qu'un coffret, mais il existe — un compte de longue
         // date dépasse le demi-millier de playlists — et la correction ne
         // coûte rien : sans page suivante, c'est exactement l'appel d'avant.
+        // #7760 — liste du compte : réponse bornée par tentative.
         let data = self
-            .detail_pagine("/playlist/getUserPlaylists", &[], "playlists")
+            .detail_pagine_borne(
+                "/playlist/getUserPlaylists",
+                &[],
+                "playlists",
+                Some(DELAI_REPONSE_LISTE_DU_COMPTE),
+            )
             .await?;
         Ok(Self::map_user_playlists(&data))
     }
@@ -3894,6 +4516,119 @@ impl StreamingService for QobuzService {
         Ok(ptids.len())
     }
 
+    /// #8066 — remplacer le titre au rang `rang` sans le déplacer.
+    ///
+    /// Qobuz n'a pas d'écriture « remplacer » : on AJOUTE le nouveau titre
+    /// (`/playlist/addTracks`, en fin de liste), on le place AVANT l'ancien
+    /// (`/playlist/updateTracksPosition`, `insert_before` = rang), on relit
+    /// pour vérifier qu'il est bien au rang dit, l'ancien juste après, et
+    /// seulement alors on retire l'ancien par son `playlist_track_id`. Si le
+    /// déplacement n'a pas pris, c'est le titre AJOUTÉ qui est retiré : la
+    /// playlist reste celle d'avant, rien n'est perdu.
+    async fn replace_playlist_track(
+        &self,
+        playlist_id: &str,
+        rang: usize,
+        ancien: &str,
+        nouveau: &str,
+    ) -> Result<(), TuneError> {
+        let lire = || async {
+            let data = self
+                .detail_pagine(
+                    "/playlist/get",
+                    &[("playlist_id", playlist_id), ("extra", "tracks")],
+                    "tracks",
+                )
+                .await?;
+            Ok::<Vec<(String, Option<u64>)>, TuneError>(
+                data["tracks"]["items"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|it| {
+                                let id = it["id"]
+                                    .as_u64()
+                                    .map(|n| n.to_string())
+                                    .or_else(|| it["id"].as_str().map(Into::into))
+                                    .unwrap_or_default();
+                                (id, it["playlist_track_id"].as_u64())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        };
+        let avant = lire().await?;
+        let Some((id_vu, Some(ptid_ancien))) = avant.get(rang).cloned() else {
+            return Err(TuneError::NotFound(format!(
+                "qobuz: aucun titre au rang {rang} de la playlist {playlist_id}"
+            )));
+        };
+        if id_vu != ancien {
+            return Err(TuneError::Other(format!(
+                "qobuz: la playlist a changé (rang {rang} : {id_vu}, attendu {ancien})"
+            )));
+        }
+        let connus: std::collections::HashSet<u64> = avant.iter().filter_map(|(_, p)| *p).collect();
+        self.api_post(
+            "/playlist/addTracks",
+            &[("playlist_id", playlist_id), ("track_ids", nouveau)],
+        )
+        .await?;
+        let ptid_nouveau = lire()
+            .await?
+            .into_iter()
+            .find_map(|(id, p)| p.filter(|p| id == nouveau && !connus.contains(p)))
+            .ok_or_else(|| {
+                TuneError::Other(format!("qobuz: le titre {nouveau} n'a pas été ajouté"))
+            })?;
+        self.api_post(
+            "/playlist/updateTracksPosition",
+            &[
+                ("playlist_id", playlist_id),
+                ("playlist_track_ids", &ptid_nouveau.to_string()),
+                ("insert_before", &rang.to_string()),
+            ],
+        )
+        .await?;
+        // Le déplacement est VÉRIFIÉ avant de retirer l'ancien : s'il n'a pas
+        // pris, on retire le titre ajouté et la playlist reste celle d'avant.
+        let deplace = lire().await?;
+        let confirme = deplace
+            .get(rang)
+            .is_some_and(|(id, p)| id == nouveau && *p == Some(ptid_nouveau))
+            && deplace
+                .get(rang + 1)
+                .is_some_and(|(_, p)| *p == Some(ptid_ancien));
+        let (a_retirer, issue) = if confirme {
+            (ptid_ancien, Ok(()))
+        } else {
+            (
+                ptid_nouveau,
+                Err(TuneError::Other(format!(
+                    "qobuz: position non confirmée au rang {rang} ; ajout annulé, playlist inchangée"
+                ))),
+            )
+        };
+        self.api_post(
+            "/playlist/deleteTracks",
+            &[
+                ("playlist_id", playlist_id),
+                ("playlist_track_ids", &a_retirer.to_string()),
+            ],
+        )
+        .await?;
+        issue?;
+        let apres = lire().await?;
+        match apres.get(rang) {
+            Some((id, _)) if id == nouveau => Ok(()),
+            autre => Err(TuneError::Other(format!(
+                "qobuz: remplacement écrit mais position non confirmée (rang {rang} : {autre:?})"
+            ))),
+        }
+    }
+
     fn supports_write(&self) -> bool {
         self.user_auth_token.is_some()
     }
@@ -3968,6 +4703,7 @@ impl StreamingService for QobuzService {
             "user_auth_token": token,
             "username": self.username,
             "subscription": self.subscription,
+            "langue_magasin": self.langue_magasin,
             "app_id": self.app_id,
             "app_secret": self.app_secret,
             "stored_username": self.stored_username,
@@ -3979,6 +4715,7 @@ impl StreamingService for QobuzService {
             self.user_auth_token = Some(t.into());
             self.username = tokens["username"].as_str().map(Into::into);
             self.subscription = tokens["subscription"].as_str().map(Into::into);
+            self.langue_magasin = tokens["langue_magasin"].as_str().map(Into::into);
             if let Some(id) = tokens["app_id"].as_str() {
                 self.app_id = id.into();
             }
@@ -4291,6 +5028,32 @@ mod tests {
     }
 
     #[test]
+    /// #8062 — une piste de `playlist/get` porte l'année et le genre de son
+    /// album ; un album sans genre ni date n'invente rien.
+    #[test]
+    fn annee_et_genre_d_une_piste_de_playlist_8062() {
+        let item = json!({
+            "id": 8062001,
+            "title": "So What",
+            "album": {
+                "id": "a8062",
+                "release_date_original": "1959-08-17",
+                "genre": { "id": 80, "name": "Jazz" }
+            }
+        });
+        assert_eq!(
+            QobuzService::annee_et_genre(&item["album"]),
+            AnneeEtGenre {
+                year: Some(1959),
+                genre: Some("Jazz".into())
+            }
+        );
+        assert_eq!(
+            QobuzService::annee_et_genre(&json!({ "genre": { "name": "  " } })),
+            AnneeEtGenre::default()
+        );
+    }
+
     /// Point 10 — la disponibilité voyage jusqu'au client : dans un album
     /// annoncé, le single sorti se joue et le reste est grisé.
     #[test]
@@ -4784,6 +5547,28 @@ mod tests {
             "ai_generated": true,
             "release_tags": [],
         })
+    }
+
+    #[test]
+    fn map_album_lit_le_marquage_explicite_de_qobuz_8088() {
+        let explicite = QobuzService::map_album(&json!({"id": "1", "parental_warning": true}));
+        assert_eq!(explicite.explicit, Some(true));
+        assert_eq!(
+            serde_json::to_value(&explicite).unwrap()["explicit"],
+            json!(true)
+        );
+        let propre = QobuzService::map_album(&json!({"id": "2", "parental_warning": false}));
+        assert_eq!(propre.explicit, Some(false));
+        let muet = QobuzService::map_album(&json!({"id": "3"}));
+        assert_eq!(muet.explicit, None);
+        assert!(
+            serde_json::to_value(&muet)
+                .unwrap()
+                .get("explicit")
+                .is_none()
+        );
+        let piste = QobuzService::map_track(&json!({"id": 4, "parental_warning": true}));
+        assert!(piste.explicit);
     }
 
     #[test]
@@ -8015,6 +8800,10 @@ mod tests_favoris_en_vol {
 /// playlists de l'utilisateur et celles qu'il suit ; seules les premières
 /// acceptent un ajout (Qobuz refuse les autres en 401).
 #[cfg(test)]
+#[path = "qobuz_remplacement_8066_tests.rs"]
+mod remplacement_8066_tests;
+
+#[cfg(test)]
 mod tests_playlists_proprietaire_2097 {
     use super::*;
     use serde_json::json;
@@ -8217,6 +9006,12 @@ mod logos_labels;
 #[cfg(test)]
 #[path = "qobuz_page_du_label_tests.rs"]
 mod page_du_label_tests;
+
+/// #7760 — un compte sans favoris rend sa liste vide avant le délai du widget,
+/// même quand l'adresse principale de Qobuz ne répond pas.
+#[cfg(test)]
+#[path = "qobuz_delai_favoris_7760_tests.rs"]
+mod delai_favoris_7760_tests;
 
 /// renesenses/tune-server-rust#7068 — un mauvais mot de passe Qobuz sortait en
 /// `qobuz login: 401 {"status":"error","code":401,"message":"Invalid

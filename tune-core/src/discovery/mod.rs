@@ -1,6 +1,7 @@
 pub mod device;
 pub mod mac;
 pub mod mdns;
+pub mod mdns_reprise;
 pub mod minimal_dmr;
 mod oui_audio;
 /// Fraîcheur du registre des serveurs multimédia (#2219, phase 1) — le verdict

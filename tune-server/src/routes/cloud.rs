@@ -577,7 +577,10 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
 /// POST /cloud/sso/disconnect — log out of the mozaiklabs.fr account: drop the
 /// stored tokens/profile and revoke the account premium. The license-key path is
 /// untouched (a keyed premium survives).
-async fn sso_disconnect(State(state): State<AppState>) -> Json<Value> {
+async fn sso_disconnect(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     // Tune Circle (décision du 28/09/2026, #5326) : défaire la liaison chez le
     // cloud AVANT d'effacer les jetons qui la prouvent. Un échec (réseau, 404,
@@ -1390,12 +1393,79 @@ async fn license_activate(
 }
 
 async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
+    let remote_released = retirer_la_licence(&state).await;
+    Json(reponse_de_retrait(
+        json!({"status": "deactivated", "tier": "free"}),
+        remote_released,
+    ))
+}
+
+/// Retire la licence de ce serveur (#7726) : prévient d'abord mozaiklabs.fr
+/// que cette machine rend sa licence, puis efface la clé locale.
+///
+/// L'effacement local seul laissait la machine détentrice de la licence côté
+/// site : l'activation sur un autre serveur était refusée (« License active on
+/// another server »). La clé est effacée **dans tous les cas**, même quand le
+/// site ne répond pas — le retrait ne doit jamais dépendre du réseau. Rend
+/// `true` quand le site a confirmé la libération de la machine.
+///
+/// Partagée par `DELETE /system/license` et `POST /cloud/license/deactivate`.
+pub(crate) async fn retirer_la_licence(state: &AppState) -> bool {
+    let ls = state.license.license_state().await;
+    let remote_released = match ls.license_key.as_deref() {
+        Some(key) => {
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
+            let payload = json!({
+                "license_key": key,
+                "hardware_fingerprint": ls.hardware_fingerprint,
+                "server_id": server_id,
+            });
+            let resp = state
+                .http_client
+                .post(license_deactivate_url(&settings))
+                .timeout(std::time::Duration::from_secs(5))
+                .json(&payload)
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => true,
+                Ok(r) => {
+                    warn!(status = %r.status(), "license_remote_release_refused");
+                    false
+                }
+                Err(e) => {
+                    warn!(error = %e, "license_remote_release_unreachable");
+                    false
+                }
+            }
+        }
+        // Aucune clé : rien à libérer côté site.
+        None => true,
+    };
     state.license.clear_license().await;
     state.event_bus.emit(
         "license.updated",
         json!({"tier": "free", "expires_at": null}),
     );
-    Json(json!({"status": "deactivated", "tier": "free"}))
+    remote_released
+}
+
+/// Ajoute à la réponse d'un retrait de licence le champ `remote_released`, et
+/// le message qui dit à l'utilisateur que le site n'a pas pu être prévenu.
+pub(crate) fn reponse_de_retrait(mut corps: Value, remote_released: bool) -> Value {
+    corps["remote_released"] = json!(remote_released);
+    if remote_released {
+        corps
+    } else {
+        crate::message_api::avec_message(corps, "api.license.removed_offline", &[])
+    }
+}
+
+/// URL du point de mozaiklabs.fr qui libère la machine détentrice d'une
+/// licence, redirigée par `mozaik_base_url` comme la validation.
+pub(crate) fn license_deactivate_url(settings: &SettingsRepo) -> String {
+    format!("{}/api/v1/license/deactivate", mozaik_base(settings))
 }
 
 /// URL du point de validation de licence chez mozaiklabs.fr.

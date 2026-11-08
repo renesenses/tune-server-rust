@@ -132,6 +132,10 @@ pub struct EqProcessor {
     /// sans niveau d'avant connu, le gain reste gardé jusqu'au prochain
     /// réglage, comme le voulait la décision du 21/10 (#6708).
     borne_de_remontee: f32,
+    /// #4176 — « Remettre à plat » a libéré le gain gardé : il remonte
+    /// jusqu'au signal sec, sans la borne de volume de #6741. Suit le neutre
+    /// d'une piste à l'autre ; un égaliseur réactivé repart sans.
+    libere: bool,
     clipping: CompteurDEcretage,
     closed: AtomicBool,
 }
@@ -188,6 +192,7 @@ impl EqProcessor {
             extinction: None,
             // #6741 — 0 : sans borne posée par la sortie, rien ne remonte.
             borne_de_remontee: 0.0,
+            libere: false,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -227,6 +232,7 @@ impl EqProcessor {
             gain_garde: (!identite).then_some(gains),
             extinction: None,
             borne_de_remontee: precedent.borne_de_remontee,
+            libere: false,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -375,6 +381,7 @@ impl EqProcessor {
             gain_garde: Some(gains),
             extinction: None,
             borne_de_remontee: self.borne_de_remontee,
+            libere: self.libere,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         };
@@ -426,10 +433,48 @@ impl EqProcessor {
     /// volume, et jamais en dessous du gain courant pour un gain inférieur à
     /// 1 — la remontée ne fait jamais baisser le niveau.
     fn cible_du_gain_garde(&self, g: f32) -> f32 {
-        if g >= 1.0 {
+        if g >= 1.0 || self.libere {
             return 1.0;
         }
         self.borne_de_remontee.min(1.0).max(g)
+    }
+
+    /// #4176 — « Remettre à plat » sur un égaliseur coupé : le geste explicite
+    /// qui rend le niveau. Le gain gardé remonte jusqu'au signal sec, même si
+    /// le volume a été monté pendant que l'égaliseur jouait (la borne de
+    /// #6741 ne s'applique plus), par la même rampe progressive de
+    /// [`REMONTEE_DB_PAR_SECONDE`] : pas de saut. Revenu à 0 dB, le neutre se
+    /// retire ([`Self::est_neutre_au_repos`]).
+    ///
+    /// Sans effet hors d'un égaliseur coupé. Pendant le fondu de la courbe,
+    /// la rampe part à sa fin.
+    pub fn liberer_le_gain_garde(&mut self) {
+        if !self.est_neutre() || self.libere {
+            return;
+        }
+        self.libere = true;
+        if self.fondu.is_none() {
+            self.relancer_depuis_le_gain_atteint();
+        }
+    }
+
+    /// Relance la rampe du gain gardé depuis le gain atteint, vers la cible
+    /// courante : une rampe en cours ne fait pas sauter le niveau.
+    fn relancer_depuis_le_gain_atteint(&mut self) {
+        let atteint: Option<Vec<f32>> = match self.extinction.take() {
+            Some(ext) => {
+                let coefs = ext.depart.len().max(1);
+                Some(
+                    (0..coefs)
+                        .map(|c| Self::gain_de_la_rampe(&ext, 0, c))
+                        .collect(),
+                )
+            }
+            None => self.gain_garde.clone(),
+        };
+        if let Some(depart) = atteint {
+            self.lancer_la_rampe(depart);
+        }
     }
 
     fn lancer_la_rampe(&mut self, depart: Vec<f32>) {
@@ -491,20 +536,7 @@ impl EqProcessor {
             // Pendant le fondu de la courbe, la borne sert à la fin du fondu.
             return;
         }
-        let atteint: Option<Vec<f32>> = match self.extinction.take() {
-            Some(ext) => {
-                let coefs = ext.depart.len().max(1);
-                Some(
-                    (0..coefs)
-                        .map(|c| Self::gain_de_la_rampe(&ext, 0, c))
-                        .collect(),
-                )
-            }
-            None => self.gain_garde.clone(),
-        };
-        if let Some(depart) = atteint {
-            self.lancer_la_rampe(depart);
-        }
+        self.relancer_depuis_le_gain_atteint();
     }
 
     /// #6741 — ce qu'un égaliseur coupé applique encore, pour le voyant :

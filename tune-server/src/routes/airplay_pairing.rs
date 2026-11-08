@@ -11,6 +11,10 @@
 //!      reads `pin_requested`, then prompts the user for the code.
 //!   3. `POST /outputs/{device_id}/airplay/pair-pin` with `{"pin":"1234"}` →
 //!      submits the code; status transitions to `connected` (or `failed:…`).
+//!   4. `POST /outputs/{device_id}/airplay/pair-cancel` → the user closed the
+//!      prompt without a code: the wait is lifted and playback goes back to
+//!      the transient connection (#8060). An unanswered wait also expires on
+//!      its own after three minutes (`pair-status` then reads `failed:…`).
 //!
 //! The pairing methods fire-and-return so a slow 30s pairing handshake never
 //! blocks the shared output mutex (status polling stays responsive).
@@ -36,6 +40,10 @@ pub fn router() -> Router<AppState> {
         .route("/{device_id}/airplay/pair-start", post(pair_start_handler))
         .route("/{device_id}/airplay/pair-status", get(pair_status_handler))
         .route("/{device_id}/airplay/pair-pin", post(pair_pin_handler))
+        .route(
+            "/{device_id}/airplay/pair-cancel",
+            post(pair_cancel_handler),
+        )
 }
 
 /// Fetch an output by id, or 404 if unknown.
@@ -108,4 +116,22 @@ async fn pair_pin_handler(
         .ok_or_else(|| AppError::bad_request("output is not an AirPlay 2 receiver"))?;
     ap2.submit_pin(&pin).await.map_err(AppError::internal)?;
     Ok(Json(json!({"ok": true})).into_response())
+}
+
+/// `POST /outputs/{device_id}/airplay/pair-cancel` — abandon the PIN entry
+/// (#8060). `cancelled` says whether a wait was pending; a connection that is
+/// already established is left untouched.
+async fn pair_cancel_handler(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let output = lookup_output(&state, &device_id).await?;
+    let guard = output.lock().await;
+    let ap2 = guard
+        .as_any()
+        .downcast_ref::<Airplay2Output>()
+        .ok_or_else(|| AppError::bad_request("output is not an AirPlay 2 receiver"))?;
+    let cancelled = ap2.cancel_pin_pairing().await;
+    let status = ap2.pairing_status().await;
+    Ok(Json(json!({"ok": true, "cancelled": cancelled, "status": status})).into_response())
 }

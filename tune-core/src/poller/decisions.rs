@@ -58,6 +58,50 @@ pub fn qui_tient_le_renderer(
     TenueDuRenderer::AutreApplication
 }
 
+/// #7636 — un autre point de contrôle tient-il le renderer OpenHome ?
+///
+/// Kazoo (ou Linn App) charge sa liste dans le renderer et la joue : l'URI
+/// rapportée n'est plus un flux Tune. Tant que la zone Tune se croit en
+/// lecture, chacune de ses relances automatiques (démarrage figé, démarrage
+/// mort, renderer calé, fin de piste suivie de la suivante) repasse par
+/// `play_media`, dont le `DeleteAll` vide la liste que Kazoo vient de
+/// charger. Après [`RELEVES_AVANT_DE_CEDER`] relevés concordants, la zone
+/// lâche donc l'appareil, sans lui envoyer d'ordre : la liste de Kazoo reste
+/// intacte, et seul un « Lire » fait dans Tune la remplace.
+///
+/// Seulement sur preuve :
+/// - une sortie OpenHome, la seule dont Tune réécrit la liste ;
+/// - une AUTRE application : l'URI d'un flux Tune (`/stream/…`) sans notre
+///   identifiant peut être la suivante armée d'un enchaînement pas encore
+///   adopté, elle ne compte pas ;
+/// - notre identifiant de flux connu : sans lui, on ne sait pas ce qui est
+///   à nous.
+pub fn renderer_tenu_par_un_autre_point_de_controle(
+    output_type: &str,
+    tenue: &TenueDuRenderer,
+    notre_stream_id_connu: bool,
+) -> bool {
+    output_type == "openhome"
+        && *tenue == TenueDuRenderer::AutreApplication
+        && notre_stream_id_connu
+}
+
+/// #7636 — relevés concordants avant de céder le renderer : une transition
+/// peut montrer un instant l'URI précédente.
+pub const RELEVES_AVANT_DE_CEDER: u8 = 3;
+
+/// #7636 — après un « Lire » fait dans Tune, le Linn peut rapporter encore
+/// quelques secondes l'URI du morceau que Kazoo jouait (événement Info en
+/// retard). Avant ce délai, compté depuis le chargement de la piste, une URI
+/// étrangère ne compte pas : la zone ne lâche pas sa propre lecture.
+pub const DELAI_AVANT_DE_JUGER_LA_TENUE_SECS: u64 = 10;
+
+/// #7636 — la piste chargée par Tune l'est-elle depuis assez longtemps pour
+/// qu'une URI étrangère dise qu'un autre point de contrôle a pris la main ?
+pub fn tenue_jugeable(secs_depuis_le_chargement: u64) -> bool {
+    secs_depuis_le_chargement >= DELAI_AVANT_DE_JUGER_LA_TENUE_SECS
+}
+
 /// Retrouver, dans l'URI qu'un renderer déclare jouer, le `stream_id` de la
 /// session Tune qu'il tire.
 ///
@@ -132,6 +176,9 @@ pub mod motif_fin {
     /// position épinglée sur sa durée, URI de la piste finie, `SetNext`
     /// accepté — sans attendre `END_MARGIN_MS` sur l'horloge de Tune.
     pub const POSITION_EPINGLEE_PISTE_FINIE_DLNA: &str = "position_pinned_finished_uri_dlna";
+    /// #7700 — l'appareil DLNA a quitté notre piste en milieu de lecture
+    /// (« suivant » à sa télécommande) avec de l'audio encore en main.
+    pub const SUIVANT_DE_L_APPAREIL: &str = "dlna_device_skipped_track";
 }
 
 /// Sondages à tenir avant de prononcer la fin « position au-delà de la fin ».
@@ -200,6 +247,10 @@ pub fn plancher_de_detection_ms(motif: &str) -> u64 {
         // Un sondage pour voir la position inchangée sur la durée rapportée
         // (au moins un de plus quand le bout caché par l'arrondi est long).
         motif_fin::POSITION_EPINGLEE_PISTE_FINIE_DLNA => tick,
+        // #7700 — deux sondages `Stopped` d'affilée.
+        motif_fin::SUIVANT_DE_L_APPAREIL => {
+            super::suivant_de_l_appareil_7700::TOURS_D_ARRET_DU_SUIVANT as u64 * tick
+        }
         _ => 0,
     }
 }
@@ -978,7 +1029,6 @@ pub fn natural_end(
     track_duration_ms: u64,
     realtime: bool,
 ) -> bool {
-    let is_short_track = track_duration_ms > 0 && track_duration_ms < MIN_TRACK_WALL_SECS * 1000;
     let repeat_end = repeat_active && peak_position_ms > 5_000;
     played_enough
         // Le pic a atteint la fin : la piste est finie, quoi qu'en dise
@@ -988,7 +1038,22 @@ pub fn natural_end(
         || repeat_end
         || (ended_naturally
             && (!realtime || ended_naturally_wall_ok(wall_elapsed, track_duration_ms)))
-        || (is_short_track && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5)
+        || titre_court_deja_avance(track_duration_ms, peak_position_ms)
+}
+
+/// #7902 — un titre de moins de [`MIN_TRACK_WALL_SECS`] dont le plus haut
+/// point vu a passé la moitié de sa durée a réellement joué.
+///
+/// Un renderer DLNA rend sa position à la seconde (`RelTime 0:00:03`) : un
+/// WAV de 4,0 s n'est jamais vu au-delà de 3 000 ms, soit 75 %, sous les
+/// 80 % de [`played_enough`]. La grâce de chargement de `tick.rs` retenait
+/// alors chaque arrêt du renderer pendant 45 s et la file semblait arrêtée.
+/// C'est la règle des titres courts que [`natural_end`] applique déjà : la
+/// grâce la laisse désormais examiner.
+pub fn titre_court_deja_avance(track_duration_ms: u64, peak_position_ms: u64) -> bool {
+    track_duration_ms > 0
+        && track_duration_ms < MIN_TRACK_WALL_SECS * 1000
+        && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5
 }
 
 /// Should the poller adopt the renderer-reported volume into the saved
@@ -1002,67 +1067,81 @@ pub fn natural_end(
 /// [`CONSIGNE_DE_SILENCE`]) n'adopte jamais une valeur plus haute : voir
 /// [`silence_rouvert_par_l_appareil`].
 ///
-/// #6739 — et jamais à la HAUSSE : un relevé plus haut que la consigne n'est
-/// pas adopté (voir [`juger_le_releve_de_volume`]). Les trois sites de
-/// `tick.rs` passent désormais par ce jugement ; ce prédicat ne sert plus
-/// qu'aux tests qui gardent la règle.
+/// #7379 — à la HAUSSE, jusqu'au plafond de suivi seulement (voir
+/// [`juger_le_releve_de_volume`]). Les trois sites de `tick.rs` passent par
+/// ce jugement ; ce prédicat ne sert plus qu'aux tests qui gardent la règle,
+/// sans limite réglée ni trim (plafond par défaut).
 #[cfg(test)]
 pub fn should_adopt_device_volume(
     prev_device_vol: Option<f64>,
     device_vol: f64,
     db_vol: f64,
 ) -> bool {
+    let plafond = crate::audio::volume_limites::LimitesDeVolume::default().plafond_de_suivi(db_vol);
     matches!(
-        juger_le_releve_de_volume(prev_device_vol, device_vol, db_vol, 0.0),
+        juger_le_releve_de_volume(prev_device_vol, device_vol, db_vol, 0.0, plafond),
         JugementDuReleve::Adopter(_)
     )
 }
 
-/// #6739 — ce que le sondeur fait d'un volume relevé sur l'appareil.
+/// #6739, #7379 — ce que le sondeur fait d'un volume relevé sur l'appareil.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JugementDuReleve {
     /// Rien : premier relevé, valeur figée, ou égale à la consigne.
     Ignorer,
-    /// L'appareil a été BAISSÉ hors de Tune (télécommande, molette) : la
-    /// consigne de la zone le reflète. La valeur est en échelle de consigne
-    /// (trim retiré) et ne dépasse jamais la consigne d'avant.
+    /// L'appareil a bougé hors de Tune (télécommande, molette, autre
+    /// application), plus bas, ou plus haut mais sous le plafond de suivi :
+    /// la consigne de la zone le reflète. La valeur est en échelle de
+    /// consigne (trim retiré), jamais au-dessus du plafond de suivi.
     Adopter(f64),
-    /// L'appareil dit plus haut que la consigne : on ne l'adopte pas, on le
-    /// dit au journal. La valeur est en échelle de consigne.
+    /// La consigne est le silence et l'appareil remonte : on ne l'adopte pas
+    /// ([`silence_rouvert_par_l_appareil`]). Échelle de consigne.
     PlusHautNonAdopte(f64),
+    /// #7379 — l'appareil dépasse le plafond de suivi : Tune le ramène AU
+    /// plafond, et la consigne s'y aligne. La valeur est la nouvelle consigne
+    /// (échelle de consigne, trim retiré).
+    RamenerAuPlafond(f64),
 }
 
 /// #6739 — le facteur par lequel un relevé d'appareil se ramène à l'échelle
 /// de la consigne : le trim tel que `set_volume` l'a composé, sans jamais
 /// dépasser 1 (un trim positif est ignoré sur une sortie à volume matériel ;
-/// sur la sortie locale, compter le relevé trop haut ne fait que refuser une
-/// adoption, jamais monter).
+/// sur la sortie locale, compter le relevé trop haut ne fait que le juger
+/// plus près du plafond, jamais monter).
 pub fn facteur_de_releve(trim_db: f64) -> f64 {
     crate::orchestrator::gain_trim_factor(trim_db).min(1.0)
 }
 
-/// #6739 (fil 2366/2375, Marantz NR1200, tweeter détruit) — décision de
-/// Bertrand du 22/10 : un relevé du volume de l'appareil ne remonte JAMAIS le
-/// volume utilisateur.
+/// #6739 (fil 2366/2375, Marantz NR1200, tweeter détruit), révisée par la
+/// décision de Bertrand du 02/11 (#7379).
 ///
-/// Le cliquet : `set_volume(0,36)` partait à 96 % avec un trim de +8,5 dB ;
-/// le sondeur relisait 96 et l'adoptait comme consigne, que le geste suivant
-/// remultipliait. Baisser le curseur finissait à 100 %.
+/// Le cliquet de #6739 : `set_volume(0,36)` partait à 96 % avec un trim de
+/// +8,5 dB ; le sondeur relisait 96 et l'adoptait comme consigne, que le
+/// geste suivant remultipliait. Le trim positif ne part plus vers un appareil
+/// à volume matériel (#6749), et le relevé est ramené à l'échelle de la
+/// consigne ([`facteur_de_releve`]) : le cliquet n'a plus de prise.
 ///
-/// Règle : le relevé est d'abord ramené à l'échelle de la consigne
-/// ([`facteur_de_releve`]) ; il n'est adopté que s'il a bougé depuis le tour
-/// précédent (front, #358), qu'il diffère de la consigne de plus de 2 points
-/// ET qu'il est plus BAS. Plus haut : [`JugementDuReleve::PlusHautNonAdopte`].
-/// La consigne de silence n'est jamais rouverte
-/// ([`silence_rouvert_par_l_appareil`]).
+/// Règle du 02/11 : quand l'appareil joue plus fort que la consigne (bouton
+/// de l'ampli, autre application), Tune le SUIT tant qu'il reste sous le
+/// plafond de suivi `plafond_appareil` (échelle de l'appareil : la limite de
+/// sécurité de la zone, ou [`crate::audio::volume_limites::PLAFOND_DE_SUIVI_PAR_DEFAUT`]
+/// sans limite réglée) ; au-dessus, [`JugementDuReleve::RamenerAuPlafond`].
+/// Un relevé n'est jugé que s'il a bougé depuis le tour précédent (front,
+/// #358) et qu'il diffère de la consigne de plus de 2 points. La consigne de
+/// silence n'est jamais rouverte ([`silence_rouvert_par_l_appareil`]).
 pub fn juger_le_releve_de_volume(
     prev_device_vol: Option<f64>,
     device_vol: f64,
     db_vol: f64,
     trim_db: f64,
+    plafond_appareil: f64,
 ) -> JugementDuReleve {
     let facteur = facteur_de_releve(trim_db);
-    if !device_vol.is_finite() || !db_vol.is_finite() || facteur <= 0.0 {
+    if !device_vol.is_finite()
+        || !db_vol.is_finite()
+        || !plafond_appareil.is_finite()
+        || facteur <= 0.0
+    {
         return JugementDuReleve::Ignorer;
     }
     let releve = device_vol / facteur;
@@ -1070,10 +1149,27 @@ pub fn juger_le_releve_de_volume(
     if !a_bouge || (releve - db_vol).abs() <= 0.02 {
         return JugementDuReleve::Ignorer;
     }
-    if releve > db_vol || silence_rouvert_par_l_appareil(releve, db_vol) {
+    if silence_rouvert_par_l_appareil(releve, db_vol) {
         return JugementDuReleve::PlusHautNonAdopte(releve);
     }
-    JugementDuReleve::Adopter(releve.clamp(0.0, db_vol.clamp(0.0, 1.0)))
+    if releve < db_vol {
+        return JugementDuReleve::Adopter(releve.clamp(0.0, db_vol.clamp(0.0, 1.0)));
+    }
+    // B2 de la revue de #7702 — à la HAUSSE, la consigne se compte SANS
+    // trim : jamais au-delà du plafond, ni du niveau RÉEL de l'appareil
+    // (`device_vol`). Avec un trim négatif, `releve = device_vol / facteur`
+    // dépasse ce que l'appareil joue (−6 dB : un geste à 60 % donnait une
+    // consigne à 100 %), et la remise du trim à 0 envoyait cette consigne
+    // telle quelle. Le facteur ne dépasse jamais 1 : `device_vol <= releve`.
+    let plafond_consigne = plafond_appareil.clamp(0.0, 1.0);
+    if device_vol > plafond_appareil + crate::audio::volume_limites::TOLERANCE_RENDERER {
+        return JugementDuReleve::RamenerAuPlafond(plafond_consigne);
+    }
+    let suivi = releve.min(device_vol).clamp(0.0, plafond_consigne);
+    if suivi <= db_vol + 0.02 {
+        return JugementDuReleve::Ignorer;
+    }
+    JugementDuReleve::Adopter(suivi)
 }
 
 /// Plus haut volume de zone tenu pour une consigne de silence : la

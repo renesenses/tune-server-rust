@@ -48,7 +48,8 @@ impl DsfInfo {
             .map(|ms| super::dsd_brut::octets_par_canal_pour_ms(self.sample_rate, ms))
             .unwrap_or(total)
             .min(total);
-        let trames = fin.saturating_sub(atteint) / 2;
+        // #7704 — la trame de clôture qui rend le compte pair.
+        let trames = super::dsd_to_dop::trames_dop_avec_cloture(fin.saturating_sub(atteint) / 2);
         trames
             .checked_mul(u64::from(self.channels))?
             .checked_mul(3)?

@@ -594,6 +594,8 @@ pub struct FiltresAnnuaire {
     /// #7466 — les critères de [`super::radios_criteres_7466::Criteres`].
     pub codec: Option<String>,
     pub bitrate_min: Option<i32>,
+    /// #7718 — le niveau de qualité minimal d'au moins un flux.
+    pub quality_min: Option<String>,
     pub lossless: Option<bool>,
     pub hires: Option<bool>,
     pub favorites_only: Option<bool>,
@@ -614,6 +616,7 @@ impl FiltresAnnuaire {
             self.rated_min,
             self.metadata_plus,
         )
+        .avec_qualite_min(self.quality_min.as_deref())
     }
 }
 
@@ -819,13 +822,10 @@ async fn lister(
     let repo = RadioRepo::with_backend(state.backend.clone());
     let mes_radios = repo.list().unwrap_or_default();
     let liens = repo.liens_annuaire().unwrap_or_default();
-    Json(corps_annuaire_avec_liens(
-        &fiches,
-        &mes_radios,
-        &liens,
-        &filtres,
-        &etat,
-    ))
+    let mut corps = corps_annuaire_avec_liens(&fiches, &mes_radios, &liens, &filtres, &etat);
+    // #7515 — le flux par défaut jouable dans le pays d'écoute.
+    super::radios::geofencing::marquer_le_flux_par_defaut(&state, &mut corps);
+    Json(corps)
 }
 
 async fn forcer_le_releve(State(state): State<AppState>) -> Json<Value> {
@@ -982,6 +982,7 @@ async fn ajouter(
             rattachement(&fiche, Lien::Id, &station.url),
         );
     }
+    super::radios::geofencing::annoncer_le_debit_ecoute(&state, &mut sortie);
     (statut, Json(sortie)).into_response()
 }
 
@@ -1036,12 +1037,35 @@ async fn mettre_a_jour_le_flux(
             rattachement(&fiche, Lien::Id, &station.url),
         );
     }
+    super::radios::geofencing::annoncer_le_debit_ecoute(&state, &mut sortie);
     Json(sortie).into_response()
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CorpsFluxPrefere {
     pub stream_url: String,
+}
+
+/// #7587 — le corps de l'écoute en un clic : le flux y est FACULTATIF. `{}`,
+/// `null`, un corps absent ou un `stream_url` vide laissent le choix au
+/// serveur, comme avant #7587.
+#[derive(Debug, Default, Deserialize)]
+pub struct CorpsEcoute {
+    #[serde(default)]
+    pub stream_url: Option<String>,
+}
+
+/// Le flux publié de `fiche` dont l'adresse est `url`, à la normalisation
+/// près ; `None` : ce flux n'est pas de la fiche (#7177, #7587).
+fn flux_publie_par_la_fiche(
+    fiche: &StationAnnuaire,
+    url: &str,
+) -> Option<super::radios::FluxAnnuaire> {
+    let voulu = flux_normalise(url);
+    fiche
+        .flux_proposes()
+        .into_iter()
+        .find(|f| flux_normalise(&f.url) == voulu)
 }
 
 /// #7177 (web#2443) — pose `url` comme flux de `station`, s'il est l'un des
@@ -1057,12 +1081,7 @@ pub fn poser_le_flux_prefere(
     station: &mut RadioStation,
     url: &str,
 ) -> bool {
-    let voulu = flux_normalise(url);
-    let Some(flux) = fiche
-        .flux_proposes()
-        .into_iter()
-        .find(|f| flux_normalise(&f.url) == voulu)
-    else {
+    let Some(flux) = flux_publie_par_la_fiche(fiche, url) else {
         return false;
     };
     station.url = flux.url;
@@ -1131,15 +1150,50 @@ async fn choisir_le_flux(
             rattachement(&fiche, Lien::Id, &station.url),
         );
     }
+    super::radios::geofencing::annoncer_le_debit_ecoute(&state, &mut sortie);
     Json(sortie).into_response()
 }
 
 /// `POST /radios/directory/{external_id}/play/{zone_id}` — l'écoute en un clic
 /// d'une fiche qui n'est pas dans « Mes radios ». Rien n'est ajouté.
+///
+/// #7587 — corps facultatif `{"stream_url": …}` : le flux choisi sur la fiche,
+/// parmi ceux qu'elle publie (422 `flux_hors_fiche` sinon, comme #7177). Pas
+/// de corps, `{}`, `null` ou un `stream_url` vide : le serveur choisit seul,
+/// comme avant. La règle de pays (#7199) s'applique dans tous les cas : un
+/// flux choisi mais interdit dans le pays d'écoute cède la place au meilleur
+/// flux autorisé ; sans flux autorisé, le refus structuré part avant toute
+/// sortie.
+///
+/// Le corps est lu à la main : `Option<Json<…>>` rejetterait, avant la garde
+/// #7199, un corps vide envoyé avec `Content-Type: application/json`.
 async fn jouer(
     State(state): State<AppState>,
     Path((external_id, zone_id)): Path<(String, i64)>,
+    profile: crate::routes::active_profile::ActiveProfile,
+    corps: axum::body::Bytes,
 ) -> Response {
+    // #7974 — le profil qui lance la station porte le bail d'écoute.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
+    let choisi = if corps.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        match serde_json::from_slice::<Option<CorpsEcoute>>(&corps) {
+            Ok(c) => c
+                .and_then(|c| c.stream_url)
+                .filter(|u| !u.trim().is_empty()),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "corps_invalide", "detail": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    };
     let Some(fiche) = fiche_par_id(&state, &external_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1147,10 +1201,20 @@ async fn jouer(
         )
             .into_response();
     };
-    let flux = match super::radios::geofencing::stream_for_directory(&state, &fiche, None) {
-        Ok(flux) => flux,
-        Err(response) => return response.into_response(),
-    };
+    if let Some(url) = choisi.as_deref()
+        && flux_publie_par_la_fiche(&fiche, url).is_none()
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "flux_hors_fiche"})),
+        )
+            .into_response();
+    }
+    let flux =
+        match super::radios::geofencing::stream_for_directory(&state, &fiche, choisi.as_deref()) {
+            Ok(flux) => flux,
+            Err(response) => return response.into_response(),
+        };
     Json(
         super::radios::jouer_un_flux(
             &state,

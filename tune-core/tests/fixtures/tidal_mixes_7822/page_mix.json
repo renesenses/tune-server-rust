@@ -1,0 +1,60 @@
+{
+  "id": "mix",
+  "title": "My Daily Discovery",
+  "rows": [
+    {
+      "modules": [
+        {
+          "type": "MIX_HEADER",
+          "mix": {
+            "id": "0011aa22bb33cc44dd55ee66ff7788",
+            "title": "My Daily Discovery",
+            "subTitle": "GoGo Penguin, Nils Frahm, Hania Rani",
+            "mixType": "DISCOVERY_MIX",
+            "images": {"LARGE": {"width": 1500, "height": 1500, "url": "https://images.tidal.invalid/discovery/1500.jpg"}}
+          }
+        }
+      ]
+    },
+    {
+      "modules": [
+        {
+          "type": "TRACK_LIST",
+          "title": "",
+          "pagedList": {
+            "limit": 100,
+            "offset": 0,
+            "totalNumberOfItems": 2,
+            "items": [
+              {
+                "id": 900000001,
+                "title": "Hopopono",
+                "duration": 280,
+                "trackNumber": 3,
+                "volumeNumber": 1,
+                "explicit": false,
+                "audioQuality": "LOSSLESS",
+                "isrc": "XX0000000001",
+                "artist": {"id": 800000001, "name": "GoGo Penguin"},
+                "album": {"id": 700000001, "title": "v2.0", "cover": "aaaa-bbbb-cccc"},
+                "mediaMetadata": {"tags": ["LOSSLESS"]}
+              },
+              {
+                "id": 900000002,
+                "title": "Says",
+                "duration": 498,
+                "trackNumber": 2,
+                "volumeNumber": 1,
+                "explicit": false,
+                "audioQuality": "HI_RES_LOSSLESS",
+                "artist": {"id": 800000002, "name": "Nils Frahm"},
+                "album": {"id": 700000002, "title": "Spaces", "cover": "ffff-0000-1111"},
+                "mediaMetadata": {"tags": ["LOSSLESS", "HIRES_LOSSLESS"]}
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

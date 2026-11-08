@@ -196,8 +196,9 @@ mod tests {
     }
 }
 
-/// L'installeur Windows (NSIS, écrit dans `release.yml`) doit poser le
-/// lanceur sans fenêtre À CÔTÉ de l'ancien, sans toucher à ce dernier.
+/// L'installeur Windows (NSIS, écrit dans `release.yml`) pose les deux
+/// lanceurs (#6253). Depuis #7637, l'entrée principale et le Bureau visent le
+/// lanceur sans fenêtre ; la console reste offerte par une entrée de dépannage.
 #[cfg(test)]
 mod installeur_tests {
     fn installeur() -> String {
@@ -225,10 +226,11 @@ mod installeur_tests {
         assert!(
             instruction(
                 &yml,
-                "CreateShortcut \"`$SMPROGRAMS\\Tune Server\\Tune Server (sans console).lnk\" \
+                "CreateShortcut \"`$SMPROGRAMS\\Tune Server\\Tune Server.lnk\" \
                  \"`$INSTDIR\\start-tune-server-sans-console.bat\" \"\" \"`$INSTDIR\\tune-server.exe\" 0 SW_SHOWMINIMIZED"
             ),
-            "raccourci du menu Démarrer, console réduite le temps du détachement"
+            "#7637 : l'entrée principale du menu Démarrer lance sans console \
+             (réduite le temps du détachement)"
         );
         assert!(
             instruction(
@@ -239,17 +241,37 @@ mod installeur_tests {
         );
     }
 
+    /// #7637 : le Bureau suit l'entrée principale (sans console) ; l'ancien
+    /// lanceur avec console reste posé, derrière une entrée de dépannage, et
+    /// l'ancien raccourci « (sans console) » est retiré à la mise à jour.
     #[test]
-    fn les_raccourcis_d_avant_ne_changent_pas_6253() {
+    fn bureau_sans_console_et_depannage_avec_console_7637() {
         let yml = installeur();
-        assert!(instruction(
-            &yml,
-            "CreateShortcut \"`$DESKTOP\\Tune Server.lnk\" \"`$INSTDIR\\start-tune-server.bat\""
-        ));
-        assert!(instruction(
-            &yml,
-            "CreateShortcut \"`$SMPROGRAMS\\Tune Server\\Tune Server.lnk\" \"`$INSTDIR\\start-tune-server.bat\""
-        ));
+        assert!(
+            instruction(
+                &yml,
+                "CreateShortcut \"`$DESKTOP\\Tune Server.lnk\" \"`$INSTDIR\\start-tune-server-sans-console.bat\""
+            ),
+            "le raccourci du Bureau lance sans console"
+        );
+        assert!(
+            !instruction(
+                &yml,
+                "CreateShortcut \"`$DESKTOP\\Tune Server.lnk\" \"`$INSTDIR\\start-tune-server.bat\""
+            ),
+            "le Bureau ne doit plus ouvrir de console"
+        );
+        assert!(
+            instruction(
+                &yml,
+                "CreateShortcut \"`$SMPROGRAMS\\Tune Server\\Tune Server (avec console, depannage).lnk\" \"`$INSTDIR\\start-tune-server.bat\""
+            ),
+            "la console reste offerte par l'entrée de dépannage"
+        );
         assert!(instruction(&yml, "FileWrite `$0 'tune-server.exe$\\r$\\n'"));
+        assert!(instruction(
+            &yml,
+            "Delete \"`$SMPROGRAMS\\Tune Server\\Tune Server (sans console).lnk\""
+        ));
     }
 }

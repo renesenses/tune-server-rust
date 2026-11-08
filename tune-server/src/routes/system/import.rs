@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
+use tune_core::db::ecoutes_importees::{EcoutesImporteesRepo, date_normalisee};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::library::importer::{
@@ -88,6 +89,8 @@ pub(super) async fn import_roon(
 
     tokio::spawn(async move {
         let track_repo = TrackRepo::with_backend(backend.clone());
+        // C1 : aucun chemin hors des dossiers de musique.
+        let racines = racines_admises(&backend);
         let artist_repo = ArtistRepo::with_backend(backend.clone());
         let album_repo = AlbumRepo::with_backend(backend.clone());
         let settings = SettingsRepo::with_backend(backend.clone());
@@ -144,6 +147,12 @@ pub(super) async fn import_roon(
 
                                     if let Some(ref fp) = file_path
                                         && track_repo.get_by_path(fp).ok().flatten().is_some()
+                                    {
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                    if let Some(ref fp) = file_path
+                                        && !chemin_admis(fp, &racines)
                                     {
                                         skipped += 1;
                                         continue;
@@ -268,6 +277,8 @@ pub(super) async fn import_plex(
         let client = tune_core::http::client::shared();
         let settings = SettingsRepo::with_backend(backend.clone());
         let track_repo = TrackRepo::with_backend(backend.clone());
+        // C1 : aucun chemin hors des dossiers de musique.
+        let racines = racines_admises(&backend);
         let artist_repo = ArtistRepo::with_backend(backend.clone());
         let album_repo = AlbumRepo::with_backend(backend.clone());
 
@@ -353,6 +364,12 @@ pub(super) async fn import_plex(
                 // Skip if we already have this track by file_path
                 if let Some(ref fp) = file_path
                     && track_repo.get_by_path(fp).ok().flatten().is_some()
+                {
+                    skipped += 1;
+                    continue;
+                }
+                if let Some(ref fp) = file_path
+                    && !chemin_admis(fp, &racines)
                 {
                     skipped += 1;
                     continue;
@@ -483,6 +500,20 @@ fn debut_du_fichier(texte: &str) -> String {
 
 /// Le contenu de la partie `file` d'un envoi multipart, en texte.
 async fn fichier_televerse(req: Request) -> Result<String, Response> {
+    let octets = octets_televerses(req).await?;
+    String::from_utf8(octets).map_err(|_| {
+        refus_dimport(
+            StatusCode::BAD_REQUEST,
+            "fichier_pas_du_texte",
+            "le fichier reçu n'est pas du texte UTF-8 ; un export Roon (CSV) ou \
+             Plex (XML) en est"
+                .to_string(),
+        )
+    })
+}
+
+/// Les octets de la partie `file` d'un envoi multipart.
+async fn octets_televerses(req: Request) -> Result<Vec<u8>, Response> {
     let mut multipart = match req.extract::<Multipart, _>().await {
         Ok(m) => m,
         Err(rejet) => return Err(rejet.into_response()),
@@ -519,22 +550,12 @@ async fn fichier_televerse(req: Request) -> Result<String, Response> {
         }
     }
 
-    let Some(octets) = contenu else {
-        return Err(refus_dimport(
+    contenu.ok_or_else(|| {
+        refus_dimport(
             StatusCode::BAD_REQUEST,
             "fichier_absent",
             "l'envoi ne porte aucune partie nommée « file » — c'est celle que \
              l'écran d'import remplit avec le fichier choisi"
-                .to_string(),
-        ));
-    };
-
-    String::from_utf8(octets).map_err(|_| {
-        refus_dimport(
-            StatusCode::BAD_REQUEST,
-            "fichier_pas_du_texte",
-            "le fichier reçu n'est pas du texte UTF-8 ; un export Roon (CSV) ou \
-             Plex (XML) en est"
                 .to_string(),
         )
     })
@@ -646,10 +667,12 @@ fn refus_apercu_hors_televersement() -> Response {
 }
 
 /// Les deux index que `match_tracks` demande : par chemin, puis par
-/// (titre, artiste, album) en minuscules.
+/// (titre, artiste, album) en minuscules ; et la note actuelle de chaque
+/// piste, pour ne reporter que les notes qui changent (#7763).
 type IndexDeBibliotheque = (
     std::collections::HashMap<String, i64>,
     std::collections::HashMap<(String, String, String), i64>,
+    std::collections::HashMap<i64, Option<i32>>,
 );
 
 /// Indexer la bibliothèque telle qu'elle est AVANT l'import.
@@ -670,6 +693,7 @@ fn indexer_la_bibliotheque(
     let track_repo = TrackRepo::with_backend(backend.clone());
     let mut par_chemin = std::collections::HashMap::new();
     let mut flou = std::collections::HashMap::new();
+    let mut notes = std::collections::HashMap::new();
     let mut offset = 0i64;
     loop {
         let pistes = match track_repo.list(PAGE, offset) {
@@ -684,6 +708,7 @@ fn indexer_la_bibliotheque(
         let lues = pistes.len() as i64;
         for piste in pistes {
             let Some(id) = piste.id else { continue };
+            notes.insert(id, piste.rating);
             if let Some(ref chemin) = piste.file_path {
                 par_chemin.insert(chemin.clone(), id);
             }
@@ -704,19 +729,104 @@ fn indexer_la_bibliotheque(
         }
         offset += lues;
     }
-    (par_chemin, flou)
+    (par_chemin, flou, notes)
+}
+
+/// Ce qu'un import reporte sur les pistes DÉJÀ en bibliothèque — #7763.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Reports {
+    /// `(piste, écoutes à ajouter, dernière écoute normalisée)`.
+    ecoutes: Vec<(i64, i64, Option<String>)>,
+    /// `(piste, note de 1 à 5)` : seulement les notes qui changent.
+    notes: Vec<(i64, i32)>,
+}
+
+impl Reports {
+    fn ecoutes_ajoutees(&self) -> usize {
+        self.ecoutes.iter().map(|(_, n, _)| *n as usize).sum()
+    }
+}
+
+/// Les reports à faire, calculés sans rien écrire : l'aperçu les montre,
+/// l'import réel les applique (`appliquer_les_reports`).
+///
+/// `rapprochements` est dans l'ordre de `pistes` (`match_tracks` rend une
+/// entrée par ligne). Seules les lignes rapprochées d'une piste existante
+/// comptent : une piste que l'import va CRÉER ne reçoit rien. Une piste
+/// rapprochée par plusieurs lignes ne reçoit que la première : un export
+/// qui liste deux fois le même titre ne double pas ses écoutes.
+fn reports_a_faire(
+    pistes: &[ImportedTrack],
+    rapprochements: &[MatchResult],
+    notes_actuelles: &std::collections::HashMap<i64, Option<i32>>,
+) -> Reports {
+    let mut vues = std::collections::HashSet::new();
+    let mut reports = Reports::default();
+    for (piste, m) in pistes.iter().zip(rapprochements) {
+        let Some(id) = m.tune_track_id.filter(|_| m.matched) else {
+            continue;
+        };
+        if !vues.insert(id) {
+            continue;
+        }
+        if piste.play_count > 0 {
+            let date = piste.last_played.as_deref().and_then(date_normalisee);
+            reports
+                .ecoutes
+                .push((id, i64::from(piste.play_count), date));
+        }
+        if let Some(note) = piste.rating
+            && notes_actuelles.get(&id).copied().flatten() != Some(note)
+        {
+            reports.notes.push((id, note));
+        }
+    }
+    reports
+}
+
+/// Ce que `appliquer_les_reports` a ÉCRIT.
+#[derive(Debug, Default)]
+struct ReportsEcrits {
+    pistes_aux_ecoutes: usize,
+    ecoutes_ajoutees: usize,
+    notes: usize,
+    echecs: Vec<String>,
+}
+
+/// Écrire les reports : le rapport de l'import réel dit ce qui a été écrit,
+/// pas ce qui était prévu.
+fn appliquer_les_reports(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    reports: &Reports,
+) -> ReportsEcrits {
+    let repo = EcoutesImporteesRepo::with_backend(backend.clone());
+    let mut ecrits = ReportsEcrits::default();
+    for (id, n, date) in &reports.ecoutes {
+        match repo.ajouter(*id, *n, date.as_deref()) {
+            Ok(()) => {
+                ecrits.pistes_aux_ecoutes += 1;
+                ecrits.ecoutes_ajoutees += *n as usize;
+            }
+            Err(e) => ecrits.echecs.push(format!("ecoutes piste {id}: {e}")),
+        }
+    }
+    for (id, note) in &reports.notes {
+        match repo.reporter_note(*id, *note) {
+            Ok(true) => ecrits.notes += 1,
+            Ok(false) => {}
+            Err(e) => ecrits.echecs.push(format!("note piste {id}: {e}")),
+        }
+    }
+    ecrits
 }
 
 /// Le rapport qu'attend l'écran, calculé sur la bibliothèque d'AVANT.
 ///
-/// `play_counts_updated`, `ratings_updated` et `history_entries_added` valent
-/// `0`, et ce n'est pas un oubli. L'import ENTRE des pistes ; il ne reporte
-/// encore ni les écoutes ni les notes de l'export sur les pistes déjà là. Les
-/// analyseurs les lisent pourtant (`ImportedTrack::play_count`, `rating`,
-/// `last_played`) — c'est une tranche à venir. Annoncer « 5 écoutes reportées »
-/// quand aucune ne l'est serait un rapport fabriqué ; l'écran n'affiche ces
-/// trois lignes que si elles sont non nulles, un zéro sincère ne montre donc
-/// rien du tout, ce qui est exact.
+/// `play_counts_updated`, `ratings_updated` et `plays_added` disent ce que
+/// l'import REPORTE sur les pistes déjà là (#7763) : calculés ici, ils sont
+/// ceux de l'aperçu ; l'import réel les remplace par ce qu'il a écrit.
+/// `history_entries_added` reste `0` : les écoutes importées ne deviennent
+/// pas des entrées d'historique (`db::ecoutes_importees`).
 ///
 /// `playlists_created` vaut `0` pour la même raison : ni `parse_roon_csv` ni
 /// `parse_plex_xml` ne créent de liste de lecture sur ces deux routes.
@@ -724,21 +834,23 @@ fn rapport_dimport(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     source: &str,
     pistes: &[ImportedTrack],
-) -> (ImportReport, Vec<MatchResult>) {
-    let (par_chemin, flou) = indexer_la_bibliotheque(backend);
+) -> (ImportReport, Vec<MatchResult>, Reports) {
+    let (par_chemin, flou, notes) = indexer_la_bibliotheque(backend);
     let rapprochements = match_tracks(pistes, &par_chemin, &flou);
     let matched = rapprochements.iter().filter(|m| m.matched).count();
+    let reports = reports_a_faire(pistes, &rapprochements, &notes);
     let rapport = ImportReport {
         source: source.to_string(),
         total_rows: pistes.len(),
         matched,
         unmatched: rapprochements.len().saturating_sub(matched),
-        play_counts_updated: 0,
-        ratings_updated: 0,
+        play_counts_updated: reports.ecoutes.len(),
+        ratings_updated: reports.notes.len(),
+        plays_added: reports.ecoutes_ajoutees(),
         history_entries_added: 0,
         playlists_created: 0,
     };
-    (rapport, rapprochements)
+    (rapport, rapprochements, reports)
 }
 
 /// Le rapport, sous les noms EXACTS que l'écran lit (`api.ts:4692`).
@@ -755,6 +867,7 @@ fn json_du_rapport(rapport: &ImportReport, details: &[MatchResult]) -> Value {
         "unmatched": rapport.unmatched,
         "play_counts_updated": rapport.play_counts_updated,
         "ratings_updated": rapport.ratings_updated,
+        "plays_added": rapport.plays_added,
         "history_entries_added": rapport.history_entries_added,
         "playlists_created": rapport.playlists_created,
         "details": details
@@ -785,12 +898,14 @@ fn json_du_rapport(rapport: &ImportReport, details: &[MatchResult]) -> Value {
 /// 🔴 Le témoin décisif de cette tranche n'est pas le code de statut : c'est
 /// `SELECT COUNT(*) FROM tracks`, INCHANGÉ après l'appel.
 fn apercu_dimport(state: &AppState, source: &str, pistes: &[ImportedTrack]) -> Response {
-    let (rapport, details) = rapport_dimport(&state.backend, source, pistes);
+    let (rapport, details, _reports) = rapport_dimport(&state.backend, source, pistes);
     tracing::info!(
         source,
         total_rows = rapport.total_rows,
         matched = rapport.matched,
         unmatched = rapport.unmatched,
+        play_counts_updated = rapport.play_counts_updated,
+        ratings_updated = rapport.ratings_updated,
         "import_apercu_rendu_sans_ecriture"
     );
     (StatusCode::OK, Json(json_du_rapport(&rapport, &details))).into_response()
@@ -824,6 +939,7 @@ fn champs_du_rapport(range: &Value) -> Value {
         "unmatched": ecrites,
         "play_counts_updated": 0,
         "ratings_updated": 0,
+        "plays_added": 0,
         "history_entries_added": 0,
         "playlists_created": 0,
         "details": [],
@@ -858,12 +974,19 @@ async fn lancer_import_de_pistes(
         // #3914 (R5) — le rapport se calcule ICI, avant la moindre écriture :
         // c'est la seule fenêtre où « déjà en bibliothèque » veut encore dire
         // quelque chose. Voir `rapport_dimport`.
-        let (rapport, _details) = rapport_dimport(&backend, source, &pistes);
+        let (mut rapport, _details, reports) = rapport_dimport(&backend, source, &pistes);
+        // #7763 — les écoutes et notes de l'export, sur les pistes déjà là.
+        // Le rapport dit alors ce qui a été ÉCRIT, plus ce qui était prévu.
+        let ecrits = appliquer_les_reports(&backend, &reports);
+        rapport.play_counts_updated = ecrits.pistes_aux_ecoutes;
+        rapport.plays_added = ecrits.ecoutes_ajoutees;
+        rapport.ratings_updated = ecrits.notes;
         let entrees: Vec<ImportTrackEntry> = pistes
             .into_iter()
             .map(entree_depuis_piste_importee)
             .collect();
-        let (imported, skipped, errors) = ecrire_les_pistes(&backend, source, &entrees);
+        let (imported, skipped, mut errors) = ecrire_les_pistes(&backend, source, &entrees);
+        errors.extend(ecrits.echecs);
         let settings = SettingsRepo::with_backend(backend.clone());
         let status = if errors.is_empty() {
             "completed"
@@ -894,6 +1017,9 @@ async fn lancer_import_de_pistes(
             errors = errors.len(),
             total_rows = rapport.total_rows,
             matched = rapport.matched,
+            play_counts_updated = rapport.play_counts_updated,
+            plays_added = rapport.plays_added,
+            ratings_updated = rapport.ratings_updated,
             "import_televerse_complete"
         );
         annoncer_bibliotheque_modifiee(&event_bus, source, imported.into());
@@ -919,7 +1045,11 @@ async fn lancer_import_de_pistes(
 /// aucun export CSV réel de Roon n'a encore été recoupé contre elles. C'est
 /// pourquoi un en-tête non reconnu sort ici en **422 nommé, avec l'en-tête
 /// reçu** — et non en import silencieux de zéro piste.
-pub(super) async fn import_roon_entree(State(state): State<AppState>, req: Request) -> Response {
+pub(super) async fn import_roon_entree(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    req: Request,
+) -> Response {
     let options = match options_dimport(&req) {
         Ok(options) => options,
         Err(refus) => return refus,
@@ -972,7 +1102,11 @@ pub(super) async fn import_roon_entree(State(state): State<AppState>, req: Reque
 ///
 /// Même défaut, même correctif que Roon : l'écran y téléverse aussi un fichier.
 /// Le chemin JSON (interrogation d'un serveur Plex par son jeton) est inchangé.
-pub(super) async fn import_plex_entree(State(state): State<AppState>, req: Request) -> Response {
+pub(super) async fn import_plex_entree(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    req: Request,
+) -> Response {
     let options = match options_dimport(&req) {
         Ok(options) => options,
         Err(refus) => return refus,
@@ -1013,6 +1147,242 @@ pub(super) async fn import_plex_entree(State(state): State<AppState>, req: Reque
     lancer_import_de_pistes(state, "plex_import", pistes).await
 }
 
+// ---------------------------------------------------------------------------
+// #7763 — des ÉCOUTES depuis une liste m3u
+// ---------------------------------------------------------------------------
+
+/// Le plus d'écoutes qu'un import m3u ajoute à chaque piste.
+const ECOUTES_M3U_MAX: i64 = 1_000;
+
+/// Les options de `POST /system/import/m3u-plays`.
+#[derive(Deserialize)]
+pub(super) struct OptionsEcoutesM3u {
+    /// Les écoutes à ajouter à CHAQUE piste trouvée, de 1 à
+    /// [`ECOUTES_M3U_MAX`]. Obligatoire.
+    plays: Option<i64>,
+    /// `?preview=true` : calculer le rapport, n'écrire RIEN.
+    preview: Option<bool>,
+}
+
+/// `POST /system/import/m3u-plays?plays=N[&preview=true]` — ajouter N écoutes
+/// à chaque piste d'une liste m3u (#7763).
+///
+/// Corps : `multipart/form-data`, la liste dans la partie `file` (`.m3u` ou
+/// `.m3u8`, UTF-8 ou Latin-1). Chaque ligne est rapprochée d'une piste locale
+/// exactement comme le fait l'import de liste de lecture
+/// (`playlists::RapprochementLocalM3u` : chemin exact, puis recherche par nom
+/// de fichier, bornée). Une ligne d'un service (Qobuz) n'est pas une piste de
+/// la bibliothèque : elle compte comme non trouvée.
+///
+/// * Une piste citée plusieurs fois reçoit N écoutes UNE fois
+///   (`duplicates_skipped`).
+/// * Les écoutes s'AJOUTENT aux existantes, sans entrée d'historique
+///   (`db::ecoutes_importees`) ; la liste ne porte pas de date, la dernière
+///   écoute ne change donc pas. Aucune liste de lecture n'est créée.
+/// * `?preview=true` rend le même rapport sans rien écrire.
+/// * Une ligne trouvée par la recherche par nom de fichier, et non par son
+///   chemin exact, reçoit ses écoutes comme les autres, mais le rapport la
+///   compte à part (`fuzzy_matched`, échantillon `fuzzy_matched_paths`) : la
+///   recherche prend le premier résultat, qui peut être une autre piste.
+///   L'aperçu permet de le voir avant d'écrire.
+///
+/// Réponse `200` : `total_rows`, `matched`, `fuzzy_matched` et `unmatched`
+/// (lignes, doublons compris), `lookup_errors`, `duplicates_skipped`,
+/// `play_counts_updated` (pistes), `plays_added` (écoutes), `plays_per_track`,
+/// `ratings_updated` (toujours 0), `preview`, et un échantillon borné des
+/// lignes non trouvées (`not_found_paths`, `not_found_truncated`) et des
+/// lignes trouvées par recherche (`fuzzy_matched_paths`,
+/// `fuzzy_matched_truncated`). Refus nommés : `400 plays_hors_bornes`,
+/// `400 requete_illisible`, `400 fichier_absent`, `415 televersement_attendu`,
+/// `500 index_bibliotheque_illisible`.
+pub(super) async fn import_m3u_plays(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    req: Request,
+) -> Response {
+    let options = match Query::<OptionsEcoutesM3u>::try_from_uri(req.uri()) {
+        Ok(Query(o)) => o,
+        Err(e) => {
+            return refus_dimport(
+                StatusCode::BAD_REQUEST,
+                "requete_illisible",
+                format!(
+                    "`?plays=` attend un entier et `?preview=` `true` ou `false` ; \
+                     rien n'a été importé. Détail : {e}"
+                ),
+            );
+        }
+    };
+    let Some(n) = options.plays.filter(|n| (1..=ECOUTES_M3U_MAX).contains(n)) else {
+        return refus_dimport(
+            StatusCode::BAD_REQUEST,
+            "plays_hors_bornes",
+            format!(
+                "`?plays=` doit être un entier de 1 à {ECOUTES_M3U_MAX} : les \
+                 écoutes à ajouter à chaque piste de la liste. Rien n'a été importé."
+            ),
+        );
+    };
+    let apercu = options.preview.unwrap_or(false);
+    if !est_un_televersement(&req) {
+        return refus_dimport(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "televersement_attendu",
+            "la liste m3u se téléverse en multipart/form-data, partie « file ». \
+             Rien n'a été importé."
+                .to_string(),
+        );
+    }
+    let octets = match octets_televerses(req).await {
+        Ok(o) => o,
+        Err(refus) => return refus,
+    };
+    match ecoutes_depuis_m3u(&state.backend, &octets, n, apercu) {
+        Ok(rapport) => (StatusCode::OK, Json(rapport)).into_response(),
+        Err(e) => refus_dimport(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "index_bibliotheque_illisible",
+            format!("la bibliothèque n'a pas pu être lue ; rien n'a été importé. Détail : {e}"),
+        ),
+    }
+}
+
+/// Le cœur de [`import_m3u_plays`], sans HTTP : rapprocher, puis ajouter `n`
+/// écoutes à chaque piste trouvée, sauf en aperçu.
+fn ecoutes_depuis_m3u(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    octets: &[u8],
+    n: i64,
+    apercu: bool,
+) -> Result<Value, String> {
+    const ECHANTILLON_NON_TROUVEES: usize = 100;
+    const ECHANTILLON_PAR_RECHERCHE: usize = 100;
+    let track_repo = TrackRepo::with_backend(backend.clone());
+    let mut locales = crate::routes::playlists::RapprochementLocalM3u::nouveau(&track_repo)?;
+
+    let mut total = 0usize;
+    let mut trouvees = 0usize;
+    let mut non_trouvees = 0usize;
+    let mut erreurs = 0usize;
+    let mut echantillon: Vec<String> = Vec::new();
+    let mut par_recherche: Vec<String> = Vec::new();
+    let mut pistes: Vec<i64> = Vec::new();
+    let mut vues = std::collections::HashSet::new();
+
+    for entree in tune_core::library::m3u_parser::parse_m3u_content(octets, false) {
+        total += 1;
+        let ligne = entree.path.as_str();
+        let est_un_service = ligne
+            .split_once("://")
+            .is_some_and(|(sch, _)| !sch.eq_ignore_ascii_case("file"));
+        let avant = locales.trouvees_par_recherche;
+        let resultat = if est_un_service {
+            crate::routes::playlists::LigneM3u::Absente
+        } else {
+            locales.piste(ligne)
+        };
+        if locales.trouvees_par_recherche > avant && par_recherche.len() < ECHANTILLON_PAR_RECHERCHE
+        {
+            par_recherche.push(ligne.to_string());
+        }
+        match resultat {
+            crate::routes::playlists::LigneM3u::Trouvee(id) => {
+                trouvees += 1;
+                if vues.insert(id) {
+                    pistes.push(id);
+                }
+            }
+            crate::routes::playlists::LigneM3u::ErreurDeRecherche(e) => {
+                if erreurs == 0 {
+                    tracing::warn!(error = %e, "m3u_plays_lookup_error");
+                }
+                erreurs += 1;
+            }
+            crate::routes::playlists::LigneM3u::Absente => {
+                non_trouvees += 1;
+                if echantillon.len() < ECHANTILLON_NON_TROUVEES {
+                    echantillon.push(ligne.to_string());
+                }
+            }
+        }
+    }
+
+    let mut ecrites = 0usize;
+    if !apercu {
+        let repo = EcoutesImporteesRepo::with_backend(backend.clone());
+        for id in &pistes {
+            match repo.ajouter(*id, n, None) {
+                Ok(()) => ecrites += 1,
+                Err(e) => tracing::warn!(track_id = id, error = %e, "m3u_plays_ecriture_echouee"),
+            }
+        }
+    }
+    let pistes_aux_ecoutes = if apercu { pistes.len() } else { ecrites };
+    tracing::info!(
+        total,
+        trouvees,
+        non_trouvees,
+        erreurs,
+        pistes = pistes_aux_ecoutes,
+        n,
+        apercu,
+        recherche_plafonnee = locales.recherche_plafonnee,
+        par_recherche = locales.trouvees_par_recherche,
+        "import_m3u_plays_termine"
+    );
+    Ok(json!({
+        "source": "m3u_import",
+        "preview": apercu,
+        "total_rows": total,
+        "matched": trouvees,
+        "fuzzy_matched": locales.trouvees_par_recherche,
+        "unmatched": non_trouvees,
+        "lookup_errors": erreurs,
+        "duplicates_skipped": trouvees - pistes.len(),
+        "plays_per_track": n,
+        "play_counts_updated": pistes_aux_ecoutes,
+        "plays_added": pistes_aux_ecoutes as i64 * n,
+        "ratings_updated": 0,
+        "history_entries_added": 0,
+        "not_found_paths": echantillon,
+        "not_found_truncated": non_trouvees > echantillon.len(),
+        "fuzzy_matched_paths": par_recherche,
+        "fuzzy_matched_truncated": locales.trouvees_par_recherche as usize > par_recherche.len(),
+    }))
+}
+
+/// C1 — les dossiers de musique, sous leur forme canonique quand elle existe.
+fn racines_admises(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Vec<std::path::PathBuf> {
+    super::get_music_dirs_list(backend)
+        .iter()
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            let p = std::path::PathBuf::from(d);
+            std::fs::canonicalize(&p).unwrap_or(p)
+        })
+        .collect()
+}
+
+/// C1 — un chemin importé n'est admis que s'il est absolu, sans `..`, et
+/// sous l'un des dossiers de musique (forme canonique s'il existe : un lien
+/// symbolique qui sort de la bibliothèque est refusé). Sans dossier de
+/// musique, aucun chemin n'est admis.
+pub(crate) fn chemin_admis(chemin: &str, racines: &[std::path::PathBuf]) -> bool {
+    use std::path::{Component, Path};
+    let p = Path::new(chemin);
+    if !p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return false;
+    }
+    let reel = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    racines.iter().any(|r| reel.starts_with(r))
+}
+
 /// Écrire des pistes importées : artiste, album, puis la piste.
 ///
 /// Partagée par le chemin JSON de `import_roon` et par les deux téléversements,
@@ -1027,6 +1397,8 @@ fn ecrire_les_pistes(
     entrees: &[ImportTrackEntry],
 ) -> (i32, i32, Vec<String>) {
     let track_repo = TrackRepo::with_backend(backend.clone());
+    // C1 : aucun chemin hors des dossiers de musique.
+    let racines = racines_admises(backend);
     let artist_repo = ArtistRepo::with_backend(backend.clone());
     let album_repo = AlbumRepo::with_backend(backend.clone());
 
@@ -1038,6 +1410,12 @@ fn ecrire_les_pistes(
         // Skip if file_path exists and already in DB
         if let Some(ref fp) = entry.file_path
             && track_repo.get_by_path(fp).ok().flatten().is_some()
+        {
+            skipped += 1;
+            continue;
+        }
+        if let Some(ref fp) = entry.file_path
+            && !chemin_admis(fp, &racines)
         {
             skipped += 1;
             continue;
@@ -1076,7 +1454,7 @@ fn ecrire_les_pistes(
     (imported, skipped, errors)
 }
 
-pub(super) async fn import_playlists_file() -> Json<Value> {
+pub(super) async fn import_playlists_file(_admin: crate::auth::RequireAdmin) -> Json<Value> {
     let task_id = uuid_v4();
     Json(json!({
         "status": "accepted",
@@ -1097,6 +1475,7 @@ pub(super) async fn import_playlists_file() -> Json<Value> {
 /// ÉCRIT, là où `ImportReport` dit ce qui a été RECONNU. Les deux réponses à
 /// deux questions différentes, aucune ne remplace l'autre.
 pub(super) async fn import_status(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Json<Value> {
@@ -1154,6 +1533,7 @@ pub(super) struct ImportJriverRequest {
 }
 
 pub(super) async fn import_jriver(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<ImportJriverRequest>,
 ) -> impl IntoResponse {
@@ -1213,6 +1593,8 @@ fn parse_jriver_xml(
     let artist_repo = ArtistRepo::with_backend(backend.clone());
     let album_repo = AlbumRepo::with_backend(backend.clone());
     let track_repo = TrackRepo::with_backend(backend.clone());
+    // C1 : aucun chemin hors des dossiers de musique.
+    let racines = racines_admises(backend);
 
     let mut imported = 0;
     let mut skipped = 0;
@@ -1268,6 +1650,12 @@ fn parse_jriver_xml(
                         skipped += 1;
                         continue;
                     }
+                    if let Some(ref fp) = file_path
+                        && !chemin_admis(fp, &racines)
+                    {
+                        skipped += 1;
+                        continue;
+                    }
 
                     let artist_id = artist_repo
                         .get_or_create(&artist_name, None, None)
@@ -1310,7 +1698,12 @@ mod tests {
     use tune_core::event_bus::TuneEvent;
 
     fn etat() -> AppState {
-        AppState::new(":memory:", 0, Default::default()).unwrap()
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        // C1 : les pistes de ces témoins sont sous `/music`.
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("music_dirs", r#"["/music"]"#)
+            .unwrap();
+        state
     }
 
     /// Attendre `library.updated` sur le bus, ou renoncer.
@@ -1399,7 +1792,11 @@ mod tests {
         let body = ImportJriverRequest {
             xml_path: xml.to_string_lossy().to_string(),
         };
-        let _ = import_jriver(State(state.clone()), Json(body)).await;
+        // C1 : la piste est sous un dossier de musique déclaré.
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("music_dirs", r#"["/music"]"#)
+            .unwrap();
+        let _ = import_jriver(crate::auth::RequireAdmin, State(state.clone()), Json(body)).await;
 
         let ev = attendre_library_updated(&mut rx).await.expect(
             "l'import JRiver doit annoncer `library.updated` : `import.completed` \
@@ -1518,5 +1915,79 @@ mod tests {
                 .contains("annoncer_bibliotheque_modifiee"),
             "le module de test ne doit pas servir de preuve au code de production"
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "import_ecoutes_tests_7763.rs"]
+mod ecoutes_tests_7763;
+
+/// C1 : aucun chemin importé hors des dossiers de musique.
+#[cfg(test)]
+mod chemins_admis_tests {
+    use super::*;
+
+    #[test]
+    fn un_chemin_hors_des_dossiers_de_musique_est_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let racines = vec![std::fs::canonicalize(dir.path()).unwrap()];
+        let dedans = dir.path().join("album/01.flac");
+        std::fs::create_dir_all(dedans.parent().unwrap()).unwrap();
+        std::fs::write(&dedans, b"x").unwrap();
+        assert!(chemin_admis(dedans.to_str().unwrap(), &racines));
+        // Un fichier absent mais sous la racine reste admis (import Roon).
+        let absent = dir.path().join("album/02.flac");
+        assert!(chemin_admis(absent.to_str().unwrap(), &racines));
+        for refuse in [
+            "/etc/passwd".to_string(),
+            "relatif/01.flac".to_string(),
+            format!("{}/../../etc/passwd", dir.path().display()),
+        ] {
+            assert!(!chemin_admis(&refuse, &racines), "{refuse}");
+        }
+        // Sans dossier de musique, rien n'est admis.
+        assert!(!chemin_admis(dedans.to_str().unwrap(), &[]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn un_lien_symbolique_qui_sort_de_la_bibliotheque_est_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let racines = vec![std::fs::canonicalize(dir.path()).unwrap()];
+        let lien = dir.path().join("piege.flac");
+        std::os::unix::fs::symlink("/etc/hostname", &lien).unwrap();
+        assert!(!chemin_admis(lien.to_str().unwrap(), &racines));
+    }
+
+    #[test]
+    fn l_import_saute_les_pistes_hors_bibliotheque() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let racine = dir.path().to_string_lossy().to_string();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&vec![&racine]).unwrap(),
+            )
+            .unwrap();
+        let entree = |titre: &str, chemin: &str| ImportTrackEntry {
+            title: titre.into(),
+            artist: None,
+            album: None,
+            file_path: Some(chemin.into()),
+            duration_ms: None,
+            track_number: None,
+            genre: None,
+        };
+        let dedans = format!("{racine}/a/01.flac");
+        let (ecrites, sautees, echecs) = ecrire_les_pistes(
+            &state.backend,
+            "roon_import",
+            &[entree("dedans", &dedans), entree("dehors", "/etc/passwd")],
+        );
+        assert_eq!((ecrites, sautees), (1, 1), "{echecs:?}");
+        let pistes = TrackRepo::with_backend(state.backend.clone());
+        assert!(pistes.get_by_path("/etc/passwd").unwrap().is_none());
+        assert!(pistes.get_by_path(&dedans).unwrap().is_some());
     }
 }

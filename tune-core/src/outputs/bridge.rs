@@ -31,6 +31,9 @@ pub struct BridgeOutput {
     command_tx: mpsc::Sender<BridgeCommand>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<BridgeResponse>>>>,
     connected: Arc<AtomicBool>,
+    /// #7379 — le dernier `get_status` n'a reçu aucune donnée du pont : le
+    /// volume rendu (0,5 de `OutputStatus::default()`) est un repli.
+    volume_illisible: AtomicBool,
 }
 
 impl BridgeOutput {
@@ -50,6 +53,7 @@ impl BridgeOutput {
             command_tx,
             pending: Arc::new(Mutex::new(HashMap::new())),
             connected,
+            volume_illisible: AtomicBool::new(false),
         }
     }
 
@@ -70,6 +74,7 @@ impl BridgeOutput {
             command_tx,
             pending,
             connected,
+            volume_illisible: AtomicBool::new(false),
         }
     }
 
@@ -122,6 +127,10 @@ impl BridgeOutput {
 
 #[async_trait::async_trait]
 impl OutputTarget for BridgeOutput {
+    fn volume_du_statut_illisible(&self) -> bool {
+        self.volume_illisible.load(Ordering::Relaxed)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -189,8 +198,15 @@ impl OutputTarget for BridgeOutput {
             .send_command("get_status", serde_json::json!({}))
             .await?;
         if let Some(data) = resp.data {
-            serde_json::from_value(data).map_err(|e| format!("status parse: {e}"))
+            let statut: OutputStatus =
+                serde_json::from_value(data).map_err(|e| format!("status parse: {e}"))?;
+            self.volume_illisible
+                .store(!statut.volume.is_finite(), Ordering::Relaxed);
+            Ok(statut)
         } else {
+            // #7379 (troisième revue, B3b) — aucune donnée : le statut par
+            // défaut (volume 0,5) est un repli, signalé au sondeur.
+            self.volume_illisible.store(true, Ordering::Relaxed);
             Ok(OutputStatus::default())
         }
     }
@@ -208,5 +224,63 @@ impl OutputTarget for BridgeOutput {
         });
         self.send_command("set_next_media", payload).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Un faux pont : chaque commande reçoit `data`.
+    fn faux_pont(data: Arc<std::sync::Mutex<Option<serde_json::Value>>>) -> BridgeOutput {
+        let (tx, mut rx) = mpsc::channel::<BridgeCommand>(8);
+        let sortie = BridgeOutput::new(
+            "Pont".into(),
+            "pont-7379".into(),
+            "dlna".into(),
+            "pont".into(),
+            tx,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let pending = sortie.pending_responses();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                let reponse = BridgeResponse {
+                    id: cmd.id.clone(),
+                    ok: true,
+                    data: data.lock().unwrap().clone(),
+                    error: None,
+                };
+                if let Some(envoi) = pending.lock().await.remove(&cmd.id) {
+                    let _ = envoi.send(reponse);
+                }
+            }
+        });
+        sortie
+    }
+
+    /// #7379 (troisième revue, B3b) — une réponse `ok` SANS données rend le
+    /// statut par défaut (volume 0,5) : la sortie le signale au sondeur ; un
+    /// statut transmis par le pont est une vraie valeur.
+    #[tokio::test]
+    async fn un_statut_sans_donnees_signale_le_repli_7379() {
+        let data = Arc::new(std::sync::Mutex::new(None));
+        let sortie = faux_pont(data.clone());
+        let statut = sortie.get_status().await.unwrap();
+        assert_eq!(statut.volume, 0.5);
+        assert!(
+            sortie.volume_du_statut_illisible(),
+            "repli du pont non signalé"
+        );
+        *data.lock().unwrap() = Some(
+            serde_json::to_value(OutputStatus {
+                volume: 0.4,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let statut = sortie.get_status().await.unwrap();
+        assert!((statut.volume - 0.4).abs() < 1e-9);
+        assert!(!sortie.volume_du_statut_illisible());
     }
 }

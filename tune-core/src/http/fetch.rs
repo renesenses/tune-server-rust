@@ -219,6 +219,17 @@ pub static DISCOGS: LazyLock<RateLimiter> = LazyLock::new(|| RateLimiter::per_se
 /// La clé unique de Discogs dans [`DISCOGS`].
 pub const CLE_DISCOGS: &str = "discogs";
 
+/// Limiteur partagé des apports Qobuz à la bibliothèque locale (#8077) :
+/// rapprochement d'un album local et lecture de sa fiche Qobuz, à
+/// l'ouverture de la fiche comme dans la passe de fond. Qobuz ne publie pas
+/// de plafond ; deux requêtes par seconde au plus pour tout le serveur, avec
+/// le ralentissement adaptatif commun. La navigation Qobuz ordinaire (écrans
+/// du service) n'y passe pas : elle n'émet que ce que l'utilisateur demande.
+pub static QOBUZ: LazyLock<RateLimiter> = LazyLock::new(|| RateLimiter::per_second(2.0));
+
+/// La clé unique de Qobuz dans [`QOBUZ`].
+pub const CLE_QOBUZ: &str = "qobuz";
+
 /// Typed result of fetching a binary resource (e.g. an image), so callers can
 /// tell a genuine "not found" from a transient rate-limit or network error.
 #[derive(Debug)]

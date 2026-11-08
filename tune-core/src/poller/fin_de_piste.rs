@@ -562,6 +562,28 @@ impl PositionPoller {
                     return true;
                 }
                 Err(e) => {
+                    // #7974 — le bail d'écoute est fini : ce n'est pas la piste
+                    // qui échoue, c'est la séance. Aucune piste n'est « sautée »,
+                    // aucune autre n'est essayée ; la zone s'arrête (appelant).
+                    if let Some(refus) =
+                        crate::db::bail_d_ecoute::Refus::depuis_sentinelle(&e.to_string())
+                    {
+                        info!(
+                            zone_id,
+                            pos = attempt_pos,
+                            raison = refus.code(),
+                            "auto_next_parental_lease_ended"
+                        );
+                        self.playback.emit_bail_parental(
+                            zone_id,
+                            "parental_lease_ended",
+                            serde_json::json!({
+                                "code": crate::db::bail_d_ecoute::CODE_REFUS,
+                                "reason": refus.code(),
+                            }),
+                        );
+                        break;
+                    }
                     warn!(zone_id, error = %e, pos = attempt_pos, "auto_next_failed");
                     // #5327 — la source dit que plus rien de cette file ne se
                     // jouera (serveur du contact éteint) : on s'arrête ici,
@@ -1015,6 +1037,23 @@ impl PositionPoller {
         let Some(next_pos) = Self::prochaine_position_jouable(&self.db, zone_id, zone_state) else {
             return GaplessPrep::NotArmed;
         };
+        // #8088 — armée, la suivante serait jouée par le renderer sans
+        // repasser par la garde des contenus explicites : pour un profil dont
+        // la politique les masque, rien n'est armé d'avance, la fin de piste
+        // passe par la garde.
+        // #7974 — de même pour la garde du bail d'écoute : on n'arme pas la
+        // suivante si le bail finit avant elle.
+        if self.orchestrator.masque_l_explicite(zone_id).await
+            || !self
+                .orchestrator
+                .bail_couvre_l_enchainement(
+                    zone_id,
+                    fin_estimee.saturating_duration_since(Instant::now()),
+                )
+                .await
+        {
+            return GaplessPrep::NotArmed;
+        }
 
         // L'identite de ce qu'on s'apprete a armer, lue AVANT de le resoudre :
         // une ligne de file, pas une position (#3026). C'est la seule trace de
@@ -1284,18 +1323,46 @@ impl PositionPoller {
                     // DSD next on DLNA; handle_track_end plays it explicitly at
                     // end-of-track instead (a small gap, never a cut). Local
                     // output keeps its internal DSD gapless chain untouched.
+                    //
+                    // #6910 — sauf renderer qui annonce le DSD (GetProtocolInfo)
+                    // ET `SetNextAVTransportURI` (SCPD) et n'a pas déjà lâché un
+                    // suivant DSD : le blanc entre deux pistes enchaînées sur le
+                    // disque (fil 2412). Un renderer qui annonce tout et ne suit
+                    // pas est rattrapé par `StuckForceEnd`, puis retenu : une
+                    // transition perdue, pas une par piste.
+                    let mut dsd_arme = false;
                     if output.output_type() == "dlna" {
                         let url_lc = resolved.url.to_lowercase();
                         let next_is_dsd = crate::playback::gapless::est_dsd(&resolved.mime_type)
                             || url_lc.ends_with(".dsf")
                             || url_lc.ends_with(".dff");
                         if next_is_dsd {
+                            let annonce_suivante = output.annonce_la_suivante().await;
+                            // #6335 — la ligne dit laquelle des conditions a
+                            // manqué : limite du renderer, sondage sans
+                            // réponse ou SCPD jamais lu par Tune.
+                            if let Some(refus) = self
+                                .orchestrator
+                                .refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
+                                .await
+                            {
+                                info!(
+                                    zone_id,
+                                    device_id,
+                                    mime = %resolved.mime_type,
+                                    raison = refus.raison(),
+                                    annonce_suivante = ?annonce_suivante,
+                                    "gapless_skipped_dsd_next_dlna"
+                                );
+                                return GaplessPrep::DsdNextSkipped;
+                            }
                             info!(
                                 zone_id,
+                                device_id,
                                 mime = %resolved.mime_type,
-                                "gapless_skipped_dsd_next_dlna"
+                                "gapless_dsd_next_dlna_arme — le renderer annonce le DSD et SetNextAVTransportURI"
                             );
-                            return GaplessPrep::DsdNextSkipped;
+                            dsd_arme = true;
                         }
                     }
                     let media = crate::outputs::PlayMedia {
@@ -1360,11 +1427,20 @@ impl PositionPoller {
                         // répondre rend `Inconnue` et rien ne change.
                         let t_verif = Instant::now();
                         let tenue = output.suivante_preparee(&resolved.url).await;
+                        self.noter_le_suivant_arme(zone_id, device_id, dsd_arme, tenue);
+                        // #8076 — `streaming` ne dit que « une session HTTP
+                        // existe » (un fichier servi tel quel en a une) : la
+                        // voie dit ce qui part sur le fil.
+                        let voie = match resolved.stream_id.as_deref() {
+                            Some(sid) => self.orchestrator.streamer.voie_servie(sid).await,
+                            None => "url_directe",
+                        };
                         info!(
                             zone_id,
                             title = %resolved.title,
                             resolve_ms,
                             streaming = is_streaming,
+                            voie,
                             suivante = ?tenue,
                             verif_ms = t_verif.elapsed().as_millis() as u64,
                             "gapless_next_set"
@@ -1384,6 +1460,60 @@ impl PositionPoller {
                 );
                 GaplessPrep::NotArmed
             }
+        }
+    }
+}
+
+impl PositionPoller {
+    /// #6910 — ce qui vient d'être armé : un suivant DSD sur DLNA est retenu
+    /// pour la zone (tout autre armement efface la note). Un renderer qui
+    /// dit déjà avoir PERDU ce suivant DSD est retenu sans attendre la fin
+    /// de piste.
+    fn noter_le_suivant_arme(
+        &self,
+        zone_id: i64,
+        device_id: &str,
+        dsd_arme: bool,
+        tenue: crate::outputs::traits::SuivantePreparee,
+    ) {
+        let mut notes = self
+            .dsd_suivant_arme
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !dsd_arme {
+            notes.remove(&zone_id);
+            return;
+        }
+        if tenue == crate::outputs::traits::SuivantePreparee::Perdue {
+            notes.remove(&zone_id);
+            drop(notes);
+            self.retenir_dsd_suivant_lache(zone_id, device_id, "suivante_perdue");
+            return;
+        }
+        notes.insert(zone_id, device_id.to_string());
+    }
+
+    /// #6910 — le suivant armé de `zone_id` n'a pas été suivi : si c'était un
+    /// DSD sur DLNA, l'appareil retrouve la garde de #402.
+    pub(super) fn constater_le_suivant_non_suivi(&self, zone_id: i64) {
+        let appareil = self
+            .dsd_suivant_arme
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&zone_id);
+        if let Some(appareil) = appareil {
+            self.retenir_dsd_suivant_lache(zone_id, &appareil, "avance_bloquee");
+        }
+    }
+
+    fn retenir_dsd_suivant_lache(&self, zone_id: i64, device_id: &str, motif: &str) {
+        if self.orchestrator.retenir_dsd_suivant_lache(device_id) {
+            info!(
+                zone_id,
+                device_id,
+                motif,
+                "gapless_dsd_next_dlna_non_suivi — garde DSD rendue à cet appareil jusqu'au redémarrage"
+            );
         }
     }
 }

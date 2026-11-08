@@ -345,3 +345,57 @@ async fn le_releve_a_la_forme_promise() {
     );
     a_neuf();
 }
+
+/// #8086 : une génération demandée par l'utilisateur ne cède pas à la lecture,
+/// une tâche automatique si. Le même appel, deux origines.
+#[tokio::test]
+async fn une_demande_de_l_utilisateur_n_est_pas_freinee_en_lecture() {
+    let _g = VERROU.lock().await;
+    a_neuf();
+    noter_etat_de_lecture(1, "playing");
+    assert!(lecture_en_cours());
+    // Pause courte pour que le témoin de l'automatique reste rapide.
+    let mut p = tune_core::taches_de_fond::priorite::politique::politique();
+    p.pause_between_items_ms = 150;
+    tune_core::taches_de_fond::priorite::politique::regler(p);
+
+    let t = std::time::Instant::now();
+    let cede = priorite::ceder_pour_bloquant(priorite::Origine::Demandee, "spectrogramme");
+    assert!(!cede, "une demande de l'utilisateur ne doit pas céder");
+    assert!(t.elapsed() < Duration::from_millis(50), "aucune pause");
+    assert!(
+        !releve().throttled.contains(&"spectrogramme"),
+        "elle ne figure pas parmi les passes ralenties"
+    );
+
+    // Contre-épreuve : la même tâche, automatique, est toujours freinée.
+    let t = std::time::Instant::now();
+    let cede = priorite::ceder_pour_bloquant(priorite::Origine::Automatique, "spectrogramme");
+    assert!(cede, "l'automatique cède toujours");
+    assert!(t.elapsed() >= Duration::from_millis(140), "elle dort");
+    assert!(releve().throttled.contains(&"spectrogramme"));
+    a_neuf();
+}
+
+/// #8086 : le fil d'une demande n'est pas « de fond » (ses lectures SQLite ne
+/// sont pas différées), celui d'une tâche automatique l'est.
+#[tokio::test]
+async fn le_fil_d_une_demande_n_est_pas_marque_de_fond() {
+    let _g = VERROU.lock().await;
+    a_neuf();
+    use tune_core::taches_de_fond::priorite::{Origine, hors_du_fil_async_pour, politique};
+    let demande =
+        hors_du_fil_async_pour(Origine::Demandee, "spectrogramme", politique::fil_de_fond)
+            .await
+            .expect("travail fini");
+    assert!(!demande);
+    let auto = hors_du_fil_async_pour(
+        Origine::Automatique,
+        "spectrogramme",
+        politique::fil_de_fond,
+    )
+    .await
+    .expect("travail fini");
+    assert!(auto, "contre-épreuve : l'automatique reste marqué de fond");
+    a_neuf();
+}

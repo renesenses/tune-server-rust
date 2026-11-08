@@ -6,8 +6,14 @@
 //! de Tune. Reste ce que l'appareil fait de lui-même : télécommande, molette,
 //! application du fabricant, ou un renderer qui se réveille à 100 %. Les trois
 //! sites d'adoption de `tick.rs` recopiaient ce volume en base ; au-dessus de
-//! la limite, ils le refusent désormais, et Tune recommande à l'appareil la
-//! consigne de la zone (déjà sous la limite), bornée une fois encore.
+//! la limite, ils le refusent désormais.
+//!
+//! #7379 (décision de Bertrand du 02/11) : Tune ramène l'appareil AU plafond,
+//! et la consigne de la zone s'y aligne (le curseur suit). Avant, il
+//! recommandait la consigne de la zone, même très en dessous : un geste au
+//! bouton de l'ampli vers 95 % sous une limite de 70 % finissait à 70, plus à
+//! la consigne d'avant le geste. La valeur envoyée reste bornée par la
+//! limite, trim compris.
 //!
 //! La recommande part sur FRONT : une fois par valeur rapportée (à
 //! [`TOLERANCE_RENDERER`] près), pour ne pas marteler à chaque tour un
@@ -24,9 +30,9 @@ use crate::audio::volume_limites::{self, TOLERANCE_RENDERER};
 
 impl PositionPoller {
     /// Rend `true` quand `rapporte` dépasse la limite de sécurité de la zone :
-    /// l'adoption doit alors être sautée. La consigne est recommandée à
-    /// l'appareil au premier tour de chaque épisode (ou quand la valeur
-    /// rapportée bouge).
+    /// l'adoption doit alors être sautée. La limite devient la consigne et
+    /// l'appareil y est ramené au premier tour de chaque épisode (ou quand la
+    /// valeur rapportée bouge).
     pub(super) async fn volume_plafond_reimpose(&self, zone_id: i64, rapporte: f64) -> bool {
         // En PURE ou à volume fixe, la limite n'a pas cours (décision du
         // 21/10) : ni recommande, ni adoption sautée.
@@ -51,17 +57,38 @@ impl PositionPoller {
         if !nouveau_front {
             return true;
         }
+        let Some(securite) = limites.securite else {
+            return true;
+        };
         let consigne = self.playback.get_state(zone_id).await.volume;
-        let cible = limites.borner_appareil(consigne);
-        let device_id = self.get_zone_device_id(zone_id);
-        match self
-            .orchestrator
-            .set_volume(zone_id, cible, device_id.as_deref())
+        // #7379 — une consigne posée depuis le relevé l'emporte.
+        if self
+            .consigne_posee_depuis_le_releve(zone_id, consigne)
             .await
         {
-            Ok(()) => warn!(zone_id, rapporte, cible, "volume_plafond_reimpose"),
-            Err(e) => warn!(zone_id, rapporte, cible, error = %e, "volume_plafond_reimpose_echec"),
+            return true;
         }
+        // #7379, #8074 — sur une sortie à volume logiciel (pas de bouton
+        // d'ampli à suivre), ou un appareil qui se dit à 100 % (réveil à
+        // pleine échelle, #5662 : les sites d'adoption l'écartent aussi), la
+        // consigne ne monte jamais vers la limite : Tune recommande la
+        // consigne, bornée (règle d'avant le 02/11).
+        //
+        // Sinon, la cible est la limite en échelle de consigne SANS trim
+        // (B2 de la revue : `limite / facteur` enregistrait 100 % avec un trim
+        // négatif, que la remise du trim à 0 envoyait ensuite). Elle part sous
+        // la garde de hausse, la consigne d'avant restant le repère
+        // (`commander_le_plafond`) : l'appareil finit à la limite ou plus bas.
+        let cible = if !self.suivi_a_la_hausse_permis(zone_id) || rapporte >= 0.999 {
+            limites.borner_appareil(consigne)
+        } else {
+            securite.clamp(0.0, 1.0)
+        };
+        warn!(
+            zone_id,
+            rapporte, consigne, cible, "volume_plafond_reimpose"
+        );
+        self.commander_le_plafond(zone_id, cible).await;
         true
     }
 }
