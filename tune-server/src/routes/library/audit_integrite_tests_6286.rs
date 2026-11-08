@@ -74,6 +74,10 @@ impl Banc {
     /// Écrit le fichier et l'inscrit à la bibliothèque, comme le scan.
     fn piste(&mut self, relatif: &str, octets: &[u8], le: SystemTime) {
         self.ecrire(relatif, octets, le);
+        self.inscrire(relatif, octets.len(), le);
+    }
+    /// Inscrit à la bibliothèque un chemin, sans rien écrire sur le disque.
+    fn inscrire(&mut self, relatif: &str, taille: usize, le: SystemTime) {
         let date_scan = le
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -84,7 +88,7 @@ impl Banc {
                 &[
                     &self.suivant,
                     &self.chemin(relatif).to_string_lossy().into_owned(),
-                    &(octets.len() as i64),
+                    &(taille as i64),
                     &date_scan,
                 ],
             )
@@ -377,4 +381,52 @@ async fn le_mode_rapide_nomme_la_trame_et_ne_sert_pas_de_preuve_au_complet() {
         "le rappel part du dernier audit complet"
     );
     assert_eq!(banc.rapport(&reprise)["octet.flac"].mode, Mode::Complet);
+}
+
+/// #8105 — un chemin accentué est enregistré en NFC (le scan normalise), mais
+/// le disque peut porter le NFD : NTFS et ext4 distinguent les deux graphies.
+/// Le fichier présent est trouvé dans les deux sens, et le rapport garde le
+/// chemin enregistré.
+#[tokio::test]
+async fn un_chemin_accentue_est_trouve_en_nfc_comme_en_nfd() {
+    let _pauses = crate::pauses_de_fond_tests::isoler().await;
+    let mut banc = Banc::new();
+    let le = date(1_700_000_000);
+    let nfc = "Beh\u{f6}lder - Album/08 - BEH\u{d6}LDER - I Magus.flac";
+    let nfd = "Beho\u{308}lder - Album/08 - BEHO\u{308}LDER - I Magus.flac";
+    let f = flac();
+    for (dossier, disque, base) in [
+        ("nfc", nfc, nfc),
+        ("disque_nfd", nfd, nfc),
+        ("base_nfd", nfc, nfd),
+    ] {
+        banc.ecrire(&format!("{dossier}/{disque}"), &f, le);
+        banc.inscrire(&format!("{dossier}/{base}"), f.len(), le);
+    }
+    let etat = banc.auditer(false);
+    let lignes = lignes(&banc.db, &etat, 0, 1000, None).unwrap();
+    assert_eq!(lignes.len(), 3);
+    for l in &lignes {
+        assert_eq!(
+            (l.resultat.verdict.clone(), l.resultat.code.as_str()),
+            (Verdict::Sain, "sain"),
+            "fichier présent déclaré introuvable : {} ({:?})",
+            l.chemin.escape_unicode(),
+            l.resultat.erreur
+        );
+        assert_eq!(
+            l.taille,
+            Some(f.len() as u64),
+            "taille non lue : {}",
+            l.chemin
+        );
+    }
+    let base_nfd = banc
+        .chemin(&format!("base_nfd/{nfd}"))
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        lignes.iter().any(|l| l.chemin == base_nfd),
+        "le rapport doit garder le chemin enregistré"
+    );
 }

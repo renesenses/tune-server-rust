@@ -90,7 +90,28 @@ fn meme_credit(
 /// Les lignes doivent porter leur `source` ; le champ est retiré ensuite, la
 /// réponse garde sa forme. L'ordre des lignes restantes est conservé.
 fn fusionner_les_lignes_balises(items: &mut Vec<Value>) {
-    use tune_core::metadata::source_des_credits::BALISES;
+    use tune_core::metadata::source_des_credits::{BALISES, QOBUZ};
+    // #8077 — une ligne reprise de Qobuz ne s'affiche pas quand une autre
+    // source (balises comprises) porte le même crédit : le local prime.
+    let est_qobuz = |item: &Value| item["source"].as_str() == Some(QOBUZ);
+    let doublons_qobuz: Vec<bool> = items
+        .iter()
+        .map(|q| {
+            est_qobuz(q)
+                && match (
+                    q["track_id"].as_i64(),
+                    q["role"].as_str(),
+                    q["artist_name"].as_str(),
+                ) {
+                    (Some(t), Some(r), Some(n)) => items.iter().any(|j| {
+                        !est_qobuz(j) && meme_credit(j, t, r, n, q["instrument"].as_str())
+                    }),
+                    _ => false,
+                }
+        })
+        .collect();
+    let mut doublons_qobuz = doublons_qobuz.into_iter();
+    items.retain(|_| !doublons_qobuz.next().unwrap_or(false));
     let est_balise = |item: &Value| item["source"].as_str() == Some(BALISES);
     let mut retirees = vec![false; items.len()];
     for i in 0..items.len() {
@@ -118,8 +139,11 @@ fn fusionner_les_lignes_balises(items: &mut Vec<Value>) {
     }
     let mut retirees = retirees.into_iter();
     items.retain(|_| !retirees.next().unwrap_or(false));
+    // La réponse garde sa forme ; seule une ligne Qobuz dit sa source (#8077).
     for item in items.iter_mut() {
-        if let Some(o) = item.as_object_mut() {
+        if let Some(o) = item.as_object_mut()
+            && o.get("source").and_then(Value::as_str) != Some(QOBUZ)
+        {
             o.remove("source");
         }
     }

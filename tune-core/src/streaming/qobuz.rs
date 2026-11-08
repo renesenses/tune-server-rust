@@ -695,7 +695,7 @@ pub(crate) fn isrcs_normalises(isrcs: &[String]) -> Vec<String> {
     vus
 }
 
-fn id_qobuz(v: &serde_json::Value) -> Option<String> {
+pub(crate) fn id_qobuz(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
         serde_json::Value::Number(n) => Some(n.to_string()),
@@ -4104,6 +4104,36 @@ impl StreamingService for QobuzService {
 
     fn langue_du_magasin(&self) -> Option<String> {
         self.langue_magasin.clone()
+    }
+
+    /// #8077 — `album/search` sur « artiste titre ». Le jugement est fait
+    /// par `library::apports_service`.
+    async fn albums_par_titre(
+        &self,
+        artiste: &str,
+        titre: &str,
+    ) -> Result<Vec<CandidatAlbum>, TuneError> {
+        let requete = format!("{} {}", artiste.trim(), titre.trim());
+        if requete.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let data = self
+            .api_get(
+                "/album/search",
+                &[("query", requete.trim()), ("limit", "25")],
+            )
+            .await?;
+        Ok(super::qobuz_apports::candidats_de_la_recherche(&data))
+    }
+
+    /// #8077 — la fiche complète, depuis `detail_album` (cache de 5 min,
+    /// pistes paginées).
+    async fn fiche_album_service(
+        &self,
+        album_id: &str,
+    ) -> Result<Option<FicheAlbumService>, TuneError> {
+        let data = self.detail_album(album_id).await?;
+        Ok(super::qobuz_apports::fiche_de_l_album(&data))
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {

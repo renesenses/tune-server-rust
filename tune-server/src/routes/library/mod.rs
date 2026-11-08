@@ -15,6 +15,8 @@ mod browse;
 // étiquette dans la forme SERVIE de `/library/collections` — même fonction,
 // mêmes `album_count` et `orphan_album_ids` (#4798).
 // Dossiers de collections (#4853) : un arbre au-dessus des deux listes plates.
+/// #8077 — les apports Qobuz à un album local (base seulement, réversibles).
+pub(crate) mod apports_qobuz;
 mod collection_folders;
 pub(crate) mod collections;
 pub(crate) mod credits;
@@ -629,6 +631,18 @@ pub fn router() -> Router<AppState> {
             get(faux_hires::etat).post(faux_hires::regler),
         )
         // #6481 — les livrets PDF du dossier de l'album, et le fichier.
+        // #8077 — les apports Qobuz d'un album local : lire (calcul à la
+        // demande), retirer, confirmer un rapprochement douteux ; la passe de
+        // fond.
+        .route(
+            "/albums/{id}/apports-qobuz",
+            get(apports_qobuz::lire).delete(apports_qobuz::retirer),
+        )
+        .route(
+            "/albums/{id}/apports-qobuz/confirmer",
+            post(apports_qobuz::confirmer),
+        )
+        .route("/apports-qobuz/passe", post(apports_qobuz::passe))
         .route("/albums/{id}/booklets", get(livrets::livrets_album))
         .route("/albums/{id}/booklets/{name}", get(livrets::livret_album))
         .route(
