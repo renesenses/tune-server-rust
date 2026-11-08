@@ -15,7 +15,9 @@ use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::EventBus;
 use tune_core::favorites_sort::TriFavoris;
+use tune_core::metadata::bio_segments::GenreDeLien;
 use tune_core::streaming::ServiceRegistry;
+use tune_core::streaming::bio_qobuz;
 use tune_core::streaming::traits::StreamingService;
 
 mod connexion_spotify_distante;
@@ -758,9 +760,12 @@ async fn service_artist(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let result = {
+    let (result, bio_html) = {
         let svc = arc.read().await;
-        svc.get_artist(&artist_id).await
+        match svc.get_artist_avec_bio_html(&artist_id).await {
+            Ok((artiste, html)) => (Ok(artiste), html),
+            Err(e) => (Err(e), None),
+        }
     };
 
     // Best-effort: persist a streaming editorial bio (e.g. Qobuz) into a
@@ -815,7 +820,37 @@ async fn service_artist(
         });
     }
 
-    svc_response(result)
+    // #8129 — la bio garde ses liens : `bio_segments` à côté de `bio`.
+    match (result, bio_html) {
+        (Ok(artiste), Some(html)) if service == bio_qobuz::SERVICE => {
+            let mut corps = json!(artiste);
+            let page = bio_qobuz::PageDeLaBio {
+                genre: GenreDeLien::Artiste,
+                id: &artiste.id,
+                noms: &[artiste.name.as_str()],
+            };
+            avec_bio_segments(&state.backend, &mut corps, "bio", &html, &page);
+            Json(corps).into_response()
+        }
+        (result, _) => svc_response(result),
+    }
+}
+
+/// #8129 — pose `bio_segments` dans `corps`, et remplace `champ` par le texte
+/// que ces segments recomposent (le même texte brut, entités décodées et
+/// paragraphes gardés) : un client les compare avant de les dessiner.
+fn avec_bio_segments(
+    backend: &Arc<dyn DbBackend>,
+    corps: &mut Value,
+    champ: &str,
+    html: &str,
+    page: &bio_qobuz::PageDeLaBio<'_>,
+) {
+    let index = tune_core::metadata::bio_segments::index_partage(backend);
+    if let Some((texte, segments)) = bio_qobuz::bio_qobuz_segmentee(html, &index, page) {
+        corps[champ] = Value::String(texte);
+        corps["bio_segments"] = serde_json::to_value(segments).unwrap_or(Value::Null);
+    }
 }
 
 /// `?offset=` pour un « voir plus » : la discographie s'arrêtait au
@@ -1408,9 +1443,35 @@ async fn service_album_description(
     State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
-        .get_album_description(&album_id)
-        .await)
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = arc.read().await;
+    let description = svc.get_album_description(&album_id).await;
+    // #8129 — les liens de la présentation : `bio_segments` à côté de
+    // `description`. `album/get` sort du cache que la ligne du dessus remplit.
+    let html = match &description {
+        Ok(Some(_)) if service == bio_qobuz::SERVICE => {
+            svc.presentation_album_html(&album_id).await.ok().flatten()
+        }
+        _ => None,
+    };
+    drop(svc);
+    match (description, html) {
+        (Ok(Some(d)), Some(h)) => {
+            let mut corps = json!(d);
+            let noms: Vec<&str> = h.noms.iter().map(String::as_str).collect();
+            let page = bio_qobuz::PageDeLaBio {
+                genre: GenreDeLien::Album,
+                id: &album_id,
+                noms: &noms,
+            };
+            avec_bio_segments(&state.backend, &mut corps, "description", &h.html, &page);
+            Json(corps).into_response()
+        }
+        (description, _) => svc_response(description),
+    }
 }
 
 // ---------------------------------------------------------------------------
