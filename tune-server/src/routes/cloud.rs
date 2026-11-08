@@ -577,7 +577,10 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
 /// POST /cloud/sso/disconnect — log out of the mozaiklabs.fr account: drop the
 /// stored tokens/profile and revoke the account premium. The license-key path is
 /// untouched (a keyed premium survives).
-async fn sso_disconnect(State(state): State<AppState>) -> Json<Value> {
+async fn sso_disconnect(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     // Tune Circle (décision du 28/09/2026, #5326) : défaire la liaison chez le
     // cloud AVANT d'effacer les jetons qui la prouvent. Un échec (réseau, 404,

@@ -226,15 +226,21 @@ async fn export_sans_secrets_ne_laisse_rien_passer() {
 }
 
 /// `include_secrets=true` reste le mode « migration vers un serveur neuf » —
-/// mais il n'est plus offert qu'à l'administrateur.
+/// mais il n'est plus offert qu'à l'administrateur authentifié.
 #[tokio::test]
 async fn export_avec_secrets_reste_complet_pour_l_administrateur() {
     let state = new_state();
     semer_les_reglages(&state);
+    // Authentification active SANS remplacer le secret semé : le jeton de
+    // l'administrateur est signé avec lui.
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("auth_enabled", "true")
+        .unwrap();
+    let admin = tune_server::auth::sign_jwt(1, "admin", FAUX_JWT).unwrap();
     let (st, corps) = get_body(
         &state,
         "/api/v1/system/config/export?include_secrets=true",
-        None,
+        Some(&admin),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -244,6 +250,26 @@ async fn export_avec_secrets_reste_complet_pour_l_administrateur() {
         Some(FAUX_JWT),
         "la sauvegarde complete doit rester complete"
     );
+}
+
+/// A2 : authentification coupée, `RequireAdmin` laisse passer tout appelant.
+/// Les secrets en clair ne sortent donc plus ; l'export scellé reste.
+#[tokio::test]
+async fn export_avec_secrets_refuse_sans_authentification() {
+    let state = new_state();
+    semer_les_reglages(&state);
+    let (st, corps) = get_body(
+        &state,
+        "/api/v1/system/config/export?include_secrets=true",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{corps}");
+    assert!(corps.contains("auth_required"), "{corps}");
+    aucun_secret_dans(&corps, "export en clair sans authentification");
+    // Témoin : l'export sans secrets reste servi.
+    let (st, _) = get_body(&state, "/api/v1/system/config/export", None).await;
+    assert_eq!(st, StatusCode::OK);
 }
 
 #[tokio::test]

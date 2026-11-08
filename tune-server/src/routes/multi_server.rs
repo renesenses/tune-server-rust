@@ -27,6 +27,20 @@ struct RemoteServer {
     status: String,
 }
 
+impl RemoteServer {
+    /// B4 — ce qu'une réponse HTTP montre d'un serveur distant : jamais son
+    /// jeton de pont, seulement sa présence.
+    fn vue(&self) -> Value {
+        json!({
+            "name": self.name,
+            "server_id": self.server_id,
+            "has_token": !self.bridge_token.is_empty(),
+            "last_seen": self.last_seen,
+            "status": self.status,
+        })
+    }
+}
+
 fn default_status() -> String {
     "unknown".to_string()
 }
@@ -125,7 +139,10 @@ pub fn router() -> Router<AppState> {
 // ---------------------------------------------------------------------------
 
 /// GET /multi-server/servers — list registered remote servers.
-async fn list_servers(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_servers(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     if let Err(resp) =
         crate::premium_guard::require_premium(&state.license, Feature::MultiServer).await
     {
@@ -136,7 +153,7 @@ async fn list_servers(State(state): State<AppState>) -> impl IntoResponse {
     let servers = load_servers(&settings);
 
     Json(json!({
-        "servers": servers,
+        "servers": servers.iter().map(RemoteServer::vue).collect::<Vec<_>>(),
         "count": servers.len(),
     }))
     .into_response()
@@ -144,6 +161,7 @@ async fn list_servers(State(state): State<AppState>) -> impl IntoResponse {
 
 /// POST /multi-server/servers — register a new remote server.
 async fn add_server(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<AddServerRequest>,
 ) -> impl IntoResponse {
@@ -227,11 +245,12 @@ async fn add_server(
         "multi_server_added"
     );
 
-    (StatusCode::CREATED, Json(json!({"server": server}))).into_response()
+    (StatusCode::CREATED, Json(json!({"server": server.vue()}))).into_response()
 }
 
 /// DELETE /multi-server/servers/{server_id} — remove a remote server.
 async fn remove_server(
+    _admin: crate::auth::RequireAdmin,
     Path(server_id): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -269,6 +288,7 @@ async fn remove_server(
 
 /// GET /multi-server/servers/{server_id}/zones — proxy zones from a remote server.
 async fn remote_zones(
+    _admin: crate::auth::RequireAdmin,
     Path(server_id): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -313,6 +333,7 @@ async fn remote_zones(
 
 /// GET /multi-server/servers/{server_id}/library/albums — proxy albums from a remote server.
 async fn remote_library_albums(
+    _admin: crate::auth::RequireAdmin,
     Path(server_id): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -357,6 +378,7 @@ async fn remote_library_albums(
 
 /// POST /multi-server/servers/{server_id}/proxy — generic proxy to any endpoint.
 async fn generic_proxy(
+    _admin: crate::auth::RequireAdmin,
     Path(server_id): Path<String>,
     State(state): State<AppState>,
     Json(body): Json<ProxyRequest>,
@@ -407,7 +429,10 @@ async fn generic_proxy(
 }
 
 /// GET /multi-server/unified/zones — aggregate zones from all servers + local.
-async fn unified_zones(State(state): State<AppState>) -> impl IntoResponse {
+async fn unified_zones(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     if let Err(resp) =
         crate::premium_guard::require_premium(&state.license, Feature::MultiServer).await
     {
@@ -482,4 +507,30 @@ async fn unified_zones(State(state): State<AppState>) -> impl IntoResponse {
         "servers": servers.len() + 1, // +1 for local
     }))
     .into_response()
+}
+
+/// B4 : le jeton de pont d'un serveur distant ne sort jamais.
+#[cfg(test)]
+mod vue_tests {
+    use super::*;
+
+    #[test]
+    fn la_vue_ne_porte_jamais_le_jeton_de_pont() {
+        let s = RemoteServer {
+            name: "salon".into(),
+            server_id: "srv-1".into(),
+            bridge_token: "FAUX-jeton-de-pont-4242".into(),
+            last_seen: None,
+            status: "online".into(),
+        };
+        let v = s.vue();
+        let texte = v.to_string();
+        assert!(!texte.contains("FAUX-jeton-de-pont-4242"), "{texte}");
+        assert!(v.get("bridge_token").is_none(), "{texte}");
+        assert_eq!(v["has_token"], true);
+        assert_eq!(v["server_id"], "srv-1");
+        // Le stockage, lui, garde le jeton.
+        let stocke = serde_json::to_string(&[s]).unwrap();
+        assert!(stocke.contains("FAUX-jeton-de-pont-4242"));
+    }
 }

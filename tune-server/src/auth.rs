@@ -221,7 +221,11 @@ pub async fn auth_middleware(
             // futur ne doit pas heriter de cette ouverture.
             || (method == axum::http::Method::GET
                 && (path == "/system/peer-info" || path == "/api/v1/system/peer-info"))
-            || path.contains("/cloud/sso/")
+            // Seul le retour du SSO est public (A5) : chemin exact, GET. Le
+            // navigateur y revient de mozaiklabs.fr ; `authorize`, `status`
+            // et `disconnect` demandent une session (le cookie la porte).
+            || (method == axum::http::Method::GET
+                && (path == "/cloud/sso/callback" || path == "/api/v1/cloud/sso/callback"))
             || path == "/ws"
             || is_public_auth_route(&method, path))
     {
@@ -591,6 +595,27 @@ impl OptionalFromRequestParts<AppState> for AuthUser {
 /// model, which only enforces once auth is enabled. When enabled, a non-admin
 /// token gets 403 and a missing/invalid token 401.
 pub struct RequireAdmin;
+
+/// L'authentification est-elle active sur ce serveur ?
+pub fn authentification_active(state: &AppState) -> bool {
+    SettingsRepo::with_backend(state.backend.clone())
+        .get("auth_enabled")
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == "true")
+}
+
+/// Refus d'une opération réservée aux serveurs dont l'authentification est
+/// active : `RequireAdmin` laisse tout passer quand elle est coupée.
+pub fn refus_sans_authentification(message: &str) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "auth_required",
+            "message": message,
+        })),
+    )
+}
 
 impl FromRequestParts<AppState> for RequireAdmin {
     type Rejection = (StatusCode, Json<Value>);
