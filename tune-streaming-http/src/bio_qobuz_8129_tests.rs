@@ -205,8 +205,14 @@ async fn la_presentation_d_album_qobuz_porte_ses_liens_8129() {
     verifier(&v, "description");
     assert_eq!(v["language"], "fr");
     // L'album de la page : son propre lien reste du texte.
+    let portant: Vec<&Value> = v["bio_segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["texte"].as_str().unwrap().contains("Kind of Blue"))
+        .collect();
     assert!(
-        segment(&v, "Kind of Blue").get("lien_service").is_none(),
+        !portant.is_empty() && portant.iter().all(|s| s.get("lien_service").is_none()),
         "{v}"
     );
 }
