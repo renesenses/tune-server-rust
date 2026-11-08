@@ -593,6 +593,10 @@ fn la_route_native_porte_le_porteur_dop_et_le_dit() {
     );
 }
 
+// Volume plein = `UNITE_DU_GAIN_DE_RENDU` (au millionième depuis #7968, au
+// millième avant) : seul ce volume-là laisse la branche brute sans arithmétique.
 fn la_branche_brute_protege_le_dop(corps: &str) -> bool {
-    corps.contains("letbit_perfect=dop||(volume_units==1000&&local_dsp_is_identity(")
+    corps.contains(
+        "letbit_perfect=dop||(volume_units==UNITE_DU_GAIN_DE_RENDU&&local_dsp_is_identity(",
+    )
 }

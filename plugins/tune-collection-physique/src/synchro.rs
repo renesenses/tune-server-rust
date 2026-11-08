@@ -54,7 +54,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::correspondance::{
-    AlbumDeService, AlbumLocal, Index, LiensMusicBrainz, choisir_sur_le_service,
+    AlbumDeService, AlbumLocal, Index, LiensMusicBrainz, choisir_sur_le_service, titre_sans_edition,
 };
 use crate::discogs::{self, Disque, PAGES_MAX, PAR_PAGE};
 use crate::memoire::{Fiche, Liens, Memoire, Streaming, SurUnService};
@@ -742,6 +742,7 @@ impl Moteur {
                         trouves,
                         services: ont_repondu,
                         lu_le: maintenant(),
+                        regle: crate::memoire::REGLE_DE_COMPARAISON,
                     },
                 );
             }
@@ -901,7 +902,12 @@ impl Moteur {
     /// Discogs) d'abord, puis par artiste + titre.
     async fn chercher_sur(&self, service: &str, d: &Disque, codes: &[String]) -> SurLeService {
         let mut requetes: Vec<(String, bool)> = codes.iter().map(|c| (c.clone(), true)).collect();
-        requetes.push((format!("{} {}", d.artiste, d.titre), false));
+        // Sans la mention d'édition (« Abbey Road - Remastered 2009 ») : le
+        // service cherche l'album, pas l'édition (#7981).
+        requetes.push((
+            format!("{} {}", d.artiste, titre_sans_edition(&d.titre)),
+            false,
+        ));
         let mut sans_reponse = false;
         for (requete, par_code) in requetes {
             attendre(self.cadence.service).await;

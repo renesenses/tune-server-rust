@@ -1,6 +1,7 @@
 mod album_order;
 mod albums;
 mod audit_integrite;
+mod bio_liens;
 /// #4806 — le drapeau `banned` des listes de pistes, partagé avec les
 /// playlists et la recherche fédérée qui vivent hors de ce module.
 pub(crate) use albums::attacher_banni;
@@ -14,6 +15,8 @@ mod browse;
 // étiquette dans la forme SERVIE de `/library/collections` — même fonction,
 // mêmes `album_count` et `orphan_album_ids` (#4798).
 // Dossiers de collections (#4853) : un arbre au-dessus des deux listes plates.
+/// #8077 — les apports Qobuz à un album local (base seulement, réversibles).
+pub(crate) mod apports_qobuz;
 mod collection_folders;
 pub(crate) mod collections;
 pub(crate) mod credits;
@@ -68,6 +71,8 @@ mod query_multi;
 mod ratings;
 mod reidentify;
 mod reports;
+// #7872 — `GET /library/query`, la requête avancée (grammaire de #7848).
+pub(crate) mod requete_avancee;
 // tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
 // fichiers de CETTE machine.
 pub(crate) mod reveler;
@@ -340,7 +345,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/artists/{id}/albums", get(artists::artist_albums))
         .route("/artists/{id}/tracks", get(artists::artist_tracks))
-        .route("/artists/{id}/bio", get(artists::artist_bio))
+        // #7910 : `bio_liens` appelle (artists::artist_bio) et ajoute `bio_segments`.
+        .route("/artists/{id}/bio", get(bio_liens::artist_bio))
         .route("/artists/{id}/similar", get(artists::artist_similar))
         .route("/artists/{id}/metadata", get(artists::artist_metadata))
         // #6463 — « Détacher l'identité » : retire le MBID, provenance `manuel`.
@@ -625,6 +631,18 @@ pub fn router() -> Router<AppState> {
             get(faux_hires::etat).post(faux_hires::regler),
         )
         // #6481 — les livrets PDF du dossier de l'album, et le fichier.
+        // #8077 — les apports Qobuz d'un album local : lire (calcul à la
+        // demande), retirer, confirmer un rapprochement douteux ; la passe de
+        // fond.
+        .route(
+            "/albums/{id}/apports-qobuz",
+            get(apports_qobuz::lire).delete(apports_qobuz::retirer),
+        )
+        .route(
+            "/albums/{id}/apports-qobuz/confirmer",
+            post(apports_qobuz::confirmer),
+        )
+        .route("/apports-qobuz/passe", post(apports_qobuz::passe))
         .route("/albums/{id}/booklets", get(livrets::livrets_album))
         .route("/albums/{id}/booklets/{name}", get(livrets::livret_album))
         .route(
@@ -694,6 +712,8 @@ pub fn router() -> Router<AppState> {
             get(lyrics_pass::couverture_rattrapage).post(lyrics_pass::rattraper_maintenant),
         )
         .route("/search", get(search::search))
+        // #7872 — la requête avancée : mêmes droits que `/search`.
+        .route("/query", get(requete_avancee::requete_avancee))
         .route("/search/acoustic", post(search::acoustic_search))
         .route("/search/acoustic/status", get(search::acoustic_status))
         // Ambiances enregistrées : du stockage, pas de la recherche — donc
@@ -769,7 +789,8 @@ pub fn router() -> Router<AppState> {
             post(duplicates::retirer_album_doublon),
         )
         .route("/activity", get(stats::library_activity))
-        .route("/albums/{id}/bio", get(albums::album_bio))
+        // #7910 : `bio_liens` appelle (albums::album_bio) et ajoute `bio_segments`.
+        .route("/albums/{id}/bio", get(bio_liens::album_bio))
         .route("/albums/{id}/similar", get(albums::album_similar))
         .route(
             "/albums/{id}/artwork/rescan",
@@ -993,8 +1014,14 @@ mod routage_tests {
 }
 
 #[cfg(test)]
+#[path = "banc_l3l4_7619.rs"]
+mod banc_l3l4_7619;
+#[cfg(test)]
 #[path = "banc_rail_5993.rs"]
 mod banc_rail_5993;
+#[cfg(test)]
+#[path = "facets_cache_7619_tests.rs"]
+mod facets_cache_7619_tests;
 
 #[cfg(test)]
 #[path = "curseur_7619_tests.rs"]
@@ -1014,6 +1041,10 @@ mod filtre_qualite_7725_tests;
 #[cfg(test)]
 #[path = "notes_et_repartitions_7849_tests.rs"]
 mod notes_et_repartitions_7849_tests;
+
+#[cfg(test)]
+#[path = "requete_avancee_7872_tests.rs"]
+mod requete_avancee_7872_tests;
 
 #[cfg(test)]
 #[path = "banc_repertoires_5998.rs"]

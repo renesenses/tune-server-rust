@@ -86,6 +86,12 @@ Fedora (63).
 On Synology, also prepare a writable, persistent model cache before enabling
 acoustic analysis: [Synology model-cache setup](docs/INSTALL-SYNOLOGY.md).
 
+Tune cannot mount an SMB share itself inside the container. Mount the share on
+the host (your NAS), then bind it with `rslave` propagation
+(`-v /volume1/music:/music:ro,rslave`) so that a share mounted after the
+container started shows up in it:
+[SMB share in Docker](docs/DOCKER-PARTAGE-SMB.md).
+
 ### Podman (Fedora)
 
 Rootless Podman under SELinux needs three more options: `--userns=keep-id` runs

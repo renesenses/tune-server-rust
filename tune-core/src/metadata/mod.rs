@@ -10,9 +10,13 @@ pub mod auto_fix;
 pub mod balises_brutes;
 pub mod batch;
 pub mod bio_batch;
+pub mod bio_segments;
 pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod completude;
+pub mod credits_balises;
+#[cfg(test)]
+mod credits_balises_tests_7766;
 pub mod credits_mb;
 pub mod credits_release;
 pub mod discogs_propositions;
@@ -21,6 +25,8 @@ pub mod ecriture_fichiers;
 pub mod empreinte_audio;
 pub mod enrich_scope;
 pub mod enrichment;
+#[cfg(test)]
+mod explicite_balise_tests_8088;
 pub mod fingerprint;
 pub mod foo_dr;
 pub mod instruments;
@@ -226,6 +232,13 @@ pub struct TrackMetadata {
     /// Lu jusqu'ici pour le seul contrôle de durée des MP3, puis jeté.
     #[serde(default)]
     pub bitrate_kbps: Option<u32>,
+    /// #8088 — le marquage explicite de la balise : `ITUNESADVISORY` (ID3
+    /// `TXXX`, VorbisComment, APE) ou l'atome MP4 `rtng`, tous rendus par
+    /// lofty sous `ItemKey::ParentalAdvisory`. `Some(true)` : 1 ou 4
+    /// (explicite) ; `Some(false)` : 0 ou 2 (sans avertissement, propre) ;
+    /// `None` : aucune balise, ou une valeur hors de ce vocabulaire.
+    #[serde(default)]
+    pub explicit: Option<bool>,
     /// Le tag « compilation » du fichier — `TCMP` en ID3, `COMPILATION` en
     /// VorbisComment, `cpil` en MP4, tous trois rendus par
     /// `ItemKey::FlagCompilation`.
@@ -2274,6 +2287,8 @@ fn dsf_dff_fallback_complete(
             .as_ref()
             .and_then(Id3v2Tags::note)
             .or_else(|| tag_lofty.and_then(|t| note_de_la_balise(t, path))),
+        // #8088 — le marquage explicite, tel que lofty l'a lu.
+        explicit: tag_lofty.and_then(|t| explicite_de_la_balise(t, path)),
         // #6332 — un flux DSD est à débit constant : 1 bit par échantillon et
         // par canal (DSD64 stéréo : 5 645 kbit/s).
         bitrate_kbps: sample_rate
@@ -2375,6 +2390,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         comment: None,
         rating: None,
         bitrate_kbps: None,
+        explicit: None,
     })
 }
 
@@ -2846,6 +2862,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         comment: None,
         rating: None,
         bitrate_kbps: None,
+        explicit: None,
     }
 }
 
@@ -2957,6 +2974,7 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         comment: balises.comment,
         rating: None,
         bitrate_kbps: None,
+        explicit: None,
     })
 }
 
@@ -3036,6 +3054,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         comment: None,
         rating: None,
         bitrate_kbps: None,
+        explicit: None,
     }
 }
 
@@ -4204,6 +4223,8 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
             .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t)),
         bpm,
         rating: note_de_la_balise(tag, path),
+        // #8088 — le marquage explicite de la balise (`ITUNESADVISORY`, `rtng`).
+        explicit: explicite_de_la_balise(tag, path),
         // #6332 — le débit moyen que lofty calcule (en-tête de trame pour un
         // MP3 CBR, Xing/VBRI pour un VBR, taille du flux sur durée sinon). Lu
         // jusqu'ici pour le seul contrôle de durée des MP3, puis jeté.
@@ -4266,6 +4287,33 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
 /// 0 (« note inconnue », que les lecteurs écrivent pour ne garder que le
 /// compteur d'écoutes) comme pour une vraie étoile. Sans relecture possible
 /// (tag ID3 qui n'est pas en tête du fichier : AIFF, WAV), le 1 est gardé.
+/// #8088 — le marquage explicite d'une balise : `ItemKey::ParentalAdvisory`,
+/// où lofty range `TXXX:ITUNESADVISORY` (ID3) et l'atome MP4 `rtng`. lofty
+/// écarte le champ `ITUNESADVISORY` d'un VorbisComment (FLAC, Ogg) : il est
+/// relu brut dans le fichier, comme `FMPS_RATING` pour la note. 1 ou 4 :
+/// explicite (4 est l'ancienne valeur d'Apple) ; 0 ou 2 : sans avertissement
+/// ou version propre. Toute autre valeur ne dit rien : `None`, comme une
+/// balise absente.
+pub(crate) fn explicite_de_la_balise(tag: &lofty::tag::Tag, path: &Path) -> Option<bool> {
+    tag.get_strings(lofty::tag::ItemKey::ParentalAdvisory)
+        .find_map(explicite_depuis_valeur)
+        .or_else(|| match tag.tag_type() {
+            lofty::tag::TagType::VorbisComments => raw_vorbis_comment(path, "ITUNESADVISORY")
+                .as_deref()
+                .and_then(explicite_depuis_valeur),
+            _ => None,
+        })
+}
+
+/// #8088 — la valeur brute d'une balise `ITUNESADVISORY`.
+pub(crate) fn explicite_depuis_valeur(brut: &str) -> Option<bool> {
+    match brut.trim().to_ascii_lowercase().as_str() {
+        "1" | "4" | "explicit" => Some(true),
+        "0" | "2" | "clean" => Some(false),
+        _ => None,
+    }
+}
+
 fn note_de_la_balise(tag: &lofty::tag::Tag, path: &Path) -> Option<u8> {
     use lofty::tag::{ItemKey, TagType};
     let id3 = tag.tag_type() == TagType::Id3v2;
@@ -4371,20 +4419,29 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     }
 
     // Credits / personnel
-    if let Some(v) = get(ItemKey::Composer) {
-        meta.insert("composer".into(), v);
-    }
-    if let Some(v) = get(ItemKey::Conductor) {
-        meta.insert("conductor".into(), v);
-    }
-    if let Some(v) = get(ItemKey::Lyricist) {
-        meta.insert("lyricist".into(), v);
+    // #7766 — chaque clé de crédit garde TOUTES ses trames : deux COMPOSER
+    // Vorbis, ou un TCOM ID3v2.4 à deux valeurs, donnaient un seul
+    // compositeur. Les clés `arranger` à `writer` sont nouvelles ; ID3 range
+    // la TIPL (producer, arranger, engineer, mix, DJ-mix) sous les mêmes
+    // `ItemKey`, MP4 ses atomes `----:com.apple.iTunes:*`. Elles deviennent
+    // des lignes `track_credits` au scan (`credits_balises`).
+    for (cle, item) in [
+        ("composer", ItemKey::Composer),
+        ("conductor", ItemKey::Conductor),
+        ("lyricist", ItemKey::Lyricist),
+        ("writer", ItemKey::Writer),
+        ("arranger", ItemKey::Arranger),
+        ("engineer", ItemKey::Engineer),
+        ("mixer", ItemKey::MixEngineer),
+        ("djmixer", ItemKey::MixDj),
+        ("remixer", ItemKey::Remixer),
+    ] {
+        if let Some(v) = toutes(item) {
+            meta.insert(cle.into(), v);
+        }
     }
     if let Some(v) = toutes(ItemKey::Performer) {
         meta.insert("performer".into(), v);
-    }
-    if let Some(v) = get(ItemKey::Remixer) {
-        meta.insert("remixer".into(), v);
     }
     if let Some(v) = label_du_tag(&get) {
         meta.insert("label".into(), v);
@@ -4471,6 +4528,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
                 .iter()
                 .chain(balises_brutes::CLES_ANNEE_ORIGINALE.iter())
                 .chain(std::iter::once(&balises_brutes::CLE_VERSION))
+                .chain(credits_balises::CLES_ENSEMBLE.iter())
                 .filter_map(|k| find_vorbis_comment(h, k).map(|v| (k.to_string(), v)))
                 .collect(),
             None => balises_brutes::lire_balises_du_fichier(path)
@@ -4485,6 +4543,11 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         if let Some(v) = balises_brutes::version_parmi(&brutes) {
             meta.insert("version".into(), v);
         }
+        // #7766 — ce que lofty ne range sous aucun `ItemKey` : l'ensemble ou
+        // l'orchestre (ENSEMBLE, ORCHESTRA), la liste des musiciens ID3v2.4
+        // (TMCL, « instrument: nom »), et l'arrangeur d'un MP4. Lu dans les
+        // mêmes clés brutes, sans E/S de plus.
+        credits_balises::completer_par_les_cles_brutes(&mut meta, &brutes);
     }
     if let Some(v) = get(ItemKey::OriginalMediaType)
         .or_else(|| find_vorbis_comment(header.as_deref()?, "SOURCE"))
@@ -4824,14 +4887,10 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
         if item.key() == ItemKey::Performer
             && let Some(val) = item.value().text()
         {
-            let (name, instrument) = if let Some((n, i)) = val.split_once('(') {
-                (
-                    n.trim().to_string(),
-                    Some(i.trim_end_matches(')').trim().to_string()),
-                )
-            } else {
-                (val.to_string(), None)
-            };
+            // #7766 — le découpage « Nom (instrument) » des crédits de balise,
+            // à la dernière parenthèse : « Orchestre (de chambre) de Paris
+            // (violon) » garde son nom entier.
+            let (name, instrument) = credits_balises::nom_et_instrument(val);
             credits.push(TrackCredit {
                 name,
                 role: "performer".into(),

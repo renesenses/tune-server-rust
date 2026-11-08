@@ -47,6 +47,12 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     include_str!("../../migrations/continue_listening.sql"),
     // #7856 — contrôle parental, sans script numéroté (voir `politique_parentale`).
     include_str!("../../migrations/politiques_parentales.sql"),
+    // #7974 — temps écouté des profils supervisés (voir `bail_d_ecoute`).
+    include_str!("../../migrations/ecoutes_parentales.sql"),
+    // #7983 — trace des tentatives d'enrichissement, sans script numéroté
+    // (voir `enrich_tentatives`).
+    include_str!("../../migrations/enrich_tentatives.sql"),
+    super::enrich_tentatives::SQL_INDEX,
     "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL, created_at DOUBLE PRECISION)",
     "CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq",
     "CREATE TABLE IF NOT EXISTS streaming_favorites (\
@@ -386,11 +392,18 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // #6332 — le débit moyen du fichier (PG 094). Ici AUSSI, même raison que
     // `rating` : l'INSERT et l'UPDATE des pistes le NOMMENT.
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bitrate_kbps BIGINT",
+    // #8088 — le marquage explicite de la balise (PG 107). Ici AUSSI, même
+    // raison que `rating` : l'INSERT et l'UPDATE des pistes le NOMMENT.
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS explicit BIGINT",
     // #7619 (L1) — la clé de tri de la vue des pistes, sans numéro de
     // migration (passe rejouée au démarrage). `COLLATE "C"` : l'ordre des
     // octets, celui de SQLite. L'index JUSTE APRÈS la colonne.
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE \"C\"",
     "CREATE INDEX IF NOT EXISTS idx_tracks_cle_tri ON tracks(cle_tri, id)",
+    // #7872 — la requête avancée d'une collection intelligente (PG 106). Ici
+    // AUSSI : une base de bascule ne rejoue pas la 106, et toutes les
+    // lectures de `smart_collections` la NOMMENT.
+    "ALTER TABLE smart_collections ADD COLUMN IF NOT EXISTS expression TEXT",
     // #6516 — le lien des radios avec l'annuaire (PG 090). Ici AUSSI : une
     // base de bascule ne rejoue pas la 090, et le rapprochement NOMME la
     // colonne. L'index JUSTE APRÈS la colonne.

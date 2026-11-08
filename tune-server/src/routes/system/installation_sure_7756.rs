@@ -14,9 +14,32 @@
 //! `.new`, sa validation (taille, en-tête ELF, architecture, `--version`)
 //! AVANT de toucher à l'ancien binaire, et la synchronisation du dossier
 //! après les renommages.
+//!
+//! `web/` avait le même défaut (constat du 03/11) : `index.html`, `sw.js`,
+//! `manifest.json`, `version.json`… laissés à 0 octet, et le `web/` de la rc10
+//! posé à côté du binaire rc9 remis en place. La copie (`fs::copy`) n'était
+//! pas forcée sur le disque, rien ne la relisait avant la bascule, l'ancien
+//! `web/` était supprimé aussitôt, et `web/` n'était copié qu'APRÈS la bascule
+//! du binaire. Désormais :
+//!
+//! 1. chaque `web/` neuf est préparé en `<cible>.new`, à côté de sa cible
+//!    (même système de fichiers), fichier par fichier forcé sur le disque,
+//!    puis vérifié ([`verifier_le_web`]) — AVANT de toucher au binaire ;
+//! 2. la bascule renomme le binaire, puis chaque dossier entier ; l'ancien
+//!    `web/` est gardé en `<cible>.old`, à côté de `tune-server.old` ;
+//! 3. un échec pendant la bascule remet le binaire ET `web/` ensemble.
+//!
+//! Retour manuel à la version précédente (installation dans `/opt/tune`,
+//! service arrêté) :
+//!
+//! ```sh
+//! cd /opt/tune
+//! cp -a tune-server.old tune-server
+//! rm -rf web.rejete && mv web web.rejete && mv web.old web
+//! ```
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
@@ -41,9 +64,15 @@ pub(super) struct Controles {
     pub architecture: Option<&'static str>,
     /// Lance le binaire posé et vérifie qu'il répond.
     pub essai: fn(&Path) -> Result<(), String>,
-    /// Remplace `web/` (`exe_dir`, `tmp_dir`) ; en production
-    /// `update_web_dir`.
-    pub mettre_a_jour_web: fn(&Path, &Path) -> Result<(), String>,
+    /// Les dossiers `web/` à remplacer, le servi en premier ; en production
+    /// `cibles_web`.
+    pub cibles_web: fn(&Path) -> Vec<PathBuf>,
+    /// Copie un fichier de `web/` et le force sur le disque ; en production
+    /// [`copier_durablement`]. Les tests y simulent une coupure.
+    pub copier: fn(&Path, &Path) -> io::Result<()>,
+    /// Renomme pendant la bascule (binaire et `web/`) ; en production
+    /// `fs::rename`. Le retour en arrière n'y passe pas.
+    pub renommer: fn(&Path, &Path) -> io::Result<()>,
 }
 
 impl Controles {
@@ -55,7 +84,9 @@ impl Controles {
             place_libre,
             architecture: linux.then_some(std::env::consts::ARCH),
             essai: if linux { essayer_version } else { sans_essai },
-            mettre_a_jour_web: super::update_web_dir,
+            cibles_web: super::cibles_web,
+            copier: copier_durablement,
+            renommer: |de, vers| std::fs::rename(de, vers),
         }
     }
 }
@@ -354,6 +385,197 @@ pub(super) fn taille_du_dossier(dir: &Path) -> u64 {
         .sum()
 }
 
+/// `<cible>.<suffixe>`, à côté de `cible` : `web` → `web.new`.
+pub(super) fn a_cote(cible: &Path, suffixe: &str) -> PathBuf {
+    let mut nom = cible.file_name().unwrap_or_default().to_os_string();
+    nom.push(".");
+    nom.push(suffixe);
+    cible.with_file_name(nom)
+}
+
+/// Copie un fichier, conserve ses droits et force ses données sur le disque.
+pub(super) fn copier_durablement(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut entree = std::fs::File::open(src)?;
+    let droits = entree.metadata()?.permissions();
+    let mut sortie = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    io::copy(&mut entree, &mut sortie)?;
+    sortie.set_permissions(droits)?;
+    sortie.sync_all()
+}
+
+/// Copie récursive de `src` vers `dst` (créé), chaque fichier par `copier`,
+/// chaque dossier synchronisé après son contenu.
+fn copier_le_dossier(
+    src: &Path,
+    dst: &Path,
+    copier: fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    std::fs::create_dir(dst)?;
+    for entree in std::fs::read_dir(src)? {
+        let entree = entree?;
+        let vers = dst.join(entree.file_name());
+        if entree.path().is_dir() {
+            copier_le_dossier(&entree.path(), &vers, copier)?;
+        } else {
+            copier(&entree.path(), &vers)?;
+        }
+    }
+    std::fs::File::open(dst)?.sync_all()
+}
+
+/// Fichiers de la racine de `web/` sans lesquels l'interface ne s'affiche
+/// pas : vides, ils sont refusés même si l'archive les donne vides.
+const FICHIERS_WEB_ESSENTIELS: [&str; 4] = ["index.html", "sw.js", "manifest.json", "version.json"];
+
+/// Vérifie le `web/` préparé contre sa source, avant toute bascule :
+/// `index.html` présent, chaque fichier présent à la taille de la source, et
+/// aucun fichier vide quand la source ne l'est pas (ni un essentiel vide).
+pub(super) fn verifier_le_web(source: &Path, prepare: &Path) -> Result<(), String> {
+    if !prepare.join("index.html").is_file() {
+        return Err(format!(
+            "invalid web: index.html missing in {}",
+            prepare.display()
+        ));
+    }
+    fn parcourir(source: &Path, prepare: &Path, relatif: &Path) -> Result<(), String> {
+        let entrees = std::fs::read_dir(source.join(relatif))
+            .map_err(|e| format!("invalid web: cannot read {}: {e}", relatif.display()))?;
+        for entree in entrees {
+            let entree = entree.map_err(|e| format!("invalid web: {e}"))?;
+            let rel = relatif.join(entree.file_name());
+            if entree.path().is_dir() {
+                parcourir(source, prepare, &rel)?;
+                continue;
+            }
+            let attendue = std::fs::metadata(entree.path())
+                .map_err(|e| format!("invalid web: cannot read source {}: {e}", rel.display()))?
+                .len();
+            let ecrite = std::fs::metadata(prepare.join(&rel))
+                .map_err(|_| format!("invalid web: {} missing", rel.display()))?
+                .len();
+            let essentiel = relatif.as_os_str().is_empty()
+                && FICHIERS_WEB_ESSENTIELS
+                    .iter()
+                    .any(|f| entree.file_name() == *f);
+            if ecrite == 0 && (attendue > 0 || essentiel) {
+                return Err(format!("invalid web: {} is empty (0 bytes)", rel.display()));
+            }
+            if ecrite != attendue {
+                return Err(format!(
+                    "invalid web: {}: {ecrite} bytes written, {attendue} expected",
+                    rel.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+    parcourir(source, prepare, Path::new(""))
+}
+
+/// Prépare `<cible>.new` pour chaque cible, copie durable puis vérifiée,
+/// sans toucher aux cibles. Au premier échec, toutes les copies préparées
+/// sont retirées. Rend les cibles préparées (aucune si l'archive n'a pas de
+/// `web/`).
+pub(super) fn preparer_les_web(
+    source: &Path,
+    cibles: &[PathBuf],
+    copier: fn(&Path, &Path) -> io::Result<()>,
+) -> Result<Vec<PathBuf>, String> {
+    if !source.is_dir() {
+        tracing::info!("no web/ directory in archive, skipping web update");
+        return Ok(Vec::new());
+    }
+    let mut preparees: Vec<PathBuf> = Vec::new();
+    for cible in cibles {
+        let prepare = a_cote(cible, "new");
+        let resultat = (|| {
+            if prepare.exists() {
+                std::fs::remove_dir_all(&prepare)
+                    .map_err(|e| format!("clear staged web {}: {e}", prepare.display()))?;
+            }
+            copier_le_dossier(source, &prepare, copier)
+                .map_err(|e| format!("stage new web/ {}: {e}", prepare.display()))?;
+            verifier_le_web(source, &prepare)
+        })();
+        if let Err(e) = resultat {
+            std::fs::remove_dir_all(&prepare).ok();
+            abandonner_les_web(&preparees);
+            return Err(e);
+        }
+        if let Some(parent) = prepare.parent() {
+            synchroniser_dossier(parent);
+        }
+        preparees.push(cible.clone());
+    }
+    Ok(preparees)
+}
+
+/// Retire les `<cible>.new` préparés et non basculés.
+pub(super) fn abandonner_les_web(cibles: &[PathBuf]) {
+    for cible in cibles {
+        std::fs::remove_dir_all(a_cote(cible, "new")).ok();
+    }
+}
+
+/// Une cible `web/` basculée : de quoi la remettre.
+pub(super) struct WebBascule {
+    pub cible: PathBuf,
+    /// Un ancien `web/` a été mis de côté en `<cible>.old`.
+    pub ancien_garde: bool,
+}
+
+/// Bascule une cible préparée : l'ancien `web/` part en `<cible>.old` (le
+/// précédent `.old` est retiré), le `.new` prend son nom, le dossier parent
+/// est synchronisé. Un échec laisse la cible comme avant.
+pub(super) fn basculer_un_web(
+    cible: &Path,
+    renommer: fn(&Path, &Path) -> io::Result<()>,
+) -> Result<WebBascule, String> {
+    let prepare = a_cote(cible, "new");
+    let ancien = a_cote(cible, "old");
+    if ancien.exists() {
+        std::fs::remove_dir_all(&ancien)
+            .map_err(|e| format!("clear web backup {}: {e}", ancien.display()))?;
+    }
+    let ancien_garde = cible.exists();
+    if ancien_garde {
+        renommer(cible, &ancien).map_err(|e| format!("park old web/ {}: {e}", cible.display()))?;
+    }
+    if let Err(e) = renommer(&prepare, cible) {
+        if ancien_garde {
+            std::fs::rename(&ancien, cible).ok();
+        }
+        return Err(format!("swap new web/ into {}: {e}", cible.display()));
+    }
+    if let Some(parent) = cible.parent() {
+        synchroniser_dossier(parent);
+    }
+    Ok(WebBascule {
+        cible: cible.to_path_buf(),
+        ancien_garde,
+    })
+}
+
+/// Remet l'ancien `web/` d'une cible basculée ; le neuf est retiré.
+pub(super) fn remettre_un_web(b: &WebBascule) -> Result<(), String> {
+    let rejete = a_cote(&b.cible, "new");
+    if rejete.exists() {
+        std::fs::remove_dir_all(&rejete).ok();
+    }
+    std::fs::rename(&b.cible, &rejete).map_err(|e| format!("{e}"))?;
+    if b.ancien_garde {
+        std::fs::rename(a_cote(&b.cible, "old"), &b.cible).map_err(|e| format!("{e}"))?;
+    }
+    std::fs::remove_dir_all(&rejete).ok();
+    if let Some(parent) = b.cible.parent() {
+        synchroniser_dossier(parent);
+    }
+    Ok(())
+}
+
 /// #7756 — une installation factice : l'ancien binaire est un script
 /// exécutable qui répond comme le serveur ; on prouve qu'après chaque refus
 /// il est toujours à sa place, intact, et qu'il s'exécute.
@@ -365,6 +587,19 @@ mod tests {
     use std::path::PathBuf;
 
     const ANCIEN: &str = "#!/bin/sh\necho tune-server 1.0.0-rc9\n";
+    const ANCIEN_INDEX: &str = "<html>rc9</html>";
+
+    /// Le `web/` neuf de l'archive : (chemin relatif, contenu).
+    const WEB_NEUF: [(&str, &str); 5] = [
+        ("index.html", "<html>rc10</html>"),
+        ("sw.js", "self.addEventListener('fetch', () => {});"),
+        ("manifest.json", "{\"name\":\"Tune\"}"),
+        ("version.json", "{\"version\":\"1.0.0-rc10\"}"),
+        (
+            "assets/app.js",
+            "console.log('tune rc10, un fichier un peu plus long');",
+        ),
+    ];
 
     struct Installation {
         _racine: tempfile::TempDir,
@@ -382,6 +617,16 @@ mod tests {
             let binaire = opt.join("tune-server");
             std::fs::write(&binaire, ANCIEN).unwrap();
             std::fs::set_permissions(&binaire, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for web in ["web", "repli"] {
+                std::fs::create_dir_all(opt.join(web).join("assets")).unwrap();
+                std::fs::write(opt.join(web).join("index.html"), ANCIEN_INDEX).unwrap();
+                std::fs::write(opt.join(web).join("assets/old.js"), "rc9").unwrap();
+            }
+            let web_neuf = extraction.join("web");
+            std::fs::create_dir_all(web_neuf.join("assets")).unwrap();
+            for (nom, contenu) in WEB_NEUF {
+                std::fs::write(web_neuf.join(nom), contenu).unwrap();
+            }
             Self {
                 _racine: racine,
                 binaire,
@@ -406,8 +651,34 @@ mod tests {
             )
         }
 
-        /// L'ancien binaire est sous son nom, inchangé, en 0755, et s'exécute.
+        fn opt(&self) -> &Path {
+            self.binaire.parent().unwrap()
+        }
+
+        /// Un `web/` (`web` ou `repli`) est l'ancien, entier, sans `.new`
+        /// qui traîne.
+        fn ancien_web_intact(&self, nom: &str) {
+            let web = self.opt().join(nom);
+            assert_eq!(
+                std::fs::read_to_string(web.join("index.html")).unwrap_or_default(),
+                ANCIEN_INDEX,
+                "{nom}/ n'est plus l'ancien : binaire et web/ ne sont plus de la même version"
+            );
+            assert!(
+                web.join("assets/old.js").exists(),
+                "{nom}/ ancien incomplet"
+            );
+            assert!(!web.join("sw.js").exists(), "{nom}/ mêle ancien et neuf");
+            assert!(
+                !self.opt().join(format!("{nom}.new")).exists(),
+                "la copie préparée {nom}.new est restée sur le disque"
+            );
+        }
+
+        /// L'ancien binaire est sous son nom, inchangé, en 0755, et s'exécute ;
+        /// l'ancien `web/` est en place.
         fn ancien_intact(&self) {
+            self.ancien_web_intact("web");
             assert_eq!(
                 std::fs::read_to_string(&self.binaire).unwrap(),
                 ANCIEN,
@@ -422,9 +693,7 @@ mod tests {
                 0o755,
                 "l'ancien binaire n'est plus exécutable"
             );
-            let sortie = std::process::Command::new(&self.binaire)
-                .output()
-                .expect("l'ancien binaire ne s'exécute plus");
+            let sortie = executer_quand_libre(&self.binaire);
             assert_eq!(
                 String::from_utf8_lossy(&sortie.stdout),
                 "tune-server 1.0.0-rc9\n"
@@ -433,6 +702,25 @@ mod tests {
                 !self.binaire.with_extension("new").exists(),
                 "le .new refusé est resté sur le disque"
             );
+        }
+    }
+
+    /// Exécute l'ancien binaire comme `lancer_quand_libre` exécute le `.new` :
+    /// en relançant sur `ETXTBSY`. Écrit par `Installation::nouvelle`, il peut
+    /// lui aussi être tenu en écriture par le `fork` d'un test voisin (#8012).
+    /// Toute autre erreur fait échouer le test.
+    fn executer_quand_libre(chemin: &Path) -> std::process::Output {
+        let debut = std::time::Instant::now();
+        loop {
+            match std::process::Command::new(chemin).output() {
+                Err(e)
+                    if e.kind() == io::ErrorKind::ExecutableFileBusy
+                        && debut.elapsed() < DELAI_FICHIER_OCCUPE =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                autre => return autre.expect("l'ancien binaire ne s'exécute plus"),
+            }
         }
     }
 
@@ -462,7 +750,9 @@ mod tests {
                 None => "x86_64",
             }),
             essai: |_| Ok(()),
-            mettre_a_jour_web: |_, _| Ok(()),
+            cibles_web: |exe_dir| vec![exe_dir.join("web")],
+            copier: copier_durablement,
+            renommer: |de, vers| std::fs::rename(de, vers),
         }
     }
 
@@ -479,6 +769,26 @@ mod tests {
             ANCIEN
         );
         assert!(!inst.binaire.with_extension("new").exists());
+        // `web/` neuf en place, entier ; l'ancien gardé en `web.old`, à côté
+        // de `tune-server.old`.
+        let web = inst.opt().join("web");
+        for (nom, contenu) in WEB_NEUF {
+            assert_eq!(
+                std::fs::read_to_string(web.join(nom)).unwrap(),
+                contenu,
+                "{nom}"
+            );
+        }
+        assert!(
+            !web.join("assets/old.js").exists(),
+            "web/ mêle ancien et neuf"
+        );
+        assert_eq!(
+            std::fs::read_to_string(inst.opt().join("web.old/index.html")).unwrap_or_default(),
+            ANCIEN_INDEX,
+            "l'ancien web/ n'est pas gardé en web.old pour le retour en arrière"
+        );
+        assert!(!inst.opt().join("web.new").exists());
     }
 
     /// Le cas du testeur : un binaire de 0 octet.
@@ -558,7 +868,10 @@ mod tests {
     }
 
     /// L'essai `--version` réel : un binaire qui échoue est refusé, un
-    /// binaire qui répond comme le serveur est accepté.
+    /// binaire qui répond comme le serveur est accepté. Le `.new` est exécuté
+    /// par `lancer_quand_libre`, l'ancien par `executer_quand_libre` : un
+    /// descripteur d'écriture hérité par le `fork` d'un test voisin ne fait
+    /// plus échouer ce test par « Text file busy » (#8012).
     #[test]
     fn l_essai_version_refuse_un_binaire_qui_ne_repond_pas() {
         let inst = Installation::nouvelle();
@@ -600,24 +913,123 @@ mod tests {
         });
     }
 
-    /// Un échec après la bascule (`web/`) remet l'ancien binaire en place.
+    /// Le constat du 03/11 : un fichier de `web/` écrit vide (données
+    /// perdues). La copie préparée est refusée avant de toucher à quoi que
+    /// ce soit : ancien binaire et ancien `web/` restent en place.
     #[test]
-    fn un_echec_de_web_remet_l_ancien_binaire() {
+    fn un_fichier_web_ecrit_vide_est_refuse_et_tout_reste_en_place() {
         let inst = Installation::nouvelle();
         let neuf = inst.extrait(&faux_elf(machine_hote(), 4096));
-        let web_en_echec = Controles {
-            mettre_a_jour_web: |_, _| Err("stage new web/: Permission denied".into()),
+        let perd_les_donnees = Controles {
+            copier: |de, vers| {
+                if de.ends_with("manifest.json") {
+                    std::fs::File::create(vers).map(|_| ())
+                } else {
+                    copier_durablement(de, vers)
+                }
+            },
             ..controles(Some(4096))
         };
         let err = inst
-            .installer(&neuf, &web_en_echec)
-            .expect_err("l'échec de web/ n'est pas remonté");
+            .installer(&neuf, &perd_les_donnees)
+            .expect_err("un web/ avec un fichier vide a été mis en place");
         assert!(
-            err.contains("previous binary restored"),
-            "l'ancien binaire n'a pas été remis après l'échec de web/ : {err}"
+            err.contains("invalid web: manifest.json is empty (0 bytes)"),
+            "le fichier vide n'est pas nommé : {err}"
         );
+        assert!(err.contains("previous binary and web/ kept"), "{err}");
         inst.ancien_intact();
         assert!(!inst.binaire.with_extension("old").exists());
+        assert!(!inst.opt().join("web.old").exists());
+    }
+
+    /// Une archive qui donne elle-même un fichier essentiel vide, ou pas
+    /// d'`index.html` : refus, rien n'est touché.
+    #[test]
+    fn un_web_sans_index_ou_avec_un_essentiel_vide_est_refuse() {
+        let inst = Installation::nouvelle();
+        let neuf = inst.extrait(&faux_elf(machine_hote(), 4096));
+        let source = inst.extraction.join("web");
+        std::fs::write(source.join("sw.js"), "").unwrap();
+        let err = inst
+            .installer(&neuf, &controles(Some(4096)))
+            .expect_err("un web/ avec sw.js vide a été mis en place");
+        assert!(
+            err.contains("invalid web: sw.js is empty (0 bytes)"),
+            "{err}"
+        );
+        inst.ancien_intact();
+
+        std::fs::write(source.join("sw.js"), "self").unwrap();
+        std::fs::remove_file(source.join("index.html")).unwrap();
+        let err = inst
+            .installer(&neuf, &controles(Some(4096)))
+            .expect_err("un web/ sans index.html a été mis en place");
+        assert!(err.contains("invalid web: index.html missing"), "{err}");
+        inst.ancien_intact();
+    }
+
+    /// Une coupure pendant la copie de `web/` : la copie s'arrête au milieu
+    /// d'un fichier. Le binaire n'a pas encore été touché ; ni l'ancien
+    /// binaire ni l'ancien `web/` ne bougent, et aucun `.new` ne traîne.
+    #[test]
+    fn une_coupure_pendant_la_copie_de_web_laisse_l_installation_d_avant() {
+        let inst = Installation::nouvelle();
+        let neuf = inst.extrait(&faux_elf(machine_hote(), 4096));
+        let coupure = Controles {
+            copier: |de, vers| {
+                if de.ends_with("assets/app.js") {
+                    let moitie = &std::fs::read(de)?[..10];
+                    std::fs::write(vers, moitie)?;
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "coupure"));
+                }
+                copier_durablement(de, vers)
+            },
+            ..controles(Some(4096))
+        };
+        let err = inst
+            .installer(&neuf, &coupure)
+            .expect_err("la coupure pendant la copie de web/ n'est pas remontée");
+        assert!(err.contains("stage new web/"), "{err}");
+        assert!(err.contains("coupure"), "{err}");
+        assert!(err.contains("previous binary and web/ kept"), "{err}");
+        inst.ancien_intact();
+        assert!(!inst.binaire.with_extension("old").exists());
+    }
+
+    /// Un échec pendant la bascule, après celle du binaire et du `web/`
+    /// servi (ici le renommage du `web/` de repli) : binaire ET `web/` sont
+    /// remis ensemble, jamais un ancien binaire avec un `web/` neuf.
+    #[test]
+    fn un_echec_de_bascule_remet_le_binaire_et_web_ensemble() {
+        let inst = Installation::nouvelle();
+        let neuf = inst.extrait(&faux_elf(machine_hote(), 4096));
+        let repli_en_echec = Controles {
+            cibles_web: |exe_dir| vec![exe_dir.join("web"), exe_dir.join("repli")],
+            renommer: |de, vers| {
+                if de.ends_with("repli.new") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Permission denied",
+                    ));
+                }
+                std::fs::rename(de, vers)
+            },
+            ..controles(Some(4096))
+        };
+        let err = inst
+            .installer(&neuf, &repli_en_echec)
+            .expect_err("l'échec de bascule de web/ n'est pas remonté");
+        assert!(err.contains("swap new web/ into"), "{err}");
+        assert!(
+            err.contains("previous binary and web/ restored"),
+            "binaire et web/ n'ont pas été remis ensemble : {err}"
+        );
+        inst.ancien_intact();
+        inst.ancien_web_intact("repli");
+        assert!(!inst.binaire.with_extension("old").exists());
+        assert!(!inst.opt().join("web.old").exists());
+        assert!(!inst.opt().join("repli.old").exists());
     }
 
     #[test]

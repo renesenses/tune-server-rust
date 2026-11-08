@@ -1,5 +1,7 @@
 #[path = "playlists_metadonnees_7738.rs"]
 pub(crate) mod metadonnees_7738;
+#[path = "playlists_remplacement_8066.rs"]
+mod remplacement_8066;
 
 use std::collections::HashSet;
 
@@ -123,6 +125,16 @@ pub fn router() -> Router<AppState> {
                 .put(reorder_tracks),
         )
         .route("/{id}/tracks/remove", post(remove_track))
+        // #8066 — remplacer un titre de service indisponible, à sa place.
+        .route(
+            "/{id}/tracks/{entry_id}/replacements",
+            get(remplacement_8066::candidats_de_la_ligne),
+        )
+        .route(
+            "/{id}/tracks/{entry_id}/replace",
+            post(remplacement_8066::remplacer_la_ligne),
+        )
+        .route("/{id}/repair", post(remplacement_8066::reparer_la_playlist))
         .route("/{id}/duplicate", post(duplicate_playlist))
         .route("/{id}/export", get(export_m3u))
         .route(

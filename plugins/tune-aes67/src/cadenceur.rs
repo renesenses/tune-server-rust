@@ -412,24 +412,119 @@ fn boucle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::horloge::HorlogeSysteme;
+    use crate::horloge::{HorlogeSysteme, horodatage_rtp};
     use std::sync::mpsc::sync_channel;
 
-    /// Attend que le flux soit entièrement parti, puis arrête le fil (qui,
-    /// depuis l'étape E3, survit à la fin d'un flux). Rend la durée d'attente.
-    fn finir(commandes: &Commandes, fil: JoinHandle<()>) -> Duration {
-        let debut = std::time::Instant::now();
-        while !commandes.fini.load(Ordering::Acquire) {
-            assert!(
-                debut.elapsed() < Duration::from_secs(10),
-                "flux jamais fini"
-            );
-            std::thread::sleep(Duration::from_millis(1));
+    /// Plafond de toute attente en temps réel : large, pour qu'une machine
+    /// chargée ne fasse jamais échouer un test juste (#8023). Les durées que
+    /// les tests vérifient sont celles de l'horloge simulée, pas celles-ci.
+    const PLAFOND: Duration = Duration::from_secs(10);
+
+    /// L'instant de départ de l'horloge simulée : un temps PTP réaliste
+    /// (2026), multiple de la milliseconde pour que les horodatages tombent
+    /// juste.
+    const T0_NS: u64 = 1_793_000_000_000_000_000;
+    const MS_NS: u64 = 1_000_000;
+
+    /// Une horloge que seul le test fait avancer (#8023). Avant, les tests
+    /// donnaient au cadenceur l'horloge réelle et se coordonnaient avec son
+    /// fil par des `sleep` : sur une machine chargée, le fil du test perdait
+    /// quelques millisecondes pendant que le fil émetteur continuait d'émettre
+    /// un paquet par milliseconde, et les comptes exacts ne tenaient plus.
+    /// Ici, tant que le test n'avance pas l'horloge, le cadenceur ne peut ni
+    /// émettre, ni prendre de retard, ni compter une sous-alimentation.
+    struct HorlogeManuelle {
+        /// (temps en ns, génération), changés ensemble par [`Self::sauter`].
+        etat: Mutex<(u64, u64)>,
+        /// Lectures de `maintenant_ns` : le fil garé sur une échéance relit
+        /// l'horloge environ chaque milliseconde réelle.
+        lectures: AtomicU64,
+    }
+
+    impl HorlogeManuelle {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                etat: Mutex::new((T0_NS, 0)),
+                lectures: AtomicU64::new(0),
+            })
         }
-        let duree = debut.elapsed();
+        fn avancer_ns(&self, ns: u64) {
+            self.etat.lock().unwrap().0 += ns;
+        }
+        /// Saut d'horloge et nouvelle génération d'un seul coup, comme le
+        /// suiveur PTP quand il se cale sur un maître.
+        fn sauter(&self, ns: u64, generation: u64) {
+            let mut e = self.etat.lock().unwrap();
+            *e = (e.0 + ns, generation);
+        }
+    }
+
+    impl SourceHorloge for HorlogeManuelle {
+        fn maintenant_ns(&self) -> u64 {
+            self.lectures.fetch_add(1, Ordering::AcqRel);
+            self.etat.lock().unwrap().0
+        }
+        fn generation(&self) -> u64 {
+            self.etat.lock().unwrap().1
+        }
+        fn reference(&self) -> crate::horloge::ReferenceHorloge {
+            crate::horloge::ReferenceHorloge::Locale
+        }
+    }
+
+    /// Attend, en temps réel et sous plafond, que `condition` soit vraie.
+    fn attendre_que(quoi: &str, condition: impl Fn() -> bool) {
+        let debut = std::time::Instant::now();
+        while !condition() {
+            assert!(debut.elapsed() < PLAFOND, "{quoi} : pas vu en {PLAFOND:?}");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    fn paquets(stats: &Statistiques) -> u64 {
+        stats.paquets.load(Ordering::Relaxed)
+    }
+
+    /// Attend que le fil ait émis `n` paquets en tout, sans toucher à
+    /// l'horloge (paquet dont l'échéance est déjà là : départ, reprise).
+    fn attendre_paquets(stats: &Statistiques, n: u64) {
+        attendre_que(&format!("{n} paquets émis"), || paquets(stats) >= n);
+        assert_eq!(
+            paquets(stats),
+            n,
+            "paquets émis : un paquet est parti avant son échéance"
+        );
+    }
+
+    /// Avance l'horloge d'une durée de paquet (1 ms) et attend le paquet qui
+    /// arrive alors à échéance : exactement un.
+    fn avancer_d_un_paquet(horloge: &HorlogeManuelle, stats: &Statistiques) {
+        let n = paquets(stats);
+        horloge.avancer_ns(MS_NS);
+        attendre_que(&format!("paquet {n} émis"), || paquets(stats) > n);
+        assert_eq!(
+            paquets(stats),
+            n + 1,
+            "plus d'un paquet parti pour 1 ms d'horloge"
+        );
+    }
+
+    /// Attend que le fil soit garé sur l'échéance de son prochain paquet :
+    /// il relit l'horloge sans rien émettre. Quatre lectures : un fil qui
+    /// n'attendrait pas l'échéance en ferait trois par paquet émis.
+    fn attendre_que_le_fil_attende(horloge: &HorlogeManuelle) {
+        let l = horloge.lectures.load(Ordering::Acquire);
+        attendre_que("fil garé sur l'échéance", || {
+            horloge.lectures.load(Ordering::Acquire) >= l + 4
+        });
+    }
+
+    /// Attend que le flux soit entièrement parti, puis arrête le fil (qui,
+    /// depuis l'étape E3, survit à la fin d'un flux).
+    fn finir(commandes: &Commandes, fil: JoinHandle<()>) {
+        attendre_que("flux fini", || commandes.fini.load(Ordering::Acquire));
         commandes.arret.store(true, Ordering::Release);
         fil.join().unwrap();
-        duree
     }
 
     fn parametres() -> ParametresCadence {
@@ -447,46 +542,39 @@ mod tests {
 
     #[test]
     fn cent_paquets_partent_en_cent_millisecondes_horodates_de_48_en_48() {
-        let ecoute = UdpSocket::bind("127.0.0.1:0").unwrap();
-        ecoute
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        s.connect(ecoute.local_addr().unwrap()).unwrap();
+        let (ecoute, s) = ecoute_et_emetteur();
         let (tx, rx) = sync_channel(200);
         for i in 0..100u8 {
             tx.send(Message::Charge(vec![i; 288])).unwrap();
         }
         tx.send(Message::Fin).unwrap();
+        let horloge = HorlogeManuelle::new();
         let commandes = Arc::new(Commandes::default());
         let stats = Arc::new(Statistiques::default());
-        let debut = std::time::Instant::now();
         let fil = lancer(
             s,
             Some(rx),
-            Arc::new(HorlogeSysteme::new()),
+            horloge.clone(),
             parametres(),
             commandes.clone(),
             stats.clone(),
         )
         .unwrap();
-        let mut recus = Vec::new();
-        let mut t = [0u8; 2048];
-        while recus.len() < 100 {
-            let n = ecoute.recv(&mut t).unwrap();
-            recus.push(t[..n].to_vec());
+        // Le premier part à t = 0, puis un par milliseconde d'horloge :
+        // jamais avant son échéance, ce que vérifiait « au moins 99 ms ».
+        attendre_paquets(&stats, 1);
+        let mut recus = recevoir(&ecoute, 1);
+        for k in 1..100 {
+            attendre_que_le_fil_attende(&horloge);
+            assert_eq!(paquets(&stats), k, "paquet parti avant son échéance");
+            avancer_d_un_paquet(&horloge, &stats);
+            recus.extend(recevoir(&ecoute, 1));
         }
-        let duree = debut.elapsed();
         finir(&commandes, fil);
-        assert!(commandes.fini.load(Ordering::Acquire));
-        // 100 paquets de 1 ms : au moins 99 ms (le premier part à t = 0).
-        assert!(duree >= Duration::from_millis(99), "{duree:?}");
-        let entetes: Vec<EnteteRtp> = recus
-            .iter()
-            .map(|p| EnteteRtp::lire(p).unwrap().0)
-            .collect();
+        let entetes: Vec<EnteteRtp> = recus.iter().map(|(e, _)| *e).collect();
         assert!(entetes[0].marqueur);
         assert!(entetes[1..].iter().all(|e| !e.marqueur));
+        assert_eq!(entetes[0].horodatage, horodatage_rtp(T0_NS, 48_000));
         for (i, paire) in entetes.windows(2).enumerate() {
             assert_eq!(paire[1].sequence, paire[0].sequence.wrapping_add(1), "{i}");
             assert_eq!(
@@ -496,31 +584,28 @@ mod tests {
             );
             assert_eq!(paire[1].ssrc, 0x1234_5678);
         }
-        for (i, p) in recus.iter().enumerate() {
-            assert_eq!(&p[12..], &[i as u8; 288][..]);
+        for (i, (_, c)) in recus.iter().enumerate() {
+            assert_eq!(&c[..], &[i as u8; 288][..]);
         }
         let r = stats.releve();
         assert_eq!(r.paquets, 100);
         assert_eq!(r.trames, 4800);
+        assert_eq!(r.retard_max_us, 0, "parti à l'échéance, pas après");
         assert_eq!(r.sous_alimentations, 0);
         assert_eq!(r.resynchronisations, 0);
     }
 
     #[test]
     fn un_trou_de_pcm_tait_le_flux_puis_repart_marque() {
-        let ecoute = UdpSocket::bind("127.0.0.1:0").unwrap();
-        ecoute
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        s.connect(ecoute.local_addr().unwrap()).unwrap();
+        let (ecoute, s) = ecoute_et_emetteur();
         let (tx, rx) = sync_channel(200);
+        let horloge = HorlogeManuelle::new();
         let commandes = Arc::new(Commandes::default());
         let stats = Arc::new(Statistiques::default());
         let fil = lancer(
             s,
             Some(rx),
-            Arc::new(HorlogeSysteme::new()),
+            horloge.clone(),
             parametres(),
             commandes.clone(),
             stats.clone(),
@@ -529,66 +614,58 @@ mod tests {
         for _ in 0..5 {
             tx.send(Message::Charge(vec![0; 288])).unwrap();
         }
-        std::thread::sleep(Duration::from_millis(50));
+        attendre_paquets(&stats, 1);
+        for _ in 1..5 {
+            avancer_d_un_paquet(&horloge, &stats);
+        }
+        // Tampon vide, mais l'échéance du paquet suivant n'est pas passée :
+        // rien à compter.
+        assert_eq!(
+            stats.releve().sous_alimentations,
+            0,
+            "sous-alimentation comptée avant l'échéance"
+        );
+        // 50 ms sans PCM : une sous-alimentation, une seule.
+        horloge.avancer_ns(50 * MS_NS);
+        attendre_que("sous-alimentation comptée", || {
+            stats.sous_alimentations.load(Ordering::Relaxed) >= 1
+        });
         for _ in 0..5 {
             tx.send(Message::Charge(vec![0; 288])).unwrap();
         }
         tx.send(Message::Fin).unwrap();
-        finir(&commandes, fil);
-        let mut t = [0u8; 2048];
-        let mut entetes = Vec::new();
-        for _ in 0..10 {
-            let n = ecoute.recv(&mut t).unwrap();
-            entetes.push(EnteteRtp::lire(&t[..n]).unwrap().0);
+        // La reprise part tout de suite, sur une origine neuve.
+        attendre_paquets(&stats, 6);
+        for _ in 6..10 {
+            avancer_d_un_paquet(&horloge, &stats);
         }
+        finir(&commandes, fil);
+        let entetes: Vec<EnteteRtp> = recevoir(&ecoute, 10).iter().map(|(e, _)| *e).collect();
         assert!(entetes[0].marqueur && entetes[5].marqueur);
+        assert!(
+            entetes[1..5]
+                .iter()
+                .chain(&entetes[6..])
+                .all(|e| !e.marqueur)
+        );
         assert_eq!(entetes[5].sequence, entetes[4].sequence.wrapping_add(1));
-        // ~50 ms de silence : l'horodatage a sauté d'environ 2400 trames.
+        // Paquet 4 à t = 4 ms, reprise à t = 54 ms : +50 ms, 2400 trames.
         let saut = entetes[5].horodatage.wrapping_sub(entetes[4].horodatage);
-        assert!(saut > 48 * 20, "saut {saut}");
+        assert_eq!(saut, 48 * 50, "saut d'horodatage");
         let r = stats.releve();
         assert_eq!(r.sous_alimentations, 1);
         assert_eq!(r.resynchronisations, 1);
     }
 
-    /// Une horloge système qu'on peut faire sauter, génération à l'appui,
-    /// comme le suiveur PTP quand il se cale sur un maître.
-    struct HorlogeQuiSaute {
-        base: HorlogeSysteme,
-        saut_ns: AtomicU64,
-        generation: AtomicU64,
-    }
-
-    impl SourceHorloge for HorlogeQuiSaute {
-        fn maintenant_ns(&self) -> u64 {
-            self.base.maintenant_ns() + self.saut_ns.load(Ordering::Acquire)
-        }
-        fn reference(&self) -> crate::horloge::ReferenceHorloge {
-            crate::horloge::ReferenceHorloge::Locale
-        }
-        fn generation(&self) -> u64 {
-            self.generation.load(Ordering::Acquire)
-        }
-    }
-
     #[test]
     fn un_changement_de_generation_repart_d_une_origine_marquee_sur_la_nouvelle_echelle() {
-        let ecoute = UdpSocket::bind("127.0.0.1:0").unwrap();
-        ecoute
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        s.connect(ecoute.local_addr().unwrap()).unwrap();
+        let (ecoute, s) = ecoute_et_emetteur();
         let (tx, rx) = sync_channel(400);
         for _ in 0..200 {
             tx.send(Message::Charge(vec![0; 288])).unwrap();
         }
         tx.send(Message::Fin).unwrap();
-        let horloge = Arc::new(HorlogeQuiSaute {
-            base: HorlogeSysteme::new(),
-            saut_ns: AtomicU64::new(0),
-            generation: AtomicU64::new(0),
-        });
+        let horloge = HorlogeManuelle::new();
         let stats = Arc::new(Statistiques::default());
         let mut p = parametres();
         p.decalage_media = 1000;
@@ -602,26 +679,25 @@ mod tests {
             stats.clone(),
         )
         .unwrap();
-        let mut t = [0u8; 2048];
-        let mut entetes = Vec::new();
-        for _ in 0..50 {
-            let n = ecoute.recv(&mut t).unwrap();
-            entetes.push(EnteteRtp::lire(&t[..n]).unwrap().0);
+        attendre_paquets(&stats, 1);
+        let mut entetes: Vec<EnteteRtp> = recevoir(&ecoute, 1).iter().map(|(e, _)| *e).collect();
+        for _ in 1..50 {
+            avancer_d_un_paquet(&horloge, &stats);
+            entetes.extend(recevoir(&ecoute, 1).iter().map(|(e, _)| *e));
         }
-        // Saut d'une heure, comme un calage PTP : nouvelle génération.
+        // Saut d'une heure, comme un calage PTP : nouvelle génération, posée
+        // en même temps que le temps. Le paquet 50 part tout de suite, sur
+        // la nouvelle échelle.
         const HEURE_NS: u64 = 3_600_000_000_000;
-        horloge.saut_ns.store(HEURE_NS, Ordering::Release);
-        horloge.generation.store(1, Ordering::Release);
-        let apres_saut = horloge.maintenant_ns();
-        for _ in 50..200 {
-            let n = ecoute.recv(&mut t).unwrap();
-            entetes.push(EnteteRtp::lire(&t[..n]).unwrap().0);
+        horloge.sauter(HEURE_NS, 1);
+        let apres_saut = T0_NS + 49 * MS_NS + HEURE_NS;
+        attendre_paquets(&stats, 51);
+        entetes.extend(recevoir(&ecoute, 1).iter().map(|(e, _)| *e));
+        for _ in 51..200 {
+            avancer_d_un_paquet(&horloge, &stats);
+            entetes.extend(recevoir(&ecoute, 1).iter().map(|(e, _)| *e));
         }
         finir(&commandes, fil);
-        // Le temps et la génération sont lus séparément : selon l'ordre vu
-        // par le fil, la rupture peut passer par la garde de retard puis par
-        // la génération (deux origines coup sur coup). C'est la DERNIÈRE
-        // origine marquée qui porte la nouvelle échelle.
         let marques: Vec<usize> = entetes
             .iter()
             .enumerate()
@@ -629,19 +705,15 @@ mod tests {
             .filter(|(_, e)| e.marqueur)
             .map(|(i, _)| i)
             .collect();
-        let rupture = *marques.last().expect("un paquet marqué après le saut");
-        assert!(marques[0] >= 50, "rupture au paquet {}", marques[0]);
-        assert!(marques.len() <= 2, "{marques:?}");
+        assert_eq!(marques, vec![50], "une seule origine, au paquet 50");
         // Après la rupture, l'horodatage suit la nouvelle échelle (+1 h, soit
         // 172 800 000 trames de plus, modulo 2³²) avec le décalage annoncé.
         let attendu = horodatage_rtp_decale(apres_saut, 48_000, 1000);
-        let ecart = entetes[rupture].horodatage.wrapping_sub(attendu) as i32;
-        assert!(ecart.abs() < 48 * 20, "écart {ecart} trames");
-        for paire in entetes[rupture..].windows(2) {
+        assert_eq!(entetes[50].horodatage, attendu);
+        for paire in entetes[50..].windows(2) {
             assert_eq!(paire[1].horodatage, paire[0].horodatage.wrapping_add(48));
         }
-        let r = stats.releve().resynchronisations;
-        assert!((1..=2).contains(&r), "{r}");
+        assert_eq!(stats.releve().resynchronisations, 1);
     }
 
     #[test]
@@ -666,9 +738,7 @@ mod tests {
 
     fn ecoute_et_emetteur() -> (UdpSocket, UdpSocket) {
         let ecoute = UdpSocket::bind("127.0.0.1:0").unwrap();
-        ecoute
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        ecoute.set_read_timeout(Some(PLAFOND)).unwrap();
         let s = UdpSocket::bind("127.0.0.1:0").unwrap();
         s.connect(ecoute.local_addr().unwrap()).unwrap();
         (ecoute, s)
@@ -717,12 +787,13 @@ mod tests {
         // +48, le paquet 6 recouvrait 90 % du paquet 5.
         let (ecoute, s) = ecoute_et_emetteur();
         let (tx, rx) = sync_channel(200);
+        let horloge = HorlogeManuelle::new();
         let commandes = Arc::new(Commandes::default());
         let stats = Arc::new(Statistiques::default());
         let fil = lancer(
             s,
             Some(rx),
-            Arc::new(HorlogeSysteme::new()),
+            horloge.clone(),
             parametres(),
             commandes.clone(),
             stats.clone(),
@@ -733,19 +804,28 @@ mod tests {
             for _ in 0..5 {
                 tx.send(Message::Charge(vec![tour; 288])).unwrap();
             }
+            for k in 0..5 {
+                if tour == 0 && k == 0 {
+                    attendre_paquets(&stats, 1);
+                } else {
+                    avancer_d_un_paquet(&horloge, &stats);
+                }
+            }
             recus.extend(recevoir(&ecoute, 5));
         }
         tx.send(Message::Fin).unwrap();
         finir(&commandes, fil);
         let entetes: Vec<EnteteRtp> = recus.iter().map(|(e, _)| *e).collect();
-        println!(
-            "pas = {:?}",
-            entetes
-                .windows(2)
-                .map(|p| p[1].horodatage.wrapping_sub(p[0].horodatage) as i32)
-                .collect::<Vec<_>>()
-        );
         verifier_la_continuite(&entetes);
+        // Le PCM est toujours arrivé avant l'échéance : aucune origine neuve.
+        assert!(entetes[0].marqueur);
+        let marques: Vec<usize> = (1..entetes.len())
+            .filter(|&i| entetes[i].marqueur)
+            .collect();
+        assert!(marques.is_empty(), "paquets marqués : {marques:?}");
+        let r = stats.releve();
+        assert_eq!(r.sous_alimentations, 0);
+        assert_eq!(r.resynchronisations, 0);
     }
 
     #[test]
@@ -798,43 +878,47 @@ mod tests {
         for _ in 0..300 {
             tx.send(Message::Charge(vec![1; 288])).unwrap();
         }
+        let horloge = HorlogeManuelle::new();
         let commandes = Arc::new(Commandes::default());
         let stats = Arc::new(Statistiques::default());
+        // Un prétampon de quatre paquets : à la pose du nouveau flux, le fil
+        // tient encore trois charges de l'ancien, qui doivent être jetées.
+        let mut p = parametres();
+        p.pretampon_paquets = 4;
         let fil = lancer(
             s,
             Some(rx),
-            Arc::new(HorlogeSysteme::new()),
-            parametres(),
+            horloge.clone(),
+            p,
             commandes.clone(),
             stats.clone(),
         )
         .unwrap();
+        attendre_paquets(&stats, 1);
+        for _ in 1..20 {
+            avancer_d_un_paquet(&horloge, &stats);
+        }
         let mut recus = recevoir(&ecoute, 20);
         let (tx2, rx2) = sync_channel(400);
         for _ in 0..30 {
             tx2.send(Message::Charge(vec![2; 288])).unwrap();
         }
         tx2.send(Message::Fin).unwrap();
+        // Le fil attend l'échéance du paquet 20, déjà tiré de l'ancien flux.
+        attendre_que_le_fil_attende(&horloge);
         commandes.installer(7, Some(rx2));
-        // Au plus un paquet de l'ancien flux part encore (celui qui
+        // Exactement un paquet de l'ancien flux part encore (celui qui
         // attendait son échéance), puis les 30 du nouveau.
-        let mut t = [0u8; 2048];
-        loop {
-            let n = ecoute.recv(&mut t).unwrap();
-            let (e, c) = EnteteRtp::lire(&t[..n]).unwrap();
-            let nouveau = c[0] == 2;
-            recus.push((e, c.to_vec()));
-            if nouveau {
-                break;
-            }
+        while recus.iter().filter(|(_, c)| c[0] == 2).count() < 30 {
+            avancer_d_un_paquet(&horloge, &stats);
+            recus.extend(recevoir(&ecoute, 1));
         }
-        recus.extend(recevoir(&ecoute, 29));
         finir(&commandes, fil);
         drop(tx);
         let premier_nouveau = recus.iter().position(|(_, c)| c[0] == 2).unwrap();
-        assert!(
-            premier_nouveau <= 21,
-            "{premier_nouveau} paquets de l'ancien flux"
+        assert_eq!(
+            premier_nouveau, 21,
+            "{premier_nouveau} paquets de l'ancien flux (21 attendus)"
         );
         assert!(
             recus[premier_nouveau].0.marqueur,
@@ -860,50 +944,53 @@ mod tests {
             tx.send(Message::Charge(vec![i; 288])).unwrap();
         }
         tx.send(Message::Fin).unwrap();
+        let horloge = HorlogeManuelle::new();
         let commandes = Arc::new(Commandes::default());
+        let stats = Arc::new(Statistiques::default());
         let fil = lancer(
             s,
             Some(rx),
-            Arc::new(HorlogeSysteme::new()),
+            horloge.clone(),
             parametres(),
             commandes.clone(),
-            Arc::new(Statistiques::default()),
+            stats.clone(),
         )
         .unwrap();
-        let mut recus = recevoir(&ecoute, 30);
-        commandes.pause.store(true, Ordering::Release);
-        std::thread::sleep(Duration::from_millis(60));
-        // Au plus un paquet a pu partir après l'ordre de pause.
-        ecoute
-            .set_read_timeout(Some(Duration::from_millis(5)))
-            .unwrap();
-        let mut t = [0u8; 2048];
-        while let Ok(n) = ecoute.recv(&mut t) {
-            let (e, c) = EnteteRtp::lire(&t[..n]).unwrap();
-            recus.push((e, c.to_vec()));
+        attendre_paquets(&stats, 1);
+        for _ in 1..30 {
+            avancer_d_un_paquet(&horloge, &stats);
         }
-        assert!(
-            recus.len() <= 31,
-            "{} paquets avant la reprise",
-            recus.len()
-        );
-        ecoute
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        // Le fil attend l'échéance du paquet 30, déjà tiré du canal : c'est
+        // le seul qui peut encore partir après l'ordre de pause.
+        attendre_que_le_fil_attende(&horloge);
+        commandes.pause.store(true, Ordering::Release);
+        avancer_d_un_paquet(&horloge, &stats);
+        // 60 ms de pause, milliseconde par milliseconde : rien ne part.
+        for _ in 0..60 {
+            horloge.avancer_ns(MS_NS);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(paquets(&stats), 31, "paquets avant la reprise");
+        let mut recus = recevoir(&ecoute, 31);
         let avant = recus.len();
         commandes.pause.store(false, Ordering::Release);
+        // La reprise part tout de suite, sur une origine neuve.
+        attendre_paquets(&stats, 32);
+        for _ in 32..100 {
+            avancer_d_un_paquet(&horloge, &stats);
+        }
         recus.extend(recevoir(&ecoute, 100 - avant));
         finir(&commandes, fil);
         let entetes: Vec<EnteteRtp> = recus.iter().map(|(e, _)| *e).collect();
         verifier_la_continuite(&entetes);
         assert!(entetes[avant].marqueur, "la reprise repart marquée");
+        // Paquet 30 à t = 30 ms, reprise à t = 90 ms : l'horloge média a
+        // avancé de 60 ms pendant la pause.
         let saut = entetes[avant]
             .horodatage
             .wrapping_sub(entetes[avant - 1].horodatage);
-        assert!(
-            saut >= 48 * 55,
-            "l'horloge média a avancé pendant la pause : +{saut}"
-        );
+        assert_eq!(saut, 48 * 60, "l'horloge média a avancé pendant la pause");
         // Toutes les charges, dans l'ordre, aucune perdue ni doublée.
         for (i, (_, c)) in recus.iter().enumerate() {
             assert_eq!(c[0], i as u8);

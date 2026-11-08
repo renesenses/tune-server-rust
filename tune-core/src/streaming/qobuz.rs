@@ -695,7 +695,7 @@ pub(crate) fn isrcs_normalises(isrcs: &[String]) -> Vec<String> {
     vus
 }
 
-fn id_qobuz(v: &serde_json::Value) -> Option<String> {
+pub(crate) fn id_qobuz(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
         serde_json::Value::Number(n) => Some(n.to_string()),
@@ -2273,6 +2273,33 @@ impl QobuzService {
         }
     }
 
+    /// L'année d'un album Qobuz : `released_at`, à défaut
+    /// `release_date_original`. Partagée par la fiche d'album et par l'année
+    /// des pistes (#8062), pour que les deux écrans disent la même année.
+    fn annee_d_album(item: &serde_json::Value) -> Option<u32> {
+        item["released_at"]
+            .as_u64()
+            .map(|ts| 1970 + (ts / 31_536_000) as u32)
+            .or_else(|| {
+                item["release_date_original"]
+                    .as_str()
+                    .and_then(|d| d.get(..4)?.parse().ok())
+            })
+    }
+
+    /// #8062 — l'année et le genre qu'un objet album Qobuz publie : le
+    /// sous-objet `album` d'une piste de playlist, ou la réponse d'`album/get`.
+    fn annee_et_genre(album: &serde_json::Value) -> AnneeEtGenre {
+        AnneeEtGenre {
+            year: Self::annee_d_album(album),
+            genre: album["genre"]["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+                .map(Into::into),
+        }
+    }
+
     /// #6063 — le type de sortie d'un album Qobuz : celui que Qobuz annonce
     /// (`release_type`), corrigé par le titre et la règle des pistes quand
     /// Qobuz dit « album » ou ne dit rien
@@ -2349,14 +2376,7 @@ impl QobuzService {
             artist: item["artist"]["name"].as_str().unwrap_or("").into(),
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
             cover_path: Self::pochette(item),
-            year: item["released_at"]
-                .as_u64()
-                .map(|ts| 1970 + (ts / 31_536_000) as u32)
-                .or_else(|| {
-                    item["release_date_original"]
-                        .as_str()
-                        .and_then(|d| d.get(..4)?.parse().ok())
-                }),
+            year: Self::annee_d_album(item),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
             quality: item["maximum_bit_depth"].as_u64().map(|bd| StreamQuality {
                 codec: "FLAC".into(),
@@ -2377,6 +2397,8 @@ impl QobuzService {
             // l'album, tel que `album/get` le rend (booléen). Une autre forme
             // ou l'absence : on ne conclut rien.
             ai_generated: item["ai_generated"].as_bool(),
+            // #8088 — le marquage explicite de l'album, comme celui des pistes.
+            explicit: item["parental_warning"].as_bool(),
         }
     }
 
@@ -3342,6 +3364,18 @@ impl StreamingService for QobuzService {
         Ok(Self::map_album(&data))
     }
 
+    /// #8062 — l'année et le genre sont ceux de l'album, au niveau supérieur
+    /// d'`album/get`. Le second `detail_album` sort du cache que le premier
+    /// vient de remplir : pas de second appel à Qobuz.
+    async fn get_album_tracks_avec_annee_et_genre(
+        &self,
+        album_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
+        let pistes = self.get_album_tracks(album_id).await?;
+        let extras = Self::annee_et_genre(&self.detail_album(album_id).await?);
+        Ok(pistes.into_iter().map(|t| (t, extras.clone())).collect())
+    }
+
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self.detail_album(album_id).await?;
         // Qobuz album/get returns album metadata at the top level while
@@ -3458,6 +3492,20 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Ok(self
+            .get_playlist_tracks_avec_annee_et_genre(playlist_id)
+            .await?
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect())
+    }
+
+    /// #8062 — chaque piste de `playlist/get` porte son sous-objet `album`, avec
+    /// `released_at` et `genre` : la même réponse donne l'année et le genre.
+    async fn get_playlist_tracks_avec_annee_et_genre(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
         // La JUMELLE de `/album/get` (#2867). Le `limit=500` écrit ici n'était
         // pas une marge confortable : c'est le PLAFOND DUR de Qobuz, mesuré —
         // `limit=1000` en rend 500. Une playlist de plus de 500 titres était
@@ -3471,7 +3519,12 @@ impl StreamingService for QobuzService {
             .await?;
         let tracks = data["tracks"]["items"]
             .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| (Self::map_track(item), Self::annee_et_genre(&item["album"])))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(tracks)
     }
@@ -4053,6 +4106,36 @@ impl StreamingService for QobuzService {
         self.langue_magasin.clone()
     }
 
+    /// #8077 — `album/search` sur « artiste titre ». Le jugement est fait
+    /// par `library::apports_service`.
+    async fn albums_par_titre(
+        &self,
+        artiste: &str,
+        titre: &str,
+    ) -> Result<Vec<CandidatAlbum>, TuneError> {
+        let requete = format!("{} {}", artiste.trim(), titre.trim());
+        if requete.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let data = self
+            .api_get(
+                "/album/search",
+                &[("query", requete.trim()), ("limit", "25")],
+            )
+            .await?;
+        Ok(super::qobuz_apports::candidats_de_la_recherche(&data))
+    }
+
+    /// #8077 — la fiche complète, depuis `detail_album` (cache de 5 min,
+    /// pistes paginées).
+    async fn fiche_album_service(
+        &self,
+        album_id: &str,
+    ) -> Result<Option<FicheAlbumService>, TuneError> {
+        let data = self.detail_album(album_id).await?;
+        Ok(super::qobuz_apports::fiche_de_l_album(&data))
+    }
+
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         let items = self.favoris_bruts("tracks").await?;
         Ok(items.iter().map(Self::map_track).collect())
@@ -4380,6 +4463,119 @@ impl StreamingService for QobuzService {
         )
         .await?;
         Ok(ptids.len())
+    }
+
+    /// #8066 — remplacer le titre au rang `rang` sans le déplacer.
+    ///
+    /// Qobuz n'a pas d'écriture « remplacer » : on AJOUTE le nouveau titre
+    /// (`/playlist/addTracks`, en fin de liste), on le place AVANT l'ancien
+    /// (`/playlist/updateTracksPosition`, `insert_before` = rang), on relit
+    /// pour vérifier qu'il est bien au rang dit, l'ancien juste après, et
+    /// seulement alors on retire l'ancien par son `playlist_track_id`. Si le
+    /// déplacement n'a pas pris, c'est le titre AJOUTÉ qui est retiré : la
+    /// playlist reste celle d'avant, rien n'est perdu.
+    async fn replace_playlist_track(
+        &self,
+        playlist_id: &str,
+        rang: usize,
+        ancien: &str,
+        nouveau: &str,
+    ) -> Result<(), TuneError> {
+        let lire = || async {
+            let data = self
+                .detail_pagine(
+                    "/playlist/get",
+                    &[("playlist_id", playlist_id), ("extra", "tracks")],
+                    "tracks",
+                )
+                .await?;
+            Ok::<Vec<(String, Option<u64>)>, TuneError>(
+                data["tracks"]["items"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|it| {
+                                let id = it["id"]
+                                    .as_u64()
+                                    .map(|n| n.to_string())
+                                    .or_else(|| it["id"].as_str().map(Into::into))
+                                    .unwrap_or_default();
+                                (id, it["playlist_track_id"].as_u64())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        };
+        let avant = lire().await?;
+        let Some((id_vu, Some(ptid_ancien))) = avant.get(rang).cloned() else {
+            return Err(TuneError::NotFound(format!(
+                "qobuz: aucun titre au rang {rang} de la playlist {playlist_id}"
+            )));
+        };
+        if id_vu != ancien {
+            return Err(TuneError::Other(format!(
+                "qobuz: la playlist a changé (rang {rang} : {id_vu}, attendu {ancien})"
+            )));
+        }
+        let connus: std::collections::HashSet<u64> = avant.iter().filter_map(|(_, p)| *p).collect();
+        self.api_post(
+            "/playlist/addTracks",
+            &[("playlist_id", playlist_id), ("track_ids", nouveau)],
+        )
+        .await?;
+        let ptid_nouveau = lire()
+            .await?
+            .into_iter()
+            .find_map(|(id, p)| p.filter(|p| id == nouveau && !connus.contains(p)))
+            .ok_or_else(|| {
+                TuneError::Other(format!("qobuz: le titre {nouveau} n'a pas été ajouté"))
+            })?;
+        self.api_post(
+            "/playlist/updateTracksPosition",
+            &[
+                ("playlist_id", playlist_id),
+                ("playlist_track_ids", &ptid_nouveau.to_string()),
+                ("insert_before", &rang.to_string()),
+            ],
+        )
+        .await?;
+        // Le déplacement est VÉRIFIÉ avant de retirer l'ancien : s'il n'a pas
+        // pris, on retire le titre ajouté et la playlist reste celle d'avant.
+        let deplace = lire().await?;
+        let confirme = deplace
+            .get(rang)
+            .is_some_and(|(id, p)| id == nouveau && *p == Some(ptid_nouveau))
+            && deplace
+                .get(rang + 1)
+                .is_some_and(|(_, p)| *p == Some(ptid_ancien));
+        let (a_retirer, issue) = if confirme {
+            (ptid_ancien, Ok(()))
+        } else {
+            (
+                ptid_nouveau,
+                Err(TuneError::Other(format!(
+                    "qobuz: position non confirmée au rang {rang} ; ajout annulé, playlist inchangée"
+                ))),
+            )
+        };
+        self.api_post(
+            "/playlist/deleteTracks",
+            &[
+                ("playlist_id", playlist_id),
+                ("playlist_track_ids", &a_retirer.to_string()),
+            ],
+        )
+        .await?;
+        issue?;
+        let apres = lire().await?;
+        match apres.get(rang) {
+            Some((id, _)) if id == nouveau => Ok(()),
+            autre => Err(TuneError::Other(format!(
+                "qobuz: remplacement écrit mais position non confirmée (rang {rang} : {autre:?})"
+            ))),
+        }
     }
 
     fn supports_write(&self) -> bool {
@@ -4781,6 +4977,32 @@ mod tests {
     }
 
     #[test]
+    /// #8062 — une piste de `playlist/get` porte l'année et le genre de son
+    /// album ; un album sans genre ni date n'invente rien.
+    #[test]
+    fn annee_et_genre_d_une_piste_de_playlist_8062() {
+        let item = json!({
+            "id": 8062001,
+            "title": "So What",
+            "album": {
+                "id": "a8062",
+                "release_date_original": "1959-08-17",
+                "genre": { "id": 80, "name": "Jazz" }
+            }
+        });
+        assert_eq!(
+            QobuzService::annee_et_genre(&item["album"]),
+            AnneeEtGenre {
+                year: Some(1959),
+                genre: Some("Jazz".into())
+            }
+        );
+        assert_eq!(
+            QobuzService::annee_et_genre(&json!({ "genre": { "name": "  " } })),
+            AnneeEtGenre::default()
+        );
+    }
+
     /// Point 10 — la disponibilité voyage jusqu'au client : dans un album
     /// annoncé, le single sorti se joue et le reste est grisé.
     #[test]
@@ -5274,6 +5496,28 @@ mod tests {
             "ai_generated": true,
             "release_tags": [],
         })
+    }
+
+    #[test]
+    fn map_album_lit_le_marquage_explicite_de_qobuz_8088() {
+        let explicite = QobuzService::map_album(&json!({"id": "1", "parental_warning": true}));
+        assert_eq!(explicite.explicit, Some(true));
+        assert_eq!(
+            serde_json::to_value(&explicite).unwrap()["explicit"],
+            json!(true)
+        );
+        let propre = QobuzService::map_album(&json!({"id": "2", "parental_warning": false}));
+        assert_eq!(propre.explicit, Some(false));
+        let muet = QobuzService::map_album(&json!({"id": "3"}));
+        assert_eq!(muet.explicit, None);
+        assert!(
+            serde_json::to_value(&muet)
+                .unwrap()
+                .get("explicit")
+                .is_none()
+        );
+        let piste = QobuzService::map_track(&json!({"id": 4, "parental_warning": true}));
+        assert!(piste.explicit);
     }
 
     #[test]
@@ -8504,6 +8748,10 @@ mod tests_favoris_en_vol {
 /// renesenses/tune-web-client#2097 — `/playlist/getUserPlaylists` mélange les
 /// playlists de l'utilisateur et celles qu'il suit ; seules les premières
 /// acceptent un ajout (Qobuz refuse les autres en 401).
+#[cfg(test)]
+#[path = "qobuz_remplacement_8066_tests.rs"]
+mod remplacement_8066_tests;
+
 #[cfg(test)]
 mod tests_playlists_proprietaire_2097 {
     use super::*;

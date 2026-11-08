@@ -79,6 +79,13 @@ struct DecisionLocale {
     fmt: String,
     zone: Option<crate::db::zone_repo::Zone>,
     needs_transcode: bool,
+    /// #7986 — les motifs qui ont rendu `needs_transcode` vrai, nommés comme
+    /// les drapeaux de [`MotifsDeTranscodage`] ; vide en passthrough. Écrits
+    /// sous `motifs=` dans `transcode_required`.
+    motifs_de_transcodage: Vec<&'static str>,
+    /// #7986 — ce qui a allumé `eq_forces_transcode` : `egaliseur`,
+    /// `correction_de_piece`, `replaygain`. Écrit sous `traitements=`.
+    traitements_de_zone: Vec<&'static str>,
     /// #4800 — l'en-tête NEUF sous lequel servir ce FLAC tel quel, quand la
     /// règle de #4350 s'applique (`Lavf` sans MD5 vers le réseau) et que
     /// rien d'autre n'impose un transcodage : `fLaC`, STREAMINFO recopié,
@@ -208,9 +215,36 @@ struct Traitement {
     needs_downsample: bool,
     sortie_tire_le_flux: bool,
     eq_forces_transcode: bool,
+    traitements_de_zone: TraitementsDeZone,
     browser_needs_wav: bool,
     dsp_progressif_wav: bool,
     flux_wav_reseau: bool,
+}
+
+/// #7986 — les traitements de zone qui allument `eq_forces_transcode`, chacun
+/// lu séparément pour que le journal dise LEQUEL a forcé le transcodage.
+#[derive(Clone, Copy, Default)]
+struct TraitementsDeZone {
+    egaliseur: bool,
+    correction_de_piece: bool,
+    replaygain: bool,
+}
+
+impl TraitementsDeZone {
+    fn un_au_moins(self) -> bool {
+        self.egaliseur || self.correction_de_piece || self.replaygain
+    }
+
+    fn noms(self) -> Vec<&'static str> {
+        [
+            (self.egaliseur, "egaliseur"),
+            (self.correction_de_piece, "correction_de_piece"),
+            (self.replaygain, "replaygain"),
+        ]
+        .into_iter()
+        .filter_map(|(vrai, nom)| vrai.then_some(nom))
+        .collect()
+    }
 }
 
 /// Deuxième temps de `decider_la_lecture_locale` : les familles de sortie.
@@ -258,6 +292,31 @@ fn reconnaitre_les_sorties(
         is_local_output,
         local_needs_wav,
         is_network_output,
+    }
+}
+
+/// #5975 — la durée qui fixe la longueur annoncée d'une conversion.
+///
+/// Une base qui n'a pas su lire la durée (0) laisse la conversion WAV sans
+/// longueur : chunkée, sans `Content-Range`, ce que Safari refuse et qui prive
+/// tout renderer de la taille du fichier (#2189). On la relit alors dans le
+/// fichier. Une tranche CUE garde la sienne (le fichier est l'image entière),
+/// une image ISO aussi (le chemin n'est pas ouvrable tel quel).
+fn duree_de_la_piste_ms(duree_en_base: i64, file_path: &str, tranche: bool) -> i64 {
+    if duree_en_base > 0 || tranche || crate::audio::iso9660::est_chemin_virtuel(file_path) {
+        return duree_en_base;
+    }
+    match crate::metadata::probe_duration_ms(std::path::Path::new(file_path)) {
+        Some(ms) => {
+            info!(
+                file = %file_path,
+                duree_ms = ms,
+                "duree_relue_dans_le_fichier — la base ignore la durée de la piste ; \
+                 relue dans le fichier pour annoncer la longueur de la conversion (#5975)"
+            );
+            ms as i64
+        }
+        None => duree_en_base,
     }
 }
 
@@ -320,12 +379,13 @@ fn assembler_la_decision(
         needs_downsample,
         sortie_tire_le_flux,
         eq_forces_transcode,
+        traitements_de_zone,
         browser_needs_wav,
         dsp_progressif_wav,
         flux_wav_reseau,
     } = traitement;
 
-    let needs_transcode = transcodage_requis(&MotifsDeTranscodage {
+    let motifs = MotifsDeTranscodage {
         needs_transcode_for_output,
         oaat_needs_wav,
         local_needs_wav,
@@ -359,7 +419,9 @@ fn assembler_la_decision(
         // #5299 — le passthrough servirait le fichier par son chemin, que le
         // serveur HTTP ne sait pas ouvrir dans une image.
         dans_une_image_iso: crate::audio::iso9660::est_chemin_virtuel(&file_path),
-    });
+    };
+    let needs_transcode = transcodage_requis(&motifs);
+    let motifs_de_transcodage = motifs.motifs_actifs();
     if flac_ffmpeg_vers_le_reseau && needs_transcode {
         // Le conteneur neuf n'a pas pu être préparé, ou un autre motif
         // transcode de toute façon : la voie de #4350, décodage puis
@@ -376,7 +438,8 @@ fn assembler_la_decision(
         info!(zone_id = req.zone_id, "eq_active_forcing_network_transcode");
     }
 
-    let track_duration_ms = track.duration_ms;
+    let track_duration_ms =
+        duree_de_la_piste_ms(track.duration_ms, &file_path, tranche_cue.is_some());
     let track_file_size = track.file_size;
     DecisionLocale {
         bit_depth,
@@ -407,6 +470,8 @@ fn assembler_la_decision(
         fmt,
         zone,
         needs_transcode,
+        motifs_de_transcodage,
+        traitements_de_zone: traitements_de_zone.noms(),
         // Sans objet dès qu'un transcodage a lieu : le bras fichier décode
         // et ré-encode, l'en-tête neuf ne sert qu'au passthrough.
         conteneur_flac_neuf: conteneur_flac_neuf.filter(|_| !needs_transcode),
@@ -798,6 +863,42 @@ impl PlaybackOrchestrator {
             }
         }
 
+        // Sur le tas (`Box::pin`), comme l'appel du prêt de sorties : le futur
+        // de la décision est gros, et le porter deux fois inclus faisait
+        // déborder la pile d'un fil de test en debug.
+        Box::pin(self.servir_la_piste_locale(
+            req,
+            track,
+            file_path,
+            fmt,
+            source_format,
+            is_dsd_source,
+            tranche_cue,
+        ))
+        .await
+    }
+
+    /// La fin de `resolve_local_track` : la décision (DoP ou natif anticipé,
+    /// forçages, transcodage, traitement), l'armement du flux et la
+    /// résolution rendue, pour une piste et son fichier déjà sur le disque.
+    ///
+    /// #8052 — appelée aussi par `resolve_direct` pour un DSD reçu d'un autre
+    /// serveur Tune (prêt de sorties) et téléchargé : `track` est alors bâtie
+    /// sur la demande et l'en-tête du fichier, pas lue en base. Le prêteur
+    /// fait ainsi EXACTEMENT ce que fait la lecture locale d'un `.dsf` : natif
+    /// ASIO, DoP vérifié, ou conversion en PCM par Tune quand le DoP est
+    /// écarté (#7265) ou que la zone joue le DSD en PCM.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn servir_la_piste_locale(
+        &self,
+        req: &PlayRequest,
+        track: crate::db::models::Track,
+        file_path: String,
+        fmt: String,
+        source_format: Option<AudioFormat>,
+        is_dsd_source: bool,
+        tranche_cue: Option<TrancheCue>,
+    ) -> Result<ResolvedStream, String> {
         let etape = super::dsp::EtapeDePreparation::debut(req.zone_id, "decision_de_lecture");
         let decision = match self
             .decider_la_lecture_locale(
@@ -1771,19 +1872,38 @@ impl PlaybackOrchestrator {
         // `skip_passthrough_levels`.
         let sortie_tire_le_flux =
             la_sortie_tire_le_flux(zone_output_type.as_deref(), is_local_output, is_oaat_output);
-        let eq_forces_transcode = sortie_sujette_au_traitement(
+        let traitements_de_zone = if sortie_sujette_au_traitement(
             is_network_output,
             is_browser_output,
             is_pull_dsp_output,
             dsd_passthrough,
             alac_passthrough,
-        ) && (self.zone_has_active_eq(req.zone_id)
-            || self.zone_has_active_ir(req.zone_id)
-            // ReplayGain scales the samples, so it lives in the same place
-            // as the EQ — and would be discarded in the same way on a
-            // passthrough. Enabling it is an explicit choice of processing;
-            // PURE zones are excluded upstream.
-            || self.zone_replaygain_changes_audio(req.zone_id, req.track_id));
+        ) {
+            // #7986 — la cadence à laquelle le convolveur sera bâti :
+            // `out_sr` du bras fichier, avant plafond. Une zone plafonnée
+            // transcode de toute façon (`needs_downsample`) ; on n'y vérifie
+            // alors que la lisibilité de la réponse impulsionnelle.
+            let cadence_du_flux = (!needs_downsample).then(|| {
+                source_format.map_or(sample_rate, |f| f.dsd_output_sample_rate(sample_rate))
+            });
+            let canaux_du_flux = transcodage.canaux_reduits.unwrap_or(source.channels);
+            TraitementsDeZone {
+                egaliseur: self.zone_has_active_eq(req.zone_id),
+                correction_de_piece: self.zone_ir_s_appliquerait(
+                    req.zone_id,
+                    cadence_du_flux,
+                    canaux_du_flux,
+                ),
+                // ReplayGain scales the samples, so it lives in the same place
+                // as the EQ — and would be discarded in the same way on a
+                // passthrough. Enabling it is an explicit choice of processing;
+                // PURE zones are excluded upstream.
+                replaygain: self.zone_replaygain_changes_audio(req.zone_id, req.track_id),
+            }
+        } else {
+            TraitementsDeZone::default()
+        };
+        let eq_forces_transcode = traitements_de_zone.un_au_moins();
         // En navigateur, la sortie transcodée doit être du WAV : un FLAC
         // ré-encodé à la volée n'a pas de seektable et cale le <audio> sur les
         // Range (#1168) — même règle que le bras streaming.
@@ -1873,6 +1993,7 @@ impl PlaybackOrchestrator {
             needs_downsample,
             sortie_tire_le_flux,
             eq_forces_transcode,
+            traitements_de_zone,
             browser_needs_wav,
             dsp_progressif_wav,
             flux_wav_reseau,
@@ -1890,6 +2011,10 @@ impl PlaybackOrchestrator {
         voies: u16,
     ) -> crate::audio::dop_ecarte_7265::AccueilDuDop {
         use crate::audio::dop_ecarte_7265::AccueilDuDop;
+        #[cfg(test)]
+        if let Some(accueil) = device_id.and_then(accueil_du_dop_force_pour_test) {
+            return accueil;
+        }
         #[cfg(feature = "local-audio")]
         {
             let Some(device_id) = device_id else {
@@ -2480,6 +2605,8 @@ impl PlaybackOrchestrator {
             zone_max_sample_rate,
             track_duration_ms,
             ref file_path,
+            ref motifs_de_transcodage,
+            ref traitements_de_zone,
             ..
         } = *decision;
         let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
@@ -2705,6 +2832,8 @@ impl PlaybackOrchestrator {
             target = ?target_fmt,
             sample_rate = out_sr,
             bit_depth = out_bd,
+            motifs = ?motifs_de_transcodage,
+            traitements = ?traitements_de_zone,
             "transcode_required"
         );
 
@@ -3096,6 +3225,9 @@ impl PlaybackOrchestrator {
                     .streamer
                     .create_file_session(file_info, cp.clone(), false)
                     .await;
+                self.streamer
+                    .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
+                    .await;
                 // The current track was a cache hit → warm the next one too,
                 // so an album keeps hitting the cache track after track.
                 self.spawn_warm_next_local(
@@ -3359,6 +3491,12 @@ impl PlaybackOrchestrator {
                             .streamer
                             .create_file_session(file_info, serve_path, false)
                             .await;
+                        self.streamer
+                            .noter_la_voie(
+                                &session_id,
+                                crate::http::streamer::voie::FICHIER_CONVERTI,
+                            )
+                            .await;
 
                         // Current track just transcoded into the cache → warm
                         // the next one in the background while this one plays,
@@ -3576,6 +3714,9 @@ impl PlaybackOrchestrator {
             };
             self.poser_le_contexte_de_conversion(&session_id, contexte)
                 .await;
+            let ecretages =
+                Arc::new(crate::audio::ecretage_de_traitement::EcretagesDeTraitement::new());
+            let ecretages_du_forwarder = ecretages.clone();
             let tx = if relais || relais_en_vol {
                 if relais {
                     tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
@@ -3586,7 +3727,16 @@ impl PlaybackOrchestrator {
                     self.noter_eq_en_vol(req.zone_id, &session_id, poste.clone());
                     dsp.en_vol = Some(poste);
                 }
-                spawn_streaming_dsp_relay(dsp, out_bd, true, tx)
+                // #7100 — le relais relève où SA chaîne écrête ; le forwarder
+                // de la même session le lit pour allumer `over_*`.
+                let releve = crate::audio::ecretage_de_traitement::ReleveDEcretage::new(
+                    ecretages.clone(),
+                    req.seek_ms.unwrap_or(0) as f64,
+                    out_sr,
+                    channels,
+                    out_bd,
+                );
+                spawn_streaming_dsp_relay_releve(dsp, out_bd, true, tx, Some(releve))
             } else {
                 tx
             };
@@ -3640,12 +3790,13 @@ impl PlaybackOrchestrator {
                 let levels_tx = match ev_bus.filter(|_| attach_levels) {
                     Some(bus) => {
                         let play_seq = playback.current_play_seq(zone_id).await;
-                        spawn_paced_levels_forwarder(
+                        spawn_paced_levels_forwarder_avec_ecretages(
                             bus,
                             playback,
                             zone_id,
                             play_seq,
                             seek_niveaux_ms,
+                            Some(ecretages_du_forwarder),
                         )
                     }
                     None => {
@@ -3891,6 +4042,8 @@ impl PlaybackOrchestrator {
                 ..Default::default()
             };
 
+            // #8076 — noté avant que `depart_natif` ne soit consommé.
+            let depart_natif_pose = depart_natif.is_some();
             let session_id = self
                 .streamer
                 .create_file_session(info, file_path.clone(), false)
@@ -3963,6 +4116,24 @@ impl PlaybackOrchestrator {
                     self.streamer.set_faststart(&session_id, map).await;
                 }
             }
+
+            // #8076 — ce que cette session sert, pour le journal de
+            // l'enchaînement : aucun bras de ce passthrough ne décode.
+            let voie_servie = {
+                use crate::http::streamer::voie;
+                if dsf_depuis_dst.is_some() {
+                    voie::DSF_RECONSTRUIT
+                } else if conteneur_flac_neuf.is_some() {
+                    voie::ENTETE_FLAC_NEUF
+                } else if depart_natif_pose {
+                    voie::DEPART_NATIF
+                } else if self.streamer.a_une_carte_d_entete(&session_id).await {
+                    voie::ENTETE_M4A_REECRIT
+                } else {
+                    voie::FICHIER_TEL_QUEL
+                }
+            };
+            self.streamer.noter_la_voie(&session_id, voie_servie).await;
 
             // Parallel decode-for-levels: decode the audio in the background
             // purely to emit VU-meter events for the web client. This does not
@@ -4135,11 +4306,51 @@ fn tranche_dop(
     }
 }
 
+/// #8052 — ce que la sonde DoP d'une sortie répond, imposé par un test.
+///
+/// La sonde n'existe que sous WASAPI (`LocalOutput::sonde_du_dop`) : sous
+/// Linux, `cargo test` ne peut pas faire écarter le DoP par la sortie. Un test
+/// pose ici la réponse d'un mixeur partagé ou d'un pilote exclusif pour SA
+/// sortie (identifiant propre au test), et `accueil_du_dop_local` la rend.
+#[cfg(test)]
+fn accueils_du_dop_forces() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, crate::audio::dop_ecarte_7265::AccueilDuDop>,
+> {
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::audio::dop_ecarte_7265::AccueilDuDop>,
+        >,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(super) fn forcer_l_accueil_du_dop_pour_test(
+    device_id: &str,
+    accueil: crate::audio::dop_ecarte_7265::AccueilDuDop,
+) {
+    accueils_du_dop_forces()
+        .lock()
+        .unwrap()
+        .insert(device_id.to_string(), accueil);
+}
+
+#[cfg(test)]
+fn accueil_du_dop_force_pour_test(
+    device_id: &str,
+) -> Option<crate::audio::dop_ecarte_7265::AccueilDuDop> {
+    accueils_du_dop_forces()
+        .lock()
+        .unwrap()
+        .get(device_id)
+        .cloned()
+}
+
 /// La cadence et le nombre de canaux d'une source DSD, lus DANS LE FICHIER
 /// (DSF, DFF, ISO SACD) — `None` si l'en-tête est illisible. Partagé par le
 /// DoP (`anticiper_le_dop`, #1894) et le DSD natif (#5643) : une seule
 /// lecture de la même vérité.
-fn sonder_l_entete_dsd(file_path: &str) -> Option<(u32, u32)> {
+pub(super) fn sonder_l_entete_dsd(file_path: &str) -> Option<(u32, u32)> {
     let ext = std::path::Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -4271,3 +4482,7 @@ mod duree_convertie_6630_tests;
 #[cfg(test)]
 #[path = "fin_apres_relance_7551_tests.rs"]
 mod fin_apres_relance_7551_tests;
+
+#[cfg(test)]
+#[path = "duree_relue_5975_tests.rs"]
+mod duree_relue_5975_tests;

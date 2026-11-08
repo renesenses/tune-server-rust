@@ -46,8 +46,7 @@ pub fn build_loader(
 ) -> PluginLoader {
     // La licence descend jusqu'aux greffons (`PluginContext::license`) pour
     // qu'un greffon payant ADAPTE sa réponse au lieu de se voir fermer la porte
-    // par l'hôte : « Concerts » servira un jour une version réduite aux comptes
-    // gratuits, et cette décision doit tenir chez lui, en un seul endroit.
+    // par l'hôte : la décision doit tenir chez lui, en un seul endroit.
     PluginLoader::new(plugins_data_root())
         .with_event_bus(event_bus.clone())
         .with_db(backend)
@@ -142,8 +141,8 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
     // sorties du cœur toujours-compilé. Elle y était démarrée SANS condition
     // par `background.rs` — elle ne tourne désormais que chez ceux qui ont
     // installé le plugin. Sa dépendance explicite est la base : lire les artistes
-    // de la bibliothèque et `instance_id`. La licence lui arrive par le contexte
-    // (`PluginContext::license`) : c'est lui qui décide ce qu'il sert (Premium).
+    // de la bibliothèque et `instance_id`. Il ne lit pas la licence : il n'est
+    // plus Premium (#7865).
     #[cfg(feature = "concerts")]
     loader
         .register(Box::new(tune_concerts::ConcertsPlugin::new(

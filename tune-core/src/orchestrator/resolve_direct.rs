@@ -880,6 +880,30 @@ impl PlaybackOrchestrator {
         }
         // ------------------------------------------------------------------
 
+        // ------------------------------------------------------------------
+        // #8052 — un DSD reçu par la façade UPnP (prêt de sorties : un autre
+        // serveur Tune joue sur la sortie LOCALE de cette zone) est joué comme
+        // un `.dsf` de la bibliothèque : natif ASIO, DoP vérifié, ou converti
+        // en PCM par Tune quand la zone ne peut ou ne veut pas du DoP.
+        //
+        // Sans ce bras, l'adresse partait telle quelle à `LocalOutput` par le
+        // bras générique ci-dessous. Or `LocalOutput` ne lit le DSD brut que
+        // sous l'en-tête interne de Tune (`audio::dsd_brut`) : un `.dsf` y
+        // tombe dans le décodage compressé, qui ne le connaît pas, et la zone
+        // reste muette. Le bras ne rend donc JAMAIS l'adresse brute : il rend
+        // la résolution de la lecture locale, quelle qu'en soit l'issue.
+        //
+        // Sur le tas (`Box::pin`) : ce bras porte toute la lecture locale, et
+        // son futur inclus tel quel dans celui de `resolve_stream` faisait
+        // déborder la pile d'un fil de test en debug.
+        if source == "upnp" && est_dsd_brut(mime_type) && is_local_output {
+            return Box::pin(
+                self.dsd_upnp_pour_la_sortie_locale(req, audio_url, mime_type, &title),
+            )
+            .await;
+        }
+        // ------------------------------------------------------------------
+
         // Fil 2062 / #5550 — un serveur UPnP qui n'annonce aucune durée (la
         // Freebox) : on la lit dans les en-têtes du flux, et seulement alors.
         // Une durée connue passe telle quelle, sans une requête de plus.
@@ -1613,6 +1637,104 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #8052 — un DSD reçu par la façade UPnP, vers la sortie LOCALE de la
+    /// zone : la lecture locale d'un `.dsf` (`servir_la_piste_locale` — natif
+    /// ASIO #5643, DoP vérifié #7265, sinon PCM converti par Tune), appliquée
+    /// au fichier téléchargé.
+    ///
+    /// Le flux vient d'un autre serveur Tune : il n'a pas de ligne en base.
+    /// La piste que lit la décision est bâtie sur la demande et l'en-tête du
+    /// fichier — sans quoi on retomberait dans le piège du bras DoP réseau,
+    /// qui se replie en PCM faute de ligne (`dsd_upnp_dop_sans_ligne_en_base_repli_pcm`).
+    ///
+    /// Le PCM n'est pas un échec du bras : c'est ce que la lecture locale du
+    /// même fichier jouerait (zone en `auto`/`pcm`, DoP écarté par la sortie,
+    /// en-tête illisible). La façade n'annonce le DSD qu'aux zones `dop` et
+    /// `native`, mais un principal plus ancien, ou dont le sondage date d'un
+    /// autre réglage, peut en envoyer à toute zone : il est converti ici.
+    async fn dsd_upnp_pour_la_sortie_locale(
+        &self,
+        req: &PlayRequest,
+        audio_url: &str,
+        mime_type: &str,
+        title: &str,
+    ) -> Result<ResolvedStream, String> {
+        let conteneur = conteneur_dsd(audio_url, mime_type);
+        let fichier = Self::telecharger_dans_un_fichier_temporaire(
+            audio_url.to_string(),
+            Vec::new(),
+            conteneur,
+        )
+        .await
+        .map_err(|e| format!("Téléchargement du DSD impossible : {e}"))?;
+        let entete = super::resolve_local::sonder_l_entete_dsd(&fichier);
+        if entete.is_none() {
+            warn!(
+                zone_id = req.zone_id,
+                url = %audio_url,
+                "dsd_upnp_sortie_locale_entete_illisible"
+            );
+        }
+
+        let mut piste = crate::db::models::Track::new(title.to_string());
+        piste.artist_name = req.artist_name.clone();
+        piste.album_title = req.album_title.clone();
+        piste.cover_path = req.cover_url.clone();
+        piste.duration_ms = req
+            .duration_ms
+            .or_else(|| duree_d_un_dsf_ms(&fichier, conteneur))
+            .unwrap_or(0);
+        piste.file_path = Some(fichier.clone());
+        piste.format = Some(conteneur.to_string());
+        piste.sample_rate = entete.and_then(|(cadence, _)| i32::try_from(cadence).ok());
+        piste.bit_depth = Some(1);
+        piste.channels = entete
+            .and_then(|(_, canaux)| i32::try_from(canaux).ok())
+            .unwrap_or(2);
+        piste.source = "upnp".into();
+
+        let resultat = self
+            .servir_la_piste_locale(
+                req,
+                piste,
+                fichier.clone(),
+                conteneur.to_string(),
+                Some(AudioFormat::Dsd),
+                true,
+                None,
+            )
+            .await;
+        match resultat {
+            Ok(mut resolu) => {
+                if let Some(sid) = resolu.stream_id.as_deref() {
+                    supprimer_a_la_fin_de_la_session(
+                        self.streamer.clone(),
+                        sid.to_string(),
+                        fichier,
+                    );
+                } else {
+                    let _ = std::fs::remove_file(&fichier);
+                }
+                resolu.source = "upnp".into();
+                resolu.origin_url = Some(audio_url.to_string());
+                info!(
+                    zone_id = req.zone_id,
+                    url = %audio_url,
+                    entete_lue = entete.is_some(),
+                    mime = %resolu.mime_type,
+                    sample_rate = ?resolu.sample_rate,
+                    bit_depth = ?resolu.bit_depth,
+                    "dsd_upnp_sortie_locale"
+                );
+                Ok(resolu)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&fichier);
+                Err(e)
+            }
+        }
+    }
+
     /// Relaie une URL distante TELLE QUELLE par une session du mandataire de
     /// Tune, et rend l'adresse `http://` de Tune à jouer avec l'identifiant
     /// de la session.
@@ -1658,6 +1780,26 @@ impl PlaybackOrchestrator {
         (stream_url, session_id)
     }
 
+    /// #8085 — VU-mètres d'un épisode de podcast. `play_episode` relaie les
+    /// octets de l'hébergeur VERBATIM au renderer réseau (#6468), ou confie
+    /// l'adresse à la sortie locale, qui décode sans rien mesurer : rien
+    /// n'est décodé côté serveur, aucun `playback.audio_levels` ne partait,
+    /// les aiguilles restaient à 0 sur toute la durée de l'épisode. Même
+    /// geste que Bandcamp (#4311) et Qobuz/Tidal (#1106) : une seconde
+    /// connexion décodée pour les seuls niveaux, bridée au rythme de lecture ;
+    /// le flux joué n'est pas touché. À appeler une fois la lecture lancée
+    /// (et l'éventuelle reprise posée) : la sonde s'attache à la piste en
+    /// cours de la zone.
+    pub async fn sonder_les_niveaux_d_un_episode(
+        &self,
+        zone_id: i64,
+        audio_url: &str,
+        mime_type: &str,
+    ) {
+        let codec = conteneur_depuis_url(audio_url, mime_type);
+        self.spawn_proxy_levels_probe(zone_id, audio_url.to_string(), codec.to_string())
+            .await;
+    }
     async fn relayer_direct_au_navigateur(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
         let Directe {
             audio_url,
@@ -2159,6 +2301,20 @@ fn conteneur_depuis_url(url: &str, mime: &str) -> &'static str {
         "audio/opus" => "opus",
         _ => "mp3",
     }
+}
+
+/// #8052 — la durée d'un DSF téléchargé, lue dans son en-tête, quand la
+/// demande n'en porte pas (la façade ne connaît que ce que le contrôleur a
+/// mis dans ses métadonnées). `None` pour un DFF ou un en-tête illisible.
+fn duree_d_un_dsf_ms(fichier: &str, conteneur: &str) -> Option<i64> {
+    if conteneur != "dsf" {
+        return None;
+    }
+    let info = crate::audio::dsf::parse_dsf(fichier).ok()?;
+    if info.sample_rate == 0 {
+        return None;
+    }
+    i64::try_from(info.total_samples.saturating_mul(1000) / u64::from(info.sample_rate)).ok()
 }
 
 /// Le conteneur d'une piste DSD relayée ou téléchargée : `dff` si l'URL ou

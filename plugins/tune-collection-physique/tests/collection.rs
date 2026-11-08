@@ -1744,3 +1744,185 @@ fn le_statut_403_du_cdn_n_est_pas_une_image_disparue_7927() {
     );
     assert_eq!(suite_selon_statut(500, true), Err(Panne));
 }
+
+/// #7981 : un disque présent dans la bibliothèque sous une autre écriture
+/// (« … - 2012 Remaster ») est retrouvé par artiste + titre, sans lien
+/// MusicBrainz (l'affinage n'a pas tourné), et n'est donc pas cherché sur
+/// les services.
+#[tokio::test]
+async fn repli_local_artiste_titre_sans_lien_musicbrainz_7981() {
+    let hote = HoteEssai::new();
+    hote.albums.lock().unwrap().push(AlbumLocal {
+        id: 9,
+        titre: "Giving My Love / Brazil - 2012 Remaster".into(),
+        artiste: Some("Janice McClain & The Ritchie Family".into()),
+        ..Default::default()
+    });
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    assert_eq!(b.hote.appels("mb "), 0, "aucun lien MusicBrainz lu");
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let gm = disque(&c, "Giving My Love / Brazil");
+    assert_eq!(gm["etat"], "bibliotheque", "repli artiste + titre : {gm}");
+    assert_eq!(gm["bibliotheque"]["album_id"], 9, "{gm}");
+    assert_eq!(gm["bibliotheque"]["par"], "artiste_titre", "{gm}");
+    assert_eq!(gm["raison"], Value::Null, "{gm}");
+    assert!(
+        !recherches(&b.hote, "tidal")
+            .iter()
+            .any(|r| r.contains("Giving My Love")),
+        "trouvé dans la bibliothèque : pas cherché sur les services"
+    );
+}
+
+/// #7981 : Qobuz rend, pour le code-barre du disque, l'album sous un titre
+/// suivi de « - Remastered » ; il est retenu.
+#[tokio::test]
+async fn qobuz_par_code_barre_titre_avec_mention_d_edition_7981() {
+    let mut hote = HoteEssai::new();
+    hote.albums.lock().unwrap().retain(|a| a.id != 2);
+    hote.recherches.insert(
+        ("qobuz".into(), "671665000928".into()),
+        vec![AlbumDeService {
+            id: "Q-1050".into(),
+            titre: "Montreal Mix Sessions Vol. 4 - Remastered".into(),
+            artiste: "Lafleche".into(),
+        }],
+    );
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let cd = disque(&c, "Montreal Mix Sessions Vol. 4");
+    assert_eq!(cd["etat"], "streaming", "{cd}");
+    assert_eq!(cd["streaming"][0]["service"], "qobuz", "{cd}");
+    assert_eq!(cd["streaming"][0]["id"], "Q-1050", "{cd}");
+    assert_eq!(cd["streaming"][0]["par"], "code_barre", "{cd}");
+}
+
+/// #7981 : sans code-barre, Qobuz par artiste + titre, sous une autre
+/// écriture (« The » en tête du titre absent, « Various Artists »).
+#[tokio::test]
+async fn qobuz_par_artiste_et_titre_assouplis_7981() {
+    let mut hote = HoteEssai::new();
+    hote.recherches.insert(
+        (
+            "qobuz".into(),
+            "Various The Haçienda - Play By 01/96".into(),
+        ),
+        vec![AlbumDeService {
+            id: "Q-H".into(),
+            titre: "Haçienda - Play By 01/96".into(),
+            artiste: "Various Artists".into(),
+        }],
+    );
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let h = disque(&c, "The Haçienda - Play By 01/96");
+    assert_eq!(h["etat"], "streaming", "{h}");
+    assert_eq!(h["streaming"][0]["id"], "Q-H", "{h}");
+    assert_eq!(h["streaming"][0]["par"], "artiste_titre", "{h}");
+    assert_eq!(c["compteurs"]["par_etat"]["nulle_part"], 0, "{c}");
+}
+
+/// #7981 : un disque « nulle part » dit pourquoi — aucun candidat, plusieurs
+/// candidats dans la bibliothèque, ou aucun service interrogé — et les
+/// compteurs le comptent.
+#[tokio::test]
+async fn un_disque_nulle_part_dit_pourquoi_7981() {
+    // Aucun candidat : les deux services ont répondu, rien.
+    let b = banc_avec(HoteEssai::new());
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let h = disque(&c, "The Haçienda - Play By 01/96");
+    assert_eq!(h["etat"], "nulle_part", "{h}");
+    assert_eq!(h["raison"], "aucun_candidat", "{h}");
+    assert_eq!(
+        c["compteurs"]["par_raison"],
+        json!({"aucun_candidat": 1, "plusieurs_candidats": 0, "service_non_interroge": 0}),
+        "{c}"
+    );
+    let gm = disque(&c, "Giving My Love / Brazil");
+    assert_eq!(gm["raison"], Value::Null, "en streaming : pas de raison");
+
+    // Aucun service connecté : rien n'a été interrogé.
+    let mut h = HoteEssai::new();
+    h.services = vec![];
+    let b = banc_avec(h);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    assert_eq!(
+        disque(&c, "The Haçienda - Play By 01/96")["raison"],
+        "service_non_interroge"
+    );
+    assert_eq!(
+        c["compteurs"]["par_raison"]["service_non_interroge"], 2,
+        "{c}"
+    );
+
+    // Plusieurs candidats : deux éditions distinctes dans la bibliothèque,
+    // et TIDAL ne le trouve plus.
+    let mut h = HoteEssai::new();
+    h.recherches.clear();
+    h.albums.lock().unwrap().extend([
+        AlbumLocal {
+            id: 10,
+            titre: "Giving My Love / Brazil - Remastered".into(),
+            artiste: Some("Janice McClain".into()),
+            ..Default::default()
+        },
+        AlbumLocal {
+            id: 11,
+            titre: "Giving My Love / Brazil Expanded Edition".into(),
+            artiste: Some("Janice McClain".into()),
+            ..Default::default()
+        },
+    ]);
+    let b = banc_avec(h);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let gm = disque(&c, "Giving My Love / Brazil");
+    assert_eq!(gm["etat"], "nulle_part", "{gm}");
+    assert_eq!(gm["raison"], "plusieurs_candidats", "{gm}");
+    assert_eq!(gm["candidats_locaux"], 2, "{gm}");
+    assert_eq!(gm["bibliotheque"], Value::Null, "on ne choisit pas : {gm}");
+}
+
+/// #7981 : une réponse « absent » d'avant la règle assouplie est redemandée
+/// à la synchronisation suivante, sans attendre trente jours.
+#[tokio::test]
+async fn une_reponse_d_avant_la_regle_assouplie_se_redemande_7981() {
+    let b = banc_avec(HoteEssai::new());
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let avant = b.hote.appels("service ");
+
+    // Contre-épreuve : la mémoire à jour, rien n'est redemandé.
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    assert_eq!(b.hote.appels("service "), avant);
+
+    // La mémoire telle que l'écrivait la version d'avant : sans `regle`.
+    let fichier = b._dossier.path().join("collection.json");
+    let mut brut: Value = serde_json::from_slice(&std::fs::read(&fichier).unwrap()).unwrap();
+    for s in brut["streaming"].as_object_mut().unwrap().values_mut() {
+        s.as_object_mut().unwrap().remove("regle");
+    }
+    std::fs::write(&fichier, brut.to_string()).unwrap();
+    let moteur = Arc::new(Moteur::new(
+        b.hote.clone(),
+        b._dossier.path().to_path_buf(),
+        Cadence::immediate(),
+    ));
+    moteur.synchroniser_maintenant("exemple").await.unwrap();
+    assert_eq!(
+        b.hote.appels("service "),
+        2 * avant,
+        "les deux disques absents de la bibliothèque sont redemandés aux deux services"
+    );
+}

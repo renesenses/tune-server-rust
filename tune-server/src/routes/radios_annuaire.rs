@@ -822,13 +822,10 @@ async fn lister(
     let repo = RadioRepo::with_backend(state.backend.clone());
     let mes_radios = repo.list().unwrap_or_default();
     let liens = repo.liens_annuaire().unwrap_or_default();
-    Json(corps_annuaire_avec_liens(
-        &fiches,
-        &mes_radios,
-        &liens,
-        &filtres,
-        &etat,
-    ))
+    let mut corps = corps_annuaire_avec_liens(&fiches, &mes_radios, &liens, &filtres, &etat);
+    // #7515 — le flux par défaut jouable dans le pays d'écoute.
+    super::radios::geofencing::marquer_le_flux_par_defaut(&state, &mut corps);
+    Json(corps)
 }
 
 async fn forcer_le_releve(State(state): State<AppState>) -> Json<Value> {
@@ -1173,8 +1170,14 @@ async fn choisir_le_flux(
 async fn jouer(
     State(state): State<AppState>,
     Path((external_id, zone_id)): Path<(String, i64)>,
+    profile: crate::routes::active_profile::ActiveProfile,
     corps: axum::body::Bytes,
 ) -> Response {
+    // #7974 — le profil qui lance la station porte le bail d'écoute.
+    state
+        .playback
+        .set_session_profile(zone_id, Some(profile.id()))
+        .await;
     let choisi = if corps.iter().all(u8::is_ascii_whitespace) {
         None
     } else {

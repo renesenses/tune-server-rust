@@ -118,15 +118,15 @@ async fn ce_qui_tourne_dit_les_passes_la_lecture_l_avancement_et_la_chaleur_4681
     assert!(!tournent.contains(&"acoustic"), "{lecture}");
 
     // La garde thermique, telle que la machine du banc la voit. Quelle que
-    // soit cette machine, la règle de #6450 se lit : illisible ⇒ bridé à un
-    // fichier ; lisible ⇒ la largeur réglée.
+    // soit cette machine, la règle de #6450 se lit : illisible ⇒ la largeur
+    // réglée, avec un avertissement ; lisible ⇒ la largeur réglée.
     let t = &lecture["thermal"];
     assert_eq!(t["speed"], "normal", "{t}");
     assert!(t["width_configured"].as_u64().is_some(), "{t}");
     match t["readable"].as_bool() {
         Some(false) => {
-            assert_eq!(t["throttled"], true, "{t}");
-            assert_eq!(t["width_effective"], 1, "{t}");
+            assert_eq!(t["throttled"], false, "{t}");
+            assert_eq!(t["width_effective"], t["width_configured"], "{t}");
             assert!(t["reason"].is_string(), "{t}");
         }
         Some(true) => {

@@ -120,6 +120,13 @@ pub struct StreamAlbum {
     /// autres services laissent `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_generated: Option<bool>,
+    /// #8088 — le service marque-t-il cet album comme EXPLICITE ? Qobuz
+    /// `parental_warning`, TIDAL `explicit` ; Spotify ne le dit que de ses
+    /// pistes. Même règle que `ai_generated` : `Some(true)` seul vaut
+    /// explicite, une absence n'est pas un marquage. Le contrôle parental
+    /// (`PolitiqueParentale::masquer_explicite`) retire ces albums des listes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -587,6 +594,70 @@ pub struct StreamBooklet {
     pub url: String,
 }
 
+/// #8077 — un album du service proposé par une recherche (artiste + titre),
+/// avec ce qu'il faut pour juger d'un rapprochement : titre, artiste, nombre
+/// de pistes, code-barres.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidatAlbum {
+    pub id: String,
+    pub titre: String,
+    pub artiste: String,
+    pub nombre_pistes: u32,
+    pub upc: Option<String>,
+}
+
+/// #8077 — une récompense de presse d'un album du service (Diapason d'or,
+/// Qobuzissime…).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recompense {
+    pub nom: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<String>,
+    /// Date d'attribution, `AAAA-MM-JJ`, quand le service la donne.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+}
+
+/// #8077 — une piste de la fiche d'un album du service.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PisteDeService {
+    pub id: String,
+    pub disque: i64,
+    pub numero: i64,
+    pub duree_ms: i64,
+    pub isrc: Option<String>,
+    pub titre: String,
+    /// Crédits dans le vocabulaire de `track_credits` (compositeur compris).
+    pub credits: Vec<crate::metadata::credits_mb::LigneCredit>,
+}
+
+/// #8077 — la fiche complète d'un album du service, ramenée à ce que la
+/// bibliothèque locale peut en reprendre. Champs absents : le service ne dit
+/// rien.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FicheAlbumService {
+    pub id: String,
+    pub titre: String,
+    pub artiste: String,
+    pub upc: Option<String>,
+    pub label: Option<String>,
+    /// Date de sortie exacte, `AAAA-MM-JJ`.
+    pub date_de_sortie: Option<String>,
+    /// La mention ℗ (droits du phonogramme), sans le symbole.
+    pub phonogramme: Option<String>,
+    /// La mention © (droits de l'œuvre graphique et du texte), sans le symbole.
+    pub copyright: Option<String>,
+    pub genres: Vec<String>,
+    pub livrets: Vec<StreamBooklet>,
+    pub recompenses: Vec<Recompense>,
+    /// Disponible en haute résolution : (profondeur, fréquence en Hz).
+    pub hires: Option<(u32, u32)>,
+    /// L'adresse de la pochette la plus grande que le service sert, et le
+    /// côté qu'il garantit pour elle (en pixels).
+    pub pochette_hd: Option<(String, u32)>,
+    pub pistes: Vec<PisteDeService>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthStatus {
     pub authenticated: bool,
@@ -621,6 +692,20 @@ pub struct RechercheDansUnGenre {
     /// Comment le genre est appliqué. `"results"` : sur les résultats de la
     /// recherche du service, d'après le genre que le service donne à chaque album.
     pub genre_filter: &'static str,
+}
+
+/// L'année et le genre d'une piste de service, quand le service les publie
+/// (#8062) : les colonnes « Year » et « Genre » du tableau d'une playlist de
+/// service restaient vides.
+///
+/// À côté de [`StreamTrack`] et non dedans : la structure se construit en
+/// littéral à près d'une centaine d'endroits, et un champ de plus les aurait
+/// tous touchés pour deux colonnes d'affichage. Un champ à `None` est une
+/// absence : la route n'écrit alors pas la clé (cellule vide).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnneeEtGenre {
+    pub year: Option<u32>,
+    pub genre: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -717,6 +802,20 @@ pub trait StreamingService: Send + Sync {
     ) -> Result<StreamUrl, TuneError>;
     async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError>;
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
+    /// Les pistes d'un album, avec l'année et le genre de l'album quand le
+    /// service les publie (#8062) — même contrat que
+    /// [`Self::get_playlist_tracks_avec_annee_et_genre`].
+    async fn get_album_tracks_avec_annee_et_genre(
+        &self,
+        album_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
+        Ok(self
+            .get_album_tracks(album_id)
+            .await?
+            .into_iter()
+            .map(|t| (t, AnneeEtGenre::default()))
+            .collect())
+    }
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError>;
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let _ = artist_id;
@@ -780,6 +879,20 @@ pub trait StreamingService: Send + Sync {
     }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
+    /// Les pistes d'une playlist, chacune avec son année et son genre quand le
+    /// service les publie (#8062). Par défaut : [`Self::get_playlist_tracks`]
+    /// sans rien de plus — un service qui ne les connaît pas ne régresse pas.
+    async fn get_playlist_tracks_avec_annee_et_genre(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<(StreamTrack, AnneeEtGenre)>, TuneError> {
+        Ok(self
+            .get_playlist_tracks(playlist_id)
+            .await?
+            .into_iter()
+            .map(|t| (t, AnneeEtGenre::default()))
+            .collect())
+    }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError>;
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError>;
@@ -819,6 +932,47 @@ pub trait StreamingService: Send + Sync {
     }
     fn supports_write(&self) -> bool {
         false
+    }
+
+    /// #8066 — l'utilisateur peut-il MODIFIER cette playlist du service ?
+    ///
+    /// `Some(true)` : elle est à lui ; `Some(false)` : non (suivie,
+    /// éditoriale, mix, ou service sans écriture) ; `None` : le service ne
+    /// permet pas de le dire. Seul `Some(true)` autorise une écriture.
+    ///
+    /// Par défaut : le drapeau `editable` de la playlist dans
+    /// [`Self::get_user_playlists`] (Qobuz le pose depuis
+    /// renesenses/tune-web-client#2097).
+    async fn playlist_modifiable(&self, playlist_id: &str) -> Result<Option<bool>, TuneError> {
+        if !self.supports_write() {
+            return Ok(Some(false));
+        }
+        Ok(self
+            .get_user_playlists()
+            .await?
+            .into_iter()
+            .find(|p| p.id == playlist_id)
+            .and_then(|p| p.editable))
+    }
+
+    /// #8066 — remplace, DANS la playlist du service, le titre au rang
+    /// `rang` (l'indice de [`Self::get_playlist_tracks`]) par `nouveau`, à la
+    /// même place.
+    ///
+    /// `ancien` est l'identifiant que l'appelant croit voir à ce rang : si la
+    /// playlist a changé entre-temps, rien n'est écrit et l'appel échoue.
+    /// L'implémentation relit la playlist à la fin et échoue si `nouveau`
+    /// n'est pas au rang `rang`.
+    async fn replace_playlist_track(
+        &self,
+        _playlist_id: &str,
+        _rang: usize,
+        _ancien: &str,
+        _nouveau: &str,
+    ) -> Result<(), TuneError> {
+        Err(TuneError::Unsupported(
+            "replace_playlist_track not supported by this service".into(),
+        ))
     }
 
     /// Le service sait-il SUPPRIMER une playlist chez lui ?
@@ -1034,6 +1188,29 @@ pub trait StreamingService: Send + Sync {
     fn langue_du_magasin(&self) -> Option<String> {
         None
     }
+
+    // ── #8077 — apports à un album de la bibliothèque LOCALE ───────────────
+    //
+    // Par défaut, rien : aucun appel. Qobuz les met en œuvre.
+
+    /// Les albums du service qu'une recherche « artiste titre » propose. Le
+    /// jugement (même artiste, même titre, même nombre de pistes) est fait
+    /// par l'appelant (`library::apports_service`), jamais ici.
+    async fn albums_par_titre(
+        &self,
+        _artiste: &str,
+        _titre: &str,
+    ) -> Result<Vec<CandidatAlbum>, TuneError> {
+        Ok(vec![])
+    }
+
+    /// La fiche complète d'un album du service, pistes et crédits compris.
+    async fn fiche_album_service(
+        &self,
+        _album_id: &str,
+    ) -> Result<Option<FicheAlbumService>, TuneError> {
+        Ok(None)
+    }
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         Ok(vec![])
     }
@@ -1247,6 +1424,7 @@ mod tests {
     fn stream_album_serialization() {
         let album = StreamAlbum {
             ai_generated: None,
+            explicit: None,
             release_type: None,
             id: "789".into(),
             title: "Kind of Blue".into(),

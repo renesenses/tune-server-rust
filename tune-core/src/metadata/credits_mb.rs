@@ -56,7 +56,7 @@ pub struct LigneCredit {
 /// chœur des enregistrements d'opéra. `sound` est le dernier type d'ingénieur
 /// de MusicBrainz qui manquait. Idée : MetaRust (`credits.rs`), qui range
 /// lui aussi `chorus master` parmi les chefs.
-fn role_canonique(rel_type: &str) -> Option<&'static str> {
+pub(crate) fn role_canonique(rel_type: &str) -> Option<&'static str> {
     Some(match rel_type {
         "instrument" | "performer" | "performing orchestra" => "performer",
         "vocal" => "vocal",

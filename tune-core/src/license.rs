@@ -67,13 +67,12 @@ pub enum Feature {
     /// « en plugin PREMIUM »).
     PontRoon,
     /// « Concerts » (#2363) : les dates à venir des artistes de la
-    /// bibliothèque, autour de la commune saisie. Sa propre tuile, incluse
-    /// dans Premium, sans achat séparé (Bertrand, 30/08 et 25/09/2026).
+    /// bibliothèque, autour de la commune saisie.
     ///
-    /// Le greffon `tune-concerts` la déclare par
-    /// `TunePlugin::required_feature` : le payant est une propriété du
-    /// GREFFON, pas d'un chemin d'URL, et la décision (complet / refusé,
-    /// bientôt réduit pour les comptes gratuits) tient chez lui.
+    /// N'est plus Premium depuis #7865 (Bertrand, 04/11/2026) : hors de
+    /// [`Feature::all_premium`], et le greffon `tune-concerts` ne la déclare
+    /// plus. La variante reste pour lire les droits déjà enregistrés ou
+    /// renvoyés par le site avec le code `concerts`.
     Concerts,
     /// « Sortie AES67 » (#7336) : diffuser une zone en flux RTP multicast
     /// vers des récepteurs AES67. Premium (Bertrand, 30/10/2026). Déclarée
@@ -84,6 +83,9 @@ pub enum Feature {
     /// Subsonic / OpenSubsonic. Premium, désactivé par défaut (Bertrand,
     /// 04/11/2026).
     Subsonic,
+    /// « Suréchantillonnage » (#7614) : le greffon de suréchantillonnage de
+    /// la sortie locale. Premium, comme le crossfeed (Bertrand, 07/11/2026).
+    Upsampling,
 }
 
 impl Feature {
@@ -118,9 +120,11 @@ impl Feature {
             Feature::Declick,
             Feature::AcousticAnalysis,
             Feature::PontRoon,
-            Feature::Concerts,
+            // `Concerts` n'est plus Premium (#7865, Bertrand, 04/11/2026) : la
+            // variante reste pour lire les droits déjà enregistrés.
             Feature::Aes67,
             Feature::Subsonic,
+            Feature::Upsampling,
         ]
     }
 
@@ -148,6 +152,7 @@ impl Feature {
             Feature::Concerts => "Concerts",
             Feature::Aes67 => "AES67 Output",
             Feature::Subsonic => "Subsonic Access",
+            Feature::Upsampling => "Upsampling",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
@@ -192,6 +197,7 @@ impl Feature {
             Feature::Concerts => "concerts",
             Feature::Aes67 => "aes67_output",
             Feature::Subsonic => "subsonic",
+            Feature::Upsampling => "upsampling",
             Feature::PlaylistTransfer => "playlist_transfer",
             Feature::AdvancedAlarms => "advanced_alarms",
             Feature::MultiProfiles => "multi_profiles",
@@ -1315,7 +1321,7 @@ fn is_expired(timestamp: &str, days: i64) -> bool {
 pub const URL_OFFRE_PREMIUM: &str = "https://mozaiklabs.fr/pricing";
 
 // Descendu de `tune-server/src/premium_guard.rs`, qui le ré-exporte : un
-// greffon natif (« Concerts », #2363) décide lui-même de son refus et ne peut
+// greffon natif (« Concerts » à l'origine, #2363) décide lui-même de son refus et ne peut
 // pas dépendre de `tune-server` — l'inverse ferait un cycle. Une seule forme
 // de refus de module pour l'hôte et pour les greffons, pas deux.
 /// Pourquoi un **module payant** (SKU séparé, ex. « diretta ») est indisponible.
@@ -1472,7 +1478,9 @@ mod tests {
         // `Concerts` (#2363) — sa propre tuile, incluse dans Premium (Bertrand,
         // 30/08 et 25/09/2026) ; puis à 28 avec `Aes67` (#7336, Bertrand,
         // 30/10/2026) ; puis à 29 avec `Subsonic` (#7855, Bertrand,
-        // 04/11/2026).
+        // 04/11/2026) ; puis revenu à 28 sans `Concerts` (#7865, Bertrand,
+        // 04/11/2026 : le module n'est plus Premium) ; puis à 29 avec
+        // `Upsampling` (#7614, Bertrand, 07/11/2026).
         assert_eq!(Feature::all_premium().len(), 29);
     }
 

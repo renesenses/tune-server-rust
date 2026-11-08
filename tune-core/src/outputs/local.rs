@@ -20,6 +20,7 @@ use super::traits::{
 };
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
+use crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
 use crate::poller::TRACK_END_NOTIFY;
 
 /// Why a device refused to open, as far as the backend string lets us tell.
@@ -100,6 +101,11 @@ pub(super) enum MotifDeReouverture {
     /// source (liste de cadences MESURÉE, flux ouvert à la cadence de la
     /// source) : le rouvrir est ce qu'un double-clic sur la piste aurait fait.
     PeripheriqueSuitLaSource,
+    /// #7614 — le greffon de suréchantillonnage porte ce flux, ou le choix
+    /// de la zone a changé depuis l'ouverture : la piste suivante est jouée
+    /// sur une sortie rouverte, avec le choix du moment. Jamais de bascule
+    /// pendant une piste.
+    Surechantillonnage,
 }
 
 impl MotifDeReouverture {
@@ -109,6 +115,7 @@ impl MotifDeReouverture {
             Self::BitPerfectStrict => "bitperfect_strict",
             Self::Pure => "pure",
             Self::PeripheriqueSuitLaSource => "peripherique_suit_la_source",
+            Self::Surechantillonnage => "surechantillonnage",
         }
     }
 }
@@ -365,6 +372,66 @@ impl Drop for SentinelleDuFilDeLecture {
     }
 }
 
+/// #7949 — échéance de la sortie du fil de lecture quand la sortie est
+/// détruite. La même que celle de `stop()`.
+const ECHEANCE_FIL_A_LA_DESTRUCTION: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// #7949 — une sortie locale détruite arrête son fil de lecture.
+///
+/// Sans ce `Drop`, retirer la sortie du registre (débranchement, balayage à
+/// chaud, « ignorer », bascule ASIO) fermait `stop_tx` et détachait le fil :
+/// le fil ne prend pas un canal fermé pour un arrêt, et en pause il attendait
+/// `paused` ou `force_silent`, que plus personne ne pouvait changer. Il
+/// gardait le flux cpal, donc le PCM `hw:` ou le pilote ASIO, jusqu'à l'arrêt
+/// du serveur (EBUSY / DeviceBusy au rebranchement), ou continuait de jouer
+/// sur une zone qui n'existait plus.
+///
+/// Même procédure que `stop()`, en synchrone : faire taire le rappel, envoyer
+/// l'arrêt, lever la pause, puis attendre le fil avec une échéance. Après un
+/// `stop()`, il n'y a plus ni canal ni fil : rien à faire.
+impl Drop for LocalOutput {
+    fn drop(&mut self) {
+        let fil = self
+            .play_thread
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let stop_tx = self
+            .stop_tx
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if fil.is_none() && stop_tx.is_none() {
+            return;
+        }
+        self.force_silent
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .store(true, Ordering::SeqCst);
+        if let Some(tx) = stop_tx {
+            let _ = tx.send(());
+        }
+        self.paused.store(false, Ordering::SeqCst);
+        let Some(fil) = fil else {
+            return;
+        };
+        let echeance = std::time::Instant::now() + ECHEANCE_FIL_A_LA_DESTRUCTION;
+        while !fil.is_finished() {
+            if std::time::Instant::now() >= echeance {
+                warn!(
+                    device_id = %self.device_id,
+                    attente_ms = ECHEANCE_FIL_A_LA_DESTRUCTION.as_millis() as u64,
+                    "local_audio_drop_thread_detached — le fil de lecture de la sortie \
+                     détruite n'a pas rendu la main : il tient peut-être encore le périphérique"
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = fil.join();
+    }
+}
+
 /// #3575 — dire QUI tient le PCM, au moment exact où nous n'arrivons pas à
 /// l'ouvrir.
 ///
@@ -450,6 +517,9 @@ pub(crate) mod gain_au_rendu_7264;
 // #7934 — le même remède sur les rappels natifs ASIO : témoins portables.
 #[cfg(test)]
 mod gain_au_rendu_asio_7934;
+// #7968 — le bas de la course `db60` : un niveau distinct par position.
+#[cfg(test)]
+mod bas_de_course_db60_7968_tests;
 
 // #5204 — l'enchaînement sans blanc en mode exclusif : quel bras enchaîne, la
 // règle de la frontière à format égal, et la lecture de l'en-tête suivant
@@ -476,6 +546,10 @@ mod chaine_par_la_boucle;
 // observer, drainer.
 mod backend;
 use backend::{BackendCpal, BackendLocal, DemandeDOuverture, Puits};
+
+// #6132 — la seconde sortie d'une zone (sortie double) : ouverture de B sur
+// le chemin partagé, et la recopie que le rappel f32 de A consulte.
+mod sortie_double_locale;
 
 // #3208 — la période demandée au pilote, et la garde de préchargement qui s'en
 // déduit. `cpal::BufferSize` n'est plus écrit à la main nulle part ailleurs
@@ -548,7 +622,8 @@ pub struct LocalOutput {
     /// scaled by the ReplayGain factor. Composing here means the dozen places
     /// that read a volume in the render loops need no knowledge of ReplayGain.
     volume: Arc<AtomicU32>,
-    /// The volume the user asked for, in milli-units — what the UI shows and
+    /// The volume the user asked for, in [`UNITE_DU_GAIN_DE_RENDU`] (#7968) —
+    /// what the UI shows and
     /// what mute restores. Kept apart from `volume` so a ReplayGain
     /// attenuation never looks like the slider moved on its own.
     user_volume: Arc<AtomicU32>,
@@ -698,6 +773,13 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// #8074 — vrai dès qu'un volume a été POSÉ sur cette sortie (`set_volume`
+    /// ou la sourdine : la graine de zone, un geste, une restauration). Une
+    /// sortie naît à pleine échelle (`user_volume` à l'unité) ; tant que ce
+    /// drapeau est faux, `play_url` ne laisse partir aucun échantillon à ce
+    /// gain-là : il pose d'abord le niveau de départ sans repère
+    /// ([`crate::audio::reglages_de_volume::gain_de_depart_sans_repere_local`]).
+    volume_pose: AtomicBool,
     /// #7632 — la convolution par RI est un droit Premium (`RoomCorrection`,
     /// décision du 04/11/2026). Faux par défaut : une sortie à qui personne
     /// n'a dit que le droit est accordé ne convolue pas. Posé par
@@ -714,6 +796,13 @@ pub struct LocalOutput {
     /// sous PURE la chaîne dit toujours « rien d'armé ». Seuls les réglages
     /// disent ce que PURE contourne. Lu par `signal_path_status`.
     pure_contourne_un_reglage: Arc<AtomicBool>,
+    /// #4176 — PURE a contourné le préampli GARDÉ d'un égaliseur coupé
+    /// (#5215). Les réglages ne le voient pas (l'égaliseur y est désactivé),
+    /// mais le gain gardé changeait le niveau et PURE le retire. Posé par
+    /// `set_pure_bypass(true)` d'après la chaîne d'avant la bascule, effacé à
+    /// la sortie de PURE. Lu par `signal_path_status`, avec le drapeau
+    /// ci-dessus.
+    pure_contourne_un_gain_garde: Arc<AtomicBool>,
     /// #6211 — la lecture en cours est-elle un flux SANS FIN (radio) ? Posé
     /// par l'orchestrateur à chaque lecture, d'après `live_stream`. Armé, le
     /// préampli gardé d'un égaliseur coupé s'éteint en fondu au lieu de
@@ -730,11 +819,23 @@ pub struct LocalOutput {
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
     /// piste par l'orchestrateur, comme `pure_bypass`. Défaut désarmé.
     strict_bitperfect: Arc<AtomicBool>,
+    /// #6132 — la seconde sortie de la zone qui joue ici (nom du périphérique
+    /// B), ou `None`. Posée par piste par l'orchestrateur depuis
+    /// `zone_{id}_sortie_double`, lue une fois par `play_url`.
+    seconde_sortie: std::sync::Mutex<Vec<crate::outputs::sortie_double::SecondeSortieDemandee>>,
     /// Optional headphone crossfeed effect, applied AFTER the convolver on the
     /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
     /// PURE) and only when the stream is stereo. Set per-play by the
     /// orchestrator via `set_crossfeed`.
     crossfeed: Arc<std::sync::Mutex<Option<super::super::audio::crossfeed::CrossfeedProcessor>>>,
+    /// #7614 — le choix du greffon de suréchantillonnage pour la zone qui
+    /// joue, posé par l'orchestrateur avant chaque lecture et rafraîchi par
+    /// la route de réglage. Lu à l'OUVERTURE seulement : l'étage d'une piste
+    /// garde le choix de son ouverture, et un changement ne prend effet qu'à
+    /// la frontière de piste suivante (Bertrand, 07/11/2026).
+    surechantillonnage: Arc<
+        std::sync::Mutex<Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage>>,
+    >,
     /// Repli mono de la zone en cours de lecture sur cette sortie (#2362).
     ///
     /// Quand il est armé, la chaîne somme `M = (L + R) / 2` et réémet `M` sur
@@ -842,7 +943,9 @@ pub struct LocalOutput {
     fondu_actif: Arc<AtomicBool>,
 }
 
-/// What the render callbacks multiply every sample by, in thousandths.
+/// What the render callbacks multiply every sample by, in
+/// [`UNITE_DU_GAIN_DE_RENDU`] (#7968: millionths, no longer thousandths).
+/// `user_units` is in the same unit; `rg_units` stays in thousandths.
 ///
 /// `dop` is not one more attenuation to fold in — it *replaces* the whole
 /// computation with unity, and that is the point. A DoP stream is a DSD
@@ -861,10 +964,10 @@ pub struct LocalOutput {
 /// than silently mute, but it is still a failure until the interface says so.
 fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
     if dop {
-        return 1000;
+        return UNITE_DU_GAIN_DE_RENDU;
     }
     let (rg_units, porte_par_l_eq) = decomposer_le_facteur_de_rendu(rg_units);
-    let user = user_units as f64 / 1000.0;
+    let user = user_units as f64 / f64::from(UNITE_DU_GAIN_DE_RENDU);
     let rg = rg_units as f64 / 1000.0;
     // Clamped to unity: above it, a ReplayGain boost would push peaks past
     // full scale and the user, who never touched the slider, would hear
@@ -873,7 +976,29 @@ fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
     // #5227 — puis divisé par la part de compensation que l'égaliseur porte
     // déjà dans ses échantillons : le produit rendu reste le même, rabot
     // compris, mais cette part-là traverse l'anneau avec le filtre.
-    ((user * rg).clamp(0.0, 1.0) * 1000.0 * 1000.0 / porte_par_l_eq as f64).round() as u32
+    let produit = (user * rg).clamp(0.0, 1.0) * f64::from(UNITE_DU_GAIN_DE_RENDU) * 1000.0
+        / porte_par_l_eq as f64;
+    // #7968 — un gain demandé non nul n'est jamais rendu muet par l'arrondi.
+    jamais_nul_s_il_est_demande(produit)
+}
+
+/// #7968 — le gain linéaire demandé par le curseur, en
+/// [`UNITE_DU_GAIN_DE_RENDU`]. Arrondi au plus proche, et jamais nul pour un
+/// gain strictement positif : seule la position 0 du curseur est muette.
+///
+/// `set_volume` tronquait en millièmes (`as u32`) : sur la loi `db60`, tout le
+/// bas de la course jusqu'à 5 % valait 0.
+pub(crate) fn unites_de_gain(volume: f64) -> u32 {
+    jamais_nul_s_il_est_demande(volume.clamp(0.0, 1.0) * f64::from(UNITE_DU_GAIN_DE_RENDU))
+}
+
+// `!(x > 0.0)` n'est pas `x <= 0.0` : seul le premier écarte `NaN`.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+fn jamais_nul_s_il_est_demande(unites: f64) -> u32 {
+    if !(unites > 0.0) {
+        return 0;
+    }
+    (unites.round() as u32).max(1)
 }
 
 /// #5227 — `rg_factor` porte DEUX nombres, en millièmes : le facteur
@@ -922,7 +1047,8 @@ fn dire_le_clamp_a_l_unite(device: &str, user_units: u32, rg_units: u32, dop: bo
         return;
     }
     let rg_units = decomposer_le_facteur_de_rendu(rg_units).0;
-    let demande = (user_units as f64 / 1000.0) * (rg_units as f64 / 1000.0);
+    let demande =
+        (user_units as f64 / f64::from(UNITE_DU_GAIN_DE_RENDU)) * (rg_units as f64 / 1000.0);
     if demande <= 1.0 {
         return;
     }
@@ -931,7 +1057,7 @@ fn dire_le_clamp_a_l_unite(device: &str, user_units: u32, rg_units: u32, dop: bo
         volume_units = user_units,
         replaygain_units = rg_units,
         demande_db = 20.0 * demande.log10(),
-        applique_db = 20.0 * (applique as f64 / 1000.0).log10(),
+        applique_db = 20.0 * (applique as f64 / f64::from(UNITE_DU_GAIN_DE_RENDU)).log10(),
         "local_gain_rabote_a_l_unite"
     );
 }
@@ -1239,8 +1365,8 @@ impl LocalOutput {
             origin_host: None,
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
-            volume: Arc::new(AtomicU32::new(1000)),
-            user_volume: Arc::new(AtomicU32::new(1000)),
+            volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
+            user_volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
             rg_factor: Arc::new(AtomicU32::new(1000)),
             replaygain_seul: AtomicU32::new(1000),
             // Même défaut que le réglage de zone : une sortie construite hors
@@ -1248,7 +1374,7 @@ impl LocalOutput {
             // facteur vaut 1 et rien ne change.
             compensation_de_niveau: AtomicBool::new(true),
             gain_moyen_dsp: Arc::new(AtomicU32::new(1000)),
-            pre_mute_volume: Arc::new(AtomicU32::new(1000)),
+            pre_mute_volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
             muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
             seek_offset_ms: Arc::new(AtomicU64::new(0)),
@@ -1276,10 +1402,13 @@ impl LocalOutput {
             convolver: Arc::new(std::sync::Mutex::new(None)),
             convolution_autorisee: Arc::new(AtomicBool::new(false)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            volume_pose: AtomicBool::new(false),
             flux_sans_fin: AtomicBool::new(false),
             volume_avant_egaliseur: AtomicU32::new(u32::MAX),
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
+            pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
+            seconde_sortie: std::sync::Mutex::new(Vec::new()),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
             disposition: Arc::new(std::sync::Mutex::new(None)),
@@ -1289,6 +1418,7 @@ impl LocalOutput {
             // exactement comme avant #1590.
             soft_mute_ms: Arc::new(AtomicU32::new(0)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
+            surechantillonnage: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
             transformations_reelles: Arc::new(std::sync::Mutex::new(None)),
@@ -1397,6 +1527,18 @@ impl LocalOutput {
         }
     }
 
+    /// #4176 — « Remettre à plat » : le gain gardé d'un égaliseur coupé
+    /// remonte, progressivement, jusqu'au niveau sans égaliseur, sans la borne
+    /// de volume de #6741 (voir `EqProcessor::liberer_le_gain_garde`). Sans
+    /// effet si la chaîne ne porte pas d'égaliseur coupé.
+    pub fn liberer_le_preampli_garde(&self) {
+        if let Ok(mut eq) = self.eq.lock()
+            && let Some(p) = eq.as_mut()
+        {
+            p.liberer_le_gain_garde();
+        }
+    }
+
     /// #6741 — ce qu'un égaliseur coupé applique encore (voyant de la sortie).
     pub fn preampli_garde(&self) -> Option<super::super::audio::eq::PreampliGarde> {
         if self.pure_bypass.load(Ordering::Relaxed) {
@@ -1459,7 +1601,7 @@ impl LocalOutput {
             .and_then(|c| c.as_ref().map(|p| p.gain_moyen_db()))
             .filter(|db| db.is_finite())
             .unwrap_or(0.0);
-        let produit = f64::from(volume) / 1000.0
+        let produit = f64::from(volume) / f64::from(UNITE_DU_GAIN_DE_RENDU)
             * f64::from(self.replaygain_seul.load(Ordering::SeqCst))
             / 1000.0
             * 10.0_f64.powf(-crossfeed_db / 20.0);
@@ -1590,12 +1732,65 @@ impl LocalOutput {
             .store(Self::pack_format(taux, canaux), Ordering::Relaxed);
     }
 
+    /// #7949 — installe un fil de lecture factice, sans carte son, à la place
+    /// de celui que lance `play_url` : même canal d'arrêt, même `paused`, même
+    /// `force_silent`, même sentinelle déclarée en premier. Rend la sentinelle,
+    /// qui retombe quand le fil a fini (« périphérique rendu »).
+    #[cfg(test)]
+    pub(crate) fn lancer_un_fil_factice_for_test<F>(&self, corps: F) -> Arc<AtomicBool>
+    where
+        F: FnOnce(std::sync::mpsc::Receiver<()>, Arc<AtomicBool>, Arc<AtomicBool>) + Send + 'static,
+    {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        *self.stop_tx.lock().unwrap() = Some(stop_tx);
+        let force_silent = Arc::new(AtomicBool::new(false));
+        *self.force_silent.lock().unwrap() = force_silent.clone();
+        let paused = self.paused.clone();
+        self.playing.store(true, Ordering::SeqCst);
+        let sentinelle = Arc::new(AtomicBool::new(true));
+        *self.sentinelle_du_fil.lock().unwrap() = Some(sentinelle.clone());
+        let sentinelle_du_fil = sentinelle.clone();
+        let fil = std::thread::spawn(move || {
+            let _sentinelle_du_fil = SentinelleDuFilDeLecture(sentinelle_du_fil);
+            corps(stop_rx, paused, force_silent);
+        });
+        *self.play_thread.lock().unwrap() = Some(fil);
+        sentinelle
+    }
+
     /// Force l'état de la boucle d'enchaînement, pour les tests : c'est la
     /// seule façon d'atteindre la sonde sans carte son. Même point d'entrée que
     /// `OaatOutput::set_chain_exhausted_for_test` (#1323).
     #[cfg(test)]
     pub(crate) fn set_chain_exhausted_for_test(&self, exhausted: bool) {
         self.chain_exhausted.store(exhausted, Ordering::SeqCst);
+    }
+
+    /// #4176 — faire passer `secondes` de silence stéréo par la chaîne DSP,
+    /// au format déclaré, par la fonction de la boucle de lecture
+    /// (`apply_local_dsp`) : fondus et rampes du gain gardé avancent, et un
+    /// égaliseur coupé revenu au repos est retiré, comme en lecture.
+    #[cfg(test)]
+    pub(crate) fn jouer_du_pcm_pour_test(&self, secondes: f64) {
+        let (taux, canaux) = self.current_format().expect("format déclaré");
+        let trames = (f64::from(taux) * secondes) as usize;
+        let paquet = (taux / 10) as usize;
+        let mut faites = 0;
+        while faites < trames {
+            let n = paquet.min(trames - faites);
+            let mut pcm = vec![0.0_f32; n * usize::from(canaux)];
+            apply_local_dsp(
+                &mut pcm,
+                &self.eq,
+                &self.convolver,
+                &self.crossfeed,
+                &self.pure_bypass,
+                &self.mono_downmix,
+                canaux,
+                false,
+            );
+            faites += n;
+        }
     }
 
     /// Lecture du drapeau PURE, pour les tests : c'est lui que `apply_local_dsp`
@@ -1693,6 +1888,23 @@ impl LocalOutput {
     /// orchestrator so a bit-perfect (PURE) zone skips convolution while other
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
+        // #4176 — relevé AVANT la bascule : sous PURE, `preampli_garde` ne
+        // dit plus rien, et la chaîne va être vidée. Un début de piste sous
+        // PURE (chaîne déjà vide) n'efface pas ce qu'une bascule a relevé ;
+        // seule la sortie de PURE le fait.
+        if bypass {
+            let garde = self
+                .eq
+                .lock()
+                .is_ok_and(|e| e.as_ref().is_some_and(|p| p.preampli_garde().is_some()));
+            if garde {
+                self.pure_contourne_un_gain_garde
+                    .store(true, Ordering::Relaxed);
+            }
+        } else {
+            self.pure_contourne_un_gain_garde
+                .store(false, Ordering::Relaxed);
+        }
         self.pure_bypass.store(bypass, Ordering::Relaxed);
         // #4685 — un DSP contourné ne change aucun niveau : sa compensation
         // doit tomber avec lui.
@@ -1719,7 +1931,7 @@ impl LocalOutput {
             true,
             true,
             false,
-            1000,
+            UNITE_DU_GAIN_DE_RENDU,
             &self.eq,
             &self.convolver,
             &self.crossfeed,
@@ -1731,6 +1943,72 @@ impl LocalOutput {
     /// #3973 — armer (ou désarmer) « bit-perfect strict » pour la zone qui
     /// joue sur cette sortie. Posé par l'orchestrateur à chaque lecture, à
     /// côté de `set_pure_bypass`.
+    /// #6132 — la seconde sortie (sortie double) de la zone qui va jouer :
+    /// le nom d'un autre périphérique local, ou `None`. Prise en compte à la
+    /// prochaine ouverture du périphérique.
+    pub fn set_secondes_sorties(
+        &self,
+        demandes: Vec<crate::outputs::sortie_double::SecondeSortieDemandee>,
+    ) {
+        *self
+            .seconde_sortie
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = demandes
+            .into_iter()
+            .filter(|d| !d.nom.trim().is_empty())
+            .collect();
+    }
+
+    /// #6132 — le curseur de volume de cette sortie (millièmes), celui que
+    /// `set_volume` et la sourdine écrivent. Partagé avec la sortie double
+    /// d'une AUTRE zone qui recopie vers ce périphérique : chaque membre d'un
+    /// groupe garde son volume.
+    pub fn volume_utilisateur(&self) -> Arc<AtomicU32> {
+        self.user_volume.clone()
+    }
+
+    /// #8074 — vrai si un volume a déjà été posé sur cette sortie.
+    pub fn volume_est_pose(&self) -> bool {
+        self.volume_pose.load(Ordering::SeqCst)
+    }
+
+    /// #8074 — la garde du premier échantillon, appelée par `play_url` avant
+    /// d'ouvrir quoi que ce soit.
+    ///
+    /// Une `LocalOutput` naît à pleine échelle. Les naissances connues posent
+    /// la graine de la zone (`orchestrator::ensemencer_la_sortie_locale_neuve`),
+    /// mais une naissance oubliée — c'était le balayage à chaud des sorties
+    /// WASAPI quand ASIO est choisi — jouait le premier morceau à 100 % du
+    /// gain, quel que soit le curseur affiché. Ici, la sortie qui n'a jamais
+    /// reçu de volume part au niveau de départ sans repère (30 % du curseur
+    /// `db60`, −42 dB), jamais à l'unité.
+    ///
+    /// PURE et bit-perfect strict n'y passent pas : leur contrat est de ne
+    /// pas toucher au signal, et leur volume (100 %) est posé par la graine.
+    /// Rend vrai quand la garde a abaissé le gain.
+    pub(crate) async fn partir_bas_si_aucun_volume_pose(&self) -> bool {
+        if self.volume_pose.load(Ordering::SeqCst)
+            || self.pure_bypass.load(Ordering::Relaxed)
+            || self.strict_bitperfect.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        let gain = crate::audio::reglages_de_volume::gain_de_depart_sans_repere_local();
+        warn!(
+            device = %self.device_name,
+            gain,
+            "local_output_volume_jamais_pose_depart_bas"
+        );
+        OutputTarget::set_volume(self, gain).await.is_ok()
+    }
+
+    pub fn secondes_sorties(&self) -> Vec<crate::outputs::sortie_double::SecondeSortieDemandee> {
+        self.seconde_sortie
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn set_strict_bitperfect(&self, strict: bool) {
         self.strict_bitperfect.store(strict, Ordering::Relaxed);
     }
@@ -1974,6 +2252,26 @@ impl LocalOutput {
     pub fn set_crossfeed(&self, cf: Option<super::super::audio::crossfeed::CrossfeedProcessor>) {
         *self.crossfeed.lock().unwrap() = cf;
         self.recalculer_la_compensation();
+    }
+
+    /// #7614 — pose (ou retire avec `None`) le choix du greffon de
+    /// suréchantillonnage de la zone. Sans effet sur la piste en cours :
+    /// l'étage d'une piste garde le choix de son ouverture ; la frontière
+    /// suivante compare et rouvre la sortie si le choix a changé.
+    pub fn set_surechantillonnage(
+        &self,
+        choix: Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage>,
+    ) {
+        if let Ok(mut slot) = self.surechantillonnage.lock() {
+            *slot = choix;
+        }
+    }
+
+    /// #7614 — le choix posé, tel que la prochaine ouverture le lira.
+    pub fn surechantillonnage(
+        &self,
+    ) -> Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage> {
+        self.surechantillonnage.lock().ok().and_then(|c| c.clone())
     }
 
     /// Remplacer le crossfeed **pendant** la lecture, en emportant les lignes à
@@ -2739,6 +3037,14 @@ mod dop_continu_7704;
 // #7703 — la quantification finale native est dithérée, après le volume.
 #[cfg(test)]
 mod quantification_finale_7703;
+
+// #7949 — une sortie locale retirée du registre rend son fil et son périphérique.
+#[cfg(test)]
+mod retrait_du_registre_7949;
+
+// #8074 — le premier morceau après le démarrage ne part jamais à pleine échelle.
+#[cfg(test)]
+mod premier_play_au_gain_de_zone_8074;
 
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
@@ -3532,7 +3838,7 @@ fn render_local_shared_f32_callback(
     let read = ring.pop(&mut output[debut..]);
     let fin = debut + read;
     ramp.dop.observer(&output[debut..fin], haut_f32);
-    let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+    let v = volume.load(Ordering::Relaxed) as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
     ramp.apply(&mut output[debut..fin], v);
     if fin < output.len() {
         ramp.dop.combler(&mut output[fin..], 0.0, repos_f32);
@@ -3588,7 +3894,7 @@ where
         }
         data_started.store(true, Ordering::Release);
     }
-    let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+    let v = volume.load(Ordering::Relaxed) as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
     let read = ramp.apply_mapped(v, |s| s.into_sample(), |map| ring.pop_mapped(output, map));
     output[read..].fill(zero);
     read
@@ -4426,7 +4732,7 @@ fn windows_signal_path_status(
     let dsp = local_dsp_runtime_state(eq, convolver, crossfeed, pure_bypass, mono_downmix, dop);
     let volume = if dop {
         OutputVolumeState::BypassedDop
-    } else if volume_units == 1000 {
+    } else if volume_units == UNITE_DU_GAIN_DE_RENDU {
         OutputVolumeState::Unity
     } else {
         OutputVolumeState::Applied
@@ -4623,7 +4929,7 @@ fn prepare_windows_native_pcm(
     };
     let canaux_adaptes = matrice.is_some() || declaree.is_some() || sortie != channels;
     let bit_perfect = dop
-        || (volume_units == 1000
+        || (volume_units == UNITE_DU_GAIN_DE_RENDU
             && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass, mono_downmix)
             && !canaux_adaptes);
     if dop && sortie != channels {
@@ -4661,7 +4967,7 @@ fn prepare_windows_native_pcm(
                 declaree.as_deref(),
             );
         }
-        let volume = volume_units as f32 / 1000.0;
+        let volume = volume_units as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
         if volume != 1.0 {
             for sample in &mut float {
                 *sample *= volume;
@@ -4766,6 +5072,57 @@ struct EtageDeConversion<'a> {
     /// Le format réellement OUVERT par le périphérique, à l'autre bout.
     sortie: FormatOuvert,
     needs_resample: bool,
+    /// #7614 — le greffon de suréchantillonnage, quand il porte la cadence
+    /// de ce flux. Exclusif de `needs_resample`.
+    surechantillonneur: Option<SurechDeLEtage<'a>>,
+}
+
+/// #7614 — l'étage du suréchantillonneur (quand il tourne) et le choix de la
+/// zone, relu à la frontière de piste seulement.
+pub(super) struct SurechDeLEtage<'a> {
+    pub(super) etage: Option<crate::audio::surechantillonnage::EtageSurechantillonneur>,
+    pub(super) choix_de_la_zone:
+        &'a std::sync::Mutex<Option<crate::audio::surechantillonnage::ChoixSurechantillonnage>>,
+    /// Les réglages lus à l'ouverture, que l'étage ait pu tourner ou non.
+    pub(super) reglages_a_l_ouverture: Option<crate::audio::surechantillonnage::UpsamplerSettings>,
+}
+
+impl SurechDeLEtage<'_> {
+    /// Le choix de la zone est-il encore celui de l'ouverture ? Faux dès que
+    /// le greffon a été activé, désactivé, retiré, ou que son filtre ou ses
+    /// plafonds ont changé : la frontière rouvre alors la sortie, et le
+    /// nouveau choix s'applique à la piste qui commence.
+    pub(super) fn choix_inchange(&self) -> bool {
+        let actuel = self
+            .choix_de_la_zone
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|c| c.reglages.clone()));
+        actuel == self.reglages_a_l_ouverture
+    }
+}
+
+/// #7614 — le greffon peut-il s'ouvrir sur ce flux ? Jamais sous PURE, jamais
+/// sur un porteur DoP : un flux 24 bits dont l'amorce est un porteur, ou trop
+/// courte pour l'écarter, garde son chemin.
+pub(super) fn surechantillonneur_admis_a_l_ouverture(
+    spec: AudioSpec,
+    amorce: &[u8],
+    pure: bool,
+    dop: bool,
+) -> bool {
+    if pure || dop {
+        return false;
+    }
+    let canaux = spec.canaux();
+    let bits = spec.profondeur().bits_declares();
+    if bits == 24 {
+        let sonde = DOP_DETECT_FRAMES * usize::from(canaux) * 3;
+        if amorce.len() < sonde || is_dop_pcm(amorce, bits, canaux) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Ce qu'une poussée vers le puits a produit.
@@ -4830,6 +5187,37 @@ impl EtageDeConversion<'_> {
         let new_ch = nouvelle_spec.canaux();
         let output_sr = self.sortie.cadence;
         let output_ch = self.sortie.canaux;
+        // #7614 — le suréchantillonneur ne change jamais de réglage pendant
+        // un flux : un choix de zone différent de celui de l'ouverture, PURE
+        // allumé, ou une piste d'un autre format, et la sortie est rouverte
+        // pour la piste suivante. À format et choix identiques, l'étage fait
+        // partie du flux continu : son état est conservé (gapless).
+        if let Some(surech) = &self.surechantillonneur {
+            if !surech.choix_inchange() {
+                journaliser_la_reouverture(
+                    MotifDeReouverture::Surechantillonnage,
+                    new_sr,
+                    output_sr,
+                    device_name,
+                );
+                return Err(MotifDeReouverture::Surechantillonnage);
+            }
+            if surech.etage.is_some() {
+                if regles.pure || new_sr != self.sample_rate() || new_ch != self.channels() {
+                    let motif = if regles.pure {
+                        MotifDeReouverture::Pure
+                    } else {
+                        MotifDeReouverture::Surechantillonnage
+                    };
+                    journaliser_la_reouverture(motif, new_sr, output_sr, device_name);
+                    return Err(motif);
+                }
+                self.spec = nouvelle_spec;
+                self.pcm_kind =
+                    LocalPcmKind::for_bit_depth(nouvelle_spec.profondeur().bits_declares());
+                return Ok(false);
+            }
+        }
         // #5416 — la piste qui se termine est DÉJÀ convertie (le périphérique
         // n'a pas suivi sa cadence à l'ouverture : WASAPI partagé à 192 kHz,
         // greffon…) et la suivante a la MÊME cadence source. Rouvrir
@@ -4930,6 +5318,13 @@ impl EtageDeConversion<'_> {
             .process_pcm_chunk(&mut self.en_attente, self.spec, &mut self.pcm_kind)
     }
 
+    /// #7614 — le greffon de suréchantillonnage porte-t-il ce flux ?
+    fn surechantillonneur_actif(&self) -> bool {
+        self.surechantillonneur
+            .as_ref()
+            .is_some_and(|s| s.etage.is_some())
+    }
+
     /// Adaptation de canaux puis rééchantillonnage, dans cet ordre et lui seul.
     fn convertir(&mut self, mut mots: Vec<f32>) -> Vec<f32> {
         let (source, sortie) = (self.spec.canaux(), self.sortie.canaux);
@@ -4962,7 +5357,14 @@ impl EtageDeConversion<'_> {
             // gardes #3233 et REF-7 lisent ici, même refus en silence.
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
-        if self.needs_resample {
+        if let Some(etage) = self
+            .surechantillonneur
+            .as_mut()
+            .and_then(|s| s.etage.as_mut())
+        {
+            // #7614 — le greffon porte la cadence ; rubato ne tourne pas.
+            mots = etage.traiter(&mots);
+        } else if self.needs_resample {
             mots = rubato_resample_chunk(
                 &mut self.resampler,
                 &mots,
@@ -5086,13 +5488,23 @@ impl Etage for EtageDeConversion<'_> {
     /// gapless qui change de cadence ; à cadence identique le rééchantillonneur
     /// fait partie du flux continu et ne se vide pas.
     fn vider(&mut self, puits: &mut (dyn PuitsDEchantillons + '_)) -> bool {
-        let flushed = rubato_resample_chunk(
-            &mut self.resampler,
-            &[],
-            self.sortie.canaux,
-            true,
-            &mut self.resample_leftover,
-        );
+        // #7614 — quand le greffon porte la cadence, la queue est celle de
+        // son noyau (exactement son délai) ; sinon celle de rubato. Un seul
+        // `livrer` dans les deux cas (garde REF-7 de #3233).
+        let flushed = match self
+            .surechantillonneur
+            .as_mut()
+            .and_then(|s| s.etage.as_mut())
+        {
+            Some(etage) => etage.vider(),
+            None => rubato_resample_chunk(
+                &mut self.resampler,
+                &[],
+                self.sortie.canaux,
+                true,
+                &mut self.resample_leftover,
+            ),
+        };
         if flushed.is_empty() {
             return true;
         }
@@ -5109,8 +5521,16 @@ impl Etage for EtageDeConversion<'_> {
             self.pcm.dop_active.load(Ordering::Relaxed),
             self.pcm.pure_bypass.load(Ordering::Relaxed),
         );
-        TransformationsReelles::nouvelles(self.spec, self.sortie, self.dsp_actif())
-            .avec_reorganisation_canaux(reordonne)
+        let t = TransformationsReelles::nouvelles(self.spec, self.sortie, self.dsp_actif())
+            .avec_reorganisation_canaux(reordonne);
+        match self
+            .surechantillonneur
+            .as_ref()
+            .and_then(|s| s.etage.as_ref())
+        {
+            Some(etage) => t.avec_surechantillonnage(etage.filtre(), etage.reserve_db()),
+            None => t,
+        }
     }
 }
 
@@ -5840,6 +6260,11 @@ impl OutputTarget for LocalOutput {
         let chrono_demarrage = std::time::Instant::now();
         self.stop().await.ok();
 
+        // #8074 — aucun échantillon ne sort au gain de naissance (pleine
+        // échelle) : une sortie à qui personne n'a encore posé de volume part
+        // BAS, avant l'ouverture du flux et du périphérique.
+        self.partir_bas_si_aucun_volume_pose().await;
+
         // Frontière de piste : le convolveur vit aussi longtemps que la sortie,
         // il ne doit pas verser la queue de la piste précédente dans celle-ci
         // (JP Robbe, revue de #2268). `play_url` est le seul point par lequel
@@ -6026,6 +6451,8 @@ impl OutputTarget for LocalOutput {
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
+        // #6132 — lue UNE fois par piste, comme `strict_bitperfect`.
+        let seconde_sortie = self.secondes_sorties();
         let mono_downmix = self.mono_downmix.clone();
         let reaffectation = self.reaffectation.clone();
         let disposition = self.disposition.clone();
@@ -6033,6 +6460,7 @@ impl OutputTarget for LocalOutput {
         #[cfg(all(target_os = "windows", feature = "asio"))]
         let canaux_de_carte = self.canaux_de_carte();
         let crossfeed = self.crossfeed.clone();
+        let surechantillonnage = self.surechantillonnage.clone();
         let dop_active = self.dop_active.clone();
         // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
         // plutôt que trois atomiques de plus dans des fermetures qui en portent
@@ -6264,6 +6692,16 @@ impl OutputTarget for LocalOutput {
                 // No WAV header — this is a compressed stream (FLAC, MP3, AAC).
                 // Read the rest of the stream, decode with symphonia, and play.
                 info!("local_audio_non_wav_stream_detected_decoding");
+                // #6132 — la sortie double n'est branchée que sur le chemin
+                // PCM partagé (`BackendCpal`) ; dit plutôt que tu.
+                for nom in seconde_sortie.iter().map(|d| d.nom.as_str()) {
+                    warn!(
+                        device = %device_name,
+                        seconde_sortie = %nom,
+                        motif = "chemin_compresse",
+                        "sortie_double_refusee — la zone joue sur sa sortie seule"
+                    );
+                }
 
                 // Read the entire remaining stream
                 let mut all_data = header_buf.clone();
@@ -6974,6 +7412,23 @@ impl OutputTarget for LocalOutput {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let bras =
                 enchainement_exclusif::bras_de_cette_plateforme(exclusive_mode, &audio_backend);
+            // #6132 — la sortie double n'existe que sur le chemin partagé.
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if bras != enchainement_exclusif::BrasDeLecture::CpalPartage
+                && !seconde_sortie.is_empty()
+            {
+                let nom = seconde_sortie
+                    .iter()
+                    .map(|d| d.nom.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                warn!(
+                    device = %device_name,
+                    seconde_sortie = %nom,
+                    motif = "mode_exclusif",
+                    "sortie_double_refusee — la zone joue sur sa sortie seule"
+                );
+            }
 
             #[cfg(target_os = "macos")]
             if bras == enchainement_exclusif::BrasDeLecture::CoreAudioExclusif {
@@ -7293,7 +7748,32 @@ impl OutputTarget for LocalOutput {
                 soft_mute: soft_mute.clone(),
                 position_ms: &position_ms,
             };
-            let mut backend = match BackendCpal::ouvrir(&demande) {
+            // #7614 — le greffon de suréchantillonnage, lu UNE fois, à
+            // l'ouverture : ni sous PURE, ni pour un porteur DoP (l'amorce
+            // 24 bits le dit, même règle que la matrice de canaux), ni quand
+            // l'amorce est trop courte pour l'écarter. #6132 — ni quand la zone
+            // recopie A vers des sorties suiveuses : elles s'ouvrent à la
+            // cadence de A, qu'elles n'acceptent pas forcément.
+            let choix_du_surechantillonneur = surechantillonnage
+                .lock()
+                .ok()
+                .and_then(|c| c.clone())
+                .filter(|_| seconde_sortie.is_empty())
+                .filter(|_| {
+                    surechantillonneur_admis_a_l_ouverture(
+                        spec,
+                        header_buf.get(data_offset..).unwrap_or_default(),
+                        pure_bypass.load(Ordering::Relaxed),
+                        dop_active.load(Ordering::Relaxed),
+                    )
+                });
+            let ouverture = match choix_du_surechantillonneur.as_ref() {
+                Some(choix) => {
+                    BackendCpal::ouvrir_pour_le_surechantillonneur(&demande, Some(choix))
+                }
+                None => BackendCpal::ouvrir(&demande),
+            };
+            let mut backend = match ouverture {
                 Ok(backend) => backend,
                 Err(refus) => {
                     refus.rapporter(&device_name, &open_failure);
@@ -7301,6 +7781,20 @@ impl OutputTarget for LocalOutput {
                     return;
                 }
             };
+            // #6132 — la sortie double : B s'ouvre et la recopie s'installe
+            // AVANT le démarrage de A, pour que la ligne à retard de A soit
+            // en place dès sa première période.
+            if !seconde_sortie.is_empty() {
+                backend.brancher_les_secondes_sorties(
+                    &seconde_sortie,
+                    strict_bitperfect,
+                    sortie_double_locale::ReglagesDeA {
+                        volume: volume.clone(),
+                        facteur_de_rendu: rg_factor_ref.clone(),
+                        dop: dop_active.clone(),
+                    },
+                );
+            }
             let sortie = backend.format_ouvert();
             // #4953 — le périphérique vient-il de prouver qu'il suit la
             // cadence de la source ? Lu UNE fois, à l'ouverture : c'est ce
@@ -7349,7 +7843,43 @@ impl OutputTarget for LocalOutput {
                 0
             };
             let skipped_bytes: u64 = 0;
-            let needs_resample = output_sr != sample_rate;
+            // #7614 — le flux s'est ouvert à la cadence négociée par le greffon :
+            // c'est lui qui porte la cadence, rubato ne tourne pas.
+            let etage_du_surechantillonneur = backend
+                .cadence_du_surechantillonneur()
+                .zip(choix_du_surechantillonneur.as_ref())
+                .and_then(|(vers, choix)| {
+                    match crate::audio::surechantillonnage::EtageSurechantillonneur::nouveau(
+                        &choix.reglages,
+                        sample_rate,
+                        vers,
+                        output_ch,
+                    ) {
+                        Ok(etage) => {
+                            info!(
+                                from_sr = sample_rate,
+                                to_sr = vers,
+                                filter = etage.filtre(),
+                                headroom_db = etage.reserve_db(),
+                                "local_audio_upsampler_engaged"
+                            );
+                            Some(etage)
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "local_audio_upsampler_refused");
+                            None
+                        }
+                    }
+                });
+            if choix_du_surechantillonneur.is_some() && etage_du_surechantillonneur.is_none() {
+                info!(
+                    device = %device_name,
+                    source_sr = sample_rate,
+                    output_sr,
+                    "local_audio_upsampler_not_applied"
+                );
+            }
+            let needs_resample = output_sr != sample_rate && etage_du_surechantillonneur.is_none();
             // #3233 — Pierre M, fil 1043 : « DSD : le temps défile, pas de
             // son ». Un porteur DoP ne survit ni au sinc ni à l'adaptation de
             // canaux : le marqueur 0x05/0xFA alterne à CHAQUE trame, c'est un
@@ -7444,6 +7974,13 @@ impl OutputTarget for LocalOutput {
                 spec,
                 sortie: FormatOuvert::new(output_sr, output_ch),
                 needs_resample,
+                surechantillonneur: Some(SurechDeLEtage {
+                    etage: etage_du_surechantillonneur,
+                    choix_de_la_zone: &surechantillonnage,
+                    reglages_a_l_ouverture: choix_du_surechantillonneur
+                        .as_ref()
+                        .map(|c| c.reglages.clone()),
+                }),
             };
             // REF-6b : dès que l'étage existe, l'écran peut savoir ce qu'il fait.
             publier_les_transformations(&transformations_reelles, &etage);
@@ -7716,6 +8253,11 @@ impl OutputTarget for LocalOutput {
                     next_url = %next.url,
                     "local_audio_gapless_chaining_next_track"
                 );
+                // #6132 — piste suivante : le retard commun des sorties
+                // suiveuses se réajustera au premier silence, jamais pendant
+                // le son. (Une piste rouverte, sans enchaînement, le recalcule
+                // d'office à l'ouverture.)
+                backend.demander_un_reajustement();
 
                 // La bascule des métadonnées et de la position a lieu PLUS BAS,
                 // une fois le flux suivant confirmé chaînable (en-tête WAV lu).
@@ -7989,7 +8531,7 @@ impl OutputTarget for LocalOutput {
 
             // Flush the resampler: process any leftover frames + drain internal delay
             if http_eof
-                && etage.needs_resample
+                && (etage.needs_resample || etage.surechantillonneur_actif())
                 && !force_silent.load(Ordering::Relaxed)
                 && !device_gone.load(Ordering::Relaxed)
             {
@@ -8265,13 +8807,15 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        let v = (volume.clamp(0.0, 1.0) * 1000.0) as u32;
+        let v = unites_de_gain(volume);
         self.user_volume.store(v, Ordering::SeqCst);
         self.recompute_effective_volume();
         if v > 0 {
             self.muted.store(false, Ordering::SeqCst);
         }
         self.reborner_le_preampli_garde();
+        // #8074 — un volume est posé : `play_url` ne le remplacera plus.
+        self.volume_pose.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -8289,12 +8833,20 @@ impl OutputTarget for LocalOutput {
             self.muted.store(true, Ordering::SeqCst);
         } else {
             let restored = self.pre_mute_volume.load(Ordering::SeqCst);
-            self.user_volume
-                .store(if restored > 0 { restored } else { 1000 }, Ordering::SeqCst);
+            self.user_volume.store(
+                if restored > 0 {
+                    restored
+                } else {
+                    UNITE_DU_GAIN_DE_RENDU
+                },
+                Ordering::SeqCst,
+            );
             self.muted.store(false, Ordering::SeqCst);
         }
         self.recompute_effective_volume();
         self.reborner_le_preampli_garde();
+        // #8074 — la sourdine est un niveau posé, comme `set_volume`.
+        self.volume_pose.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -8326,7 +8878,8 @@ impl OutputTarget for LocalOutput {
                 state: TransportState::Playing,
                 position_ms: duration_ms.saturating_add(5000),
                 duration_ms,
-                volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
+                volume: self.user_volume.load(Ordering::Relaxed) as f64
+                    / f64::from(UNITE_DU_GAIN_DE_RENDU),
                 muted: self.muted.load(Ordering::Relaxed),
                 current_uri: self.current_uri.lock().unwrap().clone(),
                 track_title: self.track_title.lock().unwrap().clone(),
@@ -8363,7 +8916,8 @@ impl OutputTarget for LocalOutput {
                 .load(Ordering::Relaxed)
                 .saturating_sub(self.fondu_retenue_ms.load(Ordering::Relaxed)),
             duration_ms,
-            volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
+            volume: self.user_volume.load(Ordering::Relaxed) as f64
+                / f64::from(UNITE_DU_GAIN_DE_RENDU),
             muted: self.muted.load(Ordering::Relaxed),
             current_uri: self.current_uri.lock().unwrap().clone(),
             track_title: self.track_title.lock().unwrap().clone(),
@@ -8390,7 +8944,8 @@ impl OutputTarget for LocalOutput {
             .and_then(|status| status.clone())?;
         status.dsp = verdict_pure_selon_les_reglages(
             status.dsp,
-            self.pure_contourne_un_reglage.load(Ordering::Relaxed),
+            self.pure_contourne_un_reglage.load(Ordering::Relaxed)
+                || self.pure_contourne_un_gain_garde.load(Ordering::Relaxed),
         );
         Some(status)
     }
@@ -9050,6 +9605,10 @@ mod empreinte_asio_f70496;
 /// REF-6b (#2219) — l'étage dit ce qu'il fait, et `LocalOutput` le publie.
 #[cfg(test)]
 mod transformations_reelles_de_l_etage_ref6b;
+
+/// #7614 — le greffon de suréchantillonnage dans l'étage de la sortie locale.
+#[cfg(test)]
+mod surechantillonnage_7614;
 
 /// #6057 — l'étage route par la disposition déclarée par le fichier.
 #[cfg(test)]

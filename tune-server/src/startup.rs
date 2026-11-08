@@ -1083,6 +1083,17 @@ fn recalculer_les_compilations(state: &AppState) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "compilations_recalcul_impossible"),
     }
+    // #6459 — meme principe pour les albums retrogrades sous « Unknown
+    // Artist » : la base garde l'artiste de leurs pistes.
+    match tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+        .rendre_leur_artiste_aux_albums_inconnus()
+    {
+        Ok(bilan) if bilan.rendus > 0 => {
+            info!(?bilan, "albums_inconnus_rendus_au_demarrage");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "albums_inconnus_reprise_impossible"),
+    }
 }
 
 /// Re-rattache les favoris orphelins aux items vivants retrouvés par identité
@@ -2541,15 +2552,13 @@ pub(crate) async fn enregistrer_les_sorties_locales(
         // logiciel local, lui, n'appartient qu'à Tune, et sa valeur de départ
         // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
         // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
-        if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
-            tune_core::orchestrator::ensemencer_le_volume_local(
-                &state.backend,
-                &zone,
-                &device_id,
-                &local_out,
-            )
-            .await;
-        }
+        // #8074 — sans zone en base, la sortie part BAS, pas à pleine échelle.
+        tune_core::orchestrator::ensemencer_la_sortie_locale_neuve(
+            &state.backend,
+            &device_id,
+            &local_out,
+        )
+        .await;
         outputs.register(Box::new(local_out));
         info!(
             name = %dev.name,
@@ -2785,6 +2794,7 @@ pub(crate) async fn remplacer_le_repli_wasapi(
         enregistrees: enregistrees.clone(),
         ..Default::default()
     };
+    let mut sorties_retirees = Vec::new();
     {
         let mut outputs = state.outputs.lock().await;
         for id in repli {
@@ -2804,10 +2814,13 @@ pub(crate) async fn remplacer_le_repli_wasapi(
                 rapport.gardees_en_lecture.push(id.clone());
                 continue;
             }
-            outputs.remove(id);
+            sorties_retirees.extend(outputs.remove(id));
             rapport.retirees.push(id.clone());
         }
     }
+    // #7949 — arrêtées hors du verrou du registre : une sortie WASAPI en
+    // pause gardait son fil et son périphérique.
+    tune_core::outputs::registry::arreter_les_sorties_retirees(sorties_retirees).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     for id in &rapport.retirees {
         let _ = zone_repo.set_online_by_device(id, false);
@@ -3885,7 +3898,8 @@ mod restore_zone_volumes_tests {
         let sortie = tune_core::outputs::local::LocalOutput::new("Test".into());
         ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
 
-        let gain = sortie.gain_de_rendu().load(Ordering::SeqCst) as f64 / 1000.0;
+        let gain = sortie.gain_de_rendu().load(Ordering::SeqCst) as f64
+            / f64::from(tune_core::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU);
         let attendu = tune_core::orchestrator::volume_avec_trim(0.8, -6.0);
         assert!(
             (gain - attendu).abs() < 2e-3,
@@ -3914,7 +3928,10 @@ mod restore_zone_volumes_tests {
         ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
 
         let gain = sortie.gain_de_rendu().load(Ordering::SeqCst);
-        assert!(gain <= 1000, "gain de rendu {gain}/1000 : plafond franchi");
+        assert!(
+            gain <= tune_core::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+            "gain de rendu {gain} : plafond de l'unité franchi"
+        );
     }
 
     /// #5695 — la graine d'une sortie locale sous PURE forcé : 100 %, SANS
@@ -3945,8 +3962,9 @@ mod restore_zone_volumes_tests {
         ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
         let gain = sortie.gain_de_rendu().load(Ordering::SeqCst);
         assert_eq!(
-            gain, 1000,
-            "gain de rendu {gain}/1000 sous PURE forcé : le trim a été composé"
+            gain,
+            tune_core::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU,
+            "gain de rendu {gain} sous PURE forcé : le trim a été composé"
         );
     }
     /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.

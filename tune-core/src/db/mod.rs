@@ -6,8 +6,12 @@ pub mod album_distinct_repo;
 pub mod album_doublons;
 pub mod album_metadata_repo;
 pub mod album_repo;
+/// #8077 — les apports d'un service à un album local (SQLite 142 / PG 108).
+pub mod apports_service;
 pub mod artist_repo;
 pub mod backend;
+/// Contrôle parental, étape 2 (#7974) : bail d'écoute et temps écouté.
+pub mod bail_d_ecoute;
 pub mod champs_tenus;
 pub mod cles_clients;
 pub mod coffrets_auto;
@@ -22,6 +26,8 @@ pub mod dossiers_des_collections;
 pub mod ecoutes_importees;
 pub mod edition_album;
 pub mod engine;
+/// #7983 — la trace des tentatives de la passe d'enrichissement des métadonnées.
+pub mod enrich_tentatives;
 pub mod facet_filter;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
@@ -35,6 +41,8 @@ pub mod home_queries;
 pub mod ignored_device_repo;
 /// Lectures SQLite en cours, pour le relevé d'un gel de l'exécuteur (#5677).
 pub mod lectures_en_cours;
+/// #7619 — la révision de la bibliothèque, clé des caches de lecture (L4, L5).
+pub mod library_revision;
 pub mod listening_resume;
 /// Registre DURABLE des serveurs multimédia (#2219, phase 1) — sur le modèle
 /// de `network_mounts` : l'intention d'un côté, le constat de l'autre.
@@ -109,6 +117,9 @@ mod album_dr_provenance_tests;
 mod ecrivains_pendant_un_lot_de_scan_tests;
 #[cfg(test)]
 mod filtre_dr_190_tests;
+/// #7979 — la graphie accentuée des balises reprend la fiche artiste.
+#[cfg(test)]
+mod graphie_artiste_tests_7979;
 #[cfg(test)]
 mod lenteur_albums_4800_tests;
 #[cfg(test)]
@@ -126,6 +137,8 @@ mod miroirs_de_qualite_7694_tests;
 mod notes_et_repartitions_7849_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
+#[cfg(test)]
+mod recherche_debut_de_mot_7619_tests;
 #[cfg(test)]
 mod replieur_wal_tests;
 /// Fil 2130 — « Reprendre l'écoute » : jointure en UNION ALL et index de

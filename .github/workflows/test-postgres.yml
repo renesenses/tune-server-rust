@@ -229,6 +229,47 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7856 -- --nocapture --test-threads=1
 
+      # #7974 — bail d'écoute : temps écouté cumulé, budget du jour et de la
+      # semaine, remise à zéro quotidienne, sur un vrai PostgreSQL.
+      - name: Bail d'écoute du contrôle parental sur PostgreSQL (#7974)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7974 -- --nocapture --test-threads=1
+
+      # #8088 — contrôle parental : `tracks.explicit` (PG 107) sur une VRAIE
+      # base : écrit, relu, gardé hors scan, retiré par le scan, marques des
+      # pistes et albums, index partiel. Le témoin vide `tracks` : il tourne
+      # seul, dans sa propre étape.
+      - name: Contenus explicites sur PostgreSQL (#8088)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8088 -- --nocapture --test-threads=1
+
+      # #7979 — un nom d'artiste corrigé dans les balises (accents ajoutés)
+      # reprend la fiche, sans osciller ; un nom différent (espace ajouté)
+      # obtient la sienne. Sans cette étape, l'épreuve prendrait son saut
+      # annoncé.
+      - name: Nom d'artiste corrigé dans les balises sur PostgreSQL (#7979)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7979 -- --nocapture --test-threads=1
+
+      # #8062 — écoutes des pistes de service (playlist, album) par
+      # identifiant du service, tous profils confondus. Sans cette étape, le
+      # témoin prendrait son saut annoncé.
+      - name: Écoutes des pistes de service sur PostgreSQL (#8062)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8062 -- --nocapture --test-threads=1
+
+      # #7980 — une écoute ne compte que pour la piste de sa provenance
+      # (locale, UPnP, service). Sans cette étape, le témoin prendrait son
+      # saut annoncé.
+      - name: Écoutes d'une piste selon sa provenance sur PostgreSQL (#7980)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7980 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -242,6 +283,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_group_by_strict_historique -- --nocapture --test-threads=1
+
+      # #8066 — remplacer un titre de service indisponible dans une playlist
+      # locale, à sa place (réécriture de la ligne `playlist_tracks`). Jumeau
+      # SQLite dans la suite ordinaire. Sans cette étape, l'épreuve prendrait
+      # son saut annoncé.
+      - name: Remplacement des titres indisponibles sur PostgreSQL (#8066)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test remplacer_indisponibles_8066 -- --nocapture --test-threads=1
 
       # #4956, suite — l'ordre alphabétique des listes REST paginées (artistes,
       # albums par titre et par artiste, listes de lecture) : le tri se fait en
@@ -346,6 +396,14 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_le_debit_aller_retour_et_complement_6332 -- --nocapture --test-threads=1
+
+      # #7288 — le vrai `pg_dump` de la sauvegarde locale contre une VRAIE
+      # base : le fichier produit est un dump custom. Sans cette étape, le
+      # témoin prendrait son saut annoncé.
+      - name: Sauvegarde locale par pg_dump sur PostgreSQL (#7288)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7288_sauvegarde_reelle -- --nocapture --test-threads=1
 
       - name: Titres de service dans les playlists sur PostgreSQL (#4889)
         env:
@@ -870,6 +928,23 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_etiquette_collection_5026 -- --nocapture --test-threads=1
 
+      # #7872 — la requête avancée : `GET /library/query` et l'`expression`
+      # des collections intelligentes (PG 106), par le vrai routeur. Sans
+      # cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Requête avancée et collections à expression sur PostgreSQL (#7872)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_requete_avancee_7872 -- --nocapture --test-threads=1
+
+      # #8077 — les apports Qobuz d'un album local (PG 108) : rapprochement,
+      # garde « compléter seulement », retrait, par le vrai routeur et une
+      # doublure de l'API Qobuz. Sans cette étape, l'épreuve prendrait son
+      # « saut annoncé ».
+      - name: Apports Qobuz des albums locaux sur PostgreSQL (#8077)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_apports_qobuz_8077 -- --nocapture --test-threads=1
+
       # #6257 — l'ordre des étiquettes : la 091 pose `tags.position` en
       # BIGINT, `PUT /tags/order` l'écrit, les listes le suivent ; une neuve
       # se range par nom tant que rien n'est réordonné. Sans cette étape,
@@ -971,3 +1046,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_5341 -- --nocapture --test-threads=1
+
+      # #7983 — la passe « Enrichir les métadonnées » reprend où elle en était :
+      # trace des tentatives notée (ON CONFLICT), pistes faites, introuvables
+      # et 503 en attente écartées, 503 au délai écoulé en queue et hors des
+      # restantes, fichier modifié de nouveau candidat. Dans un schéma à elle ;
+      # sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Reprise de l'enrichissement sur PostgreSQL (#7983)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_7983 -- --nocapture --test-threads=1

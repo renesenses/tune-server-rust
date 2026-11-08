@@ -48,8 +48,8 @@ use super::chaine_native::{
 use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, spec_du_puits_natif};
 use super::*;
 
-/// Le volume effectif qui laisse les mots intacts (`1000` = 100 %).
-const VOLUME_UNITE: u32 = 1000;
+/// Le volume effectif qui laisse les mots intacts (`UNITE_DU_GAIN_DE_RENDU` = 100 %, #7968).
+const VOLUME_UNITE: u32 = crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
 
 /// Ce que `play_url` sait, avant toute ouverture, pour choisir le chemin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,7 +199,7 @@ pub(super) fn rendre_une_periode_native_s32(
     let read = ring.pop(&mut output[debut..]);
     let fin = debut + read;
     ramp.dop.observer(&output[debut..fin], haut_i32);
-    let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+    let v = volume.load(Ordering::Relaxed) as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
     ramp.apply_i32(&mut output[debut..fin], v);
     ramp.dop.combler(&mut output[fin..], 0, repos_i32);
     read

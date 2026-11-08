@@ -1480,6 +1480,11 @@ mod hqplayer_enchainement_4851;
 #[cfg(test)]
 pub(crate) mod suivante_bannie_5143;
 
+/// #7974 — en fin de bail d'écoute, la fin de piste arrête la zone sans
+/// « sauter » la file.
+#[cfg(test)]
+mod fin_de_bail_7974_tests;
+
 /// #6735 — Répéter la piste relance un morceau plus court que les gardes
 /// anti-double-appui de `play` ; un double appui de contrôleur reste coalescé.
 #[cfg(test)]

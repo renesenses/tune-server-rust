@@ -854,11 +854,20 @@ impl PlaybackOrchestrator {
         )
         .await;
 
-        // Même exclusion que le chemin nominal : la radio n'entre pas dans
-        // l'historique local (son titre au démarrage est un instantané figé),
-        // et une re-création de flux pour une piste déjà en cours
-        // (`play_without_history`) ne doit pas doublonner la ligne.
-        if attente.record_history && attente.source != "radio" {
+        // Même règle que le chemin nominal : la radio s'écrit au nom de la
+        // station (#7965), et une re-création de flux pour une piste déjà en
+        // cours (`play_without_history`) ne doit pas doublonner la ligne.
+        if attente.record_history && attente.source == "radio" {
+            let profil = self.playback.get_state(zone_id).await.session_profile_id;
+            self.enregistrer_ecoute_radio(
+                zone_id,
+                attente.source_id.as_deref(),
+                &attente.title,
+                attente.album.as_deref(),
+                attente.cover_path.as_deref(),
+                profil,
+            );
+        } else if attente.record_history {
             let etat = self.playback.get_state(zone_id).await;
             let contexte =
                 self.contexte_de_l_ecoute(&etat, attente.track_id, attente.source_id.as_deref());

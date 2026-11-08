@@ -377,3 +377,145 @@ async fn un_scan_incremental_ne_rouvre_aucun_fichier_inchange() {
         cles(&etat.backend, id)
     );
 }
+
+// ---------------------------------------------------------------------------
+// #7766 — le scan écrit les crédits des balises dans `track_credits`, source
+// `balises`, sans toucher aux crédits d'une autre source.
+// ---------------------------------------------------------------------------
+
+fn credits(db: &Arc<dyn DbBackend>, id: i64) -> Vec<String> {
+    let mut v: Vec<String> = db
+        .query_many(
+            &format!(
+                "SELECT COALESCE(source, 'NULL'), role, artist_name FROM track_credits \
+                 WHERE track_id = {id}"
+            ),
+            &[],
+        )
+        .expect("lecture track_credits")
+        .into_iter()
+        .map(|c| {
+            c.iter()
+                .map(|x| x.as_string().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn le_scan_ecrit_les_credits_des_balises_sans_ecraser_les_autres_7766() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+    let (racine, _piste) = piste_sur_disque("credits-7766");
+    let etat = etat(racine.path());
+
+    scan_manuel(&etat, false).await;
+    let id = id_de_la_piste(&etat.backend);
+    assert_eq!(
+        credits(&etat.backend, id),
+        vec![format!("balises|composer|{COMPOSITEUR}")],
+        "#7766 — le scan n'a pas écrit le compositeur de la balise COMPOSER dans \
+         `track_credits` (source `balises`)"
+    );
+
+    // Une ligne MusicBrainz posée entre deux scans reste en place, et le scan
+    // complet ne double pas ses propres lignes.
+    etat.backend
+        .execute(
+            &format!(
+                "INSERT INTO track_credits (track_id, artist_name, role, position, source) \
+                 VALUES ({id}, 'Herbert von Karajan', 'conductor', 0, 'musicbrainz')"
+            ),
+            &[],
+        )
+        .unwrap();
+    scan_manuel(&etat, true).await;
+    assert_eq!(
+        credits(&etat.backend, id),
+        vec![
+            format!("balises|composer|{COMPOSITEUR}"),
+            "musicbrainz|conductor|Herbert von Karajan".to_string(),
+        ],
+        "#7766 — le second scan a doublé ou effacé des crédits"
+    );
+}
+
+/// Le scan AUTOMATIQUE (démarrage et scan périodique, `spawn_auto_scan`),
+/// jusqu'à ce qu'il ait vraiment tourné : s'il trouve le droit de scanner
+/// pris, il rend la main sans rien faire, et `scan_started_at` reste à 0.
+async fn scan_automatique(db: &Arc<dyn DbBackend>) {
+    let reglages = SettingsRepo::with_backend(db.clone());
+    let debut = Instant::now();
+    loop {
+        reglages.set("scan_started_at", "0").unwrap();
+        let bus = Arc::new(tune_core::event_bus::EventBus::new());
+        let fini = crate::auto_scan::spawn_auto_scan(db.clone(), bus);
+        while !fini.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(debut.elapsed() < Duration::from_secs(300), "scan sans fin");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+        if reglages.get("scan_started_at").unwrap().as_deref() != Some("0") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// #7766 — le scan automatique et le surveillant de dossier écrivent, comme
+/// le scan manuel, les crédits des balises (source `balises`) sans toucher à
+/// une ligne MusicBrainz ; une balise retouchée remplace l'ancienne ligne.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_scan_automatique_et_le_surveillant_ecrivent_les_credits_des_balises_7766() {
+    // #6163 : droit de scanner global au processus, voir `serialiser_les_scans_de_test`.
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+    let (racine, piste) = piste_sur_disque("credits-auto-7766");
+    let etat = etat(racine.path());
+    let db = etat.backend.clone();
+
+    scan_automatique(&db).await;
+    let id = id_de_la_piste(&db);
+    assert_eq!(
+        credits(&db, id),
+        vec![format!("balises|composer|{COMPOSITEUR}")],
+        "#7766 — le scan automatique n'a pas écrit le compositeur de la balise \
+         COMPOSER dans `track_credits` (source `balises`)"
+    );
+
+    db.execute(
+        &format!(
+            "INSERT INTO track_credits (track_id, artist_name, role, position, source) \
+             VALUES ({id}, 'Herbert von Karajan', 'conductor', 0, 'musicbrainz')"
+        ),
+        &[],
+    )
+    .unwrap();
+    baliser(
+        &piste,
+        &[
+            ("TITLE", "Allegro"),
+            ("ARTIST", "Berliner Philharmoniker"),
+            ("ALBUM", "Symphonie no 9"),
+            ("TRACKNUMBER", "1"),
+            ("COMPOSER", "Franz Liszt"),
+        ],
+        SystemTime::now(),
+    );
+    let change = tune_core::scanner::watcher::FileChange {
+        change_type: tune_core::scanner::watcher::ChangeType::Modified,
+        path: piste.to_string_lossy().into_owned(),
+    };
+    crate::auto_scan::reimporter_fichier_surveillant(&db, &change, true);
+    assert_eq!(
+        credits(&db, id),
+        vec![
+            "balises|composer|Franz Liszt".to_string(),
+            "musicbrainz|conductor|Herbert von Karajan".to_string(),
+        ],
+        "#7766 — le surveillant n'a pas remplacé les crédits `balises` de la \
+         piste retouchée, ou a touché à la ligne MusicBrainz"
+    );
+}

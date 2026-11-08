@@ -61,7 +61,7 @@ use crate::outputs::traits::PuitsNatif;
 
 /// #7934 — le volume que reçoit l'étage natif : l'unité. Le volume de la
 /// zone est appliqué par le rappel ASIO, après l'anneau.
-const VOLUME_A_L_UNITE: u32 = 1000;
+const VOLUME_A_L_UNITE: u32 = crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
 
 /// Ce que le bras lisait du contexte de `play_url` — trente-quatre valeurs,
 /// toutes déjà possédées par le fil de lecture. Elles sont DÉPLACÉES, jamais
@@ -866,6 +866,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
                     spec,
                     sortie: FormatOuvert::new(sample_rate, voies_de_l_etage),
                     needs_resample: false,
+                    surechantillonneur: None,
                 },
                 &transformations_reelles,
             ),

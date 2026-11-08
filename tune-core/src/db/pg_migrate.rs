@@ -238,6 +238,11 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Clés des clients Subsonic (#7855, script 104) : sans cette ligne, chaque
     // client devrait être réappairé après la bascule.
     "cles_clients",
+    // Apports Qobuz aux albums locaux (#8077, script 108) : sans ces lignes,
+    // un retrait (`retire`) serait oublié et la passe de fond remettrait les
+    // apports après la bascule.
+    "apports_service_albums",
+    "apports_service",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",
@@ -270,6 +275,10 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "tenue des versions du schema SQLite ; PostgreSQL a sa propre `schema_version`",
     ),
     (
+        "library_revision",
+        "compteur de révision de la bibliothèque (#7619) : une seule ligne, recréée par sa propre installation côté PostgreSQL ; une révision neuve invalide les caches clients, ce qui est voulu après une bascule",
+    ),
+    (
         "albums_fts",
         "index plein texte FTS5 de SQLite, sans equivalent a copier en PostgreSQL",
     ),
@@ -283,6 +292,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "upnp_catalog_revision",
         "compteur de revision du catalogue UPnP, remis a zero par le script PG 066 ; \
          les clients UPnP relisent le catalogue",
+    ),
+    (
+        "enrich_tentatives",
+        "trace des tentatives d'enrichissement (#7983) : la passe la reconstitue ; \
+         perdue, elle retente seulement les pistes déjà vues",
     ),
     (
         "musicbrainz_release_cache",
@@ -304,6 +318,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
     (
         "bpm_estimes",
         "BPM estimes (Wikidata ou signal, #4805) : se remesurent ; les balises BPM restent dans `tracks`",
+    ),
+    (
+        "ecoutes_parentales",
+        "temps ecoute des profils supervises (#7974) : compteurs du jour et de la semaine ISO, \
+         perdus au plus pour la semaine en cours ; les politiques, elles, sont copiees",
     ),
 ];
 
@@ -443,7 +462,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     rating TEXT,
     -- Debit moyen du fichier (#6332). TEXT pour la copie, comme `rating` ;
     -- la migration 094 le convertit en BIGINT.
-    bitrate_kbps TEXT
+    bitrate_kbps TEXT,
+    -- Marquage explicite de la balise (#8088). TEXT pour la copie, comme
+    -- `rating` ; la migration 107 le convertit en BIGINT.
+    explicit TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -979,7 +1001,9 @@ CREATE TABLE IF NOT EXISTS smart_collections (
     updated_at TEXT,
     description TEXT,
     icon TEXT,
-    color TEXT
+    color TEXT,
+    -- #7872 — la requête avancée de la collection (PG 106, SQLite 140).
+    expression TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bookmarks (
@@ -1153,6 +1177,26 @@ CREATE TABLE IF NOT EXISTS politiques_parentales (
  politique_json TEXT NOT NULL,
  maj_le TEXT NOT NULL
 );
+-- Temps écouté des profils supervisés (#7974), mêmes types que
+-- migrations/ecoutes_parentales.sql. Non copiée à la bascule.
+CREATE TABLE IF NOT EXISTS ecoutes_parentales (
+ profile_id BIGINT NOT NULL,
+ jour TEXT NOT NULL,
+ secondes BIGINT NOT NULL DEFAULT 0,
+ PRIMARY KEY (profile_id, jour)
+);
+-- Trace des tentatives d'enrichissement (#7983). Sans script numéroté :
+-- présente ici ET dans `ENSURE_TABLES`, mêmes types
+-- (migrations/enrich_tentatives.sql). Non copiée (TABLES_NON_COPIEES).
+CREATE TABLE IF NOT EXISTS enrich_tentatives (
+ track_id BIGINT PRIMARY KEY,
+ issue TEXT NOT NULL,
+ echecs BIGINT NOT NULL DEFAULT 0,
+ tente_le BIGINT NOT NULL,
+ reessai_apres BIGINT NOT NULL DEFAULT 0,
+ mtime_vu TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_enrich_tentatives_issue ON enrich_tentatives(issue, reessai_apres);
 -- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3 de
 -- MetaRust). Sans script numéroté : présente ici (bascule) ET dans
 -- `ENSURE_TABLES` (toute base, à chaque démarrage). Non copiée à la bascule :
@@ -1370,6 +1414,9 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating TEXT;
 -- tracks: debit moyen du fichier en kbit/s (SQLite migration v130 / PG 094,
 -- #6332). TEXT pour la copie ; la 094, rejouee juste apres, le convertit.
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS bitrate_kbps TEXT;
+-- tracks: marquage explicite de la balise (SQLite migration v141 / PG 107,
+-- #8088). TEXT pour la copie ; la 107, rejouee juste apres, le convertit.
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS explicit TEXT;
 -- tracks: cle de tri de la vue des pistes (#7619, L1, sans numero). Copiee
 -- telle quelle ; recalculee de toute facon par `assurer_les_cles_de_tri`.
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE "C";
@@ -1825,6 +1872,8 @@ fn conflict_clause(table: &str) -> &'static str {
         "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
+        "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",
+        "apports_service" => "ON CONFLICT (album_id, track_id, champ, source) DO NOTHING",
         "track_metadata" => "ON CONFLICT (track_id, key) DO NOTHING",
         "album_metadata" => "ON CONFLICT (album_id, key) DO NOTHING",
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",

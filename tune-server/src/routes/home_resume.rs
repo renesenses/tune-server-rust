@@ -13,6 +13,7 @@ pub(super) async fn resume_listening(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ResumeRequest>,
 ) -> Result<Response, AppError> {
     let _zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
@@ -25,51 +26,16 @@ pub(super) async fn resume_listening(
     // C'est un nouveau geste : un seek récent du même titre ne doit pas
     // conserver son ancienne position lors du rejeu depuis le début.
     state.playback.oublier_le_deplacement(zone_id).await;
-    if r.context_type == "podcast" {
-        let Some(tune_core::db::play_queue_repo::QueueInput::Streaming {
-            source_id,
-            title,
-            artist,
-            cover_url,
-            duration_ms,
-            ..
-        }) = r.items.first()
-        else {
+    if r.context_type == "podcast" || r.source == "podcast" {
+        // #8085 — même demande que la relance par adresse (accueil,
+        // Historique) : position moins le recul réglé, par `play_episode`.
+        let Some(demande) = super::super::podcasts::demande_de_reprise(&state, &r) else {
             return Err(AppError::bad_request("épisode de reprise absent"));
         };
-        let seconds = resumes::effective_rewind(
-            SettingsRepo::with_backend(state.backend.clone())
-                .get(resumes::REWIND_KEY)
-                .ok()
-                .flatten()
-                .as_deref(),
-        );
-        let request = super::super::podcasts::PlayEpisodeRequest {
-            audio_url: source_id.clone(),
-            title: Some(title.clone()),
-            podcast_name: Some(artist.clone()),
-            podcast_id: Some(r.context_id.clone()),
-            cover_url: cover_url.clone(),
-            duration_ms: Some((*duration_ms).max(0) as u64),
-            seek_ms: Some(resumes::rewind(r.position_ms, seconds)),
-            // Sans type gardé, l'extension puis l'hébergeur le disent (#7894).
-            mime_type: None,
-        };
-        let response = super::super::podcasts::play_episode(
-            State(state.clone()),
-            Path(zone_id),
-            Json(request),
+        return Ok(super::super::podcasts::jouer_et_rendre_la_zone(
+            &state, zone_id, headers, profile, demande,
         )
-        .await
-        .into_response();
-        return if response.status().is_success() {
-            Ok(
-                Json(super::super::playback::build_zone_json(&state, zone_id).await)
-                    .into_response(),
-            )
-        } else {
-            Ok(response)
-        };
+        .await);
     }
     if r.context_type == "playlist" && r.source == "local" {
         let id = r
@@ -366,6 +332,7 @@ mod route_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
@@ -819,6 +786,7 @@ mod replay_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await
@@ -926,6 +894,7 @@ mod replay_tests {
             State(state.clone()),
             ActiveProfile(1),
             Path(zone),
+            axum::http::HeaderMap::new(),
             Json(ResumeRequest { resume_key: key }),
         )
         .await

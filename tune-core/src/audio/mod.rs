@@ -65,6 +65,7 @@ mod dsf_http_progressif_tests;
 /// Fil 2062 — la durée d'un flux distant lue dans ses en-têtes.
 pub mod duree_des_entetes;
 pub mod ecretage;
+pub mod ecretage_de_traitement;
 #[cfg(feature = "audio-embedding")]
 pub mod embedding;
 /// READ side of audio embeddings (storage + cosine) — always compiled, no ort.
@@ -149,6 +150,8 @@ pub mod soft_mute;
 pub mod spectrogramme;
 pub mod staged_growth;
 pub mod support;
+/// #7614 — le côté hôte du greffon de suréchantillonnage.
+pub mod surechantillonnage;
 pub mod tap;
 pub mod tempo;
 /// CLAP text tower for natural-language acoustic search (Phase 3).

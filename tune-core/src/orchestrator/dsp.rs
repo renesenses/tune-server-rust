@@ -804,12 +804,21 @@ impl PlaybackOrchestrator {
             // geste même qu'on vient de rendre possible — bouger un curseur en
             // écoutant — claque à chaque cran.
             local_output.replace_eq_live(eq);
+            // #4176 — « Remettre à plat » sur un égaliseur coupé enregistre un
+            // profil aux bandes neutres : c'est le « prochain réglage » qui
+            // rend le niveau. Le gain gardé remonte jusqu'au signal sec, en
+            // rampe, même si le volume a monté pendant que l'égaliseur jouait.
+            let remis_a_plat = !actif && self.egaliseur_enregistre_a_plat(zone_id, taux, canaux);
+            if remis_a_plat {
+                local_output.liberer_le_preampli_garde();
+            }
             info!(
                 zone_id,
                 device_id = %device_id,
                 sample_rate = taux,
                 channels = canaux,
                 actif,
+                remis_a_plat,
                 "zone_eq_refreshed_live"
             );
             RapportEqAChaud {
@@ -1876,6 +1885,26 @@ impl PlaybackOrchestrator {
         Self::eq_profile_configure_with(&self.db, zone_id)
     }
 
+    /// #4176 — le profil ENREGISTRÉ de la zone est-il à plat : aucune bande
+    /// qui filtre, activé ou non (« Remettre à plat » sur un égaliseur coupé
+    /// l'enregistre désactivé) ? Même critère que le moteur, qui ne reste pas
+    /// actif sur des bandes toutes neutres. Un profil absent ou illisible
+    /// n'est pas une remise à plat.
+    #[cfg(feature = "local-audio")]
+    fn egaliseur_enregistre_a_plat(&self, zone_id: i64, taux: u32, canaux: u16) -> bool {
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let Some(mut profil) = settings
+            .get(&format!("zone_{zone_id}_eq_profile"))
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<crate::audio::eq::EqProfile>(&s).ok())
+        else {
+            return false;
+        };
+        profil.enabled = true;
+        !tune_plugin_equalizer::EqProcessor::new(&profil, taux, canaux).is_enabled()
+    }
+
     /// Même lecture, sans orchestrateur.
     fn eq_profile_configure_with(
         db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
@@ -2205,6 +2234,59 @@ impl PlaybackOrchestrator {
     /// Config lives in the settings key `zone_{id}_crossfeed` as JSON
     /// `{ "enabled": bool, "amount": f32, "delay_ms": f32 }`. Values are clamped
     /// defensively (amount 0..0.5, delay_ms 0..5) mirroring the route validation.
+    /// #7614 — le choix du greffon de suréchantillonnage de la zone, licence
+    /// comprise (Premium, comme le crossfeed). `None` sous PURE. Sans
+    /// gestionnaire de licence (les tests), aucune garde de licence, comme
+    /// [`Self::crossfeed_configure_sous_licence`].
+    pub fn choix_du_surechantillonneur(
+        &self,
+        zone_id: i64,
+        pure: bool,
+    ) -> Option<crate::audio::surechantillonnage::ChoixSurechantillonnage> {
+        let premium = self
+            .license
+            .as_ref()
+            .is_none_or(|license| license.premium_snapshot());
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        match crate::audio::surechantillonnage::choix_de_la_zone(&settings, premium, pure, zone_id)
+        {
+            Ok(choix) => Some(choix),
+            Err(ecarte) => {
+                if ecarte != crate::audio::surechantillonnage::Ecarte::Desactive {
+                    tracing::info!(zone_id, reason = ecarte.code(), "upsampler_not_engaged");
+                }
+                None
+            }
+        }
+    }
+
+    /// #7614 — repose le choix du suréchantillonneur sur la sortie locale de
+    /// la zone après un changement de réglage. La piste en cours n'en est
+    /// pas affectée : la sortie le compare à la frontière suivante.
+    pub async fn refresh_zone_upsampler(&self, zone_id: i64) {
+        #[cfg(not(feature = "local-audio"))]
+        let _ = zone_id;
+        #[cfg(feature = "local-audio")]
+        {
+            let device_id = self.peripherique_de_la_zone(zone_id);
+            if !device_id.starts_with("local:") {
+                return;
+            }
+            let pure = self.zone_audiophile(zone_id);
+            let choix = self.choix_du_surechantillonneur(zone_id, pure);
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return;
+            };
+            let output = output_arc.lock().await;
+            if let Some(local) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            {
+                local.set_surechantillonnage(choix);
+            }
+        }
+    }
+
     pub(super) fn load_crossfeed_processor(
         &self,
         zone_id: i64,

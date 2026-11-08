@@ -50,3 +50,10 @@ instead of the default path above.
 This documents the dedicated-volume workaround reported in server issue
 [#7028](https://github.com/renesenses/tune-server-rust/issues/7028). A new DSM
 installation has not been reproduced as part of this documentation change.
+
+## SMB share mounted on the NAS
+
+A Samba share mounted on the NAS (File Station › Mount Remote Folder) does not
+show up in the container unless it is bound with `rslave` propagation, and Tune
+cannot mount it itself from inside the container. See
+[SMB share in Docker](DOCKER-PARTAGE-SMB.md).

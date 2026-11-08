@@ -17,6 +17,8 @@ pub mod podcasts;
 /// #6480 — le texte de présentation d'un album de service, HTML ramené à du texte.
 pub mod presentation_album;
 pub mod qobuz;
+/// #8077 — la fiche d'un album Qobuz ramenée à ce qu'un album local peut en reprendre.
+pub mod qobuz_apports;
 pub mod qobuz_cles_brutes;
 pub mod qobuz_credits;
 /// #6401 — repli en 16/44,1 d'un flux haute résolution qui échoue au démarrage.
@@ -24,6 +26,8 @@ pub mod qobuz_repli_qualite;
 pub mod quality;
 pub mod radiofrance;
 pub mod registry;
+/// #8066 — remplacer un titre de service devenu indisponible dans une playlist.
+pub mod remplacement_indisponibles;
 pub mod spotify;
 pub mod spotify_connect;
 /// #6018 — la lecture d'un titre Spotify par librespot, comme source PCM.
