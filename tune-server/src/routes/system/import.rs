@@ -1398,7 +1398,7 @@ fn ecrire_les_pistes(
 ) -> (i32, i32, Vec<String>) {
     let track_repo = TrackRepo::with_backend(backend.clone());
     // C1 : aucun chemin hors des dossiers de musique.
-    let racines = racines_admises(&backend);
+    let racines = racines_admises(backend);
     let artist_repo = ArtistRepo::with_backend(backend.clone());
     let album_repo = AlbumRepo::with_backend(backend.clone());
 
@@ -1594,7 +1594,7 @@ fn parse_jriver_xml(
     let album_repo = AlbumRepo::with_backend(backend.clone());
     let track_repo = TrackRepo::with_backend(backend.clone());
     // C1 : aucun chemin hors des dossiers de musique.
-    let racines = racines_admises(&backend);
+    let racines = racines_admises(backend);
 
     let mut imported = 0;
     let mut skipped = 0;
