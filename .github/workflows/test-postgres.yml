@@ -389,6 +389,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_le_debit_aller_retour_et_complement_6332 -- --nocapture --test-threads=1
 
+      # #7288 — le vrai `pg_dump` de la sauvegarde locale contre une VRAIE
+      # base : le fichier produit est un dump custom. Sans cette étape, le
+      # témoin prendrait son saut annoncé.
+      - name: Sauvegarde locale par pg_dump sur PostgreSQL (#7288)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7288_sauvegarde_reelle -- --nocapture --test-threads=1
+
       - name: Titres de service dans les playlists sur PostgreSQL (#4889)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
