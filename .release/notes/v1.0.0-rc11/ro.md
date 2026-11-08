@@ -24,7 +24,7 @@ Tune 1.0.0-rc11, a unsprezecea versiune candidată a Tune 1.0.
 - **Tune tested**: Tune propune adăugarea unui dispozitiv după o oră de ascultare fără erori, dintr-un buton dedicat; un dispozitiv deja din catalog adaugă o gospodărie.
 - **Bibliotecă**: setarea „Bibliotecă extinsă la favoritele serviciilor”, activată implicit; căutare după începutul cuvântului mai rapidă; căutarea în grilă cere toate cuvintele; perioadă De la / Până la pe axa anilor; derulare mai fluidă a pieselor.
 - **Liste de piese**: ordinea coloanelor se poate schimba și fiecare ecran o ține minte; ecranul unui playlist primește coperte, dimensiunea miniaturilor și un antet compact; insigne de sursă în Managerul de playlisturi.
-- **Acasă și reluare**: alegeți panourile rezumatului ascultărilor; „Reia ascultarea” arată un subtitlu pe tip, reia un podcast cu titlu, copertă și poziție, și fără dubluri.
+- **Acasă și reluare**: alegeți panourile rezumatului ascultărilor; „Reia ascultarea” arată un subtitlu pe tip, reia un podcast cu titlu și copertă (reluarea de la poziția salvată pe o zonă DLNA vine în versiunea următoare), și fără dubluri.
 - **Istoric**: o ascultare se validează abia după 30 s sau jumătate din piesă; „Redare” după Stop păstrează albumul sau playlistul curent; episoadele de podcast și radiourile poartă numele stației.
 - **Statistici de ascultare**: ascultările importate (Roon, Plex, m3u) contează la cele mai ascultate; listele inteligente și Istoricul contează ca Biblioteca; o ascultare Qobuz nu mai contează pentru albumul local cu același nume.
 - **Crosstalk și egalizator**: curbă separare / colorare și răspunsul boxelor în ecranul de reglaj, separare țintă de la 1 dB; grafic parametric fixat implicit (Editare / Gata) și o culoare pe canal.
@@ -38,7 +38,7 @@ Tune 1.0.0-rc11, a unsprezecea versiune candidată a Tune 1.0.
 
 - **AirPlay 2**: butonul „Pair” asociază prin componenta AirPlay 2 sau numește cauza; așteptarea PIN-ului nu mai blochează redarea, iar închiderea ferestrei o anulează; sesiunea se redeschide după o pauză; poziția avansează și o pauză nu mai intră în buclă; componenta există pentru Raspberry Pi pe 64 de biți.
 - **DLNA și OpenHome**: piese DSD fără pauze, „următoarea” mai rapidă, o pauză făcută pe dispozitiv este respectată, ieșirea mașinii nu mai apare dublat, volum OpenHome fără așteptare, lista încărcată de Kazoo este păstrată, Play mai rapid pe TIDAL CD.
-- **Volum**: o ieșire locală nouă nu mai pornește la scară plină; mut nu mai lasă să treacă un volum recitit; fiecare poziție a cursorului dă un nivel distinct; volumul WASAPI și ASIO se aude imediat; Tune urmărește dispozitivul sub plafonul de siguranță.
+- **Volum**: o ieșire locală nouă nu mai pornește la scară plină; la anularea modului mut, cursorul revine la volumul anterior; fiecare poziție a cursorului dă un nivel distinct; volumul WASAPI și ASIO se aude imediat; Tune urmărește dispozitivul sub plafonul de siguranță.
 - **Windows**: scurtătura se deschide fără fereastră de consolă; un DoP pe care ieșirea nu îl poate purta pleacă ca PCM; descoperirea rețelei trece de firewall; o temperatură ilizibilă nu mai frânează analizele; actualizarea pornește scriptul de comutare la ieșire.
 - **Actualizări și licență**: pe Unix, noul binar și interfața web sunt validate înainte de a le înlocui pe cele vechi, iar un eșec este explicit; retragerea licenței eliberează și mașina pe site.
 - **Bibliotecă**: fotografiile și videoclipurile unui server UPnP nu mai intră; un set FLAC + CUE formează un singur album; edițiile DSD și CD rămân două albume; o compilație făcută manual nu mai este fragmentată; un playlist șters nu mai este recreat la scanare; o recitire fără etichetă de artist nu mai mută albumul sub „Unknown Artist”; adăugarea unui folder scanează doar acel folder.
@@ -46,4 +46,11 @@ Tune 1.0.0-rc11, a unsprezecea versiune candidată a Tune 1.0.
 - **Servicii de streaming**: căutarea Spotify returnează rezultate, un refuz nu mai este mut, iar favoritele depășesc 50 de piese; TIDAL › Favorite nu mai blochează Tune; un cont Qobuz fără favorite întoarce rapid lista goală; o piesă convertită pornește în Safari.
 - **Rețea și stocare**: descoperirea reia când rețeaua apare după Tune; o montare SMB care eșuează spune de ce, inclusiv sub Docker; copia de siguranță reușește pe PostgreSQL; extragerea de CD refuză o destinație plină sau neinscriptibilă; Tune lasă porturile Squeezebox unui server Lyrion de pe aceeași mașină.
 - **Ecrane**: ecranul Concerte se deschide fără licență; „Degrupează tot” reapare; Acum se redă urmărește schimbarea albumului; o sesiune de streaming expirată își păstrează fila „Reconectează”; Alarmă nouă rămâne vizibilă.
-- **Securitate**: corecturi de consolidare.
+- **Raspberry Pi 5**: ventilatorul Active Cooler pornește din nou (imagine Tune OS nouă).
+- **Securitate**: corecturi de consolidare; pe un server fără autentificare, exportul configurației cu secretele în clar este refuzat (folosiți copia de siguranță criptată cu o frază de acces).
+
+## Probleme cunoscute
+
+- **Mut pe o zonă DLNA**: o zonă pe mut poate reporni cu sunet când se pornește o piesă nouă. Până la remediere, reduceți volumul în loc să opriți sunetul (versiunea următoare).
+- **Reluarea unui episod de podcast**: pe o zonă DLNA, un episod reluat pornește de la început (versiunea următoare).
+- **Tune Circle**: cercurile din care faceți parte sau la care ați fost invitat nu apar încă în listă precum cele create de dumneavoastră (versiunea următoare).

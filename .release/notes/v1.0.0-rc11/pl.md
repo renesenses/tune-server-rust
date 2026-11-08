@@ -19,7 +19,7 @@ Tune 1.0.0-rc11, jedenasta wersja kandydująca Tune 1.0.
 - **Tune tested**: Tune proponuje dodanie urządzenia po godzinie słuchania bez błędów, osobnym przyciskiem; urządzenie już w katalogu dodaje gospodarstwo.
 - **Biblioteka**: ustawienie „Biblioteka rozszerzona o ulubione z usług”, domyślnie włączone; szybsze wyszukiwanie po początku słowa; wyszukiwanie w siatce wymaga wszystkich słów; okres Od / Do na osi lat; płynniejsze przewijanie utworów.
 - **Listy utworów**: kolejność kolumn można zmienić i każdy ekran ją zapamiętuje; ekran playlisty zyskuje okładki, rozmiar miniatur i zwarty nagłówek; znaczniki źródła w Menedżerze playlist.
-- **Start i wznawianie**: wybierz panele przeglądu słuchania; „Wznów słuchanie” pokazuje podtytuł dla każdego rodzaju, wznawia podcast z tytułem, okładką i pozycją, i bez duplikatów.
+- **Start i wznawianie**: wybierz panele przeglądu słuchania; „Wznów słuchanie” pokazuje podtytuł dla każdego rodzaju, wznawia podcast z tytułem i okładką (wznawianie od zapisanej pozycji w strefie DLNA pojawi się w następnej wersji), i bez duplikatów.
 - **Historia**: odsłuch jest zaliczany dopiero po 30 s lub połowie utworu; „Odtwarzaj” po Stopie zachowuje bieżący album lub playlistę; odcinki podcastów i radia noszą nazwę stacji.
 - **Statystyki słuchania**: zaimportowane odsłuchy (Roon, Plex, m3u) liczą się do najczęściej słuchanych; listy inteligentne i Historia liczą jak Biblioteka; odsłuch w Qobuz nie liczy się już dla lokalnego albumu o tej samej nazwie.
 - **Crosstalk i korektor**: krzywa separacji / koloryzacji i odpowiedź głośników na ekranie ustawień, docelowa separacja od 1 dB; wykres parametryczny domyślnie zablokowany (Edytuj / Gotowe) i kolor dla każdego kanału.
@@ -30,7 +30,7 @@ Tune 1.0.0-rc11, jedenasta wersja kandydująca Tune 1.0.
 - **Odtwarzanie**: powody transkodowania są nazywane, a FLAC jest podawany bez zmian, gdy nic się nie stosuje; Następny i Poprzedni pomijają utwory odrzucone przez usługę.
 - **Poprawki AirPlay 2**: przycisk „Pair” paruje przez komponent AirPlay 2 albo podaje przyczynę; oczekiwanie na PIN nie blokuje już odtwarzania, a zamknięcie okna je anuluje; sesja otwiera się ponownie po pauzie; pozycja postępuje, a pauza nie zapętla się; komponent istnieje dla 64-bitowego Raspberry Pi.
 - **Poprawki DLNA i OpenHome**: bezprzerwowe utwory DSD, szybsze „następny”, pauza wykonana na urządzeniu jest respektowana, własne wyjście maszyny nie pojawia się już podwójnie, głośność OpenHome bez czekania, lista załadowana przez Kazoo zostaje zachowana, szybsze Play dla TIDAL CD.
-- **Poprawki głośności**: nowe wyjście lokalne nie startuje już z pełną skalą; wyciszenie nie przepuszcza już ponownie odczytanej głośności; każda pozycja suwaka daje inny poziom; głośność WASAPI i ASIO słychać od razu; Tune podąża za urządzeniem poniżej limitu bezpieczeństwa.
+- **Poprawki głośności**: nowe wyjście lokalne nie startuje już z pełną skalą; po wyłączeniu wyciszenia suwak wraca do poprzedniej głośności; każda pozycja suwaka daje inny poziom; głośność WASAPI i ASIO słychać od razu; Tune podąża za urządzeniem poniżej limitu bezpieczeństwa.
 - **Poprawki Windows**: skrót otwiera się bez okna konsoli; DoP, którego wyjście nie udźwignie, idzie jako PCM; wykrywanie sieci przechodzi przez zaporę; nieczytelna temperatura nie spowalnia już analiz; aktualizacja uruchamia skrypt przełączenia przy wyjściu.
 - **Poprawki aktualizacji i licencji**: w systemie Unix nowy plik binarny i interfejs webowy są sprawdzane przed zastąpieniem starych, a błąd jest jawny; usunięcie licencji zwalnia też maszynę w serwisie.
 - **Poprawki biblioteki**: zdjęcia i filmy z serwera UPnP nie trafiają już do biblioteki; box FLAC + CUE tworzy jeden album; wydania DSD i CD pozostają dwoma albumami; ręcznie złożona kompilacja nie jest już rozbijana; usunięta playlista nie jest odtwarzana przy skanowaniu; ponowny odczyt bez tagu wykonawcy nie przenosi już albumu do „Unknown Artist”; dodanie folderu skanuje tylko ten folder.
@@ -38,4 +38,11 @@ Tune 1.0.0-rc11, jedenasta wersja kandydująca Tune 1.0.
 - **Poprawki usług streamingowych**: wyszukiwanie Spotify zwraca wyniki, odmowa nie jest już niema, a ulubione przekraczają 50 utworów; TIDAL › Ulubione nie zawiesza już Tune; konto Qobuz bez ulubionych szybko zwraca pustą listę; przekonwertowany utwór startuje w Safari.
 - **Poprawki sieci i przechowywania**: wykrywanie wznawia się, gdy sieć pojawi się po Tune; nieudane montowanie SMB mówi dlaczego, także w Dockerze; kopia zapasowa udaje się w PostgreSQL; ekstrakcja CD odrzuca pełny lub niezapisywalny cel; Tune zostawia porty Squeezebox serwerowi Lyrion na tej samej maszynie.
 - **Poprawki ekranów**: ekran Koncerty otwiera się bez licencji; „Rozgrupuj wszystko” wraca; Teraz odtwarzane podąża za zmianą albumu; wygasła sesja streamingu zachowuje kartę „Połącz ponownie”; Nowy budzik pozostaje widoczny.
-- **Bezpieczeństwo**: poprawki wzmacniające.
+- **Poprawki Raspberry Pi 5**: wentylator Active Cooler znowu się obraca (nowy obraz Tune OS).
+- **Bezpieczeństwo**: poprawki wzmacniające; na serwerze bez uwierzytelniania eksport konfiguracji z sekretami jawnym tekstem jest odrzucany (użyj kopii zapasowej szyfrowanej hasłem).
+
+## Znane problemy
+
+- **Wyciszenie w strefie DLNA**: wyciszona strefa może wznowić odtwarzanie z dźwiękiem po uruchomieniu nowego utworu. Do czasu poprawki zmniejszaj głośność zamiast wyciszać (następna wersja).
+- **Wznawianie odcinka podcastu**: w strefie DLNA wznowiony odcinek zaczyna się od początku (następna wersja).
+- **Tune Circle**: kręgi, których jesteś członkiem lub do których cię zaproszono, nie pojawiają się jeszcze na liście tak jak te, które utworzyłeś (następna wersja).

@@ -19,7 +19,7 @@ Tune 1.0.0-rc11, den ellevte utgivelseskandidaten av Tune 1.0.
 - **Tune tested**: Tune foreslår å legge til en enhet etter en times lytting uten feil, fra en egen knapp; en enhet som allerede er i katalogen legger til en husholdning.
 - **Bibliotek**: innstillingen «Bibliotek utvidet med tjenestenes favoritter», på som standard; raskere søk på ordstart; rutenettsøket krever alle ordene; periode Fra / Til på årstidslinjen; jevnere rulling av spor.
 - **Sporlister**: kolonnerekkefølgen kan endres og hver visning husker den; en spilleliste-visning får omslag, miniatyrstørrelse og kompakt topp; kildemerker i Spilleliste-behandleren.
-- **Hjem og fortsett**: velg panelene i lytteoversikten; «Fortsett å lytte» viser én undertittel per type, gjenopptar en podkast med tittel, omslag og posisjon, og uten duplikater.
+- **Hjem og fortsett**: velg panelene i lytteoversikten; «Fortsett å lytte» viser én undertittel per type, gjenopptar en podkast med tittel og omslag (gjenopptak fra lagret posisjon i en DLNA-sone kommer i neste versjon), og uten duplikater.
 - **Historikk**: en lytting regnes først etter 30 s eller halve sporet; «Spill» etter Stopp beholder pågående album eller spilleliste; podkastepisoder og radio bærer stasjonens navn.
 - **Lyttestatistikk**: importerte lyttinger (Roon, Plex, m3u) telles blant de mest spilte; smarte lister og Historikken teller som Biblioteket; en Qobuz-lytting teller ikke lenger for det lokale albumet med samme navn.
 - **Crosstalk og equalizer**: kurve for separasjon / farging og høyttalerrespons i innstillingsbildet, målseparasjon fra 1 dB; parametrisk graf låst som standard (Rediger / Ferdig) og én farge per kanal.
@@ -30,7 +30,7 @@ Tune 1.0.0-rc11, den ellevte utgivelseskandidaten av Tune 1.0.
 - **Avspilling**: årsakene til omkoding navngis og FLAC leveres uendret når ingenting gjelder; Neste og Forrige hopper over spor som tjenesten avviser.
 - **Rettet, AirPlay 2**: «Pair»-knappen parer via AirPlay 2-komponenten eller navngir årsaken; ventingen på PIN-koden blokkerer ikke lenger avspillingen og lukking av vinduet avbryter den; økten åpnes på nytt etter en pause; posisjonen går fremover og en pause går ikke lenger i løkke; komponenten finnes for 64-bits Raspberry Pi.
 - **Rettet, DLNA og OpenHome**: gapless DSD-spor, raskere «neste», en pause gjort på enheten respekteres, maskinens egen utgang vises ikke lenger dobbelt, OpenHome-volum uten venting, listen Kazoo har lastet beholdes, raskere Play på TIDAL CD.
-- **Rettet, volum**: en ny lokal utgang starter ikke lenger på full styrke; demping slipper ikke lenger gjennom et omlest volum; hver posisjon på glidebryteren gir et eget nivå; WASAPI- og ASIO-volum høres umiddelbart; Tune følger enheten under sikkerhetstaket.
+- **Rettet, volum**: en ny lokal utgang starter ikke lenger på full styrke; når dempingen oppheves, går glidebryteren tilbake til forrige volum; hver posisjon på glidebryteren gir et eget nivå; WASAPI- og ASIO-volum høres umiddelbart; Tune følger enheten under sikkerhetstaket.
 - **Rettet, Windows**: snarveien åpnes uten konsollvindu; en DoP som utgangen ikke kan bære sendes som PCM; nettverksoppdagelsen passerer brannmuren; en uleselig temperatur bremser ikke lenger analysene; oppdateringen starter byttescriptet ved avslutning.
 - **Rettet, oppdateringer og lisens**: på Unix valideres den nye binærfilen og webgrensesnittet før de gamle erstattes, og en feil meldes tydelig; å fjerne lisensen frigjør også maskinen på nettstedet.
 - **Rettet, bibliotek**: bilder og videoer fra en UPnP-server kommer ikke lenger inn; en FLAC- + CUE-eske blir ett album; DSD- og CD-utgaver forblir to album; en håndlaget samling splittes ikke lenger; en slettet spilleliste gjenskapes ikke ved skanning; en ny innlesing uten artistkode flytter ikke lenger albumet til «Unknown Artist»; å legge til en mappe skanner bare den mappen.
@@ -38,4 +38,11 @@ Tune 1.0.0-rc11, den ellevte utgivelseskandidaten av Tune 1.0.
 - **Rettet, strømmetjenester**: Spotify-søket gir resultater, et avslag er ikke lenger stille og favorittene går forbi 50 spor; TIDAL › Favoritter fryser ikke lenger Tune; en Qobuz-konto uten favoritter gir raskt en tom liste; et konvertert spor starter i Safari.
 - **Rettet, nettverk og lagring**: oppdagelsen gjenopptas når nettverket dukker opp etter Tune; en SMB-montering som feiler sier hvorfor, også under Docker; sikkerhetskopien lykkes på PostgreSQL; CD-uttrekk avviser en full eller ikke-skrivbar destinasjon; Tune overlater Squeezebox-portene til en Lyrion-server på samme maskin.
 - **Rettet, visninger**: Konserter åpnes uten lisens; «Fjern all gruppering» vises igjen; Spilles nå følger albumbytte; en utløpt strømmeøkt beholder fanen «Koble til igjen»; Ny alarm forblir synlig.
-- **Sikkerhet**: herdingsrettelser.
+- **Rettet, Raspberry Pi 5**: viften i Active Cooler går igjen (nytt Tune OS-bilde).
+- **Sikkerhet**: herdingsrettelser; på en server uten autentisering avvises eksport av konfigurasjonen med hemmeligheter i klartekst (bruk sikkerhetskopien kryptert med en passfrase).
+
+## Kjente problemer
+
+- **Demping i en DLNA-sone**: en dempet sone kan starte igjen med lyd når et nytt spor startes. Senk volumet i stedet for å dempe til dette er løst (neste versjon).
+- **Gjenopptak av en podkastepisode**: i en DLNA-sone starter en gjenopptatt episode fra begynnelsen (neste versjon).
+- **Tune Circle**: sirkler du er medlem av eller invitert til, vises ennå ikke i listen slik som de du har opprettet (neste versjon).
