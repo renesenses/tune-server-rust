@@ -4981,3 +4981,6 @@ mod tests_echec_de_connexion_7068 {
         assert_eq!(texte, "qobuz login: 500 boom");
     }
 }
+
+#[cfg(test)]
+mod bio_qobuz_8129_tests;
