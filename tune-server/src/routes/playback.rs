@@ -822,6 +822,69 @@ fn relance_dans_la_file(
     }
 }
 
+/// #7889 — « Lecture » sur un titre déjà dans la file, la session de la zone
+/// VIDE : le serveur a redémarré depuis le dernier « Lire » (le conteneur de
+/// session ne vit qu'en mémoire), la file, elle, est en base. Sans rien de
+/// plus, les écoutes qui suivent s'inscrivaient comme des titres isolés.
+///
+/// Le conteneur se reprend de la dernière reprise d'écoute de la zone
+/// (`listening_resumes`, en base), et seulement si elle décrit CETTE file :
+/// ses lignes (`queue_row_ids`) sont toutes encore dans la file et le titre
+/// relancé en fait partie. Une reprise de « titre » n'a pas de conteneur à
+/// rendre ; une session déjà posée n'est jamais remplacée.
+async fn restaurer_le_contexte_apres_redemarrage(
+    state: &AppState,
+    zone_id: i64,
+    relancee: impl Fn(&[tune_core::db::play_queue_repo::QueueEntry]) -> Option<i64>,
+) {
+    if state
+        .playback
+        .get_state(zone_id)
+        .await
+        .session_context_type
+        .is_some()
+    {
+        return;
+    }
+    let Ok(file) = PlayQueueRepo::with_backend(state.backend.clone()).get_ordered(zone_id) else {
+        return;
+    };
+    let Some(reprise) = tune_core::db::listening_resume::recent(&state.backend, Some(zone_id), 1)
+        .ok()
+        .and_then(|r| r.into_iter().next())
+    else {
+        return;
+    };
+    if !matches!(reprise.context_type.as_str(), "album" | "playlist")
+        || reprise.queue_row_ids.is_empty()
+    {
+        return;
+    }
+    let lignes: std::collections::HashSet<i64> = file.iter().map(|e| e.id).collect();
+    let decrit_la_file = reprise.queue_row_ids.iter().all(|id| lignes.contains(id))
+        && relancee(&file).is_some_and(|ligne| reprise.queue_row_ids.contains(&ligne));
+    if !decrit_la_file {
+        return;
+    }
+    info!(
+        zone_id,
+        nature = %reprise.context_type,
+        id = %reprise.context_id,
+        "contexte_de_session_repris_apres_redemarrage_7889"
+    );
+    state
+        .playback
+        .set_session_context(
+            zone_id,
+            Some(reprise.context_type),
+            Some(reprise.context_id),
+            Some(reprise.source),
+            Some(reprise.title).filter(|t| !t.is_empty()),
+            reprise.cover_path,
+        )
+        .await;
+}
+
 /// Whether the server would accept the manual "next" action as an actual
 /// advance instead of stopping the zone at the end of the queue.
 ///
@@ -2672,6 +2735,12 @@ async fn play(
                 if q_len > 0 {
                     let current = state.playback.get_state(zone_id).await;
                     let pos = current.queue_position.min(q_len - 1);
+                    // #7889 — « Lecture » nue après un redémarrage : la file
+                    // reprend, son conteneur aussi.
+                    restaurer_le_contexte_apres_redemarrage(&state, zone_id, |file| {
+                        file.get(pos as usize).map(|e| e.id)
+                    })
+                    .await;
                     state.playback.update_queue_info(zone_id, pos, q_len).await;
                     return match state.orchestrator.play_from_queue(zone_id, pos).await {
                         Ok(result) => {
@@ -2801,6 +2870,18 @@ async fn play(
     }
     if relance {
         info!(zone_id, "relance_dans_la_file_contexte_garde_6465");
+        // #7889 — après un redémarrage, la session gardée est VIDE (elle ne
+        // vit qu'en mémoire) : la recompléter depuis la reprise de la file.
+        restaurer_le_contexte_apres_redemarrage(&state, zone_id, |file| {
+            file.iter()
+                .find(|e| match (body.track_id, body.source_id.as_deref()) {
+                    (Some(t), _) => e.track_id == Some(t),
+                    (None, Some(sid)) => e.source_id.as_deref() == Some(sid),
+                    _ => false,
+                })
+                .map(|e| e.id)
+        })
+        .await;
     } else {
         let (contexte_type, contexte_id, contexte_service) = contexte_de_lecture(&body);
         let (contexte_titre, contexte_pochette) = nom_du_contexte(
