@@ -1275,7 +1275,10 @@ mod tests {
             let mut a = Artist::new(format!("Artiste {i}"));
             a.musicbrainz_id = Some(format!("mbid-{i:05}"));
             a.bio = Some(format!("bio {i}"));
-            repo.create(&a).unwrap();
+            let id = repo.create(&a).unwrap();
+            // #8009 : une bio sans langue ne part plus au fonds.
+            repo.update_bio_full(id, &format!("bio {i}"), "wikipedia", None, "", "fr")
+                .unwrap();
         }
         let (base, hits) = mock_refusant(429).await;
 
