@@ -38,10 +38,14 @@ async fn upnp_config(State(state): State<AppState>) -> Json<serde_json::Value> {
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(true);
+    // #8189 — le défaut est le nom réellement publié (`UpnpState`), plus la
+    // constante « Tune Server ».
     let friendly_name = settings
         .get("upnp_friendly_name")
         .ok()
         .flatten()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| state.upnp.as_ref().map(|u| u.friendly_name.clone()))
         .unwrap_or_else(|| "Tune Server".into());
 
     Json(json!({

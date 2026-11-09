@@ -813,6 +813,9 @@ pub(crate) fn suite_du_lot_de_demarrage(
 fn spawn_ssdp_startup_scan(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
+        // #8189 — le balayage de démarrage attend l'ouverture de la
+        // découverte (iOS : fenêtre « réseau local » au bon moment).
+        tune_core::discovery::porte_multicast::attendre().await;
         // Multiple scan passes to catch slow DLNA renderers (DMP-A8, etc.)
         // that don't respond to the first SSDP multicast.
         for (pass, delay_secs) in [(1, 3), (2, 8), (3, 15)] {

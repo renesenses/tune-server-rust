@@ -1798,6 +1798,18 @@ async fn rattacher_les_renderers_connus(
 /// Spawn the mDNS handler that registers Chromecast/AirPlay/BluOS/OAAT/Squeezebox outputs.
 ///
 /// Returns the `MdnsScanner` handle (must be kept alive for the scanner to keep running).
+/// Le nom annoncé de ce serveur (#8189), le même pour mDNS et UPnP : le
+/// réglage `server_name`, sinon le nom de l'appareil, suffixé s'il est
+/// générique. Voir `tune_core::discovery::nom_annonce`.
+pub fn nom_annonce_du_serveur(state: &AppState) -> String {
+    let reglage = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get("server_name")
+        .ok()
+        .flatten();
+    let udn = state.upnp.as_ref().map(|u| u.uuid.as_str()).unwrap_or("");
+    tune_core::discovery::nom_annonce::nom_annonce(reglage.as_deref(), udn)
+}
+
 pub fn spawn_mdns_handler(
     state: &AppState,
 ) -> Option<std::sync::Arc<tune_core::discovery::mdns::MdnsScanner>> {
@@ -1824,7 +1836,8 @@ pub fn spawn_mdns_handler(
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(8888u16);
-        if let Err(e) = mdns.register_self(port, tune_core::version()) {
+        let nom = nom_annonce_du_serveur(state);
+        if let Err(e) = mdns.register_self_nomme(port, tune_core::version(), &nom) {
             tracing::warn!(error = %e, "mdns_register_self_failed");
         }
         // #3326 S2-a — l'autre moitié de la découverte Sendspin. La

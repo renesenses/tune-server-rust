@@ -6,6 +6,8 @@ mod admin;
 // et un test qui recopierait la fusion la répliquerait au lieu de la garder.
 pub use admin::peers_payload;
 mod backup;
+// #8189 — `GET /system/capabilities`.
+pub(crate) mod capacites;
 // Réglages ▸ Clés d'API (#4805, lot 1 MetaRust).
 pub(crate) mod cles_api;
 mod config;
@@ -88,6 +90,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/version", get(config::version))
+        .route("/capabilities", get(capacites::capacites))
         .route("/health", get(config::health))
         .route("/stats", get(config::stats))
         .route("/profile", get(profile::system_profile))

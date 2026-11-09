@@ -1481,6 +1481,8 @@ async fn enchainer_la_suivante(state: &AppState, zone_id: i64) -> Option<Result<
 /// alimente le registre lu par le répondeur M-SEARCH.
 pub fn spawn_renderer_advertiser(state: AppState) {
     tokio::spawn(async move {
+        // #8189 — rien ne part avant l'ouverture de la découverte (iOS).
+        tune_core::discovery::porte_multicast::attendre().await;
         use std::net::{Ipv4Addr, SocketAddrV4};
         use tokio::net::UdpSocket;
         let bind = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);

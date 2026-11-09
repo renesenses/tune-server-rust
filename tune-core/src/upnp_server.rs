@@ -232,12 +232,21 @@ impl UpnpState {
         // Le nom publié suit le réglage `upnp_friendly_name` (POST
         // /api/v1/upnp/config) — il était écrit mais jamais lu, renommer le
         // serveur depuis l'interface n'avait aucun effet.
+        //
+        // #8189 — sans ce réglage, le défaut n'est plus la constante « Tune
+        // Server », identique sur toutes les machines, mais `Tune (<nom>)`
+        // avec le nom de `server_name`, sinon celui de l'appareil.
         let friendly_name = settings
             .get("upnp_friendly_name")
             .ok()
             .flatten()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "Tune Server".into());
+            .unwrap_or_else(|| {
+                let reglage = settings.get("server_name").ok().flatten();
+                crate::discovery::nom_annonce::nom_de_service(
+                    &crate::discovery::nom_annonce::nom_annonce(reglage.as_deref(), &uuid),
+                )
+            });
         Self {
             backend,
             server_port,
@@ -3950,6 +3959,8 @@ pub async fn spawn_ssdp_advertiser(uuid: String, port: u16, advertised_ip: Optio
     use tokio::net::UdpSocket;
 
     tokio::spawn(async move {
+        // #8189 — rien ne part avant l'ouverture de la découverte (iOS).
+        crate::discovery::porte_multicast::attendre().await;
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
         let socket = match UdpSocket::bind(bind_addr).await {
             Ok(s) => s,
@@ -6054,6 +6065,38 @@ mod tests {
     /// illegal. Or #2183 tient sur cette etape : « le MediaServer est vu,
     /// DECRIT et appaire » — un point de controle qui ne parse pas le
     /// descriptif ne voit pas le serveur du tout.
+    /// #8189 — sans `upnp_friendly_name`, le nom publié n'est plus la
+    /// constante « Tune Server » (quatre Tune d'un réseau s'affichaient sous
+    /// ce même nom) : c'est `Tune (<server_name>)`, sinon le nom de
+    /// l'appareil ; le réglage explicite garde la priorité.
+    #[test]
+    fn le_nom_publie_par_defaut_distingue_les_serveurs() {
+        use crate::db::sqlite::SqliteDb;
+        let neuf = || {
+            let db = SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            crate::db::migrations::run_migrations(&db).unwrap();
+            let backend: Arc<dyn DbBackend> = Arc::new(db);
+            backend
+        };
+        let b = neuf();
+        crate::db::settings_repo::SettingsRepo::with_backend(b.clone())
+            .set("server_name", "Salon")
+            .unwrap();
+        assert_eq!(
+            UpnpState::new(b.clone(), 8888, None).friendly_name,
+            "Tune (Salon)"
+        );
+        crate::db::settings_repo::SettingsRepo::with_backend(b.clone())
+            .set("upnp_friendly_name", "Mon DLNA")
+            .unwrap();
+        assert_eq!(UpnpState::new(b, 8888, None).friendly_name, "Mon DLNA");
+
+        let sans_reglage = UpnpState::new(neuf(), 8888, None).friendly_name;
+        assert_ne!(sans_reglage, "Tune Server");
+        assert!(sans_reglage.starts_with("Tune ("), "{sans_reglage}");
+    }
+
     #[test]
     fn le_nom_du_serveur_ne_casse_plus_son_descriptif() {
         use crate::db::sqlite::SqliteDb;
@@ -6078,10 +6121,17 @@ mod tests {
         let db2 = SqliteDb::open_in_memory().unwrap();
         db2.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db2).unwrap();
-        let state2 = UpnpState::new(Arc::new(db2), 8888, Some("192.168.1.18".into()));
+        // #8189 — le défaut n'est plus la constante « Tune Server » (voir
+        // `le_nom_publie_par_defaut_distingue_les_serveurs`) : le témoin pose
+        // un nom ordinaire.
+        let backend2: Arc<dyn DbBackend> = Arc::new(db2);
+        crate::db::settings_repo::SettingsRepo::with_backend(backend2.clone())
+            .set("upnp_friendly_name", "Salon")
+            .unwrap();
+        let state2 = UpnpState::new(backend2, 8888, Some("192.168.1.18".into()));
         assert!(
-            build_device_description(&state2).contains("<friendlyName>Tune Server</friendlyName>"),
-            "le nom par defaut a bouge"
+            build_device_description(&state2).contains("<friendlyName>Salon</friendlyName>"),
+            "un nom ordinaire doit traverser inchangé"
         );
     }
 
