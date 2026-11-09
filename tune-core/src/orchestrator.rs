@@ -456,12 +456,13 @@ fn spawn_paced_levels_forwarder_complet(
             // l'aiguille sans attendre la piste suivante. `1000` — soit ×1,0 —
             // sur tous les chemins qui n'en déclarent pas, ce qui laisse leur
             // mesure inchangée.
-            let gain_units = playback.gain_de_sortie_units(zone_id);
+            // #8058 — en facteur EXACT, pas en millièmes : sous 0,0005 (curseur
+            // `db60` sous ~2,5 %) l'arrondi valait 0 alors que le son sortait.
+            let gain = playback.gain_de_sortie(zone_id);
             // #4384 — ce que la sortie locale DEMANDAIT avant le rabot à
             // l'unité (volume × ReplayGain, préampli compris). `None` hors
             // sortie locale et en DoP : rien n'y est raboté.
-            let gain_demande_units = playback.gain_demande_units(zone_id);
-            let gain = gain_units as f64 / 1000.0;
+            let gain_demande = playback.gain_demande(zone_id);
             // #4969 — la carte des canaux de la sortie locale : les niveaux
             // par canal décrivent alors les voies qui SORTENT (réaffectation
             // #6044, disposition déclarée #6057), pas l'ordre du fichier.
@@ -498,7 +499,7 @@ fn spawn_paced_levels_forwarder_complet(
             let mut ecrete_gauche = lvl.depasse_left;
             let mut ecrete_droite = lvl.depasse_right;
             if let Some((gauche, droite)) = playback.crete_de_sortie(zone_id, debut_ms, fin_ms) {
-                let rendu = f64::from(playback.gain_de_rendu_units(zone_id)) / 1000.0;
+                let rendu = playback.gain_de_rendu(zone_id);
                 ecrete_gauche = gauche * rendu > 1.0;
                 ecrete_droite = droite * rendu > 1.0;
                 lvl.peak_left = (gauche * rendu).min(1.0);
@@ -516,7 +517,7 @@ fn spawn_paced_levels_forwarder_complet(
                 avec_les_niveaux_par_canal(
                     &lvl,
                     avec_le_gain_demande(
-                        gain_demande_units,
+                        gain_demande,
                         serde_json::json!({
                             "zone_id": zone_id,
                             "play_seq": play_seq,
@@ -552,10 +553,10 @@ fn spawn_paced_levels_forwarder_complet(
                             // fichier, et voir qu'un préampli positif à plein volume
                             // ne monte pas (clamp à l'unité, voir
                             // `outputs::local::effective_volume_units`).
-                            "output_gain_db": if gain_units == 1000 {
+                            "output_gain_db": if gain == 1.0 {
                                 0.0_f32
                             } else {
-                                crate::audio::levels::gain_units_en_db(gain_units)
+                                crate::audio::levels::gain_en_db(gain)
                             },
                             // #7100 — surcharge = écrêtage RÉEL après traitement
                             // (volume, gain, égaliseur, ReplayGain compris). Ce
@@ -646,13 +647,15 @@ fn spawn_paced_levels_forwarder_complet(
 /// dans le flux, et chez un serveur d'avant : un client s'en garde par leur
 /// présence.
 fn avec_le_gain_demande(
-    gain_demande_units: Option<u32>,
+    gain_demande: Option<f64>,
     mut niveaux: serde_json::Value,
 ) -> serde_json::Value {
-    if let Some(demande) = gain_demande_units {
+    if let Some(demande) = gain_demande {
         niveaux["output_gain_requested_db"] =
-            serde_json::json!(crate::audio::levels::gain_units_en_db(demande));
-        niveaux["output_gain_limited"] = serde_json::json!(demande > 1000);
+            serde_json::json!(crate::audio::levels::gain_en_db(demande));
+        // Au millième près, comme avant (#4384) : un produit qui vaut l'unité
+        // à l'arrondi près n'est pas « raboté ».
+        niveaux["output_gain_limited"] = serde_json::json!(demande > 1.0005);
     }
     niveaux
 }
@@ -2198,6 +2201,9 @@ mod convolution_sous_licence_7632_tests;
 // #7986 — une RI que le convolveur refusera ne force pas le transcodage.
 #[cfg(test)]
 mod passthrough_sans_traitement_7986_tests;
+// #8006 — Pause et Arrêt n'attendent plus sans limite un appareil occupé.
+#[cfg(test)]
+mod sortie_occupee_8006_tests;
 
 /// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
 mod duree_du_flux_2062;
@@ -2420,6 +2426,9 @@ mod qobuz_repli_prechargement_6401_tests;
 /// #4384 — la crête d'une zone locale se lit après son DSP.
 #[cfg(test)]
 mod crete_apres_dsp_4384;
+/// #8058 — en bas de course du curseur, l'aiguille suit le son qui sort.
+#[cfg(test)]
+mod crete_bas_de_course_8058;
 /// #7100 — `over_*` dit l'écrêtage réel après traitement, pas la source.
 #[cfg(test)]
 mod ecretage_reel_7100_tests;
@@ -2662,3 +2671,6 @@ mod preparation_fichier_7247;
 
 #[cfg(test)]
 mod deplacement_qobuz_6982_tests;
+// #8188 — plafond 16 bits de la zone sur le bras HTTPS des services (Qobuz).
+#[cfg(test)]
+mod plafond_16_bits_service_8188_tests;

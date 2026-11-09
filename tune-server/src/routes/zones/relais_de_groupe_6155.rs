@@ -38,7 +38,9 @@
 //! /zones/{id}/play` avec un corps (le corps vide, Lecture après Arrêt, est une
 //! reprise et n'y compte pas), le saut dans la file, la radio (« Mes radios »
 //! et l'annuaire, par `jouer_un_flux`), l'épisode de podcast, le préréglage
-//! épinglé, la radio d'artiste et la lecture aléatoire de la bibliothèque. Un
+//! épinglé, la radio d'artiste et la lecture aléatoire de la bibliothèque —
+//! et, depuis #8021, le `Play` d'un point de contrôle UPnP externe sur la
+//! façade MediaRenderer d'une zone, et la lecture lancée par un greffon. Un
 //! lancement refusé (réponse d'échec, radio qui ne part pas) rend la tête à la
 //! meneuse d'avant. Le groupe
 //! formé depuis la fiche de la Chromecast suivait la Chromecast seule : une
@@ -48,11 +50,13 @@
 //! émet elle aussi `started`, elle deviendrait meneuse à son tour et les deux
 //! zones se renverraient la lecture.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 use tracing::{info, warn};
 
+use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::playback::{PlayState, ZoneState};
@@ -155,7 +159,11 @@ pub(crate) fn geste_pour_la_suiveuse(meneuse: &Instantane, suiveuse: &Instantane
 }
 
 fn groupes_enregistres(state: &AppState) -> Vec<Value> {
-    SettingsRepo::with_backend(state.backend.clone())
+    groupes_de(&state.backend)
+}
+
+fn groupes_de(backend: &Arc<dyn DbBackend>) -> Vec<Value> {
+    SettingsRepo::with_backend(backend.clone())
         .get("zone_groups")
         .ok()
         .flatten()
@@ -238,20 +246,20 @@ static MENEUSES_EN_ECRITURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Relit les groupes, applique `changer`, et réécrit s'il a changé quelque
 /// chose, sous [`MENEUSES_EN_ECRITURE`].
 fn changer_les_groupes<R>(
-    state: &AppState,
+    backend: &Arc<dyn DbBackend>,
     changer: impl FnOnce(&mut [Value]) -> R,
     a_change: impl Fn(&R) -> bool,
 ) -> Option<R> {
     let _garde = MENEUSES_EN_ECRITURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut groupes = groupes_enregistres(state);
+    let mut groupes = groupes_de(backend);
     let rendu = changer(&mut groupes);
     if !a_change(&rendu) {
         return Some(rendu);
     }
     let texte = serde_json::to_string(&groupes).ok()?;
-    match SettingsRepo::with_backend(state.backend.clone()).set("zone_groups", &texte) {
+    match SettingsRepo::with_backend(backend.clone()).set("zone_groups", &texte) {
         Ok(()) => Some(rendu),
         Err(error) => {
             warn!(%error, "zone_group_leader_change_failed");
@@ -267,8 +275,17 @@ fn changer_les_groupes<R>(
 /// Appelé par les routes de lancement AVANT de lancer (le relais réagit au
 /// `started`), jamais par le relais. Voir [`lancer_en_tete_du_groupe`].
 pub(crate) fn prendre_la_tete_du_groupe(state: &AppState, zone: i64) -> Vec<MeneuseRemplacee> {
+    prendre_la_tete_du_groupe_sur(&state.backend, zone)
+}
+
+/// #8021 — [`prendre_la_tete_du_groupe`] pour qui n'a que la base : l'hôte des
+/// greffons ne tient pas d'`AppState` (voir `plugins_host::AppStateHost`).
+pub(crate) fn prendre_la_tete_du_groupe_sur(
+    backend: &Arc<dyn DbBackend>,
+    zone: i64,
+) -> Vec<MeneuseRemplacee> {
     let remplacees = changer_les_groupes(
-        state,
+        backend,
         |groupes| mener_les_groupes_de(groupes, zone),
         |r| !r.is_empty(),
     )
@@ -290,10 +307,20 @@ pub(crate) fn rendre_la_tete_du_groupe(
     zone: i64,
     remplacees: &[MeneuseRemplacee],
 ) {
+    rendre_la_tete_du_groupe_sur(&state.backend, zone, remplacees);
+}
+
+/// #8021 — [`rendre_la_tete_du_groupe`] pour qui n'a que la base.
+pub(crate) fn rendre_la_tete_du_groupe_sur(
+    backend: &Arc<dyn DbBackend>,
+    zone: i64,
+    remplacees: &[MeneuseRemplacee],
+) {
     if remplacees.is_empty() {
         return;
     }
-    if changer_les_groupes(state, |g| rendre_les_groupes(g, zone, remplacees), |c| *c) == Some(true)
+    if changer_les_groupes(backend, |g| rendre_les_groupes(g, zone, remplacees), |c| *c)
+        == Some(true)
     {
         info!(zone, "zone_group_leader_restored");
     }

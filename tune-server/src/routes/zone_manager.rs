@@ -348,8 +348,9 @@ async fn hot_swap_zone(
     if was_playing {
         // Stop playback on old output
         if let Some(ref old_dev) = old_device {
-            let outputs = state.outputs.lock().await;
-            if let Some(output) = outputs.get(old_dev) {
+            // #8006 — le registre est relâché avant d'attendre la sortie.
+            let sortie = state.outputs.lock().await.get(old_dev);
+            if let Some(output) = sortie {
                 let output = output.lock().await;
                 let _ = output.stop().await;
             }
@@ -976,13 +977,22 @@ async fn sync_stats(State(state): State<AppState>) -> Json<Value> {
 async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
-    let outputs = state.outputs.lock().await;
+    // #8006 — les sorties sont relevées, puis le registre relâché : une
+    // sortie occupée ne fige plus les autres zones le temps de la mesure.
+    let sorties: std::collections::HashMap<String, _> = {
+        let outputs = state.outputs.lock().await;
+        zones
+            .iter()
+            .filter_map(|z| z.output_device_id.as_ref())
+            .filter_map(|id| outputs.get(id).map(|o| (id.clone(), o)))
+            .collect()
+    };
 
     let mut results = Vec::new();
     for z in &zones {
         let zone_id = z.id.unwrap_or(0);
         if let Some(ref device_id) = z.output_device_id {
-            if let Some(output) = outputs.get(device_id) {
+            if let Some(output) = sorties.get(device_id) {
                 let output = output.lock().await;
                 match measure_control_rtt(&**output, 5).await {
                     Some(stats) => results.push(json!({
@@ -1118,7 +1128,17 @@ pub(crate) async fn unreachable_endpoints_avec_delai(
         .collect()
 }
 
-async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
+/// #8185 — un refus répond par un statut d'erreur, plus par un 200.
+///
+/// Le refus partait en `200 OK` avec un corps `{"error": …}`. L'interface web
+/// (`OaatGroupsPanel.svelte`) ne lit pas ce champ : elle affichait « groupe
+/// créé » en vert, rechargeait la liste… vide, puisque rien n'avait été
+/// enregistré (Rhorn, fil 2712 : deux récepteurs sur le port 9740 par défaut).
+/// Le corps du refus est inchangé ; seul le statut dit enfin ce qu'il est.
+async fn create_oaat_group(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
     let name = body["name"].as_str().unwrap_or("OAAT Group");
     let endpoints: Vec<(String, u16)> = body["endpoints"]
         .as_array()
@@ -1132,7 +1152,10 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
         .collect();
 
     if endpoints.is_empty() {
-        return Json(json!({ "error": "at least one endpoint required" }));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "at least one endpoint required" })),
+        );
     }
 
     // Un groupe qui ne peut pas jouer ne doit pas pouvoir se créer (#1779).
@@ -1146,16 +1169,19 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
             total = endpoints.len(),
             "oaat_multiroom_group_refused_unreachable_endpoints"
         );
-        return Json(json!({
-            "error": "oaat_endpoints_unreachable",
-            "code": "oaat_endpoints_unreachable",
-            "message": crate::message_api::texte(
-                "api.groups.unreachableEndpoints",
-                &[("endpoints", unreachable.join(", "))],
-            ),
-            "message_key": "api.groups.unreachableEndpoints",
-            "unreachable_endpoints": unreachable,
-        }));
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "oaat_endpoints_unreachable",
+                "code": "oaat_endpoints_unreachable",
+                "message": crate::message_api::texte(
+                    "api.groups.unreachableEndpoints",
+                    &[("endpoints", unreachable.join(", "))],
+                ),
+                "message_key": "api.groups.unreachableEndpoints",
+                "unreachable_endpoints": unreachable,
+            })),
+        );
     }
 
     let group_id = format!(
@@ -1191,12 +1217,15 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
 
     info!(group_id = %group_id, name, endpoints = endpoints.len(), "oaat_multiroom_group_created");
 
-    Json(oaat_group_view(json!({
-        "id": group_id,
-        "name": name,
-        "endpoints": endpoints.len(),
-        "device_id": format!("oaat-group:{group_id}"),
-    })))
+    (
+        StatusCode::OK,
+        Json(oaat_group_view(json!({
+            "id": group_id,
+            "name": name,
+            "endpoints": endpoints.len(),
+            "device_id": format!("oaat-group:{group_id}"),
+        }))),
+    )
 }
 
 async fn delete_oaat_group(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
@@ -1221,10 +1250,11 @@ async fn delete_oaat_group(State(state): State<AppState>, Path(id): Path<String>
 
 async fn oaat_group_status(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
     let device_id = format!("oaat-group:{id}");
-    let outputs = state.outputs.lock().await;
+    // #8006 — le registre est relâché avant d'attendre la sortie.
+    let sortie = state.outputs.lock().await.get(&device_id);
 
     #[cfg(feature = "oaat")]
-    if let Some(output) = outputs.get(&device_id) {
+    if let Some(output) = sortie {
         let output = output.lock().await;
         if let Some(mr) = downcast_oaat_multiroom(&**output) {
             return Json(mr.zone_snapshot().await);
@@ -1248,8 +1278,9 @@ async fn oaat_group_add_endpoint(
         return Json(json!({ "error": "host is required" }));
     }
 
-    let outputs = state.outputs.lock().await;
-    if let Some(output) = outputs.get(&device_id) {
+    // #8006 — le registre est relâché avant d'attendre la sortie.
+    let sortie = state.outputs.lock().await.get(&device_id);
+    if let Some(output) = sortie {
         let output = output.lock().await;
         if let Some(mr) = downcast_oaat_multiroom(&**output) {
             match mr.add_endpoint(host, port).await {
@@ -1280,9 +1311,10 @@ async fn oaat_group_remove_endpoint(
     Path((id, ep_id)): Path<(String, String)>,
 ) -> Json<Value> {
     let device_id = format!("oaat-group:{id}");
-    let outputs = state.outputs.lock().await;
+    // #8006 — le registre est relâché avant d'attendre la sortie.
+    let sortie = state.outputs.lock().await.get(&device_id);
 
-    if let Some(output) = outputs.get(&device_id) {
+    if let Some(output) = sortie {
         let output = output.lock().await;
         if let Some(mr) = downcast_oaat_multiroom(&**output) {
             let removed = mr.remove_endpoint(&ep_id).await;
@@ -1311,8 +1343,9 @@ async fn oaat_group_set_volume(
     let device_id = format!("oaat-group:{id}");
     let level = body["level"].as_u64().unwrap_or(100).min(100) as u8;
 
-    let outputs = state.outputs.lock().await;
-    if let Some(output) = outputs.get(&device_id) {
+    // #8006 — le registre est relâché avant d'attendre la sortie.
+    let sortie = state.outputs.lock().await.get(&device_id);
+    if let Some(output) = sortie {
         let output = output.lock().await;
         if let Some(mr) = downcast_oaat_multiroom(&**output) {
             match mr.set_zone_volume(level).await {
@@ -1342,8 +1375,9 @@ async fn oaat_group_set_endpoint_volume(
 ) -> Json<Value> {
     let device_id = format!("oaat-group:{id}");
 
-    let outputs = state.outputs.lock().await;
-    if let Some(output) = outputs.get(&device_id) {
+    // #8006 — le registre est relâché avant d'attendre la sortie.
+    let sortie = state.outputs.lock().await.get(&device_id);
+    if let Some(output) = sortie {
         let output = output.lock().await;
         if let Some(mr) = downcast_oaat_multiroom(&**output) {
             // Support both absolute level and relative offset
@@ -1385,6 +1419,10 @@ fn downcast_oaat_multiroom(
         .as_any()
         .downcast_ref::<tune_core::outputs::oaat::OaatMultiroomOutput>()
 }
+
+#[cfg(test)]
+#[path = "zone_manager_8185_tests.rs"]
+mod creation_oaat_refusee_8185_tests;
 
 #[cfg(test)]
 mod tests {
