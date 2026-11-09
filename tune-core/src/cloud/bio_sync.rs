@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cloud::rate_limit::{self, CloudScope};
 use crate::db::album_repo::AlbumRepo;
@@ -214,6 +214,21 @@ pub fn source_envoyable_au_fonds(source: Option<&str>) -> bool {
     !SOURCES_JAMAIS_ENVOYEES.contains(&s.as_str())
 }
 
+/// #8009 — la langue d'une biographie, ramenée à sa base (`fr-CA` → `fr`), ou
+/// `None` si elle n'est pas annoncée (absente, vide, illisible).
+///
+/// Depuis #7027, une biographie rangée sans langue n'est plus montrée à
+/// personne. Le fonds communautaire annonce la langue de chaque bio qu'il
+/// rend (`lang`, vérifié le 09/11 sur mozaiklabs.fr : `fr`, `en`, et le repli
+/// annoncé tel quel) : une bio qui arrive sans langue n'est pas rangée, et
+/// l'artiste ou l'album reste candidat au prochain cycle — au lieu de garder
+/// pour toujours un texte invisible qui l'en retirait. Dans l'autre sens, une
+/// bio locale sans langue ne part pas au fonds : elle y reviendrait sans
+/// langue, chez tout le monde.
+fn langue_annoncee(lang: Option<&str>) -> Option<String> {
+    lang.and_then(crate::streaming::editorial_bibliotheque::langue_de_base)
+}
+
 #[derive(Debug, Deserialize)]
 struct AlbumByTitleBiosWrapper {
     #[serde(default)]
@@ -275,6 +290,9 @@ async fn upload_bios_to(db: &Arc<dyn DbBackend>, upload_url: &str) {
     // #8022 : jamais une bio d'un service de streaming vers le fonds.
     artists.retain(|(_, _, _, source, ..)| source_envoyable_au_fonds(source.as_deref()));
     albums.retain(|(_, _, _, _, source, ..)| source_envoyable_au_fonds(source.as_deref()));
+    // #8009 : jamais une bio sans langue vers le fonds.
+    artists.retain(|(.., lang)| langue_annoncee(lang.as_deref()).is_some());
+    albums.retain(|(.., lang)| langue_annoncee(lang.as_deref()).is_some());
 
     if artists.is_empty() && albums.is_empty() {
         return;
@@ -547,13 +565,17 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client,
         let mut applied = 0usize;
         for entry in &wrapper.artists {
             if let Some(&artist_id) = id_map.get(entry.musicbrainz_id.as_str()) {
+                let Some(langue) = langue_annoncee(entry.lang.as_deref()) else {
+                    debug!(artist_id, "bio_communautaire_sans_langue_non_rangee");
+                    continue;
+                };
                 if let Err(e) = artist_repo.update_bio_full(
                     artist_id,
                     &entry.bio,
                     bio_source(&entry.source),
                     entry.source_url.clone(),
                     entry.license.as_deref().unwrap_or(""),
-                    entry.lang.as_deref().unwrap_or(""),
+                    &langue,
                 ) {
                     warn!(artist_id, error = %e, "bio_download_artist_update_failed");
                 } else {
@@ -650,13 +672,17 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client, 
         let mut applied = 0usize;
         for entry in &wrapper.albums {
             if let Some(&album_id) = id_map.get(entry.musicbrainz_id.as_str()) {
+                let Some(langue) = langue_annoncee(entry.lang.as_deref()) else {
+                    debug!(album_id, "bio_communautaire_sans_langue_non_rangee");
+                    continue;
+                };
                 if let Err(e) = album_repo.update_bio_full(
                     album_id,
                     &entry.bio,
                     bio_source(&entry.source),
                     entry.source_url.clone(),
                     entry.license.as_deref().unwrap_or(""),
-                    entry.lang.as_deref().unwrap_or(""),
+                    &langue,
                 ) {
                     warn!(album_id, error = %e, "bio_download_album_update_failed");
                 } else {
@@ -757,13 +783,17 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client, 
         for entry in &wrapper.albums {
             let key = (entry.title.as_str(), entry.artist_name.as_deref());
             if let Some(&album_id) = id_map.get(&key) {
+                let Some(langue) = langue_annoncee(entry.lang.as_deref()) else {
+                    debug!(album_id, "bio_communautaire_sans_langue_non_rangee");
+                    continue;
+                };
                 if let Err(e) = album_repo.update_bio_full(
                     album_id,
                     &entry.bio,
                     bio_source(&entry.source),
                     entry.source_url.clone(),
                     entry.license.as_deref().unwrap_or(""),
-                    entry.lang.as_deref().unwrap_or(""),
+                    &langue,
                 ) {
                     warn!(album_id, error = %e, "bio_download_album_by_title_update_failed");
                 } else {
@@ -1117,6 +1147,7 @@ mod tests {
                         "name": "Sans Bio",
                         "bio": "Une biographie communautaire.",
                         "source": "wikipedia",
+                        "lang": "fr",
                     }]
                 }))
             }),
@@ -1417,5 +1448,98 @@ mod tests {
         for r in &v {
             assert!(r.ends_with("&lang=en"), "{r}");
         }
+    }
+
+    /// #8009 — une bio du fonds qui arrive SANS langue n'est pas rangée (elle
+    /// serait invisible depuis #7027 et retirerait l'artiste des candidats) ;
+    /// la même avec sa langue l'est, sous cette langue ramenée à sa base.
+    #[tokio::test]
+    async fn une_bio_du_fonds_sans_langue_n_est_pas_rangee_8009() {
+        use axum::Router;
+        use axum::routing::get;
+
+        for (lang, attendu) in [
+            (serde_json::Value::Null, None),
+            (serde_json::json!(""), None),
+            (serde_json::json!("fr-FR"), Some("fr")),
+        ] {
+            let db = fresh_db();
+            let (artiste, _) = semer_trois_candidats(&db);
+            let corps = serde_json::json!({"bios": [{
+                "musicbrainz_id": "mbid-00042", "name": "A",
+                "bio": "Bio d'artiste.", "source": "wikipedia", "lang": lang}]});
+            let app = Router::new().route(
+                "/artists",
+                get(move || {
+                    let c = corps.clone();
+                    async move { axum::Json(c) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            download_artist_bios(
+                &db,
+                &client_de_test(),
+                &format!("http://127.0.0.1:{port}/artists"),
+            )
+            .await;
+            let repo = ArtistRepo::with_backend(db.clone());
+            let rangee = repo.get(artiste).unwrap().unwrap().bio;
+            match attendu {
+                None => {
+                    assert_eq!(
+                        rangee, None,
+                        "🔴 une bio du fonds sans langue ({lang}) a été rangée sans langue (#8009)"
+                    );
+                    assert!(
+                        repo.artists_without_bio_with_mbid()
+                            .unwrap()
+                            .iter()
+                            .any(|(id, _)| *id == artiste),
+                        "l'artiste doit rester candidat au prochain cycle"
+                    );
+                }
+                Some(l) => {
+                    assert_eq!(rangee.as_deref(), Some("Bio d'artiste."));
+                    let p = repo.bio_provenance(artiste).unwrap().unwrap();
+                    assert_eq!(p["lang"], l, "{p}");
+                }
+            }
+        }
+    }
+
+    /// #8009 — une bio locale sans langue ne part pas au fonds : elle y
+    /// reviendrait sans langue, chez tout le monde. Avec sa langue, elle part.
+    #[tokio::test]
+    async fn une_bio_sans_langue_ne_part_pas_au_fonds_8009() {
+        use crate::db::models::Artist;
+
+        let db = fresh_db();
+        let artistes = ArtistRepo::with_backend(db.clone());
+        for (i, (texte, lang)) in [("BIO-AVEC-LANGUE", "fr"), ("BIO-SANS-LANGUE", "")]
+            .iter()
+            .enumerate()
+        {
+            let mut a = Artist::new(format!("Artiste {i}"));
+            a.musicbrainz_id = Some(format!("mbid-langue-{i}"));
+            let id = artistes.create(&a).unwrap();
+            artistes
+                .update_bio_full(id, texte, "wikipedia", None, "CC-BY-SA-4.0", lang)
+                .unwrap();
+        }
+        let (base, corps) = mock_qui_garde_les_corps().await;
+        upload_bios_to(&db, &format!("{base}/upload")).await;
+        let recus = corps.lock().unwrap().join("\n");
+        assert!(
+            recus.contains("BIO-AVEC-LANGUE"),
+            "le banc doit voir un envoi ({recus})"
+        );
+        assert!(
+            !recus.contains("BIO-SANS-LANGUE"),
+            "🔴 une bio sans langue est partie vers le fonds communautaire (#8009) : {recus}"
+        );
     }
 }
