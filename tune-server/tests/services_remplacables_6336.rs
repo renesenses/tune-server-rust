@@ -724,7 +724,8 @@ async fn un_arl_refuse_par_deezer_rend_400_6336() {
 // ── La production ne change pas ───────────────────────────────────────────
 
 /// Les substitutions n'existent que sous la feature `services-factices`. Elle
-/// ne doit être allumée QUE par les `[dev-dependencies]` de tune-server : un
+/// ne doit être allumée QUE par des `[dev-dependencies]` — celles de tune-server,
+/// et celles de tune-streaming-http pour la doublure Spotify de #8142 : un
 /// manifeste qui l'allumerait en dépendance normale, ou une ligne de build
 /// publiée qui la nommerait, rendrait ces substituts actifs en production.
 #[test]
@@ -767,8 +768,11 @@ fn la_feature_des_services_factices_n_atteint_aucun_binaire_publie_6336() {
     }
     assert_eq!(
         allumages,
-        vec!["tune-server [dev-dependencies] tune-core".to_string()],
-        "`services-factices` ne doit être allumée que par les dev-dependencies de tune-server"
+        vec![
+            "tune-server [dev-dependencies] tune-core".to_string(),
+            "tune-streaming-http [dev-dependencies] tune-core".to_string(),
+        ],
+        "`services-factices` ne doit être allumée que par des dev-dependencies"
     );
     for publie in ["release.yml", "docker.yml"] {
         let texte = std::fs::read_to_string(racine.join(".github/workflows").join(publie)).unwrap();
