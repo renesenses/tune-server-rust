@@ -331,3 +331,45 @@ async fn le_rappel_direct_rend_le_code_stable() {
     .await;
     assert_refus(statut, &corps, CODE_STATE_INCONNU);
 }
+
+/// Retour d'un testeur (09/11) : le Client ID enregistré dans Tune n'était
+/// pas celui de son application. Spotify le dit sans connexion : un échange
+/// factice répond `invalid_client` (« Failed to get client »).
+#[tokio::test]
+async fn diagnostic_signale_un_client_id_inconnu_de_spotify() {
+    let mut reponses = Reponses::normales();
+    reponses.jeton = (
+        400,
+        json!({"error": "invalid_client", "error_description": "Failed to get client"}),
+    );
+    let (app, _) = app_avec(reponses).await;
+    let diag = diagnostic(&app).await;
+    assert_eq!(
+        diag["client_id"]["etat"], "ok",
+        "la forme est bonne : {diag}"
+    );
+    assert_eq!(diag["client_id"]["spotify"], "inconnu", "{diag}");
+    assert_eq!(
+        diag["client_id"]["debut"], "01234567",
+        "le début se compare à l'adresse du tableau de bord : {diag}"
+    );
+    assert_eq!(
+        diag["a_corriger"],
+        json!(["client_id_inconnu_de_spotify", "non_connecte"]),
+        "{diag}"
+    );
+}
+
+/// Un Client ID connu de Spotify (l'échange factice répond `invalid_grant`).
+#[tokio::test]
+async fn diagnostic_client_id_connu_de_spotify() {
+    let mut reponses = Reponses::normales();
+    reponses.jeton = (
+        400,
+        json!({"error": "invalid_grant", "error_description": "Invalid authorization code"}),
+    );
+    let (app, _) = app_avec(reponses).await;
+    let diag = diagnostic(&app).await;
+    assert_eq!(diag["client_id"]["spotify"], "connu", "{diag}");
+    assert_eq!(diag["a_corriger"], json!(["non_connecte"]), "{diag}");
+}

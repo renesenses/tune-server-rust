@@ -1083,6 +1083,49 @@ impl SpotifyService {
 }
 
 impl SpotifyService {
+    /// #8198 — l'adresse de retour que Tune envoie a Spotify, a declarer a
+    /// l'identique dans l'application Spotify.
+    pub fn adresse_de_retour(&self) -> &str {
+        &self.redirect_uri
+    }
+
+    /// #8198 — les 8 premiers caracteres du Client ID en service, a comparer
+    /// avec l'adresse du tableau de bord Spotify ; `None` sans Client ID.
+    pub fn debut_du_client_id(&self) -> Option<String> {
+        self.client_id_est_configure()
+            .then(|| self.client_id.chars().take(8).collect())
+    }
+
+    /// #8198 — Spotify connait-il ce Client ID ? Un echange de code factice
+    /// (`/api/token`) repond `invalid_client` (« Failed to get client ») pour
+    /// un identifiant inconnu, `invalid_grant` pour un identifiant connu.
+    /// Aucun compte n'est en jeu. `non_verifie` si Spotify ne repond pas.
+    async fn sonder_client_id(&self) -> &'static str {
+        let reponse = self
+            .client
+            .post(&self.token_url)
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", "tune-diagnostic-code-factice"),
+                ("redirect_uri", &self.redirect_uri),
+                ("client_id", &self.client_id),
+                (
+                    "code_verifier",
+                    "tune-diagnostic-verificateur-factice-0123456789",
+                ),
+            ])
+            .send()
+            .await;
+        let Ok(reponse) = reponse else {
+            return "non_verifie";
+        };
+        match reponse.json::<serde_json::Value>().await {
+            Ok(v) if v["error"] == "invalid_client" => "inconnu",
+            Ok(_) => "connu",
+            Err(_) => "non_verifie",
+        }
+    }
+
     /// #8198 — le verificateur de configuration (`GET
     /// /streaming/spotify/diagnostic`) : ce qui ne va pas, dit precisement.
     ///
@@ -1104,6 +1147,22 @@ impl SpotifyService {
         } else {
             "ok"
         };
+        // Retour d'un testeur (09/11) : le Client ID enregistre n'etait pas
+        // celui de son application. Spotify le dit sans qu'aucun compte se
+        // connecte : un echange de code factice repond `invalid_client` pour
+        // un identifiant qu'il ne connait pas. Les 8 premiers caracteres se
+        // comparent a l'adresse du tableau de bord (un Client ID n'est pas un
+        // secret).
+        let connu_de_spotify = if client_id == "ok" {
+            let connu = self.sonder_client_id().await;
+            if connu == "inconnu" {
+                a_corriger.push("client_id_inconnu_de_spotify".into());
+            }
+            connu
+        } else {
+            "non_verifie"
+        };
+        let debut = self.debut_du_client_id();
 
         let redirect = match refus_redirection(&self.redirect_uri) {
             None => "ok",
@@ -1165,7 +1224,11 @@ impl SpotifyService {
 
         serde_json::json!({
             "service": "spotify",
-            "client_id": { "etat": client_id },
+            "client_id": {
+                "etat": client_id,
+                "spotify": connu_de_spotify,
+                "debut": debut,
+            },
             "redirect_uri": {
                 "valeur": self.redirect_uri,
                 "etat": redirect,

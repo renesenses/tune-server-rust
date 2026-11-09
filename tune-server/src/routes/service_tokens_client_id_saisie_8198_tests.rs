@@ -117,3 +117,87 @@ async fn ce_qui_n_est_pas_un_client_id_est_refuse_avec_le_geste() {
     }
     assert!(enregistre(&state).is_none());
 }
+
+async fn liste_spotify(app: &axum::Router) -> Value {
+    let req = Request::builder()
+        .uri("/api/v1/services/tokens")
+        .header("accept-language", "fr")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let brut = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&brut).unwrap();
+    let lignes = v["services"]
+        .as_array()
+        .or(v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    lignes
+        .into_iter()
+        .find(|l| l["id"] == "spotify")
+        .unwrap_or_else(|| panic!("ligne spotify absente : {v}"))
+}
+
+/// Retour du testeur (09/11) : « Enregistrer » sur la valeur déjà en place
+/// ne donnait aucun retour visible.
+#[tokio::test]
+async fn enregistrer_deux_fois_la_meme_valeur_dit_inchange() {
+    if std::env::var("TUNE_SPOTIFY_CLIENT_ID").is_ok() {
+        return;
+    }
+    let (app, _) = app().await;
+    let premiere = poser(&app, CLIENT_ID).await;
+    assert_eq!(premiere["etat"], "enregistre", "{premiere}");
+    let seconde = poser(&app, CLIENT_ID).await;
+    assert_eq!(seconde["valid"], true, "{seconde}");
+    assert_eq!(seconde["etat"], "inchange", "{seconde}");
+    let message = seconde["validation_message"].as_str().unwrap();
+    assert!(message.contains("déjà enregistré"), "{message}");
+    assert!(
+        message.contains("connectez-vous"),
+        "l'étape suivante est dite : {message}"
+    );
+}
+
+/// Retour du testeur : le Client ID et l'adresse de retour à déclarer au même
+/// endroit, et un état « à connecter » plutôt que « non configuré ».
+#[tokio::test]
+async fn la_ligne_spotify_porte_l_adresse_de_retour_et_l_etape() {
+    if std::env::var("TUNE_SPOTIFY_CLIENT_ID").is_ok() {
+        return;
+    }
+    let (app, _) = app().await;
+    let avant = liste_spotify(&app).await;
+    assert_eq!(avant["spotify_etape"], "client_id_manquant", "{avant}");
+    assert_eq!(avant["spotify_client_id_debut"], Value::Null, "{avant}");
+    assert!(
+        avant["spotify_redirect_uri"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("http://127.0.0.1:")
+                && u.ends_with("/api/v1/streaming/spotify/callback")),
+        "{avant}"
+    );
+
+    poser(&app, CLIENT_ID).await;
+    let apres = liste_spotify(&app).await;
+    assert_eq!(apres["spotify_etape"], "a_connecter", "{apres}");
+    assert_eq!(apres["spotify_client_id_debut"], "01234567", "{apres}");
+    assert!(
+        apres["validation_message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Client ID enregistré") && m.contains("connectez-vous")),
+        "{apres}"
+    );
+}
+
+#[test]
+fn l_etape_suit_le_client_id_et_la_connexion() {
+    use super::etape_spotify;
+    assert_eq!(etape_spotify(false, false), "client_id_manquant");
+    assert_eq!(etape_spotify(true, false), "a_connecter");
+    assert_eq!(etape_spotify(true, true), "connecte");
+    assert_eq!(etape_spotify(false, true), "connecte");
+}

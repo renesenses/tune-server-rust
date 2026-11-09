@@ -39,6 +39,10 @@ pub async fn list(
         .and_then(|s| s["authenticated"].as_bool())
         .unwrap_or(false);
     let spotify_client_id_ok = spotify_client_id_configure(&state).await;
+    // #8198 (retour d'un testeur, 09/11) — le Client ID et l'adresse de
+    // retour à déclarer au même endroit, et un état qui dit l'étape suivante.
+    let (spotify_redirect_uri, spotify_client_id_debut) = spotify_adresse_et_debut(&state).await;
+    let spotify_etape = etape_spotify(spotify_client_id_ok, spotify_auth);
     // #6777 — D'OÙ vient le Client ID effectif : l'écran n'offre « Effacer »
     // que pour un réglage en base, pas pour une variable qui l'impose.
     let spotify_client_id_source = source_du_client_id_spotify(
@@ -232,7 +236,22 @@ pub async fn list(
             "pricing": "freemium", "pricing_note": tr("svctok.spotify.pricing"),
             "configured": spotify_auth, "source": if spotify_auth { json!("db") } else { serde_json::Value::Null },
             "valid": if spotify_auth { json!(true) } else { serde_json::Value::Null },
-            "validated_at": serde_json::Value::Null, "validation_message": serde_json::Value::Null,
+            "validated_at": serde_json::Value::Null,
+            // #8198 — « Client ID enregistré : connectez-vous à Spotify » au
+            // lieu d'un « non configuré » qui faisait croire que rien n'avait
+            // été enregistré.
+            "validation_message": match spotify_etape {
+                "a_connecter" => json!(tr("svctok.spotify.nextStepSignIn")),
+                _ => serde_json::Value::Null,
+            },
+            // `client_id_manquant`, `a_connecter` ou `connecte`.
+            "spotify_etape": spotify_etape,
+            // L'adresse de retour à déclarer dans l'application Spotify, à
+            // côté du champ Client ID.
+            "spotify_redirect_uri": spotify_redirect_uri,
+            // Les 8 premiers caractères du Client ID en service, à comparer
+            // avec l'adresse du tableau de bord (developer.spotify.com/dashboard/<id>).
+            "spotify_client_id_debut": spotify_client_id_debut,
             "fields": [],
             "help_url": "/streaming/spotify",
             "help_steps": [tr("svctok.spotify.step1")],
@@ -502,7 +521,21 @@ pub(crate) async fn enregistrer_client_id_spotify(
     };
     let client_id = client_id.as_str();
 
+    // #8198 (retour d'un testeur) — « Enregistrer » sur la valeur déjà en
+    // place ne donnait aucun retour visible : le dire, avec l'étape suivante.
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    if settings.get("spotify_client_id").ok().flatten().as_deref() == Some(client_id)
+        && spotify_client_id_configure(state).await
+    {
+        return json!({
+            "valid": true,
+            "etat": "inchange",
+            "spotify_client_id_configure": true,
+            "client_id_extrait": extrait,
+            "validation_message": tr("svctok.spotify.clientIdUnchanged"),
+        });
+    }
+
     if let Err(e) = settings.set("spotify_client_id", client_id) {
         error!(error = %e, "spotify_client_id_save_failed");
         return json!({
@@ -546,6 +579,35 @@ pub(crate) async fn enregistrer_client_id_spotify(
             tr("svctok.spotify.clientIdSaved")
         },
     })
+}
+
+/// #8198 — l'étape où en est la connexion Spotify, pour la carte des services.
+pub(crate) fn etape_spotify(client_id_ok: bool, connecte: bool) -> &'static str {
+    match (client_id_ok, connecte) {
+        (_, true) => "connecte",
+        (true, false) => "a_connecter",
+        (false, false) => "client_id_manquant",
+    }
+}
+
+/// #8198 — l'adresse de retour que le service envoie, et le début du Client
+/// ID en service.
+pub(crate) async fn spotify_adresse_et_debut(state: &AppState) -> (Option<String>, Option<String>) {
+    let svc = state.services.lock().await.get("spotify");
+    let Some(svc) = svc else {
+        return (None, None);
+    };
+    let garde = svc.read().await;
+    match garde
+        .as_any()
+        .downcast_ref::<tune_core::streaming::spotify::SpotifyService>()
+    {
+        Some(s) => (
+            Some(s.adresse_de_retour().to_owned()),
+            s.debut_du_client_id(),
+        ),
+        None => (None, None),
+    }
 }
 
 /// Fil 221 — le service Spotify tourne-t-il avec un vrai Client ID ? C'est
