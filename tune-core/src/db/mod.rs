@@ -96,6 +96,8 @@ pub mod repartitions_bibliotheque;
 pub(crate) mod replieur_wal;
 pub mod settings_repo;
 pub mod source_link_repo;
+/// Les sources réseau lues sans montage (#8189).
+pub mod sources_reseau;
 pub mod sqlite;
 pub mod streaming_favorites_repo;
 pub mod tag_repo;

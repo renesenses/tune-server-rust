@@ -553,6 +553,9 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // puisse nommer ce a quoi revenir. Independant de `record_post_update_result`,
     // qui rend la main tot sur les chemins d'echec : voir `noter_la_version_vue`.
     crate::routes::system::update::noter_la_version_vue(state);
+    // #8189 — les sources réseau configurées : enregistrées AVANT le scan de
+    // démarrage, qui parcourt leurs racines.
+    crate::routes::sources_reseau::demarrer(state);
 
     // Warm the ASIO device cache once at boot, while the audio devices are still
     // idle. An ASIO driver — notably SOtM Diretta — can't be re-enumerated once a

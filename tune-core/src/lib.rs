@@ -92,6 +92,8 @@ pub mod social;
 pub mod source_pcm;
 pub mod source_url;
 pub mod sources_physiques;
+/// Le socle « source distante » : fichiers d'un NAS lus sans montage (#8189).
+pub mod sources_reseau;
 pub mod stream_cache;
 pub mod streaming;
 mod system_sleep;

@@ -1940,7 +1940,13 @@ async fn spawn_library_scan_avec_lecteur_par(
         let event_bus_pour_panne = event_bus.clone();
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
-        let raw_dirs = super::get_music_dirs_list(&db);
+        let mut raw_dirs = super::get_music_dirs_list(&db);
+        // #8189 — les racines des sources réseau (`tune-src://…`) : parcourues
+        // par leur protocole, protégées de la purge quand elles sont
+        // injoignables.
+        raw_dirs.extend(
+            tune_core::db::sources_reseau::SourcesReseauRepo::with_backend(db.clone()).racines(),
+        );
         if raw_dirs.is_empty() {
             // #6175 — un partage monté mais non déclaré est la cause la plus
             // probable d'un scan sans dossier : le dire ici, et à l'écran.

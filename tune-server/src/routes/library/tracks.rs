@@ -1044,7 +1044,8 @@ fn octets_dans_l_image(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek};
-        let mut lecteur = match tune_core::audio::iso9660::ouvrir(&chemin) {
+        // #8189 — même chemin pour un fichier d'une source distante.
+        let mut lecteur = match tune_core::audio::iso9660::ouvrir_fichier(&chemin) {
             Ok(l) => l,
             Err(e) => {
                 let _ = tx.blocking_send(Err(e));

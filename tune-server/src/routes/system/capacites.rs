@@ -15,10 +15,11 @@ use serde_json::{Value, json};
 use crate::state::AppState;
 
 /// Les types de sources distantes que le moteur sait lire sans montage
-/// système (WebDAV, SMB, NFS : étapes 3, 4 et 6 de #8189). Vide tant
-/// qu'aucun protocole réel n'est branché.
-pub(crate) fn types_de_sources_distantes() -> Vec<&'static str> {
-    Vec::new()
+/// système (WebDAV, SMB, NFS : étapes 3, 4 et 6 de #8189) : ceux dont une
+/// fabrique est déclarée (`sources_reseau::installer_la_fabrique`). Vide
+/// tant qu'aucun protocole réel n'est branché.
+pub(crate) fn types_de_sources_distantes() -> Vec<String> {
+    tune_core::sources_reseau::types_pris_en_charge()
 }
 
 pub(crate) fn capacites_payload(mobile: bool) -> Value {
@@ -70,8 +71,10 @@ mod tests {
 
     #[tokio::test]
     async fn la_route_est_servie_par_le_routeur() {
-        let mut config = crate::config::TuneConfig::default();
-        config.mobile = true;
+        let config = crate::config::TuneConfig {
+            mobile: true,
+            ..Default::default()
+        };
         let state = AppState::new(":memory:", 0, config).unwrap();
         let app = crate::routes::router(state);
         let rep = app

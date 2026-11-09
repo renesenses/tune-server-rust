@@ -243,6 +243,9 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // apports après la bascule.
     "apports_service_albums",
     "apports_service",
+    // Sources réseau (#8189, script 109) : sans cette ligne, les sources
+    // configurées et leurs identifiants scellés seraient perdus à la bascule.
+    "sources_reseau",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",

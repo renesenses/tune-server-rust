@@ -1351,6 +1351,29 @@ pub fn dedoublonner_racines(dirs: &[String]) -> RacinesDedoublonnees {
     verdict
 }
 
+/// Un fichier d'une source distante entre-t-il au parcours ? Les formats lus
+/// seulement, ni feuille CUE ni image ISO (pas encore lues à distance), ni
+/// fichier écarté par un motif d'exclusion.
+fn fichier_distant_retenu(nom: &str, excludes: &[String]) -> bool {
+    let p = Path::new(nom);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if ext == "cue" || ext == "iso" {
+        return false;
+    }
+    let nom_l = nom.to_lowercase();
+    if excludes.iter().any(|x| nom_l.contains(x.as_str())) {
+        return false;
+    }
+    matches!(
+        crate::audio::support::library_audio_support_by_extension(p),
+        crate::audio::support::LibraryAudioSupport::Supported
+    )
+}
+
 pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
     list_audio_files_with_excludes(dirs, &[])
 }
@@ -1461,6 +1484,39 @@ pub fn list_audio_files_avec_arret(
 
     for dir in &racines.retenues {
         let normalized = normalize_path(dir);
+        // #8189 — une racine sur une source distante (`tune-src://…`) : le
+        // parcours passe par le protocole, et reprend un parcours interrompu.
+        // Illisible, elle est NOMMÉE et protégée de la purge comme un NAS
+        // démonté (`missing_dirs`), jamais rendue en liste partielle.
+        if crate::sources_reseau::est_chemin_distant(&normalized) {
+            let garder = |nom: &str| fichier_distant_retenu(nom, &excludes);
+            match crate::sources_reseau::parcourir_la_racine(
+                &normalized,
+                &garder,
+                arret,
+                std::time::Duration::from_millis(500),
+            ) {
+                Ok(trouves) => files.extend(trouves.into_iter().map(PathBuf::from)),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted && arret() => {
+                    info!(racine = %normalized, "scan_listing_interrompu — arrêt demandé");
+                    return None;
+                }
+                Err(e) => {
+                    warn!(
+                        dir = %normalized,
+                        error = %e,
+                        code = crate::sources_reseau::systeme::code_d_erreur(&e),
+                        "scan_source_distante_illisible — racine protégée"
+                    );
+                    missing_dir_reasons.push(format!(
+                        "{normalized} : source réseau injoignable ({})",
+                        crate::sources_reseau::systeme::code_d_erreur(&e)
+                    ));
+                    missing_dirs.push(normalized);
+                }
+            }
+            continue;
+        }
         let dir_path = std::path::Path::new(&normalized);
 
         // Probe with read_dir instead of a bare exists(): on Windows a NAS path

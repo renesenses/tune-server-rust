@@ -2797,6 +2797,11 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     // (`apports_service`), en base seulement, réversibles. Jumelle PG : 108.
     // Numérotée 142 / PG 108 après #8093 (141 / PG 107, contenus explicites).
     Migration { version: 142, name: "apports_service", up: include_str!("../../migrations/apports_service.sql") },
+    // #8189 — les sources réseau lues sans montage (socle « source
+    // distante », étape 2). Numérotée 143 / PG 109, numéros libres dans
+    // `batch/bugs-rc12-20261108` au 09/11 (dernières : 142 / PG 108) ; celle
+    // qui fusionne après une autre PR réclamant 143 se renumérote.
+    Migration { version: 143, name: "sources_reseau", up: include_str!("../../migrations/sources_reseau.sql") },
 ];
 
 /// L'index partiel des pistes marquées explicites (#8088), commun aux deux
@@ -5945,6 +5950,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         108,
         "apports_service",
         include_str!("../../migrations/postgres/108_apports_service.sql"),
+    ),
+    // Jumelle de la SQLite 143 (#8189) : les sources réseau, même DDL
+    // (`migrations/sources_reseau.sql`).
+    (
+        109,
+        "sources_reseau",
+        include_str!("../../migrations/postgres/109_sources_reseau.sql"),
     ),
 ];
 
@@ -9626,7 +9638,9 @@ mod tests {
         // `tracks.explicit`, que l'INSERT et l'UPDATE des pistes NOMMENT.
         // 108 : `apports_service` (#8077), jumelle de la SQLite 142. Crée les
         // tables des apports Qobuz, que la fiche album NOMME.
-        assert_eq!(pg_latest_version(), 108, "latest PG migration must be 108");
+        // 109 : `sources_reseau` (#8189), jumelle de la SQLite 143. Crée la
+        // table des sources réseau lues sans montage.
+        assert_eq!(pg_latest_version(), 109, "latest PG migration must be 109");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
