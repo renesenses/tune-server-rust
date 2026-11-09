@@ -829,6 +829,16 @@ impl PlaybackOrchestrator {
         // when we are handing out the upstream unchanged.
         let origin_url = (stream_url != stream_data.url).then(|| stream_data.url.clone());
 
+        // #8188 — la profondeur ANNONCÉE est celle qui part sur le fil, comme
+        // la cadence (#4759) : un FLAC ramené à 16 bits pour une zone
+        // plafonnée (ou un WAV/LPCM de repli) ne doit pas porter
+        // `bitsPerSample="24"` dans le DIDL, que les puces Frontier Silicon
+        // lisent strictement. Vers une sortie réseau seulement : la sortie
+        // locale lit l'en-tête de son WAV 32 bits, l'annonce n'y décide rien.
+        let profondeur_servie = self
+            .profondeur_servie_sur_le_fil(sid.as_deref(), !is_local_stream && !is_oaat_stream)
+            .await;
+
         Ok(ResolvedStream {
             url: stream_url,
             mime_type: out_mime,
@@ -849,13 +859,32 @@ impl PlaybackOrchestrator {
             // celui d'un FLAC CD.
             bit_depth: profondeur_annoncee_par_le_service(
                 &stream_data.quality,
-                stream_data.quality.bit_depth,
+                profondeur_servie.unwrap_or(stream_data.quality.bit_depth),
             ),
             channels: Some(2),
             origin_url,
             bitrate_kbps: debit_annonce_par_le_service(&stream_data.quality),
             format_source: format_livre_par_le_service(&stream_data.quality),
         })
+    }
+
+    /// #8188 — la profondeur que la session `sid` sert RÉELLEMENT sur le fil,
+    /// pour l'annonce du DIDL (`<res bitsPerSample>`). `None` hors sortie
+    /// réseau, sans session, ou pour une session sans profondeur connue :
+    /// l'appelant garde alors celle du service.
+    pub(super) async fn profondeur_servie_sur_le_fil(
+        &self,
+        sid: Option<&str>,
+        sortie_reseau: bool,
+    ) -> Option<u16> {
+        if !sortie_reseau {
+            return None;
+        }
+        self.streamer
+            .stream_output_wire(sid?)
+            .await
+            .map(|i| i.bit_depth)
+            .filter(|bd| *bd > 0)
     }
 
     /// #4759 — la cadence RÉELLEMENT servie par le bras des SERVICES, plafond
@@ -2530,6 +2559,16 @@ impl PlaybackOrchestrator {
             let https_compensation = https_dsp
                 .compensation_cuite_db()
                 .filter(|_| https_dsp_active);
+            // #8188 — le plafond 16 bits de la zone (« Limiter à 16 bits »,
+            // ou le quirk `force_16bit` du catalogue), QUATRIÈME raison de ne
+            // pas relayer verbatim. #6909 l'avait branché sur le seul bras
+            // DASH (`reglages_dash`) : le bras HTTPS — Qobuz — relayait le
+            // FLAC 24/96 du CDN tel quel vers un Ruark R3 ou un Roberts
+            // Stream 94i+ (puces Frontier Silicon, 16 bits seulement), qui
+            // jouaient du SILENCE malgré le réglage (fil 2714). Même règle que
+            // le bras DASH et la bibliothèque (`dlna_cap_16bit_applies`).
+            let plafond_16 =
+                reglages_dash(&self.db, req.zone_id, stream_data.quality.bit_depth).plafond_16;
 
             let depart_qobuz = if service_name == "qobuz"
                 && codec_lower == "flac"
@@ -2554,6 +2593,7 @@ impl PlaybackOrchestrator {
                 && renderer_supports_mime
                 && !https_dsp_active
                 && cadence_plafonnee.is_none()
+                && !plafond_16
             {
                 return self
                     .servir_qobuz_natif_a_la_position(req, stream_data, depart_qobuz)
@@ -2575,6 +2615,7 @@ impl PlaybackOrchestrator {
                         zone_output_type.as_deref(),
                         device_id,
                         renderer_supports_mime,
+                        plafond_16,
                         &https_dsp,
                     )
                     .await
@@ -2597,6 +2638,7 @@ impl PlaybackOrchestrator {
                     renderer_supports_mime,
                     https_dsp_active,
                     cadence_plafonnee.is_some(),
+                    plafond_16,
                 )
             {
                 // Deux raisons d'arriver ici : le renderer ne sait pas lire
@@ -2618,6 +2660,7 @@ impl PlaybackOrchestrator {
                     enc_format,
                     dsp_active = https_dsp_active,
                     renderer_supports_mime,
+                    plafond_16,
                     "streaming_pretranscode_for_renderer_or_dsp"
                 );
 
@@ -2680,7 +2723,10 @@ impl PlaybackOrchestrator {
                     // plafond n'a pas lieu d'être. Sans cette distinction,
                     // armer un égaliseur ferait tomber tout le Hi-Res Qobuz
                     // à 16 bits — une dégradation jamais demandée.
-                    if enc_is_wav && actual_bd > 16 {
+                    //
+                    // #8188 — et quand la ZONE plafonne à 16 bits (Ruark R3,
+                    // Roberts Stream 94i+) : FLAC, mais 16 bits.
+                    if (enc_is_wav || plafond_16) && actual_bd > 16 {
                         pcm_bytes =
                             crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
                         actual_bd = 16;
@@ -2915,6 +2961,8 @@ impl PlaybackOrchestrator {
         zone_output_type: Option<&str>,
         device_id: &str,
         renderer_supports_mime: bool,
+        // #8188 — plafond 16 bits de la zone.
+        plafond_16: bool,
         dsp: &StreamingDsp,
     ) -> Option<u16> {
         let decodable = decodage_progressif_par_range(service_name, codec_lower, &stream_data.url);
@@ -2937,7 +2985,7 @@ impl PlaybackOrchestrator {
         if !service_en_wav_progressif(actif, sortie_reseau, consenti, decodable, true) {
             return None;
         }
-        let bd = if renderer_supports_mime {
+        let bd = if renderer_supports_mime && !plafond_16 {
             cap_output_bit_depth(stream_data.quality.bit_depth)
         } else {
             16

@@ -1,5 +1,48 @@
 use super::*;
 
+/// #8006 — ce qu'une commande attend une sortie occupée avant de rendre la
+/// main. Le démarrage d'un ampli Devialet peut tenir sa sortie une trentaine
+/// de secondes (#6911) ; Pause et Arrêt ne l'attendent plus.
+///
+/// Les témoins unitaires la ramènent à 400 ms (`cfg!(test)` et non un
+/// attribut : plusieurs gardes de texte coupent ce fichier au premier
+/// attribut de test).
+pub(crate) const ATTENTE_DE_LA_SORTIE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(400)
+} else {
+    std::time::Duration::from_secs(5)
+};
+
+/// #8006 — la phrase qui nomme l'appareil qui ne répond pas.
+pub(crate) fn appareil_ne_repond_pas(device_id: &str) -> String {
+    format!("The device {device_id} does not respond: it is still busy with a previous command")
+}
+
+/// #8006 — le verrou d'une sortie, attendu au plus [`ATTENTE_DE_LA_SORTIE`].
+/// Rien n'est envoyé à l'appareil quand l'attente échoue.
+pub(crate) async fn attendre_la_sortie<'a>(
+    output: &'a Arc<Mutex<Box<dyn crate::outputs::traits::OutputTarget>>>,
+    device_id: &str,
+    command: OutputCommand,
+) -> OutputCommandResult<tokio::sync::MutexGuard<'a, Box<dyn crate::outputs::traits::OutputTarget>>>
+{
+    match tokio::time::timeout(ATTENTE_DE_LA_SORTIE, output.lock()).await {
+        Ok(sortie) => Ok(sortie),
+        Err(_) => {
+            warn!(
+                device_id,
+                %command,
+                attente_ms = ATTENTE_DE_LA_SORTIE.as_millis() as u64,
+                "output_busy_command_refused"
+            );
+            Err(OutputCommandError::failed(
+                command,
+                appareil_ne_repond_pas(device_id),
+            ))
+        }
+    }
+}
+
 /// Issue du deuxième temps de `play_inner` : un flux résolu à envoyer, ou
 /// une lecture déjà close (reprise par une plus récente, renvoi coalescé)
 /// dont le résultat remonte tel quel.
@@ -3041,7 +3084,9 @@ impl PlaybackOrchestrator {
                 )
             })?;
             let rien_ne_jouait = {
-                let sortie = output.lock().await;
+                // #8006 — une sortie occupée (démarrage d'un titre qui traîne)
+                // ne retient plus la pause sans limite.
+                let sortie = attendre_la_sortie(&output, did, OutputCommand::Pause).await?;
                 sortie.checked_pause().await?;
                 sortie.take_nothing_playing_on_pause()
             };
@@ -3716,6 +3761,50 @@ impl PlaybackOrchestrator {
         old_stream_id
     }
 
+    /// #8006 — l'arrêt de l'appareil, borné pour l'appelant.
+    ///
+    /// La zone est déjà arrêtée. L'ordre part dans une tâche : si l'appareil
+    /// est occupé (démarrage d'un titre qui traîne, ampli qui ne répond
+    /// pas), l'appelant rend la main après [`ATTENTE_DE_LA_SORTIE`] et la
+    /// tâche continue — l'appareil s'arrêtera dès qu'il sera libre, au lieu
+    /// de jouer derrière une zone qui se dit arrêtée. Le journal et
+    /// `zone.playback_error` nomment l'appareil.
+    async fn arreter_la_sortie_sans_attendre_plus(
+        &self,
+        zone_id: i64,
+        did: &str,
+        output: Arc<Mutex<Box<dyn crate::outputs::traits::OutputTarget>>>,
+    ) {
+        let appareil = did.to_string();
+        let tache = tokio::spawn(async move {
+            if let Err(e) = output.lock().await.stop().await {
+                warn!(zone_id, device_id = %appareil, error = %e, "device_stop_failed");
+            }
+        });
+        if tokio::time::timeout(ATTENTE_DE_LA_SORTIE, tache)
+            .await
+            .is_err()
+        {
+            warn!(
+                zone_id,
+                device_id = did,
+                attente_ms = ATTENTE_DE_LA_SORTIE.as_millis() as u64,
+                "device_stop_not_responding"
+            );
+            if let Some(ref bus) = self.event_bus {
+                bus.emit(
+                    "zone.playback_error",
+                    serde_json::json!({
+                        "zone_id": zone_id,
+                        "device_id": did,
+                        "code": "device_not_responding",
+                        "error": appareil_ne_repond_pas(did),
+                    }),
+                );
+            }
+        }
+    }
+
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         let old_stream_id = self.arreter_l_etat_de_la_zone(zone_id).await;
 
@@ -3730,10 +3819,9 @@ impl PlaybackOrchestrator {
         };
         if let Some(ref did) = resolved_did {
             let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc
-                && let Err(e) = output.lock().await.stop().await
-            {
-                warn!(zone_id, error = %e, "device_stop_failed");
+            if let Some(output) = arc {
+                self.arreter_la_sortie_sans_attendre_plus(zone_id, did, output)
+                    .await;
             }
         } else {
             // Aucun appareil résolu. L'ancien repli arrêtait TOUTES les sorties
