@@ -180,10 +180,10 @@ fn phrase(code: Option<&str>, langue: Langue) -> &'static str {
             "The redirect URI declared in your Spotify app does not match. Declare exactly the one Tune shows (https://mozaiklabs.fr/spotify-callback)."
         }
         ("spotify_client_id_refuse", Fr) => {
-            "Spotify ne reconnaît pas ce Client ID. Vérifiez-le dans Tune (32 caractères, copiés depuis votre application Spotify)."
+            "Spotify refuse ce Client ID. Vérifiez qu'il vient de Settings › Basic Information de votre application, puis recommencez. Causes probables : connexion lancée avant l'enregistrement du Client ID, propriétaire de l'application sans Premium (exigé en mode développement), application supprimée ou désactivée."
         }
         ("spotify_client_id_refuse", En) => {
-            "Spotify does not recognise this Client ID. Check it in Tune (32 characters, copied from your Spotify app)."
+            "Spotify refuses this Client ID. Check it comes from Settings › Basic Information in your app, then start again. Likely causes: sign-in started before the Client ID was saved, app owner without Premium (required in development mode), app deleted or disabled."
         }
         ("spotify_client_id_absent", Fr) => {
             "Aucun Client ID n'est enregistré dans Tune. Saisissez celui de votre application Spotify, puis reconnectez-vous."
