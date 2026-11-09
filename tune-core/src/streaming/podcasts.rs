@@ -510,9 +510,9 @@ impl PodcastService {
         vec![
             // ── Radio France — France Inter ──
             Podcast {
-                name: "Le sept neuf".into(),
+                name: "La grande matinale".into(),
                 artist: "France Inter".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_10241.xml".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_e8e15473-5871-4bba-907c-c12ba36cadbe.xml".into(),
                 cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/01/197263c5-db60-4f6f-b5e9-94c5ddb901b0/1400x1400_sc_la-grande-matinale-paracuellos.jpg".into(),
                 description: "La matinale de France Inter".into(),
                 episode_count: 0,
@@ -540,16 +540,6 @@ impl PodcastService {
                 category: Some("Arts".into()),
             },
             Podcast {
-                name: "Boomerang".into(),
-                artist: "France Inter".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_13937.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/06/2c34c20f-2aa1-45af-89bd-0851a725c323/1400x1400_bommerang.jpg".into(),
-                description: "L'interview culturelle d'Augustin Trapenard".into(),
-                episode_count: 0,
-                source_id: "rf-boomerang".into(),
-                category: Some("Arts".into()),
-            },
-            Podcast {
                 name: "La Terre au carré".into(),
                 artist: "France Inter".into(),
                 feed_url: "https://radiofrance-podcast.net/podcast09/rss_10212.xml".into(),
@@ -558,16 +548,6 @@ impl PodcastService {
                 episode_count: 0,
                 source_id: "rf-terre-carre".into(),
                 category: Some("Science".into()),
-            },
-            Podcast {
-                name: "Le Grand Dimanche Soir".into(),
-                artist: "France Inter".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_18153.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/03/a9d633cc-02b0-4cfa-aa22-9a2836d0af41/1400x1400_sc_le-grand-dimanche-soir.jpg".into(),
-                description: "Le spectacle du dimanche soir de Charline Vanhoenacker".into(),
-                episode_count: 0,
-                source_id: "rf-grand-dimanche".into(),
-                category: Some("Comedy".into()),
             },
             // ── Radio France — France Culture ──
             Podcast {
@@ -603,8 +583,8 @@ impl PodcastService {
             Podcast {
                 name: "Le Cours de l'histoire".into(),
                 artist: "France Culture".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_18370.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/09/4918fee6-34f9-48e5-a35b-c5f72db2e48e/1400x1400_le-cours-de-lhistoire.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_c951e8a9-6121-4400-a3ef-5f9c958d36c3.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/03/d8dd4d3d-0d36-4b42-acf1-e99d7b29be8e/1400x1400_sc_sc-sc-le-cours-de-l-histoire.jpg".into(),
                 description: "L'histoire vivante racontée par Xavier Mauduit".into(),
                 episode_count: 0,
                 source_id: "rf-cours-histoire".into(),
@@ -613,8 +593,8 @@ impl PodcastService {
             Podcast {
                 name: "LSD, la série documentaire".into(),
                 artist: "France Culture".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_15333.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/06/4cdb4c4b-f35e-4cf8-ac7d-4e2c2f14e248/1400x1400_lsd.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_fb8db8c6-20b0-4189-977e-07f112c3de79.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2021/10/9f5786b0-763e-4381-8da0-cb0e7c559562/1400x1400_lsd-la-serie-documentaire.jpg".into(),
                 description: "Quatre épisodes pour explorer un sujet en profondeur".into(),
                 episode_count: 0,
                 source_id: "rf-lsd-documentaire".into(),
@@ -633,8 +613,8 @@ impl PodcastService {
             Podcast {
                 name: "Concordance des temps".into(),
                 artist: "France Culture".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_10193.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/06/0b2c3d4e-f5a6-7890-bcde-f12345678901/1400x1400_concordance.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_d88dae25-44df-11e5-9fe0-005056a87c89.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2025/09/58027a1f-cf7c-40b2-812e-ea6064834932/1400x1400_sc_concordance-des-temps.jpg".into(),
                 description: "Le passé éclaire le présent avec Jean-Noël Jeanneney".into(),
                 episode_count: 0,
                 source_id: "rf-concordance".into(),
@@ -643,8 +623,8 @@ impl PodcastService {
             Podcast {
                 name: "Cultures monde".into(),
                 artist: "France Culture".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_14256.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/06/1a2b3c4d-e5f6-7890-abcd-ef1234567890/1400x1400_cultures-monde.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_8f2d1e07-aaf1-4935-96d2-4307f470baec.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/04/db33f031-6e74-4051-beab-ed5693e48cf7/1400x1400_sc_sc-cultures-monde-jg.jpg".into(),
                 description: "Un regard sur le monde contemporain à travers les cultures".into(),
                 episode_count: 0,
                 source_id: "rf-cultures-monde".into(),
@@ -663,22 +643,12 @@ impl PodcastService {
             Podcast {
                 name: "La Conversation scientifique".into(),
                 artist: "France Culture".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_16256.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/06/3c4d5e6f-a7b8-9012-cdef-345678901234/1400x1400_conversation-scientifique.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_d47d3c2b-44e3-11e5-9fe0-005056a87c89.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2023/07/890bf5ba-792f-4c64-ba37-deba040861ca/1400x1400_sc_bf6dcf10-cf93-4849-8d55-3f39807dd7cd.jpg".into(),
                 description: "Les grandes questions scientifiques par Étienne Klein".into(),
                 episode_count: 0,
                 source_id: "rf-conversation-scientifique".into(),
                 category: Some("Science".into()),
-            },
-            Podcast {
-                name: "Le vif de l'histoire".into(),
-                artist: "France Inter".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_11739.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2023/06/21d18070-9a66-45aa-b484-3d094c39909a/1400x1400_sc_rf_omm_0000038825_ite.jpg".into(),
-                description: "L'histoire racontée par Jean Lebrun".into(),
-                episode_count: 0,
-                source_id: "rf-vif-histoire".into(),
-                category: Some("History".into()),
             },
             // ── Radio France — FIP ──
             Podcast {
@@ -692,51 +662,21 @@ impl PodcastService {
                 category: Some("Music".into()),
             },
             Podcast {
-                name: "Pop & Co".into(),
-                artist: "FIP".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_18754.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/01/e7e2f4a0-5c3b-4f1e-b1c3-6d8e9f0a1b2c/1400x1400_sc_pop-and-co.jpg".into(),
-                description: "La pop culture décryptée sur FIP".into(),
-                episode_count: 0,
-                source_id: "rf-pop-co".into(),
-                category: Some("Music".into()),
-            },
-            Podcast {
                 name: "Certains l'aiment FIP".into(),
                 artist: "FIP".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_18891.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/03/a1b2c3d4-e5f6-7890-abcd-ef1234567890/1400x1400_sc_certains-laiment-fip.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_143dff38-e956-4a5d-8576-1c0b7242b99e.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/03/dcc93c96-f698-4630-ac8b-2d2723c97438/1400x1400_sc_fip-certainslaimentfip-3000x3000.jpg".into(),
                 description: "Les coups de cœur musicaux de FIP".into(),
                 episode_count: 0,
                 source_id: "rf-certains-fip".into(),
                 category: Some("Music".into()),
             },
-            Podcast {
-                name: "FIP au Festival".into(),
-                artist: "FIP".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_21032.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/06/b2c3d4e5-f6a7-8901-bcde-f23456789012/1400x1400_sc_fip-au-festival.jpg".into(),
-                description: "FIP en direct des festivals".into(),
-                episode_count: 0,
-                source_id: "rf-fip-festival".into(),
-                category: Some("Music".into()),
-            },
             // ── Radio France — France Musique ──
-            Podcast {
-                name: "Classique ou pas".into(),
-                artist: "France Musique".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_18994.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/01/c3d4e5f6-a7b8-9012-cdef-345678901234/1400x1400_sc_classique-ou-pas.jpg".into(),
-                description: "La musique classique accessible et décomplexée".into(),
-                episode_count: 0,
-                source_id: "rf-classique-ou-pas".into(),
-                category: Some("Music".into()),
-            },
             Podcast {
                 name: "Le van Beethoven".into(),
                 artist: "France Musique".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_16362.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/06/d4e5f6a7-b8c9-0123-def0-456789012345/1400x1400_sc_le-van-beethoven.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_addc12a9-bf8b-44a0-a0a3-7c21e80f101c.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2019/08/19b124f1-98bf-40ad-8c20-f861de07e554/1400x1400_rf_omm_0000022954_ite.jpg".into(),
                 description: "Voyage musical en camping-car à travers l'Europe".into(),
                 episode_count: 0,
                 source_id: "rf-van-beethoven".into(),
@@ -745,8 +685,8 @@ impl PodcastService {
             Podcast {
                 name: "Grands interprètes de la musique classique".into(),
                 artist: "France Musique".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_11403.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/09/e5f6a7b8-c9d0-1234-ef01-567890123456/1400x1400_sc_grands-interpretes.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_bcf2130d-ba7f-41bb-b54d-71e4717aad67.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/02/e2a3f5f4-de8d-43f6-b37f-eb7d322d15e4/1400x1400_sc_fm_visuel_carre_grands-interpretes.jpg".into(),
                 description: "Portraits des plus grands musiciens classiques".into(),
                 episode_count: 0,
                 source_id: "rf-grands-interpretes".into(),
@@ -755,8 +695,8 @@ impl PodcastService {
             Podcast {
                 name: "Disques de légende".into(),
                 artist: "France Musique".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_14017.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/09/4a5b6c7d-e8f9-0123-abcd-ef4567890123/1400x1400_disques-de-legende.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_ff67ec4f-85fe-4437-9615-d7bd65d01e94.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2023/09/75d1fee1-d2c5-4b5f-bc8f-a7c5cfee4d45/1400x1400_sc_rf_omm_0000040252_ite.jpg".into(),
                 description: "Les albums qui ont marqué l'histoire de la musique".into(),
                 episode_count: 0,
                 source_id: "rf-disques-legende".into(),
@@ -765,8 +705,8 @@ impl PodcastService {
             Podcast {
                 name: "Les Trésors de France Musique".into(),
                 artist: "France Musique".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_16399.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/09/5b6c7d8e-f9a0-1234-bcde-f56789012345/1400x1400_tresors-france-musique.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_6ad5e42b-95a5-49cc-a8c9-9c5035b4bb5d.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2023/09/211502ab-fb24-4170-98a7-c40930b4fbbe/1400x1400_sc_les-tresors-de-france-musique.jpg".into(),
                 description: "Les archives sonores exceptionnelles de France Musique".into(),
                 episode_count: 0,
                 source_id: "rf-tresors-fm".into(),
@@ -775,8 +715,8 @@ impl PodcastService {
             Podcast {
                 name: "Banzzaï".into(),
                 artist: "France Musique".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_11408.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/09/6c7d8e9f-a0b1-2345-cdef-678901234567/1400x1400_banzzai.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_62a715a5-7397-450a-ad80-0f84bbc6f3ad.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2023/09/812b2d0d-98df-4159-81a2-ccf8cf5d4ebb/1400x1400_sc_rf_omm_0000040256_ite.jpg".into(),
                 description: "Le jazz dans tous ses états sur France Musique".into(),
                 episode_count: 0,
                 source_id: "rf-banzzai".into(),
@@ -785,8 +725,8 @@ impl PodcastService {
             Podcast {
                 name: "MAXXI Classique".into(),
                 artist: "France Musique".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_19498.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/01/7d8e9f0a-b1c2-3456-def0-789012345678/1400x1400_maxxi-classique.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_001179a9-fe05-4a03-a0a0-7c360539db54.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2023/09/a48c9c60-3ef8-486e-bd4e-c9cce429fd81/1400x1400_sc_sc_maxxi-classique.jpg".into(),
                 description: "Le classique nouvelle génération".into(),
                 episode_count: 0,
                 source_id: "rf-maxxi-classique".into(),
@@ -796,8 +736,8 @@ impl PodcastService {
             Podcast {
                 name: "8h30 franceinfo".into(),
                 artist: "franceinfo".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_22737.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/01/8e9f0a1b-c2d3-4567-ef01-890123456789/1400x1400_8h30-franceinfo.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_326affac-ccc2-4e97-956f-59c73541ddb0.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/rf-cruiser-embed-production/2026/08/f2f4b147-87be-4760-a1bc-47d0555d0c8e/1400x1400_sc_carre-8h30-franceinfo.jpg".into(),
                 description: "L'interview politique de référence chaque matin".into(),
                 episode_count: 0,
                 source_id: "rf-8h30-franceinfo".into(),
@@ -806,14 +746,92 @@ impl PodcastService {
             Podcast {
                 name: "Le vrai ou faux".into(),
                 artist: "franceinfo".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_21498.xml".into(),
-                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/01/9f0a1b2c-d3e4-5678-f012-901234567890/1400x1400_vrai-ou-faux.jpg".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/podcast_eb76878a-d2e7-4930-a6e1-192c7ba60448.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/03/f6f57183-aff4-4584-8abd-879053dafe7f/1400x1400_sc_vrai-ou-faux.jpg".into(),
                 description: "Le fact-checking de franceinfo".into(),
                 episode_count: 0,
                 source_id: "rf-vrai-faux".into(),
                 category: Some("News".into()),
             },
         ]
+    }
+
+    /// #6925 — les adresses FAUSSES qu'a portées la sélection éditoriale,
+    /// et la vraie adresse de chaque émission.
+    ///
+    /// Ces `rss_NNNNN.xml` désignaient d'AUTRES émissions de Radio France
+    /// (« Banzzaï » ouvrait « Les polars de l'histoire »), réduites à un seul
+    /// élément « Retrouvez tous les épisodes sur l'appli Radio France » : le
+    /// message d'accueil que le testeur entendait à la place des épisodes.
+    /// Un abonnement pris depuis la sélection a gardé l'adresse fausse ; la
+    /// liste des abonnements la remplace par celle-ci
+    /// ([`Self::adresse_corrigee_6925`]). Vérifié au réseau le 09/11/2026.
+    pub const ADRESSES_CORRIGEES_6925: &'static [(&'static str, &'static str)] = &[
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_18370.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_c951e8a9-6121-4400-a3ef-5f9c958d36c3.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_15333.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_fb8db8c6-20b0-4189-977e-07f112c3de79.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_10193.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_d88dae25-44df-11e5-9fe0-005056a87c89.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_14256.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_8f2d1e07-aaf1-4935-96d2-4307f470baec.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_16256.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_d47d3c2b-44e3-11e5-9fe0-005056a87c89.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_18891.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_143dff38-e956-4a5d-8576-1c0b7242b99e.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_16362.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_addc12a9-bf8b-44a0-a0a3-7c21e80f101c.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_11403.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_bcf2130d-ba7f-41bb-b54d-71e4717aad67.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_14017.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_ff67ec4f-85fe-4437-9615-d7bd65d01e94.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_16399.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_6ad5e42b-95a5-49cc-a8c9-9c5035b4bb5d.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_11408.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_62a715a5-7397-450a-ad80-0f84bbc6f3ad.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_19498.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_001179a9-fe05-4a03-a0a0-7c360539db54.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_22737.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_326affac-ccc2-4e97-956f-59c73541ddb0.xml",
+        ),
+        (
+            "https://radiofrance-podcast.net/podcast09/rss_21498.xml",
+            "https://radiofrance-podcast.net/podcast09/podcast_eb76878a-d2e7-4930-a6e1-192c7ba60448.xml",
+        ),
+    ];
+
+    /// #6925 — la vraie adresse d'un flux que la sélection éditoriale a
+    /// donnée fausse, ou `None` pour toute autre adresse.
+    pub fn adresse_corrigee_6925(feed_url: &str) -> Option<&'static str> {
+        Self::ADRESSES_CORRIGEES_6925
+            .iter()
+            .find(|(fausse, _)| *fausse == feed_url.trim())
+            .map(|(_, vraie)| *vraie)
     }
 
     /// Backward-compatible alias — returns the same curated list.
@@ -1417,8 +1435,8 @@ mod tests {
             assert!(!p.cover_url.is_empty(), "empty cover_url for {}", p.name);
         }
         // Check some expected shows.
-        assert!(podcasts.iter().any(|p| p.name.contains("sept neuf")));
-        assert!(podcasts.iter().any(|p| p.name == "Boomerang"));
+        assert!(podcasts.iter().any(|p| p.source_id == "rf-sept-neuf"));
+        assert!(podcasts.iter().any(|p| p.name == "Banzzaï"));
         assert!(podcasts.iter().any(|p| p.name == "Club Jazzafip"));
     }
     /// #3395 — le pays atteint VRAIMENT le fournisseur.
@@ -1464,6 +1482,94 @@ mod tests {
                 "aucune sélection pour {ailleurs:?} — il n'en existe pas"
             );
         }
+    }
+
+    /// #6925 — « Banzzaï » de la sélection ouvrait le flux d'une AUTRE
+    /// émission (« Les polars de l'histoire », un seul élément : le message
+    /// d'accueil de l'appli Radio France). La sélection porte la vraie
+    /// adresse, et plus aucune des adresses fausses.
+    #[test]
+    fn la_selection_porte_les_vrais_flux_radio_france_6925() {
+        let podcasts = PodcastService::curated_french_podcasts();
+        let banzzai = podcasts
+            .iter()
+            .find(|p| p.source_id == "rf-banzzai")
+            .expect("Banzzaï reste dans la sélection");
+        assert_eq!(
+            banzzai.feed_url,
+            "https://radiofrance-podcast.net/podcast09/podcast_62a715a5-7397-450a-ad80-0f84bbc6f3ad.xml",
+            "Banzzaï doit ouvrir son propre flux (#6925)"
+        );
+        for p in &podcasts {
+            assert!(
+                PodcastService::adresse_corrigee_6925(&p.feed_url).is_none(),
+                "{} porte encore une adresse fausse : {}",
+                p.name,
+                p.feed_url
+            );
+        }
+        // Chaque vraie adresse est bien celle d'une émission de la sélection.
+        for (_, vraie) in PodcastService::ADRESSES_CORRIGEES_6925 {
+            assert!(
+                podcasts.iter().any(|p| p.feed_url == *vraie),
+                "{vraie} n'est plus dans la sélection"
+            );
+        }
+        assert_eq!(
+            PodcastService::adresse_corrigee_6925(
+                " https://radiofrance-podcast.net/podcast09/rss_11408.xml "
+            ),
+            Some(banzzai.feed_url.as_str())
+        );
+        assert_eq!(
+            PodcastService::adresse_corrigee_6925("https://example.org/rss.xml"),
+            None
+        );
+    }
+
+    /// #6925 — témoin réseau : chaque flux Radio France de la sélection
+    /// porte le titre de son émission et plus d'un épisode. Hors CI
+    /// (`--ignored`), il a servi à vérifier la liste le 09/11/2026.
+    #[tokio::test]
+    #[ignore = "réseau : radiofrance-podcast.net"]
+    async fn les_flux_radio_france_de_la_selection_sont_les_bons_6925() {
+        fn cle(t: &str) -> String {
+            t.to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect()
+        }
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0")
+            .build()
+            .unwrap();
+        let mut fautes = Vec::new();
+        for p in PodcastService::curated_french_podcasts()
+            .into_iter()
+            .filter(|p| p.feed_url.contains("radiofrance-podcast.net"))
+        {
+            let xml = client
+                .get(&p.feed_url)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let titre = xml
+                .split("<title>")
+                .nth(1)
+                .and_then(|r| r.split("</title>").next())
+                .unwrap_or("");
+            let episodes = xml.matches("<item>").count();
+            let promesse = cle(&p.name);
+            let lu = cle(titre);
+            let meme_emission = lu.contains(&promesse) || promesse.contains(&lu);
+            if !meme_emission || episodes < 2 {
+                fautes.push(format!("{} → « {titre} », {episodes} épisode(s)", p.name));
+            }
+        }
+        assert!(fautes.is_empty(), "flux faux : {fautes:#?}");
     }
 
     #[test]
