@@ -332,11 +332,12 @@ async fn le_rappel_direct_rend_le_code_stable() {
     assert_refus(statut, &corps, CODE_STATE_INCONNU);
 }
 
-/// Retour d'un testeur (09/11) : le Client ID enregistré dans Tune n'était
-/// pas celui de son application. Spotify le dit sans connexion : un échange
-/// factice répond `invalid_client` (« Failed to get client »).
+/// Retour d'un testeur (09/11) : `INVALID_CLIENT: Invalid client` avec un
+/// Client ID pourtant correct. Spotify refuse l'échange factice
+/// (`invalid_client`, « Failed to get client ») : le vérificateur le dit et
+/// propose les causes probables.
 #[tokio::test]
-async fn diagnostic_signale_un_client_id_inconnu_de_spotify() {
+async fn diagnostic_signale_un_client_id_refuse_par_spotify_et_ses_causes() {
     let mut reponses = Reponses::normales();
     reponses.jeton = (
         400,
@@ -348,21 +349,28 @@ async fn diagnostic_signale_un_client_id_inconnu_de_spotify() {
         diag["client_id"]["etat"], "ok",
         "la forme est bonne : {diag}"
     );
-    assert_eq!(diag["client_id"]["spotify"], "inconnu", "{diag}");
+    assert_eq!(diag["client_id"]["spotify"], "refuse", "{diag}");
+    assert_eq!(diag["client_id"]["debut"], "01234567", "{diag}");
     assert_eq!(
-        diag["client_id"]["debut"], "01234567",
-        "le début se compare à l'adresse du tableau de bord : {diag}"
+        diag["client_id"]["causes_possibles"],
+        json!([
+            "connexion_lancee_avant_le_client_id",
+            "proprietaire_sans_premium",
+            "application_supprimee_ou_desactivee"
+        ]),
+        "{diag}"
     );
     assert_eq!(
         diag["a_corriger"],
-        json!(["client_id_inconnu_de_spotify", "non_connecte"]),
+        json!(["client_id_refuse_par_spotify", "non_connecte"]),
         "{diag}"
     );
 }
 
-/// Un Client ID connu de Spotify (l'échange factice répond `invalid_grant`).
+/// Un Client ID que Spotify accepte (l'échange factice répond `invalid_grant`) :
+/// aucune cause à proposer.
 #[tokio::test]
-async fn diagnostic_client_id_connu_de_spotify() {
+async fn diagnostic_client_id_accepte_par_spotify() {
     let mut reponses = Reponses::normales();
     reponses.jeton = (
         400,
@@ -370,6 +378,7 @@ async fn diagnostic_client_id_connu_de_spotify() {
     );
     let (app, _) = app_avec(reponses).await;
     let diag = diagnostic(&app).await;
-    assert_eq!(diag["client_id"]["spotify"], "connu", "{diag}");
+    assert_eq!(diag["client_id"]["spotify"], "accepte", "{diag}");
+    assert_eq!(diag["client_id"]["causes_possibles"], json!([]), "{diag}");
     assert_eq!(diag["a_corriger"], json!(["non_connecte"]), "{diag}");
 }

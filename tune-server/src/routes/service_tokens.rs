@@ -490,6 +490,7 @@ pub(crate) async fn enregistrer_client_id_spotify(
 ) -> serde_json::Value {
     use tune_core::streaming::spotify::{
         SpotifyService, client_id_configure, client_id_depuis_saisie,
+        est_une_adresse_du_tableau_de_bord,
     };
     let tr = |k: &str| crate::i18n::t(lang, k);
     let client_id = body
@@ -507,15 +508,19 @@ pub(crate) async fn enregistrer_client_id_spotify(
             "validation_message": tr("svctok.spotify.clientIdEnv"),
         });
     }
-    // #8198 — exactement 32 caracteres hexadecimaux, ou l'adresse du tableau
-    // de bord Spotify d'ou on le tire (en le disant).
-    let Some((client_id, extrait)) =
-        client_id_depuis_saisie(client_id).filter(|(id, _)| client_id_configure(id))
+    // #8198 — exactement 32 caracteres hexadecimaux. L'adresse du tableau de
+    // bord Spotify est refusee : l'identifiant qu'elle porte n'est PAS le
+    // Client ID (verifie avec un testeur le 09/11).
+    let Some(client_id) = client_id_depuis_saisie(client_id).filter(|id| client_id_configure(id))
     else {
         return json!({
             "valid": false,
             "etat": "refuse",
-            "code": "spotify_client_id_invalide",
+            "code": if est_une_adresse_du_tableau_de_bord(client_id) {
+                "spotify_client_id_adresse_du_tableau_de_bord"
+            } else {
+                "spotify_client_id_invalide"
+            },
             "validation_message": tr("svctok.spotify.clientIdInvalid"),
         });
     };
@@ -531,7 +536,6 @@ pub(crate) async fn enregistrer_client_id_spotify(
             "valid": true,
             "etat": "inchange",
             "spotify_client_id_configure": true,
-            "client_id_extrait": extrait,
             "validation_message": tr("svctok.spotify.clientIdUnchanged"),
         });
     }
@@ -567,17 +571,12 @@ pub(crate) async fn enregistrer_client_id_spotify(
                 .replace("{error}", "service Spotify absent de ce serveur"),
         });
     }
-    tracing::info!(extrait, "spotify_client_id_enregistre");
+    tracing::info!("spotify_client_id_enregistre");
     json!({
         "valid": true,
         "etat": "enregistre",
         "spotify_client_id_configure": true,
-        "client_id_extrait": extrait,
-        "validation_message": if extrait {
-            tr("svctok.spotify.clientIdExtracted")
-        } else {
-            tr("svctok.spotify.clientIdSaved")
-        },
+        "validation_message": tr("svctok.spotify.clientIdSaved"),
     })
 }
 

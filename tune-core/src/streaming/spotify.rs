@@ -375,24 +375,22 @@ pub fn ressemble_a_un_client_id(texte: &str) -> bool {
 
 /// #8198 — le Client ID tire de ce que l'utilisateur a colle.
 ///
-/// Vu en direct avec un testeur : Spotify repondait `INVALID_CLIENT: Invalid
-/// client` parce que le champ contenait l'adresse du tableau de bord, pas le
-/// Client ID. Rend `Some((client_id, extrait))` :
-/// * 32 caracteres hexadecimaux (espaces autour toleres) : `extrait = false` ;
-/// * une adresse `developer.spotify.com/dashboard/<id>` (avec ou sans schema,
-///   avec ou sans suite) dont `<id>` a cette forme : `extrait = true`.
-///
-/// `None` pour tout le reste.
-pub fn client_id_depuis_saisie(saisie: &str) -> Option<(String, bool)> {
+/// Vu en direct avec un testeur : le champ a recu l'adresse du tableau de
+/// bord Spotify au lieu du Client ID, et Spotify repondait `INVALID_CLIENT:
+/// Invalid client`. L'identifiant de cette adresse N'EST PAS le Client ID :
+/// rien n'en est tire. Seuls 32 caracteres hexadecimaux sont acceptes
+/// (espaces autour toleres) ; `None` pour tout le reste.
+pub fn client_id_depuis_saisie(saisie: &str) -> Option<String> {
     let t = saisie.trim();
-    if ressemble_a_un_client_id(t) {
-        return Some((t.to_owned(), false));
-    }
-    let bas = t.to_ascii_lowercase();
-    let debut =
-        bas.find("developer.spotify.com/dashboard/")? + "developer.spotify.com/dashboard/".len();
-    let id = t[debut..].split(['/', '?', '#']).next().unwrap_or("");
-    ressemble_a_un_client_id(id).then(|| (id.to_owned(), true))
+    ressemble_a_un_client_id(t).then(|| t.to_owned())
+}
+
+/// #8198 — la saisie est-elle une adresse du tableau de bord Spotify ? Le
+/// refus le dit alors precisement.
+pub fn est_une_adresse_du_tableau_de_bord(saisie: &str) -> bool {
+    saisie
+        .to_ascii_lowercase()
+        .contains("developer.spotify.com/dashboard")
 }
 
 /// Le Client ID que le service doit employer — fil 221.
@@ -1096,10 +1094,13 @@ impl SpotifyService {
             .then(|| self.client_id.chars().take(8).collect())
     }
 
-    /// #8198 — Spotify connait-il ce Client ID ? Un echange de code factice
-    /// (`/api/token`) repond `invalid_client` (« Failed to get client ») pour
-    /// un identifiant inconnu, `invalid_grant` pour un identifiant connu.
-    /// Aucun compte n'est en jeu. `non_verifie` si Spotify ne repond pas.
+    /// #8198 — Spotify accepte-t-il ce Client ID ? Un echange de code factice
+    /// (`/api/token`) repond `invalid_client` (« Failed to get client ») quand
+    /// il le refuse (`refuse`), `invalid_grant` sinon (`accepte`). Aucun
+    /// compte n'est en jeu. `non_verifie` si Spotify ne repond pas. Un refus
+    /// ne prouve pas que l'identifiant est faux : application supprimee ou
+    /// desactivee, proprietaire sans Premium (mode developpement) sont des
+    /// causes possibles (voir `diagnostic`).
     async fn sonder_client_id(&self) -> &'static str {
         let reponse = self
             .client
@@ -1120,8 +1121,8 @@ impl SpotifyService {
             return "non_verifie";
         };
         match reponse.json::<serde_json::Value>().await {
-            Ok(v) if v["error"] == "invalid_client" => "inconnu",
-            Ok(_) => "connu",
+            Ok(v) if v["error"] == "invalid_client" => "refuse",
+            Ok(_) => "accepte",
             Err(_) => "non_verifie",
         }
     }
@@ -1153,14 +1154,31 @@ impl SpotifyService {
         // un identifiant qu'il ne connait pas. Les 8 premiers caracteres se
         // comparent a l'adresse du tableau de bord (un Client ID n'est pas un
         // secret).
-        let connu_de_spotify = if client_id == "ok" {
-            let connu = self.sonder_client_id().await;
-            if connu == "inconnu" {
-                a_corriger.push("client_id_inconnu_de_spotify".into());
+        let accueil_spotify = if client_id == "ok" {
+            let accueil = self.sonder_client_id().await;
+            if accueil == "refuse" {
+                a_corriger.push("client_id_refuse_par_spotify".into());
             }
-            connu
+            accueil
         } else {
             "non_verifie"
+        };
+        // Retour d'un testeur (09/11) : `INVALID_CLIENT: Invalid client` avec
+        // un Client ID pourtant correct (verifie dans Settings › Basic
+        // Information). Les causes probables, a verifier dans l'ordre.
+        let refus_du_client = accueil_spotify == "refuse"
+            || self
+                .derniere_erreur
+                .as_ref()
+                .is_some_and(|d| d.code == CODE_CLIENT_ID_REFUSE);
+        let causes_possibles: Vec<&str> = if refus_du_client {
+            vec![
+                "connexion_lancee_avant_le_client_id",
+                "proprietaire_sans_premium",
+                "application_supprimee_ou_desactivee",
+            ]
+        } else {
+            Vec::new()
         };
         let debut = self.debut_du_client_id();
 
@@ -1226,8 +1244,9 @@ impl SpotifyService {
             "service": "spotify",
             "client_id": {
                 "etat": client_id,
-                "spotify": connu_de_spotify,
+                "spotify": accueil_spotify,
                 "debut": debut,
+                "causes_possibles": causes_possibles,
             },
             "redirect_uri": {
                 "valeur": self.redirect_uri,

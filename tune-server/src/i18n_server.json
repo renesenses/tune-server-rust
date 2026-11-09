@@ -2498,23 +2498,6 @@
     "pl": "Ten Client ID jest już zapisany, nic się nie zmieniło — teraz zaloguj się do Spotify.",
     "el": "Αυτό το Client ID είναι ήδη αποθηκευμένο, δεν άλλαξε τίποτα — συνδεθείτε τώρα στο Spotify."
   },
-  "svctok.spotify.clientIdExtracted": {
-    "fr": "Adresse du tableau de bord Spotify reconnue : son Client ID a été extrait et enregistré. Vous pouvez maintenant vous connecter.",
-    "en": "Spotify dashboard address recognised: its Client ID was extracted and saved. You can now sign in.",
-    "de": "Adresse des Spotify-Dashboards erkannt: Die Client-ID wurde daraus übernommen und gespeichert. Sie können sich jetzt anmelden.",
-    "es": "Dirección del panel de Spotify reconocida: se ha extraído y guardado su Client ID. Ya puede iniciar sesión.",
-    "it": "Indirizzo della dashboard Spotify riconosciuto: il Client ID è stato estratto e salvato. Ora puoi accedere.",
-    "zh": "已识别 Spotify 控制台地址：已从中提取并保存 Client ID。现在可以登录。",
-    "ja": "Spotify ダッシュボードのアドレスを認識しました。Client ID を取り出して保存しました。サインインできます。",
-    "ko": "Spotify 대시보드 주소를 인식했습니다. Client ID를 추출해 저장했습니다. 이제 로그인할 수 있습니다.",
-    "ro": "Adresa panoului Spotify a fost recunoscută: Client ID-ul a fost extras și salvat. Acum vă puteți conecta.",
-    "sv": "Adressen till Spotify-instrumentpanelen känns igen: dess Client ID har hämtats och sparats. Du kan nu logga in.",
-    "hu": "Felismert Spotify-irányítópult cím: a Client ID-t kinyertük és elmentettük. Most már bejelentkezhet.",
-    "vi": "Đã nhận ra địa chỉ bảng điều khiển Spotify: Client ID đã được trích xuất và lưu. Giờ bạn có thể đăng nhập.",
-    "nb": "Adressen til Spotify-dashbordet er gjenkjent: Client ID er hentet ut og lagret. Du kan nå logge inn.",
-    "pl": "Rozpoznano adres panelu Spotify: Client ID został z niego wyodrębniony i zapisany. Możesz się teraz zalogować.",
-    "el": "Αναγνωρίστηκε η διεύθυνση του πίνακα ελέγχου Spotify: το Client ID εξήχθη και αποθηκεύτηκε. Μπορείτε πλέον να συνδεθείτε."
-  },
   "svctok.spotify.clientIdEnv": {
     "fr": "La variable TUNE_SPOTIFY_CLIENT_ID est posée sur ce serveur et l’emporte : modifiez-la, puis redémarrez le serveur.",
     "en": "TUNE_SPOTIFY_CLIENT_ID is set on this server and takes precedence: change it, then restart the server.",
