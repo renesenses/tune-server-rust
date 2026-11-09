@@ -723,6 +723,27 @@ async fn banc_avec_bornes(
     activee: bool,
     bornes: reglages::BornesDb,
 ) -> Banc {
+    let (sim, sortie, drapeau, relais) = pieces_du_banc(annonce, activee, bornes).await;
+    Banc {
+        sim,
+        sortie,
+        _activee: drapeau,
+        _relais: relais,
+    }
+}
+
+/// Les pièces d'un [`Banc`], pour un témoin qui doit détruire la sortie
+/// lui-même (#8029).
+async fn pieces_du_banc(
+    annonce: super::protocole::Annonce,
+    activee: bool,
+    bornes: reglages::BornesDb,
+) -> (
+    Simulateur,
+    DevialetAirOutput,
+    Arc<AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
     let sim = Simulateur::demarrer(annonce, None).await;
     let ecoute = Ecoute::nouvelle();
     let drapeau = Arc::new(AtomicBool::new(activee));
@@ -763,12 +784,44 @@ async fn banc_avec_bornes(
     tokio::time::sleep(Duration::from_millis(50)).await;
     let a = annonce_de_test();
     let sortie = DevialetAirOutput::new("EXPERT-TEST".into(), a.mac_texte(), ecoute, contexte);
-    Banc {
-        sim,
-        sortie,
-        _activee: drapeau,
-        _relais: relais,
+    (sim, sortie, drapeau, relais)
+}
+
+/// #8029 — un ampli retiré du registre sans `stop()` : la sortie est
+/// détruite pendant la lecture. Sa tâche de diffusion continuait d'envoyer
+/// des paquets à l'ampli jusqu'à la fin du titre.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn air_une_sortie_detruite_en_lecture_n_envoie_plus_rien_8029() {
+    let (sim, sortie, _drapeau, relais) =
+        pieces_du_banc(annonce_de_test(), true, reglages::BornesDb::PAR_DEFAUT).await;
+    let dossier = crate::test_scratch::scratch_dir("devialet-air-8029");
+    // Trente secondes : le titre ne peut pas finir pendant le témoin.
+    let (chemin, _) = wav_16_bits(&dossier, 44_100, 44_100 * 30);
+    sortie.play_media(&media(&chemin)).await.unwrap();
+
+    let recus = |sim: &Simulateur| -> usize { sim.etat().paquets.values().map(|p| p.len()).sum() };
+    let mut parti = false;
+    for _ in 0..250 {
+        if recus(&sim) > 20 {
+            parti = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(parti, "témoin : le flux part vers l'ampli");
+
+    // Le retrait du registre : la sortie est détruite, `stop()` jamais appelé.
+    drop(sortie);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let apres_retrait = recus(&sim);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let une_seconde_plus_tard = recus(&sim);
+    relais.abort();
+    assert_eq!(
+        une_seconde_plus_tard, apres_retrait,
+        "une sortie Devialet retirée du registre ne doit plus rien envoyer à \
+         l'ampli (#8029)"
+    );
 }
 
 /// Un fichier WAV stéréo 16 bits de `n` trames, dans un dossier jetable.

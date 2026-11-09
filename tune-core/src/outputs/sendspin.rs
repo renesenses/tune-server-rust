@@ -218,6 +218,17 @@ pub struct SendspinOutput {
     tache: AsyncMutex<Option<JoinHandle<()>>>,
 }
 
+/// #8029 — une sortie retirée du registre sans `stop()` (enceinte partie,
+/// zone supprimée) laissait sa tâche de diffusion envoyer des trames à une
+/// liaison que plus personne ne tenait. La tâche s'arrête avec la sortie.
+impl Drop for SendspinOutput {
+    fn drop(&mut self) {
+        if let Some(tache) = self.tache.get_mut().take() {
+            tache.abort();
+        }
+    }
+}
+
 impl SendspinOutput {
     #[must_use]
     pub fn new(nom: String, client_id: &str, liaison: LiaisonLecteur) -> Self {
