@@ -2201,6 +2201,9 @@ mod convolution_sous_licence_7632_tests;
 // #7986 — une RI que le convolveur refusera ne force pas le transcodage.
 #[cfg(test)]
 mod passthrough_sans_traitement_7986_tests;
+// #8006 — Pause et Arrêt n'attendent plus sans limite un appareil occupé.
+#[cfg(test)]
+mod sortie_occupee_8006_tests;
 
 /// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
 mod duree_du_flux_2062;
