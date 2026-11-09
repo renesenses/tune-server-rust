@@ -9647,7 +9647,10 @@ mod tests {
         // `tracks.explicit`, que l'INSERT et l'UPDATE des pistes NOMMENT.
         // 108 : `apports_service` (#8077), jumelle de la SQLite 142. Crée les
         // tables des apports Qobuz, que la fiche album NOMME.
-        assert_eq!(pg_latest_version(), 108, "latest PG migration must be 108");
+        // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
+        // Migration de DONNÉES : le nom, le pays et le genre de la station
+        // semée sous « PureClassic Radio ».
+        assert_eq!(pg_latest_version(), 109, "latest PG migration must be 109");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
