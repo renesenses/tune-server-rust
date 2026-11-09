@@ -643,6 +643,8 @@ where
         .route("/youtube/moods/{params}", get(youtube_mood))
         .route("/youtube/library", get(youtube_library))
         .route("/spotify/callback", get(spotify_callback))
+        // #8198 — le verificateur de configuration Spotify.
+        .route("/spotify/diagnostic", get(spotify_diagnostic))
         // #6784 — finir la connexion Spotify depuis un téléphone.
         .route(
             "/spotify/connect",
@@ -2375,6 +2377,28 @@ async fn youtube_library(State(state): State<StreamingHttpState>) -> Response {
 // OAuth callbacks
 // ---------------------------------------------------------------------------
 
+/// `GET /streaming/spotify/diagnostic` — #8198 : ce qui ne va pas dans la
+/// configuration Spotify, champ par champ (voir
+/// `SpotifyService::diagnostic`). Fonctionne service desactive.
+async fn spotify_diagnostic(State(state): State<StreamingHttpState>) -> Response {
+    let svc = match get_svc(&state, "spotify").await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.read().await;
+    match svc
+        .as_any()
+        .downcast_ref::<tune_core::streaming::spotify::SpotifyService>()
+    {
+        Some(spotify) => Json(spotify.diagnostic().await).into_response(),
+        None => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"code": "spotify_diagnostic_indisponible", "service": "spotify"})),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct SpotifyCallbackQuery {
     code: Option<String>,
@@ -2411,7 +2435,7 @@ async fn spotify_callback(
             }))
             .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => reponse_echec_auth("spotify", &e),
     }
 }
 
@@ -4995,6 +5019,8 @@ mod tests_echec_de_connexion_7068 {
     }
 }
 
+#[cfg(test)]
+mod spotify_messages_clairs_8198_tests;
 #[cfg(test)]
 mod spotify_rappel_colle_8142_tests;
 

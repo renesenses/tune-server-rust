@@ -95,6 +95,9 @@ pub struct SpotifyService {
     /// supprime la ligne de jetons. Sans cela, le service restait annoncé
     /// « Connecté » avec un jeton mort, et chaque recherche échouait.
     session_refusee: bool,
+    /// #8198 — le dernier refus de connexion portant un code stable, efface
+    /// par une connexion reussie. Le verificateur (`diagnostic`) le rapporte.
+    derniere_erreur: Option<DerniereErreur>,
 }
 
 impl Default for SpotifyService {
@@ -207,6 +210,55 @@ pub const CODE_AUTORISATION_REFUSEE: &str = "spotify_autorisation_refusee";
 /// #8142 — le `state` de l'adresse collee ne designe aucune autorisation en
 /// cours (autre onglet, lien ancien, serveur redemarre).
 pub const CODE_STATE_INCONNU: &str = "spotify_state_inconnu";
+
+/// #8198 — aucun Client ID configure sur ce serveur.
+pub const CODE_CLIENT_ID_ABSENT: &str = "spotify_client_id_absent";
+
+/// #8198 — `invalid_grant` a l'echange : code deja utilise, expire ou faux.
+pub const CODE_CODE_INVALIDE: &str = "spotify_code_invalide";
+
+/// #8198 — l'adresse de retour declaree dans l'application Spotify ne
+/// correspond pas a celle que Tune envoie.
+pub const CODE_REDIRECT_URI_DIFFERENTE: &str = "spotify_redirect_uri_differente";
+
+/// #8198 — `invalid_client` : Client ID inconnu de Spotify.
+pub const CODE_CLIENT_ID_REFUSE: &str = "spotify_client_id_refuse";
+
+/// #8198 — Spotify a delivre un jeton, mais `/me` repond 403 : compte absent
+/// de « User Management », ou proprietaire de l'application sans Premium
+/// (regle du mode developpement depuis fevrier 2026). Sans ce controle, la
+/// carte affichait « connecte » et tout echouait ensuite.
+pub const CODE_COMPTE_NON_AUTORISE: &str = "spotify_compte_non_autorise";
+
+const COMPTE_NON_AUTORISE: &str = "spotify: Spotify refuse l'acces a ce compte (HTTP 403). \
+     Ajoutez l'adresse e-mail de votre compte Spotify dans User Management de votre \
+     application (developer.spotify.com, tableau de bord), et verifiez que le \
+     proprietaire de l'application a un abonnement Premium";
+
+/// #8198 — le code stable d'un refus de l'echange du code (`/api/token`).
+///
+/// Spotify repond `{"error": "invalid_grant", "error_description": "Invalid
+/// redirect URI"}` quand l'adresse de retour differe de celle de
+/// l'autorisation, `invalid_grant` seul pour un code use, expire ou faux, et
+/// `invalid_client` pour un Client ID inconnu.
+pub fn code_du_refus_d_echange(erreur: &str, description: &str) -> Option<&'static str> {
+    let description = description.to_ascii_lowercase();
+    if description.contains("redirect") {
+        return Some(CODE_REDIRECT_URI_DIFFERENTE);
+    }
+    match erreur {
+        "invalid_grant" => Some(CODE_CODE_INVALIDE),
+        "invalid_client" => Some(CODE_CLIENT_ID_REFUSE),
+        _ => None,
+    }
+}
+
+/// #8198 — le dernier refus de connexion, que le verificateur rapporte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerniereErreur {
+    pub code: &'static str,
+    pub quand: std::time::SystemTime,
+}
 
 fn refus(code: &'static str, message: impl Into<String>) -> TuneError {
     TuneError::Refused {
@@ -403,6 +455,7 @@ impl SpotifyService {
             portees: None,
             plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
             session_refusee: false,
+            derniere_erreur: None,
         }
     }
 
@@ -1007,27 +1060,106 @@ impl SpotifyService {
     }
 }
 
-#[async_trait::async_trait]
-impl StreamingService for SpotifyService {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "spotify"
-    }
-    fn enabled(&self) -> bool {
-        self.enabled_override
-            .unwrap_or(self.client_id != DEFAULT_CLIENT_ID)
+impl SpotifyService {
+    /// #8198 — le verificateur de configuration (`GET
+    /// /streaming/spotify/diagnostic`) : ce qui ne va pas, dit precisement.
+    ///
+    /// Tune ne peut pas lire le tableau de bord Spotify. Il dit donc ce qu'il
+    /// sait : son Client ID, l'adresse de retour qu'il envoie (a declarer a
+    /// l'identique), l'etat de la liaison, et, si elle existe, ce que
+    /// repond `GET /me` (403 : compte absent de User Management ou
+    /// proprietaire sans Premium). `premium` vient de `/me.product`, que le
+    /// mode developpement ne renvoie plus depuis fevrier 2026 : `inconnu`.
+    pub async fn diagnostic(&self) -> serde_json::Value {
+        let mut a_corriger: Vec<String> = Vec::new();
+
+        let client_id = if !self.client_id_est_configure() {
+            a_corriger.push("client_id_absent".into());
+            "absent"
+        } else if !ressemble_a_un_client_id(&self.client_id) {
+            a_corriger.push("client_id_forme_invalide".into());
+            "forme_invalide"
+        } else {
+            "ok"
+        };
+
+        let redirect = match refus_redirection(&self.redirect_uri) {
+            None => "ok",
+            Some(RefusRedirection::Localhost) => {
+                a_corriger.push("redirect_localhost".into());
+                "localhost"
+            }
+            Some(RefusRedirection::HttpHorsBouclage) => {
+                a_corriger.push("redirect_http_hors_bouclage".into());
+                "http_hors_bouclage"
+            }
+        };
+
+        let connexion = if self.access_token.is_some() {
+            "connecte"
+        } else if self.session_refusee {
+            a_corriger.push("session_expiree".into());
+            "session_expiree"
+        } else {
+            a_corriger.push("non_connecte".into());
+            "non_connecte"
+        };
+
+        let (acces, detail, premium) = if self.access_token.is_none() {
+            ("non_verifie", None, "inconnu")
+        } else {
+            match self.api_get("/me").await {
+                Ok(me) => {
+                    let premium = match me["product"].as_str() {
+                        Some("premium") => "oui",
+                        Some(_) => {
+                            a_corriger.push("premium_absent".into());
+                            "non"
+                        }
+                        None => "inconnu",
+                    };
+                    ("ok", None, premium)
+                }
+                Err(e) if e.contains("HTTP 403") => {
+                    a_corriger.push("compte_non_autorise".into());
+                    ("compte_non_autorise", Some(e), "inconnu")
+                }
+                Err(e) if e == "token expired" => {
+                    a_corriger.push("jeton_refuse".into());
+                    ("jeton_refuse", Some(e), "inconnu")
+                }
+                Err(e) => ("erreur", Some(e), "inconnu"),
+            }
+        };
+
+        let derniere = self.derniere_erreur.as_ref().map(|d| {
+            a_corriger.push(d.code.to_owned());
+            serde_json::json!({
+                "code": d.code,
+                "quand": chrono::DateTime::<chrono::Utc>::from(d.quand)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            })
+        });
+
+        serde_json::json!({
+            "service": "spotify",
+            "client_id": { "etat": client_id },
+            "redirect_uri": {
+                "valeur": self.redirect_uri,
+                "etat": redirect,
+                "relais": false,
+            },
+            "connexion": { "etat": connexion, "compte": self.username },
+            "acces_api": { "etat": acces, "detail": detail },
+            "premium": { "etat": premium },
+            "derniere_erreur": derniere,
+            "a_corriger": a_corriger,
+        })
     }
 
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled_override = Some(enabled);
-    }
-
-    async fn authenticate(
+    /// L'authentification proprement dite ; [`StreamingService::authenticate`]
+    /// l'enveloppe pour noter le dernier refus (#8198).
+    async fn authentifier(
         &mut self,
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, TuneError> {
@@ -1035,12 +1167,14 @@ impl StreamingService for SpotifyService {
         // `client_id=placeholder` et l'echange d'un code finissait en
         // `invalid_client` : refuser tout de suite, en disant ou le poser.
         if !self.client_id_est_configure() {
-            return Err(format!(
-                "{CLIENT_ID_ABSENT} : enregistrez celui de votre application Spotify \
-                 (developer.spotify.com, tableau de bord) dans Reglages > Acces et jetons > \
-                 Services de streaming, ou posez TUNE_SPOTIFY_CLIENT_ID"
-            )
-            .into());
+            return Err(refus(
+                CODE_CLIENT_ID_ABSENT,
+                format!(
+                    "{CLIENT_ID_ABSENT} : enregistrez celui de votre application Spotify \
+                     (developer.spotify.com, tableau de bord) dans Reglages > Acces et jetons > \
+                     Services de streaming, ou posez TUNE_SPOTIFY_CLIENT_ID"
+                ),
+            ));
         }
         // #2680 — `callback_url` : l'adresse de rappel collee depuis un autre
         // poste, ou le rappel `127.0.0.1` ne peut pas aboutir.
@@ -1102,11 +1236,16 @@ impl StreamingService for SpotifyService {
                 } else {
                     ""
                 };
-                return Err(format!(
+                let message = format!(
                     "spotify: {err} {detail} (redirect_uri envoyee : {}){conseil}",
                     self.redirect_uri
-                )
-                .into());
+                );
+                // #8198 — un code stable pour les trois refus courants ;
+                // les autres gardent leur texte seul.
+                return Err(match code_du_refus_d_echange(err, detail) {
+                    Some(code) => refus(code, message),
+                    None => message.into(),
+                });
             }
             self.tentatives.clear();
 
@@ -1117,7 +1256,22 @@ impl StreamingService for SpotifyService {
             self.token_expires =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(expires_in));
             self.token_rejected.store(false, Ordering::Relaxed);
-            let me = self.api_get("/me").await.ok();
+            // #8198 — en mode developpement, Spotify delivre le jeton a un
+            // compte absent de « User Management » (ou dont l'application a
+            // un proprietaire sans Premium), puis refuse chaque appel en 403.
+            // Le constater ICI, et ne pas garder une liaison inutilisable.
+            let me = match self.api_get("/me").await {
+                Ok(me) => Some(me),
+                Err(e) if e.contains("HTTP 403") => {
+                    warn!(motif = %e, "spotify_compte_non_autorise");
+                    self.access_token = None;
+                    self.refresh_token = None;
+                    self.portees = None;
+                    self.token_expires = None;
+                    return Err(refus(CODE_COMPTE_NON_AUTORISE, COMPTE_NON_AUTORISE));
+                }
+                Err(_) => None,
+            };
             self.username = me
                 .as_ref()
                 .and_then(|v| v["display_name"].as_str().map(Into::into));
@@ -1139,6 +1293,47 @@ impl StreamingService for SpotifyService {
             verification_url: Some(url),
             ..Default::default()
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamingService for SpotifyService {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "spotify"
+    }
+    fn enabled(&self) -> bool {
+        self.enabled_override
+            .unwrap_or(self.client_id != DEFAULT_CLIENT_ID)
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled_override = Some(enabled);
+    }
+
+    async fn authenticate(
+        &mut self,
+        credentials: &serde_json::Value,
+    ) -> Result<AuthStatus, TuneError> {
+        let issue = self.authentifier(credentials).await;
+        // #8198 — le verificateur rapporte le dernier refus code ; une
+        // connexion reussie l'efface.
+        match &issue {
+            Err(TuneError::Refused { code, .. }) => {
+                self.derniere_erreur = Some(DerniereErreur {
+                    code,
+                    quand: std::time::SystemTime::now(),
+                });
+            }
+            Ok(status) if status.authenticated => self.derniere_erreur = None,
+            _ => {}
+        }
+        issue
     }
 
     async fn auth_status(&self) -> AuthStatus {
