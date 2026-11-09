@@ -471,12 +471,13 @@ impl App {
         Err(erreurs.join(" ; "))
     }
 
-    /// Navigation : la liste des albums, à travers le relais.
+    /// Navigation : la liste des albums, à travers le relais (qui préfixe
+    /// `/api/v1`, comme le font les apps).
     async fn albums(&self, s: &Session) -> (u16, serde_json::Value) {
         let r = self
             .http
             .get(format!(
-                "http://{}/api/relay/{}/api/v1/library/albums",
+                "http://{}/api/relay/{}/library/albums",
                 self.relais, s.server_id
             ))
             .header("x-bridge-token", &s.jeton)
@@ -683,4 +684,168 @@ async fn coupures_breves_le_serveur_revient_vite_a_chaque_fois() {
         app.naviguer_et_lire(&session, "Salon", &format!("apres la coupure {n}"))
             .await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// « État : Déconnecté » sans retour (#7714, constat du 09/11 15 h 08)
+// ---------------------------------------------------------------------------
+
+/// Un serveur relié dont la clé du coffre a changé (coffre effacé, base
+/// restaurée) : le site connaît l'ANCIENNE clé, le relais refuse toute autre
+/// (« cle du serveur requise »). Avant, l'impasse était permanente : le
+/// serveur n'inscrit sa clé qu'après une inscription réussie au relais. Il
+/// doit réinscrire sa clé sur le compte et revenir seul.
+#[tokio::test]
+async fn cle_du_serveur_changee_le_serveur_reinscrit_sa_cle_et_revient_seul() {
+    let (site, relais) = banc().await;
+    let backend = base();
+    let reglages = SettingsRepo::with_backend(backend.clone());
+    let server_id = "a6f0c2de-7714-4c0e-9b1a-0000000000aa";
+    reglages.set("server_id", server_id).unwrap();
+    reglages.set("server_name", "Salon").unwrap();
+    // Relié au compte (session SSO et jeton de liaison)...
+    reglages
+        .set("mozaik_access_token", &jeton_oauth(COMPTE))
+        .unwrap();
+    let liaison = site.lier(COMPTE, server_id).unwrap();
+    reglages.set(CLE_JETON_DE_LIAISON, &liaison).unwrap();
+    // ... mais le site garde la clé d'AVANT.
+    let ancienne = tune_laissez_passer::CleServeur::depuis_graine(&[7u8; 32])
+        .unwrap()
+        .cle_publique();
+    site.etat
+        .lock()
+        .unwrap()
+        .cles
+        .insert(server_id.to_string(), ancienne.clone());
+
+    let cle = cle_serveur::cle_du_serveur(&backend).unwrap();
+    let nouvelle = cle.cle_publique();
+    assert_ne!(nouvelle, ancienne);
+    let port = api_locale("Salon").await;
+    let client = Arc::new(
+        RelayClient::new(
+            server_id.into(),
+            "jeton-du-pont-7714-0123456789".into(),
+            format!("ws://{}/ws/server", relais.adresse),
+            port,
+        )
+        .avec_reglages(backend.clone())
+        .avec_cle(cle)
+        .avec_inscription(site.clone()),
+    );
+    client.clone().spawn();
+
+    tokio::time::timeout(PATIENCE, async {
+        while !(client.is_connected() && relais.state.servers.contains_key(server_id)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "le relais refuse le serveur (cle du serveur requise) et il ne revient pas seul : \
+             derniere erreur {:?}",
+            client.derniere_erreur()
+        )
+    });
+    assert_eq!(
+        site.etat.lock().unwrap().cles.get(server_id),
+        Some(&nouvelle),
+        "la cle du serveur n'a pas ete reinscrite sur le compte"
+    );
+    assert_eq!(client.derniere_erreur(), None);
+}
+
+/// Un faux relais : `muet` n'accuse jamais l'inscription ; sinon il l'accuse
+/// puis se tait sans fermer (connexion à moitié morte). Rend son adresse et
+/// le nombre de connexions reçues.
+async fn faux_relais(muet: bool) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    let connexions = Arc::new(AtomicUsize::new(0));
+    let c = connexions.clone();
+    tokio::spawn(async move {
+        let mut gardees = Vec::new();
+        while let Ok((tcp, _)) = ecoute.accept().await {
+            c.fetch_add(1, Ordering::SeqCst);
+            let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                continue;
+            };
+            if !muet {
+                let _ = ws.next().await; // relay.register
+                let ack = serde_json::json!({
+                    "type": "relay.registered", "ok": true, "server_id": "x",
+                });
+                let _ = ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        ack.to_string().into(),
+                    ))
+                    .await;
+            }
+            // Ni réponse, ni fermeture : la socket reste ouverte.
+            gardees.push(ws);
+        }
+    });
+    (adresse, connexions)
+}
+
+fn client_vers(adresse: std::net::SocketAddr, port: u16) -> Arc<RelayClient> {
+    Arc::new(
+        RelayClient::new(
+            "b7e0c2de-7714-4c0e-9b1a-0000000000bb".into(),
+            "jeton-du-pont-7714-0123456789".into(),
+            format!("ws://{adresse}/ws/server"),
+            port,
+        )
+        .avec_delais(tune_core::cloud::relay::DelaisDuRelais {
+            connexion: Duration::from_secs(1),
+            poignee: Duration::from_secs(1),
+            silence: Duration::from_secs(1),
+        }),
+    )
+}
+
+/// Un relais qui accepte la connexion sans jamais répondre (redéploiement en
+/// cours, mandataire bloqué) : le serveur abandonne la tentative et
+/// réessaie, au lieu d'attendre l'accusé pour toujours.
+#[tokio::test]
+async fn relais_muet_le_serveur_abandonne_et_reessaie() {
+    let (adresse, connexions) = faux_relais(true).await;
+    let client = client_vers(adresse, api_locale("Salon").await);
+    client.clone().spawn();
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    let n = connexions.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        n >= 2,
+        "le serveur attend l'accuse d'un relais muet pour toujours ({n} connexion) : \
+         il ne se reconnectera jamais sans redemarrage"
+    );
+    assert!(!client.is_connected());
+    assert!(
+        client
+            .derniere_erreur()
+            .is_some_and(|e| e.contains("timeout")),
+        "la cause doit etre lisible dans les Reglages : {:?}",
+        client.derniere_erreur()
+    );
+}
+
+/// Une connexion inscrite que le relais cesse d'alimenter (TCP à moitié
+/// ouvert après un changement d'adresse de la box, relais redéployé sans
+/// fermeture vue) : le serveur la tient pour morte et se réinscrit.
+#[tokio::test]
+async fn relais_silencieux_le_serveur_se_reinscrit() {
+    let (adresse, connexions) = faux_relais(false).await;
+    let client = client_vers(adresse, api_locale("Salon").await);
+    client.clone().spawn();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let n = connexions.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        n >= 2,
+        "une connexion que le relais n'alimente plus est gardee pour toujours ({n} \
+         connexion) : le serveur se croit connecte, le relais l'a oublie"
+    );
 }

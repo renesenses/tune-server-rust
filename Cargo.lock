@@ -6564,6 +6564,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tune-core",
  "tune-laissez-passer",
  "uuid",
 ]

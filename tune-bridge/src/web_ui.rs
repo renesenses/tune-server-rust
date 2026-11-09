@@ -24,11 +24,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::Path as AxumPath;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use tracing::{info, warn};
+
+use crate::state::RelayState;
 
 /// Variable d'environnement portant le repertoire du client web construit.
 pub const WEB_DIR_ENV: &str = "TUNE_BRIDGE_WEB_DIR";
@@ -83,10 +85,7 @@ pub fn ressemble_a_un_server_id(segment: &str) -> bool {
 ///
 /// Generique sur l'etat : ces routes n'en ont pas besoin, et l'imposer
 /// obligerait a le nommer ici pour rien.
-pub fn monter<S>(routeur: Router<S>) -> Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+pub fn monter(routeur: Router<Arc<RelayState>>) -> Router<Arc<RelayState>> {
     let Some(dir) = repertoire_web() else {
         info!("bridge_web_ui_non_montee — TUNE_BRIDGE_WEB_DIR absent ou inutilisable");
         return routeur;
@@ -101,10 +100,7 @@ where
 /// toucher a `TUNE_BRIDGE_WEB_DIR`, variable partagee par tous les tests du
 /// processus. Le repertoire est lu une fois, au montage, puis capture par les
 /// gestionnaires.
-fn monter_depuis<S>(routeur: Router<S>, dir: PathBuf) -> Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+fn monter_depuis(routeur: Router<Arc<RelayState>>, dir: PathBuf) -> Router<Arc<RelayState>> {
     let dir = Arc::new(dir);
     let d_index = dir.clone();
     let d_fichier = dir.clone();
@@ -119,17 +115,21 @@ where
         .route("/{server_id}", get(rediriger_vers_racine))
         .route(
             "/{server_id}/",
-            get(move |AxumPath(server_id): AxumPath<String>| {
-                let dir = d_index.clone();
-                async move { servir_index(&dir, &server_id).await }
-            }),
+            get(
+                move |State(etat): State<Arc<RelayState>>,
+                      AxumPath(server_id): AxumPath<String>| {
+                    let dir = d_index.clone();
+                    async move { servir_index(&dir, &etat, &server_id).await }
+                },
+            ),
         )
         .route(
             "/{server_id}/{*chemin}",
             get(
-                move |AxumPath((server_id, chemin)): AxumPath<(String, String)>| {
+                move |State(etat): State<Arc<RelayState>>,
+                      AxumPath((server_id, chemin)): AxumPath<(String, String)>| {
                     let dir = d_fichier.clone();
-                    async move { servir_fichier(&dir, &server_id, &chemin).await }
+                    async move { servir_fichier(&dir, &etat, &server_id, &chemin).await }
                 },
             ),
         )
@@ -178,14 +178,17 @@ async fn rediriger_vers_racine(AxumPath(server_id): AxumPath<String>) -> Respons
     Redirect::permanent(&format!("/{server_id}/")).into_response()
 }
 
-async fn servir_index(dir: &Path, server_id: &str) -> Response {
+async fn servir_index(dir: &Path, etat: &RelayState, server_id: &str) -> Response {
     if !ressemble_a_un_server_id(server_id) {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if !etat.servers.contains_key(server_id) {
+        return page_serveur_injoignable();
     }
     servir(&dir.join("index.html")).await
 }
 
-async fn servir_fichier(dir: &Path, server_id: &str, chemin: &str) -> Response {
+async fn servir_fichier(dir: &Path, etat: &RelayState, server_id: &str, chemin: &str) -> Response {
     if !ressemble_a_un_server_id(server_id) {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -197,10 +200,72 @@ async fn servir_fichier(dir: &Path, server_id: &str, chemin: &str) -> Response {
     let cible = dir.join(chemin);
     if chemin_est_sur(dir, &cible) && cible.is_file() {
         servir(&cible).await
+    } else if !etat.servers.contains_key(server_id) {
+        page_serveur_injoignable()
     } else {
         servir(&dir.join("index.html")).await
     }
 }
+
+/// La page rendue à la place du client web quand le relais n'a pas ce
+/// serveur (#7714). Avant, le client se chargeait puis restait sur
+/// « Chargement… » sans rien dire : aucune requête ne pouvait aboutir. Ici,
+/// une page sans script dit ce qui se passe et quoi faire, en français et en
+/// anglais, et se recharge toute seule : le serveur revenu, le client web
+/// s'ouvre sans autre geste. 503 : l'absence est passagère.
+fn page_serveur_injoignable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::RETRY_AFTER, "30"),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                CSP_PAGE_INJOIGNABLE,
+            ),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+        ],
+        PAGE_SERVEUR_INJOIGNABLE,
+    )
+        .into_response()
+}
+
+/// Aucune ressource externe, aucun script : un style en ligne seulement.
+const CSP_PAGE_INJOIGNABLE: &str = "default-src 'none'; style-src 'unsafe-inline'; \
+frame-ancestors 'none'; base-uri 'none'";
+
+/// Repère stable de la page, pour les tests et pour qui lit le HTML.
+pub const MARQUE_SERVEUR_INJOIGNABLE: &str = "tune-serveur-injoignable";
+
+const PAGE_SERVEUR_INJOIGNABLE: &str = r#"<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<meta name="tune" content="tune-serveur-injoignable">
+<title>Tune : serveur non joignable</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;line-height:1.5;color:#1a202c;background:#fff}
+@media (prefers-color-scheme:dark){body{color:#e2e8f0;background:#1a202c}}
+h1{font-size:1.3rem}h2{font-size:1.1rem;margin-top:2rem}small{opacity:.7}
+</style>
+</head>
+<body>
+<h1>Votre serveur Tune n'est pas joignable</h1>
+<p>Le relais Tune Bridge ne voit pas ce serveur en ce moment. Il est peut-être éteint, sans connexion Internet, ou en train de se reconnecter.</p>
+<ul>
+<li>Vérifiez que le serveur est allumé et connecté à Internet.</li>
+<li>Sur le réseau local, ouvrez ses Réglages › Accès à distance : l'état doit être « Connecté ». S'il affiche une erreur, notez-la.</li>
+</ul>
+<p><small>Cette page se recharge toute seule toutes les 30 secondes.</small></p>
+<h2 lang="en">Your Tune server can't be reached</h2>
+<p lang="en">Tune Bridge does not see this server right now. It may be off, offline, or reconnecting. Check that it is on and online, then look at Settings › Remote access on your local network: the status should read "Connected". This page reloads every 30 seconds.</p>
+</body>
+</html>
+"#;
 
 /// Un fichier de `dir/assets/`, ou 404 — jamais de repli SPA.
 async fn servir_ressource(dir: &Path, chemin: &str) -> Response {
@@ -515,12 +580,31 @@ mod tests {
     /// Le VRAI routeur du relais (`crate::routes()`) plus le client web, sur
     /// 127.0.0.1 : la route doit tenir a cote de celles du relais, pas seule.
     async fn pont_avec_client(dir: Option<&Path>) -> String {
+        pont_avec_client_et_serveur(dir, true).await
+    }
+
+    /// `inscrit` : le serveur `SERVEUR` est-il connecté au relais ?
+    async fn pont_avec_client_et_serveur(dir: Option<&Path>, inscrit: bool) -> String {
         let app = crate::routes();
         let app = match dir {
             Some(d) => monter_depuis(app, d.to_path_buf()),
             None => app,
         };
-        let app = app.with_state(std::sync::Arc::new(crate::state::RelayState::new()));
+        let etat = std::sync::Arc::new(crate::state::RelayState::new());
+        if inscrit {
+            let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+            etat.register_server(
+                SERVEUR.into(),
+                "Salon".into(),
+                "jeton-0123456789".into(),
+                None,
+                tx,
+            )
+            .unwrap();
+            // Le canal reste ouvert pour la durée du test.
+            std::mem::forget(rx);
+        }
+        let app = app.with_state(etat);
         let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let adresse = ecoute.local_addr().unwrap();
         tokio::spawn(async move {
@@ -623,6 +707,37 @@ mod tests {
         assert_eq!((statut, corps.as_str()), (200, INDEX));
         let (statut, _, _) = obtenir(&format!("{base}/health")).await;
         assert_eq!(statut, 200);
+    }
+
+    /// Serveur absent du relais : au lieu du client web, qui restait sur
+    /// « Chargement… », une page qui dit que le serveur n'est pas joignable
+    /// (#7714). Les fichiers statiques restent servis.
+    #[tokio::test]
+    async fn serveur_absent_la_page_dit_qu_il_n_est_pas_joignable_7714() {
+        let client = client_construit();
+        let base = pont_avec_client_et_serveur(Some(client.path()), false).await;
+        for chemin in [format!("/{SERVEUR}/"), format!("/{SERVEUR}/library")] {
+            let (statut, type_, corps) = obtenir(&format!("{base}{chemin}")).await;
+            assert_eq!(
+                statut, 503,
+                "{chemin} : serveur absent, le relais rendait le client web qui restait sur \
+                 « Chargement… » ; il doit dire que le serveur n'est pas joignable"
+            );
+            assert_eq!(type_, "text/html; charset=utf-8", "{chemin}");
+            assert!(
+                corps.contains(MARQUE_SERVEUR_INJOIGNABLE),
+                "{chemin} : {corps}"
+            );
+            assert!(corps.contains("n'est pas joignable"), "{chemin}");
+            assert!(corps.contains("can't be reached"), "{chemin}");
+            assert!(!corps.contains("<script"), "{chemin} : aucun script");
+        }
+        // Le même serveur inscrit : le client web, comme avant.
+        let base = pont_avec_client_et_serveur(Some(client.path()), true).await;
+        let (statut, _, corps) = obtenir(&format!("{base}/{SERVEUR}/")).await;
+        assert_eq!((statut, corps.as_str()), (200, INDEX));
+        let (statut, _, corps) = obtenir(&format!("{base}/{SERVEUR}/library")).await;
+        assert_eq!((statut, corps.as_str()), (200, INDEX));
     }
 
     /// L'index et les fichiers du client portent la politique de contenu.
