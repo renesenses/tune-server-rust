@@ -145,6 +145,18 @@ impl RelayClient {
                 *client.ws_tx.lock().await = None;
                 *client.ws_vrac.lock().await = None;
 
+                // Une session qui a été INSCRITE remet le compteur à zéro :
+                // `Ok` ne sort de `connect_and_run` qu'après l'accusé du
+                // relais. Sans cela, chaque coupure de la vie du serveur
+                // (redéploiement du relais, box qui redémarre) allongeait
+                // l'attente suivante, jusqu'au plafond de 60 s — mesuré sur
+                // le .18 le 08/11/2026 : « backoff_secs=60 » après une
+                // simple fermeture propre, soit une minute pendant laquelle
+                // l'app lit « serveur absent ».
+                if fin.is_ok() {
+                    attempt = 0;
+                }
+
                 if matches!(fin, Ok(FinDeSession::JetonRenouvele)) {
                     // Pas d'attente croissante : la coupure est voulue. Le court
                     // délai laisse au relais le temps de voir la fermeture et
