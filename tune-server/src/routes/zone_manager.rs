@@ -1118,7 +1118,17 @@ pub(crate) async fn unreachable_endpoints_avec_delai(
         .collect()
 }
 
-async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
+/// #8185 — un refus répond par un statut d'erreur, plus par un 200.
+///
+/// Le refus partait en `200 OK` avec un corps `{"error": …}`. L'interface web
+/// (`OaatGroupsPanel.svelte`) ne lit pas ce champ : elle affichait « groupe
+/// créé » en vert, rechargeait la liste… vide, puisque rien n'avait été
+/// enregistré (Rhorn, fil 2712 : deux récepteurs sur le port 9740 par défaut).
+/// Le corps du refus est inchangé ; seul le statut dit enfin ce qu'il est.
+async fn create_oaat_group(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
     let name = body["name"].as_str().unwrap_or("OAAT Group");
     let endpoints: Vec<(String, u16)> = body["endpoints"]
         .as_array()
@@ -1132,7 +1142,10 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
         .collect();
 
     if endpoints.is_empty() {
-        return Json(json!({ "error": "at least one endpoint required" }));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "at least one endpoint required" })),
+        );
     }
 
     // Un groupe qui ne peut pas jouer ne doit pas pouvoir se créer (#1779).
@@ -1146,16 +1159,19 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
             total = endpoints.len(),
             "oaat_multiroom_group_refused_unreachable_endpoints"
         );
-        return Json(json!({
-            "error": "oaat_endpoints_unreachable",
-            "code": "oaat_endpoints_unreachable",
-            "message": crate::message_api::texte(
-                "api.groups.unreachableEndpoints",
-                &[("endpoints", unreachable.join(", "))],
-            ),
-            "message_key": "api.groups.unreachableEndpoints",
-            "unreachable_endpoints": unreachable,
-        }));
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "oaat_endpoints_unreachable",
+                "code": "oaat_endpoints_unreachable",
+                "message": crate::message_api::texte(
+                    "api.groups.unreachableEndpoints",
+                    &[("endpoints", unreachable.join(", "))],
+                ),
+                "message_key": "api.groups.unreachableEndpoints",
+                "unreachable_endpoints": unreachable,
+            })),
+        );
     }
 
     let group_id = format!(
@@ -1191,12 +1207,15 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
 
     info!(group_id = %group_id, name, endpoints = endpoints.len(), "oaat_multiroom_group_created");
 
-    Json(oaat_group_view(json!({
-        "id": group_id,
-        "name": name,
-        "endpoints": endpoints.len(),
-        "device_id": format!("oaat-group:{group_id}"),
-    })))
+    (
+        StatusCode::OK,
+        Json(oaat_group_view(json!({
+            "id": group_id,
+            "name": name,
+            "endpoints": endpoints.len(),
+            "device_id": format!("oaat-group:{group_id}"),
+        }))),
+    )
 }
 
 async fn delete_oaat_group(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
@@ -1385,6 +1404,10 @@ fn downcast_oaat_multiroom(
         .as_any()
         .downcast_ref::<tune_core::outputs::oaat::OaatMultiroomOutput>()
 }
+
+#[cfg(test)]
+#[path = "zone_manager_8185_tests.rs"]
+mod creation_oaat_refusee_8185_tests;
 
 #[cfg(test)]
 mod tests {
