@@ -2797,6 +2797,13 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     // (`apports_service`), en base seulement, réversibles. Jumelle PG : 108.
     // Numérotée 142 / PG 108 après #8093 (141 / PG 107, contenus explicites).
     Migration { version: 142, name: "apports_service", up: include_str!("../../migrations/apports_service.sql") },
+    // #8160 — la fiche technique d'une piste : la trace DATÉE du spectrogramme
+    // conservé (nom du PNG du cache, taille, date et durée du calcul) et la
+    // signature du fichier audio au moment du calcul, qui dit s'il faut le
+    // recalculer. Numérotée 143 / PG 109, numéros libres dans
+    // `batch/bugs-rc12-20261108` au 09/11 (dernières : 142 / PG 108).
+    // Jumelle PG : 109.
+    Migration { version: 143, name: "spectrogrammes", up: include_str!("../../migrations/spectrogrammes.sql") },
 ];
 
 /// L'index partiel des pistes marquées explicites (#8088), commun aux deux
@@ -5945,6 +5952,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         108,
         "apports_service",
         include_str!("../../migrations/postgres/108_apports_service.sql"),
+    ),
+    // Jumelle de la SQLite 143 (#8160) : la trace datée du spectrogramme
+    // conservé d'une piste et la signature de son fichier.
+    (
+        109,
+        "spectrogrammes",
+        include_str!("../../migrations/postgres/109_spectrogrammes.sql"),
     ),
 ];
 
@@ -9626,7 +9640,9 @@ mod tests {
         // `tracks.explicit`, que l'INSERT et l'UPDATE des pistes NOMMENT.
         // 108 : `apports_service` (#8077), jumelle de la SQLite 142. Crée les
         // tables des apports Qobuz, que la fiche album NOMME.
-        assert_eq!(pg_latest_version(), 108, "latest PG migration must be 108");
+        // 109 : `spectrogrammes` (#8160), jumelle de la SQLite 143. Crée la
+        // trace datée des spectrogrammes conservés, que la fiche technique NOMME.
+        assert_eq!(pg_latest_version(), 109, "latest PG migration must be 109");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

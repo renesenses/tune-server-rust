@@ -271,6 +271,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "verdicts des faux hi-res (#6285) : mesures recalculables, la passe de fond les refait",
     ),
     (
+        "spectrogrammes",
+        "trace des spectrogrammes conservés (#8160) : images du cache, recalculables à la demande ; \
+         le cache des pochettes n'est pas recopié non plus",
+    ),
+    (
         "_migrations",
         "tenue des versions du schema SQLite ; PostgreSQL a sa propre `schema_version`",
     ),

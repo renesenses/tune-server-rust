@@ -96,6 +96,8 @@ pub mod repartitions_bibliotheque;
 pub(crate) mod replieur_wal;
 pub mod settings_repo;
 pub mod source_link_repo;
+/// #8160 — la trace datée du spectrogramme conservé d'une piste.
+pub mod spectrogrammes;
 pub mod sqlite;
 pub mod streaming_favorites_repo;
 pub mod tag_repo;
