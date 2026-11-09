@@ -16,7 +16,11 @@ const CLIENT_ID: &str = "0123456789abcdef0123456789abcdef";
 const BOUCLE: &str = "http://127.0.0.1:8888/api/v1/streaming/spotify/callback";
 
 fn base_de_donnees() -> Arc<dyn DbBackend> {
-    Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"))
+    // Le schéma complet : le relais et les autorisations vivent dans `settings`.
+    let base = SqliteDb::open_in_memory().expect("sqlite en memoire");
+    base.init_schema().expect("schema");
+    tune_core::db::migrations::run_migrations(&base).expect("migrations");
+    Arc::new(base)
 }
 
 fn app(backend: Arc<dyn DbBackend>, base_doublure: &str) -> Router {
