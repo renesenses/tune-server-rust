@@ -69,8 +69,9 @@ pub(crate) enum DeviceResolution {
         open_host: String,
     },
     /// Le bon hôte, mais plus aucun périphérique de ce nom : débranché,
-    /// renommé, routage macOS changé. L'appelant retombe sur la sortie
-    /// système — en le disant (#2207).
+    /// renommé, routage macOS changé. Hors Windows, l'appelant retombe sur la
+    /// sortie système — en le disant (#2207) ; sous Windows il refuse (#8171,
+    /// [`crate::outputs::peripherique_introuvable`]).
     NotFound,
 }
 
@@ -333,6 +334,10 @@ pub(super) fn looks_disambiguated(requested: &str) -> bool {
 /// Returns `(device, fell_back)` where `fell_back` is `true` if the default
 /// device was used instead of the requested one.
 ///
+/// #8171 — sous Windows, ce repli n'a plus lieu : un périphérique nommé et
+/// introuvable rend `None`, et l'appelant refuse la lecture avec un message
+/// ([`crate::outputs::peripherique_introuvable`]).
+///
 /// `origin_host` est l'hôte qui a ÉNUMÉRÉ le nom que porte la zone
 /// (`AudioDevice::backend`). Quand il est connu et qu'il diffère de l'hôte
 /// ouvert, la fonction rend `None` **sans repli** : c'est le refus de #3230.
@@ -435,10 +440,14 @@ pub(super) fn find_device_with_fallback(
                 "local_audio_alsa_hardware_pcm_preferred_at_resolve"
             );
         }
-        debug!(
+        // #8171 — `info!` et non plus `debug!` : le périphérique réellement
+        // ouvert est la première chose qu'un journal de testeur doit montrer,
+        // et le niveau par défaut ne gardait pas cette ligne.
+        info!(
             requested = %device_name,
             resolved = %identities[index].raw_name,
             endpoint_id = %identities[index].endpoint_id,
+            open_host = %open_host,
             matched_by = ?matched,
             "audio_device_resolved"
         );
@@ -462,6 +471,33 @@ pub(super) fn find_device_with_fallback(
         .iter()
         .map(|identity| format!("{} [{}]", identity.raw_name, identity.endpoint_id))
         .collect();
+
+    // #8171 — sous Windows, la sortie par défaut est celle des haut-parleurs
+    // du PC : y envoyer une zone « DAC » est exactement le défaut signalé. On
+    // refuse, comme les chemins exclusifs WASAPI et ASIO le font déjà ; le
+    // message à l'écran part de `record_shared_device_not_found`.
+    if crate::outputs::peripherique_introuvable::conduite_si_introuvable(std::env::consts::OS)
+        == crate::outputs::peripherique_introuvable::ConduiteSiIntrouvable::Refuser
+    {
+        warn!(
+            requested = %device_name,
+            requested_endpoint_id = endpoint_id.unwrap_or("<aucun>"),
+            open_host = %open_host,
+            available = ?available,
+            fallback_reason = LocalDeviceFallback::NotFoundRefused.code(),
+            "audio_device_not_found_refused — \
+             the configured device is unavailable (off, unplugged, renamed or \
+             renumbered); refusing to play on the system default output instead"
+        );
+        note_device_outcome(
+            observed_backend_name(),
+            device_name,
+            "",
+            None,
+            Some(LocalDeviceFallback::NotFoundRefused),
+        );
+        return None;
+    }
 
     if let Some(default_device) = host.default_output_device() {
         let default_name = default_device
