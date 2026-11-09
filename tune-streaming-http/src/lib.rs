@@ -25,6 +25,7 @@ pub mod deezer_proxy_handler;
 pub mod etiquettes_langue;
 /// #8066 — remplacer un titre indisponible dans une playlist du service.
 mod remplacement_indisponibles_8066;
+mod spotify_relais;
 
 /// Sous-ensemble de l'état serveur nécessaire aux routes des services de
 /// streaming. Cette frontière empêche ces routes de dépendre de tout le
@@ -645,6 +646,15 @@ where
         .route("/spotify/callback", get(spotify_callback))
         // #8198 — le verificateur de configuration Spotify.
         .route("/spotify/diagnostic", get(spotify_diagnostic))
+        // #8198, volet 3 — retour par le relais HTTPS (désactivé par défaut).
+        .route(
+            "/spotify/relais",
+            get(spotify_relais::lire).put(spotify_relais::regler),
+        )
+        .route(
+            "/spotify/retour",
+            get(spotify_relais::retour_get).post(spotify_relais::retour_post),
+        )
         // #6784 — finir la connexion Spotify depuis un téléphone.
         .route(
             "/spotify/connect",
@@ -1693,6 +1703,11 @@ async fn service_auth(
         serde_json::from_slice(&raw_body).ok()
     };
 
+    // #8198 — Spotify : réglage du relais appliqué, autorisations
+    // persistées reprises (serveur redémarré entre le clic et le retour).
+    if service == "spotify" {
+        spotify_relais::preparer(&state).await;
+    }
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -1701,9 +1716,13 @@ async fn service_auth(
     let mut svc = svc.write().await;
     let credentials = identifiants_pour_le_client(&service, body, &headers);
 
-    match svc.authenticate(&credentials).await {
+    let issue = svc.authenticate(&credentials).await;
+    drop(svc);
+    if service == "spotify" {
+        spotify_relais::persister(&state).await;
+    }
+    match issue {
         Ok(status) => {
-            drop(svc);
             state.save_tokens().await;
             // Nouveau compte possible : les listes de l'ancien ne valent plus.
             purge_contenu_utilisateur(&service);
@@ -1765,6 +1784,16 @@ pub const CODE_APPLICATION_REFUSEE: &str = "service_app_refused";
 /// `qobuz login: 401 {"status":"error",…}`). Le statut reste 400, comme avant :
 /// 401 serait lu par le client comme une session perdue. Toute autre erreur
 /// garde le texte brut, comme avant.
+/// #8198 — le code stable d'un refus, s'il en porte un.
+pub(crate) fn reponse_code_de(e: &tune_core::TuneError) -> Option<&'static str> {
+    match e {
+        tune_core::TuneError::Refused { code, .. } => Some(code),
+        tune_core::TuneError::Credentials(_) => Some(CODE_IDENTIFIANTS_REFUSES),
+        tune_core::TuneError::AppRefused(_) => Some(CODE_APPLICATION_REFUSEE),
+        _ => None,
+    }
+}
+
 fn reponse_echec_auth(service: &str, e: &tune_core::TuneError) -> Response {
     match e {
         tune_core::TuneError::Credentials(message) => (
@@ -2381,6 +2410,7 @@ async fn youtube_library(State(state): State<StreamingHttpState>) -> Response {
 /// configuration Spotify, champ par champ (voir
 /// `SpotifyService::diagnostic`). Fonctionne service desactive.
 async fn spotify_diagnostic(State(state): State<StreamingHttpState>) -> Response {
+    spotify_relais::preparer(&state).await;
     let svc = match get_svc(&state, "spotify").await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -2416,17 +2446,19 @@ async fn spotify_callback(
     let Some(code) = q.code else {
         return (StatusCode::BAD_REQUEST, "missing code parameter").into_response();
     };
+    spotify_relais::preparer(&state).await;
     let svc = match get_svc(&state, "spotify").await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let mut svc = svc.write().await;
-    match svc
-        .authenticate(&json!({"code": code, "state": q.state}))
+    let issue = svc
+        .write()
         .await
-    {
+        .authenticate(&json!({"code": code, "state": q.state}))
+        .await;
+    spotify_relais::persister(&state).await;
+    match issue {
         Ok(status) => {
-            drop(svc);
             state.save_tokens().await;
             purge_contenu_utilisateur("spotify");
             Json(json!({
@@ -5023,6 +5055,8 @@ mod tests_echec_de_connexion_7068 {
 mod spotify_messages_clairs_8198_tests;
 #[cfg(test)]
 mod spotify_rappel_colle_8142_tests;
+#[cfg(test)]
+mod spotify_relais_8198_tests;
 
 #[cfg(test)]
 mod bio_qobuz_8129_tests;
