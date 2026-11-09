@@ -111,6 +111,22 @@ struct DaemonProcess {
     stdin: Box<dyn AsyncWrite + Unpin + Send>,
 }
 
+/// #8029 — la commande qui lance le démon d'une enceinte.
+///
+/// `kill_on_drop` : une sortie retirée du registre sans `stop()` (enceinte
+/// disparue du réseau, zone supprimée) laissait son démon tourner, orphelin,
+/// jusqu'à l'arrêt du serveur. Le démon meurt désormais avec la sortie qui le
+/// tient.
+fn commande_du_demon(binary: &str) -> Command {
+    let mut commande = Command::new(binary);
+    commande
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    commande
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransportConfirmation {
     Paused,
@@ -348,20 +364,15 @@ impl Airplay2Output {
             crate::services_factices::substitut(DAEMON_BINARY).unwrap_or_else(find_daemon_binary);
         info!(binary = %binary, device = %self.name, "airplay2: starting daemon");
 
-        let mut child = Command::new(&binary)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                // #7084 — fichier introuvable : le composant a disparu
-                // (antivirus), pas une panne obscure du lancement.
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    composant_manquant_7084::signaler(&self.device_id);
-                    return composant_manquant_7084::message_composant_manquant();
-                }
-                format!("airplay-daemon spawn failed: {e}")
-            })?;
+        let mut child = commande_du_demon(&binary).spawn().map_err(|e| {
+            // #7084 — fichier introuvable : le composant a disparu
+            // (antivirus), pas une panne obscure du lancement.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                composant_manquant_7084::signaler(&self.device_id);
+                return composant_manquant_7084::message_composant_manquant();
+            }
+            format!("airplay-daemon spawn failed: {e}")
+        })?;
         composant_manquant_7084::retablir(&self.device_id);
 
         let stdin = child.stdin.take().ok_or("no stdin")?;
@@ -2084,6 +2095,9 @@ mod transport_tests {
 
 #[cfg(test)]
 mod position_relevee_tests_7084;
+
+#[cfg(all(test, target_os = "linux"))]
+mod retrait_sans_arret_tests_8029;
 
 #[cfg(test)]
 mod daemon_path_tests {

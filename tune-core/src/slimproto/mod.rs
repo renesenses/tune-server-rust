@@ -1696,7 +1696,9 @@ impl SlimProtoServer {
             crate::event_types::EventType::ZoneUpdated,
             serde_json::json!({ "device_id": device_id.clone(), "online": false }),
         );
-        state.outputs.lock().await.remove(&device_id);
+        // #8029 — retirée, la sortie est aussi arrêtée.
+        let retiree = state.outputs.lock().await.remove(&device_id);
+        crate::outputs::registry::arreter_les_sorties_retirees_en_tache(retiree);
         state.command_channels.lock().await.remove(mac_str);
         info!(mac = %mac_str, device_id = %device_id, "slimproto_zone_offline");
     }

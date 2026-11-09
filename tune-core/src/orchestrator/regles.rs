@@ -777,14 +777,23 @@ pub(super) fn cible_encodable(
 /// annonçait « 192 → 96 kHz ». Rééchantillonner demande de décoder, donc de
 /// pré-transcoder : c'est ce bras-ci, celui qui décode déjà.
 ///
+/// Une QUATRIÈME raison depuis le silence de Sevy Tabroc (#8188, fil 2714) :
+/// le plafond 16 bits de la zone (`dlna_cap_16bit` ou quirk `force_16bit`).
+/// Un Ruark R3 ou un Roberts Stream 94i+ (Frontier Silicon) annoncent
+/// `audio/flac` mais ne décodent que 16 bits : le FLAC 24/96 de Qobuz relayé
+/// verbatim y jouait du SILENCE, réglage coché. Réduire la profondeur demande
+/// de décoder, donc de pré-transcoder. #6909 ne l'avait branché que sur le
+/// bras DASH.
+///
 /// Fonction pure : la matrice de décision se teste sans orchestrateur, comme
 /// `use_file_transcode_for`.
 pub(super) fn streaming_needs_pretranscode(
     renderer_supports_mime: bool,
     dsp_active: bool,
     plafond_de_zone: bool,
+    plafond_16_bits: bool,
 ) -> bool {
-    !renderer_supports_mime || dsp_active || plafond_de_zone
+    !renderer_supports_mime || dsp_active || plafond_de_zone || plafond_16_bits
 }
 
 /// Le plafond de fréquence de la zone appliqué à un flux de SERVICE (Qobuz,

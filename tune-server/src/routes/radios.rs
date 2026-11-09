@@ -2803,7 +2803,7 @@ async fn list_radio_favorites(
     let rows = state
         .backend
         .query_many(
-            "SELECT id, title, artist, station_name, cover_url, stream_url, saved_at FROM radio_favorites ORDER BY saved_at DESC LIMIT ? OFFSET ?",
+            "SELECT id, title, artist, station_name, cover_url, stream_url, saved_at FROM radio_favorites ORDER BY saved_at DESC, id DESC LIMIT ? OFFSET ?",
             &[&limit as &dyn ToSqlValue, &offset as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
@@ -3032,7 +3032,7 @@ async fn create_playlist_from_favorites(
     let favorites: Vec<(String, String)> = state
         .backend
         .query_many(
-            "SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC",
+            "SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC, id DESC",
             &[],
         )
         .ou_defaut_journalise()
@@ -3505,7 +3505,7 @@ async fn apercu_appariement_favoris(
     let favoris: Vec<(i64, String, String, String, Option<String>)> = state
         .backend
         .query_many(
-            "SELECT id, title, artist, station_name, cover_url FROM radio_favorites ORDER BY saved_at DESC LIMIT ?",
+            "SELECT id, title, artist, station_name, cover_url FROM radio_favorites ORDER BY saved_at DESC, id DESC LIMIT ?",
             &[&limit_sql as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?
