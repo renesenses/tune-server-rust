@@ -469,7 +469,9 @@ pub(crate) async fn enregistrer_client_id_spotify(
     body: &serde_json::Value,
     env_impose: Option<&str>,
 ) -> serde_json::Value {
-    use tune_core::streaming::spotify::{SpotifyService, client_id_configure};
+    use tune_core::streaming::spotify::{
+        SpotifyService, client_id_configure, client_id_depuis_saisie,
+    };
     let tr = |k: &str| crate::i18n::t(lang, k);
     let client_id = body
         .get("client_id")
@@ -486,13 +488,19 @@ pub(crate) async fn enregistrer_client_id_spotify(
             "validation_message": tr("svctok.spotify.clientIdEnv"),
         });
     }
-    if !client_id_configure(client_id) || !client_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+    // #8198 — exactement 32 caracteres hexadecimaux, ou l'adresse du tableau
+    // de bord Spotify d'ou on le tire (en le disant).
+    let Some((client_id, extrait)) =
+        client_id_depuis_saisie(client_id).filter(|(id, _)| client_id_configure(id))
+    else {
         return json!({
             "valid": false,
             "etat": "refuse",
+            "code": "spotify_client_id_invalide",
             "validation_message": tr("svctok.spotify.clientIdInvalid"),
         });
-    }
+    };
+    let client_id = client_id.as_str();
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Err(e) = settings.set("spotify_client_id", client_id) {
@@ -526,12 +534,17 @@ pub(crate) async fn enregistrer_client_id_spotify(
                 .replace("{error}", "service Spotify absent de ce serveur"),
         });
     }
-    tracing::info!("spotify_client_id_enregistre");
+    tracing::info!(extrait, "spotify_client_id_enregistre");
     json!({
         "valid": true,
         "etat": "enregistre",
         "spotify_client_id_configure": true,
-        "validation_message": tr("svctok.spotify.clientIdSaved"),
+        "client_id_extrait": extrait,
+        "validation_message": if extrait {
+            tr("svctok.spotify.clientIdExtracted")
+        } else {
+            tr("svctok.spotify.clientIdSaved")
+        },
     })
 }
 
@@ -1004,6 +1017,10 @@ mod tests_arl_deezer_i5427;
 #[cfg(test)]
 #[path = "service_tokens_client_id_spotify_fil221_tests.rs"]
 mod tests_client_id_spotify_fil221;
+
+#[cfg(test)]
+#[path = "service_tokens_client_id_saisie_8198_tests.rs"]
+mod tests_client_id_saisie_8198;
 
 #[cfg(test)]
 #[path = "service_tokens_effacer_client_id_6777_tests.rs"]

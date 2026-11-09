@@ -373,6 +373,28 @@ pub fn ressemble_a_un_client_id(texte: &str) -> bool {
     t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// #8198 — le Client ID tire de ce que l'utilisateur a colle.
+///
+/// Vu en direct avec un testeur : Spotify repondait `INVALID_CLIENT: Invalid
+/// client` parce que le champ contenait l'adresse du tableau de bord, pas le
+/// Client ID. Rend `Some((client_id, extrait))` :
+/// * 32 caracteres hexadecimaux (espaces autour toleres) : `extrait = false` ;
+/// * une adresse `developer.spotify.com/dashboard/<id>` (avec ou sans schema,
+///   avec ou sans suite) dont `<id>` a cette forme : `extrait = true`.
+///
+/// `None` pour tout le reste.
+pub fn client_id_depuis_saisie(saisie: &str) -> Option<(String, bool)> {
+    let t = saisie.trim();
+    if ressemble_a_un_client_id(t) {
+        return Some((t.to_owned(), false));
+    }
+    let bas = t.to_ascii_lowercase();
+    let debut =
+        bas.find("developer.spotify.com/dashboard/")? + "developer.spotify.com/dashboard/".len();
+    let id = t[debut..].split(['/', '?', '#']).next().unwrap_or("");
+    ressemble_a_un_client_id(id).then(|| (id.to_owned(), true))
+}
+
 /// Le Client ID que le service doit employer — fil 221.
 ///
 /// Ordre de priorite, du plus fort au plus faible :
