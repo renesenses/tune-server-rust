@@ -4746,7 +4746,25 @@ async fn seek(
         .seek(zone_id, position_ms, device_id.as_deref())
         .await
     {
-        Ok(()) => Json(json!({ "position_ms": position_ms })).into_response(),
+        Ok(()) => {
+            // #7759 — le déplacement de la meneuse d'un groupe vaut pour ses
+            // suiveuses. Détaché : recréer un flux local prend une à trois
+            // secondes par zone, la réponse n'attend pas les suiveuses.
+            // Numérotée ICI, dans l'ordre d'arrivée : seul le relais de la
+            // dernière demande s'applique (relecture de #8254).
+            let demande = state.deplacements_de_groupe.nouvelle_demande(zone_id);
+            let s = state.clone();
+            tokio::spawn(async move {
+                crate::routes::zones::relais_de_groupe_6155::deplacer_les_suiveuses(
+                    &s,
+                    zone_id,
+                    position_ms,
+                    demande,
+                )
+                .await;
+            });
+            Json(json!({ "position_ms": position_ms })).into_response()
+        }
         Err(error) => {
             state.orchestrator.dire_deplacement_refuse(zone_id, &error);
             output_command_error_response(error)
