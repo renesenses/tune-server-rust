@@ -2677,6 +2677,26 @@ impl PlaybackOrchestrator {
             }
             return;
         }
+        // #7972 — même contrat pour une zone AirPlay 2 rétablie à la position
+        // après une pause : le flux décodé commence à `position_ms`
+        // ([`airplay2_relance_a_la_position`]) et le démon compte depuis le
+        // début de son fichier. Sa sortie ne sait pas chercher : on lui dit
+        // seulement où ce flux commence.
+        if output_type == Some(TYPE_SORTIE_AIRPLAY2)
+            && !session_is_range_seekable
+            && position_ms > 0
+        {
+            if let Some(output) = { self.outputs.lock().await.get(did) } {
+                let sortie = output.lock().await;
+                if let Some(airplay2) = sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::airplay2::Airplay2Output>()
+                {
+                    airplay2.noter_le_depart_du_flux(position_ms);
+                }
+            }
+            return;
+        }
         if !replay_needs_output_seek(
             is_network_output_type(output_type),
             session_is_range_seekable,
