@@ -56,8 +56,14 @@ fn sans_lignes_balises(engine: tune_core::db::engine::Engine) -> &'static str {
     }
 }
 
-/// `item` porte déjà le crédit (piste, rôle, nom sans casse) : même
-/// instrument, ou l'un des deux n'en précise pas.
+/// #8026 — la clé de comparaison d'un nom de crédit : sans casse ni accents.
+/// « Günter Hermanns » balisé « gunter hermanns » est le même crédit.
+fn nom_replie(nom: &str) -> String {
+    tune_core::db::engine::fold_diacritics(nom.trim()).to_lowercase()
+}
+
+/// `item` porte déjà le crédit (piste, rôle, nom sans casse ni accents) :
+/// même instrument, ou l'un des deux n'en précise pas.
 fn meme_credit(
     item: &Value,
     track_id: i64,
@@ -69,71 +75,83 @@ fn meme_credit(
         && item["role"].as_str() == Some(role)
         && item["artist_name"]
             .as_str()
-            .is_some_and(|n| n.trim().to_lowercase() == nom.trim().to_lowercase())
+            .is_some_and(|n| nom_replie(n) == nom_replie(nom))
         && match (item["instrument"].as_str(), instrument) {
-            (Some(deja), Some(nouveau)) => {
-                deja.trim().to_lowercase() == nouveau.trim().to_lowercase()
-            }
+            (Some(deja), Some(nouveau)) => nom_replie(deja) == nom_replie(nouveau),
             // Une ligne structurée sans instrument peut être
             // précisée par la première balise correspondante.
             (None, _) | (Some(_), None) => true,
         }
 }
 
-/// #7766 — une ligne `balises` de `track_credits` ne s'affiche pas quand une
-/// autre source (MusicBrainz, Roon, Discogs, manuel…) porte déjà le même
-/// crédit : elle peut seulement compléter son instrument. C'est la règle de
-/// [`ajouter_credits_des_balises`], appliquée aux lignes que le scan écrit
-/// désormais dans la table. Sans elle, « Bill Evans, piano » de MusicBrainz
-/// et la balise « Bill Evans (piano) » donnaient deux entrées.
+/// #8026 — le rang d'une source de crédit, du plus sûr au moins sûr : la
+/// priorité décidée, manuel, MusicBrainz, fichier (`balises`), Discogs, Roon,
+/// puis Qobuz (#8077 : le local prime). Une ligne ancienne de source inconnue
+/// (NULL, d'avant la migration 102) vient de MusicBrainz ou de Roon : elle
+/// garde le rang qu'elle avait face aux balises, celui de MusicBrainz.
+fn rang_de_la_source(source: Option<&str>) -> u8 {
+    use tune_core::metadata::source_des_credits::{
+        BALISES, DISCOGS, MANUEL, MUSICBRAINZ, QOBUZ, ROON,
+    };
+    match source {
+        Some(MANUEL) => 0,
+        Some(MUSICBRAINZ) | None => 1,
+        Some(BALISES) => 2,
+        Some(DISCOGS) => 3,
+        Some(ROON) => 4,
+        Some(QOBUZ) => 6,
+        // Une source que cette lecture ne connaît pas encore : après les
+        // sources décidées, avant la reprise d'un service.
+        Some(_) => 5,
+    }
+}
+
+/// La lecture UNIQUE des crédits venus de plusieurs sources (#7766, #8077,
+/// #8026), pour la piste, l'album et la page artiste.
+///
+/// Un même crédit (piste, rôle, nom sans casse ni accents, instrument
+/// compatible) porté par deux sources ne s'affiche qu'une fois : la ligne de
+/// la source de meilleur rang ([`rang_de_la_source`]) reste. Elle reçoit de
+/// la ligne écartée l'instrument et la fiche qui lui manquent (« Bill Evans »
+/// de MusicBrainz et la balise « Bill Evans (piano) » donnent « Bill Evans,
+/// piano »). Deux lignes d'une même source ne sont jamais fusionnées.
 ///
 /// Les lignes doivent porter leur `source` ; le champ est retiré ensuite, la
-/// réponse garde sa forme. L'ordre des lignes restantes est conservé.
+/// réponse garde sa forme, sauf pour une ligne Qobuz (#8077). L'ordre des
+/// lignes restantes est conservé.
 fn fusionner_les_lignes_balises(items: &mut Vec<Value>) {
-    use tune_core::metadata::source_des_credits::{BALISES, QOBUZ};
-    // #8077 — une ligne reprise de Qobuz ne s'affiche pas quand une autre
-    // source (balises comprises) porte le même crédit : le local prime.
-    let est_qobuz = |item: &Value| item["source"].as_str() == Some(QOBUZ);
-    let doublons_qobuz: Vec<bool> = items
-        .iter()
-        .map(|q| {
-            est_qobuz(q)
-                && match (
-                    q["track_id"].as_i64(),
-                    q["role"].as_str(),
-                    q["artist_name"].as_str(),
-                ) {
-                    (Some(t), Some(r), Some(n)) => items.iter().any(|j| {
-                        !est_qobuz(j) && meme_credit(j, t, r, n, q["instrument"].as_str())
-                    }),
-                    _ => false,
-                }
-        })
-        .collect();
-    let mut doublons_qobuz = doublons_qobuz.into_iter();
-    items.retain(|_| !doublons_qobuz.next().unwrap_or(false));
-    let est_balise = |item: &Value| item["source"].as_str() == Some(BALISES);
+    use tune_core::metadata::source_des_credits::QOBUZ;
+    let source = |item: &Value| item["source"].as_str().map(str::to_owned);
+    // Les lignes par rang croissant ; à rang égal, dans l'ordre de la réponse.
+    let mut ordre: Vec<usize> = (0..items.len()).collect();
+    ordre.sort_by_key(|&i| rang_de_la_source(items[i]["source"].as_str()));
+    let mut gardees: Vec<usize> = Vec::with_capacity(items.len());
     let mut retirees = vec![false; items.len()];
-    for i in 0..items.len() {
-        if !est_balise(&items[i]) {
-            continue;
-        }
+    for i in ordre {
         let (Some(track_id), Some(role), Some(nom)) = (
             items[i]["track_id"].as_i64(),
             items[i]["role"].as_str().map(str::to_owned),
             items[i]["artist_name"].as_str().map(str::to_owned),
         ) else {
+            gardees.push(i);
             continue;
         };
         let instrument = items[i]["instrument"].as_str().map(str::to_owned);
-        let Some(j) = (0..items.len()).find(|&j| {
-            !est_balise(&items[j])
+        let source_i = source(&items[i]);
+        let Some(&j) = gardees.iter().find(|&&j| {
+            source(&items[j]) != source_i
                 && meme_credit(&items[j], track_id, &role, &nom, instrument.as_deref())
         }) else {
+            gardees.push(i);
             continue;
         };
-        if items[j]["instrument"].is_null() && instrument.is_some() {
+        // Une reprise de Qobuz ne complète rien : le local prime (#8077).
+        let complete = source_i.as_deref() != Some(QOBUZ);
+        if complete && items[j]["instrument"].is_null() && instrument.is_some() {
             items[j]["instrument"] = json!(instrument);
+        }
+        if complete && items[j]["artist_id"].is_null() && !items[i]["artist_id"].is_null() {
+            items[j]["artist_id"] = items[i]["artist_id"].clone();
         }
         retirees[i] = true;
     }
@@ -1735,6 +1753,100 @@ mod tests_balises_5160 {
             resume(&artiste),
             vec!["Bill Evans|performer|piano".to_string()],
             "#7766 — crédit doublé sur la page artiste : {artiste}"
+        );
+    }
+
+    /// #8026 — TÉMOIN ROUGE avant le correctif. Un même crédit venu de deux
+    /// sources ne s'affiche qu'une fois, avec la priorité décidée : manuel,
+    /// MusicBrainz, fichier, Discogs, Roon. Les noms se comparent sans casse
+    /// NI accents. Avant, une ligne `balises` cédait à TOUTE autre source
+    /// (Roon et Discogs compris), deux sources structurées se doublaient, et
+    /// « Bill Évans » ne rejoignait pas « Bill Evans ».
+    #[tokio::test]
+    async fn un_credit_de_plusieurs_sources_suit_la_priorite_decidee_8026() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (61, 'Bill Evans');
+                 INSERT INTO albums (id, title, artist_id) VALUES (62, 'Intermodulation', 61);
+                 INSERT INTO tracks (id, title, file_path, album_id, track_number, disc_number)
+                    VALUES (63, 'I''ve Got You Under My Skin', '/musique/63.flac', 62, 1, 1);
+                 INSERT INTO track_credits (track_id, artist_id, artist_name, role, position, source)
+                    VALUES (63, 61, 'Bill Evans', 'performer', 0, 'roon');
+                 INSERT INTO track_credits (track_id, artist_name, role, instrument, position, source)
+                    VALUES (63, 'Bill Évans', 'performer', 'piano', 0, 'balises');
+                 INSERT INTO track_credits (track_id, artist_name, role, instrument, position, source)
+                    VALUES (63, 'Jim Hall', 'performer', 'electric guitar', 1, 'discogs');
+                 INSERT INTO track_credits (track_id, artist_name, role, instrument, position, source)
+                    VALUES (63, 'jim hall', 'performer', 'guitar', 1, 'balises');
+                 INSERT INTO track_credits (track_id, artist_name, role, position, source)
+                    VALUES (63, 'Cole Porter', 'composer', 2, 'manuel');
+                 INSERT INTO track_credits (track_id, artist_name, role, position, source)
+                    VALUES (63, 'cole porter', 'composer', 2, 'musicbrainz');
+                 INSERT INTO track_credits (track_id, artist_name, role, position, source)
+                    VALUES (63, 'Creed Taylor', 'producer', 3, 'roon');
+                 INSERT INTO track_credits (track_id, artist_name, role, position, source)
+                    VALUES (63, 'Creed Taylor', 'producer', 3, 'discogs');",
+            )
+            .unwrap();
+        let resume = |credits: &Value| -> Vec<String> {
+            let mut v: Vec<String> = credits
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}|{}|{}|{}",
+                        c["artist_name"].as_str().unwrap_or_default(),
+                        c["role"].as_str().unwrap_or_default(),
+                        c["instrument"].as_str().unwrap_or("-"),
+                        c["artist_id"]
+                            .as_i64()
+                            .map_or("-".into(), |i| i.to_string()),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let Json(piste) = track_credits(State(state.clone()), Path(63))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits de piste"));
+        assert_eq!(
+            resume(&piste),
+            vec![
+                // Le fichier passe devant Roon, et garde la fiche de Roon.
+                "Bill Évans|performer|piano|61".to_string(),
+                // Le manuel passe devant MusicBrainz.
+                "Cole Porter|composer|-|-".to_string(),
+                // Discogs passe devant Roon.
+                "Creed Taylor|producer|-|-".to_string(),
+                // Deux instruments différents : deux crédits.
+                "Jim Hall|performer|electric guitar|-".to_string(),
+                "jim hall|performer|guitar|-".to_string(),
+            ],
+            "#8026 — priorité des sources ou comparaison sans accents : {piste}"
+        );
+        let Json(album) = album_credits(State(state.clone()), Path(62))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits d'album"));
+        assert_eq!(album.as_array().unwrap().len(), 5, "{album}");
+        // La page artiste : une fois la ligne `balises` rattachée à sa fiche
+        // par le nom replié (passe de démarrage), elle y prime sur Roon.
+        let rattachees =
+            tune_core::metadata::rattrapage_credits_balises_8026::rattacher_les_fiches(
+                &state.backend,
+            )
+            .unwrap();
+        assert_eq!(rattachees, 1, "seule « Bill Évans » a une fiche");
+        let Json(artiste) = artist_credits(State(state), Path(61))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits d'artiste"));
+        assert_eq!(
+            resume(&artiste),
+            vec!["Bill Évans|performer|piano|61".to_string()],
+            "#8026 — page artiste : {artiste}"
         );
     }
 
