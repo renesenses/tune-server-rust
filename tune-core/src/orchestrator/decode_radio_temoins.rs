@@ -656,22 +656,12 @@ fn l_echantillon_he_aac_fabrique_se_decode_a_48_khz_avec_ses_aigus() {
     assert!(part > 1e-3, "le SBR doit reconstruire des aigus : {part:e}");
 }
 
-/// #6357 — LE TÉMOIN DU BRANCHEMENT. Un faux direct HLS sur 127.0.0.1
-/// (liste maîtresse `mp4a.40.5`, liste média, segments MPEG-TS de HE-AAC à
-/// SBR implicite, comme la BBC hors Royaume-Uni) passe par le décodeur de
-/// PRODUCTION, `decode_radio_stream_to_pcm`, jusqu'au PCM :
-///
-/// * le format publié est 48 kHz stéréo — la sortie du SBR — et non les
-///   24 kHz que l'en-tête ADTS annonce (le piège de l'étude §4.4 : un WAV à
-///   24 kHz sur du PCM à 48 kHz jouerait à demi-vitesse) ;
-/// * le PCM servi porte des aigus au-dessus de 12 kHz ;
-/// * la source publiée dit HLS, HE-AAC, et son débit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn une_station_hls_he_aac_est_decodee_jusqu_au_pcm_a_48_khz() {
-    use crate::http::streamer::{AudioStreamer, StreamInfo};
+/// Un faux direct HLS « BBC » sur 127.0.0.1 : la liste maîtresse donnée, la
+/// liste média `audio=96000.m3u8` (trois segments de 2 s de HE-AAC à SBR
+/// implicite, puis un direct immobile) et, comme la BBC hors Royaume-Uni, une
+/// variante `audio=320000.m3u8` qui répond 403 (#7802).
+fn direct_hls_he_aac(maitresse: &'static [u8]) -> crate::radio_hls::fabrique_tests::ServeurHls {
     use crate::radio_hls::fabrique_tests as fab;
-
-    // Trois segments de 2 s, puis un direct immobile.
     let adts = fab::trames_he_aac(6.0);
     let mut trames = Vec::new();
     let mut i = 0;
@@ -687,18 +677,17 @@ async fn une_station_hls_he_aac_est_decodee_jusqu_au_pcm_a_48_khz() {
         .enumerate()
         .map(|(n, t)| fab::segment_ts(&t.concat(), (n * 7 % 16) as u8, true))
         .collect();
-    let routeur: Arc<fab::Routeur> = Arc::new(move |chemin: &str, _rang: usize| {
-        match chemin {
-        "/bbc/master.m3u8" => fab::ok(
-            fab::TYPE_LISTE,
-            b"#EXTM3U\n#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=101760,CODECS=\"mp4a.40.5\"\naudio=96000.m3u8\n".to_vec(),
-        ),
+    let routeur: Arc<fab::Routeur> = Arc::new(move |chemin: &str, _rang: usize| match chemin {
+        "/bbc/master.m3u8" => fab::ok(fab::TYPE_LISTE, maitresse.to_vec()),
+        "/bbc/audio=320000.m3u8" => (403, "text/plain", b"geo".to_vec()),
         "/bbc/audio=96000.m3u8" => fab::ok(
             fab::TYPE_LISTE,
             fab::liste_media(
                 2,
                 500,
-                &(0..3).map(|n| (format!("s-{}.ts", 500 + n), String::new(), false)).collect::<Vec<_>>(),
+                &(0..3)
+                    .map(|n| (format!("s-{}.ts", 500 + n), String::new(), false))
+                    .collect::<Vec<_>>(),
                 false,
             ),
         ),
@@ -710,9 +699,27 @@ async fn une_station_hls_he_aac_est_decodee_jusqu_au_pcm_a_48_khz() {
             Some(n) if (500..503).contains(&n) => fab::ok(fab::TYPE_TS, segments[n - 500].clone()),
             _ => fab::introuvable(),
         },
-    }
     });
-    let serveur = fab::ServeurHls::lancer(routeur);
+    fab::ServeurHls::lancer(routeur)
+}
+
+/// #6357 — LE TÉMOIN DU BRANCHEMENT. Un faux direct HLS sur 127.0.0.1
+/// (liste maîtresse `mp4a.40.5`, liste média, segments MPEG-TS de HE-AAC à
+/// SBR implicite, comme la BBC hors Royaume-Uni) passe par le décodeur de
+/// PRODUCTION, `decode_radio_stream_to_pcm`, jusqu'au PCM :
+///
+/// * le format publié est 48 kHz stéréo — la sortie du SBR — et non les
+///   24 kHz que l'en-tête ADTS annonce (le piège de l'étude §4.4 : un WAV à
+///   24 kHz sur du PCM à 48 kHz jouerait à demi-vitesse) ;
+/// * le PCM servi porte des aigus au-dessus de 12 kHz ;
+/// * la source publiée dit HLS, HE-AAC, et son débit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_station_hls_he_aac_est_decodee_jusqu_au_pcm_a_48_khz() {
+    use crate::http::streamer::{AudioStreamer, StreamInfo};
+
+    let serveur = direct_hls_he_aac(
+        b"#EXTM3U\n#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=101760,CODECS=\"mp4a.40.5\"\naudio=96000.m3u8\n",
+    );
     let url = format!("{}/bbc/master.m3u8", serveur.base);
 
     let streamer = Arc::new(AudioStreamer::new(0));
@@ -767,6 +774,78 @@ async fn une_station_hls_he_aac_est_decodee_jusqu_au_pcm_a_48_khz() {
     assert!(
         part > 1e-3,
         "le PCM servi doit porter les aigus reconstruits par le SBR : {part:e}"
+    );
+
+    drop(rx);
+    let verdict = tokio::time::timeout(Duration::from_secs(15), decodeur)
+        .await
+        .expect("le décodeur doit rendre la main après le départ du consommateur")
+        .expect("la tâche de décodage ne doit pas paniquer");
+    assert_eq!(verdict, Ok(()));
+}
+
+/// #7802 — LE TÉMOIN DU BRANCHEMENT du repli. La liste maîtresse offre une
+/// variante 320 kbit/s que le diffuseur refuse (403, comme la BBC hors
+/// Royaume-Uni) et une variante 96 : le décodeur de PRODUCTION joue la 96 et
+/// PUBLIE, dans la source radio de la session, la bande déclarée de la
+/// variante jouée et la qualité refusée avec son statut — ce que le chemin
+/// du signal montre à l'auditeur. Aucun contournement : la 320 n'est demandée
+/// qu'une fois.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_repli_hls_vers_une_variante_plus_basse_est_publie_7802() {
+    use crate::http::streamer::{AudioStreamer, StreamInfo, VarianteRefusee};
+
+    let serveur = direct_hls_he_aac(
+        b"#EXTM3U\n\
+#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=339200,CODECS=\"mp4a.40.2\"\naudio=320000.m3u8\n\
+#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=101760,CODECS=\"mp4a.40.5\"\naudio=96000.m3u8\n",
+    );
+    let url = format!("{}/bbc/master.m3u8", serveur.base);
+
+    let streamer = Arc::new(AudioStreamer::new(0));
+    let info = StreamInfo {
+        format: "wav".to_string(),
+        mime_type: "audio/wav".to_string(),
+        ..StreamInfo::default()
+    };
+    let (id, _tx_session, _ready, session) = streamer.create_radio_session(info, 4).await;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let data_ready = Arc::new(tokio::sync::Notify::new());
+    let (session_d, ready_d) = (session.clone(), data_ready.clone());
+    let decodeur = tokio::task::spawn_blocking(move || {
+        decode_radio_stream_to_pcm(url, tx, ready_d, session_d, None, None, false, None)
+    });
+
+    tokio::time::timeout(Duration::from_secs(15), data_ready.notified())
+        .await
+        .expect("le premier morceau doit réveiller le consommateur en moins de 15 s");
+    let source = streamer
+        .stream_output_wire(&id)
+        .await
+        .and_then(|w| w.radio_source)
+        .expect("la source radio est publiée");
+    assert_eq!(source.transport, Some("hls"));
+    assert_eq!(
+        source.variante_refusee,
+        Some(VarianteRefusee {
+            bande_kbps: 339,
+            statut: 403
+        }),
+        "la qualité refusée par le diffuseur est publiée avec son statut : {source:?}"
+    );
+    assert_eq!(
+        source.bitrate_kbps,
+        Some(101),
+        "la bande déclarée de la variante jouée est publiée : {source:?}"
+    );
+    assert!(
+        source.debit_kbps.is_some_and(|k| k > 0),
+        "le débit mesuré reste publié : {source:?}"
+    );
+    assert_eq!(
+        serveur.demandes("/bbc/audio=320000.m3u8"),
+        1,
+        "la variante refusée n'est demandée qu'une fois : aucun contournement"
     );
 
     drop(rx);
