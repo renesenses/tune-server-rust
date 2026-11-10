@@ -376,15 +376,15 @@ async fn sso_callback(
     // nouveau venu : exactement ce qu'elle est là pour empêcher.
     tune_core::cloud::proprietaire::adopter_le_compte_lie(&settings, &state.backend);
 
-    // Store cloud tokens in settings
-    settings
-        .set("mozaik_access_token", &token.access_token)
-        .ok();
-    // #8238 : une session neuve lève « reconnexion requise » et le recul.
-    tune_core::cloud::sso::oublier_le_refus_de_session(&settings);
-    if let Some(ref rt) = token.refresh_token {
-        settings.set("mozaik_refresh_token", rt).ok();
-    }
+    // Store cloud tokens in settings. #8238 : une session neuve lève
+    // « reconnexion requise » et le recul, sous le verrou des renouvellements
+    // — un renouvellement de l'ancien jeton encore en vol ne la reprend pas.
+    tune_core::cloud::sso::ouvrir_la_session(
+        &settings,
+        &token.access_token,
+        token.refresh_token.as_deref(),
+    )
+    .await;
     settings
         .set(
             "mozaik_user",

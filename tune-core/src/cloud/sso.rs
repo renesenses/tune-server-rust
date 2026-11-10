@@ -34,9 +34,14 @@ pub const DEFAULT_CLIENT_ID: &str = "tune-server";
 const USER_AGENT_SSO: &str = "Tune/2.0 (https://mozaiklabs.fr)";
 
 /// Réglage posé quand mozaiklabs.fr REFUSE le jeton de rafraîchissement
-/// (400 `invalid_grant`, 401 `invalid_client`) : la session du compte est
-/// finie, seule une nouvelle connexion la rouvre (#8238). Valeur : l'instant
-/// du refus (RFC 3339). Effacé par la connexion et par la déconnexion.
+/// (corps `{"error":"invalid_grant"}`, RFC 6749 §5.2) : la session du compte
+/// est finie, seule une nouvelle connexion la rouvre (#8238). Valeur :
+/// l'instant du refus (RFC 3339). Effacé par la connexion et la déconnexion.
+///
+/// ⛔ Seul `invalid_grant` le pose. Un 400 sans corps OAuth (nginx, pare-feu)
+/// ou un 401 `invalid_client` (client OAuth absent quelques minutes pendant
+/// un déploiement du site) ne dit RIEN du jeton : le poser couperait tout le
+/// parc jusqu'à une reconnexion manuelle. Ceux-là passent par le recul.
 pub const CLE_RECONNEXION_REQUISE: &str = "mozaik_reconnexion_requise";
 
 /// Recul après un échec PASSAGER du renouvellement (réseau, 429, 5xx) :
@@ -72,6 +77,25 @@ pub fn reconnexion_requise(settings: &SettingsRepo) -> bool {
         .ok()
         .flatten()
         .is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Enregistre la session neuve d'une connexion SSO, SOUS le verrou des
+/// renouvellements (#8238) : un renouvellement parti avec l'ancien jeton de
+/// rafraîchissement finit d'abord (et d'écrire ce qu'il écrit), puis la
+/// session neuve le remplace et lève « reconnexion requise » et le recul.
+/// Sans le verrou, un 400 tardif de l'ancien jeton reposait l'état juste
+/// après la connexion, sur une session valide.
+pub async fn ouvrir_la_session(
+    settings: &SettingsRepo,
+    jeton_acces: &str,
+    jeton_rafraichissement: Option<&str>,
+) {
+    let _tour = VERROU_RENOUVELLEMENT.lock().await;
+    settings.set("mozaik_access_token", jeton_acces).ok();
+    oublier_le_refus_de_session(settings);
+    if let Some(rt) = jeton_rafraichissement {
+        settings.set("mozaik_refresh_token", rt).ok();
+    }
 }
 
 /// Nouvelle session ouverte (connexion SSO) ou session fermée
@@ -113,9 +137,13 @@ pub fn client_id_du_compte(settings: &SettingsRepo) -> String {
 /// - `jeton_refuse` : le jeton d'accès que l'appelant vient de se voir
 ///   refuser. Si le jeton stocké a changé entre-temps, une autre tâche a déjà
 ///   renouvelé : il est rendu tel quel, sans appel au site ;
-/// - un refus 400/401 du site pose [`CLE_RECONNEXION_REQUISE`] : plus aucun
-///   appel à `/oauth/token` avant une nouvelle connexion ;
-/// - un échec passager (réseau, 429, 5xx) arme un recul croissant.
+/// - un refus `invalid_grant` du site pose [`CLE_RECONNEXION_REQUISE`] : plus
+///   aucun appel à `/oauth/token` avant une nouvelle connexion ;
+/// - tout autre échec (réseau, autre 4xx, 429, 5xx, corps illisible) arme un
+///   recul croissant ;
+/// - rien n'est écrit si `mozaik_refresh_token` ne vaut plus le jeton envoyé :
+///   une connexion ou une déconnexion est passée pendant l'appel, et le
+///   résultat de l'ancien jeton ne la concerne pas.
 pub async fn renouveler_la_session(settings: &SettingsRepo, jeton_refuse: &str) -> Option<String> {
     let _tour = VERROU_RENOUVELLEMENT.lock().await;
 
@@ -147,7 +175,16 @@ pub async fn renouveler_la_session(settings: &SettingsRepo, jeton_refuse: &str) 
     let base = lire("mozaik_base_url");
     let auth = MozaikAuth::new(client_id_du_compte(settings), base.as_deref());
 
-    match auth.renouveler(&rt).await {
+    let resultat = auth.renouveler(&rt).await;
+
+    // La session a changé pendant l'appel (connexion, déconnexion) : le
+    // verdict de l'ancien jeton ne s'applique pas à la nouvelle.
+    if lire("mozaik_refresh_token").as_deref() != Some(rt.as_str()) {
+        debug!("sso_renouvellement_perime : la session a change pendant l'appel");
+        return lire("mozaik_access_token");
+    }
+
+    match resultat {
         Ok(tok) => {
             settings.set("mozaik_access_token", &tok.access_token).ok();
             if let Some(n) = tok.refresh_token.as_deref().filter(|s| !s.is_empty()) {
@@ -157,18 +194,17 @@ pub async fn renouveler_la_session(settings: &SettingsRepo, jeton_refuse: &str) 
             info!("sso_session_renouvelee");
             Some(tok.access_token)
         }
-        Err(Some(statut @ (400 | 401))) => {
+        Err(EchecRenouvellement::JetonRefuse) => {
             settings
                 .set(CLE_RECONNEXION_REQUISE, &chrono::Utc::now().to_rfc3339())
                 .ok();
             warn!(
-                statut,
-                "sso_reconnexion_requise : mozaiklabs.fr refuse le renouvellement, \
-                 reconnecter le compte"
+                "sso_reconnexion_requise : mozaiklabs.fr refuse le renouvellement \
+                 (invalid_grant), reconnecter le compte"
             );
             None
         }
-        Err(statut) => {
+        Err(EchecRenouvellement::Passager(statut)) => {
             let echecs = lire_recul(settings)
                 .map(|(_, n)| n)
                 .unwrap_or(0)
@@ -187,6 +223,24 @@ pub async fn renouveler_la_session(settings: &SettingsRepo, jeton_refuse: &str) 
             None
         }
     }
+}
+
+/// Échec d'un appel `grant_type=refresh_token` à `/oauth/token`.
+#[derive(Debug, PartialEq, Eq)]
+enum EchecRenouvellement {
+    /// Le site dit `{"error":"invalid_grant"}` : ce jeton est mort.
+    JetonRefuse,
+    /// Tout le reste — réseau, 429, 5xx, autre 4xx, corps illisible. Le
+    /// statut HTTP quand il y en a un.
+    Passager(Option<u16>),
+}
+
+/// Le corps d'un refus OAuth porte-t-il `"error":"invalid_grant"` ?
+fn est_invalid_grant(corps: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(corps)
+        .ok()
+        .and_then(|v| v.get("error")?.as_str().map(|e| e == "invalid_grant"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -449,14 +503,17 @@ impl MozaikAuth {
     /// concurrents avec le même jeton déconnectent le serveur pour de bon.
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenResponse, String> {
         self.renouveler(refresh_token).await.map_err(|e| match e {
-            Some(statut) => format!("oauth refresh failed: {statut}"),
-            None => "oauth refresh request failed".to_string(),
+            EchecRenouvellement::JetonRefuse => "oauth refresh failed: invalid_grant".to_string(),
+            EchecRenouvellement::Passager(Some(statut)) => {
+                format!("oauth refresh failed: {statut}")
+            }
+            EchecRenouvellement::Passager(None) => "oauth refresh request failed".to_string(),
         })
     }
 
-    /// [`Self::refresh_token`], avec le statut HTTP du refus (`None` : pas de
-    /// réponse exploitable — réseau, corps illisible).
-    async fn renouveler(&self, refresh_token: &str) -> Result<TokenResponse, Option<u16>> {
+    /// [`Self::refresh_token`], avec la nature du refus : seul un corps
+    /// `invalid_grant` condamne le jeton.
+    async fn renouveler(&self, refresh_token: &str) -> Result<TokenResponse, EchecRenouvellement> {
         let url = format!("{}/oauth/token", self.base_url);
         let client = crate::http::client::shared();
 
@@ -474,18 +531,22 @@ impl MozaikAuth {
             .await
             .map_err(|e| {
                 debug!(error = %e.without_url(), "oauth_refresh_unreachable");
-                None
+                EchecRenouvellement::Passager(None)
             })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
+            let corps = resp.bytes().await.unwrap_or_default();
             debug!(status = %status, "oauth_refresh_failed");
-            return Err(Some(status.as_u16()));
+            if status.is_client_error() && est_invalid_grant(&corps) {
+                return Err(EchecRenouvellement::JetonRefuse);
+            }
+            return Err(EchecRenouvellement::Passager(Some(status.as_u16())));
         }
 
         resp.json().await.map_err(|e| {
             debug!(error = %e, "oauth_refresh_unreadable");
-            None
+            EchecRenouvellement::Passager(None)
         })
     }
 
@@ -1028,7 +1089,7 @@ mod tests_renouvellement_8238 {
     /// comme le site. Compte les appels réellement reçus et note l'User-Agent.
     async fn banc(
         initial: &str,
-        statut_force: Option<u16>,
+        statut_force: Option<(u16, &'static str)>,
     ) -> (String, Arc<AtomicU64>, Arc<Mutex<Option<String>>>) {
         use axum::http::{HeaderMap, StatusCode};
         let site = Arc::new(Mutex::new(Site {
@@ -1051,8 +1112,8 @@ mod tests_renouvellement_8238 {
                             .map(str::to_string);
                         // Laisse aux appels concurrents le temps d'arriver.
                         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                        if let Some(code) = statut_force {
-                            return (StatusCode::from_u16(code).unwrap(), r#"{"error":"x"}"#.to_string());
+                        if let Some((code, corps)) = statut_force {
+                            return (StatusCode::from_u16(code).unwrap(), corps.to_string());
                         }
                         let rt = f.get("refresh_token").cloned().unwrap_or_default();
                         let mut s = site.lock().unwrap();
@@ -1144,7 +1205,7 @@ mod tests_renouvellement_8238 {
     #[tokio::test]
     async fn echec_passager_recule() {
         let s = settings();
-        let (adresse, appels, _) = banc("rt-0", Some(503)).await;
+        let (adresse, appels, _) = banc("rt-0", Some((503, ""))).await;
         connecte(&s, &adresse);
         assert_eq!(renouveler_la_session(&s, "at-0").await, None);
         assert_eq!(renouveler_la_session(&s, "at-0").await, None);
@@ -1153,5 +1214,77 @@ mod tests_renouvellement_8238 {
         let (jusqua, n) = lire_recul(&s).unwrap();
         assert_eq!(n, 1);
         assert!(jusqua >= maintenant_s() + RECUL_INITIAL_S - 1);
+    }
+
+    /// Seul `invalid_grant` condamne le jeton. Un 400 sans corps OAuth
+    /// (nginx, pare-feu) et un 401 `invalid_client` (déploiement du site en
+    /// cours) passent par le recul, sans « reconnexion requise ».
+    #[tokio::test]
+    async fn seul_invalid_grant_pose_reconnexion_requise() {
+        for (code, corps, refuse) in [
+            (
+                400,
+                r#"{"error":"invalid_grant","error_description":"x"}"#,
+                true,
+            ),
+            (401, r#"{"error":"invalid_grant"}"#, true),
+            (400, "", false),
+            (400, "<html><body>400 Bad Request</body></html>", false),
+            (401, r#"{"error":"invalid_client"}"#, false),
+            (403, r#"{"error":"invalid_grant"}"#, true),
+        ] {
+            let s = settings();
+            let (adresse, appels, _) = banc("rt-0", Some((code, corps))).await;
+            connecte(&s, &adresse);
+            assert_eq!(renouveler_la_session(&s, "at-0").await, None);
+            assert_eq!(appels.load(Ordering::SeqCst), 1);
+            assert_eq!(reconnexion_requise(&s), refuse, "{code} {corps}");
+            assert_eq!(lire_recul(&s).is_some(), !refuse, "{code} {corps}");
+        }
+    }
+
+    /// Course : un renouvellement parti avec l'ancien jeton revient en
+    /// `invalid_grant` APRÈS qu'une connexion a enregistré une session neuve
+    /// (écriture directe, comme le faisait `sso_callback`). L'état ne doit
+    /// pas être reposé sur la session neuve, ni ses jetons écrasés.
+    #[tokio::test]
+    async fn refus_tardif_de_l_ancien_jeton_ignore_apres_une_connexion() {
+        let db = base();
+        let s = SettingsRepo::with_backend(db.clone());
+        let (adresse, _, _) = banc("rt-0", Some((400, r#"{"error":"invalid_grant"}"#))).await;
+        connecte(&s, &adresse);
+        let s2 = SettingsRepo::with_backend(db.clone());
+        let vol = tokio::spawn(async move { renouveler_la_session(&s2, "at-0").await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        s.set("mozaik_access_token", "at-neuf").unwrap();
+        oublier_le_refus_de_session(&s);
+        s.set("mozaik_refresh_token", "rt-neuf").unwrap();
+        assert_eq!(vol.await.unwrap().as_deref(), Some("at-neuf"));
+        assert!(!reconnexion_requise(&s));
+        assert!(lire_recul(&s).is_none());
+        assert_eq!(
+            s.get("mozaik_refresh_token").unwrap().as_deref(),
+            Some("rt-neuf")
+        );
+    }
+
+    /// Même course par le vrai chemin de la connexion : `ouvrir_la_session`
+    /// attend la fin du renouvellement en vol, puis lève l'état.
+    #[tokio::test]
+    async fn ouvrir_la_session_attend_le_renouvellement_en_vol() {
+        let db = base();
+        let s = SettingsRepo::with_backend(db.clone());
+        let (adresse, _, _) = banc("rt-0", Some((400, r#"{"error":"invalid_grant"}"#))).await;
+        connecte(&s, &adresse);
+        let s2 = SettingsRepo::with_backend(db.clone());
+        let vol = tokio::spawn(async move { renouveler_la_session(&s2, "at-0").await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        ouvrir_la_session(&s, "at-neuf", Some("rt-neuf")).await;
+        vol.await.unwrap();
+        assert!(!reconnexion_requise(&s));
+        assert_eq!(
+            s.get("mozaik_access_token").unwrap().as_deref(),
+            Some("at-neuf")
+        );
     }
 }
