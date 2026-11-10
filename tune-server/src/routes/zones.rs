@@ -1708,6 +1708,9 @@ mod signal_path_gain_sortie_4384_tests;
 // #6166 — le WAV 32 bits interne d'une sortie locale n'est pas une conversion.
 #[cfg(test)]
 mod signal_path_conteneur_local_6166_tests;
+// #8149 — zone réseau : le suréchantillonnage ne s'applique pas, et le dit.
+#[cfg(test)]
+mod signal_path_surechantillonnage_reseau_8149_tests;
 // #6334 — un AAC Tidal servi en WAV se dit AAC, sans profondeur de bits.
 #[cfg(test)]
 mod signal_path_aac_tidal_6334_tests;
