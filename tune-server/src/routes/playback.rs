@@ -2496,6 +2496,11 @@ async fn lancer_la_lecture(
             &selected,
             orch_req.cover_url.as_deref(),
         );
+        // #8110 — même repli que le bouton de lecture de la fiche radio.
+        tune_core::orchestrator::retenir_les_replis_radio(
+            &selected,
+            super::radios::geofencing::replis_autorises(state, &selected),
+        );
         orch_req.source_id = Some(selected);
     }
     if reprise.is_some() {
