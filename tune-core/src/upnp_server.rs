@@ -42,6 +42,91 @@ pub(crate) use dossiers::{CleAlphabetique, cle_alphabetique};
 pub use dossiers::comparer_naturel;
 
 // ---------------------------------------------------------------------------
+// Annonce du serveur multimédia : réglage en base, variable en repli (#8374)
+// ---------------------------------------------------------------------------
+
+/// Variable d'environnement qui fixe la VALEUR PAR DÉFAUT de l'annonce du
+/// serveur multimédia (`true`/`1`/`yes` = annoncé, tout le reste = tu).
+///
+/// #8374 — elle était lue par `tune_core::config::TuneConfig::from_env`,
+/// que le serveur n'appelle jamais : la poser ne coupait rien. Elle ne
+/// vaut QUE lorsque la clé `upnp_enabled` est absente de la base ; posée
+/// depuis l'interface (POST /api/v1/upnp/config), la clé l'emporte.
+pub const VARIABLE_ANNONCE: &str = "TUNE_UPNP_SERVER_ENABLED";
+
+/// Variable d'environnement qui fixe le nom publié PAR DÉFAUT du serveur
+/// multimédia. Même règle : la clé `upnp_friendly_name` en base l'emporte.
+pub const VARIABLE_NOM: &str = "TUNE_UPNP_SERVER_NAME";
+
+/// Nom publié quand ni la base ni l'environnement n'en donnent un.
+pub const NOM_PAR_DEFAUT: &str = "Tune Server";
+
+/// L'annonce SSDP du serveur multimédia est-elle voulue ?
+///
+/// Clé `upnp_enabled` en base d'abord ; sinon `TUNE_UPNP_SERVER_ENABLED` ;
+/// sinon oui.
+pub fn annonce_voulue(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
+    annonce_voulue_avec(settings, std::env::var(VARIABLE_ANNONCE).ok().as_deref())
+}
+
+/// Même décision, la variable d'environnement passée en paramètre — c'est la
+/// forme que les épreuves exercent : `std::env::set_var` dans un test casse
+/// la suite entière.
+pub fn annonce_voulue_avec(
+    settings: &crate::db::settings_repo::SettingsRepo,
+    variable: Option<&str>,
+) -> bool {
+    annonce_voulue_selon(
+        settings.get("upnp_enabled").ok().flatten().as_deref(),
+        variable,
+    )
+}
+
+/// La règle pure : la clé en base l'emporte, la variable est le repli, et
+/// sans l'une ni l'autre le serveur s'annonce.
+pub fn annonce_voulue_selon(cle_en_base: Option<&str>, variable: Option<&str>) -> bool {
+    match cle_en_base.map(str::trim).filter(|v| !v.is_empty()) {
+        // Sémantique historique de la clé (POST /api/v1/upnp/config écrit
+        // `true` ou `false`) : seuls `false` et `0` coupent.
+        Some(v) => v != "false" && v != "0",
+        // Sémantique de `config::env_bool` : seuls `true`, `1` et `yes`
+        // allument ; une variable posée à autre chose coupe.
+        None => match variable.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) => matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"),
+            None => true,
+        },
+    }
+}
+
+/// Le nom publié du serveur multimédia.
+///
+/// Clé `upnp_friendly_name` en base d'abord ; sinon `TUNE_UPNP_SERVER_NAME` ;
+/// sinon « Tune Server ». Un nom vide ou blanc ne compte pas.
+pub fn nom_publie(settings: &crate::db::settings_repo::SettingsRepo) -> String {
+    nom_publie_avec(settings, std::env::var(VARIABLE_NOM).ok().as_deref())
+}
+
+/// Même décision, la variable d'environnement passée en paramètre.
+pub fn nom_publie_avec(
+    settings: &crate::db::settings_repo::SettingsRepo,
+    variable: Option<&str>,
+) -> String {
+    nom_publie_selon(
+        settings.get("upnp_friendly_name").ok().flatten().as_deref(),
+        variable,
+    )
+}
+
+/// La règle pure du nom : clé en base, puis variable, puis nom par défaut.
+pub fn nom_publie_selon(cle_en_base: Option<&str>, variable: Option<&str>) -> String {
+    cle_en_base
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| variable.filter(|v| !v.trim().is_empty()))
+        .map(str::to_string)
+        .unwrap_or_else(|| NOM_PAR_DEFAUT.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Shared state for UPnP routes
 // ---------------------------------------------------------------------------
 
@@ -231,13 +316,9 @@ impl UpnpState {
         };
         // Le nom publié suit le réglage `upnp_friendly_name` (POST
         // /api/v1/upnp/config) — il était écrit mais jamais lu, renommer le
-        // serveur depuis l'interface n'avait aucun effet.
-        let friendly_name = settings
-            .get("upnp_friendly_name")
-            .ok()
-            .flatten()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "Tune Server".into());
+        // serveur depuis l'interface n'avait aucun effet. Sans clé en base,
+        // `TUNE_UPNP_SERVER_NAME` donne le nom par défaut (#8374).
+        let friendly_name = nom_publie(&settings);
         Self {
             backend,
             server_port,
