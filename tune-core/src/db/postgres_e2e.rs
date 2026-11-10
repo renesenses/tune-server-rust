@@ -3734,6 +3734,8 @@ async fn pg_7619_revision_de_la_bibliotheque() {
         apres,
         "l'historique ne la change pas"
     );
+}
+
 /// web#916 — « Pas pour moi » sur le VRAI moteur PostgreSQL.
 ///
 /// Le témoin RETIRE la table et la ligne 110 de `schema_version`, puis rejoue
