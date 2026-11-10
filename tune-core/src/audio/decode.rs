@@ -40,6 +40,10 @@ use super::dsd_to_pcm::choose_output_rate;
 /// [`SESSION_IDLE_TIMEOUT`]: crate::http::streamer::SESSION_IDLE_TIMEOUT
 const SEND_TIMEOUT_SECS: u64 = crate::http::streamer::SESSION_IDLE_TIMEOUT.as_secs();
 
+// #8228 — décodage Opus pendant le téléchargement.
+#[path = "opus_en_croissance.rs"]
+mod opus_en_croissance;
+
 /// Round a preferred PCM batch size down to a whole number of interleaved frames.
 ///
 /// The streaming decode paths used to drain a fixed `32768` bytes. That length is
@@ -2391,6 +2395,33 @@ fn decode_to_pcm_streaming_inner(
             &rt,
             seek_s,
         );
+    }
+
+    // #8228 — Opus encore en téléchargement (YouTube vers une zone DLNA) :
+    // décodé au fil de l'eau au lieu d'attendre le fichier entier. Hors du
+    // contrat de ce chemin (autre cadence, seek), on attend la fin du
+    // téléchargement et le chemin intégral ci-dessous reprend, comme avant.
+    if ext == "opus"
+        && let Some(growth) = crate::audio::dash_growth::take_for(file_path)
+    {
+        if opus_en_croissance::cible_servie(target_sample_rate, target_channels, seek_s) {
+            let rt = tokio::runtime::Handle::try_current()
+                .map_err(|_| "no tokio runtime for streaming decode")?;
+            return opus_en_croissance::decoder_opus_en_croissance(
+                file_path,
+                growth,
+                target_channels,
+                target_bit_depth,
+                &tx,
+                chunk_size,
+                &data_ready,
+                &levels_tx,
+                &rt,
+            );
+        }
+        growth
+            .attendre_la_fin()
+            .map_err(|e| format!("opus download: {e}"))?;
     }
 
     // Opus (native .opus / Ogg-Opus, or Opus-in-WebM) has no symphonia codec —
