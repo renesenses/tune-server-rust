@@ -2210,6 +2210,8 @@ mod duree_du_flux_2062;
 #[cfg(test)]
 mod duree_du_flux_2062_tests;
 #[cfg(test)]
+mod prefetch_fiche_qobuz_m3u_8229_tests;
+#[cfg(test)]
 mod prefetch_wav_annonce_6990_tests;
 mod resolve_direct;
 /// #2264 — la règle de version appliquée à la lecture.
