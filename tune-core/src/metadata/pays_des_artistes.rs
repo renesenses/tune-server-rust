@@ -120,8 +120,9 @@ pub fn ranger_le_pays(
 /// `interroger` lit une fiche MusicBrainz par son MBID (le limiteur partagé
 /// en production, une réponse factice au banc).
 ///
-/// Une panne n'écrit rien et arrête le tour SUR la fiche en panne : le tour
-/// suivant la reprend.
+/// Une panne (réseau, 5xx, corps illisible) n'écrit rien et arrête le tour
+/// SUR la fiche en panne : le tour suivant la reprend. Une fiche introuvable
+/// (400, 404) est rangée sans pays.
 pub async fn rattraper_les_pays<F, Fut>(
     backend: &Arc<dyn DbBackend>,
     apres_id: i64,
@@ -158,6 +159,15 @@ where
                 } else {
                     bilan.sans_pays += 1;
                 }
+            }
+            // Une fiche introuvable (MBID supprimé, fusionné ou invalide) :
+            // MusicBrainz dit « rien », pas « plus tard ». Sans pays, et le
+            // tour continue — sinon cette fiche bloquerait la passe à vie.
+            Err(RefusMusicBrainz::Statut(400 | 404)) => {
+                ranger_le_pays(backend, id, &mbid, "")?;
+                bilan.traitees += 1;
+                bilan.sans_pays += 1;
+                bilan.dernier_id = id;
             }
             Err(e) => {
                 debug!(artiste_id = id, erreur = ?e, "pays_des_artistes_panne");

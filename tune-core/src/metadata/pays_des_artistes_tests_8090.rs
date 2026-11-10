@@ -162,3 +162,28 @@ fn le_pays_n_est_pas_range_sur_un_autre_mbid_8090() {
     assert_eq!(pays(&b, brel), (None, None));
     assert!(ranger_le_pays(&b, brel, MB_BREL, "BE").unwrap());
 }
+
+/// Une fiche introuvable (404 : MBID supprimé ou fusionné) ne bloque pas la
+/// passe : rangée sans pays, et le tour continue jusqu'au bout.
+#[tokio::test]
+async fn une_fiche_introuvable_ne_bloque_pas_la_passe_8090() {
+    let b = base();
+    let disparu = artiste(&b, "Disparu", Some(MB_SANS_PAYS));
+    let brel = artiste(&b, "Jacques Brel", Some(MB_BREL));
+    let bilan = rattraper_les_pays(&b, 0, 100, |mbid: String| async move {
+        if mbid == MB_SANS_PAYS {
+            Err(RefusMusicBrainz::Statut(404))
+        } else {
+            Ok(fiche_mb(&mbid))
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!((bilan.pannes, bilan.poses, bilan.sans_pays), (0, 1, 1));
+    assert!(bilan.fin_de_liste);
+    assert_eq!(
+        pays(&b, disparu),
+        (Some(String::new()), Some(MB_SANS_PAYS.into()))
+    );
+    assert_eq!(pays(&b, brel), (Some("BE".into()), Some(MB_BREL.into())));
+}
