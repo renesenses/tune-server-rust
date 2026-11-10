@@ -121,13 +121,17 @@ struct DaemonProcess {
 /// #8347 — le démon range ses identités d'appairage dans les données de
 /// Tune ([`identites_du_demon_8347`]) pour les relire (pair-verify).
 fn commande_du_demon(binary: &str) -> Command {
+    commande_du_demon_avec(binary, identites_du_demon_8347::pour_ce_serveur())
+}
+
+fn commande_du_demon_avec(binary: &str, identites: Option<PathBuf>) -> Command {
     let mut commande = Command::new(binary);
     commande
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    if let Some(dossier) = identites_du_demon_8347::pour_ce_serveur() {
+    if let Some(dossier) = identites {
         commande.env(identites_du_demon_8347::VARIABLE, dossier);
     }
     commande

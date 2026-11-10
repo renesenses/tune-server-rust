@@ -54,9 +54,32 @@ pub(super) fn pour_ce_serveur() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
-    use super::dossier_des_identites;
+    use super::{VARIABLE, dossier_des_identites};
+    use crate::outputs::airplay2::commande_du_demon_avec;
+
+    fn variable_de(commande: &tokio::process::Command) -> Option<Option<&OsStr>> {
+        commande
+            .as_std()
+            .get_envs()
+            .find(|(cle, _)| *cle == OsStr::new(VARIABLE))
+            .map(|(_, valeur)| valeur)
+    }
+
+    #[test]
+    fn le_demon_recoit_le_dossier_des_identites() {
+        let commande =
+            commande_du_demon_avec("airplay-daemon", Some(PathBuf::from("/data/airplay2")));
+        assert_eq!(
+            variable_de(&commande),
+            Some(Some(OsStr::new("/data/airplay2")))
+        );
+        // Rien de connu : la variable n'est pas posée, l'héritage décide.
+        let commande = commande_du_demon_avec("airplay-daemon", None);
+        assert_eq!(variable_de(&commande), None);
+    }
 
     #[test]
     fn les_donnees_de_tune_d_abord() {
