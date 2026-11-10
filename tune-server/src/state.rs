@@ -129,6 +129,11 @@ pub struct AppState {
     /// déplacement reçu deux fois coup sur coup (ticket 193, voir
     /// [`crate::routes::playback::seek_en_double`]).
     pub derniers_seeks: Arc<std::sync::Mutex<HashMap<i64, (u64, Instant)>>>,
+    /// #7759 — les déplacements relayés aux suiveuses d'un groupe, numérotés
+    /// par meneuse : seul le dernier s'applique (voir
+    /// [`crate::routes::zones::relais_de_groupe_6155::DeplacementsDeGroupe`]).
+    pub deplacements_de_groupe:
+        Arc<crate::routes::zones::relais_de_groupe_6155::DeplacementsDeGroupe>,
     /// mDNS scanner handle, populated by
     /// [`crate::discovery_setup::spawn_mdns_handler`] once discovery starts. Kept
     /// here (not just as a local `_mdns_handle`) so routes can list the peer Tune
@@ -702,6 +707,7 @@ impl AppState {
             upnp_index_lock: Arc::new(Mutex::new(())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             derniers_seeks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            deplacements_de_groupe: Arc::default(),
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             active_audio_backend: Arc::new(std::sync::RwLock::new(None)),
             annuaire_radios: Arc::new(std::sync::RwLock::new(Vec::new())),

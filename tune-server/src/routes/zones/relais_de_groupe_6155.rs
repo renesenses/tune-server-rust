@@ -397,6 +397,58 @@ pub(crate) async fn aligner_les_suiveuses(state: &AppState, meneuse: i64) {
     }
 }
 
+/// #7759 (relecture de #8254) — les déplacements relayés d'une meneuse, par
+/// numéro de génération.
+///
+/// Chaque `seek` reçu sur une meneuse prend un numéro, dans l'ordre d'arrivée
+/// à la route ; le relais aux suiveuses part détaché. En glissant le curseur,
+/// plusieurs relais sont en vol à la fois, et un relais plus ancien pouvait
+/// finir le dernier : la suiveuse restait à une position intermédiaire. Les
+/// relais d'une même meneuse passent donc un à un, et seul celui de la
+/// dernière demande s'applique ; un relais dépassé ne touche plus aucune
+/// suiveuse.
+#[derive(Default)]
+pub struct DeplacementsDeGroupe {
+    par_meneuse: std::sync::Mutex<std::collections::HashMap<i64, Arc<FileDeDeplacements>>>,
+}
+
+#[derive(Default)]
+struct FileDeDeplacements {
+    derniere: std::sync::atomic::AtomicU64,
+    un_a_la_fois: tokio::sync::Mutex<()>,
+}
+
+/// Une demande de déplacement d'une meneuse, numérotée à son arrivée.
+pub struct DemandeDeDeplacement {
+    file: Arc<FileDeDeplacements>,
+    generation: u64,
+}
+
+impl DeplacementsDeGroupe {
+    /// Numérote une nouvelle demande pour `meneuse` : elle dépasse toutes les
+    /// précédentes. À appeler dans la route, AVANT de détacher le relais.
+    pub fn nouvelle_demande(&self, meneuse: i64) -> DemandeDeDeplacement {
+        let file = self
+            .par_meneuse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(meneuse)
+            .or_default()
+            .clone();
+        let generation = file
+            .derniere
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        DemandeDeDeplacement { file, generation }
+    }
+}
+
+impl DemandeDeDeplacement {
+    fn est_la_derniere(&self) -> bool {
+        self.file.derniere.load(std::sync::atomic::Ordering::SeqCst) == self.generation
+    }
+}
+
 /// #7759 (fil 2215) — un déplacement dans la piste, donné sur la meneuse, est
 /// relayé à chaque suiveuse qui joue la même piste.
 ///
@@ -412,7 +464,21 @@ pub(crate) async fn aligner_les_suiveuses(state: &AppState, meneuse: i64) {
 /// déplacements internes (garde du sondeur pendant une recréation de flux).
 /// Une suiveuse qui ne joue pas la même piste n'est pas touchée : le relais
 /// ordinaire l'aligne déjà, à la position de la meneuse.
-pub(crate) async fn deplacer_les_suiveuses(state: &AppState, meneuse: i64, position_ms: u64) {
+///
+/// `demande` vient de [`DeplacementsDeGroupe::nouvelle_demande`] : les relais
+/// d'une meneuse passent un à un, et un relais dépassé par une demande plus
+/// récente n'applique rien.
+pub async fn deplacer_les_suiveuses(
+    state: &AppState,
+    meneuse: i64,
+    position_ms: u64,
+    demande: DemandeDeDeplacement,
+) {
+    let _un_a_la_fois = demande.file.un_a_la_fois.lock().await;
+    if !demande.est_la_derniere() {
+        info!(meneuse, position_ms, "zone_group_follower_seek_superseded");
+        return;
+    }
     let suiveuses = zones_suiveuses(&groupes_enregistres(state), meneuse);
     if suiveuses.is_empty() {
         return;
@@ -422,6 +488,10 @@ pub(crate) async fn deplacer_les_suiveuses(state: &AppState, meneuse: i64, posit
         return;
     }
     for suiveuse in suiveuses {
+        if !demande.est_la_derniere() {
+            info!(meneuse, position_ms, "zone_group_follower_seek_superseded");
+            return;
+        }
         let etat = Instantane::de(&state.playback.get_state(suiveuse).await);
         if etat.piste != tete.piste || etat.etat == PlayState::Stopped {
             continue;

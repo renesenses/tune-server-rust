@@ -4669,12 +4669,16 @@ async fn seek(
             // #7759 — le déplacement de la meneuse d'un groupe vaut pour ses
             // suiveuses. Détaché : recréer un flux local prend une à trois
             // secondes par zone, la réponse n'attend pas les suiveuses.
+            // Numérotée ICI, dans l'ordre d'arrivée : seul le relais de la
+            // dernière demande s'applique (relecture de #8254).
+            let demande = state.deplacements_de_groupe.nouvelle_demande(zone_id);
             let s = state.clone();
             tokio::spawn(async move {
                 crate::routes::zones::relais_de_groupe_6155::deplacer_les_suiveuses(
                     &s,
                     zone_id,
                     position_ms,
+                    demande,
                 )
                 .await;
             });

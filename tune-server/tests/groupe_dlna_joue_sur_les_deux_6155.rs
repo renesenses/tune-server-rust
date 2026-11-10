@@ -340,3 +340,66 @@ async fn un_deplacement_de_la_meneuse_deplace_la_suiveuse_7759() {
         joues_par(&banc.state, "dlna-kef").await,
     );
 }
+
+/// Relecture de #8254 — en glissant le curseur, plusieurs relais de
+/// déplacement sont en vol à la fois ; le plus ANCIEN peut finir le dernier.
+/// Il ne doit plus rien appliquer : la suiveuse reste à la position de la
+/// DERNIÈRE demande.
+///
+/// Le banc rejoue l'ordre défavorable sans dépendre d'une course : deux
+/// demandes numérotées dans l'ordre d'arrivée (`cible_ancienne`, puis
+/// `cible_recente`), le relais de la récente exécuté d'abord, celui de
+/// l'ancienne ensuite.
+///
+/// Contre-épreuve : faire rendre `true` à `est_la_derniere` fait tomber ce
+/// test (la KEF reçoit en dernier la position ancienne).
+#[tokio::test]
+async fn un_deplacement_relaye_depasse_ne_s_applique_plus_7759() {
+    use tune_server::routes::zones::relais_de_groupe_6155::deplacer_les_suiveuses;
+
+    let banc = phantom_et_kef().await;
+    grouper(&banc).await;
+    banc.state
+        .orchestrator
+        .play_from_queue(banc.phantom, 0)
+        .await
+        .expect("lecture sur la meneuse");
+    let kef_joue = attendre(|| async {
+        banc.state.playback.get_state(banc.kef).await.state == PlayState::Playing
+    })
+    .await;
+    assert!(kef_joue, "témoin : la KEF a rejoint la lecture du groupe");
+    let duree = banc
+        .state
+        .playback
+        .get_state(banc.phantom)
+        .await
+        .now_playing
+        .map(|np| np.duration_ms)
+        .unwrap_or(0);
+    let cible_ancienne = (duree as u64 / 4).max(1);
+    let cible_recente = (duree as u64 / 2).max(2);
+    assert_ne!(cible_ancienne, cible_recente, "prémisse : deux positions");
+
+    let ancienne = banc
+        .state
+        .deplacements_de_groupe
+        .nouvelle_demande(banc.phantom);
+    let recente = banc
+        .state
+        .deplacements_de_groupe
+        .nouvelle_demande(banc.phantom);
+    deplacer_les_suiveuses(&banc.state, banc.phantom, cible_recente, recente).await;
+    deplacer_les_suiveuses(&banc.state, banc.phantom, cible_ancienne, ancienne).await;
+
+    let deplacements = deplacements_de(&banc.state, "dlna-kef").await;
+    assert_eq!(
+        deplacements.last().copied(),
+        Some(cible_recente),
+        "la KEF doit finir à la dernière demande ({cible_recente} ms) — déplacements reçus : {deplacements:?}"
+    );
+    assert!(
+        !deplacements.contains(&cible_ancienne),
+        "un relais dépassé a déplacé la KEF : {deplacements:?}"
+    );
+}
