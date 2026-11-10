@@ -1265,14 +1265,26 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
 }
 
 pub(super) async fn diagnostics_oaat(State(state): State<AppState>) -> Json<Value> {
-    let outputs = state.outputs.lock().await;
+    // #8006 — les sorties sont relevées, puis le registre relâché ; une
+    // sortie occupée (démarrage d'un titre qui traîne) est passée au bout de
+    // deux secondes au lieu de figer le diagnostic, et le registre avec lui.
+    let sorties: Vec<_> = {
+        let outputs = state.outputs.lock().await;
+        outputs
+            .list()
+            .iter()
+            .filter_map(|id| outputs.get(id))
+            .collect()
+    };
     let mut endpoints = Vec::new();
-    for id in outputs.list() {
-        if let Some(output) = outputs.get(&id) {
-            let output = output.lock().await;
-            if let Some(diag) = output.diagnostics_json() {
-                endpoints.push(diag);
-            }
+    for output in sorties {
+        let Ok(output) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), output.lock()).await
+        else {
+            continue;
+        };
+        if let Some(diag) = output.diagnostics_json() {
+            endpoints.push(diag);
         }
     }
     Json(json!({
@@ -5579,3 +5591,7 @@ mod volume_des_zones_au_rapport_7841 {
         assert_eq!(zone["volume"]["limite_securite"], json!(0.25));
     }
 }
+
+#[cfg(test)]
+#[path = "diagnostics_oaat_8006_tests.rs"]
+mod registre_libre_pendant_le_diagnostic_8006;

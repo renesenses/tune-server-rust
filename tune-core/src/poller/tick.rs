@@ -2187,8 +2187,9 @@ impl PositionPoller {
             // (rare: end of track). Env-guarded for rollback.
             if position_reset && std::env::var("TUNE_DISABLE_CAST_ADVANCE_FIX").is_err() {
                 let can_internal_gapless = {
-                    let outputs = self.outputs.lock().await;
-                    match outputs.get(&device_id) {
+                    // #8006 — registre relâché avant d'attendre la sortie.
+                    let enregistree = self.outputs.lock().await.get(&device_id);
+                    match enregistree {
                         Some(arc) => arc.lock().await.supports_internal_gapless(),
                         None => false,
                     }
@@ -2254,8 +2255,9 @@ impl PositionPoller {
                     )
                 {
                     let est_dlna = {
-                        let outputs = self.outputs.lock().await;
-                        match outputs.get(&device_id) {
+                        // #8006 — registre relâché avant d'attendre la sortie.
+                        let enregistree = self.outputs.lock().await.get(&device_id);
+                        match enregistree {
                             Some(arc) => arc.lock().await.output_type() == "dlna",
                             None => false,
                         }
@@ -2845,8 +2847,9 @@ impl PositionPoller {
                                 // Only wait when the output can actually
                                 // transition internally; otherwise end normally.
                                 let can_internal_gapless = {
-                                    let outputs = self.outputs.lock().await;
-                                    match outputs.get(&device_id) {
+                                    // #8006 — registre relâché avant d'attendre la sortie.
+                                    let enregistree = self.outputs.lock().await.get(&device_id);
+                                    match enregistree {
                                         Some(arc) => arc.lock().await.supports_internal_gapless(),
                                         None => false,
                                     }
@@ -3658,8 +3661,9 @@ impl PositionPoller {
                             // gapless_sent so we stop retrying; the natural-end
                             // fallback advances/repeats the queue.
                             let (can_internal_gapless, annonce) = {
-                                let outputs = self.outputs.lock().await;
-                                match outputs.get(&device_id) {
+                                // #8006 — registre relâché avant d'attendre la sortie.
+                                let enregistree = self.outputs.lock().await.get(&device_id);
+                                match enregistree {
                                     Some(arc) => {
                                         let sortie = arc.lock().await;
                                         (
@@ -3809,8 +3813,9 @@ impl PositionPoller {
                         && played_enough
                         && status.position_ms + 250 >= track_duration_ms
                         && {
-                            let outputs = self.outputs.lock().await;
-                            match outputs.get(&device_id) {
+                            // #8006 — registre relâché avant d'attendre la sortie.
+                            let enregistree = self.outputs.lock().await.get(&device_id);
+                            match enregistree {
                                 Some(arc) => !arc.lock().await.supports_internal_gapless(),
                                 None => false,
                             }

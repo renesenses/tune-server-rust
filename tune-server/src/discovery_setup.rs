@@ -506,7 +506,10 @@ fn spawn_ssdp_event_handler(
                     let soap_wakeable =
                         matches!(reg.type_of(&id).as_deref(), Some("dlna") | Some("openhome"));
                     if !soap_wakeable {
-                        reg.remove(&id);
+                        // #8029 — retirée, la sortie est aussi arrêtée.
+                        tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(
+                            reg.remove(&id),
+                        );
                     }
                     set_zone_online(&event_bus, &db, &id, false);
                     event_bus.emit_typed(
@@ -2095,7 +2098,11 @@ pub fn spawn_mdns_handler(
                 }
                 MdnsEvent::DeviceLost(id) => {
                     let mut reg = outputs.lock().await;
-                    reg.remove(&id);
+                    // #8029 — retirée, la sortie est aussi arrêtée (démon
+                    // AirPlay 2, tâches réseau).
+                    tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(
+                        reg.remove(&id),
+                    );
                     drop(reg);
                     set_zone_online(&event_bus, &db, &id, false);
                     event_bus.emit_typed(
@@ -2285,7 +2292,10 @@ async fn enregistrer_la_sortie_mdns_et_sa_zone(
         {
             // Remove the old lower-priority output
             if let Some(ref old_dev_id) = z.output_device_id {
-                reg.remove(old_dev_id);
+                // #8029 — l'ancienne sortie ne garde rien en marche.
+                tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(
+                    reg.remove(old_dev_id),
+                );
             }
             let _ = zone_repo.changer_d_appareil(
                 zid,
@@ -2608,8 +2618,10 @@ async fn probe_airplay_for_bluos(
                 );
 
                 let mut reg = outputs.lock().await;
-                // Remove the old AirPlay output
-                reg.remove(dev_id);
+                // Remove the old AirPlay output — #8029 : et l'arrêter.
+                tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(
+                    reg.remove(dev_id),
+                );
                 reg.register(Box::new(bluos));
                 drop(reg);
 
