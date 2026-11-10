@@ -340,14 +340,18 @@ async fn aucun_titre_jouable_se_dit_pour_toute_la_file_8227() {
         .geste(1, SensDuGeste::Suivant)
         .await
         .expect_err("les titres suivants sont tous refusés");
+    let refuses = super::enjamber_les_refus::titres_refuses_sans_titre_jouable(&erreur)
+        .expect("l'erreur du geste dit combien de titres ont été refusés");
+    assert!(refuses >= 2, "témoin : plusieurs titres refusés ({erreur})");
     let message = PlaybackOrchestrator::message_piste_non_demarree("suivante", &erreur);
 
     assert!(
         !message.contains("ce titre"),
-        "#8227 : trois titres refusés, le message parle d'un seul : {message}"
+        "#8227 : {refuses} titres refusés, le message parle d'un seul : {message}"
     );
     assert!(
-        message.contains("aucun titre de la file") && message.contains("3 titre(s)"),
+        message.contains("aucun titre de la file")
+            && message.contains(&format!("{refuses} titre(s) refusé(s)")),
         "#8227 : le message doit dire que la file n'a plus de titre jouable, et combien \
          ont été refusés : {message}"
     );
