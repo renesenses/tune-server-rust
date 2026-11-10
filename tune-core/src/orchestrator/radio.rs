@@ -874,6 +874,17 @@ fn sonder_hls(url: &str, deja_lue: Option<(String, String)>) -> Result<Sonde, St
         (true, false, _) => None,
     };
     source_info.debit_kbps = infos.debit_kbps;
+    // #7802 — ce que la liste maîtresse déclare pour la variante jouée, et la
+    // variante plus haute que le diffuseur a refusée : le chemin du signal
+    // explique ainsi un débit plus bas que prévu.
+    source_info.bitrate_kbps = infos.bande_kbps;
+    source_info.variante_refusee =
+        infos
+            .refus
+            .map(|refus| crate::http::streamer::VarianteRefusee {
+                bande_kbps: refus.bande_kbps,
+                statut: refus.statut,
+            });
     source_info.sample_rate = Some(source_sample_rate);
     source_info.channels = Some(source_channels).filter(|n| *n > 0);
     info!(
@@ -883,6 +894,8 @@ fn sonder_hls(url: &str, deja_lue: Option<(String, String)>) -> Result<Sonde, St
         sortie_hz = source_sample_rate,
         canaux = source_channels,
         debit_kbps = ?infos.debit_kbps,
+        bande_kbps = ?infos.bande_kbps,
+        repli = ?infos.refus,
         "radio_hls_sonde"
     );
 

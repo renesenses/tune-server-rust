@@ -79,7 +79,23 @@ pub struct RadioSourceInfo {
     /// #6821 — le débit que la station ANNONCE dans son en-tête `icy-br`
     /// (kbit/s), lu à la connexion. `None` : en-tête absent ou illisible —
     /// rien n'est déduit du conteneur ni de la fréquence.
+    /// #7802 — en HLS, la bande que la liste maîtresse déclare pour la
+    /// variante retenue ; le débit mesuré (`debit_kbps`) garde la main.
     pub bitrate_kbps: Option<u32>,
+    /// #7802 — la variante HLS plus haute que le diffuseur a REFUSÉE (403,
+    /// 451) avant celle qui joue. `None` : pas de repli, ou pas HLS.
+    pub variante_refusee: Option<VarianteRefusee>,
+}
+
+/// #7802 — une qualité HLS refusée par le diffuseur : ce que la liste
+/// maîtresse déclarait pour elle, et le statut du refus. Aucun contournement
+/// n'est tenté ; l'auditeur apprend seulement pourquoi il reçoit moins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VarianteRefusee {
+    /// La bande déclarée par la liste maîtresse (kbit/s).
+    pub bande_kbps: u32,
+    /// Le statut HTTP du refus (403 ou 451).
+    pub statut: u16,
 }
 
 #[derive(Debug, Clone, Default)]
