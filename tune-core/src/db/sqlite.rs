@@ -640,7 +640,12 @@ CREATE TABLE IF NOT EXISTS artists (
     sort_name_source TEXT,
     -- Provenance du MBID (migration 133, #6463) : balise, nom, pressage,
     -- manuel ; NULL = inconnue.
-    musicbrainz_id_source TEXT
+    musicbrainz_id_source TEXT,
+    -- Pays de l'artiste lu sur MusicBrainz (migration 144, #8090) : code ISO
+    -- 3166-1 alpha-2, '' si MusicBrainz n'en donne aucun ; et le MBID dont il
+    -- a ete lu.
+    country TEXT,
+    country_mbid TEXT
 );
 
 CREATE TABLE IF NOT EXISTS albums (

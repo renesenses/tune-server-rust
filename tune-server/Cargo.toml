@@ -2098,3 +2098,9 @@ path = "tests/durcissement_configuration.rs"
 [[test]]
 name = "durcissement_routes_admin"
 path = "tests/durcissement_routes_admin.rs"
+
+# #8090 — la carte et le filtre Pays : pays de l'artiste (MusicBrainz) et pays
+# d'édition, comptés en albums. Jumeau PostgreSQL `pg_8090`.
+[[test]]
+name = "pays_artiste_8090"
+path = "tests/pays_artiste_8090.rs"
