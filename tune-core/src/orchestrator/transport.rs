@@ -3168,6 +3168,17 @@ impl PlaybackOrchestrator {
                  interdit par le contrôle parental de ce profil"
             );
         }
+        // #8227 — fil 2723 : « Suivant » a enjambé les 8 titres restants d'un
+        // album, tous refusés par le service, et l'auditeur lisait « ce titre
+        // n'est pas disponible », comme si un seul titre manquait. La file
+        // entière, dans ce sens, est injouable : on le dit.
+        if let Some(refuses) = super::enjamber_les_refus::titres_refuses_sans_titre_jouable(cause) {
+            return format!(
+                "Impossible de lire la piste {geste} : aucun titre de la file n'est \
+                 disponible à la lecture chez le service dans ce sens ({refuses} titre(s) \
+                 refusé(s) : droits, région ou abonnement)"
+            );
+        }
         if crate::poller::refus_propre_a_la_piste(cause) {
             return format!(
                 "Impossible de lire la piste {geste} : {}",

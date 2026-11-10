@@ -316,3 +316,44 @@ fn le_message_nomme_les_titres_et_la_raison_7895() {
     .unwrap();
     assert!(plusieurs.starts_with("4 titres sautés : « A », le titre n° 3, « C » et 1 autre(s)"));
 }
+
+/// #8227 — fil 2723 (rc11) : « Suivant » sur le premier titre d'un album dont
+/// le service refuse TOUS les titres suivants. Le journal :
+/// `geste_enjambe_piste_refusee` positions 2 à 9, puis `piste_non_demarree
+/// cause="aucun titre jouable, 8 titre(s) refusé(s) par le service (no url)"`.
+/// L'auditeur lisait « ce titre n'est pas disponible », comme si un seul
+/// titre manquait et que la lecture aurait dû continuer.
+///
+/// Contre-épreuve : retirer de `message_piste_non_demarree` la branche
+/// `titres_refuses_sans_titre_jouable` fait tomber ce test.
+#[tokio::test]
+async fn aucun_titre_jouable_se_dit_pour_toute_la_file_8227() {
+    let banc = Banc::monter(&[
+        ("7:1", Reponse::Url),
+        ("7:2", Reponse::Refus),
+        ("7:3", Reponse::Refus),
+        ("7:4", Reponse::Refus),
+    ])
+    .await;
+
+    let erreur = banc
+        .geste(1, SensDuGeste::Suivant)
+        .await
+        .expect_err("les titres suivants sont tous refusés");
+    let message = PlaybackOrchestrator::message_piste_non_demarree("suivante", &erreur);
+
+    assert!(
+        !message.contains("ce titre"),
+        "#8227 : trois titres refusés, le message parle d'un seul : {message}"
+    );
+    assert!(
+        message.contains("aucun titre de la file") && message.contains("3 titre(s)"),
+        "#8227 : le message doit dire que la file n'a plus de titre jouable, et combien \
+         ont été refusés : {message}"
+    );
+    // Un refus isolé garde sa phrase.
+    assert!(
+        PlaybackOrchestrator::message_piste_non_demarree("suivante", "no url")
+            .contains("ce titre n'est pas disponible")
+    );
+}
