@@ -8986,27 +8986,35 @@ impl OutputTarget for LocalOutput {
         })
     }
 
+    /// #8173 — le même appariement que l'ouverture, et rien d'autre.
+    ///
+    /// La zone est disponible quand [`resolve_device`] la retrouverait sur
+    /// l'hôte que `select_host` ouvrira : par identifiant d'endpoint d'abord
+    /// (un DAC renommé par son pilote reste disponible), puis par nom avec la
+    /// convention des rangs `(n)` de la découverte, enfin par sous-chaîne
+    /// univoque. Une zone dont le nom vient d'un autre hôte (#3230), ou que
+    /// deux candidates contiennent, est indisponible : la lecture y serait
+    /// refusée. Décision et scènes : [`zone_locale_disponible`].
     async fn is_available(&self) -> bool {
         let name = self.device_name.clone();
         let backend = self.audio_backend.clone();
+        let endpoint_id = self.endpoint_id.clone();
+        let origin_host = self.origin_host.clone();
         // Probe on a blocking thread to avoid cpal blocking the async runtime
         tokio::task::spawn_blocking(move || {
             let host = select_host(&backend);
             if name == "default" {
                 return host.default_output_device().is_some();
             }
-            host.output_devices()
-                .map(|devs| {
-                    devs.into_iter().any(|d| {
-                        d.description()
-                            .map(|desc| {
-                                let n = desc.name().to_string();
-                                n == name || n.contains(&name)
-                            })
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false)
+            let open_host: &'static str = host.id().name();
+            let (_, identities) = enumerer_les_candidates(&host);
+            zone_locale_disponible(
+                &name,
+                endpoint_id.as_deref(),
+                origin_host.as_deref(),
+                open_host,
+                &identities,
+            )
         })
         .await
         .unwrap_or(false)
@@ -9411,6 +9419,11 @@ mod backend_fallback_tests;
 /// refus, jamais la sortie par défaut. Listes de périphériques fictives.
 #[cfg(test)]
 mod peripherique_introuvable_8171_tests;
+
+/// #8173 — la disponibilité d'une zone locale suit la règle d'ouverture :
+/// scènes sur listes fictives, et garde de site sur `is_available`.
+#[cfg(test)]
+mod disponibilite_8173_tests;
 
 #[cfg(test)]
 mod backends_supportes_tests;
