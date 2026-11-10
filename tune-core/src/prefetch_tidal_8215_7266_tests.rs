@@ -463,7 +463,8 @@ async fn un_tampon_en_qualite_cd_sert_une_zone_en_qualite_cd_8249() {
 /// reprenait qu'en qualité « max ».
 #[tokio::test]
 async fn un_dash_complet_en_qualite_cd_sert_une_zone_en_qualite_cd_8249() {
-    let fichier = tempfile::NamedTempFile::new().unwrap();
+    let fichier = crate::test_scratch::scratch_file("prefetch-dash-8249", ".mp4");
+    std::fs::write(fichier.path(), b"").unwrap();
     let url = format!("file://{}", fichier.path().display());
     let moteur = PrefetchEngine::new();
     *moteur.dash_complet.lock().await = Some((
