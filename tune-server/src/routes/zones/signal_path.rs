@@ -1493,10 +1493,26 @@ pub(super) fn etat_du_surechantillonneur_lang(
     if !reglages.enabled {
         return None;
     }
+    // #8259 — le réglage de zone survit à la désinstallation du greffon
+    // (configuration préservée). Greffon absent ou désactivé : rien ne
+    // tournera, à cette piste ni à la suivante ; pas de ligne.
+    if !tune_core::audio::premium_plugins::enabled(
+        &settings,
+        tune_core::audio::surechantillonnage::ID,
+    ) {
+        return None;
+    }
     let (raison, cle) = if pure {
         ("pure", "upsampling_pure")
     } else if output_type != "local" {
         ("output_not_supported", "upsampling_not_applied")
+    } else if tune_core::audio::surechantillonnage::verdict_enregistre(&settings).is_none() {
+        // #8259 — la raison que `choix_de_la_zone` donne, au lieu d'un
+        // « non appliqué » muet.
+        (
+            tune_core::audio::surechantillonnage::Ecarte::TestDeLaMachineAbsent.code(),
+            "upsampling_not_applied",
+        )
     } else {
         ("not_applied", "upsampling_not_applied")
     };
