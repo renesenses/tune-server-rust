@@ -179,42 +179,89 @@ async fn la_sortie_airplay2_apprend_le_depart_du_flux_relance_7972() {
     );
 }
 
-/// Le chemin COMMUN du jeu (`send_to_output`), et non le seul rétablissement
-/// après une pause : un épisode de podcast repris à 12:00 par son adresse
-/// (`jouer_l_episode_par_son_adresse`) part avec `seek_ms` et un flux décodé
-/// à partir de 12:00. La position publiée doit partir de 12:00.
-///
-/// Contre-épreuve : sans la note du départ dans `send_to_output`, seul
-/// `seek_output_after_replay` la posait ; la position publiée valait 0:01.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn une_lecture_a_la_position_note_le_depart_sur_le_chemin_commun_7972() {
+/// Une sortie AirPlay 2 réelle, branchée sur un faux démon.
+async fn sortie_airplay2(orch: &PlaybackOrchestrator, appareil: &str) {
     use crate::outputs::airplay2::position_relevee_tests_7084::{
         demon_dont_le_recepteur_avance, sortie,
     };
-    let orch = orchestrateur();
-    let appareil = "airplay-7972-chemin-commun";
     let output = sortie(appareil);
     let _commandes = demon_dont_le_recepteur_avance(&output).await;
     orch.outputs.lock().await.register(Box::new(output));
+}
 
-    let media = crate::outputs::traits::PlayMedia {
-        url: "/tmp/episode-7972.wav",
-        mime_type: "audio/wav",
-        title: Some("Episode"),
-        duration_ms: Some(1_080_000),
-        ..Default::default()
-    };
-    let (envoye, erreur) = orch
-        .send_to_output(appareil, &media, Some(720_000), false, 797_204, None)
-        .await;
-    assert!(envoye, "lecture refusée : {erreur:?}");
-
+async fn position_publiee(orch: &PlaybackOrchestrator, appareil: &str) -> u64 {
     let output = orch.outputs.lock().await.get(appareil).expect("sortie");
     let statut = output.lock().await.get_status().await.unwrap();
+    statut.position_ms
+}
+
+/// Chemin commun du jeu : une lecture à 0:03 sur une zone AirPlay 2 sert un
+/// flux décodé qui COMMENCE à 0:03 (vérifié sur la session réellement
+/// servie). Le départ est alors noté, et la position publiée part de 0:03.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flux_decode_a_la_position_le_depart_est_note_7972() {
+    let zone = 797_204;
+    let (orch, appareil, _dir) = montage(zone).await;
+    orch.play_without_history(requete(zone, &appareil, Some(3_000)))
+        .await
+        .expect("lecture à la position");
+    let sid = orch
+        .playback
+        .get_state(zone)
+        .await
+        .now_playing
+        .and_then(|np| np.stream_id)
+        .expect("session installée");
+    let info = orch.streamer.stream_output_wire(&sid).await.expect("flux");
+    assert_eq!(info.mime_type, "audio/wav");
+    assert_eq!(info.duration_ms, Some(3_000), "le flux commence à 0:03");
+    assert!(!orch.streamer.is_seekable_session(&sid).await);
+
+    let reelle = "airplay-7972-decode";
+    sortie_airplay2(&orch, reelle).await;
     assert!(
-        (720_000..730_000).contains(&statut.position_ms),
-        "la position publiée doit partir de 12:00, obtenu {} ms",
-        statut.position_ms
+        orch.noter_le_depart_airplay2_si_le_flux_y_commence(reelle, Some(&sid), Some(3_000))
+            .await
     );
-    assert_eq!(statut.duration_ms, 1_800_000, "durée de la piste entière");
+    let position = position_publiee(&orch, reelle).await;
+    assert!(
+        (3_000..9_000).contains(&position),
+        "la position publiée doit partir de 0:03, obtenu {position} ms"
+    );
+    orch.stop(zone, Some(&appareil)).await;
+}
+
+/// L'épisode de podcast repris par son adresse (`resolve_direct`, qui ignore
+/// `seek_ms`) : session mandataire servie depuis l'octet 0. Le son part de
+/// 0:00 ; noter un départ à 12:00 ferait mentir l'écran. Rien n'est noté.
+///
+/// Contre-épreuve : la version précédente notait le départ dès que
+/// `seek_ms > 0`, dans `send_to_output`, sans regarder le flux servi.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flux_servi_depuis_l_octet_0_aucun_depart_note_7972() {
+    let orch = orchestrateur();
+    let sid = orch
+        .streamer
+        .create_proxy_session(
+            crate::http::streamer::StreamInfo {
+                format: "mp3".into(),
+                ..Default::default()
+            },
+            "http://127.0.0.1:9/episode-7972.mp3".into(),
+            false,
+        )
+        .await;
+    assert!(orch.streamer.is_seekable_session(&sid).await);
+    let reelle = "airplay-7972-podcast";
+    sortie_airplay2(&orch, reelle).await;
+    assert!(
+        !orch
+            .noter_le_depart_airplay2_si_le_flux_y_commence(reelle, Some(&sid), Some(720_000))
+            .await
+    );
+    let position = position_publiee(&orch, reelle).await;
+    assert!(
+        position < 720_000,
+        "flux servi depuis 0:00 : la position ne doit pas partir de 12:00 ({position} ms)"
+    );
 }
