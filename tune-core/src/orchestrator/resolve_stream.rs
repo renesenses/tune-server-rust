@@ -339,10 +339,23 @@ fn copier_en_croissance(
     growth: Arc<crate::audio::dash_growth::DashGrowth>,
 ) {
     use std::io::Write;
+    /// Une panique de la copie ne doit pas laisser le décodeur bloqué à la
+    /// frontière : la poignée est marquée en échec si rien ne l'a close.
+    struct Garde(Arc<crate::audio::dash_growth::DashGrowth>);
+    impl Drop for Garde {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.fail();
+            }
+        }
+    }
+    let _garde = Garde(growth.clone());
     let mut tampon = vec![0u8; 64 * 1024];
     let mut recus: u64 = 0;
     loop {
-        if Arc::strong_count(&growth) == 1 {
+        // Plus personne ne lit : ni le registre ni un décodeur (la garde
+        // ci-dessus tient la seconde référence).
+        if Arc::strong_count(&growth) == 2 {
             debug!(octets = recus, "telechargement_en_croissance_abandonne");
             growth.fail();
             return;
@@ -2524,7 +2537,13 @@ impl PlaybackOrchestrator {
             // décodeur le lit pendant qu'il arrive. `googlevideo` ne débite
             // qu'environ deux fois le temps réel ; l'attente valait la moitié
             // de la durée du titre (190 s mesurées, fil 2724).
-            let telechargement = if codec_lower == "opus" {
+            // Seulement si le décodeur sait servir la cible au fil de l'eau
+            // (48 kHz) : une zone plafonnée plus bas garde le téléchargement
+            // complet AVANT la session, sans quoi le renderer ouvrirait un
+            // flux muet pendant tout le téléchargement.
+            let telechargement = if codec_lower == "opus"
+                && crate::audio::decode::opus_servi_pendant_le_telechargement(Some(sr), Some(2))
+            {
                 Self::telecharger_en_croissance(
                     stream_data.url.clone(),
                     stream_data.headers.clone(),

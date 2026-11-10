@@ -44,6 +44,17 @@ const SEND_TIMEOUT_SECS: u64 = crate::http::streamer::SESSION_IDLE_TIMEOUT.as_se
 #[path = "opus_en_croissance.rs"]
 mod opus_en_croissance;
 
+/// #8228 — l'Opus peut-il être servi PENDANT son téléchargement vers cette
+/// cible ? Le bras de pré-transcodage ne lance le téléchargement en
+/// croissance que dans ce cas : sinon le décodeur attendrait le fichier
+/// entier APRÈS le Play, et le renderer resterait sans un octet.
+pub(crate) fn opus_servi_pendant_le_telechargement(
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+) -> bool {
+    opus_en_croissance::cible_servie(target_sample_rate, target_channels, 0.0)
+}
+
 /// Round a preferred PCM batch size down to a whole number of interleaved frames.
 ///
 /// The streaming decode paths used to drain a fixed `32768` bytes. That length is

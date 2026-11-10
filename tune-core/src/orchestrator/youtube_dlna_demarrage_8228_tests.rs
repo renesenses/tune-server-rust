@@ -168,4 +168,62 @@ async fn youtube_opus_sur_dlna_demarre_avant_la_fin_du_telechargement_8228() {
         reference.pcm_bytes().len(),
         "le flux servi pendant le téléchargement doit porter tout le titre"
     );
+    assert!(
+        servis[44..] == reference.pcm_bytes()[..],
+        "le PCM servi au fil de l'eau doit être celui du décodage intégral"
+    );
+}
+
+/// Une zone plafonnée sous 48 kHz : le décodeur au fil de l'eau ne la sert
+/// pas. Le téléchargement complet reste AVANT la session — sinon le Play
+/// partirait vers un flux muet pendant tout le téléchargement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zone_plafonnee_a_44_1_garde_le_telechargement_avant_la_session_8228() {
+    let corps = fixture_opus();
+    let debut = corps.len() / 2;
+    let suite = Arc::new(tokio::sync::Notify::new());
+    let url = amont_retenu(corps, debut, suite.clone()).await;
+    let orch = orchestrateur();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Salon", Some("dlna"), Some("dlna:renderer-8228"))
+        .unwrap();
+    let req = PlayRequest {
+        zone_id,
+        output_device_id: Some("dlna:renderer-8228".into()),
+        source: Some("youtube".into()),
+        source_id: Some("8228".into()),
+        ..Default::default()
+    };
+    let flux = crate::streaming::StreamUrl {
+        url,
+        mime_type: "audio/webm".into(),
+        quality: crate::streaming::traits::StreamQuality {
+            codec: "OPUS".into(),
+            sample_rate: 48_000,
+            bit_depth: 16,
+            bitrate: Some(128_000),
+            channels: 2,
+        },
+        expires_at: None,
+        headers: Vec::new(),
+    };
+    let liberation = tokio::time::Instant::now() + Duration::from_millis(1_500);
+    let s2 = suite.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep_until(liberation).await;
+        s2.notify_one();
+    });
+    let rendu = tokio::time::timeout(
+        Duration::from_secs(20),
+        orch.pretranscoder_en_flac(&req, "youtube", &flux, "opus".into(), Some(44_100)),
+    )
+    .await
+    .expect("le téléchargement complet finit")
+    .expect("le bras de pré-transcodage rend le flux");
+    assert!(
+        tokio::time::Instant::now() >= liberation,
+        "#8228 : zone à 44,1 kHz, la session est rendue avant la fin du \
+         téléchargement alors que le décodeur ne la servira qu'après — flux muet"
+    );
+    assert_eq!(rendu.2, "audio/wav");
 }

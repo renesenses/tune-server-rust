@@ -93,7 +93,7 @@ pub(super) fn decoder_opus_en_croissance(
     let track = format
         .default_track(TrackType::Audio)
         .ok_or("opus: no audio track")?;
-    let track_id = track.id;
+    let mut track_id = track.id;
     let ch_src: usize = match &track.codec_params {
         Some(CodecParameters::Audio(p)) => p.channels.as_ref().map(|c| c.count()).unwrap_or(2),
         _ => 2,
@@ -152,6 +152,29 @@ pub(super) fn decoder_opus_en_croissance(
                     en_attente.extend(convert_pcm_bit_depth(&echantillons, 16, output_bd));
                 }
                 Ok(None) => fin = true,
+                // Ogg chaîné (#1270) : nouveau flux physique, même règle que
+                // le chemin intégral — décodeur reconstruit, mêmes canaux.
+                Err(symphonia::core::errors::Error::ResetRequired) => {
+                    let Some(piste) = format.default_track(TrackType::Audio) else {
+                        fin = true;
+                        continue;
+                    };
+                    let canaux_piste = match &piste.codec_params {
+                        Some(CodecParameters::Audio(p)) => {
+                            p.channels.as_ref().map(|c| c.count()).unwrap_or(2)
+                        }
+                        _ => 2,
+                    }
+                    .clamp(1, 2);
+                    if canaux_piste != ch_src {
+                        warn!("opus_en_croissance_chaine_canaux_changes_arret");
+                        fin = true;
+                        continue;
+                    }
+                    track_id = piste.id;
+                    decoder = OpusDecoder::new(CADENCE_OPUS, canaux)
+                        .map_err(|e| format!("opus decoder init: {e}"))?;
+                }
                 Err(e) => {
                     if growth.a_echoue() {
                         return Err(format!("opus: téléchargement interrompu ({e})"));
