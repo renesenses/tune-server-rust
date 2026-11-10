@@ -295,10 +295,21 @@ async fn un_deplacement_de_la_meneuse_deplace_la_suiveuse_7759() {
     .await;
     assert!(kef_joue, "témoin : la KEF a rejoint la lecture du groupe");
 
+    // La piste de banc est courte : `seek` borne la cible à sa durée. On vise
+    // le milieu de la piste réellement lue.
+    let duree = banc
+        .state
+        .playback
+        .get_state(banc.phantom)
+        .await
+        .now_playing
+        .map(|np| np.duration_ms)
+        .unwrap_or(0);
+    let cible = (duree / 2).max(1);
     let (status, corps) = poster(
         &banc.app,
         &format!("/api/v1/zones/{}/seek", banc.phantom),
-        json!({ "position_ms": 120_000 }),
+        json!({ "position_ms": cible }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "déplacement : {corps}");
@@ -308,12 +319,17 @@ async fn un_deplacement_de_la_meneuse_deplace_la_suiveuse_7759() {
             .get_state(banc.phantom)
             .await
             .position_ms
-            >= 120_000,
-        "témoin : la meneuse s'est déplacée"
+            >= cible,
+        "témoin : la meneuse s'est déplacée (cible {cible} ms, durée {duree} ms, position {} ms)",
+        banc.state
+            .playback
+            .get_state(banc.phantom)
+            .await
+            .position_ms
     );
 
     let kef_deplacee =
-        attendre(|| async { banc.state.playback.get_state(banc.kef).await.position_ms >= 120_000 })
+        attendre(|| async { banc.state.playback.get_state(banc.kef).await.position_ms >= cible })
             .await;
     assert!(
         kef_deplacee,
