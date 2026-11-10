@@ -47,6 +47,9 @@ pub mod release_type;
 // La source d'un crédit de piste et ses témoins (#7765).
 #[cfg(test)]
 mod credits_source_7765_tests;
+// Le banc de la page artiste (#7767) : 600 000 pistes, 3 millions de crédits.
+#[cfg(test)]
+mod credits_page_artiste_banc_7767_tests;
 pub mod source_des_credits;
 pub mod suggestions;
 // Le MBID des artistes par une recherche MusicBrainz confirmée (#4805, étape C).
