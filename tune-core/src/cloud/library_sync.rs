@@ -998,7 +998,6 @@ struct FamilleSuivie {
     entite: &'static str,
     releve: &'static str,
     neuf: &'static str,
-    index: &'static str,
     projection: &'static str,
     colonnes: &'static [&'static str],
 }
@@ -1008,7 +1007,6 @@ const FAMILLES_SUIVIES: [FamilleSuivie; 3] = [
         entite: "track",
         releve: "sync_releve_pistes",
         neuf: "sync_releve_pistes_neuf",
-        index: "idx_sync_releve_pistes",
         projection: "SELECT t.id AS id, t.title AS titre, ar.name AS artiste, al.title AS album, \
                      t.album_id AS album_id, t.format AS format, t.sample_rate AS sample_rate, \
                      t.bit_depth AS bit_depth, t.duration_ms AS duration_ms, t.genre AS genre, \
@@ -1038,7 +1036,6 @@ const FAMILLES_SUIVIES: [FamilleSuivie; 3] = [
         entite: "album",
         releve: "sync_releve_albums",
         neuf: "sync_releve_albums_neuf",
-        index: "idx_sync_releve_albums",
         projection: "SELECT a.id AS id, a.title AS titre, ar.name AS artiste, a.year AS annee, \
                      a.genre AS genre, a.source AS source, \
                      (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id) AS nb_pistes, \
@@ -1059,37 +1056,63 @@ const FAMILLES_SUIVIES: [FamilleSuivie; 3] = [
         entite: "artist",
         releve: "sync_releve_artistes",
         neuf: "sync_releve_artistes_neuf",
-        index: "idx_sync_releve_artistes",
         projection: "SELECT id AS id, name AS nom, bio AS bio, musicbrainz_id AS mbid FROM artists",
         colonnes: &["nom", "bio", "mbid"],
     },
 ];
 
-fn releve_present(backend: &Arc<dyn DbBackend>, famille: &FamilleSuivie) -> bool {
-    backend
-        .query_one(&format!("SELECT 1 FROM {} LIMIT 1", famille.releve), &[])
-        .is_ok()
+/// Le relevé de cette famille porte-t-il au moins une ligne ? Les tables
+/// viennent de la migration 144 / PG 110 (#8239) ; une lecture qui échoue
+/// compte comme « vide ».
+fn releve_non_vide(backend: &Arc<dyn DbBackend>, famille: &FamilleSuivie) -> bool {
+    matches!(
+        backend.query_one(&format!("SELECT 1 FROM {} LIMIT 1", famille.releve), &[]),
+        Ok(Some(_))
+    )
+}
+
+/// Les colonnes d'une table de relevé, `id` en tête, dans l'ordre de la
+/// projection.
+fn colonnes_du_releve(famille: &FamilleSuivie) -> String {
+    std::iter::once("id")
+        .chain(famille.colonnes.iter().copied())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Exécute `requetes` dans UNE transaction (les deux moteurs) : un relevé ne
+/// reste jamais à moitié remplacé.
+fn en_transaction(backend: &Arc<dyn DbBackend>, requetes: &[String]) -> Result<(), String> {
+    backend.write_tx(&mut |tx| {
+        for sql in requetes {
+            tx.execute(sql, &[])?;
+        }
+        Ok(())
+    })
 }
 
 fn ecrire_le_releve(backend: &Arc<dyn DbBackend>, famille: &FamilleSuivie) -> Result<(), String> {
-    backend.execute_batch(&format!(
-        "DROP TABLE IF EXISTS {releve};\
-         CREATE TABLE {releve} AS {projection};\
-         CREATE INDEX IF NOT EXISTS {index} ON {releve}(id);",
-        releve = famille.releve,
-        projection = famille.projection,
-        index = famille.index,
-    ))
+    en_transaction(
+        backend,
+        &[
+            format!("DELETE FROM {}", famille.releve),
+            format!(
+                "INSERT INTO {} ({}) {}",
+                famille.releve,
+                colonnes_du_releve(famille),
+                famille.projection
+            ),
+        ],
+    )
 }
 
-/// À appeler au DÉBUT d'un scan : si aucun relevé n'existe encore (premier
-/// scan après la mise à jour, ou base passée de SQLite à PostgreSQL), le
-/// relevé est pris maintenant, avant que le scan ne touche à rien — sans quoi
+/// À appeler au DÉBUT d'un scan : si le relevé est vide (premier scan après
+/// la mise à jour, ou bibliothèque encore vide), il est pris maintenant, avant que le scan ne touche à rien — sans quoi
 /// [`journaliser_ce_qui_a_change`] n'aurait pas d'état « avant » et ne
 /// verrait, de ce premier scan, que les entités nouvelles.
 pub fn preparer_le_releve(backend: &Arc<dyn DbBackend>) {
     for famille in &FAMILLES_SUIVIES {
-        if releve_present(backend, famille) {
+        if releve_non_vide(backend, famille) {
             continue;
         }
         match ecrire_le_releve(backend, famille) {
@@ -1142,6 +1165,7 @@ fn journaliser_la_famille(
         neuf,
         ..
     } = famille;
+    let colonnes = colonnes_du_releve(famille);
     let pas_en_attente = |alias: &str| {
         format!(
             "NOT EXISTS (SELECT 1 FROM sync_changelog j WHERE j.entity_type = '{entite}' \
@@ -1151,16 +1175,19 @@ fn journaliser_la_famille(
 
     // L'état courant, figé une fois : la comparaison et le futur relevé
     // portent sur les MÊMES lignes, même si la base bouge entre-temps.
-    backend.execute_batch(&format!(
-        "DROP TABLE IF EXISTS {neuf};\
-         CREATE TABLE {neuf} AS {projection};\
-         CREATE INDEX IF NOT EXISTS {index}_neuf ON {neuf}(id);",
-        projection = famille.projection,
-        index = famille.index,
-    ))?;
+    en_transaction(
+        backend,
+        &[
+            format!("DELETE FROM {neuf}"),
+            format!("INSERT INTO {neuf} ({colonnes}) {}", famille.projection),
+        ],
+    )?;
 
-    let mut sql = String::new();
-    if releve_present(backend, famille) {
+    let mut requetes = Vec::new();
+    // Relevé vide : pas d'état « avant » (bibliothèque vide au début du scan,
+    // ou scan qui n'est pas passé par `preparer_le_releve`). Seules les
+    // entités jamais journalisées partent, plus bas — jamais tout.
+    if releve_non_vide(backend, famille) {
         let difference = famille
             .colonnes
             .iter()
@@ -1171,40 +1198,40 @@ fn journaliser_la_famille(
             "SELECT a.id FROM {releve} a WHERE NOT EXISTS (SELECT 1 FROM {neuf} n WHERE n.id = a.id)"
         );
         // Apparues ou modifiées.
-        sql.push_str(&format!(
+        requetes.push(format!(
             "INSERT INTO sync_changelog (entity_type, entity_id, action) \
              SELECT '{entite}', n.id, 'upsert' FROM {neuf} n LEFT JOIN {releve} a ON a.id = n.id \
-             WHERE (a.id IS NULL OR {difference}) AND {attente_n};",
-            attente_n = pas_en_attente("n"),
+             WHERE (a.id IS NULL OR {difference}) AND {}",
+            pas_en_attente("n"),
         ));
         // Disparues : un `upsert` encore en attente devient `delete` — sinon
         // `push_changes` enverrait « upsert » sans données.
-        sql.push_str(&format!(
+        requetes.push(format!(
             "UPDATE sync_changelog SET action = 'delete' \
-             WHERE synced = 0 AND entity_type = '{entite}' AND entity_id IN ({disparues});\
-             INSERT INTO sync_changelog (entity_type, entity_id, action) \
+             WHERE synced = 0 AND entity_type = '{entite}' AND entity_id IN ({disparues})"
+        ));
+        requetes.push(format!(
+            "INSERT INTO sync_changelog (entity_type, entity_id, action) \
              SELECT '{entite}', a.id, 'delete' FROM {releve} a \
-             WHERE NOT EXISTS (SELECT 1 FROM {neuf} n WHERE n.id = a.id) AND {attente_a};",
-            attente_a = pas_en_attente("a"),
+             WHERE NOT EXISTS (SELECT 1 FROM {neuf} n WHERE n.id = a.id) AND {}",
+            pas_en_attente("a"),
         ));
     }
     // Jamais journalisées : elles partent, relevé ou pas.
-    sql.push_str(&format!(
+    requetes.push(format!(
         "INSERT INTO sync_changelog (entity_type, entity_id, action) \
          SELECT '{entite}', n.id, 'upsert' FROM {neuf} n \
          WHERE NOT EXISTS (SELECT 1 FROM sync_changelog j \
-                           WHERE j.entity_type = '{entite}' AND j.entity_id = n.id);"
+                           WHERE j.entity_type = '{entite}' AND j.entity_id = n.id)"
     ));
-    backend.execute_batch(&sql)?;
-
-    // Le nouvel état devient le relevé.
-    backend.execute_batch(&format!(
-        "DROP TABLE IF EXISTS {releve};\
-         CREATE TABLE {releve} AS SELECT * FROM {neuf};\
-         CREATE INDEX IF NOT EXISTS {index} ON {releve}(id);\
-         DROP TABLE IF EXISTS {neuf};",
-        index = famille.index,
-    ))
+    // Le nouvel état devient le relevé — dans la MÊME transaction que le
+    // journal : l'un ne change jamais sans l'autre.
+    requetes.push(format!("DELETE FROM {releve}"));
+    requetes.push(format!(
+        "INSERT INTO {releve} ({colonnes}) SELECT {colonnes} FROM {neuf}"
+    ));
+    requetes.push(format!("DELETE FROM {neuf}"));
+    en_transaction(backend, &requetes)
 }
 
 // ---------------------------------------------------------------------------

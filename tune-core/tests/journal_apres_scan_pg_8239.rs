@@ -2,7 +2,7 @@
 //!
 //! Les gardes SQLite vivent dans `cloud::library_sync` (module
 //! `journal_apres_scan_8239_tests`). Celle-ci éprouve les MÊMES requêtes
-//! (`CREATE TABLE … AS`, `IS DISTINCT FROM`, `NOT EXISTS`) sur une vraie base
+//! (tables de la migration 110, `IS DISTINCT FROM`, `NOT EXISTS`) sur une vraie base
 //! PostgreSQL.
 //!
 //! Doctrine de `pg_insert_conditionnel_f7c250.rs` : `TUNE_TEST_PG_URL`
@@ -110,12 +110,12 @@ mod postgres {
         ))
         .unwrap();
 
-        // Relevé repris de zéro : celui d'un passage précédent du banc
-        // ignorerait les lignes posées ci-dessus.
+        // Relevé repris de zéro (tables de la migration PG 110) : celui d'un
+        // passage précédent du banc ignorerait les lignes posées ci-dessus.
         db.execute_batch(
-            "DROP TABLE IF EXISTS sync_releve_pistes;\
-             DROP TABLE IF EXISTS sync_releve_albums;\
-             DROP TABLE IF EXISTS sync_releve_artistes",
+            "DELETE FROM sync_releve_pistes;\
+             DELETE FROM sync_releve_albums;\
+             DELETE FROM sync_releve_artistes",
         )
         .unwrap();
 
