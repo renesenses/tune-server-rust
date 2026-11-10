@@ -268,7 +268,7 @@ async fn la_lecture_d_un_autre_album_n_attend_plus_le_prechargement_8215() {
         "prémisse : le préchargement tient le service"
     );
 
-    assert!(moteur.abandonner_pour_une_autre_piste("tidal", "AUTRE-ALBUM"));
+    assert!(moteur.abandonner_pour_une_autre_piste(banc.zone_id, "tidal", "AUTRE-ALBUM"));
     assert!(
         service_libre(&banc).await,
         "la lecture d'une autre piste doit reprendre le service tout de suite, \
@@ -286,7 +286,7 @@ async fn la_piste_prechargee_elle_meme_n_est_pas_abandonnee_8215() {
     let moteur = Arc::new(PrefetchEngine::new());
     let tache = prechargement_en_cours(&banc, &moteur).await;
     assert!(
-        !moteur.abandonner_pour_une_autre_piste("tidal", "LENTE"),
+        !moteur.abandonner_pour_une_autre_piste(banc.zone_id, "tidal", "LENTE"),
         "la lecture de la piste préchargée reprend son téléchargement (#7247)"
     );
     assert!(!service_libre(&banc).await);
@@ -307,4 +307,214 @@ async fn l_arret_abandonne_le_prechargement_en_cours_7266() {
         .await
         .expect("le préchargement abandonné se termine")
         .unwrap();
+}
+
+// ── Relecture de #8249 ──────────────────────────────────────────────────
+
+/// Le moteur de préchargement est commun à toutes les zones : une lecture
+/// sur une AUTRE zone (Qobuz sur la zone B) ne coupe pas le préchargement
+/// Tidal de la zone A.
+///
+/// Contre-épreuve : retirer `r.zone_id == zone_id &&` de
+/// `abandonner_pour_une_autre_piste` fait tomber ce test.
+#[tokio::test]
+async fn la_lecture_d_une_autre_zone_n_abandonne_pas_le_prechargement_8249() {
+    let banc = banc("LENTE", None).await;
+    let moteur = Arc::new(PrefetchEngine::new());
+    let tache = prechargement_en_cours(&banc, &moteur).await;
+    assert!(
+        !moteur.abandonner_pour_une_autre_piste(banc.zone_id + 1, "qobuz", "AUTRE-ZONE"),
+        "la lecture d'une autre zone a abandonné le préchargement de celle-ci"
+    );
+    assert!(
+        !moteur.abandonner_pour_une_autre_piste(banc.zone_id + 1, "tidal", "AUTRE-ZONE"),
+        "même service, autre zone : le préchargement reste"
+    );
+    assert!(
+        !service_libre(&banc).await,
+        "le préchargement tient toujours"
+    );
+    // La même zone, elle, l'abandonne toujours.
+    assert!(moteur.abandonner_pour_une_autre_piste(banc.zone_id, "qobuz", "X"));
+    tokio::time::timeout(Duration::from_secs(2), tache)
+        .await
+        .expect("le préchargement abandonné se termine")
+        .unwrap();
+}
+
+/// La même piste préchargée deux fois : la seconde abandonne la première,
+/// reprend le service et reste abandonnable par la lecture d'une autre piste.
+/// (Avant la relecture, la seconde attendait dans `get_actif`, registre tenu,
+/// la fin du téléchargement de la première.)
+#[tokio::test]
+async fn un_second_prechargement_de_la_meme_piste_reste_abandonnable_8249() {
+    let banc = banc("LENTE", None).await;
+    let moteur = Arc::new(PrefetchEngine::new());
+    let premiere = prechargement_en_cours(&banc, &moteur).await;
+    let seconde = {
+        let moteur = moteur.clone();
+        let (db, services, playback, zone) = (
+            banc.db.clone(),
+            banc.services.clone(),
+            banc.playback.clone(),
+            banc.zone_id,
+        );
+        tokio::spawn(async move { moteur.prefetch_next(db, services, playback, zone).await })
+    };
+    // La seconde abandonne la première, puis reprend le service.
+    for _ in 0..200 {
+        if banc.demandes.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(banc.demandes.lock().unwrap().len(), 2, "prémisse");
+    // La première tâche a fini (abandonnée) : c'est là qu'elle effaçait
+    // l'entrée de la seconde.
+    tokio::time::timeout(Duration::from_secs(2), premiere)
+        .await
+        .expect("la première se termine")
+        .unwrap();
+    assert!(
+        !service_libre(&banc).await,
+        "prémisse : la seconde tient le service"
+    );
+    assert!(
+        moteur.abandonner_pour_une_autre_piste(banc.zone_id, "tidal", "AUTRE-ALBUM"),
+        "le second préchargement n'est plus abandonnable"
+    );
+    assert!(service_libre(&banc).await);
+    tokio::time::timeout(Duration::from_secs(2), seconde)
+        .await
+        .expect("la seconde se termine")
+        .unwrap();
+}
+
+fn flux_dash(url: String) -> StreamUrl {
+    StreamUrl {
+        url,
+        mime_type: "audio/mp4".into(),
+        quality: crate::streaming::traits::StreamQuality {
+            codec: "flac".into(),
+            sample_rate: 44_100,
+            bit_depth: 16,
+            bitrate: None,
+            channels: 2,
+        },
+        expires_at: None,
+        headers: Vec::new(),
+    }
+}
+
+fn tampon(source_id: &str) -> crate::prefetch::PrefetchedTrack {
+    crate::prefetch::PrefetchedTrack {
+        source: "tidal".into(),
+        source_id: source_id.into(),
+        stream_id: None,
+        pcm_data: vec![0u8; 16],
+        format: "wav".into(),
+        sample_rate: 44_100,
+        bit_depth: 16,
+        channels: 2,
+        duration_ms: 200_000,
+        title: "Titre B".into(),
+        artist: None,
+        album: None,
+        cover_url: None,
+        mime_type: "audio/wav".into(),
+        upstream_url: None,
+    }
+}
+
+/// Le préchargement suit la qualité de la zone (#7266) : un tampon rempli en
+/// qualité CD sert une zone en qualité CD. Avant la relecture, la lecture
+/// ignorait tout tampon dès que la zone n'était pas en qualité « max » : le
+/// préchargement en qualité CD ne servait jamais.
+///
+/// Contre-épreuve : remettre dans `resolve_streaming_url` la condition
+/// `quality_preference != StreamingQualityPreference::Max` ramène l'ancien
+/// comportement (tampon jamais servi) ; ici, ignorer `qualite_du_tampon` dans
+/// `take_prefetched_en_qualite` fait tomber la seconde moitié.
+#[tokio::test]
+async fn un_tampon_en_qualite_cd_sert_une_zone_en_qualite_cd_8249() {
+    let moteur = PrefetchEngine::new();
+    *moteur.buffer.lock().await = Some(tampon("B"));
+    *moteur.qualite_du_tampon.lock().unwrap() = Some("LOSSLESS");
+    // La zone est passée en « max » depuis : le tampon CD ne la sert pas,
+    // et il reste en place.
+    assert!(
+        moteur
+            .take_prefetched_en_qualite("tidal", "B", None)
+            .await
+            .is_none(),
+        "un tampon en qualité CD a servi une zone en qualité max (#2723)"
+    );
+    assert!(moteur.has_prefetched("tidal", "B").await);
+    assert!(
+        moteur
+            .take_prefetched_en_qualite("tidal", "B", Some("LOSSLESS"))
+            .await
+            .is_some(),
+        "le tampon en qualité CD ne sert pas la zone en qualité CD"
+    );
+}
+
+/// Même règle pour le fMP4 DASH préchargé entier (#7247), que la lecture ne
+/// reprenait qu'en qualité « max ».
+#[tokio::test]
+async fn un_dash_complet_en_qualite_cd_sert_une_zone_en_qualite_cd_8249() {
+    let fichier = tempfile::NamedTempFile::new().unwrap();
+    let url = format!("file://{}", fichier.path().display());
+    let moteur = PrefetchEngine::new();
+    *moteur.dash_complet.lock().await = Some((
+        "tidal".into(),
+        "B".into(),
+        Some("LOSSLESS"),
+        flux_dash(url.clone()),
+    ));
+    assert!(
+        moteur
+            .prendre_dash_complet("tidal", "B", None)
+            .await
+            .is_none(),
+        "un DASH en qualité CD a servi une zone en qualité max"
+    );
+    assert_eq!(
+        moteur
+            .prendre_dash_complet("tidal", "B", Some("LOSSLESS"))
+            .await
+            .map(|f| f.url),
+        Some(url),
+        "le DASH en qualité CD ne sert pas la zone en qualité CD"
+    );
+}
+
+/// La même piste préchargée deux fois : la première tâche, abandonnée par la
+/// seconde, ne doit pas effacer en se terminant l'entrée de la seconde —
+/// sinon celle-ci n'est plus abandonnable et la lecture d'une autre piste
+/// l'attend. L'entrée s'efface par identifiant de tâche, plus par piste.
+///
+/// Contre-épreuve : comparer `(source, source_id)` au lieu de
+/// `AbortHandle::id()` dans `oublier_la_resolution` fait tomber ce test.
+#[tokio::test]
+async fn la_fin_d_une_ancienne_resolution_n_efface_pas_la_nouvelle_8249() {
+    use crate::prefetch::ResolutionEnVol;
+    let ancienne = tokio::spawn(std::future::pending::<()>());
+    let nouvelle = tokio::spawn(std::future::pending::<()>());
+    let moteur = PrefetchEngine::new();
+    *moteur.resolution_en_vol.lock().unwrap() = Some(ResolutionEnVol {
+        zone_id: 1,
+        source: "tidal".into(),
+        source_id: "LENTE".into(),
+        tache: nouvelle.abort_handle(),
+    });
+    moteur.oublier_la_resolution(ancienne.id());
+    assert!(
+        moteur.resolution_en_vol.lock().unwrap().is_some(),
+        "l'ancienne résolution de la même piste a effacé l'entrée de la nouvelle"
+    );
+    moteur.oublier_la_resolution(nouvelle.id());
+    assert!(moteur.resolution_en_vol.lock().unwrap().is_none());
+    ancienne.abort();
+    nouvelle.abort();
 }

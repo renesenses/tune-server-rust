@@ -85,7 +85,9 @@ pub struct PrefetchedTrack {
 pub struct PrefetchEngine {
     buffer: Mutex<Option<PrefetchedTrack>>,
     /// Le fMP4 DASH est entier avant le décodage du tampon PCM (#7247).
-    dash_complet: Mutex<Option<(String, String, crate::streaming::StreamUrl)>>,
+    /// `(service, piste, qualité demandée, flux)` — la qualité (`None` =
+    /// maximum du service) n'est servie qu'à une zone qui la demande.
+    dash_complet: Mutex<Option<DashComplet>>,
     /// Cancellation token: set to true to abort an in-progress prefetch.
     cancel: Mutex<bool>,
     /// The queue position that was prefetched, so callers can detect
@@ -98,10 +100,26 @@ pub struct PrefetchEngine {
     /// Elle l'abandonne désormais ([`Self::abandonner_pour_une_autre_piste`]),
     /// l'arrêt aussi ([`Self::clear`]).
     resolution_en_vol: std::sync::Mutex<Option<ResolutionEnVol>>,
+    /// #8215 / #7266 (relecture) — le jeton de qualité demandé au service
+    /// pour remplir [`Self::buffer`] (`None` = maximum du service). Écrit sous
+    /// le verrou du tampon : la lecture ne sert le tampon que si ce jeton est
+    /// celui de la qualité de la zone ([`Self::take_prefetched_en_qualite`]).
+    qualite_du_tampon: std::sync::Mutex<Option<&'static str>>,
 }
+
+/// Le fMP4 DASH préchargé entier : service, piste, jeton de qualité, flux.
+type DashComplet = (
+    String,
+    String,
+    Option<&'static str>,
+    crate::streaming::StreamUrl,
+);
 
 /// La résolution de préchargement en cours, et de quoi l'abandonner.
 struct ResolutionEnVol {
+    /// La zone dont la file est préchargée : le moteur est commun à toutes
+    /// les zones, la lecture d'une zone n'abandonne que le sien.
+    zone_id: i64,
     source: String,
     source_id: String,
     tache: tokio::task::AbortHandle,
@@ -121,11 +139,17 @@ impl PrefetchEngine {
             cancel: Mutex::new(false),
             prefetched_position: Mutex::new(None),
             resolution_en_vol: std::sync::Mutex::new(None),
+            qualite_du_tampon: std::sync::Mutex::new(None),
         }
     }
 
     /// #8215 / #7266 — abandonne la résolution de préchargement en cours si
-    /// elle porte sur une AUTRE piste que `source`/`source_id`.
+    /// elle porte sur une AUTRE piste que `source`/`source_id` de la MÊME
+    /// zone `zone_id`.
+    ///
+    /// Le moteur est commun à toutes les zones : la lecture d'une autre zone
+    /// (Qobuz sur la zone B) ne coupe pas le préchargement de la zone A
+    /// (relecture de #8249).
     ///
     /// Appelé par la lecture avant de prendre le verrou du service : un
     /// préchargement Tidal en DASH tient ce verrou le temps de télécharger la
@@ -133,19 +157,25 @@ impl PrefetchEngine {
     /// autre album l'attendait — 56,8 s mesurées au lieu d'une dizaine. Le
     /// préchargement de la piste DEMANDÉE est gardé : la lecture le reprend
     /// (`prendre_dash_complet`, #7247). Rend vrai si une tâche a été abandonnée.
-    pub fn abandonner_pour_une_autre_piste(&self, source: &str, source_id: &str) -> bool {
+    pub fn abandonner_pour_une_autre_piste(
+        &self,
+        zone_id: i64,
+        source: &str,
+        source_id: &str,
+    ) -> bool {
         let Ok(mut en_vol) = self.resolution_en_vol.lock() else {
             return false;
         };
-        let autre = en_vol
-            .as_ref()
-            .is_some_and(|r| r.source != source || r.source_id != source_id);
+        let autre = en_vol.as_ref().is_some_and(|r| {
+            r.zone_id == zone_id && (r.source != source || r.source_id != source_id)
+        });
         if !autre {
             return false;
         }
         if let Some(r) = en_vol.take() {
             r.tache.abort();
             info!(
+                zone_id,
                 source = %r.source,
                 source_id = %r.source_id,
                 demandee = %source_id,
@@ -153,6 +183,16 @@ impl PrefetchEngine {
             );
         }
         true
+    }
+
+    /// Efface l'entrée de résolution en cours si c'est encore celle de la
+    /// tâche `tache_id`.
+    fn oublier_la_resolution(&self, tache_id: tokio::task::Id) {
+        if let Ok(mut en_vol) = self.resolution_en_vol.lock()
+            && en_vol.as_ref().is_some_and(|r| r.tache.id() == tache_id)
+        {
+            *en_vol = None;
+        }
     }
 
     /// Abandonne toute résolution de préchargement en cours (arrêt, file
@@ -174,17 +214,20 @@ impl PrefetchEngine {
         &self,
         source: &str,
         source_id: &str,
+        qualite: Option<&str>,
     ) -> Option<crate::streaming::StreamUrl> {
         let mut garde = self.dash_complet.lock().await;
-        let (service, id, flux) = garde.as_ref()?;
-        if service != source || id != source_id {
+        let (service, id, rempli_a, flux) = garde.as_ref()?;
+        // Relecture de #8249 — le téléchargement suit la qualité de la zone
+        // (#7266) : il sert la zone qui demande cette qualité-là.
+        if service != source || id != source_id || *rempli_a != qualite {
             return None;
         }
         let existe = flux
             .url
             .strip_prefix("file://")
             .is_some_and(|p| std::path::Path::new(p).is_file());
-        let (_, _, flux) = garde.take()?;
+        let (_, _, _, flux) = garde.take()?;
         existe.then_some(flux)
     }
 
@@ -359,6 +402,7 @@ impl PrefetchEngine {
                 db,
                 services,
                 mode,
+                zone_id,
                 qualite,
                 source,
                 source_id,
@@ -389,6 +433,7 @@ impl PrefetchEngine {
         _db: Arc<dyn DbBackend>,
         services: Arc<Mutex<ServiceRegistry>>,
         mode: PrefetchMode,
+        zone_id: i64,
         qualite: Option<&'static str>,
         source: String,
         source_id: String,
@@ -404,6 +449,13 @@ impl PrefetchEngine {
         // service, et la résolution part dans une tâche abandonnable : la
         // lecture d'une autre piste ou l'arrêt la coupent au lieu d'attendre
         // la fin d'un téléchargement DASH.
+        //
+        // Relecture de #8249 — la résolution précédente est abandonnée AVANT
+        // de chercher le service : `get_actif` lit le service, et la
+        // résolution précédente le tient en écriture (téléchargement DASH).
+        // Cherché d'abord, le service faisait attendre ce préchargement-ci, le
+        // registre tenu, jusqu'à la fin de l'ancien téléchargement.
+        self.abandonner_la_resolution();
         let svc = {
             let registry = services.lock().await;
             match registry.get_actif(&source).await {
@@ -427,19 +479,19 @@ impl PrefetchEngine {
                 ancienne.tache.abort();
             }
             *en_vol = Some(ResolutionEnVol {
+                zone_id,
                 source: source.clone(),
                 source_id: source_id.clone(),
                 tache: tache.abort_handle(),
             });
         }
+        let tache_id = tache.id();
         let resultat = tache.await;
-        if let Ok(mut en_vol) = self.resolution_en_vol.lock()
-            && en_vol
-                .as_ref()
-                .is_some_and(|r| r.source == source && r.source_id == source_id)
-        {
-            *en_vol = None;
-        }
+        // Relecture de #8249 — n'effacer que SA propre entrée : si la même
+        // piste a été préchargée une seconde fois entre-temps, l'ancienne
+        // tâche (abandonnée) ne doit pas effacer l'entrée de la nouvelle,
+        // qui ne serait alors plus abandonnable.
+        self.oublier_la_resolution(tache_id);
         let stream_data = match resultat {
             Ok(Some(flux)) => flux,
             Ok(None) => return,
@@ -450,8 +502,12 @@ impl PrefetchEngine {
         };
 
         if source == "tidal" && stream_data.url.starts_with("file://") {
-            *self.dash_complet.lock().await =
-                Some((source.clone(), source_id.clone(), stream_data.clone()));
+            *self.dash_complet.lock().await = Some((
+                source.clone(),
+                source_id.clone(),
+                qualite,
+                stream_data.clone(),
+            ));
         }
 
         // Fetch track metadata if not provided
@@ -634,7 +690,11 @@ impl PrefetchEngine {
                     upstream_url: upstream_url_for_origin,
                 };
 
-                *self.buffer.lock().await = Some(prefetched);
+                let mut tampon = self.buffer.lock().await;
+                if let Ok(mut q) = self.qualite_du_tampon.lock() {
+                    *q = qualite;
+                }
+                *tampon = Some(prefetched);
             }
             Ok(Err(e)) => {
                 warn!(error = %e, "prefetch_failed");
@@ -671,6 +731,40 @@ impl PrefetchEngine {
             );
         }
         None
+    }
+
+    /// #8215 / #7266 (relecture) — comme [`Self::take_prefetched`], mais le
+    /// tampon n'est servi que s'il a été rempli à la qualité `qualite` (le
+    /// jeton du service pour la qualité de la zone, `None` = maximum). Le
+    /// préchargement suit la qualité de la zone (#7266) : un tampon en
+    /// qualité CD sert une zone en qualité CD. Une zone dont la qualité a
+    /// changé depuis ne reçoit pas un tampon d'une autre qualité (#2723) ; il
+    /// reste en place.
+    pub async fn take_prefetched_en_qualite(
+        &self,
+        source: &str,
+        source_id: &str,
+        qualite: Option<&str>,
+    ) -> Option<PrefetchedTrack> {
+        {
+            let buf = self.buffer.lock().await;
+            let rempli_a = self.qualite_du_tampon.lock().ok().map(|q| *q);
+            if buf
+                .as_ref()
+                .is_some_and(|p| p.source == source && p.source_id == source_id)
+                && rempli_a != Some(qualite)
+            {
+                debug!(
+                    source = %source,
+                    source_id = %source_id,
+                    demandee = ?qualite,
+                    tampon = ?rempli_a,
+                    "prefetch_quality_mismatch"
+                );
+                return None;
+            }
+        }
+        self.take_prefetched(source, source_id).await
     }
 
     /// Check if a prefetched track is available (without consuming it).
