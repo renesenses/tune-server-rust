@@ -1132,6 +1132,10 @@ path = "tests/radio_artiste_5395.rs"
 [[test]]
 name = "contexte_de_session_6465"
 path = "tests/contexte_de_session_6465.rs"
+# #7889 — « Lecture » après un redémarrage garde le conteneur de la file.
+[[test]]
+name = "contexte_apres_redemarrage_7889"
+path = "tests/contexte_apres_redemarrage_7889.rs"
 # #6468 — un épisode de podcast sur un renderer réseau passe par le mandataire
 # de Tune (http://) ; une sortie locale garde l'URL ; un refus de la sortie est
 # une erreur HTTP lisible. `autotests = false` plus haut : sans cette cible, le

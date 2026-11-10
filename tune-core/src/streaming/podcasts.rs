@@ -1539,7 +1539,7 @@ mod tests {
                 .filter(|c| c.is_alphanumeric())
                 .collect()
         }
-        let client = reqwest::Client::builder()
+        let client = crate::http::client::builder()
             .user_agent("Mozilla/5.0")
             .build()
             .unwrap();
