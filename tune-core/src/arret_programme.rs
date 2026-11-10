@@ -125,10 +125,13 @@ fn jour_coche(masque: &str, jour: u32) -> bool {
 
 /// Lit le réglage. Absent ou illisible (journalisé) → `None`.
 pub fn lire(db: &Arc<dyn DbBackend>) -> Option<ArretProgramme> {
-    let brut = SettingsRepo::with_backend(db.clone())
-        .get_sans_ecrivain(CLE)
-        .ok()
-        .flatten()?;
+    let brut = match SettingsRepo::with_backend(db.clone()).get_sans_ecrivain(CLE) {
+        Ok(v) => v?,
+        Err(e) => {
+            warn!(error = %e, "scheduled_stop_read_failed");
+            return None;
+        }
+    };
     match serde_json::from_str::<ArretProgramme>(&brut) {
         Ok(r) => Some(r),
         Err(e) => {
