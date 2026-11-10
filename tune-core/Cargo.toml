@@ -844,3 +844,9 @@ path = "tests/autoeq_canaux_7340.rs"
 [[test]]
 name = "pochettes_compilations_6077"
 path = "tests/pochettes_compilations_6077.rs"
+
+# #8239 : le journal de synchro après un scan, sur PostgreSQL (`IS DISTINCT
+# FROM`, `CREATE TABLE … AS`). Sauté sans `TUNE_TEST_PG_URL`.
+[[test]]
+name = "journal_apres_scan_pg_8239"
+path = "tests/journal_apres_scan_pg_8239.rs"

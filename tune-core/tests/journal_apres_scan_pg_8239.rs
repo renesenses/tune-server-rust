@@ -91,9 +91,18 @@ mod postgres {
              FROM albums al WHERE al.title = '{MARQUE}-album'"
         ))
         .unwrap();
-        let artiste = id(&db, &format!("SELECT id FROM artists WHERE name = '{MARQUE}-artiste'"));
-        let album = id(&db, &format!("SELECT id FROM albums WHERE title = '{MARQUE}-album'"));
-        let p1 = id(&db, &format!("SELECT id FROM tracks WHERE title = '{MARQUE}-p1'"));
+        let artiste = id(
+            &db,
+            &format!("SELECT id FROM artists WHERE name = '{MARQUE}-artiste'"),
+        );
+        let album = id(
+            &db,
+            &format!("SELECT id FROM albums WHERE title = '{MARQUE}-album'"),
+        );
+        let p1 = id(
+            &db,
+            &format!("SELECT id FROM tracks WHERE title = '{MARQUE}-p1'"),
+        );
         db.execute_batch(&format!(
             "INSERT INTO sync_changelog (entity_type, entity_id, action, synced) VALUES \
              ('artist', {artiste}, 'upsert', 1), ('album', {album}, 'upsert', 1), \
@@ -117,10 +126,18 @@ mod postgres {
              VALUES ('{MARQUE}-p2', {album}, {artiste}, '{MARQUE}/p2.flac')"
         ))
         .unwrap();
-        let p2 = id(&db, &format!("SELECT id FROM tracks WHERE title = '{MARQUE}-p2'"));
+        let p2 = id(
+            &db,
+            &format!("SELECT id FROM tracks WHERE title = '{MARQUE}-p2'"),
+        );
         journaliser_ce_qui_a_change(&db);
 
-        let a_moi = [("artist", artiste), ("album", album), ("track", p1), ("track", p2)];
+        let a_moi = [
+            ("artist", artiste),
+            ("album", album),
+            ("track", p1),
+            ("track", p2),
+        ];
         let mut vu = en_attente(&db, &a_moi);
         vu.sort();
         assert_eq!(
@@ -138,7 +155,8 @@ mod postgres {
              AND entity_id IN ({album}, {p2})"
         ))
         .unwrap();
-        db.execute_batch(&format!("DELETE FROM tracks WHERE id = {p2}")).unwrap();
+        db.execute_batch(&format!("DELETE FROM tracks WHERE id = {p2}"))
+            .unwrap();
         journaliser_ce_qui_a_change(&db);
         let mut vu = en_attente(&db, &a_moi);
         vu.sort();
