@@ -476,11 +476,15 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
     'reconnect: loop {
         match une_connexion(&mut etat, &url, &canaux) {
             SuiteRadio::Reconnecter => continue 'reconnect,
-            // #8110 — le diffuseur refuse CE flux : le suivant de la fiche,
-            // s'il y en a un, comme une première connexion (la relance
-            // bornée repart de zéro, c'est une autre adresse).
+            // #8110 — le diffuseur refuse CE flux avant le moindre PCM : le
+            // suivant de la fiche, s'il y en a un, comme une première
+            // connexion (la relance bornée repart de zéro, c'est une autre
+            // adresse). Un refus en cours d'écoute garde le comportement
+            // d'avant : le WAV est déjà annoncé au format du premier flux, et
+            // un repli d'un autre format finirait en arrêt muet.
             SuiteRadio::Rendre(Err(e))
-                if super::radio_replis_8110::flux_refuse_par_le_diffuseur(&e) =>
+                if !etat.first_chunk_sent
+                    && super::radio_replis_8110::flux_refuse_par_le_diffuseur(&e) =>
             {
                 match replis.next() {
                     Some(suivant) => {
