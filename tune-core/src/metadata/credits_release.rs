@@ -95,7 +95,7 @@ pub fn est_role_d_ecriture(role: &str) -> bool {
 /// `'a', 'b', …` pour un `IN (…)` : les rôles sont des mots du vocabulaire
 /// canonique, jamais une saisie, et un paramètre lié par rôle alourdirait les
 /// quatre branches de chaque requête.
-fn liste_sql(roles: &[&str]) -> String {
+pub(super) fn liste_sql(roles: &[&str]) -> String {
     roles
         .iter()
         .map(|r| format!("'{r}'"))
@@ -823,7 +823,7 @@ fn cle_fiche(backend: &Arc<dyn DbBackend>) -> &'static str {
 /// parcourir toute la table à chaque page artiste. `filtre` restreint chaque
 /// branche (les rôles) ; les paramètres liés sont, dans l'ordre, l'identifiant
 /// en texte, le nom, le MBID.
-fn credits_de_l_artiste_sql(backend: &Arc<dyn DbBackend>, filtre: &str) -> String {
+pub(super) fn credits_de_l_artiste_sql(backend: &Arc<dyn DbBackend>, filtre: &str) -> String {
     let cle_fiche = cle_fiche(backend);
     format!(
         "SELECT id FROM track_credits WHERE {cle_fiche}{filtre} \

@@ -15,8 +15,10 @@ pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod completude;
 pub mod credits_balises;
+// « Joue avec » de la page artiste (#7768).
 #[cfg(test)]
 mod credits_balises_tests_7766;
+pub mod credits_joue_avec;
 pub mod credits_mb;
 pub mod credits_release;
 pub mod discogs_propositions;

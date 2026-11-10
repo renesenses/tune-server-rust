@@ -1583,6 +1583,12 @@ path = "tests/credits_musicbrainz_4767.rs"
 name = "page_artiste_sections_7767"
 path = "tests/page_artiste_sections_7767.rs"
 
+# #7768 — « joue avec » (`played_with`) de la page artiste : audibles
+# seulement, ni lui-même ni « Various Artists », ordre et plafond.
+[[test]]
+name = "page_artiste_joue_avec_7768"
+path = "tests/page_artiste_joue_avec_7768.rs"
+
 # #2742 (23/09) — une zone réseau sans flux progressif garde le crossfeed
 # RÉGLABLE : les flux des services le portent. `autotests = false` plus haut :
 # sans cette cible, le fichier ne serait jamais compilé.
@@ -1739,6 +1745,13 @@ required-features = ["postgres"]
 [[test]]
 name = "pg_page_artiste_7767"
 path = "tests/pg_page_artiste_7767.rs"
+required-features = ["postgres"]
+
+# #7768 — « joue avec » sur PostgreSQL : `track_credits.artist_id` lu en
+# texte ou en entier, `CAST` de la garde, `COLLATE NOCASE` remplacé.
+[[test]]
+name = "pg_page_artiste_joue_avec_7768"
+path = "tests/pg_page_artiste_joue_avec_7768.rs"
 required-features = ["postgres"]
 
 # #7027 — une bio rangée sans langue (`bio_lang` vide ou NULL) n'est jamais

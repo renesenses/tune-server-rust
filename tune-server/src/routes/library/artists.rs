@@ -1193,6 +1193,17 @@ fn inserer_sections_de_credits(
         compteurs_de_credits(&state.backend, artist_id).to_json(),
     );
 
+    // #7768 — « joue avec » : absente quand personne n'est audible avec lui
+    // (contrat § 3.3). Avant le retour anticipé : l'artiste de ses propres
+    // pistes peut n'avoir aucun crédit et des musiciens crédités à côté.
+    let joue_avec = tune_core::metadata::credits_joue_avec::joue_avec(&state.backend, artist_id);
+    if !joue_avec.is_empty() {
+        obj.insert(
+            "played_with".into(),
+            Value::Array(joue_avec.iter().map(|j| j.to_json()).collect()),
+        );
+    }
+
     let (credits, disques) = credits_hors_discographie(&state.backend, artist_id);
     if credits.is_empty() {
         return;
