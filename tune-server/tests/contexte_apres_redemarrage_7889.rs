@@ -137,6 +137,12 @@ async fn lire_l_album_puis_stop(banc: &Banc) {
             debut.elapsed() < std::time::Duration::from_secs(20),
             "la reprise d'écoute de l'album n'a jamais été écrite"
         );
+        // Depuis #7852 la reprise n'est écrite qu'à la validation de l'écoute
+        // (seuil min(30 s, 50 %)), par le sondeur, absent de ce banc : on joue
+        // son tour avec une position au-delà du seuil de la piste d'une seconde.
+        state.playback.update_position(zone, 900).await;
+        let etat = state.playback.get_state(zone).await;
+        state.orchestrator.valider_l_ecoute(&etat);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(
