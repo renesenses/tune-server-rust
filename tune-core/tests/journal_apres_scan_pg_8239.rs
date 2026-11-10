@@ -23,6 +23,11 @@ mod postgres {
         let db = PostgresDb::connect(url)
             .await
             .unwrap_or_else(|e| panic!("TUNE_TEST_PG_URL posée mais injoignable ({url}) : {e}"));
+        // Base neuve comme base déjà servie : les scripts numérotés sont
+        // idempotents.
+        tune_core::db::migrations::run_pg_migrations(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("migrations PG : {e}"));
         Arc::new(PostgresBackend::new(db.pool().clone()))
     }
 
