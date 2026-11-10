@@ -3734,4 +3734,84 @@ async fn pg_7619_revision_de_la_bibliotheque() {
         apres,
         "l'historique ne la change pas"
     );
+/// web#916 — « Pas pour moi » sur le VRAI moteur PostgreSQL.
+///
+/// Le témoin RETIRE la table et la ligne 110 de `schema_version`, puis rejoue
+/// le lanceur : si le script 110 ne la posait pas, le premier écart rendrait
+/// une erreur SQL. Puis, par le pont `DbBackend` : les marqueurs `$n`,
+/// `ON CONFLICT … DO UPDATE` (écarter deux fois sans doublon), le
+/// cloisonnement par profil (BIGINT) et le rétablissement.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_916_suggestions_ecartees() {
+    use crate::db::suggestions_ecartees::{SuggestionEcartee, SuggestionsEcarteesRepo};
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!(
+            "SAUT : TUNE_TEST_PG_URL non posée — une épreuve de {} rend la main sans toucher aucune base.",
+            module_path!()
+        );
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap_or_else(|e| {
+        panic!("TUNE_TEST_PG_URL est POSÉE ({url}) mais la connexion échoue : {e}")
+    });
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("lanceur PG");
+    sqlx::raw_sql(
+        "DROP TABLE IF EXISTS suggestions_ecartees;
+         DELETE FROM schema_version WHERE version >= 110;",
+    )
+    .execute(&pool)
+    .await
+    .expect("retirer la table et la 110");
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("le lanceur doit rejouer la 110");
+    let pose: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = current_schema() AND table_name = 'suggestions_ecartees'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pose, 1, "la 110 n'a pas posé `suggestions_ecartees`");
+    let type_profil: String = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'suggestions_ecartees' \
+           AND column_name = 'profile_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(type_profil, "bigint");
+
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool.clone()));
+    let repo = SuggestionsEcarteesRepo::with_backend(db);
+    let album = SuggestionEcartee {
+        item_type: "album".into(),
+        source: " Qobuz".into(),
+        item_id: "pg-916".into(),
+        title: Some("Kind of Blue".into()),
+        subtitle: Some("Miles Davis".into()),
+        cover_url: None,
+        created_at: None,
+    };
+    assert!(repo.ecarter(1, &album).unwrap().is_some());
+    assert!(
+        repo.ecarter(1, &album).unwrap().is_some(),
+        "écarter deux fois : ON CONFLICT … DO UPDATE, pas d'erreur de clé"
+    );
+    let liste = repo.lister(1).unwrap();
+    assert_eq!(liste.len(), 1, "{liste:?}");
+    assert_eq!(liste[0].source, "qobuz");
+    assert!(liste[0].created_at.is_some());
+    assert!(repo.ensemble(1).album_de_service("qobuz", "pg-916"));
+    assert!(
+        !repo.ensemble(2).album_de_service("qobuz", "pg-916"),
+        "un autre profil voit toujours l'album"
+    );
+    assert!(repo.retablir(1, &album).unwrap());
+    assert!(repo.lister(1).unwrap().is_empty());
+    pool.close().await;
 }

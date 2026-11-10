@@ -98,6 +98,8 @@ pub mod settings_repo;
 pub mod source_link_repo;
 pub mod sqlite;
 pub mod streaming_favorites_repo;
+/// « Pas pour moi » — suggestions d'accueil écartées, par profil (web#916).
+pub mod suggestions_ecartees;
 pub mod tag_repo;
 /// Registre des executions automatisees (#2080).
 pub mod task_run_repo;

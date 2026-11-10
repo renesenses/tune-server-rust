@@ -2807,6 +2807,35 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "correction_pure_classix",
         up: include_str!("../../migrations/radios/correction_pure_classix_8119.sql"),
     },
+    // renesenses/tune-web-client#916 (FabienM, fil forum 1527) — « Pas pour
+    // moi » sur une suggestion de l'accueil : `suggestions_ecartees`, PAR
+    // PROFIL, écrite ET lue. Un album (local ou de service), une playlist de
+    // service, ou un artiste désigné par son nom normalisé. Les rangées de
+    // recommandation de `/home/*` ne proposent plus ce que le profil a
+    // écarté ; un autre profil le voit toujours. Go de Bertrand du 12/10.
+    //
+    // Table à part, pas un `item_type` de plus dans `hidden_items` : écarter
+    // une suggestion ne retire RIEN de la bibliothèque (voir
+    // `suggestions_ecartees.rs`).
+    //
+    // Patron `hidden_items` (89) : PAS de colonne `id`, la clé naturelle est
+    // la clé primaire — pas de divergence AUTOINCREMENT / BIGSERIAL à la
+    // bascule (#1706). `item_id` en TEXT : un identifiant de service n'est pas
+    // un entier, un nom d'artiste non plus.
+    //
+    // Numérotée 144 / PG 110 à sa jonction avec `batch/bugs-rc12-20261108`
+    // (10/11) : le chantier la tenait en 125 / 089, prises depuis le 12/10
+    // par `playlist_tracks_orphelines` (#6179) ; la 143 / PG 109 (#8119) est
+    // la dernière du lot, et la garde de contiguïté exige la suivante.
+    // ⚠️ La PR de #8239 (`sync_releve`, ouverte) réclame AUSSI 144 / 110 :
+    // celle qui fusionne après l'autre se renumérote (règle de la 119).
+    // Idempotent : IF NOT EXISTS. Aussi dans le CORE_SCHEMA (base neuve),
+    // `PG_FULL_SCHEMA` (bascule) et `ENSURE_TABLES` (bases PG converties).
+    Migration {
+        version: 144,
+        name: "suggestions_ecartees",
+        up: SQL_SUGGESTIONS_ECARTEES,
+    },
 ];
 
 /// L'index partiel des pistes marquées explicites (#8088), commun aux deux
@@ -2945,6 +2974,22 @@ fn playlist_tracks_garde_les_orphelines(db: &SqliteDb) -> Result<(), String> {
     retablies.map_err(|e| format!("migration 125 (foreign_keys) : {e}"))?;
     Ok(())
 }
+
+/// SQL de la migration 144 (web#916) — voir son entrée dans `MIGRATIONS`.
+/// Jumelle PG : `110_suggestions_ecartees.sql`.
+pub(crate) const SQL_SUGGESTIONS_ECARTEES: &str = "
+CREATE TABLE IF NOT EXISTS suggestions_ecartees (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    title TEXT,
+    subtitle TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, item_type, source, item_id)
+);
+";
 
 /// SQL de la migration 121 (#2713) — voir son entrée dans `MIGRATIONS`. Le
 /// même texte que la jumelle PG 085, à la transaction près.
@@ -5967,6 +6012,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
              ON CONFLICT (version) DO NOTHING;\n"
         ),
     ),
+    // Jumelle de la SQLite 144 (web#916) : `suggestions_ecartees`, le « Pas
+    // pour moi » de l'accueil, par profil.
+    (
+        110,
+        "suggestions_ecartees",
+        include_str!("../../migrations/postgres/110_suggestions_ecartees.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -8420,6 +8472,105 @@ mod tests {
         );
     }
 
+    /// web#916 — la migration 144 pose `suggestions_ecartees` (le « Pas pour
+    /// moi » de l'accueil, par profil), sur une base NEUVE comme sur une base
+    /// MONTÉE en 143 ; la clé primaire est le quadruplet (profil, type,
+    /// source, identifiant) ; la jumelle PG 110 existe, est enregistrée, marque
+    /// le bon numéro, et le schéma de bascule (avec sa table de copie et sa
+    /// clause de conflit) comme `ENSURE_TABLES` la portent.
+    #[test]
+    fn la_migration_144_pose_les_suggestions_ecartees_916() {
+        let colonnes = |db: &SqliteDb| -> Vec<(String, i64)> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(suggestions_ecartees)")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let cle_attendue = vec![
+            ("profile_id".to_string(), 1),
+            ("item_type".to_string(), 2),
+            ("source".to_string(), 3),
+            ("item_id".to_string(), 4),
+        ];
+        let cle = |c: Vec<(String, i64)>| -> Vec<(String, i64)> {
+            let mut k: Vec<_> = c.into_iter().filter(|(_, pk)| *pk > 0).collect();
+            k.sort_by_key(|(_, pk)| *pk);
+            k
+        };
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(cle(colonnes(&neuve)), cle_attendue, "base neuve");
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "DROP TABLE suggestions_ecartees;
+                 DELETE FROM _migrations WHERE version >= 144;",
+            )
+            .unwrap();
+        assert!(colonnes(&montee).is_empty(), "préparation : table retirée");
+        assert_eq!(current_version(&montee).unwrap(), 143);
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert!(latest_version() >= 144);
+        assert_eq!(cle(colonnes(&montee)), cle_attendue, "base montée en 143");
+        montee
+            .execute_batch(
+                "INSERT INTO suggestions_ecartees (profile_id, item_type, source, item_id) \
+                 VALUES (1, 'album', 'local', '7'), (2, 'album', 'local', '7');",
+            )
+            .expect("deux profils, même album : deux lignes distinctes");
+        assert!(
+            montee
+                .execute_batch(
+                    "INSERT INTO suggestions_ecartees (profile_id, item_type, source, item_id) \
+                     VALUES (1, 'album', 'local', '7');",
+                )
+                .is_err(),
+            "le même écart deux fois pour un profil doit heurter la clé primaire"
+        );
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "110_suggestions_ecartees.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(
+            sql_pg.contains("VALUES (110, 'suggestions_ecartees')"),
+            "le script PG marque un autre numéro dans schema_version"
+        );
+        assert!(
+            sql_pg.contains("CREATE TABLE IF NOT EXISTS suggestions_ecartees")
+                && sql_pg.contains("profile_id BIGINT NOT NULL")
+                && sql_pg.contains("PRIMARY KEY (profile_id, item_type, source, item_id)"),
+            "la jumelle PG ne pose pas la table, ou pas avec la même clé"
+        );
+        assert!(
+            include_str!("migrations.rs").contains(fichier),
+            "{fichier} n'est pas enregistrée"
+        );
+        let bascule = include_str!("pg_migrate.rs");
+        assert!(
+            bascule.contains("CREATE TABLE IF NOT EXISTS suggestions_ecartees")
+                && bascule.contains("\"suggestions_ecartees\",")
+                && bascule
+                    .contains("ON CONFLICT (profile_id, item_type, source, item_id) DO NOTHING"),
+            "pg_migrate.rs : table, copie ou clause de conflit manquante — les écarts \
+             seraient perdus à la bascule SQLite -> PostgreSQL"
+        );
+        assert!(
+            include_str!("postgres.rs").contains("CREATE TABLE IF NOT EXISTS suggestions_ecartees"),
+            "ENSURE_TABLES ne pose pas `suggestions_ecartees`"
+        );
+    }
+
     /// #6123 — la migration 124 pose `tracks.rating` (la note de la piste lue
     /// dans ses balises), sur une base NEUVE comme sur une base MONTÉE en 123
     /// avec une piste ; la colonne est NULLABLE et l'existant reste NULL ; la
@@ -9650,7 +9801,9 @@ mod tests {
         // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
         // Migration de DONNÉES : le nom, le pays et le genre de la station
         // semée sous « PureClassic Radio ».
-        assert_eq!(pg_latest_version(), 109, "latest PG migration must be 109");
+        // 110 : `suggestions_ecartees` (web#916), jumelle de la SQLite 144. Le
+        // « Pas pour moi » de l'accueil, par profil.
+        assert_eq!(pg_latest_version(), 110, "latest PG migration must be 110");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

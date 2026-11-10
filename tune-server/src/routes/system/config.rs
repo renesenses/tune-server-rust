@@ -4097,6 +4097,14 @@ fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
     r.masques_rerattaches = masques.relinked as i64;
     r.masques_non_resolus = masques.unresolved as i64;
 
+    // web#916 — les albums locaux écartés de l'accueil (« Pas pour moi »),
+    // même règle : re-rattachés, jamais supprimés ici.
+    tune_core::db::suggestions_ecartees::reconcilier_journalise(
+        state.backend.clone(),
+        false,
+        "purge",
+    );
+
     // Même absence de clé étrangère, même règle pour les paires « ces deux
     // albums ne sont pas des doublons » (#1276) : la purge fait mourir des
     // `albums.id`, donc des paires deviennent orphelines. `false` = on ne
