@@ -38,6 +38,32 @@ const REFUS_CLE_REQUISE: &str = "cle du serveur requise";
 /// Intervalle minimal entre deux réinscriptions forcées de la clé.
 const INTERVALLE_REINSCRIPTION_DE_CLE: Duration = Duration::from_secs(600);
 
+/// Durée minimale d'une session inscrite pour remettre le recul à zéro.
+///
+/// 🔴 Deux serveurs au même `server_id` (sauvegarde restaurée sur une autre
+/// machine) se délogent l'un l'autre : le relais ferme l'ancienne connexion à
+/// chaque nouvelle inscription (« superseded », `tune-bridge/src/ws_server.rs`).
+/// Chaque session est donc INSCRITE puis fermée en quelques millisecondes ;
+/// si toute session inscrite remettait le compteur à zéro, les deux
+/// serveurs se réinscrivaient toutes les 2 s, sans fin. Une session courte
+/// compte comme un échec et le recul grandit jusqu'à son plafond.
+const SESSION_STABLE: Duration = Duration::from_secs(60);
+
+/// Numéro de la prochaine tentative après une session terminée par `fin`,
+/// qui a duré `duree` depuis le début de la tentative.
+fn tentative_suivante(attempt: u32, fin: &Result<FinDeSession, String>, duree: Duration) -> u32 {
+    if fin.is_ok() && duree >= SESSION_STABLE {
+        1
+    } else {
+        attempt.saturating_add(1)
+    }
+}
+
+/// Attente avant la tentative numéro `attempt` : 2, 4, 8… plafonnée à 60 s.
+fn attente_avant(attempt: u32) -> Duration {
+    Duration::from_secs(std::cmp::min(1u64.saturating_mul(1 << attempt.min(6)), 60))
+}
+
 /// Les délais du client, remplaçables par les bancs.
 #[derive(Debug, Clone, Copy)]
 pub struct DelaisDuRelais {
@@ -237,6 +263,7 @@ impl RelayClient {
                     "connecting to relay"
                 );
 
+                let debut = std::time::Instant::now();
                 let fin = client.connect_and_run().await;
                 match &fin {
                     Ok(FinDeSession::Fermee) => {
@@ -260,18 +287,6 @@ impl RelayClient {
                 *client.ws_tx.lock().await = None;
                 *client.ws_vrac.lock().await = None;
 
-                // Une session qui a été INSCRITE remet le compteur à zéro :
-                // `Ok` ne sort de `connect_and_run` qu'après l'accusé du
-                // relais. Sans cela, chaque coupure de la vie du serveur
-                // (redéploiement du relais, box qui redémarre) allongeait
-                // l'attente suivante, jusqu'au plafond de 60 s — mesuré sur
-                // le .18 le 08/11/2026 : « backoff_secs=60 » après une
-                // simple fermeture propre, soit une minute pendant laquelle
-                // l'app lit « serveur absent ».
-                if fin.is_ok() {
-                    attempt = 0;
-                }
-
                 if matches!(fin, Ok(FinDeSession::JetonRenouvele)) {
                     // Pas d'attente croissante : la coupure est voulue. Le court
                     // délai laisse au relais le temps de voir la fermeture et
@@ -281,11 +296,16 @@ impl RelayClient {
                     continue;
                 }
 
-                attempt += 1;
-                let backoff = Duration::from_secs(std::cmp::min(
-                    1u64.saturating_mul(1 << attempt.min(6)),
-                    60,
-                ));
+                // Une session INSCRITE et STABLE (≥ 60 s) remet le compteur à
+                // zéro : `Ok` ne sort de `connect_and_run` qu'après l'accusé
+                // du relais. Sans cela, chaque coupure de la vie du serveur
+                // (redéploiement du relais, box qui redémarre) allongeait
+                // l'attente suivante, jusqu'au plafond de 60 s — mesuré sur
+                // le .18 le 08/11/2026 : « backoff_secs=60 » après une
+                // simple fermeture propre. Une session plus courte compte
+                // comme un échec : voir [`SESSION_STABLE`].
+                attempt = tentative_suivante(attempt, &fin, debut.elapsed());
+                let backoff = attente_avant(attempt);
                 info!(
                     backoff_secs = backoff.as_secs(),
                     "reconnecting after backoff"
@@ -1499,6 +1519,44 @@ pub(crate) fn entetes_de_flux(
         }
     }
     sortie
+}
+
+#[cfg(test)]
+mod recul_de_reconnexion_tests {
+    use super::*;
+
+    /// Deux serveurs au même `server_id` : chaque session est inscrite puis
+    /// délogée en quelques millisecondes. Le recul doit grandir jusqu'au
+    /// plafond — avant, il revenait à 2 s à chaque fois, sans fin.
+    #[test]
+    fn sessions_delogees_aussitot_le_recul_grandit() {
+        let mut attempt = 0;
+        let mut attentes = Vec::new();
+        for _ in 0..8 {
+            attempt = tentative_suivante(
+                attempt,
+                &Ok(FinDeSession::Fermee),
+                Duration::from_millis(50),
+            );
+            attentes.push(attente_avant(attempt).as_secs());
+        }
+        assert_eq!(attentes, vec![2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    /// Une session restée inscrite au moins 60 s remet le recul à 2 s :
+    /// une coupure isolée (relais redéployé) se rattrape aussitôt.
+    #[test]
+    fn session_stable_remet_le_recul_a_zero() {
+        let attempt = tentative_suivante(6, &Ok(FinDeSession::Fermee), SESSION_STABLE);
+        assert_eq!(attente_avant(attempt), Duration::from_secs(2));
+    }
+
+    /// Une erreur ne remet jamais le compteur à zéro, quelle que soit sa durée.
+    #[test]
+    fn erreur_longue_ne_remet_pas_a_zero() {
+        let attempt = tentative_suivante(3, &Err("ws".into()), Duration::from_secs(600));
+        assert_eq!(attempt, 4);
+    }
 }
 
 #[cfg(test)]
