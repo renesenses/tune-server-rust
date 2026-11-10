@@ -238,7 +238,12 @@ mod tests {
             sortie.get_status().await.unwrap().state,
             TransportState::Paused
         );
-        assert_eq!(*recues.lock().await, vec!["play", "play", "pause"]);
+        // #8347 — la connexion dont le setup a échoué est lâchée
+        // (`disconnect`) et rouverte (`connect`) avant le nouveau `play`.
+        assert_eq!(
+            *recues.lock().await,
+            vec!["play", "disconnect", "connect", "play", "pause"]
+        );
     }
 
     #[test]

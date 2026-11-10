@@ -17,6 +17,7 @@ use crate::outputs::traits::{
     OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState,
 };
 
+mod appairage_refuse_8347;
 pub mod composant_manquant_7084;
 mod reprise_apres_coupure_7921;
 mod session_en_panne_7823;
@@ -65,6 +66,16 @@ pub struct Airplay2Output {
     /// Délai d'abandon d'une attente de code (#8060), [`ATTENTE_DU_CODE`]
     /// hors bancs d'essai.
     delai_du_code: Duration,
+    /// Dernier refus d'appairage du récepteur (#8347) : pendant
+    /// `delai_apres_un_refus`, la lecture le redit sans recontacter
+    /// l'enceinte.
+    refus_d_appairage: Arc<Mutex<Option<appairage_refuse_8347::RefusDAppairage>>>,
+    /// [`appairage_refuse_8347::DELAI_APRES_UN_REFUS`] hors bancs d'essai.
+    delai_apres_un_refus: Duration,
+    /// Le `setup` d'une lecture a échoué sur une connexion établie : le
+    /// démon la garde, coincée au milieu du setup. La lecture suivante la
+    /// lâche (`disconnect`) et en rouvre une neuve (#8347).
+    session_a_rouvrir: Arc<AtomicBool>,
 }
 
 /// #8060 — une attente de code PIN : depuis quand, et si le récepteur
@@ -183,6 +194,9 @@ impl Airplay2Output {
             panne: Arc::new(Mutex::new(None)),
             connexion_perdue: Arc::new(AtomicBool::new(false)),
             delai_du_code: ATTENTE_DU_CODE,
+            refus_d_appairage: Arc::new(Mutex::new(None)),
+            delai_apres_un_refus: appairage_refuse_8347::DELAI_APRES_UN_REFUS,
+            session_a_rouvrir: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -205,6 +219,8 @@ impl Airplay2Output {
         let pending_transport = self.pending_transport.clone();
         let panne = self.panne.clone();
         let connexion_perdue = self.connexion_perdue.clone();
+        let refus_d_appairage = self.refus_d_appairage.clone();
+        let session_a_rouvrir = self.session_a_rouvrir.clone();
 
         tokio::spawn(async move {
             let mut line = String::new();
@@ -235,6 +251,7 @@ impl Airplay2Output {
                             "connected" | "paired" => {
                                 *pairing.lock().await = PairingPhase::Connected;
                                 connexion_perdue.store(false, Ordering::SeqCst);
+                                *refus_d_appairage.lock().await = None;
                                 debug!(device = %device_name, "airplay2: connected/paired");
                                 Some(TransportConfirmation::Connected)
                             }
@@ -280,6 +297,21 @@ impl Airplay2Output {
                                 // le voie déjà.
                                 if reprise_apres_coupure_7921::connexion_coupee(&msg) {
                                     connexion_perdue.store(true, Ordering::SeqCst);
+                                }
+                                // #8347 — le récepteur a refusé l'appairage :
+                                // noté AVANT de répondre à la commande en
+                                // attente, pour que la lecture le nomme.
+                                if appairage_refuse_8347::etape_refusee(&msg).is_some() {
+                                    *refus_d_appairage.lock().await =
+                                        Some(appairage_refuse_8347::RefusDAppairage {
+                                            depuis: std::time::Instant::now(),
+                                            cause: msg.clone(),
+                                        });
+                                }
+                                // #8347 — setup manqué : la connexion que garde
+                                // le démon n'est plus réutilisable.
+                                if appairage_refuse_8347::session_a_rouvrir(&msg) {
+                                    session_a_rouvrir.store(true, Ordering::SeqCst);
                                 }
                                 let pending = pending_transport.lock().await.take();
                                 let attendue = pending.is_some();
@@ -436,6 +468,12 @@ impl Airplay2Output {
     /// on `/pair-pin-start` (#6788, a Mac) nothing is open on the receiver
     /// side: `play` falls back to the transient connection, as before #7395.
     async fn ensure_connected(&self) -> Result<(), String> {
+        // #8347 — un récepteur qui vient de refuser l'appairage refuse
+        // encore pendant un temps (dès M2) : ne pas le relancer à chaque
+        // lecture, dire pourquoi. Une connexion réussie efface le refus.
+        if let Some(refus) = self.refus_encore_recent().await {
+            return Err(refus);
+        }
         let mut proc = self.process.lock().await;
         if proc.is_some() {
             let phase = self.pairing.lock().await.clone();
@@ -459,7 +497,22 @@ impl Airplay2Output {
                 drop(proc);
                 return self.rouvrir_la_session().await;
             }
-            if matches!(phase, PairingPhase::Connected | PairingPhase::Connecting) {
+            // #8347 — le `setup` précédent a échoué sur une connexion
+            // établie : le démon la garde, coincée après la phase 1, et un
+            // nouveau `play` finirait en « Cannot process phase 1 from state
+            // SetupPhase1 ». On la lâche et on en rouvre une neuve.
+            if self.session_a_rouvrir.swap(false, Ordering::SeqCst) {
+                info!(
+                    device = %self.name,
+                    "airplay2: the previous setup failed, dropping that session before reconnecting"
+                );
+                if let Some(daemon) = proc.as_mut() {
+                    daemon
+                        .send_cmd(&serde_json::json!({"cmd": "disconnect"}))
+                        .await
+                        .ok();
+                }
+            } else if matches!(phase, PairingPhase::Connected | PairingPhase::Connecting) {
                 return Ok(());
             }
             info!(
@@ -470,8 +523,10 @@ impl Airplay2Output {
         }
         let connect = self.commande_connect();
         *self.pairing.lock().await = PairingPhase::Connecting;
-        // Transient pairing (hard-coded PIN 3939) — works for HomePod-class and
-        // already-paired receivers. PIN-only receivers need start_pin_pairing().
+        // Default code 3939. NB (#8347): the pinned airplay-daemon sends it
+        // through a HomeKit NORMAL pair-setup (HKP=3, M1-M6), not a transient
+        // one (HKP=4, Flags=0x10): receivers that check their own code refuse
+        // it in M4. PIN-only receivers need start_pin_pairing().
         let envoye = match proc.as_mut() {
             Some(daemon) => daemon.send_cmd(&connect).await,
             None => Err("daemon not running".into()),
@@ -492,8 +547,9 @@ impl Airplay2Output {
         Ok(())
     }
 
-    /// Transient pairing (hard-coded PIN 3939) — works for HomePod-class and
-    /// already-paired receivers. PIN-only receivers need start_pin_pairing().
+    /// Default code 3939. The pinned `airplay-daemon` runs a HomeKit NORMAL
+    /// pair-setup with it (`connect_with_pin_pairing`), not a transient one
+    /// (#8347). PIN-only receivers need start_pin_pairing().
     fn commande_connect(&self) -> serde_json::Value {
         serde_json::json!({
             "cmd": "connect",
@@ -511,6 +567,8 @@ impl Airplay2Output {
     pub async fn start_pin_pairing(&self) -> Result<(), String> {
         let mut proc = self.process.lock().await;
         *self.pairing.lock().await = PairingPhase::Idle;
+        // #8347 — l'utilisateur relance l'appairage lui-même.
+        *self.refus_d_appairage.lock().await = None;
         if proc.is_none() {
             *proc = Some(self.spawn_daemon().await?);
         }
@@ -534,6 +592,7 @@ impl Airplay2Output {
             .as_mut()
             .ok_or("airplay2: no pairing in progress — call start_pin_pairing first")?;
         *self.pairing.lock().await = PairingPhase::Connecting;
+        *self.refus_d_appairage.lock().await = None;
         daemon
             .send_cmd(&serde_json::json!({
                 "cmd": "connect",
@@ -748,6 +807,14 @@ impl OutputTarget for Airplay2Output {
             .await
         {
             lisible.oublier().await;
+            // #8347 — un refus d'appairage se dit comme tel, pas comme un
+            // récepteur muet.
+            if let Some((refus, _)) = self.refus_recent().await {
+                return Err(format!(
+                    "airplay2: {}",
+                    self.message_refus_d_appairage(&refus.cause)
+                ));
+            }
             return Err(format!(
                 "airplay2: {}",
                 error.trim_start_matches("airplay2: ")
