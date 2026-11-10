@@ -541,6 +541,12 @@ impl PlaybackOrchestrator {
             }
         }
 
+        // #8215 / #7266 — un préchargement d'une AUTRE piste tient peut-être
+        // le verrou du service le temps d'un téléchargement DASH entier : la
+        // lecture ne l'attend plus, elle l'abandonne. Celui de la piste
+        // demandée est gardé (`prendre_dash_complet`, #7247).
+        self.prefetch
+            .abandonner_pour_une_autre_piste(service_name, source_id);
         let registry = self.services.lock().await;
         let svc = registry
             .get(service_name)

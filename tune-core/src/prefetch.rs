@@ -91,6 +91,20 @@ pub struct PrefetchEngine {
     /// The queue position that was prefetched, so callers can detect
     /// mismatches (e.g. queue reorder, shuffle toggle) and clear.
     prefetched_position: Mutex<Option<i64>>,
+    /// #8215 / #7266 — la résolution en cours chez le service :
+    /// `(source, source_id, tâche)`. Pour Tidal en DASH, `get_track_url`
+    /// télécharge la piste ENTIÈRE sous le verrou en écriture du service ;
+    /// la lecture d'une autre piste attendait la fin de ce téléchargement.
+    /// Elle l'abandonne désormais ([`Self::abandonner_pour_une_autre_piste`]),
+    /// l'arrêt aussi ([`Self::clear`]).
+    resolution_en_vol: std::sync::Mutex<Option<ResolutionEnVol>>,
+}
+
+/// La résolution de préchargement en cours, et de quoi l'abandonner.
+struct ResolutionEnVol {
+    source: String,
+    source_id: String,
+    tache: tokio::task::AbortHandle,
 }
 
 impl Default for PrefetchEngine {
@@ -106,6 +120,53 @@ impl PrefetchEngine {
             dash_complet: Mutex::new(None),
             cancel: Mutex::new(false),
             prefetched_position: Mutex::new(None),
+            resolution_en_vol: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// #8215 / #7266 — abandonne la résolution de préchargement en cours si
+    /// elle porte sur une AUTRE piste que `source`/`source_id`.
+    ///
+    /// Appelé par la lecture avant de prendre le verrou du service : un
+    /// préchargement Tidal en DASH tient ce verrou le temps de télécharger la
+    /// piste suivante entière (jusqu'à 60 Mo en Hi-Res), et la lecture d'un
+    /// autre album l'attendait — 56,8 s mesurées au lieu d'une dizaine. Le
+    /// préchargement de la piste DEMANDÉE est gardé : la lecture le reprend
+    /// (`prendre_dash_complet`, #7247). Rend vrai si une tâche a été abandonnée.
+    pub fn abandonner_pour_une_autre_piste(&self, source: &str, source_id: &str) -> bool {
+        let Ok(mut en_vol) = self.resolution_en_vol.lock() else {
+            return false;
+        };
+        let autre = en_vol
+            .as_ref()
+            .is_some_and(|r| r.source != source || r.source_id != source_id);
+        if !autre {
+            return false;
+        }
+        if let Some(r) = en_vol.take() {
+            r.tache.abort();
+            info!(
+                source = %r.source,
+                source_id = %r.source_id,
+                demandee = %source_id,
+                "prefetch_resolution_abandonnee_pour_la_lecture"
+            );
+        }
+        true
+    }
+
+    /// Abandonne toute résolution de préchargement en cours (arrêt, file
+    /// changée).
+    fn abandonner_la_resolution(&self) {
+        if let Ok(mut en_vol) = self.resolution_en_vol.lock()
+            && let Some(r) = en_vol.take()
+        {
+            r.tache.abort();
+            info!(
+                source = %r.source,
+                source_id = %r.source_id,
+                "prefetch_resolution_abandonnee"
+            );
         }
     }
 
@@ -289,10 +350,16 @@ impl PrefetchEngine {
                 "prefetch_starting"
             );
 
+            // #7266 — la qualité de la ZONE, comme la lecture : une zone en
+            // qualité CD préchargeait en HI_RES_LOSSLESS (`None` = le maximum
+            // du service), un téléchargement plusieurs fois plus lourd.
+            let qualite =
+                crate::orchestrator::preference_de_qualite(&db, zone_id).service_token(&source);
             self.do_prefetch(
                 db,
                 services,
                 mode,
+                qualite,
                 source,
                 source_id,
                 title,
@@ -322,6 +389,7 @@ impl PrefetchEngine {
         _db: Arc<dyn DbBackend>,
         services: Arc<Mutex<ServiceRegistry>>,
         mode: PrefetchMode,
+        qualite: Option<&'static str>,
         source: String,
         source_id: String,
         title: Option<String>,
@@ -330,20 +398,54 @@ impl PrefetchEngine {
         cover_url: Option<String>,
         duration_ms: u64,
     ) {
-        // Resolve the stream URL from the service
-        let stream_data = {
+        // Resolve the stream URL from the service.
+        //
+        // #8215 / #7266 — le registre n'est tenu que le temps de trouver le
+        // service, et la résolution part dans une tâche abandonnable : la
+        // lecture d'une autre piste ou l'arrêt la coupent au lieu d'attendre
+        // la fin d'un téléchargement DASH.
+        let svc = {
             let registry = services.lock().await;
-            let svc = match registry.get_actif(&source).await {
+            match registry.get_actif(&source).await {
                 Some(s) => s,
                 None => {
                     warn!(source = %source, "prefetch_unknown_service");
                     return;
                 }
-            };
-            let mut svc = svc.write().await;
-            match resoudre_le_flux_a_precharger(&mut **svc, &source, &source_id).await {
-                Some(flux) => flux,
-                None => return,
+            }
+        };
+        let tache = {
+            let source = source.clone();
+            let source_id = source_id.clone();
+            tokio::spawn(async move {
+                let mut svc = svc.write().await;
+                resoudre_le_flux_a_precharger(&mut **svc, &source, &source_id, qualite).await
+            })
+        };
+        if let Ok(mut en_vol) = self.resolution_en_vol.lock() {
+            if let Some(ancienne) = en_vol.take() {
+                ancienne.tache.abort();
+            }
+            *en_vol = Some(ResolutionEnVol {
+                source: source.clone(),
+                source_id: source_id.clone(),
+                tache: tache.abort_handle(),
+            });
+        }
+        let resultat = tache.await;
+        if let Ok(mut en_vol) = self.resolution_en_vol.lock()
+            && en_vol
+                .as_ref()
+                .is_some_and(|r| r.source == source && r.source_id == source_id)
+        {
+            *en_vol = None;
+        }
+        let stream_data = match resultat {
+            Ok(Some(flux)) => flux,
+            Ok(None) => return,
+            Err(e) => {
+                debug!(source = %source, source_id = %source_id, error = %e, "prefetch_resolution_interrompue");
+                return;
             }
         };
 
@@ -581,6 +683,9 @@ impl PrefetchEngine {
     /// Clear the prefetch buffer. Called when the queue changes or when
     /// the user skips/stops — the buffered track is no longer relevant.
     pub async fn clear(&self) {
+        // #7266 — l'arrêt de la zone n'attend plus la fin d'un téléchargement
+        // de préchargement : la lecture suivante n'a plus à l'attendre.
+        self.abandonner_la_resolution();
         let mut cancel = self.cancel.lock().await;
         *cancel = true;
         drop(cancel);
@@ -658,15 +763,16 @@ pub(crate) async fn resoudre_le_flux_a_precharger(
     svc: &mut dyn crate::streaming::StreamingService,
     source: &str,
     source_id: &str,
+    qualite: Option<&str>,
 ) -> Option<crate::streaming::StreamUrl> {
-    let flux = match svc.get_track_url(source_id, None).await {
+    let flux = match svc.get_track_url(source_id, qualite).await {
         Ok(data) => data,
         Err(e) => {
             // Try refresh once on auth errors
             let msg = e.to_string();
             if msg.contains("401") || msg.contains("403") {
                 if svc.refresh_if_needed().await.unwrap_or(false) {
-                    match svc.get_track_url(source_id, None).await {
+                    match svc.get_track_url(source_id, qualite).await {
                         Ok(data) => data,
                         Err(e2) => {
                             warn!(error = %e2, "prefetch_get_url_failed_after_refresh");
@@ -688,7 +794,7 @@ pub(crate) async fn resoudre_le_flux_a_precharger(
         &*svc,
         crate::http::client::shared(),
         source_id,
-        None,
+        qualite,
         flux,
     )
     .await
@@ -703,6 +809,10 @@ pub(crate) async fn resoudre_le_flux_a_precharger(
     }
     Some(flux)
 }
+
+#[cfg(test)]
+#[path = "prefetch_tidal_8215_7266_tests.rs"]
+mod prefetch_tidal_8215_7266_tests;
 
 #[cfg(test)]
 mod tests {
