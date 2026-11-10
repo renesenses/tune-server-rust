@@ -81,6 +81,30 @@ impl DashGrowth {
     }
 }
 
+impl DashGrowth {
+    /// #8228 — le téléchargement a-t-il échoué ? Distingue une fin de
+    /// conteneur d'un flux coupé.
+    pub fn a_echoue(&self) -> bool {
+        self.inner.lock().unwrap().failed
+    }
+
+    /// #8228 — bloque jusqu'à la fin du téléchargement, pour un lecteur qui
+    /// a besoin du fichier complet. Erreur si le téléchargement a échoué.
+    pub fn attendre_la_fin(&self) -> io::Result<u64> {
+        let mut g = self.inner.lock().unwrap();
+        while !g.done {
+            g = self.cv.wait(g).unwrap();
+        }
+        if g.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "streaming download failed",
+            ));
+        }
+        Ok(g.available)
+    }
+}
+
 /// A blocking [`MediaSource`] over a file another task is still appending to.
 /// `read`/`seek` block at the write frontier until more bytes arrive or the
 /// download finishes, so the forward-only fMP4 decode never sees a premature EOF.
