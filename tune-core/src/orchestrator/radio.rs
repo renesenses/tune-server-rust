@@ -577,7 +577,15 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .and_then(|c| c.get(url).send())
-        .map_err(|e| format!("radio HTTP fetch failed: {e}"))?;
+        // #8008 — la cause, pas seulement « error sending request » : le
+        // rapport du 06/11 ne disait pas pourquoi la station ne répondait
+        // pas (refus, nom introuvable, délai, TLS).
+        .map_err(|e| {
+            format!(
+                "radio HTTP fetch failed: {e} ({})",
+                crate::http::client::decrire_erreur_http(&e)
+            )
+        })?;
     if !response.status().is_success() {
         return Err(format!("radio HTTP error: {}", response.status()));
     }
@@ -1253,3 +1261,7 @@ mod radio_ogg;
 #[cfg(test)]
 #[path = "radio_source_tests.rs"]
 mod radio_source_tests;
+
+#[cfg(test)]
+#[path = "radio_cause_8008_tests.rs"]
+mod radio_cause_8008_tests;
