@@ -591,6 +591,9 @@ mod tests {
             None => app,
         };
         let etat = std::sync::Arc::new(crate::state::RelayState::new());
+        // Le canal du serveur inscrit doit rester ouvert pour la durée du test :
+        // son récepteur part avec la tâche du pont, qui vit aussi longtemps.
+        let mut canal_du_serveur = None;
         if inscrit {
             let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
             etat.register_server(
@@ -601,13 +604,13 @@ mod tests {
                 tx,
             )
             .unwrap();
-            // Le canal reste ouvert pour la durée du test.
-            std::mem::forget(rx);
+            canal_du_serveur = Some(rx);
         }
         let app = app.with_state(etat);
         let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let adresse = ecoute.local_addr().unwrap();
         tokio::spawn(async move {
+            let _canal_du_serveur = canal_du_serveur;
             let _ = axum::serve(ecoute, app).await;
         });
         format!("http://{adresse}")
