@@ -184,10 +184,19 @@ async fn lecture_nue_apres_un_redemarrage_garde_l_album_7889() {
 
     let (state, app) = banc.demarrer().await;
     let zone = banc.zone;
-    assert_eq!(
-        poster(&app, &format!("/api/v1/zones/{zone}/play"), json!({})).await,
-        StatusCode::OK
-    );
+    // « Lecture » nue : AUCUN corps (un `{}` JSON est un corps, traité comme un
+    // nouveau geste ; c'est le corps absent qui reprend la file).
+    let statut = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/zones/{zone}/play"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(statut, StatusCode::OK);
     assert_eq!(
         contexte(&state, zone).await,
         (Some("album".into()), Some("1".into())),
