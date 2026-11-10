@@ -36,8 +36,7 @@ use crate::db::settings_repo::SettingsRepo;
 /// Clé de `settings` qui marque le rattrapage comme fait.
 pub const CLE_RATTRAPAGE_CREDITS_BALISES_8026: &str = "rattrapage_credits_balises_8026";
 
-/// Pistes par lot : une requête de lecture des métadonnées par lot, sous le
-/// plafond de paramètres liés de SQLite.
+/// Pistes écrites par lot : la passe cède la main entre deux lots.
 const PISTES_PAR_LOT: usize = 400;
 
 /// `track_id` est un entier sous SQLite, du BIGINT ou du TEXT sous
@@ -55,55 +54,21 @@ fn liste_des_cles() -> String {
         .join(", ")
 }
 
-/// Les pistes qui portent au moins une clé de crédit dans `track_metadata`
-/// et aucune ligne `balises` dans `track_credits`.
-pub fn sql_pistes_sans_lignes_balises(engine: Engine) -> String {
+/// Les clés de crédit des pistes qui n'ont aucune ligne `balises` dans
+/// `track_credits`. UNE requête pour toute la bibliothèque : un filtre
+/// `track_id IN (…)` par lot ne servirait d'aucun index sous PostgreSQL
+/// (comparaison en texte) et relirait la table à chaque lot.
+pub fn sql_credits_des_pistes_sans_lignes_balises(engine: Engine) -> String {
     let jointure = match engine {
         Engine::Postgres => "CAST(tb.track_id AS TEXT) = CAST(tm.track_id AS TEXT)",
         Engine::Sqlite => "tb.track_id = tm.track_id",
     };
     format!(
-        "SELECT DISTINCT tm.track_id FROM track_metadata tm \
+        "SELECT tm.track_id, tm.key, tm.value FROM track_metadata tm \
          WHERE tm.key IN ({cles}) \
          AND NOT EXISTS (SELECT 1 FROM track_credits tb WHERE {jointure} AND tb.source = '{BALISES}')",
         cles = liste_des_cles()
     )
-}
-
-/// Les clés de crédit d'un lot de pistes, rangées par piste.
-fn metadonnees_du_lot(
-    db: &Arc<dyn DbBackend>,
-    ids: &[i64],
-) -> Result<HashMap<i64, HashMap<String, String>>, String> {
-    let marques = vec!["?"; ids.len()].join(", ");
-    let textes: Vec<String> = ids.iter().map(i64::to_string).collect();
-    let (colonne, params): (&str, Vec<&dyn ToSqlValue>) = match db.engine() {
-        Engine::Postgres => (
-            "CAST(track_id AS TEXT)",
-            textes.iter().map(|t| t as &dyn ToSqlValue).collect(),
-        ),
-        Engine::Sqlite => (
-            "track_id",
-            ids.iter().map(|i| i as &dyn ToSqlValue).collect(),
-        ),
-    };
-    let sql = format!(
-        "SELECT track_id, key, value FROM track_metadata \
-         WHERE key IN ({cles}) AND {colonne} IN ({marques})",
-        cles = liste_des_cles()
-    );
-    let mut par_piste: HashMap<i64, HashMap<String, String>> = HashMap::new();
-    for ligne in db.query_many(&sql, &params)? {
-        let (Some(id), Some(cle), Some(valeur)) = (
-            ligne.first().and_then(entier),
-            ligne.get(1).and_then(SqlValue::as_string),
-            ligne.get(2).and_then(SqlValue::as_string),
-        ) else {
-            continue;
-        };
-        par_piste.entry(id).or_default().insert(cle, valeur);
-    }
-    Ok(par_piste)
 }
 
 /// Bilan d'un rattrapage.
@@ -131,82 +96,94 @@ pub fn rattraper_les_credits_des_balises(db: &Arc<dyn DbBackend>) -> Result<Bila
             ..Bilan::default()
         });
     }
-    let mut ids: Vec<i64> = db
-        .query_many(&sql_pistes_sans_lignes_balises(db.engine()), &[])?
-        .iter()
-        .filter_map(|l| l.first().and_then(entier))
-        .collect();
-    ids.sort_unstable();
-    ids.dedup();
+    let mut par_piste: HashMap<i64, HashMap<String, String>> = HashMap::new();
+    for ligne in db.query_many(
+        &sql_credits_des_pistes_sans_lignes_balises(db.engine()),
+        &[],
+    )? {
+        let (Some(id), Some(cle), Some(valeur)) = (
+            ligne.first().and_then(entier),
+            ligne.get(1).and_then(SqlValue::as_string),
+            ligne.get(2).and_then(SqlValue::as_string),
+        ) else {
+            continue;
+        };
+        par_piste.entry(id).or_default().insert(cle, valeur);
+    }
+    let mut pistes: Vec<(i64, HashMap<String, String>)> = par_piste.into_iter().collect();
+    pistes.sort_unstable_by_key(|(id, _)| *id);
     let mut bilan = Bilan::default();
-    for tranche in ids.chunks(PISTES_PAR_LOT) {
-        let mut par_piste = metadonnees_du_lot(db, tranche)?;
-        let lot: Vec<(i64, HashMap<String, String>)> = tranche
-            .iter()
-            .filter_map(|id| par_piste.remove(id).map(|m| (*id, m)))
-            .collect();
+    for lot in pistes.chunks(PISTES_PAR_LOT) {
         bilan.pistes += lot.len();
-        bilan.lignes += credits_balises::ecrire_lot(db, &lot);
+        bilan.lignes += credits_balises::ecrire_lot(db, lot);
     }
     reglages.set(CLE_RATTRAPAGE_CREDITS_BALISES_8026, "fait")?;
     Ok(bilan)
 }
 
 /// Donne leur fiche aux lignes `balises` qui n'en ont pas. Le nom identique
-/// d'abord ; sinon la [`cle_artiste`] du nom, si UNE seule fiche la porte
-/// (deux fiches « Bjork » et « Björk » : on ne choisit pas). Rend le nombre
-/// de lignes rattachées.
+/// d'abord, s'il est celui d'UNE seule fiche (un nom identique à deux fiches
+/// ne se rattache pas, même par la clé) ; sinon la [`cle_artiste`] du nom,
+/// si UNE seule fiche la porte (« Bjork » et « Björk » : on ne choisit pas).
+/// Rend le nombre de lignes rattachées.
 pub fn rattacher_les_fiches(db: &Arc<dyn DbBackend>) -> Result<usize, String> {
-    let lignes = db.query_many(
-        "SELECT id, artist_name FROM track_credits WHERE source = ? AND artist_id IS NULL",
-        &[&BALISES as &dyn ToSqlValue],
-    )?;
-    if lignes.is_empty() {
+    // Les NOMS distincts, pas les lignes : un compositeur sans fiche cité sur
+    // mille pistes coûte une ligne lue et aucune écriture.
+    let noms: Vec<String> = db
+        .query_many(
+            "SELECT DISTINCT artist_name FROM track_credits WHERE source = ? AND artist_id IS NULL",
+            &[&BALISES as &dyn ToSqlValue],
+        )?
+        .iter()
+        .filter_map(|l| l.first().and_then(SqlValue::as_string))
+        .collect();
+    if noms.is_empty() {
         return Ok(0);
     }
-    let mut par_nom: HashMap<String, i64> = HashMap::new();
-    // `None` : plusieurs fiches portent cette clé.
+    // `None` : plusieurs fiches portent ce nom, ou cette clé. On ne choisit
+    // pas : deux « John Smith » restent sans fiche.
+    let mut par_nom: HashMap<String, Option<i64>> = HashMap::new();
     let mut par_cle: HashMap<String, Option<i64>> = HashMap::new();
-    for fiche in db.query_many("SELECT id, name FROM artists ORDER BY id", &[])? {
-        let (Some(id), Some(nom)) = (
-            fiche.first().and_then(entier),
-            fiche.get(1).and_then(SqlValue::as_string),
-        ) else {
-            continue;
-        };
-        par_nom.entry(nom.clone()).or_insert(id);
-        par_cle
-            .entry(cle_artiste(&nom))
+    let unique = |carte: &mut HashMap<String, Option<i64>>, cle: String, id: i64| {
+        carte
+            .entry(cle)
             .and_modify(|deja| {
                 if *deja != Some(id) {
                     *deja = None;
                 }
             })
             .or_insert(Some(id));
-    }
-    let mut rattachees = 0usize;
-    for ligne in lignes {
+    };
+    for fiche in db.query_many("SELECT id, name FROM artists", &[])? {
         let (Some(id), Some(nom)) = (
-            ligne.first().and_then(entier),
-            ligne.get(1).and_then(SqlValue::as_string),
+            fiche.first().and_then(entier),
+            fiche.get(1).and_then(SqlValue::as_string),
         ) else {
             continue;
         };
-        let fiche = par_nom
-            .get(&nom)
-            .copied()
-            .or_else(|| par_cle.get(&cle_artiste(&nom)).copied().flatten());
+        unique(&mut par_cle, cle_artiste(&nom), id);
+        unique(&mut par_nom, nom, id);
+    }
+    let mut rattachees = 0usize;
+    for nom in noms {
+        let fiche = match par_nom.get(&nom) {
+            Some(exact) => *exact,
+            None => par_cle.get(&cle_artiste(&nom)).copied().flatten(),
+        };
         let Some(artist_id) = fiche else {
             continue;
         };
         match db.execute(
-            "UPDATE track_credits SET artist_id = ? WHERE id = ? AND artist_id IS NULL",
-            &[&artist_id as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+            "UPDATE track_credits SET artist_id = ? \
+             WHERE source = ? AND artist_id IS NULL AND artist_name = ?",
+            &[
+                &artist_id as &dyn ToSqlValue,
+                &BALISES as &dyn ToSqlValue,
+                &nom as &dyn ToSqlValue,
+            ],
         ) {
             Ok(n) => rattachees += n,
-            Err(e) => {
-                tracing::warn!(credit_id = id, error = %e, "credits_balises_rattachement_echec")
-            }
+            Err(e) => tracing::warn!(nom = %nom, error = %e, "credits_balises_rattachement_echec"),
         }
     }
     Ok(rattachees)

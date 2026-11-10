@@ -125,7 +125,8 @@ fn fusionner_les_lignes_balises(items: &mut Vec<Value>) {
     // Les lignes par rang croissant ; à rang égal, dans l'ordre de la réponse.
     let mut ordre: Vec<usize> = (0..items.len()).collect();
     ordre.sort_by_key(|&i| rang_de_la_source(items[i]["source"].as_str()));
-    let mut gardees: Vec<usize> = Vec::with_capacity(items.len());
+    // Les lignes gardées, par piste : la page artiste en porte des milliers.
+    let mut gardees: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
     let mut retirees = vec![false; items.len()];
     for i in ordre {
         let (Some(track_id), Some(role), Some(nom)) = (
@@ -133,16 +134,16 @@ fn fusionner_les_lignes_balises(items: &mut Vec<Value>) {
             items[i]["role"].as_str().map(str::to_owned),
             items[i]["artist_name"].as_str().map(str::to_owned),
         ) else {
-            gardees.push(i);
             continue;
         };
         let instrument = items[i]["instrument"].as_str().map(str::to_owned);
         let source_i = source(&items[i]);
-        let Some(&j) = gardees.iter().find(|&&j| {
+        let de_la_piste = gardees.entry(track_id).or_default();
+        let Some(&j) = de_la_piste.iter().find(|&&j| {
             source(&items[j]) != source_i
                 && meme_credit(&items[j], track_id, &role, &nom, instrument.as_deref())
         }) else {
-            gardees.push(i);
+            de_la_piste.push(i);
             continue;
         };
         // Une reprise de Qobuz ne complète rien : le local prime (#8077).

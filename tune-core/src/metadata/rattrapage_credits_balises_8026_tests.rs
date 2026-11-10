@@ -208,3 +208,27 @@ fn un_flac_a_plusieurs_ensembles_les_credite_tous_8026() {
         "#8026 — un ensemble cité dans une seconde trame est perdu : {meta:?}"
     );
 }
+
+/// Deux fiches au nom IDENTIQUE (deux « John Smith ») : la ligne n'est
+/// rattachée à aucune, le choix serait arbitraire et définitif.
+#[test]
+fn un_nom_porte_par_deux_fiches_ne_se_rattache_pas_8026() {
+    let b = base();
+    b.execute_batch(
+        "INSERT INTO artists (id, name) VALUES (5, 'John Smith');
+         INSERT INTO artists (id, name) VALUES (6, 'John Smith');
+         INSERT INTO track_credits (track_id, artist_name, role, position, source)
+         VALUES (9, 'John Smith', 'engineer', 0, 'balises');
+         INSERT INTO track_credits (track_id, artist_name, role, position, source)
+         VALUES (9, 'john smith', 'producer', 1, 'balises');",
+    )
+    .unwrap();
+    assert_eq!(rattacher_les_fiches(&b).unwrap(), 0);
+    assert_eq!(
+        lignes(&b, 9),
+        vec![
+            "balises|engineer|John Smith||-",
+            "balises|producer|john smith||-",
+        ]
+    );
+}
