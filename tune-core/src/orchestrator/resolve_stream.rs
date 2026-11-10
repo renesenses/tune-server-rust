@@ -19,6 +19,27 @@ type FluxHttps = (String, Option<String>, String, Option<u64>);
 /// session, type MIME servi, taille du fichier.
 type FluxDash = (String, Option<String>, String, Option<u64>);
 
+/// #7738, #8229 — une fiche Qobuz qui n'a que son titre (titre importé d'un
+/// M3U : titre et durée, ni artiste, ni album, ni pochette) n'est pas une
+/// fiche complète : il faut la compléter auprès du service. Les autres
+/// services gardent la règle du titre seul.
+///
+/// Une seule règle pour tous les chemins de lecture : la résolution directe
+/// (`resolve_streaming_url`, trois bras) et le tampon de préchargement
+/// (`etiqueter_le_prefetch`, `dsp.rs`), qui sert le titre atteint par
+/// l'enchaînement.
+pub(super) fn fiche_qobuz_incomplete(
+    service: &str,
+    artiste: &Option<String>,
+    album: &Option<String>,
+    pochette: &Option<String>,
+) -> bool {
+    service == "qobuz"
+        && [artiste, album, pochette]
+            .into_iter()
+            .any(|s| s.as_deref().is_none_or(|s| s.trim().is_empty()))
+}
+
 /// Décision du cache chaud DASH (opt-in `TUNE_DASH_WARM_CACHE`) : chemin
 /// dans le cache et format qui a servi de clef.
 struct DashWarm {
@@ -763,10 +784,12 @@ impl PlaybackOrchestrator {
         // et une durée, mais aucun artiste, album ni pochette. Compléter aussi
         // ce cas ; une fiche Qobuz complète garde le chemin sans requête.
         let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
-            && (service_name != "qobuz"
-                || [&req.artist_name, &req.album_title, &req.cover_url]
-                    .into_iter()
-                    .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
+            && !fiche_qobuz_incomplete(
+                service_name,
+                &req.artist_name,
+                &req.album_title,
+                &req.cover_url,
+            );
         let (title, artist, album, mut duration_ms, cover_path) = if has_title {
             (
                 req.title.clone().unwrap_or_default(),
@@ -1696,10 +1719,12 @@ impl PlaybackOrchestrator {
                 self.spawn_warm_next_streaming(req.zone_id, source_id.to_string(), w.enc_format);
 
                 let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
-                    && (service_name != "qobuz"
-                        || [&req.artist_name, &req.album_title, &req.cover_url]
-                            .into_iter()
-                            .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
+                    && !fiche_qobuz_incomplete(
+                        service_name,
+                        &req.artist_name,
+                        &req.album_title,
+                        &req.cover_url,
+                    );
                 let (title, artist, album, duration_ms, cover_path) = if has_title {
                     (
                         req.title.clone().unwrap_or_default(),
@@ -1933,10 +1958,12 @@ impl PlaybackOrchestrator {
                 .get_stream_url(&session_id, &server_ip, "flac");
 
             let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
-                && (service_name != "qobuz"
-                    || [&req.artist_name, &req.album_title, &req.cover_url]
-                        .into_iter()
-                        .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
+                && !fiche_qobuz_incomplete(
+                    service_name,
+                    &req.artist_name,
+                    &req.album_title,
+                    &req.cover_url,
+                );
             let (title, artist, album, duration_ms, cover_path) = if has_title {
                 (
                     req.title.clone().unwrap_or_default(),

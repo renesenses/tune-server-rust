@@ -367,7 +367,21 @@ impl PlaybackOrchestrator {
         // orchestrator_play/Now Playing go blank). When that (or a missing
         // duration) happens, refetch the real metadata from the service so Now
         // Playing is never blanked and end detection has a duration.
-        if title.is_empty() || duration_ms == 0 {
+        //
+        // #8229 — même règle que la résolution directe (#7738) : un titre
+        // Qobuz importé d'un M3U arrive avec son titre, sans artiste, album
+        // ni pochette, et le tampon qui le précharge n'en sait pas plus. Le
+        // titre atteint par l'enchaînement passe par ici : sans ce second
+        // cas, le lecteur restait sans pochette ni artiste, alors que le même
+        // titre lancé au clic (résolution directe) les avait.
+        let vide = |s: &Option<String>| s.as_deref().is_none_or(|s| s.trim().is_empty());
+        let fiche_incomplete = super::resolve_stream::fiche_qobuz_incomplete(
+            &prefetched.source,
+            &artist,
+            &album,
+            &cover_url,
+        );
+        if title.is_empty() || duration_ms == 0 || fiche_incomplete {
             let registry = self.services.lock().await;
             if let Some(svc) = registry.get_actif(&prefetched.source).await {
                 let svc = svc.read().await;
@@ -377,6 +391,18 @@ impl PlaybackOrchestrator {
                         artist = artist.or(Some(track.artist));
                         album = album.or(track.album);
                         cover_url = cover_url.or(track.cover_path);
+                    } else if fiche_incomplete {
+                        // Le titre importé est gardé ; seuls les champs vides
+                        // sont complétés.
+                        if vide(&artist) && !track.artist.trim().is_empty() {
+                            artist = Some(track.artist);
+                        }
+                        if vide(&album) && track.album.is_some() {
+                            album = track.album;
+                        }
+                        if vide(&cover_url) && track.cover_path.is_some() {
+                            cover_url = track.cover_path;
+                        }
                     }
                     if duration_ms == 0 && track.duration_ms > 0 {
                         duration_ms = track.duration_ms;
@@ -408,9 +434,9 @@ impl PlaybackOrchestrator {
         let Etiquettes {
             title,
             artist,
+            album,
             cover_url,
             duration_ms,
-            ..
         } = etiquettes;
         let sr = prefetched.sample_rate;
         let bd = prefetched.bit_depth;
@@ -546,7 +572,8 @@ impl PlaybackOrchestrator {
             stream_id: Some(session_id),
             title: title.clone(),
             artist: artist.clone(),
-            album: None,
+            // #8229 — l'album complété par l'étiquetage n'était pas transmis.
+            album: album.clone(),
             duration_ms: Some(duration_ms as i64),
             source: prefetched.source,
             mime_type: out_mime.into(),
