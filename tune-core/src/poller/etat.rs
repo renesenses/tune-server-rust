@@ -54,6 +54,12 @@ pub(super) struct ZonePollState {
     /// Last polled position in milliseconds — used to detect position
     /// resets (jumps from >30s to <5s) that signal a gapless transition.
     pub(super) last_position_ms: u64,
+    /// #7293 — l'instant où `last_position_ms` a été relevé. Le sondeur est
+    /// une tâche pour toutes les zones : un appareil lent ailleurs écarte
+    /// deux relevés de bien plus qu'une seconde, et la fenêtre « position
+    /// sous 5 s » d'un enchaînement se saute. L'écart depuis ce relevé
+    /// élargit cette fenêtre d'autant (`decisions::pres_du_debut_apres_le_releve`).
+    pub(super) dernier_releve_de_position_at: Option<Instant>,
     /// Peak position reached in the current track — high-water mark used
     /// to verify that enough of the track was actually played before
     /// accepting a gapless transition.
@@ -301,6 +307,7 @@ impl ZonePollState {
             last_radio_poll: Instant::now(),
             gapless_sent_at: None,
             last_position_ms: 0,
+            dernier_releve_de_position_at: None,
             peak_position_ms: 0,
             scrobbled_key: None,
             ticks_since_db_save: 0,
