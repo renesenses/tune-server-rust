@@ -178,3 +178,43 @@ async fn la_sortie_airplay2_apprend_le_depart_du_flux_relance_7972() {
         "la position publiée part de l'endroit de la pause, pas de 0:00"
     );
 }
+
+/// Le chemin COMMUN du jeu (`send_to_output`), et non le seul rétablissement
+/// après une pause : un épisode de podcast repris à 12:00 par son adresse
+/// (`jouer_l_episode_par_son_adresse`) part avec `seek_ms` et un flux décodé
+/// à partir de 12:00. La position publiée doit partir de 12:00.
+///
+/// Contre-épreuve : sans la note du départ dans `send_to_output`, seul
+/// `seek_output_after_replay` la posait ; la position publiée valait 0:01.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_lecture_a_la_position_note_le_depart_sur_le_chemin_commun_7972() {
+    use crate::outputs::airplay2::position_relevee_tests_7084::{
+        demon_dont_le_recepteur_avance, sortie,
+    };
+    let orch = orchestrateur();
+    let appareil = "airplay-7972-chemin-commun";
+    let output = sortie(appareil);
+    let _commandes = demon_dont_le_recepteur_avance(&output).await;
+    orch.outputs.lock().await.register(Box::new(output));
+
+    let media = crate::outputs::traits::PlayMedia {
+        url: "/tmp/episode-7972.wav",
+        mime_type: "audio/wav",
+        title: Some("Episode"),
+        duration_ms: Some(1_080_000),
+        ..Default::default()
+    };
+    let (envoye, erreur) = orch
+        .send_to_output(appareil, &media, Some(720_000), false, 797_204, None)
+        .await;
+    assert!(envoye, "lecture refusée : {erreur:?}");
+
+    let output = orch.outputs.lock().await.get(appareil).expect("sortie");
+    let statut = output.lock().await.get_status().await.unwrap();
+    assert!(
+        (720_000..730_000).contains(&statut.position_ms),
+        "la position publiée doit partir de 12:00, obtenu {} ms",
+        statut.position_ms
+    );
+    assert_eq!(statut.duration_ms, 1_800_000, "durée de la piste entière");
+}

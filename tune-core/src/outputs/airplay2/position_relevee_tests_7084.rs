@@ -10,7 +10,7 @@
 use super::composant_manquant_7084::{CODE_AIRPLAY2_COMPONENT_MISSING, manque_pour};
 use super::*;
 
-fn sortie(device_id: &str) -> Airplay2Output {
+pub(crate) fn sortie(device_id: &str) -> Airplay2Output {
     Airplay2Output::new(
         "Mania".into(),
         "127.0.0.1".into(),
@@ -22,7 +22,9 @@ fn sortie(device_id: &str) -> Airplay2Output {
 
 /// Un faux démon dont le récepteur avance d'une seconde et demie à chaque
 /// `status`. Note le nom de chaque commande reçue.
-async fn demon_dont_le_recepteur_avance(output: &Airplay2Output) -> Arc<Mutex<Vec<String>>> {
+pub(crate) async fn demon_dont_le_recepteur_avance(
+    output: &Airplay2Output,
+) -> Arc<Mutex<Vec<String>>> {
     let (server_stdin, daemon_stdin) = tokio::io::duplex(4096);
     let (mut daemon_stdout, server_stdout) = tokio::io::duplex(4096);
     *output.process.lock().await = Some(DaemonProcess {

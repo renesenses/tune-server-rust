@@ -2121,7 +2121,7 @@ mod transport_tests {
 }
 
 #[cfg(test)]
-mod position_relevee_tests_7084;
+pub(crate) mod position_relevee_tests_7084;
 
 #[cfg(all(test, target_os = "linux"))]
 mod retrait_sans_arret_tests_8029;

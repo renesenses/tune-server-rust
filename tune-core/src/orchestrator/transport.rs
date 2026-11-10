@@ -2455,6 +2455,23 @@ impl PlaybackOrchestrator {
             let output = output_arc.lock().await;
             match output.play_media(media).await {
                 Ok(()) => {
+                    // #7972 — une zone AirPlay 2 jouée à une position non nulle
+                    // reçoit un flux DÉCODÉ qui commence à cette position
+                    // ([`airplay2_relance_a_la_position`]), quel que soit le
+                    // chemin du geste : rétablissement après une pause, mais
+                    // aussi épisode de podcast repris par son adresse, reprise
+                    // d'une file… Le démon compte depuis le début de SON
+                    // fichier : sans ce départ, l'écran affichait 0:00.
+                    // `play_media` vient de le remettre à zéro : il se note
+                    // après.
+                    if let Some(depart_ms) = start_position_ms.filter(|ms| *ms > 0)
+                        && let Some(airplay2) = output
+                            .as_any()
+                            .downcast_ref::<crate::outputs::airplay2::Airplay2Output>(
+                        )
+                    {
+                        airplay2.noter_le_depart_du_flux(depart_ms);
+                    }
                     drop(output);
                     info!(device_id = %used_device_id, "output_play_sent");
                     self.reimposer_la_sourdine_de_la_zone(
