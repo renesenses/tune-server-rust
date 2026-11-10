@@ -615,8 +615,11 @@ pub struct PositionPoller {
     zones_masquees_signalees: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// #7418 — zones mises en pause parce que leur APPAREIL s'est mis en pause
     /// (télécommande, changement d'entrée). Seules celles-là suivent une
-    /// reprise faite sur l'appareil. Hors de ZonePollState : la pause le jette.
-    pauses_de_l_appareil: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// reprise faite sur l'appareil, et seules celles-là deviennent un arrêt
+    /// complet quand l'appareil passe à autre chose ou reste en pause.
+    /// Hors de ZonePollState : la pause le jette.
+    pauses_de_l_appareil:
+        std::sync::Mutex<std::collections::HashMap<i64, pause_de_l_appareil_7418::SuiviDeLaPause>>,
     /// #5522 — la relance automatique d'un démarrage figé à 0, par zone : la
     /// ligne de file relancée et l'instant. Vit HORS de ZonePollState pour la
     /// même raison que `relances_demarrage_mort` : la relance recrée l'état de
@@ -674,7 +677,7 @@ impl PositionPoller {
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
             reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),
             zones_masquees_signalees: std::sync::Mutex::new(std::collections::HashSet::new()),
-            pauses_de_l_appareil: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pauses_de_l_appareil: std::sync::Mutex::new(std::collections::HashMap::new()),
             relances_demarrage_fige: std::sync::Mutex::new(std::collections::HashMap::new()),
             zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
             volumes_plafonnes: std::sync::Mutex::new(std::collections::HashMap::new()),
