@@ -808,8 +808,10 @@ impl OutputTarget for Airplay2Output {
         {
             lisible.oublier().await;
             // #8347 — un refus d'appairage se dit comme tel, pas comme un
-            // récepteur muet.
-            if let Some((refus, _)) = self.refus_recent().await {
+            // récepteur muet. `ensure_connected` a effacé tout refus expiré :
+            // celui qui reste est arrivé pendant cette lecture.
+            let refus = self.refus_d_appairage.lock().await.clone();
+            if let Some(refus) = refus {
                 return Err(format!(
                     "airplay2: {}",
                     self.message_refus_d_appairage(&refus.cause)
