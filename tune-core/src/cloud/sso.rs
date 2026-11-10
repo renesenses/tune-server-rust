@@ -29,6 +29,166 @@ pub const FENETRE_THROTTLE_DEFAUT_S: u64 = rate_limit::FENETRE_PROFIL_COMPTE_S;
 /// setting or the `TUNE_MOZAIK_CLIENT_ID` env var take precedence over this const.
 pub const DEFAULT_CLIENT_ID: &str = "tune-server";
 
+/// User-Agent des appels à `/oauth/token` (#8238), le même que les autres
+/// appels de Tune à mozaiklabs.fr.
+const USER_AGENT_SSO: &str = "Tune/2.0 (https://mozaiklabs.fr)";
+
+/// Réglage posé quand mozaiklabs.fr REFUSE le jeton de rafraîchissement
+/// (400 `invalid_grant`, 401 `invalid_client`) : la session du compte est
+/// finie, seule une nouvelle connexion la rouvre (#8238). Valeur : l'instant
+/// du refus (RFC 3339). Effacé par la connexion et par la déconnexion.
+pub const CLE_RECONNEXION_REQUISE: &str = "mozaik_reconnexion_requise";
+
+/// Recul après un échec PASSAGER du renouvellement (réseau, 429, 5xx) :
+/// premier délai, puis doublé à chaque échec, plafonné.
+const RECUL_INITIAL_S: u64 = 30;
+const RECUL_MAX_S: u64 = 30 * 60;
+
+/// Un seul renouvellement à la fois dans tout le serveur (#8238).
+static VERROU_RENOUVELLEMENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Recul en cours après un échec passager : `"<échéance epoch s>:<échecs>"`.
+/// En base et non en mémoire : un redémarrage ne relance pas la rafale.
+const CLE_RECUL: &str = "mozaik_renouvellement_recul";
+
+fn lire_recul(settings: &SettingsRepo) -> Option<(u64, u32)> {
+    let v = settings.get(CLE_RECUL).ok().flatten()?;
+    let (jusqua, n) = v.split_once(':')?;
+    Some((jusqua.trim().parse().ok()?, n.trim().parse().ok()?))
+}
+
+fn maintenant_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// La session du compte a été refusée par le site : plus aucun
+/// renouvellement ne part avant une nouvelle connexion.
+pub fn reconnexion_requise(settings: &SettingsRepo) -> bool {
+    settings
+        .get(CLE_RECONNEXION_REQUISE)
+        .ok()
+        .flatten()
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Nouvelle session ouverte (connexion SSO) ou session fermée
+/// (déconnexion) : l'état « reconnexion requise » et le recul tombent.
+pub fn oublier_le_refus_de_session(settings: &SettingsRepo) {
+    settings.delete(CLE_RECONNEXION_REQUISE).ok();
+    settings.delete(CLE_RECUL).ok();
+}
+
+/// Le client OAuth du compte : `mozaik_client_id`, puis
+/// `TUNE_MOZAIK_CLIENT_ID`, puis le client public par défaut.
+pub fn client_id_du_compte(settings: &SettingsRepo) -> String {
+    settings
+        .get("mozaik_client_id")
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("TUNE_MOZAIK_CLIENT_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string())
+}
+
+/// Renouvelle la session SSO du serveur après un 401, et rend le jeton
+/// d'accès à présenter — ou `None` s'il n'y en a pas de valide.
+///
+/// 🔴 Chemin UNIQUE de tout le serveur (#8238). Le site fait tourner le jeton
+/// de rafraîchissement à chaque usage et, s'il revoit un jeton déjà tourné,
+/// révoque TOUTE la famille (RFC 9700 §4.14.2) — le nouveau jeton compris.
+/// Tune Circle, les écoutes, la bibliothèque cloud, les notes et le battement
+/// de compte renouvelaient chacun de leur côté : au premier 401 commun, ils
+/// partaient ensemble avec le même jeton, un seul gagnait, les autres
+/// faisaient révoquer la famille, et le serveur restait déconnecté en
+/// redemandant `/oauth/token` à chaque appel.
+///
+/// - un seul renouvellement à la fois (verrou) ;
+/// - `jeton_refuse` : le jeton d'accès que l'appelant vient de se voir
+///   refuser. Si le jeton stocké a changé entre-temps, une autre tâche a déjà
+///   renouvelé : il est rendu tel quel, sans appel au site ;
+/// - un refus 400/401 du site pose [`CLE_RECONNEXION_REQUISE`] : plus aucun
+///   appel à `/oauth/token` avant une nouvelle connexion ;
+/// - un échec passager (réseau, 429, 5xx) arme un recul croissant.
+pub async fn renouveler_la_session(settings: &SettingsRepo, jeton_refuse: &str) -> Option<String> {
+    let _tour = VERROU_RENOUVELLEMENT.lock().await;
+
+    let lire = |cle: &str| {
+        settings
+            .get(cle)
+            .ok()
+            .flatten()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+
+    if let Some(actuel) = lire("mozaik_access_token")
+        && actuel != jeton_refuse.trim()
+    {
+        debug!("sso_session_deja_renouvelee");
+        return Some(actuel);
+    }
+    if reconnexion_requise(settings) {
+        return None;
+    }
+    if let Some((jusqua, _)) = lire_recul(settings)
+        && maintenant_s() < jusqua
+    {
+        debug!("sso_renouvellement_differe");
+        return None;
+    }
+    let rt = lire("mozaik_refresh_token")?;
+    let base = lire("mozaik_base_url");
+    let auth = MozaikAuth::new(client_id_du_compte(settings), base.as_deref());
+
+    match auth.renouveler(&rt).await {
+        Ok(tok) => {
+            settings.set("mozaik_access_token", &tok.access_token).ok();
+            if let Some(n) = tok.refresh_token.as_deref().filter(|s| !s.is_empty()) {
+                settings.set("mozaik_refresh_token", n).ok();
+            }
+            settings.delete(CLE_RECUL).ok();
+            info!("sso_session_renouvelee");
+            Some(tok.access_token)
+        }
+        Err(Some(statut @ (400 | 401))) => {
+            settings
+                .set(CLE_RECONNEXION_REQUISE, &chrono::Utc::now().to_rfc3339())
+                .ok();
+            warn!(
+                statut,
+                "sso_reconnexion_requise : mozaiklabs.fr refuse le renouvellement, \
+                 reconnecter le compte"
+            );
+            None
+        }
+        Err(statut) => {
+            let echecs = lire_recul(settings)
+                .map(|(_, n)| n)
+                .unwrap_or(0)
+                .saturating_add(1);
+            let delai = RECUL_INITIAL_S
+                .saturating_mul(1u64 << (echecs - 1).min(10))
+                .min(RECUL_MAX_S);
+            settings
+                .set(CLE_RECUL, &format!("{}:{echecs}", maintenant_s() + delai))
+                .ok();
+            warn!(
+                ?statut,
+                delai_s = delai,
+                "sso_renouvellement_echec_passager"
+            );
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudUser {
     pub id: i64,
@@ -250,6 +410,7 @@ impl MozaikAuth {
 
         let resp = client
             .post(&url)
+            .header(reqwest::header::USER_AGENT, USER_AGENT_SSO)
             .form(&[
                 ("grant_type", "authorization_code"),
                 ("code", code),
@@ -280,12 +441,30 @@ impl MozaikAuth {
     /// Exchange a refresh token for a fresh access/refresh token pair (public
     /// client, no secret). Used to keep the account premium fresh past the
     /// access-token expiry.
+    ///
+    /// ⛔ Ne pas appeler directement depuis une tâche : passer par
+    /// [`renouveler_la_session`], le chemin UNIQUE (#8238). Le site fait
+    /// tourner le jeton de rafraîchissement à chaque usage et révoque toute la
+    /// famille quand un jeton déjà tourné revient : deux renouvellements
+    /// concurrents avec le même jeton déconnectent le serveur pour de bon.
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenResponse, String> {
+        self.renouveler(refresh_token).await.map_err(|e| match e {
+            Some(statut) => format!("oauth refresh failed: {statut}"),
+            None => "oauth refresh request failed".to_string(),
+        })
+    }
+
+    /// [`Self::refresh_token`], avec le statut HTTP du refus (`None` : pas de
+    /// réponse exploitable — réseau, corps illisible).
+    async fn renouveler(&self, refresh_token: &str) -> Result<TokenResponse, Option<u16>> {
         let url = format!("{}/oauth/token", self.base_url);
         let client = crate::http::client::shared();
 
         let resp = client
             .post(&url)
+            // Le client partagé ne porte pas d'User-Agent : les journaux du
+            // site ne savaient pas à qui appartenaient ces appels (#8238).
+            .header(reqwest::header::USER_AGENT, USER_AGENT_SSO)
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
@@ -293,17 +472,21 @@ impl MozaikAuth {
             ])
             .send()
             .await
-            .map_err(|e| format!("oauth refresh request failed: {e}"))?;
+            .map_err(|e| {
+                debug!(error = %e.without_url(), "oauth_refresh_unreachable");
+                None
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             debug!(status = %status, "oauth_refresh_failed");
-            return Err(format!("oauth refresh failed: {status}"));
+            return Err(Some(status.as_u16()));
         }
 
-        resp.json()
-            .await
-            .map_err(|e| format!("failed to parse refresh response: {e}"))
+        resp.json().await.map_err(|e| {
+            debug!(error = %e, "oauth_refresh_unreadable");
+            None
+        })
     }
 
     /// Relit le profil du compte lié sur mozaiklabs — `premium`, la date de fin
@@ -807,5 +990,168 @@ mod tests_profil_borne {
             .expect("un 200 doit rendre le profil");
         assert_eq!(user.modules, vec!["diretta".to_string()]);
         assert!(user.premium);
+    }
+}
+
+/// #8238 — le renouvellement unique de la session SSO, contre un banc qui fait
+/// comme mozaiklabs.fr : rotation à chaque usage, et révocation de TOUTE la
+/// famille quand un jeton déjà tourné revient.
+#[cfg(test)]
+mod tests_renouvellement_8238 {
+    use super::*;
+    use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn base() -> Arc<dyn crate::db::backend::DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn settings() -> SettingsRepo {
+        SettingsRepo::with_backend(base())
+    }
+
+    #[derive(Default)]
+    struct Site {
+        /// Jeton de rafraîchissement encore valide, s'il en reste un.
+        valide: Option<String>,
+        /// Jetons déjà tournés : leur retour révoque la famille.
+        tournes: Vec<String>,
+        n: u64,
+    }
+
+    /// `POST /oauth/token` : rend `statut_force` s'il est donné, sinon tourne
+    /// comme le site. Compte les appels réellement reçus et note l'User-Agent.
+    async fn banc(
+        initial: &str,
+        statut_force: Option<u16>,
+    ) -> (String, Arc<AtomicU64>, Arc<Mutex<Option<String>>>) {
+        use axum::http::{HeaderMap, StatusCode};
+        let site = Arc::new(Mutex::new(Site {
+            valide: Some(initial.to_string()),
+            ..Default::default()
+        }));
+        let appels = Arc::new(AtomicU64::new(0));
+        let ua = Arc::new(Mutex::new(None));
+        let (compteur, ua2) = (appels.clone(), ua.clone());
+        let app = axum::Router::new().route(
+            "/oauth/token",
+            axum::routing::post(
+                move |entetes: HeaderMap, axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| {
+                    let (site, compteur, ua2) = (site.clone(), compteur.clone(), ua2.clone());
+                    async move {
+                        compteur.fetch_add(1, Ordering::SeqCst);
+                        *ua2.lock().unwrap() = entetes
+                            .get("user-agent")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        // Laisse aux appels concurrents le temps d'arriver.
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                        if let Some(code) = statut_force {
+                            return (StatusCode::from_u16(code).unwrap(), r#"{"error":"x"}"#.to_string());
+                        }
+                        let rt = f.get("refresh_token").cloned().unwrap_or_default();
+                        let mut s = site.lock().unwrap();
+                        if s.valide.as_deref() == Some(rt.as_str()) {
+                            s.n += 1;
+                            let neuf = format!("rt-{}", s.n);
+                            s.tournes.push(rt);
+                            s.valide = Some(neuf.clone());
+                            let corps = format!(
+                                r#"{{"access_token":"at-{}","refresh_token":"{neuf}","expires_in":3600}}"#,
+                                s.n
+                            );
+                            (StatusCode::OK, corps)
+                        } else {
+                            if s.tournes.contains(&rt) {
+                                s.valide = None; // famille révoquée
+                            }
+                            (StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#.to_string())
+                        }
+                    }
+                },
+            ),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = ecoute.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), appels, ua)
+    }
+
+    fn connecte(s: &SettingsRepo, base: &str) {
+        s.set("mozaik_base_url", base).unwrap();
+        s.set("mozaik_access_token", "at-0").unwrap();
+        s.set("mozaik_refresh_token", "rt-0").unwrap();
+    }
+
+    /// Cinq tâches reçoivent le même 401 en même temps : UN seul appel au
+    /// site, et toutes repartent avec le même jeton neuf. Avant, cinq appels
+    /// avec `rt-0` : un gagnait, les quatre autres faisaient révoquer la
+    /// famille et le serveur restait déconnecté.
+    #[tokio::test]
+    async fn renouvellements_concurrents_un_seul_appel() {
+        let db = base();
+        let s = SettingsRepo::with_backend(db.clone());
+        let (adresse, appels, ua) = banc("rt-0", None).await;
+        connecte(&s, &adresse);
+        let taches: Vec<_> = (0..5)
+            .map(|_| {
+                let s = SettingsRepo::with_backend(db.clone());
+                tokio::spawn(async move { renouveler_la_session(&s, "at-0").await })
+            })
+            .collect();
+        for t in taches {
+            assert_eq!(t.await.unwrap().as_deref(), Some("at-1"));
+        }
+        assert_eq!(appels.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            s.get("mozaik_refresh_token").unwrap().as_deref(),
+            Some("rt-1")
+        );
+        assert!(!reconnexion_requise(&s));
+        assert_eq!(ua.lock().unwrap().as_deref(), Some(USER_AGENT_SSO));
+    }
+
+    /// Un refus du site (400) pose « reconnexion requise » : les appels
+    /// suivants ne partent plus du tout, jusqu'à une nouvelle connexion.
+    #[tokio::test]
+    async fn refus_400_arrete_les_renouvellements() {
+        let s = settings();
+        let (adresse, appels, _) = banc("autre", None).await;
+        connecte(&s, &adresse);
+        assert_eq!(renouveler_la_session(&s, "at-0").await, None);
+        assert!(reconnexion_requise(&s));
+        for _ in 0..10 {
+            assert_eq!(renouveler_la_session(&s, "at-0").await, None);
+        }
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            1,
+            "plus aucun /oauth/token après le refus"
+        );
+        oublier_le_refus_de_session(&s);
+        assert!(!reconnexion_requise(&s));
+    }
+
+    /// Un échec passager (503) arme un recul : pas de nouvel appel pendant
+    /// le délai, et pas de « reconnexion requise ».
+    #[tokio::test]
+    async fn echec_passager_recule() {
+        let s = settings();
+        let (adresse, appels, _) = banc("rt-0", Some(503)).await;
+        connecte(&s, &adresse);
+        assert_eq!(renouveler_la_session(&s, "at-0").await, None);
+        assert_eq!(renouveler_la_session(&s, "at-0").await, None);
+        assert_eq!(appels.load(Ordering::SeqCst), 1);
+        assert!(!reconnexion_requise(&s));
+        let (jusqua, n) = lire_recul(&s).unwrap();
+        assert_eq!(n, 1);
+        assert!(jusqua >= maintenant_s() + RECUL_INITIAL_S - 1);
     }
 }

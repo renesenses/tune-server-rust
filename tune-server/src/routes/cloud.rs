@@ -380,6 +380,8 @@ async fn sso_callback(
     settings
         .set("mozaik_access_token", &token.access_token)
         .ok();
+    // #8238 : une session neuve lève « reconnexion requise » et le recul.
+    tune_core::cloud::sso::oublier_le_refus_de_session(&settings);
     if let Some(ref rt) = token.refresh_token {
         settings.set("mozaik_refresh_token", rt).ok();
     }
@@ -566,10 +568,15 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok());
+    // #8238 : le site a refusé le renouvellement de la session. Les jetons
+    // sont encore en base mais ne valent plus rien : le serveur n'est PAS
+    // connecté, et l'interface propose la connexion au compte.
+    let reconnect_required = connected && tune_core::cloud::sso::reconnexion_requise(&settings);
 
     Json(json!({
         "configured": configured,
-        "connected": connected,
+        "connected": connected && !reconnect_required,
+        "reconnect_required": reconnect_required,
         "user": user,
     }))
 }
@@ -613,6 +620,7 @@ async fn sso_disconnect(
     ] {
         settings.delete(key).ok();
     }
+    tune_core::cloud::sso::oublier_le_refus_de_session(&settings);
     state.license.clear_account_premium().await;
     // Founder endpoint order came from this account — revert to direct-first.
     state.license.set_qobuz_proxy_first(false).await;
