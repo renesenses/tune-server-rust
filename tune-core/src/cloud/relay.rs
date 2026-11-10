@@ -50,9 +50,16 @@ const INTERVALLE_REINSCRIPTION_DE_CLE: Duration = Duration::from_secs(600);
 const SESSION_STABLE: Duration = Duration::from_secs(60);
 
 /// Numéro de la prochaine tentative après une session terminée par `fin`,
-/// qui a duré `duree` depuis le début de la tentative.
-fn tentative_suivante(attempt: u32, fin: &Result<FinDeSession, String>, duree: Duration) -> u32 {
-    if fin.is_ok() && duree >= SESSION_STABLE {
+/// qui a duré `duree` depuis le début de la tentative. `stable` : durée
+/// minimale d'une session pour remettre le recul à zéro
+/// ([`DelaisDuRelais::session_stable`]).
+fn tentative_suivante(
+    attempt: u32,
+    fin: &Result<FinDeSession, String>,
+    duree: Duration,
+    stable: Duration,
+) -> u32 {
+    if fin.is_ok() && duree >= stable {
         1
     } else {
         attempt.saturating_add(1)
@@ -70,6 +77,9 @@ pub struct DelaisDuRelais {
     pub connexion: Duration,
     pub poignee: Duration,
     pub silence: Duration,
+    /// Durée minimale d'une session inscrite pour remettre le recul à zéro
+    /// ([`SESSION_STABLE`] hors bancs).
+    pub session_stable: Duration,
 }
 
 impl Default for DelaisDuRelais {
@@ -78,6 +88,7 @@ impl Default for DelaisDuRelais {
             connexion: DELAI_DE_CONNEXION,
             poignee: DELAI_DE_POIGNEE,
             silence: SILENCE_MAX,
+            session_stable: SESSION_STABLE,
         }
     }
 }
@@ -304,7 +315,12 @@ impl RelayClient {
                 // le .18 le 08/11/2026 : « backoff_secs=60 » après une
                 // simple fermeture propre. Une session plus courte compte
                 // comme un échec : voir [`SESSION_STABLE`].
-                attempt = tentative_suivante(attempt, &fin, debut.elapsed());
+                attempt = tentative_suivante(
+                    attempt,
+                    &fin,
+                    debut.elapsed(),
+                    client.delais.session_stable,
+                );
                 let backoff = attente_avant(attempt);
                 info!(
                     backoff_secs = backoff.as_secs(),
@@ -1537,6 +1553,7 @@ mod recul_de_reconnexion_tests {
                 attempt,
                 &Ok(FinDeSession::Fermee),
                 Duration::from_millis(50),
+                DelaisDuRelais::default().session_stable,
             );
             attentes.push(attente_avant(attempt).as_secs());
         }
@@ -1547,14 +1564,34 @@ mod recul_de_reconnexion_tests {
     /// une coupure isolée (relais redéployé) se rattrape aussitôt.
     #[test]
     fn session_stable_remet_le_recul_a_zero() {
-        let attempt = tentative_suivante(6, &Ok(FinDeSession::Fermee), SESSION_STABLE);
+        let attempt =
+            tentative_suivante(6, &Ok(FinDeSession::Fermee), SESSION_STABLE, SESSION_STABLE);
+        assert_eq!(attente_avant(attempt), Duration::from_secs(2));
+    }
+
+    /// Le seuil vient des délais du client : un banc qui le met à zéro
+    /// retrouve « toute session inscrite remet le recul à zéro ».
+    #[test]
+    fn seuil_reglable_par_les_delais() {
+        assert_eq!(DelaisDuRelais::default().session_stable, SESSION_STABLE);
+        let attempt = tentative_suivante(
+            5,
+            &Ok(FinDeSession::Fermee),
+            Duration::from_millis(50),
+            Duration::ZERO,
+        );
         assert_eq!(attente_avant(attempt), Duration::from_secs(2));
     }
 
     /// Une erreur ne remet jamais le compteur à zéro, quelle que soit sa durée.
     #[test]
     fn erreur_longue_ne_remet_pas_a_zero() {
-        let attempt = tentative_suivante(3, &Err("ws".into()), Duration::from_secs(600));
+        let attempt = tentative_suivante(
+            3,
+            &Err("ws".into()),
+            Duration::from_secs(600),
+            SESSION_STABLE,
+        );
         assert_eq!(attempt, 4);
     }
 }
@@ -1651,6 +1688,16 @@ pub fn spawn_relay_client(
     backend: Arc<dyn DbBackend>,
     local_port: u16,
 ) -> Option<Arc<RelayClient>> {
+    spawn_relay_client_avec_delais(backend, local_port, DelaisDuRelais::default())
+}
+
+/// [`spawn_relay_client`] avec d'autres délais (bancs de test).
+#[doc(hidden)]
+pub fn spawn_relay_client_avec_delais(
+    backend: Arc<dyn DbBackend>,
+    local_port: u16,
+    delais: DelaisDuRelais,
+) -> Option<Arc<RelayClient>> {
     let settings = &SettingsRepo::with_backend(backend.clone());
     let enabled = settings
         .get("bridge_enabled")
@@ -1701,6 +1748,7 @@ pub fn spawn_relay_client(
     // et rangée dans le coffre. Sans elle, le client s'enregistre comme un
     // serveur antérieur : le dire, sans rien bloquer.
     let mut client = RelayClient::new(server_id, bridge_token, relay_url, local_port)
+        .avec_delais(delais)
         .avec_reglages(backend.clone())
         .avec_inscription(Arc::new(
             crate::cloud::cle_serveur::InscriptionHttp::depuis_environnement(

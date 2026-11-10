@@ -327,8 +327,19 @@ async fn demarrer_serveur(relais: &Relais, nom: &'static str) -> Serveur {
         .unwrap();
     reglages.set("server_name", nom).unwrap();
     let port = api_locale(nom).await;
-    let client = tune_core::cloud::relay::spawn_relay_client(backend.clone(), port)
-        .expect("pont active : le client de relais doit demarrer");
+    // Seuil de session stable à zéro : ces bancs coupent le relais à
+    // quelques secondes d'intervalle et exigent un retour rapide à chaque
+    // fois. Le recul des sessions courtes (deux serveurs au même
+    // `server_id`) est prouvé dans `tune-core` (`recul_de_reconnexion_tests`).
+    let client = tune_core::cloud::relay::spawn_relay_client_avec_delais(
+        backend.clone(),
+        port,
+        tune_core::cloud::relay::DelaisDuRelais {
+            session_stable: Duration::ZERO,
+            ..Default::default()
+        },
+    )
+    .expect("pont active : le client de relais doit demarrer");
     let server_id = reglages.get("server_id").unwrap().unwrap();
     let s = Serveur {
         backend,
@@ -804,6 +815,7 @@ fn client_vers(adresse: std::net::SocketAddr, port: u16) -> Arc<RelayClient> {
             connexion: Duration::from_secs(1),
             poignee: Duration::from_secs(1),
             silence: Duration::from_secs(1),
+            ..Default::default()
         }),
     )
 }
