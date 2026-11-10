@@ -1496,7 +1496,10 @@ pub(super) fn etat_du_surechantillonneur_lang(
     let (raison, cle) = if pure {
         ("pure", "upsampling_pure")
     } else if output_type != "local" {
-        ("output_not_supported", "upsampling_not_applied")
+        // #8149 — une zone réseau (DLNA, AirPlay…) n'a pas de
+        // suréchantillonneur : « à la piste suivante » y était faux, rien ne
+        // s'appliquera jamais. Le dire, avec la raison.
+        ("output_not_supported", "upsampling_zone_not_supported")
     } else {
         ("not_applied", "upsampling_not_applied")
     };
