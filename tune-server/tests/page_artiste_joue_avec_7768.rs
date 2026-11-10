@@ -111,6 +111,9 @@ fn bibliotheque() -> AppState {
     artiste(&s, 6, "DJ Okapi");
     artiste(&s, 7, "Hidden Friend");
     artiste(&s, 8, "Seul");
+    // Ana Bell n'est créditée que SANS fiche : sa fiche (autre casse) est
+    // retrouvée en base.
+    artiste(&s, 9, "ana bell");
 
     // Album 100 de Nora Vidal : Ilse à la contrebasse sur les 4 pistes.
     album(&s, 100, 2, false);
@@ -275,7 +278,7 @@ async fn joue_avec_rend_les_audibles_ponderes_dans_l_ordre_7768() {
         json!([
             { "artist_id": 2, "artist_name": "Nora Vidal", "shared_tracks": 4 },
             { "artist_id": null, "artist_name": "Tomas Reyes", "shared_tracks": 2 },
-            { "artist_id": null, "artist_name": "Ana Bell", "shared_tracks": 1 },
+            { "artist_id": 9, "artist_name": "ana bell", "shared_tracks": 1 },
             { "artist_id": 6, "artist_name": "DJ Okapi", "shared_tracks": 1 }
         ]),
         "played_with : {}",
