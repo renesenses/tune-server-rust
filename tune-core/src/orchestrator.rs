@@ -2134,6 +2134,8 @@ mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+/// #8082 — flux continu entre les pistes pour les renderers DLNA.
+mod flux_continu_8082;
 mod repere_de_hausse_6721;
 #[cfg(test)]
 mod repere_de_hausse_6721_tests;
