@@ -13,8 +13,10 @@
 //!
 //! Contre-épreuve (notée dans la PR) : rendre `annonce_voulue_selon` à son
 //! ancien `unwrap_or(true)` (la branche `None => true`, sans lire la
-//! variable) — les deux premières épreuves rougissent ; retirer l'appel à
-//! `annonce_voulue` de `spawn_upnp_advertiser` — la garde de câblage rougit.
+//! variable) — la première épreuve rougit (mesuré sur Shrek) ; la deuxième
+//! ne couvre que des cas où la clé est présente, elle garde la priorité de
+//! la clé sur la variable. Retirer l'appel à `annonce_voulue` de
+//! `spawn_upnp_advertiser` — la garde de câblage rougit.
 
 use std::sync::Arc;
 
