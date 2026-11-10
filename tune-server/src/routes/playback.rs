@@ -985,6 +985,10 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             // sérialisent `NowPlaying` entier et le portent déjà ; celle-ci,
             // écrite à la main, l'aurait tu jusqu'au prochain évènement.
             "bitrate_kbps": np.bitrate_kbps,
+            // #8327 — compositeur et label, comme les autres charges utiles
+            // qui sérialisent `NowPlaying` entier ; `null` quand inconnus.
+            "composer": np.composer,
+            "label": np.label,
         })),
         "position_ms": zone_state.position_ms,
         "queue_length": zone_state.queue_length,
@@ -1017,6 +1021,9 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     // champs que GET /zones et GET /zones/{id}.
     if let Some(obj) = v.as_object_mut() {
         crate::routes::zones::inject_metadata_anchor(obj, &zone_state);
+        // #8327 — identifiants de service et artistes de la piste en cours,
+        // comme GET /zones et GET /zones/{id}.
+        crate::routes::zones::completer_la_piste_en_cours(state, zone_id, &zone_state, obj);
         crate::routes::zones::inject_session_context(obj, &zone_state);
         // #2672 — LE défaut. Cette charge utile, rendue par une vingtaine de
         // routes de lecture, ne portait aucun des neuf réglages du panneau

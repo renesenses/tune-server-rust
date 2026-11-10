@@ -328,6 +328,8 @@ impl SourcePochette {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// #8327 — la sérialisation publique ajoute `artists` (voir après la struct).
+#[serde(remote = "Self")]
 pub struct Track {
     pub id: Option<i64>,
     pub title: String,
@@ -399,6 +401,19 @@ pub struct Track {
     #[serde(default)]
     pub cue_end_ms: Option<i64>,
 }
+
+// #8327 — `artists: [{name, id?, role}]` : la liste structurée des artistes de
+// la piste. Hors base, seul le découpage fort (« feat. », « ; ») s'applique ;
+// « A & B » n'est coupé que là où la bibliothèque confirme A et B (lecture en
+// cours). L'identifiant de la piste ne va qu'à un crédit non coupé.
+crate::metadata::artistes_de_piste::serialiser_avec_artistes!(Track, TrackBrut, |p| {
+    p.artist_name
+        .as_deref()
+        .map(|nom| {
+            crate::metadata::artistes_de_piste::artistes_de_piste_sans_base(nom, p.artist_id, None)
+        })
+        .unwrap_or_default()
+});
 
 impl Track {
     /// Les bornes de la tranche à jouer, quand cette piste est une piste

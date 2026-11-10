@@ -1185,12 +1185,38 @@ pub(crate) fn album_de_service_de_la_demande(
     identifiant_de_service_sur(album_id_service)
 }
 
-/// La référence d'album de la ligne de file qui JOUE, si c'est bien elle.
+/// La ligne de file qui JOUE, si c'est bien elle.
 ///
 /// La ligne doit porter la même source et le même identifiant que la piste en
 /// cours : une file réordonnée ou rechargée ne doit pas prêter l'album d'une
 /// voisine. La ligne au rang de l'état de zone d'abord, puis la ligne marquée
 /// courante — l'état de zone peut avoir un temps de retard sur la base.
+fn ligne_qui_joue(
+    state: &AppState,
+    zone_id: i64,
+    position: i64,
+    source: &str,
+    source_id: &str,
+) -> Option<tune_core::db::play_queue_repo::QueueEntry> {
+    let repo = tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(state.backend.clone());
+    let est_elle = |e: &tune_core::db::play_queue_repo::QueueEntry| {
+        e.source.as_deref() == Some(source) && e.source_id.as_deref() == Some(source_id)
+    };
+    if let Some(e) = repo.get_at(zone_id, position).ok().flatten()
+        && est_elle(&e)
+    {
+        return Some(e);
+    }
+    repo.get_ordered(zone_id)
+        .ok()?
+        .into_iter()
+        .find(|e| e.is_current && est_elle(e))
+}
+
+/// La référence d'album de la ligne de file qui JOUE, si c'est bien elle
+/// (même règle que [`ligne_qui_joue`], qui s'arrête à la première ligne
+/// reconnue ; celle-ci cherche encore la ligne courante si la première n'a
+/// pas d'album).
 fn album_de_la_ligne_qui_joue(
     state: &AppState,
     zone_id: i64,
@@ -1213,6 +1239,74 @@ fn album_de_la_ligne_qui_joue(
         .into_iter()
         .find(|e| e.is_current && est_elle(e))
         .and_then(|e| e.album_id_service().map(str::to_string))
+}
+
+/// #8327 — les identifiants qui manquaient à `current_track` pour que les
+/// clients fassent des liens EXACTS, sans rechercher par nom :
+///
+/// - `album_id_service` / `artist_id_service` : l'album et l'artiste CHEZ LE
+///   SERVICE de la piste qui joue, tels que la ligne de file les garde
+///   (migrations 114 et 123, les clés de `GET /zones/{id}/queue`). Clés
+///   toujours présentes, `null` quand rien n'est connu (piste locale, radio,
+///   ligne absente) — même contrat que la file ;
+/// - `artists` : la liste structurée des artistes de la piste (voir
+///   `tune_core::metadata::artistes_de_piste`). Pour une piste locale, « A &
+///   B » n'est coupé que si la bibliothèque connaît A ET B, et chacun porte
+///   alors son `id`. Clé absente quand la piste n'a pas d'artiste.
+///
+/// Appelée partout où la charge utile d'une zone porte `current_track` :
+/// `GET /zones`, `GET /zones/{id}` et `build_zone_json`.
+pub(crate) fn completer_la_piste_en_cours(
+    state: &AppState,
+    zone_id: i64,
+    ps: &ZoneState,
+    obj: &mut serde_json::Map<String, Value>,
+) {
+    let Some(np) = ps.now_playing.as_ref() else {
+        return;
+    };
+    let Some(track) = obj.get_mut("current_track").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let source = np.source.as_str();
+    let est_un_service = !matches!(source, "" | "local" | "radio" | "upnp");
+    let ligne = match (est_un_service, np.source_id.as_deref()) {
+        (true, Some(sid)) if !sid.trim().is_empty() => {
+            ligne_qui_joue(state, zone_id, ps.queue_position, source, sid)
+        }
+        _ => None,
+    };
+    let album_service = ligne
+        .as_ref()
+        .and_then(|e| e.album_id_service().map(str::to_string));
+    let artiste_service = ligne
+        .as_ref()
+        .and_then(|e| e.artist_id_service().map(str::to_string));
+    track.insert("album_id_service".into(), json!(album_service));
+    track.insert("artist_id_service".into(), json!(artiste_service));
+
+    let artistes = match np.artist_name.as_deref() {
+        Some(nom) if !est_un_service => {
+            let repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());
+            tune_core::metadata::artistes_de_piste::artistes_de_piste(
+                nom,
+                np.artist_id,
+                None,
+                &|n| repo.get_by_name(n).ok().flatten().and_then(|a| a.id),
+            )
+        }
+        Some(nom) => tune_core::metadata::artistes_de_piste::artistes_de_piste_sans_base(
+            nom,
+            None,
+            artiste_service.as_deref(),
+        ),
+        None => Vec::new(),
+    };
+    if artistes.is_empty() {
+        track.remove("artists");
+    } else {
+        track.insert("artists".into(), json!(artistes));
+    }
 }
 
 /// Qui a le droit de recevoir l'adresse du flux interne — la règle, UNE fois.

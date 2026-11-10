@@ -970,6 +970,8 @@ async fn playback_manager_state_transitions() {
         bitrate_kbps: None,
         channels: None,
         version: None,
+        composer: None,
+        label: None,
     };
     state.playback.play(zone_id, np).await;
     let zs = state.playback.get_state(zone_id).await;
@@ -999,6 +1001,8 @@ async fn playback_manager_state_transitions() {
         bitrate_kbps: None,
         channels: None,
         version: None,
+        composer: None,
+        label: None,
     };
     state.playback.play(zone_id, np2).await;
     let zs = state.playback.get_state(zone_id).await;

@@ -102,6 +102,9 @@ async fn recent_history(
             None
         }
     };
+    // #8327 — l'artiste de BIBLIOTHÈQUE de chaque écoute, par sa piste.
+    let pistes: Vec<i64> = items.iter().filter_map(|item| item.track_id).collect();
+    let ids_pistes = repo.ids_des_pistes(&pistes);
     let items: Vec<Value> = items
         .into_iter()
         .enumerate()
@@ -115,6 +118,14 @@ async fn recent_history(
             // #7778 (point 6) : l'album du service, sous la clé que le client
             // lit déjà sur la file ; `album_ref` reste hors du JSON.
             value["album_id_service"] = json!(item.album_id_service());
+            // #8327 — `artist_id` : l'artiste de la piste ÉCOUTÉE (`tracks`
+            // par `track_id`), jamais un homonyme retrouvé par le nom. `null`
+            // pour une écoute de service ou une piste disparue.
+            value["artist_id"] = json!(
+                item.track_id
+                    .and_then(|id| ids_pistes.get(&id))
+                    .and_then(|(_, artiste)| *artiste)
+            );
             value
         })
         .collect();
@@ -154,7 +165,24 @@ async fn top_albums(State(state): State<AppState>, Query(p): Query<HistoryParams
 async fn top_tracks(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    let items = repo.top_tracks(limit).unwrap_or_default();
+    let mut items = repo.top_tracks(limit).unwrap_or_default();
+    // #8327 — l'album et l'artiste de BIBLIOTHÈQUE de chaque piste, par
+    // identifiant : le client n'a plus à les retrouver par leur nom. Clés
+    // toujours présentes, `null` quand la piste n'est pas en bibliothèque.
+    let pistes: Vec<i64> = items
+        .iter()
+        .filter_map(|v| v.get("track_id").and_then(Value::as_i64))
+        .collect();
+    let ids = repo.ids_des_pistes(&pistes);
+    for v in &mut items {
+        let fiche = v
+            .get("track_id")
+            .and_then(Value::as_i64)
+            .and_then(|id| ids.get(&id))
+            .copied();
+        v["album_id"] = json!(fiche.and_then(|(album, _)| album));
+        v["artist_id"] = json!(fiche.and_then(|(_, artiste)| artiste));
+    }
     Json(json!(items))
 }
 

@@ -137,7 +137,7 @@ pub fn is_allowlisted(name: &str, extra: &[String]) -> bool {
 /// (« İ » → « i̇ », 2 → 3 octets ; « ẞ » → « ß », 3 → 2), les positions
 /// tombaient au milieu d'un caractère et le serveur paniquait au démarrage
 /// (passe `recalculer_les_compilations`, v0.9.166).
-fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
+pub(crate) fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() {
         return haystack.to_string();
     }

@@ -85,6 +85,8 @@ pub enum PlayState {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// #8327 — la sérialisation publique ajoute `artists` (voir après la struct).
+#[serde(remote = "Self")]
 pub struct NowPlaying {
     pub track_id: Option<i64>,
     pub title: String,
@@ -145,7 +147,27 @@ pub struct NowPlaying {
     /// substitution). `#[serde(default)]` : un client plus ancien l'ignore.
     #[serde(default)]
     pub version: Option<VersionJouee>,
+    /// #8327 — compositeur et label de la piste, quand la bibliothèque les
+    /// connaît (`tracks.composer`, `tracks.label`), pour que la lecture en
+    /// cours en fasse des liens. Absents (clé omise) quand inconnus ;
+    /// `#[serde(default)]` : un client plus ancien ne les envoie pas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
+
+// #8327 — `artists` à côté des champs : hors base, découpage fort seulement.
+// Les charges utiles de zone le remplacent par la liste confirmée par la
+// bibliothèque (`routes/zones.rs`, `completer_la_piste_en_cours`).
+crate::metadata::artistes_de_piste::serialiser_avec_artistes!(NowPlaying, NowPlayingBrut, |p| {
+    p.artist_name
+        .as_deref()
+        .map(|nom| {
+            crate::metadata::artistes_de_piste::artistes_de_piste_sans_base(nom, p.artist_id, None)
+        })
+        .unwrap_or_default()
+});
 
 /// La piste DEMANDÉE quand la règle en a fait jouer une autre (#2264).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +198,13 @@ pub struct VersionJouee {
     /// La source de la version préférée indisponible (`qobuz`, `local`…),
     /// quand `fallback` est vrai.
     pub unavailable_source: Option<String>,
+}
+
+/// Un texte de balise utile : rogné, non vide.
+fn non_vide(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 impl NowPlaying {
@@ -221,6 +250,8 @@ impl NowPlaying {
                 .filter(|b| *b > 0),
             channels: u16::try_from(track.channels).ok().filter(|n| *n > 0),
             version: None,
+            composer: non_vide(track.composer.as_deref()),
+            label: non_vide(track.label.as_deref()),
         }
     }
 }

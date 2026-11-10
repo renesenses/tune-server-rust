@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::TuneError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// #8327 — la sérialisation publique ajoute `artists` (voir plus bas).
+#[serde(remote = "Self")]
 pub struct StreamTrack {
     #[serde(rename(serialize = "source_id"), alias = "source_id")]
     pub id: String,
@@ -66,6 +68,8 @@ pub struct StreamTrack {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// #8327 — la sérialisation publique ajoute `artists` (voir plus bas).
+#[serde(remote = "Self")]
 pub struct StreamAlbum {
     #[serde(rename(serialize = "source_id"), alias = "source_id")]
     pub id: String,
@@ -128,6 +132,25 @@ pub struct StreamAlbum {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explicit: Option<bool>,
 }
+
+// #8327 — `artists: [{name, id_service?, role}]` à côté des champs de la
+// piste et de l'album : un lien par artiste, sans découpage côté client.
+// Hors base, seul le découpage fort (« feat. », « ; ») s'applique ; un nom
+// comme « A & B » reste l'artiste du service, avec SON identifiant.
+crate::metadata::artistes_de_piste::serialiser_avec_artistes!(StreamTrack, StreamTrackBrut, |p| {
+    crate::metadata::artistes_de_piste::artistes_de_piste_sans_base(
+        &p.artist,
+        None,
+        p.artist_id.as_deref(),
+    )
+});
+crate::metadata::artistes_de_piste::serialiser_avec_artistes!(StreamAlbum, StreamAlbumBrut, |p| {
+    crate::metadata::artistes_de_piste::artistes_de_piste_sans_base(
+        &p.artist,
+        None,
+        p.artist_id.as_deref(),
+    )
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamArtist {

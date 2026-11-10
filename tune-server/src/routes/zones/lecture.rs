@@ -406,6 +406,7 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             );
             obj.insert("current_track".into(), json!(ps.now_playing));
             inject_metadata_anchor(obj, &ps);
+            completer_la_piste_en_cours(&state, zone_id, &ps, obj);
             inject_session_context(obj, &ps);
             obj.insert(
                 "device_volume_observation".into(),
@@ -651,6 +652,7 @@ pub(crate) async fn get_zone(
                 );
                 obj.insert("current_track".into(), json!(ps.now_playing));
                 inject_metadata_anchor(obj, &ps);
+                completer_la_piste_en_cours(&state, id, &ps, obj);
                 inject_session_context(obj, &ps);
                 obj.insert(
                     "device_volume_observation".into(),

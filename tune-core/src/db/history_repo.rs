@@ -1249,6 +1249,84 @@ impl HistoryRepo {
         vec!["?"; n].join(", ")
     }
 
+    /// #8327 — l'album et l'artiste de BIBLIOTHÈQUE de chaque piste nommée
+    /// par son identifiant : `(album_id, artist_id)`. UNE requête pour le
+    /// lot ; une piste absente (supprimée depuis l'écoute) n'a pas d'entrée.
+    pub fn ids_des_pistes(
+        &self,
+        ids: &[i64],
+    ) -> std::collections::HashMap<i64, (Option<i64>, Option<i64>)> {
+        let mut out = std::collections::HashMap::new();
+        let mut ids: Vec<i64> = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return out;
+        }
+        let params: Vec<Box<dyn ToSqlValue>> = ids
+            .iter()
+            .map(|i| Box::new(*i) as Box<dyn ToSqlValue>)
+            .collect();
+        let refs: Vec<&dyn ToSqlValue> = params.iter().map(|p| p.as_ref()).collect();
+        let sql = format!(
+            "SELECT id, album_id, artist_id FROM tracks WHERE id IN ({})",
+            Self::lot_in(ids.len())
+        );
+        match self.db.query_many(&sql, &refs) {
+            Ok(rows) => {
+                for r in rows {
+                    if let Some(id) = r.first().and_then(|v| v.as_i64()) {
+                        out.insert(
+                            id,
+                            (
+                                r.get(1).and_then(|v| v.as_i64()),
+                                r.get(2).and_then(|v| v.as_i64()),
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "ids_des_pistes_illisibles"),
+        }
+        out
+    }
+
+    /// #8327 — l'artiste de BIBLIOTHÈQUE de chaque nom, à la casse près, clé
+    /// en minuscules. Même règle que `GET /history/top-artists` : un nom se
+    /// rattache à UNE fiche, la plus ancienne (`MIN(id)`, comme
+    /// `get_or_create` qui réutilise la première trouvée).
+    pub fn artistes_par_nom(&self, noms: &[String]) -> std::collections::HashMap<String, i64> {
+        let mut out = std::collections::HashMap::new();
+        if noms.is_empty() {
+            return out;
+        }
+        let bas: Vec<String> = noms.iter().map(|n| n.to_lowercase()).collect();
+        let params: Vec<Box<dyn ToSqlValue>> = bas
+            .iter()
+            .map(|n| Box::new(n.clone()) as Box<dyn ToSqlValue>)
+            .collect();
+        let refs: Vec<&dyn ToSqlValue> = params.iter().map(|p| p.as_ref()).collect();
+        let sql = format!(
+            "SELECT LOWER(name), MIN(id) FROM artists WHERE LOWER(name) IN ({}) \
+             GROUP BY LOWER(name)",
+            Self::lot_in(bas.len())
+        );
+        match self.db.query_many(&sql, &refs) {
+            Ok(rows) => {
+                for r in rows {
+                    if let (Some(n), Some(id)) = (
+                        r.first().and_then(|v| v.as_string()),
+                        r.get(1).and_then(|v| v.as_i64()),
+                    ) {
+                        out.insert(n, id);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "artistes_par_nom_illisibles"),
+        }
+        out
+    }
+
     /// La pochette de chaque artiste nommé — UNE requête pour tout le lot.
     ///
     /// L'image de l'artiste d'abord, la pochette d'un de ses albums à défaut :
@@ -1613,6 +1691,7 @@ impl HistoryRepo {
             .collect();
         let pochettes_artistes = self.pochettes_par_artiste(&noms_artistes);
         let services_artistes = self.services_par_artiste(&noms_artistes);
+        let ids_artistes = self.artistes_par_nom(&noms_artistes);
         let top_artists: Vec<TopArtistEntry> = artistes_bruts
             .into_iter()
             .map(|cols| {
@@ -1628,6 +1707,7 @@ impl HistoryRepo {
                         .as_ref()
                         .and_then(|n| pochettes_artistes.get(n).cloned()),
                     source: cle.as_ref().and_then(|n| services_artistes.get(n).cloned()),
+                    artist_id: cle.as_ref().and_then(|n| ids_artistes.get(n).copied()),
                 }
             })
             .collect();
@@ -1703,20 +1783,38 @@ impl HistoryRepo {
             .filter_map(|c| c.get(1).and_then(|v| v.as_string()))
             .collect();
         let fiches_pistes = self.pistes_par_titre(&titres_pistes);
+        let pistes_vues: Vec<i64> = pistes_brutes
+            .iter()
+            .filter_map(|cols| {
+                let titre = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+                let artiste = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+                cols.first().and_then(|v| v.as_i64()).or_else(|| {
+                    fiches_pistes
+                        .get(&(titre.to_lowercase(), artiste.to_lowercase()))
+                        .and_then(|f| f.0)
+                })
+            })
+            .collect();
+        let ids_pistes = self.ids_des_pistes(&pistes_vues);
         let top_tracks: Vec<TopTrackEntry> = pistes_brutes
             .into_iter()
             .map(|cols| {
                 let titre = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
                 let artiste = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
                 let fiche = fiches_pistes.get(&(titre.to_lowercase(), artiste.to_lowercase()));
+                // L'identifiant vu dans l'historique d'abord, la
+                // correspondance de bibliothèque à défaut : l'ordre du
+                // `COALESCE(MAX(lh.track_id), …)` d'origine.
+                let track_id = cols
+                    .first()
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| fiche.and_then(|f| f.0));
+                // #8327 — l'album et l'artiste de CETTE piste, par identifiant.
+                let ids = track_id.and_then(|id| ids_pistes.get(&id)).copied();
                 TopTrackEntry {
-                    // L'identifiant vu dans l'historique d'abord, la
-                    // correspondance de bibliothèque à défaut : l'ordre du
-                    // `COALESCE(MAX(lh.track_id), …)` d'origine.
-                    track_id: cols
-                        .first()
-                        .and_then(|v| v.as_i64())
-                        .or_else(|| fiche.and_then(|f| f.0)),
+                    track_id,
+                    album_id: ids.and_then(|(album, _)| album),
+                    artist_id: ids.and_then(|(_, artiste)| artiste),
                     title: titre.clone(),
                     artist_name: artiste.clone(),
                     plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
@@ -2272,6 +2370,11 @@ pub struct TopArtistEntry {
     /// ouvre la fiche de l'artiste chez ce service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// #8327 — la fiche de BIBLIOTHÈQUE de ce nom (casse ignorée, la plus
+    /// ancienne), comme `GET /history/top-artists`. Absent quand la
+    /// bibliothèque ne connaît pas cet artiste.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2292,6 +2395,12 @@ pub struct TopAlbumEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopTrackEntry {
     pub track_id: Option<i64>,
+    /// #8327 — l'album et l'artiste de bibliothèque de `track_id`. Absents
+    /// quand la piste n'est pas (ou plus) dans la bibliothèque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist_id: Option<i64>,
     pub title: String,
     pub artist_name: String,
     pub plays: i64,

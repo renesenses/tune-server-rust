@@ -4,6 +4,7 @@ pub mod albums_manquants;
 pub mod arbre_genres;
 pub mod artist_enrichment;
 pub mod artist_split;
+pub mod artistes_de_piste;
 pub mod artistes_du_pressage;
 pub mod auto_fix;
 // Les balises réellement présentes dans un fichier, lues brutes (#6124).

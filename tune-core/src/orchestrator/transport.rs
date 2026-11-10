@@ -1434,6 +1434,19 @@ impl PlaybackOrchestrator {
             // #2264 — posé par `play_inner` après la composition : c'est la
             // décision de `appliquer_la_regle_de_version`.
             version: None,
+            // #8327 — ceux de la ligne de bibliothèque, comme `from_track`.
+            composer: track_meta
+                .as_ref()
+                .and_then(|t| t.composer.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            label: track_meta
+                .as_ref()
+                .and_then(|t| t.label.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         }
     }
 
