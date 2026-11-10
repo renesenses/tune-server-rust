@@ -40,12 +40,24 @@
 //! à 80 % n'est donc plus tenue à la consigne : sans limite de sécurité réglée,
 //! elle est SUIVIE (80 % est sous le plafond par défaut de 85 %). La correction DANS la
 //! fenêtre d'après pose (#6207, l'appareil qui remonte à chaque URI) reste.
+//!
+//! ## Le saut connu n'est pas suivi (#8328, fil 2740, rc11)
+//!
+//! Journal de pissa7 en rc11 : l'Abyss remonte à 80 à chaque piste, la
+//! fenêtre corrige (`lu_pct=80`, six fois), puis 0,7 s après la fin de la
+//! fenêtre l'appareil rapporte encore 80 et le sondeur le SUIT
+//! (`volume_releve_plus_haut_suivi consigne=0.2 adopte=0.8 plafond=0.85`).
+//! La valeur du saut corrigé dans la fenêtre est donc retenue ; hors de la
+//! fenêtre, une hausse d'au moins 10 points qui retombe sur elle (±1) est
+//! réimposée à la consigne de Tune. Toute autre hausse reste suivie.
 use std::time::Duration;
 
-use tracing::debug;
+use std::sync::atomic::Ordering;
+
+use tracing::{debug, warn};
 
 use super::DlnaOutput;
-use crate::outputs::traits::TransportState;
+use crate::outputs::traits::{OutputTarget, TransportState};
 
 /// Délai, après une demande de volume de Tune, pendant lequel une lecture de
 /// l'appareil hors fenêtre n'est pas jugée.
@@ -127,6 +139,10 @@ impl DlnaOutput {
         if !crate::outputs::dlna_repli_set_uri::volume_remonte_a_l_uri(&self.device_id) {
             return lu;
         }
+        // #8328 — le saut connu de l'appareil n'est pas un geste au bouton.
+        if self.est_le_saut_connu(lu, connu) {
+            return self.reimposer_hors_fenetre(lu, connu).await;
+        }
         let en_grace = self
             .volume_demande_a
             .lock()
@@ -142,6 +158,48 @@ impl DlnaOutput {
             );
         }
         lu
+    }
+
+    /// #8328 — la lecture est-elle le saut que l'appareil fait de lui-même
+    /// (vu et corrigé dans la fenêtre d'après pose) ? Une hausse d'au moins
+    /// [`super::HAUSSE_QUI_APPREND`] au-dessus de la consigne de Tune, qui
+    /// retombe à un point près sur la valeur du saut retenu. Un geste au
+    /// bouton monte pas à pas et ne retombe pas sur cette valeur fixe : il
+    /// reste suivi (#7379).
+    pub(super) fn est_le_saut_connu(&self, lu: f64, connu: f64) -> bool {
+        let saut = self.saut_de_l_appareil_pct.load(Ordering::Relaxed);
+        if saut == u64::MAX || lu - connu < super::HAUSSE_QUI_APPREND {
+            return false;
+        }
+        ((lu * 100.0).round() - saut as f64).abs() <= 1.0
+    }
+
+    /// #8328 — repose la consigne de Tune sur un appareil qui a refait son
+    /// saut hors de la fenêtre ; le sondeur reçoit la consigne, jamais le saut.
+    /// Vaut aussi dans la grâce d'une demande : la consigne connue est la
+    /// dernière de Tune, et la valeur reposée n'est jamais plus haute que le
+    /// relevé.
+    async fn reimposer_hors_fenetre(&self, lu: f64, connu: f64) -> f64 {
+        match self.set_volume(connu).await {
+            Ok(()) => {
+                warn!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    lu_pct = (lu * 100.0).round() as u64,
+                    volume_pct = (connu * 100.0).round() as u64,
+                    "dlna_volume_saut_connu_reimpose_hors_fenetre"
+                );
+                connu
+            }
+            Err(e) => {
+                warn!(
+                    device = %self.name,
+                    error = %e,
+                    "dlna_volume_saut_connu_reimpose_hors_fenetre_echoue"
+                );
+                lu
+            }
+        }
     }
 }
 

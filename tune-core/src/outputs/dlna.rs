@@ -661,6 +661,12 @@ pub struct DlnaOutput {
     /// qu'au-delà d'une grâce qui suit cette demande : une lecture faite
     /// pendant un glissement de curseur n'est pas un saut de l'appareil.
     volume_demande_a: std::sync::Mutex<Option<std::time::Instant>>,
+    /// #8328 — valeur (en pour-cent) à laquelle l'appareil a sauté de
+    /// lui-même dans la fenêtre d'après pose, la dernière fois que Tune l'a
+    /// corrigé (`dlna_volume_reimpose_apres_saut`). `u64::MAX` = aucun saut vu.
+    /// Hors de la fenêtre, une hausse qui retombe sur cette valeur est le même
+    /// saut, pas un geste au bouton.
+    saut_de_l_appareil_pct: AtomicU64,
     /// #5793 — URL du SCPD de `RenderingControl`, telle que le descriptif de
     /// l'appareil l'annonce. `None` : sortie construite sans descriptif, le
     /// profil standard s'applique.
@@ -854,6 +860,7 @@ impl DlnaOutput {
             dernier_volume_pct: AtomicU64::new(u64::MAX),
             uri_posee_a: std::sync::Mutex::new(None),
             volume_demande_a: std::sync::Mutex::new(None),
+            saut_de_l_appareil_pct: AtomicU64::new(u64::MAX),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
             scpd_av_transport: std::sync::RwLock::new(None),
@@ -1612,6 +1619,12 @@ impl DlnaOutput {
                 return 0.0;
             }
             return connu;
+        }
+        // #8328 — la valeur du saut est retenue : hors de la fenêtre, le
+        // même saut se reconnaît à elle.
+        if lu - connu >= HAUSSE_QUI_APPREND {
+            self.saut_de_l_appareil_pct
+                .store((lu * 100.0).round() as u64, Ordering::Relaxed);
         }
         match self.set_volume(connu).await {
             Ok(()) => {

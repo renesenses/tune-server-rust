@@ -408,20 +408,19 @@ async fn abyss_hors_fenetre(
     (sortie, etat, vie)
 }
 
-/// #6008 (pissa7, fil 2401, rc7), révisé par #7379 (décision du 02/11, fin
-/// de la règle stricte de #6871). Consigne 22 %, piste lancée, saut à 80
-/// corrigé dans les 15 s (#6207, inchangé) ; puis, hors de la fenêtre, sans
-/// aucun `SetVolume` de Tune, l'Abyss rapporte de nouveau 80. La sortie DLNA
-/// ne le ramène plus à la consigne : elle rend 80 au sondeur, qui suit sous
-/// le plafond de suivi et ramène au plafond au-dessus
-/// (`poller::volume_suivi_7379_tests`).
+/// 🔴 #8328 (pissa7, fil 2740, rc11) — révise #7379 pour le SAUT de
+/// l'appareil. Consigne 22 %, piste lancée, saut à 80 corrigé dans les 15 s
+/// (#6207) ; puis, hors de la fenêtre, l'Abyss rapporte de nouveau 80. En
+/// rc11 la sortie rendait 80 au sondeur, qui le SUIVAIT (80 < plafond de
+/// suivi par défaut de 85 %) : curseur à 80, appareil laissé à 80. Le saut
+/// connu est maintenant réimposé à la consigne, et le sondeur ne voit que 22.
 #[tokio::test]
-async fn hors_fenetre_la_sortie_rend_le_releve_au_sondeur_7379() {
-    let udn = "uuid:banc-6008-2401-hors-fenetre";
+async fn hors_fenetre_le_saut_connu_a_80_est_reimpose_8328() {
+    let udn = "uuid:banc-8328-2740-hors-fenetre";
     let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.22).await;
     let avant = etat.set_volume.lock().await.len();
 
-    // L'appareil remonte, hors de la fenêtre.
+    // L'appareil refait son saut, hors de la fenêtre.
     *etat.volume.lock().await = 80;
     let statut = sortie.get_status().await.unwrap();
     let tenu = *etat.volume.lock().await;
@@ -430,18 +429,51 @@ async fn hors_fenetre_la_sortie_rend_le_releve_au_sondeur_7379() {
     vie.abort();
 
     assert_eq!(
-        tenu, 80,
-        "#7379 : la sortie ne corrige plus hors de la fenêtre"
+        tenu, 22,
+        "#8328 : l'appareil doit être ramené à la consigne de Tune"
     );
     assert!(
-        (statut.volume - 0.80).abs() < 0.005,
-        "#7379 : le sondeur doit recevoir le relevé (80 %), pas {}",
+        (statut.volume - 0.22).abs() < 0.005,
+        "#8328 : le sondeur ne doit jamais recevoir le saut (80 %), mais la consigne ; reçu {}",
         statut.volume
     );
-    assert!(
-        apres.is_empty(),
-        "#7379 : aucun SetVolume de la sortie hors de la fenêtre : {apres:?}"
-    );
+    assert_eq!(apres, vec![22], "#8328 : un seul SetVolume, à la consigne");
+}
+
+/// #8328 — le cas exact du journal : le relevé à 80 arrive 0,7 s après la
+/// dernière réimposition de la fenêtre, donc DANS la grâce d'une demande de
+/// volume. Le saut connu est réimposé quand même.
+#[tokio::test]
+async fn hors_fenetre_le_saut_connu_est_reimpose_meme_dans_la_grace_8328() {
+    let udn = "uuid:banc-8328-2740-grace";
+    let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.20).await;
+    sortie.set_volume(0.20).await.unwrap();
+
+    *etat.volume.lock().await = 80;
+    let statut = sortie.get_status().await.unwrap();
+    let tenu = *etat.volume.lock().await;
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+
+    assert_eq!(tenu, 20, "#8328 : l'appareil doit être ramené à 20");
+    assert!((statut.volume - 0.20).abs() < 0.005, "{}", statut.volume);
+}
+
+/// #8328, contre-épreuve de #7379 — une hausse au bouton qui ne retombe pas
+/// sur la valeur du saut (ici 84, à plus de 10 points de la consigne) reste
+/// suivie : la sortie la rend telle quelle au sondeur, sans commande.
+#[tokio::test]
+async fn hors_fenetre_une_hausse_qui_n_est_pas_le_saut_reste_suivie_8328() {
+    let udn = "uuid:banc-8328-bouton-84";
+    let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.22).await;
+    let avant = etat.set_volume.lock().await.len();
+    *etat.volume.lock().await = 84;
+    let statut = sortie.get_status().await.unwrap();
+    let apres = etat.set_volume.lock().await[avant..].to_vec();
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+    assert!((statut.volume - 0.84).abs() < 0.005, "{}", statut.volume);
+    assert!(apres.is_empty(), "aucun SetVolume : {apres:?}");
 }
 
 /// #7379 — un DLNA ex-« strict » (règle « volume remonté à l'URI » apprise)
