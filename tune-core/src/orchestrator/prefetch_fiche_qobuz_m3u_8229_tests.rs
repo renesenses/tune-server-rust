@@ -229,3 +229,119 @@ async fn prefetch_8229_fiche_complete_gardee_telle_quelle() {
         Some("https://exemple.invalid/file.jpg")
     );
 }
+
+/// Relecture de #8229 — un Qobuz qui ne répond pas : `get_track` signale son
+/// entrée puis ne rend jamais la main.
+struct QobuzMuet {
+    entre: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl StreamingService for QobuzMuet {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "qobuz"
+    }
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn set_enabled(&mut self, _enabled: bool) {}
+    async fn authenticate(&mut self, _c: &serde_json::Value) -> Result<AuthStatus, TuneError> {
+        Err(non_servi())
+    }
+    async fn auth_status(&self) -> AuthStatus {
+        AuthStatus {
+            authenticated: true,
+            ..AuthStatus::default()
+        }
+    }
+    async fn logout(&mut self) -> Result<(), TuneError> {
+        Ok(())
+    }
+    async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+        Err(non_servi())
+    }
+    async fn get_track(&self, _id: &str) -> Result<StreamTrack, TuneError> {
+        self.entre.notify_one();
+        std::future::pending().await
+    }
+    async fn get_track_url(&self, _id: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+        Err(non_servi())
+    }
+    async fn get_album(&self, _id: &str) -> Result<StreamAlbum, TuneError> {
+        Err(non_servi())
+    }
+    async fn get_album_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Err(non_servi())
+    }
+    async fn get_artist(&self, _id: &str) -> Result<StreamArtist, TuneError> {
+        Err(non_servi())
+    }
+    async fn get_playlist(&self, _id: &str) -> Result<StreamPlaylist, TuneError> {
+        Err(non_servi())
+    }
+    async fn get_playlist_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Err(non_servi())
+    }
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        Ok(vec![])
+    }
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+        Ok(vec![])
+    }
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+        Ok(vec![])
+    }
+}
+
+/// Relecture de #8229 — pendant que Qobuz tarde à compléter la fiche, le
+/// registre des services reste libre (les autres services ne sont pas
+/// bloqués), et la lecture part sans la fiche au bout du délai.
+///
+/// Contre-épreuve : tenir le registre pendant `get_track` (l'ancien
+/// `let registry = self.services.lock().await;`) fait tomber l'assertion
+/// `try_lock` ; retirer le `timeout` fait pendre le test.
+#[tokio::test(start_paused = true)]
+async fn prefetch_8229_service_lent_ne_bloque_ni_le_registre_ni_la_lecture() {
+    let entre = Arc::new(tokio::sync::Notify::new());
+    let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+    let mut services = ServiceRegistry::new();
+    services.register(Box::new(QobuzMuet {
+        entre: entre.clone(),
+    }));
+    let orch = PlaybackOrchestrator::new(
+        db,
+        Arc::new(PlaybackManager::new()),
+        Arc::new(AudioStreamer::new(0)),
+        Arc::new(Mutex::new(services)),
+        Arc::new(Mutex::new(OutputRegistry::new())),
+        None,
+    );
+
+    let debut = tokio::time::Instant::now();
+    let demande = demande_m3u(None);
+    let servi = orch.serve_prefetched_pcm(tampon_m3u(), &demande);
+    let sonde = async {
+        entre.notified().await;
+        assert!(
+            orch.services.try_lock().is_ok(),
+            "le registre des services est tenu pendant l'appel réseau get_track"
+        );
+    };
+    let (r, ()) = tokio::join!(servi, sonde);
+    let r = r.expect("le préchargement doit être servi sans la fiche");
+    assert_eq!(r.title, "Foule sentimentale");
+    assert_eq!(r.artist, None, "aucune fiche n'est arrivée");
+    assert!(
+        debut.elapsed() >= super::dsp::DELAI_FICHE_DU_PRECHARGEMENT,
+        "la lecture n'a pas attendu le délai"
+    );
+}

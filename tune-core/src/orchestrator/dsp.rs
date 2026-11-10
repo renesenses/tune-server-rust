@@ -185,6 +185,12 @@ pub(crate) fn famille_de_sortie(device_id: &str, output_type: Option<&str>) -> &
     "inconnue"
 }
 
+/// #8229 (relecture) — délai accordé au service pour compléter la fiche d'un
+/// titre préchargé. Au-delà, le titre est servi avec ce qu'il a : la lecture
+/// n'attend pas un service lent.
+pub(super) const DELAI_FICHE_DU_PRECHARGEMENT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 impl PlaybackOrchestrator {
     /// Marque la zone en résolution gapless jusqu'au drop du garde.
     pub(super) fn begin_levels_prewarm(&self, zone_id: i64) -> LevelsPrewarmScope<'_> {
@@ -382,31 +388,48 @@ impl PlaybackOrchestrator {
             &cover_url,
         );
         if title.is_empty() || duration_ms == 0 || fiche_incomplete {
-            let registry = self.services.lock().await;
-            if let Some(svc) = registry.get_actif(&prefetched.source).await {
-                let svc = svc.read().await;
-                if let Ok(track) = svc.get_track(&prefetched.source_id).await {
-                    if title.is_empty() {
-                        title = track.title;
-                        artist = artist.or(Some(track.artist));
-                        album = album.or(track.album);
-                        cover_url = cover_url.or(track.cover_path);
-                    } else if fiche_incomplete {
-                        // Le titre importé est gardé ; seuls les champs vides
-                        // sont complétés.
-                        if vide(&artist) && !track.artist.trim().is_empty() {
-                            artist = Some(track.artist);
-                        }
-                        if vide(&album) && track.album.is_some() {
-                            album = track.album;
-                        }
-                        if vide(&cover_url) && track.cover_path.is_some() {
-                            cover_url = track.cover_path;
-                        }
+            // #8229 (relecture) — le registre des services n'est tenu que le
+            // temps de cloner l'`Arc` du service : l'appel réseau `get_track`
+            // se fait registre relâché, et il est borné. Tenu pendant l'appel,
+            // le registre bloquait tous les services (recherche, lecture,
+            // préchargement) aussi longtemps que Qobuz tardait à répondre, et
+            // cette consultation part désormais à chaque enchaînement d'un
+            // titre Qobuz à fiche incomplète.
+            let service = self
+                .services
+                .lock()
+                .await
+                .get_actif(&prefetched.source)
+                .await;
+            let fiche = match service {
+                Some(svc) => tokio::time::timeout(DELAI_FICHE_DU_PRECHARGEMENT, async {
+                    svc.read().await.get_track(&prefetched.source_id).await
+                })
+                .await
+                .ok(),
+                None => None,
+            };
+            if let Some(Ok(track)) = fiche {
+                if title.is_empty() {
+                    title = track.title;
+                    artist = artist.or(Some(track.artist));
+                    album = album.or(track.album);
+                    cover_url = cover_url.or(track.cover_path);
+                } else if fiche_incomplete {
+                    // Le titre importé est gardé ; seuls les champs vides
+                    // sont complétés.
+                    if vide(&artist) && !track.artist.trim().is_empty() {
+                        artist = Some(track.artist);
                     }
-                    if duration_ms == 0 && track.duration_ms > 0 {
-                        duration_ms = track.duration_ms;
+                    if vide(&album) && track.album.is_some() {
+                        album = track.album;
                     }
+                    if vide(&cover_url) && track.cover_path.is_some() {
+                        cover_url = track.cover_path;
+                    }
+                }
+                if duration_ms == 0 && track.duration_ms > 0 {
+                    duration_ms = track.duration_ms;
                 }
             }
         }
