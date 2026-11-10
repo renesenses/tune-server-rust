@@ -397,6 +397,51 @@ pub(crate) async fn aligner_les_suiveuses(state: &AppState, meneuse: i64) {
     }
 }
 
+/// #7759 (fil 2215) — un déplacement dans la piste, donné sur la meneuse, est
+/// relayé à chaque suiveuse qui joue la même piste.
+///
+/// Le relais n'écoute que `started`, `paused`, `resumed` et `stopped` : une
+/// suiveuse déjà sur la bonne piste n'avait aucune raison de bouger
+/// ([`geste_pour_la_suiveuse`] rend `None`). Après un déplacement de la
+/// meneuse, elle continuait donc à l'ancienne position : « une seule piste
+/// avance ». Journal du testeur (rc10, deux DAC en ASIO) : chaque
+/// `seek_local_output_complete` de la meneuse, aucune ligne pour la suiveuse.
+///
+/// Appelé par la route `seek`, une fois par geste, et non sur l'événement
+/// `seek` du gestionnaire de lecture, que l'orchestrateur émet aussi pour ses
+/// déplacements internes (garde du sondeur pendant une recréation de flux).
+/// Une suiveuse qui ne joue pas la même piste n'est pas touchée : le relais
+/// ordinaire l'aligne déjà, à la position de la meneuse.
+pub(crate) async fn deplacer_les_suiveuses(state: &AppState, meneuse: i64, position_ms: u64) {
+    let suiveuses = zones_suiveuses(&groupes_enregistres(state), meneuse);
+    if suiveuses.is_empty() {
+        return;
+    }
+    let tete = Instantane::de(&state.playback.get_state(meneuse).await);
+    if tete.piste.is_none() {
+        return;
+    }
+    for suiveuse in suiveuses {
+        let etat = Instantane::de(&state.playback.get_state(suiveuse).await);
+        if etat.piste != tete.piste || etat.etat == PlayState::Stopped {
+            continue;
+        }
+        let device_id = ZoneRepo::with_backend(state.backend.clone())
+            .get(suiveuse)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id);
+        info!(meneuse, suiveuse, position_ms, "zone_group_follower_seeked");
+        if let Err(error) = state
+            .orchestrator
+            .seek(suiveuse, position_ms, device_id.as_deref())
+            .await
+        {
+            warn!(meneuse, suiveuse, position_ms, error = ?error, "zone_group_follower_seek_failed");
+        }
+    }
+}
+
 /// Lance le relais : une tâche qui écoute le canal de lecture et aligne les
 /// suiveuses après chaque geste d'une meneuse. Appelé une fois au démarrage
 /// (`background.rs`).

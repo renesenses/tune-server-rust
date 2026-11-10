@@ -259,3 +259,68 @@ async fn une_zone_hors_groupe_reste_muette() {
         "sans groupe, le relais ne touche à aucune autre zone"
     );
 }
+
+/// Les cibles des `seek` que le renderer factice a reçus.
+async fn deplacements_de(state: &AppState, device_id: &str) -> Vec<u64> {
+    let registre = state.outputs.lock().await;
+    let sortie = registre.get(device_id).expect("sortie enregistree");
+    let garde = sortie.lock().await;
+    garde
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("la sortie factice")
+        .seek_calls()
+}
+
+/// #7759 (fil 2215, Didier, rc10) — un déplacement dans la piste donné sur la
+/// meneuse doit valoir pour la suiveuse. Journal du testeur : chaque
+/// `seek_local_output_complete` de la meneuse, rien pour la suiveuse, qui
+/// continuait à l'ancienne position (« une seule piste avance »).
+///
+/// Contre-épreuve : retirer de la route `seek` l'appel à
+/// `deplacer_les_suiveuses` fait tomber ce test (la KEF ne reçoit aucun
+/// déplacement et reste à sa position).
+#[tokio::test]
+async fn un_deplacement_de_la_meneuse_deplace_la_suiveuse_7759() {
+    let banc = phantom_et_kef().await;
+    grouper(&banc).await;
+    banc.state
+        .orchestrator
+        .play_from_queue(banc.phantom, 0)
+        .await
+        .expect("lecture sur la meneuse");
+    let kef_joue = attendre(|| async {
+        banc.state.playback.get_state(banc.kef).await.state == PlayState::Playing
+    })
+    .await;
+    assert!(kef_joue, "témoin : la KEF a rejoint la lecture du groupe");
+
+    let (status, corps) = poster(
+        &banc.app,
+        &format!("/api/v1/zones/{}/seek", banc.phantom),
+        json!({ "position_ms": 120_000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "déplacement : {corps}");
+    assert!(
+        deplacements_de(&banc.state, "dlna-phantom")
+            .await
+            .contains(&120_000),
+        "témoin : la meneuse s'est déplacée"
+    );
+
+    let kef_deplacee = attendre(|| async {
+        deplacements_de(&banc.state, "dlna-kef")
+            .await
+            .contains(&120_000)
+            && banc.state.playback.get_state(banc.kef).await.position_ms >= 120_000
+    })
+    .await;
+    assert!(
+        kef_deplacee,
+        "#7759 : la KEF, suiveuse du groupe, doit se déplacer avec la meneuse — \
+         déplacements reçus : {:?}, position : {} ms",
+        deplacements_de(&banc.state, "dlna-kef").await,
+        banc.state.playback.get_state(banc.kef).await.position_ms
+    );
+}
