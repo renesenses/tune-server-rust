@@ -709,7 +709,8 @@ pub fn est_artistes_divers(nom: &str) -> bool {
 ///   sinon le rôle.
 /// * **Reprises** (`covers`) : AUCUN rôle audible sur tout le disque, au
 ///   moins un rôle d'AUTEUR, et pas artiste d'une piste. Focus = les pistes
-///   qu'il a écrites. Une compilation de reprises y a sa place.
+///   qu'il a écrites ; rôles comme avant (instrument sinon rôle). Une
+///   compilation de reprises y a sa place.
 /// * **Écriture et production** (`ecriture`, #7767) : au moins un rôle
 ///   d'ÉCRITURE, qu'il y joue ou non — un disque peut donc être à la fois ici
 ///   et dans l'une des deux autres. Focus = les pistes écrites ou produites ;
@@ -766,7 +767,7 @@ pub fn classer(credits: &[CreditSurAlbum], disques: &[DisqueAClasser]) -> Classe
                     out.collaborations.push(resume(cs, est_role_audible, true));
                 }
             } else if auteur {
-                out.reprises.push(resume(cs, est_role_d_auteur, false));
+                out.reprises.push(resume(cs, est_role_d_auteur, true));
             }
         }
         if ecriture {
@@ -894,10 +895,9 @@ pub fn credits_hors_discographie(
                 .get(5)
                 .and_then(|v| v.as_string())
                 .is_some_and(|n| est_artistes_divers(&n));
-            // `EXISTS` rend un entier sur SQLite, un booléen sur PostgreSQL.
-            let artiste_de_piste = r
-                .get(6)
-                .is_some_and(|v| v.as_i64().is_some_and(|n| n != 0) || v.as_bool() == Some(true));
+            // `EXISTS` rend un entier sur SQLite, un booléen sur PostgreSQL :
+            // `as_bool` lit les deux.
+            let artiste_de_piste = r.get(6).and_then(|v| v.as_bool()).unwrap_or(false);
             disques.push(DisqueAClasser {
                 album_id,
                 compilation: drapeau || va,

@@ -41,7 +41,7 @@ const ROLES: [&str; 8] = [
 /// de crédits : chaque piste porte cinq crédits dont les noms tournent sur
 /// les 20 000 artistes, un crédit sur cinq avec sa fiche, les autres par le
 /// nom seul. L'artiste 1 y est l'artiste de 30 pistes (3 albums) et crédité
-/// sur ~750 pistes.
+/// sur 150 pistes (le modulo tourne : 30 cycles de 5).
 fn banc() -> Arc<dyn DbBackend> {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();

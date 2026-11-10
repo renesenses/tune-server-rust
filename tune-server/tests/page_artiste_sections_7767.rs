@@ -696,3 +696,45 @@ async fn album_masque_exclu_et_doublon_de_source_compte_une_fois_7767() {
     assert_eq!(requiem["focus_track_ids"].as_array().unwrap().len(), 7);
     assert_eq!(requiem["credit_roles"], serde_json::json!(["conductor"]));
 }
+
+/// § 3.1 du contrat, le cas décisif de bout en bout : un disque d'autrui où
+/// il est l'ARTISTE d'une piste (déjà dans « Apparitions ») et PRODUCTEUR
+/// d'une autre reste hors de « Apparaît sur » (#4862, inchangé) mais entre
+/// dans « Écriture et production » — y jouer n'efface pas l'avoir produit.
+/// C'est la colonne `EXISTS` de `credits_hors_discographie` lue à VRAI.
+#[tokio::test]
+async fn artiste_d_une_piste_garde_le_disque_en_ecriture_et_production_7767() {
+    let state = bibliotheque_chef();
+    // Fixture Concertos (1010) : il signe 10101 à 10103, il produit 10104.
+    credit(&state, 10104, Some(433), "Henrik Lund", "producer", None);
+    let app = tune_server::routes::router(state);
+    let (status, body) = get(&app, "/api/v1/library/artists/433/albums?sections=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["appearances"][0]["id"], 1010, "{body}");
+    let collaborations = serde_json::to_string(&body["collaborations"]).unwrap();
+    assert!(
+        !collaborations.contains("Fixture Concertos"),
+        "{collaborations}"
+    );
+    // Écriture : Fixture Concertos (2016) avant Nordic Songs (2022).
+    let writing = body["writing"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(
+        writing
+            .iter()
+            .map(|a| a["id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        [1010, 1040]
+    );
+    assert_eq!(writing[0]["focus_track_ids"], serde_json::json!([10104]));
+    assert_eq!(writing[0]["credit_roles"], serde_json::json!(["producer"]));
+    assert_eq!(
+        body["credit_counts"],
+        serde_json::json!({
+            "performing": { "albums": 5, "tracks": 25 },
+            "writing": { "albums": 2, "tracks": 5 }
+        }),
+        "{body}"
+    );
+}

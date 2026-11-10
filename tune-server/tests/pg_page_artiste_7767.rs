@@ -156,7 +156,8 @@ const MBID_ILSE: &str = "0c7a9d4e-7767-4c1a-9b2e-000000000412";
 
 /// La musicienne de jazz du contrat (§ 6.1), reconnue par ses TROIS clés :
 /// fiche sur son disque et *Fixture Jazz Session*, MBID seul sur *Second
-/// Session*, nom seul sur *Lena Park Sings*.
+/// Session*, nom seul sur *Lena Park Sings* — plus *Guest Session*, où elle
+/// signe une piste et en produit une autre.
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_7767_ecriture_et_compteurs_de_la_page_artiste() {
     let Some(url) = url_pg() else {
@@ -215,12 +216,30 @@ async fn pg_7767_ecriture_et_compteurs_de_la_page_artiste() {
         credit(b, t, None, "Ilse Brandt", None, "composer", None);
     }
 
+    // Guest Session : elle est l'ARTISTE d'une piste (« Apparitions ») et
+    // productrice d'une autre — l'`EXISTS` booléen à VRAI, le disque gardé
+    // par « Écriture et production » seulement (§ 3.1 du contrat).
+    let guest = album(b, "Guest Session", quartet, 2020);
+    let p = pistes(b, guest, quartet, 2);
+    b.execute(
+        "UPDATE tracks SET artist_id = ? WHERE id = ?",
+        &[&ilse as &dyn ToSqlValue, &p[0] as &dyn ToSqlValue],
+    )
+    .expect("artiste de la piste");
+    credit(b, p[1], Some(ilse), "Ilse Brandt", None, "producer", None);
+    let produite = p[1];
+
     // La lecture pure : l'`EXISTS` booléen est lu, les disques classés.
     let (credits, disques) = credits_hors_discographie(&state.backend, ilse);
-    assert_eq!(credits.len(), 7 + 3 + 9 + 2, "{credits:?}");
-    assert!(
-        disques.iter().all(|d| !d.artiste_de_piste),
-        "elle n'est l'artiste d'aucune piste d'autrui : {disques:?}"
+    assert_eq!(credits.len(), 7 + 3 + 9 + 2 + 1, "{credits:?}");
+    assert_eq!(
+        disques
+            .iter()
+            .filter(|d| d.artiste_de_piste)
+            .map(|d| d.album_id)
+            .collect::<Vec<_>>(),
+        vec![guest],
+        "seule Guest Session porte une piste signée par elle : {disques:?}"
     );
     let c = classer(&credits, &disques);
     assert_eq!(
@@ -236,22 +255,22 @@ async fn pg_7767_ecriture_et_compteurs_de_la_page_artiste() {
     );
     assert_eq!(
         c.ecriture.iter().map(|a| a.album_id).collect::<Vec<_>>(),
-        vec![seconde, sings]
+        vec![seconde, sings, guest]
     );
     assert_eq!(c.ecriture[0].track_ids.len(), 9);
     assert_eq!(c.ecriture[0].roles, vec!["producer"]);
 
-    // Les compteurs : interprète 3 albums, 18 pistes (8 + 7 + 3) ; écriture
-    // 3 albums, 15 pistes (4 + 9 + 2) — en BIGINT, lus en i64.
+    // Les compteurs : interprète 4 albums, 19 pistes (8 + 7 + 3 + 1) ;
+    // écriture 4 albums, 16 pistes (4 + 9 + 2 + 1) — en BIGINT, lus en i64.
     let compteurs = compteurs_de_credits(&state.backend, ilse);
     assert_eq!(
         (compteurs.performing.albums, compteurs.performing.tracks),
-        (3, 18),
+        (4, 19),
         "{compteurs:?}"
     );
     assert_eq!(
         (compteurs.writing.albums, compteurs.writing.tracks),
-        (3, 15),
+        (4, 16),
         "{compteurs:?}"
     );
 
@@ -264,10 +283,13 @@ async fn pg_7767_ecriture_et_compteurs_de_la_page_artiste() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(titres(&body["albums"]), ["Low Tide"], "{body}");
+    assert_eq!(titres(&body["appearances"]), ["Guest Session"], "{body}");
     assert_eq!(titres(&body["covers"]), ["Lena Park Sings"], "{body}");
+    // Année puis titre : Guest Session (2020), Second Session (2022), Lena
+    // Park Sings (2023).
     assert_eq!(
         titres(&body["writing"]),
-        ["Second Session", "Lena Park Sings"],
+        ["Guest Session", "Second Session", "Lena Park Sings"],
         "{body}"
     );
     assert_eq!(
@@ -275,16 +297,22 @@ async fn pg_7767_ecriture_et_compteurs_de_la_page_artiste() {
         serde_json::json!(["producer"])
     );
     assert_eq!(
+        body["writing"][0]["focus_track_ids"],
+        serde_json::json!([produite])
+    );
+    assert_eq!(
         body["credit_counts"],
         serde_json::json!({
-            "performing": { "albums": 3, "tracks": 18 },
-            "writing": { "albums": 3, "tracks": 15 }
+            "performing": { "albums": 4, "tracks": 19 },
+            "writing": { "albums": 4, "tracks": 16 }
         }),
         "{body}"
     );
+    assert!(body.get("compilations").is_none(), "{body}");
+    let collaborations = serde_json::to_string(&body["collaborations"]).unwrap();
     assert!(
-        body.get("appearances").is_none() && body.get("compilations").is_none(),
-        "{body}"
+        !collaborations.contains("Guest Session"),
+        "{collaborations}"
     );
 
     // Un artiste sans rien : `writing` absente, compteurs à zéro, présents.
