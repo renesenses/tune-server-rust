@@ -184,7 +184,10 @@ mod tests {
                     continue;
                 }
                 let deja = notees.lock().await.clone();
-                notees.lock().await.push(nom.clone());
+                // #8402 — le volume de départ n'entre pas dans le compte.
+                if nom != "volume" {
+                    notees.lock().await.push(nom.clone());
+                }
                 for evenement in reponse(&nom, &deja) {
                     let ligne = format!("{}\n", serde_json::to_string(&evenement).unwrap());
                     daemon_stdout.write_all(ligne.as_bytes()).await.unwrap();
