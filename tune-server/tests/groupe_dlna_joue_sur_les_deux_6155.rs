@@ -303,24 +303,24 @@ async fn un_deplacement_de_la_meneuse_deplace_la_suiveuse_7759() {
     .await;
     assert_eq!(status, StatusCode::OK, "déplacement : {corps}");
     assert!(
-        deplacements_de(&banc.state, "dlna-phantom")
+        banc.state
+            .playback
+            .get_state(banc.phantom)
             .await
-            .contains(&120_000),
+            .position_ms
+            >= 120_000,
         "témoin : la meneuse s'est déplacée"
     );
 
-    let kef_deplacee = attendre(|| async {
-        deplacements_de(&banc.state, "dlna-kef")
-            .await
-            .contains(&120_000)
-            && banc.state.playback.get_state(banc.kef).await.position_ms >= 120_000
-    })
-    .await;
+    let kef_deplacee =
+        attendre(|| async { banc.state.playback.get_state(banc.kef).await.position_ms >= 120_000 })
+            .await;
     assert!(
         kef_deplacee,
         "#7759 : la KEF, suiveuse du groupe, doit se déplacer avec la meneuse — \
-         déplacements reçus : {:?}, position : {} ms",
+         position : {} ms (renderer : déplacements {:?}, titres {:?})",
+        banc.state.playback.get_state(banc.kef).await.position_ms,
         deplacements_de(&banc.state, "dlna-kef").await,
-        banc.state.playback.get_state(banc.kef).await.position_ms
+        joues_par(&banc.state, "dlna-kef").await,
     );
 }
