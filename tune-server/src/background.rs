@@ -1581,10 +1581,14 @@ async fn configure_deezer_proxy(state: &AppState, config: &TuneConfig) {
 }
 
 fn spawn_alarm_scheduler(state: &AppState) {
-    let alarm_sched = Arc::new(tune_core::alarms::AlarmScheduler::with_backend(
-        state.backend.clone(),
-        state.orchestrator.clone(),
-    ));
+    let alarm_sched = Arc::new(
+        tune_core::alarms::AlarmScheduler::with_backend(
+            state.backend.clone(),
+            state.orchestrator.clone(),
+        )
+        // #8135 — une radio de la playlist du réveil : même flux qu'à la main.
+        .avec_le_choix_du_flux_radio(crate::routes::radios::choix_du_flux_de_playlist(state)),
+    );
     alarm_sched.spawn();
 }
 

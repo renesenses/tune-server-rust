@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::play_queue_repo::PlayQueueRepo;
+use tune_core::db::playlist_radio_8135;
 use tune_core::db::playlist_repo::{EntryContent, PlaylistRepo, ServiceEntry};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
@@ -60,6 +61,10 @@ struct AddTracks {
     /// reste un `Value` : un titre incomplet ne doit pas faire rejeter toute
     /// la demande par serde, il est écarté et compté (voir `add_tracks`).
     streaming_tracks: Option<Vec<Value>>,
+    /// #8135 — des stations de « Mes radios » (`radio_stations.id`), rangées
+    /// comme des radios : à la lecture, leur flux prend le relais.
+    #[serde(default)]
+    radio_ids: Vec<i64>,
 }
 
 /// Deux désignations (#6687) :
@@ -398,6 +403,12 @@ fn lignes_et_identifiants(state: &AppState, playlist_id: i64) -> Result<Vec<(i64
         .filter_map(|e| {
             match &e.content {
                 EntryContent::Local(tid) => pistes.get(tid).map(|t| t.to_json()),
+                // #8135 — une radio se montre comme une radio : `radio`,
+                // `radio_id`, et `unavailable` quand la station a quitté
+                // « Mes radios ».
+                EntryContent::Service(s) if playlist_radio_8135::est_une_radio(s) => {
+                    Some(playlist_radio_8135::decrire(&state.backend, s))
+                }
                 EntryContent::Service(s) => Some(s.to_json()),
                 EntryContent::Missing(m) => Some(m.to_json()),
             }
@@ -468,7 +479,32 @@ async fn add_tracks(
     let titres: Vec<ServiceEntry> = recus.iter().filter_map(ServiceEntry::from_json).collect();
     let incomplets = recus.len() - titres.len();
 
-    if body.track_ids.is_empty() && titres.is_empty() && incomplets > 0 {
+    // #8135 — une station inconnue n'entre pas : la ligne ne saurait ni se
+    // nommer ni se jouer. Une demande qui ne porte que de telles stations
+    // est un 404 qui le dit.
+    let stations = tune_core::db::radio_repo::RadioRepo::with_backend(state.backend.clone());
+    let radios: Vec<ServiceEntry> = body
+        .radio_ids
+        .iter()
+        .filter_map(|id| stations.get(*id).ok().flatten())
+        .filter_map(|r| playlist_radio_8135::ligne_de_radio(&r))
+        .collect();
+    let radios_inconnues = body.radio_ids.len() - radios.len();
+    if body.track_ids.is_empty() && titres.is_empty() && radios.is_empty() && radios_inconnues > 0 {
+        tracing::warn!(
+            playlist_id = id,
+            radios_inconnues,
+            "playlist_add_radio_refused_unknown_station"
+        );
+        return crate::message_api::refus(
+            StatusCode::NOT_FOUND,
+            "playlist_radio_not_found",
+            "api.playlists.radioNotFound",
+            &[("count", radios_inconnues.to_string())],
+        );
+    }
+
+    if body.track_ids.is_empty() && titres.is_empty() && radios.is_empty() && incomplets > 0 {
         tracing::warn!(
             playlist_id = id,
             incomplets,
@@ -488,6 +524,7 @@ async fn add_tracks(
         .copied()
         .map(EntryContent::Local)
         .chain(titres.iter().cloned().map(EntryContent::Service))
+        .chain(radios.iter().cloned().map(EntryContent::Service))
         .collect();
     match repo.add_entries_deduped(id, &lignes, body.position) {
         Ok(ecrites) => match repo.get(id) {
@@ -503,6 +540,11 @@ async fn add_tracks(
                         titres_de_service = de_service,
                         "playlist_add_tracks_service_entries"
                     );
+                }
+                if radios_inconnues > 0
+                    && let Some(obj) = corps.as_object_mut()
+                {
+                    obj.insert("skipped_radios".into(), json!(radios_inconnues));
                 }
                 if incomplets > 0 {
                     // Taire les écartés produirait le défaut d'à côté : une
@@ -712,6 +754,9 @@ struct LigneExportee {
     duration_ms: i64,
     file_path: Option<String>,
     service: Option<(String, String)>,
+    /// #8135 — l'adresse du flux d'une ligne RADIO (la station enregistrée),
+    /// `None` pour toute autre ligne et pour une station retirée.
+    flux_radio: Option<String>,
 }
 
 /// Les lignes d'une playlist pour les exports, dans l'ordre. Même règle que
@@ -737,8 +782,11 @@ fn lignes_a_exporter(state: &AppState, playlist_id: i64) -> Result<Vec<LigneExpo
                 duration_ms: t.duration_ms,
                 file_path: t.file_path.clone(),
                 service: None,
+                flux_radio: None,
             }),
             EntryContent::Service(s) => Some(LigneExportee {
+                // #8135 — une radio s'exporte comme une radio : son flux.
+                flux_radio: playlist_radio_8135::adresse_a_exporter(&state.backend, &s),
                 title: s.title,
                 artist: s.artist,
                 album: s.album,
@@ -756,6 +804,7 @@ fn lignes_a_exporter(state: &AppState, playlist_id: i64) -> Result<Vec<LigneExpo
                 duration_ms: m.duration_ms.unwrap_or(0),
                 file_path: m.file_path,
                 service: None,
+                flux_radio: None,
             }),
         })
         .collect())
@@ -783,6 +832,13 @@ async fn export_m3u(
         // #4889 — un titre de service n'a pas de chemin : une ligne M3U
         // désigne un fichier. Il est NOMMÉ en commentaire plutôt que tu —
         // tout lecteur M3U ignore les lignes `#`, et l'import de Tune aussi.
+        // #8135 — une radio est une ligne de FLUX, la forme M3U d'une
+        // webradio : tout lecteur la joue, et l'import de Tune la range de
+        // nouveau comme une radio (station de « Mes radios » de même adresse).
+        if let Some(flux) = &t.flux_radio {
+            m3u.push_str(&format!("#EXTINF:-1,{}\n{flux}\n", t.title));
+            continue;
+        }
         if let Some((source, source_id)) = &t.service {
             m3u.push_str(&format!(
                 "# titre de service, sans fichier : {source}:{source_id} — {} - {}\n",
@@ -841,6 +897,10 @@ async fn export_multi_format(
                     if let (Some((source, source_id)), Some(o)) = (&t.service, v.as_object_mut()) {
                         o.insert("source".into(), json!(source));
                         o.insert("source_id".into(), json!(source_id));
+                    }
+                    // #8135 — une radio porte aussi l'adresse de son flux.
+                    if let (Some(flux), Some(o)) = (&t.flux_radio, v.as_object_mut()) {
+                        o.insert("stream_url".into(), json!(flux));
                     }
                     v
                 })
@@ -906,7 +966,7 @@ async fn export_multi_format(
                     ));
                 }
                 xspf.push_str(&format!("      <duration>{}</duration>\n", t.duration_ms));
-                if let Some(ref p) = t.file_path {
+                if let Some(p) = t.file_path.as_ref().or(t.flux_radio.as_ref()) {
                     xspf.push_str(&format!(
                         "      <location>{}</location>\n",
                         quick_xml::escape::escape(p)
@@ -1140,6 +1200,15 @@ async fn import_m3u_file(
             if not_found_paths.len() < MAX_NOT_FOUND_SAMPLE {
                 not_found_paths.push(line.to_string());
             }
+            continue;
+        }
+
+        // #8135 — une ligne de flux qui est l'adresse d'une station de
+        // « Mes radios » redevient cette radio (export M3U d'une playlist
+        // « pistes + radio »).
+        if let Some(radio) = playlist_radio_8135::station_d_une_adresse(&state.backend, line) {
+            entrees.push(EntryContent::Service(radio));
+            matched += 1;
             continue;
         }
 
@@ -1864,7 +1933,12 @@ async fn transfer_playlist(
         return r;
     }
     let entries = match repo.get_entries(body.playlist_id) {
-        Ok(e) => e,
+        // #8135 — une radio entre dans la file par son flux.
+        Ok(e) => tune_core::db::playlist_radio_8135::lignes_a_jouer(
+            &state.backend,
+            e,
+            &crate::routes::radios::choix_du_flux_de_playlist(&state),
+        ),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 

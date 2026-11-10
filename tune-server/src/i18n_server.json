@@ -5337,6 +5337,23 @@
     "pl": "To żądanie zawiera tylko niekompletne utwory z serwisu ({count}): aby trafić do playlisty, każdy potrzebuje źródła (innego niż „local”), identyfikatora w serwisie i tytułu.",
     "el": "Αυτό το αίτημα περιέχει μόνο ελλιπή κομμάτια υπηρεσίας ({count}): για να μπουν σε λίστα αναπαραγωγής χρειάζονται πηγή (εκτός από «local»), αναγνωριστικό στην υπηρεσία και τίτλο."
   },
+  "api.playlists.radioNotFound": {
+    "fr": "Station introuvable dans « Mes radios » ({count}) : ajoutez-la d’abord à vos radios pour la ranger dans une playlist.",
+    "en": "Station not found in \"My radios\" ({count}): add it to your radios first to put it in a playlist.",
+    "de": "Sender nicht in „Meine Radios“ gefunden ({count}): Fügen Sie ihn zuerst Ihren Radios hinzu, um ihn in eine Playlist aufzunehmen.",
+    "es": "Emisora no encontrada en «Mis radios» ({count}): añádala primero a sus radios para incluirla en una lista.",
+    "it": "Stazione non trovata in «Le mie radio» ({count}): aggiungila prima alle tue radio per inserirla in una playlist.",
+    "zh": "在“我的电台”中找不到该电台（{count}）：请先将其添加到您的电台，再放入播放列表。",
+    "ja": "「マイラジオ」に局が見つかりません（{count}）：プレイリストに入れるには、まず局をラジオに追加してください。",
+    "ko": "'내 라디오'에서 방송국을 찾을 수 없습니다({count}). 재생목록에 넣으려면 먼저 라디오에 추가하세요.",
+    "ro": "Postul nu a fost găsit în „Radiourile mele” ({count}): adăugați-l mai întâi la radiourile dvs. pentru a-l pune într-o listă de redare.",
+    "sv": "Stationen hittades inte i ”Mina radiokanaler” ({count}): lägg först till den bland dina radiokanaler för att lägga den i en spellista.",
+    "hu": "Az állomás nem található a „Saját rádiók” között ({count}): előbb adja hozzá a rádióihoz, hogy lejátszási listába tehesse.",
+    "vi": "Không tìm thấy đài trong \"Radio của tôi\" ({count}): hãy thêm đài vào radio của bạn trước để đưa vào danh sách phát.",
+    "nb": "Fant ikke stasjonen i «Mine radiokanaler» ({count}): legg den først til radiokanalene dine for å sette den i en spilleliste.",
+    "pl": "Nie znaleziono stacji w „Moich radiach” ({count}): najpierw dodaj ją do swoich radiów, aby umieścić ją na playliście.",
+    "el": "Ο σταθμός δεν βρέθηκε στα «Τα ραδιόφωνά μου» ({count}): προσθέστε τον πρώτα στα ραδιόφωνά σας για να τον βάλετε σε λίστα αναπαραγωγής."
+  },
   "api.playlists.entryRequired": {
     "fr": "Il faut désigner la ligne à retirer : `entry_id` (préféré) ou `position` (rang).",
     "en": "Specify the row to remove: `entry_id` (preferred) or `position` (rank).",
