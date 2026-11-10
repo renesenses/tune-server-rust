@@ -234,7 +234,7 @@ pub fn tout_repousser_apres_deliaison(backend: &Arc<dyn DbBackend>) {
     SettingsRepo::with_backend(backend.clone())
         .delete("cloud_library_last_sync")
         .ok();
-    populate_changelog_after_scan(backend);
+    tout_remettre_dans_le_journal(backend);
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +286,7 @@ pub fn resynchroniser_si_le_format_a_change(
     if format_pousse >= FORMAT_SYNCHRO {
         return false;
     }
-    populate_changelog_after_scan(backend);
+    tout_remettre_dans_le_journal(backend);
     settings
         .set(CLE_FORMAT_SYNCHRO, &FORMAT_SYNCHRO.to_string())
         .ok();
@@ -855,19 +855,7 @@ pub async fn full_sync(
     info!("cloud_library_full_sync_starting");
 
     // Bulk-insert all entities that aren't already pending
-    backend
-        .execute_batch(
-            "INSERT INTO sync_changelog (entity_type, entity_id, action) \
-             SELECT 'track', id, 'upsert' FROM tracks \
-             WHERE id NOT IN (SELECT entity_id FROM sync_changelog WHERE entity_type='track' AND synced=0);\
-             INSERT INTO sync_changelog (entity_type, entity_id, action) \
-             SELECT 'album', id, 'upsert' FROM albums \
-             WHERE id NOT IN (SELECT entity_id FROM sync_changelog WHERE entity_type='album' AND synced=0);\
-             INSERT INTO sync_changelog (entity_type, entity_id, action) \
-             SELECT 'artist', id, 'upsert' FROM artists \
-             WHERE id NOT IN (SELECT entity_id FROM sync_changelog WHERE entity_type='artist' AND synced=0);",
-        )
-        .map_err(|e| format!("full_sync bulk insert: {e}"))?;
+    remettre_toute_la_bibliotheque(backend).map_err(|e| format!("full_sync bulk insert: {e}"))?;
     // #5358 : toute la bibliothèque vient de repartir dans le format courant ;
     // le cycle suivant n'a pas à la remettre une seconde fois.
     SettingsRepo::with_backend(backend.clone())
@@ -966,14 +954,13 @@ pub async fn full_sync(
 }
 
 // ---------------------------------------------------------------------------
-// populate_changelog_after_scan — bulk changelog population
+// Journal des changements : ce qui a changé (#8239), ou tout (renvoi complet)
 // ---------------------------------------------------------------------------
 
-/// After a library scan completes, bulk-insert changelog entries for all
-/// tracks, albums, and artists that don't already have a pending entry.
-/// This is more efficient than instrumenting every individual insert.
-pub fn populate_changelog_after_scan(backend: &Arc<dyn DbBackend>) {
-    let result = backend.execute_batch(
+/// Met TOUTE la bibliothèque (pistes, albums, artistes) dans le journal, sauf
+/// ce qui y attend déjà. Erreur rendue telle quelle à l'appelant.
+fn remettre_toute_la_bibliotheque(backend: &Arc<dyn DbBackend>) -> Result<(), String> {
+    backend.execute_batch(
         "INSERT INTO sync_changelog (entity_type, entity_id, action) \
          SELECT 'track', id, 'upsert' FROM tracks \
          WHERE id NOT IN (SELECT entity_id FROM sync_changelog WHERE entity_type='track' AND synced=0);\
@@ -983,11 +970,241 @@ pub fn populate_changelog_after_scan(backend: &Arc<dyn DbBackend>) {
          INSERT INTO sync_changelog (entity_type, entity_id, action) \
          SELECT 'artist', id, 'upsert' FROM artists \
          WHERE id NOT IN (SELECT entity_id FROM sync_changelog WHERE entity_type='artist' AND synced=0);",
-    );
-    match result {
-        Ok(()) => info!("sync_changelog_populated_after_scan"),
+    )
+}
+
+/// RENVOI COMPLET : remet toute la bibliothèque dans le journal. Réservé aux
+/// cas où le cloud doit tout recevoir de nouveau — déliaison
+/// ([`tout_repousser_apres_deliaison`]), format de synchro enrichi
+/// ([`resynchroniser_si_le_format_a_change`]), premier partage de cercle.
+///
+/// JAMAIS après un scan (#8239) : appelée à la fin de chaque scan, elle
+/// renvoyait 563 000 pistes au cloud à chaque fois et a contribué à saturer
+/// la base du site (site-mozaiklabs#501). Après un scan :
+/// [`journaliser_ce_qui_a_change`].
+pub fn tout_remettre_dans_le_journal(backend: &Arc<dyn DbBackend>) {
+    match remettre_toute_la_bibliotheque(backend) {
+        Ok(()) => info!("sync_changelog_bibliotheque_entiere_remise"),
         Err(e) => warn!(error = %e, "sync_changelog_populate_failed"),
     }
+}
+
+/// Une famille d'entités suivie par le relevé (#8239) : son type dans le
+/// journal, ses tables de relevé, et la projection de ce qui part vers le
+/// cloud. La projection reprend EXACTEMENT les valeurs que `push_changes`
+/// envoie : une entité dont aucune de ces valeurs n'a bougé n'a rien à
+/// renvoyer.
+struct FamilleSuivie {
+    entite: &'static str,
+    releve: &'static str,
+    neuf: &'static str,
+    index: &'static str,
+    projection: &'static str,
+    colonnes: &'static [&'static str],
+}
+
+const FAMILLES_SUIVIES: [FamilleSuivie; 3] = [
+    FamilleSuivie {
+        entite: "track",
+        releve: "sync_releve_pistes",
+        neuf: "sync_releve_pistes_neuf",
+        index: "idx_sync_releve_pistes",
+        projection: "SELECT t.id AS id, t.title AS titre, ar.name AS artiste, al.title AS album, \
+                     t.album_id AS album_id, t.format AS format, t.sample_rate AS sample_rate, \
+                     t.bit_depth AS bit_depth, t.duration_ms AS duration_ms, t.genre AS genre, \
+                     t.track_number AS track_number, t.disc_number AS disc_number, \
+                     t.source AS source, t.source_id AS source_id, t.isrc AS isrc \
+                     FROM tracks t \
+                     LEFT JOIN artists ar ON t.artist_id = ar.id \
+                     LEFT JOIN albums al ON t.album_id = al.id",
+        colonnes: &[
+            "titre",
+            "artiste",
+            "album",
+            "album_id",
+            "format",
+            "sample_rate",
+            "bit_depth",
+            "duration_ms",
+            "genre",
+            "track_number",
+            "disc_number",
+            "source",
+            "source_id",
+            "isrc",
+        ],
+    },
+    FamilleSuivie {
+        entite: "album",
+        releve: "sync_releve_albums",
+        neuf: "sync_releve_albums_neuf",
+        index: "idx_sync_releve_albums",
+        projection: "SELECT a.id AS id, a.title AS titre, ar.name AS artiste, a.year AS annee, \
+                     a.genre AS genre, a.source AS source, \
+                     (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id) AS nb_pistes, \
+                     a.musicbrainz_release_group_id AS mbid_groupe \
+                     FROM albums a \
+                     LEFT JOIN artists ar ON a.artist_id = ar.id",
+        colonnes: &[
+            "titre",
+            "artiste",
+            "annee",
+            "genre",
+            "source",
+            "nb_pistes",
+            "mbid_groupe",
+        ],
+    },
+    FamilleSuivie {
+        entite: "artist",
+        releve: "sync_releve_artistes",
+        neuf: "sync_releve_artistes_neuf",
+        index: "idx_sync_releve_artistes",
+        projection: "SELECT id AS id, name AS nom, bio AS bio, musicbrainz_id AS mbid FROM artists",
+        colonnes: &["nom", "bio", "mbid"],
+    },
+];
+
+fn releve_present(backend: &Arc<dyn DbBackend>, famille: &FamilleSuivie) -> bool {
+    backend
+        .query_one(&format!("SELECT 1 FROM {} LIMIT 1", famille.releve), &[])
+        .is_ok()
+}
+
+fn ecrire_le_releve(backend: &Arc<dyn DbBackend>, famille: &FamilleSuivie) -> Result<(), String> {
+    backend.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {releve};\
+         CREATE TABLE {releve} AS {projection};\
+         CREATE INDEX IF NOT EXISTS {index} ON {releve}(id);",
+        releve = famille.releve,
+        projection = famille.projection,
+        index = famille.index,
+    ))
+}
+
+/// À appeler au DÉBUT d'un scan : si aucun relevé n'existe encore (premier
+/// scan après la mise à jour, ou base passée de SQLite à PostgreSQL), le
+/// relevé est pris maintenant, avant que le scan ne touche à rien — sans quoi
+/// [`journaliser_ce_qui_a_change`] n'aurait pas d'état « avant » et ne
+/// verrait, de ce premier scan, que les entités nouvelles.
+pub fn preparer_le_releve(backend: &Arc<dyn DbBackend>) {
+    for famille in &FAMILLES_SUIVIES {
+        if releve_present(backend, famille) {
+            continue;
+        }
+        match ecrire_le_releve(backend, famille) {
+            Ok(()) => info!(entite = famille.entite, "sync_releve_initial_pris"),
+            Err(e) => warn!(entite = famille.entite, error = %e, "sync_releve_initial_echec"),
+        }
+    }
+}
+
+/// Met dans le journal ce qui a changé depuis le dernier relevé, et seulement
+/// cela (#8239) : entités apparues ou dont une valeur poussée a bougé →
+/// `upsert` ; entités disparues → `delete`. Puis le relevé est remplacé par
+/// l'état courant.
+///
+/// Le relevé (`sync_releve_*`) garde, pour chaque entité, les valeurs qui
+/// partent vers le cloud telles qu'elles étaient au dernier passage. Comparer
+/// à lui plutôt qu'à « ce que le scan a touché » couvre aussi ce qui change
+/// HORS scan (surveillance des dossiers, édition des balises, enrichissement),
+/// qu'aucun code n'inscrit au journal — le renvoi complet après chaque scan
+/// était, jusqu'ici, le seul à les rattraper.
+///
+/// Toute entité qui n'a JAMAIS figuré au journal y entre aussi : sans relevé
+/// antérieur (premier passage), c'est ce qui garantit qu'une entité nouvelle
+/// part quand même.
+///
+/// Requêtes communes à SQLite et PostgreSQL (`IS DISTINCT FROM`, SQLite ≥ 3.39).
+pub fn journaliser_ce_qui_a_change(backend: &Arc<dyn DbBackend>) {
+    let mut avant = pending_count(backend);
+    for famille in &FAMILLES_SUIVIES {
+        if let Err(e) = journaliser_la_famille(backend, famille) {
+            warn!(entite = famille.entite, error = %e, "sync_changelog_changements_echec");
+        }
+        let apres = pending_count(backend);
+        info!(
+            entite = famille.entite,
+            ajoutees = apres - avant,
+            "sync_changelog_changements_journalises"
+        );
+        avant = apres;
+    }
+}
+
+fn journaliser_la_famille(
+    backend: &Arc<dyn DbBackend>,
+    famille: &FamilleSuivie,
+) -> Result<(), String> {
+    let FamilleSuivie {
+        entite,
+        releve,
+        neuf,
+        ..
+    } = famille;
+    let pas_en_attente = |alias: &str| {
+        format!(
+            "NOT EXISTS (SELECT 1 FROM sync_changelog j WHERE j.entity_type = '{entite}' \
+             AND j.entity_id = {alias}.id AND j.synced = 0)"
+        )
+    };
+
+    // L'état courant, figé une fois : la comparaison et le futur relevé
+    // portent sur les MÊMES lignes, même si la base bouge entre-temps.
+    backend.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {neuf};\
+         CREATE TABLE {neuf} AS {projection};\
+         CREATE INDEX IF NOT EXISTS {index}_neuf ON {neuf}(id);",
+        projection = famille.projection,
+        index = famille.index,
+    ))?;
+
+    let mut sql = String::new();
+    if releve_present(backend, famille) {
+        let difference = famille
+            .colonnes
+            .iter()
+            .map(|c| format!("n.{c} IS DISTINCT FROM a.{c}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let disparues = format!(
+            "SELECT a.id FROM {releve} a WHERE NOT EXISTS (SELECT 1 FROM {neuf} n WHERE n.id = a.id)"
+        );
+        // Apparues ou modifiées.
+        sql.push_str(&format!(
+            "INSERT INTO sync_changelog (entity_type, entity_id, action) \
+             SELECT '{entite}', n.id, 'upsert' FROM {neuf} n LEFT JOIN {releve} a ON a.id = n.id \
+             WHERE (a.id IS NULL OR {difference}) AND {attente_n};",
+            attente_n = pas_en_attente("n"),
+        ));
+        // Disparues : un `upsert` encore en attente devient `delete` — sinon
+        // `push_changes` enverrait « upsert » sans données.
+        sql.push_str(&format!(
+            "UPDATE sync_changelog SET action = 'delete' \
+             WHERE synced = 0 AND entity_type = '{entite}' AND entity_id IN ({disparues});\
+             INSERT INTO sync_changelog (entity_type, entity_id, action) \
+             SELECT '{entite}', a.id, 'delete' FROM {releve} a \
+             WHERE NOT EXISTS (SELECT 1 FROM {neuf} n WHERE n.id = a.id) AND {attente_a};",
+            attente_a = pas_en_attente("a"),
+        ));
+    }
+    // Jamais journalisées : elles partent, relevé ou pas.
+    sql.push_str(&format!(
+        "INSERT INTO sync_changelog (entity_type, entity_id, action) \
+         SELECT '{entite}', n.id, 'upsert' FROM {neuf} n \
+         WHERE NOT EXISTS (SELECT 1 FROM sync_changelog j \
+                           WHERE j.entity_type = '{entite}' AND j.entity_id = n.id);"
+    ));
+    backend.execute_batch(&sql)?;
+
+    // Le nouvel état devient le relevé.
+    backend.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {releve};\
+         CREATE TABLE {releve} AS SELECT * FROM {neuf};\
+         CREATE INDEX IF NOT EXISTS {index} ON {releve}(id);\
+         DROP TABLE IF EXISTS {neuf};",
+        index = famille.index,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,7 +1512,7 @@ mod format_synchro_tests {
                         (2, 'Freddie Freeloader', 10, 20, '/m/02.flac', 'flac', 'local');",
             )
             .unwrap();
-        populate_changelog_after_scan(backend);
+        tout_remettre_dans_le_journal(backend);
         backend
             .execute_batch("UPDATE sync_changelog SET synced = 1;")
             .unwrap();
@@ -1408,5 +1625,192 @@ mod format_synchro_tests {
         assert_eq!(format_note(&backend).as_deref(), Some("2"));
         assert!(cycle(&backend, client, api, true).await.is_none());
         assert_eq!(pending_count(&backend), 0, "rien ne repart au redémarrage");
+    }
+}
+
+/// #8239 : après un scan, seul ce qui a changé entre au journal — jamais toute
+/// la bibliothèque. Le renvoi complet reste à [`tout_remettre_dans_le_journal`].
+#[cfg(test)]
+mod journal_apres_scan_8239_tests {
+    use super::*;
+    use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
+
+    fn ouvrir() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    /// Bibliothèque déjà poussée : un artiste, un album, deux pistes, journal
+    /// entièrement `synced = 1`.
+    fn bibliotheque_deja_poussee() -> Arc<dyn DbBackend> {
+        let backend = ouvrir();
+        backend
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (20, 'Miles Davis');\
+                 INSERT INTO albums (id, title, artist_id) VALUES (10, 'Kind of Blue', 20);\
+                 INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, source) \
+                 VALUES (1, 'So What', 10, 20, 'm/01.flac', 'flac', 'local'), \
+                        (2, 'Freddie Freeloader', 10, 20, 'm/02.flac', 'flac', 'local');",
+            )
+            .unwrap();
+        tout_remettre_dans_le_journal(&backend);
+        backend
+            .execute_batch("UPDATE sync_changelog SET synced = 1;")
+            .unwrap();
+        assert_eq!(pending_count(&backend), 0, "prémisse : rien en attente");
+        backend
+    }
+
+    fn en_attente(backend: &Arc<dyn DbBackend>) -> Vec<(String, i64, String)> {
+        backend
+            .query_many(
+                "SELECT entity_type, entity_id, action FROM sync_changelog \
+                 WHERE synced = 0 ORDER BY entity_type, entity_id",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r[0].as_string().unwrap(),
+                    r[1].as_i64().unwrap(),
+                    r[2].as_string().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn e(t: &str, id: i64, action: &str) -> (String, i64, String) {
+        (t.to_string(), id, action.to_string())
+    }
+
+    /// Un scan : relevé au début (s'il manque), `entre_deux` pendant, journal
+    /// à la fin — l'ordre exact de `routes/system/scan.rs`.
+    fn scan(backend: &Arc<dyn DbBackend>, entre_deux: &str) {
+        preparer_le_releve(backend);
+        if !entre_deux.is_empty() {
+            backend.execute_batch(entre_deux).unwrap();
+        }
+        journaliser_ce_qui_a_change(backend);
+    }
+
+    const AJOUT_D_UNE_PISTE: &str = "INSERT INTO artists (id, name) VALUES (21, 'John Coltrane');\
+         INSERT INTO albums (id, title, artist_id) VALUES (11, 'Giant Steps', 21);\
+         INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, source) \
+         VALUES (3, 'Naima', 11, 21, 'm/03.flac', 'flac', 'local');";
+
+    /// ⭐ La garde de l'issue : premier scan après la mise à jour (aucun
+    /// relevé), une piste ajoutée → elle, son album et son artiste ; rien
+    /// d'autre. Avant le correctif : les 3 pistes, 2 albums et 2 artistes.
+    #[test]
+    fn un_scan_qui_ajoute_une_piste_ne_journalise_qu_elle_et_ses_parents() {
+        let backend = bibliotheque_deja_poussee();
+        scan(&backend, AJOUT_D_UNE_PISTE);
+        assert_eq!(
+            en_attente(&backend),
+            vec![
+                e("album", 11, "upsert"),
+                e("artist", 21, "upsert"),
+                e("track", 3, "upsert")
+            ]
+        );
+    }
+
+    #[test]
+    fn meme_garde_avec_un_releve_deja_pris() {
+        let backend = bibliotheque_deja_poussee();
+        scan(&backend, "");
+        assert_eq!(en_attente(&backend), vec![], "un scan sans changement");
+        scan(&backend, AJOUT_D_UNE_PISTE);
+        assert_eq!(
+            en_attente(&backend),
+            vec![
+                e("album", 11, "upsert"),
+                e("artist", 21, "upsert"),
+                e("track", 3, "upsert")
+            ]
+        );
+        // Une fois poussé, le scan suivant ne renvoie plus rien.
+        backend
+            .execute_batch("UPDATE sync_changelog SET synced = 1;")
+            .unwrap();
+        scan(&backend, "");
+        assert_eq!(en_attente(&backend), vec![]);
+    }
+
+    #[test]
+    fn une_piste_ajoutee_a_un_album_existant_renvoie_l_album_pour_son_compte() {
+        let backend = bibliotheque_deja_poussee();
+        scan(
+            &backend,
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path) \
+             VALUES (3, 'Blue in Green', 10, 20, 'm/03.flac');",
+        );
+        assert_eq!(
+            en_attente(&backend),
+            vec![e("album", 10, "upsert"), e("track", 3, "upsert")]
+        );
+    }
+
+    #[test]
+    fn une_piste_modifiee_seule_repart() {
+        let backend = bibliotheque_deja_poussee();
+        scan(
+            &backend,
+            "UPDATE tracks SET title = 'Freddie' WHERE id = 2;",
+        );
+        assert_eq!(en_attente(&backend), vec![e("track", 2, "upsert")]);
+        // Une colonne qui ne part pas vers le cloud ne renvoie rien.
+        backend
+            .execute_batch("UPDATE sync_changelog SET synced = 1;")
+            .unwrap();
+        scan(&backend, "UPDATE tracks SET file_size = 1234 WHERE id = 1;");
+        assert_eq!(en_attente(&backend), vec![]);
+    }
+
+    #[test]
+    fn une_piste_disparue_part_en_delete() {
+        let backend = bibliotheque_deja_poussee();
+        scan(&backend, "DELETE FROM tracks WHERE id = 2;");
+        assert_eq!(
+            en_attente(&backend),
+            vec![e("album", 10, "upsert"), e("track", 2, "delete")]
+        );
+    }
+
+    #[test]
+    fn un_upsert_en_attente_d_une_entite_disparue_devient_delete() {
+        let backend = bibliotheque_deja_poussee();
+        scan(&backend, "");
+        record_change(&backend, "track", 2, "upsert");
+        backend
+            .execute_batch("DELETE FROM tracks WHERE id = 2;")
+            .unwrap();
+        scan(&backend, "");
+        let pistes: Vec<_> = en_attente(&backend)
+            .into_iter()
+            .filter(|(t, _, _)| t == "track")
+            .collect();
+        assert_eq!(pistes, vec![e("track", 2, "delete")]);
+    }
+
+    #[test]
+    fn le_renvoi_complet_reste_complet() {
+        let backend = bibliotheque_deja_poussee();
+        scan(&backend, "");
+        tout_remettre_dans_le_journal(&backend);
+        assert_eq!(pending_by_type(&backend), (1, 1, 2));
+    }
+
+    /// Le scan n'appelle plus le renvoi complet (garde de source).
+    #[test]
+    fn le_scan_n_appelle_pas_le_renvoi_complet() {
+        let scan_rs = include_str!("../../../tune-server/src/routes/system/scan.rs");
+        assert!(!scan_rs.contains("tout_remettre_dans_le_journal"));
+        assert!(scan_rs.contains("journaliser_ce_qui_a_change"));
+        assert!(scan_rs.contains("preparer_le_releve"));
     }
 }

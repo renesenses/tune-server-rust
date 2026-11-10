@@ -39,7 +39,7 @@ fn serveur(faux: &Serveur) -> Arc<dyn DbBackend> {
              VALUES (1, 'So What', 10, 20, '/tmp/so-what.flac');",
         )
         .unwrap();
-    library_sync::populate_changelog_after_scan(&backend);
+    library_sync::tout_remettre_dans_le_journal(&backend);
     backend
 }
 
