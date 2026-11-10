@@ -176,4 +176,85 @@ mod postgres {
         .unwrap();
         menage(&db);
     }
+
+    /// Relecture de #8243 — passage de version sur PostgreSQL : au premier
+    /// relevé, une piste dont le fichier a changé après le dernier envoi
+    /// réussi part avec son album et son artiste (`file_mtime` lu par
+    /// `CAST(… AS DOUBLE PRECISION)`, TEXT ou DOUBLE selon l'âge de la base).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_8239_le_premier_releve_rattrape_ce_qui_a_change_depuis_le_dernier_envoi() {
+        let Some(url) = std::env::var("TUNE_TEST_PG_URL").ok() else {
+            eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+            return;
+        };
+        let db = backend(&url).await;
+        menage(&db);
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
+        let dernier_envoi_avant = reglages.get("cloud_library_last_sync").ok().flatten();
+        // Un envoi dans un futur lointain : les pistes des autres bancs n'ont
+        // pas de fichier aussi récent, seule la nôtre est rattrapée.
+        reglages
+            .set("cloud_library_last_sync", "2100-01-01T00:00:00+00:00")
+            .unwrap();
+        let apres_l_envoi = 4_102_444_800.0 + 3_600.0;
+
+        db.execute_batch(&format!(
+            "INSERT INTO artists (name) VALUES ('{MARQUE}-artiste');\
+             INSERT INTO albums (title, artist_id) \
+             SELECT '{MARQUE}-album', id FROM artists WHERE name = '{MARQUE}-artiste';\
+             INSERT INTO tracks (title, album_id, artist_id, file_path) \
+             SELECT '{MARQUE}-p1', al.id, al.artist_id, '{MARQUE}/p1.flac' \
+             FROM albums al WHERE al.title = '{MARQUE}-album';\
+             UPDATE tracks SET file_mtime = {apres_l_envoi} WHERE title = '{MARQUE}-p1'"
+        ))
+        .unwrap();
+        let artiste = id(
+            &db,
+            &format!("SELECT id FROM artists WHERE name = '{MARQUE}-artiste'"),
+        );
+        let album = id(
+            &db,
+            &format!("SELECT id FROM albums WHERE title = '{MARQUE}-album'"),
+        );
+        let p1 = id(
+            &db,
+            &format!("SELECT id FROM tracks WHERE title = '{MARQUE}-p1'"),
+        );
+        db.execute_batch(&format!(
+            "INSERT INTO sync_changelog (entity_type, entity_id, action, synced) VALUES \
+             ('artist', {artiste}, 'upsert', 1), ('album', {album}, 'upsert', 1), \
+             ('track', {p1}, 'upsert', 1);\
+             DELETE FROM sync_releve_pistes;\
+             DELETE FROM sync_releve_albums;\
+             DELETE FROM sync_releve_artistes"
+        ))
+        .unwrap();
+
+        preparer_le_releve(&db);
+        let a_moi = [("artist", artiste), ("album", album), ("track", p1)];
+        let mut vu = en_attente(&db, &a_moi);
+        vu.sort();
+
+        match dernier_envoi_avant {
+            Some(v) => reglages.set("cloud_library_last_sync", &v).unwrap(),
+            None => reglages.delete("cloud_library_last_sync").unwrap(),
+        }
+        db.execute_batch(&format!(
+            "DELETE FROM sync_changelog WHERE (entity_type = 'artist' AND entity_id = {artiste}) \
+             OR (entity_type = 'album' AND entity_id = {album}) \
+             OR (entity_type = 'track' AND entity_id = {p1})"
+        ))
+        .unwrap();
+        menage(&db);
+
+        assert_eq!(
+            vu,
+            vec![
+                ("album".to_string(), album, "upsert".to_string()),
+                ("artist".to_string(), artiste, "upsert".to_string()),
+                ("track".to_string(), p1, "upsert".to_string()),
+            ],
+            "la piste modifiée après le dernier envoi doit partir avec ses parents"
+        );
+    }
 }

@@ -1106,11 +1106,107 @@ fn ecrire_le_releve(backend: &Arc<dyn DbBackend>, famille: &FamilleSuivie) -> Re
     )
 }
 
+/// Les requêtes qui alignent le relevé de `famille` sur l'état figé
+/// (`*_neuf`) en n'écrivant que les lignes qui changent. Communes à SQLite
+/// (≥ 3.24 pour l'upsert, ≥ 3.39 pour `IS DISTINCT FROM`) et PostgreSQL :
+/// le `WHERE true` du `SELECT` lève l'ambiguïté d'analyse de SQLite entre
+/// `ON CONFLICT` et une clause de jointure.
+fn remplacer_le_releve(famille: &FamilleSuivie) -> [String; 2] {
+    let FamilleSuivie { releve, neuf, .. } = famille;
+    let colonnes = colonnes_du_releve(famille);
+    let affectations = famille
+        .colonnes
+        .iter()
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let changee = famille
+        .colonnes
+        .iter()
+        .map(|c| format!("{releve}.{c} IS DISTINCT FROM excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    [
+        format!(
+            "DELETE FROM {releve} WHERE NOT EXISTS \
+             (SELECT 1 FROM {neuf} n WHERE n.id = {releve}.id)"
+        ),
+        format!(
+            "INSERT INTO {releve} ({colonnes}) SELECT {colonnes} FROM {neuf} WHERE true \
+             ON CONFLICT (id) DO UPDATE SET {affectations} WHERE {changee}"
+        ),
+    ]
+}
+
+/// Relecture de #8243 — le passage à la version qui tient un relevé.
+///
+/// Jusque-là, chaque fin de scan remettait toute la bibliothèque au journal :
+/// une modification faite HORS scan (surveillance des dossiers, retouche de
+/// balises) partait au scan suivant. Au premier scan de la nouvelle version,
+/// le relevé est pris au DÉBUT du scan, avec la valeur déjà modifiée : sans
+/// ce rattrapage, une modification faite entre le dernier scan de l'ancienne
+/// version et ce premier scan n'était jamais envoyée.
+///
+/// L'horodatage exploitable : `cloud_library_last_sync` (fin du dernier envoi
+/// réussi) et la date de modification du fichier de chaque piste
+/// (`tracks.file_mtime`). Une piste dont le fichier a changé depuis cet envoi
+/// part en `upsert`, avec son album et son artiste. Ce qui change en base
+/// seulement (biographie, MBID, enrichissement), sans horodatage, n'est pas
+/// rattrapé — voir les notes de version. Sans envoi réussi connu (serveur
+/// jamais lié, ou délié : le renvoi complet s'en charge), rien n'est fait.
+fn rattraper_le_passage_de_version(backend: &Arc<dyn DbBackend>) {
+    let Some(dernier_envoi) = SettingsRepo::with_backend(backend.clone())
+        .get("cloud_library_last_sync")
+        .ok()
+        .flatten()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t.trim()).ok())
+    else {
+        return;
+    };
+    let seuil = dernier_envoi.timestamp_millis() as f64 / 1000.0;
+    let requetes: Vec<String> = [
+        ("track", "t.id"),
+        ("album", "t.album_id"),
+        ("artist", "t.artist_id"),
+    ]
+    .into_iter()
+    .map(|(entite, colonne)| {
+        // `file_mtime` est TEXT sur certaines bases PostgreSQL anciennes
+        // (voir `AlbumRepo::ADDED_AT_SOURCE`) : même lecture qu'elle.
+        format!(
+            "INSERT INTO sync_changelog (entity_type, entity_id, action) \
+             SELECT DISTINCT '{entite}', {colonne}, 'upsert' FROM tracks t \
+             WHERE {colonne} IS NOT NULL \
+             AND CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION) > {seuil:.3} \
+             AND NOT EXISTS (SELECT 1 FROM sync_changelog j WHERE j.entity_type = '{entite}' \
+             AND j.entity_id = {colonne} AND j.synced = 0)"
+        )
+    })
+    .collect();
+    let avant = pending_count(backend);
+    match en_transaction(backend, &requetes) {
+        Ok(()) => info!(
+            dernier_envoi = %dernier_envoi,
+            ajoutees = pending_count(backend) - avant,
+            "sync_changelog_passage_de_version_rattrape"
+        ),
+        Err(e) => warn!(error = %e, "sync_changelog_passage_de_version_echec"),
+    }
+}
+
 /// À appeler au DÉBUT d'un scan : si le relevé est vide (premier scan après
 /// la mise à jour, ou bibliothèque encore vide), il est pris maintenant, avant que le scan ne touche à rien — sans quoi
 /// [`journaliser_ce_qui_a_change`] n'aurait pas d'état « avant » et ne
 /// verrait, de ce premier scan, que les entités nouvelles.
+///
+/// Au tout premier relevé (relevé des pistes vide), ce qui a changé depuis
+/// le dernier envoi réussi part d'abord au journal
+/// ([`rattraper_le_passage_de_version`]) : le relevé, pris avec les valeurs
+/// déjà modifiées, ne le verrait jamais.
 pub fn preparer_le_releve(backend: &Arc<dyn DbBackend>) {
+    if !releve_non_vide(backend, &FAMILLES_SUIVIES[0]) {
+        rattraper_le_passage_de_version(backend);
+    }
     for famille in &FAMILLES_SUIVIES {
         if releve_non_vide(backend, famille) {
             continue;
@@ -1226,10 +1322,13 @@ fn journaliser_la_famille(
     ));
     // Le nouvel état devient le relevé — dans la MÊME transaction que le
     // journal : l'un ne change jamais sans l'autre.
-    requetes.push(format!("DELETE FROM {releve}"));
-    requetes.push(format!(
-        "INSERT INTO {releve} ({colonnes}) SELECT {colonnes} FROM {neuf}"
-    ));
+    //
+    // Relecture de #8243 — seules les lignes qui changent sont écrites :
+    // les disparues sont effacées, les apparues insérées, les modifiées
+    // mises à jour ; une ligne identique n'est pas réécrite. Le relevé
+    // n'est plus vidé puis recopié en entier à chaque scan (≈ 2,2 M lignes
+    // pour 560 000 pistes, sous le verrou d'écriture de SQLite).
+    requetes.extend(remplacer_le_releve(famille));
     requetes.push(format!("DELETE FROM {neuf}"));
     en_transaction(backend, &requetes)
 }
@@ -1839,5 +1938,121 @@ mod journal_apres_scan_8239_tests {
         assert!(!scan_rs.contains("tout_remettre_dans_le_journal"));
         assert!(scan_rs.contains("journaliser_ce_qui_a_change"));
         assert!(scan_rs.contains("preparer_le_releve"));
+    }
+
+    /// Relecture de #8243 — le relevé n'est plus vidé puis recopié à chaque
+    /// scan : seules les lignes qui changent sont écrites. Un déclencheur
+    /// compte les écritures dans `sync_releve_pistes`.
+    ///
+    /// Contre-épreuve : revenir au `DELETE FROM {releve}` + `INSERT … SELECT`
+    /// fait compter 2 suppressions et 2 insertions au lieu d'une mise à jour.
+    #[test]
+    fn le_releve_n_ecrit_que_les_lignes_qui_changent() {
+        let backend = bibliotheque_deja_poussee();
+        scan(&backend, "");
+        backend
+            .execute_batch(
+                "CREATE TABLE ecritures_releve (genre TEXT);\
+                 CREATE TRIGGER t_ins AFTER INSERT ON sync_releve_pistes \
+                 BEGIN INSERT INTO ecritures_releve VALUES ('insert'); END;\
+                 CREATE TRIGGER t_upd AFTER UPDATE ON sync_releve_pistes \
+                 BEGIN INSERT INTO ecritures_releve VALUES ('update'); END;\
+                 CREATE TRIGGER t_del AFTER DELETE ON sync_releve_pistes \
+                 BEGIN INSERT INTO ecritures_releve VALUES ('delete'); END;",
+            )
+            .unwrap();
+        let ecritures = |backend: &Arc<dyn DbBackend>| -> Vec<String> {
+            backend
+                .query_many("SELECT genre FROM ecritures_releve ORDER BY genre", &[])
+                .unwrap()
+                .iter()
+                .map(|r| r[0].as_string().unwrap())
+                .collect()
+        };
+        scan(&backend, "");
+        assert_eq!(ecritures(&backend), Vec::<String>::new(), "rien n'a changé");
+        scan(
+            &backend,
+            "UPDATE tracks SET title = 'Freddie' WHERE id = 2;",
+        );
+        assert_eq!(ecritures(&backend), vec!["update".to_string()]);
+        let titre = backend
+            .query_one("SELECT titre FROM sync_releve_pistes WHERE id = 2", &[])
+            .unwrap()
+            .unwrap()[0]
+            .as_string();
+        assert_eq!(titre.as_deref(), Some("Freddie"), "le relevé suit la base");
+        backend
+            .execute_batch("DELETE FROM ecritures_releve;")
+            .unwrap();
+        scan(&backend, AJOUT_D_UNE_PISTE);
+        scan(&backend, "DELETE FROM tracks WHERE id = 1;");
+        assert_eq!(
+            ecritures(&backend),
+            vec!["delete".to_string(), "insert".to_string()]
+        );
+        let ids: Vec<i64> = backend
+            .query_many("SELECT id FROM sync_releve_pistes ORDER BY id", &[])
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    const DERNIER_ENVOI: &str = "2026-11-01T10:00:00+00:00";
+
+    fn dates_de_fichier(backend: &Arc<dyn DbBackend>) {
+        let envoi = chrono::DateTime::parse_from_rfc3339(DERNIER_ENVOI)
+            .unwrap()
+            .timestamp() as f64;
+        backend
+            .execute_batch(&format!(
+                "UPDATE tracks SET file_mtime = {} WHERE id = 1;\
+                 UPDATE tracks SET file_mtime = {} WHERE id = 2;",
+                envoi - 3600.0,
+                envoi + 3600.0
+            ))
+            .unwrap();
+    }
+
+    /// Relecture de #8243 — passage de version : la piste 2, dont le fichier
+    /// a changé APRÈS le dernier envoi réussi (et avant ce premier scan),
+    /// part avec son album et son artiste ; la piste 1, changée avant, non.
+    ///
+    /// Contre-épreuve : retirer l'appel à `rattraper_le_passage_de_version`
+    /// de `preparer_le_releve` fait tomber ce test (rien en attente).
+    #[test]
+    fn le_premier_releve_rattrape_ce_qui_a_change_depuis_le_dernier_envoi() {
+        let backend = bibliotheque_deja_poussee();
+        SettingsRepo::with_backend(backend.clone())
+            .set("cloud_library_last_sync", DERNIER_ENVOI)
+            .unwrap();
+        dates_de_fichier(&backend);
+        scan(&backend, "");
+        assert_eq!(
+            en_attente(&backend),
+            vec![
+                e("album", 10, "upsert"),
+                e("artist", 20, "upsert"),
+                e("track", 2, "upsert")
+            ]
+        );
+        // Le relevé pris, le rattrapage ne se rejoue plus.
+        backend
+            .execute_batch("UPDATE sync_changelog SET synced = 1;")
+            .unwrap();
+        scan(&backend, "");
+        assert_eq!(en_attente(&backend), vec![]);
+    }
+
+    /// Sans envoi réussi connu, rien n'est rattrapé (le renvoi complet de la
+    /// liaison s'en charge).
+    #[test]
+    fn sans_envoi_connu_le_premier_releve_ne_rattrape_rien() {
+        let backend = bibliotheque_deja_poussee();
+        dates_de_fichier(&backend);
+        scan(&backend, "");
+        assert_eq!(en_attente(&backend), vec![]);
     }
 }
