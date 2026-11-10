@@ -502,19 +502,20 @@ impl PlaybackOrchestrator {
         // (DEvir: seek on a TIDAL track → title stays but music stops.)
         // Only consider the prefetch buffer when NOT seeking.
         //
-        // #2723 — le tampon de préchargement est TOUJOURS rempli au maximum du
-        // service. Le servir alors que la zone demande autre chose ferait
-        // mentir le sélecteur : on l'ignore dès que la préférence n'est pas
-        // `max`.
+        // #2723 — servir un tampon d'une autre qualité que celle de la zone
+        // ferait mentir le sélecteur. Depuis #7266, le préchargement suit la
+        // qualité de la zone : le tampon est servi quand il a été rempli à la
+        // qualité que la zone demande maintenant (un tampon en qualité CD sert
+        // une zone en qualité CD), ignoré sinon.
         let quality_preference = self.streaming_quality_preference(req.zone_id);
         let provider_quality = quality_preference.service_token(service_name);
 
-        let prefetched = if req.seek_ms.is_some_and(|ms| ms > 0)
-            || quality_preference != StreamingQualityPreference::Max
-        {
+        let prefetched = if req.seek_ms.is_some_and(|ms| ms > 0) {
             None
         } else {
-            self.prefetch.take_prefetched(service_name, source_id).await
+            self.prefetch
+                .take_prefetched_en_qualite(service_name, source_id, provider_quality)
+                .await
         };
         if let Some(prefetched) = prefetched {
             let is_network = req
@@ -562,6 +563,12 @@ impl PlaybackOrchestrator {
             }
         }
 
+        // #8215 / #7266 — un préchargement d'une AUTRE piste tient peut-être
+        // le verrou du service le temps d'un téléchargement DASH entier : la
+        // lecture ne l'attend plus, elle l'abandonne. Celui de la piste
+        // demandée est gardé (`prendre_dash_complet`, #7247).
+        self.prefetch
+            .abandonner_pour_une_autre_piste(req.zone_id, service_name, source_id);
         let registry = self.services.lock().await;
         let svc = registry
             .get(service_name)
@@ -598,11 +605,11 @@ impl PlaybackOrchestrator {
         // retry. Passing `None` means the provider's highest/default quality.
         // Relu après acquisition du service : l'assemblage DASH en cours
         // sous ce verrou a alors publié le téléchargement complet (#7247).
-        let deja_telecharge = if quality_preference == StreamingQualityPreference::Max
-            && !req.seek_ms.is_some_and(|ms| ms > 0)
-        {
+        // Relecture de #8249 — servi quand il a été téléchargé à la qualité
+        // que la zone demande (le préchargement suit la zone, #7266).
+        let deja_telecharge = if !req.seek_ms.is_some_and(|ms| ms > 0) {
             self.prefetch
-                .prendre_dash_complet(service_name, source_id)
+                .prendre_dash_complet(service_name, source_id, provider_quality)
                 .await
         } else {
             None

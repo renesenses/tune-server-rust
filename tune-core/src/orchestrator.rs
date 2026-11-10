@@ -88,7 +88,7 @@ async fn request_stream_at_quality(
 /// `settings` sous `zone_<id>_quality`. Lue par les trois chemins qui
 /// résolvent une URL de service : lecture explicite, préchauffage DASH et
 /// avance sans blanc.
-fn preference_de_qualite(
+pub(crate) fn preference_de_qualite(
     db: &Arc<dyn crate::db::backend::DbBackend>,
     zone_id: i64,
 ) -> StreamingQualityPreference {
