@@ -315,6 +315,64 @@ mod tests {
         );
     }
 
+    /// #8347 — un mauvais code saisi par l'utilisateur n'est pas un refus du
+    /// code par défaut : il ne retient pas la lecture.
+    #[tokio::test]
+    async fn un_mauvais_code_saisi_ne_bloque_pas_la_lecture_8347() {
+        let sortie = mania();
+        let recues = demon_d_une_mania_qui_refuse(&sortie).await;
+        sortie.start_pin_pairing().await.unwrap();
+        sortie.submit_pin("1234").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !sortie.pairing_status().await.starts_with("failed:") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("le refus du code doit arriver");
+        assert!(sortie.refus_recent().await.is_none());
+        sortie.play_media(&piste()).await.unwrap_err();
+        assert_eq!(
+            recues
+                .lock()
+                .await
+                .iter()
+                .filter(|c| *c == "connect")
+                .count(),
+            2,
+            "la lecture retente le code par défaut : {:?}",
+            recues.lock().await
+        );
+    }
+
+    /// #8347 — une session qui joue efface le refus : la piste suivante
+    /// n'est pas retenue.
+    #[tokio::test]
+    async fn une_lecture_qui_joue_efface_le_refus_8347() {
+        let sortie = mania();
+        // Un `connect` refusé pendant que le démon garde une connexion
+        // antérieure, qui joue ensuite.
+        faux_daemon(&sortie, |commande, _| match commande {
+            "volume" => vec![erreur(REFUS_M4), serde_json::json!({"event": "playing"})],
+            _ => vec![],
+        })
+        .await;
+        sortie.set_volume(0.5).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sortie.get_status().await.unwrap().state
+                != crate::outputs::traits::TransportState::Playing
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("le démon doit dire qu'il joue");
+        assert!(
+            sortie.refus_recent().await.is_none(),
+            "une session qui joue ne doit pas laisser de refus"
+        );
+    }
+
     /// 🔴 #8347 — un `setup` manqué sur une connexion établie : la lecture
     /// suivante lâche cette connexion et en rouvre une neuve, au lieu de
     /// rappeler `setup` sur elle (« Cannot process phase 1 from state
@@ -351,5 +409,33 @@ mod tests {
             vec!["connect", "play", "disconnect", "connect", "play"]
         );
         sortie.stop().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests_relecture {
+    use super::super::Airplay2Output;
+    use std::sync::atomic::Ordering;
+
+    fn mania() -> Airplay2Output {
+        Airplay2Output::new(
+            "Mania 2".into(),
+            "127.0.0.1".into(),
+            7000,
+            "fixture-8347b".into(),
+            "00:11:22:33:44:55".into(),
+        )
+    }
+
+    /// #8347 — `stop` tue le démon et sa connexion coincée : la lecture
+    /// suivante n'a rien à lâcher.
+    #[tokio::test]
+    async fn stop_oublie_la_session_a_rouvrir_8347() {
+        let sortie = mania();
+        sortie.session_a_rouvrir.store(true, Ordering::SeqCst);
+        crate::outputs::traits::OutputTarget::stop(&sortie)
+            .await
+            .unwrap();
+        assert!(!sortie.session_a_rouvrir.load(Ordering::SeqCst));
     }
 }

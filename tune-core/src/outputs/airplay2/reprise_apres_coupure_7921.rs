@@ -82,6 +82,7 @@ impl Airplay2Output {
             expected: TransportConfirmation::Connected,
             response,
         });
+        self.connect_par_code.store(false, Ordering::SeqCst);
         if let Err(error) = self.send(&self.commande_connect()).await {
             self.pending_transport.lock().await.take();
             return Err(error);

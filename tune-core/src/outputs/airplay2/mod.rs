@@ -76,6 +76,10 @@ pub struct Airplay2Output {
     /// démon la garde, coincée au milieu du setup. La lecture suivante la
     /// lâche (`disconnect`) et en rouvre une neuve (#8347).
     session_a_rouvrir: Arc<AtomicBool>,
+    /// Le `connect` en cours porte un code saisi par l'utilisateur
+    /// (`submit_pin`) : son refus est un mauvais code, pas un refus du code
+    /// par défaut, et ne bloque pas la lecture (#8347).
+    connect_par_code: Arc<AtomicBool>,
 }
 
 /// #8060 — une attente de code PIN : depuis quand, et si le récepteur
@@ -197,6 +201,7 @@ impl Airplay2Output {
             refus_d_appairage: Arc::new(Mutex::new(None)),
             delai_apres_un_refus: appairage_refuse_8347::DELAI_APRES_UN_REFUS,
             session_a_rouvrir: Arc::new(AtomicBool::new(false)),
+            connect_par_code: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -221,6 +226,7 @@ impl Airplay2Output {
         let connexion_perdue = self.connexion_perdue.clone();
         let refus_d_appairage = self.refus_d_appairage.clone();
         let session_a_rouvrir = self.session_a_rouvrir.clone();
+        let connect_par_code = self.connect_par_code.clone();
 
         tokio::spawn(async move {
             let mut line = String::new();
@@ -251,12 +257,18 @@ impl Airplay2Output {
                             "connected" | "paired" => {
                                 *pairing.lock().await = PairingPhase::Connected;
                                 connexion_perdue.store(false, Ordering::SeqCst);
+                                // #8347 — connexion neuve : ni refus en cours,
+                                // ni session coincée à lâcher.
                                 *refus_d_appairage.lock().await = None;
+                                session_a_rouvrir.store(false, Ordering::SeqCst);
                                 debug!(device = %device_name, "airplay2: connected/paired");
                                 Some(TransportConfirmation::Connected)
                             }
                             "playing" => {
                                 *panne.lock().await = None;
+                                // #8347 — une session joue : aucun refus ne
+                                // doit retenir la piste suivante.
+                                *refus_d_appairage.lock().await = None;
                                 playing.store(true, Ordering::SeqCst);
                                 paused.store(false, Ordering::SeqCst);
                                 debug!(device = %device_name, "airplay2: playing");
@@ -301,7 +313,9 @@ impl Airplay2Output {
                                 // #8347 — le récepteur a refusé l'appairage :
                                 // noté AVANT de répondre à la commande en
                                 // attente, pour que la lecture le nomme.
-                                if appairage_refuse_8347::etape_refusee(&msg).is_some() {
+                                if appairage_refuse_8347::etape_refusee(&msg).is_some()
+                                    && !connect_par_code.load(Ordering::SeqCst)
+                                {
                                     *refus_d_appairage.lock().await =
                                         Some(appairage_refuse_8347::RefusDAppairage {
                                             depuis: std::time::Instant::now(),
@@ -522,6 +536,7 @@ impl Airplay2Output {
             );
         }
         let connect = self.commande_connect();
+        self.connect_par_code.store(false, Ordering::SeqCst);
         *self.pairing.lock().await = PairingPhase::Connecting;
         // Default code 3939. NB (#8347): the pinned airplay-daemon sends it
         // through a HomeKit NORMAL pair-setup (HKP=3, M1-M6), not a transient
@@ -593,6 +608,7 @@ impl Airplay2Output {
             .ok_or("airplay2: no pairing in progress — call start_pin_pairing first")?;
         *self.pairing.lock().await = PairingPhase::Connecting;
         *self.refus_d_appairage.lock().await = None;
+        self.connect_par_code.store(true, Ordering::SeqCst);
         daemon
             .send_cmd(&serde_json::json!({
                 "cmd": "connect",
@@ -861,6 +877,8 @@ impl OutputTarget for Airplay2Output {
         self.paused.store(false, Ordering::SeqCst);
         *self.panne.lock().await = None;
         self.connexion_perdue.store(false, Ordering::SeqCst);
+        // #8347 — le démon meurt avec sa connexion coincée.
+        self.session_a_rouvrir.store(false, Ordering::SeqCst);
         self.send(&serde_json::json!({"cmd": "stop"})).await.ok();
         self.send(&serde_json::json!({"cmd": "disconnect"}))
             .await
