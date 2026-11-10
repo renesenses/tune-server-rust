@@ -137,6 +137,13 @@ pub struct TuneConfig {
     pub peer_discovery_enabled: bool,
 
     // UPnP
+    /// ⚠️ Ces deux champs-ci ne pilotent RIEN (#8374) : `from_env` n'a aucun
+    /// appelant (voir `auto_update`). `TUNE_UPNP_SERVER_ENABLED` et
+    /// `TUNE_UPNP_SERVER_NAME` sont lues là où l'annonce se décide —
+    /// `upnp_server::annonce_voulue` et `upnp_server::nom_publie` — comme
+    /// valeur par défaut quand la clé `upnp_enabled` / `upnp_friendly_name`
+    /// est absente de la base. Laissés en place : retirer un champ d'une
+    /// configuration publique est un arbitrage de Bertrand.
     pub upnp_server_enabled: bool,
     pub upnp_server_name: String,
 
