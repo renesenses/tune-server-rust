@@ -939,8 +939,10 @@ impl PlaybackOrchestrator {
             && crate::audio::frequence_fixe::cible(&self.db, req.zone_id, plafond)?.is_some()
             && !is_radio
         {
-            return Box::pin(self.direct_a_cadence_fixe(req, audio_url, mime_type, &title, source))
-                .await;
+            return Box::pin(
+                self.direct_a_cadence_fixe(req, audio_url, mime_type, &title, &source),
+            )
+            .await;
         }
 
         let d = Directe {
