@@ -2474,8 +2474,11 @@ impl PlaybackOrchestrator {
             )
             .await;
             let output = output_arc.lock().await;
+            // #8402 (11/11) — AirPlay 2 : la zone est-elle en PURE verrouillé ?
+            self.dire_a_l_airplay2_si_la_zone_tient_le_volume(zone_id, &**output);
             match output.play_media(media).await {
                 Ok(()) => {
+                    self.dire_le_depart_muet_d_airplay2(zone_id, &**output);
                     drop(output);
                     info!(device_id = %used_device_id, "output_play_sent");
                     self.reimposer_la_sourdine_de_la_zone(
