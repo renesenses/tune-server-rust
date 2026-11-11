@@ -20,11 +20,23 @@
 //! - `play_media` donne ce volume au démon avant `play` : le démon traite ses
 //!   commandes une à une, sa `Connection` le retient, et c'est lui qui part
 //!   au récepteur au départ du flux.
+//!
+//! ## PURE verrouillé (décisions de Bertrand, 11/11)
+//!
+//! Une zone PURE verrouillée partait encore à 100 % (0 dB) : l'enceinte PURE
+//! du fil 2749. Désormais une session AirPlay 2 NEUVE d'une zone PURE
+//! verrouillée part à 0 %, et l'orchestrateur prévient l'utilisateur
+//! (`zone.playback_error` non fatal, code `airplay2_start_volume_zero_pure`).
+//! Dans la session, la piste suivante garde le niveau en cours : 0 %, ou le
+//! 100 % qu'un geste de l'utilisateur a donné depuis.
+//!
+//! Le VOLUME FIXE, lui, garde son départ à 100 % : c'est son rôle, l'ampli
+//! tient le volume.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use super::Airplay2Output;
 use crate::db::backend::DbBackend;
@@ -41,10 +53,9 @@ pub(super) fn sans_demon(erreur: &str) -> bool {
 /// Le volume (0..1) et la sourdine de départ d'une sortie AirPlay 2, d'après
 /// ce que la base dit de la zone de `device_id`.
 ///
-/// Mêmes règles que la consigne d'un geste (`set_volume` de l'orchestrateur)
-/// et que la graine des sorties locales : PURE verrouillé ou volume fixe à
-/// pleine échelle (choix explicite de l'utilisateur) ; sinon le volume de la
-/// zone, un trim positif ignoré (volume matériel, #6739), borné par la
+/// Volume fixe : pleine échelle, l'ampli tient le volume. PURE verrouillé :
+/// 0 % (décision du 11/11, voir l'en-tête). Sinon, mêmes règles que la consigne d'un geste
+/// (`set_volume` de l'orchestrateur) : le volume de la zone, un trim positif ignoré (volume matériel, #6739), borné par la
 /// limite de sécurité (#6541). Jamais au-dessus du volume mémorisé. Sans zone
 /// connue : [`VOLUME_DE_DEPART_PRUDENT`].
 pub fn volume_de_depart(db: &Arc<dyn DbBackend>, device_id: &str) -> (f64, bool) {
@@ -60,10 +71,11 @@ pub fn volume_de_depart(db: &Arc<dyn DbBackend>, device_id: &str) -> (f64, bool)
     if !zone.volume.is_finite() {
         return (VOLUME_DE_DEPART_PRUDENT, zone.muted);
     }
-    let pure_force = crate::audio::audiophile::zone_enabled(db, zone_id)
-        && crate::audio::audiophile::volume_lock_enabled(db, zone_id);
-    if zone.fixed_volume || pure_force {
+    if zone.fixed_volume {
         return (1.0, zone.muted);
+    }
+    if pure_verrouille(db, zone_id) {
+        return (0.0, zone.muted);
     }
     let memorise = (zone.volume / 100.0).clamp(0.0, 1.0);
     let trim_db = crate::orchestrator::gain_trim_db_enregistre(db, zone_id);
@@ -74,10 +86,64 @@ pub fn volume_de_depart(db: &Arc<dyn DbBackend>, device_id: &str) -> (f64, bool)
     (borne.clamp(0.0, 1.0), zone.muted)
 }
 
+/// La zone `zone_id` est-elle en PURE verrouillé (« Forcer à 100 % ») ? Lu
+/// en base à chaque piste : un réglage changé zone en marche compte tout de
+/// suite. Le volume fixe n'en est pas : il garde son départ à 100 %.
+pub fn pure_verrouille(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
+    crate::audio::audiophile::zone_enabled(db, zone_id)
+        && crate::audio::audiophile::volume_lock_enabled(db, zone_id)
+}
+
 impl Airplay2Output {
+    /// L'orchestrateur, avant chaque piste : la zone est-elle en PURE
+    /// verrouillé ?
+    pub fn tenir_le_volume_de_la_zone(&self, tenu: bool) {
+        self.volume_tenu_par_la_zone.store(tenu, Ordering::SeqCst);
+    }
+
+    /// La dernière lecture a-t-elle ouvert sa session à 0 % parce que la
+    /// zone est en PURE verrouillé ? Rend `true` une seule fois.
+    pub fn prendre_le_depart_muet(&self) -> bool {
+        self.depart_muet.swap(false, Ordering::SeqCst)
+    }
+
+    /// Une session est-elle déjà ouverte sur le récepteur (piste suivante) ?
+    /// Démon absent, connexion perdue (#7921), session à rouvrir (#8347) ou
+    /// connexion pas encore confirmée : non, la lecture en ouvre une neuve.
+    pub(super) async fn session_deja_ouverte(&self) -> bool {
+        let proc = self.process.lock().await;
+        proc.is_some()
+            && matches!(*self.pairing.lock().await, super::PairingPhase::Connected)
+            && !self.connexion_perdue.load(Ordering::SeqCst)
+            && !self.session_a_rouvrir.load(Ordering::SeqCst)
+    }
+
+    /// Décision du 11/11 : une session NEUVE d'une zone PURE verrouillée
+    /// part à 0 %. Le niveau est gardé : la piste suivante de la même session
+    /// repart du même niveau, sauf geste de l'utilisateur entre-temps.
+    pub(super) async fn partir_muet_si_la_zone_tient_le_volume(&self, session_neuve: bool) {
+        self.depart_muet.store(false, Ordering::SeqCst);
+        if !session_neuve || !self.volume_tenu_par_la_zone.load(Ordering::SeqCst) {
+            return;
+        }
+        *self.volume.lock().await = 0.0;
+        self.depart_muet.store(true, Ordering::SeqCst);
+        warn!(
+            device = %self.name,
+            "airplay2_depart_a_zero_pure_verrouille"
+        );
+    }
+
     /// Sème la sortie qui vient de naître du volume mémorisé de sa zone.
     pub async fn ensemencer_depuis_la_base(&self, db: &Arc<dyn DbBackend>) {
         let (volume, sourdine) = volume_de_depart(db, &self.device_id);
+        let tenu = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+            .get_by_device_id(&self.device_id)
+            .ok()
+            .flatten()
+            .and_then(|zone| zone.id)
+            .is_some_and(|zone_id| pure_verrouille(db, zone_id));
+        self.tenir_le_volume_de_la_zone(tenu);
         *self.volume.lock().await = volume;
         self.muted.store(sourdine, Ordering::SeqCst);
         info!(
@@ -294,5 +360,134 @@ mod tests {
         let recus = demon(&sortie, false).await;
         sortie.play_media(&piste()).await.unwrap();
         assert_eq!(*recus.lock().await, vec![decibels(0.5)]);
+    }
+    /// Décision du 11/11 (révisée) — volume fixe : le départ reste à 100 %
+    /// (0 dB), l'ampli tient le volume ; aucun départ muet à dire.
+    #[tokio::test]
+    async fn une_zone_en_volume_fixe_garde_son_depart_a_100_8402() {
+        let db = base();
+        let repo = ZoneRepo::with_backend(db.clone());
+        let zone_id = repo
+            .create("Fixe 8402", Some("airplay2"), Some(APPAREIL))
+            .unwrap();
+        repo.update_volume(zone_id, 100.0).unwrap();
+        repo.update_fixed_volume(zone_id, true).unwrap();
+        assert!(!pure_verrouille(&db, zone_id));
+        assert_eq!(volume_de_depart(&db, APPAREIL), (1.0, false));
+
+        let sortie = enceinte();
+        sortie.ensemencer_depuis_la_base(&db).await;
+        let recus = demon(&sortie, false).await;
+        sortie.play_media(&piste()).await.unwrap();
+        assert_eq!(*recus.lock().await, vec!["0.00".to_string()]);
+        assert!(
+            !sortie.prendre_le_depart_muet(),
+            "rien à dire en volume fixe"
+        );
+    }
+
+    /// Décision du 11/11 — PURE verrouillé (« Forcer à 100 % ») armé zone en
+    /// marche, APRÈS la graine : l'orchestrateur le dit à la sortie avant la
+    /// piste, et la session neuve part quand même à 0 %, pas au 100 % que
+    /// l'armement de PURE avait posé.
+    #[tokio::test]
+    async fn une_zone_pure_verrouillee_part_a_zero_8402() {
+        let db = base();
+        let repo = ZoneRepo::with_backend(db.clone());
+        let zone_id = repo
+            .create("PURE 8402", Some("airplay2"), Some(APPAREIL))
+            .unwrap();
+        repo.update_volume(zone_id, 40.0).unwrap();
+        let sortie = enceinte();
+        sortie.ensemencer_depuis_la_base(&db).await;
+        assert!(!pure_verrouille(&db, zone_id));
+
+        crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .set(
+                &format!("zone_{zone_id}_audiophile"),
+                r#"{"enabled":true,"lock_volume":true}"#,
+            )
+            .unwrap();
+        assert!(pure_verrouille(&db, zone_id));
+        assert_eq!(volume_de_depart(&db, APPAREIL), (0.0, false));
+        // L'armement de PURE commande 100 % à la sortie (`set_volume_pure_force`).
+        sortie.set_volume(1.0).await.unwrap();
+        sortie.tenir_le_volume_de_la_zone(pure_verrouille(&db, zone_id));
+
+        let recus = demon(&sortie, false).await;
+        sortie.play_media(&piste()).await.unwrap();
+        assert_eq!(*recus.lock().await, vec!["-144.00".to_string()]);
+        assert!(sortie.prendre_le_depart_muet());
+        assert!(!sortie.prendre_le_depart_muet(), "une seule fois");
+    }
+
+    /// Dans la session ouverte à 0 %, la piste suivante ne remet pas à zéro
+    /// le geste de l'utilisateur (PURE : 100 %), et ne relève pas de nouveau
+    /// départ muet.
+    #[tokio::test]
+    async fn la_piste_suivante_garde_le_geste_de_l_utilisateur_8402() {
+        let sortie = enceinte();
+        sortie.tenir_le_volume_de_la_zone(true);
+        let recus = demon(&sortie, false).await;
+        sortie.play_media(&piste()).await.unwrap();
+        assert!(sortie.prendre_le_depart_muet());
+        sortie.set_volume(1.0).await.unwrap();
+        sortie.play_media(&piste()).await.unwrap();
+        assert_eq!(
+            *recus.lock().await,
+            vec!["-144.00".to_string(), "0.00".to_string()]
+        );
+        assert!(!sortie.prendre_le_depart_muet());
+    }
+
+    /// Une zone qui ne tient pas le volume garde son niveau : aucun départ
+    /// muet, rien à dire.
+    #[tokio::test]
+    async fn une_zone_ordinaire_ne_part_pas_muette_8402() {
+        let sortie = enceinte();
+        sortie.set_volume(0.3).await.unwrap();
+        sortie.tenir_le_volume_de_la_zone(false);
+        let recus = demon(&sortie, false).await;
+        sortie.play_media(&piste()).await.unwrap();
+        assert_eq!(*recus.lock().await, vec![decibels(0.3)]);
+        assert!(!sortie.prendre_le_depart_muet());
+    }
+    /// Une session dont le récepteur a fermé la connexion (#7921) ou dont le
+    /// setup a échoué (#8347) se rouvre : c'est une session neuve, donc à 0 %
+    /// pour une zone PURE verrouillée.
+    #[tokio::test]
+    async fn une_session_a_rouvrir_n_est_pas_une_session_ouverte_8402() {
+        use std::sync::atomic::Ordering;
+        let sortie = enceinte();
+        let _recus = demon(&sortie, true).await;
+        assert!(sortie.session_deja_ouverte().await);
+        sortie.connexion_perdue.store(true, Ordering::SeqCst);
+        assert!(!sortie.session_deja_ouverte().await);
+        sortie.connexion_perdue.store(false, Ordering::SeqCst);
+        sortie.session_a_rouvrir.store(true, Ordering::SeqCst);
+        assert!(!sortie.session_deja_ouverte().await);
+    }
+    /// Titre suivant en PURE verrouillé = volume conservé : la piste suivante
+    /// n'est pas une session neuve, même quand la sortie rouvre la connexion
+    /// du démon entre deux titres (#8420, `session_consommee`). Sans geste,
+    /// elle reste à 0 % ; après le 100 % d'un geste, elle reste à 100 % ;
+    /// jamais de nouvelle alerte.
+    #[tokio::test]
+    async fn titre_suivant_en_pure_verrouille_garde_le_volume_8402() {
+        let sortie = enceinte();
+        sortie.tenir_le_volume_de_la_zone(true);
+        let recus = demon(&sortie, false).await;
+        sortie.play_media(&piste()).await.unwrap();
+        assert!(sortie.prendre_le_depart_muet());
+        sortie.play_media(&piste()).await.unwrap();
+        assert!(!sortie.prendre_le_depart_muet(), "pas une session neuve");
+        sortie.set_volume(1.0).await.unwrap();
+        sortie.play_media(&piste()).await.unwrap();
+        sortie.play_media(&piste()).await.unwrap();
+        assert!(!sortie.prendre_le_depart_muet());
+        assert_eq!(
+            *recus.lock().await,
+            vec!["-144.00", "-144.00", "0.00", "0.00"]
+        );
     }
 }
