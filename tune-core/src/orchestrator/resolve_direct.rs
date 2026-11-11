@@ -1132,12 +1132,16 @@ impl PlaybackOrchestrator {
         // station que le décodeur vient de déclarer irrécupérable.
         let refusees = self.radios_refusees.clone();
         let refus_source_id = req.source_id.clone();
+        // #8110 — les autres flux autorisés de la fiche, retenus par la route :
+        // le décodeur y passe si le diffuseur refuse celui-ci.
+        let radio_replis = super::radio_replis_8110::replis_retenus(req.source_id.as_deref());
         tokio::spawn(async move {
             // Download + decode in a blocking thread since symphonia and
             // reqwest::blocking are both synchronous.
             let result = tokio::task::spawn_blocking(move || {
                 decode_radio_stream_to_pcm_avec_profondeur(
                     radio_url,
+                    radio_replis,
                     tx,
                     data_ready,
                     session,
@@ -2092,10 +2096,13 @@ impl PlaybackOrchestrator {
             // deux chemins laisserait la relance sans fin sur l'autre.
             let refusees = self.radios_refusees.clone();
             let refus_source_id = req.source_id.clone();
+            // #8110 — même repli que le chemin local/OAAT.
+            let radio_replis = super::radio_replis_8110::replis_retenus(req.source_id.as_deref());
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    decode_radio_stream_to_pcm(
+                    decode_radio_stream_to_pcm_avec_profondeur(
                         radio_url,
+                        radio_replis,
                         tx,
                         data_ready,
                         session,
@@ -2103,6 +2110,7 @@ impl PlaybackOrchestrator {
                         radio_levels_tx,
                         radio_strict,
                         Some(en_vol),
+                        false,
                     )
                 })
                 .await;

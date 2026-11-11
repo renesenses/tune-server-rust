@@ -408,6 +408,7 @@ pub(super) fn decode_radio_stream_to_pcm(
 ) -> Result<(), String> {
     decode_radio_stream_to_pcm_avec_profondeur(
         url,
+        Vec::new(),
         tx,
         data_ready,
         session,
@@ -421,9 +422,17 @@ pub(super) fn decode_radio_stream_to_pcm(
 
 /// Seule la sortie locale relève le PCM à 24 bits quand la source le demande.
 /// Les autres appelants conservent leur contrat réseau 16 bits (#1654).
+///
+/// #8110 — `replis` : les autres flux autorisés de la fiche, du meilleur au
+/// moins bon. Quand le diffuseur REFUSE le flux joué (403, 451 :
+/// `radio_flux_interdit`), la lecture passe au suivant sur la MÊME session,
+/// sans que l'auditeur ait à choisir ; l'erreur n'est rendue que si tous ont
+/// été refusés. Une coupure réseau, une page web ou un HLS illisible gardent
+/// le comportement d'avant : reconnexion sur le même flux, ou échec dit.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
     url: String,
+    replis: Vec<String>,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
     session: std::sync::Arc<crate::http::streamer::StreamSession>,
@@ -462,9 +471,36 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
         sortie_locale,
     };
 
+    let mut url = url;
+    let mut replis = replis.into_iter();
     'reconnect: loop {
         match une_connexion(&mut etat, &url, &canaux) {
             SuiteRadio::Reconnecter => continue 'reconnect,
+            // #8110 — le diffuseur refuse CE flux avant le moindre PCM : le
+            // suivant de la fiche, s'il y en a un, comme une première
+            // connexion (la relance bornée repart de zéro, c'est une autre
+            // adresse). Un refus en cours d'écoute garde le comportement
+            // d'avant : le WAV est déjà annoncé au format du premier flux, et
+            // un repli d'un autre format finirait en arrêt muet.
+            SuiteRadio::Rendre(Err(e))
+                if !etat.first_chunk_sent
+                    && super::radio_replis_8110::flux_refuse_par_le_diffuseur(&e) =>
+            {
+                match replis.next() {
+                    Some(suivant) => {
+                        tracing::warn!(
+                            refuse = %url,
+                            suivant = %suivant,
+                            error = %e,
+                            "radio_flux_refuse_repli_8110"
+                        );
+                        url = suivant;
+                        etat.reconnects = 0;
+                        continue 'reconnect;
+                    }
+                    None => return Err(e),
+                }
+            }
             SuiteRadio::Rendre(resultat) => return resultat,
         }
     }
@@ -1278,3 +1314,7 @@ mod radio_source_tests;
 #[cfg(test)]
 #[path = "radio_cause_8008_tests.rs"]
 mod radio_cause_8008_tests;
+
+#[cfg(test)]
+#[path = "radio_repli_8110_tests.rs"]
+mod radio_repli_8110_tests;
