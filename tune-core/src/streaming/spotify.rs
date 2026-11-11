@@ -95,6 +95,11 @@ pub struct SpotifyService {
     /// supprime la ligne de jetons. Sans cela, le service restait annoncé
     /// « Connecté » avec un jeton mort, et chaque recherche échouait.
     session_refusee: bool,
+    /// #8485 — Spotify a répondu 403 à `/artists/{id}/top-tracks` : depuis
+    /// février 2026, ce point d'accès est retiré aux applications en mode
+    /// développement (celle de chaque utilisateur). Les titres phares sont
+    /// alors vides, sans erreur, et ne sont plus redemandés à Spotify.
+    titres_phares_retires: AtomicBool,
 }
 
 impl Default for SpotifyService {
@@ -403,6 +408,7 @@ impl SpotifyService {
             portees: None,
             plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
             session_refusee: false,
+            titres_phares_retires: AtomicBool::new(false),
         }
     }
 
@@ -411,6 +417,8 @@ impl SpotifyService {
     /// le nouveau : son verificateur est oublie.
     pub fn set_client_id(&mut self, client_id: &str) {
         self.client_id = client_id.trim().to_owned();
+        // #8485 — le retrait des titres phares vaut pour UNE application.
+        self.titres_phares_retires.store(false, Ordering::Relaxed);
         self.tentatives.clear();
     }
 
@@ -1158,6 +1166,7 @@ impl StreamingService for SpotifyService {
         self.portees = None;
         self.token_rejected.store(false, Ordering::Relaxed);
         self.session_refusee = false;
+        self.titres_phares_retires.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1334,9 +1343,29 @@ impl StreamingService for SpotifyService {
     }
 
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        let data = self
+        // #8485 — retiré par Spotify à cette application : section vide, sans
+        // nouvel appel. La route complète ensuite la liste par ses autres
+        // sources (écoutes de ce serveur).
+        if self.titres_phares_retires.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
+        let data = match self
             .api_get(&format!("/artists/{artist_id}/top-tracks"))
-            .await?;
+            .await
+        {
+            Ok(d) => d,
+            // `api_get` rend « spotify GET /route: HTTP 403 — motif ».
+            Err(e) if e.contains(": HTTP 403 ") => {
+                if !self.titres_phares_retires.swap(true, Ordering::Relaxed) {
+                    info!(
+                        route = "/artists/{id}/top-tracks",
+                        "spotify_point_d_acces_retire"
+                    );
+                }
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e.into()),
+        };
         Ok(data["tracks"]
             .as_array()
             .map(|i| i.iter().map(Self::map_track).collect())
@@ -2841,3 +2870,7 @@ mod favoris_pagination_8050_tests;
 #[cfg(test)]
 #[path = "spotify_playlists_items_8193_tests.rs"]
 mod playlists_items_8193_tests;
+
+#[cfg(test)]
+#[path = "spotify_titres_phares_8485_tests.rs"]
+mod titres_phares_8485_tests;
