@@ -1868,7 +1868,29 @@ fn assembler_les_etapes_lang(
         && !transcode_active
         && !dsp_applique
         && replaygain_step.is_none();
-    if !is_dsd && !decode_par_la_sortie {
+    // #8462 (kiran, fil 2762, renderer « Diretta UPnP ») — décision de
+    // Bertrand du 11/11 : même règle sur une sortie DLNA ou UPnP (OpenHome)
+    // en PASSTHROUGH. Le FLAC part tel quel et c'est le renderer qui le
+    // décode ; « Decoder FLAC » prêtait ce décodage à Tune. L'étape reste dès
+    // que Tune décode lui-même : transcodage (WAV forcé, plafond LPCM 16 bits,
+    // repli WAV du fil, conteneur réécrit), rééchantillonnage, DSP,
+    // ReplayGain, compensation de niveau, crossfeed, réaffectation de canaux,
+    // correction de pièce. Une radio garde son décodeur : son fil n'est pas
+    // forcément l'octet de la source (HLS, relais).
+    let decode_par_le_renderer = matches!(output_type, "dlna" | "openhome")
+        && !transcode_active
+        && !dsp_applique
+        && replaygain_step.is_none()
+        && !resampling_active
+        && compensation_reseau_db.is_none()
+        && !crossfeed_du_flux
+        && reaffectation_step.is_none()
+        && !correction_piece.as_ref().is_some_and(|cp| cp.applied)
+        && ps
+            .now_playing
+            .as_ref()
+            .is_none_or(|np| np.source != "radio");
+    if !is_dsd && !decode_par_la_sortie && !decode_par_le_renderer {
         let mut decodeur = json!({
             "name": "Decoder",
             "description": format_name,
@@ -2128,9 +2150,21 @@ fn assembler_les_etapes_lang(
             OutputVolumeState::Unity => {}
         }
     } else if !volume_full {
+        let pourcent = ((ui_volume * 100.0).round() as i32).to_string();
+        // #8462 (kiran, fil 2762) — sur une sortie réseau, le volume n'est pas
+        // dans le flux : c'est une commande (SetVolume) au renderer. « Volume
+        // 50% » se lisait comme un traitement de Tune. Le verdict ne change
+        // pas : l'étape était déjà marquée intacte. Le refus du volume par le
+        // renderer (502 sur PUT volume) n'est mémorisé par aucun état que ce
+        // calcul lit : seul le volume fixe (`fixed_volume`) retire l'étape.
+        let description = if tune_core::orchestrator::is_network_output_type(Some(output_type)) {
+            fs(lang, "renderer_volume", &[&pourcent])
+        } else {
+            format!("Volume {pourcent}%")
+        };
         steps.push(json!({
             "name": "Volume",
-            "description": format!("Volume {}%", (ui_volume * 100.0).round() as i32),
+            "description": description,
             "bit_perfect": true,
         }));
     }
