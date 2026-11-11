@@ -17,9 +17,11 @@ use crate::outputs::traits::{
     OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState,
 };
 
+mod appairage_refuse_8347;
 pub mod composant_manquant_7084;
 mod reprise_apres_coupure_7921;
 mod session_en_panne_7823;
+pub mod volume_de_depart_8402;
 
 const DAEMON_BINARY: &str = "airplay-daemon";
 const TRANSPORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,6 +67,20 @@ pub struct Airplay2Output {
     /// Délai d'abandon d'une attente de code (#8060), [`ATTENTE_DU_CODE`]
     /// hors bancs d'essai.
     delai_du_code: Duration,
+    /// Dernier refus d'appairage du récepteur (#8347) : pendant
+    /// `delai_apres_un_refus`, la lecture le redit sans recontacter
+    /// l'enceinte.
+    refus_d_appairage: Arc<Mutex<Option<appairage_refuse_8347::RefusDAppairage>>>,
+    /// [`appairage_refuse_8347::DELAI_APRES_UN_REFUS`] hors bancs d'essai.
+    delai_apres_un_refus: Duration,
+    /// Le `setup` d'une lecture a échoué sur une connexion établie : le
+    /// démon la garde, coincée au milieu du setup. La lecture suivante la
+    /// lâche (`disconnect`) et en rouvre une neuve (#8347).
+    session_a_rouvrir: Arc<AtomicBool>,
+    /// Le `connect` en cours porte un code saisi par l'utilisateur
+    /// (`submit_pin`) : son refus est un mauvais code, pas un refus du code
+    /// par défaut, et ne bloque pas la lecture (#8347).
+    connect_par_code: Arc<AtomicBool>,
 }
 
 /// #8060 — une attente de code PIN : depuis quand, et si le récepteur
@@ -171,7 +187,10 @@ impl Airplay2Output {
             paused: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
-            volume: Arc::new(Mutex::new(1.0)),
+            // #8402 — jamais la pleine échelle : le démon envoie ce niveau au
+            // récepteur à chaque départ de flux. La découverte le remplace par
+            // le volume mémorisé de la zone (`ensemencer_depuis_la_base`).
+            volume: Arc::new(Mutex::new(volume_de_depart_8402::VOLUME_DE_DEPART_PRUDENT)),
             muted: Arc::new(AtomicBool::new(false)),
             current_title: Arc::new(Mutex::new(None)),
             current_artist: Arc::new(Mutex::new(None)),
@@ -183,6 +202,10 @@ impl Airplay2Output {
             panne: Arc::new(Mutex::new(None)),
             connexion_perdue: Arc::new(AtomicBool::new(false)),
             delai_du_code: ATTENTE_DU_CODE,
+            refus_d_appairage: Arc::new(Mutex::new(None)),
+            delai_apres_un_refus: appairage_refuse_8347::DELAI_APRES_UN_REFUS,
+            session_a_rouvrir: Arc::new(AtomicBool::new(false)),
+            connect_par_code: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -205,6 +228,9 @@ impl Airplay2Output {
         let pending_transport = self.pending_transport.clone();
         let panne = self.panne.clone();
         let connexion_perdue = self.connexion_perdue.clone();
+        let refus_d_appairage = self.refus_d_appairage.clone();
+        let session_a_rouvrir = self.session_a_rouvrir.clone();
+        let connect_par_code = self.connect_par_code.clone();
 
         tokio::spawn(async move {
             let mut line = String::new();
@@ -235,11 +261,18 @@ impl Airplay2Output {
                             "connected" | "paired" => {
                                 *pairing.lock().await = PairingPhase::Connected;
                                 connexion_perdue.store(false, Ordering::SeqCst);
+                                // #8347 — connexion neuve : ni refus en cours,
+                                // ni session coincée à lâcher.
+                                *refus_d_appairage.lock().await = None;
+                                session_a_rouvrir.store(false, Ordering::SeqCst);
                                 debug!(device = %device_name, "airplay2: connected/paired");
                                 Some(TransportConfirmation::Connected)
                             }
                             "playing" => {
                                 *panne.lock().await = None;
+                                // #8347 — une session joue : aucun refus ne
+                                // doit retenir la piste suivante.
+                                *refus_d_appairage.lock().await = None;
                                 playing.store(true, Ordering::SeqCst);
                                 paused.store(false, Ordering::SeqCst);
                                 debug!(device = %device_name, "airplay2: playing");
@@ -280,6 +313,23 @@ impl Airplay2Output {
                                 // le voie déjà.
                                 if reprise_apres_coupure_7921::connexion_coupee(&msg) {
                                     connexion_perdue.store(true, Ordering::SeqCst);
+                                }
+                                // #8347 — le récepteur a refusé l'appairage :
+                                // noté AVANT de répondre à la commande en
+                                // attente, pour que la lecture le nomme.
+                                if appairage_refuse_8347::etape_refusee(&msg).is_some()
+                                    && !connect_par_code.load(Ordering::SeqCst)
+                                {
+                                    *refus_d_appairage.lock().await =
+                                        Some(appairage_refuse_8347::RefusDAppairage {
+                                            depuis: std::time::Instant::now(),
+                                            cause: msg.clone(),
+                                        });
+                                }
+                                // #8347 — setup manqué : la connexion que garde
+                                // le démon n'est plus réutilisable.
+                                if appairage_refuse_8347::session_a_rouvrir(&msg) {
+                                    session_a_rouvrir.store(true, Ordering::SeqCst);
                                 }
                                 let pending = pending_transport.lock().await.take();
                                 let attendue = pending.is_some();
@@ -436,6 +486,12 @@ impl Airplay2Output {
     /// on `/pair-pin-start` (#6788, a Mac) nothing is open on the receiver
     /// side: `play` falls back to the transient connection, as before #7395.
     async fn ensure_connected(&self) -> Result<(), String> {
+        // #8347 — un récepteur qui vient de refuser l'appairage refuse
+        // encore pendant un temps (dès M2) : ne pas le relancer à chaque
+        // lecture, dire pourquoi. Une connexion réussie efface le refus.
+        if let Some(refus) = self.refus_encore_recent().await {
+            return Err(refus);
+        }
         let mut proc = self.process.lock().await;
         if proc.is_some() {
             let phase = self.pairing.lock().await.clone();
@@ -459,7 +515,22 @@ impl Airplay2Output {
                 drop(proc);
                 return self.rouvrir_la_session().await;
             }
-            if matches!(phase, PairingPhase::Connected | PairingPhase::Connecting) {
+            // #8347 — le `setup` précédent a échoué sur une connexion
+            // établie : le démon la garde, coincée après la phase 1, et un
+            // nouveau `play` finirait en « Cannot process phase 1 from state
+            // SetupPhase1 ». On la lâche et on en rouvre une neuve.
+            if self.session_a_rouvrir.swap(false, Ordering::SeqCst) {
+                info!(
+                    device = %self.name,
+                    "airplay2: the previous setup failed, dropping that session before reconnecting"
+                );
+                if let Some(daemon) = proc.as_mut() {
+                    daemon
+                        .send_cmd(&serde_json::json!({"cmd": "disconnect"}))
+                        .await
+                        .ok();
+                }
+            } else if matches!(phase, PairingPhase::Connected | PairingPhase::Connecting) {
                 return Ok(());
             }
             info!(
@@ -469,9 +540,12 @@ impl Airplay2Output {
             );
         }
         let connect = self.commande_connect();
+        self.connect_par_code.store(false, Ordering::SeqCst);
         *self.pairing.lock().await = PairingPhase::Connecting;
-        // Transient pairing (hard-coded PIN 3939) — works for HomePod-class and
-        // already-paired receivers. PIN-only receivers need start_pin_pairing().
+        // Default code 3939. NB (#8347): the pinned airplay-daemon sends it
+        // through a HomeKit NORMAL pair-setup (HKP=3, M1-M6), not a transient
+        // one (HKP=4, Flags=0x10): receivers that check their own code refuse
+        // it in M4. PIN-only receivers need start_pin_pairing().
         let envoye = match proc.as_mut() {
             Some(daemon) => daemon.send_cmd(&connect).await,
             None => Err("daemon not running".into()),
@@ -492,8 +566,9 @@ impl Airplay2Output {
         Ok(())
     }
 
-    /// Transient pairing (hard-coded PIN 3939) — works for HomePod-class and
-    /// already-paired receivers. PIN-only receivers need start_pin_pairing().
+    /// Default code 3939. The pinned `airplay-daemon` runs a HomeKit NORMAL
+    /// pair-setup with it (`connect_with_pin_pairing`), not a transient one
+    /// (#8347). PIN-only receivers need start_pin_pairing().
     fn commande_connect(&self) -> serde_json::Value {
         serde_json::json!({
             "cmd": "connect",
@@ -511,6 +586,8 @@ impl Airplay2Output {
     pub async fn start_pin_pairing(&self) -> Result<(), String> {
         let mut proc = self.process.lock().await;
         *self.pairing.lock().await = PairingPhase::Idle;
+        // #8347 — l'utilisateur relance l'appairage lui-même.
+        *self.refus_d_appairage.lock().await = None;
         if proc.is_none() {
             *proc = Some(self.spawn_daemon().await?);
         }
@@ -534,6 +611,8 @@ impl Airplay2Output {
             .as_mut()
             .ok_or("airplay2: no pairing in progress — call start_pin_pairing first")?;
         *self.pairing.lock().await = PairingPhase::Connecting;
+        *self.refus_d_appairage.lock().await = None;
+        self.connect_par_code.store(true, Ordering::SeqCst);
         daemon
             .send_cmd(&serde_json::json!({
                 "cmd": "connect",
@@ -676,6 +755,14 @@ impl OutputTarget for Airplay2Output {
             lisible.oublier().await;
             return Err(error);
         }
+        // #8402 — le démon envoie au récepteur, au départ du flux, le volume
+        // qu'il tient (1.0 = 0 dB dans une `Connection` neuve) : il reçoit
+        // d'abord celui de la zone. Il traite ses commandes une à une, donc
+        // après le `connect` et avant le `play`.
+        if let Err(error) = self.donner_le_volume_au_demon().await {
+            lisible.oublier().await;
+            return Err(error);
+        }
 
         let title = media.title.unwrap_or("Unknown");
         let artist = media.artist.unwrap_or("Unknown");
@@ -748,6 +835,16 @@ impl OutputTarget for Airplay2Output {
             .await
         {
             lisible.oublier().await;
+            // #8347 — un refus d'appairage se dit comme tel, pas comme un
+            // récepteur muet. `ensure_connected` a effacé tout refus expiré :
+            // celui qui reste est arrivé pendant cette lecture.
+            let refus = self.refus_d_appairage.lock().await.clone();
+            if let Some(refus) = refus {
+                return Err(format!(
+                    "airplay2: {}",
+                    self.message_refus_d_appairage(&refus.cause)
+                ));
+            }
             return Err(format!(
                 "airplay2: {}",
                 error.trim_start_matches("airplay2: ")
@@ -792,6 +889,8 @@ impl OutputTarget for Airplay2Output {
         self.paused.store(false, Ordering::SeqCst);
         *self.panne.lock().await = None;
         self.connexion_perdue.store(false, Ordering::SeqCst);
+        // #8347 — le démon meurt avec sa connexion coincée.
+        self.session_a_rouvrir.store(false, Ordering::SeqCst);
         self.send(&serde_json::json!({"cmd": "stop"})).await.ok();
         self.send(&serde_json::json!({"cmd": "disconnect"}))
             .await
@@ -825,15 +924,32 @@ impl OutputTarget for Airplay2Output {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        if !volume.is_finite() {
+            return Err(format!("airplay2: invalid volume {volume}"));
+        }
         let volume = volume.clamp(0.0, 1.0);
-        self.send(&serde_json::json!({
-            "cmd": "volume",
-            "level": volume,
-        }))
-        .await?;
-        *self.volume.lock().await = volume;
-        self.muted.store(false, Ordering::SeqCst);
-        Ok(())
+        // #8402 — sans démon (zone arrêtée), la consigne est gardée pour la
+        // session suivante au lieu d'être perdue en « daemon not running ».
+        let precedent = std::mem::replace(&mut *self.volume.lock().await, volume);
+        let sourdine = self.muted.swap(false, Ordering::SeqCst);
+        match self
+            .send(&serde_json::json!({
+                "cmd": "volume",
+                "level": volume,
+            }))
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if volume_de_depart_8402::sans_demon(&error) => {
+                info!(device = %self.name, volume, "airplay2: volume kept for the next session");
+                Ok(())
+            }
+            Err(error) => {
+                *self.volume.lock().await = precedent;
+                self.muted.store(sourdine, Ordering::SeqCst);
+                Err(error)
+            }
+        }
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
@@ -842,13 +958,22 @@ impl OutputTarget for Airplay2Output {
         } else {
             *self.volume.lock().await
         };
-        self.send(&serde_json::json!({
-            "cmd": "volume",
-            "level": vol,
-        }))
-        .await?;
-        self.muted.store(muted, Ordering::SeqCst);
-        Ok(())
+        let precedente = self.muted.swap(muted, Ordering::SeqCst);
+        match self
+            .send(&serde_json::json!({
+                "cmd": "volume",
+                "level": vol,
+            }))
+            .await
+        {
+            Ok(()) => Ok(()),
+            // #8402 — gardée aussi : la session suivante part en sourdine.
+            Err(error) if volume_de_depart_8402::sans_demon(&error) => Ok(()),
+            Err(error) => {
+                self.muted.store(precedente, Ordering::SeqCst);
+                Err(error)
+            }
+        }
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
@@ -1270,6 +1395,11 @@ mod transport_tests {
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
                 let name = command["cmd"].as_str().unwrap().to_string();
+                // #8402 — le volume de départ : le vrai démon n'y répond
+                // qu'un `volume_set` que la sortie ignore.
+                if name == "volume" {
+                    continue;
+                }
                 // #7084 — le relevé de position de `get_status` n'est pas une
                 // commande de transport : le vrai démon y répond `status`.
                 if name == "status" {
@@ -1335,6 +1465,11 @@ mod transport_tests {
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
                 notees.lock().await.push(command.clone());
+                // #8402 — noté, sans réponse : le vrai démon n'y répond qu'un
+                // `volume_set` que la sortie ignore.
+                if command["cmd"] == "volume" {
+                    continue;
+                }
                 let event = serde_json::json!({"event": "playing"});
                 let line = format!("{}\n", serde_json::to_string(&event).unwrap());
                 daemon_stdout.write_all(line.as_bytes()).await.unwrap();
@@ -1557,6 +1692,10 @@ mod transport_tests {
             let mut lines = BufReader::new(daemon_stdin).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // #8402 — le volume de départ ne pilote pas ces bancs.
+                if command["cmd"] == "volume" {
+                    continue;
+                }
                 notees.lock().await.push(command.clone());
                 let erreur = |m: &str| serde_json::json!({"event": "error", "message": m});
                 let event = match command["cmd"].as_str().unwrap() {
@@ -1712,6 +1851,10 @@ mod transport_tests {
             let mut lines = BufReader::new(daemon_stdin).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // #8402 — le volume de départ ne pilote pas ces bancs.
+                if command["cmd"] == "volume" {
+                    continue;
+                }
                 notees.lock().await.push(command.clone());
                 let event = if command["cmd"] == "pair_pin_start" {
                     // Simule le rejet HTTP 403 sur /pair-pin-start par le récepteur macOS (#6788)
@@ -1793,6 +1936,10 @@ mod transport_tests {
             let mut lines = BufReader::new(daemon_stdin).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // #8402 — le volume de départ ne pilote pas ces bancs.
+                if command["cmd"] == "volume" {
+                    continue;
+                }
                 notees.lock().await.push(command.clone());
                 let erreur = |m: &str| serde_json::json!({"event": "error", "message": m});
                 let event = match command["cmd"].as_str().unwrap() {
@@ -1876,6 +2023,10 @@ mod transport_tests {
             let mut lines = BufReader::new(daemon_stdin).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // #8402 — le volume de départ ne pilote pas ces bancs.
+                if command["cmd"] == "volume" {
+                    continue;
+                }
                 notees.lock().await.push(command.clone());
                 let event = match command["cmd"].as_str().unwrap() {
                     "pair_pin_start" => reponse_au_code.clone(),

@@ -1329,10 +1329,17 @@ impl PlaybackOrchestrator {
             cover_path: habillage.cover_path.clone(),
             // #7360/#6059 — la durée restante du flux PCM ou natif ne
             // raccourcit pas la piste annoncée aux clients après déplacement.
-            duration_ms: super::resolve_local::duree_piste_pcm_decodee(
-                resolved.duration_ms.unwrap_or(0),
+            // #8082 — un flux continu porte plusieurs pistes : la durée résolue
+            // est celle du flux, l'écran parle de la première piste.
+            duration_ms: crate::outputs::dlna_flux_continu::duree_de_la_premiere_piste(
                 resolved.stream_id.as_deref(),
             )
+            .or_else(|| {
+                super::resolve_local::duree_piste_pcm_decodee(
+                    resolved.duration_ms.unwrap_or(0),
+                    resolved.stream_id.as_deref(),
+                )
+            })
             .unwrap_or_else(|| {
                 crate::outputs::dlna_depart_natif::duree_de_la_piste(
                     resolved.duration_ms.unwrap_or(0),
@@ -1952,7 +1959,11 @@ impl PlaybackOrchestrator {
                         .flatten()
                         .and_then(|t| t.album_id)
                 }),
-                resolved.duration_ms.unwrap_or(0),
+                // #8082 — la piste, pas le flux continu entier.
+                crate::outputs::dlna_flux_continu::duree_de_la_premiere_piste(
+                    resolved.stream_id.as_deref(),
+                )
+                .unwrap_or(resolved.duration_ms.unwrap_or(0)),
                 req.zone_id,
                 habillage.cover_path.as_deref(),
                 session_profile_id,
@@ -4054,6 +4065,21 @@ impl PlaybackOrchestrator {
         state: &crate::playback::ZoneState,
         seek_start: std::time::Instant,
     ) -> OutputCommandResult<()> {
+        // #8082 — un flux continu porte plusieurs pistes : un `Seek` du
+        // renderer viserait la position dans le FLUX, pas dans la piste. Le
+        // flux est relancé depuis la piste en cours, à la position voulue.
+        if let Some(sid) = state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+            && crate::outputs::dlna_flux_continu::est_un_flux_continu(sid)
+        {
+            info!(zone_id, position_ms, "flux_continu_deplacement_par_relance");
+            return self
+                .replay_zone_at_position(zone_id, position_ms, "flux_continu")
+                .await
+                .map_err(|e| OutputCommandError::failed(OutputCommand::Seek, e));
+        }
         let original_position_ms = state.position_ms;
         // For streaming tracks on network outputs (DLNA, OpenHome, etc.),
         // the seek strategy depends on whether the stream session supports

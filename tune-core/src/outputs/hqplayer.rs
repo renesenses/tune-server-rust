@@ -376,6 +376,7 @@ impl HqplayerOutput {
                     tokio::time::timeout(ECOUTE_APRES_RECONNEXION, control.stream.readable()).await;
             }
             recueillir_les_octets_arrives(control);
+            retirer_les_status_pousses_hqplayer_3(&mut control.pending);
             if !control.pending.iter().all(u8::is_ascii_whitespace) {
                 warn!(
                     device = %self.name,
@@ -407,6 +408,18 @@ impl HqplayerOutput {
             }
             control.header_sent = true;
             let result = post_write(control, mode, &expected).await;
+            // #8395 — la réponse brute (tronquée), pour départager au
+            // prochain journal un `PlaylistAdd` refusé, un `Status` qui ne
+            // passe jamais à 2, ou une réponse prise pour une autre.
+            debug!(
+                device = %self.name,
+                cmd = %expected,
+                raw = %match &result {
+                    Ok(reply) => reply.chars().take(300).collect::<String>().replace('\n', "\\n"),
+                    Err(e) => format!("<erreur> {}", e.chars().take(300).collect::<String>()),
+                },
+                "hqplayer_recv"
+            );
             // Silence is compatible with v6 actions, but retaining this socket
             // would let a delayed v5 ack become the NEXT request's response.
             if !result.as_ref().is_ok_and(|reply| !reply.is_empty()) {
@@ -517,12 +530,20 @@ async fn post_write(
         PostWrite::ReadResponse => std::time::Duration::from_secs(5),
         PostWrite::Action(wait) => wait,
     };
-    let reply = match tokio::time::timeout(
-        wait,
-        read_xml_frame(&mut control.stream, &mut control.pending),
-    )
-    .await
-    {
+    // #8395 — HQPlayer 3 Desktop pousse ses `Status` (`min`/`sec`, sans
+    // `position`) dès que le moteur tourne, y compris entre un `Play` et son
+    // acquittement : on les saute au lieu de les prendre pour la réponse.
+    let lire = async {
+        loop {
+            let frame = read_xml_frame(&mut control.stream, &mut control.pending).await?;
+            if expected != "Status" && status_pousse_hqplayer_3(&frame) {
+                debug!(cmd = %expected, frame = %frame, "hqplayer_status_pousse_ignore");
+                continue;
+            }
+            return Ok::<_, String>(frame);
+        }
+    };
+    let reply = match tokio::time::timeout(wait, lire).await {
         Ok(reply) => reply?,
         Err(_) if matches!(mode, PostWrite::Action(_)) => return Ok(String::new()),
         Err(_) => return Err("hqplayer read timeout".into()),
@@ -725,6 +746,75 @@ fn extract_xml_attr(xml: &str, attr_name: &str) -> Option<String> {
     None
 }
 
+/// #8395 — un `Status` tel que HQPlayer 3 Desktop le pousse sans qu'on le
+/// demande (`<Status state="2" track="1" min="0" sec="2" clips="0"/>`) : sans
+/// `position`, avec `min` et `sec`. Les `Status` de HQPlayer 4+ (qui portent
+/// `position`) ne sont pas concernés : #7244/#7869 s'y appliquent inchangés.
+fn status_pousse_hqplayer_3(frame: &str) -> bool {
+    // Rien avant la racine : un octet parasite collé devant reste soumis à #7869.
+    frame.trim_start().starts_with("<Status")
+        && xml_root(frame).as_deref() == Some("Status")
+        && extract_xml_attr(frame, "position").is_none()
+        && position_min_sec(frame).is_some()
+}
+
+/// #8395 — retire de `pending` les `Status` HQPlayer 3 complets arrivés entre
+/// deux commandes : ils ne sont ni une réponse, ni une raison de rouvrir la
+/// connexion. Tout autre octet reste, et #7869 s'applique.
+fn retirer_les_status_pousses_hqplayer_3(pending: &mut Vec<u8>) {
+    loop {
+        let debut = pending
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(pending.len());
+        let Some(fin) = xml_boundary(&pending[debut..]).map(|n| debut + n) else {
+            return;
+        };
+        match std::str::from_utf8(&pending[debut..fin]) {
+            Ok(frame) if status_pousse_hqplayer_3(frame) => {
+                debug!(frame = %frame, "hqplayer_status_pousse_ignore");
+                pending.drain(..fin);
+            }
+            _ => return,
+        }
+    }
+}
+
+/// #8395 — la position d'un `Status` HQPlayer 3 (`min`×60 + `sec`), lue sur
+/// les attributs EXACTS de la racine : `extract_xml_attr` cherche une
+/// sous-chaîne, et `sec="` se trouverait aussi dans un `total_sec="`.
+/// Aucune des deux valeurs (ou une illisible) : position inconnue.
+fn position_min_sec(xml: &str) -> Option<f64> {
+    use quick_xml::{Reader, events::Event};
+    let mut reader = Reader::from_str(xml);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(tag) | Event::Empty(tag) => {
+                let mut min = None;
+                let mut sec = None;
+                for attribute in tag.attributes() {
+                    let attribute = attribute.ok()?;
+                    let cible = match attribute.key.as_ref() {
+                        b"min" => &mut min,
+                        b"sec" => &mut sec,
+                        _ => continue,
+                    };
+                    let valeur = attribute
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )
+                        .ok()?;
+                    *cible = Some(valeur.trim().parse::<u64>().ok()?);
+                }
+                return Some(min?.checked_mul(60)?.checked_add(sec?)? as f64);
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
 /// Extract text content between XML tags: `<tag>content</tag>`.
 fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}", tag);
@@ -914,8 +1004,14 @@ impl OutputTarget for HqplayerOutput {
             return Err("hqplayer_status_etat_inconnu: état Status absent ou non reconnu".into());
         };
         *self.dernier_etat() = Some(state);
+        // #8395 — HQPlayer 3 Desktop ne donne pas `position` : son `Status`
+        // porte `min` et `sec` (`<Status state="2" track="1" min="0" sec="2"
+        // clips="0"/>`, journal HQPlayer Desktop 3.18.2). Sans repli, la
+        // position restait à 0 et la garde de démarrage figé (#5522) ne
+        // partait jamais. HQPlayer 4+ (qui donne `position`) est inchangé.
         let position = extract_xml_attr(&response, "position")
             .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| position_min_sec(&response))
             .unwrap_or(0.0);
         let duration = extract_xml_attr(&response, "duration")
             .or_else(|| extract_xml_attr(&response, "length"))

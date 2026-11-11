@@ -95,6 +95,9 @@ async fn get_status_with_signal_path_bounded(
         // #6059 — un flux natif relancé à la position : le renderer compte
         // depuis le début de CE flux, on le rapporte à la piste.
         crate::outputs::dlna_depart_natif::corriger_le_statut(output.device_id(), &mut status);
+        // #8082 — un flux continu : la position rapportée à la piste en cours
+        // (après le départ de #6059, qui la ramène au début de la première).
+        crate::outputs::dlna_flux_continu::corriger_le_statut(output.device_id(), &mut status);
         let progress = if status.realtime {
             None
         } else {

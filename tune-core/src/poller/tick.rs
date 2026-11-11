@@ -2053,6 +2053,57 @@ impl PositionPoller {
             }
             ps.transition(fsm::Transition::PremierEchantillonPlausible);
 
+            // #8082 — flux continu : le renderer a franchi la frontière d'une
+            // piste DANS le flux (`outputs::dlna_flux_continu`, qui rapporte
+            // déjà la position à la nouvelle piste). Rien n'est envoyé au
+            // renderer : la file avance, l'écran, l'historique et le
+            // préchargement suivent, comme pour un enchaînement adopté.
+            if let Some((zone_du_plan, piste)) =
+                crate::outputs::dlna_flux_continu::prendre_le_passage(&device_id)
+                && zone_du_plan == zone_id
+            {
+                info!(
+                    zone_id,
+                    position = piste.position,
+                    track_id = piste.track_id,
+                    position_ms = status.position_ms,
+                    "flux_continu_passage_de_piste"
+                );
+                match self
+                    .orchestrator
+                    .avancer_dans_le_flux_continu(zone_id, &device_id, &piste)
+                    .await
+                {
+                    Ok(()) => {
+                        ps.gapless_sent = false;
+                        ps.gapless_sent_at = None;
+                        ps.gapless_armed = None;
+                        ps.stopped_ticks = 0;
+                        ps.past_end_ticks = 0;
+                        ps.peak_position_ms = status.position_ms;
+                        ps.last_position_ms = status.position_ms;
+                        ps.dernier_releve_de_position_at = Some(Instant::now());
+                        ps.last_bytes_sent = 0;
+                        ps.playing_stall_ticks = 0;
+                        ps.stall_declines = 0;
+                        ps.track_started_at = Some(Instant::now());
+                        ps.gapless_advance_pending = false;
+                        ps.gapless_stuck_ticks = 0;
+                        ps.transition(fsm::Transition::TransitionDetectee);
+                        ps.gapless_cooldown = 4;
+                        ps.scrobbled_key = None;
+                    }
+                    Err(e) => {
+                        // La file n'a pas suivi : le plan ne dit plus ce que
+                        // Tune affiche. On le quitte ; la fin du flux reprend
+                        // la file par le chemin normal.
+                        warn!(zone_id, error = %e, "flux_continu_passage_non_suivi");
+                        crate::outputs::dlna_flux_continu::oublier(&device_id);
+                    }
+                }
+                continue;
+            }
+
             // enough of the track was actually played before accepting a
             // gapless transition.  We update this BEFORE checking for resets
             // so the peak reflects the last known good position.
@@ -2163,8 +2214,19 @@ impl PositionPoller {
             // sondage suivant tranche — `Playing` près de zéro, c'était un
             // passage (adopté sans relance) ; toujours arrêté, la branche
             // `Stopped` retombe sur l'enchaînement par `Play`.
-            let chute_brute =
-                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent);
+            // #7293 — l'âge du relevé précédent : un relevé manqué (appareil
+            // lent sur une autre zone) élargit d'autant la fenêtre « près du
+            // début ». Sans relevé daté, la fenêtre reste celle d'un tick.
+            let ecart_depuis_le_releve_ms = ps
+                .dernier_releve_de_position_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let chute_brute = decisions::position_reset_apres_le_releve(
+                ps.last_position_ms,
+                status.position_ms,
+                ps.gapless_sent,
+                ecart_depuis_le_releve_ms,
+            );
             let chute_differee =
                 decisions::chute_a_differer_hors_lecture(chute_brute, status.state);
             if chute_differee {
@@ -2212,6 +2274,7 @@ impl PositionPoller {
             }
             if !chute_differee {
                 ps.last_position_ms = status.position_ms;
+                ps.dernier_releve_de_position_at = Some(Instant::now());
             }
             // #7922 — le temps rendu, hors grâce de déplacement et hors chute :
             // une chute de position est la piste suivante ou un recul.
@@ -3482,11 +3545,15 @@ impl PositionPoller {
                     // start of the next track.  The played_enough guard
                     // prevents false transitions when a renderer (DMP-A8)
                     // reports position < 5s immediately after SetNext.
-                    let position_confirms_transition = decisions::position_confirms_transition(
-                        played_enough,
-                        status.position_ms,
-                        track_duration_ms,
-                    );
+                    // #7293 — même marge que la retombée de position : un
+                    // relevé manqué ne cache plus un passage déjà fait.
+                    let position_confirms_transition =
+                        decisions::position_confirms_transition_apres_le_releve(
+                            played_enough,
+                            status.position_ms,
+                            track_duration_ms,
+                            ecart_depuis_le_releve_ms,
+                        );
                     fsm_pact.transition_detected = duration_changed && position_confirms_transition;
                     if duration_changed && position_confirms_transition {
                         let arm_to_advance_ms = ps

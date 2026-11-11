@@ -190,6 +190,12 @@ struct PatchZone {
     /// Sans abonnement tenu, l'option ne fait rien : la sortie retombe sur le
     /// sondage complet plutôt que de servir un état inventé.
     upnp_silence: Option<bool>,
+    /// #8082 — « Flux continu entre les pistes » (zones DLNA) : une suite de
+    /// pistes de la bibliothèque de même format part en UN seul WAV, pour les
+    /// renderers qui raccordent mal deux pistes (Eversolo DMP-A8). Persisté en
+    /// setting `zone_{id}_dlna_flux_continu` ; défaut off, clé supprimée à la
+    /// désactivation. Pris à la lecture suivante.
+    dlna_flux_continu: Option<bool>,
     /// #2991 — « Envoyer le titre radio par DLNA (pour les lecteurs qui
     /// ignorent l'ICY) ». `"off"` (défaut), `"next"` (`SetNextAVTransportURI`,
     /// sans coupure) ou `"reload"` (`SetAVTransportURI` sur la même URI,
@@ -367,6 +373,14 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("upnp_silence".into(), json!(upnp_silence));
+    // #8082 — toujours publié : sa présence dit au client que ce serveur
+    // connaît le réglage.
+    obj.insert(
+        "dlna_flux_continu".into(),
+        json!(tune_core::outputs::dlna_flux_continu::active(
+            backend, zone_id
+        )),
+    );
     // #2991 — le titre radio par DIDL. TOUJOURS publié : sa présence dit au
     // client que ce serveur connaît le réglage.
     obj.insert(
@@ -1708,6 +1722,9 @@ mod signal_path_gain_sortie_4384_tests;
 // #6166 — le WAV 32 bits interne d'une sortie locale n'est pas une conversion.
 #[cfg(test)]
 mod signal_path_conteneur_local_6166_tests;
+// #8149 — zone réseau : le suréchantillonnage ne s'applique pas, et le dit.
+#[cfg(test)]
+mod signal_path_surechantillonnage_reseau_8149_tests;
 // #6334 — un AAC Tidal servi en WAV se dit AAC, sans profondeur de bits.
 #[cfg(test)]
 mod signal_path_aac_tidal_6334_tests;
