@@ -10733,3 +10733,75 @@ async fn une_session_retiree_sans_abandon_pendant_l_envoi_n_arrete_rien_6658() {
     assert_eq!(output_error, None);
     assert_eq!(mock.stop_call_count(), 0, "rien ne doit arrêter la sortie");
 }
+
+#[tokio::test]
+async fn frequence_fixe_8428_services_traverse_les_familles() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("Fixed PCM", Some("local"), Some("local:8428"))
+        .unwrap();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let req = requete_locale_3234(zone_id, 1);
+    for source in [44_100, 48_000, 96_000, 176_400] {
+        let flux = flux_de_service_4759(source);
+        let (rate, _, wire) = orch.decider_le_wav_de_sortie(&req, &flux, true).unwrap();
+        assert_eq!(
+            rate, 48_000,
+            "la cadence fixe doit servir 48 kHz pour une source à {source} Hz"
+        );
+        assert_eq!(wire.sample_rate, rate);
+        assert_eq!(
+            orch.cadence_servie_pour_un_service(&req, &flux).unwrap(),
+            (source != 48_000).then_some(48_000)
+        );
+    }
+    settings
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    let (rate, _, _) = orch
+        .decider_le_wav_de_sortie(&req, &flux_de_service_4759(44_100), true)
+        .unwrap();
+    assert_eq!(rate, 44_100, "bit-perfect strict désactive la cadence fixe");
+}
+
+#[tokio::test]
+async fn frequence_fixe_8428_bibliotheque_decide_48_hors_famille() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed PCM", Some("local"), Some("local:8428-file"))
+        .unwrap();
+    piste_192k_3973(&orch);
+    orch.db
+        .execute("UPDATE tracks SET sample_rate = 44100 WHERE id = 1", &[])
+        .unwrap();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let sortie = orch
+        .format_de_sortie_pour_test(&requete_locale_3234(zone_id, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        sortie.out_sr, 48_000,
+        "le décodeur doit recevoir 48 kHz pour une piste 44,1 kHz"
+    );
+    let samples: Vec<f32> = (0..44_100)
+        .map(|i| (std::f32::consts::TAU * 997.0 * i as f32 / 44_100.0).sin() * 0.1)
+        .collect();
+    let pcm =
+        crate::audio::resample::rubato_resample_batch_exact(&samples, 44_100, sortie.out_sr, 1);
+    assert_eq!(
+        pcm.len(),
+        48_000,
+        "une seconde doit contenir 48000 trames, pas un en-tête renommé"
+    );
+    assert!(pcm.iter().all(|s| s.is_finite()));
+}

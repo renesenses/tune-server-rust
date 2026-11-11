@@ -268,3 +268,23 @@ async fn le_titre_radio_par_didl_se_regle_par_la_route() {
     assert_eq!(fiche(&app, id).await["dlna_radio_title"], json!("off"));
     assert_eq!(settings.get(&cle).unwrap(), None, "« off » supprime la clé");
 }
+
+#[tokio::test]
+async fn frequence_fixe_8428_route_persiste_efface_et_valide() {
+    let (app, _) = serveur();
+    let id = zone_dlna(&app).await;
+    assert_eq!(fiche(&app, id).await["fixed_sample_rate"], Value::Null);
+    let (statut, reponse) = patch(&app, id, json!({"fixed_sample_rate": 48000})).await;
+    assert_eq!(statut, StatusCode::OK, "{reponse}");
+    assert_eq!(
+        fiche(&app, id).await["fixed_sample_rate"],
+        json!(48000),
+        "la cadence fixe doit être persistée par le PATCH"
+    );
+    let (statut, _) = patch(&app, id, json!({"fixed_sample_rate": 0})).await;
+    assert_eq!(statut, StatusCode::BAD_REQUEST);
+    assert_eq!(fiche(&app, id).await["fixed_sample_rate"], json!(48000));
+    let (statut, _) = patch(&app, id, json!({"fixed_sample_rate": null})).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(fiche(&app, id).await["fixed_sample_rate"], Value::Null);
+}

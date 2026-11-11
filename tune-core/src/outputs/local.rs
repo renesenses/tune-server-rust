@@ -865,6 +865,7 @@ pub struct LocalOutput {
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
     /// piste par l'orchestrateur, comme `pure_bypass`. Défaut désarmé.
     strict_bitperfect: Arc<AtomicBool>,
+    fixed_sample_rate: AtomicU32,
     /// #6132 — la seconde sortie de la zone qui joue ici (nom du périphérique
     /// B), ou `None`. Posée par piste par l'orchestrateur depuis
     /// `zone_{id}_sortie_double`, lue une fois par `play_url`.
@@ -1490,6 +1491,7 @@ impl LocalOutput {
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
             pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
+            fixed_sample_rate: AtomicU32::new(0),
             seconde_sortie: std::sync::Mutex::new(Vec::new()),
             retard_de_depart_ms: AtomicU64::new(0),
             mono_downmix: Arc::new(AtomicBool::new(false)),
@@ -2101,6 +2103,11 @@ impl LocalOutput {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub fn set_fixed_sample_rate(&self, rate: Option<u32>) {
+        self.fixed_sample_rate
+            .store(rate.unwrap_or(0), Ordering::Relaxed);
     }
 
     pub fn set_strict_bitperfect(&self, strict: bool) {
@@ -6547,6 +6554,7 @@ impl OutputTarget for LocalOutput {
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
+        let fixed_sample_rate = self.fixed_sample_rate.load(Ordering::Relaxed);
         // #6132 — lue UNE fois par piste, comme `strict_bitperfect`.
         let seconde_sortie = self.secondes_sorties();
         // #8437 — lu UNE fois par piste : une transition gapless ne repasse
@@ -7917,6 +7925,28 @@ impl OutputTarget for LocalOutput {
             let peripherique_suit_la_source = backend.suit_la_cadence_source();
 
             let output_sr = sortie.cadence;
+            // #8428 — ne pas annoncer une cadence fixe si le système en ouvre une autre.
+            // Le DoP garde sa cadence de transport et n'est jamais rééchantillonné.
+            if fixed_sample_rate != 0
+                && !dop_active.load(Ordering::Relaxed)
+                && !is_dop_pcm(
+                    header_buf.get(data_offset..).unwrap_or_default(),
+                    bit_depth,
+                    channels,
+                )
+                && !pure_bypass.load(Ordering::Relaxed)
+                && !strict_bitperfect
+                && output_sr != fixed_sample_rate
+            {
+                if let Ok(mut slot) = open_failure.lock() {
+                    *slot = Some(format!(
+                        "Fixed output sample rate {} Hz unavailable: output opened at {} Hz",
+                        fixed_sample_rate, output_sr
+                    ));
+                }
+                playing.store(false, Ordering::SeqCst);
+                return;
+            }
             let output_ch = sortie.canaux;
             reaffectation.constater_l_ouverture(voies_de_la_matrice, output_ch, &device_name);
 

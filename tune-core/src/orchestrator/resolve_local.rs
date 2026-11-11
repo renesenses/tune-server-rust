@@ -1840,7 +1840,9 @@ impl PlaybackOrchestrator {
             sample_rate,
             zone_max_sample_rate,
             dsd_passthrough,
-        );
+        ) || (!dsd_passthrough
+            && crate::audio::frequence_fixe::active(&self.db, req.zone_id)
+                .is_some_and(|rate| rate != sample_rate));
         // Un égaliseur ACTIVÉ sur la zone doit s'entendre : en passthrough
         // réseau (FLAC servi brut à la Beoplay A9), l'EqProcessor n'était
         // jamais appliqué — profil « appliqué » côté UI, zéro effet audible
@@ -2731,6 +2733,16 @@ impl PlaybackOrchestrator {
                 );
                 out_sr = cible;
             }
+        }
+        if let Some(rate) =
+            crate::audio::frequence_fixe::cible(&self.db, req.zone_id, zone_max_sample_rate)?
+        {
+            // Le décimateur DSD actuel n'accepte que des rapports entiers.
+            // Ne jamais étiqueter 48 kHz un flux décimé à une autre cadence.
+            if src_fmt == AudioFormat::Dsd && !sample_rate.is_multiple_of(rate) {
+                return Err("Fixed PCM sample rate requires an integer DSD decimation ratio; disable the fixed rate for this DSD track".into());
+            }
+            out_sr = rate;
         }
         let out_bd: u16 = if local_needs_wav {
             // Local output (cpal/WASAPI): always use 32-bit WAV.

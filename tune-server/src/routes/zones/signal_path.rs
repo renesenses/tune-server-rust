@@ -1748,6 +1748,7 @@ fn assembler_les_etapes_lang(
         oaat_transcodes,
         wire_wav,
         max_sample_rate,
+        cadence_pcm_servie,
         // #4354 — la description des étapes n'en a pas besoin : le drapeau ne
         // sert qu'au verdict de transport et au badge PURE.
         dsd_decime_en_pcm: _,
@@ -2026,6 +2027,15 @@ fn assembler_les_etapes_lang(
     // c'est elle que le client affiche « 192 → 96 kHz, pas bit-perfect », et
     // elle qui fait dire « PURE dégradé » (`pure_degraded`).
     let mut rate_conversion: Option<(u32, u32)> = None;
+    if let Some(rate) = cadence_pcm_servie.filter(|rate| *rate != sample_rate as u32) {
+        rate_conversion = Some((sample_rate as u32, rate));
+        steps.push(json!({
+            "name": "Resampler", "code": "rate_conversion",
+            "from_hz": sample_rate, "to_hz": rate,
+            "description": format!("{} kHz → {} kHz", sample_rate as f64 / 1000.0, rate as f64 / 1000.0),
+            "bit_perfect": false,
+        }));
+    }
     if let Some((t, (filtre, reserve_db))) = reel
         .filter(|t| t.reechantillonnage())
         .and_then(|t| t.surechantillonnage().map(|s| (t, s)))
@@ -2052,7 +2062,9 @@ fn assembler_les_etapes_lang(
             "description": fs(lang, "measured", &[&format!("{src_khz}kHz → {dst_khz}kHz")]),
             "bit_perfect": false,
         }));
-    } else if let Some(max_sr) = max_sample_rate.filter(|_| resampling_active) {
+    } else if let Some(max_sr) =
+        max_sample_rate.filter(|_| resampling_active && rate_conversion.is_none())
+    {
         // #5524 — la cadence SERVIE (même famille sous le plafond), celle
         // de la décision : 176,4 sous 96 s'annonce « → 88,2 kHz », pas 96.
         let cible =
@@ -2504,15 +2516,18 @@ fn rendre_les_verdicts(
     // ouvert, c'est ELLE qui dit s'il y a eu rééchantillonnage — dans les
     // deux sens. Le plafond n'est plus qu'une prédiction, utile seulement
     // tant que personne n'a mesuré.
-    let resampling_active = match transformations_reelles {
-        Some(reel) => reel.reechantillonnage(),
-        None => {
-            !is_dsd
-                && forcages
-                    .max_sample_rate
-                    .is_some_and(|max| (sample_rate as u32) > max)
-        }
-    };
+    let resampling_active = forcages
+        .cadence_pcm_servie
+        .is_some_and(|rate| rate != sample_rate as u32)
+        || match transformations_reelles {
+            Some(reel) => reel.reechantillonnage(),
+            None => {
+                !is_dsd
+                    && forcages
+                        .max_sample_rate
+                        .is_some_and(|max| (sample_rate as u32) > max)
+            }
+        };
     // Un DSP ou une adaptation de canaux DÉCLARÉS par la sortie font tomber
     // le verdict, quoi que les réglages aient prédit ; leur absence ne le
     // relève jamais — la sortie n'observe pas ce que fait l'orchestrateur
@@ -2891,6 +2906,8 @@ struct Forcages {
     /// Plafond de fréquence EFFECTIF : réglage de zone et catalogue d'appareils
     /// combinés en `min`, comme `resolve_local_track` (#3183).
     max_sample_rate: Option<u32>,
+    /// Cadence constatée dans la session PCM, avant le périphérique (#8428).
+    cadence_pcm_servie: Option<u32>,
     /// #4354 — le DSD est-il DÉCIMÉ en PCM multibit ?
     ///
     /// Vrai seulement pour une conversion de domaine réelle : ni le DSD servi
@@ -3123,6 +3140,9 @@ fn decider_les_forcages(
         oaat_transcodes,
         wire_wav,
         max_sample_rate,
+        cadence_pcm_servie: wire
+            .filter(|w| !is_dsd && sample_rate > 0 && w.sample_rate > 0)
+            .map(|w| w.sample_rate),
         dsd_decime_en_pcm,
     }
 }

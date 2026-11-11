@@ -155,6 +155,16 @@ fn valider_le_patch(
     zone_before: &Zone,
     body: &PatchZone,
 ) -> Result<Option<f64>, axum::response::Response> {
+    if let Some(Some(rate)) = body.fixed_sample_rate
+        && !tune_core::audio::frequence_fixe::CADENCES.contains(&rate)
+    {
+        return Err(refus_de_valeur(
+            id,
+            "fixed_sample_rate",
+            &rate.to_string(),
+            "unsupported PCM sample rate",
+        ));
+    }
     // Les valeurs que cette route peut juger seule, avant toute écriture : un
     // PATCH est atomique du point de vue de l'utilisateur, il ne doit pas
     // laisser la moitié de ses champs écrits derrière lui.
@@ -881,6 +891,16 @@ async fn persister_le_son(
         // changerait rien avant la piste suivante (#1725, #1786). Or ce
         // réglage-ci se vérifie précisément à l'oreille, musique en cours.
         state.orchestrator.refresh_zone_mono_downmix(id).await;
+    }
+    if let Some(rate) = body.fixed_sample_rate {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::audio::frequence_fixe::cle_de_zone(id);
+        let r = match rate {
+            Some(rate) => settings.set(&key, &rate.to_string()),
+            None => settings.delete(&key),
+        };
+        ecrire!("fixed_sample_rate", format!("{rate:?}"), r);
+        state.orchestrator.refresh_zone_upsampler(id).await;
     }
     // #3973 — « bit-perfect strict » → setting zone_{id}_strict_bitperfect.
     // Même forme que `mono_downmix` : clé supprimée à la désactivation, pour

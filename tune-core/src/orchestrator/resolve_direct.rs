@@ -1126,6 +1126,7 @@ impl PlaybackOrchestrator {
         let err_zone = req.zone_id;
         // #3973 — lu avant la tâche détachée, comme la zone elle-même.
         let radio_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
+        let frequence_fixe = crate::audio::frequence_fixe::active(&self.db, req.zone_id);
         let err_station = title.clone();
         // #3756 — de quoi RETENIR l'échec, pas seulement le dire. Le sondeur
         // ne voit que le `Ok` de `play()` ; sans cette mémoire il relance une
@@ -1139,7 +1140,7 @@ impl PlaybackOrchestrator {
             // Download + decode in a blocking thread since symphonia and
             // reqwest::blocking are both synchronous.
             let result = tokio::task::spawn_blocking(move || {
-                decode_radio_stream_to_pcm_avec_profondeur(
+                decode_radio_stream_to_pcm_avec_cadence(
                     radio_url,
                     radio_replis,
                     tx,
@@ -1154,6 +1155,7 @@ impl PlaybackOrchestrator {
                     radio_strict,
                     en_vol,
                     is_local_output,
+                    frequence_fixe,
                 )
             })
             .await;
@@ -2040,7 +2042,8 @@ impl PlaybackOrchestrator {
         let needs_proxy = req.output_device_id.is_some()
             || is_browser_output
             || !reliable_ext
-            || radio_eq_profile.is_some();
+            || radio_eq_profile.is_some()
+            || crate::audio::frequence_fixe::active(&self.db, req.zone_id).is_some();
 
         if needs_proxy {
             let wav_info = StreamInfo {
@@ -2089,6 +2092,7 @@ impl PlaybackOrchestrator {
             let err_zone = req.zone_id;
             // #3973 — lu avant la tâche détachée, comme la zone elle-même.
             let radio_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
+            let frequence_fixe = crate::audio::frequence_fixe::active(&self.db, req.zone_id);
             let err_station = title.clone();
             // #3756 — même mémoire que le chemin local/OAAT. Le journal du
             // ticket vient d'une sortie ALSA, mais rien dans la boucle de
@@ -2100,7 +2104,7 @@ impl PlaybackOrchestrator {
             let radio_replis = super::radio_replis_8110::replis_retenus(req.source_id.as_deref());
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    decode_radio_stream_to_pcm_avec_profondeur(
+                    decode_radio_stream_to_pcm_avec_cadence(
                         radio_url,
                         radio_replis,
                         tx,
@@ -2111,6 +2115,7 @@ impl PlaybackOrchestrator {
                         radio_strict,
                         Some(en_vol),
                         false,
+                        frequence_fixe,
                     )
                 })
                 .await;

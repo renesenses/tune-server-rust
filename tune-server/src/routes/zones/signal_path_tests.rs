@@ -5590,3 +5590,25 @@ fn l_etape_se_nomme_crosstalk_quand_crosstalk_est_en_service_7616() {
         );
     }
 }
+
+#[test]
+fn frequence_fixe_8428_chemin_de_signal_decrit_le_pcm_servi() {
+    let (backend, zone) = dlna_zone();
+    let ps = en_lecture(1, "flac", 44_100, 24);
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "",
+        Some(&wire("wav", 48_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(
+        resampler_to_hz(&sp),
+        Some(48_000),
+        "le chemin doit annoncer la conversion 44,1 → 48 kHz : {sp}"
+    );
+    assert_eq!(verdict(&sp), Some(false));
+    assert!(step_desc(&sp, "Resampler").unwrap().contains("44.1"));
+}
