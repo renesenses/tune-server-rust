@@ -119,6 +119,49 @@ pub(super) fn select_stream(
     country: Option<&str>,
     preferred: Option<&str>,
 ) -> Option<FluxAnnuaire> {
+    let choisi = |f: &FluxAnnuaire| {
+        preferred.is_some_and(|p| super::flux_normalise(p) == super::flux_normalise(&f.url))
+    };
+    flux_autorises(fiche, country, preferred)
+        .into_iter()
+        .rev()
+        .max_by_key(|f| (choisi(f), rang(f)))
+}
+
+/// #8110 — les flux de la fiche que la lecture peut essayer après `url`,
+/// quand le diffuseur refuse celui-ci : les autres flux autorisés pour le pays
+/// d'écoute, du meilleur au moins bon ([`rang`]), sans `url` lui-même. Vide
+/// quand `url` n'est le flux d'aucune fiche, ou que la fiche n'a pas d'autre
+/// flux autorisé.
+pub(crate) fn replis_autorises(state: &AppState, url: &str) -> Vec<String> {
+    let Ok(fiches) = state.annuaire_radios.read() else {
+        return Vec::new();
+    };
+    let Some(fiche) = fiches
+        .iter()
+        .find(|f| super::super::radios_annuaire::flux_de_la_fiche(f, url))
+    else {
+        return Vec::new();
+    };
+    let country = listener_country(state);
+    let joue = super::flux_normalise(url);
+    let mut flux: Vec<FluxAnnuaire> = flux_autorises(fiche, country.as_deref(), Some(url))
+        .into_iter()
+        .filter(|f| super::flux_normalise(&f.url) != joue)
+        .collect();
+    // Tri stable : l'ordre de la fiche départage les ex æquo, comme
+    // `flux_proposes`.
+    flux.sort_by_key(|f| std::cmp::Reverse(rang(f)));
+    flux.into_iter().map(|f| f.url).collect()
+}
+
+/// Les flux de la fiche que le pays d'écoute permet, dans l'ordre de la fiche
+/// — le filtre de [`select_stream`], partagé avec [`replis_autorises`].
+fn flux_autorises(
+    fiche: &StationAnnuaire,
+    country: Option<&str>,
+    preferred: Option<&str>,
+) -> Vec<FluxAnnuaire> {
     let country = country.and_then(country_code);
     let streams = if !fiche.streams_declared && fiche.flux.is_empty() {
         fiche.flux_proposes()
@@ -136,7 +179,6 @@ pub(super) fn select_stream(
     let flux_libre = streams.iter().any(|f| f.restricted_to_countries.is_empty());
     streams
         .into_iter()
-        .rev()
         .filter(|f| {
             match permis_dans_le_pays(&f.restricted_to_countries, country.as_deref()) {
                 Some(permis) => permis,
@@ -149,7 +191,7 @@ pub(super) fn select_stream(
                 None => flux_libre && choisi(f),
             }
         })
-        .max_by_key(|f| (choisi(f), rang(f)))
+        .collect()
 }
 
 /// #7515 — le flux que la lecture prendra sans choix de l'auditeur, et ce que
@@ -388,3 +430,7 @@ mod tests;
 #[cfg(test)]
 #[path = "radios_debit_ecoute_7721_tests.rs"]
 mod debit_ecoute_tests;
+
+#[cfg(test)]
+#[path = "radios_repli_8110_tests.rs"]
+mod repli_8110_tests;

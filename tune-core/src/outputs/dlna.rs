@@ -2653,6 +2653,8 @@ impl OutputTarget for DlnaOutput {
         self.arrete_au_lieu_de_pause.store(false, Ordering::SeqCst);
         // #6059 — le départ que porte l'URL (flux natif relancé à la position).
         super::dlna_depart_natif::noter_url_posee(&self.device_id, media.url);
+        // #8082 — une autre URI que celle du flux continu en retire le plan.
+        super::dlna_flux_continu::noter_url_posee(&self.device_id, media.url);
         // Les abonnements de la piste précédente d'abord : sans ce retrait,
         // chaque lecture en empilerait deux de plus dans le récepteur, tous
         // renouvelés toutes les 250 s pour un flux mort.

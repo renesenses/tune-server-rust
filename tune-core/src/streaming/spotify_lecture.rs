@@ -230,6 +230,63 @@ pub const SENTINELLE_NON_ACTIVEE: &str = "spotify_playback_disabled:";
 /// (`v2Settings.ts`, `min: 'intermediate'`, pastille « Avancé »).
 pub const MOTIF_NON_ACTIVEE: &str = "Lecture Spotify non activée (Réglages › Accès et jetons › Spotify Connect › « Lecture Spotify (expérimental) », niveau Avancé)";
 
+/// #8154 — code stable du refus « liaison Spotify Connect requise » : Spotify
+/// a refusé le jeton de Tune à librespot, et le geste qui débloque est connu
+/// (choisir une fois l'appareil de Tune dans l'application Spotify).
+pub const CODE_LIAISON_REQUISE: &str = "spotify_liaison_connect_requise";
+
+/// #8154 — préfixe de ce refus, reconnu par la route de lecture qui le rend
+/// en 409 avec [`CODE_LIAISON_REQUISE`] au lieu d'une « Erreur de lecture ».
+pub const SENTINELLE_LIAISON_REQUISE: &str = "spotify_liaison_connect_requise:";
+
+/// Séparateur des champs de la sentinelle : ni un nom d'appareil ni un motif
+/// ne le contiennent.
+const SEPARATEUR_LIAISON: char = '\u{1f}';
+
+/// #8154 — ce que la route de lecture doit savoir pour dire quoi faire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiaisonRequise {
+    /// Le nom de l'appareil à choisir dans l'application Spotify.
+    pub appareil: String,
+    /// librespot tourne-t-il, prêt à recevoir la liaison ? Sinon, l'écran
+    /// propose « Activer le récepteur ».
+    pub recepteur_actif: bool,
+    /// Le motif technique complet (raison de librespot, binaire lancé).
+    pub detail: String,
+}
+
+impl LiaisonRequise {
+    /// La forme d'erreur que rend `ouvrir` ; le motif reste lisible en fin.
+    pub fn en_sentinelle(&self) -> String {
+        let s = SEPARATEUR_LIAISON;
+        format!(
+            "{SENTINELLE_LIAISON_REQUISE}{}{s}{}{s}{}",
+            if self.recepteur_actif { "1" } else { "0" },
+            self.appareil,
+            self.detail
+        )
+    }
+
+    /// Relit la sentinelle n'importe où dans l'erreur (l'orchestrateur la
+    /// préfixe de « source « spotify » : »).
+    pub fn depuis_sentinelle(e: &str) -> Option<Self> {
+        let debut = e.find(SENTINELLE_LIAISON_REQUISE)? + SENTINELLE_LIAISON_REQUISE.len();
+        let mut champs = e[debut..].splitn(3, SEPARATEUR_LIAISON);
+        let recepteur_actif = match champs.next()? {
+            "1" => true,
+            "0" => false,
+            _ => return None,
+        };
+        let appareil = champs.next()?.to_string();
+        let detail = champs.next().unwrap_or_default().to_string();
+        Some(Self {
+            appareil,
+            recepteur_actif,
+            detail,
+        })
+    }
+}
+
 /// Le réglage est-il activé ? Absent ou illisible : non.
 pub fn lecture_activee(db: &Arc<dyn crate::db::backend::DbBackend>) -> bool {
     crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
@@ -317,7 +374,7 @@ impl FournisseurPcm for FournisseurSpotify {
                 {
                     rt.block_on(self.recepteur.relancer_pour_la_liaison());
                 }
-                return Err(motif_echec_librespot(
+                let motif = motif_echec_librespot(
                     &erreur,
                     portee,
                     &ContexteDeLibrespot {
@@ -325,7 +382,21 @@ impl FournisseurPcm for FournisseurSpotify {
                         appareil: self.recepteur.device_name(),
                         dossier_identifiants: dossier.as_deref(),
                     },
-                ));
+                );
+                // #8154 — le geste qui débloque est connu (choisir l'appareil
+                // dans l'application Spotify) : un code stable le porte
+                // jusqu'à l'écran, au lieu d'une « Erreur de lecture ». La
+                // liaison sans portée `streaming` garde son motif (reconnecter).
+                if est_un_refus_d_identifiants(&erreur) && portee != Some(false) {
+                    let recepteur_actif = rt.block_on(self.recepteur.recepteur_actif());
+                    return Err(LiaisonRequise {
+                        appareil: self.recepteur.device_name().to_string(),
+                        recepteur_actif,
+                        detail: motif,
+                    }
+                    .en_sentinelle());
+                }
+                return Err(motif);
             }
             return Err(e);
         }
@@ -862,6 +933,56 @@ exit 1
             refus.contains("Reconnecter Spotify") && refus.contains("streaming"),
             "{refus}"
         );
+    }
+
+    /// #8154 — le refus du jeton de Tune (liaison complète, ou portée
+    /// inconnue) porte le code stable de la liaison Spotify Connect, avec
+    /// l'appareil à choisir : l'écran peut dire quoi faire au lieu de
+    /// « Erreur de lecture ». Le motif technique reste dans le détail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_8154_refus_du_jeton_porte_le_code_de_liaison() {
+        for portee in [Some(true), None] {
+            let (refus, binaire) = tokio::task::spawn_blocking(move || refus_6933(portee))
+                .await
+                .unwrap();
+            let enveloppe = format!("source « spotify » : {refus}");
+            let liaison = LiaisonRequise::depuis_sentinelle(&enveloppe).unwrap_or_else(|| {
+                panic!("{portee:?} : le refus ne porte pas {CODE_LIAISON_REQUISE} : {refus}")
+            });
+            assert_eq!(liaison.appareil, "Tune");
+            assert!(
+                liaison.detail.contains("INVALID_CREDENTIALS") && liaison.detail.contains(&binaire),
+                "{portee:?} : le détail perd la raison de librespot : {}",
+                liaison.detail
+            );
+        }
+    }
+
+    /// #8154 — sans la portée `streaming`, le geste est de reconnecter le
+    /// compte, pas de choisir l'appareil : pas de code de liaison.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_8154_sans_portee_streaming_pas_de_code_de_liaison() {
+        let (refus, _) = tokio::task::spawn_blocking(|| refus_6933(Some(false)))
+            .await
+            .unwrap();
+        assert!(
+            LiaisonRequise::depuis_sentinelle(&refus).is_none(),
+            "{refus}"
+        );
+    }
+
+    #[test]
+    fn spotify_8154_la_sentinelle_se_relit() {
+        for recepteur_actif in [true, false] {
+            let l = LiaisonRequise {
+                appareil: "Tune: salon".into(),
+                recepteur_actif,
+                detail: "librespot : « INVALID_CREDENTIALS »".into(),
+            };
+            let e = format!("source « spotify » : {}", l.en_sentinelle());
+            assert_eq!(LiaisonRequise::depuis_sentinelle(&e), Some(l));
+        }
+        assert!(LiaisonRequise::depuis_sentinelle("decode timeout").is_none());
     }
 
     #[test]
