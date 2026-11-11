@@ -2807,6 +2807,12 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "correction_pure_classix",
         up: include_str!("../../migrations/radios/correction_pure_classix_8119.sql"),
     },
+    // #8239 — le relevé de la synchro cloud (`sync_releve_*`) : la fin d'un
+    // scan ne journalise que la différence avec lui, plus toute la
+    // bibliothèque. Jumelle PG : 110.
+    // Numérotée 144 / PG 110, après #8240 (radios, 143 / PG 109) fusionnée
+    // dans le lot le 10/11.
+    Migration { version: 144, name: "sync_releve", up: include_str!("../../migrations/sync_releve.sql") },
     // #8090 — le pays de l'ARTISTE, lu sur sa fiche MusicBrainz :
     // `artists.country` (code ISO 3166-1 alpha-2, '' quand MusicBrainz n'en
     // donne aucun) et `artists.country_mbid`, le MBID dont il a été lu — un
@@ -5993,7 +5999,15 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
              VALUES (109, 'correction_pure_classix') \
              ON CONFLICT (version) DO NOTHING;\n"
         ),
-    ), // Jumelle de la SQLite 146 (#8090) : `artists.country` et
+    ),
+    // Jumelle de la SQLite 144 (#8239) : le relevé de la synchro cloud, même
+    // DDL (`migrations/sync_releve.sql`).
+    (
+        110,
+        "sync_releve",
+        include_str!("../../migrations/postgres/110_sync_releve.sql"),
+    ),
+    // Jumelle de la SQLite 146 (#8090) : `artists.country` et
     // `artists.country_mbid`, le pays de l'artiste lu sur MusicBrainz.
     (
         112,
@@ -9683,6 +9697,8 @@ mod tests {
         // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
         // Migration de DONNÉES : le nom, le pays et le genre de la station
         // semée sous « PureClassic Radio ».
+        // 110 : `sync_releve` (#8239), jumelle de la SQLite 144. Crée le
+        // relevé de la synchro cloud, que la fin de chaque scan NOMME.
         // 112 : `artists_country` (#8090), jumelle de la SQLite 146. Pose
         // `artists.country` et `artists.country_mbid`, que les facettes et la
         // passe de fond NOMMENT.

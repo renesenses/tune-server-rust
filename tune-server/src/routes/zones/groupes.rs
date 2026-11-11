@@ -21,7 +21,7 @@ pub(super) struct CreateGroup {
 /// Kept separate from the HTTP layer so the rules can be unit-tested without a
 /// database, and so every refusal is forced to carry the words explaining it.
 #[derive(Debug, PartialEq)]
-pub(super) enum GroupRefusal {
+pub(crate) enum GroupRefusal {
     /// Fewer than two *distinct* zones.
     NotEnoughZones,
     /// A zone id that no longer exists (stale list on the client's side).
@@ -33,8 +33,16 @@ pub(super) enum GroupRefusal {
     /// message can say *which* zones clash.
     SameOutput(String, String),
     /// #6132 — deux zones locales de la machine, sous ASIO : le pilote ne
-    /// tient qu'un flux par machine, « une zone à la fois ».
+    /// tient qu'un flux par machine, « une zone à la fois ». Depuis #7759,
+    /// création et extension refusent avant ([`GroupRefusal::AsioUnsupported`]) ;
+    /// ne reste que le recalcul de la sortie double.
     AsioOneZoneAtATime(String, String),
+    /// #7759 — décision de Bertrand du 11/11 : la lecture groupée n'est
+    /// possible qu'en WASAPI. Un membre dont la sortie s'ouvre en ASIO (nommé
+    /// ici) suffit à refuser le groupe, quelle que soit la forme du groupe :
+    /// en ASIO le groupe perdait le gapless et coupait quelques secondes
+    /// (Didier, fil 2215), et le testeur préfère un refus à un mode dégradé.
+    AsioUnsupported(String),
 }
 
 /// #6132 — les sorties suiveuses d'un groupe : le meneur est une zone locale,
@@ -80,6 +88,161 @@ pub(super) fn refus_asio(
     let asio = |b: Option<&str>| b.is_some_and(|b| b.eq_ignore_ascii_case("asio"));
     (asio(backend_meneur) || asio(backend_suiveur))
         .then(|| GroupRefusal::AsioOneZoneAtATime(nom_meneur.to_string(), nom_suiveur.to_string()))
+}
+
+/// #7759 — le premier membre du groupe dont la sortie s'ouvre en ASIO, ou
+/// `None`. `backends` donne, dans l'ordre du groupe, `(nom de la zone,
+/// backend ouvrable de sa sortie)` ; une sortie réseau n'a pas de backend
+/// local (`None`) et n'est jamais refusée ici.
+pub(super) fn membre_asio(backends: &[(String, Option<String>)]) -> Option<GroupRefusal> {
+    backends
+        .iter()
+        .find(|(_, b)| {
+            b.as_deref()
+                .is_some_and(|b| b.trim().eq_ignore_ascii_case("asio"))
+        })
+        .map(|(nom, _)| GroupRefusal::AsioUnsupported(nom.clone()))
+}
+
+/// #7759 — refuser un groupe dont un membre sort par ASIO. Le backend est
+/// celui de [`backend_de_la_sortie`] : la sortie enregistrée d'abord, le
+/// backend réglé pour la machine pour une sortie locale pas encore vue.
+pub(crate) async fn refus_du_groupe_asio(
+    state: &AppState,
+    zone_ids: &[i64],
+    zones: &[Zone],
+) -> Option<GroupRefusal> {
+    let mut backends = Vec::with_capacity(zone_ids.len());
+    for id in zone_ids {
+        let sortie = zones
+            .iter()
+            .find(|z| z.id == Some(*id))
+            .and_then(|z| z.output_device_id.clone());
+        backends.push((
+            nom_de_zone(zones, *id),
+            backend_de_la_sortie(state, sortie.as_deref()).await,
+        ));
+    }
+    membre_asio(&backends)
+}
+
+/// #7759 — parmi `groups`, ceux qu'il faut défaire : un membre dont la sortie
+/// ENREGISTRÉE s'ouvre en ASIO. Rend `(index du groupe, zone ASIO)`.
+///
+/// `backend_enregistre` ne connaît que les sorties présentes au registre, sans
+/// repli sur le réglage de la machine : défaire est irréversible, et une
+/// sortie absente (DAC débranché, « Speakers » WASAPI enregistré plus tard
+/// sur une machine réglée en ASIO, réglage `asio` hérité hors Windows) ne
+/// doit jamais coûter un groupe valide. Le repli reste bon pour REFUSER une
+/// création, que l'utilisateur peut corriger sur-le-champ.
+pub(super) fn groupes_a_defaire(
+    groups: &[Value],
+    zones: &[Zone],
+    backend_enregistre: &std::collections::HashMap<i64, String>,
+) -> Vec<(usize, String)> {
+    groups
+        .iter()
+        .enumerate()
+        .filter_map(|(i, g)| {
+            let backends: Vec<(String, Option<String>)> = g["zone_ids"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| (nom_de_zone(zones, id), backend_enregistre.get(&id).cloned()))
+                .collect();
+            match membre_asio(&backends) {
+                Some(GroupRefusal::AsioUnsupported(zone)) => Some((i, zone)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// #7759 — défaire chaque groupe enregistré dont un membre sort désormais par
+/// ASIO. Rend les numéros des groupes défaits.
+///
+/// Pourquoi défaire, et pourquoi ici : le choix ASIO/WASAPI est un réglage de
+/// la machine, et les sorties locales ne s'ouvrent sous le nouveau backend
+/// qu'au démarrage suivant (ou à la bascule à chaud d'un repli WASAPI vers
+/// ASIO, #5353). C'est donc au démarrage, et après cette bascule, que la
+/// zone « passe en ASIO » pour de bon. Garder le groupe en le signalant
+/// laisserait le mode dégradé que le testeur refuse ; le refuser ne se peut
+/// plus, il existe déjà. On le défait, comme le ferait « Dégrouper » : les
+/// zones rejouent chacune de leur côté, rien d'autre n'est touché. Seules
+/// les sorties enregistrées comptent ([`groupes_a_defaire`]).
+pub async fn defaire_les_groupes_asio(state: &AppState) -> Vec<i64> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let mut groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let zones = ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap_or_default();
+    let mut backend_enregistre = std::collections::HashMap::new();
+    for z in &zones {
+        if let Some(id) = z.id
+            && let Some(b) = crate::routes::zones::backend_de_la_sortie_de_la_zone(
+                state,
+                z.output_device_id.as_deref(),
+            )
+            .await
+        {
+            backend_enregistre.insert(id, b);
+        }
+    }
+    defaire_les_groupes_selon(state, &settings, &mut groups, &zones, &backend_enregistre)
+}
+
+/// Le corps de [`defaire_les_groupes_asio`], les backends donnés.
+pub(super) fn defaire_les_groupes_selon(
+    state: &AppState,
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    groups: &mut Vec<Value>,
+    zones: &[Zone],
+    backend_enregistre: &std::collections::HashMap<i64, String>,
+) -> Vec<i64> {
+    let a_defaire = groupes_a_defaire(groups, zones, backend_enregistre);
+    if a_defaire.is_empty() {
+        return Vec::new();
+    }
+    let mut defaits = Vec::new();
+    for (i, zone) in a_defaire.iter().rev() {
+        let mut group = groups.remove(*i);
+        if let Some(meneur) = group["leader_id"].as_i64().or_else(|| {
+            group["zone_ids"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(Value::as_i64)
+        }) {
+            poser_la_sortie_double(settings, &mut group, meneur, Vec::new());
+        }
+        let gid = group.get("id").and_then(Value::as_i64);
+        warn!(
+            group_id = ?gid,
+            zone = %zone,
+            "groupe_asio_defait — la lecture groupée n'est possible qu'en WASAPI (#7759)"
+        );
+        if let Some(gid) = gid {
+            defaits.push(gid);
+        }
+    }
+    if let Ok(texte) = serde_json::to_string(&*groups) {
+        settings.set("zone_groups", &texte).ok();
+    }
+    for id in &defaits {
+        state.event_bus.emit_typed(
+            tune_core::event_types::EventType::GroupDeleted,
+            json!({ "id": id, "reason": "group_asio_unsupported" }),
+        );
+    }
+    defaits
 }
 
 /// Le nom d'une zone, pour un message.
@@ -172,6 +335,9 @@ fn poser_la_sortie_double(
 /// l'utilisateur. Un groupe qu'ASIO interdit perd sa sortie double, sans
 /// être supprimé : il reste un groupe de volume, comme avant.
 pub async fn recalculer_les_sorties_doubles(state: &AppState) {
+    // #7759 — un groupe dont un membre sort désormais par ASIO est défait
+    // avant tout recalcul.
+    defaire_les_groupes_asio(state).await;
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -257,38 +423,48 @@ pub(super) fn validate_group(zone_ids: &[i64], zones: &[Zone]) -> Result<Vec<i64
 
 /// Turn a refusal into the error envelope the web client understands:
 /// `error` is the machine code, `message` the sentence it displays.
-pub(super) fn group_refusal_response(
+pub(crate) fn group_refusal_response(
     refusal: &GroupRefusal,
     lang: &str,
 ) -> axum::response::Response {
-    let (status, code, message) = match refusal {
+    // `message_key` et `params` (#7077) : le client web n'affiche la phrase du
+    // serveur que si elle se dit traduite ; sans eux, il montrait « le serveur
+    // n'a pas pu traiter la demande » à la place de la raison du refus.
+    let (status, code, cle, params): (StatusCode, &str, &str, Vec<(&str, String)>) = match refusal {
         GroupRefusal::NotEnoughZones => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "group_needs_two_zones",
-            crate::i18n::t(lang, "zonegroup.needsTwoZones"),
+            "zonegroup.needsTwoZones",
+            Vec::new(),
         ),
         GroupRefusal::UnknownZone(id) => (
             StatusCode::NOT_FOUND,
             "group_unknown_zone",
-            crate::i18n::t(lang, "zonegroup.unknownZone").replace("{id}", &id.to_string()),
+            "zonegroup.unknownZone",
+            vec![("id", id.to_string())],
         ),
         GroupRefusal::SameOutput(a, b) => (
             StatusCode::CONFLICT,
             "group_same_output",
-            crate::i18n::t(lang, "zonegroup.sameOutput")
-                .replace("{a}", a)
-                .replace("{b}", b),
+            "zonegroup.sameOutput",
+            vec![("a", a.clone()), ("b", b.clone())],
         ),
         GroupRefusal::AsioOneZoneAtATime(a, b) => (
             StatusCode::CONFLICT,
             "group_asio_one_zone",
-            crate::i18n::t(lang, "zonegroup.asioOneZone")
-                .replace("{a}", a)
-                .replace("{b}", b),
+            "zonegroup.asioOneZone",
+            vec![("a", a.clone()), ("b", b.clone())],
+        ),
+        GroupRefusal::AsioUnsupported(zone) => (
+            StatusCode::BAD_REQUEST,
+            "group_asio_unsupported",
+            "zonegroup.asioUnsupported",
+            vec![("zone", zone.clone())],
         ),
     };
-    warn!(code, message = %message, "zone_group_refused");
-    (status, Json(json!({ "error": code, "message": message }))).into_response()
+    let corps = crate::message_api::avec_message_en(json!({ "error": code }), lang, cle, &params);
+    warn!(code, message = %corps["message"].as_str().unwrap_or_default(), "zone_group_refused");
+    (status, Json(corps)).into_response()
 }
 
 pub(super) async fn list_groups(State(state): State<AppState>) -> Json<Value> {
@@ -339,6 +515,10 @@ pub(super) async fn create_group(
         Ok(ids) => ids,
         Err(refusal) => return Ok(group_refusal_response(&refusal, &lang)),
     };
+    // #7759 — la lecture groupée n'est possible qu'en WASAPI.
+    if let Some(refusal) = refus_du_groupe_asio(&state, &zone_ids, &zones).await {
+        return Ok(group_refusal_response(&refusal, &lang));
+    }
 
     let name = body
         .name
@@ -495,6 +675,11 @@ pub(super) async fn patch_group(
                 let zones = ZoneRepo::with_backend(state.backend.clone())
                     .list()
                     .unwrap_or_default();
+                // #7759 — étendre un groupe à une zone ASIO est refusé comme
+                // le créer.
+                if let Some(refusal) = refus_du_groupe_asio(&state, zone_ids, &zones).await {
+                    return Ok(group_refusal_response(&refusal, &lang));
+                }
                 let leader_id = groups[i]["leader_id"]
                     .as_i64()
                     .or_else(|| zone_ids.first().copied())

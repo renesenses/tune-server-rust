@@ -1707,6 +1707,14 @@ impl PlaybackOrchestrator {
             let result = self
                 .session_morte_pendant_l_envoi(req, resolved, device_id, result)
                 .await;
+            if result.0 {
+                self.noter_le_depart_airplay2_si_le_flux_y_commence(
+                    device_id,
+                    resolved.stream_id.as_deref(),
+                    req.seek_ms,
+                )
+                .await;
+            }
             let total_ms = play_start.elapsed().as_millis();
             // `output_ms` ne compte plus l'attente de pré-tampon : les trois
             // termes s'additionnent maintenant pour donner `total_ms`, et un
@@ -2195,6 +2203,10 @@ impl PlaybackOrchestrator {
         // à 1.0, jamais au-delà de l'unité.
         // #8074 — sans zone en base, elle part BAS, jamais à pleine échelle.
         ensemencer_la_sortie_locale_neuve(&self.db, device_id, &local_out).await;
+        // #8437 — la sortie recréée observe aussi le retard du groupe mixte.
+        local_out.set_retard_de_depart_ms(
+            crate::zones::retard_groupe_mixte_8437::retard_de_depart_de_la_zone(&self.db, zone_id),
+        );
         {
             let mut outputs = self.outputs.lock().await;
             outputs.register(Box::new(local_out));
@@ -2340,6 +2352,12 @@ impl PlaybackOrchestrator {
                 // locale), résolue AVANT de verrouiller la sortie de A : elle
                 // lit la sortie de B dans le registre.
                 let secondes_sorties = self.demandes_de_secondes_sorties(zone_id, device_id).await;
+                // #8437 — groupée avec une zone réseau, la sortie locale part
+                // `sync_delay_ms` plus tard (tampon AirPlay compensé à la main).
+                let retard_de_depart_ms =
+                    crate::zones::retard_groupe_mixte_8437::retard_de_depart_de_la_zone(
+                        &self.db, zone_id,
+                    );
                 let output = output_arc.lock().await;
                 if let Some(local_output) = output
                     .as_any()
@@ -2355,6 +2373,7 @@ impl PlaybackOrchestrator {
                     // #6132 — la sortie double de la zone, posée à chaque
                     // lecture comme le strict : `play_url` la lit une fois.
                     local_output.set_secondes_sorties(secondes_sorties);
+                    local_output.set_retard_de_depart_ms(retard_de_depart_ms);
                     // #6522, #6524 — ce que PURE contourne, lu dans les
                     // réglages : la chaîne posée plus bas sera vide en PURE.
                     self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
@@ -2466,8 +2485,11 @@ impl PlaybackOrchestrator {
             )
             .await;
             let output = output_arc.lock().await;
+            // #8402 (11/11) — AirPlay 2 : la zone est-elle en PURE verrouillé ?
+            self.dire_a_l_airplay2_si_la_zone_tient_le_volume(zone_id, &**output);
             match output.play_media(media).await {
                 Ok(()) => {
+                    self.dire_le_depart_muet_d_airplay2(zone_id, &**output);
                     drop(output);
                     info!(device_id = %used_device_id, "output_play_sent");
                     self.reimposer_la_sourdine_de_la_zone(
@@ -2630,6 +2652,43 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #7972 — une zone AirPlay 2 jouée à une position non nulle, quel que soit
+    /// le chemin du geste (rétablissement après une pause, reprise d'une
+    /// file…) : si le flux servi COMMENCE réellement à cette position (session
+    /// décodée en canal, non « range-seekable » — même critère que
+    /// [`Self::seek_output_after_replay`]), la sortie l'apprend, sinon elle
+    /// afficherait 0:00. Une session fichier ou mandataire, servie depuis
+    /// l'octet 0 (épisode de podcast par `resolve_direct`, qui ignore
+    /// `seek_ms`), ne note RIEN : l'écran dirait 12:00 sur un son à 0:00.
+    /// Rend `true` quand le départ a été noté.
+    pub(super) async fn noter_le_depart_airplay2_si_le_flux_y_commence(
+        &self,
+        device_id: &str,
+        stream_id: Option<&str>,
+        seek_ms: Option<u64>,
+    ) -> bool {
+        let (Some(depart_ms), Some(sid)) = (seek_ms.filter(|ms| *ms > 0), stream_id) else {
+            return false;
+        };
+        let Some(output) = ({ self.outputs.lock().await.get(device_id) }) else {
+            return false;
+        };
+        if self.streamer.is_seekable_session(sid).await
+            || crate::outputs::dlna_depart_natif::depart_de_session(sid).is_some()
+        {
+            return false;
+        }
+        let sortie = output.lock().await;
+        let Some(airplay2) = sortie
+            .as_any()
+            .downcast_ref::<crate::outputs::airplay2::Airplay2Output>()
+        else {
+            return false;
+        };
+        airplay2.noter_le_depart_du_flux(depart_ms);
+        true
+    }
+
     /// Envoyer à la sortie le `Seek` qui manque après une recréation de flux
     /// (#2893). Voir [`replay_needs_output_seek`] pour la règle de décision et
     /// la raison pour laquelle elle n'est ni « toujours », ni « jamais ».
@@ -2687,6 +2746,26 @@ impl PlaybackOrchestrator {
                 && let Err(e) = output.lock().await.seek(position_ms).await
             {
                 warn!(zone_id, position_ms, error = %e, "agent_depart_du_flux_non_note");
+            }
+            return;
+        }
+        // #7972 — même contrat pour une zone AirPlay 2 rétablie à la position
+        // après une pause : le flux décodé commence à `position_ms`
+        // ([`airplay2_relance_a_la_position`]) et le démon compte depuis le
+        // début de son fichier. Sa sortie ne sait pas chercher : on lui dit
+        // seulement où ce flux commence.
+        if output_type == Some(TYPE_SORTIE_AIRPLAY2)
+            && !session_is_range_seekable
+            && position_ms > 0
+        {
+            if let Some(output) = { self.outputs.lock().await.get(did) } {
+                let sortie = output.lock().await;
+                if let Some(airplay2) = sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::airplay2::Airplay2Output>()
+                {
+                    airplay2.noter_le_depart_du_flux(position_ms);
+                }
             }
             return;
         }

@@ -1576,6 +1576,19 @@ path = "tests/credits_album_1572.rs"
 name = "credits_musicbrainz_4767"
 path = "tests/credits_musicbrainz_4767.rs"
 
+# #7767 — la page artiste rend EXACTEMENT le contrat de la route remis à Seb
+# (deux exemples recopiés en fixture) : « Écriture et production » (`writing`),
+# `credit_counts` toujours présents, remixeur audible, arrangeur non audible.
+[[test]]
+name = "page_artiste_sections_7767"
+path = "tests/page_artiste_sections_7767.rs"
+
+# #7768 — « joue avec » (`played_with`) de la page artiste : audibles
+# seulement, ni lui-même ni « Various Artists », ordre et plafond.
+[[test]]
+name = "page_artiste_joue_avec_7768"
+path = "tests/page_artiste_joue_avec_7768.rs"
+
 # #2742 (23/09) — une zone réseau sans flux progressif garde le crossfeed
 # RÉGLABLE : les flux des services le portent. `autotests = false` plus haut :
 # sans cette cible, le fichier ne serait jamais compilé.
@@ -1725,6 +1738,20 @@ required-features = ["postgres"]
 [[test]]
 name = "pg_credits_source_7765"
 path = "tests/pg_credits_source_7765.rs"
+required-features = ["postgres"]
+
+# #7767 — « Écriture et production » et `credit_counts` de la page artiste sur
+# PostgreSQL : les trois branches `UNION`, `EXISTS` booléen, `COUNT(DISTINCT)`.
+[[test]]
+name = "pg_page_artiste_7767"
+path = "tests/pg_page_artiste_7767.rs"
+required-features = ["postgres"]
+
+# #7768 — « joue avec » sur PostgreSQL : `track_credits.artist_id` lu en
+# texte ou en entier, `CAST` de la garde, `COLLATE NOCASE` remplacé.
+[[test]]
+name = "pg_page_artiste_joue_avec_7768"
+path = "tests/pg_page_artiste_joue_avec_7768.rs"
 required-features = ["postgres"]
 
 # #8026 — rattrapage des crédits des balises pour la musique déjà scannée et

@@ -552,6 +552,30 @@ struct BrowseCacheEntry {
     created: Instant,
 }
 
+/// #8426 — l'identifiant `browseId` d'une playlist pour InnerTube.
+///
+/// InnerTube ne connaît une playlist que sous son préfixe `VL` : `PL…` brut
+/// rend 400 (« Request contains an invalid argument »), `VLPL…` rend 200.
+/// Or Tune produit lui-même des identifiants bruts (playlists du compte et
+/// recherche par l'API Data), que l'Historique redemande tels quels. Un
+/// identifiant déjà préfixé, ou qui n'est pas une playlist, passe inchangé.
+fn browse_id_de_playlist(playlist_id: &str) -> std::borrow::Cow<'_, str> {
+    // Préfixes de playlist dont la forme `VL…` est celle que YouTube Music
+    // rend lui-même (playlists, albums `OLAK5uy_`, listes éditoriales
+    // `RDCLAK5uy_`). Au moins 18 caractères : un identifiant de vidéo (11)
+    // qui commencerait par `PL` n'est pas une playlist.
+    const PREFIXES_DE_PLAYLIST: [&str; 3] = ["PL", "OLAK5uy_", "RDCLAK5uy_"];
+    if playlist_id.len() >= 18
+        && PREFIXES_DE_PLAYLIST
+            .iter()
+            .any(|p| playlist_id.starts_with(p))
+    {
+        std::borrow::Cow::Owned(format!("VL{playlist_id}"))
+    } else {
+        std::borrow::Cow::Borrowed(playlist_id)
+    }
+}
+
 /// YouTube Music streaming service with optional Google OAuth.
 ///
 /// Uses the YouTube Music internal API (`music.youtube.com/youtubei/v1`) for
@@ -596,6 +620,10 @@ pub struct YouTubeService {
     /// Active Device Code flow waiting for user approval.
     pending_device_auth: Option<PendingDeviceAuth>,
     device_auth_started: Option<Instant>,
+    /// #8426 — des jetons ou un flux de connexion ont disparu dans ce
+    /// processus (`logout`, jeton révoqué, code expiré ou refusé) : la
+    /// prochaine sauvegarde doit écraser la ligne périmée, même sans jeton.
+    ligne_a_ecraser: bool,
 }
 
 impl Default for YouTubeService {
@@ -641,6 +669,7 @@ impl YouTubeService {
             email: None,
             pending_device_auth: None,
             device_auth_started: None,
+            ligne_a_ecraser: false,
         }
     }
 
@@ -1357,6 +1386,7 @@ impl YouTubeService {
         if Instant::now() > pending.expires_at {
             self.pending_device_auth = None;
             self.device_auth_started = None;
+            self.ligne_a_ecraser = true;
             return Err(TuneError::Streaming(
                 "device code expired — please restart authentication".into(),
             ));
@@ -1409,6 +1439,7 @@ impl YouTubeService {
                 "access_denied" | "expired_token" => {
                     self.pending_device_auth = None;
                     self.device_auth_started = None;
+                    self.ligne_a_ecraser = true;
                     Err(TuneError::Streaming(format!(
                         "youtube authentication {error}"
                     )))
@@ -1487,6 +1518,7 @@ impl YouTubeService {
                 self.refresh_token = None;
                 self.token_expires = None;
                 self.email = None;
+                self.ligne_a_ecraser = true;
             }
             return Ok(false);
         }
@@ -3453,6 +3485,7 @@ impl StreamingService for YouTubeService {
         self.email = None;
         self.pending_device_auth = None;
         self.device_auth_started = None;
+        self.ligne_a_ecraser = true;
         Ok(())
     }
 
@@ -3872,7 +3905,7 @@ impl StreamingService for YouTubeService {
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
         // Try YTM browse
-        if let Ok(data) = self.ytm_browse(playlist_id).await {
+        if let Ok(data) = self.ytm_browse(&browse_id_de_playlist(playlist_id)).await {
             let entete = super::youtube_decouverte::entete_playlist(&data);
             let tracks = Self::parse_browse_tracks(&data);
 
@@ -3931,7 +3964,7 @@ impl StreamingService for YouTubeService {
 
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         // Try YTM browse first
-        if let Ok(data) = self.ytm_browse(playlist_id).await {
+        if let Ok(data) = self.ytm_browse(&browse_id_de_playlist(playlist_id)).await {
             let tracks = Self::parse_browse_tracks(&data);
             if !tracks.is_empty() {
                 return Ok(tracks);
@@ -4079,10 +4112,19 @@ impl StreamingService for YouTubeService {
     // Token persistence
     // ------------------------------------------------------------------
 
+    /// #8426 — rien à écrire sans jeton ni connexion en cours : la ligne
+    /// rendait `api_key_configured` à chaque sauvegarde de N'IMPORTE QUEL
+    /// service, d'où un `tokens_saved service=youtube` trompeur. Seule
+    /// exception : après un `logout` (ou un jeton révoqué, un code expiré),
+    /// une ligne vide écrase la ligne périmée, qu'un redémarrage restaurerait.
     fn save_tokens(&self) -> Option<serde_json::Value> {
-        let mut obj = json!({
-            "api_key_configured": self.api_key.is_some(),
-        });
+        if self.access_token.is_none()
+            && self.refresh_token.is_none()
+            && self.pending_device_auth.is_none()
+        {
+            return self.ligne_a_ecraser.then(|| json!({}));
+        }
+        let mut obj = json!({});
 
         if let Some(ref at) = self.access_token {
             obj["access_token"] = json!(at);
@@ -4446,14 +4488,79 @@ mod tests {
         );
     }
 
+    /// #8426 — sans jeton ni connexion en cours, rien à écrire : la ligne
+    /// `{"api_key_configured": …}` faisait journaliser `tokens_saved
+    /// service=youtube` à chaque sauvegarde de n'importe quel service.
     #[test]
     fn save_tokens_without_auth() {
         let svc = YouTubeService::new();
-        let tokens = svc.save_tokens();
-        assert!(tokens.is_some());
-        let t = tokens.unwrap();
-        // No access_token when not authenticated
-        assert!(t["access_token"].is_null());
+        assert_eq!(svc.save_tokens(), None);
+    }
+
+    /// #8426 — après un `logout`, une ligne VIDE écrase celle de la session
+    /// close : sans elle, le redémarrage restaurerait le compte déconnecté.
+    #[tokio::test]
+    async fn save_tokens_apres_logout_ecrase_la_session_close() {
+        let mut svc = YouTubeService::new();
+        svc.access_token = Some("at".into());
+        svc.refresh_token = Some("rt".into());
+        svc.logout().await.unwrap();
+        let ligne = svc
+            .save_tokens()
+            .expect("une ligne doit écraser l'ancienne");
+        let mut relu = YouTubeService::new();
+        assert!(!relu.restore_tokens(&ligne));
+        assert!(relu.access_token.is_none() && relu.refresh_token.is_none());
+    }
+
+    /// #8426 — un code de connexion expiré n'est plus en attente : la ligne
+    /// qui le portait est écrasée, sinon chaque démarrage le ressusciterait.
+    #[tokio::test]
+    async fn save_tokens_apres_code_expire_ecrase_le_flux_mort() {
+        let mut svc = YouTubeService::new();
+        svc.pending_device_auth = Some(PendingDeviceAuth {
+            device_code: "dc".into(),
+            user_code: "UC".into(),
+            verification_url: "https://www.google.com/device".into(),
+            interval: 5,
+            expires_at: Instant::now() - Duration::from_secs(1),
+        });
+        svc.device_auth_started = Some(Instant::now());
+        assert!(svc.save_tokens().unwrap()["pending_device_code"] == "dc");
+        assert!(svc.poll_device_code().await.is_err());
+        let ligne = svc
+            .save_tokens()
+            .expect("la ligne du flux mort doit être écrasée");
+        let mut relu = YouTubeService::new();
+        relu.restore_tokens(&ligne);
+        assert!(relu.pending_device_auth.is_none());
+    }
+
+    /// #8426 — InnerTube veut `VL` devant l'identifiant d'une playlist.
+    #[test]
+    fn browse_id_de_playlist_prefixe_vl() {
+        assert_eq!(
+            browse_id_de_playlist("PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI"),
+            "VLPLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI"
+        );
+        assert_eq!(
+            browse_id_de_playlist("OLAK5uy_mnRyLDuByhBA_r8-L9ugjllTxfVytwAp0"),
+            "VLOLAK5uy_mnRyLDuByhBA_r8-L9ugjllTxfVytwAp0"
+        );
+        assert_eq!(
+            browse_id_de_playlist("RDCLAK5uy_lBNUteBRencHzKelu5iDHwLF6mYqjL-JU"),
+            "VLRDCLAK5uy_lBNUteBRencHzKelu5iDHwLF6mYqjL-JU"
+        );
+        // Déjà préfixé : pas de `VLVL`.
+        assert_eq!(
+            browse_id_de_playlist("VLPLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI"),
+            "VLPLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI"
+        );
+        // Pas une playlist (album, artiste) : inchangé.
+        assert_eq!(browse_id_de_playlist("MPREb_abc"), "MPREb_abc");
+        assert_eq!(browse_id_de_playlist("UCabc"), "UCabc");
+        // Une vidéo (11 caractères) qui commence par `PL` : inchangée.
+        assert_eq!(browse_id_de_playlist("PLabcdefghi"), "PLabcdefghi");
     }
 
     #[test]
@@ -4628,3 +4735,7 @@ mod tests {
 #[cfg(test)]
 #[path = "youtube_opus_recherche_6967_tests.rs"]
 mod opus_recherche_6967_tests;
+
+#[cfg(test)]
+#[path = "youtube_playlist_vl_8426_tests.rs"]
+mod playlist_vl_8426_tests;
