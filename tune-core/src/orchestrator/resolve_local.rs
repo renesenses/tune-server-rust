@@ -3918,6 +3918,79 @@ impl PlaybackOrchestrator {
             ref conteneur_flac_neuf,
             ..
         } = *decision;
+        // #8082 — « Flux continu entre les pistes » : la piste et les
+        // suivantes de même format partent en UN seul WAV, sans traitement.
+        // Réglage éteint, ou suite d'une seule piste : rien ne change.
+        if is_network_output
+            && let Some(flux) = self
+                .preparer_le_flux_continu(
+                    req.zone_id,
+                    zone.as_ref().and_then(|z| z.output_type.as_deref()),
+                    req.track_id,
+                    file_path,
+                    req.seek_ms,
+                )
+                .await
+        {
+            let format = flux.wav.format();
+            let total = crate::http::streamer::SourceVirtuelle::total(&flux.wav);
+            let duree_ms = flux.wav.bornes_ms().iter().map(|(_, d)| d).sum::<u64>();
+            let info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: format.cadence,
+                bit_depth: format.profondeur,
+                channels: format.canaux,
+                file_size: Some(total),
+                duration_ms: Some(duree_ms),
+                ..Default::default()
+            };
+            let session_id = self
+                .streamer
+                .create_file_session(info, file_path.clone(), false)
+                .await;
+            let plan = super::flux_continu_8082::plan_du_flux(req.zone_id, &session_id, &flux);
+            info!(
+                zone_id = req.zone_id,
+                stream_id = %session_id,
+                pistes = plan.pistes.len(),
+                positions = ?plan.pistes.iter().map(|p| p.position).collect::<Vec<_>>(),
+                cadence = format.cadence,
+                profondeur = format.profondeur,
+                canaux = format.canaux,
+                octets = total,
+                depart_ms = req.seek_ms.unwrap_or(0),
+                "flux_continu_servi"
+            );
+            self.streamer
+                .set_source_virtuelle(&session_id, Arc::new(flux.wav))
+                .await;
+            self.streamer
+                .noter_la_voie(&session_id, crate::http::streamer::voie::FLUX_CONTINU)
+                .await;
+            // Relance à une position : le flux commence DÉJÀ là. Le départ,
+            // porté par l'URL, ramène le relevé du renderer au début de la
+            // piste (#6059) et retient le `Seek` d'après relecture.
+            if let Some(depart) = req.seek_ms.filter(|d| *d > 0) {
+                crate::outputs::dlna_depart_natif::inscrire_session(&session_id, depart);
+            }
+            if let Some(did) = req
+                .output_device_id
+                .as_deref()
+                .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+            {
+                crate::outputs::dlna_flux_continu::inscrire(did, plan);
+            }
+            return Ok((
+                session_id,
+                "audio/wav".into(),
+                "wav".into(),
+                Some(total),
+                Some(format.cadence),
+                Some(u32::from(format.profondeur)),
+                Some(u32::from(format.canaux)),
+            ));
+        }
         // #6221 — un DSDIFF DST vers un renderer réseau ne part JAMAIS brut
         // (#4378) : le passthrough sert à sa place un DSF fabriqué à la volée.
         // La décision (`decider_les_forcages_reseau`) l'a déjà préparé une

@@ -214,7 +214,11 @@ bloc pour cette langue et que le français a été servi à sa place.
 
 La sonde horaire `notes-de-version-watch` reprend ce contrôle sur les cinq
 dernières versions publiées **à partir du 23/09/2026** (`FORME_DEPUIS`) et
-ouvre l'issue de veille si l'une d'elles ne rend rien.
+ouvre l'issue de veille si l'une d'elles ne rend rien — **zéro item**
+(`ITEMS_MINIMUM_VEILLE`, 1), pas moins de cinq : une note déjà publiée ne se
+réécrit pas, et un correctif à une seule correction (la rc8.1) a un item que
+le panneau affiche. La sonde dit alors que la note est courte, sans crier
+(#7861). Les 5 à 8 puces restent la règle du contrôle **avant** publication.
 
 ### 5.3 Format : un bloc par langue dans le corps de la release GitHub
 
