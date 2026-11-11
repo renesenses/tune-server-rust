@@ -2000,6 +2000,12 @@ pub(crate) async fn jouer_un_flux(
     // #7051 — une station de l'annuaire n'est pas en base : le sondeur, qui y
     // cherche le logo, le retrouvera ici quand le premier titre arrivera.
     tune_core::poller::logo_de_lancement::retenir_le_logo_de_lancement(url, logo_url.as_deref());
+    // #8110 — les autres flux autorisés de la fiche : si le diffuseur refuse
+    // celui-ci, la lecture passe seule au suivant.
+    tune_core::orchestrator::retenir_les_replis_radio(
+        url,
+        geofencing::replis_autorises(state, url),
+    );
     let play_req = tune_core::orchestrator::PlayRequest {
         zone_id,
         output_device_id: None,

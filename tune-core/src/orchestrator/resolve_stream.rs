@@ -290,7 +290,23 @@ pub(super) fn telecharger_amont(
     entetes: &[(String, String)],
     vers: &str,
 ) -> Result<(), String> {
-    let mut resp = crate::http::client::blocking_builder()
+    let mut resp = ouvrir_amont(url, entetes)?;
+    // #4833 — les octets vont directement sur le disque, sans mémoire tampon
+    // de la taille du fichier : un DSD64 fait 300 Mio, un DSD256 dépasse le
+    // gigaoctet (`telecharger_dans_un_fichier_temporaire`).
+    let mut fichier = std::fs::File::create(vers).map_err(|e| format!("write dl: {e}"))?;
+    resp.copy_to(&mut fichier)
+        .map_err(|e| format!("download: {e}"))?;
+    Ok(())
+}
+
+/// La requête amont de [`telecharger_amont`], jusqu'au statut : un refus est
+/// rendu (et journalisé) avant le premier octet du corps.
+fn ouvrir_amont(
+    url: &str,
+    entetes: &[(String, String)],
+) -> Result<reqwest::blocking::Response, String> {
+    let resp = crate::http::client::blocking_builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .and_then(|c| rejouer_les_entetes(c.get(url), entetes).send())
@@ -307,13 +323,66 @@ pub(super) fn telecharger_amont(
         );
         return Err(format!("upstream HTTP {}", resp.status()));
     }
-    // #4833 — les octets vont directement sur le disque, sans mémoire tampon
-    // de la taille du fichier : un DSD64 fait 300 Mio, un DSD256 dépasse le
-    // gigaoctet (`telecharger_dans_un_fichier_temporaire`).
-    let mut fichier = std::fs::File::create(vers).map_err(|e| format!("write dl: {e}"))?;
-    resp.copy_to(&mut fichier)
-        .map_err(|e| format!("download: {e}"))?;
-    Ok(())
+    Ok(resp)
+}
+
+/// #8228 — copie le corps amont dans `fichier` en publiant chaque avancée à
+/// `growth`, que le décodeur lit au fil de l'eau
+/// (`decode::opus_en_croissance`).
+///
+/// La copie s'arrête d'elle-même quand plus personne ne tient la poignée :
+/// ni le registre (`dash_growth::take_for` l'a retirée) ni un décodeur. Une
+/// lecture arrêtée ne laisse donc pas un téléchargement courir jusqu'au bout.
+fn copier_en_croissance(
+    mut corps: impl std::io::Read,
+    mut fichier: std::fs::File,
+    growth: Arc<crate::audio::dash_growth::DashGrowth>,
+) {
+    use std::io::Write;
+    /// Une panique de la copie ne doit pas laisser le décodeur bloqué à la
+    /// frontière : la poignée est marquée en échec si rien ne l'a close.
+    struct Garde(Arc<crate::audio::dash_growth::DashGrowth>);
+    impl Drop for Garde {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.fail();
+            }
+        }
+    }
+    let _garde = Garde(growth.clone());
+    let mut tampon = vec![0u8; 64 * 1024];
+    let mut recus: u64 = 0;
+    loop {
+        // Plus personne ne lit : ni le registre ni un décodeur (la garde
+        // ci-dessus tient la seconde référence).
+        if Arc::strong_count(&growth) == 2 {
+            debug!(octets = recus, "telechargement_en_croissance_abandonne");
+            growth.fail();
+            return;
+        }
+        match corps.read(&mut tampon) {
+            Ok(0) => {
+                debug!(octets = recus, "telechargement_en_croissance_fini");
+                growth.finish();
+                return;
+            }
+            Ok(n) => {
+                if let Err(e) = fichier.write_all(&tampon[..n]) {
+                    warn!(error = %e, octets = recus, "telechargement_en_croissance_echec_ecriture");
+                    growth.fail();
+                    return;
+                }
+                recus += n as u64;
+                growth.advance(recus);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                warn!(error = %e, octets = recus, "telechargement_en_croissance_echec");
+                growth.fail();
+                return;
+            }
+        }
+    }
 }
 
 /// Ce que le producteur du canal AAC → WAV reçoit du bras qui l'a monté.
@@ -371,6 +440,9 @@ async fn produire_le_canal_aac(c: CanalAac) {
         )
     })
     .await;
+    // #8228 — un téléchargement en croissance que le décodeur n'a pas pris
+    // (échec avant l'ouverture) : lâcher la poignée arrête la copie.
+    drop(crate::audio::dash_growth::take_for(&fichier));
     let _ = std::fs::remove_file(&fichier);
     match result {
         Ok(Ok(_)) => {
@@ -402,6 +474,10 @@ async fn produire_le_canal_aac(c: CanalAac) {
 #[cfg(test)]
 #[path = "canal_aac_fin_notee_6298_tests.rs"]
 mod canal_aac_fin_notee_6298_tests;
+
+#[cfg(test)]
+#[path = "youtube_dlna_demarrage_8228_tests.rs"]
+mod youtube_dlna_demarrage_8228_tests;
 
 impl PlaybackOrchestrator {
     /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
@@ -2375,6 +2451,32 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #8228 — comme [`Self::telecharger_dans_un_fichier_temporaire`], mais
+    /// rend le chemin dès la réponse amont acceptée : le corps continue
+    /// d'arriver en tâche de fond, et le décodeur Opus le lit au fil de l'eau
+    /// (poignée `dash_growth` inscrite sous ce chemin). Un refus amont (403)
+    /// reste rendu ici, avant toute session.
+    pub(super) async fn telecharger_en_croissance(
+        upstream_url: String,
+        upstream_headers: Vec<(String, String)>,
+        codec: &str,
+    ) -> Result<String, String> {
+        let reponse =
+            tokio::task::spawn_blocking(move || ouvrir_amont(&upstream_url, &upstream_headers))
+                .await
+                .map_err(|e| format!("download task panic: {e}"))??;
+        // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
+        let tmp_dl = std::env::temp_dir()
+            .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
+            .to_string_lossy()
+            .to_string();
+        let fichier = std::fs::File::create(&tmp_dl).map_err(|e| format!("write dl: {e}"))?;
+        let growth = crate::audio::dash_growth::DashGrowth::new(0);
+        crate::audio::dash_growth::register(&tmp_dl, growth.clone());
+        tokio::task::spawn_blocking(move || copier_en_croissance(reponse, fichier, growth));
+        Ok(tmp_dl)
+    }
+
     /// Premier temps, codecs que les renderers DLNA anciens refusent (AAC,
     /// MP4, Opus) : téléchargement puis pré-transcodage en FLAC, servi par
     /// une session de fichier avec Content-Length.
@@ -2430,13 +2532,33 @@ impl PlaybackOrchestrator {
             // ligne `amont_refuse_entetes_rejouees` reste écrite sur un refus,
             // et le fichier temporaire est supprimé par l'assistant en cas
             // d'échec comme de panique de la tâche.
-            let tmp_dl = match Self::telecharger_dans_un_fichier_temporaire(
-                stream_data.url.clone(),
-                stream_data.headers.clone(),
-                &codec_lower,
-            )
-            .await
+            //
+            // #8228 — l'Opus (YouTube) n'attend plus le fichier entier : le
+            // décodeur le lit pendant qu'il arrive. `googlevideo` ne débite
+            // qu'environ deux fois le temps réel ; l'attente valait la moitié
+            // de la durée du titre (190 s mesurées, fil 2724).
+            // Seulement si le décodeur sait servir la cible au fil de l'eau
+            // (48 kHz) : une zone plafonnée plus bas garde le téléchargement
+            // complet AVANT la session, sans quoi le renderer ouvrirait un
+            // flux muet pendant tout le téléchargement.
+            let telechargement = if codec_lower == "opus"
+                && crate::audio::decode::opus_servi_pendant_le_telechargement(Some(sr), Some(2))
             {
+                Self::telecharger_en_croissance(
+                    stream_data.url.clone(),
+                    stream_data.headers.clone(),
+                    &codec_lower,
+                )
+                .await
+            } else {
+                Self::telecharger_dans_un_fichier_temporaire(
+                    stream_data.url.clone(),
+                    stream_data.headers.clone(),
+                    &codec_lower,
+                )
+                .await
+            };
+            let tmp_dl = match telechargement {
                 Ok(chemin) => chemin,
                 Err(e) => {
                     warn!(error = %e, "streaming_aac_download_failed");

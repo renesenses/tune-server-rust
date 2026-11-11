@@ -650,6 +650,14 @@ pub(crate) async fn get_zone(
                     }),
                 );
                 obj.insert("current_track".into(), json!(ps.now_playing));
+                // #3245 — le mode sous lequel la sortie locale de la zone
+                // ouvrira le périphérique. Il diffère de `exclusive_mode`
+                // tant qu'une lecture retient le changement, ou quand la
+                // plateforme impose sa règle (ASIO). `null` hors sortie locale.
+                obj.insert(
+                    "exclusive_mode_applique".into(),
+                    json!(mode_exclusif_applique(&state, zone.output_device_id.as_deref()).await),
+                );
                 inject_metadata_anchor(obj, &ps);
                 inject_session_context(obj, &ps);
                 obj.insert(
@@ -961,5 +969,25 @@ mod asio_7372 {
                 "GET ne doit pas sonder ni altérer le pilote"
             );
         }
+    }
+}
+
+/// #3245 — le mode exclusif que porte la sortie locale `device_id`, s'il y en
+/// a une d'enregistrée.
+async fn mode_exclusif_applique(state: &AppState, device_id: Option<&str>) -> Option<bool> {
+    #[cfg(feature = "local-audio")]
+    {
+        let device_id = device_id.filter(|d| d.starts_with("local:"))?;
+        let sortie = state.outputs.lock().await.get(device_id)?;
+        let sortie = sortie.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+            .map(|l| l.mode_exclusif())
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        let _ = (state, device_id);
+        None
     }
 }

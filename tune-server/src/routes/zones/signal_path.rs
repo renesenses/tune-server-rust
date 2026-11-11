@@ -1505,7 +1505,10 @@ pub(super) fn etat_du_surechantillonneur_lang(
     let (raison, cle) = if pure {
         ("pure", "upsampling_pure")
     } else if output_type != "local" {
-        ("output_not_supported", "upsampling_not_applied")
+        // #8149 — une zone réseau (DLNA, AirPlay…) n'a pas de
+        // suréchantillonneur : « à la piste suivante » y était faux, rien ne
+        // s'appliquera jamais. Le dire, avec la raison.
+        ("output_not_supported", "upsampling_zone_not_supported")
     } else if tune_core::audio::surechantillonnage::verdict_enregistre(&settings).is_none() {
         // #8259 — la raison que `choix_de_la_zone` donne, au lieu d'un
         // « non appliqué » muet.
@@ -1718,6 +1721,7 @@ fn assembler_les_etapes_lang(
         canaux_source,
         canaux_du_fil,
         dst_reconstruit_en_dsf,
+        variante_hls_refusee,
         ..
     } = analyse.source;
     let Traitements {
@@ -1778,6 +1782,16 @@ fn assembler_les_etapes_lang(
         "description": source_desc,
         "bit_perfect": true,
     })];
+    // #7802 — une radio HLS repliée sur une variante plus basse le DIT : le
+    // diffuseur a refusé la qualité au-dessus (souvent une restriction
+    // géographique), et l'auditeur sait pourquoi il reçoit 96 et non 320.
+    if let Some(refus) = variante_hls_refusee {
+        steps[0]["detail"] = json!(fs(
+            lang,
+            "hls_variant_refused",
+            &[&refus.bande_kbps.to_string(), &refus.statut.to_string()]
+        ));
+    }
     // #4346 — l'étape qui nomme un codec inconnu le DIT par un code stable.
     let marquer_codec_inconnu = |etape: &mut Value| {
         if !codec_connu {
@@ -2557,10 +2571,12 @@ fn rendre_les_verdicts(
     // hériter du chiffre de l'extrait.
     // #6821 — une radio n'a pas de fiche : son débit est celui qu'elle annonce
     // (`icy-br`), relevé à la connexion. Même filtre : jamais sur un FLAC.
+    // #7802 — le débit MESURÉ sur les trames (HLS) prime sur celui que la
+    // station déclare : la bande d'une liste maîtresse compte le conteneur.
     let bitrate_label = np
         .bitrate_kbps
-        .or(source.debit_radio_kbps)
         .or(source.debit_source_kbps)
+        .or(source.debit_radio_kbps)
         .filter(|kbps| *kbps > 0 && !is_lossless)
         .map(|kbps| format!(" {kbps} kbit/s"))
         .unwrap_or_default();
@@ -3296,6 +3312,9 @@ struct Source<'w> {
     /// #6821 — le débit qu'une RADIO annonce (`icy-br`), relevé par la sonde.
     /// `None` hors radio : le débit d'un fichier vient de `NowPlaying`.
     debit_radio_kbps: Option<u32>,
+    /// #7802 — la variante HLS plus haute que le diffuseur a refusée avant
+    /// celle qui joue : l'étape Source explique le débit plus bas.
+    variante_hls_refusee: Option<tune_core::http::streamer::VarianteRefusee>,
 }
 
 /// The radio decoder emits 16-bit PCM and can adapt low source rates.
@@ -3390,6 +3409,7 @@ fn decrire_la_source<'w>(
             canaux_du_fil: None,
             dst_reconstruit_en_dsf: false,
             debit_radio_kbps: radio.bitrate_kbps,
+            variante_hls_refusee: radio.variante_refusee,
         };
     }
     // #6946 — un titre Spotify est le PCM que librespot a DÉCODÉ d'un Ogg
@@ -3417,6 +3437,7 @@ fn decrire_la_source<'w>(
             dst_reconstruit_en_dsf: false,
             debit_source_kbps: Some(qualite.bitrate_kbps),
             debit_radio_kbps: None,
+            variante_hls_refusee: None,
         };
     }
     // Verbatim proxy radios keep their existing wire/NowPlaying metadata
@@ -3590,6 +3611,7 @@ fn decrire_la_source<'w>(
         canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
         dst_reconstruit_en_dsf: is_dsd && wire.is_some_and(|w| w.dsd_reconstruit_depuis_dst),
         debit_radio_kbps: None,
+        variante_hls_refusee: None,
     }
 }
 
