@@ -2464,7 +2464,7 @@ impl PlaybackOrchestrator {
             )
             .await;
             let output = output_arc.lock().await;
-            // #8402 (11/11) — AirPlay 2 : la zone tient-elle le volume ?
+            // #8402 (11/11) — AirPlay 2 : la zone est-elle en PURE verrouillé ?
             self.dire_a_l_airplay2_si_la_zone_tient_le_volume(zone_id, &**output);
             match output.play_media(media).await {
                 Ok(()) => {

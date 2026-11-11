@@ -81,12 +81,12 @@ pub struct Airplay2Output {
     /// (`submit_pin`) : son refus est un mauvais code, pas un refus du code
     /// par défaut, et ne bloque pas la lecture (#8347).
     connect_par_code: Arc<AtomicBool>,
-    /// #8402 (11/11) — la zone tient le volume (volume fixe, ou PURE
-    /// verrouillé) : une session neuve part à 0 %, jamais à 100 %. Posé par
+    /// #8402 (11/11) — la zone est en PURE verrouillé : une session neuve
+    /// part à 0 %, jamais à 100 % (le volume fixe, lui, garde ses 100 %). Posé par
     /// l'orchestrateur avant chaque piste, et par la graine de la découverte.
     volume_tenu_par_la_zone: Arc<AtomicBool>,
     /// #8402 (11/11) — la dernière lecture a ouvert sa session à 0 % parce
-    /// que la zone tient le volume : l'orchestrateur le dit à l'utilisateur.
+    /// que la zone est en PURE verrouillé : l'orchestrateur le dit.
     depart_muet: Arc<AtomicBool>,
 }
 
