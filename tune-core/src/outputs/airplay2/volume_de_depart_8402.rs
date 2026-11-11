@@ -467,4 +467,27 @@ mod tests {
         sortie.session_a_rouvrir.store(true, Ordering::SeqCst);
         assert!(!sortie.session_deja_ouverte().await);
     }
+    /// Titre suivant en PURE verrouillé = volume conservé : la piste suivante
+    /// n'est pas une session neuve, même quand la sortie rouvre la connexion
+    /// du démon entre deux titres (#8420, `session_consommee`). Sans geste,
+    /// elle reste à 0 % ; après le 100 % d'un geste, elle reste à 100 % ;
+    /// jamais de nouvelle alerte.
+    #[tokio::test]
+    async fn titre_suivant_en_pure_verrouille_garde_le_volume_8402() {
+        let sortie = enceinte();
+        sortie.tenir_le_volume_de_la_zone(true);
+        let recus = demon(&sortie, false).await;
+        sortie.play_media(&piste()).await.unwrap();
+        assert!(sortie.prendre_le_depart_muet());
+        sortie.play_media(&piste()).await.unwrap();
+        assert!(!sortie.prendre_le_depart_muet(), "pas une session neuve");
+        sortie.set_volume(1.0).await.unwrap();
+        sortie.play_media(&piste()).await.unwrap();
+        sortie.play_media(&piste()).await.unwrap();
+        assert!(!sortie.prendre_le_depart_muet());
+        assert_eq!(
+            *recus.lock().await,
+            vec!["-144.00", "-144.00", "0.00", "0.00"]
+        );
+    }
 }
