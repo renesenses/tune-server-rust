@@ -1622,12 +1622,20 @@ fn spawn_alarm_scheduler(state: &AppState) {
         state.orchestrator.clone(),
     ));
     alarm_sched.spawn();
-    // #8213 — arrêt programmé de la lecture à heure fixe.
+    // #8213 — arrêt programmé de la lecture à heure fixe ; avec
+    // `action: "poweroff"`, extinction de la machine par la fonction unique
+    // d'extinction (refusée hors Tune OS).
+    let extinction: tune_core::arret_programme::Extinction = Arc::new(|| {
+        Box::pin(crate::routes::appliance::ordonner(
+            crate::routes::appliance::OrdreMachine::Eteindre,
+        ))
+    });
     Arc::new(
         tune_core::arret_programme::PlanificateurArretProgramme::new(
             state.backend.clone(),
             state.orchestrator.clone(),
-        ),
+        )
+        .avec_extinction(extinction),
     )
     .spawn();
 }
