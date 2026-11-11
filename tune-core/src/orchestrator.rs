@@ -2168,6 +2168,9 @@ mod volume_openhome_echelle_7841_tests;
 mod sourdine_a_la_piste_8151;
 #[cfg(test)]
 mod sourdine_a_la_piste_8151_tests;
+// #8437 — groupe mixte : la sortie locale part `sync_delay_ms` plus tard.
+#[cfg(all(test, feature = "local-audio"))]
+mod retard_groupe_mixte_8437_tests;
 pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]
