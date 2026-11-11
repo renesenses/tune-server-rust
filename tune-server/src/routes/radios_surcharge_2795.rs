@@ -129,7 +129,7 @@ pub(crate) async fn revenir_a_la_fiche(
         json!({"action": "updated", "id": radio_id}),
     );
     let mut sortie = json!(station);
-    super::radios_libelles::enrichir(&mut sortie, &crate::i18n::lang_from_header(&headers));
+    super::super::radios_libelles::enrichir(&mut sortie, &crate::i18n::lang_from_header(&headers));
     if let Some(o) = sortie.as_object_mut() {
         o.insert(
             "annuaire".into(),
@@ -137,7 +137,7 @@ pub(crate) async fn revenir_a_la_fiche(
         );
         o.insert("surcharge_locale".into(), Value::Bool(false));
     }
-    super::radios::geofencing::annoncer_le_debit_ecoute(&state, &mut sortie);
+    super::super::radios::geofencing::annoncer_le_debit_ecoute(&state, &mut sortie);
     Json(sortie).into_response()
 }
 
