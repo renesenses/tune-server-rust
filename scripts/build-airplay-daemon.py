@@ -28,7 +28,7 @@ import subprocess
 
 REPO = "https://github.com/renesenses/airplay2-rs"
 # Pinned rev of our fork. Same rev as Dockerfile (local developer image).
-REV = "83a7def6ab39d3709fa47a40eb90993b64afe9b4"
+REV = "d58df6265ac9137e92e3c4d8093f12d0360f1a15"
 ROOT = Path(__file__).resolve().parent.parent
 
 # ELF e_machine values (little-endian u16 at offset 18).

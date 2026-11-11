@@ -40,6 +40,21 @@ use super::dsd_to_pcm::choose_output_rate;
 /// [`SESSION_IDLE_TIMEOUT`]: crate::http::streamer::SESSION_IDLE_TIMEOUT
 const SEND_TIMEOUT_SECS: u64 = crate::http::streamer::SESSION_IDLE_TIMEOUT.as_secs();
 
+// #8228 — décodage Opus pendant le téléchargement.
+#[path = "opus_en_croissance.rs"]
+mod opus_en_croissance;
+
+/// #8228 — l'Opus peut-il être servi PENDANT son téléchargement vers cette
+/// cible ? Le bras de pré-transcodage ne lance le téléchargement en
+/// croissance que dans ce cas : sinon le décodeur attendrait le fichier
+/// entier APRÈS le Play, et le renderer resterait sans un octet.
+pub(crate) fn opus_servi_pendant_le_telechargement(
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+) -> bool {
+    opus_en_croissance::cible_servie(target_sample_rate, target_channels, 0.0)
+}
+
 /// Round a preferred PCM batch size down to a whole number of interleaved frames.
 ///
 /// The streaming decode paths used to drain a fixed `32768` bytes. That length is
@@ -93,7 +108,7 @@ pub(crate) fn echantillons_de_la_fenetre(max_duration_s: f64, rate: u32, channel
 /// Without this fix, 24-bit ALAC files are decoded as 16-bit, producing a
 /// WAV stream whose PCM data mismatches the header — causing silence or
 /// errors on DLNA renderers.
-fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
+pub(crate) fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
     if let Some(bps) = params.bits_per_sample {
         return bps as u16;
     }
@@ -2391,6 +2406,33 @@ fn decode_to_pcm_streaming_inner(
             &rt,
             seek_s,
         );
+    }
+
+    // #8228 — Opus encore en téléchargement (YouTube vers une zone DLNA) :
+    // décodé au fil de l'eau au lieu d'attendre le fichier entier. Hors du
+    // contrat de ce chemin (autre cadence, seek), on attend la fin du
+    // téléchargement et le chemin intégral ci-dessous reprend, comme avant.
+    if ext == "opus"
+        && let Some(growth) = crate::audio::dash_growth::take_for(file_path)
+    {
+        if opus_en_croissance::cible_servie(target_sample_rate, target_channels, seek_s) {
+            let rt = tokio::runtime::Handle::try_current()
+                .map_err(|_| "no tokio runtime for streaming decode")?;
+            return opus_en_croissance::decoder_opus_en_croissance(
+                file_path,
+                growth,
+                target_channels,
+                target_bit_depth,
+                &tx,
+                chunk_size,
+                &data_ready,
+                &levels_tx,
+                &rt,
+            );
+        }
+        growth
+            .attendre_la_fin()
+            .map_err(|e| format!("opus download: {e}"))?;
     }
 
     // Opus (native .opus / Ogg-Opus, or Opus-in-WebM) has no symphonia codec —

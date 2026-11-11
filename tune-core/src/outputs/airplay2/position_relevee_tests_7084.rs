@@ -43,6 +43,10 @@ pub(crate) async fn demon_dont_le_recepteur_avance(
         while let Ok(Some(ligne)) = lignes.next_line().await {
             let commande: serde_json::Value = serde_json::from_str(&ligne).unwrap();
             let nom = commande["cmd"].as_str().unwrap().to_string();
+            // #8402 — le volume de départ ne pilote pas ce banc.
+            if nom == "volume" {
+                continue;
+            }
             notees.lock().await.push(nom.clone());
             let evenement = match nom.as_str() {
                 "play" => {

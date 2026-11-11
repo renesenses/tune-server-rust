@@ -99,6 +99,13 @@ fn workspace_members(root: &Path) -> Vec<String> {
 ///
 /// `tune-core` elle-même répond oui : c'est la caisse qui détient le
 /// constructeur partagé, et donc la première à devoir s'y tenir.
+///
+/// Seules comptent les sections qui entrent dans le binaire livré —
+/// `[dependencies]` et `[target.….dependencies]`. Une caisse qui ne tire
+/// `tune-core` qu'en `[dev-dependencies]` (le pont, pour ses tests de bout en
+/// bout face au vrai client de relais) ne peut pas l'atteindre depuis son code
+/// livré : ses clients de production n'ont aucun constructeur partagé vers
+/// lequel aller, et ce n'est pas un test de la caisse qui avortera sur Android.
 fn depends_on_tune_core(root: &Path, member: &str) -> bool {
     if member == "tune-core" {
         return true;
@@ -110,9 +117,20 @@ fn depends_on_tune_core(root: &Path, member: &str) -> bool {
     // Une déclaration de dépendance commence la ligne ; `name = "tune-core"` ou
     // une mention en commentaire ne doivent pas faire entrer une caisse dans le
     // périmètre par accident.
-    manifest
-        .lines()
-        .any(|l| l.trim_start().starts_with("tune-core"))
+    let mut livree = false;
+    for l in manifest.lines() {
+        let l = l.trim_start();
+        if l.starts_with('[') {
+            let section = l.trim_end();
+            livree = section == "[dependencies]"
+                || (section.starts_with("[target.") && section.ends_with(".dependencies]"));
+            continue;
+        }
+        if livree && l.starts_with("tune-core") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Répertoires de sources examinés, déduits de l'espace de travail.

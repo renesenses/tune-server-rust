@@ -177,6 +177,41 @@ pub(crate) fn corps_du_refus_parental(e: &str, lang: &str) -> Option<Value> {
     }))
 }
 
+/// #8154 — la route du récepteur Spotify Connect que le bouton « Activer le
+/// récepteur » appelle (`POST`, corps `{}`).
+pub(crate) const ROUTE_ACTIVER_RECEPTEUR_SPOTIFY: &str = "/api/v1/spotify-connect/enable";
+
+/// #8154 — le refus « liaison Spotify Connect requise » : 409, code stable,
+/// phrase traduite qui dit quoi faire, l'appareil à choisir, l'état du
+/// récepteur et la route qui l'allume. Le motif technique va dans `cause`.
+fn refus_liaison_spotify(
+    liaison: &tune_core::streaming::spotify_lecture::LiaisonRequise,
+    lang: &str,
+) -> axum::response::Response {
+    use tune_core::streaming::spotify_lecture::CODE_LIAISON_REQUISE;
+    let cle = if liaison.recepteur_actif {
+        "spotify.playback.linkRequired"
+    } else {
+        "spotify.playback.linkRequiredReceiverOff"
+    };
+    let mut corps = crate::message_api::avec_message_en(
+        json!({
+            "error": CODE_LIAISON_REQUISE,
+            "code": CODE_LIAISON_REQUISE,
+            "device_name": liaison.appareil,
+            "receiver_active": liaison.recepteur_actif,
+            "enable_endpoint": ROUTE_ACTIVER_RECEPTEUR_SPOTIFY,
+        }),
+        lang,
+        cle,
+        &[("device", liaison.appareil.clone())],
+    );
+    if let Some(objet) = corps.as_object_mut() {
+        objet.insert("cause".into(), json!(liaison.detail));
+    }
+    (StatusCode::CONFLICT, Json(corps)).into_response()
+}
+
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     if let Some(reponse) = refus_du_bail_parental(&e, lang) {
         return reponse;
@@ -225,6 +260,16 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
             })),
         )
             .into_response();
+    }
+    // #8154 — Spotify a refusé le jeton de Tune à librespot : le geste qui
+    // débloque est connu (choisir une fois l'appareil dans l'application
+    // Spotify). 409 au code stable, phrase traduite, et de quoi proposer
+    // « Activer le récepteur » quand librespot ne tourne pas ; sans cette
+    // branche, le fourre-tout en faisait une « Erreur de lecture » (502).
+    if let Some(liaison) =
+        tune_core::streaming::spotify_lecture::LiaisonRequise::depuis_sentinelle(&e)
+    {
+        return refus_liaison_spotify(&liaison, lang);
     }
     // Orphan-zone sentinel from orchestrator.play(): the zone row has no
     // output_device_id, so playback can never produce sound (Yacine, 24/07).
@@ -820,6 +865,69 @@ fn relance_dans_la_file(
         ),
         _ => false,
     }
+}
+
+/// #7889 — « Lecture » sur un titre déjà dans la file, la session de la zone
+/// VIDE : le serveur a redémarré depuis le dernier « Lire » (le conteneur de
+/// session ne vit qu'en mémoire), la file, elle, est en base. Sans rien de
+/// plus, les écoutes qui suivent s'inscrivaient comme des titres isolés.
+///
+/// Le conteneur se reprend de la dernière reprise d'écoute de la zone
+/// (`listening_resumes`, en base), et seulement si elle décrit CETTE file :
+/// ses lignes (`queue_row_ids`) sont toutes encore dans la file et le titre
+/// relancé en fait partie. Une reprise de « titre » n'a pas de conteneur à
+/// rendre ; une session déjà posée n'est jamais remplacée.
+async fn restaurer_le_contexte_apres_redemarrage(
+    state: &AppState,
+    zone_id: i64,
+    relancee: impl Fn(&[tune_core::db::play_queue_repo::QueueEntry]) -> Option<i64>,
+) {
+    if state
+        .playback
+        .get_state(zone_id)
+        .await
+        .session_context_type
+        .is_some()
+    {
+        return;
+    }
+    let Ok(file) = PlayQueueRepo::with_backend(state.backend.clone()).get_ordered(zone_id) else {
+        return;
+    };
+    let Some(reprise) = tune_core::db::listening_resume::recent(&state.backend, Some(zone_id), 1)
+        .ok()
+        .and_then(|r| r.into_iter().next())
+    else {
+        return;
+    };
+    if !matches!(reprise.context_type.as_str(), "album" | "playlist")
+        || reprise.queue_row_ids.is_empty()
+    {
+        return;
+    }
+    let lignes: std::collections::HashSet<i64> = file.iter().map(|e| e.id).collect();
+    let decrit_la_file = reprise.queue_row_ids.iter().all(|id| lignes.contains(id))
+        && relancee(&file).is_some_and(|ligne| reprise.queue_row_ids.contains(&ligne));
+    if !decrit_la_file {
+        return;
+    }
+    info!(
+        zone_id,
+        nature = %reprise.context_type,
+        id = %reprise.context_id,
+        "contexte_de_session_repris_apres_redemarrage_7889"
+    );
+    state
+        .playback
+        .set_session_context(
+            zone_id,
+            Some(reprise.context_type),
+            Some(reprise.context_id),
+            Some(reprise.source),
+            Some(reprise.title).filter(|t| !t.is_empty()),
+            reprise.cover_path,
+        )
+        .await;
 }
 
 /// Whether the server would accept the manual "next" action as an actual
@@ -2339,6 +2447,57 @@ mod refus_de_format_3234 {
         }
     }
 
+    /// #8154 — Spotify refuse le jeton de Tune à librespot : la lecture rend
+    /// un 409 au code stable `spotify_liaison_connect_requise`, avec la phrase
+    /// qui dit de choisir l'appareil dans l'application Spotify, et non plus
+    /// le 502 `upstream_error` (« Erreur de lecture »). Récepteur éteint :
+    /// la phrase le dit, et la route qui l'allume est donnée.
+    ///
+    /// Contre-épreuve : sans la branche `LiaisonRequise` de
+    /// `play_error_response`, ce test rougit (502, `upstream_error`).
+    #[tokio::test]
+    async fn spotify_8154_liaison_connect_requise_dit_quoi_faire() {
+        use tune_core::streaming::spotify_lecture::LiaisonRequise;
+        for (recepteur_actif, phrase_fr) in [
+            (true, "choisissez une fois l'appareil « Tune »"),
+            (false, "activez-le"),
+        ] {
+            let liaison = LiaisonRequise {
+                appareil: "Tune".into(),
+                recepteur_actif,
+                detail: "Spotify a refusé la connexion de librespot (« Login request was denied: INVALID_CREDENTIALS »)".into(),
+            };
+            let e = format!("source « spotify » : {}", liaison.en_sentinelle());
+            for lang in ["fr", "en"] {
+                let reponse = play_error_response(e.clone(), lang);
+                assert_eq!(reponse.status(), StatusCode::CONFLICT, "{lang}");
+                let corps = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+                    .await
+                    .expect("corps de la réponse");
+                let corps: Value = serde_json::from_slice(&corps).expect("corps JSON");
+                assert_eq!(corps["error"], "spotify_liaison_connect_requise");
+                assert_eq!(corps["code"], "spotify_liaison_connect_requise");
+                assert_eq!(corps["device_name"], "Tune");
+                assert_eq!(corps["receiver_active"], recepteur_actif);
+                assert_eq!(corps["enable_endpoint"], "/api/v1/spotify-connect/enable");
+                assert_eq!(corps["params"]["device"], "Tune");
+                assert!(
+                    corps["cause"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("INVALID_CREDENTIALS"))
+                );
+                let message = corps["message"].as_str().unwrap_or_default();
+                assert!(message.contains("Tune"), "{lang} : {message}");
+                assert!(!message.contains('\u{1f}'), "{lang} : {message}");
+                if lang == "fr" {
+                    assert!(message.contains(phrase_fr), "{message}");
+                } else {
+                    assert!(message.contains("Spotify app"), "{message}");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn une_panne_de_lecture_ordinaire_garde_son_code() {
         let reponse = play_error_response("decode timeout".into(), "fr");
@@ -2432,6 +2591,11 @@ async fn lancer_la_lecture(
         tune_core::poller::logo_de_lancement::retenir_le_logo_de_lancement(
             &selected,
             orch_req.cover_url.as_deref(),
+        );
+        // #8110 — même repli que le bouton de lecture de la fiche radio.
+        tune_core::orchestrator::retenir_les_replis_radio(
+            &selected,
+            super::radios::geofencing::replis_autorises(state, &selected),
         );
         orch_req.source_id = Some(selected);
     }
@@ -2672,6 +2836,12 @@ async fn play(
                 if q_len > 0 {
                     let current = state.playback.get_state(zone_id).await;
                     let pos = current.queue_position.min(q_len - 1);
+                    // #7889 — « Lecture » nue après un redémarrage : la file
+                    // reprend, son conteneur aussi.
+                    restaurer_le_contexte_apres_redemarrage(&state, zone_id, |file| {
+                        file.get(pos as usize).map(|e| e.id)
+                    })
+                    .await;
                     state.playback.update_queue_info(zone_id, pos, q_len).await;
                     return match state.orchestrator.play_from_queue(zone_id, pos).await {
                         Ok(result) => {
@@ -2801,6 +2971,18 @@ async fn play(
     }
     if relance {
         info!(zone_id, "relance_dans_la_file_contexte_garde_6465");
+        // #7889 — après un redémarrage, la session gardée est VIDE (elle ne
+        // vit qu'en mémoire) : la recompléter depuis la reprise de la file.
+        restaurer_le_contexte_apres_redemarrage(&state, zone_id, |file| {
+            file.iter()
+                .find(|e| match (body.track_id, body.source_id.as_deref()) {
+                    (Some(t), _) => e.track_id == Some(t),
+                    (None, Some(sid)) => e.source_id.as_deref() == Some(sid),
+                    _ => false,
+                })
+                .map(|e| e.id)
+        })
+        .await;
     } else {
         let (contexte_type, contexte_id, contexte_service) = contexte_de_lecture(&body);
         let (contexte_titre, contexte_pochette) = nom_du_contexte(
@@ -4665,7 +4847,25 @@ async fn seek(
         .seek(zone_id, position_ms, device_id.as_deref())
         .await
     {
-        Ok(()) => Json(json!({ "position_ms": position_ms })).into_response(),
+        Ok(()) => {
+            // #7759 — le déplacement de la meneuse d'un groupe vaut pour ses
+            // suiveuses. Détaché : recréer un flux local prend une à trois
+            // secondes par zone, la réponse n'attend pas les suiveuses.
+            // Numérotée ICI, dans l'ordre d'arrivée : seul le relais de la
+            // dernière demande s'applique (relecture de #8254).
+            let demande = state.deplacements_de_groupe.nouvelle_demande(zone_id);
+            let s = state.clone();
+            tokio::spawn(async move {
+                crate::routes::zones::relais_de_groupe_6155::deplacer_les_suiveuses(
+                    &s,
+                    zone_id,
+                    position_ms,
+                    demande,
+                )
+                .await;
+            });
+            Json(json!({ "position_ms": position_ms })).into_response()
+        }
         Err(error) => {
             state.orchestrator.dire_deplacement_refuse(zone_id, &error);
             output_command_error_response(error)

@@ -1929,6 +1929,9 @@ pub fn spawn_mdns_handler(
                                     dev.id.clone(),
                                     ap_dev_id,
                                 );
+                                // #8402 — elle part du volume mémorisé de sa
+                                // zone, jamais de la pleine échelle.
+                                ap2.ensemencer_depuis_la_base(&db).await;
                                 tune_core::outputs::airplay2::composant_manquant_7084::retablir(
                                     &dev.id,
                                 );
