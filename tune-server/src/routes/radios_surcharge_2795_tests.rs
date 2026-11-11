@@ -200,7 +200,18 @@ fn une_station_surchargee_joue_son_flux_pas_celui_de_la_fiche() {
     let repo = RadioRepo::with_backend(state.backend.clone());
     let mut st = repo.get(liee).unwrap().unwrap();
     st.url = FLUX_A_MOI.into();
+    st.bitrate = Some(128);
     repo.update(&st).unwrap();
+    let debit_annonce = || {
+        let mut corps = json!([repo.get(liee).unwrap().unwrap()]);
+        crate::routes::radios::geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
+        corps[0]["bitrate"].clone()
+    };
+    assert_eq!(
+        debit_annonce(),
+        192,
+        "sans surcharge, le débit annoncé est celui de la fiche"
+    );
 
     // Sans surcharge : la lecture suit la fiche (comportement de #7199).
     assert_eq!(
@@ -213,6 +224,11 @@ fn une_station_surchargee_joue_son_flux_pas_celui_de_la_fiche() {
         crate::routes::radios::geofencing::stream_for_saved(&state, &st).unwrap(),
         FLUX_A_MOI,
         "la station surchargée doit jouer l'adresse choisie chez soi"
+    );
+    assert_eq!(
+        debit_annonce(),
+        128,
+        "le débit annoncé reste celui du flux surchargé"
     );
 }
 

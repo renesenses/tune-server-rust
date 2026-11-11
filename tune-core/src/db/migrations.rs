@@ -5994,7 +5994,8 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
              VALUES (109, 'correction_pure_classix') \
              ON CONFLICT (version) DO NOTHING;\n"
         ),
-    ), // Jumelle de la SQLite 144 (web#2795) : `radio_stations.surcharge_locale`,
+    ),
+    // Jumelle de la SQLite 144 (web#2795) : `radio_stations.surcharge_locale`,
     // la surcharge locale d'une station de l'annuaire, NULL pour l'existant.
     (
         110,
