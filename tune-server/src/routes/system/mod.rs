@@ -119,6 +119,13 @@ pub fn router() -> Router<AppState> {
             "/settings/default-zone",
             get(config::get_default_zone).put(config::set_default_zone),
         )
+        // #8213 — arrêt programmé de la lecture à heure fixe.
+        .route(
+            "/settings/scheduled-stop",
+            get(config::get_scheduled_stop)
+                .put(config::set_scheduled_stop)
+                .delete(config::delete_scheduled_stop),
+        )
         .route("/library/clear", post(scan::library_clear))
         .route("/scan", post(scan::trigger_scan))
         .route("/scan/status", get(scan::scan_status))

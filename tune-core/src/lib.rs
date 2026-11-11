@@ -6,6 +6,8 @@ pub use error::TuneError;
 pub mod ai;
 pub mod alarms;
 pub mod api_analytics;
+/// #8213 — arrêt programmé de la lecture à heure fixe.
+pub mod arret_programme;
 pub mod audio;
 pub mod bandcamp_veille;
 pub mod bug_report;

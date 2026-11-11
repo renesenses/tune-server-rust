@@ -57,6 +57,23 @@ impl SensDuGeste {
 /// entièrement refusée.
 pub const PLAFOND_REFUS_ENJAMBES_PAR_GESTE: usize = 500;
 
+/// Tête du motif rendu quand le geste n'a trouvé AUCUN titre jouable :
+/// tous les titres de la file dans ce sens sont refusés par le service.
+pub const MOTIF_AUCUN_TITRE_JOUABLE: &str = "aucun titre jouable";
+
+/// #8227 — le nombre de titres refusés quand le geste n'a trouvé aucun titre
+/// jouable (motif de [`PlaybackOrchestrator::jouer_en_enjambant_les_refus`]),
+/// `None` pour toute autre cause.
+pub fn titres_refuses_sans_titre_jouable(cause: &str) -> Option<usize> {
+    cause
+        .strip_prefix(MOTIF_AUCUN_TITRE_JOUABLE)?
+        .strip_prefix(", ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// Un titre sauté, tel qu'on le dit à l'utilisateur.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TitreSaute {
@@ -181,7 +198,7 @@ impl PlaybackOrchestrator {
 
             let aucun_jouable = || {
                 format!(
-                    "aucun titre jouable, {} titre(s) refusé(s) par le service \
+                    "{MOTIF_AUCUN_TITRE_JOUABLE}, {} titre(s) refusé(s) par le service \
                      ({cause})",
                     sautes.len()
                 )

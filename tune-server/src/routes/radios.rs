@@ -2000,6 +2000,12 @@ pub(crate) async fn jouer_un_flux(
     // #7051 — une station de l'annuaire n'est pas en base : le sondeur, qui y
     // cherche le logo, le retrouvera ici quand le premier titre arrivera.
     tune_core::poller::logo_de_lancement::retenir_le_logo_de_lancement(url, logo_url.as_deref());
+    // #8110 — les autres flux autorisés de la fiche : si le diffuseur refuse
+    // celui-ci, la lecture passe seule au suivant.
+    tune_core::orchestrator::retenir_les_replis_radio(
+        url,
+        geofencing::replis_autorises(state, url),
+    );
     let play_req = tune_core::orchestrator::PlayRequest {
         zone_id,
         output_device_id: None,
@@ -2803,7 +2809,7 @@ async fn list_radio_favorites(
     let rows = state
         .backend
         .query_many(
-            "SELECT id, title, artist, station_name, cover_url, stream_url, saved_at FROM radio_favorites ORDER BY saved_at DESC LIMIT ? OFFSET ?",
+            "SELECT id, title, artist, station_name, cover_url, stream_url, saved_at FROM radio_favorites ORDER BY saved_at DESC, id DESC LIMIT ? OFFSET ?",
             &[&limit as &dyn ToSqlValue, &offset as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
@@ -3032,7 +3038,7 @@ async fn create_playlist_from_favorites(
     let favorites: Vec<(String, String)> = state
         .backend
         .query_many(
-            "SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC",
+            "SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC, id DESC",
             &[],
         )
         .ou_defaut_journalise()
@@ -3505,7 +3511,7 @@ async fn apercu_appariement_favoris(
     let favoris: Vec<(i64, String, String, String, Option<String>)> = state
         .backend
         .query_many(
-            "SELECT id, title, artist, station_name, cover_url FROM radio_favorites ORDER BY saved_at DESC LIMIT ?",
+            "SELECT id, title, artist, station_name, cover_url FROM radio_favorites ORDER BY saved_at DESC, id DESC LIMIT ?",
             &[&limit_sql as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?

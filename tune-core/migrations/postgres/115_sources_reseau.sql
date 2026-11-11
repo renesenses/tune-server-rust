@@ -1,6 +1,6 @@
--- 109_sources_reseau.sql
+-- 115_sources_reseau.sql
 --
--- #8189 : jumelle de la migration SQLite 143 (même DDL,
+-- #8189 : jumelle de la migration SQLite 149 (même DDL,
 -- tune-core/migrations/sources_reseau.sql). Idempotent.
 
 BEGIN;
@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS sources_reseau (
 )
 ;
 
-INSERT INTO schema_version (version, name) VALUES (109, 'sources_reseau')
+INSERT INTO schema_version (version, name) VALUES (115, 'sources_reseau')
 ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

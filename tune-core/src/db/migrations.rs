@@ -2797,11 +2797,22 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     // (`apports_service`), en base seulement, réversibles. Jumelle PG : 108.
     // Numérotée 142 / PG 108 après #8093 (141 / PG 107, contenus explicites).
     Migration { version: 142, name: "apports_service", up: include_str!("../../migrations/apports_service.sql") },
+    // #8119 — la station semée « PureClassic Radio » (France, Jazz) est
+    // « Pure Classix Radio » (Pays-Bas, Oldies) : seule la fiche semée restée
+    // telle quelle est corrigée. Même texte que la jumelle PG 109.
+    // Numérotée 143 / PG 109 au 09/11 ; la PR de #8160 (spectrogrammes)
+    // réclame aussi 143 / 109 : celle qui fusionne après l'autre se renumérote.
+    Migration {
+        version: 143,
+        name: "correction_pure_classix",
+        up: include_str!("../../migrations/radios/correction_pure_classix_8119.sql"),
+    },
     // #8189 — les sources réseau lues sans montage (socle « source
-    // distante », étape 2). Numérotée 143 / PG 109, numéros libres dans
-    // `batch/bugs-rc12-20261108` au 09/11 (dernières : 142 / PG 108) ; celle
-    // qui fusionne après une autre PR réclamant 143 se renumérote.
-    Migration { version: 143, name: "sources_reseau", up: include_str!("../../migrations/sources_reseau.sql") },
+    // distante », étape 2). Numérotée 149 / PG 115 le 11/11 : 143 / PG 109
+    // sont pris par #8119 dans le lot, 144 à 148 / PG 110 à 114 sont
+    // réservés à d'autres PR (dont #8160, spectrogrammes, en 148 / PG 114)
+    // qui fusionnent avant celle-ci.
+    Migration { version: 149, name: "sources_reseau", up: include_str!("../../migrations/sources_reseau.sql") },
 ];
 
 /// L'index partiel des pistes marquées explicites (#8088), commun aux deux
@@ -5951,12 +5962,23 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "apports_service",
         include_str!("../../migrations/postgres/108_apports_service.sql"),
     ),
-    // Jumelle de la SQLite 143 (#8189) : les sources réseau, même DDL
-    // (`migrations/sources_reseau.sql`).
+    // Jumelle de la SQLite 143 (#8119) : même texte, plus sa marque de version.
     (
         109,
+        "correction_pure_classix",
+        concat!(
+            include_str!("../../migrations/radios/correction_pure_classix_8119.sql"),
+            "\nINSERT INTO schema_version (version, name) \
+             VALUES (109, 'correction_pure_classix') \
+             ON CONFLICT (version) DO NOTHING;\n"
+        ),
+    ),
+    // Jumelle de la SQLite 149 (#8189) : les sources réseau, même DDL
+    // (`migrations/sources_reseau.sql`).
+    (
+        115,
         "sources_reseau",
-        include_str!("../../migrations/postgres/109_sources_reseau.sql"),
+        include_str!("../../migrations/postgres/115_sources_reseau.sql"),
     ),
 ];
 
@@ -9638,9 +9660,12 @@ mod tests {
         // `tracks.explicit`, que l'INSERT et l'UPDATE des pistes NOMMENT.
         // 108 : `apports_service` (#8077), jumelle de la SQLite 142. Crée les
         // tables des apports Qobuz, que la fiche album NOMME.
-        // 109 : `sources_reseau` (#8189), jumelle de la SQLite 143. Crée la
+        // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
+        // Migration de DONNÉES : le nom, le pays et le genre de la station
+        // semée sous « PureClassic Radio ».
+        // 115 : `sources_reseau` (#8189), jumelle de la SQLite 149. Crée la
         // table des sources réseau lues sans montage.
-        assert_eq!(pg_latest_version(), 109, "latest PG migration must be 109");
+        assert_eq!(pg_latest_version(), 115, "latest PG migration must be 115");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
@@ -10923,3 +10948,65 @@ mod tests_playlist_titres_de_service_4889 {
 #[cfg(test)]
 #[path = "radio_external_id_6516_tests.rs"]
 mod tests_radio_external_id_6516;
+
+#[cfg(test)]
+mod tests_pure_classix_8119 {
+    use super::*;
+
+    const FLUX: &str = "http://mscp4.live-streams.nl:8140/flac.ogg";
+
+    fn fiche(db: &SqliteDb) -> Vec<(String, Option<String>, Option<String>)> {
+        let conn = db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name, country, genre FROM radio_stations WHERE url = ?1")
+            .unwrap();
+        stmt.query_map([FLUX], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// #8119 — une installation neuve (semis du 30/08 puis migrations) a la
+    /// station sous son vrai nom, avec son pays et son genre.
+    #[test]
+    fn une_base_neuve_a_pure_classix_avec_un_x_8119() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        assert_eq!(
+            fiche(&db),
+            vec![(
+                "Pure Classix Radio".to_string(),
+                Some("Pays-Bas".to_string()),
+                Some("Oldies".to_string())
+            )],
+            "🔴 la station semée garde le nom « PureClassic Radio » (France, Jazz) au \
+             lieu de « Pure Classix Radio » (Pays-Bas, Oldies) (#8119)"
+        );
+    }
+
+    /// Une station renommée à la main, ou dont seul le genre a été changé,
+    /// garde ce que l'utilisateur a écrit ; la correction se rejoue sans effet.
+    #[test]
+    fn une_fiche_retouchee_par_l_utilisateur_n_est_pas_reecrite_8119() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        db.execute_batch(&format!(
+            "UPDATE radio_stations SET name = 'Ma radio du matin', country = 'France', \
+             genre = 'Jazz' WHERE url = '{FLUX}';"
+        ))
+        .unwrap();
+        let sql = include_str!("../../migrations/radios/correction_pure_classix_8119.sql");
+        db.execute_batch(sql).unwrap();
+        db.execute_batch(sql).unwrap();
+        assert_eq!(
+            fiche(&db),
+            vec![(
+                "Ma radio du matin".to_string(),
+                Some("France".to_string()),
+                Some("Jazz".to_string())
+            )]
+        );
+    }
+}

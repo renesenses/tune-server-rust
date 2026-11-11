@@ -9,7 +9,7 @@
 -- `identifiants_refuses`, `non_prise_en_charge`.
 -- `reprise_scan` : le point de reprise d'un parcours interrompu (JSON).
 --
--- Même texte pour SQLite (143) et PostgreSQL (109).
+-- Même texte pour SQLite (149) et PostgreSQL (115).
 CREATE TABLE IF NOT EXISTS sources_reseau (
  id TEXT PRIMARY KEY,
  type_source TEXT NOT NULL,
