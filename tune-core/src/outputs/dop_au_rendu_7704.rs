@@ -245,6 +245,16 @@ mod tests {
             flux.extend(out);
         }
         verifier(&flux);
+        let releve = ring.starvation().snapshot();
+        assert_eq!(releve.events, 1, "la pause ne compte pas comme famine");
+        assert_eq!(
+            releve.missing_samples, 6,
+            "le repos ne masque pas la famine"
+        );
+        assert_eq!(
+            releve.served_samples, 148,
+            "les périodes muettes avancent l'horloge"
+        );
     }
 
     #[test]
