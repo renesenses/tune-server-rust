@@ -2502,12 +2502,16 @@ async fn spotify_diagnostic(State(state): State<StreamingHttpState>) -> Response
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let svc = svc.read().await;
-    match svc
-        .as_any()
-        .downcast_ref::<tune_core::streaming::spotify::SpotifyService>()
-    {
-        Some(spotify) => Json(spotify.diagnostic().await).into_response(),
+    // #8198 — copie sous le verrou, sondes de Spotify verrou relache : une
+    // page de diagnostic ne doit bloquer ni l'ecoute ni une connexion.
+    let instantane = {
+        let svc = svc.read().await;
+        svc.as_any()
+            .downcast_ref::<tune_core::streaming::spotify::SpotifyService>()
+            .map(|spotify| spotify.instantane_diagnostic())
+    };
+    match instantane {
+        Some(instantane) => Json(instantane.rapport().await).into_response(),
         None => (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({"code": "spotify_diagnostic_indisponible", "service": "spotify"})),
