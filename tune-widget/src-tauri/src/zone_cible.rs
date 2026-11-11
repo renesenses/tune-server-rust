@@ -32,8 +32,18 @@ fn id_de(z: &Value) -> Option<i64> {
 }
 
 /// La zone par défaut d'après la réponse de `GET /api/v1/widget/data`.
+///
+/// Le serveur énumère ses zones dans un ordre qui n'est pas stable (une table
+/// de hachage) : on les trie par identifiant, pour que « la première » soit
+/// toujours la même d'un appui à l'autre.
 pub fn zone_par_defaut(donnees: &Value) -> Option<i64> {
-    let zones = donnees.get("zones")?.as_array()?;
+    let mut zones: Vec<&Value> = donnees
+        .get("zones")?
+        .as_array()?
+        .iter()
+        .filter(|z| id_de(z).is_some())
+        .collect();
+    zones.sort_by_key(|z| id_de(z));
     zones
         .iter()
         .find(|z| joue_vraiment(z))
@@ -43,7 +53,7 @@ pub fn zone_par_defaut(donnees: &Value) -> Option<i64> {
                 .find(|z| z.get("state").and_then(Value::as_str) == Some("paused"))
         })
         .or_else(|| zones.first())
-        .and_then(id_de)
+        .and_then(|z| id_de(z))
 }
 
 #[cfg(test)]
@@ -68,8 +78,11 @@ mod tests {
             {"zone_id": 5, "state": "paused"},
         ]});
         assert_eq!(zone_par_defaut(&d), Some(5));
-        let d = json!({"zones": [{"zone_id": 3, "state": "stopped"}, {"zone_id": 9, "state": "stopped"}]});
+        // Ordre de la réponse quelconque : la plus petite zone, toujours.
+        let d = json!({"zones": [{"zone_id": 9, "state": "stopped"}, {"zone_id": 3, "state": "stopped"}]});
         assert_eq!(zone_par_defaut(&d), Some(3));
+        let d = json!({"zones": [{"zone_id": 8, "state": "paused"}, {"zone_id": 5, "state": "paused"}]});
+        assert_eq!(zone_par_defaut(&d), Some(5));
     }
 
     #[test]
