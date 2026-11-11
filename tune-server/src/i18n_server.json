@@ -3008,6 +3008,23 @@
     "pl": "„{a}” i „{b}” grają przez ASIO: sterownik ASIO odtwarza na tym komputerze tylko jedną strefę naraz, więc nie mogą grać razem. Przełącz jedną z nich na WASAPI, aby je zgrupować.",
     "el": "Οι «{a}» και «{b}» βγαίνουν μέσω ASIO: το πρόγραμμα οδήγησης ASIO αναπαράγει μόνο μία ζώνη τη φορά σε αυτόν τον υπολογιστή, οπότε δεν μπορούν να παίξουν μαζί. Αλλάξτε μία από τις δύο σε WASAPI για να τις ομαδοποιήσετε."
   },
+  "zonegroup.asioUnsupported": {
+    "fr": "La lecture groupée n'est possible qu'en WASAPI : « {zone} » sort par ASIO. Passez ces sorties en WASAPI (exclusif ou partagé) dans les réglages audio, puis groupez-les.",
+    "en": "Grouped playback is only possible with WASAPI: “{zone}” plays through ASIO. Switch these outputs to WASAPI (exclusive or shared) in the audio settings, then group them.",
+    "de": "Gruppierte Wiedergabe ist nur mit WASAPI möglich: „{zone}“ gibt über ASIO aus. Stellen Sie diese Ausgänge in den Audioeinstellungen auf WASAPI (exklusiv oder geteilt) um und gruppieren Sie sie dann.",
+    "es": "La reproducción agrupada solo es posible con WASAPI: «{zone}» sale por ASIO. Pase estas salidas a WASAPI (exclusivo o compartido) en los ajustes de audio y luego agrúpelas.",
+    "it": "La riproduzione raggruppata è possibile solo con WASAPI: «{zone}» esce tramite ASIO. Passa queste uscite a WASAPI (esclusivo o condiviso) nelle impostazioni audio, poi raggruppale.",
+    "zh": "编组播放仅支持 WASAPI：「{zone}」通过 ASIO 输出。请在音频设置中将这些输出切换为 WASAPI（独占或共享），然后再编组。",
+    "ja": "グループ再生は WASAPI でのみ可能です。「{zone}」は ASIO で出力されています。オーディオ設定でこれらの出力を WASAPI（排他または共有）に切り替えてから、グループ化してください。",
+    "ko": "그룹 재생은 WASAPI에서만 가능합니다. '{zone}'은(는) ASIO로 출력됩니다. 오디오 설정에서 이 출력들을 WASAPI(배타 또는 공유)로 바꾼 뒤 그룹으로 묶으세요.",
+    "ro": "Redarea grupată este posibilă doar cu WASAPI: „{zone}” iese prin ASIO. Treceți aceste ieșiri pe WASAPI (exclusiv sau partajat) în setările audio, apoi grupați-le.",
+    "sv": "Grupperad uppspelning är bara möjlig med WASAPI: ”{zone}” spelar via ASIO. Byt dessa utgångar till WASAPI (exklusivt eller delat) i ljudinställningarna och gruppera dem sedan.",
+    "hu": "A csoportos lejátszás csak WASAPI-val lehetséges: „{zone}” ASIO-n keresztül szól. Állítsa át ezeket a kimeneteket WASAPI-ra (kizárólagos vagy megosztott) a hangbeállításokban, majd csoportosítsa őket.",
+    "vi": "Phát theo nhóm chỉ khả dụng với WASAPI: “{zone}” phát qua ASIO. Hãy chuyển các đầu ra này sang WASAPI (độc quyền hoặc dùng chung) trong cài đặt âm thanh, rồi nhóm chúng lại.",
+    "nb": "Gruppert avspilling er bare mulig med WASAPI: «{zone}» spiller via ASIO. Bytt disse utgangene til WASAPI (eksklusiv eller delt) i lydinnstillingene, og grupper dem deretter.",
+    "pl": "Odtwarzanie grupowe jest możliwe tylko w WASAPI: „{zone}” gra przez ASIO. Przełącz te wyjścia na WASAPI (wyłączny lub współdzielony) w ustawieniach audio, a następnie je zgrupuj.",
+    "el": "Η ομαδική αναπαραγωγή είναι δυνατή μόνο με WASAPI: η «{zone}» βγαίνει μέσω ASIO. Αλλάξτε αυτές τις εξόδους σε WASAPI (αποκλειστική ή κοινόχρηστη) στις ρυθμίσεις ήχου και μετά ομαδοποιήστε τες."
+  },
   "browse.hint.windowsMappedDrive": {
     "fr": "« {drive} » est un lecteur réseau mappé : sous Windows, une lettre de lecteur n'appartient qu'à la session qui l'a créée et reste invisible au service Tune. Indiquez le chemin UNC du partage (\\\\serveur\\partage) au lieu de la lettre.",
     "en": "“{drive}” is a mapped network drive: on Windows a drive letter belongs only to the session that created it and stays invisible to the Tune service. Use the share's UNC path (\\\\server\\share) instead of the letter.",
