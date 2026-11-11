@@ -1129,6 +1129,9 @@ mod titre_radio_didl_2991;
 
 mod fin_de_piste;
 // #6932 — la zone navigateur dont la piste est finie enchaîne sans son lecteur.
+/// #8480 — le `next` du lecteur d'une zone navigateur en fin de file joue la
+/// fin de file du sondeur (lecture automatique).
+mod fin_de_file_du_lecteur_8480;
 mod fin_navigateur_6932;
 /// #4382 — un `Next` acquitté que le transport déclare ignoré.
 mod next_ignore_4382;
