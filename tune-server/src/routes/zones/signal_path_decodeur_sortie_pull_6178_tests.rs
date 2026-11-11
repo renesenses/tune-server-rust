@@ -149,6 +149,38 @@ fn dlna_avec_replaygain_garde_son_decodeur_8462() {
     assert_eq!(noms(&sp).get(1).map(String::as_str), Some("Decoder"));
 }
 
+/// #8462 — témoin : Spotify vers DLNA, fil pas encore connu. librespot
+/// décode l'Ogg Vorbis dans Tune : l'étape reste.
+#[test]
+fn dlna_spotify_sans_fil_connu_garde_son_decodeur_8462() {
+    let db = SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    tune_core::db::migrations::run_migrations(&db).unwrap();
+    let backend: Arc<dyn DbBackend> = Arc::new(db);
+    let repo = ZoneRepo::with_backend(backend.clone());
+    let id = repo.create("Salon", Some("dlna"), Some("dev-1")).unwrap();
+    let zone = repo.get(id).unwrap().unwrap();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Piste".into(),
+            source: tune_core::streaming::spotify_lecture::SOURCE.into(),
+            format: Some("ogg".into()),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let sp = build_signal_path(&ps, &zone, &backend, Some("Renderer"), "none", None).unwrap();
+    assert!(
+        noms(&sp).contains(&"Decoder".to_string()),
+        "Spotify : Tune décode, {:?}",
+        noms(&sp)
+    );
+}
+
 fn etape<'a>(sp: &'a Value, nom: &str) -> Option<&'a Value> {
     sp["steps"]
         .as_array()

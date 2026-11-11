@@ -1876,7 +1876,8 @@ fn assembler_les_etapes_lang(
     // repli WAV du fil, conteneur réécrit), rééchantillonnage, DSP,
     // ReplayGain, compensation de niveau, crossfeed, réaffectation de canaux,
     // correction de pièce. Une radio garde son décodeur : son fil n'est pas
-    // forcément l'octet de la source (HLS, relais).
+    // forcément l'octet de la source (HLS, relais). Spotify aussi : librespot
+    // décode l'Ogg Vorbis dans Tune, même avant que le fil soit connu.
     let decode_par_le_renderer = matches!(output_type, "dlna" | "openhome")
         && !transcode_active
         && !dsp_applique
@@ -1886,10 +1887,9 @@ fn assembler_les_etapes_lang(
         && !crossfeed_du_flux
         && reaffectation_step.is_none()
         && !correction_piece.as_ref().is_some_and(|cp| cp.applied)
-        && ps
-            .now_playing
-            .as_ref()
-            .is_none_or(|np| np.source != "radio");
+        && ps.now_playing.as_ref().is_none_or(|np| {
+            np.source != "radio" && np.source != tune_core::streaming::spotify_lecture::SOURCE
+        });
     if !is_dsd && !decode_par_la_sortie && !decode_par_le_renderer {
         let mut decodeur = json!({
             "name": "Decoder",
