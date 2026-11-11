@@ -242,6 +242,43 @@ printf '%s\n' "$SORTIE" | grep -q '^  moissonneur-' \
   && { printf '  RATE un tag moissonneur est juge sur sa forme\n'; rate=1; } \
   || printf '  OK   aucun tag moissonneur n est juge sur sa forme\n'
 
+echo
+echo "4d. la MEME version, le MEME fil, un CORRECTIF a une seule correction — la sonde se tait (#7861)"
+# Le corps exact de la v1.0.0-rc8.1 (27/10/2026) : un titre, une rubrique
+# reconnue, UNE puce. `parse_release_body` en tire un item, que le panneau
+# affiche — le repli « Release x.y.z » ne vient qu'a zero. La sonde horaire a
+# pourtant crie dessus toutes les heures pendant deux semaines, et rouvert le
+# jour meme une issue fermee sur decision (#7162 → #7861) : elle appliquait a
+# une note publiee le seuil de REDACTION (5), celui du mode --forme.
+cat > "$RACINE/correctif.md" <<'MD'
+# Tune 1.0.0-rc8.1
+
+## Fixes
+
+- **TIDAL: playback works again (rc8 regression, #7106).**
+MD
+verifier "le lecteur rend 1 correction" "1" "$(compter fixes "$RACINE/correctif.md")"
+poser_decor sonde-correctif "$RACINE/correctif.md"
+jouer sonde-correctif
+verifier "etat de sortie 0 (un item, le panneau l affichera)" "0" "$ETAT"
+printf '%s' "$SORTIE" | grep -q 'Notes illisibles par le panneau' \
+  && { printf '  RATE la sonde crie sur une note que le panneau affiche\n%s\n' "$SORTIE"; rate=1; } \
+  || printf '  OK   aucun cri\n'
+printf '%s' "$SORTIE" | grep -q 'v0\.9\.163 : note courte, 1 item' \
+  && printf '  OK   la sonde dit la note courte, sans crier\n' \
+  || { printf '  RATE la note courte n est pas dite\n%s\n' "$SORTIE"; rate=1; }
+# Le silence doit venir du SEUIL, pas d'un controle eteint : a
+# ITEMS_MINIMUM_VEILLE=2, la meme note fait rougir la meme sonde.
+DECOR="$RACINE/sonde-correctif" PATH="$RACINE/bin:$PATH" \
+FORUM_TOKEN=x GITHUB_REPOSITORY=renesenses/tune-server-rust GH_TOKEN=x \
+SANS_ISSUE=1 MAINTENANT_ISO="$MAINTENANT" ITEMS_MINIMUM_VEILLE=2 \
+  bash "$SONDE" > "$RACINE/correctif-seuil.sortie" 2>&1
+verifier "etat 1 sur la meme note avec ITEMS_MINIMUM_VEILLE=2" "1" "$?"
+# Et la regle de redaction ne bouge pas : AVANT publication, un seul item est
+# refuse, comme avant.
+bash "$SONDE" --forme "$RACINE/correctif.md" > /dev/null 2>&1
+verifier "le mode --forme refuse toujours la note a 1 item (etat 1)" "1" "$?"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Les tables de mots-cles : awk et Rust doivent dire la MEME chose.
 #

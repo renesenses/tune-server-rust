@@ -2928,6 +2928,42 @@ impl StreamingService for TidalService {
         ))
     }
 
+    /// #8040 — UNE page de `/users/{id}/favorites/{type}`, en UNE requête :
+    /// l'écran Favoris affiche la première page sans attendre les suivantes.
+    ///
+    /// Tidal plafonne la page à [`Self::PAGE_FAVORIS`] : une `limit` plus
+    /// grande est ramenée à ce plafond, et le `total` annoncé dit au client
+    /// ce qui reste.
+    async fn get_user_favorites_page(
+        &self,
+        fav_type: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<PageFavoris>, TuneError> {
+        if !matches!(fav_type, "tracks" | "albums" | "artists") {
+            return Ok(None);
+        }
+        let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
+        let limit = limit.clamp(1, Self::PAGE_FAVORIS);
+        let data = self
+            .api_get(&format!(
+                "/users/{user_id}/favorites/{fav_type}?limit={limit}&offset={offset}"
+            ))
+            .await?;
+        let items = data["items"]
+            .as_array()
+            .map(|lot| {
+                lot.iter()
+                    .filter_map(|e| Self::favori_date(e, fav_type))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let total = data["totalNumberOfItems"]
+            .as_u64()
+            .and_then(|t| usize::try_from(t).ok());
+        Ok(Some(PageFavoris { items, total }))
+    }
+
     /// #5997 — la même liste datée, mais `Err` si Tidal ne l'a pas servie en
     /// entier : c'est elle que le miroir réconcilie.
     async fn favoris_dates_complets(
@@ -5582,6 +5618,126 @@ mod favoris_complets_5997 {
             .unwrap()
             .unwrap();
         assert_eq!(affichage.len(), 100);
+    }
+}
+
+/// #8040 — une page des favoris Tidal se lit en UNE requête, avec le total
+/// annoncé : c'est ce qui permet à l'écran d'afficher la première page tout
+/// de suite. La lecture entière (#5997) reste celle du miroir.
+#[cfg(test)]
+mod favoris_pagines_8040 {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex as SyncMutex;
+
+    /// Les `(limit, offset)` reçus par le faux Tidal, dans l'ordre.
+    type Journal = Arc<SyncMutex<Vec<(usize, usize)>>>;
+
+    /// Un TIDAL factice de `total` titres favoris, qui note chaque page
+    /// demandée et plafonne la page à 100 comme le vrai.
+    async fn faux_tidal(total: usize) -> (TidalService, Journal) {
+        use axum::extract::{Query, State};
+        use axum::routing::get;
+        async fn favoris(
+            State((journal, total)): State<(Journal, usize)>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::Json<serde_json::Value> {
+            let offset: usize = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let limit: usize = q
+                .get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10)
+                .min(100);
+            journal.lock().unwrap().push((limit, offset));
+            let items: Vec<_> = (offset..(offset + limit).min(total))
+                .map(|i| {
+                    json!({"created": "2026-10-01T10:00:00.000+0000",
+                        "item": {"id": i + 1, "title": format!("piste {}", i + 1)}})
+                })
+                .collect();
+            axum::Json(json!({"limit": limit, "offset": offset,
+                "totalNumberOfItems": total, "items": items}))
+        }
+        let journal: Journal = Arc::default();
+        let app = axum::Router::new()
+            .route("/users/7/favorites/tracks", get(favoris))
+            .with_state((journal.clone(), total));
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let mut svc = TidalService::new();
+        svc.base_forcee = Some(format!("http://{adresse}"));
+        svc.user_id = Some(7);
+        svc.tokens = Mutex::new(TokenState {
+            access_token: Some("jeton-essai".into()),
+            refresh_token: None,
+            token_expires: None,
+        });
+        (svc, journal)
+    }
+
+    /// 120 favoris : la page `limit=50&offset=0` ne coûte qu'UNE requête,
+    /// rend 50 titres datés et annonce le total de 120.
+    #[tokio::test]
+    async fn une_page_se_lit_en_une_requete_avec_le_total_8040() {
+        let (svc, journal) = faux_tidal(120).await;
+        let page = svc
+            .get_user_favorites_page("tracks", 50, 0)
+            .await
+            .expect("lecture de la page")
+            .expect("tidal sait lire une page");
+        assert_eq!(page.total, Some(120), "#8040 : le total annoncé par Tidal");
+        let ids: Vec<_> = page
+            .items
+            .iter()
+            .map(|p| p["source_id"].as_str().unwrap_or("").to_string())
+            .collect();
+        let attendus: Vec<_> = (1..=50).map(|id| id.to_string()).collect();
+        assert_eq!(
+            ids, attendus,
+            "#8040 : les 50 premiers favoris, dans l'ordre"
+        );
+        assert!(
+            page.items.iter().all(|p| p["created_at"].is_string()),
+            "#8040 : la page porte la date de mise en favori, comme la liste entière (#3489)"
+        );
+        assert_eq!(
+            *journal.lock().unwrap(),
+            vec![(50, 0)],
+            "#8040 : une page = UNE requête chez Tidal, à la page demandée"
+        );
+    }
+
+    /// La deuxième page part du décalage demandé ; une limite au-delà du
+    /// plafond de Tidal est ramenée à 100 au lieu d'être recopiée telle quelle.
+    #[tokio::test]
+    async fn le_decalage_est_transmis_et_la_limite_plafonnee_8040() {
+        let (svc, journal) = faux_tidal(120).await;
+        let page = svc
+            .get_user_favorites_page("tracks", 500, 50)
+            .await
+            .expect("lecture de la page")
+            .expect("tidal sait lire une page");
+        assert_eq!(page.items.len(), 70, "#8040 : de 51 à 120");
+        assert_eq!(page.items[0]["source_id"], json!("51"));
+        assert_eq!(*journal.lock().unwrap(), vec![(100, 50)]);
+    }
+
+    /// Les playlists ne sont pas une liste de favoris Tidal : `None`, et la
+    /// route lit alors la liste entière comme avant.
+    #[tokio::test]
+    async fn les_playlists_ne_se_paginent_pas_chez_tidal_8040() {
+        let (svc, journal) = faux_tidal(3).await;
+        let page = svc
+            .get_user_favorites_page("playlists", 50, 0)
+            .await
+            .expect("pas d'erreur");
+        assert!(page.is_none());
+        assert!(journal.lock().unwrap().is_empty());
     }
 }
 

@@ -22,6 +22,11 @@ struct Options {
     /// #7869 — octets poussés dès l'ouverture, sur chaque connexion après la
     /// première.
     octets_a_l_ouverture: Option<&'static [u8]>,
+    /// #8395 — faux HQPlayer 3 Desktop : ses `Status` sont au format
+    /// `min`/`sec` (journal 3.18.2), et une fois le moteur lancé par `Play`
+    /// il pousse un `Status` sur cette connexion, AVANT l'acquittement du
+    /// `Play` puis après chaque réponse (le pire ordre envisageable).
+    hqplayer_3_pousse_avant_acquittement: bool,
 }
 #[derive(Default)]
 struct Etat {
@@ -58,6 +63,7 @@ impl Banc {
                         clients.spawn(async move {
                             let mut socket = BufReader::new(socket);
                             let mut acquittement_retarde = false;
+                            let mut moteur_lance_ici = false;
                             if let Some(octets) = options.octets_a_l_ouverture
                                 && id > 1
                                 && socket.get_mut().write_all(octets).await.is_err()
@@ -74,6 +80,7 @@ impl Banc {
                                     let mut e = etat.lock().unwrap();
                                     e.commandes.push((id, line.into()));
                                     match root.as_str() {
+                                        "Status" if options.hqplayer_3_pousse_avant_acquittement => format!(r#"<Status state="{}" track="1" min="0" sec="1" clips="0"/>"#, e.transport),
                                         "Status" => format!(r#"<Status state="{}" position="0" length="300" title="Beyoncé"><metadata uri="{}" /></Status>"#, e.transport, e.uri),
                                         "Stop" => { e.transport = 0; r#"<Stop result="OK"/>"#.into() },
                                         "PlaylistClear" if options.mauvaise_reponse_clear => r#"<Status state="0" position="0" length="300"/>"#.into(),
@@ -93,6 +100,19 @@ impl Banc {
                                     // L'ancien client reprendrait cette réponse décalée
                                     // pour celle du Status qu'il vient d'envoyer.
                                     if socket.get_mut().write_all(b"<Pause result=\"OK\"/>").await.is_err() { return; }
+                                }
+                                if options.hqplayer_3_pousse_avant_acquittement {
+                                    let mut trame = Vec::new();
+                                    if root == "Play" {
+                                        moteur_lance_ici = true;
+                                        trame.extend_from_slice(STATUS_POUSSE_HQP3);
+                                        trame.extend_from_slice(reponse.as_bytes());
+                                    } else {
+                                        trame.extend_from_slice(reponse.as_bytes());
+                                        if moteur_lance_ici { trame.extend_from_slice(STATUS_POUSSE_HQP3); }
+                                    }
+                                    if socket.get_mut().write_all(&trame).await.is_err() { return; }
+                                    continue;
                                 }
                                 if root == "Stop" && options.stop_lent {
                                     tokio::time::sleep(std::time::Duration::from_millis(1170)).await;
@@ -336,6 +356,8 @@ async fn status_ne_peut_pas_acquitter_playlistclear_7244() {
 // naît que d'octets restés après une réponse ou arrivés entre deux commandes.
 
 const STATUS_POUSSE: &[u8] = br#"<Status state="2" position="12" length="300"/>"#;
+/// #8395 — un `Status` poussé par HQPlayer Desktop 3.18.2 (journal public).
+const STATUS_POUSSE_HQP3: &[u8] = br#"<Status state="2" track="1" min="0" sec="2" clips="0"/>"#;
 
 #[tokio::test]
 async fn octets_non_sollicites_une_fois_la_commande_reussit_apres_reconnexion_7869() {
@@ -422,6 +444,54 @@ async fn hqplayer_3_octets_apres_chaque_reponse_la_lecture_aboutit_7869() {
             TransportState::Playing
         );
     }
+}
+
+/// #8395 — témoin : un faux HQPlayer 3 qui pousse ses `Status` dès `Play`,
+/// avant même l'acquittement. Sans le correctif, `play_media` échouait sur
+/// `hqplayer_control_reply_mismatch: expected Play, received <Status …`.
+#[tokio::test]
+async fn hqplayer_3_status_pousses_des_play_8395() {
+    let b = Banc::nouveau(Options {
+        hqplayer_3_pousse_avant_acquittement: true,
+        ..Default::default()
+    })
+    .await;
+    let sortie = b.sortie();
+    let issue = sortie.play_media(&media()).await;
+    let play = b.commandes("Play");
+    eprintln!("8395 temoin: play_media={issue:?} Play={play}");
+    issue.unwrap_or_else(|e| panic!("#8395 : lecture HQPlayer 3 refusée : {e}"));
+    assert_eq!(play, 1, "le Play n'est jamais envoyé deux fois");
+    let statut = sortie.get_status().await.expect("Status après Play");
+    assert_eq!(statut.state, TransportState::Playing);
+    sortie.action("<Pause />").await.expect("Pause après Play");
+    assert_eq!(
+        b.etat.lock().unwrap().connexions,
+        1,
+        "les Status poussés ne font pas rouvrir la connexion"
+    );
+}
+
+#[test]
+fn seuls_les_status_hqplayer_3_sont_retires_8395() {
+    let mut pending = b" <Status state=\"2\" track=\"1\" min=\"0\" sec=\"2\" clips=\"0\"/>\n<Status state=\"2\" min=\"0\" sec=\"3\"/>".to_vec();
+    retirer_les_status_pousses_hqplayer_3(&mut pending);
+    assert!(pending.iter().all(u8::is_ascii_whitespace), "{pending:?}");
+    for reste in [
+        STATUS_POUSSE,
+        &b"\0"[..],
+        &b"<Pause result=\"OK\"/>"[..],
+        &b"<Status state=\"2\" min=\"0\""[..],
+    ] {
+        let mut pending = [STATUS_POUSSE_HQP3, reste].concat();
+        retirer_les_status_pousses_hqplayer_3(&mut pending);
+        assert_eq!(pending, reste, "seul le Status HQPlayer 3 complet part");
+    }
+    // Un octet parasite DEVANT le Status : rien n'est retiré, #7869 s'applique.
+    let colle = [&b"\0"[..], STATUS_POUSSE_HQP3].concat();
+    let mut pending = colle.clone();
+    retirer_les_status_pousses_hqplayer_3(&mut pending);
+    assert_eq!(pending, colle);
 }
 
 #[test]
