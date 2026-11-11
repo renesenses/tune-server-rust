@@ -1425,7 +1425,7 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE "C";
 ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id);
 -- radio_stations: surcharge locale d'une station de l'annuaire (SQLite
--- migration v144 / PG 110, web#2795). TEXT des deux côtés.
+-- migration v147 / PG 113, web#2795). TEXT des deux côtés.
 ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS surcharge_locale TEXT;
 -- artists: provenance du nom de tri (SQLite migration v131 / PG 095, #6474).
 ALTER TABLE artists ADD COLUMN IF NOT EXISTS sort_name_source TEXT;

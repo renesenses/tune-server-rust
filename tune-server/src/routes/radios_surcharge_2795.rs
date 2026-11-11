@@ -9,8 +9,8 @@
 //! plus une station surchargée ; « Revenir à la fiche de l'annuaire » efface
 //! la surcharge.
 //!
-//! La surcharge est une date (`radio_stations.surcharge_locale`, SQLite 144 /
-//! PG 110) : NULL, la station suit sa fiche.
+//! La surcharge est une date (`radio_stations.surcharge_locale`, SQLite 147 /
+//! PG 113) : NULL, la station suit sa fiche.
 
 use super::*;
 

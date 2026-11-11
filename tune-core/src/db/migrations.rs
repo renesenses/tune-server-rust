@@ -2814,11 +2814,11 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     // plus ; « Revenir à la fiche de l'annuaire » la remet à NULL.
     //
     // Colonne posée dans le bloc de version et dans la passe finale, PAS dans
-    // `up` : même règle qu'à la 126. Jumelle PG : 110. Numérotée 144 / PG 110
-    // au 11/11 ; #8405, #8334 et #8243 réclament aussi 144 / 110 : celle qui
-    // fusionne après les autres se renumérote.
+    // `up` : même règle qu'à la 126. Jumelle PG : 113. Renumérotée 147 / PG 113
+    // le 11/11, ordre du lot : #8243 144/110, #8334 145/111, #8090 146/112,
+    // puis #8429 147/113.
     Migration {
-        version: 144,
+        version: 147,
         name: "radio_stations_surcharge_locale",
         up: "",
     },
@@ -3041,7 +3041,7 @@ const SQL_INDEX_RADIO_EXTERNAL_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id)";
 
 /// Garantit `radio_stations.surcharge_locale` (web#2795) — bloc de version de
-/// la 144 et passe finale. NULL pour l'existant : aucune station surchargée.
+/// la 147 et passe finale. NULL pour l'existant : aucune station surchargée.
 fn surcharge_locale_des_radios(db: &SqliteDb) {
     add_column_if_missing(db, "radio_stations", "surcharge_locale", "TEXT");
 }
@@ -4300,7 +4300,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // #8088 — le marquage explicite de la balise, et son index.
             marquage_explicite_des_pistes(db);
         }
-        if migration.version == 144 {
+        if migration.version == 147 {
             // web#2795 — la surcharge locale des stations de l'annuaire.
             surcharge_locale_des_radios(db);
         }
@@ -4916,8 +4916,8 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // Le lien des radios avec l'annuaire (migration 126, #6516) — posé ICI
     // aussi : le rapprochement le NOMME. PG : migration 090.
     lien_des_radios_avec_l_annuaire(db);
-    // La surcharge locale des radios (migration 144, web#2795) — posée ICI
-    // aussi : la liste et le relevé de l'annuaire la NOMMENT. PG : 110.
+    // La surcharge locale des radios (migration 147, web#2795) — posée ICI
+    // aussi : la liste et le relevé de l'annuaire la NOMMENT. PG : 113.
     surcharge_locale_des_radios(db);
     // L'ordre des etiquettes (migration 127, #6257) — pose ICI aussi :
     // l'INSERT des etiquettes le NOMME. Sans rangement : toutes a 0, la liste
@@ -5995,12 +5995,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
              ON CONFLICT (version) DO NOTHING;\n"
         ),
     ),
-    // Jumelle de la SQLite 144 (web#2795) : `radio_stations.surcharge_locale`,
+    // Jumelle de la SQLite 147 (web#2795) : `radio_stations.surcharge_locale`,
     // la surcharge locale d'une station de l'annuaire, NULL pour l'existant.
     (
-        110,
+        113,
         "radio_stations_surcharge_locale",
-        include_str!("../../migrations/postgres/110_radio_stations_surcharge_locale.sql"),
+        include_str!("../../migrations/postgres/113_radio_stations_surcharge_locale.sql"),
     ),
 ];
 
@@ -9685,10 +9685,10 @@ mod tests {
         // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
         // Migration de DONNÉES : le nom, le pays et le genre de la station
         // semée sous « PureClassic Radio ».
-        // 110 : `radio_stations_surcharge_locale` (web#2795), jumelle de la
-        // SQLite 144. Pose la surcharge locale d'une station de l'annuaire, que
+        // 113 : `radio_stations_surcharge_locale` (web#2795), jumelle de la
+        // SQLite 147. Pose la surcharge locale d'une station de l'annuaire, que
         // la liste et le relevé NOMMENT.
-        assert_eq!(pg_latest_version(), 110, "latest PG migration must be 110");
+        assert_eq!(pg_latest_version(), 113, "latest PG migration must be 113");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
