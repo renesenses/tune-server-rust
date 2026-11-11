@@ -54,27 +54,53 @@ pub const REGLAGE_AVANCEMENT_CREDITS_RELEASES: &str = "enrich_credits_releases_s
 /// automatique par enregistrement (`credits_enrich_auto`) s'efface devant elle.
 pub const TACHE_CREDITS_RELEASES: &str = "credits_releases";
 
-/// Rôles de MUSICIEN : ils font entrer un disque dans « Collaborations ».
+/// Rôles AUDIBLES — la table UNIQUE (#7767, décision du 03/11) : ils font
+/// entrer un disque d'autrui dans « Apparaît sur » (`collaborations`) et
+/// comptent dans `credit_counts.performing`.
 ///
 /// `artist` est l'`artist-credit` de l'enregistrement (l'interprète en tête du
 /// titre) ; les autres viennent des relations (`instrument`, `vocal`,
-/// `performer`, `performing orchestra`, `conductor`), canonisées par
-/// `credits_mb::role_canonique`.
-pub const ROLES_DE_MUSICIEN: &[&str] = &["artist", "performer", "vocal", "conductor"];
+/// `performer`, `performing orchestra`, `conductor`, `remixer`), canonisées
+/// par `credits_mb::role_canonique`. L'arrangeur n'est PAS audible.
+pub const ROLES_AUDIBLES: &[&str] = &["artist", "performer", "vocal", "conductor", "remixer"];
 
-/// Rôles d'AUTEUR : seuls, ils font entrer un disque dans « Reprises ».
+/// Rôles d'AUTEUR : seuls (aucun rôle audible sur tout le disque), ils font
+/// entrer un disque dans « Reprises » (`covers`).
 ///
 /// `writer` porte le parolier : `credits_mb::role_canonique` range `lyricist`,
 /// `writer` et `librettist` sous ce mot depuis CRD-1, et les règles `credit`
 /// des Smart Collections le lisent ainsi.
 pub const ROLES_D_AUTEUR: &[&str] = &["composer", "writer"];
 
-pub fn est_role_de_musicien(role: &str) -> bool {
-    ROLES_DE_MUSICIEN.contains(&role)
+/// Rôles d'ÉCRITURE ET DE PRODUCTION (#7767) : ils font entrer un disque
+/// hors de sa discographie dans « Écriture et production » (`writing`),
+/// qu'il y soit audible ou non, et comptent dans `credit_counts.writing`.
+/// `mastering` et `programming` n'en sont pas (hors de la liste du 03/11).
+pub const ROLES_D_ECRITURE: &[&str] = &[
+    "composer", "writer", "arranger", "producer", "engineer", "mixer",
+];
+
+pub fn est_role_audible(role: &str) -> bool {
+    ROLES_AUDIBLES.contains(&role)
 }
 
 pub fn est_role_d_auteur(role: &str) -> bool {
     ROLES_D_AUTEUR.contains(&role)
+}
+
+pub fn est_role_d_ecriture(role: &str) -> bool {
+    ROLES_D_ECRITURE.contains(&role)
+}
+
+/// `'a', 'b', …` pour un `IN (…)` : les rôles sont des mots du vocabulaire
+/// canonique, jamais une saisie, et un paramètre lié par rôle alourdirait les
+/// quatre branches de chaque requête.
+pub(super) fn liste_sql(roles: &[&str]) -> String {
+    roles
+        .iter()
+        .map(|r| format!("'{r}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ── Lecture de la réponse ────────────────────────────────────────────────────
@@ -620,6 +646,9 @@ pub struct AlbumCredite {
 pub struct Classement {
     pub collaborations: Vec<AlbumCredite>,
     pub reprises: Vec<AlbumCredite>,
+    /// « Écriture et production » (#7767) : les disques hors de sa
+    /// discographie où il tient un rôle d'écriture, qu'il y joue ou non.
+    pub ecriture: Vec<AlbumCredite>,
 }
 
 /// Ce qu'on sait d'un disque pour le classer.
@@ -628,6 +657,37 @@ pub struct DisqueAClasser {
     pub album_id: i64,
     /// `albums.is_compilation`, ou un artiste d'album « Various Artists ».
     pub compilation: bool,
+    /// L'artiste est l'artiste d'au moins une piste du disque : il est déjà
+    /// dans « Compilations » ou « Apparitions », et n'entre ni dans
+    /// `collaborations` ni dans `covers`. « Écriture et production » le
+    /// garde (#7767) : y jouer n'efface pas l'avoir produit.
+    pub artiste_de_piste: bool,
+}
+
+/// Un compteur de l'en-tête de la page artiste (#7767) : albums et pistes
+/// DISTINCTS, toute la bibliothèque comprise, sa discographie avec.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CompteurCredits {
+    pub albums: i64,
+    pub tracks: i64,
+}
+
+/// `credit_counts` : « interprète » (artiste de la piste ou rôle audible) et
+/// « écriture » (un rôle de [`ROLES_D_ECRITURE`]). Toujours rendu, zéros
+/// compris : sa présence dit que le serveur sait compter.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CompteursCredits {
+    pub performing: CompteurCredits,
+    pub writing: CompteurCredits,
+}
+
+impl CompteursCredits {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "performing": { "albums": self.performing.albums, "tracks": self.performing.tracks },
+            "writing": { "albums": self.writing.albums, "tracks": self.writing.tracks },
+        })
+    }
 }
 
 /// Vrai pour un nom d'artiste d'album qui désigne une compilation. Même
@@ -637,22 +697,28 @@ pub fn est_artistes_divers(nom: &str) -> bool {
     crate::library::regle_compilation::est_artistes_divers(nom)
 }
 
-/// Les deux sections, à partir des crédits de l'artiste sur les disques
-/// d'AUTRUI (l'appelant a déjà écarté ses propres disques et ceux où il est
-/// l'artiste d'une piste — Discographie, Compilations, Apparitions).
+/// Les trois sections de crédits, à partir des crédits de l'artiste sur
+/// les disques d'AUTRUI (l'appelant a déjà écarté ses propres disques —
+/// Discographie et Live — et dit, disque par disque, s'il y est l'artiste
+/// d'une piste).
 ///
-/// * **Collaborations** : au moins un rôle de MUSICIEN, disque qui n'est PAS
-///   une compilation. Focus = les pistes où il joue ou chante.
-/// * **Reprises** : AUCUN rôle de musicien sur tout le disque, au moins un rôle
-///   d'AUTEUR. Focus = les pistes qu'il a écrites. Une compilation de reprises
-///   y a sa place : c'est bien un recueil de ses chansons chantées par d'autres.
-/// * Tout le reste (producteur, ingénieur, arrangeur seuls ; musicien sur une
-///   compilation) n'entre dans aucune des deux.
+/// * **Apparaît sur** (`collaborations`) : au moins un rôle AUDIBLE, disque
+///   qui n'est PAS une compilation, et il n'y est l'artiste d'aucune piste
+///   (sinon il est déjà dans « Apparitions » ou « Compilations »). Focus =
+///   les pistes où il est audible ; rôles = l'instrument quand il est connu,
+///   sinon le rôle.
+/// * **Reprises** (`covers`) : AUCUN rôle audible sur tout le disque, au
+///   moins un rôle d'AUTEUR, et pas artiste d'une piste. Focus = les pistes
+///   qu'il a écrites ; rôles comme avant (instrument sinon rôle). Une
+///   compilation de reprises y a sa place.
+/// * **Écriture et production** (`ecriture`, #7767) : au moins un rôle
+///   d'ÉCRITURE, qu'il y joue ou non — un disque peut donc être à la fois ici
+///   et dans l'une des deux autres. Focus = les pistes écrites ou produites ;
+///   rôles = le vocabulaire canonique (`composer`, `producer`…), jamais
+///   l'instrument.
+/// * Un musicien sur une compilation, un `mastering` seul : nulle part.
 pub fn classer(credits: &[CreditSurAlbum], disques: &[DisqueAClasser]) -> Classement {
-    let compilation: HashMap<i64, bool> = disques
-        .iter()
-        .map(|d| (d.album_id, d.compilation))
-        .collect();
+    let disques: HashMap<i64, &DisqueAClasser> = disques.iter().map(|d| (d.album_id, d)).collect();
     let mut ordre: Vec<i64> = Vec::new();
     let mut par_album: HashMap<i64, Vec<&CreditSurAlbum>> = HashMap::new();
     for c in credits {
@@ -664,14 +730,17 @@ pub fn classer(credits: &[CreditSurAlbum], disques: &[DisqueAClasser]) -> Classe
             })
             .push(c);
     }
-    let resume = |cs: &[&CreditSurAlbum], garder: fn(&str) -> bool| -> AlbumCredite {
+    let resume = |cs: &[&CreditSurAlbum], garder: fn(&str) -> bool, par_instrument: bool| {
         let mut track_ids: Vec<i64> = Vec::new();
         let mut roles: Vec<String> = Vec::new();
         for c in cs.iter().filter(|c| garder(&c.role)) {
             if !track_ids.contains(&c.track_id) {
                 track_ids.push(c.track_id);
             }
-            let r = c.instrument.clone().unwrap_or_else(|| c.role.clone());
+            let r = match (&c.instrument, par_instrument) {
+                (Some(instrument), true) => instrument.clone(),
+                _ => c.role.clone(),
+            };
             if !roles.contains(&r) {
                 roles.push(r);
             }
@@ -686,22 +755,88 @@ pub fn classer(credits: &[CreditSurAlbum], disques: &[DisqueAClasser]) -> Classe
     let mut out = Classement::default();
     for album_id in ordre {
         let cs = &par_album[&album_id];
-        let musicien = cs.iter().any(|c| est_role_de_musicien(&c.role));
+        let audible = cs.iter().any(|c| est_role_audible(&c.role));
         let auteur = cs.iter().any(|c| est_role_d_auteur(&c.role));
-        let est_compilation = compilation.get(&album_id).copied().unwrap_or(false);
-        if musicien {
-            if !est_compilation {
-                out.collaborations.push(resume(cs, est_role_de_musicien));
+        let ecriture = cs.iter().any(|c| est_role_d_ecriture(&c.role));
+        let disque = disques.get(&album_id);
+        let est_compilation = disque.is_some_and(|d| d.compilation);
+        let artiste_de_piste = disque.is_some_and(|d| d.artiste_de_piste);
+        if !artiste_de_piste {
+            if audible {
+                if !est_compilation {
+                    out.collaborations.push(resume(cs, est_role_audible, true));
+                }
+            } else if auteur {
+                out.reprises.push(resume(cs, est_role_d_auteur, true));
             }
-        } else if auteur {
-            out.reprises.push(resume(cs, est_role_d_auteur));
+        }
+        if ecriture {
+            out.ecriture.push(resume(cs, est_role_d_ecriture, false));
         }
     }
     out
 }
 
-/// Les crédits d'un artiste sur les disques d'AUTRUI où il n'est l'artiste
-/// d'aucune piste, avec de quoi les classer.
+/// Les trois clés d'un artiste dans `track_credits` : sa fiche
+/// (`artist_id`), son nom exact, son MBID (`artist_mbid` =
+/// `artists.musicbrainz_id`). `None` quand la fiche n'existe pas.
+struct ClesArtiste {
+    id_str: String,
+    nom: String,
+    /// Un MBID absent est lié comme une chaîne vide, que la garde `<> ''`
+    /// empêche d'égaler les crédits sans MBID.
+    mbid: String,
+}
+
+fn cles_artiste(backend: &Arc<dyn DbBackend>, artist_id: i64) -> Option<ClesArtiste> {
+    let fiche = backend
+        .query_one(
+            "SELECT name, musicbrainz_id FROM artists WHERE id = ?",
+            &[&artist_id as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()?;
+    Some(ClesArtiste {
+        id_str: artist_id.to_string(),
+        nom: fiche
+            .first()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default(),
+        mbid: fiche.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+    })
+}
+
+/// La branche « fiche » des requêtes : sur PostgreSQL,
+/// `track_credits.artist_id` est du TEXT sur une base migrée depuis SQLite et
+/// du BIGINT ailleurs — la comparaison en texte vaut pour les deux, au prix
+/// de l'index. Sur SQLite, la chaîne liée prend l'affinité INTEGER de la
+/// colonne : l'index sert.
+fn cle_fiche(backend: &Arc<dyn DbBackend>) -> &'static str {
+    match backend.engine() {
+        crate::db::engine::Engine::Postgres => "CAST(artist_id AS TEXT) = ?",
+        crate::db::engine::Engine::Sqlite => "artist_id = ?",
+    }
+}
+
+/// Les `track_credits.id` de l'artiste, par trois branches INDEXÉES réunies
+/// en `UNION` (fiche, nom, MBID) : un `OR` sur trois colonnes ferait
+/// parcourir toute la table à chaque page artiste. `filtre` restreint chaque
+/// branche (les rôles) ; les paramètres liés sont, dans l'ordre, l'identifiant
+/// en texte, le nom, le MBID.
+pub(super) fn credits_de_l_artiste_sql(backend: &Arc<dyn DbBackend>, filtre: &str) -> String {
+    let cle_fiche = cle_fiche(backend);
+    format!(
+        "SELECT id FROM track_credits WHERE {cle_fiche}{filtre} \
+         UNION SELECT id FROM track_credits WHERE artist_name = ?{filtre} \
+         UNION SELECT id FROM track_credits WHERE artist_mbid = ? AND artist_mbid <> ''{filtre}"
+    )
+}
+
+/// Les crédits d'un artiste sur les disques d'AUTRUI — hors de sa
+/// discographie : l'artiste d'album n'est pas lui — avec de quoi les classer,
+/// dont, disque par disque, s'il y est l'artiste d'une piste (#7767 :
+/// « Écriture et production » garde ces disques-là, les deux autres sections
+/// les écartent).
 ///
 /// L'artiste est reconnu par sa fiche (`artist_id`), son MBID
 /// (`artist_mbid` = `artists.musicbrainz_id`) ou son nom exact. Les albums
@@ -710,60 +845,32 @@ pub fn credits_hors_discographie(
     backend: &Arc<dyn DbBackend>,
     artist_id: i64,
 ) -> (Vec<CreditSurAlbum>, Vec<DisqueAClasser>) {
-    let fiche = backend
-        .query_one(
-            "SELECT name, musicbrainz_id FROM artists WHERE id = ?",
-            &[&artist_id as &dyn ToSqlValue],
-        )
-        .ok()
-        .flatten();
-    let Some(fiche) = fiche else {
+    let Some(cles) = cles_artiste(backend, artist_id) else {
         return (Vec::new(), Vec::new());
-    };
-    let nom = fiche
-        .first()
-        .and_then(|v| v.as_string())
-        .unwrap_or_default();
-    // Un MBID absent est lié comme une chaîne vide, que la garde `<> ''`
-    // empêche d'égaler les crédits sans MBID.
-    let mbid = fiche.get(1).and_then(|v| v.as_string()).unwrap_or_default();
-    let id_str = artist_id.to_string();
-    // Trois clés, trois branches INDEXÉES réunies par `UNION` : un `OR` sur
-    // trois colonnes ferait parcourir toute la table à chaque page artiste.
-    //
-    // La fiche : sur PostgreSQL, `track_credits.artist_id` est du TEXT sur une
-    // base migrée depuis SQLite et du BIGINT ailleurs — la comparaison en
-    // texte vaut pour les deux, au prix de l'index. Sur SQLite, la chaîne liée
-    // prend l'affinité INTEGER de la colonne : l'index sert.
-    let cle_fiche = match backend.engine() {
-        crate::db::engine::Engine::Postgres => "CAST(artist_id AS TEXT) = ?",
-        crate::db::engine::Engine::Sqlite => "artist_id = ?",
     };
     let sql = format!(
         "SELECT t.album_id, t.id, tc.role, tc.instrument, \
-                COALESCE(a.is_compilation, 0), ar.name \
+                COALESCE(a.is_compilation, 0), ar.name, \
+                EXISTS (SELECT 1 FROM tracks t2 WHERE t2.album_id = a.id AND t2.artist_id = ?) \
          FROM track_credits tc \
          JOIN tracks t ON t.id = tc.track_id \
          JOIN albums a ON a.id = t.album_id \
          LEFT JOIN artists ar ON ar.id = a.artist_id \
-         WHERE tc.id IN ( \
-                SELECT id FROM track_credits WHERE {cle_fiche} \
-                UNION SELECT id FROM track_credits WHERE artist_name = ? \
-                UNION SELECT id FROM track_credits WHERE artist_mbid = ? AND artist_mbid <> '') \
+         WHERE tc.id IN ({}) \
            AND (a.artist_id IS NULL OR a.artist_id <> ?) \
-           AND NOT EXISTS (SELECT 1 FROM tracks t2 WHERE t2.album_id = a.id AND t2.artist_id = ?) \
            AND {} \
          ORDER BY t.album_id, t.disc_number, t.track_number, t.id, tc.position",
+        credits_de_l_artiste_sql(backend, ""),
         crate::db::facet_filter::hidden_albums_excluded()
     );
     let lignes = backend
         .query_many(
             &sql,
             &[
-                &id_str as &dyn ToSqlValue,
-                &nom as &dyn ToSqlValue,
-                &mbid as &dyn ToSqlValue,
                 &artist_id as &dyn ToSqlValue,
+                &cles.id_str as &dyn ToSqlValue,
+                &cles.nom as &dyn ToSqlValue,
+                &cles.mbid as &dyn ToSqlValue,
                 &artist_id as &dyn ToSqlValue,
             ],
         )
@@ -788,9 +895,13 @@ pub fn credits_hors_discographie(
                 .get(5)
                 .and_then(|v| v.as_string())
                 .is_some_and(|n| est_artistes_divers(&n));
+            // `EXISTS` rend un entier sur SQLite, un booléen sur PostgreSQL :
+            // `as_bool` lit les deux.
+            let artiste_de_piste = r.get(6).and_then(|v| v.as_bool()).unwrap_or(false);
             disques.push(DisqueAClasser {
                 album_id,
                 compilation: drapeau || va,
+                artiste_de_piste,
             });
         }
         credits.push(CreditSurAlbum {
@@ -801,6 +912,69 @@ pub fn credits_hors_discographie(
         });
     }
     (credits, disques)
+}
+
+/// `credit_counts` (#7767) : les pistes et albums DISTINCTS où l'artiste est
+/// audible (artiste de la piste, ou crédité avec un rôle de
+/// [`ROLES_AUDIBLES`]) et ceux où il tient un rôle de [`ROLES_D_ECRITURE`].
+/// Toute la bibliothèque, sa discographie comprise ; albums masqués exclus.
+/// Mêmes trois clés que [`credits_hors_discographie`]. Les doublons de
+/// `track_credits` (une ligne `balises` et une ligne MusicBrainz pour le même
+/// crédit, #7766) ne comptent qu'une fois : on compte des pistes, pas des
+/// lignes.
+pub fn compteurs_de_credits(backend: &Arc<dyn DbBackend>, artist_id: i64) -> CompteursCredits {
+    let Some(cles) = cles_artiste(backend, artist_id) else {
+        return CompteursCredits::default();
+    };
+    let compter = |pistes: &str, params: &[&dyn ToSqlValue]| -> CompteurCredits {
+        let sql = format!(
+            "SELECT COUNT(DISTINCT t.id), COUNT(DISTINCT t.album_id) \
+             FROM tracks t JOIN albums a ON a.id = t.album_id \
+             WHERE t.id IN ({pistes}) AND {}",
+            crate::db::facet_filter::hidden_albums_excluded()
+        );
+        match backend.query_one(&sql, params) {
+            Ok(Some(r)) => CompteurCredits {
+                tracks: r.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                albums: r.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+            },
+            Ok(None) => CompteurCredits::default(),
+            Err(e) => {
+                warn!(artist_id, erreur = %e, "compteurs_page_artiste_lecture_impossible");
+                CompteurCredits::default()
+            }
+        }
+    };
+    let audibles = format!(" AND role IN ({})", liste_sql(ROLES_AUDIBLES));
+    let ecriture = format!(" AND role IN ({})", liste_sql(ROLES_D_ECRITURE));
+    let performing = compter(
+        &format!(
+            "SELECT id FROM tracks WHERE artist_id = ? \
+             UNION SELECT track_id FROM track_credits WHERE id IN ({})",
+            credits_de_l_artiste_sql(backend, &audibles)
+        ),
+        &[
+            &artist_id as &dyn ToSqlValue,
+            &cles.id_str as &dyn ToSqlValue,
+            &cles.nom as &dyn ToSqlValue,
+            &cles.mbid as &dyn ToSqlValue,
+        ],
+    );
+    let writing = compter(
+        &format!(
+            "SELECT track_id FROM track_credits WHERE id IN ({})",
+            credits_de_l_artiste_sql(backend, &ecriture)
+        ),
+        &[
+            &cles.id_str as &dyn ToSqlValue,
+            &cles.nom as &dyn ToSqlValue,
+            &cles.mbid as &dyn ToSqlValue,
+        ],
+    );
+    CompteursCredits {
+        performing,
+        writing,
+    }
 }
 
 #[cfg(test)]
@@ -966,46 +1140,43 @@ mod tests {
         }
     }
 
-    /// Collaborations / Reprises / exclusions, disque par disque.
+    fn disque(album_id: i64, compilation: bool) -> DisqueAClasser {
+        DisqueAClasser {
+            album_id,
+            compilation,
+            artiste_de_piste: false,
+        }
+    }
+
+    /// Collaborations / Reprises / Écriture / exclusions, disque par disque.
     #[test]
     fn classer_collaborations_reprises_et_exclusions() {
         let credits = [
-            // 1 : il joue ET a écrit → Collaboration (musicien l'emporte),
-            // focus sur les pistes où il joue.
+            // 1 : il joue ET a écrit → Collaboration (audible l'emporte),
+            // focus sur les pistes où il joue ; ET Écriture (#7767), focus
+            // sur la piste écrite.
             credit(1, 10, "composer", None),
             credit(1, 11, "performer", Some("guitar")),
             credit(1, 11, "vocal", Some("vocals")),
-            // 2 : il n'a qu'écrit → Reprise.
+            // 2 : il n'a qu'écrit → Reprise, et Écriture.
             credit(2, 20, "composer", None),
             credit(2, 21, "writer", None),
-            // 3 : il joue sur une compilation → nulle part.
+            // 3 : il joue sur une compilation → ni Collaboration ni Reprise.
             credit(3, 30, "performer", Some("piano")),
-            // 4 : compilation de reprises → Reprise.
+            // 4 : compilation de reprises → Reprise, et Écriture.
             credit(4, 40, "composer", None),
-            // 5 : producteur seulement → nulle part.
+            // 5 : producteur seulement → Écriture seule (#7767).
             credit(5, 50, "producer", None),
+            // 6 : mastering seul → nulle part.
+            credit(6, 60, "mastering", None),
         ];
         let disques = [
-            DisqueAClasser {
-                album_id: 1,
-                compilation: false,
-            },
-            DisqueAClasser {
-                album_id: 2,
-                compilation: false,
-            },
-            DisqueAClasser {
-                album_id: 3,
-                compilation: true,
-            },
-            DisqueAClasser {
-                album_id: 4,
-                compilation: true,
-            },
-            DisqueAClasser {
-                album_id: 5,
-                compilation: false,
-            },
+            disque(1, false),
+            disque(2, false),
+            disque(3, true),
+            disque(4, true),
+            disque(5, false),
+            disque(6, false),
         ];
         let c = classer(&credits, &disques);
         assert_eq!(
@@ -1022,6 +1193,115 @@ mod tests {
         );
         assert_eq!(c.reprises[0].track_ids, vec![20, 21]);
         assert_eq!(c.reprises[0].roles, vec!["composer", "writer"]);
+        assert_eq!(
+            c.ecriture.iter().map(|a| a.album_id).collect::<Vec<_>>(),
+            vec![1, 2, 4, 5],
+            "{:?}",
+            c.ecriture
+        );
+        assert_eq!(c.ecriture[0].track_ids, vec![10]);
+        assert_eq!(c.ecriture[0].roles, vec!["composer"]);
+        assert_eq!(c.ecriture[3].roles, vec!["producer"]);
+    }
+
+    /// Les scénarios d'Aède (#7767), réécrits sur le classement pur :
+    /// le remixeur est AUDIBLE (décision du 03/11), l'arrangeur ne l'est pas.
+    #[test]
+    fn remixeur_dans_apparait_sur_arrangeur_dans_ecriture_seulement_7767() {
+        let credits = [
+            // 1 : remixeur d'une piste → Apparaît sur, rôle `remixer`.
+            credit(1, 10, "remixer", None),
+            // 2 : remixeur ET compositeur → Apparaît sur (pas Reprises), et
+            // Écriture par la composition.
+            credit(2, 20, "remixer", None),
+            credit(2, 21, "composer", None),
+            // 3 : arrangeur seul → Écriture et production, pas Apparaît sur.
+            credit(3, 30, "arranger", None),
+            credit(3, 31, "arranger", None),
+        ];
+        let disques = [disque(1, false), disque(2, false), disque(3, false)];
+        let c = classer(&credits, &disques);
+        assert_eq!(
+            c.collaborations
+                .iter()
+                .map(|a| a.album_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "{:?}",
+            c.collaborations
+        );
+        assert_eq!(c.collaborations[0].roles, vec!["remixer"]);
+        assert!(c.reprises.is_empty(), "{:?}", c.reprises);
+        assert_eq!(
+            c.ecriture.iter().map(|a| a.album_id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(c.ecriture[1].track_ids, vec![30, 31]);
+        assert_eq!(c.ecriture[1].roles, vec!["arranger"]);
+    }
+
+    /// Un disque où il est l'artiste d'une piste est déjà dans « Apparitions »
+    /// ou « Compilations » : ni Apparaît sur ni Reprises — mais Écriture et
+    /// production le garde (#7767 : il produit *Second Session* et y joue).
+    #[test]
+    fn artiste_de_piste_garde_l_ecriture_mais_pas_les_deux_autres_sections_7767() {
+        let credits = [
+            credit(1, 10, "performer", Some("bass")),
+            credit(1, 10, "producer", None),
+            credit(1, 11, "producer", None),
+            credit(2, 20, "composer", None),
+        ];
+        let disques = [
+            DisqueAClasser {
+                album_id: 1,
+                compilation: false,
+                artiste_de_piste: true,
+            },
+            DisqueAClasser {
+                album_id: 2,
+                compilation: false,
+                artiste_de_piste: true,
+            },
+        ];
+        let c = classer(&credits, &disques);
+        assert!(c.collaborations.is_empty(), "{:?}", c.collaborations);
+        assert!(c.reprises.is_empty(), "{:?}", c.reprises);
+        assert_eq!(
+            c.ecriture,
+            vec![
+                AlbumCredite {
+                    album_id: 1,
+                    track_ids: vec![10, 11],
+                    roles: vec!["producer".into()],
+                },
+                AlbumCredite {
+                    album_id: 2,
+                    track_ids: vec![20],
+                    roles: vec!["composer".into()],
+                },
+            ]
+        );
+    }
+
+    /// La table unique des rôles audibles, et les deux autres : aucun rôle
+    /// n'est à la fois audible et d'écriture, l'arrangeur n'est pas audible.
+    #[test]
+    fn tables_de_roles_7767() {
+        assert_eq!(
+            ROLES_AUDIBLES,
+            ["artist", "performer", "vocal", "conductor", "remixer"]
+        );
+        assert_eq!(
+            ROLES_D_ECRITURE,
+            [
+                "composer", "writer", "arranger", "producer", "engineer", "mixer"
+            ]
+        );
+        assert!(ROLES_AUDIBLES.iter().all(|r| !est_role_d_ecriture(r)));
+        assert!(ROLES_D_AUTEUR.iter().all(|r| est_role_d_ecriture(r)));
+        assert!(!est_role_audible("arranger"));
+        assert!(!est_role_d_ecriture("mastering") && !est_role_d_ecriture("programming"));
+        assert_eq!(liste_sql(ROLES_D_AUTEUR), "'composer', 'writer'");
     }
 
     #[test]

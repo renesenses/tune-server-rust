@@ -2588,6 +2588,20 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // filtrées. Voir `albums_masques`.
     let masques = albums_masques(&state);
     md.push_str(&ligne_albums_masques(masques));
+    // #8346 — les tâches de fond en pause et en cours : « je ne sais pas ce
+    // qui tourne ni comment l'arrêter » (BenjaminB, ASR #161).
+    md.push_str(&ligne_taches_de_fond(
+        tune_core::taches_de_fond::Tache::TOUTES
+            .iter()
+            .map(|t| {
+                (
+                    t.id(),
+                    tune_core::taches_de_fond::est_en_pause(*t),
+                    tune_core::taches_de_fond::avancement::releve(*t),
+                )
+            })
+            .collect(),
+    ));
     md.push('\n');
 
     md.push_str(&format!("## Zones ({zone_count})\n"));
@@ -4228,6 +4242,71 @@ mod log_tail_tests {
 
         let Json(v) = reponse_sans_journal("/x.log", None, "t");
         assert_eq!(v["source"], "none");
+    }
+}
+
+/// #8346 — la ligne « Background tasks » du rapport : celles qui tournent
+/// (avec n/N quand la passe le publie) et celles en pause.
+fn ligne_taches_de_fond(
+    taches: Vec<(
+        &'static str,
+        bool,
+        Option<tune_core::taches_de_fond::avancement::Avancement>,
+    )>,
+) -> String {
+    let mut en_cours = Vec::new();
+    let mut en_pause = Vec::new();
+    for (id, pause, releve) in taches {
+        if pause {
+            en_pause.push(id.to_string());
+        } else if let Some(a) = releve.filter(|a| a.active) {
+            en_cours.push(format!("{id} {}/{}", a.processed, a.total));
+        }
+    }
+    let liste = |v: &[String]| {
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    format!(
+        "- Background tasks: running {} ; paused {} (Settings › Background tasks)\n",
+        liste(&en_cours),
+        liste(&en_pause)
+    )
+}
+
+#[cfg(test)]
+mod tests_taches_de_fond_8346 {
+    use super::ligne_taches_de_fond;
+    use tune_core::taches_de_fond::avancement::Avancement;
+
+    #[test]
+    fn le_rapport_dit_les_taches_en_cours_et_en_pause() {
+        let empreintes = Avancement {
+            task: "fingerprints",
+            active: true,
+            processed: 120,
+            total: 4_000,
+            remaining: 3_880,
+            eta_seconds: None,
+            started_at: 0,
+            updated_at: 0,
+            elapsed_ms: 0,
+        };
+        let l = ligne_taches_de_fond(vec![
+            ("replaygain", false, None),
+            ("fingerprints", false, Some(empreintes)),
+            ("dynamic_range", true, None),
+        ]);
+        assert_eq!(
+            l,
+            "- Background tasks: running fingerprints 120/4000 ; paused dynamic_range \
+             (Settings › Background tasks)\n"
+        );
+        let rien = ligne_taches_de_fond(vec![("replaygain", false, None)]);
+        assert!(rien.contains("running none ; paused none"), "{rien}");
     }
 }
 

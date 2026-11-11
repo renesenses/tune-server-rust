@@ -22,6 +22,12 @@ const PLAFOND_RECHERCHE: usize = 50;
 /// le service l'adopte au premier `400 Invalid limit` qu'il reçoit à 50
 /// (voir [`SpotifyService::recherche`]).
 const PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT: usize = 10;
+/// #8479 — le plus grand `limit` que `GET /artists/{id}/albums` accepte
+/// depuis février 2026 (0 à 10). Au-delà : `400 Invalid limit`.
+const PAGE_ALBUMS_ARTISTE: usize = 10;
+/// #8479 — borne de sécurité de la discographie : 30 pages de 10, soit 300
+/// albums et singles, sur un service qui annoncerait toujours une suite.
+const PAGES_ALBUMS_ARTISTE_MAX: usize = 30;
 // Spotify n'accepte plus l'alias `localhost` : le HTTP en clair n'est admis
 // que pour un LITTERAL de boucle locale. C'est acquis depuis #2680 et ce
 // n'est pas ce qui change ici.
@@ -99,6 +105,10 @@ pub struct SpotifyService {
     /// #8198 — le dernier refus de connexion portant un code stable, efface
     /// par une connexion reussie. Le verificateur (`diagnostic`) le rapporte.
     derniere_erreur: Option<DerniereErreur>,
+    /// #8399 — Spotify a répondu 403 à `/browse/featured-playlists` : ce
+    /// point d'accès est fermé aux applications créées après le 27/11/2024.
+    /// La rubrique est alors vide, sans erreur, et n'est plus redemandée.
+    selection_retiree: AtomicBool,
 }
 
 impl Default for SpotifyService {
@@ -560,6 +570,7 @@ impl SpotifyService {
             plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
             session_refusee: false,
             derniere_erreur: None,
+            selection_retiree: AtomicBool::new(false),
         }
     }
 
@@ -568,6 +579,8 @@ impl SpotifyService {
     /// le nouveau : son verificateur est oublie.
     pub fn set_client_id(&mut self, client_id: &str) {
         self.client_id = client_id.trim().to_owned();
+        // #8399 — le refus de la sélection vaut pour UNE application.
+        self.selection_retiree.store(false, Ordering::Relaxed);
         self.tentatives.clear();
     }
 
@@ -1605,6 +1618,7 @@ impl StreamingService for SpotifyService {
         self.portees = None;
         self.token_rejected.store(false, Ordering::Relaxed);
         self.session_refusee = false;
+        self.selection_retiree.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1768,16 +1782,43 @@ impl StreamingService for SpotifyService {
         self.access_token.is_some() && self.user_id.is_some()
     }
 
+    /// #8479 — la discographie, par pages de [`PAGE_ALBUMS_ARTISTE`].
+    ///
+    /// On demandait `limit=50` en une fois. Depuis les changements de l'API
+    /// Web de février 2026, `GET /artists/{id}/albums` n'accepte plus qu'un
+    /// `limit` de 0 à 10 (5 par défaut) : à 50, Spotify refuse la requête
+    /// (`400 Invalid limit`) et la fiche artiste perdait TOUS ses albums
+    /// Spotify, sans un mot (Ronin22, ASR #169, rc11). On lit donc page par
+    /// page, par `offset`, jusqu'au `total` annoncé ou à la première page sans
+    /// `next`, dans la limite de [`PAGES_ALBUMS_ARTISTE_MAX`].
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
-        let data = self
-            .api_get(&format!(
-                "/artists/{artist_id}/albums?include_groups=album,single&limit=50"
-            ))
-            .await?;
-        Ok(data["items"]
-            .as_array()
-            .map(|i| i.iter().map(Self::map_album).collect())
-            .unwrap_or_default())
+        let mut albums: Vec<StreamAlbum> = Vec::new();
+        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut offset = 0usize;
+        for _ in 0..PAGES_ALBUMS_ARTISTE_MAX {
+            let data = self
+                .api_get(&format!(
+                    "/artists/{artist_id}/albums?include_groups=album,single&limit={PAGE_ALBUMS_ARTISTE}&offset={offset}"
+                ))
+                .await?;
+            let lot = data["items"].as_array().cloned().unwrap_or_default();
+            let recus = lot.len();
+            offset += recus;
+            for item in &lot {
+                let album = Self::map_album(item);
+                if album.id.is_empty() || vus.insert(album.id.clone()) {
+                    albums.push(album);
+                }
+            }
+            let fini = match data["total"].as_u64() {
+                Some(t) => offset as u64 >= t,
+                None => !data["next"].is_string(),
+            };
+            if fini || recus == 0 {
+                break;
+            }
+        }
+        Ok(albums)
     }
 
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
@@ -1799,7 +1840,24 @@ impl StreamingService for SpotifyService {
     }
 
     async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
-        let data = self.api_get("/browse/featured-playlists?limit=50").await?;
+        // #8399 — fermé par Spotify à cette application : rubrique vide, sans
+        // nouvel appel (un 403 était rendu en « HTTP 502 » brut à l'écran).
+        if self.selection_retiree.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
+        let data = match self.api_get("/browse/featured-playlists?limit=50").await {
+            Ok(d) => d,
+            Err(e) if statut_du_refus(&e) == Some(403) => {
+                if !self.selection_retiree.swap(true, Ordering::Relaxed) {
+                    info!(
+                        route = "/browse/featured-playlists",
+                        "spotify_point_d_acces_retire"
+                    );
+                }
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e.into()),
+        };
         Ok(data["playlists"]["items"]
             .as_array()
             .map(|i| i.iter().map(Self::map_playlist).collect())
@@ -2086,6 +2144,16 @@ pub fn motif_appareil_absent(nom: &str) -> String {
         "L'appareil Spotify Connect « {nom} » n'apparaît pas : librespot ne s'est pas connecté \
          au compte (Spotify Premium est exigé)."
     )
+}
+
+/// #8399 — le statut HTTP d'un refus rendu par `api_get`
+/// (« spotify GET /route: HTTP 403 — motif »), s'il y en a un.
+fn statut_du_refus(erreur: &str) -> Option<u16> {
+    let (_, apres) = erreur.split_once(": HTTP ")?;
+    apres
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|n| n.parse().ok())
 }
 
 /// #6933 — un 403 de `/me/player/play` n'est PAS un problème de connexion
@@ -3135,6 +3203,68 @@ mod tests {
         assert_eq!(genres.len(), 1);
     }
 
+    /// #8399 — fil 2750 : Spotify ferme `/browse/featured-playlists` aux
+    /// applications récentes (403). La rubrique est vide, sans erreur (le web
+    /// la masque), et Spotify n'est plus interrogé à chaque ouverture.
+    #[tokio::test]
+    async fn spotify_8399_la_selection_refusee_en_403_est_vide_sans_erreur_ni_rappel() {
+        use std::sync::atomic::AtomicUsize;
+        static APPELS: AtomicUsize = AtomicUsize::new(0);
+        let app = axum::Router::new().route(
+            "/v1/browse/featured-playlists",
+            axum::routing::get(|| async {
+                APPELS.fetch_add(1, Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(json!({"error": {"status": 403, "message": "Forbidden"}})),
+                )
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", ecoute.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+        let mut svc =
+            SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(&base);
+        svc.access_token = Some("jeton".into());
+
+        for _ in 0..3 {
+            let liste = svc
+                .get_featured()
+                .await
+                .expect("#8399 : un 403 ne remonte plus en erreur (502 à l'écran)");
+            assert!(liste.is_empty());
+        }
+        assert_eq!(
+            APPELS.load(Ordering::SeqCst),
+            1,
+            "un seul appel, puis mémorisé"
+        );
+
+        // Une autre application (Client ID) peut y avoir droit : Spotify est
+        // de nouveau interrogé.
+        svc.set_client_id("client-ancien");
+        svc.access_token = Some("jeton".into());
+        assert!(svc.get_featured().await.expect("403 → vide").is_empty());
+        assert_eq!(
+            APPELS.load(Ordering::SeqCst),
+            2,
+            "redemandé après changement d'application"
+        );
+    }
+
+    #[test]
+    fn spotify_8399_statut_du_refus() {
+        assert_eq!(
+            statut_du_refus("spotify GET /browse/featured-playlists: HTTP 403 — Forbidden"),
+            Some(403)
+        );
+        assert_eq!(
+            statut_du_refus("spotify GET /x: HTTP 404 — Not Found"),
+            Some(404)
+        );
+        assert_eq!(statut_du_refus("token expired"), None);
+    }
+
     #[test]
     fn spotify_6825_motif_du_refus_borne() {
         assert_eq!(
@@ -3288,3 +3418,7 @@ mod favoris_pagination_8050_tests;
 #[cfg(test)]
 #[path = "spotify_playlists_items_8193_tests.rs"]
 mod playlists_items_8193_tests;
+
+#[cfg(test)]
+#[path = "spotify_albums_artiste_8479_tests.rs"]
+mod albums_artiste_8479_tests;
