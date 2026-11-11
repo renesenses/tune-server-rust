@@ -498,54 +498,14 @@ async fn group_volume(
     Path(id): Path<i64>,
     Json(body): Json<GroupVolumeRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut groups = load_json_setting(&settings, "zone_groups");
-
-    let idx = groups
-        .iter()
-        .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(id));
-    match idx {
-        Some(i) => {
-            let master = body
-                .master_volume
-                .unwrap_or(groups[i]["master_volume"].as_f64().unwrap_or(0.5));
-            groups[i]["master_volume"] = json!(master);
-            if let Some(ref offsets) = body.offsets {
-                groups[i]["offsets"] = json!(offsets);
-            }
-            let zone_ids: Vec<i64> = groups[i]["zone_ids"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
-                .unwrap_or_default();
-            save_json_setting(&settings, "zone_groups", &groups);
-
-            // Apply volume to each zone only after its renderer accepts it.
-            for zid in &zone_ids {
-                let offset = body
-                    .offsets
-                    .as_ref()
-                    .and_then(|o| o.get(&zid.to_string()))
-                    .copied()
-                    .unwrap_or(0.0);
-                let effective = (master + offset).clamp(0.0, 1.0);
-                let device_id = ZoneRepo::with_backend(state.backend.clone())
-                    .get(*zid)
-                    .ok()
-                    .flatten()
-                    .and_then(|zone| zone.output_device_id);
-                if let Err(error) = state
-                    .orchestrator
-                    .set_volume(*zid, effective, device_id.as_deref())
-                    .await
-                {
-                    return crate::routes::playback::output_command_error_response(error);
-                }
-            }
-
-            Json(json!({"group_id": id, "master_volume": master})).into_response()
-        }
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+    // #8445 — le même chemin que `POST /zones/groups/{id}/volume`.
+    crate::routes::zones::appliquer_le_volume_du_groupe(
+        &state,
+        id,
+        body.master_volume,
+        body.offsets,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
