@@ -6,12 +6,15 @@
 //! dessine avec des composants : aucun HTML venu d'une source n'est jamais
 //! injecté côté web.
 //!
-//! - Liens internes, prioritaires : un artiste ou un album de la bibliothèque
-//!   cité dans le texte. Correspondance exacte, insensible à la casse et aux
-//!   accents, sur des mots entiers. Les noms courts, les mots courants, les
-//!   nombres seuls et les noms portés par plusieurs entités sont écartés. Un
-//!   seul lien par entité ; l'entité de la page (et, sur un album, son
-//!   artiste) n'est jamais liée.
+//! - Liens internes, prioritaires : un artiste, un album ou un label (#8150)
+//!   de la bibliothèque cité dans le texte. Correspondance exacte, insensible
+//!   à la casse et aux accents, sur des mots entiers ; un album se reconnaît
+//!   aussi à son titre sans mentions d'édition ni de disque (#8150). Les noms
+//!   courts, les mots courants, les nombres seuls et les noms portés par
+//!   plusieurs entités sont écartés — mais les exemplaires d'un même album
+//!   d'un même artiste ne comptent que pour un (#8150). Un seul lien par
+//!   entité ; l'entité de la page (et, sur un album, son artiste) n'est
+//!   jamais liée.
 //! - Liens externes : ceux du HTML d'origine (Last.fm), gardés au lieu d'être
 //!   effacés, mais seulement en `https` et sur les domaines des sources
 //!   ([`DOMAINES_DES_SOURCES`]). Tout le reste redevient du texte.
@@ -203,13 +206,34 @@ pub struct LienInterne {
     pub id: i64,
 }
 
+/// #8129 — un lien vers la page d'un artiste ou d'un album CHEZ UN SERVICE
+/// (Qobuz), que Tune ouvre dans sa propre fiche de service. `id` est
+/// l'identifiant du service, en texte (un album Qobuz a un identifiant
+/// alphanumérique).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct LienDeService {
+    pub service: String,
+    #[serde(rename = "type")]
+    pub genre: GenreDeLien,
+    pub id: String,
+}
+
 /// Un morceau de la bio : du texte seul, du texte avec un lien interne
-/// (`lien`), ou du texte avec un lien externe (`url`), jamais les deux.
+/// (`lien`), vers un label de la bibliothèque (`label`, #8150), vers une
+/// fiche de service (`lien_service`, #8129), ou avec un lien externe (`url`) ;
+/// jamais deux à la fois.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BioSegment {
     pub texte: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lien: Option<LienInterne>,
+    /// #8150 — le nom du label tel que la bibliothèque l'écrit : la page
+    /// `/library/labels/{nom}/artists`. Un label n'a pas d'identifiant en
+    /// base ; un champ à part laisse les anciens clients sur du texte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lien_service: Option<LienDeService>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
@@ -243,32 +267,45 @@ pub fn url_autorisee(brute: &str) -> Option<String> {
 /// retirées, entités non décodées) : c'est ce texte qu'on retrouvera ensuite
 /// dans la bio en texte brut.
 pub fn liens_depuis_html(html: &str) -> Vec<LienExterne> {
-    let ancre = regex::Regex::new(
-        r#"(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>(.*?)</a\s*>"#,
-    )
-    .expect("regex des ancres");
     let balise = regex::Regex::new(r"<[^>]+>").expect("regex des balises");
     let mut vus = HashSet::new();
     let mut liens = Vec::new();
-    for c in ancre.captures_iter(html) {
-        let href = c
-            .get(1)
-            .or_else(|| c.get(2))
-            .map(|m| m.as_str())
-            .unwrap_or("");
-        let Some(url) = url_autorisee(&href.replace("&amp;", "&")) else {
+    for (href, contenu) in ancres(html) {
+        let Some(url) = url_autorisee(&href) else {
             continue;
         };
-        let texte = balise
-            .replace_all(c.get(3).map(|m| m.as_str()).unwrap_or(""), "")
-            .trim()
-            .to_string();
+        let texte = balise.replace_all(contenu, "").trim().to_string();
         if texte.is_empty() || !vus.insert(url.clone()) {
             continue;
         }
         liens.push(LienExterne { texte, url });
     }
     liens
+}
+
+/// Les ancres `<a href>` d'un HTML de source : (`href` avec `&amp;` décodé,
+/// contenu HTML de l'ancre), dans l'ordre du texte.
+pub(crate) fn ancres(html: &str) -> Vec<(String, &str)> {
+    static ANCRE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>(.*?)</a\s*>"#,
+        )
+        .expect("regex des ancres")
+    });
+    ANCRE
+        .captures_iter(html)
+        .map(|c| {
+            let href = c
+                .get(1)
+                .or_else(|| c.get(2))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            (
+                href.replace("&amp;", "&"),
+                c.get(3).map(|m| m.as_str()).unwrap_or(""),
+            )
+        })
+        .collect()
 }
 
 /// Minuscules, sans diacritiques : « Björk » et « bjork » se rejoignent.
@@ -361,58 +398,303 @@ fn cle_retenue(nom: &str) -> Option<(String, usize)> {
     Some((cle, m.len()))
 }
 
-/// Les noms d'artistes et de titres d'albums que Tune sait ouvrir.
+/// #8150 — les mots qui font d'un suffixe une mention d'édition, comme le
+/// regroupement des versions (#7617, `tune-server`, `oeuvres.rs`), dont la
+/// liste n'est pas visible d'ici. Forme pliée.
+const MOTS_D_EDITION: &[&str] = &[
+    "remaster",
+    "deluxe",
+    "edition",
+    "anniversary",
+    "expanded",
+    "bonus",
+    "collector",
+    "reissue",
+    "re-issue",
+    "hi-res",
+    "hires",
+    "24-bit",
+    "24 bit",
+    "24bit",
+    "mono",
+    "stereo",
+    "legacy",
+    "sacd",
+    "mfsl",
+];
+
+/// #8150 — les mots qui ouvrent une mention de disque : « Disc 1 »,
+/// « CD 2 », « Disque 1 ». Forme pliée.
+const MOTS_DE_DISQUE: &[&str] = &["disc", "disk", "disque", "cd"];
+
+/// Les délimiteurs d'un suffixe : ceux du regroupement des versions, plus la
+/// virgule de « The Wall, Disc 1 ».
+const DELIMITEURS_DE_SUFFIXE: [&str; 4] = [" (", " [", " - ", ", "];
+
+/// Un suffixe est-il une mention d'édition ou de disque ? Un mot d'édition,
+/// une année seule, ou un mot de disque suivi au plus d'un numéro.
+fn est_mention_d_edition_ou_de_disque(suffixe: &str) -> bool {
+    let s = plier(suffixe.trim());
+    if s.is_empty() {
+        return false;
+    }
+    let annee_seule = s.len() == 4 && s.chars().all(|c| c.is_ascii_digit());
+    if annee_seule || MOTS_D_EDITION.iter().any(|m| s.contains(m)) {
+        return true;
+    }
+    let m = mots(&s);
+    match m.as_slice() {
+        [mot] => MOTS_DE_DISQUE.contains(&mot.plie.as_str()),
+        [mot, numero] => {
+            MOTS_DE_DISQUE.contains(&mot.plie.as_str())
+                && numero.plie.chars().all(|c| c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+/// #8150 — le titre sans ses mentions finales d'édition ou de disque :
+/// « The Wall (Remastered 2011 Version) » et « The Wall, Disc 1 » donnent
+/// « The Wall » ; « Wish You Were Here (Live) » reste entier. `None` si le
+/// titre n'en porte aucune.
+pub fn titre_de_base(titre: &str) -> Option<String> {
+    let mut reste = titre.trim();
+    loop {
+        let coupe = DELIMITEURS_DE_SUFFIXE
+            .iter()
+            .filter_map(|d| reste.rfind(d).map(|pos| (pos, *d)))
+            .max_by_key(|(pos, _)| *pos);
+        let Some((pos, d)) = coupe else { break };
+        let corps = reste[pos + d.len()..].trim();
+        let corps = match d {
+            " (" => corps.strip_suffix(')').unwrap_or(corps),
+            " [" => corps.strip_suffix(']').unwrap_or(corps),
+            _ => corps,
+        };
+        let base = reste[..pos].trim_end();
+        if base.is_empty() || !est_mention_d_edition_ou_de_disque(corps) {
+            break;
+        }
+        reste = base;
+    }
+    (reste != titre.trim()).then(|| reste.to_string())
+}
+
+/// #8150 — un album tel que l'index le voit : son artiste sépare les
+/// exemplaires d'un même album (un lien) des homonymes (aucun lien) ; sa
+/// source et sa résolution désignent l'exemplaire lié.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlbumDeLIndex {
+    pub id: i64,
+    pub titre: String,
+    pub artist_id: Option<i64>,
+    /// `albums.source = 'local'`.
+    pub local: bool,
+    pub sample_rate: Option<i64>,
+    pub bit_depth: Option<i64>,
+}
+
+/// La cible d'un nom de la bibliothèque : une page à identifiant, ou la page
+/// d'un label, à son nom (#8150).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LienDeBibliotheque {
+    Interne(LienInterne),
+    Label(String),
+}
+
+/// La force d'un nom quand plusieurs entités le portent : un artiste
+/// l'emporte sur un titre d'album, un titre sur un label, un label sur un
+/// titre sans ses mentions d'édition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rang {
+    Artiste,
+    Album,
+    Label,
+    AlbumDeBase,
+}
+
+#[derive(Debug, Clone)]
+enum Porteur {
+    Artiste(i64),
+    /// L'indice de l'album dans la liste reçue.
+    Album(usize),
+    Label(String),
+}
+
+/// L'ordre du choix de l'exemplaire, celui des versions d'une œuvre (#7617) :
+/// local avant service, meilleure fréquence, meilleure profondeur, plus
+/// ancien album.
+fn meilleur_d_abord(a: &AlbumDeLIndex, b: &AlbumDeLIndex) -> std::cmp::Ordering {
+    b.local
+        .cmp(&a.local)
+        .then(b.sample_rate.unwrap_or(0).cmp(&a.sample_rate.unwrap_or(0)))
+        .then(b.bit_depth.unwrap_or(0).cmp(&a.bit_depth.unwrap_or(0)))
+        .then(a.id.cmp(&b.id))
+}
+
+/// Les noms d'artistes, de titres d'albums et de labels que Tune sait ouvrir.
 #[derive(Debug, Default)]
 pub struct IndexDesNoms {
     /// `None` : nom porté par plusieurs entités, jamais lié.
-    noms: HashMap<String, Option<LienInterne>>,
+    noms: HashMap<String, Option<LienDeBibliotheque>>,
+    /// #8150 — album → les exemplaires liés à sa place : la page d'un
+    /// exemplaire ne lie pas vers un autre exemplaire du même album.
+    exemplaires: HashMap<i64, Vec<i64>>,
     mots_max: usize,
 }
 
 impl IndexDesNoms {
-    /// Un artiste l'emporte sur un album de même nom (album éponyme) ; deux
-    /// artistes, ou deux albums, de même nom rendent le nom ambigu.
+    /// Les artistes et des albums sans artiste connu : deux albums de même
+    /// titre y restent ambigus. Voir [`IndexDesNoms::construire_avec`].
     pub fn construire(
         artistes: impl IntoIterator<Item = (i64, String)>,
         albums: impl IntoIterator<Item = (i64, String)>,
     ) -> Self {
-        let mut index = IndexDesNoms::default();
+        let albums = albums.into_iter().map(|(id, titre)| AlbumDeLIndex {
+            id,
+            titre,
+            ..Default::default()
+        });
+        Self::construire_avec(artistes, albums, std::iter::empty())
+    }
+
+    /// Un artiste l'emporte sur un album de même nom (album éponyme) ; deux
+    /// artistes de même nom rendent le nom ambigu. #8150 : des albums de même
+    /// titre et du même artiste sont les exemplaires d'un album — le nom mène
+    /// au meilleur ([`meilleur_d_abord`]), d'où s'ouvrent ses autres
+    /// versions ; d'artistes différents (ou inconnus), ils restent ambigus.
+    /// Un album se nomme aussi par son [`titre_de_base`], plus faiblement ;
+    /// un label, plus faiblement qu'un titre exact.
+    pub fn construire_avec(
+        artistes: impl IntoIterator<Item = (i64, String)>,
+        albums: impl IntoIterator<Item = AlbumDeLIndex>,
+        labels: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut porteurs: HashMap<String, Vec<(Rang, Porteur)>> = HashMap::new();
+        let mut mots_max = 0;
+        let mut porter = |nom: &str, rang: Rang, porteur: Porteur| {
+            let Some((cle, n)) = cle_retenue(nom) else {
+                return;
+            };
+            mots_max = usize::max(mots_max, n);
+            porteurs.entry(cle).or_default().push((rang, porteur));
+        };
         for (id, nom) in artistes {
-            index.ajouter(
-                &nom,
-                LienInterne {
-                    genre: GenreDeLien::Artiste,
-                    id,
-                },
-            );
+            porter(&nom, Rang::Artiste, Porteur::Artiste(id));
         }
-        for (id, titre) in albums {
-            index.ajouter(
-                &titre,
-                LienInterne {
-                    genre: GenreDeLien::Album,
-                    id,
-                },
-            );
+        let albums: Vec<AlbumDeLIndex> = albums.into_iter().collect();
+        for (i, a) in albums.iter().enumerate() {
+            porter(&a.titre, Rang::Album, Porteur::Album(i));
+            if let Some(base) = titre_de_base(&a.titre) {
+                porter(&base, Rang::AlbumDeBase, Porteur::Album(i));
+            }
+        }
+        for nom in labels {
+            let nom = nom.trim().to_string();
+            porter(&nom, Rang::Label, Porteur::Label(nom.clone()));
+        }
+
+        let mut index = IndexDesNoms {
+            mots_max,
+            ..Default::default()
+        };
+        for (cle, liste) in porteurs {
+            let lien = index.resoudre(&liste, &albums);
+            index.noms.insert(cle, lien);
+        }
+        for v in index.exemplaires.values_mut() {
+            v.sort_unstable();
+            v.dedup();
         }
         index
     }
 
-    fn ajouter(&mut self, nom: &str, lien: LienInterne) {
-        let Some((cle, n)) = cle_retenue(nom) else {
-            return;
-        };
-        self.mots_max = self.mots_max.max(n);
-        match self.noms.get_mut(&cle) {
-            None => {
-                self.noms.insert(cle, Some(lien));
+    /// L'entité que désigne un nom, d'après ses porteurs du rang le plus fort.
+    fn resoudre(
+        &mut self,
+        liste: &[(Rang, Porteur)],
+        albums: &[AlbumDeLIndex],
+    ) -> Option<LienDeBibliotheque> {
+        let fort = liste.iter().map(|(r, _)| *r).min()?;
+        let du_rang = |r: Rang| liste.iter().filter(move |(x, _)| *x == r).map(|(_, p)| p);
+        match fort {
+            Rang::Artiste => {
+                let ids: HashSet<i64> = du_rang(fort)
+                    .filter_map(|p| match p {
+                        Porteur::Artiste(id) => Some(*id),
+                        _ => None,
+                    })
+                    .collect();
+                let [id] = ids.into_iter().collect::<Vec<_>>()[..] else {
+                    return None;
+                };
+                Some(LienDeBibliotheque::Interne(LienInterne {
+                    genre: GenreDeLien::Artiste,
+                    id,
+                }))
             }
-            Some(place) => match place {
-                Some(deja) if deja.id == lien.id && deja.genre == lien.genre => {}
-                Some(deja)
-                    if deja.genre == GenreDeLien::Artiste && lien.genre == GenreDeLien::Album => {}
-                _ => *place = None,
-            },
+            Rang::Label => {
+                let noms: HashSet<&String> = du_rang(fort)
+                    .filter_map(|p| match p {
+                        Porteur::Label(n) => Some(n),
+                        _ => None,
+                    })
+                    .collect();
+                let [nom] = noms.into_iter().collect::<Vec<_>>()[..] else {
+                    return None;
+                };
+                Some(LienDeBibliotheque::Label(nom.clone()))
+            }
+            Rang::Album | Rang::AlbumDeBase => {
+                let indices = |r: Rang| {
+                    du_rang(r)
+                        .filter_map(|p| match p {
+                            Porteur::Album(i) => Some(*i),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let mut pris = indices(fort);
+                let artiste = artiste_commun(&pris, albums)?;
+                // Un titre exact retient aussi les éditions du même artiste
+                // (« The Wall » et « The Wall (Remastered) ») : toutes sont
+                // des exemplaires du même album. D'un autre artiste, le
+                // titre exact l'emporte.
+                if fort == Rang::Album {
+                    let de_base = indices(Rang::AlbumDeBase);
+                    let mut ensemble = pris.clone();
+                    ensemble.extend(&de_base);
+                    if artiste.is_some() && artiste_commun(&ensemble, albums) == Some(artiste) {
+                        pris = ensemble;
+                    }
+                }
+                let meilleur = pris
+                    .iter()
+                    .map(|i| &albums[*i])
+                    .min_by(|a, b| meilleur_d_abord(a, b))?;
+                for i in &pris {
+                    self.exemplaires
+                        .entry(albums[*i].id)
+                        .or_default()
+                        .push(meilleur.id);
+                }
+                Some(LienDeBibliotheque::Interne(LienInterne {
+                    genre: GenreDeLien::Album,
+                    id: meilleur.id,
+                }))
+            }
+        }
+    }
+
+    /// L'entité de la bibliothèque que ce nom désignerait dans une bio, s'il
+    /// y en a une seule (#8129 : sur une fiche de service, l'artiste ou
+    /// l'album de la page n'est pas lié vers son homonyme local). Un label
+    /// n'a pas d'identifiant : `None`.
+    pub fn lien_du_nom(&self, nom: &str) -> Option<LienInterne> {
+        let (cle, _) = cle_retenue(nom)?;
+        match self.noms.get(&cle)? {
+            Some(LienDeBibliotheque::Interne(l)) => Some(*l),
+            _ => None,
         }
     }
 
@@ -425,15 +707,44 @@ impl IndexDesNoms {
     }
 
     /// Les liens internes trouvés dans `texte` : (début, fin, lien), positions
-    /// en octets, dans l'ordre du texte. Le plus long nom l'emporte ; un nom
-    /// d'un seul mot doit commencer par une majuscule dans le texte.
+    /// en octets, dans l'ordre du texte. Voir
+    /// [`IndexDesNoms::liens_de_la_bibliotheque`] ; les labels n'y sont pas.
     pub fn liens_internes(
         &self,
         texte: &str,
         exclus: &[LienInterne],
     ) -> Vec<(usize, usize, LienInterne)> {
+        self.liens_de_la_bibliotheque(texte, exclus)
+            .into_iter()
+            .filter_map(|(d, f, l)| match l {
+                LienDeBibliotheque::Interne(l) => Some((d, f, l)),
+                LienDeBibliotheque::Label(_) => None,
+            })
+            .collect()
+    }
+
+    /// Les noms de la bibliothèque trouvés dans `texte` : (début, fin, cible),
+    /// positions en octets, dans l'ordre du texte. Le plus long nom
+    /// l'emporte ; un nom d'un seul mot doit commencer par une majuscule dans
+    /// le texte. Un album exclu l'est avec ses autres exemplaires (#8150).
+    pub fn liens_de_la_bibliotheque(
+        &self,
+        texte: &str,
+        exclus: &[LienInterne],
+    ) -> Vec<(usize, usize, LienDeBibliotheque)> {
         let m = mots(texte);
-        let mut deja: HashSet<LienInterne> = exclus.iter().copied().collect();
+        let mut deja: HashSet<LienDeBibliotheque> = HashSet::new();
+        for l in exclus {
+            deja.insert(LienDeBibliotheque::Interne(*l));
+            if l.genre == GenreDeLien::Album {
+                for id in self.exemplaires.get(&l.id).into_iter().flatten() {
+                    deja.insert(LienDeBibliotheque::Interne(LienInterne {
+                        genre: GenreDeLien::Album,
+                        id: *id,
+                    }));
+                }
+            }
+        }
         let mut trouves = Vec::new();
         let mut i = 0;
         'mots: while i < m.len() {
@@ -464,10 +775,10 @@ impl IndexDesNoms {
                 {
                     continue;
                 }
-                if !deja.insert(*lien) {
+                if !deja.insert(lien.clone()) {
                     continue;
                 }
-                trouves.push((m[i].debut, m[i + n - 1].fin, *lien));
+                trouves.push((m[i].debut, m[i + n - 1].fin, lien.clone()));
                 i += n;
                 continue 'mots;
             }
@@ -475,6 +786,22 @@ impl IndexDesNoms {
         }
         trouves
     }
+}
+
+/// L'artiste commun à ces albums : `Some(None)` pour un seul album (ou un
+/// seul identifiant) sans artiste connu, `None` si leurs artistes diffèrent
+/// ou si l'un d'eux manque alors qu'ils sont plusieurs.
+fn artiste_commun(indices: &[usize], albums: &[AlbumDeLIndex]) -> Option<Option<i64>> {
+    let ids: HashSet<i64> = indices.iter().map(|i| albums[*i].id).collect();
+    let premier = albums.get(*indices.first()?)?;
+    if ids.len() == 1 {
+        return Some(premier.artist_id);
+    }
+    let artiste = premier.artist_id?;
+    indices
+        .iter()
+        .all(|i| albums[*i].artist_id == Some(artiste))
+        .then_some(Some(artiste))
 }
 
 /// Découpe `texte` en segments : liens internes d'abord, puis liens externes
@@ -486,15 +813,56 @@ pub fn segments_de_la_bio(
     exclus: &[LienInterne],
     externes: &[LienExterne],
 ) -> Vec<BioSegment> {
+    segments_avec_liens_de_service(texte, index, exclus, &[], externes)
+}
+
+/// #8129 — [`segments_de_la_bio`], avec en plus les liens du HTML d'origine
+/// qui désignent une fiche de service (texte du lien, cible). Ils passent en
+/// premier — c'est la source qui les a posés —, à la première occurrence
+/// libre de leur texte, une fois par cible ; les noms de la bibliothèque et
+/// les liens externes se placent ensuite, hors de leurs zones.
+pub fn segments_avec_liens_de_service(
+    texte: &str,
+    index: &IndexDesNoms,
+    exclus: &[LienInterne],
+    de_service: &[(String, LienDeService)],
+    externes: &[LienExterne],
+) -> Vec<BioSegment> {
     enum Cible {
         Interne(LienInterne),
+        Label(String),
+        Service(LienDeService),
         Externe(String),
     }
-    let mut zones: Vec<(usize, usize, Cible)> = index
-        .liens_internes(texte, exclus)
+    fn libre<T>(zones: &[(usize, usize, T)], d: usize, f: usize) -> bool {
+        zones.iter().all(|(zd, zf, _)| f <= *zd || d >= *zf)
+    }
+    let mut zones: Vec<(usize, usize, Cible)> = Vec::new();
+    let mut cibles = HashSet::new();
+    for (t, lien) in de_service {
+        if t.is_empty() || cibles.contains(lien) {
+            continue;
+        }
+        if let Some((d, t)) = texte
+            .match_indices(t.as_str())
+            .find(|(d, t)| libre(&zones, *d, d + t.len()))
+        {
+            cibles.insert(lien.clone());
+            zones.push((d, d + t.len(), Cible::Service(lien.clone())));
+        }
+    }
+    let internes: Vec<_> = index
+        .liens_de_la_bibliotheque(texte, exclus)
         .into_iter()
-        .map(|(d, f, l)| (d, f, Cible::Interne(l)))
+        .filter(|(d, f, _)| libre(&zones, *d, *f))
         .collect();
+    zones.extend(internes.into_iter().map(|(d, f, l)| {
+        let cible = match l {
+            LienDeBibliotheque::Interne(l) => Cible::Interne(l),
+            LienDeBibliotheque::Label(nom) => Cible::Label(nom),
+        };
+        (d, f, cible)
+    }));
     let mut urls = HashSet::new();
     for e in externes {
         let Some(url) = url_autorisee(&e.url) else {
@@ -503,11 +871,10 @@ pub fn segments_de_la_bio(
         if e.texte.is_empty() || urls.contains(&url) {
             continue;
         }
-        let libre = texte.match_indices(e.texte.as_str()).find(|(d, t)| {
-            let f = d + t.len();
-            zones.iter().all(|(zd, zf, _)| f <= *zd || *d >= *zf)
-        });
-        if let Some((d, t)) = libre {
+        let place = texte
+            .match_indices(e.texte.as_str())
+            .find(|(d, t)| libre(&zones, *d, d + t.len()));
+        if let Some((d, t)) = place {
             urls.insert(url.clone());
             zones.push((d, d + t.len(), Cible::Externe(url)));
         }
@@ -521,16 +888,22 @@ pub fn segments_de_la_bio(
             segments.push(BioSegment {
                 texte: texte[curseur..d].to_string(),
                 lien: None,
+                label: None,
+                lien_service: None,
                 url: None,
             });
         }
-        let (lien, url) = match cible {
-            Cible::Interne(l) => (Some(l), None),
-            Cible::Externe(u) => (None, Some(u)),
+        let (lien, label, lien_service, url) = match cible {
+            Cible::Interne(l) => (Some(l), None, None, None),
+            Cible::Label(n) => (None, Some(n), None, None),
+            Cible::Service(l) => (None, None, Some(l), None),
+            Cible::Externe(u) => (None, None, None, Some(u)),
         };
         segments.push(BioSegment {
             texte: texte[d..f].to_string(),
             lien,
+            label,
+            lien_service,
             url,
         });
         curseur = f;
@@ -539,24 +912,105 @@ pub fn segments_de_la_bio(
         segments.push(BioSegment {
             texte: texte[curseur..].to_string(),
             lien: None,
+            label: None,
+            lien_service: None,
             url: None,
         });
     }
     segments
 }
 
-/// L'index des noms de la bibliothèque : tous les artistes et tous les albums.
+/// L'index des noms de la bibliothèque : tous les artistes, tous les albums
+/// (avec leur artiste, leur source et leur résolution, #8150) et les labels
+/// de l'onglet Labels.
 pub fn charger_index(db: &Arc<dyn DbBackend>) -> Result<IndexDesNoms, String> {
-    let paires = |sql: &str| -> Result<Vec<(i64, String)>, String> {
-        Ok(db
-            .query_many(sql, &[])?
-            .into_iter()
-            .filter_map(|cols| Some((cols.first()?.as_i64()?, cols.get(1)?.as_string()?)))
-            .collect())
-    };
-    let artistes = paires("SELECT id, name FROM artists")?;
-    let albums = paires("SELECT id, title FROM albums")?;
-    Ok(IndexDesNoms::construire(artistes, albums))
+    let artistes: Vec<(i64, String)> = db
+        .query_many("SELECT id, name FROM artists", &[])?
+        .into_iter()
+        .filter_map(|cols| Some((cols.first()?.as_i64()?, cols.get(1)?.as_string()?)))
+        .collect();
+    let albums: Vec<AlbumDeLIndex> = db
+        .query_many(
+            "SELECT id, title, artist_id, source, sample_rate, bit_depth FROM albums",
+            &[],
+        )?
+        .into_iter()
+        .filter_map(|cols| {
+            Some(AlbumDeLIndex {
+                id: cols.first()?.as_i64()?,
+                titre: cols.get(1)?.as_string()?,
+                artist_id: cols.get(2).and_then(|c| c.as_i64()),
+                local: cols
+                    .get(3)
+                    .and_then(|c| c.as_string())
+                    .is_none_or(|s| s == "local"),
+                sample_rate: cols.get(4).and_then(|c| c.as_i64()),
+                bit_depth: cols.get(5).and_then(|c| c.as_i64()),
+            })
+        })
+        .collect();
+    let labels = crate::db::album_repo::AlbumRepo::with_backend(db.clone())
+        .labels_de_la_bibliotheque()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|l| l.nom);
+    Ok(IndexDesNoms::construire_avec(artistes, albums, labels))
+}
+
+/// Au-delà, l'index partagé est relu même si la bibliothèque n'a ni gagné ni
+/// perdu d'entrée (un artiste renommé).
+const DUREE_DE_L_INDEX: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Ce qui change quand on ajoute ou retire un artiste ou un album.
+fn signature_de_la_bibliotheque(db: &Arc<dyn DbBackend>) -> Vec<i64> {
+    db.query_one(
+        "SELECT (SELECT COUNT(*) FROM artists), (SELECT COALESCE(MAX(id), 0) FROM artists), \
+         (SELECT COUNT(*) FROM albums), (SELECT COALESCE(MAX(id), 0) FROM albums)",
+        &[],
+    )
+    .ok()
+    .flatten()
+    .map(|cols| cols.iter().map(|c| c.as_i64().unwrap_or(-1)).collect())
+    .unwrap_or_default()
+}
+
+/// L'index d'une base, gardé tant que la bibliothèque n'a pas changé (nombre
+/// et plus grand identifiant des artistes et des albums) et au plus
+/// [`DUREE_DE_L_INDEX`]. Partagé par les bios de la bibliothèque (#7910) et
+/// celles des services (#8129) : un `Arc` neuf veut dire « index rebâti ».
+pub fn index_partage(db: &Arc<dyn DbBackend>) -> Arc<IndexDesNoms> {
+    use std::sync::{Mutex, OnceLock, Weak};
+    use std::time::Instant;
+    /// Un `Weak` garde l'allocation : l'adresse ne peut pas être reprise par
+    /// une autre base tant que l'entrée existe (bases de test successives).
+    type Entree = (Weak<dyn DbBackend>, Vec<i64>, Instant, Arc<IndexDesNoms>);
+    static INDEX: OnceLock<Mutex<Vec<Entree>>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| Mutex::new(Vec::new()));
+    let signature = signature_de_la_bibliotheque(db);
+    let ici = Arc::downgrade(db);
+    {
+        let mut entrees = index.lock().unwrap_or_else(|e| e.into_inner());
+        entrees.retain(|(base, ..)| base.strong_count() > 0);
+        if let Some((_, sig, bati, i)) = entrees.iter().find(|(b, ..)| Weak::ptr_eq(b, &ici))
+            && *sig == signature
+            && bati.elapsed() < DUREE_DE_L_INDEX
+        {
+            return i.clone();
+        }
+    }
+    // Le verrou n'est jamais tenu pendant la lecture de la bibliothèque : une
+    // grosse base ferait attendre toutes les bios, de toutes les bases.
+    let neuf = Arc::new(charger_index(db).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "bio_segments_index_failed");
+        IndexDesNoms::default()
+    }));
+    let mut entrees = index.lock().unwrap_or_else(|e| e.into_inner());
+    let entree = (ici.clone(), signature, Instant::now(), neuf.clone());
+    match entrees.iter().position(|(b, ..)| Weak::ptr_eq(b, &ici)) {
+        Some(p) => entrees[p] = entree,
+        None => entrees.push(entree),
+    }
+    neuf
 }
 
 /// Empreinte stable (FNV-1a 64 bits) d'un texte de bio.
@@ -657,3 +1111,7 @@ fn bio_enregistree(db: &Arc<dyn DbBackend>, genre: GenreDeLien, id: i64) -> Opti
 #[cfg(test)]
 #[path = "bio_segments_7910_tests.rs"]
 mod bio_segments_7910_tests;
+
+#[cfg(test)]
+#[path = "bio_segments_8150_tests.rs"]
+mod bio_segments_8150_tests;

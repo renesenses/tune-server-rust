@@ -9,6 +9,8 @@
 [advisories]
 version = 2
 ignore = [
+    # RUSTSEC-2026-0459 (SQLite < 3.54 embarque) : exception de la rc11 levee
+    # par #8196 (rusqlite 0.41 / libsqlite3-sys 0.39 / SQLite 3.54.0).
     # paste 1.0.15 — unmaintained: the author archived the repo (RUSTSEC-2024-0436).
     # Pulled transitively via lofty / notify. It is a compile-time proc-macro helper
     # with no runtime code path and no known vulnerability; there is no safe upgrade

@@ -340,7 +340,45 @@ async fn search_podcasts(
         }
     }
 }
+/// #6925 — un abonnement pris depuis la sélection éditoriale a gardé l'adresse
+/// FAUSSE qu'elle portait (« Banzzaï » ouvrait « Les polars de l'histoire » et
+/// ne jouait que le message d'accueil de l'appli Radio France). La liste des
+/// abonnements la remplace par la vraie ; si la vraie est déjà suivie, la
+/// ligne fausse, en double, s'efface. Idempotent : sans adresse fausse en
+/// base, aucune ligne n'est écrite.
+fn corriger_les_adresses_de_la_selection_6925(state: &AppState) {
+    use tune_core::db::backend::ToSqlValue;
+    for (fausse, vraie) in PodcastService::ADRESSES_CORRIGEES_6925 {
+        let deja_suivie = state
+            .backend
+            .query_one(
+                "SELECT id FROM podcast_subscriptions WHERE feed_url = ?",
+                &[vraie as &dyn ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .is_some();
+        let resultat = if deja_suivie {
+            state.backend.execute(
+                "DELETE FROM podcast_subscriptions WHERE feed_url = ?",
+                &[fausse as &dyn ToSqlValue],
+            )
+        } else {
+            state.backend.execute(
+                "UPDATE podcast_subscriptions SET feed_url = ? WHERE feed_url = ?",
+                &[vraie as &dyn ToSqlValue, fausse as &dyn ToSqlValue],
+            )
+        };
+        match resultat {
+            Ok(0) => {}
+            Ok(_) => info!(fausse, vraie, "podcast_adresse_de_la_selection_corrigee"),
+            Err(e) => warn!(fausse, error = %e, "podcast_adresse_de_la_selection_non_corrigee"),
+        }
+    }
+}
+
 async fn list_subscriptions(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    corriger_les_adresses_de_la_selection_6925(&state);
     let rows = state.backend.query_many("SELECT id, feed_url, title, author, image_url, description, source_id FROM podcast_subscriptions ORDER BY title", &[]).map_err(AppError::internal)?;
     let cache = crate::routes::library::artwork_cache_dir();
     let items: Vec<Value> = rows
@@ -1054,10 +1092,29 @@ pub(super) async fn play_episode(
         "podcast_episode_play"
     );
     if echec.is_none() {
-        if let Some(seek_ms) = body.seek_ms.filter(|v| *v > 0) {
+        // #8152 — un épisode terminé, ou une position nulle, repart du début.
+        let reprise = body.seek_ms.filter(|v| {
+            *v > 0
+                && !tune_core::db::listening_resume::episode_fini(
+                    (*v).min(i64::MAX as u64) as i64,
+                    body.duration_ms.unwrap_or(0).min(i64::MAX as u64) as i64,
+                )
+        });
+        if let Some(seek_ms) = reprise {
+            info!(
+                zone_id,
+                position_ms = seek_ms,
+                reseau,
+                "podcast_reprise_position"
+            );
+            // #8152 — sur un renderer réseau, le Seek envoyé dans la foulée du
+            // Play partait avant que l'appareil ouvre le flux (Eversolo, .18) :
+            // il l'acquittait puis lisait depuis l'octet 0. L'orchestrateur
+            // l'envoie désormais une fois le transport en lecture ; la sortie
+            // locale garde `seek` (recréation du flux à la position).
             if let Err(e) = state
                 .orchestrator
-                .seek(zone_id, seek_ms, device_id.as_deref())
+                .reprendre_l_episode_a_sa_position(zone_id, device_id.as_deref(), seek_ms)
                 .await
             {
                 state.playback.stop(zone_id).await;
@@ -1620,6 +1677,12 @@ mod reprise_navigateur_7354_tests;
 #[path = "podcasts/historique_7965_tests.rs"]
 mod historique_7965_tests;
 
+#[cfg(test)]
+#[path = "podcasts/adresses_de_la_selection_6925_tests.rs"]
+mod adresses_de_la_selection_6925_tests;
+#[cfg(test)]
+#[path = "podcasts/reprise_dlna_8152_tests.rs"]
+mod reprise_dlna_8152_tests;
 #[cfg(test)]
 #[path = "podcasts/reprise_par_adresse_8085_tests.rs"]
 mod reprise_par_adresse_8085_tests;

@@ -185,6 +185,12 @@ pub(crate) fn famille_de_sortie(device_id: &str, output_type: Option<&str>) -> &
     "inconnue"
 }
 
+/// #8229 (relecture) — délai accordé au service pour compléter la fiche d'un
+/// titre préchargé. Au-delà, le titre est servi avec ce qu'il a : la lecture
+/// n'attend pas un service lent.
+pub(super) const DELAI_FICHE_DU_PRECHARGEMENT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 impl PlaybackOrchestrator {
     /// Marque la zone en résolution gapless jusqu'au drop du garde.
     pub(super) fn begin_levels_prewarm(&self, zone_id: i64) -> LevelsPrewarmScope<'_> {
@@ -367,20 +373,63 @@ impl PlaybackOrchestrator {
         // orchestrator_play/Now Playing go blank). When that (or a missing
         // duration) happens, refetch the real metadata from the service so Now
         // Playing is never blanked and end detection has a duration.
-        if title.is_empty() || duration_ms == 0 {
-            let registry = self.services.lock().await;
-            if let Some(svc) = registry.get_actif(&prefetched.source).await {
-                let svc = svc.read().await;
-                if let Ok(track) = svc.get_track(&prefetched.source_id).await {
-                    if title.is_empty() {
-                        title = track.title;
-                        artist = artist.or(Some(track.artist));
-                        album = album.or(track.album);
-                        cover_url = cover_url.or(track.cover_path);
+        //
+        // #8229 — même règle que la résolution directe (#7738) : un titre
+        // Qobuz importé d'un M3U arrive avec son titre, sans artiste, album
+        // ni pochette, et le tampon qui le précharge n'en sait pas plus. Le
+        // titre atteint par l'enchaînement passe par ici : sans ce second
+        // cas, le lecteur restait sans pochette ni artiste, alors que le même
+        // titre lancé au clic (résolution directe) les avait.
+        let vide = |s: &Option<String>| s.as_deref().is_none_or(|s| s.trim().is_empty());
+        let fiche_incomplete = super::resolve_stream::fiche_qobuz_incomplete(
+            &prefetched.source,
+            &artist,
+            &album,
+            &cover_url,
+        );
+        if title.is_empty() || duration_ms == 0 || fiche_incomplete {
+            // #8229 (relecture) — le registre des services n'est tenu que le
+            // temps de cloner l'`Arc` du service : l'appel réseau `get_track`
+            // se fait registre relâché, et il est borné. Tenu pendant l'appel,
+            // le registre bloquait tous les services (recherche, lecture,
+            // préchargement) aussi longtemps que Qobuz tardait à répondre, et
+            // cette consultation part désormais à chaque enchaînement d'un
+            // titre Qobuz à fiche incomplète.
+            let service = self
+                .services
+                .lock()
+                .await
+                .get_actif(&prefetched.source)
+                .await;
+            let fiche = match service {
+                Some(svc) => tokio::time::timeout(DELAI_FICHE_DU_PRECHARGEMENT, async {
+                    svc.read().await.get_track(&prefetched.source_id).await
+                })
+                .await
+                .ok(),
+                None => None,
+            };
+            if let Some(Ok(track)) = fiche {
+                if title.is_empty() {
+                    title = track.title;
+                    artist = artist.or(Some(track.artist));
+                    album = album.or(track.album);
+                    cover_url = cover_url.or(track.cover_path);
+                } else if fiche_incomplete {
+                    // Le titre importé est gardé ; seuls les champs vides
+                    // sont complétés.
+                    if vide(&artist) && !track.artist.trim().is_empty() {
+                        artist = Some(track.artist);
                     }
-                    if duration_ms == 0 && track.duration_ms > 0 {
-                        duration_ms = track.duration_ms;
+                    if vide(&album) && track.album.is_some() {
+                        album = track.album;
                     }
+                    if vide(&cover_url) && track.cover_path.is_some() {
+                        cover_url = track.cover_path;
+                    }
+                }
+                if duration_ms == 0 && track.duration_ms > 0 {
+                    duration_ms = track.duration_ms;
                 }
             }
         }
@@ -408,9 +457,9 @@ impl PlaybackOrchestrator {
         let Etiquettes {
             title,
             artist,
+            album,
             cover_url,
             duration_ms,
-            ..
         } = etiquettes;
         let sr = prefetched.sample_rate;
         let bd = prefetched.bit_depth;
@@ -546,7 +595,8 @@ impl PlaybackOrchestrator {
             stream_id: Some(session_id),
             title: title.clone(),
             artist: artist.clone(),
-            album: None,
+            // #8229 — l'album complété par l'étiquetage n'était pas transmis.
+            album: album.clone(),
             duration_ms: Some(duration_ms as i64),
             source: prefetched.source,
             mime_type: out_mime.into(),
@@ -3035,6 +3085,7 @@ impl PlaybackOrchestrator {
             pure_force,
             crate::audio::volume_limites::OrigineDuVolume::Absolue,
             crate::audio::garde_de_hausse::Hausse::Gardee,
+            None,
         )
         .await
         .map(|_| ())
@@ -3063,8 +3114,10 @@ impl PlaybackOrchestrator {
             pure_force,
             crate::audio::volume_limites::OrigineDuVolume::Absolue,
             hausse,
+            None,
         )
         .await
+        .map(|(retenu, _)| retenu)
     }
 
     /// #6541 — une consigne venue des boutons + / − : la limite de CONFORT
@@ -3108,8 +3161,10 @@ impl PlaybackOrchestrator {
             pure_force,
             crate::audio::volume_limites::OrigineDuVolume::Pas,
             hausse,
+            None,
         )
         .await
+        .map(|(retenu, _)| retenu)
     }
 
     /// #5695 — commande le plein volume d'une zone PURE verrouillée, SANS
@@ -3118,11 +3173,14 @@ impl PlaybackOrchestrator {
     /// Pour la route qui arme PURE : elle commande le 100 % AVANT d'écrire le
     /// réglage (un refus de l'appareil ne doit rien persister), donc
     /// [`Self::set_volume`] ne peut pas encore lire le verrou en base.
+    ///
+    /// #8137 — rend ce qui est parti vers l'appareil : rien sur une zone en
+    /// volume fixe, ni quand l'appareil a été relu à 100 %.
     pub async fn set_volume_pure_force(
         &self,
         zone_id: i64,
         device_id: Option<&str>,
-    ) -> OutputCommandResult<()> {
+    ) -> OutputCommandResult<super::EnvoiDeVolume> {
         // #6721 — l'armement de PURE est confirmé par l'utilisateur : c'est
         // l'action explicite qui autorise le 100 % (la garde ne mord pas sous
         // `pure_force`).
@@ -3133,12 +3191,14 @@ impl PlaybackOrchestrator {
             true,
             crate::audio::volume_limites::OrigineDuVolume::Absolue,
             crate::audio::garde_de_hausse::Hausse::Confirmee,
+            Some(super::BasculePure::Entree),
         )
         .await
-        .map(|_| ())
+        .map(|(_, envoi)| envoi)
     }
 
-    async fn appliquer_volume(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn appliquer_volume(
         &self,
         zone_id: i64,
         volume: f64,
@@ -3146,7 +3206,12 @@ impl PlaybackOrchestrator {
         pure_force: bool,
         origine: crate::audio::volume_limites::OrigineDuVolume,
         hausse: crate::audio::garde_de_hausse::Hausse,
-    ) -> OutputCommandResult<crate::audio::garde_de_hausse::VolumeRetenu> {
+        bascule: Option<super::BasculePure>,
+    ) -> OutputCommandResult<(
+        crate::audio::garde_de_hausse::VolumeRetenu,
+        super::EnvoiDeVolume,
+    )> {
+        use super::EnvoiDeVolume;
         let demande = volume;
         // When fixed_volume is enabled, pin volume to 1.0 (bit-perfect) and
         // skip sending to the device — the DAC/renderer handles volume.
@@ -3159,11 +3224,23 @@ impl PlaybackOrchestrator {
             ZoneRepo::with_backend(self.db.clone())
                 .update_volume(zone_id, 100.0)
                 .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
-            return Ok(crate::audio::garde_de_hausse::VolumeRetenu {
-                demande,
-                retenu: 1.0,
-                hausse_plafonnee: false,
-            });
+            // #8137 — dit au journal : aucune commande n'est partie.
+            if let Some(bascule) = bascule {
+                info!(
+                    zone_id,
+                    bascule = bascule.code(),
+                    device_id = device_id.unwrap_or(""),
+                    "bascule_pure_volume_fixe_aucun_envoi"
+                );
+            }
+            return Ok((
+                crate::audio::garde_de_hausse::VolumeRetenu {
+                    demande,
+                    retenu: 1.0,
+                    hausse_plafonnee: false,
+                },
+                EnvoiDeVolume::AucunVolumeFixe,
+            ));
         }
 
         // Trim de gain par renderer (setting `zone_{id}_gain_trim_db`, ±12 dB) :
@@ -3261,7 +3338,7 @@ impl PlaybackOrchestrator {
                 // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
                 .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
                 .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
-            return Ok(retenu_final);
+            return Ok((retenu_final, EnvoiDeVolume::AucunSansAppareil));
         };
         // #7633 — un renderer OpenHome reçoit son volume sans le verrou de
         // la sortie : le sondeur le tient pendant ses relevés SOAP (jusqu'à
@@ -3292,30 +3369,6 @@ impl PlaybackOrchestrator {
                 .capabilities()
                 .require(OutputCommand::SetVolume)?;
         }
-        // La demande prend son numéro, et l'état en mémoire comme l'évènement
-        // suivent tout de suite, dans l'ordre d'arrivée.
-        let ticket = {
-            let mut etat = file.etat.lock().await;
-            if etat.confirme.is_none() {
-                etat.confirme = Some(self.playback.get_state(zone_id).await.volume);
-            }
-            etat.dernier_ticket += 1;
-            self.noter_le_volume_aux_postes(zone_id, volume);
-            self.playback.set_volume(zone_id, volume).await;
-            self.playback.mark_volume_changed(zone_id).await;
-            etat.dernier_ticket
-        };
-        // Les demandes plus anciennes qui attendent se savent remplacées.
-        file.reveil.notify_waiters();
-        if !file.attendre_son_tour(ticket).await {
-            debug!(
-                zone_id,
-                volume,
-                device_id = did,
-                "device_set_volume_coalesced"
-            );
-            return Ok(retenu_final);
-        }
         let consigne_appareil = |output_type: &str| {
             if pure_force {
                 return 1.0;
@@ -3339,9 +3392,73 @@ impl PlaybackOrchestrator {
             // Un trim positif ne fait pas passer la limite de sécurité.
             limites.borner_appareil(volume_appareil_avec_trim(volume, trim_db, volume_materiel))
         };
+        // #8137 — à la bascule PURE, l'appareil relu à la valeur visée ne
+        // reçoit rien : la commande ne changerait pas le volume, et certains
+        // renderers coupent leur signal en la traitant. Jamais quand une
+        // commande est en vol : la relecture ne dit plus ce qu'il jouera.
+        if let Some(bascule) = bascule
+            && !file.etat.lock().await.en_vol
+        {
+            let output_type = match envoi_direct {
+                Some(_) => "openhome".to_string(),
+                None => output.lock().await.output_type().to_string(),
+            };
+            let cible = consigne_appareil(&output_type);
+            if let Some(relu) =
+                super::bascule_pure_8137::deja_a_la_cible(self.volumes_relus.connu(zone_id), cible)
+            {
+                info!(
+                    zone_id,
+                    bascule = bascule.code(),
+                    device_id = did,
+                    volume,
+                    device_volume = cible,
+                    relu,
+                    "bascule_pure_volume_deja_a_la_cible_aucun_envoi"
+                );
+                self.noter_le_volume_aux_postes(zone_id, volume);
+                self.playback.set_volume(zone_id, volume).await;
+                self.playback.mark_volume_changed(zone_id).await;
+                ZoneRepo::with_backend(self.db.clone())
+                    .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
+                    .map_err(|message| {
+                        OutputCommandError::failed(OutputCommand::SetVolume, message)
+                    })?;
+                return Ok((retenu_final, EnvoiDeVolume::AucunDejaALaCible(relu)));
+            }
+        }
+        // La demande prend son numéro, et l'état en mémoire comme l'évènement
+        // suivent tout de suite, dans l'ordre d'arrivée.
+        let ticket = {
+            let mut etat = file.etat.lock().await;
+            if etat.confirme.is_none() {
+                etat.confirme = Some(self.playback.get_state(zone_id).await.volume);
+            }
+            etat.dernier_ticket += 1;
+            self.noter_le_volume_aux_postes(zone_id, volume);
+            self.playback.set_volume(zone_id, volume).await;
+            self.playback.mark_volume_changed(zone_id).await;
+            etat.dernier_ticket
+        };
+        // Les demandes plus anciennes qui attendent se savent remplacées.
+        file.reveil.notify_waiters();
+        if !file.attendre_son_tour(ticket).await {
+            debug!(
+                zone_id,
+                volume,
+                device_id = did,
+                "device_set_volume_coalesced"
+            );
+            return Ok((retenu_final, EnvoiDeVolume::Remplace));
+        }
+        // #8137 — la relecture d'avant ne dit plus ce que l'appareil joue.
+        self.volumes_relus.oublier(zone_id);
+        let debut_de_l_envoi = std::time::Instant::now();
+        let valeur_envoyee: f64;
         let resultat = match envoi_direct {
             Some(envoi) => {
                 let device_volume = consigne_appareil("openhome");
+                valeur_envoyee = device_volume;
                 info!(
                     zone_id,
                     volume,
@@ -3357,6 +3474,7 @@ impl PlaybackOrchestrator {
             None => {
                 let sortie = output.lock().await;
                 let device_volume = consigne_appareil(sortie.output_type());
+                valeur_envoyee = device_volume;
                 info!(
                     zone_id,
                     volume,
@@ -3368,6 +3486,18 @@ impl PlaybackOrchestrator {
                 sortie.checked_set_volume(device_volume).await
             }
         };
+        self.volumes_relus.oublier(zone_id);
+        if let Some(bascule) = bascule {
+            info!(
+                zone_id,
+                bascule = bascule.code(),
+                device_id = did,
+                device_volume = valeur_envoyee,
+                duree_ms = debut_de_l_envoi.elapsed().as_millis() as u64,
+                ok = resultat.is_ok(),
+                "bascule_pure_set_volume_envoye"
+            );
+        }
         let issue = {
             let mut etat = file.etat.lock().await;
             etat.en_vol = false;
@@ -3388,7 +3518,7 @@ impl PlaybackOrchestrator {
                         // #2886 — plus d'arrondi a l'entier : il coutait 3 dB vers
                         // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
                         .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
-                        .map(|_| retenu_final)
+                        .map(|_| (retenu_final, EnvoiDeVolume::Envoye(valeur_envoyee)))
                         .map_err(|message| {
                             OutputCommandError::failed(OutputCommand::SetVolume, message)
                         })

@@ -1,6 +1,8 @@
 pub mod amazon;
 /// Favoris radio → playlist chez un service (aperçu, puis création).
 pub mod appariement_favoris_radio;
+/// #6480 — le texte de présentation d'un album de service, HTML ramené à du texte.
+pub mod bio_qobuz;
 pub mod cadence_du_flux;
 pub mod deezer;
 pub mod deezer_decrypt;
@@ -14,7 +16,6 @@ pub mod podcast_annuaires;
 pub mod podcast_catalogue;
 pub mod podcast_par_adresse;
 pub mod podcasts;
-/// #6480 — le texte de présentation d'un album de service, HTML ramené à du texte.
 pub mod presentation_album;
 pub mod qobuz;
 /// #8077 — la fiche d'un album Qobuz ramenée à ce qu'un album local peut en reprendre.

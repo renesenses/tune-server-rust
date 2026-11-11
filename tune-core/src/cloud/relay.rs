@@ -15,6 +15,84 @@ use super::ENTETE_RELAIS;
 /// inscription (voir [`RelayClient::renouveler_jeton`]).
 const DELAI_DE_REINSCRIPTION: Duration = Duration::from_millis(500);
 
+/// Délai d'ouverture de la WebSocket (TCP, TLS, mise à niveau) : au-delà, la
+/// tentative est abandonnée et la boucle réessaie. Sans lui, un relais qui
+/// accepte la connexion sans jamais répondre retenait le serveur
+/// indéfiniment, « Déconnecté », jusqu'à un redémarrage.
+const DELAI_DE_CONNEXION: Duration = Duration::from_secs(20);
+
+/// Délai de la poignée de main (`relay.register` → défi → accusé).
+const DELAI_DE_POIGNEE: Duration = Duration::from_secs(20);
+
+/// Silence maximal du relais sur une connexion inscrite. Le relais envoie
+/// `relay.ping` toutes les 30 s : trois battements manqués valent une
+/// connexion morte (TCP à moitié ouvert après un changement d'adresse de la
+/// box, relais redéployé sans fermeture vue). La boucle se réinscrit alors,
+/// au lieu d'attendre pour toujours sur une socket que plus rien n'alimente.
+const SILENCE_MAX: Duration = Duration::from_secs(90);
+
+/// Refus du relais : le site connaît pour ce `server_id` une AUTRE clé que
+/// celle du serveur. Voir [`RelayClient::reinscrire_la_cle`].
+const REFUS_CLE_REQUISE: &str = "cle du serveur requise";
+
+/// Intervalle minimal entre deux réinscriptions forcées de la clé.
+const INTERVALLE_REINSCRIPTION_DE_CLE: Duration = Duration::from_secs(600);
+
+/// Durée minimale d'une session inscrite pour remettre le recul à zéro.
+///
+/// 🔴 Deux serveurs au même `server_id` (sauvegarde restaurée sur une autre
+/// machine) se délogent l'un l'autre : le relais ferme l'ancienne connexion à
+/// chaque nouvelle inscription (« superseded », `tune-bridge/src/ws_server.rs`).
+/// Chaque session est donc INSCRITE puis fermée en quelques millisecondes ;
+/// si toute session inscrite remettait le compteur à zéro, les deux
+/// serveurs se réinscrivaient toutes les 2 s, sans fin. Une session courte
+/// compte comme un échec et le recul grandit jusqu'à son plafond.
+const SESSION_STABLE: Duration = Duration::from_secs(60);
+
+/// Numéro de la prochaine tentative après une session terminée par `fin`,
+/// qui a duré `duree` depuis le début de la tentative. `stable` : durée
+/// minimale d'une session pour remettre le recul à zéro
+/// ([`DelaisDuRelais::session_stable`]).
+fn tentative_suivante(
+    attempt: u32,
+    fin: &Result<FinDeSession, String>,
+    duree: Duration,
+    stable: Duration,
+) -> u32 {
+    if fin.is_ok() && duree >= stable {
+        1
+    } else {
+        attempt.saturating_add(1)
+    }
+}
+
+/// Attente avant la tentative numéro `attempt` : 2, 4, 8… plafonnée à 60 s.
+fn attente_avant(attempt: u32) -> Duration {
+    Duration::from_secs(std::cmp::min(1u64.saturating_mul(1 << attempt.min(6)), 60))
+}
+
+/// Les délais du client, remplaçables par les bancs.
+#[derive(Debug, Clone, Copy)]
+pub struct DelaisDuRelais {
+    pub connexion: Duration,
+    pub poignee: Duration,
+    pub silence: Duration,
+    /// Durée minimale d'une session inscrite pour remettre le recul à zéro
+    /// ([`SESSION_STABLE`] hors bancs).
+    pub session_stable: Duration,
+}
+
+impl Default for DelaisDuRelais {
+    fn default() -> Self {
+        Self {
+            connexion: DELAI_DE_CONNEXION,
+            poignee: DELAI_DE_POIGNEE,
+            silence: SILENCE_MAX,
+            session_stable: SESSION_STABLE,
+        }
+    }
+}
+
 /// Pourquoi une session avec le relais s'est terminée sans erreur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinDeSession {
@@ -55,6 +133,15 @@ pub struct RelayClient {
     /// signe le défi du relais. `None` : enregistrement par le seul jeton du
     /// pont, comme un serveur antérieur.
     cle: Option<Arc<tune_laissez_passer::CleServeur>>,
+    /// Le site, pour réinscrire la clé quand le relais la refuse (#7714).
+    /// `None` : pas de réinscription forcée.
+    inscription: Option<Arc<dyn crate::cloud::cle_serveur::InscriptionDeCle>>,
+    /// Dernière réinscription forcée, pour ne pas marteler le site.
+    derniere_reinscription: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Pourquoi la dernière tentative a échoué, `None` une fois inscrit :
+    /// les Réglages le montrent au lieu de « Redémarrez le serveur ».
+    derniere_erreur: Arc<std::sync::Mutex<Option<String>>>,
+    delais: DelaisDuRelais,
 }
 
 impl RelayClient {
@@ -82,6 +169,65 @@ impl RelayClient {
             http_flux,
             reglages: None,
             cle: None,
+            inscription: None,
+            derniere_reinscription: Arc::new(std::sync::Mutex::new(None)),
+            derniere_erreur: Arc::new(std::sync::Mutex::new(None)),
+            delais: DelaisDuRelais::default(),
+        }
+    }
+
+    /// Donne au client le site auprès duquel réinscrire la clé du serveur
+    /// quand le relais la refuse (#7714).
+    pub fn avec_inscription(
+        mut self,
+        site: Arc<dyn crate::cloud::cle_serveur::InscriptionDeCle>,
+    ) -> Self {
+        self.inscription = Some(site);
+        self
+    }
+
+    /// Remplace les délais (bancs de test).
+    #[doc(hidden)]
+    pub fn avec_delais(mut self, delais: DelaisDuRelais) -> Self {
+        self.delais = delais;
+        self
+    }
+
+    /// Pourquoi la dernière tentative d'inscription au relais a échoué.
+    /// `None` quand le serveur est inscrit, ou n'a encore rien tenté.
+    pub fn derniere_erreur(&self) -> Option<String> {
+        self.derniere_erreur.lock().ok().and_then(|e| e.clone())
+    }
+
+    /// Le relais refuse l'inscription parce que le site connaît une AUTRE
+    /// clé pour ce `server_id` : la clé du coffre a changé (coffre effacé,
+    /// base restaurée) après avoir été inscrite. Sans ce geste, l'impasse
+    /// était permanente : le relais attend la clé du site, et le serveur
+    /// n'inscrit la sienne qu'après une inscription réussie au relais
+    /// (`bridge_laissez_passer_actif`). La clé est donc réinscrite ici sur
+    /// le compte qui possède le serveur — le site exige la liaison prouvée
+    /// et la preuve de possession — puis la boucle réessaie.
+    async fn reinscrire_la_cle(&self) {
+        let (Some(backend), Some(site)) = (self.reglages.as_ref(), self.inscription.as_ref())
+        else {
+            return;
+        };
+        {
+            let Ok(mut derniere) = self.derniere_reinscription.lock() else {
+                return;
+            };
+            if derniere.is_some_and(|t| t.elapsed() < INTERVALLE_REINSCRIPTION_DE_CLE) {
+                return;
+            }
+            *derniere = Some(std::time::Instant::now());
+        }
+        match crate::cloud::cle_serveur::reinscrire(backend, site.as_ref()).await {
+            Ok(true) => info!("ecoute_distante_cle_reinscrite_apres_refus_du_relais"),
+            Ok(false) => warn!(
+                "ecoute_distante_cle_refusee_par_le_relais_serveur_non_relie — \
+                 reconnectez le compte mozaiklabs dans les Reglages"
+            ),
+            Err(e) => warn!(erreur = %e, "ecoute_distante_cle_non_reinscrite"),
         }
     }
 
@@ -128,6 +274,7 @@ impl RelayClient {
                     "connecting to relay"
                 );
 
+                let debut = std::time::Instant::now();
                 let fin = client.connect_and_run().await;
                 match &fin {
                     Ok(FinDeSession::Fermee) => {
@@ -139,6 +286,12 @@ impl RelayClient {
                     Err(e) => {
                         warn!(error = %e, "relay connection failed");
                     }
+                }
+                if let Ok(mut d) = client.derniere_erreur.lock() {
+                    *d = fin.as_ref().err().cloned();
+                }
+                if matches!(&fin, Err(e) if e.contains(REFUS_CLE_REQUISE)) {
+                    client.reinscrire_la_cle().await;
                 }
 
                 client.connected.store(false, Ordering::Relaxed);
@@ -154,11 +307,21 @@ impl RelayClient {
                     continue;
                 }
 
-                attempt += 1;
-                let backoff = Duration::from_secs(std::cmp::min(
-                    1u64.saturating_mul(1 << attempt.min(6)),
-                    60,
-                ));
+                // Une session INSCRITE et STABLE (≥ 60 s) remet le compteur à
+                // zéro : `Ok` ne sort de `connect_and_run` qu'après l'accusé
+                // du relais. Sans cela, chaque coupure de la vie du serveur
+                // (redéploiement du relais, box qui redémarre) allongeait
+                // l'attente suivante, jusqu'au plafond de 60 s — mesuré sur
+                // le .18 le 08/11/2026 : « backoff_secs=60 » après une
+                // simple fermeture propre. Une session plus courte compte
+                // comme un échec : voir [`SESSION_STABLE`].
+                attempt = tentative_suivante(
+                    attempt,
+                    &fin,
+                    debut.elapsed(),
+                    client.delais.session_stable,
+                );
+                let backoff = attente_avant(attempt);
                 info!(
                     backoff_secs = backoff.as_secs(),
                     "reconnecting after backoff"
@@ -177,18 +340,25 @@ impl RelayClient {
         let mut jeton = self.jeton.subscribe();
         let bridge_token = jeton.borrow_and_update().clone();
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&self.relay_url)
-            .await
-            .map_err(|e| format!("ws connect: {e}"))?;
+        let (ws_stream, _) = tokio::time::timeout(
+            self.delais.connexion,
+            tokio_tungstenite::connect_async(&self.relay_url),
+        )
+        .await
+        .map_err(|_| "ws connect: timeout".to_string())?
+        .map_err(|e| format!("ws connect: {e}"))?;
 
         let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
         // #6564 — le format des morceaux se décide ICI, une fois par
         // connexion : binaire si CE pont l'a annoncé dans son accusé, base64
         // sinon. Un pont antérieur (rc4 à rc6) n'annonce rien.
-        let morceaux_binaires = self
-            .poignee_de_main(&bridge_token, &mut ws_tx, &mut ws_rx)
-            .await?;
+        let morceaux_binaires = tokio::time::timeout(
+            self.delais.poignee,
+            self.poignee_de_main(&bridge_token, &mut ws_tx, &mut ws_rx),
+        )
+        .await
+        .map_err(|_| "relay: no ack (timeout)".to_string())??;
 
         info!(
             server_id = %self.server_id,
@@ -196,6 +366,9 @@ impl RelayClient {
             "registered with relay"
         );
         self.connected.store(true, Ordering::Relaxed);
+        if let Ok(mut d) = self.derniere_erreur.lock() {
+            *d = None;
+        }
 
         let (msg_tx, msg_rx) = mpsc::channel::<Trame>(256);
         let (vrac_tx, vrac_rx) = mpsc::channel::<Trame>(256);
@@ -221,20 +394,36 @@ impl RelayClient {
 
         // Reader: handle incoming messages from relay
         let mut fin = FinDeSession::Fermee;
+        let silence = tokio::time::sleep(self.delais.silence);
+        tokio::pin!(silence);
         loop {
             tokio::select! {
-                msg = ws_rx.next() => match msg {
-                    Some(Ok(tungstenite::Message::Text(text))) => {
-                        self.handle_message(&text).await;
+                // Plus rien du relais depuis `SILENCE_MAX` : connexion morte.
+                () = &mut silence => {
+                    warn!(
+                        silence_secs = self.delais.silence.as_secs(),
+                        "relay silent, reconnecting"
+                    );
+                    break;
+                }
+                msg = ws_rx.next() => {
+                    // Tout message du relais prouve que la connexion vit.
+                    silence
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + self.delais.silence);
+                    match msg {
+                        Some(Ok(tungstenite::Message::Text(text))) => {
+                            self.handle_message(&text).await;
+                        }
+                        Some(Ok(tungstenite::Message::Ping(data))) => {
+                            let pong = serde_json::json!({"type": "relay.pong"}).to_string();
+                            emettre_vers_le_relais(&self.ws_tx, pong).await;
+                            let _ = data; // ping data handled by tungstenite
+                        }
+                        Some(Ok(tungstenite::Message::Close(_))) | None | Some(Err(_)) => break,
+                        _ => {}
                     }
-                    Some(Ok(tungstenite::Message::Ping(data))) => {
-                        let pong = serde_json::json!({"type": "relay.pong"}).to_string();
-                        emettre_vers_le_relais(&self.ws_tx, pong).await;
-                        let _ = data; // ping data handled by tungstenite
-                    }
-                    Some(Ok(tungstenite::Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => {}
-                },
+                }
                 // Jeton renouvelé : cette session a été ouverte avec l'ancien.
                 // La quitter ferme la socket ; le relais oublie alors l'ancien
                 // jeton, et la boucle de `spawn` se réinscrit avec le nouveau.
@@ -1349,6 +1538,65 @@ pub(crate) fn entetes_de_flux(
 }
 
 #[cfg(test)]
+mod recul_de_reconnexion_tests {
+    use super::*;
+
+    /// Deux serveurs au même `server_id` : chaque session est inscrite puis
+    /// délogée en quelques millisecondes. Le recul doit grandir jusqu'au
+    /// plafond — avant, il revenait à 2 s à chaque fois, sans fin.
+    #[test]
+    fn sessions_delogees_aussitot_le_recul_grandit() {
+        let mut attempt = 0;
+        let mut attentes = Vec::new();
+        for _ in 0..8 {
+            attempt = tentative_suivante(
+                attempt,
+                &Ok(FinDeSession::Fermee),
+                Duration::from_millis(50),
+                DelaisDuRelais::default().session_stable,
+            );
+            attentes.push(attente_avant(attempt).as_secs());
+        }
+        assert_eq!(attentes, vec![2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    /// Une session restée inscrite au moins 60 s remet le recul à 2 s :
+    /// une coupure isolée (relais redéployé) se rattrape aussitôt.
+    #[test]
+    fn session_stable_remet_le_recul_a_zero() {
+        let attempt =
+            tentative_suivante(6, &Ok(FinDeSession::Fermee), SESSION_STABLE, SESSION_STABLE);
+        assert_eq!(attente_avant(attempt), Duration::from_secs(2));
+    }
+
+    /// Le seuil vient des délais du client : un banc qui le met à zéro
+    /// retrouve « toute session inscrite remet le recul à zéro ».
+    #[test]
+    fn seuil_reglable_par_les_delais() {
+        assert_eq!(DelaisDuRelais::default().session_stable, SESSION_STABLE);
+        let attempt = tentative_suivante(
+            5,
+            &Ok(FinDeSession::Fermee),
+            Duration::from_millis(50),
+            Duration::ZERO,
+        );
+        assert_eq!(attente_avant(attempt), Duration::from_secs(2));
+    }
+
+    /// Une erreur ne remet jamais le compteur à zéro, quelle que soit sa durée.
+    #[test]
+    fn erreur_longue_ne_remet_pas_a_zero() {
+        let attempt = tentative_suivante(
+            3,
+            &Err("ws".into()),
+            Duration::from_secs(600),
+            SESSION_STABLE,
+        );
+        assert_eq!(attempt, 4);
+    }
+}
+
+#[cfg(test)]
 mod entetes_de_flux_tests {
     use super::entetes_de_flux;
     use reqwest::header::{HeaderMap, HeaderValue};
@@ -1440,6 +1688,16 @@ pub fn spawn_relay_client(
     backend: Arc<dyn DbBackend>,
     local_port: u16,
 ) -> Option<Arc<RelayClient>> {
+    spawn_relay_client_avec_delais(backend, local_port, DelaisDuRelais::default())
+}
+
+/// [`spawn_relay_client`] avec d'autres délais (bancs de test).
+#[doc(hidden)]
+pub fn spawn_relay_client_avec_delais(
+    backend: Arc<dyn DbBackend>,
+    local_port: u16,
+    delais: DelaisDuRelais,
+) -> Option<Arc<RelayClient>> {
     let settings = &SettingsRepo::with_backend(backend.clone());
     let enabled = settings
         .get("bridge_enabled")
@@ -1490,7 +1748,13 @@ pub fn spawn_relay_client(
     // et rangée dans le coffre. Sans elle, le client s'enregistre comme un
     // serveur antérieur : le dire, sans rien bloquer.
     let mut client = RelayClient::new(server_id, bridge_token, relay_url, local_port)
-        .avec_reglages(backend.clone());
+        .avec_delais(delais)
+        .avec_reglages(backend.clone())
+        .avec_inscription(Arc::new(
+            crate::cloud::cle_serveur::InscriptionHttp::depuis_environnement(
+                crate::http::client::shared().clone(),
+            ),
+        ));
     match crate::cloud::cle_serveur::cle_du_serveur(&backend) {
         Ok(cle) => client = client.avec_cle(cle),
         Err(e) => warn!(erreur = %e, "ecoute_distante_cle_serveur_indisponible"),

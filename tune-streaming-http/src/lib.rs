@@ -15,7 +15,9 @@ use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::EventBus;
 use tune_core::favorites_sort::TriFavoris;
+use tune_core::metadata::bio_segments::GenreDeLien;
 use tune_core::streaming::ServiceRegistry;
+use tune_core::streaming::bio_qobuz;
 use tune_core::streaming::traits::StreamingService;
 
 mod connexion_spotify_distante;
@@ -235,6 +237,7 @@ fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) ->
                 tune_core::TuneError::Unsupported(_) => "unsupported",
                 tune_core::TuneError::Credentials(_) => "credentials",
                 tune_core::TuneError::AppRefused(_) => "app_refused",
+                tune_core::TuneError::Refused { .. } => "refused",
                 tune_core::TuneError::Other(_) => "other",
             };
             let message = e.to_string();
@@ -758,9 +761,12 @@ async fn service_artist(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let result = {
+    let (result, bio_html) = {
         let svc = arc.read().await;
-        svc.get_artist(&artist_id).await
+        match svc.get_artist_avec_bio_html(&artist_id).await {
+            Ok((artiste, html)) => (Ok(artiste), html),
+            Err(e) => (Err(e), None),
+        }
     };
 
     // Best-effort: persist a streaming editorial bio (e.g. Qobuz) into a
@@ -815,7 +821,37 @@ async fn service_artist(
         });
     }
 
-    svc_response(result)
+    // #8129 — la bio garde ses liens : `bio_segments` à côté de `bio`.
+    match (result, bio_html) {
+        (Ok(artiste), Some(html)) if service == bio_qobuz::SERVICE => {
+            let mut corps = json!(artiste);
+            let page = bio_qobuz::PageDeLaBio {
+                genre: GenreDeLien::Artiste,
+                id: &artiste.id,
+                noms: &[artiste.name.as_str()],
+            };
+            avec_bio_segments(&state.backend, &mut corps, "bio", &html, &page);
+            Json(corps).into_response()
+        }
+        (result, _) => svc_response(result),
+    }
+}
+
+/// #8129 — pose `bio_segments` dans `corps`, et remplace `champ` par le texte
+/// que ces segments recomposent (le même texte brut, entités décodées et
+/// paragraphes gardés) : un client les compare avant de les dessiner.
+fn avec_bio_segments(
+    backend: &Arc<dyn DbBackend>,
+    corps: &mut Value,
+    champ: &str,
+    html: &str,
+    page: &bio_qobuz::PageDeLaBio<'_>,
+) {
+    let index = tune_core::metadata::bio_segments::index_partage(backend);
+    if let Some((texte, segments)) = bio_qobuz::bio_qobuz_segmentee(html, &index, page) {
+        corps[champ] = Value::String(texte);
+        corps["bio_segments"] = serde_json::to_value(segments).unwrap_or(Value::Null);
+    }
 }
 
 /// `?offset=` pour un « voir plus » : la discographie s'arrêtait au
@@ -1408,9 +1444,35 @@ async fn service_album_description(
     State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc
-        .get_album_description(&album_id)
-        .await)
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = arc.read().await;
+    let description = svc.get_album_description(&album_id).await;
+    // #8129 — les liens de la présentation : `bio_segments` à côté de
+    // `description`. `album/get` sort du cache que la ligne du dessus remplit.
+    let html = match &description {
+        Ok(Some(_)) if service == bio_qobuz::SERVICE => {
+            svc.presentation_album_html(&album_id).await.ok().flatten()
+        }
+        _ => None,
+    };
+    drop(svc);
+    match (description, html) {
+        (Ok(Some(d)), Some(h)) => {
+            let mut corps = json!(d);
+            let noms: Vec<&str> = h.noms.iter().map(String::as_str).collect();
+            let page = bio_qobuz::PageDeLaBio {
+                genre: GenreDeLien::Album,
+                id: &album_id,
+                noms: &noms,
+            };
+            avec_bio_segments(&state.backend, &mut corps, "description", &h.html, &page);
+            Json(corps).into_response()
+        }
+        (description, _) => svc_response(description),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,6 +1783,18 @@ fn reponse_echec_auth(service: &str, e: &tune_core::TuneError) -> Response {
             })),
         )
             .into_response(),
+        // #8142 — un refus qui porte son propre code (`spotify_callback_sans_code`,
+        // `spotify_autorisation_refusee`, `spotify_state_inconnu`) : sans lui,
+        // le client n'avait qu'un texte brut et affichait son message générique.
+        tune_core::TuneError::Refused { code, message } => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": code,
+                "service": service,
+                "error": message,
+            })),
+        )
+            .into_response(),
         autre => (StatusCode::BAD_REQUEST, autre.to_string()).into_response(),
     }
 }
@@ -1984,10 +2058,72 @@ async fn lire_favoris(
 ///
 /// Facultatifs : absents, la réponse est celle d'avant, dans l'ordre du
 /// service.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct TriQuery {
     sort: Option<String>,
     order: Option<String>,
+    /// #8040 — page demandée, facultative. Absents tous les deux, la réponse
+    /// est la liste entière d'avant.
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+impl TriQuery {
+    fn sans_tri(&self) -> bool {
+        TriFavoris::depuis(self.sort.as_deref(), self.order.as_deref()).is_none()
+    }
+}
+
+/// #8040 — la page demandée sur la route des favoris (`?limit=&offset=`).
+///
+/// `None` sans aucun des deux paramètres : la réponse reste la liste entière,
+/// octet pour octet, pour les applications qui la demandent ainsi.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageDemandee {
+    limit: usize,
+    offset: usize,
+}
+
+impl PageDemandee {
+    /// Taille de page quand le client ne donne qu'`offset`.
+    const LIMITE_DEFAUT: usize = 50;
+    /// Au-delà, c'est une liste entière qui se demande sans paramètres.
+    const LIMITE_MAX: usize = 1000;
+
+    fn depuis(q: &TriQuery) -> Option<Self> {
+        if q.limit.is_none() && q.offset.is_none() {
+            return None;
+        }
+        Some(Self {
+            limit: q
+                .limit
+                .unwrap_or(Self::LIMITE_DEFAUT)
+                .clamp(1, Self::LIMITE_MAX),
+            offset: q.offset.unwrap_or(0),
+        })
+    }
+
+    /// Découpe la liste `{cle: [...]}` en `{cle: [page], total, limit,
+    /// offset}` — après le tri, qui porte sur la liste entière.
+    fn decouper(self, mut donnees: Value, cle: &str) -> Value {
+        let liste = donnees
+            .get_mut(cle)
+            .and_then(Value::as_array_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        let total = liste.len();
+        let page: Vec<Value> = liste
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .collect();
+        json!({
+            cle: page,
+            "total": total,
+            "limit": self.limit,
+            "offset": self.offset,
+        })
+    }
 }
 
 /// Pose le tri demandé sur une réponse de favoris, **après** le cache.
@@ -2002,6 +2138,67 @@ fn poser_le_tri(mut donnees: Value, q: &TriQuery) -> Value {
         tune_core::favorites_sort::trier_liste_json(&mut donnees, tri);
     }
     donnees
+}
+
+/// Ce qui part au client depuis une liste ENTIÈRE (du cache ou du service) :
+/// le tri (#2001), puis la page demandée (#8040), s'il y en a une.
+fn presenter(donnees: Value, fav_type: &str, q: &TriQuery) -> Value {
+    let donnees = poser_le_tri(donnees, q);
+    match (PageDemandee::depuis(q), TypeFavori::parse(fav_type)) {
+        (Some(page), Some(t)) => page.decouper(donnees, t.cle()),
+        _ => donnees,
+    }
+}
+
+/// #8040 — une page lue CHEZ LE SERVICE, en une requête, quand le connecteur
+/// sait le faire. `None` sinon : l'appelant lit la liste entière.
+async fn lire_une_page(
+    svc: &dyn StreamingService,
+    fav_type: &str,
+    page: PageDemandee,
+) -> Result<Option<Value>, tune_core::TuneError> {
+    let Some(cle) = TypeFavori::parse(fav_type).map(TypeFavori::cle) else {
+        return Ok(None);
+    };
+    Ok(svc
+        .get_user_favorites_page(fav_type, page.limit, page.offset)
+        .await?
+        .map(|p| {
+            json!({
+                cle: p.items,
+                "total": p.total,
+                "limit": page.limit,
+                "offset": page.offset,
+            })
+        }))
+}
+
+/// La lecture de la route, partagée entre l'aller et la reprise après
+/// rafraîchissement du jeton.
+///
+/// Une page demandée SANS tri part chez le service si le connecteur sait la
+/// servir : c'est la première page affichée tout de suite (#8040). Elle ne
+/// remplit pas le cache, qui ne mémorise que des listes entières. Dans tous
+/// les autres cas, la liste entière est lue, mise en cache, puis triée et
+/// découpée pour le client.
+async fn lire_favoris_pour_la_route(
+    svc: &dyn StreamingService,
+    service: &str,
+    ressource: &str,
+    fav_type: &str,
+    q: &TriQuery,
+) -> Result<Value, tune_core::TuneError> {
+    if let Some(page) = PageDemandee::depuis(q)
+        && q.sans_tri()
+        && let Some(reponse) = lire_une_page(svc, fav_type, page).await?
+    {
+        return Ok(reponse);
+    }
+    let data = lire_favoris(svc, fav_type).await?;
+    // Le cache reçoit la réponse BRUTE ; le tri et la page ne portent que
+    // sur la copie rendue au client.
+    memoriser_contenu_utilisateur(service, ressource, data.clone());
+    Ok(presenter(data, fav_type, q))
 }
 
 /// #7729 — attente maximale de la route des favoris pour les VERROUS : celui
@@ -2074,7 +2271,7 @@ async fn service_favorites(
     };
     let ressource = format!("favorites/{fav_type}");
     if let Some(donnees) = contenu_utilisateur_frais(&service, &ressource) {
-        return Json(poser_le_tri(donnees, &tri)).into_response();
+        return Json(presenter(donnees, &fav_type, &tri)).into_response();
     }
     // Verrou de LECTURE pour l'aller : le client web demande les trois types
     // de favoris en parallèle (`Promise.all`), et le verrou d'écriture que ce
@@ -2085,15 +2282,10 @@ async fn service_favorites(
         let Some(svc) = verrou_borne(echeance, arc.read()).await else {
             return favoris_service_occupe(&service, &fav_type);
         };
-        lire_favoris(&**svc, &fav_type).await
+        lire_favoris_pour_la_route(&**svc, &service, &ressource, &fav_type, &tri).await
     };
     match result {
-        Ok(data) => {
-            // Le cache reçoit la réponse BRUTE ; le tri ne porte que sur la
-            // copie rendue au client.
-            memoriser_contenu_utilisateur(&service, &ressource, data.clone());
-            Json(poser_le_tri(data, &tri)).into_response()
-        }
+        Ok(data) => Json(data).into_response(),
         Err(ref e)
             if {
                 let msg = e.to_string();
@@ -2123,11 +2315,10 @@ async fn service_favorites(
                 let Some(svc) = verrou_borne(echeance, arc.read()).await else {
                     return favoris_service_occupe(&service, &fav_type);
                 };
-                match lire_favoris(&**svc, &fav_type).await {
-                    Ok(data) => {
-                        memoriser_contenu_utilisateur(&service, &ressource, data.clone());
-                        Json(poser_le_tri(data, &tri)).into_response()
-                    }
+                match lire_favoris_pour_la_route(&**svc, &service, &ressource, &fav_type, &tri)
+                    .await
+                {
+                    Ok(data) => Json(data).into_response(),
                     Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
                 }
             } else {
@@ -3031,10 +3222,7 @@ mod tests_cache_utilisateur {
 
     /// Aucun tri demandé — le cas de tous les appels d'avant #2001.
     fn sans_tri() -> Query<TriQuery> {
-        Query(TriQuery {
-            sort: None,
-            order: None,
-        })
+        Query(TriQuery::default())
     }
 
     /// Lot 5 : dans le TTL, la deuxième lecture ne repart PAS vers le service.
@@ -3215,6 +3403,7 @@ mod tests_cache_utilisateur {
             Query(TriQuery {
                 sort: sort.map(str::to_string),
                 order: order.map(str::to_string),
+                ..TriQuery::default()
             }),
         )
         .await;
@@ -3404,10 +3593,7 @@ mod tests_favoris_dates {
     }
 
     fn sans_tri() -> Query<TriQuery> {
-        Query(TriQuery {
-            sort: None,
-            order: None,
-        })
+        Query(TriQuery::default())
     }
 
     /// #3489, le site d'appel. `get_user_favorites_dated` peut être parfaite
@@ -4235,6 +4421,9 @@ mod service_desactive_jamais_appele_tests;
 mod favoris_sans_gel_7729_tests;
 
 #[cfg(test)]
+mod favoris_pagines_8040_tests;
+
+#[cfg(test)]
 mod mixes_du_compte_7822_tests;
 
 #[cfg(test)]
@@ -4920,3 +5109,9 @@ mod tests_echec_de_connexion_7068 {
         assert_eq!(texte, "qobuz login: 500 boom");
     }
 }
+
+#[cfg(test)]
+mod spotify_rappel_colle_8142_tests;
+
+#[cfg(test)]
+mod bio_qobuz_8129_tests;

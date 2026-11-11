@@ -1711,6 +1711,40 @@ async fn parcourir_par_dossier_genre_et_style_7929() {
     assert!(c["disques"].as_array().unwrap().is_empty(), "{c}");
 }
 
+/// #7927 : le classement des statuts du CDN que l'hôte applique à chaque
+/// pochette (`image_discogs` de tune-server). Un 403 est un refus passager,
+/// réessayé plus tard ; seuls 404 et 410 condamnent l'image.
+#[test]
+fn le_statut_403_du_cdn_n_est_pas_une_image_disparue_7927() {
+    use tune_collection_physique::synchro::{SuiteImage, suite_selon_statut};
+    assert_eq!(
+        suite_selon_statut(403, true),
+        Ok(SuiteImage::Rendre(Image::Refusee)),
+        "un 403 du CDN ne doit pas condamner la pochette jusqu'au redémarrage (#7927)"
+    );
+    for statut in [404, 410] {
+        assert_eq!(
+            suite_selon_statut(statut, true),
+            Ok(SuiteImage::Rendre(Image::Introuvable)),
+            "{statut} : l'image a disparu"
+        );
+    }
+    for statut in [429, 503] {
+        assert_eq!(
+            suite_selon_statut(statut, true),
+            Ok(SuiteImage::Rendre(Image::Limite)),
+            "{statut} : le CDN freine"
+        );
+    }
+    assert_eq!(suite_selon_statut(200, true), Ok(SuiteImage::Lire));
+    assert_eq!(
+        suite_selon_statut(200, false),
+        Ok(SuiteImage::Rendre(Image::Introuvable)),
+        "une redirection hors de Discogs n'est pas lue"
+    );
+    assert_eq!(suite_selon_statut(500, true), Err(Panne));
+}
+
 /// #7981 : un disque présent dans la bibliothèque sous une autre écriture
 /// (« … - 2012 Remaster ») est retrouvé par artiste + titre, sans lien
 /// MusicBrainz (l'affinage n'a pas tourné), et n'est donc pas cherché sur

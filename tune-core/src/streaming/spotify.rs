@@ -190,8 +190,32 @@ pub fn refus_redirection(uri: &str) -> Option<RefusRedirection> {
 /// `code`. La coller dans Tune termine l'echange (meme verificateur PKCE, meme
 /// `redirect_uri`). Un code nu est accepte tel quel.
 pub fn code_depuis_rappel(colle: &str) -> Result<String, String> {
-    rappel_depuis_colle(colle).map(|r| r.code)
+    rappel_depuis_colle(colle)
+        .map(|r| r.code)
+        .map_err(|e| e.to_string())
 }
+
+/// #8142 — l'adresse collee ne porte pas de `code` : c'est souvent l'adresse
+/// de redirection recopiee du tableau de bord, pas celle de la page 127.0.0.1
+/// apres le consentement.
+pub const CODE_CALLBACK_SANS_CODE: &str = "spotify_callback_sans_code";
+
+/// #8142 — l'adresse collee porte `error=access_denied` : l'utilisateur a
+/// refuse l'acces sur la page Spotify.
+pub const CODE_AUTORISATION_REFUSEE: &str = "spotify_autorisation_refusee";
+
+/// #8142 — le `state` de l'adresse collee ne designe aucune autorisation en
+/// cours (autre onglet, lien ancien, serveur redemarre).
+pub const CODE_STATE_INCONNU: &str = "spotify_state_inconnu";
+
+fn refus(code: &'static str, message: impl Into<String>) -> TuneError {
+    TuneError::Refused {
+        code,
+        message: message.into(),
+    }
+}
+
+const SANS_CODE: &str = "spotify: l'adresse collee ne contient pas de code";
 
 /// Fil 221 — au plus tant d'autorisations entamees gardees en memoire : deux
 /// onglets, ou un second clic sur « Se connecter », ne s'ecrasent plus.
@@ -225,14 +249,14 @@ fn octets_aleatoires<const N: usize>() -> [u8; N] {
 }
 
 /// Comme [`code_depuis_rappel`], en gardant le `state` de l'adresse collee.
-pub fn rappel_depuis_colle(colle: &str) -> Result<RappelSpotify, String> {
+pub fn rappel_depuis_colle(colle: &str) -> Result<RappelSpotify, TuneError> {
     let colle = colle.trim();
     if colle.is_empty() {
         return Err("spotify: adresse de rappel vide".into());
     }
     let Some((_, requete)) = colle.split_once('?') else {
         if colle.contains("://") || colle.contains('/') {
-            return Err("spotify: l'adresse collee ne contient pas de code".into());
+            return Err(refus(CODE_CALLBACK_SANS_CODE, SANS_CODE));
         }
         // Fil 221 — Yan Tasset y a colle son Client ID : il partait vers
         // `api/token` comme un code, et Spotify repondait `invalid_client`.
@@ -269,9 +293,10 @@ pub fn rappel_depuis_colle(colle: &str) -> Result<RappelSpotify, String> {
     if let Some(code) = code {
         return Ok(RappelSpotify { code, state });
     }
-    Err(match erreur {
-        Some(e) => format!("spotify: {e}"),
-        None => "spotify: l'adresse collee ne contient pas de code".into(),
+    Err(match erreur.as_deref() {
+        Some("access_denied") => refus(CODE_AUTORISATION_REFUSEE, "spotify: access_denied"),
+        Some(e) => format!("spotify: {e}").into(),
+        None => refus(CODE_CALLBACK_SANS_CODE, SANS_CODE),
     })
 }
 
@@ -394,9 +419,16 @@ impl SpotifyService {
     /// Le `state` du retour la designe ; un code colle nu (sans `state`)
     /// revient a la plus recente. Rien n'est consomme ici : la tentative ne
     /// s'efface qu'apres un echange reussi.
-    fn tentative_pour(&self, state: Option<&str>) -> Result<usize, String> {
+    ///
+    /// #8142 — un `state` qui ne designe aucune tentative, y compris quand il
+    /// n'y en a plus aucune en memoire (serveur redemarre), porte
+    /// [`CODE_STATE_INCONNU`] ; un code nu sans tentative garde son texte seul.
+    fn tentative_pour(&self, state: Option<&str>) -> Result<usize, TuneError> {
         if self.tentatives.is_empty() {
-            return Err(AUCUNE_TENTATIVE.into());
+            return Err(match state {
+                Some(_) => refus(CODE_STATE_INCONNU, AUCUNE_TENTATIVE),
+                None => AUCUNE_TENTATIVE.into(),
+            });
         }
         match state {
             None => Ok(self.tentatives.len() - 1),
@@ -404,12 +436,15 @@ impl SpotifyService {
                 .tentatives
                 .iter()
                 .rposition(|t| t.state == state)
-                .ok_or_else(|| TENTATIVE_INCONNUE.into()),
+                .ok_or_else(|| refus(CODE_STATE_INCONNU, TENTATIVE_INCONNUE)),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn avec_doublure(mut self, base: &str) -> Self {
+    /// Les adresses de jeton et d'API de Spotify remplacees par `base`, pour
+    /// eprouver la connexion par le vrai routeur sans joindre Spotify (#8142).
+    /// Reserve aux bancs d'essai : aucun binaire publie ne le compile.
+    #[cfg(any(test, feature = "services-factices"))]
+    pub fn avec_doublure(mut self, base: &str) -> Self {
         self.token_url = format!("{base}/api/token");
         self.api_base = format!("{base}/v1");
         self
@@ -883,7 +918,7 @@ impl SpotifyService {
                 .and_then(|i| i.first())
                 .and_then(|i| i["url"].as_str())
                 .map(Into::into),
-            track_count: item["tracks"]["total"].as_u64().unwrap_or(0) as u32,
+            track_count: nombre_de_titres(item),
             owner: item["owner"]["display_name"].as_str().map(Into::into),
             editable: None,
             covers: Vec::new(),
@@ -1201,21 +1236,26 @@ impl StreamingService for SpotifyService {
                 .and_then(|i| i.first())
                 .and_then(|i| i["url"].as_str())
                 .map(Into::into),
-            track_count: d["tracks"]["total"].as_u64().unwrap_or(0) as u32,
+            track_count: nombre_de_titres(&d),
             owner: d["owner"]["display_name"].as_str().map(Into::into),
             editable: None,
             covers: Vec::new(),
         })
     }
     async fn get_playlist_tracks(&self, id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        // #8193 — `/playlists/{id}/tracks` est retiré par Spotify depuis la
+        // migration du 9 mars 2026 (applications en mode développement :
+        // 403) ; la route est `/items`, et chaque entrée porte `item` au lieu
+        // de `track`. Les playlists s'ouvraient vides.
         let d = self
-            .api_get(&format!("/playlists/{id}/tracks?limit=100"))
+            .api_get(&format!("/playlists/{id}/items?limit=100"))
             .await?;
         Ok(d["items"]
             .as_array()
             .map(|i| {
                 i.iter()
-                    .filter_map(|item| item.get("track").map(Self::map_track))
+                    .filter_map(element_de_playlist)
+                    .map(Self::map_track)
                     .collect()
             })
             .unwrap_or_default())
@@ -1233,8 +1273,7 @@ impl StreamingService for SpotifyService {
         name: &str,
         description: Option<&str>,
     ) -> Result<String, TuneError> {
-        let user_id = self
-            .user_id
+        self.user_id
             .as_deref()
             .ok_or("spotify: not authenticated (no user_id)")?;
         let body = serde_json::json!({
@@ -1243,7 +1282,8 @@ impl StreamingService for SpotifyService {
             "public": false
         });
         let resp = self
-            .api_post(&format!("/users/{user_id}/playlists"), body)
+            // #8193 — `/users/{id}/playlists` est retiré (février 2026).
+            .api_post("/me/playlists", body)
             .await?;
         resp["id"]
             .as_str()
@@ -1269,7 +1309,8 @@ impl StreamingService for SpotifyService {
         let mut added = 0;
         for chunk in uris.chunks(100) {
             let body = serde_json::json!({ "uris": chunk });
-            self.api_post(&format!("/playlists/{playlist_id}/tracks"), body)
+            // #8193 — `/tracks` retiré au profit de `/items` (février 2026).
+            self.api_post(&format!("/playlists/{playlist_id}/items"), body)
                 .await?;
             added += chunk.len();
         }
@@ -1633,6 +1674,25 @@ fn motif_refus_403(detail: &str) -> String {
 /// l'autre ne se règle en réessayant. Un 429 ou un 5xx est passager.
 fn refus_de_renouvellement_definitif(status: u16, code: &str) -> bool {
     code == "invalid_grant" || status == 400 || status == 401
+}
+
+/// #8193 — le nombre de titres d'une playlist. Depuis février 2026, Spotify
+/// le rend sous `items.total` (anciennement `tracks.total`) ; les deux sont
+/// lus, le nouveau d'abord.
+fn nombre_de_titres(playlist: &serde_json::Value) -> u32 {
+    playlist["items"]["total"]
+        .as_u64()
+        .or_else(|| playlist["tracks"]["total"].as_u64())
+        .unwrap_or(0) as u32
+}
+
+/// #8193 — le titre d'une entrée de playlist : `item` depuis février 2026,
+/// `track` avant. Une entrée sans objet (titre retiré du catalogue) est sautée.
+fn element_de_playlist(entree: &serde_json::Value) -> Option<&serde_json::Value> {
+    entree
+        .get("item")
+        .filter(|v| v.is_object())
+        .or_else(|| entree.get("track").filter(|v| v.is_object()))
 }
 
 /// #6825 — le motif d'un refus de l'API Web, borné : `error.message` du
@@ -2777,3 +2837,7 @@ mod session_refusee_8051_tests;
 #[cfg(test)]
 #[path = "spotify_favoris_pagination_8050_tests.rs"]
 mod favoris_pagination_8050_tests;
+
+#[cfg(test)]
+#[path = "spotify_playlists_items_8193_tests.rs"]
+mod playlists_items_8193_tests;

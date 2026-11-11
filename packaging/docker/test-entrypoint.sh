@@ -67,12 +67,16 @@ cat > "$stubs/setpriv" <<'EOF'
 #!/bin/sh
 echo "setpriv $* HOME=$HOME" >> "$JOURNAL"
 EOF
-# Group owning the fake sound nodes (63 = `audio` on a Fedora host).
+# Group owning the fake sound nodes (63 = `audio` on a Fedora host), and the
+# fake CD drive (11 on a ZimaOS host, #8141).
 cat > "$stubs/stat" <<'EOF'
 #!/bin/sh
 . "$ETAT"
 [ "$1 $2 $3" = "-L -c %g" ] || { echo "stub stat: $*" >&2; exit 2; }
-echo "$FAKE_SND_GID"
+case "$4" in
+    */cd/*) echo "$FAKE_CD_GID" ;;
+    *) echo "$FAKE_SND_GID" ;;
+esac
 EOF
 cat > "$stubs/serveur" <<'EOF'
 #!/bin/sh
@@ -80,23 +84,35 @@ echo "serveur $*" >> "$JOURNAL"
 EOF
 chmod +x "$stubs"/*
 
+# A real block device of this machine stands in for /dev/sr0 (#8141): the
+# entrypoint only keeps block devices. None in some sandboxes: the CD case of
+# the simulation is then skipped, the container run below still covers it.
+# BLOC=<node> imposes the stand-in (used for the counter-proofs).
+bloc="${BLOC:-$(find /dev -maxdepth 2 -type b 2>/dev/null | head -n1 || true)}"
+
 # One run. $1 = effective uid; the rest is the environment (VAR=value).
 lancer() {
     local euid="$1"
     shift
     export ETAT="$travail/etat" JOURNAL="$travail/journal"
-    printf 'FAKE_EUID=%s\nTUNE_UID=1000\nTUNE_GID=1000\nFAKE_GROUP_ADD="%s"\nFAKE_SND_GID=%s\n' \
-        "$euid" "${GROUP_ADD:-}" "${SND_GID:-29}" > "$ETAT"
+    printf 'FAKE_EUID=%s\nTUNE_UID=1000\nTUNE_GID=1000\nFAKE_GROUP_ADD="%s"\nFAKE_SND_GID=%s\nFAKE_CD_GID=%s\n' \
+        "$euid" "${GROUP_ADD:-}" "${SND_GID:-29}" "${CD_GID:-24}" > "$ETAT"
     : > "$JOURNAL"
-    rm -rf "$travail/data" "$travail/music" "$travail/snd"
-    mkdir -p "$travail/data/artwork_cache" "$travail/music" "$travail/snd"
+    rm -rf "$travail/data" "$travail/music" "$travail/snd" "$travail/cd"
+    mkdir -p "$travail/data/artwork_cache" "$travail/music" "$travail/snd" "$travail/cd"
     # SND=1: /dev/snd passed to the container (a char device stands in).
     if [ -n "${SND:-}" ]; then ln -s /dev/null "$travail/snd/controlC0"; fi
+    # CD=1: /dev/sr0 passed to the container (a block device stands in);
+    # /dev/null next to it is a char device named like a drive: never kept.
+    if [ -n "${CD:-}" ]; then
+        ln -s "$bloc" "$travail/cd/sr0"
+        ln -s /dev/null "$travail/cd/sr1"
+    fi
     touch "$travail/data/tune.db" "$travail/music/piste.flac"
     sortie=0
     erreur="$(env -i PATH="$stubs:/usr/bin:/bin" HOME=/root ETAT="$ETAT" JOURNAL="$JOURNAL" \
         TUNE_ENTRYPOINT_BIN="$stubs/serveur" TUNE_ENTRYPOINT_DATA_DIR="$travail/data" \
-        TUNE_ENTRYPOINT_SND_DIR="$travail/snd" \
+        TUNE_ENTRYPOINT_SND_DIR="$travail/snd" TUNE_ENTRYPOINT_CD_DIR="$travail/cd" \
         "$@" sh "$ENTRYPOINT" --un "deux mots" 2>&1 >"$travail/stdout")" || sortie=$?
     stdout="$(cat "$travail/stdout")"
     journal="$(cat "$JOURNAL")"
@@ -175,6 +191,18 @@ if [ "$sortie" = 0 ] && a "setpriv --reuid=tune --regid=tune --groups=1000,29 $s
 else ko "/dev/snd non mappé" "sortie=$sortie err=$erreur
 $journal"; fi
 
+# 10. #8141 — /dev/sr0 passed from a ZimaOS host, owned by gid 11, unknown to
+#     the image: kept next to tune's own groups, so cdparanoia can open it.
+if [ -z "$bloc" ]; then
+    echo "skip - /dev/sr0 (gid 11) : aucun périphérique bloc sur cette machine"
+else
+    CD=1 CD_GID=11 lancer 0
+    if [ "$sortie" = 0 ] && a "setpriv --reuid=tune --regid=tune --groups=1000,29,11 $stubs/serveur"; then
+        ok "/dev/sr0 (gid 11 inconnu de l'image) : groupe conservé"
+    else ko "/dev/sr0 (gid 11)" "sortie=$sortie err=$erreur
+$journal"; fi
+fi
+
 if [ "${1:-}" = "--conteneur" ]; then
     if ! docker info >/dev/null 2>&1; then
         ko "conteneur : Docker indisponible"
@@ -193,7 +221,9 @@ echo "MUSIC=$(stat -c "%u:%g" /music/piste.flac)"
 touch /music/x 2>/dev/null && echo "MUSIC_RW" || true
 mkdir /snd && mknod /snd/controlC0 c 1 3 && chgrp 63 /snd/controlC0
 printf "#!/bin/sh\necho \"\$(id -G)\"\n" > /grp.sh && chmod 755 /grp.sh
-echo "SND=$(TUNE_ENTRYPOINT_BIN=/grp.sh TUNE_ENTRYPOINT_SND_DIR=/snd sh /repo/packaging/docker/entrypoint.sh)"'
+echo "SND=$(TUNE_ENTRYPOINT_BIN=/grp.sh TUNE_ENTRYPOINT_SND_DIR=/snd sh /repo/packaging/docker/entrypoint.sh)"
+mkdir /cd && mknod /cd/sr0 b 11 0 && chgrp 11 /cd/sr0 && chmod 660 /cd/sr0
+echo "CD=$(TUNE_ENTRYPOINT_BIN=/grp.sh TUNE_ENTRYPOINT_CD_DIR=/cd sh /repo/packaging/docker/entrypoint.sh)"'
         res="$(docker run --rm -v "$racine:/repo:ro" -v "$travail/music:/music:ro" \
             debian:bookworm-slim sh -c "$script" 2>&1)" || true
         mu="$(stat -c '%u:%g' "$travail/music/piste.flac" 2>/dev/null || echo '?')"
@@ -201,7 +231,8 @@ echo "SND=$(TUNE_ENTRYPOINT_BIN=/grp.sh TUNE_ENTRYPOINT_SND_DIR=/snd sh /repo/pa
             && grep -qx "AVEC=99 100 /home/tune a b" <<<"$res" \
             && grep -qx "DATA=99:100 99:100 99:100 " <<<"$res" \
             && grep -qx "MUSIC=$mu" <<<"$res" && ! grep -q MUSIC_RW <<<"$res" \
-            && grep -qx "SND=100 63" <<<"$res"; then
+            && grep -qx "SND=100 63" <<<"$res" \
+            && grep -qx "CD=100 11" <<<"$res"; then
             ok "conteneur bookworm-slim : vrais setpriv/usermod/chown"
         else ko "conteneur bookworm-slim" "$res"; fi
     fi

@@ -542,6 +542,7 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
         &self,
         url: &str,
     ) -> Result<tune_collection_physique::Image, tune_collection_physique::Panne> {
+        use tune_collection_physique::synchro::SuiteImage;
         use tune_collection_physique::{Image, Panne};
         const IMAGE_MAX: usize = 8 * 1024 * 1024;
         if tune_collection_physique::discogs::vignette_discogs(url).as_deref() != Some(url) {
@@ -572,8 +573,11 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
             })?;
         let final_ok =
             tune_collection_physique::discogs::vignette_discogs(r.url().as_str()).is_some();
-        match r.status().as_u16() {
-            200..=299 if final_ok => {
+        let statut = r.status().as_u16();
+        // #7927 : le classement des statuts (403 réessayé, 404/410 durables)
+        // vit dans le greffon, où ses témoins le gardent.
+        match tune_collection_physique::synchro::suite_selon_statut(statut, final_ok) {
+            Ok(SuiteImage::Lire) => {
                 if r.content_length().is_some_and(|n| n as usize > IMAGE_MAX) {
                     return Ok(Image::Introuvable);
                 }
@@ -583,14 +587,10 @@ impl tune_collection_physique::Hote for HoteDeLaCollection {
                 }
                 Ok(Image::Octets(octets.to_vec()))
             }
-            200..=299 => Ok(Image::Introuvable),
-            404 | 410 => Ok(Image::Introuvable),
-            // #7927 : un refus du CDN n'est pas une image disparue.
-            403 => Ok(Image::Refusee),
-            429 | 503 => Ok(Image::Limite),
-            statut => {
+            Ok(SuiteImage::Rendre(image)) => Ok(image),
+            Err(panne) => {
                 tracing::debug!(target: "plugin", statut, "collection_physique_pochette_statut");
-                Err(Panne)
+                Err(panne)
             }
         }
     }

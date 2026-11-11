@@ -265,6 +265,18 @@ pub struct SearchPage {
     pub truncated: bool,
 }
 
+/// UNE page des favoris d'un type, lue chez le service (#8040).
+///
+/// `items` : les favoris de la page, sérialisés comme ceux de
+/// [`StreamingService::get_user_favorites_dated`] (même forme, même
+/// `created_at`). `total` : ce que le service annonce en tout, `None` s'il
+/// ne le dit pas.
+#[derive(Debug, Clone, Default)]
+pub struct PageFavoris {
+    pub items: Vec<serde_json::Value>,
+    pub total: Option<usize>,
+}
+
 /// Ce qu'un service SANS pagination peut réellement recevoir en `limit`
 /// (#2160).
 ///
@@ -545,6 +557,14 @@ pub struct StreamCredit {
 /// ([`crate::streaming::presentation_album::texte_de_presentation`]). Aucun
 /// client n'a donc de balisage à interpréter. `language` est la langue que le
 /// service annonce pour ce texte (`fr`, `en`…), quand il la donne.
+/// #8129 — un texte éditorial de service en HTML d'origine, avec les noms de
+/// la page qui le montre (titre de l'album, nom de l'artiste).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlEditorial {
+    pub html: String,
+    pub noms: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamAlbumDescription {
     pub description: String,
@@ -1167,6 +1187,25 @@ pub trait StreamingService: Send + Sync {
         Ok(None)
     }
 
+    /// #8129 — la fiche d'un artiste ET le HTML d'origine de sa bio, pour en
+    /// garder les liens (`bio` reste le texte). Un seul appel au service.
+    /// Par défaut : la fiche, sans HTML.
+    async fn get_artist_avec_bio_html(
+        &self,
+        artist_id: &str,
+    ) -> Result<(StreamArtist, Option<String>), TuneError> {
+        Ok((self.get_artist(artist_id).await?, None))
+    }
+
+    /// #8129 — le HTML d'origine de la présentation d'un album et les noms de
+    /// la page (titre, artiste). Par défaut : rien.
+    async fn presentation_album_html(
+        &self,
+        _album_id: &str,
+    ) -> Result<Option<HtmlEditorial>, TuneError> {
+        Ok(None)
+    }
+
     /// La biographie éditoriale d'un artiste du service, en texte.
     async fn bio_editoriale_artiste(
         &self,
@@ -1269,6 +1308,28 @@ pub trait StreamingService: Send + Sync {
         fav_type: &str,
     ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
         self.get_user_favorites_dated(fav_type).await
+    }
+
+    /// #8040 — UNE page des favoris d'un type, lue chez le service, pour que
+    /// l'écran affiche la première page tout de suite au lieu d'attendre
+    /// toutes les pages.
+    ///
+    /// `Ok(None)` — le défaut — signifie « ce connecteur ne sait pas lire une
+    /// page seule » : l'appelant lit alors la liste entière et la découpe
+    /// lui-même. Un connecteur qui ne surcharge rien se comporte donc comme
+    /// avant, et le contrat de la route tient pour tous.
+    ///
+    /// Une surcharge ne fait QU'UNE requête au service et rend les favoris
+    /// dans la forme de [`Self::get_user_favorites_dated`]. Elle ne doit pas
+    /// être lue par le miroir (#5997), qui exige la liste complète.
+    async fn get_user_favorites_page(
+        &self,
+        fav_type: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<PageFavoris>, TuneError> {
+        let _ = (fav_type, limit, offset);
+        Ok(None)
     }
     /// #4577 — ce service accepte-t-il qu'on ÉCRIVE ses favoris ?
     ///

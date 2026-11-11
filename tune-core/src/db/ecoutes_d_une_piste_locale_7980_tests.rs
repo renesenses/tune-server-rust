@@ -119,7 +119,7 @@ fn comptes(db: &Arc<dyn DbBackend>, piste: i64, source: &str) -> (i64, Option<St
     colonne
 }
 
-fn verifier(db: &Arc<dyn DbBackend>, base: i64) {
+fn verifier(db: &Arc<dyn DbBackend>, base: i64, source_null_possible: bool) {
     let repo = HistoryRepo::with_backend(db.clone());
     let (locale, upnp, qobuz) = (base, base + 1, base + 2);
     let date = |d: &str| Some(d.to_string());
@@ -171,9 +171,14 @@ fn verifier(db: &Arc<dyn DbBackend>, base: i64) {
     for quand in ["2026-10-01T08:00:00Z", "2026-10-02T08:00:00Z"] {
         ecouter(&repo, db, "local", quand);
     }
+    // PostgreSQL déclare `listen_history.source` NOT NULL : une ligne à source
+    // NULL n'y existe pas, seule la source vide s'y pose (même sens : locale).
+    let source_ancienne = if source_null_possible { "NULL" } else { "''" };
     db.execute(
-        "UPDATE listen_history SET source = NULL \
-         WHERE listened_at = '2026-10-01T08:00:00Z'",
+        &format!(
+            "UPDATE listen_history SET source = {source_ancienne} \
+             WHERE listened_at = '2026-10-01T08:00:00Z'"
+        ),
         &[],
     )
     .unwrap();
@@ -214,7 +219,7 @@ fn sqlite_chaque_piste_ne_compte_que_les_ecoutes_de_sa_provenance_7980() {
     migrations::run_migrations(&base).unwrap();
     let db: Arc<dyn DbBackend> = Arc::new(base);
     poser_les_pistes(&db, 1);
-    verifier(&db, 1);
+    verifier(&db, 1, true);
 }
 
 #[cfg(feature = "postgres")]
@@ -247,6 +252,6 @@ async fn pg_7980_chaque_piste_ne_compte_que_les_ecoutes_de_sa_provenance() {
     };
     nettoyer(&db);
     poser_les_pistes(&db, 7980);
-    verifier(&db, 7980);
+    verifier(&db, 7980, false);
     nettoyer(&db);
 }

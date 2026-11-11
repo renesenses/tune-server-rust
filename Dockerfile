@@ -52,7 +52,7 @@ RUN cargo install cargo-about --version 0.9.3 --locked && \
 # touch a placeholder so a local build still succeeds (AirPlay 2 then falls back
 # to legacy AirPlay 1). The release path (Dockerfile.dist) requires it.
 RUN cargo install --git https://github.com/renesenses/airplay2-rs \
-      --rev 83a7def6ab39d3709fa47a40eb90993b64afe9b4 airplay-daemon --locked \
+      --rev d58df6265ac9137e92e3c4d8093f12d0360f1a15 airplay-daemon --locked \
     || touch /usr/local/cargo/bin/airplay-daemon
 
 # Build real source — clean dummy artifacts to force recompilation
@@ -108,10 +108,13 @@ FROM debian:bookworm-slim
 
 # `upgrade` : base à jour au moment de la construction.
 # curl sert au HEALTHCHECK ; libstdc++6 et libgcc-s1 à fpcalc (arm64).
+# cdparanoia : extracteur du CD audio (#8141), cherché dans le PATH par
+# Bibliothèque › Extraction CD ; sans lui, « aucun outil d'extraction ».
 RUN apt-get update && \
     apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl libasound2 python3-pip libstdc++6 libgcc-s1 && \
+      ca-certificates curl libasound2 python3-pip libstdc++6 libgcc-s1 \
+      cdparanoia && \
     pip3 install --break-system-packages yt-dlp && \
     rm -rf /var/lib/apt/lists/*
 

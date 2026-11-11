@@ -2644,6 +2644,17 @@ async fn favoris_radio_vers_streaming_rend_les_trois_compteurs_de_l_ecran() {
         .await;
         assert!(st.is_success(), "favori « {title} » refusé (statut {st})");
     }
+    // #8067 — `saved_at` est à la seconde : les trois favoris tombent le plus
+    // souvent dans la même seconde, pas toujours. Le témoin les y met tous,
+    // pour que l'ordre promis (du plus récent au plus ancien) se joue sur le
+    // départage et non sur l'horloge.
+    state
+        .backend
+        .execute(
+            "UPDATE radio_favorites SET saved_at = '2026-11-07T10:00:00Z'",
+            &[],
+        )
+        .unwrap();
 
     // Le corps EXACT du client : api.ts:3248-3253.
     let (status, body) = post_json(
@@ -2660,8 +2671,11 @@ async fn favoris_radio_vers_streaming_rend_les_trois_compteurs_de_l_ecran() {
     // Qobuz pendant que l'écran affichait 0.
     assert_eq!(
         *ajouts.lock().unwrap(),
-        vec!["t-sure".to_string(), "t-approx".to_string()],
-        "les deux pistes rapprochées doivent être poussées sur le service"
+        // Du plus récent au plus ancien (#8067) : « Nightswimming » est le
+        // dernier favori posé, il part en tête, même à seconde égale.
+        vec!["t-approx".to_string(), "t-sure".to_string()],
+        "les deux pistes rapprochées doivent être poussées sur le service, \
+         la plus récente d'abord (#8067)"
     );
 
     // ── LE DÉFAUT #3022 : les quatre noms que l'écran lit ──

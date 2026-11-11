@@ -856,7 +856,8 @@ jobs:
           #
           # RUSTSEC-2026-0150 (audiopus_sys) a quitte cette liste : la
           # dependance a ete remplacee par `opus` / `opusic-sys`, maintenus
-          # (#2251). Il n'y a plus d'avis a taire.
+          # (#2251). Il n'y a plus d'avis a taire. RUSTSEC-2026-0459 (SQLite
+          # < 3.54) a quitte la liste avec #8196 : SQLite 3.54.0 est embarque.
           ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
       # Cet outil est exclu du workspace et possède son propre verrou.
       # L'audit de la racine ne couvre donc pas ses dépendances (#6503).

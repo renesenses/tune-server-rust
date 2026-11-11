@@ -3,7 +3,8 @@ name: Image Docker (vérification)
 # Construit l'image d'exécution SANS rien pousser : pas de secret, pas de
 # connexion à un registre. docker.yml (release) construit et pousse les images
 # publiques ; celui-ci ne sert qu'à vérifier, en PR, que les Dockerfiles
-# se construisent et que fpcalc s'exécute dans l'image, sur amd64 et arm64.
+# se construisent et que fpcalc et cdparanoia s'exécutent dans l'image, sur
+# amd64 et arm64.
 on:
   pull_request:
     paths:
@@ -61,6 +62,10 @@ jobs:
 
       - name: fpcalc -version
         run: docker run --rm --platform ${{ matrix.platform }} --entrypoint fpcalc tune-verif:${{ matrix.arch }} -version
+
+      # Extracteur du CD audio (#8141) : présent et exécutable dans l'image.
+      - name: cdparanoia -V
+        run: docker run --rm --platform ${{ matrix.platform }} --entrypoint cdparanoia tune-verif:${{ matrix.arch }} -V
 
       # Dockerfile (source) compile tout le serveur Rust : trop long pour une
       # PR. On construit seulement l'étage fpcalc, identique à celui de

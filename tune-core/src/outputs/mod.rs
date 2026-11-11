@@ -30,6 +30,8 @@ pub mod dlna_buffer_stats;
 pub(crate) mod dlna_contact;
 /// #6059 — position d'un flux natif relancé au milieu de la piste.
 pub mod dlna_depart_natif;
+/// #8082 — suivi de piste d'un flux continu servi à un renderer DLNA.
+pub mod dlna_flux_continu;
 pub(crate) mod dlna_journal_volume;
 pub mod dlna_profil_volume;
 /// Repli conservateur sur un refus de `SetAVTransportURI` (501/714/716),
@@ -41,6 +43,9 @@ mod dlna_repli_set_uri_tests;
 mod dlna_test;
 #[cfg(test)]
 mod dlna_volume_apres_uri_tests_6008;
+// #8151 — la sourdine tient à chaque nouvelle piste.
+#[cfg(test)]
+pub(crate) mod dlna_sourdine_8151_tests;
 pub mod hqplayer;
 pub mod identite_de_sortie;
 #[cfg(feature = "local-audio")]
@@ -63,6 +68,9 @@ pub mod openhome;
 pub mod openhome_pins;
 #[cfg(any(target_os = "windows", test))]
 pub(crate) mod periode_exclusive_4357;
+/// #8171 — la conduite du chemin partagé quand le périphérique d'une zone est
+/// introuvable. Hors de `local-audio`, même raison que le module suivant.
+pub mod peripherique_introuvable;
 /// Les pseudo-périphériques ALSA (le PCM `null`, la carte `snd-dummy`). Hors
 /// de `local-audio` à dessein : la porte `test` de la CI ne compile pas cette
 /// feature pour `tune-core`, et cette décision-ci doit pouvoir y être jugée.

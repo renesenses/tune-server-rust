@@ -9,13 +9,12 @@
 //!
 //! Le découpage (`tune_core::metadata::bio_segments`) est mis en cache avec la
 //! bio : la clé porte l'empreinte du texte et celle des liens d'origine, et le
-//! cache entier est refait quand la bibliothèque change (nombre et plus grand
-//! identifiant des artistes et des albums) ou au bout de
-//! [`DUREE_DE_L_INDEX`], pour suivre un renommage.
+//! cache entier est refait quand l'index partagé
+//! (`bio_segments::index_partage`) est rebâti — bibliothèque changée, ou au
+//! bout de dix minutes pour suivre un renommage.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -27,10 +26,6 @@ use tune_core::db::backend::DbBackend;
 use tune_core::metadata::bio_segments::{self, BioSegment, GenreDeLien, IndexDesNoms, LienInterne};
 
 use crate::state::AppState;
-
-/// Au-delà, l'index des noms est relu même si la bibliothèque n'a ni gagné ni
-/// perdu d'entrée (un artiste renommé).
-const DUREE_DE_L_INDEX: Duration = Duration::from_secs(600);
 
 /// Nombre de bios découpées gardées par base ; au-delà, on repart de zéro.
 const SEGMENTS_MAX: usize = 4096;
@@ -118,13 +113,12 @@ async fn avec_segments(
     sortie
 }
 
-/// Le cache d'une base : son index des noms et les bios déjà découpées.
+/// Les bios déjà découpées d'une base, avec l'index qui les a produites
+/// ([`bio_segments::index_partage`]) : un index rebâti vide le cache.
 struct CacheDUneBase {
     /// Un `Weak` garde l'allocation : l'adresse ne peut pas être reprise par
     /// une autre base tant que l'entrée existe (bases de test successives).
     base: Weak<dyn DbBackend>,
-    signature: Vec<i64>,
-    bati_le: Instant,
     index: Arc<IndexDesNoms>,
     segments: HashMap<(GenreDeLien, i64, String), Vec<BioSegment>>,
 }
@@ -132,19 +126,6 @@ struct CacheDUneBase {
 fn caches() -> &'static Mutex<Vec<CacheDUneBase>> {
     static CACHES: OnceLock<Mutex<Vec<CacheDUneBase>>> = OnceLock::new();
     CACHES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Ce qui change quand on ajoute ou retire un artiste ou un album.
-fn signature_de_la_bibliotheque(db: &Arc<dyn DbBackend>) -> Vec<i64> {
-    db.query_one(
-        "SELECT (SELECT COUNT(*) FROM artists), (SELECT COALESCE(MAX(id), 0) FROM artists), \
-         (SELECT COUNT(*) FROM albums), (SELECT COALESCE(MAX(id), 0) FROM albums)",
-        &[],
-    )
-    .ok()
-    .flatten()
-    .map(|cols| cols.iter().map(|c| c.as_i64().unwrap_or(-1)).collect())
-    .unwrap_or_default()
 }
 
 fn segments_en_cache(
@@ -165,62 +146,45 @@ fn segments_en_cache(
             bio_segments::empreinte(&empreinte_externes)
         ),
     );
-    let signature = signature_de_la_bibliotheque(db);
+    let index = bio_segments::index_partage(db);
     let ici = Arc::downgrade(db);
-
-    // Le verrou n'est jamais tenu pendant la lecture de la bibliothèque : une
-    // grosse base ferait attendre toutes les bios, de toutes les bases.
-    let index_a_jour = {
+    {
         let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
         caches.retain(|c| c.base.strong_count() > 0);
-        match caches.iter().find(|c| Weak::ptr_eq(&c.base, &ici)) {
-            Some(c) if c.signature == signature && c.bati_le.elapsed() < DUREE_DE_L_INDEX => {
-                if let Some(s) = c.segments.get(&cle) {
-                    return s.clone();
-                }
-                Some(c.index.clone())
-            }
-            _ => None,
+        if let Some(c) = caches
+            .iter()
+            .find(|c| Weak::ptr_eq(&c.base, &ici) && Arc::ptr_eq(&c.index, &index))
+            && let Some(s) = c.segments.get(&cle)
+        {
+            return s.clone();
         }
-    };
-    let index = match index_a_jour {
-        Some(index) => index,
-        None => {
-            let index = match bio_segments::charger_index(db) {
-                Ok(i) => Arc::new(i),
-                Err(e) => {
-                    tracing::warn!(error = %e, "bio_segments_index_failed");
-                    Arc::new(IndexDesNoms::default())
-                }
-            };
-            let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
-            let neuf = CacheDUneBase {
-                base: ici.clone(),
-                signature: signature.clone(),
-                bati_le: Instant::now(),
-                index: index.clone(),
-                segments: HashMap::new(),
-            };
-            match caches.iter().position(|c| Weak::ptr_eq(&c.base, &ici)) {
-                Some(p) => caches[p] = neuf,
-                None => caches.push(neuf),
-            }
-            index
-        }
-    };
+    }
 
     let segments = bio_segments::segments_de_la_bio(bio, &index, exclus, &externes);
     let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
-    // L'entrée peut avoir été rebâtie entre-temps par une autre requête : on
-    // ne range ces segments qu'auprès de l'index qui les a produits.
-    if let Some(cache) = caches
-        .iter_mut()
-        .find(|c| Weak::ptr_eq(&c.base, &ici) && Arc::ptr_eq(&c.index, &index))
-    {
-        if cache.segments.len() >= SEGMENTS_MAX {
-            cache.segments.clear();
+    match caches.iter().position(|c| Weak::ptr_eq(&c.base, &ici)) {
+        Some(p) => {
+            let cache = &mut caches[p];
+            // L'index vient d'être rebâti : les segments rangés avec l'ancien
+            // ne valent plus.
+            if !Arc::ptr_eq(&cache.index, &index) {
+                cache.index = index;
+                cache.segments.clear();
+            }
+            if cache.segments.len() >= SEGMENTS_MAX {
+                cache.segments.clear();
+            }
+            cache.segments.insert(cle, segments.clone());
         }
-        cache.segments.insert(cle, segments.clone());
+        None => {
+            let mut neuf = CacheDUneBase {
+                base: ici,
+                index,
+                segments: HashMap::new(),
+            };
+            neuf.segments.insert(cle, segments.clone());
+            caches.push(neuf);
+        }
     }
     segments
 }
