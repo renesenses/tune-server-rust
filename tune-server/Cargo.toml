@@ -1003,6 +1003,14 @@ path = "tests/nom_du_serveur_7044.rs"
 name = "radios_annuaire_6516"
 path = "tests/radios_annuaire_6516.rs"
 
+# #8156 — la relève de l'annuaire s'identifie (server_id, version), reste
+# anonyme si la télémétrie est refusée, et un refus 401/403 du site garde
+# l'annuaire et le dit à l'écran. `autotests = false` : sans cette cible,
+# jamais compilé.
+[[test]]
+name = "radios_annuaire_identite_8156"
+path = "tests/radios_annuaire_identite_8156.rs"
+
 # #3383 : la bascule « désactiver la télémétrie » n'éteignait rien — la route
 # n'écrivait pas, et les sept gardes d'envoi ne lisaient que `TUNE_TELEMETRY`.
 # Le témoin passe par les ROUTES MONTÉES puis appelle les décisions de
