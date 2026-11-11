@@ -1078,7 +1078,7 @@ impl SpotifyService {
                 .and_then(|i| i.first())
                 .and_then(|i| i["url"].as_str())
                 .map(Into::into),
-            track_count: item["tracks"]["total"].as_u64().unwrap_or(0) as u32,
+            track_count: nombre_de_titres(item),
             owner: item["owner"]["display_name"].as_str().map(Into::into),
             editable: None,
             covers: Vec::new(),
@@ -1721,21 +1721,26 @@ impl StreamingService for SpotifyService {
                 .and_then(|i| i.first())
                 .and_then(|i| i["url"].as_str())
                 .map(Into::into),
-            track_count: d["tracks"]["total"].as_u64().unwrap_or(0) as u32,
+            track_count: nombre_de_titres(&d),
             owner: d["owner"]["display_name"].as_str().map(Into::into),
             editable: None,
             covers: Vec::new(),
         })
     }
     async fn get_playlist_tracks(&self, id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        // #8193 — `/playlists/{id}/tracks` est retiré par Spotify depuis la
+        // migration du 9 mars 2026 (applications en mode développement :
+        // 403) ; la route est `/items`, et chaque entrée porte `item` au lieu
+        // de `track`. Les playlists s'ouvraient vides.
         let d = self
-            .api_get(&format!("/playlists/{id}/tracks?limit=100"))
+            .api_get(&format!("/playlists/{id}/items?limit=100"))
             .await?;
         Ok(d["items"]
             .as_array()
             .map(|i| {
                 i.iter()
-                    .filter_map(|item| item.get("track").map(Self::map_track))
+                    .filter_map(element_de_playlist)
+                    .map(Self::map_track)
                     .collect()
             })
             .unwrap_or_default())
@@ -1753,8 +1758,7 @@ impl StreamingService for SpotifyService {
         name: &str,
         description: Option<&str>,
     ) -> Result<String, TuneError> {
-        let user_id = self
-            .user_id
+        self.user_id
             .as_deref()
             .ok_or("spotify: not authenticated (no user_id)")?;
         let body = serde_json::json!({
@@ -1763,7 +1767,8 @@ impl StreamingService for SpotifyService {
             "public": false
         });
         let resp = self
-            .api_post(&format!("/users/{user_id}/playlists"), body)
+            // #8193 — `/users/{id}/playlists` est retiré (février 2026).
+            .api_post("/me/playlists", body)
             .await?;
         resp["id"]
             .as_str()
@@ -1789,7 +1794,8 @@ impl StreamingService for SpotifyService {
         let mut added = 0;
         for chunk in uris.chunks(100) {
             let body = serde_json::json!({ "uris": chunk });
-            self.api_post(&format!("/playlists/{playlist_id}/tracks"), body)
+            // #8193 — `/tracks` retiré au profit de `/items` (février 2026).
+            self.api_post(&format!("/playlists/{playlist_id}/items"), body)
                 .await?;
             added += chunk.len();
         }
@@ -2153,6 +2159,25 @@ fn motif_refus_403(detail: &str) -> String {
 /// l'autre ne se règle en réessayant. Un 429 ou un 5xx est passager.
 fn refus_de_renouvellement_definitif(status: u16, code: &str) -> bool {
     code == "invalid_grant" || status == 400 || status == 401
+}
+
+/// #8193 — le nombre de titres d'une playlist. Depuis février 2026, Spotify
+/// le rend sous `items.total` (anciennement `tracks.total`) ; les deux sont
+/// lus, le nouveau d'abord.
+fn nombre_de_titres(playlist: &serde_json::Value) -> u32 {
+    playlist["items"]["total"]
+        .as_u64()
+        .or_else(|| playlist["tracks"]["total"].as_u64())
+        .unwrap_or(0) as u32
+}
+
+/// #8193 — le titre d'une entrée de playlist : `item` depuis février 2026,
+/// `track` avant. Une entrée sans objet (titre retiré du catalogue) est sautée.
+fn element_de_playlist(entree: &serde_json::Value) -> Option<&serde_json::Value> {
+    entree
+        .get("item")
+        .filter(|v| v.is_object())
+        .or_else(|| entree.get("track").filter(|v| v.is_object()))
 }
 
 /// #6825 — le motif d'un refus de l'API Web, borné : `error.message` du
@@ -3299,3 +3324,7 @@ mod session_refusee_8051_tests;
 #[cfg(test)]
 #[path = "spotify_favoris_pagination_8050_tests.rs"]
 mod favoris_pagination_8050_tests;
+
+#[cfg(test)]
+#[path = "spotify_playlists_items_8193_tests.rs"]
+mod playlists_items_8193_tests;

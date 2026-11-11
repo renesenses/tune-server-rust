@@ -410,6 +410,7 @@ fn gapless_cooldown_suppresses_stopped() {
         last_radio_poll: Instant::now(),
         gapless_sent_at: None,
         last_position_ms: 0,
+        dernier_releve_de_position_at: None,
         peak_position_ms: 0,
         scrobbled_key: None,
         ticks_since_db_save: 0,
@@ -488,6 +489,7 @@ fn playing_state_resets_cooldown() {
         last_radio_poll: Instant::now(),
         gapless_sent_at: None,
         last_position_ms: 0,
+        dernier_releve_de_position_at: None,
         peak_position_ms: 0,
         scrobbled_key: None,
         ticks_since_db_save: 0,
@@ -811,6 +813,7 @@ fn backoff_exponential() {
         last_radio_poll: Instant::now(),
         gapless_sent_at: None,
         last_position_ms: 0,
+        dernier_releve_de_position_at: None,
         peak_position_ms: 0,
         scrobbled_key: None,
         ticks_since_db_save: 0,
@@ -1393,6 +1396,69 @@ fn position_confirms_transition_near_end_or_reset() {
     ));
 }
 
+/// #7293 — les chiffres du journal de Tades (fil 2502) : dernier relevé à
+/// 274 s sur une piste de 277 386 ms, puis la suivante (316 000 ms) vue à 8 s
+/// après un relevé manqué de 10 s.
+#[test]
+fn releve_manque_7293_la_marge_suit_l_age_du_releve() {
+    // À 1 Hz (écart ~1 s), rien ne change : 8 s n'est pas une retombée…
+    assert!(!decisions::position_reset_apres_le_releve(
+        274_000, 8_000, true, 1_000
+    ));
+    assert!(!decisions::position_confirms_transition_apres_le_releve(
+        true, 8_000, 277_386, 1_000
+    ));
+    // …et 3 s en est une, comme avant.
+    assert!(decisions::position_reset_apres_le_releve(
+        274_000, 3_000, true, 1_000
+    ));
+    // Après 10 s sans relevé, 8 s dans la suivante est une retombée.
+    assert!(decisions::position_reset_apres_le_releve(
+        274_000, 8_000, true, 10_000
+    ));
+    assert!(decisions::position_confirms_transition_apres_le_releve(
+        true, 8_000, 277_386, 10_000
+    ));
+    // Sans relevé daté (écart 0) : la marge nue de 5 s.
+    assert!(!decisions::position_reset_apres_le_releve(
+        274_000, 5_000, true, 0
+    ));
+    assert!(decisions::position_reset_apres_le_releve(
+        274_000, 4_999, true, 0
+    ));
+    // Un tick ordinaire (jusqu'à `RELEVE_NOMINAL_MS`) n'élargit RIEN : la
+    // marge reste exactement 5 s, au millième près.
+    assert!(!decisions::position_reset_apres_le_releve(
+        274_000,
+        5_000,
+        true,
+        decisions::RELEVE_NOMINAL_MS
+    ));
+    // Au-delà, elle suit l'écart : 10 s de relevé manqué = 5 s + 8 s.
+    assert!(decisions::position_reset_apres_le_releve(
+        274_000, 12_999, true, 10_000
+    ));
+    assert!(!decisions::position_reset_apres_le_releve(
+        274_000, 13_000, true, 10_000
+    ));
+    // Garde-fous inchangés : armement requis, piste à peine entamée exclue.
+    assert!(!decisions::position_reset_apres_le_releve(
+        274_000, 8_000, false, 10_000
+    ));
+    assert!(!decisions::position_reset_apres_le_releve(
+        20_000, 8_000, true, 10_000
+    ));
+    // Une position plus HAUTE que le relevé précédent n'est pas une chute,
+    // même sous la marge élargie : la lecture a simplement continué.
+    assert!(!decisions::position_reset_apres_le_releve(
+        40_000, 50_000, true, 60_000
+    ));
+    // `played_enough` reste la condition de la confirmation.
+    assert!(!decisions::position_confirms_transition_apres_le_releve(
+        false, 8_000, 277_386, 10_000
+    ));
+}
+
 #[test]
 fn dlna_playing_stall_ne_sarme_quavec_des_preuves_exploitables() {
     let eligible = |output,
@@ -1804,6 +1870,7 @@ fn gapless_stuck_forces_track_end() {
         last_radio_poll: Instant::now(),
         gapless_sent_at: None,
         last_position_ms: 0,
+        dernier_releve_de_position_at: None,
         peak_position_ms: 0,
         scrobbled_key: None,
         ticks_since_db_save: 0,
@@ -2151,6 +2218,7 @@ fn gapless_stuck_cleared_on_playing() {
         last_radio_poll: Instant::now(),
         gapless_sent_at: None,
         last_position_ms: 0,
+        dernier_releve_de_position_at: None,
         peak_position_ms: 0,
         scrobbled_key: None,
         ticks_since_db_save: 0,

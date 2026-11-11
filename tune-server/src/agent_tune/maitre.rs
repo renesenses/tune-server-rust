@@ -222,9 +222,12 @@ async fn retirer_sorties(state: &AppState, agent_id: &str) {
             .into_iter()
             .filter(|id| id.starts_with(&prefixe))
             .collect();
+        let mut sorties = Vec::with_capacity(ids.len());
         for id in &ids {
-            registre.remove(id);
+            sorties.extend(registre.remove(id));
         }
+        // #8029 — retirées, les sorties sont aussi arrêtées.
+        tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(sorties);
         ids
     };
     let repo = ZoneRepo::with_backend(state.backend.clone());

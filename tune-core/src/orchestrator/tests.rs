@@ -1898,12 +1898,12 @@ async fn une_zone_reseau_dont_le_seul_traitement_est_le_crossfeed() {
 fn un_traitement_actif_impose_le_pretranscodage_streaming() {
     // Renderer FLAC-capable, aucun traitement : proxy verbatim, bit-perfect.
     // C'est ce que les testeurs écoutent aujourd'hui — inchangé.
-    assert!(!streaming_needs_pretranscode(true, false, false));
+    assert!(!streaming_needs_pretranscode(true, false, false, false));
     // Renderer FLAC-capable, traitement armé : LE défaut #2863.
-    assert!(streaming_needs_pretranscode(true, true, false));
+    assert!(streaming_needs_pretranscode(true, true, false, false));
     // Renderer qui refuse le MIME amont : pré-transcodage, comme avant.
-    assert!(streaming_needs_pretranscode(false, false, false));
-    assert!(streaming_needs_pretranscode(false, true, false));
+    assert!(streaming_needs_pretranscode(false, false, false, false));
+    assert!(streaming_needs_pretranscode(false, true, false, false));
 }
 
 /// Le plafond 16 bits ne doit PAS suivre le traitement.
@@ -10029,10 +10029,10 @@ fn le_plafond_dun_flux_de_service_convertit_ou_refuse_4759() {
 fn le_plafond_seul_impose_le_pretranscodage_4759() {
     // Renderer FLAC-capable, aucun traitement, plafond ARMÉ : il faut décoder
     // pour rééchantillonner, donc pré-transcoder.
-    assert!(streaming_needs_pretranscode(true, false, true));
+    assert!(streaming_needs_pretranscode(true, false, true, false));
     // Et sans plafond, rien ne change : le proxy verbatim reste le chemin de
     // l'immense majorité des écoutes.
-    assert!(!streaming_needs_pretranscode(true, false, false));
+    assert!(!streaming_needs_pretranscode(true, false, false, false));
 }
 
 /// Site « plafond de zone », bras HTTPS des services (Qobuz vers un renderer

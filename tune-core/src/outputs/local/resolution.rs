@@ -322,6 +322,92 @@ pub(super) fn looks_disambiguated(requested: &str) -> bool {
         .is_some_and(|rank| rank >= 2)
 }
 
+/// La liste des périphériques de sortie de `host`, telle que la découverte
+/// la voit : puits nuls écartés, chaque identité étiquetée de l'hôte qui l'a
+/// énumérée.
+///
+/// #8173 — cette liste est construite en UN seul endroit, parce que deux
+/// consommateurs doivent la lire à l'identique : l'ouverture
+/// ([`find_device_with_fallback`]) et le contrôle de disponibilité
+/// (`LocalOutput::is_available`). Un périphérique que l'un voit et que l'autre
+/// ignore (un puits nul, par exemple) fait diverger les rangs `(n)` et, avec
+/// eux, le verdict.
+///
+/// Une énumération qui échoue rend deux listes vides : l'appelant conclut à
+/// « introuvable », jamais à autre chose.
+pub(super) fn enumerer_les_candidates(
+    host: &cpal::Host,
+) -> (Vec<cpal::Device>, Vec<DeviceIdentity>) {
+    let open_host: &'static str = host.id().name();
+    host.output_devices()
+        .map(|devs| devs.collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|device| {
+            let identity = DeviceIdentity {
+                endpoint_id: device.id().map(|id| id.to_string()).unwrap_or_default(),
+                raw_name: device
+                    .description()
+                    .map(|desc| desc.name().to_string())
+                    .unwrap_or_else(|_| "Unknown".into()),
+                host: open_host.to_string(),
+            };
+            (device, identity)
+        })
+        .filter(|(_, identity)| !is_null_sink(&identity.endpoint_id, &identity.raw_name))
+        .unzip()
+}
+
+/// #8173 — une zone locale est disponible EXACTEMENT quand l'ouverture
+/// retrouverait son périphérique, et indisponible sinon.
+///
+/// Avant ce correctif, `LocalOutput::is_available` appliquait sa propre règle
+/// (`n == name || n.contains(&name)`) : sensible à la casse, dans un seul
+/// sens, sans l'identifiant d'endpoint, sans l'hôte d'origine et sans la
+/// convention des rangs `(n)`. Deux verdicts pour une même zone :
+///
+/// - un DAC renommé par son pilote mais retrouvé par son identifiant d'endpoint
+///   JOUAIT (re-liaison de #2269) et s'affichait pourtant « indisponible » ;
+/// - la zone sur le second homonyme, « Haut-Parleurs (2) », s'affichait
+///   « indisponible » alors que la découverte la lui avait donnée ainsi et que
+///   l'ouverture la retrouve ;
+/// - à l'inverse, un nom que deux candidates contiennent (sous-chaîne
+///   ambiguë) ou un nom venu d'un autre hôte (#3230) s'affichait
+///   « disponible », et la lecture était refusée — l'auditeur ne découvrait le
+///   problème qu'en appuyant sur lecture (#8171).
+///
+/// Il n'y a qu'une règle d'appariement, celle de [`resolve_device`] ; la
+/// disponibilité en est la lecture booléenne. `ForeignHost` compte comme
+/// indisponible : l'ouverture refuse sans repli, et une zone qui ne peut pas
+/// jouer n'est pas disponible. `NotFound` aussi : hors Windows l'ouverture
+/// retombe sur la sortie système, mais ce n'est pas « retrouver son appareil »
+/// — c'est le repli de #2207, qui se dit à l'écran, et `is_available` rendait
+/// déjà `false` dans ce cas.
+///
+/// Hors champ : le chemin ASIO exclusif (`asio_exclusive.rs`) apparie par
+/// égalité ou sous-chaîne sans passer par [`resolve_device`]. Une zone ASIO
+/// exclusive dont le nom serait contenu dans DEUX pilotes ASIO jouerait sur le
+/// premier et s'afficherait ici indisponible ; les noms de pilotes ASIO sont
+/// uniques en pratique, et le mode partagé est le cas de l'issue.
+pub(super) fn zone_locale_disponible(
+    requested: &str,
+    requested_endpoint_id: Option<&str>,
+    requested_host: Option<&str>,
+    open_host: &str,
+    candidates: &[DeviceIdentity],
+) -> bool {
+    matches!(
+        resolve_device(
+            requested,
+            requested_endpoint_id,
+            requested_host,
+            open_host,
+            candidates
+        ),
+        DeviceResolution::Matched(_)
+    )
+}
+
 /// Find an audio output device by name, falling back to the default device if
 /// the requested device is not found.
 ///
@@ -372,24 +458,8 @@ pub(super) fn find_device_with_fallback(
     // « porte », et c'est cette étiquette-là que la résolution apparie.
     let open_host: &'static str = host.id().name();
 
-    let (devices, identities): (Vec<cpal::Device>, Vec<DeviceIdentity>) = host
-        .output_devices()
-        .map(|devs| devs.collect::<Vec<_>>())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|device| {
-            let identity = DeviceIdentity {
-                endpoint_id: device.id().map(|id| id.to_string()).unwrap_or_default(),
-                raw_name: device
-                    .description()
-                    .map(|desc| desc.name().to_string())
-                    .unwrap_or_else(|_| "Unknown".into()),
-                host: open_host.to_string(),
-            };
-            (device, identity)
-        })
-        .filter(|(_, identity)| !is_null_sink(&identity.endpoint_id, &identity.raw_name))
-        .unzip();
+    // #8173 — la même liste que `is_available`, et que la découverte.
+    let (devices, identities) = enumerer_les_candidates(host);
 
     let resolution = resolve_device(
         device_name,
