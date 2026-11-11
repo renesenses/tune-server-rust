@@ -165,7 +165,6 @@ async fn youtube_opus_sur_sortie_locale_demarre_avant_le_chien_de_garde_8444() {
         .await
         .expect("la tâche rend la main")
         .unwrap();
-    assert!(amont.fini.load(Ordering::SeqCst));
 
     let fichier = crate::test_scratch::scratch_file("tune-8444-reference", ".opus");
     std::fs::write(&fichier, &corps).unwrap();

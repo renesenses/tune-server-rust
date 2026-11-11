@@ -1625,6 +1625,15 @@ impl PlaybackOrchestrator {
 
         // Le decodeur a rendu son fichier. Le garde ne possede que les
         // telechargements HTTP ; les fichiers DASH du cache restent intacts.
+        // #8444 — un décodeur sorti avant d'avoir pris la poignée du
+        // téléchargement en croissance la laisse au registre : on la retire
+        // et la clôt, pour que la copie amont s'arrête aussi.
+        if let Some(fichier) = downloaded_file.as_ref()
+            && let Some(poignee) =
+                crate::audio::dash_growth::take_for(&fichier.path().to_string_lossy())
+        {
+            poignee.fail();
+        }
         drop(downloaded_file);
 
         match decode_result {
