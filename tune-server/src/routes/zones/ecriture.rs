@@ -124,6 +124,18 @@ pub(super) async fn patch_zone(
         .await;
     }
 
+    // #3245 — le mode exclusif réglé sur la zone atteint sa sortie locale :
+    // tout de suite au repos, sinon dès que la lecture rend le périphérique.
+    #[cfg(feature = "local-audio")]
+    if body.exclusive_mode.is_some()
+        && let Some(device_id) = repo.get(id).ok().flatten().and_then(|z| z.output_device_id)
+    {
+        let _ = crate::exclusif_par_zone_3245::aligner_maintenant_ou_apres_la_lecture(
+            &state, &device_id,
+        )
+        .await;
+    }
+
     if body.brand.is_some() || body.model.is_some() {
         push_device_correction(&state, id).await;
         // Dans la foulée : les réglages qui marchent chez cet utilisateur pour
@@ -883,6 +895,19 @@ async fn persister_le_son(
             settings.delete(&key)
         };
         ecrire!("strict_bitperfect", enabled, r);
+    }
+    // #3245 — mode exclusif de la zone → setting zone_{id}_exclusive_mode ;
+    // `null` supprime la clé (la zone suit la machine). La sortie est alignée
+    // par `patch_zone`, après la persistance.
+    if let Some(valeur) = body.exclusive_mode {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::config::cle_exclusif_de_zone(id);
+        let r = match valeur {
+            Some(true) => settings.set(&key, "true"),
+            Some(false) => settings.set(&key, "false"),
+            None => settings.delete(&key),
+        };
+        ecrire!("exclusive_mode", format!("{valeur:?}"), r);
     }
     // Trim de gain par renderer → setting zone_{id}_gain_trim_db (±12 dB, 0 = efface).
     if let Some(db) = body.gain_trim_db {

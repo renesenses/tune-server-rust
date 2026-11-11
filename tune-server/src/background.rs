@@ -3195,6 +3195,9 @@ fn spawn_local_audio_rescan(state: &AppState) {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
             rescan_local_audio_devices(&state).await;
+            // #3245 — un réglage d'exclusif changé pendant une lecture
+            // rattrape ici sa sortie, si le guetteur du PATCH a expiré.
+            crate::exclusif_par_zone_3245::aligner_toutes_les_sorties(&state).await;
             tokio::time::sleep(LOCAL_AUDIO_RESCAN_INTERVAL).await;
         }
     });
@@ -3618,13 +3621,20 @@ pub(crate) async fn appliquer_le_parc_local(
             // sorties en WASAPI EXCLUSIF — le son des autres applications de la
             // machine disparaissait sur un périphérique que personne n'avait
             // demandé en exclusif (jfpaquet, Asus Essence STX II).
+            // #3245 — la demande est celle de la zone de cet appareil, la
+            // machine en repli.
+            let demande_de_zone = state
+                .demande_d_exclusif_de_l_appareil(&device_id, state.requested_exclusive_mode());
             let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
                 configured_backend,
                 Some(dev.backend.as_str()),
-                state.requested_exclusive_mode(),
+                demande_de_zone.demande,
                 // #5353 — le `true` écrit par le choix d'ASIO n'est pas une
-                // demande pour ces noms WASAPI.
-                state.exclusif_arme_par_asio(),
+                // demande pour ces noms WASAPI (sauf s'il vient de la zone).
+                tune_core::config::temoin_asio_pour_la_demande(
+                    state.exclusif_arme_par_asio(),
+                    demande_de_zone,
+                ),
             );
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
