@@ -553,6 +553,11 @@ pub fn router() -> Router<AppState> {
             get(list_zones).post(create_zone).delete(delete_all_zones),
         )
         .route("/{id}", get(get_zone).patch(patch_zone).delete(delete_zone))
+        // #7806 — les sorties ASIO présentes qu'aucune zone visible ne porte.
+        .route(
+            "/asio-sans-zone",
+            get(pilote_local_7806::sorties_asio_sans_zone_route),
+        )
         // DUP-1 (phase 1) : fusion explicite de deux zones du même appareil.
         .route("/{id}/fusionner-dans/{cible}", post(fusionner_zones))
         // #6120 — rattacher à la main une zone orpheline à une sortie ASIO
@@ -673,6 +678,9 @@ mod lecture;
 pub use lecture::*;
 mod presence;
 mod rattacher_asio_6120;
+// #7806 — le pilote effectif (WASAPI / ASIO) d'une zone locale Windows, et
+// les sorties ASIO présentes sans zone.
+mod pilote_local_7806;
 mod sortie_reseau_absente_7279;
 mod tune_tested;
 // #7084 — zone AirPlay 2 servie sans son composant `airplay-daemon`.
