@@ -1197,6 +1197,73 @@ impl PlaybackOrchestrator {
         Ok(())
     }
 
+    /// #8422 — appliquer une bascule PURE DANS le flux réseau qui joue, sans
+    /// refaire la session UPnP (`dlna_stop` + `dlna_play`, la coupure du
+    /// Marantz ND8006, fil 1771). `Err(raison)` quand c'est impossible :
+    /// l'appelant retombe alors sur la relance, comme avant.
+    ///
+    /// Possible seulement sur une RADIO décodée par Tune dont le format ne
+    /// dépend d'aucun traitement : ce porteur ne cuit que l'égaliseur (le
+    /// crossfeed, la correction de pièce, les greffons tiers et le
+    /// ReplayGain n'y entrent jamais), et son format est celui de la
+    /// station, PURE ou non. Basculer PURE n'y change donc QUE l'égaliseur :
+    /// - entrée en PURE : l'égaliseur est coupé et le préampli gardé remonte
+    ///   jusqu'au signal sec ([`super::eq_en_vol::EqEnVol::poser_vers_le_sec`]) :
+    ///   au bout de la rampe, plus aucun étage ne touche les échantillons ;
+    /// - sortie de PURE : l'égaliseur enregistré revient par le fondu de #5215.
+    ///
+    /// Impossible :
+    /// - `flux_sans_poste_de_releve` / `porteur_termine` : comme
+    ///   [`Self::poser_l_eq_en_vol`] ;
+    /// - `porteur_cuit_d_autres_etages` : relais DSP progressif d'un fichier,
+    ///   qui cuit aussi crossfeed, correction et compensation, à un format que
+    ///   PURE ne garderait pas ;
+    /// - `format_depend_du_traitement` : radio que Tune ne décode que pour son
+    ///   égaliseur ; en PURE, une lecture fraîche la passerait telle quelle.
+    pub(super) fn basculer_pure_en_vol(
+        &self,
+        zone_id: i64,
+        np: &crate::playback::NowPlaying,
+    ) -> Result<(), &'static str> {
+        let Some(sid) = np.stream_id.as_deref() else {
+            return Err("flux_sans_poste_de_releve");
+        };
+        let Some(poste) = self.poste_eq_en_vol(zone_id, sid) else {
+            return Err("flux_sans_poste_de_releve");
+        };
+        if std::sync::Arc::strong_count(&poste) < 2 {
+            return Err("porteur_termine");
+        }
+        if !poste.cuit_seulement_l_egaliseur {
+            return Err("porteur_cuit_d_autres_etages");
+        }
+        if !poste.format_independant_du_traitement {
+            return Err("format_depend_du_traitement");
+        }
+        let pure = self.zone_audiophile(zone_id);
+        if pure {
+            poste.poser_vers_le_sec();
+        } else {
+            poste.poser(
+                self.load_eq_profile(zone_id)
+                    .filter(|p| crate::audio::eq::EqProcessor::new(p, 44_100, 2).is_enabled()),
+            );
+        }
+        self.noter_traitement_du_flux(
+            zone_id,
+            sid,
+            self.empreinte_du_traitement(zone_id, np.track_id),
+        );
+        info!(
+            zone_id,
+            stream_id = sid,
+            pure,
+            depots = poste.poses(),
+            "pure_en_vol_depose"
+        );
+        Ok(())
+    }
+
     /// L'empreinte de [`Self::empreinte_du_traitement`] sans son champ `eq=` :
     /// ce que la relève en vol ne change pas.
     fn empreinte_hors_egaliseur(empreinte: &str) -> String {

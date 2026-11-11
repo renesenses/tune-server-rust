@@ -300,3 +300,167 @@ async fn bascule_pure_sur_une_radio_arretee_ne_la_relance_pas_7556() {
         "aucun `play_media` ne doit partir vers le renderer"
     );
 }
+
+fn ecrire_pure(orch: &PlaybackOrchestrator, zone_id: i64, pure: bool) {
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &format!("zone_{zone_id}_audiophile"),
+            &format!(r#"{{"enabled":{pure}}}"#),
+        )
+        .unwrap();
+}
+
+/// #8422 — bascule PURE aller-retour sur une radio DLNA qui JOUE ; rend la
+/// portée de chaque sens.
+async fn basculer_pure_aller_retour(
+    orch: &Arc<PlaybackOrchestrator>,
+    zone_id: i64,
+) -> (PorteeDuReglage, PorteeDuReglage) {
+    ecrire_pure(orch, zone_id, true);
+    let aller = orch.apply_audiophile_change_portee(zone_id).await;
+    ecrire_pure(orch, zone_id, false);
+    let retour = orch.apply_audiophile_change_portee(zone_id).await;
+    (aller, retour)
+}
+
+/// Le renderer n'a rien reçu, la zone joue la même session, toujours
+/// alimentée, sans lecture refaite.
+async fn flux_intact(
+    orch: &Arc<PlaybackOrchestrator>,
+    zone_id: i64,
+    device_id: &str,
+    avant: (usize, u64),
+    sid: &str,
+    generation: u64,
+) {
+    assert_eq!(
+        relances_programmees(orch, zone_id),
+        0,
+        "aucune relance ne doit être programmée"
+    );
+    laisser_passer_l_anti_rebond().await;
+    assert_eq!(
+        commandes(orch, device_id).await,
+        avant,
+        "zéro `dlna_stop`/`SetAVTransportURI`/`dlna_play` vers le renderer"
+    );
+    assert_eq!(flux_joue(orch, zone_id).await.as_deref(), Some(sid));
+    assert!(session_vivante(orch, sid).await, "le décodeur radio tourne");
+    assert_eq!(
+        orch.playback.get_state(zone_id).await.track_generation,
+        generation,
+        "la lecture n'a pas été refaite"
+    );
+}
+
+/// #8422 — LE défaut du fil 1771 (Jean Valjean, Marantz ND8006, rc11) :
+/// crossfeed réglé, radio DLNA, bascule PURE. Avant : `traitement="crossfeed"`
+/// → `pure_bascule_change_le_signal_flux_refabrique` → `dlna_stop` +
+/// `dlna_play`, coupure à chaque bascule. Or le flux radio ne cuit pas le
+/// crossfeed : rien à refaire. Après : portée `Immediate`, même session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bascule_pure_avec_crossfeed_sur_une_radio_dlna_sans_dlna_stop_8422() {
+    let device_id = "dlna:uuid-8422-radio-crossfeed";
+    let (orch, zone_id) = zone_dlna_qui_joue_une_radio(device_id).await;
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &format!("zone_{zone_id}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_id, None),
+        Some("crossfeed"),
+        "prémisse : PURE gouverne le crossfeed de cette zone"
+    );
+    let avant = commandes(&orch, device_id).await;
+    let sid = flux_joue(&orch, zone_id).await.unwrap();
+    let generation = orch.playback.get_state(zone_id).await.track_generation;
+
+    assert_eq!(
+        basculer_pure_aller_retour(&orch, zone_id).await,
+        (PorteeDuReglage::Immediate, PorteeDuReglage::Immediate),
+        "la bascule PURE s'applique dans le flux radio en cours, sans relance"
+    );
+    flux_intact(&orch, zone_id, device_id, avant, &sid, generation).await;
+}
+
+/// #8422 — même bascule avec un égaliseur AUDIBLE : il est coupé (PURE) puis
+/// reposé (sortie de PURE) dans le flux radio en cours, par le poste de
+/// relève de #4407 — jamais par une nouvelle session UPnP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bascule_pure_avec_egaliseur_sur_une_radio_dlna_sans_dlna_stop_8422() {
+    let device_id = "dlna:uuid-8422-radio-egaliseur";
+    let (orch, zone_id) = zone_dlna_qui_joue_une_radio(device_id).await;
+    ecrire_profil(&orch, zone_id, &profil_audible(8.0));
+    assert_eq!(
+        orch.apply_eq_change_portee(zone_id).await,
+        PorteeDuReglage::Immediate,
+        "prémisse : l'égaliseur joue dans le flux radio"
+    );
+    let avant = commandes(&orch, device_id).await;
+    let sid = flux_joue(&orch, zone_id).await.unwrap();
+    let generation = orch.playback.get_state(zone_id).await.track_generation;
+    let poste = orch
+        .poste_eq_en_vol(zone_id, &sid)
+        .expect("poste de relève");
+    let depots = poste.poses();
+
+    assert_eq!(
+        basculer_pure_aller_retour(&orch, zone_id).await,
+        (PorteeDuReglage::Immediate, PorteeDuReglage::Immediate),
+        "la bascule PURE s'applique dans le flux radio en cours, sans relance"
+    );
+    assert_eq!(
+        poste.poses(),
+        depots + 2,
+        "entrée en PURE (égaliseur retiré) puis sortie (égaliseur reposé) : deux dépôts en vol"
+    );
+    assert!(
+        orch.flux_porte_deja_ce_traitement(
+            zone_id,
+            &orch.playback.get_state(zone_id).await.now_playing.unwrap()
+        ),
+        "le traitement noté du flux suit la bascule : le chemin du signal et le prochain réglage \
+         lisent l'état réel"
+    );
+    flux_intact(&orch, zone_id, device_id, avant, &sid, generation).await;
+}
+
+/// #8422 — garde : quand le FORMAT servi dépend du traitement (radio que
+/// Tune ne décode que pour son égaliseur, relais progressif d'un fichier),
+/// la bascule PURE refait encore le flux. Le poste du flux est remplacé par
+/// celui d'un tel porteur ; le banc garde la référence du porteur vivant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bascule_pure_qui_change_le_format_refait_encore_le_flux_8422() {
+    for (cas, poste) in [
+        (
+            "radio décodée pour son seul égaliseur",
+            super::eq_en_vol::EqEnVol::pour_la_radio_servie(false),
+        ),
+        (
+            "relais progressif d'un fichier",
+            super::eq_en_vol::EqEnVol::pour_le_relais(false),
+        ),
+    ] {
+        let device_id = format!("dlna:uuid-8422-format-{}", poste.cuit_seulement_l_egaliseur);
+        let (orch, zone_id) = zone_dlna_qui_joue_une_radio(&device_id).await;
+        ecrire_profil(&orch, zone_id, &profil_audible(8.0));
+        let sid = flux_joue(&orch, zone_id).await.unwrap();
+        orch.noter_eq_en_vol(zone_id, &sid, poste.clone());
+        let (lectures_avant, _) = commandes(&orch, &device_id).await;
+
+        ecrire_pure(&orch, zone_id, true);
+        assert_eq!(
+            orch.apply_audiophile_change_portee(zone_id).await,
+            PorteeDuReglage::Relance,
+            "{cas} : le format change, le flux doit être refait"
+        );
+        assert_eq!(poste.poses(), 0, "{cas} : rien n'est posé en vol");
+        laisser_passer_l_anti_rebond().await;
+        assert!(
+            commandes(&orch, &device_id).await.0 > lectures_avant,
+            "{cas} : la relance envoie un nouveau `play_media` au renderer"
+        );
+    }
+}

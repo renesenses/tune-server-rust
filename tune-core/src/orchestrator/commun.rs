@@ -592,9 +592,25 @@ impl PlaybackOrchestrator {
                 PorteeDuReglage::PisteSuivante
             }
             Some(traitement) => {
+                // #8422 — d'abord EN VOL : sur une radio décodée par Tune, la
+                // bascule ne change que l'égaliseur, que le porteur relève
+                // au bloc suivant. Même session, aucun `dlna_stop`/`dlna_play`.
+                let en_vol_impossible = match self.basculer_pure_en_vol(zone_id, &np) {
+                    Ok(()) => {
+                        info!(
+                            zone_id,
+                            pure, traitement, "pure_bascule_en_vol_flux_conserve"
+                        );
+                        return PorteeDuReglage::Immediate;
+                    }
+                    Err(raison) => raison,
+                };
                 info!(
                     zone_id,
-                    pure, traitement, "pure_bascule_change_le_signal_flux_refabrique"
+                    pure,
+                    traitement,
+                    en_vol_impossible,
+                    "pure_bascule_change_le_signal_flux_refabrique"
                 );
                 // `schedule_eq_replay` refuse quand la position est inconnue
                 // (#2595) : rien ne partira alors avant la piste suivante.
