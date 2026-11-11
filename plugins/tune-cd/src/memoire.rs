@@ -66,7 +66,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use serde::Serialize;
@@ -800,6 +800,15 @@ impl LecteurDisque for LecteurMemoire {
     }
 }
 
+/// #8514 — voir [`MemoireCd::retenir_pour_enregistrement`].
+pub struct RetenueEnregistrement(Arc<MemoireCd>);
+
+impl Drop for RetenueEnregistrement {
+    fn drop(&mut self) {
+        self.0.enregistrements.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Le chargement en mémoire du greffon : ses réglages et le disque chargé.
 pub struct MemoireCd {
     reglages: RwLock<Reglages>,
@@ -810,9 +819,10 @@ pub struct MemoireCd {
     garde: AtomicBool,
     /// #6596 — les évènements du greffon, passés à chaque chargement.
     observateur: RwLock<Option<Observateur>>,
-    /// #8514 — un enregistrement dans la bibliothèque lit la mémoire : le
-    /// disque gardé après son éjection n'est pas rendu en fin de lecture.
-    enregistrement: AtomicBool,
+    /// #8514 — les enregistrements dans la bibliothèque qui lisent la
+    /// mémoire ([`RetenueEnregistrement`]) : tant qu'il y en a, le disque
+    /// gardé après son éjection n'est pas rendu en fin de lecture.
+    enregistrements: AtomicUsize,
 }
 
 impl MemoireCd {
@@ -823,7 +833,7 @@ impl MemoireCd {
             ram_disponible: ram_disponible(),
             garde: AtomicBool::new(false),
             observateur: RwLock::new(None),
-            enregistrement: AtomicBool::new(false),
+            enregistrements: AtomicUsize::new(0),
         }
     }
 
@@ -993,14 +1003,18 @@ impl MemoireCd {
         self.courant().filter(|c| c.complet())
     }
 
-    /// #8514 — un enregistrement lit la mémoire (`true`) ou a fini.
-    pub fn marquer_enregistrement(&self, en_cours: bool) {
-        self.enregistrement.store(en_cours, Ordering::SeqCst);
+    /// #8514 — retient la mémoire pour un enregistrement : prise AVANT de
+    /// vérifier que le disque est entier (le surveillant ne peut plus le
+    /// rendre entre la vérification et la lecture), relâchée quand la
+    /// retenue tombe — fin, refus, erreur ou panique.
+    pub fn retenir_pour_enregistrement(self: &Arc<Self>) -> RetenueEnregistrement {
+        self.enregistrements.fetch_add(1, Ordering::SeqCst);
+        RetenueEnregistrement(self.clone())
     }
 
     /// #8514 — un enregistrement lit-il la mémoire ?
     pub fn enregistrement_en_cours(&self) -> bool {
-        self.enregistrement.load(Ordering::SeqCst)
+        self.enregistrements.load(Ordering::SeqCst) > 0
     }
 
     /// #6410 — le disque éjecté mais gardé en mémoire, s'il y en a un.
@@ -1420,6 +1434,23 @@ mod tests {
             lm.lire_secteurs(0, 1, &mut v[..OCTETS_PAR_SECTEUR]),
             Err(ErreurCd::AucunDisque)
         );
+    }
+
+    /// #8514 — la retenue se compte et se relâche en tombant, même si deux
+    /// demandes se croisent.
+    #[test]
+    fn la_retenue_d_enregistrement_tombe_avec_sa_garde() {
+        let m = Arc::new(MemoireCd::new(Reglages {
+            actif: true,
+            plafond_octets: u64::MAX,
+        }));
+        assert!(!m.enregistrement_en_cours());
+        let a = m.retenir_pour_enregistrement();
+        let b = m.retenir_pour_enregistrement();
+        drop(a);
+        assert!(m.enregistrement_en_cours(), "l'autre retenue vit encore");
+        drop(b);
+        assert!(!m.enregistrement_en_cours());
     }
 
     #[test]

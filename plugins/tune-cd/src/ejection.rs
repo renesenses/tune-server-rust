@@ -437,7 +437,7 @@ pub(crate) mod tests {
         b.lecteur.ejecter();
         b.surveillant.un_tour().await;
         b.hote.arreter(7).await;
-        b.memoire.marquer_enregistrement(true);
+        let retenue = b.memoire.retenir_pour_enregistrement();
         for _ in 0..TOURS_AVANT_LIBERATION * 2 {
             b.surveillant.un_tour().await;
         }
@@ -445,7 +445,7 @@ pub(crate) mod tests {
             b.memoire.disque_garde().is_some(),
             "mémoire rendue pendant l'enregistrement"
         );
-        b.memoire.marquer_enregistrement(false);
+        drop(retenue);
         for _ in 0..TOURS_AVANT_LIBERATION {
             b.surveillant.un_tour().await;
         }

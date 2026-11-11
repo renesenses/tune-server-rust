@@ -15,7 +15,10 @@
 //! sans relire le lecteur. Même plan, même encodeur, mêmes balises, même
 //! pochette, même nommage, même scan ciblé ; la lecture d'une zone continue
 //! (elle se sert dans la même mémoire) et la mémoire reste chargée. Refus
-//! `409 memoire_incomplete` si aucun disque n'est entier en mémoire.
+//! `409 memoire_incomplete` si aucun disque n'est entier en mémoire, et
+//! `409 memoire_secteurs_perdus` (avec `secteurs_perdus`) si des secteurs
+//! sont restés illisibles au chargement : la mémoire y tient du silence,
+//! l'extraction depuis le lecteur les relira.
 //!
 //! Le disque (`GET /disque`) et l'éjection (`POST /ejecter`) sont ceux du
 //! greffon ; l'éjection et la lecture refusent pendant une extraction.
@@ -319,18 +322,38 @@ async fn lancer(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
     }
     // #8514 — depuis la mémoire : le disque entier déjà chargé. Ni le
     // lecteur ni la lecture d'une zone ne sont touchés, la mémoire reste.
+    // La retenue est prise AVANT la vérification et vit jusqu'à la fin du
+    // déroulé (ou tombe avec un refus).
+    let mut retenue = None;
     let memoire = if d.depuis_memoire {
-        match e.routes.memoire.as_ref().and_then(|m| m.disque_complet()) {
-            Some(c) => Some(c),
-            None => {
-                return conflit(
-                    "memoire_incomplete",
-                    "Le disque n'est pas entièrement chargé en mémoire : \
-                     chargez-le d'abord, ou extrayez-le depuis le lecteur.",
-                    json!({}),
-                );
-            }
+        let incomplete = || {
+            conflit(
+                "memoire_incomplete",
+                "Le disque n'est pas entièrement chargé en mémoire : \
+                 chargez-le d'abord, ou extrayez-le depuis le lecteur.",
+                json!({}),
+            )
+        };
+        let Some(m) = e.routes.memoire.clone() else {
+            return incomplete();
+        };
+        let r = m.retenir_pour_enregistrement();
+        let Some(c) = m.disque_complet() else {
+            return incomplete();
+        };
+        let perdus = c.progression().secteurs_perdus;
+        if perdus > 0 {
+            return conflit(
+                "memoire_secteurs_perdus",
+                format!(
+                    "{perdus} secteur(s) sont restés illisibles au chargement : la mémoire \
+                     y tient du silence. Extrayez le disque depuis le lecteur."
+                ),
+                json!({ "secteurs_perdus": perdus }),
+            );
         }
+        retenue = Some(r);
+        Some(c)
     } else {
         let zones = zones_qui_jouent_le_disque(&e.routes).await;
         if !zones.is_empty() {
@@ -351,20 +374,11 @@ async fn lancer(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
             }
             let etat = travail.etat();
             e.ex.publier(EVT_DEMARREE, &etat);
-            // #8514 — le disque gardé après son éjection n'est pas rendu
-            // tant que l'enregistrement lit la mémoire.
-            let retenue = (etat.source == "memoire")
-                .then(|| e.routes.memoire.clone())
-                .flatten();
-            if let Some(m) = &retenue {
-                m.marquer_enregistrement(true);
-            }
             let ex = e.ex.clone();
             tokio::spawn(async move {
+                // #8514 — la retenue tombe avec la tâche, même sur panique.
+                let _retenue = retenue;
                 derouler(ex, travail, plan, pochette).await;
-                if let Some(m) = retenue {
-                    m.marquer_enregistrement(false);
-                }
             });
             (StatusCode::ACCEPTED, Json(etat)).into_response()
         }

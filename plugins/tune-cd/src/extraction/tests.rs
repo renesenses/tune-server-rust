@@ -1232,6 +1232,26 @@ async fn sans_disque_entier_en_memoire_l_enregistrement_est_refuse() {
     assert_eq!(l.appels(), 0, "le lecteur a été lu");
     assert!(banc.ex.liste().is_empty());
 
+    // Un refus ne laisse pas la mémoire retenue.
+    let m = Arc::new(MemoireCd::new(Reglages {
+        actif: true,
+        plafond_octets: u64::MAX,
+    }));
+    let mut banc = banc;
+    banc.routes.memoire = Some(m.clone());
+    let (code, _) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(
+        !m.enregistrement_en_cours(),
+        "retenue restée après un refus"
+    );
+
     // Chargement interrompu (éjection) : toujours refusé.
     l.ejecter_apres(2);
     let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
@@ -1257,4 +1277,105 @@ async fn sans_disque_entier_en_memoire_l_enregistrement_est_refuse() {
         (code, v["error"].as_str()),
         (StatusCode::CONFLICT, Some("memoire_incomplete"))
     );
+}
+
+/// #8514 (relecture) — un secteur resté illisible au chargement est du
+/// silence en mémoire : l'enregistrement est refusé et le dit, au lieu
+/// d'écrire un FLAC « parfait » qui ne l'est pas. Une demande refusée
+/// (destination invalide) ne garde pas la mémoire retenue.
+#[tokio::test]
+async fn des_secteurs_perdus_au_chargement_refusent_l_enregistrement() {
+    let l = simule();
+    l.faire_echouer(50, u32::MAX);
+    let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let m = charger_en_memoire(&mut banc, &l).await;
+    assert_eq!(m.progression().unwrap().secteurs_perdus, 1);
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::CONFLICT, Some("memoire_secteurs_perdus")),
+        "{v}"
+    );
+    assert_eq!(v["secteurs_perdus"], 1);
+    assert!(banc.ex.liste().is_empty());
+    assert!(!m.enregistrement_en_cours());
+    m.liberer();
+
+    // Sans perte, une destination refusée relâche aussi la retenue.
+    let l = simule();
+    let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let m = charger_en_memoire(&mut banc, &l).await;
+    let (code, _) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true, "destination": "/hors/bibliotheque" })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(
+        !m.enregistrement_en_cours(),
+        "retenue restée après un refus"
+    );
+    m.liberer();
+}
+
+/// Une pochette qui attend le feu vert du témoin : l'enregistrement reste
+/// en cours tant qu'on ne l'a pas donné.
+struct PochetteRetenue(Arc<tokio::sync::Notify>);
+#[async_trait]
+impl Pochettes for PochetteRetenue {
+    async fn telecharger(&self, _: &str) -> Option<Vec<u8>> {
+        self.0.notified().await;
+        Some(JPEG.to_vec())
+    }
+}
+
+/// #8514 (relecture) — la mémoire est retenue PENDANT tout l'enregistrement
+/// (le surveillant ne rend pas un disque gardé qu'on lit), puis relâchée.
+#[tokio::test]
+async fn la_memoire_est_retenue_pendant_tout_l_enregistrement() {
+    let l = simule();
+    let mut banc = Banc::new(l.clone(), Arc::new(AvecMusicBrainz));
+    let feu = Arc::new(tokio::sync::Notify::new());
+    let ex = Arc::new(
+        Extractions::new(
+            banc.backend.clone(),
+            Some(banc.bus.clone()),
+            Some(banc.scan.clone()),
+        )
+        .avec_pochettes(Arc::new(PochetteRetenue(feu.clone()))),
+    );
+    banc.ex = ex.clone();
+    banc.routes.extraction = Some(ex);
+    let m = charger_en_memoire(&mut banc, &l).await;
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::ACCEPTED, "{v}");
+    assert!(
+        m.enregistrement_en_cours(),
+        "mémoire non retenue pendant l'enregistrement"
+    );
+    feu.notify_one();
+    let fin = banc.attendre(v["id"].as_str().unwrap()).await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+    for _ in 0..200 {
+        if !m.enregistrement_en_cours() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!m.enregistrement_en_cours(), "retenue jamais relâchée");
+    m.liberer();
 }
