@@ -195,8 +195,9 @@ impl SettingsRepo {
                 valeur_validee = lu.as_deref().unwrap_or("<absente>"),
                 lieu = %lieu,
                 fil,
-                "reglage_consenti_non_valide — écrit, mais pas encore commité : \
-                 une transaction d'un autre fil est ouverte sur la connexion d'écriture"
+                "reglage_consenti_non_valide — écrit, mais pas (encore) commité : une \
+                 transaction ouverte sur la connexion d'écriture le contient, ou un \
+                 autre écrivain l'a changé entre-temps"
             ),
             Err(e) => tracing::info!(
                 cle = key,

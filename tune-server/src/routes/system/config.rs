@@ -2100,6 +2100,10 @@ pub(super) async fn update_config(
         let client = headers
             .get(axum::http::header::USER_AGENT)
             .and_then(|v| v.to_str().ok())
+            .map(|ua| match ua.char_indices().nth(160) {
+                Some((i, _)) => &ua[..i],
+                None => ua,
+            })
             .unwrap_or("?");
         tracing::info!(
             reglages = %cles_posees.join(","),
