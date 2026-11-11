@@ -3578,10 +3578,18 @@ impl PlaybackOrchestrator {
                 Some(output) => {
                     // #6541 — aucune limite ici (décision du 21/10) : sur
                     // une zone à volume fixe, elles n'ont pas cours.
-                    info!(zone_id, device_id = did, "fixed_volume_arm_sending");
-                    if let Err(error) = output.lock().await.checked_set_volume(1.0).await {
-                        warn!(zone_id, error = %error, "fixed_volume_arm_failed");
-                        return Err(error);
+                    let sortie = output.lock().await;
+                    // #5575 — une sortie qui ne règle pas le volume (volume
+                    // décoratif, OAAT fixe) est déjà à son niveau fixe : rien
+                    // à commander, et surtout rien à refuser.
+                    if !sortie.capabilities().can_set_volume {
+                        info!(zone_id, device_id = did, "fixed_volume_arm_sans_commande");
+                    } else {
+                        info!(zone_id, device_id = did, "fixed_volume_arm_sending");
+                        if let Err(error) = sortie.checked_set_volume(1.0).await {
+                            warn!(zone_id, error = %error, "fixed_volume_arm_failed");
+                            return Err(error);
+                        }
                     }
                 }
                 // Sortie déclarée mais pas encore enregistrée : rien à
