@@ -2412,22 +2412,17 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // Le registre des serveurs multimedia, lu ici et rendu dans la section
     // « Network » plus bas. Trie par nom : deux rapports du meme testeur
     // doivent se comparer ligne a ligne.
-    let mut serveurs_multimedia: Vec<(String, String, u16, bool, u64)> = {
-        let registre = state.media_servers.lock().await;
-        registre
-            .values()
-            .map(|ms| {
-                (
-                    ms.name.clone(),
-                    ms.host.clone(),
-                    ms.port,
-                    ms.is_reachable(),
-                    ms.age().as_secs(),
-                )
-            })
-            .collect()
+    //
+    // #8432 — ce registre est une COPIE : seule la carte du balayage SSDP voit
+    // sa fraîcheur remise à jour par les réannonces. Sans la reprendre ici
+    // (comme `network::synchroniser_le_registre`), le rapport rendait l'âge de
+    // la dernière synchronisation de la copie, et notre propre serveur y
+    // était dit « INJOIGNABLE — vu il y a 65008 s ». Rien n'est écrit en base.
+    let serveurs_multimedia = {
+        let vue_du_balayage = state.scanner.media_servers().await;
+        let mut registre = state.media_servers.lock().await;
+        serveurs_multimedia_du_rapport(&mut registre, vue_du_balayage)
     };
-    serveurs_multimedia.sort();
 
     let uptime_str = format!(
         "{}d {}h {}m {}s",
@@ -4073,6 +4068,104 @@ pub(super) async fn asio_devices(State(_state): State<AppState>) -> Json<Value> 
             "asio_available": false,
             "count": 0,
         }))
+    }
+}
+
+/// #8432 — les lignes « Serveurs multimedia » du rapport : la fraîcheur de
+/// la carte du balayage est d'abord reprise dans le registre (sans y insérer
+/// ni en retirer personne, voir `reprendre_la_fraicheur`), puis chaque
+/// serveur est rendu (nom, hôte, port, joignable, âge en s), trié par nom.
+fn serveurs_multimedia_du_rapport(
+    registre: &mut std::collections::HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>,
+    vue_du_balayage: Vec<tune_core::discovery::ssdp::MediaServerInfo>,
+) -> Vec<(String, String, u16, bool, u64)> {
+    tune_core::discovery::presence_serveur::reprendre_la_fraicheur(registre, vue_du_balayage);
+    let mut lignes: Vec<(String, String, u16, bool, u64)> = registre
+        .values()
+        .map(|ms| {
+            (
+                ms.name.clone(),
+                ms.host.clone(),
+                ms.port,
+                ms.is_reachable(),
+                ms.age().as_secs(),
+            )
+        })
+        .collect();
+    lignes.sort();
+    lignes
+}
+
+#[cfg(test)]
+mod tests_serveurs_multimedia_8432 {
+    use super::serveurs_multimedia_du_rapport;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    use tune_core::discovery::ssdp::MediaServerInfo;
+
+    fn serveur(id: &str, last_seen: Instant) -> MediaServerInfo {
+        MediaServerInfo {
+            id: id.into(),
+            name: "Tune Server".into(),
+            manufacturer: "MozAIk Labs".into(),
+            model: "Tune".into(),
+            location: "http://192.168.1.18:8888/upnp/description.xml".into(),
+            content_directory_url: "http://192.168.1.18:8888/upnp/cd/control".into(),
+            host: "192.168.1.18".into(),
+            port: 8888,
+            last_seen,
+            max_age: Duration::from_secs(1800),
+        }
+    }
+
+    /// Fil 2759 : la copie du registre est vieille de 18 h, la carte du
+    /// balayage a revu le serveur à l'instant. Le rapport le dit joignable,
+    /// avec l'âge de la dernière annonce.
+    ///
+    /// `Instant::checked_sub` rend `None` sur une machine fraîchement démarrée
+    /// (piège noté dans `presence_serveur.rs`) : la copie est alors datée de
+    /// maintenant puis vieillie d'une seconde réelle, et la preuve se joue sur
+    /// l'âge (0 s pour l'annonce fraîche, au moins 1 s pour la copie).
+    #[test]
+    fn une_copie_perimee_est_rafraichie_par_le_balayage() {
+        let perimee = Instant::now().checked_sub(Duration::from_secs(65_008));
+        let vieille = perimee.unwrap_or_else(|| {
+            let t = Instant::now();
+            std::thread::sleep(Duration::from_millis(1_200));
+            t
+        });
+        let mut registre = HashMap::new();
+        registre.insert("uuid:tune".to_string(), serveur("uuid:tune", vieille));
+        let lignes = serveurs_multimedia_du_rapport(
+            &mut registre,
+            vec![serveur("uuid:tune", Instant::now())],
+        );
+        assert_eq!(lignes.len(), 1);
+        let (_, _, port, joignable, age) = &lignes[0];
+        assert_eq!(*port, 8888);
+        assert_eq!(
+            *age, 0,
+            "l'âge de la dernière annonce, pas celui de la copie"
+        );
+        assert!(*joignable, "revu à l'instant : joignable ({lignes:?})");
+    }
+
+    /// La reprise n'insère personne (rideau #3688) et ne ressuscite pas un
+    /// serveur que le balayage n'a pas revu.
+    #[test]
+    fn la_reprise_n_insere_ni_ne_ressuscite() {
+        let mut registre = HashMap::new();
+        let ancienne = Instant::now();
+        registre.insert("uuid:connu".to_string(), serveur("uuid:connu", ancienne));
+        let lignes = serveurs_multimedia_du_rapport(
+            &mut registre,
+            vec![serveur("uuid:absent-du-registre", Instant::now())],
+        );
+        assert_eq!(lignes.len(), 1, "rien n'est inséré : {lignes:?}");
+        assert_eq!(
+            registre["uuid:connu"].last_seen, ancienne,
+            "non revu : inchangé"
+        );
     }
 }
 
