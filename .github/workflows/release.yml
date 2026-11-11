@@ -272,6 +272,70 @@ jobs:
             echo "::warning::ffmpeg-minimal-${{ matrix.platform }} absent de la release ffmpeg-minimal — cet artefact partira sans ffmpeg (aac/alac indisponibles, grisés par /converter/capabilities). Lancer le workflow « FFmpeg minimal »."
           fi
 
+      # fpcalc (Chromaprint) : empreinte sonore de l'identification AcoustID
+      # (#4805). Seule l'image Docker l'embarquait : les archives, Homebrew et
+      # l'installeur Windows affichaient « fpcalc n'est pas installé » (#8466,
+      # fil 2764). On livre le binaire OFFICIEL de Chromaprint, à côté de
+      # tune-server, là où binaire_fpcalc() regarde avant le PATH.
+      #
+      # Même version et mêmes sommes Linux que Dockerfile.dist : toute mise à
+      # jour change la version ET les sommes, ici et là-bas. Les sommes sont
+      # celles des archives publiées sur
+      # github.com/acoustid/chromaprint/releases/tag/v1.6.2 (calculées sur
+      # l'archive téléchargée et identiques au « digest » de l'API GitHub).
+      # 1.6.2 et non 1.5.1 : la 1.5.1 n'a pas d'archive linux-arm64.
+      #
+      # Somme fausse ou téléchargement impossible : le job ÉCHOUE. Pas de
+      # musl : le fpcalc arm64 officiel est lié à la glibc (NAS musl).
+      - name: Fetch bundled fpcalc (Chromaprint)
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        shell: bash
+        env:
+          CHROMAPRINT_VERSION: "1.6.2"
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)  arch=linux-x86_64;   ext=tar.gz; sha=c968ad4a0821592a79b158fb2e1f46cbe0a22a0a1dbc0743c67d68e75d15d2bb ;;
+            aarch64-unknown-linux-gnu) arch=linux-arm64;    ext=tar.gz; sha=3aa1498126ed272d805bc9d081c77965c9e1e1a0891bb112c13b56ef2ad47bad ;;
+            x86_64-apple-darwin)       arch=macos-x86_64;   ext=tar.gz; sha=5f7b21964163e9e1719ca76d89e71873e2bdba87e9c01d1bcb06da67132da2bb ;;
+            aarch64-apple-darwin)      arch=macos-arm64;    ext=tar.gz; sha=f3bc56cb42d89a01237bb3f3629329e4ec75f7c1b0217acf6e9bf952ac47979b ;;
+            x86_64-pc-windows-msvc)    arch=windows-x86_64; ext=zip;    sha=b74369726676670af3ab0eadff45f960cf969fdf4a87a971ba37eaf8d530e874 ;;
+            *) echo "::error::aucun fpcalc officiel prévu pour ${{ matrix.target }} (#8466)"; exit 1 ;;
+          esac
+          f="chromaprint-fpcalc-${CHROMAPRINT_VERSION}-${arch}"
+          mkdir -p "$RUNNER_TEMP/fpcalc"
+          cd "$RUNNER_TEMP/fpcalc"
+          curl -fsSL --retry 3 -o "$f.$ext" \
+            "https://github.com/acoustid/chromaprint/releases/download/v${CHROMAPRINT_VERSION}/$f.$ext"
+          # sha256sum sous Linux et Git-Bash, shasum sous macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "$sha  $f.$ext" | sha256sum -c -
+          else
+            echo "$sha  $f.$ext" | shasum -a 256 -c -
+          fi
+          # Chemins RELATIFS (le tar de Git-Bash lit « D: » comme un hôte).
+          if [ "$ext" = zip ]; then
+            7z x -y "$f.$ext" >/dev/null
+            mv "$f/fpcalc.exe" fpcalc.exe
+            test -s fpcalc.exe
+          else
+            tar -xzf "$f.$ext"
+            mv "$f/fpcalc" fpcalc
+            chmod 755 fpcalc
+            test -s fpcalc
+            file fpcalc
+          fi
+          rm -rf "$f" "$f.$ext"
+          ls -la
+
+      # L'archive aarch64 (image Tune OS du Raspberry Pi) doit porter un
+      # fpcalc ARM 64 bits : on lit l'en-tête ELF, sans l'exécuter.
+      - name: Verify fpcalc is an aarch64 binary
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          file "$RUNNER_TEMP/fpcalc/fpcalc" | grep -q 'ARM aarch64' \
+            || { echo "::error::fpcalc n'est pas un ELF ARM aarch64 (#8466)"; exit 1; }
+
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
@@ -607,6 +671,14 @@ jobs:
               FFMPEG="$FFMPEG FFMPEG-LICENSE.txt"
             fi
           fi
+          # fpcalc (Chromaprint, #8466) : à côté de tune-server, cherché là
+          # par binaire_fpcalc() avant le PATH.
+          FPCALC=""
+          if [ -f "$RUNNER_TEMP/fpcalc/fpcalc" ]; then
+            cp "$RUNNER_TEMP/fpcalc/fpcalc" package/
+            chmod 755 package/fpcalc
+            FPCALC="fpcalc"
+          fi
           # Sign the binaries that ship in the tarball (Homebrew installs these).
           #
           # Without this they keep the linker's ad-hoc signature, whose code
@@ -673,6 +745,9 @@ jobs:
             if [ -f package/ffmpeg ]; then
               sign_horodate package/ffmpeg fr.mozaiklabs.ffmpeg ""
             fi
+            if [ -f package/fpcalc ]; then
+              sign_horodate package/fpcalc fr.mozaiklabs.fpcalc ""
+            fi
             codesign --verify --strict --verbose=2 package/tune-server
             # Garde #1641 : une signature qui « réussit » sans porter la
             # permission repart pour un train entier de macOS sans analyse
@@ -704,7 +779,7 @@ jobs:
             cp packaging/linux/README.txt package/README.txt
             INSTRUCTIONS="README.txt"
           fi
-          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON $FFMPEG $LIBRESPOT web/ plugins/ $INSTRUCTIONS
+          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON $FFMPEG $FPCALC $LIBRESPOT web/ plugins/ $INSTRUCTIONS
           cd ..
 
       # ── Signature Authenticode (Windows) ───────────────────────────────────
@@ -764,6 +839,11 @@ jobs:
             $targets += "$env:RUNNER_TEMP\ffbundle\ffmpeg.exe"
           }
 
+          # fpcalc (Chromaprint, #8466) : signé EN PLACE, comme ffmpeg.
+          if (Test-Path "$env:RUNNER_TEMP\fpcalc\fpcalc.exe") {
+            $targets += "$env:RUNNER_TEMP\fpcalc\fpcalc.exe"
+          }
+
           $targets += "$env:RUNNER_TEMP\lrs\bin\librespot.exe"
           foreach ($t in $targets) {
             # /tr = horodatage : c'est lui qui fait qu'une signature reste
@@ -796,6 +876,10 @@ jobs:
               copy "$env:RUNNER_TEMP\ffbundle\FFMPEG-LICENSE.txt" package\
             }
           }
+          # fpcalc (Chromaprint, #8466), a cote de tune-server.exe.
+          if (Test-Path "$env:RUNNER_TEMP\fpcalc\fpcalc.exe") {
+            copy "$env:RUNNER_TEMP\fpcalc\fpcalc.exe" package\
+          }
           xcopy web\* package\web\ /E /I /Q
           # Bundle the Party (WASM) plugin next to tune-server.exe (see unix step).
           mkdir package\plugins\party
@@ -810,6 +894,7 @@ jobs:
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} librespot.exe LIBRESPOT-LICENSE.txt LIBRESPOT-THIRD-PARTY.txt
           if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
           if (Test-Path "ffmpeg.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} ffmpeg.exe FFMPEG-LICENSE.txt }
+          if (Test-Path "fpcalc.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} fpcalc.exe }
           cd ..
 
       - name: Install NSIS
@@ -839,6 +924,12 @@ jobs:
               copy "$env:RUNNER_TEMP\ffbundle\FFMPEG-LICENSE.txt" "target\${{ matrix.target }}\release\FFMPEG-LICENSE.txt"
               $ffmpegFile = $ffmpegFile + "`n            File `"target\${{ matrix.target }}\release\FFMPEG-LICENSE.txt`""
             }
+          }
+          # fpcalc (Chromaprint, #8466) : meme motif, a cote de tune-server.exe.
+          $fpcalcFile = ""
+          if (Test-Path "$env:RUNNER_TEMP\fpcalc\fpcalc.exe") {
+            copy "$env:RUNNER_TEMP\fpcalc\fpcalc.exe" "target\${{ matrix.target }}\release\fpcalc.exe"
+            $fpcalcFile = 'File "target\${{ matrix.target }}\release\fpcalc.exe"'
           }
           # Stage the Party (WASM) plugin so the installer ships it next to
           # tune-server.exe (plugins\ resolves exe-relative at runtime).
@@ -880,6 +971,7 @@ jobs:
             File "package\LIBRESPOT-THIRD-PARTY.txt"
             $daemonFile
             $ffmpegFile
+            $fpcalcFile
             SetOutPath "`$INSTDIR\web"
             File /r "web\*.*"
             ; Bundled Party (WASM) plugin, next to tune-server.exe
@@ -1047,6 +1139,12 @@ jobs:
               cp "$RUNNER_TEMP/ffbundle/FFMPEG-LICENSE.txt" "$APP/Contents/Resources/"
             fi
           fi
+          # fpcalc (Chromaprint, #8466) : dans Resources/, à côté de tune-server,
+          # là où binaire_fpcalc() regarde avant le PATH.
+          if [ -f "$RUNNER_TEMP/fpcalc/fpcalc" ]; then
+            cp "$RUNNER_TEMP/fpcalc/fpcalc" "$APP/Contents/Resources/"
+            chmod 755 "$APP/Contents/Resources/fpcalc"
+          fi
           cp package/librespot "$APP/Contents/Resources/"
           cp package/LIBRESPOT-*.txt "$APP/Contents/Resources/"
           cp -r web/* "$APP/Contents/Resources/web/"
@@ -1208,6 +1306,10 @@ jobs:
             if [ -f "$APP/Contents/Resources/ffmpeg" ]; then
               codesign --force --options runtime \
                 --identifier fr.mozaiklabs.ffmpeg --sign "$IDENTITY" "$APP/Contents/Resources/ffmpeg"
+            fi
+            if [ -f "$APP/Contents/Resources/fpcalc" ]; then
+              codesign --force --options runtime \
+                --identifier fr.mozaiklabs.fpcalc --sign "$IDENTITY" "$APP/Contents/Resources/fpcalc"
             fi
             # Le bundle, lui, tient son identifiant du CFBundleIdentifier écrit
             # plus haut (fr.mozaiklabs.tune-server) : rien à passer ici.
