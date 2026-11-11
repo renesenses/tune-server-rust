@@ -202,6 +202,7 @@ jobs:
       # opt-in via scripts/pg-e2e.sh.
       - name: Apply PG migrations
         run: |
+          bash scripts/ci/apt-robuste.sh
           sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
           export PGPASSWORD=tune
           psql -h localhost -U tune -d tune_test -c "CREATE EXTENSION IF NOT EXISTS unaccent;"
