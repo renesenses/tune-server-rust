@@ -46,6 +46,8 @@ mod dlna_volume_apres_uri_tests_6008;
 // #8151 — la sourdine tient à chaque nouvelle piste.
 #[cfg(test)]
 pub(crate) mod dlna_sourdine_8151_tests;
+#[cfg(feature = "local-audio")]
+pub(crate) mod dop_au_rendu_7704;
 pub mod hqplayer;
 pub mod identite_de_sortie;
 #[cfg(feature = "local-audio")]

@@ -71,6 +71,8 @@ pub struct ExclusiveOutput {
     /// Kept alive for the render callback closure.
     #[allow(dead_code)]
     paused: Arc<AtomicBool>,
+    silence: Arc<super::silence_avant_liberation_6133::SilenceAvantLiberation>,
+    started: bool,
 }
 
 /// Information about the currently-configured exclusive format.
@@ -536,6 +538,10 @@ impl ExclusiveOutput {
         let ring_for_callback = ring.clone();
         let vol_for_callback = volume.clone();
         let paused_for_callback = paused.clone();
+        let silence =
+            Arc::new(super::silence_avant_liberation_6133::SilenceAvantLiberation::default());
+        let silence_callback = silence.clone();
+        let mut dop = crate::audio::dop_continu::SuiviDoP::new(channels as u16);
 
         if let Err(error) = audio_unit.set_render_callback(
             move |args: render_callback::Args<render_callback::data::Interleaved<f32>>| {
@@ -545,29 +551,18 @@ impl ExclusiveOutput {
                     ..
                 } = args;
 
-                if paused_for_callback.load(Ordering::Relaxed) {
-                    for sample in data.buffer.iter_mut() {
-                        *sample = 0.0;
-                    }
-                    return Ok(());
-                }
-
-                let buffer = data.buffer;
-                let read = ring_for_callback.pop(buffer);
-
-                // Apply volume — #7968 : le volume partagé est rangé en
-                // `UNITE_DU_GAIN_DE_RENDU` (millionièmes), plus en millièmes.
                 let v = crate::audio::volume_scale::gain_des_unites(
                     vol_for_callback.load(Ordering::Relaxed),
-                ) as f32;
-                for sample in &mut buffer[..read] {
-                    *sample *= v;
-                }
-
-                // Silence for any remaining samples
-                for sample in &mut buffer[read..] {
-                    *sample = 0.0;
-                }
+                );
+                super::dop_au_rendu_7704::rendre_flottant(
+                    &ring_for_callback,
+                    data.buffer,
+                    v,
+                    &mut dop,
+                    silence_callback.doit_se_taire(paused_for_callback.load(Ordering::Relaxed)),
+                    0.0,
+                    |s, g| (f64::from(s) * g) as f32,
+                );
 
                 Ok(())
             },
@@ -586,6 +581,8 @@ impl ExclusiveOutput {
             ring,
             volume,
             paused,
+            silence,
+            started: false,
         })
     }
 
@@ -646,6 +643,8 @@ impl ExclusiveOutput {
             return Err(format!("Failed to start AudioUnit: {error}"));
         }
 
+        self.started = true;
+
         info!(
             device = %self.format_info.device_name,
             sample_rate = self.format_info.sample_rate,
@@ -658,6 +657,14 @@ impl ExclusiveOutput {
 
     /// Release exclusive mode and restore the device to its original state.
     pub fn release(&mut self) -> Result<(), String> {
+        // Deux tampons de repos confirmés avant de fermer le périphérique DoP (#7704).
+        if self.started {
+            self.silence.taire_puis_liberer(
+                super::silence_avant_liberation_6133::BORNE_SILENCE_AVANT_LIBERATION,
+                || {},
+            );
+            self.started = false;
+        }
         // Stop and drop the AudioUnit first
         if let Some(mut au) = self.audio_unit.take() {
             if let Err(e) = au.stop() {

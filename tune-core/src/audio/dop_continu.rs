@@ -37,6 +37,8 @@ pub struct SuiviDoP {
     canaux: usize,
     consecutives: u32,
     dernier: Option<u8>,
+    voie: usize,
+    marqueur_trame: Option<u8>,
 }
 
 impl SuiviDoP {
@@ -46,6 +48,8 @@ impl SuiviDoP {
             canaux: usize::from(canaux.max(1)),
             consecutives: 0,
             dernier: None,
+            voie: 0,
+            marqueur_trame: None,
         }
     }
 
@@ -69,39 +73,62 @@ impl SuiviDoP {
     /// Note les trames réellement émises. `haut` rend l'octet haut du mot
     /// 24 bits que porte l'échantillon.
     pub fn observer<T: Copy>(&mut self, emis: &[T], haut: impl Fn(T) -> u8) {
-        for trame in emis.chunks_exact(self.canaux) {
-            let m = haut(trame[0]);
-            let porte = (m == MARQUEUR_PAIR || m == MARQUEUR_IMPAIR)
-                && trame[1..].iter().all(|&s| haut(s) == m);
-            if porte && self.dernier != Some(m) {
+        for &mot in emis {
+            self.observer_marqueur(haut(mot));
+        }
+    }
+
+    /// Observation sans tampon intermédiaire, pour les conversions au rendu.
+    pub fn observer_marqueur(&mut self, m: u8) {
+        if self.voie == 0 {
+            self.marqueur_trame = matches!(m, MARQUEUR_PAIR | MARQUEUR_IMPAIR).then_some(m);
+        } else if self.marqueur_trame != Some(m) {
+            self.marqueur_trame = None;
+        }
+        self.voie += 1;
+        if self.voie != self.canaux {
+            return;
+        }
+        self.voie = 0;
+        match self.marqueur_trame {
+            Some(m) if self.dernier != Some(m) => {
                 self.consecutives = self.consecutives.saturating_add(1);
                 self.dernier = Some(m);
-            } else if porte {
-                // Marqueur répété : alternance rompue, on recompte depuis ici.
-                self.consecutives = 1;
-            } else {
+            }
+            Some(_) => self.consecutives = 1,
+            None => {
                 self.consecutives = 0;
                 self.dernier = None;
             }
         }
     }
 
+    /// Avance d'une trame de repos, pour les puits à mots sérialisés.
+    pub(crate) fn marqueur_de_repos(&mut self) -> Option<u8> {
+        let m = marqueur_suivant(self.dernier.filter(|_| self.actif())?);
+        self.dernier = Some(m);
+        self.consecutives = self.consecutives.saturating_add(1);
+        Some(m)
+    }
+
     /// Comble `sortie` : trames de repos DoP qui continuent l'alternance si le
     /// porteur est reconnu, sinon `zero` partout (le PCM garde son silence).
     /// Rend `true` si le comblement est du repos DoP.
-    pub fn combler<T: Copy>(&mut self, sortie: &mut [T], zero: T, repos: impl Fn(u8) -> T) -> bool {
-        let Some(mut m) = self.dernier.filter(|_| self.actif()) else {
+    pub fn combler<T: Copy>(
+        &mut self,
+        sortie: &mut [T],
+        zero: T,
+        mut repos: impl FnMut(u8) -> T,
+    ) -> bool {
+        if !self.actif() {
             sortie.fill(zero);
             return false;
-        };
-        let mut trames = 0u32;
-        for trame in sortie.chunks_mut(self.canaux) {
-            m = marqueur_suivant(m);
-            trame.fill(repos(m));
-            trames = trames.saturating_add(1);
         }
-        self.dernier = Some(m);
-        self.consecutives = self.consecutives.saturating_add(trames);
+        for trame in sortie.chunks_mut(self.canaux) {
+            if let Some(m) = self.marqueur_de_repos() {
+                trame.fill(repos(m));
+            }
+        }
         true
     }
 
