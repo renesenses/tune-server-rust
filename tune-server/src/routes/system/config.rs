@@ -3132,6 +3132,49 @@ pub(super) async fn set_default_zone(
     }
 }
 
+/// #8213 — la réponse commune des routes de l'arrêt programmé : le réglage
+/// (ou `null`) et la prochaine échéance en heure locale du serveur.
+fn reponse_arret_programme(
+    reglage: Option<tune_core::arret_programme::ArretProgramme>,
+) -> Json<Value> {
+    let prochain = reglage.as_ref().and_then(|r| {
+        r.prochaine_echeance(chrono::Local::now().naive_local())
+            .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())
+    });
+    Json(json!({ "scheduled_stop": reglage, "next_stop_at": prochain }))
+}
+
+pub(super) async fn get_scheduled_stop(State(state): State<AppState>) -> Json<Value> {
+    reponse_arret_programme(tune_core::arret_programme::lire(&state.backend))
+}
+
+/// Pose l'arrêt programmé. Réservé à l'administrateur : il arrête la lecture
+/// de toutes les zones, pas seulement celle de l'appelant.
+pub(super) async fn set_scheduled_stop(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Json(body): Json<tune_core::arret_programme::ArretProgramme>,
+) -> axum::response::Response {
+    match tune_core::arret_programme::ecrire(&state.backend, body) {
+        Ok(r) => reponse_arret_programme(Some(r)).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+pub(super) async fn delete_scheduled_stop(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    match tune_core::arret_programme::effacer(&state.backend) {
+        Ok(()) => reponse_arret_programme(None).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
 pub(super) async fn clear_cache(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("scan_result", "{}").ok();
