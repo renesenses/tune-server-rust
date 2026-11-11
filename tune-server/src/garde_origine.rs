@@ -42,6 +42,28 @@
 //! `TUNE_ALLOWED_ORIGINS` (liste séparée par des virgules, réglée par
 //! l'exploitant, jamais par HTTP) ajoute des origines de confiance, par
 //! exemple un mandataire inverse qui réécrit l'en-tête `Host`.
+//!
+//! # Hôtes acceptés
+//!
+//! Toute requête, quelle que soit sa méthode, est d'abord jugée sur son en-tête
+//! `Host` ([`hote_accepte`]) ; hors liste, elle reçoit `421` avant tout
+//! traitement. Sont acceptés :
+//!
+//! - une adresse IP littérale (IPv4, IPv6 entre crochets), quelle qu'elle soit :
+//!   accès par IP depuis le réseau local, conteneur Docker joint par l'IP de
+//!   son hôte, relais et écoute directe (rejoués sur `127.0.0.1`) ;
+//! - `localhost` et `*.localhost` ;
+//! - un nom sans point (`nuc`, `tune`), que seul le réseau local résout ;
+//! - les suffixes réservés au réseau local : `.local` (mDNS, `tune.local` de
+//!   Tune OS), `.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain` ;
+//! - le nom de la machine ([`tune_core::discovery::system_hostname`]) ;
+//! - les hôtes de `TUNE_ALLOWED_HOSTS` (séparés par des virgules ; `*.domaine`
+//!   accepte aussi les sous-domaines) et ceux des origines de
+//!   `TUNE_ALLOWED_ORIGINS`.
+//!
+//! Une requête sans `Host` (client HTTP/1.0, appel interne) passe : un
+//! navigateur en pose toujours un. `X-Forwarded-Host` n'entre pas dans ce
+//! jugement : une page de même origine peut le poser elle-même.
 
 use axum::extract::Request;
 use axum::http::header::HeaderName;
@@ -84,6 +106,21 @@ pub const MES_RADIOS: &str = "/api/v1/radios";
 /// depuis le site est une navigation (`/api/v1/radios/add`), pas une lecture :
 /// il n'a pas besoin de CORS et n'est pas ici.
 pub const LECTURES_DU_SITE: &[&str] = &[SONDE_PUBLIQUE, MES_RADIOS];
+
+/// Variable d'environnement des hôtes supplémentaires acceptés.
+pub const VARIABLE_HOTES: &str = "TUNE_ALLOWED_HOSTS";
+
+/// Suffixes que seul le réseau local résout (aucun n'est délégué dans le DNS
+/// public).
+const SUFFIXES_LOCAUX: &[&str] = &[
+    ".local",
+    ".localhost",
+    ".lan",
+    ".home",
+    ".home.arpa",
+    ".internal",
+    ".localdomain",
+];
 
 /// #8198 — le retour de connexion Spotify, renvoyé par le relais du site
 /// ([`ORIGINE_DU_SITE`], ou celui que règle `TUNE_SPOTIFY_RELAIS_URL`) en
@@ -147,6 +184,111 @@ pub fn est_origine_de_confiance(origine: &str) -> bool {
     ORIGINES_NATIVES.contains(&o.as_str()) || origines_de_l_exploitant().contains(&o)
 }
 
+fn liste_d_environnement(variable: &str) -> Vec<String> {
+    std::env::var(variable)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|o| o.trim().to_ascii_lowercase())
+                .filter(|o| !o.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `hote[:port]` → nom ou adresse, en minuscules, sans port, sans crochets ni
+/// point final. `None` si la valeur est malformée.
+fn nom_de_l_hote(hote: &str) -> Option<String> {
+    let h = hote.trim().to_ascii_lowercase();
+    if h.is_empty() || h.contains(['@', '/', '\\', ' ']) {
+        return None;
+    }
+    let nom = if let Some(reste) = h.strip_prefix('[') {
+        // IPv6 : `[::1]` ou `[::1]:8888`.
+        let (adresse, apres) = reste.split_once(']')?;
+        if !(apres.is_empty() || apres.starts_with(':')) {
+            return None;
+        }
+        adresse.to_string()
+    } else {
+        match h.rsplit_once(':') {
+            Some((nom, port)) if !nom.contains(':') => {
+                if !port.chars().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                nom.to_string()
+            }
+            // Plusieurs `:` sans crochets : IPv6 nue.
+            Some(_) => h.clone(),
+            None => h.clone(),
+        }
+    };
+    let nom = nom.trim_end_matches('.').to_string();
+    (!nom.is_empty()).then_some(nom)
+}
+
+fn est_ip_litterale(nom: &str) -> bool {
+    // Zone d'une adresse de lien local (`fe80::1%en0`) : ignorée.
+    let sans_zone = nom.split('%').next().unwrap_or(nom);
+    sans_zone.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn correspond(nom: &str, motif: &str) -> bool {
+    let motif = motif.trim().trim_end_matches('.');
+    if let Some(domaine) = motif.strip_prefix("*.") {
+        nom == domaine || nom.ends_with(&format!(".{domaine}"))
+    } else {
+        nom_de_l_hote(motif).is_some_and(|m| m == nom)
+    }
+}
+
+/// Jugement pur de l'en-tête `Host`, sans lecture de l'environnement.
+///
+/// `declares` : hôtes de l'exploitant (motifs `nom`, `nom:port`, `*.domaine`) ;
+/// `machine` : nom de la machine.
+pub fn hote_accepte_parmi(hote: &str, declares: &[String], machine: Option<&str>) -> bool {
+    let Some(nom) = nom_de_l_hote(hote) else {
+        return false;
+    };
+    if est_ip_litterale(&nom) || nom == "localhost" || !nom.contains('.') {
+        return true;
+    }
+    if SUFFIXES_LOCAUX.iter().any(|s| nom.ends_with(s)) {
+        return true;
+    }
+    if let Some(m) = machine {
+        let m = m.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !m.is_empty() && nom == m {
+            return true;
+        }
+    }
+    declares.iter().any(|d| correspond(&nom, d))
+}
+
+fn nom_de_la_machine() -> &'static str {
+    static NOM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NOM.get_or_init(tune_core::discovery::system_hostname)
+}
+
+/// L'en-tête `Host` désigne-t-il ce serveur (voir « Hôtes acceptés ») ?
+pub fn hote_accepte(hote: &str) -> bool {
+    let mut declares = liste_d_environnement(VARIABLE_HOTES);
+    declares.extend(
+        origines_de_l_exploitant()
+            .iter()
+            .filter_map(|o| decouper_origine(o).map(|(_, autorite)| autorite)),
+    );
+    hote_accepte_parmi(hote, &declares, Some(nom_de_la_machine()))
+}
+
+/// L'en-tête `Host` de la requête est-il absent ou accepté ?
+pub fn hote_de_la_requete_accepte(entetes: &HeaderMap) -> bool {
+    match entetes.get(axum::http::header::HOST) {
+        None => true,
+        Some(v) => v.to_str().ok().is_some_and(hote_accepte),
+    }
+}
+
 /// L'origine est-elle celle de l'hôte joint (`Host`, ou `X-Forwarded-Host`
 /// posé par un mandataire inverse) ?
 ///
@@ -157,6 +299,10 @@ pub fn est_meme_origine(origine: &str, entetes: &HeaderMap) -> bool {
         return false;
     };
     if !matches!(schema.as_str(), "http" | "https") {
+        return false;
+    }
+    // Un `Host` hors liste ne désigne pas ce serveur : son origine non plus.
+    if !hote_de_la_requete_accepte(entetes) {
         return false;
     }
     let hotes = [
@@ -227,6 +373,23 @@ pub fn exempte(methode: &Method, chemin: &str) -> bool {
 
 /// Couche de refus des requêtes inter-sites qui changent l'état.
 pub async fn garde(requete: Request, suivant: Next) -> Response {
+    if !hote_de_la_requete_accepte(requete.headers()) {
+        tracing::warn!(
+            methode = %requete.method(),
+            chemin = %requete.uri().path(),
+            hote = ?requete.headers().get(axum::http::header::HOST),
+            "hote_refuse"
+        );
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            axum::Json(json!({
+                "error": "host_not_allowed",
+                "message": "Host not allowed. Add it to TUNE_ALLOWED_HOSTS.",
+            })),
+        )
+            .into_response();
+    }
+    // #8198 — après la garde des hôtes : le retour du relais Spotify.
     if exempte(requete.method(), requete.uri().path()) {
         return suivant.run(requete).await;
     }
@@ -269,6 +432,10 @@ pub fn cors_autorise(origine: &HeaderValue, parts: &Parts) -> bool {
     let Ok(origine) = origine.to_str() else {
         return false;
     };
+    // Même liste d'hôtes que la garde : un `Host` étranger ne lit rien.
+    if !hote_de_la_requete_accepte(&parts.headers) {
+        return false;
+    }
     if est_origine_de_confiance(origine) || est_meme_origine(origine, &parts.headers) {
         return true;
     }
@@ -435,5 +602,175 @@ mod tests {
             ("sec-fetch-site", "cross-site"),
         ]);
         assert_eq!(juger(&Method::GET, &h), Verdict::Acceptee);
+    }
+
+    // ── Hôtes acceptés ────────────────────────────────────────────────
+
+    fn accepte(hote: &str) -> bool {
+        hote_accepte_parmi(hote, &[], Some("nuc-salon"))
+    }
+
+    #[test]
+    fn les_adresses_ip_passent() {
+        for h in [
+            "192.168.1.18:8888",
+            "192.168.1.18",
+            "10.0.0.5:8888",
+            "127.0.0.1:8888",
+            "[::1]:8888",
+            "[::1]",
+            "[fe80::1]:8888",
+            "[2a01:e0a::1]:8888",
+            "100.64.0.7:8888",
+        ] {
+            assert!(accepte(h), "{h}");
+        }
+    }
+
+    #[test]
+    fn les_noms_locaux_passent() {
+        for h in [
+            "localhost:8888",
+            "localhost",
+            "app.localhost:8888",
+            "tune.local",
+            "tune.local:8888",
+            "Tune.Local.",
+            "Studio-de-Bertrand.local:8888",
+            "nas.lan:8888",
+            "tune.home.arpa",
+            "tune:8888",
+            "nuc-salon:8888",
+        ] {
+            assert!(accepte(h), "{h}");
+        }
+    }
+
+    #[test]
+    fn le_nom_de_la_machine_passe_meme_qualifie() {
+        assert!(hote_accepte_parmi(
+            "nuc.bureau.example.com:8888",
+            &[],
+            Some("nuc.bureau.example.com")
+        ));
+        assert!(!hote_accepte_parmi(
+            "nuc.bureau.example.com:8888",
+            &[],
+            Some("autre")
+        ));
+    }
+
+    #[test]
+    fn les_hotes_declares_par_l_exploitant_passent() {
+        let declares = vec![
+            "musique.example.com".to_string(),
+            "*.maison.example.net".to_string(),
+            "tune.example.org:8443".to_string(),
+        ];
+        let ok = |h| hote_accepte_parmi(h, &declares, None);
+        assert!(ok("musique.example.com"));
+        assert!(ok("MUSIQUE.example.com:443"));
+        assert!(ok("salon.maison.example.net:8888"));
+        assert!(ok("maison.example.net"));
+        assert!(ok("tune.example.org:8443"));
+        assert!(!ok("example.com"));
+        assert!(!ok("musique.example.com.attaquant.example"));
+        assert!(!ok("attaquantmaison.example.net"));
+    }
+
+    #[test]
+    fn un_hote_etranger_est_refuse() {
+        for h in [
+            "attaquant.example:8888",
+            "attaquant.example",
+            "192.168.1.18.attaquant.example:8888",
+            "tune.local.attaquant.example",
+            "localhost.attaquant.example",
+            "",
+            "user@192.168.1.18",
+            "tune.local:abc",
+        ] {
+            assert!(!accepte(h), "{h}");
+        }
+    }
+
+    /// N1 : la page d'un site étranger dont le nom pointe désormais sur le
+    /// serveur se présente « de même origine » ; l'hôte la trahit.
+    #[test]
+    fn une_page_de_meme_origine_sous_un_hote_etranger_est_refusee() {
+        let h = entetes(&[
+            ("host", "attaquant.example:8888"),
+            ("origin", "http://attaquant.example:8888"),
+            ("sec-fetch-site", "cross-site"),
+        ]);
+        assert!(!hote_de_la_requete_accepte(&h));
+        assert!(!est_meme_origine("http://attaquant.example:8888", &h));
+        assert_eq!(juger(&Method::POST, &h), Verdict::InterSites);
+        // Lecture CORS refusée, même du catalogue public.
+        let p = parts(
+            Method::GET,
+            "/api/v1/library/albums",
+            &[("host", "attaquant.example:8888")],
+        );
+        let o = HeaderValue::from_static("http://attaquant.example:8888");
+        assert!(!cors_autorise(&o, &p));
+        // L'hôte légitime, lui, lit toujours le catalogue.
+        let p = parts(
+            Method::GET,
+            "/api/v1/library/albums",
+            &[("host", "192.168.1.18:8888")],
+        );
+        assert!(cors_autorise(&o, &p));
+    }
+
+    #[test]
+    fn une_requete_sans_hote_passe() {
+        assert!(hote_de_la_requete_accepte(&HeaderMap::new()));
+    }
+
+    /// La garde complète, montée comme en production.
+    #[tokio::test]
+    async fn la_garde_repond_421_hors_liste() {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/system/health",
+                axum::routing::get(|| async { "ok" }),
+            )
+            .layer(axum::middleware::from_fn(garde))
+            .layer(couche_cors());
+        let requete = |hote: &str| {
+            axum::http::Request::builder()
+                .uri("/api/v1/system/health")
+                .header("host", hote)
+                .header("sec-fetch-site", "same-origin")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for (hote, attendu) in [
+            ("192.168.1.18:8888", StatusCode::OK),
+            ("tune.local", StatusCode::OK),
+            ("127.0.0.1:8888", StatusCode::OK),
+            ("[::1]:8888", StatusCode::OK),
+            ("attaquant.example:8888", StatusCode::MISDIRECTED_REQUEST),
+        ] {
+            let r = app.clone().oneshot(requete(hote)).await.unwrap();
+            assert_eq!(r.status(), attendu, "{hote}");
+        }
+    }
+
+    /// `TUNE_ALLOWED_HOSTS` lue par la garde réelle. Aucun autre témoin ne
+    /// lit cette variable : la poser ici ne trouble pas la suite parallèle.
+    #[test]
+    fn la_variable_d_environnement_ajoute_des_hotes() {
+        let hote = "musique-n1.example.com:8888";
+        assert!(!hote_accepte(hote));
+        // SAFETY: variable propre à ce témoin, lue seulement par lui.
+        unsafe { std::env::set_var(VARIABLE_HOTES, " autre.example , Musique-N1.example.com ") };
+        assert!(hote_accepte(hote));
+        assert!(hote_accepte("autre.example"));
+        assert!(!hote_accepte("tiers-n1.example.com"));
+        unsafe { std::env::remove_var(VARIABLE_HOTES) };
+        assert!(!hote_accepte(hote));
     }
 }
