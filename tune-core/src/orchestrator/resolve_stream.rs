@@ -781,11 +781,24 @@ impl PlaybackOrchestrator {
         // #6370 — une sortie d'agent relancée à une position reçoit, comme
         // une sortie locale, le WAV décodé à partir de `seek_ms` : le
         // mandataire du CDN, lui, la servirait depuis l'octet 0.
+        // #7972 — une zone AirPlay 2 rétablie à une position après une pause :
+        // son démon lit le flux depuis le début, il lui faut le WAV décodé à
+        // partir de `seek_ms` (voir [`airplay2_relance_a_la_position`]).
         let is_local_stream = req
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"))
-            || agent_relance_a_la_position(req.output_device_id.as_deref(), req.seek_ms);
+            || agent_relance_a_la_position(req.output_device_id.as_deref(), req.seek_ms)
+            || (req.seek_ms.is_some_and(|ms| ms > 0)
+                && airplay2_relance_a_la_position(
+                    ZoneRepo::with_backend(self.db.clone())
+                        .get(req.zone_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|z| z.output_type)
+                        .as_deref(),
+                    req.seek_ms,
+                ));
 
         // Local and OAAT outputs expect raw PCM in a WAV container.
         // Streaming services deliver compressed audio (FLAC, AAC, etc.)

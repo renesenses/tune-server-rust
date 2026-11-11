@@ -65,6 +65,12 @@ pub struct Airplay2Output {
     /// la pause) : la session est à rouvrir avant toute lecture. Posé par le
     /// lecteur d'événements, effacé par `connected` et par `stop` (#7921).
     connexion_perdue: Arc<AtomicBool>,
+    /// Où, dans la piste, commence le flux que le démon lit (#7972). Nul pour
+    /// une lecture depuis le début ; posé par [`Self::noter_le_depart_du_flux`]
+    /// après une relance décodée à une position, remis à zéro par `play_media`.
+    /// Le démon compte depuis le début de SON fichier : la position publiée
+    /// lui ajoute ce départ.
+    depart_du_flux_ms: Arc<AtomicU64>,
     /// Délai d'abandon d'une attente de code (#8060), [`ATTENTE_DU_CODE`]
     /// hors bancs d'essai.
     delai_du_code: Duration,
@@ -225,6 +231,7 @@ impl Airplay2Output {
             copie_du_flux: Arc::new(Mutex::new(None)),
             panne: Arc::new(Mutex::new(None)),
             connexion_perdue: Arc::new(AtomicBool::new(false)),
+            depart_du_flux_ms: Arc::new(AtomicU64::new(0)),
             delai_du_code: ATTENTE_DU_CODE,
             session_consommee: Arc::new(AtomicBool::new(false)),
             refus_d_appairage: Arc::new(Mutex::new(None)),
@@ -234,6 +241,15 @@ impl Airplay2Output {
             volume_tenu_par_la_zone: Arc::new(AtomicBool::new(false)),
             depart_muet: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// #7972 — le flux que `play_media` vient de remettre au démon commence à
+    /// `depart_ms` dans la piste (relance décodée à la position, après une
+    /// pause où le récepteur a fermé sa connexion). La position et la durée
+    /// publiées sont alors celles de la PISTE, comme pour la sortie d'un agent
+    /// (#6370). Ce n'est pas un déplacement : `seek` reste refusé.
+    pub fn noter_le_depart_du_flux(&self, depart_ms: u64) {
+        self.depart_du_flux_ms.store(depart_ms, Ordering::SeqCst);
     }
 
     /// Banc d'essai : raccourcit le délai d'abandon de l'attente du code.
@@ -840,6 +856,7 @@ impl OutputTarget for Airplay2Output {
         self.duration_ms
             .store(media.duration_ms.unwrap_or(0), Ordering::SeqCst);
         self.position_ms.store(0, Ordering::SeqCst);
+        self.depart_du_flux_ms.store(0, Ordering::SeqCst);
 
         // AirPlay 2 lit le flux que le SERVEUR a decide d'envoyer, jamais le
         // fichier d'origine.
@@ -1065,10 +1082,20 @@ impl OutputTarget for Airplay2Output {
             self.demander_la_position().await;
         }
 
+        // #7972 — le démon compte depuis le début du flux qu'il lit ; ce flux
+        // commence à `depart` dans la piste après une relance à la position.
+        // La durée annoncée est alors celle qui restait (#6630) : on rend
+        // celles de la piste.
+        let depart = self.depart_du_flux_ms.load(Ordering::Relaxed);
+        let duree = self.duration_ms.load(Ordering::Relaxed);
         Ok(OutputStatus {
             state,
-            position_ms: self.position_ms.load(Ordering::Relaxed),
-            duration_ms: self.duration_ms.load(Ordering::Relaxed),
+            position_ms: depart.saturating_add(self.position_ms.load(Ordering::Relaxed)),
+            duration_ms: if duree > 0 {
+                depart.saturating_add(duree)
+            } else {
+                0
+            },
             volume: *self.volume.lock().await,
             muted: self.muted.load(Ordering::Relaxed),
             current_uri: None,
@@ -2319,7 +2346,7 @@ mod transport_tests {
 }
 
 #[cfg(test)]
-mod position_relevee_tests_7084;
+pub(crate) mod position_relevee_tests_7084;
 
 #[cfg(all(test, target_os = "linux"))]
 mod retrait_sans_arret_tests_8029;
