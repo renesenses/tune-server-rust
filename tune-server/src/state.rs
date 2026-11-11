@@ -376,6 +376,28 @@ impl AppState {
         )
     }
 
+    /// #3245 — la demande d'exclusif pour l'appareil `device_id` : celle de la
+    /// zone qui le joue quand elle en a une, sinon `demande_machine`
+    /// ([`Self::requested_exclusive_mode`], lu une fois par l'appelant).
+    pub fn demande_d_exclusif_de_l_appareil(
+        &self,
+        device_id: &str,
+        demande_machine: bool,
+    ) -> tune_core::config::DemandeDExclusifDeZone {
+        let valeur = tune_core::db::zone_repo::ZoneRepo::with_backend(self.backend.clone())
+            .get_by_device_id(device_id)
+            .ok()
+            .flatten()
+            .and_then(|zone| zone.id)
+            .and_then(|zone_id| {
+                tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
+                    .get(&tune_core::config::cle_exclusif_de_zone(zone_id))
+                    .ok()
+                    .flatten()
+            });
+        tune_core::config::demande_d_exclusif_de_la_zone(valeur.as_deref(), demande_machine)
+    }
+
     /// Vrai si c'est le CHOIX D'ASIO, et non l'utilisateur, qui a armé
     /// `local_exclusive_mode` (témoin posé par `PATCH /system/config`, #4184).
     ///
