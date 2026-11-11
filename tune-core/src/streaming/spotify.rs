@@ -21,6 +21,12 @@ const PLAFOND_RECHERCHE: usize = 50;
 /// le service l'adopte au premier `400 Invalid limit` qu'il reçoit à 50
 /// (voir [`SpotifyService::recherche`]).
 const PLAFOND_RECHERCHE_MODE_DEVELOPPEMENT: usize = 10;
+/// #8479 — le plus grand `limit` que `GET /artists/{id}/albums` accepte
+/// depuis février 2026 (0 à 10). Au-delà : `400 Invalid limit`.
+const PAGE_ALBUMS_ARTISTE: usize = 10;
+/// #8479 — borne de sécurité de la discographie : 30 pages de 10, soit 300
+/// albums et singles, sur un service qui annoncerait toujours une suite.
+const PAGES_ALBUMS_ARTISTE_MAX: usize = 30;
 // Spotify n'accepte plus l'alias `localhost` : le HTTP en clair n'est admis
 // que pour un LITTERAL de boucle locale. C'est acquis depuis #2680 et ce
 // n'est pas ce qui change ici.
@@ -1321,16 +1327,43 @@ impl StreamingService for SpotifyService {
         self.access_token.is_some() && self.user_id.is_some()
     }
 
+    /// #8479 — la discographie, par pages de [`PAGE_ALBUMS_ARTISTE`].
+    ///
+    /// On demandait `limit=50` en une fois. Depuis les changements de l'API
+    /// Web de février 2026, `GET /artists/{id}/albums` n'accepte plus qu'un
+    /// `limit` de 0 à 10 (5 par défaut) : à 50, Spotify refuse la requête
+    /// (`400 Invalid limit`) et la fiche artiste perdait TOUS ses albums
+    /// Spotify, sans un mot (Ronin22, ASR #169, rc11). On lit donc page par
+    /// page, par `offset`, jusqu'au `total` annoncé ou à la première page sans
+    /// `next`, dans la limite de [`PAGES_ALBUMS_ARTISTE_MAX`].
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
-        let data = self
-            .api_get(&format!(
-                "/artists/{artist_id}/albums?include_groups=album,single&limit=50"
-            ))
-            .await?;
-        Ok(data["items"]
-            .as_array()
-            .map(|i| i.iter().map(Self::map_album).collect())
-            .unwrap_or_default())
+        let mut albums: Vec<StreamAlbum> = Vec::new();
+        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut offset = 0usize;
+        for _ in 0..PAGES_ALBUMS_ARTISTE_MAX {
+            let data = self
+                .api_get(&format!(
+                    "/artists/{artist_id}/albums?include_groups=album,single&limit={PAGE_ALBUMS_ARTISTE}&offset={offset}"
+                ))
+                .await?;
+            let lot = data["items"].as_array().cloned().unwrap_or_default();
+            let recus = lot.len();
+            offset += recus;
+            for item in &lot {
+                let album = Self::map_album(item);
+                if album.id.is_empty() || vus.insert(album.id.clone()) {
+                    albums.push(album);
+                }
+            }
+            let fini = match data["total"].as_u64() {
+                Some(t) => offset as u64 >= t,
+                None => !data["next"].is_string(),
+            };
+            if fini || recus == 0 {
+                break;
+            }
+        }
+        Ok(albums)
     }
 
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
@@ -2841,3 +2874,7 @@ mod favoris_pagination_8050_tests;
 #[cfg(test)]
 #[path = "spotify_playlists_items_8193_tests.rs"]
 mod playlists_items_8193_tests;
+
+#[cfg(test)]
+#[path = "spotify_albums_artiste_8479_tests.rs"]
+mod albums_artiste_8479_tests;
