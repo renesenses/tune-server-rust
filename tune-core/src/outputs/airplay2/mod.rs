@@ -133,15 +133,27 @@ struct DaemonProcess {
 /// disparue du réseau, zone supprimée) laissait son démon tourner, orphelin,
 /// jusqu'à l'arrêt du serveur. Le démon meurt désormais avec la sortie qui le
 /// tient.
+///
+/// #8347 — le démon range ses identités d'appairage dans les données de
+/// Tune ([`identites_du_demon_8347`]) pour les relire (pair-verify).
 fn commande_du_demon(binary: &str) -> Command {
+    commande_du_demon_avec(binary, identites_du_demon_8347::pour_ce_serveur())
+}
+
+fn commande_du_demon_avec(binary: &str, identites: Option<PathBuf>) -> Command {
     let mut commande = Command::new(binary);
     commande
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    if let Some(dossier) = identites {
+        commande.env(identites_du_demon_8347::VARIABLE, dossier);
+    }
     commande
 }
+
+mod identites_du_demon_8347;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransportConfirmation {
@@ -265,7 +277,18 @@ impl Airplay2Output {
                                 // ni session coincée à lâcher.
                                 *refus_d_appairage.lock().await = None;
                                 session_a_rouvrir.store(false, Ordering::SeqCst);
-                                debug!(device = %device_name, "airplay2: connected/paired");
+                                // #8347 — `auth` (démon airplay2-rs#4) : pair_verify,
+                                // transient ou pin_pairing. Absent d'un ancien démon.
+                                match ev["auth"].as_str() {
+                                    Some(auth) => info!(
+                                        device = %device_name,
+                                        auth,
+                                        "airplay2: connected"
+                                    ),
+                                    None => {
+                                        debug!(device = %device_name, "airplay2: connected/paired")
+                                    }
+                                }
                                 Some(TransportConfirmation::Connected)
                             }
                             "playing" => {
@@ -367,7 +390,20 @@ impl Airplay2Output {
                                     *phase = PairingPhase::Failed(msg.clone());
                                 }
                                 drop(phase);
-                                warn!(device = %device_name, error = %msg, "airplay2: daemon error");
+                                // #8347 — le code TLV du refus d'appairage, quand
+                                // le démon l'envoie (2 authentication, 3 backoff…).
+                                if let Some(code) = ev["tlv_error"].as_u64() {
+                                    warn!(
+                                        device = %device_name,
+                                        error = %msg,
+                                        tlv_error = code,
+                                        tlv_error_name = ev["tlv_error_name"].as_str().unwrap_or(""),
+                                        pairing_step = ev["pairing_step"].as_str().unwrap_or(""),
+                                        "airplay2: receiver refused pairing"
+                                    );
+                                } else {
+                                    warn!(device = %device_name, error = %msg, "airplay2: daemon error");
+                                }
                                 None
                             }
                             _ => None,
