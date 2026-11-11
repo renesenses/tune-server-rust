@@ -107,6 +107,10 @@ fn assert_refus(statut: StatusCode, corps: &Value, code: &str) {
 struct Reponses {
     jeton: (u16, Value),
     me: (u16, Value),
+    /// Attente avant de répondre à `/api/token` (Spotify muet).
+    delai_jeton: Option<std::time::Duration>,
+    /// Le dernier jeton présenté à `/v1/me`.
+    jeton_vu: Option<String>,
 }
 
 impl Reponses {
@@ -122,6 +126,8 @@ impl Reponses {
                 }),
             ),
             me: (200, json!({"display_name": "Essai", "id": "u-essai"})),
+            delai_jeton: None,
+            jeton_vu: None,
         }
     }
 }
@@ -135,13 +141,25 @@ async fn doublure(reponses: Reponses) -> (String, Arc<VerrouSimple<Reponses>>) {
             "/api/token",
             post(move || {
                 let (statut, corps) = pour_jeton.lock().unwrap().jeton.clone();
-                async move { (StatusCode::from_u16(statut).unwrap(), Json(corps)) }
+                let delai = pour_jeton.lock().unwrap().delai_jeton;
+                async move {
+                    if let Some(delai) = delai {
+                        tokio::time::sleep(delai).await;
+                    }
+                    (StatusCode::from_u16(statut).unwrap(), Json(corps))
+                }
             }),
         )
         .route(
             "/v1/me",
-            get(move || {
-                let (statut, corps) = pour_me.lock().unwrap().me.clone();
+            get(move |entetes: axum::http::HeaderMap| {
+                let mut reponses = pour_me.lock().unwrap();
+                reponses.jeton_vu = entetes
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.trim_start_matches("Bearer ").to_owned());
+                let (statut, corps) = reponses.me.clone();
+                drop(reponses);
                 async move { (StatusCode::from_u16(statut).unwrap(), Json(corps)) }
             }),
         );
@@ -381,4 +399,75 @@ async fn diagnostic_client_id_accepte_par_spotify() {
     assert_eq!(diag["client_id"]["spotify"], "accepte", "{diag}");
     assert_eq!(diag["client_id"]["causes_possibles"], json!([]), "{diag}");
     assert_eq!(diag["a_corriger"], json!(["non_connecte"]), "{diag}");
+}
+
+/// Une reconnexion que Spotify refuse en 403 ne doit pas déconnecter un
+/// utilisateur dont la liaison marche : l'ancienne session reste en place,
+/// avec son jeton.
+#[tokio::test]
+async fn un_403_n_ecrase_pas_une_session_valide() {
+    let (app, reponses) = app_avec(Reponses::normales()).await;
+    let state = ouvrir(&app).await;
+    let (statut, corps) = coller(&app, &state).await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+
+    // Deuxième connexion, avec un autre compte que l'application refuse.
+    {
+        let mut r = reponses.lock().unwrap();
+        r.jeton.1["access_token"] = json!("jeton-refuse");
+        r.jeton.1["refresh_token"] = json!("renouveau-refuse");
+        r.me = (
+            403,
+            json!({"error": {"status": 403, "message": "the user may not be registered."}}),
+        );
+    }
+    let state = ouvrir(&app).await;
+    let (statut, corps) = coller(&app, &state).await;
+    assert_refus(statut, &corps, CODE_COMPTE_NON_AUTORISE);
+
+    reponses.lock().unwrap().me = (200, json!({"display_name": "Essai", "id": "u-essai"}));
+    let diag = diagnostic(&app).await;
+    assert_eq!(
+        diag["connexion"]["etat"], "connecte",
+        "la session valide est gardée : {diag}"
+    );
+    assert_eq!(diag["connexion"]["compte"], "Essai", "{diag}");
+    assert_eq!(diag["acces_api"]["etat"], "ok", "{diag}");
+    assert_eq!(
+        reponses.lock().unwrap().jeton_vu.as_deref(),
+        Some("jeton-essai"),
+        "l'ancien jeton reste celui en service"
+    );
+}
+
+/// Le vérificateur ne garde pas le verrou du service pendant ses appels à
+/// Spotify, et ne l'attend pas plus de 5 s : une connexion lancée pendant
+/// une sonde lente aboutit tout de suite.
+#[tokio::test]
+async fn diagnostic_sans_verrou_pendant_les_sondes_et_borne() {
+    let mut reponses = Reponses::normales();
+    reponses.delai_jeton = Some(std::time::Duration::from_secs(30));
+    let (app, _) = app_avec(reponses).await;
+
+    let debut = std::time::Instant::now();
+    let pour_diag = app.clone();
+    let diag = tokio::spawn(async move { diagnostic(&pour_diag).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Ouvrir une connexion demande le verrou en écriture.
+    let state = tokio::time::timeout(std::time::Duration::from_secs(2), ouvrir(&app))
+        .await
+        .expect("la connexion n'attend pas la fin du diagnostic");
+    assert!(!state.is_empty());
+
+    let diag = tokio::time::timeout(std::time::Duration::from_secs(15), diag)
+        .await
+        .expect("le diagnostic est borné")
+        .unwrap();
+    assert!(
+        debut.elapsed() < std::time::Duration::from_secs(12),
+        "sonde bornée à 5 s : {:?}",
+        debut.elapsed()
+    );
+    assert_eq!(diag["client_id"]["spotify"], "non_verifie", "{diag}");
 }

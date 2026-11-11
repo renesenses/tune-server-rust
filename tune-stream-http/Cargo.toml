@@ -13,6 +13,8 @@ reqwest = { workspace = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
+# #7807 — `Frame` du corps relayé par la couche de journal (déjà tiré par hyper).
+http-body = "1"
 
 [dev-dependencies]
 # Test-only : `tokio::time::pause()` / `advance()`. La garde de #2952 éprouve
