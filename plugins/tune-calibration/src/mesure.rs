@@ -49,6 +49,33 @@ use crate::hote::{ElementBalayage, HoteZone, TraitementsDeZone};
 /// servi à 48 kHz, la sortie suit ; la capture doit être à la même cadence.
 pub const FREQUENCE_MESURE: u32 = 48_000;
 
+/// #8491 — en dessous, la réponse impulsionnelle est noyée dans le bruit :
+/// le pic lui-même peut être une crête de bruit (retard faux), la réponse
+/// tombe au plancher numérique (−200 dB) et le RT60 n'a plus de sens
+/// (2 311 s à 250 Hz chez Xavier Joly, 11/11). Entre ce seuil et 40 dB,
+/// la mesure passe avec un avertissement, comme avant.
+pub const RSB_MIN_DB: f64 = 20.0;
+
+/// #8491 — ce qu'une mesure doit avoir pour donner un résultat, ou le refus
+/// motivé. `retard_max_ms` : au-delà, la réponse impulsionnelle (1,5 s après
+/// l'arrivée directe) sort de la fenêtre captée et sa queue est perdue.
+pub fn ri_exploitable(rsb_db: f64, retard_ms: f64, retard_max_ms: f64) -> Result<(), String> {
+    if !rsb_db.is_finite() || rsb_db < RSB_MIN_DB {
+        return Err(format!(
+            "rapport crête/bruit de {rsb_db:.0} dB : mesure inexploitable ({RSB_MIN_DB:.0} dB au moins). \
+             Vérifiez que le balayage sort bien par la zone mesurée, face au micro, à un niveau \
+             audible, et que le micro capte (voie, gain)"
+        ));
+    }
+    if !retard_ms.is_finite() || retard_ms > retard_max_ms {
+        return Err(format!(
+            "retard de {retard_ms:.0} ms : la réponse sort de la fenêtre captée ({retard_max_ms:.0} ms au plus). \
+             Mesurez sur une sortie locale de la machine, pas sur une sortie réseau"
+        ));
+    }
+    Ok(())
+}
+
 /// Ce que la route reçoit.
 #[derive(Debug, Clone)]
 pub struct Demande {
@@ -626,6 +653,12 @@ impl Controleur {
         };
         let balayage = deroule.balayage();
         let m = analyse_capture(&capte, balayage, &spec, etalonnage);
+        // #8491 — une mesure noyée dans le bruit, ou dont la réponse sort de
+        // la fenêtre, est REFUSÉE : avant, elle rendait une courbe et une
+        // correction absurdes, avec un simple avertissement.
+        let retard_max_ms =
+            (self.garde_trames() as f64 / FREQUENCE_MESURE as f64 - spec.extract.post_s) * 1000.0;
+        ri_exploitable(m.ir.snr_db(), m.ir.delay_ms(), retard_max_ms).map_err(Sortie::Refus)?;
         let mut avertissements = mesure.verrou().avertissements.clone();
         if m.ir.snr_db() < 40.0 {
             avertissements.push(format!(
@@ -790,6 +823,23 @@ fn nom_sur(nom: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #8491 — la mesure de Xavier Joly (11/11) : crête/bruit 11 dB, retard
+    /// 1 948 ms. Avant, elle passait avec deux avertissements et donnait une
+    /// correction ; elle est refusée sur le bruit, en le disant.
+    #[test]
+    fn une_ri_noyee_dans_le_bruit_ou_hors_fenetre_est_refusee_8491() {
+        let e = ri_exploitable(11.0, 1948.0, 2000.0).unwrap_err();
+        assert!(e.contains("11 dB") && e.contains("inexploitable"), "{e}");
+        assert!(ri_exploitable(f64::NAN, 10.0, 2000.0).is_err());
+        let e = ri_exploitable(60.0, 2100.0, 2000.0).unwrap_err();
+        assert!(e.contains("fenêtre captée"), "{e}");
+        assert!(ri_exploitable(60.0, f64::INFINITY, 2000.0).is_err());
+        // Ce qui passait reste accepté : retard élevé mais dans la fenêtre,
+        // bruit entre 20 et 40 dB (avertissement seulement).
+        assert!(ri_exploitable(25.0, 1948.0, 2000.0).is_ok());
+        assert!(ri_exploitable(72.0, 12.0, 2000.0).is_ok());
+    }
 
     #[test]
     fn les_bornes_de_la_demande_ne_se_desserrent_pas() {
