@@ -409,6 +409,10 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // colonne. L'index JUSTE APRÈS la colonne.
     "ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id)",
+    // web#2795 — la surcharge locale d'une station de l'annuaire (PG 110). Ici
+    // AUSSI : une base de bascule ne rejoue pas la 110, et la liste comme le
+    // relevé de l'annuaire NOMMENT la colonne.
+    "ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS surcharge_locale TEXT",
     // #6474 — la provenance du nom de tri (PG 095). Ici AUSSI : une base de
     // bascule ne rejoue pas la 095, et le scan comme l'enrichissement NOMMENT
     // la colonne.
