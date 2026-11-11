@@ -134,6 +134,58 @@ pub fn router() -> Router<AppState> {
         )
         .route("/radio-picks", get(radio_picks))
         .route("/streaming-highlights", get(streaming_highlights))
+        .route("/shortcuts", get(shortcuts))
+}
+
+/// Les raccourcis de l'accueil (posés depuis le client web), et rien d'autre.
+///
+/// Ils vivent dans le réglage `shortcuts`, que `GET /system/config` sert avec
+/// tout le reste ; or cette route-là est de l'administration et un appelant
+/// relayé ne l'atteint jamais (`garde_du_relais`). Les télécommandes en
+/// écoute à distance lisaient donc leurs raccourcis par une route fermée
+/// (403 `not_available_remotely`). Celle-ci ne sert que cette ligne, en
+/// lecture, sous `/home` — déjà relayable.
+async fn shortcuts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let brut = SettingsRepo::with_backend(state.backend.clone())
+        .get("shortcuts")
+        .map_err(|e| {
+            tracing::error!(erreur = %e, "raccourcis_illisibles");
+            AppError::service_unavailable("Server settings are temporarily unavailable")
+        })?;
+    Ok(Json(
+        json!({ "shortcuts": raccourcis_en_liste(brut.as_deref()) }),
+    ))
+}
+
+/// Le réglage est une chaîne de JSON ; tout ce qui n'est pas une liste donne
+/// une liste vide.
+fn raccourcis_en_liste(brut: Option<&str>) -> Value {
+    match brut.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => match serde_json::from_str::<Value>(s) {
+            Ok(v @ Value::Array(_)) => v,
+            _ => json!([]),
+        },
+        None => json!([]),
+    }
+}
+
+#[cfg(test)]
+mod raccourcis_tests {
+    use super::raccourcis_en_liste;
+    use serde_json::json;
+
+    #[test]
+    fn la_liste_stockee_est_rendue_telle_quelle() {
+        let v = raccourcis_en_liste(Some(r#"[{"id":"a","name":"Albums"}]"#));
+        assert_eq!(v, json!([{"id":"a","name":"Albums"}]));
+    }
+
+    #[test]
+    fn absent_vide_ou_illisible_donne_une_liste_vide() {
+        for brut in [None, Some(""), Some("  "), Some("{"), Some("{\"a\":1}")] {
+            assert_eq!(raccourcis_en_liste(brut), json!([]), "{brut:?}");
+        }
+    }
 }
 
 /// Returns a placeholder string appropriate for the engine.

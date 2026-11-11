@@ -129,6 +129,11 @@ pub struct AppState {
     /// déplacement reçu deux fois coup sur coup (ticket 193, voir
     /// [`crate::routes::playback::seek_en_double`]).
     pub derniers_seeks: Arc<std::sync::Mutex<HashMap<i64, (u64, Instant)>>>,
+    /// #7759 — les déplacements relayés aux suiveuses d'un groupe, numérotés
+    /// par meneuse : seul le dernier s'applique (voir
+    /// [`crate::routes::zones::relais_de_groupe_6155::DeplacementsDeGroupe`]).
+    pub deplacements_de_groupe:
+        Arc<crate::routes::zones::relais_de_groupe_6155::DeplacementsDeGroupe>,
     /// mDNS scanner handle, populated by
     /// [`crate::discovery_setup::spawn_mdns_handler`] once discovery starts. Kept
     /// here (not just as a local `_mdns_handle`) so routes can list the peer Tune
@@ -369,6 +374,28 @@ impl AppState {
             repli_applique && self.exclusif_arme_par_asio(),
             repli_applique,
         )
+    }
+
+    /// #3245 — la demande d'exclusif pour l'appareil `device_id` : celle de la
+    /// zone qui le joue quand elle en a une, sinon `demande_machine`
+    /// ([`Self::requested_exclusive_mode`], lu une fois par l'appelant).
+    pub fn demande_d_exclusif_de_l_appareil(
+        &self,
+        device_id: &str,
+        demande_machine: bool,
+    ) -> tune_core::config::DemandeDExclusifDeZone {
+        let valeur = tune_core::db::zone_repo::ZoneRepo::with_backend(self.backend.clone())
+            .get_by_device_id(device_id)
+            .ok()
+            .flatten()
+            .and_then(|zone| zone.id)
+            .and_then(|zone_id| {
+                tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
+                    .get(&tune_core::config::cle_exclusif_de_zone(zone_id))
+                    .ok()
+                    .flatten()
+            });
+        tune_core::config::demande_d_exclusif_de_la_zone(valeur.as_deref(), demande_machine)
     }
 
     /// Vrai si c'est le CHOIX D'ASIO, et non l'utilisateur, qui a armé
@@ -702,6 +729,7 @@ impl AppState {
             upnp_index_lock: Arc::new(Mutex::new(())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             derniers_seeks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            deplacements_de_groupe: Arc::default(),
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             active_audio_backend: Arc::new(std::sync::RwLock::new(None)),
             annuaire_radios: Arc::new(std::sync::RwLock::new(Vec::new())),

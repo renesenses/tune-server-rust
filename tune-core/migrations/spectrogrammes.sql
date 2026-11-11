@@ -1,4 +1,4 @@
--- Migration SQLite 143 (#8160) : le spectrogramme CONSERVÉ d'une piste, pour
+-- Migration SQLite 148 (#8160) : le spectrogramme CONSERVÉ d'une piste, pour
 -- sa fiche technique.
 --
 -- L'image elle-même reste un PNG du cache des spectrogrammes
@@ -15,7 +15,7 @@
 -- lecture de la fiche.
 --
 -- Mesure recalculable : la bascule SQLite → PostgreSQL ne la recopie pas
--- (`TABLES_NON_COPIEES` de pg_migrate.rs). Jumelle PG : 109.
+-- (`TABLES_NON_COPIEES` de pg_migrate.rs). Jumelle PG : 114.
 CREATE TABLE IF NOT EXISTS spectrogrammes (
     track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
     fichier TEXT NOT NULL,

@@ -7,7 +7,7 @@
 //!   sa ligne, une piste retirée aussi (`ON DELETE CASCADE`) ;
 //! * `signature_change_avec_le_fichier_8160` : réécrire le fichier change la
 //!   signature ;
-//! * `pg_8160_spectrogrammes` : les mêmes propriétés, script PG 109 compris.
+//! * `pg_8160_spectrogrammes` : les mêmes propriétés, script PG 114 compris.
 
 use std::sync::Arc;
 
@@ -120,13 +120,13 @@ fn signature_change_avec_le_fichier_8160() {
 // ── PostgreSQL ──────────────────────────────────────────────────────────────
 
 #[cfg(feature = "postgres")]
-async fn pg_8160_script_109(pool: &sqlx::PgPool) {
+async fn pg_8160_script_114(pool: &sqlx::PgPool) {
     sqlx::raw_sql(include_str!(
-        "../../migrations/postgres/109_spectrogrammes.sql"
+        "../../migrations/postgres/114_spectrogrammes.sql"
     ))
     .execute(pool)
     .await
-    .unwrap_or_else(|e| panic!("script PG 109 : {e}"));
+    .unwrap_or_else(|e| panic!("script PG 114 : {e}"));
 }
 
 /// Joué contre une vraie base (`TUNE_TEST_PG_URL`, schéma des scripts
@@ -142,18 +142,18 @@ async fn pg_8160_spectrogrammes() {
         .await
         .unwrap_or_else(|e| panic!("TUNE_TEST_PG_URL posée ({url}) mais injoignable : {e}"));
     let b: Arc<dyn DbBackend> = Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
-    // Base d'avant la 109 : la table retirée, sa marque aussi.
+    // Base d'avant la 114 : la table retirée, sa marque aussi.
     sqlx::raw_sql(
         "DROP TABLE IF EXISTS spectrogrammes;
-         DELETE FROM schema_version WHERE version = 109;
+         DELETE FROM schema_version WHERE version = 114;
          TRUNCATE TABLE tracks RESTART IDENTITY CASCADE;",
     )
     .execute(&pool)
     .await
     .unwrap();
-    pg_8160_script_109(&pool).await;
+    pg_8160_script_114(&pool).await;
     // Rejouable sans effet.
-    pg_8160_script_109(&pool).await;
+    pg_8160_script_114(&pool).await;
     semer_pistes(b.as_ref());
     verifier_enregistre_relu_remplace(b.as_ref());
     executer(b.as_ref(), "DELETE FROM spectrogrammes");

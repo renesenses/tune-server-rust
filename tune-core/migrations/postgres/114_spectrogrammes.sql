@@ -1,7 +1,7 @@
--- 109_spectrogrammes.sql
+-- 114_spectrogrammes.sql
 --
 -- #8160 : le spectrogramme CONSERVÉ d'une piste, pour sa fiche technique.
--- Jumelle de la migration SQLite 143 (`migrations/spectrogrammes.sql`), qui
+-- Jumelle de la migration SQLite 148 (`migrations/spectrogrammes.sql`), qui
 -- en donne le détail : l'image reste un PNG du cache plafonné des
 -- spectrogrammes ; la table en garde la trace datée et la signature du
 -- fichier audio (taille, date de modification) au moment du calcul.
@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS spectrogrammes (
 );
 CREATE INDEX IF NOT EXISTS idx_spectrogrammes_fichier ON spectrogrammes(fichier);
 
-INSERT INTO schema_version (version, name) VALUES (109, 'spectrogrammes')
+INSERT INTO schema_version (version, name) VALUES (114, 'spectrogrammes')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

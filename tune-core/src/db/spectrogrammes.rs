@@ -1,5 +1,5 @@
 //! #8160 — la trace DATÉE du spectrogramme conservé d'une piste (table
-//! `spectrogrammes`, migrations 143 / PG 109).
+//! `spectrogrammes`, migrations 148 / PG 114).
 //!
 //! L'image reste un PNG du cache plafonné des spectrogrammes (#7857). Cette
 //! table dit, pour la fiche technique d'une piste, QUELLE image en est la

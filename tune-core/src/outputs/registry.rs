@@ -231,6 +231,24 @@ pub async fn arreter_les_sorties_retirees(
     }
 }
 
+/// #8029 — [`arreter_les_sorties_retirees`] sans attendre, pour un retrait fait
+/// sous le verrou du registre : l'arrêt part dans une tâche, qui ne prend que
+/// le verrou de chaque sortie, jamais celui du registre.
+///
+/// Hors d'un runtime tokio (destruction tardive), rien n'est lancé : la sortie
+/// s'arrête alors par son `Drop`.
+pub fn arreter_les_sorties_retirees_en_tache(
+    retirees: impl IntoIterator<Item = Arc<Mutex<Box<dyn OutputTarget>>>>,
+) {
+    let retirees: Vec<_> = retirees.into_iter().collect();
+    if retirees.is_empty() {
+        return;
+    }
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(arreter_les_sorties_retirees(retirees));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

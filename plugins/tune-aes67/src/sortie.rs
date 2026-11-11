@@ -498,30 +498,32 @@ impl SortieAes67 {
 
     /// Arrête les annonces SAP (retrait envoyé) et la lecture.
     pub fn fermer(&self) {
-        if let Some(s) = self.prendre_la_session() {
-            s.arreter();
-        }
-        if let Some(e) = self
+        self.detacher().attendre();
+    }
+
+    /// Ce qui tourne pour la sortie, retiré d'elle sans rien attendre.
+    fn detacher(&self) -> Fermeture {
+        let session = self.prendre_la_session();
+        let emetteur = self
             .emetteur
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
-            e.arreter();
-        }
+            .take();
         self.suivante
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
-        if let Some(mut a) = self
+        let annonceur = self
             .annonceur
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
-            a.arreter();
-        }
+            .take();
         self.vitrine.annoncee.store(false, Ordering::Release);
+        Fermeture {
+            session,
+            emetteur,
+            annonceur,
+        }
     }
 
     /// La piste qui joue dans le flux en cours, et où.
@@ -598,9 +600,40 @@ fn infos_de(media: &PlayMedia<'_>) -> InfosPiste {
     }
 }
 
+/// Les fils d'une sortie à arrêter : producteur, émetteur, annonces SAP.
+/// Chaque arrêt attend la fin de son fil (`join`).
+struct Fermeture {
+    session: Option<Session>,
+    emetteur: Option<Emetteur>,
+    annonceur: Option<AnnonceurSap>,
+}
+
+impl Fermeture {
+    fn attendre(self) {
+        if let Some(s) = self.session {
+            s.arreter();
+        }
+        if let Some(e) = self.emetteur {
+            e.arreter();
+        }
+        if let Some(mut a) = self.annonceur {
+            a.arreter();
+        }
+    }
+}
+
+/// #8029 — une sortie détruite (retirée du registre) ne fige plus le fil du
+/// runtime qui la détruit : les `join` des fils partent dans un fil bloquant.
+/// Hors d'un runtime, ils sont attendus ici, comme avant.
 impl Drop for SortieAes67 {
     fn drop(&mut self) {
-        self.fermer();
+        let fermeture = self.detacher();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || fermeture.attendre());
+            }
+            Err(_) => fermeture.attendre(),
+        }
     }
 }
 
