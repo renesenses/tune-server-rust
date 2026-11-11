@@ -94,7 +94,14 @@ impl ServiceRegistry {
             let svc = svc.read().await;
             if let Some(tokens) = svc.save_tokens() {
                 let key = format!("auth_tokens_{name}");
-                settings.set(&key, &tokens.to_string()).ok();
+                let ligne = tokens.to_string();
+                // #8426 — chaque sauvegarde passe sur TOUS les services : une
+                // ligne inchangée n'est ni réécrite ni annoncée, sans quoi
+                // `tokens_saved` se lit pour un service que personne n'a touché.
+                if settings.get(&key).ok().flatten().as_deref() == Some(ligne.as_str()) {
+                    continue;
+                }
+                settings.set(&key, &ligne).ok();
                 info!(service = %name, "tokens_saved");
             }
         }
@@ -238,3 +245,7 @@ mod get_actif_tests {
         assert!(registre.get_actif("inconnu").await.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "registry_jetons_8426_tests.rs"]
+mod jetons_8426_tests;
