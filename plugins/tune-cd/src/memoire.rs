@@ -639,6 +639,9 @@ impl Chargement {
                     .ok()
                     .flatten();
             let Some(r) = r else {
+                // Mémoire rendue en route : pas de verdict, et plus de
+                // « en cours » qui resterait affiché.
+                c.verrou().verification_ar = None;
                 return;
             };
             tracing::info!(
