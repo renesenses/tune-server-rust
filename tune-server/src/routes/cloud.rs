@@ -1952,7 +1952,8 @@ mod tests_licence_proprietaire {
             .find("proprietaire::adopter_le_compte_lie(&settings, &state.backend)")
             .expect("la reprise des installations existantes a disparu");
         let ecrasement = source
-            .find(".set(\"mozaik_access_token\"")
+            // #8238 : le jeton s'ecrit par `sso::ouvrir_la_session`.
+            .find("sso::ouvrir_la_session(")
             .expect("l'ecriture du jeton a disparu");
         assert!(
             adoption < ecrasement,
