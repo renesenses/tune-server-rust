@@ -8,6 +8,18 @@ pub struct SettingsRepo {
     db: Arc<dyn DbBackend>,
 }
 
+/// #8521 (suite de #7307) — les deux consentements que des testeurs voient
+/// « revenir décochés » : chacune de leurs écritures est journalisée, valeur
+/// et auteur compris (voir `SettingsRepo::journaliser_consentement`).
+pub const CONSENTEMENTS_JOURNALISES: [&str; 2] = [
+    crate::metadata::ecriture_fichiers::CLE,
+    crate::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+];
+
+fn est_un_consentement_journalise(key: &str) -> bool {
+    CONSENTEMENTS_JOURNALISES.contains(&key)
+}
+
 /// Engine-agnostic SQL builders. They live as free functions so the
 /// future PostgresRepo can call them with `PostgresDialect` while the
 /// SQLite repo below uses `SqliteDialect`.
@@ -116,19 +128,85 @@ impl SettingsRepo {
         }
     }
 
+    #[track_caller]
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
+        let lieu = std::panic::Location::caller();
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let sql = self.dialect_sql(sql::upsert, sql::upsert);
         let params: [&dyn ToSqlValue; 3] = [&key, &value, &now];
         self.db.execute(&sql, &params)?;
+        if est_un_consentement_journalise(key) {
+            self.journaliser_consentement(key, Some(value), lieu);
+        }
         Ok(())
     }
 
+    #[track_caller]
     pub fn delete(&self, key: &str) -> Result<(), String> {
+        let lieu = std::panic::Location::caller();
         let sql = self.dialect_sql(sql::delete_by_key, sql::delete_by_key);
         let params: [&dyn ToSqlValue; 1] = [&key];
         self.db.execute(&sql, &params)?;
+        if est_un_consentement_journalise(key) {
+            self.journaliser_consentement(key, None, lieu);
+        }
         Ok(())
+    }
+
+    /// #8521 — chaque écriture d'un consentement suivi laisse une ligne :
+    /// la clé, la valeur (un booléen, jamais un secret), le LIEU du code qui
+    /// l'a écrite (route, tâche, import…) et son fil, puis si la valeur est
+    /// VALIDÉE en base.
+    ///
+    /// « Validée » se lit par le pool de lecture, qui ne voit que ce qui est
+    /// commité. Une écriture tombée dans la transaction ouverte d'un autre fil
+    /// (voir `transaction_du_lot.rs`, transaction déclarée orpheline) est lue
+    /// par la connexion d'écriture comme si elle était faite — la case reste
+    /// cochée à l'écran — mais disparaît si le serveur s'arrête avant le
+    /// `COMMIT`. C'est l'une des explications possibles du retour aux valeurs
+    /// par défaut « après un redémarrage, pas à chaque fois » (#8521, #7307) :
+    /// la ligne `reglage_consenti_non_valide` la nommera si elle se produit.
+    fn journaliser_consentement(
+        &self,
+        key: &str,
+        voulu: Option<&str>,
+        lieu: &'static std::panic::Location<'static>,
+    ) {
+        let sql = self.dialect_sql(sql::get_by_key, sql::get_by_key);
+        let params: [&dyn ToSqlValue; 1] = [&key];
+        let en_base = self
+            .db
+            .query_one(&sql, &params)
+            .map(|ligne| ligne.and_then(|r| r.first().and_then(|v| v.as_string())));
+        let fil = std::thread::current();
+        let fil = fil.name().unwrap_or("?");
+        let valeur = voulu.unwrap_or("<supprimée>");
+        match en_base {
+            Ok(lu) if lu.as_deref() == voulu => tracing::info!(
+                cle = key,
+                valeur,
+                lieu = %lieu,
+                fil,
+                "reglage_consenti_ecrit"
+            ),
+            Ok(lu) => tracing::warn!(
+                cle = key,
+                valeur,
+                valeur_validee = lu.as_deref().unwrap_or("<absente>"),
+                lieu = %lieu,
+                fil,
+                "reglage_consenti_non_valide — écrit, mais pas encore commité : \
+                 une transaction d'un autre fil est ouverte sur la connexion d'écriture"
+            ),
+            Err(e) => tracing::info!(
+                cle = key,
+                valeur,
+                lieu = %lieu,
+                fil,
+                relecture = %e,
+                "reglage_consenti_ecrit"
+            ),
+        }
     }
 
     pub fn all(&self) -> Result<Vec<(String, String)>, String> {

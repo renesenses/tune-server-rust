@@ -114,6 +114,8 @@ pub mod zone_repo;
 #[cfg(test)]
 mod album_dr_provenance_tests;
 #[cfg(test)]
+mod consentements_redemarrage_8521_tests;
+#[cfg(test)]
 mod ecrivains_pendant_un_lot_de_scan_tests;
 #[cfg(test)]
 mod filtre_dr_190_tests;
