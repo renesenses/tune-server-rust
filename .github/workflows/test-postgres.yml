@@ -154,6 +154,24 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
 
+      # #8190 : la machine meurt en compilant `tune-server` (code 143, « The
+      # runner has received a shutdown signal » ou « The hosted runner lost
+      # communication with the server [...] starves it for CPU/Memory »),
+      # toujours ~3 min après « Compiling tune-server », jamais pendant les
+      # tests. Trois rustc de `tune-server` (lib, lib de test, binaire) en
+      # parallèle avec PostgreSQL dépassent la mémoire vive de la machine
+      # gratuite. Une mémoire d'échange de 16 Gio absorbe la pointe sans
+      # ralentir le reste du job ni réduire le parallélisme (CARGO_BUILD_JOBS
+      # reste à 3) ; le disque a ~100 Gio libres après l'étape précédente.
+      - name: Ajouter de la mémoire d'échange (#8190)
+        run: |
+          free -h; swapon --show || true; nproc
+          sudo fallocate -l 16G /swapfile-8190
+          sudo chmod 600 /swapfile-8190
+          sudo mkswap /swapfile-8190
+          sudo swapon /swapfile-8190
+          free -h; swapon --show
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -776,6 +794,10 @@ jobs:
       # le vrai scan et le nettoyage sur deux racines, option allumee puis
       # eteinte. Le meme fichier tourne sur SQLite dans `ci.yml`.
       - name: Dedoublonnage par racine sur PostgreSQL (#6917)
+        # #8190 : ce témoin dure < 1 min ; resté figé 11 min le 09/11 (run
+        # 42576300930). Plafond propre à l'étape pour qu'un gel échoue vite
+        # au lieu de manger le plafond de 100 min du job.
+        timeout-minutes: 15
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test dedoublonnage_par_racine_6917 -- --nocapture --test-threads=1

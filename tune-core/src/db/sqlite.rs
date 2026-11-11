@@ -1199,6 +1199,32 @@ mod tests {
         assert!(tables.contains(&"track_credits".to_string()));
     }
 
+    /// #8196 (RUSTSEC-2026-0459 / CVE-2026-119375) — le SQLite embarqué par
+    /// `rusqlite` (feature `bundled`, libsqlite3-sys 0.39) doit être au moins
+    /// en 3.54.0. Ce garde rougit si un bump de dépendances fait retomber la
+    /// bibliothèque embarquée sous cette version.
+    #[test]
+    fn sqlite_embarque_au_moins_3_54_0_8196() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        let conn = db.conn.lock().unwrap();
+        let version: String = conn
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap();
+        let numero: Vec<u32> = version
+            .split('.')
+            .map(|p| p.parse::<u32>().unwrap_or(0))
+            .collect();
+        assert!(
+            numero.as_slice() >= [3, 54, 0].as_slice(),
+            "SQLite embarque {version}, attendu >= 3.54.0 (RUSTSEC-2026-0459)"
+        );
+        assert_eq!(
+            rusqlite::version(),
+            version,
+            "rusqlite::version() et sqlite_version() doivent parler de la meme bibliotheque"
+        );
+    }
+
     /// #5397 — le SQLite embarqué est compilé SANS comptabilité mémoire
     /// globale (`LIBSQLITE3_FLAGS` dans `.cargo/config.toml`). Avec elle,
     /// chaque allocation de chaque connexion du processus passe par un même
