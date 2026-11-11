@@ -145,7 +145,7 @@ impl SuiviDoP {
     ) -> usize {
         let ch = self.canaux;
         match premier {
-            Some(p) if self.actif() && sortie.len() > ch && self.dernier == Some(haut(p)) => {
+            Some(p) if self.actif() && sortie.len() >= ch && self.dernier == Some(haut(p)) => {
                 // `zero` n'est pas lu : le porteur est actif.
                 let z = repos(MARQUEUR_PAIR);
                 self.combler(&mut sortie[..ch], z, repos);
@@ -195,6 +195,25 @@ mod tests {
             assert_eq!(haut_i32(repos_i32(m)), m);
             assert_eq!(haut_f32(repos_f32(m)), m);
         }
+    }
+
+    #[test]
+    fn dop_7704_raccord_possible_sur_une_seule_trame() {
+        let mut suivi = SuiviDoP::new(2);
+        for i in 0..32 {
+            suivi.observer(
+                &[repos_i32(if i % 2 == 0 { 0x05 } else { 0xFA }); 2],
+                haut_i32,
+            );
+        }
+        let mut out = [0; 2];
+        suivi.combler(&mut out, 0, repos_i32);
+        assert_eq!(haut_i32(out[0]), 0x05);
+        assert_eq!(
+            suivi.raccorder(Some(repos_i32(0x05)), &mut out, haut_i32, repos_i32),
+            2
+        );
+        assert_eq!(out, [repos_i32(0xFA); 2]);
     }
 
     /// Un PCM ordinaire n'est jamais pris pour du DoP : son silence reste zéro.
