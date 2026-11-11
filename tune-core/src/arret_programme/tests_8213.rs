@@ -27,6 +27,7 @@ fn reglage(time: &str, jours: &str, zones: Option<Vec<i64>>) -> ArretProgramme {
         time: time.into(),
         days_of_week: jours.into(),
         zone_ids: zones,
+        action: ActionArret::StopPlayback,
     }
 }
 
@@ -65,6 +66,27 @@ fn les_jours_et_l_heure_par_defaut_a_la_lecture_du_json() {
     let r: ArretProgramme = serde_json::from_str(r#"{"enabled":true,"time":"23:00"}"#).unwrap();
     assert_eq!(r.days_of_week, "1111111");
     assert_eq!(r.zone_ids, None);
+    // Un réglage posé avant l'option garde son comportement : la lecture
+    // s'arrête, la machine reste allumée.
+    assert_eq!(r.action, ActionArret::StopPlayback);
+}
+
+#[test]
+fn l_action_se_lit_et_s_ecrit_en_snake_case() {
+    let r: ArretProgramme =
+        serde_json::from_str(r#"{"enabled":true,"time":"23:00","action":"poweroff"}"#).unwrap();
+    assert_eq!(r.action, ActionArret::Poweroff);
+    assert_eq!(
+        serde_json::to_value(&r).unwrap()["action"],
+        serde_json::json!("poweroff")
+    );
+    assert!(
+        serde_json::from_str::<ArretProgramme>(
+            r#"{"enabled":true,"time":"23:00","action":"halt"}"#
+        )
+        .is_err(),
+        "une action inconnue est refusée, pas prise pour un arrêt de lecture"
+    );
 }
 
 // ─── Échéance ──────────────────────────────────────────────────
@@ -171,6 +193,38 @@ impl Banc {
                 },
             )
             .await;
+    }
+
+    /// Le planificateur avec un crochet d'extinction qui COMPTE ses appels au
+    /// lieu d'éteindre quoi que ce soit.
+    fn avec_extinction_comptee(
+        self,
+        resultat: Result<(), String>,
+    ) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+        let appels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let compteur = appels.clone();
+        let extinction: Extinction = Arc::new(move || {
+            compteur.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let r = resultat.clone();
+            Box::pin(async move { r })
+        });
+        let Banc {
+            db,
+            playback,
+            planificateur,
+            salon,
+            chambre,
+        } = self;
+        (
+            Banc {
+                db,
+                playback,
+                planificateur: planificateur.avec_extinction(extinction),
+                salon,
+                chambre,
+            },
+            appels,
+        )
     }
 
     async fn etat(&self, zone: i64) -> PlayState {
@@ -284,4 +338,122 @@ async fn sans_reglage_ou_desactive_ou_jour_non_coche_rien_ne_s_arrete() {
 
     effacer(&banc.db).unwrap();
     assert_eq!(lire(&banc.db), None);
+}
+
+// ─── Extinction de la machine (action « poweroff », réponse 10786) ─────
+
+fn appels(c: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+    c.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn a_l_heure_dite_poweroff_arrete_la_lecture_puis_eteint_une_fois() {
+    let (banc, extinctions) = Banc::monter().await.avec_extinction_comptee(Ok(()));
+    let mut r = reglage("23:00", "1111111", None);
+    r.action = ActionArret::Poweroff;
+    ecrire(&banc.db, r).unwrap();
+    banc.jouer(banc.salon).await;
+
+    let mut derniere = None;
+    banc.planificateur
+        .passage(mardi(22, 59), &mut derniere)
+        .await;
+    assert_eq!(appels(&extinctions), 0, "rien avant l'heure");
+
+    assert_eq!(
+        banc.planificateur
+            .passage(mardi(23, 0), &mut derniere)
+            .await,
+        vec![banc.salon],
+        "la lecture s'arrête d'abord, proprement"
+    );
+    assert_eq!(banc.etat(banc.salon).await, PlayState::Stopped);
+    assert_eq!(
+        appels(&extinctions),
+        1,
+        "la machine est éteinte à l'échéance"
+    );
+
+    // Second passage dans la même minute : pas de second ordre.
+    banc.planificateur
+        .passage(mardi(23, 0), &mut derniere)
+        .await;
+    assert_eq!(appels(&extinctions), 1);
+}
+
+#[tokio::test]
+async fn poweroff_eteint_meme_si_rien_ne_joue() {
+    let (banc, extinctions) = Banc::monter().await.avec_extinction_comptee(Ok(()));
+    let mut r = reglage("23:00", "0100000", None);
+    r.action = ActionArret::Poweroff;
+    ecrire(&banc.db, r).unwrap();
+    let mut derniere = None;
+    assert!(
+        banc.planificateur
+            .passage(mardi(23, 0), &mut derniere)
+            .await
+            .is_empty()
+    );
+    assert_eq!(appels(&extinctions), 1);
+}
+
+#[tokio::test]
+async fn stop_playback_n_eteint_jamais_la_machine() {
+    let (banc, extinctions) = Banc::monter().await.avec_extinction_comptee(Ok(()));
+    ecrire(&banc.db, reglage("23:00", "1111111", None)).unwrap();
+    banc.jouer(banc.salon).await;
+    let mut derniere = None;
+    banc.planificateur
+        .passage(mardi(23, 0), &mut derniere)
+        .await;
+    assert_eq!(banc.etat(banc.salon).await, PlayState::Stopped);
+    assert_eq!(appels(&extinctions), 0);
+
+    // Poweroff mais jour non coché, ou désactivé : rien non plus.
+    let mut r = reglage("23:00", "0000011", None);
+    r.action = ActionArret::Poweroff;
+    ecrire(&banc.db, r.clone()).unwrap();
+    let mut derniere = None;
+    banc.planificateur
+        .passage(mardi(23, 0), &mut derniere)
+        .await;
+    r.days_of_week = "1111111".into();
+    r.enabled = false;
+    ecrire(&banc.db, r).unwrap();
+    banc.planificateur
+        .passage(mardi(23, 0), &mut derniere)
+        .await;
+    assert_eq!(appels(&extinctions), 0);
+}
+
+#[tokio::test]
+async fn une_extinction_refusee_ou_absente_n_empeche_pas_l_arret_de_la_lecture() {
+    // Refus du crochet (hors Tune OS) : journalisé, la lecture est arrêtée.
+    let (banc, extinctions) = Banc::monter()
+        .await
+        .avec_extinction_comptee(Err("not Tune OS".into()));
+    let mut r = reglage("23:00", "1111111", None);
+    r.action = ActionArret::Poweroff;
+    ecrire(&banc.db, r.clone()).unwrap();
+    banc.jouer(banc.salon).await;
+    let mut derniere = None;
+    assert_eq!(
+        banc.planificateur
+            .passage(mardi(23, 0), &mut derniere)
+            .await,
+        vec![banc.salon]
+    );
+    assert_eq!(appels(&extinctions), 1);
+
+    // Sans crochet du tout : même chose, sans panique.
+    let banc = Banc::monter().await;
+    ecrire(&banc.db, r).unwrap();
+    banc.jouer(banc.salon).await;
+    let mut derniere = None;
+    assert_eq!(
+        banc.planificateur
+            .passage(mardi(23, 0), &mut derniere)
+            .await,
+        vec![banc.salon]
+    );
 }

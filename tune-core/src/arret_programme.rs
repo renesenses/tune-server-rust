@@ -8,10 +8,13 @@
 //! jours, qui arrête la lecture des zones visées (toutes par défaut) par le
 //! même chemin que le bouton Stop (`PlaybackOrchestrator::stop`).
 //!
-//! Ce qui n'est PAS fait ici : éteindre la machine (`openrc-shutdown`,
-//! `systemctl poweroff`). C'est une décision à part (droits, machines où Tune
-//! n'est pas seul) ; le service Tune reste en marche pour la télécommande du
-//! lendemain.
+//! Par défaut (`action: "stop_playback"`), le service Tune et la machine
+//! restent allumés pour la télécommande du lendemain. Avec
+//! `action: "poweroff"` (décision de Bertrand du 11/11, réponse forum 10786),
+//! le planificateur arrête d'abord la lecture puis éteint la MACHINE, par le
+//! crochet [`Extinction`] que lui donne le serveur. Ce crochet est la seule
+//! fonction d'extinction du serveur (`routes::appliance::ordonner`) : elle
+//! refuse hors Tune OS, où Tune n'est pas seul sur la machine.
 //!
 //! Le réglage est rangé dans `settings` sous [`CLE`], en JSON.
 
@@ -33,6 +36,22 @@ pub const CLE: &str = "scheduled_stop";
 /// est toujours vue au moins deux fois, jamais manquée.
 const INTERVALLE_S: u64 = 20;
 
+/// Ce que fait l'échéance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionArret {
+    /// Arrêter la lecture ; le service et la machine restent allumés.
+    #[default]
+    StopPlayback,
+    /// Arrêter la lecture, puis éteindre la machine (Tune OS seulement).
+    Poweroff,
+}
+
+/// Le crochet d'extinction de la machine, fourni par le serveur. Rend
+/// l'erreur telle quelle (refus hors Tune OS, `systemctl` qui échoue).
+pub type Extinction =
+    Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, Result<(), String>> + Send + Sync>;
+
 /// Le réglage tel qu'il est rangé et tel que l'API le rend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArretProgramme {
@@ -46,6 +65,10 @@ pub struct ArretProgramme {
     /// Zones à arrêter ; absent ou `null` = toutes les zones.
     #[serde(default)]
     pub zone_ids: Option<Vec<i64>>,
+    /// Ce que fait l'échéance ; absent = arrêter la lecture (comportement
+    /// d'avant l'option).
+    #[serde(default)]
+    pub action: ActionArret,
 }
 
 fn tous_les_jours() -> String {
@@ -158,11 +181,23 @@ pub fn effacer(db: &Arc<dyn DbBackend>) -> Result<(), String> {
 pub struct PlanificateurArretProgramme {
     db: Arc<dyn DbBackend>,
     orchestrator: Arc<PlaybackOrchestrator>,
+    extinction: Option<Extinction>,
 }
 
 impl PlanificateurArretProgramme {
     pub fn new(db: Arc<dyn DbBackend>, orchestrator: Arc<PlaybackOrchestrator>) -> Self {
-        Self { db, orchestrator }
+        Self {
+            db,
+            orchestrator,
+            extinction: None,
+        }
+    }
+
+    /// Branche l'extinction de la machine pour `action: "poweroff"`. Sans
+    /// crochet, une échéance « éteindre » arrête la lecture et le journalise.
+    pub fn avec_extinction(mut self, extinction: Extinction) -> Self {
+        self.extinction = Some(extinction);
+        self
     }
 
     pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -198,7 +233,24 @@ impl PlanificateurArretProgramme {
             return Vec::new();
         }
         *derniere = Some(minute);
-        self.arreter(&reglage).await
+        let arretees = self.arreter(&reglage).await;
+        if reglage.action == ActionArret::Poweroff {
+            self.eteindre().await;
+        }
+        arretees
+    }
+
+    /// Éteint la machine par le crochet du serveur. Un refus (hors Tune OS)
+    /// ou un échec ne remonte nulle part ailleurs que dans le journal.
+    async fn eteindre(&self) {
+        let Some(extinction) = &self.extinction else {
+            warn!("scheduled_poweroff_unavailable: no power-off hook");
+            return;
+        };
+        info!("scheduled_poweroff_requested");
+        if let Err(e) = extinction().await {
+            warn!(error = %e, "scheduled_poweroff_failed");
+        }
     }
 
     /// Arrête les zones visées qui jouent ou sont en pause.

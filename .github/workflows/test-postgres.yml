@@ -111,7 +111,7 @@ jobs:
     # froide de ~4 min. Un plafond ne peut que faire echouer plus tot.
     # 100 depuis le 06/11 : les passages réussis du lot rc11 prenaient déjà
     # 52 à 75 min, au ras du plafond de 75, qui a coupé #7989 à 75 min.
-    timeout-minutes: 100
+    timeout-minutes: 180
 
     services:
       postgres:
@@ -572,6 +572,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_insert_conditionnel_f7c250 -- --nocapture
 
+      # #8239 — le journal de synchro cloud après un scan, sur PostgreSQL : le
+      # relevé `sync_releve_*` (migration 110), la comparaison par
+      # `IS DISTINCT FROM` et la réécriture du relevé par
+      # `INSERT … ON CONFLICT DO UPDATE … WHERE`. Sans cette étape, l'épreuve
+      # prendrait son « saut annoncé » (garde `derive_des_garde_fous_2816`).
+      - name: Journal de synchro après un scan sur PostgreSQL (#8239)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test journal_apres_scan_pg_8239 -- --nocapture --test-threads=1
+
       # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
       # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
       # l'autre — et refuse toute colonne que le schema neuf a et qu'aucune
@@ -923,6 +933,22 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_source_7765 -- --nocapture --test-threads=1
 
+      # #7767 — « Écriture et production » et `credit_counts` de la page
+      # artiste sur PostgreSQL : branches `UNION`, `EXISTS` booléen,
+      # `COUNT(DISTINCT)`, `EXPLAIN` imprimé. Sans cette étape, l'épreuve
+      # prendrait son saut annoncé.
+      - name: Page artiste, écriture et compteurs sur PostgreSQL (#7767)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_page_artiste_7767 -- --nocapture --test-threads=1
+
+      # #7768 — « joue avec » de la page artiste sur PostgreSQL : fiche de
+      # crédit lue en texte ou en entier, garde `CAST`, nom sans casse en
+      # `LOWER`, `EXPLAIN` imprimé.
+      - name: Page artiste, joue avec sur PostgreSQL (#7768)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_page_artiste_joue_avec_7768 -- --nocapture --test-threads=1
       # #8026 — les crédits des balises pour la musique déjà scannée : le
       # rattrapage depuis `track_metadata` et le rattachement à la fiche par le
       # nom replié, joués sur la VRAIE base (`track_id` BIGINT ou TEXT).
@@ -1086,3 +1112,12 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_7983 -- --nocapture --test-threads=1
+
+      # #4201 — les requêtes UPnP qui cherchent un favori, sur un
+      # `favorites.item_id` BIGINT (PostgreSQL 18 migrée : « bigint = text »,
+      # premier import complet `partial`) puis TEXT (`PG_FULL_SCHEMA`). Dans des
+      # schémas à elle ; sans cette étape, l'épreuve prendrait son saut annoncé.
+      - name: Favoris des bibliothèques UPnP sur PostgreSQL (#4201)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_4201 -- --nocapture --test-threads=1

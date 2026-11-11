@@ -376,13 +376,15 @@ async fn sso_callback(
     // nouveau venu : exactement ce qu'elle est là pour empêcher.
     tune_core::cloud::proprietaire::adopter_le_compte_lie(&settings, &state.backend);
 
-    // Store cloud tokens in settings
-    settings
-        .set("mozaik_access_token", &token.access_token)
-        .ok();
-    if let Some(ref rt) = token.refresh_token {
-        settings.set("mozaik_refresh_token", rt).ok();
-    }
+    // Store cloud tokens in settings. #8238 : une session neuve lève
+    // « reconnexion requise » et le recul, sous le verrou des renouvellements
+    // — un renouvellement de l'ancien jeton encore en vol ne la reprend pas.
+    tune_core::cloud::sso::ouvrir_la_session(
+        &settings,
+        &token.access_token,
+        token.refresh_token.as_deref(),
+    )
+    .await;
     settings
         .set(
             "mozaik_user",
@@ -566,10 +568,15 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok());
+    // #8238 : le site a refusé le renouvellement de la session. Les jetons
+    // sont encore en base mais ne valent plus rien : le serveur n'est PAS
+    // connecté, et l'interface propose la connexion au compte.
+    let reconnect_required = connected && tune_core::cloud::sso::reconnexion_requise(&settings);
 
     Json(json!({
         "configured": configured,
-        "connected": connected,
+        "connected": connected && !reconnect_required,
+        "reconnect_required": reconnect_required,
         "user": user,
     }))
 }
@@ -613,6 +620,7 @@ async fn sso_disconnect(
     ] {
         settings.delete(key).ok();
     }
+    tune_core::cloud::sso::oublier_le_refus_de_session(&settings);
     state.license.clear_account_premium().await;
     // Founder endpoint order came from this account — revert to direct-first.
     state.license.set_qobuz_proxy_first(false).await;
@@ -1944,7 +1952,8 @@ mod tests_licence_proprietaire {
             .find("proprietaire::adopter_le_compte_lie(&settings, &state.backend)")
             .expect("la reprise des installations existantes a disparu");
         let ecrasement = source
-            .find(".set(\"mozaik_access_token\"")
+            // #8238 : le jeton s'ecrit par `sso::ouvrir_la_session`.
+            .find("sso::ouvrir_la_session(")
             .expect("l'ecriture du jeton a disparu");
         assert!(
             adoption < ecrasement,
