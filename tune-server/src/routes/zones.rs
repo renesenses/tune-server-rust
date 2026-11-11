@@ -190,6 +190,12 @@ struct PatchZone {
     /// Sans abonnement tenu, l'option ne fait rien : la sortie retombe sur le
     /// sondage complet plutôt que de servir un état inventé.
     upnp_silence: Option<bool>,
+    /// #8082 — « Flux continu entre les pistes » (zones DLNA) : une suite de
+    /// pistes de la bibliothèque de même format part en UN seul WAV, pour les
+    /// renderers qui raccordent mal deux pistes (Eversolo DMP-A8). Persisté en
+    /// setting `zone_{id}_dlna_flux_continu` ; défaut off, clé supprimée à la
+    /// désactivation. Pris à la lecture suivante.
+    dlna_flux_continu: Option<bool>,
     /// #2991 — « Envoyer le titre radio par DLNA (pour les lecteurs qui
     /// ignorent l'ICY) ». `"off"` (défaut), `"next"` (`SetNextAVTransportURI`,
     /// sans coupure) ou `"reload"` (`SetAVTransportURI` sur la même URI,
@@ -257,6 +263,14 @@ struct PatchZone {
     /// défaut off — sans lui Tune convertit et le DIT dans le chemin du
     /// signal. Pris en compte à la lecture suivante.
     strict_bitperfect: Option<bool>,
+
+    /// #3245 — mode exclusif de CETTE zone, pour l'appareil local qu'elle
+    /// joue. Persisté en setting `zone_{id}_exclusive_mode`. `null` efface :
+    /// la zone suit à nouveau le réglage de machine `local_exclusive_mode`.
+    /// Appliqué tout de suite si rien ne joue, sinon dès que la lecture rend
+    /// le périphérique (`exclusive_mode_applique` dans la fiche de zone).
+    #[serde(default, deserialize_with = "double_option")]
+    exclusive_mode: Option<Option<bool>>,
 }
 
 /// Une transition vers le volume fixe est une commande de volume à 100 %, pas
@@ -367,6 +381,14 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("upnp_silence".into(), json!(upnp_silence));
+    // #8082 — toujours publié : sa présence dit au client que ce serveur
+    // connaît le réglage.
+    obj.insert(
+        "dlna_flux_continu".into(),
+        json!(tune_core::outputs::dlna_flux_continu::active(
+            backend, zone_id
+        )),
+    );
     // #2991 — le titre radio par DIDL. TOUJOURS publié : sa présence dit au
     // client que ce serveur connaît le réglage.
     obj.insert(
@@ -392,6 +414,20 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("mono_downmix".into(), json!(mono_downmix));
+    // #3245 — le mode exclusif réglé sur la zone. TOUJOURS publié : `null`
+    // dit « la zone suit le réglage de machine ».
+    obj.insert(
+        "exclusive_mode".into(),
+        json!(
+            settings
+                .get(&tune_core::config::cle_exclusif_de_zone(zone_id))
+                .ok()
+                .flatten()
+                .map(|v| tune_core::config::demande_d_exclusif_de_la_zone(Some(&v), false))
+                .filter(|d| d.par_la_zone)
+                .map(|d| d.demande)
+        ),
+    );
     // #3973 — « bit-perfect strict ». TOUJOURS publié : sa présence est ce qui
     // dit au client que ce serveur connaît le réglage (un vieux serveur ne
     // l'a pas, et l'interrupteur n'apparaît pas).
@@ -1708,6 +1744,9 @@ mod signal_path_gain_sortie_4384_tests;
 // #6166 — le WAV 32 bits interne d'une sortie locale n'est pas une conversion.
 #[cfg(test)]
 mod signal_path_conteneur_local_6166_tests;
+// #8149 — zone réseau : le suréchantillonnage ne s'applique pas, et le dit.
+#[cfg(test)]
+mod signal_path_surechantillonnage_reseau_8149_tests;
 // #6334 — un AAC Tidal servi en WAV se dit AAC, sans profondeur de bits.
 #[cfg(test)]
 mod signal_path_aac_tidal_6334_tests;

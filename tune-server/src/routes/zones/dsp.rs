@@ -210,9 +210,10 @@ pub(super) static CONVOLVER_RESPONSE_CACHE: std::sync::OnceLock<
 ///
 /// The running convolver only keeps its IR in FFT-partitioned form, so the taps
 /// are re-read from the persisted IR file (`ir_path_{zone_id}` setting — same
-/// source of truth as `restore_convolvers` and the transcode path). Multi-
-/// channel IRs are summarised by channel 0: averaging L/R taps would let
-/// inter-channel phase differences cancel and distort the magnitude curve.
+/// source of truth as `restore_convolvers` and the transcode path). Each IR
+/// channel gets its own curve in `channels` (web#1427) — never an L/R average,
+/// whose inter-channel phase differences would cancel and distort the
+/// magnitude; `points` stays channel 0 for older clients.
 pub(super) async fn convolver_response(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -260,31 +261,7 @@ pub(super) async fn convolver_response(
     // not "handler on the async runtime" fast — compute on the blocking pool.
     let computed = tokio::task::spawn_blocking(move || -> Result<Value, String> {
         let (ir, sample_rate) = tune_core::audio::convolver::Convolver::read_ir_taps(&ir_path)?;
-        if sample_rate == 0 {
-            return Err("IR sample rate is 0".into());
-        }
-        let taps = &ir[0]; // channel 0 (see handler doc)
-        let f_hi = 20_000.0f64.min(sample_rate as f64 * 0.45);
-        let freqs = tune_core::audio::convolver::log_freq_grid(200, 20.0, f_hi);
-        let points: Vec<Value> =
-            tune_core::audio::convolver::fir_frequency_response(taps, sample_rate, &freqs)
-                .into_iter()
-                .map(|p| {
-                    json!({
-                        "f": (p.freq_hz * 10.0).round() / 10.0,
-                        "db": (p.magnitude_db * 100.0).round() / 100.0,
-                        "phase_deg": (p.phase_deg * 100.0).round() / 100.0,
-                    })
-                })
-                .collect();
-        let latency_ms = taps.len() as f64 / 2.0 / sample_rate as f64 * 1000.0;
-        Ok(json!({
-            "loaded": true,
-            "taps": taps.len(),
-            "sample_rate": sample_rate,
-            "latency_ms": (latency_ms * 10.0).round() / 10.0,
-            "points": points,
-        }))
+        reponse_du_convolueur(&ir, sample_rate)
     })
     .await;
 
@@ -313,6 +290,65 @@ pub(super) async fn convolver_response(
                 .into_response()
         }
     }
+}
+
+/// Les points de la courbe d'UN canal de l'IR.
+fn points_de_la_courbe(taps: &[f32], sample_rate: u32, freqs: &[f64]) -> Vec<Value> {
+    tune_core::audio::convolver::fir_frequency_response(taps, sample_rate, freqs)
+        .into_iter()
+        .map(|p| {
+            json!({
+                "f": (p.freq_hz * 10.0).round() / 10.0,
+                "db": (p.magnitude_db * 100.0).round() / 100.0,
+                "phase_deg": (p.phase_deg * 100.0).round() / 100.0,
+            })
+        })
+        .collect()
+}
+
+/// Le corps de `GET /zones/{id}/convolver/response` pour une IR déjà lue.
+///
+/// web#1427 (GgB, fil 1671) — avec une IR stéréo, seule la courbe du canal
+/// gauche s'affichait : la réponse résumait toute IR par son canal 0. Le
+/// convolueur, lui, applique l'IR canal par canal ; l'écran ne montrait donc
+/// pas ce que le canal droit subit. `channels` porte désormais une courbe par
+/// canal de l'IR, dans l'ordre du fichier (0 = gauche, 1 = droit). `points`,
+/// `taps` et `latency_ms` restent ceux du canal 0, pour les clients qui ne
+/// lisent pas `channels`.
+fn reponse_du_convolueur(ir: &[Vec<f32>], sample_rate: u32) -> Result<Value, String> {
+    let Some(premier) = ir.first() else {
+        return Err("IR sans canal".into());
+    };
+    if sample_rate == 0 {
+        return Err("IR sample rate is 0".into());
+    }
+    let f_hi = 20_000.0f64.min(sample_rate as f64 * 0.45);
+    let freqs = tune_core::audio::convolver::log_freq_grid(200, 20.0, f_hi);
+    let latence = |taps: &[f32]| {
+        let ms = taps.len() as f64 / 2.0 / sample_rate as f64 * 1000.0;
+        (ms * 10.0).round() / 10.0
+    };
+    let channels: Vec<Value> = ir
+        .iter()
+        .enumerate()
+        .map(|(canal, taps)| {
+            json!({
+                "channel": canal,
+                "taps": taps.len(),
+                "latency_ms": latence(taps),
+                "points": points_de_la_courbe(taps, sample_rate, &freqs),
+            })
+        })
+        .collect();
+    let points = channels[0]["points"].clone();
+    Ok(json!({
+        "loaded": true,
+        "taps": premier.len(),
+        "sample_rate": sample_rate,
+        "latency_ms": latence(premier),
+        "points": points,
+        "channels": channels,
+    }))
 }
 
 /// Les bornes du crossfeed, publiées pour que le bout des curseurs d'un client
@@ -712,3 +748,8 @@ pub(super) async fn eq_response(
 // `eq_refresh_guard` reconnaît comme module de test, pas comme une route.
 #[cfg(test)]
 mod replaygain_rendu_tests;
+
+// web#1427 — une courbe par canal de l'IR. `#[cfg(test)]` juste au-dessus du
+// `mod`, pour le garde-fou `eq_refresh_guard`.
+#[cfg(test)]
+mod courbe_fir_stereo_1427_tests;

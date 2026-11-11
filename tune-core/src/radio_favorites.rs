@@ -98,7 +98,7 @@ impl RadioFavoriteRepo {
         let off = offset as i64;
         let rows = self.db.query_many(
             "SELECT id, title, artist, station_name, cover_url, stream_url, saved_at \
-             FROM radio_favorites ORDER BY saved_at DESC LIMIT ?1 OFFSET ?2",
+             FROM radio_favorites ORDER BY saved_at DESC, id DESC LIMIT ?1 OFFSET ?2",
             &[&lim, &off],
         )?;
 

@@ -773,6 +773,32 @@ fn la_simulation_sans_micro_est_premium_et_ne_propose_que_des_coupes_prudentes()
     );
     assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
     assert_eq!(e["error"], "correction_refusee");
+    // #8332 : en mode expert, les bornes de la mesure sont acceptées, la
+    // correction ne fait toujours que couper et se dit expert.
+    assert_eq!(s["bornes_correction"]["prudentes"]["bandes_max"], 4);
+    assert_eq!(s["bornes_correction"]["expert"]["bandes_max"], 10);
+    assert_eq!(s["bornes_correction"]["expert"]["coupe_max_db"], 12.0);
+    let (code, p) = poster(
+        l(),
+        &format!("/simulations/{id}/correction"),
+        serde_json::json!({ "coupe_max_db": 12.0, "bandes_max": 10, "expert": true }),
+    );
+    assert_eq!(code, StatusCode::OK, "{p}");
+    assert_eq!(p["expert"], true);
+    assert!(p["gain_max_db"].as_f64().unwrap() <= 1e-9);
+    assert!(p["coupe_cumulee_db"].as_f64().unwrap() >= -12.0 - 1e-6);
+    assert!(
+        p["avertissements"][1]
+            .as_str()
+            .unwrap()
+            .starts_with("mode expert")
+    );
+    let (code, e) = poster(
+        l(),
+        &format!("/simulations/{id}/correction"),
+        serde_json::json!({ "coupe_max_db": 13.0, "expert": true }),
+    );
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
     let (code, _) = poster(
         l(),
         "/simulations/sim-999/correction",

@@ -160,6 +160,17 @@ pub struct DevialetAirOutput {
     volume_voulu: Mutex<f64>,
 }
 
+/// #8029 — un ampli retiré du registre sans `stop()` (disparu du réseau, zone
+/// supprimée) laissait sa tâche de diffusion envoyer des paquets UDP à l'ampli
+/// jusqu'à la fin du titre. Elle s'arrête avec la sortie.
+impl Drop for DevialetAirOutput {
+    fn drop(&mut self) {
+        if let Phase::Lecture(flux) = self.phase.get_mut() {
+            flux.tache.abort();
+        }
+    }
+}
+
 /// L'identifiant de flux suivant. Son octet de poids faible ne vaut jamais 0 :
 /// l'annonce l'utilise pour dire « aucun flux ».
 fn flux_suivant(compteur: &AtomicU32) -> u32 {

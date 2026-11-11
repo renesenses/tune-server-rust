@@ -505,27 +505,109 @@ pub(super) fn suit_la_cadence_source(
 }
 
 /// #7614 — la cadence que le greffon de suréchantillonnage obtient de ce
-/// périphérique, sans cpal : `None` sans choix, en bit-perfect strict, ou
-/// quand la liste de cadences n'est pas une MESURE (WASAPI partagé, ALSA
-/// `default`) — une liste supposée ne prouve pas que le DAC tourne à la
-/// cadence demandée. `accepte(r)` interroge l'énumération pour `r`.
+/// périphérique, sans cpal : refusée en bit-perfect strict, ou quand la liste
+/// de cadences n'est pas une MESURE (WASAPI partagé, ALSA `default`) — une
+/// liste supposée ne prouve pas que le DAC tourne à la cadence demandée.
+/// `accepte(r)` interroge l'énumération pour `r`.
+///
+/// #8149 — le refus dit POURQUOI. Un relevé de terrain (Eversolo DAC-Z8 en
+/// ALSA `hw:`, rc11) ne montrait que `local_audio_upsampler_not_applied`,
+/// sans rien pour départager le strict, l'énumération, le verdict de la
+/// machine ou les plafonds des réglages.
 pub(super) fn cadence_pour_le_surechantillonneur(
-    choix: Option<&crate::audio::surechantillonnage::ChoixSurechantillonnage>,
+    choix: &crate::audio::surechantillonnage::ChoixSurechantillonnage,
     evidence: super::resolution::SampleRateEvidence,
     strict_bitperfect: bool,
     source_sr: u32,
     accepte: impl Fn(u32) -> bool,
-) -> Option<u32> {
-    let choix = choix?;
-    if strict_bitperfect || !evidence.is_measured() || source_sr == 0 {
-        return None;
+) -> Result<u32, RefusDeCadenceDuGreffon> {
+    if strict_bitperfect {
+        return Err(RefusDeCadenceDuGreffon::BitPerfectStrict);
     }
-    let acceptees: Vec<u32> = crate::audio::surechantillonnage::CADENCES_CANDIDATES
+    if !evidence.is_measured() {
+        return Err(RefusDeCadenceDuGreffon::CadencesNonMesurees);
+    }
+    if source_sr == 0 {
+        return Err(RefusDeCadenceDuGreffon::SourceInconnue);
+    }
+    let candidates: Vec<u32> = crate::audio::surechantillonnage::CADENCES_CANDIDATES
         .iter()
         .copied()
-        .filter(|&r| r > source_sr && r % source_sr == 0 && accepte(r))
+        .filter(|&r| r > source_sr && r % source_sr == 0)
         .collect();
-    choix.negocier(source_sr, &acceptees)
+    let acceptees: Vec<u32> = candidates.iter().copied().filter(|&r| accepte(r)).collect();
+    if acceptees.is_empty() {
+        return Err(RefusDeCadenceDuGreffon::AucuneCandidateAcceptee { candidates });
+    }
+    if let Some(r) = choix.negocier(source_sr, &acceptees) {
+        return Ok(r);
+    }
+    let admises: Vec<u32> = acceptees
+        .iter()
+        .copied()
+        .filter(|&r| choix.verdict.admet(&choix.reglages.filter, r))
+        .collect();
+    if admises.is_empty() {
+        Err(RefusDeCadenceDuGreffon::RefuseesParLaMachine { acceptees })
+    } else {
+        Err(RefusDeCadenceDuGreffon::HorsDesPlafondsDesReglages { admises })
+    }
+}
+
+/// #8149 — pourquoi [`cadence_pour_le_surechantillonneur`] ne rend aucune
+/// cadence. Chaque variante porte les cadences qui ont passé l'étape
+/// précédente : le journal dit où la chaîne s'arrête.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RefusDeCadenceDuGreffon {
+    /// Bit-perfect strict : la zone refuse toute conversion.
+    BitPerfectStrict,
+    /// La liste de cadences du périphérique est supposée, pas mesurée.
+    CadencesNonMesurees,
+    /// Cadence source inconnue (0).
+    SourceInconnue,
+    /// Aucun multiple entier de la source n'est accepté par l'énumération
+    /// du périphérique. `candidates` : ce qui lui a été demandé.
+    AucuneCandidateAcceptee { candidates: Vec<u32> },
+    /// Le périphérique accepte `acceptees`, mais le test de la machine
+    /// n'admet le filtre réglé vers aucune d'elles.
+    RefuseesParLaMachine { acceptees: Vec<u32> },
+    /// Des cadences `admises` existent, mais les plafonds des réglages
+    /// (cadence ou rapport maximal) les écartent toutes.
+    HorsDesPlafondsDesReglages { admises: Vec<u32> },
+}
+
+impl RefusDeCadenceDuGreffon {
+    /// Code stable, pour le journal.
+    pub(super) fn code(&self) -> &'static str {
+        match self {
+            Self::BitPerfectStrict => "strict_bitperfect",
+            Self::CadencesNonMesurees => "rates_not_measured",
+            Self::SourceInconnue => "source_rate_unknown",
+            Self::AucuneCandidateAcceptee { .. } => "no_candidate_rate_accepted_by_device",
+            Self::RefuseesParLaMachine { .. } => "machine_test_rejects_accepted_rates",
+            Self::HorsDesPlafondsDesReglages { .. } => "settings_caps_exclude_admitted_rates",
+        }
+    }
+}
+
+/// #8149 — les plages que cpal énumère pour ce périphérique, en une ligne
+/// (`2ch 44100-768000 I32`…), pour le journal d'un refus.
+pub(super) fn plages_enumerees(device: &cpal::Device) -> String {
+    match device.supported_output_configs() {
+        Ok(configs) => configs
+            .map(|c| {
+                format!(
+                    "{}ch {}-{} {:?}",
+                    c.channels(),
+                    c.min_sample_rate(),
+                    c.max_sample_rate(),
+                    c.sample_format()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        Err(e) => format!("erreur: {e}"),
+    }
 }
 
 impl<'a> BackendCpal<'a> {
@@ -667,18 +749,40 @@ impl<'a> BackendCpal<'a> {
             // #7614 — le greffon de suréchantillonnage a négocié une cadence
             // que la liste MESURÉE du périphérique accepte : le flux s'ouvre
             // à cette cadence, c'est lui qui la porte (rubato ne tourne pas).
-            let pour_le_greffon = cadence_pour_le_surechantillonneur(
-                surechantillonnage,
-                rate_evidence,
-                demande.strict_bitperfect,
-                sample_rate,
-                |r| find_matching_config(&device, channels, r).is_some_and(|c| c.sample_rate == r),
-            )
-            .and_then(|r| {
-                find_matching_config(&device, channels, r)
-                    .filter(|c| c.sample_rate == r)
-                    .map(|c| (r, c))
-            });
+            let pour_le_greffon = surechantillonnage
+                .and_then(|choix| {
+                    cadence_pour_le_surechantillonneur(
+                        choix,
+                        rate_evidence,
+                        demande.strict_bitperfect,
+                        sample_rate,
+                        |r| {
+                            find_matching_config(&device, channels, r)
+                                .is_some_and(|c| c.sample_rate == r)
+                        },
+                    )
+                    .inspect_err(|refus| {
+                        // #8149 — la raison du refus, et ce que cpal
+                        // énumère : sans elles, un « non appliqué » de
+                        // terrain ne se départage pas.
+                        info!(
+                            source_sr = sample_rate,
+                            backend = %host_id_name,
+                            endpoint_id = %opened_endpoint_id,
+                            channels,
+                            raison = refus.code(),
+                            detail = ?refus,
+                            plages = %plages_enumerees(&device),
+                            "local_audio_upsampler_rate_refused"
+                        );
+                    })
+                    .ok()
+                })
+                .and_then(|r| {
+                    find_matching_config(&device, channels, r)
+                        .filter(|c| c.sample_rate == r)
+                        .map(|c| (r, c))
+                });
             if let Some((cible, cfg)) = pour_le_greffon {
                 info!(
                     source_sr = sample_rate,
@@ -1253,5 +1357,116 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             restant: ring.available(),
             position_alimentee_ms: fed_position_ms,
         }
+    }
+}
+
+#[cfg(test)]
+mod refus_de_cadence_du_greffon_8149_tests {
+    //! #8149 — un « suréchantillonnage non appliqué » dit à quelle étape la
+    //! cadence a été refusée (relevé Eversolo DAC-Z8, ALSA `hw:`, rc11).
+    use super::{RefusDeCadenceDuGreffon, cadence_pour_le_surechantillonneur};
+    use crate::audio::surechantillonnage::{
+        ChoixSurechantillonnage, MesureMachine, UpsamplerSettings, VerdictMachine,
+    };
+    use crate::outputs::local::resolution::SampleRateEvidence;
+
+    fn choix(admis: bool, max_rate_hz: Option<u32>) -> ChoixSurechantillonnage {
+        ChoixSurechantillonnage {
+            reglages: UpsamplerSettings {
+                enabled: true,
+                max_rate_hz,
+                ..Default::default()
+            },
+            verdict: VerdictMachine {
+                simd_path: "avx2+fma".into(),
+                margin: 3.0,
+                results: vec![MesureMachine {
+                    filter: "polyvalent".into(),
+                    from_hz: 44_100,
+                    to_hz: 352_800,
+                    realtime_factor: 10.0,
+                    admitted: admis,
+                }],
+                measured_at: 0,
+            },
+        }
+    }
+
+    const MESUREE: SampleRateEvidence = SampleRateEvidence::Measured;
+
+    #[test]
+    fn un_dac_qui_accepte_352_8_khz_l_obtient_8149() {
+        let r =
+            cadence_pour_le_surechantillonneur(&choix(true, None), MESUREE, false, 44_100, |_| {
+                true
+            });
+        assert_eq!(r, Ok(352_800));
+    }
+
+    #[test]
+    fn chaque_refus_dit_son_etape_8149() {
+        let c = choix(true, None);
+        assert_eq!(
+            cadence_pour_le_surechantillonneur(&c, MESUREE, true, 44_100, |_| true),
+            Err(RefusDeCadenceDuGreffon::BitPerfectStrict)
+        );
+        assert_eq!(
+            cadence_pour_le_surechantillonneur(
+                &c,
+                SampleRateEvidence::Unverified,
+                false,
+                44_100,
+                |_| true
+            ),
+            Err(RefusDeCadenceDuGreffon::CadencesNonMesurees)
+        );
+        assert_eq!(
+            cadence_pour_le_surechantillonneur(&c, MESUREE, false, 0, |_| true),
+            Err(RefusDeCadenceDuGreffon::SourceInconnue)
+        );
+        // L'énumération ne voit aucune cadence au-dessus de la source : la
+        // liste de ce qui lui a été demandé est dans le refus.
+        assert_eq!(
+            cadence_pour_le_surechantillonneur(&c, MESUREE, false, 44_100, |r| r == 44_100),
+            Err(RefusDeCadenceDuGreffon::AucuneCandidateAcceptee {
+                candidates: vec![88_200, 176_400, 352_800, 705_600],
+            })
+        );
+        // Le périphérique accepte, la machine n'admet pas le filtre.
+        assert_eq!(
+            cadence_pour_le_surechantillonneur(&choix(false, None), MESUREE, false, 44_100, |r| {
+                r <= 352_800
+            }),
+            Err(RefusDeCadenceDuGreffon::RefuseesParLaMachine {
+                acceptees: vec![88_200, 176_400, 352_800],
+            })
+        );
+        // Admises, mais sous un plafond de réglage plus bas que toutes.
+        assert_eq!(
+            cadence_pour_le_surechantillonneur(
+                &choix(true, Some(48_000)),
+                MESUREE,
+                false,
+                44_100,
+                |r| r <= 352_800
+            ),
+            Err(RefusDeCadenceDuGreffon::HorsDesPlafondsDesReglages {
+                admises: vec![88_200, 176_400, 352_800],
+            })
+        );
+    }
+
+    #[test]
+    fn les_codes_sont_distincts_8149() {
+        let codes = [
+            RefusDeCadenceDuGreffon::BitPerfectStrict.code(),
+            RefusDeCadenceDuGreffon::CadencesNonMesurees.code(),
+            RefusDeCadenceDuGreffon::SourceInconnue.code(),
+            RefusDeCadenceDuGreffon::AucuneCandidateAcceptee { candidates: vec![] }.code(),
+            RefusDeCadenceDuGreffon::RefuseesParLaMachine { acceptees: vec![] }.code(),
+            RefusDeCadenceDuGreffon::HorsDesPlafondsDesReglages { admises: vec![] }.code(),
+        ];
+        let uniques: std::collections::HashSet<_> = codes.iter().collect();
+        assert_eq!(uniques.len(), codes.len());
     }
 }

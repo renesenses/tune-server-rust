@@ -288,6 +288,84 @@ fn la_variante_la_plus_haute_qui_repond_est_retenue() {
     );
 }
 
+/// #7802 — le repli entre variantes est ANNONCÉ : quand la plus haute est
+/// refusée par le diffuseur (403 hors Royaume-Uni pour la BBC, ou 451), la
+/// source ouverte porte la bande déclarée de la variante retenue, et la
+/// bande et le statut de la variante refusée. Sans refus, rien à expliquer ;
+/// un 404 n'est pas un refus du diffuseur ; une liste média seule n'a pas
+/// de bande déclarée.
+#[test]
+fn le_repli_vers_une_variante_plus_basse_est_annonce_7802() {
+    use super::source::RefusDeVariante;
+    const MAITRESSE: &[u8] = b"#EXTM3U\n\
+#EXT-X-STREAM-INF:BANDWIDTH=339200,CODECS=\"mp4a.40.2\"\nlc320.m3u8\n\
+#EXT-X-STREAM-INF:BANDWIDTH=101760,AVERAGE-BANDWIDTH=98000,CODECS=\"mp4a.40.5\"\nhe96.m3u8\n";
+    let serveur_avec = |statut_320: u16| {
+        let routeur: Arc<fab::Routeur> = Arc::new(move |chemin: &str, _rang: usize| match chemin {
+            "/v/master.m3u8" => fab::ok(fab::TYPE_LISTE, MAITRESSE.to_vec()),
+            "/v/lc320.m3u8" if statut_320 == 200 => fab::ok(
+                fab::TYPE_LISTE,
+                fab::liste_media(1, 0, &[("lc.ts".into(), String::new(), false)], true),
+            ),
+            "/v/lc320.m3u8" => (statut_320, "text/plain", b"geo".to_vec()),
+            "/v/he96.m3u8" => fab::ok(
+                fab::TYPE_LISTE,
+                fab::liste_media(1, 0, &[("he.ts".into(), String::new(), false)], true),
+            ),
+            "/v/lc.ts" | "/v/he.ts" => fab::ok(fab::TYPE_TS, segment(7)),
+            _ => fab::introuvable(),
+        });
+        ServeurHls::lancer(routeur)
+    };
+    for (statut_320, bande_attendue, refus_attendu) in [
+        (
+            403,
+            Some(98),
+            Some(RefusDeVariante {
+                bande_kbps: 339,
+                statut: 403,
+            }),
+        ),
+        (
+            451,
+            Some(98),
+            Some(RefusDeVariante {
+                bande_kbps: 339,
+                statut: 451,
+            }),
+        ),
+        (200, Some(339), None),
+        (404, Some(98), None),
+    ] {
+        let serveur = serveur_avec(statut_320);
+        let source = HlsSource::ouvrir(&format!("{}/v/master.m3u8", serveur.base), None, rapides())
+            .unwrap_or_else(|e| panic!("HTTP {statut_320} sur la 320 : {e}"));
+        assert_eq!(
+            source.infos.bande_kbps, bande_attendue,
+            "HTTP {statut_320} sur la 320 : la bande déclarée de la variante retenue \
+             (AVERAGE-BANDWIDTH, sinon BANDWIDTH, en kbit/s)"
+        );
+        assert_eq!(
+            source.infos.refus, refus_attendu,
+            "HTTP {statut_320} sur la 320 : seul un refus du diffuseur (403, 451) est annoncé"
+        );
+    }
+    // Une liste média seule : rien n'est déclaré, rien n'est refusé.
+    let routeur: Arc<fab::Routeur> = Arc::new(|chemin: &str, _rang: usize| match chemin {
+        "/m/media.m3u8" => fab::ok(
+            fab::TYPE_LISTE,
+            fab::liste_media(1, 0, &[("m.ts".into(), String::new(), false)], true),
+        ),
+        "/m/m.ts" => fab::ok(fab::TYPE_TS, segment(7)),
+        _ => fab::introuvable(),
+    });
+    let serveur = ServeurHls::lancer(routeur);
+    let source =
+        HlsSource::ouvrir(&format!("{}/m/media.m3u8", serveur.base), None, rapides()).unwrap();
+    assert_eq!(source.infos.bande_kbps, None);
+    assert_eq!(source.infos.refus, None);
+}
+
 /// Erreurs réseau : un segment répond 500 deux fois puis 200 (repris, pas
 /// de trou) ; la liste échoue deux fois (absorbé) ; un segment est perdu
 /// pour de bon (sauté, et le direct continue après lui).
