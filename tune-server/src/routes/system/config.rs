@@ -4534,6 +4534,10 @@ const METADATA_FIELDS: &[(&str, &str, &str, &str)] = &[
     // Crédits
     ("composer", "Compositeur", "Crédits", "both"),
     ("conductor", "Chef d'orchestre", "Crédits", "both"),
+    // #8325 — servis par les listes de pistes (`facettes_classiques`).
+    ("ensemble", "Ensemble / orchestre", "Crédits", "both"),
+    ("work", "Œuvre", "Crédits", "both"),
+    ("movement", "Mouvement", "Crédits", "track"),
     ("lyricist", "Parolier", "Crédits", "both"),
     ("performer", "Interprète", "Crédits", "both"),
     ("remixer", "Remixeur", "Crédits", "both"),

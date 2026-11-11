@@ -96,6 +96,10 @@ pub(super) fn track_filter_from_raw(raw: Option<&str>) -> Result<TrackFilter, Ap
         labels: texts("label"),
         composers: texts("composer"),
         instruments: texts("instrument"),
+        // #8325 — `?conductor=…&ensemble=…&work=…`, clé répétée.
+        conductors: texts("conductor"),
+        ensembles: texts("ensemble"),
+        works: texts("work"),
         artists: texts("artist"),
         countries: texts("country"),
         moods: texts("mood"),

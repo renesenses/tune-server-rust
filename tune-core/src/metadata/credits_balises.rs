@@ -122,6 +122,43 @@ pub fn completer_par_les_cles_brutes(
     }
 }
 
+/// #8325 — la clé brute BAND (Vorbis, APE, `TXXX:BAND`, atome MP4 libre).
+///
+/// foobar2000 et Mp3tag appellent « band » la trame ID3 TPE2, c'est-à-dire
+/// l'ARTISTE D'ALBUM ; un classique range au contraire son orchestre sous
+/// BAND (« %band% » à côté de « %conductor% »). BAND n'est donc lu comme
+/// ensemble que s'il DIFFÈRE de l'artiste d'album ET de l'artiste de la piste
+/// du fichier : égal à l'un d'eux, c'est un artiste sous un autre nom (le
+/// groupe d'un disque de rock), et il n'entre pas dans la facette.
+/// L'artiste d'album n'est jamais touché ici.
+pub const CLE_BAND: &str = "BAND";
+
+/// Ajoute à `ensemble` les valeurs BAND de `brutes` qui ne sont aucun des
+/// `artistes` (album, piste ; casse ignorée). Voir [`CLE_BAND`].
+pub fn completer_par_band(
+    meta: &mut HashMap<String, String>,
+    brutes: &[(String, String)],
+    artistes: &[Option<&str>],
+) {
+    let artistes: Vec<String> = artistes
+        .iter()
+        .flatten()
+        .map(|a| a.trim().to_lowercase())
+        .filter(|a| !a.is_empty())
+        .collect();
+    for (cle, valeur) in brutes {
+        if super::balises_brutes::nom_de_cle(cle) != CLE_BAND {
+            continue;
+        }
+        if artistes.contains(&valeur.trim().to_lowercase()) {
+            continue;
+        }
+        for v in valeur.split(';') {
+            ajouter(meta, "ensemble", v);
+        }
+    }
+}
+
 /// Sépare « Nom (instrument) » en ses deux parties.
 ///
 /// Le découpage se fait à la DERNIÈRE parenthèse ouvrante : « Orchestre
