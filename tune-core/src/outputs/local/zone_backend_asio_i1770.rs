@@ -89,7 +89,7 @@ fn le_mode_exclusif_reste_celui_qu_on_a_recu() {
     let sortie = LocalOutput::with_options_and_endpoint("Speakers".to_string(), None, true, "asio")
         .with_origin_host("WASAPI");
     assert!(
-        sortie.exclusive_mode,
+        sortie.mode_exclusif(),
         "rectifier le backend ne doit pas décider à la place de \
          l'utilisateur ce que vaut le mode exclusif"
     );

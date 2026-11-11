@@ -614,6 +614,16 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
             tune_core::db::rattrapage_dates_ajout_2138::rattrapage_journalise(&backend);
         });
     }
+    // #8026 — les crédits lus dans les balises pour la musique déjà scannée :
+    // une fois, dérivés de `track_metadata` (aucun fichier rouvert), puis à
+    // chaque démarrage les lignes `balises` sans fiche rattachées par le nom
+    // replié. Hors du chemin du démarrage ; une erreur se journalise.
+    {
+        let backend = state.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            tune_core::metadata::rattrapage_credits_balises_8026::passes_journalisees(&backend);
+        });
+    }
     cleanup_orphan_queues(state);
     reconcile_favorites(state);
     recalculer_les_compilations(state);
@@ -2516,11 +2526,14 @@ pub(crate) async fn enregistrer_les_sorties_locales(
         // la même raison : sans elle, un nom WASAPI héritait de l'exclusif
         // imposé par ASIO et Tune ouvrait WASAPI en mode exclusif, coupant
         // le son de toutes les autres applications de la machine.
+        // #3245 — la DEMANDE aussi est celle de la zone qui joue cet appareil,
+        // le réglage de machine ne servant plus que de repli.
+        let demande_de_zone = state.demande_d_exclusif_de_l_appareil(&device_id, exclusive_demande);
         let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
             audio_backend,
             Some(dev.backend.as_str()),
-            exclusive_demande,
-            exclusif_arme_par_asio,
+            demande_de_zone.demande,
+            tune_core::config::temoin_asio_pour_la_demande(exclusif_arme_par_asio, demande_de_zone),
         );
         let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
             dev.name.clone(),
@@ -2532,7 +2545,8 @@ pub(crate) async fn enregistrer_les_sorties_locales(
         info!(
             device_id = %device_id,
             hote_origine = %dev.backend,
-            demande = exclusive_demande,
+            demande = demande_de_zone.demande,
+            demande_par_la_zone = demande_de_zone.par_la_zone,
             effectif = statut_exclusif.effective,
             impose = statut_exclusif.forced,
             "local_output_exclusive_mode_par_peripherique"
