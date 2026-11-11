@@ -2812,17 +2812,17 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     // donne aucun) et `artists.country_mbid`, le MBID dont il a été lu — un
     // MBID changé ou retiré rend le pays caduc sans autre écriture. Colonnes
     // posées dans le bloc de version et dans la passe finale (même règle qu'à
-    // la 133). Jumelle PG : 110. Numérotée 144 / PG 110 au 10/11 ; d'autres PR
-    // ouvertes réclament aussi 110 : celle qui fusionne après se renumérote.
+    // la 133). Jumelle PG : 112. Renumérotée 146 / PG 112 le 11/11, ordre du lot :
+    // #8243 144/110, #8334 145/111, puis #8090 146/112.
     Migration {
-        version: 144,
+        version: 146,
         name: "artists_country",
         up: "",
     },
 ];
 
 /// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
-/// de la 144 et passe finale.
+/// de la 146 et passe finale.
 fn pays_des_artistes(db: &SqliteDb) {
     add_column_if_missing(db, "artists", "country", "TEXT");
     add_column_if_missing(db, "artists", "country_mbid", "TEXT");
@@ -4298,7 +4298,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // #8088 — le marquage explicite de la balise, et son index.
             marquage_explicite_des_pistes(db);
         }
-        if migration.version == 144 {
+        if migration.version == 146 {
             // #8090 — le pays de l'artiste. NULL pour l'existant : la passe
             // de fond le lit sur MusicBrainz.
             pays_des_artistes(db);
@@ -4925,8 +4925,8 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // La provenance du MBID d'artiste (migration 133, #6463) — posée ICI
     // aussi : le scan, l'enrichissement et la fiche la NOMMENT. PG : 097.
     add_column_if_missing(db, "artists", "musicbrainz_id_source", "TEXT");
-    // Le pays de l'artiste (migration 144, #8090) — posé ICI aussi : les
-    // facettes et la passe de fond le NOMMENT. PG : 110.
+    // Le pays de l'artiste (migration 146, #8090) — posé ICI aussi : les
+    // facettes et la passe de fond le NOMMENT. PG : 112.
     pays_des_artistes(db);
     // L'ordre des rayons (migration 134, #6779) — posé ICI aussi : toute
     // lecture des dossiers de collections la NOMME. PG : 098.
@@ -5993,12 +5993,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
              VALUES (109, 'correction_pure_classix') \
              ON CONFLICT (version) DO NOTHING;\n"
         ),
-    ), // Jumelle de la SQLite 144 (#8090) : `artists.country` et
+    ), // Jumelle de la SQLite 146 (#8090) : `artists.country` et
     // `artists.country_mbid`, le pays de l'artiste lu sur MusicBrainz.
     (
-        110,
+        112,
         "artists_country",
-        include_str!("../../migrations/postgres/110_artists_country.sql"),
+        include_str!("../../migrations/postgres/112_artists_country.sql"),
     ),
 ];
 
@@ -9683,10 +9683,10 @@ mod tests {
         // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
         // Migration de DONNÉES : le nom, le pays et le genre de la station
         // semée sous « PureClassic Radio ».
-        // 110 : `artists_country` (#8090), jumelle de la SQLite 144. Pose
+        // 112 : `artists_country` (#8090), jumelle de la SQLite 146. Pose
         // `artists.country` et `artists.country_mbid`, que les facettes et la
         // passe de fond NOMMENT.
-        assert_eq!(pg_latest_version(), 110, "latest PG migration must be 110");
+        assert_eq!(pg_latest_version(), 112, "latest PG migration must be 112");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

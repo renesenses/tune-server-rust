@@ -1038,7 +1038,7 @@ jobs:
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_date_relative_6122 -- --nocapture --test-threads=1
 
       # #8090 — la carte et le filtre Pays : pays de l'artiste principal
-      # (`artists.country`, PG 110) et pays d'édition, comptés en albums
+      # (`artists.country`, PG 112) et pays d'édition, comptés en albums
       # (`COUNT(DISTINCT …)`), filtre `artist_country`, par le vrai routeur.
       # Sans cette étape, l'épreuve prendrait son « saut annoncé ».
       - name: Pays de l'artiste sur PostgreSQL (#8090)

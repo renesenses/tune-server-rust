@@ -641,7 +641,7 @@ CREATE TABLE IF NOT EXISTS artists (
     -- Provenance du MBID (migration 133, #6463) : balise, nom, pressage,
     -- manuel ; NULL = inconnue.
     musicbrainz_id_source TEXT,
-    -- Pays de l'artiste lu sur MusicBrainz (migration 144, #8090) : code ISO
+    -- Pays de l'artiste lu sur MusicBrainz (migration 146, #8090) : code ISO
     -- 3166-1 alpha-2, '' si MusicBrainz n'en donne aucun ; et le MBID dont il
     -- a ete lu.
     country TEXT,

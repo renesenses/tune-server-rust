@@ -416,8 +416,8 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // #6463 — la provenance du MBID d'artiste (PG 097). Ici AUSSI : une base
     // de bascule ne rejoue pas la 097, et le scan comme la fiche la NOMMENT.
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS musicbrainz_id_source TEXT",
-    // #8090 — le pays de l'artiste et le MBID dont il a été lu (PG 110). Ici
-    // AUSSI : une base de bascule ne rejoue pas la 110, et les facettes comme
+    // #8090 — le pays de l'artiste et le MBID dont il a été lu (PG 112). Ici
+    // AUSSI : une base de bascule ne rejoue pas la 112, et les facettes comme
     // la passe de fond les NOMMENT.
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS country TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS country_mbid TEXT",
