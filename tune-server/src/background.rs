@@ -2420,6 +2420,12 @@ async fn refresh_account_premium(
         Some(t) if !t.is_empty() => t,
         _ => return, // not connected — nothing to refresh
     };
+    // #8238 : la session a été refusée par le site ; rien ne repart avant une
+    // nouvelle connexion (l'état est rendu par GET /cloud/sso/status).
+    if tune_core::cloud::sso::reconnexion_requise(&settings) {
+        debug!("mozaik_account_refresh_skipped_reconnect_required");
+        return;
+    }
 
     let client_id = settings
         .get("mozaik_client_id")
@@ -2458,25 +2464,10 @@ async fn refresh_account_premium(
         }
         ProfilCloud::Echec(e) => {
             debug!(error = %e, "mozaik_user_fetch_failed");
-            let refresh = settings
-                .get("mozaik_refresh_token")
-                .ok()
-                .flatten()
-                .filter(|s| !s.is_empty());
-            match refresh {
-                Some(rt) => match auth.refresh_token(&rt).await {
-                    Ok(tok) => {
-                        settings.set("mozaik_access_token", &tok.access_token).ok();
-                        if let Some(ref new_rt) = tok.refresh_token {
-                            settings.set("mozaik_refresh_token", new_rt).ok();
-                        }
-                        auth.get_user(&settings, &tok.access_token).await.profil()
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "mozaik_token_refresh_failed");
-                        None
-                    }
-                },
+            // #8238 : le renouvellement UNIQUE du serveur — verrou, jeton
+            // déjà renouvelé par une autre tâche, arrêt après un refus du site.
+            match tune_core::cloud::sso::renouveler_la_session(&settings, &token).await {
+                Some(nouveau) => auth.get_user(&settings, &nouveau).await.profil(),
                 None => None,
             }
         }
