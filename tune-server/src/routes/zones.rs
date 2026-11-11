@@ -263,6 +263,14 @@ struct PatchZone {
     /// défaut off — sans lui Tune convertit et le DIT dans le chemin du
     /// signal. Pris en compte à la lecture suivante.
     strict_bitperfect: Option<bool>,
+
+    /// #3245 — mode exclusif de CETTE zone, pour l'appareil local qu'elle
+    /// joue. Persisté en setting `zone_{id}_exclusive_mode`. `null` efface :
+    /// la zone suit à nouveau le réglage de machine `local_exclusive_mode`.
+    /// Appliqué tout de suite si rien ne joue, sinon dès que la lecture rend
+    /// le périphérique (`exclusive_mode_applique` dans la fiche de zone).
+    #[serde(default, deserialize_with = "double_option")]
+    exclusive_mode: Option<Option<bool>>,
 }
 
 /// Une transition vers le volume fixe est une commande de volume à 100 %, pas
@@ -406,6 +414,20 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("mono_downmix".into(), json!(mono_downmix));
+    // #3245 — le mode exclusif réglé sur la zone. TOUJOURS publié : `null`
+    // dit « la zone suit le réglage de machine ».
+    obj.insert(
+        "exclusive_mode".into(),
+        json!(
+            settings
+                .get(&tune_core::config::cle_exclusif_de_zone(zone_id))
+                .ok()
+                .flatten()
+                .map(|v| tune_core::config::demande_d_exclusif_de_la_zone(Some(&v), false))
+                .filter(|d| d.par_la_zone)
+                .map(|d| d.demande)
+        ),
+    );
     // #3973 — « bit-perfect strict ». TOUJOURS publié : sa présence est ce qui
     // dit au client que ce serveur connaît le réglage (un vieux serveur ne
     // l'a pas, et l'interrupteur n'apparaît pas).
@@ -1750,6 +1772,9 @@ mod patch_zone_deserialize_tests;
 
 #[cfg(test)]
 mod zone_group_tests;
+
+#[cfg(test)]
+mod groupe_asio_refuse_7759_tests;
 
 #[cfg(test)]
 mod aac_passthrough_tests;

@@ -177,3 +177,30 @@ fn banc_7767_page_artiste_sous_300_ms_sur_3_millions_de_credits() {
         "page artiste trop lente : sections {sections:?} / {sections_idx:?}, compteurs {comptes:?} / {comptes_idx:?}"
     );
 }
+
+/// #7768 — « joue avec » sur le même banc, et la page entière (sections,
+/// compteurs, joue avec) toujours sous 300 ms, sans index de rôle :
+///
+///     cargo test -p tune-core --lib banc_7768 -- --ignored --nocapture
+#[test]
+#[ignore]
+fn banc_7768_joue_avec_et_page_entiere_sous_300_ms() {
+    use crate::metadata::credits_joue_avec::joue_avec;
+    let b = banc();
+    let _ = joue_avec(&b, CIBLE);
+    let debut = Instant::now();
+    let liste = joue_avec(&b, CIBLE);
+    let joue = debut.elapsed();
+    let (sections, comptes) = mesurer(&b, "page entière, sans index de rôle");
+    let page = sections + comptes + joue;
+    eprintln!(
+        "joue avec : {joue:?} ({} retenus, tête {:?}) ; page entière {page:?}",
+        liste.len(),
+        liste.first()
+    );
+    assert_eq!(liste.len(), 20, "le banc doit remplir les 20 places");
+    assert!(
+        page < Duration::from_millis(300),
+        "page artiste trop lente avec joue avec : {page:?} (joue avec {joue:?})"
+    );
+}

@@ -618,7 +618,7 @@ pub async fn passe(
                             }
                         } else if statut == 401 && !session_rafraichie {
                             session_rafraichie = true;
-                            if let Some(c) = sc::rafraichir(&settings).await {
+                            if let Some(c) = sc::rafraichir(&settings, &compte.acces).await {
                                 compte = c;
                                 continue;
                             }

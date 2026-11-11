@@ -19,6 +19,7 @@ use crate::outputs::traits::{
 
 mod appairage_refuse_8347;
 pub mod composant_manquant_7084;
+mod piste_suivante_8420;
 mod reprise_apres_coupure_7921;
 mod session_en_panne_7823;
 pub mod volume_de_depart_8402;
@@ -67,6 +68,10 @@ pub struct Airplay2Output {
     /// Délai d'abandon d'une attente de code (#8060), [`ATTENTE_DU_CODE`]
     /// hors bancs d'essai.
     delai_du_code: Duration,
+    /// Un `play` est parti sur la connexion que tient le démon : il y a fait
+    /// son `setup`, et la session RTSP n'est plus en `Paired`. La piste
+    /// suivante la referme et en rouvre une neuve avant son `play` (#8420).
+    session_consommee: Arc<AtomicBool>,
     /// Dernier refus d'appairage du récepteur (#8347) : pendant
     /// `delai_apres_un_refus`, la lecture le redit sans recontacter
     /// l'enceinte.
@@ -81,6 +86,13 @@ pub struct Airplay2Output {
     /// (`submit_pin`) : son refus est un mauvais code, pas un refus du code
     /// par défaut, et ne bloque pas la lecture (#8347).
     connect_par_code: Arc<AtomicBool>,
+    /// #8402 (11/11) — la zone est en PURE verrouillé : une session neuve
+    /// part à 0 %, jamais à 100 % (le volume fixe, lui, garde ses 100 %). Posé par
+    /// l'orchestrateur avant chaque piste, et par la graine de la découverte.
+    volume_tenu_par_la_zone: Arc<AtomicBool>,
+    /// #8402 (11/11) — la dernière lecture a ouvert sa session à 0 % parce
+    /// que la zone est en PURE verrouillé : l'orchestrateur le dit.
+    depart_muet: Arc<AtomicBool>,
 }
 
 /// #8060 — une attente de code PIN : depuis quand, et si le récepteur
@@ -133,15 +145,27 @@ struct DaemonProcess {
 /// disparue du réseau, zone supprimée) laissait son démon tourner, orphelin,
 /// jusqu'à l'arrêt du serveur. Le démon meurt désormais avec la sortie qui le
 /// tient.
+///
+/// #8347 — le démon range ses identités d'appairage dans les données de
+/// Tune ([`identites_du_demon_8347`]) pour les relire (pair-verify).
 fn commande_du_demon(binary: &str) -> Command {
+    commande_du_demon_avec(binary, identites_du_demon_8347::pour_ce_serveur())
+}
+
+fn commande_du_demon_avec(binary: &str, identites: Option<PathBuf>) -> Command {
     let mut commande = Command::new(binary);
     commande
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    if let Some(dossier) = identites {
+        commande.env(identites_du_demon_8347::VARIABLE, dossier);
+    }
     commande
 }
+
+mod identites_du_demon_8347;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransportConfirmation {
@@ -202,10 +226,13 @@ impl Airplay2Output {
             panne: Arc::new(Mutex::new(None)),
             connexion_perdue: Arc::new(AtomicBool::new(false)),
             delai_du_code: ATTENTE_DU_CODE,
+            session_consommee: Arc::new(AtomicBool::new(false)),
             refus_d_appairage: Arc::new(Mutex::new(None)),
             delai_apres_un_refus: appairage_refuse_8347::DELAI_APRES_UN_REFUS,
             session_a_rouvrir: Arc::new(AtomicBool::new(false)),
             connect_par_code: Arc::new(AtomicBool::new(false)),
+            volume_tenu_par_la_zone: Arc::new(AtomicBool::new(false)),
+            depart_muet: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -265,7 +292,18 @@ impl Airplay2Output {
                                 // ni session coincée à lâcher.
                                 *refus_d_appairage.lock().await = None;
                                 session_a_rouvrir.store(false, Ordering::SeqCst);
-                                debug!(device = %device_name, "airplay2: connected/paired");
+                                // #8347 — `auth` (démon airplay2-rs#4) : pair_verify,
+                                // transient ou pin_pairing. Absent d'un ancien démon.
+                                match ev["auth"].as_str() {
+                                    Some(auth) => info!(
+                                        device = %device_name,
+                                        auth,
+                                        "airplay2: connected"
+                                    ),
+                                    None => {
+                                        debug!(device = %device_name, "airplay2: connected/paired")
+                                    }
+                                }
                                 Some(TransportConfirmation::Connected)
                             }
                             "playing" => {
@@ -367,7 +405,20 @@ impl Airplay2Output {
                                     *phase = PairingPhase::Failed(msg.clone());
                                 }
                                 drop(phase);
-                                warn!(device = %device_name, error = %msg, "airplay2: daemon error");
+                                // #8347 — le code TLV du refus d'appairage, quand
+                                // le démon l'envoie (2 authentication, 3 backoff…).
+                                if let Some(code) = ev["tlv_error"].as_u64() {
+                                    warn!(
+                                        device = %device_name,
+                                        error = %msg,
+                                        tlv_error = code,
+                                        tlv_error_name = ev["tlv_error_name"].as_str().unwrap_or(""),
+                                        pairing_step = ev["pairing_step"].as_str().unwrap_or(""),
+                                        "airplay2: receiver refused pairing"
+                                    );
+                                } else {
+                                    warn!(device = %device_name, error = %msg, "airplay2: daemon error");
+                                }
                                 None
                             }
                             _ => None,
@@ -519,11 +570,25 @@ impl Airplay2Output {
             // établie : le démon la garde, coincée après la phase 1, et un
             // nouveau `play` finirait en « Cannot process phase 1 from state
             // SetupPhase1 ». On la lâche et on en rouvre une neuve.
-            if self.session_a_rouvrir.swap(false, Ordering::SeqCst) {
-                info!(
-                    device = %self.name,
-                    "airplay2: the previous setup failed, dropping that session before reconnecting"
-                );
+            //
+            // #8420 — de même après une lecture : le démon refait `setup` à
+            // chaque `play`, et la session d'un titre déjà joué est en
+            // `Playing` (« Cannot process phase 1 from state Playing ») : la
+            // piste suivante repart elle aussi d'une connexion neuve.
+            let setup_manque = self.session_a_rouvrir.swap(false, Ordering::SeqCst);
+            let session_consommee = self.session_consommee.swap(false, Ordering::SeqCst);
+            if setup_manque || session_consommee {
+                if setup_manque {
+                    info!(
+                        device = %self.name,
+                        "airplay2: the previous setup failed, dropping that session before reconnecting"
+                    );
+                } else {
+                    info!(
+                        device = %self.name,
+                        "airplay2: the session already played a track, reopening it for the next one"
+                    );
+                }
                 if let Some(daemon) = proc.as_mut() {
                     daemon
                         .send_cmd(&serde_json::json!({"cmd": "disconnect"}))
@@ -751,10 +816,14 @@ impl OutputTarget for Airplay2Output {
         // Le daemon n'ouvre qu'un FICHIER : il faut le lui fournir AVANT de
         // le lancer, et refuser tot ce qu'il ne saura pas lire (#2169).
         let lisible = chemin_lisible_par_le_daemon(media, &self.device_id).await?;
+        // #8402 (11/11) — relevé AVANT `ensure_connected`, qui l'ouvrirait.
+        let session_neuve = !self.session_deja_ouverte().await;
         if let Err(error) = self.ensure_connected().await {
             lisible.oublier().await;
             return Err(error);
         }
+        self.partir_muet_si_la_zone_tient_le_volume(session_neuve)
+            .await;
         // #8402 — le démon envoie au récepteur, au départ du flux, le volume
         // qu'il tient (1.0 = 0 dB dans une `Connection` neuve) : il reçoit
         // d'abord celui de la zone. Il traite ses commandes une à une, donc
@@ -822,6 +891,9 @@ impl OutputTarget for Airplay2Output {
         // puis retombait a zero, sans un son ni une erreur pour l'utilisateur.
         let path = lisible.chemin.to_string_lossy().into_owned();
         *self.panne.lock().await = None;
+        // #8420 — posé AVANT l'envoi : même sans réponse, le démon a pu
+        // faire son `setup` sur cette connexion.
+        self.session_consommee.store(true, Ordering::SeqCst);
         if let Err(error) = self
             .send_confirmed(
                 &serde_json::json!({
@@ -891,6 +963,8 @@ impl OutputTarget for Airplay2Output {
         self.connexion_perdue.store(false, Ordering::SeqCst);
         // #8347 — le démon meurt avec sa connexion coincée.
         self.session_a_rouvrir.store(false, Ordering::SeqCst);
+        // #8420 — et avec la session déjà jouée.
+        self.session_consommee.store(false, Ordering::SeqCst);
         self.send(&serde_json::json!({"cmd": "stop"})).await.ok();
         self.send(&serde_json::json!({"cmd": "disconnect"}))
             .await

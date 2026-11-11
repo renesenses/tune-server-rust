@@ -1,5 +1,6 @@
 mod boucle_locale_5639;
 mod lecture_http;
+mod retard_de_depart_8437;
 use lecture_http::LecteurHttpAnnulable;
 
 use std::cell::UnsafeCell;
@@ -357,6 +358,44 @@ pub(crate) fn decider_la_relache_du_peripherique(
     }
 }
 
+/// #3245 — ce qu'une demande de changement de mode exclusif a donné.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangementDExclusif {
+    /// La sortie était déjà dans ce mode.
+    Inchange,
+    /// Le mode est changé : la prochaine ouverture du périphérique le suit.
+    Applique,
+    /// Un fil de lecture tient le périphérique : rien n'a changé.
+    DiffereEnLecture,
+}
+
+impl ChangementDExclusif {
+    /// Code stable, pour le journal et les réponses de l'API.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Inchange => "inchange",
+            Self::Applique => "applique",
+            Self::DiffereEnLecture => "differe_en_lecture",
+        }
+    }
+}
+
+/// #3245 — la règle de [`LocalOutput::changer_de_mode_exclusif_au_repos`],
+/// sans périphérique.
+pub fn decider_le_changement_d_exclusif(
+    actuel: bool,
+    voulu: bool,
+    peripherique_tenu: bool,
+) -> ChangementDExclusif {
+    if actuel == voulu {
+        ChangementDExclusif::Inchange
+    } else if peripherique_tenu {
+        ChangementDExclusif::DiffereEnLecture
+    } else {
+        ChangementDExclusif::Applique
+    }
+}
+
 /// Dit « ce fil vit encore » aussi longtemps qu'il existe.
 ///
 /// Déclarée en PREMIER dans le fil de lecture, elle est donc détruite en
@@ -678,7 +717,14 @@ pub struct LocalOutput {
     sentinelle_du_fil: std::sync::Mutex<Option<Arc<AtomicBool>>>,
     /// When true (and on macOS), use CoreAudio exclusive/hog mode for
     /// bit-perfect output, bypassing the system mixer.
-    exclusive_mode: bool,
+    ///
+    /// #3245 — atomique, et non plus figé à la construction : le mode
+    /// exclusif se règle désormais PAR ZONE, et un changement de réglage doit
+    /// atteindre la sortie déjà enregistrée sans la reconstruire (volume, EQ,
+    /// crossfeed et DSP installés y vivent). Il ne change qu'AU REPOS
+    /// ([`Self::changer_de_mode_exclusif_au_repos`]) : chaque lecture le relit à
+    /// son ouverture, jamais pendant qu'un flux tient le périphérique.
+    exclusive_mode: AtomicBool,
     /// Audio backend preference: "auto", "wasapi", or "asio" (Windows only).
     audio_backend: String,
     /// Set by stop() to immediately silence the cpal callback, even if
@@ -823,6 +869,10 @@ pub struct LocalOutput {
     /// B), ou `None`. Posée par piste par l'orchestrateur depuis
     /// `zone_{id}_sortie_double`, lue une fois par `play_url`.
     seconde_sortie: std::sync::Mutex<Vec<crate::outputs::sortie_double::SecondeSortieDemandee>>,
+    /// #8437 — retard de départ (ms) de la zone qui va jouer : son
+    /// `sync_delay_ms` quand elle est groupée avec une zone réseau, sinon 0.
+    /// Posé par l'orchestrateur à chaque lecture, lu une fois par `play_url`.
+    retard_de_depart_ms: AtomicU64,
     /// Optional headphone crossfeed effect, applied AFTER the convolver on the
     /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
     /// PURE) and only when the stream is stereo. Set per-play by the
@@ -1349,6 +1399,38 @@ impl LocalOutput {
         self.origin_host.as_deref()
     }
 
+    /// #3245 — le mode exclusif sous lequel la PROCHAINE ouverture du
+    /// périphérique se fera.
+    pub fn mode_exclusif(&self) -> bool {
+        self.exclusive_mode.load(Ordering::Acquire)
+    }
+
+    /// #3245 — applique un nouveau mode exclusif, seulement si aucun fil de
+    /// lecture ne tient le périphérique.
+    ///
+    /// Le mode est lu à l'ouverture du flux (choix du bras WASAPI, ASIO,
+    /// CoreAudio ou partagé) et par des questions posées en cours de lecture
+    /// (« ce bras sait-il enchaîner, fondre ? »). Le changer sous un flux
+    /// ouvert ferait répondre ces questions pour un bras qui ne joue pas.
+    /// Pendant une lecture, rien ne change et l'appelant réessaie plus tard.
+    pub fn changer_de_mode_exclusif_au_repos(&self, voulu: bool) -> ChangementDExclusif {
+        let fil_vivant = self
+            .sentinelle_du_fil
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::SeqCst));
+        let changement = decider_le_changement_d_exclusif(
+            self.mode_exclusif(),
+            voulu,
+            fil_vivant || self.playing.load(Ordering::SeqCst),
+        );
+        if changement == ChangementDExclusif::Applique {
+            self.exclusive_mode.store(voulu, Ordering::Release);
+        }
+        changement
+    }
+
     /// Create a local output bound to the stable backend endpoint discovered
     /// alongside its display name.
     pub fn with_options_and_endpoint(
@@ -1387,7 +1469,7 @@ impl LocalOutput {
             stop_tx: std::sync::Mutex::new(None),
             play_thread: std::sync::Mutex::new(None),
             sentinelle_du_fil: std::sync::Mutex::new(None),
-            exclusive_mode,
+            exclusive_mode: AtomicBool::new(exclusive_mode),
             audio_backend: audio_backend.to_string(),
             play_generation: Arc::new(AtomicU64::new(0)),
             force_silent: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
@@ -1409,6 +1491,7 @@ impl LocalOutput {
             pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             seconde_sortie: std::sync::Mutex::new(Vec::new()),
+            retard_de_depart_ms: AtomicU64::new(0),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
             disposition: Arc::new(std::sync::Mutex::new(None)),
@@ -1959,6 +2042,17 @@ impl LocalOutput {
             .collect();
     }
 
+    /// #8437 — le retard de départ de la prochaine ouverture du flux (ms),
+    /// voir [`crate::zones::retard_groupe_mixte_8437`]. `0` : départ immédiat.
+    pub fn set_retard_de_depart_ms(&self, ms: u64) {
+        self.retard_de_depart_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// #8437 — le retard que la prochaine ouverture du flux observera.
+    pub(crate) fn retard_de_depart_ms(&self) -> u64 {
+        self.retard_de_depart_ms.load(Ordering::Relaxed)
+    }
+
     /// #6132 — le curseur de volume de cette sortie (millièmes), celui que
     /// `set_volume` et la sourdine écrivent. Partagé avec la sortie double
     /// d'une AUTRE zone qui recopie vers ce périphérique : chaque membre d'un
@@ -2018,7 +2112,7 @@ impl LocalOutput {
     /// l'orchestrateur ne peut pas promettre du DSD natif à une sortie qui
     /// ouvrirait WASAPI ou le chemin partagé. Toujours faux hors Windows.
     pub fn sort_par_asio_exclusif(&self) -> bool {
-        enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
+        enchainement_exclusif::bras_de_cette_plateforme(self.mode_exclusif(), &self.audio_backend)
             == enchainement_exclusif::BrasDeLecture::AsioExclusif
     }
 
@@ -2034,7 +2128,7 @@ impl LocalOutput {
         #[cfg(target_os = "windows")]
         {
             let exclusif = match enchainement_exclusif::bras_de_cette_plateforme(
-                self.exclusive_mode,
+                self.mode_exclusif(),
                 &self.audio_backend,
             ) {
                 enchainement_exclusif::BrasDeLecture::WasapiExclusif => true,
@@ -2219,7 +2313,7 @@ impl LocalOutput {
     /// partagé porte le puits de fondu ; les bras exclusifs (WASAPI, ASIO,
     /// CoreAudio) enchaînent en gapless et ne fondent pas.
     pub fn sait_fondre(&self) -> bool {
-        enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
+        enchainement_exclusif::bras_de_cette_plateforme(self.mode_exclusif(), &self.audio_backend)
             == enchainement_exclusif::BrasDeLecture::CpalPartage
     }
 
@@ -2230,7 +2324,7 @@ impl LocalOutput {
             self.soft_mute_ms.load(Ordering::Relaxed),
             self.dop_active.load(Ordering::Relaxed),
             self.pure_bypass.load(Ordering::Relaxed),
-            self.exclusive_mode,
+            self.mode_exclusif(),
         )
     }
 
@@ -2240,7 +2334,7 @@ impl LocalOutput {
             self.soft_mute_ms.clone(),
             self.dop_active.clone(),
             self.pure_bypass.clone(),
-            self.exclusive_mode,
+            self.mode_exclusif(),
         )
     }
 
@@ -6192,7 +6286,7 @@ impl OutputTarget for LocalOutput {
     /// poller attend une transition d'un fil qui n'existe plus (`#1323` sur
     /// OAAT, `#1919` ici). Voir [`LocalOutput::chain_exhausted`].
     fn supports_internal_gapless(&self) -> bool {
-        enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
+        enchainement_exclusif::bras_de_cette_plateforme(self.mode_exclusif(), &self.audio_backend)
             .sait_enchainer()
             && !self.chain_exhausted.load(Ordering::Relaxed)
     }
@@ -6442,7 +6536,7 @@ impl OutputTarget for LocalOutput {
         let seek_offset_arc = self.seek_offset_ms.clone();
         let pre_seeked = self.stream_pre_seeked.load(Ordering::SeqCst);
         let duration_ms_arc = self.duration_ms.clone();
-        let exclusive_mode = self.exclusive_mode;
+        let exclusive_mode = self.mode_exclusif();
         let audio_backend = self.audio_backend.clone();
         let eq = self.eq.clone();
         let current_format = self.current_format.clone();
@@ -6455,6 +6549,9 @@ impl OutputTarget for LocalOutput {
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
         // #6132 — lue UNE fois par piste, comme `strict_bitperfect`.
         let seconde_sortie = self.secondes_sorties();
+        // #8437 — lu UNE fois par piste : une transition gapless ne repasse
+        // pas par `play_url` et garde l'avance prise au départ.
+        let retard_de_depart_ms = self.retard_de_depart_ms();
         let mono_downmix = self.mono_downmix.clone();
         let reaffectation = self.reaffectation.clone();
         let disposition = self.disposition.clone();
@@ -6508,6 +6605,21 @@ impl OutputTarget for LocalOutput {
             // sentinelle ne retombe qu'après le `Drop` du flux cpal, c'est-à-
             // dire après la fermeture effective du PCM (#3575).
             let _sentinelle_du_fil = SentinelleDuFilDeLecture(sentinelle_vivante);
+            // #8437 — groupe mixte (sortie locale + enceintes réseau) : la
+            // sortie locale attend le tampon des enceintes. Avant toute
+            // ouverture (flux, périphérique), interrompu par un Stop.
+            if retard_de_depart_ms > 0 {
+                info!(
+                    retard_ms = retard_de_depart_ms,
+                    "local_audio_retard_de_depart_groupe_mixte"
+                );
+                if !retard_de_depart_8437::attendre(retard_de_depart_ms, &force_silent, |ms| {
+                    std::thread::sleep(std::time::Duration::from_millis(ms))
+                }) {
+                    debug!("local_audio_retard_de_depart_interrompu");
+                    return;
+                }
+            }
             // ------- HTTP fetch the audio stream -------
             // Pas de delai total pour les longues pistes, mais Stop doit
             // interrompre aussi une attente HTTP, pas seulement l'alimentation
@@ -8647,7 +8759,7 @@ impl OutputTarget for LocalOutput {
         // (`RepriseDeSession::RetablirALaPosition`).
         if la_pause_rend_le_peripherique(
             cfg!(target_os = "windows"),
-            self.exclusive_mode,
+            self.mode_exclusif(),
             self.playing.load(Ordering::SeqCst),
         ) {
             let position_ms = self.position_ms.load(Ordering::SeqCst);
@@ -9643,3 +9755,6 @@ mod voies_exclusives_6230;
     test
 ))]
 mod etage_exclusif_observe_7093;
+
+#[cfg(test)]
+mod exclusif_par_zone_3245_tests;

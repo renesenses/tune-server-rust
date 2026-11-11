@@ -222,6 +222,9 @@ fn bibliotheque_jazz() -> AppState {
     pistes(&s, 911, 9, Some(401));
     for p in [9111, 9112, 9115] {
         credit(&s, p, Some(412), "Ilse Brandt", "performer", Some("bass"));
+        // #7768 : Nora Vidal au piano à côté d'elle — 7 + 3 = 10 pistes
+        // partagées, comme dans l'exemple § 6.1.
+        credit(&s, p, Some(402), "Nora Vidal", "performer", Some("piano"));
     }
     for p in 9111..=9119 {
         credit(&s, p, Some(412), "Ilse Brandt", "producer", None);
@@ -396,8 +399,30 @@ fn bibliotheque_chef() -> AppState {
 fn exemple(nom: &str) -> Value {
     let mut tout: Value = serde_json::from_str(CONTRAT).expect("fixture JSON");
     let mut ex = tout[nom].take();
-    // PR 5 (#7768) : hors de cette PR.
-    ex.as_object_mut().unwrap().remove("played_with");
+    // #7768 (PR 5) : deux écarts de l'exemple § 6.1 avec la règle du contrat
+    // § 3.3, dits ici plutôt que cachés. (1) « la fiche quand elle existe » :
+    // Sam Okafor a une fiche (403, l'artiste d'album d'*Okafor Plays
+    // Standards*), son `artist_id` est donc 403 et non `null`. (2) « ordre :
+    // `shared_tracks` décroissant, puis nom sans casse » : à 10 pistes
+    // chacun, « Nora Vidal » passe avant « Nora Vidal Quartet ». Le client
+    // web n'ordonne pas la liste et ne lit `artist_id` que pour le lien.
+    if let Some(liste) = ex.get_mut("played_with").and_then(Value::as_array_mut) {
+        for j in liste.iter_mut() {
+            if j["artist_name"] == "Sam Okafor" {
+                j["artist_id"] = serde_json::json!(403);
+            }
+        }
+        liste.sort_by(|a, b| {
+            b["shared_tracks"]
+                .as_i64()
+                .cmp(&a["shared_tracks"].as_i64())
+                .then_with(|| {
+                    let n =
+                        |v: &Value| v["artist_name"].as_str().unwrap_or_default().to_lowercase();
+                    n(a).cmp(&n(b))
+                })
+        });
+    }
     ex
 }
 
@@ -513,6 +538,11 @@ fn comparer_reponse(attendu: &Value, rendu: &Value) {
         rendu["credit_counts"], attendu["credit_counts"],
         "credit_counts : {}",
         rendu["credit_counts"]
+    );
+    assert_eq!(
+        rendu["played_with"], attendu["played_with"],
+        "played_with (#7768) : {}",
+        rendu["played_with"]
     );
 }
 

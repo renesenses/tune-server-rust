@@ -1304,6 +1304,12 @@ pub struct PlaybackOrchestrator {
     /// à la position (voir `transfert_en_pause_5050`). Verrou std : accès
     /// courts.
     transferts_en_pause: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #7418 — zones mises en pause parce que leur APPAREIL s'est mis en
+    /// pause (télécommande, autre entrée) : leur reprise depuis Tune rétablit
+    /// la piste à la position, au lieu d'un `Play` « sur place » envoyé à un
+    /// appareil qui peut être passé à autre chose. Voir
+    /// `pause_de_l_appareil_7418`. Verrou std : accès courts.
+    pauses_de_l_appareil: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// #6612 — la dernière reprise SUR PLACE d'un renderer réseau, par zone :
     /// (position, instant). Voir `plage_hors_fichier_6612`. Verrou std :
     /// accès courts.
@@ -1972,6 +1978,7 @@ impl PlaybackOrchestrator {
             dlna_canaux_max: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashMap::new()),
             transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pauses_de_l_appareil: std::sync::Mutex::new(std::collections::HashSet::new()),
             reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -2159,8 +2166,13 @@ mod volume_openhome_sans_attendre_7633_tests;
 mod volume_openhome_echelle_7841_tests;
 // #8151 — la sourdine de la zone tient au démarrage de chaque piste.
 mod sourdine_a_la_piste_8151;
+// #8402 (11/11) — AirPlay 2 en PURE verrouillé : départ à 0 %, dit.
+mod depart_muet_airplay2_8402;
 #[cfg(test)]
 mod sourdine_a_la_piste_8151_tests;
+// #8437 — groupe mixte : la sortie locale part `sync_delay_ms` plus tard.
+#[cfg(all(test, feature = "local-audio"))]
+mod retard_groupe_mixte_8437_tests;
 pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]
@@ -2614,6 +2626,9 @@ mod historique_conteneurs_tests_6466;
 mod sortie_de_radio_dlna_6130_tests;
 mod transfert_en_pause_5050;
 pub use transfert_en_pause_5050::ErreurDeTransfert;
+/// #7418 — une pause faite sur l'appareil devient un arrêt complet, et la
+/// lecture repart normalement depuis Tune.
+mod pause_de_l_appareil_7418;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).
