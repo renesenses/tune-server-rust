@@ -279,6 +279,17 @@ async fn arret_programme_poweroff_reserve_a_tune_os() {
         (status, serde_json::from_slice(&body).unwrap_or(json!(null)))
     }
 
+    // Retire `TUNE_APPLIANCE` même si une assertion échoue en route : un
+    // « 1 » laissé derrière ferait croire aux essais voisins qu'ils tournent
+    // sur Tune OS.
+    struct RetirerAppliance;
+    impl Drop for RetirerAppliance {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("TUNE_APPLIANCE") };
+        }
+    }
+    let _retirer = RetirerAppliance;
+
     let eteindre = json!({"enabled": true, "time": "23:00", "action": "poweroff"});
 
     // 1) Machine ordinaire (Docker, NAS, Mac, bureau) : refus clair, rien posé.
@@ -310,6 +321,4 @@ async fn arret_programme_poweroff_reserve_a_tune_os() {
     let (status, body) = put(&app, eteindre).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["scheduled_stop"]["action"], json!("poweroff"));
-
-    unsafe { std::env::remove_var("TUNE_APPLIANCE") };
 }
