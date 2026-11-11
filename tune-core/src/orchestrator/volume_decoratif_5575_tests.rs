@@ -163,3 +163,35 @@ async fn sur_un_volume_decoratif_le_curseur_est_refuse_mais_le_volume_fixe_s_arm
     );
     serveur.abort();
 }
+
+/// Relecture du 11/11 : avec `can_set_volume: false`, le contrôle de capacité
+/// refusait AUSSI les consignes à 100 % qui passaient avant (PURE forcé,
+/// restauration, réveil) : PURE devenait inactivable sur un Diretta (422).
+/// Une consigne pleine est tenue sans commande ; une consigne plus basse
+/// reste refusée.
+#[tokio::test]
+async fn sur_un_volume_decoratif_pure_force_et_100_pour_cent_passent_sans_commande_5575() {
+    let (hote, compteur, serveur) = faux_renderer().await;
+    let orch = orchestrateur();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("C19", Some("dlna"), Some(DIRETTA))
+        .unwrap();
+    orch.outputs
+        .lock()
+        .await
+        .register(Box::new(sortie(&hote, DIRETTA)));
+
+    let envoi = orch
+        .set_volume_pure_force(zone_id, Some(DIRETTA))
+        .await
+        .expect("#5575 : PURE forcé à 100 % refusé sur un volume décoratif");
+    assert!(!envoi.envoye(), "aucune commande : {envoi:?}");
+    orch.set_volume(zone_id, 1.0, Some(DIRETTA))
+        .await
+        .expect("#5575 : une consigne à 100 % refusée sur un volume décoratif");
+    assert_eq!(compteur.load(Ordering::SeqCst), 0, "aucun SetVolume envoyé");
+    assert_eq!(orch.playback.get_state(zone_id).await.volume, 1.0);
+    // Une consigne plus basse reste refusée.
+    assert!(orch.set_volume(zone_id, 0.5, Some(DIRETTA)).await.is_err());
+    serveur.abort();
+}
