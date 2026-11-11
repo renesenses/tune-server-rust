@@ -1727,6 +1727,13 @@ name = "pg_credits_source_7765"
 path = "tests/pg_credits_source_7765.rs"
 required-features = ["postgres"]
 
+# #8026 — rattrapage des crédits des balises pour la musique déjà scannée et
+# rattachement des lignes `balises` à leur fiche, sur PostgreSQL.
+[[test]]
+name = "pg_credits_balises_8026"
+path = "tests/pg_credits_balises_8026.rs"
+required-features = ["postgres"]
+
 # #7027 — une bio rangée sans langue (`bio_lang` vide ou NULL) n'est jamais
 # servie comme de l'anglais, sur PostgreSQL.
 [[test]]

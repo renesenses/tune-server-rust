@@ -738,6 +738,40 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
 
 #[cfg(feature = "cloud-relay")]
 async fn spawn_relay_client(state: &AppState) {
+    // Une première tentative tout de suite, puis une par minute tant que le
+    // client n'est pas lancé (#7714). Avant, le client n'était lancé qu'au
+    // démarrage, et seulement si le pont était activé ET le Premium déjà
+    // connu à cet instant : un pont activé plus tard, un Premium du compte
+    // relu après le démarrage, ou un conflit de session passager laissaient
+    // le serveur « Déconnecté » pour toujours, et les Réglages disaient
+    // « Redémarrez le serveur ». Un utilisateur n'a jamais à redémarrer.
+    if lancer_le_client_de_relais(state).await {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut tic = tokio::time::interval(SURVEILLANCE_DU_CLIENT_DE_RELAIS);
+        tic.tick().await;
+        loop {
+            tic.tick().await;
+            if lancer_le_client_de_relais(&state).await {
+                return;
+            }
+        }
+    });
+}
+
+/// Cadence à laquelle un client de relais pas encore lancé est retenté.
+#[cfg(feature = "cloud-relay")]
+const SURVEILLANCE_DU_CLIENT_DE_RELAIS: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Lance le client de relais s'il ne tourne pas encore et si le pont est
+/// activé et le Premium acquis. Vrai si le client tourne en sortie.
+#[cfg(feature = "cloud-relay")]
+pub(crate) async fn lancer_le_client_de_relais(state: &AppState) -> bool {
+    if state.relay_client.get().is_some() {
+        return true;
+    }
     // Premium gate: Cloud Relay requires Premium
     if !state
         .license
@@ -745,7 +779,7 @@ async fn spawn_relay_client(state: &AppState) {
         .await
     {
         info!("cloud_relay_requires_premium");
-        return;
+        return false;
     }
 
     if let Some(client) =
@@ -759,7 +793,9 @@ async fn spawn_relay_client(state: &AppState) {
             warn!("relay client already published — spawn called twice");
         }
         info!("cloud relay client spawned");
+        return true;
     }
+    false
 }
 
 /// Ce que le lot SSDP de démarrage fait d'un appareil dont une zone d'un
@@ -1590,12 +1626,20 @@ fn spawn_alarm_scheduler(state: &AppState) {
         .avec_le_choix_du_flux_radio(crate::routes::radios::choix_du_flux_de_playlist(state)),
     );
     alarm_sched.spawn();
-    // #8213 — arrêt programmé de la lecture à heure fixe.
+    // #8213 — arrêt programmé de la lecture à heure fixe ; avec
+    // `action: "poweroff"`, extinction de la machine par la fonction unique
+    // d'extinction (refusée hors Tune OS).
+    let extinction: tune_core::arret_programme::Extinction = Arc::new(|| {
+        Box::pin(crate::routes::appliance::ordonner(
+            crate::routes::appliance::OrdreMachine::Eteindre,
+        ))
+    });
     Arc::new(
         tune_core::arret_programme::PlanificateurArretProgramme::new(
             state.backend.clone(),
             state.orchestrator.clone(),
-        ),
+        )
+        .avec_extinction(extinction),
     )
     .spawn();
 }
@@ -2388,6 +2432,12 @@ async fn refresh_account_premium(
         Some(t) if !t.is_empty() => t,
         _ => return, // not connected — nothing to refresh
     };
+    // #8238 : la session a été refusée par le site ; rien ne repart avant une
+    // nouvelle connexion (l'état est rendu par GET /cloud/sso/status).
+    if tune_core::cloud::sso::reconnexion_requise(&settings) {
+        debug!("mozaik_account_refresh_skipped_reconnect_required");
+        return;
+    }
 
     let client_id = settings
         .get("mozaik_client_id")
@@ -2426,25 +2476,10 @@ async fn refresh_account_premium(
         }
         ProfilCloud::Echec(e) => {
             debug!(error = %e, "mozaik_user_fetch_failed");
-            let refresh = settings
-                .get("mozaik_refresh_token")
-                .ok()
-                .flatten()
-                .filter(|s| !s.is_empty());
-            match refresh {
-                Some(rt) => match auth.refresh_token(&rt).await {
-                    Ok(tok) => {
-                        settings.set("mozaik_access_token", &tok.access_token).ok();
-                        if let Some(ref new_rt) = tok.refresh_token {
-                            settings.set("mozaik_refresh_token", new_rt).ok();
-                        }
-                        auth.get_user(&settings, &tok.access_token).await.profil()
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "mozaik_token_refresh_failed");
-                        None
-                    }
-                },
+            // #8238 : le renouvellement UNIQUE du serveur — verrou, jeton
+            // déjà renouvelé par une autre tâche, arrêt après un refus du site.
+            match tune_core::cloud::sso::renouveler_la_session(&settings, &token).await {
+                Some(nouveau) => auth.get_user(&settings, &nouveau).await.profil(),
                 None => None,
             }
         }
@@ -3199,6 +3234,9 @@ fn spawn_local_audio_rescan(state: &AppState) {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
             rescan_local_audio_devices(&state).await;
+            // #3245 — un réglage d'exclusif changé pendant une lecture
+            // rattrape ici sa sortie, si le guetteur du PATCH a expiré.
+            crate::exclusif_par_zone_3245::aligner_toutes_les_sorties(&state).await;
             tokio::time::sleep(LOCAL_AUDIO_RESCAN_INTERVAL).await;
         }
     });
@@ -3622,13 +3660,20 @@ pub(crate) async fn appliquer_le_parc_local(
             // sorties en WASAPI EXCLUSIF — le son des autres applications de la
             // machine disparaissait sur un périphérique que personne n'avait
             // demandé en exclusif (jfpaquet, Asus Essence STX II).
+            // #3245 — la demande est celle de la zone de cet appareil, la
+            // machine en repli.
+            let demande_de_zone = state
+                .demande_d_exclusif_de_l_appareil(&device_id, state.requested_exclusive_mode());
             let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
                 configured_backend,
                 Some(dev.backend.as_str()),
-                state.requested_exclusive_mode(),
+                demande_de_zone.demande,
                 // #5353 — le `true` écrit par le choix d'ASIO n'est pas une
-                // demande pour ces noms WASAPI.
-                state.exclusif_arme_par_asio(),
+                // demande pour ces noms WASAPI (sauf s'il vient de la zone).
+                tune_core::config::temoin_asio_pour_la_demande(
+                    state.exclusif_arme_par_asio(),
+                    demande_de_zone,
+                ),
             );
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
@@ -5795,5 +5840,59 @@ mod recensement_squeezebox_silencieux_tests {
         assert!(!recensement_squeezebox_a_annoncer(&mut dernier, 2));
         dernier = None;
         assert!(recensement_squeezebox_a_annoncer(&mut dernier, 2));
+    }
+}
+
+/// #7714 — « État : Déconnecté », bandeau « Redémarrez le serveur » : le
+/// client de relais n'était lancé qu'au démarrage, et seulement si le Premium
+/// était déjà connu. Le voici relancé dès que les conditions sont réunies.
+#[cfg(all(test, feature = "cloud-relay"))]
+mod relance_du_client_de_relais_7714 {
+    use super::*;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    fn etat_pont_active() -> AppState {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let s = SettingsRepo::with_backend(state.backend.clone());
+        s.set("bridge_enabled", "true").unwrap();
+        // Un relais injoignable (port fermé) : aucune sortie réseau.
+        s.set("bridge_url", "ws://127.0.0.1:9/ws/server").unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn le_client_part_quand_le_premium_arrive_apres_le_demarrage() {
+        let state = etat_pont_active();
+        // Au démarrage, le Premium du compte n'est pas encore connu.
+        assert!(!lancer_le_client_de_relais(&state).await);
+        assert!(state.relay_client.get().is_none());
+        // Il arrive (battement, connexion SSO) : la tentative suivante lance
+        // le client, sans redémarrage.
+        state.license.set_account_premium(true, None).await;
+        assert!(
+            lancer_le_client_de_relais(&state).await,
+            "Premium acquis, pont active : le client de relais doit partir sans redemarrage"
+        );
+        assert!(state.relay_client.get().is_some());
+        // Une fois lancé, rien n'est relancé en double.
+        assert!(lancer_le_client_de_relais(&state).await);
+    }
+
+    #[tokio::test]
+    async fn le_demarrage_surveille_le_client_tant_qu_il_n_est_pas_lance() {
+        // Garde de câblage : `spawn_relay_client` doit retenter, pas tenter
+        // une seule fois. Contre-épreuve : la boucle retirée, ce test rougit.
+        let source = include_str!("background.rs");
+        let corps = source
+            .split("async fn spawn_relay_client(state: &AppState) {")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .expect("spawn_relay_client introuvable");
+        assert!(
+            corps.contains("SURVEILLANCE_DU_CLIENT_DE_RELAIS")
+                && corps.matches("lancer_le_client_de_relais(").count() >= 2,
+            "spawn_relay_client ne retente plus : un pont active apres le demarrage \
+             reste Deconnecte jusqu'au redemarrage"
+        );
     }
 }
