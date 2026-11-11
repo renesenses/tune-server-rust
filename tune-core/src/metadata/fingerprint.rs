@@ -249,9 +249,9 @@ mod tests {
     /// Windows) est préféré au `PATH`, que launchd ou systemd réduisent.
     #[test]
     fn fpcalc_livre_a_cote_de_tune_server_est_prefere_au_path_8466() {
-        let racine = std::env::temp_dir().join(format!("tune-fpcalc-8466-{}", std::process::id()));
-        let vide = racine.join("vide");
-        let paquet = racine.join("paquet");
+        let racine = tempfile::tempdir().unwrap();
+        let vide = racine.path().join("vide");
+        let paquet = racine.path().join("paquet");
         std::fs::create_dir_all(&vide).unwrap();
         std::fs::create_dir_all(&paquet).unwrap();
         let livre = paquet.join(nom_fpcalc());
@@ -274,8 +274,6 @@ mod tests {
             fpcalc_parmi(&[vide]),
             std::ffi::OsString::from(nom_fpcalc())
         );
-
-        let _ = std::fs::remove_dir_all(&racine);
     }
 
     #[test]
