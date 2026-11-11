@@ -280,9 +280,12 @@ fn ou_candidates(d: &dyn SqlDialect, p_after: usize, p_cutoff: usize) -> String 
            AND t.title <> '' AND ar.name <> '' \
            AND NOT {HAS_LRC} AND NOT {HAS_TAG} AND NOT {HAS_LRCLIB} \
            AND NOT EXISTS (SELECT 1 FROM lyrics_cache c \
-                           WHERE c.track_id = t.id AND c.fetched_at >= {p2})",
+                           WHERE c.track_id = t.id AND c.fetched_at >= {p2} \
+                             AND c.source = '{marque}')",
         p1 = d.placeholder(p_after),
         p2 = d.placeholder(p_cutoff),
+        // #8417 — un échec d'avant le dernier essai sans album ne compte pas.
+        marque = crate::lyrics::SOURCE_ECHEC_LRCLIB,
     )
 }
 
@@ -1501,6 +1504,44 @@ mod tests {
             .map(|c| c.track_id)
             .collect();
         assert_eq!(ids, vec![t], "un échec périmé redevient candidat");
+    }
+
+    /// #8417 — un échec écrit AVANT le dernier essai sans album (`source =
+    /// 'lrclib'`, la valeur de toujours) n'attend plus ses 14 jours : la piste
+    /// redevient candidate tout de suite. Un échec écrit depuis (marqué) et
+    /// des paroles trouvées avant restent écartés : rien n'est vidé.
+    #[test]
+    fn candidates_reprend_un_echec_d_avant_8417_mais_garde_le_reste() {
+        let db = test_db();
+        let ancien = make_track(&db, "Echec ancien", "A");
+        crate::lyrics::store_cache_entry(&db, ancien, "Echec ancien", "A", None, None);
+        db.execute(
+            "UPDATE lyrics_cache SET source = 'lrclib' WHERE track_id = ?1",
+            &[&ancien],
+        )
+        .unwrap();
+        let recent = make_track(&db, "Echec recent", "B");
+        crate::lyrics::store_cache_entry(&db, recent, "Echec recent", "B", None, None);
+        let trouve = make_track(&db, "Trouvee avant", "C");
+        crate::lyrics::store_cache_entry(&db, trouve, "Trouvee avant", "C", None, Some("x"));
+
+        let ids: Vec<i64> = candidates(&db, 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.track_id)
+            .collect();
+        assert_eq!(ids, vec![ancien], "seul l'échec d'avant #8417 est repris");
+        assert_eq!(compter_les_candidats(&db), Some(1));
+
+        let entree = crate::lyrics::load_cache_entry(&db, ancien).unwrap();
+        assert!(
+            !entree.spares_a_fetch(),
+            "la route à la demande retente aussi"
+        );
+        let entree = crate::lyrics::load_cache_entry(&db, recent).unwrap();
+        assert!(entree.spares_a_fetch(), "un échec marqué reste payé");
+        let entree = crate::lyrics::load_cache_entry(&db, trouve).unwrap();
+        assert!(entree.spares_a_fetch(), "les paroles trouvées restent");
     }
 
     #[test]
