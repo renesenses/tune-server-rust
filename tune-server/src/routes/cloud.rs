@@ -1062,9 +1062,27 @@ async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
         }
     };
 
+    // Pourquoi « Déconnecté » (#7714) : le client tourne-t-il, et qu'a dit
+    // sa dernière tentative ? Les Réglages le montrent au lieu de
+    // « Redémarrez le serveur ».
+    #[cfg(feature = "cloud-relay")]
+    let (client_lance, derniere_erreur) = match state.relay_client.get() {
+        Some(c) => (true, c.derniere_erreur()),
+        None => (false, None),
+    };
+    #[cfg(not(feature = "cloud-relay"))]
+    let (client_lance, derniere_erreur): (bool, Option<String>) = (false, None);
+    let premium = state
+        .license
+        .check_feature(tune_core::license::Feature::CloudRelay)
+        .await;
+
     Json(json!({
         "enabled": enabled,
         "connected": connected,
+        "client_lance": client_lance,
+        "premium": premium,
+        "derniere_erreur": derniere_erreur,
         "server_id": server_id,
         "relay_url": bridge_url,
         "has_token": bridge_token.is_some(),
@@ -1243,11 +1261,13 @@ async fn bridge_enable(
     let server_id = TelemetryReporter::get_or_create_server_id(&settings);
     info!(server_id = %server_id, "bridge enabled");
 
+    // Plus de redémarrage (#7714) : la surveillance lancée au démarrage
+    // (`background::spawn_relay_client`) démarre le client dans la minute.
     let mut reponse = json!({
         "enabled": true,
         "server_id": server_id,
         "access_url": format!("https://bridge.mozaiklabs.fr/{server_id}/"),
-        "note": "restart server to activate the relay connection"
+        "note": "the relay connection starts within a minute",
     });
     // #6603 — le jeton du pont ne sert plus qu'à l'ancien lien. Une fois ce
     // lien coupé par le relais, il n'a plus à sortir d'ici.

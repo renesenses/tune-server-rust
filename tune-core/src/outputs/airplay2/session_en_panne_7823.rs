@@ -107,7 +107,8 @@ mod tests {
                 let nom = commande["cmd"].as_str().unwrap().to_string();
                 // `status` est la lecture de position ajoutée par #7084 après
                 // un `play` : elle ne pilote rien, on ne compte que les ordres.
-                if nom != "status" {
+                // #8402 — ni le volume de départ.
+                if nom != "status" && nom != "volume" {
                     notees.lock().await.push(nom.clone());
                 }
                 let evenement = reponse(&nom, plays);
@@ -238,7 +239,12 @@ mod tests {
             sortie.get_status().await.unwrap().state,
             TransportState::Paused
         );
-        assert_eq!(*recues.lock().await, vec!["play", "play", "pause"]);
+        // #8347 — la connexion dont le setup a échoué est lâchée
+        // (`disconnect`) et rouverte (`connect`) avant le nouveau `play`.
+        assert_eq!(
+            *recues.lock().await,
+            vec!["play", "disconnect", "connect", "play", "pause"]
+        );
     }
 
     #[test]

@@ -25,6 +25,10 @@ mod radio;
 /// verdict que la lecture (#3578). Le reste de ce module reste interne.
 pub use radio::non_audio_content_type;
 pub(crate) use radio::*;
+/// #8110 — les flux de repli d'une station, retenus par la route au
+/// lancement : la lecture y passe quand le diffuseur refuse le flux joué.
+mod radio_replis_8110;
+pub use radio_replis_8110::retenir_les_replis_radio;
 
 /// re-resolve or re-send. The `superseded` play_seq guard in `play_inner` only
 /// catches an OVERLAPPING second play; when the second play arrives just AFTER
@@ -88,7 +92,7 @@ async fn request_stream_at_quality(
 /// `settings` sous `zone_<id>_quality`. Lue par les trois chemins qui
 /// résolvent une URL de service : lecture explicite, préchauffage DASH et
 /// avance sans blanc.
-fn preference_de_qualite(
+pub(crate) fn preference_de_qualite(
     db: &Arc<dyn crate::db::backend::DbBackend>,
     zone_id: i64,
 ) -> StreamingQualityPreference {
@@ -1300,6 +1304,12 @@ pub struct PlaybackOrchestrator {
     /// à la position (voir `transfert_en_pause_5050`). Verrou std : accès
     /// courts.
     transferts_en_pause: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #7418 — zones mises en pause parce que leur APPAREIL s'est mis en
+    /// pause (télécommande, autre entrée) : leur reprise depuis Tune rétablit
+    /// la piste à la position, au lieu d'un `Play` « sur place » envoyé à un
+    /// appareil qui peut être passé à autre chose. Voir
+    /// `pause_de_l_appareil_7418`. Verrou std : accès courts.
+    pauses_de_l_appareil: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// #6612 — la dernière reprise SUR PLACE d'un renderer réseau, par zone :
     /// (position, instant). Voir `plage_hors_fichier_6612`. Verrou std :
     /// accès courts.
@@ -1968,6 +1978,7 @@ impl PlaybackOrchestrator {
             dlna_canaux_max: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashMap::new()),
             transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pauses_de_l_appareil: std::sync::Mutex::new(std::collections::HashSet::new()),
             reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -2134,6 +2145,8 @@ mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+/// #8082 — flux continu entre les pistes pour les renderers DLNA.
+mod flux_continu_8082;
 mod repere_de_hausse_6721;
 #[cfg(test)]
 mod repere_de_hausse_6721_tests;
@@ -2209,6 +2222,8 @@ mod sortie_occupee_8006_tests;
 mod duree_du_flux_2062;
 #[cfg(test)]
 mod duree_du_flux_2062_tests;
+#[cfg(test)]
+mod prefetch_fiche_qobuz_m3u_8229_tests;
 #[cfg(test)]
 mod prefetch_wav_annonce_6990_tests;
 mod resolve_direct;
@@ -2606,6 +2621,9 @@ mod historique_conteneurs_tests_6466;
 mod sortie_de_radio_dlna_6130_tests;
 mod transfert_en_pause_5050;
 pub use transfert_en_pause_5050::ErreurDeTransfert;
+/// #7418 — une pause faite sur l'appareil devient un arrêt complet, et la
+/// lecture repart normalement depuis Tune.
+mod pause_de_l_appareil_7418;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).
