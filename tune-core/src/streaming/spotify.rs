@@ -409,11 +409,6 @@ fn maintenant_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// #8198 — l'origine de la page Tune qui lance la connexion, reduite a
-/// `schema://hote[:port]`. `None` si elle n'a pas cette forme : pas
-/// d'identifiants, pas d'espace, http(s) seulement, 200 caracteres au plus.
-/// Le relais du site refait ses propres controles ; c'est le nonce du
-/// `state`, connu de ce seul serveur, qui fait foi au retour.
 /// #8198 — encode un composant d'URL (requete de l'adresse de retour).
 pub fn encoder_composant(texte: &str) -> String {
     urlencoding::encode(texte).into_owned()
@@ -426,6 +421,12 @@ pub fn decoder_composant(texte: &str) -> String {
         .unwrap_or_else(|_| texte.to_owned())
 }
 
+/// #8198 — l'origine de la page Tune qui lance la connexion, reduite a
+/// `schema://hote[:port]`. `None` si elle n'a pas cette forme : pas
+/// d'identifiants, pas d'espace, un hote non vide (nom ASCII ou IPv6 entre
+/// crochets), un port numerique de 1 a 65535, http(s) seulement, 200 caracteres au plus.
+/// Le relais du site refait ses propres controles ; c'est le nonce du
+/// `state`, connu de ce seul serveur, qui fait foi au retour.
 pub fn normaliser_origine(origine: &str) -> Option<String> {
     let o = origine.trim();
     if o.len() > 200 || o.chars().any(|c| c.is_whitespace() || c.is_control()) {
@@ -440,11 +441,34 @@ pub fn normaliser_origine(origine: &str) -> Option<String> {
     if autorite.is_empty() || autorite.contains('@') {
         return None;
     }
-    if !autorite
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']' | '_'))
-    {
+    let (hote_valide, port) = match autorite.strip_prefix('[') {
+        Some(reste) => {
+            let (ip6, apres) = reste.split_once(']')?;
+            (ip6.parse::<std::net::Ipv6Addr>().is_ok(), apres)
+        }
+        None => {
+            let (hote, apres) = autorite.split_at(autorite.find(':').unwrap_or(autorite.len()));
+            let valide = !hote.is_empty()
+                && hote
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+            (valide, apres)
+        }
+    };
+    if !hote_valide {
         return None;
+    }
+    if !port.is_empty() {
+        let chiffres = port.strip_prefix(':')?;
+        if chiffres.is_empty()
+            || chiffres.len() > 5
+            || !chiffres.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        if !(1..=65535).contains(&chiffres.parse::<u32>().ok()?) {
+            return None;
+        }
     }
     Some(format!("{schema}://{}", autorite.to_ascii_lowercase()))
 }
@@ -3468,6 +3492,9 @@ mod tests {
 #[path = "spotify_recherche_7659_tests.rs"]
 mod recherche_7659_tests;
 
+#[cfg(test)]
+#[path = "spotify_relais_8198_tests.rs"]
+mod relais_8198_tests;
 #[cfg(test)]
 #[path = "spotify_session_refusee_8051_tests.rs"]
 mod session_refusee_8051_tests;

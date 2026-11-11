@@ -324,3 +324,94 @@ async fn chaque_autorisation_garde_son_adresse_de_retour() {
         "{echange}"
     );
 }
+
+fn assert_state_inconnu(r: &Reponse) {
+    assert_eq!(r.statut, StatusCode::BAD_REQUEST, "{}", r.texte);
+    assert!(
+        r.texte
+            .contains("data-spotify-retour=\"spotify_state_inconnu\""),
+        "{}",
+        r.texte
+    );
+}
+
+/// Un `state` qui n'est pas celui émis par ce serveur (nonce inventé, ou
+/// origine remplacée dans un `state` authentique) ne désigne aucune
+/// autorisation : refusé, sans échange du code.
+#[tokio::test]
+async fn un_state_modifie_est_refuse() {
+    let (base, recus) = doublure().await;
+    let app = app(base_de_donnees(), &base);
+    activer(&app, true).await;
+    let (_, state) = ouvrir(&app, json!({"origine": "http://192.168.1.20:8888"})).await;
+    let (nonce, _) = state.split_once('.').expect("nonce.origine");
+
+    for faux in [
+        format!("{nonce}.{}", b64("https://autre.example")),
+        format!("{nonce}.{}", b64("http://192.168.1.21:8888")),
+        nonce.to_owned(),
+        format!("AAAAAAAAAAAAAAAAAAAAAA.{}", b64("http://192.168.1.20:8888")),
+    ] {
+        let r = retour_get(
+            &app,
+            &format!("code=code-essai&state={}", encoder_composant(&faux)),
+        )
+        .await;
+        assert_state_inconnu(&r);
+    }
+    assert!(
+        recus.lock().unwrap().is_empty(),
+        "aucun échange pour un state inconnu"
+    );
+
+    // Le vrai `state` reste valable après ces essais.
+    let r = retour_get(
+        &app,
+        &format!("code=code-essai&state={}", encoder_composant(&state)),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{}", r.texte);
+}
+
+/// Un `state` sert une fois : après une connexion réussie, le même retour
+/// est refusé.
+#[tokio::test]
+async fn un_state_ne_sert_qu_une_fois() {
+    let (base, recus) = doublure().await;
+    let app = app(base_de_donnees(), &base);
+    activer(&app, true).await;
+    let (_, state) = ouvrir(&app, json!({})).await;
+    let requete = format!("code=code-essai&state={}", encoder_composant(&state));
+    let r = retour_get(&app, &requete).await;
+    assert_eq!(r.statut, StatusCode::OK, "{}", r.texte);
+    let r = retour_get(&app, &requete).await;
+    assert_state_inconnu(&r);
+    assert_eq!(recus.lock().unwrap().len(), 1, "un seul échange");
+}
+
+/// Un code sans `state` sur `/retour` (GET ou POST) est refusé avant tout
+/// échange, même quand une autorisation est ouverte.
+#[tokio::test]
+async fn un_retour_sans_state_est_refuse() {
+    let (base, recus) = doublure().await;
+    let app = app(base_de_donnees(), &base);
+    activer(&app, true).await;
+    let _ = ouvrir(&app, json!({})).await;
+
+    for requete in ["code=code-essai", "code=code-essai&state="] {
+        assert_state_inconnu(&retour_get(&app, requete).await);
+    }
+    let r = envoyer(
+        &app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/streaming/spotify/retour")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("accept-language", "fr")
+            .body(axum::body::Body::from("code=code-essai"))
+            .unwrap(),
+    )
+    .await;
+    assert_state_inconnu(&r);
+    assert!(recus.lock().unwrap().is_empty(), "aucun échange sans state");
+}

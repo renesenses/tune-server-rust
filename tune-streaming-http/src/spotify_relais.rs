@@ -25,7 +25,9 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
 use tune_core::db::settings_repo::SettingsRepo;
-use tune_core::streaming::spotify::{SpotifyService, adresse_du_relais, encoder_composant};
+use tune_core::streaming::spotify::{
+    CODE_STATE_INCONNU, SpotifyService, adresse_du_relais, encoder_composant,
+};
 
 use crate::connexion_spotify_distante::{Langue, echapper_html, langue, page};
 use crate::{StreamingHttpState, get_svc, purge_contenu_utilisateur, reponse_code_de};
@@ -212,6 +214,19 @@ fn phrase(code: Option<&str>, langue: Langue) -> &'static str {
 
 async fn terminer(state: StreamingHttpState, headers: HeaderMap, p: ParametresRetour) -> Response {
     let langue = langue(&headers);
+    // #8198 — ce chemin ne sert qu'au retour du relais, qui rend toujours le
+    // `state` envoyé. Sans lui, l'échange reviendrait à l'autorisation la
+    // plus récente (règle de l'adresse collée à la main) : refusé ici, avant
+    // tout échange.
+    if p.state.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        tracing::warn!(code = CODE_STATE_INCONNU, "spotify_retour_refuse");
+        return page_echec(
+            langue,
+            StatusCode::BAD_REQUEST,
+            Some(CODE_STATE_INCONNU),
+            "spotify: state absent",
+        );
+    }
     preparer(&state).await;
     let svc = match get_svc(&state, "spotify").await {
         Ok(s) => s,

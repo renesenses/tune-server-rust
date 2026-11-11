@@ -242,6 +242,22 @@ mod tests {
         }
     }
 
+    /// #8198 — les autorisations Spotify entamées (`spotify_tentatives_pkce`)
+    /// portent les vérificateurs PKCE : le fragment `pkce` les masque. Le
+    /// retirer de la liste les rendrait lisibles par `/system/config`.
+    #[test]
+    fn le_fragment_pkce_reste_un_secret() {
+        assert!(FRAGMENTS_SECRETS.contains(&"pkce"));
+        assert!(est_secret("spotify_tentatives_pkce"));
+        let mut carte = serde_json::Map::new();
+        carte.insert(
+            "spotify_tentatives_pkce".to_string(),
+            json!("[{\"state\":\"s\",\"verifier\":\"v\"}]"),
+        );
+        caviarder_carte(&mut carte);
+        assert_eq!(carte["spotify_tentatives_pkce"], json!(MASQUE));
+    }
+
     #[test]
     fn la_casse_du_nom_ne_permet_pas_de_passer() {
         assert!(est_secret("JWT_SECRET"));
