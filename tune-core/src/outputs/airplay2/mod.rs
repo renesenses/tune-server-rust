@@ -21,6 +21,7 @@ mod appairage_refuse_8347;
 pub mod composant_manquant_7084;
 mod reprise_apres_coupure_7921;
 mod session_en_panne_7823;
+pub mod volume_de_depart_8402;
 
 const DAEMON_BINARY: &str = "airplay-daemon";
 const TRANSPORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -186,7 +187,10 @@ impl Airplay2Output {
             paused: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
-            volume: Arc::new(Mutex::new(1.0)),
+            // #8402 — jamais la pleine échelle : le démon envoie ce niveau au
+            // récepteur à chaque départ de flux. La découverte le remplace par
+            // le volume mémorisé de la zone (`ensemencer_depuis_la_base`).
+            volume: Arc::new(Mutex::new(volume_de_depart_8402::VOLUME_DE_DEPART_PRUDENT)),
             muted: Arc::new(AtomicBool::new(false)),
             current_title: Arc::new(Mutex::new(None)),
             current_artist: Arc::new(Mutex::new(None)),
@@ -751,6 +755,14 @@ impl OutputTarget for Airplay2Output {
             lisible.oublier().await;
             return Err(error);
         }
+        // #8402 — le démon envoie au récepteur, au départ du flux, le volume
+        // qu'il tient (1.0 = 0 dB dans une `Connection` neuve) : il reçoit
+        // d'abord celui de la zone. Il traite ses commandes une à une, donc
+        // après le `connect` et avant le `play`.
+        if let Err(error) = self.donner_le_volume_au_demon().await {
+            lisible.oublier().await;
+            return Err(error);
+        }
 
         let title = media.title.unwrap_or("Unknown");
         let artist = media.artist.unwrap_or("Unknown");
@@ -912,15 +924,32 @@ impl OutputTarget for Airplay2Output {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        if !volume.is_finite() {
+            return Err(format!("airplay2: invalid volume {volume}"));
+        }
         let volume = volume.clamp(0.0, 1.0);
-        self.send(&serde_json::json!({
-            "cmd": "volume",
-            "level": volume,
-        }))
-        .await?;
-        *self.volume.lock().await = volume;
-        self.muted.store(false, Ordering::SeqCst);
-        Ok(())
+        // #8402 — sans démon (zone arrêtée), la consigne est gardée pour la
+        // session suivante au lieu d'être perdue en « daemon not running ».
+        let precedent = std::mem::replace(&mut *self.volume.lock().await, volume);
+        let sourdine = self.muted.swap(false, Ordering::SeqCst);
+        match self
+            .send(&serde_json::json!({
+                "cmd": "volume",
+                "level": volume,
+            }))
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if volume_de_depart_8402::sans_demon(&error) => {
+                info!(device = %self.name, volume, "airplay2: volume kept for the next session");
+                Ok(())
+            }
+            Err(error) => {
+                *self.volume.lock().await = precedent;
+                self.muted.store(sourdine, Ordering::SeqCst);
+                Err(error)
+            }
+        }
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
@@ -929,13 +958,22 @@ impl OutputTarget for Airplay2Output {
         } else {
             *self.volume.lock().await
         };
-        self.send(&serde_json::json!({
-            "cmd": "volume",
-            "level": vol,
-        }))
-        .await?;
-        self.muted.store(muted, Ordering::SeqCst);
-        Ok(())
+        let precedente = self.muted.swap(muted, Ordering::SeqCst);
+        match self
+            .send(&serde_json::json!({
+                "cmd": "volume",
+                "level": vol,
+            }))
+            .await
+        {
+            Ok(()) => Ok(()),
+            // #8402 — gardée aussi : la session suivante part en sourdine.
+            Err(error) if volume_de_depart_8402::sans_demon(&error) => Ok(()),
+            Err(error) => {
+                self.muted.store(precedente, Ordering::SeqCst);
+                Err(error)
+            }
+        }
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
@@ -1357,6 +1395,11 @@ mod transport_tests {
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
                 let name = command["cmd"].as_str().unwrap().to_string();
+                // #8402 — le volume de départ : le vrai démon n'y répond
+                // qu'un `volume_set` que la sortie ignore.
+                if name == "volume" {
+                    continue;
+                }
                 // #7084 — le relevé de position de `get_status` n'est pas une
                 // commande de transport : le vrai démon y répond `status`.
                 if name == "status" {
@@ -1422,6 +1465,11 @@ mod transport_tests {
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
                 notees.lock().await.push(command.clone());
+                // #8402 — noté, sans réponse : le vrai démon n'y répond qu'un
+                // `volume_set` que la sortie ignore.
+                if command["cmd"] == "volume" {
+                    continue;
+                }
                 let event = serde_json::json!({"event": "playing"});
                 let line = format!("{}\n", serde_json::to_string(&event).unwrap());
                 daemon_stdout.write_all(line.as_bytes()).await.unwrap();
@@ -1644,6 +1692,10 @@ mod transport_tests {
             let mut lines = BufReader::new(daemon_stdin).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // #8402 — le volume de départ ne pilote pas ces bancs.
+                if command["cmd"] == "volume" {
+                    continue;
+                }
                 notees.lock().await.push(command.clone());
                 let erreur = |m: &str| serde_json::json!({"event": "error", "message": m});
                 let event = match command["cmd"].as_str().unwrap() {
@@ -1799,6 +1851,10 @@ mod transport_tests {
             let mut lines = BufReader::new(daemon_stdin).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // #8402 — le volume de départ ne pilote pas ces bancs.
+                if command["cmd"] == "volume" {
+                    continue;
+                }
                 notees.lock().await.push(command.clone());
                 let event = if command["cmd"] == "pair_pin_start" {
                     // Simule le rejet HTTP 403 sur /pair-pin-start par le récepteur macOS (#6788)
@@ -1880,6 +1936,10 @@ mod transport_tests {
             let mut lines = BufReader::new(daemon_stdin).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // #8402 — le volume de départ ne pilote pas ces bancs.
+                if command["cmd"] == "volume" {
+                    continue;
+                }
                 notees.lock().await.push(command.clone());
                 let erreur = |m: &str| serde_json::json!({"event": "error", "message": m});
                 let event = match command["cmd"].as_str().unwrap() {
@@ -1963,6 +2023,10 @@ mod transport_tests {
             let mut lines = BufReader::new(daemon_stdin).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let command: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // #8402 — le volume de départ ne pilote pas ces bancs.
+                if command["cmd"] == "volume" {
+                    continue;
+                }
                 notees.lock().await.push(command.clone());
                 let event = match command["cmd"].as_str().unwrap() {
                     "pair_pin_start" => reponse_au_code.clone(),

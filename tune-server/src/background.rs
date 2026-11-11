@@ -1590,6 +1590,14 @@ fn spawn_alarm_scheduler(state: &AppState) {
         .avec_le_choix_du_flux_radio(crate::routes::radios::choix_du_flux_de_playlist(state)),
     );
     alarm_sched.spawn();
+    // #8213 — arrêt programmé de la lecture à heure fixe.
+    Arc::new(
+        tune_core::arret_programme::PlanificateurArretProgramme::new(
+            state.backend.clone(),
+            state.orchestrator.clone(),
+        ),
+    )
+    .spawn();
 }
 
 fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {

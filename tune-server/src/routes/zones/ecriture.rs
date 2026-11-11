@@ -732,6 +732,19 @@ async fn persister_l_upnp(
         };
         ecrire!("dlna_radio_title", mode.as_str(), r);
     }
+    // #8082 — flux continu entre les pistes → setting
+    // zone_{id}_dlna_flux_continu. Clé supprimée à la désactivation ; lu à
+    // chaque lecture, rien à rafraîchir en vol.
+    if let Some(enabled) = body.dlna_flux_continu {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::outputs::dlna_flux_continu::cle(id);
+        let r = if enabled {
+            settings.set(&key, "true")
+        } else {
+            settings.delete(&key)
+        };
+        ecrire!("dlna_flux_continu", enabled, r);
+    }
     // Silence UPnP (#2263) → setting zone_{id}_upnp_silence. Même forme que
     // `upnp_renderer` : clé supprimée à la désactivation.
     if let Some(enabled) = body.upnp_silence {

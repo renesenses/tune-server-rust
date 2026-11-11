@@ -1037,6 +1037,12 @@ impl PositionPoller {
         let Some(next_pos) = Self::prochaine_position_jouable(&self.db, zone_id, zone_state) else {
             return GaplessPrep::NotArmed;
         };
+        // #8082 — la suivante est DÉJÀ dans le flux continu que joue le renderer :
+        // l'armer la lui ferait jouer deux fois. Sur la dernière piste du flux,
+        // rien n'est couvert et la suivante s'arme comme d'habitude.
+        if crate::outputs::dlna_flux_continu::couvre_la_suivante(device_id, next_pos) {
+            return GaplessPrep::NotArmed;
+        }
         // #8088 — armée, la suivante serait jouée par le renderer sans
         // repasser par la garde des contenus explicites : pour un profil dont
         // la politique les masque, rien n'est armé d'avance, la fin de piste

@@ -938,6 +938,12 @@ impl SpotifyConnectManager {
         self.daemon.identifiants_en_cache()
     }
 
+    /// #8154 — librespot tourne-t-il (récepteur allumé, désignable depuis
+    /// l'application Spotify) ?
+    pub async fn recepteur_actif(&self) -> bool {
+        self.daemon.is_running().await
+    }
+
     /// #6933 — le dossier où librespot garde sa connexion.
     pub fn dossier_identifiants_librespot(&self) -> Option<PathBuf> {
         self.daemon.dossier_identifiants().map(Path::to_path_buf)
