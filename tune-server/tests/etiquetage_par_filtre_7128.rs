@@ -23,7 +23,8 @@ use tower::ServiceExt;
 
 use tune_server::state::AppState;
 
-const FILTRE_ROB: &str = "genre=Jazz7128&genre=Vocal7128&all_of=genre";
+// #5638 : le filtre Genre porte désormais sur le principal seul.
+const FILTRE_ROB: &str = "genre=Jazz7128";
 
 async fn appel(state: &AppState, req: Request<Body>) -> (StatusCode, Value) {
     let app = tune_server::routes::router(state.clone());
@@ -95,9 +96,9 @@ fn nettoyer(state: &AppState) {
     );
 }
 
-/// Deux albums, cinq pistes. Le filtre de Rob (Jazz ET Vocal) désigne les
-/// pistes 1, 2 et 5, donc les albums 101 et 102. La piste 3 (Jazz seul) et
-/// la piste 4 (Vocal seul) sont les témoins qui ne doivent RIEN recevoir.
+/// Deux albums, cinq pistes. Le genre principal Jazz désigne les pistes
+/// 1, 2 et 3, donc les albums 101 et 102. Les pistes 4 et 5 (Vocal principal,
+/// même avec Jazz secondaire) ne doivent RIEN recevoir.
 fn semer(state: &AppState) {
     nettoyer(state);
     executer(
@@ -182,8 +183,8 @@ async fn scenario(state: &AppState, moteur: &str) {
     );
     assert_eq!(
         poses(state, tag, "track"),
-        vec![7128001, 7128002, 7128005],
-        "{moteur} : seules les pistes Jazz ET Vocal doivent porter l'étiquette"
+        vec![7128001, 7128002, 7128003],
+        "{moteur} : seules les pistes de genre principal Jazz doivent porter l'étiquette"
     );
 
     // 2. Relancer ne crée aucun doublon.
