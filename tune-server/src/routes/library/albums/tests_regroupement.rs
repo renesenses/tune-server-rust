@@ -1695,3 +1695,108 @@ async fn un_nom_vide_garde_le_titre_calcule_8464() {
     assert_eq!(corps["titre"].as_str(), Some("101"));
     assert_eq!(titre_de(&state, a), "101");
 }
+
+/// Didier (fil 2763, demande du 11/11) — PLUSIEURS albums multi-disques dans
+/// un même coffret : un album de 4 CD, un de 3 CD, deux d'un disque. Rend
+/// `[(album, disques)]` dans cet ordre.
+fn quatre_albums_dont_deux_multi_disques(state: &Etat) -> Vec<(i64, i64)> {
+    let art = artiste(state, "Pink Floyd");
+    let mut v = Vec::new();
+    for (titre, nb) in [("Box A", 4), ("Box B", 3), ("Single C", 1), ("Single D", 1)] {
+        let id = album(state, titre, art);
+        for cd in 1..=nb {
+            for n in 1..=2 {
+                piste_disque(
+                    state,
+                    id,
+                    art,
+                    Some(cd),
+                    n,
+                    &format!("/m/PF/{titre}/CD{cd}/{n:02}.flac"),
+                );
+            }
+        }
+        v.push((id, nb));
+    }
+    v
+}
+
+/// Compose dans l'ordre `rangs` (indices dans les quatre albums), vérifie
+/// que chaque album occupe la plage attendue, puis défait et vérifie que
+/// chacun retrouve ses numéros d'origine.
+async fn composer_et_defaire_quatre(rangs: [usize; 4], plages: [(i64, i64); 4]) {
+    let (app, state) = serveur();
+    let albums = quatre_albums_dont_deux_multi_disques(&state);
+    let ids: Vec<i64> = rangs.iter().map(|&i| albums[i].0).collect();
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": ids }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["disques"].as_i64(), Some(9), "corps = {corps}");
+    let cible = ids[0];
+    let compose = disposition(&state);
+    assert!(compose.iter().all(|(_, a, _)| *a == cible), "{compose:?}");
+    for (k, &i) in rangs.iter().enumerate() {
+        let titre = ["Box A", "Box B", "Single C", "Single D"][i];
+        let (debut, fin) = plages[k];
+        let disques: Vec<i64> = compose
+            .iter()
+            .filter(|(c, _, _)| c.starts_with(&format!("/m/PF/{titre}/")))
+            .map(|(c, _, d)| {
+                // Le CD d'origine k doit devenir `debut + k - 1`.
+                let cd: i64 = c.split("/CD").nth(1).unwrap()[..1].parse().unwrap();
+                assert_eq!(*d, debut + cd - 1, "{c} : {compose:?}");
+                *d
+            })
+            .collect();
+        assert_eq!(disques.first().copied(), Some(debut), "{titre}");
+        assert_eq!(disques.last().copied(), Some(fin), "{titre}");
+    }
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/coffrets/{cible}/defaire-manuel"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(
+        corps["albums_recrees"].as_array().map(|v| v.len()),
+        Some(3),
+        "corps = {corps}"
+    );
+    let defait = disposition(&state);
+    for (titre, nb) in [("Box A", 4), ("Box B", 3), ("Single C", 1), ("Single D", 1)] {
+        let lignes: Vec<&(String, i64, i64)> = defait
+            .iter()
+            .filter(|(c, _, _)| c.starts_with(&format!("/m/PF/{titre}/")))
+            .collect();
+        assert_eq!(lignes.len(), (nb * 2) as usize, "{titre} : {defait:?}");
+        let album_rendu = lignes[0].1;
+        assert!(
+            lignes.iter().all(|(_, a, _)| *a == album_rendu),
+            "{titre} revient en UN album : {defait:?}"
+        );
+        assert_eq!(titre_de(&state, album_rendu), titre);
+        for (c, _, d) in &lignes {
+            let cd: i64 = c.split("/CD").nth(1).unwrap()[..1].parse().unwrap();
+            assert_eq!(*d, cd, "{c} reprend son numéro d'origine : {defait:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn deux_albums_multi_disques_et_deux_simples_font_neuf_disques_8463() {
+    // 4 CD, 3 CD, 1, 1 → 1-4, 5-7, 8, 9.
+    composer_et_defaire_quatre([0, 1, 2, 3], [(1, 4), (5, 7), (8, 8), (9, 9)]).await;
+}
+
+#[tokio::test]
+async fn l_album_de_trois_cd_coche_en_premier_prend_1_a_3_8463() {
+    // Album 2 (3 CD) en premier → 1-3, puis album 1 (4 CD) 4-7, 8, 9.
+    composer_et_defaire_quatre([1, 0, 2, 3], [(1, 3), (4, 7), (8, 8), (9, 9)]).await;
+}
