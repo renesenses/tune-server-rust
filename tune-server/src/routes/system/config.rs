@@ -3133,7 +3133,9 @@ pub(super) async fn set_default_zone(
 }
 
 /// #8213 — la réponse commune des routes de l'arrêt programmé : le réglage
-/// (ou `null`) et la prochaine échéance en heure locale du serveur.
+/// (ou `null`), la prochaine échéance en heure locale du serveur, et
+/// `poweroff_available` : l'action « éteindre la machine » est-elle permise
+/// ici (Tune OS seulement) ? L'écran ne propose le choix que si `true`.
 fn reponse_arret_programme(
     reglage: Option<tune_core::arret_programme::ArretProgramme>,
 ) -> Json<Value> {
@@ -3141,7 +3143,11 @@ fn reponse_arret_programme(
         r.prochaine_echeance(chrono::Local::now().naive_local())
             .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())
     });
-    Json(json!({ "scheduled_stop": reglage, "next_stop_at": prochain }))
+    Json(json!({
+        "scheduled_stop": reglage,
+        "next_stop_at": prochain,
+        "poweroff_available": crate::routes::appliance::is_appliance(),
+    }))
 }
 
 pub(super) async fn get_scheduled_stop(State(state): State<AppState>) -> Json<Value> {
@@ -3155,6 +3161,20 @@ pub(super) async fn set_scheduled_stop(
     State(state): State<AppState>,
     Json(body): Json<tune_core::arret_programme::ArretProgramme>,
 ) -> axum::response::Response {
+    // Éteindre la machine : Tune OS seulement. Refusé à l'enregistrement,
+    // pas découvert à l'heure dite (la fonction d'extinction refuse aussi).
+    if body.action == tune_core::arret_programme::ActionArret::Poweroff
+        && !crate::routes::appliance::is_appliance()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": crate::routes::appliance::REFUS_HORS_TUNE_OS,
+                "code": "poweroff_unavailable",
+            })),
+        )
+            .into_response();
+    }
     match tune_core::arret_programme::ecrire(&state.backend, body) {
         Ok(r) => reponse_arret_programme(Some(r)).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),

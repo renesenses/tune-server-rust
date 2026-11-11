@@ -2807,6 +2807,12 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "correction_pure_classix",
         up: include_str!("../../migrations/radios/correction_pure_classix_8119.sql"),
     },
+    // #8239 — le relevé de la synchro cloud (`sync_releve_*`) : la fin d'un
+    // scan ne journalise que la différence avec lui, plus toute la
+    // bibliothèque. Jumelle PG : 110.
+    // Numérotée 144 / PG 110, après #8240 (radios, 143 / PG 109) fusionnée
+    // dans le lot le 10/11.
+    Migration { version: 144, name: "sync_releve", up: include_str!("../../migrations/sync_releve.sql") },
     // renesenses/tune-web-client#916 (FabienM, fil forum 1527) — « Pas pour
     // moi » sur une suggestion de l'accueil : `suggestions_ecartees`, PAR
     // PROFIL, écrite ET lue. Un album (local ou de service), une playlist de
@@ -6010,6 +6016,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
              VALUES (109, 'correction_pure_classix') \
              ON CONFLICT (version) DO NOTHING;\n"
         ),
+    ),
+    // Jumelle de la SQLite 144 (#8239) : le relevé de la synchro cloud, même
+    // DDL (`migrations/sync_releve.sql`).
+    (
+        110,
+        "sync_releve",
+        include_str!("../../migrations/postgres/110_sync_releve.sql"),
     ),
     // Jumelle de la SQLite 145 (web#916) : `suggestions_ecartees`, le « Pas
     // pour moi » de l'accueil, par profil.
@@ -9805,6 +9818,7 @@ mod tests {
         // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
         // Migration de DONNÉES : le nom, le pays et le genre de la station
         // semée sous « PureClassic Radio ».
+        // 110 : `sync_releve` (#8239), jumelle de la SQLite 144.
         // 111 : `suggestions_ecartees` (web#916), jumelle de la SQLite 145. Le
         // « Pas pour moi » de l'accueil, par profil.
         assert_eq!(pg_latest_version(), 111, "latest PG migration must be 111");

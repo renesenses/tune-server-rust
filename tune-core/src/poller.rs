@@ -1127,6 +1127,9 @@ mod radio;
 /// #2991 — le titre radio relayé par DIDL vers un renderer DLNA (opt-in par zone).
 mod titre_radio_didl_2991;
 
+/// #8480 — le `next` du lecteur d'une zone navigateur en fin de file joue la
+/// fin de file du sondeur (lecture automatique).
+mod fin_de_file_du_lecteur_8480;
 mod fin_de_piste;
 // #6932 — la zone navigateur dont la piste est finie enchaîne sans son lecteur.
 mod fin_navigateur_6932;

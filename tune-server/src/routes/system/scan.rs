@@ -2220,6 +2220,10 @@ async fn spawn_library_scan_avec_lecteur_par(
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
 
+        // #8239 — l'état « avant » de la synchro cloud, s'il n'existe pas
+        // encore : la fin du scan n'en journalise que la différence.
+        tune_core::cloud::library_sync::preparer_le_releve(&db);
+
         // Load existing tracks BEFORE scanning to skip unchanged files.
         // A DB read error must ABORT the scan, not degrade into an empty map:
         // with an empty map every file on disk looks new, so a transient DB
@@ -3584,8 +3588,9 @@ async fn spawn_library_scan_avec_lecteur_par(
         }
 
         etapes.fin("index_de_recherche");
-        // Populate cloud sync changelog with all new/updated entities
-        tune_core::cloud::library_sync::populate_changelog_after_scan(&db);
+        // #8239 — seul ce qui a changé depuis le dernier relevé entre au
+        // journal de la synchro cloud ; plus jamais toute la bibliothèque.
+        tune_core::cloud::library_sync::journaliser_ce_qui_a_change(&db);
 
         // Turn any .m3u/.m3u8/.pls files found in the scanned dirs into local
         // playlists (Bertrand). Runs after import so every track is in the DB to

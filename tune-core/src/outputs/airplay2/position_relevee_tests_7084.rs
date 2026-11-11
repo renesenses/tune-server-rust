@@ -10,7 +10,7 @@
 use super::composant_manquant_7084::{CODE_AIRPLAY2_COMPONENT_MISSING, manque_pour};
 use super::*;
 
-fn sortie(device_id: &str) -> Airplay2Output {
+pub(crate) fn sortie(device_id: &str) -> Airplay2Output {
     Airplay2Output::new(
         "Mania".into(),
         "127.0.0.1".into(),
@@ -22,7 +22,9 @@ fn sortie(device_id: &str) -> Airplay2Output {
 
 /// Un faux démon dont le récepteur avance d'une seconde et demie à chaque
 /// `status`. Note le nom de chaque commande reçue.
-async fn demon_dont_le_recepteur_avance(output: &Airplay2Output) -> Arc<Mutex<Vec<String>>> {
+pub(crate) async fn demon_dont_le_recepteur_avance(
+    output: &Airplay2Output,
+) -> Arc<Mutex<Vec<String>>> {
     let (server_stdin, daemon_stdin) = tokio::io::duplex(4096);
     let (mut daemon_stdout, server_stdout) = tokio::io::duplex(4096);
     *output.process.lock().await = Some(DaemonProcess {
@@ -60,6 +62,11 @@ async fn demon_dont_le_recepteur_avance(output: &Airplay2Output) -> Arc<Mutex<Ve
                         "device": "Mania",
                     })
                 }
+                // #8420 — une nouvelle piste rouvre la session du démon
+                // (`disconnect` puis `connect`) : le faux démon répond comme
+                // le vrai.
+                "disconnect" => serde_json::json!({"event": "disconnected"}),
+                "connect" => serde_json::json!({"event": "connected", "auth": "pair_verify"}),
                 autre => serde_json::json!({
                     "event": "error",
                     "message": format!("unexpected command: {autre}"),
@@ -164,4 +171,62 @@ async fn un_demon_introuvable_dit_le_composant_manquant_7084() {
         "un airplay-daemon introuvable doit dire le composant manquant (#7084), obtenu : {erreur}"
     );
     assert!(manque_pour(device_id), "la zone doit être signalée");
+}
+
+/// #7972 — après une relance décodée à 2:19 (pause où le récepteur a fermé
+/// sa connexion), le démon compte depuis le début de SON fichier. La position
+/// publiée part de 2:19, pas de 0:00 ; la durée redevient celle de la piste.
+/// Une lecture suivante, depuis le début, ne garde pas ce départ.
+#[tokio::test]
+async fn la_position_part_du_depart_du_flux_relance_7972() {
+    let output = sortie("airplay-mania-7972-depart");
+    let _commandes = demon_dont_le_recepteur_avance(&output).await;
+
+    output
+        .play_media(&PlayMedia {
+            url: "/tmp/mania-7972.wav",
+            mime_type: "audio/wav",
+            title: Some("Relance"),
+            // Le temps qui RESTE à servir après 2:19 (#6630).
+            duration_ms: Some(101_000),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    output.noter_le_depart_du_flux(139_000);
+
+    let mut statut = output.get_status().await.unwrap();
+    for _ in 0..50 {
+        if statut.position_ms > 139_000 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        statut = output.get_status().await.unwrap();
+    }
+    assert!(
+        (139_000..145_000).contains(&statut.position_ms),
+        "la position doit partir de l'endroit de la pause (2:19), obtenu {} ms",
+        statut.position_ms
+    );
+    assert_eq!(
+        statut.duration_ms, 240_000,
+        "la durée publiée est celle de la piste"
+    );
+
+    output
+        .play_media(&PlayMedia {
+            url: "/tmp/mania-7972-suivante.flac",
+            mime_type: "audio/flac",
+            duration_ms: Some(200_000),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let statut = output.get_status().await.unwrap();
+    assert!(
+        statut.position_ms < 139_000,
+        "la piste suivante repart de son début : {} ms",
+        statut.position_ms
+    );
+    assert_eq!(statut.duration_ms, 200_000);
 }

@@ -65,6 +65,7 @@
     "upsampling": "Suréchantillonnage {0}, filtre {1}, réserve de niveau {2} dB (greffon)",
     "upsampling_pure": "Suréchantillonnage inactif (mode PURE)",
     "upsampling_zone_not_supported": "Le suréchantillonnage ne s'applique pas à cette zone : seule la sortie locale de la machine le prend en charge",
+    "upsampling_strict_bitperfect": "Suréchantillonnage inactif : le bit-perfect strict est activé sur cette zone et refuse toute conversion de fréquence ; désactivez-le dans les réglages de la zone pour suréchantillonner",
     "upsampling_not_applied": "Suréchantillonnage activé, non appliqué à cette piste (sortie, cadence ou machine non prises en charge) ; il s'applique à l'ouverture de la piste suivante"
   },
   "en": {
@@ -133,6 +134,7 @@
     "upsampling": "Upsampling {0}, filter {1}, level headroom {2} dB (plugin)",
     "upsampling_pure": "Upsampling inactive (PURE mode)",
     "upsampling_zone_not_supported": "Upsampling does not apply to this zone: only the machine's local output supports it",
+    "upsampling_strict_bitperfect": "Upsampling inactive: bit-perfect strict is on for this zone and refuses any sample-rate conversion; turn it off in the zone settings to upsample",
     "upsampling_not_applied": "Upsampling enabled, not applied to this track (output, rate or machine not supported); it applies when the next track opens"
   },
   "de": {
@@ -201,6 +203,7 @@
     "upsampling": "Upsampling {0}, Filter {1}, Pegelreserve {2} dB (Plugin)",
     "upsampling_pure": "Upsampling inaktiv (PURE-Modus)",
     "upsampling_zone_not_supported": "Upsampling gilt nicht für diese Zone: nur der lokale Ausgang des Rechners unterstützt es",
+    "upsampling_strict_bitperfect": "Upsampling inaktiv: Bit-perfect strict ist für diese Zone aktiviert und verweigert jede Abtastratenwandlung; deaktivieren Sie es in den Zoneneinstellungen, um hochzurechnen",
     "upsampling_not_applied": "Upsampling aktiviert, auf diesen Titel nicht angewendet (Ausgang, Abtastrate oder Rechner nicht unterstützt); es gilt ab dem nächsten Titel"
   },
   "es": {
@@ -269,6 +272,7 @@
     "upsampling": "Sobremuestreo {0}, filtro {1}, margen de nivel {2} dB (complemento)",
     "upsampling_pure": "Sobremuestreo inactivo (modo PURE)",
     "upsampling_zone_not_supported": "El sobremuestreo no se aplica a esta zona: solo la salida local del equipo lo admite",
+    "upsampling_strict_bitperfect": "Sobremuestreo inactivo: el bit-perfect strict está activado en esta zona y rechaza toda conversión de frecuencia; desactívelo en los ajustes de la zona para sobremuestrear",
     "upsampling_not_applied": "Sobremuestreo activado, no aplicado a esta pista (salida, frecuencia o equipo no compatibles); se aplica al abrir la pista siguiente"
   },
   "it": {
@@ -337,6 +341,7 @@
     "upsampling": "Sovracampionamento {0}, filtro {1}, margine di livello {2} dB (plugin)",
     "upsampling_pure": "Sovracampionamento inattivo (modalità PURE)",
     "upsampling_zone_not_supported": "Il sovracampionamento non si applica a questa zona: solo l'uscita locale della macchina lo supporta",
+    "upsampling_strict_bitperfect": "Sovracampionamento inattivo: il bit-perfect strict è attivo su questa zona e rifiuta ogni conversione di frequenza; disattivalo nelle impostazioni della zona per sovracampionare",
     "upsampling_not_applied": "Sovracampionamento attivo, non applicato a questo brano (uscita, frequenza o macchina non supportate); si applica all'apertura del brano successivo"
   },
   "zh": {
@@ -405,6 +410,7 @@
     "upsampling": "升频 {0}，滤波器 {1}，电平余量 {2} dB（插件）",
     "upsampling_pure": "升频未启用（PURE 模式）",
     "upsampling_zone_not_supported": "升频不适用于此区域：仅本机的本地输出支持升频",
+    "upsampling_strict_bitperfect": "升频未启用：此区域已开启 Bit-perfect strict，拒绝任何采样率转换；请在区域设置中关闭它以启用升频",
     "upsampling_not_applied": "升频已启用，未应用于此曲目（输出、采样率或机器不受支持）；将在下一曲目开始时生效"
   },
   "ja": {
@@ -473,6 +479,7 @@
     "upsampling": "アップサンプリング {0}、フィルター {1}、レベル余裕 {2} dB（プラグイン）",
     "upsampling_pure": "アップサンプリング無効（PURE モード）",
     "upsampling_zone_not_supported": "アップサンプリングはこのゾーンには適用されません。対応しているのはこのマシンのローカル出力のみです",
+    "upsampling_strict_bitperfect": "アップサンプリング無効：このゾーンでは Bit-perfect strict が有効で、サンプルレート変換をすべて拒否します。アップサンプリングするにはゾーン設定でオフにしてください",
     "upsampling_not_applied": "アップサンプリングは有効ですが、この曲には適用されていません（出力、レート、またはマシンが非対応）。次の曲から適用されます"
   },
   "ko": {
@@ -541,6 +548,7 @@
     "upsampling": "업샘플링 {0}, 필터 {1}, 레벨 여유 {2} dB (플러그인)",
     "upsampling_pure": "업샘플링 비활성 (PURE 모드)",
     "upsampling_zone_not_supported": "업샘플링은 이 존에 적용되지 않습니다. 이 기기의 로컬 출력만 지원합니다",
+    "upsampling_strict_bitperfect": "업샘플링 비활성: 이 존에서 Bit-perfect strict가 켜져 있어 모든 샘플링 레이트 변환을 거부합니다. 업샘플링하려면 존 설정에서 끄세요",
     "upsampling_not_applied": "업샘플링이 켜져 있지만 이 트랙에는 적용되지 않았습니다(출력, 샘플링 레이트 또는 기기 미지원). 다음 트랙부터 적용됩니다"
   },
   "ro": {
@@ -609,6 +617,7 @@
     "upsampling": "Supraeșantionare {0}, filtru {1}, rezervă de nivel {2} dB (plugin)",
     "upsampling_pure": "Supraeșantionare inactivă (mod PURE)",
     "upsampling_zone_not_supported": "Supraeșantionarea nu se aplică acestei zone: doar ieșirea locală a mașinii o acceptă",
+    "upsampling_strict_bitperfect": "Supraeșantionare inactivă: bit-perfect strict este activat pe această zonă și refuză orice conversie de frecvență; dezactivați-l în setările zonei pentru a supraeșantiona",
     "upsampling_not_applied": "Supraeșantionare activată, neaplicată acestei piese (ieșire, frecvență sau mașină neacceptate); se aplică la deschiderea piesei următoare"
   },
   "sv": {
@@ -677,6 +686,7 @@
     "upsampling": "Uppsampling {0}, filter {1}, nivåmarginal {2} dB (tillägg)",
     "upsampling_pure": "Uppsampling inaktiv (PURE-läge)",
     "upsampling_zone_not_supported": "Uppsampling gäller inte för den här zonen: endast datorns lokala utgång stöder det",
+    "upsampling_strict_bitperfect": "Uppsampling inaktiv: Bit-perfect strict är på för den här zonen och vägrar all konvertering av samplingsfrekvens; stäng av det i zoninställningarna för att uppsampla",
     "upsampling_not_applied": "Uppsampling aktiverad, inte tillämpad på detta spår (utgång, samplingsfrekvens eller dator stöds inte); gäller från nästa spår"
   },
   "vi": {
@@ -745,6 +755,7 @@
     "upsampling": "Tăng tần số lấy mẫu {0}, bộ lọc {1}, dự trữ mức {2} dB (tiện ích)",
     "upsampling_pure": "Tăng tần số lấy mẫu không hoạt động (chế độ PURE)",
     "upsampling_zone_not_supported": "Tăng tần số lấy mẫu không áp dụng cho vùng này: chỉ đầu ra cục bộ của máy hỗ trợ",
+    "upsampling_strict_bitperfect": "Tăng tần số lấy mẫu không hoạt động: Bit-perfect nghiêm ngặt đang bật cho vùng này và từ chối mọi chuyển đổi tần số; hãy tắt nó trong cài đặt vùng để tăng tần số lấy mẫu",
     "upsampling_not_applied": "Đã bật tăng tần số lấy mẫu, chưa áp dụng cho bài này (đầu ra, tần số hoặc máy không được hỗ trợ); áp dụng khi mở bài tiếp theo"
   },
   "hu": {
@@ -813,6 +824,7 @@
     "upsampling": "Felülmintavételezés {0}, szűrő {1}, szinttartalék {2} dB (bővítmény)",
     "upsampling_pure": "Felülmintavételezés inaktív (PURE mód)",
     "upsampling_zone_not_supported": "A felülmintavételezés nem vonatkozik erre a zónára: csak a gép helyi kimenete támogatja",
+    "upsampling_strict_bitperfect": "Felülmintavételezés inaktív: ezen a zónán be van kapcsolva a Bit-perfect strict, amely minden frekvenciaátalakítást elutasít; kapcsolja ki a zóna beállításaiban a felülmintavételezéshez",
     "upsampling_not_applied": "Felülmintavételezés bekapcsolva, erre a számra nem alkalmazva (kimenet, frekvencia vagy gép nem támogatott); a következő számtól érvényes"
   },
   "nb": {
@@ -881,6 +893,7 @@
     "upsampling": "Oppsampling {0}, filter {1}, nivåmargin {2} dB (programtillegg)",
     "upsampling_pure": "Oppsampling inaktiv (PURE-modus)",
     "upsampling_zone_not_supported": "Oppsampling gjelder ikke for denne sonen: bare maskinens lokale utgang støtter det",
+    "upsampling_strict_bitperfect": "Oppsampling inaktiv: Streng bit-perfect er på for denne sonen og nekter all konvertering av samplingsfrekvens; slå det av i soneinnstillingene for å oppsample",
     "upsampling_not_applied": "Oppsampling aktivert, ikke brukt på dette sporet (utgang, samplingsfrekvens eller maskin støttes ikke); gjelder fra neste spor"
   },
   "pl": {
@@ -949,6 +962,7 @@
     "upsampling": "Nadpróbkowanie {0}, filtr {1}, zapas poziomu {2} dB (wtyczka)",
     "upsampling_pure": "Nadpróbkowanie nieaktywne (tryb PURE)",
     "upsampling_zone_not_supported": "Nadpróbkowanie nie dotyczy tej strefy: obsługuje je tylko lokalne wyjście komputera",
+    "upsampling_strict_bitperfect": "Nadpróbkowanie nieaktywne: w tej strefie włączony jest ścisły bit-perfect, który odrzuca każdą konwersję częstotliwości; wyłącz go w ustawieniach strefy, aby nadpróbkowywać",
     "upsampling_not_applied": "Nadpróbkowanie włączone, nie zastosowane do tego utworu (wyjście, częstotliwość lub komputer nieobsługiwane); działa od następnego utworu"
   },
   "el": {
@@ -1017,6 +1031,7 @@
     "upsampling": "Υπερδειγματοληψία {0}, φίλτρο {1}, περιθώριο στάθμης {2} dB (πρόσθετο)",
     "upsampling_pure": "Υπερδειγματοληψία ανενεργή (λειτουργία PURE)",
     "upsampling_zone_not_supported": "Η υπερδειγματοληψία δεν ισχύει σε αυτή τη ζώνη: μόνο η τοπική έξοδος του μηχανήματος την υποστηρίζει",
+    "upsampling_strict_bitperfect": "Η υπερδειγματοληψία είναι ανενεργή: το αυστηρό bit-perfect είναι ενεργό σε αυτή τη ζώνη και αρνείται κάθε μετατροπή συχνότητας· απενεργοποιήστε το στις ρυθμίσεις της ζώνης για υπερδειγματοληψία",
     "upsampling_not_applied": "Η υπερδειγματοληψία είναι ενεργή, δεν εφαρμόστηκε σε αυτό το κομμάτι (έξοδος, συχνότητα ή μηχάνημα δεν υποστηρίζονται)· ισχύει από το επόμενο κομμάτι"
   }
 }

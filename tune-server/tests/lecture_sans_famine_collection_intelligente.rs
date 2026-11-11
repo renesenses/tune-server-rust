@@ -45,6 +45,21 @@
 //! `/smart-collections/{id}/albums` : la réponse JSON est sérialisée sur
 //! l'exécuteur.
 //!
+//! # #8401 — indépendant de la charge de la machine
+//!
+//! Le banc échouait au hasard sur les runners partagés de la CI, saturés : un
+//! silence du flux ou un retard de minuterie peut venir de la MACHINE (le fil
+//! du renderer, ou celui de l'exécuteur, privé de processeur par d'autres
+//! travaux), et non de Tune. Un fil système TÉMOIN, hors de l'exécuteur, dort
+//! à la cadence du renderer et mesure son propre plus long réveil manqué
+//! pendant la rafale : c'est le gel que la machine impose à TOUS les fils,
+//! le banc compris. Les seuils s'en allongent (`SEUIL + 2 × gel`, gel plafonné à 1 s).
+//!
+//! Ce que le banc prouve ne change pas : une famine de l'exécuteur (0.9.168 :
+//! 2,5 à 6,7 s de silence) ne gèle PAS un fil système à part — le témoin
+//! reste à quelques ms et le seuil à ~1 s. Seule une machine elle-même figée
+//! élargit la marge, et d'autant seulement.
+//!
 //! ⚠️ `tune-server` porte `autotests = false` — ce fichier n'est compilé que
 //! par sa cible `[[test]]` dans `Cargo.toml`.
 use std::io::{Read, Write};
@@ -89,6 +104,54 @@ const TAILLE_FICHIER: usize = 48 * 1024 * 1024;
 const SEUIL_SILENCE: Duration = Duration::from_secs(1);
 /// Retard admis d'une minuterie de l'exécuteur, même raison.
 const SEUIL_RETARD: Duration = Duration::from_secs(1);
+
+/// #8401 — le seuil, élargi du gel que la machine a imposé au fil témoin.
+/// Deux fois le gel : le témoin et le fil mesuré ne sont pas gelés aux mêmes
+/// instants, et deux gels successifs peuvent se cumuler sur une fenêtre.
+/// Le gel compté est plafonné à [`GEL_MACHINE_MAX`] : une machine figée
+/// plusieurs secondes (pause de VM) ne doit pas rendre le banc aveugle.
+fn seuil_sous_charge(seuil: Duration, gel_machine: Duration) -> Duration {
+    seuil + gel_machine.min(GEL_MACHINE_MAX) * 2
+}
+
+/// #8401 — au-delà, le gel de la machine n'élargit plus le seuil.
+const GEL_MACHINE_MAX: Duration = Duration::from_secs(1);
+
+/// #8401 — le fil témoin : dort [`CADENCE_RENDERER`] en boucle, hors de
+/// l'exécuteur, et rend son plus long réveil manqué (au-delà de la cadence)
+/// pendant que `actif` est vrai.
+fn temoin_de_la_machine(actif: Arc<AtomicBool>, arret: Arc<AtomicBool>) -> Duration {
+    let mut pire = Duration::ZERO;
+    while !arret.load(Ordering::Relaxed) {
+        let t0 = Instant::now();
+        std::thread::sleep(CADENCE_RENDERER);
+        let manque = t0.elapsed().saturating_sub(CADENCE_RENDERER);
+        if actif.load(Ordering::Relaxed) {
+            pire = pire.max(manque);
+        }
+    }
+    pire
+}
+
+#[test]
+fn le_seuil_ne_s_elargit_que_du_gel_de_la_machine() {
+    // Machine calme : le seuil reste celui de la famine.
+    assert_eq!(
+        seuil_sous_charge(SEUIL_SILENCE, Duration::ZERO),
+        SEUIL_SILENCE
+    );
+    // La famine de la 0.9.168 (2,5 s au moins) reste rouge tant que la machine
+    // ne gèle pas elle-même ses fils plus de 700 ms.
+    assert!(
+        Duration::from_millis(2_500)
+            >= seuil_sous_charge(SEUIL_SILENCE, Duration::from_millis(700))
+    );
+    // Une machine figée 10 s n'ouvre pas un seuil de 21 s.
+    assert_eq!(
+        seuil_sous_charge(SEUIL_SILENCE, Duration::from_secs(10)),
+        Duration::from_secs(3)
+    );
+}
 
 fn env_ou(nom: &str, defaut: usize) -> usize {
     std::env::var(nom)
@@ -341,6 +404,11 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
             pire
         }
     });
+    // #8401 — le témoin de la machine, hors de l'exécuteur.
+    let temoin = std::thread::spawn({
+        let (actif, arret) = (mesurer_retard.clone(), arret.clone());
+        move || temoin_de_la_machine(actif, arret)
+    });
     // Le flux prend son rythme.
     std::thread::sleep(Duration::from_millis(500));
 
@@ -386,6 +454,9 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
     arret.store(true, Ordering::Relaxed);
     let arrivees = lecteur.join().unwrap();
     let pire_lecture_triviale = sonde.join().unwrap();
+    let gel_machine = temoin.join().unwrap();
+    let seuil_silence = seuil_sous_charge(SEUIL_SILENCE, gel_machine);
+    let seuil_retard = seuil_sous_charge(SEUIL_RETARD, gel_machine);
 
     let pire_silence = arrivees
         .windows(2)
@@ -398,7 +469,7 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
         "banc coupure : {} version {} ; {fils} fils ; {pistes} pistes, {albums} albums ; \
          {RAFALES} rafales de {} requêtes en {:.0} ms ; pire silence du flux {:.0} ms ; \
          pire retard de minuterie {:.0} ms ; pire attente d'une lecture triviale {:.0} ms ; \
-         {} lectures du renderer",
+         {} lectures du renderer ; gel de la machine (témoin) {:.0} ms",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
         chemins.len(),
@@ -407,20 +478,27 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
         retard.as_secs_f64() * 1e3,
         pire_lecture_triviale.as_secs_f64() * 1e3,
         arrivees.len(),
+        gel_machine.as_secs_f64() * 1e3,
     );
     for (statut, c) in &statuts {
         assert_eq!(*statut, 200, "{c}");
     }
     assert!(
-        pire_silence < SEUIL_SILENCE,
+        pire_silence < seuil_silence,
         "le renderer DLNA n'a rien reçu pendant {} ms pendant le chargement d'une grosse \
-         collection intelligente ({fils} fils, {pistes} pistes)",
-        pire_silence.as_millis()
+         collection intelligente ({fils} fils, {pistes} pistes ; seuil {} ms dont gel de \
+         la machine {} ms)",
+        pire_silence.as_millis(),
+        seuil_silence.as_millis(),
+        gel_machine.as_millis()
     );
     assert!(
-        retard < SEUIL_RETARD,
+        retard < seuil_retard,
         "une minuterie de l'exécuteur a pris {} ms de retard pendant le chargement d'une \
-         grosse collection intelligente ({fils} fils, {pistes} pistes)",
-        retard.as_millis()
+         grosse collection intelligente ({fils} fils, {pistes} pistes ; seuil {} ms dont gel \
+         de la machine {} ms)",
+        retard.as_millis(),
+        seuil_retard.as_millis(),
+        gel_machine.as_millis()
     );
 }

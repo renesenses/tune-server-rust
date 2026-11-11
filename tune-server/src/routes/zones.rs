@@ -1774,6 +1774,9 @@ mod patch_zone_deserialize_tests;
 mod zone_group_tests;
 
 #[cfg(test)]
+mod groupe_asio_refuse_7759_tests;
+
+#[cfg(test)]
 mod aac_passthrough_tests;
 
 /// Garde-fou : le PATCH d'une zone ne doit plus jamais échouer en silence.

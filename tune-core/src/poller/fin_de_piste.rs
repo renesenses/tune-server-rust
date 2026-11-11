@@ -76,7 +76,7 @@ impl PositionPoller {
     /// Fin de file : plus rien à jouer après cette piste. Autoplay (piste
     /// semée depuis l'écoute en cours) quand la zone l'a demandé, sinon la
     /// zone s'arrête. Chaque chemin sort après avoir décidé.
-    async fn terminer_la_file(
+    pub(super) async fn terminer_la_file(
         &self,
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
