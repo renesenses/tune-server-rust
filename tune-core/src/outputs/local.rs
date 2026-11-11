@@ -1,5 +1,6 @@
 mod boucle_locale_5639;
 mod lecture_http;
+mod retard_de_depart_8437;
 use lecture_http::LecteurHttpAnnulable;
 
 use std::cell::UnsafeCell;
@@ -868,6 +869,10 @@ pub struct LocalOutput {
     /// B), ou `None`. Posée par piste par l'orchestrateur depuis
     /// `zone_{id}_sortie_double`, lue une fois par `play_url`.
     seconde_sortie: std::sync::Mutex<Vec<crate::outputs::sortie_double::SecondeSortieDemandee>>,
+    /// #8437 — retard de départ (ms) de la zone qui va jouer : son
+    /// `sync_delay_ms` quand elle est groupée avec une zone réseau, sinon 0.
+    /// Posé par l'orchestrateur à chaque lecture, lu une fois par `play_url`.
+    retard_de_depart_ms: AtomicU64,
     /// Optional headphone crossfeed effect, applied AFTER the convolver on the
     /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
     /// PURE) and only when the stream is stereo. Set per-play by the
@@ -1486,6 +1491,7 @@ impl LocalOutput {
             pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             seconde_sortie: std::sync::Mutex::new(Vec::new()),
+            retard_de_depart_ms: AtomicU64::new(0),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
             disposition: Arc::new(std::sync::Mutex::new(None)),
@@ -2034,6 +2040,17 @@ impl LocalOutput {
             .into_iter()
             .filter(|d| !d.nom.trim().is_empty())
             .collect();
+    }
+
+    /// #8437 — le retard de départ de la prochaine ouverture du flux (ms),
+    /// voir [`crate::zones::retard_groupe_mixte_8437`]. `0` : départ immédiat.
+    pub fn set_retard_de_depart_ms(&self, ms: u64) {
+        self.retard_de_depart_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// #8437 — le retard que la prochaine ouverture du flux observera.
+    pub(crate) fn retard_de_depart_ms(&self) -> u64 {
+        self.retard_de_depart_ms.load(Ordering::Relaxed)
     }
 
     /// #6132 — le curseur de volume de cette sortie (millièmes), celui que
@@ -6532,6 +6549,9 @@ impl OutputTarget for LocalOutput {
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
         // #6132 — lue UNE fois par piste, comme `strict_bitperfect`.
         let seconde_sortie = self.secondes_sorties();
+        // #8437 — lu UNE fois par piste : une transition gapless ne repasse
+        // pas par `play_url` et garde l'avance prise au départ.
+        let retard_de_depart_ms = self.retard_de_depart_ms();
         let mono_downmix = self.mono_downmix.clone();
         let reaffectation = self.reaffectation.clone();
         let disposition = self.disposition.clone();
@@ -6585,6 +6605,21 @@ impl OutputTarget for LocalOutput {
             // sentinelle ne retombe qu'après le `Drop` du flux cpal, c'est-à-
             // dire après la fermeture effective du PCM (#3575).
             let _sentinelle_du_fil = SentinelleDuFilDeLecture(sentinelle_vivante);
+            // #8437 — groupe mixte (sortie locale + enceintes réseau) : la
+            // sortie locale attend le tampon des enceintes. Avant toute
+            // ouverture (flux, périphérique), interrompu par un Stop.
+            if retard_de_depart_ms > 0 {
+                info!(
+                    retard_ms = retard_de_depart_ms,
+                    "local_audio_retard_de_depart_groupe_mixte"
+                );
+                if !retard_de_depart_8437::attendre(retard_de_depart_ms, &force_silent, |ms| {
+                    std::thread::sleep(std::time::Duration::from_millis(ms))
+                }) {
+                    debug!("local_audio_retard_de_depart_interrompu");
+                    return;
+                }
+            }
             // ------- HTTP fetch the audio stream -------
             // Pas de delai total pour les longues pistes, mais Stop doit
             // interrompre aussi une attente HTTP, pas seulement l'alimentation
