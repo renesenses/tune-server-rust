@@ -81,6 +81,13 @@ pub struct Airplay2Output {
     /// (`submit_pin`) : son refus est un mauvais code, pas un refus du code
     /// par défaut, et ne bloque pas la lecture (#8347).
     connect_par_code: Arc<AtomicBool>,
+    /// #8402 (11/11) — la zone tient le volume (volume fixe, ou PURE
+    /// verrouillé) : une session neuve part à 0 %, jamais à 100 %. Posé par
+    /// l'orchestrateur avant chaque piste, et par la graine de la découverte.
+    volume_tenu_par_la_zone: Arc<AtomicBool>,
+    /// #8402 (11/11) — la dernière lecture a ouvert sa session à 0 % parce
+    /// que la zone tient le volume : l'orchestrateur le dit à l'utilisateur.
+    depart_muet: Arc<AtomicBool>,
 }
 
 /// #8060 — une attente de code PIN : depuis quand, et si le récepteur
@@ -206,6 +213,8 @@ impl Airplay2Output {
             delai_apres_un_refus: appairage_refuse_8347::DELAI_APRES_UN_REFUS,
             session_a_rouvrir: Arc::new(AtomicBool::new(false)),
             connect_par_code: Arc::new(AtomicBool::new(false)),
+            volume_tenu_par_la_zone: Arc::new(AtomicBool::new(false)),
+            depart_muet: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -751,10 +760,14 @@ impl OutputTarget for Airplay2Output {
         // Le daemon n'ouvre qu'un FICHIER : il faut le lui fournir AVANT de
         // le lancer, et refuser tot ce qu'il ne saura pas lire (#2169).
         let lisible = chemin_lisible_par_le_daemon(media, &self.device_id).await?;
+        // #8402 (11/11) — relevé AVANT `ensure_connected`, qui l'ouvrirait.
+        let session_neuve = !self.session_deja_ouverte().await;
         if let Err(error) = self.ensure_connected().await {
             lisible.oublier().await;
             return Err(error);
         }
+        self.partir_muet_si_la_zone_tient_le_volume(session_neuve)
+            .await;
         // #8402 — le démon envoie au récepteur, au départ du flux, le volume
         // qu'il tient (1.0 = 0 dB dans une `Connection` neuve) : il reçoit
         // d'abord celui de la zone. Il traite ses commandes une à une, donc
