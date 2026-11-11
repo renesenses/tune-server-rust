@@ -1,0 +1,615 @@
+{
+  "jazz": {
+    "albums": [
+      {
+        "id": 900,
+        "title": "Low Tide",
+        "artist_id": 412,
+        "artist_name": "Ilse Brandt",
+        "year": 2019,
+        "original_year": null,
+        "genre": "Jazz",
+        "genres": "[\"Jazz\"]",
+        "disc_count": 1,
+        "track_count": 8,
+        "cover_path": "/var/lib/tune/covers/900.jpg",
+        "source": "local",
+        "source_id": null,
+        "label": null,
+        "catalog_number": null,
+        "barcode": null,
+        "format": "flac",
+        "sample_rate": 96000,
+        "bit_depth": 24,
+        "bio": null,
+        "musicbrainz_release_id": null,
+        "musicbrainz_release_group_id": null,
+        "release_date": "2019",
+        "original_date": null,
+        "added_at": 1761900000.0,
+        "is_compilation": false,
+        "release_type": "album",
+        "quality": "hi-res",
+        "community_listens": 37
+      }
+    ],
+    "compilations": [
+      {
+        "id": 950,
+        "title": "Fixture Sampler Vol. 1",
+        "artist_id": 3,
+        "artist_name": "Various Artists",
+        "year": 2021,
+        "original_year": null,
+        "genre": "Jazz",
+        "genres": "[\"Jazz\"]",
+        "disc_count": 1,
+        "track_count": 16,
+        "cover_path": "/var/lib/tune/covers/950.jpg",
+        "source": "local",
+        "source_id": null,
+        "label": null,
+        "catalog_number": null,
+        "barcode": null,
+        "format": "flac",
+        "sample_rate": 44100,
+        "bit_depth": 16,
+        "bio": null,
+        "musicbrainz_release_id": null,
+        "musicbrainz_release_group_id": null,
+        "release_date": "2021",
+        "original_date": null,
+        "added_at": 1761900000.0,
+        "is_compilation": true,
+        "release_type": "album",
+        "quality": "cd"
+      }
+    ],
+    "collaborations": [
+      {
+        "artist_id": 401,
+        "artist_name": "Nora Vidal Quartet",
+        "albums": [
+          {
+            "id": 910,
+            "title": "Fixture Jazz Session",
+            "artist_id": 401,
+            "artist_name": "Nora Vidal Quartet",
+            "year": 2018,
+            "original_year": null,
+            "genre": "Jazz",
+            "genres": "[\"Jazz\"]",
+            "disc_count": 1,
+            "track_count": 7,
+            "cover_path": "/var/lib/tune/covers/910.jpg",
+            "source": "local",
+            "source_id": null,
+            "label": null,
+            "catalog_number": null,
+            "barcode": null,
+            "format": "flac",
+            "sample_rate": 44100,
+            "bit_depth": 16,
+            "bio": null,
+            "musicbrainz_release_id": null,
+            "musicbrainz_release_group_id": null,
+            "release_date": "2018",
+            "original_date": null,
+            "added_at": 1761900000.0,
+            "is_compilation": false,
+            "release_type": "album",
+            "quality": "cd",
+            "focus_track_ids": [
+              9101,
+              9102,
+              9103,
+              9104,
+              9105,
+              9106,
+              9107
+            ],
+            "credit_roles": [
+              "bass"
+            ]
+          },
+          {
+            "id": 911,
+            "title": "Second Session",
+            "artist_id": 401,
+            "artist_name": "Nora Vidal Quartet",
+            "year": 2022,
+            "original_year": null,
+            "genre": "Jazz",
+            "genres": "[\"Jazz\"]",
+            "disc_count": 1,
+            "track_count": 9,
+            "cover_path": "/var/lib/tune/covers/911.jpg",
+            "source": "local",
+            "source_id": null,
+            "label": null,
+            "catalog_number": null,
+            "barcode": null,
+            "format": "flac",
+            "sample_rate": 44100,
+            "bit_depth": 16,
+            "bio": null,
+            "musicbrainz_release_id": null,
+            "musicbrainz_release_group_id": null,
+            "release_date": "2022",
+            "original_date": null,
+            "added_at": 1761900000.0,
+            "is_compilation": false,
+            "release_type": "album",
+            "quality": "cd",
+            "focus_track_ids": [
+              9111,
+              9112,
+              9115
+            ],
+            "credit_roles": [
+              "bass"
+            ]
+          }
+        ]
+      },
+      {
+        "artist_id": null,
+        "artist_name": "Sam Okafor",
+        "albums": [
+          {
+            "id": 920,
+            "title": "Okafor Plays Standards",
+            "artist_id": null,
+            "artist_name": "Sam Okafor",
+            "year": 2020,
+            "original_year": null,
+            "genre": "Jazz",
+            "genres": "[\"Jazz\"]",
+            "disc_count": 1,
+            "track_count": 10,
+            "cover_path": "/var/lib/tune/covers/920.jpg",
+            "source": "local",
+            "source_id": null,
+            "label": null,
+            "catalog_number": null,
+            "barcode": null,
+            "format": "mp3",
+            "sample_rate": 44100,
+            "bit_depth": null,
+            "bio": null,
+            "musicbrainz_release_id": null,
+            "musicbrainz_release_group_id": null,
+            "release_date": "2020",
+            "original_date": null,
+            "added_at": 1761900000.0,
+            "is_compilation": false,
+            "release_type": "album",
+            "quality": "lossy",
+            "focus_track_ids": [
+              9204
+            ],
+            "credit_roles": [
+              "bass"
+            ]
+          }
+        ]
+      }
+    ],
+    "covers": [
+      {
+        "id": 930,
+        "title": "Lena Park Sings",
+        "artist_id": 520,
+        "artist_name": "Lena Park",
+        "year": 2023,
+        "original_year": null,
+        "genre": "Jazz",
+        "genres": "[\"Jazz\"]",
+        "disc_count": 1,
+        "track_count": 11,
+        "cover_path": "/var/lib/tune/covers/930.jpg",
+        "source": "local",
+        "source_id": null,
+        "label": null,
+        "catalog_number": null,
+        "barcode": null,
+        "format": "flac",
+        "sample_rate": 44100,
+        "bit_depth": 16,
+        "bio": null,
+        "musicbrainz_release_id": null,
+        "musicbrainz_release_group_id": null,
+        "release_date": "2023",
+        "original_date": null,
+        "added_at": 1761900000.0,
+        "is_compilation": false,
+        "release_type": "album",
+        "quality": "cd",
+        "focus_track_ids": [
+          9302,
+          9309
+        ],
+        "credit_roles": [
+          "composer"
+        ]
+      }
+    ],
+    "writing": [
+      {
+        "id": 911,
+        "title": "Second Session",
+        "artist_id": 401,
+        "artist_name": "Nora Vidal Quartet",
+        "year": 2022,
+        "original_year": null,
+        "genre": "Jazz",
+        "genres": "[\"Jazz\"]",
+        "disc_count": 1,
+        "track_count": 9,
+        "cover_path": "/var/lib/tune/covers/911.jpg",
+        "source": "local",
+        "source_id": null,
+        "label": null,
+        "catalog_number": null,
+        "barcode": null,
+        "format": "flac",
+        "sample_rate": 44100,
+        "bit_depth": 16,
+        "bio": null,
+        "musicbrainz_release_id": null,
+        "musicbrainz_release_group_id": null,
+        "release_date": "2022",
+        "original_date": null,
+        "added_at": 1761900000.0,
+        "is_compilation": false,
+        "release_type": "album",
+        "quality": "cd",
+        "focus_track_ids": [
+          9111,
+          9112,
+          9113,
+          9114,
+          9115,
+          9116,
+          9117,
+          9118,
+          9119
+        ],
+        "credit_roles": [
+          "producer"
+        ]
+      },
+      {
+        "id": 930,
+        "title": "Lena Park Sings",
+        "artist_id": 520,
+        "artist_name": "Lena Park",
+        "year": 2023,
+        "original_year": null,
+        "genre": "Jazz",
+        "genres": "[\"Jazz\"]",
+        "disc_count": 1,
+        "track_count": 11,
+        "cover_path": "/var/lib/tune/covers/930.jpg",
+        "source": "local",
+        "source_id": null,
+        "label": null,
+        "catalog_number": null,
+        "barcode": null,
+        "format": "flac",
+        "sample_rate": 44100,
+        "bit_depth": 16,
+        "bio": null,
+        "musicbrainz_release_id": null,
+        "musicbrainz_release_group_id": null,
+        "release_date": "2023",
+        "original_date": null,
+        "added_at": 1761900000.0,
+        "is_compilation": false,
+        "release_type": "album",
+        "quality": "cd",
+        "focus_track_ids": [
+          9302,
+          9309
+        ],
+        "credit_roles": [
+          "composer"
+        ]
+      }
+    ],
+    "credit_counts": {
+      "performing": {
+        "albums": 5,
+        "tracks": 20
+      },
+      "writing": {
+        "albums": 3,
+        "tracks": 15
+      }
+    },
+    "played_with": [
+      {
+        "artist_id": 401,
+        "artist_name": "Nora Vidal Quartet",
+        "shared_tracks": 10
+      },
+      {
+        "artist_id": 402,
+        "artist_name": "Nora Vidal",
+        "shared_tracks": 10
+      },
+      {
+        "artist_id": null,
+        "artist_name": "Sam Okafor",
+        "shared_tracks": 8
+      },
+      {
+        "artist_id": null,
+        "artist_name": "Tomas Reyes",
+        "shared_tracks": 7
+      }
+    ]
+  },
+  "chef": {
+    "albums": [
+      {
+        "id": 1001,
+        "title": "Sibelius: Symphonies 2 & 5",
+        "artist_id": 433,
+        "artist_name": "Henrik Lund",
+        "year": 2017,
+        "original_year": null,
+        "genre": "Classical",
+        "genres": "[\"Classical\"]",
+        "disc_count": 1,
+        "track_count": 8,
+        "cover_path": "/var/lib/tune/covers/1001.jpg",
+        "source": "local",
+        "source_id": null,
+        "label": null,
+        "catalog_number": null,
+        "barcode": null,
+        "format": "flac",
+        "sample_rate": 96000,
+        "bit_depth": 24,
+        "bio": null,
+        "musicbrainz_release_id": null,
+        "musicbrainz_release_group_id": null,
+        "release_date": "2017",
+        "original_date": null,
+        "added_at": 1761900000.0,
+        "is_compilation": false,
+        "release_type": "album",
+        "quality": "hi-res",
+        "community_listens": 12
+      }
+    ],
+    "live": [
+      {
+        "id": 1002,
+        "title": "Live at the Fixture Hall",
+        "artist_id": 433,
+        "artist_name": "Henrik Lund",
+        "year": 2021,
+        "original_year": null,
+        "genre": "Classical",
+        "genres": "[\"Classical\"]",
+        "disc_count": 1,
+        "track_count": 6,
+        "cover_path": "/var/lib/tune/covers/1002.jpg",
+        "source": "local",
+        "source_id": null,
+        "label": null,
+        "catalog_number": null,
+        "barcode": null,
+        "format": "flac",
+        "sample_rate": 44100,
+        "bit_depth": 16,
+        "bio": null,
+        "musicbrainz_release_id": null,
+        "musicbrainz_release_group_id": null,
+        "release_date": "2021",
+        "original_date": null,
+        "added_at": 1761900000.0,
+        "is_compilation": false,
+        "release_type": "album",
+        "quality": "cd",
+        "release_secondary_types": [
+          "live"
+        ]
+      }
+    ],
+    "appearances": [
+      {
+        "id": 1010,
+        "title": "Fixture Concertos",
+        "artist_id": 440,
+        "artist_name": "Clara Moreau",
+        "year": 2016,
+        "original_year": null,
+        "genre": "Classical",
+        "genres": "[\"Classical\"]",
+        "disc_count": 1,
+        "track_count": 6,
+        "cover_path": "/var/lib/tune/covers/1010.jpg",
+        "source": "local",
+        "source_id": null,
+        "label": null,
+        "catalog_number": null,
+        "barcode": null,
+        "format": "flac",
+        "sample_rate": 44100,
+        "bit_depth": 16,
+        "bio": null,
+        "musicbrainz_release_id": null,
+        "musicbrainz_release_group_id": null,
+        "release_date": "2016",
+        "original_date": null,
+        "added_at": 1761900000.0,
+        "is_compilation": false,
+        "release_type": "album",
+        "quality": "cd"
+      }
+    ],
+    "collaborations": [
+      {
+        "artist_id": 441,
+        "artist_name": "Orchestre Fixture de Lyon",
+        "albums": [
+          {
+            "id": 1020,
+            "title": "Brahms: Ein deutsches Requiem",
+            "artist_id": 441,
+            "artist_name": "Orchestre Fixture de Lyon",
+            "year": 2019,
+            "original_year": null,
+            "genre": "Classical",
+            "genres": "[\"Classical\"]",
+            "disc_count": 1,
+            "track_count": 7,
+            "cover_path": "/var/lib/tune/covers/1020.jpg",
+            "source": "local",
+            "source_id": null,
+            "label": null,
+            "catalog_number": null,
+            "barcode": null,
+            "format": "flac",
+            "sample_rate": 44100,
+            "bit_depth": 16,
+            "bio": null,
+            "musicbrainz_release_id": null,
+            "musicbrainz_release_group_id": null,
+            "release_date": "2019",
+            "original_date": null,
+            "added_at": 1761900000.0,
+            "is_compilation": false,
+            "release_type": "album",
+            "quality": "cd",
+            "focus_track_ids": [
+              10201,
+              10202,
+              10203,
+              10204,
+              10205,
+              10206,
+              10207
+            ],
+            "credit_roles": [
+              "conductor"
+            ]
+          }
+        ]
+      },
+      {
+        "artist_id": 450,
+        "artist_name": "DJ Okapi",
+        "albums": [
+          {
+            "id": 1030,
+            "title": "Okapi Reworks Brahms",
+            "artist_id": 450,
+            "artist_name": "DJ Okapi",
+            "year": 2024,
+            "original_year": null,
+            "genre": "Electronic",
+            "genres": "[\"Electronic\"]",
+            "disc_count": 1,
+            "track_count": 5,
+            "cover_path": "/var/lib/tune/covers/1030.jpg",
+            "source": "local",
+            "source_id": null,
+            "label": null,
+            "catalog_number": null,
+            "barcode": null,
+            "format": "aac",
+            "sample_rate": 44100,
+            "bit_depth": null,
+            "bio": null,
+            "musicbrainz_release_id": null,
+            "musicbrainz_release_group_id": null,
+            "release_date": "2024",
+            "original_date": null,
+            "added_at": 1761900000.0,
+            "is_compilation": false,
+            "release_type": "album",
+            "quality": "lossy",
+            "focus_track_ids": [
+              10303
+            ],
+            "credit_roles": [
+              "remixer"
+            ]
+          }
+        ]
+      }
+    ],
+    "writing": [
+      {
+        "id": 1040,
+        "title": "Nordic Songs",
+        "artist_id": 460,
+        "artist_name": "Elise Fournier",
+        "year": 2022,
+        "original_year": null,
+        "genre": "Classical",
+        "genres": "[\"Classical\"]",
+        "disc_count": 1,
+        "track_count": 12,
+        "cover_path": "/var/lib/tune/covers/1040.jpg",
+        "source": "local",
+        "source_id": null,
+        "label": null,
+        "catalog_number": null,
+        "barcode": null,
+        "format": "flac",
+        "sample_rate": 44100,
+        "bit_depth": 16,
+        "bio": null,
+        "musicbrainz_release_id": null,
+        "musicbrainz_release_group_id": null,
+        "release_date": "2022",
+        "original_date": null,
+        "added_at": 1761900000.0,
+        "is_compilation": false,
+        "release_type": "album",
+        "quality": "cd",
+        "focus_track_ids": [
+          10401,
+          10402,
+          10403,
+          10404
+        ],
+        "credit_roles": [
+          "arranger"
+        ]
+      }
+    ],
+    "credit_counts": {
+      "performing": {
+        "albums": 5,
+        "tracks": 25
+      },
+      "writing": {
+        "albums": 1,
+        "tracks": 4
+      }
+    },
+    "played_with": [
+      {
+        "artist_id": 441,
+        "artist_name": "Orchestre Fixture de Lyon",
+        "shared_tracks": 7
+      },
+      {
+        "artist_id": 440,
+        "artist_name": "Clara Moreau",
+        "shared_tracks": 3
+      },
+      {
+        "artist_id": 450,
+        "artist_name": "DJ Okapi",
+        "shared_tracks": 1
+      }
+    ]
+  }
+}
