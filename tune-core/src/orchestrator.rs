@@ -2159,6 +2159,8 @@ mod volume_openhome_sans_attendre_7633_tests;
 mod volume_openhome_echelle_7841_tests;
 // #8151 — la sourdine de la zone tient au démarrage de chaque piste.
 mod sourdine_a_la_piste_8151;
+// #8402 (11/11) — AirPlay 2 en volume fixe ou PURE verrouillé : départ à 0 %, dit.
+mod depart_muet_airplay2_8402;
 #[cfg(test)]
 mod sourdine_a_la_piste_8151_tests;
 pub use dsp::PorteeDuReglage;
