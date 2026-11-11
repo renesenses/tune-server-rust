@@ -925,6 +925,12 @@ pub async fn get_lyrics(
         && cached.spares_a_fetch()
     {
         debug!(track_id, "lyrics_cache_hit");
+        // Un échec porte la marque #8417 en base ; le client lit « lrclib ».
+        let source = if cached.is_negative() {
+            "lrclib".to_string()
+        } else {
+            cached.source.clone()
+        };
         let lines = cached
             .synced_lyrics
             .as_deref()
@@ -934,12 +940,7 @@ pub async fn get_lyrics(
             synced: !lines.is_empty(),
             lines,
             plain_text: cached.plain_lyrics,
-            // Un échec porte la marque #8417 en base ; le client lit « lrclib ».
-            source: if cached.is_negative() {
-                "lrclib".into()
-            } else {
-                cached.source
-            },
+            source,
         });
     }
 

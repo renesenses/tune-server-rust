@@ -53,6 +53,8 @@
 //! Rust) — la même règle exactement que la route à la demande. Une piste sans
 //! paroles n'est donc réinterrogée qu'après
 //! [`crate::lyrics::NEGATIVE_CACHE_TTL_DAYS`] jours, pas à chaque passe.
+//! Depuis #8417, seul un échec marqué [`crate::lyrics::SOURCE_ECHEC_LRCLIB`]
+//! compte : ceux d'avant le dernier essai sans album sont repris d'office.
 //!
 //! C'est aussi ce qui rend la passe **reprenable** : une passe interrompue a
 //! déjà écrit une ligne pour chaque piste traitée, donc la suivante reprend
@@ -123,8 +125,11 @@ const HAS_LRCLIB: &str = "EXISTS (SELECT 1 FROM lyrics_cache c WHERE c.track_id 
        OR (c.plain_lyrics IS NOT NULL AND c.plain_lyrics <> '')))";
 
 /// LRCLIB a déjà été interrogé pour cette piste et n'avait rien — la trace de
-/// tentative, celle qui évite de repayer.
+/// tentative, celle qui évite de repayer. Seuls les échecs marqués
+/// [`crate::lyrics::SOURCE_ECHEC_LRCLIB`] comptent (#8417) : ceux d'avant sont
+/// repris par [`candidates`], l'indicateur doit les compter comme à faire.
 const SEARCHED_EMPTY: &str = "EXISTS (SELECT 1 FROM lyrics_cache c WHERE c.track_id = t.id \
+     AND c.source = 'lrclib-8417' \
      AND (c.synced_lyrics IS NULL OR c.synced_lyrics = '') \
      AND (c.plain_lyrics IS NULL OR c.plain_lyrics = ''))";
 
@@ -220,8 +225,8 @@ pub struct LyricsCandidate {
 
 /// Pistes sans paroles connues **et** qui ne coûteraient pas une requête déjà
 /// payée : ni `.lrc`, ni étiquette, ni entrée `lyrics_cache` encore valable
-/// (positive, ou négative de moins de
-/// [`crate::lyrics::NEGATIVE_CACHE_TTL_DAYS`] jours).
+/// (positive, ou négative marquée [`crate::lyrics::SOURCE_ECHEC_LRCLIB`] de
+/// moins de [`crate::lyrics::NEGATIVE_CACHE_TTL_DAYS`] jours, #8417).
 ///
 /// Les pistes sans artiste ou sans titre sont écartées : LRCLIB exige les deux,
 /// la route à la demande s'arrête pareil (`if artist.is_empty()`), et les
@@ -1532,6 +1537,15 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![ancien], "seul l'échec d'avant #8417 est repris");
         assert_eq!(compter_les_candidats(&db), Some(1));
+        // L'indicateur dit la même chose : l'ancien échec est « jamais
+        // cherché » (à refaire), le récent « cherché sans résultat ».
+        let cov = coverage(&db).unwrap();
+        assert_eq!(cov.searched_no_result, 1, "{cov:?}");
+        assert_eq!(cov.never_searched, 1, "{cov:?}");
+        assert!(
+            SEARCHED_EMPTY.contains(&format!("'{}'", crate::lyrics::SOURCE_ECHEC_LRCLIB)),
+            "l'indicateur lit la même marque que la sélection"
+        );
 
         let entree = crate::lyrics::load_cache_entry(&db, ancien).unwrap();
         assert!(
