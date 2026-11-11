@@ -2053,6 +2053,57 @@ impl PositionPoller {
             }
             ps.transition(fsm::Transition::PremierEchantillonPlausible);
 
+            // #8082 — flux continu : le renderer a franchi la frontière d'une
+            // piste DANS le flux (`outputs::dlna_flux_continu`, qui rapporte
+            // déjà la position à la nouvelle piste). Rien n'est envoyé au
+            // renderer : la file avance, l'écran, l'historique et le
+            // préchargement suivent, comme pour un enchaînement adopté.
+            if let Some((zone_du_plan, piste)) =
+                crate::outputs::dlna_flux_continu::prendre_le_passage(&device_id)
+                && zone_du_plan == zone_id
+            {
+                info!(
+                    zone_id,
+                    position = piste.position,
+                    track_id = piste.track_id,
+                    position_ms = status.position_ms,
+                    "flux_continu_passage_de_piste"
+                );
+                match self
+                    .orchestrator
+                    .avancer_dans_le_flux_continu(zone_id, &device_id, &piste)
+                    .await
+                {
+                    Ok(()) => {
+                        ps.gapless_sent = false;
+                        ps.gapless_sent_at = None;
+                        ps.gapless_armed = None;
+                        ps.stopped_ticks = 0;
+                        ps.past_end_ticks = 0;
+                        ps.peak_position_ms = status.position_ms;
+                        ps.last_position_ms = status.position_ms;
+                        ps.dernier_releve_de_position_at = Some(Instant::now());
+                        ps.last_bytes_sent = 0;
+                        ps.playing_stall_ticks = 0;
+                        ps.stall_declines = 0;
+                        ps.track_started_at = Some(Instant::now());
+                        ps.gapless_advance_pending = false;
+                        ps.gapless_stuck_ticks = 0;
+                        ps.transition(fsm::Transition::TransitionDetectee);
+                        ps.gapless_cooldown = 4;
+                        ps.scrobbled_key = None;
+                    }
+                    Err(e) => {
+                        // La file n'a pas suivi : le plan ne dit plus ce que
+                        // Tune affiche. On le quitte ; la fin du flux reprend
+                        // la file par le chemin normal.
+                        warn!(zone_id, error = %e, "flux_continu_passage_non_suivi");
+                        crate::outputs::dlna_flux_continu::oublier(&device_id);
+                    }
+                }
+                continue;
+            }
+
             // enough of the track was actually played before accepting a
             // gapless transition.  We update this BEFORE checking for resets
             // so the peak reflects the last known good position.

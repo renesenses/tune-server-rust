@@ -108,7 +108,7 @@ pub(crate) fn echantillons_de_la_fenetre(max_duration_s: f64, rate: u32, channel
 /// Without this fix, 24-bit ALAC files are decoded as 16-bit, producing a
 /// WAV stream whose PCM data mismatches the header — causing silence or
 /// errors on DLNA renderers.
-fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
+pub(crate) fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
     if let Some(bps) = params.bits_per_sample {
         return bps as u16;
     }
