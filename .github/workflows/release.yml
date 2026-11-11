@@ -366,6 +366,7 @@ jobs:
           # et le message d'erreur final ci-dessous ne pouvait pas s'afficher.
           # Mesure du 19/08 sur la 0.9.88 : marche tuee a 6 min 07.
           for essai in 1 2 3; do
+            bash scripts/ci/apt-robuste.sh
             if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
               echo "libasound2-dev installe (essai $essai)"
               exit 0
@@ -1612,6 +1613,7 @@ jobs:
             scripts/creer-alias-actifs-release.sh
             scripts/canal-de-release.sh
             scripts/assembler-notes-release.py
+            scripts/ci/apt-robuste.sh
             .github/scripts/forme-des-notes.awk
             tune-server/src/i18n.rs
             .release/
@@ -1721,6 +1723,7 @@ jobs:
           # automatique de tout le parc — bien pire qu'une release en retard.
           # Trois essais bornes, puis on echoue en le disant.
           for essai in 1 2 3; do
+            bash scripts/ci/apt-robuste.sh
             if timeout 100 sudo apt-get update && timeout 100 sudo apt-get install -y minisign; then
               break
             fi
