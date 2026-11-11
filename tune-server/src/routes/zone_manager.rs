@@ -417,10 +417,31 @@ async fn list_groups(State(state): State<AppState>) -> Json<Value> {
     Json(json!(groups))
 }
 
+/// #7759 — le refus `group_asio_unsupported` des routes du gestionnaire de
+/// zones, dans la langue de la requête.
+async fn refus_asio_du_gestionnaire(
+    state: &AppState,
+    zone_ids: &[i64],
+) -> Option<axum::response::Response> {
+    let zones = ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap_or_default();
+    let refus = crate::routes::zones::refus_du_groupe_asio(state, zone_ids, &zones).await?;
+    Some(crate::routes::zones::group_refusal_response(
+        &refus,
+        crate::message_api::langue(),
+    ))
+}
+
 async fn create_group(
     State(state): State<AppState>,
     Json(body): Json<CreateGroupRequest>,
 ) -> impl IntoResponse {
+    // #7759 — même règle que `POST /zones/group` : la lecture groupée n'est
+    // possible qu'en WASAPI.
+    if let Some(refus) = refus_asio_du_gestionnaire(&state, &body.zone_ids).await {
+        return refus;
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut groups = load_json_setting(&settings, "zone_groups");
     // #7937 — une zone n'appartient qu'à UN groupe (même règle que
@@ -461,6 +482,10 @@ async fn update_group(
                 groups[i]["name"] = json!(name);
             }
             if let Some(ref zone_ids) = body.zone_ids {
+                // #7759 — étendre un groupe à une zone ASIO est refusé.
+                if let Some(refus) = refus_asio_du_gestionnaire(&state, zone_ids).await {
+                    return refus;
+                }
                 groups[i]["zone_ids"] = json!(zone_ids);
             }
             let result = groups[i].clone();
