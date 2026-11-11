@@ -667,6 +667,11 @@ pub struct DlnaOutput {
     /// Hors de la fenêtre, une hausse qui retombe sur cette valeur est le même
     /// saut, pas un geste au bouton.
     saut_de_l_appareil_pct: AtomicU64,
+    /// #8328 (relecture) — valeur (en pour-cent) de la dernière demande de
+    /// volume de Tune, notée AVANT l'acquittement : tant que `memoriser_volume`
+    /// n'a pas suivi, la consigne connue est encore l'ancienne. Une lecture
+    /// égale à cette demande, dans la grâce, est Tune lui-même, pas le saut.
+    volume_demande_pct: AtomicU64,
     /// #5793 — URL du SCPD de `RenderingControl`, telle que le descriptif de
     /// l'appareil l'annonce. `None` : sortie construite sans descriptif, le
     /// profil standard s'applique.
@@ -861,6 +866,7 @@ impl DlnaOutput {
             uri_posee_a: std::sync::Mutex::new(None),
             volume_demande_a: std::sync::Mutex::new(None),
             saut_de_l_appareil_pct: AtomicU64::new(u64::MAX),
+            volume_demande_pct: AtomicU64::new(u64::MAX),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
             scpd_av_transport: std::sync::RwLock::new(None),
@@ -1607,6 +1613,12 @@ impl DlnaOutput {
             );
             super::dlna_repli_set_uri::memoriser_volume_remonte_a_l_uri(&self.device_id);
         }
+        // #8328 — la valeur du saut est retenue, sourdine comprise : hors de
+        // la fenêtre, le même saut se reconnaît à elle.
+        if lu - connu >= HAUSSE_QUI_APPREND {
+            self.saut_de_l_appareil_pct
+                .store((lu * 100.0).round() as u64, Ordering::Relaxed);
+        }
         // #8151 — en sourdine, seule la sourdine est reposée, jamais un
         // `SetVolume` : un firmware qui lève sa sourdine sur `SetVolume`
         // jouerait la consigne le temps d'un aller-retour. La consigne reste
@@ -1619,12 +1631,6 @@ impl DlnaOutput {
                 return 0.0;
             }
             return connu;
-        }
-        // #8328 — la valeur du saut est retenue : hors de la fenêtre, le
-        // même saut se reconnaît à elle.
-        if lu - connu >= HAUSSE_QUI_APPREND {
-            self.saut_de_l_appareil_pct
-                .store((lu * 100.0).round() as u64, Ordering::Relaxed);
         }
         match self.set_volume(connu).await {
             Ok(()) => {
@@ -3363,7 +3369,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        self.noter_demande_de_volume();
+        self.noter_demande_de_volume(volume);
         if let Some(ip) = &self.micromega_ip {
             let target_vol = volume * 100.0;
             let msg = format!("GET /volume HTTP/1.0\r\n\r\nvolume={target_vol:.1}\r\n");

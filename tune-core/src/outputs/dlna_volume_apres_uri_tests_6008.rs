@@ -459,6 +459,88 @@ async fn hors_fenetre_le_saut_connu_est_reimpose_meme_dans_la_grace_8328() {
     assert!((statut.volume - 0.20).abs() < 0.005, "{}", statut.volume);
 }
 
+/// 🔴 #8328 — la séquence du journal de pissa7 (fil 2740, rc11), rejouée
+/// sur un faux `RenderingControl` : consigne 20 %, plusieurs pistes où
+/// l'Abyss remonte à 80 à chaque pose (corrigé dans la fenêtre), puis un
+/// geste au bouton de l'appareil (20 → 30, suivi par #7379), puis, quelques
+/// secondes plus tard et hors de la fenêtre, le saut propre de l'appareil à
+/// 80. Ce saut n'arrive jamais au sondeur, l'appareil est ramené, et aucun
+/// `SetVolume` ne part au-dessus de la consigne de Tune.
+#[tokio::test]
+async fn sequence_du_journal_2740_le_saut_apres_un_geste_au_bouton_est_reimpose_8328() {
+    let udn = "uuid:banc-8328-2740-sequence";
+    let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.20).await;
+    // Pistes suivantes : saut à 80 à chaque pose, corrigé dans la fenêtre.
+    for url in [
+        "http://127.0.0.1:9/stream/2740-b.flac",
+        "http://127.0.0.1:9/stream/2740-c.flac",
+    ] {
+        sortie.play_media(&piste(url)).await.expect("la piste part");
+        *etat.volume.lock().await = 80;
+        let statut = sortie.get_status().await.unwrap();
+        assert!(
+            (statut.volume - 0.20).abs() < 0.005,
+            "prémisse : saut corrigé dans la fenêtre ({})",
+            statut.volume
+        );
+    }
+    sortie.vieillir_la_pose_d_uri();
+    sortie.vieillir_la_demande_de_volume();
+
+    // Geste au bouton de l'Abyss : 30, suivi tel quel, sans commande.
+    let avant = etat.set_volume.lock().await.len();
+    *etat.volume.lock().await = 30;
+    let statut = sortie.get_status().await.unwrap();
+    assert!(
+        (statut.volume - 0.30).abs() < 0.005,
+        "#7379 : le geste au bouton reste suivi ({})",
+        statut.volume
+    );
+    assert!(etat.set_volume.lock().await[avant..].is_empty());
+
+    // Quelques secondes plus tard, hors de la fenêtre : l'appareil saute à 80.
+    *etat.volume.lock().await = 80;
+    let statut = sortie.get_status().await.unwrap();
+    let tenu = *etat.volume.lock().await;
+    let apres = etat.set_volume.lock().await[avant..].to_vec();
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+
+    // La consigne connue de la sortie est la dernière commande de Tune (20) :
+    // le sondeur, absent du banc, n'y écrit pas le geste au bouton.
+    assert!(
+        (statut.volume - 0.20).abs() < 0.005,
+        "#8328 : le sondeur a reçu {} au lieu de la consigne (le saut serait adopté)",
+        statut.volume
+    );
+    assert_eq!(tenu, 20, "#8328 : l'appareil est resté à {tenu} %");
+    assert_eq!(apres, vec![20], "#8328 : un seul SetVolume, à la consigne");
+}
+
+/// #8328 (relecture) — l'auditeur pose 80 depuis Tune alors que le saut
+/// retenu est 80 : un relevé à 80 qui arrive avant l'acquittement (consigne
+/// connue encore à 22) est sa propre demande, pas le saut. Rien n'est
+/// réimposé, son choix n'est pas écrasé.
+#[tokio::test]
+async fn une_demande_de_tune_a_la_valeur_du_saut_n_est_pas_reimposee_8328() {
+    let udn = "uuid:banc-8328-demande-a-80";
+    let (sortie, etat, vie) = abyss_hors_fenetre(udn, 0.22).await;
+    let avant = etat.set_volume.lock().await.len();
+    sortie.demande_de_volume_en_vol(0.80);
+    *etat.volume.lock().await = 80;
+    let statut = sortie.get_status().await.unwrap();
+    let tenu = *etat.volume.lock().await;
+    let apres = etat.set_volume.lock().await[avant..].to_vec();
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+    assert_eq!(
+        tenu, 80,
+        "la demande de l'auditeur a été écrasée : {apres:?}"
+    );
+    assert!(apres.is_empty(), "aucun SetVolume : {apres:?}");
+    assert!((statut.volume - 0.80).abs() < 0.005, "{}", statut.volume);
+}
+
 /// #8328, contre-épreuve de #7379 — une hausse au bouton qui ne retombe pas
 /// sur la valeur du saut (ici 84, à plus de 10 points de la consigne) reste
 /// suivie : la sortie la rend telle quelle au sondeur, sans commande.

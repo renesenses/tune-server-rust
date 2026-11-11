@@ -89,11 +89,22 @@ pub(crate) fn meme_origine(piste_de_l_appareil: &str, pose_de_tune: &str) -> boo
 
 impl DlnaOutput {
     /// Retient qu'une demande de volume de Tune part maintenant.
-    pub(super) fn noter_demande_de_volume(&self) {
+    pub(super) fn noter_demande_de_volume(&self, volume: f64) {
+        self.volume_demande_pct.store(
+            (volume.clamp(0.0, 1.0) * 100.0).round() as u64,
+            Ordering::Relaxed,
+        );
         *self
             .volume_demande_a
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    }
+
+    /// Banc #8328 : une demande de volume de Tune partie, dont l'acquittement
+    /// n'est pas encore revenu (la consigne connue n'a pas suivi).
+    #[cfg(test)]
+    pub(crate) fn demande_de_volume_en_vol(&self, volume: f64) {
+        self.noter_demande_de_volume(volume);
     }
 
     /// Banc : fait comme si la dernière demande de volume datait d'au-delà de
@@ -171,7 +182,20 @@ impl DlnaOutput {
         if saut == u64::MAX || lu - connu < super::HAUSSE_QUI_APPREND {
             return false;
         }
-        ((lu * 100.0).round() - saut as f64).abs() <= 1.0
+        let lu_pct = (lu * 100.0).round();
+        if (lu_pct - saut as f64).abs() > 1.0 {
+            return false;
+        }
+        // Relecture : une demande de Tune à cette valeur, encore dans la
+        // grâce (acquittement pas revenu, consigne connue pas encore à jour),
+        // est l'auditeur qui pose 80 depuis Tune, pas l'appareil.
+        let demande = self.volume_demande_pct.load(Ordering::Relaxed);
+        let en_grace = self
+            .volume_demande_a
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|t| t.elapsed() < GRACE_APRES_DEMANDE);
+        !(en_grace && demande != u64::MAX && (lu_pct - demande as f64).abs() <= 1.0)
     }
 
     /// #8328 — repose la consigne de Tune sur un appareil qui a refait son
@@ -180,6 +204,17 @@ impl DlnaOutput {
     /// dernière de Tune, et la valeur reposée n'est jamais plus haute que le
     /// relevé.
     async fn reimposer_hors_fenetre(&self, lu: f64, connu: f64) -> f64 {
+        // #8151 — en sourdine, seule la sourdine est reposée, comme dans la
+        // fenêtre : un `SetVolume` à la consigne rendrait le son à un appareil
+        // tenu muet par un volume nul, ou à un firmware qui lève sa sourdine
+        // sur `SetVolume`.
+        if self.en_sourdine() {
+            self.reimposer_la_sourdine("saut_connu_hors_fenetre").await;
+            if self.sourdine_par_volume_nul.load(Ordering::Relaxed) {
+                return 0.0;
+            }
+            return connu;
+        }
         match self.set_volume(connu).await {
             Ok(()) => {
                 warn!(
