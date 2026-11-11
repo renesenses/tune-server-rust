@@ -3296,6 +3296,116 @@ fn radio_hls_6357_le_chemin_du_signal_nomme_hls_et_le_profil() {
     }
 }
 
+/// #7802 — une radio HLS repliée sur une variante plus basse, parce que le
+/// diffuseur a refusé la plus haute (403 hors Royaume-Uni pour la BBC) :
+/// l'étape Source porte le débit MESURÉ (97, et non les 101 kbit/s que la
+/// liste déclare, conteneur compris), et son détail nomme la qualité
+/// refusée et le statut, dans la langue demandée. Sans repli, aucun détail ;
+/// sans mesure (MP3), la bande déclarée sert de débit.
+#[test]
+fn radio_hls_7802_le_repli_de_variante_est_explique() {
+    use tune_core::http::streamer::{RadioSourceInfo, VarianteRefusee};
+    let (backend, mut zone) = dlna_zone();
+    zone.output_type = Some("dlna".into());
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            source: "radio".into(),
+            format: Some("wav".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let refus = Some(VarianteRefusee {
+        bande_kbps: 339,
+        statut: 403,
+    });
+    for (lang, profil, format, mesure, declare, refus, desc, detail) in [
+        (
+            "fr",
+            Some("HE-AAC"),
+            Some("aac"),
+            Some(97),
+            Some(101),
+            refus,
+            "HLS · HE-AAC 97 kbit/s 48kHz",
+            Some(
+                "La qualité 339 kbit/s est refusée par le diffuseur (HTTP 403), souvent une \
+                 restriction géographique : Tune joue la qualité suivante",
+            ),
+        ),
+        (
+            "en",
+            Some("HE-AAC"),
+            Some("aac"),
+            Some(97),
+            Some(101),
+            refus,
+            "HLS · HE-AAC 97 kbit/s 48kHz",
+            Some(
+                "The 339 kbit/s quality is refused by the broadcaster (HTTP 403), often a \
+                 geographic restriction: Tune plays the next quality down",
+            ),
+        ),
+        (
+            "fr",
+            Some("AAC-LC"),
+            Some("aac"),
+            Some(318),
+            Some(339),
+            None,
+            "HLS · AAC-LC 318 kbit/s 48kHz",
+            None,
+        ),
+        (
+            "fr",
+            None,
+            Some("mp3"),
+            None,
+            Some(128),
+            None,
+            "HLS · MP3 128 kbit/s 48kHz",
+            None,
+        ),
+    ] {
+        let stream = StreamInfo {
+            radio_source: Some(RadioSourceInfo {
+                channels: Some(2),
+                format,
+                sample_rate: Some(48_000),
+                transport: Some("hls"),
+                profil,
+                debit_kbps: mesure,
+                bitrate_kbps: declare,
+                variante_refusee: refus,
+                ..Default::default()
+            }),
+            ..wire("wav", 48_000, 16)
+        };
+        let sp = build_signal_path_lang(
+            lang,
+            &ps,
+            &zone,
+            &backend,
+            Some("Renderer"),
+            "none",
+            Some(&stream),
+        )
+        .unwrap();
+        assert_eq!(
+            step_desc(&sp, "Source").as_deref(),
+            Some(desc),
+            "{lang} : le débit mesuré prime sur la bande déclarée"
+        );
+        assert_eq!(
+            step_detail(&sp, "Source").as_deref(),
+            detail,
+            "{lang} : le détail de l'étape Source explique le repli, et lui seul"
+        );
+    }
+}
+
 #[test]
 fn radio_4346_without_probe_cannot_claim_lossless() {
     let (backend, zone) = dlna_zone();

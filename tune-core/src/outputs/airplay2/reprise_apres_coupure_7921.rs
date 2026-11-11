@@ -67,8 +67,7 @@ impl Airplay2Output {
 
     /// Rouvre la session d'un daemon vivant dont le récepteur a fermé la
     /// connexion : `disconnect` (le daemon lâche la socket morte), `connect`
-    /// attendu jusqu'à `connected`, puis le volume mémorisé, réglé peut-être
-    /// pendant la pause.
+    /// attendu jusqu'à `connected`. Le volume mémorisé suit dans `play_media`.
     pub(super) async fn rouvrir_la_session(&self) -> Result<(), String> {
         let _command_guard = self.transport_command.lock().await;
         warn!(
@@ -106,14 +105,8 @@ impl Airplay2Output {
             ));
         }
 
-        let niveau = if self.muted.load(Ordering::SeqCst) {
-            0.0
-        } else {
-            *self.volume.lock().await
-        };
-        self.send(&serde_json::json!({"cmd": "volume", "level": niveau}))
-            .await
-            .ok();
+        // Le volume mémorisé, réglé peut-être pendant la pause, part ensuite
+        // de `play_media`, avant `play`, comme à toute ouverture (#8402).
         info!(device = %self.name, "airplay2: session reopened");
         Ok(())
     }

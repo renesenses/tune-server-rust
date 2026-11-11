@@ -99,6 +99,10 @@ mod aleatoire_selection_5526_tests;
 mod isolement_disque_tests_5467;
 #[cfg(test)]
 mod labels_albums_4836_tests;
+// #8374 : TUNE_UPNP_SERVER_ENABLED / TUNE_UPNP_SERVER_NAME, valeurs par
+// défaut de l'annonce du serveur multimédia quand la clé est absente.
+#[cfg(test)]
+mod annonce_upnp_par_defaut_8374_tests;
 
 /// The whole server startup, so out-of-tree binaries can compose it with their
 /// own plugins. See [`bootstrap::run`].
