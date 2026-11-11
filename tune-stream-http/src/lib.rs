@@ -2218,6 +2218,16 @@ const PAS_DE_PERTE_MS: i64 = 1_000;
 /// en produirait des centaines.
 const PERTES_AU_JOURNAL: u32 = 3;
 
+/// #6478 — une lecture du fichier plus longue que ce seuil est portée en WARN
+/// (`service_fichier_lecture_disque_lente`). 200 ms : dix fois le temps d'un
+/// bloc de 64 Kio en DSD256 sur un disque sain, et le dixième du tampon de
+/// ~2 s du FiiO K17.
+const LECTURE_DISQUE_LENTE_MS: u64 = 200;
+
+/// #6478 — au plus autant de WARN de lecture lente par connexion ; les
+/// suivantes passent en DEBUG (le bilan de fin les compte toutes).
+const LECTURES_LENTES_AU_JOURNAL: u32 = 3;
+
 /// Avance de livraison au-dessus de laquelle une perte de terrain ne menace
 /// pas la lecture : le renderer a encore tout cela devant lui.
 ///
@@ -2486,6 +2496,17 @@ struct ChronoServiceFichier {
     /// d'emblée : c'est la seule fin que le générateur ne peut pas écrire
     /// lui-même, puisqu'il ne reprend jamais la main pour le faire.
     fin: FinDuService,
+    /// #6478 — temps passé à LIRE le fichier (`file.read().await`), cumulé et
+    /// pire bloc, séparé du temps passé à ENVOYER (attente du `yield` : le
+    /// transport ne redemande un bloc que quand la socket a de la place).
+    /// Sans cette séparation, un disque lent et un lien bloqué donnaient la
+    /// même perte de terrain.
+    lecture_us: u64,
+    lecture_max_us: u64,
+    lectures: u64,
+    lectures_lentes: u32,
+    envoi_us: u64,
+    envoi_max_us: u64,
 }
 
 impl ChronoServiceFichier {
@@ -2503,7 +2524,58 @@ impl ChronoServiceFichier {
             pertes: 0,
             alertes: 0,
             fin: FinDuService::ConsommateurParti,
+            lecture_us: 0,
+            lecture_max_us: 0,
+            lectures: 0,
+            lectures_lentes: 0,
+            envoi_us: 0,
+            envoi_max_us: 0,
         }
+    }
+
+    /// #6478 — une lecture du fichier vient de rendre la main après `duree`.
+    /// Écrit un WARN (borné par connexion) si elle a dépassé
+    /// [`LECTURE_DISQUE_LENTE_MS`].
+    fn noter_lecture(&mut self, duree: std::time::Duration, octets: usize) {
+        let us = duree.as_micros() as u64;
+        self.lecture_us += us;
+        self.lecture_max_us = self.lecture_max_us.max(us);
+        self.lectures += 1;
+        let ms = us / 1_000;
+        if ms < LECTURE_DISQUE_LENTE_MS {
+            return;
+        }
+        self.lectures_lentes += 1;
+        if self.lectures_lentes <= LECTURES_LENTES_AU_JOURNAL {
+            warn!(
+                stream_id = %self.stream_id,
+                lecture_ms = ms,
+                octets_lus = octets,
+                position = self.servis,
+                elapsed_ms = self.debut.elapsed().as_millis() as u64,
+                occurrence = self.lectures_lentes,
+                seuil_ms = LECTURE_DISQUE_LENTE_MS,
+                "service_fichier_lecture_disque_lente — une lecture du fichier \
+                 a pris plus que le seuil : c'est le disque (ou le partage) qui \
+                 a fait attendre, pas le réseau (#6478)"
+            );
+        } else {
+            debug!(
+                stream_id = %self.stream_id,
+                lecture_ms = ms,
+                occurrence = self.lectures_lentes,
+                "service_fichier_lecture_disque_lente"
+            );
+        }
+    }
+
+    /// #6478 — le transport a redemandé un bloc `duree` après qu'on le lui a
+    /// remis : c'est le temps d'ENVOI (socket pleine = réseau ou renderer qui
+    /// ne tire pas).
+    fn noter_envoi(&mut self, duree: std::time::Duration) {
+        let us = duree.as_micros() as u64;
+        self.envoi_us += us;
+        self.envoi_max_us = self.envoi_max_us.max(us);
     }
 
     /// #4645 — noter COMMENT le service s'est terminé.
@@ -2556,6 +2628,11 @@ impl ChronoServiceFichier {
                 octets = self.servis,
                 elapsed_ms,
                 occurrence = self.pertes,
+                // #6478 — à ce stade, qui a fait attendre : le disque ou l'envoi ?
+                lecture_disque_ms = self.lecture_us / 1_000,
+                lecture_disque_max_ms = self.lecture_max_us / 1_000,
+                envoi_reseau_ms = self.envoi_us / 1_000,
+                envoi_reseau_max_ms = self.envoi_max_us / 1_000,
                 "service_fichier_perd_du_terrain — le renderer a cessé de tirer \
                  pendant tout ce que l'avance a perdu (pause comprise) ; \
                  l'état de la zone tranche (#4645)"
@@ -2610,6 +2687,18 @@ impl Drop for ChronoServiceFichier {
             // #4645 — LE discriminant : le corps s'est-il arrêté de
             // lui-même, ou a-t-on cessé de le lire ?
             fin = self.fin.etiquette(),
+            // #6478 — disque contre réseau. Débit de lecture = octets lus
+            // rapportés au seul temps de lecture (absent sans lecture
+            // mesurable : faststart servi de la mémoire, ou < 1 ms).
+            lecture_disque_ms = self.lecture_us / 1_000,
+            lecture_disque_max_ms = self.lecture_max_us / 1_000,
+            lectures = self.lectures,
+            lectures_lentes = self.lectures_lentes,
+            debit_lecture_kio_s = (self.lecture_us >= 1_000).then(|| {
+                ((self.servis as f64 / 1024.0) / (self.lecture_us as f64 / 1e6)).round()
+            }),
+            envoi_reseau_ms = self.envoi_us / 1_000,
+            envoi_reseau_max_ms = self.envoi_max_us / 1_000,
             "service_fichier_termine"
         );
     }
@@ -2638,7 +2727,9 @@ fn build_file_body(
                 let s = vpos as usize;
                 byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
                 chrono.compter(n as u64);
+                let envoi = std::time::Instant::now();
                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&map.header[s..s + n]));
+                chrono.noter_envoi(envoi.elapsed());
                 vpos += n as u64;
                 remaining -= n as u64;
             }
@@ -2655,13 +2746,18 @@ fn build_file_body(
                         let mut buf = vec![0u8; 65536];
                         while remaining > 0 {
                             let to_read = (remaining as usize).min(buf.len());
-                            match file.read(&mut buf[..to_read]).await {
+                            let lecture = std::time::Instant::now();
+                            let lu = file.read(&mut buf[..to_read]).await;
+                            if let Ok(n) = &lu { chrono.noter_lecture(lecture.elapsed(), *n); }
+                            match lu {
                                 Ok(0) => { chrono.noter_fin(FinDuService::FichierPlusCourt); break; }
                                 Ok(n) => {
                                     remaining -= n as u64;
                                     byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
                                     chrono.compter(n as u64);
+                                    let envoi = std::time::Instant::now();
                                     yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
+                                    chrono.noter_envoi(envoi.elapsed());
                                 }
                                 Err(e) => { warn!(error = %e, "file_read_error"); chrono.noter_fin(FinDuService::Erreur); break; }
                             }
@@ -2681,13 +2777,18 @@ fn build_file_body(
                     let mut buf = vec![0u8; 65536];
                     while remaining > 0 {
                         let to_read = (remaining as usize).min(buf.len());
-                        match file.read(&mut buf[..to_read]).await {
+                        let lecture = std::time::Instant::now();
+                        let lu = file.read(&mut buf[..to_read]).await;
+                        if let Ok(n) = &lu { chrono.noter_lecture(lecture.elapsed(), *n); }
+                        match lu {
                             Ok(0) => { chrono.noter_fin(FinDuService::FichierPlusCourt); break; }
                             Ok(n) => {
                                 remaining -= n as u64;
                                 byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
                                 chrono.compter(n as u64);
+                                let envoi = std::time::Instant::now();
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
+                                chrono.noter_envoi(envoi.elapsed());
                             }
                             Err(e) => { warn!(error = %e, "file_read_error"); chrono.noter_fin(FinDuService::Erreur); break; }
                         }
@@ -7207,3 +7308,112 @@ mod multichannel_7275_tests;
 
 #[cfg(test)]
 mod mode_fichier_nr1602_6909;
+
+/// #6478 — le WARN de lecture disque lente et le bilan disque / réseau de
+/// `service_fichier_termine`, éprouvés sur le chrono lui-même (un disque lent
+/// ne se simule pas de façon fiable sous `file.read`). Le chemin de bout en
+/// bout est éprouvé par `tests/journal_streamer_6478_7807.rs`.
+#[cfg(test)]
+mod lecture_disque_lente_6478 {
+    use super::{ChronoServiceFichier, LECTURES_LENTES_AU_JOURNAL};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn journal_de(f: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(abonne, f);
+        String::from_utf8_lossy(&capture.0.lock().unwrap()).into_owned()
+    }
+
+    fn lignes<'a>(journal: &'a str, evenement: &str) -> Vec<&'a str> {
+        journal.lines().filter(|l| l.contains(evenement)).collect()
+    }
+
+    #[test]
+    fn une_lecture_lente_ecrit_un_warn_et_le_bilan_separe_disque_et_reseau() {
+        let lente = ["service", "fichier", "lecture", "disque", "lente"].join("_");
+        let journal = journal_de(|| {
+            let mut c = ChronoServiceFichier::new("s6478".into(), 3 * 65_536, None);
+            c.noter_lecture(Duration::from_millis(2), 65_536);
+            c.compter(65_536);
+            c.noter_envoi(Duration::from_millis(40));
+            c.noter_lecture(Duration::from_millis(250), 65_536);
+            c.compter(65_536);
+            c.noter_envoi(Duration::from_millis(5));
+        });
+        let warns = lignes(&journal, &lente);
+        assert_eq!(
+            warns.len(),
+            1,
+            "une seule lecture au-dessus du seuil :\n{journal}"
+        );
+        assert!(warns[0].contains("WARN"), "{}", warns[0]);
+        assert!(warns[0].contains("lecture_ms=250"), "{}", warns[0]);
+        assert!(warns[0].contains("position=65536"), "{}", warns[0]);
+
+        let bilan = lignes(&journal, "service_fichier_termine");
+        assert_eq!(bilan.len(), 1, "{journal}");
+        let b = bilan[0];
+        for champ in [
+            "lecture_disque_ms=252",
+            "lecture_disque_max_ms=250",
+            "lectures=2",
+            "lectures_lentes=1",
+            "envoi_reseau_ms=45",
+            "envoi_reseau_max_ms=40",
+            "debit_lecture_kio_s=",
+        ] {
+            assert!(b.contains(champ), "champ « {champ} » absent : {b}");
+        }
+    }
+
+    /// Contre-épreuve : des lectures rapides n'écrivent AUCUN WARN (pas de
+    /// bruit), et le budget de WARN par connexion tient.
+    #[test]
+    fn des_lectures_rapides_nalertent_pas_et_le_budget_de_warn_tient() {
+        let lente = ["service", "fichier", "lecture", "disque", "lente"].join("_");
+        let journal = journal_de(|| {
+            let mut c = ChronoServiceFichier::new("r6478".into(), 0, None);
+            for _ in 0..100 {
+                c.noter_lecture(Duration::from_millis(199), 65_536);
+            }
+        });
+        assert!(lignes(&journal, &lente).is_empty(), "{journal}");
+
+        let journal = journal_de(|| {
+            let mut c = ChronoServiceFichier::new("b6478".into(), 0, None);
+            for _ in 0..10 {
+                c.noter_lecture(Duration::from_millis(300), 65_536);
+            }
+        });
+        assert_eq!(
+            lignes(&journal, &lente).len(),
+            LECTURES_LENTES_AU_JOURNAL as usize,
+            "{journal}"
+        );
+        assert!(journal.contains("lectures_lentes=10"), "{journal}");
+    }
+}
