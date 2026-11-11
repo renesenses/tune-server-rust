@@ -111,7 +111,7 @@ jobs:
     # froide de ~4 min. Un plafond ne peut que faire echouer plus tot.
     # 100 depuis le 06/11 : les passages réussis du lot rc11 prenaient déjà
     # 52 à 75 min, au ras du plafond de 75, qui a coupé #7989 à 75 min.
-    timeout-minutes: 100
+    timeout-minutes: 180
 
     services:
       postgres:
