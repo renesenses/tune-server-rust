@@ -1139,6 +1139,12 @@ mod sondage_accelere_4382;
 
 mod tick;
 
+/// #8483 — fichier abîmé : la zone figée sur la coupure connue passe à la
+/// piste suivante, avec un avis traduit.
+mod fichier_abime_8483;
+#[cfg(test)]
+mod fichier_abime_8483_tests;
+
 /// #5522 — piste « en lecture » dont la position reste à 0 : une relance,
 /// puis l'arrêt avec bandeau.
 mod demarrage_fige_5522;
