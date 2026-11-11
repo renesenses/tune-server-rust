@@ -617,6 +617,16 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
             tune_core::db::rattrapage_dates_ajout_2138::rattrapage_journalise(&backend);
         });
     }
+    // #8026 — les crédits lus dans les balises pour la musique déjà scannée :
+    // une fois, dérivés de `track_metadata` (aucun fichier rouvert), puis à
+    // chaque démarrage les lignes `balises` sans fiche rattachées par le nom
+    // replié. Hors du chemin du démarrage ; une erreur se journalise.
+    {
+        let backend = state.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            tune_core::metadata::rattrapage_credits_balises_8026::passes_journalisees(&backend);
+        });
+    }
     cleanup_orphan_queues(state);
     reconcile_favorites(state);
     recalculer_les_compilations(state);
