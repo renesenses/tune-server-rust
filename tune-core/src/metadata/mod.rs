@@ -43,6 +43,8 @@ pub mod musicbrainz_release_cache;
 pub mod note;
 #[cfg(test)]
 mod note_balises_6123_tests;
+// Les crédits des balises pour la musique déjà scannée (#8026).
+pub mod rattrapage_credits_balises_8026;
 pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;
@@ -3443,10 +3445,18 @@ fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
 /// profil de test — où le témoin de #3816 (relecture de 501 pistes) passait
 /// ici 6,5 s sur 9 et dépassait son délai de 30 s sous charge.
 fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
+    find_vorbis_comments(data, field_name, 1).into_iter().next()
+}
+
+/// #8026 — toutes les trames d'un champ, jusqu'à `max`, dans l'ordre du
+/// fichier : un FLAC qui cite deux orchestres porte deux trames ENSEMBLE.
+/// Même parcours que [`find_vorbis_comment`], qui s'arrête à la première.
+fn find_vorbis_comments(data: &[u8], field_name: &str, max: usize) -> Vec<String> {
+    let mut valeurs = Vec::new();
     let needle = format!("{}=", field_name.to_ascii_uppercase());
     let nlen = needle.len();
-    if data.len() <= nlen {
-        return None;
+    if data.len() <= nlen || max == 0 {
+        return valeurs;
     }
     // `fin` parcourt les positions du `=` final : i = fin + 1 - nlen, i >= 4.
     let mut fin = nlen + 3;
@@ -3469,10 +3479,13 @@ fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
         if let Ok(value) = std::str::from_utf8(&data[i + nlen..i + len])
             && !value.is_empty()
         {
-            return Some(value.to_string());
+            valeurs.push(value.to_string());
+            if valeurs.len() >= max {
+                break;
+            }
         }
     }
-    None
+    valeurs
 }
 
 /// Provenance d'un `dr_track` LU DANS LE TAG du fichier (#3924).
@@ -4533,8 +4546,14 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
                 .iter()
                 .chain(balises_brutes::CLES_ANNEE_ORIGINALE.iter())
                 .chain(std::iter::once(&balises_brutes::CLE_VERSION))
-                .chain(credits_balises::CLES_ENSEMBLE.iter())
                 .filter_map(|k| find_vorbis_comment(h, k).map(|v| (k.to_string(), v)))
+                // #8026 — TOUTES les trames ENSEMBLE / ORCHESTRA : un fichier
+                // qui cite deux orchestres les crédite tous les deux.
+                .chain(credits_balises::CLES_ENSEMBLE.iter().flat_map(|k| {
+                    find_vorbis_comments(h, k, usize::MAX)
+                        .into_iter()
+                        .map(move |v| (k.to_string(), v))
+                }))
                 .collect(),
             None => balises_brutes::lire_balises_du_fichier(path)
                 .map(|b| b.paires())
