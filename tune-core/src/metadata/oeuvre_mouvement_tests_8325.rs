@@ -155,3 +155,151 @@ fn un_mp3_itunes_rend_son_oeuvre_en_tit1_quand_grp1_est_la_8325() {
         "#8325 — TIT1 sans GRP1 n'est qu'un regroupement : {meta:?}"
     );
 }
+
+/// Un FLAC balisé des paires Vorbis données, relu par le scan.
+fn flac(epreuve: &str, paires: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+    use lofty::flac::FlacFile;
+    use lofty::ogg::VorbisComments;
+    let chemin = copie("test.flac", epreuve);
+    let mut fh = std::fs::File::open(&*chemin).unwrap();
+    let mut f = FlacFile::read_from(&mut fh, ParseOptions::new()).unwrap();
+    drop(fh);
+    let mut vc = VorbisComments::default();
+    for (k, v) in paires {
+        vc.push((*k).into(), (*v).into());
+    }
+    f.set_vorbis_comments(vc);
+    f.save_to_path(&*chemin, WriteOptions::default()).unwrap();
+    super::read_extended_metadata(&chemin)
+}
+
+/// Les trois schémas classiques du testeur HCFR (ESL63P). Chez lui, %band%
+/// est TOUJOURS l'orchestre ou l'ensemble, et l'artiste d'album vaut souvent
+/// le même nom : en contexte classique (compositeur ET chef ou œuvre), BAND
+/// compte comme ensemble même s'il égale l'artiste d'album.
+#[test]
+fn les_schemas_classiques_du_testeur_hcfr_8325() {
+    // « %composer% / %work% - %artist% » : un soliste, pas d'ensemble.
+    let m = flac(
+        "hcfr-1",
+        &[
+            ("COMPOSER", "Johann Sebastian Bach"),
+            ("WORK", "Variations Goldberg, BWV 988"),
+            ("ARTIST", "Glenn Gould"),
+            ("ALBUMARTIST", "Glenn Gould"),
+        ],
+    );
+    assert_eq!(
+        m.get("work").map(String::as_str),
+        Some("Variations Goldberg, BWV 988")
+    );
+    assert_eq!(m.get("ensemble"), None, "schéma 1 : {m:?}");
+
+    // « %composer% / %work% - %conductor% - %band% », BAND = artiste d'album.
+    let m = flac(
+        "hcfr-2",
+        &[
+            ("COMPOSER", "Ludwig van Beethoven"),
+            ("WORK", "Symphonie n° 9"),
+            ("CONDUCTOR", "Herbert von Karajan"),
+            ("BAND", "Berliner Philharmoniker"),
+            ("ALBUMARTIST", "Berliner Philharmoniker"),
+            ("ARTIST", "Berliner Philharmoniker"),
+        ],
+    );
+    assert_eq!(
+        m.get("ensemble").map(String::as_str),
+        Some("Berliner Philharmoniker"),
+        "schéma 2 : {m:?}"
+    );
+
+    // « %composer% / %album% - %conductor% - %band% » : pas de WORK, le chef
+    // suffit au contexte classique.
+    let m = flac(
+        "hcfr-3",
+        &[
+            ("COMPOSER", "Gustav Mahler"),
+            ("ALBUM", "Symphonie n° 2"),
+            ("CONDUCTOR", "Claudio Abbado"),
+            ("BAND", "Lucerne Festival Orchestra"),
+            ("ALBUMARTIST", "Lucerne Festival Orchestra"),
+            ("CHOIR", "Orfeón Donostiarra"),
+        ],
+    );
+    assert_eq!(
+        m.get("ensemble").map(String::as_str),
+        Some("Orfeón Donostiarra; Lucerne Festival Orchestra"),
+        "schéma 3, chœur compris : {m:?}"
+    );
+
+    // « %artist% - %album% » hors classique : BAND = artiste d'album reste
+    // l'artiste, pas un ensemble.
+    let m = flac(
+        "hcfr-pop",
+        &[
+            ("ARTIST", "Pink Floyd"),
+            ("ALBUMARTIST", "Pink Floyd"),
+            ("BAND", "Pink Floyd"),
+        ],
+    );
+    assert_eq!(m.get("ensemble"), None, "hors classique : {m:?}");
+}
+
+/// CHOIR, le chœur : Vorbis, `TXXX:CHOIR` (MP3), `----:com.apple.iTunes:CHOIR`
+/// (M4A), rangé avec l'ensemble.
+#[test]
+fn le_choeur_est_un_ensemble_dans_les_trois_conteneurs_8325() {
+    let m = flac("choir-flac", &[("CHOIR", "Monteverdi Choir")]);
+    assert_eq!(
+        m.get("ensemble").map(String::as_str),
+        Some("Monteverdi Choir")
+    );
+
+    {
+        use lofty::TextEncoding;
+        use lofty::id3::v2::{ExtendedTextFrame, Frame, Id3v2Tag};
+        use lofty::mpeg::MpegFile;
+        let chemin = copie("test.mp3", "choir-mp3");
+        let mut fh = std::fs::File::open(&*chemin).unwrap();
+        let mut mp3 = MpegFile::read_from(&mut fh, ParseOptions::new()).unwrap();
+        drop(fh);
+        let mut tag = mp3.id3v2().cloned().unwrap_or_else(Id3v2Tag::new);
+        tag.insert(Frame::UserText(ExtendedTextFrame::new(
+            TextEncoding::UTF8,
+            "CHOIR",
+            "Monteverdi Choir",
+        )));
+        mp3.set_id3v2(tag);
+        mp3.save_to_path(&*chemin, WriteOptions::default()).unwrap();
+        let m = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            m.get("ensemble").map(String::as_str),
+            Some("Monteverdi Choir"),
+            "TXXX:CHOIR : {m:?}"
+        );
+    }
+    {
+        use lofty::mp4::{Atom, AtomData, AtomIdent, Ilst, Mp4File};
+        use std::borrow::Cow;
+        let chemin = copie("test.m4a", "choir-m4a");
+        let mut fh = std::fs::File::open(&*chemin).unwrap();
+        let mut m4a = Mp4File::read_from(&mut fh, ParseOptions::new()).unwrap();
+        drop(fh);
+        let mut ilst = m4a.ilst().cloned().unwrap_or_else(Ilst::default);
+        ilst.insert(Atom::new(
+            AtomIdent::Freeform {
+                mean: Cow::Borrowed("com.apple.iTunes"),
+                name: Cow::Borrowed("CHOIR"),
+            },
+            AtomData::UTF8("Monteverdi Choir".to_string()),
+        ));
+        m4a.set_ilst(ilst);
+        m4a.save_to_path(&*chemin, WriteOptions::default()).unwrap();
+        let m = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            m.get("ensemble").map(String::as_str),
+            Some("Monteverdi Choir"),
+            "----:CHOIR : {m:?}"
+        );
+    }
+}
