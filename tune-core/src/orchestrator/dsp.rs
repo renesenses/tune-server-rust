@@ -1613,7 +1613,7 @@ impl PlaybackOrchestrator {
     /// #8422 — dire aux télécommandes qu'une bascule PURE a relancé le flux,
     /// et à quelle position : un avis, pas une erreur (`fatal: false`), émis
     /// UNE fois par relance réussie. `code` est stable ; `message` est le
-    /// repli en français des clients qui ne le traduisent pas.
+    /// repli en anglais des clients qui ne le traduisent pas.
     pub(super) fn annoncer_la_reprise_pure(&self, zone_id: i64, position_ms: u64) {
         let position = position_lisible(position_ms);
         info!(zone_id, position_ms, %position, "pure_bascule_reprise_annoncee");
@@ -1625,7 +1625,7 @@ impl PlaybackOrchestrator {
                     "code": AVIS_REPRISE_PURE,
                     "position_ms": position_ms,
                     "position": position,
-                    "message": format!("Bascule PURE : reprise à {position}"),
+                    "message": format!("PURE switch: resumed at {position}"),
                     "fatal": false,
                 }),
             );

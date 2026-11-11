@@ -6104,7 +6104,7 @@ async fn la_bascule_pure_reprend_a_la_position_en_cours_et_le_dit_8422() {
     assert_eq!(
         a["message"],
         format!(
-            "Bascule PURE : reprise à {}",
+            "PURE switch: resumed at {}",
             super::dsp::position_lisible(vue)
         )
     );
