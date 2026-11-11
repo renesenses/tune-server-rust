@@ -468,12 +468,14 @@ impl Controleur {
                 ri_wav: None,
             }),
         });
+        // #8513 — les traitements ne colorent plus la mesure : ils sont
+        // contournés le temps du balayage (`ZoneTenue`), et le résultat le dit.
         if traitements.egaliseur {
-            mesure.avertir("égaliseur actif sur la zone : la mesure inclut sa correction");
+            mesure.avertir("égaliseur de la zone contourné pendant la mesure, rétabli ensuite");
         }
         if traitements.correction_ir {
             mesure.avertir(
-                "correction de pièce (IR) active sur la zone : la mesure inclut son effet",
+                "correction de pièce (IR) de la zone contournée pendant la mesure, rétablie ensuite",
             );
         }
         if traitements.pure {
@@ -766,10 +768,16 @@ enum Sortie {
 }
 
 /// La zone pendant la mesure : volume forcé, puis rendu — quoi qu'il arrive.
+///
+/// #8513 — et ses traitements (égaliseur, FIR, crossfeed, crosstalk,
+/// suréchantillonnage…) contournés : la mesure entend la pièce nue. La garde
+/// est un champ : elle tombe avec la `ZoneTenue`, donc aussi sur une panique
+/// du fil de mesure ; `rendre` la rend explicitement APRÈS l'arrêt de la zone.
 struct ZoneTenue {
     hote: Arc<dyn HoteZone>,
     zone_id: i64,
     volume_initial: f64,
+    contournement: tune_core::audio::mesure_nue::Contournement,
 }
 
 impl ZoneTenue {
@@ -779,12 +787,16 @@ impl ZoneTenue {
         volume_initial: f64,
         volume_mesure: f64,
     ) -> Result<Self, Sortie> {
+        // Posée AVANT le volume et le balayage : la lecture lit le
+        // contournement à son démarrage. Un refus du volume la rend aussitôt.
+        let contournement = tune_core::audio::mesure_nue::Contournement::poser(zone_id);
         hote.regler_volume(zone_id, volume_mesure)
             .map_err(|e| Sortie::Erreur(format!("volume de mesure refusé : {e}")))?;
         Ok(Self {
             hote,
             zone_id,
             volume_initial,
+            contournement,
         })
     }
 
@@ -796,6 +808,8 @@ impl ZoneTenue {
 
     fn rendre(self) {
         self.hote.arreter(self.zone_id);
+        // Zone arrêtée : la prochaine lecture repartira avec ses traitements.
+        drop(self.contournement);
         if let Err(e) = self.hote.regler_volume(self.zone_id, self.volume_initial) {
             tracing::warn!(zone = self.zone_id, error = %e, "calibration_volume_non_restaure");
         }

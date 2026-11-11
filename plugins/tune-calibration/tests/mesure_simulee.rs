@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tune_calibration::sim::RoomSim;
 use tune_calibration_greffon::fournisseur::FournisseurBalayage;
 use tune_calibration_greffon::generateur::Consigne;
+use tune_calibration_greffon::hote::TraitementsDeZone;
 use tune_calibration_greffon::mesure::{Controleur, Demande, Etat, FREQUENCE_MESURE};
 use tune_calibration_greffon::simulation::{Boucle, HoteSimule, MicroSimule, PieceEnDirect};
 use tune_entree_audio::peripheriques::Peripheriques;
@@ -28,9 +29,20 @@ struct Banc {
 }
 
 fn banc(sim: &RoomSim, gain_micro: f64, volume: Option<f64>, nom: &str) -> Banc {
+    banc_traite(sim, gain_micro, volume, nom, TraitementsDeZone::default())
+}
+
+fn banc_traite(
+    sim: &RoomSim,
+    gain_micro: f64,
+    volume: Option<f64>,
+    nom: &str,
+    traitements: TraitementsDeZone,
+) -> Banc {
     let boucle = Boucle::new(PieceEnDirect::depuis(sim, gain_micro), VITESSE);
     let fournisseur = FournisseurBalayage::new();
-    let hote = HoteSimule::new(fournisseur.clone(), boucle.clone(), volume);
+    let hote =
+        HoteSimule::avec_traitements(fournisseur.clone(), boucle.clone(), volume, traitements);
     let micro: Arc<dyn Peripheriques> = Arc::new(MicroSimule {
         nom: MICRO.into(),
         frequence: FREQUENCE_MESURE,
@@ -226,6 +238,8 @@ fn le_plafond_joue_arrete_la_montee_sur_une_piece_trop_sourde() {
     assert_eq!(j.volumes, vec![40.0, 50.0]);
     assert_eq!(j.arrets, 1);
     assert_eq!(b.fournisseur.armes(), 0);
+    // #8513 — refus : les traitements de la zone sont rétablis.
+    assert!(!tune_core::audio::mesure_nue::active(3));
 }
 
 /// Garde-fou de la capture : un micro trop chaud écrête dès la première
@@ -316,8 +330,61 @@ fn l_annulation_coupe_le_balayage_et_rend_la_zone() {
     assert_eq!(j.volumes, vec![40.0, 55.0]);
     assert_eq!(j.arrets, 1);
     assert_eq!(b.fournisseur.armes(), 0);
+    // #8513 — annulation : les traitements de la zone sont rétablis.
+    assert!(!tune_core::audio::mesure_nue::active(5));
     // Annuler une mesure finie ne fait rien.
     assert!(!b.controleur.annuler(&id));
+}
+
+/// #8513 — égaliseur et correction IR actifs : la mesure entend la pièce
+/// NUE. Les traitements sont contournés pendant tout le balayage (à chaque
+/// lecture et jusqu'à l'arrêt), rétablis à la fin, et le résultat le dit au
+/// lieu d'avertir que la mesure inclut la correction.
+#[test]
+fn les_traitements_de_la_zone_sont_contournes_pendant_la_mesure_8513() {
+    const ZONE: i64 = 8513;
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc_traite(
+        &sim,
+        1.0,
+        Some(60.0),
+        "mesure-nue",
+        TraitementsDeZone {
+            egaliseur: true,
+            correction_ir: true,
+            ..Default::default()
+        },
+    );
+    assert!(!tune_core::audio::mesure_nue::active(ZONE));
+    let id = b.controleur.lancer(demande(ZONE)).expect("lancée");
+    let etat = attendre_fin(&b.controleur, &id, Duration::from_secs(60));
+    assert_eq!(etat, Etat::Terminee);
+    {
+        let j = b.hote.journal();
+        assert!(!j.contournes_au_jeu.is_empty());
+        assert!(
+            j.contournes_au_jeu.iter().all(|c| *c),
+            "balayage joué avec les traitements de la zone : {:?}",
+            j.contournes_au_jeu
+        );
+        assert_eq!(j.contournes_a_l_arret, vec![true], "rétablis avant l'arrêt");
+    }
+    assert!(
+        !tune_core::audio::mesure_nue::active(ZONE),
+        "traitements restés contournés après la mesure"
+    );
+    let av = b
+        .controleur
+        .mesure(&id)
+        .unwrap()
+        .avancement()
+        .avertissements;
+    assert!(
+        av.iter()
+            .any(|a| a.contains("égaliseur de la zone contourné")),
+        "{av:?}"
+    );
+    assert!(!av.iter().any(|a| a.contains("la mesure inclut")), "{av:?}");
 }
 
 /// Deux mesures sur la même zone ne se chevauchent pas.
