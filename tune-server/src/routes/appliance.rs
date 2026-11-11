@@ -38,6 +38,7 @@ pub fn router() -> Router<AppState> {
         .route("/wifi/connect", post(wifi_connect))
         .route("/wifi/forget", post(wifi_forget))
         .route("/shutdown", post(shutdown))
+        .route("/reboot", post(reboot))
 }
 
 /// Le binaire d'extinction, surchargeable pour les tests et les images
@@ -46,27 +47,83 @@ fn systemctl_bin() -> String {
     std::env::var("TUNE_SYSTEMCTL_BIN").unwrap_or_else(|_| "systemctl".into())
 }
 
-/// L'unique argument passé au binaire d'extinction.
+/// Les deux ordres que Tune donne à la machine (#1511, #8213).
 ///
-/// `systemctl poweroff` plutôt que `shutdown -h now` : c'est l'ordre que
-/// systemd comprend sans passer par un shell, et il rend la main tout de
-/// suite.
-const POWEROFF_ARG: &str = "poweroff";
+/// `systemctl poweroff` / `systemctl reboot` plutôt que `shutdown -h now` :
+/// c'est l'ordre que systemd comprend sans passer par un shell, et il rend la
+/// main tout de suite. Tune OS est une Fedora sous systemd (et non une Alpine
+/// sous OpenRC) : le service y tourne sous `tune`, et la règle polkit
+/// `/etc/polkit-1/rules.d/50-tune.rules` de l'image lui accorde
+/// `org.freedesktop.login1.power-off` et `org.freedesktop.login1.reboot`
+/// (tune-os, depuis #3206). Ni sudo ni doas. Les images Debian historiques
+/// tournent le service en root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrdreMachine {
+    Eteindre,
+    Redemarrer,
+}
 
-/// Envoyer l'ordre d'extinction — **le binaire est un paramètre**.
+impl OrdreMachine {
+    /// L'unique argument passé au binaire.
+    fn argument(self) -> &'static str {
+        match self {
+            OrdreMachine::Eteindre => "poweroff",
+            OrdreMachine::Redemarrer => "reboot",
+        }
+    }
+}
+
+/// Le refus hors Tune OS, en clair.
+pub const REFUS_HORS_TUNE_OS: &str = "Shutting down or rebooting the machine is only available on \
+Tune OS. Elsewhere (Docker, NAS, Mac, Windows, desktop Linux) Tune shares the machine with \
+other uses and does not power it off.";
+
+/// Envoyer l'ordre — **le binaire est un paramètre**.
 ///
-/// Isolé du handler exprès : c'est la seule façon d'éprouver « la route
-/// appelle bien la commande d'extinction, avec cet argument » sans éteindre
-/// la machine de test. Le chemin est passé en argument et **non lu de
-/// l'environnement ici** : `TUNE_SYSTEMCTL_BIN` est une variable de
-/// PROCESSUS, un test qui la poserait ferait dérailler les essais voisins du
-/// même binaire.
-async fn issue_poweroff(bin: &str) -> Result<(), String> {
-    match Command::new(bin).arg(POWEROFF_ARG).output().await {
+/// Isolé exprès : c'est la seule façon d'éprouver « la commande part, avec cet
+/// argument » sans éteindre la machine de test. Le chemin est passé en
+/// argument et **non lu de l'environnement ici** : `TUNE_SYSTEMCTL_BIN` est une
+/// variable de PROCESSUS, un test qui la poserait ferait dérailler les essais
+/// voisins du même binaire.
+async fn envoyer_ordre(bin: &str, ordre: OrdreMachine) -> Result<(), String> {
+    match Command::new(bin).arg(ordre.argument()).output().await {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// LA fonction d'extinction, paramètres explicites (tests).
+///
+/// Hors Tune OS, rien ne part : le binaire n'est même pas lancé.
+async fn ordonner_avec(appliance: bool, bin: &str, ordre: OrdreMachine) -> Result<(), String> {
+    if !appliance {
+        return Err(REFUS_HORS_TUNE_OS.to_string());
+    }
+    envoyer_ordre(bin, ordre).await
+}
+
+/// LA fonction d'extinction du serveur : boutons « Éteindre » et
+/// « Redémarrer » (routes ci-dessous) et arrêt programmé `action: "poweroff"`
+/// (#8213) passent tous par elle. Permise sur Tune OS seulement
+/// ([`is_appliance`]), refusée partout ailleurs avec [`REFUS_HORS_TUNE_OS`].
+pub async fn ordonner(ordre: OrdreMachine) -> Result<(), String> {
+    ordonner_avec(is_appliance(), &systemctl_bin(), ordre).await
+}
+
+/// Lance l'ordre APRÈS la réponse HTTP : sans ce délai le client verrait sa
+/// requête coupée et afficherait une erreur réseau pour une extinction qui se
+/// déroule pourtant normalement. Si l'ordre échoue (droits, polkit), la
+/// réponse est déjà partie : le journal est le SEUL endroit où l'échec
+/// apparaît.
+fn ordonner_apres_la_reponse(ordre: OrdreMachine) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        tracing::info!(?ordre, "appliance_power_requested");
+        if let Err(err) = ordonner(ordre).await {
+            tracing::warn!(?ordre, error = %err, "appliance_power_failed");
+        }
+    });
 }
 
 /// Éteindre la machine — **uniquement sur l'appliance**.
@@ -82,28 +139,18 @@ async fn issue_poweroff(bin: &str) -> Result<(), String> {
 /// éteindre depuis une page web y serait au mieux une surprise, au pire une
 /// perte de travail. `require_appliance()` rend 404 ailleurs — la route
 /// n'existe pas, plutôt que d'exister et de refuser.
-///
-/// L'ordre part **après** la réponse HTTP, comme pour le redémarrage : sans ce
-/// délai le client verrait sa requête coupée et afficherait une erreur réseau
-/// pour une extinction qui se déroule pourtant normalement.
 async fn shutdown(_admin: crate::auth::RequireAdmin) -> Result<Json<Value>, AppError> {
     require_appliance()?;
-
-    tokio::spawn(async {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        tracing::info!("appliance_shutdown_requested");
-        // Les images Debian historiques tournent leur service en root ;
-        // Tune OS le tourne sous `tune`, et une règle polkit lui accorde
-        // `org.freedesktop.login1.power-off` (#3206). Si l'ordre échoue quand
-        // même (droits, polkit), la réponse HTTP est déjà partie : le journal
-        // est le SEUL endroit où l'échec apparaît. D'où la garde ci-dessous
-        // sur les trois images Debian, qui n'ont pas cette règle.
-        if let Err(err) = issue_poweroff(&systemctl_bin()).await {
-            tracing::warn!(error = %err, "appliance_shutdown_failed");
-        }
-    });
-
+    ordonner_apres_la_reponse(OrdreMachine::Eteindre);
     Ok(Json(json!({ "status": "shutting_down" })))
+}
+
+/// Redémarrer la MACHINE (#8213) — mêmes gardes que [`shutdown`]. À ne pas
+/// confondre avec `POST /system/restart`, qui relance le seul processus Tune.
+async fn reboot(_admin: crate::auth::RequireAdmin) -> Result<Json<Value>, AppError> {
+    require_appliance()?;
+    ordonner_apres_la_reponse(OrdreMachine::Redemarrer);
+    Ok(Json(json!({ "status": "rebooting" })))
 }
 
 /// True when running on a Tune appliance image (or forced via env for dev).
@@ -737,7 +784,7 @@ mod tests {
     #[tokio::test]
     async fn l_extinction_envoie_exactement_poweroff() {
         let (_garde, bin, trace) = bouchon_systemctl(0);
-        let issue = issue_poweroff(bin.to_str().unwrap()).await;
+        let issue = envoyer_ordre(bin.to_str().unwrap(), OrdreMachine::Eteindre).await;
         assert!(
             issue.is_ok(),
             "un bouchon qui rend 0 est un succes : {issue:?}"
@@ -748,7 +795,36 @@ mod tests {
             argv, "poweroff",
             "l'unique argument doit etre `poweroff` — ni `-h`, ni `now`"
         );
-        assert_eq!(POWEROFF_ARG, "poweroff");
+    }
+
+    /// #8213 — « Redémarrer la machine » envoie `reboot`, et rien d'autre.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn le_redemarrage_envoie_exactement_reboot() {
+        let (_garde, bin, trace) = bouchon_systemctl(0);
+        let issue = ordonner_avec(true, bin.to_str().unwrap(), OrdreMachine::Redemarrer).await;
+        assert!(issue.is_ok(), "{issue:?}");
+        assert_eq!(std::fs::read_to_string(&trace).unwrap(), "reboot");
+    }
+
+    /// #8213 — LA garde de la fonction unique : hors Tune OS, ni extinction ni
+    /// redémarrage, et le binaire n'est même pas lancé (aucune trace écrite).
+    /// C'est elle qui protège aussi l'arrêt programmé `poweroff`, qu'un
+    /// `PATCH /system/config` ou un import pourrait poser sans passer par la
+    /// validation de la route.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hors_tune_os_rien_ne_part() {
+        for ordre in [OrdreMachine::Eteindre, OrdreMachine::Redemarrer] {
+            let (_garde, bin, trace) = bouchon_systemctl(0);
+            let issue = ordonner_avec(false, bin.to_str().unwrap(), ordre).await;
+            assert_eq!(issue, Err(REFUS_HORS_TUNE_OS.to_string()), "{ordre:?}");
+            assert!(
+                !trace.exists(),
+                "{ordre:?} : le binaire d'extinction a été lancé hors Tune OS"
+            );
+        }
+        assert!(REFUS_HORS_TUNE_OS.contains("Tune OS"));
     }
 
     /// Le motif « 200 pour rien » : sur une image dont le service ne tourne pas
@@ -759,7 +835,7 @@ mod tests {
     #[tokio::test]
     async fn une_extinction_refusee_ne_passe_pas_pour_un_succes() {
         let (_garde, bin, _trace) = bouchon_systemctl(1);
-        let issue = issue_poweroff(bin.to_str().unwrap()).await;
+        let issue = envoyer_ordre(bin.to_str().unwrap(), OrdreMachine::Eteindre).await;
         assert_eq!(
             issue,
             Err("refuse".to_string()),
@@ -770,7 +846,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn un_binaire_d_extinction_absent_remonte_l_erreur() {
-        let issue = issue_poweroff("/n/existe/pas/systemctl").await;
+        let issue = envoyer_ordre("/n/existe/pas/systemctl", OrdreMachine::Eteindre).await;
         assert!(issue.is_err(), "un binaire absent n'eteint rien");
     }
 

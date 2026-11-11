@@ -120,3 +120,44 @@ fn le_chemin_d_une_zone_dlna_porte_la_ligne_8149() {
         "{e}"
     );
 }
+
+/// #8149 (GgB, fil 2742, 10/11) — Eversolo DAC-Z8 en sortie locale, « bit-perfect
+/// strict » activé : le suréchantillonneur était écarté sans un mot à l'écran
+/// (« non appliqué… à la piste suivante », faux tant que le strict reste).
+/// La ligne dit maintenant la vraie raison.
+#[test]
+fn zone_locale_en_bit_perfect_strict_dit_la_raison_8149() {
+    let (backend, zone, _ps) = zone("local");
+    let id = zone.id.unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::bitperfect_strict::cle_de_zone(id),
+            "true",
+        )
+        .unwrap();
+    let (etat, etape) =
+        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None).unwrap();
+    assert_eq!(etat["reason"], "strict_bitperfect", "{etat}");
+    let d = etape["description"].as_str().unwrap();
+    assert_eq!(
+        d,
+        super::textes_signal::texte("fr", "upsampling_strict_bitperfect")
+    );
+    assert!(d.contains("bit-perfect strict"), "{d}");
+    assert!(!d.contains("suivante"), "{d}");
+    // PURE garde la priorité : sa ligne ne change pas.
+    let (etat, _) =
+        etat_du_surechantillonneur_lang("fr", &backend, id, true, "local", None).unwrap();
+    assert_eq!(etat["reason"], "pure", "{etat}");
+}
+
+#[test]
+fn le_texte_du_strict_existe_dans_toutes_les_langues_8149() {
+    let textes: serde_json::Map<String, Value> =
+        serde_json::from_str(include_str!("textes_signal.json")).unwrap();
+    assert_eq!(textes.len(), 15);
+    for (lang, t) in &textes {
+        let v = t["upsampling_strict_bitperfect"].as_str();
+        assert!(v.is_some_and(|v| !v.is_empty()), "manque en {lang}");
+    }
+}

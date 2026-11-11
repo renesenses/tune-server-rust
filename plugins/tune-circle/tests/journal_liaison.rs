@@ -55,7 +55,7 @@ async fn le_jeton_de_liaison_n_entre_jamais_au_journal() {
              INSERT INTO tracks (id, title, album_id, artist_id) VALUES (1, 'So What', 10, 20);",
         )
         .unwrap();
-    library_sync::populate_changelog_after_scan(&backend);
+    library_sync::tout_remettre_dans_le_journal(&backend);
     let api = format!("{}/api/v1/cloud-library", faux.base);
     let client = reqwest::Client::new();
 

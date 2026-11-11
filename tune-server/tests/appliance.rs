@@ -199,16 +199,19 @@ async fn extinction_montee_et_gardee_par_l_auth() {
     );
 
     const SECRET: &str = "test-jwt-secret-2135";
-    const ROUTE: &str = "/api/v1/appliance/shutdown";
 
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("auth_enabled", "true").unwrap();
     settings.set("jwt_secret", SECRET).unwrap();
 
-    async fn statut(state: &tune_server::state::AppState, jeton: Option<&str>) -> StatusCode {
+    async fn statut(
+        state: &tune_server::state::AppState,
+        route: &str,
+        jeton: Option<&str>,
+    ) -> StatusCode {
         let app = tune_server::routes::router(state.clone());
-        let mut req = Request::post(ROUTE);
+        let mut req = Request::post(route);
         if let Some(j) = jeton {
             req = req.header(header::AUTHORIZATION, format!("Bearer {j}"));
         }
@@ -218,30 +221,104 @@ async fn extinction_montee_et_gardee_par_l_auth() {
             .status()
     }
 
-    // 1) Anonyme : refusé net. Surtout pas 200, surtout pas 404.
-    assert_eq!(
-        statut(&state, None).await,
-        StatusCode::UNAUTHORIZED,
-        "une extinction sans jeton doit être refusée"
-    );
-
-    // 2) Jeton valide mais rôle ordinaire : refusé aussi. Un compte d'écoute
-    //    n'éteint pas la machine des autres.
     let jeton_user = tune_server::auth::sign_jwt(2, "user", SECRET).unwrap();
-    assert_eq!(
-        statut(&state, Some(&jeton_user)).await,
-        StatusCode::FORBIDDEN,
-        "le rôle `user` n'a pas à éteindre l'appliance"
-    );
-
-    // 3) Admin, mais machine ordinaire : la route EXISTE (on l'a atteinte, ce
-    //    n'est plus l'auth qui parle) et la porte appliance rend 404. C'est ce
-    //    404-là qui prouve le montage : un chemin non monté rendrait 404 lui
-    //    aussi, mais il aurait rendu 404 aux étapes 1 et 2 également.
     let jeton_admin = tune_server::auth::sign_jwt(1, "admin", SECRET).unwrap();
-    assert_eq!(
-        statut(&state, Some(&jeton_admin)).await,
-        StatusCode::NOT_FOUND,
-        "hors appliance la route ne s'exécute pas — mais elle est bien montée"
+    // #8213 — « Redémarrer la machine » porte exactement les mêmes gardes.
+    for route in ["/api/v1/appliance/shutdown", "/api/v1/appliance/reboot"] {
+        // 1) Anonyme : refusé net. Surtout pas 200, surtout pas 404.
+        assert_eq!(
+            statut(&state, route, None).await,
+            StatusCode::UNAUTHORIZED,
+            "une extinction sans jeton doit être refusée"
+        );
+
+        // 2) Jeton valide mais rôle ordinaire : refusé aussi. Un compte d'écoute
+        //    n'éteint pas la machine des autres.
+        assert_eq!(
+            statut(&state, route, Some(&jeton_user)).await,
+            StatusCode::FORBIDDEN,
+            "le rôle `user` n'a pas à éteindre l'appliance"
+        );
+
+        // 3) Admin, mais machine ordinaire : la route EXISTE (on l'a atteinte, ce
+        //    n'est plus l'auth qui parle) et la porte appliance rend 404. C'est ce
+        //    404-là qui prouve le montage : un chemin non monté rendrait 404 lui
+        //    aussi, mais il aurait rendu 404 aux étapes 1 et 2 également.
+        assert_eq!(
+            statut(&state, route, Some(&jeton_admin)).await,
+            StatusCode::NOT_FOUND,
+            "hors appliance la route ne s'exécute pas — mais elle est bien montée"
+        );
+    }
+}
+
+/// #8213 — l'arrêt programmé `action: "poweroff"` n'est permis que sur
+/// Tune OS : refusé en clair ailleurs, et l'écran sait s'il doit le proposer
+/// (`poweroff_available`). Le planificateur n'est pas lancé par
+/// `routes::router` : rien ne peut s'éteindre ici.
+#[tokio::test]
+async fn arret_programme_poweroff_reserve_a_tune_os() {
+    let _environment = crate::lock_environment();
+    const ROUTE: &str = "/api/v1/system/settings/scheduled-stop";
+
+    async fn put(app: &axum::Router, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::put(ROUTE)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(json!(null)))
+    }
+
+    // Retire `TUNE_APPLIANCE` même si une assertion échoue en route : un
+    // « 1 » laissé derrière ferait croire aux essais voisins qu'ils tournent
+    // sur Tune OS.
+    struct RetirerAppliance;
+    impl Drop for RetirerAppliance {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("TUNE_APPLIANCE") };
+        }
+    }
+    let _retirer = RetirerAppliance;
+
+    let eteindre = json!({"enabled": true, "time": "23:00", "action": "poweroff"});
+
+    // 1) Machine ordinaire (Docker, NAS, Mac, bureau) : refus clair, rien posé.
+    unsafe { std::env::set_var("TUNE_APPLIANCE", "0") };
+    let app = make_app();
+    let (status, body) = get(&app, ROUTE).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["poweroff_available"], json!(false), "{body}");
+    let (status, body) = put(&app, eteindre.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], json!("poweroff_unavailable"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("Tune OS"),
+        "le refus doit dire pourquoi : {body}"
     );
+    let (_, body) = get(&app, ROUTE).await;
+    assert_eq!(body["scheduled_stop"], json!(null), "un refus ne pose rien");
+
+    // L'arrêt de la lecture, lui, reste permis partout (défaut inchangé).
+    let (status, body) = put(&app, json!({"enabled": true, "time": "23:00"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["scheduled_stop"]["action"], json!("stop_playback"));
+
+    // 2) Tune OS : l'action est proposée et acceptée.
+    unsafe { std::env::set_var("TUNE_APPLIANCE", "1") };
+    let app = make_app();
+    let (_, body) = get(&app, ROUTE).await;
+    assert_eq!(body["poweroff_available"], json!(true), "{body}");
+    let (status, body) = put(&app, eteindre).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["scheduled_stop"]["action"], json!("poweroff"));
 }

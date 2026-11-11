@@ -2807,6 +2807,12 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "correction_pure_classix",
         up: include_str!("../../migrations/radios/correction_pure_classix_8119.sql"),
     },
+    // #8239 — le relevé de la synchro cloud (`sync_releve_*`) : la fin d'un
+    // scan ne journalise que la différence avec lui, plus toute la
+    // bibliothèque. Jumelle PG : 110.
+    // Numérotée 144 / PG 110, après #8240 (radios, 143 / PG 109) fusionnée
+    // dans le lot le 10/11.
+    Migration { version: 144, name: "sync_releve", up: include_str!("../../migrations/sync_releve.sql") },
     // #8160 — la fiche technique d'une piste : la trace DATÉE du spectrogramme
     // conservé (nom du PNG du cache, taille, date et durée du calcul) et la
     // signature du fichier audio au moment du calcul, qui dit s'il faut le
@@ -5974,6 +5980,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
              VALUES (109, 'correction_pure_classix') \
              ON CONFLICT (version) DO NOTHING;\n"
         ),
+    ),
+    // Jumelle de la SQLite 144 (#8239) : le relevé de la synchro cloud, même
+    // DDL (`migrations/sync_releve.sql`).
+    (
+        110,
+        "sync_releve",
+        include_str!("../../migrations/postgres/110_sync_releve.sql"),
     ),
     // Jumelle de la SQLite 148 (#8160) : la trace datée du spectrogramme
     // conservé d'une piste et la signature de son fichier.
@@ -9665,6 +9678,8 @@ mod tests {
         // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
         // Migration de DONNÉES : le nom, le pays et le genre de la station
         // semée sous « PureClassic Radio ».
+        // 110 : `sync_releve` (#8239), jumelle de la SQLite 144. Crée le
+        // relevé de la synchro cloud, que la fin de chaque scan NOMME.
         // 114 : `spectrogrammes` (#8160), jumelle de la SQLite 148. Crée la
         // trace datée des spectrogrammes conservés, que la fiche technique NOMME.
         assert_eq!(pg_latest_version(), 114, "latest PG migration must be 114");
