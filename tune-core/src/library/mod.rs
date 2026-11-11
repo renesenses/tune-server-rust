@@ -50,6 +50,8 @@ pub mod quality;
 pub mod regle_compilation;
 /// Où vit la règle de choix des versions : par profil, puis globale (#2264).
 pub mod regle_de_version;
+/// #8325 — la relecture unique des balises classiques des fichiers importés.
+pub mod relecture_classique;
 /// La grammaire de requêtes de la bibliothèque et son compilateur SQL (#7848).
 pub mod requete;
 pub mod smart_collections;

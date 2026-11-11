@@ -151,6 +151,23 @@ async fn pg_chefs_ensembles_et_oeuvres_8325() {
             .collect();
         assert_eq!(titres, vec!["A".to_string()], "PG : filtre par chef");
 
+        // La règle intelligente, corrélée sur `t.id`, sur le vrai moteur.
+        for (op, attendu) in [("=", vec!["B"]), ("!=", vec!["A"])] {
+            let (c, nier) =
+                regle(Champ::Ensemble, op, &["rundfunkchor berlin".into()], "t.id").unwrap();
+            let c = if nier { format!("NOT {c}") } else { c };
+            let titres: Vec<String> = db
+                .query_many(
+                    &format!("SELECT t.title FROM tracks t WHERE {c} ORDER BY t.title"),
+                    &[],
+                )
+                .unwrap()
+                .into_iter()
+                .filter_map(|r| r.into_iter().next()?.as_string())
+                .collect();
+            assert_eq!(titres, attendu, "PG : règle ensemble {op}");
+        }
+
         let col = valeurs_des_pistes(&db, Champ::Ensemble, &[a, b]).unwrap();
         assert_eq!(
             col.get(&a).map(String::as_str),

@@ -294,6 +294,65 @@ pub fn bloc(
     }
 }
 
+/// #8325 — une règle intelligente (playlist ou collection) sur `champ`,
+/// pour la piste dont l'identifiant est `piste` (une expression SQL, `t.id`).
+///
+/// Rend la condition POSITIVE et s'il faut la NIER : `!=`, « ne contient
+/// pas » et « est vide » se lisent « aucune entrée ne… ». C'est l'appelant
+/// qui nie, parce que la négation ne se pose pas au même niveau partout : une
+/// collection retient un album dont AUCUNE piste ne passe la condition.
+///
+/// Mêmes magasins et même découpe à « ; » que la facette : `=` compare une
+/// entrée entière (casse ignorée), « contient » cherche dans la valeur.
+/// `in` : l'une des `valeurs`. Sous-requête CORRÉLÉE sur les colonnes nues
+/// (`track_id = t.id`) : les index servent, et la comparaison tient sur les
+/// deux moteurs comme celle de la règle « crédit ». `None` : opérateur
+/// inconnu ou valeur vide.
+pub fn regle(champ: Champ, op: &str, valeurs: &[String], piste: &str) -> Option<(String, bool)> {
+    let valeurs: Vec<&str> = valeurs
+        .iter()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let esc = super::track_repo::like_escape_clause();
+    let motif = |expr: &str, m: String| {
+        format!("LOWER({expr}) LIKE LOWER('{}'){esc}", m.replace('\'', "''"))
+    };
+    let liste = liste_normalisee("s.v");
+    let e = |v: &str| super::track_repo::echapper_jokers_like(v);
+    let premiere = valeurs.first().copied();
+    let (cond, nier) = match op {
+        "is_null" => ("s.v != ''".to_string(), true),
+        "is_not_null" => ("s.v != ''".to_string(), false),
+        "in" if !valeurs.is_empty() => (
+            format!(
+                "({})",
+                valeurs
+                    .iter()
+                    .map(|v| motif(&liste, format!("%;{};%", e(v))))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            ),
+            false,
+        ),
+        "=" | "!=" => (motif(&liste, format!("%;{};%", e(premiere?))), op == "!="),
+        "contains" | "not_contains" => (
+            motif("s.v", format!("%{}%", e(premiere?))),
+            op == "not_contains",
+        ),
+        "starts_with" => (motif(&liste, format!("%;{}%", e(premiere?))), false),
+        "ends_with" => (motif(&liste, format!("%{};%", e(premiere?))), false),
+        _ => return None,
+    };
+    Some((
+        format!(
+            "EXISTS (SELECT 1 FROM ({}) s WHERE {cond})",
+            paires_sur(Engine::Sqlite, champ, Some(piste))
+        ),
+        nier,
+    ))
+}
+
 /// Cumule des couples `(piste, valeur brute)` en effectifs par entrée :
 /// une piste compte une fois par entrée, quel que soit le nombre de magasins
 /// qui la portent. Les entrées qui ne diffèrent que par la casse sont
