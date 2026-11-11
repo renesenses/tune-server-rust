@@ -195,7 +195,9 @@ impl Surveillant {
                 lisent.push(z);
             }
         }
-        if !lisent.is_empty() {
+        // #8514 — un enregistrement dans la bibliothèque lit encore la
+        // mémoire : la rendre le couperait.
+        if !lisent.is_empty() || m.enregistrement_en_cours() {
             self.tours_sans_lecture = 0;
             return;
         }
@@ -424,6 +426,30 @@ pub(crate) mod tests {
             lire_piste(&b.fournisseur, 1).is_err(),
             "plus de disque, plus de mémoire : la piste ne s'ouvre pas"
         );
+    }
+
+    /// #8514 — un enregistrement dans la bibliothèque lit la mémoire gardée :
+    /// la fin de la lecture ne la rend pas tant qu'il tourne ; elle est
+    /// rendue ensuite, au rythme habituel.
+    #[tokio::test]
+    async fn la_memoire_gardee_reste_pendant_un_enregistrement() {
+        let (mut b, _) = banc(None).await;
+        b.lecteur.ejecter();
+        b.surveillant.un_tour().await;
+        b.hote.arreter(7).await;
+        b.memoire.marquer_enregistrement(true);
+        for _ in 0..TOURS_AVANT_LIBERATION * 2 {
+            b.surveillant.un_tour().await;
+        }
+        assert!(
+            b.memoire.disque_garde().is_some(),
+            "mémoire rendue pendant l'enregistrement"
+        );
+        b.memoire.marquer_enregistrement(false);
+        for _ in 0..TOURS_AVANT_LIBERATION {
+            b.surveillant.un_tour().await;
+        }
+        assert!(b.memoire.disque_garde().is_none());
     }
 
     /// Un autre disque joué rend la mémoire du disque gardé.

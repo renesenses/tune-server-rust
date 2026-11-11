@@ -172,6 +172,10 @@ pub struct EtatTravail {
     pub format: Format,
     pub verification: Verification,
     pub lecteur: String,
+    /// #8514 — d'où viennent les secteurs : `lecteur` (le disque est relu)
+    /// ou `memoire` (« Enregistrer dans la bibliothèque » : le disque déjà
+    /// chargé en mémoire, sans relire le lecteur).
+    pub source: &'static str,
     pub disc_id: String,
     /// `musicbrainz` ou `repli` (« Piste NN »).
     pub metadonnees: &'static str,
