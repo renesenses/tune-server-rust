@@ -31,6 +31,10 @@ const POSITION_DE_PAUSE_MS: u64 = 10_000;
 struct Recu {
     lectures: AtomicU32,
     autres: AtomicU32,
+    /// Sous-compte de `lectures` : les nouveaux flux (`play_media`).
+    nouveaux_flux: AtomicU32,
+    /// Sous-compte de `autres` : les `Stop`.
+    arrets: AtomicU32,
 }
 
 /// Un WiiM vu par DLNA : l'état et l'URI qu'il rapporte sont fixés par le
@@ -51,8 +55,13 @@ impl OutputTarget for Wiim {
     fn output_type(&self) -> &str {
         "dlna"
     }
+    /// Comme un vrai renderer DLNA : pause, reprise, arrêt et `Seek` admis.
+    fn capabilities(&self) -> crate::outputs::OutputCapabilities {
+        crate::outputs::OutputCapabilities::v1(true, true, true, true, true, true)
+    }
     async fn play_media(&self, _media: &PlayMedia<'_>) -> Result<(), String> {
         self.recu.lectures.fetch_add(1, Ordering::SeqCst);
+        self.recu.nouveaux_flux.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn pause(&self) -> Result<(), String> {
@@ -65,6 +74,7 @@ impl OutputTarget for Wiim {
     }
     async fn stop(&self) -> Result<(), String> {
         self.recu.autres.fetch_add(1, Ordering::SeqCst);
+        self.recu.arrets.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn seek(&self, _position_ms: u64) -> Result<(), String> {
@@ -103,6 +113,11 @@ struct Banc {
     recu: Arc<Recu>,
     poll_states: HashMap<i64, ZonePollState>,
     idle_backoff: HashMap<i64, IdlePollBackoff>,
+    streamer: Arc<AudioStreamer>,
+    /// La session de flux que l'appareil joue (`NOTRE_FLUX` tant qu'aucune
+    /// vraie session n'est ouverte, voir [`Banc::ouvrir_une_vraie_session`]).
+    flux: String,
+    fichier: String,
     _fichiers: tempfile::TempDir,
 }
 
@@ -155,10 +170,11 @@ impl Banc {
         }));
 
         let playback = Arc::new(PlaybackManager::new());
+        let streamer = Arc::new(AudioStreamer::new(0));
         let orchestrator = Arc::new(PlaybackOrchestrator::new(
             db.clone(),
             playback.clone(),
-            Arc::new(AudioStreamer::new(0)),
+            streamer.clone(),
             Arc::new(Mutex::new(ServiceRegistry::new())),
             outputs.clone(),
             None,
@@ -199,6 +215,9 @@ impl Banc {
             recu,
             poll_states: HashMap::new(),
             idle_backoff: HashMap::new(),
+            streamer,
+            flux: NOTRE_FLUX.into(),
+            fichier: fichier.to_str().unwrap().to_string(),
             _fichiers: fichiers,
         }
     }
@@ -209,6 +228,47 @@ impl Banc {
 
     fn notre_uri() -> String {
         format!("http://192.168.1.10:8888/stream/{NOTRE_FLUX}")
+    }
+
+    fn uri_du_flux(&self) -> String {
+        format!("http://192.168.1.10:8888/stream/{}", self.flux)
+    }
+
+    /// La zone joue une session de flux VIVANTE : sans elle, toute reprise
+    /// passe déjà par un nouveau flux (session morte, #2512), et le banc ne
+    /// distinguerait pas la reprise sur place.
+    async fn ouvrir_une_vraie_session(&mut self) {
+        let sid = self
+            .streamer
+            .create_file_session(
+                crate::http::streamer::StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 44100,
+                    bit_depth: 16,
+                    channels: 2,
+                    duration_ms: Some(240_000),
+                    ..Default::default()
+                },
+                self.fichier.clone(),
+                false,
+            )
+            .await;
+        self.flux = sid.clone();
+        self.playback
+            .play(
+                self.zone_id,
+                NowPlaying {
+                    track_id: Some(1),
+                    title: "Potion".into(),
+                    source: "local".into(),
+                    duration_ms: 240_000,
+                    stream_id: Some(sid),
+                    ..Default::default()
+                },
+            )
+            .await;
+        self.playback.update_queue_info(self.zone_id, 0, 1).await;
     }
 
     async fn tours(&mut self, n: usize) {
@@ -229,7 +289,7 @@ impl Banc {
 
     /// Lecture, puis pause à la télécommande tenue assez longtemps.
     async fn pause_a_la_telecommande(&mut self) {
-        let uri = Self::notre_uri();
+        let uri = self.uri_du_flux();
         self.appareil(TransportState::Playing, Some(&uri));
         self.tours(2).await;
         self.appareil(TransportState::Paused, Some(&uri));
@@ -342,7 +402,8 @@ async fn la_lecture_a_la_telecommande_fait_reprendre_la_zone_7418() {
 }
 
 /// Une AUTRE application (Emby) joue sur l'appareil après la pause : la zone
-/// reste en pause et rien ne part.
+/// ne reprend pas, rien ne part. Depuis rc12 elle s'ARRÊTE (l'appareil est
+/// passé à autre chose), sans couper Emby.
 #[tokio::test]
 async fn une_autre_application_sur_l_appareil_ne_fait_pas_reprendre_la_zone_7418() {
     let mut banc = Banc::monter(RepeatMode::Off).await;
@@ -354,8 +415,13 @@ async fn une_autre_application_sur_l_appareil_ne_fait_pas_reprendre_la_zone_7418
     );
     banc.tours(8).await;
 
-    assert_eq!(banc.etat_de_zone().await, PlayState::Paused);
+    assert_ne!(banc.etat_de_zone().await, PlayState::Playing);
     assert_eq!(banc.recu.lectures.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        banc.recu.arrets.load(Ordering::SeqCst),
+        0,
+        "la musique d'Emby ne doit pas être coupée"
+    );
 }
 
 #[test]
@@ -366,4 +432,190 @@ fn seule_une_sortie_dlna_hors_grace_suit_la_pause_de_son_appareil_7418() {
     assert!(!pause_de_l_appareil_etablie("dlna", N, true));
     assert!(!pause_de_l_appareil_etablie("local", N, false));
     assert!(!pause_de_l_appareil_etablie("oaat", N, false));
+}
+
+// ── rc12 : la pause de l'appareil devient un arrêt complet ──────────────────
+
+impl Banc {
+    /// Fait comme si la zone avait suivi la pause de l'appareil il y a
+    /// `duree` : l'horloge murale ne se simule pas autrement.
+    fn vieillir_la_pause(&self, duree: std::time::Duration) {
+        let mut zones = self.poller.pauses_de_l_appareil.lock().unwrap();
+        let suivi = zones
+            .get_mut(&self.zone_id)
+            .expect("la zone doit être suivie comme mise en pause par son appareil");
+        suivi.depuis = Instant::now() - duree;
+    }
+
+    async fn reprise_armee(&self) -> Option<i64> {
+        self.playback.pending_resume_ms(self.zone_id).await
+    }
+
+    fn etat_enregistre(&self) -> Option<String> {
+        ZoneRepo::with_backend(self.db.clone()).get_last_play_state(self.zone_id)
+    }
+}
+
+/// CHANGEMENT D'ENTRÉE (fil 2531) : pause à la télécommande, puis l'appareil
+/// s'arrête (autre entrée, téléviseur). La zone ne reste plus « en pause »
+/// sur un appareil qui n'a plus notre piste : elle s'ARRÊTE, sans commande
+/// vers l'appareil, piste et position armées pour « Lecture » dans Tune.
+#[tokio::test]
+async fn l_appareil_passe_a_autre_chose_la_zone_s_arrete_sans_commande_7418() {
+    let mut banc = Banc::monter(RepeatMode::Off).await;
+    banc.pause_a_la_telecommande().await;
+    assert_eq!(banc.etat_de_zone().await, PlayState::Paused);
+
+    banc.appareil(TransportState::Stopped, None);
+    banc.tours(40).await;
+
+    assert_eq!(
+        banc.etat_de_zone().await,
+        PlayState::Stopped,
+        "#7418 : l'appareil a quitté notre flux, la zone restait « en pause » et « Lecture » n'y renvoyait qu'un Play sur place"
+    );
+    assert_eq!(banc.etat_enregistre().as_deref(), Some("stopped"));
+    assert_eq!(banc.recu.lectures.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        banc.recu.autres.load(Ordering::SeqCst),
+        0,
+        "l'appareil est déjà ailleurs : rien ne lui est envoyé"
+    );
+    let np = banc
+        .playback
+        .get_state(banc.zone_id)
+        .await
+        .now_playing
+        .expect("la piste reste en mémoire pour « Lecture »");
+    assert_eq!(np.track_id, Some(1));
+    assert_eq!(
+        banc.reprise_armee().await,
+        Some(POSITION_DE_PAUSE_MS as i64),
+        "« Lecture » dans Tune doit repartir de la position de la pause"
+    );
+}
+
+/// PAUSE TENUE (fil 2531, « 10 à 15 minutes après ») : l'appareil garde
+/// notre flux en pause. Tant que dure le délai, rien ne bouge (la télécommande
+/// peut reprendre) ; passé le délai, Tune arrête l'appareil — il ne pourra
+/// plus reprendre seul — et la zone.
+#[tokio::test]
+async fn une_pause_tenue_sur_notre_flux_devient_un_arret_complet_7418() {
+    let mut banc = Banc::monter(RepeatMode::Off).await;
+    banc.pause_a_la_telecommande().await;
+
+    banc.tours(30).await;
+    assert_eq!(
+        banc.etat_de_zone().await,
+        PlayState::Paused,
+        "avant le délai, la pause reste une pause"
+    );
+    assert_eq!(banc.recu.autres.load(Ordering::SeqCst), 0);
+
+    banc.vieillir_la_pause(super::pause_de_l_appareil_7418::DELAI_AVANT_L_ARRET_DE_L_APPAREIL);
+    banc.tours(10).await;
+
+    assert_eq!(
+        banc.etat_de_zone().await,
+        PlayState::Stopped,
+        "#7418 : passé le délai, la pause de l'appareil doit devenir un arrêt complet"
+    );
+    assert_eq!(
+        banc.recu.arrets.load(Ordering::SeqCst),
+        1,
+        "#7418 : l'appareil garde notre flux en pause, un Stop doit l'empêcher de le reprendre seul"
+    );
+    assert_eq!(banc.recu.lectures.load(Ordering::SeqCst), 0);
+    assert_eq!(banc.etat_enregistre().as_deref(), Some("stopped"));
+    assert_eq!(
+        banc.reprise_armee().await,
+        Some(POSITION_DE_PAUSE_MS as i64),
+        "#7418 : « Lecture » dans Tune doit repartir de la position de la pause"
+    );
+}
+
+/// « LECTURE » DANS TUNE pendant la pause de l'appareil : un nouveau flux
+/// à la position, jamais un `Play` sur place vers un appareil qui a pu
+/// changer d'entrée.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn la_lecture_dans_tune_apres_la_pause_de_l_appareil_retablit_notre_flux_7418() {
+    let mut banc = Banc::monter(RepeatMode::Off).await;
+    banc.ouvrir_une_vraie_session().await;
+    banc.pause_a_la_telecommande().await;
+    assert_eq!(banc.etat_de_zone().await, PlayState::Paused);
+
+    banc.poller
+        .orchestrator
+        .resume(banc.zone_id, Some(DEVICE_ID))
+        .await
+        .expect("la reprise depuis Tune doit aboutir");
+
+    assert_eq!(
+        banc.recu.nouveaux_flux.load(Ordering::SeqCst),
+        1,
+        "#7418 : la reprise depuis Tune doit rétablir notre flux, pas envoyer un Play sur place"
+    );
+    assert_eq!(
+        banc.recu.lectures.load(Ordering::SeqCst),
+        1,
+        "un seul lancement, aucun Play sur place en plus"
+    );
+    assert_eq!(banc.etat_de_zone().await, PlayState::Playing);
+}
+
+/// TÉMOIN : une pause demandée DANS TUNE garde la reprise sur place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_pause_de_tune_garde_la_reprise_sur_place_7418() {
+    let mut banc = Banc::monter(RepeatMode::Off).await;
+    banc.ouvrir_une_vraie_session().await;
+    banc.poller
+        .orchestrator
+        .pause(banc.zone_id, Some(DEVICE_ID))
+        .await
+        .unwrap();
+    banc.poller
+        .orchestrator
+        .resume(banc.zone_id, Some(DEVICE_ID))
+        .await
+        .unwrap();
+    assert_eq!(banc.recu.nouveaux_flux.load(Ordering::SeqCst), 0);
+    assert_eq!(banc.recu.lectures.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn la_suite_d_une_pause_de_l_appareil_7418() {
+    use super::decisions::RELEVES_AVANT_DE_CEDER as R;
+    use super::pause_de_l_appareil_7418::{
+        DELAI_AVANT_L_ARRET_DE_L_APPAREIL as D, Releve, Suite, releve, suite_de_la_pause,
+    };
+    use std::time::Duration;
+    let z = Duration::ZERO;
+    assert_eq!(releve(TransportState::Playing, true), Releve::JoueLeNotre);
+    assert_eq!(
+        releve(TransportState::Paused, true),
+        Releve::EnPauseSurLeNotre
+    );
+    assert_eq!(releve(TransportState::Paused, false), Releve::Ailleurs);
+    assert_eq!(releve(TransportState::Playing, false), Releve::Ailleurs);
+    assert_eq!(releve(TransportState::Stopped, true), Releve::Ailleurs);
+    assert_eq!(
+        suite_de_la_pause(Releve::JoueLeNotre, 0, D),
+        Suite::Reprendre
+    );
+    assert_eq!(
+        suite_de_la_pause(Releve::Ailleurs, R - 1, D),
+        Suite::Attendre
+    );
+    assert_eq!(
+        suite_de_la_pause(Releve::Ailleurs, R, z),
+        Suite::ArreterSansCommande
+    );
+    assert_eq!(
+        suite_de_la_pause(Releve::EnPauseSurLeNotre, 0, D - Duration::from_secs(1)),
+        Suite::Attendre
+    );
+    assert_eq!(
+        suite_de_la_pause(Releve::EnPauseSurLeNotre, 0, D),
+        Suite::ArreterLAppareil
+    );
 }

@@ -833,6 +833,8 @@ impl PlaybackOrchestrator {
         // #5050 — une lecture part : la pose « en pause sans lancer » d'un
         // transfert ne vaut plus.
         self.prendre_le_transfert_en_pause(req.zone_id);
+        // #7418 — de même pour la pause venue de l'appareil.
+        self.prendre_la_pause_de_l_appareil(req.zone_id);
         // Zone navigateur : la sortie est l'onglet, pas un appareil. Relevé ici
         // parce que la ligne de zone est déjà lue juste en dessous, et qu'il
         // faudra le savoir bien plus bas, au moment d'annoncer l'écoute
@@ -2464,8 +2466,11 @@ impl PlaybackOrchestrator {
             )
             .await;
             let output = output_arc.lock().await;
+            // #8402 (11/11) — AirPlay 2 : la zone est-elle en PURE verrouillé ?
+            self.dire_a_l_airplay2_si_la_zone_tient_le_volume(zone_id, &**output);
             match output.play_media(media).await {
                 Ok(()) => {
+                    self.dire_le_depart_muet_d_airplay2(zone_id, &**output);
                     drop(output);
                     info!(device_id = %used_device_id, "output_play_sent");
                     self.reimposer_la_sourdine_de_la_zone(
@@ -3483,9 +3488,19 @@ impl PlaybackOrchestrator {
             if transfert_en_pause {
                 info!(zone_id, position_ms, "resume_apres_transfert_en_pause");
             }
+            // #7418 — en pause parce que l'APPAREIL s'y est mis (télécommande,
+            // autre entrée) : il a pu passer à autre chose, un `Play` « sur
+            // place » y restait sans effet. On rétablit notre flux.
+            let pause_de_l_appareil = self.prendre_la_pause_de_l_appareil(zone_id);
+            if pause_de_l_appareil {
+                info!(zone_id, position_ms, "resume_apres_pause_de_l_appareil");
+            }
             #[allow(clippy::blocks_in_conditions)]
             let peripherique_rendu = apres_refus_de_la_sortie
                 || transfert_en_pause
+                // Une écoute qu'on ne sait pas redemander garde le `Play` sur
+                // place, plutôt qu'un « impossible de reprendre ».
+                || (pause_de_l_appareil && rejouable)
                 || match device_id {
                     Some(did) => match { self.outputs.lock().await.get(did) } {
                         Some(sortie) => sortie.lock().await.device_released_on_pause(),
@@ -3760,6 +3775,8 @@ impl PlaybackOrchestrator {
         self.playback.marquer_commande_de_transport(zone_id).await;
         // #5050 — arrêtée : la pose d'un transfert en pause ne vaut plus.
         self.prendre_le_transfert_en_pause(zone_id);
+        // #7418 — de même pour la pause venue de l'appareil.
+        self.prendre_la_pause_de_l_appareil(zone_id);
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "stopped")
