@@ -243,6 +243,12 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // apports après la bascule.
     "apports_service_albums",
     "apports_service",
+    // Relevé de la synchro cloud (#8239, script 110) : sans ces lignes, le
+    // premier scan après la bascule reprendrait un relevé de zéro et ne
+    // verrait pas ce qui a changé pendant ce scan.
+    "sync_releve_pistes",
+    "sync_releve_albums",
+    "sync_releve_artistes",
     // Sources réseau (#8189, script 115) : sans cette ligne, les sources
     // configurées et leurs identifiants scellés seraient perdus à la bascule.
     "sources_reseau",
@@ -269,6 +275,18 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
 /// des deux listes — c'est ainsi que `file_first_seen` s'etait perdue (#5389).
 #[cfg_attr(not(test), allow(dead_code))]
 const TABLES_NON_COPIEES: &[(&str, &str)] = &[
+    (
+        "sync_releve_pistes_neuf",
+        "état courant figé le temps d'une comparaison (#8239) : vide en dehors d'elle",
+    ),
+    (
+        "sync_releve_albums_neuf",
+        "état courant figé le temps d'une comparaison (#8239) : vide en dehors d'elle",
+    ),
+    (
+        "sync_releve_artistes_neuf",
+        "état courant figé le temps d'une comparaison (#8239) : vide en dehors d'elle",
+    ),
     (
         "hires_verifications",
         "verdicts des faux hi-res (#6285) : mesures recalculables, la passe de fond les refait",

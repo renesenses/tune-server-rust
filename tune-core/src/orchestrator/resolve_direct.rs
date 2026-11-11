@@ -2037,10 +2037,11 @@ impl PlaybackOrchestrator {
         // extension), soit 44 des 51 entrees de l'annuaire au 28/08/2026.
         // Seules les rares URL en .mp3/.flac/.wav prenaient ce raccourci —
         // TSF Jazz en fait partie, et c'est la station signalee.
-        let needs_proxy = req.output_device_id.is_some()
-            || is_browser_output
-            || !reliable_ext
-            || radio_eq_profile.is_some();
+        // #8422 — décodée même sans égaliseur : le format servi ne dépend
+        // alors d'aucun traitement, et la bascule PURE se pose en vol.
+        let proxy_sans_egaliseur =
+            req.output_device_id.is_some() || is_browser_output || !reliable_ext;
+        let needs_proxy = proxy_sans_egaliseur || radio_eq_profile.is_some();
 
         if needs_proxy {
             let wav_info = StreamInfo {
@@ -2063,7 +2064,7 @@ impl PlaybackOrchestrator {
             );
             // #4407 — le poste de relève : un changement d'égaliseur est posé
             // dans CE flux au paquet suivant, sans nouvelle session UPnP.
-            let en_vol = super::eq_en_vol::EqEnVol::pour_la_radio();
+            let en_vol = super::eq_en_vol::EqEnVol::pour_la_radio_servie(proxy_sans_egaliseur);
             self.noter_eq_en_vol(req.zone_id, &session_id, en_vol.clone());
             let radio_url = audio_url.to_string();
             // VU-mètres sur radio (DLNA) : forwarder de niveaux alimenté
