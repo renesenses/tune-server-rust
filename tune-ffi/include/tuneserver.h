@@ -41,6 +41,25 @@ int32_t tune_server_set_container_root(const char *root);
  * Retour : 0 scan lance, 1 un scan tourne deja, -1 serveur pas pret. */
 int32_t tune_server_scan(void);
 
+/* Nom de l'appareil (iOS : UIDevice.current.name), A APPELER AVANT
+ * tune_server_start : nom annonce en UPnP et mDNS quand aucun server_name
+ * n'est regle. Un nom generique ("iPhone") est suffixe de 4 caracteres
+ * stables. NULL ou vide : nom d'hote du systeme.
+ * Retour : 0 succes, -2 si la chaine n'est pas de l'UTF-8. */
+int32_t tune_server_set_device_name(const char *name);
+
+/* Differer la decouverte reseau (SSDP, mDNS, annonces) jusqu'au premier
+ * usage : ecran "Sources du reseau", recherche d'appareils, ou
+ * tune_server_start_network_discovery. Sur iOS, la fenetre "reseau local"
+ * arrive alors au bon moment. Une fois ouverte, elle demarre d'emblee aux
+ * lancements suivants. A APPELER AVANT tune_server_start ; 0 = normal.
+ * Retour : 0. */
+int32_t tune_server_defer_network_discovery(int32_t defer);
+
+/* Ouvre la decouverte reseau differee.
+ * Retour : 0 ouverte par cet appel, 1 deja ouverte. */
+int32_t tune_server_start_network_discovery(void);
+
 /* Arret propre. Retour : 0 succes, -1 pas demarre. */
 int32_t tune_server_stop(void);
 

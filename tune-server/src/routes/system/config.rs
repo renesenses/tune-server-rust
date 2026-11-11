@@ -4874,7 +4874,9 @@ pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value>
 pub(crate) fn resolve_server_name(configured: Option<&str>) -> String {
     match configured.map(str::trim).filter(|s| !s.is_empty()) {
         Some(name) => name.to_string(),
-        None => tune_core::discovery::system_hostname(),
+        // #8189 — le nom de l'appareil donné par l'application hôte
+        // (téléphone), sinon le nom d'hôte du système.
+        None => tune_core::discovery::nom_annonce::nom_de_l_appareil(),
     }
 }
 
