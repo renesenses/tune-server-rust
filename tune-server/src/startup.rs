@@ -2916,6 +2916,9 @@ pub(crate) async fn basculer_le_repli_wasapi_sur_asio(
     BASCULE_ASIO_TENTEE.store(true, Ordering::Release);
     let repli = repli.unwrap_or_default();
     let rapport = remplacer_le_repli_wasapi(state, &asio, &repli).await;
+    // #7759 — les zones viennent de passer en ASIO : leurs groupes sont
+    // défaits, la lecture groupée n'étant possible qu'en WASAPI.
+    crate::routes::zones::defaire_les_groupes_asio(state).await;
     if rapport.gardees_en_lecture.is_empty() {
         *REPLI_WASAPI_DE_DEMARRAGE
             .lock()
