@@ -300,6 +300,9 @@ pub fn planifier_dossier(dossier: &Path) -> PlanCue {
         .cloned()
         .collect();
     feuilles.sort();
+    // #8534 — un dossier « CD3 - Titre » ne dit le disque que de SA feuille :
+    // s'il en range plusieurs, chacune garde le numéro de son nom.
+    let feuille_seule = feuilles.len() == 1;
 
     let mut plan = PlanCue::default();
     let mut resolues: Vec<FeuilleResolue> = Vec::new();
@@ -369,7 +372,8 @@ pub fn planifier_dossier(dossier: &Path) -> PlanCue {
         match ecart {
             Some(motif) => plan.ecartees.push((chemin, motif)),
             None => {
-                let disque = disque_de_la_feuille(dossier, &chemin, &feuille, &images);
+                let disque =
+                    disque_de_la_feuille(dossier, &chemin, &feuille, &images, feuille_seule);
                 resolues.push(FeuilleResolue {
                     chemin,
                     feuille,
@@ -393,7 +397,8 @@ pub fn planifier_dossier(dossier: &Path) -> PlanCue {
 /// 2. le dossier, quand il n'est QUE cela (`CD2/`) — la même lecture que le
 ///    scan ordinaire ([`crate::metadata::numero_de_disque`]), où le dossier
 ///    tranche aussi — ou qu'il COMMENCE par le marqueur (`CD3 - On The Night`,
-///    [`crate::metadata::coffrets::marqueur_de_tete`], #8534) ;
+///    [`crate::metadata::coffrets::marqueur_de_tete`], #8534, quand il ne
+///    range que cette feuille) ;
 /// 3. le marqueur en FIN de nom du fichier image, puis de la feuille :
 ///    « Ring CD03.flac », « Ring (Disc 3).cue », ou le nom nu « cd3.flac ».
 ///
@@ -407,6 +412,7 @@ fn disque_de_la_feuille(
     chemin: &Path,
     feuille: &CueSheet,
     images: &HashMap<String, PathBuf>,
+    feuille_seule: bool,
 ) -> Option<u32> {
     let du_nom = |p: &Path| {
         let racine = p.file_stem()?.to_str()?;
@@ -424,8 +430,16 @@ fn disque_de_la_feuille(
             // venait du nom de l'image (« On The Night CD1 », numéroté dans
             // l'album d'origine) et le CD 3 du coffret, « disque 1 » déjà
             // pris, devenait une autre version.
-            crate::metadata::numero_de_disque(nom)
-                .or_else(|| crate::metadata::coffrets::marqueur_de_tete(nom).map(|(_, d)| d))
+            //
+            // Seulement quand le dossier ne range que cette feuille : un
+            // dossier « CD1 - Titre » qui tient « Titre CD1.cue » et
+            // « Titre CD2.cue » n'est pas un disque, c'est le coffret.
+            crate::metadata::numero_de_disque(nom).or_else(|| {
+                feuille_seule
+                    .then(|| crate::metadata::coffrets::marqueur_de_tete(nom))
+                    .flatten()
+                    .map(|(_, d)| d)
+            })
         })
         .or_else(|| {
             feuille
@@ -1017,6 +1031,30 @@ mod tests {
                 dossier.display()
             );
         }
+    }
+
+    /// #8534, CONTRE-POIDS — un dossier « Disc 1 - Der Ring » qui range
+    /// DEUX feuilles (« Der Ring CD1 », « Der Ring CD2 ») est le coffret, pas
+    /// son disque 1 : chaque feuille garde le numéro de son nom, et le tout
+    /// reste UN album à deux disques.
+    #[test]
+    fn un_dossier_cd_sous_titre_a_plusieurs_feuilles_garde_leurs_numeros_8534() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = d.path().join("Disc 1 - Der Ring");
+        fs::create_dir_all(&dossier).unwrap();
+        for n in [1, 2] {
+            let image = format!("Der Ring CD{n}.wav");
+            ecrire_wav(&dossier.join(&image), 50);
+            fs::write(
+                dossier.join(format!("Der Ring CD{n}.cue")),
+                feuille_de_coffret("Georg Solti", &image, ""),
+            )
+            .unwrap();
+        }
+        let plan = planifier_dossier(&dossier);
+        assert_eq!(plan.albums.len(), 1, "{plan:?}");
+        let disques: Vec<Option<u32>> = plan.albums[0].pistes.iter().map(|p| p.disque).collect();
+        assert_eq!(disques, vec![Some(1), Some(1), Some(2), Some(2)]);
     }
 
     /// #7751, CONTRE-POIDS — deux albums DIFFÉRENTS de même titre restent
