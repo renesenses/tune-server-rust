@@ -3738,8 +3738,8 @@ async fn pg_7619_revision_de_la_bibliotheque() {
 
 /// web#916 — « Pas pour moi » sur le VRAI moteur PostgreSQL.
 ///
-/// Le témoin RETIRE la table et la ligne 110 de `schema_version`, puis rejoue
-/// le lanceur : si le script 110 ne la posait pas, le premier écart rendrait
+/// Le témoin RETIRE la table et la ligne 111 de `schema_version`, puis rejoue
+/// le lanceur : si le script 111 ne la posait pas, le premier écart rendrait
 /// une erreur SQL. Puis, par le pont `DbBackend` : les marqueurs `$n`,
 /// `ON CONFLICT … DO UPDATE` (écarter deux fois sans doublon), le
 /// cloisonnement par profil (BIGINT) et le rétablissement.
@@ -3762,14 +3762,14 @@ async fn pg_916_suggestions_ecartees() {
         .expect("lanceur PG");
     sqlx::raw_sql(
         "DROP TABLE IF EXISTS suggestions_ecartees;
-         DELETE FROM schema_version WHERE version >= 110;",
+         DELETE FROM schema_version WHERE version >= 111;",
     )
     .execute(&pool)
     .await
-    .expect("retirer la table et la 110");
+    .expect("retirer la table et la 111");
     crate::db::migrations::run_pg_migrations(&pool)
         .await
-        .expect("le lanceur doit rejouer la 110");
+        .expect("le lanceur doit rejouer la 111");
     let pose: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.tables \
          WHERE table_schema = current_schema() AND table_name = 'suggestions_ecartees'",
@@ -3777,7 +3777,7 @@ async fn pg_916_suggestions_ecartees() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(pose, 1, "la 110 n'a pas posé `suggestions_ecartees`");
+    assert_eq!(pose, 1, "la 111 n'a pas posé `suggestions_ecartees`");
     let type_profil: String = sqlx::query_scalar(
         "SELECT data_type FROM information_schema.columns \
          WHERE table_schema = current_schema() AND table_name = 'suggestions_ecartees' \

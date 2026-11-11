@@ -1048,7 +1048,7 @@ CREATE TABLE IF NOT EXISTS streaming_hidden_items (
 );
 CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
 
--- « Pas pour moi » sur une suggestion de l'accueil (web#916, migration 144),
+-- « Pas pour moi » sur une suggestion de l'accueil (web#916, migration 145),
 -- par profil. Ne retire RIEN de la bibliothèque : seules les rangées de
 -- recommandation de `/home/*` la lisent.
 CREATE TABLE IF NOT EXISTS suggestions_ecartees (

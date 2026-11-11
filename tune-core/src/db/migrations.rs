@@ -2825,14 +2825,13 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     //
     // Numérotée 144 / PG 110 à sa jonction avec `batch/bugs-rc12-20261108`
     // (10/11) : le chantier la tenait en 125 / 089, prises depuis le 12/10
-    // par `playlist_tracks_orphelines` (#6179) ; la 143 / PG 109 (#8119) est
-    // la dernière du lot, et la garde de contiguïté exige la suivante.
-    // ⚠️ La PR de #8239 (`sync_releve`, ouverte) réclame AUSSI 144 / 110 :
-    // celle qui fusionne après l'autre se renumérote (règle de la 119).
+    // par `playlist_tracks_orphelines` (#6179). Renumérotée 145 / PG 111 le
+    // 11/11, ordre du lot : #8243 144/110, #8334 145/111, #8090 146/112,
+    // #8429 147/113.
     // Idempotent : IF NOT EXISTS. Aussi dans le CORE_SCHEMA (base neuve),
     // `PG_FULL_SCHEMA` (bascule) et `ENSURE_TABLES` (bases PG converties).
     Migration {
-        version: 144,
+        version: 145,
         name: "suggestions_ecartees",
         up: SQL_SUGGESTIONS_ECARTEES,
     },
@@ -2975,8 +2974,8 @@ fn playlist_tracks_garde_les_orphelines(db: &SqliteDb) -> Result<(), String> {
     Ok(())
 }
 
-/// SQL de la migration 144 (web#916) — voir son entrée dans `MIGRATIONS`.
-/// Jumelle PG : `110_suggestions_ecartees.sql`.
+/// SQL de la migration 145 (web#916) — voir son entrée dans `MIGRATIONS`.
+/// Jumelle PG : `111_suggestions_ecartees.sql`.
 pub(crate) const SQL_SUGGESTIONS_ECARTEES: &str = "
 CREATE TABLE IF NOT EXISTS suggestions_ecartees (
     profile_id INTEGER NOT NULL DEFAULT 1,
@@ -6012,12 +6011,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
              ON CONFLICT (version) DO NOTHING;\n"
         ),
     ),
-    // Jumelle de la SQLite 144 (web#916) : `suggestions_ecartees`, le « Pas
+    // Jumelle de la SQLite 145 (web#916) : `suggestions_ecartees`, le « Pas
     // pour moi » de l'accueil, par profil.
     (
-        110,
+        111,
         "suggestions_ecartees",
-        include_str!("../../migrations/postgres/110_suggestions_ecartees.sql"),
+        include_str!("../../migrations/postgres/111_suggestions_ecartees.sql"),
     ),
 ];
 
@@ -8472,14 +8471,14 @@ mod tests {
         );
     }
 
-    /// web#916 — la migration 144 pose `suggestions_ecartees` (le « Pas pour
+    /// web#916 — la migration 145 pose `suggestions_ecartees` (le « Pas pour
     /// moi » de l'accueil, par profil), sur une base NEUVE comme sur une base
-    /// MONTÉE en 143 ; la clé primaire est le quadruplet (profil, type,
-    /// source, identifiant) ; la jumelle PG 110 existe, est enregistrée, marque
+    /// MONTÉE juste avant ; la clé primaire est le quadruplet (profil, type,
+    /// source, identifiant) ; la jumelle PG 111 existe, est enregistrée, marque
     /// le bon numéro, et le schéma de bascule (avec sa table de copie et sa
     /// clause de conflit) comme `ENSURE_TABLES` la portent.
     #[test]
-    fn la_migration_144_pose_les_suggestions_ecartees_916() {
+    fn la_migration_145_pose_les_suggestions_ecartees_916() {
         let colonnes = |db: &SqliteDb| -> Vec<(String, i64)> {
             let conn = db.connection().lock().unwrap();
             let mut stmt = conn
@@ -8513,15 +8512,20 @@ mod tests {
         montee
             .execute_batch(
                 "DROP TABLE suggestions_ecartees;
-                 DELETE FROM _migrations WHERE version >= 144;",
+                 DELETE FROM _migrations WHERE version >= 145;",
             )
             .unwrap();
         assert!(colonnes(&montee).is_empty(), "préparation : table retirée");
-        assert_eq!(current_version(&montee).unwrap(), 143);
+        // 144 (#8243) une fois fusionnée, 143 avant : seul l'en-deçà compte.
+        assert!(current_version(&montee).unwrap() < 145);
         run_migrations(&montee).unwrap();
         assert_eq!(current_version(&montee).unwrap(), latest_version());
-        assert!(latest_version() >= 144);
-        assert_eq!(cle(colonnes(&montee)), cle_attendue, "base montée en 143");
+        assert!(latest_version() >= 145);
+        assert_eq!(
+            cle(colonnes(&montee)),
+            cle_attendue,
+            "base montée sous la 145"
+        );
         montee
             .execute_batch(
                 "INSERT INTO suggestions_ecartees (profile_id, item_type, source, item_id) \
@@ -8539,11 +8543,11 @@ mod tests {
         );
 
         let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let fichier = "110_suggestions_ecartees.sql";
+        let fichier = "111_suggestions_ecartees.sql";
         let sql_pg =
             std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
         assert!(
-            sql_pg.contains("VALUES (110, 'suggestions_ecartees')"),
+            sql_pg.contains("VALUES (111, 'suggestions_ecartees')"),
             "le script PG marque un autre numéro dans schema_version"
         );
         assert!(
@@ -9801,9 +9805,9 @@ mod tests {
         // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
         // Migration de DONNÉES : le nom, le pays et le genre de la station
         // semée sous « PureClassic Radio ».
-        // 110 : `suggestions_ecartees` (web#916), jumelle de la SQLite 144. Le
+        // 111 : `suggestions_ecartees` (web#916), jumelle de la SQLite 145. Le
         // « Pas pour moi » de l'accueil, par profil.
-        assert_eq!(pg_latest_version(), 110, "latest PG migration must be 110");
+        assert_eq!(pg_latest_version(), 111, "latest PG migration must be 111");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

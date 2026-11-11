@@ -263,7 +263,7 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8088 -- --nocapture --test-threads=1
 
-      # web#916 — « Pas pour moi » de l'accueil : la PG 110 pose
+      # web#916 — « Pas pour moi » de l'accueil : la PG 111 pose
       # `suggestions_ecartees`, l'écart passe par `$n` et `ON CONFLICT … DO
       # UPDATE`, cloisonné par profil (BIGINT), puis rétabli. Sans cette
       # étape, l'épreuve prendrait son saut annoncé.

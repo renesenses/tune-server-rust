@@ -1,9 +1,10 @@
--- 110_suggestions_ecartees.sql
+-- 111_suggestions_ecartees.sql
 --
 -- renesenses/tune-web-client#916 (FabienM, fil forum 1527) : « Pas pour moi »
 -- sur une suggestion de l'accueil, PAR PROFIL. Jumelle de la migration
--- SQLite 144 (numerotee 089 / SQLite 125 sur le chantier, renumerotee a
--- sa jonction avec batch/bugs-rc12-20261108 le 10/11).
+-- SQLite 145 (numerotee 089 / SQLite 125 sur le chantier, renumerotee a
+-- sa jonction avec batch/bugs-rc12-20261108 le 10/11, puis 145 / PG 111
+-- le 11/11, ordre du lot : #8243 144/110, #8334 145/111).
 --
 -- Un album (local ou de service), une playlist de service, ou un artiste
 -- designe par son nom normalise (`source = 'nom'`). Pas de colonne `id` : la
@@ -29,7 +30,7 @@ CREATE TABLE IF NOT EXISTS suggestions_ecartees (
     PRIMARY KEY (profile_id, item_type, source, item_id)
 );
 
-INSERT INTO schema_version (version, name) VALUES (110, 'suggestions_ecartees')
+INSERT INTO schema_version (version, name) VALUES (111, 'suggestions_ecartees')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

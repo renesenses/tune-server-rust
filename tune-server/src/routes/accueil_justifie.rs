@@ -41,7 +41,7 @@
 //! # « Pas pour moi » : `/home/dismissed-suggestions`
 //!
 //! Par profil (`X-Profile-Id`), en base (`suggestions_ecartees`, migration
-//! SQLite 144 / PG 110). Les rangées de RECOMMANDATION — recommandations,
+//! SQLite 145 / PG 111). Les rangées de RECOMMANDATION — recommandations,
 //! nouveautés de vos artistes, autres versions — ne proposent plus ce que le
 //! profil a écarté. Depuis le go du 13/10, « Continuer l'écoute », les mix
 //! par genre et la page composée `/home` aussi (reprises, plus écoutés, à

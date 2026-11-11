@@ -1200,7 +1200,7 @@ CREATE TABLE IF NOT EXISTS enrich_tentatives (
  mtime_vu TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_enrich_tentatives_issue ON enrich_tentatives(issue, reessai_apres);
--- « Pas pour moi » de l'accueil (web#916, SQLite 144 / PG 110), par profil.
+-- « Pas pour moi » de l'accueil (web#916, SQLite 145 / PG 111), par profil.
 CREATE TABLE IF NOT EXISTS suggestions_ecartees (
     profile_id BIGINT NOT NULL DEFAULT 1,
     item_type TEXT NOT NULL,

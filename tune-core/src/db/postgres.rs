@@ -191,8 +191,8 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             PRIMARY KEY (profile_id, item_type, source, source_id)\
         )",
     "CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id)",
-    // « Pas pour moi » de l'accueil (web#916, PG 110). Ici AUSSI : une base
-    // PostgreSQL convertie avant cette version ne rejoue pas la 110, et les
+    // « Pas pour moi » de l'accueil (web#916, PG 111). Ici AUSSI : une base
+    // PostgreSQL convertie avant cette version ne rejoue pas la 111, et les
     // rangées de `/home/*` LISENT la table à chaque affichage.
     "CREATE TABLE IF NOT EXISTS suggestions_ecartees (\
             profile_id BIGINT NOT NULL DEFAULT 1,\
