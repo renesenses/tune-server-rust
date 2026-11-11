@@ -1613,6 +1613,7 @@ jobs:
             scripts/creer-alias-actifs-release.sh
             scripts/canal-de-release.sh
             scripts/assembler-notes-release.py
+            scripts/ci/apt-robuste.sh
             .github/scripts/forme-des-notes.awk
             tune-server/src/i18n.rs
             .release/

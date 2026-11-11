@@ -60,7 +60,7 @@ miroir_repond() {
   getent hosts "$hote" >/dev/null 2>&1 || return 1
   [ -n "$CODE" ] || return 0
   command -v curl >/dev/null 2>&1 || return 0
-  curl -fsS -o /dev/null --max-time 15 "${url%/}/dists/$CODE/InRelease"
+  curl -fsS -o /dev/null --max-time 8 "${url%/}/dists/$CODE/InRelease"
 }
 
 # 1. La liste de miroirs (format : « URL<TAB>priority:N », une par ligne).
