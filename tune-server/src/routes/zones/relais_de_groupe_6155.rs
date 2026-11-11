@@ -38,7 +38,9 @@
 //! /zones/{id}/play` avec un corps (le corps vide, Lecture après Arrêt, est une
 //! reprise et n'y compte pas), le saut dans la file, la radio (« Mes radios »
 //! et l'annuaire, par `jouer_un_flux`), l'épisode de podcast, le préréglage
-//! épinglé, la radio d'artiste et la lecture aléatoire de la bibliothèque. Un
+//! épinglé, la radio d'artiste et la lecture aléatoire de la bibliothèque —
+//! et, depuis #8021, le `Play` d'un point de contrôle UPnP externe sur la
+//! façade MediaRenderer d'une zone, et la lecture lancée par un greffon. Un
 //! lancement refusé (réponse d'échec, radio qui ne part pas) rend la tête à la
 //! meneuse d'avant. Le groupe
 //! formé depuis la fiche de la Chromecast suivait la Chromecast seule : une
@@ -48,11 +50,13 @@
 //! émet elle aussi `started`, elle deviendrait meneuse à son tour et les deux
 //! zones se renverraient la lecture.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 use tracing::{info, warn};
 
+use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::playback::{PlayState, ZoneState};
@@ -155,7 +159,11 @@ pub(crate) fn geste_pour_la_suiveuse(meneuse: &Instantane, suiveuse: &Instantane
 }
 
 fn groupes_enregistres(state: &AppState) -> Vec<Value> {
-    SettingsRepo::with_backend(state.backend.clone())
+    groupes_de(&state.backend)
+}
+
+fn groupes_de(backend: &Arc<dyn DbBackend>) -> Vec<Value> {
+    SettingsRepo::with_backend(backend.clone())
         .get("zone_groups")
         .ok()
         .flatten()
@@ -238,20 +246,20 @@ static MENEUSES_EN_ECRITURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Relit les groupes, applique `changer`, et réécrit s'il a changé quelque
 /// chose, sous [`MENEUSES_EN_ECRITURE`].
 fn changer_les_groupes<R>(
-    state: &AppState,
+    backend: &Arc<dyn DbBackend>,
     changer: impl FnOnce(&mut [Value]) -> R,
     a_change: impl Fn(&R) -> bool,
 ) -> Option<R> {
     let _garde = MENEUSES_EN_ECRITURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut groupes = groupes_enregistres(state);
+    let mut groupes = groupes_de(backend);
     let rendu = changer(&mut groupes);
     if !a_change(&rendu) {
         return Some(rendu);
     }
     let texte = serde_json::to_string(&groupes).ok()?;
-    match SettingsRepo::with_backend(state.backend.clone()).set("zone_groups", &texte) {
+    match SettingsRepo::with_backend(backend.clone()).set("zone_groups", &texte) {
         Ok(()) => Some(rendu),
         Err(error) => {
             warn!(%error, "zone_group_leader_change_failed");
@@ -267,8 +275,17 @@ fn changer_les_groupes<R>(
 /// Appelé par les routes de lancement AVANT de lancer (le relais réagit au
 /// `started`), jamais par le relais. Voir [`lancer_en_tete_du_groupe`].
 pub(crate) fn prendre_la_tete_du_groupe(state: &AppState, zone: i64) -> Vec<MeneuseRemplacee> {
+    prendre_la_tete_du_groupe_sur(&state.backend, zone)
+}
+
+/// #8021 — [`prendre_la_tete_du_groupe`] pour qui n'a que la base : l'hôte des
+/// greffons ne tient pas d'`AppState` (voir `plugins_host::AppStateHost`).
+pub(crate) fn prendre_la_tete_du_groupe_sur(
+    backend: &Arc<dyn DbBackend>,
+    zone: i64,
+) -> Vec<MeneuseRemplacee> {
     let remplacees = changer_les_groupes(
-        state,
+        backend,
         |groupes| mener_les_groupes_de(groupes, zone),
         |r| !r.is_empty(),
     )
@@ -290,10 +307,20 @@ pub(crate) fn rendre_la_tete_du_groupe(
     zone: i64,
     remplacees: &[MeneuseRemplacee],
 ) {
+    rendre_la_tete_du_groupe_sur(&state.backend, zone, remplacees);
+}
+
+/// #8021 — [`rendre_la_tete_du_groupe`] pour qui n'a que la base.
+pub(crate) fn rendre_la_tete_du_groupe_sur(
+    backend: &Arc<dyn DbBackend>,
+    zone: i64,
+    remplacees: &[MeneuseRemplacee],
+) {
     if remplacees.is_empty() {
         return;
     }
-    if changer_les_groupes(state, |g| rendre_les_groupes(g, zone, remplacees), |c| *c) == Some(true)
+    if changer_les_groupes(backend, |g| rendre_les_groupes(g, zone, remplacees), |c| *c)
+        == Some(true)
     {
         info!(zone, "zone_group_leader_restored");
     }
@@ -366,6 +393,121 @@ pub(crate) async fn aligner_les_suiveuses(state: &AppState, meneuse: i64) {
         };
         if let Err(error) = resultat {
             warn!(meneuse, suiveuse, geste = ?geste, %error, "zone_group_follower_failed");
+        }
+    }
+}
+
+/// #7759 (relecture de #8254) — les déplacements relayés d'une meneuse, par
+/// numéro de génération.
+///
+/// Chaque `seek` reçu sur une meneuse prend un numéro, dans l'ordre d'arrivée
+/// à la route ; le relais aux suiveuses part détaché. En glissant le curseur,
+/// plusieurs relais sont en vol à la fois, et un relais plus ancien pouvait
+/// finir le dernier : la suiveuse restait à une position intermédiaire. Les
+/// relais d'une même meneuse passent donc un à un, et seul celui de la
+/// dernière demande s'applique ; un relais dépassé ne touche plus aucune
+/// suiveuse.
+#[derive(Default)]
+pub struct DeplacementsDeGroupe {
+    par_meneuse: std::sync::Mutex<std::collections::HashMap<i64, Arc<FileDeDeplacements>>>,
+}
+
+#[derive(Default)]
+struct FileDeDeplacements {
+    derniere: std::sync::atomic::AtomicU64,
+    un_a_la_fois: tokio::sync::Mutex<()>,
+}
+
+/// Une demande de déplacement d'une meneuse, numérotée à son arrivée.
+pub struct DemandeDeDeplacement {
+    file: Arc<FileDeDeplacements>,
+    generation: u64,
+}
+
+impl DeplacementsDeGroupe {
+    /// Numérote une nouvelle demande pour `meneuse` : elle dépasse toutes les
+    /// précédentes. À appeler dans la route, AVANT de détacher le relais.
+    pub fn nouvelle_demande(&self, meneuse: i64) -> DemandeDeDeplacement {
+        let file = self
+            .par_meneuse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(meneuse)
+            .or_default()
+            .clone();
+        let generation = file
+            .derniere
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        DemandeDeDeplacement { file, generation }
+    }
+}
+
+impl DemandeDeDeplacement {
+    fn est_la_derniere(&self) -> bool {
+        self.file.derniere.load(std::sync::atomic::Ordering::SeqCst) == self.generation
+    }
+}
+
+/// #7759 (fil 2215) — un déplacement dans la piste, donné sur la meneuse, est
+/// relayé à chaque suiveuse qui joue la même piste.
+///
+/// Le relais n'écoute que `started`, `paused`, `resumed` et `stopped` : une
+/// suiveuse déjà sur la bonne piste n'avait aucune raison de bouger
+/// ([`geste_pour_la_suiveuse`] rend `None`). Après un déplacement de la
+/// meneuse, elle continuait donc à l'ancienne position : « une seule piste
+/// avance ». Journal du testeur (rc10, deux DAC en ASIO) : chaque
+/// `seek_local_output_complete` de la meneuse, aucune ligne pour la suiveuse.
+///
+/// Appelé par la route `seek`, une fois par geste, et non sur l'événement
+/// `seek` du gestionnaire de lecture, que l'orchestrateur émet aussi pour ses
+/// déplacements internes (garde du sondeur pendant une recréation de flux).
+/// Une suiveuse qui ne joue pas la même piste n'est pas touchée : le relais
+/// ordinaire l'aligne déjà, à la position de la meneuse.
+///
+/// `demande` vient de [`DeplacementsDeGroupe::nouvelle_demande`] : les relais
+/// d'une meneuse passent un à un, et un relais dépassé par une demande plus
+/// récente n'applique rien.
+pub async fn deplacer_les_suiveuses(
+    state: &AppState,
+    meneuse: i64,
+    position_ms: u64,
+    demande: DemandeDeDeplacement,
+) {
+    let _un_a_la_fois = demande.file.un_a_la_fois.lock().await;
+    if !demande.est_la_derniere() {
+        info!(meneuse, position_ms, "zone_group_follower_seek_superseded");
+        return;
+    }
+    let suiveuses = zones_suiveuses(&groupes_enregistres(state), meneuse);
+    if suiveuses.is_empty() {
+        return;
+    }
+    let tete = Instantane::de(&state.playback.get_state(meneuse).await);
+    if tete.piste.is_none() {
+        return;
+    }
+    for suiveuse in suiveuses {
+        if !demande.est_la_derniere() {
+            info!(meneuse, position_ms, "zone_group_follower_seek_superseded");
+            return;
+        }
+        let etat = Instantane::de(&state.playback.get_state(suiveuse).await);
+        if etat.piste != tete.piste || etat.etat == PlayState::Stopped {
+            continue;
+        }
+        let device_id = ZoneRepo::with_backend(state.backend.clone())
+            .get(suiveuse)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id);
+        info!(meneuse, suiveuse, position_ms, "zone_group_follower_seeked");
+        if let Err(error) = state
+            .orchestrator
+            .seek(suiveuse, position_ms, device_id.as_deref())
+            .await
+        {
+            warn!(meneuse, suiveuse, position_ms, error = ?error, "zone_group_follower_seek_failed");
         }
     }
 }

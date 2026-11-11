@@ -495,7 +495,28 @@ async fn avtransport_control(
                     // lui sur la zone (ni son bail d'écoute) ; le profil actif
                     // du serveur s'applique.
                     state.playback.set_session_profile(zone_id, None).await;
-                    match state.orchestrator.play(req).await {
+                    // #8021 — une lecture envoyée par un point de contrôle sur
+                    // une zone d'un groupe part sur tout le groupe, comme
+                    // depuis Tune (#7717) : la zone prend la tête, le relais
+                    // fait suivre les autres au `started`. Refusée, la tête
+                    // revient à la meneuse d'avant. La reprise (au-dessus) et
+                    // l'enchaînement (`enchainer_la_suivante`) n'y comptent pas.
+                    let remplacees =
+                        crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe(
+                            &state, zone_id,
+                        );
+                    let lancement = state.orchestrator.play(req).await;
+                    if !lancement
+                        .as_ref()
+                        .is_ok_and(|result| result.sortie_refusee().is_none())
+                    {
+                        crate::routes::zones::relais_de_groupe_6155::rendre_la_tete_du_groupe(
+                            &state,
+                            zone_id,
+                            &remplacees,
+                        );
+                    }
+                    match lancement {
                         // #5574 — la sortie a REFUSÉ (renderer qui acquitte
                         // Play et garde l'ancien flux, URL injoignable…) :
                         // `play()` rend `Ok` avec l'erreur dans le résultat.
@@ -2050,6 +2071,10 @@ mod enchainement_par_la_zone_6335_tests;
 #[cfg(test)]
 #[path = "upnp_media_renderer_tests_8052.rs"]
 mod sink_dsd_de_la_zone_8052_tests;
+
+#[cfg(test)]
+#[path = "upnp_media_renderer_tests_8021.rs"]
+mod groupe_suit_le_point_de_controle_8021_tests;
 
 #[cfg(test)]
 mod publication_de_zone_4626_tests {

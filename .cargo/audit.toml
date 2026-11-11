@@ -30,6 +30,9 @@ ignore = [
     # web-time. Transitif uniquement ; un build natif ne touche jamais son
     # chemin wasm.
     "RUSTSEC-2024-0384",
+    # RUSTSEC-2026-0459 (CVE-2026-119375, SQLite < 3.54 embarque) a ete RETIRE
+    # d'ici (#8196) : rusqlite 0.41 / libsqlite3-sys 0.39 embarquent SQLite
+    # 3.54.0. L'exception temporaire de la rc11 (#8195) n'a plus d'objet.
     # RUSTSEC-2026-0150 (audiopus_sys 0.2.2 abandonne) a ete RETIRE d'ici : la
     # dependance elle-meme a disparu. `tune-core` passe par `opus 0.4.0` /
     # `opusic-sys 0.7.5`, tous deux maintenus (#2251). Il n'y a donc plus

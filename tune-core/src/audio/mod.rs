@@ -167,6 +167,8 @@ pub mod volume_limites;
 /// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).
 pub mod volume_scale;
 pub mod wav;
+/// #8082 — plusieurs pistes de même format servies en un seul WAV continu.
+pub mod wav_continu;
 pub mod wavpack;
 
 /// Linear (2-tap) resampler over interleaved f32 samples.
