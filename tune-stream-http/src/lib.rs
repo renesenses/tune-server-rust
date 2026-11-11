@@ -14,6 +14,8 @@ mod bruit_suspect_6130;
 // #6255 — le bruit suspect vu depuis un lecteur réseau (reprise hors trame,
 // décodage décalé, en-tête au milieu).
 mod bruit_suspect_reseau;
+// #7807 — une ligne INFO par requête d'un renderer vers le streamer.
+mod journal_requete_renderer_7807;
 
 use tune_core::http::streamer::{
     ICY_METAINT, ReresolveFn, SharedSessions, StreamInfo, StreamSession, build_icy_metadata,
@@ -3731,6 +3733,12 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
             "/stream/{stream_id}",
             axum::routing::get(handle_stream).head(handle_head),
         )
+        // #7807 — journal seul, aucun changement de comportement : une ligne
+        // par requête du renderer (méthode, chemin, Range, agent, IP, statut,
+        // octets, durée à la fermeture).
+        .route_layer(axum::middleware::from_fn(
+            journal_requete_renderer_7807::journaliser,
+        ))
         .with_state(sessions)
 }
 
