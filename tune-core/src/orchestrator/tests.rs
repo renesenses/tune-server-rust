@@ -10805,3 +10805,48 @@ async fn frequence_fixe_8428_bibliotheque_decide_48_hors_famille() {
     );
     assert!(pcm.iter().all(|s| s.is_finite()));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_url_directe_ne_contourne_pas_la_conversion() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed direct", Some("local"), Some("local:8428-direct"))
+        .unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/source.wav", listener.local_addr().unwrap());
+    let serveur = tokio::spawn(async move {
+        let (mut client, _) = listener.accept().await.unwrap();
+        let mut requete = [0u8; 4096];
+        let _ = client.read(&mut requete).await.unwrap();
+        let mut wav =
+            crate::audio::wav::build_wav_header_with_data_size(2, 44_100, 16, 176_400).to_vec();
+        wav.resize(44 + 176_400, 0);
+        client.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", wav.len()).as_bytes()).await.unwrap();
+        client.write_all(&wav).await.unwrap();
+    });
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.track_id = None;
+    req.source = Some("upnp".into());
+    req.source_id = Some(url.clone());
+    req.output_device_id = Some("local:8428-direct".into());
+    req.sample_rate = Some(44_100);
+    req.bit_depth = Some(16);
+    req.duration_ms = Some(1000);
+    let resolu = orch.resolve_direct_url(&req).await.unwrap();
+    assert_eq!(
+        resolu.sample_rate,
+        Some(48_000),
+        "une URL directe doit aussi être convertie à la cadence fixe"
+    );
+    assert_ne!(
+        resolu.url, url,
+        "ne pas transmettre la source 44,1 kHz intacte"
+    );
+    let sid = resolu.stream_id.expect("session convertie");
+    orch.streamer.remove_session(&sid).await;
+    serveur.abort();
+}

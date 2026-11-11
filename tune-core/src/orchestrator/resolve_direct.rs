@@ -929,6 +929,20 @@ impl PlaybackOrchestrator {
             None
         };
 
+        // #8428 — les URL finies ne doivent pas contourner la cadence de zone.
+        // Réutiliser le chemin fichier porte aussi le DSP à la bonne cadence.
+        let plafond = crate::device_catalog::combine_max_sample_rate(
+            zone.as_ref().and_then(|z| z.max_sample_rate),
+            crate::device_catalog::resolve_zone_quirks(&self.db, req.zone_id).max_sample_rate,
+        );
+        if !est_dsd_brut(mime_type)
+            && crate::audio::frequence_fixe::cible(&self.db, req.zone_id, plafond)?.is_some()
+            && !is_radio
+        {
+            return Box::pin(self.direct_a_cadence_fixe(req, audio_url, mime_type, &title, source))
+                .await;
+        }
+
         let d = Directe {
             audio_url,
             title: &title,
@@ -1412,6 +1426,11 @@ impl PlaybackOrchestrator {
                 };
                 let cadence = self.cadence_servie_pour_un_service(req, &stream_data)?;
                 let sr = cadence.unwrap_or(stream_data.quality.sample_rate);
+                if crate::audio::frequence_fixe::active(&self.db, req.zone_id).is_some()
+                    && (dsd_rate == 0 || !dsd_rate.is_multiple_of(sr))
+                {
+                    return Err("Fixed PCM sample rate requires an integer DSD decimation ratio; disable the fixed rate for this DSD track".into());
+                }
                 let (url, session_id, mime) = if conteneur == "dsf" {
                     // Au fil de l'eau : mesuré sur le .18 (23/09, 17:xx UTC),
                     // le téléchargement ENTIER du DSF prenait 5 minutes — le
@@ -1639,6 +1658,99 @@ impl PlaybackOrchestrator {
             autre => {
                 let _ = std::fs::remove_file(&fichier);
                 autre
+            }
+        }
+    }
+
+    /// #8428 : une URL finie suit le même rééchantillonneur que la bibliothèque.
+    /// Le téléchargement entier est nécessaire au décodeur fichier existant.
+    async fn direct_a_cadence_fixe(
+        &self,
+        req: &PlayRequest,
+        audio_url: &str,
+        mime_type: &str,
+        title: &str,
+        source: &str,
+    ) -> Result<ResolvedStream, String> {
+        let conteneur = conteneur_depuis_url(audio_url, mime_type);
+        let fichier = Self::telecharger_dans_un_fichier_temporaire(
+            audio_url.to_string(),
+            Vec::new(),
+            conteneur,
+        )
+        .await?;
+        let chemin = fichier.clone();
+        let metadata = tokio::task::spawn_blocking(move || {
+            crate::metadata::read_metadata(std::path::Path::new(&chemin))
+        })
+        .await
+        .ok()
+        .flatten();
+        let mut piste = crate::db::models::Track::new(title.to_string());
+        piste.id = req.track_id;
+        piste.artist_name = req.artist_name.clone();
+        piste.album_title = req.album_title.clone();
+        piste.cover_path = req.cover_url.clone();
+        piste.duration_ms = req
+            .duration_ms
+            .or_else(|| {
+                metadata
+                    .as_ref()
+                    .and_then(|m| m.duration_ms)
+                    .map(|d| d as i64)
+            })
+            .unwrap_or(0);
+        piste.file_path = Some(fichier.clone());
+        let format = metadata
+            .as_ref()
+            .and_then(|m| m.format.clone())
+            .unwrap_or_else(|| conteneur.to_string());
+        piste.format = Some(format.clone());
+        piste.sample_rate = metadata
+            .as_ref()
+            .and_then(|m| m.sample_rate)
+            .or(req.sample_rate)
+            .map(|r| r as i32);
+        piste.bit_depth = metadata
+            .as_ref()
+            .and_then(|m| m.bit_depth)
+            .or(req.bit_depth)
+            .map(i32::from);
+        piste.channels = metadata
+            .as_ref()
+            .and_then(|m| m.channels)
+            .map(i32::from)
+            .unwrap_or(2);
+        piste.source = source.to_string();
+        let resultat = self
+            .servir_la_piste_locale(
+                req,
+                piste,
+                fichier.clone(),
+                format.clone(),
+                AudioFormat::from_extension(&format),
+                false,
+                None,
+            )
+            .await;
+        match resultat {
+            Ok(mut resolu) => {
+                if let Some(sid) = resolu.stream_id.as_deref() {
+                    supprimer_a_la_fin_de_la_session(
+                        self.streamer.clone(),
+                        sid.to_string(),
+                        fichier,
+                    );
+                } else {
+                    let _ = std::fs::remove_file(&fichier);
+                }
+                resolu.source = source.to_string();
+                resolu.origin_url = Some(audio_url.to_string());
+                Ok(resolu)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&fichier);
+                Err(e)
             }
         }
     }
