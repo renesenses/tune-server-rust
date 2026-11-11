@@ -1588,13 +1588,14 @@ async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
         // lu : désactiver le media server depuis l'interface n'avait aucun
         // effet. Les routes /upnp restent montées (inertes sans annonce) ;
         // la bascule prend effet au redémarrage, comme le renommage.
-        let enabled =
-            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-                .get("upnp_enabled")
-                .ok()
-                .flatten()
-                .map(|v| v != "false" && v != "0")
-                .unwrap_or(true);
+        //
+        // #8374 — sans clé en base, `TUNE_UPNP_SERVER_ENABLED` décide : la
+        // variable était déclarée dans `tune_core::config` et jamais lue, un
+        // utilisateur qui la posait croyait couper l'annonce et ne coupait
+        // rien. La clé en base, posée depuis l'interface, l'emporte toujours.
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        let enabled = tune_core::upnp_server::annonce_voulue(&settings);
         if !enabled {
             info!("upnp_mediaserver_disabled_by_setting");
             return;
@@ -1668,6 +1669,14 @@ fn spawn_alarm_scheduler(state: &AppState) {
         state.orchestrator.clone(),
     ));
     alarm_sched.spawn();
+    // #8213 — arrêt programmé de la lecture à heure fixe.
+    Arc::new(
+        tune_core::arret_programme::PlanificateurArretProgramme::new(
+            state.backend.clone(),
+            state.orchestrator.clone(),
+        ),
+    )
+    .spawn();
 }
 
 fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {

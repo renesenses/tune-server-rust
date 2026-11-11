@@ -319,6 +319,8 @@ pub mod voie {
     pub const FICHIER: &str = "fichier";
     /// Canal alimenté au fil de l'eau par un décodeur.
     pub const FLUX_CONVERTI: &str = "flux_converti";
+    /// #8082 — plusieurs pistes de même format en un seul WAV continu.
+    pub const FLUX_CONTINU: &str = "flux_continu_wav";
     /// Octets de l'amont recopiés (service, radio non transcodée).
     pub const MANDATAIRE: &str = "mandataire";
     pub const RADIO: &str = "radio";
