@@ -2195,6 +2195,10 @@ impl PlaybackOrchestrator {
         // à 1.0, jamais au-delà de l'unité.
         // #8074 — sans zone en base, elle part BAS, jamais à pleine échelle.
         ensemencer_la_sortie_locale_neuve(&self.db, device_id, &local_out).await;
+        // #8437 — la sortie recréée observe aussi le retard du groupe mixte.
+        local_out.set_retard_de_depart_ms(
+            crate::zones::retard_groupe_mixte_8437::retard_de_depart_de_la_zone(&self.db, zone_id),
+        );
         {
             let mut outputs = self.outputs.lock().await;
             outputs.register(Box::new(local_out));
@@ -2340,6 +2344,12 @@ impl PlaybackOrchestrator {
                 // locale), résolue AVANT de verrouiller la sortie de A : elle
                 // lit la sortie de B dans le registre.
                 let secondes_sorties = self.demandes_de_secondes_sorties(zone_id, device_id).await;
+                // #8437 — groupée avec une zone réseau, la sortie locale part
+                // `sync_delay_ms` plus tard (tampon AirPlay compensé à la main).
+                let retard_de_depart_ms =
+                    crate::zones::retard_groupe_mixte_8437::retard_de_depart_de_la_zone(
+                        &self.db, zone_id,
+                    );
                 let output = output_arc.lock().await;
                 if let Some(local_output) = output
                     .as_any()
@@ -2355,6 +2365,7 @@ impl PlaybackOrchestrator {
                     // #6132 — la sortie double de la zone, posée à chaque
                     // lecture comme le strict : `play_url` la lit une fois.
                     local_output.set_secondes_sorties(secondes_sorties);
+                    local_output.set_retard_de_depart_ms(retard_de_depart_ms);
                     // #6522, #6524 — ce que PURE contourne, lu dans les
                     // réglages : la chaîne posée plus bas sera vide en PURE.
                     self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
