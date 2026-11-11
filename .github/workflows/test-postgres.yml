@@ -572,6 +572,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_insert_conditionnel_f7c250 -- --nocapture
 
+      # #8239 — le journal de synchro cloud après un scan, sur PostgreSQL : le
+      # relevé `sync_releve_*` (migration 110), la comparaison par
+      # `IS DISTINCT FROM` et la réécriture du relevé par
+      # `INSERT … ON CONFLICT DO UPDATE … WHERE`. Sans cette étape, l'épreuve
+      # prendrait son « saut annoncé » (garde `derive_des_garde_fous_2816`).
+      - name: Journal de synchro après un scan sur PostgreSQL (#8239)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test journal_apres_scan_pg_8239 -- --nocapture --test-threads=1
+
       # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
       # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
       # l'autre — et refuse toute colonne que le schema neuf a et qu'aucune
