@@ -1209,7 +1209,9 @@ impl PlaybackOrchestrator {
     /// station, PURE ou non. Basculer PURE n'y change donc QUE l'égaliseur :
     /// - entrée en PURE : l'égaliseur est coupé et le préampli gardé remonte
     ///   jusqu'au signal sec ([`super::eq_en_vol::EqEnVol::poser_vers_le_sec`]) :
-    ///   au bout de la rampe, plus aucun étage ne touche les échantillons ;
+    ///   au bout de la rampe (fondu de 300 ms, puis remontée à 2 dB/s, soit
+    ///   quelques secondes pour une réserve de plusieurs dB), plus aucun étage
+    ///   ne touche les échantillons ; avant, aucune marche de niveau ;
     /// - sortie de PURE : l'égaliseur enregistré revient par le fondu de #5215.
     ///
     /// Impossible :

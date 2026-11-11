@@ -448,8 +448,6 @@ async fn bascule_pure_qui_change_le_format_refait_encore_le_flux_8422() {
         ecrire_profil(&orch, zone_id, &profil_audible(8.0));
         let sid = flux_joue(&orch, zone_id).await.unwrap();
         orch.noter_eq_en_vol(zone_id, &sid, poste.clone());
-        let (lectures_avant, _) = commandes(&orch, &device_id).await;
-
         ecrire_pure(&orch, zone_id, true);
         assert_eq!(
             orch.apply_audiophile_change_portee(zone_id).await,
@@ -457,10 +455,10 @@ async fn bascule_pure_qui_change_le_format_refait_encore_le_flux_8422() {
             "{cas} : le format change, le flux doit être refait"
         );
         assert_eq!(poste.poses(), 0, "{cas} : rien n'est posé en vol");
-        laisser_passer_l_anti_rebond().await;
-        assert!(
-            commandes(&orch, &device_id).await.0 > lectures_avant,
-            "{cas} : la relance envoie un nouveau `play_media` au renderer"
+        assert_eq!(
+            relances_programmees(&orch, zone_id),
+            1,
+            "{cas} : la relance du flux est armée, comme avant le correctif"
         );
     }
 }

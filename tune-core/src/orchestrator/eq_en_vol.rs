@@ -50,7 +50,7 @@ pub(crate) struct EqEnVol {
     pub(crate) flux_sans_fin: bool,
     /// #8422 — le FORMAT du flux servi ne dépend d'aucun traitement : une
     /// radio qu'on décode en WAV de toute façon (renderer désigné,
-    /// navigateur, codec ambigu, OAAT). Faux pour une radio que Tune ne
+    /// navigateur, codec ambigu, ou chemin OAAT de `decoder_la_radio_en_wav`). Faux pour une radio que Tune ne
     /// décode QUE parce qu'un égaliseur est actif : sans lui (PURE), une
     /// lecture fraîche passerait la station telle quelle, autre format.
     pub(crate) format_independant_du_traitement: bool,
@@ -626,16 +626,23 @@ mod tests {
         );
     }
 
-    /// #8422 — un dépôt ordinaire après une entrée en PURE annule la
-    /// remontée vers le sec : la sortie de PURE repose l'égaliseur.
+    /// #8422 — un dépôt ordinaire qui arrive avant la relève remplace une
+    /// entrée en PURE : une simple coupure (ici, consigne de volume inconnue)
+    /// garde le préampli comme avant (#6708), sans hériter de la remontée
+    /// vers le sec.
     #[test]
     fn un_depot_ordinaire_efface_la_demande_de_signal_sec_8422() {
-        let poste = EqEnVol::pour_la_radio();
-        poste.poser_vers_le_sec();
-        poste.poser(Some(profil()));
-        let mut courant = None;
-        poste.relever(&mut courant, SR, 2);
-        assert!(courant.as_ref().is_some_and(|e| !e.est_neutre()));
+        let mut radio = RadioFactice::new();
+        radio.passer(8);
+        radio.poste.poser(Some(profil()));
+        radio.passer(20);
+        radio.poste.poser_vers_le_sec();
+        radio.poste.poser(None);
+        radio.passer(350);
+        assert!(
+            radio.eq.as_ref().and_then(|e| e.preampli_garde()).is_some(),
+            "coupure ordinaire : le préampli reste gardé, la demande de sec est oubliée"
+        );
     }
 
     /// Un poste dont personne n'a rien déposé ne touche à rien.
