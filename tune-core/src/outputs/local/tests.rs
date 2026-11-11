@@ -60,7 +60,7 @@ fn une_chaine_locale_terminee_ne_declenche_plus_l_avance_muette() {
 
     let sortie = LocalOutput::new("USB DAC".to_string());
     assert!(
-        !sortie.exclusive_mode,
+        !sortie.mode_exclusif(),
         "le cas d'Alain est le chemin cpal PARTAGÉ"
     );
 

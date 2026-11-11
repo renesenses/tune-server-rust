@@ -1304,6 +1304,12 @@ pub struct PlaybackOrchestrator {
     /// à la position (voir `transfert_en_pause_5050`). Verrou std : accès
     /// courts.
     transferts_en_pause: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #7418 — zones mises en pause parce que leur APPAREIL s'est mis en
+    /// pause (télécommande, autre entrée) : leur reprise depuis Tune rétablit
+    /// la piste à la position, au lieu d'un `Play` « sur place » envoyé à un
+    /// appareil qui peut être passé à autre chose. Voir
+    /// `pause_de_l_appareil_7418`. Verrou std : accès courts.
+    pauses_de_l_appareil: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// #6612 — la dernière reprise SUR PLACE d'un renderer réseau, par zone :
     /// (position, instant). Voir `plage_hors_fichier_6612`. Verrou std :
     /// accès courts.
@@ -1972,6 +1978,7 @@ impl PlaybackOrchestrator {
             dlna_canaux_max: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashMap::new()),
             transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pauses_de_l_appareil: std::sync::Mutex::new(std::collections::HashSet::new()),
             reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -2614,6 +2621,9 @@ mod historique_conteneurs_tests_6466;
 mod sortie_de_radio_dlna_6130_tests;
 mod transfert_en_pause_5050;
 pub use transfert_en_pause_5050::ErreurDeTransfert;
+/// #7418 — une pause faite sur l'appareil devient un arrêt complet, et la
+/// lecture repart normalement depuis Tune.
+mod pause_de_l_appareil_7418;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).

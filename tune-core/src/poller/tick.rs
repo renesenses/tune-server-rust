@@ -319,9 +319,10 @@ impl PositionPoller {
             // initial states read and the device poll response.
             let fresh_states = self.playback.all_states().await;
             // #7418 — l'appareil qui avait mis la zone en pause rejoue notre
-            // flux (Play à la télécommande) : la zone reprend avec lui.
+            // flux (Play à la télécommande) : la zone reprend avec lui. Passé
+            // à autre chose, ou resté en pause trop longtemps : arrêt complet.
             if self
-                .suivre_la_reprise_de_l_appareil(zone_id, &device_id, &status, &fresh_states)
+                .suivre_l_appareil_apres_sa_pause(zone_id, &device_id, &status, &fresh_states)
                 .await
             {
                 continue;
