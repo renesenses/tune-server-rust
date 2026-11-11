@@ -62,6 +62,11 @@ pub(crate) async fn demon_dont_le_recepteur_avance(
                         "device": "Mania",
                     })
                 }
+                // #8420 — une nouvelle piste rouvre la session du démon
+                // (`disconnect` puis `connect`) : le faux démon répond comme
+                // le vrai.
+                "disconnect" => serde_json::json!({"event": "disconnected"}),
+                "connect" => serde_json::json!({"event": "connected", "auth": "pair_verify"}),
                 autre => serde_json::json!({
                     "event": "error",
                     "message": format!("unexpected command: {autre}"),
