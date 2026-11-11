@@ -288,6 +288,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7980 -- --nocapture --test-threads=1
 
+      # #8416 — les règles « nombre d'écoutes » et « dernière écoute » des
+      # listes et collections intelligentes comptent les écoutes importées
+      # (`imported_plays`) comme la Bibliothèque. Sans cette étape, le témoin
+      # prendrait son saut annoncé.
+      - name: Écoutes importées dans les règles intelligentes sur PostgreSQL (#8416)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8416 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
