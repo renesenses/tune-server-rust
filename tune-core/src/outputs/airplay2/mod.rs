@@ -19,6 +19,7 @@ use crate::outputs::traits::{
 
 mod appairage_refuse_8347;
 pub mod composant_manquant_7084;
+mod piste_suivante_8420;
 mod reprise_apres_coupure_7921;
 mod session_en_panne_7823;
 pub mod volume_de_depart_8402;
@@ -67,6 +68,10 @@ pub struct Airplay2Output {
     /// Délai d'abandon d'une attente de code (#8060), [`ATTENTE_DU_CODE`]
     /// hors bancs d'essai.
     delai_du_code: Duration,
+    /// Un `play` est parti sur la connexion que tient le démon : il y a fait
+    /// son `setup`, et la session RTSP n'est plus en `Paired`. La piste
+    /// suivante la referme et en rouvre une neuve avant son `play` (#8420).
+    session_consommee: Arc<AtomicBool>,
     /// Dernier refus d'appairage du récepteur (#8347) : pendant
     /// `delai_apres_un_refus`, la lecture le redit sans recontacter
     /// l'enceinte.
@@ -214,6 +219,7 @@ impl Airplay2Output {
             panne: Arc::new(Mutex::new(None)),
             connexion_perdue: Arc::new(AtomicBool::new(false)),
             delai_du_code: ATTENTE_DU_CODE,
+            session_consommee: Arc::new(AtomicBool::new(false)),
             refus_d_appairage: Arc::new(Mutex::new(None)),
             delai_apres_un_refus: appairage_refuse_8347::DELAI_APRES_UN_REFUS,
             session_a_rouvrir: Arc::new(AtomicBool::new(false)),
@@ -555,11 +561,25 @@ impl Airplay2Output {
             // établie : le démon la garde, coincée après la phase 1, et un
             // nouveau `play` finirait en « Cannot process phase 1 from state
             // SetupPhase1 ». On la lâche et on en rouvre une neuve.
-            if self.session_a_rouvrir.swap(false, Ordering::SeqCst) {
-                info!(
-                    device = %self.name,
-                    "airplay2: the previous setup failed, dropping that session before reconnecting"
-                );
+            //
+            // #8420 — de même après une lecture : le démon refait `setup` à
+            // chaque `play`, et la session d'un titre déjà joué est en
+            // `Playing` (« Cannot process phase 1 from state Playing ») : la
+            // piste suivante repart elle aussi d'une connexion neuve.
+            let setup_manque = self.session_a_rouvrir.swap(false, Ordering::SeqCst);
+            let session_consommee = self.session_consommee.swap(false, Ordering::SeqCst);
+            if setup_manque || session_consommee {
+                if setup_manque {
+                    info!(
+                        device = %self.name,
+                        "airplay2: the previous setup failed, dropping that session before reconnecting"
+                    );
+                } else {
+                    info!(
+                        device = %self.name,
+                        "airplay2: the session already played a track, reopening it for the next one"
+                    );
+                }
                 if let Some(daemon) = proc.as_mut() {
                     daemon
                         .send_cmd(&serde_json::json!({"cmd": "disconnect"}))
@@ -858,6 +878,9 @@ impl OutputTarget for Airplay2Output {
         // puis retombait a zero, sans un son ni une erreur pour l'utilisateur.
         let path = lisible.chemin.to_string_lossy().into_owned();
         *self.panne.lock().await = None;
+        // #8420 — posé AVANT l'envoi : même sans réponse, le démon a pu
+        // faire son `setup` sur cette connexion.
+        self.session_consommee.store(true, Ordering::SeqCst);
         if let Err(error) = self
             .send_confirmed(
                 &serde_json::json!({
@@ -927,6 +950,8 @@ impl OutputTarget for Airplay2Output {
         self.connexion_perdue.store(false, Ordering::SeqCst);
         // #8347 — le démon meurt avec sa connexion coincée.
         self.session_a_rouvrir.store(false, Ordering::SeqCst);
+        // #8420 — et avec la session déjà jouée.
+        self.session_consommee.store(false, Ordering::SeqCst);
         self.send(&serde_json::json!({"cmd": "stop"})).await.ok();
         self.send(&serde_json::json!({"cmd": "disconnect"}))
             .await
