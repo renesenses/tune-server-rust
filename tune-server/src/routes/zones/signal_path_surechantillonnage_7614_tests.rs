@@ -48,7 +48,26 @@ fn chemin(
     build_signal_path(ps, zone, backend, Some("DAC"), "CPAL", Some(&fil)).unwrap()
 }
 
+/// Le greffon installé et actif, migration des greffons passée : ce que
+/// l'installation depuis le catalogue laisse en base.
+fn installer_le_greffon(backend: &Arc<dyn tune_core::db::backend::DbBackend>) {
+    let s = SettingsRepo::with_backend(backend.clone());
+    s.set(tune_core::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    s.set("plugin_upsampler_installed", "true").unwrap();
+    s.set("plugin_upsampler_enabled", "true").unwrap();
+}
+
+/// #8259 — ce que `marketplace::uninstall_plugin` efface : les drapeaux du
+/// greffon, pas le réglage de zone (configuration préservée).
+fn desinstaller_le_greffon(backend: &Arc<dyn tune_core::db::backend::DbBackend>) {
+    let s = SettingsRepo::with_backend(backend.clone());
+    s.delete("plugin_upsampler_installed").unwrap();
+    s.delete("plugin_upsampler_enabled").unwrap();
+}
+
 fn activer(backend: &Arc<dyn tune_core::db::backend::DbBackend>, zone_id: i64) {
+    installer_le_greffon(backend);
     tune_core::audio::surechantillonnage::enregistrer_les_reglages(
         &SettingsRepo::with_backend(backend.clone()),
         zone_id,
@@ -115,4 +134,53 @@ fn sous_pure_la_ligne_inactif_mode_pure() {
     let e = etape(&sp, "upsampling").expect("la ligne PURE");
     assert_eq!(e["bit_perfect"], true);
     assert!(e["description"].as_str().unwrap().contains("PURE"));
+}
+
+/// #8259 — greffon désinstallé, réglage de zone resté à `enabled` : plus de
+/// ligne « non appliqué … à la piste suivante », plus d'état à la racine.
+#[test]
+fn greffon_desinstalle_plus_de_ligne_8259() {
+    let (backend, zone, ps) = zone_locale();
+    activer(&backend, zone.id.unwrap());
+    let avant = chemin(&backend, &zone, &ps);
+    assert!(
+        etape(&avant, "upsampling").is_some(),
+        "greffon installé : la ligne est là ({avant})"
+    );
+    desinstaller_le_greffon(&backend);
+    assert!(
+        tune_core::audio::surechantillonnage::reglages_de_la_zone(
+            &SettingsRepo::with_backend(backend.clone()),
+            zone.id.unwrap()
+        )
+        .enabled,
+        "le réglage de zone survit à la désinstallation"
+    );
+    let sp = chemin(&backend, &zone, &ps);
+    assert!(sp.get("upsampling").is_none(), "{sp}");
+    assert!(etape(&sp, "upsampling").is_none(), "{sp}");
+}
+
+/// #8259 — greffon désactivé (pas désinstallé) : rien ne tourne, pas de ligne.
+#[test]
+fn greffon_desactive_plus_de_ligne_8259() {
+    let (backend, zone, ps) = zone_locale();
+    activer(&backend, zone.id.unwrap());
+    SettingsRepo::with_backend(backend.clone())
+        .set("plugin_upsampler_enabled", "false")
+        .unwrap();
+    let sp = chemin(&backend, &zone, &ps);
+    assert!(etape(&sp, "upsampling").is_none(), "{sp}");
+}
+
+/// #8259 — la ligne « non appliqué » porte la raison connue : le test de la
+/// machine n'a pas été passé.
+#[test]
+fn non_applique_nomme_le_test_de_la_machine_absent_8259() {
+    let (backend, zone, ps) = zone_locale();
+    activer(&backend, zone.id.unwrap());
+    let sp = chemin(&backend, &zone, &ps);
+    assert_eq!(sp["upsampling"]["active"], false, "{sp}");
+    assert_eq!(sp["upsampling"]["reason"], "machine_test_missing", "{sp}");
+    assert!(etape(&sp, "upsampling").is_some());
 }
