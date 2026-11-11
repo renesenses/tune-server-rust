@@ -154,6 +154,11 @@ declarer_evenements! {
     /// (`actif: false`). Charge : `zone_id`, `renderer_volume`, `tune_volume`
     /// (fractions 0–1), `actif`.
     ZoneVolumeExterne => "zone.volume_externe", Emis;
+    /// #8422 — un AVIS pour l'auditeur, jamais une erreur : `zone_id`,
+    /// `code` stable (`pure_resumed_at_position` : une bascule PURE a dû
+    /// relancer le flux, repris à `position_ms` / `position`), `message` en
+    /// français pour les clients qui ne traduisent pas le code, `fatal: false`.
+    ZoneNotice => "zone.notice", Emis;
     GroupCreated => "group.created", Emis;
     GroupUpdated => "group.updated", Emis;
     GroupDeleted => "group.deleted", Emis;

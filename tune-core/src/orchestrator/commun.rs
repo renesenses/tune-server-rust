@@ -614,7 +614,8 @@ impl PlaybackOrchestrator {
                 );
                 // `schedule_eq_replay` refuse quand la position est inconnue
                 // (#2595) : rien ne partira alors avant la piste suivante.
-                if self.schedule_eq_replay(zone_id) {
+                // #8422 — la relance reprend à la position EN COURS et le dit.
+                if self.schedule_replay_pour(zone_id, super::dsp::RaisonDeRelance::BasculePure) {
                     PorteeDuReglage::Relance
                 } else {
                     PorteeDuReglage::PisteSuivante

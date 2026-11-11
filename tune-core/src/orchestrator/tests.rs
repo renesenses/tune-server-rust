@@ -6022,14 +6022,100 @@ async fn la_bascule_pure_reprend_a_la_position_mesuree() {
     laisser_passer_l_anti_rebond().await;
 
     let apres = orch.playback.get_state(zone_id).await;
-    assert_eq!(
-        apres.position_ms, 137_000,
-        "la relecture doit repartir de la position MESURÉE, pas de zéro"
+    // #8422 — la position mesurée, plus le temps joué depuis le relevé
+    // (l'anti-rebond, au moins) : jamais zéro, jamais en arrière.
+    assert!(
+        (137_000..=137_000 + super::dsp::EXTRAPOLATION_MAX_MS as i64).contains(&apres.position_ms),
+        "la relecture doit repartir de la position mesurée, pas de zéro : {}",
+        apres.position_ms
     );
     assert_ne!(
         apres.track_generation, generation_avant,
         "la relecture doit bien avoir eu lieu : sans elle, ce test ne prouverait rien du cas nominal"
     );
+}
+
+/// #8422 (décision de Bertrand du 11/11) — fichier local sur une sortie
+/// DLNA, égaliseur réglé : la bascule PURE doit refaire le flux (octets déjà
+/// cuits), mais reprendre EXACTEMENT là où l'on en était, et le dire une
+/// fois. Le sondeur relève la position une fois par seconde : la bascule
+/// tombe entre deux relevés, puis l'anti-rebond ajoute 500 ms. Avant, la
+/// relance repartait du dernier relevé, jusqu'à 1,5 s en arrière, sans un
+/// mot à l'écran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn la_bascule_pure_reprend_a_la_position_en_cours_et_le_dit_8422() {
+    let device_id = "dlna:uuid-8422-fichier";
+    let (mut orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let bus = Arc::new(EventBus::new());
+    let mut rx = bus.subscribe();
+    orch.event_bus = Some(bus.clone());
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
+    orch.playback.update_position(zone_id, 151_000).await;
+    let releve = std::time::Instant::now();
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        crate::orchestrator::PorteeDuReglage::Relance,
+        "prémisse : fichier aux octets cuits, la relance reste le seul chemin"
+    );
+    let mut vue = 0;
+    for _ in 0..100 {
+        vue = position_vue_par_la_sortie(&orch, device_id).await;
+        if vue >= 151_000 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let plus_tot = 151_000 + 900 + PlaybackOrchestrator::EQ_REPLAY_DEBOUNCE_MS;
+    let plus_tard = 151_000 + releve.elapsed().as_millis() as u64;
+    assert!(
+        vue + 500 >= plus_tot && vue <= plus_tard + 500,
+        "la reprise doit tomber à ±0,5 s de la position EN COURS ({plus_tot}..{plus_tard} ms), \
+         pas au dernier relevé du sondeur (151000) : le renderer a reçu {vue}"
+    );
+    assert_ne!(
+        orch.playback.get_state(zone_id).await.track_generation,
+        generation_avant,
+        "prémisse : la relance a bien eu lieu"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let mut avis = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        if e.event_type == "zone.notice" {
+            avis.push(e.data);
+        }
+    }
+    assert_eq!(avis.len(), 1, "un avis, une seule fois : {avis:?}");
+    let a = &avis[0];
+    assert_eq!(a["code"], super::dsp::AVIS_REPRISE_PURE);
+    assert_eq!(a["zone_id"], zone_id);
+    assert_eq!(a["fatal"], false, "un avis, pas une erreur");
+    assert_eq!(
+        a["position_ms"], vue,
+        "l'avis dit la position envoyée au renderer"
+    );
+    assert_eq!(
+        a["message"],
+        format!(
+            "Bascule PURE : reprise à {}",
+            super::dsp::position_lisible(vue)
+        )
+    );
+}
+
+/// #8422 — la position lisible de l'avis.
+#[test]
+fn la_position_de_l_avis_se_lit_comme_a_l_ecran_8422() {
+    assert_eq!(super::dsp::position_lisible(151_400), "2:31");
+    assert_eq!(super::dsp::position_lisible(5_000), "0:05");
+    assert_eq!(super::dsp::position_lisible(3_725_000), "1:02:05");
 }
 
 /// LE défaut de Pierre M (#2595), zone 987 : « Cet ordinateur », donc AUCUN
@@ -6183,10 +6269,18 @@ async fn bascule_pure_avec_egaliseur_sur_dlna_refabrique_le_flux() {
         plays, 1,
         "le renderer doit recevoir exactement une nouvelle URI (SetAVTransportURI + Play)"
     );
-    assert_eq!(
-        attendre_la_position_vue_par_la_sortie(&orch, device_id, 160_000).await,
-        160_000,
-        "et le Seek vers la position mesurée qui suit la relecture (#2893)"
+    // #8422 — la position mesurée plus le temps joué depuis le relevé.
+    let mut vue = 0;
+    for _ in 0..60 {
+        vue = position_vue_par_la_sortie(&orch, device_id).await;
+        if vue >= 160_000 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        (160_000..=160_000 + super::dsp::EXTRAPOLATION_MAX_MS).contains(&vue),
+        "et le Seek vers la position en cours qui suit la relecture (#2893) : {vue}"
     );
 }
 

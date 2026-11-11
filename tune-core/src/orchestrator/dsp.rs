@@ -30,6 +30,68 @@ pub enum PorteeDuReglage {
     RienNeJoue,
 }
 
+/// #8422 — qui demande une relance du flux réseau.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaisonDeRelance {
+    /// Un réglage (égaliseur, crossfeed, compensation…) : `eq_change`.
+    Reglage,
+    /// Une bascule du mode PURE, annoncée aux télécommandes.
+    BasculePure,
+}
+
+impl RaisonDeRelance {
+    /// La raison écrite dans `zone_replayed_at_position`.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Reglage => "eq_change",
+            Self::BasculePure => "pure_bascule",
+        }
+    }
+}
+
+/// #8422 — au-delà, le dernier relevé du sondeur est trop vieux pour qu'on
+/// en déduise la position : on reprend à la valeur mesurée, comme avant.
+pub(crate) const EXTRAPOLATION_MAX_MS: u64 = 3_000;
+
+/// #8422 — la position EN COURS d'une zone qui joue : le dernier relevé du
+/// sondeur (une fois par seconde environ), plus le temps joué depuis qu'il a
+/// avancé. Sans cela la relance reprenait jusqu'à une seconde et demie en
+/// arrière (relevé + anti-rebond de 500 ms). Pas d'extrapolation hors
+/// lecture, sans relevé, après un `seek` (qui l'efface) ni au-delà de
+/// [`EXTRAPOLATION_MAX_MS`] ; jamais au-delà de la fin de la piste.
+pub(crate) fn position_a_reprendre(etat: &crate::playback::ZoneState) -> u64 {
+    let mesuree = etat.position_ms.max(0) as u64;
+    if etat.state != crate::playback::PlayState::Playing {
+        return mesuree;
+    }
+    let Some(avance) = etat.derniere_avance_de_position else {
+        return mesuree;
+    };
+    let ecoule = avance.elapsed().as_millis() as u64;
+    if ecoule > EXTRAPOLATION_MAX_MS {
+        return mesuree;
+    }
+    let estimee = mesuree + ecoule;
+    match etat.now_playing.as_ref().map(|np| np.duration_ms) {
+        Some(duree) if duree > 0 => estimee.min((duree as u64).saturating_sub(1_000).max(mesuree)),
+        _ => estimee,
+    }
+}
+
+/// #8422 — `2:31`, `1:02:05` : la position telle que l'écran l'affiche.
+pub(crate) fn position_lisible(position_ms: u64) -> String {
+    let s = position_ms / 1000;
+    let (h, m, s) = (s / 3600, (s / 60) % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// #8422 — le code stable de l'avis « bascule PURE, reprise à … ».
+pub(crate) const AVIS_REPRISE_PURE: &str = "pure_resumed_at_position";
+
 impl PorteeDuReglage {
     /// Le mot publié dans les réponses (`portee`).
     pub fn code(self) -> &'static str {
@@ -1445,6 +1507,16 @@ impl PlaybackOrchestrator {
     /// **Ne programme rien quand la position de la zone n'est pas mesurée**
     /// (#2595) : voir `Self::position_entretenue_par_le_sondeur`.
     pub fn schedule_eq_replay(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        self.schedule_replay_pour(zone_id, RaisonDeRelance::Reglage)
+    }
+
+    /// #8422 — [`Self::schedule_eq_replay`], en disant QUI relance : une
+    /// bascule PURE annonce aux télécommandes la position de reprise.
+    pub(super) fn schedule_replay_pour(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+        raison: RaisonDeRelance,
+    ) -> bool {
         // #2595 — ne pas rejouer à une position INCONNUE.
         //
         // Ce redémarrage ne vaut que par sa promesse : reprendre là où on en
@@ -1505,9 +1577,11 @@ impl PlaybackOrchestrator {
                 info!(zone_id, etat = ?etat.state, "eq_replay_skipped_zone_pas_en_lecture");
                 return;
             }
-            let position_ms = etat.position_ms.max(0) as u64;
+            // #8422 — la position EN COURS, pas celle du dernier relevé du
+            // sondeur : le temps joué depuis compte.
+            let position_ms = position_a_reprendre(&etat);
             match moi
-                .replay_zone_at_position(zone_id, position_ms, "eq_change")
+                .replay_zone_at_position(zone_id, position_ms, raison.code())
                 .await
             {
                 Ok(()) => {
@@ -1515,12 +1589,47 @@ impl PlaybackOrchestrator {
                         .lock()
                         .unwrap()
                         .insert(zone_id, std::time::Instant::now());
-                    info!(zone_id, position_ms, "eq_replay_done");
+                    info!(
+                        zone_id,
+                        position_ms,
+                        mesuree_ms = etat.position_ms,
+                        "eq_replay_done"
+                    );
+                    // Une radio n'a pas de position : rien à annoncer.
+                    let piste = etat
+                        .now_playing
+                        .as_ref()
+                        .is_some_and(|np| np.duration_ms > 0);
+                    if raison == RaisonDeRelance::BasculePure && piste {
+                        moi.annoncer_la_reprise_pure(zone_id, position_ms);
+                    }
                 }
                 Err(e) => warn!(zone_id, error = %e, "eq_replay_failed"),
             }
         });
         true
+    }
+
+    /// #8422 — dire aux télécommandes qu'une bascule PURE a relancé le flux,
+    /// et à quelle position : un avis, pas une erreur (`fatal: false`), émis
+    /// UNE fois par relance réussie. `code` est stable ; `message` est le
+    /// repli en français des clients qui ne le traduisent pas.
+    pub(super) fn annoncer_la_reprise_pure(&self, zone_id: i64, position_ms: u64) {
+        let position = position_lisible(position_ms);
+        info!(zone_id, position_ms, %position, "pure_bascule_reprise_annoncee");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit_typed(
+                crate::event_types::EventType::ZoneNotice,
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "code": AVIS_REPRISE_PURE,
+                    "position_ms": position_ms,
+                    "position": position,
+                    "message": format!("Bascule PURE : reprise à {position}"),
+                    "fatal": false,
+                }),
+            );
+        }
     }
 
     /// Réappliquer le crossfeed d'une zone à la sortie locale qui joue, sans
