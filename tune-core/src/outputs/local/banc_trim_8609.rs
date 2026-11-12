@@ -349,13 +349,14 @@ fn purge_simple() {
     crate::memoire_rendue::rendre_la_memoire_liberee();
 }
 
-/// Variante évaluée pour Tune OS (#8609, point 2 de la relecture) : lever le
-/// verrouillage le temps de la purge, puis le reposer à l'identique.
-fn purge_avec_reverrouillage() {
-    // SAFETY : appels sans pointeur.
-    unsafe { libc::munlockall() };
-    crate::memoire_rendue::rendre_la_memoire_liberee();
-    unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) };
+/// La purge de PRODUCTION (#8609, décision du 12/11) : sous le verrou de
+/// Tune, elle le lève le temps de `malloc_trim` puis le rétablit.
+fn purge_de_production() {
+    let p = crate::memoire_rendue::purger().expect("purge");
+    assert!(
+        p.echec_du_reverrouillage.is_none(),
+        "verrou non rétabli : {p:?}"
+    );
 }
 
 fn preparer_les_pistes() -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
@@ -472,9 +473,9 @@ fn banc_trim_pendant_lecture_8609() {
 /// coûtent les variantes ?
 ///
 /// `BANC_8609_MLOCK` choisit le verrouillage posé AU DÉPART du processus :
-/// - `future` : celui de production ; purge simple ;
-/// - `relock` : celui de production ; purge = `munlockall`, `malloc_trim`,
-///   `mlockall` identique ;
+/// - `future` : celui de production ; `malloc_trim` seul (contre-épreuve) ;
+/// - `relock` : celui de production ; la purge de production
+///   (`memoire_rendue::purger`, qui lève puis rétablit le verrou) ;
 /// - `courant` : `MCL_CURRENT|MCL_ONFAULT` seul (ce qui sera alloué ensuite
 ///   — ici l'anneau et les tampons de la phase — n'est PAS verrouillé) ;
 /// - `aucun` : témoin.
@@ -488,23 +489,31 @@ fn banc_trim_sous_mlockall_8609() {
     let mode = std::env::var("BANC_8609_MLOCK").unwrap_or_else(|_| "future".into());
     let secondes = secondes_par_phase();
     let (dossier, fichiers) = preparer_les_pistes();
-    let drapeaux = match mode.as_str() {
-        "future" | "relock" => Some(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT),
-        "courant" => Some(libc::MCL_CURRENT | libc::MCL_ONFAULT),
-        _ => None,
-    };
-    if let Some(d) = drapeaux {
-        // SAFETY : appel sans pointeur.
-        let rc = unsafe { libc::mlockall(d) };
-        assert_eq!(
-            rc,
-            0,
-            "mlockall refusé : {}",
-            std::io::Error::last_os_error()
-        );
+    match mode.as_str() {
+        // Le verrou de PRODUCTION, posé par `ordonnancement_rt` lui-même.
+        "future" | "relock" => assert!(
+            matches!(
+                crate::audio::ordonnancement_rt::verrouiller_sans_decision_pour_un_banc(),
+                crate::audio::ordonnancement_rt::VerrouillageMemoire::Verrouille { .. }
+            ),
+            "mlockall refusé"
+        ),
+        "courant" => {
+            // SAFETY : appel sans pointeur.
+            let rc = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_ONFAULT) };
+            assert_eq!(
+                rc,
+                0,
+                "mlockall refusé : {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        _ => {}
     }
+    // `future` : contre-épreuve, `malloc_trim` seul sous le verrou.
+    // `relock` : la purge de production, qui lève et rétablit le verrou.
     let purge: fn() = if mode == "relock" {
-        purge_avec_reverrouillage
+        purge_de_production
     } else {
         purge_simple
     };

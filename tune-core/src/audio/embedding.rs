@@ -938,6 +938,8 @@ pub(super) async fn rendre_la_memoire_apres_relachement() {
             rendu = p.rendu(),
             rendu_mb = p.rendu_mb(),
             memoire_verrouillee_mb = p.verrouillee_kb.map(|k| k / 1024),
+            memoire_verrouillee_apres_mb = p.verrouillee_apres_kb.map(|k| k / 1024),
+            verrou_leve = p.verrou_leve,
             duree_ms = p.duree_ms,
             lecture_en_cours = crate::taches_de_fond::priorite::lecture_en_cours(),
             "audio_embed_memoire_rendue"

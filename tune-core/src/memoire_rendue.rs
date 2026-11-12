@@ -35,17 +35,38 @@ static PURGE_EN_COURS: AtomicBool = AtomicBool::new(false);
 /// Mesuré sur Shrek (banc `banc_trim_pendant_lecture_8609`) : voir
 /// `tune-server/src/memoire_a_froid.rs` et la PR #8614.
 pub fn rendre_la_memoire_liberee() -> bool {
-    if PURGE_EN_COURS.swap(true, Ordering::AcqRel) {
+    let Some(_tour) = TourDePurge::prendre() else {
         return false;
+    };
+    malloc_trim_brut()
+}
+
+/// Le tour de purge, rendu à sa sortie de portée (même sur panique).
+struct TourDePurge;
+
+impl TourDePurge {
+    fn prendre() -> Option<Self> {
+        (!PURGE_EN_COURS.swap(true, Ordering::AcqRel)).then_some(Self)
     }
+}
+
+impl Drop for TourDePurge {
+    fn drop(&mut self) {
+        PURGE_EN_COURS.store(false, Ordering::Release);
+    }
+}
+
+fn malloc_trim_brut() -> bool {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY : `malloc_trim` n'a pas de précondition ; il prend lui-même
-    // le verrou de chaque arène et ne déplace aucune allocation vivante.
-    let rendu = unsafe { libc::malloc_trim(0) != 0 };
+    {
+        // SAFETY : `malloc_trim` n'a pas de précondition ; il prend lui-même
+        // le verrou de chaque arène et ne déplace aucune allocation vivante.
+        unsafe { libc::malloc_trim(0) != 0 }
+    }
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    let rendu = false;
-    PURGE_EN_COURS.store(false, Ordering::Release);
-    rendu
+    {
+        false
+    }
 }
 
 /// Ce que dit `mallinfo2()` du tas, en mégaoctets (#8609).
@@ -140,7 +161,8 @@ pub fn rss_mb() -> Option<u64> {
 /// la mémoire (#3206, `audio::ordonnancement_rt`) — le noyau REFUSE
 /// `MADV_DONTNEED` sur les pages verrouillées : `malloc_trim` ne rend
 /// presque rien, mais la glibc répond quand même « rendu ». D'où ce champ
-/// dans chaque ligne de purge.
+/// dans chaque ligne de purge, et la levée du verrou autour d'elle
+/// ([`purger`]).
 pub fn memoire_verrouillee_kb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -157,7 +179,7 @@ pub fn memoire_verrouillee_kb() -> Option<u64> {
 }
 
 /// Une purge faite, et ce qu'elle a VRAIMENT rendu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurgeFaite {
     pub rss_avant_kb: Option<u64>,
     pub rss_apres_kb: Option<u64>,
@@ -166,6 +188,13 @@ pub struct PurgeFaite {
     pub glibc_dit_rendu: bool,
     /// Mémoire verrouillée (`VmLck`) au moment de la purge, en Ko.
     pub verrouillee_kb: Option<u64>,
+    /// Mémoire verrouillée APRÈS la purge (verrou rétabli), en Ko.
+    pub verrouillee_apres_kb: Option<u64>,
+    /// Le verrou de Tune a été levé le temps de la purge (#8609).
+    pub verrou_leve: bool,
+    /// Le verrou n'a pas pu être rétabli (cause) : journalisé en erreur et
+    /// retenté au prochain relevé.
+    pub echec_du_reverrouillage: Option<String>,
     pub duree_ms: u64,
 }
 
@@ -199,26 +228,34 @@ impl PurgeFaite {
 
 /// Purge MESURÉE, sur le fil courant (jamais le fil async ni un rappel
 /// audio). `None` hors glibc, ou si une autre purge tourne déjà.
+///
+/// Sous le verrou mémoire de Tune (`mlockall`, Tune OS et `.deb`), le verrou
+/// est levé le temps de la purge puis rétabli avec les mêmes drapeaux
+/// (`audio::ordonnancement_rt::purger_en_levant_le_verrou`) : sans cela, le
+/// noyau refuse de reprendre la moindre page.
 pub fn purger() -> Option<PurgeFaite> {
     if !cfg!(all(target_os = "linux", target_env = "gnu")) {
         return None;
     }
-    if PURGE_EN_COURS.load(Ordering::Acquire) {
-        return None;
-    }
+    let _tour = TourDePurge::prendre()?;
+    crate::audio::ordonnancement_rt::reverrouiller_si_en_attente();
     let verrouillee_kb = memoire_verrouillee_kb();
     let rss_avant_kb = rss_kb();
     let debut = std::time::Instant::now();
-    // La course entre le `load` ci-dessus et le `swap` de
-    // `rendre_la_memoire_liberee` est sans danger : au pire une purge rend
-    // `false` sans avoir rien fait, et le RSS ne bouge pas.
-    let glibc_dit_rendu = rendre_la_memoire_liberee();
+    let (glibc_dit_rendu, verrou) = crate::audio::ordonnancement_rt::purger_en_levant_le_verrou(
+        verrouillee_kb.is_some_and(|k| k > 0),
+        malloc_trim_brut,
+    );
+    let duree_ms = debut.elapsed().as_millis() as u64;
     Some(PurgeFaite {
         rss_avant_kb,
         rss_apres_kb: rss_kb(),
         glibc_dit_rendu,
         verrouillee_kb,
-        duree_ms: debut.elapsed().as_millis() as u64,
+        verrouillee_apres_kb: memoire_verrouillee_kb(),
+        verrou_leve: verrou.leve,
+        echec_du_reverrouillage: verrou.echec_du_retablissement,
+        duree_ms,
     })
 }
 

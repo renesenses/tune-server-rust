@@ -208,6 +208,12 @@ path = "tests/sendspin_poignee_s2a.rs"
 name = "integration_contracts"
 path = "tests/integration_contracts.rs"
 
+# #8609 — la purge sous `mlockall` : binaire à lui seul (le verrou vaut pour
+# tout le processus), un seul test.
+[[test]]
+name = "purge_sous_mlockall_8609"
+path = "tests/purge_sous_mlockall_8609.rs"
+
 # `autotests = false` : sans cette cible, le témoin ne serait jamais compilé.
 # Binaire à lui seul : le cache d'intérêt de tracing est un état de PROCESSUS
 # (voir l'en-tête du fichier, #5370).

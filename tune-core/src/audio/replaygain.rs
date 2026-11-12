@@ -1655,6 +1655,8 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
             rendu = p.rendu(),
             rendu_mb = p.rendu_mb(),
             memoire_verrouillee_mb = p.verrouillee_kb.map(|k| k / 1024),
+            memoire_verrouillee_apres_mb = p.verrouillee_apres_kb.map(|k| k / 1024),
+            verrou_leve = p.verrou_leve,
             duree_ms = p.duree_ms,
             "replaygain_memoire_rendue"
         );

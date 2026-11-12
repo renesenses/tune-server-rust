@@ -148,7 +148,8 @@ pub fn decider_la_purge(une_sortie_locale_joue: bool, libre_mb: Option<u64>) -> 
 ///
 /// La ligne ne dit `rendu=true` que si le RSS a BAISSÉ : sous `mlockall`
 /// (Tune OS, `.deb`), la glibc répond « rendu » sans que rien ne revienne au
-/// système, et `memoire_verrouillee_mb` le montre.
+/// système. Depuis la décision du 12/11, le verrou de Tune est levé le
+/// temps de la purge puis rétabli (`verrou_leve`, `memoire_verrouillee_apres_mb`).
 pub async fn purger_a_froid(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     tas: Option<tune_core::memoire_rendue::EtatDuTas>,
@@ -176,6 +177,8 @@ pub async fn purger_a_froid(
             rendu = purge.rendu(),
             rendu_mb = purge.rendu_mb(),
             memoire_verrouillee_mb = purge.verrouillee_kb.map(|k| k / 1024),
+            memoire_verrouillee_apres_mb = purge.verrouillee_apres_kb.map(|k| k / 1024),
+            verrou_leve = purge.verrou_leve,
             tas_libre_avant_mb = libre_avant_mb,
             duree_ms = purge.duree_ms,
             pendant_lecture_locale = decision == DecisionDePurge::PendantLectureLocale,

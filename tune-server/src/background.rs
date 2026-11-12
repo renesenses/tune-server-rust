@@ -3241,10 +3241,15 @@ fn spawn_memory_diagnostics(
             // #8609 — « libre mais gardé » contre « en usage » : le RSS seul
             // ne les distingue pas. UN `mallinfo2` par relevé (il parcourt les
             // arènes, hors du fil async), servi à la ligne ET à la purge.
-            let tas = tokio::task::spawn_blocking(tune_core::memoire_rendue::etat_du_tas)
-                .await
-                .ok()
-                .flatten();
+            let tas = tokio::task::spawn_blocking(|| {
+                // #8609 — un verrou mémoire non rétabli à la dernière purge
+                // est retenté à chaque relevé, jamais oublié.
+                tune_core::audio::ordonnancement_rt::reverrouiller_si_en_attente();
+                tune_core::memoire_rendue::etat_du_tas()
+            })
+            .await
+            .ok()
+            .flatten();
             #[cfg(target_os = "linux")]
             if let Ok(statm) = tokio::fs::read_to_string("/proc/self/statm").await {
                 let rss_pages: u64 = statm
