@@ -1790,6 +1790,9 @@ mod signal_path_spotify_6946_tests;
 // #2029 — un DSD qui part en DoP se dit « over PCM (DoP) ».
 #[cfg(test)]
 mod signal_path_dop_2029_tests;
+// #8569 — sortie au volume non réglable : pas d'étape Volume.
+#[cfg(test)]
+mod signal_path_volume_non_reglable_8569_tests;
 
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///

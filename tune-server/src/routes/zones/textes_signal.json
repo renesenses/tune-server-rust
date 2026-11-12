@@ -81,7 +81,9 @@
     "upsampling_disabled_at_open": "Suréchantillonnage non appliqué à cette piste: réglage désactivé à l’ouverture",
     "upsampling_plugin_absent_at_open": "Suréchantillonnage non appliqué à cette piste: greffon absent ou désactivé à l’ouverture",
     "renderer_volume": "Volume du renderer {0}%",
-    "upsampling_strict_bitperfect": "Suréchantillonnage inactif : le bit-perfect strict est activé sur cette zone et refuse toute conversion de fréquence ; désactivez-le dans les réglages de la zone pour suréchantillonner"
+    "upsampling_strict_bitperfect": "Suréchantillonnage inactif : le bit-perfect strict est activé sur cette zone et refuse toute conversion de fréquence ; désactivez-le dans les réglages de la zone pour suréchantillonner",
+    "dsd_natif_local": "{0} natif ({1})",
+    "volume_dsd_natif": "Volume non appliqué (DSD natif)"
   },
   "en": {
     "pregain": "auto pre-gain {0} dB",
@@ -165,7 +167,9 @@
     "upsampling_disabled_at_open": "Upsampling not applied to this track: setting disabled when playback opened",
     "upsampling_plugin_absent_at_open": "Upsampling not applied to this track: plugin absent or disabled when playback opened",
     "renderer_volume": "Renderer volume {0}%",
-    "upsampling_strict_bitperfect": "Upsampling inactive: bit-perfect strict is on for this zone and refuses any sample-rate conversion; turn it off in the zone settings to upsample"
+    "upsampling_strict_bitperfect": "Upsampling inactive: bit-perfect strict is on for this zone and refuses any sample-rate conversion; turn it off in the zone settings to upsample",
+    "dsd_natif_local": "{0} native ({1})",
+    "volume_dsd_natif": "Volume not applied (native DSD)"
   },
   "de": {
     "pregain": "automatische Vorverstärkung {0} dB",
@@ -249,7 +253,9 @@
     "upsampling_disabled_at_open": "Upsampling auf diesen Titel nicht angewendet: Einstellung beim Wiedergabestart deaktiviert",
     "upsampling_plugin_absent_at_open": "Upsampling auf diesen Titel nicht angewendet: Plugin beim Wiedergabestart nicht vorhanden oder deaktiviert",
     "renderer_volume": "Renderer-Lautstärke {0}%",
-    "upsampling_strict_bitperfect": "Upsampling inaktiv: Bit-perfect strict ist für diese Zone aktiviert und verweigert jede Abtastratenwandlung; deaktivieren Sie es in den Zoneneinstellungen, um hochzurechnen"
+    "upsampling_strict_bitperfect": "Upsampling inaktiv: Bit-perfect strict ist für diese Zone aktiviert und verweigert jede Abtastratenwandlung; deaktivieren Sie es in den Zoneneinstellungen, um hochzurechnen",
+    "dsd_natif_local": "{0} nativ ({1})",
+    "volume_dsd_natif": "Lautstärke nicht angewendet (natives DSD)"
   },
   "es": {
     "pregain": "preganancia automática {0} dB",
@@ -333,7 +339,9 @@
     "upsampling_disabled_at_open": "Sobremuestreo no aplicado a esta pista: ajuste desactivado al iniciar la reproducción",
     "upsampling_plugin_absent_at_open": "Sobremuestreo no aplicado a esta pista: complemento ausente o desactivado al iniciar la reproducción",
     "renderer_volume": "Volumen del renderer {0}%",
-    "upsampling_strict_bitperfect": "Sobremuestreo inactivo: el bit-perfect strict está activado en esta zona y rechaza toda conversión de frecuencia; desactívelo en los ajustes de la zona para sobremuestrear"
+    "upsampling_strict_bitperfect": "Sobremuestreo inactivo: el bit-perfect strict está activado en esta zona y rechaza toda conversión de frecuencia; desactívelo en los ajustes de la zona para sobremuestrear",
+    "dsd_natif_local": "{0} nativo ({1})",
+    "volume_dsd_natif": "Volumen no aplicado (DSD nativo)"
   },
   "it": {
     "pregain": "pre-guadagno automatico {0} dB",
@@ -417,7 +425,9 @@
     "upsampling_disabled_at_open": "Sovracampionamento non applicato a questa traccia: impostazione disattivata all’avvio della riproduzione",
     "upsampling_plugin_absent_at_open": "Sovracampionamento non applicato a questa traccia: plugin assente o disattivato all’avvio della riproduzione",
     "renderer_volume": "Volume del renderer {0}%",
-    "upsampling_strict_bitperfect": "Sovracampionamento inattivo: il bit-perfect strict è attivo su questa zona e rifiuta ogni conversione di frequenza; disattivalo nelle impostazioni della zona per sovracampionare"
+    "upsampling_strict_bitperfect": "Sovracampionamento inattivo: il bit-perfect strict è attivo su questa zona e rifiuta ogni conversione di frequenza; disattivalo nelle impostazioni della zona per sovracampionare",
+    "dsd_natif_local": "{0} nativo ({1})",
+    "volume_dsd_natif": "Volume non applicato (DSD nativo)"
   },
   "zh": {
     "pregain": "自动预增益 {0} dB",
@@ -501,7 +511,9 @@
     "upsampling_disabled_at_open": "此曲目未应用升采样: 开始播放时设置未启用",
     "upsampling_plugin_absent_at_open": "此曲目未应用升采样: 开始播放时插件缺失或未启用",
     "renderer_volume": "渲染器音量 {0}%",
-    "upsampling_strict_bitperfect": "升频未启用：此区域已开启 Bit-perfect strict，拒绝任何采样率转换；请在区域设置中关闭它以启用升频"
+    "upsampling_strict_bitperfect": "升频未启用：此区域已开启 Bit-perfect strict，拒绝任何采样率转换；请在区域设置中关闭它以启用升频",
+    "dsd_natif_local": "{0} 原生 ({1})",
+    "volume_dsd_natif": "未应用音量（原生 DSD）"
   },
   "ja": {
     "pregain": "自動プリアンプ {0} dB",
@@ -585,7 +597,9 @@
     "upsampling_disabled_at_open": "この曲にはアップサンプリングが適用されていません: 再生開始時に設定が無効でした",
     "upsampling_plugin_absent_at_open": "この曲にはアップサンプリングが適用されていません: 再生開始時にプラグインが未導入または無効でした",
     "renderer_volume": "レンダラーの音量 {0}%",
-    "upsampling_strict_bitperfect": "アップサンプリング無効：このゾーンでは Bit-perfect strict が有効で、サンプルレート変換をすべて拒否します。アップサンプリングするにはゾーン設定でオフにしてください"
+    "upsampling_strict_bitperfect": "アップサンプリング無効：このゾーンでは Bit-perfect strict が有効で、サンプルレート変換をすべて拒否します。アップサンプリングするにはゾーン設定でオフにしてください",
+    "dsd_natif_local": "{0} ネイティブ ({1})",
+    "volume_dsd_natif": "音量は適用されません（ネイティブ DSD）"
   },
   "ko": {
     "pregain": "자동 프리게인 {0} dB",
@@ -669,7 +683,9 @@
     "upsampling_disabled_at_open": "이 트랙에 업샘플링이 적용되지 않음: 재생 시작 시 설정이 비활성화됨",
     "upsampling_plugin_absent_at_open": "이 트랙에 업샘플링이 적용되지 않음: 재생 시작 시 플러그인이 없거나 비활성화됨",
     "renderer_volume": "렌더러 볼륨 {0}%",
-    "upsampling_strict_bitperfect": "업샘플링 비활성: 이 존에서 Bit-perfect strict가 켜져 있어 모든 샘플링 레이트 변환을 거부합니다. 업샘플링하려면 존 설정에서 끄세요"
+    "upsampling_strict_bitperfect": "업샘플링 비활성: 이 존에서 Bit-perfect strict가 켜져 있어 모든 샘플링 레이트 변환을 거부합니다. 업샘플링하려면 존 설정에서 끄세요",
+    "dsd_natif_local": "{0} 네이티브 ({1})",
+    "volume_dsd_natif": "볼륨 미적용 (네이티브 DSD)"
   },
   "ro": {
     "pregain": "pre-amplificare automată {0} dB",
@@ -753,7 +769,9 @@
     "upsampling_disabled_at_open": "Supraeșantionarea nu este aplicată acestei piese: setare dezactivată la pornirea redării",
     "upsampling_plugin_absent_at_open": "Supraeșantionarea nu este aplicată acestei piese: modul absent sau dezactivat la pornirea redării",
     "renderer_volume": "Volumul rendererului {0}%",
-    "upsampling_strict_bitperfect": "Supraeșantionare inactivă: bit-perfect strict este activat pe această zonă și refuză orice conversie de frecvență; dezactivați-l în setările zonei pentru a supraeșantiona"
+    "upsampling_strict_bitperfect": "Supraeșantionare inactivă: bit-perfect strict este activat pe această zonă și refuză orice conversie de frecvență; dezactivați-l în setările zonei pentru a supraeșantiona",
+    "dsd_natif_local": "{0} nativ ({1})",
+    "volume_dsd_natif": "Volum neaplicat (DSD nativ)"
   },
   "sv": {
     "pregain": "automatisk förförstärkning {0} dB",
@@ -837,7 +855,9 @@
     "upsampling_disabled_at_open": "Uppsampling används inte för detta spår: inställningen var avstängd när uppspelningen startade",
     "upsampling_plugin_absent_at_open": "Uppsampling används inte för detta spår: insticksprogrammet saknades eller var avstängt när uppspelningen startade",
     "renderer_volume": "Renderarens volym {0}%",
-    "upsampling_strict_bitperfect": "Uppsampling inaktiv: Bit-perfect strict är på för den här zonen och vägrar all konvertering av samplingsfrekvens; stäng av det i zoninställningarna för att uppsampla"
+    "upsampling_strict_bitperfect": "Uppsampling inaktiv: Bit-perfect strict är på för den här zonen och vägrar all konvertering av samplingsfrekvens; stäng av det i zoninställningarna för att uppsampla",
+    "dsd_natif_local": "{0} inbyggt ({1})",
+    "volume_dsd_natif": "Volym tillämpas inte (inbyggt DSD)"
   },
   "vi": {
     "pregain": "tiền khuếch đại tự động {0} dB",
@@ -921,7 +941,9 @@
     "upsampling_disabled_at_open": "Không áp dụng lấy mẫu tăng cho bản nhạc này: cài đặt bị tắt khi bắt đầu phát",
     "upsampling_plugin_absent_at_open": "Không áp dụng lấy mẫu tăng cho bản nhạc này: thiếu hoặc tắt phần bổ trợ khi bắt đầu phát",
     "renderer_volume": "Âm lượng của renderer {0}%",
-    "upsampling_strict_bitperfect": "Tăng tần số lấy mẫu không hoạt động: Bit-perfect nghiêm ngặt đang bật cho vùng này và từ chối mọi chuyển đổi tần số; hãy tắt nó trong cài đặt vùng để tăng tần số lấy mẫu"
+    "upsampling_strict_bitperfect": "Tăng tần số lấy mẫu không hoạt động: Bit-perfect nghiêm ngặt đang bật cho vùng này và từ chối mọi chuyển đổi tần số; hãy tắt nó trong cài đặt vùng để tăng tần số lấy mẫu",
+    "dsd_natif_local": "{0} gốc ({1})",
+    "volume_dsd_natif": "Không áp dụng âm lượng (DSD gốc)"
   },
   "hu": {
     "pregain": "automatikus előerősítés {0} dB",
@@ -1005,7 +1027,9 @@
     "upsampling_disabled_at_open": "Felülmintavételezés nincs alkalmazva erre a számra: a beállítás ki volt kapcsolva a lejátszás indításakor",
     "upsampling_plugin_absent_at_open": "Felülmintavételezés nincs alkalmazva erre a számra: a bővítmény hiányzott vagy ki volt kapcsolva a lejátszás indításakor",
     "renderer_volume": "Renderer hangereje {0}%",
-    "upsampling_strict_bitperfect": "Felülmintavételezés inaktív: ezen a zónán be van kapcsolva a Bit-perfect strict, amely minden frekvenciaátalakítást elutasít; kapcsolja ki a zóna beállításaiban a felülmintavételezéshez"
+    "upsampling_strict_bitperfect": "Felülmintavételezés inaktív: ezen a zónán be van kapcsolva a Bit-perfect strict, amely minden frekvenciaátalakítást elutasít; kapcsolja ki a zóna beállításaiban a felülmintavételezéshez",
+    "dsd_natif_local": "{0} natív ({1})",
+    "volume_dsd_natif": "Hangerő nincs alkalmazva (natív DSD)"
   },
   "nb": {
     "pregain": "automatisk forsterkning før behandling {0} dB",
@@ -1089,7 +1113,9 @@
     "upsampling_disabled_at_open": "Oppsampling brukes ikke på dette sporet: innstillingen var deaktivert da avspillingen startet",
     "upsampling_plugin_absent_at_open": "Oppsampling brukes ikke på dette sporet: tillegget manglet eller var deaktivert da avspillingen startet",
     "renderer_volume": "Renderervolum {0} %",
-    "upsampling_strict_bitperfect": "Oppsampling inaktiv: Streng bit-perfect er på for denne sonen og nekter all konvertering av samplingsfrekvens; slå det av i soneinnstillingene for å oppsample"
+    "upsampling_strict_bitperfect": "Oppsampling inaktiv: Streng bit-perfect er på for denne sonen og nekter all konvertering av samplingsfrekvens; slå det av i soneinnstillingene for å oppsample",
+    "dsd_natif_local": "{0} native ({1})",
+    "volume_dsd_natif": "Volum ikke brukt (native DSD)"
   },
   "pl": {
     "pregain": "automatyczne wzmocnienie wstępne {0} dB",
@@ -1173,7 +1199,9 @@
     "upsampling_disabled_at_open": "Nadpróbkowanie nie jest stosowane do tego utworu: ustawienie wyłączone przy rozpoczęciu odtwarzania",
     "upsampling_plugin_absent_at_open": "Nadpróbkowanie nie jest stosowane do tego utworu: wtyczka nieobecna lub wyłączona przy rozpoczęciu odtwarzania",
     "renderer_volume": "Głośność renderera {0}%",
-    "upsampling_strict_bitperfect": "Nadpróbkowanie nieaktywne: w tej strefie włączony jest ścisły bit-perfect, który odrzuca każdą konwersję częstotliwości; wyłącz go w ustawieniach strefy, aby nadpróbkowywać"
+    "upsampling_strict_bitperfect": "Nadpróbkowanie nieaktywne: w tej strefie włączony jest ścisły bit-perfect, który odrzuca każdą konwersję częstotliwości; wyłącz go w ustawieniach strefy, aby nadpróbkowywać",
+    "dsd_natif_local": "{0} natywny ({1})",
+    "volume_dsd_natif": "Głośność nie jest stosowana (natywne DSD)"
   },
   "el": {
     "pregain": "αυτόματη προ-ενίσχυση {0} dB",
@@ -1257,6 +1285,8 @@
     "upsampling_disabled_at_open": "Δεν εφαρμόζεται υπερδειγματοληψία σε αυτό το κομμάτι: η ρύθμιση ήταν ανενεργή στην έναρξη της αναπαραγωγής",
     "upsampling_plugin_absent_at_open": "Δεν εφαρμόζεται υπερδειγματοληψία σε αυτό το κομμάτι: το πρόσθετο έλειπε ή ήταν ανενεργό στην έναρξη της αναπαραγωγής",
     "renderer_volume": "Ένταση του renderer {0}%",
-    "upsampling_strict_bitperfect": "Η υπερδειγματοληψία είναι ανενεργή: το αυστηρό bit-perfect είναι ενεργό σε αυτή τη ζώνη και αρνείται κάθε μετατροπή συχνότητας· απενεργοποιήστε το στις ρυθμίσεις της ζώνης για υπερδειγματοληψία"
+    "upsampling_strict_bitperfect": "Η υπερδειγματοληψία είναι ανενεργή: το αυστηρό bit-perfect είναι ενεργό σε αυτή τη ζώνη και αρνείται κάθε μετατροπή συχνότητας· απενεργοποιήστε το στις ρυθμίσεις της ζώνης για υπερδειγματοληψία",
+    "dsd_natif_local": "{0} εγγενές ({1})",
+    "volume_dsd_natif": "Η ένταση δεν εφαρμόζεται (εγγενές DSD)"
   }
 }

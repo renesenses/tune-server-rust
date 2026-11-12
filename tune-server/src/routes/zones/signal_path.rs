@@ -390,6 +390,49 @@ pub async fn signal_path_sous_licence(
     .await
 }
 
+/// #8569 (reliquat de #8462, kiran, fil 2762) — une sortie qui ne règle pas
+/// le volume (`can_set_volume == false`) n'a pas d'étape « Volume » dans le
+/// chemin du signal.
+///
+/// Cas d'origine : le volume DÉCORATIF d'un Diretta UPnP Renderer, que #8538
+/// annonce non réglable. La zone garde le volume enregistré d'avant (50 %),
+/// que le curseur grisé ne permet plus de changer, et la branche sans sonde
+/// de [`build_signal_path_lang`] affichait « Volume du renderer 50 % » pour un
+/// niveau que l'appareil n'applique jamais. Décision du 12/11 : pas d'étape.
+///
+/// Même règle que les autres volumes fixes déjà en place : zone en volume
+/// fixe (`fixed_volume`) et PURE verrouillé (volume tenu à 100 %) ne
+/// produisent pas d'étape. Le constructeur ne voit pas les capacités de la
+/// sortie (elles vivent derrière le registre asynchrone des sorties) : la
+/// règle s'applique ici, à la sortie du constructeur, comme la licence de la
+/// correction de pièce. Sans capacités connues (sortie non enregistrée), rien
+/// ne change. L'étape était marquée intacte : le verdict ne bouge pas.
+pub fn sans_volume_d_une_sortie_non_reglable(
+    signal_path: Option<Value>,
+    capacites: Option<&tune_core::outputs::OutputCapabilities>,
+) -> Option<Value> {
+    let mut sp = signal_path?;
+    if capacites.is_some_and(|c| !c.can_set_volume) {
+        if let Some(etapes) = sp.get_mut("steps").and_then(Value::as_array_mut) {
+            etapes.retain(|e| e.get("name").and_then(Value::as_str) != Some("Volume"));
+        }
+    }
+    Some(sp)
+}
+
+/// [`sans_volume_d_une_sortie_non_reglable`] avec les capacités de la sortie
+/// enregistrée pour la zone (`output_device_id`), lues comme `GET /zones`
+/// les publie (`output_capabilities`).
+pub async fn signal_path_selon_la_sortie(
+    state: &AppState,
+    output_device_id: Option<&str>,
+    signal_path: Option<Value>,
+) -> Option<Value> {
+    signal_path.as_ref()?;
+    let capacites = super::output_capabilities(state, output_device_id).await;
+    sans_volume_d_une_sortie_non_reglable(signal_path, capacites.as_ref())
+}
+
 /// Description du traitement EQ réellement configuré, y compris le headroom
 /// automatique.
 ///
@@ -946,6 +989,8 @@ pub(super) fn zone_reaffectation_ignoree_lang(
 /// disent la même chose.
 pub(super) fn dsd_family_name(sample_rate: i32) -> &'static str {
     match sample_rate {
+        // #8248 — DSD1024 (45,2 / 49,2 MHz) se disait « DSD512 » (fil 2730).
+        r if r >= 44_000_000 => "DSD1024",
         r if r >= 22_000_000 => "DSD512",
         r if r >= 11_000_000 => "DSD256",
         r if r >= 5_000_000 => "DSD128",
@@ -961,6 +1006,37 @@ pub(super) fn dsd_resolution_label(sample_rate: i32) -> String {
         name = dsd_family_name(sample_rate),
         mhz = sample_rate as f64 / 1_000_000.0
     )
+}
+
+/// #8248 — la session sert-elle le flux DSD brut de la sortie locale native
+/// (ASIO, ALSA `DSD_U32`) ? Son MIME n'appartient qu'à elle.
+pub(super) fn est_le_flux_dsd_natif_local(mime_type: &str) -> bool {
+    mime_type.eq_ignore_ascii_case(tune_core::audio::dsd_brut::MIME)
+}
+
+/// #8248 — le pilote qui reçoit le DSD natif d'une sortie locale : ASIO sous
+/// Windows, ALSA (`DSD_U32`) ailleurs — les deux seuls bras natifs.
+pub(super) fn pilote_du_dsd_natif_local() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "ASIO"
+    } else {
+        "ALSA"
+    }
+}
+
+/// #8248 — l'étape « DSD natif » : « DSD128 natif (ALSA) ». Bit-perfect : les
+/// bits du fichier partent tels quels, rangés en mots de 32 bits.
+pub(super) fn etape_dsd_natif_local(lang: &str, sample_rate: i32) -> Value {
+    json!({
+        "name": "Transcoder",
+        "code": "dsd_natif",
+        "description": fs(
+            lang,
+            "dsd_natif_local",
+            &[dsd_family_name(sample_rate), pilote_du_dsd_natif_local()],
+        ),
+        "bit_perfect": true,
+    })
 }
 
 /// « DSD64 over PCM (DoP) » — l'étage de sortie d'un DSD emballé en DoP
@@ -1753,6 +1829,7 @@ fn assembler_les_etapes_lang(
         canaux_source,
         canaux_du_fil,
         dst_reconstruit_en_dsf,
+        dsd_natif_local,
         variante_hls_refusee,
         ..
     } = analyse.source;
@@ -2160,7 +2237,17 @@ fn assembler_les_etapes_lang(
     // La sonde locale tranche si le gain a réellement été appliqué. Pour les
     // sorties sans sonde, conserver l'affichage historique fondé sur le
     // réglage de zone.
-    if let Some(runtime) = runtime_signal_path {
+    if dsd_natif_local {
+        // #8248 — DSD natif : aucun volume logiciel sur du 1 bit. L'étape le
+        // dit au lieu d'afficher un pourcentage qui n'est pas appliqué.
+        if !volume_full {
+            steps.push(json!({
+                "name": "Volume",
+                "description": ts(lang, "volume_dsd_natif"),
+                "bit_perfect": true,
+            }));
+        }
+    } else if let Some(runtime) = runtime_signal_path {
         match runtime.volume {
             // Le même fait ne peut pas être peint de deux couleurs selon la
             // plateforme : la branche sans sonde (macOS, Linux, navigateur,
@@ -2188,7 +2275,10 @@ fn assembler_les_etapes_lang(
         // 50% » se lisait comme un traitement de Tune. Le verdict ne change
         // pas : l'étape était déjà marquée intacte. Le refus du volume par le
         // renderer (502 sur PUT volume) n'est mémorisé par aucun état que ce
-        // calcul lit : seul le volume fixe (`fixed_volume`) retire l'étape.
+        // calcul lit : seul le volume fixe (`fixed_volume`) retire l'étape
+        // ici. #8569 — une sortie qui annonce `can_set_volume == false`
+        // (volume décoratif Diretta, #8538) la perd en sortie de
+        // constructeur : `sans_volume_d_une_sortie_non_reglable`.
         let description = if tune_core::orchestrator::is_network_output_type(Some(output_type)) {
             fs(lang, "renderer_volume", &[&pourcent])
         } else {
@@ -2473,6 +2563,12 @@ fn assembler_les_etapes_lang(
             "description": fs(lang, cle, &[&canaux.to_string(), &disposition]),
             "bit_perfect": intacte,
         }));
+    }
+
+    // #8248 — DSD natif local : l'étage qui dit « DSD natif (ALSA) », là où
+    // un DoP dit « DSD64 over PCM (DoP) » (étape Transcoder, code `dop`).
+    if dsd_natif_local {
+        steps.push(etape_dsd_natif_local(lang, sample_rate));
     }
 
     // Transport step
@@ -3372,6 +3468,10 @@ struct Source<'w> {
     /// (`StreamInfo::dsd_reconstruit_depuis_dst`, posé par la session) : DSD
     /// natif décompressé, aucune conversion PCM.
     dst_reconstruit_en_dsf: bool,
+    /// #8248 — le fil porte le flux DSD BRUT de la sortie locale native
+    /// (`audio::dsd_brut::MIME`) : ALSA `DSD_U32` sous Linux, ASIO sous
+    /// Windows. Constaté sur la session, pas déduit du réglage.
+    dsd_natif_local: bool,
     /// #6357 — le débit du codec mesuré par le décodeur radio (HLS), quand
     /// la lecture en cours n'en porte pas.
     debit_source_kbps: Option<u32>,
@@ -3474,6 +3574,7 @@ fn decrire_la_source<'w>(
             canaux_source: None,
             canaux_du_fil: None,
             dst_reconstruit_en_dsf: false,
+            dsd_natif_local: false,
             debit_radio_kbps: radio.bitrate_kbps,
             variante_hls_refusee: radio.variante_refusee,
         };
@@ -3501,6 +3602,7 @@ fn decrire_la_source<'w>(
             canaux_source: None,
             canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
             dst_reconstruit_en_dsf: false,
+            dsd_natif_local: false,
             debit_source_kbps: Some(qualite.bitrate_kbps),
             debit_radio_kbps: None,
             variante_hls_refusee: None,
@@ -3676,6 +3778,9 @@ fn decrire_la_source<'w>(
             .map(|c| c as u16),
         canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
         dst_reconstruit_en_dsf: is_dsd && wire.is_some_and(|w| w.dsd_reconstruit_depuis_dst),
+        dsd_natif_local: is_dsd
+            && output_type == "local"
+            && wire.is_some_and(|w| est_le_flux_dsd_natif_local(&w.mime_type)),
         debit_radio_kbps: None,
         variante_hls_refusee: None,
     }
