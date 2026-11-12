@@ -39,7 +39,7 @@
 //!   `l_adresse_dsf_du_principal_est_reconnue_comme_du_dsd` et, par la porte
 //!   publique, `le_preteur_sert_en_dop_un_dsd_recu_par_la_facade`.
 
-use crate::db::backend::DbBackend;
+use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::migrations::run_migrations;
 use crate::db::sqlite::SqliteDb;
 use crate::db::zone_repo::ZoneRepo;
@@ -52,7 +52,7 @@ use crate::upnp_server::{
     build_renderer_connection_manager_response_pour, zone_pretee_accepte_le_dsd,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -280,9 +280,23 @@ fn preteur_sur(sortie: &str, dsd_mode: &str) -> (PlaybackOrchestrator, i64) {
     run_migrations(&db).unwrap();
     let db: Arc<dyn DbBackend> = Arc::new(db);
     let zones = ZoneRepo::with_backend(db.clone());
-    let zone_id = zones
+    let premier_id = zones
         .create("Gustard X16", Some("local"), Some(sortie))
         .unwrap();
+    // Un identifiant propre à chaque prêteur : la raison #7265 vit dans un
+    // registre GLOBAL par zone (`dop_ecarte_7265::par_zone`), partagé par
+    // tous les tests du binaire. Chaque base en mémoire numérote sa première
+    // zone 1 ; une résolution DSD locale d'un autre test sur « la zone 1 »
+    // appelait `oublier(1)` entre la pose de la raison et sa lecture, et
+    // `le_preteur_convertit_en_pcm_quand_sa_sortie_ecarte_le_dop` rougissait
+    // par moments en CI (« la garde #7265 a bien écarté le DoP »).
+    static PROCHAIN_ID: AtomicI64 = AtomicI64::new(8_052_000_001);
+    let zone_id = PROCHAIN_ID.fetch_add(1, Ordering::SeqCst);
+    db.execute(
+        "UPDATE zones SET id = ? WHERE id = ?",
+        &[&zone_id as &dyn ToSqlValue, &premier_id as &dyn ToSqlValue],
+    )
+    .unwrap();
     zones.update_dsd_mode(zone_id, dsd_mode).unwrap();
     let orch = PlaybackOrchestrator::new(
         db,

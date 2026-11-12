@@ -3542,11 +3542,32 @@ impl PlaybackOrchestrator {
         // Un envoi direct OpenHome n'existe que si le renderer publie son
         // service Volume : la capacité est acquise.
         if envoi_direct.is_none() && !file.etat.lock().await.en_vol {
-            output
-                .lock()
-                .await
-                .capabilities()
-                .require(OutputCommand::SetVolume)?;
+            let capacites = output.lock().await.capabilities();
+            // #5575 — une sortie sans volume réglable (volume décoratif,
+            // OAAT fixe) joue déjà à plein niveau : une consigne à 100 %
+            // (PURE forcé, restauration, réveil) est tenue sans commande,
+            // comme avant que la capacité ne soit annoncée. Seule une
+            // consigne plus basse, que l'appareil ne peut pas tenir, est
+            // refusée.
+            if !capacites.can_set_volume && (pure_force || volume >= 1.0 - 1e-6) {
+                info!(
+                    zone_id,
+                    device_id = did,
+                    volume,
+                    pure_force,
+                    "volume_plein_sans_commande_sortie_non_reglable"
+                );
+                self.noter_le_volume_aux_postes(zone_id, volume);
+                self.playback.set_volume(zone_id, volume).await;
+                self.playback.mark_volume_changed(zone_id).await;
+                ZoneRepo::with_backend(self.db.clone())
+                    .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
+                    .map_err(|message| {
+                        OutputCommandError::failed(OutputCommand::SetVolume, message)
+                    })?;
+                return Ok((retenu_final, EnvoiDeVolume::AucunVolumeFixe));
+            }
+            capacites.require(OutputCommand::SetVolume)?;
         }
         let consigne_appareil = |output_type: &str| {
             if pure_force {
@@ -3757,10 +3778,18 @@ impl PlaybackOrchestrator {
                 Some(output) => {
                     // #6541 — aucune limite ici (décision du 21/10) : sur
                     // une zone à volume fixe, elles n'ont pas cours.
-                    info!(zone_id, device_id = did, "fixed_volume_arm_sending");
-                    if let Err(error) = output.lock().await.checked_set_volume(1.0).await {
-                        warn!(zone_id, error = %error, "fixed_volume_arm_failed");
-                        return Err(error);
+                    let sortie = output.lock().await;
+                    // #5575 — une sortie qui ne règle pas le volume (volume
+                    // décoratif, OAAT fixe) est déjà à son niveau fixe : rien
+                    // à commander, et surtout rien à refuser.
+                    if !sortie.capabilities().can_set_volume {
+                        info!(zone_id, device_id = did, "fixed_volume_arm_sans_commande");
+                    } else {
+                        info!(zone_id, device_id = did, "fixed_volume_arm_sending");
+                        if let Err(error) = sortie.checked_set_volume(1.0).await {
+                            warn!(zone_id, error = %error, "fixed_volume_arm_failed");
+                            return Err(error);
+                        }
                     }
                 }
                 // Sortie déclarée mais pas encore enregistrée : rien à
