@@ -285,6 +285,33 @@ mod tests {
     }
 
     #[test]
+    fn dop_7704_repos_i24_traverse_la_quantification_a_gain_unitaire() {
+        let ring = RingBuf::new(256);
+        let source: Vec<_> = mots(32)
+            .iter()
+            .map(|w| (*w >> 8) as f32 / 8_388_608.0)
+            .collect();
+        ring.push(&source);
+        let mut suivi = SuiviDoP::new(2);
+        let mut q = super::super::quantification_au_rendu_7703::QuantificationAuRendu::new(24);
+        let mut musique = [0; 64];
+        rendre_flottant(&ring, &mut musique, 1.0, &mut suivi, false, 0, |s, g| {
+            q.rendre(s, g)
+        });
+        let mut flux: Vec<_> = musique.iter().map(|w| w << 8).collect();
+        for muet in [true, false] {
+            let mut out = [0; 6];
+            rendre_flottant(&ring, &mut out, 0.0, &mut suivi, muet, 0, |s, g| {
+                q.rendre(s, g)
+            });
+            let mots: Vec<_> = out.iter().map(|w| w << 8).collect();
+            repos(&mots);
+            flux.extend(mots);
+        }
+        verifier(&flux);
+    }
+
+    #[test]
     fn dop_7704_pcm_conserve_des_zeros() {
         let ring = NativePcmRing::new(128);
         let mut g = gain();

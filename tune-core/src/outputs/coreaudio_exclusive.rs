@@ -635,6 +635,7 @@ impl ExclusiveOutput {
     /// cadence et son hog, comme `rollback_exclusive_setup` le faisait en
     /// ligne. Le message d'erreur est celui d'avant, mot pour mot.
     pub fn start(&mut self) -> Result<(), String> {
+        self.started = false;
         let Some(audio_unit) = self.audio_unit.as_mut() else {
             return Err("Failed to start AudioUnit: AudioUnit already released".to_string());
         };
@@ -655,12 +656,36 @@ impl ExclusiveOutput {
         Ok(())
     }
 
-    /// Release exclusive mode and restore the device to its original state.
+    /// L'état du HAL, relu sur le producteur à la libération. Une lecture
+    /// indisponible conserve l'attente bornée ; un arrêt ou une erreur de rendu
+    /// explicitement rapportés l'annulent.
+    fn rendu_actif(&self) -> bool {
+        let Some(au) = self.audio_unit.as_ref() else {
+            return false;
+        };
+        // AudioUnitProperties.h, propriétés UInt32 / OSStatus, scope global.
+        // https://developer.apple.com/documentation/audiotoolbox/kaudiooutputunitproperty_isrunning
+        const IS_RUNNING: u32 = 2001;
+        // https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_lastrendererror
+        const LAST_RENDER_ERROR: u32 = 22;
+        let actif = au.get_property::<u32>(IS_RUNNING, Scope::Global, Element::Output);
+        let erreur = au.get_property::<i32>(LAST_RENDER_ERROR, Scope::Global, Element::Output);
+        !matches!(actif, Ok(0)) && !matches!(erreur, Ok(code) if code != 0)
+    }
+
+    /// Rend le bail sur le fil producteur de `local::play_url` (std::thread),
+    /// via `BackendCoreAudio`/Drop. Ni le rappel audio ni une tâche async
+    /// ne possèdent cette sortie. L'attente peut atteindre 600 ms si le HAL
+    /// annonce encore une unité active mais ne rappelle plus.
     pub fn release(&mut self) -> Result<(), String> {
-        // Deux tampons de repos confirmés avant de fermer le périphérique DoP (#7704).
+        let silence = self.silence.clone();
         if self.started {
-            self.silence.taire_puis_liberer(
+            silence.taire_puis_liberer_tant_que(
                 super::silence_avant_liberation_6133::BORNE_SILENCE_AVANT_LIBERATION,
+                || {
+                    self.started = self.started && self.rendu_actif();
+                    self.started
+                },
                 || {},
             );
             self.started = false;
