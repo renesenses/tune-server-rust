@@ -12,7 +12,15 @@ type Journal = Arc<Mutex<Vec<(String, String)>>>;
 /// Un faux Spotify qui n'accepte QUE `/me/library` (les anciennes routes
 /// répondent 403, comme le vrai depuis février 2026) et note chaque appel.
 async fn service(journal: Journal) -> SpotifyService {
-    let noter = |methode: &'static str, journal: Journal| {
+    service_repondant(journal, axum::http::StatusCode::OK).await
+}
+
+/// Comme [`service`], mais `/me/library` répond `statut_bibliotheque`.
+async fn service_repondant(
+    journal: Journal,
+    statut_bibliotheque: axum::http::StatusCode,
+) -> SpotifyService {
+    let noter = move |methode: &'static str, journal: Journal| {
         move |uri: axum::http::Uri| {
             let journal = journal.clone();
             async move {
@@ -21,7 +29,7 @@ async fn service(journal: Journal) -> SpotifyService {
                     .unwrap()
                     .push((methode.to_string(), uri.to_string()));
                 if uri.path() == "/v1/me/library" {
-                    axum::http::StatusCode::OK
+                    statut_bibliotheque
                 } else {
                     axum::http::StatusCode::FORBIDDEN
                 }
@@ -111,4 +119,59 @@ async fn spotify_2026_type_de_favori_inconnu_refuse() {
     let mut svc = service(journal.clone()).await;
     assert!(svc.add_favorite("playlists-x", "abc").await.is_err());
     assert!(journal.lock().unwrap().is_empty());
+}
+
+/// #8579 — une liaison qui ne porte PAS la portée d'écriture (compte relié
+/// avant le changement) : refus au code stable, AVANT tout appel à Spotify.
+#[tokio::test]
+async fn spotify_8579_sans_la_portee_le_favori_demande_une_reconnexion() {
+    let journal: Journal = Arc::default();
+    let mut svc = service(journal.clone()).await;
+    svc.portees = Some("user-read-private user-library-read streaming".into());
+    for (genre, portee) in [
+        ("tracks", "user-library-modify"),
+        ("artists", "user-follow-modify"),
+    ] {
+        match svc.add_favorite(genre, "x").await {
+            Err(TuneError::Refused { code, message }) => {
+                assert_eq!(code, CODE_RECONNEXION_FAVORIS);
+                assert!(message.contains(portee), "{message}");
+            }
+            autre => panic!("{genre} : refus attendu, obtenu {autre:?}"),
+        }
+    }
+    assert!(
+        journal.lock().unwrap().is_empty(),
+        "aucun appel sans la portée"
+    );
+}
+
+/// Portées inconnues (liaison d'avant leur enregistrement) : un 403 de
+/// Spotify vaut la même demande de reconnexion.
+#[tokio::test]
+async fn spotify_8579_portees_inconnues_un_403_demande_une_reconnexion() {
+    let journal: Journal = Arc::default();
+    let mut svc = service_repondant(journal, axum::http::StatusCode::FORBIDDEN).await;
+    svc.portees = None;
+    assert!(matches!(
+        svc.remove_favorite("albums", "x").await,
+        Err(TuneError::Refused { code, .. }) if code == CODE_RECONNEXION_FAVORIS
+    ));
+}
+
+/// Contre-épreuve : avec la portée, un 403 reste l'erreur de Spotify
+/// (propriétaire sans Premium, autre refus) ; se reconnecter n'y changerait
+/// rien.
+#[tokio::test]
+async fn spotify_8579_avec_la_portee_un_403_n_est_pas_une_reconnexion() {
+    let journal: Journal = Arc::default();
+    let mut svc = service_repondant(journal, axum::http::StatusCode::FORBIDDEN).await;
+    svc.portees = Some(SCOPES.into());
+    match svc.add_favorite("tracks", "x").await {
+        Err(TuneError::Refused { .. }) => {
+            panic!("403 avec la portée présenté comme une reconnexion")
+        }
+        Err(e) => assert!(e.to_string().contains("403"), "{e}"),
+        Ok(()) => panic!("403 attendu"),
+    }
 }

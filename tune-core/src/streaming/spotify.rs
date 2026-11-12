@@ -1014,6 +1014,45 @@ impl SpotifyService {
             .map(|p| p.split_whitespace().any(|x| x == "streaming"))
     }
 
+    /// La liaison porte-t-elle la portée `portee` ? `None` : on ne le sait
+    /// pas (liaison antérieure à l'enregistrement des portées).
+    pub fn porte(&self, portee: &str) -> Option<bool> {
+        self.portees
+            .as_deref()
+            .map(|p| p.split_whitespace().any(|x| x == portee))
+    }
+
+    /// Février 2026 — ajouter (`ajout`) ou retirer un favori par
+    /// `/me/library`. Une liaison sans la portée d'écriture (compte relié
+    /// avant #8579) est refusée AVANT l'appel, avec le code stable
+    /// [`CODE_RECONNEXION_FAVORIS`] : l'écran propose « Reconnecter Spotify ».
+    /// Un 403 de Spotify sur une liaison dont on ignore les portées vaut le
+    /// même refus ; avec la portée, un 403 reste l'erreur de Spotify.
+    async fn ecrire_favori(
+        &self,
+        ajout: bool,
+        fav_type: &str,
+        item_id: &str,
+    ) -> Result<(), TuneError> {
+        let path = chemin_de_bibliotheque(fav_type, item_id)?;
+        let portee = portee_du_favori(fav_type);
+        if self.porte(portee) == Some(false) {
+            return Err(refus_reconnexion_favoris(portee));
+        }
+        let resultat = if ajout {
+            self.api_put(&path).await
+        } else {
+            self.api_delete(&path).await
+        };
+        match resultat {
+            Ok(()) => Ok(()),
+            Err(e) if e.ends_with(": 403") && self.porte(portee).is_none() => {
+                Err(refus_reconnexion_favoris(portee))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// #6018 — l'identifiant API Web de l'appareil Connect nommé `nom`.
     pub async fn appareil_par_nom(&self, nom: &str) -> Result<Option<String>, String> {
         let d = self.api_get("/me/player/devices").await?;
@@ -2184,15 +2223,11 @@ impl StreamingService for SpotifyService {
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
-        let path = chemin_de_bibliotheque(fav_type, item_id)?;
-        self.api_put(&path).await?;
-        Ok(())
+        self.ecrire_favori(true, fav_type, item_id).await
     }
 
     async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
-        let path = chemin_de_bibliotheque(fav_type, item_id)?;
-        self.api_delete(&path).await?;
-        Ok(())
+        self.ecrire_favori(false, fav_type, item_id).await
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         // #8050 — toutes les pages, pas seulement les 50 premières.
@@ -2379,6 +2414,28 @@ pub fn motif_appareil_absent(nom: &str) -> String {
     format!(
         "L'appareil Spotify Connect « {nom} » n'apparaît pas : librespot ne s'est pas connecté \
          au compte (Spotify Premium est exigé)."
+    )
+}
+
+/// #8579 — code stable du refus « reconnecter Spotify pour gérer les
+/// favoris » : la liaison du compte ne porte pas la portée d'écriture.
+pub const CODE_RECONNEXION_FAVORIS: &str = "spotify_reconnexion_favoris";
+
+/// La portée qu'exige l'écriture d'un favori de ce type.
+fn portee_du_favori(fav_type: &str) -> &'static str {
+    if fav_type == "artists" {
+        "user-follow-modify"
+    } else {
+        "user-library-modify"
+    }
+}
+
+fn refus_reconnexion_favoris(portee: &str) -> TuneError {
+    refus(
+        CODE_RECONNEXION_FAVORIS,
+        format!(
+            "spotify: la liaison du compte ne porte pas la portee {portee} ; reconnecter Spotify une fois pour gerer les favoris"
+        ),
     )
 }
 
