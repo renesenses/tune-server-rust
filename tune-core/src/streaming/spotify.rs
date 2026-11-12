@@ -3735,13 +3735,13 @@ mod favoris_pagination_8050_tests;
 mod playlists_items_8193_tests;
 
 #[cfg(test)]
-#[path = "spotify_favoris_bibliotheque_2026_tests.rs"]
-mod favoris_bibliotheque_2026_tests;
-
-#[cfg(test)]
 #[path = "spotify_titres_phares_8485_tests.rs"]
 mod titres_phares_8485_tests;
 
 #[cfg(test)]
 #[path = "spotify_albums_artiste_8479_tests.rs"]
 mod albums_artiste_8479_tests;
+
+#[cfg(test)]
+#[path = "spotify_favoris_bibliotheque_2026_tests.rs"]
+mod favoris_bibliotheque_2026_tests;
