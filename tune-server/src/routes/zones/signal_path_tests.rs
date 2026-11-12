@@ -5605,6 +5605,12 @@ fn l_etape_se_nomme_crosstalk_quand_crosstalk_est_en_service_7616() {
 #[test]
 fn frequence_fixe_8428_chemin_de_signal_decrit_le_pcm_servi() {
     let (backend, zone) = dlna_zone();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::frequence_fixe::cle_de_zone(zone.id.unwrap()),
+            "48000",
+        )
+        .unwrap();
     let ps = en_lecture(1, "flac", 44_100, 24);
     let sp = build_signal_path(
         &ps,
@@ -5622,4 +5628,147 @@ fn frequence_fixe_8428_chemin_de_signal_decrit_le_pcm_servi() {
     );
     assert_eq!(verdict(&sp), Some(false));
     assert!(step_desc(&sp, "Resampler").unwrap().contains("44.1"));
+}
+
+#[test]
+fn frequence_fixe_8428_absente_ou_contournee_ne_cree_pas_d_etape() {
+    let (backend, zone) = dlna_zone();
+    let ps = en_lecture(1, "flac", 44_100, 24);
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let id = zone.id.unwrap();
+    for mode in ["absente", "pure", "strict"] {
+        let cle = if mode == "pure" {
+            format!("zone_{id}_audiophile")
+        } else {
+            tune_core::audio::bitperfect_strict::cle_de_zone(id)
+        };
+        if mode != "absente" {
+            settings
+                .set(&tune_core::audio::frequence_fixe::cle_de_zone(id), "48000")
+                .unwrap();
+            settings
+                .set(
+                    &cle,
+                    if mode == "pure" {
+                        r#"{"enabled":true}"#
+                    } else {
+                        "true"
+                    },
+                )
+                .unwrap();
+        }
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("DAC"),
+            "",
+            Some(&wire("wav", 48_000, 24)),
+        )
+        .unwrap();
+        assert_eq!(
+            resampler_to_hz(&sp),
+            None,
+            "sans réglage actif, le fil seul ne doit pas inventer une étape de cadence fixe ({mode}) : {sp}"
+        );
+        assert!(
+            !sp["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["code"] == "fixed_rate_limit")
+        );
+        if mode != "absente" {
+            settings.delete(&cle).unwrap();
+        }
+    }
+}
+
+#[test]
+fn frequence_fixe_8428_demande_et_cadence_plafonnee_sont_expliquees() {
+    let (backend, mut zone) = dlna_zone();
+    let id = zone.id.unwrap();
+    zone.max_sample_rate = Some(96_000);
+    backend
+        .execute(
+            "UPDATE zones SET max_sample_rate = 96000 WHERE id = ?",
+            &[&id],
+        )
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&tune_core::audio::frequence_fixe::cle_de_zone(id), "192000")
+        .unwrap();
+    let ps = en_lecture(1, "flac", 44_100, 24);
+    for lang in [
+        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "vi", "hu", "nb", "pl", "el",
+    ] {
+        let sp = build_signal_path_lang(
+            lang,
+            &ps,
+            &zone,
+            &backend,
+            Some("DAC"),
+            "",
+            Some(&wire("wav", 96_000, 24)),
+        )
+        .unwrap();
+        let steps = sp["steps"].as_array().unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| s["code"] == "rate_conversion")
+                .count(),
+            1,
+            "{sp}"
+        );
+        assert_eq!(resampler_to_hz(&sp), Some(96_000));
+        let notice = steps
+            .iter()
+            .find(|s| s["code"] == "fixed_rate_limit")
+            .expect("le plafond doit être expliqué");
+        assert_eq!(notice["requested_hz"], 192_000);
+        assert_eq!(notice["applied_hz"], 96_000);
+        let texte = notice["description"].as_str().unwrap();
+        assert!(
+            texte.contains("192") && texte.contains("96") && !texte.contains('{'),
+            "{lang}: {texte}"
+        );
+    }
+}
+
+#[test]
+fn frequence_fixe_8428_ne_double_pas_la_conversion_mesuree() {
+    use tune_core::outputs::traits::{AudioSpec, FormatOuvert, ProfondeurPcm};
+    let (backend, zone) = local_zone_migrated();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::frequence_fixe::cle_de_zone(zone.id.unwrap()),
+            "48000",
+        )
+        .unwrap();
+    let mut ps = en_lecture(1, "flac", 44_100, 16);
+    ps.transformations_reelles = Some(TransformationsReelles::nouvelles(
+        AudioSpec::nouvelle(44_100, ProfondeurPcm::Entier16, 2).unwrap(),
+        FormatOuvert::new(48_000, 2),
+        false,
+    ));
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CPAL",
+        Some(&wire("wav", 48_000, 16)),
+    )
+    .unwrap();
+    assert_eq!(
+        sp["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["code"] == "rate_conversion")
+            .count(),
+        1,
+        "la session et la mesure décrivent une seule conversion 44,1 → 48 kHz : {sp}"
+    );
 }

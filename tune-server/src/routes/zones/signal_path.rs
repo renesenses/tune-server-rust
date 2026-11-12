@@ -1756,6 +1756,7 @@ fn assembler_les_etapes_lang(
         wire_wav,
         max_sample_rate,
         cadence_pcm_servie,
+        cadence_fixe_demandee,
         // #4354 — la description des étapes n'en a pas besoin : le drapeau ne
         // sert qu'au verdict de transport et au badge PURE.
         dsd_decime_en_pcm: _,
@@ -2056,7 +2057,14 @@ fn assembler_les_etapes_lang(
     // c'est elle que le client affiche « 192 → 96 kHz, pas bit-perfect », et
     // elle qui fait dire « PURE dégradé » (`pure_degraded`).
     let mut rate_conversion: Option<(u32, u32)> = None;
-    if let Some(rate) = cadence_pcm_servie.filter(|rate| *rate != sample_rate as u32) {
+    if let Some(rate) = cadence_pcm_servie.filter(|rate| {
+        *rate != sample_rate as u32
+            && !reel.is_some_and(|t| {
+                t.reechantillonnage()
+                    && t.entree().cadence() == sample_rate as u32
+                    && t.ouvert().cadence == *rate
+            })
+    }) {
         rate_conversion = Some((sample_rate as u32, rate));
         steps.push(json!({
             "name": "Resampler", "code": "rate_conversion",
@@ -2108,6 +2116,23 @@ fn assembler_les_etapes_lang(
             "to_hz": cible,
             "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz"),
             "bit_perfect": false,
+        }));
+    }
+
+    if !is_dsd
+        && let Some(demandee) = cadence_fixe_demandee
+        && let Some(appliquee) = reel
+            .map(|t| t.ouvert().cadence)
+            .or(cadence_pcm_servie)
+            .filter(|r| *r > 0)
+        && demandee != appliquee
+    {
+        steps.push(json!({
+            "name": ts(lang, "fixed_rate_limit_name"),
+            "code": "fixed_rate_limit",
+            "requested_hz": demandee, "applied_hz": appliquee,
+            "description": fs(lang, "fixed_rate_limit", &[&(demandee as f64 / 1000.0).to_string(), &(appliquee as f64 / 1000.0).to_string()]),
+            "bit_perfect": true,
         }));
     }
 
@@ -2949,6 +2974,7 @@ struct Forcages {
     max_sample_rate: Option<u32>,
     /// Cadence constatée dans la session PCM, avant le périphérique (#8428).
     cadence_pcm_servie: Option<u32>,
+    cadence_fixe_demandee: Option<u32>,
     /// #4354 — le DSD est-il DÉCIMÉ en PCM multibit ?
     ///
     /// Vrai seulement pour une conversion de domaine réelle : ni le DSD servi
@@ -3170,6 +3196,9 @@ fn decider_les_forcages(
             is_network_output,
             &ZoneRepo::with_backend(backend.clone()).get_dsd_mode(zone_id),
         ) == tune_core::orchestrator::TransportDsd::Pcm;
+    let cadence_fixe_demandee = (!is_dsd)
+        .then(|| tune_core::audio::frequence_fixe::demandee_active(backend, zone_id))
+        .flatten();
     Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
@@ -3182,8 +3211,11 @@ fn decider_les_forcages(
         wire_wav,
         max_sample_rate,
         cadence_pcm_servie: wire
-            .filter(|w| !is_dsd && sample_rate > 0 && w.sample_rate > 0)
+            .filter(|w| {
+                !is_dsd && sample_rate > 0 && w.sample_rate > 0 && cadence_fixe_demandee.is_some()
+            })
             .map(|w| w.sample_rate),
+        cadence_fixe_demandee,
         dsd_decime_en_pcm,
     }
 }

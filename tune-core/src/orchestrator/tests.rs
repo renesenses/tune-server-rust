@@ -10944,3 +10944,213 @@ async fn frequence_fixe_8428_url_directe_ne_contourne_pas_la_conversion() {
     orch.streamer.remove_session(&sid).await;
     serveur.abort();
 }
+
+#[tokio::test]
+async fn frequence_fixe_8428_absente_preserve_le_service_et_airplay() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    for (numero, sortie) in ["local", "airplay", "airplay2"].into_iter().enumerate() {
+        let id = zones.create("Cadence témoin", Some(sortie), None).unwrap();
+        let nouveau = 984280 + numero as i64;
+        orch.db
+            .execute("UPDATE zones SET id = ? WHERE id = ?", &[&nouveau, &id])
+            .unwrap();
+        let id = nouveau;
+        let req = requete_locale_3234(id, 1);
+        let flux = flux_de_service_4759(44_100);
+        assert_eq!(
+            orch.decider_le_wav_de_sortie(&req, &flux, true).unwrap().0,
+            44_100
+        );
+        if sortie != "local" {
+            crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+                .set(&crate::audio::frequence_fixe::cle_de_zone(id), "48000")
+                .unwrap();
+            assert_eq!(
+                orch.decider_le_wav_de_sortie(&req, &flux, true).unwrap().0,
+                44_100,
+                "la cadence du protocole AirPlay ne doit pas être remplacée"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_la_lecture_locale_sert_vraiment_48000_trames() {
+    let orch = test_orchestrator();
+    let dir = tempfile::tempdir().unwrap();
+    let fichier = dir.path().join("source.wav");
+    ecrire_wav_carre(&fichier, 1000);
+    piste_3234(&orch, fichier.to_str().unwrap(), "wav");
+    orch.db
+        .execute("UPDATE tracks SET duration_ms = 1000 WHERE id = 1", &[])
+        .unwrap();
+    let id = ZoneRepo::with_backend(orch.db.clone())
+        .create("PCM fixe", Some("local"), Some("local:8428-reel"))
+        .unwrap();
+    orch.db
+        .execute("UPDATE zones SET id = 984284 WHERE id = ?", &[&id])
+        .unwrap();
+    let id = 984284;
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(id), "48000")
+        .unwrap();
+    let mut req = requete_locale_3234(id, 1);
+    req.output_device_id = Some("local:8428-reel".into());
+    let resolu = orch.resolve_local_track(&req).await.unwrap();
+    assert_eq!(resolu.sample_rate, Some(48_000));
+    let sid = resolu.stream_id.unwrap();
+    let session = orch
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(&sid)
+        .cloned()
+        .unwrap();
+    let octets_par_trame = usize::try_from(resolu.channels.unwrap()).unwrap()
+        * usize::try_from(resolu.bit_depth.unwrap() / 8).unwrap();
+    let octets = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut octets = Vec::new();
+        while octets.len() < 44 + 48_000 * octets_par_trame {
+            match session.recv_chunk().await {
+                Some(bloc) => octets.extend(bloc),
+                None => break,
+            }
+        }
+        octets
+    })
+    .await
+    .expect("le décodeur doit servir la seconde de WAV sans périphérique");
+    let en_trop =
+        tokio::time::timeout(std::time::Duration::from_millis(500), session.recv_chunk()).await;
+    assert!(
+        !matches!(en_trop, Ok(Some(ref b)) if !b.is_empty()),
+        "le décodeur ne doit pas servir plus d'une seconde"
+    );
+    orch.streamer.remove_session(&sid).await;
+    assert_eq!(&octets[..4], b"RIFF");
+    assert_eq!(
+        u32::from_le_bytes(octets[24..28].try_into().unwrap()),
+        48_000
+    );
+    let mut debut = 12;
+    while &octets[debut..debut + 4] != b"data" {
+        let n = u32::from_le_bytes(octets[debut + 4..debut + 8].try_into().unwrap()) as usize;
+        debut += 8 + n + n % 2;
+    }
+    let pcm = &octets[debut + 8..];
+    assert_eq!(
+        pcm.len() / octets_par_trame,
+        48_000,
+        "le chemin de lecture doit convertir les échantillons, pas seulement renommer l'en-tête"
+    );
+    assert!(pcm.iter().any(|b| *b != 0));
+
+    for mode in ["pure", "strict"] {
+        let cle = if mode == "pure" {
+            format!("zone_{id}_audiophile")
+        } else {
+            crate::audio::bitperfect_strict::cle_de_zone(id)
+        };
+        settings
+            .set(
+                &cle,
+                if mode == "pure" {
+                    r#"{"enabled":true}"#
+                } else {
+                    "true"
+                },
+            )
+            .unwrap();
+        let resolu = orch.resolve_local_track(&req).await.unwrap();
+        assert_eq!(
+            resolu.sample_rate,
+            Some(44_100),
+            "{mode} doit couper la cadence fixe sur la vraie résolution"
+        );
+        if let Some(sid) = resolu.stream_id {
+            orch.streamer.remove_session(&sid).await;
+        }
+        settings.delete(&cle).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn frequence_fixe_8428_le_plafond_borne_la_demande_sur_local_et_reseau() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    for sortie in ["local", "dlna", "oaat"] {
+        let id = zones
+            .create("Cadence plafonnée", Some(sortie), None)
+            .unwrap();
+        orch.db
+            .execute(
+                "UPDATE zones SET max_sample_rate = 96000 WHERE id = ?",
+                &[&id],
+            )
+            .unwrap();
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(&crate::audio::frequence_fixe::cle_de_zone(id), "192000")
+            .unwrap();
+        let req = requete_locale_3234(id, 1);
+        let flux = flux_de_service_4759(44_100);
+        assert_eq!(
+            orch.decider_le_wav_de_sortie(&req, &flux, sortie == "local")
+                .unwrap()
+                .0,
+            96_000
+        );
+        assert_eq!(
+            orch.cadence_servie_pour_un_service(&req, &flux).unwrap(),
+            Some(96_000)
+        );
+        assert_eq!(
+            crate::audio::frequence_fixe::lire(&orch.db, id),
+            Some(192_000)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_epargne_le_dsd_brut_et_le_dop() {
+    for (numero, mode) in ["native", "dop"].into_iter().enumerate() {
+        let orch = test_orchestrator();
+        let dir = tempfile::tempdir().unwrap();
+        let fichier = dir.path().join("source.dsf");
+        crate::audio::decode::dop_deplacement_tests_6456::ecrire_dsf(&fichier, 352_800);
+        piste_3234(&orch, fichier.to_str().unwrap(), "dsf");
+        orch.db.execute("UPDATE tracks SET sample_rate = 2822400, bit_depth = 1, duration_ms = 1000 WHERE id = 1", &[]).unwrap();
+        let zones = ZoneRepo::with_backend(orch.db.clone());
+        let id = zones
+            .create("DSD", Some("dlna"), Some("dlna:8428-sans-reseau"))
+            .unwrap();
+        let nouveau = 984288 + numero as i64;
+        orch.db
+            .execute("UPDATE zones SET id = ? WHERE id = ?", &[&nouveau, &id])
+            .unwrap();
+        let id = nouveau;
+        zones.update_dsd_mode(id, mode).unwrap();
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(&crate::audio::frequence_fixe::cle_de_zone(id), "48000")
+            .unwrap();
+        let mut req = requete_locale_3234(id, 1);
+        req.output_device_id = Some("dlna:8428-sans-reseau".into());
+        let resolu = orch.resolve_local_track(&req).await.unwrap();
+        assert_eq!(
+            resolu.sample_rate,
+            Some(if mode == "native" { 2_822_400 } else { 176_400 }),
+            "le transport {mode} ne doit jamais prendre la cadence PCM fixe"
+        );
+        if let Some(sid) = resolu.stream_id {
+            orch.streamer.remove_session(&sid).await;
+        }
+        if mode == "native" {
+            assert!(
+                orch.format_de_sortie_pour_test(&req).await.is_ok(),
+                "même la décision de format doit ignorer la cadence PCM en passthrough DSD"
+            );
+        }
+    }
+}

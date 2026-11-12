@@ -19,32 +19,56 @@ pub fn lire(db: &Arc<dyn DbBackend>, id: i64) -> Option<u32> {
         .filter(|r| CADENCES.contains(r))
 }
 
-/// Le choix reste mémorisé sous PURE/strict, mais ne transforme jamais le flux.
-pub fn active(db: &Arc<dyn DbBackend>, id: i64) -> Option<u32> {
-    if super::audiophile::zone_enabled(db, id) || super::bitperfect_strict::zone_enabled(db, id) {
-        None
-    } else {
-        lire(db, id)
-    }
+/// AirPlay impose sa cadence de transport ; ce réglage PCM ne la remplace pas.
+pub fn sortie_compatible(type_sortie: &str) -> bool {
+    !matches!(type_sortie, "airplay" | "airplay2")
 }
 
-/// Une cadence fixe ne se rabat pas silencieusement vers une autre famille.
-/// Le plafond matériel reste opposable : une configuration incompatible échoue.
+/// Le choix reste mémorisé sous PURE/strict, sans transformer le flux.
+pub fn demandee_active(db: &Arc<dyn DbBackend>, id: i64) -> Option<u32> {
+    if super::audiophile::zone_enabled(db, id) || super::bitperfect_strict::zone_enabled(db, id) {
+        return None;
+    }
+    let zone = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+        .get(id)
+        .ok()
+        .flatten();
+    if zone
+        .as_ref()
+        .and_then(|z| z.output_type.as_deref())
+        .is_some_and(|t| !sortie_compatible(t))
+    {
+        return None;
+    }
+    lire(db, id)
+}
+
+/// Cadence effective : choix demandé, borné par la zone et le catalogue.
+/// Décision de Bertrand du 12/11 : ramener au plafond au lieu d'échouer.
+pub fn active(db: &Arc<dyn DbBackend>, id: i64) -> Option<u32> {
+    let demandee = demandee_active(db, id)?;
+    let zone = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+        .get(id)
+        .ok()
+        .flatten();
+    let plafond = crate::device_catalog::combine_max_sample_rate(
+        zone.and_then(|z| z.max_sample_rate),
+        crate::device_catalog::resolve_zone_quirks(db, id).max_sample_rate,
+    );
+    Some(
+        plafond
+            .filter(|p| *p > 0)
+            .map_or(demandee, |p| demandee.min(p)),
+    )
+}
+
+/// Le chemin de lecture peut connaître un plafond plus précis que la zone.
 pub fn cible(
     db: &Arc<dyn DbBackend>,
     id: i64,
     plafond: Option<u32>,
 ) -> Result<Option<u32>, String> {
-    let rate = active(db, id);
-    if let Some(r) = rate
-        && plafond.is_some_and(|max| r > max)
-    {
-        return Err(format!(
-            "Fixed output sample rate {r} Hz exceeds the output limit {} Hz",
-            plafond.unwrap()
-        ));
-    }
-    Ok(rate)
+    Ok(active(db, id).map(|r| plafond.filter(|p| *p > 0).map_or(r, |p| r.min(p))))
 }
 
 #[cfg(test)]
@@ -64,7 +88,7 @@ mod tests {
             Some(48_000),
             "la cadence fixe doit conserver 48 kHz hors famille"
         );
-        assert!(cible(&db, 8428, Some(44_100)).is_err());
+        assert_eq!(cible(&db, 8428, Some(44_100)).unwrap(), Some(44_100));
         s.set(&super::super::bitperfect_strict::cle_de_zone(8428), "true")
             .unwrap();
         assert_eq!(active(&db, 8428), None);

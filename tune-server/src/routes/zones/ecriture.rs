@@ -155,6 +155,21 @@ fn valider_le_patch(
     zone_before: &Zone,
     body: &PatchZone,
 ) -> Result<Option<f64>, axum::response::Response> {
+    let type_sortie = body
+        .output_type
+        .as_deref()
+        .or(zone_before.output_type.as_deref())
+        .unwrap_or("");
+    if matches!(body.fixed_sample_rate, Some(Some(_)))
+        && !tune_core::audio::frequence_fixe::sortie_compatible(type_sortie)
+    {
+        return Err(refus_de_valeur(
+            id,
+            "fixed_sample_rate",
+            type_sortie,
+            "AirPlay uses its protocol sample rate; fixed_sample_rate is unavailable for this output",
+        ));
+    }
     if let Some(Some(rate)) = body.fixed_sample_rate
         && !tune_core::audio::frequence_fixe::CADENCES.contains(&rate)
     {

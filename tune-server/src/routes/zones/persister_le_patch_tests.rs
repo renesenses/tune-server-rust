@@ -288,3 +288,17 @@ async fn frequence_fixe_8428_route_persiste_efface_et_valide() {
     assert_eq!(statut, StatusCode::OK);
     assert_eq!(fiche(&app, id).await["fixed_sample_rate"], Value::Null);
 }
+
+#[tokio::test]
+async fn frequence_fixe_8428_airplay_refuse_la_cadence_mais_permet_de_l_effacer() {
+    let (app, state) = serveur();
+    let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    for sortie in ["airplay", "airplay2"] {
+        let id = repo.create("AirPlay", Some(sortie), None).unwrap();
+        let (statut, _) = patch(&app, id, json!({"fixed_sample_rate": 48000})).await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST);
+        assert_eq!(fiche(&app, id).await["fixed_sample_rate"], Value::Null);
+        let (statut, _) = patch(&app, id, json!({"fixed_sample_rate": null})).await;
+        assert_eq!(statut, StatusCode::OK);
+    }
+}
