@@ -211,6 +211,12 @@ done
                 .unwrap()
                 .push(format!("volume {zone_id} {v:.2}"));
         }
+        async fn rendre_l_appareil(&self, nom: &str) {
+            self.appels
+                .lock()
+                .unwrap()
+                .push(format!("pause-appareil {nom}"));
+        }
     }
 
     fn recepteur(dossier: &std::path::Path) -> Arc<SpotifyConnectManager> {
@@ -286,11 +292,18 @@ done
             .count()
     }
 
-    /// #8580 — Stop dans Tune sur la zone exposée : la session est morte.
-    /// Lecture dans l'application Spotify la ROUVRE (avant : `etat.zone`
-    /// restait rempli, aucun son).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn session_8580_rouverte_apres_un_stop_dans_tune() {
+    /// #8580 — « le dernier geste gagne » : un geste de Tune sur la zone
+    /// exposée (`Stop`, ou un album Qobuz lancé à la place) REND la session.
+    /// L'application Spotify enchaîne pourtant le titre suivant
+    /// (`track_changed` + `playing`) : rien ne rouvre, l'appareil est mis en
+    /// pause, la zone n'est ni relancée ni coupée.
+    async fn geste_de_tune_puis_titre_suivant() -> (
+        Arc<FaussesZones>,
+        EtatSession,
+        PiloteConnect<Arc<FaussesZones>>,
+        Arc<SpotifyConnectManager>,
+        tempfile::TempDir,
+    ) {
         let dossier = tempfile::tempdir().unwrap();
         let recepteur = recepteur(dossier.path());
         let zones = Arc::new(FaussesZones::default());
@@ -302,13 +315,64 @@ done
         let mut etat = EtatSession::default();
         pilote.traiter(&mut etat, &joue("a")).await;
         assert_eq!(ouvertures(&zones), 1);
-        // Contre-épreuve : la zone joue encore la session, rien ne rouvre.
+        // Contre-épreuve : la zone joue encore la session, rien ne bouge.
         pilote.traiter(&mut etat, &joue("a")).await;
         assert_eq!(ouvertures(&zones), 1, "session vivante rouverte à tort");
+        // Le geste de Tune : la zone ne joue plus la session.
         zones
             .ne_joue_plus
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        pilote.traiter(&mut etat, &joue("a")).await;
+        pilote.traiter(&mut etat, &titre("b", "Suivant")).await;
+        pilote.traiter(&mut etat, &joue("b")).await;
+        (zones, etat, pilote, recepteur, dossier)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_stop_dans_tune_puis_titre_suivant_pas_de_reouverture() {
+        let (zones, etat, _p, recepteur, _d) = geste_de_tune_puis_titre_suivant().await;
+        recepteur.disable().await;
+        let appels = zones.appels.lock().unwrap().clone();
+        assert_eq!(ouvertures(&zones), 1, "zone arrêtée relancée : {appels:?}");
+        assert!(
+            appels.iter().any(|a| a == "pause-appareil Tune"),
+            "{appels:?}"
+        );
+        assert!(!appels.iter().any(|a| a == "arreter 9"), "{appels:?}");
+        assert!(etat.rendu());
+        assert_eq!(etat.zone(), None);
+    }
+
+    /// Même chose quand Tune a lancé un album Qobuz sur la zone exposée :
+    /// l'album continue (ni « ouvrir » ni « arreter » sur la zone).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_album_lance_par_tune_continue_au_titre_suivant() {
+        let (zones, _e, _p, recepteur, _d) = geste_de_tune_puis_titre_suivant().await;
+        recepteur.disable().await;
+        let appels = zones.appels.lock().unwrap().clone();
+        let touches: Vec<_> = appels
+            .iter()
+            .skip(1)
+            .filter(|a| {
+                a.ends_with(" 9") || a.starts_with("ouvrir 9") || a.starts_with("morceau 9")
+            })
+            .collect();
+        assert!(
+            touches.is_empty(),
+            "la zone de l'album a été touchée : {appels:?}"
+        );
+    }
+
+    /// Après la pause (l'application la voit : `paused`), Lecture dans
+    /// l'application est une NOUVELLE action : la session rouvre.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_apres_pause_lecture_dans_l_appli_rouvre() {
+        let (zones, mut etat, pilote, recepteur, _d) = geste_de_tune_puis_titre_suivant().await;
+        zones
+            .ne_joue_plus
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        pilote.traiter(&mut etat, &ev("paused")).await;
+        assert!(!etat.rendu(), "la pause de l'application lève la garde");
+        pilote.traiter(&mut etat, &joue("b")).await;
         recepteur.disable().await;
         assert_eq!(ouvertures(&zones), 2, "{:?}", zones.appels.lock().unwrap());
         assert_eq!(etat.zone(), Some(9));
