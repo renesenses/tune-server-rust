@@ -1242,9 +1242,10 @@ impl PlaybackOrchestrator {
             let sortie = self
                 .sortie_dsd_locale(req.output_device_id.as_deref())
                 .await;
-            match decider_dsd_natif_local(
+            match decider_dsd_natif_local_voies(
                 &sortie,
                 entete.map(|(cadence, _)| cadence),
+                entete.map(|(_, canaux)| canaux),
                 source.zone_max_sample_rate,
                 crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
             ) {
@@ -2085,6 +2086,45 @@ impl PlaybackOrchestrator {
                 }
             };
             if !asio {
+                // #8248 — Linux : un PCM ALSA `hw:` dont le pilote offre
+                // `DSD_U32`. Sondé UNE fois, hors du fil asynchrone, et
+                // seulement si le PCM est libre ; la sortie le sonde aussi
+                // elle-même à chaque ouverture tant qu'il est inconnu
+                // (`LocalOutput::play_url`), ce qui couvre le passage d'une
+                // piste PCM à une piste DSD pendant la lecture.
+                #[cfg(target_os = "linux")]
+                {
+                    use crate::outputs::local::ResultatSondeDsdAlsa;
+                    match capacite::connue(&nom) {
+                        Some(CapaciteConnue::AlsaDsdU32 { cadences }) => {
+                            return SortieDsdLocale::Alsa {
+                                cadences,
+                                voies: crate::outputs::local::VOIES_SONDEES_DSD_ALSA,
+                            };
+                        }
+                        Some(CapaciteConnue::SortieNonAsio) => return SortieDsdLocale::NonAsio,
+                        _ => {}
+                    }
+                    let sonde = {
+                        let sortie = sortie.lock().await;
+                        sortie
+                            .as_any()
+                            .downcast_ref::<crate::outputs::local::LocalOutput>()
+                            .and_then(crate::outputs::local::LocalOutput::sonde_dsd_alsa)
+                    };
+                    if let Some(sonde) = sonde {
+                        match tokio::task::spawn_blocking(move || sonde.sonder_et_retenir())
+                            .await
+                            .unwrap_or(ResultatSondeDsdAlsa::Occupe)
+                        {
+                            ResultatSondeDsdAlsa::Sonde { cadences, voies } => {
+                                return SortieDsdLocale::Alsa { cadences, voies };
+                            }
+                            ResultatSondeDsdAlsa::Occupe => return SortieDsdLocale::AlsaNonSondee,
+                            ResultatSondeDsdAlsa::PasUnPcmMateriel => {}
+                        }
+                    }
+                }
                 capacite::retenir(&nom, CapaciteConnue::SortieNonAsio);
                 return SortieDsdLocale::NonAsio;
             }

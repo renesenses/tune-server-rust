@@ -22,10 +22,15 @@ fn diagnostic_transport_dsd(zone: &Zone, dsd_mode: &str) -> (Value, Value) {
             Some(CapaciteConnue::SortieNonAsio) => {
                 (json!("natif_servi_en_dop"), json!("sortie_non_asio"))
             }
-            Some(CapaciteConnue::Asio { cadences }) if cadences.is_empty() => {
+            Some(CapaciteConnue::Asio { cadences } | CapaciteConnue::AlsaDsdU32 { cadences })
+                if cadences.is_empty() =>
+            {
                 (json!("natif_servi_en_dop"), json!("pilote_sans_dsd"))
             }
-            Some(CapaciteConnue::Asio { .. }) => (json!("natif"), Value::Null),
+            // #8248 — un PCM ALSA `hw:` qui offre `DSD_U32` : natif, comme ASIO.
+            Some(CapaciteConnue::Asio { .. } | CapaciteConnue::AlsaDsdU32 { .. }) => {
+                (json!("natif"), Value::Null)
+            }
         };
     }
     (
@@ -922,6 +927,20 @@ mod asio_7372 {
                 }),
                 json!("natif"),
                 Value::Null,
+            ),
+            (
+                "8248-api-alsa-natif",
+                Some(CapaciteConnue::AlsaDsdU32 {
+                    cadences: vec![2_822_400],
+                }),
+                json!("natif"),
+                Value::Null,
+            ),
+            (
+                "8248-api-alsa-sans-dsd",
+                Some(CapaciteConnue::AlsaDsdU32 { cadences: vec![] }),
+                json!("natif_servi_en_dop"),
+                json!("pilote_sans_dsd"),
             ),
         ];
         for (nom, capacite, transport, motif) in cas {
