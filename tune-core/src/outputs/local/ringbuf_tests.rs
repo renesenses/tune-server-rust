@@ -61,7 +61,7 @@ fn count_allocator_calls<T>(operation: impl FnOnce() -> T) -> (T, usize) {
     (result, TRACKED_ALLOCATOR_CALLS.with(Cell::get))
 }
 
-fn assert_no_allocation<T>(operation: impl FnOnce() -> T) -> T {
+pub(super) fn assert_no_allocation<T>(operation: impl FnOnce() -> T) -> T {
     let (result, calls) = count_allocator_calls(operation);
     assert_eq!(
         calls, 0,
@@ -563,4 +563,132 @@ fn le_puits_d_anneau_natif_refuse_un_bloc_qui_contredit_le_format_ouvert() {
         !puits.ecrire(bon.bloc(&octets)),
         "un puits tué par une rupture de contrat doit le RESTER"
     );
+}
+
+/// #8609 — le rappel `f32` local PARTAGÉ, celui de l'immense majorité des
+/// DAC, n'appelle pas l'allocateur : c'est ce qui permet à `malloc_trim` de
+/// tourner pendant une lecture locale sans le faire attendre (il ne bloque
+/// que les fils qui allouent ou libèrent). Amorçage, période servie, période
+/// plus longue que l'anneau (comblement), rampe armée en sourdine.
+#[test]
+fn le_rappel_f32_local_partage_rend_une_periode_sans_allouer() {
+    let ring = RingBuf::new(64);
+    let volume = AtomicU32::new(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU);
+    let paused = AtomicBool::new(false);
+    let silent = AtomicBool::new(false);
+    let data_started = AtomicBool::new(false);
+    let mut ramp = SoftMuteRamp::new(44_100, 2);
+    assert_eq!(ring.push(&[0.25, -0.5, 0.75, -1.0]), 4);
+    let mut periode = [7.0f32; 8];
+    let lus = assert_no_allocation(|| {
+        super::render_local_shared_f32_callback(
+            &ring,
+            &volume,
+            &paused,
+            &silent,
+            &data_started,
+            &mut ramp,
+            0,
+            8,
+            &mut periode,
+        )
+    });
+    assert_eq!(lus, 0, "sous le seuil d'amorçage, rien n'est lu");
+    assert_eq!(ring.push(&[0.5; 8]), 8);
+    let mut periode = [7.0f32; 16];
+    let lus = assert_no_allocation(|| {
+        super::render_local_shared_f32_callback(
+            &ring,
+            &volume,
+            &paused,
+            &silent,
+            &data_started,
+            &mut ramp,
+            0,
+            8,
+            &mut periode,
+        )
+    });
+    assert_eq!(lus, 12);
+    assert_eq!(periode[12..], [0.0; 4], "le reliquat est comblé");
+    paused.store(true, Ordering::Relaxed);
+    assert_eq!(ring.push(&[0.5; 32]), 32);
+    let mut periode = [0.0f32; 32];
+    assert_no_allocation(|| {
+        super::render_local_shared_f32_callback(
+            &ring,
+            &volume,
+            &paused,
+            &silent,
+            &data_started,
+            &mut ramp,
+            50,
+            8,
+            &mut periode,
+        )
+    });
+}
+
+/// #8609 — le rappel natif S32 de Linux (`hw:`, #6734) n'appelle pas
+/// l'allocateur non plus.
+#[cfg(target_os = "linux")]
+#[test]
+fn le_rappel_natif_s32_rend_une_periode_sans_allouer() {
+    let ring = NativePcmRing::new(64);
+    let volume = AtomicU32::new(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU);
+    let paused = AtomicBool::new(false);
+    let silent = AtomicBool::new(false);
+    let data_started = AtomicBool::new(false);
+    let mut ramp = SoftMuteRamp::new(96_000, 2);
+    assert_eq!(ring.push(&[1 << 20; 4]), 4);
+    let mut periode = [7i32; 8];
+    let lus = assert_no_allocation(|| {
+        super::bras_alsa_natif::rendre_une_periode_native_s32(
+            &ring,
+            &volume,
+            &paused,
+            &silent,
+            &data_started,
+            &mut ramp,
+            0,
+            8,
+            &mut periode,
+        )
+    });
+    assert_eq!(lus, 0, "sous le seuil d'amorçage, rien n'est lu");
+    assert_eq!(ring.push(&[1 << 20; 8]), 8);
+    let mut periode = [7i32; 16];
+    let lus = assert_no_allocation(|| {
+        super::bras_alsa_natif::rendre_une_periode_native_s32(
+            &ring,
+            &volume,
+            &paused,
+            &silent,
+            &data_started,
+            &mut ramp,
+            0,
+            8,
+            &mut periode,
+        )
+    });
+    assert_eq!(lus, 12);
+    volume.store(
+        crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU / 2,
+        Ordering::Relaxed,
+    );
+    assert_eq!(ring.push(&[1 << 20; 16]), 16);
+    let mut periode = [0i32; 16];
+    assert_no_allocation(|| {
+        super::bras_alsa_natif::rendre_une_periode_native_s32(
+            &ring,
+            &volume,
+            &paused,
+            &silent,
+            &data_started,
+            &mut ramp,
+            0,
+            8,
+            &mut periode,
+        )
+    });
 }

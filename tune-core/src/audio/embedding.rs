@@ -846,7 +846,7 @@ where
     Fut: std::future::Future<Output = Option<E>>,
 {
     if !reste_des_pistes_a_analyser(backend).await {
-        relacher_la_session(embedder, backend, "balayage_termine").await;
+        relacher_la_session(embedder, "balayage_termine").await;
         return TourDeBalayage::RienAAnalyser;
     }
     if embedder.is_none()
@@ -867,7 +867,7 @@ where
         // Rien de traité : lot vide, ou interrompu par la lecture avant sa
         // première piste. Dans les deux cas la session n'a plus d'usage
         // immédiat ; la garder, c'est la porter pendant la sieste.
-        relacher_la_session(embedder, backend, "lot_vide").await;
+        relacher_la_session(embedder, "lot_vide").await;
     }
     TourDeBalayage::Lot(did)
 }
@@ -907,59 +907,41 @@ fn seuil_de_report_maintenant() -> String {
 }
 
 /// Relâcher la session ONNX si elle est chargée, puis rendre la mémoire libérée
-/// ([`rendre_la_memoire_si_rien_ne_joue`]). Ne fait rien si elle ne l'est pas :
+/// ([`rendre_la_memoire_apres_relachement`]). Ne fait rien si elle ne l'est pas :
 /// pas de `malloc_trim` toutes les 30 s pendant une pause.
 async fn relacher_la_session<E>(
     embedder: &mut Option<Arc<std::sync::Mutex<E>>>,
-    backend: &Arc<dyn DbBackend>,
     raison: &'static str,
 ) {
     if embedder.take().is_some() {
         info!(raison, "audio_embedder_released");
-        rendre_la_memoire_si_rien_ne_joue(backend).await;
+        rendre_la_memoire_apres_relachement().await;
     }
 }
 
 /// Rendre au noyau, tout de suite, ce que l'allocateur garde après une session
-/// ONNX relâchée — sans attendre la purge à froid de `tune-server` (cinq
-/// minutes). Rendre la session ne suffit pas : ses pages restent dans les
-/// arènes glibc des fils `spawn_blocking`.
+/// ONNX relâchée — sans attendre la purge de `tune-server` (cinq minutes).
+/// Rendre la session ne suffit pas : ses pages restent dans les arènes glibc
+/// des fils `spawn_blocking`.
 ///
-/// Seulement si RIEN ne joue : `malloc_trim` tient le verrou de chaque arène,
-/// et une sortie locale qui alloue à cet instant attendrait. Quand une zone
-/// joue, la purge à froid de `tune-server` (qui, elle, distingue sortie locale
-/// et zone réseau) s'en charge à son prochain passage.
-pub(super) async fn rendre_la_memoire_si_rien_ne_joue(backend: &Arc<dyn DbBackend>) {
-    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
-        return;
-    }
-    if crate::taches_de_fond::priorite::lecture_en_cours() {
-        return;
-    }
-    let b = backend.clone();
-    let mesure = tokio::task::spawn_blocking(move || {
-        // Pas `any_zone_playing`, qui répond « rien ne joue » quand sa requête
-        // échoue : ici, dans le doute, on ne purge pas.
-        let joue = b
-            .query_one(
-                "SELECT 1 FROM zones WHERE last_play_state = 'playing' LIMIT 1",
-                &[],
-            )
-            .map(|l| l.is_some())
-            .unwrap_or(true);
-        if joue {
-            return None;
-        }
-        let avant = process_rss_mb();
-        let rendu = crate::memoire_rendue::rendre_la_memoire_liberee();
-        Some((avant, process_rss_mb(), rendu))
-    })
-    .await;
-    if let Ok(Some((avant, apres, rendu))) = mesure {
+/// #8609 — QUE QUELQUE CHOSE JOUE OU NON. La garde « seulement si rien ne
+/// joue » privait de cette purge tout serveur qui écoute sur sa carte son
+/// toute la journée (fil 2167 : modèle texte chargé, +1,1 Go en cinq minutes,
+/// jamais rendus). La purge tourne hors du fil async, et le rappel de rendu
+/// local n'alloue pas : elle ne peut pas le faire attendre
+/// (`crate::memoire_rendue::rendre_la_memoire_liberee`).
+pub(super) async fn rendre_la_memoire_apres_relachement() {
+    if let Some(p) = crate::memoire_rendue::rendre_hors_du_fil_async().await {
         info!(
-            rss_avant_mb = avant.unwrap_or(0),
-            rss_apres_mb = apres.unwrap_or(0),
-            rendu,
+            rss_avant_mb = p.rss_avant_mb().unwrap_or(0),
+            rss_apres_mb = p.rss_apres_mb().unwrap_or(0),
+            rendu = p.rendu(),
+            rendu_mb = p.rendu_mb(),
+            memoire_verrouillee_mb = p.verrouillee_kb.map(|k| k / 1024),
+            memoire_verrouillee_apres_mb = p.verrouillee_apres_kb.map(|k| k / 1024),
+            verrou_leve = p.verrou_leve,
+            duree_ms = p.duree_ms,
+            lecture_en_cours = crate::taches_de_fond::priorite::lecture_en_cours(),
             "audio_embed_memoire_rendue"
         );
     }
@@ -1189,7 +1171,7 @@ fn pause_libere_session(pause: PauseAcoustique) -> bool {
 /// dure aussi longtemps que quelqu'un écoute.
 ///
 /// Rend `true` quand une session VIVANTE vient d'être relâchée : l'appelant
-/// rend alors la mémoire au noyau ([`rendre_la_memoire_si_rien_ne_joue`]).
+/// rend alors la mémoire au noyau ([`rendre_la_memoire_apres_relachement`]).
 fn entrer_en_pause<T>(embedder: &mut Option<T>, pause: PauseAcoustique) -> bool {
     poser_pause(pause);
     pause_libere_session(pause) && embedder.take().is_some()
@@ -1498,7 +1480,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                 // On relâche aussi la session ONNX : inutile de garder ~300 Mo
                 // résidents pour une passe qui ne tournera pas.
                 if entrer_en_pause(&mut embedder, PauseAcoustique::NonPremium) {
-                    rendre_la_memoire_si_rien_ne_joue(&backend).await;
+                    rendre_la_memoire_apres_relachement().await;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS)).await;
                 continue;
@@ -1584,7 +1566,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         info!("audio_embed_pause_utilisateur — analyse acoustique suspendue");
                     }
                     if entrer_en_pause(&mut embedder, PauseAcoustique::Utilisateur) {
-                        rendre_la_memoire_si_rien_ne_joue(&backend).await;
+                        rendre_la_memoire_apres_relachement().await;
                     }
                     tokio::time::sleep(crate::taches_de_fond::CADENCE_RELECTURE_PAUSE).await;
                     continue;
@@ -1619,7 +1601,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     // quand la musique s'arrête — et la passe est déjà conçue
                     // pour reconstruire sa session (`embedder.is_none()`).
                     if entrer_en_pause(&mut embedder, PauseAcoustique::Lecture) {
-                        rendre_la_memoire_si_rien_ne_joue(&backend).await;
+                        rendre_la_memoire_apres_relachement().await;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(
                         crate::audio::replaygain::PLAYBACK_BACKOFF_SECS,
@@ -1649,7 +1631,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         );
                     }
                     if entrer_en_pause(&mut embedder, PauseAcoustique::ScanBibliotheque) {
-                        rendre_la_memoire_si_rien_ne_joue(&backend).await;
+                        rendre_la_memoire_apres_relachement().await;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(
                         crate::audio::replaygain::PLAYBACK_BACKOFF_SECS,
@@ -1673,7 +1655,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     // Même règle : une machine qui a trop chaud n'a pas non
                     // plus besoin de porter la session ONNX en attendant.
                     if entrer_en_pause(&mut embedder, PauseAcoustique::Thermique) {
-                        rendre_la_memoire_si_rien_ne_joue(&backend).await;
+                        rendre_la_memoire_apres_relachement().await;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
                     continue;
@@ -1712,7 +1694,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     // pour que `MIN_AVAILABLE_MB` redevienne atteignable et
                     // que la passe puisse reprendre.
                     if entrer_en_pause(&mut embedder, PauseAcoustique::Memoire) {
-                        rendre_la_memoire_si_rien_ne_joue(&backend).await;
+                        rendre_la_memoire_apres_relachement().await;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(LOW_MEMORY_RETRY_SECS)).await;
                     continue;
@@ -1755,7 +1737,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                 if crate::taches_de_fond::ordre::le_clap_cede_a_la_plage_dynamique() {
                     if embedder.take().is_some() {
                         info!("audio_embed_cede_a_la_plage_dynamique — session relachee");
-                        rendre_la_memoire_si_rien_ne_joue(&backend).await;
+                        rendre_la_memoire_apres_relachement().await;
                     }
                     BALAYAGE_EN_COURS.store(false, std::sync::atomic::Ordering::Relaxed);
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -1831,7 +1813,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
             // faux) ou un chargement en échec arrivent aussi jusqu'ici.
             // Fuite du .18 du 08/10 : la session passait la sieste en mémoire.
             if sieste >= IDLE_SLEEP_SECS {
-                relacher_la_session(&mut embedder, &backend, "sieste_longue").await;
+                relacher_la_session(&mut embedder, "sieste_longue").await;
             }
             tokio::time::sleep(std::time::Duration::from_secs(sieste)).await;
         }
