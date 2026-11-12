@@ -69,6 +69,7 @@ mod pg_sqlite_type_parity;
 /// #7695 — les photos et vidéos indexées comme pistes par l'UPnP, retirées.
 pub mod photos_indexees_upnp_7695;
 pub mod play_queue_repo;
+pub mod playlist_radio_8135;
 pub mod playlist_repo;
 pub mod playlists_reconcile;
 /// Contrôle parental, étape 1 (#7856) : politique d'un profil supervisé.
