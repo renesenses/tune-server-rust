@@ -132,7 +132,8 @@ mod avec_un_faux_librespot {
 
     /// Un faux librespot : exécute, ligne à ligne, les ordres posés dans le
     /// fichier `ordres` — `ev <EVENEMENT> <PISTE> <VOLUME>` publie un
-    /// évènement par `--onevent`, `pcm <N>` écrit N octets 0x55.
+    /// évènement par `--onevent`, `pcm <N>` écrit N octets 0x55, `dors <s>`
+    /// se tait (le chargement du titre suivant).
     const FAUX: &str = r#"#!/bin/sh
 D=$(dirname "$0")
 printf '%s\n' "$*" > "$D/args"
@@ -150,6 +151,7 @@ while :; do
       case "$A" in
         ev) PLAYER_EVENT="$B" TRACK_ID="$C" VOLUME="$E" NAME="Titre $C" DURATION_MS=1000 $EV ;;
         pcm) head -c "$B" /dev/zero | tr '\000' '\125' ;;
+        dors) sleep "$B" ;;
       esac
     done < "$D/encours"
     rm -f "$D/encours"
@@ -336,7 +338,7 @@ done
         tokio::time::sleep(Duration::from_millis(400)).await;
         ordonner(
             dossier.path(),
-            &format!("pcm {un}\nev end_of_track a\npcm {un}\n"),
+            &format!("pcm {un}\nev end_of_track a\ndors 0.7\npcm {un}\n"),
         );
         let lu = lecture.await.unwrap();
         recepteur.disable().await;
