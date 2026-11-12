@@ -100,3 +100,23 @@ async fn spotify_2026_un_autre_refus_reste_une_erreur() {
         assert_eq!(appels.load(Ordering::SeqCst), 3, "{statut}");
     }
 }
+
+/// Le retrait se lit par `rubrique_retiree` (l'en-tête de la route), et
+/// seulement après le refus : avant, rien n'est dit retiré.
+#[tokio::test]
+async fn spotify_2026_le_retrait_se_lit_par_rubrique_retiree() {
+    use crate::streaming::traits::RubriqueRetirable as R;
+    let appels = Arc::new(AtomicUsize::new(0));
+    let svc = service(403, appels).await;
+    assert!(!svc.rubrique_retiree(R::Nouveautes));
+    assert!(!svc.rubrique_retiree(R::Genres));
+    svc.get_new_releases().await.expect("vide");
+    assert!(svc.rubrique_retiree(R::Nouveautes));
+    assert!(
+        !svc.rubrique_retiree(R::Genres),
+        "les genres n'ont pas été demandés"
+    );
+    svc.get_genres(None).await.expect("vide");
+    assert!(svc.rubrique_retiree(R::Genres));
+    assert!(!svc.rubrique_retiree(R::Selection));
+}

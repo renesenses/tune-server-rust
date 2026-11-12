@@ -2130,6 +2130,16 @@ impl StreamingService for SpotifyService {
             .unwrap_or_default())
     }
 
+    fn rubrique_retiree(&self, rubrique: RubriqueRetirable) -> bool {
+        let drapeau = match rubrique {
+            RubriqueRetirable::Selection => &self.selection_retiree,
+            RubriqueRetirable::Nouveautes => &self.nouveautes_retirees,
+            RubriqueRetirable::Genres => &self.genres_retires,
+            RubriqueRetirable::TitresPhares => &self.titres_phares_retires,
+        };
+        drapeau.load(Ordering::Relaxed)
+    }
+
     async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         // #8399 — fermé par Spotify à cette application : rubrique vide, sans
         // nouvel appel (un 403 était rendu en « HTTP 502 » brut à l'écran).
