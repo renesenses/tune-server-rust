@@ -117,3 +117,31 @@ The driver-call sequence lives in `dsd::probe_dsd_rates`, exercised through
 the existing portable `tune-core/tests/asio_dsd_5643.rs` target. These tests
 use closures, never a device; Windows + ASIO compilation and hardware
 verification remain separate requirements.
+
+## #8489 — capture from packed 24-bit-only devices (S24_3LE / S24_3BE)
+
+ALSA host only, capture only. Upstream CPAL maps no 3-byte format, so a
+device that offers nothing else (miniDSP UMIK-1, UMIK-2: `S24_3LE`, 2
+channels, 48 kHz) had no supported configuration, and
+`default_input_config` failed with `StreamTypeNotSupported`. Using `plughw`
+instead made Tune pick 44.1 kHz, which the measurement refuses.
+
+- src/host/alsa/packed24.rs (new, self-contained, tested on Linux by
+  tune-core/tests/alsa_s24_3_8489.rs through `#[path]`): `Packed24::for_capture`
+  decides when to open the packed format (capture, no 4-byte S24, native
+  endianness first) and `unpack_s24_3` turns one period into native-endian
+  `i32` (sign-extended), the layout of CPAL's `I24` data.
+- src/host/alsa/mod.rs:
+  - `supported_configs(Capture)` lists `I24` for such a device. Playback
+    lists are unchanged.
+  - `init_hw_params` / `set_hw_params_from_format` take the stream
+    direction; an `I24` capture whose 4-byte S24 is refused opens
+    `S24_3LE`/`S24_3BE` and reports it. `StreamInner` keeps it as
+    `packed24`.
+  - the input worker reads one period into a packed buffer (3 bytes per
+    sample) and unpacks it into the usual transfer buffer before the
+    callback. Streams without `packed24` take the previous path unchanged.
+
+Not proven without the microphone: the real UMIK-1 under Tune OS. The
+end-to-end test runs CPAL's real ALSA path against a private ALSA PCM
+restricted to S24_3LE / 2 ch / 48 kHz.

@@ -37,40 +37,78 @@ use crate::db::play_queue_repo::PlayQueueRepo;
 /// l'écriture du nouvel ordre (un ajout concurrent, par exemple).
 const ESSAIS: usize = 3;
 
-/// Mélange `ids[debut..]` sur place, à la Fisher-Yates.
-fn melanger_a_partir_de(ids: &mut [i64], debut: usize) {
+/// Mélange `ids[debut..]` sur place, à la Fisher-Yates. Une ligne de `fixes`
+/// garde son rang (#8135) : seules les autres sont rebattues entre elles.
+fn melanger_a_partir_de(ids: &mut [i64], debut: usize, fixes: &HashSet<i64>) {
     if debut >= ids.len() {
         return;
     }
-    let suite = &mut ids[debut..];
+    let rangs: Vec<usize> = (debut..ids.len())
+        .filter(|&i| !fixes.contains(&ids[i]))
+        .collect();
     // `current` hors bornes : aucune ligne n'est ramenée en tête, la
     // permutation est un tirage pur.
-    let ordre = generate_shuffle_order(suite.len(), usize::MAX);
-    let copie: Vec<i64> = suite.to_vec();
-    for (dest, src) in suite.iter_mut().zip(ordre) {
-        *dest = copie[src];
+    let ordre = generate_shuffle_order(rangs.len(), usize::MAX);
+    let copie: Vec<i64> = rangs.iter().map(|&i| ids[i]).collect();
+    for (&dest, src) in rangs.iter().zip(ordre) {
+        ids[dest] = copie[src];
     }
+}
+
+/// #8135 (fil 2703) — les lignes RADIO d'une file qui porte aussi des titres :
+/// elles ne se mélangent pas, elles gardent leur rang. Un direct n'a pas de
+/// fin : tiré au milieu d'une playlist « pistes puis radio », il jouerait
+/// pour toujours et les titres qui le suivent ne passeraient jamais. Une file
+/// toute de stations, elle, se mélange comme avant (aucune ligne fixe).
+pub fn lignes_radio_fixes(entrees: &[crate::db::play_queue_repo::QueueEntry]) -> HashSet<i64> {
+    let est_radio = |e: &crate::db::play_queue_repo::QueueEntry| {
+        e.track_id.is_none() && e.source.as_deref() == Some("radio")
+    };
+    if entrees.iter().all(est_radio) {
+        return HashSet::new();
+    }
+    entrees
+        .iter()
+        .filter(|e| est_radio(e))
+        .map(|e| e.id)
+        .collect()
 }
 
 /// L'ordre de la file après activation : `ids[..=courant]` inchangé (titres
 /// déjà joués et titre en cours), la suite rebattue. Sans titre en cours
 /// (`None`), toute la file est rebattue.
 pub fn melanger_la_suite(ids: &[i64], courant: Option<usize>) -> Vec<i64> {
+    melanger_la_suite_hors(ids, courant, &HashSet::new())
+}
+
+/// [`melanger_la_suite`], les lignes de `fixes` gardant leur rang (#8135).
+pub fn melanger_la_suite_hors(
+    ids: &[i64],
+    courant: Option<usize>,
+    fixes: &HashSet<i64>,
+) -> Vec<i64> {
     let mut nouvel = ids.to_vec();
     let debut = courant.map_or(0, |c| c.saturating_add(1));
-    melanger_a_partir_de(&mut nouvel, debut);
+    melanger_a_partir_de(&mut nouvel, debut, fixes);
     nouvel
 }
 
 /// L'ordre d'une file NEUVE lancée pendant l'aléatoire : le titre de départ en
 /// tête, tout le reste (titres qui le précédaient compris) rebattu derrière.
 pub fn melanger_une_file_neuve(ids: &[i64], depart: usize) -> Vec<i64> {
+    melanger_une_file_neuve_hors(ids, depart, &HashSet::new())
+}
+
+/// [`melanger_une_file_neuve`], les lignes de `fixes` gardant leur rang une
+/// fois le titre de départ passé en tête (#8135) : une radio posée en
+/// dernier reste la dernière.
+pub fn melanger_une_file_neuve_hors(ids: &[i64], depart: usize, fixes: &HashSet<i64>) -> Vec<i64> {
     let mut nouvel = ids.to_vec();
     if depart < nouvel.len() {
         let tete = nouvel.remove(depart);
         nouvel.insert(0, tete);
     }
-    melanger_a_partir_de(&mut nouvel, 1);
+    melanger_a_partir_de(&mut nouvel, 1, fixes);
     nouvel
 }
 
@@ -194,7 +232,14 @@ pub async fn basculer_l_aleatoire(
             } else {
                 ids.clone()
             };
-            (Some(melanger_la_suite(&ids, courant)), Some(origine))
+            (
+                Some(melanger_la_suite_hors(
+                    &ids,
+                    courant,
+                    &lignes_radio_fixes(&entrees),
+                )),
+                Some(origine),
+            )
         } else if etat.shuffle {
             let retenu = playback.ordre_d_origine(zone_id);
             (Some(retablir_l_ordre(&ids, &retenu)), None)
@@ -272,7 +317,7 @@ pub async fn sur_file_neuve(
     let Some(rang) = usize::try_from(depart).ok().filter(|&r| r < ids.len()) else {
         return depart;
     };
-    let nouvel = melanger_une_file_neuve(&ids, rang);
+    let nouvel = melanger_une_file_neuve_hors(&ids, rang, &lignes_radio_fixes(&entrees));
     if nouvel != ids {
         if let Err(e) = repo.reordonner(zone_id, &nouvel) {
             warn!(zone_id, error = %e, "aleatoire_file_neuve_ecriture_echouee");
@@ -335,6 +380,47 @@ mod tests {
     fn trie(mut v: Vec<i64>) -> Vec<i64> {
         v.sort_unstable();
         v
+    }
+
+    fn ligne(id: i64, source: &str) -> crate::db::play_queue_repo::QueueEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "zone_id": 1, "track_id": if source == "local" { Some(id) } else { None },
+            "position": id, "is_current": false, "source": source,
+            "source_id": format!("{source}-{id}"),
+        }))
+        .expect("ligne de file")
+    }
+
+    /// #8135 (fil 2703) — playlist « pistes puis radio » sous l'aléatoire :
+    /// la radio reste en dernier, les pistes seules sont rebattues. Sans la
+    /// garde, la radio tombait au milieu et les titres suivants ne passaient
+    /// jamais (un direct n'a pas de fin).
+    #[test]
+    fn une_radio_de_playlist_garde_son_rang_sous_l_aleatoire_8135() {
+        let mut entrees: Vec<_> = (1..=12).map(|id| ligne(id, "local")).collect();
+        entrees.push(ligne(13, "radio"));
+        let fixes = lignes_radio_fixes(&entrees);
+        assert_eq!(fixes, HashSet::from([13]));
+        let ids: Vec<i64> = entrees.iter().map(|e| e.id).collect();
+        let mut a_bouge = false;
+        for _ in 0..50 {
+            let suite = melanger_la_suite_hors(&ids, Some(0), &fixes);
+            assert_eq!(suite.last(), Some(&13), "la radio reste la dernière");
+            assert_eq!(trie(suite.clone()), ids);
+            let neuve = melanger_une_file_neuve_hors(&ids, 4, &fixes);
+            assert_eq!(neuve[0], 5);
+            assert_eq!(neuve.last(), Some(&13));
+            assert_eq!(trie(neuve.clone()), ids);
+            a_bouge |= suite != ids;
+        }
+        assert!(a_bouge, "les pistes, elles, sont rebattues");
+    }
+
+    /// Une file toute de stations se mélange comme avant.
+    #[test]
+    fn une_file_de_stations_seules_n_a_aucune_ligne_fixe_8135() {
+        let entrees: Vec<_> = (1..=3).map(|id| ligne(id, "radio")).collect();
+        assert!(lignes_radio_fixes(&entrees).is_empty());
     }
 
     #[test]

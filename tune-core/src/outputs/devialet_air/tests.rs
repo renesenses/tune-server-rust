@@ -474,6 +474,7 @@ async fn lancer_un_flux(
     let etat = Arc::new(Mutex::new(EtatFlux::default()));
     let p = ParametresFlux {
         session,
+        session_annoncee: SESSION_DE_TEST,
         flux: 0x0042,
         frequence,
         cadence: CADENCE_DE_TEST,
@@ -594,6 +595,7 @@ async fn air_sans_retour_retenu_le_motif_dit_ce_qui_a_ete_ecarte() {
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let p = ParametresFlux {
         session: SESSION_DE_TEST,
+        session_annoncee: SESSION_DE_TEST,
         flux: 0x0042,
         frequence: 44_100,
         cadence: CADENCE_DE_TEST,
@@ -625,12 +627,49 @@ async fn air_sans_retour_retenu_le_motif_dit_ce_qui_a_ete_ecarte() {
     }
 }
 
+/// #8536 — mesuré par Rémi sur un Expert : l'ampli renvoie les retours `Df`
+/// d'une session à l'hôte qui l'a ouverte (ici un « Roon »), quel que soit
+/// l'émetteur du paquet. Un émetteur qui recopie la session de Roon
+/// n'entend donc rien ; avec une session neuve, l'ampli l'adopte et lui
+/// répond.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn air_une_session_etrangere_n_est_pas_acceptee_par_l_ampli() {
+async fn air_les_retours_d_une_session_vont_a_l_hote_qui_l_a_ouverte_8536() {
+    let roon = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let sim = Simulateur::demarrer(annonce_de_test(), None).await;
-    let (fin, _) = lancer_un_flux(&sim, [1, 2, 3, 4], sinus(44_100, 44_100), 44_100).await;
-    assert!(matches!(fin, FinDeFlux::Interrompu { .. }), "{fin:?}");
-    assert!(sim.etat().paquets.is_empty());
+    sim.etat()
+        .hotes_de_session
+        .insert(SESSION_DE_TEST, roon.local_addr().unwrap());
+    // La session de Roon recopiée : les retours partent chez Roon.
+    let (fin, etat) = lancer_un_flux(&sim, SESSION_DE_TEST, sinus(44_100, 44_100), 44_100).await;
+    match fin {
+        FinDeFlux::Interrompu { motif, .. } => assert!(motif.contains("aucun retour"), "{motif}"),
+        autre => panic!("attendu une interruption, reçu {autre:?}"),
+    }
+    assert_eq!(etat.retours_recus, 0);
+    let mut b = [0u8; 256];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(1), roon.recv_from(&mut b))
+        .await
+        .expect("les retours sont partis chez Roon")
+        .unwrap();
+    assert_eq!(analyser_retour(&b[..n]).unwrap().session, SESSION_DE_TEST);
+    // Un arrêt remet l'ampli simulé à zéro avant le second flux.
+    let arret = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    arret
+        .send_to(&paquet_arret(SESSION_DE_TEST, 0x0043), sim.adresse)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    sim.etat().paquets.clear();
+    // Une session neuve : adoptée, et l'émetteur reçoit ses retours.
+    let neuve = [0x0b, 0xad, 0xf0, 0x0d];
+    let (fin, etat) = lancer_un_flux(&sim, neuve, sinus(44_100, 22_050), 44_100).await;
+    assert_eq!(fin, FinDeFlux::Naturelle);
+    assert!(etat.retours_recus > 0);
+    assert_eq!(
+        sim.etat().annonce.as_ref().unwrap().session,
+        neuve,
+        "adoptée"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -640,6 +679,7 @@ async fn air_l_avance_sur_la_lecture_est_tenue() {
     let etat = Arc::new(Mutex::new(EtatFlux::default()));
     let p = ParametresFlux {
         session: SESSION_DE_TEST,
+        session_annoncee: SESSION_DE_TEST,
         flux: 0x0042,
         frequence: 44_100,
         cadence: CADENCE_DE_TEST,
@@ -679,6 +719,7 @@ async fn air_un_echec_de_decodage_interrompt_le_flux() {
     tx.send(Err("fichier illisible".to_string())).await.unwrap();
     let p = ParametresFlux {
         session: SESSION_DE_TEST,
+        session_annoncee: SESSION_DE_TEST,
         flux: 1,
         frequence: 44_100,
         cadence: CADENCE_DE_TEST,
@@ -745,6 +786,14 @@ async fn pieces_du_banc(
     tokio::task::JoinHandle<()>,
 ) {
     let sim = Simulateur::demarrer(annonce, None).await;
+    // #8536 — un port audio fixe pour tous les flux de la sortie, comme
+    // 45456 en service : l'ampli renvoie les retours d'une session à
+    // l'adresse qui l'a ouverte, un port neuf par flux ne les recevrait plus.
+    let audio_local = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let ecoute = Ecoute::nouvelle();
     let drapeau = Arc::new(AtomicBool::new(activee));
     let indice = Arc::new(AtomicU8::new(9));
@@ -758,7 +807,7 @@ async fn pieces_du_banc(
         ports: Ports {
             annonces: 0,
             ampli: sim.adresse.port(),
-            audio_local: 0,
+            audio_local,
             adresse_locale: Ipv4Addr::LOCALHOST,
         },
         cadence: CADENCE_DE_TEST,
@@ -1129,3 +1178,112 @@ mod volume_db_6918;
 
 #[path = "demarrage_borne_6911_tests.rs"]
 mod demarrage_borne_6911;
+
+// ─── #8536 — la session de la sortie, l'écoute à côté de Roon ───────────────
+
+/// #8536 — un Roon a ouvert la session annoncée : l'ampli lui renvoie les
+/// retours de cette session. La sortie tire SA session et l'ampli lui
+/// répond. Rouge si la sortie recopie la session de l'annonce : aucun
+/// retour, flux abandonné au bout d'une seconde, rien ne joue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn air_la_sortie_tire_sa_session_et_l_ampli_lui_repond_8536() {
+    let b = banc(annonce_de_test(), true).await;
+    let roon = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    b.sim
+        .etat()
+        .hotes_de_session
+        .insert(SESSION_DE_TEST, roon.local_addr().unwrap());
+    let session = b.sortie.session();
+    assert_ne!(session, SESSION_DE_TEST, "jamais la session annoncée");
+    assert_ne!(session, [0; 4]);
+    let dossier = crate::test_scratch::scratch_dir("devialet-air-8536");
+    let (chemin, attendu) = wav_16_bits(&dossier, 44_100, 22_050);
+    b.sortie.play_media(&media(&chemin)).await.unwrap();
+    let st = attendre_l_arret(&b.sortie).await;
+    let echec = b.sortie.take_output_failure();
+    assert!(
+        st.ended_naturally,
+        "fin naturelle attendue, échec : {echec:?}"
+    );
+    assert_eq!(echec, None);
+    let s = b.sim.etat();
+    let (&flux, paquets) = s.paquets.iter().next().expect("un flux");
+    assert!(paquets.values().all(|(e, _, _)| e.session == session));
+    let pcm = s.pcm(flux).expect("flux complet");
+    let tete = trames_arrondies(44_100, CADENCE_DE_TEST.silence_de_tete) as usize;
+    assert_eq!(&pcm[tete..tete + attendu.len()], &attendu[..]);
+    let mut o = [0u8; 256];
+    assert!(roon.try_recv_from(&mut o).is_err(), "Roon ne reçoit rien");
+}
+
+/// #8536 — la session est tirée une fois par sortie et sert à tous ses flux
+/// (pause puis reprise = deux flux, une session).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn air_une_session_par_sortie_pour_tous_ses_flux_8536() {
+    let b = banc(annonce_de_test(), true).await;
+    let session = b.sortie.session();
+    let dossier = crate::test_scratch::scratch_dir("devialet-air-8536-flux");
+    let (chemin, _) = wav_16_bits(&dossier, 44_100, 88_200);
+    b.sortie.play_media(&media(&chemin)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    b.sortie.pause().await.unwrap();
+    b.sortie.resume().await.unwrap();
+    // Au-delà du délai du premier retour : la reprise a été entendue.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let st = b.sortie.get_status().await.unwrap();
+    assert_eq!(
+        st.state,
+        TransportState::Playing,
+        "la reprise reçoit ses retours : {:?}",
+        b.sortie.take_output_failure()
+    );
+    b.sortie.stop().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let s = b.sim.etat();
+    assert_eq!(s.paquets.len(), 2, "deux flux");
+    for paquets in s.paquets.values() {
+        assert!(paquets.values().all(|(e, _, _)| e.session == session));
+    }
+    assert_eq!(b.sortie.session(), session, "inchangée");
+}
+
+/// #8536 — RoonServer sur la même machine tient le port des annonces
+/// (comme .NET sous Unix : SO_REUSEADDR et SO_REUSEPORT). L'écoute de Tune
+/// doit s'ouvrir à côté. Rouge sans SO_REUSEADDR/SO_REUSEPORT.
+#[tokio::test]
+async fn air_l_ecoute_s_ouvre_a_cote_d_un_roon_qui_tient_le_port_8536() {
+    let roon = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .unwrap();
+    roon.set_reuse_address(true).unwrap();
+    #[cfg(unix)]
+    roon.set_reuse_port(true).unwrap();
+    roon.bind(&socket2::SockAddr::from(std::net::SocketAddrV4::new(
+        Ipv4Addr::UNSPECIFIED,
+        0,
+    )))
+    .unwrap();
+    let port = roon.local_addr().unwrap().as_socket().unwrap().port();
+    let ecoute = Ecoute::nouvelle();
+    ecoute
+        .demarrer(port)
+        .expect("l'écoute doit s'ouvrir à côté de Roon");
+    assert!(ecoute.en_ecoute());
+    ecoute.arreter();
+}
+
+/// #8536 — un port tenu sans partage : l'ouverture échoue et le DIT (port et
+/// cause), au lieu de laisser la zone absente sans explication.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn air_l_ecoute_refusee_rend_une_erreur_qui_nomme_le_port_8536() {
+    let exclusif = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = exclusif.local_addr().unwrap().port();
+    let ecoute = Ecoute::nouvelle();
+    let e = ecoute.demarrer(port).unwrap_err();
+    assert!(e.contains(&format!(":{port}")), "{e}");
+    assert!(!ecoute.en_ecoute());
+}

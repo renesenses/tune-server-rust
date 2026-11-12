@@ -1366,6 +1366,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "auto_scan_hidden_albums_reconcile_failed"),
             }
+            // web#916 — les albums locaux écartés de l'accueil (« Pas pour
+            // moi ») : même mécanique, même garde `full_scan_ok`.
+            tune_core::db::suggestions_ecartees::reconcilier_journalise(
+                db.clone(),
+                full_scan_ok,
+                "scan_auto",
+            );
             // Les paires « pas des doublons » (#1276) : même mécanique, même
             // garde `full_scan_ok`. Un arbitrage perdu ne se voit pas — il se
             // paie à la fusion suivante, qui supprime la ligne perdante.

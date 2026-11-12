@@ -365,6 +365,11 @@ impl SsdpScanner {
     }
 
     pub async fn rescan(&self) -> Vec<DiscoveredDevice> {
+        // #8189 — découverte pas encore ouverte (iOS) : aucune émission, on
+        // rend ce qui est connu.
+        if !super::porte_multicast::est_ouverte() {
+            return self.devices().await;
+        }
         let reponses = rechercher_en_flux(&self.search_targets);
         let event_tx = self.event_tx.lock().await.clone();
         traiter_le_flux(&self.state, &event_tx, reponses).await;

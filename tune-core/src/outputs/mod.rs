@@ -8,6 +8,8 @@ pub mod airplay2;
 pub mod asio_blocage_4556;
 #[cfg(all(target_os = "windows", feature = "asio"))]
 pub mod asio_exclusive;
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
+pub(crate) mod quantification_au_rendu_7703;
 // #6133 — silence ASIO avant libération ; sans Windows+asio, seul le banc s'en sert.
 pub mod bluos;
 pub mod bridge;
