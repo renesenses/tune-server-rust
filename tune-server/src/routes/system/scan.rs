@@ -3460,6 +3460,13 @@ async fn spawn_library_scan_avec_lecteur_par(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "post_scan_hidden_albums_reconcile_failed"),
             }
+            // web#916 — les albums locaux écartés de l'accueil (« Pas pour
+            // moi ») : même mécanique, même garde `full_scan_ok`.
+            tune_core::db::suggestions_ecartees::reconcilier_journalise(
+                db.clone(),
+                full_scan_ok,
+                "fin_de_scan",
+            );
             // Les paires « ces deux albums ne sont pas des doublons » (#1276)
             // suivent la même mécanique et la même garde `full_scan_ok` : le
             // scan est précisément le moment où les rowids d'albums meurent et

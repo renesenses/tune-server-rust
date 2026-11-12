@@ -202,6 +202,7 @@ jobs:
       # opt-in via scripts/pg-e2e.sh.
       - name: Apply PG migrations
         run: |
+          bash scripts/ci/apt-robuste.sh
           sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
           export PGPASSWORD=tune
           psql -h localhost -U tune -d tune_test -c "CREATE EXTENSION IF NOT EXISTS unaccent;"
@@ -263,6 +264,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8088 -- --nocapture --test-threads=1
 
+      # web#916 — « Pas pour moi » de l'accueil : la PG 111 pose
+      # `suggestions_ecartees`, l'écart passe par `$n` et `ON CONFLICT … DO
+      # UPDATE`, cloisonné par profil (BIGINT), puis rétabli. Sans cette
+      # étape, l'épreuve prendrait son saut annoncé.
+      - name: Suggestions écartées de l'accueil sur PostgreSQL (web#916)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_916 -- --nocapture --test-threads=1
+
       # #7979 — un nom d'artiste corrigé dans les balises (accents ajoutés)
       # reprend la fiche, sans osciller ; un nom différent (espace ajouté)
       # obtient la sienne. Sans cette étape, l'épreuve prendrait son saut
@@ -287,6 +297,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7980 -- --nocapture --test-threads=1
+
+      # #8416 — les règles « nombre d'écoutes » et « dernière écoute » des
+      # listes et collections intelligentes comptent les écoutes importées
+      # (`imported_plays`) comme la Bibliothèque. Sans cette étape, le témoin
+      # prendrait son saut annoncé.
+      - name: Écoutes importées dans les règles intelligentes sur PostgreSQL (#8416)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8416 -- --nocapture --test-threads=1
 
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:

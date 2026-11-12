@@ -1,5 +1,5 @@
 use axum::extract::{Query, State};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -135,6 +135,15 @@ pub fn router() -> Router<AppState> {
         .route("/radio-picks", get(radio_picks))
         .route("/streaming-highlights", get(streaming_highlights))
         .route("/shortcuts", get(shortcuts))
+        // web#916 — « Pas pour moi », par profil (`X-Profile-Id`).
+        .route(
+            "/dismissed-suggestions",
+            get(super::accueil_justifie::lister).post(super::accueil_justifie::ecarter),
+        )
+        .route(
+            "/dismissed-suggestions/restore",
+            post(super::accueil_justifie::retablir),
+        )
 }
 
 /// Les raccourcis de l'accueil (posés depuis le client web), et rien d'autre.
@@ -197,23 +206,51 @@ fn ph(engine: Engine, idx: usize) -> String {
 }
 
 /// Aggregated home page: returns all sections in a single response.
-async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+///
+/// web#916 (go du 13/10/2026) — la page composée suit les mêmes règles que
+/// les routes qu'elle agrège : chaque élément porte sa `raison`, et ce que le
+/// profil qui regarde (`X-Profile-Id`) a écarté n'est plus proposé (reprises,
+/// plus écoutés, à découvrir ; les ajouts récents restent factuels). Les
+/// titres de section suivent la langue de l'interface (`Accept-Language`) au
+/// lieu d'être écrits en français ; `id` reste la clé stable.
+async fn home_page(
+    State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let lang = crate::i18n::lang_from_header(&headers);
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
     // No zone filter for the aggregated home page — show all zones.
     let en_cours = lectures_en_cours(&state).await;
-    let continue_items = continuer_l_ecoute(&state, 10, None, &en_cours)?;
+    let continue_items = reprises_du_profil(&state, &ecartees, 10, None, &en_cours)?;
     // L'accueil agrege garde SA fenetre de 7 jours : c'est une vignette, pas
     // l'onglet. La fenetre choisie vit sur `/home/recently-added` (#3039).
     let recent_items = fetch_recently_added(&state, 20, borne_basse_de_fenetre(None)?)?;
-    let top_tracks = fetch_top_tracks(&state, 20);
+    let marge = marge_d_ecarts(&ecartees);
+    let mut top_tracks: Vec<Value> = fetch_top_tracks(&state, 20 + marge)
+        .into_iter()
+        .filter(|t| !super::accueil_justifie::piste_ecartee(&ecartees, t))
+        .map(|mut t| {
+            if let Some(r) = t["plays"]
+                .as_i64()
+                .and_then(super::accueil_justifie::raison_souvent_ecoute)
+            {
+                t["raison"] = r;
+            }
+            t
+        })
+        .collect();
+    top_tracks.truncate(20);
     let radios = fetch_radio_picks(&state)?;
-    let discover = fetch_recommendations(&state, 20)?;
+    let discover = recommandations_du_profil(&state, &ecartees, 20)?;
+    let titre = |cle: &str| crate::i18n::t(&lang, cle);
 
     let mut sections = Vec::new();
 
     if !continue_items.is_empty() {
         sections.push(json!({
             "id": "continue",
-            "title": "Continuer l'\u{00e9}coute",
+            "title": titre("home.section.continue"),
             "type": "albums",
             "items": continue_items,
         }));
@@ -222,7 +259,7 @@ async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     if !recent_items.is_empty() {
         sections.push(json!({
             "id": "recent",
-            "title": "Ajout\u{00e9}s r\u{00e9}cemment",
+            "title": titre("home.section.recent"),
             "type": "albums",
             "items": recent_items,
         }));
@@ -231,7 +268,7 @@ async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     if !top_tracks.is_empty() {
         sections.push(json!({
             "id": "top",
-            "title": "Les plus \u{00e9}cout\u{00e9}s",
+            "title": titre("home.section.top"),
             "type": "tracks",
             "items": top_tracks,
         }));
@@ -240,7 +277,7 @@ async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     if !radios.is_empty() {
         sections.push(json!({
             "id": "radios",
-            "title": "Radios favorites",
+            "title": titre("home.section.radios"),
             "type": "radios",
             "items": radios,
         }));
@@ -249,7 +286,7 @@ async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     if !discover.is_empty() {
         sections.push(json!({
             "id": "discover",
-            "title": "\u{00c0} d\u{00e9}couvrir",
+            "title": titre("home.section.discover"),
             "type": "albums",
             "items": discover,
         }));
@@ -260,18 +297,48 @@ async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppErro
 
 /// Albums from listen history where the user hasn't finished the album
 /// (listened tracks < total tracks).
+///
+/// web#916 (go du 13/10/2026) — chaque entrée porte `raison: reprise` (la
+/// date de la dernière écoute), et ce que le profil qui regarde a écarté
+/// (« Pas pour moi ») n'y revient plus.
 async fn continue_listening(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<HomeParams>,
 ) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(10);
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
     // When zone_id is provided, filter continue-listening items to albums
     // that were played on that specific zone. This prevents zone mismatch:
     // the client sends the CURRENT active zone, not a stored zone from
     // history (DEvir QA B-09).
     let en_cours = lectures_en_cours(&state).await;
-    let items = continuer_l_ecoute(&state, limit, p.zone_id, &en_cours)?;
+    let items = reprises_du_profil(&state, &ecartees, limit, p.zone_id, &en_cours)?;
     Ok(Json(json!(items)))
+}
+
+/// Ce qu'un profil a écarté, en nombre d'éléments à demander en plus pour
+/// qu'une rangée reste pleine après filtrage.
+fn marge_d_ecarts(e: &tune_core::db::suggestions_ecartees::Ecartees) -> i64 {
+    i64::try_from(e.len()).unwrap_or(0).min(500)
+}
+
+/// « Continuer l'écoute » pour un profil : sans ce qu'il a écarté ni ce qui
+/// joue déjà (#8085, `en_cours`), coupée à `limit`.
+fn reprises_du_profil(
+    state: &AppState,
+    ecartees: &tune_core::db::suggestions_ecartees::Ecartees,
+    limit: i64,
+    zone_id: Option<i64>,
+    en_cours: &[LectureEnCours],
+) -> Result<Vec<Value>, AppError> {
+    if ecartees.est_vide() {
+        return continuer_l_ecoute(state, limit, zone_id, en_cours);
+    }
+    let mut items = continuer_l_ecoute(state, limit + marge_d_ecarts(ecartees), zone_id, en_cours)?;
+    items.retain(|i| !super::accueil_justifie::reprise_ecartee(ecartees, i));
+    items.truncate(usize::try_from(limit.max(0)).unwrap_or(0));
+    Ok(items)
 }
 
 /// Combien de contextes distincts on ramene avant de filtrer.
@@ -480,7 +547,9 @@ fn continuer_l_ecoute(
             "source": r.source, "title": r.title, "last_track_title": r.last_track_title,
             "artist_name": artist_name, "album_title": album_title,
             "cover_path": r.cover_path, "album_id": r.album_id, "id": r.album_id.unwrap_or(0),
-            "position": r.position, "position_ms": r.position_ms}));
+            "position": r.position, "position_ms": r.position_ms,
+            // web#916 — la raison d'une reprise : la date de sa dernière écoute.
+            "raison": super::accueil_justifie::raison_reprise(Some(&r.updated_at))}));
     }
     for old in fetch_continue_listening_borne(state, limit, zone_id, BORNE_SECOND_RANG)? {
         let nature = old["context_type"].as_str().unwrap_or("album");
@@ -686,7 +755,14 @@ fn fetch_continue_listening_borne(
             .then_with(|| a.1["context_id"].as_str().cmp(&b.1["context_id"].as_str()))
     });
     items.truncate(limit.max(0) as usize);
-    Ok(items.into_iter().map(|(_, item)| item).collect())
+    // web#916 — la raison d'une reprise : la date de sa dernière écoute.
+    Ok(items
+        .into_iter()
+        .map(|(date, mut item)| {
+            item["raison"] = super::accueil_justifie::raison_reprise(Some(&date));
+            item
+        })
+        .collect())
 }
 
 /// La derniere ecoute de chaque contexte distinct, enrichie de quoi l'afficher.
@@ -2150,6 +2226,11 @@ fn fetch_recently_added_par(
                 // temps que les clients migrent — il porte la meme valeur.
                 "added_at": cols.get(10).and_then(|v| v.as_f64()),
                 "added_mtime": cols.get(10).and_then(|v| v.as_f64()),
+                // web#916 — même raison que « Nouveautés dans votre
+                // bibliothèque » : la fenêtre est celle des AJOUTS.
+                "raison": super::accueil_justifie::raison_ajout_recent(
+                    cols.get(10).and_then(|v| v.as_f64())
+                ),
             })
         })
         .collect())
@@ -2157,13 +2238,37 @@ fn fetch_recently_added_par(
 
 /// Recommendations based on listening history: find most-played genres/artists,
 /// suggest albums from the same genres that haven't been listened to yet.
+///
+/// web#916 — chaque album porte sa `raison` quand la logique la connaît
+/// (`genre_frequent` : un des genres les plus écoutés), aucune quand il vient
+/// du repli au hasard. Ce que le profil qui regarde a écarté (« Pas pour
+/// moi ») n'est plus proposé : la requête demande d'autant plus d'albums,
+/// puis on filtre et on coupe.
 async fn home_recommendations(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<HomeParams>,
 ) -> Result<Json<Value>, AppError> {
-    let limit = p.limit.unwrap_or(20);
-    let items = fetch_recommendations(&state, limit)?;
-    Ok(Json(json!(items)))
+    let limit = p.limit.unwrap_or(20).clamp(1, 200);
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
+    Ok(Json(json!(recommandations_du_profil(
+        &state, &ecartees, limit
+    )?)))
+}
+
+/// Les recommandations d'un profil : la requête demande d'autant plus
+/// d'albums qu'il en a écarté, puis on filtre et on coupe.
+fn recommandations_du_profil(
+    state: &AppState,
+    ecartees: &tune_core::db::suggestions_ecartees::Ecartees,
+    limit: i64,
+) -> Result<Vec<Value>, AppError> {
+    let mut items = fetch_recommendations(state, limit + marge_d_ecarts(ecartees))?;
+    if !ecartees.est_vide() {
+        items.retain(|a| !super::accueil_justifie::album_local_ecarte(ecartees, a));
+    }
+    items.truncate(usize::try_from(limit.max(0)).unwrap_or(0));
+    Ok(items)
 }
 
 fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
@@ -2234,25 +2339,49 @@ fn albums_du_genre_non_ecoutes(state: &AppState, genres: &[String], limit: i64) 
 
 /// Une ligne `a.id, a.title, ar.name, a.year, a.cover_path, a.genre` dans la
 /// forme que l'ecran lit, avec la raison pour laquelle on la propose.
+///
+/// `reason` (chaîne) reste pour les clients déployés ; `raison` (objet,
+/// web#916) : `genre_frequent` pour `genre_match` quand l'album a bien un
+/// genre, `hasard` pour le repli au hasard (go du 13/10/2026 : le hasard
+/// dit qu'il est le hasard).
 fn album_recommande(cols: &[tune_core::db::backend::SqlValue], raison: &str) -> Value {
-    json!({
+    let genre = cols.get(5).and_then(|v| v.as_string());
+    let mut album = json!({
         "id": cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
         "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
         "artist_name": cols.get(2).and_then(|v| v.as_string()),
         "year": cols.get(3).and_then(|v| v.as_i64()),
         "cover_path": cols.get(4).and_then(|v| v.as_string()),
-        "genre": cols.get(5).and_then(|v| v.as_string()),
+        "genre": genre,
         "reason": raison,
-    })
+    });
+    if raison == "genre_match" {
+        if let Some(r) = genre
+            .as_deref()
+            .and_then(super::accueil_justifie::raison_genre_frequent)
+        {
+            album["raison"] = r;
+        }
+    } else if raison == "random" {
+        album["raison"] = super::accueil_justifie::raison_hasard();
+    }
+    album
 }
 
 /// Auto-generated "mixes" by genre from top genres in history.
 /// Each mix = playlist of 20 tracks from that genre.
+///
+/// web#916 (go du 13/10/2026) — chaque mix porte `raison: genre_frequent` (il
+/// est bâti sur un des genres les plus écoutés), chaque piste son `album_id`,
+/// et les pistes d'un album ou d'un artiste que le profil a écarté n'y
+/// entrent plus.
 async fn top_mixes(
     State(state): State<AppState>,
     profile: crate::routes::active_profile::ActiveProfile,
 ) -> Result<Json<Value>, AppError> {
     let engine = state.backend.engine();
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
+    let marge = marge_d_ecarts(&ecartees);
 
     // Get top 5 genres from history
     let top_genres: Vec<(String, i64)> = state
@@ -2273,15 +2402,16 @@ async fn top_mixes(
     // par le profil qui regarde. Les deux genres sont parenthésés pour que
     // le socle s'applique aux deux branches du OR.
     let sans_bannis = tune_core::db::facet_filter::banned_tracks_excluded(profile.id());
+    let plafond = 20 + marge;
     let tracks_sql = format!(
         "SELECT t.id, t.title, ar.name, al.title, \
-                CAST(t.duration_ms AS BIGINT), al.cover_path \
+                CAST(t.duration_ms AS BIGINT), al.cover_path, t.album_id \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
          WHERE (t.genre = {p1} OR al.genre = {p2}) \
          AND {sans_bannis} \
-         ORDER BY RANDOM() LIMIT 20"
+         ORDER BY RANDOM() LIMIT {plafond}"
     );
 
     let mixes: Vec<Value> = top_genres
@@ -2301,20 +2431,25 @@ async fn top_mixes(
                         "album_title": cols.get(3).and_then(|v| v.as_string()),
                         "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
                         "cover_path": cols.get(5).and_then(|v| v.as_string()),
+                        "album_id": cols.get(6).and_then(|v| v.as_i64()),
                     })
                 })
+                .filter(|t| !super::accueil_justifie::piste_ecartee(&ecartees, t))
+                .take(20)
                 .collect();
 
             if tracks.is_empty() {
                 return None;
             }
 
+            let raison = super::accueil_justifie::raison_genre_frequent(&genre);
             Some(json!({
                 "genre": genre,
                 "title": format!("Mix {}", genre),
                 "play_count": play_count,
                 "track_count": tracks.len(),
                 "tracks": tracks,
+                "raison": raison,
             }))
         })
         .collect();
@@ -2365,6 +2500,11 @@ async fn new_in_library(
                 // Nom garde pour les clients deployes ; la valeur est la date
                 // d'ajout (#4546).
                 "file_mtime": cols.get(6).and_then(|v| v.as_f64()),
+                // web#916 — la rangée est triée par date d'AJOUT : c'est sa
+                // raison, et la date est celle qu'elle vient de lire.
+                "raison": super::accueil_justifie::raison_ajout_recent(
+                    cols.get(6).and_then(|v| v.as_f64())
+                ),
             })
         })
         .collect();
@@ -2569,12 +2709,18 @@ const ECOUTES_STREAMING: usize = 6;
 /// rendu. Le couper ne filtrerait pas la reponse, il la viderait.
 async fn other_versions(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<OtherVersionsParams>,
 ) -> Result<axum::response::Response, AppError> {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let fournisseur = fournisseur_streaming_reel(state.clone());
     let (groupes, en_preparation) = autres_versions(&state, &p, fournisseur)?;
+    // web#916 — la raison de chaque groupe (`autre_version`), et ce que le
+    // profil qui regarde a écarté retiré ; sur la réponse 202 comme sur la
+    // 200, puisque toutes deux portent la liste des groupes.
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
+    let groupes = super::accueil_justifie::epurer_autres_versions(groupes, &ecartees);
     if en_preparation {
         // 202 + un corps qui reste LA LISTE des groupes (ceux que la
         // bibliotheque a deja rendus, vide au pire) : un client qui ne connait
@@ -3115,7 +3261,12 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
         .favorites()
         .unwrap_or_default()
         .into_iter()
-        .map(|r| json!(r))
+        .map(|r| {
+            let mut v = json!(r);
+            // web#916 — pourquoi elle est là : c'est une favorite.
+            v["raison"] = super::accueil_justifie::raison_radio(true, None);
+            v
+        })
         .collect();
 
     // `is_favorite = '0'` et non `= 0` (#3181). La colonne n'a pas le meme type
@@ -3153,6 +3304,11 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
                 "last_played": cols.get(5).and_then(|v| v.as_string()),
                 "play_count": cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
                 "is_favorite": false,
+                // web#916 — écoutée récemment, à cette date.
+                "raison": super::accueil_justifie::raison_radio(
+                    false,
+                    cols.get(5).and_then(|v| v.as_string()).as_deref(),
+                ),
             })
         })
         .collect();

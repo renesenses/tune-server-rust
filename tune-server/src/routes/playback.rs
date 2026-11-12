@@ -2632,8 +2632,9 @@ fn reprise_applicable(
 /// #7717 — `POST /zones/{id}/play` : une lecture lancée sur une zone d'un
 /// groupe, depuis n'importe quel client, fait de cette zone la meneuse, et le
 /// relais y fait suivre les autres zones. Le corps vide (Lecture après Arrêt)
-/// reprend ce que la zone jouait : une reprise sur une suiveuse ne vaut que
-/// pour elle, elle ne prend pas la tête.
+/// reprend ce que la zone jouait : c'est une reprise, elle ne prend pas la
+/// tête ; depuis #8445, une reprise sur une suiveuse vaut pour tout le groupe
+/// (voir `relayer_le_geste_d_un_membre`).
 async fn play_en_tete_du_groupe(
     State(state): State<AppState>,
     profile: ActiveProfile,
@@ -2642,9 +2643,17 @@ async fn play_en_tete_du_groupe(
     body: Option<Json<PlayRequest>>,
 ) -> axum::response::Response {
     if body.is_none() {
-        return play(State(state), profile, Path(zone_id), headers, None)
+        let reponse = play(State(state.clone()), profile, Path(zone_id), headers, None)
             .await
             .into_response();
+        if reponse.status().is_success() {
+            crate::routes::zones::relais_de_groupe_6155::relayer_le_geste_d_un_membre(
+                &state,
+                zone_id,
+                crate::routes::zones::relais_de_groupe_6155::GesteDUnMembre::Reprise,
+            );
+        }
+        return reponse;
     }
     let lancement = play(State(state.clone()), profile, Path(zone_id), headers, body);
     crate::routes::zones::relais_de_groupe_6155::lancer_en_tete_du_groupe(
@@ -3691,6 +3700,15 @@ async fn play(
                 // rangs (`GET /playlists/{id}/tracks` les montre) ; la file,
                 // elle, ne les reçoit pas. `start_index` est ramené au rang de
                 // la même ligne parmi les lignes jouables.
+                //
+                // #8135 — une radio de la playlist entre dans la file par son
+                // FLUX (choisi comme pour une radio jouée seule) ; une
+                // station retirée devient une ligne introuvable, sautée ici.
+                let e = tune_core::db::playlist_radio_8135::lignes_a_jouer(
+                    &state.backend,
+                    e,
+                    &crate::routes::radios::choix_du_flux_de_playlist(&state),
+                );
                 let (jouables, depart) = sans_les_introuvables(e, body.start_index);
                 body.start_index = depart;
                 jouables
@@ -4125,6 +4143,12 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl 
         .await
     {
         Ok(tune_core::orchestrator::IssueDePause::EnPause) => {
+            // #8445 — une pause donnée sur une suiveuse vaut pour le groupe.
+            crate::routes::zones::relais_de_groupe_6155::relayer_le_geste_d_un_membre(
+                &state,
+                zone_id,
+                crate::routes::zones::relais_de_groupe_6155::GesteDUnMembre::Pause,
+            );
             Json(build_zone_json(&state, zone_id).await).into_response()
         }
         // #7894 — l'appareil ne jouait rien : la zone est arrêtée (reprise
@@ -4157,12 +4181,33 @@ mod pause_sans_media_7894_tests;
 #[path = "playback/bail_parental_7974_route_tests.rs"]
 mod bail_parental_7974_route_tests;
 
+/// `POST /zones/{id}/resume` (et `playpause` hors lecture).
+///
+/// #8445 — une reprise réussie sur une suiveuse vaut pour tout son groupe.
 async fn resume(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     info!(zone_id = zone_id, origine = "api", "resume_requested");
+    let reponse = reprendre_la_zone(State(state.clone()), Path(zone_id), headers)
+        .await
+        .into_response();
+    if reponse.status().is_success() {
+        crate::routes::zones::relais_de_groupe_6155::relayer_le_geste_d_un_membre(
+            &state,
+            zone_id,
+            crate::routes::zones::relais_de_groupe_6155::GesteDUnMembre::Reprise,
+        );
+    }
+    reponse
+}
+
+async fn reprendre_la_zone(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     let lang = crate::i18n::lang_from_header(&headers);
     let current = state.playback.get_state(zone_id).await;
 
@@ -4379,6 +4424,13 @@ async fn resume(
 
 async fn stop(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     arreter_la_zone(&state, zone_id).await;
+    // #8445 — un arrêt donné sur une suiveuse arrête le groupe, sans le
+    // défaire (le relais ne touche pas `zone_groups`).
+    crate::routes::zones::relais_de_groupe_6155::relayer_le_geste_d_un_membre(
+        &state,
+        zone_id,
+        crate::routes::zones::relais_de_groupe_6155::GesteDUnMembre::Arret,
+    );
     Json(build_zone_json(&state, zone_id).await)
 }
 
