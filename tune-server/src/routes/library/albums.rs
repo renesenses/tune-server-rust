@@ -109,6 +109,7 @@ pub(super) struct LangQuery {
 pub(super) async fn list_albums(
     State(state): State<AppState>,
     Query(p): Query<AlbumFilters>,
+    recomptage: Option<axum::Extension<crate::routes::politique_parentale::RecomptageParental>>,
 ) -> Json<Value> {
     // #4800 — TOUTES les lectures de cette route sont synchrones (rusqlite),
     // et la page d'albums est la plus longue du serveur : 35 à 42 s sur le
@@ -119,6 +120,9 @@ pub(super) async fn list_albums(
     let backend = state.backend.clone();
     let (limit, offset) = (p.limit.unwrap_or(50), p.offset.unwrap_or(0));
     match tokio::task::spawn_blocking(move || lire_la_page_d_albums(backend, p)).await {
+        // #7913 — un recomptage parental ne lit que les éléments : pas
+        // d'appel au site pour les écoutes de la communauté.
+        Ok(corps) if recomptage.is_some() => Json(corps),
         Ok(mut corps) => {
             // #6738 — « (5 400) » dans la grille : les écoutes de la
             // communauté, lues au site par lot et gardées 24 h.

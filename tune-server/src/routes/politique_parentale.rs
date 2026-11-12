@@ -221,10 +221,135 @@ fn fiche_de_la_route(chemin: &str) -> Option<Fiche> {
 /// #7913 — le code du refus d'une fiche bloquée.
 pub(crate) const CODE_REFUS_FICHE_BLOQUEE: &str = "parental_content_blocked";
 
+/// #7913 — marque posée sur les requêtes INTERNES de recomptage : les
+/// handlers de listes n'y font pas leurs annotations (écoutes de la
+/// communauté, un appel HTTP au site par page).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecomptageParental;
+
+/// Durée de vie d'un décompte mis en cache.
+const DUREE_DU_DECOMPTE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Un décompte d'éléments bloqués, valable tant que la politique (révision),
+/// la liste (total servi) et la bibliothèque (empreinte) n'ont pas changé.
+#[derive(Clone)]
+struct Decompte {
+    total_servi: u64,
+    empreinte: String,
+    bloques: u64,
+    quand: std::time::Instant,
+}
+
+type CleDuDecompte = (i64, String, i64);
+
+fn decomptes() -> &'static std::sync::Mutex<std::collections::HashMap<CleDuDecompte, Decompte>> {
+    static D: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<CleDuDecompte, Decompte>>,
+    > = std::sync::OnceLock::new();
+    D.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Nombre de pages relues pour un recomptage (témoins et mesure).
+pub static PAGES_RELUES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// L'empreinte de la bibliothèque : nombre et plus grand identifiant des
+/// albums, pistes et artistes. Un scan, un ajout ou un retrait la changent ;
+/// une modification en place (renommage) attend la fin de `DUREE_DU_DECOMPTE`.
+fn empreinte_de_la_bibliotheque(state: &AppState) -> String {
+    let mut e = String::new();
+    for table in ["albums", "tracks", "artists"] {
+        let r = state
+            .backend
+            .query_one(
+                &format!("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM {table}"),
+                &[],
+            )
+            .ok()
+            .flatten()
+            .map(|r| {
+                format!(
+                    "{}:{}",
+                    r.first().and_then(|v| v.as_i64()).unwrap_or(-1),
+                    r.get(1).and_then(|v| v.as_i64()).unwrap_or(-1)
+                )
+            })
+            .unwrap_or_default();
+        e.push_str(&r);
+        e.push('|');
+    }
+    e
+}
+
+/// La liste sans sa fenêtre : la clé du décompte.
+fn chemin_sans_fenetre(uri: &axum::http::Uri) -> String {
+    let mut q: Vec<&str> = uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .filter(|p| !matches!(p.split('=').next().unwrap_or(""), "limit" | "offset"))
+        .collect();
+    q.sort_unstable();
+    format!("{}?{}", uri.path(), q.join("&"))
+}
+
 /// Taille des pages relues pour compter le total exact.
 const PAGE_DE_COMPTAGE: u64 = 500;
 /// Plafond de pages relues : au-delà, le total reste celui de la page.
 const PAGES_DE_COMPTAGE_MAX: usize = 400;
+
+/// [`bloques_dans_toute_la_liste`], gardé en cache par (profil, liste sans
+/// fenêtre, révision de la politique) : la liste n'est relue que si son total,
+/// la bibliothèque ou la politique ont changé, ou après `DUREE_DU_DECOMPTE`.
+/// Feuilleter une liste ne la relit donc qu'une fois.
+#[allow(clippy::too_many_arguments)]
+async fn bloques_avec_cache(
+    state: &AppState,
+    cle: CleDuDecompte,
+    suite: &Next,
+    gabarit: &(
+        axum::http::Uri,
+        axum::http::HeaderMap,
+        axum::http::Extensions,
+    ),
+    graine: Option<&Value>,
+    filtre: &Filtre,
+    liste: Liste,
+    total: u64,
+) -> Option<u64> {
+    let empreinte = empreinte_de_la_bibliotheque(state);
+    if let Ok(d) = decomptes().lock()
+        && let Some(c) = d.get(&cle)
+        && c.total_servi == total
+        && c.empreinte == empreinte
+        && c.quand.elapsed() < DUREE_DU_DECOMPTE
+    {
+        return Some(c.bloques);
+    }
+    let debut = std::time::Instant::now();
+    let bloques = bloques_dans_toute_la_liste(suite, gabarit, graine, filtre, liste, total).await?;
+    tracing::debug!(
+        profil = cle.0,
+        liste = %cle.1,
+        total,
+        bloques,
+        ms = debut.elapsed().as_millis() as u64,
+        "politique_parentale_total_recompte"
+    );
+    if let Ok(mut d) = decomptes().lock() {
+        d.retain(|_, c| c.quand.elapsed() < DUREE_DU_DECOMPTE);
+        d.insert(
+            cle,
+            Decompte {
+                total_servi: total,
+                empreinte,
+                bloques,
+                quand: std::time::Instant::now(),
+            },
+        );
+    }
+    Some(bloques)
+}
 
 /// #7913 — le total EXACT d'une liste paginée pour un profil supervisé.
 ///
@@ -282,6 +407,8 @@ async fn bloques_dans_toute_la_liste(
             .ok()?;
         *req.headers_mut() = entetes.clone();
         *req.extensions_mut() = extensions.clone();
+        req.extensions_mut().insert(RecomptageParental);
+        PAGES_RELUES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let reponse = suite.clone().run(req).await;
         if !reponse.status().is_success() {
             return None;
@@ -350,8 +477,8 @@ pub(crate) async fn filtrer_les_listes(
         Err(never) => match never {},
     };
     let req = Request::from_parts(parts, body);
-    let politique = match pp::lire(&state.backend, profil) {
-        Ok(Some(p)) => p.politique,
+    let (politique, revision) = match pp::lire(&state.backend, profil) {
+        Ok(Some(p)) => (p.politique, p.revision),
         Ok(None) => return next.run(req).await,
         // Sans table, aucune politique n'a pu être posée.
         Err(e) if pp::table_absente(&e) => {
@@ -419,9 +546,17 @@ pub(crate) async fn filtrer_les_listes(
     if let (Some(l @ (Liste::Bibliotheque | Liste::Artistes)), Some(total)) = (liste, total_servi)
         && filtre.bloque_des_artistes()
         && valeur.get("items").is_some_and(Value::is_array)
-        && let Some(bloques) =
-            bloques_dans_toute_la_liste(&suite, &gabarit, valeur.get("seed"), &filtre, l, total)
-                .await
+        && let Some(bloques) = bloques_avec_cache(
+            &state,
+            (profil, chemin_sans_fenetre(&gabarit.0), revision),
+            &suite,
+            &gabarit,
+            valeur.get("seed"),
+            &filtre,
+            l,
+            total,
+        )
+        .await
     {
         valeur["total"] = Value::from(total.saturating_sub(bloques));
         retires = retires.max(1);
