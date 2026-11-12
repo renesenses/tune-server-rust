@@ -98,6 +98,11 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS year TEXT",
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS sample_rate TEXT",
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS bit_depth TEXT",
+    // tune-web-client#2759 — référence d'album (PG 078, aussi dans
+    // `ENSURE_COLUMNS`), que `SELECT_COLS` NOMME désormais pour rendre
+    // `album_id_service` : même raison que `ai_generated`, une table montée
+    // par ce seul chemin (banc `pg_3715_*`) doit rester lisible.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS album_ref TEXT",
     // Only re-attach the TEXT default while the column IS still text.
     // On a database healed by migration 012 the column is BIGINT and
     // already defaults to `nextval('streaming_favorites_id_seq')`, so

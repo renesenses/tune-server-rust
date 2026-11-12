@@ -737,7 +737,15 @@ async fn renderingcontrol_control(
                     .set_volume(zone_id, f64::from(v) / 100.0, device_id.as_deref())
                     .await
                 {
-                    Ok(()) => upnp_renderer::empty_response("SetVolume"),
+                    Ok(()) => {
+                        // #8165 — le volume d'un point de contrôle est un
+                        // geste : il lève la sourdine de la zone.
+                        state
+                            .orchestrator
+                            .lever_la_sourdine_au_geste_de_volume(zone_id, device_id.as_deref())
+                            .await;
+                        upnp_renderer::empty_response("SetVolume")
+                    }
                     Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
                 }
             }

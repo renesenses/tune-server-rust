@@ -1800,3 +1800,146 @@ async fn l_album_de_trois_cd_coche_en_premier_prend_1_a_3_8463() {
     // Album 2 (3 CD) en premier → 1-3, puis album 1 (4 CD) 4-7, 8, 9.
     composer_et_defaire_quatre([1, 0, 2, 3], [(1, 3), (4, 7), (8, 8), (9, 9)]).await;
 }
+
+// ---------------------------------------------------------------------------
+// #8571 (fil 2763) — réordonner les albums d'un coffret composé à la main
+// ---------------------------------------------------------------------------
+
+/// Le coffret de Didier composé dans l'ordre des coches, puis réordonné
+/// depuis sa fiche : les trois albums HiRes en tête, l'Immersion (3 CD)
+/// ensuite. Les trois CD gardent leur ordre et prennent 4 à 6 ; « Défaire »
+/// rend toujours l'Immersion au coffret, sous ses numéros d'origine.
+#[tokio::test]
+async fn reordonner_le_coffret_de_didier_renumerote_les_disques_8571() {
+    let (app, state) = serveur();
+    let (imm, multi, quadra, stereo) = l_immersion_de_didier(&state);
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [imm, multi, quadra, stereo] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+
+    // La sonde de l'écran.
+    let (statut, vue) = appel(
+        &app,
+        "GET",
+        &format!("/api/v1/library/albums/{imm}/edition"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "vue = {vue}");
+    assert_eq!(vue["ordre_coffret"], true);
+
+    let (statut, ordre) = appel(
+        &app,
+        "GET",
+        &format!("/api/v1/library/coffrets/{imm}/ordre"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "ordre = {ordre}");
+    assert_eq!(ordre["coffret"].as_i64(), Some(imm));
+    let membres: Vec<(i64, Vec<i64>)> = ordre["membres"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["membre"].as_i64().unwrap(),
+                m["disques"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Value::as_i64)
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        membres,
+        vec![(0, vec![1, 2, 3]), (1, vec![4]), (2, vec![5]), (3, vec![6])]
+    );
+    assert_eq!(
+        ordre["membres"][0]["titre"].as_str(),
+        Some("The Dark Side Of The Moon (Immersion Box Set)")
+    );
+    assert_eq!(ordre["membres"][0]["pistes"].as_i64(), Some(6));
+
+    // Un ordre incomplet : 422, rien d'écrit.
+    let avant = disposition(&state);
+    let (statut, corps) = appel_corps(
+        &app,
+        "PUT",
+        &format!("/api/v1/library/coffrets/{imm}/ordre"),
+        json!({ "membres": [3, 2, 1] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY, "corps = {corps}");
+    assert_eq!(
+        corps["error"].as_str(),
+        Some("ordre_invalide"),
+        "corps = {corps}"
+    );
+    assert_eq!(disposition(&state), avant);
+
+    // Stereo, Multichannel, l'Immersion, Quadraphonic.
+    let (statut, corps) = appel_corps(
+        &app,
+        "PUT",
+        &format!("/api/v1/library/coffrets/{imm}/ordre"),
+        json!({ "membres": [3, 1, 0, 2] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["membres"][2]["disques"], json!([3, 4, 5]));
+    let attendu: Vec<(String, i64, i64)> = vec![
+        ("/m/PF/Immersion/CD1/01.flac".into(), imm, 3),
+        ("/m/PF/Immersion/CD1/02.flac".into(), imm, 3),
+        ("/m/PF/Immersion/CD2/01.flac".into(), imm, 4),
+        ("/m/PF/Immersion/CD2/02.flac".into(), imm, 4),
+        ("/m/PF/Immersion/CD3/01.flac".into(), imm, 5),
+        ("/m/PF/Immersion/CD3/02.flac".into(), imm, 5),
+        ("/m/PF/Multichannel/01.flac".into(), imm, 2),
+        ("/m/PF/Quadraphonic/01.flac".into(), imm, 6),
+        ("/m/PF/Stereo/01.flac".into(), imm, 1),
+    ];
+    assert_eq!(disposition(&state), attendu);
+
+    // DÉFAIRE après le réordonnancement : chacun retrouve ses numéros.
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/coffrets/{imm}/defaire-manuel"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(
+        titre_de(&state, imm),
+        "The Dark Side Of The Moon (Immersion Box Set)"
+    );
+    let defait = disposition(&state);
+    for (chemin, album_id, disque) in &defait {
+        if chemin.contains("/Immersion/") {
+            assert_eq!(*album_id, imm, "{defait:?}");
+            let cd: i64 = chemin.split("/CD").nth(1).unwrap()[..1].parse().unwrap();
+            assert_eq!(*disque, cd, "{defait:?}");
+        } else {
+            assert_ne!(*album_id, imm, "{defait:?}");
+            assert_eq!(*disque, 1, "{defait:?}");
+        }
+    }
+
+    // Plus un coffret : 409.
+    let (statut, corps) = appel(
+        &app,
+        "GET",
+        &format!("/api/v1/library/coffrets/{imm}/ordre"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::CONFLICT, "corps = {corps}");
+    assert_eq!(corps["error"].as_str(), Some("pas_un_coffret_manuel"));
+    // Inconnu : 404.
+    let (statut, _) = appel(&app, "GET", "/api/v1/library/coffrets/987654/ordre").await;
+    assert_eq!(statut, StatusCode::NOT_FOUND);
+}

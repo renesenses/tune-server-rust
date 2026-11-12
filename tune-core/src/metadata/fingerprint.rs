@@ -20,7 +20,8 @@ pub struct AcoustIdMatch {
 
 /// Le binaire `fpcalc` remplacé — une doublure dans les tests (#4805). `None`
 /// en service : `fpcalc` est cherché à côté de `tune-server`, puis dans le
-/// `PATH` (#8466).
+/// `PATH` (#8466), puis dans les dossiers usuels des gestionnaires de paquets
+/// (forum, fil 2764).
 static FPCALC_REMPLACE: std::sync::RwLock<Option<std::path::PathBuf>> =
     std::sync::RwLock::new(None);
 
@@ -73,13 +74,56 @@ fn fpcalc_parmi(dossiers: &[std::path::PathBuf]) -> std::ffi::OsString {
         .unwrap_or_else(|| nom_fpcalc().into())
 }
 
+/// Les dossiers où Homebrew, apt/dnf ou un `make install` posent `fpcalc`
+/// (forum, fil 2764). Un service lancé par launchd, une application ouverte
+/// depuis le Finder ou une unité systemd n'héritent PAS du `PATH` du shell :
+/// launchd donne `/usr/bin:/bin:/usr/sbin:/sbin`, sans `/opt/homebrew/bin`
+/// (Mac Apple Silicon) ni `/usr/local/bin` (Mac Intel). Un `fpcalc` installé
+/// par `brew install chromaprint` y restait invisible : « fpcalc absent ».
+fn dossiers_usuels() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+    } else if cfg!(windows) {
+        &[]
+    } else {
+        &[
+            "/usr/bin",
+            "/usr/local/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+            "/snap/bin",
+        ]
+    }
+}
+
+/// Ordre de recherche : à côté de `tune-server` (#8466), puis le `PATH`
+/// reçu, puis les dossiers usuels (fil 2764). Le `PATH` passe avant les
+/// dossiers usuels : un `fpcalc` choisi par l'utilisateur reste prioritaire.
+fn dossiers_de_recherche(
+    tune: Vec<std::path::PathBuf>,
+    path: Option<&std::ffi::OsStr>,
+    usuels: &[&str],
+) -> Vec<std::path::PathBuf> {
+    let mut dossiers = tune;
+    if let Some(path) = path {
+        dossiers.extend(std::env::split_paths(path).filter(|d| !d.as_os_str().is_empty()));
+    }
+    dossiers.extend(usuels.iter().map(std::path::PathBuf::from));
+    dossiers
+}
+
 fn binaire_fpcalc() -> std::ffi::OsString {
     FPCALC_REMPLACE
         .read()
         .ok()
         .and_then(|f| f.clone())
         .map(|p| p.into_os_string())
-        .unwrap_or_else(|| fpcalc_parmi(&dossiers_de_tune()))
+        .unwrap_or_else(|| {
+            fpcalc_parmi(&dossiers_de_recherche(
+                dossiers_de_tune(),
+                std::env::var_os("PATH").as_deref(),
+                dossiers_usuels(),
+            ))
+        })
 }
 
 pub async fn generate_fingerprint(file_path: &str) -> Result<FingerprintResult, String> {
@@ -274,6 +318,75 @@ mod tests {
             fpcalc_parmi(&[vide]),
             std::ffi::OsString::from(nom_fpcalc())
         );
+    }
+
+    /// Fil 2764 : `brew install chromaprint` pose `fpcalc` dans
+    /// `/usr/local/bin` (Mac Intel) ou `/opt/homebrew/bin` (Apple Silicon),
+    /// absents du `PATH` réduit de launchd. Il doit être trouvé quand même.
+    #[test]
+    fn fpcalc_hors_du_path_reduit_de_launchd_est_trouve_2764() {
+        let racine = tempfile::tempdir().unwrap();
+        let tune = racine.path().join("tune");
+        let systeme = racine.path().join("usr-bin");
+        let brew = racine.path().join("homebrew-bin");
+        for d in [&tune, &systeme, &brew] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let installe = brew.join(nom_fpcalc());
+        std::fs::write(&installe, b"").unwrap();
+        // Le PATH de launchd : seulement des dossiers système, sans fpcalc.
+        let path_reduit = std::env::join_paths([&systeme]).unwrap();
+        let usuel = brew.to_str().unwrap();
+
+        assert_eq!(
+            fpcalc_parmi(&dossiers_de_recherche(
+                vec![tune.clone()],
+                Some(&path_reduit),
+                &[usuel],
+            )),
+            installe.clone().into_os_string(),
+            "le fpcalc de Homebrew doit être trouvé hors du PATH réduit"
+        );
+        // Contre-épreuve : sans les dossiers usuels (comportement de la
+        // rc11), seul le nom nu reste, et launchd ne le trouve pas.
+        assert_eq!(
+            fpcalc_parmi(&dossiers_de_recherche(
+                vec![tune.clone()],
+                Some(&path_reduit),
+                &[],
+            )),
+            std::ffi::OsString::from(nom_fpcalc())
+        );
+        // Un fpcalc présent dans le PATH passe avant les dossiers usuels.
+        let choisi = systeme.join(nom_fpcalc());
+        std::fs::write(&choisi, b"").unwrap();
+        assert_eq!(
+            fpcalc_parmi(&dossiers_de_recherche(
+                vec![tune.clone()],
+                Some(&path_reduit),
+                &[usuel],
+            )),
+            choisi.into_os_string()
+        );
+        // Et celui livré à côté de tune-server (#8466) passe avant tout.
+        let livre = tune.join(nom_fpcalc());
+        std::fs::write(&livre, b"").unwrap();
+        assert_eq!(
+            fpcalc_parmi(&dossiers_de_recherche(
+                vec![tune],
+                Some(&path_reduit),
+                &[usuel],
+            )),
+            livre.into_os_string()
+        );
+    }
+
+    /// Les deux préfixes Homebrew du Mac font partie des dossiers usuels.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dossiers_usuels_du_mac_couvrent_les_deux_homebrew_2764() {
+        assert!(dossiers_usuels().contains(&"/opt/homebrew/bin"));
+        assert!(dossiers_usuels().contains(&"/usr/local/bin"));
     }
 
     #[test]
