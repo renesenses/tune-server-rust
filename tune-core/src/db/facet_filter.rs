@@ -166,6 +166,29 @@ pub fn bloc_metadonnee(
     }
 }
 
+/// #8090 — le pays d'un artiste n'est LU que s'il vient de son MBID courant
+/// (`artists.country_mbid`), et s'il n'est pas vide (`''` : MusicBrainz n'en
+/// donne aucun). Un MBID changé ou retiré rend le pays caduc. `pa_ar` est
+/// l'alias de `artists` dans les requêtes des facettes et du filtre.
+pub const PAYS_ARTISTE_VALIDE: &str = "pa_ar.country_mbid IS NOT NULL \
+     AND pa_ar.country_mbid = LOWER(TRIM(pa_ar.musicbrainz_id)) \
+     AND pa_ar.country IS NOT NULL AND pa_ar.country <> ''";
+
+/// #8090 — pays de l'ARTISTE PRINCIPAL de l'album (`albums.artist_id`), sans
+/// la casse : la piste appartient à un album dont l'artiste est de l'un des
+/// pays choisis. Une piste sans album n'a pas de pays d'artiste.
+pub fn bloc_pays_artiste(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
+    let c = ph.in_list_ci("pa_ar.country", valeurs.len())?;
+    Some((
+        format!(
+            "t.album_id IN (SELECT pa_al.id FROM albums pa_al \
+             JOIN artists pa_ar ON pa_ar.id = pa_al.artist_id \
+             WHERE {PAYS_ARTISTE_VALIDE} AND {c})"
+        ),
+        valeurs.iter().map(|v| SqlValue::Text(v.clone())).collect(),
+    ))
+}
+
 /// Liste de lecture, par son nom, sans la casse.
 pub fn bloc_listes(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
     let c = ph.in_list_ci("pl.name", valeurs.len())?;
@@ -1284,6 +1307,9 @@ pub struct TrackFilter {
     pub instruments: Vec<String>,
     pub artists: Vec<String>,
     pub countries: Vec<String>,
+    /// #8090 — pays de l'artiste principal de l'album (`?artist_country=FR`),
+    /// lu sur MusicBrainz : voir [`bloc_pays_artiste`].
+    pub artist_countries: Vec<String>,
     pub moods: Vec<String>,
     pub source_medias: Vec<String>,
     pub ratings: Vec<i64>,
@@ -1374,6 +1400,7 @@ impl TrackFilter {
             || !self.instruments.is_empty()
             || !self.artists.is_empty()
             || !self.countries.is_empty()
+            || !self.artist_countries.is_empty()
             || !self.moods.is_empty()
             || !self.source_medias.is_empty()
             || !self.ratings.is_empty()

@@ -98,6 +98,8 @@ pub(super) fn track_filter_from_raw(raw: Option<&str>) -> Result<TrackFilter, Ap
         instruments: texts("instrument"),
         artists: texts("artist"),
         countries: texts("country"),
+        // #8090 — pays de l'artiste (MusicBrainz), à côté du pays d'édition.
+        artist_countries: texts("artist_country"),
         moods: texts("mood"),
         source_medias: texts("source_media"),
         ratings: ints(raw, "rating")?,

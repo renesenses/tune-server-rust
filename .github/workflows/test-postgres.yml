@@ -1082,6 +1082,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_date_relative_6122 -- --nocapture --test-threads=1
 
+      # #8090 — la carte et le filtre Pays : pays de l'artiste principal
+      # (`artists.country`, PG 112) et pays d'édition, comptés en albums
+      # (`COUNT(DISTINCT …)`), filtre `artist_country`, par le vrai routeur.
+      # Sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Pays de l'artiste sur PostgreSQL (#8090)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pays_artiste_8090 -- --nocapture --test-threads=1
+
       # #6143 — « après », « avant », « entre » et `now-90d` des collections et
       # des playlists : bornes calculées en Rust (secondes pour `file_mtime`,
       # ISO pour `listened_at`) au lieu de `DATETIME()`, propre à SQLite. Sans
