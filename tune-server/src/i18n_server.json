@@ -4980,6 +4980,23 @@
     "pl": "Ścieżki dźwiękowe",
     "el": "Μουσική ταινιών"
   },
+  "radio.genre.religious": {
+    "fr": "Religieux",
+    "en": "Religious",
+    "de": "Religiös",
+    "es": "Religiosa",
+    "it": "Religiosa",
+    "zh": "宗教",
+    "ja": "宗教",
+    "ko": "종교",
+    "ro": "Religioasă",
+    "sv": "Religiöst",
+    "hu": "Vallásos zene",
+    "vi": "Tôn giáo",
+    "nb": "Religiøst",
+    "pl": "Religijne",
+    "el": "Θρησκευτικά"
+  },
   "radio.genre.news": {
     "fr": "Info",
     "en": "News",
