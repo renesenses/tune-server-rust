@@ -2157,3 +2157,9 @@ path = "tests/playlists_radio_8135.rs"
 [[test]]
 name = "pays_artiste_8090"
 path = "tests/pays_artiste_8090.rs"
+
+# Banc synthétique HTTP + navigateur : exécution explicite, SQLite et PostgreSQL.
+[[test]]
+name = "banc_albums_http_7774"
+path = "tests/banc_albums_http_7774.rs"
+required-features = ["postgres"]
