@@ -1719,6 +1719,8 @@ fn output_reach_of(
 }
 
 mod signal_path;
+// #8419 — le chemin du signal d'une lecture groupée dit chaque sortie.
+pub(crate) mod signal_path_groupe_8419;
 pub(crate) mod textes_signal;
 pub use signal_path::*;
 
