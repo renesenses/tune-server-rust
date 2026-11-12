@@ -65,7 +65,11 @@ jobs:
           while IFS= read -r LOT; do
             [ -n "$LOT" ] || continue
             ENC="$(jq -rn --arg b "$LOT" '$b|@uri')"
-            INFO="$(gh api "repos/$GH_REPO/branches/$ENC" --jq '[.commit.sha, .commit.commit.committer.date] | @tsv')"
+            # Lot supprime entre la liste et la lecture : on passe au suivant.
+            INFO="$(gh api "repos/$GH_REPO/branches/$ENC" --jq '[.commit.sha, .commit.commit.committer.date] | @tsv')" || {
+              echo "saute  $LOT : branche illisible (supprimee ?)"
+              continue
+            }
             SHA="$(cut -f1 <<<"$INFO")"
             DATE="$(cut -f2 <<<"$INFO")"
             AGE_H=$(( (MAINTENANT - $(date -u -d "$DATE" +%s)) / 3600 ))

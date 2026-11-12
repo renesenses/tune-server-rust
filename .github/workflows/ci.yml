@@ -135,8 +135,12 @@ jobs:
           fi
 
       # Jobs lourds sur une PR : seulement si le diff les concerne. Tout le
-      # reste (push du lot ou de main, nuit, lancement manuel, PR vers main
-      # ou rc/*, etiquette `ci:full`) lance tout. Un job saute est
+      # reste (push du lot ou de main, nuit, lancement manuel, PR vers main,
+      # etiquette `ci:full`) lance tout. Une PR vers rc/* allume les familles
+      # dont un check est requis sur rc/* (audit, FFI) plus Windows et macOS.
+      # Jeu livre, embedding et librespot restent EN PLUS soumis a
+      # `full` (profil rapide des PR vers batch/* et rc/* : sautes comme
+      # avant cette etape, quel que soit le diff). Un job saute est
       # « skipped », que GitHub compte comme reussi pour un controle requis :
       # aucun controle requis ne disparait. Fail-closed : base introuvable,
       # diff impossible ou sortie incomplete => tout allume.
@@ -156,10 +160,17 @@ jobs:
             done
             exit 0
           }
+          requis_rc() {
+            echo "jobs lourds : windows, macos, ffi, audit ($1)"
+            printf '%s\n' windows=true macos=true ffi=true audit=true \
+              librespot=false livre=false embedding=false >> "$GITHUB_OUTPUT"
+            exit 0
+          }
           [ "$EVENEMENT" = pull_request ] || tout "evenement $EVENEMENT"
           [ "$FORCER_COMPLET" = true ] && tout "etiquette ci:full"
           case "$BASE_REF_CI" in
-            main | rc/*) tout "PR vers $BASE_REF_CI" ;;
+            main) tout "PR vers main" ;;
+            rc/*) requis_rc "PR vers $BASE_REF_CI" ;;
             '') tout "base de PR vide" ;;
           esac
           # La base du diff est le point de divergence avec la base de la PR,
@@ -178,7 +189,15 @@ jobs:
           if grep -Eq '^[+-][^+-].*(cfg|target).*(windows|unix|macos|target_os|target_family|target_vendor)' /tmp/diff-lourds; then
             CFG_PLATEFORME=true
           fi
-          VERDICT="$(CFG_PLATEFORME="$CFG_PLATEFORME" bash scripts/detecter-jobs-lourds-ci.sh < /tmp/chemins-lourds)" \
+          # `tune-ffi` est la seule configuration compilee SANS `oaat` (et
+          # sans les fonctionnalites par defaut de tune-server) : une ligne
+          # `cfg(feature = ...)` / `cfg(not(feature ...))` ajoutee ou retiree
+          # allume la FFI.
+          CFG_FEATURE=false
+          if grep -Eq '^[+-][^+-].*cfg.*feature' /tmp/diff-lourds; then
+            CFG_FEATURE=true
+          fi
+          VERDICT="$(CFG_PLATEFORME="$CFG_PLATEFORME" CFG_FEATURE="$CFG_FEATURE" bash scripts/detecter-jobs-lourds-ci.sh < /tmp/chemins-lourds)" \
             || tout "classifieur en erreur"
           for f in windows macos ffi librespot livre embedding audit; do
             printf '%s\n' "$VERDICT" | grep -qxE "$f=(true|false)" || tout "sortie incomplete ($f)"
@@ -366,7 +385,7 @@ jobs:
   test-shipped-features:
     name: Test (jeu de fonctionnalites livre)
     needs: impact
-    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.livre == 'true'
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.livre == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # test-shipped-features — ~5 min observe
     steps:
@@ -424,7 +443,7 @@ jobs:
   audio-embedding:
     name: Audio embedding feature
     needs: impact
-    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.embedding == 'true'
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.embedding == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
@@ -1037,7 +1056,7 @@ jobs:
   librespot:
     name: librespot (${{ matrix.target }})
     needs: impact
-    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.librespot == 'true'
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.librespot == 'true'
     strategy:
       fail-fast: false
       matrix:

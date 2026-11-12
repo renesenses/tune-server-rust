@@ -5,6 +5,9 @@
 #          (`git diff --no-renames --name-only -z BASE HEAD`).
 # Env    : CFG_PLATEFORME=true si le diff ajoute ou retire une ligne Rust/TOML
 #          qui parle de plateforme (`cfg(windows)`, `target_os`, `[target.`...).
+#          CFG_FEATURE=true si le diff ajoute ou retire une ligne
+#          `cfg(feature ...)` : tune-ffi compile tune-server SANS `oaat` ni
+#          fonctionnalites par defaut, seule configuration de ce genre.
 # Sortie : une ligne `cle=true|false` par famille de jobs, a ajouter telle
 #          quelle a `$GITHUB_OUTPUT` :
 #            windows    Windows + ASIO (compilation PR)
@@ -60,7 +63,7 @@ choisir_jobs_lourds() {
       *macos* | *darwin* | *coreaudio* | *apple* | tune-desktop/*) macos=true ;;
     esac
     case "$bas" in
-      tune-ffi/* | *android* | *uniffi* | */ios/*) ffi=true ;;
+      tune-ffi/* | *android* | *uniffi* | */ios/* | *oaat*) ffi=true ;;
     esac
     case "$bas" in
       *librespot* | *airplay-daemon* | *airplay_daemon*) librespot=true ;;
@@ -88,6 +91,11 @@ choisir_jobs_lourds() {
     ffi=true
   fi
 
+  if [ "${CFG_FEATURE:-false}" = true ]; then
+    printf 'jobs lourds : ligne cfg(feature) dans le diff => FFI\n' >&2
+    ffi=true
+  fi
+
   printf 'windows=%s\nmacos=%s\nffi=%s\nlibrespot=%s\nlivre=%s\nembedding=%s\naudit=%s\n' \
     "$windows" "$macos" "$ffi" "$librespot" "$livre" "$embedding" "$audit"
 }
@@ -96,13 +104,14 @@ autotest() {
   local echecs=0
 
   attendu() {
-    local libelle="$1" attendu_lignes="$2" cfg="$3"
+    local libelle="$1" attendu_lignes="$2" cfg="$3" feat=false
     shift 3
+    if [ "$cfg" = feature ]; then cfg=false; feat=true; fi
     local obtenu
     if [ "$#" -eq 0 ]; then
-      obtenu="$(CFG_PLATEFORME="$cfg" choisir_jobs_lourds </dev/null 2>/dev/null | tr '\n' ' ')"
+      obtenu="$(CFG_PLATEFORME="$cfg" CFG_FEATURE="$feat" choisir_jobs_lourds </dev/null 2>/dev/null | tr '\n' ' ')"
     else
-      obtenu="$(printf '%s\0' "$@" | CFG_PLATEFORME="$cfg" choisir_jobs_lourds 2>/dev/null | tr '\n' ' ')"
+      obtenu="$(printf '%s\0' "$@" | CFG_PLATEFORME="$cfg" CFG_FEATURE="$feat" choisir_jobs_lourds 2>/dev/null | tr '\n' ' ')"
     fi
     if [ "$obtenu" = "$attendu_lignes" ]; then
       printf '  ok    %s\n' "$libelle"
@@ -139,6 +148,13 @@ autotest() {
   attendu 'tune-desktop' 'windows=true macos=true ffi=false librespot=false livre=false embedding=false audit=false ' false 'tune-desktop/src/main.rs'
   # Ligne de plateforme dans un fichier ordinaire (motif de #3074).
   attendu 'cfg(windows) dans le diff' 'windows=true macos=true ffi=true librespot=false livre=false embedding=false audit=false ' true 'tune-core/src/db/album_repo.rs'
+
+  # tune-ffi compile tune-server sans `oaat` : une garde de fonctionnalite
+  # touchee ou un chemin oaat allume la FFI, et elle seule.
+  local FFI='windows=false macos=false ffi=true librespot=false livre=false embedding=false audit=false '
+  attendu 'cfg(feature) sous tune-server/src' "$FFI" feature 'tune-server/src/routes/system/diagnostics.rs'
+  attendu 'chemin oaat' "$FFI" false 'tune-core/src/outputs/oaat/mod.rs'
+  attendu 'chemin oaat dans tune-server' "$FFI" false 'tune-server/src/routes/system/diagnostics_oaat_8006_tests.rs'
 
   if [ "$echecs" -ne 0 ]; then
     printf '%s contre-epreuve(s) en echec\n' "$echecs" >&2
