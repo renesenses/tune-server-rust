@@ -1982,6 +1982,20 @@ async fn play_radio(
     Json(corps).into_response()
 }
 
+/// #8135 — le choix du flux d'une radio rangée dans une playlist : celui de
+/// `play_radio` (fiche de l'annuaire, pays de l'auditeur). Un flux refusé
+/// (pays exclu) rend `None` : la ligne est sautée à la lecture.
+pub(crate) fn choix_du_flux_de_playlist(
+    state: &AppState,
+) -> tune_core::db::playlist_radio_8135::ChoixDuFlux {
+    let state = state.clone();
+    std::sync::Arc::new(move |radio: &tune_core::db::radio_repo::RadioStation| {
+        geofencing::stream_for_saved(&state, radio)
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+    })
+}
+
 /// Lance un flux de radio sur une zone et rend le corps de réponse de
 /// `POST /radios/{id}/play/{zone_id}`.
 ///
@@ -4162,10 +4176,13 @@ async fn test_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
         return resp;
     }
 
-    let scheduler = std::sync::Arc::new(tune_core::alarms::AlarmScheduler::with_backend(
-        state.backend.clone(),
-        state.orchestrator.clone(),
-    ));
+    let scheduler = std::sync::Arc::new(
+        tune_core::alarms::AlarmScheduler::with_backend(
+            state.backend.clone(),
+            state.orchestrator.clone(),
+        )
+        .avec_le_choix_du_flux_radio(choix_du_flux_de_playlist(&state)),
+    );
 
     match scheduler.get_alarm(id) {
         Ok(Some(alarm)) => {

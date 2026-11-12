@@ -28,9 +28,12 @@
 //! un arrêt fugace de la meneuse entre deux pistes ne coupe pas les
 //! suiveuses ([`DELAI_AVANT_D_ARRETER`]).
 //!
-//! Seuls les gestes de la MENEUSE sont relayés : une pause, une reprise, un
-//! arrêt, un suivant ou un précédent donnés sur une suiveuse ne valent que
-//! pour elle.
+//! Le relais n'écoute que les événements de la MENEUSE. #8445 (Jon, fil
+//! 2760) — une pause, une reprise ou un arrêt donnés sur une SUIVEUSE valent
+//! désormais pour tout le groupe, comme si la meneuse les avait reçus : la
+//! route du geste les lui transmet ([`relayer_le_geste_d_un_membre`]), et le
+//! relais fait suivre les autres. Un suivant ou un précédent donnés sur une
+//! suiveuse ne valent toujours que pour elle.
 //!
 //! #7717 — une exception : une NOUVELLE lecture lancée sur une zone du groupe,
 //! depuis n'importe quel client, fait de cette zone la meneuse
@@ -397,6 +400,135 @@ pub(crate) async fn aligner_les_suiveuses(state: &AppState, meneuse: i64) {
     }
 }
 
+/// #8445 — un geste de transport donné par l'utilisateur sur une zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GesteDUnMembre {
+    Pause,
+    Reprise,
+    Arret,
+}
+
+/// #8445 — ce que la meneuse fait du geste donné sur une de ses suiveuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PourLaMeneuse {
+    /// La meneuse reçoit le geste ; le relais, à son événement, fait suivre
+    /// les autres suiveuses.
+    Transmettre,
+    /// La meneuse est déjà dans l'état voulu : seules les autres suiveuses
+    /// sont alignées sur elle.
+    Aligner,
+    /// Reprise sur une suiveuse alors que la meneuse est arrêtée : la
+    /// suiveuse, seule à rejouer, prend la tête du groupe et les autres la
+    /// rejoignent (comme une lecture lancée sur elle, #7717).
+    PrendreLaTete,
+    /// Rien à faire pour le groupe (pause d'une suiveuse sous une meneuse
+    /// arrêtée).
+    Rien,
+}
+
+/// #8445 — la décision, sur le seul état de la meneuse relu au moment d'agir.
+pub(crate) fn pour_la_meneuse(geste: GesteDUnMembre, meneuse: PlayState) -> PourLaMeneuse {
+    use GesteDUnMembre as G;
+    match (geste, meneuse) {
+        (G::Pause, PlayState::Playing) => PourLaMeneuse::Transmettre,
+        (G::Pause, PlayState::Paused) => PourLaMeneuse::Aligner,
+        (G::Pause, PlayState::Stopped) => PourLaMeneuse::Rien,
+        (G::Reprise, PlayState::Paused) => PourLaMeneuse::Transmettre,
+        (G::Reprise, PlayState::Playing) => PourLaMeneuse::Aligner,
+        (G::Reprise, PlayState::Stopped) => PourLaMeneuse::PrendreLaTete,
+        (G::Arret, PlayState::Stopped) => PourLaMeneuse::Aligner,
+        (G::Arret, _) => PourLaMeneuse::Transmettre,
+    }
+}
+
+/// #8445 — les meneuses des groupes où `zone` est SUIVEUSE (vide : zone hors
+/// groupe, ou meneuse de son groupe — ses gestes passent déjà par le relais).
+pub(crate) fn meneuses_de(groupes: &[Value], zone: i64) -> Vec<i64> {
+    let mut meneuses = Vec::new();
+    for groupe in groupes {
+        let Some(meneuse) = meneuse_du_groupe(groupe) else {
+            continue;
+        };
+        if meneuse != zone
+            && zones_du_groupe(groupe).contains(&zone)
+            && !meneuses.contains(&meneuse)
+        {
+            meneuses.push(meneuse);
+        }
+    }
+    meneuses
+}
+
+/// #8445 (Jon, fil 2760) — une pause, une reprise ou un arrêt donnés par
+/// l'utilisateur sur une SUIVEUSE valent pour tout son groupe.
+///
+/// Appelé par les routes `pause`, `resume` (et donc `playpause`), `stop` et
+/// `play` sans corps, une fois le geste réussi sur la zone elle-même ; jamais
+/// par le relais. Il n'y a donc pas de boucle : la meneuse reçoit le geste par
+/// l'orchestrateur, pas par une route ; le relais réagit à l'événement de la
+/// meneuse et commande les suiveuses par l'orchestrateur ; les événements des
+/// suiveuses ne relaient rien (elles ne mènent aucun groupe). Un arrêt de
+/// groupe ne défait pas le groupe : `zone_groups` n'est touché que par
+/// [`PourLaMeneuse::PrendreLaTete`].
+///
+/// Le travail part détaché : prévenir un renderer DLNA peut prendre plusieurs
+/// secondes, la réponse de la route n'attend pas le groupe. Rend la tâche, ou
+/// `None` si `zone` n'est suiveuse d'aucun groupe (rien n'est lancé).
+pub(crate) fn relayer_le_geste_d_un_membre(
+    state: &AppState,
+    zone: i64,
+    geste: GesteDUnMembre,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let meneuses = meneuses_de(&groupes_enregistres(state), zone);
+    if meneuses.is_empty() {
+        return None;
+    }
+    let state = state.clone();
+    Some(tokio::spawn(async move {
+        for meneuse in meneuses {
+            let etat = state.playback.get_state(meneuse).await.state;
+            let decision = pour_la_meneuse(geste, etat);
+            info!(zone, meneuse, geste = ?geste, decision = ?decision, "zone_group_member_gesture_relayed");
+            match decision {
+                PourLaMeneuse::Transmettre => {
+                    let device_id = ZoneRepo::with_backend(state.backend.clone())
+                        .get(meneuse)
+                        .ok()
+                        .flatten()
+                        .and_then(|z| z.output_device_id);
+                    let resultat = match geste {
+                        GesteDUnMembre::Pause => state
+                            .orchestrator
+                            .pause(meneuse, device_id.as_deref())
+                            .await
+                            .map_err(|e| format!("{e:?}")),
+                        GesteDUnMembre::Reprise => state
+                            .orchestrator
+                            .resume(meneuse, device_id.as_deref())
+                            .await
+                            .map_err(|e| format!("{e:?}")),
+                        GesteDUnMembre::Arret => {
+                            state.orchestrator.stop(meneuse, device_id.as_deref()).await;
+                            Ok(())
+                        }
+                    };
+                    if let Err(error) = resultat {
+                        warn!(zone, meneuse, geste = ?geste, %error, "zone_group_member_gesture_failed");
+                    }
+                }
+                PourLaMeneuse::Aligner => aligner_les_suiveuses(&state, meneuse).await,
+                PourLaMeneuse::PrendreLaTete => {
+                    if state.playback.get_state(zone).await.state == PlayState::Playing {
+                        prendre_la_tete_du_groupe(&state, zone);
+                        aligner_les_suiveuses(&state, zone).await;
+                    }
+                }
+                PourLaMeneuse::Rien => {}
+            }
+        }
+    }))
+}
+
 /// #7759 (relecture de #8254) — les déplacements relayés d'une meneuse, par
 /// numéro de génération.
 ///
@@ -549,3 +681,7 @@ pub fn lancer_le_relais_de_groupe(state: &AppState) {
 #[cfg(test)]
 #[path = "relais_de_groupe_6155_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "relais_de_groupe_8445_tests.rs"]
+mod tests_8445;

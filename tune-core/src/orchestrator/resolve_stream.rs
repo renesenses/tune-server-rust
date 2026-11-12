@@ -781,11 +781,24 @@ impl PlaybackOrchestrator {
         // #6370 — une sortie d'agent relancée à une position reçoit, comme
         // une sortie locale, le WAV décodé à partir de `seek_ms` : le
         // mandataire du CDN, lui, la servirait depuis l'octet 0.
+        // #7972 — une zone AirPlay 2 rétablie à une position après une pause :
+        // son démon lit le flux depuis le début, il lui faut le WAV décodé à
+        // partir de `seek_ms` (voir [`airplay2_relance_a_la_position`]).
         let is_local_stream = req
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"))
-            || agent_relance_a_la_position(req.output_device_id.as_deref(), req.seek_ms);
+            || agent_relance_a_la_position(req.output_device_id.as_deref(), req.seek_ms)
+            || (req.seek_ms.is_some_and(|ms| ms > 0)
+                && airplay2_relance_a_la_position(
+                    ZoneRepo::with_backend(self.db.clone())
+                        .get(req.zone_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|z| z.output_type)
+                        .as_deref(),
+                    req.seek_ms,
+                ));
 
         // Local and OAAT outputs expect raw PCM in a WAV container.
         // Streaming services deliver compressed audio (FLAC, AAC, etc.)
@@ -1506,6 +1519,55 @@ impl PlaybackOrchestrator {
                         .unwrap_or(0);
                     info!(path = %file_path, file_size, "streaming_dash_file_already_on_disk");
                     file_path
+                } else if opus_decode_pendant_le_telechargement(&codec, sr, seek_s) {
+                    // #8444 — l'Opus de YouTube n'attend plus son dernier
+                    // octet : le décodeur le lit pendant qu'il arrive (même
+                    // mécanisme que le DLNA, #8228). Sinon la sortie restait
+                    // à 0:00 tout le téléchargement (~ moitié du titre) et le
+                    // chien de garde #5522 arrêtait la zone au bout de 8 s.
+                    match download::telecharger_en_croissance_pour_session(
+                        &streamer_for_eof,
+                        &session_id_for_eof,
+                        &upstream_url,
+                        &upstream_headers,
+                        &codec,
+                        // tmp-autorise: base seule : le fichier y est créé par tempfile, au nom aléatoire.
+                        &std::env::temp_dir(),
+                    )
+                    .await
+                    {
+                        Ok(Some(file)) => {
+                            info!(
+                                stream_id = %session_id_for_eof,
+                                "streaming_opus_decode_pendant_le_telechargement"
+                            );
+                            let path = file.path().to_string_lossy().into_owned();
+                            downloaded_file = Some(file);
+                            path
+                        }
+                        Ok(None) => {
+                            info!(
+                                stream_id = %session_id_for_eof,
+                                zone_id,
+                                "streaming_download_cancelled_session_removed"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(
+                                stream_id = %session_id_for_eof,
+                                error = %e,
+                                "streaming_transcode_download_failed"
+                            );
+                            abandonner_la_session_de_transcodage(
+                                &streamer_for_eof,
+                                &session_id_for_eof,
+                                None,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
                 } else {
                     let debut_telechargement = std::time::Instant::now();
                     match download::telecharger_pour_session(
@@ -1584,6 +1646,15 @@ impl PlaybackOrchestrator {
 
         // Le decodeur a rendu son fichier. Le garde ne possede que les
         // telechargements HTTP ; les fichiers DASH du cache restent intacts.
+        // #8444 — un décodeur sorti avant d'avoir pris la poignée du
+        // téléchargement en croissance la laisse au registre : on la retire
+        // et la clôt, pour que la copie amont s'arrête aussi.
+        if let Some(fichier) = downloaded_file.as_ref()
+            && let Some(poignee) =
+                crate::audio::dash_growth::take_for(&fichier.path().to_string_lossy())
+        {
+            poignee.fail();
+        }
         drop(downloaded_file);
 
         match decode_result {
@@ -3268,6 +3339,16 @@ pub(crate) fn decodage_progressif_par_range(service: &str, codec: &str, url: &st
     }
     (service.eq_ignore_ascii_case("tidal") || service.eq_ignore_ascii_case("qobuz"))
         && codec == "flac"
+}
+
+/// #8444 — l'Opus d'un service (YouTube) vers une sortie locale ou OAAT se
+/// décode-t-il PENDANT son téléchargement ? Oui quand le décodeur au fil de
+/// l'eau sert la cible telle quelle (48 kHz ou libre, stéréo) et sans seek ;
+/// sinon le chemin d'avant (téléchargement complet, puis décodage) reste.
+pub(crate) fn opus_decode_pendant_le_telechargement(codec: &str, sr: u32, seek_s: f64) -> bool {
+    codec.eq_ignore_ascii_case("opus")
+        && seek_s <= 0.0
+        && crate::audio::decode::opus_servi_pendant_le_telechargement(Some(sr), Some(2))
 }
 
 #[cfg(test)]

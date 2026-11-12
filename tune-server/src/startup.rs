@@ -1158,6 +1158,14 @@ fn reconcile_favorites(state: &AppState) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "hidden_albums_reconcile_failed"),
     }
+    // web#916 — les suggestions d'accueil écartées (« Pas pour moi ») sur un
+    // album local suivent la même mécanique, et la même règle : rien n'est
+    // supprimé au démarrage.
+    tune_core::db::suggestions_ecartees::reconcilier_journalise(
+        state.backend.clone(),
+        false,
+        "demarrage",
+    );
     // Les paires « ces deux albums ne sont pas des doublons » (#1276) suivent
     // la MÊME mécanique et la même règle : au démarrage on ne supprime jamais
     // une paire introuvable. Perdre l'arbitrage rouvrirait la fusion

@@ -639,7 +639,12 @@ fn sur_une_sortie_reseau_l_etape_volume_reste_lineaire_7762() {
     let zone = repo.get(id).unwrap().unwrap();
     let ps = alac_hires_playing();
     let sp = build_signal_path(&ps, &zone, &backend, Some("Node"), "none", None).unwrap();
-    assert_eq!(step_desc(&sp, "Volume").as_deref(), Some("Volume 50%"));
+    // #8462 — sur une sortie réseau, l'étape dit que c'est le volume du
+    // renderer (une commande), pas un traitement du flux.
+    assert_eq!(
+        step_desc(&sp, "Volume").as_deref(),
+        Some("Volume du renderer 50%")
+    );
 }
 
 /// Contre-épreuve : l'exemption ne vaut QUE pour le volume seul. Dès qu'une
@@ -1158,7 +1163,10 @@ fn volume_step_reads_persisted_zone_volume_not_stale_memory() {
     ps.volume = 0.5;
 
     let sp = build_signal_path(&ps, &zone, &backend, Some("Node"), "none", None).unwrap();
-    assert_eq!(step_desc(&sp, "Volume").as_deref(), Some("Volume 20%"));
+    assert_eq!(
+        step_desc(&sp, "Volume").as_deref(),
+        Some("Volume du renderer 20%")
+    );
 }
 
 // Réciproque : curseur de la page à 100 % → pas d'étape Volume, même si la
@@ -1551,7 +1559,10 @@ fn l_etape_replaygain_suit_pure_et_jamais_le_curseur_de_volume_5683() {
         attendu,
         "volume 35 % : {bas}"
     );
-    assert_eq!(step_desc(&bas, "Volume").as_deref(), Some("Volume 35%"));
+    assert_eq!(
+        step_desc(&bas, "Volume").as_deref(),
+        Some("Volume du renderer 35%")
+    );
     let retour = chemin_au_volume_5683(&backend, zone_id, &ps, 100.0);
     assert_eq!(
         step_desc(&retour, "ReplayGain"),

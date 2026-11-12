@@ -1707,6 +1707,14 @@ impl PlaybackOrchestrator {
             let result = self
                 .session_morte_pendant_l_envoi(req, resolved, device_id, result)
                 .await;
+            if result.0 {
+                self.noter_le_depart_airplay2_si_le_flux_y_commence(
+                    device_id,
+                    resolved.stream_id.as_deref(),
+                    req.seek_ms,
+                )
+                .await;
+            }
             let total_ms = play_start.elapsed().as_millis();
             // `output_ms` ne compte plus l'attente de pré-tampon : les trois
             // termes s'additionnent maintenant pour donner `total_ms`, et un
@@ -2541,7 +2549,9 @@ impl PlaybackOrchestrator {
     /// convolver (in the local output). Bertrand: "PURE doit désactiver toutes
     /// les modifs".
     pub(super) fn zone_audiophile(&self, zone_id: i64) -> bool {
-        crate::audio::audiophile::zone_enabled(&self.db, zone_id)
+        // #8513 — PURE, ou une mesure de pièce qui tient la zone : même
+        // chemin, aucun traitement.
+        crate::audio::audiophile::traitements_contournes(&self.db, zone_id)
     }
 
     /// Rejouer la piste en cours d'une zone **à sa position courante**, en
@@ -2648,6 +2658,43 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #7972 — une zone AirPlay 2 jouée à une position non nulle, quel que soit
+    /// le chemin du geste (rétablissement après une pause, reprise d'une
+    /// file…) : si le flux servi COMMENCE réellement à cette position (session
+    /// décodée en canal, non « range-seekable » — même critère que
+    /// [`Self::seek_output_after_replay`]), la sortie l'apprend, sinon elle
+    /// afficherait 0:00. Une session fichier ou mandataire, servie depuis
+    /// l'octet 0 (épisode de podcast par `resolve_direct`, qui ignore
+    /// `seek_ms`), ne note RIEN : l'écran dirait 12:00 sur un son à 0:00.
+    /// Rend `true` quand le départ a été noté.
+    pub(super) async fn noter_le_depart_airplay2_si_le_flux_y_commence(
+        &self,
+        device_id: &str,
+        stream_id: Option<&str>,
+        seek_ms: Option<u64>,
+    ) -> bool {
+        let (Some(depart_ms), Some(sid)) = (seek_ms.filter(|ms| *ms > 0), stream_id) else {
+            return false;
+        };
+        let Some(output) = ({ self.outputs.lock().await.get(device_id) }) else {
+            return false;
+        };
+        if self.streamer.is_seekable_session(sid).await
+            || crate::outputs::dlna_depart_natif::depart_de_session(sid).is_some()
+        {
+            return false;
+        }
+        let sortie = output.lock().await;
+        let Some(airplay2) = sortie
+            .as_any()
+            .downcast_ref::<crate::outputs::airplay2::Airplay2Output>()
+        else {
+            return false;
+        };
+        airplay2.noter_le_depart_du_flux(depart_ms);
+        true
+    }
+
     /// Envoyer à la sortie le `Seek` qui manque après une recréation de flux
     /// (#2893). Voir [`replay_needs_output_seek`] pour la règle de décision et
     /// la raison pour laquelle elle n'est ni « toujours », ni « jamais ».
@@ -2705,6 +2752,26 @@ impl PlaybackOrchestrator {
                 && let Err(e) = output.lock().await.seek(position_ms).await
             {
                 warn!(zone_id, position_ms, error = %e, "agent_depart_du_flux_non_note");
+            }
+            return;
+        }
+        // #7972 — même contrat pour une zone AirPlay 2 rétablie à la position
+        // après une pause : le flux décodé commence à `position_ms`
+        // ([`airplay2_relance_a_la_position`]) et le démon compte depuis le
+        // début de son fichier. Sa sortie ne sait pas chercher : on lui dit
+        // seulement où ce flux commence.
+        if output_type == Some(TYPE_SORTIE_AIRPLAY2)
+            && !session_is_range_seekable
+            && position_ms > 0
+        {
+            if let Some(output) = { self.outputs.lock().await.get(did) } {
+                let sortie = output.lock().await;
+                if let Some(airplay2) = sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::airplay2::Airplay2Output>()
+                {
+                    airplay2.noter_le_depart_du_flux(position_ms);
+                }
             }
             return;
         }
@@ -3075,7 +3142,8 @@ impl PlaybackOrchestrator {
     ) -> u32 {
         use crate::audio::soft_mute::{SOFT_MUTE_DEFAULT_MS, SOFT_MUTE_MAX_MS};
         // PURE : le PCM atteint la sortie intact, aucune rampe n'est appliquée.
-        if crate::audio::audiophile::zone_enabled(db, zone_id) {
+        // #8513 — ni pendant une mesure de pièce.
+        if crate::audio::audiophile::traitements_contournes(db, zone_id) {
             return 0;
         }
         crate::db::settings_repo::SettingsRepo::with_backend(db.clone())

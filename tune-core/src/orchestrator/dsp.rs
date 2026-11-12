@@ -30,6 +30,68 @@ pub enum PorteeDuReglage {
     RienNeJoue,
 }
 
+/// #8422 — qui demande une relance du flux réseau.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaisonDeRelance {
+    /// Un réglage (égaliseur, crossfeed, compensation…) : `eq_change`.
+    Reglage,
+    /// Une bascule du mode PURE, annoncée aux télécommandes.
+    BasculePure,
+}
+
+impl RaisonDeRelance {
+    /// La raison écrite dans `zone_replayed_at_position`.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Reglage => "eq_change",
+            Self::BasculePure => "pure_bascule",
+        }
+    }
+}
+
+/// #8422 — au-delà, le dernier relevé du sondeur est trop vieux pour qu'on
+/// en déduise la position : on reprend à la valeur mesurée, comme avant.
+pub(crate) const EXTRAPOLATION_MAX_MS: u64 = 3_000;
+
+/// #8422 — la position EN COURS d'une zone qui joue : le dernier relevé du
+/// sondeur (une fois par seconde environ), plus le temps joué depuis qu'il a
+/// avancé. Sans cela la relance reprenait jusqu'à une seconde et demie en
+/// arrière (relevé + anti-rebond de 500 ms). Pas d'extrapolation hors
+/// lecture, sans relevé, après un `seek` (qui l'efface) ni au-delà de
+/// [`EXTRAPOLATION_MAX_MS`] ; jamais au-delà de la fin de la piste.
+pub(crate) fn position_a_reprendre(etat: &crate::playback::ZoneState) -> u64 {
+    let mesuree = etat.position_ms.max(0) as u64;
+    if etat.state != crate::playback::PlayState::Playing {
+        return mesuree;
+    }
+    let Some(avance) = etat.derniere_avance_de_position else {
+        return mesuree;
+    };
+    let ecoule = avance.elapsed().as_millis() as u64;
+    if ecoule > EXTRAPOLATION_MAX_MS {
+        return mesuree;
+    }
+    let estimee = mesuree + ecoule;
+    match etat.now_playing.as_ref().map(|np| np.duration_ms) {
+        Some(duree) if duree > 0 => estimee.min((duree as u64).saturating_sub(1_000).max(mesuree)),
+        _ => estimee,
+    }
+}
+
+/// #8422 — `2:31`, `1:02:05` : la position telle que l'écran l'affiche.
+pub(crate) fn position_lisible(position_ms: u64) -> String {
+    let s = position_ms / 1000;
+    let (h, m, s) = (s / 3600, (s / 60) % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// #8422 — le code stable de l'avis « bascule PURE, reprise à … ».
+pub(crate) const AVIS_REPRISE_PURE: &str = "pure_resumed_at_position";
+
 impl PorteeDuReglage {
     /// Le mot publié dans les réponses (`portee`).
     pub fn code(self) -> &'static str {
@@ -1197,6 +1259,75 @@ impl PlaybackOrchestrator {
         Ok(())
     }
 
+    /// #8422 — appliquer une bascule PURE DANS le flux réseau qui joue, sans
+    /// refaire la session UPnP (`dlna_stop` + `dlna_play`, la coupure du
+    /// Marantz ND8006, fil 1771). `Err(raison)` quand c'est impossible :
+    /// l'appelant retombe alors sur la relance, comme avant.
+    ///
+    /// Possible seulement sur une RADIO décodée par Tune dont le format ne
+    /// dépend d'aucun traitement : ce porteur ne cuit que l'égaliseur (le
+    /// crossfeed, la correction de pièce, les greffons tiers et le
+    /// ReplayGain n'y entrent jamais), et son format est celui de la
+    /// station, PURE ou non. Basculer PURE n'y change donc QUE l'égaliseur :
+    /// - entrée en PURE : l'égaliseur est coupé et le préampli gardé remonte
+    ///   jusqu'au signal sec ([`super::eq_en_vol::EqEnVol::poser_vers_le_sec`]) :
+    ///   au bout de la rampe (fondu de 300 ms, puis remontée à 2 dB/s, soit
+    ///   quelques secondes pour une réserve de plusieurs dB), plus aucun étage
+    ///   ne touche les échantillons ; avant, aucune marche de niveau ;
+    /// - sortie de PURE : l'égaliseur enregistré revient par le fondu de #5215.
+    ///
+    /// Impossible :
+    /// - `flux_sans_poste_de_releve` / `porteur_termine` : comme
+    ///   [`Self::poser_l_eq_en_vol`] ;
+    /// - `porteur_cuit_d_autres_etages` : relais DSP progressif d'un fichier,
+    ///   qui cuit aussi crossfeed, correction et compensation, à un format que
+    ///   PURE ne garderait pas ;
+    /// - `format_depend_du_traitement` : radio que Tune ne décode que pour son
+    ///   égaliseur ; en PURE, une lecture fraîche la passerait telle quelle.
+    pub(super) fn basculer_pure_en_vol(
+        &self,
+        zone_id: i64,
+        np: &crate::playback::NowPlaying,
+    ) -> Result<(), &'static str> {
+        let Some(sid) = np.stream_id.as_deref() else {
+            return Err("flux_sans_poste_de_releve");
+        };
+        let Some(poste) = self.poste_eq_en_vol(zone_id, sid) else {
+            return Err("flux_sans_poste_de_releve");
+        };
+        if std::sync::Arc::strong_count(&poste) < 2 {
+            return Err("porteur_termine");
+        }
+        if !poste.cuit_seulement_l_egaliseur {
+            return Err("porteur_cuit_d_autres_etages");
+        }
+        if !poste.format_independant_du_traitement {
+            return Err("format_depend_du_traitement");
+        }
+        let pure = self.zone_audiophile(zone_id);
+        if pure {
+            poste.poser_vers_le_sec();
+        } else {
+            poste.poser(
+                self.load_eq_profile(zone_id)
+                    .filter(|p| crate::audio::eq::EqProcessor::new(p, 44_100, 2).is_enabled()),
+            );
+        }
+        self.noter_traitement_du_flux(
+            zone_id,
+            sid,
+            self.empreinte_du_traitement(zone_id, np.track_id),
+        );
+        info!(
+            zone_id,
+            stream_id = sid,
+            pure,
+            depots = poste.poses(),
+            "pure_en_vol_depose"
+        );
+        Ok(())
+    }
+
     /// L'empreinte de [`Self::empreinte_du_traitement`] sans son champ `eq=` :
     /// ce que la relève en vol ne change pas.
     fn empreinte_hors_egaliseur(empreinte: &str) -> String {
@@ -1376,6 +1507,16 @@ impl PlaybackOrchestrator {
     /// **Ne programme rien quand la position de la zone n'est pas mesurée**
     /// (#2595) : voir `Self::position_entretenue_par_le_sondeur`.
     pub fn schedule_eq_replay(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        self.schedule_replay_pour(zone_id, RaisonDeRelance::Reglage)
+    }
+
+    /// #8422 — [`Self::schedule_eq_replay`], en disant QUI relance : une
+    /// bascule PURE annonce aux télécommandes la position de reprise.
+    pub(super) fn schedule_replay_pour(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+        raison: RaisonDeRelance,
+    ) -> bool {
         // #2595 — ne pas rejouer à une position INCONNUE.
         //
         // Ce redémarrage ne vaut que par sa promesse : reprendre là où on en
@@ -1436,9 +1577,11 @@ impl PlaybackOrchestrator {
                 info!(zone_id, etat = ?etat.state, "eq_replay_skipped_zone_pas_en_lecture");
                 return;
             }
-            let position_ms = etat.position_ms.max(0) as u64;
+            // #8422 — la position EN COURS, pas celle du dernier relevé du
+            // sondeur : le temps joué depuis compte.
+            let position_ms = position_a_reprendre(&etat);
             match moi
-                .replay_zone_at_position(zone_id, position_ms, "eq_change")
+                .replay_zone_at_position(zone_id, position_ms, raison.code())
                 .await
             {
                 Ok(()) => {
@@ -1446,12 +1589,47 @@ impl PlaybackOrchestrator {
                         .lock()
                         .unwrap()
                         .insert(zone_id, std::time::Instant::now());
-                    info!(zone_id, position_ms, "eq_replay_done");
+                    info!(
+                        zone_id,
+                        position_ms,
+                        mesuree_ms = etat.position_ms,
+                        "eq_replay_done"
+                    );
+                    // Une radio n'a pas de position : rien à annoncer.
+                    let piste = etat
+                        .now_playing
+                        .as_ref()
+                        .is_some_and(|np| np.duration_ms > 0);
+                    if raison == RaisonDeRelance::BasculePure && piste {
+                        moi.annoncer_la_reprise_pure(zone_id, position_ms);
+                    }
                 }
                 Err(e) => warn!(zone_id, error = %e, "eq_replay_failed"),
             }
         });
         true
+    }
+
+    /// #8422 — dire aux télécommandes qu'une bascule PURE a relancé le flux,
+    /// et à quelle position : un avis, pas une erreur (`fatal: false`), émis
+    /// UNE fois par relance réussie. `code` est stable ; `message` est le
+    /// repli en anglais des clients qui ne le traduisent pas.
+    pub(super) fn annoncer_la_reprise_pure(&self, zone_id: i64, position_ms: u64) {
+        let position = position_lisible(position_ms);
+        info!(zone_id, position_ms, %position, "pure_bascule_reprise_annoncee");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit_typed(
+                crate::event_types::EventType::ZoneNotice,
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "code": AVIS_REPRISE_PURE,
+                    "position_ms": position_ms,
+                    "position": position,
+                    "message": format!("PURE switch: resumed at {position}"),
+                    "fatal": false,
+                }),
+            );
+        }
     }
 
     /// Réappliquer le crossfeed d'une zone à la sortie locale qui joue, sans
@@ -2741,7 +2919,8 @@ impl PlaybackOrchestrator {
         zone_id: i64,
     ) -> bool {
         // PURE : le PCM atteint la sortie intact, aucun repli n'est appliqué.
-        if crate::audio::audiophile::zone_enabled(db, zone_id) {
+        // #8513 — pendant une mesure de pièce non plus.
+        if crate::audio::audiophile::traitements_contournes(db, zone_id) {
             return false;
         }
         Self::zone_mono_downmix_configure_with(db, zone_id)

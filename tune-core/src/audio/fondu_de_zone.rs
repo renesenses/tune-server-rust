@@ -54,7 +54,8 @@ pub fn duree_reglee_s(db: &Arc<dyn DbBackend>, zone_id: i64) -> f64 {
 /// en bit-perfect strict, quel que soit le réglage.
 #[must_use]
 pub fn duree_appliquee_ms(db: &Arc<dyn DbBackend>, zone_id: i64) -> u32 {
-    if super::audiophile::zone_enabled(db, zone_id)
+    // #8513 — ni pendant une mesure de pièce : la rampe mangerait le balayage.
+    if super::audiophile::traitements_contournes(db, zone_id)
         || super::bitperfect_strict::zone_enabled(db, zone_id)
     {
         return 0;
