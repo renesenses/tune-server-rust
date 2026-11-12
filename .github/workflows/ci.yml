@@ -314,6 +314,7 @@ jobs:
         timeout-minutes: 18
         run: |
           for essai in 1 2 3; do
+            bash scripts/ci/apt-robuste.sh
             if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
               exit 0
             fi
@@ -372,6 +373,7 @@ jobs:
         timeout-minutes: 18
         run: |
           for essai in 1 2 3; do
+            bash scripts/ci/apt-robuste.sh
             if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
               exit 0
             fi
@@ -538,6 +540,7 @@ jobs:
           # defaut et githubstatus ne declare rien : sans garde-fou, une panne
           # de miroir passagere coute une version entiere.
           for essai in 1 2 3; do
+            bash scripts/ci/apt-robuste.sh
             if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
               echo "libasound2-dev installe (essai $essai)"
               exit 0
@@ -721,6 +724,7 @@ jobs:
         timeout-minutes: 18
         run: |
           for essai in 1 2 3; do
+            bash scripts/ci/apt-robuste.sh
             if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
               exit 0
             fi
@@ -900,6 +904,7 @@ jobs:
         timeout-minutes: 16
         run: |
           for essai in 1 2 3; do
+            bash scripts/ci/apt-robuste.sh
             if timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y libasound2-dev; then
               echo "libasound2-dev installe (essai $essai)"
               exit 0
