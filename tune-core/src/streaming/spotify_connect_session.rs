@@ -60,6 +60,29 @@ pub const SOURCE: &str = "spotify-connect";
 pub const SOURCE_ID: &str = "session";
 /// #8565 — le code rendu par le statut quand la zone exposée n'existe plus.
 pub const CODE_ZONE_EXPOSEE_ABSENTE: &str = "exposed_zone_missing";
+
+/// #8580 — la zone exposée a refusé la session : plafond de zones de
+/// l'offre gratuite (`free_zone_cap:…`).
+pub const CODE_PLAFOND_DE_ZONES: &str = "zone_cap_reached";
+/// #8580 — la zone exposée a refusé la session : contrôle parental (hors
+/// des plages, budget épuisé, contenu explicite).
+pub const CODE_REFUS_PARENTAL: &str = "parental_refused";
+
+/// #8580 — un refus de lecture de la zone exposée, rendu par un CODE STABLE
+/// que l'écran traduit (`session_error`), au lieu d'une sentinelle interne
+/// (`free_zone_cap:2:1`, `parental_lease_refused:…`). Tout autre motif est
+/// rendu tel quel.
+pub fn code_de_refus_de_session(erreur: &str) -> String {
+    if erreur.contains("free_zone_cap:") {
+        CODE_PLAFOND_DE_ZONES.into()
+    } else if erreur.contains(crate::db::bail_d_ecoute::SENTINELLE)
+        || erreur.contains(crate::db::politique_parentale::CODE_REFUS_EXPLICITE)
+    {
+        CODE_REFUS_PARENTAL.into()
+    } else {
+        erreur.to_string()
+    }
+}
 /// Le titre affiché tant que librespot n'a pas nommé le morceau.
 pub const TITRE_PAR_DEFAUT: &str = "Spotify Connect";
 /// Les évènements de volume reçus juste après l'ouverture sont ceux de la
@@ -126,6 +149,9 @@ pub struct EtatSession {
     en_pause: bool,
     ouverte_a: Option<Instant>,
     morceau: Morceau,
+    /// #8580 — le lancement de librespot sous lequel la session a été
+    /// ouverte ([`SpotifyConnectManager::lancement_de_librespot`]).
+    lancement: Option<u64>,
 }
 
 impl EtatSession {
@@ -136,6 +162,7 @@ impl EtatSession {
         self.zone = None;
         self.en_pause = false;
         self.ouverte_a = None;
+        self.lancement = None;
     }
 }
 
@@ -285,6 +312,20 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
     pub async fn traiter(&self, etat: &mut EtatSession, ev: &EvenementLibrespot) {
         let zone_exposee = self.recepteur.zone_exposee().await;
         let pompe = self.recepteur.pompe();
+        // #8580 — une session MORTE ne reste pas ouverte : la zone a été
+        // arrêtée (ou reprise) dans Tune, ou librespot a été relancé
+        // (renommage, plantage, relance pour la liaison). Sans cela,
+        // `etat.zone` restait rempli et Lecture / Suivant dans l'application
+        // Spotify ne rouvrait plus rien : aucun son. L'état est fermé, et le
+        // `playing` qui suit rouvre la session.
+        if let Some(zone_id) = etat.zone
+            && !pompe.consommateur_de_tune()
+            && (etat.lancement != Some(self.recepteur.lancement_de_librespot())
+                || !self.zones.joue_la_session(zone_id).await)
+        {
+            info!(zone_id, evenement = %ev.evenement, "spotify_connect_session_morte_refermee");
+            etat.fermer();
+        }
         let actions = decider(
             etat,
             ev,
@@ -297,6 +338,7 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
                 Action::Ouvrir { zone_id, morceau } => {
                     match self.zones.ouvrir(zone_id, &morceau).await {
                         Ok(()) => {
+                            etat.lancement = Some(self.recepteur.lancement_de_librespot());
                             self.recepteur.noter_erreur_de_session(None);
                             info!(zone_id, piste = ?morceau.piste, "spotify_connect_session_ouverte");
                         }
@@ -371,12 +413,16 @@ impl ZonesConnect for ZonesDeLOrchestrateur {
             cover_url: morceau.pochette.clone(),
             ..Default::default()
         };
-        let r = self.0.play_transfere_sans_historique(req).await?;
+        let r = self
+            .0
+            .play_transfere_sans_historique(req)
+            .await
+            .map_err(|e| code_de_refus_de_session(&e))?;
         if let Some(refus) = r.sortie_refusee() {
             return Err(refus.to_string());
         }
         if let Some(e) = r.error {
-            return Err(e);
+            return Err(code_de_refus_de_session(&e));
         }
         Ok(())
     }

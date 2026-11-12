@@ -575,6 +575,10 @@ pub struct LibrespotDaemon {
     /// #8565 — où chaque évènement de librespot est AUSSI remis, entier :
     /// le pilote des sessions Spotify Connect.
     relais: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<EvenementLibrespot>>>>,
+    /// #8580 — numéro du lancement courant de librespot (un de plus à chaque
+    /// démarrage) : une session Connect ouverte sous un AUTRE lancement est
+    /// morte (renommage, plantage, relance pour la liaison).
+    lancements: AtomicU64,
 }
 
 /// #6933 — une ligne de stderr de librespot est-elle une erreur ? Le format
@@ -600,8 +604,19 @@ pub const CODE_PREMIUM_EXIGE: &str = "spotify_premium_required";
 /// #8565 — une ligne (ou une erreur) de librespot dit-elle que le compte
 /// n'est pas Premium ? librespot nomme le refus `PremiumAccountRequired`
 /// (code d'échec de connexion de Spotify) ou parle de « premium ».
+///
+/// STRICT : une ligne d'information qui cite « premium » (nom d'offre,
+/// bannière) n'est pas un refus, et ne doit pas écraser `derniere_erreur`
+/// d'un compte Premium. Même prédicat que `spotify_lecture::est_un_refus_premium`
+/// (#8577) : librespot 0.8.0 (« Premium account required »), ses versions
+/// antérieures (`PremiumAccountRequired`), l'API Web (`PREMIUM_REQUIRED`,
+/// « Premium required »).
 pub fn exige_premium(ligne: &str) -> bool {
-    ligne.to_ascii_lowercase().contains("premium")
+    let bas = ligne.to_lowercase();
+    bas.contains("premium account required")
+        || bas.contains("premiumaccountrequired")
+        || bas.contains("premium_required")
+        || bas.contains("premium required")
 }
 
 impl LibrespotDaemon {
@@ -618,6 +633,7 @@ impl LibrespotDaemon {
             dossier_identifiants: None,
             dernier_lance: std::sync::Mutex::new(None),
             relais: Arc::new(std::sync::Mutex::new(None)),
+            lancements: AtomicU64::new(0),
         }
     }
 
@@ -867,6 +883,7 @@ impl LibrespotDaemon {
         self.connecte_par_jeton
             .store(jeton.is_some() || par_cache, Ordering::SeqCst);
 
+        self.lancements.fetch_add(1, Ordering::SeqCst);
         info!(device = %self.device_name, "librespot_started");
         *self.process.lock().await = Some(proc);
         Ok(())
@@ -1000,6 +1017,12 @@ impl SpotifyConnectManager {
         if let Ok(mut r) = self.daemon.relais.lock() {
             *r = Some(tx);
         }
+    }
+
+    /// #8580 — le numéro du lancement courant de librespot (0 : jamais
+    /// lancé).
+    pub fn lancement_de_librespot(&self) -> u64 {
+        self.daemon.lancements.load(Ordering::SeqCst)
     }
 
     /// #8565 — retient pourquoi la session n'a pas pu jouer (`None` : elle
