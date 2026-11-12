@@ -316,12 +316,10 @@ done
         assert!(recepteur.pompe().consommateur_continu());
         assert!(!recepteur.pompe().consommateur_de_tune());
         let un = OCTETS_PAR_SECONDE / 4;
-        ordonner(
-            dossier.path(),
-            &format!("pcm {un}\nev end_of_track a\npcm {un}\n"),
-        );
         let mut lecteur = flux.lecteur;
-        let lu = tokio::task::spawn_blocking(move || {
+        // Le lecteur tourne AVANT que librespot n'écrive : il doit servir du
+        // silence en attendant.
+        let lecture = tokio::task::spawn_blocking(move || {
             let mut pcm = 0usize;
             let mut silence = 0usize;
             let mut tampon = vec![0u8; 8192];
@@ -334,11 +332,62 @@ done
                 silence += tampon[..n].iter().filter(|&&o| o == 0).count();
             }
             (pcm, silence)
-        })
-        .await
-        .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        ordonner(
+            dossier.path(),
+            &format!("pcm {un}\nev end_of_track a\npcm {un}\n"),
+        );
+        let lu = lecture.await.unwrap();
         recepteur.disable().await;
         assert_eq!(lu.0, 2 * un, "les deux titres arrivent en entier");
         assert!(lu.1 > 0, "du silence comble l'attente du premier octet");
     }
+}
+
+/// #8565 — un compte gratuit : le statut le dit par un code stable, au lieu
+/// d'un récepteur qui « joue » en silence.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn premium_8565_un_compte_gratuit_est_dit_par_le_statut() {
+    use std::os::unix::fs::PermissionsExt;
+    let dossier = tempfile::tempdir().unwrap();
+    let bin = dossier.path().join("librespot");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\necho '[2026-11-12T12:00:00Z ERROR librespot] could not initialize spirc: Permission denied { PremiumAccountRequired }' >&2\nexec sleep 30\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let recepteur = SpotifyConnectManager::avec_binaire(
+        "Tune".into(),
+        0,
+        Some(bin.to_string_lossy().into_owned()),
+    );
+    assert!(recepteur.status().await["receiver_error_code"].is_null());
+    recepteur.enable(1).await.unwrap();
+    let mut code = serde_json::Value::Null;
+    for _ in 0..100 {
+        code = recepteur.status().await["receiver_error_code"].clone();
+        if !code.is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    recepteur.disable().await;
+    assert_eq!(code, crate::streaming::spotify_connect::CODE_PREMIUM_EXIGE);
+}
+
+#[test]
+fn premium_8565_les_lignes_de_librespot_reconnues() {
+    use crate::streaming::spotify_connect::exige_premium;
+    assert!(exige_premium(
+        "Permission denied { PremiumAccountRequired }"
+    ));
+    assert!(exige_premium(
+        "[.. WARN librespot] Premium account required"
+    ));
+    assert!(!exige_premium(
+        "could not initialize spirc: INVALID_CREDENTIALS"
+    ));
 }

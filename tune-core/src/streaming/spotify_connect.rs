@@ -593,6 +593,17 @@ pub fn ligne_d_erreur_librespot(ligne: &str) -> Option<String> {
     None
 }
 
+/// #8565 — le code rendu par le statut quand Spotify refuse le compte
+/// parce qu'il n'est pas Premium : Spotify Connect par librespot l'exige.
+pub const CODE_PREMIUM_EXIGE: &str = "spotify_premium_required";
+
+/// #8565 — une ligne (ou une erreur) de librespot dit-elle que le compte
+/// n'est pas Premium ? librespot nomme le refus `PremiumAccountRequired`
+/// (code d'échec de connexion de Spotify) ou parle de « premium ».
+pub fn exige_premium(ligne: &str) -> bool {
+    ligne.to_ascii_lowercase().contains("premium")
+}
+
 impl LibrespotDaemon {
     pub fn new(device_name: String, binary_path: Option<String>, bitrate: Option<u32>) -> Self {
         Self {
@@ -836,6 +847,14 @@ impl LibrespotDaemon {
                         warn!(erreur = %erreur, "librespot_erreur");
                         if let Ok(mut e) = derniere_erreur.lock() {
                             *e = Some(erreur);
+                        }
+                    } else if exige_premium(&line) {
+                        // #8565 — un compte gratuit : librespot le dit à un
+                        // autre niveau que ERROR ; retenu quand même, pour
+                        // que l'écran dise « Premium exigé ».
+                        warn!(ligne = %line, "librespot_premium_exige");
+                        if let Ok(mut e) = derniere_erreur.lock() {
+                            *e = Some(line.trim().to_string());
                         }
                     } else if let Some((event, track_id)) = parse_librespot_event(&line) {
                         on_event(event, track_id);
@@ -1128,6 +1147,12 @@ impl SpotifyConnectManager {
             // #8565 — la dernière session lancée depuis l'application Spotify
             // n'a pas pu jouer dans la zone exposée : pourquoi.
             "session_error": self.erreur_de_session.lock().ok().and_then(|e| e.clone()),
+            // #8565 — un refus que l'écran sait dire : compte non Premium.
+            "receiver_error_code": self
+                .daemon
+                .derniere_erreur()
+                .filter(|e| exige_premium(e))
+                .map(|_| CODE_PREMIUM_EXIGE),
         })
     }
 }
