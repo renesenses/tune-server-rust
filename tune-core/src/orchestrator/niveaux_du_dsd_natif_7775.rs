@@ -13,8 +13,12 @@ fn orchestrateur() -> (PlaybackOrchestrator, Arc<EventBus>) {
         Arc::new(db),
         Arc::new(PlaybackManager::new()),
         Arc::new(crate::http::streamer::AudioStreamer::new(0)),
-        Arc::new(tokio::sync::Mutex::new(crate::streaming::registry::ServiceRegistry::new())),
-        Arc::new(tokio::sync::Mutex::new(crate::outputs::registry::OutputRegistry::new())),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::streaming::registry::ServiceRegistry::new(),
+        )),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::outputs::registry::OutputRegistry::new(),
+        )),
         None,
     );
     let bus = Arc::new(EventBus::new());
@@ -30,32 +34,59 @@ async fn premiere_trame(
     tokio::time::timeout(attente, async {
         loop {
             match rx.recv().await {
-                Ok(ev) if ev.event_type == "playback.audio_levels" && ev.data["zone_id"] == zone => return ev.data,
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                Ok(ev)
+                    if ev.event_type == "playback.audio_levels" && ev.data["zone_id"] == zone =>
+                {
+                    return ev.data;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(e) => panic!("bus fermé : {e}"),
             }
         }
-    }).await.ok()
+    })
+    .await
+    .ok()
 }
 
-async fn observer(zone: i64, debut_fichier: u64, seek: u64, prewarm: bool) -> Option<serde_json::Value> {
+async fn observer(
+    zone: i64,
+    debut_fichier: u64,
+    seek: u64,
+    prewarm: bool,
+) -> Option<serde_json::Value> {
     let dossier = tempfile::tempdir().unwrap();
     let dsf = dossier.path().join("source.dsf");
     crate::audio::decode::dop_deplacement_tests_6456::ecrire_dsf(
-        &dsf, 4 * crate::audio::decode::dop_deplacement_tests_6456::OCTETS_PAR_SECONDE,
+        &dsf,
+        4 * crate::audio::decode::dop_deplacement_tests_6456::OCTETS_PAR_SECONDE,
     );
     let (orch, bus) = orchestrateur();
     let mut rx = bus.subscribe();
     orch.playback.play(zone, NowPlaying::default()).await;
     orch.playback.seek(zone, seek as i64).await;
-    let requete = PlayRequest { zone_id: zone, seek_ms: Some(seek), ..Default::default() };
+    let requete = PlayRequest {
+        zone_id: zone,
+        seek_ms: Some(seek),
+        ..Default::default()
+    };
     let mut piste = crate::db::models::Track::new("DSD témoin".into());
     piste.duration_ms = 4_000;
     let _prewarm = prewarm.then(|| orch.begin_levels_prewarm(zone));
-    let resolu = orch.servir_le_dsd_natif(
-        &requete, &piste, dsf.to_str().unwrap().to_string(), 2_822_400, 2,
-        crate::audio::dsd_brut::Fenetre { debut_ms: debut_fichier, fin_ms: Some(4_000) },
-    ).await.unwrap().unwrap();
+    let resolu = orch
+        .servir_le_dsd_natif(
+            &requete,
+            &piste,
+            dsf.to_str().unwrap().to_string(),
+            2_822_400,
+            2,
+            crate::audio::dsd_brut::Fenetre {
+                debut_ms: debut_fichier,
+                fin_ms: Some(4_000),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
     // Le service reste natif, pas remplacé par la sonde PCM.
     assert_eq!(resolu.mime_type, crate::audio::dsd_brut::MIME);
     assert_eq!(resolu.bit_depth, Some(1));
@@ -70,17 +101,28 @@ async fn observer(zone: i64, debut_fichier: u64, seek: u64, prewarm: bool) -> Op
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dsd_natif_7775_publie_des_niveaux_reels() {
-    let vue = observer(987_775, 0, 0, false).await
-        .expect("#7775 : le service DSD natif ne publie aucun niveau, VU et spectre restent à plat");
+    let vue = observer(987_775, 0, 0, false).await.expect(
+        "#7775 : le service DSD natif ne publie aucun niveau, VU et spectre restent à plat",
+    );
     assert_eq!(vue["position_ms"], 0);
-    assert!(vue["peak_left_db"].as_f64().unwrap() > -90.0, "la sonde doit mesurer la source DSD");
-    assert!(vue["spectrum"].as_array().unwrap().iter().any(|v| v.as_f64().unwrap() > 0.0));
+    assert!(
+        vue["peak_left_db"].as_f64().unwrap() > -90.0,
+        "la sonde doit mesurer la source DSD"
+    );
+    assert!(
+        vue["spectrum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_f64().unwrap() > 0.0)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dsd_natif_7775_seek_et_cue_gardent_l_horloge_de_la_piste() {
     // Le fichier part à 2 s (tranche à 1 s + seek de 1 s), la piste à 1 s.
-    let vue = observer(987_776, 2_000, 1_000, false).await
+    let vue = observer(987_776, 2_000, 1_000, false)
+        .await
         .expect("#7775 : aucun niveau après déplacement en DSD natif");
     assert_eq!(vue["position_ms"], 1_000);
     assert!(vue["peak_left_db"].as_f64().unwrap() > -90.0);
@@ -88,6 +130,8 @@ async fn dsd_natif_7775_seek_et_cue_gardent_l_horloge_de_la_piste() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dsd_natif_7775_la_preparation_ne_publie_pas_la_piste_suivante() {
-    assert!(observer(987_777, 0, 0, true).await.is_none(),
-        "une session seulement préparée ne doit pas remplacer les niveaux de la piste en cours");
+    assert!(
+        observer(987_777, 0, 0, true).await.is_none(),
+        "une session seulement préparée ne doit pas remplacer les niveaux de la piste en cours"
+    );
 }

@@ -1272,7 +1272,14 @@ impl PlaybackOrchestrator {
                         },
                     };
                     return self
-                        .servir_le_dsd_natif(req, track, file_path.to_string(), cadence, canaux, fenetre)
+                        .servir_le_dsd_natif(
+                            req,
+                            track,
+                            file_path.to_string(),
+                            cadence,
+                            canaux,
+                            fenetre,
+                        )
                         .await;
                 }
                 Err(motif) => motif_natif = Some(motif),
