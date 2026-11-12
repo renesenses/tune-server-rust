@@ -458,3 +458,86 @@ fn la_lecture_des_pistes_coupe_l_instrument_comme_le_scan_7766() {
         "#7766 — `parse_credits` ne découpe pas comme `nom_et_instrument`"
     );
 }
+
+/// #8325 — BAND est l'orchestre d'un classique, mais l'artiste d'album chez
+/// foobar2000 / Mp3tag (TPE2) : il n'entre dans `ensemble` que s'il diffère
+/// de l'artiste d'album, qui n'est jamais touché.
+#[test]
+fn band_n_est_un_ensemble_que_s_il_n_est_pas_l_artiste_d_album_8325() {
+    use super::credits_balises::completer_par_band;
+    let mut meta = m(&[]);
+    completer_par_band(
+        &mut meta,
+        &[("BAND".into(), "Wiener Philharmoniker".into())],
+        &[Some("Carlos Kleiber"), Some("Carlos Kleiber")],
+    );
+    assert_eq!(
+        meta.get("ensemble").map(String::as_str),
+        Some("Wiener Philharmoniker")
+    );
+
+    let mut meta = m(&[("ensemble", "Wiener Singverein")]);
+    completer_par_band(
+        &mut meta,
+        &[("TXXX:band".into(), "Berliner Philharmoniker".into())],
+        &[None, Some("Herbert von Karajan")],
+    );
+    assert_eq!(
+        meta.get("ensemble").map(String::as_str),
+        Some("Wiener Singverein; Berliner Philharmoniker"),
+        "sans artiste d'album, BAND complète l'ensemble"
+    );
+
+    let mut meta = m(&[]);
+    completer_par_band(
+        &mut meta,
+        &[("BAND".into(), "the beatles".into())],
+        &[Some("The Beatles"), None],
+    );
+    assert!(
+        !meta.contains_key("ensemble"),
+        "BAND égal à l'artiste d'album n'est pas un ensemble : {meta:?}"
+    );
+
+    // Un disque de rock balisé BAND sans ALBUMARTIST : BAND est l'artiste
+    // de la piste, pas un ensemble.
+    let mut meta = m(&[]);
+    completer_par_band(
+        &mut meta,
+        &[("BAND".into(), "Pink Floyd".into())],
+        &[None, Some("Pink Floyd")],
+    );
+    assert!(
+        !meta.contains_key("ensemble"),
+        "BAND égal à l'artiste de la piste n'est pas un ensemble : {meta:?}"
+    );
+    assert!(!meta.contains_key("album_artist"));
+}
+
+/// #8325 — contexte classique : compositeur ET (chef OU œuvre). BAND y est
+/// l'ensemble même s'il égale l'artiste d'album ; hors de ce contexte, la
+/// règle d'avant tient.
+#[test]
+fn band_egal_a_l_artiste_d_album_compte_en_contexte_classique_8325() {
+    use super::credits_balises::completer_par_band;
+    let band = [("BAND".to_string(), "Wiener Philharmoniker".to_string())];
+    let artistes = [Some("Wiener Philharmoniker"), Some("Wiener Philharmoniker")];
+    for (contexte, attendu) in [
+        (
+            vec![("composer", "Mozart"), ("conductor", "Karl Böhm")],
+            true,
+        ),
+        (vec![("composer", "Mozart"), ("work", "Requiem")], true),
+        (vec![("composer", "Mozart")], false),
+        (vec![("conductor", "Karl Böhm")], false),
+    ] {
+        let mut meta = m(&contexte);
+        completer_par_band(&mut meta, &band, &artistes);
+        assert_eq!(
+            meta.get("ensemble").map(String::as_str),
+            attendu.then_some("Wiener Philharmoniker"),
+            "{contexte:?}"
+        );
+        assert!(!meta.contains_key("album_artist"));
+    }
+}

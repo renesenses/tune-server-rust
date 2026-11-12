@@ -117,15 +117,28 @@ pub(super) fn joindre_dr_par_piste(
     // remaster…), lues au scan (`read_extended_metadata`). Même contrat que
     // le DR : la clé est ABSENTE quand le fichier ne porte pas la balise.
     let (original_date, version) = super::albums::date_originale_et_version(&meta_repo, &track_ids);
-    let mut items = super::albums::attach_track_tags(
-        items,
-        &[
-            ("dynamic_range", &dr),
-            ("dynamic_range_source", &dr_source),
-            ("original_date", &original_date),
-            ("version", &version),
-        ],
-    );
+    // #8325 — chef, ensemble, œuvre et mouvement, pour les colonnes de la
+    // Collection. Même contrat : la clé est ABSENTE quand la piste n'en porte
+    // pas. Une requête par champ et par page, restreinte à ses pistes.
+    use tune_core::db::facettes_classiques::{Champ, valeurs_des_pistes};
+    let classiques: Vec<(&str, std::collections::HashMap<i64, String>)> = Champ::COLONNES
+        .into_iter()
+        .map(|c| {
+            let valeurs = valeurs_des_pistes(&state.backend, c, &track_ids).unwrap_or_else(|e| {
+                tracing::warn!(champ = c.nom(), error = %e, "colonnes_classiques_non_lues");
+                Default::default()
+            });
+            (c.nom(), valeurs)
+        })
+        .collect();
+    let mut etiquettes: Vec<(&str, &std::collections::HashMap<i64, String>)> = vec![
+        ("dynamic_range", &dr),
+        ("dynamic_range_source", &dr_source),
+        ("original_date", &original_date),
+        ("version", &version),
+    ];
+    etiquettes.extend(classiques.iter().map(|(k, v)| (*k, v)));
+    let mut items = super::albums::attach_track_tags(items, &etiquettes);
     // #3518 — « Idéalement sur la même route que les autres listes de pistes,
     // pour que le tableau ait les mêmes colonnes partout » : ce chemin est le
     // seam unique des autres surfaces (`/library/tracks` filtré, non filtré,

@@ -31,6 +31,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_squeezebox_poller(state);
     // #8077 — la passe de fond des apports Qobuz (15 min après, puis 6 h).
     crate::routes::library::apports_qobuz::armer_la_passe(state);
+    // #8325 — une fois : relire WORK / MOVEMENTNAME / BAND des fichiers
+    // déjà importés, sans scan à lancer par l'utilisateur.
+    crate::routes::library::relecture_classique::armer(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
     spawn_dash_temp_gc();

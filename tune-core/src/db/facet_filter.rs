@@ -57,9 +57,13 @@ use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 /// piste : deux valeurs en ET n'y rendraient jamais rien. `?all_of=year` est
 /// donc IGNORÉ, et la facette reste en « Ou » — un filtre qui vide la liste à
 /// coup sûr serait un piège, pas une option.
-pub const FACETTES_COMBINABLES_EN_ET: [&str; 10] = [
+pub const FACETTES_COMBINABLES_EN_ET: [&str; 12] = [
     "genre",
     "composer",
+    // #8325 — deux chefs (chef et chef de chœur), un chœur et un orchestre :
+    // une piste peut en porter plusieurs.
+    "conductor",
+    "ensemble",
     "label",
     "instrument",
     "country",
@@ -546,7 +550,7 @@ impl Placeholders {
 /// changer — la règle de liaison de SQLite (voir le piège n°2) est intacte.
 ///
 /// Pour `n <= 2` le résultat est mot pour mot celui d'avant.
-fn ou_equilibre(mut parts: Vec<String>) -> String {
+pub(crate) fn ou_equilibre(mut parts: Vec<String>) -> String {
     debug_assert!(!parts.is_empty(), "appelé sur une liste non vide seulement");
     while parts.len() > 1 {
         let mut etage = Vec::with_capacity(parts.len().div_ceil(2));
@@ -1305,6 +1309,12 @@ pub struct TrackFilter {
     /// (CRD-6). Une facette de jointure : le prédicat vit dans
     /// [`instrument_exists`], jumeau de `dr_album_in`.
     pub instruments: Vec<String>,
+    /// #8325 — chefs d'orchestre, ensembles / orchestres et œuvres, lus dans
+    /// les magasins ouverts (`track_credits`, `track_metadata`,
+    /// `album_metadata`) : voir [`super::facettes_classiques`].
+    pub conductors: Vec<String>,
+    pub ensembles: Vec<String>,
+    pub works: Vec<String>,
     pub artists: Vec<String>,
     pub countries: Vec<String>,
     /// #8090 — pays de l'artiste principal de l'album (`?artist_country=FR`),
@@ -1398,6 +1408,9 @@ impl TrackFilter {
             || !self.labels.is_empty()
             || !self.composers.is_empty()
             || !self.instruments.is_empty()
+            || !self.conductors.is_empty()
+            || !self.ensembles.is_empty()
+            || !self.works.is_empty()
             || !self.artists.is_empty()
             || !self.countries.is_empty()
             || !self.artist_countries.is_empty()
