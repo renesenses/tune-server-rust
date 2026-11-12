@@ -300,6 +300,29 @@ pub fn router() -> Router<AppState> {
         .route("/episodes/{podcast_id}", get(podcast_episodes))
         .route("/episodes", get(episodes_by_feed_url))
         .route("/play/{zone_id}", post(play_episode_en_tete_du_groupe))
+        // #8170 — la position de chaque épisode commencé, pour la fiche.
+        .route("/positions", get(positions_des_episodes))
+}
+
+#[derive(Deserialize)]
+struct PositionsQuery {
+    /// La zone dont la reprise prime ; sans elle, la plus récente.
+    zone_id: Option<i64>,
+}
+
+/// `GET /podcasts/positions?zone_id=` — #8170 : la position enregistrée de
+/// chaque épisode commencé (`audio_url`, `position_ms`, `duration_ms`,
+/// `updated_at`), un par épisode. La fiche d'un podcast y retrouve ses
+/// épisodes par leur adresse et les relance là où on les a laissés (le recul
+/// de reprise reste l'affaire de la fiche, comme pour web#2730).
+async fn positions_des_episodes(
+    State(state): State<AppState>,
+    Query(q): Query<PositionsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let positions =
+        tune_core::db::listening_resume::positions_des_episodes(&state.backend, q.zone_id)
+            .map_err(AppError::internal)?;
+    Ok(Json(json!({ "positions": positions })))
 }
 async fn search_podcasts(
     State(state): State<AppState>,
@@ -1680,6 +1703,9 @@ mod historique_7965_tests;
 #[cfg(test)]
 #[path = "podcasts/adresses_de_la_selection_6925_tests.rs"]
 mod adresses_de_la_selection_6925_tests;
+#[cfg(test)]
+#[path = "podcasts/positions_des_episodes_8170_tests.rs"]
+mod positions_des_episodes_8170_tests;
 #[cfg(test)]
 #[path = "podcasts/reprise_dlna_8152_tests.rs"]
 mod reprise_dlna_8152_tests;

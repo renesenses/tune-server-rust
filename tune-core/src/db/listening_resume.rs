@@ -487,8 +487,123 @@ pub fn podcast_de_l_adresse(
     }
     Ok(ailleurs)
 }
+/// #8170 — la position enregistrée d'un épisode commencé.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PositionDEpisode {
+    /// L'adresse du média, telle qu'elle a été lancée.
+    pub audio_url: String,
+    pub position_ms: i64,
+    /// La durée connue au lancement ; 0 si inconnue.
+    pub duration_ms: i64,
+    pub updated_at: String,
+}
+
+/// #8170 — inscrit (ou met à jour) la position de l'épisode `url` sur la
+/// zone, dans `podcast_episode_positions` : UNE ligne par épisode et par
+/// zone (clé [`cle_d_episode`]).
+///
+/// `listening_resumes` n'en garde qu'une par podcast et par zone (clé
+/// `(zone, contexte, source)`) : le lancement d'un autre épisode du même
+/// podcast écrasait la reprise du précédent, et la fiche du podcast ne savait
+/// reprendre que le dernier.
+pub fn noter_position_d_episode(
+    db: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    url: &str,
+    position_ms: i64,
+    duree_ms: i64,
+) -> Result<(), String> {
+    let cle = cle_d_episode(url);
+    if cle.is_empty() {
+        return Ok(());
+    }
+    let position = position_ms.max(0);
+    let duree = duree_ms.max(0);
+    let maintenant = chrono::Utc::now().to_rfc3339();
+    db.execute(
+        "INSERT INTO podcast_episode_positions \
+         (zone_id, episode_key, audio_url, position_ms, duration_ms, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(zone_id, episode_key) DO UPDATE SET \
+         audio_url = excluded.audio_url, position_ms = excluded.position_ms, \
+         duration_ms = CASE WHEN excluded.duration_ms > 0 THEN excluded.duration_ms \
+                       ELSE podcast_episode_positions.duration_ms END, \
+         updated_at = excluded.updated_at",
+        &[
+            &zone_id as &dyn ToSqlValue,
+            &cle,
+            &url.trim(),
+            &position,
+            &duree,
+            &maintenant,
+        ],
+    )?;
+    Ok(())
+}
+
+/// #8170 — l'épisode `url` est écouté jusqu'au bout sur la zone : il n'a
+/// plus de position à rendre.
+fn oublier_position_d_episode(
+    db: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    url: &str,
+) -> Result<(), String> {
+    db.execute(
+        "DELETE FROM podcast_episode_positions WHERE zone_id = ? AND episode_key = ?",
+        &[&zone_id as &dyn ToSqlValue, &cle_d_episode(url)],
+    )?;
+    Ok(())
+}
+
+/// #8170 — la position de CHAQUE épisode commencé, un par épisode : celle de
+/// la zone `zone_id` d'abord, sinon la plus récente des autres zones — la
+/// même règle que [`podcast_de_l_adresse`]. De la plus récente à la plus
+/// ancienne. Un épisode terminé n'est pas rendu ([`podcast_termine`]).
+pub fn positions_des_episodes(
+    db: &Arc<dyn DbBackend>,
+    zone_id: Option<i64>,
+) -> Result<Vec<PositionDEpisode>, String> {
+    let lignes = db.query_many(
+        "SELECT zone_id, episode_key, audio_url, position_ms, duration_ms, updated_at \
+         FROM podcast_episode_positions WHERE position_ms > 0 \
+         ORDER BY updated_at DESC, zone_id",
+        &[],
+    )?;
+    let mut par_cle: std::collections::HashMap<String, (bool, usize)> =
+        std::collections::HashMap::new();
+    let mut retenues: Vec<PositionDEpisode> = Vec::new();
+    for l in &lignes {
+        let zone = l.first().and_then(|v| v.as_i64());
+        let Some(cle) = l.get(1).and_then(|v| v.as_string()) else {
+            continue;
+        };
+        let p = PositionDEpisode {
+            audio_url: l.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+            position_ms: l.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+            duration_ms: l.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+            updated_at: l.get(5).and_then(|v| v.as_string()).unwrap_or_default(),
+        };
+        let de_la_zone = zone_id.is_some() && zone == zone_id;
+        match par_cle.get(&cle).copied() {
+            None => {
+                par_cle.insert(cle, (de_la_zone, retenues.len()));
+                retenues.push(p);
+            }
+            // Une ligne plus ancienne ne remplace la retenue que si elle est
+            // celle de la zone et que la retenue ne l'est pas.
+            Some((false, i)) if de_la_zone => {
+                par_cle.insert(cle, (true, i));
+                retenues[i] = p;
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(retenues)
+}
+
 /// Retire la reprise de l'épisode `url` sur cette zone (épisode écouté).
 pub fn podcast_termine(db: &Arc<dyn DbBackend>, zone_id: i64, url: &str) -> Result<usize, String> {
+    oublier_position_d_episode(db, zone_id, url)?;
     let mut retirees = 0;
     for (r, _) in reprises_d_episodes(db, Some(zone_id))?
         .into_iter()
@@ -525,6 +640,11 @@ pub fn podcast_position_avec_duree(
     if episode_fini(position_ms, duree_ms) {
         podcast_termine(db, zone_id, url)?;
         return Ok(());
+    }
+    // #8170 — la position de l'épisode, même quand un autre épisode du
+    // podcast a pris sa place dans « Reprendre l'écoute ».
+    if position_ms > 0 {
+        noter_position_d_episode(db, zone_id, url, position_ms, duree_ms)?;
     }
     if let Some((mut r, _)) = reprises_d_episodes(db, Some(zone_id))?
         .into_iter()
@@ -569,6 +689,9 @@ pub fn podcast_started_in_context(
     // « Reprendre l'écoute » montrait l'épisode quatre fois sur le .18. La
     // reprise de l'épisode déjà écrite sur cette zone garde son contexte, et
     // c'est elle que l'upsert met à jour.
+    // #8170 — chaque épisode garde SA position, à part de la reprise du
+    // podcast, qu'un autre épisode du même podcast remplace.
+    noter_position_d_episode(db, zone_id, url, position_ms, np.duration_ms)?;
     let existante = reprises_d_episodes(db, Some(zone_id))?
         .into_iter()
         .map(|(r, _)| r)

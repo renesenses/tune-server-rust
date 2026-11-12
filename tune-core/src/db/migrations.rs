@@ -2868,6 +2868,18 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "radio_stations_surcharge_locale",
         up: "",
     },
+    // #8170 (suite de #8152 et de tune-web-client#2730) — la position de
+    // CHAQUE épisode de podcast commencé : `podcast_episode_positions`, une
+    // ligne par épisode et par zone. `listening_resumes` n'en garde qu'une par
+    // podcast et par zone (clé `(zone, contexte, source)`) : lancer un autre
+    // épisode du même podcast écrasait la reprise du précédent, et la fiche
+    // du podcast ne savait reprendre que le dernier. Naît vide. Jumelle PG :
+    // 114. Patron `listening_resumes` (135 / PG 100).
+    Migration {
+        version: 148,
+        name: "podcast_episode_positions",
+        up: include_str!("../../migrations/podcast_episode_positions.sql"),
+    },
 ];
 
 /// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
@@ -6100,6 +6112,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "radio_stations_surcharge_locale",
         include_str!("../../migrations/postgres/113_radio_stations_surcharge_locale.sql"),
     ),
+    // Jumelle de la SQLite 148 (#8170) : `podcast_episode_positions`, la
+    // position de chaque épisode de podcast commencé. Naît vide.
+    (
+        114,
+        "podcast_episode_positions",
+        include_str!("../../migrations/postgres/114_podcast_episode_positions.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -8553,6 +8572,66 @@ mod tests {
         );
     }
 
+    /// #8170 — la migration 148 pose `podcast_episode_positions` (la position
+    /// de chaque épisode de podcast commencé), sur une base NEUVE comme sur une
+    /// base MONTÉE juste avant ; la clé primaire est (zone, épisode) ; la
+    /// jumelle PG 114 existe, marque son numéro, et la bascule copie la table.
+    #[test]
+    fn la_migration_148_pose_les_positions_d_episodes_8170() {
+        let cle = |db: &SqliteDb| -> Vec<String> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(podcast_episode_positions)")
+                .unwrap();
+            let mut k: Vec<(i64, String)> = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(5)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .filter(|(pk, _)| *pk > 0)
+                .collect();
+            k.sort();
+            k.into_iter().map(|(_, n)| n).collect()
+        };
+        let attendue = vec!["zone_id".to_string(), "episode_key".to_string()];
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(cle(&neuve), attendue, "base neuve");
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "DROP TABLE podcast_episode_positions;
+                 DELETE FROM _migrations WHERE version >= 148;",
+            )
+            .unwrap();
+        assert!(cle(&montee).is_empty(), "préparation : table retirée");
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert_eq!(cle(&montee), attendue, "base montée sous la 148");
+        montee
+            .execute_batch(
+                "INSERT INTO podcast_episode_positions \
+                 (zone_id, episode_key, audio_url, position_ms, duration_ms, updated_at) \
+                 VALUES (1, 'u', 'u', 5, 0, 't'), (2, 'u', 'u', 5, 0, 't');",
+            )
+            .expect("deux zones, même épisode : deux lignes");
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "114_podcast_episode_positions.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(sql_pg.contains("VALUES (114, 'podcast_episode_positions')"));
+        assert!(sql_pg.contains("PRIMARY KEY (zone_id, episode_key)"));
+        assert!(include_str!("migrations.rs").contains(fichier));
+        let bascule = include_str!("pg_migrate.rs");
+        assert!(bascule.contains("\"podcast_episode_positions\","));
+        assert!(bascule.contains("ON CONFLICT (zone_id, episode_key) DO NOTHING"));
+    }
+
     /// web#916 — la migration 145 pose `suggestions_ecartees` (le « Pas pour
     /// moi » de l'accueil, par profil), sur une base NEUVE comme sur une base
     /// MONTÉE juste avant ; la clé primaire est le quadruplet (profil, type,
@@ -9895,7 +9974,10 @@ mod tests {
         // 113 : `radio_stations_surcharge_locale` (web#2795), jumelle de la
         // SQLite 147. Pose la surcharge locale d'une station de l'annuaire, que
         // la liste et le relevé NOMMENT.
-        assert_eq!(pg_latest_version(), 113, "latest PG migration must be 113");
+        // 114 : `podcast_episode_positions` (#8170), jumelle de la SQLite 148.
+        // Crée la position de chaque épisode de podcast commencé, que la
+        // reprise des podcasts NOMME.
+        assert_eq!(pg_latest_version(), 114, "latest PG migration must be 114");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
