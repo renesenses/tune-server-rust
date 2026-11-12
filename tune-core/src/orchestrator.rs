@@ -2173,6 +2173,10 @@ mod sourdine_a_la_piste_8151;
 mod depart_muet_airplay2_8402;
 #[cfg(test)]
 mod sourdine_a_la_piste_8151_tests;
+// #8165 — un geste de volume lève la sourdine de la zone, sur toutes les sorties.
+mod volume_leve_la_sourdine_8165;
+#[cfg(test)]
+mod volume_leve_la_sourdine_8165_tests;
 // #8437 — groupe mixte : la sortie locale part `sync_delay_ms` plus tard.
 #[cfg(all(test, feature = "local-audio"))]
 mod retard_groupe_mixte_8437_tests;

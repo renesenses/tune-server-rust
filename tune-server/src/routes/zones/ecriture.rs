@@ -325,6 +325,14 @@ async fn commander_la_sortie(
             error,
         ));
     }
+    // #8165 — un geste de volume lève la sourdine, sauf quand ce même PATCH
+    // dit lui-même ce qu'elle doit être (pas de levée puis de remise).
+    if volume_demande.is_some() && body.muted.is_none() {
+        state
+            .orchestrator
+            .lever_la_sourdine_au_geste_de_volume(id, command_device_id)
+            .await;
+    }
     if let Some(muted) = body.muted
         && let Err(error) = state
             .orchestrator
@@ -1606,7 +1614,7 @@ pub(super) async fn update_volume(
             .into_response();
     }
 
-    match state
+    let resultat = state
         .orchestrator
         .set_volume_avec_garde(
             id,
@@ -1614,8 +1622,15 @@ pub(super) async fn update_volume(
             device_id.as_deref(),
             tune_core::audio::garde_de_hausse::Hausse::depuis_confirmation(body.confirm_increase),
         )
-        .await
-    {
+        .await;
+    // #8165 — un geste de volume lève la sourdine de la zone.
+    if resultat.is_ok() {
+        state
+            .orchestrator
+            .lever_la_sourdine_au_geste_de_volume(id, device_id.as_deref())
+            .await;
+    }
+    match resultat {
         // #6721 — 204 comme avant pour une consigne appliquée telle quelle ;
         // 200 et le gain retenu quand la garde l'a plafonnée, pour que le
         // client propose de confirmer (`confirm_increase`).

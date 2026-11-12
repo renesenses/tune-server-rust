@@ -5038,6 +5038,11 @@ async fn set_volume(
         // sans refaire le calcul, et surtout constater quand le verrou PURE
         // l'a remonté à 100 % : `volume_db` vaudra alors 0.
         Ok(retenu) => {
+            // #8165 — un geste de volume lève la sourdine de la zone.
+            state
+                .orchestrator
+                .lever_la_sourdine_au_geste_de_volume(zone_id, device_id.as_deref())
+                .await;
             // #6721 — plafonnée par la garde : `volume` et `volume_db` disent
             // le gain RETENU, et la réponse dit comment confirmer.
             let volume = if retenu.hausse_plafonnee {

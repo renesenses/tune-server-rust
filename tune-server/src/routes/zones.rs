@@ -690,6 +690,9 @@ mod limites_de_volume_6541;
 // #6721 — la garde contre les montées brusques, par le routeur public.
 #[cfg(test)]
 mod garde_de_hausse_6721_tests;
+// #8165 — un geste de volume lève la sourdine, par le routeur public.
+#[cfg(test)]
+mod volume_leve_la_sourdine_8165_tests;
 
 // #5353 — le backend nommé par le chemin du signal est celui de LA sortie.
 mod backend_de_la_sortie_5353;
