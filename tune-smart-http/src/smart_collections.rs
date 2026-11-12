@@ -1409,11 +1409,33 @@ fn execute_album_query(
         .query_many(&sql, liens)
         .map_err(AppError::internal)?;
 
+    // #7903 (fil 2656) — `added_at` (date d'ajout dans Tune, la même que la
+    // liste de la Bibliothèque) : le tri « Ordre d'ajout dans Tune » d'une
+    // collection ouverte se fait à l'écran, sur ces albums. Une requête
+    // groupée pour toute la liste ; un échec la laisse sans date, et le
+    // journal le dit — rien n'est inventé.
+    let ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+        .collect();
+    let ajouts = if ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+            .added_at_by_ids(&ids)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "added_at_by_ids a échoué — collection sans date d'ajout");
+                std::collections::HashMap::new()
+            })
+    };
+
     Ok(rows
         .into_iter()
         .map(|r| {
+            let id = r.first().and_then(|v| v.as_i64());
             json!({
-                "id": r.first().and_then(|v| v.as_i64()),
+                "id": id,
+                "added_at": id.and_then(|i| ajouts.get(&i).copied()),
                 "title": r.get(1).and_then(|v| v.as_string()),
                 "artist_name": r.get(2).and_then(|v| v.as_string()),
                 "year": r.get(3).and_then(|v| v.as_i64()),
@@ -3196,5 +3218,50 @@ mod date_de_sortie_2206 {
         let giant = lignes.iter().find(|a| a["id"] == 2).expect("album 2");
         assert!(giant["release_date"].is_null(), "{giant}");
         assert!(giant["original_date"].is_null(), "{giant}");
+    }
+}
+
+/// #7903 (fil 2656) — les albums d'une collection intelligente portent leur
+/// date d'ajout dans Tune (`added_at`, la même que la Bibliothèque) : le tri
+/// « Ordre d'ajout dans Tune » de la collection ouverte se fait à l'écran.
+#[cfg(test)]
+mod ordre_d_ajout_7903 {
+    use std::sync::Arc;
+
+    use crate::SmartHttpState;
+
+    #[test]
+    fn les_albums_d_une_collection_portent_leur_date_d_ajout() {
+        let db = crate::criteres::tests::bibliotheque();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let attendu = tune_core::db::album_repo::AlbumRepo::with_backend(backend.clone())
+            .added_at_by_ids(&[1, 2])
+            .expect("dates d'ajout de la bibliothèque");
+        let etat = SmartHttpState::new(backend);
+        let Ok(lignes) = super::execute_album_query(&etat, "", "ORDER BY al.id ASC", "", &[])
+        else {
+            panic!("la requête des albums de la collection échoue");
+        };
+        for id in [1_i64, 2] {
+            let album = lignes.iter().find(|a| a["id"] == id).expect("album");
+            let lu = album["added_at"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("added_at absent : {album}"));
+            assert_eq!(
+                Some(&lu),
+                attendu.get(&id),
+                "même date que la Bibliothèque : {album}"
+            );
+        }
+        // Kind of Blue (2024) a été ajouté après Giant Steps (2019).
+        let date = |id: i64| {
+            lignes.iter().find(|a| a["id"] == id).unwrap()["added_at"]
+                .as_f64()
+                .unwrap()
+        };
+        assert!(
+            date(1) > date(2),
+            "l'ordre d'ajout doit se lire dans added_at"
+        );
     }
 }
