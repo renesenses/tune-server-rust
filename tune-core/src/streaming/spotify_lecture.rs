@@ -71,14 +71,44 @@ pub trait PiloteSpotify: Send + Sync {
 }
 
 /// #6933 — l'erreur de librespot est-elle un refus d'identifiants ?
+///
+/// librespot 0.8.0 écrit le refus du point d'accès en clair
+/// (`login_error_message` : « Login failed with reason: Bad credentials ») ;
+/// les versions antérieures écrivaient la variante (`BadCredentials`).
 pub fn est_un_refus_d_identifiants(erreur: &str) -> bool {
     [
         "INVALID_CREDENTIALS",
         "BadCredentials",
+        "Bad credentials",
         "Login request was denied",
     ]
     .iter()
     .any(|m| erreur.contains(m))
+}
+
+/// Code stable du refus « compte Spotify Premium exigé » : Spotify ne laisse
+/// lire un titre dans une application tierce (librespot, API Web
+/// `/me/player/play`) qu'avec un compte Premium. Un compte gratuit peut se
+/// connecter et parcourir le catalogue ; il ne peut pas écouter dans Tune.
+pub const CODE_PREMIUM_REQUIS: &str = "spotify_premium_required";
+
+/// Préfixe de ce refus, reconnu par la route de lecture qui le rend en 409
+/// avec [`CODE_PREMIUM_REQUIS`] et une phrase traduite, au lieu d'une
+/// « Erreur de lecture » (502) qui laissait chercher une panne.
+pub const SENTINELLE_PREMIUM_REQUIS: &str = "spotify_premium_required:";
+
+/// Le refus vient-il de l'abonnement (compte gratuit) ? Trois formes :
+/// librespot 0.8.0 (« Login failed with reason: Premium account required »),
+/// ses versions antérieures (`PremiumAccountRequired`), et l'API Web
+/// (`"reason": "PREMIUM_REQUIRED"`, « Player command failed: Premium
+/// required », repris par `motif_refus_403`).
+pub fn est_un_refus_premium(erreur: &str) -> bool {
+    let bas = erreur.to_lowercase();
+    bas.contains("premium account required")
+        || bas.contains("premiumaccountrequired")
+        || bas.contains("premium_required")
+        || bas.contains("premium required")
+        || bas.contains("compte spotify premium est exigé")
 }
 
 /// #6933 — ce que le motif d'échec doit savoir du récepteur.
@@ -377,6 +407,22 @@ impl FournisseurPcm for FournisseurSpotify {
         }
         if let Err(e) = lancement {
             pompe.detacher();
+            // Compte gratuit : ni librespot ni l'API Web ne joueront, quoi
+            // qu'on reconnecte ou relance. Le dire tel quel, AVANT les
+            // conseils de liaison, qui enverraient chercher ailleurs.
+            let erreur_librespot = self.recepteur.derniere_erreur_librespot();
+            if est_un_refus_premium(&e)
+                || erreur_librespot
+                    .as_deref()
+                    .is_some_and(est_un_refus_premium)
+            {
+                let detail = erreur_librespot
+                    .filter(|l| est_un_refus_premium(l))
+                    .map(|l| format!("librespot : « {l} »"))
+                    .unwrap_or(e);
+                tracing::warn!(detail = %detail, "spotify_lecture_premium_requis");
+                return Err(format!("{SENTINELLE_PREMIUM_REQUIS}{detail}"));
+            }
             // #6933 — si librespot a dit pourquoi il ne s'est pas connecté,
             // c'est SA raison qui est rendue, pas un « reconnecter » générique.
             if let Some(erreur) = self.recepteur.derniere_erreur_librespot() {
@@ -1126,5 +1172,128 @@ exit 1
             );
             assert!(pauses.is_empty(), "{echoue} : {pauses:?}");
         }
+    }
+
+    /// Compte Spotify GRATUIT : le point d'accès refuse librespot 0.8.0
+    /// (`login_error_message` : « Premium account required »), l'appareil
+    /// n'apparaît jamais.
+    const LIBRESPOT_COMPTE_GRATUIT: &str = r#"#!/bin/sh
+echo "[2026-11-12T10:00:00Z INFO  librespot] librespot 0.8.0 (Built on 2025-10-01)" >&2
+echo "[2026-11-12T10:00:01Z ERROR librespot] could not initialize spirc: Login failed with reason: Premium account required" >&2
+exit 1
+"#;
+
+    fn refus_avec(script: &str, pilote: Arc<dyn PiloteSpotify>) -> String {
+        let dossier = tempfile::tempdir().unwrap();
+        let bin = dossier.path().join("librespot");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let recepteur = Arc::new(SpotifyConnectManager::avec_binaire(
+            "Tune".into(),
+            0,
+            Some(bin.to_string_lossy().into_owned()),
+        ));
+        FournisseurSpotify::new(recepteur, pilote, Arc::new(|| true))
+            .ouvrir("spotify:track:4uLU6hMCjMI75M1A2tKUQC", 0)
+            .err()
+            .expect("la lecture doit échouer")
+    }
+
+    /// Compte gratuit, côté librespot : le refus porte le code stable
+    /// « Premium exigé », ni « liaison requise » (choisir l'appareil dans
+    /// l'application n'y changerait rien) ni un motif technique brut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_premium_compte_gratuit_refuse_par_librespot() {
+        let refus = tokio::task::spawn_blocking(|| {
+            refus_avec(
+                LIBRESPOT_COMPTE_GRATUIT,
+                Arc::new(PiloteAppareilAbsent { portee: Some(true) }),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            refus.starts_with(SENTINELLE_PREMIUM_REQUIS),
+            "compte gratuit : le refus ne porte pas {CODE_PREMIUM_REQUIS} : {refus}"
+        );
+        assert!(refus.contains("Premium account required"), "{refus}");
+        assert!(
+            LiaisonRequise::depuis_sentinelle(&refus).is_none(),
+            "compte gratuit présenté comme une liaison à faire : {refus}"
+        );
+    }
+
+    /// L'API Web refuse `/me/player/play` à un compte gratuit
+    /// (`PREMIUM_REQUIRED`, rendu par `motif_refus_403`).
+    struct PiloteSansPremium;
+
+    #[async_trait]
+    impl PiloteSpotify for PiloteSansPremium {
+        async fn jeton(&self) -> Result<String, String> {
+            Ok("jeton-essai".into())
+        }
+        async fn duree_ms(&self, _: &str) -> Result<u64, String> {
+            Ok(1000)
+        }
+        async fn lancer(&self, _: &str, _: &str, _: u64) -> Result<(), String> {
+            Err(
+                "Spotify refuse la lecture : un compte Spotify Premium est exigé. \
+                 (Player command failed: Premium required)"
+                    .into(),
+            )
+        }
+    }
+
+    /// Compte gratuit, côté API Web : même code stable, même si librespot,
+    /// lui, n'a rien écrit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_premium_compte_gratuit_refuse_par_l_api_web() {
+        let b = banc(1000, 0);
+        let f = FournisseurSpotify::new(
+            b.recepteur.clone(),
+            Arc::new(PiloteSansPremium),
+            Arc::new(|| true),
+        );
+        let refus = tokio::task::spawn_blocking(move || {
+            f.ouvrir("spotify:track:4uLU6hMCjMI75M1A2tKUQC", 0)
+                .err()
+                .expect("la lecture doit échouer")
+        })
+        .await
+        .unwrap();
+        assert!(refus.starts_with(SENTINELLE_PREMIUM_REQUIS), "{refus}");
+        assert!(refus.contains("Premium required"), "{refus}");
+    }
+
+    /// Contre-épreuve : un refus d'identifiants n'est pas un refus d'abonnement.
+    #[test]
+    fn spotify_premium_seul_le_refus_d_abonnement_est_reconnu() {
+        for oui in [
+            "Login failed with reason: Premium account required",
+            "Login failed with reason: PremiumAccountRequired",
+            r#"{"error":{"status":403,"message":"Player command failed: Premium required","reason":"PREMIUM_REQUIRED"}}"#,
+        ] {
+            assert!(est_un_refus_premium(oui), "{oui}");
+        }
+        for non in [
+            "Login failed with reason: Bad credentials",
+            "Login request was denied: INVALID_CREDENTIALS",
+            "Spotify refuse la lecture de ce titre (HTTP 403, UNKNOWN) : Restriction violated",
+        ] {
+            assert!(!est_un_refus_premium(non), "{non}");
+        }
+    }
+
+    /// librespot 0.8.0 écrit le refus du point d'accès en clair
+    /// (« Bad credentials ») : c'est un refus d'identifiants, comme
+    /// `INVALID_CREDENTIALS`.
+    #[test]
+    fn spotify_6933_bad_credentials_de_librespot_0_8_est_un_refus_d_identifiants() {
+        assert!(est_un_refus_d_identifiants(
+            "could not initialize spirc: Login failed with reason: Bad credentials"
+        ));
+        assert!(!est_un_refus_d_identifiants(
+            "Login failed with reason: Premium account required"
+        ));
     }
 }
