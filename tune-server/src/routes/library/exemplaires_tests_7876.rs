@@ -14,7 +14,9 @@ use axum::response::Response;
 use serde_json::Value;
 use tune_core::db::settings_repo::SettingsRepo;
 
-use super::{CorpsOrdre, ordre_get, ordre_put};
+use axum::extract::Path;
+
+use super::{CorpsOrdre, CorpsPreference, ordre_get, ordre_put, preference_put};
 use crate::config::TuneConfig;
 use crate::state::AppState;
 
@@ -115,4 +117,35 @@ async fn un_dossier_inconnu_reste_refuse() {
     let (statut, v) = poser_ordre(&state, &["/ailleurs"]).await;
     assert_eq!(statut, StatusCode::BAD_REQUEST);
     assert_eq!(v["code"], "not_music_dirs");
+}
+
+#[tokio::test]
+async fn sans_reglage_la_preference_d_album_accepte_un_dossier_du_fichier_7876() {
+    let config = TuneConfig {
+        music_dirs: vec!["/conf/a".into(), "/conf/b".into()],
+        ..TuneConfig::default()
+    };
+    let state = etat(config);
+    SettingsRepo::with_backend(state.backend.clone())
+        .delete("music_dirs")
+        .ok();
+    state
+        .backend
+        .execute("INSERT INTO albums (id, title) VALUES (5, 'Album')", &[])
+        .unwrap();
+    let r = preference_put(
+        State(state.clone()),
+        Path(5),
+        Json(CorpsPreference {
+            racine: "/conf/b".into(),
+        }),
+    )
+    .await;
+    let (statut, v) = corps(r).await;
+    assert_eq!(
+        statut,
+        StatusCode::OK,
+        "#7876 : plus de 400 root_not_music_dir pour un dossier du fichier : {v}"
+    );
+    assert_eq!(v["racine"], "/conf/b");
 }

@@ -36,22 +36,11 @@ fn dossiers_bruts(state: &AppState) -> Vec<String> {
         .unwrap_or_else(|| state.config.music_dirs.clone())
 }
 
-/// Les dossiers de musique NORMALISÉS. #7876 : quand le réglage est absent,
-/// ce sont ceux du fichier de configuration, que l'écran affiche aussi ; sans
-/// ce repli, chaque flèche rendait 400 `not_music_dirs`.
+/// Les dossiers de musique NORMALISÉS. #7876 : réglage absent ⇒ ceux du
+/// fichier de configuration, repli tenu par `tune_core` (et donc aussi par le
+/// choix de l'exemplaire lu).
 fn dossiers(state: &AppState) -> Vec<String> {
-    let en_base = ex::dossiers_de_musique(&*state.backend);
-    if !en_base.is_empty() {
-        return en_base;
-    }
-    let mut out: Vec<String> = Vec::new();
-    for d in &state.config.music_dirs {
-        let d = tune_core::scanner::walker::normalize_path(d);
-        if !d.is_empty() && !out.contains(&d) {
-            out.push(d);
-        }
-    }
-    out
+    ex::dossiers_de_musique(&*state.backend)
 }
 
 /// #7876 — l'ordre effectif réécrit dans l'écriture BRUTE de `music_dirs`.
