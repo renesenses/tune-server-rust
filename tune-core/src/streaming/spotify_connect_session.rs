@@ -152,11 +152,21 @@ pub struct EtatSession {
     /// #8580 — le lancement de librespot sous lequel la session a été
     /// ouverte ([`SpotifyConnectManager::lancement_de_librespot`]).
     lancement: Option<u64>,
+    /// #8580 — « le dernier geste gagne » : la session a été RENDUE à Tune
+    /// (zone arrêtée, ou autre source lancée dans Tune sur la zone exposée).
+    /// L'appareil est mis en pause ; seule une NOUVELLE action dans
+    /// l'application Spotify (`paused`/`stopped` puis `playing`, ou une
+    /// nouvelle connexion) peut rouvrir une session.
+    rendu: bool,
 }
 
 impl EtatSession {
     pub fn zone(&self) -> Option<i64> {
         self.zone
+    }
+    /// #8580 — la session a-t-elle été rendue à Tune ?
+    pub fn rendu(&self) -> bool {
+        self.rendu
     }
     fn fermer(&mut self) {
         self.zone = None;
@@ -187,6 +197,24 @@ pub fn decider(
             }
             None => Vec::new(),
         };
+    }
+    // #8580 — session rendue à Tune : les titres que l'application continue
+    // d'enchaîner ne rouvrent rien (ils couperaient l'album que Tune vient de
+    // lancer, ou relanceraient la zone arrêtée). Une nouvelle action dans
+    // l'application (pause ou arrêt, puis lecture ; nouvelle connexion) lève
+    // la garde.
+    if etat.rendu {
+        if matches!(
+            ev.evenement.as_str(),
+            "paused"
+                | "stopped"
+                | "session_connected"
+                | "session_disconnected"
+                | "session_client_changed"
+        ) {
+            etat.rendu = false;
+        }
+        return Vec::new();
     }
     // Récepteur désactivé, ou zone exposée changée : la session se ferme.
     if let Some(zone_id) = etat.zone
@@ -293,6 +321,10 @@ pub trait ZonesConnect: Send + Sync {
     async fn reprise(&self, zone_id: i64);
     async fn arreter(&self, zone_id: i64);
     async fn volume(&self, zone_id: i64, volume: f64);
+    /// #8580 — « le dernier geste gagne » : met en pause l'appareil Spotify
+    /// Connect `nom`, pour que l'application Spotify voie que Tune a repris
+    /// la zone.
+    async fn rendre_l_appareil(&self, nom: &str);
 }
 
 /// Le pilote : reçoit les évènements du récepteur et les applique.
@@ -312,19 +344,37 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
     pub async fn traiter(&self, etat: &mut EtatSession, ev: &EvenementLibrespot) {
         let zone_exposee = self.recepteur.zone_exposee().await;
         let pompe = self.recepteur.pompe();
-        // #8580 — une session MORTE ne reste pas ouverte : la zone a été
-        // arrêtée (ou reprise) dans Tune, ou librespot a été relancé
-        // (renommage, plantage, relance pour la liaison). Sans cela,
-        // `etat.zone` restait rempli et Lecture / Suivant dans l'application
-        // Spotify ne rouvrait plus rien : aucun son. L'état est fermé, et le
-        // `playing` qui suit rouvre la session.
+        // Lu AVANT tout `await` : une relance pendant l'ouverture ne doit pas
+        // être prise pour le lancement de la session.
+        let lancement = self.recepteur.lancement_de_librespot();
+        // #8580 — une session MORTE ne reste pas ouverte.
+        // * librespot relancé (renommage, plantage, relance pour la liaison),
+        //   sans geste de Tune : l'état est fermé, le `playing` suivant rouvre.
+        // * GESTE DE TUNE (« le dernier geste gagne ») : la zone exposée a été
+        //   arrêtée, ou une autre source y a été lancée. La session est RENDUE :
+        //   l'appareil est mis en pause pour que l'application Spotify le voie,
+        //   et les titres qu'elle enchaînerait encore ne rouvrent rien.
+        //   Détecté au premier évènement qui suit le geste : rien n'est
+        //   rouvert d'ici là, donc rien n'est coupé.
         if let Some(zone_id) = etat.zone
             && !pompe.consommateur_de_tune()
-            && (etat.lancement != Some(self.recepteur.lancement_de_librespot())
-                || !self.zones.joue_la_session(zone_id).await)
         {
-            info!(zone_id, evenement = %ev.evenement, "spotify_connect_session_morte_refermee");
-            etat.fermer();
+            let relance = etat.lancement != Some(lancement);
+            let joue = self.zones.joue_la_session(zone_id).await;
+            if relance || !joue {
+                pompe.detacher_continu();
+                if joue {
+                    self.zones.arreter(zone_id).await;
+                }
+                etat.fermer();
+                if !relance {
+                    etat.rendu = true;
+                    self.zones
+                        .rendre_l_appareil(&self.recepteur.device_name())
+                        .await;
+                }
+                info!(zone_id, relance, evenement = %ev.evenement, "spotify_connect_session_morte_refermee");
+            }
         }
         let actions = decider(
             etat,
@@ -338,7 +388,7 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
                 Action::Ouvrir { zone_id, morceau } => {
                     match self.zones.ouvrir(zone_id, &morceau).await {
                         Ok(()) => {
-                            etat.lancement = Some(self.recepteur.lancement_de_librespot());
+                            etat.lancement = Some(lancement);
                             self.recepteur.noter_erreur_de_session(None);
                             info!(zone_id, piste = ?morceau.piste, "spotify_connect_session_ouverte");
                         }
@@ -425,6 +475,21 @@ impl ZonesConnect for ZonesDeLOrchestrateur {
             return Err(code_de_refus_de_session(&e));
         }
         Ok(())
+    }
+
+    async fn rendre_l_appareil(&self, nom: &str) {
+        let service = self.0.services.lock().await.get("spotify");
+        let Some(service) = service else {
+            return;
+        };
+        let service = service.read().await;
+        if let Some(spotify) = service
+            .as_any()
+            .downcast_ref::<crate::streaming::spotify::SpotifyService>()
+            && let Err(e) = spotify.mettre_en_pause_l_appareil(nom).await
+        {
+            warn!(erreur = %e, "spotify_connect_pause_apres_geste_de_tune_impossible");
+        }
     }
 
     async fn joue_la_session(&self, zone_id: i64) -> bool {
