@@ -393,3 +393,38 @@ fn premium_8565_les_lignes_de_librespot_reconnues() {
         "could not initialize spirc: INVALID_CREDENTIALS"
     ));
 }
+
+/// « Le dernier geste gagne » (Bertrand, 12/11) — l'évènement synthétique de
+/// Tune ferme la session ouverte, même si la pompe n'est plus à Tune (sa
+/// lecture a échoué).
+#[test]
+fn decider_tune_prend_la_main_ferme_la_session_ouverte() {
+    let t0 = Instant::now();
+    let mut etat = EtatSession::default();
+    let _ = decider(&mut etat, &titre("p1", "Un"), Some(7), false, t0);
+    let _ = decider(&mut etat, &joue("p1"), Some(7), false, t0);
+    assert_eq!(etat.zone(), Some(7), "session ouverte sur la zone exposée");
+    let actions = decider(
+        &mut etat,
+        &ev(crate::streaming::spotify_connect::EVENEMENT_TUNE_PREND_LA_MAIN),
+        Some(7),
+        false,
+        t0,
+    );
+    assert_eq!(actions, vec![Action::Arreter { zone_id: 7 }]);
+    assert_eq!(etat.zone(), None);
+}
+
+/// Contre-épreuve : sans session ouverte, l'évènement ne fait rien.
+#[test]
+fn decider_tune_prend_la_main_sans_session_ne_fait_rien() {
+    let mut etat = EtatSession::default();
+    let actions = decider(
+        &mut etat,
+        &ev(crate::streaming::spotify_connect::EVENEMENT_TUNE_PREND_LA_MAIN),
+        Some(7),
+        false,
+        Instant::now(),
+    );
+    assert!(actions.is_empty(), "{actions:?}");
+}

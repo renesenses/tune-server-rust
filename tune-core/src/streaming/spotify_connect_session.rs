@@ -151,8 +151,12 @@ pub fn decider(
     maintenant: Instant,
 ) -> Vec<Action> {
     // Une lecture lancée par Tune garde la main ; une session encore ouverte
-    // (sur une autre zone) s'arrête, la pompe ne la sert plus.
-    if lecture_de_tune {
+    // (sur une autre zone) s'arrête, la pompe ne la sert plus. « Le dernier
+    // geste gagne » : l'évènement synthétique de Tune la ferme aussitôt, même
+    // si la lecture de Tune échoue ensuite (la pompe est alors libre).
+    if lecture_de_tune
+        || ev.evenement == crate::streaming::spotify_connect::EVENEMENT_TUNE_PREND_LA_MAIN
+    {
         return match etat.zone {
             Some(zone_id) => {
                 etat.fermer();

@@ -56,6 +56,13 @@ pub trait PiloteSpotify: Send + Sync {
     async fn duree_ms(&self, piste: &str) -> Result<u64, String>;
     /// Demande à l'appareil `appareil` de jouer `piste` depuis `position_ms`.
     async fn lancer(&self, appareil: &str, piste: &str, position_ms: u64) -> Result<(), String>;
+    /// « Le dernier geste gagne » — met l'appareil en pause, pour que
+    /// l'application Spotify voie s'arrêter une session Connect que Tune a
+    /// reprise sans pouvoir jouer. Par défaut : rien.
+    async fn mettre_en_pause(&self, appareil: &str) -> Result<(), String> {
+        let _ = appareil;
+        Ok(())
+    }
     /// #6933 — la liaison porte-t-elle la portée `streaming` ? `None` : on
     /// ne le sait pas.
     async fn porte_la_lecture(&self) -> Option<bool> {
@@ -188,6 +195,16 @@ impl PiloteSpotify for PiloteDuRegistre {
         spotify
             .lancer_sur_l_appareil(appareil, piste, position_ms)
             .await
+    }
+
+    async fn mettre_en_pause(&self, appareil: &str) -> Result<(), String> {
+        let svc = self.service().await?;
+        let svc = svc.read().await;
+        let spotify = svc
+            .as_any()
+            .downcast_ref::<SpotifyService>()
+            .ok_or("service Spotify inattendu")?;
+        spotify.mettre_en_pause_l_appareil(appareil).await
     }
 
     async fn porte_la_lecture(&self) -> Option<bool> {
@@ -337,12 +354,28 @@ impl FournisseurPcm for FournisseurSpotify {
         // La pompe est attachée AVANT de lancer le titre : pas un octet du
         // début ne se perd.
         let pompe = self.recepteur.pompe();
+        // « Le dernier geste gagne » (Bertrand, 12/11) : une session Spotify
+        // Connect ouverte perd la pompe. Le pilote des sessions la ferme côté
+        // zone tout de suite (la zone ne reste pas à moitié Connect).
+        let session_connect = pompe.consommateur_continu();
         let rx = pompe.attacher(Some(piste.clone()));
-        if let Err(e) = rt.block_on(self.pilote.lancer(
+        if session_connect {
+            self.recepteur.signaler_reprise_par_tune();
+        }
+        let lancement = rt.block_on(self.pilote.lancer(
             self.recepteur.device_name(),
             &piste,
             depuis_ms,
-        )) {
+        ));
+        // La reprise a échoué : l'appareil jouerait encore la session dans le
+        // vide. Pause, pour que l'application Spotify le voie s'arrêter.
+        if lancement.is_err()
+            && session_connect
+            && let Err(e) = rt.block_on(self.pilote.mettre_en_pause(self.recepteur.device_name()))
+        {
+            tracing::warn!(erreur = %e, "spotify_pause_apres_reprise_impossible");
+        }
+        if let Err(e) = lancement {
             pompe.detacher();
             // #6933 — si librespot a dit pourquoi il ne s'est pas connecté,
             // c'est SA raison qui est rendue, pas un « reconnecter » générique.
@@ -1001,5 +1034,97 @@ exit 1
             "{m}"
         );
         assert!(!m.to_lowercase().contains("reconnect"), "{m}");
+    }
+
+    /// « Le dernier geste gagne » — un pilote dont le lancement réussit ou
+    /// échoue, et qui note les pauses demandées.
+    struct PiloteReprise {
+        echoue: bool,
+        pauses: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl PiloteSpotify for PiloteReprise {
+        async fn jeton(&self) -> Result<String, String> {
+            Ok("jeton-essai".into())
+        }
+        async fn duree_ms(&self, _: &str) -> Result<u64, String> {
+            Ok(1000)
+        }
+        async fn lancer(&self, _: &str, _: &str, _: u64) -> Result<(), String> {
+            if self.echoue {
+                Err("Spotify a refusé la lecture (HTTP 500) : panne".into())
+            } else {
+                Ok(())
+            }
+        }
+        async fn mettre_en_pause(&self, appareil: &str) -> Result<(), String> {
+            self.pauses.lock().unwrap().push(appareil.to_string());
+            Ok(())
+        }
+    }
+
+    /// Ouvre un titre depuis Tune pendant qu'une session Connect tient la
+    /// pompe (ou non) ; rend les évènements reçus par le pilote des sessions
+    /// et les pauses demandées.
+    fn reprise(session_ouverte: bool, echoue: bool) -> (Vec<String>, Vec<String>) {
+        let b = banc(1000, 0);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        b.recepteur.brancher_les_evenements(tx);
+        let _session = session_ouverte.then(|| b.recepteur.pompe().attacher_continu());
+        let pilote = Arc::new(PiloteReprise {
+            echoue,
+            pauses: std::sync::Mutex::new(Vec::new()),
+        });
+        let f = FournisseurSpotify::new(b.recepteur.clone(), pilote.clone(), Arc::new(|| true));
+        let resultat = f.ouvrir("spotify:track:4uLU6hMCjMI75M1A2tKUQC", 0);
+        assert_eq!(resultat.is_err(), echoue);
+        let mut evenements = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            evenements.push(ev.evenement);
+        }
+        let pauses = pilote.pauses.lock().unwrap().clone();
+        (evenements, pauses)
+    }
+
+    const PREND: &str = crate::streaming::spotify_connect::EVENEMENT_TUNE_PREND_LA_MAIN;
+
+    /// Session Connect ouverte, Tune lance un titre : le pilote des sessions
+    /// est prévenu (il ferme la zone) ; le titre de Tune joue sur l'appareil,
+    /// aucune pause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dernier_geste_tune_prend_la_main_sur_la_session_connect() {
+        let (evenements, pauses) = tokio::task::spawn_blocking(|| reprise(true, false))
+            .await
+            .unwrap();
+        assert!(evenements.iter().any(|e| e == PREND), "{evenements:?}");
+        assert!(pauses.is_empty(), "{pauses:?}");
+    }
+
+    /// La reprise échoue : la session est fermée quand même, et l'appareil
+    /// est mis en pause pour que l'application Spotify le voie s'arrêter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dernier_geste_reprise_echouee_ferme_et_met_en_pause() {
+        let (evenements, pauses) = tokio::task::spawn_blocking(|| reprise(true, true))
+            .await
+            .unwrap();
+        assert!(evenements.iter().any(|e| e == PREND), "{evenements:?}");
+        assert_eq!(pauses, vec!["Tune".to_string()]);
+    }
+
+    /// Contre-épreuve : sans session Connect, Tune ne signale rien et ne met
+    /// rien en pause, même en échec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dernier_geste_sans_session_connect_rien_a_reprendre() {
+        for echoue in [false, true] {
+            let (evenements, pauses) = tokio::task::spawn_blocking(move || reprise(false, echoue))
+                .await
+                .unwrap();
+            assert!(
+                !evenements.iter().any(|e| e == PREND),
+                "{echoue} : {evenements:?}"
+            );
+            assert!(pauses.is_empty(), "{echoue} : {pauses:?}");
+        }
     }
 }
