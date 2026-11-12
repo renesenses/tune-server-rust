@@ -425,8 +425,13 @@ fn candidat(a: &Album, versions: &HashMap<i64, String>) -> Option<Candidat> {
 }
 
 /// Une version, telle que le sélecteur la montre.
-fn version_json(a: &Album, nom: &Option<String>) -> Value {
-    json!({
+///
+/// tune-web-client#2731 — avec `max_channels` (le plus grand nombre de canaux
+/// de ses pistes, comme dans la grille, #7725) : la fiche dit quelle version
+/// est en 2.0 et laquelle en 5.1. Clé absente quand les pistes ne le disent
+/// pas ; champ additif, un client qui l'ignore lit la réponse d'avant.
+fn version_json(a: &Album, nom: &Option<String>, canaux: &HashMap<i64, i64>) -> Value {
+    let mut v = json!({
         "id": a.id,
         "title": a.title,
         "version_name": nom,
@@ -440,11 +445,31 @@ fn version_json(a: &Album, nom: &Option<String>) -> Value {
         "cover_path": a.cover_path,
         "track_count": a.track_count,
         "musicbrainz_release_id": a.musicbrainz_release_id,
-    })
+    });
+    if let Some(obj) = v.as_object_mut() {
+        super::albums::inserer_max_channels(obj, a, canaux);
+    }
+    v
 }
 
-fn oeuvre_json(o: &Oeuvre, albums: &HashMap<i64, &Album>) -> Value {
-    let preferee = albums.get(&o.preferee).map(|a| a.to_json());
+/// Les canaux de toutes les versions des œuvres `oeuvres`, en UNE requête.
+fn canaux_des_versions(state: &AppState, oeuvres: &[&Oeuvre]) -> HashMap<i64, i64> {
+    let ids: Vec<i64> = oeuvres
+        .iter()
+        .flat_map(|o| o.versions.iter().map(|v| v.id))
+        .collect();
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    super::albums::canaux_max_par_album(&repo, &ids)
+}
+
+fn oeuvre_json(o: &Oeuvre, albums: &HashMap<i64, &Album>, canaux: &HashMap<i64, i64>) -> Value {
+    let preferee = albums.get(&o.preferee).map(|a| {
+        let mut j = a.to_json();
+        if let Some(obj) = j.as_object_mut() {
+            super::albums::inserer_max_channels(obj, a, canaux);
+        }
+        j
+    });
     json!({
         "work_id": o.work_id,
         "method": o.methode.nom(),
@@ -454,7 +479,7 @@ fn oeuvre_json(o: &Oeuvre, albums: &HashMap<i64, &Album>) -> Value {
         "versions": o
             .versions
             .iter()
-            .filter_map(|v| albums.get(&v.id).map(|a| version_json(a, &v.nom)))
+            .filter_map(|v| albums.get(&v.id).map(|a| version_json(a, &v.nom, canaux)))
             .collect::<Vec<_>>(),
     })
 }
@@ -509,11 +534,11 @@ pub(crate) async fn lister_oeuvres(
     let par_id: HashMap<i64, &Album> = albums.iter().filter_map(|a| Some((a.id?, a))).collect();
     let limite = page.limit.clamp(1, 1000) as usize;
     let debut = page.offset.max(0) as usize;
-    let items: Vec<Value> = oeuvres
-        .iter()
-        .skip(debut)
-        .take(limite)
-        .map(|o| oeuvre_json(o, &par_id))
+    let de_la_page: Vec<&Oeuvre> = oeuvres.iter().skip(debut).take(limite).collect();
+    let canaux = canaux_des_versions(&state, &de_la_page);
+    let items: Vec<Value> = de_la_page
+        .into_iter()
+        .map(|o| oeuvre_json(o, &par_id, &canaux))
         .collect();
     Ok(Json(json!({
         "enabled": actif,
@@ -608,7 +633,8 @@ pub(crate) async fn versions_de_l_album(
         .iter()
         .find(|o| o.versions.iter().any(|v| v.id == id))
         .ok_or(AppError::not_found("album not found"))?;
-    let mut corps = oeuvre_json(oeuvre, &par_id);
+    let canaux = canaux_des_versions(&state, &[oeuvre]);
+    let mut corps = oeuvre_json(oeuvre, &par_id, &canaux);
     if let Some(obj) = corps.as_object_mut() {
         obj.insert("enabled".into(), json!(actif));
         obj.insert("album_id".into(), json!(id));

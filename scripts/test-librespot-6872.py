@@ -81,7 +81,7 @@ class Librespot6872(unittest.TestCase):
             (package / "tune-server").write_bytes(b"server")
             env = dict(os.environ, RUNNER_TEMP=str(base))
             subprocess.run(["bash", "-eu", "-c", 'LIBRESPOT=""\n' + textwrap.dedent(stage) +
-                            "\nDAEMON= FFMPEG= INSTRUCTIONS=\n" + command],
+                            "\nDAEMON= FFMPEG= FPCALC= INSTRUCTIONS=\n" + command],
                            cwd=base, env=env, check=True)
             with tarfile.open(base / "witness.tar.gz") as archive:
                 for name in ("librespot", "LIBRESPOT-LICENSE.txt", "LIBRESPOT-THIRD-PARTY.txt"):

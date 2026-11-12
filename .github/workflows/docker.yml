@@ -128,6 +128,7 @@ jobs:
         env:
           CARGO_TARGET_DIR: target-amd64
         run: |
+          bash scripts/ci/apt-robuste.sh
           sudo apt-get update && sudo apt-get install -y libasound2-dev
           # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding","dst"]}
           cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme

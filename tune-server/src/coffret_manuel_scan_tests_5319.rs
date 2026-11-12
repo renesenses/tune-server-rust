@@ -764,3 +764,102 @@ async fn retablir_sur_un_coffret_compose_5319() {
     assert_eq!(statut, StatusCode::OK, "{vue}");
     assert_eq!(vue["album"]["title"], "Messiah - Gardiner - Disc A");
 }
+
+/// #8463 (fil 2763) — un album DÉJÀ à trois disques (un dossier, balises
+/// DISCNUMBER 1 à 3) réuni à la main avec un album d'un disque : ses trois
+/// disques restent trois (1-2-3, puis 4), le scan forcé ne défait pas cette
+/// disposition, et « Défaire » puis un scan rendent un album de trois disques.
+#[tokio::test]
+async fn un_album_de_trois_disques_garde_ses_disques_au_scan_et_au_defaire_8463() {
+    let b = bibliotheque("trois-disques-8463");
+    let hier = SystemTime::now() - Duration::from_secs(86_400);
+    let immersion = b.racine.join("Pink Floyd - DSOTM Immersion");
+    let stereo = b.racine.join("Pink Floyd - DSOTM Stereo");
+    std::fs::create_dir_all(&immersion).unwrap();
+    std::fs::create_dir_all(&stereo).unwrap();
+    for cd in 1..=3 {
+        for n in 1..=2 {
+            let piste = immersion.join(format!("{cd}-0{n}.flac"));
+            std::fs::write(&piste, flac_8_canaux()).unwrap();
+            baliser(
+                &piste,
+                &[
+                    ("TITLE", &format!("CD{cd} piste {n}")),
+                    ("ARTIST", "Pink Floyd"),
+                    ("ALBUMARTIST", "Pink Floyd"),
+                    ("ALBUM", "The Dark Side Of The Moon (Immersion Box Set)"),
+                    ("DISCNUMBER", &cd.to_string()),
+                    ("TRACKNUMBER", &n.to_string()),
+                    ("DATE", "2011"),
+                ],
+                hier,
+            );
+        }
+    }
+    let piste = stereo.join("01.flac");
+    std::fs::write(&piste, flac_8_canaux()).unwrap();
+    baliser(
+        &piste,
+        &[
+            ("TITLE", "Speak To Me"),
+            ("ARTIST", "Pink Floyd"),
+            ("ALBUMARTIST", "Pink Floyd"),
+            ("ALBUM", "The Dark Side Of The Moon (Stereo)"),
+            ("TRACKNUMBER", "1"),
+            ("DATE", "1973"),
+        ],
+        hier,
+    );
+
+    scan_force(&b.etat).await;
+    let imm = album_de(&b.db, &immersion.to_string_lossy());
+    let ste = album_de(&b.db, &stereo.to_string_lossy());
+    assert_ne!(imm, ste, "montage : deux albums");
+    let disques_de = |db: &Arc<dyn DbBackend>, dossier: &Path| -> Vec<i64> {
+        disposition(db)
+            .into_iter()
+            .filter(|(c, _, _)| c.starts_with(&*dossier.to_string_lossy()))
+            .map(|(_, _, d)| d)
+            .collect()
+    };
+    let origine = disques_de(&b.db, &immersion);
+    assert_eq!(origine, vec![1, 1, 2, 2, 3, 3], "montage : trois disques");
+
+    let corps = composer(&b.etat, &[imm, ste]).await;
+    assert_eq!(corps["disques"].as_i64(), Some(4), "{corps}");
+    let compose = disposition(&b.db);
+    assert!(compose.iter().all(|(_, a, _)| *a == imm), "{compose:?}");
+    assert_eq!(disques_de(&b.db, &immersion), vec![1, 1, 2, 2, 3, 3]);
+    assert_eq!(disques_de(&b.db, &stereo), vec![4]);
+
+    scan_force(&b.etat).await;
+    assert_eq!(
+        disposition(&b.db),
+        compose,
+        "le scan forcé a défait la disposition du coffret"
+    );
+
+    let (statut, corps) = defaire(&b.etat, imm).await;
+    assert_eq!(statut, StatusCode::OK, "défaire refusé : {corps}");
+    let defait = disposition(&b.db);
+    assert_eq!(
+        disques_de(&b.db, &immersion),
+        vec![1, 1, 2, 2, 3, 3],
+        "{defait:?}"
+    );
+    assert_eq!(disques_de(&b.db, &stereo), vec![1], "{defait:?}");
+    assert!(
+        defait
+            .iter()
+            .filter(|(c, _, _)| c.starts_with(&*immersion.to_string_lossy()))
+            .all(|(_, a, _)| *a == imm),
+        "les trois CD reviennent ENSEMBLE à l'Immersion : {defait:?}"
+    );
+
+    scan_force(&b.etat).await;
+    assert_eq!(
+        disposition(&b.db),
+        defait,
+        "après « Défaire », le scan garde l'album de trois disques"
+    );
+}

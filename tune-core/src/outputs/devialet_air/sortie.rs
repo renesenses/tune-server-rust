@@ -153,6 +153,10 @@ pub struct DevialetAirOutput {
     phase: AsyncMutex<Phase>,
     compteur_flux: Arc<AtomicU32>,
     compteur_paquets: AtomicU16,
+    /// #8536 — la session de CETTE sortie, tirée au hasard à sa création et
+    /// gardée pour tous ses flux. Jamais celle de l'annonce : c'est celle
+    /// d'un autre hôte (Roon), à qui l'ampli renverrait ses retours `Df`.
+    session: [u8; 4],
     /// Ce que le flux en cours fait au signal, pour le chemin du signal.
     transformations: Mutex<Option<TransformationsReelles>>,
     echec: Mutex<Option<String>>,
@@ -190,6 +194,25 @@ fn est_un_de_nos_flux(compteur: &AtomicU32, octet: u8) -> bool {
     (0..8u32).any(|k| (c.wrapping_sub(k) & 0xFF) as u8 == octet)
 }
 
+/// #8536 — une session de 4 octets tirée au hasard, jamais nulle. L'ampli
+/// adopte la session d'un flux neuf et l'associe à l'adresse qui l'envoie.
+fn session_aleatoire() -> [u8; 4] {
+    loop {
+        let mut s = [0u8; 4];
+        if getrandom::getrandom(&mut s).is_err() {
+            // Repli sans aléa système : l'horloge en nanosecondes.
+            let n = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+                .unwrap_or(0x5eed_0001);
+            s = n.to_le_bytes();
+        }
+        if s != [0; 4] {
+            return s;
+        }
+    }
+}
+
 fn graine_de_flux() -> u32 {
     // Un départ qui change d'un démarrage du serveur à l'autre, pour ne pas
     // reprendre l'identifiant d'un flux que l'ampli aurait encore en tête.
@@ -212,10 +235,17 @@ impl DevialetAirOutput {
             phase: AsyncMutex::new(Phase::Arret),
             compteur_flux: Arc::new(AtomicU32::new(graine_de_flux())),
             compteur_paquets: AtomicU16::new(0),
+            session: session_aleatoire(),
             transformations: Mutex::new(None),
             echec: Mutex::new(None),
             volume_voulu: Mutex::new(reglages::db_vers_volume(-40.0)),
         }
+    }
+
+    /// #8536 — la session de cette sortie, pour les témoins.
+    #[cfg(test)]
+    pub(crate) fn session(&self) -> [u8; 4] {
+        self.session
     }
 
     fn ampli(&self) -> Option<AmpliVu> {
@@ -406,7 +436,8 @@ impl DevialetAirOutput {
         );
         let flux = flux_suivant(&self.compteur_flux);
         let p = ParametresFlux {
-            session: ampli.annonce.session,
+            session: self.session,
+            session_annoncee: ampli.annonce.session,
             flux,
             frequence: cadence_envoyee,
             cadence: self.contexte.cadence,

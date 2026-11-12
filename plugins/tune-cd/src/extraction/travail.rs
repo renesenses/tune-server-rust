@@ -18,6 +18,7 @@ use super::accuraterip::{self, CalculAccurateRip};
 use super::balises::{self, Balises};
 use super::lecture_sure::{self, Bilan, SECTEURS_PAR_BLOC, Verification};
 use super::{ErreurTravail, Format, StatutPiste, Travail};
+use crate::accuraterip_base::{self as ar, Base, CalculDecale, IdentifiantAr};
 use crate::lecteur::{ErreurCd, LecteurDisque};
 use crate::toc::{OCTETS_PAR_SECTEUR, TRAMES_PAR_SECTEUR};
 
@@ -35,6 +36,20 @@ pub struct PlanPiste {
     /// Première et dernière piste AUDIO du disque (bords AccurateRip).
     pub premiere_audio: bool,
     pub derniere_audio: bool,
+    /// #8522 — rang de la piste parmi les pistes audio (index dans la base).
+    pub index_ar: usize,
+}
+
+/// #8522 — ce que la vérification AccurateRip de l'extraction sait.
+#[derive(Debug, Clone)]
+pub struct PlanAr {
+    pub identifiant: IdentifiantAr,
+    /// Remplie par le déroulé avant la première piste.
+    pub base: Base,
+    pub decalage: i32,
+    pub decalage_detecte: bool,
+    /// Le programme audio, en secteurs : `[début de la 1ʳᵉ piste, fin)`.
+    pub audio: (u32, u32),
 }
 
 /// Tout ce que le fil bloquant doit savoir.
@@ -49,6 +64,8 @@ pub struct Plan {
     pub dossier: PathBuf,
     pub pistes: Vec<PlanPiste>,
     pub pochette: Option<Vec<u8>>,
+    /// #8522 — `None` : pas de vérification (témoins anciens).
+    pub ar: Option<PlanAr>,
 }
 
 /// Le fichier provisoire d'un chemin final.
@@ -186,12 +203,41 @@ fn extraire_piste(
             Sortie::Wav(w)
         }
     };
-    let mut ar = CalculAccurateRip::new(
+    let mut calcul_ar = CalculAccurateRip::new(
         secteurs * TRAMES_PAR_SECTEUR as u32,
         piste.premiere_audio,
         piste.derniere_audio,
     );
     let mut bilan = Bilan::default();
+    // #8522 — le CRC au décalage du lecteur, au fil de la lecture : seules
+    // les trames qui débordent de la piste sont lues en plus.
+    let mut decale = plan.ar.as_ref().map(|a| {
+        CalculDecale::new(
+            secteurs * TRAMES_PAR_SECTEUR as u32,
+            (piste.premiere_audio, piste.derniere_audio),
+            a.decalage,
+        )
+    });
+    let mut bilan_bords = Bilan::default();
+    let mut lire_bord = |l: u32, k: u32, s: &mut [u8]| -> Result<(), ErreurCd> {
+        let v = lecture_sure::lire_bloc(
+            plan.lecteur.as_ref(),
+            l,
+            k,
+            plan.verification,
+            &mut bilan_bords,
+        )?;
+        s.copy_from_slice(&v);
+        Ok(())
+    };
+    let erreur_de_lecture = |e: ErreurCd| match e {
+        ErreurCd::AucunDisque => disque_retire(),
+        e => ErreurTravail::new("lecture", e.to_string()),
+    };
+    if let (Some(c), Some(a)) = (decale.as_mut(), plan.ar.as_ref()) {
+        c.avant(&mut lire_bord, piste.debut, a.audio)
+            .map_err(erreur_de_lecture)?;
+    }
     let mut lba = piste.debut;
     while lba < piste.fin {
         if travail.annulee() {
@@ -212,7 +258,10 @@ fn extraire_piste(
             Err(ErreurCd::AucunDisque) => return Err(disque_retire()),
             Err(e) => return Err(ErreurTravail::new("lecture", e.to_string())),
         };
-        ar.ajouter(&bloc);
+        calcul_ar.ajouter(&bloc);
+        if let Some(c) = decale.as_mut() {
+            c.piste(&bloc);
+        }
         match &mut sortie {
             Sortie::Flac(enc) => enc.write_sync(&bloc).map_err(erreur_encodage)?,
             Sortie::Wav(w) => w.write_all(&bloc).map_err(sur(&part))?,
@@ -229,6 +278,30 @@ fn extraire_piste(
         });
         progression();
     }
+    // #8522 — le verdict, AVANT les balises qui le portent.
+    let mut balises = piste.balises.clone();
+    let mut verdict = None;
+    if let (Some(c), Some(a)) = (decale.as_mut(), plan.ar.as_ref()) {
+        c.apres(&mut lire_bord, piste.fin, a.audio)
+            .map_err(erreur_de_lecture)?;
+        let v = ar::juger(
+            &a.base,
+            piste.index_ar,
+            piste.numero,
+            c.resultat(),
+            a.decalage,
+        );
+        let texte = ar::texte_de_balise(&v);
+        tracing::info!(
+            piste = piste.numero,
+            disque = %a.identifiant.nom(),
+            verdict = %texte,
+            "cd_extraction_accuraterip"
+        );
+        balises.accuraterip = Some(texte);
+        balises.accuraterip_disque = Some(a.identifiant.nom());
+        verdict = Some(v);
+    }
     travail.modifier(|e| e.pistes[i].statut = StatutPiste::Ecriture);
     match sortie {
         Sortie::Flac(mut enc) => {
@@ -242,16 +315,22 @@ fn extraire_piste(
                 .map_err(sur(&part))?;
         }
     }
-    balises::ecrire(&part, plan.format, &piste.balises, plan.pochette.as_deref())
+    balises::ecrire(&part, plan.format, &balises, plan.pochette.as_deref())
         .map_err(|m| ErreurTravail::new("balises", m))?;
     if plan.ecraser && piste.chemin.exists() {
         std::fs::remove_file(&piste.chemin).map_err(sur(&piste.chemin))?;
     }
     std::fs::rename(&part, &piste.chemin).map_err(sur(&piste.chemin))?;
-    let (v1, v2) = ar.resultat();
+    let (v1, v2) = calcul_ar.resultat();
     travail.modifier(|e| {
         e.pistes[i].accuraterip_v1 = Some(accuraterip::hex(v1));
         e.pistes[i].accuraterip_v2 = Some(accuraterip::hex(v2));
+        if let Some(v) = verdict {
+            if let Some(a) = e.accuraterip.as_mut() {
+                a.pistes.push(v.clone());
+            }
+            e.pistes[i].verification = Some(v);
+        }
     });
     if bilan.secteurs_illisibles > 0 {
         tracing::warn!(

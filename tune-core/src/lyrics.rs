@@ -21,6 +21,17 @@ use crate::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 /// Negative cache entries (no lyrics found) are retried after this delay.
 pub const NEGATIVE_CACHE_TTL_DAYS: i64 = 14;
 
+/// `lyrics_cache.source` d'un ÉCHEC enregistré par une version qui fait le
+/// dernier essai sans album (#8417).
+///
+/// Les échecs écrits avant ce correctif portent `source = 'lrclib'` : ils ont
+/// été décidés sans ce dernier essai, et une compilation (« 15 Jaar Top 2000
+/// FLAC00010500(1975) ») y est restée « sans paroles ». Seuls les échecs qui
+/// portent cette marque dispensent d'une nouvelle recherche ; les anciens sont
+/// périmés d'office, sans migration ni purge, et les paroles trouvées
+/// (positifs) restent en cache.
+pub const SOURCE_ECHEC_LRCLIB: &str = "lrclib-8417";
+
 /// Process-wide count of LRCLIB replies that told us to slow down (HTTP 429
 /// « Too Many Requests » or 503). Incremented by [`fetch_lrclib_raw`], never
 /// reset — a caller snapshots it before a run and compares afterwards.
@@ -395,6 +406,13 @@ pub const ECART_DE_DUREE_SYNCHRO_SECS: f64 = 2.0;
 /// quel passe TOUJOURS en premier, donc rien de ce qui marche aujourd'hui ne
 /// peut régresser. Un 429/503 sort par `?` sans rien retenter.
 ///
+/// #8417 — dernier essai SANS album : si l'album a été envoyé et que
+/// `/api/get` a rendu 404 (avec le titre tel quel, puis nettoyé s'il y avait
+/// lieu), on rejoue sans `album_name`, même durée. Une compilation locale
+/// (« 15 Jaar Top 2000 FLAC00010500(1975) ») n'existe pas chez LRCLIB alors
+/// que le morceau, lui, y est. Au plus trois `/api/get` par piste ; un
+/// 429/503 sort toujours par `?`.
+///
 /// #5248 — quand `/api/get` rend des paroles SANS `syncedLyrics`, on
 /// interroge `/api/search` et on retient une version synchronisée dont la
 /// durée est à ±[`ECART_DE_DUREE_SYNCHRO_SECS`] de la piste. Voir
@@ -442,6 +460,11 @@ pub async fn fetch_lrclib_raw_sur(
             duration_secs,
         )
         .await?;
+    }
+    let album_envoye = album_name.is_some_and(|a| !a.trim().is_empty());
+    if trouve.is_none() && album_envoye {
+        debug!("lrclib_retry_sans_album (#8417)");
+        trouve = lrclib_get(client, base, artist, track_name, None, duration_secs).await?;
     }
     match trouve {
         Some(raw) if !a_des_paroles_synchronisees(&raw) => Ok(Some(
@@ -762,7 +785,13 @@ impl LyricsCacheEntry {
     }
 
     /// True when a cached negative is still fresh (no re-fetch needed).
+    ///
+    /// Un échec antérieur à #8417 (sans la marque [`SOURCE_ECHEC_LRCLIB`]) ne
+    /// l'est jamais : il a été décidé sans le dernier essai sans album.
     pub fn negative_still_fresh(&self) -> bool {
+        if self.source != SOURCE_ECHEC_LRCLIB {
+            return false;
+        }
         let Some(ref fetched) = self.fetched_at else {
             return false;
         };
@@ -855,7 +884,12 @@ pub fn store_cache_entry(
     });
 
     let fetched_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let source = "lrclib";
+    let vide = |s: Option<&str>| s.is_none_or(|s| s.trim().is_empty());
+    let source = if vide(synced_lyrics) && vide(plain_lyrics) {
+        SOURCE_ECHEC_LRCLIB
+    } else {
+        "lrclib"
+    };
     let params: [&dyn ToSqlValue; 7] = [
         &track_id,
         &title,
@@ -891,6 +925,12 @@ pub async fn get_lyrics(
         && cached.spares_a_fetch()
     {
         debug!(track_id, "lyrics_cache_hit");
+        // Un échec porte la marque #8417 en base ; le client lit « lrclib ».
+        let source = if cached.is_negative() {
+            "lrclib".to_string()
+        } else {
+            cached.source.clone()
+        };
         let lines = cached
             .synced_lyrics
             .as_deref()
@@ -900,7 +940,7 @@ pub async fn get_lyrics(
             synced: !lines.is_empty(),
             lines,
             plain_text: cached.plain_lyrics,
-            source: cached.source,
+            source,
         });
     }
 
@@ -1051,13 +1091,25 @@ mod tests {
     #[test]
     fn negative_cache_freshness() {
         let fresh = LyricsCacheEntry {
+            source: SOURCE_ECHEC_LRCLIB.into(),
             fetched_at: Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
             ..Default::default()
         };
         assert!(fresh.is_negative());
         assert!(fresh.negative_still_fresh());
 
+        // #8417 — un échec d'avant le correctif (`source = 'lrclib'`), même
+        // d'il y a une minute, ne dispense plus d'une recherche.
+        let ancien = LyricsCacheEntry {
+            source: "lrclib".into(),
+            ..fresh.clone()
+        };
+        assert!(ancien.is_negative());
+        assert!(!ancien.negative_still_fresh());
+        assert!(!ancien.spares_a_fetch());
+
         let stale = LyricsCacheEntry {
+            source: SOURCE_ECHEC_LRCLIB.into(),
             fetched_at: Some("2020-01-01T00:00:00Z".into()),
             ..Default::default()
         };
@@ -1338,6 +1390,155 @@ mod tests {
         assert_eq!(raw.synced_lyrics, None);
         assert_eq!(raw.plain_lyrics.as_deref(), Some(TEXTE_BRUT));
         assert_eq!(journal.lock().unwrap().len(), 2);
+    }
+
+    // ── #8417 : dernier essai sans album ───────────────────────────────────
+
+    /// Un faux LRCLIB qui se comporte comme le vrai pour Pierre M : `/api/get`
+    /// rend 404 dès qu'un `album_name` est donné (compilation inconnue), et les
+    /// paroles sans album — sauf si `connu` est faux (titre absent partout).
+    /// `statut_avec_album` force la réponse de l'appel avec album (429…).
+    async fn faux_lrclib_sans_album(
+        connu: bool,
+        statut_avec_album: u16,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        use axum::extract::RawQuery;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::get as route_get;
+
+        let journal: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (j_get, j_search) = (journal.clone(), journal.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/get",
+                route_get(move |RawQuery(q): RawQuery| {
+                    let j = j_get.clone();
+                    async move {
+                        let q = q.unwrap_or_default();
+                        j.lock().unwrap().push(format!("get?{q}"));
+                        if q.contains("album_name=") {
+                            return StatusCode::from_u16(statut_avec_album)
+                                .unwrap()
+                                .into_response();
+                        }
+                        if !connu {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        axum::Json(serde_json::json!({
+                            "trackName": "Bohemian Rhapsody", "artistName": "Queen",
+                            "albumName": "A Night at the Opera", "duration": 355.0,
+                            "plainLyrics": TEXTE_BRUT, "syncedLyrics": LRC_280}))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/api/search",
+                route_get(move |RawQuery(q): RawQuery| {
+                    let j = j_search.clone();
+                    async move {
+                        j.lock()
+                            .unwrap()
+                            .push(format!("search?{}", q.unwrap_or_default()));
+                        axum::Json(serde_json::json!([]))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port local");
+        let port = listener.local_addr().expect("adresse locale").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://127.0.0.1:{port}"), journal)
+    }
+
+    async fn chercher_queen(base: &str, album: Option<&str>) -> Result<Option<LrclibRaw>, String> {
+        fetch_lrclib_raw_sur(
+            crate::http::client::shared(),
+            base,
+            "Queen",
+            "Bohemian Rhapsody",
+            album,
+            Some(355),
+        )
+        .await
+    }
+
+    /// LE CAS DU TESTEUR (fil 2722). Album de compilation inconnu de LRCLIB,
+    /// sans mention de qualité que Tune sache retirer : 404 avec l'album,
+    /// paroles sans. Rouge avant #8417 : un seul appel, `Ok(None)`.
+    #[tokio::test]
+    async fn compilation_inconnue_le_dernier_essai_sans_album_rend_les_paroles() {
+        let album = "15 Jaar Top 2000 FLAC00010500(1975)";
+        assert_eq!(
+            album_de_repli(Some(album)),
+            None,
+            "pas de repli nettoyé ici"
+        );
+        let (base, journal) = faux_lrclib_sans_album(true, 404).await;
+        let raw = chercher_queen(&base, Some(album))
+            .await
+            .expect("pas d'erreur")
+            .expect("les paroles, trouvées sans l'album (#8417)");
+        assert_eq!(raw.synced_lyrics.as_deref(), Some(LRC_280));
+
+        let j = journal.lock().unwrap().clone();
+        assert_eq!(j.len(), 2, "avec album, puis sans : {j:?}");
+        assert!(
+            j[0].contains("album_name="),
+            "l'album passe d'abord : {j:?}"
+        );
+        assert!(
+            !j[1].contains("album_name"),
+            "dernier essai sans album : {j:?}"
+        );
+        assert!(j[1].contains("duration=355"), "même durée : {j:?}");
+    }
+
+    /// Titre réellement absent : « aucune parole », au plus trois appels même
+    /// avec une mention de qualité (tel quel, nettoyé, sans album).
+    #[tokio::test]
+    async fn titre_absent_partout_au_plus_trois_appels() {
+        let (base, journal) = faux_lrclib_sans_album(false, 404).await;
+        let raw = chercher_queen(&base, Some("A Night at the Opera [24/96]"))
+            .await
+            .expect("pas d'erreur");
+        assert!(raw.is_none());
+        let j = journal.lock().unwrap().clone();
+        assert_eq!(j.len(), 3, "tel quel, nettoyé, sans album : {j:?}");
+        assert!(
+            j.iter().all(|r| r.starts_with("get?")),
+            "pas de recherche : {j:?}"
+        );
+
+        let (base, journal) = faux_lrclib_sans_album(false, 404).await;
+        assert!(
+            chercher_queen(&base, Some("Compilation"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(journal.lock().unwrap().len(), 2);
+    }
+
+    /// Sans album connu, le premier appel est déjà sans album : rien à rejouer.
+    #[tokio::test]
+    async fn sans_album_aucun_appel_de_plus() {
+        let (base, journal) = faux_lrclib_sans_album(false, 404).await;
+        assert!(chercher_queen(&base, None).await.unwrap().is_none());
+        assert!(chercher_queen(&base, Some("  ")).await.unwrap().is_none());
+        assert_eq!(journal.lock().unwrap().len(), 2, "un appel chacun");
+    }
+
+    /// Un 429 sur l'appel avec album sort en erreur sans rien retenter.
+    #[tokio::test]
+    async fn un_429_avec_album_ne_retente_pas_sans_album() {
+        let (base, journal) = faux_lrclib_sans_album(true, 429).await;
+        assert!(chercher_queen(&base, Some("Compilation")).await.is_err());
+        assert_eq!(journal.lock().unwrap().len(), 1);
     }
 
     /// La règle de choix : même titre exigé, puis le même album d'abord, puis

@@ -676,7 +676,8 @@ impl AppState {
         ));
         skin_manager.ensure_dirs();
 
-        let loader = crate::plugins::build_loader(&event_bus, backend.clone(), license.clone());
+        let loader =
+            crate::plugins::build_loader(&event_bus, backend.clone(), license.clone(), db_path);
         let plugin_setup_report = loader.setup_report();
         let plugins = Arc::new(Mutex::new(loader));
 
