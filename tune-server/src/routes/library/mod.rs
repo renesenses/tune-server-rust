@@ -50,6 +50,8 @@ mod etiquetage_par_filtre;
 mod exemplaires;
 mod facets;
 mod faux_hires;
+/// #8160 — la fiche technique d'une piste.
+pub(crate) mod fiche_technique;
 mod folder_facet;
 mod genres;
 // LA définition du genre, partagée avec `/dashboard/stats` (#4527) : une seule
@@ -546,6 +548,13 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/file-tags", get(tracks::track_file_tags))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/spectrogramme.png", get(spectrogramme::png))
+        // #8160 — la fiche technique d'une piste (lecture seule), et le
+        // recalcul de son spectrogramme conservé.
+        .route("/tracks/{id}/fiche-technique", get(fiche_technique::fiche))
+        .route(
+            "/tracks/{id}/spectrogramme",
+            post(spectrogramme::recalculer),
+        )
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
         // #2264 — les mêmes candidats, regroupés par enregistrement, avec la
