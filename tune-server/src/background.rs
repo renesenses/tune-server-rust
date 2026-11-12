@@ -3238,6 +3238,13 @@ fn spawn_memory_diagnostics(
         #[cfg(target_os = "linux")]
         let mut rss_initial_mb: Option<u64> = None;
         loop {
+            // #8609 — « libre mais gardé » contre « en usage » : le RSS seul
+            // ne les distingue pas. UN `mallinfo2` par relevé (il parcourt les
+            // arènes, hors du fil async), servi à la ligne ET à la purge.
+            let tas = tokio::task::spawn_blocking(tune_core::memoire_rendue::etat_du_tas)
+                .await
+                .ok()
+                .flatten();
             #[cfg(target_os = "linux")]
             if let Ok(statm) = tokio::fs::read_to_string("/proc/self/statm").await {
                 let rss_pages: u64 = statm
@@ -3255,13 +3262,6 @@ fn spawn_memory_diagnostics(
                 // Ventilation du RSS : un champ indisponible est omis de la
                 // ligne, jamais remplacé par un zéro.
                 let detail = crate::releve_memoire::lire().await;
-                // #8609 — « libre mais gardé » contre « en usage » : le RSS
-                // seul ne les distingue pas. `mallinfo2` parcourt les arènes,
-                // hors du fil async.
-                let tas = tokio::task::spawn_blocking(tune_core::memoire_rendue::etat_du_tas)
-                    .await
-                    .ok()
-                    .flatten();
                 info!(
                     rss_mb,
                     rss_delta_mb,
@@ -3278,7 +3278,7 @@ fn spawn_memory_diagnostics(
             }
             // #8609 — y compris pendant une lecture locale (voir
             // `memoire_a_froid::decider_la_purge`).
-            crate::memoire_a_froid::purger_a_froid(&backend).await;
+            crate::memoire_a_froid::purger_a_froid(&backend, tas).await;
             let _ = (&outputs, &streamer); // keep alive on non-linux
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }

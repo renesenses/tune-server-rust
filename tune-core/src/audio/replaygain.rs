@@ -1647,11 +1647,14 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // async ; le rappel de rendu local n'alloue pas et ne peut pas attendre.
     if done > 0
         && let Some(p) = crate::memoire_rendue::rendre_hors_du_fil_async().await
-        && p.rendu
+        && (p.glibc_dit_rendu || p.rendu())
     {
         info!(
-            rss_avant_mb = p.rss_avant_mb,
-            rss_apres_mb = p.rss_apres_mb,
+            rss_avant_mb = p.rss_avant_mb(),
+            rss_apres_mb = p.rss_apres_mb(),
+            rendu = p.rendu(),
+            rendu_mb = p.rendu_mb(),
+            memoire_verrouillee_mb = p.verrouillee_kb.map(|k| k / 1024),
             duree_ms = p.duree_ms,
             "replaygain_memoire_rendue"
         );

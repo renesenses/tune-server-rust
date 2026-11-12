@@ -1,13 +1,23 @@
 //! Rendre au noyau les pages libres que l'allocateur garde (`malloc_trim`).
 //!
 //! Le geste et sa mesure sont décrits dans `tune-server/src/memoire_a_froid.rs`,
-//! qui le joue toutes les cinq minutes à froid. Il vit ici, dans `tune-core`,
-//! pour que la passe acoustique puisse le jouer AUSSITÔT après avoir relâché sa
-//! session ONNX — sans attendre le prochain relevé (fuite CLAP du .18, 08/10).
+//! qui le joue toutes les cinq minutes. Il vit ici, dans `tune-core`, pour que
+//! la passe ReplayGain et la passe acoustique puissent le jouer AUSSITÔT après
+//! une tâche lourde — sans attendre le prochain relevé (fuite CLAP du .18,
+//! 08/10 ; #8609).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Une purge à la fois (#8609) : le relevé de cinq minutes, la fin d'un lot
+/// ReplayGain et le relâchement d'une session ONNX peuvent tomber ensemble.
+/// Deux `malloc_trim` simultanés se disputeraient les mêmes verrous d'arène
+/// pour rien : le second passe son tour.
+static PURGE_EN_COURS: AtomicBool = AtomicBool::new(false);
 
 /// Rend au noyau les pages libres que l'allocateur garde. `true` quand
-/// l'allocateur dit en avoir rendu ; `false` s'il n'y avait rien à rendre, ou
-/// hors glibc, où rien n'est fait.
+/// l'allocateur DIT en avoir rendu — ce qui ne prouve rien sous `mlockall`
+/// (voir [`purger`]) ; `false` s'il n'y avait rien à rendre, si une autre
+/// purge tourne déjà, ou hors glibc, où rien n'est fait.
 ///
 /// ⚠️ Tient le verrou de chaque arène pendant qu'il la parcourt : un fil qui
 /// ALLOUE à cet instant attend (de 0 à quelques dizaines de millisecondes).
@@ -15,25 +25,27 @@
 ///
 /// # Pendant une lecture LOCALE (#8609)
 ///
-/// Il n'attend que les fils qui allouent ou libèrent. Le rappel de rendu
-/// local n'en fait aucun : il lit l'anneau dans le tampon que lui tend le
-/// pilote (`render_local_shared_*_callback`, plus aucune allocation depuis
-/// #2218, gardé par `outputs::local::ringbuf_tests` qui compte les appels à
-/// l'allocateur), et le fil ALSA de cpal travaille dans des tampons faits à
-/// l'ouverture. Le producteur, lui, alloue, mais il a deux secondes d'anneau
-/// devant lui. Mesuré sur Shrek (banc `banc_trim_pendant_lecture_8609`) :
-/// voir `tune-server/src/memoire_a_froid.rs`.
+/// Il n'attend que les fils qui allouent ou libèrent. Les rappels de rendu
+/// local n'en font aucun : ils lisent l'anneau dans le tampon que leur tend le
+/// pilote, et des gardes comptent leurs appels à l'allocateur
+/// (`outputs::local::ringbuf_tests` : rappels partagés `f32` et entier, rappel
+/// natif S32 ; `sortie_double_locale` : la recopie vers la seconde sortie).
+/// Le fil ALSA de cpal travaille dans des tampons faits à l'ouverture. Le
+/// producteur, lui, alloue, mais il a deux secondes d'anneau devant lui.
+/// Mesuré sur Shrek (banc `banc_trim_pendant_lecture_8609`) : voir
+/// `tune-server/src/memoire_a_froid.rs` et la PR #8614.
 pub fn rendre_la_memoire_liberee() -> bool {
+    if PURGE_EN_COURS.swap(true, Ordering::AcqRel) {
+        return false;
+    }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        // SAFETY : `malloc_trim` n'a pas de précondition ; il prend lui-même
-        // le verrou de chaque arène et ne déplace aucune allocation vivante.
-        unsafe { libc::malloc_trim(0) != 0 }
-    }
+    // SAFETY : `malloc_trim` n'a pas de précondition ; il prend lui-même
+    // le verrou de chaque arène et ne déplace aucune allocation vivante.
+    let rendu = unsafe { libc::malloc_trim(0) != 0 };
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    {
-        false
-    }
+    let rendu = false;
+    PURGE_EN_COURS.store(false, Ordering::Release);
+    rendu
 }
 
 /// Ce que dit `mallinfo2()` du tas, en mégaoctets (#8609).
@@ -53,16 +65,40 @@ pub struct EtatDuTas {
     pub mmap_mb: u64,
 }
 
-/// Lit l'état du tas. `None` hors glibc.
+/// `mallinfo2`, résolu À L'EXÉCUTION (`dlsym`) et non à l'édition des liens :
+/// il n'existe que depuis la glibc 2.33, et la cible
+/// `aarch64-unknown-linux-gnu` est construite par `cross` dans un conteneur
+/// plus ancien. Un appel direct ferait échouer l'édition des liens (ou le
+/// chargement du binaire sur une glibc < 2.33). Absent : `None`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn mallinfo2_resolu() -> Option<unsafe extern "C" fn() -> libc::mallinfo2> {
+    static FN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let adresse = *FN.get_or_init(|| {
+        // SAFETY : `dlsym` sur `RTLD_DEFAULT` avec un nom C terminé par NUL ;
+        // il rend NULL si le symbole n'existe pas.
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) as usize }
+    });
+    if adresse == 0 {
+        return None;
+    }
+    // SAFETY : l'adresse est celle de `mallinfo2`, dont la signature glibc
+    // est `struct mallinfo2 mallinfo2(void)`.
+    Some(unsafe {
+        std::mem::transmute::<usize, unsafe extern "C" fn() -> libc::mallinfo2>(adresse)
+    })
+}
+
+/// Lit l'état du tas. `None` hors glibc, ou glibc < 2.33 (pas de `mallinfo2`).
 ///
 /// ⚠️ `mallinfo2` prend, lui aussi, le verrou de chaque arène le temps de
-/// compter ses listes libres : hors du fil async, comme la purge.
+/// compter ses listes libres : hors du fil async, comme la purge, et une
+/// fois par relevé.
 pub fn etat_du_tas() -> Option<EtatDuTas> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        // SAFETY : `mallinfo2` n'a pas de précondition et rend une structure
-        // par valeur.
-        let m = unsafe { libc::mallinfo2() };
+        let f = mallinfo2_resolu()?;
+        // SAFETY : voir `mallinfo2_resolu` ; aucune précondition.
+        let m = unsafe { f() };
         const MO: usize = 1024 * 1024;
         Some(EtatDuTas {
             en_usage_mb: ((m.uordblks + m.hblkhd) / MO) as u64,
@@ -76,13 +112,14 @@ pub fn etat_du_tas() -> Option<EtatDuTas> {
     }
 }
 
-/// RSS du processus en mégaoctets (`/proc/self/statm`). `None` hors Linux.
-pub fn rss_mb() -> Option<u64> {
+/// RSS du processus en kilooctets (`/proc/self/statm`, pages de 4 Kio).
+/// `None` hors Linux.
+pub fn rss_kb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
         let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        Some(pages * 4 / 1024)
+        Some(pages * 4)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -90,19 +127,104 @@ pub fn rss_mb() -> Option<u64> {
     }
 }
 
-/// Une purge faite, et ce qu'elle a rendu.
+/// RSS du processus en mégaoctets. `None` hors Linux.
+pub fn rss_mb() -> Option<u64> {
+    rss_kb().map(|k| k / 1024)
+}
+
+/// Mémoire verrouillée du processus (`VmLck` de `/proc/self/status`), en
+/// kilooctets. `None` hors Linux ou champ absent.
+///
+/// Sous `mlockall(MCL_FUTURE)` — Tune OS et le paquet `.deb` posent
+/// `LimitMEMLOCK=infinity`, et le premier rendu local verrouille alors toute
+/// la mémoire (#3206, `audio::ordonnancement_rt`) — le noyau REFUSE
+/// `MADV_DONTNEED` sur les pages verrouillées : `malloc_trim` ne rend
+/// presque rien, mais la glibc répond quand même « rendu ». D'où ce champ
+/// dans chaque ligne de purge.
+pub fn memoire_verrouillee_kb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmLck:"))
+            .and_then(|v| v.split_whitespace().next()?.parse().ok())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Une purge faite, et ce qu'elle a VRAIMENT rendu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PurgeFaite {
-    pub rss_avant_mb: Option<u64>,
-    pub rss_apres_mb: Option<u64>,
-    /// L'allocateur dit avoir rendu des pages.
-    pub rendu: bool,
+    pub rss_avant_kb: Option<u64>,
+    pub rss_apres_kb: Option<u64>,
+    /// Ce que la glibc a répondu (`malloc_trim != 0`). Ne prouve rien : sous
+    /// `mlockall`, elle répond « rendu » sans que le RSS bouge.
+    pub glibc_dit_rendu: bool,
+    /// Mémoire verrouillée (`VmLck`) au moment de la purge, en Ko.
+    pub verrouillee_kb: Option<u64>,
     pub duree_ms: u64,
 }
 
-/// Purge HORS du fil async, juste après une tâche lourde qui vient de rendre
-/// sa mémoire à l'allocateur (fin d'un lot ReplayGain, session ONNX relâchée),
-/// QUE QUELQUE CHOSE JOUE OU NON (#8609). `None` hors glibc.
+impl PurgeFaite {
+    /// Ce que le RSS a perdu, en Mo (0 s'il n'a pas baissé ou est inconnu).
+    pub fn rendu_mb(&self) -> u64 {
+        match (self.rss_avant_kb, self.rss_apres_kb) {
+            (Some(a), Some(b)) => a.saturating_sub(b) / 1024,
+            _ => 0,
+        }
+    }
+
+    /// `true` seulement si le RSS a BAISSÉ d'au moins 1 Mo.
+    pub fn rendu(&self) -> bool {
+        self.rendu_mb() > 0
+    }
+
+    /// Une partie de la mémoire est verrouillée (`mlockall` actif).
+    pub fn sous_mlock(&self) -> bool {
+        self.verrouillee_kb.is_some_and(|k| k > 0)
+    }
+
+    pub fn rss_avant_mb(&self) -> Option<u64> {
+        self.rss_avant_kb.map(|k| k / 1024)
+    }
+
+    pub fn rss_apres_mb(&self) -> Option<u64> {
+        self.rss_apres_kb.map(|k| k / 1024)
+    }
+}
+
+/// Purge MESURÉE, sur le fil courant (jamais le fil async ni un rappel
+/// audio). `None` hors glibc, ou si une autre purge tourne déjà.
+pub fn purger() -> Option<PurgeFaite> {
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+        return None;
+    }
+    if PURGE_EN_COURS.load(Ordering::Acquire) {
+        return None;
+    }
+    let verrouillee_kb = memoire_verrouillee_kb();
+    let rss_avant_kb = rss_kb();
+    let debut = std::time::Instant::now();
+    // La course entre le `load` ci-dessus et le `swap` de
+    // `rendre_la_memoire_liberee` est sans danger : au pire une purge rend
+    // `false` sans avoir rien fait, et le RSS ne bouge pas.
+    let glibc_dit_rendu = rendre_la_memoire_liberee();
+    Some(PurgeFaite {
+        rss_avant_kb,
+        rss_apres_kb: rss_kb(),
+        glibc_dit_rendu,
+        verrouillee_kb,
+        duree_ms: debut.elapsed().as_millis() as u64,
+    })
+}
+
+/// [`purger`] HORS du fil async, juste après une tâche lourde qui vient de
+/// rendre sa mémoire à l'allocateur (fin d'un lot ReplayGain, session ONNX
+/// relâchée), QUE QUELQUE CHOSE JOUE OU NON (#8609).
 ///
 /// Avant #8609, ces purges n'avaient lieu que si rien ne jouait : un serveur
 /// qui écoute sur sa carte son toute la journée ne rendait jamais rien
@@ -112,19 +234,7 @@ pub async fn rendre_hors_du_fil_async() -> Option<PurgeFaite> {
     if !cfg!(all(target_os = "linux", target_env = "gnu")) {
         return None;
     }
-    tokio::task::spawn_blocking(|| {
-        let rss_avant_mb = rss_mb();
-        let debut = std::time::Instant::now();
-        let rendu = rendre_la_memoire_liberee();
-        PurgeFaite {
-            rss_avant_mb,
-            rss_apres_mb: rss_mb(),
-            rendu,
-            duree_ms: debut.elapsed().as_millis() as u64,
-        }
-    })
-    .await
-    .ok()
+    tokio::task::spawn_blocking(purger).await.ok().flatten()
 }
 
 // ---------------------------------------------------------------------------

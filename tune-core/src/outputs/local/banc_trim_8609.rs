@@ -263,7 +263,7 @@ fn phase(
     nom: &'static str,
     secondes: u64,
     fichiers: &[std::path::PathBuf],
-    purger: bool,
+    purger: Option<fn()>,
     allouer_dans_le_rappel: bool,
 ) -> (Phase, Vec<Vec<Vec<u8>>>) {
     let capacite = TAUX as usize * CANAUX as usize * 2;
@@ -306,9 +306,9 @@ fn phase(
         std::thread::sleep(Duration::from_millis(500));
         rss_max_mb = rss_max_mb.max(crate::memoire_rendue::rss_mb().unwrap_or(0));
         libre_max_mb = libre_max_mb.max(crate::memoire_rendue::etat_du_tas().unwrap().libre_mb);
-        if purger {
+        if let Some(purge) = purger {
             let t = Instant::now();
-            crate::memoire_rendue::rendre_la_memoire_liberee();
+            purge();
             durees_purge.push(t.elapsed().as_micros() as u64);
         }
     }
@@ -345,60 +345,40 @@ fn releve(quand: &str) {
     );
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-#[test]
-#[ignore = "banc de mesure #8609 : lancer à la main sur Shrek"]
-fn banc_trim_pendant_lecture_8609() {
-    let seuil = crate::memoire_rendue::fixer_le_seuil_mmap();
-    let secondes: u64 = std::env::var("BANC_8609_S")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
+fn purge_simple() {
+    crate::memoire_rendue::rendre_la_memoire_liberee();
+}
+
+/// Variante évaluée pour Tune OS (#8609, point 2 de la relecture) : lever le
+/// verrouillage le temps de la purge, puis le reposer à l'identique.
+fn purge_avec_reverrouillage() {
+    // SAFETY : appels sans pointeur.
+    unsafe { libc::munlockall() };
+    crate::memoire_rendue::rendre_la_memoire_liberee();
+    unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) };
+}
+
+fn preparer_les_pistes() -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
     let dossier = std::env::temp_dir().join(format!("banc-8609-{}", std::process::id()));
     std::fs::create_dir_all(&dossier).unwrap();
-    let fichiers: Vec<_> = (0..4u32)
+    let fichiers = (0..4u32)
         .map(|i| {
             let f = dossier.join(format!("piste-{i}.wav"));
             ecrire_wav_32(&f, 60, i + 1);
             f
         })
         .collect();
-    println!(
-        "\n#8609 — banc malloc_trim pendant lecture locale ({secondes} s par phase, seuil mmap : {})",
-        seuil.libelle()
-    );
-    println!(
-        "  MALLOC_ARENA_MAX={}",
-        std::env::var("MALLOC_ARENA_MAX").unwrap_or_else(|_| "(défaut)".into())
-    );
-    releve("départ");
+    (dossier, fichiers)
+}
 
-    let mut phases = Vec::new();
-    let (p, bouchons) = phase("1. sans purge", secondes, &fichiers, false, false);
-    phases.push(p);
-    releve("fin phase 1 (aucune purge)");
-    let t = Instant::now();
-    crate::memoire_rendue::rendre_la_memoire_liberee();
-    println!("  une purge : {} ms", t.elapsed().as_millis());
-    releve("après UNE purge");
-    drop(bouchons);
-    crate::memoire_rendue::rendre_la_memoire_liberee();
-    let (p, bouchons) = phase("2. purge /500 ms", secondes, &fichiers, true, false);
-    phases.push(p);
-    releve("fin phase 2");
-    drop(bouchons);
-    crate::memoire_rendue::rendre_la_memoire_liberee();
-    let (p, bouchons) = phase(
-        "3. contre-épreuve : alloue",
-        secondes,
-        &fichiers,
-        true,
-        true,
-    );
-    phases.push(p);
-    releve("fin phase 3");
-    drop(bouchons);
+fn secondes_par_phase() -> u64 {
+    std::env::var("BANC_8609_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+}
 
+fn imprimer(phases: &[Phase]) {
     println!(
         "\n  {:<28} {:>8} {:>7} {:>10} {:>8} {:>10} {:>10} {:>6} {:>9} {:>9} {:>3} {:>8} {:>9}",
         "phase",
@@ -415,7 +395,7 @@ fn banc_trim_pendant_lecture_8609() {
         "RSS_max",
         "libre_max"
     );
-    for p in &phases {
+    for p in phases {
         println!(
             "  {:<28} {:>8} {:>7} {:>8}µs {:>6}µs {:>8}µs {:>8}ms {:>6} {:>7}ms {:>7.1}ms {:>3} {:>6}Mo {:>7}Mo",
             p.nom,
@@ -433,5 +413,127 @@ fn banc_trim_pendant_lecture_8609() {
             p.libre_max_mb
         );
     }
+}
+
+#[test]
+#[ignore = "banc de mesure #8609 : lancer à la main sur Shrek"]
+fn banc_trim_pendant_lecture_8609() {
+    let seuil = crate::memoire_rendue::fixer_le_seuil_mmap();
+    let secondes = secondes_par_phase();
+    let (dossier, fichiers) = preparer_les_pistes();
+    println!(
+        "\n#8609 — banc malloc_trim pendant lecture locale ({secondes} s par phase, seuil mmap : {})",
+        seuil.libelle()
+    );
+    println!(
+        "  MALLOC_ARENA_MAX={}",
+        std::env::var("MALLOC_ARENA_MAX").unwrap_or_else(|_| "(défaut)".into())
+    );
+    releve("départ");
+
+    let mut phases = Vec::new();
+    let (p, bouchons) = phase("1. sans purge", secondes, &fichiers, None, false);
+    phases.push(p);
+    releve("fin phase 1 (aucune purge)");
+    let t = Instant::now();
+    crate::memoire_rendue::rendre_la_memoire_liberee();
+    println!("  une purge : {} ms", t.elapsed().as_millis());
+    releve("après UNE purge");
+    drop(bouchons);
+    purge_simple();
+    let (p, bouchons) = phase(
+        "2. purge /500 ms",
+        secondes,
+        &fichiers,
+        Some(purge_simple),
+        false,
+    );
+    phases.push(p);
+    releve("fin phase 2");
+    drop(bouchons);
+    purge_simple();
+    let (p, bouchons) = phase(
+        "3. contre-épreuve : alloue",
+        secondes,
+        &fichiers,
+        Some(purge_simple),
+        true,
+    );
+    phases.push(p);
+    releve("fin phase 3");
+    drop(bouchons);
+    imprimer(&phases);
+    let _ = std::fs::remove_dir_all(&dossier);
+}
+
+/// Point 2 de la relecture de #8614 : sous `mlockall` (Tune OS et `.deb`
+/// posent `LimitMEMLOCK=infinity`, et `audio::ordonnancement_rt` verrouille
+/// alors `MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT`), que rend la purge, et que
+/// coûtent les variantes ?
+///
+/// `BANC_8609_MLOCK` choisit le verrouillage posé AU DÉPART du processus :
+/// - `future` : celui de production ; purge simple ;
+/// - `relock` : celui de production ; purge = `munlockall`, `malloc_trim`,
+///   `mlockall` identique ;
+/// - `courant` : `MCL_CURRENT|MCL_ONFAULT` seul (ce qui sera alloué ensuite
+///   — ici l'anneau et les tampons de la phase — n'est PAS verrouillé) ;
+/// - `aucun` : témoin.
+///
+/// Demande `RLIMIT_MEMLOCK` assez grande (Shrek : 31 Gio) ; en production,
+/// une limite finie écarte `mlockall` (`decider_le_verrouillage`).
+#[test]
+#[ignore = "banc de mesure #8609 : lancer à la main sur Shrek"]
+fn banc_trim_sous_mlockall_8609() {
+    crate::memoire_rendue::fixer_le_seuil_mmap();
+    let mode = std::env::var("BANC_8609_MLOCK").unwrap_or_else(|_| "future".into());
+    let secondes = secondes_par_phase();
+    let (dossier, fichiers) = preparer_les_pistes();
+    let drapeaux = match mode.as_str() {
+        "future" | "relock" => Some(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT),
+        "courant" => Some(libc::MCL_CURRENT | libc::MCL_ONFAULT),
+        _ => None,
+    };
+    if let Some(d) = drapeaux {
+        // SAFETY : appel sans pointeur.
+        let rc = unsafe { libc::mlockall(d) };
+        assert_eq!(
+            rc,
+            0,
+            "mlockall refusé : {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let purge: fn() = if mode == "relock" {
+        purge_avec_reverrouillage
+    } else {
+        purge_simple
+    };
+    println!("\n#8609 — banc sous mlockall : mode {mode} ({secondes} s par phase)");
+    let vmlck = || crate::memoire_rendue::memoire_verrouillee_kb().unwrap_or(0) / 1024;
+    releve("départ");
+    let mut phases = Vec::new();
+    let (p, bouchons) = phase("1. sans purge", secondes, &fichiers, None, false);
+    phases.push(p);
+    releve("fin phase 1 (aucune purge)");
+    println!("  VmLck {} Mo", vmlck());
+    let t = Instant::now();
+    purge();
+    println!("  une purge ({mode}) : {} ms", t.elapsed().as_millis());
+    releve("après UNE purge");
+    println!("  VmLck {} Mo", vmlck());
+    drop(bouchons);
+    purge();
+    let (p, bouchons) = phase("2. purge /500 ms", secondes, &fichiers, Some(purge), false);
+    phases.push(p);
+    releve("fin phase 2");
+    let t = Instant::now();
+    purge();
+    println!("  une purge ({mode}) : {} ms", t.elapsed().as_millis());
+    releve("après UNE purge");
+    println!("  VmLck {} Mo", vmlck());
+    drop(bouchons);
+    imprimer(&phases);
+    // SAFETY : appel sans pointeur.
+    unsafe { libc::munlockall() };
     let _ = std::fs::remove_dir_all(&dossier);
 }

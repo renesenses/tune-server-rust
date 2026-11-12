@@ -140,46 +140,42 @@ pub fn decider_la_purge(une_sortie_locale_joue: bool, libre_mb: Option<u64>) -> 
 
 /// Le relevé de cinq minutes rend au système la mémoire libre gardée par
 /// l'allocateur ([`decider_la_purge`]) et journalise `memoire_rendue_a_froid`.
-/// Hors du fil async : `mallinfo2` et `malloc_trim` parcourent les arènes.
-/// `None` hors glibc, ou quand la purge est retenue.
+/// Hors du fil async : `malloc_trim` parcourt les arènes.
+///
+/// `tas` : l'état que le relevé vient de lire (UN seul `mallinfo2` par
+/// relevé). `None` hors glibc, quand la purge est retenue, ou quand une autre
+/// purge tournait déjà.
+///
+/// La ligne ne dit `rendu=true` que si le RSS a BAISSÉ : sous `mlockall`
+/// (Tune OS, `.deb`), la glibc répond « rendu » sans que rien ne revienne au
+/// système, et `memoire_verrouillee_mb` le montre.
 pub async fn purger_a_froid(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    tas: Option<tune_core::memoire_rendue::EtatDuTas>,
 ) -> Option<(DecisionDePurge, tune_core::memoire_rendue::PurgeFaite)> {
     // Hors glibc, rien à rendre : ne pas payer la requête des zones.
     if !cfg!(all(target_os = "linux", target_env = "gnu")) {
         return None;
     }
     let backend = backend.clone();
-    let mesure = tokio::task::spawn_blocking(move || {
-        let locale = une_sortie_locale_joue(&backend);
-        let tas = tune_core::memoire_rendue::etat_du_tas();
-        let decision = decider_la_purge(locale, tas.map(|t| t.libre_mb));
+    let libre_avant_mb = tas.map(|t| t.libre_mb);
+    let (decision, purge) = tokio::task::spawn_blocking(move || {
+        let decision = decider_la_purge(une_sortie_locale_joue(&backend), libre_avant_mb);
         if !decision.purge() {
             return None;
         }
-        let rss_avant_mb = rss_mb();
-        let debut = std::time::Instant::now();
-        let rendu = rendre_la_memoire_liberee();
-        let duree_ms = debut.elapsed().as_millis() as u64;
-        Some((
-            decision,
-            tas.map(|t| t.libre_mb),
-            tune_core::memoire_rendue::PurgeFaite {
-                rss_avant_mb,
-                rss_apres_mb: rss_mb(),
-                rendu,
-                duree_ms,
-            },
-        ))
+        Some((decision, tune_core::memoire_rendue::purger()?))
     })
     .await
     .ok()
     .flatten()?;
-    let (decision, libre_avant_mb, purge) = mesure;
-    if purge.rendu {
+    if purge.glibc_dit_rendu || purge.rendu() {
         tracing::info!(
-            rss_avant_mb = purge.rss_avant_mb,
-            rss_apres_mb = purge.rss_apres_mb,
+            rss_avant_mb = purge.rss_avant_mb(),
+            rss_apres_mb = purge.rss_apres_mb(),
+            rendu = purge.rendu(),
+            rendu_mb = purge.rendu_mb(),
+            memoire_verrouillee_mb = purge.verrouillee_kb.map(|k| k / 1024),
             tas_libre_avant_mb = libre_avant_mb,
             duree_ms = purge.duree_ms,
             pendant_lecture_locale = decision == DecisionDePurge::PendantLectureLocale,

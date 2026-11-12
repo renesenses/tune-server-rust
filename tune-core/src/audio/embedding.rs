@@ -933,9 +933,11 @@ async fn relacher_la_session<E>(
 pub(super) async fn rendre_la_memoire_apres_relachement() {
     if let Some(p) = crate::memoire_rendue::rendre_hors_du_fil_async().await {
         info!(
-            rss_avant_mb = p.rss_avant_mb.unwrap_or(0),
-            rss_apres_mb = p.rss_apres_mb.unwrap_or(0),
-            rendu = p.rendu,
+            rss_avant_mb = p.rss_avant_mb().unwrap_or(0),
+            rss_apres_mb = p.rss_apres_mb().unwrap_or(0),
+            rendu = p.rendu(),
+            rendu_mb = p.rendu_mb(),
+            memoire_verrouillee_mb = p.verrouillee_kb.map(|k| k / 1024),
             duree_ms = p.duree_ms,
             lecture_en_cours = crate::taches_de_fond::priorite::lecture_en_cours(),
             "audio_embed_memoire_rendue"

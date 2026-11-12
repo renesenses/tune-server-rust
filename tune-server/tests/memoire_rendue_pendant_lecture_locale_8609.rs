@@ -73,21 +73,26 @@ async fn la_purge_tourne_et_se_journalise_pendant_une_lecture_locale() {
             .collect();
         fils.into_iter().map(|f| f.join().unwrap()).collect()
     });
-    let libre = tune_core::memoire_rendue::etat_du_tas().unwrap().libre_mb;
+    let tas = tune_core::memoire_rendue::etat_du_tas();
+    let libre = tas.expect("glibc >= 2.33 sur la machine de test").libre_mb;
     assert!(
         libre >= tune_server::memoire_a_froid::SEUIL_LIBRE_PENDANT_LECTURE_MB,
         "le scénario doit laisser de la mémoire libre gardée : {libre} Mo"
     );
 
-    let (decision, purge) = purger_a_froid(&backend)
+    let (decision, purge) = purger_a_froid(&backend, tas)
         .await
         .expect("la purge doit avoir lieu pendant une lecture locale (#8609)");
     drop(bouchons);
     assert_eq!(decision, DecisionDePurge::PendantLectureLocale);
-    assert!(
-        purge.rendu,
-        "malloc_trim devait rendre des pages : {purge:?}"
-    );
+    // « Rendu » veut dire : le RSS a BAISSÉ. Sous `mlockall`, la glibc dit
+    // « rendu » sans que rien ne revienne — la ligne doit alors le dire.
+    if !purge.sous_mlock() {
+        assert!(
+            purge.rendu_mb() >= 100,
+            "~200 Mo libres gardés : le RSS devait baisser d'au moins 100 Mo : {purge:?}"
+        );
+    }
 
     let texte = String::from_utf8_lossy(&journal.0.lock().unwrap()).into_owned();
     let ligne = texte
@@ -101,4 +106,10 @@ async fn la_purge_tourne_et_se_journalise_pendant_une_lecture_locale() {
         "la ligne doit dire que la purge a eu lieu pendant la lecture locale : {ligne}"
     );
     assert!(ligne.contains("tas_libre_avant_mb="), "{ligne}");
+    assert!(ligne.contains("memoire_verrouillee_mb="), "{ligne}");
+    assert!(
+        ligne.contains(&format!("rendu={}", purge.rendu()))
+            && ligne.contains(&format!("rendu_mb={}", purge.rendu_mb())),
+        "la ligne doit porter la baisse MESURÉE du RSS : {ligne}"
+    );
 }
