@@ -122,6 +122,15 @@ const SUFFIXES_LOCAUX: &[&str] = &[
     ".localdomain",
 ];
 
+/// #8198 — le retour de connexion Spotify, renvoyé par le relais du site
+/// ([`ORIGINE_DU_SITE`], ou celui que règle `TUNE_SPOTIFY_RELAIS_URL`) en
+/// formulaire `POST` : une requête inter-sites par nature. Seul ce chemin
+/// exact, en `POST`, échappe au refus : ce qui fait foi y est le `state`,
+/// qui doit désigner une autorisation ouverte par CE serveur, et le
+/// vérificateur PKCE, qui ne le quitte jamais. Aucune lecture inter-sites
+/// n'est ouverte (la couche CORS ne change pas).
+pub const RETOUR_SPOTIFY: &str = "/api/v1/streaming/spotify/retour";
+
 const SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 
@@ -356,6 +365,12 @@ pub fn juger(methode: &Method, entetes: &HeaderMap) -> Verdict {
     }
 }
 
+/// Le chemin échappe-t-il au refus des requêtes inter-sites ? Seul
+/// `POST` [`RETOUR_SPOTIFY`].
+pub fn exempte(methode: &Method, chemin: &str) -> bool {
+    *methode == Method::POST && chemin == RETOUR_SPOTIFY
+}
+
 /// Couche de refus des requêtes inter-sites qui changent l'état.
 pub async fn garde(requete: Request, suivant: Next) -> Response {
     if !hote_de_la_requete_accepte(requete.headers()) {
@@ -373,6 +388,10 @@ pub async fn garde(requete: Request, suivant: Next) -> Response {
             })),
         )
             .into_response();
+    }
+    // #8198 — après la garde des hôtes : le retour du relais Spotify.
+    if exempte(requete.method(), requete.uri().path()) {
+        return suivant.run(requete).await;
     }
     match juger(requete.method(), requete.headers()) {
         Verdict::Acceptee => suivant.run(requete).await,

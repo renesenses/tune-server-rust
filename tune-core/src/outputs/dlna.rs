@@ -2617,7 +2617,12 @@ impl OutputTarget for DlnaOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, true, true, true, true).with_percent_volume()
+        // #5575 — un volume décoratif (acquitté, jamais appliqué) n'est pas un
+        // volume réglable : `can_set_volume: false` ôte le curseur du client
+        // au lieu de le laisser produire un refus à chaque geste (fil 2482).
+        let volume_reglable =
+            !volume_decoratif_5575::volume_decoratif(&self.device_id, self.modele.as_deref());
+        OutputCapabilities::v1(true, true, true, volume_reglable, true, true).with_percent_volume()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

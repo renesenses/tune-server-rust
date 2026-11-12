@@ -31,6 +31,8 @@ use crate::state::AppState;
 fn station_localisee(state: &AppState, station: &RadioStation, headers: &HeaderMap) -> Value {
     let mut corps = json!(station);
     radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(headers));
+    // web#2795 — le repère de la surcharge locale.
+    super::radios_annuaire::surcharge::marquer_les_surcharges(state, &mut corps);
     geofencing::annoncer_le_debit_ecoute(state, &mut corps);
     corps
 }
@@ -1330,7 +1332,13 @@ pub(crate) fn rattraper_les_logos(
     // c'est par lui que les passes suivantes la retrouvent (jamais par le nom).
     super::radios_annuaire::lier_les_stations(repo, annuaire);
     let liens = repo.liens_annuaire().unwrap_or_default();
+    // web#2795 — une station surchargée chez l'utilisateur (nom, logo, flux)
+    // ne suit plus sa fiche : le relevé n'y touche pas.
+    let surchargees = repo.surcharges_locales().unwrap_or_default();
     for mut st in repo.list().unwrap_or_default() {
+        if st.id.is_some_and(|id| surchargees.contains(&id)) {
+            continue;
+        }
         let lien = st.id.and_then(|id| liens.get(&id)).map(String::as_str);
         let mut logo_change = false;
         match logo_a_poser(annuaire, &st, lien) {
@@ -1723,6 +1731,8 @@ async fn list_radios(
     // d'annuaire la porte sous `annuaire` (logo, clé radio-metadata…). Rien
     // n'est écrit en base, et une station absente de l'annuaire reste là.
     super::radios_annuaire::rattacher_a_l_annuaire(&state, &mut corps);
+    // web#2795 — le repère de la surcharge locale.
+    super::radios_annuaire::surcharge::marquer_les_surcharges(&state, &mut corps);
     // #7721 — le débit annoncé est celui du flux que la lecture prendra.
     geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
     Json(corps)
@@ -1901,6 +1911,7 @@ async fn update_radio(
     let Some(mut station) = repo.get(id).ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let avant = station.clone();
     if let Some(name) = body.name {
         station.name = name;
     }
@@ -1934,6 +1945,9 @@ async fn update_radio(
     }
     match repo.update(&station) {
         Ok(()) => {
+            // web#2795 — une station de l'annuaire dont on change le nom, le
+            // flux ou le logo est surchargée chez soi : le relevé la laisse.
+            super::radios_annuaire::surcharge::noter_la_surcharge(&repo, &avant, &station);
             state.event_bus.emit(
                 "library.radios_changed",
                 json!({"action": "updated", "id": id}),
@@ -1980,6 +1994,20 @@ async fn play_radio(
     let corps = jouer_un_flux(&state, zone_id, &radio.name, &url, radio.logo_url.clone()).await;
     repo.record_play(id).ok();
     Json(corps).into_response()
+}
+
+/// #8135 — le choix du flux d'une radio rangée dans une playlist : celui de
+/// `play_radio` (fiche de l'annuaire, pays de l'auditeur). Un flux refusé
+/// (pays exclu) rend `None` : la ligne est sautée à la lecture.
+pub(crate) fn choix_du_flux_de_playlist(
+    state: &AppState,
+) -> tune_core::db::playlist_radio_8135::ChoixDuFlux {
+    let state = state.clone();
+    std::sync::Arc::new(move |radio: &tune_core::db::radio_repo::RadioStation| {
+        geofencing::stream_for_saved(&state, radio)
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+    })
 }
 
 /// Lance un flux de radio sur une zone et rend le corps de réponse de
@@ -2212,6 +2240,8 @@ async fn list_favorites(headers: HeaderMap, State(state): State<AppState>) -> Js
     // d'annuaire la porte sous `annuaire` (logo, clé radio-metadata…). Rien
     // n'est écrit en base, et une station absente de l'annuaire reste là.
     super::radios_annuaire::rattacher_a_l_annuaire(&state, &mut corps);
+    // web#2795 — le repère de la surcharge locale.
+    super::radios_annuaire::surcharge::marquer_les_surcharges(&state, &mut corps);
     // #7721 — le débit annoncé est celui du flux que la lecture prendra.
     geofencing::annoncer_le_debit_ecoute(&state, &mut corps);
     Json(corps)
@@ -2467,8 +2497,13 @@ async fn set_radio_artwork(
             .into_response();
     }
 
+    let avant = radio.clone();
     radio.logo_url = Some(hash.clone());
-    repo.update(&radio).ok();
+    if repo.update(&radio).is_ok() {
+        // web#2795 — un logo téléversé sur une station de l'annuaire la
+        // surcharge, comme un logo saisi.
+        super::radios_annuaire::surcharge::noter_la_surcharge(&repo, &avant, &radio);
+    }
     Json(station_localisee(&state, &radio, &headers)).into_response()
 }
 
@@ -4162,10 +4197,13 @@ async fn test_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
         return resp;
     }
 
-    let scheduler = std::sync::Arc::new(tune_core::alarms::AlarmScheduler::with_backend(
-        state.backend.clone(),
-        state.orchestrator.clone(),
-    ));
+    let scheduler = std::sync::Arc::new(
+        tune_core::alarms::AlarmScheduler::with_backend(
+            state.backend.clone(),
+            state.orchestrator.clone(),
+        )
+        .avec_le_choix_du_flux_radio(choix_du_flux_de_playlist(&state)),
+    );
 
     match scheduler.get_alarm(id) {
         Ok(Some(alarm)) => {

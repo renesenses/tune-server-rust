@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::protocole::{Annonce, TAILLE_ANNONCE, analyser_annonce};
 
@@ -125,7 +125,11 @@ impl Ecoute {
         if tache.as_ref().is_some_and(|t| !t.is_finished()) {
             return Ok(());
         }
-        let socket = ouvrir_socket_d_ecoute(port)?;
+        // #8536 — un échec d'ouverture ne reste jamais muet : la zone
+        // n'apparaîtrait pas, sans rien dans les journaux pour dire pourquoi.
+        let socket = ouvrir_socket_d_ecoute(port).inspect_err(|e| {
+            error!(port, erreur = %e, "devialet_air_ecoute_ouverture_refusee");
+        })?;
         info!(port, "devialet_air_ecoute_ouverte");
         let moi = Arc::clone(self);
         *tache = Some(tokio::spawn(async move {
@@ -177,10 +181,21 @@ fn ouvrir_socket_d_ecoute(port: u16) -> Result<tokio::net::UdpSocket, String> {
         Some(socket2::Protocol::UDP),
     )
     .map_err(|e| format!("devialet_air: socket: {e}"))?;
-    s.set_reuse_address(true).ok();
+    // #8536 — RoonServer garde 45454 ouvert en permanence. SO_REUSEADDR (et,
+    // sous Unix, SO_REUSEPORT : macOS l'exige pour partager un port de
+    // diffusion, Linux l'accepte) permet de l'écouter à côté de lui. Sous
+    // Windows, SO_REUSEADDR seul suffit. Un refus d'option se journalise :
+    // c'est lui qui ferait échouer l'ouverture qui suit.
+    if let Err(e) = s.set_reuse_address(true) {
+        warn!(port, erreur = %e, "devialet_air_ecoute_so_reuseaddr_refuse");
+    }
     #[cfg(unix)]
-    s.set_reuse_port(true).ok();
-    s.set_broadcast(true).ok();
+    if let Err(e) = s.set_reuse_port(true) {
+        warn!(port, erreur = %e, "devialet_air_ecoute_so_reuseport_refuse");
+    }
+    if let Err(e) = s.set_broadcast(true) {
+        warn!(port, erreur = %e, "devialet_air_ecoute_so_broadcast_refuse");
+    }
     s.bind(&socket2::SockAddr::from(SocketAddrV4::new(
         Ipv4Addr::UNSPECIFIED,
         port,

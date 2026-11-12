@@ -1346,3 +1346,457 @@ async fn composer_un_coffret_donne_a_chaque_disque_son_titre_d_origine_2094() {
     assert_eq!(statut, StatusCode::OK, "corps = {corps}");
     assert_eq!(sous_titres(x), vec![(1, None), (2, None)]);
 }
+
+// ---------------------------------------------------------------------------
+// #8463 (fil 2763) — un album DÉJÀ à plusieurs disques garde ses disques
+// ---------------------------------------------------------------------------
+
+/// Une piste sur un disque donné (`None` = `disc_number` NULL).
+fn piste_disque(
+    state: &Etat,
+    album_id: i64,
+    artist_id: i64,
+    disque: Option<i64>,
+    numero: i64,
+    chemin: &str,
+) {
+    inserer(
+        state,
+        "INSERT INTO tracks (title, album_id, artist_id, disc_number, track_number, file_path) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+        &[
+            &format!("Piste {numero}") as &dyn ToSqlValue,
+            &album_id,
+            &artist_id,
+            &disque,
+            &numero,
+            &chemin,
+        ],
+    );
+}
+
+/// `(chemin, album_id, disc_number)` de chaque piste, triées par chemin.
+fn disposition(state: &Etat) -> Vec<(String, i64, i64)> {
+    let mut v: Vec<(String, i64, i64)> = state
+        .backend
+        .query_many(
+            "SELECT file_path, album_id, COALESCE(disc_number, 1) FROM tracks",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_string().unwrap_or_default(),
+                r[1].as_i64().unwrap_or(-1),
+                r[2].as_i64().unwrap_or(-1),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn titre_de(state: &Etat, id: i64) -> String {
+    state
+        .backend
+        .query_one(
+            "SELECT title FROM albums WHERE id = ?",
+            &[&id as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_string()))
+        .unwrap_or_default()
+}
+
+/// Le cas de Didier : *The Dark Side Of The Moon (Immersion Box Set)*, DÉJÀ
+/// trois disques (deux pistes chacun), puis trois albums d'un disque —
+/// Multichannel, Quadraphonic, Stereo (une piste chacun, l'un sans numéro
+/// de disque). Rend `(immersion, multi, quadra, stereo)`.
+fn l_immersion_de_didier(state: &Etat) -> (i64, i64, i64, i64) {
+    let pf = artiste(state, "Pink Floyd");
+    let imm = album(state, "The Dark Side Of The Moon (Immersion Box Set)", pf);
+    for cd in 1..=3 {
+        for n in 1..=2 {
+            piste_disque(
+                state,
+                imm,
+                pf,
+                Some(cd),
+                n,
+                &format!("/m/PF/Immersion/CD{cd}/{n:02}.flac"),
+            );
+        }
+    }
+    let multi = album(state, "The Dark Side Of The Moon (Multichannel)", pf);
+    piste_disque(state, multi, pf, Some(1), 1, "/m/PF/Multichannel/01.flac");
+    let quadra = album(state, "The Dark Side Of The Moon (Quadraphonic)", pf);
+    piste_disque(state, quadra, pf, None, 1, "/m/PF/Quadraphonic/01.flac");
+    let stereo = album(state, "The Dark Side Of The Moon (Stereo)", pf);
+    piste_disque(state, stereo, pf, Some(1), 1, "/m/PF/Stereo/01.flac");
+    (imm, multi, quadra, stereo)
+}
+
+#[tokio::test]
+async fn un_album_de_trois_disques_et_trois_albums_d_un_disque_font_six_disques_8463() {
+    let (app, state) = serveur();
+    let (imm, multi, quadra, stereo) = l_immersion_de_didier(&state);
+
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [imm, multi, quadra, stereo] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["cible"].as_i64(), Some(imm));
+    assert_eq!(corps["disques"].as_i64(), Some(6), "corps = {corps}");
+
+    // 🔴 LE SYMPTÔME : avant #8463, les six pistes des trois CD étaient
+    // toutes sous le disque 1. Chaque CD garde ici son numéro, et les trois
+    // albums suivants prennent 4, 5 et 6.
+    let attendu: Vec<(String, i64, i64)> = vec![
+        ("/m/PF/Immersion/CD1/01.flac".into(), imm, 1),
+        ("/m/PF/Immersion/CD1/02.flac".into(), imm, 1),
+        ("/m/PF/Immersion/CD2/01.flac".into(), imm, 2),
+        ("/m/PF/Immersion/CD2/02.flac".into(), imm, 2),
+        ("/m/PF/Immersion/CD3/01.flac".into(), imm, 3),
+        ("/m/PF/Immersion/CD3/02.flac".into(), imm, 3),
+        ("/m/PF/Multichannel/01.flac".into(), imm, 4),
+        ("/m/PF/Quadraphonic/01.flac".into(), imm, 5),
+        ("/m/PF/Stereo/01.flac".into(), imm, 6),
+    ];
+    assert_eq!(disposition(&state), attendu);
+
+    // Les sous-titres suivent : chaque disque porte le titre de l'album
+    // qu'il était, les trois CD celui de l'Immersion.
+    let sous_titres: Vec<(i64, Option<String>)> = state
+        .backend
+        .query_many(
+            "SELECT DISTINCT disc_number, disc_subtitle FROM tracks WHERE album_id = ? ORDER BY 1",
+            &[&imm as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| (r[0].as_i64().unwrap_or(-1), r[1].as_string()))
+        .collect();
+    let s = |t: &str| Some(format!("The Dark Side Of The Moon ({t})"));
+    assert_eq!(
+        sous_titres,
+        vec![
+            (1, s("Immersion Box Set")),
+            (2, s("Immersion Box Set")),
+            (3, s("Immersion Box Set")),
+            (4, s("Multichannel")),
+            (5, s("Quadraphonic")),
+            (6, s("Stereo")),
+        ]
+    );
+
+    // DÉFAIRE rend les numéros d'ORIGINE : l'Immersion redevient UN album
+    // de trois disques, les trois autres un disque chacun.
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/coffrets/{imm}/defaire-manuel"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    let recrees: Vec<i64> = corps["albums_recrees"]
+        .as_array()
+        .map(|v| v.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+    assert_eq!(recrees.len(), 3, "corps = {corps}");
+    assert_eq!(
+        titre_de(&state, imm),
+        "The Dark Side Of The Moon (Immersion Box Set)"
+    );
+    let (r1, r2, r3) = (recrees[0], recrees[1], recrees[2]);
+    assert_eq!(
+        titre_de(&state, r1),
+        "The Dark Side Of The Moon (Multichannel)"
+    );
+    assert_eq!(
+        titre_de(&state, r2),
+        "The Dark Side Of The Moon (Quadraphonic)"
+    );
+    assert_eq!(titre_de(&state, r3), "The Dark Side Of The Moon (Stereo)");
+    let rendu: Vec<(String, i64, i64)> = vec![
+        ("/m/PF/Immersion/CD1/01.flac".into(), imm, 1),
+        ("/m/PF/Immersion/CD1/02.flac".into(), imm, 1),
+        ("/m/PF/Immersion/CD2/01.flac".into(), imm, 2),
+        ("/m/PF/Immersion/CD2/02.flac".into(), imm, 2),
+        ("/m/PF/Immersion/CD3/01.flac".into(), imm, 3),
+        ("/m/PF/Immersion/CD3/02.flac".into(), imm, 3),
+        ("/m/PF/Multichannel/01.flac".into(), r1, 1),
+        ("/m/PF/Quadraphonic/01.flac".into(), r2, 1),
+        ("/m/PF/Stereo/01.flac".into(), r3, 1),
+    ];
+    assert_eq!(disposition(&state), rendu);
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COALESCE(disc_count, 0) FROM albums WHERE id = ?",
+            imm
+        ),
+        3
+    );
+}
+
+/// L'album à plusieurs disques en SECOND : ses disques 1-2-3 deviennent
+/// 2-3-4. Renuméroter disque par disque ferait de « 1 → 2 » puis « 2 → 3 »
+/// un seul disque 3 : la renumérotation se fait d'un seul `CASE`.
+#[tokio::test]
+async fn un_album_de_plusieurs_disques_en_second_est_decale_sans_se_meler_8463() {
+    let (app, state) = serveur();
+    let (imm, _, _, stereo) = l_immersion_de_didier(&state);
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [stereo, imm] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["disques"].as_i64(), Some(4));
+    let compose: Vec<(String, i64, i64)> = disposition(&state)
+        .into_iter()
+        .filter(|(c, _, _)| c.contains("/Immersion/") || c.contains("/Stereo/"))
+        .collect();
+    assert_eq!(
+        compose,
+        vec![
+            ("/m/PF/Immersion/CD1/01.flac".into(), stereo, 2),
+            ("/m/PF/Immersion/CD1/02.flac".into(), stereo, 2),
+            ("/m/PF/Immersion/CD2/01.flac".into(), stereo, 3),
+            ("/m/PF/Immersion/CD2/02.flac".into(), stereo, 3),
+            ("/m/PF/Immersion/CD3/01.flac".into(), stereo, 4),
+            ("/m/PF/Immersion/CD3/02.flac".into(), stereo, 4),
+            ("/m/PF/Stereo/01.flac".into(), stereo, 1),
+        ]
+    );
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/coffrets/{stereo}/defaire-manuel"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    let recrees: Vec<i64> = corps["albums_recrees"]
+        .as_array()
+        .map(|v| v.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        recrees.len(),
+        1,
+        "UN album rendu pour les trois CD : {corps}"
+    );
+    let rendu: Vec<(String, i64, i64)> = disposition(&state)
+        .into_iter()
+        .filter(|(c, _, _)| c.contains("/Immersion/") || c.contains("/Stereo/"))
+        .collect();
+    let r = recrees[0];
+    assert_eq!(
+        rendu,
+        vec![
+            ("/m/PF/Immersion/CD1/01.flac".into(), r, 1),
+            ("/m/PF/Immersion/CD1/02.flac".into(), r, 1),
+            ("/m/PF/Immersion/CD2/01.flac".into(), r, 2),
+            ("/m/PF/Immersion/CD2/02.flac".into(), r, 2),
+            ("/m/PF/Immersion/CD3/01.flac".into(), r, 3),
+            ("/m/PF/Immersion/CD3/02.flac".into(), r, 3),
+            ("/m/PF/Stereo/01.flac".into(), stereo, 1),
+        ]
+    );
+    assert_eq!(
+        titre_de(&state, r),
+        "The Dark Side Of The Moon (Immersion Box Set)"
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COALESCE(disc_count, 0) FROM albums WHERE id = ?",
+            r
+        ),
+        3
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #8464 (fil 2765) — le nom du coffret, saisi au moment de le réunir
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn le_nom_saisi_devient_le_titre_du_coffret_et_l_apercu_dit_le_titre_calcule_8464() {
+    let (app, state) = serveur();
+    let (a, b) = le_101_de_depeche_mode(&state);
+
+    // L'aperçu : le titre que la composition donnerait, sans rien écrire.
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret/apercu",
+        json!({ "album_ids": [a, b] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["titre"].as_str(), Some("101"));
+    assert!(album_existe(&state, b), "l'aperçu n'écrit rien");
+    assert_eq!(titre_de(&state, a), "101 - Disc A");
+
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [a, b], "titre": "  101 (Live, 1988)  " }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["titre"].as_str(), Some("101 (Live, 1988)"));
+    assert_eq!(titre_de(&state, a), "101 (Live, 1988)");
+    // Tenu comme modifié à la main, comme le titre calculé (#5319).
+    let edites = state
+        .backend
+        .query_one(
+            "SELECT value FROM album_metadata WHERE album_id = ? AND key = 'edition_manuelle'",
+            &[&a as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_string()))
+        .unwrap_or_default();
+    assert!(edites.contains("\"title\""), "edition_manuelle = {edites}");
+
+    // DÉFAIRE rend le titre d'origine : le nom saisi était celui de la
+    // composition.
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/coffrets/{a}/defaire-manuel"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(titre_de(&state, a), "101 - Disc A");
+}
+
+#[tokio::test]
+async fn un_nom_vide_garde_le_titre_calcule_8464() {
+    let (app, state) = serveur();
+    let (a, b) = le_101_de_depeche_mode(&state);
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [a, b], "titre": "   " }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["titre"].as_str(), Some("101"));
+    assert_eq!(titre_de(&state, a), "101");
+}
+
+/// Didier (fil 2763, demande du 11/11) — PLUSIEURS albums multi-disques dans
+/// un même coffret : un album de 4 CD, un de 3 CD, deux d'un disque. Rend
+/// `[(album, disques)]` dans cet ordre.
+fn quatre_albums_dont_deux_multi_disques(state: &Etat) -> Vec<(i64, i64)> {
+    let art = artiste(state, "Pink Floyd");
+    let mut v = Vec::new();
+    for (titre, nb) in [("Box A", 4), ("Box B", 3), ("Single C", 1), ("Single D", 1)] {
+        let id = album(state, titre, art);
+        for cd in 1..=nb {
+            for n in 1..=2 {
+                piste_disque(
+                    state,
+                    id,
+                    art,
+                    Some(cd),
+                    n,
+                    &format!("/m/PF/{titre}/CD{cd}/{n:02}.flac"),
+                );
+            }
+        }
+        v.push((id, nb));
+    }
+    v
+}
+
+/// Compose dans l'ordre `rangs` (indices dans les quatre albums), vérifie
+/// que chaque album occupe la plage attendue, puis défait et vérifie que
+/// chacun retrouve ses numéros d'origine.
+async fn composer_et_defaire_quatre(rangs: [usize; 4], plages: [(i64, i64); 4]) {
+    let (app, state) = serveur();
+    let albums = quatre_albums_dont_deux_multi_disques(&state);
+    let ids: Vec<i64> = rangs.iter().map(|&i| albums[i].0).collect();
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": ids }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["disques"].as_i64(), Some(9), "corps = {corps}");
+    let cible = ids[0];
+    let compose = disposition(&state);
+    assert!(compose.iter().all(|(_, a, _)| *a == cible), "{compose:?}");
+    for (k, &i) in rangs.iter().enumerate() {
+        let titre = ["Box A", "Box B", "Single C", "Single D"][i];
+        let (debut, fin) = plages[k];
+        let disques: Vec<i64> = compose
+            .iter()
+            .filter(|(c, _, _)| c.starts_with(&format!("/m/PF/{titre}/")))
+            .map(|(c, _, d)| {
+                // Le CD d'origine k doit devenir `debut + k - 1`.
+                let cd: i64 = c.split("/CD").nth(1).unwrap()[..1].parse().unwrap();
+                assert_eq!(*d, debut + cd - 1, "{c} : {compose:?}");
+                *d
+            })
+            .collect();
+        assert_eq!(disques.first().copied(), Some(debut), "{titre}");
+        assert_eq!(disques.last().copied(), Some(fin), "{titre}");
+    }
+
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/coffrets/{cible}/defaire-manuel"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(
+        corps["albums_recrees"].as_array().map(|v| v.len()),
+        Some(3),
+        "corps = {corps}"
+    );
+    let defait = disposition(&state);
+    for (titre, nb) in [("Box A", 4), ("Box B", 3), ("Single C", 1), ("Single D", 1)] {
+        let lignes: Vec<&(String, i64, i64)> = defait
+            .iter()
+            .filter(|(c, _, _)| c.starts_with(&format!("/m/PF/{titre}/")))
+            .collect();
+        assert_eq!(lignes.len(), (nb * 2) as usize, "{titre} : {defait:?}");
+        let album_rendu = lignes[0].1;
+        assert!(
+            lignes.iter().all(|(_, a, _)| *a == album_rendu),
+            "{titre} revient en UN album : {defait:?}"
+        );
+        assert_eq!(titre_de(&state, album_rendu), titre);
+        for (c, _, d) in &lignes {
+            let cd: i64 = c.split("/CD").nth(1).unwrap()[..1].parse().unwrap();
+            assert_eq!(*d, cd, "{c} reprend son numéro d'origine : {defait:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn deux_albums_multi_disques_et_deux_simples_font_neuf_disques_8463() {
+    // 4 CD, 3 CD, 1, 1 → 1-4, 5-7, 8, 9.
+    composer_et_defaire_quatre([0, 1, 2, 3], [(1, 4), (5, 7), (8, 8), (9, 9)]).await;
+}
+
+#[tokio::test]
+async fn l_album_de_trois_cd_coche_en_premier_prend_1_a_3_8463() {
+    // Album 2 (3 CD) en premier → 1-3, puis album 1 (4 CD) 4-7, 8, 9.
+    composer_et_defaire_quatre([1, 0, 2, 3], [(1, 3), (4, 7), (8, 8), (9, 9)]).await;
+}

@@ -640,7 +640,12 @@ CREATE TABLE IF NOT EXISTS artists (
     sort_name_source TEXT,
     -- Provenance du MBID (migration 133, #6463) : balise, nom, pressage,
     -- manuel ; NULL = inconnue.
-    musicbrainz_id_source TEXT
+    musicbrainz_id_source TEXT,
+    -- Pays de l'artiste lu sur MusicBrainz (migration 146, #8090) : code ISO
+    -- 3166-1 alpha-2, '' si MusicBrainz n'en donne aucun ; et le MBID dont il
+    -- a ete lu.
+    country TEXT,
+    country_mbid TEXT
 );
 
 CREATE TABLE IF NOT EXISTS albums (
@@ -1047,6 +1052,21 @@ CREATE TABLE IF NOT EXISTS streaming_hidden_items (
     PRIMARY KEY (profile_id, item_type, source, source_id)
 );
 CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
+
+-- « Pas pour moi » sur une suggestion de l'accueil (web#916, migration 145),
+-- par profil. Ne retire RIEN de la bibliothèque : seules les rangées de
+-- recommandation de `/home/*` la lisent.
+CREATE TABLE IF NOT EXISTS suggestions_ecartees (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    title TEXT,
+    subtitle TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, item_type, source, item_id)
+);
 
 -- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3
 -- de MetaRust) : l'identification les demande avec les `inc` des crédits, la

@@ -166,6 +166,9 @@ const MIGRATION_TABLES: &[&str] = &[
     // Qobuz/Tidal/Bandcamp bannis redeviendraient jouables par l'aleatoire
     // et la radio a la bascule SQLite -> PostgreSQL.
     "streaming_hidden_items",
+    // « Pas pour moi » de l'accueil (web#916). Sans cette ligne, toutes les
+    // suggestions écartées reviendraient à la bascule SQLite -> PostgreSQL.
+    "suggestions_ecartees",
     "favorites",
     // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
     // seraient perdus à la bascule SQLite → PostgreSQL.
@@ -1220,6 +1223,18 @@ CREATE TABLE IF NOT EXISTS enrich_tentatives (
  mtime_vu TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_enrich_tentatives_issue ON enrich_tentatives(issue, reessai_apres);
+-- « Pas pour moi » de l'accueil (web#916, SQLite 145 / PG 111), par profil.
+CREATE TABLE IF NOT EXISTS suggestions_ecartees (
+    profile_id BIGINT NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    title TEXT,
+    subtitle TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, item_type, source, item_id)
+);
 -- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3 de
 -- MetaRust). Sans script numéroté : présente ici (bascule) ET dans
 -- `ENSURE_TABLES` (toute base, à chaque démarrage). Non copiée à la bascule :
@@ -1447,10 +1462,17 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE "C";
 -- PG 090, #6516). TEXT des deux côtés : la copie texte n'a rien à convertir.
 ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id);
+-- radio_stations: surcharge locale d'une station de l'annuaire (SQLite
+-- migration v147 / PG 113, web#2795). TEXT des deux côtés.
+ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS surcharge_locale TEXT;
 -- artists: provenance du nom de tri (SQLite migration v131 / PG 095, #6474).
 ALTER TABLE artists ADD COLUMN IF NOT EXISTS sort_name_source TEXT;
 -- artists: provenance du MBID (SQLite migration v133 / PG 097, #6463).
 ALTER TABLE artists ADD COLUMN IF NOT EXISTS musicbrainz_id_source TEXT;
+-- artists: pays de l'artiste et MBID dont il a ete lu (SQLite migration v146 /
+-- PG 112, #8090). TEXT des deux cotes.
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS country TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS country_mbid TEXT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE
@@ -1909,6 +1931,8 @@ fn conflict_clause(table: &str) -> &'static str {
         "streaming_hidden_items" => {
             "ON CONFLICT (profile_id, item_type, source, source_id) DO NOTHING"
         }
+        // Même cas (web#916) : pas de colonne `id`, la clef est le quadruplet.
+        "suggestions_ecartees" => "ON CONFLICT (profile_id, item_type, source, item_id) DO NOTHING",
         // Meme cas : pas de colonne `id`, la clef primaire est l'UDN — la
         // seule identite d'un appareil UPnP qui survive a un changement de
         // port (#2219, phase 1).
