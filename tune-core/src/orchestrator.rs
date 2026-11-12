@@ -2694,6 +2694,8 @@ mod refus_asio_bloque_4556;
 mod refus_amont_4366;
 
 mod preparation_fichier_7247;
+// #6718 — un pré-transcodage abandonné ne laisse plus son fichier.
+mod pretranscode_abandonne_6718;
 
 #[cfg(test)]
 mod deplacement_qobuz_6982_tests;
