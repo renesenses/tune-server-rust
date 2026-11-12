@@ -28,6 +28,14 @@ pub fn adresse_mini(serveur: &str) -> String {
     format!("{}/?vue=mini&hote=widget", serveur.trim_end_matches('/'))
 }
 
+/// L'adresse de l'interface complète dans la fenêtre du widget (#8531).
+/// `hote=widget` seul (sans `vue=mini`) n'affiche aucun bouton natif : il dit
+/// seulement à la page de signaler sa zone (`/__widget/zone/<id>`), pour que
+/// les touches média visent la zone choisie dans la fenêtre.
+pub fn adresse_complete(serveur: &str) -> String {
+    format!("{}/?hote=widget", serveur.trim_end_matches('/'))
+}
+
 /// Le client web servi par ce serveur sait-il afficher la vue mini ?
 ///
 /// `vue-mini.json` vaut `{"vue_mini":1,...}`. Un serveur plus ancien répond
@@ -48,6 +56,9 @@ pub enum ActionWidget {
     Replier,
     Deplier,
     Complet,
+    /// La page signale la zone qu'elle affiche (`/__widget/zone/<id>`) : les
+    /// raccourcis et les touches média du clavier la visent (#8531).
+    Zone(i64),
 }
 
 /// Ce que la fenêtre fait d'une navigation.
@@ -96,6 +107,10 @@ pub fn decider_navigation(serveur: &str, cible: &Url) -> Decision {
         Some("replier") => Decision::Action(ActionWidget::Replier),
         Some("deplier") => Decision::Action(ActionWidget::Deplier),
         Some("complet") => Decision::Action(ActionWidget::Complet),
+        Some(reste) if reste.starts_with("zone/") => match reste["zone/".len()..].parse::<i64>() {
+            Ok(id) if id > 0 => Decision::Action(ActionWidget::Zone(id)),
+            _ => Decision::Refuser,
+        },
         // Une action inconnue n'est pas une page : on ne la charge pas.
         Some(_) => Decision::Refuser,
     }
@@ -169,6 +184,38 @@ mod tests {
         assert_eq!(
             decider_navigation(SRV, &u(&format!("{SRV}/__widget/inconnue"))),
             Decision::Refuser
+        );
+    }
+
+    #[test]
+    fn la_page_signale_sa_zone_sans_rien_charger() {
+        assert_eq!(
+            decider_navigation(SRV, &u(&format!("{SRV}/__widget/zone/7"))),
+            Decision::Action(ActionWidget::Zone(7))
+        );
+        for faux in ["zone/", "zone/0", "zone/-3", "zone/abc", "zone/7/x", "zone"] {
+            assert_eq!(
+                decider_navigation(SRV, &u(&format!("{SRV}/__widget/{faux}"))),
+                Decision::Refuser,
+                "{faux}"
+            );
+        }
+        // Depuis une autre origine, ce n'est pas un signal.
+        assert_eq!(
+            decider_navigation(SRV, &u("http://evil.example/__widget/zone/7")),
+            Decision::Externe
+        );
+    }
+
+    #[test]
+    fn l_interface_complete_porte_l_hote_sans_la_vue_mini() {
+        assert_eq!(
+            adresse_complete("http://192.168.1.18:8888/"),
+            "http://192.168.1.18:8888/?hote=widget"
+        );
+        assert_eq!(
+            decider_navigation(SRV, &u(&adresse_complete(SRV))),
+            Decision::Autoriser
         );
     }
 

@@ -1306,7 +1306,9 @@ pub fn appliquer(
 // Attacher / détacher un disque
 // ---------------------------------------------------------------------------
 
-fn numeros_de_disque(db: &Arc<dyn DbBackend>, album_id: i64) -> Result<Vec<i32>, TuneError> {
+/// Les numéros de disque DISTINCTS d'un album, croissants, `NULL` compté
+/// `1`. Partagé avec la composition d'un coffret à la main (#8463).
+pub fn numeros_de_disque(db: &Arc<dyn DbBackend>, album_id: i64) -> Result<Vec<i32>, TuneError> {
     let mut v: Vec<i32> =
         lignes_de(db.query_many_strong(&sql_lignes(db.engine()), &[&album_id as &dyn ToSqlValue])?)
             .into_iter()
@@ -1538,6 +1540,73 @@ fn dossier_stocke(chemin: &str) -> Option<&str> {
     crate::library::local_path::dossier_et_nom(chemin).map(|(d, _)| d)
 }
 
+/// #8463 — un album que « Défaire » rend : ses disques DANS le coffret, chacun
+/// avec le numéro qu'il reprend, et ce que la composition a retenu de lui.
+struct AlbumARendre<'a> {
+    /// `(numéro dans le coffret, numéro rendu)`, croissants.
+    disques: Vec<(i32, i32)>,
+    retenu: Option<&'a coffrets_auto::DisqueRetenu>,
+}
+
+impl AlbumARendre<'_> {
+    /// `CASE` qui rend à chaque piste son numéro d'origine. Des entiers lus
+    /// en base, écrits en clair ; un disque inconnu reprend le disque 1.
+    fn case_sql(&self) -> String {
+        let cas: String = self
+            .disques
+            .iter()
+            .map(|(n, o)| format!(" WHEN {n} THEN {o}"))
+            .collect();
+        format!("CASE COALESCE(disc_number, 1){cas} ELSE 1 END")
+    }
+
+    fn liste_sql(&self) -> String {
+        self.disques
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// #8463 (fil 2763) — les albums à rendre, le coffret d'abord.
+///
+/// Un disque dont le marqueur retient l'album d'origine (`membre`) et
+/// l'ancien numéro (`disque_origine`) rejoint les autres disques de cet
+/// album, sous son ancien numéro : un album de 3 CD réuni à d'autres revient
+/// en UN album de 3 CD. Un disque que le marqueur ne connaît pas (marqueur
+/// d'avant #8463, disque attaché après coup) redevient un album à lui seul,
+/// disque 1 — la règle d'avant. Les albums sont rangés par leur plus petit
+/// numéro dans le coffret : le premier reste le coffret.
+fn albums_a_rendre<'a>(numeros: &BTreeSet<i32>, marqueur: &'a Marqueur) -> Vec<AlbumARendre<'a>> {
+    let connus: HashMap<i32, (u32, u32, &coffrets_auto::DisqueRetenu)> = marqueur
+        .disques
+        .iter()
+        .filter_map(|d| Some((d.n as i32, (d.membre?, d.disque_origine?, d))))
+        .collect();
+    let mut par_membre: std::collections::BTreeMap<u32, AlbumARendre<'a>> =
+        std::collections::BTreeMap::new();
+    let mut groupes = Vec::new();
+    for &n in numeros {
+        match connus.get(&n) {
+            Some(&(membre, origine, d)) => {
+                let g = par_membre.entry(membre).or_insert(AlbumARendre {
+                    disques: Vec::new(),
+                    retenu: Some(d),
+                });
+                g.disques.push((n, origine as i32));
+            }
+            None => groupes.push(AlbumARendre {
+                disques: vec![(n, 1)],
+                retenu: None,
+            }),
+        }
+    }
+    groupes.extend(par_membre.into_values());
+    groupes.sort_by_key(|g| g.disques.first().map_or(i32::MAX, |(n, _)| *n));
+    groupes
+}
+
 /// DÉFAIT un coffret composé à la main (marqueur `manuel` : composition ou
 /// « attacher »). Rend les identifiants des albums recréés.
 ///
@@ -1546,7 +1615,9 @@ fn dossier_stocke(chemin: &str) -> Option<&str> {
 ///   le titre du coffret suivi du nom du disque, comme « détacher ». Son
 ///   dossier lui est rendu s'il en a un à lui : c'est l'identité que le scan
 ///   retrouvera. Ses pistes gardent leurs identifiants (favoris, écoutes,
-///   étiquettes) et reprennent le disque 1.
+///   étiquettes) et reprennent leur numéro de disque d'origine (#8463 : un
+///   album de 3 CD revient en un album de 3 CD ; disque 1 pour un marqueur
+///   qui ne retient pas l'origine).
 /// - Le coffret redevient le premier disque. Son titre d'origine lui est
 ///   rendu s'il porte encore le titre de la composition, et le marquage
 ///   « titre modifié à la main » que la composition avait posé est retiré.
@@ -1579,11 +1650,15 @@ pub fn defaire_coffret_manuel(
     let heritage = lire_edition(db, album_id)?;
     let dossier_du_coffret = repo.folder_path_of(album_id)?;
     let p = |n| marque(db.engine(), n);
-    let (p1, p2, p3) = (p(1), p(2), p(3));
+    let (p1, p2) = (p(1), p(2));
 
+    let groupes = albums_a_rendre(&numeros, &marqueur);
     let mut recrees = Vec::new();
-    for &numero in numeros.iter().skip(1) {
-        let siennes: Vec<&Ligne> = lignes.iter().filter(|l| l.disque == numero).collect();
+    for groupe in groupes.iter().skip(1) {
+        let siennes: Vec<&Ligne> = lignes
+            .iter()
+            .filter(|l| groupe.disques.iter().any(|(n, _)| *n == l.disque))
+            .collect();
         // Le dossier du disque : celui de ses fichiers, ou de son image CUE.
         let dossiers: BTreeSet<&str> = siennes
             .iter()
@@ -1594,14 +1669,25 @@ pub fn defaire_coffret_manuel(
             })
             .filter_map(dossier_stocke)
             .collect();
-        let dossier = (dossiers.len() == 1)
+        let dossier_des_pistes = (dossiers.len() == 1)
             .then(|| dossiers.iter().next().map(|d| d.to_string()))
             .flatten();
-        let retenu = marqueur
-            .disques
-            .iter()
-            .find(|d| dossier.as_deref() == Some(d.dossier.as_str()))
-            .or_else(|| marqueur.disques.iter().find(|d| d.n as i32 == numero));
+        let premier = groupe.disques[0].0;
+        let retenu = groupe.retenu.or_else(|| {
+            marqueur
+                .disques
+                .iter()
+                .find(|d| dossier_des_pistes.as_deref() == Some(d.dossier.as_str()))
+                .or_else(|| marqueur.disques.iter().find(|d| d.n as i32 == premier))
+        });
+        // #8463 — un album de plusieurs disques a ses pistes dans plusieurs
+        // dossiers (CD1, CD2…) : le dossier que la composition a retenu.
+        let dossier = dossier_des_pistes.or_else(|| {
+            groupe
+                .retenu
+                .map(|r| r.dossier.trim().to_string())
+                .filter(|d| !d.is_empty())
+        });
         let nom = siennes.iter().find_map(|l| l.nom_disque.clone());
         let mut disque = coffret.clone();
         disque.id = None;
@@ -1612,7 +1698,7 @@ pub fn defaire_coffret_manuel(
         };
         disque.artist_id = retenu.and_then(|r| r.artiste_id).or(coffret.artist_id);
         disque.track_count = Some(0);
-        disque.disc_count = None;
+        disque.disc_count = (groupe.disques.len() > 1).then_some(groupe.disques.len() as i32);
         disque.musicbrainz_release_id = None;
         let nouveau = repo.create(&disque)?;
         if let Some(d) = &dossier
@@ -1622,21 +1708,31 @@ pub fn defaire_coffret_manuel(
         }
         db.execute(
             &format!(
-                "UPDATE tracks SET album_id = {p1}, disc_number = 1 \
-                 WHERE album_id = {p2} AND COALESCE(disc_number, 1) = {p3}"
+                "UPDATE tracks SET album_id = {p1}, disc_number = {} \
+                 WHERE album_id = {p2} AND COALESCE(disc_number, 1) IN ({})",
+                groupe.case_sql(),
+                groupe.liste_sql()
             ),
-            &[&nouveau as &dyn ToSqlValue, &album_id, &(numero as i64)],
+            &[&nouveau as &dyn ToSqlValue, &album_id],
         )?;
         repo.update_track_count(nouveau)?;
         recrees.push(nouveau);
     }
+    // Le coffret redevient le PREMIER album, sous ses numéros d'origine.
+    let disques_rendus = groupes.first().map_or(1, |g| g.disques.len().max(1));
+    match groupes.first() {
+        Some(g) => db.execute(
+            &format!(
+                "UPDATE tracks SET disc_number = {} WHERE album_id = {p1}",
+                g.case_sql()
+            ),
+            &[&album_id as &dyn ToSqlValue],
+        )?,
+        None => 0,
+    };
     db.execute(
-        &format!("UPDATE tracks SET disc_number = 1 WHERE album_id = {p1}"),
-        &[&album_id as &dyn ToSqlValue],
-    )?;
-    db.execute(
-        &format!("UPDATE albums SET disc_count = 1 WHERE id = {p1}"),
-        &[&album_id as &dyn ToSqlValue],
+        &format!("UPDATE albums SET disc_count = {p1} WHERE id = {p2}"),
+        &[&(disques_rendus as i64) as &dyn ToSqlValue, &album_id],
     )?;
     repo.update_track_count(album_id)?;
 

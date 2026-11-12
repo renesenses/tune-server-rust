@@ -643,6 +643,8 @@ where
         .route("/youtube/moods/{params}", get(youtube_mood))
         .route("/youtube/library", get(youtube_library))
         .route("/spotify/callback", get(spotify_callback))
+        // #8198 — le verificateur de configuration Spotify.
+        .route("/spotify/diagnostic", get(spotify_diagnostic))
         // #6784 — finir la connexion Spotify depuis un téléphone.
         .route(
             "/spotify/connect",
@@ -900,10 +902,24 @@ async fn service_artist_top_tracks(
     // #7107 — la popularité Last.fm complète la liste du service (qui n'est
     // que l'ordre d'un album) ; sans clé ou en échec, la liste ne change pas.
     let cle = tune_core::streaming::titres_phares_lastfm::cle_lastfm(&state.backend);
+    // #8350 — le MBID de la bibliothèque d'abord ; l'identifiant de la page
+    // écarte les homonymes trouvés par recherche.
+    let nom = items
+        .first()
+        .and_then(|v| v.get("artist_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mbid =
+        tune_core::streaming::titres_phares_lastfm::mbid_de_la_bibliotheque(&state.backend, &nom);
     tune_core::streaming::titres_phares_lastfm::completer(
         &state.http,
         &tune_core::streaming::titres_phares_lastfm::Reglages::production(&cle),
         &service,
+        &tune_core::streaming::titres_phares_lastfm::ArtisteDeLaPage {
+            id: &artist_id,
+            mbid: mbid.as_deref(),
+        },
         &mut items,
         |requete| {
             let arc = arc.clone();
@@ -2492,6 +2508,32 @@ async fn youtube_library(State(state): State<StreamingHttpState>) -> Response {
 // OAuth callbacks
 // ---------------------------------------------------------------------------
 
+/// `GET /streaming/spotify/diagnostic` — #8198 : ce qui ne va pas dans la
+/// configuration Spotify, champ par champ (voir
+/// `SpotifyService::diagnostic`). Fonctionne service desactive.
+async fn spotify_diagnostic(State(state): State<StreamingHttpState>) -> Response {
+    let svc = match get_svc(&state, "spotify").await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    // #8198 — copie sous le verrou, sondes de Spotify verrou relache : une
+    // page de diagnostic ne doit bloquer ni l'ecoute ni une connexion.
+    let instantane = {
+        let svc = svc.read().await;
+        svc.as_any()
+            .downcast_ref::<tune_core::streaming::spotify::SpotifyService>()
+            .map(|spotify| spotify.instantane_diagnostic())
+    };
+    match instantane {
+        Some(instantane) => Json(instantane.rapport().await).into_response(),
+        None => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"code": "spotify_diagnostic_indisponible", "service": "spotify"})),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct SpotifyCallbackQuery {
     code: Option<String>,
@@ -2528,7 +2570,7 @@ async fn spotify_callback(
             }))
             .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => reponse_echec_auth("spotify", &e),
     }
 }
 
@@ -5110,6 +5152,8 @@ mod tests_echec_de_connexion_7068 {
     }
 }
 
+#[cfg(test)]
+mod spotify_messages_clairs_8198_tests;
 #[cfg(test)]
 mod spotify_rappel_colle_8142_tests;
 
