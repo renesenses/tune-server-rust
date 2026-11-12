@@ -378,6 +378,102 @@ done
         assert_eq!(etat.zone(), Some(9));
     }
 
+    fn pauses_appareil(z: &FaussesZones) -> usize {
+        z.appels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.starts_with("pause-appareil"))
+            .count()
+    }
+
+    /// Une session ouverte sur la zone 9 et son pilote.
+    async fn session_ouverte() -> (
+        Arc<FaussesZones>,
+        EtatSession,
+        PiloteConnect<Arc<FaussesZones>>,
+        Arc<SpotifyConnectManager>,
+        tempfile::TempDir,
+    ) {
+        let dossier = tempfile::tempdir().unwrap();
+        let recepteur = recepteur(dossier.path());
+        let zones = Arc::new(FaussesZones::default());
+        let pilote = PiloteConnect {
+            recepteur: recepteur.clone(),
+            zones: zones.clone(),
+        };
+        recepteur.enable(9).await.unwrap();
+        let mut etat = EtatSession::default();
+        pilote.traiter(&mut etat, &joue("a")).await;
+        assert_eq!(ouvertures(&zones), 1);
+        (zones, etat, pilote, recepteur, dossier)
+    }
+
+    fn geste_de_tune(z: &FaussesZones) {
+        z.ne_joue_plus
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Pause dans l'application, PUIS geste de Tune, puis Lecture dans
+    /// l'application : la Lecture est le dernier geste. La session rouvre,
+    /// l'appareil n'est pas remis en pause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_pause_appli_geste_tune_puis_lecture_appli_rouvre() {
+        let (zones, mut etat, pilote, recepteur, _d) = session_ouverte().await;
+        pilote.traiter(&mut etat, &ev("paused")).await;
+        geste_de_tune(&zones);
+        pilote.traiter(&mut etat, &joue("a")).await;
+        recepteur.disable().await;
+        assert_eq!(ouvertures(&zones), 2, "{:?}", zones.appels.lock().unwrap());
+        assert_eq!(
+            pauses_appareil(&zones),
+            0,
+            "{:?}",
+            zones.appels.lock().unwrap()
+        );
+        assert!(!etat.rendu());
+    }
+
+    /// Geste de Tune, puis un autre téléphone se connecte (`session_connected`)
+    /// et lance la lecture : nouvelle action, la session rouvre, pas de pause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_geste_tune_puis_nouvelle_connexion_rouvre_sans_pause() {
+        let (zones, mut etat, pilote, recepteur, _d) = session_ouverte().await;
+        geste_de_tune(&zones);
+        pilote.traiter(&mut etat, &ev("session_connected")).await;
+        pilote.traiter(&mut etat, &joue("z")).await;
+        recepteur.disable().await;
+        assert_eq!(ouvertures(&zones), 2, "{:?}", zones.appels.lock().unwrap());
+        assert_eq!(
+            pauses_appareil(&zones),
+            0,
+            "{:?}",
+            zones.appels.lock().unwrap()
+        );
+    }
+
+    /// La pause de l'appareil a échoué (401, appareil absent) : l'application
+    /// continue d'enchaîner, rien ne rouvre ; la garde tombe à la prochaine
+    /// pause, et la Lecture qui suit rouvre.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_pause_appareil_echouee_garde_jusqu_a_la_pause_suivante() {
+        let (zones, mut etat, pilote, recepteur, _d) = session_ouverte().await;
+        geste_de_tune(&zones);
+        pilote.traiter(&mut etat, &titre("b", "Suivant")).await;
+        assert!(etat.rendu());
+        // La pause n'a rien fait : l'application enchaîne encore deux titres.
+        for p in ["c", "d"] {
+            pilote.traiter(&mut etat, &titre(p, p)).await;
+            pilote.traiter(&mut etat, &joue(p)).await;
+        }
+        assert_eq!(ouvertures(&zones), 1, "réouverture pendant la garde");
+        pilote.traiter(&mut etat, &ev("paused")).await;
+        assert!(!etat.rendu());
+        pilote.traiter(&mut etat, &joue("d")).await;
+        recepteur.disable().await;
+        assert_eq!(ouvertures(&zones), 2, "{:?}", zones.appels.lock().unwrap());
+    }
+
     /// #8580 — librespot relancé (renommage #8570, plantage, relance pour la
     /// liaison) : la session ouverte sous l'ancien lancement est morte, le
     /// `playing` suivant la rouvre.

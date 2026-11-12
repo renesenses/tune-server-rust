@@ -342,11 +342,12 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
     }
 
     pub async fn traiter(&self, etat: &mut EtatSession, ev: &EvenementLibrespot) {
+        // Lu AVANT tout `await` (évènement reçu sous ce lancement) : une
+        // relance de librespot pendant l'ouverture ne doit pas être prise pour
+        // le lancement de la session.
+        let lancement = self.recepteur.lancement_de_librespot();
         let zone_exposee = self.recepteur.zone_exposee().await;
         let pompe = self.recepteur.pompe();
-        // Lu AVANT tout `await` : une relance pendant l'ouverture ne doit pas
-        // être prise pour le lancement de la session.
-        let lancement = self.recepteur.lancement_de_librespot();
         // #8580 — une session MORTE ne reste pas ouverte.
         // * librespot relancé (renommage, plantage, relance pour la liaison),
         //   sans geste de Tune : l'état est fermé, le `playing` suivant rouvre.
@@ -356,18 +357,35 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
         //   et les titres qu'elle enchaînerait encore ne rouvrent rien.
         //   Détecté au premier évènement qui suit le geste : rien n'est
         //   rouvert d'ici là, donc rien n'est coupé.
+        //   SEULEMENT si cet évènement est la POURSUITE de la lecture en cours
+        //   (`track_changed`, ou `playing` hors pause) : l'application ne fait
+        //   qu'enchaîner. Si c'est une NOUVELLE action dans l'application
+        //   (`playing` après une pause, `paused`, `stopped`, `session_*`),
+        //   c'est elle le dernier geste : la session est fermée sans pause de
+        //   l'appareil ni garde, et l'évènement la rouvre s'il le faut.
+        //
+        //   Sortie de l'état « rendu » quand la pause de l'appareil a échoué
+        //   (401, appareil absent) : l'application continue d'enchaîner, ce
+        //   qui ne rouvre rien ; la garde tombe à la prochaine pause, au
+        //   prochain arrêt ou à une nouvelle connexion. Un simple changement
+        //   de titre ou de contexte ne la lève pas : librespot 0.8.0 n'émet
+        //   aucun évènement propre au chargement d'un nouveau contexte
+        //   (`loading` et `play_request_id_changed` sont émis titre par titre,
+        //   enchaînement automatique compris), indiscernable d'une poursuite.
         if let Some(zone_id) = etat.zone
             && !pompe.consommateur_de_tune()
         {
             let relance = etat.lancement != Some(lancement);
             let joue = self.zones.joue_la_session(zone_id).await;
             if relance || !joue {
+                let poursuite = ev.evenement == "track_changed"
+                    || (ev.evenement == "playing" && !etat.en_pause);
                 pompe.detacher_continu();
                 if joue {
                     self.zones.arreter(zone_id).await;
                 }
                 etat.fermer();
-                if !relance {
+                if !relance && poursuite {
                     etat.rendu = true;
                     self.zones
                         .rendre_l_appareil(&self.recepteur.device_name())
