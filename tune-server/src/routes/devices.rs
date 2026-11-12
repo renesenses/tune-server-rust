@@ -229,6 +229,15 @@ fn identite_de_l_entree(item: &Value) -> tune_core::db::ignored_device_repo::Dev
     let s = |cle: &str| item.get(cle).and_then(Value::as_str).unwrap_or("");
     tune_core::db::ignored_device_repo::DeviceIdentity::new(s("id"), s("host"), s("name"))
         .with_mac(item.get("mac_address").and_then(Value::as_str))
+        .with_protocol(protocole_de_l_entree(item))
+}
+
+/// Le protocole d'une entrée de `GET /devices` : `device_type` pour un
+/// appareil découvert, `type` pour une sortie seulement enregistrée.
+fn protocole_de_l_entree(item: &Value) -> Option<&str> {
+    item.get("device_type")
+        .or_else(|| item.get("type"))
+        .and_then(Value::as_str)
 }
 
 /// Retire de la liste les appareils ignorés (#1280).
@@ -244,7 +253,7 @@ fn retirer_appareils_ignores(items: &mut Vec<Value>, db: &Arc<dyn DbBackend>) {
         // Liste vide, ou base pré-migration : rien à retirer.
         _ => return,
     };
-    items.retain(|item| {
+    items.retain_mut(|item| {
         let principale = identite_de_l_entree(item);
         if ignores
             .iter()
@@ -252,6 +261,7 @@ fn retirer_appareils_ignores(items: &mut Vec<Value>, db: &Arc<dyn DbBackend>) {
         {
             return false;
         }
+        let protocole_principal = principale.protocole.unwrap_or("").to_string();
         let alternatives = item
             .get("capabilities")
             .and_then(|c| c.get("alternatives"))
@@ -259,7 +269,12 @@ fn retirer_appareils_ignores(items: &mut Vec<Value>, db: &Arc<dyn DbBackend>) {
         let Some(alternatives) = alternatives else {
             return true;
         };
-        !alternatives.iter().any(|alt| {
+        // Les alternatives ignorées, et pour chacune : est-elle de la même
+        // famille de protocole que l'entrée ?
+        let mut retirer_l_entree = false;
+        let mut alternatives_ignorees: Vec<String> = Vec::new();
+        for alt in alternatives {
+            let protocole_alt = alt.get("device_type").and_then(Value::as_str);
             let identite = tune_core::db::ignored_device_repo::DeviceIdentity::new(
                 alt.get("id").and_then(Value::as_str).unwrap_or(""),
                 principale.host,
@@ -267,11 +282,44 @@ fn retirer_appareils_ignores(items: &mut Vec<Value>, db: &Arc<dyn DbBackend>) {
                     .and_then(Value::as_str)
                     .unwrap_or(principale.name),
             )
-            .with_mac(principale.mac);
-            ignores
+            .with_mac(principale.mac)
+            .with_protocol(protocole_alt);
+            if !ignores
                 .iter()
                 .any(|e| tune_core::db::ignored_device_repo::identity_matches(e, identite))
-        })
+            {
+                continue;
+            }
+            // #6155 — une jumelle du même protocole (SSDP, #1280) emporte
+            // l'entrée ; une identité d'un AUTRE protocole (le Chromecast
+            // replié sous le DLNA de la KEF) ne retire qu'elle-même.
+            if tune_core::db::ignored_device_repo::protocoles_de_meme_famille(
+                &protocole_principal,
+                protocole_alt,
+            ) {
+                retirer_l_entree = true;
+                break;
+            }
+            if let Some(id) = alt.get("id").and_then(Value::as_str) {
+                alternatives_ignorees.push(id.to_string());
+            }
+        }
+        if retirer_l_entree {
+            return false;
+        }
+        if !alternatives_ignorees.is_empty()
+            && let Some(alts) = item
+                .get_mut("capabilities")
+                .and_then(|c| c.get_mut("alternatives"))
+                .and_then(Value::as_array_mut)
+        {
+            alts.retain(|a| {
+                !a.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| alternatives_ignorees.iter().any(|x| x == id))
+            });
+        }
+        true
     });
 }
 
@@ -1147,7 +1195,10 @@ pub(crate) async fn register_discovered_dlna(
             tune_core::db::ignored_device_repo::DeviceIdentity::new(
                 &dev.uuid, &dev.host, &dev.name,
             )
-            .with_mac(Some(dev.mac.as_str())),
+            .with_mac(Some(dev.mac.as_str()))
+            // #6155 — c'est un renderer DLNA : une entrée Chromecast ignorée
+            // de même nom et de même adresse ne le concerne pas.
+            .with_protocol(Some("dlna")),
         )
     {
         info!(uuid = %dev.uuid, name = %dev.name, "discovered_dlna_appareil_ignore");
@@ -1909,6 +1960,29 @@ async fn instantane_d_identite(
         snapshot.host.clone_from(&d.host);
         snapshot.name.clone_from(&d.name);
         snapshot.device_type = d.device_type.to_string();
+        // #6155 — le geste vise une identité SECONDAIRE (le Chromecast replié
+        // sous le DLNA de la KEF) : on fige SON protocole et SON nom, pas ceux
+        // de l'identité primaire, sinon ignorer le Chromecast ferait taire le
+        // DLNA.
+        if d.id != device_id
+            && let Some(alt) = d
+                .capabilities
+                .get("alternatives")
+                .and_then(|a| a.as_array())
+                .and_then(|alts| {
+                    alts.iter()
+                        .find(|a| a.get("id").and_then(Value::as_str) == Some(device_id))
+                })
+        {
+            if let Some(t) = alt.get("device_type").and_then(Value::as_str) {
+                snapshot.device_type = t.to_string();
+            }
+            if let Some(n) = alt.get("name").and_then(Value::as_str)
+                && !n.is_empty()
+            {
+                snapshot.name = n.to_string();
+            }
+        }
         return snapshot;
     }
 
@@ -3125,6 +3199,91 @@ mod liste_appareils_ignores_1280 {
             items[0].get("name").and_then(Value::as_str),
             Some("Cabasse Pearl Akoya")
         );
+    }
+
+    /// #6155 — la KEF LS50 Wireless II : DLNA (primaire) et Chromecast
+    /// (replié en alternative) sous le même nom, à la même adresse.
+    fn kef_dlna_et_chromecast() -> Vec<DiscoveredDevice> {
+        vec![
+            DiscoveredDevice::new(
+                "uuid:kef-dlna".into(),
+                "LS50 Wireless II-Living Room".into(),
+                OutputType::Dlna,
+                "192.168.1.60".into(),
+                8080,
+            ),
+            DiscoveredDevice::new(
+                "kef-cast".into(),
+                "LS50 Wireless II-Living Room".into(),
+                OutputType::Chromecast,
+                "192.168.1.60".into(),
+                8009,
+            ),
+        ]
+    }
+
+    /// #6155 — ignorer le Chromecast de la KEF laisse son entrée DLNA dans la
+    /// liste ; seule l'alternative Chromecast disparaît.
+    #[test]
+    fn ignorer_le_chromecast_de_la_kef_garde_son_dlna_6155() {
+        let db = base();
+        IgnoredDeviceRepo::with_backend(db.clone())
+            .ignore(&IgnoredDevice {
+                device_id: "kef-cast".into(),
+                mac: String::new(),
+                host: "192.168.1.60".into(),
+                name: "LS50 Wireless II-Living Room".into(),
+                device_type: "chromecast".into(),
+                created_at: None,
+            })
+            .unwrap();
+        let mut items = build_device_list(
+            kef_dlna_et_chromecast(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        assert_eq!(items.len(), 1, "le DLNA et le Chromecast sont repliés");
+        retirer_appareils_ignores(&mut items, &db);
+        assert_eq!(
+            items.len(),
+            1,
+            "l'entrée DLNA de la KEF doit rester proposée (#6155), obtenu : {items:?}"
+        );
+        assert_eq!(
+            items[0].get("id").and_then(Value::as_str),
+            Some("uuid:kef-dlna")
+        );
+        let alternatives = items[0]
+            .get("capabilities")
+            .and_then(|c| c.get("alternatives"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            alternatives
+                .iter()
+                .all(|a| a.get("id").and_then(Value::as_str) != Some("kef-cast")),
+            "le Chromecast ignoré n'est plus proposé en alternative : {alternatives:?}"
+        );
+    }
+
+    /// #6155 — ignorer le DLNA de la KEF retire l'entrée entière.
+    #[test]
+    fn ignorer_le_dlna_de_la_kef_retire_l_entree_6155() {
+        let db = base();
+        faire_taire(
+            &db,
+            "uuid:kef-dlna",
+            "192.168.1.60",
+            "LS50 Wireless II-Living Room",
+        );
+        let mut items = build_device_list(
+            kef_dlna_et_chromecast(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        retirer_appareils_ignores(&mut items, &db);
+        assert!(items.is_empty(), "obtenu : {items:?}");
     }
 }
 

@@ -50,7 +50,8 @@ use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
 /// Les facettes dont une piste peut porter plusieurs valeurs à la fois, et
 /// qui acceptent donc l'opérateur « Et » (#2108) — par leur nom de paramètre
-/// de requête.
+/// de requête. Le genre est conservé pour les URL enregistrées : depuis
+/// #5638, deux genres principaux distincts en ET ne rendent aucune piste.
 ///
 /// Les autres (année, format, fréquence, profondeur, artiste de la piste,
 /// note, DR, année d'enregistrement, provenance) n'ont qu'UNE valeur par
@@ -114,16 +115,14 @@ pub fn combiner<T>(
     }
 }
 
-/// Genre : la colonne `t.genre` OU le tableau JSON `t.genres` (#1821 : sans
-/// la casse des DEUX côtés). Les valeurs sont empilées dans l'ordre de sortie
-/// des marqueurs : les N du `IN`, puis les N motifs `LIKE`.
+/// #5638 : seul le genre principal classe une piste dans la facette Genre.
+/// Les genres secondaires restent des métadonnées, sans élargir le filtre.
 pub fn bloc_genres(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
-    let n = valeurs.len();
-    let in_part = ph.in_list_ci("t.genre", n)?;
-    let like_part = ph.or_like_ci("t.genres", n)?;
-    let mut p: Vec<SqlValue> = valeurs.iter().map(|g| SqlValue::Text(g.clone())).collect();
-    p.extend(valeurs.iter().map(|g| SqlValue::Text(format!("%\"{g}\"%"))));
-    Some((format!("({in_part} OR {like_part})"), p))
+    let condition = ph.in_list_ci("t.genre", valeurs.len())?;
+    Some((
+        condition,
+        valeurs.iter().map(|g| SqlValue::Text(g.clone())).collect(),
+    ))
 }
 
 /// Facette « contient » (label, compositeur) : `LIKE '%v%'` sans la casse.

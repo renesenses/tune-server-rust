@@ -461,7 +461,7 @@ pub(super) async fn list_tracks(
     profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<TrackFilterQuery>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, AppError> {
+) -> Result<axum::response::Response, AppError> {
     // Facettes à plusieurs valeurs : la clé répétée (`?format=aiff&format=flac`)
     // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
     // et qu'il refuse même en double.
@@ -491,13 +491,15 @@ pub(super) async fn list_tracks(
                 corps.get_mut("items"),
             )
             .await;
-            Ok(Json(corps))
+            // #8555 — la dernière conversion en octets retenait encore le fil async.
+            tune_http_types::json_hors_executeur(corps).await
         }
         Err(e) => {
             tracing::error!(error = %e, "list_tracks_tache_bloquante_perdue");
-            Ok(Json(
-                json!({"items": [], "total": 0, "limit": limit, "offset": offset}),
-            ))
+            Ok(
+                Json(json!({"items": [], "total": 0, "limit": limit, "offset": offset}))
+                    .into_response(),
+            )
         }
     }
 }
@@ -3750,7 +3752,7 @@ mod tests_termes_de_chemin_5192 {
         let liste = |raw: &'static str| {
             let state = state.clone();
             async move {
-                let Json(v) = list_tracks(
+                let reponse = list_tracks(
                     State(state),
                     ActiveProfile(1),
                     Query(TrackFilterQuery::default()),
@@ -3759,7 +3761,10 @@ mod tests_termes_de_chemin_5192 {
                 .await
                 .ok()
                 .expect("la route répond");
-                v
+                let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&octets).unwrap()
             }
         };
 

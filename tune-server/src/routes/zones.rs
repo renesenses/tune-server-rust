@@ -553,6 +553,12 @@ pub fn router() -> Router<AppState> {
             get(list_zones).post(create_zone).delete(delete_all_zones),
         )
         .route("/{id}", get(get_zone).patch(patch_zone).delete(delete_zone))
+        // #7836 — « Zones supprimées (n) » et leur bouton Restaurer.
+        .route("/supprimees", get(zones_supprimees_7836::lister))
+        .route(
+            "/{id}/restaurer",
+            axum::routing::post(zones_supprimees_7836::restaurer),
+        )
         // #7806 — les sorties ASIO présentes qu'aucune zone visible ne porte.
         .route(
             "/asio-sans-zone",
@@ -687,9 +693,14 @@ mod tune_tested;
 mod composant_airplay2_7084;
 // #6541 — boutons + / − et limites de volume d'une zone.
 mod limites_de_volume_6541;
+// #7836 — les zones supprimées, listées et restaurables.
+mod zones_supprimees_7836;
 // #6721 — la garde contre les montées brusques, par le routeur public.
 #[cfg(test)]
 mod garde_de_hausse_6721_tests;
+// #8165 — un geste de volume lève la sourdine, par le routeur public.
+#[cfg(test)]
+mod volume_leve_la_sourdine_8165_tests;
 
 // #5353 — le backend nommé par le chemin du signal est celui de LA sortie.
 mod backend_de_la_sortie_5353;
@@ -1719,6 +1730,8 @@ fn output_reach_of(
 }
 
 mod signal_path;
+// #8419 — le chemin du signal d'une lecture groupée dit chaque sortie.
+pub(crate) mod signal_path_groupe_8419;
 pub(crate) mod textes_signal;
 pub use signal_path::*;
 
@@ -1790,6 +1803,9 @@ mod signal_path_spotify_6946_tests;
 // #2029 — un DSD qui part en DoP se dit « over PCM (DoP) ».
 #[cfg(test)]
 mod signal_path_dop_2029_tests;
+// #8569 — sortie au volume non réglable : pas d'étape Volume.
+#[cfg(test)]
+mod signal_path_volume_non_reglable_8569_tests;
 
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///
