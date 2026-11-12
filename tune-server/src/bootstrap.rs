@@ -475,6 +475,10 @@ pub async fn run_with(opts: RunOptions) {
     crate::boot_status::set_phase("partages réseau");
     crate::startup::remount_network_shares(&state).await;
 
+    // #8325 / ESL63P — le réglage « Balises du classique » dans son miroir en
+    // mémoire AVANT le premier scan : le scan le lit à chaque fichier.
+    tune_core::metadata::balises_classique::charger(&state.backend);
+
     // Auto-scan music directories at startup — et, même sans `auto_scan`,
     // la reprise d'un scan qu'une mise à jour forcée a arrêté (#5531).
     let scan_done = if crate::auto_scan::scan_au_demarrage(config.auto_scan, &state.backend) {
