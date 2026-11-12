@@ -433,3 +433,46 @@ async fn remettre_a_plat_rend_tout_le_niveau_garde_par_l_egaliseur_coupe_4176() 
     );
     assert_eq!(verdict(&orch).await, OutputDspState::Inactive);
 }
+
+/// #8513 — une mesure de pièce contourne, comme PURE, ce que la zone arme :
+/// égaliseur, crossfeed, repli mono, rampe de soft-mute, fondu. Lu par les
+/// VRAIS chargeurs de l'orchestrateur, puis rétabli quand la garde tombe. La
+/// zone porte un numéro que nul autre test n'emploie : le registre de la
+/// mesure est un statique du processus.
+#[test]
+fn une_mesure_de_piece_contourne_les_traitements_puis_les_rend_8513() {
+    const Z: i64 = 851_320;
+    let orch = orchestrateur();
+    armer_l_egaliseur(&orch, Z);
+    armer_le_crossfeed(&orch, Z);
+    armer_le_repli_mono(&orch, Z);
+    reglages(&orch)
+        .set(&format!("zone_{Z}_soft_mute_ms"), "80")
+        .unwrap();
+    let arme = |orch: &PlaybackOrchestrator| {
+        (
+            orch.zone_audiophile(Z),
+            orch.load_eq_processor(Z, 48_000, 2).is_some(),
+            orch.load_crossfeed_processor(Z, 48_000).is_some(),
+            orch.zone_mono_downmix(Z),
+            PlaybackOrchestrator::zone_soft_mute_ms_with(&orch.db, Z),
+        )
+    };
+    assert_eq!(arme(&orch), (false, true, true, true, 80), "banc mal armé");
+    let garde = crate::audio::mesure_nue::Contournement::poser(Z);
+    assert_eq!(
+        arme(&orch),
+        (true, false, false, false, 0),
+        "pendant la mesure, la zone doit jouer nue"
+    );
+    assert!(
+        !crate::audio::audiophile::zone_enabled(&orch.db, Z),
+        "PURE ne doit pas être écrit en base"
+    );
+    drop(garde);
+    assert_eq!(
+        arme(&orch),
+        (false, true, true, true, 80),
+        "traitements non rétablis"
+    );
+}

@@ -37,7 +37,8 @@ impl BasculePure {
 pub enum EnvoiDeVolume {
     /// Une commande est partie vers l'appareil, avec cette valeur.
     Envoye(f64),
-    /// Zone en volume fixe : aucune commande.
+    /// Zone en volume fixe, ou sortie sans volume réglable tenue à plein
+    /// niveau (#5575) : aucune commande.
     AucunVolumeFixe,
     /// L'appareil a été relu à cette valeur, qui est celle visée : aucune
     /// commande.

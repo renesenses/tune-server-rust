@@ -157,3 +157,66 @@ async fn un_contenu_de_reveil_vide_ou_invalide_ne_remplace_pas_la_file_7058() {
             .is_none()
     );
 }
+
+/// #8135 (fil 2703) — un réveil sur une playlist « pistes + radio » : la file
+/// enchaîne les pistes puis le FLUX de la radio. Avant, la ligne radio entrait
+/// dans la file avec `source_id` = l'identifiant de la station : une adresse
+/// qui ne joue rien.
+#[tokio::test]
+async fn un_reveil_sur_une_playlist_pistes_puis_radio_finit_sur_le_flux_8135() {
+    use crate::db::play_queue_repo::QueueInput;
+    use crate::db::playlist_radio_8135::ligne_de_radio;
+    use crate::db::playlist_repo::EntryContent;
+    use crate::db::radio_repo::{RadioRepo, RadioStation};
+    let b = Banc::nouveau().await;
+    let mut fip = RadioStation {
+        id: None,
+        name: "FIP".into(),
+        url: "https://icecast.radiofrance.fr/fip-hifi.aac".into(),
+        homepage: None,
+        logo_url: None,
+        country: None,
+        language: None,
+        genre: None,
+        codec: None,
+        bitrate: None,
+        is_favorite: false,
+        last_played: None,
+        play_count: 0,
+    };
+    fip.id = Some(RadioRepo::with_backend(b.db.clone()).create(&fip).unwrap());
+    PlaylistRepo::with_backend(b.db.clone())
+        .add_entries_deduped(
+            b.playlist,
+            &[EntryContent::Service(ligne_de_radio(&fip).unwrap())],
+            None,
+        )
+        .unwrap();
+    let scheduler = AlarmScheduler::with_backend(b.db.clone(), b.orch.clone());
+    let contenu = scheduler
+        .contenu_du_reveil("playlist", &b.playlist.to_string(), Some(b.profil))
+        .unwrap()
+        .unwrap();
+    assert_eq!(contenu.len(), 3);
+    assert!(matches!(contenu[0], QueueInput::Local { track_id } if track_id == b.pistes[0]));
+    match &contenu[2] {
+        QueueInput::Streaming {
+            source, source_id, ..
+        } => {
+            assert_eq!(source, "radio");
+            assert_eq!(source_id, "https://icecast.radiofrance.fr/fip-hifi.aac");
+        }
+        autre => panic!("la radio doit finir la file, pas {autre:?}"),
+    }
+
+    // Station retirée de « Mes radios » : le réveil joue quand même ses
+    // pistes, la radio est sautée.
+    RadioRepo::with_backend(b.db.clone())
+        .delete(fip.id.unwrap())
+        .unwrap();
+    let contenu = scheduler
+        .contenu_du_reveil("playlist", &b.playlist.to_string(), Some(b.profil))
+        .unwrap()
+        .unwrap();
+    assert_eq!(contenu.len(), 2);
+}

@@ -278,8 +278,11 @@ fn reconnaitre_les_sorties(
     // #6370 — la sortie d'un agent Tune est une sortie locale, de l'autre côté
     // du réseau : relancée à une position, elle reçoit le même WAV décodé à
     // partir de `seek_ms` (voir [`agent_relance_a_la_position`]).
+    // #7972 — une zone AirPlay 2 rétablie à une position après une pause :
+    // même règle (voir [`airplay2_relance_a_la_position`]).
     let local_needs_wav = (is_local_output
-        || agent_relance_a_la_position(req.output_device_id.as_deref(), req.seek_ms))
+        || agent_relance_a_la_position(req.output_device_id.as_deref(), req.seek_ms)
+        || airplay2_relance_a_la_position(zone_output_type, req.seek_ms))
         && source_format.is_some();
 
     // Calculé ici, et non plus après la branche DoP : celle-ci en a besoin
@@ -4572,6 +4575,9 @@ mod dff_dop_longueur_7362_tests;
 #[cfg(test)]
 #[path = "duree_convertie_6630_tests.rs"]
 mod duree_convertie_6630_tests;
+#[cfg(test)]
+#[path = "reprise_airplay2_position_7972_tests.rs"]
+mod reprise_airplay2_position_7972_tests;
 
 #[cfg(test)]
 #[path = "fin_apres_relance_7551_tests.rs"]
