@@ -367,20 +367,3 @@ fn le_reglage_se_lit_en_base_et_un_json_casse_rend_les_defauts() {
     assert_eq!(apres, BalisesClassique::default());
     assert_eq!(s.get(CLE_REGLAGE).unwrap(), None);
 }
-
-#[test]
-fn les_cles_candidates_couvrent_band_et_les_graphies_standard() {
-    let c = BalisesClassique::default().cles_candidates();
-    for k in [
-        "BAND",
-        "CONDUCTOR",
-        "TPE3",
-        "ENSEMBLE",
-        "ORCHESTRA",
-        "CHOIR",
-        "WORK",
-        "MOVEMENTNAME",
-    ] {
-        assert!(c.contains(&k.to_string()), "{k} manque : {c:?}");
-    }
-}

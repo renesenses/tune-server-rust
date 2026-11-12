@@ -46,16 +46,8 @@ pub(super) async fn set_classical_tags(
     let ecrit = tokio::task::spawn_blocking(move || bc::ecrire(&backend, saisie)).await;
     match ecrit {
         Ok(Ok((ancien, nouveau))) => {
-            let relecture = ancien != nouveau;
-            if relecture {
-                let mut candidates = ancien.cles_candidates();
-                for c in nouveau.cles_candidates() {
-                    if !candidates.contains(&c) {
-                        candidates.push(c);
-                    }
-                }
-                crate::routes::library::relecture_classique::relancer(&state, candidates);
-            }
+            let relecture = ancien != nouveau
+                && crate::routes::library::relecture_classique::relancer(&state, ancien).await;
             reponse(&nouveau, relecture).into_response()
         }
         Ok(Err(e)) => (

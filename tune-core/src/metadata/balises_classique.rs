@@ -247,36 +247,6 @@ impl BalisesClassique {
             }
         }
     }
-
-    /// Toutes les clés (sans préfixe) qu'une lecture selon CE réglage peut
-    /// prendre, standard compris (avec leurs graphies de conteneur) et BAND.
-    /// La relecture après modification n'efface une valeur que si le
-    /// fichier la porte sous l'une d'elles (voir `relecture_classique`).
-    pub fn cles_candidates(&self) -> Vec<String> {
-        let mut cles = self.cles_brutes();
-        let mut pousser = |c: &str| {
-            if !cles.iter().any(|x| x == c) {
-                cles.push(c.to_owned());
-            }
-        };
-        pousser(super::credits_balises::CLE_BAND);
-        if Self::lit_standard(&self.conductor, STANDARD_CHEF) {
-            for c in ["CONDUCTOR", "TPE3"] {
-                pousser(c);
-            }
-        }
-        if Self::lit_standard(&self.work, STANDARD_OEUVRE) {
-            for c in ["WORK", "WORKTITLE", "©WRK", "TIT1"] {
-                pousser(c);
-            }
-        }
-        if Self::lit_standard(&self.movement, STANDARD_MOUVEMENT) {
-            for c in ["MOVEMENTNAME", "MVNM", "©MVN"] {
-                pousser(c);
-            }
-        }
-        cles
-    }
 }
 
 static COURANTE: LazyLock<RwLock<Arc<BalisesClassique>>> =

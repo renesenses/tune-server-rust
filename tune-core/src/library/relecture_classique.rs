@@ -15,16 +15,22 @@
 //!   `conductor`, par upsert, et seulement quand le fichier les porte. Une
 //!   œuvre posée par l'assistant IA sur un fichier qui n'en dit rien reste en
 //!   place.
-//! - **Relancée par le réglage « Balises du classique »** ([`reinitialiser`]) :
-//!   la passe repart de zéro, selon le nouveau réglage ; elle efface alors
-//!   une valeur que le fichier porte sous une clé que le réglage ne lit plus,
-//!   et réécrit les crédits `balises` de la piste.
+//! - **Relancée par le réglage « Balises du classique »** ([`reinitialiser`],
+//!   appelé au PUT, donc persistant : un redémarrage la reprend) : la passe
+//!   repart de zéro selon le nouveau réglage. Elle n'efface une valeur que si
+//!   elle est ÉGALE à ce qu'un ANCIEN réglage lisait dans le fichier et que le
+//!   nouveau ne la lit plus ; une valeur posée par l'assistant IA, la
+//!   communauté ou l'utilisateur, que l'ancien réglage ne produisait pas,
+//!   reste. Elle réécrit aussi les crédits `balises` de la piste.
 //!
 //! Le pilote (pause, lecture, registre des tâches de fond) est côté serveur :
 //! `tune-server/src/routes/library/relecture_classique.rs`.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use crate::metadata::balises_classique::BalisesClassique;
 
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
@@ -35,85 +41,51 @@ pub const CLE_FAITE: &str = "relecture_classique_8325_faite";
 /// Le dernier identifiant de piste traité.
 pub const CLE_CURSEUR: &str = "relecture_classique_8325_curseur";
 /// Présente pendant une relecture demandée par une MODIFICATION du réglage
-/// « Balises du classique » : les clés brutes (sans préfixe) sous
-/// lesquelles une valeur déjà en base a pu être lue (JSON). Voir
-/// [`reinitialiser`].
+/// « Balises du classique » : les réglages d'AVANT (JSON, liste), ceux qui
+/// ont produit les valeurs en base. Voir [`reinitialiser`].
 pub const CLE_RECONFIGURATION: &str = "relecture_classique_reconfiguration";
 /// Les clés de `track_metadata` que la passe écrit.
 pub const CLES: [&str; 4] = ["work", "movement", "ensemble", "conductor"];
 
-/// Ce qu'une lecture de fichier rend à la passe.
-#[derive(Debug, Clone, Default)]
-pub struct Lecture {
-    /// Les métadonnées étendues, lues selon le réglage en vigueur.
-    pub meta: std::collections::HashMap<String, String>,
-    /// Toutes les balises brutes du fichier `(clé, valeur)`.
-    pub brutes: Vec<(String, String)>,
-}
+/// Sérialise un lot et une remise à zéro : sans lui, un lot en cours
+/// écrirait son curseur APRÈS la remise à zéro du PUT, et sauterait des
+/// pistes.
+static VERROU: Mutex<()> = Mutex::new(());
 
-impl Lecture {
-    /// Témoins : une lecture qui ne porte que `paires` (et aucune brute).
-    pub fn de(paires: &[(&str, &str)]) -> Self {
-        Self {
-            meta: paires
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            brutes: Vec::new(),
-        }
-    }
+fn verrou() -> std::sync::MutexGuard<'static, ()> {
+    VERROU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Relance la passe pour TOUTE la bibliothèque après une modification du
-/// réglage « Balises du classique » : le curseur repart de zéro, et la
-/// passe peut cette fois EFFACER une valeur que le fichier porte sous l'une
-/// des `candidates` mais que le nouveau réglage ne lit plus (BAND ignoré,
-/// balise retirée d'une liste). Une valeur posée d'ailleurs (assistant IA,
-/// communauté) n'est jamais effacée : le fichier ne la porte sous aucune
-/// clé candidate.
-pub fn reinitialiser(backend: &Arc<dyn DbBackend>, candidates: &[String]) -> Result<(), String> {
+/// réglage « Balises du classique ». Appelée au PUT : le curseur repart de
+/// zéro, la passe n'est plus close, et `ancien` (le réglage qui a produit les
+/// valeurs en base) est enregistré — tout est en base, un redémarrage
+/// reprend la relance. Plusieurs modifications de suite cumulent leurs
+/// anciens réglages.
+pub fn reinitialiser(
+    backend: &Arc<dyn DbBackend>,
+    ancien: &BalisesClassique,
+) -> Result<(), String> {
+    let _v = verrou();
     let settings = SettingsRepo::with_backend(backend.clone());
-    let mut toutes: Vec<String> = settings
-        .get(CLE_RECONFIGURATION)
-        .ok()
-        .flatten()
-        .and_then(|j| serde_json::from_str(&j).ok())
-        .unwrap_or_default();
-    for c in candidates {
-        if !toutes.contains(c) {
-            toutes.push(c.clone());
-        }
+    let mut anciens = anciens_reglages(backend).unwrap_or_default();
+    if !anciens.contains(ancien) {
+        anciens.push(ancien.clone());
     }
-    let json = serde_json::to_string(&toutes).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(&anciens).map_err(|e| e.to_string())?;
     settings.set(CLE_RECONFIGURATION, &json)?;
     settings.delete(CLE_CURSEUR)?;
     settings.delete(CLE_FAITE)?;
     Ok(())
 }
 
-fn candidates(backend: &Arc<dyn DbBackend>) -> Option<Vec<String>> {
+/// Les anciens réglages d'une relance en cours, `None` hors relance.
+fn anciens_reglages(backend: &Arc<dyn DbBackend>) -> Option<Vec<BalisesClassique>> {
     SettingsRepo::with_backend(backend.clone())
         .get(CLE_RECONFIGURATION)
         .ok()
         .flatten()
         .and_then(|j| serde_json::from_str(&j).ok())
-}
-
-/// Chaque entrée (« ; ») de `valeur` est-elle portée par le fichier sous
-/// l'une des clés `candidates` ?
-fn portee_par_le_fichier(valeur: &str, brutes: &[(String, String)], candidates: &[String]) -> bool {
-    let norm = |v: &str| v.trim().to_lowercase();
-    let du_fichier: Vec<String> = brutes
-        .iter()
-        .filter(|(k, _)| candidates.contains(&crate::metadata::balises_brutes::nom_de_cle(k)))
-        .flat_map(|(_, v)| v.split(';').map(norm).collect::<Vec<_>>())
-        .collect();
-    let entrees: Vec<String> = valeur
-        .split(';')
-        .map(norm)
-        .filter(|e| !e.is_empty())
-        .collect();
-    !entrees.is_empty() && entrees.iter().all(|e| du_fichier.contains(e))
 }
 
 /// Ce qu'un lot a fait.
@@ -170,26 +142,30 @@ pub fn restantes(backend: &Arc<dyn DbBackend>) -> u64 {
         .max(0) as u64
 }
 
-/// Les clés classiques d'un fichier, telles que le scan les lit selon le
-/// réglage en vigueur, et ses balises brutes. `None` : fichier illisible
-/// (partage absent…) — la piste est sautée, rien n'est effacé.
-pub fn lire(chemin: &Path) -> Option<Lecture> {
-    let brutes = crate::metadata::balises_brutes::lire_balises_du_fichier(chemin)
-        .ok()?
-        .paires();
-    let meta = crate::metadata::read_extended_metadata(chemin);
-    Some(Lecture { meta, brutes })
+/// Les métadonnées étendues d'un fichier selon le réglage `reglage`.
+/// `None` : fichier introuvable ou illisible (partage absent…) — la piste
+/// est sautée, rien n'est effacé. Une seule lecture des balises.
+pub fn lire(chemin: &Path, reglage: &BalisesClassique) -> Option<HashMap<String, String>> {
+    let ouvrable = match crate::audio::iso9660::ouvrir_si_virtuel(chemin) {
+        Some(lecteur) => lecteur.is_ok(),
+        None => crate::audio::iso9660::ouvrir_fichier(chemin).is_ok(),
+    };
+    ouvrable.then(|| crate::metadata::read_extended_metadata_selon(chemin, reglage))
 }
 
-/// Lit et écrit le lot suivant de `taille` pistes locales, avance le
-/// curseur, et clôt la passe quand il n'y a plus rien.
+/// Lit et écrit le lot suivant de `taille` pistes locales selon le réglage
+/// `actuel`, avance le curseur, et clôt la passe quand il n'y a plus rien.
 ///
 /// `lire_fichier` est [`lire`] en production ; les témoins le remplacent.
+/// Pendant une relance, un fichier n'est relu selon un ancien réglage que
+/// pour une clé que le nouveau ne donne plus et que la base porte.
 pub fn traiter_lot_suivant(
     backend: &Arc<dyn DbBackend>,
     taille: i64,
-    lire_fichier: impl Fn(&Path) -> Option<Lecture>,
+    actuel: &BalisesClassique,
+    lire_fichier: impl Fn(&Path, &BalisesClassique) -> Option<HashMap<String, String>>,
 ) -> Result<Lot, String> {
+    let _v = verrou();
     let settings = SettingsRepo::with_backend(backend.clone());
     if est_faite(backend) {
         return Ok(Lot {
@@ -197,7 +173,7 @@ pub fn traiter_lot_suivant(
             ..Lot::default()
         });
     }
-    let reconfiguration = candidates(backend);
+    let anciens = anciens_reglages(backend);
     let apres = curseur(backend);
     let n = id_num(backend);
     let rangs = backend.query_many(
@@ -228,42 +204,44 @@ pub fn traiter_lot_suivant(
         };
         dernier = dernier.max(id);
         lot.lues += 1;
-        let Some(lecture) = lire_fichier(Path::new(&chemin)) else {
+        let chemin = Path::new(&chemin);
+        let Some(lu) = lire_fichier(chemin, actuel) else {
             continue;
         };
         let mut ecrite = false;
+        // Les lectures selon les anciens réglages, faites au besoin seulement.
+        let mut lus_avant: Vec<Option<Option<HashMap<String, String>>>> =
+            vec![None; anciens.as_ref().map_or(0, Vec::len)];
         for cle in CLES {
-            match lecture
-                .meta
-                .get(cle)
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-            {
-                Some(valeur) => {
-                    meta.set(id, cle, valeur)?;
-                    ecrite = true;
-                }
-                None => {
-                    // Seulement après une modification du réglage, et
-                    // seulement une valeur que le fichier porte sous une clé
-                    // candidate : celle que l'ancien réglage avait lue.
-                    let Some(candidates) = &reconfiguration else {
-                        continue;
-                    };
-                    let deja = meta.get_all(id)?.get(cle).cloned();
-                    if let Some(deja) = deja
-                        && portee_par_le_fichier(&deja, &lecture.brutes, candidates)
-                    {
-                        meta.delete(id, cle)?;
-                        ecrite = true;
-                    }
-                }
+            if let Some(valeur) = lu.get(cle).map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                meta.set(id, cle, valeur)?;
+                ecrite = true;
+                continue;
+            }
+            let Some(anciens) = &anciens else {
+                continue;
+            };
+            let Some(deja) = meta.get_all(id)?.get(cle).cloned() else {
+                continue;
+            };
+            // Effacée seulement si un ancien réglage la LISAIT dans ce
+            // fichier, telle quelle.
+            let lue_avant = anciens.iter().enumerate().any(|(i, ancien)| {
+                let lu_avant = lus_avant[i].get_or_insert_with(|| lire_fichier(chemin, ancien));
+                lu_avant
+                    .as_ref()
+                    .and_then(|m| m.get(cle))
+                    .is_some_and(|v| v.trim() == deja.trim())
+            });
+            if lue_avant {
+                meta.delete(id, cle)?;
+                ecrite = true;
             }
         }
-        if reconfiguration.is_some() {
+        if anciens.is_some() {
             // Les crédits `balises` (chef, ensemble) suivent le réglage, comme
             // au scan d'un fichier modifié.
-            let lignes = crate::metadata::credits_balises::lignes_des_balises(&lecture.meta);
+            let lignes = crate::metadata::credits_balises::lignes_des_balises(&lu);
             crate::metadata::credits_balises::ecrire_credits_des_balises(backend, id, &lignes)?;
         }
         if ecrite {
