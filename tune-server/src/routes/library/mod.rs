@@ -454,6 +454,11 @@ pub fn router() -> Router<AppState> {
             "/coffrets/{id}/defaire-manuel",
             post(edition::defaire_coffret_manuel),
         )
+        // #8571 (fil 2763) — réordonner les albums d'un coffret manuel.
+        .route(
+            "/coffrets/{id}/ordre",
+            get(edition::ordre_du_coffret).put(edition::reordonner_coffret),
+        )
         .route(
             "/albums/disques-abimes/reparer",
             post(albums::reparer_disques),
