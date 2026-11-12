@@ -342,6 +342,20 @@ pub mod sql_annuaire {
             d.placeholder(2)
         )
     }
+
+    /// web#2795 — les stations surchargées chez l'utilisateur.
+    pub fn surcharges() -> &'static str {
+        "SELECT id FROM radio_stations WHERE surcharge_locale IS NOT NULL"
+    }
+
+    /// web#2795 — pose (date RFC 3339) ou retire (NULL) la surcharge locale.
+    pub fn surcharger<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE radio_stations SET surcharge_locale = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
 }
 
 impl RadioRepo {
@@ -375,6 +389,27 @@ impl RadioRepo {
         let sql = self.dialect_sql(sql_annuaire::lier, sql_annuaire::lier);
         let ext: Option<String> = external_id.map(str::to_string);
         let params: [&dyn ToSqlValue; 2] = [&ext, &id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// web#2795 — les stations dont l'utilisateur a changé chez lui le nom, le
+    /// logo ou le flux alors qu'elles sont liées à leur fiche de l'annuaire.
+    /// Le relevé de l'annuaire ne les touche pas.
+    pub fn surcharges_locales(&self) -> Result<std::collections::HashSet<i64>, String> {
+        let rows = self.db.query_many(sql_annuaire::surcharges(), &[])?;
+        Ok(rows
+            .iter()
+            .filter_map(|c| c.first().and_then(|v| v.as_i64()))
+            .collect())
+    }
+
+    /// web#2795 — pose la surcharge locale (`Some(date)`) ou la retire
+    /// (`None`, « Revenir à la fiche de l'annuaire »).
+    pub fn surcharger_localement(&self, id: i64, date: Option<&str>) -> Result<(), String> {
+        let sql = self.dialect_sql(sql_annuaire::surcharger, sql_annuaire::surcharger);
+        let date: Option<String> = date.map(str::to_string);
+        let params: [&dyn ToSqlValue; 2] = [&date, &id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }

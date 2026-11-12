@@ -2853,6 +2853,21 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "artists_country",
         up: "",
     },
+    // web#2795 (décision de Bertrand, 11/11) — la SURCHARGE LOCALE d'une
+    // station de l'annuaire : `radio_stations.surcharge_locale`, la date à
+    // laquelle l'utilisateur a changé chez lui le nom, le logo ou le flux ;
+    // NULL : la station suit sa fiche. Le relevé de l'annuaire ne la touche
+    // plus ; « Revenir à la fiche de l'annuaire » la remet à NULL.
+    //
+    // Colonne posée dans le bloc de version et dans la passe finale, PAS dans
+    // `up` : même règle qu'à la 126. Jumelle PG : 113. Renumérotée 147 / PG 113
+    // le 11/11, ordre du lot : #8243 144/110, #8334 145/111, #8090 146/112,
+    // puis #8429 147/113.
+    Migration {
+        version: 147,
+        name: "radio_stations_surcharge_locale",
+        up: "",
+    },
 ];
 
 /// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
@@ -3093,6 +3108,12 @@ fn date_de_creation_des_fichiers(db: &SqliteDb) {
 /// L'index de la migration 126 (#6516). `IF NOT EXISTS` : rejouable.
 const SQL_INDEX_RADIO_EXTERNAL_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id)";
+
+/// Garantit `radio_stations.surcharge_locale` (web#2795) — bloc de version de
+/// la 147 et passe finale. NULL pour l'existant : aucune station surchargée.
+fn surcharge_locale_des_radios(db: &SqliteDb) {
+    add_column_if_missing(db, "radio_stations", "surcharge_locale", "TEXT");
+}
 
 /// Garantit `radio_stations.external_id` puis pose son index (#6516). Un échec
 /// de l'index est JOURNALISÉ : sans lui, le rapprochement est lent, pas faux.
@@ -4353,6 +4374,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // de fond le lit sur MusicBrainz.
             pays_des_artistes(db);
         }
+        if migration.version == 147 {
+            // web#2795 — la surcharge locale des stations de l'annuaire.
+            surcharge_locale_des_radios(db);
+        }
         if migration.version == 137 {
             // #7765 — la source des crédits, puis l'attribution UNE fois des
             // lignes existantes. L'index vient APRES la colonne qu'il nomme.
@@ -4965,6 +4990,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // Le lien des radios avec l'annuaire (migration 126, #6516) — posé ICI
     // aussi : le rapprochement le NOMME. PG : migration 090.
     lien_des_radios_avec_l_annuaire(db);
+    // La surcharge locale des radios (migration 147, web#2795) — posée ICI
+    // aussi : la liste et le relevé de l'annuaire la NOMMENT. PG : 113.
+    surcharge_locale_des_radios(db);
     // L'ordre des etiquettes (migration 127, #6257) — pose ICI aussi :
     // l'INSERT des etiquettes le NOMME. Sans rangement : toutes a 0, la liste
     // reste rangee par nom (le nom departage). PG : migration 091.
@@ -6064,6 +6092,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         112,
         "artists_country",
         include_str!("../../migrations/postgres/112_artists_country.sql"),
+    ),
+    // Jumelle de la SQLite 147 (web#2795) : `radio_stations.surcharge_locale`,
+    // la surcharge locale d'une station de l'annuaire, NULL pour l'existant.
+    (
+        113,
+        "radio_stations_surcharge_locale",
+        include_str!("../../migrations/postgres/113_radio_stations_surcharge_locale.sql"),
     ),
 ];
 
@@ -9857,7 +9892,10 @@ mod tests {
         // 112 : `artists_country` (#8090), jumelle de la SQLite 146. Pose
         // `artists.country` et `artists.country_mbid`, que les facettes et la
         // passe de fond NOMMENT.
-        assert_eq!(pg_latest_version(), 112, "latest PG migration must be 112");
+        // 113 : `radio_stations_surcharge_locale` (web#2795), jumelle de la
+        // SQLite 147. Pose la surcharge locale d'une station de l'annuaire, que
+        // la liste et le relevé NOMMENT.
+        assert_eq!(pg_latest_version(), 113, "latest PG migration must be 113");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
