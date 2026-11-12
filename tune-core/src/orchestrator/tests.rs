@@ -10827,3 +10827,75 @@ async fn une_session_retiree_sans_abandon_pendant_l_envoi_n_arrete_rien_6658() {
     assert_eq!(output_error, None);
     assert_eq!(mock.stop_call_count(), 0, "rien ne doit arrêter la sortie");
 }
+
+/// #8404 — fil 2748 : un second appareil lance un autre titre sur la zone
+/// DLNA où joue déjà la tablette. Mesure de l'hypothèse « le flux du titre
+/// remplacé n'est pas libéré » : après le remplacement, la session de la
+/// piste remplacée doit avoir disparu, seule celle du nouveau titre vit, et
+/// c'est son URL que le renderer a reçue en dernier.
+#[tokio::test]
+async fn remplacer_la_lecture_d_une_zone_dlna_ferme_le_flux_remplace_8404() {
+    let device_id = "dlna-marantz-nr1200";
+    let (orch, zone_id, _dir) = zone_reseau_trois_pistes(device_id, false).await;
+
+    // La tablette lance la piste 1.
+    orch.play(PlayRequest {
+        zone_id,
+        track_id: Some(1),
+        source: Some("local".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("première lecture");
+    let sid_tablette = orch
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .and_then(|np| np.stream_id)
+        .expect("la piste de la tablette a sa session de flux");
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+    // Le portable lance un AUTRE titre sur la même zone.
+    orch.play(PlayRequest {
+        zone_id,
+        track_id: Some(3),
+        source: Some("local".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("seconde lecture");
+    let sid_portable = orch
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .and_then(|np| np.stream_id)
+        .expect("la piste du portable a sa session de flux");
+    assert_ne!(sid_tablette, sid_portable);
+
+    let vivantes: Vec<String> = {
+        let sessions = orch.streamer.sessions_state();
+        let sessions = sessions.lock().await;
+        sessions.keys().cloned().collect()
+    };
+    assert!(
+        !vivantes.contains(&sid_tablette),
+        "le flux du titre remplacé vit encore : {vivantes:?}"
+    );
+    assert_eq!(
+        vivantes,
+        vec![sid_portable.clone()],
+        "une seule session vivante"
+    );
+
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).expect("sortie enregistree");
+    let guard = out.lock().await;
+    let mock = guard.as_any().downcast_ref::<MockOutput>().expect("mock");
+    let url = mock.last_play_url().await.expect("une URL envoyée");
+    assert!(
+        url.contains(&sid_portable),
+        "le renderer doit avoir reçu le flux du portable : {url}"
+    );
+}
