@@ -18,7 +18,8 @@
 /// Il n'attend que les fils qui allouent ou libèrent. Le rappel de rendu
 /// local n'en fait aucun : il lit l'anneau dans le tampon que lui tend le
 /// pilote (`render_local_shared_*_callback`, plus aucune allocation depuis
-/// #2218), et le fil ALSA de cpal travaille dans des tampons faits à
+/// #2218, gardé par `outputs::local::ringbuf_tests` qui compte les appels à
+/// l'allocateur), et le fil ALSA de cpal travaille dans des tampons faits à
 /// l'ouverture. Le producteur, lui, alloue, mais il a deux secondes d'anneau
 /// devant lui. Mesuré sur Shrek (banc `banc_trim_pendant_lecture_8609`) :
 /// voir `tune-server/src/memoire_a_froid.rs`.
@@ -46,6 +47,7 @@ pub struct EtatDuTas {
     /// Blocs vivants, tas des arènes ET blocs `mmap` (`uordblks + hblkhd`).
     pub en_usage_mb: u64,
     /// Blocs libres que les arènes gardent (`fordblks`) : ce que la purge vise.
+    /// Résidents ou non : une page déjà rendue au noyau y reste comptée.
     pub libre_mb: u64,
     /// Dont blocs servis par `mmap` (`hblkhd`), rendus seuls à leur libération.
     pub mmap_mb: u64,

@@ -102,6 +102,10 @@ pub fn rendre_la_memoire_liberee() -> bool {
 /// Mémoire libre gardée par les arènes (`mallinfo2().fordblks`) au-delà de
 /// laquelle la purge a lieu MÊME pendant une lecture locale (#8609). En deçà,
 /// le jeu n'en vaut pas la chandelle : on attend le prochain relevé.
+///
+/// ⚠️ `fordblks` compte les octets libres, RÉSIDENTS OU NON : une page déjà
+/// rendue par une purge précédente y figure encore. Le seuil écarte un tas
+/// petit, il ne prouve pas que la purge rendra quelque chose.
 pub const SEUIL_LIBRE_PENDANT_LECTURE_MB: u64 = 64;
 
 /// Ce que décide le relevé de cinq minutes.
