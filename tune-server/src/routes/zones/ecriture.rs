@@ -1357,7 +1357,7 @@ pub(super) async fn delete_all_zones(State(state): State<AppState>) -> impl Into
 /// #7937 — une zone ressuscitée par `POST /zones` (même appareil, même
 /// numéro) repart sans groupe de lecture. Un échec d'écriture est journalisé
 /// et ne fait pas échouer la création : la zone est bien revenue.
-fn sortir_la_zone_recreee_des_groupes(state: &AppState, id: i64) {
+pub(super) fn sortir_la_zone_recreee_des_groupes(state: &AppState, id: i64) {
     match tune_core::zones::groupes_enregistres::retirer_des_groupes_enregistres(
         &state.backend,
         &[id],
