@@ -8,10 +8,15 @@
 //! manquantes. Il peut perdre des paquets à la première réception, ou se
 //! taire, pour exercer les retransmissions et les délais.
 //!
+//! Sessions (#8536, mesuré par Rémi sur un Expert) : l'ampli associe chaque
+//! session à l'adresse qui l'a ouverte et renvoie ses `Df` à CETTE adresse,
+//! pas à l'émetteur du paquet. Une session neuve est adoptée : elle passe
+//! dans l'annonce et ses retours vont à son émetteur.
+//!
 //! Il n'imite que ce que la spécification décrit : c'est un témoin de
 //! conformité à la spécification, pas une preuve de ce que fait un ampli.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -85,6 +90,10 @@ pub struct EtatSimule {
     pub perdus: HashSet<u64>,
     /// Ne renvoie aucun `Df`.
     pub muet: bool,
+    /// #8536 — l'hôte à qui chaque session appartient, et donc où partent
+    /// les `Df` de ses flux. Un témoin y place la session annoncée pour
+    /// simuler un Roon qui l'a ouverte.
+    pub hotes_de_session: HashMap<[u8; 4], SocketAddr>,
     /// Délai d'allumage simulé.
     pub delai_allumage: Duration,
     allumage_demande: Option<Instant>,
@@ -296,10 +305,12 @@ fn recevoir(etat: &Mutex<EtatSimule>, o: &[u8], de: SocketAddr) {
             trames,
             decalages,
         }) => {
-            // Mauvaise session : l'ampli ignore le flux (hypothèse Q1).
-            if e.annonce.as_ref().map(|a| a.session) != Some(entete.session) {
-                e.refus.push("session étrangère".into());
-                return;
+            // #8536 — une session inconnue est adoptée et appartient à son
+            // émetteur ; une session connue renvoie ses retours à son hôte,
+            // quel que soit l'émetteur du paquet.
+            let hote = *e.hotes_de_session.entry(entete.session).or_insert(de);
+            if let Some(a) = e.annonce.as_mut() {
+                a.session = entete.session;
             }
             if e.perdre_une_fois.remove(&entete.position) {
                 e.perdus.insert(entete.position);
@@ -309,7 +320,7 @@ fn recevoir(etat: &Mutex<EtatSimule>, o: &[u8], de: SocketAddr) {
                 e.flux_courant = Some(entete.flux);
                 e.lecture_depuis = None;
             }
-            e.client = Some(de);
+            e.client = Some(hote);
             e.frequence = entete.frequence;
             if entete.lecture && e.lecture_depuis.is_none() {
                 e.lecture_depuis = Some(Instant::now());
