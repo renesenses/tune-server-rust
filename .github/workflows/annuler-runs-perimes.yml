@@ -2,14 +2,17 @@ name: Annuler les runs périmés
 
 # Nettoyage de la file GitHub Actions (go de Bertrand du 12/11/2026).
 #
-# Annule :
+# Annule, parmi les runs déclenchés par l'événement pull_request SEULEMENT :
 #   1. les runs « queued » créés depuis plus de MAX_QUEUED_HOURS heures ;
 #   2. les runs « queued » ou « in_progress » dont la branche est celle d'une PR
 #      déjà fermée ou fusionnée (et qui n'a plus aucune PR ouverte).
 #
 # Ne touche JAMAIS :
-#   - un run de main, de rc/*, de release/* ou d'un tag, ni un run déclenché par
-#     l'événement release (les runs planifiés tournent sur main : protégés) ;
+#   - un run d'un autre événement que pull_request (push, schedule,
+#     workflow_dispatch, release…) : les runs de push et les runs nocturnes
+#     d'un lot batch/** (CI allégée, #8601) n'ont pas de PR derrière eux ;
+#   - un run de main, de rc/*, de release/*, de batch/*, d'integration/* ou
+#     d'un tag ;
 #   - un run d'un workflow de la liste blanche ci-dessous (déploiement, release,
 #     paquets, promotion) ni ce workflow lui-même.
 #
@@ -58,7 +61,7 @@ env:
   # (insensible à la casse) est aussi protégé.
   PROTECTED_WORKFLOW_PATTERN: 'deploy|déploi|release|publi|promot|rollback|testflight|firebase|docker|debian|\.deb|tune os|annuler les runs'
   # Branches protégées (expression régulière étendue sur headBranch).
-  PROTECTED_BRANCH_PATTERN: '^(main|master|rc/.*|release/.*)$'
+  PROTECTED_BRANCH_PATTERN: '^(main|master|rc/.*|release/.*|batch/.*|integration/.*)$'
   MAX_QUEUED_HOURS: '6'
 
 jobs:
@@ -113,6 +116,12 @@ jobs:
                 [ "$id" = "$SELF_RUN_ID" ] && continue
                 if raison=$(est_protege "$wf" "$br" "$ev"); then
                   echo "garde   $id [$statut] « $wf » $br ($ev) : $raison"
+                  continue
+                fi
+                # Les règles (a) et (b) ne visent que les runs de PR : un run de
+                # push, planifié ou manuel n'a pas de PR derrière lui.
+                if [ "$ev" != "pull_request" ]; then
+                  echo "garde   $id [$statut] « $wf » $br ($ev) : événement $ev, seuls les runs pull_request sont nettoyés"
                   continue
                 fi
                 motif=""
