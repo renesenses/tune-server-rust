@@ -1,0 +1,135 @@
+name: Annuler les runs périmés
+
+# Nettoyage de la file GitHub Actions (go de Bertrand du 12/11/2026).
+#
+# Annule :
+#   1. les runs « queued » créés depuis plus de MAX_QUEUED_HOURS heures ;
+#   2. les runs « queued » ou « in_progress » dont la branche est celle d'une PR
+#      déjà fermée ou fusionnée (et qui n'a plus aucune PR ouverte).
+#
+# Ne touche JAMAIS :
+#   - un run de main, de rc/*, de release/* ou d'un tag, ni un run déclenché par
+#     l'événement release (les runs planifiés tournent sur main : protégés) ;
+#   - un run d'un workflow de la liste blanche ci-dessous (déploiement, release,
+#     paquets, promotion) ni ce workflow lui-même.
+#
+# Planifié : agit pour de vrai. Manuel : à blanc par défaut (dry_run: true).
+
+on:
+  schedule:
+    - cron: '17 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "À blanc : journaliser sans rien annuler"
+        type: boolean
+        default: true
+
+permissions:
+  actions: write        # gh run list / gh run cancel
+  pull-requests: read   # état des PR de la branche
+  contents: read        # reconnaître un tag
+
+concurrency:
+  group: annuler-runs-perimes
+  cancel-in-progress: false
+
+env:
+  # ---- LISTE BLANCHE : jamais annulés (noms exacts de workflow, un par ligne) ----
+  PROTECTED_WORKFLOWS: |
+    Release
+    Desktop Release
+    Docker
+    Paquet Debian (.deb)
+    Widget Release
+    Tune OS Image
+    Trigger OS image builds
+    Preflight
+    Promote staged release
+    Release controller
+    Post-release — synchroniser le tag vers main
+    Rollback
+    Moissonneur Roon
+    Changelog
+    Audit des protections
+    FFmpeg minimal
+    Annuler les runs périmés
+  # Filet supplémentaire : tout workflow dont le nom contient l'un de ces motifs
+  # (insensible à la casse) est aussi protégé.
+  PROTECTED_WORKFLOW_PATTERN: 'deploy|déploi|release|publi|promot|rollback|testflight|firebase|docker|debian|\.deb|tune os|annuler les runs'
+  # Branches protégées (expression régulière étendue sur headBranch).
+  PROTECTED_BRANCH_PATTERN: '^(main|master|rc/.*|release/.*)$'
+  MAX_QUEUED_HOURS: '6'
+
+jobs:
+  nettoyer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Annuler les runs périmés
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          SELF_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          owner="${GH_REPO%%/*}"
+          now=$(date -u +%s)
+          limite=$(( now - MAX_QUEUED_HOURS * 3600 ))
+          echo "Mode à blanc : $DRY_RUN"
+
+          est_protege() { # $1=workflow $2=branche $3=événement
+            local wf="$1" br="$2" ev="$3"
+            if printf '%s\n' "$PROTECTED_WORKFLOWS" | sed 's/^ *//;s/ *$//' | grep -Fxq -- "$wf"; then echo "workflow en liste blanche"; return 0; fi
+            if printf '%s' "$wf" | grep -Eiq -- "$PROTECTED_WORKFLOW_PATTERN"; then echo "workflow protégé (motif)"; return 0; fi
+            if [ -z "$br" ]; then echo "branche inconnue"; return 0; fi
+            if printf '%s' "$br" | grep -Eq -- "$PROTECTED_BRANCH_PATTERN"; then echo "branche protégée"; return 0; fi
+            if [ "$ev" = "release" ]; then echo "événement release"; return 0; fi
+            if gh api "repos/$GH_REPO/git/matching-refs/tags/$br" --jq '.[].ref' 2>/dev/null | grep -Fxq "refs/tags/$br"; then echo "tag"; return 0; fi
+            return 1
+          }
+
+          declare -A etat_pr=()
+          pr_fermee() { # vrai si la branche n'a aucune PR ouverte et au moins une PR fermée/fusionnée
+            local br="$1"
+            if [ -z "${etat_pr[$br]+x}" ]; then
+              local etats
+              etats=$(gh api -X GET "repos/$GH_REPO/pulls" -f state=all -f head="$owner:$br" -f per_page=100 --jq '.[].state' 2>/dev/null || echo "erreur")
+              if [ "$etats" = "erreur" ] || [ -z "$etats" ] || printf '%s\n' "$etats" | grep -qx open; then
+                etat_pr[$br]=non
+              else
+                etat_pr[$br]=oui
+              fi
+            fi
+            [ "${etat_pr[$br]}" = oui ]
+          }
+
+          for statut in queued in_progress; do
+            gh run list --status "$statut" --limit 500 \
+              --json databaseId,workflowName,headBranch,event,createdAt,url \
+              --jq '.[] | [.databaseId, .workflowName, .headBranch, .event, .createdAt, (.createdAt | fromdateiso8601), .url] | map(tostring) | join("\u001f")' \
+            | while IFS=$'\x1f' read -r id wf br ev cree cree_s url; do
+                [ "$id" = "$SELF_RUN_ID" ] && continue
+                if raison=$(est_protege "$wf" "$br" "$ev"); then
+                  echo "garde   $id [$statut] « $wf » $br ($ev) : $raison"
+                  continue
+                fi
+                motif=""
+                if [ "$statut" = queued ] && [ "$cree_s" -lt "$limite" ]; then
+                  motif="en file depuis plus de ${MAX_QUEUED_HOURS} h (créé $cree)"
+                elif pr_fermee "$br"; then
+                  motif="PR de la branche fermée ou fusionnée"
+                fi
+                [ -z "$motif" ] && continue
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "À BLANC $id [$statut] « $wf » $br ($ev) : $motif — $url"
+                else
+                  if gh run cancel "$id" >/dev/null 2>&1; then
+                    echo "ANNULÉ  $id [$statut] « $wf » $br ($ev) : $motif — $url"
+                  else
+                    echo "ÉCHEC   $id [$statut] « $wf » $br ($ev) : $motif — $url"
+                  fi
+                fi
+              done
+          done
