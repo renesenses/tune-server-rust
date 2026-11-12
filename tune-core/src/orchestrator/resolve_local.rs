@@ -1269,7 +1269,7 @@ impl PlaybackOrchestrator {
                         },
                     };
                     return self
-                        .servir_le_dsd_natif(track, file_path.to_string(), cadence, canaux, fenetre)
+                        .servir_le_dsd_natif(req, track, file_path.to_string(), cadence, canaux, fenetre)
                         .await;
                 }
                 Err(motif) => motif_natif = Some(motif),
@@ -2116,6 +2116,7 @@ impl PlaybackOrchestrator {
     /// octets DSD tels quels. Aucun DoP, aucune conversion de niveau.
     async fn servir_le_dsd_natif(
         &self,
+        req: &PlayRequest,
         track: &crate::db::models::Track,
         file_path: String,
         cadence: u32,
@@ -2167,6 +2168,26 @@ impl PlaybackOrchestrator {
                 Err(e) => tracing::warn!(error = %e, "dsd_natif_stream_failed"),
             }
         });
+        // #7775 — le DSD brut, comme le DoP, ne contient pas de PCM à
+        // mesurer. La sonde séparée alimente les niveaux ; les octets du
+        // transport natif restent ceux de diffuser_dsd_brut. L'horloge du
+        // fichier inclut la tranche CUE, celle de la piste seulement le seek.
+        if let Some(bus) = self
+            .event_bus
+            .clone()
+            .filter(|_| self.levels_attach_allowed(req.zone_id))
+        {
+            let play_seq = self.playback.current_play_seq(req.zone_id).await;
+            spawn_local_file_levels_decode_depuis(
+                bus,
+                self.playback.clone(),
+                req.zone_id,
+                play_seq,
+                file_path.clone(),
+                fenetre.debut_ms,
+                req.seek_ms.unwrap_or(0),
+            );
+        }
         let server_ip = self.server_ip();
         let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "dsd");
         Ok(Some(ResolvedStream {
@@ -4559,3 +4580,7 @@ mod fin_apres_relance_7551_tests;
 #[cfg(test)]
 #[path = "duree_relue_5975_tests.rs"]
 mod duree_relue_5975_tests;
+
+#[cfg(test)]
+#[path = "niveaux_du_dsd_natif_7775.rs"]
+mod niveaux_du_dsd_natif_7775;
