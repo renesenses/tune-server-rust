@@ -1,6 +1,13 @@
 //! La prochaine piste Tidal de HQPlayer se prépare pendant la courante.
 //! Le résultat est partagé avec le lancement explicite : une préparation
 //! lente n'est ni annulée par le budget DLNA, ni téléchargée une seconde fois.
+//!
+//! #6718 — même chose pour une zone DLNA ou OpenHome dont le traitement
+//! (égaliseur, crossfeed…) impose le pré-transcodage COMPLET d'une piste
+//! Qobuz ou Tidal : la suivante se prépare pendant la courante, une seule
+//! d'avance, et l'armement (`SetNext`) comme la fin de piste la reprennent au
+//! lieu de tout recommencer. Seul HQPlayer arme tôt ; un renderer réseau garde
+//! sa fenêtre des trente dernières secondes.
 use super::*;
 use tokio::sync::watch;
 
@@ -12,6 +19,9 @@ pub(super) struct Preparation {
     demande: PlayRequest,
     empreinte: String,
     resultat: watch::Receiver<Option<Result<ResolvedStream, String>>>,
+    /// HQPlayer : la suivante prête part tout de suite en file. Un renderer
+    /// réseau (#6718) attend sa fenêtre d'enchaînement habituelle.
+    arme_tot: bool,
     invalidee: Arc<std::sync::atomic::AtomicBool>,
     publication: watch::Sender<Option<Result<ResolvedStream, String>>>,
     _bail: Arc<std::sync::Mutex<Option<crate::http::streamer::BailFichierPrepare>>>,
@@ -68,11 +78,48 @@ impl PlaybackOrchestrator {
         )
     }
 
+    /// Une préparation existe pour cette zone (les témoins de #7247 ; la
+    /// production lit [`Self::preparation_fichier_arme_tot`] depuis #6718).
+    #[cfg(test)]
     pub(crate) fn fichier_suivant_en_preparation(&self, zone_id: i64) -> bool {
         self.preparations_fichiers
             .lock()
             .expect("préparations fichier")
             .contains_key(&zone_id)
+    }
+
+    /// #6718 — la préparation de cette zone autorise-t-elle l'armement AVANT
+    /// la fenêtre des trente dernières secondes ? Vrai pour HQPlayer seul.
+    pub(crate) fn preparation_fichier_arme_tot(&self, zone_id: i64) -> bool {
+        self.preparations_fichiers
+            .lock()
+            .expect("préparations fichier")
+            .get(&zone_id)
+            .is_some_and(|p| p.arme_tot)
+    }
+
+    /// #6718 — la piste de service suivante d'une zone réseau sera-t-elle
+    /// pré-transcodée EN ENTIER ? Oui quand un traitement est actif et que le
+    /// WAV progressif (#5080) n'est pas consenti ; consenti, la résolution est
+    /// courte si le renderer annonce le LPCM, et rien n'est préparé d'avance.
+    fn pretranscode_complet_attendu(&self, zone_id: i64) -> bool {
+        let dsp = self.load_streaming_dsp(zone_id, None, 44_100, 2);
+        if !dsp.is_active() {
+            return false;
+        }
+        let opt_in = SettingsRepo::with_backend(self.db.clone())
+            .get("dsp_progressif_reseau")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true");
+        let autre_traitement =
+            dsp.replaygain.is_some() || dsp.eq.is_some() || dsp.convolver.is_some();
+        !super::crossfeed_bibliotheque_reseau::wav_progressif_consenti(
+            opt_in,
+            dsp.crossfeed.is_some(),
+            autre_traitement,
+        )
     }
 
     pub(crate) fn preparation_fichier_indisponible(&self, zone_id: i64) -> bool {
@@ -163,8 +210,16 @@ impl PlaybackOrchestrator {
             .get(zone_id)
             .ok()
             .flatten();
-        let cible =
-            zone.filter(|z| z.output_type.as_deref() == Some("hqplayer") && z.gapless_enabled);
+        let cible = zone.filter(|z| z.gapless_enabled);
+        let hqplayer = cible
+            .as_ref()
+            .is_some_and(|z| z.output_type.as_deref() == Some("hqplayer"));
+        // #6718 — un renderer réseau dont la suivante attendrait son
+        // pré-transcodage complet.
+        let reseau = cible
+            .as_ref()
+            .is_some_and(|z| matches!(z.output_type.as_deref(), Some("dlna" | "openhome")));
+        let cible = cible.filter(|_| hqplayer || reseau);
         let suivant = (etat.state == crate::playback::PlayState::Playing
             && !etat
                 .now_playing
@@ -177,9 +232,18 @@ impl PlaybackOrchestrator {
                 .get_at(zone_id, position)
                 .ok()
                 .flatten()
-                .filter(|e| e.track_id.is_none() && e.source.as_deref() == Some("tidal"))
+                .filter(|e| {
+                    e.track_id.is_none()
+                        && match e.source.as_deref() {
+                            Some("tidal") => true,
+                            Some("qobuz") => reseau,
+                            _ => false,
+                        }
+                })
                 .map(|e| (position, e))
         });
+        // Le traitement n'est lu qu'une fois tout le reste réuni.
+        let ligne = ligne.filter(|_| hqplayer || self.pretranscode_complet_attendu(zone_id));
         let (Some(zone), Some((position, ligne))) = (cible, ligne) else {
             self.annuler_preparation_fichier(zone_id).await;
             return;
@@ -276,6 +340,7 @@ impl PlaybackOrchestrator {
                     demande,
                     empreinte,
                     resultat,
+                    arme_tot: hqplayer,
                     invalidee,
                     publication,
                     _bail: bail,
@@ -372,3 +437,8 @@ mod niveaux_tests_7247 {
         assert!(orch.levels_attach_allowed(7247));
     }
 }
+
+// #6718 — la préparation d'avance vers un renderer OpenHome à traitement actif.
+#[cfg(test)]
+#[path = "preparation_reseau_6718_tests.rs"]
+mod preparation_reseau_6718_tests;

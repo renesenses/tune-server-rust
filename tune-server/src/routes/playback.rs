@@ -1162,9 +1162,23 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             ),
         )
         .await;
+        // #8569 — sortie au volume non réglable : pas d'étape Volume.
+        let signal_path = crate::routes::zones::signal_path_selon_la_sortie(
+            state,
+            zone.output_device_id.as_deref(),
+            signal_path,
+        )
+        .await;
         v.as_object_mut()
             .unwrap()
             .insert("signal_path".into(), json!(signal_path));
+        // #8419 — en lecture groupée, chaque sortie et son étage final.
+        if let (Some(zid), Some(obj)) = (zone.id, v.as_object_mut()) {
+            crate::routes::zones::signal_path_groupe_8419::injecter_les_sorties_du_groupe(
+                state, zid, obj,
+            )
+            .await;
+        }
         // #1395 — même raison que pour `signal_path` ci-dessus : c'est CETTE
         // réponse que `playAndSync` rend à la première piste. Sans le champ
         // ici, la divergence « réglé ASIO / joué en WASAPI » n'apparaîtrait
@@ -5038,6 +5052,11 @@ async fn set_volume(
         // sans refaire le calcul, et surtout constater quand le verrou PURE
         // l'a remonté à 100 % : `volume_db` vaudra alors 0.
         Ok(retenu) => {
+            // #8165 — un geste de volume lève la sourdine de la zone.
+            state
+                .orchestrator
+                .lever_la_sourdine_au_geste_de_volume(zone_id, device_id.as_deref())
+                .await;
             // #6721 — plafonnée par la garde : `volume` et `volume_db` disent
             // le gain RETENU, et la réponse dit comment confirmer.
             let volume = if retenu.hausse_plafonnee {

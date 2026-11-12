@@ -86,6 +86,7 @@ mod spectrogramme;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
 // source de la même façon. Un seul point de vérité, partagé (#2147).
+mod classements_8264;
 pub(crate) mod compositeur_depuis_credits;
 pub(crate) mod graver_compilation;
 pub(crate) mod graver_dr;
@@ -454,6 +455,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/coffrets/{id}/defaire-manuel",
             post(edition::defaire_coffret_manuel),
+        )
+        // #8571 (fil 2763) — réordonner les albums d'un coffret manuel.
+        .route(
+            "/coffrets/{id}/ordre",
+            get(edition::ordre_du_coffret).put(edition::reordonner_coffret),
         )
         .route(
             "/albums/disques-abimes/reparer",
@@ -1055,6 +1061,10 @@ mod filtre_qualite_7725_tests;
 #[cfg(test)]
 #[path = "notes_et_repartitions_7849_tests.rs"]
 mod notes_et_repartitions_7849_tests;
+
+#[cfg(test)]
+#[path = "classements_8264_tests.rs"]
+mod classements_8264_tests;
 
 #[cfg(test)]
 #[path = "requete_avancee_7872_tests.rs"]

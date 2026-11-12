@@ -186,3 +186,48 @@ fn une_pause_de_longueur_impaire_est_raccordee() {
     b.periodes(3);
     b.juger();
 }
+
+#[test]
+fn dop_7704_repli_entier_i32_pause_recherche_et_arret() {
+    let mut b = Banc::monter();
+    b.ring.push(&dop_f32(64, 0x12));
+    let mut flux = Vec::new();
+    for (n, pause, arret, reamorce) in [
+        (64, false, false, false),
+        (6, true, false, false),
+        (66, false, false, false),
+        (6, false, false, true),
+        (6, false, true, false),
+    ] {
+        b.paused.store(pause, Ordering::Relaxed);
+        b.silent.store(arret, Ordering::Relaxed);
+        if reamorce {
+            b.data_started.store(false, Ordering::Release);
+        }
+        let mut out = vec![0i32; n];
+        render_local_shared_integer_callback(
+            &b.ring,
+            &b.volume,
+            &b.paused,
+            &b.silent,
+            &b.data_started,
+            &mut b.ramp,
+            0,
+            64,
+            0,
+            &mut out,
+        );
+        if pause || arret || reamorce {
+            assert!(out.iter().all(|w| (*w as u32 & 0x00ffff00) == 0x00696900));
+        }
+        flux.extend(out);
+    }
+    let mut precedent = None;
+    for trame in flux.chunks_exact(2) {
+        let m = crate::audio::dop_continu::haut_i32(trame[0]);
+        assert!(matches!(m, 0x05 | 0xFA));
+        assert_eq!(crate::audio::dop_continu::haut_i32(trame[1]), m);
+        assert_ne!(precedent, Some(m));
+        precedent = Some(m);
+    }
+}
