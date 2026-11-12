@@ -215,7 +215,11 @@ struct CorpsCreation {
     identifiants: Option<CorpsIdentifiants>,
 }
 
-async fn creer(State(state): State<AppState>, Json(c): Json<CorpsCreation>) -> Response {
+async fn creer(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Json(c): Json<CorpsCreation>,
+) -> Response {
     if sr::fabrique(&c.type_source).is_none() {
         return erreur(
             StatusCode::BAD_REQUEST,
@@ -293,7 +297,11 @@ async fn obtenir(State(state): State<AppState>, Path(id): Path<String>) -> Respo
     }
 }
 
-async fn supprimer(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn supprimer(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
     sr::retirer(&id);
     match repo(&state).supprimer(&id) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -326,7 +334,11 @@ async fn bloquant<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.ok()
 }
 
-async fn tester(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn tester(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
     let (s, sys) = match systeme_ou_erreur(&state, &id) {
         Ok(x) => x,
         Err(r) => return r,
@@ -358,7 +370,11 @@ async fn tester(State(state): State<AppState>, Path(id): Path<String>) -> Respon
     }
 }
 
-async fn rescanner(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn rescanner(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
     let (s, _) = match systeme_ou_erreur(&state, &id) {
         Ok(x) => x,
         Err(r) => return r,
@@ -399,6 +415,7 @@ fn chemin_sous_la_racine(s: &SourceReseau, demande: &str) -> Option<String> {
 }
 
 async fn parcourir(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<QueryChemin>,
@@ -425,6 +442,7 @@ async fn parcourir(
 }
 
 async fn lien(
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<QueryChemin>,

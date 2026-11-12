@@ -416,3 +416,105 @@ async fn une_source_distante_s_indexe_se_lit_et_survit_a_une_coupure() {
     assert_eq!(json_de(&o)["etat"], "injoignable");
     m.couper(false);
 }
+
+/// Créer, supprimer, tester, rescanner, parcourir et signer un lien sont des
+/// gestes d'administration, comme monter un partage (`/network/mounts`) :
+/// authentification active, un profil non-admin reçoit 403 et rien ne bouge ;
+/// l'admin garde le comportement d'avant.
+#[tokio::test(flavor = "multi_thread")]
+async fn les_routes_de_gestion_exigent_l_admin() {
+    const SECRET: &str = "secret-epreuve-8202";
+    let (state, _d) = etat(false);
+    let m = faux_nas("nas-admin");
+    m.ajouter("Musique/A/01.flac", vec![1; 10], 1);
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    reglages.set("auth_enabled", "true").unwrap();
+    reglages.set("jwt_secret", SECRET).unwrap();
+    let porteur = |role: &str, id: i64| {
+        format!(
+            "Bearer {}",
+            crate::auth::sign_jwt(id, role, SECRET).unwrap()
+        )
+    };
+    let admin = porteur("admin", 1);
+    let usager = porteur("user", 2);
+    let corps = json!({"type": "memoire", "hote": "nas-admin", "racine": "Musique"});
+
+    // Création : refusée au profil non-admin, sans rien écrire.
+    let (s, _, _) = appel_entetes(
+        &state,
+        "POST",
+        "/api/v1/sources-reseau",
+        Some(corps.clone()),
+        &[("authorization", &usager)],
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(repo_compte(&state), 0);
+
+    let (s, o, _) = appel_entetes(
+        &state,
+        "POST",
+        "/api/v1/sources-reseau",
+        Some(corps),
+        &[("authorization", &admin)],
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{}", String::from_utf8_lossy(&o));
+    let id = json_de(&o)["id"].as_str().unwrap().to_string();
+
+    // Les cinq autres gestes : 403 pour le profil non-admin.
+    let gestes = [
+        ("POST", format!("/api/v1/sources-reseau/{id}/tester")),
+        ("POST", format!("/api/v1/sources-reseau/{id}/rescanner")),
+        (
+            "GET",
+            format!("/api/v1/sources-reseau/{id}/parcourir?chemin=A"),
+        ),
+        (
+            "POST",
+            format!("/api/v1/sources-reseau/{id}/lien?chemin=A/01.flac"),
+        ),
+        ("DELETE", format!("/api/v1/sources-reseau/{id}")),
+    ];
+    for (methode, uri) in &gestes {
+        let (s, _, _) =
+            appel_entetes(&state, methode, uri, None, &[("authorization", &usager)]).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{methode} {uri}");
+    }
+    assert_eq!(repo_compte(&state), 1, "le refus a supprimé la source");
+
+    // L'admin : comportement inchangé.
+    let a = [("authorization", admin.as_str())];
+    let (s, o, _) = appel_entetes(&state, "POST", &gestes[0].1, None, &a).await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&o));
+    assert_eq!(json_de(&o)["ok"], true);
+    let (s, o, _) = appel_entetes(&state, "GET", &gestes[2].1, None, &a).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json_de(&o)["entrees"].as_array().unwrap().len(), 1);
+    let (s, o, _) = appel_entetes(&state, "POST", &gestes[3].1, None, &a).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(json_de(&o)["chemin"].as_str().is_some());
+    // Rescanner une source inconnue (pas de scan lancé pendant les autres
+    // épreuves) : la porte laisse passer, la route répond 404 comme avant.
+    let (s, _, _) = appel_entetes(
+        &state,
+        "POST",
+        "/api/v1/sources-reseau/inconnue/rescanner",
+        None,
+        &a,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _, _) = appel_entetes(&state, "DELETE", &gestes[4].1, None, &a).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(repo_compte(&state), 0);
+}
+
+fn repo_compte(state: &AppState) -> usize {
+    state
+        .backend
+        .query_many("SELECT id FROM sources_reseau", &[])
+        .unwrap()
+        .len()
+}
