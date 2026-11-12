@@ -902,10 +902,24 @@ async fn service_artist_top_tracks(
     // #7107 — la popularité Last.fm complète la liste du service (qui n'est
     // que l'ordre d'un album) ; sans clé ou en échec, la liste ne change pas.
     let cle = tune_core::streaming::titres_phares_lastfm::cle_lastfm(&state.backend);
+    // #8350 — le MBID de la bibliothèque d'abord ; l'identifiant de la page
+    // écarte les homonymes trouvés par recherche.
+    let nom = items
+        .first()
+        .and_then(|v| v.get("artist_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mbid =
+        tune_core::streaming::titres_phares_lastfm::mbid_de_la_bibliotheque(&state.backend, &nom);
     tune_core::streaming::titres_phares_lastfm::completer(
         &state.http,
         &tune_core::streaming::titres_phares_lastfm::Reglages::production(&cle),
         &service,
+        &tune_core::streaming::titres_phares_lastfm::ArtisteDeLaPage {
+            id: &artist_id,
+            mbid: mbid.as_deref(),
+        },
         &mut items,
         |requete| {
             let arc = arc.clone();

@@ -347,6 +347,9 @@ pub struct AlarmScheduler {
     db: Arc<dyn DbBackend>,
     orchestrator: Arc<PlaybackOrchestrator>,
     snooze: Mutex<SnoozeState>,
+    /// #8135 — le choix du flux d'une radio rangée dans la playlist du
+    /// réveil : celui d'une radio jouée seule, que le serveur installe.
+    choix_du_flux_radio: crate::db::playlist_radio_8135::ChoixDuFlux,
 }
 
 impl AlarmScheduler {
@@ -355,7 +358,18 @@ impl AlarmScheduler {
             db,
             orchestrator,
             snooze: Mutex::new(SnoozeState::new()),
+            choix_du_flux_radio: crate::db::playlist_radio_8135::flux_enregistre(),
         }
+    }
+
+    /// #8135 — installe le choix du flux d'une radio de playlist (fiche de
+    /// l'annuaire, pays de l'auditeur), le même que `POST /radios/{id}/play`.
+    pub fn avec_le_choix_du_flux_radio(
+        mut self,
+        choix: crate::db::playlist_radio_8135::ChoixDuFlux,
+    ) -> Self {
+        self.choix_du_flux_radio = choix;
+        self
     }
 
     pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -500,26 +514,32 @@ impl AlarmScheduler {
             let profil = profil.ok_or("profil du réveil absent")?;
             repo.get_for_profile(id, profil)?
                 .ok_or("playlist du réveil introuvable")?;
-            repo.get_entries(id)?
-                .into_iter()
-                .filter_map(|e| match e.content {
-                    EntryContent::Local(track_id) => Some(QueueInput::Local { track_id }),
-                    EntryContent::Missing(_) => None,
-                    EntryContent::Service(t) => Some(QueueInput::Streaming {
-                        source: t.source,
-                        source_id: t.source_id,
-                        title: t.title,
-                        artist: t.artist.unwrap_or_default(),
-                        album: t.album,
-                        cover_url: t.cover_url,
-                        duration_ms: t.duration_ms.unwrap_or(0),
-                        track_number: None,
-                        disc_number: None,
-                        album_ref: t.album_source_id,
-                        artist_ref: None,
-                    }),
-                })
-                .collect()
+            // #8135 — une radio de la playlist se joue par son flux ; une
+            // station retirée est sautée, comme une piste introuvable.
+            crate::db::playlist_radio_8135::lignes_a_jouer(
+                &self.db,
+                repo.get_entries(id)?,
+                &self.choix_du_flux_radio,
+            )
+            .into_iter()
+            .filter_map(|e| match e.content {
+                EntryContent::Local(track_id) => Some(QueueInput::Local { track_id }),
+                EntryContent::Missing(_) => None,
+                EntryContent::Service(t) => Some(QueueInput::Streaming {
+                    source: t.source,
+                    source_id: t.source_id,
+                    title: t.title,
+                    artist: t.artist.unwrap_or_default(),
+                    album: t.album,
+                    cover_url: t.cover_url,
+                    duration_ms: t.duration_ms.unwrap_or(0),
+                    track_number: None,
+                    disc_number: None,
+                    album_ref: t.album_source_id,
+                    artist_ref: None,
+                }),
+            })
+            .collect()
         };
         if pistes.is_empty() {
             return Err("contenu du réveil sans piste jouable".into());

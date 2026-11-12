@@ -94,14 +94,24 @@ const DEBUT_JOURNALISE: usize = 120;
 /// #7869 — ajoute à `pending` ce qui est déjà arrivé sur la socket sans être
 /// lu, sans attendre. Un message poussé par HQPlayer entre deux commandes est
 /// ainsi vu avant d'écrire la suivante, au lieu d'être lu comme sa réponse.
-fn recueillir_les_octets_arrives(control: &mut Control) {
+///
+/// #8395 — rend `false` quand HQPlayer a **fermé** la connexion entre deux
+/// commandes (fin de flux, ou erreur autre que « rien à lire »). Sans ce
+/// constat, la commande suivante partait dans une socket morte : l'écriture
+/// réussit (le pair n'a fermé que son sens), puis la lecture de la réponse
+/// échoue — `hqplayer read error: … (os error 10053)` sous Windows chez le
+/// testeur HQPlayer 3 Desktop.
+fn recueillir_les_octets_arrives(control: &mut Control) -> bool {
     let mut buf = [0u8; 8192];
     while control.pending.len() < 1024 * 1024 {
         match control.stream.try_read(&mut buf) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return false,
             Ok(n) => control.pending.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+            Err(_) => return false,
         }
     }
+    true
 }
 
 /// #7869 — le début des octets non sollicités, lisible dans un journal : les
@@ -375,8 +385,24 @@ impl HqplayerOutput {
                 let _ =
                     tokio::time::timeout(ECOUTE_APRES_RECONNEXION, control.stream.readable()).await;
             }
-            recueillir_les_octets_arrives(control);
+            let vivante = recueillir_les_octets_arrives(control);
             retirer_les_status_pousses_hqplayer_3(&mut control.pending);
+            if !vivante {
+                // #8395 — rien n'est encore écrit : rouvrir et envoyer sur une
+                // connexion neuve n'exécute pas la commande deux fois.
+                debug!(
+                    device = %self.name,
+                    cmd = xml_body,
+                    attempt,
+                    reste = %debut_des_octets(&control.pending),
+                    "hqplayer_connexion_fermee_par_hqplayer"
+                );
+                *conn = None;
+                if attempt == 0 {
+                    continue;
+                }
+                return Err("hqplayer: connection closed by HQPlayer before the command".into());
+            }
             if !control.pending.iter().all(u8::is_ascii_whitespace) {
                 warn!(
                     device = %self.name,

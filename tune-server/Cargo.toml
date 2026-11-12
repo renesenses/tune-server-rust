@@ -2132,3 +2132,9 @@ path = "tests/durcissement_configuration.rs"
 [[test]]
 name = "durcissement_routes_admin"
 path = "tests/durcissement_routes_admin.rs"
+
+# #8135 — une radio comme élément d'une playlist (ajout, liste, lecture,
+# export/import). `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "playlists_radio_8135"
+path = "tests/playlists_radio_8135.rs"

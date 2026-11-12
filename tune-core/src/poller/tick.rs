@@ -2500,6 +2500,54 @@ impl PositionPoller {
             }
             let mut pause_de_l_appareil = false;
 
+            // #8483 — fichier abîmé (go de Bertrand, rc12) : la zone s'est
+            // figée sur la coupure que le décodage de Tune a déjà vue. C'est la
+            // fin de la piste : suivante de la file (ou fin de file), avec un
+            // avis traduit, au lieu d'un silence « en lecture » que la garde
+            // #2116/#6702 finissait par ARRÊTER. Hors des grâces et de tout
+            // enchaînement en cours ; registre vide = aucune lecture en base.
+            if zone_state.state == PlayState::Playing
+                && !in_seek_grace
+                && !ps.gapless_sent
+                && !ps.gapless_advance_pending
+                && !crate::audio::coupure_connue_8483::aucune_coupure_connue()
+            {
+                let position_figee = match status.state {
+                    TransportState::Playing => fichier_abime_8483::gel_etabli(
+                        &mut ps.gel_sur_coupure,
+                        status.position_ms,
+                        Instant::now(),
+                    )
+                    .then_some(status.position_ms),
+                    TransportState::Stopped => {
+                        ps.gel_sur_coupure = None;
+                        // Pic nul : rien n'a encore joué, aucune lecture en base.
+                        Some(ps.peak_position_ms).filter(|pic| *pic > 0)
+                    }
+                    _ => {
+                        ps.gel_sur_coupure = None;
+                        None
+                    }
+                };
+                // Hors ligne et en boîte : `tick` est un futur déjà énorme, et
+                // chaque bras ajouté ici grossit la pile de son appelant.
+                if let Some(position) = position_figee
+                    && Box::pin(self.passer_le_fichier_abime(
+                        zone_id,
+                        zone_state,
+                        &device_id,
+                        position,
+                        status.state,
+                    ))
+                    .await
+                {
+                    poll_states.remove(&zone_id);
+                    continue;
+                }
+            } else {
+                ps.gel_sur_coupure = None;
+            }
+
             match status.state {
                 TransportState::Stopped if !tune_is_playing || !tune_has_track => {
                     // Tune is not playing on this zone — ignore device Stopped.
