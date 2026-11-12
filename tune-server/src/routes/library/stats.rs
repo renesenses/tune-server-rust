@@ -181,6 +181,9 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
                 Value::Null
             }
         };
+    // #8264 — artistes et genres classés par nombre de pistes. Clé ADDITIVE,
+    // à côté de `distributions` (dont le contenu ne change pas).
+    corps["rankings"] = super::classements_8264::lire(state.backend.as_ref());
     Ok(Json(corps))
 }
 
