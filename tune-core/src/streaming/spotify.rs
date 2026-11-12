@@ -1110,6 +1110,33 @@ impl SpotifyService {
         }
     }
 
+    /// « Le dernier geste gagne » — met en pause l'appareil Connect `nom`
+    /// (`PUT /me/player/pause?device_id=`). Appareil absent : rien à faire.
+    pub async fn mettre_en_pause_l_appareil(&self, nom: &str) -> Result<(), String> {
+        let token = self
+            .access_token
+            .clone()
+            .ok_or("Spotify n'est pas connecté")?;
+        let Some(appareil) = self.appareil_par_nom(nom).await? else {
+            return Ok(());
+        };
+        let resp = self
+            .client
+            .put(format!(
+                "{}/me/player/pause?device_id={}",
+                self.api_base,
+                urlencoding::encode(&appareil)
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| format!("spotify api: {e}"))?;
+        match resp.status().as_u16() {
+            200 | 202 | 204 => Ok(()),
+            statut => Err(format!("Spotify a refusé la pause (HTTP {statut})")),
+        }
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let album = &item["album"];
         StreamTrack {
