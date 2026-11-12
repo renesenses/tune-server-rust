@@ -8,6 +8,8 @@ use tracing::{debug, info, warn};
 use crate::library::local_path::resolve_existing_local_path;
 
 mod transcodage;
+#[doc(hidden)]
+pub use transcodage::transcoder_vers_un_fichier_8558;
 use transcodage::*;
 /// #8558 (volet B) — piste trop lourde pour le bras fichier : WAV progressif.
 mod bascule_progressive_8558;
