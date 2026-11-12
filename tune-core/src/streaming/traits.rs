@@ -728,6 +728,25 @@ pub struct AnneeEtGenre {
     pub genre: Option<String>,
 }
 
+/// Les rubriques qu'un service peut retirer à Tune (voir
+/// [`StreamingService::rubrique_retiree`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RubriqueRetirable {
+    /// Playlists mises en avant (`/featured`).
+    Selection,
+    /// Nouveautés (`/new-releases`).
+    Nouveautes,
+    /// Genres et leurs albums (`/genres`, `/genres/{id}/albums`).
+    Genres,
+    /// Titres phares d'un artiste (`/artists/{id}/top-tracks`).
+    TitresPhares,
+}
+
+/// L'en-tête posé sur la réponse d'une rubrique que le service a retirée à
+/// Tune : la liste est vide parce que le service ne la fournit plus, pas par
+/// panne. Valeur : `1`.
+pub const ENTETE_RUBRIQUE_RETIREE: &str = "x-tune-rubrique-retiree";
+
 #[async_trait::async_trait]
 pub trait StreamingService: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
@@ -1002,6 +1021,16 @@ pub trait StreamingService: Send + Sync {
     /// tous les services et le clic rendrait un 501. On le laisse à `false` et
     /// chaque service qui sait vraiment le faire le relève.
     fn supports_playlist_delete(&self) -> bool {
+        false
+    }
+
+    /// Le service a-t-il RETIRÉ cette rubrique à Tune (et non : elle est
+    /// vide, ou en panne) ? Spotify ferme des points d'accès aux applications
+    /// personnelles (#8399, #8485, février 2026) : la route le dit à l'écran
+    /// par l'en-tête [`ENTETE_RUBRIQUE_RETIREE`], qui affiche une phrase au
+    /// lieu d'une rubrique vide. Lu APRÈS l'appel de la rubrique.
+    fn rubrique_retiree(&self, rubrique: RubriqueRetirable) -> bool {
+        let _ = rubrique;
         false
     }
 

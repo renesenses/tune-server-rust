@@ -176,6 +176,12 @@ tokenizers = { version = "0.20", default-features = false, features = ["onig"], 
 # macOS + Linux : statfs pour détecter les montages réseau (scanner/watcher.rs).
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# #8248 — sonder le DSD natif d'un PCM `hw:` (formats DSD_U32_BE/_LE et
+# cadences exactes) : cpal ne dit pas lequel des deux ordres il ouvre. Même
+# version que celle de vendor/cpal, déjà dans Cargo.lock.
+alsa = { version = "0.11", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "objc2-core-audio-types", "AudioHardware", "AudioHardwareDeprecated"], optional = true }
@@ -455,7 +461,7 @@ harness = false
 
 [features]
 default = ["local-audio"]
-local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio", "objc2-core-audio-types"]
+local-audio = ["cpal", "alsa", "coreaudio-rs", "objc2-core-audio", "objc2-core-audio-types"]
 # Lets plugins mount HTTP routes through `PluginContext::register_router`.
 # Gated so tune-cli — which links tune-core but serves no HTTP — does not
 # have to build axum. tune-server enables it.

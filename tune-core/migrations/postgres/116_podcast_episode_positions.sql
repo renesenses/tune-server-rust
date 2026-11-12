@@ -1,9 +1,9 @@
--- 114_podcast_episode_positions.sql
+-- 116_podcast_episode_positions.sql
 --
 -- renesenses/tune-server-rust#8170 (suite de #8152 et de tune-web-client#2730) :
 -- la position de CHAQUE episode de podcast commence, une ligne par episode et
 -- par zone (`episode_key` = adresse du media sans fragment). Jumelle de la
--- migration SQLite 148.
+-- migration SQLite 150 (115 = sources_reseau, #8202).
 --
 -- `listening_resumes` n'en garde qu'une par podcast et par zone : lancer un
 -- autre episode du meme podcast ecrasait la reprise du precedent. Naît vide ;
@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS podcast_episode_positions (
  PRIMARY KEY (zone_id, episode_key)
 );
 
-INSERT INTO schema_version (version, name) VALUES (114, 'podcast_episode_positions')
+INSERT INTO schema_version (version, name) VALUES (116, 'podcast_episode_positions')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

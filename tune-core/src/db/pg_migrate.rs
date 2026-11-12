@@ -232,7 +232,7 @@ const MIGRATION_TABLES: &[&str] = &[
 const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Reprises (#7280), créées par le script 100 : conserver leur file et position.
     "listening_resumes",
-    // Positions des épisodes de podcast (#8170), créées par le script 114 :
+    // Positions des épisodes de podcast (#8170), créées par le script 116 :
     // sans cette ligne, chaque épisode commencé repartirait du début.
     "podcast_episode_positions",
     // Écoutes importées (#7763, script 101) : sans cette ligne, les écoutes
@@ -293,6 +293,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
     (
         "hires_verifications",
         "verdicts des faux hi-res (#6285) : mesures recalculables, la passe de fond les refait",
+    ),
+    (
+        "spectrogrammes",
+        "trace des spectrogrammes conservés (#8160) : images du cache, recalculables à la demande ; \
+         le cache des pochettes n'est pas recopié non plus",
     ),
     (
         "_migrations",

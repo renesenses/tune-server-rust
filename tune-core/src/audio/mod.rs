@@ -55,6 +55,11 @@ mod dsd_brut_tests_5643;
 mod dsd_ordre_canaux_et_phase;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
+/// #8248 — le DSD natif ALSA (`DSD_U32_BE`/`DSD_U32_LE`) de la sortie locale Linux.
+pub mod dsd_u32_alsa;
+#[cfg(test)]
+#[path = "dsd_u32_alsa_tests_8248.rs"]
+mod dsd_u32_alsa_tests_8248;
 pub mod dsf;
 pub mod dsf_depuis_dst;
 #[cfg(test)]

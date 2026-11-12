@@ -222,46 +222,24 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
         corps["q"] = json!(q);
         return corps;
     }
-    let page = if veut_le_total {
-        repo.list_filtered_seeded_avec_total(
-            limit,
-            offset,
-            sort,
-            order,
-            p.format.as_deref(),
-            p.quality.as_deref(),
-            p.compilation,
-            include_hidden,
-            dr,
-            seed,
-        )
-    } else {
-        repo.list_filtered_seeded(
-            limit,
-            offset,
-            sort,
-            order,
-            p.format.as_deref(),
-            p.quality.as_deref(),
-            p.compilation,
-            include_hidden,
-            dr,
-            seed,
-        )
-        .map(|albums| (albums, None))
-    };
-    let (items, total_de_la_page) = match page {
-        Ok(page) => page,
+    let page = repo.list_filtered_seeded_avec_reperes(
+        limit,
+        offset,
+        sort,
+        order,
+        p.format.as_deref(),
+        p.quality.as_deref(),
+        p.compilation,
+        include_hidden,
+        dr,
+        seed,
+        veut_le_total,
+    );
+    let (items, total_de_la_page, reperes) = match page {
+        Ok(page) => (page.albums, page.total, page.reperes_alphabetiques),
         Err(e) => {
-            tracing::error!(
-                error = %e,
-                sort,
-                order,
-                limit,
-                offset,
-                "list_albums_query_failed"
-            );
-            (Vec::new(), None)
+            tracing::error!(error = %e, sort, order, limit, offset, "list_albums_query_failed");
+            (Vec::new(), None, None)
         }
     };
     // Le total suit la même exclusion que la liste, sinon la grille pagine
@@ -307,7 +285,7 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
             None => repo.count_visible().unwrap_or(0),
         },
     };
-    corps_de_la_page(
+    let mut corps = corps_de_la_page(
         &repo,
         &backend,
         douteux_visible,
@@ -316,7 +294,11 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
         limit,
         offset,
         seed,
-    )
+    );
+    if let Some(reperes) = reperes {
+        corps["reperes_alphabetiques"] = json!(reperes);
+    }
+    corps
 }
 
 /// La réponse de `GET /library/albums` pour une page déjà lue : le DR de
@@ -4893,7 +4875,11 @@ mod tests_genre_pistes_5314 {
     #[tokio::test]
     async fn chaque_route_d_ecriture_d_album_atteint_la_facette_d_oxygen() {
         let state = banc();
-        assert_eq!(facette(&state).await, ["Blues", "Pop", "Rock"]);
+        assert_eq!(
+            facette(&state).await,
+            ["Blues", "Rock"],
+            "#5638 : Pop est secondaire et ne doit pas entrer dans la facette"
+        );
 
         let (s, _) = request(
             &state,
@@ -4903,27 +4889,29 @@ mod tests_genre_pistes_5314 {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
+        assert_eq!(facette(&state).await, ["Jazz", "Rock"]);
         let (s, _) = request(
             &state,
             "POST",
             "/library/albums/batch-update",
-            json!({ "album_ids": [2], "genre": "Jazz" }),
+            json!({ "album_ids": [2], "genre": "Soul" }),
         )
         .await;
         assert_eq!(s, StatusCode::OK);
+        assert_eq!(facette(&state).await, ["Jazz", "Rock", "Soul"]);
         let (s, v) = request(
             &state,
             "PUT",
             "/library/albums/3/edition",
-            json!({ "genre": "Jazz" }),
+            json!({ "genre": "Classical" }),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
 
         assert_eq!(
             facette(&state).await,
-            ["Jazz"],
-            "#5314 : la facette Genre d'Oxygen doit proposer le genre posé sur les albums, et lui seul"
+            ["Classical", "Jazz", "Soul"],
+            "#5314 : chaque route doit propager le genre principal de son album aux pistes et à Oxygen"
         );
     }
 }

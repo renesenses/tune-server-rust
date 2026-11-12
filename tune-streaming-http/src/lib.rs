@@ -444,6 +444,34 @@ macro_rules! with_svc_editorial {
         svc_response_editorial($body)
     }};
 }
+/// Une rubrique éditoriale qui peut être RETIRÉE par le service : la réponse
+/// porte `x-tune-rubrique-retiree` quand le service le dit, pour que l'écran
+/// affiche « ne fournit plus cette rubrique » au lieu d'une rubrique vide.
+/// Le corps est inchangé (liste vide) : les clients qui ignorent l'en-tête
+/// voient ce qu'ils voyaient.
+macro_rules! with_svc_editorial_retirable {
+    ($state:expr, $service:expr, $rubrique:expr, |$svc:ident| $body:expr) => {{
+        let arc = match get_svc_actif($state, $service).await {
+            Ok(s) => s,
+            Err(e) => return e.into_response(),
+        };
+        let $svc = arc.read().await;
+        let reponse = svc_response_editorial($body);
+        marquer_si_retiree(reponse, $svc.rubrique_retiree($rubrique))
+    }};
+}
+
+/// Pose `x-tune-rubrique-retiree` sur une réponse réussie si `retiree`.
+fn marquer_si_retiree(mut reponse: Response, retiree: bool) -> Response {
+    if retiree && reponse.status().is_success() {
+        reponse.headers_mut().insert(
+            tune_core::streaming::ENTETE_RUBRIQUE_RETIREE,
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    reponse
+}
+
 macro_rules! with_svc_mut {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
         let arc = match get_svc_actif($state, $service).await {
@@ -898,12 +926,17 @@ async fn service_artist_top_tracks(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let pistes = arc
-        .read()
-        .await
-        .get_artist_top_tracks(&artist_id)
-        .await
-        .map(dedoublonner_titres_phares);
+    let (pistes, retiree) = {
+        let svc = arc.read().await;
+        let pistes = svc
+            .get_artist_top_tracks(&artist_id)
+            .await
+            .map(dedoublonner_titres_phares);
+        (
+            pistes,
+            svc.rubrique_retiree(tune_core::streaming::RubriqueRetirable::TitresPhares),
+        )
+    };
     let pistes = match pistes {
         Ok(p) => p,
         Err(e) => return svc_response::<()>(Err(e)),
@@ -958,7 +991,9 @@ async fn service_artist_top_tracks(
         &mut items,
     )
     .await;
-    Json(Value::Array(items)).into_response()
+    // Titres phares retirés par le service : l'écran le dit, même si les
+    // écoutes de ce serveur ou Last.fm ont complété la liste.
+    marquer_si_retiree(Json(Value::Array(items)).into_response(), retiree)
 }
 
 /// Écart de durée sous lequel deux titres phares de même nom et de même
@@ -1179,7 +1214,12 @@ async fn service_featured(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
 ) -> Response {
-    with_svc_editorial!(&state, &service, |svc| svc.get_featured().await)
+    with_svc_editorial_retirable!(
+        &state,
+        &service,
+        tune_core::streaming::RubriqueRetirable::Selection,
+        |svc| svc.get_featured().await
+    )
 }
 
 /// #7822 — `GET /streaming/{service}/mixes` : les mixes du compte, liste
@@ -1196,7 +1236,12 @@ async fn service_new_releases(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
 ) -> Response {
-    with_svc_editorial!(&state, &service, |svc| svc.get_new_releases().await)
+    with_svc_editorial_retirable!(
+        &state,
+        &service,
+        tune_core::streaming::RubriqueRetirable::Nouveautes,
+        |svc| svc.get_new_releases().await
+    )
 }
 
 #[derive(Deserialize)]
@@ -1210,7 +1255,12 @@ async fn service_genres(
     Query(q): Query<GenreQuery>,
 ) -> Response {
     let pid = q.parent_id.as_deref();
-    with_svc_editorial!(&state, &service, |svc| svc.get_genres(pid).await)
+    with_svc_editorial_retirable!(
+        &state,
+        &service,
+        tune_core::streaming::RubriqueRetirable::Genres,
+        |svc| svc.get_genres(pid).await
+    )
 }
 
 #[derive(Deserialize)]
@@ -1230,9 +1280,12 @@ async fn service_genre_albums(
 ) -> Response {
     let limit = q.limit.unwrap_or(50);
     match q.section.as_deref() {
-        None => with_svc_editorial!(&state, &service, |svc| svc
-            .get_genre_albums(&genre_id, limit)
-            .await),
+        None => with_svc_editorial_retirable!(
+            &state,
+            &service,
+            tune_core::streaming::RubriqueRetirable::Genres,
+            |svc| svc.get_genre_albums(&genre_id, limit).await
+        ),
         Some(section) => with_svc_editorial!(&state, &service, |svc| svc
             .get_genre_section(&genre_id, section, limit)
             .await),
@@ -5193,3 +5246,182 @@ mod spotify_relais_8198_tests;
 
 #[cfg(test)]
 mod bio_qobuz_8129_tests;
+
+#[cfg(test)]
+mod tests_rubrique_retiree_2026 {
+    //! Spotify retire des rubriques aux applications personnelles (#8399,
+    //! #8485, février 2026). La route garde son corps (liste vide) et pose
+    //! `x-tune-rubrique-retiree: 1` : l'écran dit « ne fournit plus cette
+    //! rubrique » au lieu d'une rubrique vide. Une rubrique simplement vide
+    //! ne porte pas l'en-tête.
+    use super::*;
+    use tower::ServiceExt;
+    use tune_core::TuneError;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::streaming::RubriqueRetirable;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamGenre, StreamPlaylist,
+        StreamTrack, StreamUrl,
+    };
+
+    struct ServiceRetrait {
+        nom: String,
+        retirees: Vec<RubriqueRetirable>,
+    }
+
+    const PANNE: &str = "hors sujet";
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServiceRetrait {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            &self.nom
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _e: bool) {}
+        async fn authenticate(&mut self, _c: &Value) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        fn rubrique_retiree(&self, rubrique: RubriqueRetirable) -> bool {
+            self.retirees.contains(&rubrique)
+        }
+        async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_genres(&self, _p: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_artist_top_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Ok(vec![])
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+    }
+
+    async fn entete(
+        nom: &str,
+        retirees: Vec<RubriqueRetirable>,
+        chemin: &str,
+    ) -> (StatusCode, Option<String>, String) {
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServiceRetrait {
+            nom: nom.to_string(),
+            retirees,
+        }));
+        let etat = StreamingHttpState::new(
+            backend,
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        );
+        let app = Router::new().nest("/api/v1/streaming", router().with_state(etat));
+        let r = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/streaming/{nom}/{chemin}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = r.status();
+        let valeur = r
+            .headers()
+            .get(tune_core::streaming::ENTETE_RUBRIQUE_RETIREE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (
+            statut,
+            valeur,
+            String::from_utf8_lossy(&octets).into_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn une_rubrique_retiree_porte_l_entete_et_garde_sa_liste_vide() {
+        for (i, (rubrique, chemin)) in [
+            (RubriqueRetirable::Nouveautes, "new-releases"),
+            (RubriqueRetirable::Selection, "featured"),
+            (RubriqueRetirable::Genres, "genres"),
+            (RubriqueRetirable::TitresPhares, "artists/a-1/top-tracks"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let nom = format!("retrait-oui-{i}");
+            let (statut, valeur, corps) = entete(&nom, vec![rubrique], chemin).await;
+            assert_eq!(statut, StatusCode::OK, "{chemin} : {corps}");
+            assert_eq!(valeur.as_deref(), Some("1"), "{chemin} : en-tête absent");
+            assert_eq!(corps.trim(), "[]", "{chemin} : le corps change");
+        }
+    }
+
+    /// Contre-épreuve : une rubrique vide que le service n'a pas retirée ne
+    /// porte pas l'en-tête (l'écran ne doit pas accuser Spotify à tort).
+    #[tokio::test]
+    async fn une_rubrique_simplement_vide_ne_porte_pas_l_entete() {
+        for (i, chemin) in [
+            "new-releases",
+            "featured",
+            "genres",
+            "artists/a-1/top-tracks",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let nom = format!("retrait-non-{i}");
+            let (statut, valeur, _) = entete(&nom, Vec::new(), chemin).await;
+            assert_eq!(statut, StatusCode::OK, "{chemin}");
+            assert!(valeur.is_none(), "{chemin} : en-tête posé à tort");
+        }
+    }
+}
