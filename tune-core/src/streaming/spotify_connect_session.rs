@@ -61,6 +61,15 @@ pub const SOURCE_ID: &str = "session";
 /// #8565 — le code rendu par le statut quand la zone exposée n'existe plus.
 pub const CODE_ZONE_EXPOSEE_ABSENTE: &str = "exposed_zone_missing";
 
+/// #8581 — quand Tune prend la main, l'échéance laissée à sa lecture pour
+/// remplacer la lecture en cours de la zone : la zone est sondée jusque-là ;
+/// si elle quitte la session, c'est la zone que Tune lance (on n'y touche
+/// pas) ; si elle la joue encore à l'échéance (autre zone, lecture de Tune
+/// échouée), elle est arrêtée.
+pub const DELAI_REPRISE_PAR_TUNE: Duration = Duration::from_secs(10);
+/// #8581 — l'intervalle de ce sondage.
+const SONDE_REPRISE_PAR_TUNE: Duration = Duration::from_millis(200);
+
 /// #8580 — la zone exposée a refusé la session : plafond de zones de
 /// l'offre gratuite (`free_zone_cap:…`).
 pub const CODE_PLAFOND_DE_ZONES: &str = "zone_cap_reached";
@@ -188,8 +197,12 @@ pub fn decider(
     maintenant: Instant,
 ) -> Vec<Action> {
     // Une lecture lancée par Tune garde la main ; une session encore ouverte
-    // (sur une autre zone) s'arrête, la pompe ne la sert plus.
-    if lecture_de_tune {
+    // (sur une autre zone) s'arrête, la pompe ne la sert plus. « Le dernier
+    // geste gagne » : l'évènement synthétique de Tune la ferme aussitôt, même
+    // si la lecture de Tune échoue ensuite (la pompe est alors libre).
+    if lecture_de_tune
+        || ev.evenement == crate::streaming::spotify_connect::EVENEMENT_TUNE_PREND_LA_MAIN
+    {
         return match etat.zone {
             Some(zone_id) => {
                 etat.fermer();
@@ -459,7 +472,21 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
                     }
                 }
                 Action::Arreter { zone_id } => {
-                    if self.zones.joue_la_session(zone_id).await {
+                    // Tune prend la main (#8581) : sa lecture peut viser CETTE
+                    // zone, et elle n'a peut-être pas encore remplacé la
+                    // lecture en cours. On laisse la résolution finir : si la
+                    // zone joue encore la session ensuite (autre zone, ou
+                    // lecture de Tune échouée), elle est arrêtée ; sinon elle
+                    // joue le titre de Tune, on n'y touche pas.
+                    let mut joue = self.zones.joue_la_session(zone_id).await;
+                    if joue && pompe.consommateur_de_tune() {
+                        let echeance = Instant::now() + DELAI_REPRISE_PAR_TUNE;
+                        while joue && Instant::now() < echeance {
+                            tokio::time::sleep(SONDE_REPRISE_PAR_TUNE).await;
+                            joue = self.zones.joue_la_session(zone_id).await;
+                        }
+                    }
+                    if joue {
                         self.zones.arreter(zone_id).await;
                     }
                     pompe.detacher_continu();

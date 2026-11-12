@@ -94,6 +94,14 @@ pub fn qualite_de_librespot(bitrate: u32) -> QualiteDeLibrespot {
 /// Préfixe des lignes écrites sur stderr par le script `--onevent`.
 pub const PREFIXE_EVENEMENT: &str = "TUNE_EVENT\t";
 
+/// « Le dernier geste gagne » (décision de Bertrand, 12/11) — évènement
+/// SYNTHÉTIQUE, écrit par Tune et non par librespot : une lecture lancée
+/// depuis Tune (#6018) prend la pompe à une session Spotify Connect ouverte.
+/// Le pilote des sessions ferme alors la session côté zone, tout de suite,
+/// sans attendre un évènement de librespot (qui ne vient pas si la lecture
+/// de Tune échoue).
+pub const EVENEMENT_TUNE_PREND_LA_MAIN: &str = "tune_prend_la_main";
+
 /// Un évènement de lecteur publié par librespot (`--onevent`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvenementLibrespot {
@@ -1016,6 +1024,21 @@ impl SpotifyConnectManager {
     pub fn brancher_les_evenements(&self, tx: mpsc::UnboundedSender<EvenementLibrespot>) {
         if let Ok(mut r) = self.daemon.relais.lock() {
             *r = Some(tx);
+        }
+    }
+
+    /// « Le dernier geste gagne » — une lecture lancée depuis Tune prend la
+    /// main sur la session Spotify Connect : remet au pilote des sessions
+    /// l'évènement [`EVENEMENT_TUNE_PREND_LA_MAIN`]. Sans pilote branché,
+    /// rien.
+    pub fn signaler_reprise_par_tune(&self) {
+        if let Ok(r) = self.daemon.relais.lock()
+            && let Some(tx) = r.as_ref()
+        {
+            let _ = tx.send(EvenementLibrespot {
+                evenement: EVENEMENT_TUNE_PREND_LA_MAIN.into(),
+                ..Default::default()
+            });
         }
     }
 

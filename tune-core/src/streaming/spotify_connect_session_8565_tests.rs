@@ -579,6 +579,58 @@ done
         assert_eq!(ouvertures(&zones), 2, "{:?}", zones.appels.lock().unwrap());
     }
 
+    /// #8581 — Tune lance un titre Spotify sur la zone MÊME qui joue la
+    /// session Connect : la zone n'est pas arrêtée par le pilote, même si son
+    /// évènement arrive avant que la lecture de Tune ait remplacé la lecture
+    /// en cours (relecture du 12/11).
+    async fn reprise_sur_la_zone(zone_reprise_par_tune: bool) -> Vec<String> {
+        let dossier = tempfile::tempdir().unwrap();
+        let recepteur = recepteur(dossier.path());
+        let zones = Arc::new(FaussesZones::default());
+        let pilote = PiloteConnect {
+            recepteur: recepteur.clone(),
+            zones: zones.clone(),
+        };
+        recepteur.enable(9).await.unwrap();
+        let mut etat = EtatSession::default();
+        pilote.traiter(&mut etat, &joue("a")).await;
+        // Tune prend la pompe pour son titre.
+        let _rx = recepteur.pompe().attacher(Some("t".into()));
+        if zone_reprise_par_tune {
+            // La lecture de Tune remplace celle de la zone 300 ms plus tard.
+            let z = zones.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                z.ne_joue_plus
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        // L'évènement de librespot pour le titre de Tune arrive AVANT.
+        pilote
+            .traiter(&mut etat, &titre("t", "Titre de Tune"))
+            .await;
+        recepteur.disable().await;
+        let appels = zones.appels.lock().unwrap().clone();
+        appels
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reprise_8581_meme_zone_pas_arretee() {
+        let appels = reprise_sur_la_zone(true).await;
+        assert!(
+            !appels.iter().any(|a| a == "arreter 9"),
+            "la zone que Tune lance a été arrêtée : {appels:?}"
+        );
+    }
+
+    /// Contre-épreuve : la session jouait sur une zone que Tune ne reprend
+    /// pas : elle est arrêtée.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reprise_8581_autre_zone_arretee() {
+        let appels = reprise_sur_la_zone(false).await;
+        assert!(appels.iter().any(|a| a == "arreter 9"), "{appels:?}");
+    }
+
     /// Zone exposée absente : la raison est retenue et rendue par le statut.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn session_8565_zone_absente_le_statut_le_dit() {
@@ -722,4 +774,39 @@ fn session_8580_refus_de_zone_en_code_stable() {
         CODE_REFUS_PARENTAL
     );
     assert_eq!(code_de_refus_de_session("sortie absente"), "sortie absente");
+}
+
+/// « Le dernier geste gagne » (Bertrand, 12/11) — l'évènement synthétique de
+/// Tune ferme la session ouverte, même si la pompe n'est plus à Tune (sa
+/// lecture a échoué).
+#[test]
+fn decider_tune_prend_la_main_ferme_la_session_ouverte() {
+    let t0 = Instant::now();
+    let mut etat = EtatSession::default();
+    let _ = decider(&mut etat, &titre("p1", "Un"), Some(7), false, t0);
+    let _ = decider(&mut etat, &joue("p1"), Some(7), false, t0);
+    assert_eq!(etat.zone(), Some(7), "session ouverte sur la zone exposée");
+    let actions = decider(
+        &mut etat,
+        &ev(crate::streaming::spotify_connect::EVENEMENT_TUNE_PREND_LA_MAIN),
+        Some(7),
+        false,
+        t0,
+    );
+    assert_eq!(actions, vec![Action::Arreter { zone_id: 7 }]);
+    assert_eq!(etat.zone(), None);
+}
+
+/// Contre-épreuve : sans session ouverte, l'évènement ne fait rien.
+#[test]
+fn decider_tune_prend_la_main_sans_session_ne_fait_rien() {
+    let mut etat = EtatSession::default();
+    let actions = decider(
+        &mut etat,
+        &ev(crate::streaming::spotify_connect::EVENEMENT_TUNE_PREND_LA_MAIN),
+        Some(7),
+        false,
+        Instant::now(),
+    );
+    assert!(actions.is_empty(), "{actions:?}");
 }
