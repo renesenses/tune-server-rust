@@ -168,12 +168,21 @@ pub(super) fn est_un_fourre_tout(nom_normalise_: &str) -> bool {
 /// cesserait de faire remonter sa parution QOBUZ sous `sources=qobuz`, ce qui
 /// retirerait des resultats du service explicitement demande. Vivier n'est
 /// pas contenu.
+///
+/// ## web#916 — pourquoi, et « Pas pour moi »
+///
+/// Chaque parution porte une `raison` : `artiste_favori` si l'artiste est
+/// aimé, sinon `artiste_possede` avec le nombre d'albums de la bibliothèque —
+/// la même annotation que le groupe, dite pour l'élément. Un artiste ou une
+/// parution que le profil qui regarde a écarté ne remonte plus.
 pub(super) async fn artist_releases(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<Params>,
 ) -> Result<Json<Value>, AppError> {
     let limite = p.limit.unwrap_or(20).clamp(1, 100);
     let filtre = FiltreSources::depuis(p.sources.as_deref());
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
 
     // Les services qui repondront. Etabli AVANT tout appel reseau : quand la
     // liste est vide et que Bandcamp est ecarte lui aussi, il n'y a rien a
@@ -306,6 +315,13 @@ pub(super) async fn artist_releases(
             }) else {
                 continue;
             };
+            // « Pas pour moi » (web#916) : l'artiste entier, ou cette parution.
+            if ecartees.artiste(&affiche)
+                || ecartees.artiste(&album.artist)
+                || ecartees.album_de_service(nom_service, &album.id)
+            {
+                continue;
+            }
 
             let parution = json!({
                 "service": nom_service,
@@ -313,6 +329,7 @@ pub(super) async fn artist_releases(
                 "title": album.title,
                 "cover_path": album.cover_path,
                 "year": album.year,
+                "raison": super::accueil_justifie::raison_artiste(&affiche, aime, albums_possedes),
             });
 
             match groupes
@@ -358,12 +375,23 @@ pub(super) async fn artist_releases(
         if est_un_fourre_tout(&cle) {
             continue;
         }
+        if ecartees.artiste(nom) {
+            continue;
+        }
+        let aime = aimes.contains(&cle);
+        let albums_possedes = connus.get(&cle).map(|(_, n)| *n).unwrap_or(0);
+        let raison = super::accueil_justifie::raison_artiste(nom, aime, albums_possedes);
         let parutions: Vec<Value> = depot
             .get("parutions")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default()
             .into_iter()
+            .filter(|p| {
+                !p.get("url")
+                    .and_then(|u| u.as_str())
+                    .is_some_and(|u| ecartees.album_de_service("bandcamp", u))
+            })
             .map(|p| {
                 json!({
                     "service": "bandcamp",
@@ -373,15 +401,13 @@ pub(super) async fn artist_releases(
                     // Bandcamp ne date pas sa discographie : annoncer une annee
                     // serait l'inventer.
                     "year": Value::Null,
+                    "raison": raison,
                 })
             })
             .collect();
         if parutions.is_empty() {
             continue;
         }
-
-        let aime = aimes.contains(&cle);
-        let albums_possedes = connus.get(&cle).map(|(_, n)| *n).unwrap_or(0);
         match groupes
             .iter_mut()
             .find(|g| g["key"].as_str() == Some(cle.as_str()))

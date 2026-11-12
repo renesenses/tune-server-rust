@@ -344,10 +344,14 @@ pub async fn sonder_un_flux(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> 
     // `probe: … no suitable format reader found` sur un 2xx audio. La lecture
     // reprend une fois un décodeur qui échoue à la sonde du format
     // (`echec_avant_le_premier_octet`) : la sentinelle refait un essai de même.
+    //
+    // #8443 — un corps coupé par le CDN (le cas réel de #7805 : « f » seul sur
+    // 328 Mo annoncés) est retenté de même.
     match sonder_en_http(flux).await {
         Err(e)
-            if e.cause == Cause::Decodage
-                && crate::audio::decode::echec_avant_le_premier_octet(&e.detail) =>
+            if (e.cause == Cause::Decodage
+                && crate::audio::decode::echec_avant_le_premier_octet(&e.detail))
+                || (e.cause == Cause::Http && e.detail.starts_with(PREFIXE_COUPURE)) =>
         {
             warn!(detail = %e.detail, "sentinelle_streaming_second_essai");
             sonder_en_http(flux).await
@@ -355,6 +359,10 @@ pub async fn sonder_un_flux(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> 
         autre => autre,
     }
 }
+
+/// Début du détail d'un corps HTTP terminé avant la tête voulue et avant la
+/// longueur annoncée (#8443).
+const PREFIXE_COUPURE: &str = "flux coupé";
 
 /// Ce qui est arrivé, pour un échec de décodage : les 16 premiers octets en
 /// hexadécimal, les en-têtes de type et de longueur, le nombre d'octets lus.
@@ -416,29 +424,57 @@ async fn sonder_en_http(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> {
             ));
         }
         let mut octets = Vec::with_capacity(borne.min(OCTETS_DE_TETE));
+        // #8443 — les morceaux courts sont cumulés jusqu'à la borne : seule la
+        // fin du corps arrête la lecture. Une fin AVANT la longueur annoncée,
+        // ou une erreur après quelques octets, est une coupure du CDN : elle
+        // est gardée, pour ne pas la faire passer pour un défaut de décodage.
+        let mut coupure = None;
         while octets.len() < borne {
             match reponse.chunk().await {
                 Ok(Some(c)) => octets.extend_from_slice(&c),
-                Ok(None) => break,
+                Ok(None) => {
+                    if let Some(l) = longueur
+                        && (octets.len() as u64) < l
+                    {
+                        coupure = Some(format!(
+                            "{PREFIXE_COUPURE} après {} octets sur {l} annoncés : fin du corps",
+                            octets.len()
+                        ));
+                    }
+                    break;
+                }
                 Err(e) => {
+                    let cause = crate::http::client::decrire_erreur_http(&e);
                     if octets.is_empty() {
                         return Err(EchecSonde::new(
                             Cause::Http,
-                            format!("lecture du flux : {e}"),
+                            format!("lecture du flux : {cause}"),
                         ));
                     }
+                    let annonce = longueur
+                        .map(|l| format!(" sur {l} annoncés"))
+                        .unwrap_or_default();
+                    coupure = Some(format!(
+                        "{PREFIXE_COUPURE} après {} octets{annonce} : {cause}",
+                        octets.len()
+                    ));
                     break;
                 }
             }
         }
         octets.truncate(borne);
-        Ok((octets, type_recu, longueur))
+        Ok((octets, type_recu, longueur, coupure))
     };
-    let (octets, type_recu, longueur) = tokio::time::timeout(DELAI_TELECHARGEMENT, telechargement)
-        .await
-        .map_err(|_| EchecSonde::new(Cause::Delai, "téléchargement de la tête du flux"))??;
+    let (octets, type_recu, longueur, coupure) =
+        tokio::time::timeout(DELAI_TELECHARGEMENT, telechargement)
+            .await
+            .map_err(|_| EchecSonde::new(Cause::Delai, "téléchargement de la tête du flux"))??;
     if octets.is_empty() {
-        return Err(EchecSonde::new(Cause::Http, "le flux est vide (0 octet)"));
+        // #8443 — rien reçu sur une longueur annoncée : la même coupure, retentée.
+        return Err(EchecSonde::new(
+            Cause::Http,
+            coupure.unwrap_or_else(|| "le flux est vide (0 octet)".to_string()),
+        ));
     }
     let lus = octets.len() as u64;
     let fichier = tempfile::Builder::new()
@@ -451,14 +487,16 @@ async fn sonder_en_http(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> {
     let mut decode = decoder_le_fichier(fichier.path().to_string_lossy().into_owned())
         .await
         .map_err(|e| {
-            EchecSonde::new(
-                e.cause,
-                format!(
-                    "{} ({})",
-                    e.detail,
-                    constat_des_octets(&octets, &type_recu, longueur)
+            let constat = constat_des_octets(&octets, &type_recu, longueur);
+            match &coupure {
+                // #8443 — la tête est incomplète parce que le CDN a coupé :
+                // la cause est réseau, le décodage n'en est que la suite.
+                Some(c) => EchecSonde::new(
+                    Cause::Http,
+                    format!("{c} ; décodage de la tête : {} ({constat})", e.detail),
                 ),
-            )
+                None => EchecSonde::new(e.cause, format!("{} ({constat})", e.detail)),
+            }
         })?;
     decode.octets_lus = lus;
     drop(fichier);
