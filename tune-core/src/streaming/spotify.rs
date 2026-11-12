@@ -109,6 +109,11 @@ pub struct SpotifyService {
     /// automatique » est active ; `None` (defaut) : l'adresse de retour reste
     /// `redirect_uri`, comme avant.
     relais: Option<String>,
+    /// #8485 — Spotify a répondu 403 à `/artists/{id}/top-tracks` : depuis
+    /// février 2026, ce point d'accès est retiré aux applications en mode
+    /// développement (celle de chaque utilisateur). Les titres phares sont
+    /// alors vides, sans erreur, et ne sont plus redemandés à Spotify.
+    titres_phares_retires: AtomicBool,
     /// #8399 — Spotify a répondu 403 à `/browse/featured-playlists` : ce
     /// point d'accès est fermé aux applications créées après le 27/11/2024.
     /// La rubrique est alors vide, sans erreur, et n'est plus redemandée.
@@ -673,6 +678,7 @@ impl SpotifyService {
             session_refusee: false,
             derniere_erreur: None,
             relais: None,
+            titres_phares_retires: AtomicBool::new(false),
             selection_retiree: AtomicBool::new(false),
         }
     }
@@ -682,6 +688,8 @@ impl SpotifyService {
     /// le nouveau : son verificateur est oublie.
     pub fn set_client_id(&mut self, client_id: &str) {
         self.client_id = client_id.trim().to_owned();
+        // #8485 — le retrait des titres phares vaut pour UNE application.
+        self.titres_phares_retires.store(false, Ordering::Relaxed);
         // #8399 — le refus de la sélection vaut pour UNE application.
         self.selection_retiree.store(false, Ordering::Relaxed);
         self.tentatives.clear();
@@ -1831,6 +1839,7 @@ impl StreamingService for SpotifyService {
         self.portees = None;
         self.token_rejected.store(false, Ordering::Relaxed);
         self.session_refusee = false;
+        self.titres_phares_retires.store(false, Ordering::Relaxed);
         self.selection_retiree.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -2035,9 +2044,28 @@ impl StreamingService for SpotifyService {
     }
 
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        let data = self
+        // #8485 — retiré par Spotify à cette application : section vide, sans
+        // nouvel appel. La route complète ensuite la liste par ses autres
+        // sources (écoutes de ce serveur).
+        if self.titres_phares_retires.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
+        let data = match self
             .api_get(&format!("/artists/{artist_id}/top-tracks"))
-            .await?;
+            .await
+        {
+            Ok(d) => d,
+            Err(e) if statut_du_refus(&e) == Some(403) => {
+                if !self.titres_phares_retires.swap(true, Ordering::Relaxed) {
+                    info!(
+                        route = "/artists/{id}/top-tracks",
+                        "spotify_point_d_acces_retire"
+                    );
+                }
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e.into()),
+        };
         Ok(data["tracks"]
             .as_array()
             .map(|i| i.iter().map(Self::map_track).collect())
@@ -3636,6 +3664,10 @@ mod favoris_pagination_8050_tests;
 #[cfg(test)]
 #[path = "spotify_playlists_items_8193_tests.rs"]
 mod playlists_items_8193_tests;
+
+#[cfg(test)]
+#[path = "spotify_titres_phares_8485_tests.rs"]
+mod titres_phares_8485_tests;
 
 #[cfg(test)]
 #[path = "spotify_albums_artiste_8479_tests.rs"]

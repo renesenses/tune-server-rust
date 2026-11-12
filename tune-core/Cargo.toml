@@ -732,6 +732,13 @@ required-features = ["local-audio"]
 name = "asio_dsd_5643"
 path = "tests/asio_dsd_5643.rs"
 
+# #8489 — capture d'un micro S24_3LE seul (UMIK-1/UMIK-2) : fonctions pures du
+# correctif de vendor/cpal (alsa/packed24.rs) par `#[path]`, plus un banc de
+# bout en bout contre un PCM ALSA privé sous `local-audio`.
+[[test]]
+name = "alsa_s24_3_8489"
+path = "tests/alsa_s24_3_8489.rs"
+
 # #4378 — la garde qui tient la fonctionnalité `dst` ARMÉE (licence acceptée le
 # 06/10/2026) : présente dans les lignes `--features` de toutes les recettes
 # qui PUBLIENT un artefact (release.yml, docker.yml, Dockerfile), bases
@@ -844,3 +851,9 @@ path = "tests/autoeq_canaux_7340.rs"
 [[test]]
 name = "pochettes_compilations_6077"
 path = "tests/pochettes_compilations_6077.rs"
+
+# #8239 : le journal de synchro après un scan, sur PostgreSQL (`IS DISTINCT
+# FROM`, tables de la migration 110). Sauté sans `TUNE_TEST_PG_URL`.
+[[test]]
+name = "journal_apres_scan_pg_8239"
+path = "tests/journal_apres_scan_pg_8239.rs"

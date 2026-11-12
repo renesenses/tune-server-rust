@@ -3999,6 +3999,43 @@ pub(super) async fn coffrets_eclates(
 pub(super) struct CoffretManuel {
     /// Les albums à réunir, DANS L'ORDRE DES DISQUES. Deux au minimum.
     pub album_ids: Vec<i64>,
+    /// #8464 (fil 2765) — le nom du coffret, saisi au moment de le réunir.
+    /// Absent ou vide : le titre calculé ([`titre_du_coffret_calcule`]).
+    #[serde(default)]
+    pub titre: Option<String>,
+}
+
+/// Le titre que la composition donnerait au coffret, sans rien saisir : le
+/// plus long préfixe commun ([`titre_commun`]), sinon le titre du premier
+/// album. Partagé par la composition et par son aperçu (#8464), pour que le
+/// champ prérempli de l'écran dise exactement ce que la route écrirait.
+fn titre_du_coffret_calcule(titres: &[String]) -> Option<String> {
+    titre_commun(titres).or_else(|| titres.first().cloned())
+}
+
+/// Ce que l'écran envoie pour l'aperçu du titre (#8464).
+#[derive(serde::Deserialize)]
+pub(super) struct ApercuCoffret {
+    pub album_ids: Vec<i64>,
+}
+
+/// `POST /library/albums/coffret/apercu` — #8464 (fil 2765) : le titre que
+/// « Réunir en coffret » donnerait aux albums cochés, pour préremplir le
+/// champ du nom. N'écrit RIEN. Un identifiant inconnu est ignoré : l'aperçu
+/// ne refuse pas, la composition le fera.
+pub(super) async fn apercu_coffret(
+    State(state): State<AppState>,
+    Json(body): Json<ApercuCoffret>,
+) -> Result<Json<Value>, AppError> {
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let mut vus = std::collections::BTreeSet::new();
+    let mut titres = Vec::new();
+    for id in body.album_ids.into_iter().filter(|id| vus.insert(*id)) {
+        if let Some(a) = repo.get(id).map_err(AppError::internal)? {
+            titres.push(a.title);
+        }
+    }
+    Ok(Json(json!({ "titre": titre_du_coffret_calcule(&titres) })))
 }
 
 /// `POST /library/albums/coffret` — composer un coffret À LA MAIN.
@@ -4029,7 +4066,12 @@ pub(super) struct CoffretManuel {
 ///
 /// # Ce qu'il écrit
 ///
-/// Le numéro de disque de chaque album — `1`, `2`, … dans l'ordre reçu — puis
+/// Les numéros de disque, À LA SUITE dans l'ordre reçu : chaque album garde
+/// SES disques, décalés après ceux du précédent (#8463, fil 2763 — un album
+/// de 3 CD suivi de trois albums d'un disque donne les disques 1-3, puis 4,
+/// 5 et 6 ; avant, chaque album recevait UN numéro et les trois CD finissaient
+/// mêlés sous « Disque 1 »). Le marqueur retient pour chaque disque son album
+/// d'origine et son ancien numéro, que « Défaire » rend. Puis
 /// la fusion par [`AlbumRepo::absorber`], celle-là même qu'emploie le
 /// regroupement automatique, et la disposition de chaque piste, TENUE
 /// (`edition_pistes`) pour qu'un scan qui relit les fichiers ne défasse pas
@@ -4067,15 +4109,38 @@ pub(super) async fn composer_coffret(
     // Les disques tels qu'ils étaient AVANT la réunion : « Défaire le
     // coffret » les rend (#5319).
     let mut disques = Vec::with_capacity(ids.len());
+    // #8463 — par album, `(ancien numéro, nouveau numéro)` de chacun de ses
+    // disques : les numéros se suivent d'un album à l'autre.
+    let mut renumerotation: Vec<(i64, Vec<(i32, u32)>)> = Vec::with_capacity(ids.len());
+    let mut suivant = 1u32;
     for (rang, &id) in ids.iter().enumerate() {
         match repo.get(id) {
             Ok(Some(a)) => {
-                disques.push(coffrets_auto::DisqueRetenu {
-                    n: (rang + 1) as u32,
-                    titre: a.title.clone(),
-                    dossier: repo.folder_path_of(id).ok().flatten().unwrap_or_default(),
-                    artiste_id: a.artist_id,
-                });
+                let origines =
+                    match tune_core::db::edition_album::numeros_de_disque(&state.backend, id) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return AppError::internal(format!(
+                                "lecture des disques de l'album {id} : {e}"
+                            ))
+                            .into_response();
+                        }
+                    };
+                let dossier = repo.folder_path_of(id).ok().flatten().unwrap_or_default();
+                let mut table = Vec::with_capacity(origines.len());
+                for origine in origines {
+                    disques.push(coffrets_auto::DisqueRetenu {
+                        n: suivant,
+                        titre: a.title.clone(),
+                        dossier: dossier.clone(),
+                        artiste_id: a.artist_id,
+                        membre: Some(rang as u32),
+                        disque_origine: Some(origine.max(0) as u32),
+                    });
+                    table.push((origine, suivant));
+                    suivant += 1;
+                }
+                renumerotation.push((id, table));
                 titres.push(a.title);
             }
             Ok(None) => {
@@ -4124,21 +4189,31 @@ pub(super) async fn composer_coffret(
         .iter()
         .any(|c| c == "title");
 
-    // Le numéro de disque, dans l'ordre reçu — y compris pour la cible, qui
-    // devient le disque 1 même si ses pistes se déclaraient autre chose.
-    for (rang, &id) in ids.iter().enumerate() {
-        let (p1, p2) = match state.backend.engine() {
-            Engine::Postgres => (
-                PostgresDialect.placeholder(1),
-                PostgresDialect.placeholder(2),
-            ),
-            Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
+    // Les numéros de disque, à la suite dans l'ordre reçu — y compris pour
+    // la cible, dont le premier disque devient le disque 1 même si ses pistes
+    // se déclaraient autre chose. #8463 : UNE requête par album, en `CASE`,
+    // pour que « 1 → 2 » ne rattrape pas ensuite les pistes de « 2 → 3 ».
+    // Les numéros sont des entiers lus en base, écrits en clair.
+    for (id, table) in &renumerotation {
+        if table.is_empty() {
+            continue;
+        }
+        let p1 = match state.backend.engine() {
+            Engine::Postgres => PostgresDialect.placeholder(1),
+            Engine::Sqlite => SqliteDialect.placeholder(1),
         };
+        let cas: String = table
+            .iter()
+            .map(|(avant, apres)| format!(" WHEN {avant} THEN {apres}"))
+            .collect();
         if let Err(e) = state.backend.execute(
-            &format!("UPDATE tracks SET disc_number = {p1} WHERE album_id = {p2}"),
-            &[&((rang + 1) as i64) as &dyn ToSqlValue, &id],
+            &format!(
+                "UPDATE tracks SET disc_number = CASE COALESCE(disc_number, 1){cas} \
+                 ELSE disc_number END WHERE album_id = {p1}"
+            ),
+            &[id as &dyn ToSqlValue],
         ) {
-            return AppError::internal(format!("numérotation du disque {id} : {e}"))
+            return AppError::internal(format!("numérotation des disques de {id} : {e}"))
                 .into_response();
         }
     }
@@ -4151,7 +4226,15 @@ pub(super) async fn composer_coffret(
         absorbes += 1;
     }
 
-    let titre = titre_commun(&titres);
+    // #8464 — le nom saisi à l'écran prime ; sinon le titre calculé. Dans
+    // les deux cas il est tenu comme modifié à la main, plus bas.
+    let titre_saisi = body
+        .titre
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let titre = titre_saisi.or_else(|| titre_commun(&titres));
     let mut titre_compose = None;
     if let Some(t) = titre.as_deref() {
         let (p1, p2) = match state.backend.engine() {
@@ -4196,6 +4279,7 @@ pub(super) async fn composer_coffret(
     // Sans lui, un coffret manuel ne se distingue d'un coffret réparti sur
     // plusieurs dossiers que par cette absence ; la passe l'épargne aussi,
     // mais par prudence et non par décision.
+    let disques_du_coffret = disques.len();
     let marqueur = serde_json::to_string(&coffrets_auto::Marqueur {
         disques,
         titre_compose,
@@ -4223,13 +4307,15 @@ pub(super) async fn composer_coffret(
         json!({ "source": "coffret_manuel", "cible": cible }),
     );
     let titre_rendu = titre.unwrap_or_else(|| titres[0].clone());
-    tracing::info!(cible, absorbes, disques = ids.len(), titre = %titre_rendu, "coffret_compose");
+    // #8463 — le nombre de DISQUES du coffret, plus celui des albums réunis.
+    let nb_disques = disques_du_coffret;
+    tracing::info!(cible, absorbes, disques = nb_disques, titre = %titre_rendu, "coffret_compose");
     (
         StatusCode::OK,
         Json(json!({
             "cible": cible,
             "absorbes": absorbes,
-            "disques": ids.len(),
+            "disques": nb_disques,
             "titre": titre_rendu,
         })),
     )
@@ -4609,6 +4695,7 @@ mod tests_garde_source_fusion_20260927 {
         deux_albums(&s, "upnp");
         let corps = CoffretManuel {
             album_ids: vec![1, 2],
+            titre: None,
         };
         let (code, v) = lire(composer_coffret(State(s.clone()), Json(corps)).await).await;
         assert_eq!(
@@ -4644,6 +4731,7 @@ mod tests_garde_source_fusion_20260927 {
         deux_albums(&s, "local");
         let corps = CoffretManuel {
             album_ids: vec![1, 2],
+            titre: None,
         };
         let (code, v) = lire(composer_coffret(State(s.clone()), Json(corps)).await).await;
         assert_ne!(
@@ -4666,6 +4754,7 @@ mod tests_garde_source_fusion_20260927 {
         deux_albums(&s, "local");
         let corps = CoffretManuel {
             album_ids: vec![1, 99],
+            titre: None,
         };
         let (code, v) = lire(composer_coffret(State(s.clone()), Json(corps)).await).await;
         assert_eq!(code, StatusCode::NOT_FOUND, "rendu {v}");

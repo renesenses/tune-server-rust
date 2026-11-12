@@ -19,7 +19,8 @@ pub struct AcoustIdMatch {
 }
 
 /// Le binaire `fpcalc` remplacé — une doublure dans les tests (#4805). `None`
-/// en service : `fpcalc` est cherché dans le `PATH`.
+/// en service : `fpcalc` est cherché à côté de `tune-server`, puis dans le
+/// `PATH` (#8466).
 static FPCALC_REMPLACE: std::sync::RwLock<Option<std::path::PathBuf>> =
     std::sync::RwLock::new(None);
 
@@ -35,13 +36,50 @@ pub fn remplacer_fpcalc(chemin: Option<std::path::PathBuf>) {
     }
 }
 
+/// Nom de l'exécutable `fpcalc` sur cette plateforme.
+fn nom_fpcalc() -> &'static str {
+    if cfg!(windows) {
+        "fpcalc.exe"
+    } else {
+        "fpcalc"
+    }
+}
+
+/// Les dossiers où les paquets de Tune posent `fpcalc` (#8466) : celui de
+/// `tune-server` tel qu'il a été lancé, puis le même, liens résolus (le
+/// lien `bin/tune-server` d'une formule Homebrew pointe dans le Cellar).
+fn dossiers_de_tune() -> Vec<std::path::PathBuf> {
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    let mut dossiers: Vec<std::path::PathBuf> = exe.parent().map(Into::into).into_iter().collect();
+    if let Ok(resolu) = std::fs::canonicalize(&exe)
+        && let Some(d) = resolu.parent()
+        && !dossiers.iter().any(|x| x == d)
+    {
+        dossiers.push(d.to_path_buf());
+    }
+    dossiers
+}
+
+/// Le `fpcalc` à lancer : le premier présent dans `dossiers`, sinon le nom nu,
+/// cherché dans le `PATH`.
+fn fpcalc_parmi(dossiers: &[std::path::PathBuf]) -> std::ffi::OsString {
+    dossiers
+        .iter()
+        .map(|d| d.join(nom_fpcalc()))
+        .find(|p| p.is_file())
+        .map(|p| p.into_os_string())
+        .unwrap_or_else(|| nom_fpcalc().into())
+}
+
 fn binaire_fpcalc() -> std::ffi::OsString {
     FPCALC_REMPLACE
         .read()
         .ok()
         .and_then(|f| f.clone())
         .map(|p| p.into_os_string())
-        .unwrap_or_else(|| "fpcalc".into())
+        .unwrap_or_else(|| fpcalc_parmi(&dossiers_de_tune()))
 }
 
 pub async fn generate_fingerprint(file_path: &str) -> Result<FingerprintResult, String> {
@@ -205,6 +243,37 @@ mod tests {
         };
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["score"], 0.95);
+    }
+
+    /// #8466 : le `fpcalc` livré à côté de `tune-server` (tar.gz, installeur
+    /// Windows) est préféré au `PATH`, que launchd ou systemd réduisent.
+    #[test]
+    fn fpcalc_livre_a_cote_de_tune_server_est_prefere_au_path_8466() {
+        let racine = tempfile::tempdir().unwrap();
+        let vide = racine.path().join("vide");
+        let paquet = racine.path().join("paquet");
+        std::fs::create_dir_all(&vide).unwrap();
+        std::fs::create_dir_all(&paquet).unwrap();
+        let livre = paquet.join(nom_fpcalc());
+        std::fs::write(&livre, b"").unwrap();
+
+        assert_eq!(
+            fpcalc_parmi(&[vide.clone(), paquet.clone()]),
+            livre.clone().into_os_string(),
+            "le fpcalc posé à côté de tune-server doit être lancé par son chemin"
+        );
+        // Aucun fpcalc livré : le nom nu, cherché dans le PATH comme avant.
+        assert_eq!(
+            fpcalc_parmi(&[vide.clone()]),
+            std::ffi::OsString::from(nom_fpcalc())
+        );
+        assert_eq!(fpcalc_parmi(&[]), std::ffi::OsString::from(nom_fpcalc()));
+        // Un DOSSIER nommé fpcalc n'est pas un exécutable.
+        std::fs::create_dir_all(vide.join(nom_fpcalc())).unwrap();
+        assert_eq!(
+            fpcalc_parmi(&[vide]),
+            std::ffi::OsString::from(nom_fpcalc())
+        );
     }
 
     #[test]

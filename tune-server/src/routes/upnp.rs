@@ -34,7 +34,7 @@ async fn upnp_config(State(state): State<AppState>) -> Json<serde_json::Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     // #8374 — mêmes règles que l'annonceur (`background::spawn_upnp_advertiser`)
     // et que `UpnpState::new` : clé en base, sinon variable d'environnement,
-    // sinon valeur par défaut. L'écran reflète ainsi ce que le serveur fait.
+    // sinon `Tune (<nom>)` (#8189). L'écran reflète ainsi ce que le serveur fait.
     let enabled = tune_core::upnp_server::annonce_voulue(&settings);
     let friendly_name = tune_core::upnp_server::nom_publie(&settings);
 

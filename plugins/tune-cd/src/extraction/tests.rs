@@ -27,6 +27,7 @@ use super::{EVT_DEMARREE, EVT_TERMINEE, Extractions, ScanCible};
 use crate::ejection::tests::HoteTemoin;
 use crate::fournisseur::SOURCE;
 use crate::lecteur::{ErreurCd, ErreurEjection, LecteurDisque, Presence};
+use crate::memoire::{Fin, MemoireCd, Reglages};
 use crate::musicbrainz::{Consultation, InfosDisque, InfosPiste};
 use crate::routes::{EtatRoutes, router};
 use crate::simule::{LecteurSimule, contenu_des_secteurs};
@@ -1020,6 +1021,7 @@ fn une_ecriture_refusee_pendant_l_extraction_nomme_sa_cause_et_son_chemin_7105()
         format: Format::Flac,
         verification: Verification::default(),
         lecteur: String::new(),
+        source: "lecteur",
         disc_id: String::new(),
         metadonnees: "repli",
         artiste: String::new(),
@@ -1094,4 +1096,286 @@ fn les_erreurs_d_ecriture_sont_classees_par_cause_7105() {
         m.contains("/media/Artiste/Album") && m.contains("plus de place"),
         "{m}"
     );
+}
+
+// ─── #8514 : « Enregistrer dans la bibliothèque » depuis la mémoire ─────────
+
+/// Le disque simulé ENTIER chargé en mémoire (#6043), branché sur le banc.
+async fn charger_en_memoire(banc: &mut Banc, l: &Arc<LecteurSimule>) -> Arc<MemoireCd> {
+    let m = Arc::new(MemoireCd::new(Reglages {
+        actif: true,
+        plafond_octets: u64::MAX,
+    }));
+    let ld: Arc<dyn LecteurDisque> = l.clone();
+    let toc = petite_toc();
+    let c = m
+        .charger_le_disque(&ld, &toc, &crate::discid::disc_id(&toc), 0)
+        .unwrap();
+    let fin = tokio::task::spawn_blocking(move || c.attendre_la_fin())
+        .await
+        .unwrap();
+    assert_eq!(fin, Some(Fin::Termine));
+    banc.routes.memoire = Some(m.clone());
+    m
+}
+
+/// Le témoin principal de #8514 : le disque chargé en mémoire se verse dans
+/// la bibliothèque SANS une lecture de plus au lecteur — FLAC bit exact,
+/// balises et pochette, même dossier et mêmes noms que l'extraction depuis
+/// le lecteur, scan ciblé ; les CRC AccurateRip valent ceux calculés au
+/// chargement ; la mémoire reste chargée et la zone qui joue n'est pas
+/// coupée.
+#[tokio::test]
+async fn enregistrer_depuis_la_memoire_verse_les_pistes_sans_relire_le_lecteur() {
+    let l = simule();
+    let mut banc = Banc::new(l.clone(), Arc::new(AvecMusicBrainz));
+    let m = charger_en_memoire(&mut banc, &l).await;
+    // Une zone joue le disque (depuis la mémoire) : pas un refus ici.
+    banc.hote.sources.lock().await.insert(4, SOURCE.into());
+    banc.routes.zones.lock().await.insert(4);
+    let lectures_avant = l.appels();
+
+    let fin = banc.extraire(json!({ "depuis_memoire": true })).await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+    assert_eq!(fin["source"], "memoire");
+    assert_eq!(fin["scan"], "lance");
+    assert_eq!(
+        l.appels(),
+        lectures_avant,
+        "le lecteur a été relu pour enregistrer un disque déjà en mémoire"
+    );
+    assert!(banc.hote.arrets.lock().await.is_empty(), "zone coupée");
+
+    let album = banc.racine().join("Le Groupe").join("Un Album_ Live_");
+    assert_eq!(fin["dossier"], album.to_string_lossy().as_ref());
+    assert_eq!(
+        *banc.scan.dossiers.lock().unwrap(),
+        vec![album.to_string_lossy().to_string()]
+    );
+    let charge = m.progression().unwrap();
+    assert_eq!(charge.fin, Some(Fin::Termine), "la mémoire a été rendue");
+    let noms = [
+        "01 - Premier.flac",
+        "02 - Deuxième _ bis.flac",
+        "03 - Troisième.flac",
+    ];
+    for (i, (n, debut, fin_piste)) in PLAGES.iter().enumerate() {
+        let chemin = album.join(noms[i]);
+        assert_eq!(
+            pcm_relu(&chemin),
+            contenu_des_secteurs(*debut, fin_piste - debut),
+            "piste {n} : PCM relu ≠ secteurs du disque"
+        );
+        let p = &fin["pistes"][i];
+        let (v1, v2) = crc_attendu(*n, *debut, *fin_piste);
+        assert_eq!(
+            (p["accuraterip_v1"].as_str(), p["accuraterip_v2"].as_str()),
+            (Some(&*v1), Some(&*v2))
+        );
+        assert_eq!(
+            (
+                charge.accuraterip[i].v1.as_str(),
+                charge.accuraterip[i].v2.as_str()
+            ),
+            (&*v1, &*v2),
+            "piste {n} : CRC du chargement ≠ CRC de l'enregistrement"
+        );
+        let meta = tune_core::metadata::read_metadata(&chemin).expect("balises lisibles");
+        assert_eq!(meta.track_number, Some(*n as u32));
+        assert_eq!(meta.album.as_deref(), Some("Un Album: Live?"));
+        assert_eq!(meta.musicbrainz_release_id.as_deref(), Some("rel-1"));
+        use lofty::file::TaggedFileExt;
+        let lofty = lofty::read_from_path(&chemin).unwrap();
+        assert_eq!(lofty.primary_tag().unwrap().pictures()[0].data(), JPEG);
+    }
+    assert_eq!(std::fs::read(album.join("cover.jpg")).unwrap(), JPEG);
+    assert!(!m.enregistrement_en_cours());
+    m.liberer();
+}
+
+/// Le disque est sorti du lecteur mais gardé ENTIER en mémoire (#6410) :
+/// l'enregistrement se fait quand même, le lecteur vide n'est pas consulté.
+#[tokio::test]
+async fn enregistrer_un_disque_ejecte_mais_garde_en_memoire() {
+    let l = simule();
+    let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let m = charger_en_memoire(&mut banc, &l).await;
+    l.ejecter();
+    assert!(m.garder_apres_ejection());
+    let fin = banc
+        .extraire(json!({ "depuis_memoire": true, "format": "wav", "pistes": [2] }))
+        .await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+    let chemin = PathBuf::from(fin["pistes"][0]["fichier"].as_str().unwrap());
+    assert_eq!(chemin.file_name().unwrap(), "02 - Piste 02.wav");
+    assert_eq!(pcm_relu(&chemin), contenu_des_secteurs(40, 75));
+    m.liberer();
+}
+
+/// Contre-épreuve du contrat : sans disque entier en mémoire, refus
+/// `memoire_incomplete` — pas d'extraction silencieuse depuis le lecteur.
+#[tokio::test]
+async fn sans_disque_entier_en_memoire_l_enregistrement_est_refuse() {
+    let l = simule();
+    let banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::CONFLICT, Some("memoire_incomplete"))
+    );
+    assert_eq!(l.appels(), 0, "le lecteur a été lu");
+    assert!(banc.ex.liste().is_empty());
+
+    // Un refus ne laisse pas la mémoire retenue.
+    let m = Arc::new(MemoireCd::new(Reglages {
+        actif: true,
+        plafond_octets: u64::MAX,
+    }));
+    let mut banc = banc;
+    banc.routes.memoire = Some(m.clone());
+    let (code, _) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(
+        !m.enregistrement_en_cours(),
+        "retenue restée après un refus"
+    );
+
+    // Chargement interrompu (éjection) : toujours refusé.
+    l.ejecter_apres(2);
+    let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let m = Arc::new(MemoireCd::new(Reglages {
+        actif: true,
+        plafond_octets: u64::MAX,
+    }));
+    let ld: Arc<dyn LecteurDisque> = l.clone();
+    let c = m.charger_le_disque(&ld, &petite_toc(), "d", 0).unwrap();
+    let fin = tokio::task::spawn_blocking(move || c.attendre_la_fin())
+        .await
+        .unwrap();
+    assert_eq!(fin, Some(Fin::Ejecte));
+    banc.routes.memoire = Some(m);
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::CONFLICT, Some("memoire_incomplete"))
+    );
+}
+
+/// #8514 (relecture) — un secteur resté illisible au chargement est du
+/// silence en mémoire : l'enregistrement est refusé et le dit, au lieu
+/// d'écrire un FLAC « parfait » qui ne l'est pas. Une demande refusée
+/// (destination invalide) ne garde pas la mémoire retenue.
+#[tokio::test]
+async fn des_secteurs_perdus_au_chargement_refusent_l_enregistrement() {
+    let l = simule();
+    l.faire_echouer(50, u32::MAX);
+    let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let m = charger_en_memoire(&mut banc, &l).await;
+    assert_eq!(m.progression().unwrap().secteurs_perdus, 1);
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::CONFLICT, Some("memoire_secteurs_perdus")),
+        "{v}"
+    );
+    assert_eq!(v["secteurs_perdus"], 1);
+    assert!(banc.ex.liste().is_empty());
+    assert!(!m.enregistrement_en_cours());
+    m.liberer();
+
+    // Sans perte, une destination refusée relâche aussi la retenue.
+    let l = simule();
+    let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let m = charger_en_memoire(&mut banc, &l).await;
+    let (code, _) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true, "destination": "/hors/bibliotheque" })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(
+        !m.enregistrement_en_cours(),
+        "retenue restée après un refus"
+    );
+    m.liberer();
+}
+
+/// Une pochette qui attend le feu vert du témoin : l'enregistrement reste
+/// en cours tant qu'on ne l'a pas donné.
+struct PochetteRetenue(Arc<tokio::sync::Notify>);
+#[async_trait]
+impl Pochettes for PochetteRetenue {
+    async fn telecharger(&self, _: &str) -> Option<Vec<u8>> {
+        self.0.notified().await;
+        Some(JPEG.to_vec())
+    }
+}
+
+/// #8514 (relecture) — la mémoire est retenue PENDANT tout l'enregistrement
+/// (le surveillant ne rend pas un disque gardé qu'on lit), puis relâchée.
+#[tokio::test]
+async fn la_memoire_est_retenue_pendant_tout_l_enregistrement() {
+    let l = simule();
+    let mut banc = Banc::new(l.clone(), Arc::new(AvecMusicBrainz));
+    let feu = Arc::new(tokio::sync::Notify::new());
+    let ex = Arc::new(
+        Extractions::new(
+            banc.backend.clone(),
+            Some(banc.bus.clone()),
+            Some(banc.scan.clone()),
+        )
+        .avec_pochettes(Arc::new(PochetteRetenue(feu.clone()))),
+    );
+    banc.ex = ex.clone();
+    banc.routes.extraction = Some(ex);
+    let m = charger_en_memoire(&mut banc, &l).await;
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::ACCEPTED, "{v}");
+    assert!(
+        m.enregistrement_en_cours(),
+        "mémoire non retenue pendant l'enregistrement"
+    );
+    feu.notify_one();
+    let fin = banc.attendre(v["id"].as_str().unwrap()).await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+    for _ in 0..200 {
+        if !m.enregistrement_en_cours() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!m.enregistrement_en_cours(), "retenue jamais relâchée");
+    m.liberer();
 }
