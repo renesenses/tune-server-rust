@@ -981,7 +981,8 @@ pub(super) async fn album_en_cours(
         && let Some(album) = c.id.as_deref().filter(|s| !s.trim().is_empty())
     {
         let service = c.service.as_deref().unwrap_or("local");
-        return Json(reponse(id, service, album, None, "queue_context")).into_response();
+        let album = album_plutot_que_sa_piste(service, album.to_string()).await;
+        return Json(reponse(id, service, &album, None, "queue_context")).into_response();
     }
 
     // 1. Le geste — seulement pour une ligne sans conteneur propre.
@@ -996,7 +997,8 @@ pub(super) async fn album_en_cours(
         // #1361 ; la bibliothèque est le seul autre espace de noms possible,
         // et c'est le mot que `contexte_de_lecture` y écrit.
         let service = ps.session_context_source.as_deref().unwrap_or("local");
-        return Json(reponse(id, service, album, None, "session_context")).into_response();
+        let album = album_plutot_que_sa_piste(service, album.to_string()).await;
+        return Json(reponse(id, service, &album, None, "session_context")).into_response();
     }
 
     let Some(np) = ps.now_playing.as_ref() else {
@@ -1074,10 +1076,34 @@ pub(super) async fn album_en_cours(
     //    ne savait donc rien. La référence que Tune a déjà rangée pour cette
     //    piste (file, favoris, historique : `reference_d_album_bandcamp`, la
     //    même recherche que la resignature du flux) prend alors le relais.
+    drop(svc);
+    drop(registre);
     match album_de_la_file {
-        Some((album, origine)) => Json(reponse(id, source, &album, None, origine)).into_response(),
+        Some((album, origine)) => {
+            let album = album_plutot_que_sa_piste(source, album).await;
+            Json(reponse(id, source, &album, None, origine)).into_response()
+        }
         None => rien(id, raison),
     }
+}
+
+/// #7591 (FabienM, fil 2559 point 12) — une référence Bandcamp rangée peut
+/// être la page de la PISTE (`/track/…`) : un titre acheté ou mis en favori
+/// seul n'en a pas d'autre. Servie telle quelle, la vignette ouvrait une
+/// fiche d'une seule piste, au titre du morceau. La page de piste nomme son
+/// album : on ouvre celui-là. Sans album (un single), page muette ou autre
+/// service : la référence reste celle d'avant.
+async fn album_plutot_que_sa_piste(source: &str, album: String) -> String {
+    #[cfg(feature = "bandcamp")]
+    if source == "bandcamp"
+        && tune_bandcamp::est_une_page_de_piste(&album)
+        && let Some(parent) = tune_bandcamp::page_d_album_d_une_piste(&album).await
+    {
+        return parent;
+    }
+    #[cfg(not(feature = "bandcamp"))]
+    let _ = source;
+    album
 }
 
 /// La référence d'album qu'une piste Bandcamp a déjà laissée dans la base
