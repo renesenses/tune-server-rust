@@ -562,6 +562,10 @@ pub(crate) fn build_smart_query_rapport(
         format!("WHERE {}", conditions.join(joiner))
     };
 
+    // #7769, #8416 — le tri par nombre d'écoutes compte comme la
+    // Bibliothèque (historique + écoutes importées), et non par la colonne
+    // morte `tracks.play_count`.
+    let ecoutes = tune_core::db::history_repo::sql::ecoutes_de_la_piste("t");
     let order = if sort_by == "random" {
         "ORDER BY RANDOM()".to_string()
     } else {
@@ -573,7 +577,7 @@ pub(crate) fn build_smart_query_rapport(
                 "year" => "t.year",
                 "duration" => "t.duration_ms",
                 "added_at" => "t.id",
-                "play_count" => "t.play_count",
+                "play_count" => ecoutes.as_str(),
                 _ => "t.title",
             },
             if sort_order == "desc" { "DESC" } else { "ASC" }
@@ -636,13 +640,19 @@ fn condition_hors_colonne(
     // (titre + interprète), et non par `listen_history.track_id` seul, toujours
     // NULL : ces règles ne retenaient aucune piste, « jamais » les retenait
     // toutes.
+    // 🔴 #8416 — et les écoutes IMPORTÉES (`imported_plays`, #7763), que la
+    // Bibliothèque compte : une piste écoutée seulement dans Roon ou Plex
+    // était « jamais écoutée » pour ces règles.
     let ecoute = tune_core::db::history_repo::sql::ecoute_de_la_piste("t", "he");
     let ecoutee_depuis = |seuil: String| {
         format!(
-            "EXISTS (SELECT 1 FROM listen_history he WHERE {ecoute} AND he.listened_at {seuil})"
+            "(EXISTS (SELECT 1 FROM listen_history he WHERE {ecoute} AND he.listened_at {seuil}) \
+             OR EXISTS (SELECT 1 FROM imported_plays ip \
+                        WHERE ip.track_id = t.id AND ip.last_played_at {seuil}))"
         )
     };
     let derniere = tune_core::db::history_repo::sql::derniere_ecoute_de_la_piste("t");
+    let compte = tune_core::db::history_repo::sql::ecoutes_de_la_piste("t");
     Some(match (field, op) {
         // #6143 — la date du fichier se compare en SECONDES à une borne
         // calculée en Rust : `DATETIME(t.file_mtime, 'unixepoch')` et
@@ -683,7 +693,9 @@ fn condition_hors_colonne(
             Some((lo, hi)) => format!("{derniere} BETWEEN {lo} AND {hi}"),
             None => regles_sql::FAUX.to_string(),
         },
-        ("last_played_at", "is_null") => format!("{derniere} IS NULL"),
+        // « jamais » : ni date ni écoute. Une piste importée avec un nombre
+        // d'écoutes mais sans date (liste m3u) a été écoutée (#8416).
+        ("last_played_at", "is_null") => format!("({derniere} IS NULL AND {compte} = 0)"),
         ("credit", "has") => {
             let sous = value_raw
                 .and_then(|v| v.as_object())
@@ -730,13 +742,8 @@ pub(crate) fn execute_smart_track_query(
     limit_clause: &str,
 ) -> Result<Vec<Value>, AppError> {
     let where_clause = avec_le_socle_des_bannis(where_clause, profile_id);
-    // #7769 — le tri par nombre d'écoutes compte comme la Bibliothèque ; la
-    // jointure par `listen_history.track_id` (toujours NULL) rangeait toutes
-    // les pistes à zéro.
-    let order = order.replace(
-        "t.play_count",
-        &tune_core::db::history_repo::sql::ecoutes_de_la_piste("t"),
-    );
+    // Le tri par nombre d'écoutes est déjà écrit avec le compte de la
+    // Bibliothèque par `build_smart_query_rapport` (#7769, #8416).
     let sql = format!(
         // `al.is_compilation` en 10 (#1957) : la ligne porte déjà quatre
         // colonnes d'album (`al.title`, `al.id`, `al.cover_path`, l'année),

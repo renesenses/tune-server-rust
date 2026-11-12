@@ -166,6 +166,64 @@ pub(super) fn la_ligne_est_ce_qui_joue(
     }
 }
 
+/// #8446 — le bandeau porte un CODE stable et ses paramètres, que le client
+/// traduit (`erreursServeur.<code>`, `{title}`, `{seconds}`, `{cause}`) :
+/// le texte `error`, composé en français, s'affichait tel quel dans une
+/// interface en vietnamien (fil 2761). Le texte reste, pour les anciens
+/// clients et le « Détails » replié.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Bandeau {
+    pub(super) code: &'static str,
+    pub(super) message: String,
+    pub(super) params: serde_json::Value,
+}
+
+/// Code du bandeau : arrêt sans relance possible (hors file, #6925).
+pub(super) const CODE_HORS_FILE: &str = "start_stalled_out_of_queue";
+/// Code du bandeau : arrêt après une relance restée figée.
+pub(super) const CODE_ARRET: &str = "start_stalled";
+/// Code du bandeau : la relance elle-même a échoué.
+pub(super) const CODE_RELANCE_ECHOUEE: &str = "start_stalled_retry_failed";
+
+pub(super) fn bandeau_hors_file(titre: &str) -> Bandeau {
+    Bandeau {
+        code: CODE_HORS_FILE,
+        message: message_d_arret_hors_file(titre),
+        params: serde_json::json!({"title": titre, "seconds": DEMARRAGE_FIGE_SECS}),
+    }
+}
+
+pub(super) fn bandeau_d_arret(titre: &str) -> Bandeau {
+    Bandeau {
+        code: CODE_ARRET,
+        message: message_d_arret(titre),
+        params: serde_json::json!({"title": titre, "seconds": DEMARRAGE_FIGE_SECS}),
+    }
+}
+
+pub(super) fn bandeau_de_relance_echouee(titre: &str, cause: &str) -> Bandeau {
+    Bandeau {
+        code: CODE_RELANCE_ECHOUEE,
+        message: message_de_relance_echouee(titre, cause),
+        params: serde_json::json!({
+            "title": titre,
+            "seconds": DEMARRAGE_FIGE_SECS,
+            "cause": cause,
+        }),
+    }
+}
+
+/// La charge de `zone.playback_error` pour ce bandeau.
+pub(super) fn charge_du_bandeau(zone_id: i64, bandeau: &Bandeau) -> serde_json::Value {
+    serde_json::json!({
+        "zone_id": zone_id,
+        "error": bandeau.message,
+        "code": bandeau.code,
+        "params": bandeau.params,
+        "fatal": true,
+    })
+}
+
 /// Le texte du bandeau, quand ce qui joue n'est pas dans la file : aucune
 /// relance possible sans jouer autre chose (#6925).
 pub(super) fn message_d_arret_hors_file(titre: &str) -> String {
@@ -231,12 +289,8 @@ impl super::PositionPoller {
                     "demarrage_fige_hors_file_arret_6925"
                 );
                 self.oublier_la_relance(zone_id);
-                self.arreter_avec_bandeau(
-                    zone_id,
-                    appareil.as_deref(),
-                    message_d_arret_hors_file(&titre),
-                )
-                .await;
+                self.arreter_avec_bandeau(zone_id, appareil.as_deref(), bandeau_hors_file(&titre))
+                    .await;
             }
             Verdict::Relancer => {
                 // Noter AVANT d'agir : la relance recrée l'état de sondage, et
@@ -259,7 +313,7 @@ impl super::PositionPoller {
                     self.arreter_avec_bandeau(
                         zone_id,
                         appareil.as_deref(),
-                        message_de_relance_echouee(&titre, &e),
+                        bandeau_de_relance_echouee(&titre, &e),
                     )
                     .await;
                 }
@@ -273,7 +327,7 @@ impl super::PositionPoller {
                     "demarrage_fige_apres_relance_arret_5522"
                 );
                 self.oublier_la_relance(zone_id);
-                self.arreter_avec_bandeau(zone_id, appareil.as_deref(), message_d_arret(&titre))
+                self.arreter_avec_bandeau(zone_id, appareil.as_deref(), bandeau_d_arret(&titre))
                     .await;
             }
         }
@@ -287,16 +341,9 @@ impl super::PositionPoller {
 
     /// Le même canal que les autres gardes du sondeur : `zone.playback_error`,
     /// `fatal` pour que la fenêtre de grâce du client ne l'avale pas.
-    async fn arreter_avec_bandeau(&self, zone_id: i64, appareil: Option<&str>, message: String) {
+    async fn arreter_avec_bandeau(&self, zone_id: i64, appareil: Option<&str>, bandeau: Bandeau) {
         if let Some(ref bus) = self.event_bus {
-            bus.emit(
-                "zone.playback_error",
-                serde_json::json!({
-                    "zone_id": zone_id,
-                    "error": message,
-                    "fatal": true,
-                }),
-            );
+            bus.emit("zone.playback_error", charge_du_bandeau(zone_id, &bandeau));
         }
         self.orchestrator.stop(zone_id, appareil).await;
     }
@@ -305,6 +352,35 @@ impl super::PositionPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #8446 — fil 2761 : chaque bandeau porte un code stable, ses
+    /// paramètres, et garde son texte pour les anciens clients.
+    #[test]
+    fn le_bandeau_porte_un_code_traduisible_et_ses_parametres() {
+        let cas = [
+            (bandeau_d_arret("Hello"), CODE_ARRET, None),
+            (bandeau_hors_file("Hello"), CODE_HORS_FILE, None),
+            (
+                bandeau_de_relance_echouee("Hello", "flux introuvable"),
+                CODE_RELANCE_ECHOUEE,
+                Some("flux introuvable"),
+            ),
+        ];
+        for (bandeau, code, cause) in cas {
+            let charge = charge_du_bandeau(7, &bandeau);
+            assert_eq!(charge["code"], code, "{charge}");
+            assert_eq!(charge["zone_id"], 7);
+            assert_eq!(charge["fatal"], true);
+            assert_eq!(charge["params"]["title"], "Hello", "{charge}");
+            assert_eq!(charge["params"]["seconds"], DEMARRAGE_FIGE_SECS, "{charge}");
+            match cause {
+                Some(c) => assert_eq!(charge["params"]["cause"], c, "{charge}"),
+                None => assert!(charge["params"].get("cause").is_none(), "{charge}"),
+            }
+            let texte = charge["error"].as_str().unwrap();
+            assert!(texte.contains("« Hello »"), "le texte reste : {texte}");
+        }
+    }
 
     fn fige() -> Constat {
         Constat {

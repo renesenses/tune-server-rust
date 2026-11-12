@@ -3468,6 +3468,54 @@ mod tests {
         }
     }
 
+    /// #8534 — le coffret du forum (fil 2774) : un dossier par CD, nommé
+    /// `CDn - Sous-titre`, et chaque image numérotée DANS son album d'origine
+    /// (`On The Night CD1` est le CD 3 du coffret). Avant : le numéro venait
+    /// du nom de l'image, le CD 3 se disait « disque 1 », déjà pris par
+    /// Alchemy, et devenait une autre version. Le dossier dit le disque du
+    /// coffret : UN album, disques 1 à 4, et un rescan n'y change rien.
+    #[test]
+    fn un_coffret_en_dossiers_cd_sous_titre_fait_un_album_8534() {
+        let d = tempfile::TempDir::new().unwrap();
+        let coffret = d.path().join("Dire Straits - Live 1978-1992");
+        let mut disques = Vec::new();
+        let mut images = Vec::new();
+        for (n, sous_album, rang) in [
+            (1, "Alchemy", 1),
+            (2, "Alchemy", 2),
+            (3, "On The Night", 1),
+            (4, "On The Night", 2),
+        ] {
+            let disque = coffret.join(format!("CD{n} - {sous_album}"));
+            fs::create_dir_all(&disque).unwrap();
+            let nom = format!("Dire Straits - {sous_album} CD{rang}");
+            let image = disque.join(format!("{nom}.wav"));
+            ecrire_wav(&image, 4_000);
+            fs::write(
+                disque.join(format!("{nom}.cue")),
+                feuille_7751("Dire Straits", &format!("{nom}.wav")),
+            )
+            .unwrap();
+            disques.push(disque);
+            images.push(image);
+        }
+
+        let db = base();
+        for passe in 1..=2 {
+            let (_, bilan, _) = inventorier_et_ecrire(db.clone(), &disques, &racines(d.path()));
+            assert_eq!(bilan.echecs, 0, "passe {passe} : {bilan:?}");
+            let lignes = tranches_7751(&db, &images);
+            assert_eq!(lignes.len(), 8, "passe {passe} : {lignes:?}");
+            assert_eq!(
+                albums_7751(&lignes),
+                1,
+                "passe {passe} : des CD du coffret sont vus comme d'autres versions : {lignes:?}"
+            );
+            let disques: Vec<i32> = lignes.iter().map(|l| l.1).collect();
+            assert_eq!(disques, vec![1, 1, 2, 2, 3, 3, 4, 4], "passe {passe}");
+        }
+    }
+
     /// #7751 — la bibliothèque DÉJÀ scannée avant le correctif : chaque
     /// dossier `CDn` du coffret a sa propre ligne d'album. Le scan suivant
     /// doit réunir les disques sous un seul album, puis le garder ainsi ; les

@@ -1127,6 +1127,9 @@ mod radio;
 /// #2991 — le titre radio relayé par DIDL vers un renderer DLNA (opt-in par zone).
 mod titre_radio_didl_2991;
 
+/// #8480 — le `next` du lecteur d'une zone navigateur en fin de file joue la
+/// fin de file du sondeur (lecture automatique).
+mod fin_de_file_du_lecteur_8480;
 mod fin_de_piste;
 // #6932 — la zone navigateur dont la piste est finie enchaîne sans son lecteur.
 mod fin_navigateur_6932;
@@ -1138,6 +1141,12 @@ pub use refus_de_piste::{MESSAGE_TITRE_INDISPONIBLE, refus_propre_a_la_piste};
 mod sondage_accelere_4382;
 
 mod tick;
+
+/// #8483 — fichier abîmé : la zone figée sur la coupure connue passe à la
+/// piste suivante, avec un avis traduit.
+mod fichier_abime_8483;
+#[cfg(test)]
+mod fichier_abime_8483_tests;
 
 /// #5522 — piste « en lecture » dont la position reste à 0 : une relance,
 /// puis l'arrêt avec bandeau.

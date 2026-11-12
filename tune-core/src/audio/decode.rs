@@ -2339,6 +2339,9 @@ fn decode_to_pcm_streaming_inner(
     // bornée d'une tranche est ouverte par `decode_to_pcm_streaming_tranche`,
     // qui la transmet par `source_override`.
     let image_cdda = super::image_cdda::est_image_cdda(Path::new(file_path));
+    // #8483 — seul un décodage du FICHIER lui-même (ni corps HTTP, ni image de
+    // CD fenêtrée) peut noter où ce fichier s'arrête vraiment.
+    let decode_le_fichier = source_override.is_none() && !image_cdda;
     let (source_override, seek_s) = match source_override {
         None if image_cdda => {
             let fenetre =
@@ -3029,6 +3032,17 @@ fn decode_to_pcm_streaming_inner(
     // trace. À `warn` et non à `debug` parce que le journal exporté par
     // « Diagnostics » est filtré à `info` (même raison qu'`ape_ouvert`, #3311).
     integrite.trames_rendues = (source_samples_seen / source_channels.max(1) as usize) as u64;
+    // #8483 — la coupure sert désormais à la LECTURE, pas qu'au journal : le
+    // sondeur passe à la piste suivante quand la zone se fige dessus.
+    // `trames_annoncees` n'est renseigné que sur un décodage depuis le début.
+    if decode_le_fichier {
+        super::coupure_connue_8483::noter_le_releve(
+            file_path,
+            integrite.trames_annoncees,
+            integrite.trames_rendues,
+            source_rate,
+        );
+    }
     if integrite.perte_detectee() {
         tracing::warn!(
             file = file_path,

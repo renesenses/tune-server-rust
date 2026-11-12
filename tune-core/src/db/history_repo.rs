@@ -363,19 +363,72 @@ pub mod sql {
 
     /// Le nombre d'écoutes de la piste `piste`, en sous-requête corrélée :
     /// `0` pour une piste jamais écoutée, jamais NULL (#7769).
+    ///
+    /// 🔴 #8416 — c'est le nombre de la Bibliothèque
+    /// ([`super::HistoryRepo::plays_for_tracks`]) : les écoutes de
+    /// l'historique PLUS les écoutes importées (`imported_plays`, #7763). Les
+    /// deux tables ne partagent aucune ligne — un import n'écrit rien dans
+    /// l'historique — donc la somme ne compte aucune écoute deux fois ; et
+    /// `imported_plays` n'a qu'une ligne par piste (`track_id` en clé).
     pub fn ecoutes_de_la_piste(piste: &str) -> String {
         format!(
-            "(SELECT COUNT(*) FROM listen_history he WHERE {})",
-            ecoute_de_la_piste(piste, "he")
+            "((SELECT COUNT(*) FROM listen_history he WHERE {}) + {})",
+            ecoute_de_la_piste(piste, "he"),
+            ecoutes_importees_de_la_piste(piste)
+        )
+    }
+
+    /// Les écoutes importées de la piste `piste` (#7763, #8416) : `0` si
+    /// elle n'en a aucune, jamais NULL.
+    fn ecoutes_importees_de_la_piste(piste: &str) -> String {
+        format!(
+            "COALESCE((SELECT ip.play_count FROM imported_plays ip \
+             WHERE ip.track_id = {piste}.id), 0)"
         )
     }
 
     /// La dernière écoute de la piste `piste`, NULL si elle n'a jamais été
     /// écoutée (#7769) — le `MAX(listened_at)` de [`plays_for_tracks`].
+    ///
+    /// #8416 — la plus récente de l'historique et de la date importée, comme
+    /// la Bibliothèque. Les deux sont au même format (`AAAA-MM-JJTHH:MM:SSZ`,
+    /// TEXT des deux côtés) et se comparent comme des chaînes.
     pub fn derniere_ecoute_de_la_piste(piste: &str) -> String {
         format!(
-            "(SELECT MAX(he.listened_at) FROM listen_history he WHERE {})",
+            "(SELECT MAX(dates_8416.d) FROM (\
+             SELECT he.listened_at AS d FROM listen_history he WHERE {} \
+             UNION ALL \
+             SELECT ip.last_played_at AS d FROM imported_plays ip \
+             WHERE ip.track_id = {piste}.id) AS dates_8416)",
             ecoute_de_la_piste(piste, "he")
+        )
+    }
+
+    /// Les albums écoutés, pour les collections intelligentes (#8416) : une
+    /// table dérivée `(album_id, n, derniere)` — le nombre d'écoutes de
+    /// l'album (somme de celles de ses pistes, historique + importées) et sa
+    /// dernière écoute. Un album sans aucune écoute n'y figure pas ; une
+    /// piste sans album non plus (un `NULL` dans un `NOT IN` le rendrait
+    /// faux pour tous).
+    ///
+    /// Historique par la règle de la Bibliothèque ([`ecoute_de_la_piste`]),
+    /// importées par `imported_plays.track_id` : deux tables sans ligne
+    /// commune, aucune écoute comptée deux fois.
+    pub fn ecoutes_des_albums() -> String {
+        format!(
+            "(SELECT e.album_id AS album_id, CAST(SUM(e.n) AS BIGINT) AS n, \
+                     MAX(e.d) AS derniere \
+              FROM (SELECT t3.album_id AS album_id, COUNT(*) AS n, \
+                           MAX(lh.listened_at) AS d \
+                    FROM tracks t3 JOIN listen_history lh ON {} \
+                    GROUP BY t3.album_id \
+                    UNION ALL \
+                    SELECT t4.album_id AS album_id, ip.play_count AS n, \
+                           ip.last_played_at AS d \
+                    FROM tracks t4 JOIN imported_plays ip ON ip.track_id = t4.id) e \
+              WHERE e.album_id IS NOT NULL \
+              GROUP BY e.album_id)",
+            ecoute_de_la_piste("t3", "lh")
         )
     }
 
@@ -2456,6 +2509,10 @@ mod ecoutes_pistes_de_service_8062_tests;
 #[cfg(test)]
 #[path = "ecoutes_d_une_piste_locale_7980_tests.rs"]
 mod ecoutes_d_une_piste_locale_7980_tests;
+
+#[cfg(test)]
+#[path = "ecoutes_importees_regles_8416_tests.rs"]
+mod ecoutes_importees_regles_8416_tests;
 
 #[cfg(test)]
 mod tests {
