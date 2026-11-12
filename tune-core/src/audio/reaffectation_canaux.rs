@@ -150,7 +150,8 @@ pub fn regle_effective_with(
     album_id: Option<i64>,
     canaux_source: Option<u16>,
 ) -> Option<RegleEffective> {
-    if crate::audio::audiophile::zone_enabled(db, zone_id) {
+    // #8513 — ni pendant une mesure de pièce (pièce nue).
+    if crate::audio::audiophile::traitements_contournes(db, zone_id) {
         return None;
     }
     let settings = SettingsRepo::with_backend(db.clone());

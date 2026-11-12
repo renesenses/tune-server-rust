@@ -1,5 +1,6 @@
 use reqwest::Client;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{info, warn};
 
@@ -84,7 +85,7 @@ pub struct SpotifyService {
     /// jusqu'au prochain `refresh_if_needed`, qui a `&mut self`. Sans lui, un
     /// jeton révoqué produisait des 401 indéfiniment sans que rien ne tente
     /// de le renouveler.
-    token_rejected: AtomicBool,
+    token_rejected: Arc<AtomicBool>,
     /// #6933 — les portées que Spotify dit avoir ACCORDÉES (champ `scope`
     /// de la réponse du jeton, à l'échange comme au rafraîchissement).
     /// `None` : inconnues (liaison restaurée d'une version qui ne les gardait
@@ -101,6 +102,18 @@ pub struct SpotifyService {
     /// supprime la ligne de jetons. Sans cela, le service restait annoncé
     /// « Connecté » avec un jeton mort, et chaque recherche échouait.
     session_refusee: bool,
+    /// #8198 — le dernier refus de connexion portant un code stable, efface
+    /// par une connexion reussie. Le verificateur (`diagnostic`) le rapporte.
+    derniere_erreur: Option<DerniereErreur>,
+    /// #8198 — l'adresse du relais de retour quand l'option « retour
+    /// automatique » est active ; `None` (defaut) : l'adresse de retour reste
+    /// `redirect_uri`, comme avant.
+    relais: Option<String>,
+    /// #8485 — Spotify a répondu 403 à `/artists/{id}/top-tracks` : depuis
+    /// février 2026, ce point d'accès est retiré aux applications en mode
+    /// développement (celle de chaque utilisateur). Les titres phares sont
+    /// alors vides, sans erreur, et ne sont plus redemandés à Spotify.
+    titres_phares_retires: AtomicBool,
     /// #8399 — Spotify a répondu 403 à `/browse/featured-playlists` : ce
     /// point d'accès est fermé aux applications créées après le 27/11/2024.
     /// La rubrique est alors vide, sans erreur, et n'est plus redemandée.
@@ -218,6 +231,138 @@ pub const CODE_AUTORISATION_REFUSEE: &str = "spotify_autorisation_refusee";
 /// cours (autre onglet, lien ancien, serveur redemarre).
 pub const CODE_STATE_INCONNU: &str = "spotify_state_inconnu";
 
+/// #8198 — aucun Client ID configure sur ce serveur.
+pub const CODE_CLIENT_ID_ABSENT: &str = "spotify_client_id_absent";
+
+/// #8198 — `invalid_grant` a l'echange : code deja utilise, expire ou faux.
+pub const CODE_CODE_INVALIDE: &str = "spotify_code_invalide";
+
+/// #8198 — l'adresse de retour declaree dans l'application Spotify ne
+/// correspond pas a celle que Tune envoie.
+pub const CODE_REDIRECT_URI_DIFFERENTE: &str = "spotify_redirect_uri_differente";
+
+/// #8198 — `invalid_client` : Client ID inconnu de Spotify.
+pub const CODE_CLIENT_ID_REFUSE: &str = "spotify_client_id_refuse";
+
+/// #8198 — Spotify a delivre un jeton, mais `/me` repond 403 : compte absent
+/// de « User Management », ou proprietaire de l'application sans Premium
+/// (regle du mode developpement depuis fevrier 2026). Sans ce controle, la
+/// carte affichait « connecte » et tout echouait ensuite.
+pub const CODE_COMPTE_NON_AUTORISE: &str = "spotify_compte_non_autorise";
+
+const COMPTE_NON_AUTORISE: &str = "spotify: Spotify refuse l'acces a ce compte (HTTP 403). \
+     Ajoutez l'adresse e-mail de votre compte Spotify dans User Management de votre \
+     application (developer.spotify.com, tableau de bord), et verifiez que le \
+     proprietaire de l'application a un abonnement Premium";
+
+/// #8198 — le code stable d'un refus de l'echange du code (`/api/token`).
+///
+/// Spotify repond `{"error": "invalid_grant", "error_description": "Invalid
+/// redirect URI"}` quand l'adresse de retour differe de celle de
+/// l'autorisation, `invalid_grant` seul pour un code use, expire ou faux, et
+/// `invalid_client` pour un Client ID inconnu.
+pub fn code_du_refus_d_echange(erreur: &str, description: &str) -> Option<&'static str> {
+    let description = description.to_ascii_lowercase();
+    if description.contains("redirect") {
+        return Some(CODE_REDIRECT_URI_DIFFERENTE);
+    }
+    match erreur {
+        "invalid_grant" => Some(CODE_CODE_INVALIDE),
+        "invalid_client" => Some(CODE_CLIENT_ID_REFUSE),
+        _ => None,
+    }
+}
+
+/// #8198 — un echec d'appel a l'API Web, avec le statut HTTP quand Spotify
+/// a repondu. Le statut se lit ici, pas dans le texte du message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErreurApi {
+    /// `None` : pas de reponse (reseau, delai depasse) ou corps illisible.
+    pub statut: Option<u16>,
+    pub message: String,
+}
+
+/// #8198 — statut de `/me` pour un compte que l'application n'autorise pas.
+pub const STATUT_COMPTE_NON_AUTORISE: u16 = 403;
+
+impl ErreurApi {
+    fn sans_statut(message: impl Into<String>) -> Self {
+        Self {
+            statut: None,
+            message: message.into(),
+        }
+    }
+
+    /// Spotify refuse l'acces a ce compte (`403`) ?
+    pub fn compte_non_autorise(&self) -> bool {
+        self.statut == Some(STATUT_COMPTE_NON_AUTORISE)
+    }
+
+    /// Le jeton est refuse (`401`) ?
+    pub fn jeton_refuse(&self) -> bool {
+        self.statut == Some(401)
+    }
+}
+
+/// #8198 — delai d'une sonde du verificateur (`/api/token` factice, `/me`) :
+/// une page de diagnostic ne doit pas attendre un Spotify muet.
+pub const DELAI_SONDE_DIAGNOSTIC: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Un `GET` de l'API Web avec `jeton`. `401` donne `statut: Some(401)` et le
+/// message `token expired` ; l'appelant note le refus du jeton.
+async fn requete_api(
+    client: &Client,
+    api_base: &str,
+    jeton: &str,
+    path: &str,
+    delai: Option<std::time::Duration>,
+) -> Result<serde_json::Value, ErreurApi> {
+    let mut requete = client
+        .get(format!("{api_base}{path}"))
+        .header("Authorization", format!("Bearer {jeton}"));
+    if let Some(delai) = delai {
+        requete = requete.timeout(delai);
+    }
+    let resp = requete
+        .send()
+        .await
+        .map_err(|e| ErreurApi::sans_statut(format!("spotify api: {e}")))?;
+
+    if resp.status() == 401 {
+        return Err(ErreurApi {
+            statut: Some(401),
+            message: "token expired".into(),
+        });
+    }
+    // #7659 et #6825 — un refus (400, 403, 404, 429…) porte un corps JSON
+    // valide, `{"error":{"status":400,"message":"Invalid limit"}}` : le
+    // lire comme une réponse faisait passer le refus pour une recherche
+    // sans résultat ou un onglet Éditorial vide (mis en cache 30 min).
+    // C'est une erreur, journalisée avec son statut ; le chemin est
+    // journalisé sans sa requête, le motif borné à 200 caractères.
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let corps = resp.text().await.unwrap_or_default();
+        let message = motif_du_refus(&corps);
+        let route = path.split('?').next().unwrap_or(path);
+        warn!(status, route, message = %message, "spotify_api_error");
+        return Err(ErreurApi {
+            statut: Some(status),
+            message: format!("spotify GET {route}: HTTP {status} — {message}"),
+        });
+    }
+    resp.json()
+        .await
+        .map_err(|e| ErreurApi::sans_statut(format!("spotify json: {e}")))
+}
+
+/// #8198 — le dernier refus de connexion, que le verificateur rapporte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerniereErreur {
+    pub code: &'static str,
+    pub quand: std::time::SystemTime,
+}
+
 fn refus(code: &'static str, message: impl Into<String>) -> TuneError {
     TuneError::Refused {
         code,
@@ -243,6 +388,104 @@ const TENTATIVE_INCONNUE: &str = "spotify: cette adresse de retour vient d'une a
 struct TentativePkce {
     state: String,
     verifier: String,
+    /// #8198 — l'adresse de retour envoyee avec CETTE autorisation : l'echange
+    /// doit la renvoyer a l'identique, meme si le relais a ete active ou
+    /// coupe entre-temps.
+    redirect_uri: String,
+    /// #8198 — secondes Unix de l'ouverture ; au-dela de
+    /// [`DUREE_TENTATIVE_SECS`], la tentative est oubliee.
+    ouverte_le: u64,
+}
+
+/// #8198 — l'adresse du relais de retour de Mozaik Labs. Une adresse HTTPS
+/// publique et fixe, la meme pour tous : chacun la declare une fois dans SA
+/// propre application Spotify. Le relais renvoie le navigateur vers
+/// l'installation Tune dont l'origine voyage dans le `state` ; le code seul ne
+/// sert a rien sans le verificateur PKCE, qui ne quitte jamais ce serveur.
+pub const RELAIS_PAR_DEFAUT: &str = "https://mozaiklabs.fr/spotify-callback";
+
+/// #8198 — l'adresse du relais : `TUNE_SPOTIFY_RELAIS_URL` (essais), sinon
+/// [`RELAIS_PAR_DEFAUT`].
+pub fn adresse_du_relais() -> String {
+    std::env::var("TUNE_SPOTIFY_RELAIS_URL")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| RELAIS_PAR_DEFAUT.to_owned())
+}
+
+/// #8198 — duree de vie d'une autorisation entamee (persistee ou non).
+pub const DUREE_TENTATIVE_SECS: u64 = 15 * 60;
+
+fn maintenant_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// #8198 — encode un composant d'URL (requete de l'adresse de retour).
+pub fn encoder_composant(texte: &str) -> String {
+    urlencoding::encode(texte).into_owned()
+}
+
+/// #8198 — decode un composant d'URL ; le texte tel quel s'il est invalide.
+pub fn decoder_composant(texte: &str) -> String {
+    urlencoding::decode(texte)
+        .map(|v| v.into_owned())
+        .unwrap_or_else(|_| texte.to_owned())
+}
+
+/// #8198 — l'origine de la page Tune qui lance la connexion, reduite a
+/// `schema://hote[:port]`. `None` si elle n'a pas cette forme : pas
+/// d'identifiants, pas d'espace, un hote non vide (nom ASCII ou IPv6 entre
+/// crochets), un port numerique de 1 a 65535, http(s) seulement, 200 caracteres au plus.
+/// Le relais du site refait ses propres controles ; c'est le nonce du
+/// `state`, connu de ce seul serveur, qui fait foi au retour.
+pub fn normaliser_origine(origine: &str) -> Option<String> {
+    let o = origine.trim();
+    if o.len() > 200 || o.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    let (schema, reste) = o.split_once("://")?;
+    let schema = schema.to_ascii_lowercase();
+    if schema != "http" && schema != "https" {
+        return None;
+    }
+    let autorite = reste.split(['/', '?', '#']).next().unwrap_or("");
+    if autorite.is_empty() || autorite.contains('@') {
+        return None;
+    }
+    let (hote_valide, port) = match autorite.strip_prefix('[') {
+        Some(reste) => {
+            let (ip6, apres) = reste.split_once(']')?;
+            (ip6.parse::<std::net::Ipv6Addr>().is_ok(), apres)
+        }
+        None => {
+            let (hote, apres) = autorite.split_at(autorite.find(':').unwrap_or(autorite.len()));
+            let valide = !hote.is_empty()
+                && hote
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+            (valide, apres)
+        }
+    };
+    if !hote_valide {
+        return None;
+    }
+    if !port.is_empty() {
+        let chiffres = port.strip_prefix(':')?;
+        if chiffres.is_empty()
+            || chiffres.len() > 5
+            || !chiffres.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        if !(1..=65535).contains(&chiffres.parse::<u32>().ok()?) {
+            return None;
+        }
+    }
+    Some(format!("{schema}://{}", autorite.to_ascii_lowercase()))
 }
 
 /// Ce qu'une adresse de retour apporte : le code, et le `state` s'il y est.
@@ -331,6 +574,26 @@ pub fn ressemble_a_un_client_id(texte: &str) -> bool {
     t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// #8198 — le Client ID tire de ce que l'utilisateur a colle.
+///
+/// Vu en direct avec un testeur : le champ a recu l'adresse du tableau de
+/// bord Spotify au lieu du Client ID, et Spotify repondait `INVALID_CLIENT:
+/// Invalid client`. L'identifiant de cette adresse N'EST PAS le Client ID :
+/// rien n'en est tire. Seuls 32 caracteres hexadecimaux sont acceptes
+/// (espaces autour toleres) ; `None` pour tout le reste.
+pub fn client_id_depuis_saisie(saisie: &str) -> Option<String> {
+    let t = saisie.trim();
+    ressemble_a_un_client_id(t).then(|| t.to_owned())
+}
+
+/// #8198 — la saisie est-elle une adresse du tableau de bord Spotify ? Le
+/// refus le dit alors precisement.
+pub fn est_une_adresse_du_tableau_de_bord(saisie: &str) -> bool {
+    saisie
+        .to_ascii_lowercase()
+        .contains("developer.spotify.com/dashboard")
+}
+
 /// Le Client ID que le service doit employer — fil 221.
 ///
 /// Ordre de priorite, du plus fort au plus faible :
@@ -409,10 +672,13 @@ impl SpotifyService {
             api_base: API_BASE.to_owned(),
             token_expires: None,
             enabled_override: None,
-            token_rejected: AtomicBool::new(false),
+            token_rejected: Arc::new(AtomicBool::new(false)),
             portees: None,
             plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
             session_refusee: false,
+            derniere_erreur: None,
+            relais: None,
+            titres_phares_retires: AtomicBool::new(false),
             selection_retiree: AtomicBool::new(false),
         }
     }
@@ -422,6 +688,8 @@ impl SpotifyService {
     /// le nouveau : son verificateur est oublie.
     pub fn set_client_id(&mut self, client_id: &str) {
         self.client_id = client_id.trim().to_owned();
+        // #8485 — le retrait des titres phares vaut pour UNE application.
+        self.titres_phares_retires.store(false, Ordering::Relaxed);
         // #8399 — le refus de la sélection vaut pour UNE application.
         self.selection_retiree.store(false, Ordering::Relaxed);
         self.tentatives.clear();
@@ -437,18 +705,26 @@ impl SpotifyService {
     /// n'y en a plus aucune en memoire (serveur redemarre), porte
     /// [`CODE_STATE_INCONNU`] ; un code nu sans tentative garde son texte seul.
     fn tentative_pour(&self, state: Option<&str>) -> Result<usize, TuneError> {
-        if self.tentatives.is_empty() {
+        // #8198 — une tentative de plus de `DUREE_TENTATIVE_SECS` ne compte plus.
+        let maintenant = maintenant_secs();
+        let vivante =
+            |t: &TentativePkce| maintenant.saturating_sub(t.ouverte_le) < DUREE_TENTATIVE_SECS;
+        if !self.tentatives.iter().any(vivante) {
             return Err(match state {
                 Some(_) => refus(CODE_STATE_INCONNU, AUCUNE_TENTATIVE),
                 None => AUCUNE_TENTATIVE.into(),
             });
         }
         match state {
-            None => Ok(self.tentatives.len() - 1),
+            None => Ok(self
+                .tentatives
+                .iter()
+                .rposition(vivante)
+                .expect("au moins une tentative vivante")),
             Some(state) => self
                 .tentatives
                 .iter()
-                .rposition(|t| t.state == state)
+                .rposition(|t| t.state == state && vivante(t))
                 .ok_or_else(|| refus(CODE_STATE_INCONNU, TENTATIVE_INCONNUE)),
         }
     }
@@ -492,44 +768,30 @@ impl SpotifyService {
         (verifier, challenge)
     }
 
-    fn auth_url(&self, challenge: &str, state: &str) -> String {
+    fn auth_url(&self, challenge: &str, state: &str, redirect_uri: &str) -> String {
         format!(
             "{AUTH_URL}?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={challenge}&state={state}",
             urlencoding::encode(&self.client_id),
-            urlencoding::encode(&self.redirect_uri),
+            urlencoding::encode(redirect_uri),
             urlencoding::encode(SCOPES),
         )
     }
 
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
-        let token = self.access_token.as_deref().ok_or("not authenticated")?;
-        let resp = self
-            .client
-            .get(format!("{}{path}", self.api_base))
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await
-            .map_err(|e| format!("spotify api: {e}"))?;
+        self.api_get_detaille(path).await.map_err(|e| e.message)
+    }
 
-        if resp.status() == 401 {
+    /// [`Self::api_get`], le statut HTTP lisible ([`ErreurApi`]).
+    async fn api_get_detaille(&self, path: &str) -> Result<serde_json::Value, ErreurApi> {
+        let token = self
+            .access_token
+            .as_deref()
+            .ok_or_else(|| ErreurApi::sans_statut("not authenticated"))?;
+        let reponse = requete_api(&self.client, &self.api_base, token, path, None).await;
+        if matches!(&reponse, Err(e) if e.jeton_refuse()) {
             self.note_token_rejected();
-            return Err("token expired".into());
         }
-        // #7659 et #6825 — un refus (400, 403, 404, 429…) porte un corps JSON
-        // valide, `{"error":{"status":400,"message":"Invalid limit"}}` : le
-        // lire comme une réponse faisait passer le refus pour une recherche
-        // sans résultat ou un onglet Éditorial vide (mis en cache 30 min).
-        // C'est une erreur, journalisée avec son statut ; le chemin est
-        // journalisé sans sa requête, le motif borné à 200 caractères.
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let corps = resp.text().await.unwrap_or_default();
-            let message = motif_du_refus(&corps);
-            let route = path.split('?').next().unwrap_or(path);
-            warn!(status, route, message = %message, "spotify_api_error");
-            return Err(format!("spotify GET {route}: HTTP {status} — {message}"));
-        }
-        resp.json().await.map_err(|e| format!("spotify json: {e}"))
+        reponse
     }
 
     /// #8050 — taille d'une page des listes de l'utilisateur : le plafond
@@ -1020,27 +1282,124 @@ impl SpotifyService {
     }
 }
 
-#[async_trait::async_trait]
-impl StreamingService for SpotifyService {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "spotify"
-    }
-    fn enabled(&self) -> bool {
-        self.enabled_override
-            .unwrap_or(self.client_id != DEFAULT_CLIENT_ID)
+impl SpotifyService {
+    /// #8198 — l'adresse de retour envoyee a Spotify : celle du relais quand
+    /// l'option est active, sinon `redirect_uri`.
+    pub fn adresse_de_retour(&self) -> &str {
+        self.relais.as_deref().unwrap_or(&self.redirect_uri)
     }
 
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled_override = Some(enabled);
+    /// #8198 — active (`Some(adresse)`) ou coupe (`None`) le retour par le
+    /// relais. Les autorisations deja ouvertes gardent leur propre adresse.
+    pub fn regler_relais(&mut self, relais: Option<String>) {
+        self.relais = relais;
     }
 
-    async fn authenticate(
+    /// #8198 — le relais est-il actif ?
+    pub fn relais_actif(&self) -> bool {
+        self.relais.is_some()
+    }
+
+    fn oublier_les_tentatives_perimees(&mut self) {
+        let maintenant = maintenant_secs();
+        self.tentatives
+            .retain(|t| maintenant.saturating_sub(t.ouverte_le) < DUREE_TENTATIVE_SECS);
+    }
+
+    /// #8198 — les autorisations entamees, a persister : elles survivent
+    /// ainsi a un redemarrage du serveur (conteneur mis a jour entre le clic
+    /// et le retour). Le verificateur PKCE y figure : la ligne vit dans la
+    /// meme base que les jetons, et 15 minutes au plus.
+    pub fn tentatives_a_persister(&self) -> serde_json::Value {
+        let maintenant = maintenant_secs();
+        serde_json::Value::Array(
+            self.tentatives
+                .iter()
+                .filter(|t| maintenant.saturating_sub(t.ouverte_le) < DUREE_TENTATIVE_SECS)
+                .map(|t| {
+                    serde_json::json!({
+                        "state": t.state,
+                        "verifier": t.verifier,
+                        "redirect_uri": t.redirect_uri,
+                        "ouverte_le": t.ouverte_le,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// #8198 — reprend les autorisations persistees, si ce service n'en a
+    /// aucune en memoire (il vient de demarrer). Les perimees sont ignorees.
+    /// Rend le nombre de tentatives reprises.
+    pub fn reprendre_tentatives(&mut self, persistees: &serde_json::Value) -> usize {
+        if !self.tentatives.is_empty() {
+            return 0;
+        }
+        let maintenant = maintenant_secs();
+        let Some(liste) = persistees.as_array() else {
+            return 0;
+        };
+        for t in liste {
+            let (Some(state), Some(verifier), Some(redirect_uri), Some(ouverte_le)) = (
+                t["state"].as_str(),
+                t["verifier"].as_str(),
+                t["redirect_uri"].as_str(),
+                t["ouverte_le"].as_u64(),
+            ) else {
+                continue;
+            };
+            if maintenant.saturating_sub(ouverte_le) >= DUREE_TENTATIVE_SECS {
+                continue;
+            }
+            self.tentatives.push(TentativePkce {
+                state: state.to_owned(),
+                verifier: verifier.to_owned(),
+                redirect_uri: redirect_uri.to_owned(),
+                ouverte_le,
+            });
+        }
+        if self.tentatives.len() > TENTATIVES_MAX {
+            let trop = self.tentatives.len() - TENTATIVES_MAX;
+            self.tentatives.drain(..trop);
+        }
+        self.tentatives.len()
+    }
+
+    /// #8198 — les 8 premiers caracteres du Client ID en service, a comparer
+    /// avec l'adresse du tableau de bord Spotify ; `None` sans Client ID.
+    pub fn debut_du_client_id(&self) -> Option<String> {
+        self.client_id_est_configure()
+            .then(|| self.client_id.chars().take(8).collect())
+    }
+
+    /// #8198 — ce que le verificateur doit lire, copie sous le verrou : les
+    /// appels a Spotify ([`InstantaneDiagnostic::rapport`]) se font verrou
+    /// relache, pour ne bloquer ni l'ecoute ni une connexion.
+    pub fn instantane_diagnostic(&self) -> InstantaneDiagnostic {
+        InstantaneDiagnostic {
+            client: self.client.clone(),
+            client_id: self.client_id.clone(),
+            redirect_uri: self.adresse_de_retour().to_owned(),
+            relais: self.relais_actif(),
+            token_url: self.token_url.clone(),
+            api_base: self.api_base.clone(),
+            access_token: self.access_token.clone(),
+            session_refusee: self.session_refusee,
+            username: self.username.clone(),
+            derniere_erreur: self.derniere_erreur.clone(),
+            token_rejected: Arc::clone(&self.token_rejected),
+        }
+    }
+
+    /// #8198 — le verificateur, sans verrou a garder : voir
+    /// [`Self::instantane_diagnostic`].
+    pub async fn diagnostic(&self) -> serde_json::Value {
+        self.instantane_diagnostic().rapport().await
+    }
+
+    /// L'authentification proprement dite ; [`StreamingService::authenticate`]
+    /// l'enveloppe pour noter le dernier refus (#8198).
+    async fn authentifier(
         &mut self,
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, TuneError> {
@@ -1048,12 +1407,14 @@ impl StreamingService for SpotifyService {
         // `client_id=placeholder` et l'echange d'un code finissait en
         // `invalid_client` : refuser tout de suite, en disant ou le poser.
         if !self.client_id_est_configure() {
-            return Err(format!(
-                "{CLIENT_ID_ABSENT} : enregistrez celui de votre application Spotify \
-                 (developer.spotify.com, tableau de bord) dans Reglages > Acces et jetons > \
-                 Services de streaming, ou posez TUNE_SPOTIFY_CLIENT_ID"
-            )
-            .into());
+            return Err(refus(
+                CODE_CLIENT_ID_ABSENT,
+                format!(
+                    "{CLIENT_ID_ABSENT} : enregistrez celui de votre application Spotify \
+                     (developer.spotify.com, tableau de bord) dans Reglages > Acces et jetons > \
+                     Services de streaming, ou posez TUNE_SPOTIFY_CLIENT_ID"
+                ),
+            ));
         }
         // #2680 — `callback_url` : l'adresse de rappel collee depuis un autre
         // poste, ou le rappel `127.0.0.1` ne peut pas aboutir.
@@ -1084,13 +1445,14 @@ impl StreamingService for SpotifyService {
             let code = code.as_str();
             let indice = self.tentative_pour(state.as_deref())?;
             let verifier = self.tentatives[indice].verifier.clone();
+            let redirect_uri = self.tentatives[indice].redirect_uri.clone();
             let resp = self
                 .client
                 .post(&self.token_url)
                 .form(&[
                     ("grant_type", "authorization_code"),
                     ("code", code),
-                    ("redirect_uri", &self.redirect_uri),
+                    ("redirect_uri", &redirect_uri),
                     ("client_id", &self.client_id),
                     ("code_verifier", &verifier),
                 ])
@@ -1115,13 +1477,30 @@ impl StreamingService for SpotifyService {
                 } else {
                     ""
                 };
-                return Err(format!(
-                    "spotify: {err} {detail} (redirect_uri envoyee : {}){conseil}",
-                    self.redirect_uri
-                )
-                .into());
+                let message = format!(
+                    "spotify: {err} {detail} (redirect_uri envoyee : {redirect_uri}){conseil}"
+                );
+                // #8198 — un code stable pour les trois refus courants ;
+                // les autres gardent leur texte seul.
+                return Err(match code_du_refus_d_echange(err, detail) {
+                    Some(code) => refus(code, message),
+                    None => message.into(),
+                });
             }
             self.tentatives.clear();
+
+            // #8198 — la session en place, rendue telle quelle si Spotify
+            // refuse ce compte (`/me` en 403) : un essai rate ne doit pas
+            // deconnecter un utilisateur dont la liaison marche.
+            let session_valide = self.access_token.is_some()
+                && !self.session_refusee
+                && !self.token_rejected.load(Ordering::Relaxed);
+            let session_precedente = (
+                self.access_token.take(),
+                self.refresh_token.take(),
+                self.portees.take(),
+                self.token_expires.take(),
+            );
 
             self.access_token = data["access_token"].as_str().map(Into::into);
             self.refresh_token = data["refresh_token"].as_str().map(Into::into);
@@ -1130,7 +1509,31 @@ impl StreamingService for SpotifyService {
             self.token_expires =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(expires_in));
             self.token_rejected.store(false, Ordering::Relaxed);
-            let me = self.api_get("/me").await.ok();
+            // #8198 — en mode developpement, Spotify delivre le jeton a un
+            // compte absent de « User Management » (ou dont l'application a
+            // un proprietaire sans Premium), puis refuse chaque appel en 403.
+            // Le constater ICI, et ne pas garder une liaison inutilisable.
+            let me = match self.api_get_detaille("/me").await {
+                Ok(me) => Some(me),
+                Err(e) if e.compte_non_autorise() => {
+                    warn!(motif = %e.message, "spotify_compte_non_autorise");
+                    if session_valide {
+                        (
+                            self.access_token,
+                            self.refresh_token,
+                            self.portees,
+                            self.token_expires,
+                        ) = session_precedente;
+                    } else {
+                        self.access_token = None;
+                        self.refresh_token = None;
+                        self.portees = None;
+                        self.token_expires = None;
+                    }
+                    return Err(refus(CODE_COMPTE_NON_AUTORISE, COMPTE_NON_AUTORISE));
+                }
+                Err(_) => None,
+            };
             self.username = me
                 .as_ref()
                 .and_then(|v| v["display_name"].as_str().map(Into::into));
@@ -1140,9 +1543,32 @@ impl StreamingService for SpotifyService {
         }
 
         let (verifier, challenge) = Self::generate_pkce();
-        let state = base64url_encode(&octets_aleatoires::<16>());
-        let url = self.auth_url(&challenge, &state);
-        self.tentatives.push(TentativePkce { state, verifier });
+        let nonce = base64url_encode(&octets_aleatoires::<16>());
+        // #8198 — relais actif : l'origine de la page Tune voyage dans le
+        // `state` (`<nonce>.<origine en base64url>`), pour que le relais
+        // sache ou renvoyer le navigateur. Sans origine, le nonce seul : le
+        // relais n'offre alors que l'adresse a copier.
+        let redirect_uri = self.adresse_de_retour().to_owned();
+        let state = match (
+            &self.relais,
+            credentials
+                .get("origine")
+                .and_then(|v| v.as_str())
+                .and_then(normaliser_origine),
+        ) {
+            (Some(_), Some(origine)) => {
+                format!("{nonce}.{}", base64url_encode(origine.as_bytes()))
+            }
+            _ => nonce,
+        };
+        let url = self.auth_url(&challenge, &state, &redirect_uri);
+        self.oublier_les_tentatives_perimees();
+        self.tentatives.push(TentativePkce {
+            state,
+            verifier,
+            redirect_uri,
+            ouverte_le: maintenant_secs(),
+        });
         if self.tentatives.len() > TENTATIVES_MAX {
             let trop = self.tentatives.len() - TENTATIVES_MAX;
             self.tentatives.drain(..trop);
@@ -1152,6 +1578,248 @@ impl StreamingService for SpotifyService {
             verification_url: Some(url),
             ..Default::default()
         })
+    }
+}
+
+/// #8198 — copie de l'etat du service pour le verificateur de configuration,
+/// prise sous le verrou puis lue sans lui.
+pub struct InstantaneDiagnostic {
+    client: Client,
+    client_id: String,
+    /// L'adresse de retour envoyee a Spotify (celle du relais s'il est actif).
+    redirect_uri: String,
+    relais: bool,
+    token_url: String,
+    api_base: String,
+    access_token: Option<String>,
+    session_refusee: bool,
+    username: Option<String>,
+    derniere_erreur: Option<DerniereErreur>,
+    token_rejected: Arc<AtomicBool>,
+}
+
+impl InstantaneDiagnostic {
+    /// #8198 — Spotify accepte-t-il ce Client ID ? Un echange de code factice
+    /// (`/api/token`) repond `invalid_client` (« Failed to get client ») quand
+    /// il le refuse (`refuse`), `invalid_grant` sinon (`accepte`). Aucun
+    /// compte n'est en jeu. `non_verifie` si Spotify ne repond pas. Un refus
+    /// ne prouve pas que l'identifiant est faux : application supprimee ou
+    /// desactivee, proprietaire sans Premium (mode developpement) sont des
+    /// causes possibles (voir `rapport`). Delai : [`DELAI_SONDE_DIAGNOSTIC`].
+    async fn sonder_client_id(&self) -> &'static str {
+        let reponse = self
+            .client
+            .post(&self.token_url)
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", "tune-diagnostic-code-factice"),
+                ("redirect_uri", &self.redirect_uri),
+                ("client_id", &self.client_id),
+                (
+                    "code_verifier",
+                    "tune-diagnostic-verificateur-factice-0123456789",
+                ),
+            ])
+            .timeout(DELAI_SONDE_DIAGNOSTIC)
+            .send()
+            .await;
+        let Ok(reponse) = reponse else {
+            return "non_verifie";
+        };
+        match reponse.json::<serde_json::Value>().await {
+            Ok(v) if v["error"] == "invalid_client" => "refuse",
+            Ok(_) => "accepte",
+            Err(_) => "non_verifie",
+        }
+    }
+
+    /// #8198 — le verificateur de configuration (`GET
+    /// /streaming/spotify/diagnostic`) : ce qui ne va pas, dit precisement.
+    ///
+    /// Tune ne peut pas lire le tableau de bord Spotify. Il dit donc ce qu'il
+    /// sait : son Client ID, l'adresse de retour qu'il envoie (a declarer a
+    /// l'identique), l'etat de la liaison, et, si elle existe, ce que
+    /// repond `GET /me` (403 : compte absent de User Management ou
+    /// proprietaire sans Premium). `premium` vient de `/me.product`, que le
+    /// mode developpement ne renvoie plus depuis fevrier 2026 : `inconnu`.
+    pub async fn rapport(self) -> serde_json::Value {
+        let mut a_corriger: Vec<String> = Vec::new();
+
+        let client_id = if !client_id_configure(&self.client_id) {
+            a_corriger.push("client_id_absent".into());
+            "absent"
+        } else if !ressemble_a_un_client_id(&self.client_id) {
+            a_corriger.push("client_id_forme_invalide".into());
+            "forme_invalide"
+        } else {
+            "ok"
+        };
+        // Retour d'un testeur (09/11) : le Client ID enregistre n'etait pas
+        // celui de son application. Spotify le dit sans qu'aucun compte se
+        // connecte : un echange de code factice repond `invalid_client` pour
+        // un identifiant qu'il ne connait pas. Les 8 premiers caracteres se
+        // comparent a l'adresse du tableau de bord (un Client ID n'est pas un
+        // secret).
+        let accueil_spotify = if client_id == "ok" {
+            let accueil = self.sonder_client_id().await;
+            if accueil == "refuse" {
+                a_corriger.push("client_id_refuse_par_spotify".into());
+            }
+            accueil
+        } else {
+            "non_verifie"
+        };
+        // Retour d'un testeur (09/11) : `INVALID_CLIENT: Invalid client` avec
+        // un Client ID pourtant correct (verifie dans Settings › Basic
+        // Information). Les causes probables, a verifier dans l'ordre.
+        let refus_du_client = accueil_spotify == "refuse"
+            || self
+                .derniere_erreur
+                .as_ref()
+                .is_some_and(|d| d.code == CODE_CLIENT_ID_REFUSE);
+        let causes_possibles: Vec<&str> = if refus_du_client {
+            vec![
+                "connexion_lancee_avant_le_client_id",
+                "proprietaire_sans_premium",
+                "application_supprimee_ou_desactivee",
+            ]
+        } else {
+            Vec::new()
+        };
+        let debut = client_id_configure(&self.client_id)
+            .then(|| self.client_id.chars().take(8).collect::<String>());
+
+        let redirect = match refus_redirection(&self.redirect_uri) {
+            None => "ok",
+            Some(RefusRedirection::Localhost) => {
+                a_corriger.push("redirect_localhost".into());
+                "localhost"
+            }
+            Some(RefusRedirection::HttpHorsBouclage) => {
+                a_corriger.push("redirect_http_hors_bouclage".into());
+                "http_hors_bouclage"
+            }
+        };
+
+        let connexion = if self.access_token.is_some() {
+            "connecte"
+        } else if self.session_refusee {
+            a_corriger.push("session_expiree".into());
+            "session_expiree"
+        } else {
+            a_corriger.push("non_connecte".into());
+            "non_connecte"
+        };
+
+        let (acces, detail, premium) = if self.access_token.is_none() {
+            ("non_verifie", None, "inconnu")
+        } else {
+            let jeton = self.access_token.as_deref().unwrap_or_default();
+            let me = requete_api(
+                &self.client,
+                &self.api_base,
+                jeton,
+                "/me",
+                Some(DELAI_SONDE_DIAGNOSTIC),
+            )
+            .await;
+            if matches!(&me, Err(e) if e.jeton_refuse()) {
+                // Le prochain rafraichissement renouvellera le jeton.
+                self.token_rejected.store(true, Ordering::Relaxed);
+            }
+            match me {
+                Ok(me) => {
+                    let premium = match me["product"].as_str() {
+                        Some("premium") => "oui",
+                        Some(_) => {
+                            a_corriger.push("premium_absent".into());
+                            "non"
+                        }
+                        None => "inconnu",
+                    };
+                    ("ok", None, premium)
+                }
+                Err(e) if e.compte_non_autorise() => {
+                    a_corriger.push("compte_non_autorise".into());
+                    ("compte_non_autorise", Some(e.message), "inconnu")
+                }
+                Err(e) if e.jeton_refuse() => {
+                    a_corriger.push("jeton_refuse".into());
+                    ("jeton_refuse", Some(e.message), "inconnu")
+                }
+                Err(e) => ("erreur", Some(e.message), "inconnu"),
+            }
+        };
+
+        let derniere = self.derniere_erreur.as_ref().map(|d| {
+            a_corriger.push(d.code.to_owned());
+            serde_json::json!({
+                "code": d.code,
+                "quand": chrono::DateTime::<chrono::Utc>::from(d.quand)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            })
+        });
+
+        serde_json::json!({
+            "service": "spotify",
+            "client_id": {
+                "etat": client_id,
+                "spotify": accueil_spotify,
+                "debut": debut,
+                "causes_possibles": causes_possibles,
+            },
+            "redirect_uri": {
+                "valeur": self.redirect_uri,
+                "etat": redirect,
+                "relais": self.relais,
+            },
+            "connexion": { "etat": connexion, "compte": self.username },
+            "acces_api": { "etat": acces, "detail": detail },
+            "premium": { "etat": premium },
+            "derniere_erreur": derniere,
+            "a_corriger": a_corriger,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamingService for SpotifyService {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "spotify"
+    }
+    fn enabled(&self) -> bool {
+        self.enabled_override
+            .unwrap_or(self.client_id != DEFAULT_CLIENT_ID)
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled_override = Some(enabled);
+    }
+
+    async fn authenticate(
+        &mut self,
+        credentials: &serde_json::Value,
+    ) -> Result<AuthStatus, TuneError> {
+        let issue = self.authentifier(credentials).await;
+        // #8198 — le verificateur rapporte le dernier refus code ; une
+        // connexion reussie l'efface.
+        match &issue {
+            Err(TuneError::Refused { code, .. }) => {
+                self.derniere_erreur = Some(DerniereErreur {
+                    code,
+                    quand: std::time::SystemTime::now(),
+                });
+            }
+            Ok(status) if status.authenticated => self.derniere_erreur = None,
+            _ => {}
+        }
+        issue
     }
 
     async fn auth_status(&self) -> AuthStatus {
@@ -1171,6 +1839,7 @@ impl StreamingService for SpotifyService {
         self.portees = None;
         self.token_rejected.store(false, Ordering::Relaxed);
         self.session_refusee = false;
+        self.titres_phares_retires.store(false, Ordering::Relaxed);
         self.selection_retiree.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -1375,9 +2044,28 @@ impl StreamingService for SpotifyService {
     }
 
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        let data = self
+        // #8485 — retiré par Spotify à cette application : section vide, sans
+        // nouvel appel. La route complète ensuite la liste par ses autres
+        // sources (écoutes de ce serveur).
+        if self.titres_phares_retires.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
+        let data = match self
             .api_get(&format!("/artists/{artist_id}/top-tracks"))
-            .await?;
+            .await
+        {
+            Ok(d) => d,
+            Err(e) if statut_du_refus(&e) == Some(403) => {
+                if !self.titres_phares_retires.swap(true, Ordering::Relaxed) {
+                    info!(
+                        route = "/artists/{id}/top-tracks",
+                        "spotify_point_d_acces_retire"
+                    );
+                }
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e.into()),
+        };
         Ok(data["tracks"]
             .as_array()
             .map(|i| i.iter().map(Self::map_track).collect())
@@ -1775,7 +2463,9 @@ fn motif_du_refus(corps: &str) -> String {
         .trim();
     message.chars().take(200).collect()
 }
-fn base64url_encode(data: &[u8]) -> String {
+/// Base64url sans remplissage (RFC 4648 §5) : verificateur, `state`, origine
+/// du relais (#8198).
+pub fn base64url_encode(data: &[u8]) -> String {
     let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut output = String::new();
     let mut buf: u32 = 0;
@@ -2088,7 +2778,7 @@ mod tests {
             Some("https://tune.example/api/v1/streaming/spotify/callback"),
             DEFAULT_API_PORT,
         );
-        let url = svc.auth_url("challenge-test", "etat-test");
+        let url = svc.auth_url("challenge-test", "etat-test", &svc.redirect_uri);
 
         assert!(url.contains("client_id=client-test"));
         assert!(url.contains(
@@ -2961,6 +3651,9 @@ mod tests {
 mod recherche_7659_tests;
 
 #[cfg(test)]
+#[path = "spotify_relais_8198_tests.rs"]
+mod relais_8198_tests;
+#[cfg(test)]
 #[path = "spotify_session_refusee_8051_tests.rs"]
 mod session_refusee_8051_tests;
 
@@ -2971,6 +3664,10 @@ mod favoris_pagination_8050_tests;
 #[cfg(test)]
 #[path = "spotify_playlists_items_8193_tests.rs"]
 mod playlists_items_8193_tests;
+
+#[cfg(test)]
+#[path = "spotify_titres_phares_8485_tests.rs"]
+mod titres_phares_8485_tests;
 
 #[cfg(test)]
 #[path = "spotify_albums_artiste_8479_tests.rs"]

@@ -280,6 +280,9 @@ pub(super) struct ZonePollState {
     /// #7922 — la position et l'instant du dernier relevé compté ; `None`
     /// après un déplacement, une pause ou un changement de piste.
     pub(super) tune_tested_releve: Option<(u64, Instant)>,
+    /// #8483 — la position d'une sortie `Playing` qui ne bouge plus, pour
+    /// reconnaître le gel sur la coupure connue d'un fichier abîmé.
+    pub(super) gel_sur_coupure: Option<super::fichier_abime_8483::SuiviDuGel>,
 }
 
 impl ZonePollState {
@@ -346,6 +349,7 @@ impl ZonePollState {
             octets_du_demarrage: None,
             tune_tested_rendu_ms: 0,
             tune_tested_releve: None,
+            gel_sur_coupure: None,
         }
     }
 

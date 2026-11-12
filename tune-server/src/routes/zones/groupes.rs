@@ -710,7 +710,51 @@ pub(super) async fn group_volume(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
     Json(body): Json<GroupVolumeRequest>,
-) -> Result<impl IntoResponse, AppError> {
+) -> axum::response::Response {
+    appliquer_le_volume_du_groupe(&state, group_id, body.master_volume, body.offsets).await
+}
+
+/// #8445 — le volume que chaque membre d'un groupe reçoit du volume maître.
+///
+/// `effectif = maître + décalage du membre`, borné à 0..1. Le décalage vient
+/// de la requête si elle en porte, sinon de ceux que le groupe a ENREGISTRÉS :
+/// avant #8445, une requête qui ne portait que `master_volume` (le curseur du
+/// client web) remettait chaque décalage à zéro à l'application, alors même
+/// que le groupe les gardait en base. Un membre en volume fixe (#2811) n'en
+/// reçoit aucun : il reste à 100 %, bit-perfect.
+pub(crate) fn volumes_des_membres(
+    zone_ids: &[i64],
+    master: f64,
+    decalages: &serde_json::Map<String, Value>,
+    fixes: &[i64],
+) -> Vec<(i64, f64)> {
+    zone_ids
+        .iter()
+        .filter(|zid| !fixes.contains(zid))
+        .map(|zid| {
+            let decalage = decalages
+                .get(&zid.to_string())
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            (*zid, (master + decalage).clamp(0.0, 1.0))
+        })
+        .collect()
+}
+
+/// #8445 — `POST /zones/groups/{id}/volume` et `POST
+/// /zone-manager/groups/{id}/volume` : un seul chemin pour le volume maître.
+///
+/// Les deux routes portaient chacune une copie de ce code. Un membre qui
+/// refuse le volume (verrou PURE, appareil injoignable) ne prive plus les
+/// suivants du leur : ils sont tous servis, et la réponse nomme ceux qui ont
+/// refusé (`zones_refusees`). Seul un groupe dont AUCUN membre n'a accepté
+/// rend l'erreur du premier refus.
+pub(crate) async fn appliquer_le_volume_du_groupe(
+    state: &AppState,
+    group_id: i64,
+    master_volume: Option<f64>,
+    offsets: Option<std::collections::HashMap<String, f64>>,
+) -> axum::response::Response {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -719,53 +763,76 @@ pub(super) async fn group_volume(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let idx = groups
+    let Some(i) = groups
         .iter()
-        .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
-    match idx {
-        Some(i) => {
-            let master = body
-                .master_volume
-                .unwrap_or(groups[i]["master_volume"].as_f64().unwrap_or(0.5));
-            groups[i]["master_volume"] = json!(master);
-            if let Some(ref offsets) = body.offsets {
-                groups[i]["offsets"] = json!(offsets);
-            }
-            let zone_ids: Vec<i64> = groups[i]["zone_ids"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
-                .unwrap_or_default();
-            settings
-                .set("zone_groups", &serde_json::to_string(&groups)?)
-                .ok();
-
-            for zid in &zone_ids {
-                let offset = body
-                    .offsets
-                    .as_ref()
-                    .and_then(|o| o.get(&zid.to_string()))
-                    .copied()
-                    .unwrap_or(0.0);
-                let effective = (master + offset).clamp(0.0, 1.0);
-                let device_id = ZoneRepo::with_backend(state.backend.clone())
-                    .get(*zid)
-                    .ok()
-                    .flatten()
-                    .and_then(|zone| zone.output_device_id);
-                if let Err(error) = state
-                    .orchestrator
-                    .set_volume(*zid, effective, device_id.as_deref())
-                    .await
-                {
-                    return Ok(crate::routes::playback::output_command_error_response(
-                        error,
-                    ));
-                }
-            }
-            Ok(Json(json!({"group_id": group_id, "master_volume": master})).into_response())
-        }
-        None => Ok(StatusCode::NOT_FOUND.into_response()),
+        .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let master = master_volume
+        .unwrap_or(groups[i]["master_volume"].as_f64().unwrap_or(0.5))
+        .clamp(0.0, 1.0);
+    groups[i]["master_volume"] = json!(master);
+    if let Some(ref offsets) = offsets {
+        groups[i]["offsets"] = json!(offsets);
     }
+    let decalages = groups[i]["offsets"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let zone_ids: Vec<i64> = groups[i]["zone_ids"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+    if let Ok(texte) = serde_json::to_string(&groups) {
+        settings.set("zone_groups", &texte).ok();
+    }
+
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let fixes: Vec<i64> = zone_ids
+        .iter()
+        .copied()
+        .filter(|zid| {
+            repo.get(*zid)
+                .ok()
+                .flatten()
+                .is_some_and(|zone| zone.fixed_volume)
+        })
+        .collect();
+    let mut acceptees = 0usize;
+    let mut refusees = Vec::new();
+    let mut premier_refus = None;
+    for (zid, effectif) in volumes_des_membres(&zone_ids, master, &decalages, &fixes) {
+        let device_id = repo
+            .get(zid)
+            .ok()
+            .flatten()
+            .and_then(|zone| zone.output_device_id);
+        match state
+            .orchestrator
+            .set_volume(zid, effectif, device_id.as_deref())
+            .await
+        {
+            Ok(()) => acceptees += 1,
+            Err(error) => {
+                warn!(group_id, zone_id = zid, error = ?error, "zone_group_volume_member_refused");
+                refusees.push(zid);
+                premier_refus.get_or_insert(error);
+            }
+        }
+    }
+    if acceptees == 0
+        && let Some(error) = premier_refus
+    {
+        return crate::routes::playback::output_command_error_response(error);
+    }
+    Json(json!({
+        "group_id": group_id,
+        "master_volume": master,
+        "zones_volume_fixe": fixes,
+        "zones_refusees": refusees,
+    }))
+    .into_response()
 }
 
 pub(super) async fn calibrate_group(

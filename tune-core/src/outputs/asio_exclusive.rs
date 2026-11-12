@@ -29,6 +29,7 @@ use crate::audio::volume_scale::gain_des_unites;
 use super::canaux_de_carte_6171::{CanauxDeCarte, Dispersion, PlanDeCanaux, remplir_le_tampon};
 use super::local::gain_au_rendu_7264::GainAuRendu;
 use super::local::{NativePcmRing, RingBuf};
+use super::quantification_au_rendu_7703::QuantificationAuRendu;
 use super::silence_avant_liberation_6133::{
     BORNE_SILENCE_AVANT_LIBERATION, SilenceAvantLiberation, remplir_le_bloc_dsd_natif,
 };
@@ -882,6 +883,7 @@ impl AsioExclusiveOutput {
             }
             AsioTransport::ProcessedI32(_) => {
                 let errors = counters.clone();
+                let mut quantification = QuantificationAuRendu::new(32);
                 let mut dispersion = plan.cloned().map(|p| Dispersion::new(p, 0i32));
                 device
                     .build_output_stream(
@@ -893,12 +895,8 @@ impl AsioExclusiveOutput {
                             }
                             let volume = gain_des_unites(volume.load(Ordering::Relaxed));
                             if remplir_le_tampon(data, &mut dispersion, 0, |d| {
-                                float_ring.pop_mapped(d, |sample| {
-                                    let scaled = (f64::from(sample) * volume * 2_147_483_648.0)
-                                        .round()
-                                        .clamp(i32::MIN as f64, i32::MAX as f64);
-                                    scaled as i32
-                                })
+                                float_ring
+                                    .pop_mapped(d, |sample| quantification.rendre(sample, volume))
                             }) {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
@@ -912,6 +910,7 @@ impl AsioExclusiveOutput {
             }
             AsioTransport::ProcessedI24(_) => {
                 let errors = counters.clone();
+                let mut quantification = QuantificationAuRendu::new(24);
                 let mut dispersion = plan.cloned().map(|p| Dispersion::new(p, I24_ZERO));
                 device
                     .build_output_stream(
@@ -925,11 +924,7 @@ impl AsioExclusiveOutput {
                             let volume = gain_des_unites(volume.load(Ordering::Relaxed));
                             if remplir_le_tampon(data, &mut dispersion, zero, |d| {
                                 float_ring.pop_mapped(d, |sample| {
-                                    let scaled = (f64::from(sample) * volume * 8_388_608.0)
-                                        .round()
-                                        .clamp(-8_388_608.0, 8_388_607.0)
-                                        as i32;
-                                    i24_borne(scaled)
+                                    i24_borne(quantification.rendre(sample, volume))
                                 })
                             }) {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
@@ -944,6 +939,7 @@ impl AsioExclusiveOutput {
             }
             AsioTransport::ProcessedI16(_) => {
                 let errors = counters.clone();
+                let mut quantification = QuantificationAuRendu::new(16);
                 let mut dispersion = plan.cloned().map(|p| Dispersion::new(p, 0i16));
                 device
                     .build_output_stream(
@@ -956,10 +952,7 @@ impl AsioExclusiveOutput {
                             let volume = gain_des_unites(volume.load(Ordering::Relaxed));
                             if remplir_le_tampon(data, &mut dispersion, 0, |d| {
                                 float_ring.pop_mapped(d, |sample| {
-                                    let scaled = (f64::from(sample) * volume * 32_768.0)
-                                        .round()
-                                        .clamp(i16::MIN as f64, i16::MAX as f64);
-                                    scaled as i16
+                                    quantification.rendre(sample, volume) as i16
                                 })
                             }) {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
