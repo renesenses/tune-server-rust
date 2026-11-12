@@ -703,6 +703,7 @@ async fn add_streaming_favorite(
             isrc: body.isrc.clone(),
             created_at: None,
             annee_qualite: Default::default(),
+            album_ref: None,
         };
         return match tune_core::streaming::favorites_mirror::ajouter(&arc, &state.backend, id, &fav)
             .await
