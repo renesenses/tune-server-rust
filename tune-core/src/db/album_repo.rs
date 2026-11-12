@@ -4053,13 +4053,15 @@ impl AlbumRepo {
         Ok(par_id)
     }
 
-    /// #7725 — le plus grand nombre de canaux des pistes de chaque album de
-    /// `ids`, en une requête groupée par paquet. Un album absent de la table
-    /// rendue n'a aucune piste dont le nombre de canaux soit connu.
-    pub fn canaux_max_par_album(
+    /// #7725 — le plus petit et le plus grand nombre de canaux des pistes de
+    /// chaque album de `ids` (`(min, max)`), en une requête groupée par
+    /// paquet. Le plus petit sert au filtre Stéréo (#8560). Un album absent
+    /// de la table rendue n'a aucune piste dont le nombre de canaux soit
+    /// connu.
+    pub fn canaux_min_max_par_album(
         &self,
         ids: &[i64],
-    ) -> Result<std::collections::HashMap<i64, i64>, TuneError> {
+    ) -> Result<std::collections::HashMap<i64, (i64, i64)>, TuneError> {
         let mut par_id = std::collections::HashMap::new();
         for chunk in ids.chunks(5000) {
             let id_list = chunk
@@ -4068,16 +4070,18 @@ impl AlbumRepo {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT album_id, MAX(channels) FROM tracks \
+                "SELECT album_id, MIN(channels), MAX(channels) FROM tracks \
                   WHERE album_id IN ({id_list}) AND channels IS NOT NULL \
+                    AND channels > 0 \
                   GROUP BY album_id"
             );
             for row in &self.db.query_many(&sql, &[])? {
-                if let (Some(id), Some(n)) = (
+                if let (Some(id), Some(min), Some(max)) = (
                     row.first().and_then(|v| v.as_i64()),
                     row.get(1).and_then(|v| v.as_i64()),
+                    row.get(2).and_then(|v| v.as_i64()),
                 ) {
-                    par_id.insert(id, n);
+                    par_id.insert(id, (min, max));
                 }
             }
         }
@@ -4513,6 +4517,9 @@ impl AlbumRepo {
         // #7725 : Multicanal se lit sur les pistes, l'album n'a pas de canaux.
         if quality == Some(Album::QUALITE_MULTICANAL) {
             wheres.push(Album::multicanal_sql_album("a"));
+        } else if quality == Some(Album::QUALITE_STEREO) {
+            // #8560 : Stéréo se lit aussi sur les pistes.
+            wheres.push(Album::stereo_sql_album("a"));
         } else if let Some(pred) = quality.and_then(|q| Album::quality_sql(q, "a")) {
             wheres.push(pred);
         }

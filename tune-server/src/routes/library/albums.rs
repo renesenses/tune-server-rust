@@ -352,7 +352,7 @@ fn corps_de_la_page(
             tracing::warn!(error = %e, "hires_par_album a échoué — page servie sans verdict");
             std::collections::HashMap::new()
         });
-    let canaux_par_id = canaux_max_par_album(repo, &ids);
+    let canaux_par_id = canaux_par_album(repo, &ids);
     let items: Vec<Value> = items
         .iter()
         .map(|a| {
@@ -385,29 +385,31 @@ fn corps_de_la_page(
     corps
 }
 
-/// #7725 — le nombre de canaux le plus grand parmi les pistes de chaque album
-/// de `ids`, pour le filtre Multicanal du client (`max_channels` > 2). Un
-/// échec ne vide pas la liste : elle part sans `max_channels`, et le journal
-/// le dit.
-pub(super) fn canaux_max_par_album(
-    repo: &AlbumRepo,
-    ids: &[i64],
-) -> std::collections::HashMap<i64, i64> {
-    repo.canaux_max_par_album(ids).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "canaux_max_par_album a échoué — liste servie sans canaux");
+/// Les canaux de chaque album, `(min, max)` sur ses pistes.
+pub(super) type CanauxParAlbum = std::collections::HashMap<i64, (i64, i64)>;
+
+/// #7725 — le plus petit et le plus grand nombre de canaux parmi les pistes de
+/// chaque album de `ids`, pour les filtres Multicanal (`max_channels` > 2) et
+/// Stéréo (`min_channels` <= 2, #8560) du client. Un échec ne vide pas la
+/// liste : elle part sans canaux, et le journal le dit.
+pub(super) fn canaux_par_album(repo: &AlbumRepo, ids: &[i64]) -> CanauxParAlbum {
+    repo.canaux_min_max_par_album(ids).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "canaux_min_max_par_album a échoué — liste servie sans canaux");
         std::collections::HashMap::new()
     })
 }
 
-/// Pose `max_channels` sur l'album, quand ses pistes le disent ; clé absente
-/// sinon. Champ additif : un client qui l'ignore lit la réponse d'avant.
+/// Pose `max_channels` et `min_channels` (#8560) sur l'album, quand ses
+/// pistes le disent ; clés absentes sinon. Champs additifs : un client qui
+/// les ignore lit la réponse d'avant.
 pub(super) fn inserer_max_channels(
     obj: &mut serde_json::Map<String, Value>,
     album: &Album,
-    canaux_par_id: &std::collections::HashMap<i64, i64>,
+    canaux_par_id: &CanauxParAlbum,
 ) {
-    if let Some(n) = album.id.and_then(|id| canaux_par_id.get(&id)) {
-        obj.insert("max_channels".into(), json!(n));
+    if let Some((min, max)) = album.id.and_then(|id| canaux_par_id.get(&id)) {
+        obj.insert("max_channels".into(), json!(max));
+        obj.insert("min_channels".into(), json!(min));
     }
 }
 
