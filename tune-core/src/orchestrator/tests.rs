@@ -1632,6 +1632,111 @@ async fn la_bascule_progressive_8558_est_cablee_jusqu_au_format_servi() {
     imposer_la_memoire_disponible(None);
 }
 
+/// #8600 (suite de #8558) — le pré-transcodage de la piste SUIVANTE suit la
+/// règle de la piste en cours : le bras fichier tient la piste entière en
+/// mémoire, une suivante trop lourde n'est donc pas pré-transcodée.
+///
+/// - piste normale (CD de 5 min) : pré-transcodée dans le cache, inchangé ;
+/// - suivante 192/24 de 15 min, VM de 4 Gio (~3,3 Gio disponibles) : rien
+///   n'est chargé ni écrit ;
+/// - la même avec une mémoire abondante, ou sans mesure : pré-transcodée
+///   comme avant (rien ne change là où rien ne cassait).
+#[tokio::test]
+async fn le_prechauffage_de_la_suivante_suit_la_regle_de_la_bascule_8600() {
+    use super::queue::{PrechauffageSuivante, prechauffer_la_suivante_locale};
+    let dossier = tempfile::tempdir().unwrap();
+    let suivante = dossier.path().join("suivante-8600.flac");
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        &suivante,
+    )
+    .unwrap();
+    let suivante = suivante.to_string_lossy().to_string();
+
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Salon", Some("dlna"), Some("uuid:salon-8600"))
+        .unwrap();
+    let pistes = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone());
+    let mut ids = Vec::new();
+    for (n, chemin) in [
+        (1, "/aucun/chemin/8600/courante.flac"),
+        (2, suivante.as_str()),
+    ] {
+        let mut piste = crate::db::models::Track::new(format!("Piste {n}"));
+        piste.file_path = Some(chemin.to_string());
+        piste.track_number = n;
+        piste.duration_ms = 300_000;
+        piste.format = Some("flac".into());
+        piste.sample_rate = Some(44_100);
+        piste.bit_depth = Some(16);
+        piste.channels = 2;
+        ids.push(pistes.create(&piste).unwrap());
+    }
+    crate::db::play_queue_repo::PlayQueueRepo::with_backend(orch.db.clone())
+        .set_queue(zone_id, &ids)
+        .unwrap();
+
+    let prechauffer = |sr: u32, bd: u16, disponible: Option<u64>| {
+        prechauffer_la_suivante_locale(
+            orch.db.clone(),
+            orch.playback.clone(),
+            zone_id,
+            sr,
+            bd,
+            2,
+            "flac".into(),
+            sr,
+            bd,
+            "flac".into(),
+            disponible,
+        )
+    };
+    let peu = Some((33u64 << 30) / 10);
+
+    // Piste normale : pré-transcodage inchangé, même sur la VM de 4 Gio.
+    let cle_cd = crate::transcode_cache::cache_path(&suivante, "flac", 44_100, 16, 2).unwrap();
+    let _ = std::fs::remove_file(&cle_cd);
+    assert_eq!(
+        prechauffer(44_100, 16, peu).await,
+        PrechauffageSuivante::Rechauffee
+    );
+    assert!(crate::transcode_cache::is_hit(&cle_cd));
+    // …et un rendu en cache n'est pas refait.
+    assert_eq!(
+        prechauffer(44_100, 16, peu).await,
+        PrechauffageSuivante::DejaEnCache
+    );
+    let _ = std::fs::remove_file(&cle_cd);
+
+    // Suivante lourde (fil 2777) : 192/24 stéréo de 15 min.
+    orch.db
+        .execute(
+            "UPDATE tracks SET duration_ms = 900000, sample_rate = 192000, bit_depth = 24",
+            &[],
+        )
+        .unwrap();
+    let cle_lourde = crate::transcode_cache::cache_path(&suivante, "flac", 192_000, 24, 2).unwrap();
+    let _ = std::fs::remove_file(&cle_lourde);
+    assert_eq!(
+        prechauffer(192_000, 24, peu).await,
+        PrechauffageSuivante::TropLourde,
+        "suivante trop lourde : pas de chargement complet"
+    );
+    assert!(
+        !std::path::Path::new(&cle_lourde).exists(),
+        "rien n'est écrit dans le cache"
+    );
+
+    // Contre-épreuves : mémoire abondante, ou sans mesure (macOS, Windows) —
+    // même règle que la piste en cours, donc pré-transcodée comme avant.
+    for disponible in [Some(1u64 << 40), None] {
+        let issue = prechauffer(192_000, 24, disponible).await;
+        let _ = std::fs::remove_file(&cle_lourde);
+        assert_eq!(issue, PrechauffageSuivante::Rechauffee, "{disponible:?}");
+    }
+}
+
 /// #3311 — la cible WAV d'un `.ape` sur une zone RÉSEAU exige les TROIS
 /// conditions. En retirer une seule rend au FLAC, donc au fichier.
 #[test]
