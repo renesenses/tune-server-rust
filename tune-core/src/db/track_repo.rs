@@ -3557,6 +3557,10 @@ impl TrackRepo {
         if quality == Some(super::models::Album::QUALITE_MULTICANAL) {
             let pred = super::models::Album::multicanal_sql_piste("t");
             extra.push_str(&format!(" AND {pred}"));
+        } else if quality == Some(super::models::Album::QUALITE_STEREO) {
+            // #8560 : sous « Stéréo », seules les pistes d'un ou deux canaux.
+            let pred = super::models::Album::stereo_sql_piste("t");
+            extra.push_str(&format!(" AND {pred}"));
         } else if let Some(pred) = quality.and_then(|q| super::models::Album::quality_sql(q, "t")) {
             extra.push_str(&format!(" AND {pred}"));
         }
