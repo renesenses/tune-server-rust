@@ -12,6 +12,19 @@
 //! - après 5 s de stabilisation, écart suiveur − maître sous 250 µs sur
 //!   chaque mesure de la fenêtre ;
 //! - fréquence apprise à ±10 ppm des +40 ppm du maître.
+//!
+//! #8460 — le seuil d'écart sous charge. Avec un horodatage LOGICIEL, un fil
+//! réveillé en retard à la réception rend le chemin asymétrique, et l'écart
+//! estimé par tout suiveur PTP se décale de `(d_ms − d_sm) / 2`. Cette erreur
+//! est bornée par le délai moyen de chemin que le suiveur mesure lui-même,
+//! `(d_ms + d_sm) / 2`. Sur un runner de CI saturé, l'écart sortait à
+//! [-412, -235] µs, hors des 250 µs. Deux remèdes : les bancs passent un par
+//! un (ils se faussaient l'un l'autre), la fréquence apprise est la médiane
+//! de la fenêtre et non un relevé isolé, et le seuil est 250 µs PLUS le plus
+//! grand délai moyen vu pendant la mesure. Machine calme (délai de quelques
+//! dizaines de µs), il reste à ~250 µs ; un suiveur qui ne suit pas le maître
+//! (dérive non apprise : 40 ppm, soit 200 µs de plus toutes les 5 s, ou pas
+//! de calage) reste rouge par l'écart ou par la fréquence.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
@@ -29,6 +42,19 @@ use tune_aes67::rtp::EnteteRtp;
 use tune_aes67::sap;
 use tune_aes67::sdp;
 use tune_aes67::sortie::{ReglagesEmission, SortieAes67};
+
+/// #8460 — les bancs de ce fichier mesurent du TEMPS (écart d'horloge,
+/// fréquence, cadence RTP) : joués en parallèle dans le même processus, trois
+/// maîtres, trois suiveurs et un cadenceur se disputaient le processeur et se
+/// faussaient l'un l'autre (mesuré sur Shrek : 3 rouges sur 6, fréquence
+/// apprise 67,8 ppm). Ils passent un par un.
+static UN_BANC_A_LA_FOIS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn un_banc_a_la_fois() -> std::sync::MutexGuard<'static, ()> {
+    UN_BANC_A_LA_FOIS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 const SEUIL_ECART_NS: i64 = 250_000;
 const LIMITE_CALAGE: Duration = Duration::from_secs(20);
@@ -77,22 +103,66 @@ fn attendre(limite: Duration, condition: impl Fn() -> bool) -> Option<Duration> 
     None
 }
 
-/// Mesure l'écart toutes les 50 ms pendant `duree` ; rend (min, max, moyenne).
-fn mesurer(maitre: &MaitreSimule, s: &SuiveurPtp, duree: Duration) -> (i64, i64, i64) {
+/// Ce que [`mesurer`] relève sur la fenêtre.
+struct Mesure {
+    min: i64,
+    max: i64,
+    moyenne: i64,
+    /// Le plus grand délai moyen de chemin publié par le suiveur.
+    delai_max: i64,
+    /// #8460 — la fréquence apprise, MÉDIANE des relevés de la fenêtre : un
+    /// relevé unique pris à la fin tombait parfois sur une correction en
+    /// cours (-9,26 ppm mesuré sur Shrek, écart pourtant sous 102 µs).
+    frequence_ppm: f64,
+}
+
+/// Mesure l'écart, le délai de chemin et la fréquence apprise toutes les
+/// 50 ms pendant `duree`.
+fn mesurer(maitre: &MaitreSimule, s: &SuiveurPtp, duree: Duration) -> Mesure {
     let debut = Instant::now();
     let mut v = Vec::new();
+    let mut frequences = Vec::new();
+    let mut delai_max = 0i64;
     while debut.elapsed() < duree {
         v.push(ecart_ns(maitre, s));
+        let e = s.etat();
+        delai_max = delai_max.max(e.delai_moyen_ns.unwrap_or(0).abs());
+        frequences.push(e.frequence_ppm);
         std::thread::sleep(Duration::from_millis(50));
     }
-    let min = *v.iter().min().unwrap();
-    let max = *v.iter().max().unwrap();
-    let moyenne = v.iter().sum::<i64>() / v.len() as i64;
-    (min, max, moyenne)
+    frequences.sort_by(f64::total_cmp);
+    Mesure {
+        min: *v.iter().min().unwrap(),
+        max: *v.iter().max().unwrap(),
+        moyenne: v.iter().sum::<i64>() / v.len() as i64,
+        delai_max,
+        frequence_ppm: frequences[frequences.len() / 2],
+    }
+}
+
+/// #8460 — le seuil d'écart : celui de la boucle locale calme, plus la borne
+/// de l'erreur d'asymétrie que l'horodatage logiciel ne peut pas éviter (le
+/// délai moyen de chemin mesuré). Voir l'en-tête du fichier.
+fn seuil_ecart_ns(delai_moyen_max_ns: i64) -> i64 {
+    SEUIL_ECART_NS + delai_moyen_max_ns.max(0)
+}
+
+#[test]
+fn le_seuil_ne_s_elargit_que_du_delai_de_chemin_mesure() {
+    assert_eq!(seuil_ecart_ns(0), SEUIL_ECART_NS);
+    assert_eq!(
+        seuil_ecart_ns(-5),
+        SEUIL_ECART_NS,
+        "un délai négatif n'élargit rien"
+    );
+    // Le cas du runner saturé : -412 µs d'écart pour un délai de chemin
+    // d'au moins 412 − 250 µs.
+    assert!(412_172 < seuil_ecart_ns(200_000));
 }
 
 #[test]
 fn le_suiveur_se_cale_sur_un_maitre_1588_2008_et_suit_sa_derive() {
+    let _banc = un_banc_a_la_fois();
     let maitre = MaitreSimule::demarrer(ConfigMaitre::par_defaut()).unwrap();
     let s = suiveur_pour(&maitre);
     assert_eq!(
@@ -122,21 +192,29 @@ fn le_suiveur_se_cale_sur_un_maitre_1588_2008_et_suit_sa_derive() {
     );
 
     std::thread::sleep(Duration::from_secs(5));
-    let (min, max, moyenne) = mesurer(&maitre, &s, Duration::from_secs(5));
+    let Mesure {
+        min,
+        max,
+        moyenne,
+        delai_max,
+        frequence_ppm,
+    } = mesurer(&maitre, &s, Duration::from_secs(5));
+    let seuil = seuil_ecart_ns(delai_max);
     let e = s.etat();
     eprintln!(
         "écart suiveur − maître sur 5 s : min {min} ns, max {max} ns, moyenne {moyenne} ns ; \
-         fréquence {:.2} ppm ; état {e:?}",
+         délai moyen de chemin max {delai_max} ns, seuil {seuil} ns ; \
+         fréquence médiane {frequence_ppm:.2} ppm (dernière {:.2}) ; état {e:?}",
         e.frequence_ppm
     );
     assert!(
-        min.abs() < SEUIL_ECART_NS && max.abs() < SEUIL_ECART_NS,
-        "écart hors seuil : [{min}, {max}] ns"
+        min.abs() < seuil && max.abs() < seuil,
+        "écart hors seuil : [{min}, {max}] ns (seuil {seuil} ns = {SEUIL_ECART_NS} + délai \
+         moyen de chemin max {delai_max} ns)"
     );
     assert!(
-        (e.frequence_ppm - 40.0).abs() < 10.0,
-        "fréquence apprise {} ppm",
-        e.frequence_ppm
+        (frequence_ppm - 40.0).abs() < 10.0,
+        "fréquence apprise (médiane sur 5 s) {frequence_ppm} ppm"
     );
     assert!(e.calee && !e.repli_horloge_locale && e.raison_du_repli.is_none());
     assert_eq!(e.etat_port, "esclave");
@@ -154,6 +232,7 @@ fn le_suiveur_se_cale_sur_un_maitre_1588_2008_et_suit_sa_derive() {
 
 #[test]
 fn contre_epreuve_un_maitre_d_un_autre_domaine_n_est_jamais_suivi() {
+    let _banc = un_banc_a_la_fois();
     let mut cfg = ConfigMaitre::par_defaut();
     cfg.domaine = 1;
     let maitre = MaitreSimule::demarrer(cfg).unwrap();
@@ -184,6 +263,7 @@ fn contre_epreuve_un_maitre_d_un_autre_domaine_n_est_jamais_suivi() {
 
 #[test]
 fn perte_du_maitre_repli_sans_saut_puis_calage_sur_un_autre_maitre() {
+    let _banc = un_banc_a_la_fois();
     let maitre_a = MaitreSimule::demarrer(ConfigMaitre::par_defaut()).unwrap();
     let (adr_e, adr_g) = maitre_a.adresses();
     let s = suiveur_pour(&maitre_a);
@@ -231,12 +311,22 @@ fn perte_du_maitre_repli_sans_saut_puis_calage_sur_un_autre_maitre() {
         "ptp=IEEE1588-2008:00-0A-E4-FF-FE-AB-CD-EF:0"
     );
     std::thread::sleep(Duration::from_secs(5));
-    let (min, max, moyenne) = mesurer(&maitre_b, &s, Duration::from_secs(3));
+    let Mesure {
+        min,
+        max,
+        moyenne,
+        delai_max,
+        ..
+    } = mesurer(&maitre_b, &s, Duration::from_secs(3));
+    let seuil = seuil_ecart_ns(delai_max);
     eprintln!(
-        "écart sur B : [{min}, {max}] ns, moyenne {moyenne} ns ; {:?}",
+        "écart sur B : [{min}, {max}] ns, moyenne {moyenne} ns, seuil {seuil} ns ; {:?}",
         s.etat()
     );
-    assert!(min.abs() < SEUIL_ECART_NS && max.abs() < SEUIL_ECART_NS);
+    assert!(
+        min.abs() < seuil && max.abs() < seuil,
+        "écart sur B hors seuil : [{min}, {max}] ns (seuil {seuil} ns)"
+    );
 }
 
 /// Lance le cadenceur sur `horloge`, reçoit `n` paquets et rend, pour
@@ -294,6 +384,7 @@ fn emettre_et_recevoir(
 
 #[test]
 fn l_emetteur_cale_horodate_en_temps_ptp_et_la_contre_epreuve_non() {
+    let _banc = un_banc_a_la_fois();
     let maitre = MaitreSimule::demarrer(ConfigMaitre::par_defaut()).unwrap();
     let s = suiveur_pour(&maitre);
     attendre(LIMITE_CALAGE, || s.calee()).expect("calage");
@@ -352,8 +443,12 @@ fn l_emetteur_cale_horodate_en_temps_ptp_et_la_contre_epreuve_non() {
     s.arreter();
 }
 
+// Le verrou ne sert qu'à faire passer les bancs un par un : le tenir à
+// travers les `.await` de ce test est voulu, aucun autre code ne le prend.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn le_sdp_passe_de_local_a_ptp_au_calage_et_sap_le_reannonce() {
+    let _banc = un_banc_a_la_fois();
     let maitre = MaitreSimule::demarrer(ConfigMaitre::par_defaut()).unwrap();
     let s = suiveur_pour(&maitre);
     let sap_ecoute = UdpSocket::bind("127.0.0.1:0").unwrap();

@@ -22,6 +22,7 @@ pub mod channels;
 /// crête (jamais d'écrêtage).
 pub mod compensation_reseau;
 pub mod convolver;
+pub mod coupure_connue_8483;
 pub mod crete_de_sortie;
 pub mod crete_vraie;
 pub mod crossfeed;

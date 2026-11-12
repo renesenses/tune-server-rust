@@ -202,6 +202,7 @@ jobs:
       # opt-in via scripts/pg-e2e.sh.
       - name: Apply PG migrations
         run: |
+          bash scripts/ci/apt-robuste.sh
           sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
           export PGPASSWORD=tune
           psql -h localhost -U tune -d tune_test -c "CREATE EXTENSION IF NOT EXISTS unaccent;"
@@ -287,6 +288,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7980 -- --nocapture --test-threads=1
+
+      # #8416 — les règles « nombre d'écoutes » et « dernière écoute » des
+      # listes et collections intelligentes comptent les écoutes importées
+      # (`imported_plays`) comme la Bibliothèque. Sans cette étape, le témoin
+      # prendrait son saut annoncé.
+      - name: Écoutes importées dans les règles intelligentes sur PostgreSQL (#8416)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8416 -- --nocapture --test-threads=1
 
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
@@ -571,6 +581,16 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_insert_conditionnel_f7c250 -- --nocapture
+
+      # #8239 — le journal de synchro cloud après un scan, sur PostgreSQL : le
+      # relevé `sync_releve_*` (migration 110), la comparaison par
+      # `IS DISTINCT FROM` et la réécriture du relevé par
+      # `INSERT … ON CONFLICT DO UPDATE … WHERE`. Sans cette étape, l'épreuve
+      # prendrait son « saut annoncé » (garde `derive_des_garde_fous_2816`).
+      - name: Journal de synchro après un scan sur PostgreSQL (#8239)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test journal_apres_scan_pg_8239 -- --nocapture --test-threads=1
 
       # Parite des DEUX ecritures du schema PG (#2111). Le test monte lui-meme
       # deux bases jetables — les scripts numerotes d'un cote, PG_FULL_SCHEMA de
@@ -923,6 +943,22 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_source_7765 -- --nocapture --test-threads=1
 
+      # #7767 — « Écriture et production » et `credit_counts` de la page
+      # artiste sur PostgreSQL : branches `UNION`, `EXISTS` booléen,
+      # `COUNT(DISTINCT)`, `EXPLAIN` imprimé. Sans cette étape, l'épreuve
+      # prendrait son saut annoncé.
+      - name: Page artiste, écriture et compteurs sur PostgreSQL (#7767)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_page_artiste_7767 -- --nocapture --test-threads=1
+
+      # #7768 — « joue avec » de la page artiste sur PostgreSQL : fiche de
+      # crédit lue en texte ou en entier, garde `CAST`, nom sans casse en
+      # `LOWER`, `EXPLAIN` imprimé.
+      - name: Page artiste, joue avec sur PostgreSQL (#7768)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_page_artiste_joue_avec_7768 -- --nocapture --test-threads=1
       # #8026 — les crédits des balises pour la musique déjà scannée : le
       # rattrapage depuis `track_metadata` et le rattachement à la fiche par le
       # nom replié, joués sur la VRAIE base (`track_id` BIGINT ou TEXT).
@@ -1086,3 +1122,12 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_7983 -- --nocapture --test-threads=1
+
+      # #4201 — les requêtes UPnP qui cherchent un favori, sur un
+      # `favorites.item_id` BIGINT (PostgreSQL 18 migrée : « bigint = text »,
+      # premier import complet `partial`) puis TEXT (`PG_FULL_SCHEMA`). Dans des
+      # schémas à elle ; sans cette étape, l'épreuve prendrait son saut annoncé.
+      - name: Favoris des bibliothèques UPnP sur PostgreSQL (#4201)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_4201 -- --nocapture --test-threads=1

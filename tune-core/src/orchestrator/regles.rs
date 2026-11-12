@@ -1425,6 +1425,27 @@ pub(super) fn agent_relance_a_la_position(
         && seek_ms.is_some_and(|ms| ms > 0)
 }
 
+/// `output_type` d'une zone AirPlay 2 (`tune-server/src/discovery_setup.rs`).
+pub const TYPE_SORTIE_AIRPLAY2: &str = "airplay2";
+
+/// #7972 — faut-il servir à une zone AirPlay 2 un flux DÉCODÉ qui commence à
+/// la position demandée ?
+///
+/// Le démon AirPlay 2 lit un fichier d'un bout à l'autre et ne sait pas s'y
+/// déplacer (`Airplay2Output::seek` refuse). Quand le récepteur a fermé sa
+/// connexion pendant une pause, la reprise rejoue la piste à la position
+/// (`retablir_a_la_position`, #7921). Mais une piste de la bibliothèque en
+/// passthrough part dans une session FICHIER servie depuis l'octet 0 : la
+/// musique repartait à 0:00. Même cas, même remède que l'agent (#6370) : une
+/// relance à une position non nulle prend le bras qui décode à partir de
+/// `seek_ms`. Une lecture depuis le début ne change pas de bras.
+pub(super) fn airplay2_relance_a_la_position(
+    zone_output_type: Option<&str>,
+    seek_ms: Option<u64>,
+) -> bool {
+    zone_output_type == Some(TYPE_SORTIE_AIRPLAY2) && seek_ms.is_some_and(|ms| ms > 0)
+}
+
 /// Une zone navigateur doit-elle recevoir la source décodée en WAV ? Oui pour
 /// tout format que `<audio>` ne décode pas — DSD avant tout (Reivax66, 0.9.44),
 /// WavPack, APE, WMA, AIFF, ALAC, et Matroska (#3633 : `<audio>` n'ouvre pas
@@ -1735,6 +1756,25 @@ mod lecture_locale_tests {
             Some(2_000)
         ));
         assert!(!agent_relance_a_la_position(None, Some(2_000)));
+    }
+
+    #[test]
+    fn seule_une_relance_a_une_position_non_nulle_decode_pour_airplay2_7972() {
+        assert!(airplay2_relance_a_la_position(
+            Some("airplay2"),
+            Some(139_000)
+        ));
+        assert!(
+            !airplay2_relance_a_la_position(Some("airplay2"), Some(0)),
+            "une lecture depuis le début garde son bras"
+        );
+        assert!(!airplay2_relance_a_la_position(Some("airplay2"), None));
+        assert!(
+            !airplay2_relance_a_la_position(Some("airplay"), Some(139_000)),
+            "AirPlay 1 n'est pas concerné"
+        );
+        assert!(!airplay2_relance_a_la_position(Some("dlna"), Some(139_000)));
+        assert!(!airplay2_relance_a_la_position(None, Some(139_000)));
     }
 
     #[test]

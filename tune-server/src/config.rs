@@ -66,6 +66,11 @@ pub struct TuneConfig {
     /// il était déclaré dans une configuration que rien ne construit.
     #[serde(default)]
     pub auto_update: bool,
+    /// Serveur embarqué dans une application mobile (`tune-ffi`), jamais lu
+    /// d'un fichier : il règle les capacités annoncées par
+    /// `GET /system/capabilities` (#8189).
+    #[serde(skip)]
+    pub mobile: bool,
 }
 
 fn default_free_max_zones() -> i64 {
@@ -178,6 +183,7 @@ impl Default for TuneConfig {
             // ne l'a pas demandé. Poser le drapeau ne déclenche qu'un contrôle
             // périodique, jamais une installation.
             auto_update: false,
+            mobile: false,
         }
     }
 }

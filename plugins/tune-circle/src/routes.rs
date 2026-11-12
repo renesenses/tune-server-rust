@@ -707,7 +707,7 @@ async fn partager(
             .flatten()
             .is_none_or(|v| v.trim().is_empty());
         if jamais_poussee {
-            library_sync::populate_changelog_after_scan(relais.backend());
+            library_sync::tout_remettre_dans_le_journal(relais.backend());
         }
     }
     // Contrat de site-mozaiklabs#233 : les deux 404 du PUT deviennent des

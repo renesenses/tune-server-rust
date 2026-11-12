@@ -466,3 +466,66 @@ async fn hors_sourdine_la_reimposition_du_volume_est_inchangee() {
     compat::reinitialiser_compatibilite(udn).unwrap();
     vie.abort();
 }
+
+/// 🔴 #8328 — en sourdine, le saut connu de l'Abyss hors de la fenêtre ne
+/// rend jamais le son. Appareil sans `SetMute` (sourdine tenue par un volume
+/// nul) : le saut à 80 est vu et retenu dans la fenêtre d'une piste lue avec
+/// le son ; la sourdine est posée ; hors de la fenêtre, l'appareil saute de
+/// nouveau à 80. Seul le volume nul est reposé, jamais la consigne de 30.
+#[tokio::test]
+async fn en_sourdine_le_saut_connu_hors_fenetre_ne_rend_pas_le_son_8328() {
+    let udn = "uuid:banc-8328-sourdine-hors-fenetre";
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    compat::memoriser_volume_remonte_a_l_uri(udn);
+    let etat = FauxEversolo::new(true);
+    let (sortie, vie) = demarrer(etat.clone(), udn).await;
+
+    sortie.set_volume(0.30).await.unwrap();
+    sortie
+        .play_media(&piste("http://127.0.0.1:9/stream/8328-sourdine.flac"))
+        .await
+        .expect("la piste part");
+    // Dans la fenêtre : l'appareil remonte à 80, Tune le ramène à 30.
+    *etat.volume.lock().await = 80;
+    let _ = sortie.get_status().await.unwrap();
+    assert_eq!(
+        etat.audible().await,
+        30,
+        "prémisse : saut corrigé dans la fenêtre"
+    );
+
+    sortie.set_mute(true).await.unwrap();
+    assert_eq!(
+        etat.audible().await,
+        0,
+        "prémisse : sourdine par volume nul"
+    );
+    sortie.vieillir_la_pose_d_uri();
+    sortie.vieillir_la_demande_de_volume();
+    etat.son_apres_commande.lock().await.clear();
+    etat.commandes.lock().await.clear();
+
+    // Hors de la fenêtre, l'appareil refait son saut.
+    *etat.volume.lock().await = 80;
+    let statut = sortie.get_status().await.unwrap();
+    let commandes = etat.commandes.lock().await.clone();
+    let audible = etat.audible().await;
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+
+    assert_eq!(
+        audible, 0,
+        "#8328 : en sourdine, l'appareil est resté audible ; commandes : {commandes:?}"
+    );
+    assert!(
+        !commandes
+            .iter()
+            .any(|c| c.starts_with("SetVolume(") && c != "SetVolume(0)"),
+        "#8328 : en sourdine, aucun SetVolume autre que 0 : {commandes:?}"
+    );
+    assert!(
+        statut.volume < 0.005,
+        "le sondeur reçoit 0, pas {}",
+        statut.volume
+    );
+}
