@@ -118,6 +118,13 @@ pub struct SpotifyService {
     /// point d'accès est fermé aux applications créées après le 27/11/2024.
     /// La rubrique est alors vide, sans erreur, et n'est plus redemandée.
     selection_retiree: AtomicBool,
+    /// Février 2026 — Spotify a retiré `GET /browse/new-releases` aux
+    /// applications en mode développement : la rubrique « Nouveautés » est
+    /// alors vide, sans erreur, et n'est plus redemandée.
+    nouveautes_retirees: AtomicBool,
+    /// Février 2026 — `GET /browse/categories` et
+    /// `/browse/categories/{id}/…` retirés de même : les genres sont vides.
+    genres_retires: AtomicBool,
 }
 
 impl Default for SpotifyService {
@@ -680,6 +687,8 @@ impl SpotifyService {
             relais: None,
             titres_phares_retires: AtomicBool::new(false),
             selection_retiree: AtomicBool::new(false),
+            nouveautes_retirees: AtomicBool::new(false),
+            genres_retires: AtomicBool::new(false),
         }
     }
 
@@ -692,6 +701,8 @@ impl SpotifyService {
         self.titres_phares_retires.store(false, Ordering::Relaxed);
         // #8399 — le refus de la sélection vaut pour UNE application.
         self.selection_retiree.store(false, Ordering::Relaxed);
+        self.nouveautes_retirees.store(false, Ordering::Relaxed);
+        self.genres_retires.store(false, Ordering::Relaxed);
         self.tentatives.clear();
     }
 
@@ -1251,6 +1262,32 @@ impl SpotifyService {
             return Err(format!("spotify DELETE {path}: {status}"));
         }
         Ok(())
+    }
+
+    /// Février 2026 — un point d'accès que Spotify a retiré aux applications
+    /// en mode développement répond 403 (ou 404). `None` : retiré, la
+    /// rubrique est vide ; le retrait est mémorisé dans `retire` (une seule
+    /// requête, puis plus rien jusqu'au changement d'application). Tout autre
+    /// refus reste une erreur.
+    async fn lire_ou_retire(
+        &self,
+        chemin: &str,
+        route: &'static str,
+        retire: &AtomicBool,
+    ) -> Result<Option<serde_json::Value>, TuneError> {
+        if retire.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match self.api_get(chemin).await {
+            Ok(d) => Ok(Some(d)),
+            Err(e) if matches!(statut_du_refus(&e), Some(403 | 404)) => {
+                if !retire.swap(true, Ordering::Relaxed) {
+                    info!(route, "spotify_point_d_acces_retire");
+                }
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn api_post(
@@ -1841,6 +1878,8 @@ impl StreamingService for SpotifyService {
         self.session_refusee = false;
         self.titres_phares_retires.store(false, Ordering::Relaxed);
         self.selection_retiree.store(false, Ordering::Relaxed);
+        self.nouveautes_retirees.store(false, Ordering::Relaxed);
+        self.genres_retires.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2073,7 +2112,18 @@ impl StreamingService for SpotifyService {
     }
 
     async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
-        let data = self.api_get("/browse/new-releases?limit=50").await?;
+        // Février 2026 — retiré par Spotify aux applications en mode
+        // développement : rubrique vide, sans « HTTP 502 » brut à l'écran.
+        let Some(data) = self
+            .lire_ou_retire(
+                "/browse/new-releases?limit=50",
+                "/browse/new-releases",
+                &self.nouveautes_retirees,
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
         Ok(data["albums"]["items"]
             .as_array()
             .map(|i| i.iter().map(Self::map_album).collect())
@@ -2106,7 +2156,17 @@ impl StreamingService for SpotifyService {
     }
 
     async fn get_genres(&self, _parent_id: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
-        let data = self.api_get("/browse/categories?limit=50").await?;
+        // Février 2026 — retiré par Spotify, comme les nouveautés.
+        let Some(data) = self
+            .lire_ou_retire(
+                "/browse/categories?limit=50",
+                "/browse/categories",
+                &self.genres_retires,
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
         Ok(data["categories"]["items"]
             .as_array()
             .map(|i| i.iter().map(Self::map_category_to_genre).collect())
@@ -2118,11 +2178,16 @@ impl StreamingService for SpotifyService {
         genre_id: &str,
         limit: usize,
     ) -> Result<Vec<StreamAlbum>, TuneError> {
-        let data = self
-            .api_get(&format!(
-                "/browse/categories/{genre_id}/playlists?limit={limit}"
-            ))
-            .await?;
+        let Some(data) = self
+            .lire_ou_retire(
+                &format!("/browse/categories/{genre_id}/playlists?limit={limit}"),
+                "/browse/categories/{id}/playlists",
+                &self.genres_retires,
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
         let playlists: Vec<String> = data["playlists"]["items"]
             .as_array()
             .map(|i| {
@@ -3664,6 +3729,10 @@ mod favoris_pagination_8050_tests;
 #[cfg(test)]
 #[path = "spotify_playlists_items_8193_tests.rs"]
 mod playlists_items_8193_tests;
+
+#[cfg(test)]
+#[path = "spotify_rubriques_retirees_2026_tests.rs"]
+mod spotify_rubriques_retirees_2026_tests;
 
 #[cfg(test)]
 #[path = "spotify_titres_phares_8485_tests.rs"]
