@@ -359,8 +359,9 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
         //   rouvert d'ici là, donc rien n'est coupé.
         //   SAUF si cet évènement est une NOUVELLE action dans l'application,
         //   liste fermée : `paused`, `stopped`, `session_connected`,
-        //   `session_disconnected`, `session_client_changed`, et `playing`
-        //   après une pause. C'est alors elle le dernier geste : la session
+        //   `session_disconnected`, `session_client_changed`, et TOUT
+        //   évènement reçu pendant que l'application est en pause (aucun
+        //   enchaînement possible : volume, recherche, puis Lecture). C'est alors elle le dernier geste : la session
         //   est fermée sans pause de l'appareil ni garde, et l'évènement la
         //   rouvre s'il le faut. Tout autre évènement (`preload_next`,
         //   `end_of_track`, `loading`, `play_request_id_changed`,
@@ -392,14 +393,18 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
                 // `play_request_id_changed`, `loading`, `track_changed`,
                 // `playing` hors pause…) est l'enchaînement de la lecture en
                 // cours, et rend la session.
-                let nouvelle_action = matches!(
-                    ev.evenement.as_str(),
-                    "paused"
-                        | "stopped"
-                        | "session_connected"
-                        | "session_disconnected"
-                        | "session_client_changed"
-                ) || (ev.evenement == "playing" && etat.en_pause);
+                // Application EN PAUSE : aucun enchaînement possible, tout
+                // évènement (volume, recherche dans le titre…) est une action
+                // de l'utilisateur ; la Lecture suivante doit rouvrir.
+                let nouvelle_action = etat.en_pause
+                    || matches!(
+                        ev.evenement.as_str(),
+                        "paused"
+                            | "stopped"
+                            | "session_connected"
+                            | "session_disconnected"
+                            | "session_client_changed"
+                    );
                 let poursuite = !nouvelle_action;
                 pompe.detacher_continu();
                 if joue {
