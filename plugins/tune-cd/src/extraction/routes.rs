@@ -10,6 +10,16 @@
 //! * `GET    /extractions/{id}`     — suivre une extraction ;
 //! * `DELETE /extractions/{id}`     — l'annuler.
 //!
+//! #8514 — `POST /extractions` avec `"depuis_memoire": true` : « Enregistrer
+//! dans la bibliothèque » le disque ENTIER déjà chargé en mémoire (#6043),
+//! sans relire le lecteur. Même plan, même encodeur, mêmes balises, même
+//! pochette, même nommage, même scan ciblé ; la lecture d'une zone continue
+//! (elle se sert dans la même mémoire) et la mémoire reste chargée. Refus
+//! `409 memoire_incomplete` si aucun disque n'est entier en mémoire, et
+//! `409 memoire_secteurs_perdus` (avec `secteurs_perdus`) si des secteurs
+//! sont restés illisibles au chargement : la mémoire y tient du silence,
+//! l'extraction depuis le lecteur les relira.
+//!
 //! Le disque (`GET /disque`) et l'éjection (`POST /ejecter`) sont ceux du
 //! greffon ; l'éjection et la lecture refusent pendant une extraction.
 
@@ -38,7 +48,8 @@ use super::{
     StatutPiste, StatutTravail, Travail, Verification,
 };
 use crate::discid::disc_id;
-use crate::lecteur::{Presence, plateforme_prise_en_charge};
+use crate::lecteur::{LecteurDisque, Presence, plateforme_prise_en_charge};
+use crate::memoire::{Chargement, LecteurMemoire};
 use crate::routes::{EtatRoutes, Refus, refus, toc_ou_refus, zones_qui_jouent_le_disque};
 
 /// Longueur maximale d'un texte fourni (artiste, album, titre).
@@ -263,6 +274,10 @@ pub struct DemandeExtraction {
     /// Remplacer des fichiers existants (défaut : refuser).
     #[serde(default)]
     pub ecraser: bool,
+    /// #8514 — verser le disque déjà chargé en mémoire, sans relire le
+    /// lecteur (défaut : extraire depuis le lecteur).
+    #[serde(default)]
+    pub depuis_memoire: bool,
     /// Corrections, prioritaires sur MusicBrainz.
     pub artiste: Option<String>,
     pub album: Option<String>,
@@ -305,24 +320,66 @@ async fn lancer(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
     if let Some(t) = e.ex.en_cours() {
         return conflit_extraction(&t.id);
     }
-    let zones = zones_qui_jouent_le_disque(&e.routes).await;
-    if !zones.is_empty() {
-        return conflit(
-            "lecture_en_cours",
-            "Le disque est en lecture : arrêtez la lecture avant de l'extraire.",
-            json!({ "zones": zones }),
-        );
-    }
-    // #6043 — l'extraction lit le lecteur : le chargement en mémoire s'arrête.
-    crate::routes::liberer_memoire(&e.routes).await;
-    match preparer(&e, d).await {
+    // #8514 — depuis la mémoire : le disque entier déjà chargé. Ni le
+    // lecteur ni la lecture d'une zone ne sont touchés, la mémoire reste.
+    // La retenue est prise AVANT la vérification et vit jusqu'à la fin du
+    // déroulé (ou tombe avec un refus).
+    let mut retenue = None;
+    let memoire = if d.depuis_memoire {
+        let incomplete = || {
+            conflit(
+                "memoire_incomplete",
+                "Le disque n'est pas entièrement chargé en mémoire : \
+                 chargez-le d'abord, ou extrayez-le depuis le lecteur.",
+                json!({}),
+            )
+        };
+        let Some(m) = e.routes.memoire.clone() else {
+            return incomplete();
+        };
+        let r = m.retenir_pour_enregistrement();
+        let Some(c) = m.disque_complet() else {
+            return incomplete();
+        };
+        let perdus = c.progression().secteurs_perdus;
+        if perdus > 0 {
+            return conflit(
+                "memoire_secteurs_perdus",
+                format!(
+                    "{perdus} secteur(s) sont restés illisibles au chargement : la mémoire \
+                     y tient du silence. Extrayez le disque depuis le lecteur."
+                ),
+                json!({ "secteurs_perdus": perdus }),
+            );
+        }
+        retenue = Some(r);
+        Some(c)
+    } else {
+        let zones = zones_qui_jouent_le_disque(&e.routes).await;
+        if !zones.is_empty() {
+            return conflit(
+                "lecture_en_cours",
+                "Le disque est en lecture : arrêtez la lecture avant de l'extraire.",
+                json!({ "zones": zones }),
+            );
+        }
+        // #6043 — l'extraction lit le lecteur : le chargement en mémoire s'arrête.
+        crate::routes::liberer_memoire(&e.routes).await;
+        None
+    };
+    match preparer(&e, d, memoire).await {
         Ok((travail, plan, pochette)) => {
             if let Err(autre) = e.ex.inscrire(travail.clone()) {
                 return conflit_extraction(&autre.id);
             }
             let etat = travail.etat();
             e.ex.publier(EVT_DEMARREE, &etat);
-            tokio::spawn(derouler(e.ex.clone(), travail, plan, pochette));
+            let ex = e.ex.clone();
+            tokio::spawn(async move {
+                // #8514 — la retenue tombe avec la tâche, même sur panique.
+                let _retenue = retenue;
+                derouler(ex, travail, plan, pochette).await;
+            });
             (StatusCode::ACCEPTED, Json(etat)).into_response()
         }
         Err(r) => r,
@@ -335,6 +392,7 @@ async fn lancer(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
 async fn preparer(
     e: &EtatExtraction,
     d: DemandeExtraction,
+    memoire: Option<Arc<Chargement>>,
 ) -> Result<(Arc<Travail>, Plan, Option<String>), Response> {
     let format = match &d.format {
         Some(f) => Format::depuis(f).ok_or_else(|| reponse(format_refuse(f)))?,
@@ -380,13 +438,26 @@ async fn preparer(
         }
     };
 
-    let toc = toc_ou_refus(&e.routes).await.map_err(reponse)?;
-    let Some(lecteur) = e.routes.lecteur.clone() else {
-        return Err(reponse((
-            StatusCode::NOT_FOUND,
-            "aucun_lecteur",
-            "Aucun lecteur de CD.".into(),
-        )));
+    let (toc, lecteur): (_, Arc<dyn LecteurDisque>) = match &memoire {
+        // #8514 — la TOC du disque chargé (le lecteur peut être vide : disque
+        // éjecté mais gardé, #6410), et la mémoire comme lecteur.
+        Some(c) => (
+            c.toc().clone(),
+            Arc::new(LecteurMemoire {
+                chargement: c.clone(),
+            }),
+        ),
+        None => {
+            let toc = toc_ou_refus(&e.routes).await.map_err(reponse)?;
+            let Some(lecteur) = e.routes.lecteur.clone() else {
+                return Err(reponse((
+                    StatusCode::NOT_FOUND,
+                    "aucun_lecteur",
+                    "Aucun lecteur de CD.".into(),
+                )));
+            };
+            (toc, lecteur)
+        }
     };
     let generation = lecteur.generation_lecteur();
     let audio: Vec<u8> = toc.pistes_audio().map(|p| p.numero).collect();
@@ -557,6 +628,11 @@ async fn preparer(
         format,
         verification,
         lecteur: lecteur.chemin(),
+        source: if memoire.is_some() {
+            "memoire"
+        } else {
+            "lecteur"
+        },
         disc_id: disc,
         metadonnees: if infos.is_some() {
             "musicbrainz"
