@@ -172,15 +172,36 @@ pub(crate) fn mb_choisir_artiste(data: &serde_json::Value, wanted: &str) -> Opti
     Some(choisi.to_string())
 }
 
-/// Deux noms d'artiste désignent-ils la MÊME entrée ? À la casse et aux espaces
-/// de bord près, rien d'autre : ni accents ni ponctuation repliés
-/// (« Motorhead » ≠ « Motörhead »). Même règle que
-/// `library::artwork::artist_name_matches_exactly`.
+/// Deux noms d'artiste désignent-ils la MÊME entrée ? À la casse, aux espaces
+/// de bord et à la GRAPHIE du trait d'union et de l'apostrophe près, rien
+/// d'autre : ni accents ni autre ponctuation repliés (« Motorhead » ≠
+/// « Motörhead »). Même règle que `library::artwork::artist_name_matches_exactly`.
+///
+/// #8524 — MusicBrainz, et le site qui reprend ses noms, écrivent
+/// « Jean‐Michel Jarre » avec le trait d'union typographique U+2010 (et
+/// « Guns N’ Roses » avec U+2019) ; les balises portent celui du clavier.
+/// Ce n'est pas un autre nom, seulement un autre caractère pour le même signe :
+/// sans ce repli, Jean-Jacques Goldman ne recevait ni MBID ni portrait.
 pub(crate) fn noms_d_artiste_identiques(candidate: &str, wanted: &str) -> bool {
     let candidate = candidate.trim();
     let wanted = wanted.trim();
     // Un nom vide se « retrouve » partout : il ne départage rien.
-    !candidate.is_empty() && !wanted.is_empty() && candidate.to_lowercase() == wanted.to_lowercase()
+    !candidate.is_empty()
+        && !wanted.is_empty()
+        && graphie_de_comparaison(candidate) == graphie_de_comparaison(wanted)
+}
+
+/// Le nom en minuscules, traits d'union (U+2010, U+2011) et apostrophes
+/// (U+2018, U+2019) typographiques ramenés à leur forme ASCII.
+fn graphie_de_comparaison(nom: &str) -> String {
+    nom.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            '\u{2010}' | '\u{2011}' => '-',
+            '\u{2018}' | '\u{2019}' => '\'',
+            autre => autre,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -5514,6 +5535,50 @@ mod tests {
             mb_choisir_artiste(&reponse_mb_christophe(), "Jean‐Christophe"),
             Some("0df890e1-f4f2-4b21-a413-cd8af1af32d8".to_string())
         );
+    }
+
+    /// #8524 — réponse `ws/2/artist?query=artist:"Jean-Jacques Goldman"`
+    /// mesurée le 11/11/2026 (alias réduits) : le seul candidat porte le trait
+    /// d'union U+2010, et aucun alias n'a celui du clavier.
+    fn reponse_mb_goldman() -> serde_json::Value {
+        serde_json::json!({
+            "artists": [
+                {"id": "0b3819e6-3fa1-4a50-a84c-f2a62643185d", "score": 100,
+                 "name": "Jean\u{2010}Jacques Goldman",
+                 "aliases": [{"name": "JJG"}, {"name": "Jean Jacques Goldman"},
+                             {"name": "Jean-Jaques Goldman"}, {"name": "JJ Goldman"}]}
+            ]
+        })
+    }
+
+    #[test]
+    fn mb_le_trait_d_union_typographique_est_le_meme_nom_8524() {
+        assert_eq!(
+            mb_choisir_artiste(&reponse_mb_goldman(), "Jean-Jacques Goldman").as_deref(),
+            Some("0b3819e6-3fa1-4a50-a84c-f2a62643185d"),
+            "#8524 — « Jean-Jacques Goldman » (U+002D) doit recevoir le MBID de \
+             « Jean\u{2010}Jacques Goldman » (U+2010)"
+        );
+        assert!(noms_d_artiste_identiques(
+            "Jean\u{2010}Michel Jarre",
+            "jean-michel jarre"
+        ));
+        assert!(noms_d_artiste_identiques(
+            "Jean\u{2011}Michel Jarre",
+            "Jean-Michel Jarre"
+        ));
+        assert!(noms_d_artiste_identiques(
+            "Guns N\u{2019} Roses",
+            "Guns N' Roses"
+        ));
+        // Le repli s'arrête là : ni accents, ni espace pour un trait d'union,
+        // ni tiret long.
+        assert!(!noms_d_artiste_identiques("Motörhead", "Motorhead"));
+        assert!(!noms_d_artiste_identiques(
+            "Jean Jacques Goldman",
+            "Jean-Jacques Goldman"
+        ));
+        assert!(!noms_d_artiste_identiques("A\u{2014}B", "A-B"));
     }
 
     /// Build a minimal ID3v2.3 tag containing a single APIC frame.

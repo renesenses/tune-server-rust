@@ -3310,6 +3310,13 @@ mod tests {
         // bibliothèque, comme côté web (`trouverArtisteExact`).
         assert!(!artist_name_matches_exactly("Motörhead", "Motorhead"));
 
+        // #8524 — le site et MusicBrainz écrivent « Jean‐Jacques Goldman »
+        // avec U+2010 : c'est le même nom que celui des balises (U+002D).
+        assert!(artist_name_matches_exactly(
+            "Jean\u{2010}Jacques Goldman",
+            "Jean-Jacques Goldman"
+        ));
+
         // Un nom vide se « retrouve » partout — c'est le piège qui fabrique une
         // fausse preuve. Il ne départage rien, donc il ne correspond à rien.
         assert!(!artist_name_matches_exactly("", ""));
