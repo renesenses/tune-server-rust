@@ -452,6 +452,38 @@ done
         );
     }
 
+    /// Enchaînement automatique réel après un geste de Tune : le premier
+    /// évènement relayé n'est presque jamais `track_changed`. Aucune
+    /// réouverture (l'album de Tune n'est pas coupé), appareil mis en pause.
+    async fn enchainement_apres_geste(premiers: &[&str]) {
+        let (zones, mut etat, pilote, recepteur, _d) = session_ouverte().await;
+        geste_de_tune(&zones);
+        for e in premiers {
+            pilote.traiter(&mut etat, &ev(e)).await;
+        }
+        pilote.traiter(&mut etat, &titre("b", "Suivant")).await;
+        pilote.traiter(&mut etat, &joue("b")).await;
+        recepteur.disable().await;
+        let appels = zones.appels.lock().unwrap().clone();
+        assert_eq!(
+            ouvertures(&zones),
+            1,
+            "{premiers:?} : réouverture {appels:?}"
+        );
+        assert_eq!(pauses_appareil(&zones), 1, "{premiers:?} : {appels:?}");
+        assert!(etat.rendu(), "{premiers:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_enchainement_preload_end_loading_ne_rouvre_pas() {
+        enchainement_apres_geste(&["preload_next", "end_of_track", "loading"]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_enchainement_play_request_id_ne_rouvre_pas() {
+        enchainement_apres_geste(&["play_request_id_changed", "loading"]).await;
+    }
+
     /// La pause de l'appareil a échoué (401, appareil absent) : l'application
     /// continue d'enchaîner, rien ne rouvre ; la garde tombe à la prochaine
     /// pause, et la Lecture qui suit rouvre.

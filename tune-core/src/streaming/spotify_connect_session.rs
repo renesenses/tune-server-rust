@@ -366,12 +366,21 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
         //   et les titres qu'elle enchaînerait encore ne rouvrent rien.
         //   Détecté au premier évènement qui suit le geste : rien n'est
         //   rouvert d'ici là, donc rien n'est coupé.
-        //   SEULEMENT si cet évènement est la POURSUITE de la lecture en cours
-        //   (`track_changed`, ou `playing` hors pause) : l'application ne fait
-        //   qu'enchaîner. Si c'est une NOUVELLE action dans l'application
-        //   (`playing` après une pause, `paused`, `stopped`, `session_*`),
-        //   c'est elle le dernier geste : la session est fermée sans pause de
-        //   l'appareil ni garde, et l'évènement la rouvre s'il le faut.
+        //   SAUF si cet évènement est une NOUVELLE action dans l'application,
+        //   liste fermée : `paused`, `stopped`, `session_connected`,
+        //   `session_disconnected`, `session_client_changed`, et `playing`
+        //   après une pause. C'est alors elle le dernier geste : la session
+        //   est fermée sans pause de l'appareil ni garde, et l'évènement la
+        //   rouvre s'il le faut. Tout autre évènement (`preload_next`,
+        //   `end_of_track`, `loading`, `play_request_id_changed`,
+        //   `track_changed`, `playing` hors pause…) est l'enchaînement
+        //   automatique de la lecture en cours : la session est rendue.
+        //
+        //   Limite assumée (le scénario « l'album de Tune coupé » prime) : une
+        //   nouvelle lecture lancée dans l'application SANS pause préalable,
+        //   après un geste de Tune, est indiscernable d'un enchaînement : elle
+        //   reste gardée jusqu'à une pause, un arrêt ou une nouvelle
+        //   connexion.
         //
         //   Sortie de l'état « rendu » quand la pause de l'appareil a échoué
         //   (401, appareil absent) : l'application continue d'enchaîner, ce
@@ -387,8 +396,20 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
             let relance = etat.lancement != Some(lancement);
             let joue = self.zones.joue_la_session(zone_id).await;
             if relance || !joue {
-                let poursuite = ev.evenement == "track_changed"
-                    || (ev.evenement == "playing" && !etat.en_pause);
+                // Liste FERMÉE des nouvelles actions de l'application ; tout le
+                // reste (`preload_next`, `preloading`, `end_of_track`,
+                // `play_request_id_changed`, `loading`, `track_changed`,
+                // `playing` hors pause…) est l'enchaînement de la lecture en
+                // cours, et rend la session.
+                let nouvelle_action = matches!(
+                    ev.evenement.as_str(),
+                    "paused"
+                        | "stopped"
+                        | "session_connected"
+                        | "session_disconnected"
+                        | "session_client_changed"
+                ) || (ev.evenement == "playing" && etat.en_pause);
+                let poursuite = !nouvelle_action;
                 pompe.detacher_continu();
                 if joue {
                     self.zones.arreter(zone_id).await;
