@@ -2545,6 +2545,9 @@ mod dop_routing_tests;
 /// #5643 — la règle du DSD natif local (ASIO) et la valeur publiée par l'API.
 #[cfg(test)]
 mod dsd_natif_5643_tests;
+/// #8248 — le DSD natif local ALSA (`DSD_U32`) : la même règle, ses voies.
+#[cfg(test)]
+mod dsd_natif_alsa_8248_tests;
 
 /// Garde-fou #1998 : ce que la sortie a refusé n'est annoncé nulle part.
 ///

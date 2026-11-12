@@ -1133,6 +1133,10 @@ pub enum TransportDsd {
     /// #5643 — DSD natif : la sortie locale ASIO reçoit les octets DSD
     /// eux-mêmes (`DsdU8`), sans DoP, sans volume ni DSP. Seule
     /// [`decider_dsd_natif_local`] y mène, jamais [`transport_dsd`] seul.
+    ///
+    /// #8248 — même chose sur une sortie locale ALSA `hw:` dont le pilote
+    /// offre `DSD_U32_BE`/`DSD_U32_LE` : la sortie range les octets en mots
+    /// de 32 bits (`audio::dsd_u32_alsa`), sans toucher un bit.
     Natif,
 }
 
@@ -1186,8 +1190,9 @@ pub fn transport_dsd(is_local: bool, is_network: bool, dsd_mode: &str) -> Transp
 /// « natif », au moment de résoudre une piste DSD.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SortieDsdLocale {
-    /// La sortie ne passe pas par le bras ASIO exclusif (WASAPI, partagé,
-    /// macOS, Linux/ALSA — ce dernier reste hors périmètre de #5643).
+    /// La sortie n'a pas de bras DSD natif : ni ASIO exclusif, ni PCM ALSA
+    /// `hw:` (WASAPI, partagé, macOS, PCM ALSA logiciel `plughw:`/`default`/
+    /// `dmix:`/PipeWire).
     NonAsio,
     /// Bras ASIO, capacité pas encore sondée et impossible à sonder
     /// maintenant : le verrou de périphérique est tenu par un flux en cours.
@@ -1195,6 +1200,14 @@ pub enum SortieDsdLocale {
     /// Bras ASIO, pilote sondé : les cadences DSD qu'il a déclarées (vide =
     /// pilote PCM seulement).
     Asio { cadences: Vec<u32> },
+    /// #8248 — PCM ALSA `hw:`, capacité pas encore sondée et impossible à
+    /// sonder maintenant : le PCM est tenu (par un autre flux ou un autre
+    /// programme). Même règle qu'ASIO : on ne force pas le pilote.
+    AlsaNonSondee,
+    /// #8248 — PCM ALSA `hw:` sondé : les cadences DSD qu'il accepte en
+    /// `DSD_U32` (vide = pilote sans DSD natif, le cas d'un DAC sans quirk
+    /// dans le noyau), et le nombre de voies sondé.
+    Alsa { cadences: Vec<u32>, voies: u16 },
 }
 
 /// #5643 — pourquoi une zone « natif » part quand même en DoP. Chaque motif
@@ -1217,6 +1230,9 @@ pub enum MotifDsdServiEnDop {
     /// catalogue) interdit cette cadence — la même règle que le DoP : le
     /// débit DoP équivalent (cadence / 16) doit tenir sous le plafond.
     PlafondDeZone,
+    /// #8248 — le pilote ALSA offre le DSD natif, mais pas sur le nombre de
+    /// voies du fichier (un multicanal sur un DAC stéréo).
+    VoiesNonDeclarees,
 }
 
 impl MotifDsdServiEnDop {
@@ -1229,6 +1245,7 @@ impl MotifDsdServiEnDop {
             Self::CadenceInconnue => "cadence_du_fichier_inconnue",
             Self::CadenceNonDeclaree => "cadence_non_declaree_par_le_pilote",
             Self::PlafondDeZone => "plafond_de_cadence_de_la_zone",
+            Self::VoiesNonDeclarees => "voies_non_declarees_par_le_pilote",
         }
     }
 }
@@ -1258,8 +1275,10 @@ pub fn decider_dsd_natif_local(
     let _ = strict;
     let cadences = match sortie {
         SortieDsdLocale::NonAsio => return Err(MotifDsdServiEnDop::SortieNonAsio),
-        SortieDsdLocale::AsioNonSondee => return Err(MotifDsdServiEnDop::CapaciteNonSondee),
-        SortieDsdLocale::Asio { cadences } => cadences,
+        SortieDsdLocale::AsioNonSondee | SortieDsdLocale::AlsaNonSondee => {
+            return Err(MotifDsdServiEnDop::CapaciteNonSondee);
+        }
+        SortieDsdLocale::Asio { cadences } | SortieDsdLocale::Alsa { cadences, .. } => cadences,
     };
     if cadences.is_empty() {
         return Err(MotifDsdServiEnDop::PiloteSansDsd);
@@ -1272,6 +1291,25 @@ pub fn decider_dsd_natif_local(
     }
     if plafond_zone.is_some_and(|max| cadence / 16 > max) {
         return Err(MotifDsdServiEnDop::PlafondDeZone);
+    }
+    Ok(())
+}
+
+/// #8248 — [`decider_dsd_natif_local`], plus le nombre de voies du fichier :
+/// une sortie ALSA a été sondée sur un nombre de voies précis, et le pilote
+/// refuserait les autres. ASIO ouvre les voies du fichier : inchangé.
+pub fn decider_dsd_natif_local_voies(
+    sortie: &SortieDsdLocale,
+    cadence_fichier: Option<u32>,
+    canaux_fichier: Option<u32>,
+    plafond_zone: Option<u32>,
+    strict: bool,
+) -> Result<(), MotifDsdServiEnDop> {
+    decider_dsd_natif_local(sortie, cadence_fichier, plafond_zone, strict)?;
+    if let SortieDsdLocale::Alsa { voies, .. } = sortie
+        && canaux_fichier != Some(u32::from(*voies))
+    {
+        return Err(MotifDsdServiEnDop::VoiesNonDeclarees);
     }
     Ok(())
 }
