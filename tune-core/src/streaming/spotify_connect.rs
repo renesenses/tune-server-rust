@@ -545,6 +545,18 @@ pub fn ligne_d_erreur_librespot(ligne: &str) -> Option<String> {
     None
 }
 
+/// Fil 2778 — une ligne `WARN` de librespot (« Skipping to next track,
+/// unable to load track », clé audio refusée…). Elle restait au niveau
+/// `debug`, invisible dans le journal d'un testeur : c'est pourtant elle qui
+/// dit pourquoi le récepteur saute les titres.
+pub fn ligne_d_avertissement_librespot(ligne: &str) -> Option<String> {
+    let l = ligne.trim();
+    let i = l.find(" WARN ")?;
+    let reste = &l[i + " WARN ".len()..];
+    let message = reste.split_once("] ").map_or(reste, |(_, m)| m);
+    Some(message.trim().to_string())
+}
+
 impl LibrespotDaemon {
     pub fn new(device_name: String, binary_path: Option<String>, bitrate: Option<u32>) -> Self {
         Self {
@@ -796,6 +808,8 @@ impl LibrespotDaemon {
                         if let Ok(mut e) = derniere_erreur.lock() {
                             *e = Some(erreur);
                         }
+                    } else if let Some(avertissement) = ligne_d_avertissement_librespot(&line) {
+                        warn!(avertissement = %avertissement, "librespot_avertissement");
                     } else if let Some((event, track_id)) = parse_librespot_event(&line) {
                         on_event(event, track_id);
                     } else {
@@ -1569,6 +1583,24 @@ mod tests {
         // Même nom : rien ne bouge.
         assert!(!recepteur.renommer(Some("Salon")).await.unwrap());
         recepteur.disable().await;
+    }
+
+    #[test]
+    fn avertissement_2778_ligne_warn_de_librespot_reconnue() {
+        assert_eq!(
+            ligne_d_avertissement_librespot(
+                "[2026-11-12T11:05:01Z WARN  librespot_playback::player] Skipping to next track, unable to load track"
+            )
+            .as_deref(),
+            Some("Skipping to next track, unable to load track")
+        );
+        assert_eq!(
+            ligne_d_avertissement_librespot(
+                "[2026-11-12T11:05:01Z INFO  librespot] Using Pipe sink"
+            ),
+            None
+        );
+        assert_eq!(ligne_d_avertissement_librespot("TUNE_EVENT\tplaying"), None);
     }
 
     #[test]
