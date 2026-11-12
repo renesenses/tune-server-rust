@@ -2913,7 +2913,8 @@ impl PlaybackOrchestrator {
         zone_id: i64,
     ) -> bool {
         // PURE : le PCM atteint la sortie intact, aucun repli n'est appliqué.
-        if crate::audio::audiophile::zone_enabled(db, zone_id) {
+        // #8513 — pendant une mesure de pièce non plus.
+        if crate::audio::audiophile::traitements_contournes(db, zone_id) {
             return false;
         }
         Self::zone_mono_downmix_configure_with(db, zone_id)
