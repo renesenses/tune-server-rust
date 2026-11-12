@@ -37,6 +37,8 @@ pub mod liens_externes;
 pub mod lyrics;
 pub mod matcher;
 pub mod musicbrainz_release;
+#[cfg(test)]
+mod oeuvre_mouvement_tests_8325;
 // Les réponses `/release/{mbid}` gardées en base (#4805, idée 3 de MetaRust).
 pub mod musicbrainz_release_cache;
 // La note d'une piste lue dans ses balises, ramenée sur 0 à 5 (#6123).
@@ -4501,6 +4503,24 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::ContentGroup) {
         meta.insert("grouping".into(), v);
     }
+    // #8325 — l'ŒUVRE et le MOUVEMENT, pour les facettes et les colonnes de
+    // la Collection. lofty les range sous `Work` / `Movement` : Vorbis WORK et
+    // MOVEMENTNAME, ID3v2 `TXXX:WORK` et MVNM, MP4 `©wrk` et `©mvn`, APE
+    // WORKTITLE et MOVEMENTNAME. Mêmes clés que l'assistant IA, qui ne les
+    // remplit que quand le fichier n'en dit rien. GROUPING reste aussi sous
+    // `grouping`.
+    // iTunes 12.5 et suivants écrivent l'œuvre dans la trame ID3 TIT1 et le
+    // regroupement dans GRP1 : quand GRP1 est présent, TIT1 est l'œuvre
+    // (c'est la désambiguïsation que lofty documente pour `ContentGroup`).
+    // Sans GRP1, TIT1 reste un regroupement quelconque et n'est pas repris.
+    if let Some(v) = get(ItemKey::Work)
+        .or_else(|| get(ItemKey::AppleId3v2ContentGroup).and_then(|_| get(ItemKey::ContentGroup)))
+    {
+        meta.insert("work".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Movement) {
+        meta.insert("movement".into(), v);
+    }
     if let Some(v) = get(ItemKey::FlagCompilation) {
         meta.insert("compilation".into(), v);
     }
@@ -4572,11 +4592,16 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
                 .filter_map(|k| find_vorbis_comment(h, k).map(|v| (k.to_string(), v)))
                 // #8026 — TOUTES les trames ENSEMBLE / ORCHESTRA : un fichier
                 // qui cite deux orchestres les crédite tous les deux.
-                .chain(credits_balises::CLES_ENSEMBLE.iter().flat_map(|k| {
-                    find_vorbis_comments(h, k, usize::MAX)
-                        .into_iter()
-                        .map(move |v| (k.to_string(), v))
-                }))
+                .chain(
+                    credits_balises::CLES_ENSEMBLE
+                        .iter()
+                        .chain(std::iter::once(&credits_balises::CLE_BAND))
+                        .flat_map(|k| {
+                            find_vorbis_comments(h, k, usize::MAX)
+                                .into_iter()
+                                .map(move |v| (k.to_string(), v))
+                        }),
+                )
                 .collect(),
             None => balises_brutes::lire_balises_du_fichier(path)
                 .map(|b| b.paires())
@@ -4595,6 +4620,16 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         // (TMCL, « instrument: nom »), et l'arrangeur d'un MP4. Lu dans les
         // mêmes clés brutes, sans E/S de plus.
         credits_balises::completer_par_les_cles_brutes(&mut meta, &brutes);
+        // #8325 — BAND, quand il n'est ni l'artiste d'album (TPE2 chez
+        // foobar2000 / Mp3tag) ni celui de la piste : l'orchestre d'un classique.
+        credits_balises::completer_par_band(
+            &mut meta,
+            &brutes,
+            &[
+                get(ItemKey::AlbumArtist).as_deref(),
+                get(ItemKey::TrackArtist).as_deref(),
+            ],
+        );
     }
     if let Some(v) = get(ItemKey::OriginalMediaType)
         .or_else(|| find_vorbis_comment(header.as_deref()?, "SOURCE"))

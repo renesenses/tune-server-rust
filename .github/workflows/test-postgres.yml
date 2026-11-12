@@ -273,6 +273,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_916 -- --nocapture --test-threads=1
 
+      # #8325 — facettes du classique (chefs, ensembles, oeuvres) sur un vrai
+      # PostgreSQL : effectifs du rail, prédicat de la liste (marqueurs `$n`,
+      # identifiants projetés en texte) et colonnes. Sans cette étape,
+      # l'épreuve prendrait son saut annoncé.
+      - name: Facettes du classique sur PostgreSQL (#8325)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_chefs_ensembles_et_oeuvres_8325 -- --nocapture --test-threads=1
+
       # #7979 — un nom d'artiste corrigé dans les balises (accents ajoutés)
       # reprend la fiche, sans osciller ; un nom différent (espace ajouté)
       # obtient la sienne. Sans cette étape, l'épreuve prendrait son saut

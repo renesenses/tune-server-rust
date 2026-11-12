@@ -449,6 +449,35 @@ fn build_facet_conditions(
         conds.push(c);
         params.extend(p);
     }
+    // #8325 — chef, ensemble, œuvre : facettes à part entière (elles ne se
+    // filtrent pas elles-mêmes), lues dans les magasins ouverts.
+    for (valeurs, champ) in [
+        (
+            &sel.conductors,
+            tune_core::db::facettes_classiques::Champ::Chef,
+        ),
+        (
+            &sel.ensembles,
+            tune_core::db::facettes_classiques::Champ::Ensemble,
+        ),
+        (
+            &sel.works,
+            tune_core::db::facettes_classiques::Champ::Oeuvre,
+        ),
+    ] {
+        if exclude == champ.nom() {
+            continue;
+        }
+        if let Some((c, p)) = combiner(
+            &mut ph,
+            valeurs,
+            sel.est_en_et(champ.nom()),
+            tune_core::db::facettes_classiques::bloc(engine, champ),
+        ) {
+            conds.push(c);
+            params.extend(p);
+        }
+    }
     if exclude != "artist" {
         // `tracks` has no artist_name column (artist is a FK to `artists`), and
         // these conditions run against `FROM tracks t` with no join, so resolve
@@ -816,6 +845,12 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 // tant que les crédits ne sont pas là, un client la demande
                 // explicitement (`fields=…,instrument`).
                 "instrument" => instrument_facet(state, engine, limit, conds, params),
+                // #8325 — chef, ensemble, œuvre. Comme `instrument`, hors du jeu
+                // par défaut : vides sur une bibliothèque sans classique, un
+                // client les demande explicitement (`fields=…,conductor`).
+                f @ ("conductor" | "ensemble" | "work") => {
+                    classique_facet(state, f, limit, conds, params)
+                }
                 "favorite" => favorite_facet(state, q.sel.profile_id, conds, params),
                 "playlist" => playlist_facet(state, limit, conds, params),
                 "untagged" => untagged_facet(state, conds, params),
@@ -887,7 +922,7 @@ pub(super) enum OrdreDeFacette {
 fn ordre_de_la_facette(field: &str) -> OrdreDeFacette {
     match field {
         "original_year" | "dr" | "rating" | "favorite" | "untagged" => OrdreDeFacette::TelQuel,
-        "instrument" => OrdreDeFacette::EffectifPuisValeur,
+        "instrument" | "conductor" | "ensemble" | "work" => OrdreDeFacette::EffectifPuisValeur,
         _ => OrdreDeFacette::Effectif,
     }
 }
@@ -1790,6 +1825,23 @@ fn instrument_facet(
         .collect()
 }
 
+/// #8325 — chef, ensemble ou œuvre : une entrée par personne ou par œuvre,
+/// comptée en pistes distinctes, tous magasins confondus
+/// ([`tune_core::db::facettes_classiques`]).
+fn classique_facet(
+    state: &AppState,
+    field: &str,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let Some(champ) = tune_core::db::facettes_classiques::Champ::facette(field) else {
+        return Vec::new();
+    };
+    tune_core::db::facettes_classiques::effectifs(&state.backend, champ, conds, params, limit)
+        .ou_defaut_journalise()
+}
+
 fn kv_facet(
     state: &AppState,
     key: &str,
@@ -1836,6 +1888,10 @@ mod socle_5977_tests;
 #[cfg(test)]
 #[path = "facettes_et_2108_tests.rs"]
 mod facettes_et_2108_tests;
+
+#[cfg(test)]
+#[path = "facettes_classiques_8325_tests.rs"]
+mod facettes_classiques_8325_tests;
 
 #[cfg(test)]
 mod tests {

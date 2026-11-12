@@ -21,6 +21,8 @@ mod collection_folders;
 pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
+/// #8325 — la relecture unique des balises classiques des fichiers importés.
+pub(crate) mod relecture_classique;
 // #4805 — les crédits d'un album lus juste après son identification.
 mod credits_apres_identification;
 mod duplicates;
@@ -82,6 +84,7 @@ mod spectrogramme;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
 // source de la même façon. Un seul point de vérité, partagé (#2147).
+mod classements_8264;
 pub(crate) mod compositeur_depuis_credits;
 pub(crate) mod graver_compilation;
 pub(crate) mod graver_dr;
@@ -1044,6 +1047,10 @@ mod filtre_qualite_7725_tests;
 #[cfg(test)]
 #[path = "notes_et_repartitions_7849_tests.rs"]
 mod notes_et_repartitions_7849_tests;
+
+#[cfg(test)]
+#[path = "classements_8264_tests.rs"]
+mod classements_8264_tests;
 
 #[cfg(test)]
 #[path = "requete_avancee_7872_tests.rs"]
