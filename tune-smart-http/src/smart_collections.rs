@@ -1032,7 +1032,15 @@ pub fn build_album_query(
             // 🔴 #7769 — les écoutes d'une piste de l'album par la règle de la
             // Bibliothèque (titre + interprète) : `lh.track_id`, toujours NULL,
             // ne rattachait aucune écoute à aucun album.
-            let on = tune_core::db::history_repo::sql::ecoute_de_la_piste("t3", "lh");
+            // 🔴 #8416 — et les écoutes IMPORTÉES (`imported_plays`, #7763),
+            // que la Bibliothèque compte aussi : `ecoutes_des_albums` rend, par
+            // album écouté, la somme des deux et la plus récente des dates.
+            let albums = tune_core::db::history_repo::sql::ecoutes_des_albums();
+            let parmi =
+                |cond: &str| format!("al.id IN (SELECT ea.album_id FROM {albums} ea WHERE {cond})");
+            let hors = |cond: &str| {
+                format!("al.id NOT IN (SELECT ea.album_id FROM {albums} ea WHERE {cond})")
+            };
             // Un nombre d'écoutes illisible ne vaut plus 0 : la règle rend
             // FAUX (#1231), comme côté pistes.
             let int_v = match value.trim().parse::<i64>() {
@@ -1044,45 +1052,14 @@ pub fn build_album_query(
                 Err(_) => 0,
             };
             let cond = match (field, op) {
-                ("play_count", "=" | "==") if int_v == 0 => format!(
-                    "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on})"
-                ),
-                ("play_count", "=") => format!(
-                    "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on} \
-                     GROUP BY t3.album_id HAVING COUNT(*) = {int_v})"
-                ),
-                ("play_count", ">=") => format!(
-                    "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on} \
-                     GROUP BY t3.album_id HAVING COUNT(*) >= {int_v})"
-                ),
-                ("play_count", ">") => format!(
-                    "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on} \
-                     GROUP BY t3.album_id HAVING COUNT(*) > {int_v})"
-                ),
-                ("play_count", "<") => format!(
-                    "al.id NOT IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on} \
-                     GROUP BY t3.album_id HAVING COUNT(*) >= {int_v})"
-                ),
-                ("last_played_at", ">" | ">=") => {
+                ("play_count", "=" | "==") if int_v == 0 => hors("ea.n > 0"),
+                ("play_count", "=") => parmi(&format!("ea.n = {int_v}")),
+                ("play_count", ">=") => parmi(&format!("ea.n >= {int_v}")),
+                ("play_count", ">") => parmi(&format!("ea.n > {int_v}")),
+                ("play_count", "<") => hors(&format!("ea.n >= {int_v}")),
+                ("last_played_at", ">" | ">=" | "<" | "<=") => {
                     let ts = resolve_timestamp_sql(&value);
-                    format!(
-                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON {on} \
-                         WHERE lh.listened_at {op} {ts} GROUP BY t3.album_id)"
-                    )
-                }
-                ("last_played_at", "<" | "<=") => {
-                    let ts = resolve_timestamp_sql(&value);
-                    format!(
-                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON {on} \
-                         GROUP BY t3.album_id HAVING MAX(lh.listened_at) {op} {ts})"
-                    )
+                    parmi(&format!("ea.derniere {op} {ts}"))
                 }
                 // #5547 — « entre » : l'éditeur le propose pour les deux
                 // champs, et le moteur n'avait aucun bras. La règle tombait
@@ -1091,18 +1068,11 @@ pub fn build_album_query(
                     let Some((lo, hi)) = crate::regles_sql::bornes_de_nombres(value_raw) else {
                         continue;
                     };
-                    let dans = format!(
-                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON {on} \
-                         GROUP BY t3.album_id HAVING COUNT(*) BETWEEN {lo} AND {hi})"
-                    );
+                    let dans = parmi(&format!("ea.n BETWEEN {lo} AND {hi}"));
                     if lo <= 0 {
                         // Zéro écoute n'a pas de ligne : « entre 0 et N »
                         // doit garder les albums jamais écoutés.
-                        format!(
-                            "(al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
-                             JOIN listen_history lh ON {on}) OR {dans})"
-                        )
+                        format!("({} OR {dans})", hors("ea.n > 0"))
                     } else {
                         dans
                     }
@@ -1111,29 +1081,18 @@ pub fn build_album_query(
                     let Some((lo, hi)) = crate::regles_sql::bornes_de_dates(value_raw) else {
                         continue;
                     };
-                    format!(
-                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON {on} \
-                         GROUP BY t3.album_id HAVING MAX(lh.listened_at) BETWEEN {lo} AND {hi})"
-                    )
+                    parmi(&format!("ea.derniere BETWEEN {lo} AND {hi}"))
                 }
                 // #6122 — « écouté dans les N derniers jours » : une écoute au
                 // moins depuis le seuil, lu à l'horloge à chaque requête.
                 ("last_played_at", crate::regles_sql::DANS_LES_DERNIERS_JOURS) => {
                     match crate::regles_sql::seuil_de(value_raw) {
-                        Some(s) => format!(
-                            "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                             JOIN listen_history lh ON {on} \
-                             WHERE lh.listened_at >= {} GROUP BY t3.album_id)",
-                            s.iso
-                        ),
+                        Some(s) => parmi(&format!("ea.derniere >= {}", s.iso)),
                         None => crate::regles_sql::FAUX.to_string(),
                     }
                 }
-                ("last_played_at", "is_null") => format!(
-                    "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on})"
-                ),
+                // « jamais » : ni écoute ni date, comme côté pistes (#8416).
+                ("last_played_at", "is_null") => hors("ea.n > 0 OR ea.derniere IS NOT NULL"),
                 _ => continue,
             };
             conditions.push(cond);

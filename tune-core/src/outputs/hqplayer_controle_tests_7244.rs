@@ -27,6 +27,10 @@ struct Options {
     /// il pousse un `Status` sur cette connexion, AVANT l'acquittement du
     /// `Play` puis après chaque réponse (le pire ordre envisageable).
     hqplayer_3_pousse_avant_acquittement: bool,
+    /// #8395 — HQPlayer ferme la connexion de contrôle juste après avoir
+    /// répondu : sur chaque connexion (`true`), ou sur la première seulement
+    /// (`false`, une connexion restée ouverte puis fermée côté HQPlayer).
+    ferme_apres_reponse: Option<bool>,
 }
 #[derive(Default)]
 struct Etat {
@@ -130,6 +134,11 @@ impl Banc {
                                     if toujours || premiere { trame.extend_from_slice(octets); }
                                     if socket.get_mut().write_all(&trame).await.is_err() { return; }
                                 } else if socket.get_mut().write_all(reponse.as_bytes()).await.is_err() { return; }
+                                if let Some(toujours) = options.ferme_apres_reponse
+                                    && (toujours || id == 1)
+                                {
+                                    return;
+                                }
                             }
                         });
                     }
@@ -470,6 +479,53 @@ async fn hqplayer_3_status_pousses_des_play_8395() {
         1,
         "les Status poussés ne font pas rouvrir la connexion"
     );
+}
+
+/// #8395 — témoin (journal du testeur : `hqplayer read error: … os error
+/// 10053`) : HQPlayer a fermé la connexion de contrôle restée ouverte. Le
+/// clic suivant commence par un `Status` écrit dans cette socket morte ; sans
+/// le correctif, sa lecture échoue et `play_media` est refusé.
+#[tokio::test]
+async fn connexion_fermee_par_hqplayer_le_clic_suivant_aboutit_8395() {
+    let b = Banc::nouveau(Options {
+        ferme_apres_reponse: Some(false),
+        ..Default::default()
+    })
+    .await;
+    let sortie = b.sortie();
+    sortie.get_status().await.expect("premier Status");
+    // Le temps que la fermeture de HQPlayer arrive (le sondeur, lui, attend 1 s).
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let issue = sortie.play_media(&media()).await;
+    eprintln!("8395 temoin fermeture: play_media={issue:?}");
+    issue.unwrap_or_else(|e| panic!("#8395 : lecture refusée après fermeture : {e}"));
+    assert_eq!(
+        b.commandes("Play"),
+        1,
+        "le Play n'est jamais envoyé deux fois"
+    );
+    assert_eq!(b.commandes("PlaylistAdd"), 1);
+    assert_eq!(b.etat.lock().unwrap().connexions, 2);
+}
+
+/// #8395 — un HQPlayer qui ferme après CHAQUE réponse : chaque sondage
+/// rouvre une connexion au lieu d'échouer une fois sur deux.
+#[tokio::test]
+async fn hqplayer_qui_ferme_apres_chaque_reponse_chaque_sondage_aboutit_8395() {
+    let b = Banc::nouveau(Options {
+        ferme_apres_reponse: Some(true),
+        ..Default::default()
+    })
+    .await;
+    let sortie = b.sortie();
+    for tour in 0..3 {
+        if let Err(e) = sortie.get_status().await {
+            panic!("#8395 : sondage {tour} en échec après fermeture : {e}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(b.commandes("Status"), 3, "un seul Status écrit par sondage");
+    assert_eq!(b.etat.lock().unwrap().connexions, 3);
 }
 
 #[test]
