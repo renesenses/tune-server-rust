@@ -1839,6 +1839,7 @@ fn touche_le_replaygain(cles_posees: &[String]) -> bool {
 
 pub(super) async fn update_config(
     _admin: crate::auth::RequireAdmin,
+    headers: axum::http::HeaderMap,
     profile: ActiveProfile,
     State(state): State<AppState>,
     Json(body): Json<ConfigPatch>,
@@ -2093,9 +2094,21 @@ pub(super) async fn update_config(
         tune_core::audio::replaygain::progression::au_repos();
     }
     if !cles_posees.is_empty() {
+        // #8521 — QUI a envoyé l'écriture (interface web, application, script) :
+        // l'en-tête `User-Agent`, jamais un secret. La valeur des deux
+        // consentements suivis est, elle, dans `reglage_consenti_ecrit`.
+        let client = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|ua| match ua.char_indices().nth(160) {
+                Some((i, _)) => &ua[..i],
+                None => ua,
+            })
+            .unwrap_or("?");
         tracing::info!(
             reglages = %cles_posees.join(","),
             nombre = cles_posees.len(),
+            client,
             "reglages_ecrits"
         );
     }
@@ -5719,6 +5732,7 @@ mod purge_hors_perimetre_tests {
         let objet = patch.as_object().expect("patch objet").clone();
         let reponse = super::update_config(
             RequireAdmin,
+            axum::http::HeaderMap::new(),
             ActiveProfile(DEFAULT_PROFILE_ID),
             State(state.clone()),
             Json(super::ConfigPatch(objet)),
@@ -6211,6 +6225,7 @@ mod ui_preferences_par_profil_tests {
         );
         update_config(
             RequireAdmin,
+            axum::http::HeaderMap::new(),
             ActiveProfile(pid),
             State(state.clone()),
             Json(super::ConfigPatch(objet)),
@@ -6516,6 +6531,7 @@ mod levee_du_bridage_6713_tests {
         corps.insert(CLE_LEVER_LE_BRIDAGE.to_string(), json!(true));
         update_config(
             RequireAdmin,
+            axum::http::HeaderMap::new(),
             ActiveProfile(DEFAULT_PROFILE_ID),
             State(state.clone()),
             Json(super::ConfigPatch(corps)),
@@ -6588,6 +6604,7 @@ mod rappel_audit_integrite_6286_tests {
         corps.insert(CLE_RAPPEL_JOURS.to_string(), json!(30));
         let _reponse = update_config(
             RequireAdmin,
+            axum::http::HeaderMap::new(),
             ActiveProfile(DEFAULT_PROFILE_ID),
             State(state.clone()),
             Json(super::ConfigPatch(corps)),
@@ -6713,6 +6730,7 @@ mod politique_de_lecture_4681_tests {
         );
         update_config(
             RequireAdmin,
+            axum::http::HeaderMap::new(),
             ActiveProfile(DEFAULT_PROFILE_ID),
             State(state.clone()),
             Json(super::ConfigPatch(corps)),
