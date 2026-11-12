@@ -602,6 +602,7 @@ pub async fn run_with(opts: RunOptions) {
     // leur nom : un démarrage resté sur la page d'attente ne laissait voir
     // que « découverte réseau », qui n'était plus l'étape en cours.
     crate::boot_status::set_phase("Spotify Connect");
+    routes::spotify_connect::brancher_les_sessions(&state);
     routes::spotify_connect::auto_start(&state).await;
 
     // Clone before `state` is moved into the router — used to auto-resume local

@@ -646,6 +646,16 @@ impl AppState {
                 ),
             ),
         );
+        // #8565 — une lecture lancée depuis l'application Spotify vers le
+        // récepteur : session PCM en direct sur la zone exposée.
+        orch.sources_pcm().inscrire(
+            tune_core::streaming::spotify_connect_session::SOURCE,
+            Arc::new(
+                tune_core::streaming::spotify_connect_session::FournisseurConnect::new(
+                    spotify_connect.clone(),
+                ),
+            ),
+        );
         let orchestrator = Arc::new(orch);
 
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);

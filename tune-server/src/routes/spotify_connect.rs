@@ -211,6 +211,22 @@ async fn transfer_playback(
     }
 }
 
+/// #8565 — les sessions lancées depuis l'application Spotify jouent dans la
+/// zone exposée : le pilote reçoit chaque évènement de librespot.
+pub fn brancher_les_sessions(state: &AppState) {
+    use tune_core::streaming::spotify_connect_session::{PiloteConnect, ZonesDeLOrchestrateur};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    state.spotify_connect.brancher_les_evenements(tx);
+    tokio::spawn(
+        PiloteConnect {
+            recepteur: state.spotify_connect.clone(),
+            zones: ZonesDeLOrchestrateur(state.orchestrator.clone()),
+        }
+        .piloter(rx),
+    );
+    info!("spotify_connect_sessions_branchees");
+}
+
 pub async fn auto_start(state: &AppState) {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
