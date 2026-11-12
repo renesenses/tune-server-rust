@@ -164,6 +164,8 @@ done
     struct FaussesZones {
         appels: StdMutex<Vec<String>>,
         refuser: bool,
+        /// #8580 — la zone a été arrêtée (ou reprise) dans Tune.
+        ne_joue_plus: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -180,7 +182,7 @@ done
             }
         }
         async fn joue_la_session(&self, _: i64) -> bool {
-            true
+            !self.ne_joue_plus.load(std::sync::atomic::Ordering::SeqCst)
         }
         async fn morceau(&self, zone_id: i64, m: &Morceau) {
             self.appels.lock().unwrap().push(format!(
@@ -273,6 +275,122 @@ done
             ],
             "args de librespot : {args}"
         );
+    }
+
+    fn ouvertures(z: &FaussesZones) -> usize {
+        z.appels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.starts_with("ouvrir "))
+            .count()
+    }
+
+    /// #8580 — Stop dans Tune sur la zone exposée : la session est morte.
+    /// Lecture dans l'application Spotify la ROUVRE (avant : `etat.zone`
+    /// restait rempli, aucun son).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_rouverte_apres_un_stop_dans_tune() {
+        let dossier = tempfile::tempdir().unwrap();
+        let recepteur = recepteur(dossier.path());
+        let zones = Arc::new(FaussesZones::default());
+        let pilote = PiloteConnect {
+            recepteur: recepteur.clone(),
+            zones: zones.clone(),
+        };
+        recepteur.enable(9).await.unwrap();
+        let mut etat = EtatSession::default();
+        pilote.traiter(&mut etat, &joue("a")).await;
+        assert_eq!(ouvertures(&zones), 1);
+        // Contre-épreuve : la zone joue encore la session, rien ne rouvre.
+        pilote.traiter(&mut etat, &joue("a")).await;
+        assert_eq!(ouvertures(&zones), 1, "session vivante rouverte à tort");
+        zones
+            .ne_joue_plus
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        pilote.traiter(&mut etat, &joue("a")).await;
+        recepteur.disable().await;
+        assert_eq!(ouvertures(&zones), 2, "{:?}", zones.appels.lock().unwrap());
+        assert_eq!(etat.zone(), Some(9));
+    }
+
+    /// #8580 — librespot relancé (renommage #8570, plantage, relance pour la
+    /// liaison) : la session ouverte sous l'ancien lancement est morte, le
+    /// `playing` suivant la rouvre.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_rouverte_apres_une_relance_de_librespot() {
+        let dossier = tempfile::tempdir().unwrap();
+        let recepteur = recepteur(dossier.path());
+        let zones = Arc::new(FaussesZones::default());
+        let pilote = PiloteConnect {
+            recepteur: recepteur.clone(),
+            zones: zones.clone(),
+        };
+        recepteur.enable(9).await.unwrap();
+        let avant = recepteur.lancement_de_librespot();
+        let mut etat = EtatSession::default();
+        pilote.traiter(&mut etat, &joue("a")).await;
+        assert_eq!(ouvertures(&zones), 1);
+        recepteur.relancer_pour_la_liaison().await;
+        assert!(
+            recepteur.lancement_de_librespot() > avant,
+            "relance non comptée"
+        );
+        pilote.traiter(&mut etat, &joue("a")).await;
+        recepteur.disable().await;
+        assert_eq!(ouvertures(&zones), 2, "{:?}", zones.appels.lock().unwrap());
+    }
+
+    /// #8581 — Tune lance un titre Spotify sur la zone MÊME qui joue la
+    /// session Connect : la zone n'est pas arrêtée par le pilote, même si son
+    /// évènement arrive avant que la lecture de Tune ait remplacé la lecture
+    /// en cours (relecture du 12/11).
+    async fn reprise_sur_la_zone(zone_reprise_par_tune: bool) -> Vec<String> {
+        let dossier = tempfile::tempdir().unwrap();
+        let recepteur = recepteur(dossier.path());
+        let zones = Arc::new(FaussesZones::default());
+        let pilote = PiloteConnect {
+            recepteur: recepteur.clone(),
+            zones: zones.clone(),
+        };
+        recepteur.enable(9).await.unwrap();
+        let mut etat = EtatSession::default();
+        pilote.traiter(&mut etat, &joue("a")).await;
+        // Tune prend la pompe pour son titre.
+        let _rx = recepteur.pompe().attacher(Some("t".into()));
+        if zone_reprise_par_tune {
+            // La lecture de Tune remplace celle de la zone 300 ms plus tard.
+            let z = zones.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                z.ne_joue_plus
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        // L'évènement de librespot pour le titre de Tune arrive AVANT.
+        pilote
+            .traiter(&mut etat, &titre("t", "Titre de Tune"))
+            .await;
+        recepteur.disable().await;
+        let appels = zones.appels.lock().unwrap().clone();
+        appels
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reprise_8581_meme_zone_pas_arretee() {
+        let appels = reprise_sur_la_zone(true).await;
+        assert!(
+            !appels.iter().any(|a| a == "arreter 9"),
+            "la zone que Tune lance a été arrêtée : {appels:?}"
+        );
+    }
+
+    /// Contre-épreuve : la session jouait sur une zone que Tune ne reprend
+    /// pas : elle est arrêtée.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reprise_8581_autre_zone_arretee() {
+        let appels = reprise_sur_la_zone(false).await;
+        assert!(appels.iter().any(|a| a == "arreter 9"), "{appels:?}");
     }
 
     /// Zone exposée absente : la raison est retenue et rendue par le statut.
@@ -392,6 +510,32 @@ fn premium_8565_les_lignes_de_librespot_reconnues() {
     assert!(!exige_premium(
         "could not initialize spirc: INVALID_CREDENTIALS"
     ));
+    // #8580 — une ligne d'information qui cite « premium » n'est pas un
+    // refus : elle n'écrase pas la dernière erreur d'un compte Premium.
+    for info in [
+        "[2026-11-12T12:00:00Z INFO  librespot_core::session] Account type: premium",
+        "[.. DEBUG librespot] product=premium, catalogue=premium",
+    ] {
+        assert!(!exige_premium(info), "{info}");
+    }
+}
+
+/// #8580 — les refus de la zone exposée deviennent des codes stables.
+#[test]
+fn session_8580_refus_de_zone_en_code_stable() {
+    assert_eq!(
+        code_de_refus_de_session("free_zone_cap:2:1"),
+        CODE_PLAFOND_DE_ZONES
+    );
+    assert_eq!(
+        code_de_refus_de_session("parental_lease_refused:hors_plage"),
+        CODE_REFUS_PARENTAL
+    );
+    assert_eq!(
+        code_de_refus_de_session("parental_explicit_refused"),
+        CODE_REFUS_PARENTAL
+    );
+    assert_eq!(code_de_refus_de_session("sortie absente"), "sortie absente");
 }
 
 /// « Le dernier geste gagne » (Bertrand, 12/11) — l'évènement synthétique de

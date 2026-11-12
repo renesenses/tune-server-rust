@@ -385,25 +385,32 @@ impl FournisseurPcm for FournisseurSpotify {
         // début ne se perd.
         let pompe = self.recepteur.pompe();
         // « Le dernier geste gagne » (Bertrand, 12/11) : une session Spotify
-        // Connect ouverte perd la pompe. Le pilote des sessions la ferme côté
-        // zone tout de suite (la zone ne reste pas à moitié Connect).
+        // Connect ouverte perd la pompe.
         let session_connect = pompe.consommateur_continu();
         let rx = pompe.attacher(Some(piste.clone()));
-        if session_connect {
-            self.recepteur.signaler_reprise_par_tune();
-        }
         let lancement = rt.block_on(self.pilote.lancer(
             self.recepteur.device_name(),
             &piste,
             depuis_ms,
         ));
-        // La reprise a échoué : l'appareil jouerait encore la session dans le
-        // vide. Pause, pour que l'application Spotify le voie s'arrêter.
-        if lancement.is_err()
-            && session_connect
-            && let Err(e) = rt.block_on(self.pilote.mettre_en_pause(self.recepteur.device_name()))
-        {
-            tracing::warn!(erreur = %e, "spotify_pause_apres_reprise_impossible");
+        // Réussite : RIEN n'est signalé d'ici. `ouvrir` tourne pendant la
+        // résolution de la lecture, avant que la zone ne remplace sa lecture
+        // en cours : un arrêt demandé maintenant toucherait la zone même que
+        // Tune est en train de lancer, si c'est elle qui jouait la session
+        // (relecture du 12/11). La session est fermée par le pilote au
+        // premier évènement de librespot pour le titre de Tune
+        // (`lecture_de_tune`), ou comme session morte (#8580).
+        //
+        // Échec : la zone garde une session au flux mort et l'appareil
+        // jouerait dans le vide. Le pilote la ferme tout de suite, et
+        // l'appareil est mis en pause pour que l'application Spotify le voie
+        // s'arrêter.
+        if lancement.is_err() && session_connect {
+            self.recepteur.signaler_reprise_par_tune();
+            if let Err(e) = rt.block_on(self.pilote.mettre_en_pause(&self.recepteur.device_name()))
+            {
+                tracing::warn!(erreur = %e, "spotify_pause_apres_reprise_impossible");
+            }
         }
         if let Err(e) = lancement {
             pompe.detacher();
@@ -1135,15 +1142,19 @@ exit 1
 
     const PREND: &str = crate::streaming::spotify_connect::EVENEMENT_TUNE_PREND_LA_MAIN;
 
-    /// Session Connect ouverte, Tune lance un titre : le pilote des sessions
-    /// est prévenu (il ferme la zone) ; le titre de Tune joue sur l'appareil,
-    /// aucune pause.
+    /// Session Connect ouverte, Tune lance un titre avec succès : AUCUN
+    /// évènement synthétique n'est envoyé pendant `ouvrir` (relecture du
+    /// 12/11). `ouvrir` tourne pendant la résolution de la lecture, avant
+    /// que la zone ne remplace sa lecture en cours : un arrêt demandé là
+    /// toucherait la zone même que Tune lance, si c'est elle qui jouait la
+    /// session. Le pilote ferme la session au premier évènement de librespot
+    /// pour le titre de Tune (`lecture_de_tune`). Aucune pause.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dernier_geste_tune_prend_la_main_sur_la_session_connect() {
+    async fn dernier_geste_reussi_ne_signale_rien_pendant_la_resolution() {
         let (evenements, pauses) = tokio::task::spawn_blocking(|| reprise(true, false))
             .await
             .unwrap();
-        assert!(evenements.iter().any(|e| e == PREND), "{evenements:?}");
+        assert!(!evenements.iter().any(|e| e == PREND), "{evenements:?}");
         assert!(pauses.is_empty(), "{pauses:?}");
     }
 
