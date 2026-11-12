@@ -261,6 +261,30 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
         )
             .into_response();
     }
+    // Compte Spotify gratuit : Spotify ne laisse écouter dans une application
+    // tierce qu'avec Premium (refus de librespot ou `PREMIUM_REQUIRED` de
+    // l'API Web). 409 au code stable, phrase traduite qui le dit et rappelle
+    // que la navigation reste possible ; testé AVANT la liaison, que
+    // choisir l'appareil dans l'application Spotify ne débloquerait pas.
+    if let Some(pos) = e.find(tune_core::streaming::spotify_lecture::SENTINELLE_PREMIUM_REQUIS) {
+        use tune_core::streaming::spotify_lecture::{
+            CODE_PREMIUM_REQUIS, SENTINELLE_PREMIUM_REQUIS,
+        };
+        let cause = e[pos + SENTINELLE_PREMIUM_REQUIS.len()..].trim();
+        let mut corps = crate::message_api::avec_message_en(
+            json!({
+                "error": CODE_PREMIUM_REQUIS,
+                "code": CODE_PREMIUM_REQUIS,
+            }),
+            lang,
+            "spotify.playback.premiumRequired",
+            &[],
+        );
+        if let Some(objet) = corps.as_object_mut() {
+            objet.insert("cause".into(), json!(cause));
+        }
+        return (StatusCode::CONFLICT, Json(corps)).into_response();
+    }
     // #8154 — Spotify a refusé le jeton de Tune à librespot : le geste qui
     // débloque est connu (choisir une fois l'appareil dans l'application
     // Spotify). 409 au code stable, phrase traduite, et de quoi proposer
@@ -2509,6 +2533,43 @@ mod refus_de_format_3234 {
                     assert!(message.contains("Spotify app"), "{message}");
                 }
             }
+        }
+    }
+
+    /// Compte Spotify gratuit : 409 au code stable `spotify_premium_required`,
+    /// phrase traduite qui dit que Premium est exigé par Spotify et que la
+    /// navigation reste possible ; la cause technique reste dans `cause`.
+    ///
+    /// Contre-épreuve : sans la branche Premium de `play_error_response`, ce
+    /// test rougit (502, `upstream_error`, le texte brut du refus).
+    #[tokio::test]
+    async fn spotify_compte_gratuit_dit_que_premium_est_exige() {
+        let e = format!(
+            "source « spotify » : {}librespot : « Login failed with reason: Premium account required »",
+            tune_core::streaming::spotify_lecture::SENTINELLE_PREMIUM_REQUIS
+        );
+        for (lang, phrase) in [("fr", "Spotify Premium"), ("en", "Spotify Premium")] {
+            let reponse = play_error_response(e.clone(), lang);
+            assert_eq!(reponse.status(), StatusCode::CONFLICT, "{lang}");
+            let corps = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+                .await
+                .expect("corps de la réponse");
+            let corps: Value = serde_json::from_slice(&corps).expect("corps JSON");
+            assert_eq!(corps["error"], "spotify_premium_required");
+            assert_eq!(corps["code"], "spotify_premium_required");
+            assert_eq!(corps["message_key"], "spotify.playback.premiumRequired");
+            assert!(
+                corps["cause"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("Premium account required")),
+                "{corps}"
+            );
+            let message = corps["message"].as_str().unwrap_or_default();
+            assert!(message.contains(phrase), "{lang} : {message}");
+            assert!(
+                !message.contains("spotify_premium_required"),
+                "{lang} : {message}"
+            );
         }
     }
 
