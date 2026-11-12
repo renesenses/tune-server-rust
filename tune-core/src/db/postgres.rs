@@ -191,6 +191,20 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             PRIMARY KEY (profile_id, item_type, source, source_id)\
         )",
     "CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id)",
+    // « Pas pour moi » de l'accueil (web#916, PG 111). Ici AUSSI : une base
+    // PostgreSQL convertie avant cette version ne rejoue pas la 111, et les
+    // rangées de `/home/*` LISENT la table à chaque affichage.
+    "CREATE TABLE IF NOT EXISTS suggestions_ecartees (\
+            profile_id BIGINT NOT NULL DEFAULT 1,\
+            item_type TEXT NOT NULL,\
+            source TEXT NOT NULL,\
+            item_id TEXT NOT NULL,\
+            title TEXT,\
+            subtitle TEXT,\
+            cover_url TEXT,\
+            created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),\
+            PRIMARY KEY (profile_id, item_type, source, item_id)\
+        )",
     // Registre DURABLE des serveurs multimedia (#2219, phase 1). Quatrieme
     // chemin, meme raison : une base PostgreSQL convertie AVANT cette version
     // porte `schema_version = 99` et ne recevra jamais la migration 058. Or la

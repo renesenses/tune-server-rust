@@ -300,6 +300,9 @@ pub fn planifier_dossier(dossier: &Path) -> PlanCue {
         .cloned()
         .collect();
     feuilles.sort();
+    // #8534 — un dossier « CD3 - Titre » ne dit le disque que de SA feuille :
+    // s'il en range plusieurs, chacune garde le numéro de son nom.
+    let feuille_seule = feuilles.len() == 1;
 
     let mut plan = PlanCue::default();
     let mut resolues: Vec<FeuilleResolue> = Vec::new();
@@ -369,7 +372,8 @@ pub fn planifier_dossier(dossier: &Path) -> PlanCue {
         match ecart {
             Some(motif) => plan.ecartees.push((chemin, motif)),
             None => {
-                let disque = disque_de_la_feuille(dossier, &chemin, &feuille, &images);
+                let disque =
+                    disque_de_la_feuille(dossier, &chemin, &feuille, &images, feuille_seule);
                 resolues.push(FeuilleResolue {
                     chemin,
                     feuille,
@@ -392,7 +396,9 @@ pub fn planifier_dossier(dossier: &Path) -> PlanCue {
 /// 1. `REM DISCNUMBER` de la feuille, quand l'outil de rip l'a écrit ;
 /// 2. le dossier, quand il n'est QUE cela (`CD2/`) — la même lecture que le
 ///    scan ordinaire ([`crate::metadata::numero_de_disque`]), où le dossier
-///    tranche aussi ;
+///    tranche aussi — ou qu'il COMMENCE par le marqueur (`CD3 - On The Night`,
+///    [`crate::metadata::coffrets::marqueur_de_tete`], #8534, quand il ne
+///    range que cette feuille) ;
 /// 3. le marqueur en FIN de nom du fichier image, puis de la feuille :
 ///    « Ring CD03.flac », « Ring (Disc 3).cue », ou le nom nu « cd3.flac ».
 ///
@@ -406,6 +412,7 @@ fn disque_de_la_feuille(
     chemin: &Path,
     feuille: &CueSheet,
     images: &HashMap<String, PathBuf>,
+    feuille_seule: bool,
 ) -> Option<u32> {
     let du_nom = |p: &Path| {
         let racine = p.file_stem()?.to_str()?;
@@ -416,10 +423,23 @@ fn disque_de_la_feuille(
     feuille
         .disc_number
         .or_else(|| {
-            dossier
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(crate::metadata::numero_de_disque)
+            let nom = dossier.file_name()?.to_str()?;
+            // #8534 — `CD3 - On The Night` est un dossier de disque autant que
+            // `CD3` : la règle C4 le lit déjà ainsi
+            // (`compilation::nom_de_disque`). Sans cette lecture, le numéro
+            // venait du nom de l'image (« On The Night CD1 », numéroté dans
+            // l'album d'origine) et le CD 3 du coffret, « disque 1 » déjà
+            // pris, devenait une autre version.
+            //
+            // Seulement quand le dossier ne range que cette feuille : un
+            // dossier « CD1 - Titre » qui tient « Titre CD1.cue » et
+            // « Titre CD2.cue » n'est pas un disque, c'est le coffret.
+            crate::metadata::numero_de_disque(nom).or_else(|| {
+                feuille_seule
+                    .then(|| crate::metadata::coffrets::marqueur_de_tete(nom))
+                    .flatten()
+                    .map(|(_, d)| d)
+            })
         })
         .or_else(|| {
             feuille
@@ -980,6 +1000,61 @@ mod tests {
         let plan = planifier_dossier(d.path());
         assert_eq!(plan.albums.len(), 1, "{plan:?}");
         assert_eq!(plan.albums[0].pistes[2].disque, Some(2));
+    }
+
+    /// #8534 — un dossier `CD3 - On The Night` dit le disque 3, même quand
+    /// l'image se numérote dans son album d'origine (`… CD1`). Un dossier
+    /// sans marqueur de tête (`Live At The BBC`) ne dit rien : le nom de
+    /// l'image reprend la main.
+    #[test]
+    fn un_dossier_cd_sous_titre_dit_son_disque_8534() {
+        let d = tempfile::TempDir::new().unwrap();
+        for (dossier, attendu) in [
+            ("CD3 - On The Night", Some(3)),
+            ("Live At The BBC", Some(1)),
+        ] {
+            let dossier = d.path().join(dossier);
+            fs::create_dir_all(&dossier).unwrap();
+            let image = "Dire Straits - On The Night CD1.wav";
+            ecrire_wav(&dossier.join(image), 50);
+            fs::write(
+                dossier.join("album.cue"),
+                feuille_de_coffret("Dire Straits", image, ""),
+            )
+            .unwrap();
+            let plan = planifier_dossier(&dossier);
+            assert_eq!(plan.albums.len(), 1, "{plan:?}");
+            assert_eq!(
+                plan.albums[0].pistes[0].disque,
+                attendu,
+                "{}",
+                dossier.display()
+            );
+        }
+    }
+
+    /// #8534, CONTRE-POIDS — un dossier « Disc 1 - Der Ring » qui range
+    /// DEUX feuilles (« Der Ring CD1 », « Der Ring CD2 ») est le coffret, pas
+    /// son disque 1 : chaque feuille garde le numéro de son nom, et le tout
+    /// reste UN album à deux disques.
+    #[test]
+    fn un_dossier_cd_sous_titre_a_plusieurs_feuilles_garde_leurs_numeros_8534() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = d.path().join("Disc 1 - Der Ring");
+        fs::create_dir_all(&dossier).unwrap();
+        for n in [1, 2] {
+            let image = format!("Der Ring CD{n}.wav");
+            ecrire_wav(&dossier.join(&image), 50);
+            fs::write(
+                dossier.join(format!("Der Ring CD{n}.cue")),
+                feuille_de_coffret("Georg Solti", &image, ""),
+            )
+            .unwrap();
+        }
+        let plan = planifier_dossier(&dossier);
+        assert_eq!(plan.albums.len(), 1, "{plan:?}");
+        let disques: Vec<Option<u32>> = plan.albums[0].pistes.iter().map(|p| p.disque).collect();
+        assert_eq!(disques, vec![Some(1), Some(1), Some(2), Some(2)]);
     }
 
     /// #7751, CONTRE-POIDS — deux albums DIFFÉRENTS de même titre restent

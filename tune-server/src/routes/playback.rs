@@ -3700,6 +3700,15 @@ async fn play(
                 // rangs (`GET /playlists/{id}/tracks` les montre) ; la file,
                 // elle, ne les reçoit pas. `start_index` est ramené au rang de
                 // la même ligne parmi les lignes jouables.
+                //
+                // #8135 — une radio de la playlist entre dans la file par son
+                // FLUX (choisi comme pour une radio jouée seule) ; une
+                // station retirée devient une ligne introuvable, sautée ici.
+                let e = tune_core::db::playlist_radio_8135::lignes_a_jouer(
+                    &state.backend,
+                    e,
+                    &crate::routes::radios::choix_du_flux_de_playlist(&state),
+                );
                 let (jouables, depart) = sans_les_introuvables(e, body.start_index);
                 body.start_index = depart;
                 jouables

@@ -23,6 +23,30 @@
 //!   coupure courte à chaque morceau est attendue. Le serveur de flux accepte
 //!   la reconnexion (`radio_stream_reconnect`).
 //!
+//! ## Pourquoi « next » ne peut pas, par construction, changer l'écran
+//!
+//! (rc12, Rose RS250A, fil 2201 : « next » ne fait rien, « reload » marche.)
+//! `SetNextAVTransportURI` ne décrit que la piste SUIVANTE : un renderer
+//! conforme range ce DIDL dans `NextAVTransportURIMetaData` et n'y touche
+//! qu'à la transition, qui n'arrive jamais sur une radio sans fin. L'écran,
+//! lui, montre la piste COURANTE (`CurrentTrackMetaData`, que rend
+//! `GetPositionInfo`), et AVTransport:1 ne la laisse changer que par
+//! `SetAVTransportURI` — qui fait rouvrir la ressource au renderer, avec
+//! la coupure du mode « reload ». Changer l'URI (paramètre de requête par
+//! morceau sur le même flux) n'y change rien : la coupure vient de la
+//! réouverture, et le Rose recharge déjà sur une URI identique. La seule
+//! voie sans coupure envisageable serait de découper le flux en « pistes »
+//! enchaînées par `SetNext` (fin propre de la réponse HTTP au changement de
+//! morceau, nouvelle URI qui continue le même flux) : c'est une fonction à
+//! part, risquée sur un renderer dont l'enchaînement n'est pas établi
+//! (#5372), et elle n'est pas faite ici.
+//!
+//! Pour le prouver sur pièces chez le testeur, chaque réémission journalise
+//! ce qui part et ce que le renderer répond (`radio_didl_relai_soap`), puis
+//! RELIT sa piste courante par `GetPositionInfo` (`radio_didl_relai_constat`) :
+//! `piste_courante = "inchangee"` après un acquittement, c'est « le renderer
+//! a pris le DIDL de la suivante et garde l'ancien titre à l'écran ».
+//!
 //! `LastChange` n'est pas une voie : c'est un évènement que le RENDERER émet
 //! vers ses abonnés, un point de contrôle ne peut pas le lui envoyer.
 //!
@@ -80,6 +104,54 @@ impl ModeTitreRadioDidl {
     }
 }
 
+/// Ce que la piste COURANTE du renderer dit du titre qu'on vient d'envoyer,
+/// lu dans une réponse `GetPositionInfo` (`TrackMetaData`, DIDL échappé) :
+/// - `"suit"` : son `dc:title` est le nouveau titre ;
+/// - `"inchangee"` : il porte un autre titre (le renderer a acquitté sans
+///   rien changer à la piste qu'il affiche) ;
+/// - `"illisible"` : pas de réponse, faute, ou métadonnées absentes
+///   (`NOT_IMPLEMENTED`, vide) — on ne conclut rien.
+pub fn constat_piste_courante(reponse_position: Option<&str>, titre: &str) -> &'static str {
+    let Some(reponse) = reponse_position.filter(|r| !faute_commande_soap(r)) else {
+        return "illisible";
+    };
+    let Some(meta) = super::extract_tag(reponse, "TrackMetaData") else {
+        return "illisible";
+    };
+    // Un niveau d'échappement pour le DIDL dans le SOAP ; certains renderers
+    // le rendent en clair, ce qui ne change rien ici.
+    let didl = if meta.contains("&lt;") {
+        desechapper(&meta)
+    } else {
+        meta
+    };
+    let Some(lu) = super::extract_tag(&didl, "dc:title") else {
+        return "illisible";
+    };
+    if desechapper(lu.trim()) == titre.trim() {
+        "suit"
+    } else {
+        "inchangee"
+    }
+}
+
+fn desechapper(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Les `n` premiers caractères, pour un journal qui ne déborde pas.
+fn extrait(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
 /// La clé de réglage de la zone. Absente = désactivé ; elle est supprimée
 /// au retour à « off », pour que l'absence et le défaut soient un seul état.
 pub fn cle_de_zone(zone_id: i64) -> String {
@@ -129,8 +201,12 @@ pub struct TitreRadio {
 /// L'issue d'une réémission, pour le journal et les épreuves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssueRelai {
-    /// Le DIDL est parti et l'appareil l'a acquitté.
-    Envoye { action: &'static str },
+    /// Le DIDL est parti et l'appareil l'a acquitté. `piste_courante` est le
+    /// constat relu juste après ([`constat_piste_courante`]).
+    Envoye {
+        action: &'static str,
+        piste_courante: &'static str,
+    },
     /// Rien n'est parti, et voici pourquoi.
     Ignore(&'static str),
 }
@@ -230,7 +306,32 @@ impl DlnaOutput {
             ),
             ModeTitreRadioDidl::Desactive => unreachable!("traité plus haut"),
         };
-        let reponse = self.av_action(action, &corps).await?;
+        info!(
+            device = %self.name,
+            mode = mode.as_str(),
+            action,
+            uri = %pose.url,
+            // Toujours vrai aujourd'hui : écrit pour que le journal le dise.
+            uri_identique_a_la_pose = true,
+            titre = %titre.titre,
+            didl_octets = didl.len(),
+            didl = %extrait(&didl, 1200),
+            "radio_didl_relai_soap — envoi"
+        );
+        let reponse = match self.av_action(action, &corps).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(device = %self.name, action, error = %e, "radio_didl_relai_soap — pas de réponse");
+                return Err(e);
+            }
+        };
+        info!(
+            device = %self.name,
+            action,
+            faute = faute_commande_soap(&reponse),
+            reponse = %extrait(&reponse, 600),
+            "radio_didl_relai_soap — réponse"
+        );
         if faute_commande_soap(&reponse) {
             warn!(
                 device = %self.name,
@@ -247,7 +348,38 @@ impl DlnaOutput {
             self.relancer_si_arrete_apres_rechargement().await;
             self.reimposer_le_volume_apres_uri().await;
         }
-        Ok(IssueRelai::Envoye { action })
+        let piste_courante = self.constater_piste_courante(&pose.url, &titre.titre).await;
+        Ok(IssueRelai::Envoye {
+            action,
+            piste_courante,
+        })
+    }
+
+    /// Relit la piste COURANTE du renderer après l'acquittement : c'est elle
+    /// que l'écran affiche. Une seule lecture, seulement quand le réglage est
+    /// actif et que le DIDL est parti.
+    async fn constater_piste_courante(&self, url: &str, titre: &str) -> &'static str {
+        let reponse = self
+            .av_action("GetPositionInfo", "<InstanceID>0</InstanceID>")
+            .await
+            .ok();
+        let constat = constat_piste_courante(reponse.as_deref(), titre);
+        let track_uri = reponse
+            .as_deref()
+            .and_then(|r| super::extract_tag(r, "TrackURI"))
+            .unwrap_or_default();
+        info!(
+            device = %self.name,
+            piste_courante = constat,
+            track_uri_est_le_flux = super::meme_url(&track_uri, url),
+            track_metadata = %reponse
+                .as_deref()
+                .and_then(|r| super::extract_tag(r, "TrackMetaData"))
+                .map(|m| extrait(&m, 600))
+                .unwrap_or_else(|| "-".into()),
+            "radio_didl_relai_constat"
+        );
+        constat
     }
 
     /// Après un `SetAVTransportURI` de rechargement, l'appareil a pu s'arrêter.

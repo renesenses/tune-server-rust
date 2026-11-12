@@ -1,3 +1,5 @@
+/// web#916 — la raison de chaque suggestion d'accueil et « Pas pour moi ».
+pub mod accueil_justifie;
 pub mod active_profile;
 /// #4626 — appairage maître / agent et ordres entre serveurs Tune.
 pub mod agent_tune;
