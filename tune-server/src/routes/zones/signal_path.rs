@@ -390,6 +390,49 @@ pub async fn signal_path_sous_licence(
     .await
 }
 
+/// #8569 (reliquat de #8462, kiran, fil 2762) — une sortie qui ne règle pas
+/// le volume (`can_set_volume == false`) n'a pas d'étape « Volume » dans le
+/// chemin du signal.
+///
+/// Cas d'origine : le volume DÉCORATIF d'un Diretta UPnP Renderer, que #8538
+/// annonce non réglable. La zone garde le volume enregistré d'avant (50 %),
+/// que le curseur grisé ne permet plus de changer, et la branche sans sonde
+/// de [`build_signal_path_lang`] affichait « Volume du renderer 50 % » pour un
+/// niveau que l'appareil n'applique jamais. Décision du 12/11 : pas d'étape.
+///
+/// Même règle que les autres volumes fixes déjà en place : zone en volume
+/// fixe (`fixed_volume`) et PURE verrouillé (volume tenu à 100 %) ne
+/// produisent pas d'étape. Le constructeur ne voit pas les capacités de la
+/// sortie (elles vivent derrière le registre asynchrone des sorties) : la
+/// règle s'applique ici, à la sortie du constructeur, comme la licence de la
+/// correction de pièce. Sans capacités connues (sortie non enregistrée), rien
+/// ne change. L'étape était marquée intacte : le verdict ne bouge pas.
+pub fn sans_volume_d_une_sortie_non_reglable(
+    signal_path: Option<Value>,
+    capacites: Option<&tune_core::outputs::OutputCapabilities>,
+) -> Option<Value> {
+    let mut sp = signal_path?;
+    if capacites.is_some_and(|c| !c.can_set_volume) {
+        if let Some(etapes) = sp.get_mut("steps").and_then(Value::as_array_mut) {
+            etapes.retain(|e| e.get("name").and_then(Value::as_str) != Some("Volume"));
+        }
+    }
+    Some(sp)
+}
+
+/// [`sans_volume_d_une_sortie_non_reglable`] avec les capacités de la sortie
+/// enregistrée pour la zone (`output_device_id`), lues comme `GET /zones`
+/// les publie (`output_capabilities`).
+pub async fn signal_path_selon_la_sortie(
+    state: &AppState,
+    output_device_id: Option<&str>,
+    signal_path: Option<Value>,
+) -> Option<Value> {
+    signal_path.as_ref()?;
+    let capacites = super::output_capabilities(state, output_device_id).await;
+    sans_volume_d_une_sortie_non_reglable(signal_path, capacites.as_ref())
+}
+
 /// Description du traitement EQ réellement configuré, y compris le headroom
 /// automatique.
 ///
@@ -2163,7 +2206,10 @@ fn assembler_les_etapes_lang(
         // 50% » se lisait comme un traitement de Tune. Le verdict ne change
         // pas : l'étape était déjà marquée intacte. Le refus du volume par le
         // renderer (502 sur PUT volume) n'est mémorisé par aucun état que ce
-        // calcul lit : seul le volume fixe (`fixed_volume`) retire l'étape.
+        // calcul lit : seul le volume fixe (`fixed_volume`) retire l'étape
+        // ici. #8569 — une sortie qui annonce `can_set_volume == false`
+        // (volume décoratif Diretta, #8538) la perd en sortie de
+        // constructeur : `sans_volume_d_une_sortie_non_reglable`.
         let description = if tune_core::orchestrator::is_network_output_type(Some(output_type)) {
             fs(lang, "renderer_volume", &[&pourcent])
         } else {

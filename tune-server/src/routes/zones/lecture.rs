@@ -517,6 +517,13 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 ),
             )
             .await;
+            // #8569 — sortie au volume non réglable : pas d'étape Volume.
+            let signal_path = super::signal_path_selon_la_sortie(
+                &state,
+                z.output_device_id.as_deref(),
+                signal_path,
+            )
+            .await;
             obj.insert("signal_path".into(), json!(signal_path));
             // #1395 — quel backend local tourne VRAIMENT sur cette zone, face à
             // celui qui est réglé. Absent des zones non locales.
@@ -756,6 +763,13 @@ pub(crate) async fn get_zone(
                         audio_backend_de_la_zone,
                         wire.as_ref(),
                     ),
+                )
+                .await;
+                // #8569 — voir la note au site jumeau (`list_zones`).
+                let signal_path = super::signal_path_selon_la_sortie(
+                    &state,
+                    zone.output_device_id.as_deref(),
+                    signal_path,
                 )
                 .await;
                 obj.insert("signal_path".into(), json!(signal_path));

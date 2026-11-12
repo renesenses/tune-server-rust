@@ -1162,6 +1162,13 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             ),
         )
         .await;
+        // #8569 — sortie au volume non réglable : pas d'étape Volume.
+        let signal_path = crate::routes::zones::signal_path_selon_la_sortie(
+            state,
+            zone.output_device_id.as_deref(),
+            signal_path,
+        )
+        .await;
         v.as_object_mut()
             .unwrap()
             .insert("signal_path".into(), json!(signal_path));
