@@ -128,6 +128,10 @@ pub fn cle_genre(genre: &str) -> Option<&'static str> {
         | "film"
         | "films" => "radio.genre.soundtrack",
         "news" | "talk" | "info" | "information" => "radio.genre.news",
+        // C000096 « Religious » de radio-metadata.fr (go de Bertrand du
+        // 12/11/2026). `gospel` n'y est pas rangé : la bibliothèque le classe
+        // sous R&B (tune-core/src/library/genre_tree.rs).
+        "religious" | "religion" | "religieux" | "religieuse" => "radio.genre.religious",
         _ => return None,
     };
     Some(cle)
@@ -280,6 +284,33 @@ mod tests {
         }
         assert_eq!(crate::i18n::t("fr", "radio.genre.news"), "Info");
         assert_eq!(crate::i18n::t("de", "radio.genre.news"), "Nachrichten");
+    }
+
+    #[test]
+    fn le_genre_religious_de_radio_metadata_a_une_cle_traduite() {
+        for genre in [
+            "religious",
+            "Religious",
+            "religion",
+            "Religieux",
+            "religieuse",
+        ] {
+            assert_eq!(
+                cle_genre(genre),
+                Some("radio.genre.religious"),
+                "genre {genre}"
+            );
+        }
+        assert_eq!(cle_genre("gospel"), None);
+        for lang in crate::i18n::SUPPORTED.iter().copied() {
+            let t = crate::i18n::t(lang, "radio.genre.religious");
+            assert!(
+                !t.is_empty() && t != "radio.genre.religious",
+                "radio.genre.religious manque en {lang}"
+            );
+        }
+        assert_eq!(crate::i18n::t("fr", "radio.genre.religious"), "Religieux");
+        assert_eq!(crate::i18n::t("de", "radio.genre.religious"), "Religiös");
     }
 
     #[test]
