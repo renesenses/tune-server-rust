@@ -359,9 +359,10 @@ fn purge_de_production() {
     );
 }
 
-fn preparer_les_pistes() -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
-    let dossier = std::env::temp_dir().join(format!("banc-8609-{}", std::process::id()));
-    std::fs::create_dir_all(&dossier).unwrap();
+/// Le dossier est un `test_scratch` : supprimé à sa sortie de portée, même
+/// si le banc échoue (#3030).
+fn preparer_les_pistes() -> (crate::test_scratch::ScratchDir, Vec<std::path::PathBuf>) {
+    let dossier = crate::test_scratch::scratch_dir("banc-8609");
     let fichiers = (0..4u32)
         .map(|i| {
             let f = dossier.join(format!("piste-{i}.wav"));
@@ -464,7 +465,7 @@ fn banc_trim_pendant_lecture_8609() {
     releve("fin phase 3");
     drop(bouchons);
     imprimer(&phases);
-    let _ = std::fs::remove_dir_all(&dossier);
+    drop(dossier);
 }
 
 /// Point 2 de la relecture de #8614 : sous `mlockall` (Tune OS et `.deb`
@@ -544,5 +545,5 @@ fn banc_trim_sous_mlockall_8609() {
     imprimer(&phases);
     // SAFETY : appel sans pointeur.
     unsafe { libc::munlockall() };
-    let _ = std::fs::remove_dir_all(&dossier);
+    drop(dossier);
 }
