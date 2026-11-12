@@ -1014,6 +1014,7 @@ pub(crate) fn scenario_sous_titres_2094(db: &Arc<dyn DbBackend>) {
         titre: "Arkhangelsk".into(),
         dossier: d.into(),
         artiste_id: Some(ark),
+        ..Default::default()
     };
     let poses = poser_les_sous_titres(
         db,
@@ -1077,6 +1078,7 @@ fn retenu(n: u32, titre: &str, dossier: &str) -> DisqueRetenu {
         titre: titre.into(),
         dossier: dossier.into(),
         artiste_id: None,
+        ..Default::default()
     }
 }
 

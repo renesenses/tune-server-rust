@@ -39,6 +39,13 @@ pub fn zone_enabled(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
         .unwrap_or(false)
 }
 
+/// #8513 — les traitements de la zone sont-ils contournés ? En PURE, ou
+/// pendant le balayage d'une mesure de pièce ([`super::mesure_nue`]). Ne
+/// touche ni au réglage PURE ni au verrou de volume : seul le chemin DSP le lit.
+pub fn traitements_contournes(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
+    zone_enabled(db, zone_id) || super::mesure_nue::active(zone_id)
+}
+
 /// Le verrou de volume global est-il armé ? **Faux par défaut** : seule la chaîne
 /// « true » l'active, pour qu'une clé absente ou illisible ne modifie jamais
 /// le volume de personne.
@@ -109,6 +116,30 @@ mod tests {
         SettingsRepo::with_backend(db.clone())
             .set(key, value)
             .expect("ecrire le reglage");
+    }
+
+    /// #8513 — une mesure contourne les traitements sans écrire PURE en base
+    /// et sans armer le verrou de volume.
+    #[test]
+    fn une_mesure_contourne_les_traitements_sans_toucher_pure_ni_le_volume() {
+        let db = mem_db();
+        set(&db, SETTING_LOCK_VOLUME, "true");
+        assert!(!traitements_contournes(&db, 851_310));
+        let g = super::super::mesure_nue::Contournement::poser(851_310);
+        assert!(traitements_contournes(&db, 851_310));
+        assert!(!zone_enabled(&db, 851_310), "PURE ne doit pas être écrit");
+        assert_eq!(
+            effective_volume(&db, 851_310, 0.4),
+            0.4,
+            "volume de mesure forcé à 100 %"
+        );
+        drop(g);
+        assert!(!traitements_contournes(&db, 851_310));
+        set(&db, "zone_851311_audiophile", r#"{"enabled":true}"#);
+        assert!(
+            traitements_contournes(&db, 851_311),
+            "PURE contourne toujours"
+        );
     }
 
     #[test]

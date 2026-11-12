@@ -59,8 +59,8 @@ pub struct MdnsScanner {
 /// Les services que Tune annonce et l'adresse qu'ils portent.
 #[derive(Default)]
 struct Annonces {
-    /// `(port, version)` de `register_self`.
-    tune: Option<(u16, String)>,
+    /// `(port, version, nom annoncé)` de `register_self`.
+    tune: Option<(u16, String, String)>,
     /// Port de `register_sendspin_server`.
     sendspin: Option<u16>,
     /// Adresse annoncée ; `None` = `127.0.0.1` (aucune adresse au moment de
@@ -202,21 +202,38 @@ impl MdnsScanner {
     /// Announce this Tune server instance via mDNS so HomeAssistant
     /// and other clients can auto-discover it.
     pub fn register_self(&self, port: u16, version: &str) -> Result<(), String> {
+        self.register_self_nomme(
+            port,
+            version,
+            &crate::discovery::nom_annonce::nom_de_l_appareil(),
+        )
+    }
+
+    /// Comme [`Self::register_self`], sous le nom annoncé `nom` (#8189 : nom
+    /// réglé, sinon nom de l'appareil — voir `discovery::nom_annonce`).
+    pub fn register_self_nomme(&self, port: u16, version: &str, nom: &str) -> Result<(), String> {
         let ip = crate::discovery::ssdp::get_local_ip();
         {
             let mut a = self.annonces.lock().unwrap();
-            a.tune = Some((port, version.to_owned()));
+            a.tune = Some((port, version.to_owned(), nom.to_owned()));
             a.ip = ip;
         }
-        self.annoncer_tune(port, version, ip)
+        self.annoncer_tune(port, version, nom, ip)
     }
 
-    fn annoncer_tune(&self, port: u16, version: &str, ip: Option<Ipv4Addr>) -> Result<(), String> {
-        // Real OS hostname (not the env-only derivation that collapsed to
-        // "tune-server" under systemd, colliding every instance — #1112).
-        let hostname = crate::discovery::system_hostname();
-        let service_name = format!("Tune ({hostname})");
-        let host_label = crate::discovery::mdns_host_label(&hostname);
+    fn annoncer_tune(
+        &self,
+        port: u16,
+        version: &str,
+        nom: &str,
+        ip: Option<Ipv4Addr>,
+    ) -> Result<(), String> {
+        // Le nom d'instance suit le nom annoncé (#8189) ; l'hôte mDNS reste
+        // celui de l'appareil (nom d'hôte du système sur un bureau — #1112 —,
+        // nom donné par l'application sur un téléphone).
+        let service_name = crate::discovery::nom_annonce::nom_de_service(nom);
+        let host_label =
+            crate::discovery::mdns_host_label(&crate::discovery::nom_annonce::nom_de_l_appareil());
         let local_ip = texte_ip(ip);
 
         let properties = [("version", version), ("path", "/api/v1")];
@@ -431,8 +448,8 @@ impl MdnsScanner {
         for nom in noms {
             let _ = self.daemon.unregister(&nom);
         }
-        if let Some((port, version)) = tune
-            && let Err(e) = self.annoncer_tune(port, &version, Some(ip))
+        if let Some((port, version, nom)) = tune
+            && let Err(e) = self.annoncer_tune(port, &version, &nom, Some(ip))
         {
             warn!(error = %e, "mdns_reenregistrement_echec");
         }

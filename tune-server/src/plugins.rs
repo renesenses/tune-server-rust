@@ -43,11 +43,12 @@ pub fn build_loader(
     event_bus: &tune_core::event_bus::EventBus,
     backend: Arc<dyn tune_core::db::backend::DbBackend>,
     license: Arc<tune_core::license::LicenseManager>,
+    db_path: &str,
 ) -> PluginLoader {
     // La licence descend jusqu'aux greffons (`PluginContext::license`) pour
     // qu'un greffon payant ADAPTE sa réponse au lieu de se voir fermer la porte
     // par l'hôte : la décision doit tenir chez lui, en un seul endroit.
-    PluginLoader::new(plugins_data_root())
+    PluginLoader::new(plugins_data_root(db_path))
         .with_event_bus(event_bus.clone())
         .with_db(backend)
         .with_license(license)
@@ -55,14 +56,55 @@ pub fn build_loader(
 
 /// Where plugins keep their private state. Each plugin gets
 /// `{root}/{plugin_name}/`, created by `setup_all`.
-fn plugins_data_root() -> std::path::PathBuf {
-    std::env::var("TUNE_PLUGINS_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("TUNE_PLUGINS_DIR")
-                .map(|d| std::path::PathBuf::from(d).join("data"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("plugins/data"))
-        })
+fn plugins_data_root(db_path: &str) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    racine_des_donnees_de_greffons(
+        std::env::var("TUNE_PLUGINS_DATA_DIR").ok(),
+        std::env::var("TUNE_PLUGINS_DIR").ok(),
+        std::env::var("TUNE_DATA_DIR").ok(),
+        db_path,
+        &cwd,
+    )
+}
+
+/// #8458 — la racine des données des greffons, résolue sans environnement
+/// (fonction pure) :
+///
+/// 1. `TUNE_PLUGINS_DATA_DIR`, puis `TUNE_PLUGINS_DIR/data` : l'exploitant a
+///    tranché ;
+/// 2. `plugins/data` dans le répertoire courant **s'il existe déjà** : une
+///    installation qui y range son état (paquet Debian, `WorkingDirectory`
+///    inscriptible) le garde ;
+/// 3. sinon `<dossier de données>/plugins-data`, le dossier de données étant
+///    résolu comme celui de la base ;
+/// 4. une base en mémoire (essais) garde l'ancien `plugins/data` relatif.
+///
+/// Avant, seul `plugins/data` RELATIF au répertoire courant existait. Or
+/// l'application macOS lance le serveur depuis `/` (launchd), en lecture
+/// seule : le dossier ne pouvait pas être créé, et « Ma collection physique »
+/// ne pouvait écrire ni sa mémoire ni ses pochettes (« Le serveur n'a pas pu
+/// enregistrer les données »). L'accès complet au disque n'y changeait rien.
+/// `plugins-data` et non `plugins/data` : `<données>/plugins` est la racine
+/// des greffons installés depuis la boutique (`plugins_host::user_plugins_dir`).
+fn racine_des_donnees_de_greffons(
+    donnees_greffons_env: Option<String>,
+    greffons_env: Option<String>,
+    donnees_env: Option<String>,
+    db_path: &str,
+    cwd: &std::path::Path,
+) -> std::path::PathBuf {
+    if let Some(d) = donnees_greffons_env {
+        return std::path::PathBuf::from(d);
+    }
+    if let Some(d) = greffons_env {
+        return std::path::PathBuf::from(d).join("data");
+    }
+    let historique = cwd.join("plugins").join("data");
+    if historique.is_dir() || db_path.is_empty() || db_path == ":memory:" {
+        return historique;
+    }
+    crate::gel_executeur::dossier_de_donnees(donnees_env.as_deref(), db_path, cwd)
+        .join("plugins-data")
 }
 
 /// The compiled-in plugin set.
@@ -1173,3 +1215,7 @@ fn membres_de_collection(
 #[cfg(all(test, feature = "collection-physique"))]
 #[path = "plugins_tests_jeton_discogs_7195.rs"]
 mod tests_jeton_discogs_7195;
+
+#[cfg(test)]
+#[path = "plugins_tests_racine_donnees_8458.rs"]
+mod tests_racine_donnees_8458;

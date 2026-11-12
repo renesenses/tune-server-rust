@@ -437,6 +437,9 @@ pub fn router() -> Router<AppState> {
         // Composer un coffret À LA MAIN — ce que la détection automatique ne
         // peut pas voir : marqueurs en lettres (« Disc A »), rangement libre.
         .route("/albums/coffret", post(albums::composer_coffret))
+        // #8464 (fil 2765) — le titre que la composition donnerait, pour
+        // préremplir le nom du coffret à l'écran. N'écrit rien.
+        .route("/albums/coffret/apercu", post(albums::apercu_coffret))
         .route(
             "/albums/coffrets/{cible}/regrouper",
             post(albums::regrouper_coffret),
