@@ -1265,7 +1265,7 @@ impl SpotifyService {
     }
 
     /// Février 2026 — un point d'accès que Spotify a retiré aux applications
-    /// en mode développement répond 403 (ou 404). `None` : retiré, la
+    /// en mode développement répond 403 (#8399, #8485). `None` : retiré, la
     /// rubrique est vide ; le retrait est mémorisé dans `retire` (une seule
     /// requête, puis plus rien jusqu'au changement d'application). Tout autre
     /// refus reste une erreur.
@@ -1280,7 +1280,7 @@ impl SpotifyService {
         }
         match self.api_get(chemin).await {
             Ok(d) => Ok(Some(d)),
-            Err(e) if matches!(statut_du_refus(&e), Some(403 | 404)) => {
+            Err(e) if statut_du_refus(&e) == Some(403) => {
                 if !retire.swap(true, Ordering::Relaxed) {
                     info!(route, "spotify_point_d_acces_retire");
                 }
@@ -3470,12 +3470,16 @@ mod tests {
                     )
                 }),
             )
+            // Un 403 de `/browse/new-releases` est désormais le retrait
+            // documenté de février 2026 (rubrique vide, voir
+            // `spotify_rubriques_retirees_2026_tests`) ; tout AUTRE refus
+            // reste une erreur, ce que #6825 garde.
             .route(
                 "/v1/browse/new-releases",
                 axum::routing::get(|| async {
                     (
-                        axum::http::StatusCode::FORBIDDEN,
-                        axum::Json(json!({"error": {"status": 403, "message": "Forbidden"}})),
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": {"status": 500, "message": "Server error"}})),
                     )
                 }),
             )
@@ -3497,9 +3501,9 @@ mod tests {
         let err = svc
             .get_new_releases()
             .await
-            .expect_err("#6825 : un 403 de /browse/new-releases rendait une liste vide")
+            .expect_err("#6825 : un refus de /browse/new-releases rendait une liste vide")
             .to_string();
-        assert!(err.contains("403") && err.contains("Forbidden"), "{err}");
+        assert!(err.contains("500") && err.contains("Server error"), "{err}");
         assert!(!err.contains("jeton"), "le jeton ne sort jamais : {err}");
         let err = svc
             .get_featured()
