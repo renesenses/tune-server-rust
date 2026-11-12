@@ -3144,6 +3144,10 @@ mod retrait_du_registre_7949;
 #[cfg(test)]
 mod premier_play_au_gain_de_zone_8074;
 
+// #8609 — banc de mesure : `malloc_trim` pendant une lecture locale.
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+mod banc_trim_8609;
+
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
 /// `decode_compressed_stream` rendait `None` pour QUATRE causes distinctes, et

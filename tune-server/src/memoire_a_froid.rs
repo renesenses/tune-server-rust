@@ -30,7 +30,7 @@
 //! minutes) : de 0 à 59 ms par purge ; RSS au repos 666 Mo sans la purge,
 //! 255 à 293 Mo avec (anonyme : 537 Mo contre 132 à 170 Mo).
 //!
-//! Il n'est fait qu'À FROID — aucune SORTIE LOCALE en lecture — parce qu'il
+//! Il n'était fait qu'À FROID (jusqu'à #8609, voir plus bas) parce qu'il
 //! tient le verrou de chaque arène pendant qu'il la parcourt : un fil de
 //! lecture qui allouerait à cet instant attendrait.
 //!
@@ -54,22 +54,39 @@
 //! pistes sans la purge, 100 à 165 Mo avec ; la mémoire réellement en usage
 //! reste de 95 à 156 Mo dans les deux cas.
 //!
+//! # Une sortie LOCALE qui joue ne l'empêche plus non plus (#8609, fil 2167)
+//!
+//! Le même testeur écoute désormais toute la journée sur sa carte son (ALSA,
+//! DAC USB) : la purge ne tournait plus JAMAIS, et le serveur est passé de
+//! 505 Mo à 5 Go en dix heures, par marches de +1,1 Go en cinq minutes
+//! (passe ReplayGain, modèle texte CLAP chargé), sans une ligne
+//! `memoire_rendue_a_froid`.
+//!
+//! La garde reposait sur une précaution, jamais mesurée : « un fil de lecture
+//! qui allouerait attendrait ». Or `malloc_trim` n'attend que les fils qui
+//! ALLOUENT ou LIBÈRENT, et le rappel de rendu local n'en fait aucun :
+//! il copie l'anneau dans le tampon du pilote (`render_local_shared_*_callback`,
+//! sans allocation depuis #2218), et le fil ALSA de cpal écrit dans des
+//! tampons faits à l'ouverture. Le producteur (décodage) alloue, mais il a
+//! deux secondes d'anneau devant lui, contre quelques dizaines de
+//! millisecondes de purge.
+//!
+//! Mesuré sur Shrek (banc `banc_trim_pendant_lecture_8609`, rappel de rendu
+//! RÉEL à la cadence d'une période de 11,6 ms, passe ReplayGain réelle sur
+//! des WAV 32 bits / 96 kHz et rafales d'allocations type ONNX en parallèle,
+//! purge toutes les 500 ms) : chiffres dans la PR #8609.
+//!
+//! Pendant une lecture locale, la purge ne se fait plus que si la mémoire
+//! libre gardée en vaut la peine ([`SEUIL_LIBRE_PENDANT_LECTURE_MB`]) : à
+//! froid, rien ne change.
+//!
 //! Hors glibc (macOS, Windows, musl), la fonction ne fait rien : leurs
 //! allocateurs ont leur propre politique, et ce relevé ne les concerne pas.
 
 /// RSS du processus, en mégaoctets — la même lecture que `memory_diagnostics`
 /// (`/proc/self/statm`, pages de 4 Kio). `None` hors Linux.
 pub fn rss_mb() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        Some(pages * 4 / 1024)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    tune_core::memoire_rendue::rss_mb()
 }
 
 /// Rend au noyau les pages libres que l'allocateur garde. `true` quand
@@ -82,12 +99,93 @@ pub fn rendre_la_memoire_liberee() -> bool {
     tune_core::memoire_rendue::rendre_la_memoire_liberee()
 }
 
-/// La purge n'a lieu qu'à froid : aucune sortie LOCALE ne joue (fil 2167).
-pub fn purge_permise(une_sortie_locale_joue: bool) -> bool {
-    !une_sortie_locale_joue
+/// Mémoire libre gardée par les arènes (`mallinfo2().fordblks`) au-delà de
+/// laquelle la purge a lieu MÊME pendant une lecture locale (#8609). En deçà,
+/// le jeu n'en vaut pas la chandelle : on attend le prochain relevé.
+pub const SEUIL_LIBRE_PENDANT_LECTURE_MB: u64 = 64;
+
+/// Ce que décide le relevé de cinq minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionDePurge {
+    /// Aucune sortie locale ne joue : purge, comme toujours.
+    AFroid,
+    /// Une sortie locale joue, et la mémoire libre gardée dépasse le seuil.
+    PendantLectureLocale,
+    /// Une sortie locale joue, peu de mémoire libre gardée : rien à gagner.
+    Retenue,
 }
 
-/// Une zone qui joue retient-elle la purge ? Oui quand elle est locale, quand
+impl DecisionDePurge {
+    pub fn purge(self) -> bool {
+        !matches!(self, Self::Retenue)
+    }
+}
+
+/// Décision PURE. `libre_mb` : `mallinfo2().fordblks` ; inconnu (`None`),
+/// la purge a lieu — elle ne coûte que quelques dizaines de millisecondes à
+/// des fils qui ne sont pas le rendu.
+pub fn decider_la_purge(une_sortie_locale_joue: bool, libre_mb: Option<u64>) -> DecisionDePurge {
+    if !une_sortie_locale_joue {
+        return DecisionDePurge::AFroid;
+    }
+    match libre_mb {
+        Some(l) if l < SEUIL_LIBRE_PENDANT_LECTURE_MB => DecisionDePurge::Retenue,
+        _ => DecisionDePurge::PendantLectureLocale,
+    }
+}
+
+/// Le relevé de cinq minutes rend au système la mémoire libre gardée par
+/// l'allocateur ([`decider_la_purge`]) et journalise `memoire_rendue_a_froid`.
+/// Hors du fil async : `mallinfo2` et `malloc_trim` parcourent les arènes.
+/// `None` hors glibc, ou quand la purge est retenue.
+pub async fn purger_a_froid(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Option<(DecisionDePurge, tune_core::memoire_rendue::PurgeFaite)> {
+    // Hors glibc, rien à rendre : ne pas payer la requête des zones.
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+        return None;
+    }
+    let backend = backend.clone();
+    let mesure = tokio::task::spawn_blocking(move || {
+        let locale = une_sortie_locale_joue(&backend);
+        let tas = tune_core::memoire_rendue::etat_du_tas();
+        let decision = decider_la_purge(locale, tas.map(|t| t.libre_mb));
+        if !decision.purge() {
+            return None;
+        }
+        let rss_avant_mb = rss_mb();
+        let debut = std::time::Instant::now();
+        let rendu = rendre_la_memoire_liberee();
+        let duree_ms = debut.elapsed().as_millis() as u64;
+        Some((
+            decision,
+            tas.map(|t| t.libre_mb),
+            tune_core::memoire_rendue::PurgeFaite {
+                rss_avant_mb,
+                rss_apres_mb: rss_mb(),
+                rendu,
+                duree_ms,
+            },
+        ))
+    })
+    .await
+    .ok()
+    .flatten()?;
+    let (decision, libre_avant_mb, purge) = mesure;
+    if purge.rendu {
+        tracing::info!(
+            rss_avant_mb = purge.rss_avant_mb,
+            rss_apres_mb = purge.rss_apres_mb,
+            tas_libre_avant_mb = libre_avant_mb,
+            duree_ms = purge.duree_ms,
+            pendant_lecture_locale = decision == DecisionDePurge::PendantLectureLocale,
+            "memoire_rendue_a_froid"
+        );
+    }
+    Some((decision, purge))
+}
+
+/// Une sortie locale joue-t-elle ? Oui quand la zone est locale, quand
 /// son type est inconnu, ou quand elle partage son groupe avec une zone
 /// locale (une suiveuse locale peut ne pas porter elle-même `playing`).
 /// SQL standard : la même requête sert SQLite et PostgreSQL.

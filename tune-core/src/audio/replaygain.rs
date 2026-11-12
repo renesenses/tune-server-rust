@@ -1641,6 +1641,21 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
         curseur = suivant,
         "replaygain_track_batch"
     );
+    // #8609 — les tampons de décodage du lot sont libérés, mais les arènes
+    // glibc les gardent : les rendre tout de suite, MÊME si une sortie locale
+    // joue (la passe ralentie tourne justement pendant l'écoute). Hors du fil
+    // async ; le rappel de rendu local n'alloue pas et ne peut pas attendre.
+    if done > 0
+        && let Some(p) = crate::memoire_rendue::rendre_hors_du_fil_async().await
+        && p.rendu
+    {
+        info!(
+            rss_avant_mb = p.rss_avant_mb,
+            rss_apres_mb = p.rss_apres_mb,
+            duree_ms = p.duree_ms,
+            "replaygain_memoire_rendue"
+        );
+    }
     done
 }
 

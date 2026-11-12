@@ -9,8 +9,19 @@
 /// l'allocateur dit en avoir rendu ; `false` s'il n'y avait rien à rendre, ou
 /// hors glibc, où rien n'est fait.
 ///
-/// ⚠️ Tient le verrou de chaque arène pendant qu'il la parcourt : ne pas
-/// l'appeler pendant qu'une sortie LOCALE joue.
+/// ⚠️ Tient le verrou de chaque arène pendant qu'il la parcourt : un fil qui
+/// ALLOUE à cet instant attend (de 0 à quelques dizaines de millisecondes).
+/// Jamais depuis le fil async, ni depuis un rappel de rendu audio.
+///
+/// # Pendant une lecture LOCALE (#8609)
+///
+/// Il n'attend que les fils qui allouent ou libèrent. Le rappel de rendu
+/// local n'en fait aucun : il lit l'anneau dans le tampon que lui tend le
+/// pilote (`render_local_shared_*_callback`, plus aucune allocation depuis
+/// #2218), et le fil ALSA de cpal travaille dans des tampons faits à
+/// l'ouverture. Le producteur, lui, alloue, mais il a deux secondes d'anneau
+/// devant lui. Mesuré sur Shrek (banc `banc_trim_pendant_lecture_8609`) :
+/// voir `tune-server/src/memoire_a_froid.rs`.
 pub fn rendre_la_memoire_liberee() -> bool {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
@@ -22,6 +33,96 @@ pub fn rendre_la_memoire_liberee() -> bool {
     {
         false
     }
+}
+
+/// Ce que dit `mallinfo2()` du tas, en mégaoctets (#8609).
+///
+/// De quoi trancher, dans le journal, entre « libéré mais gardé par les
+/// arènes » (`libre_mb` monte : `malloc_trim` le rend) et « vraiment en
+/// usage » (`en_usage_mb` monte : une structure vivante grossit, et aucune
+/// purge n'y peut rien).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EtatDuTas {
+    /// Blocs vivants, tas des arènes ET blocs `mmap` (`uordblks + hblkhd`).
+    pub en_usage_mb: u64,
+    /// Blocs libres que les arènes gardent (`fordblks`) : ce que la purge vise.
+    pub libre_mb: u64,
+    /// Dont blocs servis par `mmap` (`hblkhd`), rendus seuls à leur libération.
+    pub mmap_mb: u64,
+}
+
+/// Lit l'état du tas. `None` hors glibc.
+///
+/// ⚠️ `mallinfo2` prend, lui aussi, le verrou de chaque arène le temps de
+/// compter ses listes libres : hors du fil async, comme la purge.
+pub fn etat_du_tas() -> Option<EtatDuTas> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY : `mallinfo2` n'a pas de précondition et rend une structure
+        // par valeur.
+        let m = unsafe { libc::mallinfo2() };
+        const MO: usize = 1024 * 1024;
+        Some(EtatDuTas {
+            en_usage_mb: ((m.uordblks + m.hblkhd) / MO) as u64,
+            libre_mb: (m.fordblks / MO) as u64,
+            mmap_mb: (m.hblkhd / MO) as u64,
+        })
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        None
+    }
+}
+
+/// RSS du processus en mégaoctets (`/proc/self/statm`). `None` hors Linux.
+pub fn rss_mb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(pages * 4 / 1024)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Une purge faite, et ce qu'elle a rendu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeFaite {
+    pub rss_avant_mb: Option<u64>,
+    pub rss_apres_mb: Option<u64>,
+    /// L'allocateur dit avoir rendu des pages.
+    pub rendu: bool,
+    pub duree_ms: u64,
+}
+
+/// Purge HORS du fil async, juste après une tâche lourde qui vient de rendre
+/// sa mémoire à l'allocateur (fin d'un lot ReplayGain, session ONNX relâchée),
+/// QUE QUELQUE CHOSE JOUE OU NON (#8609). `None` hors glibc.
+///
+/// Avant #8609, ces purges n'avaient lieu que si rien ne jouait : un serveur
+/// qui écoute sur sa carte son toute la journée ne rendait jamais rien
+/// (505 Mo → 5 Go en dix heures, fil 2167). Voir [`rendre_la_memoire_liberee`]
+/// pour ce que la lecture locale risque — rien de mesurable.
+pub async fn rendre_hors_du_fil_async() -> Option<PurgeFaite> {
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+        return None;
+    }
+    tokio::task::spawn_blocking(|| {
+        let rss_avant_mb = rss_mb();
+        let debut = std::time::Instant::now();
+        let rendu = rendre_la_memoire_liberee();
+        PurgeFaite {
+            rss_avant_mb,
+            rss_apres_mb: rss_mb(),
+            rendu,
+            duree_ms: debut.elapsed().as_millis() as u64,
+        }
+    })
+    .await
+    .ok()
 }
 
 // ---------------------------------------------------------------------------

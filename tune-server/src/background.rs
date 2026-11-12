@@ -3215,8 +3215,14 @@ fn spawn_cloud_library_sync(state: &AppState) {
 /// de fond n'ont pas le même correctif. Ceci rend le prochain relevé
 /// exploitable, rien de plus.
 ///
-/// Après le relevé, et sans sortie locale en lecture, la mémoire libre que garde
-/// l'allocateur est rendue au système ([`crate::memoire_a_froid`]) : mesuré
+/// - `tas_en_usage_mb`, `tas_libre_mb`, `tas_mmap_mb` (#8609, glibc) : ce que
+///   dit `mallinfo2`. Un `tas_libre_mb` qui monte est de la mémoire libérée
+///   mais gardée par les arènes (la purge la rend) ; un `tas_en_usage_mb` qui
+///   monte est de la mémoire VIVANTE, qu'aucune purge ne rendra.
+///
+/// Après le relevé, la mémoire libre que garde l'allocateur est rendue au
+/// système, y compris pendant une lecture locale (#8609,
+/// [`crate::memoire_a_froid`]) : mesuré
 /// sur Shrek, 94 % du tas résident au repos était de la mémoire libre, et le
 /// relevé ne redescendait jamais.
 fn spawn_memory_diagnostics(
@@ -3249,55 +3255,34 @@ fn spawn_memory_diagnostics(
                 // Ventilation du RSS : un champ indisponible est omis de la
                 // ligne, jamais remplacé par un zéro.
                 let detail = crate::releve_memoire::lire().await;
+                // #8609 — « libre mais gardé » contre « en usage » : le RSS
+                // seul ne les distingue pas. `mallinfo2` parcourt les arènes,
+                // hors du fil async.
+                let tas = tokio::task::spawn_blocking(tune_core::memoire_rendue::etat_du_tas)
+                    .await
+                    .ok()
+                    .flatten();
                 info!(
                     rss_mb,
                     rss_delta_mb,
                     rss_anon_mb = detail.anon_mb,
                     rss_file_mb = detail.file_mb,
                     rss_shmem_mb = detail.shmem_mb,
+                    tas_en_usage_mb = tas.map(|t| t.en_usage_mb),
+                    tas_libre_mb = tas.map(|t| t.libre_mb),
+                    tas_mmap_mb = tas.map(|t| t.mmap_mb),
                     outputs_count = count,
                     stream_sessions,
                     "memory_diagnostics"
                 );
             }
-            purger_a_froid(&backend).await;
+            // #8609 — y compris pendant une lecture locale (voir
+            // `memoire_a_froid::decider_la_purge`).
+            crate::memoire_a_froid::purger_a_froid(&backend).await;
             let _ = (&outputs, &streamer); // keep alive on non-linux
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
-}
-
-/// Rend au système la mémoire libre gardée par l'allocateur, si aucune sortie
-/// locale ne joue (fil 2167). Hors du fil asynchrone : le parcours des arènes prend quelques
-/// dizaines de millisecondes au pire.
-async fn purger_a_froid(backend: &Arc<dyn tune_core::db::backend::DbBackend>) {
-    // Hors glibc, rien à rendre : ne pas payer la requête des zones.
-    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
-        return;
-    }
-    let backend = backend.clone();
-    let mesure = tokio::task::spawn_blocking(move || {
-        // Fil 2167 — seule une sortie LOCALE en lecture retient la purge : une
-        // zone réseau qui joue sans arrêt ne la bloque plus pour toujours.
-        let locale = crate::memoire_a_froid::une_sortie_locale_joue(&backend);
-        if !crate::memoire_a_froid::purge_permise(locale) {
-            return None;
-        }
-        let avant = crate::memoire_a_froid::rss_mb();
-        let debut = std::time::Instant::now();
-        let rendu = crate::memoire_a_froid::rendre_la_memoire_liberee();
-        let apres = crate::memoire_a_froid::rss_mb();
-        Some((avant, apres, rendu, debut.elapsed()))
-    })
-    .await;
-    if let Ok(Some((Some(avant), Some(apres), true, duree))) = mesure {
-        info!(
-            rss_avant_mb = avant,
-            rss_apres_mb = apres,
-            duree_ms = duree.as_millis() as u64,
-            "memoire_rendue_a_froid"
-        );
-    }
 }
 
 /// Periodically re-enumerate local audio devices to detect USB DACs that were

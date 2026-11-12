@@ -252,6 +252,12 @@ path = "tests/correction_de_piece_appliquee_7642.rs"
 name = "memoire_a_froid"
 path = "tests/memoire_a_froid.rs"
 
+# #8609 — la purge pendant une lecture locale, et sa ligne de journal. Abonné
+# `tracing` GLOBAL : un binaire, un test.
+[[test]]
+name = "memoire_rendue_pendant_lecture_locale_8609"
+path = "tests/memoire_rendue_pendant_lecture_locale_8609.rs"
+
 # `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
 # point d'accès Sendspin doit être une cible déclarée pour être compilé.
 [[test]]
