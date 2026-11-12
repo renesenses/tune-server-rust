@@ -105,6 +105,22 @@ pub(crate) fn injecter_backend_de_sortie(
     backend_configure: &str,
     backend_sortie: Option<&str>,
 ) {
+    injecter_backend_de_sortie_sur(
+        obj,
+        backend_configure,
+        backend_sortie,
+        cfg!(target_os = "windows"),
+    );
+}
+
+/// Même pose, la plateforme en paramètre : c'est ce qui permet au banc Linux
+/// de prouver le câblage de `pilote_local` sous Windows (#7806).
+pub(crate) fn injecter_backend_de_sortie_sur(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    backend_configure: &str,
+    backend_sortie: Option<&str>,
+    on_windows: bool,
+) {
     let Some(sortie) = backend_sortie else {
         return;
     };
@@ -113,6 +129,8 @@ pub(crate) fn injecter_backend_de_sortie(
         "hors_backend_choisi".into(),
         serde_json::json!(hors_backend_choisi(backend_configure, sortie)),
     );
+    // #7806 — le pilote réellement emprunté, sur chaque zone locale Windows.
+    super::pilote_local_7806::injecter_pilote_local(obj, Some(sortie), on_windows);
 }
 
 #[cfg(test)]

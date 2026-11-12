@@ -29,6 +29,8 @@ pub mod engine;
 /// #7983 — la trace des tentatives de la passe d'enrichissement des métadonnées.
 pub mod enrich_tentatives;
 pub mod facet_filter;
+/// #8325 — chef, ensemble, œuvre : facettes et colonnes de la Collection.
+pub mod facettes_classiques;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
 /// #5314 — le genre posé sur un album vaut pour ses pistes.

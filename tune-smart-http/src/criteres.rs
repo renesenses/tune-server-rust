@@ -139,6 +139,11 @@ pub(crate) const CRITERES: &[Critere] = &[
     deux("track_artist", Famille::Texte),
     deux("genre", Famille::Texte),
     deux("composer", Famille::Texte),
+    // #8325 — chef d'orchestre, ensemble / orchestre et œuvre : crédits,
+    // balises du scan et fiche d'album, comme les facettes de la Collection.
+    deux("conductor", Famille::Texte),
+    deux("ensemble", Famille::Texte),
+    deux("work", Famille::Texte),
     deux("label", Famille::Texte),
     deux("format", Famille::Texte),
     deux("source", Famille::Source),
@@ -354,7 +359,7 @@ pub(crate) mod tests {
     }
 
     /// Les identifiants des albums que retient une règle de COLLECTION.
-    fn albums(db: &SqliteDb, regles: &str) -> Vec<i64> {
+    pub(crate) fn albums(db: &SqliteDb, regles: &str) -> Vec<i64> {
         let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let (w, _o, _l) = build_album_query(regles, "all", "title", "asc", None, &ctx);
         assert!(
@@ -687,14 +692,15 @@ pub(crate) mod tests {
     /// collections (#5530 : « Généré par IA » ; #6123 : « Note de la piste » ;
     /// #6121 : « Artiste de l'album » ; #6124 : « Année de sortie originale »
     /// et « Version » ; #6232 : « Interprète » ; #6285 : « Verdict hi-res »,
-    /// que `smartRegles.ts` n'a pas encore). Si ce nombre bouge,
-    /// `smartRegles.ts` doit bouger aussi.
+    /// que `smartRegles.ts` n'a pas encore ; #8325 : « Chef d'orchestre »,
+    /// « Ensemble / orchestre » et « Œuvre », web#2762 → 37 / 35 côté client).
+    /// Si ce nombre bouge, `smartRegles.ts` doit bouger aussi.
     #[test]
     fn le_tableau_a_la_taille_de_celui_du_client() {
-        assert_eq!(CRITERES.len(), 35);
+        assert_eq!(CRITERES.len(), 38);
         assert_eq!(
             CRITERES.iter().filter(|c| c.collection.is_some()).count(),
-            33
+            36
         );
     }
     // ---------------------------------------------------------------------
@@ -1317,6 +1323,10 @@ mod hires_6285;
 #[cfg(test)]
 #[path = "criteres_ecoutes_7769_tests.rs"]
 mod ecoutes_7769;
+
+#[cfg(test)]
+#[path = "criteres_classiques_8325_tests.rs"]
+mod classiques_8325;
 
 #[cfg(test)]
 #[path = "criteres_ecoutes_importees_8416_tests.rs"]

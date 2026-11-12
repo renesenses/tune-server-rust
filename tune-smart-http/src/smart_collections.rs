@@ -1136,6 +1136,20 @@ pub fn build_album_query(
             continue;
         }
 
+        // #8325 — chef, ensemble, œuvre : un album passe dès qu'UNE de ses
+        // pistes porte la valeur ; « différent », « ne contient pas » et
+        // « vide » demandent qu'AUCUNE piste ne la porte.
+        if let Some(r) = crate::regles_sql::condition_classique(field, op, value_raw) {
+            conditions.push(match r {
+                Some((c, false)) => c,
+                Some((c, true)) => {
+                    format!("NOT EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = al.id AND {c})")
+                }
+                None => crate::regles_sql::FAUX.to_string(),
+            });
+            continue;
+        }
+
         let col = match field {
             "genre" => "t.genre",
             "artist" | "artist_name" => "ar.name",
