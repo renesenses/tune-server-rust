@@ -1863,9 +1863,14 @@ async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin
 /// l'écrire. `None` si la tâche a été interrompue : rien à poser.
 async fn calculer_l_empreinte(track_id: i64, chemin: &str) -> Option<String> {
     let chemin_owned = chemin.to_string();
+    // #8346 — chaque ligne écrite pendant ce calcul (le rééchantillonnage
+    // 44,1 kHz → 11 025 Hz en tête) porte le nom de la passe et le chemin de
+    // sa pause.
+    let passe = span_de_la_passe_d_empreintes();
     // #7915 — sur un fil en priorité processeur basse, pas sur le pool
     // bloquant ordinaire.
     let calcul = crate::taches_de_fond::basse_priorite::en_priorite_basse(move || {
+        let _passe = passe.enter();
         // #4681 — E/S basses si une zone joue.
         let _basse = crate::taches_de_fond::priorite::politique::baisser_pendant_la_lecture();
         crate::audio::empreinte::empreinte_du_fichier(&chemin_owned)
@@ -1878,6 +1883,37 @@ async fn calculer_l_empreinte(track_id: i64, chemin: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// #8346 — où l'on arrête la passe d'empreintes, écrit dans le journal : un
+/// utilisateur qui voyait « rubato_batch_resample_complete … to_sr=11025 »
+/// tourner depuis 8 h ne pouvait le relier ni à la tâche ni à sa pause
+/// (BenjaminB, ASR #161).
+pub const PAUSE_DES_EMPREINTES: &str = "Settings › Background tasks › Fingerprints › Pause";
+
+/// #8346 — le span qui nomme la passe d'empreintes dans le journal.
+fn span_de_la_passe_d_empreintes() -> tracing::Span {
+    tracing::info_span!(
+        "fingerprints_pass",
+        task = crate::taches_de_fond::Tache::Empreintes.id(),
+        pause = PAUSE_DES_EMPREINTES
+    )
+}
+
+/// #8346 — la ligne d'avancement de la passe d'empreintes, une par lot (et
+/// non une par piste) : la tâche, n/N pistes, et comment l'arrêter.
+fn ligne_d_avancement_des_empreintes(
+    lot: usize,
+    releve: Option<crate::taches_de_fond::avancement::Avancement>,
+) -> String {
+    let progression = match releve {
+        Some(a) if a.total > 0 => format!("{}/{} pistes", a.processed, a.total),
+        _ => "progression inconnue".to_string(),
+    };
+    format!(
+        "fingerprints pass: {lot} track(s) in this batch, {progression} \
+         (pause: {PAUSE_DES_EMPREINTES})"
+    )
 }
 
 /// La valeur à poser pour un calcul d'empreinte : l'empreinte sérialisée, ou
@@ -2085,7 +2121,17 @@ pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
         },
     )
     .await;
-    info!(empreintes = done, "empreinte_lot");
+    // #8346 — l'avancement par lot, avec le nom de la tâche et sa pause.
+    let releve =
+        crate::taches_de_fond::avancement::releve(crate::taches_de_fond::Tache::Empreintes);
+    info!(
+        task = crate::taches_de_fond::Tache::Empreintes.id(),
+        empreintes = done,
+        traitees = releve.map(|a| a.processed),
+        total = releve.map(|a| a.total),
+        "empreinte_lot — {}",
+        ligne_d_avancement_des_empreintes(done, releve)
+    );
     done
 }
 
@@ -6903,6 +6949,60 @@ mod garde_pic_hors_echelle {
             (sans - ferraille).abs() < 1e-12,
             "sans pic {sans} != pic hors échelle {ferraille}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_passe_d_empreintes_nommee_8346 {
+    use super::*;
+    use crate::taches_de_fond::avancement::Avancement;
+
+    fn releve(processed: i64, total: i64) -> Avancement {
+        Avancement {
+            task: "fingerprints",
+            active: true,
+            processed,
+            total,
+            remaining: total - processed,
+            eta_seconds: None,
+            started_at: 0,
+            updated_at: 0,
+            elapsed_ms: 0,
+        }
+    }
+
+    /// ASR #161 : la ligne du journal nomme la passe, dit où l'arrêter et
+    /// donne l'avancement n/N par lot.
+    #[test]
+    fn la_ligne_d_avancement_nomme_la_passe_et_sa_pause() {
+        let l = ligne_d_avancement_des_empreintes(25, Some(releve(1_250, 40_000)));
+        assert!(l.starts_with("fingerprints pass:"), "{l}");
+        assert!(l.contains("25 track(s)"), "{l}");
+        assert!(l.contains("1250/40000"), "{l}");
+        assert!(
+            l.contains("Settings › Background tasks › Fingerprints › Pause"),
+            "{l}"
+        );
+        let sans = ligne_d_avancement_des_empreintes(3, None);
+        assert!(
+            sans.contains("progression inconnue") && sans.contains("Pause"),
+            "{sans}"
+        );
+    }
+
+    /// Le nom de la passe dans le journal est l'identifiant de la tâche que
+    /// lisent l'écran « Tâches de fond » et sa route `/{id}/pause`.
+    #[test]
+    fn le_nom_de_la_passe_est_celui_de_la_tache_et_de_sa_pause() {
+        assert_eq!(
+            crate::taches_de_fond::Tache::Empreintes.id(),
+            "fingerprints"
+        );
+        assert_eq!(
+            crate::taches_de_fond::Tache::depuis_id("fingerprints"),
+            Some(crate::taches_de_fond::Tache::Empreintes)
+        );
+        assert!(PAUSE_DES_EMPREINTES.contains("Fingerprints"));
     }
 }
 

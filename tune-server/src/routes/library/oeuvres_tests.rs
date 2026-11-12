@@ -692,3 +692,82 @@ async fn paire_distincte_meme_oeuvre_dans_la_grille_et_dans_la_fiche() {
     let (_, avec_nu) = dans_la_grille(nu);
     assert_eq!(avec_nu, vec![nu]);
 }
+
+// ── tune-web-client#2731 — les canaux de CHAQUE version ─────────────────────
+
+fn piste_a_canaux(state: &AppState, album: i64, chemin: &str, canaux: i64) {
+    state
+        .backend
+        .execute(
+            "INSERT INTO tracks (title, album_id, file_path, source, channels) \
+             VALUES ('t', ?1, ?2, 'local', ?3)",
+            &[
+                &album as &dyn ToSqlValue,
+                &chemin.to_string() as &dyn ToSqlValue,
+                &canaux as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap();
+}
+
+fn version(oeuvre: &Value, id: i64) -> &Value {
+    oeuvre["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == json!(id))
+        .unwrap_or_else(|| panic!("version {id} absente de {oeuvre}"))
+}
+
+#[tokio::test]
+async fn chaque_version_porte_ses_canaux_2731() {
+    let b = banc();
+    // L'édition stéréo et l'édition SACD multicanale du même disque : la
+    // fiche doit dire laquelle est en 2.0 et laquelle en 5.1.
+    piste_a_canaux(&b.state, b.dsotm, "/m/stereo/01.dsf", 2);
+    piste_a_canaux(&b.state, b.dsotm_sacd, "/m/multi/01.dsf", 2);
+    piste_a_canaux(&b.state, b.dsotm_sacd, "/m/multi/02.dsf", 6);
+
+    let (statut, corps) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{}/versions", b.dsotm),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(
+        version(&corps, b.dsotm)["max_channels"],
+        json!(2),
+        "{corps}"
+    );
+    assert_eq!(
+        version(&corps, b.dsotm_sacd)["max_channels"],
+        json!(6),
+        "le canal MAXIMUM des pistes de la version : {corps}"
+    );
+
+    // Même chose dans la bibliothèque en œuvres.
+    let (_, oeuvres) = appeler(&b.state, "GET", "/api/v1/library/albums/works", None).await;
+    let dsotm = oeuvres["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| ids(o).contains(&b.dsotm))
+        .unwrap();
+    assert_eq!(version(dsotm, b.dsotm)["max_channels"], json!(2));
+    assert_eq!(version(dsotm, b.dsotm_sacd)["max_channels"], json!(6));
+
+    // Canaux inconnus : la clé est ABSENTE, le client ne pose aucun badge.
+    let (_, seul) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{}/versions", b.hits_a),
+        None,
+    )
+    .await;
+    assert!(
+        seul["versions"][0].get("max_channels").is_none(),
+        "pas de canaux connus, pas de clé : {seul}"
+    );
+}

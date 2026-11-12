@@ -2193,6 +2193,7 @@ mod filtre_actif_tests {
             ("composer", "composer=Bach"),
             ("artist", "artist=Miles+Davis"),
             ("country", "country=FR"),
+            ("artist_country", "artist_country=FR"),
             ("mood", "mood=calme"),
             ("source_media", "source_media=CD"),
             ("original_year", "original_year=1969"),

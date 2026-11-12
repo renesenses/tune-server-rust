@@ -2104,6 +2104,9 @@ mod relance_ytdlp_4366;
 // Lot L3b (rc3) — un `Seek` refusé par un renderer DLNA (701/710/711).
 #[cfg(test)]
 mod seek_refuse_par_le_renderer;
+// #5575 — un volume décoratif (Diretta UPnP) s'annonce non réglable.
+#[cfg(test)]
+mod volume_decoratif_5575_tests;
 
 mod resolve_local;
 // #6059 — Seek ignoré par le renderer : le flux natif relancé à la position.

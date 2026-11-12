@@ -86,7 +86,11 @@ fn trames_ecoulees(frequence: u32, duree: Duration) -> u64 {
 /// Ce qu'un flux a besoin de savoir pour partir.
 #[derive(Debug, Clone, Copy)]
 pub struct ParametresFlux {
+    /// La session de l'émetteur (#8536 : la sienne, jamais celle annoncée).
     pub session: [u8; 4],
+    /// La session que l'ampli annonçait au départ, pour les journaux : si
+    /// elle diffère de la nôtre, elle appartient à un autre hôte (Roon).
+    pub session_annoncee: [u8; 4],
     pub flux: u32,
     pub frequence: u32,
     pub cadence: Cadence,
@@ -186,6 +190,17 @@ pub async fn diffuser(
     // rien n'est arrivé (filtrage réseau, ampli qui n'écoute pas) ou si des
     // retours sont arrivés et ont été écartés (format, session, flux).
     let mut ecartes = Ecartes::default();
+    // #8536 — codes neutres, lisibles dans les journaux sans capture réseau.
+    let session = hexa(&p.session);
+    let session_annoncee = hexa(&p.session_annoncee);
+    info!(
+        flux = p.flux,
+        %ampli,
+        session = %session,
+        session_annoncee = %session_annoncee,
+        frequence = f,
+        "devialet_air_flux_debut"
+    );
 
     loop {
         tokio::select! {
@@ -275,6 +290,9 @@ pub async fn diffuser(
                         flux = p.flux,
                         %ampli,
                         %local,
+                        session = %session,
+                        session_annoncee = %session_annoncee,
+                        retours_recus = instantane.retours_recus,
                         paquets_envoyes = instantane.paquets_envoyes,
                         datagrammes_ecartes = ecartes.nombre,
                         constat = %constat,
@@ -287,11 +305,25 @@ pub async fn diffuser(
                     ));
                 }
                 if dernier_retour.is_some_and(|t| t.elapsed() > c.delai_retour_perdu) {
+                    warn!(
+                        flux = p.flux,
+                        %ampli,
+                        session = %session,
+                        session_annoncee = %session_annoncee,
+                        retours_recus = instantane.retours_recus,
+                        paquets_envoyes = instantane.paquets_envoyes,
+                        datagrammes_ecartes = ecartes.nombre,
+                        "devialet_air_retours_interrompus"
+                    );
                     return FinDeFlux::interrompu("l'ampli ne répond plus (retours Df interrompus)");
                 }
                 if let (Some(fin), Some(depuis)) = (position_finale, fin_envoyee_a) {
                     if jouee + TRAMES_PAR_PAQUET as u64 >= fin {
-                        info!(flux = p.flux, "devialet_air_fin_naturelle");
+                        info!(
+                            flux = p.flux,
+                            retours_recus = instantane.retours_recus,
+                            "devialet_air_fin_naturelle"
+                        );
                         return FinDeFlux::Naturelle;
                     }
                     if depuis.elapsed() > c.avance_cible + c.vidage_max {
@@ -321,6 +353,9 @@ pub async fn diffuser(
                     ));
                     continue;
                 }
+                if dernier_retour.is_none() {
+                    info!(flux = p.flux, %de, session = %session, "devialet_air_premier_retour");
+                }
                 dernier_retour = Some(Instant::now());
                 if df.position_jouee != jouee {
                     jouee = df.position_jouee;
@@ -346,6 +381,12 @@ pub async fn diffuser(
             }
         }
     }
+}
+
+/// Une session en hexadécimal (`5a17c0de`), pour les journaux.
+#[must_use]
+pub fn hexa(session: &[u8; 4]) -> String {
+    session.iter().map(|o| format!("{o:02x}")).collect()
 }
 
 /// Les datagrammes reçus sur le port local et écartés par l'émetteur.

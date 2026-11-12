@@ -3,6 +3,7 @@
 mod server;
 mod volume;
 mod vue_mini;
+mod zone_cible;
 
 use serde::Serialize;
 use tauri::{
@@ -14,8 +15,26 @@ use tokio::sync::RwLock;
 
 struct AppState {
     server_url: RwLock<String>,
-    active_zone_id: RwLock<i64>,
+    /// La zone signalée par la page (`select_zone` ou `/__widget/zone/<id>`).
+    /// `None` tant que rien n'a été signalé : voir [`zone_visee`] (#8531).
+    active_zone_id: RwLock<Option<i64>>,
     http: reqwest::Client,
+}
+
+/// La zone que visent les commandes, les raccourcis et les touches média.
+///
+/// Celle que la page a signalée ; à défaut, la zone qui joue, sinon en pause,
+/// sinon la première (`zone_cible::zone_par_defaut`) ; serveur muet : 1, la
+/// valeur d'avant #8531.
+async fn zone_visee(state: &AppState) -> i64 {
+    if let Some(id) = *state.active_zone_id.read().await {
+        return id;
+    }
+    let url = state.server_url.read().await.clone();
+    fetch_widget_data(&state.http, &url, None)
+        .await
+        .and_then(|d| zone_cible::zone_par_defaut(&d))
+        .unwrap_or(1)
 }
 
 /// Shape of the `/api/v1/widget/data` payload. Kept as the written record of
@@ -36,8 +55,8 @@ struct WidgetData {
 
 #[tauri::command]
 async fn get_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let zone_id = zone_visee(&state).await;
     let url = state.server_url.read().await;
-    let zone_id = *state.active_zone_id.read().await;
     let resp = state
         .http
         .get(format!("{url}/api/v1/widget/data?zone_id={zone_id}"))
@@ -61,8 +80,8 @@ async fn get_zones(state: State<'_, AppState>) -> Result<serde_json::Value, Stri
 
 #[tauri::command]
 async fn play_pause(state: State<'_, AppState>) -> Result<(), String> {
+    let zone_id = zone_visee(&state).await;
     let url = state.server_url.read().await;
-    let zone_id = *state.active_zone_id.read().await;
     let status: serde_json::Value = state
         .http
         .get(format!("{url}/api/v1/widget/data?zone_id={zone_id}"))
@@ -88,8 +107,8 @@ async fn play_pause(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn next_track(state: State<'_, AppState>) -> Result<(), String> {
+    let zone_id = zone_visee(&state).await;
     let url = state.server_url.read().await;
-    let zone_id = *state.active_zone_id.read().await;
     state
         .http
         .post(format!("{url}/api/v1/zones/{zone_id}/next"))
@@ -101,8 +120,8 @@ async fn next_track(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn prev_track(state: State<'_, AppState>) -> Result<(), String> {
+    let zone_id = zone_visee(&state).await;
     let url = state.server_url.read().await;
-    let zone_id = *state.active_zone_id.read().await;
     state
         .http
         .post(format!("{url}/api/v1/zones/{zone_id}/previous"))
@@ -114,8 +133,8 @@ async fn prev_track(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn set_volume(state: State<'_, AppState>, volume: i32) -> Result<(), String> {
+    let zone_id = zone_visee(&state).await;
     let url = state.server_url.read().await;
-    let zone_id = *state.active_zone_id.read().await;
     state
         .http
         .put(format!("{url}/api/v1/zones/{zone_id}/volume"))
@@ -129,7 +148,7 @@ async fn set_volume(state: State<'_, AppState>, volume: i32) -> Result<(), Strin
 
 #[tauri::command]
 async fn select_zone(state: State<'_, AppState>, zone_id: i64) -> Result<(), String> {
-    *state.active_zone_id.write().await = zone_id;
+    *state.active_zone_id.write().await = Some(zone_id);
     Ok(())
 }
 
@@ -222,8 +241,8 @@ async fn play_item(
     item_type: String,
     item_id: i64,
 ) -> Result<(), String> {
+    let zone_id = zone_visee(&state).await;
     let url = state.server_url.read().await;
-    let zone_id = *state.active_zone_id.read().await;
     let body = match item_type.as_str() {
         "album" => serde_json::json!({"album_id": item_id}),
         _ => serde_json::json!({"track_id": item_id}),
@@ -247,7 +266,7 @@ async fn play_item(
 // failures are logged (never unwrapped), and does all work on the async
 // runtime so the AppKit main thread is never blocked in the callback.
 // ---------------------------------------------------------------------------
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShortcutAction {
     PlayPause,
     Next,
@@ -268,14 +287,28 @@ const SHORTCUTS: &[(&str, ShortcutAction)] = &[
     ("CmdOrCtrl+Shift+Up", ShortcutAction::VolUp),
     ("CmdOrCtrl+Shift+Down", ShortcutAction::VolDown),
     ("CmdOrCtrl+Shift+M", ShortcutAction::ToggleMode),
+    // Les touches média du clavier (#8531), sur la zone visée. Les touches de
+    // VOLUME du clavier restent au système : elles règlent la sortie de
+    // l'ordinateur, et les capturer casserait ce réglage. Le volume de la
+    // zone reste sur Cmd/Ctrl+Maj+↑/↓.
+    // macOS : la capture passe par un `CGEventTap` soumis à l'autorisation
+    // d'Accessibilité ; refusée, l'enregistrement échoue (journalisé plus
+    // bas) et les touches restent aux autres applications.
+    ("MediaPlayPause", ShortcutAction::PlayPause),
+    ("MediaTrackNext", ShortcutAction::Next),
+    ("MediaTrackPrevious", ShortcutAction::Prev),
 ];
 
 async fn fetch_widget_data(
     http: &reqwest::Client,
     url: &str,
-    zone_id: i64,
+    zone_id: Option<i64>,
 ) -> Option<serde_json::Value> {
-    http.get(format!("{url}/api/v1/widget/data?zone_id={zone_id}"))
+    let requete = match zone_id {
+        Some(id) => format!("{url}/api/v1/widget/data?zone_id={id}"),
+        None => format!("{url}/api/v1/widget/data"),
+    };
+    http.get(requete)
         .send()
         .await
         .ok()?
@@ -287,7 +320,7 @@ async fn fetch_widget_data(
 async fn run_shortcut_action(app: tauri::AppHandle, action: ShortcutAction) {
     let state = app.state::<AppState>();
     let url = state.server_url.read().await.clone();
-    let zone_id = *state.active_zone_id.read().await;
+    let zone_id = zone_visee(&state).await;
     let http = state.http.clone();
     match action {
         // Seule action qui ne parle pas au serveur : elle doit fonctionner même
@@ -309,7 +342,7 @@ async fn run_shortcut_action(app: tauri::AppHandle, action: ShortcutAction) {
                 .await;
         }
         ShortcutAction::PlayPause => {
-            let playing = fetch_widget_data(&http, &url, zone_id)
+            let playing = fetch_widget_data(&http, &url, Some(zone_id))
                 .await
                 .map(|d| d["state"].as_str() == Some("playing"))
                 .unwrap_or(false);
@@ -586,7 +619,7 @@ async fn navigate_unified(app: &tauri::AppHandle, full: bool) -> bool {
         return false;
     }
     let target = if full {
-        url.clone()
+        vue_mini::adresse_complete(&url)
     } else {
         vue_mini::adresse_mini(&url)
     };
@@ -738,6 +771,11 @@ fn taille_mini(replie: bool) -> (f64, f64) {
 /// Aucune commande Tauri n'est ouverte à la page distante.
 async fn executer_action(app: tauri::AppHandle, action: vue_mini::ActionWidget) {
     use vue_mini::ActionWidget;
+    if let ActionWidget::Zone(id) = action {
+        *app.state::<AppState>().active_zone_id.write().await = Some(id);
+        tracing::info!(zone_id = id, "zone_visee_signalee");
+        return;
+    }
     let Some(win) = app.get_webview_window("full") else {
         return;
     };
@@ -756,6 +794,8 @@ async fn executer_action(app: tauri::AppHandle, action: vue_mini::ActionWidget) 
             tracing::info!(replie, "mini_replie");
         }
         ActionWidget::Complet => set_full_mode(&app, true).await,
+        // Déjà traitée plus haut, sans fenêtre.
+        ActionWidget::Zone(_) => {}
     }
 }
 
@@ -1017,7 +1057,7 @@ fn main() {
             tracing::info!(server_url = %saved_url, "server_url_resolved");
             AppState {
                 server_url: RwLock::new(saved_url),
-                active_zone_id: RwLock::new(1),
+                active_zone_id: RwLock::new(None),
                 http: reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(10))
                     .build()
@@ -1177,8 +1217,42 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_is_stale, fit_to_work_area, taille_mini, FULL_WINDOW_MIN_SIZE, FULL_WINDOW_SIZE,
+        cache_is_stale, fit_to_work_area, taille_mini, ShortcutAction, FULL_WINDOW_MIN_SIZE,
+        FULL_WINDOW_SIZE, SHORTCUTS,
     };
+
+    /// #8531 — les touches média du clavier sont enregistrées, sans modificateur,
+    /// sur la lecture/pause, le suivant et le précédent de la zone visée.
+    #[test]
+    fn les_touches_media_du_clavier_pilotent_la_lecture() {
+        use tauri_plugin_global_shortcut::{Code, Shortcut};
+        let action_de = |code: Code| {
+            SHORTCUTS.iter().find_map(|(spec, action)| {
+                let sc = spec.parse::<Shortcut>().ok()?;
+                (sc == Shortcut::new(None, code)).then_some(*action)
+            })
+        };
+        assert_eq!(
+            action_de(Code::MediaPlayPause),
+            Some(ShortcutAction::PlayPause)
+        );
+        assert_eq!(action_de(Code::MediaTrackNext), Some(ShortcutAction::Next));
+        assert_eq!(
+            action_de(Code::MediaTrackPrevious),
+            Some(ShortcutAction::Prev)
+        );
+        // Les touches de volume du clavier restent au système.
+        assert_eq!(action_de(Code::AudioVolumeUp), None);
+        assert_eq!(action_de(Code::AudioVolumeDown), None);
+        // Tous les raccourcis se lisent, et aucun n'est déclaré deux fois.
+        let lus: Vec<Shortcut> = SHORTCUTS
+            .iter()
+            .map(|(spec, _)| spec.parse::<Shortcut>().expect(spec))
+            .collect();
+        for (i, a) in lus.iter().enumerate() {
+            assert!(!lus[i + 1..].contains(a), "{}", SHORTCUTS[i].0);
+        }
+    }
 
     #[test]
     fn la_grande_fenetre_ne_depasse_plus_le_bureau() {

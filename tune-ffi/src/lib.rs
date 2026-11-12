@@ -10,6 +10,11 @@
 //! - `tune_server_set_container_root(root)` → racine du conteneur de l'hôte,
 //!   pour relocaliser la base quand iOS déplace l'application
 //! - `tune_server_scan()` → scan incrémental (retour au premier plan)
+//! - `tune_server_set_device_name(name)` → nom de l'appareil, pour le nom
+//!   annoncé sur le réseau (#8189)
+//! - `tune_server_defer_network_discovery(defer)` → SSDP/mDNS différés
+//!   jusqu'au premier usage (#8189, permission « réseau local » d'iOS)
+//! - `tune_server_start_network_discovery()` → ouvre la découverte
 //!
 //! Au démarrage, comme le binaire (`bootstrap.rs`) : scan des dossiers de
 //! musique (`auto_scan`), puis surveillant de fichiers (kqueue sur iOS,
@@ -40,6 +45,11 @@ static ETAT: Mutex<Option<tune_server::state::AppState>> = Mutex::new(None);
 /// Le surveillant de fichiers tourne jusqu'à la fin du processus (il n'a pas
 /// d'arrêt) : un second démarrage dans le même processus ne le double pas.
 static SURVEILLANT_LANCE: AtomicBool = AtomicBool::new(false);
+/// L'hôte a demandé de différer la découverte réseau (#8189).
+static DECOUVERTE_DIFFEREE: AtomicBool = AtomicBool::new(false);
+/// Le réglage qui retient qu'on a déjà ouvert la découverte une fois : au
+/// lancement suivant, elle démarre d'emblée (la permission est déjà donnée).
+const REGLAGE_DECOUVERTE_OUVERTE: &str = "mobile_decouverte_reseau_ouverte";
 
 /// Barriere d'ABI : une panique ne doit JAMAIS franchir un `extern "C"`.
 ///
@@ -295,6 +305,87 @@ pub extern "C" fn tune_server_scan() -> i32 {
     })
 }
 
+/// Nom de l'appareil (iOS : `UIDevice.current.name`), pour le nom sous lequel
+/// le serveur s'annonce (UPnP, mDNS) quand aucun `server_name` n'est réglé.
+/// À APPELER AVANT `tune_server_start`. Un nom générique (« iPhone ») est
+/// suffixé de quatre caractères stables. NULL ou vide : nom d'hôte.
+///
+/// Retour : 0 succès, -2 si la chaîne n'est pas de l'UTF-8.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[unsafe(no_mangle)]
+pub extern "C" fn tune_server_set_device_name(name: *const c_char) -> i32 {
+    barriere_abi("tune_server_set_device_name", -2, || {
+        if name.is_null() {
+            tune_core::discovery::nom_annonce::definir_nom_de_l_appareil(None);
+            return 0;
+        }
+        let Ok(nom) = unsafe { CStr::from_ptr(name) }.to_str() else {
+            return -2;
+        };
+        tune_core::discovery::nom_annonce::definir_nom_de_l_appareil(Some(nom));
+        0
+    })
+}
+
+/// Différer la découverte réseau (SSDP, mDNS, annonces) jusqu'au premier
+/// usage : ouverture de l'écran « Sources du réseau », recherche d'appareils,
+/// ou `tune_server_start_network_discovery`. Sur iOS, la fenêtre « réseau
+/// local » s'ouvre alors au moment où l'utilisateur cherche quelque chose.
+/// Une fois ouverte, la découverte démarre d'emblée aux lancements suivants.
+/// À APPELER AVANT `tune_server_start`. `defer` = 0 : comportement normal.
+///
+/// Retour : 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn tune_server_defer_network_discovery(defer: i32) -> i32 {
+    barriere_abi("tune_server_defer_network_discovery", -2, || {
+        DECOUVERTE_DIFFEREE.store(defer != 0, Ordering::SeqCst);
+        0
+    })
+}
+
+/// Ouvre la découverte réseau différée. Sans effet si elle l'est déjà.
+///
+/// Retour : 0 ouverte par cet appel, 1 déjà ouverte.
+#[unsafe(no_mangle)]
+pub extern "C" fn tune_server_start_network_discovery() -> i32 {
+    barriere_abi("tune_server_start_network_discovery", -2, || {
+        if ouvrir_la_decouverte() { 0 } else { 1 }
+    })
+}
+
+/// Ouvre la porte de la découverte et retient, en base, qu'elle l'a été.
+fn ouvrir_la_decouverte() -> bool {
+    let ouverte = tune_core::discovery::porte_multicast::ouvrir();
+    if ouverte && let Some(etat) = ETAT.lock().ok().and_then(|g| g.clone()) {
+        let _ = tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone())
+            .set(REGLAGE_DECOUVERTE_OUVERTE, "1");
+    }
+    ouverte
+}
+
+/// Les requêtes qui valent « premier usage » de la découverte : la liste des
+/// serveurs de l'écran « Sources du réseau », et la recherche d'appareils.
+pub(crate) fn requete_ouvre_la_decouverte(methode: &axum::http::Method, chemin: &str) -> bool {
+    use axum::http::Method;
+    let chemin = chemin.trim_end_matches('/');
+    (methode == Method::GET
+        && (chemin == "/api/v1/network/media-servers" || chemin == "/api/v1/peers"))
+        || (methode == Method::POST && chemin == "/api/v1/devices/scan")
+}
+
+/// La porte doit-elle rester fermée au démarrage ?
+fn decouverte_fermee_au_demarrage(state: &tune_server::state::AppState) -> bool {
+    if !DECOUVERTE_DIFFEREE.load(Ordering::SeqCst) {
+        return false;
+    }
+    let deja = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get(REGLAGE_DECOUVERTE_OUVERTE)
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == "1");
+    !deja
+}
+
 // ---------------------------------------------------------------------------
 // Internal server runner
 // ---------------------------------------------------------------------------
@@ -331,9 +422,32 @@ async fn run_server(
     #[cfg(feature = "local-audio")]
     tune_server::startup::register_local_outputs(&state).await;
 
-    let oh_listener = tune_server::startup::create_oh_listener().await;
-    tune_server::discovery_setup::spawn_ssdp_handler(&state, &config, oh_listener);
-    let _mdns = tune_server::discovery_setup::spawn_mdns_handler(&state);
+    // #8189 — découverte différée (iOS) : la porte reste fermée tant que
+    // l'utilisateur n'a rien cherché sur le réseau. Les annonceurs et le
+    // balayage de démarrage de `spawn_background_tasks` l'attendent d'eux-mêmes ;
+    // SSDP et mDNS démarrent ici à son ouverture.
+    if decouverte_fermee_au_demarrage(&state) {
+        info!("tune_ffi_decouverte_differee");
+        tune_core::discovery::porte_multicast::fermer();
+    } else {
+        tune_core::discovery::porte_multicast::ouvrir();
+    }
+    {
+        let state = state.clone();
+        let config = config.clone();
+        let mut arret = shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tune_core::discovery::porte_multicast::attendre() => {}
+                _ = arret.changed() => return,
+            }
+            let oh_listener = tune_server::startup::create_oh_listener().await;
+            tune_server::discovery_setup::spawn_ssdp_handler(&state, &config, oh_listener);
+            let _mdns = tune_server::discovery_setup::spawn_mdns_handler(&state);
+            // Le démon mDNS vit jusqu'à l'arrêt du serveur.
+            let _ = arret.changed().await;
+        });
+    }
     tune_server::background::spawn_background_tasks(&state, &config).await;
 
     // Build router
@@ -386,6 +500,9 @@ fn config_mobile(
     // défaut est déjà `false`, on le pose quand même pour qu'un changement de
     // défaut côté serveur ne l'active pas ici en silence.
     config.auto_update = false;
+    // Capacités annoncées (`GET /system/capabilities`, #8189) : pas de
+    // montage système de partages sur un téléphone.
+    config.mobile = true;
     config
 }
 
@@ -471,10 +588,14 @@ pub(crate) fn dossier_de_travail(db_path: &str) -> Option<std::path::PathBuf> {
 /// mise à jour ou de l'appliance reçoit une réponse normale.
 pub(crate) fn route_refusee_sur_mobile(methode: &axum::http::Method, chemin: &str) -> bool {
     use axum::http::Method;
+    let chemin = chemin.trim_end_matches('/');
+    // Les routes réseau du système, lectures comprises (#8189).
+    if route_reseau_refusee_sur_mobile(methode, chemin) {
+        return true;
+    }
     if methode == Method::GET || methode == Method::HEAD || methode == Method::OPTIONS {
         return false;
     }
-    let chemin = chemin.trim_end_matches('/');
     const EXACTES: &[&str] = &[
         "/api/v1/system/update/install",
         "/api/v1/system/update/apply",
@@ -484,11 +605,47 @@ pub(crate) fn route_refusee_sur_mobile(methode: &axum::http::Method, chemin: &st
     EXACTES.contains(&chemin) || chemin.starts_with("/api/v1/appliance/")
 }
 
+/// Routes réseau désactivées sur mobile (#8189).
+///
+/// Le montage de partages (SMB, NFS), leur exploration et le sondage d'un
+/// hôte passent par des commandes du système (`mount.cifs`, `smbutil`,
+/// `smbclient`, `showmount`…) qui n'existent pas dans une application, et un
+/// téléphone ne monte rien. Elles sont refusées, en lecture comme en
+/// écriture, sauf les deux listes tirées de la base (`/network/mounts`,
+/// `/network/smb/mounts`), qui restent lisibles. Les serveurs UPnP/DLNA
+/// (`/network/media-servers*`, `/network/library-sources`) ne sont pas
+/// touchés : c'est l'écran « Sources du réseau ».
+fn route_reseau_refusee_sur_mobile(methode: &axum::http::Method, chemin: &str) -> bool {
+    use axum::http::Method;
+    let Some(reste) = chemin.strip_prefix("/api/v1/network") else {
+        return false;
+    };
+    let lecture = methode == Method::GET || methode == Method::HEAD || methode == Method::OPTIONS;
+    let sous = |p: &str| reste == p || reste.starts_with(&format!("{p}/"));
+    if sous("/mounts") || sous("/smb/mounts") {
+        // Les listes restent lisibles ; tout geste (créer, tester, oublier) est refusé.
+        return !(lecture && (reste == "/mounts" || reste == "/smb/mounts"));
+    }
+    sous("/smb") || sous("/shares") || sous("/scan-host")
+}
+
 async fn garde_mobile(
     requete: axum::extract::Request,
     suite: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    if route_reseau_refusee_sur_mobile(requete.method(), requete.uri().path().trim_end_matches('/'))
+    {
+        tracing::info!(chemin = %requete.uri().path(), "tune_ffi_route_reseau_refusee_sur_mobile");
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "network_mounts_unavailable_on_mobile",
+                "detail": "Les partages réseau du système (SMB, NFS) ne se montent pas dans l'application mobile.",
+            })),
+        )
+            .into_response();
+    }
     if route_refusee_sur_mobile(requete.method(), requete.uri().path()) {
         tracing::info!(chemin = %requete.uri().path(), "tune_ffi_route_refusee_sur_mobile");
         return (
@@ -499,6 +656,11 @@ async fn garde_mobile(
             })),
         )
             .into_response();
+    }
+    if requete_ouvre_la_decouverte(requete.method(), requete.uri().path())
+        && !tune_core::discovery::porte_multicast::est_ouverte()
+    {
+        ouvrir_la_decouverte();
     }
     suite.run(requete).await
 }
@@ -768,6 +930,184 @@ mod tests {
             &Method::POST,
             "/api/v1/system/restarted"
         ));
+    }
+
+    /// #8189 — les routes réseau qui montent, explorent ou sondent par les
+    /// commandes du système sont refusées sur mobile, en écriture comme en
+    /// lecture ; les deux listes tirées de la base restent lisibles, et les
+    /// serveurs UPnP/DLNA ne sont pas touchés.
+    #[test]
+    fn les_routes_reseau_du_systeme_sont_refusees_sur_mobile() {
+        use axum::http::Method;
+        for (m, chemin) in [
+            (Method::POST, "/api/v1/network/smb/mount"),
+            (Method::POST, "/api/v1/network/smb/mount/"),
+            (Method::POST, "/api/v1/network/mounts"),
+            (Method::POST, "/api/v1/network/mounts/test"),
+            (Method::DELETE, "/api/v1/network/mounts/3"),
+            (Method::DELETE, "/api/v1/network/smb/mounts/3"),
+            (Method::POST, "/api/v1/network/smb/discover"),
+            (Method::GET, "/api/v1/network/smb/discover"),
+            (Method::GET, "/api/v1/network/shares"),
+            (Method::GET, "/api/v1/network/shares/7"),
+            (Method::GET, "/api/v1/network/scan-host"),
+        ] {
+            assert!(
+                route_refusee_sur_mobile(&m, chemin),
+                "{m} {chemin} doit être refusé"
+            );
+        }
+        for (m, chemin) in [
+            (Method::GET, "/api/v1/network/mounts"),
+            (Method::GET, "/api/v1/network/smb/mounts"),
+            (Method::GET, "/api/v1/network/media-servers"),
+            (Method::GET, "/api/v1/network/media-servers/abc/browse"),
+            (Method::POST, "/api/v1/network/media-servers/abc/indexer"),
+            (
+                Method::DELETE,
+                "/api/v1/network/media-servers/abc/bibliotheque",
+            ),
+            (Method::POST, "/api/v1/network/library-sources"),
+            (Method::POST, "/api/v1/network-quality"),
+        ] {
+            assert!(
+                !route_refusee_sur_mobile(&m, chemin),
+                "{m} {chemin} doit passer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn la_garde_refuse_le_montage_smb_avec_un_code_explicite() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use std::sync::atomic::AtomicUsize;
+        use tower::ServiceExt;
+
+        static MONTAGES: AtomicUsize = AtomicUsize::new(0);
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/network/smb/mount",
+                axum::routing::post(|| async {
+                    MONTAGES.fetch_add(1, Ordering::SeqCst);
+                    "monté"
+                }),
+            )
+            .layer(axum::middleware::from_fn(garde_mobile));
+        let rep = app
+            .oneshot(
+                Request::post("/api/v1/network/smb/mount")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rep.status(), StatusCode::FORBIDDEN);
+        let corps = axum::body::to_bytes(rep.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&corps).unwrap();
+        assert_eq!(v["error"], "network_mounts_unavailable_on_mobile");
+        assert_eq!(
+            MONTAGES.load(Ordering::SeqCst),
+            0,
+            "le montage ne doit pas tourner"
+        );
+    }
+
+    #[test]
+    fn les_requetes_de_premier_usage_ouvrent_la_decouverte() {
+        use axum::http::Method;
+        assert!(requete_ouvre_la_decouverte(
+            &Method::GET,
+            "/api/v1/network/media-servers"
+        ));
+        assert!(requete_ouvre_la_decouverte(&Method::GET, "/api/v1/peers"));
+        assert!(requete_ouvre_la_decouverte(
+            &Method::POST,
+            "/api/v1/devices/scan"
+        ));
+        assert!(!requete_ouvre_la_decouverte(&Method::GET, "/api/v1/zones"));
+        assert!(!requete_ouvre_la_decouverte(
+            &Method::GET,
+            "/api/v1/system/health"
+        ));
+        assert!(!requete_ouvre_la_decouverte(
+            &Method::GET,
+            "/api/v1/network/media-servers/x/browse"
+        ));
+    }
+
+    /// Différée puis ouverte par l'écran : la porte s'ouvre, la base le
+    /// retient, et le démarrage suivant ne la ferme plus.
+    #[test]
+    fn decouverte_differee_ouverte_au_premier_usage_puis_retenue() {
+        use tune_core::discovery::porte_multicast as porte;
+        let _g = test_lock();
+        let dossier = tempfile::tempdir().unwrap();
+        let base = dossier.path().join("tune.db");
+        let base = base.to_str().unwrap();
+        let state = tune_server::state::AppState::new(base, 0, Default::default()).unwrap();
+        assert!(
+            !decouverte_fermee_au_demarrage(&state),
+            "non différée par défaut"
+        );
+        assert_eq!(tune_server_defer_network_discovery(1), 0);
+        assert!(
+            decouverte_fermee_au_demarrage(&state),
+            "différée, jamais ouverte"
+        );
+
+        porte::fermer();
+        *ETAT.lock().unwrap() = Some(state.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/network/media-servers",
+                axum::routing::get(|| async { "[]" }),
+            )
+            .layer(axum::middleware::from_fn(garde_mobile));
+        get_runtime().block_on(async {
+            use tower::ServiceExt;
+            let rep = app
+                .oneshot(
+                    axum::http::Request::get("/api/v1/network/media-servers")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rep.status(), axum::http::StatusCode::OK);
+        });
+        assert!(
+            porte::est_ouverte(),
+            "l'écran Sources du réseau ouvre la découverte"
+        );
+        // Redémarrage : un nouvel état sur la même base.
+        *ETAT.lock().unwrap() = None;
+        drop(state);
+        let relance = tune_server::state::AppState::new(base, 0, Default::default()).unwrap();
+        assert!(
+            !decouverte_fermee_au_demarrage(&relance),
+            "au lancement suivant, la découverte démarre d'emblée"
+        );
+        assert_eq!(tune_server_start_network_discovery(), 1, "déjà ouverte");
+        assert_eq!(tune_server_defer_network_discovery(0), 0);
+    }
+
+    #[test]
+    fn le_nom_de_l_appareil_passe_au_nom_annonce() {
+        let _g = test_lock();
+        let c = CString::new("iPad de Léa").unwrap();
+        assert_eq!(tune_server_set_device_name(c.as_ptr()), 0);
+        assert_eq!(
+            tune_core::discovery::nom_annonce::nom_annonce(None, "uuid:abcd"),
+            "iPad de Léa"
+        );
+        assert_eq!(tune_server_set_device_name(std::ptr::null()), 0);
+        assert_eq!(
+            tune_core::discovery::nom_annonce::nom_de_l_appareil(),
+            tune_core::discovery::system_hostname()
+        );
     }
 
     #[tokio::test]

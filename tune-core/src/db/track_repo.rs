@@ -3059,6 +3059,12 @@ impl TrackRepo {
             }
         }
 
+        // #8090 — pays de l'artiste principal de l'album (MusicBrainz).
+        if let Some((c, p)) = crate::db::facet_filter::bloc_pays_artiste(ph, &f.artist_countries) {
+            conditions.push(c);
+            owned_params.extend(p);
+        }
+
         // Folder facet (Oxygen drill-down): restrict to tracks whose file lives
         // under the selected directory subtree. The current breadcrumb path IS
         // the filter — recursive so a parent folder includes its sub-folders.
