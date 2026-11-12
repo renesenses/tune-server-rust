@@ -918,3 +918,7 @@ mod tests {
         assert_eq!(r.trames_decodees, 34 * 1152);
     }
 }
+
+#[cfg(test)]
+#[path = "audit_integrite_tests_8403.rs"]
+mod tests_8403;
