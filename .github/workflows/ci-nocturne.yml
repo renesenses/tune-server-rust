@@ -1,0 +1,87 @@
+name: CI nocturne des lots
+
+# Chaque nuit, la batterie COMPLETE de ci.yml sur chaque lot `batch/*` actif.
+#
+# Les PR vers un lot ne lancent plus les jobs lourds (Windows, macOS, FFI,
+# librespot, jeu livre, embedding, audit) que si leur diff les concerne. Le
+# push du lot les rattrape a chaque fusion ; cette passe de nuit couvre ce que
+# le push ne voit pas : un avis de securite publie depuis (cargo audit), un
+# runner ou une dependance qui a bouge, un run de push annule par la rafale
+# suivante.
+#
+# Mecanique : `gh workflow run ci.yml --ref <lot>` (workflow_dispatch, que
+# GITHUB_TOKEN a le droit de declencher). C'est le ci.yml DU LOT qui tourne,
+# avec `workflow_dispatch` => impact `rust=true` et tous les jobs lourds.
+#
+# Un lot est saute si sa tete a deja un run ci.yml de push ou de lancement
+# manuel reussi ou en cours depuis moins de 24 h, ou si son dernier commit a
+# plus de 3 jours (lot fige ou abandonne).
+#
+# Le `schedule` ne s'arme qu'une fois ce fichier sur la branche par defaut.
+# A la main : Actions > « CI nocturne des lots » > Run workflow (entree
+# `lot` facultative), ou directement `gh workflow run ci.yml --ref <branche>`.
+
+on:
+  schedule:
+    - cron: '41 1 * * *'  # 02 h 41 / 03 h 41 a Paris, hors des heures de PR
+  workflow_dispatch:
+    inputs:
+      lot:
+        description: "Branche a valider (vide = tous les lots batch/* actifs)"
+        required: false
+        default: ''
+
+concurrency:
+  group: ci-nocturne
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  lancer:
+    name: Lancer la CI complete sur les lots
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      LOT_DEMANDE: ${{ inputs.lot }}
+    steps:
+      - name: Lancer ci.yml sur chaque lot actif
+        run: |
+          set -euo pipefail
+          if [ -n "${LOT_DEMANDE:-}" ]; then
+            LOTS="$LOT_DEMANDE"
+          else
+            LOTS="$(gh api --paginate "repos/$GH_REPO/branches?per_page=100" --jq '.[].name' | grep '^batch/' || true)"
+          fi
+          if [ -z "$LOTS" ]; then
+            echo "aucun lot batch/* : rien a lancer"
+            exit 0
+          fi
+          MAINTENANT="$(date -u +%s)"
+          while IFS= read -r LOT; do
+            [ -n "$LOT" ] || continue
+            ENC="$(jq -rn --arg b "$LOT" '$b|@uri')"
+            INFO="$(gh api "repos/$GH_REPO/branches/$ENC" --jq '[.commit.sha, .commit.commit.committer.date] | @tsv')"
+            SHA="$(cut -f1 <<<"$INFO")"
+            DATE="$(cut -f2 <<<"$INFO")"
+            AGE_H=$(( (MAINTENANT - $(date -u -d "$DATE" +%s)) / 3600 ))
+            if [ -z "${LOT_DEMANDE:-}" ] && [ "$AGE_H" -gt 72 ]; then
+              echo "saute  $LOT : dernier commit il y a ${AGE_H} h (lot fige)"
+              continue
+            fi
+            DEJA="$(gh run list --workflow ci.yml --branch "$LOT" --commit "$SHA" --limit 20 \
+              --json event,status,conclusion,createdAt \
+              --jq "[.[] | select(.event == \"push\" or .event == \"workflow_dispatch\")
+                         | select(.status != \"completed\" or .conclusion == \"success\")
+                         | select((.createdAt | fromdateiso8601) > ($MAINTENANT - 86400))] | length")"
+            if [ -z "${LOT_DEMANDE:-}" ] && [ "${DEJA:-0}" -gt 0 ]; then
+              echo "saute  $LOT : ${SHA:0:12} deja valide ou en cours depuis moins de 24 h"
+              continue
+            fi
+            gh workflow run ci.yml --ref "$LOT"
+            echo "LANCE  $LOT @ ${SHA:0:12}"
+          done <<< "$LOTS"
