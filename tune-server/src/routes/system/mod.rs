@@ -91,6 +91,8 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/version", get(config::version))
         .route("/capabilities", get(capacites::capacites))
+        // #7371 — profil réseau actif et règle de pare-feu (Windows).
+        .route("/pare-feu", get(crate::pare_feu_windows::route_etat))
         .route("/health", get(config::health))
         .route("/stats", get(config::stats))
         .route("/profile", get(profile::system_profile))

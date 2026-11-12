@@ -20,7 +20,7 @@
 //! La logique (lecture du JSON, verdict) est pure et testée partout ; seul le
 //! lancement de PowerShell est propre à Windows.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Une règle du pare-feu Windows qui porte sur un programme « tune-server ».
 ///
@@ -196,6 +196,205 @@ pub fn journaliser(verdict: &VerdictPareFeu, exe: &str, nombre_de_regles: usize)
     }
 }
 
+// ───────────────────────── #7371 — profil réseau actif ─────────────────────────
+//
+// TEAC NT-505X (fil VNAV, 26-30/10) : seul AirPlay est proposé, le renderer
+// UPnP n'est jamais découvert. La règle « Tune » que pose l'installeur (rc11)
+// ne couvre que le profil PRIVÉ (décision du 30/10, confirmée le 12/11 : on
+// ne l'étend pas au Public). Sur un réseau classé Public, la découverte SSDP
+// et le flux DLNA restent donc filtrés, et rien ne le disait : ni le journal,
+// ni l'écran. Ce relevé dit le profil actif et ce que la règle en couvre.
+
+/// Un profil du pare-feu Windows, tel que le réseau actif le porte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfilReseau {
+    Domaine,
+    Prive,
+    Public,
+}
+
+impl ProfilReseau {
+    const TOUS: [ProfilReseau; 3] = [Self::Domaine, Self::Prive, Self::Public];
+
+    /// Le bit du profil dans le masque `Profile` d'une règle.
+    fn bit(self) -> i64 {
+        match self {
+            Self::Domaine => 1,
+            Self::Prive => PROFIL_PRIVE,
+            Self::Public => 4,
+        }
+    }
+
+    /// `NetworkCategory` de `Get-NetConnectionProfile`, converti en entier :
+    /// 0 = Public, 1 = Privé, 2 = Domaine (authentifié).
+    fn depuis_categorie(categorie: i64) -> Option<Self> {
+        match categorie {
+            0 => Some(Self::Public),
+            1 => Some(Self::Prive),
+            2 => Some(Self::Domaine),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ProfilLu {
+    categorie: i64,
+}
+
+/// Lit la sortie de [`SCRIPT_PROFILS_RESEAU`] : `[]`, un objet seul ou un
+/// tableau. Profils dédoublonnés, dans l'ordre Domaine, Privé, Public.
+pub fn lire_les_profils(json: &str) -> Result<Vec<ProfilReseau>, String> {
+    let texte = json.trim().trim_start_matches('\u{feff}');
+    if texte.is_empty() {
+        return Ok(Vec::new());
+    }
+    let valeur: serde_json::Value = serde_json::from_str(texte).map_err(|e| e.to_string())?;
+    let lus: Vec<ProfilLu> = match valeur {
+        serde_json::Value::Array(_) => serde_json::from_value(valeur).map_err(|e| e.to_string())?,
+        serde_json::Value::Object(_) => {
+            vec![serde_json::from_value(valeur).map_err(|e| e.to_string())?]
+        }
+        autre => return Err(format!("sortie inattendue : {autre}")),
+    };
+    let actifs: Vec<ProfilReseau> = lus
+        .iter()
+        .filter_map(|p| ProfilReseau::depuis_categorie(p.categorie))
+        .collect();
+    Ok(ProfilReseau::TOUS
+        .into_iter()
+        .filter(|p| actifs.contains(p))
+        .collect())
+}
+
+/// Ce que le pare-feu fait des réseaux actifs, pour `tune-server.exe`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EtatDuPareFeu {
+    /// Les profils des réseaux connectés (vide : aucun réseau, ou relevé muet).
+    pub profils_actifs: Vec<ProfilReseau>,
+    /// Une règle entrante active `Allow` existe pour CET exécutable.
+    pub regle_presente: bool,
+    /// Les profils où l'entrant de Tune est autorisé (et non bloqué).
+    pub profils_couverts: Vec<ProfilReseau>,
+    /// Les profils actifs que la règle ne couvre pas : la découverte DLNA et
+    /// l'accès distant y sont filtrés.
+    pub profils_non_couverts: Vec<ProfilReseau>,
+}
+
+impl EtatDuPareFeu {
+    /// Faut-il le dire à l'écran ?
+    pub fn alerte(&self) -> bool {
+        !self.profils_non_couverts.is_empty()
+    }
+}
+
+/// L'état, pur : quels profils actifs la règle de Tune couvre-t-elle ?
+pub fn etat_du_pare_feu(
+    regles: &[RegleDePareFeu],
+    profils_actifs: &[ProfilReseau],
+    exe: &str,
+    variable: &dyn Fn(&str) -> Option<String>,
+) -> EtatDuPareFeu {
+    let les_notres: Vec<&RegleDePareFeu> = regles
+        .iter()
+        .filter(|r| r.direction == ENTRANT && r.enabled == ACTIVEE)
+        .filter(|r| meme_chemin(&r.program, exe, variable))
+        .collect();
+    let porte_sur =
+        |r: &RegleDePareFeu, p: ProfilReseau| r.profile == 0 || r.profile & p.bit() != 0;
+    let profils_couverts: Vec<ProfilReseau> = ProfilReseau::TOUS
+        .into_iter()
+        .filter(|&p| {
+            let bloque = les_notres
+                .iter()
+                .any(|r| r.action == BLOQUER && porte_sur(r, p));
+            let autorise = les_notres
+                .iter()
+                .any(|r| r.action == AUTORISER && porte_sur(r, p));
+            autorise && !bloque
+        })
+        .collect();
+    let profils_non_couverts = profils_actifs
+        .iter()
+        .copied()
+        .filter(|p| !profils_couverts.contains(p))
+        .collect();
+    EtatDuPareFeu {
+        profils_actifs: profils_actifs.to_vec(),
+        regle_presente: les_notres.iter().any(|r| r.action == AUTORISER),
+        profils_couverts,
+        profils_non_couverts,
+    }
+}
+
+/// La ligne de journal du profil réseau. Un seul appel par démarrage.
+pub fn journaliser_l_etat(etat: &EtatDuPareFeu, exe: &str) {
+    use tracing::{info, warn};
+    if etat.alerte() {
+        warn!(
+            program = exe,
+            active_profiles = ?etat.profils_actifs,
+            rule_present = etat.regle_presente,
+            covered_profiles = ?etat.profils_couverts,
+            uncovered_profiles = ?etat.profils_non_couverts,
+            "windows_firewall_profile_not_covered — the active network profile is not \
+             covered by Tune's inbound firewall rule: DLNA discovery and remote access are \
+             filtered. Set the network to Private, or allow tune-server.exe in 'Allow an app \
+             through Windows Firewall' for this profile"
+        );
+    } else {
+        info!(
+            program = exe,
+            active_profiles = ?etat.profils_actifs,
+            rule_present = etat.regle_presente,
+            covered_profiles = ?etat.profils_couverts,
+            "windows_firewall_network_profile"
+        );
+    }
+}
+
+static ETAT_RELEVE: std::sync::RwLock<Option<EtatDuPareFeu>> = std::sync::RwLock::new(None);
+
+/// Retient l'état relevé, que lit [`etat_releve`].
+pub fn retenir_l_etat(etat: EtatDuPareFeu) {
+    if let Ok(mut place) = ETAT_RELEVE.write() {
+        *place = Some(etat);
+    }
+}
+
+/// Le dernier état relevé au démarrage (`None` hors Windows, ou avant la fin
+/// du relevé).
+pub fn etat_releve() -> Option<EtatDuPareFeu> {
+    ETAT_RELEVE.read().ok().and_then(|e| e.clone())
+}
+
+/// Le corps de `GET /api/v1/system/pare-feu`. Contrat additif.
+pub fn charge_utile(windows: bool, etat: Option<&EtatDuPareFeu>) -> serde_json::Value {
+    serde_json::json!({
+        "windows": windows,
+        "releve": etat,
+        "alerte": etat.is_some_and(EtatDuPareFeu::alerte),
+    })
+}
+
+/// `GET /api/v1/system/pare-feu` — l'écran des zones l'affiche quand le
+/// profil actif n'est pas couvert (#7371).
+pub async fn route_etat() -> axum::Json<serde_json::Value> {
+    axum::Json(charge_utile(
+        cfg!(target_os = "windows"),
+        etat_releve().as_ref(),
+    ))
+}
+
+/// #7371 — les profils des réseaux connectés, en entiers (indépendance de la
+/// langue). Ni nom de réseau ni adresse : rien qui identifie le testeur dans
+/// un journal partagé. Lecture seule.
+pub const SCRIPT_PROFILS_RESEAU: &str = "$ErrorActionPreference='SilentlyContinue'; \
+$p = @(Get-NetConnectionProfile | Select-Object @{n='Categorie';e={[int]$_.NetworkCategory}}); \
+ConvertTo-Json -InputObject $p -Compress";
+
 /// Le script PowerShell : toutes les règles dont le programme ressemble à
 /// `tune-server`, énumérations converties en entiers, sortie JSON compacte.
 /// Lecture seule.
@@ -206,6 +405,21 @@ ForEach-Object { $p = $_.Program; $_ | Get-NetFirewallRule | Select-Object Displ
 @{n='Enabled';e={[int]$_.Enabled}}, @{n='Profile';e={[int]$_.Profile}} }); \
 ConvertTo-Json -InputObject $r -Compress";
 
+/// Lance un script PowerShell en lecture seule et rend sa sortie standard.
+#[cfg(target_os = "windows")]
+async fn lancer_powershell(script: &str) -> Result<String, String> {
+    let mut commande = tokio::process::Command::new("powershell");
+    commande
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .kill_on_drop(true);
+    match tokio::time::timeout(std::time::Duration::from_secs(30), commande.output()).await {
+        Ok(Ok(sortie)) => Ok(String::from_utf8_lossy(&sortie.stdout).into_owned()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("timed out".into()),
+    }
+}
+
 /// Lance le relevé en tâche de fond, une fois. Sans effet hors Windows.
 pub fn lancer_le_releve() {
     #[cfg(target_os = "windows")]
@@ -214,39 +428,42 @@ pub fn lancer_le_releve() {
             return;
         };
         let exe = exe.display().to_string();
-        let mut commande = tokio::process::Command::new("powershell");
-        commande
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                SCRIPT_POWERSHELL,
-            ])
-            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-            .kill_on_drop(true);
-        let sortie =
-            match tokio::time::timeout(std::time::Duration::from_secs(30), commande.output()).await
-            {
-                Ok(Ok(sortie)) => sortie,
-                Ok(Err(e)) => {
-                    tracing::info!(error = %e, "windows_firewall_probe_unavailable");
-                    return;
-                }
-                Err(_) => {
-                    tracing::info!("windows_firewall_probe_timed_out");
-                    return;
-                }
-            };
-        let texte = String::from_utf8_lossy(&sortie.stdout);
-        match lire_les_regles(&texte) {
-            Ok(regles) => {
-                let v = verdict(&regles, &exe, &|nom| std::env::var(nom).ok());
-                journaliser(&v, &exe, regles.len());
+        let texte = match lancer_powershell(SCRIPT_POWERSHELL).await {
+            Ok(texte) => texte,
+            Err(e) => {
+                tracing::info!(error = %e, "windows_firewall_probe_unavailable");
+                return;
             }
-            Err(e) => tracing::info!(error = %e, "windows_firewall_probe_unreadable"),
+        };
+        let regles = match lire_les_regles(&texte) {
+            Ok(regles) => regles,
+            Err(e) => {
+                tracing::info!(error = %e, "windows_firewall_probe_unreadable");
+                return;
+            }
+        };
+        let variable = |nom: &str| std::env::var(nom).ok();
+        let v = verdict(&regles, &exe, &variable);
+        journaliser(&v, &exe, regles.len());
+        // #7371 — le profil du réseau actif, et ce que la règle en couvre.
+        let profils = match lancer_powershell(SCRIPT_PROFILS_RESEAU).await {
+            Ok(texte) => lire_les_profils(&texte),
+            Err(e) => Err(e),
+        };
+        match profils {
+            Ok(profils) => {
+                let etat = etat_du_pare_feu(&regles, &profils, &exe, &variable);
+                journaliser_l_etat(&etat, &exe);
+                retenir_l_etat(etat);
+            }
+            Err(e) => tracing::info!(error = %e, "windows_firewall_profile_probe_unreadable"),
         }
     });
 }
+
+#[cfg(test)]
+#[path = "pare_feu_profil_reseau_7371_tests.rs"]
+mod profil_reseau_7371_tests;
 
 #[cfg(test)]
 mod tests {
