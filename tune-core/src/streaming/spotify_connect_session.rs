@@ -61,10 +61,14 @@ pub const SOURCE_ID: &str = "session";
 /// #8565 — le code rendu par le statut quand la zone exposée n'existe plus.
 pub const CODE_ZONE_EXPOSEE_ABSENTE: &str = "exposed_zone_missing";
 
-/// #8581 — quand Tune prend la main, le temps laissé à sa lecture pour
-/// remplacer la lecture en cours de la zone avant de juger si la session
-/// Connect y joue encore.
-pub const DELAI_REPRISE_PAR_TUNE: Duration = Duration::from_secs(2);
+/// #8581 — quand Tune prend la main, l'échéance laissée à sa lecture pour
+/// remplacer la lecture en cours de la zone : la zone est sondée jusque-là ;
+/// si elle quitte la session, c'est la zone que Tune lance (on n'y touche
+/// pas) ; si elle la joue encore à l'échéance (autre zone, lecture de Tune
+/// échouée), elle est arrêtée.
+pub const DELAI_REPRISE_PAR_TUNE: Duration = Duration::from_secs(10);
+/// #8581 — l'intervalle de ce sondage.
+const SONDE_REPRISE_PAR_TUNE: Duration = Duration::from_millis(200);
 
 /// #8580 — la zone exposée a refusé la session : plafond de zones de
 /// l'offre gratuite (`free_zone_cap:…`).
@@ -474,10 +478,15 @@ impl<Z: ZonesConnect> PiloteConnect<Z> {
                     // zone joue encore la session ensuite (autre zone, ou
                     // lecture de Tune échouée), elle est arrêtée ; sinon elle
                     // joue le titre de Tune, on n'y touche pas.
-                    if pompe.consommateur_de_tune() {
-                        tokio::time::sleep(DELAI_REPRISE_PAR_TUNE).await;
+                    let mut joue = self.zones.joue_la_session(zone_id).await;
+                    if joue && pompe.consommateur_de_tune() {
+                        let echeance = Instant::now() + DELAI_REPRISE_PAR_TUNE;
+                        while joue && Instant::now() < echeance {
+                            tokio::time::sleep(SONDE_REPRISE_PAR_TUNE).await;
+                            joue = self.zones.joue_la_session(zone_id).await;
+                        }
                     }
-                    if self.zones.joue_la_session(zone_id).await {
+                    if joue {
                         self.zones.arreter(zone_id).await;
                     }
                     pompe.detacher_continu();
