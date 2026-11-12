@@ -86,6 +86,7 @@ fn deux_faux_lastfm_sur_le_meme_port_ne_partagent_pas_un_echec() {
                     &client,
                     &cfg(&url, "cle", 8),
                     "qobuz",
+                    &page(),
                     &mut items,
                     catalogue(vec![], Arc::default()),
                 )
@@ -111,6 +112,7 @@ fn piste(id: &str, titre: &str, artiste: &str, isrc: Option<&str>) -> StreamTrac
         "album_title": null, "album_id": null, "duration_ms": 240_000,
         "cover_path": null, "track_number": null, "disc_number": null,
         "explicit": false, "quality": null, "isrc": isrc,
+        "artist_id": if artiste == KIWANUKA { "kiwa" } else { "autre" },
     }))
     .unwrap()
 }
@@ -189,6 +191,16 @@ fn cfg<'a>(base: &'a str, cle: &'a str, max: usize) -> Reglages<'a> {
         recherches_max: max,
     }
 }
+
+/// La page de l'artiste : son identifiant chez le service et son MBID.
+fn page() -> ArtisteDeLaPage<'static> {
+    ArtisteDeLaPage {
+        id: "kiwa",
+        mbid: Some(MBID_KIWANUKA),
+    }
+}
+
+const MBID_KIWANUKA: &str = "11111111-2222-3333-4444-555555555555";
 
 fn client() -> reqwest::Client {
     crate::http::client::shared().clone()
@@ -278,6 +290,7 @@ async fn kiwanuka_les_titres_des_autres_albums_remontent_apres_les_ecoutes() {
         &client(),
         &cfg(&url, "cle-de-test", 8),
         "qobuz",
+        &page(),
         &mut items,
         catalogue(service, recherches.clone()),
     )
@@ -326,6 +339,7 @@ async fn sans_cle_la_liste_ne_change_pas_et_rien_n_est_appele() {
         &client(),
         &cfg(&url, "  ", 8),
         "qobuz",
+        &page(),
         &mut items,
         catalogue(vec![], recherches.clone()),
     )
@@ -349,6 +363,7 @@ async fn si_lastfm_echoue_la_liste_ne_change_pas_et_l_echec_est_memorise() {
                 &client(),
                 &cfg(&url, "cle", 8),
                 "qobuz",
+                &page(),
                 &mut items,
                 catalogue(vec![], Arc::default()),
             )
@@ -371,6 +386,7 @@ async fn lastfm_injoignable_est_un_repli() {
         &client(),
         &cfg("http://127.0.0.1:1/", "cle", 8),
         "qobuz",
+        &page(),
         &mut items,
         catalogue(vec![], Arc::default()),
     )
@@ -387,6 +403,7 @@ async fn le_succes_est_mis_en_cache() {
             &client(),
             &cfg(&url, "cle", 8),
             "qobuz",
+            &page(),
             &mut items,
             catalogue(vec![], Arc::default()),
         )
@@ -407,6 +424,7 @@ async fn les_recherches_sont_bornees() {
         &client(),
         &cfg(&url, "cle", 3),
         "qobuz",
+        &page(),
         &mut items,
         catalogue(vec![], recherches.clone()),
     )
@@ -426,6 +444,7 @@ async fn la_version_live_s_efface_devant_l_originale_et_reste_seule_sinon() {
         &client(),
         &cfg(&url, "cle", 0),
         "qobuz",
+        &page(),
         &mut items,
         catalogue(vec![], Arc::default()),
     )
@@ -467,9 +486,261 @@ async fn une_piste_deja_presente_par_son_isrc_n_est_pas_ajoutee_deux_fois() {
         &client(),
         &cfg(&url, "cle", 8),
         "qobuz",
+        &page(),
         &mut items,
         catalogue(service, Arc::default()),
     )
     .await;
     assert_eq!(items.len(), 1, "{items:?}");
+}
+
+// ---------------------------------------------------------------------------
+// #8350 — jamais d'homonyme (DidLyon, fil 2394 : « Ange », « Barbara »).
+
+const ANGE: &str = "Ange";
+const MBID_ANGE: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+/// Un faux Last.fm qui note la chaîne de requête de chaque appel.
+async fn faux_lastfm_qui_note(corps: Value) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::Router;
+    use axum::extract::{RawQuery, State};
+    use axum::routing::get;
+
+    type Etat = (Arc<std::sync::Mutex<Vec<String>>>, Value);
+    async fn repondre(
+        State((notes, corps)): State<Etat>,
+        RawQuery(q): RawQuery,
+    ) -> axum::Json<Value> {
+        notes.lock().unwrap().push(q.unwrap_or_default());
+        axum::Json(corps)
+    }
+    let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    let chemin = format!("/lastfm-note-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let app = Router::new()
+        .route(&chemin, get(repondre))
+        .with_state((notes.clone(), corps));
+    let adresse = ecoute.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(ecoute, app).await.ok();
+    });
+    (format!("http://{adresse}{chemin}"), notes)
+}
+
+fn piste_de(id: &str, titre: &str, artiste: &str, artiste_id: &str) -> StreamTrack {
+    let mut p = piste(id, titre, artiste, None);
+    p.artist_id = Some(artiste_id.to_string());
+    p
+}
+
+fn ange() -> Vec<Value> {
+    [
+        ("a-1", "Le cimetière des arlequins"),
+        ("a-2", "Hymne à la vie"),
+    ]
+    .iter()
+    .map(|(id, t)| json_de(&piste_de(id, t, ANGE, "ange-groupe")))
+    .collect()
+}
+
+#[tokio::test]
+async fn avec_un_mbid_lastfm_est_interroge_par_mbid_sans_autocorrect() {
+    let (url, notes) = faux_lastfm_qui_note(top(&["Hymne à la vie"])).await;
+    let mut items = ange();
+    completer(
+        &client(),
+        &cfg(&url, "cle", 8),
+        "qobuz",
+        &ArtisteDeLaPage {
+            id: "ange-groupe",
+            mbid: Some(MBID_ANGE),
+        },
+        &mut items,
+        catalogue(vec![], Arc::default()),
+    )
+    .await;
+    let notes = notes.lock().unwrap().clone();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains(&format!("mbid={MBID_ANGE}")), "{notes:?}");
+    assert!(
+        !notes[0].contains("artist="),
+        "pas de nom avec un MBID : {notes:?}"
+    );
+    assert!(!notes[0].contains("autocorrect=1"), "{notes:?}");
+    assert_eq!(items[1][CHAMP_RANG], json!(1));
+}
+
+#[tokio::test]
+async fn sans_mbid_lastfm_est_interroge_par_nom_sans_autocorrect() {
+    let (url, notes) = faux_lastfm_qui_note(top(&["Hymne à la vie"])).await;
+    let mut items = ange();
+    completer(
+        &client(),
+        &cfg(&url, "cle", 8),
+        "qobuz",
+        &ArtisteDeLaPage {
+            id: "ange-groupe",
+            mbid: None,
+        },
+        &mut items,
+        catalogue(vec![], Arc::default()),
+    )
+    .await;
+    let notes = notes.lock().unwrap().clone();
+    assert!(notes[0].contains("artist=Ange"), "{notes:?}");
+    assert!(!notes[0].contains("autocorrect=1"), "{notes:?}");
+    assert_eq!(
+        items[1][CHAMP_RANG],
+        json!(1),
+        "la liste recoupe le catalogue"
+    );
+}
+
+/// Le cas de DidLyon : le nom désigne un homonyme sur Last.fm. Ses titres ne
+/// recoupent rien du catalogue d'Ange : sans MBID, Last.fm est ignoré.
+#[tokio::test]
+async fn sans_mbid_une_liste_d_homonyme_est_ignoree() {
+    let (url, _) = faux_lastfm(200, top(&["Tube de l'autre Ange", "Autre tube"])).await;
+    let mut items = ange();
+    let avant = items.clone();
+    let recherches = Arc::new(AtomicUsize::new(0));
+    let service = vec![piste_de(
+        "h-1",
+        "Tube de l'autre Ange",
+        ANGE,
+        "ange-chanteuse",
+    )];
+    completer(
+        &client(),
+        &cfg(&url, "cle", 8),
+        "qobuz",
+        &ArtisteDeLaPage {
+            id: "ange-groupe",
+            mbid: None,
+        },
+        &mut items,
+        catalogue(service, recherches.clone()),
+    )
+    .await;
+    assert_eq!(items, avant, "Last.fm ignoré");
+    assert_eq!(recherches.load(Ordering::SeqCst), 0);
+}
+
+/// Même titre, même nom d'interprète, mais un AUTRE artiste chez le service :
+/// la piste n'entre pas dans les titres phares.
+#[tokio::test]
+async fn une_piste_d_un_homonyme_trouvee_par_recherche_n_entre_pas() {
+    let (url, _) = faux_lastfm(200, top(&["Hymne à la vie", "Ces gens-là"])).await;
+    let mut items = ange();
+    let homonyme = piste_de("h-1", "Ces gens-là", ANGE, "ange-chanteuse");
+    let mut sans_id = piste("h-2", "Ces gens-là", ANGE, None);
+    sans_id.artist_id = None;
+    completer(
+        &client(),
+        &cfg(&url, "cle", 8),
+        "qobuz",
+        &ArtisteDeLaPage {
+            id: "ange-groupe",
+            mbid: Some(MBID_ANGE),
+        },
+        &mut items,
+        catalogue(vec![homonyme, sans_id], Arc::default()),
+    )
+    .await;
+    let ids: Vec<&str> = items
+        .iter()
+        .map(|v| v["source_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["a-1", "a-2"], "aucun homonyme ajouté");
+}
+
+/// Une réponse Last.fm dont les pistes portent le MBID d'un autre artiste.
+#[tokio::test]
+async fn une_reponse_au_mbid_d_un_autre_artiste_est_refusee() {
+    let corps = json!({"toptracks": {"track": [
+        {"name": "Hymne à la vie", "artist": {"name": "Ange", "mbid": "ffffffff-0000-0000-0000-000000000000"}}
+    ]}});
+    let (url, _) = faux_lastfm(200, corps).await;
+    let mut items = ange();
+    let avant = items.clone();
+    completer(
+        &client(),
+        &cfg(&url, "cle", 8),
+        "qobuz",
+        &ArtisteDeLaPage {
+            id: "ange-groupe",
+            mbid: Some(MBID_ANGE),
+        },
+        &mut items,
+        catalogue(vec![], Arc::default()),
+    )
+    .await;
+    assert_eq!(items, avant);
+}
+
+/// Par nom : une réponse qui désigne un autre artiste (redirection) est refusée.
+#[tokio::test]
+async fn une_reponse_pour_un_autre_nom_est_refusee() {
+    let corps = json!({"toptracks": {
+        "track": [{"name": "Hymne à la vie"}],
+        "@attr": {"artist": "Ange Leccia"}
+    }});
+    let (url, _) = faux_lastfm(200, corps).await;
+    let mut items = ange();
+    let avant = items.clone();
+    completer(
+        &client(),
+        &cfg(&url, "cle", 8),
+        "qobuz",
+        &ArtisteDeLaPage {
+            id: "ange-groupe",
+            mbid: None,
+        },
+        &mut items,
+        catalogue(vec![], Arc::default()),
+    )
+    .await;
+    assert_eq!(items, avant);
+}
+
+#[test]
+fn le_mbid_vient_de_la_bibliotheque() {
+    let b = base();
+    let repo = crate::db::artist_repo::ArtistRepo::with_backend(b.clone());
+    let mut a = crate::db::models::Artist::new(ANGE.into());
+    a.musicbrainz_id = Some(MBID_ANGE.into());
+    repo.create(&a).unwrap();
+    assert_eq!(
+        mbid_de_la_bibliotheque(&b, ANGE).as_deref(),
+        Some(MBID_ANGE)
+    );
+    assert_eq!(mbid_de_la_bibliotheque(&b, "Inconnu"), None);
+    // Deux « Ange » en bibliothèque : le nom ne dit plus lequel, pas de MBID.
+    repo.create(&crate::db::models::Artist::new("ange".into()))
+        .unwrap();
+    assert_eq!(mbid_de_la_bibliotheque(&b, ANGE), None);
+}
+
+/// Un service qui ne donne aucun identifiant d'artiste (YouTube) : le nom
+/// reste le critère, comme avant #8350.
+#[tokio::test]
+async fn sans_identifiants_chez_le_service_le_nom_reste_le_critere() {
+    let (url, _) = faux_lastfm(200, top(&["Hymne à la vie", "Ces gens-là"])).await;
+    let mut items = ange();
+    let mut p = piste("y-1", "Ces gens-là", ANGE, None);
+    p.artist_id = None;
+    completer(
+        &client(),
+        &cfg(&url, "cle", 8),
+        "youtube",
+        &ArtisteDeLaPage {
+            id: "ange-groupe",
+            mbid: Some(MBID_ANGE),
+        },
+        &mut items,
+        catalogue(vec![p], Arc::default()),
+    )
+    .await;
+    assert!(items.iter().any(|v| v["source_id"] == "y-1"), "{items:?}");
 }

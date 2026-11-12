@@ -3,7 +3,11 @@ pub mod mac;
 pub mod mdns;
 pub mod mdns_reprise;
 pub mod minimal_dmr;
+/// Nom annoncé sur le réseau (#8189).
+pub mod nom_annonce;
 mod oui_audio;
+/// Découverte réseau différée jusqu'au premier usage (#8189, iOS).
+pub mod porte_multicast;
 /// Fraîcheur du registre des serveurs multimédia (#2219, phase 1) — le verdict
 /// PUR « présent / absent », sans horloge ni réseau.
 pub mod presence_serveur;

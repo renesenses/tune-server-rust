@@ -77,13 +77,15 @@ fn la_cle_en_base_l_emporte_sur_la_variable() {
 }
 
 /// Même règle pour le nom publié : clé `upnp_friendly_name` d'abord, puis
-/// `TUNE_UPNP_SERVER_NAME`, puis « Tune Server ». Un nom blanc ne compte pas.
+/// `TUNE_UPNP_SERVER_NAME`, puis `Tune (<nom>)` (#8189 — plus la constante
+/// « Tune Server »). Un nom blanc ne compte pas.
 #[test]
 fn le_nom_suit_la_cle_puis_la_variable_puis_le_defaut() {
     let settings = base_vierge();
-    assert_eq!(nom_publie_avec(&settings, None), "Tune Server");
-    assert_eq!(nom_publie_avec(&settings, Some("")), "Tune Server");
-    assert_eq!(nom_publie_avec(&settings, Some("   ")), "Tune Server");
+    settings.set("server_name", "Bureau").unwrap();
+    assert_eq!(nom_publie_avec(&settings, None), "Tune (Bureau)");
+    assert_eq!(nom_publie_avec(&settings, Some("")), "Tune (Bureau)");
+    assert_eq!(nom_publie_avec(&settings, Some("   ")), "Tune (Bureau)");
     assert_eq!(
         nom_publie_avec(&settings, Some("Salon")),
         "Salon",
@@ -101,6 +103,21 @@ fn le_nom_suit_la_cle_puis_la_variable_puis_le_defaut() {
         "Salon",
         "une cle blanche en base ne compte pas"
     );
+    assert_eq!(
+        nom_publie_avec(&settings, None),
+        "Tune (Bureau)",
+        "ni cle ni variable : le defaut Tune (<server_name>)"
+    );
+}
+
+/// #8189 — sans clé, sans variable et sans `server_name`, le défaut n'est
+/// plus « Tune Server » mais `Tune (<nom de l'appareil>)`.
+#[test]
+fn le_defaut_sans_aucun_reglage_n_est_plus_tune_server() {
+    let settings = base_vierge();
+    let nom = nom_publie_avec(&settings, None);
+    assert_ne!(nom, "Tune Server");
+    assert!(nom.starts_with("Tune (") && nom.ends_with(')'), "{nom}");
 }
 
 /// Garde de câblage : la décision doit être prise par les fonctions

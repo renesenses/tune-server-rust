@@ -1282,7 +1282,9 @@ pub(crate) mod tests {
 /// la Bibliothèque, `track_id` ne servant plus qu'en plus quand il est rempli.
 /// Puis, avec la Bibliothèque, elles ne comptent plus que les écoutes de la
 /// provenance de la piste (#7980, `history_repo::sql::meme_provenance`) au
-/// lieu de toutes les écoutes hors radio.
+/// lieu de toutes les écoutes hors radio. Enfin, toujours avec la
+/// Bibliothèque, elles ajoutent les écoutes importées (`imported_plays`,
+/// #8416).
 #[cfg(test)]
 mod anciennes_regles {
     use crate::smart_playlists::build_smart_query_rapport;
@@ -1315,3 +1317,7 @@ mod hires_6285;
 #[cfg(test)]
 #[path = "criteres_ecoutes_7769_tests.rs"]
 mod ecoutes_7769;
+
+#[cfg(test)]
+#[path = "criteres_ecoutes_importees_8416_tests.rs"]
+mod ecoutes_importees_8416;

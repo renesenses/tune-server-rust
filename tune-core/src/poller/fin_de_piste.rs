@@ -76,7 +76,7 @@ impl PositionPoller {
     /// Fin de file : plus rien à jouer après cette piste. Autoplay (piste
     /// semée depuis l'écoute en cours) quand la zone l'a demandé, sinon la
     /// zone s'arrête. Chaque chemin sort après avoir décidé.
-    async fn terminer_la_file(
+    pub(super) async fn terminer_la_file(
         &self,
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
@@ -1068,6 +1068,18 @@ impl PositionPoller {
             .get_at(zone_id, next_pos)
             .ok()
             .flatten();
+
+        // #8135 — une RADIO rangée dans une playlist n'est jamais armée
+        // d'avance : un direct n'a ni fichier ni longueur à préparer. La fin
+        // de la piste en cours la lance par la file (`play_from_queue`), le
+        // chemin d'une radio jouée seule.
+        if ligne.as_ref().is_some_and(|e| {
+            e.track_id.is_none()
+                && e.source.as_deref() == Some(crate::db::playlist_radio_8135::SOURCE_RADIO)
+        }) {
+            debug!(zone_id, next_pos, "gapless_suivante_radio_non_armee");
+            return GaplessPrep::NotArmed;
+        }
 
         // #2211 — ce que la frontière permet au fondu enchaîné (même album,
         // live, DSD), jugé ICI parce que c'est le seul endroit qui tient à la

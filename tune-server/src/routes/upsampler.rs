@@ -109,11 +109,31 @@ async fn tester_la_machine(_admin: RequireAdmin, State(state): State<AppState>) 
 }
 
 /// Pourquoi le réglage de la zone ne s'appliquerait pas, à cet instant.
+///
+/// #8149 — au-delà du choix de la zone (licence, greffon, PURE, test de la
+/// machine), deux refus que l'écran taisait : une zone qui ne sort pas sur
+/// la sortie locale (`output_not_supported`, même code que le chemin du
+/// signal) et le « bit-perfect strict » de la zone (`strict_bitperfect`,
+/// même code que `RefusDeCadenceDuGreffon::BitPerfectStrict`), qui refuse
+/// toute conversion de cadence (GgB, fil 2742).
 fn contrainte(state: &AppState, premium: bool, zone_id: i64) -> Option<&'static str> {
     let pure = tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id);
-    su::choix_de_la_zone(&settings(state), premium, pure, zone_id)
-        .err()
-        .map(su::Ecarte::code)
+    if let Err(ecarte) = su::choix_de_la_zone(&settings(state), premium, pure, zone_id) {
+        return Some(ecarte.code());
+    }
+    let peripherique = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id)
+        .filter(|d| !d.is_empty());
+    if peripherique.is_some_and(|d| !d.starts_with("local:")) {
+        return Some("output_not_supported");
+    }
+    if tune_core::audio::bitperfect_strict::zone_enabled(&state.backend, zone_id) {
+        return Some("strict_bitperfect");
+    }
+    None
 }
 
 async fn forme_de_zone(state: &AppState, zone_id: i64) -> Value {

@@ -395,32 +395,38 @@ async fn complete_single_container(
                 .filter_map(|t| t.id.map(|track_id| QueueInput::Local { track_id }))
                 .collect()
         } else {
-            tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone())
-                .get_entries(id)
-                .map_err(AppError::internal)?
-                .into_iter()
-                .filter_map(|e| match e.content {
-                    tune_core::db::playlist_repo::EntryContent::Local(track_id) => {
-                        Some(QueueInput::Local { track_id })
-                    }
-                    tune_core::db::playlist_repo::EntryContent::Service(s) => {
-                        Some(QueueInput::Streaming {
-                            source: s.source,
-                            source_id: s.source_id,
-                            title: s.title,
-                            artist: s.artist.unwrap_or_default(),
-                            album: s.album,
-                            cover_url: s.cover_url,
-                            duration_ms: s.duration_ms.unwrap_or(0),
-                            track_number: None,
-                            disc_number: None,
-                            album_ref: s.album_source_id,
-                            artist_ref: None,
-                        })
-                    }
-                    _ => None,
-                })
-                .collect()
+            // #8135 — une radio de la playlist reprend par son FLUX, comme
+            // à la lecture ; une station retirée est sautée.
+            tune_core::db::playlist_radio_8135::lignes_a_jouer(
+                &state.backend,
+                tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone())
+                    .get_entries(id)
+                    .map_err(AppError::internal)?,
+                &crate::routes::radios::choix_du_flux_de_playlist(state),
+            )
+            .into_iter()
+            .filter_map(|e| match e.content {
+                tune_core::db::playlist_repo::EntryContent::Local(track_id) => {
+                    Some(QueueInput::Local { track_id })
+                }
+                tune_core::db::playlist_repo::EntryContent::Service(s) => {
+                    Some(QueueInput::Streaming {
+                        source: s.source,
+                        source_id: s.source_id,
+                        title: s.title,
+                        artist: s.artist.unwrap_or_default(),
+                        album: s.album,
+                        cover_url: s.cover_url,
+                        duration_ms: s.duration_ms.unwrap_or(0),
+                        track_number: None,
+                        disc_number: None,
+                        album_ref: s.album_source_id,
+                        artist_ref: None,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
         }
     } else {
         let services = state.services.lock().await;
@@ -598,6 +604,103 @@ mod single_origin_tests {
     use tune_core::db::backend::ToSqlValue;
     use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
     use tune_core::orchestrator::ContexteEcoute;
+
+    /// #8135 — reprendre une playlist « pistes puis radio » arrêtée sur la
+    /// radio : la file mémorisée porte le FLUX de la station, la playlist
+    /// reconstruite doit le porter aussi. Sans cela la ligne radio revenait
+    /// avec l'identifiant de la station, et la reprise répondait « dernier
+    /// titre absent du conteneur ».
+    #[tokio::test]
+    async fn reprise_8135_une_playlist_finie_sur_sa_radio_se_reprend_sur_le_flux() {
+        use tune_core::db::radio_repo::{RadioRepo, RadioStation};
+        const FLUX: &str = "https://flux.invalid/reprise-8135.aac";
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let db = &state.backend;
+        db.execute(
+            "INSERT INTO tracks (title, file_path) VALUES ('Titre', 'reprise-8135.flac')",
+            &[],
+        )
+        .unwrap();
+        let piste = db.last_insert_rowid();
+        let mut radio = RadioStation {
+            id: None,
+            name: "FIP".into(),
+            url: FLUX.into(),
+            homepage: None,
+            logo_url: None,
+            country: None,
+            language: None,
+            genre: None,
+            codec: None,
+            bitrate: None,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
+        };
+        radio.id = Some(RadioRepo::with_backend(db.clone()).create(&radio).unwrap());
+        let playlists = tune_core::db::playlist_repo::PlaylistRepo::with_backend(db.clone());
+        let playlist = playlists.create("Réveil", None, 1).unwrap();
+        playlists
+            .add_entries_deduped(
+                playlist,
+                &[
+                    tune_core::db::playlist_repo::EntryContent::Local(piste),
+                    tune_core::db::playlist_repo::EntryContent::Service(
+                        tune_core::db::playlist_radio_8135::ligne_de_radio(&radio).unwrap(),
+                    ),
+                ],
+                None,
+            )
+            .unwrap();
+        let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone())
+            .create("Muette", None, None)
+            .unwrap();
+        let q = PlayQueueRepo::with_backend(db.clone());
+        let flux = QueueInput::Streaming {
+            source: "radio".into(),
+            source_id: FLUX.into(),
+            title: "FIP".into(),
+            artist: "Live Radio".into(),
+            album: Some("FIP".into()),
+            cover_url: None,
+            duration_ms: 0,
+            track_number: None,
+            disc_number: None,
+            album_ref: None,
+            artist_ref: None,
+        };
+        q.append(zone, &[QueueInput::Local { track_id: piste }, flux])
+            .unwrap();
+        q.set_current_pos(zone, 1).unwrap();
+        let id = playlist.to_string();
+        resumes::started(
+            db,
+            zone,
+            &ContexteEcoute {
+                nature: Some("playlist"),
+                id: Some(&id),
+                rang: Some(1),
+                service: Some("local"),
+                titre: None,
+                pochette: None,
+            },
+            "radio",
+            Some(FLUX),
+            "FIP",
+            Some("FIP"),
+            None,
+        )
+        .unwrap();
+        let mut r = resumes::recent(db, None, 10).unwrap().remove(0);
+        complete_single_container(&state, &mut r)
+            .await
+            .unwrap_or_else(|_| panic!("la playlist doit se reconstruire sur sa radio"));
+        assert_eq!(r.position, 1);
+        match &r.items[1] {
+            QueueInput::Streaming { source_id, .. } => assert_eq!(source_id, FLUX),
+            autre => panic!("la radio doit revenir par son flux, pas {autre:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn reprise_fabien_7280_un_titre_ajoute_depuis_un_album_retrouve_toute_sa_suite() {
