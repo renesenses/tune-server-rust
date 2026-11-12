@@ -105,6 +105,10 @@ pub struct SpotifyService {
     /// #8198 — le dernier refus de connexion portant un code stable, efface
     /// par une connexion reussie. Le verificateur (`diagnostic`) le rapporte.
     derniere_erreur: Option<DerniereErreur>,
+    /// #8198 — l'adresse du relais de retour quand l'option « retour
+    /// automatique » est active ; `None` (defaut) : l'adresse de retour reste
+    /// `redirect_uri`, comme avant.
+    relais: Option<String>,
     /// #8485 — Spotify a répondu 403 à `/artists/{id}/top-tracks` : depuis
     /// février 2026, ce point d'accès est retiré aux applications en mode
     /// développement (celle de chaque utilisateur). Les titres phares sont
@@ -384,6 +388,104 @@ const TENTATIVE_INCONNUE: &str = "spotify: cette adresse de retour vient d'une a
 struct TentativePkce {
     state: String,
     verifier: String,
+    /// #8198 — l'adresse de retour envoyee avec CETTE autorisation : l'echange
+    /// doit la renvoyer a l'identique, meme si le relais a ete active ou
+    /// coupe entre-temps.
+    redirect_uri: String,
+    /// #8198 — secondes Unix de l'ouverture ; au-dela de
+    /// [`DUREE_TENTATIVE_SECS`], la tentative est oubliee.
+    ouverte_le: u64,
+}
+
+/// #8198 — l'adresse du relais de retour de Mozaik Labs. Une adresse HTTPS
+/// publique et fixe, la meme pour tous : chacun la declare une fois dans SA
+/// propre application Spotify. Le relais renvoie le navigateur vers
+/// l'installation Tune dont l'origine voyage dans le `state` ; le code seul ne
+/// sert a rien sans le verificateur PKCE, qui ne quitte jamais ce serveur.
+pub const RELAIS_PAR_DEFAUT: &str = "https://mozaiklabs.fr/spotify-callback";
+
+/// #8198 — l'adresse du relais : `TUNE_SPOTIFY_RELAIS_URL` (essais), sinon
+/// [`RELAIS_PAR_DEFAUT`].
+pub fn adresse_du_relais() -> String {
+    std::env::var("TUNE_SPOTIFY_RELAIS_URL")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| RELAIS_PAR_DEFAUT.to_owned())
+}
+
+/// #8198 — duree de vie d'une autorisation entamee (persistee ou non).
+pub const DUREE_TENTATIVE_SECS: u64 = 15 * 60;
+
+fn maintenant_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// #8198 — encode un composant d'URL (requete de l'adresse de retour).
+pub fn encoder_composant(texte: &str) -> String {
+    urlencoding::encode(texte).into_owned()
+}
+
+/// #8198 — decode un composant d'URL ; le texte tel quel s'il est invalide.
+pub fn decoder_composant(texte: &str) -> String {
+    urlencoding::decode(texte)
+        .map(|v| v.into_owned())
+        .unwrap_or_else(|_| texte.to_owned())
+}
+
+/// #8198 — l'origine de la page Tune qui lance la connexion, reduite a
+/// `schema://hote[:port]`. `None` si elle n'a pas cette forme : pas
+/// d'identifiants, pas d'espace, un hote non vide (nom ASCII ou IPv6 entre
+/// crochets), un port numerique de 1 a 65535, http(s) seulement, 200 caracteres au plus.
+/// Le relais du site refait ses propres controles ; c'est le nonce du
+/// `state`, connu de ce seul serveur, qui fait foi au retour.
+pub fn normaliser_origine(origine: &str) -> Option<String> {
+    let o = origine.trim();
+    if o.len() > 200 || o.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    let (schema, reste) = o.split_once("://")?;
+    let schema = schema.to_ascii_lowercase();
+    if schema != "http" && schema != "https" {
+        return None;
+    }
+    let autorite = reste.split(['/', '?', '#']).next().unwrap_or("");
+    if autorite.is_empty() || autorite.contains('@') {
+        return None;
+    }
+    let (hote_valide, port) = match autorite.strip_prefix('[') {
+        Some(reste) => {
+            let (ip6, apres) = reste.split_once(']')?;
+            (ip6.parse::<std::net::Ipv6Addr>().is_ok(), apres)
+        }
+        None => {
+            let (hote, apres) = autorite.split_at(autorite.find(':').unwrap_or(autorite.len()));
+            let valide = !hote.is_empty()
+                && hote
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+            (valide, apres)
+        }
+    };
+    if !hote_valide {
+        return None;
+    }
+    if !port.is_empty() {
+        let chiffres = port.strip_prefix(':')?;
+        if chiffres.is_empty()
+            || chiffres.len() > 5
+            || !chiffres.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        if !(1..=65535).contains(&chiffres.parse::<u32>().ok()?) {
+            return None;
+        }
+    }
+    Some(format!("{schema}://{}", autorite.to_ascii_lowercase()))
 }
 
 /// Ce qu'une adresse de retour apporte : le code, et le `state` s'il y est.
@@ -575,6 +677,7 @@ impl SpotifyService {
             plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
             session_refusee: false,
             derniere_erreur: None,
+            relais: None,
             titres_phares_retires: AtomicBool::new(false),
             selection_retiree: AtomicBool::new(false),
         }
@@ -602,18 +705,26 @@ impl SpotifyService {
     /// n'y en a plus aucune en memoire (serveur redemarre), porte
     /// [`CODE_STATE_INCONNU`] ; un code nu sans tentative garde son texte seul.
     fn tentative_pour(&self, state: Option<&str>) -> Result<usize, TuneError> {
-        if self.tentatives.is_empty() {
+        // #8198 — une tentative de plus de `DUREE_TENTATIVE_SECS` ne compte plus.
+        let maintenant = maintenant_secs();
+        let vivante =
+            |t: &TentativePkce| maintenant.saturating_sub(t.ouverte_le) < DUREE_TENTATIVE_SECS;
+        if !self.tentatives.iter().any(vivante) {
             return Err(match state {
                 Some(_) => refus(CODE_STATE_INCONNU, AUCUNE_TENTATIVE),
                 None => AUCUNE_TENTATIVE.into(),
             });
         }
         match state {
-            None => Ok(self.tentatives.len() - 1),
+            None => Ok(self
+                .tentatives
+                .iter()
+                .rposition(vivante)
+                .expect("au moins une tentative vivante")),
             Some(state) => self
                 .tentatives
                 .iter()
-                .rposition(|t| t.state == state)
+                .rposition(|t| t.state == state && vivante(t))
                 .ok_or_else(|| refus(CODE_STATE_INCONNU, TENTATIVE_INCONNUE)),
         }
     }
@@ -657,11 +768,11 @@ impl SpotifyService {
         (verifier, challenge)
     }
 
-    fn auth_url(&self, challenge: &str, state: &str) -> String {
+    fn auth_url(&self, challenge: &str, state: &str, redirect_uri: &str) -> String {
         format!(
             "{AUTH_URL}?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={challenge}&state={state}",
             urlencoding::encode(&self.client_id),
-            urlencoding::encode(&self.redirect_uri),
+            urlencoding::encode(redirect_uri),
             urlencoding::encode(SCOPES),
         )
     }
@@ -1172,10 +1283,86 @@ impl SpotifyService {
 }
 
 impl SpotifyService {
-    /// #8198 — l'adresse de retour que Tune envoie a Spotify, a declarer a
-    /// l'identique dans l'application Spotify.
+    /// #8198 — l'adresse de retour envoyee a Spotify : celle du relais quand
+    /// l'option est active, sinon `redirect_uri`.
     pub fn adresse_de_retour(&self) -> &str {
-        &self.redirect_uri
+        self.relais.as_deref().unwrap_or(&self.redirect_uri)
+    }
+
+    /// #8198 — active (`Some(adresse)`) ou coupe (`None`) le retour par le
+    /// relais. Les autorisations deja ouvertes gardent leur propre adresse.
+    pub fn regler_relais(&mut self, relais: Option<String>) {
+        self.relais = relais;
+    }
+
+    /// #8198 — le relais est-il actif ?
+    pub fn relais_actif(&self) -> bool {
+        self.relais.is_some()
+    }
+
+    fn oublier_les_tentatives_perimees(&mut self) {
+        let maintenant = maintenant_secs();
+        self.tentatives
+            .retain(|t| maintenant.saturating_sub(t.ouverte_le) < DUREE_TENTATIVE_SECS);
+    }
+
+    /// #8198 — les autorisations entamees, a persister : elles survivent
+    /// ainsi a un redemarrage du serveur (conteneur mis a jour entre le clic
+    /// et le retour). Le verificateur PKCE y figure : la ligne vit dans la
+    /// meme base que les jetons, et 15 minutes au plus.
+    pub fn tentatives_a_persister(&self) -> serde_json::Value {
+        let maintenant = maintenant_secs();
+        serde_json::Value::Array(
+            self.tentatives
+                .iter()
+                .filter(|t| maintenant.saturating_sub(t.ouverte_le) < DUREE_TENTATIVE_SECS)
+                .map(|t| {
+                    serde_json::json!({
+                        "state": t.state,
+                        "verifier": t.verifier,
+                        "redirect_uri": t.redirect_uri,
+                        "ouverte_le": t.ouverte_le,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// #8198 — reprend les autorisations persistees, si ce service n'en a
+    /// aucune en memoire (il vient de demarrer). Les perimees sont ignorees.
+    /// Rend le nombre de tentatives reprises.
+    pub fn reprendre_tentatives(&mut self, persistees: &serde_json::Value) -> usize {
+        if !self.tentatives.is_empty() {
+            return 0;
+        }
+        let maintenant = maintenant_secs();
+        let Some(liste) = persistees.as_array() else {
+            return 0;
+        };
+        for t in liste {
+            let (Some(state), Some(verifier), Some(redirect_uri), Some(ouverte_le)) = (
+                t["state"].as_str(),
+                t["verifier"].as_str(),
+                t["redirect_uri"].as_str(),
+                t["ouverte_le"].as_u64(),
+            ) else {
+                continue;
+            };
+            if maintenant.saturating_sub(ouverte_le) >= DUREE_TENTATIVE_SECS {
+                continue;
+            }
+            self.tentatives.push(TentativePkce {
+                state: state.to_owned(),
+                verifier: verifier.to_owned(),
+                redirect_uri: redirect_uri.to_owned(),
+                ouverte_le,
+            });
+        }
+        if self.tentatives.len() > TENTATIVES_MAX {
+            let trop = self.tentatives.len() - TENTATIVES_MAX;
+            self.tentatives.drain(..trop);
+        }
+        self.tentatives.len()
     }
 
     /// #8198 — les 8 premiers caracteres du Client ID en service, a comparer
@@ -1192,7 +1379,8 @@ impl SpotifyService {
         InstantaneDiagnostic {
             client: self.client.clone(),
             client_id: self.client_id.clone(),
-            redirect_uri: self.redirect_uri.clone(),
+            redirect_uri: self.adresse_de_retour().to_owned(),
+            relais: self.relais_actif(),
             token_url: self.token_url.clone(),
             api_base: self.api_base.clone(),
             access_token: self.access_token.clone(),
@@ -1257,13 +1445,14 @@ impl SpotifyService {
             let code = code.as_str();
             let indice = self.tentative_pour(state.as_deref())?;
             let verifier = self.tentatives[indice].verifier.clone();
+            let redirect_uri = self.tentatives[indice].redirect_uri.clone();
             let resp = self
                 .client
                 .post(&self.token_url)
                 .form(&[
                     ("grant_type", "authorization_code"),
                     ("code", code),
-                    ("redirect_uri", &self.redirect_uri),
+                    ("redirect_uri", &redirect_uri),
                     ("client_id", &self.client_id),
                     ("code_verifier", &verifier),
                 ])
@@ -1289,8 +1478,7 @@ impl SpotifyService {
                     ""
                 };
                 let message = format!(
-                    "spotify: {err} {detail} (redirect_uri envoyee : {}){conseil}",
-                    self.redirect_uri
+                    "spotify: {err} {detail} (redirect_uri envoyee : {redirect_uri}){conseil}"
                 );
                 // #8198 — un code stable pour les trois refus courants ;
                 // les autres gardent leur texte seul.
@@ -1355,9 +1543,32 @@ impl SpotifyService {
         }
 
         let (verifier, challenge) = Self::generate_pkce();
-        let state = base64url_encode(&octets_aleatoires::<16>());
-        let url = self.auth_url(&challenge, &state);
-        self.tentatives.push(TentativePkce { state, verifier });
+        let nonce = base64url_encode(&octets_aleatoires::<16>());
+        // #8198 — relais actif : l'origine de la page Tune voyage dans le
+        // `state` (`<nonce>.<origine en base64url>`), pour que le relais
+        // sache ou renvoyer le navigateur. Sans origine, le nonce seul : le
+        // relais n'offre alors que l'adresse a copier.
+        let redirect_uri = self.adresse_de_retour().to_owned();
+        let state = match (
+            &self.relais,
+            credentials
+                .get("origine")
+                .and_then(|v| v.as_str())
+                .and_then(normaliser_origine),
+        ) {
+            (Some(_), Some(origine)) => {
+                format!("{nonce}.{}", base64url_encode(origine.as_bytes()))
+            }
+            _ => nonce,
+        };
+        let url = self.auth_url(&challenge, &state, &redirect_uri);
+        self.oublier_les_tentatives_perimees();
+        self.tentatives.push(TentativePkce {
+            state,
+            verifier,
+            redirect_uri,
+            ouverte_le: maintenant_secs(),
+        });
         if self.tentatives.len() > TENTATIVES_MAX {
             let trop = self.tentatives.len() - TENTATIVES_MAX;
             self.tentatives.drain(..trop);
@@ -1375,7 +1586,9 @@ impl SpotifyService {
 pub struct InstantaneDiagnostic {
     client: Client,
     client_id: String,
+    /// L'adresse de retour envoyee a Spotify (celle du relais s'il est actif).
     redirect_uri: String,
+    relais: bool,
     token_url: String,
     api_base: String,
     access_token: Option<String>,
@@ -1558,7 +1771,7 @@ impl InstantaneDiagnostic {
             "redirect_uri": {
                 "valeur": self.redirect_uri,
                 "etat": redirect,
-                "relais": false,
+                "relais": self.relais,
             },
             "connexion": { "etat": connexion, "compte": self.username },
             "acces_api": { "etat": acces, "detail": detail },
@@ -2250,7 +2463,9 @@ fn motif_du_refus(corps: &str) -> String {
         .trim();
     message.chars().take(200).collect()
 }
-fn base64url_encode(data: &[u8]) -> String {
+/// Base64url sans remplissage (RFC 4648 §5) : verificateur, `state`, origine
+/// du relais (#8198).
+pub fn base64url_encode(data: &[u8]) -> String {
     let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut output = String::new();
     let mut buf: u32 = 0;
@@ -2563,7 +2778,7 @@ mod tests {
             Some("https://tune.example/api/v1/streaming/spotify/callback"),
             DEFAULT_API_PORT,
         );
-        let url = svc.auth_url("challenge-test", "etat-test");
+        let url = svc.auth_url("challenge-test", "etat-test", &svc.redirect_uri);
 
         assert!(url.contains("client_id=client-test"));
         assert!(url.contains(
@@ -3435,6 +3650,9 @@ mod tests {
 #[path = "spotify_recherche_7659_tests.rs"]
 mod recherche_7659_tests;
 
+#[cfg(test)]
+#[path = "spotify_relais_8198_tests.rs"]
+mod relais_8198_tests;
 #[cfg(test)]
 #[path = "spotify_session_refusee_8051_tests.rs"]
 mod session_refusee_8051_tests;

@@ -2134,6 +2134,12 @@ path = "tests/licence_retrait_libere_la_machine_7726.rs"
 name = "durcissement_configuration"
 path = "tests/durcissement_configuration.rs"
 
+# #8198 — le retour Spotify du relais (POST inter-sites) passe le contrôle
+# d'origine ; tout le reste le garde. `autotests = false` : cible déclarée.
+[[test]]
+name = "spotify_retour_garde_origine_8198"
+path = "tests/spotify_retour_garde_origine_8198.rs"
+
 # Routes d'administration : un témoin par route, authentification active et
 # coupée. `autotests = false` plus haut : sans cette cible, jamais compilé.
 [[test]]
