@@ -90,16 +90,53 @@ fn les_voies_du_fichier_doivent_etre_celles_du_pilote() {
     );
 }
 
-/// Le plafond de cadence de la zone s'applique comme au DoP (cadence / 16).
+/// Le plafond de cadence de la zone borne la cadence RÉELLEMENT ouverte en
+/// `DSD_U32` (cadence / 32), pas le débit DoP équivalent (décision du 12/11) :
+/// une zone plafonnée à 768 kHz reçoit le DSD512 natif (705,6 et 768 kHz) ;
+/// plafonnée à 384 kHz, elle le refuse et repart en DoP comme avant.
 #[test]
-fn le_plafond_de_zone_vaut_aussi_pour_le_natif_alsa() {
+fn le_plafond_de_zone_borne_la_cadence_ouverte_en_dsd_u32() {
+    for cadence in [DSD512, DSD512_48] {
+        assert_eq!(
+            decider_dsd_natif_local_voies(
+                &sabaj_d5(),
+                Some(cadence),
+                Some(2),
+                Some(768_000),
+                false
+            ),
+            Ok(()),
+            "zone plafonnée à 768 kHz : DSD {cadence} Hz s'ouvre à {} Hz, natif attendu",
+            cadence / 32
+        );
+        assert_eq!(
+            decider_dsd_natif_local_voies(
+                &sabaj_d5(),
+                Some(cadence),
+                Some(2),
+                Some(384_000),
+                false
+            ),
+            Err(MotifDsdServiEnDop::PlafondDeZone),
+            "zone plafonnée à 384 kHz : DSD {cadence} Hz refusé en natif"
+        );
+    }
     assert_eq!(
-        decider_dsd_natif_local_voies(&sabaj_d5(), Some(DSD512), Some(2), Some(705_600), false),
-        Err(MotifDsdServiEnDop::PlafondDeZone)
+        decider_dsd_natif_local_voies(&sabaj_d5(), Some(DSD64), Some(2), Some(88_200), false),
+        Ok(()),
+        "DSD64 s'ouvre à 88,2 kHz"
     );
+}
+
+/// L'ASIO natif garde la règle de #5643 : débit DoP équivalent (cadence / 16).
+#[test]
+fn l_asio_natif_garde_le_plafond_au_debit_dop() {
+    let asio = SortieDsdLocale::Asio {
+        cadences: vec![DSD512],
+    };
     assert_eq!(
-        decider_dsd_natif_local_voies(&sabaj_d5(), Some(DSD512), Some(2), Some(1_411_200), false),
-        Ok(())
+        decider_dsd_natif_local_voies(&asio, Some(DSD512), Some(2), Some(768_000), false),
+        Err(MotifDsdServiEnDop::PlafondDeZone)
     );
 }
 

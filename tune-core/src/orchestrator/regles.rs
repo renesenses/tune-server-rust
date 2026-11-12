@@ -1259,9 +1259,9 @@ impl MotifDsdServiEnDop {
 ///
 /// - `cadence_fichier` : la cadence DSD lue dans l'en-tête du fichier ;
 /// - `plafond_zone` : le plafond de cadence de la zone, déjà combiné avec le
-///   catalogue (`zone_max_sample_rate`). Il s'applique comme au DoP, sur le
-///   débit équivalent `cadence / 16` : une zone que le DoP n'a pas le droit de
-///   servir à cette cadence ne la reçoit pas non plus en natif ;
+///   catalogue (`zone_max_sample_rate`). Sur ASIO, il s'applique comme au
+///   DoP, sur le débit équivalent `cadence / 16` ; sur ALSA `DSD_U32`, sur la
+///   cadence réellement ouverte, `cadence / 32` (#8248) ;
 /// - `strict` : « bit-perfect strict ». Le DSD natif est bit-perfect par
 ///   construction, le mode strict ne l'empêche donc pas ; sur repli, c'est le
 ///   chemin DoP qui applique le strict comme avant (refus si le plafond
@@ -1289,7 +1289,15 @@ pub fn decider_dsd_natif_local(
     if !cadences.contains(&cadence) {
         return Err(MotifDsdServiEnDop::CadenceNonDeclaree);
     }
-    if plafond_zone.is_some_and(|max| cadence / 16 > max) {
+    // #8248 (décision de Bertrand du 12/11) — en `DSD_U32`, le PCM ALSA
+    // s'ouvre à cadence / 32 (DSD512 : 705,6 ou 768 kHz) : c'est cette
+    // cadence-là que le plafond de la zone doit borner, pas le débit DoP
+    // équivalent. ASIO natif et DoP gardent la règle de #5643 (cadence / 16).
+    let cadence_bornee = match sortie {
+        SortieDsdLocale::Alsa { .. } => crate::audio::dsd_u32_alsa::cadence_de_trame(cadence),
+        _ => cadence / 16,
+    };
+    if plafond_zone.is_some_and(|max| cadence_bornee > max) {
         return Err(MotifDsdServiEnDop::PlafondDeZone);
     }
     Ok(())
