@@ -1201,7 +1201,7 @@ mod tests {
         // Le rang doit etre LU, et seulement par la requete dediee : la
         // requete ordinaire ne le nomme pas, donc la forme du JSON ne bouge pas.
         assert!(sql::list_by_type_pour_rang(&SqliteDialect).contains(
-            "created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, position"
+            "created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, album_ref, position"
         ));
         assert!(!sql::list_by_type(&SqliteDialect).contains("position"));
     }
