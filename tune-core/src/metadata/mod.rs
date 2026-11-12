@@ -8,6 +8,8 @@ pub mod artistes_du_pressage;
 pub mod auto_fix;
 // Les balises réellement présentes dans un fichier, lues brutes (#6124).
 pub mod balises_brutes;
+/// Réglage « Balises du classique » (#8325, ESL63P).
+pub mod balises_classique;
 pub mod batch;
 pub mod bio_batch;
 pub mod bio_segments;
@@ -4405,6 +4407,18 @@ pub const CLE_INTERPRETE_DE_LA_PISTE: &str = "track_artist";
 /// This extracts tags like composer, conductor, lyricist, performer, remixer,
 /// ReplayGain values, MusicBrainz IDs, and other extended fields.
 pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
+    read_extended_metadata_selon(path, &balises_classique::courante())
+}
+
+/// [`read_extended_metadata`] selon un réglage « Balises du classique »
+/// explicite (#8325, ESL63P) : les témoins le passent sans toucher au miroir
+/// global. Avec [`balises_classique::BalisesClassique::default`], la lecture
+/// est exactement celle d'avant le réglage.
+pub fn read_extended_metadata_selon(
+    path: &Path,
+    classique: &balises_classique::BalisesClassique,
+) -> HashMap<String, String> {
+    use balises_classique::{BalisesClassique, STANDARD_CHEF, STANDARD_MOUVEMENT, STANDARD_OEUVRE};
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::{Accessor, ItemKey};
 
@@ -4468,9 +4482,15 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // la TIPL (producer, arranger, engineer, mix, DJ-mix) sous les mêmes
     // `ItemKey`, MP4 ses atomes `----:com.apple.iTunes:*`. Elles deviennent
     // des lignes `track_credits` au scan (`credits_balises`).
+    // Le chef par lofty (CONDUCTOR, TPE3, atome MP4) seulement si le réglage
+    // « Balises du classique » garde le nom standard (défaut).
+    if BalisesClassique::lit_standard(&classique.conductor, STANDARD_CHEF)
+        && let Some(v) = toutes(ItemKey::Conductor)
+    {
+        meta.insert("conductor".into(), v);
+    }
     for (cle, item) in [
         ("composer", ItemKey::Composer),
-        ("conductor", ItemKey::Conductor),
         ("lyricist", ItemKey::Lyricist),
         ("writer", ItemKey::Writer),
         ("arranger", ItemKey::Arranger),
@@ -4513,12 +4533,18 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // regroupement dans GRP1 : quand GRP1 est présent, TIT1 est l'œuvre
     // (c'est la désambiguïsation que lofty documente pour `ContentGroup`).
     // Sans GRP1, TIT1 reste un regroupement quelconque et n'est pas repris.
-    if let Some(v) = get(ItemKey::Work)
-        .or_else(|| get(ItemKey::AppleId3v2ContentGroup).and_then(|_| get(ItemKey::ContentGroup)))
+    // Réglage « Balises du classique » : WORK / MOVEMENTNAME retirés de leur
+    // liste coupent ces lectures standard.
+    if BalisesClassique::lit_standard(&classique.work, STANDARD_OEUVRE)
+        && let Some(v) = get(ItemKey::Work).or_else(|| {
+            get(ItemKey::AppleId3v2ContentGroup).and_then(|_| get(ItemKey::ContentGroup))
+        })
     {
         meta.insert("work".into(), v);
     }
-    if let Some(v) = get(ItemKey::Movement) {
+    if BalisesClassique::lit_standard(&classique.movement, STANDARD_MOUVEMENT)
+        && let Some(v) = get(ItemKey::Movement)
+    {
         meta.insert("movement".into(), v);
     }
     if let Some(v) = get(ItemKey::FlagCompilation) {
@@ -4592,14 +4618,17 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
                 .filter_map(|k| find_vorbis_comment(h, k).map(|v| (k.to_string(), v)))
                 // #8026 — TOUTES les trames ENSEMBLE / ORCHESTRA : un fichier
                 // qui cite deux orchestres les crédite tous les deux.
+                // Réglage « Balises du classique » : les clés libres des
+                // quatre rôles (par défaut ENSEMBLE, ORCHESTRA, CHOIR).
                 .chain(
-                    credits_balises::CLES_ENSEMBLE
-                        .iter()
-                        .chain(std::iter::once(&credits_balises::CLE_BAND))
+                    classique
+                        .cles_brutes()
+                        .into_iter()
+                        .chain(std::iter::once(credits_balises::CLE_BAND.to_string()))
                         .flat_map(|k| {
-                            find_vorbis_comments(h, k, usize::MAX)
+                            find_vorbis_comments(h, &k, usize::MAX)
                                 .into_iter()
-                                .map(move |v| (k.to_string(), v))
+                                .map(move |v| (k.clone(), v))
                         }),
                 )
                 .collect(),
@@ -4619,16 +4648,24 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         // l'orchestre (ENSEMBLE, ORCHESTRA), la liste des musiciens ID3v2.4
         // (TMCL, « instrument: nom »), et l'arrangeur d'un MP4. Lu dans les
         // mêmes clés brutes, sans E/S de plus.
-        credits_balises::completer_par_les_cles_brutes(&mut meta, &brutes);
+        credits_balises::completer_par_les_cles_brutes_selon(
+            &mut meta,
+            &brutes,
+            &classique.ensemble,
+        );
+        // Les clés libres du chef, de l'œuvre et du mouvement (aucune par
+        // défaut).
+        classique.completer_par_les_noms_libres(&mut meta, &brutes);
         // #8325 — BAND, quand il n'est ni l'artiste d'album (TPE2 chez
         // foobar2000 / Mp3tag) ni celui de la piste : l'orchestre d'un classique.
-        credits_balises::completer_par_band(
+        credits_balises::completer_par_band_selon(
             &mut meta,
             &brutes,
             &[
                 get(ItemKey::AlbumArtist).as_deref(),
                 get(ItemKey::TrackArtist).as_deref(),
             ],
+            classique.band,
         );
     }
     if let Some(v) = get(ItemKey::OriginalMediaType)

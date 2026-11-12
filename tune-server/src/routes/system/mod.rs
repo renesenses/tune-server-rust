@@ -56,6 +56,8 @@ mod replaygain;
 // recopier la règle au lieu de l'appeler — un test qui réplique le code ne le
 // garde pas. Les items du module restent `pub(crate)` sauf ceux exposés
 // expressément.
+/// Réglage « Balises du classique » (#8325, ESL63P).
+mod balises_classique;
 /// « Ce qui tourne » : passes de fond, cession à la lecture, avancement,
 /// garde thermique (#4681).
 pub(crate) mod ce_qui_tourne;
@@ -118,6 +120,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/settings/default-zone",
             get(config::get_default_zone).put(config::set_default_zone),
+        )
+        // #8325 / ESL63P — les balises lues pour le chef, l'ensemble,
+        // l'œuvre et le mouvement, et le sort de BAND.
+        .route(
+            "/settings/classical-tags",
+            get(balises_classique::get_classical_tags).put(balises_classique::set_classical_tags),
         )
         // #8213 — arrêt programmé de la lecture à heure fixe.
         .route(
