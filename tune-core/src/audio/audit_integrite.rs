@@ -11,12 +11,17 @@ use std::{
     path::Path,
 };
 use symphonia::core::{
-    codecs::{CodecParameters, audio::AudioDecoderOptions},
+    codecs::{
+        CodecParameters,
+        audio::{AudioDecoder, AudioDecoderOptions},
+    },
     errors::Error,
     formats::probe::Hint,
     formats::{FormatOptions, TrackType},
     io::{MediaSource, MediaSourceStream},
     meta::MetadataOptions,
+    packet::Packet,
+    units::{Duration, Timestamp},
 };
 
 /// #8105 — fin des données audio d'un FLAC : la taille du fichier moins les
@@ -398,7 +403,7 @@ fn verifier_source<R: Read + Seek + Send + Sync + 'static>(
     mut source: R,
     taille: u64,
     extension: Option<&str>,
-    rouvrir: impl FnOnce() -> io::Result<R>,
+    rouvrir: impl Fn() -> io::Result<R>,
     mut continuer: impl FnMut() -> bool,
 ) -> Option<Resultat> {
     let flac = super::flac_vendeur::entete_flac(&mut source);
@@ -509,7 +514,20 @@ fn verifier_source<R: Read + Seek + Send + Sync + 'static>(
             Err(Error::IoError(e))
                 if flac.is_some() && e.kind() == io::ErrorKind::UnexpectedEof =>
             {
-                return fin_de_flux_inattendue(rouvrir, fin, taille, trames, attendues, continuer);
+                let md5_nul = flac.as_ref().is_some_and(|f| f.md5_nul);
+                return fin_de_flux_inattendue(
+                    rouvrir,
+                    Fin {
+                        fin,
+                        taille,
+                        trames,
+                        attendues,
+                        md5_nul,
+                    },
+                    decoder.as_mut(),
+                    id,
+                    continuer,
+                );
             }
             Err(e) => return Some(Resultat::defaut("decodage", e, Some(trames), trames)),
         };
@@ -576,17 +594,79 @@ fn verifier_source<R: Read + Seek + Send + Sync + 'static>(
     })
 }
 
-/// Le décodeur FLAC a rencontré la fin du flux avant le dernier échantillon
-/// annoncé (#8105). « Tronqué » n'est rendu que si le parcours des trames
-/// le confirme : le fichier est réellement plus court que ce qu'il annonce.
-/// Sinon c'est la dernière trame qui est fautive (abîmée, ou suivie de
-/// données inconnues). Le message donne la position et la taille réelle.
-fn fin_de_flux_inattendue<R: Read>(
-    rouvrir: impl FnOnce() -> io::Result<R>,
+/// Ce que sait le décodage complet quand le flux FLAC finit trop tôt.
+struct Fin {
+    /// Fin des données audio (étiquettes finales connues retirées).
     fin: u64,
     taille: u64,
+    /// Échantillons décodés avant la trame perdue.
     trames: u64,
     attendues: Option<u64>,
+    md5_nul: bool,
+}
+
+/// Longueur maximale d'une trame FLAC lue pour la décoder seule : bien
+/// au-delà de toute trame réelle (16 bits × 8 canaux × 65 535 échantillons).
+const TRAME_MAX: u64 = 1 << 24;
+
+/// #8403 — la dernière trame, lue seule de `debut` à `fin` : si elle finit
+/// intacte (CRC-16 nul) avant `fin` et que le décodeur la décode, le nombre
+/// d'échantillons qu'elle donne. Ce qui la suit (étiquette ID3v2 en fin de
+/// fichier, bourrage, données inconnues) n'est pas de l'audio : le
+/// démultiplexeur de symphonia l'y colle et perd la trame. Le décodeur, lui,
+/// ne lit que la trame et met à jour le MD5 seulement après un décodage
+/// réussi : les fins candidates sont essayées dans l'ordre, la première qui
+/// se décode est la bonne. Seul le MD5 de STREAMINFO conclut ensuite.
+fn derniere_trame_seule<R: Read + Seek>(
+    mut source: R,
+    debut: u64,
+    fin: u64,
+    decodeur: &mut dyn AudioDecoder,
+    piste: u32,
+    trames: u64,
+) -> Option<u64> {
+    if fin <= debut || fin - debut > TRAME_MAX {
+        return None;
+    }
+    source.seek(SeekFrom::Start(debut)).ok()?;
+    let mut octets = Vec::new();
+    source.take(fin - debut).read_to_end(&mut octets).ok()?;
+    let pts = Timestamp::new(i64::try_from(trames).ok()?);
+    let mut crc = 0u16;
+    for (i, &o) in octets.iter().enumerate() {
+        crc = crc::crc16(crc, o);
+        // Au moins l'en-tête minimal (6 octets) et le CRC-16 ; une fin au
+        // dernier octet serait une trame entière, que le démultiplexeur
+        // n'aurait pas perdue.
+        if crc != 0 || i < 7 || i + 1 == octets.len() {
+            continue;
+        }
+        let paquet = Packet::new(piste, pts, Duration::ZERO, &octets[..=i]);
+        if let Ok(pcm) = decodeur.decode(&paquet) {
+            return Some(pcm.frames() as u64);
+        }
+    }
+    None
+}
+
+/// Le décodeur FLAC a rencontré la fin du flux avant le dernier échantillon
+/// annoncé (#8105). La dernière trame est d'abord décodée seule : si elle
+/// est intacte, suivie d'octets qui ne sont pas de l'audio, et que le MD5 de
+/// STREAMINFO est juste, le fichier est sain (#8403). « Tronqué » n'est
+/// rendu que si le parcours des trames le confirme : le fichier est
+/// réellement plus court que ce qu'il annonce. Sinon c'est la dernière trame
+/// qui est fautive. Le message donne la position et la taille réelle.
+fn fin_de_flux_inattendue<R: Read + Seek>(
+    rouvrir: impl Fn() -> io::Result<R>,
+    Fin {
+        fin,
+        taille,
+        trames,
+        attendues,
+        md5_nul,
+    }: Fin,
+    decodeur: &mut dyn AudioDecoder,
+    piste: u32,
     continuer: impl FnMut() -> bool,
 ) -> Option<Resultat> {
     let annonce = attendues
@@ -602,6 +682,36 @@ fn fin_de_flux_inattendue<R: Read>(
         Ok(crc::Analyse::Interrompu) => return None,
         Ok(crc::Analyse::NonApplicable) | Err(_) => None,
     };
+    // La trame perdue est celle où le parcours situe la coupure ou la
+    // faute, au premier échantillon que le décodeur n'a pas rendu.
+    let perdue = constat.as_ref().and_then(|c| {
+        c.tronque
+            .as_ref()
+            .or(c.premiere_faute.as_ref().map(|f| &f.lieu))
+            .filter(|lieu| lieu.echantillon == Some(trames))
+            .map(|lieu| lieu.octet)
+    });
+    if let (Some(debut), Some(attendues)) = (perdue, attendues)
+        && let Ok(source) = rouvrir()
+        && let Some(n) = derniere_trame_seule(source, debut, fin, decodeur, piste, trames)
+        && trames + n == attendues
+    {
+        if md5_nul {
+            return Some(Resultat::non_verifiable("md5_nul", attendues));
+        }
+        if decodeur.finalize().verify_ok == Some(true) {
+            return Some(Resultat {
+                verdict: Verdict::Sain,
+                code: "sain".into(),
+                erreur: None,
+                position_trames: None,
+                trames_decodees: attendues,
+                localisation: None,
+                fautes: None,
+                unites_controlees: None,
+            });
+        }
+    }
     let (code, position, detail) = match constat {
         Some(crc::Constat {
             tronque: Some(lieu),
