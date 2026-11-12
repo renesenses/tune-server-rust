@@ -24,12 +24,64 @@ use tune_core::library::exemplaires as ex;
 
 use crate::state::AppState;
 
+/// #7876 — les dossiers de musique tels que `GET /system/config` les rend
+/// (écriture BRUTE) : le réglage `music_dirs`, ou à défaut ceux du fichier de
+/// configuration. C'est cette liste que Réglages › Bibliothèque affiche.
+fn dossiers_bruts(state: &AppState) -> Vec<String> {
+    SettingsRepo::with_backend(state.backend.clone())
+        .get("music_dirs")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_else(|| state.config.music_dirs.clone())
+}
+
+/// Les dossiers de musique NORMALISÉS. #7876 : quand le réglage est absent,
+/// ce sont ceux du fichier de configuration, que l'écran affiche aussi ; sans
+/// ce repli, chaque flèche rendait 400 `not_music_dirs`.
+fn dossiers(state: &AppState) -> Vec<String> {
+    let en_base = ex::dossiers_de_musique(&*state.backend);
+    if !en_base.is_empty() {
+        return en_base;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for d in &state.config.music_dirs {
+        let d = tune_core::scanner::walker::normalize_path(d);
+        if !d.is_empty() && !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// #7876 — l'ordre effectif réécrit dans l'écriture BRUTE de `music_dirs`.
+///
+/// `ordre` est normalisé (sous Windows, `/` devient `\` ; le séparateur
+/// final tombe), alors que l'écran compare chaque entrée à la liste brute de
+/// `GET /system/config`. Dès que les deux écritures différaient, le PUT
+/// réussissait mais l'écran redessinait la même liste : les flèches
+/// semblaient sans effet.
+fn ordre_affiche(ordre: &[String], bruts: &[String]) -> Vec<String> {
+    ordre
+        .iter()
+        .map(|o| {
+            bruts
+                .iter()
+                .find(|b| tune_core::scanner::walker::normalize_path(b) == *o)
+                .cloned()
+                .unwrap_or_else(|| o.clone())
+        })
+        .collect()
+}
+
 fn ordre_actuel(state: &AppState) -> Value {
     let db = &*state.backend;
-    let dossiers = ex::dossiers_de_musique(db);
+    let dossiers = dossiers(state);
     let regle = ex::ordre_regle(db);
+    let ordre = ex::ordre_effectif(&dossiers, &regle);
     json!({
-        "ordre": ex::ordre_effectif(&dossiers, &regle),
+        "ordre_affiche": ordre_affiche(&ordre, &dossiers_bruts(state)),
+        "ordre": ordre,
         "music_dirs": dossiers,
         "regle": regle,
     })
@@ -53,7 +105,7 @@ pub(super) async fn ordre_put(
     State(state): State<AppState>,
     Json(corps): Json<CorpsOrdre>,
 ) -> Response {
-    let dossiers = ex::dossiers_de_musique(&*state.backend);
+    let dossiers = dossiers(&state);
     let mut ordre: Vec<String> = Vec::new();
     let mut inconnus: Vec<String> = Vec::new();
     for d in &corps.ordre {
@@ -84,6 +136,9 @@ pub(super) async fn ordre_put(
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    // #7876 : la route n'écrivait aucune ligne ; un rapport ne permettait pas
+    // de dire si le clic sur une flèche avait atteint le serveur.
+    tracing::info!(ordre = ?ordre, "ordre_des_repertoires_regle");
     Json(ordre_actuel(&state)).into_response()
 }
 
@@ -167,3 +222,7 @@ pub(super) async fn preference_delete(
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
+
+#[cfg(test)]
+#[path = "exemplaires_tests_7876.rs"]
+mod tests_7876;
