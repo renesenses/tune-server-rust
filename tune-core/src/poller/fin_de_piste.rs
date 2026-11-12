@@ -1049,7 +1049,8 @@ impl PositionPoller {
         // passe par la garde.
         // #7974 — de même pour la garde du bail d'écoute : on n'arme pas la
         // suivante si le bail finit avant elle.
-        if self.orchestrator.masque_l_explicite(zone_id).await
+        // #8611 — et pour un profil qui bloque des artistes.
+        if self.orchestrator.garde_parentale_par_piste(zone_id).await
             || !self
                 .orchestrator
                 .bail_couvre_l_enchainement(
