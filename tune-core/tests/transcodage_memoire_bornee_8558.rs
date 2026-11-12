@@ -150,9 +150,7 @@ fn transcodage_fichier_192_24_vers_96_ne_recopie_pas_la_piste_8558() {
     );
 
     let rapport = pic as f64 / piste_i32 as f64;
-    eprintln!(
-        "#8558 pic={pic} o | piste i32 à 192 kHz={piste_i32} o | rapport={rapport:.2}"
-    );
+    eprintln!("#8558 pic={pic} o | piste i32 à 192 kHz={piste_i32} o | rapport={rapport:.2}");
     // Avant #8558 : décodage par doublements, copie de canaux, `f32`, pré-roll,
     // sortie `f32`, sortie `i32`, puis l'encodeur — plus de 4 fois la piste.
     // Après : la piste décodée, sa sortie à 96 kHz, ses octets, l'encodeur
