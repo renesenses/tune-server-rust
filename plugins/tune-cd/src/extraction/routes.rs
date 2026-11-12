@@ -192,6 +192,9 @@ fn etat_des_reglages(ex: &Extractions) -> Value {
         "destination": destination,
         "destination_source": source,
         "emplacements": destination::emplacements(ex.backend.as_ref()),
+        // #8522 — en échantillons stéréo, pour la vérification AccurateRip.
+        "decalage_lecteur": crate::accuraterip_base::decalage_regle(ex.backend.clone()),
+        "decalage_max": crate::accuraterip_base::DECALAGE_MAX,
     })
 }
 
@@ -205,6 +208,8 @@ struct DemandeReglages {
     format: Option<String>,
     /// `""` revient au défaut (le premier emplacement).
     destination: Option<String>,
+    /// #8522 — le décalage du lecteur, `±DECALAGE_MAX` échantillons.
+    decalage_lecteur: Option<i32>,
 }
 
 async fn regler(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
@@ -219,6 +224,18 @@ async fn regler(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
             return reponse(format_refuse(f));
         };
         if let Err(m) = repo.set(CLE_FORMAT, f.extension()) {
+            return reponse((StatusCode::INTERNAL_SERVER_ERROR, "reglage", m));
+        }
+    }
+    if let Some(o) = d.decalage_lecteur {
+        let max = crate::accuraterip_base::DECALAGE_MAX;
+        if !(-max..=max).contains(&o) {
+            return reponse(mauvaise(
+                "decalage_invalide",
+                format!("Le décalage du lecteur va de -{max} à +{max} échantillons."),
+            ));
+        }
+        if let Err(m) = repo.set(crate::accuraterip_base::CLE_DECALAGE, &o.to_string()) {
             return reponse((StatusCode::INTERNAL_SERVER_ERROR, "reglage", m));
         }
     }
@@ -560,6 +577,8 @@ async fn preparer(
             piste_id: mb.and_then(|m| m.piste_id.clone()),
             artiste_ids: mb_ids(mb.map(|m| m.artiste_ids.as_slice()).unwrap_or(&[])),
             artiste_album_ids: mb_ids(&[]),
+            accuraterip: None,
+            accuraterip_disque: None,
         };
         pistes_etat.push(EtatPiste {
             numero: n,
@@ -572,6 +591,7 @@ async fn preparer(
             secteurs_illisibles: 0,
             accuraterip_v1: None,
             accuraterip_v2: None,
+            verification: None,
             fichier: None,
             erreur: None,
         });
@@ -583,6 +603,7 @@ async fn preparer(
             balises,
             premiere_audio: Some(n) == premiere,
             derniere_audio: Some(n) == derniere,
+            index_ar: audio.iter().position(|a| *a == n).unwrap_or(0),
         });
     }
     if !d.ecraser {
@@ -622,6 +643,29 @@ async fn preparer(
         ));
     }
     let verification = d.verification.unwrap_or_default();
+    // #8522 — la vérification AccurateRip : le décalage détecté sur le
+    // disque en mémoire s'il l'a été, sinon le réglage. La base est
+    // consultée par le déroulé, pas ici : la réponse 202 n'attend pas.
+    let identifiant = crate::accuraterip_base::IdentifiantAr::depuis_toc(&toc);
+    let (decalage, decalage_detecte) = memoire
+        .as_ref()
+        .and_then(|c| c.progression().verification_accuraterip)
+        .filter(|v| v.decalage_detecte && v.base == "trouvee")
+        .map(|v| (v.decalage, true))
+        .unwrap_or_else(|| {
+            (
+                crate::accuraterip_base::decalage_regle(e.ex.backend.clone()),
+                false,
+            )
+        });
+    let plan_ar = crate::accuraterip_base::VerificationAr {
+        identifiant: identifiant.nom(),
+        base: "en_cours",
+        decalage,
+        decalage_detecte,
+        pistes: Vec::new(),
+    };
+    let audio_debut = toc.pistes_audio().next().map(|p| p.debut).unwrap_or(0);
     let mut etat = EtatTravail {
         id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
         statut: StatutTravail::EnCours,
@@ -651,6 +695,7 @@ async fn preparer(
         debut: maintenant(),
         fin: None,
         erreur: None,
+        accuraterip: Some(plan_ar),
         scan: None,
     };
     etat.recalculer();
@@ -663,6 +708,13 @@ async fn preparer(
         dossier,
         pistes: pistes_plan,
         pochette: None,
+        ar: Some(super::travail::PlanAr {
+            identifiant,
+            base: crate::accuraterip_base::Base::Injoignable("pas encore consultée".into()),
+            decalage,
+            decalage_detecte,
+            audio: (audio_debut, toc.fin_audio().1),
+        }),
     };
     let pochette = infos.and_then(|i| i.pochette);
     Ok((Arc::new(Travail::new(etat)), plan, pochette))
@@ -685,6 +737,17 @@ pub(crate) async fn derouler(
 ) {
     if let Some(url) = pochette {
         plan.pochette = ex.pochettes.telecharger(&url).await;
+    }
+    // #8522 — un seul appel à la base par disque ; injoignable : les pistes
+    // seront « non vérifiées », l'extraction continue.
+    if let Some(a) = plan.ar.as_mut() {
+        a.base = ex.base_ar.consulter(&a.identifiant).await;
+        let etat_base = a.base.etat();
+        travail.modifier(|e| {
+            if let Some(v) = e.accuraterip.as_mut() {
+                v.base = etat_base;
+            }
+        });
     }
     let (ex2, t2) = (ex.clone(), travail.clone());
     let resultat = tokio::task::spawn_blocking(move || {
