@@ -250,10 +250,12 @@ fn le_bras_asio_monte_l_etage_a_l_unite_et_les_rappels_rendent_le_volume() {
             .unwrap_or_default(),
     );
     assert_eq!(
-        rappels.matches("native_ring.pop_mapped_au_gain(").count(),
+        rappels.matches("native_ring.pop_mapped_au_gain(").count()
+            + rappels.matches("dop_au_rendu_7704::rendre_natif(").count(),
         3,
         "#7934 : les rappels natifs I32, I24 et I16 passent par le gain au rendu"
     );
+    assert!(include_str!("../dop_au_rendu_7704.rs").contains("ring.pop_mapped_au_gain("));
     assert!(
         !rappels.contains("native_ring.pop(") && !rappels.contains("native_ring.pop_mapped("),
         "#7934 : un rappel natif ASIO recopie encore l'anneau sans gain"

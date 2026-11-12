@@ -2708,6 +2708,10 @@ impl NativePcmRing {
         self.pop_mapped(out, |sample| sample)
     }
 
+    pub(crate) fn starvation(&self) -> Arc<RingStarvation> {
+        self.starvation.clone()
+    }
+
     /// #7704 — le prochain mot à tirer, SANS le consommer (consommateur seul).
     pub(crate) fn premier_en_attente(&self) -> Option<i32> {
         let w = self.write.load(Ordering::Acquire);
@@ -3973,6 +3977,7 @@ where
     T: Copy,
     f32: symphonia::core::audio::conv::IntoSample<T>,
 {
+    use crate::audio::dop_continu::{haut_f32, repos_f32};
     use symphonia::core::audio::conv::IntoSample;
     // Rampe anti-« ploc » (#1590). Ce chemin sert les DAC qui refusent le
     // flottant : la rampe y est armée par la même porte, donc toujours
@@ -3980,19 +3985,50 @@ where
     ramp.arm(armed_ms);
     let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
     if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-        periode_muette(ring, output, zero);
+        ramp.dop
+            .combler(output, zero, |m| repos_f32(m).into_sample());
+        ring.starvation().record_silent_period(output.len());
         return 0;
     }
     if !data_started.load(Ordering::Acquire) {
         if ring.available() < min_buffer_samples {
-            periode_muette(ring, output, zero);
+            ramp.dop
+                .combler(output, zero, |m| repos_f32(m).into_sample());
+            ring.starvation().record_silent_period(output.len());
             return 0;
         }
         data_started.store(true, Ordering::Release);
     }
+    let ch = ramp.dop.canaux();
+    let mut debut = 0;
+    if ramp.dop.actif()
+        && output.len() >= ch
+        && ring.premier_en_attente().map(haut_f32) == ramp.dop.dernier_marqueur()
+    {
+        ramp.dop
+            .combler(&mut output[..ch], zero, |m| repos_f32(m).into_sample());
+        debut = ch;
+    }
+    let mut dop = std::mem::replace(
+        &mut ramp.dop,
+        crate::audio::dop_continu::SuiviDoP::new(ch as u16),
+    );
     let v = volume.load(Ordering::Relaxed) as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
-    let read = ramp.apply_mapped(v, |s| s.into_sample(), |map| ring.pop_mapped(output, map));
-    output[read..].fill(zero);
+    ring.starvation().record_silent_period(debut);
+    let read = ramp.apply_mapped(
+        v,
+        |s| s.into_sample(),
+        |map| {
+            ring.pop_mapped(&mut output[debut..], |s| {
+                dop.observer_marqueur(haut_f32(s));
+                map(s)
+            })
+        },
+    );
+    dop.combler(&mut output[debut + read..], zero, |m| {
+        repos_f32(m).into_sample()
+    });
+    ramp.dop = dop;
     read
 }
 

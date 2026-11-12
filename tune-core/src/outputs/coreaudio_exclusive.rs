@@ -71,6 +71,8 @@ pub struct ExclusiveOutput {
     /// Kept alive for the render callback closure.
     #[allow(dead_code)]
     paused: Arc<AtomicBool>,
+    silence: Arc<super::silence_avant_liberation_6133::SilenceAvantLiberation>,
+    started: bool,
 }
 
 /// Information about the currently-configured exclusive format.
@@ -536,6 +538,10 @@ impl ExclusiveOutput {
         let ring_for_callback = ring.clone();
         let vol_for_callback = volume.clone();
         let paused_for_callback = paused.clone();
+        let silence =
+            Arc::new(super::silence_avant_liberation_6133::SilenceAvantLiberation::default());
+        let silence_callback = silence.clone();
+        let mut dop = crate::audio::dop_continu::SuiviDoP::new(channels as u16);
 
         if let Err(error) = audio_unit.set_render_callback(
             move |args: render_callback::Args<render_callback::data::Interleaved<f32>>| {
@@ -545,29 +551,18 @@ impl ExclusiveOutput {
                     ..
                 } = args;
 
-                if paused_for_callback.load(Ordering::Relaxed) {
-                    for sample in data.buffer.iter_mut() {
-                        *sample = 0.0;
-                    }
-                    return Ok(());
-                }
-
-                let buffer = data.buffer;
-                let read = ring_for_callback.pop(buffer);
-
-                // Apply volume — #7968 : le volume partagé est rangé en
-                // `UNITE_DU_GAIN_DE_RENDU` (millionièmes), plus en millièmes.
                 let v = crate::audio::volume_scale::gain_des_unites(
                     vol_for_callback.load(Ordering::Relaxed),
-                ) as f32;
-                for sample in &mut buffer[..read] {
-                    *sample *= v;
-                }
-
-                // Silence for any remaining samples
-                for sample in &mut buffer[read..] {
-                    *sample = 0.0;
-                }
+                );
+                super::dop_au_rendu_7704::rendre_flottant(
+                    &ring_for_callback,
+                    data.buffer,
+                    v,
+                    &mut dop,
+                    silence_callback.doit_se_taire(paused_for_callback.load(Ordering::Relaxed)),
+                    0.0,
+                    |s, g| (f64::from(s) * g) as f32,
+                );
 
                 Ok(())
             },
@@ -586,6 +581,8 @@ impl ExclusiveOutput {
             ring,
             volume,
             paused,
+            silence,
+            started: false,
         })
     }
 
@@ -638,6 +635,7 @@ impl ExclusiveOutput {
     /// cadence et son hog, comme `rollback_exclusive_setup` le faisait en
     /// ligne. Le message d'erreur est celui d'avant, mot pour mot.
     pub fn start(&mut self) -> Result<(), String> {
+        self.started = false;
         let Some(audio_unit) = self.audio_unit.as_mut() else {
             return Err("Failed to start AudioUnit: AudioUnit already released".to_string());
         };
@@ -645,6 +643,8 @@ impl ExclusiveOutput {
             self.audio_unit = None;
             return Err(format!("Failed to start AudioUnit: {error}"));
         }
+
+        self.started = true;
 
         info!(
             device = %self.format_info.device_name,
@@ -656,8 +656,40 @@ impl ExclusiveOutput {
         Ok(())
     }
 
-    /// Release exclusive mode and restore the device to its original state.
+    /// L'état du HAL, relu sur le producteur à la libération. Une lecture
+    /// indisponible conserve l'attente bornée ; un arrêt ou une erreur de rendu
+    /// explicitement rapportés l'annulent.
+    fn rendu_actif(&self) -> bool {
+        let Some(au) = self.audio_unit.as_ref() else {
+            return false;
+        };
+        // AudioUnitProperties.h, propriétés UInt32 / OSStatus, scope global.
+        // https://developer.apple.com/documentation/audiotoolbox/kaudiooutputunitproperty_isrunning
+        const IS_RUNNING: u32 = 2001;
+        // https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_lastrendererror
+        const LAST_RENDER_ERROR: u32 = 22;
+        let actif = au.get_property::<u32>(IS_RUNNING, Scope::Global, Element::Output);
+        let erreur = au.get_property::<i32>(LAST_RENDER_ERROR, Scope::Global, Element::Output);
+        !matches!(actif, Ok(0)) && !matches!(erreur, Ok(code) if code != 0)
+    }
+
+    /// Rend le bail sur le fil producteur de `local::play_url` (std::thread),
+    /// via `BackendCoreAudio`/Drop. Ni le rappel audio ni une tâche async
+    /// ne possèdent cette sortie. L'attente peut atteindre 600 ms si le HAL
+    /// annonce encore une unité active mais ne rappelle plus.
     pub fn release(&mut self) -> Result<(), String> {
+        let silence = self.silence.clone();
+        if self.started {
+            silence.taire_puis_liberer_tant_que(
+                super::silence_avant_liberation_6133::BORNE_SILENCE_AVANT_LIBERATION,
+                || {
+                    self.started = self.started && self.rendu_actif();
+                    self.started
+                },
+                || {},
+            );
+            self.started = false;
+        }
         // Stop and drop the AudioUnit first
         if let Some(mut au) = self.audio_unit.take() {
             if let Err(e) = au.stop() {

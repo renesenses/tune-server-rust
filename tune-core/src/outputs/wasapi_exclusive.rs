@@ -685,6 +685,8 @@ pub struct WasapiExclusiveOutput {
     channels: u32,
     ring: Arc<NativePcmRing>,
     paused: Arc<AtomicBool>,
+    #[cfg(target_os = "windows")]
+    silence: Arc<super::silence_avant_liberation_6133::SilenceAvantLiberation>,
     /// #7264 — le volume effectif de la zone, appliqué par le fil de rendu
     /// aux mots tirés de l'anneau (`pop_pcm_bytes_au_gain`). `None` : rendu
     /// à l'unité, identique au bit près à la sérialisation seule.
@@ -1138,6 +1140,7 @@ impl WasapiExclusiveOutput {
                 ring,
                 paused,
                 volume_au_rendu: None,
+                silence: Arc::new(Default::default()),
                 audio_client,
                 render_client,
                 event_handle: event,
@@ -1182,6 +1185,8 @@ impl WasapiExclusiveOutput {
             self.channels,
         );
 
+        let mut dop = crate::audio::dop_continu::SuiviDoP::new(self.channels as u16);
+
         // Exclusive event-driven rendering uses two endpoint buffers. Prime
         // the first one completely before Start so the driver never begins on
         // an unowned/uninitialised buffer. The producer may not have reached
@@ -1203,13 +1208,15 @@ impl WasapiExclusiveOutput {
             let buffer_bytes =
                 (self.buffer_frame_count * self.channels * (self.bit_depth / 8)) as usize;
             let out = std::slice::from_raw_parts_mut(buf, buffer_bytes);
-            let written = if self.paused.load(Ordering::Relaxed) {
-                0
-            } else {
-                self.ring
-                    .pop_pcm_bytes_au_gain(out, self.bit_depth as u16, &mut gain)
-            };
-            out[written..].fill(0);
+            super::dop_au_rendu_7704::rendre_octets(
+                &self.ring,
+                out,
+                self.bit_depth as u16,
+                &mut gain,
+                &mut dop,
+                self.silence
+                    .doit_se_taire(self.paused.load(Ordering::Relaxed)),
+            );
 
             let release_buffer: ReleaseBufferFn = std::mem::transmute(*vtable.add(4));
             let hr = release_buffer(self.render_client, self.buffer_frame_count, 0);
@@ -1234,6 +1241,7 @@ impl WasapiExclusiveOutput {
 
         let ring = self.ring.clone();
         let paused = self.paused.clone();
+        let silence = self.silence.clone();
         let running = self.running.clone();
         let render_client = self.render_client as usize; // Send as usize (pointer)
         let event_handle = self.event_handle as usize;
@@ -1349,37 +1357,6 @@ impl WasapiExclusiveOutput {
                     }
                 }
 
-                if paused.load(Ordering::SeqCst) {
-                    unsafe {
-                        let mut buf: *mut u8 = std::ptr::null_mut();
-                        type GetBufferFn = unsafe extern "system" fn(
-                            *mut std::ffi::c_void,
-                            u32,
-                            *mut *mut u8,
-                        )
-                            -> i32;
-                        let vtable = *(render_client as *const *const *const std::ffi::c_void);
-                        let get_buf: GetBufferFn = std::mem::transmute(*vtable.add(3));
-                        let hr = get_buf(render_client, buffer_frame_count, &mut buf);
-                        if hr == S_OK_LOCAL {
-                            std::ptr::write_bytes(
-                                buf,
-                                0,
-                                (buffer_frame_count * frame_bytes) as usize,
-                            );
-                            type RelBufFn =
-                                unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> i32;
-                            let rel_buf: RelBufFn = std::mem::transmute(*vtable.add(4));
-                            if rel_buf(render_client, buffer_frame_count, 0) != S_OK_LOCAL {
-                                callback_errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                        } else {
-                            callback_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    continue;
-                }
-
                 unsafe {
                     let mut buf: *mut u8 = std::ptr::null_mut();
                     type GetBufferFn =
@@ -1402,11 +1379,16 @@ impl WasapiExclusiveOutput {
                         buf,
                         (buffer_frame_count * frame_bytes) as usize,
                     );
-                    let written = ring.pop_pcm_bytes_au_gain(out_slice, bit_depth, &mut gain);
-                    if written < out_slice.len() {
+                    if super::dop_au_rendu_7704::rendre_octets(
+                        &ring,
+                        out_slice,
+                        bit_depth,
+                        &mut gain,
+                        &mut dop,
+                        silence.doit_se_taire(paused.load(Ordering::SeqCst)),
+                    ) {
                         underruns.fetch_add(1, Ordering::Relaxed);
                     }
-                    out_slice[written..].fill(0);
 
                     type RelBufFn =
                         unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> i32;
@@ -1451,6 +1433,12 @@ impl WasapiExclusiveOutput {
     pub fn stop(&mut self) {
         if self.resources_released {
             return;
+        }
+        if self.running.load(Ordering::SeqCst) {
+            self.silence.taire_puis_liberer(
+                super::silence_avant_liberation_6133::BORNE_SILENCE_AVANT_LIBERATION,
+                || {},
+            );
         }
         let was_running = self.running.swap(false, Ordering::SeqCst);
 
