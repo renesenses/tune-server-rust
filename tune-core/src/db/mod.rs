@@ -29,6 +29,8 @@ pub mod engine;
 /// #7983 — la trace des tentatives de la passe d'enrichissement des métadonnées.
 pub mod enrich_tentatives;
 pub mod facet_filter;
+/// #8325 — chef, ensemble, œuvre : facettes et colonnes de la Collection.
+pub mod facettes_classiques;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
 /// #5314 — le genre posé sur un album vaut pour ses pistes.
@@ -69,6 +71,7 @@ mod pg_sqlite_type_parity;
 /// #7695 — les photos et vidéos indexées comme pistes par l'UPnP, retirées.
 pub mod photos_indexees_upnp_7695;
 pub mod play_queue_repo;
+pub mod playlist_radio_8135;
 pub mod playlist_repo;
 pub mod playlists_reconcile;
 /// Contrôle parental, étape 1 (#7856) : politique d'un profil supervisé.
@@ -98,8 +101,12 @@ pub mod settings_repo;
 pub mod source_link_repo;
 /// Les sources réseau lues sans montage (#8189).
 pub mod sources_reseau;
+/// #8160 — la trace datée du spectrogramme conservé d'une piste.
+pub mod spectrogrammes;
 pub mod sqlite;
 pub mod streaming_favorites_repo;
+/// « Pas pour moi » — suggestions d'accueil écartées, par profil (web#916).
+pub mod suggestions_ecartees;
 pub mod tag_repo;
 /// Registre des executions automatisees (#2080).
 pub mod task_run_repo;
@@ -115,6 +122,8 @@ pub mod zone_repo;
 
 #[cfg(test)]
 mod album_dr_provenance_tests;
+#[cfg(test)]
+mod consentements_redemarrage_8521_tests;
 #[cfg(test)]
 mod ecrivains_pendant_un_lot_de_scan_tests;
 #[cfg(test)]

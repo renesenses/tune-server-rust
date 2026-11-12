@@ -449,6 +449,35 @@ fn build_facet_conditions(
         conds.push(c);
         params.extend(p);
     }
+    // #8325 — chef, ensemble, œuvre : facettes à part entière (elles ne se
+    // filtrent pas elles-mêmes), lues dans les magasins ouverts.
+    for (valeurs, champ) in [
+        (
+            &sel.conductors,
+            tune_core::db::facettes_classiques::Champ::Chef,
+        ),
+        (
+            &sel.ensembles,
+            tune_core::db::facettes_classiques::Champ::Ensemble,
+        ),
+        (
+            &sel.works,
+            tune_core::db::facettes_classiques::Champ::Oeuvre,
+        ),
+    ] {
+        if exclude == champ.nom() {
+            continue;
+        }
+        if let Some((c, p)) = combiner(
+            &mut ph,
+            valeurs,
+            sel.est_en_et(champ.nom()),
+            tune_core::db::facettes_classiques::bloc(engine, champ),
+        ) {
+            conds.push(c);
+            params.extend(p);
+        }
+    }
     if exclude != "artist" {
         // `tracks` has no artist_name column (artist is a FK to `artists`), and
         // these conditions run against `FROM tracks t` with no join, so resolve
@@ -467,7 +496,9 @@ fn build_facet_conditions(
         (&sel.moods, "mood", "mood", "mood"),
         (&sel.source_medias, "source_media", "source", "source_media"),
     ] {
-        if exclude == own {
+        // #8090 — `country_albums` est la facette « pays d'édition » comptée
+        // en albums : elle ne se filtre pas elle-même non plus.
+        if exclude == own || (own == "country" && exclude == "country_albums") {
             continue;
         }
         if let Some((c, p)) = combiner(&mut ph, values, sel.est_en_et(param), bloc_metadonnee(key))
@@ -475,6 +506,15 @@ fn build_facet_conditions(
             conds.push(c);
             params.extend(p);
         }
+    }
+    // #8090 — pays de l'artiste principal de l'album. Ne se filtre pas
+    // lui-même.
+    if exclude != "artist_country"
+        && let Some((c, p)) =
+            tune_core::db::facet_filter::bloc_pays_artiste(&mut ph, &sel.artist_countries)
+    {
+        conds.push(c);
+        params.extend(p);
     }
     // Folder selection (Oxygen drill-down) narrows every facet's counts. The
     // folder-facet endpoint scopes by path prefix on its own, so it passes
@@ -785,6 +825,11 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 "sample_rate" => column_facet(state, "sample_rate", limit, conds, params),
                 "bit_depth" => column_facet(state, "bit_depth", limit, conds, params),
                 "country" => kv_facet(state, "release_country", limit, conds, params),
+                // #8090 — la carte et le filtre Pays, comptés en ALBUMS : le
+                // pays de l'artiste principal (MusicBrainz) et le pays
+                // d'édition. Absents du jeu par défaut : un client les demande.
+                "artist_country" => artist_country_facet(state, limit, conds, params),
+                "country_albums" => kv_album_facet(state, "release_country", limit, conds, params),
                 "mood" => kv_facet(state, "mood", limit, conds, params),
                 "source" => kv_facet(state, "source_media", limit, conds, params),
                 "rating" => rating_facet(state, q.sel.profile_id, limit, conds, params),
@@ -800,6 +845,12 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 // tant que les crédits ne sont pas là, un client la demande
                 // explicitement (`fields=…,instrument`).
                 "instrument" => instrument_facet(state, engine, limit, conds, params),
+                // #8325 — chef, ensemble, œuvre. Comme `instrument`, hors du jeu
+                // par défaut : vides sur une bibliothèque sans classique, un
+                // client les demande explicitement (`fields=…,conductor`).
+                f @ ("conductor" | "ensemble" | "work") => {
+                    classique_facet(state, f, limit, conds, params)
+                }
                 "favorite" => favorite_facet(state, q.sel.profile_id, conds, params),
                 "playlist" => playlist_facet(state, limit, conds, params),
                 "untagged" => untagged_facet(state, conds, params),
@@ -818,7 +869,10 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
             // `COUNT(DISTINCT track_id)` —, la différence est donc EXACTE.
             // La facette Collections garde le socle complet : elle compte
             // ailleurs, collection par collection.
-            (Some(liste), f) if f != "collection" => {
+            // #8090 — les facettes comptées en ALBUMS ne s'additionnent pas
+            // sur des pistes disjointes (un album à cheval sur les deux jeux
+            // compterait deux fois) : elles gardent le socle complet.
+            (Some(liste), f) if !COMPTEES_EN_ALBUMS.contains(&f) && f != "collection" => {
                 let (conds, params) = build_conditions(
                     &q,
                     engine,
@@ -868,7 +922,7 @@ pub(super) enum OrdreDeFacette {
 fn ordre_de_la_facette(field: &str) -> OrdreDeFacette {
     match field {
         "original_year" | "dr" | "rating" | "favorite" | "untagged" => OrdreDeFacette::TelQuel,
-        "instrument" => OrdreDeFacette::EffectifPuisValeur,
+        "instrument" | "conductor" | "ensemble" | "work" => OrdreDeFacette::EffectifPuisValeur,
         _ => OrdreDeFacette::Effectif,
     }
 }
@@ -1652,6 +1706,79 @@ fn artist_facet(
         .collect()
 }
 
+/// #8090 — les facettes qui comptent des ALBUMS distincts, pas des pistes.
+const COMPTEES_EN_ALBUMS: &[&str] = &["artist_country", "country_albums"];
+
+/// #8090 — le pays de l'ARTISTE PRINCIPAL de chaque album (`albums.artist_id`,
+/// lu sur MusicBrainz), avec le nombre d'ALBUMS distincts, resserré par les
+/// autres facettes actives. Code ISO en majuscules.
+fn artist_country_facet(
+    state: &AppState,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let extra = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let valide = tune_core::db::facet_filter::PAYS_ARTISTE_VALIDE;
+    let sql = format!(
+        "SELECT UPPER(pa_ar.country) AS pays, COUNT(DISTINCT pa_al.id) AS n FROM tracks t \
+         JOIN albums pa_al ON pa_al.id = t.album_id \
+         JOIN artists pa_ar ON pa_ar.id = pa_al.artist_id \
+         WHERE {valide}{extra} \
+         GROUP BY UPPER(pa_ar.country) ORDER BY n DESC, pays{limit_clause}"
+    );
+    compter_les_lignes(state, &sql, params)
+}
+
+/// #8090 — une métadonnée étendue (`release_country`) comptée en ALBUMS
+/// distincts : un album dont les pistes portent la valeur compte une fois.
+fn kv_album_facet(
+    state: &AppState,
+    key: &str,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let extra = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let sql = format!(
+        "SELECT tm.value, COUNT(DISTINCT t.album_id) AS n FROM track_metadata tm \
+         JOIN tracks t ON tm.track_id = t.id \
+         WHERE tm.key = '{key}' AND tm.value <> '' AND t.album_id IS NOT NULL{extra} \
+         GROUP BY tm.value ORDER BY n DESC, tm.value{limit_clause}"
+    );
+    compter_les_lignes(state, &sql, params)
+}
+
+/// `(valeur, effectif)` de chaque ligne d'une requête de facette.
+fn compter_les_lignes(state: &AppState, sql: &str, params: &[SqlValue]) -> Vec<(String, i64)> {
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(sql, &bound)
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let value = it.next()?.as_string()?;
+            let count = it.next()?.as_i64().unwrap_or(0);
+            Some((value, count))
+        })
+        .collect()
+}
+
 /// Count distinct values of an extended tag in the `track_metadata` k/v store,
 /// optionally narrowed to the tracks matching the active-facet conditions.
 /// La facette « instrument » (CRD-6) : chaque instrument des crédits, avec le
@@ -1696,6 +1823,23 @@ fn instrument_facet(
             Some((value, count))
         })
         .collect()
+}
+
+/// #8325 — chef, ensemble ou œuvre : une entrée par personne ou par œuvre,
+/// comptée en pistes distinctes, tous magasins confondus
+/// ([`tune_core::db::facettes_classiques`]).
+fn classique_facet(
+    state: &AppState,
+    field: &str,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let Some(champ) = tune_core::db::facettes_classiques::Champ::facette(field) else {
+        return Vec::new();
+    };
+    tune_core::db::facettes_classiques::effectifs(&state.backend, champ, conds, params, limit)
+        .ou_defaut_journalise()
 }
 
 fn kv_facet(
@@ -1744,6 +1888,10 @@ mod socle_5977_tests;
 #[cfg(test)]
 #[path = "facettes_et_2108_tests.rs"]
 mod facettes_et_2108_tests;
+
+#[cfg(test)]
+#[path = "facettes_classiques_8325_tests.rs"]
+mod facettes_classiques_8325_tests;
 
 #[cfg(test)]
 mod tests {

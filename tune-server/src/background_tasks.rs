@@ -72,7 +72,9 @@ pub fn tache_suspendable(id: &str) -> Option<Tache> {
         | "credits_enrich_auto"
         | "types_de_sortie"
         | "credits_releases"
-        | "apports_qobuz" => Some(Tache::Enrichissement),
+        | "apports_qobuz"
+        // #8325 — la relecture unique des balises classiques.
+        | "relecture_classique" => Some(Tache::Enrichissement),
         // `album_artwork` : la passe des pochettes d'albums (inscrite sous
         // `artwork` avant l'écran des images, 01/11/2026) ; elle attend son
         // tour sur `Tache::ImagesArtistes`, comme les portraits.

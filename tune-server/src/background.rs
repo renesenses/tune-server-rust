@@ -31,6 +31,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_squeezebox_poller(state);
     // #8077 — la passe de fond des apports Qobuz (15 min après, puis 6 h).
     crate::routes::library::apports_qobuz::armer_la_passe(state);
+    // #8325 — une fois : relire WORK / MOVEMENTNAME / BAND des fichiers
+    // déjà importés, sans scan à lancer par l'utilisateur.
+    crate::routes::library::relecture_classique::armer(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
     spawn_dash_temp_gc();
@@ -149,6 +152,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // déjà identifiées, puis déduction « Nom, Prénom ». Un test de câblage
     // garde la ligne.
     spawn_rattrapage_noms_de_tri(state);
+    spawn_pays_des_artistes(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);
     spawn_social_sharing_listener(state);
@@ -389,6 +393,88 @@ fn spawn_rattrapage_noms_de_tri(state: &AppState) {
                 reglages.set(RATTRAPAGE_NOMS_DE_TRI_FAIT, "1").ok();
                 return;
             }
+            // Une panne MusicBrainz : on laisse le limiteur se calmer.
+            let pause = if bilan.pannes > 0 { 600 } else { 5 };
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
+        }
+    });
+}
+
+/// #8090 — curseur de reprise de la passe « pays des artistes ».
+const PAYS_DES_ARTISTES_CURSEUR: &str = "pays_des_artistes_8090_curseur";
+/// Fiches par tour : au créneau d'une requête par seconde, un peu plus d'une
+/// minute de MusicBrainz, puis la main aux autres passes.
+const PAYS_DES_ARTISTES_PAR_TOUR: usize = 60;
+/// Une fois la liste parcourue, la passe repart de zéro après ce délai : les
+/// MBID résolus depuis par l'enrichissement (ou changés) y sont repris. Sur
+/// une base à jour, un tour ne coûte qu'une requête SQL.
+const PAYS_DES_ARTISTES_RELANCE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// #8090 — le pays de l'ARTISTE, lu sur sa fiche MusicBrainz pour chaque
+/// artiste au MBID résolu (`metadata::pays_des_artistes`). Mêmes gardes que
+/// le rattrapage des noms de tri : droit d'enrichissement automatique, pause
+/// « Enrichissement », limiteur MusicBrainz partagé. Curseur en base : un
+/// arrêt ou une panne reprend où il s'était arrêté.
+fn spawn_pays_des_artistes(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        let backend = state.backend.clone();
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+        loop {
+            if !state
+                .license
+                .check_feature(tune_core::license::Feature::AutoEnrichment)
+                .await
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                continue;
+            }
+            if tune_core::taches_de_fond::est_en_pause(
+                tune_core::taches_de_fond::Tache::Enrichissement,
+            ) {
+                tokio::time::sleep(tune_core::taches_de_fond::CADENCE_RELECTURE_PAUSE).await;
+                continue;
+            }
+            let apres = reglages
+                .get(PAYS_DES_ARTISTES_CURSEUR)
+                .ok()
+                .flatten()
+                .and_then(|c| c.parse::<i64>().ok())
+                .unwrap_or(0);
+            let bilan = match tune_core::metadata::pays_des_artistes::rattraper_les_pays(
+                &backend,
+                apres,
+                PAYS_DES_ARTISTES_PAR_TOUR,
+                tune_core::metadata::noms_de_tri::interroger_la_fiche_musicbrainz,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "pays_des_artistes_echoue");
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                    continue;
+                }
+            };
+            if bilan.traitees > 0 || bilan.pannes > 0 {
+                info!(
+                    traitees = bilan.traitees,
+                    poses = bilan.poses,
+                    sans_pays = bilan.sans_pays,
+                    pannes = bilan.pannes,
+                    fin_de_liste = bilan.fin_de_liste,
+                    "pays_des_artistes_tour"
+                );
+            }
+            if bilan.fin_de_liste {
+                reglages.set(PAYS_DES_ARTISTES_CURSEUR, "0").ok();
+                tokio::time::sleep(PAYS_DES_ARTISTES_RELANCE).await;
+                continue;
+            }
+            reglages
+                .set(PAYS_DES_ARTISTES_CURSEUR, &bilan.dernier_id.to_string())
+                .ok();
             // Une panne MusicBrainz : on laisse le limiteur se calmer.
             let pause = if bilan.pannes > 0 { 600 } else { 5 };
             tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
@@ -1620,10 +1706,14 @@ async fn configure_deezer_proxy(state: &AppState, config: &TuneConfig) {
 }
 
 fn spawn_alarm_scheduler(state: &AppState) {
-    let alarm_sched = Arc::new(tune_core::alarms::AlarmScheduler::with_backend(
-        state.backend.clone(),
-        state.orchestrator.clone(),
-    ));
+    let alarm_sched = Arc::new(
+        tune_core::alarms::AlarmScheduler::with_backend(
+            state.backend.clone(),
+            state.orchestrator.clone(),
+        )
+        // #8135 — une radio de la playlist du réveil : même flux qu'à la main.
+        .avec_le_choix_du_flux_radio(crate::routes::radios::choix_du_flux_de_playlist(state)),
+    );
     alarm_sched.spawn();
     // #8213 — arrêt programmé de la lecture à heure fixe ; avec
     // `action: "poweroff"`, extinction de la machine par la fonction unique

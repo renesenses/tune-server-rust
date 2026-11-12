@@ -601,6 +601,14 @@ mod simulation_reseau {
         verrou.lock().unwrap().retain(|r| r != dir);
         signal.notify_all();
     }
+
+    /// #6717 — racines simulées « réseau » dont le moteur natif entend les
+    /// changements, comme un partage SMB sous Windows.
+    pub(super) static NATIF_ENTEND: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn natif_entend(dir: &Path) -> bool {
+        NATIF_ENTEND.lock().unwrap().iter().any(|r| r == dir)
+    }
 }
 
 fn est_une_racine_reseau(dir: &Path) -> bool {
@@ -609,6 +617,26 @@ fn est_une_racine_reseau(dir: &Path) -> bool {
         return true;
     }
     is_network_path(dir)
+}
+
+/// #6717 — le moteur natif entend-il, sur cette racine réseau, les changements
+/// faits par une autre application ou une autre machine ?
+///
+/// Sous Windows, oui : `ReadDirectoryChangesW` sur un partage SMB (lettre
+/// réseau ou chemin UNC) relaie les notifications de changement que le
+/// serveur envoie (`CHANGE_NOTIFY` de SMB2, que Windows et Samba servent). Une
+/// retouche de balises écrite SUR PLACE (MusicBee, fil 2365) ne change pas la
+/// date du dossier : le passage incrémental de la sonde ne la voit pas, et
+/// seul le passage complet horaire la rattrapait. inotify et FSEvents, eux,
+/// n'entendent rien d'un partage monté : la sonde seule reste la règle hors
+/// Windows.
+fn le_moteur_natif_entend_les_partages(dir: &Path) -> bool {
+    #[cfg(test)]
+    if simulation_reseau::natif_entend(dir) {
+        return true;
+    }
+    let _ = dir;
+    cfg!(windows)
 }
 
 /// Le relevé initial d'une racine réseau, sur son propre fil (voir
@@ -1074,14 +1102,20 @@ impl FileWatcher {
         let repli: Vec<PathBuf> = std::mem::take(&mut *verrou(&self.sondage.repli_natif));
 
         // Retry pending dirs.
-        let a_reprendre: Vec<(PathBuf, bool)> = std::mem::take(&mut self.pending)
+        let mut a_reprendre: Vec<(PathBuf, bool)> = std::mem::take(&mut self.pending)
             .into_iter()
             .map(|d| (d, false))
             .chain(repli.into_iter().map(|d| (d, true)))
             .collect();
+        // #6717 — sous Windows, une racine réseau perdue revient en attente
+        // deux fois (moteur natif ET sonde) : une seule reprise.
+        let mut deja = HashSet::new();
+        a_reprendre.retain(|(d, natif)| deja.insert((d.clone(), *natif)));
         for (dir, natif_impose) in a_reprendre {
             if std::fs::read_dir(&dir).is_err() {
-                self.pending.push(dir);
+                if !self.pending.contains(&dir) {
+                    self.pending.push(dir);
+                }
                 continue;
             }
             if !natif_impose && est_une_racine_reseau(&dir) {
@@ -1089,13 +1123,37 @@ impl FileWatcher {
                 // machines on an SMB/NFS share — poll instead. Le relevé
                 // initial de la sonde part sur son propre fil (fil 2148) :
                 // il ne retient ni la création du surveillant ni sa boucle.
+                let deja_sondee = verrou(&self.sondage.pretes).iter().any(|(d, _)| d == &dir);
                 let mut en_amorce = verrou(&self.sondage.en_amorce);
-                if !en_amorce.contains(&dir) {
+                if !deja_sondee && !en_amorce.contains(&dir) {
                     en_amorce.push(dir.clone());
                     drop(en_amorce);
                     info!(dir = %dir.display(), "watching_directory_poll_amorce — network mount, baseline walk in background");
-                    amorcer_la_sonde(self.sondage.clone(), self.event_tx.clone(), dir);
+                    amorcer_la_sonde(self.sondage.clone(), self.event_tx.clone(), dir.clone());
                 }
+                // #6717 — là où le moteur natif entend le partage (Windows),
+                // il s'ajoute à la sonde : une retouche sur place arrive tout
+                // de suite au lieu d'attendre le passage complet horaire. La
+                // sonde reste le filet (notification perdue, serveur muet).
+                if !le_moteur_natif_entend_les_partages(&dir) || self.dirs.contains(&dir) {
+                    continue;
+                }
+                if let Some(w) = self.watcher.as_mut() {
+                    match w.watch(&dir, RecursiveMode::Recursive) {
+                        Ok(()) => {
+                            info!(dir = %dir.display(), "watching_directory_native_on_network_share");
+                            self.dirs.push(dir);
+                        }
+                        Err(e) => {
+                            // La sonde suit déjà cette racine : rien à remettre
+                            // en attente.
+                            warn!(dir = %dir.display(), error = %e, "watch_network_share_native_failed — polling only");
+                        }
+                    }
+                }
+                continue;
+            }
+            if self.dirs.contains(&dir) {
                 continue;
             }
             if let Some(w) = self.watcher.as_mut() {
@@ -1876,6 +1934,166 @@ mod tests {
             watcher.racines_sondees().is_empty(),
             "une sonde finie après l'arrêt ne doit pas se poser"
         );
+    }
+
+    /// #6717 (fil 2365) — une retouche de balises écrite SUR PLACE dans un
+    /// album d'une racine réseau (MusicBee sous Windows) ne change pas la date
+    /// du dossier : le passage incrémental de la sonde ne la voit pas, et seul
+    /// le passage complet horaire la rattrapait. Là où le moteur natif entend
+    /// le partage (Windows), il suit aussi la racine : la retouche arrive en
+    /// secondes, sans attendre la sonde (dont le délai minimal est d'une
+    /// minute).
+    #[test]
+    fn une_retouche_sur_place_sur_un_partage_arrive_sans_attendre_la_sonde_6717() {
+        let racine = crate::test_scratch::scratch_dir("watcher-retouche-partage-6717");
+        let reseau = racine.join("partage");
+        let album = reseau.join("Debussy").join("Pelleas");
+        fs::create_dir_all(&album).unwrap();
+        let piste = album.join("01.flac");
+        fs::write(&piste, b"fLaC avant la retouche").unwrap();
+        simulation_reseau::RACINES
+            .lock()
+            .unwrap()
+            .push(reseau.clone());
+        simulation_reseau::NATIF_ENTEND
+            .lock()
+            .unwrap()
+            .push(reseau.clone());
+
+        let mut watcher = FileWatcher::new(vec![reseau.to_string_lossy().to_string()])
+            .expect("le surveillant se crée");
+        let limite = std::time::Instant::now() + Duration::from_secs(20);
+        while !watcher.racines_sondees().contains(&reseau) {
+            assert!(
+                std::time::Instant::now() < limite,
+                "la sonde de la racine réseau n'est jamais entrée en service"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            watcher.dirs.contains(&reseau),
+            "🔴 #6717 — la racine réseau n'est suivie que par la sonde : une \
+             retouche sur place attend le passage complet horaire ({:?})",
+            watcher.dirs
+        );
+        // Un second passage ne double ni la sonde ni le suivi natif.
+        watcher.ensure_watches();
+        assert_eq!(watcher.dirs.iter().filter(|d| **d == reseau).count(), 1);
+        assert_eq!(
+            watcher
+                .racines_sondees()
+                .iter()
+                .filter(|d| **d == reseau)
+                .count(),
+            1
+        );
+        // Vider ce que la création a pu laisser.
+        let _ = watcher.poll_changes(Duration::from_millis(300));
+
+        // Témoin : le moteur natif de CETTE machine rend-il des événements ?
+        // Sur une machine de compilation partagée, il peut être sourd (même
+        // une racine locale n'y reçoit rien) ; `watcher_lifecycle` le tolère
+        // déjà. Sourd, la preuve s'arrête au suivi natif posé ci-dessus.
+        let entend = {
+            let temoin = crate::test_scratch::scratch_dir("watcher-temoin-natif-6717");
+            let mut w = FileWatcher::new(vec![temoin.to_string_lossy().to_string()])
+                .expect("le surveillant témoin se crée");
+            std::thread::sleep(Duration::from_millis(200));
+            fs::write(temoin.join("temoin.flac"), b"x").unwrap();
+            let recu = !w.poll_changes(Duration::from_secs(3)).is_empty();
+            w.stop();
+            recu
+        };
+        if !entend {
+            eprintln!("#6717 : moteur natif sourd sur cette machine, preuve par événement sautée");
+            watcher.stop();
+            return;
+        }
+
+        let date_du_dossier = fs::metadata(&album).unwrap().modified().unwrap();
+        {
+            let mut f = fs::OpenOptions::new().write(true).open(&piste).unwrap();
+            f.write_all(b"fLaC apres la retouche").unwrap();
+            f.sync_all().unwrap();
+        }
+        assert_eq!(
+            fs::metadata(&album).unwrap().modified().unwrap(),
+            date_du_dossier,
+            "prémisse : une écriture sur place ne change pas la date du dossier"
+        );
+
+        // `ends_with` : FSEvents rend `/private/var/…` pour `/var/…`.
+        let limite = std::time::Instant::now() + Duration::from_secs(10);
+        let mut vue = false;
+        while !vue && std::time::Instant::now() < limite {
+            vue = watcher
+                .poll_changes(Duration::from_millis(500))
+                .iter()
+                .any(|c| {
+                    c.path.ends_with("Pelleas/01.flac") && c.change_type == ChangeType::Modified
+                });
+        }
+        watcher.stop();
+        assert!(
+            vue,
+            "🔴 #6717 — la retouche sur place d'une piste d'un partage n'est \
+             signalée par personne avant le passage complet horaire de la sonde"
+        );
+    }
+
+    /// #6717 — une racine réseau suivie à la fois par la sonde et par le
+    /// moteur natif, perdue puis revenue, ne reprend qu'UNE sonde et UN suivi
+    /// natif (les deux listes la remettent en attente).
+    #[test]
+    fn un_partage_perdu_puis_revenu_ne_double_ni_la_sonde_ni_le_natif_6717() {
+        let racine = crate::test_scratch::scratch_dir("watcher-partage-revenu-6717");
+        let reseau = racine.join("partage");
+        let ailleurs = racine.join("parti");
+        fs::create_dir_all(&reseau).unwrap();
+        fs::write(reseau.join("01.flac"), b"x").unwrap();
+        simulation_reseau::RACINES
+            .lock()
+            .unwrap()
+            .push(reseau.clone());
+        simulation_reseau::NATIF_ENTEND
+            .lock()
+            .unwrap()
+            .push(reseau.clone());
+        let mut watcher = FileWatcher::new(vec![reseau.to_string_lossy().to_string()])
+            .expect("le surveillant se crée");
+        let attendre_la_sonde = |w: &FileWatcher| {
+            let limite = std::time::Instant::now() + Duration::from_secs(20);
+            while !w.racines_sondees().contains(&reseau) {
+                assert!(
+                    std::time::Instant::now() < limite,
+                    "sonde jamais en service"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        attendre_la_sonde(&watcher);
+        assert!(watcher.dirs.contains(&reseau));
+
+        fs::rename(&reseau, &ailleurs).unwrap();
+        watcher.ensure_watches();
+        assert!(!watcher.dirs.contains(&reseau));
+        assert!(watcher.racines_sondees().is_empty());
+
+        fs::rename(&ailleurs, &reseau).unwrap();
+        watcher.ensure_watches();
+        attendre_la_sonde(&watcher);
+        // Une reprise de plus, le relevé déjà fini : rien ne se double.
+        watcher.ensure_watches();
+        std::thread::sleep(Duration::from_millis(500));
+        let sondes = watcher
+            .racines_sondees()
+            .iter()
+            .filter(|d| **d == reseau)
+            .count();
+        let natifs = watcher.dirs.iter().filter(|d| **d == reseau).count();
+        let en_attente = watcher.pending.iter().filter(|d| **d == reseau).count();
+        watcher.stop();
+        assert_eq!((sondes, natifs, en_attente), (1, 1, 0));
     }
 
     /// #5168 — un `foo_dr.txt` posé ou réécrit dans un dossier d'album doit

@@ -516,6 +516,16 @@ pub(crate) fn build_smart_query_rapport(
                 refusees.push(format!("{field} {op}"));
             }
             c
+        } else if let Some(r) = regles_sql::condition_classique(field, op, value_raw) {
+            // #8325 — chef, ensemble, œuvre : crédits, balises, fiche d'album.
+            match r {
+                Some((c, false)) => c,
+                Some((c, true)) => format!("NOT {c}"),
+                None => {
+                    refusees.push(format!("{field} {op}"));
+                    regles_sql::FAUX.to_string()
+                }
+            }
         } else if field == "play_count" {
             // 🔴 #7769 — le compte de la Bibliothèque (titre + interprète),
             // pas `listen_history.track_id`, toujours NULL : « = 0 » rendait

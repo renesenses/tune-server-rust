@@ -3033,6 +3033,27 @@ impl TrackRepo {
             owned_params.extend(p);
         }
 
+        // #8325 — chef, ensemble, œuvre : les magasins ouverts, pas une
+        // colonne ; le prédicat jumeau du rail vit dans `facettes_classiques`.
+        for (valeurs, champ) in [
+            (&f.conductors, crate::db::facettes_classiques::Champ::Chef),
+            (
+                &f.ensembles,
+                crate::db::facettes_classiques::Champ::Ensemble,
+            ),
+            (&f.works, crate::db::facettes_classiques::Champ::Oeuvre),
+        ] {
+            if let Some((c, p)) = combiner(
+                ph,
+                valeurs,
+                f.est_en_et(champ.nom()),
+                crate::db::facettes_classiques::bloc(engine, champ),
+            ) {
+                conditions.push(c);
+                owned_params.extend(p);
+            }
+        }
+
         // The artist name lives on the joined `artists` table (tracks stores
         // only artist_id) — `tracks` has no artist_name column, so the old
         // `t.artist_name` predicate raised a SQL error that list_tracks
@@ -3057,6 +3078,12 @@ impl TrackRepo {
                 conditions.push(c);
                 owned_params.extend(p);
             }
+        }
+
+        // #8090 — pays de l'artiste principal de l'album (MusicBrainz).
+        if let Some((c, p)) = crate::db::facet_filter::bloc_pays_artiste(ph, &f.artist_countries) {
+            conditions.push(c);
+            owned_params.extend(p);
         }
 
         // Folder facet (Oxygen drill-down): restrict to tracks whose file lives

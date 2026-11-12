@@ -21,6 +21,8 @@ mod collection_folders;
 pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
+/// #8325 — la relecture unique des balises classiques des fichiers importés.
+pub(crate) mod relecture_classique;
 // #4805 — les crédits d'un album lus juste après son identification.
 mod credits_apres_identification;
 mod duplicates;
@@ -48,6 +50,8 @@ mod etiquetage_par_filtre;
 mod exemplaires;
 mod facets;
 mod faux_hires;
+/// #8160 — la fiche technique d'une piste.
+pub(crate) mod fiche_technique;
 mod folder_facet;
 mod genres;
 // LA définition du genre, partagée avec `/dashboard/stats` (#4527) : une seule
@@ -435,6 +439,9 @@ pub fn router() -> Router<AppState> {
         // Composer un coffret À LA MAIN — ce que la détection automatique ne
         // peut pas voir : marqueurs en lettres (« Disc A »), rangement libre.
         .route("/albums/coffret", post(albums::composer_coffret))
+        // #8464 (fil 2765) — le titre que la composition donnerait, pour
+        // préremplir le nom du coffret à l'écran. N'écrit rien.
+        .route("/albums/coffret/apercu", post(albums::apercu_coffret))
         .route(
             "/albums/coffrets/{cible}/regrouper",
             post(albums::regrouper_coffret),
@@ -535,6 +542,13 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/file-tags", get(tracks::track_file_tags))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/spectrogramme.png", get(spectrogramme::png))
+        // #8160 — la fiche technique d'une piste (lecture seule), et le
+        // recalcul de son spectrogramme conservé.
+        .route("/tracks/{id}/fiche-technique", get(fiche_technique::fiche))
+        .route(
+            "/tracks/{id}/spectrogramme",
+            post(spectrogramme::recalculer),
+        )
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
         // #2264 — les mêmes candidats, regroupés par enregistrement, avec la

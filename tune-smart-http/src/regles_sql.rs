@@ -455,6 +455,37 @@ pub(crate) fn normaliser_op(brut: &str) -> &str {
     }
 }
 
+/// #8325 — chef, ensemble, œuvre : la condition d'une règle de PISTE
+/// (`nier` posé sur la piste elle-même), ou `None` si le champ n'en est pas
+/// un. `Some(None)` : opérateur ou valeur intraduisible.
+pub(crate) fn condition_classique(
+    champ: &str,
+    op: &str,
+    valeur: Option<&serde_json::Value>,
+) -> Option<Option<(String, bool)>> {
+    let c = tune_core::db::facettes_classiques::Champ::facette(champ)?;
+    Some(tune_core::db::facettes_classiques::regle(
+        c,
+        op,
+        &valeurs_de_regle(op, valeur),
+        "t.id",
+    ))
+}
+
+/// Les valeurs d'une règle texte : une liste (`in`, tableau ou « a, b »)
+/// ou la valeur seule.
+pub(crate) fn valeurs_de_regle(op: &str, valeur: Option<&serde_json::Value>) -> Vec<String> {
+    match (op, valeur) {
+        ("in", Some(serde_json::Value::Array(arr))) => {
+            arr.iter().map(|v| texte_de(Some(v))).collect()
+        }
+        ("in", Some(serde_json::Value::String(s))) => {
+            s.split(',').map(|x| x.trim().to_string()).collect()
+        }
+        _ => vec![texte_de(valeur)],
+    }
+}
+
 /// #6250 — l'opérateur « ne contient pas », dans sa graphie canonique.
 pub(crate) const NE_CONTIENT_PAS: &str = "not_contains";
 

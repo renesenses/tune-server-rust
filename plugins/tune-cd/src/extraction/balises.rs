@@ -35,7 +35,16 @@ pub struct Balises {
     pub piste_id: Option<String>,
     pub artiste_ids: Vec<String>,
     pub artiste_album_ids: Vec<String>,
+    /// #8522 — `ACCURATERIPRESULT` (le verdict, voir
+    /// `accuraterip_base::texte_de_balise`) et `ACCURATERIPDISCID`.
+    pub accuraterip: Option<String>,
+    pub accuraterip_disque: Option<String>,
 }
+
+/// #8522 — les clés AccurateRip, celles de dBpoweramp (commentaires Vorbis
+/// en FLAC, `TXXX` en WAV).
+pub const CLE_RESULTAT: &str = "ACCURATERIPRESULT";
+pub const CLE_DISQUE: &str = "ACCURATERIPDISCID";
 
 /// Le type d'une image d'après ses premiers octets. `None` : ni JPEG ni PNG,
 /// l'image n'est pas écrite.
@@ -113,7 +122,18 @@ pub fn ecrire(
             if let Some(i) = image {
                 tag.push_picture(i);
             }
-            tag.save_to(&mut f, WriteOptions::default())
+            // #8522 — le `Tag` générique n'a pas de clé libre : les clés
+            // AccurateRip se posent dans les commentaires Vorbis eux-mêmes.
+            let mut vc = lofty::ogg::VorbisComments::from(tag);
+            for (cle, v) in [
+                (CLE_RESULTAT, &b.accuraterip),
+                (CLE_DISQUE, &b.accuraterip_disque),
+            ] {
+                if let Some(v) = v.as_ref().filter(|v| !v.is_empty()) {
+                    vc.insert(cle.to_string(), v.clone());
+                }
+            }
+            vc.save_to(&mut f, WriteOptions::default())
         }
         Format::Wav => {
             id3_avec_identifiants(tag, b, image).save_to(&mut f, WriteOptions::default())
@@ -148,6 +168,8 @@ fn id3_avec_identifiants(
         "MusicBrainz Album Artist Id",
         b.artiste_album_ids.first().cloned(),
     );
+    txxx(CLE_RESULTAT, b.accuraterip.clone());
+    txxx(CLE_DISQUE, b.accuraterip_disque.clone());
     if let Some(rec) = b.recording_id.as_ref().filter(|r| !r.is_empty()) {
         id3.insert(Frame::UniqueFileIdentifier(UniqueFileIdentifierFrame::new(
             "http://musicbrainz.org",

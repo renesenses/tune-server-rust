@@ -2545,7 +2545,9 @@ impl PlaybackOrchestrator {
     /// convolver (in the local output). Bertrand: "PURE doit désactiver toutes
     /// les modifs".
     pub(super) fn zone_audiophile(&self, zone_id: i64) -> bool {
-        crate::audio::audiophile::zone_enabled(&self.db, zone_id)
+        // #8513 — PURE, ou une mesure de pièce qui tient la zone : même
+        // chemin, aucun traitement.
+        crate::audio::audiophile::traitements_contournes(&self.db, zone_id)
     }
 
     /// Rejouer la piste en cours d'une zone **à sa position courante**, en
@@ -3136,7 +3138,8 @@ impl PlaybackOrchestrator {
     ) -> u32 {
         use crate::audio::soft_mute::{SOFT_MUTE_DEFAULT_MS, SOFT_MUTE_MAX_MS};
         // PURE : le PCM atteint la sortie intact, aucune rampe n'est appliquée.
-        if crate::audio::audiophile::zone_enabled(db, zone_id) {
+        // #8513 — ni pendant une mesure de pièce.
+        if crate::audio::audiophile::traitements_contournes(db, zone_id) {
             return 0;
         }
         crate::db::settings_repo::SettingsRepo::with_backend(db.clone())

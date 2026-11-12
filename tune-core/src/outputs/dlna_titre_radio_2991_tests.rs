@@ -23,6 +23,10 @@ struct Etat {
     /// `SetAVTransportURI` remet le transport à l'arrêt (ce que font la
     /// plupart des renderers) : sert à l'épreuve du mode « recharger ».
     arret_sur_set_uri: bool,
+    /// Le DIDL de la piste COURANTE, tel que `GetPositionInfo` le rend
+    /// (`TrackMetaData`, échappé). Comme un renderer conforme : seul
+    /// `SetAVTransportURI` le change, `SetNextAVTransportURI` le laisse.
+    meta_courante: String,
 }
 
 pub(crate) struct Serveur(tokio::task::JoinHandle<()>);
@@ -111,6 +115,7 @@ pub(crate) async fn faux_renderer(arret_sur_set_uri: bool) -> FauxRenderer {
                 let reponse = match action.as_str() {
                     "SetAVTransportURI" => {
                         etat.uri = entre(&corps, "CurrentURI").to_string();
+                        etat.meta_courante = entre(&corps, "CurrentURIMetaData").to_string();
                         if etat.arret_sur_set_uri {
                             etat.en_lecture = false;
                         }
@@ -131,6 +136,10 @@ pub(crate) async fn faux_renderer(arret_sur_set_uri: bool) -> FauxRenderer {
                     "GetMediaInfo" => format!(
                         "<s:Envelope><s:Body><u:GetMediaInfoResponse><NrTracks>1</NrTracks><CurrentURI>{}</CurrentURI></u:GetMediaInfoResponse></s:Body></s:Envelope>",
                         etat.uri
+                    ),
+                    "GetPositionInfo" => format!(
+                        "<s:Envelope><s:Body><u:GetPositionInfoResponse><Track>1</Track><TrackURI>{}</TrackURI><TrackMetaData>{}</TrackMetaData><RelTime>0:01:00</RelTime></u:GetPositionInfoResponse></s:Body></s:Envelope>",
+                        etat.uri, etat.meta_courante
                     ),
                     _ => "<Response/>".to_string(),
                 };
@@ -237,7 +246,10 @@ async fn la_voie_next_envoie_le_didl_du_morceau_sans_toucher_au_flux() {
     assert_eq!(
         issue,
         IssueRelai::Envoye {
-            action: "SetNextAVTransportURI"
+            action: "SetNextAVTransportURI",
+            // #2991 rc12 : l'acquittement ne touche pas la piste courante —
+            // c'est ce que le journal doit montrer chez le testeur.
+            piste_courante: "inchangee",
         }
     );
     let next = r.actions("SetNextAVTransportURI");
@@ -277,7 +289,8 @@ async fn la_voie_reload_repose_la_meme_uri_et_relance_si_l_appareil_s_arrete() {
     assert_eq!(
         issue,
         IssueRelai::Envoye {
-            action: "SetAVTransportURI"
+            action: "SetAVTransportURI",
+            piste_courante: "suit",
         }
     );
     let poses = r.actions("SetAVTransportURI");
@@ -328,4 +341,67 @@ async fn une_autre_uri_posee_n_est_pas_remplacee() {
         .unwrap();
     assert_eq!(issue, IssueRelai::Ignore("uri_posee_differente"));
     assert_eq!(r.total(), total);
+}
+
+/// #2991 rc12 — le constat se lit sur le `dc:title` de la piste courante,
+/// échappé une fois (forme SOAP) ou en clair, et ne conclut rien sans lui.
+#[test]
+fn le_constat_lit_le_titre_de_la_piste_courante() {
+    let reponse = |meta: &str| {
+        format!(
+            "<u:GetPositionInfoResponse><TrackMetaData>{meta}</TrackMetaData></u:GetPositionInfoResponse>"
+        )
+    };
+    let echappe = "&lt;DIDL-Lite&gt;&lt;item&gt;&lt;dc:title&gt;Iron &amp;amp; Wine&lt;/dc:title&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;";
+    assert_eq!(
+        constat_piste_courante(Some(&reponse(echappe)), "Iron & Wine"),
+        "suit"
+    );
+    assert_eq!(
+        constat_piste_courante(Some(&reponse(echappe)), "Friend Of The Devil"),
+        "inchangee"
+    );
+    let clair = "<DIDL-Lite><item><dc:title>RP Mellow</dc:title></item></DIDL-Lite>";
+    assert_eq!(
+        constat_piste_courante(Some(&reponse(clair)), "Friend Of The Devil"),
+        "inchangee"
+    );
+    assert_eq!(
+        constat_piste_courante(Some(&reponse("NOT_IMPLEMENTED")), "x"),
+        "illisible"
+    );
+    assert_eq!(
+        constat_piste_courante(Some("<Response/>"), "x"),
+        "illisible"
+    );
+    assert_eq!(constat_piste_courante(None, "x"), "illisible");
+}
+
+/// #2991 rc12 — « next » répété (le « 3 changements » de Serge) : chaque
+/// titre part, chaque fois acquitté, et la piste courante reste celle de la
+/// pose. Le renderer conforme ne PEUT pas changer son écran par cette voie.
+#[tokio::test]
+async fn next_repete_trois_fois_laisse_la_piste_courante_inchangee() {
+    let r = faux_renderer(false).await;
+    let sortie = r.sortie("uuid:2991-next-x3");
+    poser_la_radio(&sortie).await;
+    for titre in ["Un", "Deux", "Trois"] {
+        let t = TitreRadio {
+            titre: titre.into(),
+            ..titre_lyle()
+        };
+        let issue = sortie
+            .reemettre_titre_radio(ModeTitreRadioDidl::Suivante, URL_RADIO, &t)
+            .await
+            .unwrap();
+        assert_eq!(
+            issue,
+            IssueRelai::Envoye {
+                action: "SetNextAVTransportURI",
+                piste_courante: "inchangee",
+            }
+        );
+    }
+    assert_eq!(r.actions("SetNextAVTransportURI").len(), 3);
+    assert!(r.actions("GetPositionInfo").len() >= 3);
 }
