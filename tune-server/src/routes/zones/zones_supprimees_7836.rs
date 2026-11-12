@@ -116,14 +116,41 @@ pub(crate) async fn restaurer(State(state): State<AppState>, Path(id): Path<i64>
         )
             .into_response();
     }
-    if let Err(e) = repo.unhide(id) {
-        warn!(zone_id = id, error = %e, "zone_restauration_echouee");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "zone_restauration_echouee"})),
-        )
-            .into_response();
+    // Atomique : la condition (encore masquée, même motif) est relue dans
+    // l'écriture ; une autre écriture passée entre-temps n'est pas défaite.
+    let ecrite = match MotifMasquage::depuis_stocke(etat.motif.as_deref()) {
+        Some(motif) => repo.demasquer_si_motif(id, motif).map(|n| n > 0),
+        // Motif inconnu (masquage d'avant la migration 112) : rien à relire.
+        None => repo.unhide(id).map(|()| true),
+    };
+    match ecrite {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "zone_non_supprimee"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            warn!(zone_id = id, error = %e, "zone_restauration_echouee");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "zone_restauration_echouee"})),
+            )
+                .into_response();
+        }
     }
+    // Comme la résurrection par `POST /zones` : la zone revient en ligne si
+    // son appareil est annoncé ; absent, elle attend son retour.
+    let detecte = match repo.get(id) {
+        Ok(Some(z)) => match z.output_device_id.as_deref() {
+            Some(d) => state.outputs.lock().await.get(d).is_some(),
+            None => false,
+        },
+        _ => false,
+    };
+    let _ = repo.update_online(id, detecte);
     super::ecriture::sortir_la_zone_recreee_des_groupes(&state, id);
     info!(zone_id = id, motif = ?etat.motif, masquee_le = ?etat.masquee_le, "zone_restauree");
     state
