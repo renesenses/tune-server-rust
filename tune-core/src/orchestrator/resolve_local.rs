@@ -2613,7 +2613,7 @@ impl PlaybackOrchestrator {
             ..
         } = *decision;
         let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
-        let target_fmt = if oaat_needs_wav || local_needs_wav || browser_needs_wav {
+        let mut target_fmt = if oaat_needs_wav || local_needs_wav || browser_needs_wav {
             AudioFormat::Wav
         } else if dlna_needs_wav {
             // Renderer doesn't support FLAC — transcode to WAV (LPCM)
@@ -2678,6 +2678,31 @@ impl PlaybackOrchestrator {
             // MP3, OGG) devenait du FLAC en silence, servi sous `audio/aiff`.
             cible_encodable(src_fmt.dlna_transcode_target())
         };
+        // #8558 (volet B) — une piste trop lourde pour le bras FICHIER (piste
+        // entière en mémoire) part en WAV progressif, comme le DSD. Forum, fil
+        // 2777 : un FLAC 192/24 vers un Chromecast Audio faisait tuer le
+        // serveur par le noyau sur une VM de 4 Gio. Le pic se compte à la
+        // cadence DÉCODÉE (avant plafond), celle du PCM que le bras tient.
+        let bras_fichier_trop_lourd = super::bascule_progressive_8558::basculer_en_progressif(
+            is_network_output,
+            src_fmt,
+            track_duration_ms,
+            src_fmt.dsd_output_sample_rate(sample_rate),
+            channels,
+            crate::chemins_de_travail::memoire_disponible(),
+        );
+        if bras_fichier_trop_lourd && target_fmt != AudioFormat::Wav {
+            warn!(
+                zone_id = req.zone_id,
+                file = %file_path,
+                duree_ms = track_duration_ms,
+                cadence = sample_rate,
+                canaux = channels,
+                cible_abandonnee = ?target_fmt,
+                "bras_fichier_trop_lourd_session_progressive_8558"
+            );
+            target_fmt = AudioFormat::Wav;
+        }
         let mut out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
         // #4354 — la zone a déjà manqué son pré-tampon sur un DSD décimé :
         // la décimation vise 176,4 kHz. Seulement pour un DSD servi en PCM
@@ -2878,8 +2903,11 @@ impl PlaybackOrchestrator {
         // vaut pour les deux issues — la branche `flux_wav_reseau` ci-dessus, et
         // le WAV que `dlna_needs_wav` impose déjà à un renderer sans
         // `audio/flac`, que ce prédicat renvoyait au fichier.
-        let wav_diffusable =
-            dsd_lpcm_streams || (flux_wav_reseau && target_fmt == AudioFormat::Wav);
+        // #8558 — même sortie de secours pour une piste trop lourde : un WAV
+        // que `dlna_needs_wav` imposait déjà repartait sinon au fichier, où
+        // l'encodeur WAV accumule la piste ENTIÈRE.
+        let wav_diffusable = dsd_lpcm_streams
+            || ((flux_wav_reseau || bras_fichier_trop_lourd) && target_fmt == AudioFormat::Wav);
         // #4016 — le plafond de 4 GiB de l'en-tête RIFF, VU AVANT de décoder.
         //
         // Les quatre grandeurs qui le décident sont toutes connues ici : durée

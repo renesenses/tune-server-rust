@@ -169,6 +169,51 @@ pub fn memoire_vive_totale() -> Option<u64> {
     }
 }
 
+/// La mémoire qu'une nouvelle allocation peut encore obtenir, en octets
+/// (#8558) : la marge sous le plafond du cgroup v2 quand il y en a un
+/// (conteneur, unité systemd bornée), sinon `MemAvailable`. `None` hors Linux
+/// ou illisible : l'appelant ne doit rien inventer.
+///
+/// ⚠️ `audio::embedding` a sa propre lecture (cgroup v1 compris), derrière la
+/// fonctionnalité `audio-embedding` : à fusionner ici quand on y touchera.
+pub fn memoire_disponible() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let lire = |p: &str| std::fs::read_to_string(p).ok();
+        marge_du_cgroup(
+            lire("/sys/fs/cgroup/memory.max").as_deref(),
+            lire("/sys/fs/cgroup/memory.current").as_deref(),
+        )
+        .or_else(|| memoire_disponible_de_meminfo(lire("/proc/meminfo").as_deref()?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Marge sous le plafond du cgroup v2, en octets. `None` sans plafond
+/// (`max`, fichier absent ou illisible).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn marge_du_cgroup(plafond: Option<&str>, usage: Option<&str>) -> Option<u64> {
+    let plafond: u64 = plafond?.trim().parse().ok()?;
+    let usage: u64 = usage?.trim().parse().ok()?;
+    Some(plafond.saturating_sub(usage))
+}
+
+/// `MemAvailable` de `/proc/meminfo`, en octets.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn memoire_disponible_de_meminfo(meminfo: &str) -> Option<u64> {
+    let kio: u64 = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kio.saturating_mul(1024))
+}
+
 /// Plancher du plafond d'un cache posé en mémoire : de quoi garder la piste
 /// en cours et la suivante, même sur une petite machine.
 pub const PLANCHER_CACHE_EN_MEMOIRE: u64 = 128 * 1024 * 1024;
@@ -240,6 +285,21 @@ pub fn plafond_de_cache_pour(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memoire_disponible_lit_le_cgroup_puis_meminfo_8558() {
+        assert_eq!(marge_du_cgroup(Some("max\n"), Some("100\n")), None);
+        assert_eq!(marge_du_cgroup(Some("1000\n"), Some("300\n")), Some(700));
+        assert_eq!(marge_du_cgroup(Some("100"), Some("300")), Some(0));
+        assert_eq!(marge_du_cgroup(None, Some("1")), None);
+        assert_eq!(
+            memoire_disponible_de_meminfo(
+                "MemTotal:  4177920 kB\nMemFree: 1 kB\nMemAvailable:   3460000 kB\n"
+            ),
+            Some(3_460_000 * 1024)
+        );
+        assert_eq!(memoire_disponible_de_meminfo("MemTotal: 1 kB\n"), None);
+    }
+
     use super::*;
 
     /// Le témoin de #4770 : **deux utilisateurs ne se marchent pas dessus**.
