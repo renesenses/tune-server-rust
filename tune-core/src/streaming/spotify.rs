@@ -58,7 +58,12 @@ pub fn default_redirect_uri(api_port: u16) -> String {
 /// #6018 — `streaming` connecte librespot au compte ; les deux portées
 /// `*-playback-state` laissent l'API Web désigner et piloter son appareil.
 /// Un compte relié AVANT ce changement doit se reconnecter une fois.
-const SCOPES: &str = "user-read-private user-library-read playlist-read-private playlist-modify-private playlist-modify-public streaming user-read-playback-state user-modify-playback-state";
+/// Février 2026 — `user-library-modify`, `user-follow-read` et
+/// `user-follow-modify` : ajouter ou retirer un favori (`PUT`/`DELETE
+/// /me/library`) et lire les artistes suivis (`/me/following`) les exigent.
+/// Ils manquaient : le cœur « favori » rendait 403 sur Spotify. Un compte
+/// relié avant ne les a pas tant qu'il ne s'est pas reconnecté.
+const SCOPES: &str = "user-read-private user-library-read user-library-modify user-follow-read user-follow-modify playlist-read-private playlist-modify-private playlist-modify-public streaming user-read-playback-state user-modify-playback-state";
 
 pub struct SpotifyService {
     client: Client,
@@ -1018,6 +1023,45 @@ impl SpotifyService {
         self.portees
             .as_deref()
             .map(|p| p.split_whitespace().any(|x| x == "streaming"))
+    }
+
+    /// La liaison porte-t-elle la portée `portee` ? `None` : on ne le sait
+    /// pas (liaison antérieure à l'enregistrement des portées).
+    pub fn porte(&self, portee: &str) -> Option<bool> {
+        self.portees
+            .as_deref()
+            .map(|p| p.split_whitespace().any(|x| x == portee))
+    }
+
+    /// Février 2026 — ajouter (`ajout`) ou retirer un favori par
+    /// `/me/library`. Une liaison sans la portée d'écriture (compte relié
+    /// avant #8579) est refusée AVANT l'appel, avec le code stable
+    /// [`CODE_RECONNEXION_FAVORIS`] : l'écran propose « Reconnecter Spotify ».
+    /// Un 403 de Spotify sur une liaison dont on ignore les portées vaut le
+    /// même refus ; avec la portée, un 403 reste l'erreur de Spotify.
+    async fn ecrire_favori(
+        &self,
+        ajout: bool,
+        fav_type: &str,
+        item_id: &str,
+    ) -> Result<(), TuneError> {
+        let path = chemin_de_bibliotheque(fav_type, item_id)?;
+        let portee = portee_du_favori(fav_type);
+        if self.porte(portee) == Some(false) {
+            return Err(refus_reconnexion_favoris(portee));
+        }
+        let resultat = if ajout {
+            self.api_put(&path).await
+        } else {
+            self.api_delete(&path).await
+        };
+        match resultat {
+            Ok(()) => Ok(()),
+            Err(e) if e.ends_with(": 403") && self.porte(portee).is_none() => {
+                Err(refus_reconnexion_favoris(portee))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// #6018 — l'identifiant API Web de l'appareil Connect nommé `nom`.
@@ -2281,25 +2325,11 @@ impl StreamingService for SpotifyService {
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
-        let path = match fav_type {
-            "tracks" => format!("/me/tracks?ids={item_id}"),
-            "albums" => format!("/me/albums?ids={item_id}"),
-            "artists" => format!("/me/following?type=artist&ids={item_id}"),
-            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
-        };
-        self.api_put(&path).await?;
-        Ok(())
+        self.ecrire_favori(true, fav_type, item_id).await
     }
 
     async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
-        let path = match fav_type {
-            "tracks" => format!("/me/tracks?ids={item_id}"),
-            "albums" => format!("/me/albums?ids={item_id}"),
-            "artists" => format!("/me/following?type=artist&ids={item_id}"),
-            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
-        };
-        self.api_delete(&path).await?;
-        Ok(())
+        self.ecrire_favori(false, fav_type, item_id).await
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         // #8050 — toutes les pages, pas seulement les 50 premières.
@@ -2487,6 +2517,45 @@ pub fn motif_appareil_absent(nom: &str) -> String {
         "L'appareil Spotify Connect « {nom} » n'apparaît pas : librespot ne s'est pas connecté \
          au compte (Spotify Premium est exigé)."
     )
+}
+
+/// #8579 — code stable du refus « reconnecter Spotify pour gérer les
+/// favoris » : la liaison du compte ne porte pas la portée d'écriture.
+pub const CODE_RECONNEXION_FAVORIS: &str = "spotify_reconnexion_favoris";
+
+/// La portée qu'exige l'écriture d'un favori de ce type.
+fn portee_du_favori(fav_type: &str) -> &'static str {
+    if fav_type == "artists" {
+        "user-follow-modify"
+    } else {
+        "user-library-modify"
+    }
+}
+
+fn refus_reconnexion_favoris(portee: &str) -> TuneError {
+    refus(
+        CODE_RECONNEXION_FAVORIS,
+        format!(
+            "spotify: la liaison du compte ne porte pas la portee {portee} ; reconnecter Spotify une fois pour gerer les favoris"
+        ),
+    )
+}
+
+/// Février 2026 — Spotify a retiré `PUT`/`DELETE /me/tracks`, `/me/albums`
+/// et `/me/following` : un favori s'ajoute ou se retire par `/me/library`,
+/// qui prend des URI (`spotify:track:…`, `spotify:album:…`,
+/// `spotify:artist:…`). L'identifiant reçu peut déjà être une URI.
+fn chemin_de_bibliotheque(fav_type: &str, item_id: &str) -> Result<String, TuneError> {
+    let genre = match fav_type {
+        "tracks" => "track",
+        "albums" => "album",
+        "artists" => "artist",
+        _ => return Err(format!("unknown favorite type: {fav_type}").into()),
+    };
+    let id = item_id.trim();
+    let id = id.strip_prefix(&format!("spotify:{genre}:")).unwrap_or(id);
+    let uri = format!("spotify:{genre}:{id}");
+    Ok(format!("/me/library?uris={}", urlencoding::encode(&uri)))
 }
 
 /// #8399 — le statut HTTP d'un refus rendu par `api_get`
@@ -3782,3 +3851,7 @@ mod titres_phares_8485_tests;
 #[cfg(test)]
 #[path = "spotify_albums_artiste_8479_tests.rs"]
 mod albums_artiste_8479_tests;
+
+#[cfg(test)]
+#[path = "spotify_favoris_bibliotheque_2026_tests.rs"]
+mod favoris_bibliotheque_2026_tests;
