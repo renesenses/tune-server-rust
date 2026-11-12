@@ -155,6 +155,19 @@ pub(super) struct FormatDeSortie {
     pub(super) info: StreamInfo,
 }
 
+/// Ce que le bras fichier cuit dans le rendu, et l'empreinte de sa clé de
+/// cache (`traitements_du_fichier`).
+struct TraitementsDuFichier {
+    eq_profile: Option<crate::audio::eq::EqProcessor>,
+    convolver: Option<crate::audio::convolver::Convolver>,
+    crossfeed: Option<(crate::audio::crossfeed::CrossfeedProcessor, (f32, f32))>,
+    crossfeed_cuit: bool,
+    compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
+    compensation_cuite_db: Option<f64>,
+    replaygain_factor: Option<f64>,
+    empreinte_dsp: Option<[u8; 32]>,
+}
+
 /// Ce que le premier temps de `decider_la_lecture_locale` relève de la ligne
 /// `tracks` et de la zone, lu par tous les temps suivants (REF-2 phase 2,
 /// #2219). Les champs portent les noms des `let` d'origine.
@@ -2474,7 +2487,7 @@ impl PlaybackOrchestrator {
         ),
         String,
     > {
-        let format = self.decider_le_format_de_sortie(req, decision)?;
+        let format = self.format_de_sortie_avec_bascule(req, decision).await?;
         if format.use_file_transcode {
             self.transcoder_vers_fichier(req, decision, format).await
         } else {
@@ -2514,7 +2527,43 @@ impl PlaybackOrchestrator {
             .await?
         {
             DecisionOuResolu::Decision(decision) => {
-                self.decider_le_format_de_sortie(req, &decision)
+                self.format_de_sortie_avec_bascule(req, &decision).await
+            }
+            DecisionOuResolu::Resolu(_) => Err("résolu sans transcodage".into()),
+        }
+    }
+
+    /// Le chemin du rendu FICHIER que `transcoder_vers_fichier` chercherait en
+    /// cache pour cette lecture, sans la bascule #8558. Réservé aux tests.
+    #[cfg(test)]
+    pub(super) async fn chemin_du_rendu_en_cache_pour_test(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<Option<String>, String> {
+        let track_id = req.track_id.ok_or("no track_id for local playback")?;
+        let track = TrackRepo::with_backend(self.db.clone())
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
+        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
+        let fmt = track.format.clone().unwrap_or_else(|| "flac".into());
+        let source_format = AudioFormat::from_extension(&fmt);
+        let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+        match self
+            .decider_la_lecture_locale(
+                req,
+                &track,
+                file_path,
+                fmt,
+                source_format,
+                is_dsd_source,
+                None,
+            )
+            .await?
+        {
+            DecisionOuResolu::Decision(decision) => {
+                let format = self.decider_le_format_de_sortie(req, &decision, None)?;
+                Ok(self.chemin_du_rendu_en_cache(req, &decision, &format))
             }
             DecisionOuResolu::Resolu(_) => Err("résolu sans transcodage".into()),
         }
@@ -2565,7 +2614,7 @@ impl PlaybackOrchestrator {
             DecisionOuResolu::Decision(d) => d,
             DecisionOuResolu::Resolu(_) => return Err("résolu sans transcodage".into()),
         };
-        let format = self.decider_le_format_de_sortie(req, &decision)?;
+        let format = self.decider_le_format_de_sortie(req, &decision, None)?;
         let dsp =
             self.load_streaming_dsp(req.zone_id, req.track_id, format.out_sr, decision.channels);
         let actif = dsp.is_active();
@@ -2580,10 +2629,15 @@ impl PlaybackOrchestrator {
     /// par la zone, profondeur selon la sortie, conteneur et type MIME, et le
     /// choix entre fichier pré-transcodé et session à la volée
     /// (`use_file_transcode_for`).
+    ///
+    /// `bascule` (#8558) : la piste est trop lourde pour le bras fichier et le
+    /// renderer accepte le WAV — cible WAV en session progressive, à la
+    /// profondeur dite. `None` : la décision d'avant, inchangée.
     fn decider_le_format_de_sortie(
         &self,
         req: &PlayRequest,
         decision: &DecisionLocale,
+        bascule: Option<super::bascule_progressive_8558::ProfondeurDeBascule>,
     ) -> Result<FormatDeSortie, String> {
         let DecisionLocale {
             bit_depth,
@@ -2679,28 +2733,11 @@ impl PlaybackOrchestrator {
             cible_encodable(src_fmt.dlna_transcode_target())
         };
         // #8558 (volet B) — une piste trop lourde pour le bras FICHIER (piste
-        // entière en mémoire) part en WAV progressif, comme le DSD. Forum, fil
-        // 2777 : un FLAC 192/24 vers un Chromecast Audio faisait tuer le
-        // serveur par le noyau sur une VM de 4 Gio. Le pic se compte à la
-        // cadence DÉCODÉE (avant plafond), celle du PCM que le bras tient.
-        let bras_fichier_trop_lourd = super::bascule_progressive_8558::basculer_en_progressif(
-            is_network_output,
-            src_fmt,
-            track_duration_ms,
-            src_fmt.dsd_output_sample_rate(sample_rate),
-            channels,
-            crate::chemins_de_travail::memoire_disponible(),
-        );
-        if bras_fichier_trop_lourd && target_fmt != AudioFormat::Wav {
-            warn!(
-                zone_id = req.zone_id,
-                file = %file_path,
-                duree_ms = track_duration_ms,
-                cadence = sample_rate,
-                canaux = channels,
-                cible_abandonnee = ?target_fmt,
-                "bras_fichier_trop_lourd_session_progressive_8558"
-            );
+        // entière en mémoire) part en WAV progressif, comme le DSD. Décidé par
+        // `format_de_sortie_avec_bascule`, qui a vérifié le cache et le WAV
+        // du renderer.
+        let bras_fichier_trop_lourd = bascule.is_some();
+        if bras_fichier_trop_lourd {
             target_fmt = AudioFormat::Wav;
         }
         let mut out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
@@ -2843,6 +2880,13 @@ impl PlaybackOrchestrator {
         // aval ne sait ni convertir ni encoder. Arrondi vers le HAUT, comme
         // au décodage : aucun bit perdu (#1437).
         let out_bd = crate::audio::decode::container_bit_depth(out_bd);
+        // #8558 — le renderer n'a annoncé que le LPCM 16 bits.
+        let out_bd = if bascule == Some(super::bascule_progressive_8558::ProfondeurDeBascule::Seize)
+        {
+            16
+        } else {
+            out_bd
+        };
         let out_mime = if oaat_needs_wav || local_needs_wav {
             "audio/wav".to_string()
         } else {
@@ -3032,6 +3076,271 @@ impl PlaybackOrchestrator {
         })
     }
 
+    /// Ce que le bras FICHIER cuit dans le rendu (égaliseur, convolution,
+    /// crossfeed, compensation, ReplayGain) et l'empreinte qui entre dans la
+    /// clé de son cache. Partagé par `transcoder_vers_fichier` et par la
+    /// bascule #8558, qui doit trouver la MÊME clé.
+    fn traitements_du_fichier(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+        out_sr: u32,
+    ) -> TraitementsDuFichier {
+        let DecisionLocale {
+            channels,
+            is_local_output,
+            is_network_output,
+            tranche_cue,
+            ..
+        } = *decision;
+        // EQ alters the encoded bytes and is not part of the cache key,
+        // so a zone with an active EQ never uses the cache (always fresh).
+        //
+        // PAS pour une sortie LOCALE, exactement comme le ReplayGain
+        // quinze lignes plus bas : `LocalOutput` applique déjà l'égaliseur
+        // et le convolveur dans sa propre boucle de lecture. Les cuire ici
+        // AUSSI doublerait la courbe en dB et convoluerait deux fois — le
+        // défaut que `relais_dsp_progressif` chasse sur l'autre bras. La
+        // garde du ReplayGain était SEULE ; elle ne l'est plus.
+        let cuire = traitement_cuit_dans_le_fichier(is_local_output);
+        let eq_profile = cuire
+            .then(|| self.load_eq_processor(req.zone_id, out_sr, channels))
+            .flatten();
+        // The FIR convolver, like the EQ, alters the encoded bytes and
+        // is not part of the cache key → a zone with an active IR never
+        // uses the cache (always fresh).
+        let convolver = cuire
+            .then(|| self.load_convolver(req.zone_id, out_sr, channels))
+            .flatten();
+        // #2742 — le crossfeed, cuit côté RÉSEAU seulement, et sa clé de
+        // cache : `crossfeed_bibliotheque_reseau`, cas 1.
+        let crossfeed =
+            self.crossfeed_du_fichier(req.zone_id, out_sr, is_network_output, is_local_output);
+        // #5114 — ce que le fichier servi porte, dit par son `StreamInfo`.
+        // Le crossfeed n'agit qu'en stéréo (`CrossfeedProcessor::process_pcm`).
+        let crossfeed_cuit = crossfeed.is_some() && channels == 2;
+        // #5071 — la compensation de niveau, cuite APRÈS eux et bornée à
+        // la crête de la piste. Fermée à une sortie `local:` (qui compense
+        // par son volume) par `compensation_du_flux_reseau` elle-même.
+        let compensation = cuire
+            .then(|| {
+                self.compensation_du_flux_reseau(
+                    req.zone_id,
+                    eq_profile.as_ref(),
+                    crossfeed.as_ref().map(|(p, _)| p).filter(|_| channels == 2),
+                )
+            })
+            .flatten();
+        // Ce que le fichier servi porte, dit par son `StreamInfo` comme le
+        // crossfeed ci-dessus : le chemin du signal le lit au lieu de le prévoir.
+        let compensation_cuite_db = compensation.as_ref().map(|c| c.cible_db());
+        // ReplayGain scales the samples, so like the EQ and the FIR it
+        // changes the encoded bytes without being part of the cache key.
+        // A cached transcode made at a different gain would be served
+        // silently at the wrong level — so the gain is part of the cache
+        // key (LAT-F2): a rendition is only ever served at its own gain.
+        // NOT for a local zone: the local output applies the gain on
+        // its own render path, and a local zone with a known source
+        // format always comes through here (`local_needs_wav`) — so
+        // baking it in as well multiplied the gain twice. A -6 dB track
+        // played at -12 dB, quietly.
+        let replaygain_factor = match (
+            is_local_output || self.zone_audiophile(req.zone_id),
+            req.track_id,
+        ) {
+            (false, Some(tid)) => {
+                let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+                if (f - 1.0).abs() > 1e-6 {
+                    Some(f)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        // LAT-F2 : le traitement entre dans la clé du cache. Une rendition
+        // par réglage — égaliseur (profil canonique), ReplayGain (facteur
+        // exact), convolution (contenu de l'IR) — au lieu de retranscoder
+        // à chaque écoute dès qu'un traitement est actif. Sans traitement,
+        // l'empreinte est `None` et la clé reste celle d'avant.
+        let empreinte_dsp = crate::transcode_cache::empreinte_dsp(
+            eq_profile
+                .as_ref()
+                .and_then(|_| self.load_eq_profile(req.zone_id))
+                .and_then(|p| serde_json::to_string(&p).ok())
+                .as_deref(),
+            replaygain_factor,
+            convolver
+                .as_ref()
+                .and_then(|_| self.octets_ir(req.zone_id))
+                .as_deref(),
+        );
+        // 🔴 #3631 — la TRANCHE entre dans la clé. La clé est bâtie sur le
+        // fichier SOURCE, et les quinze pistes d'une image CUE le
+        // partagent : sans ce brassage, la première rendition mise en
+        // cache serait servie pour les quatorze autres.
+        let empreinte_dsp = crate::transcode_cache::empreinte_avec_tranche(
+            empreinte_dsp,
+            tranche_cue.map(|t| (t.debut_ms, t.duree_ms.map(|d| t.debut_ms + d))),
+        );
+        let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_crossfeed(
+            empreinte_dsp,
+            crossfeed.as_ref().map(|(_, reglage)| *reglage),
+        );
+        // #5081 — et l'ombre de la tête du processeur chargé.
+        let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_ombre(
+            empreinte_dsp,
+            crossfeed.as_ref().and_then(|(p, _)| p.ombre()),
+        );
+        // #5071 — la compensation change les octets : elle entre dans la
+        // clé, sinon une rendition non compensée serait servie à une zone
+        // qui l'a demandée (et inversement). `None` : la clé d'avant.
+        let empreinte_dsp = crate::audio::compensation_reseau::empreinte_avec_compensation(
+            empreinte_dsp,
+            compensation.as_ref().map(|c| c.cible_db()),
+        );
+        let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_etages_tiers(
+            empreinte_dsp,
+            &crossfeed
+                .as_ref()
+                .map(|_| self.empreinte_des_etages_tiers(req.zone_id))
+                .unwrap_or_default(),
+        );
+        TraitementsDuFichier {
+            eq_profile,
+            convolver,
+            crossfeed,
+            crossfeed_cuit,
+            compensation,
+            compensation_cuite_db,
+            replaygain_factor,
+            empreinte_dsp,
+        }
+    }
+
+    /// Le chemin du rendu fichier que `transcoder_vers_fichier` servirait
+    /// depuis le cache pour `format`, s'il y est (`is_hit`). `None` sinon.
+    fn chemin_du_rendu_en_cache(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+        format: &FormatDeSortie,
+    ) -> Option<String> {
+        let empreinte_dsp = self
+            .traitements_du_fichier(req, decision, format.out_sr)
+            .empreinte_dsp;
+        crate::transcode_cache::cache_path_dsp(
+            &decision.file_path,
+            &format.out_ext,
+            format.out_sr,
+            format.out_bd,
+            decision.channels,
+            empreinte_dsp.as_ref(),
+        )
+    }
+
+    /// #8558 (volet B) — le format de sortie, avec la bascule vers le WAV
+    /// progressif d'une piste trop lourde pour le bras FICHIER (la piste
+    /// entière en mémoire). Forum, fil 2777 : un FLAC 192/24 vers un
+    /// Chromecast Audio faisait tuer le serveur par le noyau sur une VM de
+    /// 4 Gio. La bascule n'a lieu que si les quatre conditions tiennent :
+    ///
+    /// 1. le bras fichier était la voie (`use_file_transcode`) ;
+    /// 2. son pic estimé dépasse la moitié de la mémoire disponible MESURÉE
+    ///    (sans mesure, pas de bascule) — à la cadence DÉCODÉE, avant plafond ;
+    /// 3. aucun rendu de ce format n'est déjà en cache (servi tel quel, il ne
+    ///    coûte rien) ;
+    /// 4. le renderer accepte le WAV (`profondeur_de_bascule`), et pour un
+    ///    Chromecast, à 96 kHz au plus.
+    async fn format_de_sortie_avec_bascule(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+    ) -> Result<FormatDeSortie, String> {
+        use super::bascule_progressive_8558 as b;
+        let format = self.decider_le_format_de_sortie(req, decision, None)?;
+        if !format.use_file_transcode {
+            return Ok(format);
+        }
+        let src_fmt = decision.source_format.unwrap_or(AudioFormat::Flac);
+        let disponible = b::memoire_disponible();
+        if !b::basculer_en_progressif(
+            decision.is_network_output,
+            src_fmt,
+            decision.track_duration_ms,
+            src_fmt.dsd_output_sample_rate(decision.sample_rate),
+            decision.channels,
+            disponible,
+        ) {
+            return Ok(format);
+        }
+        if let Some(cp) = self
+            .chemin_du_rendu_en_cache(req, decision, &format)
+            .filter(|cp| crate::transcode_cache::is_hit(cp))
+        {
+            info!(
+                zone_id = req.zone_id,
+                file = %decision.file_path,
+                cache = %cp,
+                "bascule_progressive_8558_ecartee_rendu_en_cache"
+            );
+            return Ok(format);
+        }
+        let deja_wav = format.target_format_str == "wav";
+        let chromecast_trop_haut =
+            decision.is_chromecast && format.out_sr > b::CADENCE_MAX_CHROMECAST;
+        let profondeur = if chromecast_trop_haut {
+            None
+        } else {
+            let did = identifiant_du_renderer(
+                req.output_device_id.as_deref(),
+                decision
+                    .zone
+                    .as_ref()
+                    .and_then(|z| z.output_device_id.as_deref()),
+            );
+            let source_hi_res = decision.bit_depth > 16;
+            let accepte_hi_res = !deja_wav
+                && source_hi_res
+                && !did.is_empty()
+                && self.dlna_accepte_lpcm(did, true).await;
+            let accepte_16 =
+                !deja_wav && !did.is_empty() && self.dlna_accepte_lpcm(did, false).await;
+            b::profondeur_de_bascule(
+                deja_wav,
+                source_hi_res,
+                decision.dlna_cap_16bit,
+                decision.dlna_wav24,
+                accepte_hi_res,
+                accepte_16,
+            )
+        };
+        let Some(profondeur) = profondeur else {
+            warn!(
+                zone_id = req.zone_id,
+                file = %decision.file_path,
+                duree_ms = decision.track_duration_ms,
+                cadence = decision.sample_rate,
+                memoire_disponible = ?disponible,
+                chromecast_trop_haut,
+                "bascule_progressive_8558_impossible_renderer_sans_wav"
+            );
+            return Ok(format);
+        };
+        warn!(
+            zone_id = req.zone_id,
+            file = %decision.file_path,
+            duree_ms = decision.track_duration_ms,
+            cadence = decision.sample_rate,
+            canaux = decision.channels,
+            memoire_disponible = ?disponible,
+            cible_abandonnee = %format.target_format_str,
+            profondeur = ?profondeur,
+            "bras_fichier_trop_lourd_session_progressive_8558"
+        );
+        self.decider_le_format_de_sortie(req, decision, Some(profondeur))
+    }
+
     /// Deuxième temps, sorties réseau : décodage → encodage → fichier
     /// temporaire, puis session de fichier servie avec Content-Length et
     /// Range. Cache par empreinte quand aucun traitement n'altère les octets.
@@ -3045,8 +3354,6 @@ impl PlaybackOrchestrator {
         let DecisionLocale {
             bit_depth,
             channels,
-            is_local_output,
-            is_network_output,
             sample_rate,
             track_duration_ms,
             tranche_cue,
@@ -3070,119 +3377,19 @@ impl PlaybackOrchestrator {
             let ev_bus = self.event_bus.clone();
             let playback = self.playback.clone();
             let zone_id = req.zone_id;
-            // EQ alters the encoded bytes and is not part of the cache key,
-            // so a zone with an active EQ never uses the cache (always fresh).
-            //
-            // PAS pour une sortie LOCALE, exactement comme le ReplayGain
-            // quinze lignes plus bas : `LocalOutput` applique déjà l'égaliseur
-            // et le convolveur dans sa propre boucle de lecture. Les cuire ici
-            // AUSSI doublerait la courbe en dB et convoluerait deux fois — le
-            // défaut que `relais_dsp_progressif` chasse sur l'autre bras. La
-            // garde du ReplayGain était SEULE ; elle ne l'est plus.
-            let cuire = traitement_cuit_dans_le_fichier(is_local_output);
-            let eq_profile = cuire
-                .then(|| self.load_eq_processor(req.zone_id, out_sr, channels))
-                .flatten();
-            // The FIR convolver, like the EQ, alters the encoded bytes and
-            // is not part of the cache key → a zone with an active IR never
-            // uses the cache (always fresh).
-            let convolver = cuire
-                .then(|| self.load_convolver(req.zone_id, out_sr, channels))
-                .flatten();
-            // #2742 — le crossfeed, cuit côté RÉSEAU seulement, et sa clé de
-            // cache : `crossfeed_bibliotheque_reseau`, cas 1.
-            let crossfeed =
-                self.crossfeed_du_fichier(req.zone_id, out_sr, is_network_output, is_local_output);
-            // #5114 — ce que le fichier servi porte, dit par son `StreamInfo`.
-            // Le crossfeed n'agit qu'en stéréo (`CrossfeedProcessor::process_pcm`).
-            let crossfeed_cuit = crossfeed.is_some() && channels == 2;
-            // #5071 — la compensation de niveau, cuite APRÈS eux et bornée à
-            // la crête de la piste. Fermée à une sortie `local:` (qui compense
-            // par son volume) par `compensation_du_flux_reseau` elle-même.
-            let compensation = cuire
-                .then(|| {
-                    self.compensation_du_flux_reseau(
-                        req.zone_id,
-                        eq_profile.as_ref(),
-                        crossfeed.as_ref().map(|(p, _)| p).filter(|_| channels == 2),
-                    )
-                })
-                .flatten();
-            // Ce que le fichier servi porte, dit par son `StreamInfo` comme le
-            // crossfeed ci-dessus : le chemin du signal le lit au lieu de le prévoir.
-            let compensation_cuite_db = compensation.as_ref().map(|c| c.cible_db());
-            // ReplayGain scales the samples, so like the EQ and the FIR it
-            // changes the encoded bytes without being part of the cache key.
-            // A cached transcode made at a different gain would be served
-            // silently at the wrong level — so the gain is part of the cache
-            // key (LAT-F2): a rendition is only ever served at its own gain.
-            // NOT for a local zone: the local output applies the gain on
-            // its own render path, and a local zone with a known source
-            // format always comes through here (`local_needs_wav`) — so
-            // baking it in as well multiplied the gain twice. A -6 dB track
-            // played at -12 dB, quietly.
-            let replaygain_factor = match (
-                is_local_output || self.zone_audiophile(req.zone_id),
-                req.track_id,
-            ) {
-                (false, Some(tid)) => {
-                    let f = crate::audio::replaygain::playback_factor(&self.db, tid);
-                    if (f - 1.0).abs() > 1e-6 {
-                        Some(f)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            // LAT-F2 : le traitement entre dans la clé du cache. Une rendition
-            // par réglage — égaliseur (profil canonique), ReplayGain (facteur
-            // exact), convolution (contenu de l'IR) — au lieu de retranscoder
-            // à chaque écoute dès qu'un traitement est actif. Sans traitement,
-            // l'empreinte est `None` et la clé reste celle d'avant.
-            let empreinte_dsp = crate::transcode_cache::empreinte_dsp(
-                eq_profile
-                    .as_ref()
-                    .and_then(|_| self.load_eq_profile(req.zone_id))
-                    .and_then(|p| serde_json::to_string(&p).ok())
-                    .as_deref(),
+            // Les traitements cuits dans le fichier et l'empreinte qui entre
+            // dans la clé du cache : `traitements_du_fichier`, partagé avec
+            // la bascule #8558 qui consulte le cache AVANT de décider.
+            let TraitementsDuFichier {
+                eq_profile,
+                convolver,
+                crossfeed,
+                crossfeed_cuit,
+                compensation,
+                compensation_cuite_db,
                 replaygain_factor,
-                convolver
-                    .as_ref()
-                    .and_then(|_| self.octets_ir(req.zone_id))
-                    .as_deref(),
-            );
-            // 🔴 #3631 — la TRANCHE entre dans la clé. La clé est bâtie sur le
-            // fichier SOURCE, et les quinze pistes d'une image CUE le
-            // partagent : sans ce brassage, la première rendition mise en
-            // cache serait servie pour les quatorze autres.
-            let empreinte_dsp = crate::transcode_cache::empreinte_avec_tranche(
                 empreinte_dsp,
-                tranche_cue.map(|t| (t.debut_ms, t.duree_ms.map(|d| t.debut_ms + d))),
-            );
-            let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_crossfeed(
-                empreinte_dsp,
-                crossfeed.as_ref().map(|(_, reglage)| *reglage),
-            );
-            // #5081 — et l'ombre de la tête du processeur chargé.
-            let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_ombre(
-                empreinte_dsp,
-                crossfeed.as_ref().and_then(|(p, _)| p.ombre()),
-            );
-            // #5071 — la compensation change les octets : elle entre dans la
-            // clé, sinon une rendition non compensée serait servie à une zone
-            // qui l'a demandée (et inversement). `None` : la clé d'avant.
-            let empreinte_dsp = crate::audio::compensation_reseau::empreinte_avec_compensation(
-                empreinte_dsp,
-                compensation.as_ref().map(|c| c.cible_db()),
-            );
-            let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_etages_tiers(
-                empreinte_dsp,
-                &crossfeed
-                    .as_ref()
-                    .map(|_| self.empreinte_des_etages_tiers(req.zone_id))
-                    .unwrap_or_default(),
-            );
+            } = self.traitements_du_fichier(req, decision, out_sr);
             let cache_path_opt = crate::transcode_cache::cache_path_dsp(
                 &file_path,
                 &out_ext,

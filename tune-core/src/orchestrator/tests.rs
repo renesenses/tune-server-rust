@@ -1518,6 +1518,120 @@ async fn une_zone_dlna_avec_egaliseur_part_en_wav_progressif_sur_opt_in() {
     assert!(sans_sink.use_file_transcode);
 }
 
+/// #8558 (volet B) — le CÂBLAGE de la bascule, de la décision au format servi :
+/// une piste 192/24 de 15 min vers une zone réseau à égaliseur (bras fichier,
+/// FLAC ré-encodé), la mémoire disponible imposée sur le fil du test.
+///
+/// - trop lourde et renderer capable ⇒ WAV en session progressive ;
+/// - renderer sans WAV annoncé ⇒ pas de bascule, le fichier comme avant ;
+/// - rendu déjà en cache ⇒ pas de bascule, servi tel quel ;
+/// - Chromecast ⇒ 16 bits, et seulement à 96 kHz au plus ;
+/// - mémoire abondante ⇒ rien ne change.
+#[tokio::test]
+async fn la_bascule_progressive_8558_est_cablee_jusqu_au_format_servi() {
+    use super::bascule_progressive_8558::imposer_la_memoire_disponible;
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac");
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Salon", Some("dlna"), Some("uuid:salon-8558"))
+        .unwrap();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(
+            &format!("zone_{zone_id}_eq_profile"),
+            &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+        )
+        .unwrap();
+    settings.set("plugin_equalizer_installed", "true").unwrap();
+    piste_3234(&orch, fixture, "flac");
+    orch.db
+        .execute(
+            "UPDATE tracks SET duration_ms = 900000, sample_rate = 192000, bit_depth = 24 \
+             WHERE id = 1",
+            &[],
+        )
+        .unwrap();
+    let req = requete_locale_3234(zone_id, 1);
+
+    // Contre-épreuve : mémoire abondante, rien ne change.
+    imposer_la_memoire_disponible(Some(1 << 40));
+    let large = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(large.out_mime, "audio/flac");
+    assert!(large.use_file_transcode);
+
+    // VM de 4 Gio du fil 2777 : ~3,3 Gio disponibles. Sortie absente du
+    // registre : présumée capable (convention de `dlna_accepte_lpcm`).
+    imposer_la_memoire_disponible(Some((33u64 << 30) / 10));
+    let bascule = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(bascule.out_mime, "audio/wav", "bascule déclenchée");
+    assert_eq!(bascule.out_ext, "wav");
+    assert_eq!(bascule.out_bd, 24, "WAV/L24 accepté : la profondeur source");
+    assert!(
+        !bascule.use_file_transcode,
+        "bascule ⇒ session progressive, pas le bras fichier"
+    );
+
+    // Rendu FLAC déjà en cache : servi tel quel, pas de bascule.
+    let cp = orch
+        .chemin_du_rendu_en_cache_pour_test(&req)
+        .await
+        .unwrap()
+        .expect("la fixture existe : une clé de cache");
+    std::fs::write(&cp, vec![0u8; 4096]).unwrap();
+    let en_cache = orch.format_de_sortie_pour_test(&req).await;
+    let _ = std::fs::remove_file(&cp);
+    let en_cache = en_cache.unwrap();
+    assert_eq!(
+        en_cache.out_mime, "audio/flac",
+        "rendu en cache ⇒ pas de bascule"
+    );
+    assert!(en_cache.use_file_transcode);
+
+    // Renderer enregistré SANS WAV annoncé (pas de Sink LPCM) : pas de
+    // bascule, le bras fichier actuel reste la voie.
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("uuid:salon-8558", "Salon").with_type("dlna"),
+    ));
+    let sans_wav = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(
+        sans_wav.out_mime, "audio/flac",
+        "renderer sans WAV ⇒ pas de bascule"
+    );
+    assert!(sans_wav.use_file_transcode);
+
+    // Chromecast : 16 bits (« WAV (LPCM) » documenté sans profondeur), et
+    // seulement sous 96 kHz.
+    let cast = ZoneRepo::with_backend(orch.db.clone())
+        .create("Cuisine", Some("chromecast"), Some("cast-8558"))
+        .unwrap();
+    settings
+        .set(
+            &format!("zone_{cast}_eq_profile"),
+            &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+        )
+        .unwrap();
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("cast-8558", "Cuisine").with_type("chromecast"),
+    ));
+    let req_cast = requete_locale_3234(cast, 1);
+    let cast_192 = orch.format_de_sortie_pour_test(&req_cast).await.unwrap();
+    assert_ne!(
+        cast_192.out_mime, "audio/wav",
+        "Chromecast à 192 kHz : pas de bascule"
+    );
+    assert!(cast_192.use_file_transcode);
+    ZoneRepo::with_backend(orch.db.clone())
+        .update_max_sample_rate(cast, Some(96_000))
+        .unwrap();
+    let cast_96 = orch.format_de_sortie_pour_test(&req_cast).await.unwrap();
+    assert_eq!(cast_96.out_mime, "audio/wav");
+    assert_eq!(cast_96.out_bd, 16, "Chromecast : 16 bits, jamais 24");
+    assert_eq!(cast_96.out_sr, 96_000);
+    assert!(!cast_96.use_file_transcode);
+
+    imposer_la_memoire_disponible(None);
+}
+
 /// #3311 — la cible WAV d'un `.ape` sur une zone RÉSEAU exige les TROIS
 /// conditions. En retirer une seule rend au FLAC, donc au fichier.
 #[test]
