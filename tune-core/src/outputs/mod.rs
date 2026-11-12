@@ -46,6 +46,8 @@ mod dlna_test;
 #[cfg(test)]
 mod dlna_volume_apres_uri_tests_6008;
 // #8151 — la sourdine tient à chaque nouvelle piste.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod cadence_exclusive_8616;
 #[cfg(test)]
 pub(crate) mod dlna_sourdine_8151_tests;
 #[cfg(feature = "local-audio")]

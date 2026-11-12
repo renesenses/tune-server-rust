@@ -2055,6 +2055,63 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #8616 — sonde limitée à WASAPI exclusif, hors des verrous asynchrones.
+    async fn cadence_pcm_exclusive(
+        &self,
+        device_id: Option<&str>,
+        cadence: u32,
+        voies: u16,
+    ) -> Result<Option<u32>, String> {
+        #[cfg(test)]
+        if let Some(acceptees) =
+            device_id.and_then(|id| cadences_pcm_de_test().lock().unwrap().get(id).cloned())
+        {
+            return crate::outputs::cadence_exclusive_8616::choisir_cadence(
+                cadence,
+                voies,
+                |hz, _, _| {
+                    if acceptees.contains(&hz) {
+                        crate::outputs::negociation_format_exclusif_3837::ResultatSonde::Accepte
+                    } else {
+                        crate::outputs::negociation_format_exclusif_3837::ResultatSonde::Refuse {
+                            hr: 0x88890008u32 as i32,
+                            propose: None,
+                        }
+                    }
+                },
+            );
+        }
+        #[cfg(all(feature = "local-audio", target_os = "windows"))]
+        {
+            let Some(id) = device_id else {
+                return Ok(None);
+            };
+            let Some(sortie) = ({ self.outputs.lock().await.get(id) }) else {
+                return Ok(None);
+            };
+            let endpoint = {
+                let sortie = sortie.lock().await;
+                sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                    .and_then(crate::outputs::local::LocalOutput::endpoint_pcm_exclusif)
+            };
+            let Some(endpoint) = endpoint else {
+                return Ok(None);
+            };
+            tokio::task::spawn_blocking(move || {
+                crate::outputs::wasapi_exclusive::sonder_la_cadence_pcm(endpoint, cadence, voies)
+            })
+            .await
+            .unwrap_or(Ok(None))
+        }
+        #[cfg(not(all(feature = "local-audio", target_os = "windows")))]
+        {
+            let _ = (device_id, cadence, voies);
+            Ok(None)
+        }
+    }
+
     /// #5643 — ce que la sortie locale `device_id` permet en DSD natif.
     ///
     /// Le bras se lit sur la sortie elle-même (`sort_par_asio_exclusif`, la
@@ -2542,7 +2599,7 @@ impl PlaybackOrchestrator {
         ),
         String,
     > {
-        let format = self.decider_le_format_de_sortie(req, decision)?;
+        let format = self.decider_le_format_de_sortie(req, decision).await?;
         if format.use_file_transcode {
             self.transcoder_vers_fichier(req, decision, format).await
         } else {
@@ -2582,7 +2639,7 @@ impl PlaybackOrchestrator {
             .await?
         {
             DecisionOuResolu::Decision(decision) => {
-                self.decider_le_format_de_sortie(req, &decision)
+                self.decider_le_format_de_sortie(req, &decision).await
             }
             DecisionOuResolu::Resolu(_) => Err("résolu sans transcodage".into()),
         }
@@ -2633,7 +2690,7 @@ impl PlaybackOrchestrator {
             DecisionOuResolu::Decision(d) => d,
             DecisionOuResolu::Resolu(_) => return Err("résolu sans transcodage".into()),
         };
-        let format = self.decider_le_format_de_sortie(req, &decision)?;
+        let format = self.decider_le_format_de_sortie(req, &decision).await?;
         let dsp =
             self.load_streaming_dsp(req.zone_id, req.track_id, format.out_sr, decision.channels);
         let actif = dsp.is_active();
@@ -2648,7 +2705,7 @@ impl PlaybackOrchestrator {
     /// par la zone, profondeur selon la sortie, conteneur et type MIME, et le
     /// choix entre fichier pré-transcodé et session à la volée
     /// (`use_file_transcode_for`).
-    fn decider_le_format_de_sortie(
+    async fn decider_le_format_de_sortie(
         &self,
         req: &PlayRequest,
         decision: &DecisionLocale,
@@ -2801,6 +2858,34 @@ impl PlaybackOrchestrator {
                     "zone_max_sample_rate_cap_applied"
                 );
                 out_sr = cible;
+            }
+        }
+        // #8616 — le porteur PCM est produit à la cadence acceptée, pas seulement
+        // étiqueté autrement à l'ouverture WASAPI. Le chemin du signal reçoit
+        // cette même cadence via StreamInfo et la session de transcodage.
+        if local_needs_wav {
+            if let Some(cible) = self
+                .cadence_pcm_exclusive(req.output_device_id.as_deref(), out_sr, channels)
+                .await?
+            {
+                if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
+                    out_sr,
+                    cible,
+                    crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
+                )
+                .refus()
+                {
+                    return Err(refus.sentinelle());
+                }
+                if cible != out_sr {
+                    info!(
+                        zone_id = req.zone_id,
+                        source_rate = out_sr,
+                        target_rate = cible,
+                        "wasapi_exclusive_cadence_refusee_repli_pcm"
+                    );
+                    out_sr = cible;
+                }
             }
         }
         let out_bd: u16 = if local_needs_wav {
@@ -4637,3 +4722,11 @@ mod duree_relue_5975_tests;
 #[cfg(test)]
 #[path = "niveaux_du_dsd_natif_7775.rs"]
 mod niveaux_du_dsd_natif_7775;
+
+#[cfg(test)]
+pub(super) fn cadences_pcm_de_test()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<u32>>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<u32>>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}

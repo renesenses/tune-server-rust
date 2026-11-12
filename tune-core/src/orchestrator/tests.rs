@@ -10827,3 +10827,71 @@ async fn une_session_retiree_sans_abandon_pendant_l_envoi_n_arrete_rien_6658() {
     assert_eq!(output_error, None);
     assert_eq!(mock.stop_call_count(), 0, "rien ne doit arrêter la sortie");
 }
+
+/// Le vrai choix de format alimente le décodeur ET StreamInfo, sans périphérique audio.
+#[tokio::test]
+async fn cadence_8616_dsd_pcm_et_metadonnees_suivent_la_sonde() {
+    let orch = test_orchestrator();
+    let id = "local:wasapi-synthetique-8616";
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("WASAPI synthétique", Some("local"), Some(id))
+        .unwrap();
+    zones.update_dsd_mode(zone_id, "pcm").unwrap();
+    let chemin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/dsd/ref_dsd64_stereo.dsf"
+    );
+    orch.db
+        .execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Synthétique')",
+            &[],
+        )
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Synthétique', 1)",
+            &[],
+        )
+        .unwrap();
+    orch.db.execute("INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, duration_ms, sample_rate, bit_depth, channels) VALUES (1, 'DSD64', 1, 1, ?, 'dsf', 1000, 2822400, 1, 2)", &[&chemin.to_string() as &dyn crate::db::backend::ToSqlValue]).unwrap();
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.output_device_id = Some(id.into());
+    // Sans mesure (Linux, partagé, ASIO ou pilote muet), aucun changement.
+    assert_eq!(
+        orch.format_de_sortie_pour_test(&req).await.unwrap().out_sr,
+        176_400
+    );
+    super::resolve_local::cadences_pcm_de_test()
+        .lock()
+        .unwrap()
+        .insert(id.into(), vec![88_200, 44_100]);
+    let f = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(
+        f.out_sr, 88_200,
+        "le décodeur doit produire la cadence acceptée, pas 176400"
+    );
+    assert_eq!(
+        f.info.sample_rate, 88_200,
+        "le chemin du signal doit annoncer la conversion réelle"
+    );
+    assert_eq!(f.out_bd, 32);
+    assert_eq!(f.info.channels, 2);
+    assert!(!f.use_file_transcode);
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    assert_eq!(
+        orch.format_de_sortie_pour_test(&req)
+            .await
+            .map(|f| f.out_sr),
+        Err("bitperfect_strict_refused:176400:88200".into())
+    );
+    super::resolve_local::cadences_pcm_de_test()
+        .lock()
+        .unwrap()
+        .remove(id);
+}
