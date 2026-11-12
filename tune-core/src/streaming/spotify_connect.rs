@@ -506,7 +506,9 @@ impl LibrespotLance {
 pub const FICHIER_IDENTIFIANTS: &str = "credentials.json";
 
 pub struct LibrespotDaemon {
-    device_name: String,
+    /// Le nom annoncé à l'application Spotify (`--name`). Modifiable : il
+    /// vaut au PROCHAIN lancement de librespot (fil 2778).
+    device_name: std::sync::Mutex<String>,
     binary_path: Option<String>,
     bitrate: u32,
     process: Mutex<Option<Child>>,
@@ -546,7 +548,7 @@ pub fn ligne_d_erreur_librespot(ligne: &str) -> Option<String> {
 impl LibrespotDaemon {
     pub fn new(device_name: String, binary_path: Option<String>, bitrate: Option<u32>) -> Self {
         Self {
-            device_name,
+            device_name: std::sync::Mutex::new(device_name),
             binary_path,
             bitrate: bitrate.unwrap_or(DEFAULT_BITRATE),
             process: Mutex::new(None),
@@ -585,6 +587,25 @@ impl LibrespotDaemon {
 
     pub fn pompe(&self) -> Arc<PompePcm> {
         self.pompe.clone()
+    }
+
+    /// Le nom annoncé à l'application Spotify.
+    pub fn device_name(&self) -> String {
+        self.device_name
+            .lock()
+            .map(|n| n.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    /// Change le nom annoncé ; rend `true` s'il a changé. Il vaut au
+    /// prochain lancement : à l'appelant de relancer librespot.
+    fn renommer(&self, nom: &str) -> bool {
+        let mut garde = self.device_name.lock().unwrap_or_else(|e| e.into_inner());
+        if *garde == nom {
+            return false;
+        }
+        *garde = nom.to_string();
+        true
     }
 
     /// #6946 — ce que Spotify livre à ce librespot.
@@ -660,7 +681,7 @@ impl LibrespotDaemon {
         let bitrate = self.bitrate.to_string();
         let mut args: Vec<String> = vec![
             "--name".into(),
-            self.device_name.clone(),
+            self.device_name(),
             "--bitrate".into(),
             bitrate,
             "--backend".into(),
@@ -786,7 +807,7 @@ impl LibrespotDaemon {
         self.connecte_par_jeton
             .store(jeton.is_some() || par_cache, Ordering::SeqCst);
 
-        info!(device = %self.device_name, "librespot_started");
+        info!(device = %self.device_name(), "librespot_started");
         *self.process.lock().await = Some(proc);
         Ok(())
     }
@@ -871,11 +892,30 @@ fn parse_librespot_event(line: &str) -> Option<(String, Option<String>)> {
     Some((event.to_string(), track_id))
 }
 
+/// Le nom du récepteur quand l'utilisateur n'en choisit aucun.
+pub const NOM_PAR_DEFAUT: &str = "Tune";
+
+/// Le nom que l'application Spotify affichera pour `saisie` : vide ou blanc
+/// → [`NOM_PAR_DEFAUT`] ; sinon le texte, sans les blancs autour, et sans
+/// caractère de contrôle (librespot le reçoit en argument).
+pub fn nom_du_recepteur(saisie: Option<&str>) -> String {
+    let nom: String = saisie
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let nom = nom.trim();
+    if nom.is_empty() {
+        NOM_PAR_DEFAUT.to_string()
+    } else {
+        nom.chars().take(64).collect()
+    }
+}
+
 pub struct SpotifyConnectManager {
     daemon: Arc<LibrespotDaemon>,
     enabled: Mutex<bool>,
     zone_id: Mutex<Option<i64>>,
-    device_name: String,
     relay_port: u16,
 }
 
@@ -887,16 +927,36 @@ impl SpotifyConnectManager {
     /// Comme [`Self::new`], avec un binaire imposé (tests : un faux librespot).
     pub fn avec_binaire(device_name: String, relay_port: u16, binaire: Option<String>) -> Self {
         Self {
-            daemon: Arc::new(LibrespotDaemon::new(device_name.clone(), binaire, None)),
+            daemon: Arc::new(LibrespotDaemon::new(device_name, binaire, None)),
             enabled: Mutex::new(false),
             zone_id: Mutex::new(None),
-            device_name,
             relay_port,
         }
     }
 
-    pub fn device_name(&self) -> &str {
-        &self.device_name
+    pub fn device_name(&self) -> String {
+        self.daemon.device_name()
+    }
+
+    /// Fil 2778 — le nom saisi dans Réglages › Spotify Connect était
+    /// journalisé puis oublié : librespot gardait « Tune ». Il est retenu
+    /// ici ; si librespot tourne déjà sous un autre nom, il est relancé pour
+    /// que l'application Spotify voie le nouveau. Rend `true` s'il a changé.
+    pub async fn renommer(&self, saisie: Option<&str>) -> Result<bool, String> {
+        let nom = nom_du_recepteur(saisie);
+        if !self.daemon.renommer(&nom) {
+            return Ok(false);
+        }
+        info!(nom = %nom, "spotify_connect_renomme");
+        if self.daemon.is_running().await {
+            self.daemon.stop().await;
+            self.daemon
+                .start(|event, track_id| {
+                    info!(event = %event, track_id = ?track_id, "spotify_connect_event");
+                })
+                .await?;
+        }
+        Ok(true)
     }
 
     /// La pompe du PCM de librespot (une seule par récepteur).
@@ -1023,7 +1083,7 @@ impl SpotifyConnectManager {
         let binaire = trouver_le_binaire();
         serde_json::json!({
             "enabled": enabled,
-            "device_name": &self.device_name,
+            "device_name": self.device_name(),
             "zone_id": zone_id,
             "active": running,
             "binary_available": binary_available(),
@@ -1457,5 +1517,65 @@ mod tests {
         // `/bin/echo` n'est pas un script : sa première ligne est relue
         // (« --version » en BSD, la version de coreutils en GNU).
         assert!(version_de_librespot(Path::new("/bin/echo")).await.is_some());
+    }
+
+    /// Fil 2778 — le nom saisi atteint `--name` de librespot : retenu avant
+    /// le lancement, et librespot relancé s'il tournait déjà sous un autre.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nom_2778_le_nom_choisi_atteint_librespot() {
+        let dossier = tempfile::tempdir().unwrap();
+        // Un faux librespot qui relève ses arguments et reste en vie.
+        let bin = poser(
+            dossier.path(),
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/args\"\nexec sleep 30\n",
+        );
+        let args = dossier.path().join("args");
+        let recepteur = SpotifyConnectManager::avec_binaire(
+            NOM_PAR_DEFAUT.into(),
+            0,
+            Some(bin.to_string_lossy().into_owned()),
+        );
+        let attendre = |n: usize| {
+            let args = args.clone();
+            async move {
+                for _ in 0..100 {
+                    let lu = std::fs::read_to_string(&args).unwrap_or_default();
+                    if lu.lines().count() >= n {
+                        return lu;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                std::fs::read_to_string(&args).unwrap_or_default()
+            }
+        };
+
+        // Avant l'activation (ce que fait Réglages › Spotify Connect).
+        assert!(recepteur.renommer(Some(" Tune_1 ")).await.unwrap());
+        recepteur.enable(1).await.unwrap();
+        let lu = attendre(1).await;
+        assert!(lu.contains("--name Tune_1 "), "premier lancement : {lu}");
+        assert_eq!(recepteur.status().await["device_name"], "Tune_1");
+
+        // Pendant qu'il tourne : relancé sous le nouveau nom.
+        assert!(recepteur.renommer(Some("Salon")).await.unwrap());
+        let lu = attendre(2).await;
+        assert!(
+            lu.lines()
+                .nth(1)
+                .is_some_and(|l| l.contains("--name Salon ")),
+            "relance : {lu}"
+        );
+        // Même nom : rien ne bouge.
+        assert!(!recepteur.renommer(Some("Salon")).await.unwrap());
+        recepteur.disable().await;
+    }
+
+    #[test]
+    fn nom_2778_saisie_vide_ou_sale() {
+        assert_eq!(nom_du_recepteur(None), "Tune");
+        assert_eq!(nom_du_recepteur(Some("   ")), "Tune");
+        assert_eq!(nom_du_recepteur(Some(" a\nb\t")), "ab");
+        assert_eq!(nom_du_recepteur(Some(&"x".repeat(100))).len(), 64);
     }
 }
