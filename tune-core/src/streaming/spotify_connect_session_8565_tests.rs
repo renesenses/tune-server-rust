@@ -484,6 +484,52 @@ done
         enchainement_apres_geste(&["play_request_id_changed", "loading"]).await;
     }
 
+    fn volume_evt() -> EvenementLibrespot {
+        volume(30_000)
+    }
+
+    /// Application EN PAUSE, geste de Tune, puis l'utilisateur touche le
+    /// volume dans l'application avant de relancer : la Lecture rouvre (rien
+    /// n'enchaîne pendant une pause), l'appareil n'est pas mis en pause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_geste_tune_pendant_pause_volume_puis_lecture_rouvre() {
+        let (zones, mut etat, pilote, recepteur, _d) = session_ouverte().await;
+        pilote.traiter(&mut etat, &ev("paused")).await;
+        geste_de_tune(&zones);
+        pilote.traiter(&mut etat, &volume_evt()).await;
+        assert!(
+            !etat.rendu(),
+            "une action pendant la pause n'est pas un enchaînement"
+        );
+        pilote.traiter(&mut etat, &joue("a")).await;
+        recepteur.disable().await;
+        assert_eq!(ouvertures(&zones), 2, "{:?}", zones.appels.lock().unwrap());
+        assert_eq!(
+            pauses_appareil(&zones),
+            0,
+            "{:?}",
+            zones.appels.lock().unwrap()
+        );
+    }
+
+    /// Contre-épreuve : session normale, SANS geste de Tune ; volume,
+    /// recherche dans le titre, correction de position : rien n'est fermé ni
+    /// rendu.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_8580_sans_geste_de_tune_volume_et_recherche_ne_ferment_rien() {
+        let (zones, mut etat, pilote, recepteur, _d) = session_ouverte().await;
+        for e in [volume_evt(), ev("seeked"), ev("position_correction")] {
+            pilote.traiter(&mut etat, &e).await;
+        }
+        recepteur.disable().await;
+        assert_eq!(etat.zone(), Some(9));
+        assert!(!etat.rendu());
+        assert_eq!(pauses_appareil(&zones), 0);
+        let appels = zones.appels.lock().unwrap().clone();
+        assert!(!appels.iter().any(|a| a == "arreter 9"), "{appels:?}");
+        assert_eq!(ouvertures(&zones), 1);
+    }
+
     /// La pause de l'appareil a échoué (401, appareil absent) : l'application
     /// continue d'enchaîner, rien ne rouvre ; la garde tombe à la prochaine
     /// pause, et la Lecture qui suit rouvre.
