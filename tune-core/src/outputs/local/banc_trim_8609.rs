@@ -187,7 +187,9 @@ fn produire(ring: Arc<RingBuf>, arret: Arc<AtomicBool>, capacite: usize) -> Mesu
 }
 
 /// Rafales d'allocations type session ONNX, avec bouchons qui fragmentent.
-fn baratter(arret: Arc<AtomicBool>, graine: u64) {
+/// Rend ses bouchons : ils restent vivants le temps du relevé, comme ceux
+/// d'un fil du pool `spawn_blocking` qui survit à sa tâche.
+fn baratter(arret: Arc<AtomicBool>, graine: u64) -> Vec<Vec<u8>> {
     let mut x = graine.max(1);
     let mut bouchons: Vec<Vec<u8>> = Vec::new();
     while !arret.load(Ordering::Relaxed) {
@@ -207,6 +209,7 @@ fn baratter(arret: Arc<AtomicBool>, graine: u64) {
         }
         drop(blocs);
     }
+    bouchons
 }
 
 fn passe_replaygain(fichiers: Vec<std::path::PathBuf>, arret: Arc<AtomicBool>) -> usize {
@@ -252,6 +255,8 @@ struct Phase {
     purge_max_ms: u64,
     purge_moy_ms: f64,
     pistes_rg: usize,
+    rss_max_mb: u64,
+    libre_max_mb: u64,
 }
 
 fn phase(
@@ -260,7 +265,7 @@ fn phase(
     fichiers: &[std::path::PathBuf],
     purger: bool,
     allouer_dans_le_rappel: bool,
-) -> Phase {
+) -> (Phase, Vec<Vec<Vec<u8>>>) {
     let capacite = TAUX as usize * CANAUX as usize * 2;
     let famine = Arc::new(RingStarvation::new());
     famine.begin_stream(TAUX, CANAUX);
@@ -296,8 +301,11 @@ fn phase(
 
     let fin = Instant::now() + Duration::from_secs(secondes);
     let mut durees_purge = Vec::new();
+    let (mut rss_max_mb, mut libre_max_mb) = (0u64, 0u64);
     while Instant::now() < fin {
         std::thread::sleep(Duration::from_millis(500));
+        rss_max_mb = rss_max_mb.max(crate::memoire_rendue::rss_mb().unwrap_or(0));
+        libre_max_mb = libre_max_mb.max(crate::memoire_rendue::etat_du_tas().unwrap().libre_mb);
         if purger {
             let t = Instant::now();
             crate::memoire_rendue::rendre_la_memoire_liberee();
@@ -308,11 +316,9 @@ fn phase(
     let rendu = rendu.join().unwrap();
     let producteur = prod.join().unwrap();
     let pistes_rg = rg.join().unwrap();
-    for b in barattes {
-        b.join().unwrap();
-    }
+    let bouchons: Vec<Vec<Vec<u8>>> = barattes.into_iter().map(|b| b.join().unwrap()).collect();
     let purges = durees_purge.len();
-    Phase {
+    let mesure = Phase {
         nom,
         rendu,
         producteur,
@@ -324,7 +330,10 @@ fn phase(
             durees_purge.iter().sum::<u64>() as f64 / purges as f64 / 1000.0
         },
         pistes_rg,
-    }
+        rss_max_mb,
+        libre_max_mb,
+    };
+    (mesure, bouchons)
 }
 
 fn releve(quand: &str) {
@@ -365,25 +374,33 @@ fn banc_trim_pendant_lecture_8609() {
     releve("départ");
 
     let mut phases = Vec::new();
-    phases.push(phase("1. sans purge", secondes, &fichiers, false, false));
-    releve("après phase 1 (aucune purge)");
+    let (p, bouchons) = phase("1. sans purge", secondes, &fichiers, false, false);
+    phases.push(p);
+    releve("fin phase 1 (aucune purge)");
     let t = Instant::now();
     crate::memoire_rendue::rendre_la_memoire_liberee();
     println!("  une purge : {} ms", t.elapsed().as_millis());
     releve("après UNE purge");
-    phases.push(phase("2. purge /500 ms", secondes, &fichiers, true, false));
-    releve("après phase 2");
-    phases.push(phase(
-        "3. contre-épreuve : rappel qui alloue",
+    drop(bouchons);
+    crate::memoire_rendue::rendre_la_memoire_liberee();
+    let (p, bouchons) = phase("2. purge /500 ms", secondes, &fichiers, true, false);
+    phases.push(p);
+    releve("fin phase 2");
+    drop(bouchons);
+    crate::memoire_rendue::rendre_la_memoire_liberee();
+    let (p, bouchons) = phase(
+        "3. contre-épreuve : alloue",
         secondes,
         &fichiers,
         true,
         true,
-    ));
-    releve("après phase 3");
+    );
+    phases.push(p);
+    releve("fin phase 3");
+    drop(bouchons);
 
     println!(
-        "\n  {:<40} {:>8} {:>8} {:>9} {:>9} {:>8} {:>8} {:>7} {:>9} {:>9} {:>6}",
+        "\n  {:<28} {:>8} {:>7} {:>10} {:>8} {:>10} {:>10} {:>6} {:>9} {:>9} {:>3} {:>8} {:>9}",
         "phase",
         "périodes",
         "famines",
@@ -394,11 +411,13 @@ fn banc_trim_pendant_lecture_8609() {
         "purges",
         "purge_max",
         "purge_moy",
-        "RG"
+        "RG",
+        "RSS_max",
+        "libre_max"
     );
     for p in &phases {
         println!(
-            "  {:<40} {:>8} {:>8} {:>7}µs {:>7}µs {:>8}µs {:>8}ms {:>7} {:>7}ms {:>7.1}ms {:>6}",
+            "  {:<28} {:>8} {:>7} {:>8}µs {:>6}µs {:>8}µs {:>8}ms {:>6} {:>7}ms {:>7.1}ms {:>3} {:>6}Mo {:>7}Mo",
             p.nom,
             p.rendu.periodes,
             p.rendu.famines,
@@ -409,7 +428,9 @@ fn banc_trim_pendant_lecture_8609() {
             p.purges,
             p.purge_max_ms,
             p.purge_moy_ms,
-            p.pistes_rg
+            p.pistes_rg,
+            p.rss_max_mb,
+            p.libre_max_mb
         );
     }
     let _ = std::fs::remove_dir_all(&dossier);
