@@ -2295,11 +2295,36 @@ impl QobuzService {
             .collect()
     }
 
+    /// #8271 — le titre d'une piste ou d'un album Qobuz, complété de sa
+    /// VERSION. Qobuz range le nom du mix ou de l'édition à part, dans
+    /// `version` (« Bright-Side Mix », « Dark-Side Mix », « Remastered
+    /// 2011 »…) : sans lui, deux mixes d'un même titre s'affichaient sous le
+    /// même nom, impossibles à distinguer. Rendu comme le fait Qobuz :
+    /// « Titre (Version) ». Une version vide, ou déjà présente dans le titre,
+    /// n'ajoute rien.
+    pub(crate) fn titre_avec_version(item: &serde_json::Value) -> String {
+        let titre = item["title"].as_str().unwrap_or("").trim();
+        let Some(version) = item["version"]
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        else {
+            return titre.to_string();
+        };
+        if titre.to_lowercase().contains(&version.to_lowercase()) {
+            return titre.to_string();
+        }
+        if titre.is_empty() {
+            return version.to_string();
+        }
+        format!("{titre} ({version})")
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let album = &item["album"];
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
-            title: item["title"].as_str().unwrap_or("").into(),
+            title: Self::titre_avec_version(item),
             artist: Self::artiste_interprete(item),
             // L'identifiant de CET artiste-là, pour que « Lecture en cours »
             // puisse ouvrir sa fiche sans rechercher son nom (#1361).
@@ -2309,7 +2334,9 @@ impl QobuzService {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(Into::into),
-            album: album["title"].as_str().map(Into::into),
+            album: album["title"]
+                .as_str()
+                .map(|_| Self::titre_avec_version(album)),
             album_id: album["id"]
                 .as_str()
                 .map(Into::into)
@@ -2438,7 +2465,7 @@ impl QobuzService {
                 .map(Into::into)
                 .or_else(|| item["id"].as_u64().map(|id| id.to_string()))
                 .unwrap_or_default(),
-            title: item["title"].as_str().unwrap_or("").into(),
+            title: Self::titre_avec_version(item),
             artist: item["artist"]["name"].as_str().unwrap_or("").into(),
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
             cover_path: Self::pochette(item),
@@ -3483,7 +3510,9 @@ impl StreamingService for QobuzService {
         // individual track items inside tracks.items do NOT carry an
         // "album" sub-object.  Extract the album-level title, image and
         // id so we can inject them into each mapped track.
-        let album_title = data["title"].as_str().map(String::from);
+        let album_title = data["title"]
+            .as_str()
+            .map(|_| Self::titre_avec_version(&data));
         let album_cover = Self::pochette(&data);
         let album_id_val = data["id"]
             .as_str()
@@ -9105,6 +9134,11 @@ mod page_du_label_tests;
 #[cfg(test)]
 #[path = "qobuz_delai_favoris_7760_tests.rs"]
 mod delai_favoris_7760_tests;
+
+/// #8271 — les mixes d'un même titre se distinguent par leur version.
+#[cfg(test)]
+#[path = "qobuz_versions_mixes_8271_tests.rs"]
+mod versions_mixes_8271_tests;
 
 /// #8134 — une application distante refusée ne fait ni tomber la session, ni
 /// passer le refus pour un mauvais mot de passe.
