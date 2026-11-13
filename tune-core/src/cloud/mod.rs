@@ -22,6 +22,8 @@ pub mod recommendations;
 pub mod refusal;
 #[cfg(feature = "cloud-relay")]
 pub mod relay;
+/// Renvoi unique des images d'artistes perdues par le site (rc12).
+pub mod renvoi_images_artistes;
 pub mod sauvegarde_config;
 pub mod sso;
 pub mod support;
