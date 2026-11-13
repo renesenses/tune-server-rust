@@ -307,6 +307,16 @@ pub enum Liste {
     Podcasts,
 }
 
+/// #7913 — la fiche ouverte directement, selon la route qui la sert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fiche {
+    Album,
+    Artiste,
+    Piste,
+    Radio,
+    Podcast,
+}
+
 /// La politique prête à filtrer : ensembles normalisés une fois par requête.
 pub struct Filtre {
     ids_bloques: HashSet<i64>,
@@ -422,6 +432,51 @@ impl Filtre {
             .filter_map(|k| o.get(*k).and_then(texte))
             .collect();
         !valeurs.is_empty() && !valeurs.iter().any(|v| autorises.contains(v))
+    }
+
+    /// #7913 — la politique bloque-t-elle des artistes ? Sans artiste bloqué,
+    /// les listes de la bibliothèque passent telles quelles.
+    pub fn bloque_des_artistes(&self) -> bool {
+        !self.ids_bloques.is_empty() || !self.noms_bloques.is_empty()
+    }
+
+    /// #7913 — la FICHE ouverte directement (album, artiste, piste, radio,
+    /// podcast) est-elle bloquée pour ce profil ? Le filtre des listes ne
+    /// retire que des éléments de tableaux : la racine d'une fiche lui
+    /// échappait.
+    pub fn fiche_bloquee(&self, corps: &Value, fiche: Fiche) -> bool {
+        let Value::Object(o) = corps else {
+            return false;
+        };
+        match fiche {
+            Fiche::Artiste => self.retire(o, Liste::Artistes, true),
+            Fiche::Album | Fiche::Piste => self.retire(o, Liste::Bibliotheque, false),
+            Fiche::Radio => self.retire(o, Liste::Radios, false),
+            Fiche::Podcast => self.retire(o, Liste::Podcasts, false),
+        }
+    }
+
+    /// #7913 — combien d'éléments du tableau `items` de la racine (ou de la
+    /// racine elle-même, si c'est un tableau) sont bloqués. Sert au total
+    /// exact d'une liste paginée : seuls les éléments de premier rang
+    /// comptent, pas les pistes retirées DANS un album gardé.
+    pub fn bloques_au_premier_rang(&self, corps: &Value, liste: Liste) -> usize {
+        let elements = match corps {
+            Value::Array(a) => a,
+            Value::Object(o) => match o.get("items") {
+                Some(Value::Array(a)) => a,
+                _ => return 0,
+            },
+            _ => return 0,
+        };
+        let artistes = liste == Liste::Artistes;
+        elements
+            .iter()
+            .filter(|e| match e {
+                Value::Object(o) => self.retire(o, liste, artistes),
+                _ => false,
+            })
+            .count()
     }
 
     /// Retire de `corps` les éléments bloqués, à toute profondeur, et rend

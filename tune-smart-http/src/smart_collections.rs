@@ -1623,7 +1623,8 @@ async fn resolve_albums(
     // (DecodingError.typeMismatch: expected Array, found dictionary) when
     // opening a smart collection in remote mode; the web client already
     // accepts either shape.
-    Ok(Json(albums).into_response())
+    // #8555 — la sérialisation de milliers d’albums retenait encore le fil async.
+    tune_http_types::json_hors_executeur(albums).await
 }
 
 /// Les albums d'une collection pour un profil, tels que la vue les rend :

@@ -281,6 +281,88 @@ async fn parcours_sans_duree(db: Arc<dyn DbBackend>) {
     assert!(!orch.ecoute_en_attente(SALON));
 }
 
+/// #8107 — SALON et CUISINE dans un même groupe de lecture (`zone_groups`).
+fn grouper(db: &Arc<dyn DbBackend>) {
+    crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .set(
+            crate::zones::groupes_enregistres::CLE_ZONE_GROUPS,
+            &serde_json::json!([{"id": 1, "zone_ids": [SALON, CUISINE], "leader_id": SALON}])
+                .to_string(),
+        )
+        .unwrap();
+}
+
+async fn parcours_groupe_une_ecoute(db: Arc<dyn DbBackend>) {
+    let orch = orchestrateur(db.clone());
+    grouper(&db);
+    // Le relais de groupe aligne la suiveuse : les deux zones jouent le titre,
+    // chacune arme puis valide sa propre écoute.
+    let np = piste("Ensemble", 240_000);
+    lancer(&orch, SALON, &np).await;
+    lancer(&orch, CUISINE, &np).await;
+    assert!(
+        avancer(&orch, SALON, 31_000).await,
+        "la meneuse valide au seuil"
+    );
+    assert!(
+        !avancer(&orch, CUISINE, 32_000).await,
+        "#8107 : la suiveuse n'écrit pas une seconde écoute du même titre"
+    );
+    assert_eq!(
+        ecoutes(&db),
+        1,
+        "#8107 : une écoute sur deux sorties groupées compte une seule fois"
+    );
+
+    // Le titre suivant du groupe compte, lui aussi, une seule fois — quelle
+    // que soit la zone qui atteint le seuil la première.
+    let np2 = piste("Ensemble 2", 240_000);
+    lancer(&orch, SALON, &np2).await;
+    lancer(&orch, CUISINE, &np2).await;
+    assert!(avancer(&orch, CUISINE, 31_000).await);
+    assert!(!avancer(&orch, SALON, 31_500).await);
+    assert_eq!(ecoutes(&db), 2, "#8107 : deux titres, deux écoutes");
+
+    // Un flux sans durée, écrit au démarrage par chaque zone : une fois aussi.
+    let flux = piste("Flux groupé", 0);
+    lancer(&orch, SALON, &flux).await;
+    lancer(&orch, CUISINE, &flux).await;
+    assert_eq!(ecoutes(&db), 3, "#8107 : un flux groupé compte une fois");
+}
+
+async fn parcours_zones_seules(db: Arc<dyn DbBackend>) {
+    let orch = orchestrateur(db.clone());
+    // Pas de groupe : deux zones qui jouent le même titre, ce sont deux écoutes.
+    let np = piste("Chacun chez soi", 240_000);
+    lancer(&orch, SALON, &np).await;
+    lancer(&orch, CUISINE, &np).await;
+    assert!(avancer(&orch, SALON, 31_000).await);
+    assert!(avancer(&orch, CUISINE, 31_000).await);
+    assert_eq!(
+        ecoutes(&db),
+        2,
+        "#8107 : des zones qui ne sont pas groupées comptent chacune leur écoute"
+    );
+    // Une zone seule qui rejoue le même titre le compte encore.
+    lancer(&orch, SALON, &np).await;
+    assert!(avancer(&orch, SALON, 31_000).await);
+    assert_eq!(
+        ecoutes(&db),
+        3,
+        "#8107 : une sortie seule compte normalement"
+    );
+}
+
+#[tokio::test]
+async fn lecture_groupee_une_seule_ecoute_8107() {
+    parcours_groupe_une_ecoute(sqlite()).await;
+}
+
+#[tokio::test]
+async fn zones_non_groupees_comptent_chacune_8107() {
+    parcours_zones_seules(sqlite()).await;
+}
+
 // ─── La règle ───────────────────────────────────────────────────────────────
 
 #[test]
@@ -357,7 +439,12 @@ mod pg {
             .unwrap_or_else(|e| panic!("TUNE_TEST_PG_URL posée mais connexion refusée : {e}"));
         let db: Arc<dyn DbBackend> =
             Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
-        for table in ["listen_history", "listening_resumes", "queue_items"] {
+        for table in [
+            "listen_history",
+            "listening_resumes",
+            "queue_items",
+            "settings",
+        ] {
             db.execute(
                 &format!("CREATE TEMP TABLE {table} (LIKE public.{table} INCLUDING ALL)"),
                 &[],
@@ -401,5 +488,13 @@ mod pg {
     sur_pg!(
         pg_flux_sans_duree_ecrit_au_demarrage_7852,
         parcours_sans_duree
+    );
+    sur_pg!(
+        pg_lecture_groupee_une_seule_ecoute_8107,
+        parcours_groupe_une_ecoute
+    );
+    sur_pg!(
+        pg_zones_non_groupees_comptent_chacune_8107,
+        parcours_zones_seules
     );
 }

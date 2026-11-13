@@ -806,7 +806,12 @@ pub(super) async fn enrich_all_credits(
         // Même chiffre, même instant, dans le registre : le bandeau global
         // n'affiche une fraction qu'une fois le total connu (0/0 se lit comme
         // un arrêt côté client).
-        taches.update_progress(TACHE_CREDITS, 0, total as u64, "Crédits");
+        taches.update_progress(
+            TACHE_CREDITS,
+            0,
+            total as u64,
+            crate::background_tasks::Phase::Credits,
+        );
 
         let mut enriched = 0i32;
         let mut errors = 0i32;
@@ -863,7 +868,7 @@ pub(super) async fn enrich_all_credits(
                     TACHE_CREDITS,
                     traitees(enriched, errors, skipped),
                     total as u64,
-                    "Crédits",
+                    crate::background_tasks::Phase::Credits,
                 );
             }
         }
@@ -1125,9 +1130,12 @@ async fn un_tour_de_credits(state: &AppState) -> BilanTour {
             suspendu = true;
             break;
         }
-        state
-            .background_tasks
-            .update_progress(TACHE_CREDITS_AUTO, i as u64, total, "Crédits");
+        state.background_tasks.update_progress(
+            TACHE_CREDITS_AUTO,
+            i as u64,
+            total,
+            crate::background_tasks::Phase::Credits,
+        );
         let mbid = match c.mbid.clone() {
             Some(m) => Some(m),
             None => {

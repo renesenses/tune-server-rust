@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Le lot recoit la batterie COMPLETE a chaque fusion : c'est la que les
+    # jobs lourds sautes sur les PR (Windows, macOS, FFI, librespot...) se
+    # rattrapent, avant la RC. Rafale de fusions : le groupe de concurrence
+    # ci-dessous ne garde que la derniere.
+    branches: [main, 'batch/**']
   # Toutes les PR, y compris les PR empilees dont la base est une branche de
   # travail. L'ancien filtre main/release laissait ces PR avec PostgreSQL seul.
   pull_request:
@@ -36,6 +40,13 @@ jobs:
     outputs:
       rust: ${{ steps.classer.outputs.rust }}
       full: ${{ steps.classer.outputs.full }}
+      windows: ${{ steps.lourds.outputs.windows }}
+      macos: ${{ steps.lourds.outputs.macos }}
+      ffi: ${{ steps.lourds.outputs.ffi }}
+      librespot: ${{ steps.lourds.outputs.librespot }}
+      livre: ${{ steps.lourds.outputs.livre }}
+      embedding: ${{ steps.lourds.outputs.embedding }}
+      audit: ${{ steps.lourds.outputs.audit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -123,10 +134,82 @@ jobs:
             echo "rust=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Jobs lourds sur une PR : seulement si le diff les concerne. Tout le
+      # reste (push du lot ou de main, nuit, lancement manuel, PR vers main,
+      # etiquette `ci:full`) lance tout. Une PR vers rc/* allume les familles
+      # dont un check est requis sur rc/* (audit, FFI) plus Windows et macOS.
+      # Jeu livre, embedding et librespot restent EN PLUS soumis a
+      # `full` (profil rapide des PR vers batch/* et rc/* : sautes comme
+      # avant cette etape, quel que soit le diff). Un job saute est
+      # « skipped », que GitHub compte comme reussi pour un controle requis :
+      # aucun controle requis ne disparait. Fail-closed : base introuvable,
+      # diff impossible ou sortie incomplete => tout allume.
+      - name: Choisir les jobs lourds
+        id: lourds
+        env:
+          EVENEMENT: ${{ github.event_name }}
+          BASE_REF_CI: ${{ github.base_ref }}
+          FORCER_COMPLET: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          tout() {
+            echo "jobs lourds : tout ($1)"
+            for f in windows macos ffi librespot livre embedding audit; do
+              echo "$f=true" >> "$GITHUB_OUTPUT"
+            done
+            exit 0
+          }
+          requis_rc() {
+            echo "jobs lourds : windows, macos, ffi, audit ($1)"
+            printf '%s\n' windows=true macos=true ffi=true audit=true \
+              librespot=false livre=false embedding=false >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          [ "$EVENEMENT" = pull_request ] || tout "evenement $EVENEMENT"
+          [ "$FORCER_COMPLET" = true ] && tout "etiquette ci:full"
+          case "$BASE_REF_CI" in
+            main) tout "PR vers main" ;;
+            rc/*) requis_rc "PR vers $BASE_REF_CI" ;;
+            '') tout "base de PR vide" ;;
+          esac
+          # La base du diff est le point de divergence avec la base de la PR,
+          # comme la vue « Files changed » : un lot qui avance ne doit pas
+          # allumer les jobs lourds d'une PR qui ne l'a pas touche.
+          git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null || tout "base introuvable"
+          git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null || tout "tete introuvable"
+          DEBUT="$(git merge-base "$BASE_SHA" "$HEAD_SHA")" || tout "merge-base impossible"
+          git diff --no-renames --name-only -z "$DEBUT" "$HEAD_SHA" > /tmp/chemins-lourds || tout "diff impossible"
+          # Ligne de plateforme ajoutee ou retiree (`cfg(windows)`,
+          # `target_os`, `[target.'cfg(unix)'...]`) : Windows, macOS et FFI.
+          # Fichier intermediaire : `grep -q` dans un tube + pipefail rendrait
+          # un faux « non » sur SIGPIPE.
+          git diff --no-renames -U0 "$DEBUT" "$HEAD_SHA" -- '*.rs' '*.toml' > /tmp/diff-lourds || tout "diff de contenu impossible"
+          CFG_PLATEFORME=false
+          if grep -Eq '^[+-][^+-].*(cfg|target).*(windows|unix|macos|target_os|target_family|target_vendor)' /tmp/diff-lourds; then
+            CFG_PLATEFORME=true
+          fi
+          # `tune-ffi` est la seule configuration compilee SANS `oaat` (et
+          # sans les fonctionnalites par defaut de tune-server) : une ligne
+          # `cfg(feature = ...)` / `cfg(not(feature ...))` ajoutee ou retiree
+          # allume la FFI.
+          CFG_FEATURE=false
+          if grep -Eq '^[+-][^+-].*cfg.*feature' /tmp/diff-lourds; then
+            CFG_FEATURE=true
+          fi
+          VERDICT="$(CFG_PLATEFORME="$CFG_PLATEFORME" CFG_FEATURE="$CFG_FEATURE" bash scripts/detecter-jobs-lourds-ci.sh < /tmp/chemins-lourds)" \
+            || tout "classifieur en erreur"
+          for f in windows macos ffi librespot livre embedding audit; do
+            printf '%s\n' "$VERDICT" | grep -qxE "$f=(true|false)" || tout "sortie incomplete ($f)"
+          done
+          printf '%s\n' "$VERDICT"
+          printf '%s\n' "$VERDICT" >> "$GITHUB_OUTPUT"
+
       - name: Contre-épreuves du classifieur
         run: |
           bash scripts/detecter-impact-ci.sh --autotest
           bash scripts/determiner-profil-ci.sh --autotest
+          bash scripts/detecter-jobs-lourds-ci.sh --autotest
 
       - name: Contre-épreuves des garde-fous d issues
         run: |
@@ -156,6 +239,7 @@ jobs:
             koalaman/shellcheck-alpine:v0.10.0 shellcheck --severity=warning \
             scripts/detecter-impact-ci.sh \
             scripts/determiner-profil-ci.sh \
+            scripts/detecter-jobs-lourds-ci.sh \
             scripts/verifier-fermeture.sh \
             scripts/verifier-refs-issues.sh \
             scripts/docker-install.sh \
@@ -301,7 +385,7 @@ jobs:
   test-shipped-features:
     name: Test (jeu de fonctionnalites livre)
     needs: impact
-    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.livre == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # test-shipped-features — ~5 min observe
     steps:
@@ -359,7 +443,7 @@ jobs:
   audio-embedding:
     name: Audio embedding feature
     needs: impact
-    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.embedding == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
@@ -418,10 +502,19 @@ jobs:
   # Deliberement PAS la piste « poser `ci:full` quand un Cargo.toml change » :
   # #3074 ne touchait aucun manifeste — la caisse etait deja declaree sous son
   # `cfg(unix)`, seul l'APPEL etait neuf. Ce garde-la n'aurait rien vu.
+  #
+  # 12/11/2026 (file d'attente saturee, 100+ runs) : sur une PR vers un lot,
+  # ces deux jobs ne tournent plus que si le diff touche une plateforme
+  # (chemin windows/macos/asio/coreaudio..., ligne `cfg`/`target` de
+  # plateforme, manifeste, verrou, CI, empaquetage) — voir
+  # scripts/detecter-jobs-lourds-ci.sh. Le motif #3074 (appel neuf sans ligne
+  # de plateforme) n'est donc plus vu sur la PR mais sur le PUSH du lot, ou la
+  # matrice `build` compile Windows et macOS a chaque fusion, puis chaque nuit
+  # (ci-nocturne.yml) : avant la RC, comme l'exigeait #3123.
   windows-pr:
     name: Windows + ASIO (compilation PR)
     needs: impact
-    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true'
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.windows == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -464,7 +557,7 @@ jobs:
   macos-pr:
     name: macOS (compilation PR)
     needs: impact
-    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true'
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.macos == 'true'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -810,7 +903,7 @@ jobs:
   audit:
     name: Security Audit
     needs: impact
-    if: needs.impact.outputs.rust == 'true'
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.audit == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15  # audit — 10 s observe
     # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
@@ -873,7 +966,7 @@ jobs:
   ffi:
     name: FFI mobile (compilation)
     needs: impact
-    if: needs.impact.outputs.rust == 'true'
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.ffi == 'true'
     # `tune-ffi` prend `tune-server` en `default-features = false` : c'est la
     # SEULE configuration du depot ou la feature `oaat` est absente. Les sept
     # cibles de release.yml l'activent toutes, `cargo test --workspace` aussi.
@@ -963,7 +1056,7 @@ jobs:
   librespot:
     name: librespot (${{ matrix.target }})
     needs: impact
-    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true'
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.librespot == 'true'
     strategy:
       fail-fast: false
       matrix:

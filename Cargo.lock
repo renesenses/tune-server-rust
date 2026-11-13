@@ -6629,6 +6629,7 @@ version = "1.0.0"
 dependencies = [
  "aes",
  "aes-gcm",
+ "alsa",
  "ape-decoder",
  "argon2",
  "async-stream",
@@ -6773,7 +6774,9 @@ dependencies = [
  "axum",
  "reqwest",
  "rusqlite",
+ "serde",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 

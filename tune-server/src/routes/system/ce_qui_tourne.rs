@@ -218,6 +218,9 @@ pub(crate) fn avancement(state: &AppState, tache: Tache) -> Value {
                     "processed": p.processed,
                     "total": p.total,
                     "detail": if p.detail.is_empty() { id } else { p.detail },
+                    // #8282 — le code stable de la sous-phase, et ses paramètres.
+                    "detail_code": p.detail_code,
+                    "detail_params": p.detail_params,
                 })
             })
             .unwrap_or(Value::Null),

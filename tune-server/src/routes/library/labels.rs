@@ -624,7 +624,12 @@ pub(crate) fn lancer_passes_logos(
             (n as u64).min(total)
         }
     };
-    taches.update_progress(TACHE_LOGOS_LABELS, 0, total, "labels");
+    taches.update_progress(
+        TACHE_LOGOS_LABELS,
+        0,
+        total,
+        crate::background_tasks::Phase::Labels,
+    );
     tokio::spawn(async move {
         let _garde = garde;
         let mut toutes = Box::pin(futures_util::future::join_all(passes));
@@ -632,12 +637,17 @@ pub(crate) fn lancer_passes_logos(
             tokio::select! {
                 fins = &mut toutes => break fins.into_iter().map(|r| r.unwrap_or(0)).sum(),
                 _ = tokio::time::sleep(PERIODE_AVANCEMENT) => {
-                    taches.update_progress(TACHE_LOGOS_LABELS, traites(), total, "labels");
+                    taches.update_progress(TACHE_LOGOS_LABELS, traites(), total, crate::background_tasks::Phase::Labels);
                 }
             }
         };
         let traites = traites();
-        taches.update_progress(TACHE_LOGOS_LABELS, traites, total, "labels");
+        taches.update_progress(
+            TACHE_LOGOS_LABELS,
+            traites,
+            total,
+            crate::background_tasks::Phase::Labels,
+        );
         let bilan = json!({
             "started_at": debut,
             "finished_at": maintenant(),

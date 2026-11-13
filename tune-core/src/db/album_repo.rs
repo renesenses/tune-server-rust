@@ -7,6 +7,17 @@ use super::models::{Album, SourcePochette};
 use super::sqlite::SqliteDb;
 use crate::TuneError;
 
+/// Première position de chaque initiale dans une liste triée.
+pub type ReperesAlphabetiques = std::collections::BTreeMap<String, usize>;
+
+/// Une page et les repères calculés avec son ordre complet (#7774).
+/// Aucun album supplémentaire ni requête supplémentaire pour le rail A–Z.
+pub struct PageAlbumsAvecReperes {
+    pub albums: Vec<Album>,
+    pub total: Option<i64>,
+    pub reperes_alphabetiques: Option<ReperesAlphabetiques>,
+}
+
 /// #5034 — la pochette d'un album et ce que la base sait de sa source.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EtatPochette {
@@ -4053,13 +4064,15 @@ impl AlbumRepo {
         Ok(par_id)
     }
 
-    /// #7725 — le plus grand nombre de canaux des pistes de chaque album de
-    /// `ids`, en une requête groupée par paquet. Un album absent de la table
-    /// rendue n'a aucune piste dont le nombre de canaux soit connu.
-    pub fn canaux_max_par_album(
+    /// #7725 — le plus petit et le plus grand nombre de canaux des pistes de
+    /// chaque album de `ids` (`(min, max)`), en une requête groupée par
+    /// paquet. Le plus petit sert au filtre Stéréo (#8560). Un album absent
+    /// de la table rendue n'a aucune piste dont le nombre de canaux soit
+    /// connu.
+    pub fn canaux_min_max_par_album(
         &self,
         ids: &[i64],
-    ) -> Result<std::collections::HashMap<i64, i64>, TuneError> {
+    ) -> Result<std::collections::HashMap<i64, (i64, i64)>, TuneError> {
         let mut par_id = std::collections::HashMap::new();
         for chunk in ids.chunks(5000) {
             let id_list = chunk
@@ -4068,16 +4081,18 @@ impl AlbumRepo {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT album_id, MAX(channels) FROM tracks \
+                "SELECT album_id, MIN(channels), MAX(channels) FROM tracks \
                   WHERE album_id IN ({id_list}) AND channels IS NOT NULL \
+                    AND channels > 0 \
                   GROUP BY album_id"
             );
             for row in &self.db.query_many(&sql, &[])? {
-                if let (Some(id), Some(n)) = (
+                if let (Some(id), Some(min), Some(max)) = (
                     row.first().and_then(|v| v.as_i64()),
                     row.get(1).and_then(|v| v.as_i64()),
+                    row.get(2).and_then(|v| v.as_i64()),
                 ) {
-                    par_id.insert(id, n);
+                    par_id.insert(id, (min, max));
                 }
             }
         }
@@ -4215,7 +4230,7 @@ impl AlbumRepo {
             None,
             false,
         )
-        .map(|(albums, _)| albums)
+        .map(|page| page.albums)
     }
 
     /// [`Self::list_filtered_seeded`], plus l'EFFECTIF de l'ensemble filtré,
@@ -4257,6 +4272,39 @@ impl AlbumRepo {
             None,
             true,
         )
+        .map(|page| (page.albums, page.total))
+    }
+
+    /// Version conservant les repères pour le client paginé.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_filtered_seeded_avec_reperes(
+        &self,
+        limit: i64,
+        offset: i64,
+        sort: &str,
+        order: &str,
+        format: Option<&str>,
+        quality: Option<&str>,
+        compilation: Option<bool>,
+        include_hidden: bool,
+        dr: Option<DrRange>,
+        seed: Option<i64>,
+        avec_total: bool,
+    ) -> Result<PageAlbumsAvecReperes, TuneError> {
+        self.lister_filtre(
+            limit,
+            offset,
+            sort,
+            order,
+            format,
+            quality,
+            compilation,
+            include_hidden,
+            dr,
+            seed,
+            None,
+            avec_total,
+        )
     }
 
     /// [`Self::list_filtered_seeded_avec_total`], restreint aux albums qui
@@ -4294,6 +4342,7 @@ impl AlbumRepo {
             Some(recherche),
             true,
         )
+        .map(|page| (page.albums, page.total))
     }
 
     /// Le prédicat de la recherche de l'écran Bibliothèque (fil 1684).
@@ -4354,7 +4403,7 @@ impl AlbumRepo {
         valeurs: &[&dyn ToSqlValue],
         par_artiste: bool,
         desc: bool,
-    ) -> Result<Vec<i64>, TuneError> {
+    ) -> Result<(Vec<i64>, ReperesAlphabetiques), TuneError> {
         use crate::upnp_server::{CleAlphabetique, cle_alphabetique};
         let lignes = self.db.query_many(sql, valeurs)?;
         let mut cles: Vec<(CleAlphabetique, Option<i64>, Option<CleAlphabetique>, i64)> = lignes
@@ -4383,7 +4432,11 @@ impl AlbumRepo {
                 .then_with(|| a.2.cmp(&b.2))
                 .then_with(|| a.3.cmp(&b.3))
         });
-        Ok(cles.into_iter().map(|(_, _, _, id)| id).collect())
+        let mut reperes = std::collections::BTreeMap::new();
+        for (offset, (cle, _, _, _)) in cles.iter().enumerate() {
+            reperes.entry(cle.initiale().to_string()).or_insert(offset);
+        }
+        Ok((cles.into_iter().map(|(_, _, _, id)| id).collect(), reperes))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4419,7 +4472,7 @@ impl AlbumRepo {
         // `false` = le SQL d'avant, au caractère près, pour les appelants qui
         // n'ont que faire du total (Browse UPnP, maintenance).
         avec_total: bool,
-    ) -> Result<(Vec<Album>, Option<i64>), TuneError> {
+    ) -> Result<PageAlbumsAvecReperes, TuneError> {
         let dir = if order.eq_ignore_ascii_case("desc") {
             "DESC"
         } else {
@@ -4513,6 +4566,9 @@ impl AlbumRepo {
         // #7725 : Multicanal se lit sur les pistes, l'album n'a pas de canaux.
         if quality == Some(Album::QUALITE_MULTICANAL) {
             wheres.push(Album::multicanal_sql_album("a"));
+        } else if quality == Some(Album::QUALITE_STEREO) {
+            // #8560 : Stéréo se lit aussi sur les pistes.
+            wheres.push(Album::stereo_sql_album("a"));
         } else if let Some(pred) = quality.and_then(|q| Album::quality_sql(q, "a")) {
             wheres.push(pred);
         }
@@ -4633,7 +4689,7 @@ impl AlbumRepo {
         } else {
             format!("SELECT a.id{colonne_total} FROM albums a {joins}")
         };
-        let (ordered_ids, total) = if matches!(sort, "title" | "artist") {
+        let (ordered_ids, total, reperes_alphabetiques) = if matches!(sort, "title" | "artist") {
             // #4956 — les deux tris ALPHABÉTIQUES (les seuls où le client web
             // offre le rail A–Z) suivent l'ordre du serveur média, calculé en
             // Rust : `LOWER(a.title)` / `LOWER(ar.name)` ne repliaient que
@@ -4648,12 +4704,13 @@ impl AlbumRepo {
             );
             let refs: Vec<&dyn ToSqlValue> =
                 bind_values.iter().map(|v| v as &dyn ToSqlValue).collect();
-            let ids =
+            let (ids, reperes) =
                 self.ids_en_ordre_alphabetique(&sql, &refs, sort == "artist", dir == "DESC")?;
             let total = avec_total.then_some(ids.len() as i64);
             (
                 super::ordre_alphabetique::tranche(ids, limit, offset),
                 total,
+                Some(reperes),
             )
         } else {
             let sql = format!(
@@ -4676,10 +4733,14 @@ impl AlbumRepo {
             } else {
                 None
             };
-            (ordered_ids, total)
+            (ordered_ids, total, None)
         };
         if ordered_ids.is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok(PageAlbumsAvecReperes {
+                albums: Vec::new(),
+                total: None,
+                reperes_alphabetiques,
+            });
         }
 
         // #3397 — la date d'ajout se lit ICI, sur la page déjà bornée, pour
@@ -4730,7 +4791,11 @@ impl AlbumRepo {
                 Some(album)
             })
             .collect();
-        Ok((albums, total))
+        Ok(PageAlbumsAvecReperes {
+            albums,
+            total,
+            reperes_alphabetiques,
+        })
     }
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, TuneError> {

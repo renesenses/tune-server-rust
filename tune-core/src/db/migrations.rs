@@ -2868,6 +2868,20 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "radio_stations_surcharge_locale",
         up: "",
     },
+    // #8160 — la fiche technique d'une piste : la trace DATÉE du spectrogramme
+    // conservé (nom du PNG du cache, taille, date et durée du calcul) et la
+    // signature du fichier audio au moment du calcul, qui dit s'il faut le
+    // recalculer. Numérotée 148 / PG 114 le 11/11 : 143 / PG 109 sont pris
+    // par #8119 dans le lot, 144 à 147 / PG 110 à 113 sont réservés à
+    // d'autres PR qui fusionnent avant celle-ci.
+    // Jumelle PG : 114.
+    Migration { version: 148, name: "spectrogrammes", up: include_str!("../../migrations/spectrogrammes.sql") },
+    // #8189 — les sources réseau lues sans montage (socle « source
+    // distante », étape 2). Numérotée 149 / PG 115 le 11/11 : 143 / PG 109
+    // sont pris par #8119 dans le lot, 144 à 148 / PG 110 à 114 sont
+    // réservés à d'autres PR (dont #8160, spectrogrammes, en 148 / PG 114)
+    // qui fusionnent avant celle-ci.
+    Migration { version: 149, name: "sources_reseau", up: include_str!("../../migrations/sources_reseau.sql") },
 ];
 
 /// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
@@ -6099,6 +6113,20 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         113,
         "radio_stations_surcharge_locale",
         include_str!("../../migrations/postgres/113_radio_stations_surcharge_locale.sql"),
+    ),
+    // Jumelle de la SQLite 148 (#8160) : la trace datée du spectrogramme
+    // conservé d'une piste et la signature de son fichier.
+    (
+        114,
+        "spectrogrammes",
+        include_str!("../../migrations/postgres/114_spectrogrammes.sql"),
+    ),
+    // Jumelle de la SQLite 149 (#8189) : les sources réseau, même DDL
+    // (`migrations/sources_reseau.sql`).
+    (
+        115,
+        "sources_reseau",
+        include_str!("../../migrations/postgres/115_sources_reseau.sql"),
     ),
 ];
 
@@ -9895,7 +9923,11 @@ mod tests {
         // 113 : `radio_stations_surcharge_locale` (web#2795), jumelle de la
         // SQLite 147. Pose la surcharge locale d'une station de l'annuaire, que
         // la liste et le relevé NOMMENT.
-        assert_eq!(pg_latest_version(), 113, "latest PG migration must be 113");
+        // 114 : `spectrogrammes` (#8160), jumelle de la SQLite 148. Crée la
+        // trace datée des spectrogrammes conservés, que la fiche technique NOMME.
+        // 115 : `sources_reseau` (#8189), jumelle de la SQLite 149. Crée la
+        // table des sources réseau lues sans montage.
+        assert_eq!(pg_latest_version(), 115, "latest PG migration must be 115");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
