@@ -220,6 +220,13 @@ path = "tests/integration_contracts.rs"
 name = "purge_sous_mlockall_8609"
 path = "tests/purge_sous_mlockall_8609.rs"
 
+# Banc rc12 (#8609) — rétablissement du verrou refusé par le noyau, puis
+# retenté au relevé suivant. Binaire à lui seul (`mlockall` et
+# `RLIMIT_MEMLOCK` valent pour tout le processus).
+[[test]]
+name = "purge_reverrouillage_refuse_8609"
+path = "tests/purge_reverrouillage_refuse_8609.rs"
+
 # `autotests = false` : sans cette cible, le témoin ne serait jamais compilé.
 # Binaire à lui seul : le cache d'intérêt de tracing est un état de PROCESSUS
 # (voir l'en-tête du fichier, #5370).
