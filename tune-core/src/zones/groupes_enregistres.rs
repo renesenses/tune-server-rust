@@ -448,9 +448,10 @@ mod tests {
 
     #[test]
     fn normaliser_le_reglage_sur_sqlite_8680() {
-        verifier_le_reglage_8680(Arc::new(
-            crate::db::sqlite::SqliteDb::open_in_memory().unwrap(),
-        ));
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        verifier_le_reglage_8680(Arc::new(db));
     }
 
     #[cfg(feature = "postgres")]

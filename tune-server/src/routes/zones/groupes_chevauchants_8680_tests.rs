@@ -213,7 +213,7 @@ async fn etendre_un_groupe_retire_ses_zones_des_autres_groupes() {
     assert_eq!(groupes, vec![groupe(1, b, &[b, c, d])]);
 
     // Une composition de moins de deux zones est refusée, comme à la création.
-    assert_eq!(patcher(&state, 1, json!({ "zone_ids": [b, b] })).await, 400);
+    assert_eq!(patcher(&state, 1, json!({ "zone_ids": [b, b] })).await, 422);
     assert_eq!(lire_les_groupes(&state), vec![groupe(1, b, &[b, c, d])]);
 }
 
