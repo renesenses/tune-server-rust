@@ -143,7 +143,8 @@ fn reglages(base: &str, cache: &std::path::Path) -> Reglages {
 }
 
 fn champ(corps: &str, nom: &str) -> Option<String> {
-    let debut = corps.find(&format!("name=\"{nom}\"\r\n\r\n"))? + nom.len() + 10;
+    let marque = format!("name=\"{nom}\"\r\n\r\n");
+    let debut = corps.find(&marque)? + marque.len();
     let fin = corps[debut..].find("\r\n")?;
     Some(corps[debut..debut + fin].to_string())
 }
