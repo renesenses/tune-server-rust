@@ -465,3 +465,96 @@ fn l_annuaire_compte_ses_facettes_sous_la_qualite_min() {
     assert_eq!(corps["total"], 2);
     assert_eq!(corps["countries"], json!([{"code": "FR", "count": 1}]));
 }
+
+/// Recette rc12 (13/11) — une fiche au seul flux donné, sous un nom.
+fn fiche_a_un_flux(nom: &str, codec: Option<&str>, frequence: i32) -> StationAnnuaire {
+    let url = format!("https://exemple.invalid/{nom}");
+    StationAnnuaire {
+        name: nom.into(),
+        stream_url: url.clone(),
+        codec: codec.map(Into::into),
+        flux: vec![FluxAnnuaire {
+            url,
+            codec: codec.map(Into::into),
+            bitrate: Some(320),
+            sample_rate: Some(frequence),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn hires_rc12_un_flux_avec_perte_n_est_jamais_hires() {
+    let c = criteres("hires=true");
+    // Les deux fiches de l'annuaire réel qui passaient à tort le 13/11.
+    for (nom, codec, frequence) in [
+        ("africa-mp3-192k", Some("MP3"), 192_000),
+        ("wrsi-aac-96k", Some("AAC"), 96_000),
+        ("aac-plus-96k", Some("AAC+"), 96_000),
+        ("opus-96k", Some("opus"), 96_000),
+        ("vorbis-96k", Some("Ogg Vorbis"), 96_000),
+        ("format-inconnu-96k", None, 96_000),
+        ("flac-cd", Some("FLAC"), 44_100),
+        ("flac-48k", Some("FLAC"), 48_000),
+    ] {
+        assert!(
+            !c.retient_la_fiche(&fiche_a_un_flux(nom, codec, frequence), None),
+            "{nom} : un flux avec perte, de format inconnu ou à 48 kHz au plus n'est pas Hi-Res"
+        );
+    }
+    for (nom, codec, frequence) in [
+        ("flac-96k", "FLAC", 96_000),
+        ("flac-192k", "flac", 192_000),
+        ("alac-88k", "ALAC", 88_200),
+        ("ogg-flac-96k", "Ogg FLAC", 96_000),
+    ] {
+        assert!(
+            c.retient_la_fiche(&fiche_a_un_flux(nom, Some(codec), frequence), None),
+            "{nom} : un flux sans perte au-delà de 48 kHz est Hi-Res"
+        );
+    }
+}
+
+#[test]
+fn hires_rc12_le_flux_sans_perte_doit_etre_celui_de_la_haute_frequence() {
+    // Un FLAC 44,1 kHz à côté d'un AAC 96 kHz : aucun flux n'est Hi-Res.
+    let mut f = fiche_a_un_flux("melange", Some("FLAC"), 44_100);
+    f.flux.push(flux(
+        "https://exemple.invalid/melange.aac",
+        "AAC",
+        320,
+        96_000,
+    ));
+    assert!(!criteres("hires=true").retient_la_fiche(&f, None));
+    // Un MP3 principal et un FLAC 192 kHz de secours : la station en a un.
+    let mut g = fiche_a_un_flux("secours", Some("MP3"), 44_100);
+    g.flux.push(flux(
+        "https://exemple.invalid/secours.flac",
+        "FLAC",
+        9216,
+        192_000,
+    ));
+    assert!(criteres("hires=true").retient_la_fiche(&g, None));
+}
+
+#[test]
+fn hires_rc12_mes_radios_juge_le_flux_ecoute() {
+    // « Mes radios » écoute le MP3 que l'annuaire dit à 192 kHz : pas Hi-Res.
+    let fiche = fiche_a_un_flux("africa", Some("MP3"), 192_000);
+    let st = station(
+        "Africa",
+        "https://exemple.invalid/africa",
+        "France",
+        "Pop",
+        None,
+        None,
+        false,
+    );
+    assert!(
+        criteres("hires=true")
+            .filtrer_les_stations(vec![st], &[fiche], &HashMap::new())
+            .is_empty(),
+        "un MP3 de « Mes radios » ne passe pas le filtre Hi-Res"
+    );
+}

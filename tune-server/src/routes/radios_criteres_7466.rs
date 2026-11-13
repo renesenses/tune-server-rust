@@ -14,8 +14,9 @@
 //! de stations, l'annuaire est en mémoire).
 //!
 //! Critères livrés : `genre` (liste séparée par des virgules), `country` (code
-//! ISO alpha-2), `codec`, `bitrate_min`, `lossless`, `hires` (un flux au-delà
-//! de 48 kHz — la profondeur en bits n'est publiée nulle part), `favorites_only`,
+//! ISO alpha-2), `codec`, `bitrate_min`, `lossless`, `hires` (un flux SANS
+//! PERTE au-delà de 48 kHz, voir [`FluxProfil::est_hires`] — la profondeur en
+//! bits n'est publiée nulle part), `favorites_only`,
 //! `rated_min` (la note moyenne radio-metadata.fr, `avg_rating`) et
 //! `metadata_plus` (la fiche a une clé radio-metadata.fr : le badge Metadata+).
 //! #7718 — `quality_min`, un niveau de qualité de flux sans distinction de
@@ -38,7 +39,7 @@ use super::radios_libelles::{cle_genre, code_pays};
 /// (sans texte) : l'annuaire entier se parcourt par `GET /radios/directory`.
 pub const SUGGESTIONS_MAX: usize = 200;
 
-/// Au-delà, c'est de la haute résolution.
+/// Au-delà, un flux SANS PERTE est de la haute résolution.
 const FREQUENCE_HIRES: i32 = 48_000;
 
 /// La fréquence d'un CD, celle que suppose un flux sans perte muet.
@@ -85,6 +86,20 @@ struct FluxProfil {
     sans_perte: bool,
     debit: Option<i32>,
     frequence: Option<i32>,
+}
+
+impl FluxProfil {
+    /// Recette rc12 (13/11) — LA définition du Hi-Res d'une radio : un flux
+    /// SANS PERTE (FLAC, ALAC, WAV… selon son codec réel) au-delà de 48 kHz.
+    /// Un MP3 ou un AAC n'est jamais Hi-Res, quels que soient son débit et la
+    /// fréquence que l'annuaire lui prête (« Africa Radio » : MP3 « 192 kHz »,
+    /// « WRSI » : AAC 96 kHz) ; un flux de format inconnu non plus. Avant, la
+    /// station passait sur la plus haute fréquence de N'IMPORTE LEQUEL de ses
+    /// flux, sans regarder le format. La profondeur en bits n'est publiée
+    /// par aucun annuaire : seule la fréquence départage.
+    fn est_hires(&self) -> bool {
+        self.sans_perte && self.frequence.is_some_and(|f| f > FREQUENCE_HIRES)
+    }
 }
 
 /// Un nombre JSON, écrit en nombre ou en texte (`4.7` ou `"4.7"`).
@@ -166,7 +181,6 @@ struct Profil<'a> {
     codecs: Vec<String>,
     /// #7718 — chaque flux, jugé un par un.
     flux: Vec<FluxProfil>,
-    frequence_max: Option<i32>,
     note_centiemes: Option<i32>,
     favori: bool,
     metadata_plus: bool,
@@ -274,7 +288,7 @@ impl Criteres {
                 .qualite_min
                 .is_none_or(|n| p.flux.iter().any(|x| n.atteint(x)))
             && (!self.sans_perte || p.codecs.iter().any(|c| est_sans_perte(c)))
-            && (!self.hires || p.frequence_max.is_some_and(|f| f > FREQUENCE_HIRES))
+            && (!self.hires || p.flux.iter().any(FluxProfil::est_hires))
             && (!self.favoris || p.favori)
             && self.note_min.is_none_or(|min| {
                 p.note_centiemes
@@ -368,7 +382,6 @@ fn profil_de_fiche(f: &StationAnnuaire, favori: Option<bool>) -> Profil<'_> {
         pays: f.country.clone(),
         codecs,
         flux,
-        frequence_max: f.flux.iter().filter_map(|x| x.sample_rate).max(),
         note_centiemes: f.note_centiemes,
         favori: favori == Some(true),
         metadata_plus: f.radio_metadata_key.is_some(),
@@ -414,7 +427,6 @@ fn profil_de_station<'a>(st: &'a RadioStation, fiche: Option<&'a StationAnnuaire
         pays: st.country.clone(),
         codecs: codec.map(|c| famille_codec(&c)).into_iter().collect(),
         flux: vec![ecoute],
-        frequence_max: flux.and_then(|x| x.sample_rate),
         note_centiemes: fiche.and_then(|f| f.note_centiemes),
         favori: st.is_favorite,
         metadata_plus: fiche.is_some_and(|f| f.radio_metadata_key.is_some()),
