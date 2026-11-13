@@ -413,3 +413,45 @@ async fn hqplayer_play_acquitte_sans_demarrage_arrete_la_zone_et_dit_pourquoi_72
         1
     );
 }
+
+/// #7779 — le VRAI orchestrateur : une zone HQPlayer mise en pause puis
+/// arrêtée (bouton Stop, fin de file) laisse HQPlayer ARRÊTÉ (état 0,
+/// constaté par `Status`), pas en pause avec son traitement prêt (~70 W).
+/// La pause, elle, n'envoie aucun `Stop` : la reprise reste sur place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zone_hqplayer_arretee_apres_une_pause_arrete_hqplayer_7779() {
+    let banc = Banc::monter().await;
+    let device = banc.faux.device_id();
+    banc.poller
+        .orchestrator
+        .pause(banc.zone_id, Some(&device))
+        .await
+        .unwrap();
+    assert_eq!(
+        banc.faux.etat.lock().unwrap().etat,
+        1,
+        "{:?}",
+        banc.faux.recu()
+    );
+    assert!(
+        !banc.faux.recu().iter().any(|c| c.starts_with("<Stop")),
+        "#7779 : la pause ne doit pas arrêter HQPlayer : {:?}",
+        banc.faux.recu()
+    );
+
+    banc.faux.regler(|e| e.status_avant_arret = 1);
+    banc.poller
+        .orchestrator
+        .stop(banc.zone_id, Some(&device))
+        .await;
+    assert_eq!(
+        banc.faux.etat.lock().unwrap().etat,
+        0,
+        "#7779 : zone arrêtée, HQPlayer pas arrêté ; reçu {:?}",
+        banc.faux.recu()
+    );
+    assert_eq!(
+        banc.playback.get_state(banc.zone_id).await.state,
+        PlayState::Stopped
+    );
+}

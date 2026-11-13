@@ -234,7 +234,10 @@ impl HqplayerOutput {
     /// l'arrêt effectif (`0`) : d'où l'attente sur `Status`, pas seulement
     /// l'envoi. Une borne dépassée refuse le lancement suivant : continuer
     /// réutiliserait un moteur dont l'arrêt n'a jamais été confirmé (#7244).
-    async fn arreter_et_attendre(&self) -> Result<(), String> {
+    ///
+    /// #7779 — sert aussi l'arrêt de la zone (`stop`) : `pour` le dit au
+    /// journal et dans l'erreur (« avant lancement » ou « arrêt de zone »).
+    async fn arreter_et_attendre(&self, pour: PourquoiLArret) -> Result<(), String> {
         self.action("<Stop />").await?;
         let debut = tokio::time::Instant::now();
         let limite = debut + ATTENTE_ARRET;
@@ -250,7 +253,8 @@ impl HqplayerOutput {
                         info!(
                             device = %self.name,
                             attente_ms = debut.elapsed().as_millis() as u64,
-                            "hqplayer_arret_avant_lancement"
+                            pour = pour.journal(),
+                            "hqplayer_arret_confirme"
                         );
                         return Ok(());
                     }
@@ -274,12 +278,10 @@ impl HqplayerOutput {
         warn!(
             device = %self.name,
             borne_ms = ATTENTE_ARRET.as_millis() as u64,
-            "hqplayer_arret_non_confirme — lancement refuse sans arret rapporte par Status"
+            pour = pour.journal(),
+            "hqplayer_arret_non_confirme — aucun arret rapporte par Status"
         );
-        Err(
-            "hqplayer_stop_not_confirmed: HQPlayer did not stop before loading the next track"
-                .into(),
-        )
+        Err(format!("hqplayer_stop_not_confirmed: {}", pour.message()))
     }
 
     fn enchainement(&self) -> std::sync::MutexGuard<'_, Enchainement> {
@@ -535,6 +537,30 @@ impl HqplayerOutput {
                 *conn = None;
                 Err(e)
             }
+        }
+    }
+}
+
+/// #7779 — pourquoi HQPlayer est arrêté : avant un autre titre (#6115) ou
+/// parce que la zone s'arrête.
+#[derive(Clone, Copy)]
+enum PourquoiLArret {
+    Lancement,
+    ArretDeZone,
+}
+
+impl PourquoiLArret {
+    fn journal(self) -> &'static str {
+        match self {
+            Self::Lancement => "avant_lancement",
+            Self::ArretDeZone => "arret_de_zone",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Lancement => "HQPlayer did not stop before loading the next track",
+            Self::ArretDeZone => "HQPlayer did not report the stop; it may still be paused",
         }
     }
 }
@@ -900,10 +926,12 @@ impl OutputTarget for HqplayerOutput {
             etat,
             Some(TransportState::Playing | TransportState::Paused | TransportState::Transitioning)
         ) {
-            self.arreter_et_attendre().await.map_err(|e| {
-                warn!(error = %e, "hqplayer_stop_before_play_failed");
-                e
-            })?;
+            self.arreter_et_attendre(PourquoiLArret::Lancement)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "hqplayer_stop_before_play_failed");
+                    e
+                })?;
         }
 
         // Match complete action acknowledgements when present. HQPlayer 6 can
@@ -961,11 +989,31 @@ impl OutputTarget for HqplayerOutput {
         self.attendre_le_demarrage().await
     }
 
+    /// #7779 — un VRAI arrêt, quand la zone s'arrête (bouton Stop, fin de
+    /// la file, changement de sortie) : jamais en pause, dont la reprise
+    /// reste un `Play` sur place.
+    ///
+    /// Retour terrain (nurni, rc9, HQPlayer Embedded 5.17, SDM DSD256 et
+    /// convolution) : un HQPlayer en pause garde tout son traitement prêt et
+    /// l'hôte reste à ~70 W ; seul `Stop` le ramène au repos (~31 W, mesuré
+    /// quand Roon l'envoie). L'ancien arrêt écrivait `Stop` sans vérifier :
+    /// un v6 muet ou une connexion perdue laissaient HQPlayer en pause sans
+    /// que personne le sache. Désormais, `Stop` est suivi de `Status` jusqu'à
+    /// l'état 0 (borne [`ATTENTE_ARRET`], comme le lancement #6115), et un
+    /// arrêt non rapporté est une erreur, journalisée par l'orchestrateur
+    /// (`device_stop_failed`).
     async fn stop(&self) -> Result<(), String> {
-        self.action("<Stop />").await?;
         self.enchainement().suivante = None;
-        info!(device = %self.name, "hqplayer_stop");
-        Ok(())
+        match self.arreter_et_attendre(PourquoiLArret::ArretDeZone).await {
+            Ok(()) => {
+                info!(device = %self.name, "hqplayer_stop confirme");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(device = %self.name, error = %e, "hqplayer_stop_non_confirme");
+                Err(e)
+            }
+        }
     }
 
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
@@ -1292,6 +1340,9 @@ pub(crate) mod enchainement_tests_4851;
 #[path = "hqplayer_lancement_tests_6115.rs"]
 mod lancement_tests_6115;
 
+#[cfg(test)]
+#[path = "hqplayer_arret_tests_7779.rs"]
+mod arret_tests_7779;
 #[cfg(test)]
 #[path = "hqplayer_controle_tests_7244.rs"]
 mod controle_tests_7244;

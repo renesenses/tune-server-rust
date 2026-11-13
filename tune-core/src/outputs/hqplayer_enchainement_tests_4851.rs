@@ -146,6 +146,11 @@ fn repondre(etat: &mut EtatFaux, ligne: &str) -> String {
     }
     if ligne.starts_with("<Play ") || ligne.starts_with("<Play/") {
         etat.etat = if etat.refuse_la_sortie { 0 } else { 2 };
+    } else if ligne.starts_with("<Pause") {
+        // #7779 — la pause garde le moteur prêt (état 1), elle n'arrête rien.
+        if etat.etat == 2 {
+            etat.etat = 1;
+        }
     } else if ligne.starts_with("<Stop") {
         if etat.n_arrete_jamais || etat.status_avant_arret > 0 {
             etat.etat = 3;
