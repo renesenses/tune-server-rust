@@ -107,6 +107,159 @@ pub fn lignes_bannies_a_enjamber(
     (verdict, enjambees)
 }
 
+/// #8600 — ce qu'est devenu le pré-transcodage de la piste suivante.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrechauffageSuivante {
+    /// Pas de suivante locale, paramètres différents, DSD ou métadonnées
+    /// manquantes : la clé de cache de la vraie lecture n'est pas garantie.
+    Ecarte,
+    /// Un rendu de la suivante est déjà dans le cache.
+    DejaEnCache,
+    /// #8600 — la suivante est trop lourde pour le bras fichier (même règle
+    /// que la piste en cours, #8558) : rien n'est chargé.
+    TropLourde,
+    /// Rendu écrit dans le cache.
+    Rechauffee,
+    /// Le transcodage a échoué ; le fichier temporaire est retiré.
+    Echec,
+}
+
+/// Le corps de [`PlaybackOrchestrator::spawn_warm_next_local`], attendu par
+/// les tests. `disponible` : la mémoire disponible mesurée (`None` hors Linux).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn prechauffer_la_suivante_locale(
+    db: Arc<dyn crate::db::backend::DbBackend>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    cur_sr: u32,
+    cur_bd: u16,
+    cur_ch: u16,
+    out_ext: String,
+    out_sr: u32,
+    out_bd: u16,
+    target_fmt: String,
+    disponible: Option<u64>,
+) -> PrechauffageSuivante {
+    use PrechauffageSuivante::*;
+    // Locate the current queue position and the item right after it.
+    let qrepo = PlayQueueRepo::with_backend(db.clone());
+    let queue = match qrepo.get_queue(zone_id) {
+        Ok(q) => q,
+        Err(_) => return Ecarte,
+    };
+    let Some(cur_pos) = queue.iter().find(|q| q.is_current).map(|q| q.position) else {
+        return Ecarte;
+    };
+    // #5143 — la suivante que l'avance jouera : une bannie est
+    // enjambée, jamais transcodée pour rien.
+    let session = playback.get_state(zone_id).await.session_profile_id;
+    let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1, session)
+        .0
+        .position_depuis(cur_pos + 1)
+    else {
+        return Ecarte;
+    };
+    let Some(next) = queue.iter().find(|q| q.position == next_pos) else {
+        return Ecarte;
+    };
+    let Some(next_file) = next.file_path.clone() else {
+        return Ecarte;
+    };
+    // Same decoded params as the current track? A NULL prop or a DSD
+    // source means the negotiated output could differ — skip to avoid
+    // warming a cache key the real play won't hit.
+    let trepo = TrackRepo::with_backend(db.clone());
+    let Some(t) = trepo.get(next.track_id).ok().flatten() else {
+        return Ecarte;
+    };
+    let is_dsd = t
+        .format
+        .as_deref()
+        .map(|f| matches!(f.to_ascii_lowercase().as_str(), "dsd" | "dsf" | "dff"))
+        .unwrap_or(false);
+    let (Some(n_sr), Some(n_bd)) = (t.sample_rate, t.bit_depth) else {
+        return Ecarte;
+    };
+    if is_dsd || n_sr as u32 != cur_sr || n_bd as u16 != cur_bd || t.channels as u16 != cur_ch {
+        return Ecarte;
+    }
+    // Already warmed / cached?
+    let Some(cp) = crate::transcode_cache::cache_path(&next_file, &out_ext, out_sr, out_bd, cur_ch)
+    else {
+        return Ecarte;
+    };
+    if crate::transcode_cache::is_hit(&cp) {
+        return DejaEnCache;
+    }
+    // #8600 — même règle que la piste en cours (#8558) : le bras fichier
+    // tient la piste entière en mémoire, à la cadence décodée (ici celle de
+    // la piste en cours, vérifiée égale). Trop lourde : aucun pré-transcodage
+    // complet ; la lecture de la suivante passera par la décision de
+    // `format_de_sortie_avec_bascule` (session progressive si le renderer
+    // accepte le WAV). Source non DSD, vérifié plus haut.
+    if super::bascule_progressive_8558::basculer_en_progressif(
+        true,
+        AudioFormat::Flac,
+        t.duration_ms,
+        cur_sr,
+        cur_ch,
+        disponible,
+    ) {
+        warn!(
+            zone_id,
+            file = %next_file,
+            duree_ms = t.duration_ms,
+            cadence = cur_sr,
+            canaux = cur_ch,
+            memoire_disponible = ?disponible,
+            "transcode_cache_warm_next_trop_lourd_8600"
+        );
+        return TropLourde;
+    }
+    // Transcode into a fresh temp file, then atomically rename it into the
+    // cache (crash-safe: a partial write never lands under a cache name).
+    // tmp-autorise: fichier au nom aléatoire (UUID v4), renommé dans le cache ou supprimé.
+    let tmp = std::env::temp_dir()
+        .join(format!(
+            "tune-transcode-{}.{}",
+            uuid::Uuid::new_v4(),
+            out_ext
+        ))
+        .to_string_lossy()
+        .to_string();
+    match transcode_source_to_file(
+        next_file,
+        out_sr,
+        cur_ch,
+        out_bd,
+        target_fmt,
+        None,
+        None,
+        None,
+        tmp.clone(),
+        // Pré-chauffage en fond, sans budget ni auditeur qui attend :
+        // rien à mesurer, rien à étendre (#3140).
+        None,
+        // …et rien à préempter : ce travail n'appartient à aucune
+        // demande de lecture, il ne tient pas la zone (#3444).
+        None,
+        // Fichier ordinaire : aucune tranche à découper (#3631).
+        None,
+    )
+    .await
+    {
+        Ok((size, _, _)) if size >= 1024 && std::fs::rename(&tmp, &cp).is_ok() => {
+            tokio::task::spawn_blocking(crate::transcode_cache::evict);
+            info!(zone_id, cache = %cp, "transcode_cache_warmed_next");
+            Rechauffee
+        }
+        _ => {
+            let _ = std::fs::remove_file(&tmp);
+            Echec
+        }
+    }
+}
+
 impl PlaybackOrchestrator {
     /// Remove any gapless-prepared stream session for a zone.
     /// Called when a zone starts a new track or stops, so the
@@ -144,6 +297,12 @@ impl PlaybackOrchestrator {
     /// non-DSD): only then is the negotiated output — and thus the cache key —
     /// guaranteed identical to what the next track's real play would produce.
     /// Callers fire this only when the current track was itself cached (no EQ).
+    ///
+    /// #8600 — le pré-transcodage passe par le bras FICHIER, qui tient la
+    /// piste entière en mémoire : il suit donc la règle de la piste en cours
+    /// (#8558, `bascule_progressive_8558`). Une suivante trop lourde pour la
+    /// mémoire disponible n'est pas pré-transcodée ; sa lecture décidera
+    /// (session progressive si le renderer accepte le WAV).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_warm_next_local(
         &self,
@@ -158,102 +317,14 @@ impl PlaybackOrchestrator {
     ) {
         let db = self.db.clone();
         let playback = self.playback.clone();
+        // Lue ici, sur le fil de l'appelant (imposée par les tests sur ce fil).
+        let disponible = super::bascule_progressive_8558::memoire_disponible();
         tokio::spawn(async move {
-            // Locate the current queue position and the item right after it.
-            let qrepo = PlayQueueRepo::with_backend(db.clone());
-            let queue = match qrepo.get_queue(zone_id) {
-                Ok(q) => q,
-                Err(_) => return,
-            };
-            let Some(cur_pos) = queue.iter().find(|q| q.is_current).map(|q| q.position) else {
-                return;
-            };
-            // #5143 — la suivante que l'avance jouera : une bannie est
-            // enjambée, jamais transcodée pour rien.
-            let session = playback.get_state(zone_id).await.session_profile_id;
-            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1, session)
-                .0
-                .position_depuis(cur_pos + 1)
-            else {
-                return;
-            };
-            let Some(next) = queue.iter().find(|q| q.position == next_pos) else {
-                return;
-            };
-            let Some(next_file) = next.file_path.clone() else {
-                return;
-            };
-            // Same decoded params as the current track? A NULL prop or a DSD
-            // source means the negotiated output could differ — skip to avoid
-            // warming a cache key the real play won't hit.
-            let trepo = TrackRepo::with_backend(db.clone());
-            let Some(t) = trepo.get(next.track_id).ok().flatten() else {
-                return;
-            };
-            let is_dsd = t
-                .format
-                .as_deref()
-                .map(|f| matches!(f.to_ascii_lowercase().as_str(), "dsd" | "dsf" | "dff"))
-                .unwrap_or(false);
-            let (Some(n_sr), Some(n_bd)) = (t.sample_rate, t.bit_depth) else {
-                return;
-            };
-            if is_dsd
-                || n_sr as u32 != cur_sr
-                || n_bd as u16 != cur_bd
-                || t.channels as u16 != cur_ch
-            {
-                return;
-            }
-            // Already warmed / cached?
-            let Some(cp) =
-                crate::transcode_cache::cache_path(&next_file, &out_ext, out_sr, out_bd, cur_ch)
-            else {
-                return;
-            };
-            if crate::transcode_cache::is_hit(&cp) {
-                return;
-            }
-            // Transcode into a fresh temp file, then atomically rename it into the
-            // cache (crash-safe: a partial write never lands under a cache name).
-            // tmp-autorise: fichier au nom aléatoire (UUID v4), renommé dans le cache ou supprimé.
-            let tmp = std::env::temp_dir()
-                .join(format!(
-                    "tune-transcode-{}.{}",
-                    uuid::Uuid::new_v4(),
-                    out_ext
-                ))
-                .to_string_lossy()
-                .to_string();
-            match transcode_source_to_file(
-                next_file,
-                out_sr,
-                cur_ch,
-                out_bd,
-                target_fmt,
-                None,
-                None,
-                None,
-                tmp.clone(),
-                // Pré-chauffage en fond, sans budget ni auditeur qui attend :
-                // rien à mesurer, rien à étendre (#3140).
-                None,
-                // …et rien à préempter : ce travail n'appartient à aucune
-                // demande de lecture, il ne tient pas la zone (#3444).
-                None,
-                // Fichier ordinaire : aucune tranche à découper (#3631).
-                None,
+            prechauffer_la_suivante_locale(
+                db, playback, zone_id, cur_sr, cur_bd, cur_ch, out_ext, out_sr, out_bd, target_fmt,
+                disponible,
             )
-            .await
-            {
-                Ok((size, _, _)) if size >= 1024 && std::fs::rename(&tmp, &cp).is_ok() => {
-                    tokio::task::spawn_blocking(crate::transcode_cache::evict);
-                    info!(zone_id, cache = %cp, "transcode_cache_warmed_next");
-                }
-                _ => {
-                    let _ = std::fs::remove_file(&tmp);
-                }
-            }
+            .await;
         });
     }
 
