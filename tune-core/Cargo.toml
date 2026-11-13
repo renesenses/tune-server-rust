@@ -418,6 +418,12 @@ path = "tests/ape_incremental_i2505.rs"
 name = "ape_pic_memoire_i2505"
 path = "tests/ape_pic_memoire_i2505.rs"
 
+# #8558 — pic mémoire du transcodage vers fichier (FLAC 192/24 vers 96 kHz,
+# Chromecast). Binaire à lui seul : `#[global_allocator]` de mesure.
+[[test]]
+name = "transcodage_memoire_bornee_8558"
+path = "tests/transcodage_memoire_bornee_8558.rs"
+
 # #6168 — seuil mmap de la glibc fixé au démarrage. Binaire à lui seul : il
 # se relance en processus fils, l'état de l'allocateur est global.
 [[test]]

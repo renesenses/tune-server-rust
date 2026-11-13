@@ -8,6 +8,8 @@ use tracing::{debug, info, warn};
 use crate::library::local_path::resolve_existing_local_path;
 
 mod transcodage;
+#[doc(hidden)]
+pub use transcodage::transcoder_vers_un_fichier_8558;
 use transcodage::*;
 
 /// A second play of the SAME track pushed to a NETWORK renderer within this

@@ -609,6 +609,22 @@ pub fn rubato_resample_chunk(
 ///
 /// Converts to normalized f32 for the sinc pass, then back with clamping.
 /// This is the converter's offline entry point — quality over speed.
+///
+/// #8558 — PAR BLOCS. La version d'avant matérialisait la piste entière trois
+/// fois de plus que son entrée : une copie `f32`, la même précédée du
+/// pré-roll, puis la sortie `f32` (qui grandissait par doublements) avant la
+/// sortie `i32`. Un FLAC 192/24 de neuf minutes vers 96 kHz (Chromecast
+/// Audio, forum fil 2777) dépassait ainsi les 4 Gio d'une petite VM, et le
+/// noyau tuait le serveur. Ici, l'entrée est convertie et passée au
+/// rééchantillonneur par tranches, et la sortie `i32` est allouée une fois,
+/// à sa taille exacte : la mémoire en plus de l'entrée se réduit à la sortie.
+///
+/// Le résultat est IDENTIQUE au bit près à l'ancien calcul en bloc
+/// ([`rubato_resample_batch_exact`]) : les blocs de rubato tombent aux mêmes
+/// frontières absolues (`FixedAsync::Input`, reste reporté par
+/// [`rubato_resample_chunk`]), le pré-roll et le retrait du délai sont les
+/// mêmes. Le témoin `resample_i32_par_blocs_egale_le_calcul_en_bloc_8558`
+/// le vérifie.
 pub fn resample_i32(
     samples: &[i32],
     bit_depth: u16,
@@ -619,6 +635,66 @@ pub fn resample_i32(
     if from_sr == to_sr || samples.is_empty() {
         return samples.to_vec();
     }
+    let ch = channels as usize;
+    if ch == 0 {
+        return Vec::new();
+    }
+    let mut resampler = match new_streaming_resampler(from_sr, to_sr, channels) {
+        Ok(r) => Some(r),
+        // Le repli linéaire de l'ancien chemin, inchangé.
+        Err(_) => return resample_i32_en_bloc(samples, bit_depth, channels, from_sr, to_sr),
+    };
+    let full_scale = (1i64 << (bit_depth.clamp(8, 32) - 1)) as f32;
+    let max = full_scale - 1.0;
+    let ratio = to_sr as f64 / from_sr as f64;
+    let (pre_roll, a_retirer, _residu) = alignement_de_piste(from_sr, to_sr);
+    let attendu = ((samples.len() / ch) as f64 * ratio).round() as usize * ch;
+
+    let mut sortie: Vec<i32> = Vec::with_capacity(attendu);
+    let mut a_sauter = a_retirer * ch;
+    let mut pousser = |bloc: Vec<f32>, sortie: &mut Vec<i32>| {
+        let mut bloc = &bloc[..];
+        let saut = a_sauter.min(bloc.len());
+        a_sauter -= saut;
+        bloc = &bloc[saut..];
+        let place = attendu - sortie.len();
+        sortie.extend(
+            bloc[..bloc.len().min(place)]
+                .iter()
+                .map(|&v| (v * full_scale).clamp(-full_scale, max) as i32),
+        );
+    };
+
+    let mut reste: Vec<f32> = Vec::new();
+    if pre_roll > 0 {
+        let zeros = vec![0.0f32; pre_roll * ch];
+        let bloc = rubato_resample_chunk(&mut resampler, &zeros, channels, false, &mut reste);
+        pousser(bloc, &mut sortie);
+    }
+    // 16 blocs de rubato par tranche : quelques centaines de Kio.
+    const TRAMES_PAR_TRANCHE: usize = 16 * 1024;
+    let mut tranche: Vec<f32> = Vec::with_capacity(TRAMES_PAR_TRANCHE * ch);
+    for morceau in samples.chunks(TRAMES_PAR_TRANCHE * ch) {
+        tranche.clear();
+        tranche.extend(morceau.iter().map(|&s| s as f32 / full_scale));
+        let bloc = rubato_resample_chunk(&mut resampler, &tranche, channels, false, &mut reste);
+        pousser(bloc, &mut sortie);
+    }
+    let bloc = rubato_resample_chunk(&mut resampler, &[], channels, true, &mut reste);
+    pousser(bloc, &mut sortie);
+    sortie
+}
+
+/// L'ancien calcul de [`resample_i32`], en bloc : repli quand le
+/// rééchantillonneur sinc ne se construit pas, et référence du témoin
+/// d'identité de #8558.
+fn resample_i32_en_bloc(
+    samples: &[i32],
+    bit_depth: u16,
+    channels: u16,
+    from_sr: u32,
+    to_sr: u32,
+) -> Vec<i32> {
     let full_scale = (1i64 << (bit_depth.clamp(8, 32) - 1)) as f32;
     let as_f32: Vec<f32> = samples.iter().map(|&s| s as f32 / full_scale).collect();
     let resampled = rubato_resample_batch_exact(&as_f32, from_sr, to_sr, channels);
@@ -646,6 +722,45 @@ mod tests {
     const PRODUCT_PCM_SAMPLE_RATES: [u32; 8] = [
         44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
     ];
+
+    /// #8558 : le calcul par blocs rend EXACTEMENT les échantillons de
+    /// l'ancien calcul en bloc, sur des longueurs qui ne tombent ni sur un
+    /// bloc de rubato ni sur une tranche, et sur les couples du produit.
+    #[test]
+    fn resample_i32_par_blocs_egale_le_calcul_en_bloc_8558() {
+        let couples = [
+            (192_000, 96_000, 2u16),
+            (176_400, 88_200, 2),
+            (192_000, 44_100, 2),
+            (44_100, 48_000, 2),
+            (96_000, 48_000, 6),
+            (88_200, 96_000, 1),
+        ];
+        for (de, vers, ch) in couples {
+            for trames in [1usize, 777, 1024, 16 * 1024 + 3, 3 * 16 * 1024 + 517] {
+                let n = trames * ch as usize;
+                let entree: Vec<i32> = (0..n)
+                    .map(|i| {
+                        let t = (i / ch as usize) as f64 / de as f64;
+                        let v = (2.0 * std::f64::consts::PI * 997.0 * t).sin() * 0.8
+                            + ((i * 7919) % 101) as f64 / 1000.0;
+                        (v * 8_000_000.0) as i32
+                    })
+                    .collect();
+                let par_blocs = resample_i32(&entree, 24, ch, de, vers);
+                let en_bloc = resample_i32_en_bloc(&entree, 24, ch, de, vers);
+                assert_eq!(
+                    par_blocs.len(),
+                    en_bloc.len(),
+                    "{de} → {vers}, {ch} canaux, {trames} trames : longueur"
+                );
+                assert!(
+                    par_blocs == en_bloc,
+                    "{de} → {vers}, {ch} canaux, {trames} trames : échantillons différents"
+                );
+            }
+        }
+    }
 
     /// #4754 : Cubique partout où les instants de sortie tombent ENTRE deux
     /// phases de la table, Linéaire là où ils tombent pile dessus.
