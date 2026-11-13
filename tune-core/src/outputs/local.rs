@@ -2167,6 +2167,18 @@ impl LocalOutput {
         }
     }
 
+    /// #8616 — endpoint exclusif à sonder hors des verrous de sortie.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn endpoint_pcm_exclusif(&self) -> Option<String> {
+        (enchainement_exclusif::bras_de_cette_plateforme(self.mode_exclusif(), &self.audio_backend)
+            == enchainement_exclusif::BrasDeLecture::WasapiExclusif)
+            .then(|| {
+                self.endpoint_id
+                    .clone()
+                    .unwrap_or_else(|| self.device_name.clone())
+            })
+    }
+
     /// #8248 — de quoi sonder le DSD natif ALSA de cette sortie. `None` hors
     /// Linux : le DSD natif n'y passe que par ASIO.
     pub fn sonde_dsd_alsa(&self) -> Option<SondeDsdAlsa> {

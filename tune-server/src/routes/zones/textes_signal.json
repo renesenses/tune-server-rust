@@ -86,7 +86,8 @@
     "volume_dsd_natif": "Volume non appliqué (DSD natif)",
     "upsampling_fixed_rate": "Suréchantillonnage inactif : la fréquence de sortie fixe de la zone porte déjà la conversion ; retirez-la dans les réglages de la zone pour suréchantillonner",
     "fixed_rate_limit_name": "Fréquence de sortie",
-    "fixed_rate_limit": "{0} kHz demandé, {1} kHz appliqué"
+    "fixed_rate_limit": "{0} kHz demandé, {1} kHz appliqué",
+    "wasapi_rate_fallback": "Conversion {0} → {1} kHz : le périphérique ne prend pas {0} kHz en mode WASAPI exclusif"
   },
   "en": {
     "pregain": "auto pre-gain {0} dB",
@@ -175,7 +176,8 @@
     "volume_dsd_natif": "Volume not applied (native DSD)",
     "upsampling_fixed_rate": "Upsampling inactive: the zone's fixed output sample rate already performs the conversion; remove it in the zone settings to upsample",
     "fixed_rate_limit_name": "Output sample rate",
-    "fixed_rate_limit": "{0} kHz requested, {1} kHz applied"
+    "fixed_rate_limit": "{0} kHz requested, {1} kHz applied",
+    "wasapi_rate_fallback": "Conversion {0} → {1} kHz: the device does not support {0} kHz in WASAPI exclusive mode"
   },
   "de": {
     "pregain": "automatische Vorverstärkung {0} dB",
@@ -264,7 +266,8 @@
     "volume_dsd_natif": "Lautstärke nicht angewendet (natives DSD)",
     "upsampling_fixed_rate": "Upsampling inaktiv: Die feste Ausgabe-Abtastrate der Zone übernimmt bereits die Wandlung; entfernen Sie sie in den Zoneneinstellungen, um hochzurechnen",
     "fixed_rate_limit_name": "Ausgabe-Abtastrate",
-    "fixed_rate_limit": "{0} kHz angefordert, {1} kHz angewendet"
+    "fixed_rate_limit": "{0} kHz angefordert, {1} kHz angewendet",
+    "wasapi_rate_fallback": "Wandlung {0} → {1} kHz: Das Gerät unterstützt {0} kHz im exklusiven WASAPI-Modus nicht"
   },
   "es": {
     "pregain": "preganancia automática {0} dB",
@@ -353,7 +356,8 @@
     "volume_dsd_natif": "Volumen no aplicado (DSD nativo)",
     "upsampling_fixed_rate": "Sobremuestreo inactivo: la frecuencia de salida fija de la zona ya realiza la conversión; quítela en los ajustes de la zona para sobremuestrear",
     "fixed_rate_limit_name": "Frecuencia de salida",
-    "fixed_rate_limit": "{0} kHz solicitados, {1} kHz aplicados"
+    "fixed_rate_limit": "{0} kHz solicitados, {1} kHz aplicados",
+    "wasapi_rate_fallback": "Conversión {0} → {1} kHz: el dispositivo no admite {0} kHz en modo WASAPI exclusivo"
   },
   "it": {
     "pregain": "pre-guadagno automatico {0} dB",
@@ -442,7 +446,8 @@
     "volume_dsd_natif": "Volume non applicato (DSD nativo)",
     "upsampling_fixed_rate": "Sovracampionamento inattivo: la frequenza di uscita fissa della zona esegue già la conversione; rimuovila nelle impostazioni della zona per sovracampionare",
     "fixed_rate_limit_name": "Frequenza di uscita",
-    "fixed_rate_limit": "{0} kHz richiesti, {1} kHz applicati"
+    "fixed_rate_limit": "{0} kHz richiesti, {1} kHz applicati",
+    "wasapi_rate_fallback": "Conversione {0} → {1} kHz: il dispositivo non supporta {0} kHz in modalità WASAPI esclusiva"
   },
   "zh": {
     "pregain": "自动预增益 {0} dB",
@@ -531,7 +536,8 @@
     "volume_dsd_natif": "未应用音量（原生 DSD）",
     "upsampling_fixed_rate": "升频未启用：此区域的固定输出采样率已完成转换；请在区域设置中移除它以启用升频",
     "fixed_rate_limit_name": "输出采样率",
-    "fixed_rate_limit": "请求 {0} kHz，实际应用 {1} kHz"
+    "fixed_rate_limit": "请求 {0} kHz，实际应用 {1} kHz",
+    "wasapi_rate_fallback": "转换 {0} → {1} kHz：设备在 WASAPI 独占模式下不支持 {0} kHz"
   },
   "ja": {
     "pregain": "自動プリアンプ {0} dB",
@@ -620,7 +626,8 @@
     "volume_dsd_natif": "音量は適用されません（ネイティブ DSD）",
     "upsampling_fixed_rate": "アップサンプリング無効：このゾーンの固定出力サンプルレートがすでに変換を行っています。アップサンプリングするにはゾーン設定で解除してください",
     "fixed_rate_limit_name": "出力サンプルレート",
-    "fixed_rate_limit": "要求 {0} kHz、適用 {1} kHz"
+    "fixed_rate_limit": "要求 {0} kHz、適用 {1} kHz",
+    "wasapi_rate_fallback": "{0} → {1} kHz に変換：デバイスは WASAPI 排他モードで {0} kHz に対応していません"
   },
   "ko": {
     "pregain": "자동 프리게인 {0} dB",
@@ -709,7 +716,8 @@
     "volume_dsd_natif": "볼륨 미적용 (네이티브 DSD)",
     "upsampling_fixed_rate": "업샘플링 비활성: 이 존의 고정 출력 샘플레이트가 이미 변환을 수행합니다. 업샘플링하려면 존 설정에서 해제하세요",
     "fixed_rate_limit_name": "출력 샘플레이트",
-    "fixed_rate_limit": "요청 {0} kHz, 적용 {1} kHz"
+    "fixed_rate_limit": "요청 {0} kHz, 적용 {1} kHz",
+    "wasapi_rate_fallback": "{0} → {1} kHz 변환: 장치가 WASAPI 독점 모드에서 {0} kHz를 지원하지 않습니다"
   },
   "ro": {
     "pregain": "pre-amplificare automată {0} dB",
@@ -798,7 +806,8 @@
     "volume_dsd_natif": "Volum neaplicat (DSD nativ)",
     "upsampling_fixed_rate": "Supraeșantionare inactivă: frecvența de ieșire fixă a zonei face deja conversia; eliminați-o în setările zonei pentru a supraeșantiona",
     "fixed_rate_limit_name": "Frecvența de ieșire",
-    "fixed_rate_limit": "{0} kHz solicitat, {1} kHz aplicat"
+    "fixed_rate_limit": "{0} kHz solicitat, {1} kHz aplicat",
+    "wasapi_rate_fallback": "Conversie {0} → {1} kHz: dispozitivul nu acceptă {0} kHz în modul WASAPI exclusiv"
   },
   "sv": {
     "pregain": "automatisk förförstärkning {0} dB",
@@ -887,7 +896,8 @@
     "volume_dsd_natif": "Volym tillämpas inte (inbyggt DSD)",
     "upsampling_fixed_rate": "Uppsampling inaktiv: zonens fasta utgångsfrekvens utför redan konverteringen; ta bort den i zoninställningarna för att uppsampla",
     "fixed_rate_limit_name": "Utgångens samplingsfrekvens",
-    "fixed_rate_limit": "{0} kHz begärd, {1} kHz tillämpad"
+    "fixed_rate_limit": "{0} kHz begärd, {1} kHz tillämpad",
+    "wasapi_rate_fallback": "Omvandling {0} → {1} kHz: enheten stöder inte {0} kHz i exklusivt WASAPI-läge"
   },
   "vi": {
     "pregain": "tiền khuếch đại tự động {0} dB",
@@ -976,7 +986,8 @@
     "volume_dsd_natif": "Không áp dụng âm lượng (DSD gốc)",
     "upsampling_fixed_rate": "Tăng tần số lấy mẫu không hoạt động: tần số đầu ra cố định của vùng đã thực hiện chuyển đổi; hãy bỏ nó trong cài đặt vùng để tăng tần số lấy mẫu",
     "fixed_rate_limit_name": "Tần số lấy mẫu đầu ra",
-    "fixed_rate_limit": "Yêu cầu {0} kHz, áp dụng {1} kHz"
+    "fixed_rate_limit": "Yêu cầu {0} kHz, áp dụng {1} kHz",
+    "wasapi_rate_fallback": "Chuyển đổi {0} → {1} kHz: thiết bị không hỗ trợ {0} kHz ở chế độ WASAPI độc quyền"
   },
   "hu": {
     "pregain": "automatikus előerősítés {0} dB",
@@ -1065,7 +1076,8 @@
     "volume_dsd_natif": "Hangerő nincs alkalmazva (natív DSD)",
     "upsampling_fixed_rate": "Felülmintavételezés inaktív: a zóna rögzített kimeneti frekvenciája már elvégzi az átalakítást; távolítsa el a zóna beállításaiban a felülmintavételezéshez",
     "fixed_rate_limit_name": "Kimeneti mintavételi frekvencia",
-    "fixed_rate_limit": "Kért: {0} kHz, alkalmazott: {1} kHz"
+    "fixed_rate_limit": "Kért: {0} kHz, alkalmazott: {1} kHz",
+    "wasapi_rate_fallback": "Átalakítás {0} → {1} kHz: az eszköz nem támogatja a {0} kHz-et kizárólagos WASAPI módban"
   },
   "nb": {
     "pregain": "automatisk forsterkning før behandling {0} dB",
@@ -1154,7 +1166,8 @@
     "volume_dsd_natif": "Volum ikke brukt (native DSD)",
     "upsampling_fixed_rate": "Oppsampling inaktiv: sonens faste utgangsfrekvens utfører allerede konverteringen; fjern den i soneinnstillingene for å oppsample",
     "fixed_rate_limit_name": "Samplingsfrekvens ut",
-    "fixed_rate_limit": "{0} kHz forespurt, {1} kHz brukt"
+    "fixed_rate_limit": "{0} kHz forespurt, {1} kHz brukt",
+    "wasapi_rate_fallback": "Konvertering {0} → {1} kHz: enheten støtter ikke {0} kHz i eksklusiv WASAPI-modus"
   },
   "pl": {
     "pregain": "automatyczne wzmocnienie wstępne {0} dB",
@@ -1243,7 +1256,8 @@
     "volume_dsd_natif": "Głośność nie jest stosowana (natywne DSD)",
     "upsampling_fixed_rate": "Nadpróbkowanie nieaktywne: stała częstotliwość wyjściowa strefy już wykonuje konwersję; usuń ją w ustawieniach strefy, aby nadpróbkowywać",
     "fixed_rate_limit_name": "Częstotliwość wyjściowa",
-    "fixed_rate_limit": "Żądano {0} kHz, zastosowano {1} kHz"
+    "fixed_rate_limit": "Żądano {0} kHz, zastosowano {1} kHz",
+    "wasapi_rate_fallback": "Konwersja {0} → {1} kHz: urządzenie nie obsługuje {0} kHz w trybie wyłącznym WASAPI"
   },
   "el": {
     "pregain": "αυτόματη προ-ενίσχυση {0} dB",
@@ -1332,6 +1346,7 @@
     "volume_dsd_natif": "Η ένταση δεν εφαρμόζεται (εγγενές DSD)",
     "upsampling_fixed_rate": "Η υπερδειγματοληψία είναι ανενεργή: η σταθερή συχνότητα εξόδου της ζώνης κάνει ήδη τη μετατροπή· αφαιρέστε την στις ρυθμίσεις της ζώνης για υπερδειγματοληψία",
     "fixed_rate_limit_name": "Συχνότητα δειγματοληψίας εξόδου",
-    "fixed_rate_limit": "Ζητήθηκαν {0} kHz, εφαρμόστηκαν {1} kHz"
+    "fixed_rate_limit": "Ζητήθηκαν {0} kHz, εφαρμόστηκαν {1} kHz",
+    "wasapi_rate_fallback": "Μετατροπή {0} → {1} kHz: η συσκευή δεν υποστηρίζει {0} kHz σε αποκλειστική λειτουργία WASAPI"
   }
 }

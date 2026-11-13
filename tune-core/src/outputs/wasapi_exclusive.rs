@@ -673,6 +673,99 @@ fn sonder_l_accueil_du_dop_sur_ce_fil(
     }
 }
 
+/// #8616 — sonde PCM exclusive avant transcodage. Aucun Initialize/Start.
+#[cfg(target_os = "windows")]
+pub(crate) fn sonder_la_cadence_pcm(
+    demande: String,
+    cadence: u32,
+    voies: u16,
+    plafond: Option<u32>,
+    repli: bool,
+) -> Result<Option<u32>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let lance = std::thread::Builder::new()
+        .name("tune-sonde-pcm-8616".into())
+        .spawn(move || {
+            let _ = tx.send(sonder_la_cadence_pcm_sur_ce_fil(
+                &demande, cadence, voies, plafond, repli,
+            ));
+        });
+    if lance.is_err() {
+        return Ok(None);
+    }
+    rx.recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap_or(Ok(None))
+}
+
+#[cfg(target_os = "windows")]
+fn sonder_la_cadence_pcm_sur_ce_fil(
+    demande: &str,
+    cadence: u32,
+    voies: u16,
+    plafond: Option<u32>,
+    repli: bool,
+) -> Result<Option<u32>, String> {
+    use ffi::*;
+    use std::ffi::c_void;
+    use std::ptr;
+    let Ok(_com) = ComApartmentGuard::initialize_sta() else {
+        return Ok(None);
+    };
+    let Ok(resolved) = resolve_wasapi_endpoint(demande) else {
+        return Ok(None);
+    };
+    unsafe {
+        let mut enumerator: *mut c_void = ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_MMDEVICE_ENUMERATOR,
+            ptr::null_mut(),
+            CLSCTX_ALL,
+            &IID_IMMDEVICE_ENUMERATOR,
+            &mut enumerator,
+        );
+        if hr != S_OK {
+            return Ok(None);
+        }
+        let mut device: *mut c_void = ptr::null_mut();
+        {
+            type GetDeviceFn =
+                unsafe extern "system" fn(*mut c_void, *const u16, *mut *mut c_void) -> HRESULT;
+            let vtable = *(enumerator as *const *const *const c_void);
+            let get_device: GetDeviceFn = std::mem::transmute(*vtable.add(5));
+            let endpoint_wide: Vec<u16> = resolved
+                .id
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let hr = get_device(enumerator, endpoint_wide.as_ptr(), &mut device);
+            release(enumerator);
+            if hr != S_OK {
+                return Ok(None);
+            }
+        }
+        let audio_client = match activate_audio_client(device) {
+            Ok(client) => client,
+            Err(_) => {
+                release(device);
+                return Ok(None);
+            }
+        };
+
+        let resultat = super::cadence_exclusive_8616::choisir_cadence(
+            cadence,
+            voies,
+            plafond,
+            repli,
+            |hz, format, masque| {
+                sonder_format_exclusif(audio_client, format, u32::from(voies), hz, masque)
+            },
+        );
+        release(audio_client);
+        release(device);
+        resultat
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
