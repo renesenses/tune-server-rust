@@ -213,7 +213,17 @@ async fn fiche_d_une_piste_locale_8160() {
 
     assert_eq!(f["note"]["texte_md"], "**Pressage** japonais");
     assert!(f["note"]["maj_le"].as_str().is_some());
-    assert!(f["forme_d_onde"].is_null(), "place réservée à #8159");
+    // Fil 2793 — la forme d'onde : son URL, calculée à la demande.
+    assert_eq!(
+        f["forme_d_onde"]["url"], "/api/v1/library/tracks/1/forme-onde?colonnes=1000",
+        "{}",
+        f["forme_d_onde"]
+    );
+    assert!(
+        ["absent", "a_jour"].contains(&f["forme_d_onde"]["etat"].as_str().unwrap_or("")),
+        "{}",
+        f["forme_d_onde"]
+    );
 
     // Recalcul, puis la fiche dit « à jour », datée.
     let (statut, s) = appel(&app, "POST", "/api/v1/library/tracks/1/spectrogramme", None).await;

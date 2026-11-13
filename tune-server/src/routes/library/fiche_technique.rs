@@ -16,7 +16,9 @@
 //! * `provenance` : la source de la piste, ses identifiants, les champs tenus
 //!   à la main dans Tune, les crédits par source, la date du fichier lu ;
 //! * `note` : la note personnelle du profil appelant (#7849) ;
-//! * `forme_d_onde` : réservée à l'étude #8159, toujours `null` ici.
+//! * `forme_d_onde` (fil 2793) : son état (`a_jour` si elle est en cache
+//!   pour le fichier d'aujourd'hui, `absent` sinon) et l'URL de
+//!   `GET /library/tracks/{id}/forme-onde` ; `null` sans fichier.
 //!
 //! Une section que rien ne renseigne vaut `null` : une piste de service, sans
 //! fichier, n'a ni spectrogramme, ni DR mesuré, ni intégrité, et le client
@@ -171,6 +173,8 @@ pub(crate) fn construire(
 
     let provenance = provenance(state, &track, date_du_fichier.clone())?;
 
+    let forme_d_onde = super::forme_onde::section(&track, &super::forme_onde::dossier_du_cache());
+
     let note = notes::lire(state.backend.as_ref(), profile_id, TypeDObjet::Track, id)
         .map_err(AppError::internal)?
         .map(|n| json!({ "texte_md": n.texte_md, "maj_le": n.maj_le }));
@@ -190,8 +194,8 @@ pub(crate) fn construire(
         "integrite": integrite,
         "provenance": provenance,
         "note": note,
-        // #8159 — la forme d'onde : place réservée, pas encore calculée ici.
-        "forme_d_onde": Value::Null,
+        // Fil 2793 — la forme d'onde : état et URL, calculée par sa route.
+        "forme_d_onde": forme_d_onde,
     }))
 }
 
