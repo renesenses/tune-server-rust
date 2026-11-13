@@ -128,6 +128,10 @@ struct CachedUrl {
     bit_depth: u16,
     bitrate: Option<u32>,
     created: Instant,
+    /// #7266 — un fMP4 DASH rendu avant son dernier segment (décodage en
+    /// croissance) : `true` une fois le fichier complet. `None` : complet
+    /// dès la mise en cache.
+    complet: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct UrlCache {
@@ -312,11 +316,26 @@ impl TidalService {
     /// moov boxes) and each media segment contains moof+mdat with FLAC frames.
     /// All segments must be concatenated in order to form a valid ISO BMFF file
     /// that symphonia's IsoMp4Reader can decode.
+    #[cfg(test)]
     async fn download_dash_segments(
         &self,
         segments: &DashSegmentInfo,
         track_id: &str,
     ) -> Result<String, String> {
+        self.telecharger_les_segments_dash(segments, track_id)
+            .await
+            .map(|(chemin, _)| chemin)
+    }
+
+    /// Le téléchargement DASH, et — quand il se poursuit en tâche de fond
+    /// ([`crate::audio::dash_growth::decodage_en_croissance`]) — le témoin
+    /// posé à `true` une fois le fichier complet. `None` : le fichier rendu
+    /// est déjà complet.
+    async fn telecharger_les_segments_dash(
+        &self,
+        segments: &DashSegmentInfo,
+        track_id: &str,
+    ) -> Result<(String, Option<Arc<std::sync::atomic::AtomicBool>>), String> {
         let start = Instant::now();
         let total = segments.segment_count;
         info!(
@@ -374,16 +393,23 @@ impl TidalService {
                 .map_err(|e| format!("tmp write init: {e}"))?;
         }
 
-        // Streaming DASH (#1146 Plan C step 2): with TUNE_DASH_STREAM_DECODE, hand
-        // a growth handle to the decoder and download the media segments in the
-        // BACKGROUND, so the FLAC transcode can start on the init segment and
-        // consume fragments as they land — overlapping the download under the
-        // transcode. Return the temp path immediately (only the init is present).
-        if crate::audio::dash_growth::stream_decode_enabled() {
+        // Streaming DASH (#1146 Plan C step 2): hand a growth handle to the
+        // decoder and download the media segments in the BACKGROUND, so the
+        // decode can start on the init segment and consume fragments as they
+        // land. Return the temp path immediately (only the init is present).
+        //
+        // #7266 — armé par défaut pour une sortie locale (session WAV servie en
+        // continu) : la première note n'attend plus le dernier segment. Les
+        // segments partent [`SEGMENTS_DASH_EN_VOL`] à la fois, dans l'ordre,
+        // comme le téléchargement complet ; une lecture abandonnée (plus
+        // personne ne tient la poignée) arrête le téléchargement.
+        if crate::audio::dash_growth::decodage_en_croissance() {
+            use futures_util::StreamExt as _;
             use std::io::Write;
             let init_len = init_data.len() as u64;
             let growth = crate::audio::dash_growth::DashGrowth::new(init_len);
             crate::audio::dash_growth::register(&tmp_path, growth.clone());
+            let complet = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Open the append handle NOW, before returning: the orchestrator
             // renames the temp to `{path}.decoding` right after we return, and an
@@ -393,62 +419,74 @@ impl TidalService {
                 .append(true)
                 .open(&tmp_path)
                 .map_err(|e| format!("tmp reopen (stream): {e}"))?;
-            let client = self.client.clone();
-            let seg = segments.clone();
+            let mut en_ordre = segments_dash_en_ordre(self.client.clone(), segments.clone());
             let track_bg = track_id.to_string();
             let path_bg = tmp_path.clone();
+            let complet_bg = complet.clone();
 
             tokio::spawn(async move {
                 let mut written = init_len;
                 let mut failed = 0u32;
-                for i in 0..seg.segment_count {
-                    let seg_number = seg.start_number + i;
-                    let seg_url = seg
-                        .media_template
-                        .replace("$Number$", &seg_number.to_string());
-                    match client.get(&seg_url).send().await {
-                        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                            Ok(data) => {
-                                if let Err(e) = file.write_all(&data) {
-                                    warn!(track_id = %track_bg, segment = seg_number, error = %e, "tidal_dash_stream_write_failed");
-                                    growth.fail();
-                                    return;
-                                }
-                                written += data.len() as u64;
-                                // Publish the new write frontier so the decoder
-                                // can consume the just-landed fragment.
-                                growth.advance(written);
+                let mut recus = 0u32;
+                while let Some((seg_number, resultat)) = en_ordre.next().await {
+                    if growth.abandonnee() {
+                        drop(en_ordre);
+                        drop(file);
+                        let _ = std::fs::remove_file(&path_bg);
+                        info!(
+                            track_id = %track_bg,
+                            segments_recus = recus,
+                            segment_count = total,
+                            "tidal_dash_croissance_abandonnee"
+                        );
+                        return;
+                    }
+                    recus += 1;
+                    match resultat {
+                        Ok(data) => {
+                            if let Err(e) = file.write_all(&data) {
+                                warn!(track_id = %track_bg, segment = seg_number, error = %e, "tidal_dash_stream_write_failed");
+                                growth.fail();
+                                return;
                             }
-                            Err(e) => {
-                                warn!(track_id = %track_bg, segment = seg_number, error = %e, "tidal_dash_stream_segment_read_failed");
-                                failed += 1;
-                            }
-                        },
-                        Ok(resp) => {
-                            warn!(track_id = %track_bg, segment = seg_number, status = resp.status().as_u16(), "tidal_dash_stream_segment_http_error");
-                            failed += 1;
+                            written += data.len() as u64;
+                            // Publish the new write frontier so the decoder
+                            // can consume the just-landed fragment.
+                            growth.advance(written);
                         }
-                        Err(e) => {
-                            warn!(track_id = %track_bg, segment = seg_number, error = %e, "tidal_dash_stream_segment_fetch_error");
+                        Err(echec) => {
+                            journaliser_le_segment_en_echec(&track_bg, seg_number, &echec);
                             failed += 1;
                         }
                     }
                 }
-                if failed >= seg.segment_count {
+                drop(file);
+                if failed >= total {
                     growth.fail();
                 } else {
+                    complet_bg.store(true, std::sync::atomic::Ordering::SeqCst);
                     growth.finish();
                 }
-                debug!(track_id = %track_bg, path = %path_bg, written, failed, "tidal_dash_streaming_download_done");
+                info!(
+                    track_id = %track_bg,
+                    total_bytes = written,
+                    segment_count = total,
+                    failed_segments = failed,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    path = %path_bg,
+                    croissance = true,
+                    "tidal_dash_multi_segment_download_complete"
+                );
             });
 
             info!(
                 track_id,
                 path = tmp_path.as_str(),
                 segment_count = total,
+                elapsed_ms = start.elapsed().as_millis() as u64,
                 "tidal_dash_streaming_download_started"
             );
-            return Ok(tmp_path);
+            return Ok((tmp_path, Some(complet)));
         }
 
         // Download media segments and append them to the file IN ORDER.
@@ -472,24 +510,7 @@ impl TidalService {
                 .open(&tmp_path)
                 .map_err(|e| format!("tmp reopen: {e}"))?;
 
-            let requetes = (0..total).map(|i| {
-                let seg_number = segments.start_number + i;
-                let seg_url = segments
-                    .media_template
-                    .replace("$Number$", &seg_number.to_string());
-                let client = self.client.clone();
-                async move {
-                    let resultat = match client.get(&seg_url).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            resp.bytes().await.map_err(SegmentEnEchec::Lecture)
-                        }
-                        Ok(resp) => Err(SegmentEnEchec::Statut(resp.status().as_u16())),
-                        Err(e) => Err(SegmentEnEchec::Requete(e)),
-                    };
-                    (seg_number, resultat)
-                }
-            });
-            let mut en_ordre = futures_util::stream::iter(requetes).buffered(SEGMENTS_DASH_EN_VOL);
+            let mut en_ordre = segments_dash_en_ordre(self.client.clone(), segments.clone());
 
             while let Some((seg_number, resultat)) = en_ordre.next().await {
                 match resultat {
@@ -498,31 +519,8 @@ impl TidalService {
                             .map_err(|e| format!("tmp write seg {seg_number}: {e}"))?;
                         total_bytes += data.len() as u64;
                     }
-                    Err(SegmentEnEchec::Lecture(e)) => {
-                        warn!(
-                            track_id,
-                            segment = seg_number,
-                            error = %e,
-                            "tidal_dash_segment_read_failed"
-                        );
-                        failed_segments += 1;
-                    }
-                    Err(SegmentEnEchec::Statut(status)) => {
-                        warn!(
-                            track_id,
-                            segment = seg_number,
-                            status,
-                            "tidal_dash_segment_http_error"
-                        );
-                        failed_segments += 1;
-                    }
-                    Err(SegmentEnEchec::Requete(e)) => {
-                        warn!(
-                            track_id,
-                            segment = seg_number,
-                            error = %e,
-                            "tidal_dash_segment_fetch_error"
-                        );
+                    Err(echec) => {
+                        journaliser_le_segment_en_echec(track_id, seg_number, &echec);
                         failed_segments += 1;
                     }
                 }
@@ -548,7 +546,7 @@ impl TidalService {
             "tidal_dash_multi_segment_download_complete"
         );
 
-        Ok(tmp_path)
+        Ok((tmp_path, None))
     }
 
     /// Create a TidalService with a specific quality setting from config.
@@ -2283,7 +2281,14 @@ impl StreamingService for TidalService {
                     .url
                     .strip_prefix("file://")
                     .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) == 0)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    // #7266 — un fMP4 encore en croissance (ou abandonné en
+                    // route) n'est pas une piste entière : le relire comme un
+                    // fichier ordinaire la tronquerait au dernier segment reçu.
+                    || cached
+                        .complet
+                        .as_ref()
+                        .is_some_and(|c| !c.load(std::sync::atomic::Ordering::SeqCst));
                 if !stale_dash {
                     return Ok(StreamUrl {
                         url: cached.url.clone(),
@@ -2484,6 +2489,7 @@ impl StreamingService for TidalService {
                 .map_err(|e| format!("utf8: {e}"))?;
 
         // Parse the manifest to get URL + optional codec/mime from the manifest itself
+        let mut fichier_en_croissance = None;
         let (url, man_codec, man_mime) = if manifest_mime == "application/dash+xml" {
             // Log raw manifest content for debugging Hi-Res issues
             debug!(
@@ -2515,7 +2521,10 @@ impl StreamingService for TidalService {
                     dash_mime = dash.mime_type.as_deref().unwrap_or("none"),
                     "tidal_dash_multi_segment_detected"
                 );
-                let tmp_path = self.download_dash_segments(seg_info, track_id).await?;
+                let (tmp_path, complet) = self
+                    .telecharger_les_segments_dash(seg_info, track_id)
+                    .await?;
+                fichier_en_croissance = complet;
                 let file_url = format!("file://{tmp_path}");
                 (file_url, dash.codec, dash.mime_type)
             } else {
@@ -2658,6 +2667,7 @@ impl StreamingService for TidalService {
                     bit_depth,
                     bitrate,
                     created: Instant::now(),
+                    complet: fichier_en_croissance,
                 },
             );
         }
@@ -3532,6 +3542,62 @@ enum SegmentEnEchec {
     Lecture(reqwest::Error),
     Statut(u16),
     Requete(reqwest::Error),
+}
+
+/// Un segment DASH reçu (ou son échec), avec son numéro.
+type SegmentRecu = (u32, Result<bytes::Bytes, SegmentEnEchec>);
+
+/// #7266 — les segments média, demandés [`SEGMENTS_DASH_EN_VOL`] à la fois
+/// et rendus dans l'ordre des numéros. Partagé par le téléchargement complet
+/// et par le téléchargement en croissance (tâche de fond, d'où `'static`).
+fn segments_dash_en_ordre(
+    client: Client,
+    segments: DashSegmentInfo,
+) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = SegmentRecu> + Send>> {
+    use futures_util::StreamExt as _;
+    let requetes = (0..segments.segment_count).map(move |i| {
+        let seg_number = segments.start_number + i;
+        let seg_url = segments
+            .media_template
+            .replace("$Number$", &seg_number.to_string());
+        let client = client.clone();
+        async move {
+            let resultat = match client.get(&seg_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    resp.bytes().await.map_err(SegmentEnEchec::Lecture)
+                }
+                Ok(resp) => Err(SegmentEnEchec::Statut(resp.status().as_u16())),
+                Err(e) => Err(SegmentEnEchec::Requete(e)),
+            };
+            (seg_number, resultat)
+        }
+    });
+    Box::pin(futures_util::stream::iter(requetes).buffered(SEGMENTS_DASH_EN_VOL))
+}
+
+/// Le segment manquant est sauté : on le dit, avec la même famille
+/// d'événements qu'avant #7266.
+fn journaliser_le_segment_en_echec(track_id: &str, seg_number: u32, echec: &SegmentEnEchec) {
+    match echec {
+        SegmentEnEchec::Lecture(e) => warn!(
+            track_id,
+            segment = seg_number,
+            error = %e,
+            "tidal_dash_segment_read_failed"
+        ),
+        SegmentEnEchec::Statut(status) => warn!(
+            track_id,
+            segment = seg_number,
+            status,
+            "tidal_dash_segment_http_error"
+        ),
+        SegmentEnEchec::Requete(e) => warn!(
+            track_id,
+            segment = seg_number,
+            error = %e,
+            "tidal_dash_segment_fetch_error"
+        ),
+    }
 }
 
 /// Segment information extracted from DASH SegmentTemplate + SegmentTimeline.

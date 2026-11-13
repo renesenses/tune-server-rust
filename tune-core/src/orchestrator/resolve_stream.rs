@@ -479,6 +479,20 @@ mod canal_aac_fin_notee_6298_tests;
 #[path = "youtube_dlna_demarrage_8228_tests.rs"]
 mod youtube_dlna_demarrage_8228_tests;
 
+/// #7266 — la résolution d'une piste pour cette lecture peut-elle rendre un
+/// fMP4 DASH encore en téléchargement ? Oui pour une sortie locale : sa session
+/// WAV est servie en continu, sans longueur annoncée, et le décodeur suit la
+/// frontière d'écriture. Non pour un renderer réseau (il lui faut le fichier
+/// complet et sa longueur), ni pour un départ à une position (la reprise
+/// relit un fichier complet), ni si `TUNE_DASH_STREAM_DECODE=0`.
+pub(super) fn decoder_pendant_le_telechargement(req: &PlayRequest) -> bool {
+    req.output_device_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("local:"))
+        && !req.seek_ms.is_some_and(|ms| ms > 0)
+        && !crate::audio::dash_growth::decodage_local_desarme()
+}
+
 impl PlaybackOrchestrator {
     /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
     /// radios du MediaServer.
@@ -698,7 +712,16 @@ impl PlaybackOrchestrator {
                 );
                 flux
             }
-            None => request_stream_at_quality(&mut **svc, source_id, provider_quality).await?,
+            // #7266 — pour une sortie locale, un fMP4 DASH revient dès son
+            // segment d'initialisation et se décode pendant que les autres
+            // arrivent : la première note n'attend plus la piste entière.
+            None => {
+                crate::audio::dash_growth::pendant_le_telechargement(
+                    decoder_pendant_le_telechargement(req),
+                    request_stream_at_quality(&mut **svc, source_id, provider_quality),
+                )
+                .await?
+            }
         };
         // #6401 — un flux Qobuz haute résolution qui échoue au démarrage
         // (erreur HTTP, flux coupé avant le premier octet) est redemandé UNE

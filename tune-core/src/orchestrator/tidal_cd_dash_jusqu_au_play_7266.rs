@@ -274,6 +274,8 @@ struct JournalTidal {
     manifeste: Option<Instant>,
     init: Option<Instant>,
     dernier_segment: Option<Instant>,
+    /// Segments média servis jusqu'ici.
+    servis: usize,
 }
 
 fn mpd(base: &str, codec: &str, piste: &PisteDash) -> String {
@@ -362,6 +364,7 @@ async fn faux_tidal(
         };
         tokio::time::sleep(Duration::from_millis(LATENCE_MS)).await;
         let mut j = e.journal.lock().unwrap();
+        j.servis += 1;
         let maintenant = Instant::now();
         j.dernier_segment = Some(j.dernier_segment.map_or(maintenant, |t| t.max(maintenant)));
         octets.clone().into_response()
@@ -781,4 +784,136 @@ async fn un_aac_dash_annonce_aac_est_decode_et_joue_7266() {
     let r = m.renderer.lock().unwrap();
     let recus = r.recus.clone().expect("flux reçu");
     assert_eq!(&recus[..4], b"fLaC", "décodé puis encodé en FLAC");
+}
+
+// ── Sortie locale (Windows ASIO, macOS) ───────────────────────────────────
+
+/// Les octets PCM d'un flux WAV, en-tête retiré.
+fn pcm_du_wav(octets: &[u8]) -> &[u8] {
+    if !octets.starts_with(b"RIFF") {
+        return octets;
+    }
+    let mut i = 12;
+    while i + 8 <= octets.len() {
+        let taille = u32::from_le_bytes(octets[i + 4..i + 8].try_into().unwrap()) as usize;
+        if &octets[i..i + 4] == b"data" {
+            return &octets[i + 8..];
+        }
+        i += 8 + taille;
+    }
+    &[]
+}
+
+/// LE TÉMOIN DE LA SORTIE LOCALE (fil forum 2719, Windows ASIO ; macOS) : la
+/// première note d'un FLAC CD TIDAL en DASH n'attend plus le dernier segment.
+/// Avant : `get_track_url` assemblait les 60 segments sur disque avant que
+/// la session WAV reçoive un seul échantillon (18,6 s en rc10 sur 86
+/// segments). Après : le décodage suit la frontière d'écriture, et la piste
+/// entière arrive quand même, échantillon pour échantillon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sur_une_sortie_locale_la_premiere_note_n_attend_pas_le_dernier_segment_7266() {
+    let pcm = pcm_cd();
+    let flac = flac_cd(&pcm).await;
+    let piste = Arc::new(decouper(&flac));
+
+    let ecoute_flux = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = ecoute_flux.local_addr().unwrap().port();
+    drop(ecoute_flux);
+    let streamer = Arc::new(crate::http::streamer::AudioStreamer::new(port));
+    let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    let db: Arc<dyn DbBackend> = Arc::new(db);
+    let orch = PlaybackOrchestrator::new(
+        db,
+        Arc::new(crate::playback::PlaybackManager::new()),
+        streamer.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::streaming::registry::ServiceRegistry::new(),
+        )),
+        Arc::new(tokio::sync::Mutex::new(
+            crate::outputs::registry::OutputRegistry::new(),
+        )),
+        Some("127.0.0.1".into()),
+    );
+    let (base, tidal) = faux_tidal(piste, "flac").await;
+    orch.services
+        .lock()
+        .await
+        .register(Box::new(TidalService::pour_un_faux_tidal(base)));
+    let appareil = "local:Banc 7266".to_string();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Bureau 7266", Some("local"), Some(&appareil))
+        .unwrap();
+    let req = PlayRequest {
+        zone_id,
+        output_device_id: Some(appareil),
+        source: Some("tidal".into()),
+        source_id: Some(PISTE.into()),
+        title: Some("Témoin 7266".into()),
+        artist_name: Some("Banc".into()),
+        album_title: Some("DASH".into()),
+        duration_ms: Some(SECONDES as i64 * 1000),
+        ..Default::default()
+    };
+    assert!(super::resolve_stream::decoder_pendant_le_telechargement(
+        &req
+    ));
+
+    let debut = Instant::now();
+    let resolu = orch
+        .resolve_streaming_url("tidal", &req)
+        .await
+        .expect("la piste se résout");
+    let resolution = debut.elapsed();
+    let servis_a_la_resolution = tidal.lock().unwrap().servis;
+    let sid = resolu.stream_id.expect("une session WAV");
+    let session = streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(&sid)
+        .cloned()
+        .expect("session ouverte");
+
+    let mut recu = Vec::new();
+    let mut premiere_note: Option<(Duration, usize)> = None;
+    while let Ok(Some(morceau)) =
+        tokio::time::timeout(Duration::from_secs(10), session.recv_chunk()).await
+    {
+        recu.extend_from_slice(&morceau);
+        if premiere_note.is_none() && !pcm_du_wav(&recu).is_empty() {
+            premiere_note = Some((debut.elapsed(), tidal.lock().unwrap().servis));
+        }
+    }
+    let (instant, servis) = premiere_note.expect("aucun échantillon reçu");
+    println!(
+        "#7266 sortie locale — {SEGMENTS} segments, {LATENCE_MS} ms chacun : résolution \
+         {:.2} s ({servis_a_la_resolution} segments servis), première note {:.2} s \
+         ({servis} segments servis)",
+        resolution.as_secs_f64(),
+        instant.as_secs_f64()
+    );
+    assert!(
+        servis < SEGMENTS / 2,
+        "première note après {servis}/{SEGMENTS} segments servis ({instant:?}) : la \
+         sortie locale attend encore la piste entière"
+    );
+
+    // La piste entière, sans perte : le WAV 32 bits de la sortie locale porte
+    // les échantillons 16 bits de la source.
+    let servi = pcm_du_wav(&recu);
+    let source: Vec<i16> = pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let rendu: Vec<i16> = servi
+        .chunks_exact(4)
+        .map(|c| (i32::from_le_bytes([c[0], c[1], c[2], c[3]]) >> 16) as i16)
+        .collect();
+    assert_eq!(rendu.len(), source.len(), "piste tronquée ou allongée");
+    assert!(
+        rendu == source,
+        "les échantillons servis diffèrent de la source"
+    );
 }

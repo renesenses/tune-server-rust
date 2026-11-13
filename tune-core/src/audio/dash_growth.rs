@@ -18,9 +18,10 @@
 //! A process-global registry hands the growth handle from the downloader
 //! (`tidal.rs`) to the decoder (`decode.rs`) keyed by temp path, WITHOUT changing
 //! the `get_track_url`/`StreamUrl` contract. The orchestrator renames the temp to
-//! `{path}.decoding` before decoding, so [`take_for`] strips that suffix. All of
-//! this only engages behind `TUNE_DASH_STREAM_DECODE`; otherwise the registry is
-//! empty and the decoder opens a plain `File` (byte-identical).
+//! `{path}.decoding` before decoding, so [`take_for`] strips that suffix. This
+//! engages behind `TUNE_DASH_STREAM_DECODE` for every output, and — since #7266 —
+//! by default for a LOCAL output ([`pendant_le_telechargement`]); otherwise the
+//! registry is empty and the decoder opens a plain `File` (byte-identical).
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -214,6 +215,49 @@ pub fn stream_decode_enabled() -> bool {
     std::env::var("TUNE_DASH_STREAM_DECODE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+tokio::task_local! {
+    /// #7266 — posé par l'orchestrateur autour de la résolution d'une piste
+    /// destinée à une sortie LOCALE : sa session WAV est servie en continu,
+    /// sans longueur annoncée, et peut donc commencer pendant que les
+    /// segments DASH arrivent. Lu dans la tâche qui résout ; une tâche lancée
+    /// à part (préchargement, sentinelle) ne le voit pas.
+    static DECODAGE_PENDANT_LE_TELECHARGEMENT: bool;
+}
+
+/// #7266 — exécute `f` (la résolution d'une piste) en demandant, si `actif`,
+/// le téléchargement DASH en croissance : le chemin revient dès le segment
+/// d'initialisation, et le décodeur suit la frontière d'écriture.
+pub async fn pendant_le_telechargement<F: std::future::Future>(actif: bool, f: F) -> F::Output {
+    DECODAGE_PENDANT_LE_TELECHARGEMENT.scope(actif, f).await
+}
+
+/// Le téléchargement DASH qui commence doit-il rendre la main dès l'init ?
+/// Oui si `TUNE_DASH_STREAM_DECODE` l'arme pour tout le serveur, ou si la
+/// tâche courante résout pour une sortie locale ([`pendant_le_telechargement`]).
+pub fn decodage_en_croissance() -> bool {
+    stream_decode_enabled()
+        || DECODAGE_PENDANT_LE_TELECHARGEMENT
+            .try_with(|actif| *actif)
+            .unwrap_or(false)
+}
+
+/// #7266 — `TUNE_DASH_STREAM_DECODE=0` (ou `false`) rend l'ancien
+/// comportement aux sorties locales : la piste entière avant la première note.
+pub fn decodage_local_desarme() -> bool {
+    std::env::var("TUNE_DASH_STREAM_DECODE")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+impl DashGrowth {
+    /// #7266 — personne d'autre que le téléchargeur ne tient plus la poignée
+    /// (ni le registre, ni un décodeur) : la lecture a été abandonnée, la
+    /// suite du téléchargement ne servirait à rien.
+    pub fn abandonnee(self: &Arc<Self>) -> bool {
+        Arc::strong_count(self) == 1
+    }
 }
 
 #[cfg(test)]

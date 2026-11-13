@@ -21,6 +21,8 @@ const INIT: &[u8] = b"\0\0\0\x18ftypiso6essai-init";
 struct Compteurs {
     en_vol: AtomicUsize,
     max_en_vol: AtomicUsize,
+    /// Segments média demandés au faux CDN.
+    demandes: AtomicUsize,
 }
 
 /// Faux CDN : `0.mp4` est l'init, `n.mp4` rend un octet, `n`. Le segment
@@ -46,6 +48,7 @@ async fn faux_cdn(en_echec: Option<u32>) -> (String, Arc<Compteurs>) {
             return INIT.to_vec().into_response();
         }
         let c = &etat.compteurs;
+        c.demandes.fetch_add(1, Ordering::SeqCst);
         let n = c.en_vol.fetch_add(1, Ordering::SeqCst) + 1;
         c.max_en_vol.fetch_max(n, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(LATENCE_MS)).await;
@@ -138,4 +141,101 @@ async fn un_segment_refuse_n_emmele_pas_les_suivants_7266() {
     let (octets, _) = telecharger(&base).await;
     let attendus: Vec<u8> = (1..=SEGMENTS as u8).filter(|n| *n != 17).collect();
     assert_eq!(&octets[INIT.len()..], &attendus[..]);
+}
+
+/// Le téléchargement en croissance, tel qu'une sortie locale le demande.
+async fn en_croissance(
+    base: &str,
+) -> (String, Option<Arc<std::sync::atomic::AtomicBool>>, Duration) {
+    let svc = TidalService::new();
+    let debut = Instant::now();
+    let (chemin, complet) = crate::audio::dash_growth::pendant_le_telechargement(
+        true,
+        svc.telecharger_les_segments_dash(&segments(base), "7266-croissance"),
+    )
+    .await
+    .expect("init servi par le faux CDN");
+    (chemin, complet, debut.elapsed())
+}
+
+/// #7266, sortie locale : le chemin revient dès le segment d'init, sans
+/// attendre les 60 segments (≥ 1 s à six en vol). Le fichier se complète
+/// ensuite, dans l'ordre, six segments en vol au plus, et le témoin
+/// `complet` passe à vrai à la fin.
+#[tokio::test]
+async fn en_croissance_le_chemin_revient_des_l_init_7266() {
+    let (base, compteurs) = faux_cdn(None).await;
+    let (chemin, complet, duree) = en_croissance(&base).await;
+    let complet = complet.expect("un téléchargement en croissance a son témoin");
+    assert!(
+        duree < Duration::from_millis(LATENCE_MS * 3),
+        "chemin rendu en {duree:?} : il attend encore les segments"
+    );
+    assert!(
+        !complet.load(Ordering::SeqCst),
+        "le fichier ne peut pas être complet dès l'init"
+    );
+    let poignee = crate::audio::dash_growth::take_for(&chemin).expect("poignée inscrite");
+    let attente = poignee.clone();
+    let taille = tokio::task::spawn_blocking(move || attente.attendre_la_fin())
+        .await
+        .unwrap()
+        .expect("téléchargement mené au bout");
+    assert!(complet.load(Ordering::SeqCst), "témoin posé à la fin");
+    let octets = std::fs::read(&chemin).unwrap();
+    let _ = std::fs::remove_file(&chemin);
+    assert_eq!(octets.len() as u64, taille);
+    let attendus: Vec<u8> = (1..=SEGMENTS as u8).collect();
+    assert_eq!(&octets[..INIT.len()], INIT);
+    assert_eq!(
+        &octets[INIT.len()..],
+        &attendus[..],
+        "segments dans l'ordre"
+    );
+    let max = compteurs.max_en_vol.load(Ordering::SeqCst);
+    assert!(
+        max > 1 && max <= SEGMENTS_DASH_EN_VOL,
+        "{max} segments en vol (plafond {SEGMENTS_DASH_EN_VOL}, et pas un par un)"
+    );
+    drop(poignee);
+}
+
+/// Une lecture abandonnée (le décodeur a lâché la poignée) arrête le
+/// téléchargement au lieu de tirer la piste entière en concurrence avec la
+/// suivante, et le fichier partiel est retiré.
+#[tokio::test]
+async fn une_lecture_abandonnee_arrete_le_telechargement_7266() {
+    let (base, compteurs) = faux_cdn(None).await;
+    let (chemin, complet, _) = en_croissance(&base).await;
+    drop(crate::audio::dash_growth::take_for(&chemin).expect("poignée inscrite"));
+    tokio::time::sleep(Duration::from_millis(LATENCE_MS * SEGMENTS as u64 / 2)).await;
+    let demandes = compteurs.demandes.load(Ordering::SeqCst);
+    assert!(
+        demandes < SEGMENTS as usize / 2,
+        "{demandes} segments demandés après l'abandon de la lecture"
+    );
+    assert!(
+        !std::path::Path::new(&chemin).exists(),
+        "le fichier partiel reste sur le disque"
+    );
+    assert!(!complet.unwrap().load(Ordering::SeqCst));
+}
+
+/// Hors d'une résolution pour une sortie locale (renderer réseau,
+/// préchargement), rien ne change : le fichier rendu est complet.
+#[tokio::test]
+async fn hors_sortie_locale_le_fichier_rendu_est_complet_7266() {
+    let (base, _) = faux_cdn(None).await;
+    let svc = TidalService::new();
+    let (chemin, complet) = crate::audio::dash_growth::pendant_le_telechargement(
+        false,
+        svc.telecharger_les_segments_dash(&segments(&base), "7266-complet"),
+    )
+    .await
+    .unwrap();
+    assert!(complet.is_none());
+    assert!(crate::audio::dash_growth::take_for(&chemin).is_none());
+    let octets = std::fs::read(&chemin).unwrap();
+    let _ = std::fs::remove_file(&chemin);
+    assert_eq!(octets.len(), INIT.len() + SEGMENTS as usize);
 }
