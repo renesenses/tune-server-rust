@@ -120,6 +120,8 @@ pub use tune_stream_http as stream_handler;
 // chemin historique `routes::streaming` pour les appelants.
 pub use tune_streaming_http as streaming;
 pub mod sources_physiques;
+// #8189 — sources réseau lues sans montage (socle « source distante »).
+pub mod sources_reseau;
 pub mod support;
 pub mod system;
 pub mod tagger;
@@ -514,6 +516,7 @@ pub fn router_with_plugins(
         .nest("/library/smart-collections", smart_collections::router())
         .nest("/export", export::router())
         .nest("/network", network::router())
+        .nest("/sources-reseau", sources_reseau::router())
         .nest(
             "/appliance",
             appliance::router().merge(appliance_storage::router()),

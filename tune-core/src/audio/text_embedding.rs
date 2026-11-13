@@ -193,7 +193,7 @@ static TEXT_EMBEDDER: Mutex<ALaDemande<TextEmbedder>> = Mutex::const_new(ALaDema
 /// [`TEXT_IDLE`] sans recherche, rend la mémoire, et s'arrête. Une seule à la
 /// fois : elle ne naît qu'au chargement, qui n'a lieu que session absente, et
 /// elle s'éteint dès que la session l'est.
-fn veiller_sur_le_modele_texte(backend: Arc<dyn DbBackend>) {
+fn veiller_sur_le_modele_texte() {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(TEXT_VEILLE).await;
@@ -207,7 +207,7 @@ fn veiller_sur_le_modele_texte(backend: Arc<dyn DbBackend>) {
                     idle_s = TEXT_IDLE.as_secs(),
                     "text_embedder_released — modèle texte relâché après inactivité"
                 );
-                super::embedding::rendre_la_memoire_si_rien_ne_joue(&backend).await;
+                super::embedding::rendre_la_memoire_apres_relachement().await;
                 return;
             }
         }
@@ -290,7 +290,7 @@ pub async fn embed_query(backend: &Arc<dyn DbBackend>, query: &str) -> Result<Ve
     let vecteur = embedder.embed_text(query);
     drop(slot);
     if chargee {
-        veiller_sur_le_modele_texte(backend.clone());
+        veiller_sur_le_modele_texte();
     }
     vecteur
 }

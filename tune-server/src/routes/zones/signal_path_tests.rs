@@ -5601,3 +5601,70 @@ fn l_etape_se_nomme_crosstalk_quand_crosstalk_est_en_service_7616() {
         );
     }
 }
+
+// ---- #8248 : DSD natif ALSA de la sortie locale ---------------------------
+
+fn etape_par_code<'a>(v: &'a Value, code: &str) -> Option<&'a Value> {
+    v.get("steps")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("code").and_then(Value::as_str) == Some(code))
+}
+
+/// Le fil porte le flux DSD brut de la sortie native : le chemin du signal
+/// dit « DSD128 natif (ALSA) », bit-perfect, sans étape DoP ; le volume
+/// logiciel n'y est pas appliqué et l'étape le dit.
+#[test]
+fn le_dsd_natif_local_se_dit_natif_et_non_dop_8248() {
+    let (backend, mut zone) = local_zone_migrated();
+    zone.volume = 40.0;
+    let fil = wire_mime("dsd", tune_core::audio::dsd_brut::MIME, 5_644_800, 1);
+    let sp = build_signal_path_lang(
+        "fr",
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        None,
+        "ALSA",
+        Some(&fil),
+    )
+    .unwrap();
+    let natif = etape_par_code(&sp, "dsd_natif").expect("étape DSD natif absente");
+    let attendu = format!("DSD128 natif ({})", pilote_du_dsd_natif_local());
+    assert_eq!(natif["description"], attendu.as_str(), "{sp}");
+    assert_eq!(natif["bit_perfect"], true);
+    assert!(
+        etape_par_code(&sp, "dop").is_none(),
+        "un natif n'est pas un DoP : {sp}"
+    );
+    assert_eq!(
+        step_desc(&sp, "Volume").as_deref(),
+        Some("Volume non appliqué (DSD natif)"),
+        "le volume n'est pas appliqué sur du DSD natif : {sp}"
+    );
+}
+
+/// Contre-témoin : le même DSD servi en DoP (fil WAV, `dop_active`) garde
+/// son étape DoP et n'est jamais annoncé natif.
+#[test]
+fn le_dop_local_ne_se_dit_pas_natif_8248() {
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = dsd128_playing();
+    ps.dop_active = true;
+    let fil = wire_mime("wav", "audio/wav", 352_800, 24);
+    let sp = build_signal_path_lang("fr", &ps, &zone, &backend, None, "ALSA", Some(&fil)).unwrap();
+    assert!(etape_par_code(&sp, "dsd_natif").is_none(), "{sp}");
+    assert!(
+        etape_par_code(&sp, "dop").is_some(),
+        "le DoP doit rester dit : {sp}"
+    );
+}
+
+/// DSD1024 se dit DSD1024 (il se disait DSD512, fil 2730).
+#[test]
+fn dsd1024_se_dit_dsd1024_8248() {
+    assert_eq!(dsd_family_name(45_158_400), "DSD1024");
+    assert_eq!(dsd_family_name(49_152_000), "DSD1024");
+    assert_eq!(dsd_family_name(22_579_200), "DSD512");
+    assert_eq!(dsd_family_name(24_576_000), "DSD512");
+}

@@ -176,6 +176,55 @@ pub(super) async fn defaire_coffret_manuel(
     }
 }
 
+/// Ce que l'écran envoie pour réordonner un coffret (#8571).
+#[derive(Deserialize)]
+pub(super) struct OrdreCoffret {
+    /// Les `membre` de `GET …/ordre`, tous, dans l'ordre voulu.
+    pub membres: Vec<u32>,
+}
+
+/// Les refus propres au réordonnancement : 409 pour un album qui n'est pas
+/// (ou plus) réordonnable, 422 pour un ordre incohérent.
+fn refuser_ordre(e: RefusEdition) -> Response {
+    match e {
+        RefusEdition::Invalide {
+            code: code @ ("pas_un_coffret_manuel" | "ordre_indisponible"),
+            message,
+        } => refus(StatusCode::CONFLICT, code, message),
+        e => refuser(e),
+    }
+}
+
+/// `GET /library/coffrets/{id}/ordre` — #8571 (fil 2763) : les albums d'un
+/// coffret composé à la main, dans l'ordre de ses disques. 409
+/// `pas_un_coffret_manuel` ou `ordre_indisponible`.
+pub(super) async fn ordre_du_coffret(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    match edition_album::ordre_du_coffret(&state.backend, id) {
+        Ok(o) => Json(o).into_response(),
+        Err(e) => refuser_ordre(e),
+    }
+}
+
+/// `PUT /library/coffrets/{id}/ordre` — #8571 (fil 2763) : réordonne les
+/// albums d'un coffret composé à la main ; les disques sont renumérotés à la
+/// suite. Rend le nouvel ordre. Voir [`edition_album::reordonner_coffret`].
+pub(super) async fn reordonner_coffret(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<OrdreCoffret>,
+) -> Response {
+    match edition_album::reordonner_coffret(&state.backend, id, &body.membres) {
+        Ok(o) => {
+            annoncer(&state, "coffret_reordonne", id);
+            Json(o).into_response()
+        }
+        Err(e) => refuser_ordre(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

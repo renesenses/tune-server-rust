@@ -2947,10 +2947,7 @@ impl TrackRepo {
         let mut conditions: Vec<String> = Vec::new();
         let mut owned_params: Vec<SqlValue> = Vec::new();
 
-        // Genre : la colonne `t.genre` OU le tableau JSON `t.genres`. Avec
-        // plusieurs genres sélectionnés, les deux tests s'étendent ensemble —
-        // et les valeurs sont empilées dans l'ordre où les marqueurs sortent :
-        // d'abord les N du `IN`, puis les N motifs `LIKE`.
+        // #5638 : genre principal seul, comme les compteurs du rail.
         //
         // #2108 : chaque facette « combinable » passe par
         // `facet_filter::combiner`, qui rend le SQL d'avant en « Ou » (défaut)
@@ -3559,6 +3556,10 @@ impl TrackRepo {
         // #7725 : sous « Multicanal », seules les pistes de plus de deux canaux.
         if quality == Some(super::models::Album::QUALITE_MULTICANAL) {
             let pred = super::models::Album::multicanal_sql_piste("t");
+            extra.push_str(&format!(" AND {pred}"));
+        } else if quality == Some(super::models::Album::QUALITE_STEREO) {
+            // #8560 : sous « Stéréo », seules les pistes d'un ou deux canaux.
+            let pred = super::models::Album::stereo_sql_piste("t");
             extra.push_str(&format!(" AND {pred}"));
         } else if let Some(pred) = quality.and_then(|q| super::models::Album::quality_sql(q, "t")) {
             extra.push_str(&format!(" AND {pred}"));
@@ -7749,8 +7750,7 @@ pub(crate) mod tests_b209_ordre_dans_l_album {
 }
 
 /// #2108 — l'opérateur « Et » entre les valeurs d'une même facette, sur la
-/// liste filtrée : compositeurs (facette « contient ») et genres (colonne OU
-/// tableau JSON, deux marqueurs par valeur).
+/// liste filtrée : compositeurs multivalués et genre principal seul (#5638).
 #[cfg(test)]
 mod tests_facettes_en_et_2108 {
     use crate::db::facet_filter::TrackFilter;
@@ -7819,7 +7819,8 @@ mod tests_facettes_en_et_2108 {
                 en_et: vec!["genre".into()],
                 ..Default::default()
             }),
-            ["Deux"]
+            Vec::<String>::new(),
+            "#5638 : une piste ne porte qu'un genre principal ; son secondaire ne satisfait pas ET"
         );
     }
 }

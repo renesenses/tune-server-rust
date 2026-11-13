@@ -272,6 +272,56 @@ fn la_preference_injoignable_se_replie_sur_l_exemplaire_suivant() {
     assert_eq!(racine_preferee(&*db, 1), None);
 }
 
+/// #7876 — sans réglage `music_dirs` (dossiers du seul fichier de
+/// configuration), l'ordre des répertoires choisit quand même l'exemplaire
+/// LU : avant, `racines_ordonnees` ne connaissait que la base et l'ordre
+/// réglé restait sans effet sur la lecture.
+#[test]
+fn sans_reglage_les_dossiers_du_fichier_ordonnent_l_exemplaire_lu_7876() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("nas");
+    let b = dir.path().join("local");
+    let fa = a.join("Kind of Blue/01.flac");
+    let fb = b.join("Kind of Blue/01.flac");
+    ecrire(&fa);
+    ecrire(&fb);
+    let (a, b) = (
+        a.to_string_lossy().into_owned(),
+        b.to_string_lossy().into_owned(),
+    );
+    let db = base();
+    socle(&*db);
+    piste(&*db, 7, 1, &fa.to_string_lossy(), "flac", 44_100, 16);
+    copie(&*db, 7, &fb.to_string_lossy());
+    // Pas de réglage : les dossiers viennent du fichier de configuration.
+    inscrire_les_dossiers_du_fichier(&db, &[a.clone(), b.clone()]);
+    assert_eq!(dossiers_de_musique(&*db), vec![a.clone(), b.clone()]);
+
+    let mut t = get(&db, 7);
+    appliquer_a_la_lecture(&*db, &mut t).expect("deux exemplaires");
+    assert_eq!(t.file_path.as_deref(), Some(&*fa.to_string_lossy()));
+
+    // L'auditeur met « local » en tête (ce qu'écrit `PUT /library/repertoires/ordre`).
+    let ordre = serde_json::to_string(&[&b, &a]).unwrap();
+    let params: [&dyn ToSqlValue; 1] = [&ordre];
+    db.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES ('ordre_des_repertoires', ?, '')",
+        &params,
+    )
+    .unwrap();
+    let mut t = get(&db, 7);
+    appliquer_a_la_lecture(&*db, &mut t).unwrap();
+    assert_eq!(
+        t.file_path.as_deref(),
+        Some(&*fb.to_string_lossy()),
+        "#7876 : l'ordre réglé doit décider de l'exemplaire lu"
+    );
+
+    // Une autre base n'hérite pas de ces dossiers.
+    let autre = base();
+    assert!(dossiers_de_musique(&*autre).is_empty());
+}
+
 /// Une sœur d'une autre qualité (même album, disque, numéro, titre) est un
 /// exemplaire : la meilleure qualité est lue, même depuis la ligne moindre
 /// qu'une playlist aurait retenue.

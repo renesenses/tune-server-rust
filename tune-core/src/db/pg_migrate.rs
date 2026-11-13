@@ -252,6 +252,9 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     "sync_releve_pistes",
     "sync_releve_albums",
     "sync_releve_artistes",
+    // Sources réseau (#8189, script 115) : sans cette ligne, les sources
+    // configurées et leurs identifiants scellés seraient perdus à la bascule.
+    "sources_reseau",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",
@@ -290,6 +293,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
     (
         "hires_verifications",
         "verdicts des faux hi-res (#6285) : mesures recalculables, la passe de fond les refait",
+    ),
+    (
+        "spectrogrammes",
+        "trace des spectrogrammes conservés (#8160) : images du cache, recalculables à la demande ; \
+         le cache des pochettes n'est pas recopié non plus",
     ),
     (
         "_migrations",

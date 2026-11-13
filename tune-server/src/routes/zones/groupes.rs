@@ -813,7 +813,15 @@ pub(crate) async fn appliquer_le_volume_du_groupe(
             .set_volume(zid, effectif, device_id.as_deref())
             .await
         {
-            Ok(()) => acceptees += 1,
+            Ok(()) => {
+                // #8165 — le curseur du groupe est un geste de volume : il
+                // lève la sourdine de chaque membre.
+                state
+                    .orchestrator
+                    .lever_la_sourdine_au_geste_de_volume(zid, device_id.as_deref())
+                    .await;
+                acceptees += 1
+            }
             Err(error) => {
                 warn!(group_id, zone_id = zid, error = ?error, "zone_group_volume_member_refused");
                 refusees.push(zid);

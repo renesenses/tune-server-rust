@@ -542,6 +542,9 @@ mod bras_wasapi;
 // la chaîne des bras Windows exclusifs.
 #[cfg(target_os = "linux")]
 mod bras_alsa_natif;
+// #8248 — le DSD natif de Linux : PCM `hw:` ouvert en `DSD_U32_BE`/`_LE`.
+#[cfg(target_os = "linux")]
+mod bras_alsa_dsd;
 
 // REF-8 (#2219) : l'étage natif des bras Windows exclusifs — octets source
 // → mots `i32` alignés à gauche → `PuitsNatif` — et le puits de tout
@@ -2152,6 +2155,17 @@ impl LocalOutput {
         }
     }
 
+    /// #8248 — de quoi sonder le DSD natif ALSA de cette sortie. `None` hors
+    /// Linux : le DSD natif n'y passe que par ASIO.
+    pub fn sonde_dsd_alsa(&self) -> Option<SondeDsdAlsa> {
+        cfg!(target_os = "linux").then(|| SondeDsdAlsa {
+            device_name: self.device_name.clone(),
+            endpoint_id: self.endpoint_id.clone(),
+            origin_host: self.origin_host.clone(),
+            audio_backend: self.audio_backend.clone(),
+        })
+    }
+
     /// #5643 — le nom du périphérique, tel que la sortie l'ouvrira (la clé de
     /// la capacité DSD sondée, `outputs::capacite_dsd_natif`).
     pub fn nom_du_peripherique(&self) -> &str {
@@ -2546,6 +2560,72 @@ impl SondeDuDop {
         {
             let _ = (cadence_dop, voies);
             crate::audio::dop_ecarte_7265::AccueilDuDop::Inconnu
+        }
+    }
+}
+
+/// #8248 — le nombre de voies sur lequel le DSD natif ALSA est sondé pour la
+/// table de capacité : le DSD natif des DAC USB est stéréo. Un fichier
+/// multicanal part en DoP (`MotifDsdServiEnDop::VoiesNonDeclarees`).
+pub const VOIES_SONDEES_DSD_ALSA: u16 = 2;
+
+/// #8248 — ce qu'a rendu le sondage DSD natif d'une sortie ALSA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultatSondeDsdAlsa {
+    /// La sortie n'ouvre pas un PCM ALSA matériel (`hw:`) : pas de DSD natif.
+    PasUnPcmMateriel,
+    /// PCM tenu (ou illisible) : capacité non sondée, rien n'est retenu.
+    Occupe,
+    /// PCM sondé : les cadences DSD acceptées en `DSD_U32` (vide = aucune).
+    Sonde { cadences: Vec<u32>, voies: u16 },
+}
+
+/// #8248 — une question « ce PCM offre-t-il le DSD natif ? », détachée de la
+/// sortie (voir [`LocalOutput::sonde_dsd_alsa`]) : le sondage ouvre le PCM,
+/// il se fait hors du verrou de la sortie et hors du fil asynchrone.
+#[derive(Debug, Clone)]
+pub struct SondeDsdAlsa {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    device_name: String,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    endpoint_id: Option<String>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    origin_host: Option<String>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    audio_backend: String,
+}
+
+impl SondeDsdAlsa {
+    /// Bloquant. Une réponse (PCM matériel ou non, cadences) est retenue dans
+    /// `capacite_dsd_natif` ; un PCM occupé ne retient rien.
+    pub fn sonder_et_retenir(&self) -> ResultatSondeDsdAlsa {
+        #[cfg(target_os = "linux")]
+        {
+            use crate::outputs::capacite_dsd_natif::{self as capacite, CapaciteConnue};
+            let r = bras_alsa_dsd::sonder_la_sortie(
+                &self.device_name,
+                self.endpoint_id.as_deref(),
+                self.origin_host.as_deref(),
+                &self.audio_backend,
+                VOIES_SONDEES_DSD_ALSA,
+            );
+            match &r {
+                ResultatSondeDsdAlsa::Sonde { cadences, .. } => capacite::retenir(
+                    &self.device_name,
+                    CapaciteConnue::AlsaDsdU32 {
+                        cadences: cadences.clone(),
+                    },
+                ),
+                ResultatSondeDsdAlsa::PasUnPcmMateriel => {
+                    capacite::retenir(&self.device_name, CapaciteConnue::SortieNonAsio);
+                }
+                ResultatSondeDsdAlsa::Occupe => {}
+            }
+            r
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ResultatSondeDsdAlsa::PasUnPcmMateriel
         }
     }
 }
@@ -3143,6 +3223,10 @@ mod retrait_du_registre_7949;
 // #8074 — le premier morceau après le démarrage ne part jamais à pleine échelle.
 #[cfg(test)]
 mod premier_play_au_gain_de_zone_8074;
+
+// #8609 — banc de mesure : `malloc_trim` pendant une lecture locale.
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+mod banc_trim_8609;
 
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
@@ -6496,6 +6580,18 @@ impl OutputTarget for LocalOutput {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
+        // #8248 — le PCM vient d'être rendu : c'est le moment de sonder son
+        // DSD natif s'il est encore inconnu. L'orchestrateur ne peut pas le
+        // faire pendant qu'une piste PCM tient le PCM `hw:` (EBUSY) ; sans ce
+        // relevé, la première piste DSD qui suit une piste PCM partirait en
+        // DoP. Une fois par périphérique : la réponse est retenue.
+        #[cfg(target_os = "linux")]
+        if crate::outputs::capacite_dsd_natif::connue(&self.device_name).is_none()
+            && let Some(sonde) = self.sonde_dsd_alsa()
+        {
+            let _ = tokio::task::spawn_blocking(move || sonde.sonder_et_retenir()).await;
+        }
+
         // Create a FRESH force_silent flag for the new stream.
         // The old stream's callback keeps its clone of the previous Arc
         // (which was set to true by stop()), so it stays silent.
@@ -6765,21 +6861,53 @@ impl OutputTarget for LocalOutput {
                     });
                     return;
                 }
-                warn!(
-                    device = %device_name,
-                    cadence = entete.cadence,
-                    canaux = entete.canaux,
-                    "local_audio_dsd_natif_recu_sans_bras_asio"
-                );
-                if let Ok(mut slot) = open_failure.lock() {
-                    *slot = Some(format!(
-                        "« {device_name} » : flux DSD natif reçu, mais cette sortie n'est pas \
-                         un pilote ASIO exclusif."
-                    ));
+                // #8248 — Linux : PCM ALSA `hw:` ouvert en `DSD_U32`.
+                #[cfg(target_os = "linux")]
+                {
+                    bras_alsa_dsd::jouer_dsd_natif_via_alsa(bras_alsa_dsd::EntreesDsdNatifAlsa {
+                        device_name,
+                        endpoint_id,
+                        origin_host,
+                        audio_backend,
+                        url,
+                        entete,
+                        header_buf,
+                        reader,
+                        seek_offset,
+                        my_generation,
+                        paused,
+                        playing,
+                        force_silent,
+                        stop_rx,
+                        open_failure,
+                        position_ms,
+                        play_generation,
+                        track_ended_naturally,
+                        track_ended_generation,
+                        dop_active,
+                        chain_exhausted: chain_exhausted_ref,
+                        device_gone,
+                    });
+                    return;
                 }
-                force_silent.store(true, Ordering::SeqCst);
-                playing.store(false, Ordering::SeqCst);
-                return;
+                #[cfg(not(target_os = "linux"))]
+                {
+                    warn!(
+                        device = %device_name,
+                        cadence = entete.cadence,
+                        canaux = entete.canaux,
+                        "local_audio_dsd_natif_recu_sans_bras_asio"
+                    );
+                    if let Ok(mut slot) = open_failure.lock() {
+                        *slot = Some(format!(
+                            "« {device_name} » : flux DSD natif reçu, mais cette sortie n'est pas \
+                             un pilote ASIO exclusif."
+                        ));
+                    }
+                    force_silent.store(true, Ordering::SeqCst);
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
             }
 
             // #5439 — un flux décodé en continu repart du début de la piste :

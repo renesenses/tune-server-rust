@@ -226,46 +226,24 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
         corps["q"] = json!(q);
         return corps;
     }
-    let page = if veut_le_total {
-        repo.list_filtered_seeded_avec_total(
-            limit,
-            offset,
-            sort,
-            order,
-            p.format.as_deref(),
-            p.quality.as_deref(),
-            p.compilation,
-            include_hidden,
-            dr,
-            seed,
-        )
-    } else {
-        repo.list_filtered_seeded(
-            limit,
-            offset,
-            sort,
-            order,
-            p.format.as_deref(),
-            p.quality.as_deref(),
-            p.compilation,
-            include_hidden,
-            dr,
-            seed,
-        )
-        .map(|albums| (albums, None))
-    };
-    let (items, total_de_la_page) = match page {
-        Ok(page) => page,
+    let page = repo.list_filtered_seeded_avec_reperes(
+        limit,
+        offset,
+        sort,
+        order,
+        p.format.as_deref(),
+        p.quality.as_deref(),
+        p.compilation,
+        include_hidden,
+        dr,
+        seed,
+        veut_le_total,
+    );
+    let (items, total_de_la_page, reperes) = match page {
+        Ok(page) => (page.albums, page.total, page.reperes_alphabetiques),
         Err(e) => {
-            tracing::error!(
-                error = %e,
-                sort,
-                order,
-                limit,
-                offset,
-                "list_albums_query_failed"
-            );
-            (Vec::new(), None)
+            tracing::error!(error = %e, sort, order, limit, offset, "list_albums_query_failed");
+            (Vec::new(), None, None)
         }
     };
     // Le total suit la même exclusion que la liste, sinon la grille pagine
@@ -311,7 +289,7 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
             None => repo.count_visible().unwrap_or(0),
         },
     };
-    corps_de_la_page(
+    let mut corps = corps_de_la_page(
         &repo,
         &backend,
         douteux_visible,
@@ -320,7 +298,11 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
         limit,
         offset,
         seed,
-    )
+    );
+    if let Some(reperes) = reperes {
+        corps["reperes_alphabetiques"] = json!(reperes);
+    }
+    corps
 }
 
 /// La réponse de `GET /library/albums` pour une page déjà lue : le DR de
@@ -356,7 +338,7 @@ fn corps_de_la_page(
             tracing::warn!(error = %e, "hires_par_album a échoué — page servie sans verdict");
             std::collections::HashMap::new()
         });
-    let canaux_par_id = canaux_max_par_album(repo, &ids);
+    let canaux_par_id = canaux_par_album(repo, &ids);
     let items: Vec<Value> = items
         .iter()
         .map(|a| {
@@ -389,29 +371,31 @@ fn corps_de_la_page(
     corps
 }
 
-/// #7725 — le nombre de canaux le plus grand parmi les pistes de chaque album
-/// de `ids`, pour le filtre Multicanal du client (`max_channels` > 2). Un
-/// échec ne vide pas la liste : elle part sans `max_channels`, et le journal
-/// le dit.
-pub(super) fn canaux_max_par_album(
-    repo: &AlbumRepo,
-    ids: &[i64],
-) -> std::collections::HashMap<i64, i64> {
-    repo.canaux_max_par_album(ids).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "canaux_max_par_album a échoué — liste servie sans canaux");
+/// Les canaux de chaque album, `(min, max)` sur ses pistes.
+pub(super) type CanauxParAlbum = std::collections::HashMap<i64, (i64, i64)>;
+
+/// #7725 — le plus petit et le plus grand nombre de canaux parmi les pistes de
+/// chaque album de `ids`, pour les filtres Multicanal (`max_channels` > 2) et
+/// Stéréo (`min_channels` <= 2, #8560) du client. Un échec ne vide pas la
+/// liste : elle part sans canaux, et le journal le dit.
+pub(super) fn canaux_par_album(repo: &AlbumRepo, ids: &[i64]) -> CanauxParAlbum {
+    repo.canaux_min_max_par_album(ids).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "canaux_min_max_par_album a échoué — liste servie sans canaux");
         std::collections::HashMap::new()
     })
 }
 
-/// Pose `max_channels` sur l'album, quand ses pistes le disent ; clé absente
-/// sinon. Champ additif : un client qui l'ignore lit la réponse d'avant.
+/// Pose `max_channels` et `min_channels` (#8560) sur l'album, quand ses
+/// pistes le disent ; clés absentes sinon. Champs additifs : un client qui
+/// les ignore lit la réponse d'avant.
 pub(super) fn inserer_max_channels(
     obj: &mut serde_json::Map<String, Value>,
     album: &Album,
-    canaux_par_id: &std::collections::HashMap<i64, i64>,
+    canaux_par_id: &CanauxParAlbum,
 ) {
-    if let Some(n) = album.id.and_then(|id| canaux_par_id.get(&id)) {
-        obj.insert("max_channels".into(), json!(n));
+    if let Some((min, max)) = album.id.and_then(|id| canaux_par_id.get(&id)) {
+        obj.insert("max_channels".into(), json!(max));
+        obj.insert("min_channels".into(), json!(min));
     }
 }
 
@@ -4897,7 +4881,11 @@ mod tests_genre_pistes_5314 {
     #[tokio::test]
     async fn chaque_route_d_ecriture_d_album_atteint_la_facette_d_oxygen() {
         let state = banc();
-        assert_eq!(facette(&state).await, ["Blues", "Pop", "Rock"]);
+        assert_eq!(
+            facette(&state).await,
+            ["Blues", "Rock"],
+            "#5638 : Pop est secondaire et ne doit pas entrer dans la facette"
+        );
 
         let (s, _) = request(
             &state,
@@ -4907,27 +4895,29 @@ mod tests_genre_pistes_5314 {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
+        assert_eq!(facette(&state).await, ["Jazz", "Rock"]);
         let (s, _) = request(
             &state,
             "POST",
             "/library/albums/batch-update",
-            json!({ "album_ids": [2], "genre": "Jazz" }),
+            json!({ "album_ids": [2], "genre": "Soul" }),
         )
         .await;
         assert_eq!(s, StatusCode::OK);
+        assert_eq!(facette(&state).await, ["Jazz", "Rock", "Soul"]);
         let (s, v) = request(
             &state,
             "PUT",
             "/library/albums/3/edition",
-            json!({ "genre": "Jazz" }),
+            json!({ "genre": "Classical" }),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
 
         assert_eq!(
             facette(&state).await,
-            ["Jazz"],
-            "#5314 : la facette Genre d'Oxygen doit proposer le genre posé sur les albums, et lui seul"
+            ["Classical", "Jazz", "Soul"],
+            "#5314 : chaque route doit propager le genre principal de son album aux pistes et à Oxygen"
         );
     }
 }
