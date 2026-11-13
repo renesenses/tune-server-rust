@@ -2897,7 +2897,22 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "podcast_episode_positions",
         up: include_str!("../../migrations/podcast_episode_positions.sql"),
     },
+    // Forum, fil 2694 (Ilan) ; décision de Bertrand du 13/11 — la radio de fin
+    // de file est ACTIVÉE par défaut, comme Roon. Bascule unique des zones
+    // « désactivé » (défaut historique depuis la 46) vers « titres
+    // similaires » ; les modes nommés (#2271) ne bougent pas. Les zones
+    // créées ensuite naissent à 1 (`ZoneRepo::create`). Jumelle PG : 117.
+    Migration {
+        version: 151,
+        name: "radio_fin_de_file_par_defaut",
+        up: SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT,
+    },
 ];
+
+/// SQL de la migration 151 (fil 2694). SQLite range `'0'` en entier (affinité
+/// INTEGER) : la comparaison à 0 couvre les deux écritures.
+pub(crate) const SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT: &str = "UPDATE zones SET autoplay_enabled = 1 \
+     WHERE autoplay_enabled IS NULL OR autoplay_enabled = 0 OR autoplay_enabled = 'off'";
 
 /// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
 /// de la 146 et passe finale.
@@ -6149,6 +6164,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         116,
         "podcast_episode_positions",
         include_str!("../../migrations/postgres/116_podcast_episode_positions.sql"),
+    ),
+    // Jumelle de la SQLite 151 (fil 2694) : radio de fin de file activée par
+    // défaut — bascule unique des zones « désactivé », DEFAULT '1'.
+    (
+        117,
+        "radio_fin_de_file_par_defaut",
+        include_str!("../../migrations/postgres/117_radio_fin_de_file_par_defaut.sql"),
     ),
 ];
 
@@ -10013,7 +10035,10 @@ mod tests {
         // (115 = `sources_reseau`, #8202, fusionnée avant).
         // Crée la position de chaque épisode de podcast commencé, que la
         // reprise des podcasts NOMME.
-        assert_eq!(pg_latest_version(), 116, "latest PG migration must be 116");
+        // 117 : `radio_fin_de_file_par_defaut` (fil 2694), jumelle de la
+        // SQLite 151. Migration de DONNÉES : la radio de fin de file activée
+        // par défaut, et le DEFAULT de `zones.autoplay_enabled` à '1'.
+        assert_eq!(pg_latest_version(), 117, "latest PG migration must be 117");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

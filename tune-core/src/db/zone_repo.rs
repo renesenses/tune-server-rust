@@ -214,9 +214,13 @@ pub mod sql {
         format!("SELECT {COLS} FROM zones ORDER BY name")
     }
 
+    /// Fil 2694 (décision de Bertrand du 13/11, « comme Roon ») : une zone
+    /// naît avec la radio de fin de file ACTIVÉE (`autoplay_enabled` = '1',
+    /// mode « titres similaires »). Désactivable par zone.
     pub fn create<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO zones (name, output_type, output_device_id) VALUES ({}, {}, {})",
+            "INSERT INTO zones (name, output_type, output_device_id, autoplay_enabled) \
+             VALUES ({}, {}, {}, '1')",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3)
@@ -4982,13 +4986,15 @@ mod autoplay_mode_tests {
         assert!(lue(jamais).is_some(), "par identifiant aussi");
     }
 
-    /// Defaut inchange : une zone neuve n'enchaine rien.
+    /// Fil 2694 (décision de Bertrand du 13/11, « comme Roon ») : une zone
+    /// neuve enchaîne sur des titres similaires à la fin de la file. C'était
+    /// `Off` jusqu'à la rc12.
     #[test]
-    fn zone_neuve_est_eteinte() {
+    fn zone_neuve_a_la_radio_de_fin_de_file() {
         let repo = repo();
         let id = zone(&repo);
-        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Off);
-        assert!(!repo.get_autoplay_enabled(id));
+        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Similar);
+        assert!(repo.get_autoplay_enabled(id));
     }
 
     /// LE TEST DE NON-REGRESSION. Une zone dont l'autoplay etait actif avant

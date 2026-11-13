@@ -561,6 +561,9 @@ impl AlarmScheduler {
         if file.count_all(zone)? == 0 {
             return Err("contenu du réveil sans piste jouable".into());
         }
+        // Fil 2694 — la file d'un réveil s'arrête à sa fin : la radio de fin
+        // de file ne la prolonge pas (tant qu'on n'y a rien changé).
+        crate::playback::radio_fin_de_file::noter_fin_voulue(&self.db, zone);
         self.orchestrator.clear_prefetch().await;
         self.orchestrator.play_from_queue(zone, 0).await
     }

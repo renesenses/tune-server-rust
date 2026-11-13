@@ -124,6 +124,81 @@ impl PositionPoller {
             return;
         }
         let mode = ZoneRepo::with_backend(self.db.clone()).get_autoplay_mode(zone_id);
+        // Fil 2694 (Ilan) — la radio de fin de file, activée par défaut depuis
+        // la rc12, ne s'invite pas là où la fin est voulue : « Vider la suite »,
+        // file d'un réveil, profil sous contrôle parental. La consigne de fin
+        // voulue est consommée même réglage coupé : elle ne vaut que pour
+        // cette fin-là.
+        let fin_voulue = crate::playback::radio_fin_de_file::fin_voulue(&self.db, zone_id);
+        if mode != AutoplayMode::Off {
+            if fin_voulue {
+                info!(zone_id, "radio_fin_de_file_ecartee_fin_voulue");
+            } else if !self
+                .radio_de_fin_de_file_sans_garde_parentale(zone_id)
+                .await
+            {
+                info!(zone_id, "radio_fin_de_file_ecartee_controle_parental");
+            } else {
+                let avant =
+                    crate::playback::radio_fin_de_file::lignes_de_la_file(&self.db, zone_id);
+                self.prolonger_la_file(zone_id, zone_state, device_id, mode)
+                    .await;
+                let marquees = crate::playback::radio_fin_de_file::marquer_les_ajouts(
+                    &self.db, zone_id, &avant,
+                );
+                if marquees > 0
+                    && let Some(ref bus) = self.event_bus
+                {
+                    // Les marques s'écrivent APRÈS l'ajout : on redit la file
+                    // pour que le badge « ajouté par la radio » paraisse sans
+                    // attendre le rechargement suivant.
+                    bus.emit(
+                        "playback.queue_changed",
+                        serde_json::json!({ "zone_id": zone_id, "added_by_radio": marquees }),
+                    );
+                }
+                return;
+            }
+        }
+        // Log the queue geometry so a "doesn't advance to next track" report
+        // (Jean-Pierre) can be told apart at a glance: queue_len=1 means the
+        // play truncated the queue to a single track (single-track play path),
+        // whereas queue_len>1 with pos+1<len would be a genuine advance bug.
+        info!(
+            zone_id,
+            queue_pos = zone_state.queue_position,
+            queue_len = zone_state.queue_length,
+            repeat = ?zone_state.repeat,
+            "queue_ended"
+        );
+        self.orchestrator.stop(zone_id, device_id).await;
+    }
+
+    /// Fil 2694 — la radio de fin de file ne joue pas pour un profil sous
+    /// contrôle parental : elle choisirait seule des titres hors des listes
+    /// permises ou d'un artiste bloqué. Garde simple et sûre : toute
+    /// politique posée (ou illisible, ou base muette) l'écarte.
+    async fn radio_de_fin_de_file_sans_garde_parentale(&self, zone_id: i64) -> bool {
+        matches!(
+            self.orchestrator.politique_de_la_zone(zone_id).await,
+            crate::orchestrator::artiste_bloque_8611::PolitiqueDeLaZone::Aucune
+        )
+    }
+
+    /// Le prolongement de la file selon le mode de la zone (#2271). Chaque
+    /// chemin sort après avoir décidé : lecture du lot ajouté, ou arrêt.
+    async fn prolonger_la_file(
+        &self,
+        zone_id: i64,
+        zone_state: &crate::playback::ZoneState,
+        device_id: Option<&str>,
+        mode: crate::db::zone_repo::AutoplayMode,
+    ) {
+        use crate::db::zone_repo::AutoplayMode;
+        // Fil 2694 — pas de doublon : ce qui est déjà dans la file (joué ou
+        // à venir) n'y revient pas par la radio.
+        let deja_dans_la_file =
+            crate::playback::radio_fin_de_file::pistes_locales_de_la_file(&self.db, zone_id);
         match mode {
             AutoplayMode::RandomAlbum
             | AutoplayMode::RandomArtist
@@ -162,6 +237,7 @@ impl PositionPoller {
                 let ids: Vec<i64> = radio
                     .iter()
                     .filter_map(|t| t["track_id"].as_i64())
+                    .filter(|id| !deja_dans_la_file.contains(id))
                     .collect();
                 if !ids.is_empty() {
                     info!(
@@ -263,6 +339,11 @@ impl PositionPoller {
                 }
             }
 
+            generated.retain(|t| {
+                t["track_id"]
+                    .as_i64()
+                    .is_none_or(|id| !deja_dans_la_file.contains(&id))
+            });
             let track_ids: Vec<i64> = generated
                 .iter()
                 .filter_map(|t| t["track_id"].as_i64())

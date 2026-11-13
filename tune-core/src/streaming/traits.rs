@@ -916,6 +916,19 @@ pub trait StreamingService: Send + Sync {
     fn propose_des_artistes_similaires(&self) -> bool {
         false
     }
+    /// Fil 2694 (Ilan, « comme Roon ») — la radio d'UN titre telle que le
+    /// service la compose (TIDAL : `GET /tracks/{id}/radio`). Sert la radio de
+    /// fin de file, qui la préfère aux artistes similaires quand la piste qui
+    /// s'achève vient de ce service. Défaut vide : un service sans radio de
+    /// titre laisse la main au chemin des artistes similaires.
+    async fn get_track_radio(
+        &self,
+        track_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamTrack>, TuneError> {
+        let _ = (track_id, limit);
+        Ok(vec![])
+    }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
     /// Les pistes d'une playlist, chacune avec son année et son genre quand le
