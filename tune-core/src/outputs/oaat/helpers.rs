@@ -338,12 +338,30 @@ fn parse_dsf(buf: &mut Vec<u8>) -> Option<StreamInfo> {
     })
 }
 
+/// Le multiplicateur DSD d'une cadence de la famille 44,1 kHz.
+///
+/// #8602 — DSD1024 (45 158 400 Hz) manquait : un fichier DSD1024 partait vers
+/// l'endpoint OAAT sans multiplicateur (`dsd_rate: None` dans `FormatPropose`),
+/// et la garde `dsd_max_rate` de l'endpoint, qui compare ce multiplicateur, ne
+/// jouait pas — un récepteur limité à DSD512 recevait du DSD1024.
 pub(super) fn dsd_rate_from_sample_rate(sr: u32) -> Option<u16> {
     match sr {
         2_822_400 => Some(64),
         5_644_800 => Some(128),
         11_289_600 => Some(256),
         22_579_200 => Some(512),
+        45_158_400 => Some(1024),
+        _ => None,
+    }
+}
+
+/// Le multiplicateur DSD qui dépasse le plafond annoncé par l'endpoint
+/// (`dsd_max_rate`), ou `None` si le DSD natif peut partir. Le chemin DSD natif
+/// d'OAAT se replie alors sur le PCM au lieu d'envoyer un débit refusé (#8602).
+#[cfg_attr(not(feature = "oaat"), allow(dead_code))]
+pub(super) fn dsd_natif_au_dela_du_max(sample_rate: u32, dsd_max_rate: Option<u16>) -> Option<u16> {
+    match (dsd_rate_from_sample_rate(sample_rate), dsd_max_rate) {
+        (Some(m), Some(max)) if m > max => Some(m),
         _ => None,
     }
 }
@@ -698,6 +716,30 @@ mod tests {
         assert_eq!(dsd_rate_from_sample_rate(11_289_600), Some(256));
         assert_eq!(dsd_rate_from_sample_rate(22_579_200), Some(512));
         assert_eq!(dsd_rate_from_sample_rate(44100), None);
+    }
+
+    /// #8602 — DSD1024 (45,2 MHz) est reconnu : en-tête DSF, affichage et
+    /// garde du plafond de l'endpoint.
+    #[test]
+    fn dsd1024_reconnu_8602() {
+        assert_eq!(dsd_rate_from_sample_rate(45_158_400), Some(1024));
+
+        let sample_count = 45_158_400u64 * 2;
+        let data_size = 8192u32;
+        let mut buf = make_dsf(45_158_400, 2, sample_count, data_size);
+        let si = detect_and_parse(&mut buf).expect("DSF DSD1024");
+        assert_eq!(si.dsd_rate, Some(1024));
+        assert_eq!(si.duration_ms, 2000);
+        assert_eq!(
+            format_rate_display(45_158_400, 1, AudioFormat::DsdU8),
+            "DSD1024"
+        );
+
+        // Un endpoint limité à DSD512 refuse le DSD1024 : repli PCM.
+        assert_eq!(dsd_natif_au_dela_du_max(45_158_400, Some(512)), Some(1024));
+        assert_eq!(dsd_natif_au_dela_du_max(45_158_400, Some(1024)), None);
+        assert_eq!(dsd_natif_au_dela_du_max(22_579_200, Some(512)), None);
+        assert_eq!(dsd_natif_au_dela_du_max(45_158_400, None), None);
     }
 }
 
