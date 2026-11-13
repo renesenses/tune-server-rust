@@ -2572,6 +2572,9 @@ async fn service_set_catalog_country(
     if let Err(e) = svc.choisir_le_pays_du_catalogue(corps.country.as_deref()) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
     }
+    // Favoris et playlists mémorisés ont été lus sous l'ancien pays : leurs
+    // disponibilités ne valent plus.
+    purge_contenu_utilisateur(&service);
     let Some(pays) = svc.pays_du_catalogue() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };

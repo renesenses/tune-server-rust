@@ -82,7 +82,7 @@ async fn le_pays_choisi_part_dans_les_requetes_et_survit_au_compte_8481() {
 fn un_pays_mal_forme_est_refuse_sans_rien_changer_8481() {
     let mut svc = TidalService::new();
     svc.choisir_le_pays_du_catalogue(Some("PL")).unwrap();
-    for faux in ["POL", "pl-PL", "1A", "P"] {
+    for faux in ["POL", "pl-PL", "1A", "P", "XX", "PO", "ZZ"] {
         assert!(
             svc.choisir_le_pays_du_catalogue(Some(faux)).is_err(),
             "{faux} doit être refusé"
@@ -118,4 +118,16 @@ fn qobuz_ne_laisse_pas_choisir_le_pays_8481() {
     let mut q = crate::streaming::qobuz::QobuzService::new("app".into(), "secret".into());
     assert!(q.pays_du_catalogue().is_none());
     assert!(q.choisir_le_pays_du_catalogue(Some("PL")).is_err());
+}
+
+#[test]
+fn tous_les_codes_attribues_et_eux_seuls_8481() {
+    let codes: Vec<&str> = CODES_ISO_3166_1.split(' ').collect();
+    assert_eq!(codes.len(), 249);
+    for c in ["PL", "FR", "GB", "US", "DE", "JP", "BR", "ZA"] {
+        assert_eq!(pays_iso3166(&c.to_lowercase()).as_deref(), Some(c));
+    }
+    for faux in ["XX", "PO", "UK", "EU"] {
+        assert_eq!(pays_iso3166(faux), None, "{faux}");
+    }
 }

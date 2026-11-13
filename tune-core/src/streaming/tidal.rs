@@ -1587,6 +1587,10 @@ impl TidalService {
         self.vider_le_cache_des_mixes();
         if let Ok(mut urls) = self.url_cache.try_lock() {
             *urls = UrlCache::new(240);
+        } else {
+            // Une résolution est en cours : le cache des adresses de flux n'est
+            // pas vidé, ses entrées expirent d'elles-mêmes (4 min).
+            warn!("tidal_cache_des_urls_non_vide_verrou_occupe");
         }
     }
 
@@ -2017,8 +2021,11 @@ impl StreamingService for TidalService {
         let choisi = match pays.map(str::trim).filter(|p| !p.is_empty()) {
             None => None,
             Some(brut) => Some(
-                pays_iso2(brut)
-                    .ok_or_else(|| format!("pays invalide : « {brut} » (attendu : PL, GB, US…)"))?,
+                pays_iso3166(brut).ok_or_else(|| {
+                    format!(
+                        "pays invalide : « {brut} » n'est pas un code ISO 3166-1 alpha-2 (attendu : PL, GB, US…)"
+                    )
+                })?,
             ),
         };
         if choisi == self.pays_choisi {
@@ -3529,6 +3536,16 @@ fn pays_iso2(brut: &str) -> Option<String> {
     let taille = brut.trim();
     (taille.len() == 2 && taille.chars().all(|c| c.is_ascii_alphabetic()))
         .then(|| taille.to_ascii_uppercase())
+}
+
+/// #8481 — les 249 codes ISO 3166-1 alpha-2 officiellement attribués.
+const CODES_ISO_3166_1: &str = "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW";
+
+/// #8481 — un pays CHOISI par l'utilisateur : deux lettres ET un code ISO
+/// 3166-1 attribué. `XX` ou `PO` ont la bonne forme mais ne désignent aucun
+/// pays ; TIDAL ne dirait rien, et le catalogue deviendrait vide sans un mot.
+fn pays_iso3166(brut: &str) -> Option<String> {
+    pays_iso2(brut).filter(|p| CODES_ISO_3166_1.split(' ').any(|c| c == p))
 }
 
 fn base64_decode_url(input: &str) -> Result<Vec<u8>, String> {

@@ -122,3 +122,28 @@ async fn le_choix_revient_au_demarrage_8481() {
     assert_eq!(pays.choisi.as_deref(), Some("PL"));
     assert_eq!(pays.effectif, "PL");
 }
+
+#[tokio::test]
+async fn un_code_bien_forme_mais_non_attribue_est_refuse_8481() {
+    let (app, _, _) = app();
+    for faux in ["XX", "PO", "ZZ"] {
+        let (statut, corps) = appeler(&app, "PUT", URI, Some(json!({"country": faux}))).await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST, "{faux}");
+        assert!(
+            corps["error"].as_str().unwrap_or("").contains("ISO 3166-1"),
+            "message clair : {corps}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn changer_de_pays_purge_les_favoris_et_playlists_memorises_8481() {
+    let (app, _, _) = app();
+    memoriser_contenu_utilisateur("tidal", "favorites/tracks", json!([{"id": "1"}]));
+    memoriser_contenu_utilisateur("tidal", "playlists", json!([{"id": "p"}]));
+    assert!(contenu_utilisateur_frais("tidal", "favorites/tracks").is_some());
+    let (statut, _) = appeler(&app, "PUT", URI, Some(json!({"country": "PL"}))).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert!(contenu_utilisateur_frais("tidal", "favorites/tracks").is_none());
+    assert!(contenu_utilisateur_frais("tidal", "playlists").is_none());
+}
