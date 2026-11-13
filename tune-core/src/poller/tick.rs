@@ -3668,7 +3668,10 @@ impl PositionPoller {
                         // flux a expire cote serveur. On la jette pour que la
                         // condition ci-dessous rearme proprement, plutot que de
                         // laisser le renderer chercher une adresse morte.
-                        if !self.orchestrator.fichier_suivant_en_preparation(zone_id)
+                        // #6718 — seule une préparation qui arme tôt (HQPlayer)
+                        // vieillit au-delà de la fenêtre ; celle d'un renderer
+                        // réseau arme dans sa fenêtre habituelle.
+                        if !self.orchestrator.preparation_fichier_arme_tot(zone_id)
                             && decisions::gapless_stage_expired(
                                 ps.gapless_sent,
                                 ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
@@ -3736,7 +3739,7 @@ impl PositionPoller {
                             }
                         }
                         (!ps.gapless_sent
-                            && self.orchestrator.fichier_suivant_en_preparation(zone_id))
+                            && self.orchestrator.preparation_fichier_arme_tot(zone_id))
                             || decisions::should_arm_gapless(
                                 ps.gapless_sent,
                                 status.duration_ms,

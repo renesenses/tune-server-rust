@@ -76,6 +76,16 @@ pub fn prochain_numero(groupes: &[Value]) -> i64 {
         + 1
 }
 
+/// #8107 — les AUTRES zones du groupe de `zone` (vide si elle joue seule).
+pub fn zones_compagnes(groupes: &[Value], zone: i64) -> Vec<i64> {
+    groupes
+        .iter()
+        .map(ids_du_groupe)
+        .find(|ids| ids.contains(&zone))
+        .map(|ids| ids.into_iter().filter(|id| *id != zone).collect())
+        .unwrap_or_default()
+}
+
 /// Lit `zone_groups` (vide s'il est absent ou illisible).
 pub fn lire(settings: &SettingsRepo) -> Vec<Value> {
     settings

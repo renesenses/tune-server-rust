@@ -244,7 +244,7 @@ async fn pg_edition_album_scenarios() {
     use crate::db::edition_album::tests as e;
     let db = pg_or_skip!();
     type Scenario = fn(&Arc<dyn DbBackend>);
-    let scenarios: [(&str, Scenario); 8] = [
+    let scenarios: [(&str, Scenario); 9] = [
         ("aller_retour", e::scenario_aller_retour),
         ("disque_vide", e::scenario_disque_vide),
         ("refus", e::scenario_refus),
@@ -256,6 +256,8 @@ async fn pg_edition_album_scenarios() {
         ("passe_des_coffrets", e::scenario_passe_des_coffrets),
         ("attacher_detacher", e::scenario_attacher_detacher),
         ("balises_effectives", e::scenario_balises_effectives),
+        // #8571 (fil 2763) — réordonner un coffret composé à la main.
+        ("ordre_du_coffret_8571", e::scenario_ordre_du_coffret_8571),
     ];
     for (nom, scenario) in scenarios {
         eprintln!("pg_edition_album : {nom}");

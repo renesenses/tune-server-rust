@@ -347,13 +347,7 @@ fn build_facet_conditions(
     let mut ph = Placeholders::new(engine);
     let sel = &q.sel;
 
-    // Genre : la colonne `t.genre` OU le tableau JSON `t.genres`. Avec
-    // plusieurs genres cochés, les deux tests s'étendent ensemble ; les valeurs
-    // sont empilées dans l'ordre de sortie des marqueurs (les N du `IN`, puis
-    // les N motifs `LIKE`).
-    //
-    // ⚠️ `or_like_ci` des DEUX côtés (`bloc_genres`) : un `LIKE` nu est
-    // insensible à la casse en SQLite mais SENSIBLE en PostgreSQL (#1821).
+    // #5638 : même genre principal et même liaison que TrackRepo.
     //
     // #2108 : les facettes « combinables » passent par `combiner`, qui rend le
     // SQL d'avant en « Ou » et un prédicat par valeur, joints par `AND`, en
@@ -449,6 +443,35 @@ fn build_facet_conditions(
         conds.push(c);
         params.extend(p);
     }
+    // #8325 — chef, ensemble, œuvre : facettes à part entière (elles ne se
+    // filtrent pas elles-mêmes), lues dans les magasins ouverts.
+    for (valeurs, champ) in [
+        (
+            &sel.conductors,
+            tune_core::db::facettes_classiques::Champ::Chef,
+        ),
+        (
+            &sel.ensembles,
+            tune_core::db::facettes_classiques::Champ::Ensemble,
+        ),
+        (
+            &sel.works,
+            tune_core::db::facettes_classiques::Champ::Oeuvre,
+        ),
+    ] {
+        if exclude == champ.nom() {
+            continue;
+        }
+        if let Some((c, p)) = combiner(
+            &mut ph,
+            valeurs,
+            sel.est_en_et(champ.nom()),
+            tune_core::db::facettes_classiques::bloc(engine, champ),
+        ) {
+            conds.push(c);
+            params.extend(p);
+        }
+    }
     if exclude != "artist" {
         // `tracks` has no artist_name column (artist is a FK to `artists`), and
         // these conditions run against `FROM tracks t` with no join, so resolve
@@ -467,7 +490,9 @@ fn build_facet_conditions(
         (&sel.moods, "mood", "mood", "mood"),
         (&sel.source_medias, "source_media", "source", "source_media"),
     ] {
-        if exclude == own {
+        // #8090 — `country_albums` est la facette « pays d'édition » comptée
+        // en albums : elle ne se filtre pas elle-même non plus.
+        if exclude == own || (own == "country" && exclude == "country_albums") {
             continue;
         }
         if let Some((c, p)) = combiner(&mut ph, values, sel.est_en_et(param), bloc_metadonnee(key))
@@ -475,6 +500,15 @@ fn build_facet_conditions(
             conds.push(c);
             params.extend(p);
         }
+    }
+    // #8090 — pays de l'artiste principal de l'album. Ne se filtre pas
+    // lui-même.
+    if exclude != "artist_country"
+        && let Some((c, p)) =
+            tune_core::db::facet_filter::bloc_pays_artiste(&mut ph, &sel.artist_countries)
+    {
+        conds.push(c);
+        params.extend(p);
     }
     // Folder selection (Oxygen drill-down) narrows every facet's counts. The
     // folder-facet endpoint scopes by path prefix on its own, so it passes
@@ -785,6 +819,11 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 "sample_rate" => column_facet(state, "sample_rate", limit, conds, params),
                 "bit_depth" => column_facet(state, "bit_depth", limit, conds, params),
                 "country" => kv_facet(state, "release_country", limit, conds, params),
+                // #8090 — la carte et le filtre Pays, comptés en ALBUMS : le
+                // pays de l'artiste principal (MusicBrainz) et le pays
+                // d'édition. Absents du jeu par défaut : un client les demande.
+                "artist_country" => artist_country_facet(state, limit, conds, params),
+                "country_albums" => kv_album_facet(state, "release_country", limit, conds, params),
                 "mood" => kv_facet(state, "mood", limit, conds, params),
                 "source" => kv_facet(state, "source_media", limit, conds, params),
                 "rating" => rating_facet(state, q.sel.profile_id, limit, conds, params),
@@ -800,6 +839,12 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 // tant que les crédits ne sont pas là, un client la demande
                 // explicitement (`fields=…,instrument`).
                 "instrument" => instrument_facet(state, engine, limit, conds, params),
+                // #8325 — chef, ensemble, œuvre. Comme `instrument`, hors du jeu
+                // par défaut : vides sur une bibliothèque sans classique, un
+                // client les demande explicitement (`fields=…,conductor`).
+                f @ ("conductor" | "ensemble" | "work") => {
+                    classique_facet(state, f, limit, conds, params)
+                }
                 "favorite" => favorite_facet(state, q.sel.profile_id, conds, params),
                 "playlist" => playlist_facet(state, limit, conds, params),
                 "untagged" => untagged_facet(state, conds, params),
@@ -818,7 +863,10 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
             // `COUNT(DISTINCT track_id)` —, la différence est donc EXACTE.
             // La facette Collections garde le socle complet : elle compte
             // ailleurs, collection par collection.
-            (Some(liste), f) if f != "collection" => {
+            // #8090 — les facettes comptées en ALBUMS ne s'additionnent pas
+            // sur des pistes disjointes (un album à cheval sur les deux jeux
+            // compterait deux fois) : elles gardent le socle complet.
+            (Some(liste), f) if !COMPTEES_EN_ALBUMS.contains(&f) && f != "collection" => {
                 let (conds, params) = build_conditions(
                     &q,
                     engine,
@@ -868,7 +916,7 @@ pub(super) enum OrdreDeFacette {
 fn ordre_de_la_facette(field: &str) -> OrdreDeFacette {
     match field {
         "original_year" | "dr" | "rating" | "favorite" | "untagged" => OrdreDeFacette::TelQuel,
-        "instrument" => OrdreDeFacette::EffectifPuisValeur,
+        "instrument" | "conductor" | "ensemble" | "work" => OrdreDeFacette::EffectifPuisValeur,
         _ => OrdreDeFacette::Effectif,
     }
 }
@@ -1257,79 +1305,16 @@ fn column_facet(
     fusionner_les_casses(brut)
 }
 
-/// Rail « Genre » : une entrée par GENRE, pas par chaîne brute de colonne.
-///
-/// `column_facet` groupe sur la seule colonne `t.genre`. Or le filtre jumeau
-/// (`build_facet_conditions` ici, `TrackRepo::list_filtered` côté liste) retient
-/// une piste si `LOWER(t.genre) = LOWER(?)` **OU** si le tableau JSON
-/// `t.genres` contient la valeur. Le rail comptait donc STRICTEMENT MOINS que
-/// ce que son propre filtre sait trouver : tout genre SECONDAIRE restait
-/// invisible, même coché il aurait rendu des pistes.
-///
-/// C'est ce qui rendait le classement dépendant du logiciel de gravure (#1821,
-/// DEvir) : un disque gravé avec deux champs `GENRE` (Vorbis) ou deux atomes
-/// `©gen` (MP4) n'apparaissait que sous son premier genre, tandis que le même
-/// disque acheté ailleurs, avec « Jazz; Fusion » dans un unique `TCON`,
-/// apparaissait sous les deux.
-///
-/// ⚠️ On compte exactement l'UNION que le filtre teste — `{t.genre}` ∪ les
-/// éléments de `t.genres` — et RIEN de plus. En particulier on ne redécoupe
-/// PAS `t.genre` : le filtre le compare en entier, donc annoncer « Jazz » pour
-/// une ligne dont la colonne vaut « Jazz; Fusion » rendrait un compteur qui
-/// ment, précisément le défaut de #1864.
+/// #5638 : le rail compte le genre principal seul, comme `bloc_genres`.
+/// La limite s'applique après fusion des casses, pour compter toutes les pistes.
 fn genre_facet(
     state: &AppState,
     limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
 ) -> Vec<(String, i64)> {
-    let extra = if conds.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", conds.join(" AND "))
-    };
-    // Pas de LIMIT en SQL : l'éclatement des valeurs multiples change les
-    // effectifs, donc le classement. La troncature se fait après le compte.
-    let sql = format!(
-        "SELECT t.genre, t.genres, COUNT(*) AS n FROM tracks t \
-         WHERE ((t.genre IS NOT NULL AND t.genre <> '') \
-         OR (t.genres IS NOT NULL AND t.genres <> '')){extra} \
-         GROUP BY t.genre, t.genres ORDER BY n DESC"
-    );
-    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
-        .iter()
-        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
-        .collect();
-    let mut brut: Vec<(String, i64)> = Vec::new();
-    for row in state
-        .backend
-        .query_many(&sql, &bound)
-        .ou_defaut_journalise()
-    {
-        let mut it = row.into_iter();
-        let colonne = it.next().and_then(|v| v.as_string());
-        let tableau = it.next().and_then(|v| v.as_string());
-        let n = it.next().and_then(|v| v.as_i64()).unwrap_or(0);
-
-        let mut valeurs: Vec<String> = Vec::new();
-        if let Some(json) = tableau.as_deref()
-            && let Ok(arr) = serde_json::from_str::<Vec<String>>(json)
-        {
-            valeurs.extend(arr.into_iter().filter(|g| !g.trim().is_empty()));
-        }
-        if let Some(g) = colonne.as_deref().filter(|g| !g.trim().is_empty()) {
-            valeurs.push(g.to_string());
-        }
-        // Une ligne ne compte qu'une fois par genre, même si la colonne
-        // répète le premier élément du tableau (le cas courant).
-        let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for v in valeurs {
-            if vus.insert(v.to_lowercase()) {
-                brut.push((v, n));
-            }
-        }
-    }
-    let mut sortie = fusionner_les_casses(brut);
+    let mut sortie = column_facet(state, "genre", None, conds, params);
+    sortie.retain(|(genre, _)| !genre.trim().is_empty());
     sortie.sort_by_key(|a| std::cmp::Reverse(a.1));
     if let Some(n) = limit {
         sortie.truncate(n.max(0) as usize);
@@ -1652,6 +1637,79 @@ fn artist_facet(
         .collect()
 }
 
+/// #8090 — les facettes qui comptent des ALBUMS distincts, pas des pistes.
+const COMPTEES_EN_ALBUMS: &[&str] = &["artist_country", "country_albums"];
+
+/// #8090 — le pays de l'ARTISTE PRINCIPAL de chaque album (`albums.artist_id`,
+/// lu sur MusicBrainz), avec le nombre d'ALBUMS distincts, resserré par les
+/// autres facettes actives. Code ISO en majuscules.
+fn artist_country_facet(
+    state: &AppState,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let extra = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let valide = tune_core::db::facet_filter::PAYS_ARTISTE_VALIDE;
+    let sql = format!(
+        "SELECT UPPER(pa_ar.country) AS pays, COUNT(DISTINCT pa_al.id) AS n FROM tracks t \
+         JOIN albums pa_al ON pa_al.id = t.album_id \
+         JOIN artists pa_ar ON pa_ar.id = pa_al.artist_id \
+         WHERE {valide}{extra} \
+         GROUP BY UPPER(pa_ar.country) ORDER BY n DESC, pays{limit_clause}"
+    );
+    compter_les_lignes(state, &sql, params)
+}
+
+/// #8090 — une métadonnée étendue (`release_country`) comptée en ALBUMS
+/// distincts : un album dont les pistes portent la valeur compte une fois.
+fn kv_album_facet(
+    state: &AppState,
+    key: &str,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let extra = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let sql = format!(
+        "SELECT tm.value, COUNT(DISTINCT t.album_id) AS n FROM track_metadata tm \
+         JOIN tracks t ON tm.track_id = t.id \
+         WHERE tm.key = '{key}' AND tm.value <> '' AND t.album_id IS NOT NULL{extra} \
+         GROUP BY tm.value ORDER BY n DESC, tm.value{limit_clause}"
+    );
+    compter_les_lignes(state, &sql, params)
+}
+
+/// `(valeur, effectif)` de chaque ligne d'une requête de facette.
+fn compter_les_lignes(state: &AppState, sql: &str, params: &[SqlValue]) -> Vec<(String, i64)> {
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(sql, &bound)
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let value = it.next()?.as_string()?;
+            let count = it.next()?.as_i64().unwrap_or(0);
+            Some((value, count))
+        })
+        .collect()
+}
+
 /// Count distinct values of an extended tag in the `track_metadata` k/v store,
 /// optionally narrowed to the tracks matching the active-facet conditions.
 /// La facette « instrument » (CRD-6) : chaque instrument des crédits, avec le
@@ -1696,6 +1754,23 @@ fn instrument_facet(
             Some((value, count))
         })
         .collect()
+}
+
+/// #8325 — chef, ensemble ou œuvre : une entrée par personne ou par œuvre,
+/// comptée en pistes distinctes, tous magasins confondus
+/// ([`tune_core::db::facettes_classiques`]).
+fn classique_facet(
+    state: &AppState,
+    field: &str,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let Some(champ) = tune_core::db::facettes_classiques::Champ::facette(field) else {
+        return Vec::new();
+    };
+    tune_core::db::facettes_classiques::effectifs(&state.backend, champ, conds, params, limit)
+        .ou_defaut_journalise()
 }
 
 fn kv_facet(
@@ -1744,6 +1819,10 @@ mod socle_5977_tests;
 #[cfg(test)]
 #[path = "facettes_et_2108_tests.rs"]
 mod facettes_et_2108_tests;
+
+#[cfg(test)]
+#[path = "facettes_classiques_8325_tests.rs"]
+mod facettes_classiques_8325_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2058,24 +2137,14 @@ mod tests {
             "{where_clause}"
         );
 
-        // Le genre teste DEUX colonnes (colonne + tableau JSON) : son OU doit
-        // rester enfermé dans ses parenthèses.
+        // Deux genres principaux cochés se combinent en OU.
         let q = depuis("genre=Jazz&genre=Blues&year=1971");
         let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
-        assert_eq!(
-            conds[0],
-            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR (LOWER(t.genres) LIKE LOWER($3) OR LOWER(t.genres) LIKE LOWER($4)))"
-        );
-        assert_eq!(conds[1], "t.year = $5");
+        assert_eq!(conds[0], "LOWER(t.genre) IN (LOWER($1), LOWER($2))");
+        assert_eq!(conds[1], "t.year = $3");
         assert_eq!(
             params.iter().map(texte).collect::<Vec<_>>(),
-            vec![
-                "Jazz".to_string(),
-                "Blues".to_string(),
-                "%\"Jazz\"%".to_string(),
-                "%\"Blues\"%".to_string(),
-                "1971".to_string(),
-            ]
+            vec!["Jazz".to_string(), "Blues".to_string(), "1971".to_string(),]
         );
     }
 
@@ -2198,11 +2267,8 @@ mod tests {
         assert!(where_clause.contains("t.genre"), "{where_clause}");
         // Les marqueurs se renumérotent depuis 1 : le prédicat retiré ne doit
         // pas laisser de trou dans la liaison.
-        assert_eq!(
-            conds[0],
-            "(LOWER(t.genre) IN (LOWER($1), LOWER($2)) OR (LOWER(t.genres) LIKE LOWER($3) OR LOWER(t.genres) LIKE LOWER($4)))"
-        );
-        assert_eq!(params.len(), 4);
+        assert_eq!(conds[0], "LOWER(t.genre) IN (LOWER($1), LOWER($2))");
+        assert_eq!(params.len(), 2);
 
         // Symétrique : en comptant le genre, c'est le format qui reste.
         let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "genre", None);
@@ -2220,12 +2286,12 @@ mod tests {
         assert_eq!(
             conds,
             vec![
-                "(LOWER(t.genre) = LOWER($1) OR LOWER(t.genres) LIKE LOWER($2))".to_string(),
-                "t.year = $3".to_string(),
-                "LOWER(t.format) = LOWER($4)".to_string(),
-                "LOWER(t.label) LIKE LOWER($5)".to_string(),
+                "LOWER(t.genre) = LOWER($1)".to_string(),
+                "t.year = $2".to_string(),
+                "LOWER(t.format) = LOWER($3)".to_string(),
+                "LOWER(t.label) LIKE LOWER($4)".to_string(),
                 "EXISTS (SELECT 1 FROM album_ratings arr WHERE arr.album_id = t.album_id \
-                 AND arr.profile_id = 1 AND arr.rating = $6)"
+                 AND arr.profile_id = 1 AND arr.rating = $5)"
                     .to_string(),
             ]
         );
@@ -2233,7 +2299,6 @@ mod tests {
             params.iter().map(texte).collect::<Vec<_>>(),
             vec![
                 "Jazz".to_string(),
-                "%\"Jazz\"%".to_string(),
                 "1971".to_string(),
                 "flac".to_string(),
                 "%ECM%".to_string(),
@@ -2274,10 +2339,7 @@ mod tests {
     fn une_valeur_a_virgule_reste_une_seule_valeur() {
         let q = depuis("genre=Jazz%2C+Blues");
         let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
-        assert_eq!(
-            conds,
-            vec!["(LOWER(t.genre) = LOWER($1) OR LOWER(t.genres) LIKE LOWER($2))"]
-        );
+        assert_eq!(conds, vec!["LOWER(t.genre) = LOWER($1)"]);
         assert_eq!(texte(&params[0]), "Jazz, Blues");
     }
 

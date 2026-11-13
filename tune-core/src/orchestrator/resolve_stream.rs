@@ -2234,98 +2234,107 @@ impl PlaybackOrchestrator {
             // `tidal_dash_multi_segment_download_complete`, qui porte déjà son
             // `elapsed_ms` (`streaming/tidal.rs`).
             let pre_transcode_start = std::time::Instant::now();
-            let transcode_result = tokio::task::spawn_blocking(move || {
-                // Fast path: Tidal HI-RES DASH is ALREADY FLAC (frames inside an
-                // fMP4). If the renderer takes FLAC and no zone EQ is active, REMUX
-                // (copy the FLAC frames + STREAMINFO into a .flac) instead of
-                // decode→PCM→re-encode — a ~59s CPU transcode becomes a sub-second
-                // I/O copy, bit-identical (#1146). WAV renderers, zone DSP and
-                // capped zones fall through to the decode path.
-                //
-                // #7266 — c'est désormais le chemin par défaut : le FLAC CD de
-                // TIDAL arrive par ce bras depuis la rc8 (#6334), et le
-                // ré-encodage FLAC→FLAC de la piste entière retenait le Play.
-                // `TUNE_DASH_REMUX=0` rend l'ancien comportement.
-                if remux_dash_sans_perte(
-                    source_flac,
-                    dash_is_wav,
-                    dash_dsp_active,
-                    dash_plafond_16,
-                    plafonnee,
-                ) {
-                    match crate::audio::decode::remux_flac_dash(&unique_path_clone, &tmp_path_clone)
-                    {
-                        Ok(remuxe) => {
-                            // Les VU-mètres décrivaient le PCM du transcodage.
-                            // Le remux n'en produit pas : un décodage À CÔTÉ,
-                            // après coup, les nourrit sans retarder le Play (le
-                            // forwarder se cale sur la position de lecture). Il
-                            // lit son propre lien du fichier : le service peut
-                            // renommer ou effacer l'original.
-                            if let Some(ltx) = dash_levels_tx {
-                                nourrir_les_vu_apres_le_remux(&tmp_path_clone, ltx);
+            // #6718 — même garde que le bras HTTPS : un pré-transcodage DASH
+            // abandonné ne laisse ni sa source ni son fichier.
+            let fichiers_de_la_tache = vec![unique_path.clone(), tmp_path.clone()];
+            let transcode_result = super::pretranscode_abandonne_6718::attendre_ou_nettoyer(
+                tokio::task::spawn_blocking(move || {
+                    // Fast path: Tidal HI-RES DASH is ALREADY FLAC (frames inside an
+                    // fMP4). If the renderer takes FLAC and no zone EQ is active, REMUX
+                    // (copy the FLAC frames + STREAMINFO into a .flac) instead of
+                    // decode→PCM→re-encode — a ~59s CPU transcode becomes a sub-second
+                    // I/O copy, bit-identical (#1146). WAV renderers, zone DSP and
+                    // capped zones fall through to the decode path.
+                    //
+                    // #7266 — c'est désormais le chemin par défaut : le FLAC CD de
+                    // TIDAL arrive par ce bras depuis la rc8 (#6334), et le
+                    // ré-encodage FLAC→FLAC de la piste entière retenait le Play.
+                    // `TUNE_DASH_REMUX=0` rend l'ancien comportement.
+                    if remux_dash_sans_perte(
+                        source_flac,
+                        dash_is_wav,
+                        dash_dsp_active,
+                        dash_plafond_16,
+                        plafonnee,
+                    ) {
+                        match crate::audio::decode::remux_flac_dash(
+                            &unique_path_clone,
+                            &tmp_path_clone,
+                        ) {
+                            Ok(remuxe) => {
+                                // Les VU-mètres décrivaient le PCM du transcodage.
+                                // Le remux n'en produit pas : un décodage À CÔTÉ,
+                                // après coup, les nourrit sans retarder le Play (le
+                                // forwarder se cale sur la position de lecture). Il
+                                // lit son propre lien du fichier : le service peut
+                                // renommer ou effacer l'original.
+                                if let Some(ltx) = dash_levels_tx {
+                                    nourrir_les_vu_apres_le_remux(&tmp_path_clone, ltx);
+                                }
+                                return Ok(remuxe);
                             }
-                            return Ok(remuxe);
+                            // #7266 — un fMP4 qui n'a pas les trames FLAC attendues
+                            // (codec mal annoncé, STREAMINFO absent) se décode
+                            // comme avant : la piste joue, plus lentement.
+                            Err(e) => warn!(error = %e, "streaming_dash_remux_echec_decodage"),
                         }
-                        // #7266 — un fMP4 qui n'a pas les trames FLAC attendues
-                        // (codec mal annoncé, STREAMINFO absent) se décode
-                        // comme avant : la piste joue, plus lentement.
-                        Err(e) => warn!(error = %e, "streaming_dash_remux_echec_decodage"),
                     }
-                }
 
-                let decoded = crate::audio::decode::decode_to_pcm(
-                    &unique_path_clone,
-                    Some(sr),
-                    Some(2),
-                    0.0,
-                    0.0,
-                )?;
+                    let decoded = crate::audio::decode::decode_to_pcm(
+                        &unique_path_clone,
+                        Some(sr),
+                        Some(2),
+                        0.0,
+                        0.0,
+                    )?;
 
-                let mut pcm_bytes = decoded.pcm_bytes();
-                let mut actual_bd = decoded.bit_depth;
+                    let mut pcm_bytes = decoded.pcm_bytes();
+                    let mut actual_bd = decoded.bit_depth;
 
-                if (dash_is_wav || dash_plafond_16) && actual_bd > 16 {
-                    pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
-                    actual_bd = 16;
-                }
+                    if (dash_is_wav || dash_plafond_16) && actual_bd > 16 {
+                        pcm_bytes =
+                            crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
+                        actual_bd = 16;
+                    }
 
-                // ReplayGain, égaliseur, puis convolveur FIR — l'ordre de
-                // `transcode_source_to_file`. Ce bras n'appliquait que le
-                // deuxième (#2863).
-                dash_dsp.process(&mut pcm_bytes, actual_bd);
+                    // ReplayGain, égaliseur, puis convolveur FIR — l'ordre de
+                    // `transcode_source_to_file`. Ce bras n'appliquait que le
+                    // deuxième (#2863).
+                    dash_dsp.process(&mut pcm_bytes, actual_bd);
 
-                // Niveaux post-EQ : les VU décrivent ce qui sera entendu.
-                if let Some(ref ltx) = dash_levels_tx {
-                    crate::audio::tap::send_windowed_pcm(
-                        ltx,
-                        &pcm_bytes,
-                        actual_bd,
-                        decoded.channels as u16,
-                        decoded.sample_rate,
-                    );
-                }
+                    // Niveaux post-EQ : les VU décrivent ce qui sera entendu.
+                    if let Some(ref ltx) = dash_levels_tx {
+                        crate::audio::tap::send_windowed_pcm(
+                            ltx,
+                            &pcm_bytes,
+                            actual_bd,
+                            decoded.channels as u16,
+                            decoded.sample_rate,
+                        );
+                    }
 
-                let rt = tokio::runtime::Handle::try_current()
-                    .map_err(|e| format!("no tokio runtime: {e}"))?;
-                let encoded_data = rt.block_on(async {
-                    let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                        dash_enc_format,
-                        decoded.sample_rate,
-                        actual_bd as u32,
-                        decoded.channels,
-                    );
-                    encoder.start().await?;
-                    encoder.write(&pcm_bytes).await?;
-                    encoder.finish().await
-                })?;
+                    let rt = tokio::runtime::Handle::try_current()
+                        .map_err(|e| format!("no tokio runtime: {e}"))?;
+                    let encoded_data = rt.block_on(async {
+                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                            dash_enc_format,
+                            decoded.sample_rate,
+                            actual_bd as u32,
+                            decoded.channels,
+                        );
+                        encoder.start().await?;
+                        encoder.write(&pcm_bytes).await?;
+                        encoder.finish().await
+                    })?;
 
-                std::fs::write(&tmp_path_clone, &encoded_data)
-                    .map_err(|e| format!("write temp file: {e}"))?;
+                    std::fs::write(&tmp_path_clone, &encoded_data)
+                        .map_err(|e| format!("write temp file: {e}"))?;
 
-                let file_size = encoded_data.len() as u64;
-                Ok::<(u64, u16, u32), String>((file_size, actual_bd, decoded.sample_rate))
-            })
+                    let file_size = encoded_data.len() as u64;
+                    Ok::<(u64, u16, u32), String>((file_size, actual_bd, decoded.sample_rate))
+                }),
+                fichiers_de_la_tache,
+            )
             .await;
 
             let _ = std::fs::remove_file(&unique_path);
@@ -2929,88 +2938,95 @@ impl PlaybackOrchestrator {
                 let wav_levels_tx = self
                     .levels_forwarder_if_allowed(req.zone_id, depart_qobuz as i64)
                     .await;
-                let transcode_result = tokio::task::spawn_blocking(move || {
-                    // 1. Download — #4366 : même chemin, même ligne de journal.
-                    telecharger_amont(&upstream_url, &upstream_headers, &tmp_dl_clone)?;
+                // #6718 — si cette résolution est abandonnée (préparation de la
+                // suivante hors budget), la tâche va au bout : ses fichiers
+                // sont alors supprimés à sa fin au lieu de rester orphelins.
+                let fichiers_de_la_tache = vec![tmp_dl.clone(), tmp_wav.clone()];
+                let transcode_result = super::pretranscode_abandonne_6718::attendre_ou_nettoyer(
+                    tokio::task::spawn_blocking(move || {
+                        // 1. Download — #4366 : même chemin, même ligne de journal.
+                        telecharger_amont(&upstream_url, &upstream_headers, &tmp_dl_clone)?;
 
-                    // 2. Decode to PCM
-                    let decoded = crate::audio::decode::decode_to_pcm(
-                        &tmp_dl_clone,
-                        Some(sr),
-                        Some(2),
-                        depart_qobuz as f64 / 1000.0,
-                        0.0,
-                    )?;
-                    let mut pcm_bytes = decoded.pcm_bytes();
-                    let mut actual_bd = decoded.bit_depth;
-                    let actual_sr = decoded.sample_rate;
-                    let actual_ch = decoded.channels;
+                        // 2. Decode to PCM
+                        let decoded = crate::audio::decode::decode_to_pcm(
+                            &tmp_dl_clone,
+                            Some(sr),
+                            Some(2),
+                            depart_qobuz as f64 / 1000.0,
+                            0.0,
+                        )?;
+                        let mut pcm_bytes = decoded.pcm_bytes();
+                        let mut actual_bd = decoded.bit_depth;
+                        let actual_sr = decoded.sample_rate;
+                        let actual_ch = decoded.channels;
 
-                    // Plafond 16 bits : UNIQUEMENT quand on retombe sur
-                    // WAV/LPCM. Le renderer a rejeté le FLAC, on sert donc
-                    // sous `DLNA.ORG_PN=LPCM`, un profil 16 bits seulement —
-                    // un Hi-Res 24 bits servi dessous joue du SILENCE sur un
-                    // Ruark R3 / LHC-62 (Yves, #1137).
-                    //
-                    // Quand c'est le TRAITEMENT qui impose le
-                    // pré-transcodage (#2863), le renderer sait lire le
-                    // FLAC : on ré-encode en FLAC pleine profondeur, et le
-                    // plafond n'a pas lieu d'être. Sans cette distinction,
-                    // armer un égaliseur ferait tomber tout le Hi-Res Qobuz
-                    // à 16 bits — une dégradation jamais demandée.
-                    //
-                    // #8188 — et quand la ZONE plafonne à 16 bits (Ruark R3,
-                    // Roberts Stream 94i+) : FLAC, mais 16 bits.
-                    if (enc_is_wav || plafond_16) && actual_bd > 16 {
-                        pcm_bytes =
-                            crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
-                        actual_bd = 16;
-                    }
+                        // Plafond 16 bits : UNIQUEMENT quand on retombe sur
+                        // WAV/LPCM. Le renderer a rejeté le FLAC, on sert donc
+                        // sous `DLNA.ORG_PN=LPCM`, un profil 16 bits seulement —
+                        // un Hi-Res 24 bits servi dessous joue du SILENCE sur un
+                        // Ruark R3 / LHC-62 (Yves, #1137).
+                        //
+                        // Quand c'est le TRAITEMENT qui impose le
+                        // pré-transcodage (#2863), le renderer sait lire le
+                        // FLAC : on ré-encode en FLAC pleine profondeur, et le
+                        // plafond n'a pas lieu d'être. Sans cette distinction,
+                        // armer un égaliseur ferait tomber tout le Hi-Res Qobuz
+                        // à 16 bits — une dégradation jamais demandée.
+                        //
+                        // #8188 — et quand la ZONE plafonne à 16 bits (Ruark R3,
+                        // Roberts Stream 94i+) : FLAC, mais 16 bits.
+                        if (enc_is_wav || plafond_16) && actual_bd > 16 {
+                            pcm_bytes =
+                                crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
+                            actual_bd = 16;
+                        }
 
-                    // ReplayGain, égaliseur, puis convolveur FIR — l'ordre
-                    // de `transcode_source_to_file`. Sans traitement actif,
-                    // `pcm_bytes` n'est pas touché d'un octet.
-                    https_dsp.process(&mut pcm_bytes, actual_bd);
+                        // ReplayGain, égaliseur, puis convolveur FIR — l'ordre
+                        // de `transcode_source_to_file`. Sans traitement actif,
+                        // `pcm_bytes` n'est pas touché d'un octet.
+                        https_dsp.process(&mut pcm_bytes, actual_bd);
 
-                    // Niveaux post-traitement : les VU décrivent ce qui sera
-                    // entendu, comme sur le bras DASH.
-                    if let Some(ref ltx) = wav_levels_tx {
-                        crate::audio::tap::send_windowed_pcm(
-                            ltx,
-                            &pcm_bytes,
+                        // Niveaux post-traitement : les VU décrivent ce qui sera
+                        // entendu, comme sur le bras DASH.
+                        if let Some(ref ltx) = wav_levels_tx {
+                            crate::audio::tap::send_windowed_pcm(
+                                ltx,
+                                &pcm_bytes,
+                                actual_bd,
+                                actual_ch as u16,
+                                actual_sr,
+                            );
+                        }
+
+                        // 3. Encode
+                        let rt = tokio::runtime::Handle::try_current()
+                            .map_err(|e| format!("no tokio runtime: {e}"))?;
+                        let encoded_data = rt.block_on(async {
+                            let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                                enc_format,
+                                actual_sr,
+                                actual_bd as u32,
+                                actual_ch,
+                            );
+                            encoder.start().await?;
+                            encoder.write(&pcm_bytes).await?;
+                            encoder.finish().await
+                        })?;
+
+                        std::fs::write(&tmp_wav_clone, &encoded_data)
+                            .map_err(|e| format!("write pre-transcode: {e}"))?;
+
+                        let _ = std::fs::remove_file(&tmp_dl_clone);
+                        let file_size = encoded_data.len() as u64;
+                        Ok::<(u64, u16, u32, u16), String>((
+                            file_size,
                             actual_bd,
+                            actual_sr,
                             actual_ch as u16,
-                            actual_sr,
-                        );
-                    }
-
-                    // 3. Encode
-                    let rt = tokio::runtime::Handle::try_current()
-                        .map_err(|e| format!("no tokio runtime: {e}"))?;
-                    let encoded_data = rt.block_on(async {
-                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            enc_format,
-                            actual_sr,
-                            actual_bd as u32,
-                            actual_ch,
-                        );
-                        encoder.start().await?;
-                        encoder.write(&pcm_bytes).await?;
-                        encoder.finish().await
-                    })?;
-
-                    std::fs::write(&tmp_wav_clone, &encoded_data)
-                        .map_err(|e| format!("write pre-transcode: {e}"))?;
-
-                    let _ = std::fs::remove_file(&tmp_dl_clone);
-                    let file_size = encoded_data.len() as u64;
-                    Ok::<(u64, u16, u32, u16), String>((
-                        file_size,
-                        actual_bd,
-                        actual_sr,
-                        actual_ch as u16,
-                    ))
-                })
+                        ))
+                    }),
+                    fichiers_de_la_tache,
+                )
                 .await;
 
                 match transcode_result {

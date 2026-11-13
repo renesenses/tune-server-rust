@@ -2841,7 +2841,55 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "suggestions_ecartees",
         up: SQL_SUGGESTIONS_ECARTEES,
     },
+    // #8090 — le pays de l'ARTISTE, lu sur sa fiche MusicBrainz :
+    // `artists.country` (code ISO 3166-1 alpha-2, '' quand MusicBrainz n'en
+    // donne aucun) et `artists.country_mbid`, le MBID dont il a été lu — un
+    // MBID changé ou retiré rend le pays caduc sans autre écriture. Colonnes
+    // posées dans le bloc de version et dans la passe finale (même règle qu'à
+    // la 133). Jumelle PG : 112. Renumérotée 146 / PG 112 le 11/11, ordre du lot :
+    // #8243 144/110, #8334 145/111, puis #8090 146/112.
+    Migration {
+        version: 146,
+        name: "artists_country",
+        up: "",
+    },
+    // web#2795 (décision de Bertrand, 11/11) — la SURCHARGE LOCALE d'une
+    // station de l'annuaire : `radio_stations.surcharge_locale`, la date à
+    // laquelle l'utilisateur a changé chez lui le nom, le logo ou le flux ;
+    // NULL : la station suit sa fiche. Le relevé de l'annuaire ne la touche
+    // plus ; « Revenir à la fiche de l'annuaire » la remet à NULL.
+    //
+    // Colonne posée dans le bloc de version et dans la passe finale, PAS dans
+    // `up` : même règle qu'à la 126. Jumelle PG : 113. Renumérotée 147 / PG 113
+    // le 11/11, ordre du lot : #8243 144/110, #8334 145/111, #8090 146/112,
+    // puis #8429 147/113.
+    Migration {
+        version: 147,
+        name: "radio_stations_surcharge_locale",
+        up: "",
+    },
+    // #8160 — la fiche technique d'une piste : la trace DATÉE du spectrogramme
+    // conservé (nom du PNG du cache, taille, date et durée du calcul) et la
+    // signature du fichier audio au moment du calcul, qui dit s'il faut le
+    // recalculer. Numérotée 148 / PG 114 le 11/11 : 143 / PG 109 sont pris
+    // par #8119 dans le lot, 144 à 147 / PG 110 à 113 sont réservés à
+    // d'autres PR qui fusionnent avant celle-ci.
+    // Jumelle PG : 114.
+    Migration { version: 148, name: "spectrogrammes", up: include_str!("../../migrations/spectrogrammes.sql") },
+    // #8189 — les sources réseau lues sans montage (socle « source
+    // distante », étape 2). Numérotée 149 / PG 115 le 11/11 : 143 / PG 109
+    // sont pris par #8119 dans le lot, 144 à 148 / PG 110 à 114 sont
+    // réservés à d'autres PR (dont #8160, spectrogrammes, en 148 / PG 114)
+    // qui fusionnent avant celle-ci.
+    Migration { version: 149, name: "sources_reseau", up: include_str!("../../migrations/sources_reseau.sql") },
 ];
+
+/// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
+/// de la 146 et passe finale.
+fn pays_des_artistes(db: &SqliteDb) {
+    add_column_if_missing(db, "artists", "country", "TEXT");
+    add_column_if_missing(db, "artists", "country_mbid", "TEXT");
+}
 
 /// L'index partiel des pistes marquées explicites (#8088), commun aux deux
 /// moteurs. Posé APRÈS la colonne qu'il nomme.
@@ -3074,6 +3122,12 @@ fn date_de_creation_des_fichiers(db: &SqliteDb) {
 /// L'index de la migration 126 (#6516). `IF NOT EXISTS` : rejouable.
 const SQL_INDEX_RADIO_EXTERNAL_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id)";
+
+/// Garantit `radio_stations.surcharge_locale` (web#2795) — bloc de version de
+/// la 147 et passe finale. NULL pour l'existant : aucune station surchargée.
+fn surcharge_locale_des_radios(db: &SqliteDb) {
+    add_column_if_missing(db, "radio_stations", "surcharge_locale", "TEXT");
+}
 
 /// Garantit `radio_stations.external_id` puis pose son index (#6516). Un échec
 /// de l'index est JOURNALISÉ : sans lui, le rapprochement est lent, pas faux.
@@ -4329,6 +4383,15 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // #8088 — le marquage explicite de la balise, et son index.
             marquage_explicite_des_pistes(db);
         }
+        if migration.version == 146 {
+            // #8090 — le pays de l'artiste. NULL pour l'existant : la passe
+            // de fond le lit sur MusicBrainz.
+            pays_des_artistes(db);
+        }
+        if migration.version == 147 {
+            // web#2795 — la surcharge locale des stations de l'annuaire.
+            surcharge_locale_des_radios(db);
+        }
         if migration.version == 137 {
             // #7765 — la source des crédits, puis l'attribution UNE fois des
             // lignes existantes. L'index vient APRES la colonne qu'il nomme.
@@ -4941,6 +5004,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // Le lien des radios avec l'annuaire (migration 126, #6516) — posé ICI
     // aussi : le rapprochement le NOMME. PG : migration 090.
     lien_des_radios_avec_l_annuaire(db);
+    // La surcharge locale des radios (migration 147, web#2795) — posée ICI
+    // aussi : la liste et le relevé de l'annuaire la NOMMENT. PG : 113.
+    surcharge_locale_des_radios(db);
     // L'ordre des etiquettes (migration 127, #6257) — pose ICI aussi :
     // l'INSERT des etiquettes le NOMME. Sans rangement : toutes a 0, la liste
     // reste rangee par nom (le nom departage). PG : migration 091.
@@ -4951,6 +5017,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // La provenance du MBID d'artiste (migration 133, #6463) — posée ICI
     // aussi : le scan, l'enrichissement et la fiche la NOMMENT. PG : 097.
     add_column_if_missing(db, "artists", "musicbrainz_id_source", "TEXT");
+    // Le pays de l'artiste (migration 146, #8090) — posé ICI aussi : les
+    // facettes et la passe de fond le NOMMENT. PG : 112.
+    pays_des_artistes(db);
     // L'ordre des rayons (migration 134, #6779) — posé ICI aussi : toute
     // lecture des dossiers de collections la NOMME. PG : 098.
     add_column_if_missing(
@@ -6030,6 +6099,34 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         111,
         "suggestions_ecartees",
         include_str!("../../migrations/postgres/111_suggestions_ecartees.sql"),
+    ),
+    // Jumelle de la SQLite 146 (#8090) : `artists.country` et
+    // `artists.country_mbid`, le pays de l'artiste lu sur MusicBrainz.
+    (
+        112,
+        "artists_country",
+        include_str!("../../migrations/postgres/112_artists_country.sql"),
+    ),
+    // Jumelle de la SQLite 147 (web#2795) : `radio_stations.surcharge_locale`,
+    // la surcharge locale d'une station de l'annuaire, NULL pour l'existant.
+    (
+        113,
+        "radio_stations_surcharge_locale",
+        include_str!("../../migrations/postgres/113_radio_stations_surcharge_locale.sql"),
+    ),
+    // Jumelle de la SQLite 148 (#8160) : la trace datée du spectrogramme
+    // conservé d'une piste et la signature de son fichier.
+    (
+        114,
+        "spectrogrammes",
+        include_str!("../../migrations/postgres/114_spectrogrammes.sql"),
+    ),
+    // Jumelle de la SQLite 149 (#8189) : les sources réseau, même DDL
+    // (`migrations/sources_reseau.sql`).
+    (
+        115,
+        "sources_reseau",
+        include_str!("../../migrations/postgres/115_sources_reseau.sql"),
     ),
 ];
 
@@ -9818,10 +9915,19 @@ mod tests {
         // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
         // Migration de DONNÉES : le nom, le pays et le genre de la station
         // semée sous « PureClassic Radio ».
-        // 110 : `sync_releve` (#8239), jumelle de la SQLite 144.
-        // 111 : `suggestions_ecartees` (web#916), jumelle de la SQLite 145. Le
-        // « Pas pour moi » de l'accueil, par profil.
-        assert_eq!(pg_latest_version(), 111, "latest PG migration must be 111");
+        // 110 : `sync_releve` (#8239), jumelle de la SQLite 144. Crée le
+        // relevé de la synchro cloud, que la fin de chaque scan NOMME.
+        // 112 : `artists_country` (#8090), jumelle de la SQLite 146. Pose
+        // `artists.country` et `artists.country_mbid`, que les facettes et la
+        // passe de fond NOMMENT.
+        // 113 : `radio_stations_surcharge_locale` (web#2795), jumelle de la
+        // SQLite 147. Pose la surcharge locale d'une station de l'annuaire, que
+        // la liste et le relevé NOMMENT.
+        // 114 : `spectrogrammes` (#8160), jumelle de la SQLite 148. Crée la
+        // trace datée des spectrogrammes conservés, que la fiche technique NOMME.
+        // 115 : `sources_reseau` (#8189), jumelle de la SQLite 149. Crée la
+        // table des sources réseau lues sans montage.
+        assert_eq!(pg_latest_version(), 115, "latest PG migration must be 115");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

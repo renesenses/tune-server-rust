@@ -162,6 +162,11 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
         .await;
         let output_capabilities =
             crate::routes::zones::output_capabilities(state, z.output_device_id.as_deref()).await;
+        // #8569 — sortie au volume non réglable : pas d'étape Volume.
+        let signal_path = crate::routes::zones::sans_volume_d_une_sortie_non_reglable(
+            signal_path,
+            output_capabilities.as_ref(),
+        );
         // #3514 — la meme decision que celle que la route applique, calculee
         // par la meme fonction : ce n'est pas au client de la deviner.
         let peut_avancer = crate::routes::playback::can_skip_next_publie(state, zid, &ps).await;

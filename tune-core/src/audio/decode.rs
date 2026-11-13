@@ -315,26 +315,23 @@ pub struct DecodedAudio {
 
 impl DecodedAudio {
     pub fn pcm_bytes(&self) -> Vec<u8> {
-        match self.bit_depth {
-            24 => self
-                .samples_i32
-                .iter()
-                .flat_map(|s| {
-                    let b = s.to_le_bytes();
-                    [b[0], b[1], b[2]].into_iter()
-                })
-                .collect(),
-            32 => self
-                .samples_i32
-                .iter()
-                .flat_map(|s| s.to_le_bytes())
-                .collect(),
-            _ => self
-                .samples_i32
-                .iter()
-                .flat_map(|s| (*s as i16).to_le_bytes())
-                .collect(),
+        // #8558 — capacité exacte : `flat_map` ne donne pas de taille à
+        // `collect`, qui grandissait par doublements, jusqu'à deux fois la
+        // place utile pour une piste entière.
+        let largeur = match self.bit_depth {
+            24 => 3,
+            32 => 4,
+            _ => 2,
+        };
+        let mut octets = Vec::with_capacity(self.samples_i32.len() * largeur);
+        for s in &self.samples_i32 {
+            match largeur {
+                3 => octets.extend_from_slice(&s.to_le_bytes()[..3]),
+                4 => octets.extend_from_slice(&s.to_le_bytes()),
+                _ => octets.extend_from_slice(&(*s as i16).to_le_bytes()),
+            }
         }
+        octets
     }
 }
 
@@ -373,19 +370,41 @@ fn adapt_decoded_audio(
         return Err("requested PCM sample rate must be greater than zero".into());
     }
 
-    let mut samples = super::channels::adapt_channels_i32_disposee(
-        &decoded.samples_i32,
-        source_channels,
-        output_channels,
-        decoded.bit_depth,
-        disposition,
-    )?;
-    if decoded.sample_rate != output_rate {
+    // #8558 — une seule piste entière vivante à la fois : le PCM décodé est
+    // REPRIS quand ses canaux passent tels quels (il était recopié), et chaque
+    // étage libère son entrée dès que sa sortie existe. Sur un FLAC 192/24 de
+    // neuf minutes, ces copies faisaient tuer le serveur par le noyau (forum,
+    // fil 2777, Chromecast Audio sur une VM de 4 Gio).
+    let DecodedAudio {
+        samples_i32,
+        bit_depth,
+        sample_rate: source_rate,
+        integrite,
+        ..
+    } = decoded;
+    let mut samples = if source_channels == output_channels {
+        if !samples_i32.len().is_multiple_of(source_channels as usize) {
+            return Err(format!(
+                "PCM sample count {} is not aligned to {source_channels} source channels",
+                samples_i32.len()
+            ));
+        }
+        samples_i32
+    } else {
+        super::channels::adapt_channels_i32_disposee(
+            &samples_i32,
+            source_channels,
+            output_channels,
+            bit_depth,
+            disposition,
+        )?
+    };
+    if source_rate != output_rate {
         samples = super::resample::resample_i32(
             &samples,
-            decoded.bit_depth,
+            bit_depth,
             output_channels,
-            decoded.sample_rate,
+            source_rate,
             output_rate,
         );
     }
@@ -398,12 +417,12 @@ fn adapt_decoded_audio(
     let frames = samples.len() / output_channels as usize;
     let duration_s = frames as f64 / output_rate as f64;
     debug!(
-        source_rate = decoded.sample_rate,
+        source_rate,
         output_rate, source_channels, output_channels, frames, "decoded_pcm_contract_applied"
     );
     Ok(DecodedAudio {
         samples_i32: samples,
-        bit_depth: decoded.bit_depth,
+        bit_depth,
         sample_rate: output_rate,
         channels: output_channels as u32,
         duration_s,
@@ -412,7 +431,7 @@ fn adapt_decoded_audio(
         // invente pas. Le reporter tel quel est la seule lecture juste — le
         // laisser à `Default` ici effacerait, à l'étage d'après, ce que le
         // décodeur vient de mesurer (#2218 T4).
-        integrite: decoded.integrite,
+        integrite,
     })
 }
 
@@ -4104,7 +4123,20 @@ fn decode_symphonia(
         }
     }
 
-    let mut all_samples: Vec<i32> = Vec::new();
+    // #8558 — la piste entière est réservée d'emblée quand le conteneur
+    // annonce sa longueur : laissé à ses doublements, ce vecteur atteignait
+    // jusqu'à deux fois la place utile, et trois fois le temps d'une
+    // réallocation (forum, fil 2777 : FLAC 192/24 tué par le noyau). Borné à
+    // 2 Gio : une annonce farfelue ne réserve pas plus.
+    const RESERVE_MAX: u64 = 1 << 29;
+    let mut all_samples: Vec<i32> = Vec::with_capacity(
+        trames_annoncees
+            .map(|t| {
+                t.saturating_mul(u64::from(source_channels))
+                    .min(RESERVE_MAX) as usize
+            })
+            .unwrap_or(0),
+    );
     let max_samples = echantillons_de_la_fenetre(max_duration_s, source_rate, source_channels);
     // 🔴 #2218 T4 — les deux `Err(_)` muets de cette boucle sont la CAUSE
     // mesurée du défaut FLAC : un octet abîmé au milieu des trames coûtait

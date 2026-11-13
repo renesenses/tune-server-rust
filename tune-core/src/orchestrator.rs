@@ -8,7 +8,11 @@ use tracing::{debug, info, warn};
 use crate::library::local_path::resolve_existing_local_path;
 
 mod transcodage;
+#[doc(hidden)]
+pub use transcodage::transcoder_vers_un_fichier_8558;
 use transcodage::*;
+/// #8558 (volet B) — piste trop lourde pour le bras fichier : WAV progressif.
+mod bascule_progressive_8558;
 
 /// A second play of the SAME track pushed to a NETWORK renderer within this
 /// window is treated as a redundant re-trigger (a slow pre-transcode resolve
@@ -1372,6 +1376,10 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     ecoutes_en_attente: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEnAttente>>,
+    /// #8107 — la dernière écoute écrite par chaque zone, pour qu'un groupe
+    /// de zones (`zone_groups`) ne compte qu'une écoute par titre. Voir
+    /// `ecoute_validee_7852`.
+    ecoutes_ecrites: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEcrite>>,
     /// #7974 — le suivi du bail d'écoute de chaque zone en lecture. Voir
     /// `bail_parental_7974`.
     ///
@@ -1987,6 +1995,7 @@ impl PlaybackOrchestrator {
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
+            ecoutes_ecrites: std::sync::Mutex::new(HashMap::new()),
             suivis_de_bail: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
@@ -2104,6 +2113,9 @@ mod relance_ytdlp_4366;
 // Lot L3b (rc3) — un `Seek` refusé par un renderer DLNA (701/710/711).
 #[cfg(test)]
 mod seek_refuse_par_le_renderer;
+// #5575 — un volume décoratif (Diretta UPnP) s'annonce non réglable.
+#[cfg(test)]
+mod volume_decoratif_5575_tests;
 
 mod resolve_local;
 // #6059 — Seek ignoré par le renderer : le flux natif relancé à la position.
@@ -2170,6 +2182,10 @@ mod sourdine_a_la_piste_8151;
 mod depart_muet_airplay2_8402;
 #[cfg(test)]
 mod sourdine_a_la_piste_8151_tests;
+// #8165 — un geste de volume lève la sourdine de la zone, sur toutes les sorties.
+mod volume_leve_la_sourdine_8165;
+#[cfg(test)]
+mod volume_leve_la_sourdine_8165_tests;
 // #8437 — groupe mixte : la sortie locale part `sync_delay_ms` plus tard.
 #[cfg(all(test, feature = "local-audio"))]
 mod retard_groupe_mixte_8437_tests;
@@ -2542,6 +2558,9 @@ mod dop_routing_tests;
 /// #5643 — la règle du DSD natif local (ASIO) et la valeur publiée par l'API.
 #[cfg(test)]
 mod dsd_natif_5643_tests;
+/// #8248 — le DSD natif local ALSA (`DSD_U32`) : la même règle, ses voies.
+#[cfg(test)]
+mod dsd_natif_alsa_8248_tests;
 
 /// Garde-fou #1998 : ce que la sortie a refusé n'est annoncé nulle part.
 ///
@@ -2691,6 +2710,8 @@ mod refus_asio_bloque_4556;
 mod refus_amont_4366;
 
 mod preparation_fichier_7247;
+// #6718 — un pré-transcodage abandonné ne laisse plus son fichier.
+mod pretranscode_abandonne_6718;
 
 #[cfg(test)]
 mod deplacement_qobuz_6982_tests;

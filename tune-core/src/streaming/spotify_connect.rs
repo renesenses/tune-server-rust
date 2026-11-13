@@ -94,6 +94,14 @@ pub fn qualite_de_librespot(bitrate: u32) -> QualiteDeLibrespot {
 /// Préfixe des lignes écrites sur stderr par le script `--onevent`.
 pub const PREFIXE_EVENEMENT: &str = "TUNE_EVENT\t";
 
+/// « Le dernier geste gagne » (décision de Bertrand, 12/11) — évènement
+/// SYNTHÉTIQUE, écrit par Tune et non par librespot : une lecture lancée
+/// depuis Tune (#6018) prend la pompe à une session Spotify Connect ouverte.
+/// Le pilote des sessions ferme alors la session côté zone, tout de suite,
+/// sans attendre un évènement de librespot (qui ne vient pas si la lecture
+/// de Tune échoue).
+pub const EVENEMENT_TUNE_PREND_LA_MAIN: &str = "tune_prend_la_main";
+
 /// Un évènement de lecteur publié par librespot (`--onevent`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvenementLibrespot {
@@ -108,6 +116,8 @@ pub struct EvenementLibrespot {
     pub artistes: Option<String>,
     pub album: Option<String>,
     pub pochette: Option<String>,
+    /// #8565 — `VOLUME` (`volume_changed`) : 0 à 65 535.
+    pub volume: Option<u16>,
 }
 
 impl EvenementLibrespot {
@@ -128,9 +138,10 @@ pub fn script_onevent() -> String {
 # Ecrit par Tune (#6018) : relaie un evenement de librespot sur stderr.
 c() { printf '%s' "$1" | tr '\t\r\n' '   '; }
 l() { printf '%s\n' "$1" | awk 'NF { if (n++) printf ", "; printf "%s", $0 }' | tr '\t\r' '  '; }
-printf 'TUNE_EVENT\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+printf 'TUNE_EVENT\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$(c "$PLAYER_EVENT")" "$(c "$TRACK_ID")" "$(c "$POSITION_MS")" "$(c "$DURATION_MS")" \
-  "$(c "$NAME")" "$(l "$ARTISTS")" "$(c "$ALBUM")" "$(printf '%s\n' "$COVERS" | head -n 1 | tr '\t\r' '  ')" >&2
+  "$(c "$NAME")" "$(l "$ARTISTS")" "$(c "$ALBUM")" "$(printf '%s\n' "$COVERS" | head -n 1 | tr '\t\r' '  ')" \
+  "$(c "$VOLUME")" >&2
 "#
     .to_string()
 }
@@ -153,6 +164,7 @@ pub fn lire_evenement_tune(ligne: &str) -> Option<EvenementLibrespot> {
         artistes: suivant(),
         album: suivant(),
         pochette: suivant(),
+        volume: suivant().and_then(|v| v.parse().ok()),
     })
 }
 
@@ -166,6 +178,10 @@ pub struct PompePcm {
 struct Consommateur {
     generation: u64,
     piste: Option<String>,
+    /// #8565 — une session Spotify Connect (lancée depuis l'application
+    /// Spotify) : un flux SANS FIN qui traverse les titres ; la fin d'un
+    /// titre ne le ferme pas.
+    continu: bool,
     tx: mpsc::Sender<Vec<u8>>,
 }
 
@@ -182,6 +198,43 @@ impl PompePcm {
     /// ferme). `piste` : le titre attendu, pour que la fin d'un AUTRE titre
     /// ne ferme pas ce flux-ci.
     pub fn attacher(&self, piste: Option<String>) -> mpsc::Receiver<Vec<u8>> {
+        self.attacher_en(piste, false)
+    }
+
+    /// #8565 — attache le flux continu d'une session Spotify Connect : la
+    /// fin d'un titre ne le ferme pas, seul un autre consommateur (ou son
+    /// départ) le fait.
+    pub fn attacher_continu(&self) -> mpsc::Receiver<Vec<u8>> {
+        self.attacher_en(None, true)
+    }
+
+    /// #8565 — le consommateur courant est-il une lecture lancée PAR TUNE
+    /// (#6018, un titre précis) ?
+    pub fn consommateur_de_tune(&self) -> bool {
+        self.consommateur
+            .lock()
+            .map(|c| c.as_ref().is_some_and(|c| !c.continu))
+            .unwrap_or(false)
+    }
+
+    /// #8565 — le consommateur courant est-il la session continue ?
+    pub fn consommateur_continu(&self) -> bool {
+        self.consommateur
+            .lock()
+            .map(|c| c.as_ref().is_some_and(|c| c.continu))
+            .unwrap_or(false)
+    }
+
+    /// #8565 — détache la session continue, et elle seule.
+    pub fn detacher_continu(&self) {
+        if let Ok(mut c) = self.consommateur.lock()
+            && c.as_ref().is_some_and(|c| c.continu)
+        {
+            *c = None;
+        }
+    }
+
+    fn attacher_en(&self, piste: Option<String>, continu: bool) -> mpsc::Receiver<Vec<u8>> {
         let (tx, rx) = mpsc::channel(CANAL);
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.fin_demandee.store(false, Ordering::SeqCst);
@@ -189,6 +242,7 @@ impl PompePcm {
             *c = Some(Consommateur {
                 generation,
                 piste,
+                continu,
                 tx,
             });
         }
@@ -224,8 +278,9 @@ impl PompePcm {
             .consommateur
             .lock()
             .map(|c| {
-                c.as_ref()
-                    .is_some_and(|c| c.piste.is_none() || c.piste.as_deref() == piste)
+                c.as_ref().is_some_and(|c| {
+                    !c.continu && (c.piste.is_none() || c.piste.as_deref() == piste)
+                })
             })
             .unwrap_or(false);
         if concerne {
@@ -506,7 +561,9 @@ impl LibrespotLance {
 pub const FICHIER_IDENTIFIANTS: &str = "credentials.json";
 
 pub struct LibrespotDaemon {
-    device_name: String,
+    /// Le nom annoncé à l'application Spotify (`--name`). Modifiable : il
+    /// vaut au PROCHAIN lancement de librespot (fil 2778).
+    device_name: std::sync::Mutex<String>,
     binary_path: Option<String>,
     bitrate: u32,
     process: Mutex<Option<Child>>,
@@ -525,6 +582,13 @@ pub struct LibrespotDaemon {
     dossier_identifiants: Option<PathBuf>,
     /// #6933 — le binaire lancé en dernier : chemin, origine, version.
     dernier_lance: std::sync::Mutex<Option<LibrespotLance>>,
+    /// #8565 — où chaque évènement de librespot est AUSSI remis, entier :
+    /// le pilote des sessions Spotify Connect.
+    relais: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<EvenementLibrespot>>>>,
+    /// #8580 — numéro du lancement courant de librespot (un de plus à chaque
+    /// démarrage) : une session Connect ouverte sous un AUTRE lancement est
+    /// morte (renommage, plantage, relance pour la liaison).
+    lancements: AtomicU64,
 }
 
 /// #6933 — une ligne de stderr de librespot est-elle une erreur ? Le format
@@ -543,10 +607,44 @@ pub fn ligne_d_erreur_librespot(ligne: &str) -> Option<String> {
     None
 }
 
+/// Fil 2778 — une ligne `WARN` de librespot (« Skipping to next track,
+/// unable to load track », clé audio refusée…). Elle restait au niveau
+/// `debug`, invisible dans le journal d'un testeur : c'est pourtant elle qui
+/// dit pourquoi le récepteur saute les titres.
+pub fn ligne_d_avertissement_librespot(ligne: &str) -> Option<String> {
+    let l = ligne.trim();
+    let i = l.find(" WARN ")?;
+    let reste = &l[i + " WARN ".len()..];
+    let message = reste.split_once("] ").map_or(reste, |(_, m)| m);
+    Some(message.trim().to_string())
+}
+
+/// #8565 — le code rendu par le statut quand Spotify refuse le compte
+/// parce qu'il n'est pas Premium : Spotify Connect par librespot l'exige.
+pub const CODE_PREMIUM_EXIGE: &str = "spotify_premium_required";
+
+/// #8565 — une ligne (ou une erreur) de librespot dit-elle que le compte
+/// n'est pas Premium ? librespot nomme le refus `PremiumAccountRequired`
+/// (code d'échec de connexion de Spotify) ou parle de « premium ».
+///
+/// STRICT : une ligne d'information qui cite « premium » (nom d'offre,
+/// bannière) n'est pas un refus, et ne doit pas écraser `derniere_erreur`
+/// d'un compte Premium. Même prédicat que `spotify_lecture::est_un_refus_premium`
+/// (#8577) : librespot 0.8.0 (« Premium account required »), ses versions
+/// antérieures (`PremiumAccountRequired`), l'API Web (`PREMIUM_REQUIRED`,
+/// « Premium required »).
+pub fn exige_premium(ligne: &str) -> bool {
+    let bas = ligne.to_lowercase();
+    bas.contains("premium account required")
+        || bas.contains("premiumaccountrequired")
+        || bas.contains("premium_required")
+        || bas.contains("premium required")
+}
+
 impl LibrespotDaemon {
     pub fn new(device_name: String, binary_path: Option<String>, bitrate: Option<u32>) -> Self {
         Self {
-            device_name,
+            device_name: std::sync::Mutex::new(device_name),
             binary_path,
             bitrate: bitrate.unwrap_or(DEFAULT_BITRATE),
             process: Mutex::new(None),
@@ -556,6 +654,8 @@ impl LibrespotDaemon {
             derniere_erreur: Arc::new(std::sync::Mutex::new(None)),
             dossier_identifiants: None,
             dernier_lance: std::sync::Mutex::new(None),
+            relais: Arc::new(std::sync::Mutex::new(None)),
+            lancements: AtomicU64::new(0),
         }
     }
 
@@ -585,6 +685,25 @@ impl LibrespotDaemon {
 
     pub fn pompe(&self) -> Arc<PompePcm> {
         self.pompe.clone()
+    }
+
+    /// Le nom annoncé à l'application Spotify.
+    pub fn device_name(&self) -> String {
+        self.device_name
+            .lock()
+            .map(|n| n.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    /// Change le nom annoncé ; rend `true` s'il a changé. Il vaut au
+    /// prochain lancement : à l'appelant de relancer librespot.
+    fn renommer(&self, nom: &str) -> bool {
+        let mut garde = self.device_name.lock().unwrap_or_else(|e| e.into_inner());
+        if *garde == nom {
+            return false;
+        }
+        *garde = nom.to_string();
+        true
     }
 
     /// #6946 — ce que Spotify livre à ce librespot.
@@ -660,7 +779,7 @@ impl LibrespotDaemon {
         let bitrate = self.bitrate.to_string();
         let mut args: Vec<String> = vec![
             "--name".into(),
-            self.device_name.clone(),
+            self.device_name(),
             "--bitrate".into(),
             bitrate,
             "--backend".into(),
@@ -668,6 +787,11 @@ impl LibrespotDaemon {
             "--device-type".into(),
             "speaker".into(),
             "--disable-audio-cache".into(),
+            // #8565 — librespot ne touche plus au PCM : le volume de
+            // l'application Spotify devient celui de la ZONE (avec ses
+            // limites), au lieu d'une atténuation numérique en plus.
+            "--volume-ctrl".into(),
+            "fixed".into(),
         ];
         // La file de Tune enchaîne les titres : Spotify n'en ajoute pas.
         args.extend(["--autoplay".into(), "off".into()]);
@@ -754,6 +878,7 @@ impl LibrespotDaemon {
         }
         if let Some(stderr) = proc.stderr.take() {
             let pompe = self.pompe.clone();
+            let relais = self.relais.clone();
             let derniere_erreur = self.derniere_erreur.clone();
             tokio::spawn(async move {
                 let reader = tokio::io::BufReader::new(stderr);
@@ -769,12 +894,27 @@ impl LibrespotDaemon {
                         if ev.termine() {
                             pompe.signaler_fin(ev.piste.as_deref());
                         }
+                        if let Ok(r) = relais.lock()
+                            && let Some(tx) = r.as_ref()
+                        {
+                            let _ = tx.send(ev.clone());
+                        }
                         on_event(ev.evenement, ev.piste);
                     } else if let Some(erreur) = ligne_d_erreur_librespot(&line) {
                         warn!(erreur = %erreur, "librespot_erreur");
                         if let Ok(mut e) = derniere_erreur.lock() {
                             *e = Some(erreur);
                         }
+                    } else if exige_premium(&line) {
+                        // #8565 — un compte gratuit : librespot le dit à un
+                        // autre niveau que ERROR ; retenu quand même, pour
+                        // que l'écran dise « Premium exigé ».
+                        warn!(ligne = %line, "librespot_premium_exige");
+                        if let Ok(mut e) = derniere_erreur.lock() {
+                            *e = Some(line.trim().to_string());
+                        }
+                    } else if let Some(avertissement) = ligne_d_avertissement_librespot(&line) {
+                        warn!(avertissement = %avertissement, "librespot_avertissement");
                     } else if let Some((event, track_id)) = parse_librespot_event(&line) {
                         on_event(event, track_id);
                     } else {
@@ -786,7 +926,8 @@ impl LibrespotDaemon {
         self.connecte_par_jeton
             .store(jeton.is_some() || par_cache, Ordering::SeqCst);
 
-        info!(device = %self.device_name, "librespot_started");
+        self.lancements.fetch_add(1, Ordering::SeqCst);
+        info!(device = %self.device_name(), "librespot_started");
         *self.process.lock().await = Some(proc);
         Ok(())
     }
@@ -871,11 +1012,33 @@ fn parse_librespot_event(line: &str) -> Option<(String, Option<String>)> {
     Some((event.to_string(), track_id))
 }
 
+/// Le nom du récepteur quand l'utilisateur n'en choisit aucun.
+pub const NOM_PAR_DEFAUT: &str = "Tune";
+
+/// Le nom que l'application Spotify affichera pour `saisie` : vide ou blanc
+/// → [`NOM_PAR_DEFAUT`] ; sinon le texte, sans les blancs autour, et sans
+/// caractère de contrôle (librespot le reçoit en argument).
+pub fn nom_du_recepteur(saisie: Option<&str>) -> String {
+    let nom: String = saisie
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let nom = nom.trim();
+    if nom.is_empty() {
+        NOM_PAR_DEFAUT.to_string()
+    } else {
+        nom.chars().take(64).collect()
+    }
+}
+
 pub struct SpotifyConnectManager {
     daemon: Arc<LibrespotDaemon>,
     enabled: Mutex<bool>,
     zone_id: Mutex<Option<i64>>,
-    device_name: String,
+    /// #8565 — pourquoi la dernière session lancée depuis l'application
+    /// Spotify n'a pas pu jouer dans la zone exposée (`None` : elle a joué).
+    erreur_de_session: std::sync::Mutex<Option<String>>,
     relay_port: u16,
 }
 
@@ -887,16 +1050,37 @@ impl SpotifyConnectManager {
     /// Comme [`Self::new`], avec un binaire imposé (tests : un faux librespot).
     pub fn avec_binaire(device_name: String, relay_port: u16, binaire: Option<String>) -> Self {
         Self {
-            daemon: Arc::new(LibrespotDaemon::new(device_name.clone(), binaire, None)),
+            daemon: Arc::new(LibrespotDaemon::new(device_name, binaire, None)),
             enabled: Mutex::new(false),
             zone_id: Mutex::new(None),
-            device_name,
+            erreur_de_session: std::sync::Mutex::new(None),
             relay_port,
         }
     }
 
-    pub fn device_name(&self) -> &str {
-        &self.device_name
+    pub fn device_name(&self) -> String {
+        self.daemon.device_name()
+    }
+
+    /// Fil 2778 — le nom saisi dans Réglages › Spotify Connect était
+    /// journalisé puis oublié : librespot gardait « Tune ». Il est retenu
+    /// ici ; si librespot tourne déjà sous un autre nom, il est relancé pour
+    /// que l'application Spotify voie le nouveau. Rend `true` s'il a changé.
+    pub async fn renommer(&self, saisie: Option<&str>) -> Result<bool, String> {
+        let nom = nom_du_recepteur(saisie);
+        if !self.daemon.renommer(&nom) {
+            return Ok(false);
+        }
+        info!(nom = %nom, "spotify_connect_renomme");
+        if self.daemon.is_running().await {
+            self.daemon.stop().await;
+            self.daemon
+                .start(|event, track_id| {
+                    info!(event = %event, track_id = ?track_id, "spotify_connect_event");
+                })
+                .await?;
+        }
+        Ok(true)
     }
 
     /// La pompe du PCM de librespot (une seule par récepteur).
@@ -907,6 +1091,51 @@ impl SpotifyConnectManager {
     /// #6946 — ce que Spotify livre réellement au récepteur.
     pub fn qualite_recue(&self) -> QualiteDeLibrespot {
         self.daemon.qualite_recue()
+    }
+
+    /// #8565 — chaque évènement de librespot sera aussi remis à `tx` (le
+    /// pilote des sessions lancées depuis l'application Spotify).
+    pub fn brancher_les_evenements(&self, tx: mpsc::UnboundedSender<EvenementLibrespot>) {
+        if let Ok(mut r) = self.daemon.relais.lock() {
+            *r = Some(tx);
+        }
+    }
+
+    /// « Le dernier geste gagne » — une lecture lancée depuis Tune prend la
+    /// main sur la session Spotify Connect : remet au pilote des sessions
+    /// l'évènement [`EVENEMENT_TUNE_PREND_LA_MAIN`]. Sans pilote branché,
+    /// rien.
+    pub fn signaler_reprise_par_tune(&self) {
+        if let Ok(r) = self.daemon.relais.lock()
+            && let Some(tx) = r.as_ref()
+        {
+            let _ = tx.send(EvenementLibrespot {
+                evenement: EVENEMENT_TUNE_PREND_LA_MAIN.into(),
+                ..Default::default()
+            });
+        }
+    }
+
+    /// #8580 — le numéro du lancement courant de librespot (0 : jamais
+    /// lancé).
+    pub fn lancement_de_librespot(&self) -> u64 {
+        self.daemon.lancements.load(Ordering::SeqCst)
+    }
+
+    /// #8565 — retient pourquoi la session n'a pas pu jouer (`None` : elle
+    /// a joué).
+    pub fn noter_erreur_de_session(&self, erreur: Option<String>) {
+        if let Ok(mut e) = self.erreur_de_session.lock() {
+            *e = erreur;
+        }
+    }
+
+    /// #8565 — la zone exposée, si le récepteur est activé.
+    pub async fn zone_exposee(&self) -> Option<i64> {
+        if !*self.enabled.lock().await {
+            return None;
+        }
+        *self.zone_id.lock().await
     }
 
     /// #6933 — la dernière erreur écrite par librespot depuis son démarrage.
@@ -1023,7 +1252,7 @@ impl SpotifyConnectManager {
         let binaire = trouver_le_binaire();
         serde_json::json!({
             "enabled": enabled,
-            "device_name": &self.device_name,
+            "device_name": self.device_name(),
             "zone_id": zone_id,
             "active": running,
             "binary_available": binary_available(),
@@ -1035,6 +1264,15 @@ impl SpotifyConnectManager {
             // #6946 — la qualité réellement reçue, que Réglages › Spotify
             // affiche au lieu de laisser croire à un réglage sans perte.
             "quality": self.qualite_recue(),
+            // #8565 — la dernière session lancée depuis l'application Spotify
+            // n'a pas pu jouer dans la zone exposée : pourquoi.
+            "session_error": self.erreur_de_session.lock().ok().and_then(|e| e.clone()),
+            // #8565 — un refus que l'écran sait dire : compte non Premium.
+            "receiver_error_code": self
+                .daemon
+                .derniere_erreur()
+                .filter(|e| exige_premium(e))
+                .map(|_| CODE_PREMIUM_EXIGE),
         })
     }
 }
@@ -1457,5 +1695,83 @@ mod tests {
         // `/bin/echo` n'est pas un script : sa première ligne est relue
         // (« --version » en BSD, la version de coreutils en GNU).
         assert!(version_de_librespot(Path::new("/bin/echo")).await.is_some());
+    }
+
+    /// Fil 2778 — le nom saisi atteint `--name` de librespot : retenu avant
+    /// le lancement, et librespot relancé s'il tournait déjà sous un autre.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nom_2778_le_nom_choisi_atteint_librespot() {
+        let dossier = tempfile::tempdir().unwrap();
+        // Un faux librespot qui relève ses arguments et reste en vie.
+        let bin = poser(
+            dossier.path(),
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/args\"\nexec sleep 30\n",
+        );
+        let args = dossier.path().join("args");
+        let recepteur = SpotifyConnectManager::avec_binaire(
+            NOM_PAR_DEFAUT.into(),
+            0,
+            Some(bin.to_string_lossy().into_owned()),
+        );
+        let attendre = |n: usize| {
+            let args = args.clone();
+            async move {
+                for _ in 0..100 {
+                    let lu = std::fs::read_to_string(&args).unwrap_or_default();
+                    if lu.lines().count() >= n {
+                        return lu;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                std::fs::read_to_string(&args).unwrap_or_default()
+            }
+        };
+
+        // Avant l'activation (ce que fait Réglages › Spotify Connect).
+        assert!(recepteur.renommer(Some(" Tune_1 ")).await.unwrap());
+        recepteur.enable(1).await.unwrap();
+        let lu = attendre(1).await;
+        assert!(lu.contains("--name Tune_1 "), "premier lancement : {lu}");
+        assert_eq!(recepteur.status().await["device_name"], "Tune_1");
+
+        // Pendant qu'il tourne : relancé sous le nouveau nom.
+        assert!(recepteur.renommer(Some("Salon")).await.unwrap());
+        let lu = attendre(2).await;
+        assert!(
+            lu.lines()
+                .nth(1)
+                .is_some_and(|l| l.contains("--name Salon ")),
+            "relance : {lu}"
+        );
+        // Même nom : rien ne bouge.
+        assert!(!recepteur.renommer(Some("Salon")).await.unwrap());
+        recepteur.disable().await;
+    }
+
+    #[test]
+    fn avertissement_2778_ligne_warn_de_librespot_reconnue() {
+        assert_eq!(
+            ligne_d_avertissement_librespot(
+                "[2026-11-12T11:05:01Z WARN  librespot_playback::player] Skipping to next track, unable to load track"
+            )
+            .as_deref(),
+            Some("Skipping to next track, unable to load track")
+        );
+        assert_eq!(
+            ligne_d_avertissement_librespot(
+                "[2026-11-12T11:05:01Z INFO  librespot] Using Pipe sink"
+            ),
+            None
+        );
+        assert_eq!(ligne_d_avertissement_librespot("TUNE_EVENT\tplaying"), None);
+    }
+
+    #[test]
+    fn nom_2778_saisie_vide_ou_sale() {
+        assert_eq!(nom_du_recepteur(None), "Tune");
+        assert_eq!(nom_du_recepteur(Some("   ")), "Tune");
+        assert_eq!(nom_du_recepteur(Some(" a\nb\t")), "ab");
+        assert_eq!(nom_du_recepteur(Some(&"x".repeat(100))).len(), 64);
     }
 }

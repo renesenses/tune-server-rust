@@ -108,8 +108,18 @@ async fn enable_connect(
 ) -> Json<Value> {
     let zone_id = body.zone_id.unwrap_or(1);
 
-    if let Some(ref name) = body.device_name {
-        info!(name, "spotify_connect_custom_name");
+    // Fil 2778 — le nom saisi était journalisé puis oublié : l'application
+    // Spotify voyait toujours « Tune ». Il est retenu (réglage relu au
+    // démarrage) et appliqué AVANT le lancement de librespot. Absent du
+    // corps : le nom courant est gardé ; vide : retour au nom par défaut.
+    if let Some(ref saisie) = body.device_name {
+        let nom = tune_core::streaming::spotify_connect::nom_du_recepteur(Some(saisie));
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(CLE_NOM_DU_RECEPTEUR, &nom)
+            .ok();
+        if let Err(e) = state.spotify_connect.renommer(Some(&nom)).await {
+            info!(error = %e, "spotify_connect_renommage_relance_impossible");
+        }
     }
 
     if let Err(e) = state.spotify_connect.enable(zone_id).await {
@@ -128,6 +138,9 @@ async fn enable_connect(
 
     Json(statut_complet(&state).await)
 }
+
+/// Fil 2778 — le réglage qui garde le nom du récepteur.
+pub(crate) const CLE_NOM_DU_RECEPTEUR: &str = "spotify_connect_device_name";
 
 async fn disable_connect(State(state): State<AppState>) -> Json<Value> {
     state.spotify_connect.disable().await;
@@ -211,6 +224,22 @@ async fn transfer_playback(
     }
 }
 
+/// #8565 — les sessions lancées depuis l'application Spotify jouent dans la
+/// zone exposée : le pilote reçoit chaque évènement de librespot.
+pub fn brancher_les_sessions(state: &AppState) {
+    use tune_core::streaming::spotify_connect_session::{PiloteConnect, ZonesDeLOrchestrateur};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    state.spotify_connect.brancher_les_evenements(tx);
+    tokio::spawn(
+        PiloteConnect {
+            recepteur: state.spotify_connect.clone(),
+            zones: ZonesDeLOrchestrateur(state.orchestrator.clone()),
+        }
+        .piloter(rx),
+    );
+    info!("spotify_connect_sessions_branchees");
+}
+
 pub async fn auto_start(state: &AppState) {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
@@ -228,6 +257,13 @@ pub async fn auto_start(state: &AppState) {
         .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
+
+    // Fil 2778 — le nom choisi survit au redémarrage de Tune.
+    if let Some(nom) = settings.get(CLE_NOM_DU_RECEPTEUR).ok().flatten()
+        && let Err(e) = state.spotify_connect.renommer(Some(&nom)).await
+    {
+        info!(error = %e, "spotify_connect_renommage_impossible");
+    }
 
     if !tune_core::streaming::spotify_connect::binary_available() {
         info!("spotify_connect_auto_start_skipped: librespot not found");
@@ -313,6 +349,61 @@ mod tests {
         .await;
         assert_eq!(corps["lecture_experimentale"], false);
         assert!(!tune_core::streaming::spotify_lecture::lecture_activee(&db));
+    }
+
+    /// Fil 2778 (Jon, rc11, Raspberry Pi) — le nom saisi dans Réglages ›
+    /// Spotify Connect avant d'activer le récepteur était journalisé puis
+    /// oublié : le statut et l'application Spotify disaient « Tune ». Il est
+    /// désormais retenu, rendu par le statut et gardé en réglage ; un nom
+    /// vide ramène « Tune ».
+    #[tokio::test]
+    async fn spotify_2778_le_nom_saisi_avant_l_activation_est_retenu() {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let db = state.backend.clone();
+        let app = crate::routes::router_with_plugins(state, Vec::new());
+        // librespot peut manquer sur la machine de test : l'activation
+        // échoue alors, mais le nom doit être retenu quand même.
+        let (statut, corps) = appel(
+            &app,
+            "POST",
+            "/api/v1/spotify-connect/enable",
+            Some(serde_json::json!({"zone_id": 1, "device_name": "  Tune_1 "})),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{corps}");
+        assert_eq!(corps["device_name"], "Tune_1", "{corps}");
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
+        assert_eq!(
+            reglages
+                .get(super::CLE_NOM_DU_RECEPTEUR)
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some("Tune_1"),
+            "le nom survit au redémarrage"
+        );
+        let (_, corps) = appel(&app, "GET", "/api/v1/spotify-connect/status", None).await;
+        assert_eq!(corps["device_name"], "Tune_1", "{corps}");
+
+        // Sans `device_name` : le nom courant est gardé.
+        let (_, corps) = appel(
+            &app,
+            "POST",
+            "/api/v1/spotify-connect/enable",
+            Some(serde_json::json!({"zone_id": 1})),
+        )
+        .await;
+        assert_eq!(corps["device_name"], "Tune_1", "{corps}");
+
+        // Vide : retour au nom par défaut.
+        let (_, corps) = appel(
+            &app,
+            "POST",
+            "/api/v1/spotify-connect/enable",
+            Some(serde_json::json!({"zone_id": 1, "device_name": "   "})),
+        )
+        .await;
+        assert_eq!(corps["device_name"], "Tune", "{corps}");
     }
 
     /// #6946 — Réglages › Spotify lit ici la qualité réellement reçue, et sa

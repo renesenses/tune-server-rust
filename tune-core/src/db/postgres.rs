@@ -98,6 +98,11 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS year TEXT",
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS sample_rate TEXT",
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS bit_depth TEXT",
+    // tune-web-client#2759 — référence d'album (PG 078, aussi dans
+    // `ENSURE_COLUMNS`), que `SELECT_COLS` NOMME désormais pour rendre
+    // `album_id_service` : même raison que `ai_generated`, une table montée
+    // par ce seul chemin (banc `pg_3715_*`) doit rester lisible.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS album_ref TEXT",
     // Only re-attach the TEXT default while the column IS still text.
     // On a database healed by migration 012 the column is BIGINT and
     // already defaults to `nextval('streaming_favorites_id_seq')`, so
@@ -423,6 +428,10 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // colonne. L'index JUSTE APRÈS la colonne.
     "ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id)",
+    // web#2795 — la surcharge locale d'une station de l'annuaire (PG 113). Ici
+    // AUSSI : une base de bascule ne rejoue pas la 113, et la liste comme le
+    // relevé de l'annuaire NOMMENT la colonne.
+    "ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS surcharge_locale TEXT",
     // #6474 — la provenance du nom de tri (PG 095). Ici AUSSI : une base de
     // bascule ne rejoue pas la 095, et le scan comme l'enrichissement NOMMENT
     // la colonne.
@@ -430,6 +439,11 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // #6463 — la provenance du MBID d'artiste (PG 097). Ici AUSSI : une base
     // de bascule ne rejoue pas la 097, et le scan comme la fiche la NOMMENT.
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS musicbrainz_id_source TEXT",
+    // #8090 — le pays de l'artiste et le MBID dont il a été lu (PG 112). Ici
+    // AUSSI : une base de bascule ne rejoue pas la 112, et les facettes comme
+    // la passe de fond les NOMMENT.
+    "ALTER TABLE artists ADD COLUMN IF NOT EXISTS country TEXT",
+    "ALTER TABLE artists ADD COLUMN IF NOT EXISTS country_mbid TEXT",
     // #7765 — la source d'un crédit de piste (PG 102). Ici AUSSI : tous les
     // écrivains de crédits et les passes « à faire » NOMMENT la colonne.
     // L'index JUSTE APRÈS la colonne.

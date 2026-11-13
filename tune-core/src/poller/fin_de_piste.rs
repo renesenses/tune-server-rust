@@ -1232,7 +1232,10 @@ impl PositionPoller {
             info!(zone_id, device_id, "gapless_set_next_evite_coupe_la_piste");
             return GaplessPrep::Abandonnee;
         }
-        let fichier_prepare = self.orchestrator.fichier_suivant_en_preparation(zone_id);
+        // #6718 — « prête trop tard » ne vaut pas pour HQPlayer, qui met la
+        // suivante en file ; un renderer réseau garde cette garde même quand
+        // sa suivante vient d'une préparation d'avance.
+        let fichier_prepare = self.orchestrator.preparation_fichier_arme_tot(zone_id);
         if self.orchestrator.preparation_fichier_indisponible(zone_id) {
             // La tâche poursuit son téléchargement sans retenir ce tick ni
             // subir le budget des renderers réseau ordinaires.

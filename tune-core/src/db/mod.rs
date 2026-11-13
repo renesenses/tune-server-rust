@@ -29,6 +29,8 @@ pub mod engine;
 /// #7983 — la trace des tentatives de la passe d'enrichissement des métadonnées.
 pub mod enrich_tentatives;
 pub mod facet_filter;
+/// #8325 — chef, ensemble, œuvre : facettes et colonnes de la Collection.
+pub mod facettes_classiques;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
 /// #5314 — le genre posé sur un album vaut pour ses pistes.
@@ -97,6 +99,10 @@ pub mod repartitions_bibliotheque;
 pub(crate) mod replieur_wal;
 pub mod settings_repo;
 pub mod source_link_repo;
+/// Les sources réseau lues sans montage (#8189).
+pub mod sources_reseau;
+/// #8160 — la trace datée du spectrogramme conservé d'une piste.
+pub mod spectrogrammes;
 pub mod sqlite;
 pub mod streaming_favorites_repo;
 /// « Pas pour moi » — suggestions d'accueil écartées, par profil (web#916).

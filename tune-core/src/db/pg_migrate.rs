@@ -252,6 +252,9 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     "sync_releve_pistes",
     "sync_releve_albums",
     "sync_releve_artistes",
+    // Sources réseau (#8189, script 115) : sans cette ligne, les sources
+    // configurées et leurs identifiants scellés seraient perdus à la bascule.
+    "sources_reseau",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",
@@ -290,6 +293,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
     (
         "hires_verifications",
         "verdicts des faux hi-res (#6285) : mesures recalculables, la passe de fond les refait",
+    ),
+    (
+        "spectrogrammes",
+        "trace des spectrogrammes conservés (#8160) : images du cache, recalculables à la demande ; \
+         le cache des pochettes n'est pas recopié non plus",
     ),
     (
         "_migrations",
@@ -1457,10 +1465,17 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE "C";
 -- PG 090, #6516). TEXT des deux côtés : la copie texte n'a rien à convertir.
 ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id);
+-- radio_stations: surcharge locale d'une station de l'annuaire (SQLite
+-- migration v147 / PG 113, web#2795). TEXT des deux côtés.
+ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS surcharge_locale TEXT;
 -- artists: provenance du nom de tri (SQLite migration v131 / PG 095, #6474).
 ALTER TABLE artists ADD COLUMN IF NOT EXISTS sort_name_source TEXT;
 -- artists: provenance du MBID (SQLite migration v133 / PG 097, #6463).
 ALTER TABLE artists ADD COLUMN IF NOT EXISTS musicbrainz_id_source TEXT;
+-- artists: pays de l'artiste et MBID dont il a ete lu (SQLite migration v146 /
+-- PG 112, #8090). TEXT des deux cotes.
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS country TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS country_mbid TEXT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE

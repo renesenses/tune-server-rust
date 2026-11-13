@@ -24,8 +24,107 @@ use tune_core::taches_de_fond::{Tache, est_en_pause};
 pub struct TaskProgress {
     pub processed: u64,
     pub total: u64,
-    /// Sub-phase label, e.g. `"MusicBrainz"` or `"Images"`.
+    /// Sub-phase label, e.g. `"MusicBrainz"` or `"Crédits"`. Texte français
+    /// historique, gardé tel quel pour les clients antérieurs.
     pub detail: String,
+    /// #8282 — code STABLE de la sous-phase (`credits`, `files`, `source`…),
+    /// que le client traduit (`app.task.phase.<code>` côté web) sans dépendre
+    /// de la phrase de `detail`.
+    pub detail_code: &'static str,
+    /// #8282 — paramètres du code, ex. `{"name": "MusicBrainz"}` pour
+    /// `source`. Omis quand il n'y en a pas.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub detail_params: serde_json::Map<String, serde_json::Value>,
+}
+
+/// #8282 — la sous-phase d'une tâche de fond, publiée sous un code stable.
+///
+/// Avant, chaque passe écrivait une phrase française (« Crédits »,
+/// « Métadonnées », « en attente : lecture en cours »…) que le client devait
+/// reconnaître pour la traduire : « Fetching credits… — Crédits 16/150 » dans
+/// une interface anglaise (web#2760). Les codes reprennent les clés
+/// `app.task.phase.*` du client web (PR web#2786).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Credits,
+    Files,
+    LrcFiles,
+    Metadata,
+    Tags,
+    Composer,
+    Compilations,
+    Albums,
+    Labels,
+    Images,
+    DynamicRange,
+    /// La passe de la plage dynamique attend la fin de la lecture.
+    WaitingPlayback,
+    /// … attend que la machine refroidisse.
+    WaitingHeat,
+    /// … attend qu'une autre analyse finisse de décoder.
+    WaitingSlot,
+    Paused,
+    Done,
+    /// Un service nommé (MusicBrainz, LRCLIB, Discogs / Last.fm) : nom propre,
+    /// non traduit, passé en paramètre `name`.
+    Source(&'static str),
+}
+
+impl Phase {
+    /// Le code stable publié dans `detail_code`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Phase::Credits => "credits",
+            Phase::Files => "files",
+            Phase::LrcFiles => "lrcFiles",
+            Phase::Metadata => "metadata",
+            Phase::Tags => "tags",
+            Phase::Composer => "composer",
+            Phase::Compilations => "compilations",
+            Phase::Albums => "albums",
+            Phase::Labels => "labels",
+            Phase::Images => "images",
+            Phase::DynamicRange => "dynamicRange",
+            Phase::WaitingPlayback => "waitingPlayback",
+            Phase::WaitingHeat => "waitingHeat",
+            Phase::WaitingSlot => "waitingSlot",
+            Phase::Paused => "paused",
+            Phase::Done => "done",
+            Phase::Source(_) => "source",
+        }
+    }
+
+    /// Le texte historique de `detail` (inchangé pour les clients antérieurs).
+    pub fn texte(self) -> &'static str {
+        match self {
+            Phase::Credits => "Crédits",
+            Phase::Files => "Fichiers",
+            Phase::LrcFiles => "Fichiers .lrc",
+            Phase::Metadata => "Métadonnées",
+            Phase::Tags => "Étiquettes",
+            Phase::Composer => "Compositeur",
+            Phase::Compilations => "Compilations",
+            Phase::Albums => "albums",
+            Phase::Labels => "labels",
+            Phase::Images => "Images",
+            Phase::DynamicRange => "Plage dynamique",
+            Phase::WaitingPlayback => "en attente : lecture en cours",
+            Phase::WaitingHeat => "en attente : machine trop chaude",
+            Phase::WaitingSlot => "en attente : une autre analyse décode",
+            Phase::Paused => "en pause",
+            Phase::Done => "terminé",
+            Phase::Source(nom) => nom,
+        }
+    }
+
+    /// Les paramètres de `detail_code`.
+    pub fn parametres(self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        if let Phase::Source(nom) = self {
+            m.insert("name".into(), json!(nom));
+        }
+        m
+    }
 }
 
 /// A single background task currently in progress.
@@ -72,7 +171,9 @@ pub fn tache_suspendable(id: &str) -> Option<Tache> {
         | "credits_enrich_auto"
         | "types_de_sortie"
         | "credits_releases"
-        | "apports_qobuz" => Some(Tache::Enrichissement),
+        | "apports_qobuz"
+        // #8325 — la relecture unique des balises classiques.
+        | "relecture_classique" => Some(Tache::Enrichissement),
         // `album_artwork` : la passe des pochettes d'albums (inscrite sous
         // `artwork` avant l'écran des images, 01/11/2026) ; elle attend son
         // tour sur `Tache::ImagesArtistes`, comme les portraits.
@@ -188,14 +289,19 @@ impl BackgroundTasks {
 
     /// Attach/refresh granular progress on an already-registered task. No-op if
     /// the task isn't currently active (e.g. it just finished and cleared).
-    pub fn update_progress(&self, id: &str, processed: u64, total: u64, detail: impl Into<String>) {
+    ///
+    /// #8282 — la sous-phase est une [`Phase`] : code stable + paramètres,
+    /// plus le texte historique dans `detail`.
+    pub fn update_progress(&self, id: &str, processed: u64, total: u64, phase: Phase) {
         {
             let mut map = self.inner.lock().unwrap();
             let Some(task) = map.get_mut(id) else { return };
             task.progress = Some(TaskProgress {
                 processed,
                 total,
-                detail: detail.into(),
+                detail: phase.texte().to_string(),
+                detail_code: phase.code(),
+                detail_params: phase.parametres(),
             });
         }
         self.emit();
@@ -238,5 +344,78 @@ pub struct TaskGuard {
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         self.tasks.end(&self.id);
+    }
+}
+
+#[cfg(test)]
+mod tests_8282 {
+    //! #8282 — la sous-phase publiée sous un code stable, plus ses paramètres.
+    use super::*;
+
+    fn registre() -> BackgroundTasks {
+        BackgroundTasks::new(Arc::new(EventBus::new()))
+    }
+
+    fn progression(t: &BackgroundTasks, id: &str) -> serde_json::Value {
+        let tache = t.snapshot().into_iter().find(|x| x.id == id).unwrap();
+        serde_json::to_value(&tache).unwrap()["progress"].clone()
+    }
+
+    #[test]
+    fn la_sous_phase_porte_un_code_stable_et_garde_son_texte() {
+        let t = registre();
+        let _g = t.begin("credits_enrich_auto", "Crédits", "credits");
+        t.update_progress("credits_enrich_auto", 16, 150, Phase::Credits);
+        let p = progression(&t, "credits_enrich_auto");
+        assert_eq!(p["detail_code"], "credits", "{p}");
+        // Le texte historique reste, pour les clients antérieurs.
+        assert_eq!(p["detail"], "Crédits", "{p}");
+        // Pas de paramètre : le champ est omis.
+        assert!(p.get("detail_params").is_none(), "{p}");
+    }
+
+    #[test]
+    fn un_service_nomme_passe_en_parametre() {
+        let t = registre();
+        let _g = t.begin("lyrics_fetch", "Paroles", "lyrics");
+        t.update_progress("lyrics_fetch", 1, 2, Phase::Source("LRCLIB"));
+        let p = progression(&t, "lyrics_fetch");
+        assert_eq!(p["detail_code"], "source", "{p}");
+        assert_eq!(p["detail_params"], json!({"name": "LRCLIB"}), "{p}");
+        assert_eq!(p["detail"], "LRCLIB", "{p}");
+    }
+
+    /// Les codes sont un CONTRAT avec les clients (`app.task.phase.<code>`
+    /// côté web) : aucun n'est une phrase, aucun n'est en double.
+    #[test]
+    fn les_codes_sont_des_identifiants_uniques() {
+        let toutes = [
+            Phase::Credits,
+            Phase::Files,
+            Phase::LrcFiles,
+            Phase::Metadata,
+            Phase::Tags,
+            Phase::Composer,
+            Phase::Compilations,
+            Phase::Albums,
+            Phase::Labels,
+            Phase::Images,
+            Phase::DynamicRange,
+            Phase::WaitingPlayback,
+            Phase::WaitingHeat,
+            Phase::WaitingSlot,
+            Phase::Paused,
+            Phase::Done,
+            Phase::Source("MusicBrainz"),
+        ];
+        let mut vus = std::collections::HashSet::new();
+        for ph in toutes {
+            let c = ph.code();
+            assert!(
+                c.chars().all(|x| x.is_ascii_alphanumeric()),
+                "code non stable : {c:?}"
+            );
+            assert!(vus.insert(c), "code en double : {c}");
+        }
     }
 }

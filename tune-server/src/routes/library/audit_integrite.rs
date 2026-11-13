@@ -542,6 +542,86 @@ fn enregistrer(
     Ok(())
 }
 
+/// #8160 — le dernier résultat d'audit d'intégrité d'UNE piste, pour sa fiche
+/// technique, ou `None` sans résultat (jamais auditée, hors périmètre, piste
+/// de service).
+///
+/// Cherché dans l'audit courant, puis, s'il est partiel et pas terminé, dans
+/// son audit de référence. Une piste de feuille CUE lit la ligne de son image
+/// (portée par la plus petite piste de l'image, voir [`candidats`]).
+/// `audite_le` est la date d'écriture de la ligne ; `fichier_change_depuis`
+/// compare la taille et la date du fichier d'aujourd'hui (`meta`) à celles
+/// lues par l'audit.
+pub(super) fn de_la_piste(
+    db: &Arc<dyn DbBackend>,
+    track_id: i64,
+    cue_media_path: Option<&str>,
+    meta: Option<&std::fs::Metadata>,
+) -> Result<Option<serde_json::Value>, String> {
+    let etat = lire(db)?;
+    if etat.generation.is_empty() {
+        return Ok(None);
+    }
+    let id = match cue_media_path.filter(|c| !c.is_empty()) {
+        Some(image) => db
+            .query_one(
+                &format!(
+                    "SELECT MIN(id) FROM tracks WHERE cue_media_path = {}",
+                    match db.engine() {
+                        Engine::Sqlite => "?".to_string(),
+                        Engine::Postgres => "$1".to_string(),
+                    }
+                ),
+                &[&image],
+            )?
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(track_id),
+        None => track_id,
+    };
+    let mut generations = vec![etat.generation.clone()];
+    if etat.status != "completed"
+        && let Some(r) = etat.reference.clone()
+    {
+        generations.push(r);
+    }
+    let marque = match db.engine() {
+        Engine::Sqlite => "?",
+        Engine::Postgres => "$1",
+    };
+    for generation in generations {
+        let Some(r) = db.query_one(
+            &format!("SELECT value, updated_at FROM settings WHERE key = {marque}"),
+            &[&cle_ligne(&generation, id)],
+        )?
+        else {
+            continue;
+        };
+        let brut = r.first().and_then(|v| v.as_string()).unwrap_or_default();
+        let Ok(ligne) = serde_json::from_str::<Ligne>(&brut) else {
+            continue;
+        };
+        let audite_le = r.get(1).and_then(|v| v.as_string());
+        let change = meta.map(|m| {
+            ligne.taille.is_some_and(|t| t != m.len())
+                || ligne
+                    .date
+                    .zip(date_secondes(m))
+                    .is_some_and(|(a, b)| (a - b).abs() >= 0.001)
+        });
+        return Ok(Some(serde_json::json!({
+            "verdict": ligne.resultat.verdict,
+            "code": ligne.resultat.code,
+            "erreur": ligne.resultat.erreur,
+            "position_trames": ligne.resultat.position_trames,
+            "mode": ligne.mode,
+            "audite_le": audite_le,
+            "audit_en_cours": etat.status == "running" && generation == etat.generation,
+            "fichier_change_depuis": change,
+        })));
+    }
+    Ok(None)
+}
+
 #[derive(Default, Deserialize)]
 pub(super) struct Page {
     #[serde(default)]

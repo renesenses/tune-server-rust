@@ -21,6 +21,8 @@ mod collection_folders;
 pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
+/// #8325 — la relecture unique des balises classiques des fichiers importés.
+pub(crate) mod relecture_classique;
 // #4805 — les crédits d'un album lus juste après son identification.
 mod credits_apres_identification;
 mod duplicates;
@@ -48,6 +50,8 @@ mod etiquetage_par_filtre;
 mod exemplaires;
 mod facets;
 mod faux_hires;
+/// #8160 — la fiche technique d'une piste.
+pub(crate) mod fiche_technique;
 mod folder_facet;
 mod genres;
 // LA définition du genre, partagée avec `/dashboard/stats` (#4527) : une seule
@@ -82,6 +86,7 @@ mod spectrogramme;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
 // source de la même façon. Un seul point de vérité, partagé (#2147).
+mod classements_8264;
 pub(crate) mod compositeur_depuis_credits;
 pub(crate) mod graver_compilation;
 pub(crate) mod graver_dr;
@@ -451,6 +456,11 @@ pub fn router() -> Router<AppState> {
             "/coffrets/{id}/defaire-manuel",
             post(edition::defaire_coffret_manuel),
         )
+        // #8571 (fil 2763) — réordonner les albums d'un coffret manuel.
+        .route(
+            "/coffrets/{id}/ordre",
+            get(edition::ordre_du_coffret).put(edition::reordonner_coffret),
+        )
         .route(
             "/albums/disques-abimes/reparer",
             post(albums::reparer_disques),
@@ -538,6 +548,13 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/file-tags", get(tracks::track_file_tags))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/spectrogramme.png", get(spectrogramme::png))
+        // #8160 — la fiche technique d'une piste (lecture seule), et le
+        // recalcul de son spectrogramme conservé.
+        .route("/tracks/{id}/fiche-technique", get(fiche_technique::fiche))
+        .route(
+            "/tracks/{id}/spectrogramme",
+            post(spectrogramme::recalculer),
+        )
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
         // #2264 — les mêmes candidats, regroupés par enregistrement, avec la
@@ -1044,6 +1061,10 @@ mod filtre_qualite_7725_tests;
 #[cfg(test)]
 #[path = "notes_et_repartitions_7849_tests.rs"]
 mod notes_et_repartitions_7849_tests;
+
+#[cfg(test)]
+#[path = "classements_8264_tests.rs"]
+mod classements_8264_tests;
 
 #[cfg(test)]
 #[path = "requete_avancee_7872_tests.rs"]

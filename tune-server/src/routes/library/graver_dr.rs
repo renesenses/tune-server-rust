@@ -502,7 +502,12 @@ async fn derouler_la_passe(
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let pistes = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone());
     let mut c = Compteurs::default();
-    taches.update_progress(TACHE_GRAVER_DR, 0, total as u64, "Dynamic Range");
+    taches.update_progress(
+        TACHE_GRAVER_DR,
+        0,
+        total as u64,
+        crate::background_tasks::Phase::DynamicRange,
+    );
     // L'utilisateur peut retirer l'autorisation pendant la passe — et une
     // passe qui attend un fichier reporté peut durer : relue avant CHAQUE
     // écriture, jamais seulement au lancement.
@@ -538,7 +543,7 @@ async fn derouler_la_passe(
                 TACHE_GRAVER_DR,
                 traitees as u64,
                 total as u64,
-                "Dynamic Range",
+                crate::background_tasks::Phase::DynamicRange,
             );
             ecrire_statut(backend, &c.statut("running", total));
         }
@@ -614,7 +619,12 @@ async fn derouler_la_passe(
         reportees = encore;
     }
 
-    taches.update_progress(TACHE_GRAVER_DR, total as u64, total as u64, "Dynamic Range");
+    taches.update_progress(
+        TACHE_GRAVER_DR,
+        total as u64,
+        total as u64,
+        crate::background_tasks::Phase::DynamicRange,
+    );
     ecrire_statut(backend, &c.statut("done", total));
     let Compteurs {
         written,

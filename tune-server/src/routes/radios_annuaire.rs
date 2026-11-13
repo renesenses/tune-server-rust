@@ -404,6 +404,10 @@ pub fn relever_a_l_ouverture(
     }))
 }
 
+/// web#2795 — la surcharge locale d'une station de l'annuaire.
+#[path = "radios_surcharge_2795.rs"]
+pub(crate) mod surcharge;
+
 // ---------------------------------------------------------------------------
 // Rapprochement « Mes radios » ↔ annuaire
 // ---------------------------------------------------------------------------
@@ -654,6 +658,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/directory/preferred-stream/{radio_id}",
             post(choisir_le_flux),
+        )
+        // web#2795 — « Revenir à la fiche de l'annuaire » : efface la
+        // surcharge locale.
+        .route(
+            "/directory/revert/{radio_id}",
+            post(surcharge::revenir_a_la_fiche),
         )
 }
 

@@ -1136,6 +1136,20 @@ pub fn build_album_query(
             continue;
         }
 
+        // #8325 — chef, ensemble, œuvre : un album passe dès qu'UNE de ses
+        // pistes porte la valeur ; « différent », « ne contient pas » et
+        // « vide » demandent qu'AUCUNE piste ne la porte.
+        if let Some(r) = crate::regles_sql::condition_classique(field, op, value_raw) {
+            conditions.push(match r {
+                Some((c, false)) => c,
+                Some((c, true)) => {
+                    format!("NOT EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = al.id AND {c})")
+                }
+                None => crate::regles_sql::FAUX.to_string(),
+            });
+            continue;
+        }
+
         let col = match field {
             "genre" => "t.genre",
             "artist" | "artist_name" => "ar.name",
@@ -1584,7 +1598,8 @@ async fn resolve_albums(
     // (DecodingError.typeMismatch: expected Array, found dictionary) when
     // opening a smart collection in remote mode; the web client already
     // accepts either shape.
-    Ok(Json(albums).into_response())
+    // #8555 — la sérialisation de milliers d’albums retenait encore le fil async.
+    tune_http_types::json_hors_executeur(albums).await
 }
 
 /// Les albums d'une collection pour un profil, tels que la vue les rend :

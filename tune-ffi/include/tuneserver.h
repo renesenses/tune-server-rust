@@ -11,6 +11,7 @@
 #ifndef TUNESERVER_H
 #define TUNESERVER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -59,6 +60,16 @@ int32_t tune_server_defer_network_discovery(int32_t defer);
 /* Ouvre la decouverte reseau differee.
  * Retour : 0 ouverte par cet appel, 1 deja ouverte. */
 int32_t tune_server_start_network_discovery(void);
+
+/* Cle maitresse (32 octets) des identifiants des sources reseau, gardee
+ * par l'hote (trousseau iOS, Keystore Android) et tenue en memoire
+ * seulement, jamais ecrite sur disque. A APPELER AVANT tune_server_start.
+ * Retour : 0 succes, -2 si key est NULL ou len different de 32. */
+int32_t tune_server_set_master_key(const uint8_t *key, size_t len);
+
+/* Le reseau a change (NWPathMonitor, NetworkCallback) : les sources reseau
+ * oublient leurs connexions. Retour : 0. */
+int32_t tune_server_network_changed(void);
 
 /* Arret propre. Retour : 0 succes, -1 pas demarre. */
 int32_t tune_server_stop(void);

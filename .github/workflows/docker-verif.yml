@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# Annule l'exécution précédente de la même PR (ou de la même branche) dès
+# qu'un nouveau commit arrive : son résultat ne sert plus à rien.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verif:
     name: Image ${{ matrix.platform }} (sans push)
