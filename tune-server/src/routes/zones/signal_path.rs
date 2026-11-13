@@ -1578,7 +1578,10 @@ pub(super) fn etat_du_surechantillonneur_lang(
     ) {
         return None;
     }
-    let (raison, cle) = if pure {
+    let refus_observe = transformations_reelles.and_then(|t| t.refus_surechantillonnage());
+    let (raison, cle) = if let Some(raison) = refus_observe.filter(|_| output_type == "local") {
+        (raison, texte_du_refus_surechantillonnage(raison))
+    } else if pure {
         ("pure", "upsampling_pure")
     } else if output_type != "local" {
         // #8149 — une zone réseau (DLNA, AirPlay…) n'a pas de
@@ -1602,7 +1605,7 @@ pub(super) fn etat_du_surechantillonneur_lang(
         // « non appliqué » muet.
         (
             tune_core::audio::surechantillonnage::Ecarte::TestDeLaMachineAbsent.code(),
-            "upsampling_not_applied",
+            "upsampling_machine_test_missing",
         )
     } else {
         ("not_applied", "upsampling_not_applied")
@@ -1616,6 +1619,29 @@ pub(super) fn etat_du_surechantillonneur_lang(
             "bit_perfect": true,
         }),
     ))
+}
+
+/// #8259 — codes observés, sans déduire une cause du seul réglage actuel.
+fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
+    match raison {
+        "fixed_rate" => "upsampling_fixed_rate",
+        "pure" => "upsampling_pure",
+        "strict_bitperfect" => "upsampling_strict",
+        "disabled" => "upsampling_disabled_at_open",
+        "plugin_not_installed" => "upsampling_plugin_absent_at_open",
+        "premium_required" => "upsampling_premium_required",
+        "machine_test_missing" => "upsampling_machine_test_missing",
+        "rates_not_measured" => "upsampling_rates_not_measured",
+        "no_candidate_rate_accepted_by_device" => "upsampling_device_rates",
+        "machine_test_rejects_accepted_rates" => "upsampling_machine_rates",
+        "settings_caps_exclude_admitted_rates" => "upsampling_settings_caps",
+        "source_rate_unknown" | "source_probe_incomplete" => "upsampling_source_unknown",
+        "output_path_not_supported" => "upsampling_output_path",
+        "dop" => "upsampling_dop",
+        "multiple_outputs" => "upsampling_multiple_outputs",
+        "output_rate_open_failed" | "filter_initialization_failed" => "upsampling_opening_failed",
+        _ => "upsampling_not_applied",
+    }
 }
 
 /// #6946 — pose la raison du plafond de librespot sur l'étape Source et la
