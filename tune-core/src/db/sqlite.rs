@@ -714,7 +714,7 @@ CREATE TABLE IF NOT EXISTS albums (
     cover_source TEXT,
     cover_source_path TEXT,
     cover_source_stamp TEXT,
-    -- Pays d'edition lu sur la release MusicBrainz de l'album (migration 152,
+    -- Pays d'edition lu sur la release MusicBrainz de l'album (migration 154,
     -- #8668) : code ISO 3166-1 alpha-2, '' si MusicBrainz n'en donne aucun ;
     -- et l'identifiant de release dont il a ete lu. La balise RELEASECOUNTRY
     -- d'une piste prime toujours.

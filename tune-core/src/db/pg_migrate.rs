@@ -1476,7 +1476,7 @@ ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS surcharge_locale TEXT;
 -- convertit.
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS interrupt_playback TEXT DEFAULT 1;
 -- albums: pays d'edition lu sur MusicBrainz et release dont il a ete lu
--- (SQLite migration v152 / PG 118, #8668). TEXT des deux cotes.
+-- (SQLite migration v154 / PG 120, #8668). TEXT des deux cotes.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country_mbid TEXT;
 -- artists: provenance du nom de tri (SQLite migration v131 / PG 095, #6474).

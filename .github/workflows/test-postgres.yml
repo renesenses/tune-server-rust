@@ -1110,7 +1110,7 @@ jobs:
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pays_artiste_8090 -- --nocapture --test-threads=1
 
       # #8668 — le pays d'édition lu sur MusicBrainz (`albums.release_country`,
-      # PG 118), la balise prioritaire, le filtre `country=` et la route
+      # PG 120), la balise prioritaire, le filtre `country=` et la route
       # `album-countries`, par le vrai routeur.
       - name: Pays d'édition MusicBrainz sur PostgreSQL (#8668)
         env:
