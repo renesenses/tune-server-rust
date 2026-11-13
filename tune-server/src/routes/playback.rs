@@ -179,6 +179,10 @@ pub(crate) fn corps_du_refus_parental(e: &str, lang: &str) -> Option<Value> {
 
 /// #8154 — la route du récepteur Spotify Connect que le bouton « Activer le
 /// récepteur » appelle (`POST`, corps `{}`).
+/// #8565 — la phrase « Spotify a refusé les clés audio de ce compte »
+/// (`i18n_server.json`), rendue par la lecture et par le statut du récepteur.
+pub(crate) const CLE_CLES_AUDIO_REFUSEES: &str = "spotify.playback.audioKeyRefused";
+
 pub(crate) const ROUTE_ACTIVER_RECEPTEUR_SPOTIFY: &str = "/api/v1/spotify-connect/enable";
 
 /// #8154 — le refus « liaison Spotify Connect requise » : 409, code stable,
@@ -292,6 +296,29 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
             }),
             lang,
             "spotify.playback.premiumRequired",
+            &[],
+        );
+        if let Some(objet) = corps.as_object_mut() {
+            objet.insert("cause".into(), json!(cause));
+        }
+        return (StatusCode::CONFLICT, Json(corps)).into_response();
+    }
+    // #8565 (décision de Bertrand du 13/11) — Spotify refuse les clés audio
+    // du compte (librespot #1649) : le titre sautait sans un son. 409 au code
+    // stable, phrase traduite « Spotify a refusé les clés audio de ce
+    // compte ».
+    if let Some(pos) = e.find(tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES)
+    {
+        use tune_core::streaming::spotify_connect::CODE_CLES_AUDIO_REFUSEES;
+        use tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES;
+        let cause = e[pos + SENTINELLE_CLES_AUDIO_REFUSEES.len()..].trim();
+        let mut corps = crate::message_api::avec_message_en(
+            json!({
+                "error": CODE_CLES_AUDIO_REFUSEES,
+                "code": CODE_CLES_AUDIO_REFUSEES,
+            }),
+            lang,
+            CLE_CLES_AUDIO_REFUSEES,
             &[],
         );
         if let Some(objet) = corps.as_object_mut() {
@@ -2547,6 +2574,39 @@ mod refus_de_format_3234 {
                     assert!(message.contains("Spotify app"), "{message}");
                 }
             }
+        }
+    }
+
+    /// #8565 (décision de Bertrand du 13/11) — Spotify refuse les clés audio
+    /// du compte : 409 au code stable `spotify_audio_key_refused` et la phrase
+    /// « Spotify a refusé les clés audio de ce compte », au lieu d'un titre
+    /// sauté sans un mot. Contre-épreuve : sans la branche, 502.
+    #[tokio::test]
+    async fn spotify_8565_cles_audio_refusees_dit_le_refus() {
+        let e = format!(
+            "source « spotify » : {}Spotify a refusé les clés audio de ce compte (librespot : « error audio key »)",
+            tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES
+        );
+        for (lang, phrase) in [
+            ("fr", "Spotify a refusé les clés audio de ce compte"),
+            ("en", "Spotify refused the audio keys for this account"),
+        ] {
+            let reponse = play_error_response(e.clone(), lang);
+            assert_eq!(reponse.status(), StatusCode::CONFLICT, "{lang}");
+            let corps = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+                .await
+                .expect("corps de la réponse");
+            let corps: Value = serde_json::from_slice(&corps).expect("corps JSON");
+            assert_eq!(corps["error"], "spotify_audio_key_refused");
+            assert_eq!(corps["code"], "spotify_audio_key_refused");
+            assert_eq!(corps["message_key"], super::CLE_CLES_AUDIO_REFUSEES);
+            let message = corps["message"].as_str().unwrap_or_default();
+            assert!(message.contains(phrase), "{lang} : {message}");
+            assert!(
+                corps["cause"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("audio key"))
+            );
         }
     }
 

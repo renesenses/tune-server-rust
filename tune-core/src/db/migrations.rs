@@ -2897,7 +2897,28 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "podcast_episode_positions",
         up: include_str!("../../migrations/podcast_episode_positions.sql"),
     },
+    // #8615 (fil 2784, décision de Bertrand du 13/11) — l'option de réveil
+    // « Interrompre la lecture en cours » : `alarms.interrupt_playback`,
+    // COCHÉE par défaut, y compris pour les réveils existants (DEFAULT 1).
+    // Colonne posée dans le bloc de version et dans la passe finale, PAS dans
+    // `up` : même règle qu'à la 126. Jumelle PG : 117.
+    Migration {
+        version: 151,
+        name: "alarms_interrupt_playback",
+        up: "",
+    },
 ];
+
+/// Pose `alarms.interrupt_playback` (#8615) — bloc de version de la 151 et
+/// passe finale. 1 pour l'existant : l'option est cochée par défaut.
+pub(crate) fn interruption_par_le_reveil(db: &SqliteDb) {
+    add_column_if_missing(
+        db,
+        "alarms",
+        "interrupt_playback",
+        "INTEGER NOT NULL DEFAULT 1",
+    );
+}
 
 /// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
 /// de la 146 et passe finale.
@@ -4407,6 +4428,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // web#2795 — la surcharge locale des stations de l'annuaire.
             surcharge_locale_des_radios(db);
         }
+        if migration.version == 151 {
+            // #8615 — « Interrompre la lecture en cours », cochée par défaut.
+            interruption_par_le_reveil(db);
+        }
         if migration.version == 137 {
             // #7765 — la source des crédits, puis l'attribution UNE fois des
             // lignes existantes. L'index vient APRES la colonne qu'il nomme.
@@ -5022,6 +5047,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // La surcharge locale des radios (migration 147, web#2795) — posée ICI
     // aussi : la liste et le relevé de l'annuaire la NOMMENT. PG : 113.
     surcharge_locale_des_radios(db);
+    // L'interruption de la lecture par le réveil (migration 151, #8615) —
+    // posée ICI aussi : le planificateur et les routes des réveils la
+    // NOMMENT. PG : 117.
+    interruption_par_le_reveil(db);
     // L'ordre des etiquettes (migration 127, #6257) — pose ICI aussi :
     // l'INSERT des etiquettes le NOMME. Sans rangement : toutes a 0, la liste
     // reste rangee par nom (le nom departage). PG : migration 091.
@@ -6149,6 +6178,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         116,
         "podcast_episode_positions",
         include_str!("../../migrations/postgres/116_podcast_episode_positions.sql"),
+    ),
+    // Jumelle de la SQLite 151 (#8615) : `alarms.interrupt_playback`,
+    // « Interrompre la lecture en cours », 1 pour l'existant.
+    (
+        117,
+        "alarms_interrupt_playback",
+        include_str!("../../migrations/postgres/117_alarms_interrupt_playback.sql"),
     ),
 ];
 
@@ -10013,7 +10049,10 @@ mod tests {
         // (115 = `sources_reseau`, #8202, fusionnée avant).
         // Crée la position de chaque épisode de podcast commencé, que la
         // reprise des podcasts NOMME.
-        assert_eq!(pg_latest_version(), 116, "latest PG migration must be 116");
+        // 117 : `alarms_interrupt_playback` (#8615), jumelle de la SQLite
+        // 151. Pose l'option de réveil « Interrompre la lecture en cours »,
+        // que le planificateur et les routes des réveils NOMMENT.
+        assert_eq!(pg_latest_version(), 117, "latest PG migration must be 117");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

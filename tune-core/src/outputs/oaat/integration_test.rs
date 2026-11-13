@@ -1087,6 +1087,25 @@ mod tests {
     /// `.dsf` directly, with no orphaned DSD->PCM transcode). stop() (run before
     /// every play_media) clears native-DSD mode so a following PCM track goes
     /// back to the url-prefetch path.
+    /// #8647 (relecture) — la découverte construit une sortie neuve à chaque
+    /// ré-annonce mDNS puis la jette en gardant celle qui joue. La neuve ne
+    /// doit pas remplacer, dans le registre du chemin du signal, le drapeau
+    /// de la sortie qui joue.
+    #[tokio::test]
+    async fn une_sortie_neuve_jetee_ne_remplace_pas_celle_qui_joue_8647() {
+        use crate::outputs::dsd_natif_oaat_8647::est_actif;
+        let id = "oaat:reannonce-8647";
+        let a = OaatOutput::new("A".into(), "127.0.0.1".into(), 9999, id.into());
+        a.publier_le_drapeau_dsd_natif();
+        a.set_native_dsd_active_for_test(true);
+        assert!(est_actif(id));
+        let b = OaatOutput::new("B".into(), "127.0.0.1".into(), 9999, id.into());
+        drop(b);
+        assert!(est_actif(id), "la ré-annonce a effacé le DSD natif de A");
+        a.set_native_dsd_active_for_test(false);
+        assert!(!est_actif(id), "le registre suit toujours le drapeau de A");
+    }
+
     #[tokio::test]
     async fn oaat_gapless_capabilities_reflect_native_dsd() {
         let output = OaatOutput::new("Test".into(), "127.0.0.1".into(), 9999, "id".into());

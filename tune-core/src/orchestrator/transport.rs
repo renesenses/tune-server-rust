@@ -2409,8 +2409,8 @@ impl PlaybackOrchestrator {
                     // `None` sous PURE, sans Premium, sans greffon installé,
                     // désactivé (défaut) ou sans test de la machine. La sortie
                     // le lit à l'ouverture de CETTE piste, jamais pendant.
-                    local_output.set_surechantillonnage(
-                        self.choix_du_surechantillonneur(zone_id, zone_audiophile),
+                    local_output.set_decision_surechantillonnage(
+                        self.decision_du_surechantillonneur(zone_id, zone_audiophile),
                     );
                     // Zone equalizer, applied by the output itself for a local
                     // DAC — exactly like the crossfeed above, and for the same

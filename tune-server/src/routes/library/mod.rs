@@ -648,7 +648,9 @@ pub fn router() -> Router<AppState> {
         // défaut). Segment statique : aucun conflit avec `/albums/{id}`.
         .route(
             "/hires-check",
-            get(faux_hires::etat).post(faux_hires::regler),
+            get(faux_hires::etat)
+                .post(faux_hires::regler)
+                .put(faux_hires::regler),
         )
         // #6481 — les livrets PDF du dossier de l'album, et le fichier.
         // #8077 — les apports Qobuz d'un album local : lire (calcul à la

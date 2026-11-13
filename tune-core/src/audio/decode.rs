@@ -2693,6 +2693,10 @@ fn decode_to_pcm_streaming_inner(
     }
 
     // Symphonia streaming decode: packet-by-packet progressive output
+    // #7266 — la poignée d'un fMP4 DASH en croissance est gardée : un
+    // téléchargement perdu en route doit finir en ERREUR de lecture, pas en
+    // fin de piste (le démuxeur s'arrête de la même façon dans les deux cas).
+    let mut croissance_dash: Option<Arc<crate::audio::dash_growth::DashGrowth>> = None;
     let mss = if let Some(source) = source_override {
         MediaSourceStream::new(source, Default::default())
     } else if let Some(growth) = crate::audio::staged_growth::take_for(file_path) {
@@ -2700,6 +2704,7 @@ fn decode_to_pcm_streaming_inner(
             .map_err(|e| format!("open (staged growing): {e}"))?;
         MediaSourceStream::new(Box::new(source), Default::default())
     } else if let Some(growth) = crate::audio::dash_growth::take_for(file_path) {
+        croissance_dash = Some(growth.clone());
         let source = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
             .map_err(|e| format!("open (growing): {e}"))?;
         MediaSourceStream::new(Box::new(source), Default::default())
@@ -3110,8 +3115,22 @@ fn decode_to_pcm_streaming_inner(
         );
     }
 
+    if let Some(growth) = croissance_dash
+        && growth.a_echoue()
+    {
+        return Err(format!(
+            "{TELECHARGEMENT_DASH_INTERROMPU} : {} trames décodées",
+            integrite.trames_rendues
+        ));
+    }
+
     Ok((output_bd, output_rate))
 }
+
+/// #7266 — tête du message d'erreur d'un décodage dont le téléchargement DASH
+/// en croissance a été perdu en route ; l'orchestrateur la reconnaît pour
+/// signaler l'erreur de lecture à la zone.
+pub const TELECHARGEMENT_DASH_INTERROMPU: &str = "téléchargement DASH interrompu";
 
 /// Extract a human-readable message from a panic payload.
 fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
