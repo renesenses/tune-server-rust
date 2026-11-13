@@ -11676,6 +11676,74 @@ async fn frequence_fixe_8428_epargne_le_dsd_brut_et_le_dop() {
     }
 }
 
+/// Le vrai choix de format alimente le décodeur ET StreamInfo, sans périphérique audio.
+#[tokio::test]
+async fn cadence_8616_dsd_pcm_et_metadonnees_suivent_la_sonde() {
+    let orch = test_orchestrator();
+    let id = "local:wasapi-synthetique-8616";
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("WASAPI synthétique", Some("local"), Some(id))
+        .unwrap();
+    zones.update_dsd_mode(zone_id, "pcm").unwrap();
+    let chemin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/dsd/ref_dsd64_stereo.dsf"
+    );
+    orch.db
+        .execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Synthétique')",
+            &[],
+        )
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Synthétique', 1)",
+            &[],
+        )
+        .unwrap();
+    orch.db.execute("INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, duration_ms, sample_rate, bit_depth, channels) VALUES (1, 'DSD64', 1, 1, ?, 'dsf', 1000, 2822400, 1, 2)", &[&chemin.to_string() as &dyn crate::db::backend::ToSqlValue]).unwrap();
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.output_device_id = Some(id.into());
+    // Sans mesure (Linux, partagé, ASIO ou pilote muet), aucun changement.
+    assert_eq!(
+        orch.format_de_sortie_pour_test(&req).await.unwrap().out_sr,
+        176_400
+    );
+    super::resolve_local::cadences_pcm_de_test()
+        .lock()
+        .unwrap()
+        .insert(id.into(), vec![88_200, 44_100]);
+    let f = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(
+        f.out_sr, 88_200,
+        "le décodeur doit produire la cadence acceptée, pas 176400"
+    );
+    assert_eq!(
+        f.info.sample_rate, 88_200,
+        "le chemin du signal doit annoncer la conversion réelle"
+    );
+    assert_eq!(f.out_bd, 32);
+    assert_eq!(f.info.channels, 2);
+    assert!(!f.use_file_transcode);
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    assert_eq!(
+        orch.format_de_sortie_pour_test(&req)
+            .await
+            .map(|f| f.out_sr),
+        Err("bitperfect_strict_refused:176400:88200".into())
+    );
+    super::resolve_local::cadences_pcm_de_test()
+        .lock()
+        .unwrap()
+        .remove(id);
+}
+
 /// #8404 — fil 2748 : un second appareil lance un autre titre sur la zone
 /// DLNA où joue déjà la tablette. Mesure de l'hypothèse « le flux du titre
 /// remplacé n'est pas libéré » : après le remplacement, la session de la
@@ -11746,4 +11814,81 @@ async fn remplacer_la_lecture_d_une_zone_dlna_ferme_le_flux_remplace_8404() {
         url.contains(&sid_portable),
         "le renderer doit avoir reçu le flux du portable : {url}"
     );
+}
+
+/// #8671 — sonde factice, aucun flux ni périphérique audio ouvert.
+#[tokio::test]
+async fn cadence_8671_pcm_decodeur_metadata_strict_et_fixe() {
+    let orch = test_orchestrator();
+    let id = "local:wasapi-synthetique-8671";
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("Casque 48 kHz", Some("local"), Some(id))
+        .unwrap();
+    piste_192k_3973(&orch);
+    orch.db
+        .execute("UPDATE tracks SET sample_rate = 44100 WHERE id = 1", &[])
+        .unwrap();
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.output_device_id = Some(id.into());
+    super::resolve_local::cadences_pcm_de_test()
+        .lock()
+        .unwrap()
+        .insert(id.into(), vec![48_000]);
+    let f = orch
+        .format_de_sortie_pour_test(&req)
+        .await
+        .expect("un pilote 48 kHz doit accepter la piste CD");
+    assert_eq!(f.out_sr, 48_000, "le décodeur doit produire 48 kHz");
+    assert_eq!(f.info.sample_rate, 48_000);
+    assert_eq!(f.info.repli_pcm_exclusif, Some((44_100, 48_000)));
+    assert!(!f.use_file_transcode);
+    let samples = vec![0.0; 44_100];
+    let pcm = crate::audio::resample::rubato_resample_batch_exact(&samples, 44_100, f.out_sr, 1);
+    assert_eq!(
+        pcm.len(),
+        48_000,
+        "une seconde de PCM doit être réellement convertie"
+    );
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    assert_eq!(
+        orch.format_de_sortie_pour_test(&req)
+            .await
+            .map(|f| f.out_sr),
+        Err("bitperfect_strict_refused:44100:48000".into())
+    );
+    settings
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "false",
+        )
+        .unwrap();
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "44100")
+        .unwrap();
+    let e = orch
+        .format_de_sortie_pour_test(&req)
+        .await
+        .err()
+        .expect("cadence fixe refusée : pas de remplacement silencieux");
+    assert!(e.contains("mode partagé"));
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let f = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(f.out_sr, 48_000);
+    assert_eq!(
+        f.info.repli_pcm_exclusif, None,
+        "la cadence fixe acceptée n’est pas un repli"
+    );
+    super::resolve_local::cadences_pcm_de_test()
+        .lock()
+        .unwrap()
+        .remove(id);
 }

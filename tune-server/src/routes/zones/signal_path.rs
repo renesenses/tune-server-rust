@@ -1888,6 +1888,7 @@ fn assembler_les_etapes_lang(
         max_sample_rate,
         cadence_pcm_servie,
         cadence_fixe_demandee,
+        repli_pcm_exclusif,
         // #4354 — la description des étapes n'en a pas besoin : le drapeau ne
         // sert qu'au verdict de transport et au badge PURE.
         dsd_decime_en_pcm: _,
@@ -2222,7 +2223,16 @@ fn assembler_les_etapes_lang(
     // c'est elle que le client affiche « 192 → 96 kHz, pas bit-perfect », et
     // elle qui fait dire « PURE dégradé » (`pure_degraded`).
     let mut rate_conversion: Option<(u32, u32)> = None;
-    if let Some((de, vers)) = dsd_reechantillonne {
+    if let Some((de, vers)) = repli_pcm_exclusif {
+        rate_conversion = Some((de, vers));
+        steps.push(json!({
+            "name": "Resampler", "code": "rate_conversion",
+            "reason": "wasapi_exclusive_rate_unsupported",
+            "from_hz": de, "to_hz": vers,
+            "description": fs(lang, "wasapi_rate_fallback", &[&(de as f64 / 1000.0).to_string(), &(vers as f64 / 1000.0).to_string()]),
+            "bit_perfect": false,
+        }));
+    } else if let Some((de, vers)) = dsd_reechantillonne {
         rate_conversion = Some((de, vers));
         steps.push(json!({
             "name": "Resampler", "code": "rate_conversion",
@@ -3171,6 +3181,7 @@ struct Forcages {
     /// Cadence constatée dans la session PCM, avant le périphérique (#8428).
     cadence_pcm_servie: Option<u32>,
     cadence_fixe_demandee: Option<u32>,
+    repli_pcm_exclusif: Option<(u32, u32)>,
     /// #4354 — le DSD est-il DÉCIMÉ en PCM multibit ?
     ///
     /// Vrai seulement pour une conversion de domaine réelle : ni le DSD servi
@@ -3420,6 +3431,7 @@ fn decider_les_forcages(
             })
             .map(|w| w.sample_rate),
         cadence_fixe_demandee,
+        repli_pcm_exclusif: wire.and_then(|w| w.repli_pcm_exclusif),
         dsd_decime_en_pcm,
     }
 }
