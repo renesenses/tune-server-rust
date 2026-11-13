@@ -266,7 +266,7 @@ async fn controle_parental_aucun_titre_ajoute() {
 }
 
 #[tokio::test]
-async fn migration_151_active_la_radio_des_zones_au_reglage_par_defaut() {
+async fn migration_152_active_la_radio_des_zones_au_reglage_par_defaut() {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     crate::db::migrations::run_migrations(&db).unwrap();
@@ -274,7 +274,7 @@ async fn migration_151_active_la_radio_des_zones_au_reglage_par_defaut() {
         "INSERT INTO zones (id, name, autoplay_enabled) VALUES (1, 'Défaut', 0);
          INSERT INTO zones (id, name, autoplay_enabled) VALUES (2, 'Album', 'random_album');
          INSERT INTO zones (id, name, autoplay_enabled) VALUES (3, 'Nulle', NULL);
-         DELETE FROM _migrations WHERE version >= 151;",
+         DELETE FROM _migrations WHERE version >= 152;",
     )
     .unwrap();
     crate::db::migrations::run_migrations(&db).unwrap();

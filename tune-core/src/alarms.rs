@@ -575,6 +575,12 @@ impl AlarmScheduler {
     /// cours n'est pas interrompue et le saut est journalisé
     /// (`alarm_skipped_zone_playing`). Cyrille Moutia (fil 2111) avait vu son
     /// album Qobuz coupé par France Inter, un réveil d'essai oublié.
+    ///
+    /// #8615 (fil 2784, décision de Bertrand du 13/11) : cette règle devient
+    /// l'option `interrupt_playback` du réveil, COCHÉE par défaut. Cochée, le
+    /// réveil programmé remplace la lecture en cours, au volume (et au fondu)
+    /// du réveil (`alarm_interrupts_zone_playing`) ; décochée, la zone garde sa
+    /// musique comme avant. L'essai ne coupe jamais une lecture (#5669).
     async fn sonner(&self, alarm: &serde_json::Value, essai: bool) -> ZonesDuReveil {
         let alarm_id = alarm["id"].as_i64().unwrap_or(0);
         // Owner of this alarm: its playback is tagged to that profile's history
@@ -636,15 +642,27 @@ impl AlarmScheduler {
         let zone_repo = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone());
         let mut zones = ZonesDuReveil::default();
 
+        // #8615 — « Interrompre la lecture en cours » (cochée par défaut,
+        // décision de Bertrand du 13/11) : le réveil programmé prend la main
+        // sur une zone qui joue. Le bouton d'essai garde la règle de #5669.
+        let interrompt = !essai && interrompt_la_lecture(alarm);
+
         for &target_zone in &target_zones {
-            if self
+            let joue = self
                 .orchestrator
                 .playback
                 .get_state(target_zone)
                 .await
                 .state
-                == crate::playback::PlayState::Playing
-            {
+                == crate::playback::PlayState::Playing;
+            if joue && interrompt {
+                info!(
+                    alarm_id,
+                    name = alarm["name"].as_str().unwrap_or(""),
+                    zone_id = target_zone,
+                    "alarm_interrupts_zone_playing"
+                );
+            } else if joue {
                 info!(
                     alarm_id,
                     name = alarm["name"].as_str().unwrap_or(""),
@@ -751,7 +769,7 @@ impl AlarmScheduler {
     fn list_enabled_alarms(&self) -> Result<Vec<serde_json::Value>, String> {
         use crate::db::backend::SqlValue;
         let rows = self.db.query_many(
-            "SELECT id, name, time, days, zone_id, source_type, CAST(source_id AS TEXT), volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id FROM alarms WHERE enabled = '1'",
+            "SELECT id, name, time, days, zone_id, source_type, CAST(source_id AS TEXT), volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id, interrupt_playback FROM alarms WHERE enabled = '1'",
             &[],
         )?;
         Ok(rows
@@ -774,6 +792,7 @@ impl AlarmScheduler {
                     "days_of_week": r.get(13).and_then(SqlValue::as_str),
                     "multi_zone_ids": r.get(14).and_then(SqlValue::as_str),
                     "profile_id": r.get(15).and_then(SqlValue::as_i64),
+                    "interrupt_playback": r.get(16).and_then(SqlValue::as_i64),
                 })
             })
             .collect())
@@ -783,7 +802,7 @@ impl AlarmScheduler {
     pub fn get_alarm(&self, id: i64) -> Result<Option<serde_json::Value>, String> {
         use crate::db::backend::SqlValue;
         let row = self.db.query_one(
-            "SELECT id, name, time, days, zone_id, source_type, CAST(source_id AS TEXT), volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id FROM alarms WHERE id = ?",
+            "SELECT id, name, time, days, zone_id, source_type, CAST(source_id AS TEXT), volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id, interrupt_playback FROM alarms WHERE id = ?",
             &[&id as &dyn ToSqlValue],
         )?;
         Ok(row.map(|r| {
@@ -804,9 +823,25 @@ impl AlarmScheduler {
                 "days_of_week": r.get(13).and_then(SqlValue::as_str),
                 "multi_zone_ids": r.get(14).and_then(SqlValue::as_str),
                 "profile_id": r.get(15).and_then(SqlValue::as_i64),
+                    "interrupt_playback": r.get(16).and_then(SqlValue::as_i64),
             })
         }))
     }
+}
+
+/// #8615 — l'option « Interrompre la lecture en cours » d'un réveil. Absente
+/// ou NULL (réveil d'avant la migration 151, client qui ne l'envoie pas) :
+/// cochée, la valeur par défaut décidée le 13/11.
+pub fn interrompt_la_lecture(alarm: &serde_json::Value) -> bool {
+    let v = &alarm["interrupt_playback"];
+    v.as_bool()
+        .or_else(|| v.as_i64().map(|n| n != 0))
+        .or_else(|| {
+            v.as_str()
+                .and_then(|t| t.trim().parse::<i64>().ok())
+                .map(|n| n != 0)
+        })
+        .unwrap_or(true)
 }
 
 fn alarm_enabled(alarm: &serde_json::Value) -> bool {
@@ -986,3 +1021,6 @@ mod reprise_en_main_5669;
 
 #[cfg(test)]
 mod contenus_album_playlist_7058;
+
+#[cfg(test)]
+mod interrompre_la_lecture_8615;

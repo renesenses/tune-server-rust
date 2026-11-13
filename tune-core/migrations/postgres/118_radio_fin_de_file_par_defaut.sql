@@ -1,9 +1,9 @@
--- 117_radio_fin_de_file_par_defaut.sql
+-- 118_radio_fin_de_file_par_defaut.sql
 --
 -- Forum, fil 2694 (Ilan, 12/11/2026) ; decision de Bertrand du 13/11 : la
 -- radio de fin de file (« continuer avec des titres similaires a la fin de la
 -- file », comme Roon) est ACTIVEE par defaut. Jumelle de la migration SQLite
--- 151.
+-- 152.
 --
 -- Une seule bascule des zones au reglage « desactive » (defaut historique
 -- depuis la 046) vers « titres similaires » ('1') ; les modes nommes (#2271)
@@ -20,7 +20,7 @@ UPDATE zones SET autoplay_enabled = '1'
 
 ALTER TABLE zones ALTER COLUMN autoplay_enabled SET DEFAULT '1';
 
-INSERT INTO schema_version (version, name) VALUES (117, 'radio_fin_de_file_par_defaut')
+INSERT INTO schema_version (version, name) VALUES (118, 'radio_fin_de_file_par_defaut')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;
