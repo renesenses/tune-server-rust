@@ -1776,6 +1776,10 @@ mod signal_path_ombre_5081_tests;
 #[cfg(test)]
 mod signal_path_crossfeed_greffon_tests;
 
+// #8554 — l'étape « Contour de loudness » du chemin du signal.
+#[cfg(test)]
+mod signal_path_contour_de_sonie_8554_tests;
+
 // #6044 — l'étape « Réaffectation des canaux » du chemin du signal.
 #[cfg(test)]
 mod signal_path_reaffectation_6044_tests;

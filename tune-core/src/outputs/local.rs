@@ -562,6 +562,8 @@ mod gain_au_rendu_asio_7934;
 // #7968 — le bas de la course `db60` : un niveau distinct par position.
 #[cfg(test)]
 mod bas_de_course_db60_7968_tests;
+#[cfg(test)]
+mod contour_de_sonie_8554_tests;
 
 // #5204 — l'enchaînement sans blanc en mode exclusif : quel bras enchaîne, la
 // règle de la frontière à format égal, et la lecture de l'en-tête suivant
@@ -637,6 +639,16 @@ struct PendingNextMedia {
 // ---------------------------------------------------------------------------
 // LocalOutput — streams audio from an HTTP URL to a local audio device
 // ---------------------------------------------------------------------------
+
+/// #8554 — le contour de loudness qu'une zone demande à sa sortie locale :
+/// le réglage, et le format du flux qui va jouer (au cas où la chaîne n'a
+/// pas encore d'égaliseur pour en donner un).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContourVoulu {
+    pub reglage: crate::audio::contour_de_sonie::ReglageContour,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
 
 pub struct LocalOutput {
     device_name: String,
@@ -882,6 +894,13 @@ pub struct LocalOutput {
     /// PURE) and only when the stream is stereo. Set per-play by the
     /// orchestrator via `set_crossfeed`.
     crossfeed: Arc<std::sync::Mutex<Option<super::super::audio::crossfeed::CrossfeedProcessor>>>,
+    /// #8554 — le contour de loudness que la zone qui joue demande, avec le
+    /// format du flux : `(réglage, taux, canaux)`. `None` : aucun (désactivé,
+    /// PURE, bit-perfect strict, volume fixe sans niveau manuel). Le contour
+    /// lui-même tourne DANS l'égaliseur (`EqProcessor::poser_le_contour`),
+    /// pour suivre exactement les mêmes chemins et contournements ; cette
+    /// sortie le passe d'un égaliseur au suivant et lui transmet le volume.
+    contour_de_sonie: std::sync::Mutex<Option<ContourVoulu>>,
     /// #7614 — le choix du greffon de suréchantillonnage pour la zone qui
     /// joue, posé par l'orchestrateur avant chaque lecture et rafraîchi par
     /// la route de réglage. Lu à l'OUVERTURE seulement : l'étage d'une piste
@@ -1506,6 +1525,7 @@ impl LocalOutput {
             // exactement comme avant #1590.
             soft_mute_ms: Arc::new(AtomicU32::new(0)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
+            contour_de_sonie: std::sync::Mutex::new(None),
             surechantillonnage: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
@@ -1548,9 +1568,107 @@ impl LocalOutput {
             }
             self.eteindre_si_flux_sans_fin(&mut eq);
             self.borner_la_remontee(&mut eq);
+            // #8554 — le contour passe à l'égaliseur de la piste (même
+            // format : ses filtres gardent leur état).
+            let ancien = emplacement.as_mut().and_then(|p| p.prendre_le_contour());
             *emplacement = eq;
+            self.accrocher_le_contour(&mut emplacement, ancien);
         }
         self.recalculer_la_compensation();
+    }
+
+    /// #8554 — poser le contour de loudness de la zone qui joue (`None` :
+    /// aucun). Un contour retiré redescend à zéro en douceur avant de quitter
+    /// la chaîne ; un réglage changé est rejoint en douceur.
+    pub fn set_contour_de_sonie(&self, voulu: Option<ContourVoulu>) {
+        *self.contour_de_sonie.lock().unwrap() = voulu;
+        let mut emplacement = self.eq.lock().unwrap();
+        self.accrocher_le_contour(&mut emplacement, None);
+    }
+
+    /// #8554 — le volume de l'auditeur en dB (celui d'avant la sourdine) ;
+    /// `None` à volume nul.
+    fn volume_db_de_l_auditeur(&self) -> Option<f64> {
+        let unites = self.volume_de_l_auditeur();
+        (unites > 0).then(|| {
+            20.0 * (f64::from(unites.min(UNITE_DU_GAIN_DE_RENDU))
+                / f64::from(UNITE_DU_GAIN_DE_RENDU))
+            .log10()
+        })
+    }
+
+    /// #8554 — accrocher à l'égaliseur de `emplacement` le contour voulu :
+    /// `ancien` (ou celui qu'il porte déjà) s'il a le même format, sinon un
+    /// neuf ; un porteur sans égaliseur s'il n'y en a pas. Sans contour voulu,
+    /// l'ancien est coupé et redescend à zéro ; sous PURE il est retiré net
+    /// (la chaîne est de toute façon contournée).
+    fn accrocher_le_contour(
+        &self,
+        emplacement: &mut Option<super::super::audio::eq::EqProcessor>,
+        ancien: Option<Box<super::super::audio::contour_de_sonie::ContourDeSonie>>,
+    ) {
+        use super::super::audio::contour_de_sonie::ContourDeSonie;
+        use super::super::audio::eq::EqProcessor;
+        let ancien = ancien.or_else(|| emplacement.as_mut().and_then(|p| p.prendre_le_contour()));
+        let pure = self.pure_bypass.load(Ordering::Relaxed);
+        let voulu = if pure {
+            None
+        } else {
+            self.contour_de_sonie.lock().unwrap().clone()
+        };
+        let volume_db = self.volume_db_de_l_auditeur();
+        let contour = match voulu {
+            None => ancien.filter(|_| !pure).and_then(|mut c| {
+                c.eteindre();
+                (!c.est_au_repos()).then_some(c)
+            }),
+            Some(ContourVoulu {
+                reglage,
+                sample_rate,
+                channels,
+            }) => {
+                let (taux, canaux) = emplacement
+                    .as_ref()
+                    .map_or((sample_rate, channels), |p| (p.sample_rate(), p.channels()));
+                Some(match ancien {
+                    Some(mut c) if c.sample_rate() == taux && c.channels() == canaux => {
+                        if c.est_coupe() || c.reglage() != &reglage {
+                            c.regler(reglage);
+                        }
+                        c.suivre_le_volume(volume_db);
+                        c
+                    }
+                    _ => Box::new(ContourDeSonie::new(reglage, taux, canaux, volume_db)),
+                })
+            }
+        };
+        let Some(contour) = contour else {
+            return;
+        };
+        let hote = emplacement.get_or_insert_with(|| {
+            EqProcessor::porteur_du_contour(contour.sample_rate(), contour.channels())
+        });
+        hote.poser_le_contour(Some(contour));
+    }
+
+    /// #8554 — le volume a changé : le contour rejoint sa nouvelle consigne.
+    fn contour_suit_le_volume(&self) {
+        let volume_db = self.volume_db_de_l_auditeur();
+        if let Ok(mut eq) = self.eq.lock()
+            && let Some(c) = eq.as_mut().and_then(|p| p.contour_mut())
+        {
+            c.suivre_le_volume(volume_db);
+        }
+    }
+
+    /// #8554 — la consigne courante du contour installé (chemin du signal).
+    pub fn consigne_du_contour(&self) -> Option<super::super::audio::contour_de_sonie::Consigne> {
+        self.eq
+            .lock()
+            .ok()?
+            .as_ref()?
+            .contour()
+            .map(|c| c.consigne_courante())
     }
 
     /// #6741 — le volume que l'auditeur a demandé (celui d'avant la sourdine
@@ -1728,7 +1846,10 @@ impl LocalOutput {
         {
             let mut emplacement = self.eq.lock().unwrap();
             self.noter_le_volume_avant_l_egaliseur(&emplacement, &eq);
-            let precedent = emplacement.take();
+            let mut precedent = emplacement.take();
+            // #8554 — le contour ne prend pas part au fondu : il passe tel
+            // quel au nouvel égaliseur.
+            let ancien = precedent.as_mut().and_then(|p| p.prendre_le_contour());
             *emplacement = if self.pure_bypass.load(Ordering::Relaxed) {
                 // PURE : la chaîne est contournée, rien à fondre — et rien ne
                 // doit rester monté qui ferait croire à un DSP actif.
@@ -1743,6 +1864,7 @@ impl LocalOutput {
                 self.borner_la_remontee(&mut releve);
                 releve
             };
+            self.accrocher_le_contour(&mut emplacement, ancien);
         }
         // Verrou relâché : la compensation relit l'égaliseur ET le crossfeed.
         self.recalculer_la_compensation();
@@ -9145,6 +9267,7 @@ impl OutputTarget for LocalOutput {
             self.muted.store(false, Ordering::SeqCst);
         }
         self.reborner_le_preampli_garde();
+        self.contour_suit_le_volume();
         // #8074 — un volume est posé : `play_url` ne le remplacera plus.
         self.volume_pose.store(true, Ordering::SeqCst);
         Ok(())

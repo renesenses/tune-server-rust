@@ -2000,6 +2000,11 @@ pub fn router() -> Router<AppState> {
         )
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
         .route("/{id}/eq", get(get_eq).post(set_eq))
+        // #8554 — contour de loudness qui suit le volume, à côté de l'égaliseur.
+        .route(
+            "/{id}/eq/loudness",
+            get(super::contour_de_sonie::get_loudness).post(super::contour_de_sonie::set_loudness),
+        )
         // DSP route is in zones.rs (/{id}/dsp GET+PUT)
         .route("/{id}/crossfade", get(get_crossfade).post(set_crossfade))
         .route("/{id}/normalization", post(set_normalization))

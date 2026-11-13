@@ -137,6 +137,11 @@ pub struct EqProcessor {
     /// d'une piste à l'autre ; un égaliseur réactivé repart sans.
     libere: bool,
     clipping: CompteurDEcretage,
+    /// #8554 — le contour de loudness qui suit le volume, appliqué APRÈS
+    /// tout le reste (fondu compris) par [`Self::process_interleaved`]. Il
+    /// appartient à la sortie, pas au profil : la sortie le passe d'un
+    /// égaliseur à l'autre ([`Self::prendre_le_contour`]).
+    contour: Option<Box<super::contour_de_sonie::ContourDeSonie>>,
     closed: AtomicBool,
 }
 enum Engine {
@@ -194,6 +199,7 @@ impl EqProcessor {
             borne_de_remontee: 0.0,
             libere: false,
             clipping: Default::default(),
+            contour: None,
             closed: AtomicBool::new(false),
         }
     }
@@ -234,6 +240,7 @@ impl EqProcessor {
             borne_de_remontee: precedent.borne_de_remontee,
             libere: false,
             clipping: Default::default(),
+            contour: None,
             closed: AtomicBool::new(false),
         }
     }
@@ -383,6 +390,7 @@ impl EqProcessor {
             borne_de_remontee: self.borne_de_remontee,
             libere: self.libere,
             clipping: Default::default(),
+            contour: None,
             closed: AtomicBool::new(false),
         };
         // #6524 (b) — la part du gain reporté supérieure à 1 reprend son
@@ -582,7 +590,62 @@ impl EqProcessor {
     /// préampli : identité exacte, à retirer de la chaîne. Un neutre qui
     /// garde un préampli reste monté : il porte le niveau (décision du 10/10).
     pub fn est_neutre_au_repos(&self) -> bool {
-        self.est_neutre() && self.fondu.is_none() && self.gain_garde.is_none()
+        self.est_neutre()
+            && self.fondu.is_none()
+            && self.gain_garde.is_none()
+            // #8554 — un contour de loudness encore actif n'est pas l'identité.
+            && self.contour.as_ref().is_none_or(|c| c.est_au_repos())
+    }
+
+    /// #8554 — un égaliseur COUPÉ qui ne porte que le contour de loudness :
+    /// la zone n'a pas d'égaliseur, mais le contour doit tourner sur la même
+    /// chaîne (même place, mêmes contournements PURE et DoP).
+    pub fn porteur_du_contour(sample_rate: u32, channels: u16) -> Self {
+        Self {
+            engine: Engine::Neutre,
+            sample_rate,
+            channels,
+            fondu: None,
+            compensation: 1.0,
+            gain_moyen_db: 0.0,
+            gain_garde: None,
+            extinction: None,
+            borne_de_remontee: 0.0,
+            libere: false,
+            clipping: Default::default(),
+            contour: None,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// #8554 — retirer le contour de cet égaliseur (pour le passer au suivant
+    /// sans perdre l'état de ses filtres).
+    pub fn prendre_le_contour(&mut self) -> Option<Box<super::contour_de_sonie::ContourDeSonie>> {
+        self.contour.take()
+    }
+
+    /// #8554 — poser (ou retirer avec `None`) le contour de loudness.
+    pub fn poser_le_contour(
+        &mut self,
+        contour: Option<Box<super::contour_de_sonie::ContourDeSonie>>,
+    ) {
+        self.contour = contour;
+    }
+
+    pub fn contour(&self) -> Option<&super::contour_de_sonie::ContourDeSonie> {
+        self.contour.as_deref()
+    }
+
+    pub fn contour_mut(&mut self) -> Option<&mut super::contour_de_sonie::ContourDeSonie> {
+        self.contour.as_deref_mut()
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn channels(&self) -> u16 {
+        self.channels
     }
 
     /// #4685 — ce que cet égaliseur, réserve automatique comprise, fait
@@ -597,7 +660,7 @@ impl EqProcessor {
         // progressif d'un flux réseau) : le fondu de `prendre_la_releve` ne
         // vit que dans le chemin flottant. Le temps du fondu (300 ms), le
         // bloc y passe ; ensuite, retour au chemin entier habituel.
-        if self.fondu.is_some() || self.gain_garde.is_some() {
+        if self.fondu.is_some() || self.gain_garde.is_some() || self.contour.is_some() {
             return self.process_pcm_en_fondu(pcm, depth);
         }
         match &mut self.engine {
@@ -615,7 +678,7 @@ impl EqProcessor {
         let trame = octets * usize::from(self.channels.max(1));
         if !(2..=4).contains(&octets) || pcm.is_empty() || !pcm.len().is_multiple_of(trame) {
             self.fondu = None;
-            if self.gain_garde.is_some() {
+            if self.gain_garde.is_some() || self.contour.is_some() {
                 // Bloc illisible : le rendre tel quel plutôt que boucler.
                 return EqProcessStats::default();
             }
@@ -642,13 +705,26 @@ impl EqProcessor {
         stats
     }
     pub fn process_interleaved(&mut self, samples: &mut [f32]) -> EqProcessStats {
+        let stats = self.traiter_hors_contour(samples);
+        // #8554 — le contour EN DERNIER, après le fondu : un égaliseur qui
+        // change ne le fait ni doubler ni sauter.
+        if let Some(contour) = self.contour.as_mut() {
+            contour.process_interleaved(samples);
+            if contour.est_au_repos() {
+                self.contour = None;
+            }
+        }
+        stats
+    }
+
+    fn traiter_hors_contour(&mut self, samples: &mut [f32]) -> EqProcessStats {
         let Some(mut fondu) = self.fondu.take() else {
             return self.traiter_sans_fondu(samples);
         };
         fondu.tampon.clear();
         fondu.tampon.extend_from_slice(samples);
         if let Some(depart) = fondu.depart.as_mut() {
-            depart.process_interleaved(&mut fondu.tampon);
+            depart.traiter_hors_contour(&mut fondu.tampon);
         }
         let stats = self.traiter_sans_fondu(samples);
         let canaux = self.channels.max(1) as usize;
@@ -739,7 +815,10 @@ impl EqProcessor {
             Engine::Unavailable => "indisponible",
             Engine::Neutre => "neutre",
         };
-        format!("egaliseur:{moteur}@{}", self.sample_rate)
+        match self.contour.as_ref() {
+            Some(c) => format!("egaliseur:{moteur}@{} > {}", self.sample_rate, c.decrire()),
+            None => format!("egaliseur:{moteur}@{}", self.sample_rate),
+        }
     }
 
     pub fn is_enabled(&self) -> bool {

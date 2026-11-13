@@ -433,6 +433,67 @@ pub async fn signal_path_selon_la_sortie(
     sans_volume_d_une_sortie_non_reglable(signal_path, capacites.as_ref())
 }
 
+/// #8554 — l'étape « Contour de loudness » de la zone, ou `None` quand le
+/// réglage est éteint. `bit_perfect` n'est faux que si le contour modifie
+/// réellement le signal (actif ET non nul au volume courant).
+pub(super) fn etape_du_contour_de_sonie(
+    lang: &str,
+    zone: &Zone,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    output_type: &str,
+) -> Option<Value> {
+    use tune_core::audio::contour_de_sonie as cs;
+    let zone_id = zone.id?;
+    let local = output_type == "local"
+        || zone
+            .output_device_id
+            .as_deref()
+            .is_some_and(|d| d.starts_with("local:"));
+    let (reglage, etat) = cs::etat_de_la_zone(backend, zone_id, local);
+    if etat == cs::EtatDuContour::Desactive {
+        return None;
+    }
+    let apercu = cs::apercu(&reglage, cs::volume_db_du_gain(zone.volume));
+    let mut bit_perfect = true;
+    let description = match etat {
+        cs::EtatDuContour::Actif => match &apercu {
+            Some((a, points)) if points.iter().any(|(_, g)| g.abs() >= 0.05) => {
+                bit_perfect = false;
+                let a_63 = points.iter().find(|(f, _)| *f == 63.0).map_or(0.0, |p| p.1);
+                let a_10k = points
+                    .iter()
+                    .find(|(f, _)| *f == 10000.0)
+                    .map_or(0.0, |p| p.1);
+                fs(
+                    lang,
+                    "loudness_active",
+                    &[
+                        &format!("{a_63:+.1}"),
+                        &format!("{a_10k:+.1}"),
+                        &format!("{a:.1}"),
+                    ],
+                )
+            }
+            _ => ts(lang, "loudness_reference").to_string(),
+        },
+        cs::EtatDuContour::ContournePure => ts(lang, "loudness_pure").to_string(),
+        cs::EtatDuContour::ContourneBitPerfectStrict => ts(lang, "loudness_strict").to_string(),
+        cs::EtatDuContour::NiveauInconnu => ts(lang, "loudness_unknown").to_string(),
+        cs::EtatDuContour::SortieNonPriseEnCharge | cs::EtatDuContour::Desactive => {
+            ts(lang, "loudness_unsupported").to_string()
+        }
+    };
+    Some(json!({
+        "name": "Contour de loudness",
+        "code": "loudness_contour",
+        "status": etat.code(),
+        "description": description,
+        "bit_perfect": bit_perfect,
+        "applied": !bit_perfect,
+        "attenuation_db": apercu.as_ref().map(|(a, _)| (a * 10.0).round() / 10.0),
+    }))
+}
+
 /// Description du traitement EQ réellement configuré, y compris le headroom
 /// automatique.
 ///
@@ -1391,6 +1452,8 @@ pub fn build_signal_path_lang(
         output_type,
         runtime_signal_path,
         analyse,
+        // #8554 — lue ici : l'assemblage ne voit pas la base.
+        etape_du_contour_de_sonie(lang, zone, backend, output_type),
     );
     // Un greffon natif tiers de la famille du crossfeed, ou `crosstalk`
     // (#7616), remplace le crossfeed intégré : l'étape porte SON nom, et l'ombre de la tête du crossfeed
@@ -1784,6 +1847,7 @@ struct Etapes {
 /// `build_signal_path`, sorti tel quel, qui relit l'analyse sous les noms
 /// d'origine. Elle prend l'analyse par valeur : ses champs non copiables
 /// (descriptions, étapes optionnelles) y sont consommés.
+#[allow(clippy::too_many_arguments)]
 fn assembler_les_etapes_lang(
     lang: &str,
     ps: &ZoneState,
@@ -1792,6 +1856,7 @@ fn assembler_les_etapes_lang(
     output_type: &str,
     runtime_signal_path: Option<&OutputSignalPathStatus>,
     analyse: Analyse<'_>,
+    etape_du_contour: Option<Value>,
 ) -> Etapes {
     let (transport_bit_perfect, transport_desc, output_format_name) = analyse.transport;
     let canaux_declares = analyse.canaux_declares;
@@ -2431,6 +2496,15 @@ fn assembler_les_etapes_lang(
             "description": eq_step_description.as_deref().unwrap_or(ts(lang, "eq_on")),
             "bit_perfect": false,
         }));
+    }
+
+    // Étape « Contour de loudness » (#8554) — juste après le DSP, là où il
+    // tourne (dans l'étage de l'égaliseur de la sortie locale). Publiée dès
+    // que le réglage est allumé : un contour contourné (PURE, bit-perfect
+    // strict), sans niveau connu (volume fixe) ou que la sortie n'applique
+    // pas se DIT, comme la correction de pièce.
+    if let Some(etape) = etape_du_contour {
+        steps.push(etape);
     }
 
     // Étape « Correction de pièce » (#7632) — la réponse impulsionnelle de la

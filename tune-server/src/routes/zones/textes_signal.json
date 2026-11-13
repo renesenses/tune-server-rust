@@ -72,7 +72,13 @@
     "fixed_rate_limit_name": "Fréquence de sortie",
     "fixed_rate_limit": "{0} kHz demandé, {1} kHz appliqué",
     "dsd_natif_local": "{0} natif ({1})",
-    "volume_dsd_natif": "Volume non appliqué (DSD natif)"
+    "volume_dsd_natif": "Volume non appliqué (DSD natif)",
+    "loudness_active": "Contour de loudness ISO 226 : {0} dB à 63 Hz, {1} dB à 10 kHz ({2} dB sous la référence)",
+    "loudness_reference": "Contour de loudness ISO 226 : nul au niveau de référence",
+    "loudness_pure": "Contour de loudness contourné par PURE",
+    "loudness_strict": "Contour de loudness inactif : bit-perfect strict",
+    "loudness_unknown": "Contour de loudness inactif : volume fixe, Tune ne connaît pas le niveau d'écoute (réglez un niveau manuel)",
+    "loudness_unsupported": "Contour de loudness pas encore appliqué sur cette sortie"
   },
   "en": {
     "pregain": "auto pre-gain {0} dB",
@@ -147,7 +153,13 @@
     "fixed_rate_limit_name": "Output sample rate",
     "fixed_rate_limit": "{0} kHz requested, {1} kHz applied",
     "dsd_natif_local": "{0} native ({1})",
-    "volume_dsd_natif": "Volume not applied (native DSD)"
+    "volume_dsd_natif": "Volume not applied (native DSD)",
+    "loudness_active": "ISO 226 loudness contour: {0} dB at 63 Hz, {1} dB at 10 kHz ({2} dB below reference)",
+    "loudness_reference": "ISO 226 loudness contour: flat at the reference level",
+    "loudness_pure": "Loudness contour bypassed by PURE",
+    "loudness_strict": "Loudness contour inactive: strict bit-perfect",
+    "loudness_unknown": "Loudness contour inactive: fixed volume, Tune does not know the listening level (set a manual level)",
+    "loudness_unsupported": "Loudness contour not yet applied on this output"
   },
   "de": {
     "pregain": "automatische Vorverstärkung {0} dB",
@@ -222,7 +234,13 @@
     "fixed_rate_limit_name": "Ausgabe-Abtastrate",
     "fixed_rate_limit": "{0} kHz angefordert, {1} kHz angewendet",
     "dsd_natif_local": "{0} nativ ({1})",
-    "volume_dsd_natif": "Lautstärke nicht angewendet (natives DSD)"
+    "volume_dsd_natif": "Lautstärke nicht angewendet (natives DSD)",
+    "loudness_active": "Loudness-Kontur ISO 226: {0} dB bei 63 Hz, {1} dB bei 10 kHz ({2} dB unter der Referenz)",
+    "loudness_reference": "Loudness-Kontur ISO 226: neutral beim Referenzpegel",
+    "loudness_pure": "Loudness-Kontur durch PURE umgangen",
+    "loudness_strict": "Loudness-Kontur inaktiv: striktes Bit-Perfect",
+    "loudness_unknown": "Loudness-Kontur inaktiv: feste Lautstärke, Tune kennt den Abhörpegel nicht (manuellen Pegel einstellen)",
+    "loudness_unsupported": "Loudness-Kontur auf diesem Ausgang noch nicht angewendet"
   },
   "es": {
     "pregain": "preganancia automática {0} dB",
@@ -297,7 +315,13 @@
     "fixed_rate_limit_name": "Frecuencia de salida",
     "fixed_rate_limit": "{0} kHz solicitados, {1} kHz aplicados",
     "dsd_natif_local": "{0} nativo ({1})",
-    "volume_dsd_natif": "Volumen no aplicado (DSD nativo)"
+    "volume_dsd_natif": "Volumen no aplicado (DSD nativo)",
+    "loudness_active": "Contorno de loudness ISO 226: {0} dB a 63 Hz, {1} dB a 10 kHz ({2} dB bajo la referencia)",
+    "loudness_reference": "Contorno de loudness ISO 226: plano en el nivel de referencia",
+    "loudness_pure": "Contorno de loudness omitido por PURE",
+    "loudness_strict": "Contorno de loudness inactivo: bit-perfect estricto",
+    "loudness_unknown": "Contorno de loudness inactivo: volumen fijo, Tune no conoce el nivel de escucha (ajuste un nivel manual)",
+    "loudness_unsupported": "Contorno de loudness aún no aplicado en esta salida"
   },
   "it": {
     "pregain": "pre-guadagno automatico {0} dB",
@@ -372,7 +396,13 @@
     "fixed_rate_limit_name": "Frequenza di uscita",
     "fixed_rate_limit": "{0} kHz richiesti, {1} kHz applicati",
     "dsd_natif_local": "{0} nativo ({1})",
-    "volume_dsd_natif": "Volume non applicato (DSD nativo)"
+    "volume_dsd_natif": "Volume non applicato (DSD nativo)",
+    "loudness_active": "Contorno loudness ISO 226: {0} dB a 63 Hz, {1} dB a 10 kHz ({2} dB sotto il riferimento)",
+    "loudness_reference": "Contorno loudness ISO 226: nullo al livello di riferimento",
+    "loudness_pure": "Contorno loudness escluso da PURE",
+    "loudness_strict": "Contorno loudness inattivo: bit-perfect rigoroso",
+    "loudness_unknown": "Contorno loudness inattivo: volume fisso, Tune non conosce il livello di ascolto (imposta un livello manuale)",
+    "loudness_unsupported": "Contorno loudness non ancora applicato su questa uscita"
   },
   "zh": {
     "pregain": "自动预增益 {0} dB",
@@ -447,7 +477,13 @@
     "fixed_rate_limit_name": "输出采样率",
     "fixed_rate_limit": "请求 {0} kHz，实际应用 {1} kHz",
     "dsd_natif_local": "{0} 原生 ({1})",
-    "volume_dsd_natif": "未应用音量（原生 DSD）"
+    "volume_dsd_natif": "未应用音量（原生 DSD）",
+    "loudness_active": "ISO 226 响度补偿：63 Hz {0} dB，10 kHz {1} dB（低于参考 {2} dB）",
+    "loudness_reference": "ISO 226 响度补偿：在参考电平下为零",
+    "loudness_pure": "响度补偿已被 PURE 绕过",
+    "loudness_strict": "响度补偿未启用：严格比特完美",
+    "loudness_unknown": "响度补偿未启用：固定音量，Tune 不知道聆听电平（请设置手动电平）",
+    "loudness_unsupported": "此输出尚未应用响度补偿"
   },
   "ja": {
     "pregain": "自動プリアンプ {0} dB",
@@ -522,7 +558,13 @@
     "fixed_rate_limit_name": "出力サンプルレート",
     "fixed_rate_limit": "要求 {0} kHz、適用 {1} kHz",
     "dsd_natif_local": "{0} ネイティブ ({1})",
-    "volume_dsd_natif": "音量は適用されません（ネイティブ DSD）"
+    "volume_dsd_natif": "音量は適用されません（ネイティブ DSD）",
+    "loudness_active": "ISO 226 ラウドネス補正：63 Hz で {0} dB、10 kHz で {1} dB（基準より {2} dB 低い）",
+    "loudness_reference": "ISO 226 ラウドネス補正：基準レベルではフラット",
+    "loudness_pure": "ラウドネス補正は PURE によりバイパス",
+    "loudness_strict": "ラウドネス補正は無効：厳格なビットパーフェクト",
+    "loudness_unknown": "ラウドネス補正は無効：固定音量のため Tune は再生レベルを把握できません（手動レベルを設定）",
+    "loudness_unsupported": "この出力ではラウドネス補正はまだ適用されません"
   },
   "ko": {
     "pregain": "자동 프리게인 {0} dB",
@@ -597,7 +639,13 @@
     "fixed_rate_limit_name": "출력 샘플레이트",
     "fixed_rate_limit": "요청 {0} kHz, 적용 {1} kHz",
     "dsd_natif_local": "{0} 네이티브 ({1})",
-    "volume_dsd_natif": "볼륨 미적용 (네이티브 DSD)"
+    "volume_dsd_natif": "볼륨 미적용 (네이티브 DSD)",
+    "loudness_active": "ISO 226 라우드니스 보정: 63 Hz에서 {0} dB, 10 kHz에서 {1} dB (기준보다 {2} dB 낮음)",
+    "loudness_reference": "ISO 226 라우드니스 보정: 기준 레벨에서 평탄",
+    "loudness_pure": "라우드니스 보정이 PURE로 우회됨",
+    "loudness_strict": "라우드니스 보정 비활성: 엄격한 비트퍼펙트",
+    "loudness_unknown": "라우드니스 보정 비활성: 고정 볼륨이라 Tune이 청취 레벨을 알 수 없음 (수동 레벨 설정)",
+    "loudness_unsupported": "이 출력에는 아직 라우드니스 보정이 적용되지 않음"
   },
   "ro": {
     "pregain": "pre-amplificare automată {0} dB",
@@ -672,7 +720,13 @@
     "fixed_rate_limit_name": "Frecvența de ieșire",
     "fixed_rate_limit": "{0} kHz solicitat, {1} kHz aplicat",
     "dsd_natif_local": "{0} nativ ({1})",
-    "volume_dsd_natif": "Volum neaplicat (DSD nativ)"
+    "volume_dsd_natif": "Volum neaplicat (DSD nativ)",
+    "loudness_active": "Contur de loudness ISO 226: {0} dB la 63 Hz, {1} dB la 10 kHz ({2} dB sub referință)",
+    "loudness_reference": "Contur de loudness ISO 226: nul la nivelul de referință",
+    "loudness_pure": "Contur de loudness ocolit de PURE",
+    "loudness_strict": "Contur de loudness inactiv: bit-perfect strict",
+    "loudness_unknown": "Contur de loudness inactiv: volum fix, Tune nu cunoaște nivelul de ascultare (setați un nivel manual)",
+    "loudness_unsupported": "Contur de loudness încă neaplicat pe această ieșire"
   },
   "sv": {
     "pregain": "automatisk förförstärkning {0} dB",
@@ -747,7 +801,13 @@
     "fixed_rate_limit_name": "Utgångens samplingsfrekvens",
     "fixed_rate_limit": "{0} kHz begärd, {1} kHz tillämpad",
     "dsd_natif_local": "{0} inbyggt ({1})",
-    "volume_dsd_natif": "Volym tillämpas inte (inbyggt DSD)"
+    "volume_dsd_natif": "Volym tillämpas inte (inbyggt DSD)",
+    "loudness_active": "Loudness-kontur ISO 226: {0} dB vid 63 Hz, {1} dB vid 10 kHz ({2} dB under referensen)",
+    "loudness_reference": "Loudness-kontur ISO 226: neutral vid referensnivån",
+    "loudness_pure": "Loudness-kontur förbigås av PURE",
+    "loudness_strict": "Loudness-kontur inaktiv: strikt bit-perfect",
+    "loudness_unknown": "Loudness-kontur inaktiv: fast volym, Tune känner inte till lyssningsnivån (ställ in en manuell nivå)",
+    "loudness_unsupported": "Loudness-kontur tillämpas ännu inte på denna utgång"
   },
   "vi": {
     "pregain": "tiền khuếch đại tự động {0} dB",
@@ -822,7 +882,13 @@
     "fixed_rate_limit_name": "Tần số lấy mẫu đầu ra",
     "fixed_rate_limit": "Yêu cầu {0} kHz, áp dụng {1} kHz",
     "dsd_natif_local": "{0} gốc ({1})",
-    "volume_dsd_natif": "Không áp dụng âm lượng (DSD gốc)"
+    "volume_dsd_natif": "Không áp dụng âm lượng (DSD gốc)",
+    "loudness_active": "Bù loudness ISO 226: {0} dB tại 63 Hz, {1} dB tại 10 kHz (thấp hơn mức tham chiếu {2} dB)",
+    "loudness_reference": "Bù loudness ISO 226: phẳng ở mức tham chiếu",
+    "loudness_pure": "Bù loudness bị PURE bỏ qua",
+    "loudness_strict": "Bù loudness không hoạt động: bit-perfect nghiêm ngặt",
+    "loudness_unknown": "Bù loudness không hoạt động: âm lượng cố định, Tune không biết mức nghe (hãy đặt mức thủ công)",
+    "loudness_unsupported": "Bù loudness chưa được áp dụng trên đầu ra này"
   },
   "hu": {
     "pregain": "automatikus előerősítés {0} dB",
@@ -897,7 +963,13 @@
     "fixed_rate_limit_name": "Kimeneti mintavételi frekvencia",
     "fixed_rate_limit": "Kért: {0} kHz, alkalmazott: {1} kHz",
     "dsd_natif_local": "{0} natív ({1})",
-    "volume_dsd_natif": "Hangerő nincs alkalmazva (natív DSD)"
+    "volume_dsd_natif": "Hangerő nincs alkalmazva (natív DSD)",
+    "loudness_active": "ISO 226 loudness-kontúr: {0} dB 63 Hz-en, {1} dB 10 kHz-en ({2} dB-lel a referencia alatt)",
+    "loudness_reference": "ISO 226 loudness-kontúr: a referenciaszinten semleges",
+    "loudness_pure": "A loudness-kontúrt a PURE megkerüli",
+    "loudness_strict": "A loudness-kontúr inaktív: szigorú bit-perfect",
+    "loudness_unknown": "A loudness-kontúr inaktív: fix hangerő, a Tune nem ismeri a hallgatási szintet (állítson be kézi szintet)",
+    "loudness_unsupported": "A loudness-kontúr ezen a kimeneten még nem érvényes"
   },
   "nb": {
     "pregain": "automatisk forsterkning før behandling {0} dB",
@@ -972,7 +1044,13 @@
     "fixed_rate_limit_name": "Samplingsfrekvens ut",
     "fixed_rate_limit": "{0} kHz forespurt, {1} kHz brukt",
     "dsd_natif_local": "{0} native ({1})",
-    "volume_dsd_natif": "Volum ikke brukt (native DSD)"
+    "volume_dsd_natif": "Volum ikke brukt (native DSD)",
+    "loudness_active": "Loudness-kontur ISO 226: {0} dB ved 63 Hz, {1} dB ved 10 kHz ({2} dB under referansen)",
+    "loudness_reference": "Loudness-kontur ISO 226: nøytral ved referansenivået",
+    "loudness_pure": "Loudness-kontur forbigått av PURE",
+    "loudness_strict": "Loudness-kontur inaktiv: streng bit-perfect",
+    "loudness_unknown": "Loudness-kontur inaktiv: fast volum, Tune kjenner ikke lyttenivået (still inn et manuelt nivå)",
+    "loudness_unsupported": "Loudness-kontur brukes ennå ikke på denne utgangen"
   },
   "pl": {
     "pregain": "automatyczne wzmocnienie wstępne {0} dB",
@@ -1047,7 +1125,13 @@
     "fixed_rate_limit_name": "Częstotliwość wyjściowa",
     "fixed_rate_limit": "Żądano {0} kHz, zastosowano {1} kHz",
     "dsd_natif_local": "{0} natywny ({1})",
-    "volume_dsd_natif": "Głośność nie jest stosowana (natywne DSD)"
+    "volume_dsd_natif": "Głośność nie jest stosowana (natywne DSD)",
+    "loudness_active": "Kontur loudness ISO 226: {0} dB przy 63 Hz, {1} dB przy 10 kHz ({2} dB poniżej odniesienia)",
+    "loudness_reference": "Kontur loudness ISO 226: płaski na poziomie odniesienia",
+    "loudness_pure": "Kontur loudness pominięty przez PURE",
+    "loudness_strict": "Kontur loudness nieaktywny: ścisły bit-perfect",
+    "loudness_unknown": "Kontur loudness nieaktywny: stała głośność, Tune nie zna poziomu odsłuchu (ustaw poziom ręczny)",
+    "loudness_unsupported": "Kontur loudness nie jest jeszcze stosowany na tym wyjściu"
   },
   "el": {
     "pregain": "αυτόματη προ-ενίσχυση {0} dB",
@@ -1122,6 +1206,12 @@
     "fixed_rate_limit_name": "Συχνότητα δειγματοληψίας εξόδου",
     "fixed_rate_limit": "Ζητήθηκαν {0} kHz, εφαρμόστηκαν {1} kHz",
     "dsd_natif_local": "{0} εγγενές ({1})",
-    "volume_dsd_natif": "Η ένταση δεν εφαρμόζεται (εγγενές DSD)"
+    "volume_dsd_natif": "Η ένταση δεν εφαρμόζεται (εγγενές DSD)",
+    "loudness_active": "Καμπύλη loudness ISO 226: {0} dB στα 63 Hz, {1} dB στα 10 kHz ({2} dB κάτω από την αναφορά)",
+    "loudness_reference": "Καμπύλη loudness ISO 226: επίπεδη στη στάθμη αναφοράς",
+    "loudness_pure": "Η καμπύλη loudness παρακάμπτεται από το PURE",
+    "loudness_strict": "Καμπύλη loudness ανενεργή: αυστηρό bit-perfect",
+    "loudness_unknown": "Καμπύλη loudness ανενεργή: σταθερή ένταση, το Tune δεν γνωρίζει τη στάθμη ακρόασης (ορίστε χειροκίνητη στάθμη)",
+    "loudness_unsupported": "Η καμπύλη loudness δεν εφαρμόζεται ακόμη σε αυτή την έξοδο"
   }
 }

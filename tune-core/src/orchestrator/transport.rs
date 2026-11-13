@@ -2429,6 +2429,11 @@ impl PlaybackOrchestrator {
                     // #6211 — une radio n'a pas de piste suivante : le
                     // préampli gardé d'un égaliseur coupé s'y éteint en fondu.
                     local_output.set_flux_sans_fin(media.live_stream);
+                    // #8554 — le contour de loudness AVANT l'égaliseur : `set_eq`
+                    // le passe au processeur de la piste. `None` sous PURE et
+                    // en bit-perfect strict.
+                    local_output
+                        .set_contour_de_sonie(self.contour_de_sonie_voulu(zone_id, cf_sr, eq_ch));
                     local_output.set_eq(self.load_eq_processor(zone_id, cf_sr, eq_ch));
                     // Repli mono (#2362) — sortie LOCALE uniquement, comme le
                     // crossfeed juste au-dessus. `zone_mono_downmix` rend

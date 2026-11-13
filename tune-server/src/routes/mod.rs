@@ -18,6 +18,7 @@ pub mod cloud_error;
 #[cfg(test)]
 mod compression_tests_7619;
 pub mod connect;
+pub mod contour_de_sonie;
 pub(crate) mod convert_destination;
 pub mod converter;
 pub(crate) mod corps_json_optionnel;

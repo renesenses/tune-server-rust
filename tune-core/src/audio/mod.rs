@@ -21,6 +21,7 @@ pub mod channels;
 /// #5071 — la compensation de niveau cuite dans le flux réseau, bornée à la
 /// crête (jamais d'écrêtage).
 pub mod compensation_reseau;
+pub mod contour_de_sonie;
 pub mod convolver;
 pub mod coupure_connue_8483;
 pub mod crete_de_sortie;
