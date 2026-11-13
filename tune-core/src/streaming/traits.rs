@@ -747,6 +747,19 @@ pub enum RubriqueRetirable {
 /// panne. Valeur : `1`.
 pub const ENTETE_RUBRIQUE_RETIREE: &str = "x-tune-rubrique-retiree";
 
+/// #8481 — le pays dont le service sert le catalogue.
+///
+/// `du_compte` est celui que le compte annonce ; `choisi`, celui que
+/// l'utilisateur impose dans les Réglages (comme « PL » dans LMS) ; `effectif`,
+/// celui qui part réellement dans les requêtes (`choisi`, à défaut
+/// `du_compte`, à défaut le repli du service).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PaysDuCatalogue {
+    pub du_compte: Option<String>,
+    pub choisi: Option<String>,
+    pub effectif: String,
+}
+
 #[async_trait::async_trait]
 pub trait StreamingService: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
@@ -754,6 +767,23 @@ pub trait StreamingService: Send + Sync {
     fn name(&self) -> &str;
     fn enabled(&self) -> bool;
     fn set_enabled(&mut self, enabled: bool);
+
+    /// #8481 — le pays du catalogue, pour les services qui le laissent
+    /// choisir. `None` : le service ne le permet pas (Qobuz, par exemple, sert
+    /// toujours le magasin du compte, aucune requête n'accepte de pays).
+    fn pays_du_catalogue(&self) -> Option<PaysDuCatalogue> {
+        None
+    }
+
+    /// #8481 — imposer (`Some("PL")`) ou rendre au compte (`None`) le pays du
+    /// catalogue. Refuse un code qui n'est pas ISO 3166-1 alpha-2, et tout
+    /// service qui ne le permet pas.
+    fn choisir_le_pays_du_catalogue(&mut self, _pays: Option<&str>) -> Result<(), String> {
+        Err(format!(
+            "{} : le pays du catalogue ne se choisit pas",
+            self.name()
+        ))
+    }
 
     async fn authenticate(
         &mut self,
