@@ -70,6 +70,9 @@ services:
 
 volumes:
   tune-data:
+    # Le volume de `docker run -v tune-data:/data`. Sans `name`, Compose en
+    # créerait un autre (`<projet>_tune-data`), vide : base et réglages perdus.
+    name: tune-data
 ```
 
 Remplacez `/volume1/music` par le dossier de votre NAS. L'écran **Volume** de
