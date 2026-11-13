@@ -355,6 +355,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         if !exclude_patterns.is_empty() {
             info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
         }
+        // #7478 — avec les motifs par emplacement.
+        let exclusions_scan = exclusions_du_scan(&db);
         // #6019 (Tades, fil 2195, Tune OS) — le scan de DÉMARRAGE parcourait
         // et `stat`ait toute la bibliothèque sans un mot sur le bus : sur trois
         // montages réseau, plusieurs minutes où `scan/status` dit « scanning »
@@ -373,9 +375,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // #5552 — « Arrêter » est lu à chaque entrée du parcours. Interrompu,
         // il ne rend aucune liste, et le scan s'arrête sans rien écrire : une
         // liste partielle ferait croire à des fichiers disparus.
-        let Some(list_result) = tune_core::scanner::walker::list_audio_files_avec_arret(
+        let Some(list_result) = tune_core::scanner::walker::list_audio_files_avec_exclusions(
             &music_dirs,
-            &exclude_patterns,
+            &exclusions_scan,
             tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
             &mut |p| {
                 event_bus.emit(
@@ -1160,7 +1162,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             let examinees = pistes_locales.len();
             for (&db_path, &track_id) in &pistes_locales {
                 if !discovered_paths.contains(db_path) {
-                    match verdict_purge(
+                    match crate::routes::system::scan::verdict_purge_avec_exclusions(
+                        &exclusions_scan,
                         db_path,
                         &music_dirs,
                         &missing_dirs,
@@ -1217,7 +1220,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 &discovered_paths,
                 None,
                 |chemin| {
-                    verdict_purge(
+                    crate::routes::system::scan::verdict_purge_avec_exclusions(
+                        &exclusions_scan,
                         chemin,
                         &music_dirs,
                         &missing_dirs,
@@ -1713,6 +1717,54 @@ pub(crate) fn scan_exclude_patterns(
         .unwrap_or_default()
 }
 
+/// #7478 — les exclusions par emplacement enregistrées (liste vide si le
+/// réglage manque ou ne se lit pas).
+pub(crate) fn regles_par_emplacement(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Vec<tune_core::scanner::exclusions::ExclusionsDEmplacement> {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get(tune_core::scanner::exclusions::CLE_EXCLUSIONS_PAR_EMPLACEMENT)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// #7478 — toutes les exclusions du scan : globales et par emplacement.
+pub(crate) fn exclusions_du_scan(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> tune_core::scanner::exclusions::Exclusions {
+    tune_core::scanner::exclusions::Exclusions::new(
+        &scan_exclude_patterns(db),
+        &regles_par_emplacement(db),
+    )
+}
+
+/// #7478 — les exclusions que lit la surveillance des dossiers, rechargées à
+/// chaque changement de réglage : plus besoin de redémarrer.
+static EXCLUSIONS_DU_SURVEILLANT: std::sync::RwLock<
+    Option<std::sync::Arc<tune_core::scanner::exclusions::Exclusions>>,
+> = std::sync::RwLock::new(None);
+
+/// Relire les exclusions pour la surveillance des dossiers.
+pub(crate) fn recharger_les_exclusions(db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) {
+    let nouvelles = std::sync::Arc::new(exclusions_du_scan(db));
+    if let Ok(mut e) = EXCLUSIONS_DU_SURVEILLANT.write() {
+        *e = Some(nouvelles);
+    }
+}
+
+/// Les exclusions courantes de la surveillance (vides avant le premier
+/// chargement).
+pub(crate) fn exclusions_du_surveillant()
+-> std::sync::Arc<tune_core::scanner::exclusions::Exclusions> {
+    EXCLUSIONS_DU_SURVEILLANT
+        .read()
+        .ok()
+        .and_then(|e| e.clone())
+        .unwrap_or_default()
+}
+
 /// How long to wait before re-checking a freshly-changed file's size. A file
 /// still being written — a large copy in progress, a download, or a file
 /// produced in real time — fires Create/Modify events while incomplete; scanning
@@ -1742,6 +1794,9 @@ fn settle_partition(
     for change in changes {
         let path_l = change.path.to_lowercase();
         if !excludes.is_empty() && excludes.iter().any(|x| path_l.contains(x.as_str())) {
+            continue;
+        }
+        if exclusions_du_surveillant().exclut_par_emplacement(&change.path) {
             continue;
         }
         if tune_core::scanner::is_tune_temp_file(std::path::Path::new(&change.path)) {
@@ -3089,6 +3144,10 @@ fn ecarte_du_surveillant(chemin: &str, exclusions: &[String]) -> bool {
             return true;
         }
     }
+    // #7478 — les motifs par emplacement, rechargés sans redémarrage.
+    if exclusions_du_surveillant().exclut_par_emplacement(chemin) {
+        return true;
+    }
     // Tune's own streaming temp files (tune-stream-*/
     // tune-prefetch-* in %TEMP%) fire watcher events on every
     // transcode when the library root is a parent of the temp
@@ -3298,7 +3357,9 @@ fn suivre_les_images_de_pochette(
     let mut albums = std::collections::BTreeSet::new();
     for image in images {
         let chemin_l = image.path.to_lowercase();
-        if exclusions.iter().any(|x| chemin_l.contains(x.as_str())) {
+        if exclusions.iter().any(|x| chemin_l.contains(x.as_str()))
+            || exclusions_du_surveillant().exclut_par_emplacement(&image.path)
+        {
             continue;
         }
         let Some(dossier) = std::path::Path::new(&image.path).parent() else {
@@ -3743,11 +3804,7 @@ pub fn spawn_file_watcher(
             if !stale.is_empty() {
                 info!(count = stale.len(), "file_watcher_drained_stale_events");
             }
-            let watcher_excludes: Vec<String> = scan_exclude_patterns(&db)
-                .iter()
-                .map(|p| p.trim().to_lowercase())
-                .filter(|p| !p.is_empty())
-                .collect();
+            recharger_les_exclusions(&db);
             let watcher_quality_split =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
                     .get("quality_split")
@@ -3798,6 +3855,9 @@ pub fn spawn_file_watcher(
                 // only complete files — no more 0-byte/truncated snapshots of a
                 // file captured mid-write. One recheck sleep for the whole batch.
                 changes.append(&mut pending_settle);
+                // #7478 — relues à chaque lot : un réglage changé vaut tout de
+                // suite, sans redémarrage.
+                let watcher_excludes: Vec<String> = exclusions_du_surveillant().globales().to_vec();
                 let (changes, still_writing) = settle_partition(changes, &watcher_excludes);
                 pending_settle = still_writing;
                 // Fil 2134 — les écritures de Tune lui-même (gravure des DR,
@@ -3880,6 +3940,10 @@ mod surveillant_retouche_tests_4896;
 #[cfg(test)]
 #[path = "surveillant_dossiers_tests_4896.rs"]
 mod surveillant_dossiers_tests_4896;
+
+#[cfg(test)]
+#[path = "exclusions_surveillant_7478_tests.rs"]
+mod exclusions_surveillant_7478_tests;
 
 #[cfg(test)]
 #[path = "surveillant_fichier_renomme_tests_4896.rs"]

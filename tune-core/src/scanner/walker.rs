@@ -1430,11 +1430,25 @@ pub fn list_audio_files_avec_arret(
     on_progress: &mut dyn FnMut(ProgressionParcours<'_>),
     arret: &dyn Fn() -> bool,
 ) -> Option<ListAudioResult> {
-    let excludes: Vec<String> = exclude_patterns
-        .iter()
-        .map(|p| p.trim().to_lowercase())
-        .filter(|p| !p.is_empty())
-        .collect();
+    list_audio_files_avec_exclusions(
+        dirs,
+        &crate::scanner::exclusions::Exclusions::globales_seules(exclude_patterns),
+        cadence,
+        on_progress,
+        arret,
+    )
+}
+
+/// Comme [`list_audio_files_avec_arret`], avec les exclusions PAR EMPLACEMENT
+/// (#7478) en plus des sous-chaînes globales.
+pub fn list_audio_files_avec_exclusions(
+    dirs: &[String],
+    exclusions: &crate::scanner::exclusions::Exclusions,
+    cadence: std::time::Duration,
+    on_progress: &mut dyn FnMut(ProgressionParcours<'_>),
+    arret: &dyn Fn() -> bool,
+) -> Option<ListAudioResult> {
+    let excludes: Vec<String> = exclusions.globales().to_vec();
     let skip_set: HashSet<&str> = SKIP_DIRS.iter().copied().collect();
 
     let mut files = Vec::new();
@@ -1489,7 +1503,9 @@ pub fn list_audio_files_avec_arret(
         // Illisible, elle est NOMMÉE et protégée de la purge comme un NAS
         // démonté (`missing_dirs`), jamais rendue en liste partielle.
         if crate::sources_reseau::est_chemin_distant(&normalized) {
-            let garder = |nom: &str| fichier_distant_retenu(nom, &excludes);
+            let garder = |nom: &str| {
+                fichier_distant_retenu(nom, &excludes) && !exclusions.exclut_par_emplacement(nom)
+            };
             match crate::sources_reseau::parcourir_la_racine(
                 &normalized,
                 &garder,
@@ -1589,6 +1605,14 @@ pub fn list_audio_files_avec_arret(
                         debug!(path = %e.path().display(), "scan_excluded_by_pattern");
                         return false;
                     }
+                }
+                // #7478 — les motifs de l'emplacement : un dossier écarté
+                // n'est pas descendu, un fichier écarté n'est pas lu.
+                if exclusions.a_des_exclusions_par_emplacement()
+                    && exclusions.exclut_par_emplacement(&e.path().to_string_lossy())
+                {
+                    debug!(path = %e.path().display(), "scan_exclu_par_l_emplacement");
+                    return false;
                 }
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy();

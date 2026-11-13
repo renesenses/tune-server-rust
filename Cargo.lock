@@ -6653,6 +6653,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "getrandom 0.2.17",
+ "glob",
  "hmac 0.12.1",
  "hostname",
  "http-body-util",

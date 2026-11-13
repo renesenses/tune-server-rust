@@ -4,6 +4,7 @@ pub mod compilation;
 pub mod cue;
 pub mod cue_album;
 pub mod cue_bibliotheque;
+pub mod exclusions;
 pub mod hasher;
 pub mod obstacle;
 pub mod quality;

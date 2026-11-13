@@ -1853,6 +1853,15 @@ pub(super) async fn update_config(
     if let Some(refus) = refus_des_cles_protegees(&state, values.keys().map(String::as_str)) {
         return Ok(refus);
     }
+    // #7478 — les exclusions par emplacement retirent des pistes : elles ne
+    // s'écrivent que par leur route, qui exige la confirmation du nombre.
+    if values.contains_key(tune_core::scanner::exclusions::CLE_EXCLUSIONS_PAR_EMPLACEMENT) {
+        return Err(AppError::bad_request(
+            "scan_exclusions_par_emplacement : passer par PUT /system/scan-exclusions",
+        ));
+    }
+    let exclusions_globales_touchees =
+        values.contains_key(tune_core::scanner::exclusions::CLE_EXCLUSIONS_GLOBALES);
     if let Some(value) = values.get(tune_core::db::listening_resume::REWIND_KEY) {
         if value
             .as_u64()
@@ -2077,6 +2086,10 @@ pub(super) async fn update_config(
             return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
         }
         cles_posees.push(key);
+    }
+    // #7478 — la surveillance des dossiers relit ses exclusions tout de suite.
+    if exclusions_globales_touchees {
+        crate::auto_scan::recharger_les_exclusions(&state.backend);
     }
     if scan_au_demarrage_efface {
         let cle = crate::auto_scan::CLE_SCAN_AU_DEMARRAGE;
