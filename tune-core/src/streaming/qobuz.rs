@@ -2477,7 +2477,10 @@ impl QobuzService {
             albums.extend(
                 items
                     .iter()
-                    .map(|item| Self::map_album(&Self::album_depuis_release(item))),
+                    .map(|item| Self::map_album(&Self::album_depuis_release(item)))
+                    // Un élément sans `id` donnerait une vignette impossible
+                    // à ouvrir : écarté, et le repli joue si rien ne reste.
+                    .filter(|a| !a.id.is_empty()),
             );
             offset += items.len();
             if items.is_empty() || page["has_more"].as_bool() != Some(true) {
@@ -9419,6 +9422,16 @@ mod tests_nouveautes_du_lecteur_8646 {
     /// `discover_ok` : la route du lecteur répond (deux pages si
     /// `deux_pages`) ; sinon elle rend un 401 comme sans session.
     async fn qobuz_simule(discover_ok: bool, deux_pages: bool) -> (String, Vus) {
+        qobuz_simule_complet(discover_ok, deux_pages, false).await
+    }
+
+    /// `sans_id` : la route du lecteur répond 200, mais avec des éléments
+    /// sans `id` (ou qui ne sont pas des objets).
+    async fn qobuz_simule_complet(
+        discover_ok: bool,
+        deux_pages: bool,
+        sans_id: bool,
+    ) -> (String, Vus) {
         let vus: Vus = Arc::default();
         let (note_d, note_f) = (vus.clone(), vus.clone());
         let app = Router::new()
@@ -9438,7 +9451,11 @@ mod tests_nouveautes_du_lecteur_8646 {
                                     "message": "User authentication is required."})),
                             );
                         }
-                        let corps = if offset == "0" {
+                        let corps = if sans_id {
+                            let mut sans = release_u2();
+                            sans.as_object_mut().expect("objet").remove("id");
+                            json!({"has_more": false, "items": [sans, "pas un objet", null]})
+                        } else if offset == "0" {
                             json!({"has_more": deux_pages, "items": [release_u2()]})
                         } else {
                             let mut autre = release_u2();
@@ -9571,6 +9588,23 @@ mod tests_nouveautes_du_lecteur_8646 {
             chemins(&vus),
             vec!["/discover/newReleases", "/album/getFeatured"]
         );
+        assert_eq!(albums[0].title, "Requiem for a Village");
+    }
+
+    /// Un 200 dont aucun élément n'a d'`id` ne donne pas de vignettes
+    /// vides : tout est écarté et le repli sur `getFeatured` joue.
+    #[tokio::test]
+    async fn des_elements_sans_id_retombent_sur_getfeatured() {
+        let (base, vus) = qobuz_simule_complet(true, false, true).await;
+        let svc = QobuzService::connecte_a_base_forcee(base);
+
+        let albums = svc.get_genre_albums("112", 50).await.expect("repli");
+
+        assert_eq!(
+            chemins(&vus),
+            vec!["/discover/newReleases", "/album/getFeatured"]
+        );
+        assert!(albums.iter().all(|a| !a.id.is_empty()));
         assert_eq!(albums[0].title, "Requiem for a Village");
     }
 
