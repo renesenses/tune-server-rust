@@ -243,9 +243,13 @@ async fn wrapped(
 
     let top_artists: Vec<Value> = b
         .query_many(
-            "SELECT artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' AND artist_name IS NOT NULL \
-             GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
+            // #8645 — ni l'émission d'un podcast, ni une radio.
+            &format!(
+                "SELECT artist_name, COUNT(*) as plays FROM listen_history \
+                 WHERE listened_at >= ? AND listened_at < ? AND {} AND artist_name IS NOT NULL \
+                 GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
+                tune_core::db::history_repo::ECOUTE_D_ARTISTE
+            ),
             &[
                 &year_start as &dyn tune_core::db::backend::ToSqlValue,
                 &year_end,

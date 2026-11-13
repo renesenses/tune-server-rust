@@ -4,6 +4,7 @@ use serde::Serialize;
 use tracing::info;
 
 use crate::db::backend::{DbBackend, ToSqlValue};
+use crate::db::history_repo::ECOUTE_D_ARTISTE;
 
 // ---------------------------------------------------------------------------
 // DigestReport — the full weekly listening report
@@ -85,9 +86,11 @@ pub fn generate_digest(backend: &Arc<dyn DbBackend>) -> Result<DigestReport, Str
     // --- Top 5 artists this week ---
     let artist_rows = backend
         .query_many(
-            "SELECT artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' AND artist_name IS NOT NULL \
-             GROUP BY artist_name ORDER BY plays DESC LIMIT 5",
+            &format!(
+                "SELECT artist_name, COUNT(*) as plays FROM listen_history \
+                 WHERE listened_at >= ? AND listened_at < ? AND {ECOUTE_D_ARTISTE} AND artist_name IS NOT NULL \
+                 GROUP BY artist_name ORDER BY plays DESC LIMIT 5"
+            ),
             &[&week_start as &dyn ToSqlValue, &week_end],
         )
         .unwrap_or_default();
@@ -122,11 +125,13 @@ pub fn generate_digest(backend: &Arc<dyn DbBackend>) -> Result<DigestReport, Str
     // --- New artists discovered (first play ever was this week) ---
     let new_rows = backend
         .query_many(
-            "SELECT artist_name FROM listen_history \
-             WHERE artist_name IS NOT NULL AND COALESCE(source, '') <> 'radio' \
-             GROUP BY artist_name \
-             HAVING MIN(listened_at) >= ? AND MIN(listened_at) < ? \
-             ORDER BY COUNT(*) DESC LIMIT 10",
+            &format!(
+                "SELECT artist_name FROM listen_history \
+                 WHERE artist_name IS NOT NULL AND {ECOUTE_D_ARTISTE} \
+                 GROUP BY artist_name \
+                 HAVING MIN(listened_at) >= ? AND MIN(listened_at) < ? \
+                 ORDER BY COUNT(*) DESC LIMIT 10"
+            ),
             &[&week_start as &dyn ToSqlValue, &week_end],
         )
         .unwrap_or_default();
