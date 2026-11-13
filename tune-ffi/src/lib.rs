@@ -15,6 +15,10 @@
 //! - `tune_server_defer_network_discovery(defer)` → SSDP/mDNS différés
 //!   jusqu'au premier usage (#8189, permission « réseau local » d'iOS)
 //! - `tune_server_start_network_discovery()` → ouvre la découverte
+//! - `tune_server_set_master_key(key, len)` → clé maîtresse des identifiants
+//!   des sources réseau, gardée par l'hôte (trousseau, Keystore), jamais
+//!   écrite sur disque (#8189)
+//! - `tune_server_network_changed()` → le réseau a changé (#8189)
 //!
 //! Au démarrage, comme le binaire (`bootstrap.rs`) : scan des dossiers de
 //! musique (`auto_scan`), puis surveillant de fichiers (kqueue sur iOS,
@@ -350,6 +354,47 @@ pub extern "C" fn tune_server_defer_network_discovery(defer: i32) -> i32 {
 pub extern "C" fn tune_server_start_network_discovery() -> i32 {
     barriere_abi("tune_server_start_network_discovery", -2, || {
         if ouvrir_la_decouverte() { 0 } else { 1 }
+    })
+}
+
+/// Clé maîtresse (32 octets) des identifiants des sources réseau, gardée par
+/// l'application hôte — iOS : trousseau (`kSecAttrAccessibleAfterFirstUnlock
+/// ThisDeviceOnly`) ; Android : chiffrée par une clé du Keystore. Tenue en
+/// mémoire seulement, JAMAIS écrite sur le disque. À APPELER AVANT
+/// `tune_server_start` : les sources configurées s'ouvrent au démarrage.
+/// Sans elle, le serveur mobile refuse d'enregistrer un identifiant.
+///
+/// Retour : 0 succès, -2 si `key` est NULL ou `len` ≠ 32.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[unsafe(no_mangle)]
+pub extern "C" fn tune_server_set_master_key(key: *const u8, len: usize) -> i32 {
+    barriere_abi("tune_server_set_master_key", -2, || {
+        if key.is_null() || len != 32 {
+            return -2;
+        }
+        let mut cle = [0u8; 32];
+        cle.copy_from_slice(unsafe { std::slice::from_raw_parts(key, 32) });
+        tune_core::sources_reseau::identifiants::installer_la_cle_de_l_hote(cle);
+        {
+            use std::ptr::write_volatile;
+            for o in cle.iter_mut() {
+                unsafe { write_volatile(o, 0) };
+            }
+        }
+        0
+    })
+}
+
+/// Le réseau a changé (iOS : `NWPathMonitor` ; Android :
+/// `ConnectivityManager.NetworkCallback`) : chaque source réseau oublie ses
+/// connexions et se reconnecte à la lecture suivante.
+///
+/// Retour : 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn tune_server_network_changed() -> i32 {
+    barriere_abi("tune_server_network_changed", -2, || {
+        tune_core::sources_reseau::reseau_change();
+        0
     })
 }
 
@@ -1092,6 +1137,29 @@ mod tests {
         );
         assert_eq!(tune_server_start_network_discovery(), 1, "déjà ouverte");
         assert_eq!(tune_server_defer_network_discovery(0), 0);
+    }
+
+    #[test]
+    fn la_cle_maitresse_de_l_hote_est_tenue_en_memoire() {
+        let _g = test_lock();
+        use tune_core::sources_reseau::identifiants as ids;
+        assert_eq!(tune_server_set_master_key(std::ptr::null(), 32), -2);
+        let courte = [1u8; 16];
+        assert_eq!(tune_server_set_master_key(courte.as_ptr(), 16), -2);
+        ids::oublier_la_cle_de_l_hote();
+        assert!(!ids::cle_de_l_hote_installee());
+        let cle = [3u8; 32];
+        assert_eq!(tune_server_set_master_key(cle.as_ptr(), 32), 0);
+        assert!(ids::cle_de_l_hote_installee());
+        let i = ids::Identifiants {
+            utilisateur: "u".into(),
+            mot_de_passe: "p".into(),
+            domaine: None,
+        };
+        let scelle = ids::sceller(&i, true).unwrap();
+        assert_eq!(ids::ouvrir(&scelle, true).unwrap(), i);
+        ids::oublier_la_cle_de_l_hote();
+        assert_eq!(tune_server_network_changed(), 0);
     }
 
     #[test]
