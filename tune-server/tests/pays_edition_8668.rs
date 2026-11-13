@@ -59,6 +59,8 @@ fn menage(state: &AppState) {
 }
 
 struct Ids {
+    artiste: i64,
+    caduc_artiste: i64,
     balise: i64,
     mb_jp: i64,
     caduc: i64,
@@ -84,6 +86,15 @@ fn bibliotheque(state: &AppState) -> Ids {
             &[&nom as &dyn ToSqlValue],
         )
         .expect("artiste");
+    // Pays lu d'un ANCIEN MBID : la fiche ne le montre pas.
+    let nom_caduc = format!("{MARQUE} Caduc");
+    let caduc_artiste = b
+        .execute_returning_id(
+            "INSERT INTO artists (name, musicbrainz_id, country, country_mbid) \
+             VALUES (?, 'mb-caduc-8668-neuf', 'DE', 'mb-caduc-8668-ancien')",
+            &[&nom_caduc as &dyn ToSqlValue],
+        )
+        .expect("artiste caduc");
     let album = |titre: &str, release: &str, pays: &str, lu_de: &str| {
         let titre = format!("{MARQUE} {titre}");
         b.execute_returning_id(
@@ -133,6 +144,8 @@ fn bibliotheque(state: &AppState) -> Ids {
     piste(caduc);
     piste(vide);
     Ids {
+        artiste,
+        caduc_artiste,
         balise,
         mb_jp,
         caduc,
@@ -247,6 +260,16 @@ async fn scenario(state: AppState) {
         attendu.sort();
         assert_eq!(paires(&r, &tous), attendu, "{chemin} : {r}");
     }
+    // La fiche artiste porte son pays (null s'il est caduc).
+    let fiche = get(&app, &format!("/api/v1/library/artists/{}", ids.artiste)).await;
+    assert_eq!(fiche["country"], "FR", "{fiche}");
+    let fiche = get(
+        &app,
+        &format!("/api/v1/library/artists/{}", ids.caduc_artiste),
+    )
+    .await;
+    assert!(fiche["country"].is_null(), "{fiche}");
+
     let (status, _) = appel(&app, "/api/v1/library/album-countries?source=label").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
