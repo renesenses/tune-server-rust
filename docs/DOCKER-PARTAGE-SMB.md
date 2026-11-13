@@ -57,6 +57,8 @@ forme longue du volume :
 services:
   tune:
     image: renesenses/tune:latest
+    container_name: tune-server
+    network_mode: host
     volumes:
       - type: bind
         source: /volume1/music
@@ -65,6 +67,9 @@ services:
         bind:
           propagation: rslave
       - tune-data:/data
+
+volumes:
+  tune-data:
 ```
 
 Remplacez `/volume1/music` par le dossier de votre NAS. L'écran **Volume** de
@@ -108,9 +113,11 @@ NAS, mais Tune n'en trouve aucun. Trois causes sont possibles :
   dossiers de musique dans les réglages de Tune, puis relancez une analyse.
 - **Le compte de Tune ne peut pas lire les fichiers.** Tune tourne sous
   l'UID/GID `1000:1000`, et un autre conteneur peut tourner sous un autre
-  compte. Vérifiez avec
-  `docker exec tune-server ls -ln /music`. Si les fichiers ne sont pas
-  lisibles par ce compte, donnez-lui le droit de lecture dans DSM, ou lancez
+  compte. Vérifiez sous le compte de Tune (`tune` dans l'image, renuméroté
+  par `PUID`/`PGID`), et non en root comme le fait `docker exec` par défaut :
+  `docker exec -u tune tune-server ls /music`. Un refus (« Permission
+  denied ») signifie que ce compte ne lit pas les fichiers.
+  Dans ce cas, donnez-lui le droit de lecture dans DSM, ou lancez
   le conteneur avec `-e PUID=<uid> -e PGID=<gid>` d'un compte qui les lit
   (les identifiants de **votre** NAS, colonnes 3 et 4 de `ls -ln` sur l'hôte).
 - **Le partage est monté sur l'hôte après le démarrage du conteneur, sans
