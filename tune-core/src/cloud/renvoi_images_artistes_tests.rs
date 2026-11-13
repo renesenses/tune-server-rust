@@ -239,11 +239,16 @@ async fn ne_renvoie_que_ce_que_le_site_n_a_plus_puis_pose_le_marqueur() {
     assert_eq!(dernier, (2, 2));
     assert_eq!(bilan.renvoyees, 1);
     assert!(bilan.terminee);
-    assert!(deja_fait(
-        &SettingsRepo::with_backend(db.clone()),
-        "1.0.0-rc12"
-    ));
-    assert!(!deja_fait(&SettingsRepo::with_backend(db), "1.0.0-rc13"));
+    let settings = SettingsRepo::with_backend(db);
+    assert!(deja_fait(&settings));
+    // Le renvoi est UNIQUE : la clé ne dépend pas de la version, une version
+    // suivante du serveur trouve le marqueur et ne relance rien.
+    assert_eq!(CLE_MARQUEUR, "renvoi_images_2026_11_v1");
+    assert_eq!(
+        settings.get(CLE_MARQUEUR).unwrap().as_deref(),
+        Some("1.0.0-rc12"),
+        "la valeur garde la version qui a fait le renvoi"
+    );
 }
 
 #[tokio::test]
@@ -265,7 +270,7 @@ async fn sans_consentement_rien_ne_part_et_rien_n_est_marque() {
     let recu = site.recu.lock().unwrap();
     assert!(recu.questions.is_empty() && recu.envois.is_empty());
     assert!(!bilan.terminee);
-    assert!(!deja_fait(&SettingsRepo::with_backend(db), "1.0.0-rc12"));
+    assert!(!deja_fait(&SettingsRepo::with_backend(db)));
 }
 
 #[tokio::test]
@@ -309,7 +314,7 @@ async fn un_site_qui_reste_en_503_remet_la_passe_au_prochain_demarrage() {
     assert!(!bilan.terminee);
     assert!(bilan.reportee.is_some());
     assert!(
-        !deja_fait(&SettingsRepo::with_backend(db), "1.0.0-rc12"),
+        !deja_fait(&SettingsRepo::with_backend(db)),
         "sans marqueur, le prochain démarrage reprend"
     );
 }
@@ -332,7 +337,7 @@ async fn une_route_pas_encore_deployee_ne_marque_rien() {
 
     assert!(!bilan.terminee);
     assert!(site.recu.lock().unwrap().envois.is_empty());
-    assert!(!deja_fait(&SettingsRepo::with_backend(db), "1.0.0-rc12"));
+    assert!(!deja_fait(&SettingsRepo::with_backend(db)));
 }
 
 #[tokio::test]

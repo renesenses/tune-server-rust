@@ -1,7 +1,7 @@
 //! Le pilote du renvoi UNIQUE des images d'artistes perdues par le site
 //! (rc12, 13/11/2026) : `tune_core::cloud::renvoi_images_artistes`.
 //!
-//! - une fois par version du serveur (marqueur en réglage), et seulement si
+//! - une seule fois (marqueur constant en réglage), et seulement si
 //!   l'utilisateur a consenti au partage communautaire ;
 //! - visible dans « Ce qui tourne » et les tâches de fond sous [`TACHE`] ;
 //! - pausable avec les images d'artistes (`tache_suspendable`) et cédant à la
@@ -23,15 +23,15 @@ pub(crate) const TACHE: &str = "renvoi_images_artistes";
 /// Le délai après le démarrage : laisser passer la reprise des autres passes.
 const DELAI_AU_DEMARRAGE: Duration = Duration::from_secs(10 * 60);
 
-/// La version pour laquelle la passe se fait une fois.
+/// La version qui fait le renvoi, gardée dans le marqueur pour le diagnostic.
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Au démarrage : la passe, une fois par version, si elle n'est pas faite.
+/// Au démarrage : la passe, une seule fois, si elle n'est pas faite.
 pub(crate) fn armer(state: &AppState) {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if renvoi::deja_fait(&settings, version()) {
+    if renvoi::deja_fait(&settings) {
         return;
     }
     let state = state.clone();
@@ -49,8 +49,7 @@ pub(crate) async fn executer(
     reglages: Option<renvoi::Reglages>,
 ) -> Option<renvoi::Bilan> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if renvoi::deja_fait(&settings, version())
-        || !tune_core::cloud::consent::contribution_autorisee(&settings)
+    if renvoi::deja_fait(&settings) || !tune_core::cloud::consent::contribution_autorisee(&settings)
     {
         return None;
     }

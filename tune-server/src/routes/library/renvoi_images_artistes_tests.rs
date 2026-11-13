@@ -1,5 +1,5 @@
 //! rc12 — le renvoi des images d'artistes perdues : armé au démarrage,
-//! suspendu avec les images d'artistes, une fois par version, jamais sans
+//! suspendu avec les images d'artistes, une seule fois, jamais sans
 //! consentement.
 
 use super::*;
@@ -103,7 +103,7 @@ async fn sans_consentement_le_renvoi_ne_tourne_pas() {
 }
 
 #[tokio::test]
-async fn le_renvoi_tourne_une_fois_par_version_et_quitte_le_registre() {
+async fn le_renvoi_tourne_une_seule_fois_et_quitte_le_registre() {
     let cache = tune_core::test_scratch::scratch_dir("renvoi-serveur-une-fois");
     let state = etat_avec_un_artiste(&cache);
     SettingsRepo::with_backend(state.backend.clone())
@@ -125,7 +125,28 @@ async fn le_renvoi_tourne_une_fois_par_version_et_quitte_le_registre() {
         executer(&state, Some(reglages(&base, &cache)))
             .await
             .is_none(),
-        "le marqueur de version empêche une seconde passe"
+        "le marqueur empêche une seconde passe"
     );
     assert_eq!(envois.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn un_renvoi_fait_par_une_version_precedente_ne_se_refait_pas() {
+    let cache = tune_core::test_scratch::scratch_dir("renvoi-serveur-version-precedente");
+    let state = etat_avec_un_artiste(&cache);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings
+        .set(tune_core::cloud::consent::CONTRIBUTION_SETTING_KEY, "true")
+        .unwrap();
+    // Le marqueur posé par une version antérieure du serveur.
+    settings.set(renvoi::CLE_MARQUEUR, "1.0.0-rc11").unwrap();
+    let (base, envois) = faux_site().await;
+
+    assert!(
+        executer(&state, Some(reglages(&base, &cache)))
+            .await
+            .is_none(),
+        "le renvoi est unique : une nouvelle version ne le relance pas"
+    );
+    assert_eq!(envois.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

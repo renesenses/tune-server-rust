@@ -11,7 +11,8 @@
 //! submitted » / « rejected » pour un succès. Sans ce renvoi, les images
 //! perdues ne reviendraient jamais.
 //!
-//! La passe, une fois par version du serveur ([`CLE_MARQUEUR`]) :
+//! La passe, UNE fois pour toutes ([`CLE_MARQUEUR`], constant : une nouvelle
+//! version du serveur ne la relance pas) :
 //!
 //! 1. liste les artistes locaux qui ont un MBID ET une image en cache venue
 //!    d'une source externe ([`SOURCES_A_RENVOYER`] ; jamais `community`, l'image
@@ -49,8 +50,10 @@ use crate::cloud::community::{self, MBID_MANQUANTS_PAR_LOT, RefusDuSite};
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 
-/// Réglage qui porte la version du serveur pour laquelle le renvoi est fait.
-pub const CLE_MARQUEUR: &str = "renvoi_images_artistes_version";
+/// Réglage posé quand le renvoi est fait. Sa clé est CONSTANTE : le renvoi
+/// est unique (décision de Bertrand du 13/11/2026), pas une passe par
+/// version. Sa valeur garde, pour le diagnostic, la version qui l'a fait.
+pub const CLE_MARQUEUR: &str = "renvoi_images_2026_11_v1";
 
 /// Les `artists.image_source` d'une image trouvée par la cascade externe — les
 /// seules que la passe d'images proposait au site. `auto` est la cascade par
@@ -133,9 +136,13 @@ fn mbid_valide(mbid: &str) -> bool {
         })
 }
 
-/// Le renvoi est-il déjà fait pour cette version ?
-pub fn deja_fait(settings: &SettingsRepo, version: &str) -> bool {
-    settings.get(CLE_MARQUEUR).ok().flatten().as_deref() == Some(version)
+/// Le renvoi est-il déjà fait, par n'importe quelle version ?
+pub fn deja_fait(settings: &SettingsRepo) -> bool {
+    settings
+        .get(CLE_MARQUEUR)
+        .ok()
+        .flatten()
+        .is_some_and(|v| !v.trim().is_empty())
 }
 
 /// Ce qui règle une passe. Les témoins raccourcissent cadence et attentes.
@@ -178,7 +185,7 @@ pub struct Bilan {
     pub renvoyees: u64,
     /// Images que le site a refusées définitivement, ou illisibles en local.
     pub ecartees: u64,
-    /// Le marqueur est posé : la passe ne reviendra qu'à la version suivante.
+    /// Le marqueur est posé : la passe ne reviendra plus.
     pub terminee: bool,
     /// Pourquoi la passe s'est arrêtée avant la fin, le cas échéant.
     pub reportee: Option<String>,
