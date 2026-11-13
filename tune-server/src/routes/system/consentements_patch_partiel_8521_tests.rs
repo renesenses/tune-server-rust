@@ -66,7 +66,7 @@ async fn un_patch_d_autres_reglages_ne_touche_pas_aux_consentements() {
     for corps in [
         json!({ "quality_split": false }),
         json!({ "scan_import_playlists": false, "enrich_on_scan": false }),
-        json!({ "zone_auto_create": true }),
+        json!({ "metadata_readonly": false }),
     ] {
         let (statut, reponse) = appel(&state, "PATCH", Some(corps.clone())).await;
         assert_eq!(statut, StatusCode::OK, "{corps} → {reponse}");
