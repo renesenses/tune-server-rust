@@ -562,6 +562,9 @@ mod gain_au_rendu_asio_7934;
 // #7968 — le bas de la course `db60` : un niveau distinct par position.
 #[cfg(test)]
 mod bas_de_course_db60_7968_tests;
+// #8624 — `set_volume` ne lève plus la sourdine de la sortie locale.
+#[cfg(test)]
+mod sourdine_8624_tests;
 
 // #5204 — l'enchaînement sans blanc en mode exclusif : quel bras enchaîne, la
 // règle de la frontière à format égal, et la lecture de l'en-tête suivant
@@ -9139,11 +9142,16 @@ impl OutputTarget for LocalOutput {
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
         let v = unites_de_gain(volume);
-        self.user_volume.store(v, Ordering::SeqCst);
-        self.recompute_effective_volume();
-        if v > 0 {
-            self.muted.store(false, Ordering::SeqCst);
+        // #8624 — une sortie en sourdine le reste : la consigne devient le
+        // niveau que `set_mute(false)` rendra. Seul un geste de volume
+        // (#8165, `lever_la_sourdine_au_geste_de_volume`) lève la sourdine ;
+        // une réimposition, une limite, PURE ou une reprise ne la lèvent pas.
+        if self.muted.load(Ordering::SeqCst) {
+            self.pre_mute_volume.store(v, Ordering::SeqCst);
+        } else {
+            self.user_volume.store(v, Ordering::SeqCst);
         }
+        self.recompute_effective_volume();
         self.reborner_le_preampli_garde();
         // #8074 — un volume est posé : `play_url` ne le remplacera plus.
         self.volume_pose.store(true, Ordering::SeqCst);
@@ -9163,15 +9171,12 @@ impl OutputTarget for LocalOutput {
             self.user_volume.store(0, Ordering::SeqCst);
             self.muted.store(true, Ordering::SeqCst);
         } else {
+            // #8624 — le niveau d'avant la sourdine, ou la consigne donnée
+            // pendant la sourdine, même nulle : un geste à 0 % puis la levée
+            // ne doit pas repartir à pleine échelle. `pre_mute_volume` part de
+            // l'unité et `set_mute(true)` n'y range qu'un niveau non nul.
             let restored = self.pre_mute_volume.load(Ordering::SeqCst);
-            self.user_volume.store(
-                if restored > 0 {
-                    restored
-                } else {
-                    UNITE_DU_GAIN_DE_RENDU
-                },
-                Ordering::SeqCst,
-            );
+            self.user_volume.store(restored, Ordering::SeqCst);
             self.muted.store(false, Ordering::SeqCst);
         }
         self.recompute_effective_volume();
