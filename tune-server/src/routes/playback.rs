@@ -221,6 +221,20 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     if e.contains(tune_core::db::politique_parentale::CODE_REFUS_EXPLICITE) {
         return super::politique_parentale::refus_explicite(lang);
     }
+    // #8611 — une piste d'un artiste bloqué par la politique parentale du
+    // profil qui écoute : 403 au code stable `parental_content_blocked`.
+    if e.contains(tune_core::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE) {
+        return super::politique_parentale::refus_contenu_bloque(lang);
+    }
+    // #8611 — la politique parentale enregistrée du profil ne se relit pas.
+    if e.contains(tune_core::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE) {
+        let code = tune_core::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": code, "code": code})),
+        )
+            .into_response();
+    }
     // Sentinelle « plafond de zones » de orchestrator.play() → 402 traduit,
     // avec le code stable et les deux nombres. Le format est
     // `free_zone_cap:<actives>:<limite>` : la phrase se compose ICI, pas dans
