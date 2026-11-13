@@ -14,7 +14,7 @@ use crate::TuneError;
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
 use crate::db::politique_parentale::{
-    ArtisteBloque, CODE_POLITIQUE_ILLISIBLE, CODE_REFUS_CONTENU_BLOQUE, PolitiqueParentale, poser,
+    ArtisteBloque, CODE_REFUS_CONTENU_BLOQUE, PolitiqueParentale, poser,
 };
 use crate::source_url::{FournisseurDUrl, RefusDUrl, UrlFournie};
 use crate::streaming::traits::{
