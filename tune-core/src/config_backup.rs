@@ -610,6 +610,7 @@ fn export_alarms(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
         "one_shot",
         "source_name",
         "fade_duration_s",
+        "interrupt_playback",
     ];
     // `days_of_week` (the mask the scheduler reads first), `skip_holidays`
     // and `multi_zone_ids` were missing: every restored alarm rang daily, on
@@ -618,7 +619,7 @@ fn export_alarms(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
         "SELECT id, zone_id, time, enabled, days, source_type, \
          source_id, volume, fade_in_seconds, name, days_of_week, \
          skip_holidays, multi_zone_ids, one_shot, source_name, \
-         fade_duration_s \
+         fade_duration_s, interrupt_playback \
          FROM alarms ORDER BY id",
         &[],
     )?;
@@ -1456,8 +1457,8 @@ fn import_alarms(
             "INSERT INTO alarms (zone_id, time, enabled, days, source_type, \
              source_id, volume, fade_in_seconds, name, days_of_week, \
              skip_holidays, multi_zone_ids, one_shot, source_name, \
-             fade_duration_s) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             fade_duration_s, interrupt_playback) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 &zone_id as &dyn ToSqlValue,
                 &time.to_string() as &dyn ToSqlValue,
@@ -1474,6 +1475,9 @@ fn import_alarms(
                 &a["one_shot"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
                 &alarm_text(a, "source_name") as &dyn ToSqlValue,
                 &a["fade_duration_s"].as_i64().unwrap_or(60) as &dyn ToSqlValue,
+                // #8615 — une sauvegarde d'avant l'option : cochée, comme
+                // la migration 151 l'a posée pour tous les réveils.
+                &(crate::alarms::interrompt_la_lecture(a) as i64) as &dyn ToSqlValue,
             ],
         )?;
         count += 1;
@@ -1698,7 +1702,7 @@ mod tests {
         backend
             .query_one(
                 "SELECT days_of_week, skip_holidays, multi_zone_ids, zone_id, one_shot, \
-                 CAST(source_id AS TEXT), source_name, fade_duration_s \
+                 CAST(source_id AS TEXT), source_name, fade_duration_s, interrupt_playback \
                  FROM alarms WHERE name = ?",
                 &[&name.to_string() as &dyn ToSqlValue],
             )
@@ -1721,9 +1725,9 @@ mod tests {
         src.execute(
             "INSERT INTO alarms (name, time, days, zone_id, source_type, source_id, \
              source_name, days_of_week, skip_holidays, multi_zone_ids, one_shot, \
-             fade_duration_s) \
+             fade_duration_s, interrupt_playback) \
              VALUES ('Semaine', '06:45', '0,1,2,3,4', 1, 'radio', 'fip-uuid', 'FIP', \
-             '1111100', 1, '[1,2]', 0, 120)",
+             '1111100', 1, '[1,2]', 0, 120, 0)",
             &[],
         )
         .unwrap();
@@ -1746,6 +1750,7 @@ mod tests {
         assert_eq!(r[5].as_str(), Some("fip-uuid"), "source_id");
         assert_eq!(r[6].as_str(), Some("FIP"), "source_name");
         assert_eq!(r[7].as_i64(), Some(120), "fade_duration_s");
+        assert_eq!(r[8].as_i64(), Some(0), "interrupt_playback (#8615)");
 
         // And the scheduler reads it as Mon..Fri.
         let alarm = serde_json::json!({ "days_of_week": r[0].as_str() });
@@ -1785,6 +1790,7 @@ mod tests {
         assert_eq!(r[4].as_i64(), Some(0), "one_shot default");
         assert_eq!(r[5].as_str(), Some("42"), "numeric source_id kept");
         assert_eq!(r[7].as_i64(), Some(60), "fade_duration_s default");
+        assert_eq!(r[8].as_i64(), Some(1), "interrupt_playback default (#8615)");
     }
 
     // ── Sealed streaming tokens ─────────────────────────────────────
