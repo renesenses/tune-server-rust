@@ -389,7 +389,7 @@ impl FournisseurPcm for FournisseurSpotify {
         let session_connect = pompe.consommateur_continu();
         let rx = pompe.attacher(Some(piste.clone()));
         let lancement = rt.block_on(self.pilote.lancer(
-            self.recepteur.device_name(),
+            &self.recepteur.device_name(),
             &piste,
             depuis_ms,
         ));
@@ -465,7 +465,7 @@ impl FournisseurPcm for FournisseurSpotify {
                     portee,
                     &ContexteDeLibrespot {
                         binaire: &binaire,
-                        appareil: self.recepteur.device_name(),
+                        appareil: &self.recepteur.device_name(),
                         dossier_identifiants: dossier.as_deref(),
                     },
                 );
@@ -476,7 +476,7 @@ impl FournisseurPcm for FournisseurSpotify {
                 if est_un_refus_d_identifiants(&erreur) && portee != Some(false) {
                     let recepteur_actif = rt.block_on(self.recepteur.recepteur_actif());
                     return Err(LiaisonRequise {
-                        appareil: self.recepteur.device_name().to_string(),
+                        appareil: self.recepteur.device_name(),
                         recepteur_actif,
                         detail: motif,
                     }
