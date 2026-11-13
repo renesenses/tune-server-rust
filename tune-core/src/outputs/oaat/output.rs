@@ -445,6 +445,15 @@ impl OaatOutput {
         self.native_dsd_active.load(Ordering::Relaxed)
     }
 
+    /// #8647 — publie le drapeau « DSD natif » de CETTE sortie pour le chemin
+    /// du signal. Appelé par `play_media`, jamais par `new()` : la découverte
+    /// construit une sortie neuve à chaque ré-annonce mDNS puis la jette en
+    /// gardant celle qui joue, et une inscription au constructeur aurait
+    /// remplacé le drapeau vivant par une référence morte.
+    pub(crate) fn publier_le_drapeau_dsd_natif(&self) {
+        crate::outputs::dsd_natif_oaat_8647::inscrire(&self.device_id, &self.native_dsd_active);
+    }
+
     // These three exist only for `integration_test`, which is gated on
     // `all(test, feature = "oaat")`. Gating them on `test` alone — or not at
     // all — leaves them compiled but unused in a plain `cargo test`, which is
@@ -746,6 +755,8 @@ impl OutputTarget for OaatOutput {
         use oaat_core::wire::PacketFlags;
 
         self.stop().await.ok();
+        // #8647 — la sortie qui joue est celle que le chemin du signal lit.
+        self.publier_le_drapeau_dsd_natif();
 
         let url = media.url.to_owned();
         let file_path = media.file_path.map(|s| s.to_owned());
@@ -1086,6 +1097,8 @@ impl OutputTarget for OaatOutput {
                             .await
                         {
                             error!(device = %device_name, error = %e, "oaat: DSD format propose failed");
+                            // #8647 — rien ne part en DSD : ne pas l'annoncer.
+                            native_dsd_active.store(false, Ordering::SeqCst);
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
@@ -1121,6 +1134,8 @@ impl OutputTarget for OaatOutput {
                             // n'avait rien refuse (#2758).
                             error!(device = %device_name, raison = %refus.raison, "oaat: negociation de format DSD echouee, on ne joue pas");
                             signaler_refus_negociation(&refus_negociation, &refus);
+                            // #8647 — DSD refusé : ne pas l'annoncer natif.
+                            native_dsd_active.store(false, Ordering::SeqCst);
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
