@@ -96,6 +96,8 @@ pub struct Statistiques {
     pub retard_max_ns: AtomicU64,
     pub sous_alimentations: AtomicU64,
     pub resynchronisations: AtomicU64,
+    /// Pauses effectivement prises par le fil, distinctes des ordres reçus.
+    pub pauses_observees: AtomicU64,
     pub erreurs_d_envoi: AtomicU64,
     /// Le flux en cours d'émission, et `trames` au moment où il a été posé.
     pub flux_courant: AtomicU64,
@@ -109,6 +111,7 @@ pub struct ReleveStatistiques {
     pub retard_max_us: u64,
     pub sous_alimentations: u64,
     pub resynchronisations: u64,
+    pub pauses_observees: u64,
     pub erreurs_d_envoi: u64,
 }
 
@@ -120,6 +123,7 @@ impl Statistiques {
             retard_max_us: self.retard_max_ns.load(Ordering::Relaxed) / 1000,
             sous_alimentations: self.sous_alimentations.load(Ordering::Relaxed),
             resynchronisations: self.resynchronisations.load(Ordering::Relaxed),
+            pauses_observees: self.pauses_observees.load(Ordering::Acquire),
             erreurs_d_envoi: self.erreurs_d_envoi.load(Ordering::Relaxed),
         }
     }
@@ -250,6 +254,7 @@ fn boucle(
     let mut fin_vue = rx.is_none();
     let pretampon = p.pretampon_paquets.max(1);
     let mut premiere_origine = true;
+    let mut etait_en_pause = false;
     let avance_ns = u64::try_from(p.avance.as_nanos()).unwrap_or(0);
     let resync_ns = u64::try_from(RETARD_DE_RESYNCHRONISATION.as_nanos()).unwrap_or(u64::MAX);
     let tpp = u64::from(p.trames_par_paquet);
@@ -274,9 +279,14 @@ fn boucle(
         }
         if commandes.pause.load(Ordering::Acquire) {
             origine = None;
+            if !etait_en_pause {
+                stats.pauses_observees.fetch_add(1, Ordering::Release);
+                etait_en_pause = true;
+            }
             std::thread::sleep(ATTENTE_DU_PCM);
             continue;
         }
+        etait_en_pause = false;
         let Some(canal) = rx.as_ref() else {
             std::thread::sleep(ATTENTE_DU_PCM);
             continue;
