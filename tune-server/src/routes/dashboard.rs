@@ -248,7 +248,7 @@ async fn wrapped(
                 "SELECT artist_name, COUNT(*) as plays FROM listen_history \
                  WHERE listened_at >= ? AND listened_at < ? AND {} AND artist_name IS NOT NULL \
                  GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
-                tune_core::db::history_repo::ECOUTE_D_ARTISTE
+                tune_core::db::history_repo::ECOUTE_DE_MUSIQUE
             ),
             &[
                 &year_start as &dyn tune_core::db::backend::ToSqlValue,
@@ -267,9 +267,13 @@ async fn wrapped(
 
     let top_tracks: Vec<Value> = b
         .query_many(
-            "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' \
-             GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10",
+            // #8645 — ni radio, ni épisode de podcast.
+            &format!(
+                "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
+                 WHERE listened_at >= ? AND listened_at < ? AND {} \
+                 GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10",
+                tune_core::db::history_repo::ECOUTE_DE_MUSIQUE
+            ),
             &[
                 &year_start as &dyn tune_core::db::backend::ToSqlValue,
                 &year_end,
@@ -318,8 +322,13 @@ async fn wrapped(
 
     let stats_row = b
         .query_one(
-            "SELECT COUNT(DISTINCT artist_name), COUNT(DISTINCT COALESCE(title, '') || COALESCE(artist_name, '')) \
-             FROM listen_history WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio'",
+            // #8645 — une émission de podcast n'est pas un artiste de plus.
+            &format!(
+                "SELECT COUNT(DISTINCT CASE WHEN {} THEN artist_name END), \
+                 COUNT(DISTINCT COALESCE(title, '') || COALESCE(artist_name, '')) \
+                 FROM listen_history WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio'",
+                tune_core::db::history_repo::ECOUTE_DE_MUSIQUE
+            ),
             &[&year_start as &dyn tune_core::db::backend::ToSqlValue, &year_end],
         )
         .unwrap_or(None)

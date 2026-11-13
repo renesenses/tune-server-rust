@@ -10,13 +10,15 @@
 //! Témoin, sur SQLite ET PostgreSQL (`pg_8645_…`, saute sans
 //! `TUNE_TEST_PG_URL`) : un interprète écouté 3 fois, une émission écoutée
 //! 6 fois (plus que l'interprète, comme sur le .18), une ancienne ligne de
-//! radio à titre ICY. L'émission et l'interprète ICY sortent des classements
-//! et du compte d'artistes ; les épisodes restent dans le nombre d'écoutes et
-//! le temps d'écoute.
+//! radio à titre ICY, une ancienne écoute SANS source (NULL), qui reste de la
+//! musique. L'émission, ses épisodes et l'interprète ICY sortent des
+//! classements (artistes, albums, titres — décision de Bertrand du 13/11) et
+//! du compte d'artistes ; les épisodes restent dans le nombre d'écoutes et le
+//! temps d'écoute.
 //!
-//! Contre-épreuve : retirer `'podcast'` de [`super::ECOUTE_D_ARTISTE`] /
-//! [`super::ecoute_d_artiste`] fait rougir le témoin (l'émission arrive en
-//! tête des deux classements).
+//! Contre-épreuve : retirer `'podcast'` de [`super::ECOUTE_DE_MUSIQUE`] /
+//! [`super::ecoute_de_musique`] fait rougir le témoin (l'émission arrive en
+//! tête des classements).
 
 use super::*;
 use crate::db::migrations;
@@ -24,8 +26,10 @@ use crate::db::migrations;
 const INTERPRETE: &str = "Interprète 8645";
 const EMISSION: &str = "Émission 8645";
 const ICY: &str = "Interprète ICY 8645";
+const ANCIEN: &str = "Interprète ancien 8645";
 const MS_PISTE: i64 = 200_000;
 const MS_EPISODE: i64 = 1_800_000;
+const MS_ANCIEN: i64 = 100_000;
 
 fn ecoute(titre: &str, artiste: &str, album: Option<&str>, source: &str, ms: i64) -> ListenRecord {
     ListenRecord {
@@ -67,6 +71,16 @@ fn poser_le_temoin(repo: &HistoryRepo) {
     // Ligne de radio d'avant la v0.8.258 : l'interprète d'un titre ICY.
     repo.record(&ecoute("Titre ICY 8645", ICY, None, "radio", 0))
         .unwrap();
+    // Écoute d'avant la colonne `source` renseignée : NULL, donc musique.
+    repo.db
+        .execute(
+            &format!(
+                "INSERT INTO listen_history (title, artist_name, album_title, source, duration_ms) \
+                 VALUES ('Titre ancien 8645', '{ANCIEN}', 'Album ancien 8645', NULL, {MS_ANCIEN})"
+            ),
+            &[],
+        )
+        .unwrap();
 }
 
 fn noms<'a>(it: impl Iterator<Item = &'a str>) -> Vec<String> {
@@ -81,21 +95,28 @@ fn verifier_les_classements(repo: &HistoryRepo) {
     let artistes = repo.top_artists(100_000).unwrap();
     assert_eq!(
         noms(artistes.iter().map(|(n, _)| n.as_str())),
-        vec![INTERPRETE.to_string()],
+        vec![INTERPRETE.to_string(), ANCIEN.to_string()],
         "top_artists (Tune Circle, statistiques) : ni l'émission, ni l'interprète ICY : {artistes:?}"
     );
     let albums = repo.top_albums(100_000).unwrap();
     assert_eq!(
         noms(albums.iter().map(|(t, _, _)| t.as_str())),
-        vec!["Album 8645".to_string()],
+        vec!["Album 8645".to_string(), "Album ancien 8645".to_string()],
         "top_albums : l'émission n'est pas un album : {albums:?}"
+    );
+
+    let titres = repo.top_tracks(100_000).unwrap();
+    assert_eq!(
+        noms(titres.iter().filter_map(|t| t["title"].as_str())),
+        vec!["Titre 8645".to_string(), "Titre ancien 8645".to_string()],
+        "top_tracks : aucun épisode de podcast, ni titre ICY : {titres:?}"
     );
 
     // L'accueil : « Artistes les plus écoutés » et les tops du tableau de bord.
     let d = repo.full_dashboard("all", None, None, 100_000).unwrap();
     assert_eq!(
         noms(d.top_artists.iter().map(|a| a.artist_name.as_str())),
-        vec![INTERPRETE.to_string()],
+        vec![INTERPRETE.to_string(), ANCIEN.to_string()],
         "tableau de bord, artistes les plus écoutés : {:?}",
         d.top_artists
             .iter()
@@ -112,8 +133,13 @@ fn verifier_les_classements(repo: &HistoryRepo) {
     );
     assert_eq!(
         noms(d.top_albums.iter().map(|a| a.album_title.as_str())),
-        vec!["Album 8645".to_string()],
+        vec!["Album 8645".to_string(), "Album ancien 8645".to_string()],
         "tableau de bord, albums les plus écoutés"
+    );
+    assert_eq!(
+        noms(d.top_tracks.iter().map(|t| t.title.as_str())),
+        vec!["Titre 8645".to_string(), "Titre ancien 8645".to_string()],
+        "tableau de bord, titres les plus écoutés : aucun épisode"
     );
 }
 
@@ -128,17 +154,17 @@ fn sqlite_une_emission_de_podcast_n_est_pas_un_artiste_8645() {
 
     // Base vierge : les totaux se vérifient exactement.
     let d = repo.full_dashboard("all", None, None, 50).unwrap();
-    assert_eq!(d.totals.plays, 9, "les épisodes restent des écoutes");
+    assert_eq!(d.totals.plays, 10, "les épisodes restent des écoutes");
     assert_eq!(
         d.totals.listening_ms,
-        3 * MS_PISTE + 6 * MS_EPISODE,
+        3 * MS_PISTE + 6 * MS_EPISODE + MS_ANCIEN,
         "le temps d'écoute garde les épisodes"
     );
     assert_eq!(
-        d.totals.unique_artists, 1,
-        "l'émission n'est pas un artiste de plus"
+        d.totals.unique_artists, 2,
+        "l'émission n'est pas un artiste de plus, l'écoute sans source en est un"
     );
-    assert_eq!(repo.dashboard().unwrap().unique_artists, 1);
+    assert_eq!(repo.dashboard().unwrap().unique_artists, 2);
 }
 
 #[cfg(feature = "postgres")]

@@ -201,7 +201,7 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
          ORDER BY h.plays DESC, h.cle",
         // #8645 — ni l'émission d'un podcast, ni l'interprète d'un titre ICY
         // d'une ancienne ligne de radio.
-        d_artiste = tune_core::db::history_repo::ECOUTE_D_ARTISTE,
+        d_artiste = tune_core::db::history_repo::ECOUTE_DE_MUSIQUE,
     );
     use tune_core::db::backend::ToSqlValue;
     let rows = state
