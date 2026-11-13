@@ -11048,6 +11048,28 @@ async fn une_session_retiree_sans_abandon_pendant_l_envoi_n_arrete_rien_6658() {
 }
 
 #[tokio::test]
+async fn diagnostic_8259_frequence_fixe_8428_conserve_le_refus() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed PCM", Some("local"), Some("local:8428"))
+        .unwrap();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let refus = orch
+        .decision_du_surechantillonneur(zone_id, false)
+        .err()
+        .unwrap();
+    assert_eq!(
+        refus,
+        crate::audio::surechantillonnage::Ecarte::FrequenceFixe
+    );
+    assert_eq!(refus.code(), "fixed_rate");
+    assert!(orch.choix_du_surechantillonneur(zone_id, false).is_none());
+}
+
+#[tokio::test]
 async fn frequence_fixe_8428_services_traverse_les_familles() {
     let orch = test_orchestrator();
     let zones = ZoneRepo::with_backend(orch.db.clone());

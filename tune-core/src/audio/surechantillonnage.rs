@@ -169,6 +169,7 @@ pub struct ChoixSurechantillonnage {
 /// Pourquoi aucun choix n'est rendu : pour le journal et l'écran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ecarte {
+    FrequenceFixe,
     Desactive,
     PremiumRequis,
     GreffonNonInstalle,
@@ -179,6 +180,7 @@ pub enum Ecarte {
 impl Ecarte {
     pub fn code(self) -> &'static str {
         match self {
+            Self::FrequenceFixe => "fixed_rate",
             Self::Desactive => "disabled",
             Self::PremiumRequis => "premium_required",
             Self::GreffonNonInstalle => "plugin_not_installed",

@@ -4461,7 +4461,9 @@ impl PositionPoller {
 
             if demarrage_fige != demarrage_fige_5522::Verdict::Attendre {
                 poll_states.remove(&zone_id);
-                self.agir_sur_un_demarrage_fige(zone_id, zone_state, demarrage_fige)
+                // Cette relance rare ouvre toute la chaîne de lecture. Ne pas
+                // conserver son gros futur dans celui du sondeur.
+                Box::pin(self.agir_sur_un_demarrage_fige(zone_id, zone_state, demarrage_fige))
                     .await;
             } else if force_stop {
                 self.noter_tune_tested(zone_state, &device_id, false).await;

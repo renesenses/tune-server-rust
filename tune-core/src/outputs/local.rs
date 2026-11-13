@@ -1,4 +1,5 @@
 mod boucle_locale_5639;
+mod diagnostic_surechantillonnage_8259;
 mod lecture_http;
 mod retard_de_depart_8437;
 use lecture_http::LecteurHttpAnnulable;
@@ -890,6 +891,9 @@ pub struct LocalOutput {
     surechantillonnage: Arc<
         std::sync::Mutex<Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage>>,
     >,
+
+    /// #8259 — la cause de refus de la piste ouverte, distincte du réglage.
+    diagnostic_surechantillonnage: Arc<diagnostic_surechantillonnage_8259::Diagnostic>,
     /// Repli mono de la zone en cours de lecture sur cette sortie (#2362).
     ///
     /// Quand il est armé, la chaîne somme `M = (L + R) / 2` et réémet `M` sur
@@ -1506,6 +1510,7 @@ impl LocalOutput {
             // exactement comme avant #1590.
             soft_mute_ms: Arc::new(AtomicU32::new(0)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
+            diagnostic_surechantillonnage: Arc::default(),
             surechantillonnage: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
@@ -2377,8 +2382,23 @@ impl LocalOutput {
         &self,
         choix: Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage>,
     ) {
+        self.set_decision_surechantillonnage(
+            choix.ok_or(crate::audio::surechantillonnage::Ecarte::Desactive),
+        );
+    }
+
+    /// Le refus suit le choix, sans réécrire le diagnostic de la piste en cours.
+    pub fn set_decision_surechantillonnage(
+        &self,
+        choix: Result<
+            crate::audio::surechantillonnage::ChoixSurechantillonnage,
+            crate::audio::surechantillonnage::Ecarte,
+        >,
+    ) {
         if let Ok(mut slot) = self.surechantillonnage.lock() {
-            *slot = choix;
+            self.diagnostic_surechantillonnage
+                .demander(choix.as_ref().err().map(|e| e.code()));
+            *slot = choix.ok();
         }
     }
 
@@ -5347,24 +5367,15 @@ pub(super) fn cadence_fixe_ramenee(
 /// #7614 — le greffon peut-il s'ouvrir sur ce flux ? Jamais sous PURE, jamais
 /// sur un porteur DoP : un flux 24 bits dont l'amorce est un porteur, ou trop
 /// courte pour l'écarter, garde son chemin.
+#[cfg(test)]
 pub(super) fn surechantillonneur_admis_a_l_ouverture(
     spec: AudioSpec,
     amorce: &[u8],
     pure: bool,
     dop: bool,
 ) -> bool {
-    if pure || dop {
-        return false;
-    }
-    let canaux = spec.canaux();
-    let bits = spec.profondeur().bits_declares();
-    if bits == 24 {
-        let sonde = DOP_DETECT_FRAMES * usize::from(canaux) * 3;
-        if amorce.len() < sonde || is_dop_pcm(amorce, bits, canaux) {
-            return false;
-        }
-    }
-    true
+    diagnostic_surechantillonnage_8259::refus_a_l_ouverture(spec, amorce, pure, dop, false)
+        .is_none()
 }
 
 /// Ce qu'une poussée vers le puits a produit.
@@ -6719,6 +6730,10 @@ impl OutputTarget for LocalOutput {
         let canaux_de_carte = self.canaux_de_carte();
         let crossfeed = self.crossfeed.clone();
         let surechantillonnage = self.surechantillonnage.clone();
+        let diagnostic_surechantillonnage = self.diagnostic_surechantillonnage.clone();
+        if let Ok(choix) = surechantillonnage.lock() {
+            diagnostic_surechantillonnage.ouvrir(choix.is_some());
+        }
         let dop_active = self.dop_active.clone();
         // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
         // plutôt que trois atomiques de plus dans des fermetures qui en portent
@@ -8062,15 +8077,20 @@ impl OutputTarget for LocalOutput {
             let choix_du_surechantillonneur = surechantillonnage
                 .lock()
                 .ok()
-                .and_then(|c| c.clone())
-                .filter(|_| seconde_sortie.is_empty())
+                .and_then(|c| {
+                    diagnostic_surechantillonnage.ouvrir(c.is_some());
+                    c.clone()
+                })
                 .filter(|_| {
-                    surechantillonneur_admis_a_l_ouverture(
+                    let refus = diagnostic_surechantillonnage_8259::refus_a_l_ouverture(
                         spec,
                         header_buf.get(data_offset..).unwrap_or_default(),
                         pure_bypass.load(Ordering::Relaxed),
                         dop_active.load(Ordering::Relaxed),
-                    )
+                        !seconde_sortie.is_empty(),
+                    );
+                    diagnostic_surechantillonnage.noter(refus);
+                    refus.is_none()
                 });
             let ouverture = match choix_du_surechantillonneur.as_ref() {
                 Some(choix) => {
@@ -8203,6 +8223,11 @@ impl OutputTarget for LocalOutput {
                     }
                 });
             if choix_du_surechantillonneur.is_some() && etage_du_surechantillonneur.is_none() {
+                diagnostic_surechantillonnage.noter(Some(
+                    backend
+                        .refus_du_surechantillonneur()
+                        .unwrap_or("filter_initialization_failed"),
+                ));
                 info!(
                     device = %device_name,
                     source_sr = sample_rate,
@@ -9114,6 +9139,7 @@ impl OutputTarget for LocalOutput {
         if let Ok(mut slot) = self.signal_path_status.lock() {
             *slot = None;
         }
+        self.diagnostic_surechantillonnage.noter(None);
         if let Ok(mut slot) = self.transformations_reelles.lock() {
             *slot = None;
         }
@@ -9292,7 +9318,10 @@ impl OutputTarget for LocalOutput {
         // le voyant nomme ce gain au lieu d'un « DSP appliqué » ambigu.
         let garde = self.preampli_garde();
         mesure.map(|t| {
-            let t = t.avec_fondu_enchaine(fondu);
+            let t = self
+                .diagnostic_surechantillonnage
+                .declarer(t)
+                .avec_fondu_enchaine(fondu);
             match garde {
                 Some(g) => t.avec_preampli_garde(g.db, g.en_retour),
                 None => t,
