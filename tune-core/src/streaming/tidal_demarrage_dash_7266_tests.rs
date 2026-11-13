@@ -261,7 +261,7 @@ async fn une_lecture_abandonnee_arrete_le_telechargement_7266() {
     tokio::time::sleep(Duration::from_millis(LATENCE_MS * SEGMENTS as u64)).await;
     let demandes = compteurs.demandes.load(Ordering::SeqCst);
     assert!(
-        demandes < SEGMENTS as usize,
+        demandes < SEGMENTS as usize / 2,
         "{demandes} segments demandés après l'abandon de la lecture"
     );
     assert!(

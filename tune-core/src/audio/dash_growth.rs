@@ -118,8 +118,21 @@ pub struct GrowingFileSource {
     delai_sans_progres: std::time::Duration,
 }
 
+/// #7266 — délai total d'une requête de segment (client HTTP de TIDAL).
+pub const DELAI_D_UNE_REQUETE_DE_SEGMENT: std::time::Duration = std::time::Duration::from_secs(30);
+/// #7266 — un segment refusé est redemandé une fois avant l'échec.
+pub const REPRISES_D_UN_SEGMENT: u64 = 1;
+/// #7266 — marge au-delà du pire cas légitime (requête, puis sa reprise).
+const MARGE_SANS_PROGRES: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// #7266 — attente maximale à la frontière d'écriture sans qu'un octet arrive.
-pub const ATTENTE_MAX_SANS_PROGRES: std::time::Duration = std::time::Duration::from_secs(30);
+/// Dérivée du pire cas d'un réseau lent mais vivant : une requête de segment
+/// qui va au bout de son délai, puis sa reprise, plus une marge (75 s). En
+/// deçà, une piste qui aurait fini par jouer serait coupée.
+pub const ATTENTE_MAX_SANS_PROGRES: std::time::Duration = std::time::Duration::from_secs(
+    DELAI_D_UNE_REQUETE_DE_SEGMENT.as_secs() * (1 + REPRISES_D_UN_SEGMENT)
+        + MARGE_SANS_PROGRES.as_secs(),
+);
 
 impl GrowingFileSource {
     pub fn open(path: &str, growth: Arc<DashGrowth>) -> io::Result<Self> {
@@ -297,6 +310,8 @@ pub fn decodage_local_desarme() -> bool {
 pub struct SuiviDuTelechargement {
     etat: std::sync::atomic::AtomicU8,
     attendants: std::sync::atomic::AtomicUsize,
+    /// Octets écrits jusqu'ici : tant qu'ils augmentent, on attend.
+    octets: std::sync::atomic::AtomicU64,
     fin: tokio::sync::Notify,
 }
 
@@ -309,6 +324,7 @@ impl SuiviDuTelechargement {
         Arc::new(Self {
             etat: std::sync::atomic::AtomicU8::new(EN_COURS),
             attendants: std::sync::atomic::AtomicUsize::new(0),
+            octets: std::sync::atomic::AtomicU64::new(0),
             fin: tokio::sync::Notify::new(),
         })
     }
@@ -326,6 +342,14 @@ impl SuiviDuTelechargement {
         self.etat.load(std::sync::atomic::Ordering::SeqCst) == COMPLET
     }
 
+    /// Le fichier tient maintenant `octets` : réveille qui attend, pour qu'il
+    /// reparte d'un nouveau délai.
+    pub fn avancer(&self, octets: u64) {
+        self.octets
+            .fetch_max(octets, std::sync::atomic::Ordering::SeqCst);
+        self.fin.notify_waiters();
+    }
+
     pub fn en_cours(&self) -> bool {
         self.etat.load(std::sync::atomic::Ordering::SeqCst) == EN_COURS
     }
@@ -335,8 +359,11 @@ impl SuiviDuTelechargement {
         self.attendants.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 
-    /// Attend la fin, `delai` au plus. `true` si le fichier est complet.
-    pub async fn attendre_la_fin(&self, delai: std::time::Duration) -> bool {
+    /// Attend la fin tant que le téléchargement progresse : l'attente n'est
+    /// bornée que par `delai_sans_progres` SANS nouvel octet (une piste longue
+    /// sur une ligne lente peut prendre des minutes, elle n'est jamais
+    /// relancée de zéro tant qu'elle avance). `true` si le fichier est complet.
+    pub async fn attendre_la_fin(&self, delai_sans_progres: std::time::Duration) -> bool {
         struct Attendant<'a>(&'a std::sync::atomic::AtomicUsize);
         impl Drop for Attendant<'_> {
             fn drop(&mut self) {
@@ -346,7 +373,8 @@ impl SuiviDuTelechargement {
         self.attendants
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _attendant = Attendant(&self.attendants);
-        let limite = tokio::time::Instant::now() + delai;
+        let mut vu = self.octets.load(std::sync::atomic::Ordering::SeqCst);
+        let mut limite = tokio::time::Instant::now() + delai_sans_progres;
         loop {
             let notifie = self.fin.notified();
             tokio::pin!(notifie);
@@ -354,8 +382,16 @@ impl SuiviDuTelechargement {
             if !self.en_cours() {
                 return self.est_complet();
             }
+            let maintenant = self.octets.load(std::sync::atomic::Ordering::SeqCst);
+            if maintenant != vu {
+                vu = maintenant;
+                limite = tokio::time::Instant::now() + delai_sans_progres;
+            }
             if tokio::time::timeout_at(limite, notifie).await.is_err() {
-                return self.est_complet();
+                let fin = self.octets.load(std::sync::atomic::Ordering::SeqCst);
+                if fin == vu {
+                    return self.est_complet();
+                }
             }
         }
     }
@@ -451,6 +487,50 @@ mod tests {
         assert_eq!(erreur.kind(), io::ErrorKind::TimedOut);
         assert!(debut.elapsed() < std::time::Duration::from_secs(5));
         assert!(growth.a_echoue(), "la poignée est marquée en échec");
+    }
+
+    /// La borne d'inactivité couvre une requête de segment qui va au bout de
+    /// son délai puis sa reprise : un réseau lent mais vivant n'est pas coupé.
+    #[test]
+    fn l_attente_sans_progres_couvre_une_requete_et_sa_reprise_7266() {
+        assert!(
+            ATTENTE_MAX_SANS_PROGRES
+                > DELAI_D_UNE_REQUETE_DE_SEGMENT * (1 + REPRISES_D_UN_SEGMENT as u32)
+        );
+        assert_eq!(ATTENTE_MAX_SANS_PROGRES, std::time::Duration::from_secs(75));
+    }
+
+    /// Un téléchargement qui avance n'est jamais lâché, même bien au-delà de
+    /// la borne d'inactivité ; un téléchargement immobile l'est.
+    #[tokio::test]
+    async fn l_attente_dure_tant_que_le_telechargement_progresse_7266() {
+        let suivi = SuiviDuTelechargement::new();
+        let s = suivi.clone();
+        let producteur = tokio::spawn(async move {
+            for i in 1..=10u64 {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                s.avancer(i * 1000);
+            }
+            s.terminer(true);
+        });
+        let debut = std::time::Instant::now();
+        // Borne de 150 ms, téléchargement de 600 ms qui progresse.
+        assert!(
+            suivi
+                .attendre_la_fin(std::time::Duration::from_millis(150))
+                .await
+        );
+        assert!(debut.elapsed() >= std::time::Duration::from_millis(500));
+        producteur.await.unwrap();
+
+        let immobile = SuiviDuTelechargement::new();
+        let debut = std::time::Instant::now();
+        assert!(
+            !immobile
+                .attendre_la_fin(std::time::Duration::from_millis(150))
+                .await
+        );
+        assert!(debut.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]

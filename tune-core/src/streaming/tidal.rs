@@ -262,7 +262,9 @@ impl TidalService {
     pub fn new() -> Self {
         Self {
             client: crate::http::client::builder()
-                .timeout(Duration::from_secs(30))
+                // #7266 — la borne d'inactivité du lecteur DASH en croissance
+                // est dérivée de ce délai (`ATTENTE_MAX_SANS_PROGRES`).
+                .timeout(crate::audio::dash_growth::DELAI_D_UNE_REQUETE_DE_SEGMENT)
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             tokens: Mutex::new(TokenState {
@@ -2334,7 +2336,7 @@ impl StreamingService for TidalService {
             let Some(suivi) = a_attendre else { break };
             info!(track_id, "tidal_dash_attend_le_telechargement_en_cours");
             suivi
-                .attendre_la_fin(ATTENTE_D_UN_TELECHARGEMENT_EN_COURS)
+                .attendre_la_fin(crate::audio::dash_growth::ATTENTE_MAX_SANS_PROGRES)
                 .await;
             attente_faite = true;
         }
@@ -3579,10 +3581,6 @@ const SEGMENTS_DE_MESURE: usize = SEGMENTS_DASH_EN_VOL + 1;
 /// vite qu'elle ne se joue ; en deçà, la lecture le rattraperait.
 const AVANCE_MINIMALE: f64 = 1.5;
 
-/// #7266 — au plus, l'attente d'un téléchargement en croissance déjà lancé
-/// pour la même piste, avant d'en lancer un autre.
-const ATTENTE_D_UN_TELECHARGEMENT_EN_COURS: Duration = Duration::from_secs(120);
-
 /// #7266 — pourquoi un segment DASH n'a pas été reçu (même journal qu'avant).
 enum SegmentEnEchec {
     Lecture(reqwest::Error),
@@ -3690,7 +3688,7 @@ impl Drop for GardeCroissance {
 #[cfg(not(test))]
 const DELAI_AVANT_ABANDON: Duration = Duration::from_secs(3);
 #[cfg(test)]
-const DELAI_AVANT_ABANDON: Duration = Duration::from_millis(300);
+const DELAI_AVANT_ABANDON: Duration = Duration::from_millis(100);
 
 /// #7266 — la suite d'un téléchargement en croissance, après ses premiers
 /// segments : chaque segment écrit publie la nouvelle frontière au décodeur.
@@ -3747,6 +3745,7 @@ async fn poursuivre_en_croissance(mut t: EnCroissance) {
         }
         t.written += data.len() as u64;
         t.garde.growth().advance(t.written);
+        t.garde.suivi.avancer(t.written);
     }
     let _ = t.file.flush();
     info!(

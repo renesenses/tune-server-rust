@@ -514,3 +514,66 @@ async fn un_aac_dash_garde_le_fichier_complet_meme_en_local_7266() {
     );
     assert_eq!(std::fs::read(chemin).unwrap(), aac);
 }
+
+/// #7266, par le vrai chemin de l'orchestrateur : une lecture locale démarre en
+/// croissance, puis un SAUT à 20 s arrive avant la fin du téléchargement
+/// (l'ancienne session est retirée, son décodeur lâche la poignée). La
+/// résolution du saut attend le téléchargement en cours, qui progresse : un
+/// seul téléchargement, et la session du saut part bien de 20 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_saut_en_cours_de_telechargement_reprend_le_meme_telechargement_7266() {
+    let (pcm, piste) = piste_cd().await;
+    let (base, journal) = faux_tidal(piste, "flac", None).await;
+    let orch = orchestrateur();
+    orch.services
+        .lock()
+        .await
+        .register(Box::new(TidalService::pour_un_faux_tidal(base)));
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Casque 7266", Some("local"), Some("local:Casque"))
+        .unwrap();
+    let mut req = PlayRequest {
+        zone_id,
+        output_device_id: Some("local:Casque".into()),
+        source: Some("tidal".into()),
+        source_id: Some(PISTE.into()),
+        title: Some("Témoin 7266".into()),
+        artist_name: Some("Banc".into()),
+        album_title: Some("DASH".into()),
+        duration_ms: Some(SECONDES as i64 * 1000),
+        ..Default::default()
+    };
+    let premier = orch.resolve_stream(&req).await.expect("lecture");
+    let sid = premier.stream_id.clone().expect("session WAV");
+    // Quelques morceaux joués, puis le saut : l'ancienne session disparaît.
+    let session = orch
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(&sid)
+        .cloned()
+        .expect("session");
+    for _ in 0..3 {
+        let _ = tokio::time::timeout(Duration::from_secs(5), session.recv_chunk()).await;
+    }
+    drop(session);
+    let encore_en_cours = journal.dernier_segment.lock().unwrap().is_none();
+    println!("#7266 saut : téléchargement encore en cours au saut = {encore_en_cours}");
+    orch.streamer.remove_session(&sid).await;
+
+    req.seek_ms = Some(20_000);
+    let saut = orch.resolve_stream(&req).await.expect("saut");
+    assert_eq!(
+        journal.inits.load(Ordering::SeqCst),
+        1,
+        "le saut a relancé un téléchargement au lieu d'attendre celui en cours"
+    );
+    let lu = lire_la_session(&orch, &saut.stream_id.clone().expect("session du saut")).await;
+    let (trames, _) = trames_wav(&lu.octets);
+    let attendues = pcm.len() / 4 - 20 * SR as usize;
+    assert!(
+        trames.abs_diff(attendues) < SR as usize / 2,
+        "{trames} trames lues après un saut à 20 s, ~{attendues} attendues"
+    );
+}
