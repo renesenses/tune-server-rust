@@ -47,10 +47,15 @@
 /// `parental_explicit_refused` (#8088) : la politique parentale du profil
 /// refuse CETTE piste, marquée explicite. La suivante, non marquée, se joue :
 /// un album qui compte des titres explicites continue sans eux.
-const MOTIFS_PROPRES_A_LA_PISTE: [&str; 3] = [
+///
+/// `parental_content_blocked` (#8611) : l'artiste de CETTE piste est bloqué
+/// par la politique parentale du profil ; une playlist mêlée continue avec
+/// les autres artistes.
+const MOTIFS_PROPRES_A_LA_PISTE: [&str; 4] = [
     "no url",
     crate::source_url::MOTIF_PISTE_REFUSEE,
     crate::db::politique_parentale::CODE_REFUS_EXPLICITE,
+    crate::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE,
 ];
 
 /// #7778 (points 3 et 4) — ce que l'auditeur lit à la place du motif brut

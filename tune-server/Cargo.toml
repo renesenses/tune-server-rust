@@ -2082,6 +2082,11 @@ path = "tests/politique_parentale_7913.rs"
 name = "politique_parentale_cout_7913"
 path = "tests/politique_parentale_cout_7913.rs"
 
+# #8611 — artiste bloqué : playlists, historique, favoris, services, lecture.
+[[test]]
+name = "politique_parentale_8611"
+path = "tests/politique_parentale_8611.rs"
+
 # #8088 — contrôle parental : masquer et refuser les contenus explicites.
 [[test]]
 name = "politique_parentale_explicite_8088"
