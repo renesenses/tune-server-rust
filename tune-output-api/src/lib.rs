@@ -2026,6 +2026,8 @@ pub struct TransformationsReelles {
     /// cadence de l'entrée vers celle ouverte : `(filtre, réserve en
     /// centièmes de dB)`. `None` quand il ne tourne pas.
     surechantillonnage: Option<(&'static str, i32)>,
+    /// Motif observé à l'ouverture lorsque le suréchantillonneur ne tourne pas.
+    refus_surechantillonnage: Option<&'static str>,
 }
 
 impl TransformationsReelles {
@@ -2042,6 +2044,7 @@ impl TransformationsReelles {
             reorganisation_canaux: false,
             preampli_garde: None,
             surechantillonnage: None,
+            refus_surechantillonnage: None,
         }
     }
 
@@ -2050,6 +2053,7 @@ impl TransformationsReelles {
     /// ≤ 0) a porté la cadence de l'entrée à celle ouverte. Additif.
     #[must_use]
     pub fn avec_surechantillonnage(mut self, filtre: &'static str, reserve_db: f64) -> Self {
+        self.refus_surechantillonnage = None;
         self.surechantillonnage = Some((
             filtre,
             if reserve_db.is_finite() {
@@ -2067,6 +2071,19 @@ impl TransformationsReelles {
     pub fn surechantillonnage(&self) -> Option<(&'static str, f64)> {
         self.surechantillonnage
             .map(|(filtre, centiemes)| (filtre, f64::from(centiemes) / 100.0))
+    }
+
+    /// Diagnostic additif : il ne change aucun verdict ni aucune transformation.
+    /// Une observation de traitement effectif prime toujours sur un refus.
+    #[must_use]
+    pub fn avec_refus_surechantillonnage(mut self, raison: Option<&'static str>) -> Self {
+        self.refus_surechantillonnage = raison.filter(|_| self.surechantillonnage.is_none());
+        self
+    }
+
+    #[must_use]
+    pub fn refus_surechantillonnage(&self) -> Option<&'static str> {
+        self.refus_surechantillonnage
     }
 
     /// tune-server-rust#6741 — la même déclaration, en disant qu'un
