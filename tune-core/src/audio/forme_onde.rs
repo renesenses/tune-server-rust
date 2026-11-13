@@ -5,8 +5,12 @@
 //! compression, comme un éditeur du type iZotope RX. Par canal et par colonne
 //! de temps : le minimum et le maximum des échantillons (crêtes) et la valeur
 //! efficace (RMS). Par canal et pour l'ensemble : la crête maximale, la RMS
-//! globale, le facteur de crête (PLR, crête − RMS en dB) et le nombre
-//! d'échantillons écrêtés (à [`SEUIL_ECRETAGE_DBFS`] ou au-dessus).
+//! globale, le facteur de crête (crête − RMS en dB, non pondéré : ce n'est
+//! PAS le PLR de l'EBU, qui se mesure entre la crête vraie et la sonie
+//! intégrée) et le nombre d'échantillons écrêtés : ceux d'une suite d'au
+//! moins [`ECRETAGE_SUITE_MIN`] échantillons consécutifs à la pleine échelle
+//! du format. Une crête isolée qui touche 0 dBFS (piste normalisée) n'est
+//! pas un écrêtage.
 //!
 //! Calculé en Rust natif sur le PCM que Tune décode lui-même (jamais ffmpeg),
 //! comme le spectrogramme (#7857) : la piste est décodée par fenêtres de
@@ -16,15 +20,22 @@
 //!
 //! Les niveaux sont normalisés à ±1 (pleine échelle = 0 dBFS). La RMS est la
 //! valeur efficace brute : un sinus à −6 dBFS de crête a une RMS de −9 dBFS.
+//!
+//! Limites connues : le décodage passe par des entiers, donc une source en
+//! virgule flottante dont des crêtes dépassent 0 dBFS est ramenée à la
+//! pleine échelle (crête affichée 0,0 dBFS, pas sa vraie valeur) ; pour le
+//! DSD, le niveau dépend de la référence de gain de la conversion en PCM.
 
 /// Durée d'une fenêtre de décodage, en secondes.
 pub const FENETRE_S: f64 = 10.0;
 pub const COLONNES_MIN: usize = 50;
 pub const COLONNES_MAX: usize = 4000;
 pub const COLONNES_DEFAUT: usize = 1000;
-/// Un échantillon à −0,01 dBFS ou au-dessus compte comme écrêté : la pleine
-/// échelle d'un fichier 16 bits (32767) est à −0,0003 dBFS.
-pub const SEUIL_ECRETAGE_DBFS: f64 = -0.01;
+/// Un échantillon compte comme écrêté s'il est à la pleine échelle du format
+/// (32767 ou −32768 en 16 bits) DANS une suite d'au moins autant
+/// d'échantillons consécutifs, sur un même canal : un signal coupé reste
+/// collé au plafond, une crête normalisée le touche une fois.
+pub const ECRETAGE_SUITE_MIN: u64 = 3;
 /// En deçà, un niveau est du silence : pas de valeur en dBFS.
 pub const PLANCHER_DBFS: f64 = -150.0;
 
@@ -39,8 +50,13 @@ pub fn dbfs(amplitude: f64) -> Option<f64> {
     (db.is_finite() && db > PLANCHER_DBFS).then_some(db)
 }
 
-fn seuil_ecretage() -> f32 {
-    10f64.powf(SEUIL_ECRETAGE_DBFS / 20.0) as f32
+/// La pleine échelle d'un format entier de `bits` bits, normalisée : le plus
+/// grand code positif, (2^(bits−1) − 1) / 2^(bits−1). Le plus petit code
+/// négatif (−1,0) est au-delà.
+pub fn pleine_echelle(bits: u32) -> f32 {
+    let bits = bits.clamp(2, 32);
+    let pas = (1u64 << (bits - 1)) as f64;
+    ((pas - 1.0) / pas) as f32
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +65,7 @@ struct Case {
     max: f32,
     somme_carres: f64,
     n: u64,
+    ecretes: u64,
 }
 
 impl Case {
@@ -57,6 +74,7 @@ impl Case {
         max: 0.0,
         somme_carres: 0.0,
         n: 0,
+        ecretes: 0,
     };
 
     fn ajouter(&mut self, x: f32) {
@@ -83,6 +101,7 @@ impl Case {
         self.max = self.max.max(autre.max);
         self.somme_carres += autre.somme_carres;
         self.n += autre.n;
+        self.ecretes += autre.ecretes;
     }
 
     fn rms(&self) -> f64 {
@@ -100,6 +119,8 @@ struct Totaux {
     somme_carres: f64,
     n: u64,
     ecretes: u64,
+    /// La suite en cours d'échantillons à la pleine échelle.
+    suite: u64,
 }
 
 /// L'accumulateur : on lui pousse des trames entrelacées normalisées à ±1.
@@ -145,8 +166,15 @@ impl Accumulateur {
             trames_courante: 0,
             totaux: vec![Totaux::default(); canaux],
             trames: 0,
-            seuil: seuil_ecretage(),
+            seuil: 1.0,
         }
+    }
+
+    /// La pleine échelle d'un format entier de `bits` bits (sans cela :
+    /// 1,0, soit 0 dBFS exactement).
+    pub fn avec_bits(mut self, bits: u32) -> Self {
+        self.seuil = pleine_echelle(bits);
+        self
     }
 
     pub fn canaux(&self) -> usize {
@@ -164,7 +192,18 @@ impl Accumulateur {
                 t.somme_carres += f64::from(x) * f64::from(x);
                 t.n += 1;
                 if a >= self.seuil {
-                    t.ecretes += 1;
+                    t.suite += 1;
+                    // La suite devient un écrêtage : ses premiers
+                    // échantillons comptent d'un coup, les suivants un à un.
+                    let compte = match t.suite {
+                        s if s == ECRETAGE_SUITE_MIN => ECRETAGE_SUITE_MIN,
+                        s if s > ECRETAGE_SUITE_MIN => 1,
+                        _ => 0,
+                    };
+                    t.ecretes += compte;
+                    self.courante[c].ecretes += compte;
+                } else {
+                    t.suite = 0;
                 }
             }
             self.trames += 1;
@@ -214,6 +253,7 @@ impl Accumulateur {
                 let mut min = Vec::with_capacity(colonnes);
                 let mut max = Vec::with_capacity(colonnes);
                 let mut rms = Vec::with_capacity(colonnes);
+                let mut colonnes_ecretees = Vec::new();
                 for j in 0..colonnes {
                     let debut = j * m / colonnes;
                     let fin = ((j + 1) * m / colonnes).max(debut + 1);
@@ -224,11 +264,15 @@ impl Accumulateur {
                     min.push(col.min);
                     max.push(col.max);
                     rms.push(col.rms() as f32);
+                    if col.ecretes > 0 {
+                        colonnes_ecretees.push(j);
+                    }
                 }
                 Voie {
                     min,
                     max,
                     rms,
+                    colonnes_ecretees,
                     crete: f64::from(t.crete),
                     rms_globale: if t.n == 0 {
                         0.0
@@ -264,6 +308,9 @@ pub struct Voie {
     pub min: Vec<f32>,
     pub max: Vec<f32>,
     pub rms: Vec<f32>,
+    /// Les colonnes qui contiennent un écrêtage (au sens de
+    /// [`ECRETAGE_SUITE_MIN`]), par ordre croissant.
+    pub colonnes_ecretees: Vec<usize>,
     /// Crête maximale, linéaire (0..1).
     pub crete: f64,
     /// RMS globale, linéaire.
@@ -278,7 +325,7 @@ impl Voie {
     pub fn rms_dbfs(&self) -> Option<f64> {
         dbfs(self.rms_globale)
     }
-    /// Facteur de crête (PLR), en dB.
+    /// Facteur de crête (crête − RMS, non pondéré), en dB.
     pub fn facteur_de_crete_db(&self) -> Option<f64> {
         Some(self.crete_dbfs()? - self.rms_dbfs()?)
     }
@@ -318,17 +365,21 @@ pub fn normaliser(echantillons: &[i32], bits: u32) -> Vec<f32> {
         .collect()
 }
 
+/// L'erreur d'un calcul abandonné en route.
+pub const INTERROMPU: &str = "calcul interrompu";
+
 /// Calcule la forme d'onde du fichier `chemin`, de `debut_s` sur `duree_s`
 /// secondes (toute la piste quand `None`). `duree_piste_s` : la durée connue
 /// de la piste, pour borner le décodage et dimensionner les cases. `ceder`
-/// est appelé entre deux fenêtres.
+/// est appelé entre deux fenêtres : s'il rend `false` (la demande a été
+/// abandonnée), le calcul s'arrête là et rend une erreur.
 pub fn calculer(
     chemin: &str,
     colonnes: usize,
     debut_s: f64,
     duree_s: Option<f64>,
     duree_piste_s: Option<f64>,
-    ceder: &dyn Fn(),
+    ceder: &dyn Fn() -> bool,
 ) -> Result<FormeOnde, String> {
     let debut_s = debut_s.max(0.0);
     let longueur = match (duree_s, duree_piste_s) {
@@ -352,8 +403,8 @@ pub fn calculer(
             }
             fenetre = fenetre.min(fin - depart);
         }
-        if i > 0 {
-            ceder();
+        if i > 0 && !ceder() {
+            return Err(INTERROMPU.to_string());
         }
         let pcm = match crate::audio::decode::decode_to_pcm(chemin, None, None, depart, fenetre) {
             Ok(pcm) => pcm,
@@ -368,6 +419,7 @@ pub fn calculer(
         let acc = accumulateur.get_or_insert_with(|| {
             let estimees = longueur.map(|l| (l * f64::from(pcm.sample_rate)) as u64);
             Accumulateur::new(pcm.sample_rate, canaux, colonnes, estimees)
+                .avec_bits(u32::from(pcm.bit_depth))
         });
         if acc.canaux() != canaux as usize {
             return Err("nombre de canaux variable".to_string());

@@ -1,8 +1,9 @@
 //! `GET /library/tracks/{id}/forme-onde` — la forme d'onde d'une piste pour
 //! sa fiche technique (fil du forum 2793, rc12) : par canal et par colonne de
 //! temps, les crêtes (min / max) et la RMS ; par canal et en tout, la crête
-//! maximale, la RMS globale, le facteur de crête (PLR) et le nombre
-//! d'échantillons écrêtés. JSON, niveaux linéaires normalisés à ±1 et
+//! maximale, la RMS globale, le facteur de crête (crête − RMS, non pondéré ;
+//! pas le PLR de l'EBU) et le nombre d'échantillons écrêtés (suites d'au
+//! moins `ECRETAGE_SUITE_MIN` échantillons à la pleine échelle). JSON, niveaux linéaires normalisés à ±1 et
 //! chiffres en dBFS.
 //!
 //! Même règle que le spectrogramme (#7857, `spectrogramme.rs`) :
@@ -10,27 +11,33 @@
 //! * calculé à la demande sur le PCM décodé par Tune (`tune_core::audio::forme_onde`),
 //!   jamais ffmpeg, aucun son ; pistes locales sans perte et avec perte ;
 //!   une piste de service (sans fichier) rend 422, comme le spectrogramme ;
-//! * le résultat de la piste entière est gardé dans
+//! * le résultat de la piste entière, au nombre de colonnes par défaut (le
+//!   seul que l'écran demande), est gardé dans
 //!   `<cache des pochettes>/formes-onde/`, sous une clé qui porte la piste,
 //!   l'empreinte du fichier (chemin, taille, date) et le nombre de colonnes :
-//!   un fichier remplacé ne sert jamais une forme périmée. Plafond
+//!   un autre nombre de colonnes est calculé sans cache ; un fichier remplacé ne sert jamais une forme périmée. Plafond
 //!   [`PLAFOND_DEFAUT_OCTETS`] (ou `TUNE_FORME_ONDE_CACHE_MO`), les moins
 //!   récemment servies partent d'abord ;
 //! * un seul décodage lourd par piste à la fois, deux au plus en tout
-//!   (verrous et sémaphore partagés avec le spectrogramme).
+//!   (verrous et sémaphore partagés avec le spectrogramme). La place du
+//!   sémaphore vit DANS le travail bloquant : une requête abandonnée la garde
+//!   jusqu'à ce que le décodage s'arrête, à la fenêtre suivante.
 //!
 //! Paramètres : `colonnes` (50..4000, 1000 par défaut) ; `debut_s` et `fin_s`
-//! pour une PLAGE (le zoom de l'écran) : calculée sans cache, bornée au
-//! fichier. L'en-tête `X-Tune-Cache` dit `hit`, `miss` ou `plage`.
+//! pour une PLAGE (le zoom de l'écran) : calculée sans cache, bornée à la
+//! durée de la piste (422 si `debut_s` est au-delà, `fin_s` ramenée à la
+//! fin). L'en-tête `X-Tune-Cache` dit `hit`, `miss`, `plage` ou `hors-cache`.
 
 use std::path::{Path as CheminFs, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tune_core::audio::forme_onde::{self, COLONNES_DEFAUT, FormeOnde, SEUIL_ECRETAGE_DBFS};
+use tune_core::audio::forme_onde::{self, COLONNES_DEFAUT, ECRETAGE_SUITE_MIN, FormeOnde};
 use tune_core::db::models::Track;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::taches_de_fond::priorite;
@@ -125,19 +132,21 @@ pub(crate) async fn servir(
 
     // Une plage (zoom) : calculée sans cache.
     if p.debut_s.is_some() || p.fin_s.is_some() {
-        let debut = p.debut_s.unwrap_or(0.0);
-        if !debut.is_finite() || debut < 0.0 {
-            return erreur(StatusCode::BAD_REQUEST, "invalid debut_s");
-        }
-        let duree = match p.fin_s {
-            Some(fin) if !fin.is_finite() || fin <= debut => {
-                return erreur(StatusCode::BAD_REQUEST, "fin_s must be after debut_s");
-            }
-            Some(fin) => Some(fin - debut),
-            None => None,
+        let (debut, duree) = match borner_la_plage(p.debut_s, p.fin_s, duree_piste_s) {
+            Ok(plage) => plage,
+            Err(r) => return r,
         };
         return match calculer(id, chemin, colonnes, debut, duree, duree_piste_s).await {
             Ok(v) => reponse(serde_json::to_vec(&v).unwrap_or_default(), "plage"),
+            Err(r) => r,
+        };
+    }
+
+    // Seul le nombre de colonnes par défaut entre au cache : un autre
+    // nombre ne fait pas pousser le cache d'une variante par valeur.
+    if colonnes != COLONNES_DEFAUT {
+        return match calculer(id, chemin, colonnes, 0.0, None, duree_piste_s).await {
+            Ok(v) => reponse(serde_json::to_vec(&v).unwrap_or_default(), "hors-cache"),
             Err(r) => r,
         };
     }
@@ -171,6 +180,54 @@ pub(crate) async fn servir(
     issue
 }
 
+/// La plage demandée, bornée à la piste : `(debut, duree)`. 400 pour des
+/// bornes absurdes ; 422 quand `debut_s` tombe à la fin de la piste ou
+/// au-delà ; `fin_s` au-delà de la fin est ramenée à la fin (sinon la durée
+/// estimée gonfle les cases et la réponse perd des colonnes). Sans durée
+/// connue, le décodage s'arrête de lui-même à la fin du fichier.
+pub(crate) fn borner_la_plage(
+    debut_s: Option<f64>,
+    fin_s: Option<f64>,
+    duree_piste_s: Option<f64>,
+) -> Result<(f64, Option<f64>), Response> {
+    let debut = debut_s.unwrap_or(0.0);
+    if !debut.is_finite() || debut < 0.0 {
+        return Err(erreur(StatusCode::BAD_REQUEST, "invalid debut_s"));
+    }
+    if let Some(fin) = fin_s {
+        if !fin.is_finite() || fin <= debut {
+            return Err(erreur(
+                StatusCode::BAD_REQUEST,
+                "fin_s must be after debut_s",
+            ));
+        }
+    }
+    let fin = match duree_piste_s {
+        Some(piste) => {
+            if debut >= piste {
+                return Err(erreur(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "debut_s is past the end of the track",
+                ));
+            }
+            Some(fin_s.map_or(piste, |f| f.min(piste)))
+        }
+        None => fin_s,
+    };
+    Ok((debut, fin.map(|f| f - debut)))
+}
+
+/// Levé quand le futur de la requête est lâché (le client a coupé, le zoom
+/// suivant a annulé celui-ci) : le décodage le voit entre deux fenêtres et
+/// s'arrête.
+struct ArretAuDrop(Arc<AtomicBool>);
+
+impl Drop for ArretAuDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 async fn calculer(
     id: i64,
     chemin: String,
@@ -179,14 +236,23 @@ async fn calculer(
     duree_s: Option<f64>,
     duree_piste_s: Option<f64>,
 ) -> Result<Value, Response> {
-    let _place = spectro::GENERATIONS
-        .acquire()
+    let arret = Arc::new(AtomicBool::new(false));
+    let _arret_au_drop = ArretAuDrop(arret.clone());
+    // `acquire_owned` : la place part avec le travail bloquant et n'est
+    // rendue qu'à la fin du décodage, même si la requête est abandonnée.
+    let place = Arc::clone(&spectro::GENERATIONS)
+        .acquire_owned()
         .await
         .map_err(|e| erreur(StatusCode::INTERNAL_SERVER_ERROR, format!("semaphore: {e}")))?;
     let debut = std::time::Instant::now();
     let resultat = priorite::hors_du_fil_async_pour(ORIGINE, TACHE, move || {
+        let _place = place;
+        if arret.load(Ordering::Relaxed) {
+            return Err(forme_onde::INTERROMPU.to_string());
+        }
         forme_onde::calculer(&chemin, colonnes, debut_s, duree_s, duree_piste_s, &|| {
             priorite::ceder_pour_bloquant(ORIGINE, TACHE);
+            !arret.load(Ordering::Relaxed)
         })
     })
     .await
@@ -235,6 +301,7 @@ pub(crate) fn en_json(id: i64, f: &FormeOnde, debut_s: f64, duree_calcul_ms: u64
                 "rms_dbfs": db(v.rms_dbfs()),
                 "facteur_crete_db": db(v.facteur_de_crete_db()),
                 "ecretes": v.ecretes,
+                "colonnes_ecretees": v.colonnes_ecretees,
                 "min": colonne(&v.min),
                 "max": colonne(&v.max),
                 "rms": colonne(&v.rms),
@@ -249,7 +316,7 @@ pub(crate) fn en_json(id: i64, f: &FormeOnde, debut_s: f64, duree_calcul_ms: u64
         "sample_rate": f.sample_rate,
         "debut_s": arrondi(debut_s, 3),
         "duree_s": arrondi(f.duree_s, 3),
-        "seuil_ecretage_dbfs": SEUIL_ECRETAGE_DBFS,
+        "ecretage_suite_min": ECRETAGE_SUITE_MIN,
         "global": {
             "crete_dbfs": db(f.crete_dbfs()),
             "rms_dbfs": db(f.rms_dbfs()),

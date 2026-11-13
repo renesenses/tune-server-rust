@@ -154,7 +154,8 @@ fn fichier_decode_par_fenetres_et_plage() {
     let chemin = chemin.to_string_lossy().into_owned();
     let cessions = std::cell::Cell::new(0);
     let f = calculer(&chemin, 400, 0.0, None, Some(12.0), &|| {
-        cessions.set(cessions.get() + 1)
+        cessions.set(cessions.get() + 1);
+        true
     })
     .unwrap();
     assert_eq!(f.voies.len(), 2);
@@ -166,9 +167,84 @@ fn fichier_decode_par_fenetres_et_plage() {
     assert!(cessions.get() >= 1, "deux fenêtres de 10 s : une cession");
 
     // Une plage de 2 s au milieu.
-    let p = calculer(&chemin, 100, 5.0, Some(2.0), Some(12.0), &|| {}).unwrap();
+    let p = calculer(&chemin, 100, 5.0, Some(2.0), Some(12.0), &|| true).unwrap();
     assert!((p.duree_s - 2.0).abs() < 0.05, "plage {}", p.duree_s);
     assert_eq!(p.colonnes, 100);
 
-    assert!(calculer("/nulle/part.wav", 100, 0.0, None, None, &|| {}).is_err());
+    assert!(calculer("/nulle/part.wav", 100, 0.0, None, None, &|| true).is_err());
+}
+
+#[test]
+fn crete_isolee_a_pleine_echelle_n_est_pas_un_ecretage() {
+    // Une piste normalisée : quelques crêtes isolées à 0 dBFS, et une suite
+    // de deux. Rien n'est écrêté.
+    let mut x = vec![0.25f32; 1000];
+    x[100] = 1.0;
+    x[300] = -1.0;
+    x[500] = 1.0;
+    x[501] = 1.0;
+    let f = forme(&x, 1, 100, Some(1000));
+    assert_eq!(f.ecretes, 0);
+    assert!(f.voies[0].colonnes_ecretees.is_empty());
+    assert!(
+        f.crete_dbfs().unwrap().abs() < 1e-6,
+        "la crête, elle, est à 0 dBFS"
+    );
+
+    // Une suite de trois, puis une de cinq (16 bits : 32767 / 32768 compte).
+    let fs16 = pleine_echelle(16);
+    x[700..703].fill(1.0);
+    x[900..905].fill(-fs16);
+    let mut acc = Accumulateur::new(SR, 1, 100, Some(1000)).avec_bits(16);
+    acc.pousser(&x);
+    let f = acc.terminer();
+    assert_eq!(f.ecretes, 8);
+    assert_eq!(f.voies[0].colonnes_ecretees, vec![70, 90]);
+}
+
+#[test]
+fn ecretage_par_canal_et_a_cheval_sur_deux_poussees() {
+    // La suite se poursuit d'une poussée à l'autre, canal par canal : en
+    // stéréo, le gauche est collé au plafond, le droit alterne.
+    let mut acc = Accumulateur::new(SR, 2, 50, None);
+    acc.pousser(&[1.0, 1.0, 1.0, 0.0]);
+    acc.pousser(&[1.0, 1.0, 1.0, 0.0]);
+    let f = acc.terminer();
+    assert_eq!(f.voies[0].ecretes, 4);
+    assert_eq!(f.voies[1].ecretes, 0);
+}
+
+#[test]
+fn pleine_echelle_selon_le_format() {
+    assert_eq!(pleine_echelle(16), 32767.0 / 32768.0);
+    assert_eq!(pleine_echelle(24), 8_388_607.0 / 8_388_608.0);
+    // En deçà du plus grand code : pas à la pleine échelle.
+    assert!(32766.0 / 32768.0 < pleine_echelle(16));
+}
+
+#[test]
+fn colonnes_bornees() {
+    assert_eq!(borner_colonnes(0), COLONNES_MIN);
+    assert_eq!(borner_colonnes(49), COLONNES_MIN);
+    assert_eq!(borner_colonnes(50), 50);
+    assert_eq!(borner_colonnes(1000), 1000);
+    assert_eq!(borner_colonnes(4000), 4000);
+    assert_eq!(borner_colonnes(4001), COLONNES_MAX);
+    assert_eq!(borner_colonnes(usize::MAX), COLONNES_MAX);
+}
+
+#[test]
+fn calcul_abandonne_entre_deux_fenetres() {
+    let dossier = tempfile::tempdir().unwrap();
+    let chemin = dossier.path().join("long.wav");
+    ecrire_wav_stereo(&chemin, 25.0);
+    let chemin = chemin.to_string_lossy().into_owned();
+    let cessions = std::cell::Cell::new(0);
+    let e = calculer(&chemin, 100, 0.0, None, Some(25.0), &|| {
+        cessions.set(cessions.get() + 1);
+        false
+    })
+    .unwrap_err();
+    assert_eq!(e, INTERROMPU);
+    assert_eq!(cessions.get(), 1, "arrêté dès la première cession");
 }

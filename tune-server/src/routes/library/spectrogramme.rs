@@ -85,8 +85,10 @@ static VERROUS: LazyLock<Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
 
 /// Deux générations au plus en même temps, toutes pistes confondues (la
 /// forme d'onde, fil 2793, partage cette limite).
-pub(super) static GENERATIONS: LazyLock<tokio::sync::Semaphore> =
-    LazyLock::new(|| tokio::sync::Semaphore::new(2));
+/// Dans un `Arc` pour `acquire_owned` (la forme d'onde déplace sa place dans
+/// le travail bloquant).
+pub(super) static GENERATIONS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
 
 pub(super) fn verrou_de(id: i64) -> Arc<tokio::sync::Mutex<()>> {
     let mut verrous = VERROUS.lock().unwrap_or_else(|e| e.into_inner());

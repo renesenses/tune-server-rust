@@ -99,16 +99,16 @@ async fn sinus_stereo_contrat_json_et_cache() {
     let banc = Banc::new();
     banc.piste(1, &[-6.0, -12.0]);
 
-    let (statut, cache, f) = banc.servir(1, colonnes(200)).await;
+    let (statut, cache, f) = banc.servir(1, colonnes(COLONNES_DEFAUT)).await;
     assert_eq!(statut, StatusCode::OK, "{f}");
     assert_eq!(cache.as_deref(), Some("miss"));
     assert_eq!(f["version"], 1);
     assert_eq!(f["track_id"], 1);
-    assert_eq!(f["colonnes"], 200);
+    assert_eq!(f["colonnes"], COLONNES_DEFAUT);
     assert_eq!(f["canaux"], 2);
     assert_eq!(f["sample_rate"], SR);
     assert!(proche(&f["duree_s"], 3.0, 0.01), "{}", f["duree_s"]);
-    assert_eq!(f["seuil_ecretage_dbfs"], SEUIL_ECRETAGE_DBFS);
+    assert_eq!(f["ecretage_suite_min"], ECRETAGE_SUITE_MIN);
     assert!(f["calcule_le"].as_str().is_some_and(|d| d.ends_with('Z')));
     assert!(f["duree_calcul_ms"].as_u64().is_some());
 
@@ -122,16 +122,21 @@ async fn sinus_stereo_contrat_json_et_cache() {
     assert!(proche(&d["crete_dbfs"], -12.0, 0.1), "{}", d["crete_dbfs"]);
     for voie in [g, d] {
         for cle in ["min", "max", "rms"] {
-            assert_eq!(voie[cle].as_array().unwrap().len(), 200, "{cle}");
+            assert_eq!(
+                voie[cle].as_array().unwrap().len(),
+                COLONNES_DEFAUT,
+                "{cle}"
+            );
         }
+        assert_eq!(voie["colonnes_ecretees"], json!([]));
     }
-    assert!(proche(&g["max"][100], 0.501, 0.01), "{}", g["max"][100]);
-    assert!(proche(&g["min"][100], -0.501, 0.01));
+    assert!(proche(&g["max"][500], 0.501, 0.01), "{}", g["max"][500]);
+    assert!(proche(&g["min"][500], -0.501, 0.01));
     assert!(proche(&f["global"]["crete_dbfs"], -6.0, 0.1));
     assert_eq!(f["global"]["ecretes"], 0);
 
     // Second appel : depuis le cache, à l'identique.
-    let (statut, cache, f2) = banc.servir(1, colonnes(200)).await;
+    let (statut, cache, f2) = banc.servir(1, Parametres::default()).await;
     assert_eq!(statut, StatusCode::OK);
     assert_eq!(cache.as_deref(), Some("hit"));
     assert_eq!(f2["voies"], f["voies"]);
@@ -150,6 +155,12 @@ async fn signal_ecrete_decompte_positif() {
     );
     assert_eq!(f["canaux"], 1);
     assert!(proche(&f["global"]["crete_dbfs"], 0.0, 0.01));
+    assert!(
+        !f["voies"][0]["colonnes_ecretees"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -244,4 +255,131 @@ async fn route_branchee_au_routeur() {
         b"track not found",
         "la route existe : 404 de la piste"
     );
+}
+
+#[tokio::test]
+async fn autre_nombre_de_colonnes_hors_cache() {
+    let banc = Banc::new();
+    banc.piste(6, &[-6.0]);
+    for _ in 0..2 {
+        let (statut, cache, f) = banc.servir(6, colonnes(200)).await;
+        assert_eq!(statut, StatusCode::OK, "{f}");
+        assert_eq!(cache.as_deref(), Some("hors-cache"));
+        assert_eq!(f["colonnes"], 200);
+    }
+    assert!(!banc.cache().exists(), "seul le défaut entre au cache");
+    // Les bornes s'appliquent avant : 10 colonnes deviennent 50, 10^9 4000.
+    let (_, _, f) = banc.servir(6, colonnes(10)).await;
+    assert_eq!(f["colonnes"], forme_onde::COLONNES_MIN);
+    let (_, _, f) = banc.servir(6, colonnes(1_000_000_000)).await;
+    // Une piste de 3 s n'a pas 4 000 cases : on vérifie seulement la borne.
+    assert!(f["colonnes"].as_u64().unwrap() <= forme_onde::COLONNES_MAX as u64);
+}
+
+#[tokio::test]
+async fn plage_bornee_a_la_piste() {
+    let banc = Banc::new();
+    banc.piste(7, &[-6.0]);
+    // fin_s au-delà de la fin : ramenée à 3 s, toutes les colonnes rendues.
+    let p = Parametres {
+        colonnes: Some(100),
+        debut_s: Some(1.0),
+        fin_s: Some(1e12),
+    };
+    let (statut, cache, f) = banc.servir(7, p).await;
+    assert_eq!(statut, StatusCode::OK, "{f}");
+    assert_eq!(cache.as_deref(), Some("plage"));
+    assert!(proche(&f["duree_s"], 2.0, 0.01), "{}", f["duree_s"]);
+    assert_eq!(f["colonnes"], 100);
+
+    // debut_s à la fin ou au-delà : 422, rien n'est décodé.
+    for debut in [3.0, 1e12] {
+        let p = Parametres {
+            colonnes: None,
+            debut_s: Some(debut),
+            fin_s: None,
+        };
+        let (statut, _, _) = banc.servir(7, p).await;
+        assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY, "debut_s={debut}");
+    }
+}
+
+#[test]
+fn borner_la_plage_cas_limites() {
+    let ok = |d, f, p| borner_la_plage(d, f, p).ok();
+    assert_eq!(ok(Some(1.0), Some(2.0), Some(10.0)), Some((1.0, Some(1.0))));
+    assert_eq!(
+        ok(Some(1.0), Some(50.0), Some(10.0)),
+        Some((1.0, Some(9.0)))
+    );
+    assert_eq!(ok(Some(4.0), None, Some(10.0)), Some((4.0, Some(6.0))));
+    assert_eq!(ok(None, Some(2.0), None), Some((0.0, Some(2.0))));
+    assert_eq!(ok(Some(4.0), None, None), Some((4.0, None)));
+    let statut = |d, f, p| borner_la_plage(d, f, p).unwrap_err().status();
+    assert_eq!(
+        statut(Some(10.0), None, Some(10.0)),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        statut(Some(-1.0), None, Some(10.0)),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(statut(Some(f64::NAN), None, None), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        statut(Some(2.0), Some(2.0), Some(10.0)),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        statut(Some(2.0), Some(f64::INFINITY), None),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn eviction_au_plafond_garde_la_derniere() {
+    let banc = Banc::new();
+    banc.piste(8, &[-6.0]);
+    banc.piste(9, &[-12.0]);
+    let servir_avec = |id: i64, plafond: u64| {
+        let cache = banc.cache();
+        let state = banc.state.clone();
+        async move {
+            servir(&state, id, Parametres::default(), &cache, plafond)
+                .await
+                .status()
+        }
+    };
+    assert_eq!(servir_avec(8, PLAFOND_DEFAUT_OCTETS).await, StatusCode::OK);
+    let premier: Vec<_> = std::fs::read_dir(banc.cache()).unwrap().flatten().collect();
+    assert_eq!(premier.len(), 1);
+    let taille = premier[0].metadata().unwrap().len();
+    // Un plafond qui tient une seule forme : la plus ancienne part, la
+    // dernière calculée reste.
+    assert_eq!(servir_avec(9, taille + taille / 2).await, StatusCode::OK);
+    let noms: Vec<String> = std::fs::read_dir(banc.cache())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(noms.len(), 1, "{noms:?}");
+    assert!(noms[0].starts_with("9-"), "{noms:?}");
+    // Un plafond nul ne retire jamais celle qu'on vient d'écrire.
+    assert_eq!(servir_avec(8, 0).await, StatusCode::OK);
+    let noms: Vec<String> = std::fs::read_dir(banc.cache())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(noms.len(), 1, "{noms:?}");
+    assert!(noms[0].starts_with("8-"), "{noms:?}");
+}
+
+#[test]
+fn arret_leve_au_drop_du_futur() {
+    let arret = Arc::new(AtomicBool::new(false));
+    {
+        let _garde = ArretAuDrop(arret.clone());
+        assert!(!arret.load(Ordering::Relaxed));
+    }
+    assert!(arret.load(Ordering::Relaxed));
 }
