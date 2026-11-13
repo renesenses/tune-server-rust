@@ -39,9 +39,19 @@ async fn banc(services: crate::streaming::ServiceRegistry) -> Banc {
     db.init_schema().unwrap();
     crate::db::migrations::run_migrations(&db).unwrap();
     let db: Arc<dyn DbBackend> = Arc::new(db);
-    let zone_id = ZoneRepo::with_backend(db.clone())
+    let cree = ZoneRepo::with_backend(db.clone())
         .create("Radio 2694", Some("mock"), Some(SORTIE))
         .unwrap();
+    // Les consignes de la radio (fin voulue, fin sur erreur, dernier lot)
+    // vivent en mémoire, par zone : un identifiant propre à chaque épreuve
+    // les empêche de se croiser entre épreuves parallèles.
+    static PROCHAINE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(26_940_000);
+    let zone_id = PROCHAINE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    db.execute(
+        "UPDATE zones SET id = ? WHERE id = ?",
+        &[&zone_id as &dyn ToSqlValue, &cree],
+    )
+    .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     db.execute_batch(
         "INSERT INTO artists (id, name) VALUES (1, 'Artiste');
@@ -241,6 +251,131 @@ async fn fin_voulue_perimee_si_la_file_a_change() {
 }
 
 #[tokio::test]
+async fn zone_suiveuse_d_un_groupe_ne_lance_pas_la_radio() {
+    let b = banc(crate::streaming::ServiceRegistry::new()).await;
+    crate::db::settings_repo::SettingsRepo::with_backend(b.db.clone())
+        .set(
+            "zone_groups",
+            &serde_json::json!([{ "leader_id": 9999, "zone_ids": [9999, b.zone_id] }]).to_string(),
+        )
+        .unwrap();
+    b.poller
+        .handle_track_end(b.zone_id, &fin_de_la_piste_3(b.zone_id))
+        .await;
+    rien_n_est_ajoute(&b).await;
+}
+
+#[tokio::test]
+async fn la_meneuse_d_un_groupe_lance_la_radio() {
+    let b = banc(crate::streaming::ServiceRegistry::new()).await;
+    crate::db::settings_repo::SettingsRepo::with_backend(b.db.clone())
+        .set(
+            "zone_groups",
+            &serde_json::json!([{ "leader_id": b.zone_id, "zone_ids": [b.zone_id, 9999] }])
+                .to_string(),
+        )
+        .unwrap();
+    b.poller
+        .handle_track_end(b.zone_id, &fin_de_la_piste_3(b.zone_id))
+        .await;
+    assert!(pistes_de_la_file(&b).len() > 2);
+}
+
+#[tokio::test]
+async fn fin_sur_erreur_ne_lance_pas_la_radio() {
+    let b = banc(crate::streaming::ServiceRegistry::new()).await;
+    rff::noter_fin_sur_erreur(b.zone_id);
+    b.poller
+        .handle_track_end(b.zone_id, &fin_de_la_piste_3(b.zone_id))
+        .await;
+    rien_n_est_ajoute(&b).await;
+    // La consigne est consommée : la fin naturelle suivante relance.
+    assert!(!rff::prendre_fin_sur_erreur(b.zone_id));
+}
+
+#[tokio::test]
+async fn un_lot_qui_n_a_joue_aucun_titre_en_entier_n_en_appelle_pas_un_autre() {
+    let b = banc(crate::streaming::ServiceRegistry::new()).await;
+    // La ligne en cours (piste 3) est celle d'un lot dont rien n'a joué.
+    let lignes = rff::lignes_de_la_file(&b.db, b.zone_id);
+    rff::noter_lot(b.zone_id, vec![lignes[1]]);
+    b.poller
+        .terminer_la_file(b.zone_id, &fin_de_la_piste_3(b.zone_id), Some(SORTIE))
+        .await;
+    rien_n_est_ajoute(&b).await;
+}
+
+#[tokio::test]
+async fn un_titre_ajoute_par_l_auditeur_pendant_l_appel_n_est_pas_marque() {
+    let b = banc(crate::streaming::ServiceRegistry::new()).await;
+    let avant = rff::lignes_de_la_file(&b.db, b.zone_id);
+    let file = PlayQueueRepo::with_backend(b.db.clone());
+    file.append_tracks(b.zone_id, &[2]).unwrap(); // l'auditeur
+    file.append_tracks(b.zone_id, &[4]).unwrap(); // la radio, 1 titre
+    let lot = rff::marquer_les_ajouts(&b.db, b.zone_id, &avant, 1);
+    let lignes = rff::lignes_de_la_file(&b.db, b.zone_id);
+    assert_eq!(lot, vec![lignes[3]]);
+    assert!(!rff::lignes_ajoutees_par_la_radio(&b.db, b.zone_id).contains(&lignes[2]));
+}
+
+#[tokio::test]
+async fn les_lignes_de_radio_deja_jouees_sont_purgees_au_dela_du_seuil() {
+    let b = banc(crate::streaming::ServiceRegistry::new()).await;
+    let file = PlayQueueRepo::with_backend(b.db.clone());
+    file.clear(b.zone_id).unwrap();
+    let anciennes: Vec<QueueInput> = (0..rff::GARDER_JOUEES + 5)
+        .map(|i| QueueInput::Streaming {
+            source: "tidal".into(),
+            source_id: format!("x{i}"),
+            title: format!("Ancienne {i}"),
+            artist: "Voisin".into(),
+            album: None,
+            cover_url: None,
+            duration_ms: 180_000,
+            track_number: None,
+            disc_number: None,
+            album_ref: None,
+            artist_ref: None,
+        })
+        .collect();
+    file.append(b.zone_id, &anciennes).unwrap();
+    let marques = rff::lignes_de_la_file(&b.db, b.zone_id);
+    crate::db::settings_repo::SettingsRepo::with_backend(b.db.clone())
+        .set(
+            &rff::cle(b.zone_id),
+            &serde_json::to_string(&marques).unwrap(),
+        )
+        .unwrap();
+    file.append_tracks(b.zone_id, &[3]).unwrap();
+    let n = anciennes.len() as i64;
+    let mut etat = fin_de_la_piste_3(b.zone_id);
+    etat.queue_position = n;
+    etat.queue_length = n + 1;
+    b.poller.handle_track_end(b.zone_id, &etat).await;
+
+    let restantes = file.get_ordered(b.zone_id).unwrap();
+    assert_eq!(
+        restantes[0].source_id.as_deref(),
+        Some("x5"),
+        "les 5 plus anciennes sont parties"
+    );
+    assert_eq!(
+        restantes
+            .iter()
+            .filter(|r| r.source.as_deref() == Some("tidal"))
+            .count(),
+        rff::GARDER_JOUEES
+    );
+    let etat = b.playback.get_state(b.zone_id).await;
+    assert_eq!(etat.state, crate::playback::PlayState::Playing);
+    assert_eq!(
+        etat.queue_position,
+        rff::GARDER_JOUEES as i64 + 1,
+        "la lecture part sur le premier titre du nouveau lot"
+    );
+}
+
+#[tokio::test]
 async fn controle_parental_aucun_titre_ajoute() {
     use crate::db::politique_parentale::{ArtisteBloque, PolitiqueParentale, poser};
     let b = banc(crate::streaming::ServiceRegistry::new()).await;
@@ -415,7 +550,13 @@ async fn la_radio_du_titre_tidal_prolonge_la_file_sans_doublon() {
         .unwrap();
     let ajoutes = b
         .poller
-        .autoplay_streaming_radio(b.zone_id, "Artiste", "tidal", Some("graine"))
+        .autoplay_streaming_radio(
+            b.zone_id,
+            "Artiste",
+            "tidal",
+            Some("graine"),
+            &["deja".to_string()].into_iter().collect(),
+        )
         .await;
     assert_eq!(ajoutes, 2);
     let ids: Vec<Option<String>> = PlayQueueRepo::with_backend(b.db.clone())

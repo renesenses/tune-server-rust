@@ -38,8 +38,23 @@ impl PositionPoller {
             warn!(zone_id, error = %e, "reprise_contexte_non_retiree");
         }
 
+        // Fil 2694 — fin naturelle ou piste en erreur ? Un titre de radio
+        // joué en entier fait « servir » son lot.
+        let fin_sur_erreur = crate::playback::radio_fin_de_file::prendre_fin_sur_erreur(zone_id);
+        if !fin_sur_erreur && crate::playback::radio_fin_de_file::a_un_lot(zone_id) {
+            let pos = zone_state.queue_position.max(0) as usize;
+            if let Some(ligne) =
+                crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
+                    .get_ordered(zone_id)
+                    .ok()
+                    .and_then(|f| f.get(pos).map(|r| r.id))
+            {
+                crate::playback::radio_fin_de_file::noter_ligne_jouee(zone_id, ligne);
+            }
+        }
+
         let Some(next_pos) = Self::next_position(zone_state) else {
-            self.terminer_la_file(zone_id, zone_state, device_id.as_deref())
+            self.terminer_la_file_apres(zone_id, zone_state, device_id.as_deref(), fin_sur_erreur)
                 .await;
             return;
         };
@@ -81,6 +96,19 @@ impl PositionPoller {
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
         device_id: Option<&str>,
+    ) {
+        self.terminer_la_file_apres(zone_id, zone_state, device_id, false)
+            .await;
+    }
+
+    /// [`Self::terminer_la_file`], en disant si la piste qui s'achève a
+    /// échoué (fil 2694 : la radio ne part que sur une fin naturelle).
+    pub(super) async fn terminer_la_file_apres(
+        &self,
+        zone_id: i64,
+        zone_state: &crate::playback::ZoneState,
+        device_id: Option<&str>,
+        fin_sur_erreur: bool,
     ) {
         use crate::db::zone_repo::{AutoplayMode, ZoneRepo};
         // #7415 — la dernière piste de la file vient d'aller à son terme : les
@@ -125,37 +153,93 @@ impl PositionPoller {
         }
         let mode = ZoneRepo::with_backend(self.db.clone()).get_autoplay_mode(zone_id);
         // Fil 2694 (Ilan) — la radio de fin de file, activée par défaut depuis
-        // la rc12, ne s'invite pas là où la fin est voulue : « Vider la suite »,
-        // file d'un réveil, profil sous contrôle parental. La consigne de fin
-        // voulue est consommée même réglage coupé : elle ne vaut que pour
-        // cette fin-là.
-        let fin_voulue = crate::playback::radio_fin_de_file::fin_voulue(&self.db, zone_id);
+        // la rc12, ne s'invite pas là où la fin est voulue (« Vider la
+        // file », réveil), ni après une piste en ERREUR, ni sur une zone qui
+        // en SUIT une autre (la meneuse lance la radio, le relais la
+        // propage), ni quand le lot précédent n'a joué aucun titre en entier,
+        // ni sous contrôle parental. Les consignes de fin sont consommées
+        // même réglage coupé : elles ne valent que pour cette fin-là.
+        use crate::playback::radio_fin_de_file as rff;
+        let photo_de_fin_voulue = rff::prendre_fin_voulue(zone_id);
         if mode != AutoplayMode::Off {
-            if fin_voulue {
-                info!(zone_id, "radio_fin_de_file_ecartee_fin_voulue");
+            let queue = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
+            // La file, lue UNE fois pour toute la décision.
+            let mut file = queue.get_ordered(zone_id).unwrap_or_default();
+            let lignes: Vec<i64> = file.iter().map(|r| r.id).collect();
+            let ligne_courante = lignes
+                .get(zone_state.queue_position.max(0) as usize)
+                .copied();
+            let motif = if fin_sur_erreur {
+                Some("fin_sur_erreur")
+            } else if photo_de_fin_voulue.as_ref() == Some(&lignes) {
+                Some("fin_voulue")
+            } else if rff::zone_suiveuse(&self.db, zone_id) {
+                Some("zone_suiveuse")
+            } else if rff::lot_muet(zone_id, ligne_courante) {
+                Some("lot_precedent_sans_titre_joue")
             } else if !self
                 .radio_de_fin_de_file_sans_garde_parentale(zone_id)
                 .await
             {
-                info!(zone_id, "radio_fin_de_file_ecartee_controle_parental");
+                Some("controle_parental")
             } else {
-                let avant =
-                    crate::playback::radio_fin_de_file::lignes_de_la_file(&self.db, zone_id);
-                self.prolonger_la_file(zone_id, zone_state, device_id, mode)
-                    .await;
-                let marquees = crate::playback::radio_fin_de_file::marquer_les_ajouts(
-                    &self.db, zone_id, &avant,
+                None
+            };
+            if let Some(motif) = motif {
+                info!(zone_id, motif, "radio_fin_de_file_ecartee");
+            } else {
+                // File bornée : les lignes de radio déjà jouées au-delà des
+                // `GARDER_JOUEES` plus récentes quittent la file.
+                let mut etat = zone_state.clone();
+                let marques = rff::lignes_ajoutees_par_la_radio(&self.db, zone_id);
+                let a_purger = rff::lignes_de_radio_a_purger(
+                    &lignes,
+                    &marques,
+                    zone_state.queue_position,
+                    rff::GARDER_JOUEES,
                 );
-                if marquees > 0
-                    && let Some(ref bus) = self.event_bus
-                {
-                    // Les marques s'écrivent APRÈS l'ajout : on redit la file
-                    // pour que le badge « ajouté par la radio » paraisse sans
-                    // attendre le rechargement suivant.
-                    bus.emit(
-                        "playback.queue_changed",
-                        serde_json::json!({ "zone_id": zone_id, "added_by_radio": marquees }),
-                    );
+                if !a_purger.is_empty() {
+                    match queue.retirer_les_lignes(&file, &a_purger) {
+                        Ok(n) => {
+                            file.retain(|r| !a_purger.contains(&r.id));
+                            etat.queue_position -= n as i64;
+                            etat.queue_length = file.len() as i64;
+                            self.playback
+                                .update_queue_info(zone_id, etat.queue_position, etat.queue_length)
+                                .await;
+                            info!(zone_id, retirees = n, "radio_fin_de_file_purge");
+                        }
+                        Err(e) => warn!(zone_id, error = %e, "radio_fin_de_file_purge_echouee"),
+                    }
+                }
+                let avant: Vec<i64> = file.iter().map(|r| r.id).collect();
+                let deja_dans_la_file: std::collections::HashSet<i64> =
+                    file.iter().filter_map(|r| r.track_id).collect();
+                let deja_de_service: std::collections::HashSet<String> =
+                    file.iter().filter_map(|r| r.source_id.clone()).collect();
+                let ajoutees = self
+                    .prolonger_la_file(
+                        zone_id,
+                        &etat,
+                        device_id,
+                        mode,
+                        &deja_dans_la_file,
+                        &deja_de_service,
+                    )
+                    .await;
+                let lot = rff::marquer_les_ajouts(&self.db, zone_id, &avant, ajoutees);
+                if !lot.is_empty() {
+                    let marquees = lot.len();
+                    rff::noter_lot(zone_id, lot);
+                    if let Some(ref bus) = self.event_bus {
+                        // Les marques s'écrivent APRÈS l'ajout : on redit la
+                        // file pour que le badge « Radio » paraisse sans
+                        // attendre le rechargement suivant.
+                        bus.emit(
+                            "playback.queue_changed",
+                            serde_json::json!({ "zone_id": zone_id, "added_by_radio": marquees }),
+                        );
+                    }
                 }
                 return;
             }
@@ -186,26 +270,26 @@ impl PositionPoller {
     }
 
     /// Le prolongement de la file selon le mode de la zone (#2271). Chaque
-    /// chemin sort après avoir décidé : lecture du lot ajouté, ou arrêt.
+    /// chemin sort après avoir décidé : lecture du lot ajouté, ou arrêt. Rend
+    /// le nombre de lignes ajoutées par la radio (fil 2694 : seules celles-ci
+    /// reçoivent la marque). `deja_dans_la_file` / `deja_de_service` : la file
+    /// lue UNE fois par l'appelant (pistes locales, identifiants de service).
     async fn prolonger_la_file(
         &self,
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
         device_id: Option<&str>,
         mode: crate::db::zone_repo::AutoplayMode,
-    ) {
+        deja_dans_la_file: &std::collections::HashSet<i64>,
+        deja_de_service: &std::collections::HashSet<String>,
+    ) -> usize {
         use crate::db::zone_repo::AutoplayMode;
-        // Fil 2694 — pas de doublon : ce qui est déjà dans la file (joué ou
-        // à venir) n'y revient pas par la radio.
-        let deja_dans_la_file =
-            crate::playback::radio_fin_de_file::pistes_locales_de_la_file(&self.db, zone_id);
         match mode {
             AutoplayMode::RandomAlbum
             | AutoplayMode::RandomArtist
             | AutoplayMode::RandomYear
             | AutoplayMode::RandomTracks => {
-                self.continuer_aleatoirement(zone_id, mode, device_id).await;
-                return;
+                return self.continuer_aleatoirement(zone_id, mode, device_id).await;
             }
             AutoplayMode::Off | AutoplayMode::Similar => {}
         }
@@ -253,7 +337,7 @@ impl PositionPoller {
                             warn!(zone_id, error = %e, "autoplay_play_failed");
                             self.orchestrator.stop(zone_id, device_id).await;
                         }
-                        return;
+                        return ids.len();
                     }
                 }
 
@@ -296,7 +380,13 @@ impl PositionPoller {
                 && let Some(ref source) = seed_source
             {
                 let added = self
-                    .autoplay_streaming_radio(zone_id, artist, source, seed_source_id.as_deref())
+                    .autoplay_streaming_radio(
+                        zone_id,
+                        artist,
+                        source,
+                        seed_source_id.as_deref(),
+                        deja_de_service,
+                    )
                     .await;
                 if added > 0 {
                     let new_pos = zone_state.queue_position + 1;
@@ -310,7 +400,7 @@ impl PositionPoller {
                         warn!(zone_id, error = %e, "autoplay_play_failed");
                         self.orchestrator.stop(zone_id, device_id).await;
                     }
-                    return;
+                    return added;
                 }
                 // Le service n'a rien rendu (hors catalogue, API muette) :
                 // on retombe sur le generateur local plutot que de laisser
@@ -364,7 +454,13 @@ impl PositionPoller {
                     .filter(|s| s != "local" && !s.is_empty())
             {
                 let added = self
-                    .autoplay_streaming_radio(zone_id, artist, &source, seed_source_id.as_deref())
+                    .autoplay_streaming_radio(
+                        zone_id,
+                        artist,
+                        &source,
+                        seed_source_id.as_deref(),
+                        deja_de_service,
+                    )
                     .await;
                 if added > 0 {
                     let new_pos = zone_state.queue_position + 1;
@@ -378,7 +474,7 @@ impl PositionPoller {
                         warn!(zone_id, error = %e, "autoplay_play_failed");
                         self.orchestrator.stop(zone_id, device_id).await;
                     }
-                    return;
+                    return added;
                 }
             }
 
@@ -395,7 +491,7 @@ impl PositionPoller {
                 if let Err(e) = queue_repo.append_tracks(zone_id, &track_ids) {
                     warn!(zone_id, error = %e, "autoplay_append_queue_failed");
                     self.orchestrator.stop(zone_id, device_id).await;
-                    return;
+                    return 0;
                 }
 
                 // Emit autoplay_tracks_added event for UI updates
@@ -419,7 +515,7 @@ impl PositionPoller {
                     warn!(zone_id, error = %e, "autoplay_play_failed");
                     self.orchestrator.stop(zone_id, device_id).await;
                 }
-                return;
+                return track_ids.len();
             }
             info!(zone_id, "autoplay_no_similar_tracks_found");
         }
@@ -436,6 +532,7 @@ impl PositionPoller {
             "queue_ended"
         );
         self.orchestrator.stop(zone_id, device_id).await;
+        0
     }
 
     /// #5395 — recharge une radio artiste quand la file s'achève sur l'un de
@@ -520,7 +617,7 @@ impl PositionPoller {
         zone_id: i64,
         mode: crate::db::zone_repo::AutoplayMode,
         device_id: Option<&str>,
-    ) {
+    ) -> usize {
         let result = (|| {
             let generated = crate::playback::auto_dj::generate_random_queue(&self.db, mode)?;
             let ids: Vec<i64> = generated
@@ -563,10 +660,13 @@ impl PositionPoller {
                         }),
                     );
                 }
+                let ajoutees = ids.len();
                 match self.orchestrator.play_from_queue(zone_id, position).await {
-                    Ok(_) => return,
+                    Ok(_) => return ajoutees,
                     Err(e) => {
-                        warn!(zone_id, mode = mode.as_str(), error = %e, "autoplay_play_failed")
+                        warn!(zone_id, mode = mode.as_str(), error = %e, "autoplay_play_failed");
+                        self.orchestrator.stop(zone_id, device_id).await;
+                        return ajoutees;
                     }
                 }
             }
@@ -580,6 +680,7 @@ impl PositionPoller {
             }
         }
         self.orchestrator.stop(zone_id, device_id).await;
+        0
     }
 
     /// Avance : joue la position suivante, et saute les pistes qui échouent

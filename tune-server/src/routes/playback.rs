@@ -10695,8 +10695,10 @@ mod vider_la_suite_4169 {
             tune_core::playback::radio_fin_de_file::marquer_les_ajouts(
                 &state.backend,
                 zone_id,
-                &avant
-            ),
+                &avant,
+                2
+            )
+            .len(),
             2
         );
         let reponse = crate::routes::router(state.clone())

@@ -1024,3 +1024,6 @@ mod contenus_album_playlist_7058;
 
 #[cfg(test)]
 mod interrompre_la_lecture_8615;
+
+#[cfg(test)]
+mod radio_fin_de_file_2694;

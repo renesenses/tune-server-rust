@@ -199,6 +199,7 @@ impl PositionPoller {
         seed_artist: &str,
         source: &str,
         seed_source_id: Option<&str>,
+        deja_de_service: &std::collections::HashSet<String>,
     ) -> usize {
         let Some(service) = self
             .orchestrator
@@ -219,11 +220,8 @@ impl PositionPoller {
         if let Some(id) = seed_source_id {
             exclude.insert(id.to_string());
         }
-        if let Ok(rows) = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
-            .get_ordered(zone_id)
-        {
-            exclude.extend(rows.into_iter().filter_map(|r| r.source_id));
-        }
+        // La file, lue une fois par l'appelant (fil 2694).
+        exclude.extend(deja_de_service.iter().cloned());
         // #4806 — ni un titre de ce service BANNI par le profil actif : la
         // radio est une sélection automatique. L'exclusion se fait AVANT le
         // tirage, pour que les 10 titres demandés soient 10 titres jouables.
