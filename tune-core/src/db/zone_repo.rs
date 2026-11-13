@@ -214,13 +214,9 @@ pub mod sql {
         format!("SELECT {COLS} FROM zones ORDER BY name")
     }
 
-    /// Fil 2694 (décision de Bertrand du 13/11, « comme Roon ») : une zone
-    /// naît avec la radio de fin de file ACTIVÉE (`autoplay_enabled` = '1',
-    /// mode « titres similaires »). Désactivable par zone.
     pub fn create<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO zones (name, output_type, output_device_id, autoplay_enabled) \
-             VALUES ({}, {}, {}, '1')",
+            "INSERT INTO zones (name, output_type, output_device_id) VALUES ({}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3)
@@ -1335,7 +1331,23 @@ impl ZoneRepo {
         // the rowid we read reflects the INSERT we just did.
         let create_sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&name, &output_type, &output_device_id];
-        self.db.execute_returning_id(&create_sql, &params)
+        let id = self.db.execute_returning_id(&create_sql, &params)?;
+        self.radio_de_fin_de_file_par_defaut(id);
+        Ok(id)
+    }
+
+    /// Fil 2694 (décision de Bertrand du 13/11, « comme Roon ») : une zone
+    /// naît avec la radio de fin de file ACTIVÉE (mode « titres similaires »).
+    /// Désactivable par zone. Au mieux : une base trop ancienne pour avoir la
+    /// colonne crée sa zone quand même (le réglage y est de toute façon
+    /// illisible, donc éteint).
+    fn radio_de_fin_de_file_par_defaut(&self, id: i64) {
+        let sql = self.update_field_sql("autoplay_enabled");
+        let val = AutoplayMode::Similar.as_stocke().to_string();
+        let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        if let Err(e) = self.db.execute(&sql, &params) {
+            tracing::debug!(zone_id = id, error = %e, "radio_fin_de_file_defaut_non_pose");
+        }
     }
 
     /// Atomically get an existing zone by output_device_id, or create a new one.
