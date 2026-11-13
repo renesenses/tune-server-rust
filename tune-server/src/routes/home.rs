@@ -4666,6 +4666,13 @@ mod tests_raisons_8280 {
         state.backend.execute(requete, &[]).expect(requete);
     }
 
+    fn recommandes(state: &AppState) -> Vec<Value> {
+        let Ok(items) = fetch_recommendations_graine(state, 20, 0) else {
+            panic!("la requete doit repondre")
+        };
+        items
+    }
+
     fn par_raison<'a>(items: &'a [Value], reason: &str) -> Vec<&'a Value> {
         items.iter().filter(|i| i["reason"] == reason).collect()
     }
@@ -4692,7 +4699,7 @@ mod tests_raisons_8280 {
              VALUES ('So What', 'Miles Davis', 'Kind of Blue', 1, '2026-10-01T10:00:00Z')",
         );
 
-        let items = fetch_recommendations_graine(&state, 20, 0).unwrap();
+        let items = recommandes(&state);
         let mut ids: Vec<i64> = items.iter().filter_map(|i| i["id"].as_i64()).collect();
         ids.sort();
         assert_eq!(
@@ -4740,7 +4747,7 @@ mod tests_raisons_8280 {
             );
         }
 
-        let items = fetch_recommendations_graine(&state, 20, 0).unwrap();
+        let items = recommandes(&state);
         assert_eq!(items.len(), 1, "{items:?}");
         assert_eq!(items[0]["id"], json!(2));
         assert_eq!(items[0]["reason"], json!("year_match"));
@@ -4762,7 +4769,7 @@ mod tests_raisons_8280 {
             &state,
             "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Hits 1', 1), (2, 'Hits 2', 1)",
         );
-        let items = fetch_recommendations_graine(&state, 20, 0).unwrap();
+        let items = recommandes(&state);
         assert!(
             items.iter().all(|i| i["reason"] == "random"),
             "seul le hasard reste : {items:?}"
@@ -4792,7 +4799,7 @@ mod tests_raisons_8280 {
                  VALUES ('So What', 'Miles Davis', 'Kind of Blue', 1, '2026-10-01T10:00:00Z')",
             );
         }
-        let items = fetch_recommendations_graine(&state, 20, 0).unwrap();
+        let items = recommandes(&state);
         let ids: Vec<i64> = items.iter().filter_map(|i| i["id"].as_i64()).collect();
         let uniques: std::collections::BTreeSet<i64> = ids.iter().copied().collect();
         assert_eq!(ids.len(), uniques.len(), "doublon : {items:?}");
@@ -4824,7 +4831,7 @@ mod tests_raisons_8280 {
             "INSERT INTO listen_history (title, artist_name, album_title, album_id, listened_at) \
              VALUES ('So What', 'Miles Davis', 'Kind of Blue', 1, '2026-10-01T10:00:00Z')",
         );
-        let items = fetch_recommendations_graine(&state, 20, 0).unwrap();
+        let items = recommandes(&state);
         assert_eq!(items.len(), 2, "{items:?}");
         for a in &items {
             for champ in [
