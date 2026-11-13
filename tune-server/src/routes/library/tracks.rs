@@ -1681,7 +1681,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
             let mut skipped = 0usize;
             let mut errors = 0usize;
             let mut extended_metadata_failed_batches = 0usize;
-            taches.update_progress(TACHE_RESCAN_METADATA, 0, total as u64, "Métadonnées");
+            taches.update_progress(TACHE_RESCAN_METADATA, 0, total as u64, crate::background_tasks::Phase::Metadata);
 
             for track in tracks {
                 // Jalon en TÊTE de boucle, pas en queue : trois branches de ce
@@ -1696,8 +1696,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                     taches.update_progress(
                         TACHE_RESCAN_METADATA,
                         traitees as u64,
-                        total as u64,
-                        "Métadonnées",
+                        total as u64, crate::background_tasks::Phase::Metadata,
                     );
                 }
 
