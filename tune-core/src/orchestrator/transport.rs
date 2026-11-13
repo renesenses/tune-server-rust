@@ -3266,6 +3266,13 @@ impl PlaybackOrchestrator {
                  interdit par le contrôle parental de ce profil"
             );
         }
+        // #8611 — la politique du profil ne se relit pas : la file s'arrête.
+        if cause.contains(crate::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE) {
+            return format!(
+                "Impossible de lire la piste {geste} : la politique de contrôle \
+                 parental de ce profil est illisible"
+            );
+        }
         // #8611 — de même pour un artiste bloqué.
         if cause.contains(crate::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE) {
             return format!(

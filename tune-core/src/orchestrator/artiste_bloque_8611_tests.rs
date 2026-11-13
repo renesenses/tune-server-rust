@@ -7,14 +7,14 @@
 //! Services simulés (aucun appel réel), aucune sortie audible.
 use std::sync::Arc;
 
-use super::artiste_bloque_8611::sentinelle_contenu_bloque;
+use super::artiste_bloque_8611::{sentinelle_contenu_bloque, sentinelle_politique_illisible};
 use super::enjamber_les_refus::SensDuGeste;
 use super::{PlayRequest, PlaybackOrchestrator};
 use crate::TuneError;
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
 use crate::db::politique_parentale::{
-    ArtisteBloque, CODE_REFUS_CONTENU_BLOQUE, PolitiqueParentale, poser,
+    ArtisteBloque, CODE_POLITIQUE_ILLISIBLE, CODE_REFUS_CONTENU_BLOQUE, PolitiqueParentale, poser,
 };
 use crate::source_url::{FournisseurDUrl, RefusDUrl, UrlFournie};
 use crate::streaming::traits::{
@@ -384,8 +384,18 @@ fn ligne(reference: &str, titre: &str, artiste: &str) -> QueueInput {
     }
 }
 
-#[tokio::test]
-async fn dans_une_file_la_piste_bloquee_est_sautee_8611() {
+struct BancDeFile {
+    db: Arc<dyn DbBackend>,
+    orch: Arc<PlaybackOrchestrator>,
+    playback: Arc<crate::playback::PlaybackManager>,
+    zone_id: i64,
+    fournisseur: Arc<FauxFournisseur>,
+    bus: Arc<crate::event_bus::EventBus>,
+}
+
+/// Une zone DLNA simulée, une file de trois titres (le deuxième de
+/// l'artiste bloqué), le profil `profil` à l'écoute.
+async fn banc_de_file(profil: i64) -> BancDeFile {
     use crate::outputs::OutputRegistry;
     use crate::outputs::mock::MockOutput;
     let db = base();
@@ -425,7 +435,39 @@ async fn dans_une_file_la_piste_bloquee_est_sautee_8611() {
     });
     orch.sources_url().inscrire(SOURCE, fournisseur.clone());
     playback.update_queue_info(zone_id, 0, 3).await;
-    playback.set_session_profile(zone_id, Some(ENFANT)).await;
+    playback.set_session_profile(zone_id, Some(profil)).await;
+    BancDeFile {
+        db,
+        orch,
+        playback,
+        zone_id,
+        fournisseur,
+        bus,
+    }
+}
+
+fn sauts(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+) -> Vec<serde_json::Value> {
+    let mut v = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        if e.event_type == "playback.track_skipped" {
+            v.push(e.data.clone());
+        }
+    }
+    v
+}
+
+#[tokio::test]
+async fn dans_une_file_la_piste_bloquee_est_sautee_8611() {
+    let BancDeFile {
+        db,
+        orch,
+        playback,
+        zone_id,
+        fournisseur,
+        bus,
+    } = banc_de_file(ENFANT).await;
     bloquer(&db);
     let mut rx = bus.subscribe();
 
@@ -445,13 +487,9 @@ async fn dans_une_file_la_piste_bloquee_est_sautee_8611() {
         etat.now_playing.and_then(|n| n.source_id).as_deref(),
         Some("8611:3")
     );
-    let mut saut = None;
-    while let Ok(e) = rx.try_recv() {
-        if e.event_type == "playback.track_skipped" {
-            saut = Some(e.data.clone());
-        }
-    }
-    let saut = saut.expect("le saut de la piste bloquée doit être annoncé");
+    let saut = sauts(&mut rx)
+        .pop()
+        .expect("le saut de la piste bloquée doit être annoncé");
     assert_eq!(saut["position"], 1);
     assert!(
         saut["reason"]
@@ -468,4 +506,113 @@ async fn dans_une_file_la_piste_bloquee_est_sautee_8611() {
         .await
         .expect("l'administrateur joue la piste");
     assert_eq!(*fournisseur.demandes.lock().unwrap(), vec!["8611:2"]);
+}
+
+// --- Politique qui ne se relit pas (relecture de #8636). ---
+
+/// La ligne de la politique de l'enfant, corrompue.
+fn corrompre(db: &Arc<dyn DbBackend>) {
+    db.execute(
+        "UPDATE politiques_parentales SET politique_json = '{pas du json' WHERE profile_id = ?",
+        &[&ENFANT as &dyn ToSqlValue],
+    )
+    .unwrap();
+}
+
+/// La base ne relit plus la table des politiques (erreur qui n'est ni une
+/// table absente ni une ligne corrompue : base occupée, PG coupé).
+fn casser_la_lecture(db: &Arc<dyn DbBackend>) {
+    db.execute(
+        "ALTER TABLE politiques_parentales RENAME COLUMN politique_json TO autre_8611",
+        &[],
+    )
+    .unwrap();
+}
+
+fn demande_de_la_file(zone_id: i64, artiste: &str) -> PlayRequest {
+    PlayRequest {
+        zone_id,
+        source: Some(SOURCE.into()),
+        source_id: Some("8611:9".into()),
+        artist_name: Some(artiste.into()),
+        ..Default::default()
+    }
+}
+
+/// Politique corrompue : la garde des artistes refuse au code
+/// `parental_policy_unreadable`, qui n'est pas propre à la piste et ARRÊTE
+/// la file : pas de saut en chaîne, rien n'est demandé à la source.
+#[tokio::test]
+async fn une_politique_corrompue_arrete_la_file_sans_sauter_8611() {
+    let e = sentinelle_politique_illisible();
+    assert!(
+        !crate::poller::refus_propre_a_la_piste(&e),
+        "pas propre à la piste"
+    );
+    assert!(crate::source_url::arret_de_la_file(&e), "la file s'arrête");
+    let m = PlaybackOrchestrator::message_piste_non_demarree("suivante", &e);
+    assert!(m.contains("illisible"), "{m}");
+
+    let banc = banc_de_file(ENFANT).await;
+    bloquer(&banc.db);
+    corrompre(&banc.db);
+    assert_eq!(
+        banc.orch
+            .verifier_l_artiste_bloque(&demande_de_la_file(banc.zone_id, "Groupe Libre"))
+            .await,
+        Err(sentinelle_politique_illisible())
+    );
+    assert!(!e.contains(CODE_REFUS_CONTENU_BLOQUE));
+    let mut rx = banc.bus.subscribe();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        banc.orch
+            .jouer_en_enjambant_les_refus(banc.zone_id, 0, SensDuGeste::Suivant),
+    )
+    .await
+    .expect("le geste doit rendre la main")
+    .expect_err("politique corrompue : rien ne joue");
+    assert!(sauts(&mut rx).is_empty(), "aucun saut en chaîne");
+    assert!(banc.fournisseur.demandes.lock().unwrap().is_empty());
+
+    // Témoin : l'administrateur (sans politique) joue sur la même base.
+    banc.playback
+        .set_session_profile(banc.zone_id, Some(ADMIN))
+        .await;
+    banc.orch
+        .jouer_en_enjambant_les_refus(banc.zone_id, 1, SensDuGeste::Suivant)
+        .await
+        .expect("l'administrateur n'est pas bloqué");
+    assert_eq!(*banc.fournisseur.demandes.lock().unwrap(), vec!["8611:2"]);
+}
+
+/// La base ne relit plus les politiques (base occupée, PG coupé) : la garde
+/// des artistes ne bloque RIEN et ne refuse pas en chaîne ; l'administrateur
+/// joue la file. (Pour le profil supervisé, le bail #7974 garde son propre
+/// comportement : seule la garde des artistes est jugée ici.)
+#[tokio::test]
+async fn une_base_qui_ne_repond_pas_ne_bloque_pas_sur_l_artiste_8611() {
+    let banc = banc_de_file(ADMIN).await;
+    bloquer(&banc.db);
+    casser_la_lecture(&banc.db);
+    let mut rx = banc.bus.subscribe();
+    banc.orch
+        .jouer_en_enjambant_les_refus(banc.zone_id, 1, SensDuGeste::Suivant)
+        .await
+        .expect("l'administrateur n'est pas bloqué pendant la panne");
+    assert_eq!(*banc.fournisseur.demandes.lock().unwrap(), vec!["8611:2"]);
+    assert!(sauts(&mut rx).is_empty(), "aucun saut");
+
+    banc.playback
+        .set_session_profile(banc.zone_id, Some(ENFANT))
+        .await;
+    assert_eq!(
+        banc.orch
+            .verifier_l_artiste_bloque(&demande_de_la_file(banc.zone_id, "Groupe Interdit"))
+            .await,
+        Ok(()),
+        "base muette : la garde des artistes ne refuse rien"
+    );
+    // Pas de préparation d'avance pendant la panne.
+    assert!(banc.orch.garde_parentale_par_piste(banc.zone_id).await);
 }

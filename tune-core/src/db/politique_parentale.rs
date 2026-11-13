@@ -29,6 +29,22 @@ pub const CODE_REFUS_EXPLICITE: &str = "parental_explicit_refused";
 /// `orchestrator::play`).
 pub const CODE_REFUS_CONTENU_BLOQUE: &str = "parental_content_blocked";
 
+/// #8611 — le code stable d'une lecture refusée parce que la politique
+/// ENREGISTRÉE du profil ne se relit pas (ligne corrompue). Ce refus n'est
+/// PAS propre à la piste : il arrête la file au lieu de la faire sauter
+/// piste après piste (`source_url::arret_de_la_file`).
+pub const CODE_POLITIQUE_ILLISIBLE: &str = "parental_policy_unreadable";
+
+/// Tête de l'erreur de [`lire`] quand la ligne existe mais que son JSON ne
+/// se relit pas.
+const TETE_POLITIQUE_CORROMPUE: &str = "politique_parentale illisible";
+
+/// #8611 — l'erreur de [`lire`] dit-elle que la politique est enregistrée
+/// mais corrompue (et non que la base n'a pas répondu) ?
+pub fn politique_corrompue(erreur: &str) -> bool {
+    erreur.starts_with(TETE_POLITIQUE_CORROMPUE)
+}
+
 /// Plafonds de taille d'une politique : une liste plus longue est refusée.
 pub const ELEMENTS_MAX: usize = 5000;
 pub const PLAGES_MAX: usize = 64;
@@ -168,7 +184,7 @@ pub fn lire(
         return Ok(None);
     };
     let politique = serde_json::from_str(&row[3].as_string().unwrap_or_default())
-        .map_err(|e| format!("politique_parentale illisible: {e}"))?;
+        .map_err(|e| format!("{TETE_POLITIQUE_CORROMPUE}: {e}"))?;
     Ok(Some(PolitiqueEnregistree {
         profile_id: row[0].as_i64().unwrap_or(profile_id),
         superviseur_id: row[1].as_i64().unwrap_or(0),

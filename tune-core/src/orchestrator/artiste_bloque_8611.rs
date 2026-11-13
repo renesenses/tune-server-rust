@@ -19,8 +19,17 @@
 //!   lecture échouera de toute façon sans le service).
 //!
 //! Un profil sans politique, ou sans artiste bloqué, ne coûte qu'une lecture
-//! de la politique (clé primaire). Une politique illisible refuse la lecture,
-//! comme elle refuse les listes.
+//! de la politique (clé primaire).
+//!
+//! Politique qui ne se relit pas :
+//! - la BASE ne répond pas (occupée, PostgreSQL coupé) : la garde des
+//!   artistes ne bloque rien et le journalise. Refuser ici refuserait toutes
+//!   les pistes de toutes les zones, administrateur compris ; la garde des
+//!   contenus explicites (#8088) garde son comportement ;
+//! - la ligne existe mais est CORROMPUE (seul un profil supervisé en a une) :
+//!   la lecture est refusée au code `parental_policy_unreadable`, qui n'est
+//!   pas propre à la piste et ARRÊTE la file (`source_url::arret_de_la_file`)
+//!   au lieu de la faire sauter piste après piste.
 
 use super::{PlayRequest, PlaybackOrchestrator};
 use crate::db::politique_parentale as pp;
@@ -33,12 +42,22 @@ pub fn sentinelle_contenu_bloque() -> String {
     )
 }
 
+/// #8611 — la sentinelle de la lecture refusée sur une politique corrompue.
+pub fn sentinelle_politique_illisible() -> String {
+    format!(
+        "{}: politique parentale du profil illisible",
+        pp::CODE_POLITIQUE_ILLISIBLE
+    )
+}
+
 /// La politique du profil qui écoute sur une zone, telle que la lecture la
-/// voit : aucune (pas de ligne, ou pas de table), posée, ou illisible.
+/// voit : aucune (pas de ligne, ou pas de table), posée, base qui ne répond
+/// pas, ou ligne corrompue.
 pub(crate) enum PolitiqueDeLaZone {
     Aucune,
     Posee(pp::PolitiqueParentale),
-    Illisible,
+    BaseIndisponible,
+    Corrompue,
 }
 
 impl PlaybackOrchestrator {
@@ -50,9 +69,13 @@ impl PlaybackOrchestrator {
             Ok(Some(p)) => PolitiqueDeLaZone::Posee(p.politique),
             Ok(None) => PolitiqueDeLaZone::Aucune,
             Err(e) if pp::table_absente(&e) => PolitiqueDeLaZone::Aucune,
+            Err(e) if pp::politique_corrompue(&e) => {
+                tracing::warn!(zone_id, profil, error = %e, "parental_policy_corrupted");
+                PolitiqueDeLaZone::Corrompue
+            }
             Err(e) => {
                 tracing::warn!(zone_id, profil, error = %e, "parental_policy_unreadable");
-                PolitiqueDeLaZone::Illisible
+                PolitiqueDeLaZone::BaseIndisponible
             }
         }
     }
@@ -65,7 +88,7 @@ impl PlaybackOrchestrator {
         match self.politique_de_la_zone(zone_id).await {
             PolitiqueDeLaZone::Aucune => false,
             PolitiqueDeLaZone::Posee(p) => p.masquer_explicite || !p.artistes_bloques.is_empty(),
-            PolitiqueDeLaZone::Illisible => true,
+            PolitiqueDeLaZone::BaseIndisponible | PolitiqueDeLaZone::Corrompue => true,
         }
     }
 
@@ -73,12 +96,12 @@ impl PlaybackOrchestrator {
     pub(super) async fn verifier_l_artiste_bloque(&self, req: &PlayRequest) -> Result<(), String> {
         let politique = match self.politique_de_la_zone(req.zone_id).await {
             PolitiqueDeLaZone::Aucune => return Ok(()),
-            PolitiqueDeLaZone::Illisible => {
-                tracing::info!(
-                    zone_id = req.zone_id,
-                    "parental_content_blocked_policy_unreadable"
-                );
-                return Err(sentinelle_contenu_bloque());
+            // La base ne répond pas : rien n'est bloqué sur l'artiste (déjà
+            // journalisé par `politique_de_la_zone`).
+            PolitiqueDeLaZone::BaseIndisponible => return Ok(()),
+            PolitiqueDeLaZone::Corrompue => {
+                tracing::info!(zone_id = req.zone_id, "parental_policy_unreadable_refused");
+                return Err(sentinelle_politique_illisible());
             }
             PolitiqueDeLaZone::Posee(p) => p,
         };
