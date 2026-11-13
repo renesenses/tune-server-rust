@@ -11,7 +11,19 @@
 //!   désarme la passe (désactivée par défaut) ; montre ou masque le verdict
 //!   « douteux » dans la liste des albums, son filtre et les règles
 //!   intelligentes (masqué par défaut, deuxième étape). Les deux champs sont
-//!   facultatifs : un champ absent garde sa valeur.
+//!   facultatifs : un champ absent garde sa valeur — sauf un cas, ci-dessous.
+//!   `PUT` est accepté aussi, avec le même corps.
+//!
+//! # L'interrupteur de l'utilisateur montre aussi « douteux » (rc12)
+//!
+//! Décision de Bertrand (13/11/2026) : la détection doit être utilisable
+//! depuis Réglages › Bibliothèque, où un seul interrupteur « Détecter les
+//! faux Hi-Res » envoie `{active}`. Allumer la détection sans rien dire de
+//! `douteux_visible` le MONTRE ; l'éteindre ainsi le masque. Le verdict
+//! « douteux » suit donc l'interrupteur, et un appel qui fournit
+//! `douteux_visible` garde la main (la deuxième étape reste pilotable à part).
+//! Rien ne change par défaut : sans geste de l'utilisateur, la passe dort et
+//! « douteux » reste masqué.
 //!
 //! Le verdict de la fiche suit le même réglage que la liste : tant que
 //! « douteux » est masqué, une piste ou un album douteux se rend
@@ -116,7 +128,8 @@ pub(super) async fn regler(
     if let Some(active) = body.active {
         activer(&state.backend, active).map_err(AppError::internal)?;
     }
-    if let Some(visible) = body.douteux_visible {
+    // rc12 — sans `douteux_visible` explicite, « douteux » suit l'interrupteur.
+    if let Some(visible) = body.douteux_visible.or(body.active) {
         montrer_douteux(&state.backend, visible).map_err(AppError::internal)?;
     }
     Ok(Json(json!({
