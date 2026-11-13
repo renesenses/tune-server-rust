@@ -338,31 +338,50 @@ fn parse_dsf(buf: &mut Vec<u8>) -> Option<StreamInfo> {
     })
 }
 
-/// Le multiplicateur DSD d'une cadence de la famille 44,1 kHz.
+/// Les multiplicateurs DSD reconnus, de DSD64 à DSD1024.
+const MULTIPLICATEURS_DSD: [u32; 5] = [64, 128, 256, 512, 1024];
+
+/// Le multiplicateur DSD d'une cadence, dans la famille 44,1 kHz (DSD64 =
+/// 2 822 400 Hz) comme dans la famille 48 kHz (DSD64 = 3 072 000 Hz).
 ///
-/// #8602 — DSD1024 (45 158 400 Hz) manquait : un fichier DSD1024 partait vers
-/// l'endpoint OAAT sans multiplicateur (`dsd_rate: None` dans `FormatPropose`),
-/// et la garde `dsd_max_rate` de l'endpoint, qui compare ce multiplicateur, ne
-/// jouait pas — un récepteur limité à DSD512 recevait du DSD1024.
+/// #8602 — la table s'arrêtait à DSD512 (44,1 kHz) : un fichier DSD1024, ou
+/// tout DSD de la famille 48 kHz, partait vers l'endpoint OAAT sans
+/// multiplicateur (`dsd_rate: None` dans `FormatPropose`), et la garde
+/// `dsd_max_rate` de l'endpoint, qui compare ce multiplicateur, ne jouait pas.
 pub(super) fn dsd_rate_from_sample_rate(sr: u32) -> Option<u16> {
-    match sr {
-        2_822_400 => Some(64),
-        5_644_800 => Some(128),
-        11_289_600 => Some(256),
-        22_579_200 => Some(512),
-        45_158_400 => Some(1024),
-        _ => None,
-    }
+    [44_100u32, 48_000].iter().find_map(|&base| {
+        (sr % base == 0)
+            .then(|| sr / base)
+            .filter(|m| MULTIPLICATEURS_DSD.contains(m))
+            .map(|m| m as u16)
+    })
 }
 
-/// Le multiplicateur DSD qui dépasse le plafond annoncé par l'endpoint
-/// (`dsd_max_rate`), ou `None` si le DSD natif peut partir. Le chemin DSD natif
-/// d'OAAT se replie alors sur le PCM au lieu d'envoyer un débit refusé (#8602).
+/// Pourquoi le DSD natif ne part pas vers l'endpoint (#8602).
 #[cfg_attr(not(feature = "oaat"), allow(dead_code))]
-pub(super) fn dsd_natif_au_dela_du_max(sample_rate: u32, dsd_max_rate: Option<u16>) -> Option<u16> {
-    match (dsd_rate_from_sample_rate(sample_rate), dsd_max_rate) {
-        (Some(m), Some(max)) if m > max => Some(m),
-        _ => None,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RefusDsdNatif {
+    /// Le multiplicateur dépasse le plafond `dsd_max_rate` de l'endpoint.
+    AuDelaDuMax { dsd: u16, max: u16 },
+    /// La cadence ne correspond à aucun multiplicateur connu : on ne peut ni
+    /// l'annoncer, ni la comparer au plafond.
+    CadenceInconnue,
+}
+
+/// Le refus du DSD natif vers un endpoint qui annonce `dsd_max_rate`, ou
+/// `None` si le DSD natif peut partir. Le chemin DSD natif d'OAAT se replie
+/// alors sur le PCM au lieu d'envoyer un débit refusé, ou un débit qu'il ne
+/// sait pas nommer (#8602). Sans plafond annoncé, aucun refus.
+#[cfg_attr(not(feature = "oaat"), allow(dead_code))]
+pub(super) fn refus_dsd_natif(
+    sample_rate: u32,
+    dsd_max_rate: Option<u16>,
+) -> Option<RefusDsdNatif> {
+    let max = dsd_max_rate?;
+    match dsd_rate_from_sample_rate(sample_rate) {
+        None => Some(RefusDsdNatif::CadenceInconnue),
+        Some(m) if m > max => Some(RefusDsdNatif::AuDelaDuMax { dsd: m, max }),
+        Some(_) => None,
     }
 }
 
@@ -736,10 +755,53 @@ mod tests {
         );
 
         // Un endpoint limité à DSD512 refuse le DSD1024 : repli PCM.
-        assert_eq!(dsd_natif_au_dela_du_max(45_158_400, Some(512)), Some(1024));
-        assert_eq!(dsd_natif_au_dela_du_max(45_158_400, Some(1024)), None);
-        assert_eq!(dsd_natif_au_dela_du_max(22_579_200, Some(512)), None);
-        assert_eq!(dsd_natif_au_dela_du_max(45_158_400, None), None);
+        assert_eq!(
+            refus_dsd_natif(45_158_400, Some(512)),
+            Some(RefusDsdNatif::AuDelaDuMax {
+                dsd: 1024,
+                max: 512
+            })
+        );
+        assert_eq!(refus_dsd_natif(45_158_400, Some(1024)), None);
+        assert_eq!(refus_dsd_natif(22_579_200, Some(512)), None);
+        assert_eq!(refus_dsd_natif(45_158_400, None), None);
+    }
+
+    /// #8602 — la famille 48 kHz : les cinq cadences ont leur multiplicateur,
+    /// et un DSD1024 à 48 kHz ne part pas en natif vers un récepteur DSD512.
+    #[test]
+    fn dsd_famille_48k_reconnue_8602() {
+        assert_eq!(dsd_rate_from_sample_rate(3_072_000), Some(64));
+        assert_eq!(dsd_rate_from_sample_rate(6_144_000), Some(128));
+        assert_eq!(dsd_rate_from_sample_rate(12_288_000), Some(256));
+        assert_eq!(dsd_rate_from_sample_rate(24_576_000), Some(512));
+        assert_eq!(dsd_rate_from_sample_rate(49_152_000), Some(1024));
+        assert_eq!(
+            format_rate_display(49_152_000, 1, AudioFormat::DsdU8),
+            "DSD1024"
+        );
+        assert_eq!(
+            refus_dsd_natif(49_152_000, Some(512)),
+            Some(RefusDsdNatif::AuDelaDuMax {
+                dsd: 1024,
+                max: 512
+            })
+        );
+        assert_eq!(refus_dsd_natif(24_576_000, Some(512)), None);
+    }
+
+    /// #8602 — une cadence sans multiplicateur connu ne part pas en natif vers
+    /// un endpoint qui annonce un plafond : repli PCM.
+    #[test]
+    fn cadence_dsd_inconnue_se_replie_8602() {
+        assert_eq!(dsd_rate_from_sample_rate(1_411_200), None); // DSD32
+        assert_eq!(dsd_rate_from_sample_rate(2_000_000), None);
+        assert_eq!(dsd_rate_from_sample_rate(90_316_800), None); // DSD2048
+        assert_eq!(
+            refus_dsd_natif(2_000_000, Some(1024)),
+            Some(RefusDsdNatif::CadenceInconnue)
+        );
+        assert_eq!(refus_dsd_natif(2_000_000, None), None);
     }
 }
 
