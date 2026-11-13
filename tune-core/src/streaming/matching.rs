@@ -63,7 +63,7 @@ pub fn best_stream_match_scored<'a>(
         return None;
     }
 
-    let candidates = candidats(tracks);
+    let candidates = candidats(title, tracks);
     let result = find_best_match(title, artist, isrc, duration_ms as i64, &candidates);
     let best = result.best_match?;
     if best.score < MATCH_APPROX_SCORE {
@@ -77,12 +77,37 @@ pub fn best_stream_match_scored<'a>(
 ///
 /// L'INDICE sert d'identifiant de candidat : deux résultats peuvent partager
 /// un titre, et c'est la position qui ramène au bon [`StreamTrack`].
-fn candidats(tracks: &[StreamTrack]) -> Vec<MatchCandidate> {
+/// #8271 — le titre à RAPPROCHER, sans sa parenthèse finale quand l'autre
+/// titre ne la mentionne pas.
+///
+/// Qobuz affiche désormais « Panopticom (Bright-Side Mix) » : la version y est
+/// collée au titre. Face à « Panopticom » (radio, bibliothèque, autre service),
+/// le score de titre tombait sous le seuil et la piste ressortait
+/// « introuvable ». La parenthèse finale est donc ignorée quand `autre` ne la
+/// contient pas ; quand il la contient (« Panopticom (Dark-Side Mix) »), elle
+/// reste et départage les mixes.
+pub(crate) fn titre_a_rapprocher<'t>(titre: &'t str, autre: &str) -> &'t str {
+    let t = titre.trim_end();
+    let Some(sans_fermante) = t.strip_suffix(')') else {
+        return titre;
+    };
+    let Some(debut) = sans_fermante.rfind('(') else {
+        return titre;
+    };
+    let dedans = sans_fermante[debut + 1..].trim().to_lowercase();
+    let tete = sans_fermante[..debut].trim_end();
+    if dedans.is_empty() || tete.is_empty() || autre.to_lowercase().contains(&dedans) {
+        return titre;
+    }
+    tete
+}
+
+fn candidats(requete: &str, tracks: &[StreamTrack]) -> Vec<MatchCandidate> {
     tracks
         .iter()
         .enumerate()
         .map(|(i, t)| MatchCandidate {
-            title: t.title.clone(),
+            title: titre_a_rapprocher(&t.title, requete).to_string(),
             artist_name: t.artist.clone(),
             album_title: t.album.clone().unwrap_or_default(),
             source_id: i.to_string(),
@@ -128,7 +153,7 @@ pub fn best_stream_matches_scored<'a>(
     if tracks.is_empty() {
         return Vec::new();
     }
-    let candidates = candidats(tracks);
+    let candidates = candidats(title, tracks);
     classer_candidats(
         title,
         artist,
