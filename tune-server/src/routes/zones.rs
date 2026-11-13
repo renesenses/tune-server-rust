@@ -102,6 +102,9 @@ struct PatchZone {
     /// `null` → `Some(None)` (effacer), valeur → `Some(Some(v))`.
     #[serde(default, deserialize_with = "double_option")]
     max_sample_rate: Option<Option<u32>>,
+    /// #8428 — cadence fixe PCM ; null désactive, absence conserve.
+    #[serde(default, deserialize_with = "double_option")]
+    fixed_sample_rate: Option<Option<u32>>,
     /// When enabled, sends audio at 100% volume (bit-perfect) and disables volume sync from device.
     fixed_volume: Option<bool>,
     /// Accord ponctuel de l'utilisateur pour une activation qui porte
@@ -427,6 +430,10 @@ fn inject_device_identity(
                 .filter(|d| d.par_la_zone)
                 .map(|d| d.demande)
         ),
+    );
+    obj.insert(
+        "fixed_sample_rate".into(),
+        json!(tune_core::audio::frequence_fixe::lire(backend, zone_id)),
     );
     // #3973 — « bit-perfect strict ». TOUJOURS publié : sa présence est ce qui
     // dit au client que ce serveur connaît le réglage (un vieux serveur ne

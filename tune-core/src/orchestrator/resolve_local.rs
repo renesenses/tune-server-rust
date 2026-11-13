@@ -31,6 +31,7 @@ pub(super) fn duree_piste_pcm_decodee(duree_servie_ms: i64, session: Option<&str
 /// armes relisent (REF-2 phase 2, #2219). Les champs portent les noms des
 /// `let` d'origine ; les armes les destructurent et ne changent pas.
 struct DecisionLocale {
+    dsd_passthrough: bool,
     bit_depth: u16,
     bit_depth_wire: u16,
     browser_needs_wav: bool,
@@ -370,6 +371,7 @@ fn assembler_la_decision(
         ..
     } = sorties;
     let ForcagesReseau {
+        dsd_passthrough,
         is_browser_output,
         bit_depth_wire,
         dlna_wav24,
@@ -458,6 +460,7 @@ fn assembler_la_decision(
         duree_de_la_piste_ms(track.duration_ms, &file_path, tranche_cue.is_some());
     let track_file_size = track.file_size;
     DecisionLocale {
+        dsd_passthrough,
         bit_depth,
         bit_depth_wire,
         browser_needs_wav,
@@ -1864,7 +1867,9 @@ impl PlaybackOrchestrator {
             sample_rate,
             zone_max_sample_rate,
             dsd_passthrough,
-        );
+        ) || (!dsd_passthrough
+            && crate::audio::frequence_fixe::active(&self.db, req.zone_id)
+                .is_some_and(|rate| rate != sample_rate));
         // Un égaliseur ACTIVÉ sur la zone doit s'entendre : en passthrough
         // réseau (FLAC servi brut à la Beoplay A9), l'EqProcessor n'était
         // jamais appliqué — profil « appliqué » côté UI, zéro effet audible
@@ -2864,6 +2869,25 @@ impl PlaybackOrchestrator {
                 );
                 out_sr = cible;
             }
+        }
+        if !decision.dsd_passthrough
+            && let Some(rate) =
+                crate::audio::frequence_fixe::cible(&self.db, req.zone_id, zone_max_sample_rate)?
+        {
+            // Un DSD hors famille (48 kHz sous DSD64) est décimé dans sa
+            // famille puis rééchantillonné vers `rate` par le décodeur
+            // (`dsd_to_pcm::cadence_de_decimation`) : le flux sort bien à `rate`.
+            if src_fmt == AudioFormat::Dsd && !sample_rate.is_multiple_of(rate) {
+                info!(
+                    zone_id = req.zone_id,
+                    dsd_rate = sample_rate,
+                    cadence_decimee =
+                        crate::audio::dsd_to_pcm::cadence_de_decimation(sample_rate, rate),
+                    cadence_fixe = rate,
+                    "frequence_fixe_dsd_decime_puis_reechantillonne"
+                );
+            }
+            out_sr = rate;
         }
         let out_bd: u16 = if local_needs_wav {
             // Local output (cpal/WASAPI): always use 32-bit WAV.

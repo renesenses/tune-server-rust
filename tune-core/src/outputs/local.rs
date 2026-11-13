@@ -868,6 +868,7 @@ pub struct LocalOutput {
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
     /// piste par l'orchestrateur, comme `pure_bypass`. Défaut désarmé.
     strict_bitperfect: Arc<AtomicBool>,
+    fixed_sample_rate: AtomicU32,
     /// #6132 — la seconde sortie de la zone qui joue ici (nom du périphérique
     /// B), ou `None`. Posée par piste par l'orchestrateur depuis
     /// `zone_{id}_sortie_double`, lue une fois par `play_url`.
@@ -1493,6 +1494,7 @@ impl LocalOutput {
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
             pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
+            fixed_sample_rate: AtomicU32::new(0),
             seconde_sortie: std::sync::Mutex::new(Vec::new()),
             retard_de_depart_ms: AtomicU64::new(0),
             mono_downmix: Arc::new(AtomicBool::new(false)),
@@ -2104,6 +2106,11 @@ impl LocalOutput {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub fn set_fixed_sample_rate(&self, rate: Option<u32>) {
+        self.fixed_sample_rate
+            .store(rate.unwrap_or(0), Ordering::Relaxed);
     }
 
     pub fn set_strict_bitperfect(&self, strict: bool) {
@@ -5318,6 +5325,25 @@ impl SurechDeLEtage<'_> {
     }
 }
 
+/// #8428 — la cadence fixe de la zone que l'ouverture du périphérique a
+/// RAMENÉE à la cadence que la sortie accepte : `Some((demandée, ouverte))`.
+/// `None` quand rien n'est demandé, que la cadence est tenue, ou que le flux
+/// est un porteur DoP, sous PURE ou bit-perfect strict (aucune conversion).
+///
+/// Décision de Bertrand du 12/11 : ce n'est JAMAIS un refus. La piste joue à
+/// la cadence ouverte, convertie comme toute autre ; le chemin du signal le
+/// dit (`fixed_rate_limit`, lu sur la cadence ouverte que la sortie déclare).
+pub(super) fn cadence_fixe_ramenee(
+    demandee: u32,
+    ouverte: u32,
+    dop: bool,
+    pure: bool,
+    strict: bool,
+) -> Option<(u32, u32)> {
+    (demandee != 0 && ouverte != 0 && demandee != ouverte && !dop && !pure && !strict)
+        .then_some((demandee, ouverte))
+}
+
 /// #7614 — le greffon peut-il s'ouvrir sur ce flux ? Jamais sous PURE, jamais
 /// sur un porteur DoP : un flux 24 bits dont l'amorce est un porteur, ou trop
 /// courte pour l'écarter, garde son chemin.
@@ -6679,6 +6705,7 @@ impl OutputTarget for LocalOutput {
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
+        let fixed_sample_rate = self.fixed_sample_rate.load(Ordering::Relaxed);
         // #6132 — lue UNE fois par piste, comme `strict_bitperfect`.
         let seconde_sortie = self.secondes_sorties();
         // #8437 — lu UNE fois par piste : une transition gapless ne repasse
@@ -8081,6 +8108,32 @@ impl OutputTarget for LocalOutput {
             let peripherique_suit_la_source = backend.suit_la_cadence_source();
 
             let output_sr = sortie.cadence;
+            // #8428 — décision de Bertrand du 12/11 : RAMENER AU PLAFOND. Le
+            // système a ouvert une autre cadence que la cadence fixe (WASAPI
+            // partagé, mixeur à 48 kHz) : la piste joue à la cadence ouverte,
+            // convertie comme toute autre, et le chemin du signal le dit
+            // (`fixed_rate_limit` : « 96 kHz demandé, 48 kHz appliqué », lu sur
+            // la cadence OUVERTE que la sortie déclare). Le DoP garde sa
+            // cadence de transport et n'est jamais rééchantillonné.
+            if let Some((demandee, ouverte)) = cadence_fixe_ramenee(
+                fixed_sample_rate,
+                output_sr,
+                dop_active.load(Ordering::Relaxed)
+                    || is_dop_pcm(
+                        header_buf.get(data_offset..).unwrap_or_default(),
+                        bit_depth,
+                        channels,
+                    ),
+                pure_bypass.load(Ordering::Relaxed),
+                strict_bitperfect,
+            ) {
+                warn!(
+                    device = %device_name,
+                    cadence_fixe_demandee = demandee,
+                    cadence_ouverte = ouverte,
+                    "frequence_fixe_ramenee_a_la_cadence_de_la_sortie"
+                );
+            }
             let output_ch = sortie.canaux;
             reaffectation.constater_l_ouverture(voies_de_la_matrice, output_ch, &device_name);
 

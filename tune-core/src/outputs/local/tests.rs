@@ -5030,3 +5030,32 @@ async fn le_preampli_garde_se_declare_dans_les_transformations_reelles_6741() {
     assert!(!en_retour, "rampe finie");
     assert!((db + 12.04).abs() < 0.2, "{db} dB gardés, attendu ≈ −12,04");
 }
+
+/// #8428 — WASAPI partagé (mixeur à 48 kHz), cadence fixe de 96 kHz : la
+/// lecture n'est plus refusée, la cadence est ramenée à celle de la sortie.
+#[test]
+fn cadence_fixe_8428_ramenee_a_la_cadence_ouverte_sans_refus() {
+    assert_eq!(
+        cadence_fixe_ramenee(96_000, 48_000, false, false, false),
+        Some((96_000, 48_000))
+    );
+    // Cadence tenue, rien de demandé : rien à dire.
+    assert_eq!(
+        cadence_fixe_ramenee(48_000, 48_000, false, false, false),
+        None
+    );
+    assert_eq!(cadence_fixe_ramenee(0, 48_000, false, false, false), None);
+    // DoP, PURE, strict : la cadence fixe ne s'applique pas.
+    assert_eq!(
+        cadence_fixe_ramenee(96_000, 48_000, true, false, false),
+        None
+    );
+    assert_eq!(
+        cadence_fixe_ramenee(96_000, 48_000, false, true, false),
+        None
+    );
+    assert_eq!(
+        cadence_fixe_ramenee(96_000, 48_000, false, false, true),
+        None
+    );
+}
