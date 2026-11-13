@@ -37,8 +37,54 @@
 //!   l'attente vers la cible avant d'arrêter la source.
 //! - Redémarrage du serveur : l'attente vit en mémoire ; un titre joué moins
 //!   que son seuil au moment d'un redémarrage n'est pas compté.
+//! - #8107 — lecture groupée (`zone_groups`) : chaque zone du groupe joue le
+//!   même titre et valide sa propre écoute ; seule la PREMIÈRE est écrite.
+//!   Une zone n'écrit pas un titre qu'une zone de son groupe vient d'écrire
+//!   (dans la durée du titre, ou [`FENETRE_SANS_DUREE`] pour un flux). Une
+//!   zone qui joue seule compte ses écoutes comme avant.
 use super::{ContexteEcoute, PlaybackOrchestrator};
 use crate::playback::{PlayState, ZoneState};
+
+/// #8107 — fenêtre de la règle « une écoute par groupe » pour un titre sans
+/// durée connue (flux, radio) : écrit au démarrage par chaque zone.
+pub const FENETRE_SANS_DUREE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// #8107 — la dernière écoute qu'une zone a écrite.
+#[derive(Debug, Clone)]
+pub(super) struct EcouteEcrite {
+    title: String,
+    source: String,
+    source_id: Option<String>,
+    quand: std::time::Instant,
+    fenetre: std::time::Duration,
+}
+
+impl EcouteEcrite {
+    fn de(e: &EcouteEnAttente) -> Self {
+        Self {
+            title: e.title.clone(),
+            source: e.source.clone(),
+            source_id: e.source_id.clone(),
+            quand: std::time::Instant::now(),
+            fenetre: if e.duration_ms > 0 {
+                std::time::Duration::from_millis(e.duration_ms as u64)
+            } else {
+                FENETRE_SANS_DUREE
+            },
+        }
+    }
+
+    /// Le même titre, écrit il y a moins que sa durée ?
+    fn couvre(&self, e: &EcouteEnAttente) -> bool {
+        self.quand.elapsed() < self.fenetre
+            && self.title == e.title
+            && self.source == e.source
+            && match (self.source_id.as_deref(), e.source_id.as_deref()) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+    }
+}
 
 /// Plafond du seuil : 30 s, quelle que soit la durée du titre.
 pub const SEUIL_MAX_MS: i64 = 30_000;
@@ -132,7 +178,7 @@ impl PlaybackOrchestrator {
     /// de durée connue. Remplace l'attente précédente de la zone.
     pub(super) fn armer_l_ecoute(&self, zone_id: i64, ecoute: EcouteEnAttente) {
         if seuil_d_ecoute_ms(ecoute.duration_ms).is_none() {
-            self.ecrire_l_ecoute(zone_id, &ecoute);
+            self.ecrire_l_ecoute_une_fois_par_groupe(zone_id, &ecoute);
             return;
         }
         if let Ok(mut attentes) = self.ecoutes_en_attente.lock() {
@@ -172,7 +218,38 @@ impl PlaybackOrchestrator {
             duration_ms = ecoute.duration_ms,
             "ecoute_validee"
         );
-        self.ecrire_l_ecoute(etat.zone_id, &ecoute);
+        self.ecrire_l_ecoute_une_fois_par_groupe(etat.zone_id, &ecoute)
+    }
+
+    /// #8107 — écrit l'écoute, sauf si une autre zone du groupe de `zone_id`
+    /// vient d'écrire le même titre. Rend `true` quand la ligne est écrite.
+    fn ecrire_l_ecoute_une_fois_par_groupe(&self, zone_id: i64, ecoute: &EcouteEnAttente) -> bool {
+        let compagnes = crate::zones::groupes_enregistres::zones_compagnes(
+            &crate::zones::groupes_enregistres::lire(
+                &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+            ),
+            zone_id,
+        );
+        {
+            let Ok(mut ecrites) = self.ecoutes_ecrites.lock() else {
+                self.ecrire_l_ecoute(zone_id, ecoute);
+                return true;
+            };
+            if let Some(par) = compagnes
+                .iter()
+                .find(|z| ecrites.get(z).is_some_and(|e| e.couvre(ecoute)))
+            {
+                tracing::info!(
+                    zone_id,
+                    deja_par = *par,
+                    title = %ecoute.title,
+                    "ecoute_de_groupe_deja_comptee"
+                );
+                return false;
+            }
+            ecrites.insert(zone_id, EcouteEcrite::de(ecoute));
+        }
+        self.ecrire_l_ecoute(zone_id, ecoute);
         true
     }
 
