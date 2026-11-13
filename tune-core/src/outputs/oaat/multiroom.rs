@@ -730,7 +730,10 @@ impl OutputTarget for OaatMultiroomOutput {
                 .map_err(|e| format!("OAAT multiroom set volume failed: {e}"))?;
         }
         self.volume.store(level as u32, Ordering::SeqCst);
-        self.muted.store(false, Ordering::SeqCst);
+        // #8624 — la consigne ne lève pas la sourdine. L'endpoint OAAT tient
+        // sa sourdine à part du volume (`Mute` ≠ `Volume`) et reste muet ;
+        // le drapeau suit : seul un geste de volume (#8165,
+        // `lever_la_sourdine_au_geste_de_volume` → `set_mute(false)`) la lève.
         Ok(())
     }
 
@@ -782,6 +785,45 @@ impl OutputTarget for OaatMultiroomOutput {
     #[cfg(feature = "oaat")]
     fn diagnostics_json(&self) -> Option<serde_json::Value> {
         None
+    }
+}
+
+#[cfg(test)]
+mod sourdine_tests_8624 {
+    //! #8624 — `set_volume` levait la sourdine du groupe OAAT : la zone était
+    //! annoncée non muette (sondeur, interface) alors que les endpoints
+    //! restaient muets, ou l'inverse après une limite ou une alarme. Aucun
+    //! son : groupe sans endpoint.
+    use super::*;
+
+    fn groupe() -> OaatMultiroomOutput {
+        OaatMultiroomOutput::new("Groupe 8624".into(), "g8624".into(), Vec::new())
+    }
+
+    #[tokio::test]
+    async fn set_volume_garde_la_sourdine_du_groupe_8624() {
+        let groupe = groupe();
+        groupe.set_volume(0.40).await.unwrap();
+        groupe.set_mute(true).await.unwrap();
+        groupe.set_volume(0.25).await.unwrap();
+        let statut = groupe.get_status().await.unwrap();
+        assert!(statut.muted, "#8624 : set_volume a levé la sourdine");
+        assert!(
+            (statut.volume - 0.25).abs() < 0.011,
+            "la consigne est gardée"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_geste_leve_la_sourdine_au_niveau_du_geste_8624() {
+        let groupe = groupe();
+        groupe.set_volume(0.40).await.unwrap();
+        groupe.set_mute(true).await.unwrap();
+        groupe.set_volume(0.20).await.unwrap();
+        groupe.set_mute(false).await.unwrap();
+        let statut = groupe.get_status().await.unwrap();
+        assert!(!statut.muted);
+        assert!((statut.volume - 0.20).abs() < 0.011, "niveau du geste");
     }
 }
 
