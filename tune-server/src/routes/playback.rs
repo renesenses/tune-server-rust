@@ -2811,7 +2811,80 @@ async fn play_en_tete_du_groupe(
     .await
 }
 
+/// Les natures de conteneur que la file garde sur ses lignes (#6465).
+///
+/// `track` n'en est pas : un titre lancé seul n'a pas de conteneur à
+/// rendre, et la suite que le serveur enfile derrière lui (son album, #5372)
+/// ne doit pas s'inscrire sous ce titre.
+const CONTENEURS_DE_FILE: [&str; 4] = ["album", "playlist", "artist", "label"];
+
+/// `POST /zones/{id}/play`, puis le conteneur du geste posé sur les lignes de
+/// file qu'il vient de créer (#6465).
+///
+/// FabienM, fils 2302 (point 7), 2379 et 2559 (point 2) : « le menu historique
+/// n'historise plus la lecture des conteneurs, uniquement des titres ». Les
+/// lignes posées par « Lire » restaient à `context_type` NULL et suivaient le
+/// contexte de SESSION de la zone, qui ne vit qu'en mémoire et que tout geste
+/// sans conteneur efface (radio, podcast, radio d'artiste, préréglage —
+/// #6558 —, redémarrage du serveur — #7889). Il suffisait donc d'une radio
+/// écoutée entre deux, puis d'un clic sur un titre de l'album resté dans la
+/// file, pour que ce titre et toute la suite s'inscrivent au premier niveau.
+///
+/// Chaque ligne porte désormais le conteneur qui l'a mise en file, comme
+/// celles de « Lire ensuite » et « Ajouter à la file » (#6466) : l'écoute le
+/// lit d'abord (`contexte_de_la_piste_jouee`), quelle que soit la session.
+/// Rien n'est dédoublé : une écoute reste une ligne d'historique, seul son
+/// conteneur est désormais fiable. Seules les lignes de CE geste sont
+/// touchées (identifiant > dernier identifiant d'avant), et seulement quand
+/// le geste a bien posé ce conteneur sur la session (une relance dans la file
+/// garde ses lignes et n'en crée pas).
 async fn play(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<PlayRequest>>,
+) -> axum::response::Response {
+    let demande = body.as_ref().map(|Json(b)| contexte_de_lecture(b));
+    let avant = tune_core::db::contexte_de_file::dernier_identifiant(&state.backend, zone_id);
+    let reponse = lancer_la_lecture(State(state.clone()), profile, Path(zone_id), headers, body)
+        .await
+        .into_response();
+    if let Some((Some(nature), id, _)) = demande
+        && CONTENEURS_DE_FILE.contains(&nature.as_str())
+    {
+        let session = state.playback.get_state(zone_id).await;
+        if session.session_context_type.as_deref() == Some(nature.as_str())
+            && session.session_context_id == id
+        {
+            let contexte = tune_core::db::contexte_de_file::ContexteDeFile {
+                nature,
+                id,
+                service: session.session_context_source,
+                titre: session.session_context_title,
+                pochette: session.session_context_cover,
+            };
+            match tune_core::db::contexte_de_file::poser_apres(
+                &state.backend,
+                zone_id,
+                avant,
+                &contexte,
+            ) {
+                Ok(n) if n > 0 => info!(
+                    zone_id,
+                    nature = %contexte.nature,
+                    lignes = n,
+                    "conteneur_pose_sur_la_file_6465"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(zone_id, erreur = %e, "conteneur_de_file_non_pose_6465"),
+            }
+        }
+    }
+    reponse
+}
+
+async fn lancer_la_lecture(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Path(zone_id): Path<i64>,
