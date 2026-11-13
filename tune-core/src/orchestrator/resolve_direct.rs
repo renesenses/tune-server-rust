@@ -936,12 +936,20 @@ impl PlaybackOrchestrator {
             crate::device_catalog::resolve_zone_quirks(&self.db, req.zone_id).max_sample_rate,
         );
         if !est_dsd_brut(mime_type)
-            && crate::audio::frequence_fixe::cible(&self.db, req.zone_id, plafond)?.is_some()
             && !is_radio
+            && let Some(cadence) =
+                crate::audio::frequence_fixe::cible(&self.db, req.zone_id, plafond)?
         {
-            return Box::pin(
-                self.direct_a_cadence_fixe(req, audio_url, mime_type, &title, &source),
-            )
+            return Box::pin(self.direct_a_cadence_fixe(
+                req,
+                audio_url,
+                mime_type,
+                &title,
+                &source,
+                cadence,
+                is_local_output,
+                duration_ms,
+            ))
             .await;
         }
 
@@ -1428,11 +1436,9 @@ impl PlaybackOrchestrator {
                 };
                 let cadence = self.cadence_servie_pour_un_service(req, &stream_data)?;
                 let sr = cadence.unwrap_or(stream_data.quality.sample_rate);
-                if crate::audio::frequence_fixe::active(&self.db, req.zone_id).is_some()
-                    && (dsd_rate == 0 || !dsd_rate.is_multiple_of(sr))
-                {
-                    return Err("Fixed PCM sample rate requires an integer DSD decimation ratio; disable the fixed rate for this DSD track".into());
-                }
+                // #8428 — une cadence fixe hors famille n'est plus refusée : le
+                // décodeur DSD décime dans la famille puis rééchantillonne
+                // vers `sr` (`dsd_to_pcm::cadence_de_decimation`).
                 let (url, session_id, mime) = if conteneur == "dsf" {
                     // Au fil de l'eau : mesuré sur le .18 (23/09, 17:xx UTC),
                     // le téléchargement ENTIER du DSF prenait 5 minutes — le
@@ -1664,8 +1670,19 @@ impl PlaybackOrchestrator {
         }
     }
 
-    /// #8428 : une URL finie suit le même rééchantillonneur que la bibliothèque.
-    /// Le téléchargement entier est nécessaire au décodeur fichier existant.
+    /// #8428 — une URL directe (serveur média, flux poussé par BubbleUPnP ou
+    /// mconnect) vers une zone à cadence fixe : décodée et rééchantillonnée
+    /// AU FIL DE L'EAU vers une session WAV à `cadence`, comme le DSF distant
+    /// (`decoder_le_dsf_distant_en_wav`). La session est rendue tout de suite.
+    ///
+    /// Relecture du 12/11 : la première version téléchargeait l'URL ENTIÈRE
+    /// avant le premier son. Un flux sans fin non étiqueté « radio » attendait
+    /// le délai de 120 s puis échouait, un podcast de 2 h attendait son
+    /// dernier octet, et un abandon laissait un `tune-stream-*` orphelin. Ici,
+    /// aucun fichier temporaire : une source qui accepte `Range` est lue par
+    /// requêtes (saut possible), sinon le corps HTTP est décodé tel qu'il
+    /// arrive, sans fin si le flux n'en a pas.
+    #[allow(clippy::too_many_arguments)]
     async fn direct_a_cadence_fixe(
         &self,
         req: &PlayRequest,
@@ -1673,88 +1690,145 @@ impl PlaybackOrchestrator {
         mime_type: &str,
         title: &str,
         source: &str,
+        cadence: u32,
+        is_local_output: bool,
+        duration_ms: Option<i64>,
     ) -> Result<ResolvedStream, String> {
-        let conteneur = conteneur_depuis_url(audio_url, mime_type);
-        let fichier = Self::telecharger_dans_un_fichier_temporaire(
-            audio_url.to_string(),
-            Vec::new(),
-            conteneur,
-        )
-        .await?;
-        let chemin = fichier.clone();
-        let metadata = tokio::task::spawn_blocking(move || {
-            crate::metadata::read_metadata(std::path::Path::new(&chemin))
-        })
-        .await
-        .ok()
-        .flatten();
-        let mut piste = crate::db::models::Track::new(title.to_string());
-        piste.id = req.track_id;
-        piste.artist_name = req.artist_name.clone();
-        piste.album_title = req.album_title.clone();
-        piste.cover_path = req.cover_url.clone();
-        piste.duration_ms = req
-            .duration_ms
-            .or_else(|| {
-                metadata
-                    .as_ref()
-                    .and_then(|m| m.duration_ms)
-                    .map(|d| d as i64)
-            })
-            .unwrap_or(0);
-        piste.file_path = Some(fichier.clone());
-        let format = metadata
-            .as_ref()
-            .and_then(|m| m.format.clone())
-            .unwrap_or_else(|| conteneur.to_string());
-        piste.format = Some(format.clone());
-        piste.sample_rate = metadata
-            .as_ref()
-            .and_then(|m| m.sample_rate)
-            .or(req.sample_rate)
-            .map(|r| r as i32);
-        piste.bit_depth = metadata
-            .as_ref()
-            .and_then(|m| m.bit_depth)
-            .or(req.bit_depth)
-            .map(i32::from);
-        piste.channels = metadata
-            .as_ref()
-            .and_then(|m| m.channels)
-            .map(i32::from)
-            .unwrap_or(2);
-        piste.source = source.to_string();
-        let resultat = self
-            .servir_la_piste_locale(
-                req,
-                piste,
-                fichier.clone(),
-                format.clone(),
-                AudioFormat::from_extension(&format),
-                false,
-                None,
-            )
-            .await;
-        match resultat {
-            Ok(mut resolu) => {
-                if let Some(sid) = resolu.stream_id.as_deref() {
-                    supprimer_a_la_fin_de_la_session(
-                        self.streamer.clone(),
-                        sid.to_string(),
-                        fichier,
-                    );
-                } else {
-                    let _ = std::fs::remove_file(&fichier);
-                }
-                resolu.source = source.to_string();
-                resolu.origin_url = Some(audio_url.to_string());
-                Ok(resolu)
+        let conteneur = conteneur_depuis_url(audio_url, mime_type).to_string();
+        // Sortie locale : WAV 32 bits et DSP dans son propre rappel, comme le
+        // bras local des services (`decider_le_wav_de_sortie`).
+        let bd: u16 = if is_local_output {
+            32
+        } else {
+            super::regles::cap_output_bit_depth(req.bit_depth.unwrap_or(24))
+        };
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: cadence,
+            bit_depth: bd,
+            channels: 2,
+            file_size: None,
+            duration_ms: duration_ms.filter(|d| *d > 0).map(|d| d as u64),
+            ..Default::default()
+        };
+        let dsp = (!is_local_output)
+            .then(|| self.load_streaming_dsp(req.zone_id, req.track_id, cadence, 2))
+            .filter(|dsp| dsp.is_active());
+        let info = match dsp.as_ref() {
+            Some(dsp) => StreamInfo {
+                crossfeed: dsp.crossfeed_executable(),
+                compensation_db: dsp.compensation_cuite_db(),
+                ..info
+            },
+            None => info,
+        };
+        let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+        let tx = match dsp {
+            Some(mut dsp) => {
+                let poste = super::eq_en_vol::EqEnVol::pour_le_relais(dsp.compensation.is_some());
+                self.noter_eq_en_vol(req.zone_id, &session_id, poste.clone());
+                dsp.en_vol = Some(poste);
+                spawn_streaming_dsp_relay(dsp, bd, true, tx)
             }
-            Err(e) => {
-                let _ = std::fs::remove_file(&fichier);
-                Err(e)
+            None => tx,
+        };
+        // L'en-tête WAV part DANS le canal : sans ce drapeau, `handle_stream`
+        // en préfixerait un second.
+        {
+            let sessions = self.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            if let Some(session) = sessions.get(&session_id) {
+                session
+                    .wav_header_included
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
+        let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
+        info!(
+            zone_id = req.zone_id,
+            url = %audio_url,
+            conteneur = %conteneur,
+            cadence,
+            bit_depth = bd,
+            "frequence_fixe_url_directe_au_fil_de_l_eau"
+        );
+
+        let ev_bus = self.event_bus.clone();
+        let playback = self.playback.clone();
+        let zone_id = req.zone_id;
+        let attach_levels = self.levels_attach_allowed(zone_id);
+        let url = audio_url.to_string();
+        tokio::spawn(async move {
+            let err_bus = ev_bus.clone();
+            let levels_tx = match ev_bus.filter(|_| attach_levels) {
+                Some(bus) => {
+                    let play_seq = playback.current_play_seq(zone_id).await;
+                    spawn_paced_levels_forwarder(
+                        bus,
+                        playback,
+                        zone_id,
+                        play_seq,
+                        (seek_s * 1000.0) as i64,
+                    )
+                }
+                None => tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0,
+            };
+            let url_decode = url.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                decoder_l_url_a_cadence_fixe(
+                    &url_decode,
+                    &conteneur,
+                    cadence,
+                    bd,
+                    tx,
+                    data_ready,
+                    levels_tx,
+                    seek_s,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => debug!(url = %url, "frequence_fixe_url_directe_terminee"),
+                Ok(Err(e)) => {
+                    warn!(url = %url, error = %e, "frequence_fixe_url_directe_decodage_echoue");
+                    if let Some(ref bus) = err_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "code": "track_decode_failed",
+                                "error": "The track could not be decoded.",
+                                "cause": e,
+                            }),
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(url = %url, error = %e, "frequence_fixe_url_directe_tache_paniquee")
+                }
+            }
+        });
+
+        let server_ip = self.server_ip();
+        Ok(ResolvedStream {
+            url: self.streamer.get_stream_url(&session_id, &server_ip, "wav"),
+            mime_type: "audio/wav".into(),
+            title: title.to_string(),
+            artist: req.artist_name.clone(),
+            album: req.album_title.clone(),
+            duration_ms,
+            source: source.to_string(),
+            cover_url: req.cover_url.clone(),
+            stream_id: Some(session_id),
+            file_size: None,
+            sample_rate: Some(cadence),
+            bit_depth: Some(u32::from(bd)),
+            channels: Some(2),
+            origin_url: Some(audio_url.to_string()),
+            bitrate_kbps: None,
+            format_source: None,
+        })
     }
 
     /// #8052 — un DSD reçu par la façade UPnP, vers la sortie LOCALE de la
@@ -2456,6 +2530,46 @@ pub(crate) fn conteneur_dsd(url: &str, mime: &str) -> &'static str {
     } else {
         "dsf"
     }
+}
+
+/// #8428 — le décodage d'une URL directe vers la cadence fixe, sans fichier
+/// temporaire. Une source qui accepte `Range` (fichier de serveur média,
+/// podcast) est lue par requêtes et peut sauter à `seek_s` ; sinon le corps
+/// HTTP est décodé tel qu'il arrive (flux poussé sans fin), depuis le début.
+#[allow(clippy::too_many_arguments)]
+fn decoder_l_url_a_cadence_fixe(
+    url: &str,
+    conteneur: &str,
+    cadence: u32,
+    bd: u16,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
+    use symphonia::core::io::{MediaSource, ReadOnlySource};
+    let (source, seek_s): (Box<dyn MediaSource>, f64) =
+        match crate::audio::http_range::HttpRangeSource::open(url) {
+            Ok(source) => (Box::new(source), seek_s),
+            Err(e) => {
+                debug!(url, error = %e, "frequence_fixe_url_directe_sans_range");
+                let reponse = crate::http::client::blocking_builder()
+                    .timeout(None)
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .and_then(|c| c.get(url).send())
+                    .map_err(|e| {
+                        format!("http: {}", crate::http::client::decrire_erreur_http(&e))
+                    })?;
+                if !reponse.status().is_success() {
+                    return Err(format!("http: {}", reponse.status()));
+                }
+                (Box::new(ReadOnlySource::new(reponse)), 0.0)
+            }
+        };
+    crate::audio::decode::decode_source_to_pcm_streaming_a_cadence(
+        source, conteneur, cadence, 2, bd, tx, 32768, data_ready, levels_tx, seek_s,
+    )
 }
 
 /// Supprime un fichier temporaire quand la session qui le lit n'existe plus.

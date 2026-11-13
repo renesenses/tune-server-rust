@@ -1516,6 +1516,11 @@ pub(super) fn etat_du_surechantillonneur_lang(
         // même code). Le dire, au lieu du « non appliqué » muet qui promet
         // la piste suivante.
         ("strict_bitperfect", "upsampling_strict_bitperfect")
+    } else if tune_core::audio::frequence_fixe::active(backend, zone_id).is_some() {
+        // #8428 — la cadence fixe de la zone porte déjà la conversion : le
+        // greffon est écarté (`choix_du_surechantillonneur` dans dsp.rs), et
+        // le chemin du signal le dit au lieu d'un « non appliqué » muet.
+        ("fixed_rate", "upsampling_fixed_rate")
     } else if tune_core::audio::surechantillonnage::verdict_enregistre(&settings).is_none() {
         // #8259 — la raison que `choix_de_la_zone` donne, au lieu d'un
         // « non appliqué » muet.
@@ -1910,6 +1915,10 @@ fn assembler_les_etapes_lang(
         // a pu s'intercaler.
         steps.insert(1, decodeur);
     }
+    // #8428 — un DSD décimé DANS SA FAMILLE puis rééchantillonné vers une
+    // cadence fixe hors famille (DSD64 → 88,2 kHz → 48 kHz) : les deux
+    // étapes sont nommées, la seconde par l'étape « Resampler » plus bas.
+    let mut dsd_reechantillonne: Option<(u32, u32)> = None;
     if transcode_active {
         // OAAT lossless PCM → WAV preserves all audio data, but DSD → WAV is a
         // lossy domain conversion (see the "oaat" transport arm above). A DLNA
@@ -1973,8 +1982,24 @@ fn assembler_les_etapes_lang(
         // `dsd_mode`, qui dit ce qui a été demandé (#1595).
         let dop_sur_le_fil =
             is_dsd && ps.dop_active && !is_dsd_resolution(out_sample_rate, out_bit_depth);
+        if is_dsd
+            && !dop_sur_le_fil
+            && sample_rate > 0
+            && out_sample_rate > 0
+            && !is_dsd_resolution(out_sample_rate, out_bit_depth)
+        {
+            let decimee = tune_core::audio::dsd_to_pcm::cadence_de_decimation(
+                sample_rate as u32,
+                out_sample_rate as u32,
+            );
+            if decimee != out_sample_rate as u32 {
+                dsd_reechantillonne = Some((decimee, out_sample_rate as u32));
+            }
+        }
         let out_desc = if dop_sur_le_fil {
             dop_stage_label(sample_rate)
+        } else if let Some((decimee, _)) = dsd_reechantillonne {
+            output_stage_label("PCM", decimee as i32, out_bit_depth)
         } else {
             output_stage_label(output_format_name, out_sample_rate, out_bit_depth)
         };
@@ -2057,7 +2082,15 @@ fn assembler_les_etapes_lang(
     // c'est elle que le client affiche « 192 → 96 kHz, pas bit-perfect », et
     // elle qui fait dire « PURE dégradé » (`pure_degraded`).
     let mut rate_conversion: Option<(u32, u32)> = None;
-    if let Some(rate) = cadence_pcm_servie.filter(|rate| {
+    if let Some((de, vers)) = dsd_reechantillonne {
+        rate_conversion = Some((de, vers));
+        steps.push(json!({
+            "name": "Resampler", "code": "rate_conversion",
+            "from_hz": de, "to_hz": vers,
+            "description": format!("{} kHz → {} kHz", de as f64 / 1000.0, vers as f64 / 1000.0),
+            "bit_perfect": false,
+        }));
+    } else if let Some(rate) = cadence_pcm_servie.filter(|rate| {
         *rate != sample_rate as u32
             && !reel.is_some_and(|t| {
                 t.reechantillonnage()

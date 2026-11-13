@@ -5205,6 +5205,25 @@ impl SurechDeLEtage<'_> {
     }
 }
 
+/// #8428 — la cadence fixe de la zone que l'ouverture du périphérique a
+/// RAMENÉE à la cadence que la sortie accepte : `Some((demandée, ouverte))`.
+/// `None` quand rien n'est demandé, que la cadence est tenue, ou que le flux
+/// est un porteur DoP, sous PURE ou bit-perfect strict (aucune conversion).
+///
+/// Décision de Bertrand du 12/11 : ce n'est JAMAIS un refus. La piste joue à
+/// la cadence ouverte, convertie comme toute autre ; le chemin du signal le
+/// dit (`fixed_rate_limit`, lu sur la cadence ouverte que la sortie déclare).
+pub(super) fn cadence_fixe_ramenee(
+    demandee: u32,
+    ouverte: u32,
+    dop: bool,
+    pure: bool,
+    strict: bool,
+) -> Option<(u32, u32)> {
+    (demandee != 0 && ouverte != 0 && demandee != ouverte && !dop && !pure && !strict)
+        .then_some((demandee, ouverte))
+}
+
 /// #7614 — le greffon peut-il s'ouvrir sur ce flux ? Jamais sous PURE, jamais
 /// sur un porteur DoP : un flux 24 bits dont l'amorce est un porteur, ou trop
 /// courte pour l'écarter, garde son chemin.
@@ -7925,27 +7944,31 @@ impl OutputTarget for LocalOutput {
             let peripherique_suit_la_source = backend.suit_la_cadence_source();
 
             let output_sr = sortie.cadence;
-            // #8428 — ne pas annoncer une cadence fixe si le système en ouvre une autre.
-            // Le DoP garde sa cadence de transport et n'est jamais rééchantillonné.
-            if fixed_sample_rate != 0
-                && !dop_active.load(Ordering::Relaxed)
-                && !is_dop_pcm(
-                    header_buf.get(data_offset..).unwrap_or_default(),
-                    bit_depth,
-                    channels,
-                )
-                && !pure_bypass.load(Ordering::Relaxed)
-                && !strict_bitperfect
-                && output_sr != fixed_sample_rate
-            {
-                if let Ok(mut slot) = open_failure.lock() {
-                    *slot = Some(format!(
-                        "Fixed output sample rate {} Hz unavailable: output opened at {} Hz",
-                        fixed_sample_rate, output_sr
-                    ));
-                }
-                playing.store(false, Ordering::SeqCst);
-                return;
+            // #8428 — décision de Bertrand du 12/11 : RAMENER AU PLAFOND. Le
+            // système a ouvert une autre cadence que la cadence fixe (WASAPI
+            // partagé, mixeur à 48 kHz) : la piste joue à la cadence ouverte,
+            // convertie comme toute autre, et le chemin du signal le dit
+            // (`fixed_rate_limit` : « 96 kHz demandé, 48 kHz appliqué », lu sur
+            // la cadence OUVERTE que la sortie déclare). Le DoP garde sa
+            // cadence de transport et n'est jamais rééchantillonné.
+            if let Some((demandee, ouverte)) = cadence_fixe_ramenee(
+                fixed_sample_rate,
+                output_sr,
+                dop_active.load(Ordering::Relaxed)
+                    || is_dop_pcm(
+                        header_buf.get(data_offset..).unwrap_or_default(),
+                        bit_depth,
+                        channels,
+                    ),
+                pure_bypass.load(Ordering::Relaxed),
+                strict_bitperfect,
+            ) {
+                warn!(
+                    device = %device_name,
+                    cadence_fixe_demandee = demandee,
+                    cadence_ouverte = ouverte,
+                    "frequence_fixe_ramenee_a_la_cadence_de_la_sortie"
+                );
             }
             let output_ch = sortie.canaux;
             reaffectation.constater_l_ouverture(voies_de_la_matrice, output_ch, &device_name);

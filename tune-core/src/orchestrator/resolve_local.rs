@@ -2744,10 +2744,18 @@ impl PlaybackOrchestrator {
             && let Some(rate) =
                 crate::audio::frequence_fixe::cible(&self.db, req.zone_id, zone_max_sample_rate)?
         {
-            // Le décimateur DSD actuel n'accepte que des rapports entiers.
-            // Ne jamais étiqueter 48 kHz un flux décimé à une autre cadence.
+            // Un DSD hors famille (48 kHz sous DSD64) est décimé dans sa
+            // famille puis rééchantillonné vers `rate` par le décodeur
+            // (`dsd_to_pcm::cadence_de_decimation`) : le flux sort bien à `rate`.
             if src_fmt == AudioFormat::Dsd && !sample_rate.is_multiple_of(rate) {
-                return Err("Fixed PCM sample rate requires an integer DSD decimation ratio; disable the fixed rate for this DSD track".into());
+                info!(
+                    zone_id = req.zone_id,
+                    dsd_rate = sample_rate,
+                    cadence_decimee =
+                        crate::audio::dsd_to_pcm::cadence_de_decimation(sample_rate, rate),
+                    cadence_fixe = rate,
+                    "frequence_fixe_dsd_decime_puis_reechantillonne"
+                );
             }
             out_sr = rate;
         }

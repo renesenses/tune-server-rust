@@ -2212,6 +2212,38 @@ pub fn decode_http_range_to_pcm_streaming_seeked(
     )
 }
 
+/// #8428 — le décodeur progressif d'une source QUELCONQUE (corps HTTP lu en
+/// continu, ou source `Range`) à cadence, canaux et profondeur imposés, avec
+/// témoin de données et niveaux : l'URL directe d'une zone à cadence fixe.
+/// Une source qui ne sait pas sauter doit recevoir `seek_s = 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_source_to_pcm_streaming_a_cadence(
+    source: Box<dyn MediaSource>,
+    codec_hint: &str,
+    target_sample_rate: u32,
+    target_channels: u32,
+    target_bit_depth: u16,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
+    let source_name = format!("flux-distant.{codec_hint}");
+    decode_to_pcm_streaming_inner(
+        &source_name,
+        Some(target_sample_rate),
+        Some(target_channels),
+        Some(target_bit_depth),
+        tx,
+        chunk_size,
+        Some(data_ready),
+        Some(levels_tx),
+        seek_s.max(0.0),
+        Some(source),
+    )
+}
+
 /// #6673 — le décodeur progressif à cadence, canaux et profondeur IMPOSÉS,
 /// sur un fichier (`source` absente : `chemin` est son chemin) ou sur une
 /// source quelconque (`chemin` ne sert alors que d'indice de format, comme
@@ -4470,7 +4502,18 @@ fn decoder_le_dsd_par_blocs(
     use super::dsd_to_pcm::DsdToPcmStreamer;
 
     let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
-    let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, lsb_first);
+    // #8428 — une cadence hors famille (48 kHz fixe sous DSD64) : décimée
+    // dans la famille, puis rééchantillonnée par l'adaptateur ci-dessous.
+    let cadence_decimee = super::dsd_to_pcm::cadence_de_decimation(dsd_rate, output_rate);
+    if cadence_decimee != output_rate {
+        tracing::info!(
+            dsd_rate,
+            cadence_decimee,
+            output_rate,
+            "dsd_decime_puis_reechantillonne"
+        );
+    }
+    let mut streamer = DsdToPcmStreamer::new(dsd_rate, cadence_decimee, channels, lsb_first);
     let source_ch = checked_channels(channels as u32, "DSD stream source")?;
     let output_ch = checked_channels(
         target_channels.unwrap_or(channels as u32),
@@ -4483,7 +4526,7 @@ fn decoder_le_dsd_par_blocs(
         24,
         source_ch as u32,
         output_ch as u32,
-        output_rate,
+        cadence_decimee,
         output_rate,
     )?
     .avec_la_disposition(disposition_pour_le_routage(
@@ -5015,7 +5058,12 @@ fn decode_dsd_to_pcm(
     let (dsd_rate, output_rate, channels) = if ext == "iso" {
         let chemin = Path::new(file_path);
         let (dsd_rate, channels) = super::sacd::parametres_de_lecture(chemin)?;
-        let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+        // #8428 — hors famille : décimé dans la famille, `adapt_decoded_audio`
+        // rééchantillonne ensuite vers `target_sample_rate`.
+        let output_rate = super::dsd_to_pcm::cadence_de_decimation(
+            dsd_rate,
+            target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate)),
+        );
         let debut_ms = (seek_s.max(0.0) * 1000.0).round() as u64;
         let mut reader = super::sacd::ouvrir_lecture(chemin, debut_ms, None)?;
         let atteint_s = reader.trame_atteinte().map_or(0.0, |t| {
@@ -5042,7 +5090,12 @@ fn decode_dsd_to_pcm(
         let info = super::dsf::parse_dsf(file_path)?;
         let dsd_rate = info.sample_rate;
         let channels = info.channels as usize;
-        let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+        // #8428 — hors famille : décimé dans la famille, `adapt_decoded_audio`
+        // rééchantillonne ensuite vers `target_sample_rate`.
+        let output_rate = super::dsd_to_pcm::cadence_de_decimation(
+            dsd_rate,
+            target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate)),
+        );
         let decimation = (dsd_rate / output_rate).max(1) as u64;
         let total_samples = info.total_samples;
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
@@ -5086,7 +5139,12 @@ fn decode_dsd_to_pcm(
         let info = super::dff::parse_dff(file_path)?;
         let dsd_rate = info.sample_rate;
         let channels = info.channels as usize;
-        let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+        // #8428 — hors famille : décimé dans la famille, `adapt_decoded_audio`
+        // rééchantillonne ensuite vers `target_sample_rate`.
+        let output_rate = super::dsd_to_pcm::cadence_de_decimation(
+            dsd_rate,
+            target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate)),
+        );
         // DFF has no explicit sample count; estimate from the data chunk size
         // (data_size bytes * 8 DSD samples/byte, then decimated).
         let decimation = (dsd_rate / output_rate).max(1) as u64;

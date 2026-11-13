@@ -5772,3 +5772,117 @@ fn frequence_fixe_8428_ne_double_pas_la_conversion_mesuree() {
         "la session et la mesure décrivent une seule conversion 44,1 → 48 kHz : {sp}"
     );
 }
+
+/// #8428 — décision du 12/11 : un DSD64 vers une cadence fixe HORS FAMILLE
+/// (48 kHz) est décimé dans sa famille (88,2 kHz) puis rééchantillonné. Le
+/// chemin du signal montre les deux étapes.
+#[test]
+fn frequence_fixe_8428_dsd_hors_famille_montre_decimation_puis_reechantillonnage() {
+    let (backend, zone) = dlna_zone();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::frequence_fixe::cle_de_zone(zone.id.unwrap()),
+            "48000",
+        )
+        .unwrap();
+    let ps = en_lecture(1, "dsf", 2_822_400, 1);
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "",
+        Some(&wire("wav", 48_000, 24)),
+    )
+    .unwrap();
+    let transcodeur = step_desc(&sp, "Transcoder").unwrap_or_else(|| panic!("{sp}"));
+    assert!(
+        transcodeur.starts_with("DSD64") && transcodeur.contains("PCM 88kHz"),
+        "la décimation doit viser 88,2 kHz : {transcodeur}"
+    );
+    let steps = sp["steps"].as_array().unwrap();
+    let conversions: Vec<&Value> = steps
+        .iter()
+        .filter(|s| s["code"] == "rate_conversion")
+        .collect();
+    assert_eq!(conversions.len(), 1, "{sp}");
+    assert_eq!(conversions[0]["from_hz"], 88_200);
+    assert_eq!(conversions[0]["to_hz"], 48_000);
+    let i_transcodeur = steps
+        .iter()
+        .position(|s| s["name"] == "Transcoder")
+        .unwrap();
+    let i_conversion = steps
+        .iter()
+        .position(|s| s["code"] == "rate_conversion")
+        .unwrap();
+    assert!(
+        i_transcodeur < i_conversion,
+        "décimation puis rééchantillonnage : {sp}"
+    );
+}
+
+/// Contre-épreuve : un DSD décimé DANS sa famille (176,4 kHz) garde une
+/// seule étape, sans rééchantillonnage.
+#[test]
+fn frequence_fixe_8428_dsd_dans_la_famille_garde_une_seule_etape() {
+    let (backend, zone) = dlna_zone();
+    let ps = en_lecture(1, "dsf", 2_822_400, 1);
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "",
+        Some(&wire("wav", 176_400, 24)),
+    )
+    .unwrap();
+    assert!(
+        !sp["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["code"] == "rate_conversion"),
+        "{sp}"
+    );
+    assert!(!step_desc(&sp, "Transcoder").unwrap().contains("PCM 88kHz"));
+}
+
+/// #8428 — décision du 12/11 (« ramener au plafond ») côté sortie locale :
+/// WASAPI partagé ouvre 48 kHz sous une cadence fixe de 96 kHz. La lecture
+/// n'est plus refusée ; le chemin du signal dit « 96 kHz demandé, 48 kHz
+/// appliqué » d'après la cadence OUVERTE que la sortie déclare.
+#[test]
+fn frequence_fixe_8428_sortie_locale_ramenee_a_la_cadence_ouverte() {
+    use tune_core::outputs::traits::{AudioSpec, FormatOuvert, ProfondeurPcm};
+    let (backend, zone) = local_zone_migrated();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::frequence_fixe::cle_de_zone(zone.id.unwrap()),
+            "96000",
+        )
+        .unwrap();
+    let mut ps = en_lecture(1, "flac", 44_100, 16);
+    ps.transformations_reelles = Some(TransformationsReelles::nouvelles(
+        AudioSpec::nouvelle(96_000, ProfondeurPcm::Entier16, 2).unwrap(),
+        FormatOuvert::new(48_000, 2),
+        false,
+    ));
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CPAL",
+        Some(&wire("wav", 96_000, 16)),
+    )
+    .unwrap();
+    let notice = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["code"] == "fixed_rate_limit")
+        .unwrap_or_else(|| panic!("la cadence ramenée doit être dite : {sp}"));
+    assert_eq!(notice["requested_hz"], 96_000);
+    assert_eq!(notice["applied_hz"], 48_000);
+}
