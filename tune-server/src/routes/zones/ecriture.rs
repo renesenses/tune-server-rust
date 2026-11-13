@@ -977,6 +977,11 @@ async fn persister_le_son(
             warn!(zone_id = id, error = %error, "gain_trim_volume_refresh_failed");
         }
     }
+    // #8554 — volume fixe et bit-perfect strict décident du contour de
+    // loudness : le relire en vol, sans attendre la piste suivante.
+    if body.fixed_volume.is_some() || body.strict_bitperfect.is_some() {
+        state.orchestrator.refresh_zone_contour_de_sonie(id).await;
+    }
     Ok(())
 }
 

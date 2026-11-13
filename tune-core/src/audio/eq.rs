@@ -594,7 +594,13 @@ impl EqProcessor {
             && self.fondu.is_none()
             && self.gain_garde.is_none()
             // #8554 — un contour de loudness encore actif n'est pas l'identité.
-            && self.contour.as_ref().is_none_or(|c| c.est_au_repos())
+            // Allumé mais NUL (au niveau de référence), il n'agit pas non
+            // plus : la chaîne reste bit-perfect, la sortie le raccroche dès
+            // que le volume baisse (`LocalOutput::contour_suit_le_volume`).
+            && self
+                .contour
+                .as_ref()
+                .is_none_or(|c| c.est_au_repos() || c.est_identite())
     }
 
     /// #8554 — un égaliseur COUPÉ qui ne porte que le contour de loudness :

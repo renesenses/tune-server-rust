@@ -1902,6 +1902,9 @@ impl PlaybackOrchestrator {
             // l'historique des biquads et les lignes à retard doivent survivre
             // au remplacement — sinon la bascule claque.
             local_output.replace_crossfeed_live(self.load_crossfeed_processor(zone_id, taux));
+            // #8554 — le contour de loudness suit la bascule : retiré sous PURE,
+            // revenu en rampe depuis zéro à la sortie de PURE.
+            local_output.set_contour_de_sonie(self.contour_de_sonie_voulu(zone_id, taux, canaux));
             local_output.replace_eq_live(self.load_eq_processor(zone_id, taux, canaux));
             // Le repli mono est lui aussi gouverné par PURE (#2362) : basculer
             // PURE doit donc le désarmer ou le réarmer dans le même geste, sans

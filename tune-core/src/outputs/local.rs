@@ -1638,7 +1638,17 @@ impl LocalOutput {
                         c.suivre_le_volume(volume_db);
                         c
                     }
-                    _ => Box::new(ContourDeSonie::new(reglage, taux, canaux, volume_db)),
+                    // Autre format : les gains atteints sont repris, pas de
+                    // nouvelle rampe depuis zéro.
+                    Some(c) => Box::new(ContourDeSonie::new_depuis(
+                        reglage,
+                        taux,
+                        canaux,
+                        volume_db,
+                        c.gains_courants_db(),
+                    )),
+                    // Neuf : part de gains nuls et rejoint sa consigne en rampe.
+                    None => Box::new(ContourDeSonie::new(reglage, taux, canaux, volume_db)),
                 })
             }
         };
@@ -1652,12 +1662,15 @@ impl LocalOutput {
     }
 
     /// #8554 — le volume a changé : le contour rejoint sa nouvelle consigne.
+    /// Un contour nul (au niveau de référence) a pu quitter la chaîne pour la
+    /// garder bit-perfect : il y est alors raccroché.
     fn contour_suit_le_volume(&self) {
         let volume_db = self.volume_db_de_l_auditeur();
-        if let Ok(mut eq) = self.eq.lock()
-            && let Some(c) = eq.as_mut().and_then(|p| p.contour_mut())
-        {
-            c.suivre_le_volume(volume_db);
+        if let Ok(mut eq) = self.eq.lock() {
+            match eq.as_mut().and_then(|p| p.contour_mut()) {
+                Some(c) => c.suivre_le_volume(volume_db),
+                None => self.accrocher_le_contour(&mut eq, None),
+            }
         }
     }
 

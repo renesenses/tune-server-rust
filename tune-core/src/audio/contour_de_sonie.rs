@@ -24,11 +24,12 @@
 //! (20 à 90 phones) : sous 20 phones, le contour cesse de croître.
 //!
 //! Les courbes d'égale sonie se resserrent dans le grave (`Lp` y croît de
-//! moins de 1 dB par phone) : `0 ≤ G(f) ≤ A`. Sur une sortie dont le volume
-//! est numérique et appliqué APRÈS le contour, la crête rendue ne dépasse
-//! donc jamais celle du niveau de référence ; un préampli négatif
-//! ([`ContourDeSonie::preampli_db`]) reprend le reste quand ce n'est pas le
-//! cas (niveau manuel sur une zone en volume fixe).
+//! moins de 1 dB par phone) : `0 ≤ G(f) ≤ A`. Le contour tourne AVANT
+//! l'anneau de la sortie et le volume s'applique au rendu, environ 2 s plus
+//! tard : un préampli négatif ([`Consigne::preampli_db`]) reprend donc
+//! toute la crête des filtres, sans dépendre du volume. Le contour ne
+//! dépasse jamais le niveau d'entrée : il creuse le médium plutôt que de
+//! pousser le grave au-dessus de la pleine échelle.
 //!
 //! ## Les filtres
 //!
@@ -40,8 +41,9 @@
 //!
 //! ## Sans clic
 //!
-//! Un changement de volume ne pose qu'une CIBLE. Les gains appliqués s'en
-//! rapprochent à [`VITESSE_DB_PAR_SECONDE`], par pas recalculés tous les
+//! Un changement de volume ne pose qu'une CIBLE, et un contour neuf part de
+//! gains nuls. Les gains appliqués s'en rapprochent à
+//! [`VITESSE_DB_PAR_SECONDE`], par pas recalculés tous les
 //! [`TRAMES_PAR_PAS`] trames ; les biquads (forme transposée II, état en
 //! `f64`) gardent leur historique d'un pas à l'autre.
 //!
@@ -398,15 +400,31 @@ fn resoudre(m: &mut [[f64; 5]; 4], n: usize) -> Option<[f64; 4]> {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Consigne {
     pub gains_db: [f64; 4],
-    /// Préampli (dB, ≤ 0) qui garde la crête sous la pleine échelle une fois
-    /// le volume numérique appliqué.
+    /// Préampli (dB, ≤ 0) : moins la crête de la réponse des filtres. Le
+    /// contour ne dépasse donc JAMAIS le niveau d'entrée, quel que soit le
+    /// volume (relecture de #8657) : le volume s'applique au rendu, ~2 s
+    /// après le contour, et un préampli qui comptait sur lui laissait passer
+    /// +14 dB de grave au volume plein le temps que l'anneau se vide.
     pub preampli_db: f64,
 }
 
+/// La crête (dB, ≥ 0) de la réponse des filtres sur les fréquences de la
+/// norme sous Nyquist.
+fn crete_db(gains: &[f64; 4], sample_rate: u32) -> f64 {
+    if gains.iter().all(|g| *g == 0.0) {
+        return 0.0;
+    }
+    FREQUENCES_ISO
+        .iter()
+        .filter(|f| **f < f64::from(sample_rate) * 0.45)
+        .map(|f| reponse_db(gains, *f, sample_rate))
+        .fold(0.0_f64, f64::max)
+}
+
 impl Consigne {
-    /// La consigne du réglage pour un volume de zone `volume_db` (le volume
-    /// numérique appliqué après le contour sur une sortie locale). `None` :
-    /// niveau inconnu, la consigne courante est gardée.
+    /// La consigne du réglage pour un volume de zone `volume_db`. `None` :
+    /// niveau inconnu, la consigne courante est gardée. Le préampli ne
+    /// dépend PAS du volume : il reprend toute la crête des filtres.
     pub fn calculer(
         reglage: &ReglageContour,
         volume_db: Option<f64>,
@@ -415,20 +433,14 @@ impl Consigne {
         let a = reglage.attenuation_db(volume_db)?;
         let cible = contour_cible(reglage, a);
         let gains_db = ajuster(&cible, sample_rate, reglage.bass_only);
-        let crete = FREQUENCES_ISO
-            .iter()
-            .filter(|f| **f < f64::from(sample_rate) * 0.45)
-            .map(|f| reponse_db(&gains_db, *f, sample_rate))
-            .fold(0.0_f64, f64::max);
-        let volume = volume_db.filter(|v| v.is_finite()).unwrap_or(0.0).min(0.0);
         Some(Self {
             gains_db,
-            preampli_db: (-(crete + volume)).min(0.0),
+            preampli_db: -crete_db(&gains_db, sample_rate),
         })
     }
 
     pub fn est_nulle(&self) -> bool {
-        self.gains_db.iter().all(|g| g.abs() < 1e-9) && self.preampli_db.abs() < 1e-9
+        self.gains_db.iter().all(|g| g.abs() < 1e-9)
     }
 }
 
@@ -448,11 +460,27 @@ pub struct ContourDeSonie {
 }
 
 impl ContourDeSonie {
+    /// Un contour neuf part de gains NULS et rejoint sa consigne en douceur :
+    /// l'allumer en cours d'écoute (ou sortir de PURE) ne fait pas sauter le
+    /// grave de +10 à +15 dB d'un coup (relecture de #8657).
     pub fn new(
         reglage: ReglageContour,
         sample_rate: u32,
         channels: u16,
         volume_db: Option<f64>,
+    ) -> Self {
+        Self::new_depuis(reglage, sample_rate, channels, volume_db, [0.0; 4])
+    }
+
+    /// Un contour neuf (autre format) qui reprend les gains atteints par le
+    /// précédent : un changement de fréquence d'échantillonnage ne refait pas
+    /// la rampe depuis zéro.
+    pub fn new_depuis(
+        reglage: ReglageContour,
+        sample_rate: u32,
+        channels: u16,
+        volume_db: Option<f64>,
+        gains_de_depart_db: [f64; 4],
     ) -> Self {
         let mut c = Self {
             reglage,
@@ -466,8 +494,7 @@ impl ContourDeSonie {
             dernier_volume_db: None,
         };
         c.suivre_le_volume(volume_db);
-        // Au début d'une piste, rien à lisser : la consigne s'applique d'emblée.
-        c.courant = c.cible;
+        c.courant.gains_db = gains_de_depart_db;
         c.recalculer_les_coefficients();
         c
     }
@@ -525,6 +552,11 @@ impl ContourDeSonie {
         self.courant.est_nulle() && self.cible.est_nulle()
     }
 
+    /// Les gains atteints (dB), pour un contour qui prend la relève.
+    pub fn gains_courants_db(&self) -> [f64; 4] {
+        self.courant.gains_db
+    }
+
     pub fn consigne_courante(&self) -> Consigne {
         self.courant
     }
@@ -550,6 +582,9 @@ impl ContourDeSonie {
         for (i, (forme, fc, q)) in FILTRES.iter().enumerate() {
             self.coefs[i] = coefficients(*forme, *fc, *q, self.courant.gains_db[i], fs);
         }
+        // Le préampli suit les gains APPLIQUÉS, pas la cible : pendant une
+        // rampe aussi, la crête reste sous le niveau d'entrée.
+        self.courant.preampli_db = -crete_db(&self.courant.gains_db, self.sample_rate);
     }
 
     /// Avance les gains courants d'un pas vers la cible ; vrai s'ils ont bougé.
@@ -574,11 +609,6 @@ impl ContourDeSonie {
                 &mut bouge,
             );
         }
-        rapprocher(
-            &mut self.courant.preampli_db,
-            self.cible.preampli_db,
-            &mut bouge,
-        );
         if bouge {
             self.recalculer_les_coefficients();
         }
@@ -603,14 +633,13 @@ impl ContourDeSonie {
         for bloc in samples.chunks_mut(TRAMES_PAR_PAS * canaux) {
             self.avancer(bloc.len() / canaux);
             let pre = 10f64.powf(self.courant.preampli_db / 20.0);
-            let actifs: Vec<usize> = (0..4)
-                .filter(|&i| self.courant.gains_db[i] != 0.0)
-                .collect();
+            // Sans allocation : un drapeau par filtre.
+            let actif: [bool; 4] = std::array::from_fn(|i| self.courant.gains_db[i] != 0.0);
             for trame in bloc.chunks_mut(canaux) {
                 for (c, s) in trame.iter_mut().enumerate() {
                     let mut x = f64::from(*s);
                     let etat = &mut self.etats[c];
-                    for &i in &actifs {
+                    for i in (0..4).filter(|&i| actif[i]) {
                         let k = &self.coefs[i];
                         let st = &mut etat[i];
                         let y = k[0] * x + st[0];
@@ -619,6 +648,15 @@ impl ContourDeSonie {
                         x = y;
                     }
                     *s = (x * pre) as f32;
+                }
+            }
+            // Dénormaux : un état qui s'éteint dans le silence retombe à zéro
+            // au lieu de traîner des valeurs sous-normales, lentes à calculer.
+            for etat in &mut self.etats {
+                for st in etat.iter_mut().flatten() {
+                    if st.abs() < 1e-30 {
+                        *st = 0.0;
+                    }
                 }
             }
         }
@@ -909,20 +947,72 @@ mod tests {
     }
 
     #[test]
-    fn la_crete_ne_depasse_pas_la_reference_en_mode_volume() {
-        let r = reglage();
-        for v in [-10.0, -20.0, -40.0] {
-            let k = Consigne::calculer(&r, Some(v), 48_000).unwrap();
-            let crete = FREQUENCES_ISO
-                .iter()
-                .map(|f| reponse_db(&k.gains_db, *f, 48_000))
-                .fold(f64::MIN, f64::max);
-            assert!(
-                crete + k.preampli_db + v <= 1e-6,
-                "{v} dB : crête {crete} pre {}",
-                k.preampli_db
-            );
+    fn la_crete_ne_depasse_jamais_l_entree_quel_que_soit_le_volume() {
+        for r in [
+            reglage(),
+            ReglageContour {
+                level_source: SourceDuNiveau::Manual,
+                manual_level_db: -40.0,
+                ..reglage()
+            },
+        ] {
+            for v in [0.0, -10.0, -20.0, -40.0, -60.0] {
+                let k = Consigne::calculer(&r, Some(v), 48_000).unwrap();
+                let crete = crete_db(&k.gains_db, 48_000);
+                assert!(
+                    crete + k.preampli_db <= 1e-9,
+                    "{v} dB : crête {crete} pre {}",
+                    k.preampli_db
+                );
+            }
         }
+    }
+
+    /// Relecture de #8657 — le contour tourne ~2 s AVANT le volume (anneau de
+    /// la sortie) : remonter le volume de −30 à 0 dB laissait passer ~2 s de
+    /// grave relevé au volume plein. Un sinus 40 Hz à pleine échelle, traité
+    /// au contour de −30 dB, ne doit JAMAIS dépasser la pleine échelle.
+    #[test]
+    fn un_grave_a_pleine_echelle_n_ecrete_jamais() {
+        let sr = 48_000;
+        let mut c = ContourDeSonie::new(reglage(), sr, 2, Some(-30.0));
+        let mut x: Vec<f32> = (0..sr as usize * 2)
+            .flat_map(|n| {
+                let s = (std::f64::consts::TAU * 40.0 * n as f64 / f64::from(sr)).sin() as f32;
+                [s, s]
+            })
+            .collect();
+        c.process_interleaved(&mut x);
+        let crete = x.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            crete <= 1.0 + 1e-3,
+            "crête {crete} : écrêtage au volume plein"
+        );
+        assert!(!c.consigne_courante().est_nulle(), "le contour agit bien");
+    }
+
+    /// Relecture de #8657 — allumer le contour en cours d'écoute (ou sortir de
+    /// PURE) part de gains nuls : pas de saut de +10 à +15 dB de grave.
+    #[test]
+    fn allumer_en_cours_d_ecoute_part_de_zero() {
+        let sr = 48_000;
+        let mut c = ContourDeSonie::new(reglage(), sr, 2, Some(-30.0));
+        assert!(
+            c.consigne_courante().est_nulle(),
+            "rien d'appliqué à l'allumage"
+        );
+        let mut bloc = sinus(50.0, sr, TRAMES_PAR_PAS, 0);
+        c.process_interleaved(&mut bloc);
+        let pas = VITESSE_DB_PAR_SECONDE * TRAMES_PAR_PAS as f64 / f64::from(sr);
+        let g = c.consigne_courante().gains_db;
+        assert!(g.iter().all(|x| x.abs() <= pas + 1e-9), "premier pas {g:?}");
+        let depuis =
+            ContourDeSonie::new_depuis(reglage(), 96_000, 2, Some(-30.0), [3.0, 2.0, 0.0, 1.0]);
+        assert_eq!(
+            depuis.gains_courants_db(),
+            [3.0, 2.0, 0.0, 1.0],
+            "relève de format : gains repris"
+        );
     }
 
     #[test]
@@ -955,22 +1045,37 @@ mod tests {
     #[test]
     fn le_grave_monte_quand_le_volume_baisse_et_1_khz_ne_bouge_pas() {
         let sr = 48_000;
-        let mut c = ContourDeSonie::new(reglage(), sr, 2, Some(-30.0));
-        let mut grave = sinus(50.0, sr, sr as usize, 0);
-        c.process_interleaved(&mut grave);
-        let g = niveau_db(&grave[grave.len() / 2..]);
-        let attendu = c.consigne_courante();
-        let prevu = reponse_db(&attendu.gains_db, 50.0, sr) + attendu.preampli_db;
+        // Deux secondes : la rampe d'allumage (~0,7 s) est finie.
+        let mesurer = |f: f64| {
+            let mut c = ContourDeSonie::new(reglage(), sr, 2, Some(-30.0));
+            let mut x = sinus(f, sr, 2 * sr as usize, 0);
+            c.process_interleaved(&mut x);
+            let k = c.consigne_courante();
+            assert_eq!(k, c.consigne_cible(), "rampe finie");
+            (
+                niveau_db(&x[x.len() / 2..]),
+                reponse_db(&k.gains_db, f, sr) + k.preampli_db,
+            )
+        };
+        let (g, prevu_g) = mesurer(50.0);
+        let (m, prevu_m) = mesurer(1000.0);
         assert!(
-            (g - prevu).abs() < 0.3,
-            "50 Hz : {g:.2} dB, prévu {prevu:.2}"
+            (g - prevu_g).abs() < 0.3,
+            "50 Hz : {g:.2} dB, prévu {prevu_g:.2}"
         );
-        assert!(g > 8.0, "50 Hz relevé de {g:.2} dB seulement");
-        let mut c = ContourDeSonie::new(reglage(), sr, 2, Some(-30.0));
-        let mut milieu = sinus(1000.0, sr, sr as usize / 2, 0);
-        c.process_interleaved(&mut milieu);
-        let m = niveau_db(&milieu[milieu.len() / 2..]) - c.consigne_courante().preampli_db;
-        assert!(m.abs() < 1.0, "1 kHz bouge de {m:.2} dB");
+        assert!(
+            (m - prevu_m).abs() < 0.3,
+            "1 kHz : {m:.2} dB, prévu {prevu_m:.2}"
+        );
+        assert!(
+            g - m > 8.0,
+            "50 Hz relevé de {:.2} dB seulement par rapport à 1 kHz",
+            g - m
+        );
+        assert!(
+            g <= 0.01,
+            "50 Hz à {g:.2} dB : au-dessus du niveau d'entrée"
+        );
     }
 
     /// Un saut de volume ne fait pas sauter le signal : la consigne est
@@ -1007,6 +1112,8 @@ mod tests {
     fn couper_ramene_a_zero_puis_au_repos() {
         let sr = 48_000;
         let mut c = ContourDeSonie::new(reglage(), sr, 2, Some(-30.0));
+        let mut chauffe = sinus(60.0, sr, sr as usize, 0);
+        c.process_interleaved(&mut chauffe);
         c.eteindre();
         assert!(!c.est_au_repos(), "le grave redescend en douceur");
         let mut x = sinus(60.0, sr, sr as usize, 0);

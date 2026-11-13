@@ -67,17 +67,28 @@ fn gain_cible_du_grave(sortie: &LocalOutput) -> f64 {
 
 #[tokio::test]
 async fn sans_egaliseur_le_contour_releve_le_grave_a_bas_volume() {
-    let sortie = LocalOutput::new("DAC test".to_string());
-    sortie.set_volume(0.1).await.unwrap(); // −20 dB
-    sortie.set_contour_de_sonie(voulu());
+    // Le grave monte PAR RAPPORT au médium (le préampli creuse le médium
+    // plutôt que de pousser le grave au-dessus de l'entrée).
+    async fn niveau(f: f64) -> (f64, LocalOutput) {
+        let sortie = LocalOutput::new("DAC test".to_string());
+        sortie.set_volume(0.1).await.unwrap(); // −20 dB
+        sortie.set_contour_de_sonie(voulu());
+        let mut x = sinus(f, 2 * TAUX as usize);
+        traiter(&sortie, &mut x);
+        (rms_db(&x[x.len() / 2..]), sortie)
+    }
+    let (g, sortie) = niveau(50.0).await;
+    let (m, _) = niveau(1000.0).await;
     assert!(
         !sortie.has_eq(),
         "le porteur du contour n'est pas un égaliseur"
     );
-    let mut grave = sinus(50.0, TAUX as usize);
-    traiter(&sortie, &mut grave);
-    let g = rms_db(&grave[grave.len() / 2..]);
-    assert!(g > 5.0, "50 Hz relevé de {g:.2} dB seulement à −20 dB");
+    assert!(
+        g - m > 5.0,
+        "50 Hz relevé de {:.2} dB seulement à −20 dB",
+        g - m
+    );
+    assert!(g <= 0.01, "50 Hz à {g:.2} dB : au-dessus de l'entrée");
     assert!(!local_dsp_is_identity(
         &sortie.eq,
         &sortie.convolver,
@@ -188,6 +199,8 @@ async fn retire_il_redescend_puis_quitte_la_chaine() {
     let sortie = LocalOutput::new("DAC test".to_string());
     sortie.set_volume(0.1).await.unwrap();
     sortie.set_contour_de_sonie(voulu());
+    let mut chauffe = sinus(50.0, TAUX as usize);
+    traiter(&sortie, &mut chauffe);
     sortie.set_contour_de_sonie(None);
     assert!(
         sortie.consigne_du_contour().is_some_and(|c| !c.est_nulle()),
@@ -199,4 +212,60 @@ async fn retire_il_redescend_puis_quitte_la_chaine() {
         sortie.eq.lock().unwrap().is_none(),
         "revenu à zéro, il quitte la chaîne"
     );
+}
+
+/// Relecture de #8657 — allumer le contour pendant l'écoute : le premier bloc
+/// sort (presque) tel quel, le grave arrive en rampe.
+#[tokio::test]
+async fn allume_en_cours_d_ecoute_il_arrive_en_rampe() {
+    let sortie = LocalOutput::new("DAC test".to_string());
+    sortie.set_volume(0.1).await.unwrap();
+    sortie.set_contour_de_sonie(voulu());
+    let entree = sinus(50.0, 480);
+    let mut x = entree.clone();
+    traiter(&sortie, &mut x);
+    let ecart = x
+        .iter()
+        .zip(&entree)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        ecart < 0.01,
+        "premier bloc de 10 ms changé de {ecart} : saut à l'allumage"
+    );
+}
+
+/// Relecture de #8657 — allumé mais NUL (volume de référence) : la chaîne
+/// reste bit-perfect, et le contour revient dès que le volume baisse.
+#[tokio::test]
+async fn nul_a_la_reference_la_chaine_reste_bit_perfect() {
+    let sortie = LocalOutput::new("DAC test".to_string());
+    sortie.set_volume(1.0).await.unwrap();
+    sortie.set_contour_de_sonie(voulu());
+    let mut x = sinus(50.0, 960);
+    traiter(&sortie, &mut x);
+    assert!(local_dsp_is_identity(
+        &sortie.eq,
+        &sortie.convolver,
+        &sortie.crossfeed,
+        &sortie.pure_bypass,
+        &sortie.mono_downmix
+    ));
+    assert_eq!(
+        local_dsp_runtime_state(
+            &sortie.eq,
+            &sortie.convolver,
+            &sortie.crossfeed,
+            &sortie.pure_bypass,
+            &sortie.mono_downmix,
+            false
+        ),
+        OutputDspState::Inactive
+    );
+    sortie.set_volume(0.1).await.unwrap();
+    assert!(
+        sortie.consigne_du_contour().is_some(),
+        "le volume baisse : le contour est raccroché"
+    );
+    assert!(gain_cible_du_grave(&sortie) > 3.0);
 }
