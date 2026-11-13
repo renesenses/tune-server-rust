@@ -2077,6 +2077,12 @@ path = "tests/politique_parentale_7856.rs"
 name = "politique_parentale_7913"
 path = "tests/politique_parentale_7913.rs"
 
+# Banc rc12 (#7913) — accueil, genres, collections, recherche et pistes
+# sans l'artiste bloqué. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "banc_rc12_politique_parentale_listes_7913"
+path = "tests/banc_rc12_politique_parentale_listes_7913.rs"
+
 # #7913 — coût du total exact : une relecture par liste, puis le cache.
 [[test]]
 name = "politique_parentale_cout_7913"
