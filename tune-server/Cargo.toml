@@ -1532,6 +1532,12 @@ path = "tests/compilations_regroupees_8106.rs"
 name = "dedoublonnage_par_racine_6917"
 path = "tests/dedoublonnage_par_racine_6917.rs"
 
+# #7478 — exclusions du scan par emplacement : motif glob, aperçu exact,
+# confirmation obligatoire, retrait au scan suivant, liste globale inchangée.
+[[test]]
+name = "exclusions_du_scan_7478"
+path = "tests/exclusions_du_scan_7478.rs"
+
 # « pas de bouton pour supprimer une playlist Tidal ! » — le trait savait le
 # faire (Qobuz seulement) mais AUCUNE route ne l'appelait. `autotests = false`
 # plus haut : sans cette cible, la garde du refus préalable (501 avant tout

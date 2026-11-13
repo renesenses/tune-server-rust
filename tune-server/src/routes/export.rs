@@ -164,10 +164,19 @@ async fn export_library_audit_csv(
     // Côté disque : le walker du scan, avec ses gardes (NAS gelé, montage
     // absent → missing_dirs, extensions ignorées comptées) et les mêmes
     // exclusions que le scan.
-    let excludes = crate::auto_scan::scan_exclude_patterns(&state.backend);
+    let exclusions = crate::auto_scan::exclusions_du_scan(&state.backend);
     let liste = match tokio::task::spawn_blocking({
         let dirs = dirs.clone();
-        move || tune_core::scanner::walker::list_audio_files_with_excludes(&dirs, &excludes)
+        move || {
+            tune_core::scanner::walker::list_audio_files_avec_exclusions(
+                &dirs,
+                &exclusions,
+                tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
+                &mut |_| {},
+                &|| false,
+            )
+            .expect("sans demande d'arrêt, le parcours va toujours au bout")
+        }
     })
     .await
     {

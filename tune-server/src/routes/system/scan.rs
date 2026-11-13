@@ -903,6 +903,38 @@ pub(crate) enum VerdictPurge {
 /// Cette règle existait en DEUX copies — `routes/system/scan.rs` et
 /// `auto_scan.rs` — portant les mêmes trous. Les faire diverger encore serait
 /// reproduire #1943 ; les faire vivre ici les corrige des deux côtés à la fois.
+/// #7478 — le verdict de purge, quand l'utilisateur a EXCLU des chemins de
+/// leur emplacement. Une piste écartée par un motif de son emplacement est
+/// retirée, même si son dossier entier « disparaît » d'un coup — c'est la
+/// règle qui le vide, pas un montage absent. Tout le reste suit
+/// [`verdict_purge`], et le plafond de la purge s'applique ensuite comme
+/// toujours. Les fichiers ne sont jamais touchés : seule la ligne part.
+pub(crate) fn verdict_purge_avec_exclusions(
+    exclusions: &tune_core::scanner::exclusions::Exclusions,
+    db_path: &str,
+    racines_configurees: &[String],
+    missing_dirs: &[String],
+    error_dirs: &[String],
+    emptied_roots: &[String],
+    sous_arbres_vides: &[String],
+) -> VerdictPurge {
+    if exclusions.exclut_par_emplacement(db_path)
+        && racines_configurees
+            .iter()
+            .any(|r| sous_le_dossier(db_path, r))
+    {
+        return VerdictPurge::Supprimer;
+    }
+    verdict_purge(
+        db_path,
+        racines_configurees,
+        missing_dirs,
+        error_dirs,
+        emptied_roots,
+        sous_arbres_vides,
+    )
+}
+
 pub(crate) fn verdict_purge(
     db_path: &str,
     racines_configurees: &[String],
@@ -2048,6 +2080,8 @@ async fn spawn_library_scan_avec_lecteur_par(
         if !exclude_patterns.is_empty() {
             tracing::info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
         }
+        // #7478 — avec les motifs par emplacement.
+        let exclusions_scan = crate::auto_scan::exclusions_du_scan(&db);
         // Le parcours des dossiers est la phase la plus longue d'un scan sur
         // un partage réseau, et c'était la seule totalement muette : dans la
         // boucle de `walker.rs` aucune trace n'est émise hors chemin d'erreur,
@@ -2072,9 +2106,9 @@ async fn spawn_library_scan_avec_lecteur_par(
         // tenait le bouton en échec sur un partage lent (#1129). Interrompu, il
         // ne rend AUCUNE liste — une liste partielle ferait croire à des
         // fichiers disparus — et le scan s'arrête sans rien écrire.
-        let Some(list_result) = tune_core::scanner::walker::list_audio_files_avec_arret(
+        let Some(list_result) = tune_core::scanner::walker::list_audio_files_avec_exclusions(
             &scan_dirs,
-            &exclude_patterns,
+            &exclusions_scan,
             tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
             &mut |p| {
                 let dossier = Some(p.dossier_courant);
@@ -3053,7 +3087,8 @@ async fn spawn_library_scan_avec_lecteur_par(
                     }
                 examinees += 1;
                 if !discovered_paths.contains(db_path) {
-                    match verdict_purge(
+                    match verdict_purge_avec_exclusions(
+                        &exclusions_scan,
                         db_path,
                         &scan_dirs,
                         &missing_dirs,
@@ -3107,7 +3142,8 @@ async fn spawn_library_scan_avec_lecteur_par(
                 &discovered_paths,
                 targeted.as_deref(),
                 |chemin| {
-                    verdict_purge(
+                    verdict_purge_avec_exclusions(
+                        &exclusions_scan,
                         chemin,
                         &scan_dirs,
                         &missing_dirs,

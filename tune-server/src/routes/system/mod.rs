@@ -16,9 +16,11 @@ pub(crate) use config::{pistes_qui_partiraient, retirer_un_dossier};
 mod config_backup;
 mod convert;
 mod database;
+// #7478 — exclusions du scan par emplacement.
 #[cfg(test)]
 mod diagnostic_sans_ecrivain_tests;
 pub(crate) mod diagnostics;
+pub(crate) mod exclusions_du_scan;
 pub(crate) mod sauvegarde_cloud;
 // `pub(crate)` depuis #2507 : `enrich::QuotaDuJour` est la lecture unique du
 // compteur journalier, et les essais de `routes/library/artwork.rs` la lisent
@@ -226,6 +228,11 @@ pub fn router() -> Router<AppState> {
             "/music-dirs",
             get(config::get_music_dirs).post(config::add_music_dir),
         )
+        .route(
+            "/scan-exclusions",
+            get(exclusions_du_scan::lire).put(exclusions_du_scan::enregistrer),
+        )
+        .route("/scan-exclusions/preview", post(exclusions_du_scan::apercu))
         .route("/music-dirs/add", post(config::add_music_dir))
         .route("/music-dirs/remove", post(config::remove_music_dir))
         .route("/music-dirs/orphans", get(config::orphan_tracks))
