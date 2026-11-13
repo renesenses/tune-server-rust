@@ -143,7 +143,8 @@ async fn un_segment_refuse_n_emmele_pas_les_suivants_7266() {
     assert_eq!(&octets[INIT.len()..], &attendus[..]);
 }
 
-/// Le téléchargement en croissance, tel qu'une sortie locale le demande.
+/// Le téléchargement en croissance, tel qu'une sortie locale ou OAAT le
+/// demande pour un FLAC.
 async fn en_croissance(
     base: &str,
 ) -> (String, Option<Arc<std::sync::atomic::AtomicBool>>, Duration) {
@@ -151,29 +152,34 @@ async fn en_croissance(
     let debut = Instant::now();
     let (chemin, complet) = crate::audio::dash_growth::pendant_le_telechargement(
         true,
-        svc.telecharger_les_segments_dash(&segments(base), "7266-croissance"),
+        svc.telecharger_les_segments_dash(&segments(base), "7266-croissance", true),
     )
     .await
     .expect("init servi par le faux CDN");
     (chemin, complet, debut.elapsed())
 }
 
-/// #7266, sortie locale : le chemin revient dès le segment d'init, sans
-/// attendre les 60 segments (≥ 1 s à six en vol). Le fichier se complète
-/// ensuite, dans l'ordre, six segments en vol au plus, et le témoin
+/// #7266, sortie locale : le chemin revient après l'init et le PREMIER
+/// segment, sans attendre les 60 (≥ 1 s à six en vol). Le fichier se
+/// complète ensuite, dans l'ordre, six segments en vol au plus, et le témoin
 /// `complet` passe à vrai à la fin.
 #[tokio::test]
-async fn en_croissance_le_chemin_revient_des_l_init_7266() {
+async fn en_croissance_le_chemin_revient_apres_le_premier_segment_7266() {
     let (base, compteurs) = faux_cdn(None).await;
     let (chemin, complet, duree) = en_croissance(&base).await;
     let complet = complet.expect("un téléchargement en croissance a son témoin");
     assert!(
-        duree < Duration::from_millis(LATENCE_MS * 3),
+        duree < Duration::from_millis(LATENCE_MS * 4),
         "chemin rendu en {duree:?} : il attend encore les segments"
     );
     assert!(
         !complet.load(Ordering::SeqCst),
-        "le fichier ne peut pas être complet dès l'init"
+        "le fichier ne peut pas être complet après un segment"
+    );
+    let rendu = std::fs::read(&chemin).unwrap();
+    assert!(
+        rendu.len() > INIT.len(),
+        "le premier segment est écrit avant que le chemin soit rendu"
     );
     let poignee = crate::audio::dash_growth::take_for(&chemin).expect("poignée inscrite");
     let attente = poignee.clone();
@@ -200,6 +206,40 @@ async fn en_croissance_le_chemin_revient_des_l_init_7266() {
     drop(poignee);
 }
 
+/// Premier segment refusé : en cas de doute, le téléchargement complet
+/// d'avant (aucune poignée de croissance, fichier rendu entier, segment 1
+/// sauté comme avant).
+#[tokio::test]
+async fn en_croissance_un_premier_segment_refuse_se_replie_sur_le_fichier_complet_7266() {
+    let (base, _) = faux_cdn(Some(1)).await;
+    let (chemin, complet, _) = en_croissance(&base).await;
+    assert!(complet.is_none(), "repli : fichier complet, sans témoin");
+    assert!(crate::audio::dash_growth::take_for(&chemin).is_none());
+    let octets = std::fs::read(&chemin).unwrap();
+    let _ = std::fs::remove_file(&chemin);
+    let attendus: Vec<u8> = (2..=SEGMENTS as u8).collect();
+    assert_eq!(&octets[INIT.len()..], &attendus[..]);
+}
+
+/// Segment refusé au milieu (et à sa nouvelle tentative) : le téléchargement
+/// est déclaré en échec, le lecteur reçoit une erreur, pas une fin muette.
+#[tokio::test]
+async fn en_croissance_un_segment_refuse_au_milieu_echoue_franchement_7266() {
+    let (base, compteurs) = faux_cdn(Some(17)).await;
+    let (chemin, complet, _) = en_croissance(&base).await;
+    let poignee = crate::audio::dash_growth::take_for(&chemin).expect("poignée inscrite");
+    let attente = poignee.clone();
+    let fin = tokio::task::spawn_blocking(move || attente.attendre_la_fin())
+        .await
+        .unwrap();
+    assert!(fin.is_err(), "fin muette au lieu d'une erreur : {fin:?}");
+    assert!(poignee.a_echoue());
+    assert!(!complet.unwrap().load(Ordering::SeqCst));
+    // Le segment 17 a été demandé deux fois (la tentative et sa reprise).
+    assert!(compteurs.demandes.load(Ordering::SeqCst) >= 18);
+    let _ = std::fs::remove_file(&chemin);
+}
+
 /// Une lecture abandonnée (le décodeur a lâché la poignée) arrête le
 /// téléchargement au lieu de tirer la piste entière en concurrence avec la
 /// suivante, et le fichier partiel est retiré.
@@ -221,21 +261,24 @@ async fn une_lecture_abandonnee_arrete_le_telechargement_7266() {
     assert!(!complet.unwrap().load(Ordering::SeqCst));
 }
 
-/// Hors d'une résolution pour une sortie locale (renderer réseau,
-/// préchargement), rien ne change : le fichier rendu est complet.
+/// Hors d'une résolution pour une sortie locale ou OAAT (renderer réseau,
+/// préchargement), rien ne change : le fichier rendu est complet. De même
+/// pour un codec autre que FLAC, même sur une sortie locale.
 #[tokio::test]
-async fn hors_sortie_locale_le_fichier_rendu_est_complet_7266() {
-    let (base, _) = faux_cdn(None).await;
-    let svc = TidalService::new();
-    let (chemin, complet) = crate::audio::dash_growth::pendant_le_telechargement(
-        false,
-        svc.telecharger_les_segments_dash(&segments(&base), "7266-complet"),
-    )
-    .await
-    .unwrap();
-    assert!(complet.is_none());
-    assert!(crate::audio::dash_growth::take_for(&chemin).is_none());
-    let octets = std::fs::read(&chemin).unwrap();
-    let _ = std::fs::remove_file(&chemin);
-    assert_eq!(octets.len(), INIT.len() + SEGMENTS as usize);
+async fn hors_sortie_locale_ou_hors_flac_le_fichier_rendu_est_complet_7266() {
+    for (sortie_locale, flac) in [(false, true), (true, false)] {
+        let (base, _) = faux_cdn(None).await;
+        let svc = TidalService::new();
+        let (chemin, complet) = crate::audio::dash_growth::pendant_le_telechargement(
+            sortie_locale,
+            svc.telecharger_les_segments_dash(&segments(&base), "7266-complet", flac),
+        )
+        .await
+        .unwrap();
+        assert!(complet.is_none(), "local={sortie_locale} flac={flac}");
+        assert!(crate::audio::dash_growth::take_for(&chemin).is_none());
+        let octets = std::fs::read(&chemin).unwrap();
+        let _ = std::fs::remove_file(&chemin);
+        assert_eq!(octets.len(), INIT.len() + SEGMENTS as usize);
+    }
 }

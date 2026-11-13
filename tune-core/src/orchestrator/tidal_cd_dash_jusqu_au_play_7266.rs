@@ -36,12 +36,12 @@ use crate::db::backend::DbBackend;
 use crate::db::zone_repo::ZoneRepo;
 use crate::streaming::tidal::TidalService;
 
-const PISTE: &str = "72660001";
-const SR: u32 = 44_100;
+pub(super) const PISTE: &str = "72660001";
+pub(super) const SR: u32 = 44_100;
 /// Une piste courte, découpée en autant de segments qu'une piste réelle de
 /// 4 min (TIDAL : ~4 s par segment). C'est le nombre d'allers-retours, pas
 /// la longueur, qui retenait le départ.
-const SECONDES: u32 = 30;
+pub(super) const SECONDES: u32 = 30;
 const SEGMENTS: usize = 60;
 const LATENCE_MS: u64 = 100;
 /// La borne du témoin, de l'appel à `play()` au `Play` reçu. Avant #7266 :
@@ -58,7 +58,7 @@ const BORNE_REMUX: Duration = Duration::from_millis(750);
 
 /// Le PCM 16 bits stéréo de la piste : deux sinus et un bruit bas, assez
 /// riches pour que le FLAC ait de vraies trames à recopier.
-fn pcm_cd() -> Vec<u8> {
+pub(super) fn pcm_cd() -> Vec<u8> {
     let mut x: u32 = 7266;
     (0..SR * SECONDES)
         .flat_map(|n| {
@@ -72,7 +72,7 @@ fn pcm_cd() -> Vec<u8> {
         .collect()
 }
 
-async fn flac_cd(pcm: &[u8]) -> Vec<u8> {
+pub(super) async fn flac_cd(pcm: &[u8]) -> Vec<u8> {
     let mut enc = crate::audio::encoder::AudioEncoder::new("flac", SR, 16, 2);
     enc.start().await.unwrap();
     enc.write(pcm).await.unwrap();
@@ -241,12 +241,12 @@ fn segment_media(numero: u32, debut: u64, trames: &[(Vec<u8>, u32)]) -> Vec<u8> 
 }
 
 /// La piste DASH : l'init, puis [`SEGMENTS`] segments au plus.
-struct PisteDash {
-    init: Vec<u8>,
-    segments: Vec<(Vec<u8>, u32)>,
+pub(super) struct PisteDash {
+    pub(super) init: Vec<u8>,
+    pub(super) segments: Vec<(Vec<u8>, u32)>,
 }
 
-fn decouper(flac: &[u8]) -> PisteDash {
+pub(super) fn decouper(flac: &[u8]) -> PisteDash {
     let (info, trames) = trames_flac(flac);
     assert!(trames.len() >= SEGMENTS, "{} trames", trames.len());
     // Exactement SEGMENTS segments, les trames réparties au plus juste.
@@ -274,11 +274,9 @@ struct JournalTidal {
     manifeste: Option<Instant>,
     init: Option<Instant>,
     dernier_segment: Option<Instant>,
-    /// Segments média servis jusqu'ici.
-    servis: usize,
 }
 
-fn mpd(base: &str, codec: &str, piste: &PisteDash) -> String {
+pub(super) fn mpd(base: &str, codec: &str, piste: &PisteDash) -> String {
     let timeline: String = piste
         .segments
         .iter()
@@ -364,7 +362,6 @@ async fn faux_tidal(
         };
         tokio::time::sleep(Duration::from_millis(LATENCE_MS)).await;
         let mut j = e.journal.lock().unwrap();
-        j.servis += 1;
         let maintenant = Instant::now();
         j.dernier_segment = Some(j.dernier_segment.map_or(maintenant, |t| t.max(maintenant)));
         octets.clone().into_response()
@@ -659,7 +656,7 @@ fn tableau(m: &Mesure) -> String {
     )
 }
 
-fn pcm_de(octets: &[u8], ext: &str) -> (Vec<u8>, u32, u16) {
+pub(super) fn pcm_de(octets: &[u8], ext: &str) -> (Vec<u8>, u32, u16) {
     let chemin = crate::test_scratch::scratch_file("tune-7266-banc", &format!(".{ext}"));
     std::fs::write(chemin.path(), octets).unwrap();
     let d = crate::audio::decode::decode_to_pcm(&chemin.as_str(), None, None, 0.0, 0.0).unwrap();
@@ -786,134 +783,35 @@ async fn un_aac_dash_annonce_aac_est_decode_et_joue_7266() {
     assert_eq!(&recus[..4], b"fLaC", "décodé puis encodé en FLAC");
 }
 
-// ── Sortie locale (Windows ASIO, macOS) ───────────────────────────────────
-
-/// Les octets PCM d'un flux WAV, en-tête retiré.
-fn pcm_du_wav(octets: &[u8]) -> &[u8] {
-    if !octets.starts_with(b"RIFF") {
-        return octets;
-    }
-    let mut i = 12;
-    while i + 8 <= octets.len() {
-        let taille = u32::from_le_bytes(octets[i + 4..i + 8].try_into().unwrap()) as usize;
-        if &octets[i..i + 4] == b"data" {
-            return &octets[i + 8..];
-        }
-        i += 8 + taille;
-    }
-    &[]
-}
-
-/// LE TÉMOIN DE LA SORTIE LOCALE (fil forum 2719, Windows ASIO ; macOS) : la
-/// première note d'un FLAC CD TIDAL en DASH n'attend plus le dernier segment.
-/// Avant : `get_track_url` assemblait les 60 segments sur disque avant que
-/// la session WAV reçoive un seul échantillon (18,6 s en rc10 sur 86
-/// segments). Après : le décodage suit la frontière d'écriture, et la piste
-/// entière arrive quand même, échantillon pour échantillon.
+/// #7266 (décodage pendant le téléchargement, sorties locales et OAAT
+/// seulement) : une zone DLNA garde le chemin d'avant. Le renderer ne reçoit
+/// son URL qu'une fois le DERNIER segment servi par le CDN, et lit un FLAC
+/// complet, bit-identique à la source (Content-Length, protection
+/// anti-troncature).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sur_une_sortie_locale_la_premiere_note_n_attend_pas_le_dernier_segment_7266() {
+async fn une_zone_dlna_recoit_toujours_le_fichier_complet_7266() {
     let pcm = pcm_cd();
     let flac = flac_cd(&pcm).await;
     let piste = Arc::new(decouper(&flac));
-
-    let ecoute_flux = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = ecoute_flux.local_addr().unwrap().port();
-    drop(ecoute_flux);
-    let streamer = Arc::new(crate::http::streamer::AudioStreamer::new(port));
-    let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
-    db.init_schema().unwrap();
-    crate::db::migrations::run_migrations(&db).unwrap();
-    let db: Arc<dyn DbBackend> = Arc::new(db);
-    let orch = PlaybackOrchestrator::new(
-        db,
-        Arc::new(crate::playback::PlaybackManager::new()),
-        streamer.clone(),
-        Arc::new(tokio::sync::Mutex::new(
-            crate::streaming::registry::ServiceRegistry::new(),
-        )),
-        Arc::new(tokio::sync::Mutex::new(
-            crate::outputs::registry::OutputRegistry::new(),
-        )),
-        Some("127.0.0.1".into()),
-    );
-    let (base, tidal) = faux_tidal(piste, "flac").await;
-    orch.services
+    let m = jouer(piste, "flac").await;
+    assert!(m.resultat.as_ref().expect("la lecture part").output_sent);
+    let dernier_segment = m
+        .tidal
         .lock()
-        .await
-        .register(Box::new(TidalService::pour_un_faux_tidal(base)));
-    let appareil = "local:Banc 7266".to_string();
-    let zone_id = ZoneRepo::with_backend(orch.db.clone())
-        .create("Bureau 7266", Some("local"), Some(&appareil))
-        .unwrap();
-    let req = PlayRequest {
-        zone_id,
-        output_device_id: Some(appareil),
-        source: Some("tidal".into()),
-        source_id: Some(PISTE.into()),
-        title: Some("Témoin 7266".into()),
-        artist_name: Some("Banc".into()),
-        album_title: Some("DASH".into()),
-        duration_ms: Some(SECONDES as i64 * 1000),
-        ..Default::default()
-    };
-    assert!(super::resolve_stream::decoder_pendant_le_telechargement(
-        &req
-    ));
-
-    let debut = Instant::now();
-    let resolu = orch
-        .resolve_streaming_url("tidal", &req)
-        .await
-        .expect("la piste se résout");
-    let resolution = debut.elapsed();
-    let servis_a_la_resolution = tidal.lock().unwrap().servis;
-    let sid = resolu.stream_id.expect("une session WAV");
-    let session = streamer
-        .sessions_state()
-        .lock()
-        .await
-        .get(&sid)
-        .cloned()
-        .expect("session ouverte");
-
-    let mut recu = Vec::new();
-    let mut premiere_note: Option<(Duration, usize)> = None;
-    while let Ok(Some(morceau)) =
-        tokio::time::timeout(Duration::from_secs(10), session.recv_chunk()).await
-    {
-        recu.extend_from_slice(&morceau);
-        if premiere_note.is_none() && !pcm_du_wav(&recu).is_empty() {
-            premiere_note = Some((debut.elapsed(), tidal.lock().unwrap().servis));
-        }
-    }
-    let (instant, servis) = premiere_note.expect("aucun échantillon reçu");
-    println!(
-        "#7266 sortie locale — {SEGMENTS} segments, {LATENCE_MS} ms chacun : résolution \
-         {:.2} s ({servis_a_la_resolution} segments servis), première note {:.2} s \
-         ({servis} segments servis)",
-        resolution.as_secs_f64(),
-        instant.as_secs_f64()
-    );
+        .unwrap()
+        .dernier_segment
+        .expect("segments servis");
+    let r = m.renderer.lock().unwrap();
+    let set_uri = r.set_uri.expect("SetAVTransportURI reçu");
     assert!(
-        servis < SEGMENTS / 2,
-        "première note après {servis}/{SEGMENTS} segments servis ({instant:?}) : la \
-         sortie locale attend encore la piste entière"
+        set_uri >= dernier_segment,
+        "DLNA : l'URL est partie {:?} avant le dernier segment — le renderer \
+         lirait un fichier incomplet",
+        dernier_segment.saturating_duration_since(set_uri)
     );
-
-    // La piste entière, sans perte : le WAV 32 bits de la sortie locale porte
-    // les échantillons 16 bits de la source.
-    let servi = pcm_du_wav(&recu);
-    let source: Vec<i16> = pcm
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    let rendu: Vec<i16> = servi
-        .chunks_exact(4)
-        .map(|c| (i32::from_le_bytes([c[0], c[1], c[2], c[3]]) >> 16) as i16)
-        .collect();
-    assert_eq!(rendu.len(), source.len(), "piste tronquée ou allongée");
+    let (servi, _, _) = pcm_de(&r.recus.clone().expect("flux reçu en entier"), "flac");
     assert!(
-        rendu == source,
-        "les échantillons servis diffèrent de la source"
+        servi == pcm,
+        "DLNA : le FLAC servi n'est plus la source entière"
     );
 }

@@ -20,7 +20,7 @@
 //! the `get_track_url`/`StreamUrl` contract. The orchestrator renames the temp to
 //! `{path}.decoding` before decoding, so [`take_for`] strips that suffix. This
 //! engages behind `TUNE_DASH_STREAM_DECODE` for every output, and — since #7266 —
-//! by default for a LOCAL output ([`pendant_le_telechargement`]); otherwise the
+//! by default for a LOCAL or OAAT output (FLAC only) ([`pendant_le_telechargement`]); otherwise the
 //! registry is empty and the decoder opens a plain `File` (byte-identical).
 
 use std::collections::HashMap;
@@ -219,7 +219,7 @@ pub fn stream_decode_enabled() -> bool {
 
 tokio::task_local! {
     /// #7266 — posé par l'orchestrateur autour de la résolution d'une piste
-    /// destinée à une sortie LOCALE : sa session WAV est servie en continu,
+    /// destinée à une sortie LOCALE ou OAAT : sa session WAV est servie en continu,
     /// sans longueur annoncée, et peut donc commencer pendant que les
     /// segments DASH arrivent. Lu dans la tâche qui résout ; une tâche lancée
     /// à part (préchargement, sentinelle) ne le voit pas.
@@ -235,7 +235,7 @@ pub async fn pendant_le_telechargement<F: std::future::Future>(actif: bool, f: F
 
 /// Le téléchargement DASH qui commence doit-il rendre la main dès l'init ?
 /// Oui si `TUNE_DASH_STREAM_DECODE` l'arme pour tout le serveur, ou si la
-/// tâche courante résout pour une sortie locale ([`pendant_le_telechargement`]).
+/// tâche courante résout pour une sortie locale ou OAAT ([`pendant_le_telechargement`]).
 pub fn decodage_en_croissance() -> bool {
     stream_decode_enabled()
         || DECODAGE_PENDANT_LE_TELECHARGEMENT
@@ -244,7 +244,7 @@ pub fn decodage_en_croissance() -> bool {
 }
 
 /// #7266 — `TUNE_DASH_STREAM_DECODE=0` (ou `false`) rend l'ancien
-/// comportement aux sorties locales : la piste entière avant la première note.
+/// comportement aux sorties locales et OAAT : la piste entière avant la première note.
 pub fn decodage_local_desarme() -> bool {
     std::env::var("TUNE_DASH_STREAM_DECODE")
         .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
