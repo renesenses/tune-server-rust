@@ -172,12 +172,9 @@ async fn en_croissance_de(segments: DashSegmentInfo) -> (String, Suivi, Duration
 #[tokio::test]
 async fn en_croissance_le_chemin_revient_apres_le_premier_segment_7266() {
     let (base, compteurs) = faux_cdn(None).await;
+    let debut = Instant::now();
     let (chemin, complet, duree) = en_croissance(&base).await;
     let complet = complet.expect("un téléchargement en croissance a son témoin");
-    assert!(
-        duree < Duration::from_millis(LATENCE_MS * 5),
-        "chemin rendu en {duree:?} : il attend encore les segments"
-    );
     assert!(
         !complet.est_complet(),
         "le fichier ne peut pas être complet après quelques segments"
@@ -193,6 +190,13 @@ async fn en_croissance_le_chemin_revient_apres_le_premier_segment_7266() {
         .await
         .unwrap()
         .expect("téléchargement mené au bout");
+    // Relatif, pour tenir sur une machine chargée : 7 segments sur 60
+    // (deux tournées sur dix) contre le téléchargement entier.
+    let entier = debut.elapsed();
+    assert!(
+        duree * 2 < entier,
+        "chemin rendu en {duree:?}, téléchargement entier en {entier:?} : il attend encore les segments"
+    );
     assert!(complet.est_complet(), "suivi complet à la fin");
     let octets = std::fs::read(&chemin).unwrap();
     let _ = std::fs::remove_file(&chemin);
