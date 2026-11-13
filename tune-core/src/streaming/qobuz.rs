@@ -2311,7 +2311,19 @@ impl QobuzService {
         else {
             return titre.to_string();
         };
-        if titre.to_lowercase().contains(&version.to_lowercase()) {
+        // Déjà dans le titre : seulement comme parenthèse (ou crochet) FINALE
+        // identique. Une simple sous-chaîne ne suffit pas — « Live » est dans
+        // « Live Forever », et la version y manquerait.
+        let titre_l = titre.to_lowercase();
+        let version_l = version.to_lowercase();
+        if titre_l.ends_with(&format!("({version_l})"))
+            || titre_l.ends_with(&format!("[{version_l}]"))
+        {
+            return titre.to_string();
+        }
+        // « X (Remastered 2011) » + « 2011 Remaster » : une seule mention de
+        // réédition suffit.
+        if titre_l.contains("remaster") && version_l.contains("remaster") {
             return titre.to_string();
         }
         if titre.is_empty() {

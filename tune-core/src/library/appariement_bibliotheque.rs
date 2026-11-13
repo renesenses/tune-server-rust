@@ -67,6 +67,14 @@ pub fn classer_en_bibliotheque<'a>(
         return Vec::new();
     }
     let candidats = candidats(pistes);
+    // #8271 — un titre Qobuz versionné (« Panopticom (Bright-Side Mix) ») face
+    // à des pistes locales qui ne nomment pas le mix : la parenthèse finale
+    // n'entre pas dans le score si AUCUNE piste ne la mentionne.
+    let title = candidats
+        .iter()
+        .map(|c| crate::streaming::matching::titre_a_rapprocher(title, &c.title))
+        .max_by_key(|t| t.len())
+        .unwrap_or(title);
     classer_candidats(
         title,
         artist,
@@ -206,5 +214,25 @@ mod tests {
         );
         assert_eq!(classes[0].0.id, Some(2), "{classes:?}");
         assert_eq!(classes[0].1, 1.0);
+    }
+
+    /// #8271 — un titre Qobuz versionné retrouve la piste locale qui ne
+    /// nomme pas le mix.
+    #[test]
+    fn un_titre_qobuz_versionne_retrouve_la_piste_locale_8271() {
+        let pistes = vec![piste(7, "Panopticom", "Peter Gabriel", 330_000)];
+        let classes = classer_en_bibliotheque(
+            "Panopticom (Bright-Side Mix)",
+            "Peter Gabriel",
+            "",
+            330_000,
+            &pistes,
+            3,
+        );
+        assert_eq!(
+            classes.first().map(|(t, _)| t.id),
+            Some(Some(7)),
+            "{classes:?}"
+        );
     }
 }
