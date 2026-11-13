@@ -100,6 +100,16 @@ struct DecisionLocale {
     /// d'une bibliothèque : chaque site qui la lit garde alors son
     /// comportement d'avant, à l'octet près.
     tranche_cue: Option<TrancheCue>,
+    /// Discussion #8519 — le suréchantillonneur de la zone pour ce flux
+    /// réseau : `None` sans objet (sortie non réseau, greffon pas choisi),
+    /// `Some(Ok)` la cible que le bras fichier fera tourner, `Some(Err)` la
+    /// raison pour laquelle il n'entre pas.
+    surechantillonnage: Option<
+        Result<
+            crate::audio::surechantillonnage_reseau::CibleReseau,
+            crate::audio::surechantillonnage_reseau::RefusReseau,
+        >,
+    >,
 }
 
 /// Un intervalle nommé à l'intérieur d'un fichier image (#3631).
@@ -154,6 +164,9 @@ pub(super) struct FormatDeSortie {
     pub(super) target_format_str: String,
     pub(super) use_file_transcode: bool,
     pub(super) info: StreamInfo,
+    /// Discussion #8519 — l'étage du suréchantillonneur que le bras fichier
+    /// fera tourner : `out_sr` vaut alors `vers`. `None` : aucun.
+    pub(super) surechantillonnage: Option<crate::audio::surechantillonnage_reseau::CibleReseau>,
 }
 
 /// Ce que le bras fichier cuit dans le rendu, et l'empreinte de sa clé de
@@ -354,6 +367,12 @@ fn assembler_la_decision(
     traitement: Traitement,
     flac_ffmpeg_vers_le_reseau: bool,
     conteneur_flac_neuf: Option<crate::audio::faststart::FaststartMap>,
+    surechantillonnage: Option<
+        Result<
+            crate::audio::surechantillonnage_reseau::CibleReseau,
+            crate::audio::surechantillonnage_reseau::RefusReseau,
+        >,
+    >,
 ) -> DecisionLocale {
     let SourceEtZone {
         sample_rate,
@@ -437,6 +456,9 @@ fn assembler_la_decision(
         // #5299 — le passthrough servirait le fichier par son chemin, que le
         // serveur HTTP ne sait pas ouvrir dans une image.
         dans_une_image_iso: crate::audio::iso9660::est_chemin_virtuel(&file_path),
+        // Discussion #8519 — le suréchantillonneur ne tourne que dans le bras
+        // fichier : un passthrough ne le porterait pas.
+        surechantillonnage: matches!(surechantillonnage, Some(Ok(_))),
     };
     let needs_transcode = transcodage_requis(&motifs);
     let motifs_de_transcodage = motifs.motifs_actifs();
@@ -495,6 +517,7 @@ fn assembler_la_decision(
         // et ré-encode, l'en-tête neuf ne sert qu'au passthrough.
         conteneur_flac_neuf: conteneur_flac_neuf.filter(|_| !needs_transcode),
         tranche_cue,
+        surechantillonnage,
     }
 }
 
@@ -950,6 +973,27 @@ impl PlaybackOrchestrator {
             self.servir_en_passthrough(req, &decision).await?
         };
         drop(etape);
+        // Discussion #8519 — le suréchantillonneur réglé qui n'entre pas dans
+        // ce flux : la raison, notée sur la session pour le chemin du signal.
+        let refus_du_surechantillonnage = match decision.surechantillonnage.as_ref() {
+            Some(Err(refus)) => Some(refus.code()),
+            // Décidé, mais la piste a basculé en WAV progressif (#8558) : le
+            // flux ne le porte pas.
+            Some(Ok(_)) => self
+                .streamer
+                .stream_output_wire(&session_id)
+                .await
+                .filter(|w| w.surechantillonnage.is_none())
+                .map(|_| {
+                    crate::audio::surechantillonnage_reseau::RefusReseau::PisteTropLourde.code()
+                }),
+            None => None,
+        };
+        if let Some(code) = refus_du_surechantillonnage {
+            self.streamer
+                .noter_le_refus_du_surechantillonnage(&session_id, code)
+                .await;
+        }
         let DecisionLocale {
             is_network_output,
             needs_transcode,
@@ -1139,6 +1183,19 @@ impl PlaybackOrchestrator {
         } else {
             None
         };
+        // Discussion #8519 — le suréchantillonneur d'une zone réseau.
+        let surechantillonnage = self
+            .decider_le_surechantillonnage_reseau(
+                req,
+                source_format,
+                &source,
+                &sorties,
+                &forcages,
+                &transcodage,
+                &traitement,
+                duree_de_la_piste_ms(track.duration_ms, &file_path, tranche_cue.is_some()),
+            )
+            .await;
         Ok(DecisionOuResolu::Decision(assembler_la_decision(
             req,
             track,
@@ -1153,6 +1210,7 @@ impl PlaybackOrchestrator {
             traitement,
             flac_ffmpeg_vers_le_reseau,
             conteneur_flac_neuf,
+            surechantillonnage,
         )))
     }
 
@@ -2740,6 +2798,15 @@ impl PlaybackOrchestrator {
             ..
         } = *decision;
         let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
+        // Discussion #8519 — l'étage du suréchantillonneur, sauf quand la
+        // piste bascule en WAV progressif (#8558) : il ne tourne que dans le
+        // bras fichier.
+        let surechantillonnage = decision
+            .surechantillonnage
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .filter(|_| bascule.is_none())
+            .cloned();
         let mut target_fmt = if oaat_needs_wav || local_needs_wav || browser_needs_wav {
             AudioFormat::Wav
         } else if dlna_needs_wav {
@@ -2759,6 +2826,12 @@ impl PlaybackOrchestrator {
             AudioFormat::Wav
         } else if needs_downsample && !needs_transcode_for_output {
             // Only downsampling — keep the same lossless format
+            AudioFormat::Flac
+        } else if surechantillonnage.is_some() {
+            // Discussion #8519 — le renderer lit le FLAC (sinon
+            // `dlna_needs_wav` aurait pris la main) : FLAC ré-encodé à la
+            // cadence cible, servi par le fichier. Une source WAV ou AIFF y
+            // passe aussi, au lieu de sa session progressive.
             AudioFormat::Flac
         } else if is_chromecast && src_fmt == AudioFormat::Aiff {
             // AIFF → FLAC for Chromecast (Cast decodes FLAC up to
@@ -2889,6 +2962,10 @@ impl PlaybackOrchestrator {
             }
             out_sr = rate;
         }
+        // Discussion #8519 — la cadence négociée avec le renderer.
+        if let Some(c) = surechantillonnage.as_ref() {
+            out_sr = c.vers;
+        }
         let out_bd: u16 = if local_needs_wav {
             // Local output (cpal/WASAPI): always use 32-bit WAV.
             //
@@ -2972,6 +3049,16 @@ impl PlaybackOrchestrator {
         // aval ne sait ni convertir ni encoder. Arrondi vers le HAUT, comme
         // au décodage : aucun bit perdu (#1437).
         let out_bd = crate::audio::decode::container_bit_depth(out_bd);
+        // Discussion #8519 — un flux suréchantillonné part en 24 bits, sauf
+        // plafond 16 bits de la zone ou LPCM 16 bits imposé par le renderer.
+        let out_bd = if surechantillonnage.is_some()
+            && !dlna_cap_16bit
+            && (!dlna_needs_wav || decision.dlna_wav24)
+        {
+            24
+        } else {
+            out_bd
+        };
         // #8558 — le renderer n'a annoncé que le LPCM 16 bits.
         let out_bd = if bascule == Some(super::bascule_progressive_8558::ProfondeurDeBascule::Seize)
         {
@@ -3100,6 +3187,20 @@ impl PlaybackOrchestrator {
             (is_browser_output || is_network_output) && eq_forces_transcode,
         );
 
+        // Discussion #8519 — le bras fichier est garanti en amont (cible FLAC,
+        // ou WAV `dlna_needs_wav` sous le plafond RIFF, sans bascule) ; s'il
+        // ne l'était pas, l'étage ne tournerait pas et ce flux le dirait.
+        let surechantillonnage = match surechantillonnage {
+            Some(c) if !use_file_transcode => {
+                warn!(
+                    zone_id = req.zone_id,
+                    to_sr = c.vers,
+                    "dlna_upsampler_dropped_progressive_session"
+                );
+                None
+            }
+            autre => autre,
+        };
         let info = StreamInfo {
             format: out_ext.clone(),
             mime_type: out_mime.clone(),
@@ -3165,6 +3266,7 @@ impl PlaybackOrchestrator {
             target_format_str,
             use_file_transcode,
             info,
+            surechantillonnage,
         })
     }
 
@@ -3297,6 +3399,19 @@ impl PlaybackOrchestrator {
                 .as_ref()
                 .map(|_| self.empreinte_des_etages_tiers(req.zone_id))
                 .unwrap_or_default(),
+        );
+        // Discussion #8519 — le suréchantillonneur change les octets : son
+        // filtre entre dans la clé (la cadence cible y est déjà, `out_sr`).
+        // Appliqué quand la décision le porte et que le format retenu sert
+        // bien sa cadence (pas de bascule #8558).
+        let empreinte_dsp = crate::transcode_cache::empreinte_avec_surechantillonnage(
+            empreinte_dsp,
+            decision
+                .surechantillonnage
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .filter(|c| c.vers == out_sr)
+                .map(|c| c.reglages.filter.as_str()),
         );
         TraitementsDuFichier {
             eq_profile,
@@ -3458,8 +3573,14 @@ impl PlaybackOrchestrator {
             out_mime,
             out_ext,
             target_format_str,
+            surechantillonnage,
             ..
         } = format;
+        // Discussion #8519 — ce que le fichier servi porte, dit par son
+        // `StreamInfo` (rendu frais comme rendu en cache).
+        let surechantillonnage_cuit = surechantillonnage
+            .as_ref()
+            .map(crate::http::streamer::SurechantillonnageCuit::depuis_la_cible);
         let flux = {
             // ── Pre-transcode to temp file (FLAC) ──────────────────
             // Decode → encode → write to /tmp, then create a file session.
@@ -3549,6 +3670,7 @@ impl PlaybackOrchestrator {
                     duration_ms: Some(track_duration_ms as u64),
                     crossfeed: crossfeed_cuit,
                     compensation_db: compensation_cuite_db,
+                    surechantillonnage: surechantillonnage_cuit.clone(),
                     ..Default::default()
                 };
                 let session_id = self
@@ -3560,16 +3682,20 @@ impl PlaybackOrchestrator {
                     .await;
                 // The current track was a cache hit → warm the next one too,
                 // so an album keeps hitting the cache track after track.
-                self.spawn_warm_next_local(
-                    req.zone_id,
-                    sample_rate,
-                    bit_depth,
-                    channels,
-                    out_ext.clone(),
-                    out_sr,
-                    out_bd,
-                    target_format_str.clone(),
-                );
+                // #8519 — pas pour un flux suréchantillonné : le préchauffage
+                // n'a pas l'étage, sa rendition ne serait jamais servie.
+                if surechantillonnage.is_none() {
+                    self.spawn_warm_next_local(
+                        req.zone_id,
+                        sample_rate,
+                        bit_depth,
+                        channels,
+                        out_ext.clone(),
+                        out_sr,
+                        out_bd,
+                        target_format_str.clone(),
+                    );
+                }
 
                 // …et les VU-mètres avec, sinon ils s'éteignent DÈS la
                 // deuxième écoute.
@@ -3733,6 +3859,7 @@ impl PlaybackOrchestrator {
                         }),
                         crossfeed.map(|(processeur, _)| processeur),
                         compensation,
+                        surechantillonnage.clone(),
                     ),
                     progres,
                     politique,
@@ -3815,6 +3942,7 @@ impl PlaybackOrchestrator {
                             duration_ms: Some(track_duration_ms as u64),
                             crossfeed: crossfeed_cuit,
                             compensation_db: compensation_cuite_db,
+                            surechantillonnage: surechantillonnage_cuit.clone(),
                             ..Default::default()
                         };
                         let session_id = self
@@ -3834,7 +3962,7 @@ impl PlaybackOrchestrator {
                         // Only when the current was actually cached (Some means
                         // no EQ) — warming an EQ zone would populate an entry
                         // the real (EQ) play never hits.
-                        if cache_path_opt.is_some() {
+                        if cache_path_opt.is_some() && surechantillonnage.is_none() {
                             self.spawn_warm_next_local(
                                 req.zone_id,
                                 sample_rate,
@@ -4896,3 +5024,7 @@ mod duree_relue_5975_tests;
 #[cfg(test)]
 #[path = "niveaux_du_dsd_natif_7775.rs"]
 mod niveaux_du_dsd_natif_7775;
+
+/// Discussion #8519 — le suréchantillonneur sur une zone DLNA / OpenHome.
+#[path = "surechantillonnage_reseau_8519.rs"]
+mod surechantillonnage_reseau_8519;

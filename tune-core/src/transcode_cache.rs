@@ -139,6 +139,26 @@ pub fn empreinte_avec_tranche(
     Some(h.finalize().into())
 }
 
+/// Discussion #8519 — l'empreinte du rendu, plus le filtre du
+/// suréchantillonneur quand l'étage est cuit dans le fichier. `None` :
+/// l'empreinte d'avant, inchangée.
+pub fn empreinte_avec_surechantillonnage(
+    dsp: Option<[u8; 32]>,
+    filtre: Option<&str>,
+) -> Option<[u8; 32]> {
+    let Some(filtre) = filtre else {
+        return dsp;
+    };
+    let mut h = Sha256::new();
+    h.update(b"upsampler\0");
+    h.update(filtre.as_bytes());
+    if let Some(d) = dsp {
+        h.update(b"dsp\0");
+        h.update(d);
+    }
+    Some(h.finalize().into())
+}
+
 /// Clé de cache d'une rendition locale, avec l'empreinte du traitement quand
 /// il y en a un : une rendition par réglage, rejouée instantanément, au lieu
 /// de retranscoder à chaque écoute dès qu'un EQ est actif (LAT-F2).

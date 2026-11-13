@@ -161,6 +161,8 @@ pub mod staged_growth;
 pub mod support;
 /// #7614 — le côté hôte du greffon de suréchantillonnage.
 pub mod surechantillonnage;
+/// Discussion #8519 — le suréchantillonneur sur une zone DLNA / OpenHome.
+pub mod surechantillonnage_reseau;
 pub mod tap;
 pub mod tempo;
 /// CLAP text tower for natural-language acoustic search (Phase 3).
