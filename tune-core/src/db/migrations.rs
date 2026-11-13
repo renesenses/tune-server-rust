@@ -2882,6 +2882,21 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     // réservés à d'autres PR (dont #8160, spectrogrammes, en 148 / PG 114)
     // qui fusionnent avant celle-ci.
     Migration { version: 149, name: "sources_reseau", up: include_str!("../../migrations/sources_reseau.sql") },
+    // #8170 (suite de #8152 et de tune-web-client#2730) — la position de
+    // CHAQUE épisode de podcast commencé : `podcast_episode_positions`, une
+    // ligne par épisode et par zone. `listening_resumes` n'en garde qu'une par
+    // podcast et par zone (clé `(zone, contexte, source)`) : lancer un autre
+    // épisode du même podcast écrasait la reprise du précédent, et la fiche
+    // du podcast ne savait reprendre que le dernier. Naît vide. Jumelle PG :
+    // 116. Renumérotée 150 / PG 116 le 12/11 : 148 / PG 114 sont pris par
+    // #8160 dans le lot, 149 / PG 115 par #8202 (`sources_reseau`), qui
+    // fusionne avant celle-ci (garde de contiguïté).
+    // Patron `listening_resumes` (135 / PG 100).
+    Migration {
+        version: 150,
+        name: "podcast_episode_positions",
+        up: include_str!("../../migrations/podcast_episode_positions.sql"),
+    },
 ];
 
 /// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
@@ -6128,6 +6143,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "sources_reseau",
         include_str!("../../migrations/postgres/115_sources_reseau.sql"),
     ),
+    // Jumelle de la SQLite 150 (#8170) : `podcast_episode_positions`, la
+    // position de chaque épisode de podcast commencé. Naît vide.
+    (
+        116,
+        "podcast_episode_positions",
+        include_str!("../../migrations/postgres/116_podcast_episode_positions.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -8581,6 +8603,66 @@ mod tests {
         );
     }
 
+    /// #8170 — la migration 150 pose `podcast_episode_positions` (la position
+    /// de chaque épisode de podcast commencé), sur une base NEUVE comme sur une
+    /// base MONTÉE juste avant ; la clé primaire est (zone, épisode) ; la
+    /// jumelle PG 116 existe, marque son numéro, et la bascule copie la table.
+    #[test]
+    fn la_migration_150_pose_les_positions_d_episodes_8170() {
+        let cle = |db: &SqliteDb| -> Vec<String> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(podcast_episode_positions)")
+                .unwrap();
+            let mut k: Vec<(i64, String)> = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(5)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .filter(|(pk, _)| *pk > 0)
+                .collect();
+            k.sort();
+            k.into_iter().map(|(_, n)| n).collect()
+        };
+        let attendue = vec!["zone_id".to_string(), "episode_key".to_string()];
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(cle(&neuve), attendue, "base neuve");
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "DROP TABLE podcast_episode_positions;
+                 DELETE FROM _migrations WHERE version >= 150;",
+            )
+            .unwrap();
+        assert!(cle(&montee).is_empty(), "préparation : table retirée");
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert_eq!(cle(&montee), attendue, "base montée sous la 150");
+        montee
+            .execute_batch(
+                "INSERT INTO podcast_episode_positions \
+                 (zone_id, episode_key, audio_url, position_ms, duration_ms, updated_at) \
+                 VALUES (1, 'u', 'u', 5, 0, 't'), (2, 'u', 'u', 5, 0, 't');",
+            )
+            .expect("deux zones, même épisode : deux lignes");
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "116_podcast_episode_positions.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(sql_pg.contains("VALUES (116, 'podcast_episode_positions')"));
+        assert!(sql_pg.contains("PRIMARY KEY (zone_id, episode_key)"));
+        assert!(include_str!("migrations.rs").contains(fichier));
+        let bascule = include_str!("pg_migrate.rs");
+        assert!(bascule.contains("\"podcast_episode_positions\","));
+        assert!(bascule.contains("ON CONFLICT (zone_id, episode_key) DO NOTHING"));
+    }
+
     /// web#916 — la migration 145 pose `suggestions_ecartees` (le « Pas pour
     /// moi » de l'accueil, par profil), sur une base NEUVE comme sur une base
     /// MONTÉE juste avant ; la clé primaire est le quadruplet (profil, type,
@@ -9927,7 +10009,11 @@ mod tests {
         // trace datée des spectrogrammes conservés, que la fiche technique NOMME.
         // 115 : `sources_reseau` (#8189), jumelle de la SQLite 149. Crée la
         // table des sources réseau lues sans montage.
-        assert_eq!(pg_latest_version(), 115, "latest PG migration must be 115");
+        // 116 : `podcast_episode_positions` (#8170), jumelle de la SQLite 150
+        // (115 = `sources_reseau`, #8202, fusionnée avant).
+        // Crée la position de chaque épisode de podcast commencé, que la
+        // reprise des podcasts NOMME.
+        assert_eq!(pg_latest_version(), 116, "latest PG migration must be 116");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
