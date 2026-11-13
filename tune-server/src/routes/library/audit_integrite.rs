@@ -737,15 +737,21 @@ fn ligne_csv(l: &Ligne) -> String {
     .join(",")
         + "\r\n"
 }
-pub(super) async fn csv(State(state): State<AppState>) -> Response {
+pub(super) async fn csv(State(state): State<AppState>, Query(page): Query<Page>) -> Response {
+    let nom = match page.verdict.as_ref() {
+        Some(Verdict::Sain) => "integrite-bibliotheque-sain.csv",
+        Some(Verdict::Corrompu) => "integrite-bibliotheque-corrompu.csv",
+        Some(Verdict::NonVerifiable) => "integrite-bibliotheque-non_verifiable.csv",
+        None => "integrite-bibliotheque.csv",
+    };
     match bloquant(move || {
         let etat = lire(&state.backend)?;
         let mut csv = String::from("\u{feff}chemin,état,code,erreur,position_trames,trames_décodées,taille_sans_nouvelle_date,mode,unité_fautive,numéro,octet,fautes\r\n");
         let mut offset = 0;
-        loop { let rows = lignes(&state.backend, &etat, offset, 1000, None)?; if rows.is_empty() { break; } offset += rows.len() as u64; for l in rows { csv.push_str(&ligne_csv(&l)); } }
+        loop { let rows = lignes(&state.backend, &etat, offset, 1000, page.verdict.as_ref())?; if rows.is_empty() { break; } offset += rows.len() as u64; for l in rows { csv.push_str(&ligne_csv(&l)); } }
         Ok(csv)
     }).await {
-        Ok(csv) => ([(header::CONTENT_TYPE, "text/csv; charset=utf-8"), (header::CONTENT_DISPOSITION, "attachment; filename=integrite-bibliotheque.csv")], csv).into_response(), Err(e) => e,
+        Ok(csv) => ([(header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()), (header::CONTENT_DISPOSITION, format!("attachment; filename={nom}"))], csv).into_response(), Err(e) => e,
     }
 }
 
@@ -757,6 +763,119 @@ mod tests {
             Arc::new(tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap());
         db.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT); CREATE TABLE tracks (id INTEGER PRIMARY KEY, file_path TEXT, cue_media_path TEXT, file_size INTEGER, file_mtime REAL, source TEXT)").unwrap();
         db
+    }
+    #[tokio::test]
+    async fn csv_filtre_2925_exporte_toutes_les_pages_du_seul_verdict() {
+        use axum::{
+            Router,
+            body::{Body, to_bytes},
+            http::{Request, StatusCode},
+            routing::get,
+        };
+        use tower::ServiceExt;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let etat = Etat {
+            generation: "csv-2925".into(),
+            status: "completed".into(),
+            ..Default::default()
+        };
+        for id in 1..=1003 {
+            let verdict = match id {
+                1 => Verdict::Sain,
+                2 => Verdict::NonVerifiable,
+                _ => Verdict::Corrompu,
+            };
+            let mut resultat = Resultat::defaut("temoin", "synthétique", None, 0);
+            resultat.verdict = verdict;
+            let ligne = Ligne {
+                id,
+                chemin: format!("/synthetique/{id}.flac"),
+                taille: Some(40),
+                taille_sans_nouvelle_date: false,
+                resultat,
+                date: None,
+                verifie_par: None,
+                mode: Mode::Complet,
+            };
+            sauver(&state.backend, &etat, Some(&ligne)).unwrap();
+        }
+        let app = Router::new()
+            .route("/csv", get(csv))
+            .route("/json", get(report))
+            .with_state(state);
+        for (filtre, nombre, nom) in [
+            (
+                "?verdict=corrompu",
+                1001,
+                "integrite-bibliotheque-corrompu.csv",
+            ),
+            ("?verdict=sain", 1, "integrite-bibliotheque-sain.csv"),
+            (
+                "?verdict=non_verifiable",
+                1,
+                "integrite-bibliotheque-non_verifiable.csv",
+            ),
+            ("", 1003, "integrite-bibliotheque.csv"),
+        ] {
+            let reponse = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/csv{filtre}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(reponse.status(), StatusCode::OK);
+            assert_eq!(
+                reponse.headers()[header::CONTENT_DISPOSITION],
+                format!("attachment; filename={nom}")
+            );
+            let texte = String::from_utf8(
+                to_bytes(reponse.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            let lignes: Vec<_> = texte.lines().skip(1).collect();
+            assert_eq!(
+                lignes.len(),
+                nombre,
+                "export CSV 2925 : seules les lignes filtrées, toutes pages comprises"
+            );
+            if let Some(verdict) = filtre.strip_prefix("?verdict=") {
+                let attendu = if verdict == "non_verifiable" {
+                    "non vérifiable"
+                } else {
+                    verdict
+                };
+                assert!(
+                    lignes
+                        .iter()
+                        .all(|l| l.split(',').nth(1).map(|s| s.trim_matches('"')) == Some(attendu)),
+                    "aucun autre verdict dans le CSV : {filtre}"
+                );
+            }
+        }
+        for route in ["/csv", "/json"] {
+            let reponse = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{route}?verdict=inconnu"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                reponse.status(),
+                StatusCode::BAD_REQUEST,
+                "même validation JSON/CSV"
+            );
+        }
     }
     #[test]
     fn rapport_et_curseur_survivent_a_la_relecture() {
