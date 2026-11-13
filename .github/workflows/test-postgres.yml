@@ -325,6 +325,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8416 -- --nocapture --test-threads=1
 
+      # #8645 — une émission de podcast (nom écrit en artiste et en album)
+      # n'entre dans aucun classement par artiste, album ou titre ; ses
+      # épisodes restent dans le temps d'écoute. Sans cette étape, le témoin
+      # prendrait son saut annoncé.
+      - name: Podcasts hors des classements sur PostgreSQL (#8645)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8645 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
