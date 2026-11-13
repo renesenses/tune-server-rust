@@ -30,6 +30,9 @@
 //! | `GET /collection[?format=&etat=&dossier=&genre=&style=]` | les disques, leur état (et pour « nulle part » sa `raison`, #7981), les compteurs (par état, raison, format, dossier, genre, style) |
 //! | `GET /parcourir` | les dossiers Discogs, les genres et les styles de la collection, avec leurs compteurs (#7929) |
 //! | `GET /disques/{release}/services` | « Chercher sur les services » : les albums les plus proches chez chaque service connecté (#7928) |
+//! | `GET /disques/{release}/albums[?q=]` | « Associer à un album » (#8672) : la recherche dans la bibliothèque (préremplie artiste + titre) et, pour « plusieurs correspondants », les candidats |
+//! | `PUT /disques/{release}/association` | `{album_id}` : associe le disque à cet album, à la main (#8672) |
+//! | `DELETE /disques/{release}/association` | « Dissocier » : le disque revient au rapprochement automatique (#8672) |
 //! | `GET /cd?mb_release=&code_barre=` | un CD inséré est-il dans la collection, et copié ? |
 //! | `GET /pochettes/{release}[?taille=originale]` | la pochette, servie depuis le cache local (`ETag`, 304) |
 //! | `DELETE /cache[?quoi=pochettes]` | efface le cache : pochettes et mémoire, ou les pochettes seules |
@@ -49,6 +52,7 @@
 //! Gratuit. Opt-in : il dort tant que l'utilisateur ne l'a pas installé
 //! depuis le catalogue (Réglages › Extensions).
 
+pub mod associations;
 pub mod correspondance;
 pub mod discogs;
 pub mod memoire;
@@ -56,6 +60,7 @@ pub mod pochettes;
 pub mod recherche;
 pub mod synchro;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,7 +72,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -75,7 +80,7 @@ use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
-use crate::correspondance::{AlbumLocal, Index, Rapprochement};
+use crate::correspondance::{AlbumLocal, Index, Par, Rapprochement};
 use crate::discogs::{Disque, Famille, code_barre_normalise, nom_utilisateur_valide};
 use crate::memoire::Memoire;
 use crate::synchro::code;
@@ -298,8 +303,38 @@ impl Raison {
     }
 }
 
+/// Un album local tel que l'écran le lit.
+fn album_json(a: &AlbumLocal, par: Option<Par>) -> Value {
+    json!({
+        "album_id": a.id,
+        "titre": a.titre,
+        "artiste": a.artiste,
+        "qualite": a.qualite,
+        "format": a.format,
+        "sample_rate": a.sample_rate,
+        "bit_depth": a.bit_depth,
+        "cover_path": a.pochette,
+        "par": par,
+    })
+}
+
+/// Les associations manuelles (#8672). Illisibles : aucune, et on le dit au
+/// journal — l'écran de la collection ne tombe pas pour autant.
+fn associations_manuelles(etat: &Etat) -> HashMap<u64, i64> {
+    associations::lire(&etat.backend).unwrap_or_else(|e| {
+        tracing::warn!(target: "plugin", erreur = %e, "collection_physique_associations_illisibles");
+        HashMap::new()
+    })
+}
+
 /// Un disque tel que l'écran le lit, et son état.
-fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Value, EtatDisque) {
+fn vue(
+    d: &Disque,
+    m: &Memoire,
+    index: &Index<'_>,
+    services: &[String],
+    manuelles: &HashMap<u64, i64>,
+) -> (Value, EtatDisque) {
     let codes = m
         .fiches
         .get(&d.release_id)
@@ -307,7 +342,12 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
         .unwrap_or_default();
     let mb = m.liens_mb.get(&d.release_id).map(|l| &l.liens);
     let rapprochement = index.rapprocher(d, &codes, mb);
-    let local = rapprochement.trouve();
+    // L'association manuelle prime (#8672) ; vers un album qui a quitté la
+    // bibliothèque, elle ne compte pas.
+    let manuel = manuelles.get(&d.release_id).and_then(|&id| index.album(id));
+    let local = manuel
+        .map(|a| (a, Par::Manuel))
+        .or_else(|| rapprochement.trouve());
     let streaming = m.streaming.get(&d.release_id);
     let trouves = streaming.map(|s| s.trouves.clone()).unwrap_or_default();
     let etat = if local.is_some() {
@@ -325,19 +365,7 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
         _ => Raison::AucunCandidat,
     });
     let copie = d.famille.se_copie().then_some(local.is_some());
-    let bibliotheque = local.map(|(a, par)| {
-        json!({
-            "album_id": a.id,
-            "titre": a.titre,
-            "artiste": a.artiste,
-            "qualite": a.qualite,
-            "format": a.format,
-            "sample_rate": a.sample_rate,
-            "bit_depth": a.bit_depth,
-            "cover_path": a.pochette,
-            "par": par,
-        })
-    });
+    let bibliotheque = local.map(|(a, par)| album_json(a, Some(par)));
     let v = json!({
         "instance_id": d.instance_id,
         "release_id": d.release_id,
@@ -362,7 +390,7 @@ fn vue(d: &Disque, m: &Memoire, index: &Index<'_>, services: &[String]) -> (Valu
         // « nulle part » seulement : pourquoi (#7981) ; `null` sinon.
         "raison": raison.map(Raison::code),
         "candidats_locaux": match rapprochement {
-            Rapprochement::Plusieurs(n) => Some(n),
+            Rapprochement::Plusieurs(n) if manuel.is_none() => Some(n),
             _ => None,
         },
         "copie": copie,
@@ -504,6 +532,7 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
         Err(r) => return r.into_response(),
     };
     let index = Index::new(&albums);
+    let manuelles = associations_manuelles(&etat);
     let mut par_etat = serde_json::Map::new();
     let mut par_format = serde_json::Map::new();
     for e in EtatDisque::TOUS {
@@ -520,7 +549,7 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
     let navigation = compteurs_de_navigation(&m);
     let mut disques = Vec::new();
     for d in &m.disques {
-        let (v, e) = vue(d, &m, &index, &services);
+        let (v, e) = vue(d, &m, &index, &services, &manuelles);
         incrementer(&mut par_etat, e.code());
         incrementer(&mut par_format, d.famille.code());
         if let Some(r) = v["raison"].as_str() {
@@ -594,6 +623,147 @@ async fn chercher_sur_les_services(State(etat): State<Etat>, Path(release): Path
     .into_response()
 }
 
+/// Le disque `release` de la collection suivie, s'il y est.
+fn disque_suivi(etat: &Etat, release: u64) -> Option<(Memoire, Disque)> {
+    let nom = nom_suivi(&etat.backend);
+    let m = etat.moteur.memoire();
+    if nom.is_none() || m.nom_utilisateur != nom {
+        return None;
+    }
+    let d = m.disques.iter().find(|d| d.release_id == release)?.clone();
+    Some((m, d))
+}
+
+/// La recherche que « Associer à un album » propose : le premier artiste
+/// (sauf « Various ») et le titre sans sa mention d'édition. Le premier
+/// seulement : la recherche veut TOUS les mots, et l'album local ne porte
+/// souvent que l'artiste principal (« Janice McClain / The Ritchie Family »).
+fn requete_proposee(d: &Disque) -> String {
+    let titre = correspondance::titre_sans_edition(&d.titre).trim();
+    let artiste = d
+        .artistes
+        .first()
+        .map(String::as_str)
+        .unwrap_or(&d.artiste)
+        .trim();
+    if artiste.is_empty() || correspondance::artiste_normalise(artiste) == "various" {
+        titre.to_string()
+    } else {
+        format!("{artiste} {titre}")
+    }
+}
+
+#[derive(Deserialize)]
+struct QuestionAlbums {
+    q: Option<String>,
+}
+
+/// `GET /disques/{release}/albums[?q=]` (#8672) : « Associer à un album ».
+/// `requete` : la recherche faite (`q`, sinon celle que l'écran propose,
+/// artiste + titre) ; `albums` : ses résultats dans la bibliothèque ;
+/// `candidats` : pour « plusieurs correspondants », les albums entre
+/// lesquels le rapprochement n'a pas choisi (vide sinon).
+async fn albums_a_associer(
+    State(etat): State<Etat>,
+    Path(release): Path<u64>,
+    Query(q): Query<QuestionAlbums>,
+) -> Response {
+    let Some((_, d)) = disque_suivi(&etat, release) else {
+        return refus(StatusCode::NOT_FOUND, "disque_inconnu");
+    };
+    let albums = match albums_et_services(&etat).await {
+        Ok((a, _)) => a,
+        Err(r) => return r.into_response(),
+    };
+    let index = Index::new(&albums);
+    let candidats = index.candidats(&d);
+    let candidats: Vec<Value> = if candidats.len() > 1 {
+        candidats.iter().map(|a| album_json(a, None)).collect()
+    } else {
+        Vec::new()
+    };
+    let requete =
+        q.q.map(|s| s.trim().to_string())
+            .unwrap_or_else(|| requete_proposee(&d));
+    let trouves: Vec<Value> = associations::chercher(&albums, &requete)
+        .into_iter()
+        .map(|a| album_json(a, None))
+        .collect();
+    Json(json!({
+        "release_id": release,
+        "requete": requete,
+        "proposee": requete_proposee(&d),
+        "candidats": candidats,
+        "albums": trouves,
+        "association": associations_manuelles(&etat).get(&release),
+    }))
+    .into_response()
+}
+
+/// Le disque tel que l'écran le lit, après une association ou une
+/// dissociation.
+async fn disque_relu(etat: &Etat, release: u64) -> Response {
+    let Some((m, d)) = disque_suivi(etat, release) else {
+        return refus(StatusCode::NOT_FOUND, "disque_inconnu");
+    };
+    let (albums, services) = match albums_et_services(etat).await {
+        Ok(x) => x,
+        Err(r) => return r.into_response(),
+    };
+    let index = Index::new(&albums);
+    let (v, _) = vue(&d, &m, &index, &services, &associations_manuelles(etat));
+    Json(json!({"disque": v, "attribution": attribution()})).into_response()
+}
+
+#[derive(Deserialize)]
+struct CorpsAssociation {
+    album_id: i64,
+}
+
+/// `PUT /disques/{release}/association` (#8672) : `{album_id}`. 404
+/// `disque_inconnu` hors de la collection, 404 `album_inconnu` pour un album
+/// qui n'est pas (ou plus) un album local de la bibliothèque.
+async fn associer(
+    State(etat): State<Etat>,
+    Path(release): Path<u64>,
+    corps: axum::body::Bytes,
+) -> Response {
+    let Ok(c) = serde_json::from_slice::<CorpsAssociation>(&corps) else {
+        return refus(StatusCode::UNPROCESSABLE_ENTITY, "corps_invalide");
+    };
+    if disque_suivi(&etat, release).is_none() {
+        return refus(StatusCode::NOT_FOUND, "disque_inconnu");
+    }
+    let albums = match albums_et_services(&etat).await {
+        Ok((a, _)) => a,
+        Err(r) => return r.into_response(),
+    };
+    if !albums.iter().any(|a| a.id == c.album_id) {
+        return refus(StatusCode::NOT_FOUND, "album_inconnu");
+    }
+    if let Err(e) =
+        associations::associer(&etat.backend, release, c.album_id, synchro::maintenant())
+    {
+        tracing::warn!(target: "plugin", erreur = %e, "collection_physique_association_non_ecrite");
+        return refus(StatusCode::INTERNAL_SERVER_ERROR, code::ECRITURE);
+    }
+    disque_relu(&etat, release).await
+}
+
+/// `DELETE /disques/{release}/association` (#8672) : « Dissocier ». Le
+/// disque revient au rapprochement automatique. Sans association, rien à
+/// défaire : la réponse est la même.
+async fn dissocier(State(etat): State<Etat>, Path(release): Path<u64>) -> Response {
+    if disque_suivi(&etat, release).is_none() {
+        return refus(StatusCode::NOT_FOUND, "disque_inconnu");
+    }
+    if let Err(e) = associations::dissocier(&etat.backend, release) {
+        tracing::warn!(target: "plugin", erreur = %e, "collection_physique_dissociation_non_ecrite");
+        return refus(StatusCode::INTERNAL_SERVER_ERROR, code::ECRITURE);
+    }
+    disque_relu(&etat, release).await
+}
+
 fn incrementer(m: &mut serde_json::Map<String, Value>, cle: &str) {
     let n = m.get(cle).and_then(Value::as_u64).unwrap_or(0) + 1;
     m.insert(cle.to_string(), json!(n));
@@ -646,7 +816,7 @@ async fn cd(State(etat): State<Etat>, Query(q): Query<QuestionCd>) -> Response {
         Err(r) => return r.into_response(),
     };
     let index = Index::new(&albums);
-    let (v, _) = vue(d, &m, &index, &services);
+    let (v, _) = vue(d, &m, &index, &services, &associations_manuelles(&etat));
     Json(json!({
         "dans_la_collection": true,
         "copie": v["copie"] == true,
@@ -793,6 +963,11 @@ pub fn router(backend: Arc<dyn DbBackend>, moteur: Arc<Moteur>) -> Router<()> {
         .route(
             "/disques/{release}/services",
             get(chercher_sur_les_services),
+        )
+        .route("/disques/{release}/albums", get(albums_a_associer))
+        .route(
+            "/disques/{release}/association",
+            put(associer).delete(dissocier),
         )
         .route("/pochettes/{release}", get(pochette))
         .route("/cache", delete(effacer_cache))
