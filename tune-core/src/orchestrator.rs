@@ -2239,6 +2239,9 @@ mod convolution_sous_licence_7632_tests;
 // #7986 — une RI que le convolveur refusera ne force pas le transcodage.
 #[cfg(test)]
 mod passthrough_sans_traitement_7986_tests;
+// Discussion #8519 — le suréchantillonneur sur une zone DLNA, devant un faux renderer.
+#[cfg(test)]
+mod surechantillonnage_reseau_8519_tests;
 // #8006 — Pause et Arrêt n'attendent plus sans limite un appareil occupé.
 #[cfg(test)]
 mod sortie_occupee_8006_tests;

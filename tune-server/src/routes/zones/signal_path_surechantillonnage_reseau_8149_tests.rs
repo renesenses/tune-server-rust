@@ -50,13 +50,23 @@ fn zone(output_type: &str) -> (Arc<dyn tune_core::db::backend::DbBackend>, Zone,
 
 fn ligne(lang: &str, output_type: &str) -> (Value, Value) {
     let (backend, zone, _ps) = zone(output_type);
-    etat_du_surechantillonneur_lang(lang, &backend, zone.id.unwrap(), false, output_type, None)
-        .expect("suréchantillonneur réglé : un état et une ligne")
+    etat_du_surechantillonneur_lang(
+        lang,
+        &backend,
+        zone.id.unwrap(),
+        false,
+        output_type,
+        None,
+        None,
+    )
+    .expect("suréchantillonneur réglé : un état et une ligne")
 }
 
 #[test]
-fn zone_dlna_dit_que_le_surechantillonnage_ne_s_applique_pas_8149() {
-    let (etat, etape) = ligne("fr", "dlna");
+fn zone_chromecast_dit_que_le_surechantillonnage_ne_s_applique_pas_8149() {
+    // Depuis #8519, DLNA et OpenHome le prennent en charge : la zone réseau
+    // témoin est un Chromecast.
+    let (etat, etape) = ligne("fr", "chromecast");
     assert_eq!(etat["active"], false, "{etat}");
     assert_eq!(etat["reason"], "output_not_supported", "{etat}");
     let d = etape["description"].as_str().unwrap();
@@ -70,7 +80,7 @@ fn zone_dlna_dit_que_le_surechantillonnage_ne_s_applique_pas_8149() {
         "#8149 : une zone réseau ne recevra jamais le suréchantillonnage, \
          « à la piste suivante » est faux : {d}"
     );
-    let en = ligne("en", "dlna").1;
+    let en = ligne("en", "chromecast").1;
     let en = en["description"].as_str().unwrap();
     assert!(!en.contains("next track"), "{en}");
     assert!(en.contains("this zone"), "{en}");
@@ -98,8 +108,8 @@ fn le_texte_existe_dans_toutes_les_langues_8149() {
 }
 
 #[test]
-fn le_chemin_d_une_zone_dlna_porte_la_ligne_8149() {
-    let (backend, zone, ps) = zone("dlna");
+fn le_chemin_d_une_zone_chromecast_porte_la_ligne_8149() {
+    let (backend, zone, ps) = zone("chromecast");
     let fil = StreamInfo {
         format: "flac".into(),
         sample_rate: 44_100,
@@ -136,7 +146,7 @@ fn zone_locale_en_bit_perfect_strict_dit_la_raison_8149() {
         )
         .unwrap();
     let (etat, etape) =
-        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None).unwrap();
+        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None, None).unwrap();
     assert_eq!(etat["reason"], "strict_bitperfect", "{etat}");
     let d = etape["description"].as_str().unwrap();
     assert_eq!(
@@ -147,7 +157,7 @@ fn zone_locale_en_bit_perfect_strict_dit_la_raison_8149() {
     assert!(!d.contains("suivante"), "{d}");
     // PURE garde la priorité : sa ligne ne change pas.
     let (etat, _) =
-        etat_du_surechantillonneur_lang("fr", &backend, id, true, "local", None).unwrap();
+        etat_du_surechantillonneur_lang("fr", &backend, id, true, "local", None, None).unwrap();
     assert_eq!(etat["reason"], "pure", "{etat}");
 }
 
@@ -175,7 +185,7 @@ fn zone_locale_a_cadence_fixe_dit_la_raison_8428() {
         .set(&tune_core::audio::frequence_fixe::cle_de_zone(id), "48000")
         .unwrap();
     let (etat, etape) =
-        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None).unwrap();
+        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None, None).unwrap();
     assert_eq!(etat["reason"], "fixed_rate", "{etat}");
     let d = etape["description"].as_str().unwrap();
     assert_eq!(
@@ -187,7 +197,7 @@ fn zone_locale_a_cadence_fixe_dit_la_raison_8428() {
         .delete(&tune_core::audio::frequence_fixe::cle_de_zone(id))
         .unwrap();
     let (etat, _) =
-        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None).unwrap();
+        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None, None).unwrap();
     assert_ne!(etat["reason"], "fixed_rate", "{etat}");
 }
 

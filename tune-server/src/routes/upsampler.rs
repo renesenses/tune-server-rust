@@ -112,7 +112,8 @@ async fn tester_la_machine(_admin: RequireAdmin, State(state): State<AppState>) 
 ///
 /// #8149 — au-delà du choix de la zone (licence, greffon, PURE, test de la
 /// machine), deux refus que l'écran taisait : une zone qui ne sort pas sur
-/// la sortie locale (`output_not_supported`, même code que le chemin du
+/// la sortie locale ni sur une zone DLNA / OpenHome (#8519)
+/// (`output_not_supported`, même code que le chemin du
 /// signal) et le « bit-perfect strict » de la zone (`strict_bitperfect`,
 /// même code que `RefusDeCadenceDuGreffon::BitPerfectStrict`), qui refuse
 /// toute conversion de cadence (GgB, fil 2742).
@@ -121,13 +122,20 @@ fn contrainte(state: &AppState, premium: bool, zone_id: i64) -> Option<&'static 
     if let Err(ecarte) = su::choix_de_la_zone(&settings(state), premium, pure, zone_id) {
         return Some(ecarte.code());
     }
-    let peripherique = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
-        .flatten()
+        .flatten();
+    // Discussion #8519 — DLNA et OpenHome le prennent en charge aussi : Tune
+    // leur sert un flux suréchantillonné.
+    let reseau_pris_en_charge = zone
+        .as_ref()
+        .and_then(|z| z.output_type.as_deref())
+        .is_some_and(tune_core::audio::surechantillonnage_reseau::sortie_prise_en_charge);
+    let peripherique = zone
         .and_then(|z| z.output_device_id)
         .filter(|d| !d.is_empty());
-    if peripherique.is_some_and(|d| !d.starts_with("local:")) {
+    if !reseau_pris_en_charge && peripherique.is_some_and(|d| !d.starts_with("local:")) {
         return Some("output_not_supported");
     }
     if tune_core::audio::bitperfect_strict::zone_enabled(&state.backend, zone_id) {

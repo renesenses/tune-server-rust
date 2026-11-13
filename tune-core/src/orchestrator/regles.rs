@@ -1605,6 +1605,9 @@ pub(super) struct MotifsDeTranscodage {
     /// fichier du disque : seul le décodage, qui lit l'image par étendues, la
     /// rend.
     pub(super) dans_une_image_iso: bool,
+    /// Discussion #8519 — le suréchantillonneur de la zone entre dans ce flux
+    /// réseau : seul le bras fichier le fait tourner.
+    pub(super) surechantillonnage: bool,
 }
 
 impl MotifsDeTranscodage {
@@ -1636,6 +1639,7 @@ impl MotifsDeTranscodage {
             ),
             (self.reduction_de_canaux, "reduction_de_canaux"),
             (self.dans_une_image_iso, "dans_une_image_iso"),
+            (self.surechantillonnage, "surechantillonnage"),
         ]
         .into_iter()
         .filter_map(|(vrai, nom)| vrai.then_some(nom))
@@ -1887,7 +1891,20 @@ mod lecture_locale_tests {
             conteneur_flac_neuf_pret: false,
             reduction_de_canaux: false,
             dans_une_image_iso: false,
+            surechantillonnage: false,
         }
+    }
+
+    /// Discussion #8519 — le suréchantillonneur seul force le transcodage :
+    /// un passthrough servirait la piste à sa cadence d'origine.
+    #[test]
+    fn le_surechantillonneur_seul_force_le_transcodage_8519() {
+        let motifs = MotifsDeTranscodage {
+            surechantillonnage: true,
+            ..aucun_motif()
+        };
+        assert!(transcodage_requis(&motifs));
+        assert_eq!(motifs.motifs_actifs(), vec!["surechantillonnage"]);
     }
 
     #[test]
@@ -2008,7 +2025,7 @@ mod lecture_locale_tests {
     /// aucune décision de transcodage.
     #[test]
     fn les_motifs_nommes_rendent_la_decision_du_ou_d_origine() {
-        for masque in 0u32..(1 << 15) {
+        for masque in 0u32..(1 << 16) {
             let b = |i: u32| masque & (1 << i) != 0;
             let m = MotifsDeTranscodage {
                 needs_transcode_for_output: b(0),
@@ -2026,6 +2043,7 @@ mod lecture_locale_tests {
                 conteneur_flac_neuf_pret: b(12),
                 reduction_de_canaux: b(13),
                 dans_une_image_iso: b(14),
+                surechantillonnage: b(15),
             };
             let ou_d_origine = m.needs_transcode_for_output
                 || m.oaat_needs_wav
@@ -2039,11 +2057,12 @@ mod lecture_locale_tests {
                 || m.est_une_tranche_cue
                 || (m.flac_ffmpeg_vers_le_reseau && !m.conteneur_flac_neuf_pret)
                 || m.reduction_de_canaux
-                || m.dans_une_image_iso;
+                || m.dans_une_image_iso
+                || m.surechantillonnage;
             assert_eq!(
                 transcodage_requis(&m),
                 ou_d_origine,
-                "masque {masque:#017b}"
+                "masque {masque:#018b}"
             );
         }
     }
@@ -2118,6 +2137,7 @@ mod flac_ffmpeg_tests {
             conteneur_flac_neuf_pret: false,
             reduction_de_canaux: false,
             dans_une_image_iso: false,
+            surechantillonnage: false,
         }
     }
 

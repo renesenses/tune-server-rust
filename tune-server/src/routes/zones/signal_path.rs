@@ -1442,6 +1442,7 @@ pub fn build_signal_path_lang(
         pure,
         output_type,
         transformations_reelles,
+        wire,
     );
     if let Some((_, etape)) = surechantillonnage.as_ref().filter(|(_, e)| !e.is_null()) {
         let avant_la_sortie = etapes.steps.len().saturating_sub(1);
@@ -1571,9 +1572,24 @@ pub(super) fn etat_du_surechantillonneur_lang(
     pure: bool,
     output_type: &str,
     transformations_reelles: Option<&TransformationsReelles>,
+    wire: Option<&StreamInfo>,
 ) -> Option<(Value, Value)> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
     let reglages = tune_core::audio::surechantillonnage::reglages_de_la_zone(&settings, zone_id);
+    // Discussion #8519 — l'étage cuit dans le flux RÉSEAU servi, tel que la
+    // session le publie : un fait du flux, pas une déduction des réglages.
+    if let Some(su) = wire.and_then(|w| w.surechantillonnage.as_ref()) {
+        return Some((
+            json!({
+                "active": true,
+                "from_hz": su.de,
+                "to_hz": su.vers,
+                "filter": su.filtre,
+                "headroom_db": su.reserve_db,
+            }),
+            Value::Null,
+        ));
+    }
     if let Some((filtre, reserve_db)) = transformations_reelles.and_then(|t| t.surechantillonnage())
     {
         let t = transformations_reelles?;
@@ -1601,14 +1617,22 @@ pub(super) fn etat_du_surechantillonneur_lang(
         return None;
     }
     let refus_observe = transformations_reelles.and_then(|t| t.refus_surechantillonnage());
+    let reseau = tune_core::audio::surechantillonnage_reseau::sortie_prise_en_charge(output_type);
+    // Discussion #8519 — le refus que le flux réseau servi a noté.
+    let refus_du_flux = wire
+        .and_then(|w| w.refus_surechantillonnage)
+        .filter(|_| reseau);
     let (raison, cle) = if let Some(raison) = refus_observe.filter(|_| output_type == "local") {
         (raison, texte_du_refus_surechantillonnage(raison))
     } else if pure {
         ("pure", "upsampling_pure")
-    } else if output_type != "local" {
-        // #8149 — une zone réseau (DLNA, AirPlay…) n'a pas de
-        // suréchantillonneur : « à la piste suivante » y était faux, rien ne
-        // s'appliquera jamais. Le dire, avec la raison.
+    } else if let Some(raison) = refus_du_flux {
+        (raison, texte_du_refus_reseau(raison))
+    } else if output_type != "local" && !reseau {
+        // #8149 — une zone réseau sans suréchantillonneur (AirPlay,
+        // Chromecast…) : « à la piste suivante » y serait faux, rien ne
+        // s'appliquera jamais. Le dire, avec la raison. Depuis #8519, DLNA et
+        // OpenHome le prennent en charge.
         ("output_not_supported", "upsampling_zone_not_supported")
     } else if tune_core::audio::bitperfect_strict::zone_enabled(backend, zone_id) {
         // #8149 (GgB, fil 2742) — le « bit-perfect strict » de la zone refuse
@@ -1641,6 +1665,23 @@ pub(super) fn etat_du_surechantillonneur_lang(
             "bit_perfect": true,
         }),
     ))
+}
+
+/// Discussion #8519 — les refus d'une zone DLNA / OpenHome
+/// (`RefusReseau::code`), notés par le flux servi.
+fn texte_du_refus_reseau(raison: &str) -> &'static str {
+    match raison {
+        "output_not_supported" => "upsampling_zone_not_supported",
+        "source_not_pcm" => "upsampling_source_not_pcm",
+        "strict_bitperfect" => "upsampling_strict_bitperfect",
+        "progressive_stream" => "upsampling_progressive_stream",
+        "renderer_rates_unknown" => "upsampling_renderer_rates_unknown",
+        "renderer_rate_ceiling" => "upsampling_renderer_rate_ceiling",
+        "machine_test_rejects_accepted_rates" => "upsampling_machine_rates",
+        "settings_caps_exclude_admitted_rates" => "upsampling_settings_caps",
+        "track_too_heavy" => "upsampling_track_too_heavy",
+        _ => "upsampling_not_applied",
+    }
 }
 
 /// #8259 — codes observés, sans déduire une cause du seul réglage actuel.
@@ -1870,6 +1911,7 @@ fn assembler_les_etapes_lang(
         reaffectation_ignoree,
         compensation_reseau_db,
         crossfeed_du_flux,
+        surechantillonnage_du_flux,
         ui_volume,
         volume_full,
         correction_piece,
@@ -2246,7 +2288,18 @@ fn assembler_les_etapes_lang(
             "bit_perfect": false,
         }));
     }
-    if let Some((t, (filtre, reserve_db))) = reel
+    if let Some(su) = surechantillonnage_du_flux.as_ref() {
+        // Discussion #8519 — le greffon porte la cadence du flux RÉSEAU :
+        // « 44,1 kHz → 176,4 kHz, filtre, réserve », avant l'égaliseur.
+        rate_conversion = Some((su.de, su.vers));
+        steps.push(etape_du_surechantillonneur_lang(
+            lang,
+            su.de,
+            su.vers,
+            &su.filtre,
+            su.reserve_db,
+        ));
+    } else if let Some((t, (filtre, reserve_db))) = reel
         .filter(|t| t.reechantillonnage())
         .and_then(|t| t.surechantillonnage().map(|s| (t, s)))
     {
@@ -2781,6 +2834,8 @@ fn rendre_les_verdicts(
     let resampling_active = forcages
         .cadence_pcm_servie
         .is_some_and(|rate| rate != sample_rate as u32)
+        // Discussion #8519 — le suréchantillonneur cuit dans le flux réseau.
+        || traitements.surechantillonnage_du_flux.is_some()
         || match transformations_reelles {
             Some(reel) => reel.reechantillonnage(),
             None => {
@@ -3450,6 +3505,9 @@ struct Traitements {
     /// #5114 — le flux servi porte le crossfeed dans ses octets, tel que la
     /// session le publie (`StreamInfo::crossfeed`). `false` sans session.
     crossfeed_du_flux: bool,
+    /// Discussion #8519 — le suréchantillonneur cuit dans le flux réseau
+    /// servi (`StreamInfo::surechantillonnage`). `None` sans session.
+    surechantillonnage_du_flux: Option<tune_core::http::streamer::SurechantillonnageCuit>,
     ui_volume: f64,
     volume_full: bool,
     /// #7632 — la correction de pièce de la zone (`ir_path_{zone}`), décrite.
@@ -3549,6 +3607,7 @@ fn relever_les_traitements_lang(
         reaffectation_ignoree: None,
         compensation_reseau_db,
         crossfeed_du_flux,
+        surechantillonnage_du_flux: wire.and_then(|w| w.surechantillonnage.clone()),
         ui_volume,
         volume_full,
         correction_piece: zone_correction_piece_lang(

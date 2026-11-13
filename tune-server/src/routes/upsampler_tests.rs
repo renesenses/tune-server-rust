@@ -155,11 +155,30 @@ async fn le_bit_perfect_strict_de_la_zone_est_dit_a_l_ecran_8149() {
     assert_eq!(v["constraint"], "strict_bitperfect", "{v}");
 }
 
-/// #8149 — une zone réseau ne reçoit pas le suréchantillonneur : l'écran le
-/// dit, avec le même code que le chemin du signal.
+/// #8149 — une zone réseau sans suréchantillonneur (Chromecast) : l'écran
+/// le dit, avec le même code que le chemin du signal.
 #[tokio::test]
 async fn une_zone_reseau_est_dite_non_prise_en_charge_8149() {
-    let (state, id) = zone_prete("dlna:uuid:eversolo-dmp-a8").await;
+    let (state, id) = zone_prete("chromecast:salon").await;
     let Json(v) = lire_zone(State(state), Path(id)).await;
     assert_eq!(v["constraint"], "output_not_supported", "{v}");
+}
+
+/// Discussion #8519 — une zone DLNA ou OpenHome reçoit le suréchantillonneur :
+/// plus de contrainte « sortie non prise en charge » ; le strict y reste dit.
+#[tokio::test]
+async fn une_zone_dlna_ou_openhome_est_prise_en_charge_8519() {
+    for peripherique in ["dlna:uuid:eversolo-dmp-a8", "openhome:uuid:linn"] {
+        let (state, id) = zone_prete(peripherique).await;
+        let Json(v) = lire_zone(State(state.clone()), Path(id)).await;
+        assert!(v["constraint"].is_null(), "{peripherique} : {v}");
+        settings(&state)
+            .set(
+                &tune_core::audio::bitperfect_strict::cle_de_zone(id),
+                "true",
+            )
+            .unwrap();
+        let Json(v) = lire_zone(State(state), Path(id)).await;
+        assert_eq!(v["constraint"], "strict_bitperfect", "{peripherique} : {v}");
+    }
 }

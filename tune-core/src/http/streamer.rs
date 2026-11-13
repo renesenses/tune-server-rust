@@ -134,6 +134,38 @@ pub struct StreamInfo {
     /// fait du flux, posé là où il est bâti, lu tel quel par le chemin du
     /// signal (« DST décompressé → DSF »). `false` partout ailleurs.
     pub dsd_reconstruit_depuis_dst: bool,
+    /// Discussion #8519 — le suréchantillonneur CUIT dans les octets de ce
+    /// flux réseau : de quelle cadence à quelle cadence, avec quel filtre et
+    /// quelle réserve. Même règle que [`Self::crossfeed`] : un fait du flux,
+    /// posé là où il est bâti (bras fichier, rendu frais ou en cache), lu tel
+    /// quel par le chemin du signal. `None` partout ailleurs.
+    pub surechantillonnage: Option<SurechantillonnageCuit>,
+    /// Discussion #8519 — le suréchantillonneur était réglé et actif pour la
+    /// zone, mais n'est PAS entré dans ce flux réseau : le code de la raison
+    /// (`RefusReseau::code`). Posé par
+    /// [`AudioStreamer::noter_le_refus_du_surechantillonnage`].
+    pub refus_surechantillonnage: Option<&'static str>,
+}
+
+/// Discussion #8519 — l'étage du suréchantillonneur tel qu'il est cuit dans
+/// un flux réseau.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurechantillonnageCuit {
+    pub de: u32,
+    pub vers: u32,
+    pub filtre: String,
+    pub reserve_db: f64,
+}
+
+impl SurechantillonnageCuit {
+    pub fn depuis_la_cible(c: &crate::audio::surechantillonnage_reseau::CibleReseau) -> Self {
+        Self {
+            de: c.de,
+            vers: c.vers,
+            filtre: c.reglages.filter.clone(),
+            reserve_db: c.reserve_db(),
+        }
+    }
 }
 
 /// #6221 — un fichier VIRTUEL servi par la branche fichier (`serve_file`) :
@@ -375,6 +407,9 @@ pub struct StreamSession {
     /// #8076 — ce que la session sert RÉELLEMENT, noté par qui la crée
     /// (voir [`voie`]). Vide : la voie se déduit de la forme de la session.
     pub voie_notee: std::sync::OnceLock<&'static str>,
+    /// Discussion #8519 — pourquoi le suréchantillonneur réglé n'est pas
+    /// dans ce flux (`StreamInfo::refus_surechantillonnage`).
+    pub refus_surechantillonnage: std::sync::OnceLock<&'static str>,
     pub proxy_url: Mutex<Option<String>>,
     /// Re-resolver for the proxied CDN URL. Set for streaming proxy sessions
     /// whose signed URL can expire (Qobuz/Tidal). When a proxied upstream
@@ -679,6 +714,9 @@ impl StreamSession {
 
     pub(crate) fn effective_output_info(&self) -> StreamInfo {
         let mut info = self.info.clone();
+        if let Some(code) = self.refus_surechantillonnage.get() {
+            info.refus_surechantillonnage = Some(code);
+        }
         if self.is_radio {
             info.radio_source = *self
                 .detected_radio_source
@@ -757,6 +795,7 @@ impl StreamSession {
             faststart: std::sync::Mutex::new(None),
             source_virtuelle: std::sync::Mutex::new(None),
             voie_notee: std::sync::OnceLock::new(),
+            refus_surechantillonnage: std::sync::OnceLock::new(),
             proxy_url: Mutex::new(None),
             reresolve: Mutex::new(None),
             track_title: None,
@@ -1850,6 +1889,14 @@ impl AudioStreamer {
 
     /// #8076 — note ce que la session sert (une constante de [`voie`]). La
     /// première note fait foi.
+    /// Discussion #8519 — note sur la session pourquoi le suréchantillonneur
+    /// réglé n'entre pas dans ce flux réseau.
+    pub async fn noter_le_refus_du_surechantillonnage(&self, id: &str, code: &'static str) {
+        if let Some(s) = self.sessions.lock().await.get(id) {
+            let _ = s.refus_surechantillonnage.set(code);
+        }
+    }
+
     pub async fn noter_la_voie(&self, id: &str, voie_servie: &'static str) {
         if let Some(s) = self.sessions.lock().await.get(id) {
             let _ = s.voie_notee.set(voie_servie);

@@ -459,7 +459,7 @@ pub(super) async fn transcode_source_to_file(
 ) -> Result<(u64, Vec<u8>, u16), String> {
     transcode_source_to_file_avec_crossfeed(
         source, out_sr, channels, target_bd, target_fmt, eq, convolver, replaygain, dest, progres,
-        abandon, tranche, None, None,
+        abandon, tranche, None, None, None,
     )
     .await
 }
@@ -501,6 +501,11 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // #5071 — la compensation de niveau, DERNIER étage, bornée à la crête de
     // la piste entière. `None` : strictement la chaîne d'avant.
     compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
+    // Discussion #8519 — le suréchantillonneur d'une zone RÉSEAU : la piste
+    // est décodée à la cadence de la SOURCE (`cible.de`), puis l'étage du
+    // greffon la porte à `cible.vers` (= `out_sr`) AVANT le ReplayGain et
+    // l'égaliseur. `None` : strictement la chaîne d'avant.
+    surechantillonnage: Option<crate::audio::surechantillonnage_reseau::CibleReseau>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // LAT-F1 (phase 2a) : le chemin fichier reste le seul où le renderer
     // attend le morceau ENTIER (cible FLAC, Content-Length exigé). Avant de
@@ -510,6 +515,9 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // que le terrain lira sur le .18 avant qu'on décide quoi pipeliner.
     let chrono = std::time::Instant::now();
     let dest_journal = dest.clone();
+    // #8519 — décodée à la cadence de la source quand l'étage porte la
+    // cadence : rubato ne tourne pas.
+    let cadence_decodee = surechantillonnage.as_ref().map_or(out_sr, |c| c.de);
     // 1. Decode source to PCM (blocking I/O).
     let decoded = tokio::task::spawn_blocking(move || {
         // La balise se pose SUR CE THREAD : c'est lui qui décode (#3140).
@@ -523,7 +531,7 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         // disposition que le fichier déclare.
         crate::audio::decode::decode_to_pcm_routee(
             &source,
-            Some(out_sr),
+            Some(cadence_decodee),
             Some(channels as u32),
             debut_s,
             duree_s,
@@ -538,14 +546,49 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // #8558 — les échantillons `i32` de la piste entière sont libérés dès
     // que leurs octets existent : ils restaient vivants jusqu'à la fin, à côté
     // du PCM, de l'encodeur et du fichier encodé (forum, fil 2777).
-    let (decoded_sample_rate, decoded_channels) = (decoded.sample_rate, decoded.channels);
+    let (mut decoded_sample_rate, decoded_channels) = (decoded.sample_rate, decoded.channels);
     drop(decoded);
+    // 1-0. #8519 — l'étage du suréchantillonneur, PREMIER traitement : tout
+    // ce qui suit (ReplayGain, égaliseur, convolveur, crossfeed,
+    // compensation) a été bâti à la cadence cible. Calcul lourd : hors du fil
+    // asynchrone. Le PCM ressort en 32 bits, ramené plus bas à la profondeur
+    // négociée (24 bits).
+    let source_bd = actual_bd;
+    let surechantillonnage_journal = surechantillonnage.as_ref().map(|c| (c.de, c.vers));
+    if let Some(cible) = surechantillonnage {
+        let entree = std::mem::take(&mut pcm_bytes);
+        let (de, bd) = (decoded_sample_rate, actual_bd);
+        let (rendu, filtre, reserve_db) = tokio::task::spawn_blocking(move || {
+            let mut etage = crate::audio::surechantillonnage::EtageSurechantillonneur::nouveau(
+                &cible.reglages,
+                de,
+                cible.vers,
+                u16::try_from(decoded_channels).map_err(|e| e.to_string())?,
+            )?;
+            let rendu = crate::audio::surechantillonnage_reseau::surechantillonner_pcm(
+                &mut etage, &entree, bd,
+            )?;
+            Ok::<_, String>((rendu, etage.filtre(), etage.reserve_db()))
+        })
+        .await
+        .map_err(|e| format!("upsampler task panic: {e}"))??;
+        info!(
+            dest = %dest_journal,
+            from_sr = de,
+            to_sr = cible.vers,
+            filter = filtre,
+            headroom_db = reserve_db,
+            "dlna_upsampler_engaged"
+        );
+        pcm_bytes = rendu;
+        actual_bd = 32;
+        decoded_sample_rate = cible.vers;
+    }
     // #4455 — ce que la ligne de synthèse doit DIRE de la chaîne : la
     // profondeur décodée, le gain appliqué, les étages actifs. Le rapport
     // de Sevy Tabroc ne permettait pas de savoir si le WAV 24 bits servi au
     // LHC-208 venait d'une source 24 bits ou d'un 16 bits élargi, ni si un
     // gain ou un égaliseur avait touché les échantillons.
-    let source_bd = actual_bd;
     let replaygain_db = replaygain
         .filter(|f| *f > 0.0)
         .map(|f| (20.0 * f.log10() * 100.0).round() / 100.0);
@@ -685,6 +728,7 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         crossfeed = crossfeed_actif,
         compensation_cible_db = ?compensation_cible_db,
         compensation_appliquee_db = ?compensation_appliquee_db,
+        surechantillonnage = ?surechantillonnage_journal,
         "transcode_to_temp_file_stages"
     );
 
