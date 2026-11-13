@@ -78,6 +78,9 @@ const CLES_SMART_COLLECTION: &[&str] = &[
     // collection ouverte.
     "release_date",
     "original_date",
+    // #7903 (fil 2656) — la date d'ajout dans Tune, pour le tri « Ordre
+    // d'ajout dans Tune » de la collection ouverte.
+    "added_at",
 ];
 
 /// Idem pour l'album qu'une playlist intelligente déduit de ses pistes.

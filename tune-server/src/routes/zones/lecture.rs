@@ -530,6 +530,9 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             )
             .await;
             obj.insert("signal_path".into(), json!(signal_path));
+            // #8419 — en lecture groupée, chaque sortie et son étage final.
+            super::signal_path_groupe_8419::injecter_les_sorties_du_groupe(&state, zone_id, obj)
+                .await;
             // #1395 — quel backend local tourne VRAIMENT sur cette zone, face à
             // celui qui est réglé. Absent des zones non locales.
             if let Some(status) =
@@ -778,6 +781,9 @@ pub(crate) async fn get_zone(
                 )
                 .await;
                 obj.insert("signal_path".into(), json!(signal_path));
+                // #8419 — en lecture groupée, chaque sortie et son étage final.
+                super::signal_path_groupe_8419::injecter_les_sorties_du_groupe(&state, id, obj)
+                    .await;
                 // #1395 — voir la note au site jumeau (`list_zones`).
                 if let Some(status) =
                     local_backend_status_value(zone.output_type.as_deref(), &audio_backend_pref)

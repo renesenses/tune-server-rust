@@ -1127,10 +1127,7 @@ impl OutputTarget for ChromecastOutput {
                 .map_err(|e| format!("connect receiver: {e}"))?;
             device
                 .receiver
-                .set_volume(rust_cast::channels::receiver::Volume {
-                    level: Some(level),
-                    muted: Some(false),
-                })
+                .set_volume(consigne_de_volume(level))
                 .map_err(|e| format!("volume: {e}"))?;
             Ok::<(), String>(())
         })
@@ -1347,6 +1344,31 @@ impl OutputTarget for ChromecastOutput {
         })
         .await
         .is_ok()
+    }
+}
+
+/// #8610 — la consigne `SET_VOLUME` d'un `set_volume` : le niveau SEUL.
+/// Elle portait `muted: false`, qui levait la sourdine de l'appareil à chaque
+/// consigne (limite abaissée, alarme, sondeur) pendant que la zone restait
+/// affichée en sourdine. Seul `set_mute(false)` — le geste de volume, #8165 —
+/// lève la sourdine.
+fn consigne_de_volume(level: f32) -> rust_cast::channels::receiver::Volume {
+    rust_cast::channels::receiver::Volume {
+        level: Some(level),
+        muted: None,
+    }
+}
+
+#[cfg(test)]
+mod sourdine_8610_tests {
+    /// #8610 — la consigne de volume ne porte plus `muted` : le récepteur
+    /// garde sa sourdine (limite abaissée, alarme, sondeur). La levée passe
+    /// par `set_mute(false)`, le geste de #8165.
+    #[test]
+    fn la_consigne_de_volume_ne_touche_pas_la_sourdine_8610() {
+        let consigne = super::consigne_de_volume(0.25);
+        assert_eq!(consigne.level, Some(0.25));
+        assert_eq!(consigne.muted, None, "#8610 : pas de « muted: false »");
     }
 }
 

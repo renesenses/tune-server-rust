@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use tune_core::library::relecture_classique as rc;
+use tune_core::metadata::balises_classique::{self, BalisesClassique};
 use tune_core::taches_de_fond::{Tache, attendre_son_tour};
 
 use crate::state::AppState;
@@ -37,9 +38,79 @@ pub(crate) fn armer(state: &AppState) {
     });
 }
 
+/// Les relances dont la mise en base ([`rc::reinitialiser`]) a échoué : la
+/// passe les retente à chaque tour, et les journalise tant qu'elles échouent.
+static RELANCES_EN_ECHEC: std::sync::Mutex<Vec<BalisesClassique>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn relances_en_echec() -> std::sync::MutexGuard<'static, Vec<BalisesClassique>> {
+    RELANCES_EN_ECHEC.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Retente les relances en échec. `true` si toutes sont passées.
+async fn retenter_les_relances(state: &AppState) -> bool {
+    let en_attente: Vec<BalisesClassique> = std::mem::take(&mut *relances_en_echec());
+    if en_attente.is_empty() {
+        return true;
+    }
+    let b = state.backend.clone();
+    let restees = tokio::task::spawn_blocking(move || {
+        en_attente
+            .into_iter()
+            .filter(|ancien| match rc::reinitialiser(&b, ancien) {
+                Ok(()) => false,
+                Err(e) => {
+                    tracing::warn!(error = %e, "relecture_classique_relance_echec_nouvel_essai");
+                    true
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let ok = restees.is_empty();
+    relances_en_echec().extend(restees);
+    ok
+}
+
+/// ESL63P — après une modification du réglage « Balises du classique »
+/// (`ancien` = le réglage d'avant) : la relance est mise EN BASE tout de
+/// suite (curseur à zéro, passe rouverte, ancien réglage enregistré) — un
+/// redémarrage la reprend par [`armer`]. Puis la passe part, ou une passe en
+/// cours la prend à son lot suivant. Rend `false` si la mise en base a
+/// échoué : la relance est alors gardée et retentée par la passe.
+pub(crate) async fn relancer(state: &AppState, ancien: BalisesClassique) -> bool {
+    let b = state.backend.clone();
+    let a = ancien.clone();
+    let persistee = matches!(
+        tokio::task::spawn_blocking(move || rc::reinitialiser(&b, &a)).await,
+        Ok(Ok(()))
+    );
+    if !persistee {
+        tracing::warn!("relecture_classique_relance_non_persistee_nouvel_essai");
+        relances_en_echec().push(ancien);
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        // Une passe qui se termine pendant l'appel rend son verrou un instant
+        // plus tard : on réessaie tant que la passe n'est pas close.
+        for _ in 0..30 {
+            if executer(&state).await {
+                break;
+            }
+            let reste = !rc::est_faite(&state.backend) || !relances_en_echec().is_empty();
+            if !reste {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+    persistee
+}
+
 /// La passe entière. `false` : déjà en cours ou déjà faite.
 pub(crate) async fn executer(state: &AppState) -> bool {
-    if rc::est_faite(&state.backend) {
+    if rc::est_faite(&state.backend) && relances_en_echec().is_empty() {
         return false;
     }
     let Some(_garde) = state.background_tasks.try_begin(
@@ -49,7 +120,8 @@ pub(crate) async fn executer(state: &AppState) -> bool {
     ) else {
         return false;
     };
-    let total = {
+    retenter_les_relances(state).await;
+    let mut total = {
         let b = state.backend.clone();
         tokio::task::spawn_blocking(move || rc::restantes(&b))
             .await
@@ -58,16 +130,32 @@ pub(crate) async fn executer(state: &AppState) -> bool {
     let mut faites = 0u64;
     state
         .background_tasks
-        .update_progress(TACHE, 0, total, "Étiquettes");
+        .update_progress(TACHE, 0, total, crate::background_tasks::Phase::Tags);
     loop {
+        // Une relance dont la mise en base avait échoué : nouvel essai.
+        let en_echec = !relances_en_echec().is_empty();
+        if en_echec && retenter_les_relances(state).await {
+            let b = state.backend.clone();
+            total = tokio::task::spawn_blocking(move || rc::restantes(&b))
+                .await
+                .unwrap_or(0);
+            faites = 0;
+        }
         attendre_son_tour(Tache::Enrichissement).await;
         let b = state.backend.clone();
         let lot = tokio::task::spawn_blocking(move || {
-            rc::traiter_lot_suivant(&b, TAILLE_DU_LOT, rc::lire)
+            let actuel = balises_classique::courante();
+            rc::traiter_lot_suivant(&b, TAILLE_DU_LOT, &actuel, rc::lire)
         })
         .await;
         match lot {
             Ok(Ok(lot)) if lot.fini => {
+                // Une relance arrivée entre le dernier lot et ici a rouvert
+                // la passe, ou attend son nouvel essai : on continue.
+                if !relances_en_echec().is_empty() || !rc::est_faite(&state.backend) {
+                    tokio::time::sleep(PAUSE_ENTRE_LOTS).await;
+                    continue;
+                }
                 tracing::info!(pistes = faites, "relecture_classique_terminee");
                 break;
             }
@@ -77,7 +165,7 @@ pub(crate) async fn executer(state: &AppState) -> bool {
                     TACHE,
                     faites,
                     total.max(faites),
-                    "Étiquettes",
+                    crate::background_tasks::Phase::Tags,
                 );
             }
             Ok(Err(e)) => {

@@ -191,6 +191,7 @@ fn diagnostic_8259_le_chemin_restitue_le_refus_observe_et_non_un_reglage_deduit(
     activer(&backend, zone.id.unwrap());
     // Aucun verdict en base : une observation de la piste reste prioritaire.
     for (raison, mot) in [
+        ("fixed_rate", "fixe"),
         ("disabled", "désactivé à l’ouverture"),
         ("plugin_not_installed", "greffon absent"),
         ("premium_required", "Premium"),

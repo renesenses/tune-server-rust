@@ -11,7 +11,8 @@
 //! - calage en moins de 20 s ;
 //! - après 5 s de stabilisation, écart suiveur − maître sous 250 µs sur
 //!   chaque mesure de la fenêtre ;
-//! - fréquence apprise à ±10 ppm des +40 ppm du maître.
+//! - pente parcourue à ±10 ppm des +40 ppm du maître, plus l’incertitude
+//!   de phase et de lecture mesurée sur la fenêtre (supplément plafonné à 20 ppm).
 //!
 //! #8460 — le seuil d'écart sous charge. Avec un horodatage LOGICIEL, un fil
 //! réveillé en retard à la réception rend le chemin asymétrique, et l'écart
@@ -114,12 +115,47 @@ struct Mesure {
     /// relevé unique pris à la fin tombait parfois sur une correction en
     /// cours (-9,26 ppm mesuré sur Shrek, écart pourtant sous 102 µs).
     frequence_ppm: f64,
+    frequence_mesuree_ppm: f64,
+    incertitude_lecture_ns: u64,
+    duree_ns: u64,
+    meme_generation: bool,
+}
+
+/// Encadre une lecture de l'horloge par deux instants monotones : le temps
+/// passé à lire n'est pas confondu avec une erreur de fréquence.
+fn lire_pente(s: &SuiveurPtp) -> (Instant, u64, u64) {
+    let avant = Instant::now();
+    let virtuel = s.maintenant_ns();
+    let apres = Instant::now();
+    let largeur = apres - avant;
+    (avant + largeur / 2, virtuel, largeur.as_nanos() as u64)
+}
+
+/// L'asymétrie du chemin déplace une phase d'au plus le délai moyen ;
+/// deux extrémités donnent 2 × délai / durée en erreur de pente. On garde
+/// les 10 ppm du banc calme et ajoute l'incertitude de lecture mesurée.
+/// Le supplément est plafonné à la moitié de la dérive du maître :
+/// une horloge restée à 0 ppm ne peut jamais être déclarée correcte.
+fn seuil_frequence_ppm(delai_ns: i64, lecture_ns: u64, duree_ns: u64) -> f64 {
+    let incertitude =
+        (2.0 * delai_ns.max(0) as f64 + lecture_ns as f64) / duree_ns.max(1) as f64 * 1e6;
+    10.0 + incertitude.min(20.0)
+}
+
+#[test]
+fn la_marge_de_frequence_vient_de_la_mesure_et_rejette_une_horloge_non_corrigee() {
+    assert_eq!(seuil_frequence_ppm(0, 0, 5_000_000_000), 10.0);
+    assert!((seuil_frequence_ppm(31_108, 0, 5_000_000_000) - 22.4432).abs() < 1e-9);
+    assert_eq!(seuil_frequence_ppm(1_000_000_000, 1_000_000_000, 1), 30.0);
+    assert!(seuil_frequence_ppm(i64::MAX, u64::MAX, 1) < 40.0);
 }
 
 /// Mesure l'écart, le délai de chemin et la fréquence apprise toutes les
 /// 50 ms pendant `duree`.
 fn mesurer(maitre: &MaitreSimule, s: &SuiveurPtp, duree: Duration) -> Mesure {
     let debut = Instant::now();
+    let generation = s.generation();
+    let (t0, v0, lecture0) = lire_pente(s);
     let mut v = Vec::new();
     let mut frequences = Vec::new();
     let mut delai_max = 0i64;
@@ -130,6 +166,8 @@ fn mesurer(maitre: &MaitreSimule, s: &SuiveurPtp, duree: Duration) -> Mesure {
         frequences.push(e.frequence_ppm);
         std::thread::sleep(Duration::from_millis(50));
     }
+    let (t1, v1, lecture1) = lire_pente(s);
+    let duree_ns = (t1 - t0).as_nanos() as u64;
     frequences.sort_by(f64::total_cmp);
     Mesure {
         min: *v.iter().min().unwrap(),
@@ -137,6 +175,10 @@ fn mesurer(maitre: &MaitreSimule, s: &SuiveurPtp, duree: Duration) -> Mesure {
         moyenne: v.iter().sum::<i64>() / v.len() as i64,
         delai_max,
         frequence_ppm: frequences[frequences.len() / 2],
+        frequence_mesuree_ppm: ((v1 as i128 - v0 as i128) as f64 / duree_ns as f64 - 1.0) * 1e6,
+        incertitude_lecture_ns: lecture0.saturating_add(lecture1) / 2,
+        duree_ns,
+        meme_generation: generation == s.generation(),
     }
 }
 
@@ -198,6 +240,10 @@ fn le_suiveur_se_cale_sur_un_maitre_1588_2008_et_suit_sa_derive() {
         moyenne,
         delai_max,
         frequence_ppm,
+        frequence_mesuree_ppm,
+        incertitude_lecture_ns,
+        duree_ns,
+        meme_generation,
     } = mesurer(&maitre, &s, Duration::from_secs(5));
     let seuil = seuil_ecart_ns(delai_max);
     let e = s.etat();
@@ -212,9 +258,17 @@ fn le_suiveur_se_cale_sur_un_maitre_1588_2008_et_suit_sa_derive() {
         "écart hors seuil : [{min}, {max}] ns (seuil {seuil} ns = {SEUIL_ECART_NS} + délai \
          moyen de chemin max {delai_max} ns)"
     );
+    let seuil_frequence = seuil_frequence_ppm(delai_max, incertitude_lecture_ns, duree_ns);
     assert!(
-        (frequence_ppm - 40.0).abs() < 10.0,
-        "fréquence apprise (médiane sur 5 s) {frequence_ppm} ppm"
+        meme_generation,
+        "un saut pendant la mesure ne doit pas passer pour une pente"
+    );
+    eprintln!(
+        "pente réellement parcourue {frequence_mesuree_ppm:.2} ppm, marge {seuil_frequence:.2} ppm, lectures ±{incertitude_lecture_ns} ns"
+    );
+    assert!(
+        (frequence_mesuree_ppm - 40.0).abs() < seuil_frequence,
+        "fréquence mesurée {frequence_mesuree_ppm} ppm, attendue 40 ±{seuil_frequence} ppm"
     );
     assert!(e.calee && !e.repli_horloge_locale && e.raison_du_repli.is_none());
     assert_eq!(e.etat_port, "esclave");

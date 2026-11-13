@@ -194,10 +194,11 @@ const LIAISONS_DE_TETE: [char; 12] = [
 ///
 /// Formes lues : « CD1 - Titre », « Disc 2 - Titre », « CD 03 · Titre »,
 /// « Disque 2 : Titre ». Mêmes exigences que [`marqueur_final`] : un mot de
-/// [`MOTS_DE_DISQUE`] (jamais `vol`), un numéro d'un ou deux chiffres qui ne
+/// [`MOTS_DE_DISQUE`] (jamais `vol`), un numéro de un à trois chiffres qui ne
 /// vaut pas zéro, et un titre non vide derrière. Le mot est un MOT :
 /// « Discovery 2 - X » ou « CDs 2 - X » n'ont pas de marqueur ; le numéro
-/// aussi : « CD1Titre » ou « CD 123 - X » non plus.
+/// aussi : « CD1Titre » ou « CD 1000 - X » non plus. Les zéros initiaux
+/// sont acceptés (« CD012 - Titre » donne le disque 12, #8617).
 ///
 /// ⚠️ Retirer ce marqueur ne suffit pas à former un coffret : [`coffrets`]
 /// exige toujours un SOCLE commun. « CD01 - Bruch… » et « CD02 - Brahms… »
@@ -219,7 +220,7 @@ pub fn marqueur_de_tete(nom: &str) -> Option<(String, u32)> {
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(apres_mot.len());
         let chiffres = &apres_mot[..chiffres_fin];
-        if chiffres.is_empty() || chiffres.len() > 2 {
+        if chiffres.is_empty() || chiffres.len() > 3 {
             continue;
         }
         let Some(numero) = chiffres.parse::<u32>().ok().filter(|&d| d > 0) else {
@@ -875,14 +876,67 @@ mod tests {
     }
 
     #[test]
+    fn marqueur_trois_chiffres_8617_garde_les_bornes() {
+        for (nom, numero) in [
+            ("CD001 - Titre", 1),
+            ("CD012 - Titre", 12),
+            ("CD100 - Titre", 100),
+            ("CD999 - Titre", 999),
+            ("Disc 123 : Titre", 123),
+        ] {
+            assert_eq!(
+                marqueur_de_tete(nom),
+                Some(("Titre".into(), numero)),
+                "8617 : numéro de disque à trois chiffres, {nom}"
+            );
+        }
+        for nom in [
+            "CD000 - Titre",
+            "CD1000 - Titre",
+            "CD001Titre",
+            "Vol. 2 - Titre",
+            "Side B - Titre",
+        ] {
+            assert_eq!(
+                marqueur_de_tete(nom),
+                None,
+                "8617 : marqueur ambigu ou hors bornes refusé, {nom}"
+            );
+        }
+    }
+
+    #[test]
+    fn marqueur_trois_chiffres_8617_exige_encore_un_titre_commun() {
+        let commun = coffrets(&[
+            alb(1, "CD001 - Suite", "/m/Suite/CD001 - Suite"),
+            alb(12, "CD012 - Suite", "/m/Suite/CD012 - Suite"),
+            alb(100, "CD100 - Suite", "/m/Suite/CD100 - Suite"),
+        ]);
+        assert_eq!(
+            commun.len(),
+            1,
+            "8617 : un seul coffret pour le titre commun"
+        );
+        assert_eq!(commun[0].disques, vec![(1, 1), (12, 12), (100, 100)]);
+        let distincts = coffrets(&[
+            alb(1, "CD001 - Bruch", "/m/Collection/CD001 - Bruch"),
+            alb(12, "CD012 - Brahms", "/m/Collection/CD012 - Brahms"),
+        ]);
+        assert!(
+            distincts.is_empty(),
+            "8617 : trois chiffres ne réunissent pas des albums distincts"
+        );
+    }
+
+    #[test]
     fn le_marqueur_de_tete_est_etroit() {
         // Le mot est un MOT.
         assert_eq!(marqueur_de_tete("Discovery 2 - Daft Punk"), None);
         assert_eq!(marqueur_de_tete("CDs 2 - Titre"), None);
-        // Le numéro est un NOMBRE d'un ou deux chiffres, jamais zéro, suivi
+        // Le numéro est un NOMBRE de un à trois chiffres, jamais zéro, suivi
         // d'une liaison.
         assert_eq!(marqueur_de_tete("CD1Titre"), None);
-        assert_eq!(marqueur_de_tete("CD 123 - Titre"), None);
+        assert_eq!(marqueur_de_tete("CD 1000 - Titre"), None);
         assert_eq!(marqueur_de_tete("CD 0 - Titre"), None);
         assert_eq!(marqueur_de_tete("CD - Titre"), None);
         // Un titre DERRIÈRE, sinon c'est un dossier de disque (« CD1 »).

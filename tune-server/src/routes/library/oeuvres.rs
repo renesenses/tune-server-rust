@@ -430,7 +430,7 @@ fn candidat(a: &Album, versions: &HashMap<i64, String>) -> Option<Candidat> {
 /// de ses pistes, comme dans la grille, #7725) : la fiche dit quelle version
 /// est en 2.0 et laquelle en 5.1. Clé absente quand les pistes ne le disent
 /// pas ; champ additif, un client qui l'ignore lit la réponse d'avant.
-fn version_json(a: &Album, nom: &Option<String>, canaux: &HashMap<i64, i64>) -> Value {
+fn version_json(a: &Album, nom: &Option<String>, canaux: &super::albums::CanauxParAlbum) -> Value {
     let mut v = json!({
         "id": a.id,
         "title": a.title,
@@ -453,16 +453,20 @@ fn version_json(a: &Album, nom: &Option<String>, canaux: &HashMap<i64, i64>) -> 
 }
 
 /// Les canaux de toutes les versions des œuvres `oeuvres`, en UNE requête.
-fn canaux_des_versions(state: &AppState, oeuvres: &[&Oeuvre]) -> HashMap<i64, i64> {
+fn canaux_des_versions(state: &AppState, oeuvres: &[&Oeuvre]) -> super::albums::CanauxParAlbum {
     let ids: Vec<i64> = oeuvres
         .iter()
         .flat_map(|o| o.versions.iter().map(|v| v.id))
         .collect();
     let repo = AlbumRepo::with_backend(state.backend.clone());
-    super::albums::canaux_max_par_album(&repo, &ids)
+    super::albums::canaux_par_album(&repo, &ids)
 }
 
-fn oeuvre_json(o: &Oeuvre, albums: &HashMap<i64, &Album>, canaux: &HashMap<i64, i64>) -> Value {
+fn oeuvre_json(
+    o: &Oeuvre,
+    albums: &HashMap<i64, &Album>,
+    canaux: &super::albums::CanauxParAlbum,
+) -> Value {
     let preferee = albums.get(&o.preferee).map(|a| {
         let mut j = a.to_json();
         if let Some(obj) = j.as_object_mut() {

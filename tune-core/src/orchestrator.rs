@@ -8,7 +8,11 @@ use tracing::{debug, info, warn};
 use crate::library::local_path::resolve_existing_local_path;
 
 mod transcodage;
+#[doc(hidden)]
+pub use transcodage::transcoder_vers_un_fichier_8558;
 use transcodage::*;
+/// #8558 (volet B) — piste trop lourde pour le bras fichier : WAV progressif.
+mod bascule_progressive_8558;
 
 /// A second play of the SAME track pushed to a NETWORK renderer within this
 /// window is treated as a redundant re-trigger (a slow pre-transcode resolve
@@ -1372,6 +1376,10 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     ecoutes_en_attente: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEnAttente>>,
+    /// #8107 — la dernière écoute écrite par chaque zone, pour qu'un groupe
+    /// de zones (`zone_groups`) ne compte qu'une écoute par titre. Voir
+    /// `ecoute_validee_7852`.
+    ecoutes_ecrites: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEcrite>>,
     /// #7974 — le suivi du bail d'écoute de chaque zone en lecture. Voir
     /// `bail_parental_7974`.
     ///
@@ -1987,6 +1995,7 @@ impl PlaybackOrchestrator {
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
+            ecoutes_ecrites: std::sync::Mutex::new(HashMap::new()),
             suivis_de_bail: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
@@ -2173,6 +2182,10 @@ mod sourdine_a_la_piste_8151;
 mod depart_muet_airplay2_8402;
 #[cfg(test)]
 mod sourdine_a_la_piste_8151_tests;
+// #8165 — un geste de volume lève la sourdine de la zone, sur toutes les sorties.
+mod volume_leve_la_sourdine_8165;
+#[cfg(test)]
+mod volume_leve_la_sourdine_8165_tests;
 // #8437 — groupe mixte : la sortie locale part `sync_delay_ms` plus tard.
 #[cfg(all(test, feature = "local-audio"))]
 mod retard_groupe_mixte_8437_tests;

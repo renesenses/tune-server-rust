@@ -488,6 +488,17 @@ pub mod sql {
             .join(", ")
     }
 
+    /// #7572 — renommer SEULEMENT si le nom est encore celui qu'on croit :
+    /// un nom choisi par l'utilisateur entre-temps n'est jamais écrasé.
+    pub fn renommer_si_nom_inchange<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET name = {} WHERE id = {} AND name = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
     pub fn rename_generic_local_label<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET name = {} \
@@ -2942,6 +2953,21 @@ impl ZoneRepo {
     /// EVERY local zone with the generic label, so a machine with several
     /// DACs showed indistinguishable twins (forum #1233, Alain Bonnel). Only
     /// the exact generic labels are touched — a user-renamed zone never is.
+    /// #7572 — donne `nouveau` à la zone `zone_id` si, et seulement si, elle
+    /// s'appelle encore `ancien` (le nom que la découverte lui avait donné).
+    /// Rend le nombre de lignes touchées : `0` quand l'utilisateur l'a
+    /// renommée, et c'est voulu.
+    pub fn renommer_si_nom_inchange(
+        &self,
+        zone_id: i64,
+        ancien: &str,
+        nouveau: &str,
+    ) -> Result<usize, String> {
+        let sql = self.dialect_sql(sql::renommer_si_nom_inchange, sql::renommer_si_nom_inchange);
+        let params: [&dyn ToSqlValue; 3] = [&nouveau, &zone_id, &ancien];
+        self.db.execute(&sql, &params)
+    }
+
     pub fn rename_generic_local_label(
         &self,
         zone_id: i64,

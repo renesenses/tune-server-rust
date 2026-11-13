@@ -248,6 +248,33 @@ pub fn choose_output_rate(dsd_rate: u32) -> u32 {
     }
 }
 
+/// #8428 — la cadence à laquelle DÉCIMER un DSD pour servir `cible`.
+///
+/// Le décimateur n'accepte qu'un rapport entier (`dsd_rate / cible`) : un
+/// rapport fractionnaire était TRONQUÉ (DSD64 vers 48 kHz : rapport 58 au lieu
+/// de 58,8, PCM à 48,66 kHz étiqueté 48 kHz). Une cadence fixe de zone hors
+/// famille (48 kHz pour un convolueur) est donc décimée DANS LA FAMILLE de la
+/// source, à la plus petite cadence `dsd_rate / 2^k` (rapport ≥ 8) qui couvre
+/// `cible` — 88,2 kHz pour 48 kHz —, puis rééchantillonnée vers `cible` comme
+/// un PCM. Même règle que le Convertisseur (#5481,
+/// `convertisseur_dsd::frequence_de_decimation`) : on rééchantillonne vers le
+/// bas, sauf au-delà de `dsd_rate / 8`. Un rapport entier rend `cible`
+/// elle-même : rien ne change pour les cadences de la famille.
+pub fn cadence_de_decimation(dsd_rate: u32, cible: u32) -> u32 {
+    const DECIMATION_MINIMALE: u32 = 8;
+    if cible == 0 || dsd_rate == 0 {
+        return choose_output_rate(dsd_rate);
+    }
+    if dsd_rate.is_multiple_of(cible) {
+        return cible;
+    }
+    let mut rapport = DECIMATION_MINIMALE;
+    while dsd_rate.is_multiple_of(rapport * 2) && dsd_rate / (rapport * 2) >= cible {
+        rapport *= 2;
+    }
+    dsd_rate / rapport
+}
+
 /// Streaming DSD-to-PCM converter that processes DSD data in chunks.
 ///
 /// Unlike `DsdToPcmConverter::process()` which loads the entire DSD file
@@ -988,6 +1015,23 @@ mod tests {
                 "alternating DFF pattern should be near-silence, got {s}"
             );
         }
+    }
+
+    #[test]
+    fn cadence_de_decimation_8428_hors_famille_puis_dans_la_famille() {
+        // Hors famille : décimé à 88,2 kHz, le rééchantillonneur fait le reste.
+        assert_eq!(cadence_de_decimation(2_822_400, 48_000), 88_200);
+        assert_eq!(cadence_de_decimation(2_822_400, 96_000), 176_400);
+        assert_eq!(cadence_de_decimation(2_822_400, 192_000), 352_800);
+        // Au-delà de dsd / 8 : jamais un rapport sous 8, on remonte ensuite.
+        assert_eq!(cadence_de_decimation(2_822_400, 384_000), 352_800);
+        assert_eq!(cadence_de_decimation(5_644_800, 384_000), 705_600);
+        // Dans la famille : la cible, inchangée.
+        assert_eq!(cadence_de_decimation(2_822_400, 44_100), 44_100);
+        assert_eq!(cadence_de_decimation(2_822_400, 176_400), 176_400);
+        // DSD de la famille 48 kHz : rapport entier, inchangé.
+        assert_eq!(cadence_de_decimation(3_072_000, 48_000), 48_000);
+        assert_eq!(cadence_de_decimation(3_072_000, 44_100), 48_000);
     }
 
     #[test]

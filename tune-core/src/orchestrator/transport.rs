@@ -2364,6 +2364,9 @@ impl PlaybackOrchestrator {
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
+                    local_output.set_fixed_sample_rate(crate::audio::frequence_fixe::active(
+                        &self.db, zone_id,
+                    ));
                     // #3973 — « bit-perfect strict » de la zone, posé à chaque
                     // lecture comme PURE : c'est lui que `play_url` transmet à
                     // l'ouverture cpal (`DemandeDOuverture::strict_bitperfect`).
@@ -2396,7 +2399,8 @@ impl PlaybackOrchestrator {
                     // zone has crossfeed disabled OR is in PURE mode, so a PURE
                     // zone stays bit-perfect. Rebuilt per-play at the resolved
                     // stream sample rate so the delay line matches the DAC clock.
-                    let cf_sr = media.sample_rate.unwrap_or(44100);
+                    let cf_sr = crate::audio::frequence_fixe::active(&self.db, zone_id)
+                        .unwrap_or_else(|| media.sample_rate.unwrap_or(44100));
                     local_output.set_crossfeed(self.load_crossfeed_processor(zone_id, cf_sr));
                     // #7614 — le greffon de suréchantillonnage de la zone :
                     // `None` sous PURE, sans Premium, sans greffon installé,

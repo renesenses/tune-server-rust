@@ -1037,6 +1037,9 @@ impl PlaybackOrchestrator {
                 .and_then(|z| z.max_sample_rate),
             crate::device_catalog::resolve_zone_quirks(&self.db, req.zone_id).max_sample_rate,
         );
+        if let Some(rate) = crate::audio::frequence_fixe::cible(&self.db, req.zone_id, plafond)? {
+            return Ok((rate != stream_data.quality.sample_rate).then_some(rate));
+        }
         match plafond_de_flux_de_service(
             stream_data.quality.sample_rate,
             plafond,
@@ -1234,6 +1237,11 @@ impl PlaybackOrchestrator {
                 "streaming_zone_max_sample_rate_cap_applied"
             );
             sr = cible;
+        }
+        if let Some(rate) =
+            crate::audio::frequence_fixe::cible(&self.db, req.zone_id, zone_max_sample_rate)?
+        {
+            sr = rate;
         }
         // Local output: 32-bit to avoid 24-bit byte misalignment noise
         // (see local_needs_wav comment in resolve_local_track).

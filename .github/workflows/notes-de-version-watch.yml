@@ -47,6 +47,13 @@ permissions:
   contents: read
   issues: write
 
+# Annule l'exécution précédente de la même PR dès qu'un nouveau commit arrive.
+# Les exécutions hors PR (main, tag, planifiées, manuelles) ne sont JAMAIS
+# interrompues : l'annulation ne vaut que pour l'événement pull_request.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # ───────────────────────────────────────────────────────────────────────────
   # La contre-épreuve (#4461). Le périmètre de la sonde — les versions de Tune,

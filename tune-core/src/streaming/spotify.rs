@@ -58,7 +58,12 @@ pub fn default_redirect_uri(api_port: u16) -> String {
 /// #6018 — `streaming` connecte librespot au compte ; les deux portées
 /// `*-playback-state` laissent l'API Web désigner et piloter son appareil.
 /// Un compte relié AVANT ce changement doit se reconnecter une fois.
-const SCOPES: &str = "user-read-private user-library-read playlist-read-private playlist-modify-private playlist-modify-public streaming user-read-playback-state user-modify-playback-state";
+/// Février 2026 — `user-library-modify`, `user-follow-read` et
+/// `user-follow-modify` : ajouter ou retirer un favori (`PUT`/`DELETE
+/// /me/library`) et lire les artistes suivis (`/me/following`) les exigent.
+/// Ils manquaient : le cœur « favori » rendait 403 sur Spotify. Un compte
+/// relié avant ne les a pas tant qu'il ne s'est pas reconnecté.
+const SCOPES: &str = "user-read-private user-library-read user-library-modify user-follow-read user-follow-modify playlist-read-private playlist-modify-private playlist-modify-public streaming user-read-playback-state user-modify-playback-state";
 
 pub struct SpotifyService {
     client: Client,
@@ -118,6 +123,13 @@ pub struct SpotifyService {
     /// point d'accès est fermé aux applications créées après le 27/11/2024.
     /// La rubrique est alors vide, sans erreur, et n'est plus redemandée.
     selection_retiree: AtomicBool,
+    /// Février 2026 — Spotify a retiré `GET /browse/new-releases` aux
+    /// applications en mode développement : la rubrique « Nouveautés » est
+    /// alors vide, sans erreur, et n'est plus redemandée.
+    nouveautes_retirees: AtomicBool,
+    /// Février 2026 — `GET /browse/categories` et
+    /// `/browse/categories/{id}/…` retirés de même : les genres sont vides.
+    genres_retires: AtomicBool,
 }
 
 impl Default for SpotifyService {
@@ -680,6 +692,8 @@ impl SpotifyService {
             relais: None,
             titres_phares_retires: AtomicBool::new(false),
             selection_retiree: AtomicBool::new(false),
+            nouveautes_retirees: AtomicBool::new(false),
+            genres_retires: AtomicBool::new(false),
         }
     }
 
@@ -692,6 +706,8 @@ impl SpotifyService {
         self.titres_phares_retires.store(false, Ordering::Relaxed);
         // #8399 — le refus de la sélection vaut pour UNE application.
         self.selection_retiree.store(false, Ordering::Relaxed);
+        self.nouveautes_retirees.store(false, Ordering::Relaxed);
+        self.genres_retires.store(false, Ordering::Relaxed);
         self.tentatives.clear();
     }
 
@@ -1009,6 +1025,45 @@ impl SpotifyService {
             .map(|p| p.split_whitespace().any(|x| x == "streaming"))
     }
 
+    /// La liaison porte-t-elle la portée `portee` ? `None` : on ne le sait
+    /// pas (liaison antérieure à l'enregistrement des portées).
+    pub fn porte(&self, portee: &str) -> Option<bool> {
+        self.portees
+            .as_deref()
+            .map(|p| p.split_whitespace().any(|x| x == portee))
+    }
+
+    /// Février 2026 — ajouter (`ajout`) ou retirer un favori par
+    /// `/me/library`. Une liaison sans la portée d'écriture (compte relié
+    /// avant #8579) est refusée AVANT l'appel, avec le code stable
+    /// [`CODE_RECONNEXION_FAVORIS`] : l'écran propose « Reconnecter Spotify ».
+    /// Un 403 de Spotify sur une liaison dont on ignore les portées vaut le
+    /// même refus ; avec la portée, un 403 reste l'erreur de Spotify.
+    async fn ecrire_favori(
+        &self,
+        ajout: bool,
+        fav_type: &str,
+        item_id: &str,
+    ) -> Result<(), TuneError> {
+        let path = chemin_de_bibliotheque(fav_type, item_id)?;
+        let portee = portee_du_favori(fav_type);
+        if self.porte(portee) == Some(false) {
+            return Err(refus_reconnexion_favoris(portee));
+        }
+        let resultat = if ajout {
+            self.api_put(&path).await
+        } else {
+            self.api_delete(&path).await
+        };
+        match resultat {
+            Ok(()) => Ok(()),
+            Err(e) if e.ends_with(": 403") && self.porte(portee).is_none() => {
+                Err(refus_reconnexion_favoris(portee))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// #6018 — l'identifiant API Web de l'appareil Connect nommé `nom`.
     pub async fn appareil_par_nom(&self, nom: &str) -> Result<Option<String>, String> {
         let d = self.api_get("/me/player/devices").await?;
@@ -1096,6 +1151,33 @@ impl SpotifyService {
                     ))
                 }
             }
+        }
+    }
+
+    /// « Le dernier geste gagne » — met en pause l'appareil Connect `nom`
+    /// (`PUT /me/player/pause?device_id=`). Appareil absent : rien à faire.
+    pub async fn mettre_en_pause_l_appareil(&self, nom: &str) -> Result<(), String> {
+        let token = self
+            .access_token
+            .clone()
+            .ok_or("Spotify n'est pas connecté")?;
+        let Some(appareil) = self.appareil_par_nom(nom).await? else {
+            return Ok(());
+        };
+        let resp = self
+            .client
+            .put(format!(
+                "{}/me/player/pause?device_id={}",
+                self.api_base,
+                urlencoding::encode(&appareil)
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| format!("spotify api: {e}"))?;
+        match resp.status().as_u16() {
+            200 | 202 | 204 => Ok(()),
+            statut => Err(format!("Spotify a refusé la pause (HTTP {statut})")),
         }
     }
 
@@ -1251,6 +1333,32 @@ impl SpotifyService {
             return Err(format!("spotify DELETE {path}: {status}"));
         }
         Ok(())
+    }
+
+    /// Février 2026 — un point d'accès que Spotify a retiré aux applications
+    /// en mode développement répond 403 (#8399, #8485). `None` : retiré, la
+    /// rubrique est vide ; le retrait est mémorisé dans `retire` (une seule
+    /// requête, puis plus rien jusqu'au changement d'application). Tout autre
+    /// refus reste une erreur.
+    async fn lire_ou_retire(
+        &self,
+        chemin: &str,
+        route: &'static str,
+        retire: &AtomicBool,
+    ) -> Result<Option<serde_json::Value>, TuneError> {
+        if retire.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match self.api_get(chemin).await {
+            Ok(d) => Ok(Some(d)),
+            Err(e) if statut_du_refus(&e) == Some(403) => {
+                if !retire.swap(true, Ordering::Relaxed) {
+                    info!(route, "spotify_point_d_acces_retire");
+                }
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn api_post(
@@ -1841,6 +1949,8 @@ impl StreamingService for SpotifyService {
         self.session_refusee = false;
         self.titres_phares_retires.store(false, Ordering::Relaxed);
         self.selection_retiree.store(false, Ordering::Relaxed);
+        self.nouveautes_retirees.store(false, Ordering::Relaxed);
+        self.genres_retires.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2073,11 +2183,32 @@ impl StreamingService for SpotifyService {
     }
 
     async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
-        let data = self.api_get("/browse/new-releases?limit=50").await?;
+        // Février 2026 — retiré par Spotify aux applications en mode
+        // développement : rubrique vide, sans « HTTP 502 » brut à l'écran.
+        let Some(data) = self
+            .lire_ou_retire(
+                "/browse/new-releases?limit=50",
+                "/browse/new-releases",
+                &self.nouveautes_retirees,
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
         Ok(data["albums"]["items"]
             .as_array()
             .map(|i| i.iter().map(Self::map_album).collect())
             .unwrap_or_default())
+    }
+
+    fn rubrique_retiree(&self, rubrique: RubriqueRetirable) -> bool {
+        let drapeau = match rubrique {
+            RubriqueRetirable::Selection => &self.selection_retiree,
+            RubriqueRetirable::Nouveautes => &self.nouveautes_retirees,
+            RubriqueRetirable::Genres => &self.genres_retires,
+            RubriqueRetirable::TitresPhares => &self.titres_phares_retires,
+        };
+        drapeau.load(Ordering::Relaxed)
     }
 
     async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
@@ -2106,7 +2237,17 @@ impl StreamingService for SpotifyService {
     }
 
     async fn get_genres(&self, _parent_id: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
-        let data = self.api_get("/browse/categories?limit=50").await?;
+        // Février 2026 — retiré par Spotify, comme les nouveautés.
+        let Some(data) = self
+            .lire_ou_retire(
+                "/browse/categories?limit=50",
+                "/browse/categories",
+                &self.genres_retires,
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
         Ok(data["categories"]["items"]
             .as_array()
             .map(|i| i.iter().map(Self::map_category_to_genre).collect())
@@ -2118,11 +2259,16 @@ impl StreamingService for SpotifyService {
         genre_id: &str,
         limit: usize,
     ) -> Result<Vec<StreamAlbum>, TuneError> {
-        let data = self
-            .api_get(&format!(
-                "/browse/categories/{genre_id}/playlists?limit={limit}"
-            ))
-            .await?;
+        let Some(data) = self
+            .lire_ou_retire(
+                &format!("/browse/categories/{genre_id}/playlists?limit={limit}"),
+                "/browse/categories/{id}/playlists",
+                &self.genres_retires,
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
         let playlists: Vec<String> = data["playlists"]["items"]
             .as_array()
             .map(|i| {
@@ -2179,25 +2325,11 @@ impl StreamingService for SpotifyService {
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
-        let path = match fav_type {
-            "tracks" => format!("/me/tracks?ids={item_id}"),
-            "albums" => format!("/me/albums?ids={item_id}"),
-            "artists" => format!("/me/following?type=artist&ids={item_id}"),
-            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
-        };
-        self.api_put(&path).await?;
-        Ok(())
+        self.ecrire_favori(true, fav_type, item_id).await
     }
 
     async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
-        let path = match fav_type {
-            "tracks" => format!("/me/tracks?ids={item_id}"),
-            "albums" => format!("/me/albums?ids={item_id}"),
-            "artists" => format!("/me/following?type=artist&ids={item_id}"),
-            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
-        };
-        self.api_delete(&path).await?;
-        Ok(())
+        self.ecrire_favori(false, fav_type, item_id).await
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         // #8050 — toutes les pages, pas seulement les 50 premières.
@@ -2385,6 +2517,45 @@ pub fn motif_appareil_absent(nom: &str) -> String {
         "L'appareil Spotify Connect « {nom} » n'apparaît pas : librespot ne s'est pas connecté \
          au compte (Spotify Premium est exigé)."
     )
+}
+
+/// #8579 — code stable du refus « reconnecter Spotify pour gérer les
+/// favoris » : la liaison du compte ne porte pas la portée d'écriture.
+pub const CODE_RECONNEXION_FAVORIS: &str = "spotify_reconnexion_favoris";
+
+/// La portée qu'exige l'écriture d'un favori de ce type.
+fn portee_du_favori(fav_type: &str) -> &'static str {
+    if fav_type == "artists" {
+        "user-follow-modify"
+    } else {
+        "user-library-modify"
+    }
+}
+
+fn refus_reconnexion_favoris(portee: &str) -> TuneError {
+    refus(
+        CODE_RECONNEXION_FAVORIS,
+        format!(
+            "spotify: la liaison du compte ne porte pas la portee {portee} ; reconnecter Spotify une fois pour gerer les favoris"
+        ),
+    )
+}
+
+/// Février 2026 — Spotify a retiré `PUT`/`DELETE /me/tracks`, `/me/albums`
+/// et `/me/following` : un favori s'ajoute ou se retire par `/me/library`,
+/// qui prend des URI (`spotify:track:…`, `spotify:album:…`,
+/// `spotify:artist:…`). L'identifiant reçu peut déjà être une URI.
+fn chemin_de_bibliotheque(fav_type: &str, item_id: &str) -> Result<String, TuneError> {
+    let genre = match fav_type {
+        "tracks" => "track",
+        "albums" => "album",
+        "artists" => "artist",
+        _ => return Err(format!("unknown favorite type: {fav_type}").into()),
+    };
+    let id = item_id.trim();
+    let id = id.strip_prefix(&format!("spotify:{genre}:")).unwrap_or(id);
+    let uri = format!("spotify:{genre}:{id}");
+    Ok(format!("/me/library?uris={}", urlencoding::encode(&uri)))
 }
 
 /// #8399 — le statut HTTP d'un refus rendu par `api_get`
@@ -3405,12 +3576,16 @@ mod tests {
                     )
                 }),
             )
+            // Un 403 de `/browse/new-releases` est désormais le retrait
+            // documenté de février 2026 (rubrique vide, voir
+            // `spotify_rubriques_retirees_2026_tests`) ; tout AUTRE refus
+            // reste une erreur, ce que #6825 garde.
             .route(
                 "/v1/browse/new-releases",
                 axum::routing::get(|| async {
                     (
-                        axum::http::StatusCode::FORBIDDEN,
-                        axum::Json(json!({"error": {"status": 403, "message": "Forbidden"}})),
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": {"status": 500, "message": "Server error"}})),
                     )
                 }),
             )
@@ -3432,9 +3607,9 @@ mod tests {
         let err = svc
             .get_new_releases()
             .await
-            .expect_err("#6825 : un 403 de /browse/new-releases rendait une liste vide")
+            .expect_err("#6825 : un refus de /browse/new-releases rendait une liste vide")
             .to_string();
-        assert!(err.contains("403") && err.contains("Forbidden"), "{err}");
+        assert!(err.contains("500") && err.contains("Server error"), "{err}");
         assert!(!err.contains("jeton"), "le jeton ne sort jamais : {err}");
         let err = svc
             .get_featured()
@@ -3666,9 +3841,17 @@ mod favoris_pagination_8050_tests;
 mod playlists_items_8193_tests;
 
 #[cfg(test)]
+#[path = "spotify_rubriques_retirees_2026_tests.rs"]
+mod spotify_rubriques_retirees_2026_tests;
+
+#[cfg(test)]
 #[path = "spotify_titres_phares_8485_tests.rs"]
 mod titres_phares_8485_tests;
 
 #[cfg(test)]
 #[path = "spotify_albums_artiste_8479_tests.rs"]
 mod albums_artiste_8479_tests;
+
+#[cfg(test)]
+#[path = "spotify_favoris_bibliotheque_2026_tests.rs"]
+mod favoris_bibliotheque_2026_tests;

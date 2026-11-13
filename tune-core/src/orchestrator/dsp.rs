@@ -2483,6 +2483,10 @@ impl PlaybackOrchestrator {
         crate::audio::surechantillonnage::ChoixSurechantillonnage,
         crate::audio::surechantillonnage::Ecarte,
     > {
+        // #8428 — la cadence fixe porte déjà le flux décodé : ne pas la multiplier.
+        if crate::audio::frequence_fixe::active(&self.db, zone_id).is_some() {
+            return Err(crate::audio::surechantillonnage::Ecarte::FrequenceFixe);
+        }
         let premium = self
             .license
             .as_ref()
@@ -2523,6 +2527,8 @@ impl PlaybackOrchestrator {
                 .downcast_ref::<crate::outputs::local::LocalOutput>()
             {
                 local.set_decision_surechantillonnage(choix);
+                local
+                    .set_fixed_sample_rate(crate::audio::frequence_fixe::active(&self.db, zone_id));
             }
         }
     }

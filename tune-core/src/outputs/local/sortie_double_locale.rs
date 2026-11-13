@@ -621,6 +621,41 @@ mod tests {
         assert!(!emplacement.est_actif());
     }
 
+    /// #8609 — la recopie vers la seconde sortie, que le rappel `f32` de A
+    /// fait à chaque période (`rendre_la_periode_de_a` → `recopier_la_periode`
+    /// → `SortieMultiple::traiter` → `Recopieur`), n'appelle pas
+    /// l'allocateur : `malloc_trim` ne peut pas la faire attendre. Le premier
+    /// rappel (réglage du retard commun) compris. `rendre_la_periode_de_a`
+    /// elle-même prend un `cpal::OutputCallbackInfo`, que seul cpal construit :
+    /// ses deux autres étapes sont `render_local_shared_f32_callback` (gardé
+    /// dans `ringbuf_tests`) et une boucle de gain.
+    #[test]
+    fn la_recopie_vers_b_ne_fait_aucune_allocation() {
+        let emplacement = emplacement_vide();
+        let anneau = Arc::new(AnneauDeB::nouveau(48_000));
+        let autre = Arc::new(AnneauDeB::nouveau(48_000));
+        emplacement.installer(SortieMultiple::nouvelle(
+            2,
+            48_000,
+            0.010,
+            vec![
+                (Recopieur::nouveau(2, 48_000, 48_000, 0.010), anneau.clone()),
+                (Recopieur::nouveau(2, 48_000, 44_100, 0.010), autre.clone()),
+            ],
+        ));
+        let mut periode = vec![0.25f32; 960];
+        for i in 0..20 {
+            periode.fill(0.25);
+            if i == 10 {
+                emplacement.demander_un_reajustement();
+            }
+            super::super::ringbuf_tests::assert_no_allocation(|| {
+                recopier_la_periode(&emplacement, &mut periode, Some(0.005))
+            });
+        }
+        assert!(anneau.en_attente() > 0 && autre.en_attente() > 0);
+    }
+
     /// #6132 étape 2 — volume par membre : B suit SON curseur, composé avec le
     /// ReplayGain de la piste ; la zone B coupée (curseur à 0) se tait même
     /// quand A joue fort ; sans curseur connu, B suit A.

@@ -1050,7 +1050,7 @@ pub(super) async fn artist_albums(
         Default::default()
     });
     // #7725 — `max_channels` de chaque album, pour le filtre Multicanal.
-    let canaux = super::albums::canaux_max_par_album(&repo, &ids);
+    let canaux = super::albums::canaux_par_album(&repo, &ids);
     let items: Vec<(bool, Value)> = items
         .iter()
         .map(|a| {
@@ -1132,7 +1132,7 @@ pub(super) async fn artist_albums(
         let mut albums = albums;
         repo.attacher_added_at(&mut albums);
         let ids: Vec<i64> = albums.iter().filter_map(|a| a.id).collect();
-        let canaux = super::albums::canaux_max_par_album(&repo, &ids);
+        let canaux = super::albums::canaux_par_album(&repo, &ids);
         let albums: Vec<Value> = albums
             .iter()
             .map(|a| {

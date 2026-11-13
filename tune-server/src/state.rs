@@ -510,6 +510,13 @@ impl AppState {
         // Build the backend: PG when configured + feature-enabled, else SQLite.
         let backend: Arc<dyn DbBackend> =
             Self::create_backend(selected_engine, &tune_config, sqlite_db.as_ref(), db_path)?;
+        // #7876 — les dossiers du fichier de configuration servent de repli
+        // quand le réglage `music_dirs` est absent (ordre des répertoires,
+        // exemplaire lu), comme `GET /system/config` qui les affiche.
+        tune_core::library::exemplaires::inscrire_les_dossiers_du_fichier(
+            &backend,
+            &tune_config.music_dirs,
+        );
 
         // Le ménage des `tune-transcode-*` laissés par un plantage ne se fait
         // PAS ici : il se fait au DÉMARRAGE du processus, dans
@@ -643,6 +650,16 @@ impl AppState {
                             tune_core::streaming::spotify_lecture::lecture_activee(&db)
                         })
                     },
+                ),
+            ),
+        );
+        // #8565 — une lecture lancée depuis l'application Spotify vers le
+        // récepteur : session PCM en direct sur la zone exposée.
+        orch.sources_pcm().inscrire(
+            tune_core::streaming::spotify_connect_session::SOURCE,
+            Arc::new(
+                tune_core::streaming::spotify_connect_session::FournisseurConnect::new(
+                    spotify_connect.clone(),
                 ),
             ),
         );

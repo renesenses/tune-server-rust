@@ -100,6 +100,7 @@ pub mod fondu_de_zone;
 /// de sortie n'est touché : c'est tout le sujet du ticket.
 pub mod fondu_enchaine;
 pub mod formats;
+pub mod frequence_fixe;
 /// #6721 — garde générale contre les montées brusques du volume.
 pub mod garde_de_hausse;
 pub mod http_range;
