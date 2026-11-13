@@ -11057,8 +11057,14 @@ async fn diagnostic_8259_frequence_fixe_8428_conserve_le_refus() {
     settings
         .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
         .unwrap();
-    let refus = orch.decision_du_surechantillonneur(zone_id, false).err().unwrap();
-    assert_eq!(refus, crate::audio::surechantillonnage::Ecarte::FrequenceFixe);
+    let refus = orch
+        .decision_du_surechantillonneur(zone_id, false)
+        .err()
+        .unwrap();
+    assert_eq!(
+        refus,
+        crate::audio::surechantillonnage::Ecarte::FrequenceFixe
+    );
     assert_eq!(refus.code(), "fixed_rate");
     assert!(orch.choix_du_surechantillonneur(zone_id, false).is_none());
 }
