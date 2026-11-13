@@ -127,7 +127,8 @@ async fn cover_passe_avant_front() {
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(d.join("front.png"), png(300)).unwrap();
     std::fs::write(d.join("cover.png"), png(300)).unwrap();
-    let source = source_de_la_pochette(&b.state, d.to_str().unwrap()).unwrap();
+    let source = source_de_la_pochette(&b.state, d.to_str().unwrap())
+        .unwrap_or_else(|_| panic!("la source se lit"));
     assert_eq!(source, SourcePochette::Image(d.join("cover.png")));
 }
 
@@ -152,7 +153,8 @@ async fn sans_image_le_dossier_prend_la_pochette_de_son_album() {
         ))
         .unwrap();
 
-    let source = source_de_la_pochette(&b.state, artiste.to_str().unwrap()).unwrap();
+    let source = source_de_la_pochette(&b.state, artiste.to_str().unwrap())
+        .unwrap_or_else(|_| panic!("la source se lit"));
     assert_eq!(source, SourcePochette::Album(hash.to_string()));
 
     let (statut, entetes, corps) = demander(&b, &artiste, Some("128"), None).await;
