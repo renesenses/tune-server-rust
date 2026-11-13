@@ -380,6 +380,10 @@ impl OaatOutput {
         } else {
             format!("oaat:{endpoint_id}")
         };
+        let native_dsd_active = Arc::new(AtomicBool::new(false));
+        // #8647 — le chemin du signal lit ce drapeau pour dire « DSD natif »
+        // au lieu de la conversion WAV que l'orchestrateur a préparée.
+        crate::outputs::dsd_natif_oaat_8647::inscrire(&device_id, &native_dsd_active);
         Self {
             name,
             device_id,
@@ -389,7 +393,7 @@ impl OaatOutput {
             stream_counter: Arc::new(AtomicU32::new(1)),
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
-            native_dsd_active: Arc::new(AtomicBool::new(false)),
+            native_dsd_active,
             direct_pcm_active: Arc::new(AtomicBool::new(false)),
             chain_exhausted: Arc::new(AtomicBool::new(false)),
             refus_negociation: Arc::new(std::sync::Mutex::new(None)),
