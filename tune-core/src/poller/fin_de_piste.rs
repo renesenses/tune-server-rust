@@ -138,6 +138,11 @@ impl PositionPoller {
             .as_ref()
             .is_some_and(|np| np.source == "upnp" && np.track_id.is_none())
         {
+            info!(
+                zone_id,
+                motif = "controleur_upnp",
+                "radio_fin_de_file_ecartee"
+            );
             self.orchestrator.stop(zone_id, device_id).await;
             return;
         }
@@ -161,7 +166,16 @@ impl PositionPoller {
         // même réglage coupé : elles ne valent que pour cette fin-là.
         use crate::playback::radio_fin_de_file as rff;
         let photo_de_fin_voulue = rff::prendre_fin_voulue(zone_id);
-        if mode != AutoplayMode::Off {
+        if mode == AutoplayMode::Off {
+            // Bertrand, 13/11 : « chez moi il ne se lance jamais ». La raison
+            // d'une fin de file sans radio se lit désormais au journal, en
+            // INFO, sous un seul nom d'évènement.
+            info!(
+                zone_id,
+                motif = "reglage_coupe",
+                "radio_fin_de_file_ecartee"
+            );
+        } else {
             let queue = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
             // La file, lue UNE fois pour toute la décision.
             let mut file = queue.get_ordered(zone_id).unwrap_or_default();
@@ -227,6 +241,21 @@ impl PositionPoller {
                         &deja_de_service,
                     )
                     .await;
+                if ajoutees == 0 {
+                    info!(
+                        zone_id,
+                        motif = "aucun_titre_similaire",
+                        mode = mode.as_str(),
+                        "radio_fin_de_file_ecartee"
+                    );
+                } else {
+                    info!(
+                        zone_id,
+                        ajoutees,
+                        mode = mode.as_str(),
+                        "radio_fin_de_file_lancee"
+                    );
+                }
                 let lot = rff::marquer_les_ajouts(&self.db, zone_id, &avant, ajoutees);
                 if !lot.is_empty() {
                     let marquees = lot.len();
