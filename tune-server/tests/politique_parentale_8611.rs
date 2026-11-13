@@ -267,28 +267,33 @@ async fn superviser(app: &axum::Router) {
     assert_eq!(statut, StatusCode::OK, "{corps}");
 }
 
-/// Une playlist (700, 800) et les favoris (artiste, album, piste des deux
-/// artistes ; un favori de service de chacun) pour chaque profil.
-async fn garnir(app: &axum::Router) -> i64 {
-    let (statut, p) = appel(
-        app,
-        "POST",
-        "/api/v1/playlists",
-        ADMIN,
-        Some(json!({"name": "Mélange 8611"})),
-    )
-    .await;
-    assert!(statut.is_success(), "{statut} {p}");
-    let pid = p["id"].as_i64().expect("identifiant de la playlist");
-    let (statut, r) = appel(
-        app,
-        "POST",
-        &format!("/api/v1/playlists/{pid}/tracks"),
-        ADMIN,
-        Some(json!({"track_ids": [700, 800]})),
-    )
-    .await;
-    assert!(statut.is_success(), "{statut} {r}");
+/// Une playlist (700, 800) par profil (elles sont à leur propriétaire) et
+/// les favoris (artiste, album, piste des deux artistes ; un favori de
+/// service de chacun) pour chaque profil. Rend les playlists (admin, enfant).
+async fn garnir(app: &axum::Router) -> (i64, i64) {
+    let mut pids = Vec::new();
+    for profil in [ADMIN, ENFANT] {
+        let (statut, p) = appel(
+            app,
+            "POST",
+            "/api/v1/playlists",
+            profil,
+            Some(json!({"name": "Mélange 8611"})),
+        )
+        .await;
+        assert!(statut.is_success(), "{statut} {p}");
+        let pid = p["id"].as_i64().expect("identifiant de la playlist");
+        let (statut, r) = appel(
+            app,
+            "POST",
+            &format!("/api/v1/playlists/{pid}/tracks"),
+            profil,
+            Some(json!({"track_ids": [700, 800]})),
+        )
+        .await;
+        assert!(statut.is_success(), "{statut} {r}");
+        pids.push(pid);
+    }
     for profil in [ADMIN, ENFANT] {
         for (genre, id) in [
             ("artist", 7),
@@ -326,7 +331,7 @@ async fn garnir(app: &axum::Router) -> i64 {
             assert!(statut.is_success(), "{statut} {r}");
         }
     }
-    pid
+    (pids[0], pids[1])
 }
 
 fn contient(corps: &Value, aiguille: &str) -> bool {
@@ -336,8 +341,13 @@ fn contient(corps: &Value, aiguille: &str) -> bool {
 #[tokio::test]
 async fn les_listes_restantes_ne_montrent_plus_l_artiste_bloque_8611() {
     let (app, _state) = app().await;
-    let pid = garnir(&app).await;
+    let (pid_admin, pid_enfant) = garnir(&app).await;
     let listes = |profil: i64| {
+        let pid = if profil == ADMIN {
+            pid_admin
+        } else {
+            pid_enfant
+        };
         vec![
             format!("/api/v1/playlists/{pid}/tracks"),
             "/api/v1/history".to_string(),

@@ -3758,6 +3758,7 @@ mod tests_termes_de_chemin_5192 {
                     ActiveProfile(1),
                     Query(TrackFilterQuery::default()),
                     RawQuery(Some(raw.to_string())),
+                    None,
                 )
                 .await
                 .ok()
