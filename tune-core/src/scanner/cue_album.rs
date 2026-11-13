@@ -1033,6 +1033,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cue_dossier_trois_chiffres_8617_prime_sur_numero_image() {
+        let d = tempfile::TempDir::new().unwrap();
+        for (nom, numero) in [
+            ("CD001 - Suite", 1),
+            ("CD012 - Suite", 12),
+            ("CD100 - Suite", 100),
+            ("CD999 - Suite", 999),
+        ] {
+            let dossier = d.path().join(nom);
+            fs::create_dir_all(&dossier).unwrap();
+            let image = "Suite CD2.wav";
+            ecrire_wav(&dossier.join(image), 50);
+            fs::write(
+                dossier.join("album.cue"),
+                feuille_de_coffret("Artiste synthétique", image, ""),
+            )
+            .unwrap();
+            let plan = planifier_dossier(&dossier);
+            assert_eq!(plan.albums.len(), 1, "{plan:?}");
+            assert_eq!(
+                plan.albums[0]
+                    .pistes
+                    .iter()
+                    .map(|p| (p.disque, p.numero))
+                    .collect::<Vec<_>>(),
+                vec![(Some(numero), 1), (Some(numero), 2)],
+                "8617 : le dossier {nom} doit donner le disque {numero}, avant CD2 de l'image : {plan:?}"
+            );
+        }
+    }
+
     /// #8534, CONTRE-POIDS — un dossier « Disc 1 - Der Ring » qui range
     /// DEUX feuilles (« Der Ring CD1 », « Der Ring CD2 ») est le coffret, pas
     /// son disque 1 : chaque feuille garde le numéro de son nom, et le tout
