@@ -113,7 +113,13 @@ pub struct GrowingFileSource {
     file: std::fs::File,
     pos: u64,
     growth: Arc<DashGrowth>,
+    /// #7266 — au-delà, une frontière qui n'avance plus est un téléchargement
+    /// perdu (tâche disparue, CDN muet) : erreur, jamais une attente à vie.
+    delai_sans_progres: std::time::Duration,
 }
+
+/// #7266 — attente maximale à la frontière d'écriture sans qu'un octet arrive.
+pub const ATTENTE_MAX_SANS_PROGRES: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl GrowingFileSource {
     pub fn open(path: &str, growth: Arc<DashGrowth>) -> io::Result<Self> {
@@ -121,28 +127,61 @@ impl GrowingFileSource {
             file: std::fs::File::open(path)?,
             pos: 0,
             growth,
+            delai_sans_progres: ATTENTE_MAX_SANS_PROGRES,
         })
+    }
+
+    /// Le même lecteur avec un autre délai d'inactivité (essais).
+    pub fn avec_delai_sans_progres(mut self, delai: std::time::Duration) -> Self {
+        self.delai_sans_progres = delai;
+        self
     }
 
     /// Block until `target` bytes are available or the download ends. Returns the
     /// current `available` (which may be < target only when `done`), or an error
     /// if the download failed before reaching `target`.
+    ///
+    /// #7266 — l'échec n'est PAS rendu en `UnexpectedEof` : les décodeurs
+    /// prennent ce genre-là pour la fin normale du flux, et une piste coupée
+    /// au segment 30 sur 86 finissait en silence, comme si elle était jouée.
+    /// Une frontière immobile plus de `delai_sans_progres` vaut échec.
     fn wait_until(&self, target: u64) -> io::Result<u64> {
         let mut g = self.growth.inner.lock().unwrap();
+        let mut vu = g.available;
+        let mut depuis = std::time::Instant::now();
         loop {
             if target <= g.available {
                 return Ok(g.available);
             }
             if g.failed {
                 return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
+                    io::ErrorKind::ConnectionAborted,
                     "dash streaming download failed",
                 ));
             }
             if g.done {
                 return Ok(g.available); // final size reached, no more bytes
             }
-            g = self.growth.cv.wait(g).unwrap();
+            if g.available != vu {
+                vu = g.available;
+                depuis = std::time::Instant::now();
+            }
+            let reste = self.delai_sans_progres.saturating_sub(depuis.elapsed());
+            if reste.is_zero() {
+                g.failed = true;
+                g.done = true;
+                self.growth.cv.notify_all();
+                tracing::warn!(
+                    octets = g.available,
+                    delai_s = self.delai_sans_progres.as_secs_f64(),
+                    "dash_croissance_frontiere_immobile_lecture_interrompue"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "dash streaming download stalled",
+                ));
+            }
+            g = self.growth.cv.wait_timeout(g, reste).unwrap().0;
         }
     }
 }
@@ -251,6 +290,77 @@ pub fn decodage_local_desarme() -> bool {
         .unwrap_or(false)
 }
 
+/// #7266 — l'état d'un téléchargement en croissance, vu du cache d'URL : il
+/// dit s'il est en cours, complet ou perdu, et laisse une lecture qui a besoin
+/// du fichier ENTIER (un saut dans la même piste) attendre sa fin au lieu de le
+/// retélécharger. Tant que quelqu'un attend, le téléchargeur ne l'abandonne pas.
+pub struct SuiviDuTelechargement {
+    etat: std::sync::atomic::AtomicU8,
+    attendants: std::sync::atomic::AtomicUsize,
+    fin: tokio::sync::Notify,
+}
+
+const EN_COURS: u8 = 0;
+const COMPLET: u8 = 1;
+const PERDU: u8 = 2;
+
+impl SuiviDuTelechargement {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            etat: std::sync::atomic::AtomicU8::new(EN_COURS),
+            attendants: std::sync::atomic::AtomicUsize::new(0),
+            fin: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Le téléchargement est fini : `complet`, ou perdu.
+    pub fn terminer(&self, complet: bool) {
+        self.etat.store(
+            if complet { COMPLET } else { PERDU },
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.fin.notify_waiters();
+    }
+
+    pub fn est_complet(&self) -> bool {
+        self.etat.load(std::sync::atomic::Ordering::SeqCst) == COMPLET
+    }
+
+    pub fn en_cours(&self) -> bool {
+        self.etat.load(std::sync::atomic::Ordering::SeqCst) == EN_COURS
+    }
+
+    /// Quelqu'un attend la fin (le téléchargement ne doit pas être abandonné).
+    pub fn attendu(&self) -> bool {
+        self.attendants.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// Attend la fin, `delai` au plus. `true` si le fichier est complet.
+    pub async fn attendre_la_fin(&self, delai: std::time::Duration) -> bool {
+        struct Attendant<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Attendant<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.attendants
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _attendant = Attendant(&self.attendants);
+        let limite = tokio::time::Instant::now() + delai;
+        loop {
+            let notifie = self.fin.notified();
+            tokio::pin!(notifie);
+            notifie.as_mut().enable();
+            if !self.en_cours() {
+                return self.est_complet();
+            }
+            if tokio::time::timeout_at(limite, notifie).await.is_err() {
+                return self.est_complet();
+            }
+        }
+    }
+}
+
 impl DashGrowth {
     /// #7266 — personne d'autre que le téléchargeur ne tient plus la poignée
     /// (ni le registre, ni un décodeur) : la lecture a été abandonnée, la
@@ -318,7 +428,42 @@ mod tests {
         assert_eq!(src.read(&mut buf).unwrap(), 4);
         // Reader now at the frontier; a failed download must error, not EOF.
         growth.fail();
-        assert!(src.read(&mut buf).is_err());
+        let erreur = src.read(&mut buf).unwrap_err();
+        // #7266 — pas `UnexpectedEof`, que les décodeurs prennent pour la fin.
+        assert_ne!(erreur.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// #7266 — un téléchargeur disparu sans clore la poignée ne bloque pas le
+    /// lecteur à vie : passé le délai d'inactivité, erreur et poignée en échec.
+    #[test]
+    fn une_frontiere_immobile_finit_en_erreur_7266() {
+        let fichier = crate::test_scratch::scratch_file("tune-growtest-immobile", ".bin");
+        let path = fichier.to_string_lossy().to_string();
+        std::fs::write(&path, b"AAAA").unwrap();
+        let growth = DashGrowth::new(4);
+        let mut src = GrowingFileSource::open(&path, growth.clone())
+            .unwrap()
+            .avec_delai_sans_progres(std::time::Duration::from_millis(200));
+        let mut buf = [0u8; 4];
+        assert_eq!(src.read(&mut buf).unwrap(), 4);
+        let debut = std::time::Instant::now();
+        let erreur = src.read(&mut buf).unwrap_err();
+        assert_eq!(erreur.kind(), io::ErrorKind::TimedOut);
+        assert!(debut.elapsed() < std::time::Duration::from_secs(5));
+        assert!(growth.a_echoue(), "la poignée est marquée en échec");
+    }
+
+    #[tokio::test]
+    async fn le_suivi_reveille_qui_attend_la_fin_7266() {
+        let suivi = SuiviDuTelechargement::new();
+        let s = suivi.clone();
+        let attente =
+            tokio::spawn(async move { s.attendre_la_fin(std::time::Duration::from_secs(5)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(suivi.attendu());
+        suivi.terminer(true);
+        assert!(attente.await.unwrap());
+        assert!(!suivi.attendu());
     }
 
     #[test]

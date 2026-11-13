@@ -129,9 +129,9 @@ struct CachedUrl {
     bitrate: Option<u32>,
     created: Instant,
     /// #7266 — un fMP4 DASH rendu avant son dernier segment (décodage en
-    /// croissance) : `true` une fois le fichier complet. `None` : complet
-    /// dès la mise en cache.
-    complet: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// croissance) : l'état de son téléchargement. `None` : complet dès la
+    /// mise en cache.
+    suivi: Option<Arc<crate::audio::dash_growth::SuiviDuTelechargement>>,
 }
 
 struct UrlCache {
@@ -328,15 +328,20 @@ impl TidalService {
     }
 
     /// Le téléchargement DASH, et — quand il se poursuit en tâche de fond
-    /// ([`crate::audio::dash_growth::decodage_en_croissance`]) — le témoin
-    /// posé à `true` une fois le fichier complet. `None` : le fichier rendu
-    /// est déjà complet.
+    /// ([`crate::audio::dash_growth::decodage_en_croissance`]) — son suivi.
+    /// `None` : le fichier rendu est déjà complet.
     async fn telecharger_les_segments_dash(
         &self,
         segments: &DashSegmentInfo,
         track_id: &str,
         progressif: bool,
-    ) -> Result<(String, Option<Arc<std::sync::atomic::AtomicBool>>), String> {
+    ) -> Result<
+        (
+            String,
+            Option<Arc<crate::audio::dash_growth::SuiviDuTelechargement>>,
+        ),
+        String,
+    > {
         let start = Instant::now();
         let total = segments.segment_count;
         info!(
@@ -400,59 +405,104 @@ impl TidalService {
         //
         // #7266 — armé par défaut pour une sortie locale ou OAAT (session WAV
         // servie en continu), pour un FLAC seulement (`progressif`, décidé
-        // par l'appelant). Le chemin n'est rendu qu'une fois l'init ET le
-        // premier segment écrits ; un premier segment refusé retombe sur le
-        // téléchargement complet ci-dessous. Les segments partent
-        // [`SEGMENTS_DASH_EN_VOL`] à la fois, dans l'ordre. Un segment refusé
-        // en cours de route est redemandé une fois, puis le téléchargement est
-        // déclaré en échec : le décodeur reçoit une erreur, pas une fin de
-        // piste muette. Une lecture abandonnée (plus personne ne tient la
-        // poignée) arrête le téléchargement.
+        // par l'appelant), et seulement si le doute est levé :
+        // - les [`SEGMENTS_DE_MESURE`] premiers segments sont tous arrivés ;
+        // - ils sont arrivés au moins [`AVANCE_MINIMALE`] fois plus vite que
+        //   la musique qu'ils portent (sinon la lecture rattraperait le
+        //   téléchargement et se couperait) ;
+        // - la piste en compte davantage (sinon tout est déjà là).
+        // Autrement, le téléchargement complet d'avant se poursuit sur les
+        // mêmes requêtes. Les segments partent [`SEGMENTS_DASH_EN_VOL`] à la
+        // fois, dans l'ordre. Un segment refusé en cours de route est
+        // redemandé une fois, puis le téléchargement est déclaré perdu : le
+        // décodeur reçoit une erreur, la zone une erreur de lecture.
+        use futures_util::StreamExt as _;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("tmp reopen: {e}"))?;
+        let mut total_bytes = init_data.len() as u64;
+        let mut failed_segments = 0u32;
+        let mut en_ordre = segments_dash_en_ordre(self.client.clone(), segments.clone());
+
         if progressif && crate::audio::dash_growth::decodage_en_croissance() {
-            use futures_util::StreamExt as _;
-            use std::io::Write;
-            let mut en_ordre = segments_dash_en_ordre(self.client.clone(), segments.clone());
-            match en_ordre.next().await {
-                Some((premier, Ok(data))) => {
-                    let mut file = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&tmp_path)
-                        .map_err(|e| format!("tmp reopen (stream): {e}"))?;
-                    file.write_all(&data)
-                        .map_err(|e| format!("tmp write seg {premier}: {e}"))?;
-                    let written = init_data.len() as u64 + data.len() as u64;
-                    let growth = crate::audio::dash_growth::DashGrowth::new(written);
+            let debut_mesure = Instant::now();
+            let a_mesurer = SEGMENTS_DE_MESURE.min(total as usize);
+            let mut mesures: Vec<SegmentRecu> = Vec::with_capacity(a_mesurer);
+            while mesures.len() < a_mesurer {
+                match en_ordre.next().await {
+                    Some(recu) => mesures.push(recu),
+                    None => break,
+                }
+            }
+            let ecoule = debut_mesure.elapsed().as_secs_f64().max(0.001);
+            let tous_recus = mesures.iter().all(|(_, r)| r.is_ok());
+            let audio_s = segments
+                .duree_audio_s
+                .map(|d| d * mesures.len() as f64 / total.max(1) as f64);
+            let avance = audio_s.map(|a| a / ecoule);
+            let decision = if !tous_recus {
+                Some("segment_refuse")
+            } else if avance.is_none() {
+                Some("duree_inconnue")
+            } else if avance.is_some_and(|a| a < AVANCE_MINIMALE) {
+                Some("debit_insuffisant")
+            } else if (total as usize) <= mesures.len() {
+                Some("piste_deja_complete")
+            } else {
+                None
+            };
+            for (seg_number, resultat) in mesures {
+                match resultat {
+                    Ok(data) => {
+                        file.write_all(&data)
+                            .map_err(|e| format!("tmp write seg {seg_number}: {e}"))?;
+                        total_bytes += data.len() as u64;
+                    }
+                    Err(echec) => {
+                        journaliser_le_segment_en_echec(track_id, seg_number, &echec);
+                        failed_segments += 1;
+                    }
+                }
+            }
+            match decision {
+                None => {
+                    let growth = crate::audio::dash_growth::DashGrowth::new(total_bytes);
                     crate::audio::dash_growth::register(&tmp_path, growth.clone());
-                    let complet = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let suivi = crate::audio::dash_growth::SuiviDuTelechargement::new();
+                    info!(
+                        track_id,
+                        path = tmp_path.as_str(),
+                        segment_count = total,
+                        avance = avance.unwrap_or(0.0),
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "tidal_dash_streaming_download_started"
+                    );
                     tokio::spawn(poursuivre_en_croissance(EnCroissance {
                         client: self.client.clone(),
                         segments: segments.clone(),
                         en_ordre,
                         file,
-                        growth,
-                        complet: complet.clone(),
-                        written,
+                        garde: GardeCroissance {
+                            growth: Some(growth),
+                            suivi: suivi.clone(),
+                            path: tmp_path.clone(),
+                        },
+                        written: total_bytes,
                         track_id: track_id.to_string(),
-                        path: tmp_path.clone(),
                         start,
                     }));
-                    info!(
-                        track_id,
-                        path = tmp_path.as_str(),
-                        segment_count = total,
-                        elapsed_ms = start.elapsed().as_millis() as u64,
-                        "tidal_dash_streaming_download_started"
-                    );
-                    return Ok((tmp_path, Some(complet)));
+                    return Ok((tmp_path, Some(suivi)));
                 }
-                Some((premier, Err(echec))) => {
-                    journaliser_le_segment_en_echec(track_id, premier, &echec);
+                Some(raison) => {
                     info!(
                         track_id,
+                        raison,
+                        avance = avance.unwrap_or(0.0),
                         "tidal_dash_croissance_repli_telechargement_complet"
                     );
                 }
-                None => {}
             }
         }
 
@@ -466,33 +516,20 @@ impl TidalService {
         // [`SEGMENTS_DASH_EN_VOL`] à la fois ; `buffered` rend les réponses
         // dans l'ordre des numéros, donc le fichier est écrit dans l'ordre,
         // et au plus `SEGMENTS_DASH_EN_VOL` segments attendent en mémoire.
-        let mut total_bytes = init_data.len() as u64;
-        let mut failed_segments = 0u32;
-
-        {
-            use futures_util::StreamExt as _;
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&tmp_path)
-                .map_err(|e| format!("tmp reopen: {e}"))?;
-
-            let mut en_ordre = segments_dash_en_ordre(self.client.clone(), segments.clone());
-
-            while let Some((seg_number, resultat)) = en_ordre.next().await {
-                match resultat {
-                    Ok(data) => {
-                        file.write_all(&data)
-                            .map_err(|e| format!("tmp write seg {seg_number}: {e}"))?;
-                        total_bytes += data.len() as u64;
-                    }
-                    Err(echec) => {
-                        journaliser_le_segment_en_echec(track_id, seg_number, &echec);
-                        failed_segments += 1;
-                    }
+        while let Some((seg_number, resultat)) = en_ordre.next().await {
+            match resultat {
+                Ok(data) => {
+                    file.write_all(&data)
+                        .map_err(|e| format!("tmp write seg {seg_number}: {e}"))?;
+                    total_bytes += data.len() as u64;
+                }
+                Err(echec) => {
+                    journaliser_le_segment_en_echec(track_id, seg_number, &echec);
+                    failed_segments += 1;
                 }
             }
         }
+        drop(file);
 
         let elapsed = start.elapsed();
 
@@ -2236,26 +2273,32 @@ impl StreamingService for TidalService {
         // Keying on the track alone made a prior `max` play silently defeat a
         // later per-zone `cd`/`low` selection (and vice versa).
         let cache_key = format!("{track_id}:{requested_quality}");
-        {
-            let cache = self.url_cache.lock().await;
-            if let Some(cached) = cache.get(&cache_key) {
+        // #7266 — une lecture qui a besoin du fichier ENTIER (un saut dans la
+        // piste, le préchargement) et qui trouve au cache un fMP4 encore en
+        // croissance attend la fin de ce téléchargement, une fois, au lieu
+        // d'en lancer un second.
+        let mut attente_faite = false;
+        loop {
+            let a_attendre = {
+                let cache = self.url_cache.lock().await;
+                let Some(cached) = cache.get(&cache_key) else {
+                    break;
+                };
                 // A cached DASH `file://` entry becomes stale once the temp file
                 // is consumed and deleted after playback. Serving it again makes
                 // the transcode open a missing/empty file (os error 2) and the
                 // track never plays. Only reuse a file:// entry if the file still
                 // exists and is non-empty; otherwise fall through to re-download.
+                let en_croissance = cached.suivi.as_ref().filter(|s| s.en_cours()).cloned();
                 let stale_dash = cached
                     .url
                     .strip_prefix("file://")
                     .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) == 0)
                     .unwrap_or(false)
-                    // #7266 — un fMP4 encore en croissance (ou abandonné en
-                    // route) n'est pas une piste entière : le relire comme un
-                    // fichier ordinaire la tronquerait au dernier segment reçu.
-                    || cached
-                        .complet
-                        .as_ref()
-                        .is_some_and(|c| !c.load(std::sync::atomic::Ordering::SeqCst));
+                    // #7266 — un fMP4 encore en croissance, ou perdu en route,
+                    // n'est pas une piste entière : le relire comme un fichier
+                    // ordinaire la tronquerait au dernier segment reçu.
+                    || cached.suivi.as_ref().is_some_and(|s| !s.est_complet());
                 if !stale_dash {
                     return Ok(StreamUrl {
                         url: cached.url.clone(),
@@ -2271,12 +2314,29 @@ impl StreamingService for TidalService {
                         headers: Vec::new(),
                     });
                 }
-                tracing::info!(
-                    track_id,
-                    path = %cached.url,
-                    "tidal_dash_cache_stale_redownloading"
-                );
-            }
+                match en_croissance {
+                    Some(suivi)
+                        if !attente_faite
+                            && !crate::audio::dash_growth::decodage_en_croissance() =>
+                    {
+                        Some(suivi)
+                    }
+                    _ => {
+                        tracing::info!(
+                            track_id,
+                            path = %cached.url,
+                            "tidal_dash_cache_stale_redownloading"
+                        );
+                        None
+                    }
+                }
+            };
+            let Some(suivi) = a_attendre else { break };
+            info!(track_id, "tidal_dash_attend_le_telechargement_en_cours");
+            suivi
+                .attendre_la_fin(ATTENTE_D_UN_TELECHARGEMENT_EN_COURS)
+                .await;
+            attente_faite = true;
         }
 
         // Quality fallback cascade: HI_RES_LOSSLESS → HI_RES → LOSSLESS → HIGH
@@ -2640,7 +2700,7 @@ impl StreamingService for TidalService {
                     bit_depth,
                     bitrate,
                     created: Instant::now(),
-                    complet: fichier_en_croissance,
+                    suivi: fichier_en_croissance,
                 },
             );
         }
@@ -3510,6 +3570,19 @@ struct DashManifest {
 /// attend en mémoire avant d'être écrit (six segments de ~4 s).
 const SEGMENTS_DASH_EN_VOL: usize = 6;
 
+/// #7266 — segments reçus avant de décider du décodage pendant le
+/// téléchargement : une tournée complète en vol, plus un, pour mesurer un
+/// débit soutenu et non la seule latence de la première tournée.
+const SEGMENTS_DE_MESURE: usize = SEGMENTS_DASH_EN_VOL + 1;
+
+/// #7266 — le téléchargement doit amener la musique au moins 1,5 fois plus
+/// vite qu'elle ne se joue ; en deçà, la lecture le rattraperait.
+const AVANCE_MINIMALE: f64 = 1.5;
+
+/// #7266 — au plus, l'attente d'un téléchargement en croissance déjà lancé
+/// pour la même piste, avant d'en lancer un autre.
+const ATTENTE_D_UN_TELECHARGEMENT_EN_COURS: Duration = Duration::from_secs(120);
+
 /// #7266 — pourquoi un segment DASH n'a pas été reçu (même journal qu'avant).
 enum SegmentEnEchec {
     Lecture(reqwest::Error),
@@ -3562,32 +3635,89 @@ struct EnCroissance {
     segments: DashSegmentInfo,
     en_ordre: std::pin::Pin<Box<dyn futures_util::Stream<Item = SegmentRecu> + Send>>,
     file: std::fs::File,
-    growth: Arc<crate::audio::dash_growth::DashGrowth>,
-    complet: Arc<std::sync::atomic::AtomicBool>,
+    garde: GardeCroissance,
     written: u64,
     track_id: String,
-    path: String,
     start: Instant,
 }
 
-/// #7266 — la suite d'un téléchargement en croissance, après son premier
-/// segment : chaque segment écrit publie la nouvelle frontière au décodeur.
+/// #7266 — la poignée du décodeur, tenue par la tâche de téléchargement. Si
+/// la tâche disparaît sans conclure (panique, arrêt du runtime, sortie
+/// imprévue), la poignée est déclarée en échec et le fichier partiel retiré :
+/// le décodeur reçoit une erreur au lieu d'attendre à vie (#8228, même garde
+/// que `copier_en_croissance`).
+struct GardeCroissance {
+    growth: Option<Arc<crate::audio::dash_growth::DashGrowth>>,
+    suivi: Arc<crate::audio::dash_growth::SuiviDuTelechargement>,
+    path: String,
+}
+
+impl GardeCroissance {
+    fn growth(&self) -> &Arc<crate::audio::dash_growth::DashGrowth> {
+        self.growth
+            .as_ref()
+            .expect("poignée tenue jusqu'à la conclusion")
+    }
+
+    /// Plus personne ne lit ni n'attend : la garde tient la seule référence
+    /// restante et le suivi n'a pas d'attendant.
+    fn personne_ne_lit(&self) -> bool {
+        self.growth().abandonnee() && !self.suivi.attendu()
+    }
+
+    fn finir(mut self) {
+        if let Some(g) = self.growth.take() {
+            self.suivi.terminer(true);
+            g.finish();
+        }
+    }
+}
+
+impl Drop for GardeCroissance {
+    fn drop(&mut self) {
+        if let Some(g) = self.growth.take() {
+            g.fail();
+            self.suivi.terminer(false);
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// #7266 — combien de temps une lecture abandonnée reste sans lecteur avant
+/// que son téléchargement s'arrête : un saut dans la même piste relance la
+/// résolution juste après avoir lâché l'ancien décodeur, et vient alors
+/// attendre ce téléchargement au lieu d'en refaire un.
+#[cfg(not(test))]
+const DELAI_AVANT_ABANDON: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const DELAI_AVANT_ABANDON: Duration = Duration::from_millis(300);
+
+/// #7266 — la suite d'un téléchargement en croissance, après ses premiers
+/// segments : chaque segment écrit publie la nouvelle frontière au décodeur.
 async fn poursuivre_en_croissance(mut t: EnCroissance) {
     use futures_util::StreamExt as _;
     use std::io::Write;
     let total = t.segments.segment_count;
+    let mut sans_lecteur_depuis: Option<Instant> = None;
     while let Some((seg_number, resultat)) = t.en_ordre.next().await {
-        if t.growth.abandonnee() {
-            drop(t.en_ordre);
-            drop(t.file);
-            let _ = std::fs::remove_file(&t.path);
-            info!(
-                track_id = %t.track_id,
-                segment = seg_number,
-                segment_count = total,
-                "tidal_dash_croissance_abandonnee"
-            );
+        if t.garde.growth().a_echoue() {
+            // Le lecteur a jugé la frontière immobile trop longtemps.
+            info!(track_id = %t.track_id, segment = seg_number, "tidal_dash_croissance_close_par_le_lecteur");
             return;
+        }
+        if t.garde.personne_ne_lit() {
+            let depuis = *sans_lecteur_depuis.get_or_insert_with(Instant::now);
+            if depuis.elapsed() >= DELAI_AVANT_ABANDON {
+                info!(
+                    track_id = %t.track_id,
+                    segment = seg_number,
+                    segment_count = total,
+                    "tidal_dash_croissance_abandonnee"
+                );
+                return;
+            }
+        } else {
+            sans_lecteur_depuis = None;
         }
         let resultat = match resultat {
             Ok(data) => Ok(data),
@@ -3601,39 +3731,34 @@ async fn poursuivre_en_croissance(mut t: EnCroissance) {
             Ok(data) => data,
             Err(echec) => {
                 // Un trou dans le fMP4 ferait sauter de la musique en silence :
-                // le décodeur reçoit une erreur à la frontière.
+                // la garde déclare l'échec, le décodeur reçoit une erreur.
                 journaliser_le_segment_en_echec(&t.track_id, seg_number, &echec);
                 warn!(
                     track_id = %t.track_id,
                     segment = seg_number,
                     "tidal_dash_croissance_segment_perdu_lecture_interrompue"
                 );
-                t.growth.fail();
-                drop(t.file);
-                let _ = std::fs::remove_file(&t.path);
                 return;
             }
         };
         if let Err(e) = t.file.write_all(&data) {
             warn!(track_id = %t.track_id, segment = seg_number, error = %e, "tidal_dash_stream_write_failed");
-            t.growth.fail();
             return;
         }
         t.written += data.len() as u64;
-        t.growth.advance(t.written);
+        t.garde.growth().advance(t.written);
     }
-    drop(t.file);
-    t.complet.store(true, std::sync::atomic::Ordering::SeqCst);
-    t.growth.finish();
+    let _ = t.file.flush();
     info!(
         track_id = %t.track_id,
         total_bytes = t.written,
         segment_count = total,
         elapsed_ms = t.start.elapsed().as_millis() as u64,
-        path = %t.path,
+        path = %t.garde.path,
         croissance = true,
         "tidal_dash_multi_segment_download_complete"
     );
+    t.garde.finir();
 }
 
 /// Le segment manquant est sauté : on le dit, avec la même famille
@@ -3674,6 +3799,10 @@ struct DashSegmentInfo {
     start_number: u32,
     /// Total number of media segments to download
     segment_count: u32,
+    /// #7266 — durée audio de la piste d'après la SegmentTimeline (somme des
+    /// `d × (1 + r)` sur `timescale`), en secondes. `None` si le MPD ne la
+    /// donne pas : le décodage pendant le téléchargement n'est alors pas tenté.
+    duree_audio_s: Option<f64>,
 }
 
 /// Default Tidal CDN base used to resolve relative URLs in DASH manifests.
@@ -3753,6 +3882,9 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
     // Each <S d="..." r="N"/> means 1 + N segments (r = repeat count, 0-based).
     let mut timeline_segment_count: u32 = 0;
     let mut has_segment_timeline = false;
+    // #7266 — durée totale de la timeline, en unités de `timescale`.
+    let mut timeline_unites: u64 = 0;
+    let mut timescale: u64 = 1;
 
     loop {
         match reader.read_event() {
@@ -3804,6 +3936,9 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                                 "startNumber" => {
                                     segment_template_start_number = val.parse().unwrap_or(1);
                                 }
+                                "timescale" => {
+                                    timescale = val.parse().unwrap_or(1).max(1);
+                                }
                                 _ => {}
                             }
                         }
@@ -3815,15 +3950,20 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                         // <S d="380928" r="52"/> means 1 + 52 = 53 segments
                         // <S t="0" d="380928"/> means 1 segment (r defaults to 0)
                         let mut repeat: u32 = 0;
+                        let mut duree: u64 = 0;
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
                             let val = valeur_d_attribut_mpd(&attr);
                             if key == "r" {
                                 repeat = val.parse().unwrap_or(0);
+                            } else if key == "d" {
+                                duree = val.parse().unwrap_or(0);
                             }
                         }
                         // 1 for this <S> element + r repeats
                         timeline_segment_count += 1 + repeat;
+                        timeline_unites =
+                            timeline_unites.saturating_add(duree.saturating_mul(1 + repeat as u64));
                     }
                     _ => {}
                 }
@@ -3877,6 +4017,8 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                 media_template,
                 start_number: segment_template_start_number,
                 segment_count: timeline_segment_count,
+                duree_audio_s: (timeline_unites > 0)
+                    .then(|| timeline_unites as f64 / timescale as f64),
             })
         } else {
             None

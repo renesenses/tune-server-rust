@@ -310,12 +310,16 @@ async fn sortie_locale_un_saut_prend_le_fichier_complet_7266() {
 }
 
 /// Un segment qui échoue (deux fois) au milieu de la piste : la session se
-/// termine, sans pendre et sans faire croire à une piste entière.
+/// termine sans pendre, ET la zone reçoit une erreur de lecture — pas une fin
+/// de piste muette qui ferait passer à la suivante comme si de rien n'était.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sortie_locale_un_segment_en_echec_termine_la_session_proprement_7266() {
+async fn sortie_locale_un_segment_en_echec_termine_la_session_en_erreur_7266() {
     let (pcm, piste) = piste_cd().await;
     let (base, _) = faux_tidal(piste, "flac", Some(30)).await;
-    let orch = orchestrateur();
+    let mut orch = orchestrateur();
+    let bus = Arc::new(crate::event_bus::EventBus::new());
+    let mut evenements = bus.subscribe();
+    orch.event_bus = Some(bus);
     let (r, _, _) = resoudre_en_local(&orch, base, None).await;
     let lu = lire_la_session(&orch, &r.stream_id.clone().expect("session")).await;
     let (trames, _) = if lu.octets.len() > 4096 {
@@ -326,6 +330,24 @@ async fn sortie_locale_un_segment_en_echec_termine_la_session_proprement_7266() 
     assert!(
         trames < pcm.len() / 4,
         "segment 30 refusé : {trames} trames servies, autant que la piste entière"
+    );
+    let mut erreur = None;
+    let limite = Instant::now() + Duration::from_secs(5);
+    while erreur.is_none() && Instant::now() < limite {
+        match tokio::time::timeout(Duration::from_millis(200), evenements.recv()).await {
+            Ok(Ok(ev)) if ev.event_type == "zone.playback_error" => erreur = Some(ev.data),
+            Ok(Ok(_)) | Err(_) => {}
+            Ok(Err(_)) => break,
+        }
+    }
+    let erreur =
+        erreur.expect("segment 30 perdu : aucune zone.playback_error, la piste a fini en silence");
+    assert!(
+        erreur["cause"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with(crate::audio::decode::TELECHARGEMENT_DASH_INTERROMPU),
+        "{erreur}"
     );
 }
 
@@ -430,6 +452,40 @@ async fn le_cache_ne_sert_que_les_fichiers_complets_7266() {
     assert_eq!(std::fs::metadata(&chemin_b).unwrap().len() as usize, total);
     let _ = std::fs::remove_file(&chemin_a);
     let _ = std::fs::remove_file(&chemin_b);
+}
+
+/// Un saut dans la piste pendant son téléchargement en croissance : l'ancien
+/// décodeur lâche la poignée, la nouvelle résolution (hors croissance, elle
+/// veut le fichier entier) ATTEND ce téléchargement au lieu d'en refaire un ;
+/// le partiel n'est ni supprimé ni abandonné.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_saut_attend_le_telechargement_en_cours_7266() {
+    let (_, piste) = piste_cd().await;
+    let total: usize =
+        piste.init.len() + piste.segments.iter().map(|(s, _)| s.len()).sum::<usize>();
+    let (base, journal) = faux_tidal(piste, "flac", None).await;
+    let svc = TidalService::pour_un_faux_tidal(base);
+    let a = crate::audio::dash_growth::pendant_le_telechargement(
+        true,
+        svc.get_track_url(PISTE, Some("LOSSLESS")),
+    )
+    .await
+    .unwrap();
+    let chemin = a.url.strip_prefix("file://").unwrap().to_string();
+    // L'ancien décodeur s'arrête (saut) : il lâche la poignée.
+    drop(crate::audio::dash_growth::take_for(&chemin).expect("poignée"));
+    let saut = svc.get_track_url(PISTE, Some("LOSSLESS")).await.unwrap();
+    assert_eq!(
+        saut.url, a.url,
+        "le saut reprend le téléchargement en cours"
+    );
+    assert_eq!(
+        journal.inits.load(Ordering::SeqCst),
+        1,
+        "un second téléchargement a été lancé"
+    );
+    assert_eq!(std::fs::metadata(&chemin).unwrap().len() as usize, total);
+    let _ = std::fs::remove_file(&chemin);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

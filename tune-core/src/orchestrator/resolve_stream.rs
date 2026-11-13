@@ -855,8 +855,20 @@ impl PlaybackOrchestrator {
         };
 
         let (stream_url, sid, out_mime, stream_file_size) = if is_local_stream || is_oaat_stream {
-            self.resoudre_flux_local_ou_oaat(req, service_name, &stream_data, is_local_stream)
-                .await?
+            match self
+                .resoudre_flux_local_ou_oaat(req, service_name, &stream_data, is_local_stream)
+                .await
+            {
+                Ok(flux) => flux,
+                Err(e) => {
+                    // #7266 — aucun décodeur ne prendra la poignée d'un fMP4
+                    // en croissance : la lâcher arrête son téléchargement.
+                    if let Some(chemin) = stream_data.url.strip_prefix("file://") {
+                        drop(crate::audio::dash_growth::take_for(chemin));
+                    }
+                    return Err(e);
+                }
+            }
         } else if is_dash_file {
             match self
                 .resoudre_flux_dash(
@@ -1426,6 +1438,9 @@ impl PlaybackOrchestrator {
         // streaming-service content played through local/OAAT outputs.
         // Paced to the playback clock by the forwarder; without a bus,
         // the receiver is dropped and the decoder's sends are no-ops.
+        // #7266 — pour signaler une piste coupée en route (le bus ci-dessous
+        // ne sert aux niveaux que si la zone les demande).
+        let bus_des_erreurs = ev_bus.clone();
         let levels_tx = match ev_bus.filter(|_| attach_levels) {
             Some(bus) => {
                 let play_seq = playback.current_play_seq(zone_id).await;
@@ -1698,6 +1713,21 @@ impl PlaybackOrchestrator {
             }
             Ok(Err(e)) => {
                 warn!(error = %e, "streaming_transcode_decode_failed");
+                // #7266 — un fMP4 DASH perdu en cours de téléchargement : la
+                // zone l'apprend, au lieu de passer en silence à la suite.
+                if e.starts_with(crate::audio::decode::TELECHARGEMENT_DASH_INTERROMPU)
+                    && let Some(ref bus) = bus_des_erreurs
+                {
+                    bus.emit(
+                        "zone.playback_error",
+                        serde_json::json!({
+                            "zone_id": zone_id,
+                            "code": "track_decode_failed",
+                            "error": "The track could not be decoded.",
+                            "cause": e,
+                        }),
+                    );
+                }
             }
             Err(e) => {
                 warn!(error = %e, "streaming_transcode_decode_task_panic");

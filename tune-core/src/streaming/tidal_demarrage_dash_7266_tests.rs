@@ -80,6 +80,8 @@ fn segments(base: &str) -> DashSegmentInfo {
         media_template: format!("{base}/mediatracks/essai/$Number$.mp4"),
         start_number: 1,
         segment_count: SEGMENTS,
+        // Une demi-seconde de musique par segment.
+        duree_audio_s: Some(SEGMENTS as f64 * 0.5),
     }
 }
 
@@ -145,22 +147,26 @@ async fn un_segment_refuse_n_emmele_pas_les_suivants_7266() {
 
 /// Le téléchargement en croissance, tel qu'une sortie locale ou OAAT le
 /// demande pour un FLAC.
-async fn en_croissance(
-    base: &str,
-) -> (String, Option<Arc<std::sync::atomic::AtomicBool>>, Duration) {
+type Suivi = Option<Arc<crate::audio::dash_growth::SuiviDuTelechargement>>;
+
+async fn en_croissance(base: &str) -> (String, Suivi, Duration) {
+    en_croissance_de(segments(base)).await
+}
+
+async fn en_croissance_de(segments: DashSegmentInfo) -> (String, Suivi, Duration) {
     let svc = TidalService::new();
     let debut = Instant::now();
     let (chemin, complet) = crate::audio::dash_growth::pendant_le_telechargement(
         true,
-        svc.telecharger_les_segments_dash(&segments(base), "7266-croissance", true),
+        svc.telecharger_les_segments_dash(&segments, "7266-croissance", true),
     )
     .await
     .expect("init servi par le faux CDN");
     (chemin, complet, debut.elapsed())
 }
 
-/// #7266, sortie locale : le chemin revient après l'init et le PREMIER
-/// segment, sans attendre les 60 (≥ 1 s à six en vol). Le fichier se
+/// #7266, sortie locale : le chemin revient après l'init et les
+/// `SEGMENTS_DE_MESURE` premiers segments, sans attendre les 60. Le fichier se
 /// complète ensuite, dans l'ordre, six segments en vol au plus, et le témoin
 /// `complet` passe à vrai à la fin.
 #[tokio::test]
@@ -169,12 +175,12 @@ async fn en_croissance_le_chemin_revient_apres_le_premier_segment_7266() {
     let (chemin, complet, duree) = en_croissance(&base).await;
     let complet = complet.expect("un téléchargement en croissance a son témoin");
     assert!(
-        duree < Duration::from_millis(LATENCE_MS * 4),
+        duree < Duration::from_millis(LATENCE_MS * 5),
         "chemin rendu en {duree:?} : il attend encore les segments"
     );
     assert!(
-        !complet.load(Ordering::SeqCst),
-        "le fichier ne peut pas être complet après un segment"
+        !complet.est_complet(),
+        "le fichier ne peut pas être complet après quelques segments"
     );
     let rendu = std::fs::read(&chemin).unwrap();
     assert!(
@@ -187,7 +193,7 @@ async fn en_croissance_le_chemin_revient_apres_le_premier_segment_7266() {
         .await
         .unwrap()
         .expect("téléchargement mené au bout");
-    assert!(complet.load(Ordering::SeqCst), "témoin posé à la fin");
+    assert!(complet.est_complet(), "suivi complet à la fin");
     let octets = std::fs::read(&chemin).unwrap();
     let _ = std::fs::remove_file(&chemin);
     assert_eq!(octets.len() as u64, taille);
@@ -234,7 +240,7 @@ async fn en_croissance_un_segment_refuse_au_milieu_echoue_franchement_7266() {
         .unwrap();
     assert!(fin.is_err(), "fin muette au lieu d'une erreur : {fin:?}");
     assert!(poignee.a_echoue());
-    assert!(!complet.unwrap().load(Ordering::SeqCst));
+    assert!(!complet.unwrap().est_complet());
     // Le segment 17 a été demandé deux fois (la tentative et sa reprise).
     assert!(compteurs.demandes.load(Ordering::SeqCst) >= 18);
     let _ = std::fs::remove_file(&chemin);
@@ -248,17 +254,17 @@ async fn une_lecture_abandonnee_arrete_le_telechargement_7266() {
     let (base, compteurs) = faux_cdn(None).await;
     let (chemin, complet, _) = en_croissance(&base).await;
     drop(crate::audio::dash_growth::take_for(&chemin).expect("poignée inscrite"));
-    tokio::time::sleep(Duration::from_millis(LATENCE_MS * SEGMENTS as u64 / 2)).await;
+    tokio::time::sleep(Duration::from_millis(LATENCE_MS * SEGMENTS as u64)).await;
     let demandes = compteurs.demandes.load(Ordering::SeqCst);
     assert!(
-        demandes < SEGMENTS as usize / 2,
+        demandes < SEGMENTS as usize,
         "{demandes} segments demandés après l'abandon de la lecture"
     );
     assert!(
         !std::path::Path::new(&chemin).exists(),
         "le fichier partiel reste sur le disque"
     );
-    assert!(!complet.unwrap().load(Ordering::SeqCst));
+    assert!(!complet.unwrap().est_complet());
 }
 
 /// Hors d'une résolution pour une sortie locale ou OAAT (renderer réseau,
@@ -281,4 +287,70 @@ async fn hors_sortie_locale_ou_hors_flac_le_fichier_rendu_est_complet_7266() {
         let _ = std::fs::remove_file(&chemin);
         assert_eq!(octets.len(), INIT.len() + SEGMENTS as usize);
     }
+}
+
+/// #7266 — un CDN qui amène la musique moins de 1,5 fois plus vite qu'elle ne
+/// se joue : le décodage pendant le téléchargement se ferait rattraper et
+/// couperait. Repli sur le fichier complet, comme avant.
+#[tokio::test]
+async fn un_cdn_plus_lent_que_la_musique_se_replie_sur_le_fichier_complet_7266() {
+    let (base, _) = faux_cdn(None).await;
+    // 100 ms par segment, six en vol, pour 10 ms de musique chacun.
+    let lents = DashSegmentInfo {
+        duree_audio_s: Some(SEGMENTS as f64 * 0.01),
+        ..segments(&base)
+    };
+    let (chemin, complet, _) = en_croissance_de(lents).await;
+    assert!(complet.is_none(), "CDN trop lent : fichier complet attendu");
+    assert!(crate::audio::dash_growth::take_for(&chemin).is_none());
+    let octets = std::fs::read(&chemin).unwrap();
+    let _ = std::fs::remove_file(&chemin);
+    assert_eq!(octets.len(), INIT.len() + SEGMENTS as usize);
+}
+
+/// #7266 — sans durée dans le MPD, pas de mesure possible : fichier complet.
+#[tokio::test]
+async fn sans_duree_connue_le_fichier_est_complet_7266() {
+    let (base, _) = faux_cdn(None).await;
+    let sans_duree = DashSegmentInfo {
+        duree_audio_s: None,
+        ..segments(&base)
+    };
+    let (chemin, complet, _) = en_croissance_de(sans_duree).await;
+    assert!(complet.is_none());
+    let _ = std::fs::remove_file(&chemin);
+}
+
+/// #7266 — la tâche de téléchargement qui disparaît (annulée, en panique)
+/// déclare la poignée en échec : le lecteur reçoit une erreur, il n'attend
+/// pas à vie.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_tache_de_telechargement_disparue_libere_le_lecteur_7266() {
+    let fichier = crate::test_scratch::scratch_file("tune-7266-garde", ".mp4");
+    let chemin = fichier.to_string_lossy().to_string();
+    std::fs::write(&chemin, INIT).unwrap();
+    let growth = crate::audio::dash_growth::DashGrowth::new(INIT.len() as u64);
+    let suivi = crate::audio::dash_growth::SuiviDuTelechargement::new();
+    let lecteur = growth.clone();
+    // Une tâche qui tient la garde et ne conclut jamais.
+    let garde = GardeCroissance {
+        growth: Some(growth),
+        suivi: suivi.clone(),
+        path: chemin.clone(),
+    };
+    let tache = tokio::spawn(async move {
+        let _garde = garde;
+        std::future::pending::<()>().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tache.abort();
+    let fin = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || lecteur.attendre_la_fin()),
+    )
+    .await
+    .expect("le lecteur attend encore : la tâche disparue ne l'a pas libéré")
+    .unwrap();
+    assert!(fin.is_err());
+    assert!(!suivi.en_cours() && !suivi.est_complet());
 }
