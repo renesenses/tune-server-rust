@@ -41,7 +41,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tune_core::db::politique_parentale::{self as pp, Ecriture, Filtre, Liste, PolitiqueParentale};
+use tune_core::db::politique_parentale::{
+    self as pp, Ecriture, Fiche, Filtre, Liste, PolitiqueParentale,
+};
 
 use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
@@ -189,8 +191,240 @@ fn liste_de_la_route(chemin: &str) -> Option<Liste> {
         | "/podcasts/discover"
         | "/podcasts/top"
         | "/podcasts/catalogue" => Some(Liste::Podcasts),
+        // #7913 — les rangées de l'accueil, les genres, les collections, les
+        // listes intelligentes et les sous-listes de la bibliothèque (albums
+        // d'un artiste, pistes d'un album…) : un artiste bloqué n'y paraît
+        // plus. Les fiches elles-mêmes sont refusées (`fiche_de_la_route`).
+        c if c == "/home" || c.starts_with("/home/") || c.starts_with("/library/") => {
+            Some(Liste::Bibliotheque)
+        }
         _ => None,
     }
+}
+
+/// #7913 — les fiches ouvertes directement, refusées (403) quand leur objet
+/// est bloqué pour le profil.
+fn fiche_de_la_route(chemin: &str) -> Option<Fiche> {
+    let chemin = chemin.strip_prefix("/api/v1").unwrap_or(chemin);
+    let segments: Vec<&str> = chemin.trim_matches('/').split('/').collect();
+    let nombre = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match segments.as_slice() {
+        ["library", "albums", id] if nombre(id) => Some(Fiche::Album),
+        ["library", "artists", id] if nombre(id) => Some(Fiche::Artiste),
+        ["library", "tracks", id] if nombre(id) => Some(Fiche::Piste),
+        ["radios", id] if nombre(id) => Some(Fiche::Radio),
+        ["podcasts", "episodes"] | ["podcasts", "episodes", _] => Some(Fiche::Podcast),
+        _ => None,
+    }
+}
+
+/// #7913 — le code du refus d'une fiche bloquée.
+pub(crate) const CODE_REFUS_FICHE_BLOQUEE: &str = "parental_content_blocked";
+
+/// #7913 — marque posée sur les requêtes INTERNES de recomptage : les
+/// handlers de listes n'y font pas leurs annotations (écoutes de la
+/// communauté, un appel HTTP au site par page).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecomptageParental;
+
+/// Durée de vie d'un décompte mis en cache.
+const DUREE_DU_DECOMPTE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Un décompte d'éléments bloqués, valable tant que la politique (révision),
+/// la liste (total servi) et la bibliothèque (empreinte) n'ont pas changé.
+#[derive(Clone)]
+struct Decompte {
+    total_servi: u64,
+    empreinte: String,
+    bloques: u64,
+    quand: std::time::Instant,
+}
+
+type CleDuDecompte = (i64, String, i64);
+
+fn decomptes() -> &'static std::sync::Mutex<std::collections::HashMap<CleDuDecompte, Decompte>> {
+    static D: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<CleDuDecompte, Decompte>>,
+    > = std::sync::OnceLock::new();
+    D.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Nombre de pages relues pour un recomptage (témoins et mesure).
+pub static PAGES_RELUES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// L'empreinte de la bibliothèque : nombre et plus grand identifiant des
+/// albums, pistes et artistes. Un scan, un ajout ou un retrait la changent ;
+/// une modification en place (renommage) attend la fin de `DUREE_DU_DECOMPTE`.
+fn empreinte_de_la_bibliotheque(state: &AppState) -> String {
+    let mut e = String::new();
+    for table in ["albums", "tracks", "artists"] {
+        let r = state
+            .backend
+            .query_one(
+                &format!("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM {table}"),
+                &[],
+            )
+            .ok()
+            .flatten()
+            .map(|r| {
+                format!(
+                    "{}:{}",
+                    r.first().and_then(|v| v.as_i64()).unwrap_or(-1),
+                    r.get(1).and_then(|v| v.as_i64()).unwrap_or(-1)
+                )
+            })
+            .unwrap_or_default();
+        e.push_str(&r);
+        e.push('|');
+    }
+    e
+}
+
+/// La liste sans sa fenêtre : la clé du décompte.
+fn chemin_sans_fenetre(uri: &axum::http::Uri) -> String {
+    let mut q: Vec<&str> = uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .filter(|p| !matches!(p.split('=').next().unwrap_or(""), "limit" | "offset"))
+        .collect();
+    q.sort_unstable();
+    format!("{}?{}", uri.path(), q.join("&"))
+}
+
+/// Taille des pages relues pour compter le total exact.
+const PAGE_DE_COMPTAGE: u64 = 500;
+/// Plafond de pages relues : au-delà, le total reste celui de la page.
+const PAGES_DE_COMPTAGE_MAX: usize = 400;
+
+/// [`bloques_dans_toute_la_liste`], gardé en cache par (profil, liste sans
+/// fenêtre, révision de la politique) : la liste n'est relue que si son total,
+/// la bibliothèque ou la politique ont changé, ou après `DUREE_DU_DECOMPTE`.
+/// Feuilleter une liste ne la relit donc qu'une fois.
+#[allow(clippy::too_many_arguments)]
+async fn bloques_avec_cache(
+    state: &AppState,
+    cle: CleDuDecompte,
+    suite: &Next,
+    gabarit: &(
+        axum::http::Uri,
+        axum::http::HeaderMap,
+        axum::http::Extensions,
+    ),
+    graine: Option<&Value>,
+    filtre: &Filtre,
+    liste: Liste,
+    total: u64,
+) -> Option<u64> {
+    let empreinte = empreinte_de_la_bibliotheque(state);
+    if let Ok(d) = decomptes().lock()
+        && let Some(c) = d.get(&cle)
+        && c.total_servi == total
+        && c.empreinte == empreinte
+        && c.quand.elapsed() < DUREE_DU_DECOMPTE
+    {
+        return Some(c.bloques);
+    }
+    let debut = std::time::Instant::now();
+    let bloques = bloques_dans_toute_la_liste(suite, gabarit, graine, filtre, liste, total).await?;
+    tracing::debug!(
+        profil = cle.0,
+        liste = %cle.1,
+        total,
+        bloques,
+        ms = debut.elapsed().as_millis() as u64,
+        "politique_parentale_total_recompte"
+    );
+    if let Ok(mut d) = decomptes().lock() {
+        d.retain(|_, c| c.quand.elapsed() < DUREE_DU_DECOMPTE);
+        d.insert(
+            cle,
+            Decompte {
+                total_servi: total,
+                empreinte,
+                bloques,
+                quand: std::time::Instant::now(),
+            },
+        );
+    }
+    Some(bloques)
+}
+
+/// #7913 — le total EXACT d'une liste paginée pour un profil supervisé.
+///
+/// Le filtre ne voit que la page servie : un `total` diminué des seuls
+/// éléments retirés de CETTE page comptait encore ceux des autres pages. La
+/// liste est donc relue page à page (même requête, `offset`/`limit`
+/// réécrits, la graine d'un tri aléatoire reprise), et ses éléments bloqués
+/// comptés. Rend `None` si une relecture échoue : le total reste alors celui
+/// de la page, comme avant.
+async fn bloques_dans_toute_la_liste(
+    suite: &Next,
+    gabarit: &(
+        axum::http::Uri,
+        axum::http::HeaderMap,
+        axum::http::Extensions,
+    ),
+    graine: Option<&Value>,
+    filtre: &Filtre,
+    liste: Liste,
+    total: u64,
+) -> Option<u64> {
+    let (uri, entetes, extensions) = gabarit;
+    // Les paramètres de la requête, gardés tels quels (encodés), sauf la
+    // fenêtre et la graine, réécrites à chaque page.
+    let garder: Vec<&str> = uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .filter(|p| {
+            let cle = p.split('=').next().unwrap_or("");
+            !matches!(cle, "limit" | "offset" | "seed")
+        })
+        .collect();
+    let graine = graine.and_then(|g| match g {
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) => Some(urlencoding::encode(s).into_owned()),
+        _ => None,
+    });
+    let mut bloques = 0u64;
+    let mut offset = 0u64;
+    for _ in 0..PAGES_DE_COMPTAGE_MAX {
+        let mut q: Vec<String> = garder.iter().map(|p| p.to_string()).collect();
+        q.push(format!("limit={PAGE_DE_COMPTAGE}"));
+        q.push(format!("offset={offset}"));
+        if let Some(g) = &graine {
+            q.push(format!("seed={g}"));
+        }
+        let q = q.join("&");
+        let cible = format!("{}?{}", uri.path(), q);
+        let mut req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(cible)
+            .body(Body::empty())
+            .ok()?;
+        *req.headers_mut() = entetes.clone();
+        *req.extensions_mut() = extensions.clone();
+        req.extensions_mut().insert(RecomptageParental);
+        PAGES_RELUES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reponse = suite.clone().run(req).await;
+        if !reponse.status().is_success() {
+            return None;
+        }
+        let octets = axum::body::to_bytes(reponse.into_body(), CORPS_MAX)
+            .await
+            .ok()?;
+        let page: Value = serde_json::from_slice(&octets).ok()?;
+        let n = page.get("items").and_then(Value::as_array)?.len() as u64;
+        bloques += filtre.bloques_au_premier_rang(&page, liste) as u64;
+        offset += n;
+        if n == 0 || offset >= total {
+            return Some(bloques);
+        }
+    }
+    None
 }
 
 /// #8088 — les routes dont les contenus explicites sont retirés pour un
@@ -232,7 +466,8 @@ pub(crate) async fn filtrer_les_listes(
     }
     let liste = liste_de_la_route(req.uri().path());
     let contenus = route_a_contenus(req.uri().path());
-    if liste.is_none() && !contenus {
+    let fiche = fiche_de_la_route(req.uri().path());
+    if liste.is_none() && !contenus && fiche.is_none() {
         return next.run(req).await;
     }
     let lang = crate::i18n::lang_from_header(req.headers());
@@ -242,8 +477,8 @@ pub(crate) async fn filtrer_les_listes(
         Err(never) => match never {},
     };
     let req = Request::from_parts(parts, body);
-    let politique = match pp::lire(&state.backend, profil) {
-        Ok(Some(p)) => p.politique,
+    let (politique, revision) = match pp::lire(&state.backend, profil) {
+        Ok(Some(p)) => (p.politique, p.revision),
         Ok(None) => return next.run(req).await,
         // Sans table, aucune politique n'a pu être posée.
         Err(e) if pp::table_absente(&e) => {
@@ -253,7 +488,13 @@ pub(crate) async fn filtrer_les_listes(
         // Une politique illisible ne doit pas laisser passer la liste entière.
         Err(e) => return interne(e),
     };
-    if liste.is_none() && !politique.masquer_explicite {
+    let filtre = Filtre::depuis(&politique);
+    // #7913 — toutes les routes de la bibliothèque passent désormais par le
+    // filtre des artistes : sans artiste bloqué, elles n'ont rien à relire.
+    let liste = liste.filter(|l| {
+        !matches!(l, Liste::Bibliotheque | Liste::Artistes) || filtre.bloque_des_artistes()
+    });
+    if liste.is_none() && fiche.is_none() && !politique.masquer_explicite {
         return next.run(req).await;
     }
     // #8088 — les marques explicites de la bibliothèque locale, lues une
@@ -267,6 +508,13 @@ pub(crate) async fn filtrer_les_listes(
     } else {
         None
     };
+    // #7913 — de quoi relire la liste pour son total exact.
+    let gabarit = (
+        req.uri().clone(),
+        req.headers().clone(),
+        req.extensions().clone(),
+    );
+    let suite = next.clone();
     let reponse = next.run(req).await;
     let est_json = reponse
         .headers()
@@ -284,7 +532,35 @@ pub(crate) async fn filtrer_les_listes(
     let Ok(mut valeur) = serde_json::from_slice::<Value>(&octets) else {
         return Response::from_parts(parts, Body::from(octets));
     };
-    let mut retires = liste.map_or(0, |l| Filtre::depuis(&politique).filtrer(&mut valeur, l));
+    // #7913 — la fiche d'un élément bloqué : refusée, pas vidée.
+    if let Some(f) = fiche
+        && filtre.fiche_bloquee(&valeur, f)
+    {
+        tracing::debug!(profil, fiche = ?f, "politique_parentale_fiche_bloquee_refusee");
+        return refus(StatusCode::FORBIDDEN, CODE_REFUS_FICHE_BLOQUEE);
+    }
+    let total_servi = valeur.get("total").and_then(Value::as_u64);
+    let mut retires = liste.map_or(0, |l| filtre.filtrer(&mut valeur, l));
+    // #7913 — le total d'une liste paginée compte seulement ce que le profil
+    // peut voir, sur TOUTES les pages.
+    if let (Some(l @ (Liste::Bibliotheque | Liste::Artistes)), Some(total)) = (liste, total_servi)
+        && filtre.bloque_des_artistes()
+        && valeur.get("items").is_some_and(Value::is_array)
+        && let Some(bloques) = bloques_avec_cache(
+            &state,
+            (profil, chemin_sans_fenetre(&gabarit.0), revision),
+            &suite,
+            &gabarit,
+            valeur.get("seed"),
+            &filtre,
+            l,
+            total,
+        )
+        .await
+    {
+        valeur["total"] = Value::from(total.saturating_sub(bloques));
+        retires = retires.max(1);
+    }
     if let Some(m) = &marques {
         // La fiche d'un album ou d'une piste explicite : refusée, pas vidée.
         if m.racine_explicite(&valeur) {
@@ -327,6 +603,65 @@ mod tests_8088 {
             "/api/v1/profiles/2/politique-parentale",
         ] {
             assert!(!route_a_contenus(c), "{c}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_7913 {
+    use super::{Fiche, Liste, fiche_de_la_route, liste_de_la_route};
+
+    #[test]
+    fn les_rangees_et_sous_listes_sont_filtrees_7913() {
+        for c in [
+            "/api/v1/home",
+            "/api/v1/home/recently-added",
+            "/api/v1/library/genres/Rock/albums",
+            "/api/v1/library/collections/3/albums",
+            "/api/v1/library/smart-playlists/2/tracks",
+            "/api/v1/library/smart-collections",
+            "/api/v1/library/artists/4/albums",
+        ] {
+            assert_eq!(liste_de_la_route(c), Some(Liste::Bibliotheque), "{c}");
+        }
+        assert_eq!(
+            liste_de_la_route("/api/v1/library/artists"),
+            Some(Liste::Artistes)
+        );
+        assert_eq!(liste_de_la_route("/api/v1/homeassistant/x"), None);
+        assert_eq!(liste_de_la_route("/api/v1/zones"), None);
+    }
+
+    #[test]
+    fn les_fiches_ouvertes_directement_7913() {
+        assert_eq!(
+            fiche_de_la_route("/api/v1/library/albums/12"),
+            Some(Fiche::Album)
+        );
+        assert_eq!(
+            fiche_de_la_route("/api/v1/library/artists/7"),
+            Some(Fiche::Artiste)
+        );
+        assert_eq!(
+            fiche_de_la_route("/api/v1/library/tracks/9"),
+            Some(Fiche::Piste)
+        );
+        assert_eq!(fiche_de_la_route("/api/v1/radios/5"), Some(Fiche::Radio));
+        assert_eq!(
+            fiche_de_la_route("/api/v1/podcasts/episodes/8"),
+            Some(Fiche::Podcast)
+        );
+        assert_eq!(
+            fiche_de_la_route("/api/v1/podcasts/episodes"),
+            Some(Fiche::Podcast)
+        );
+        for c in [
+            "/api/v1/library/albums",
+            "/api/v1/library/albums/12/tracks",
+            "/api/v1/radios/search",
+            "/api/v1/radios/favorites",
+        ] {
+            assert_eq!(fiche_de_la_route(c), None, "{c}");
         }
     }
 }

@@ -224,6 +224,21 @@ struct StreamingFailure {
 fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) -> Response {
     match result {
         Ok(data) => Json(json!(data)).into_response(),
+        // #8579 — un refus qui porte un code stable (Spotify :
+        // `spotify_reconnexion_favoris`, liaison sans la portée d'écriture
+        // des favoris) : 409 JSON `{code, error, message}`, que l'écran
+        // traduit et accompagne de « Reconnecter ». Aucune route de ce
+        // convertisseur ne rendait `Refused` jusqu'ici (les refus de
+        // connexion passent par `reponse_echec_auth`).
+        Err(tune_core::TuneError::Refused { code, message }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "code": code,
+                "error": code,
+                "message": message,
+            })),
+        )
+            .into_response(),
         Err(e) => {
             let status = statut_porte_par_l_erreur(&e).unwrap_or(StatusCode::BAD_GATEWAY);
             let error_kind = match &e {
@@ -249,6 +264,35 @@ fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) ->
             });
             response
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_refus_code_8579 {
+    //! #8579 — un refus au code stable devient un 409 JSON que l'écran
+    //! traduit (« Reconnectez Spotify une fois pour gérer vos favoris »).
+    use super::*;
+
+    #[tokio::test]
+    async fn un_refus_au_code_stable_rend_un_409_json() {
+        let r = svc_response::<()>(Err(tune_core::TuneError::Refused {
+            code: tune_core::streaming::spotify::CODE_RECONNEXION_FAVORIS,
+            message: "portee manquante".into(),
+        }));
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        let corps: Value = serde_json::from_slice(&octets).expect("corps JSON");
+        assert_eq!(corps["code"], "spotify_reconnexion_favoris");
+        assert_eq!(corps["error"], "spotify_reconnexion_favoris");
+    }
+
+    /// Contre-épreuve : une panne ordinaire garde son 502 en texte.
+    #[tokio::test]
+    async fn une_panne_garde_son_502() {
+        let r = svc_response::<()>(Err(tune_core::TuneError::Streaming(
+            "spotify PUT /me/library: 500".into(),
+        )));
+        assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
     }
 }
 

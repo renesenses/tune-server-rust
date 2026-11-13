@@ -169,6 +169,124 @@ pub fn memoire_vive_totale() -> Option<u64> {
     }
 }
 
+/// La mémoire qu'une nouvelle allocation peut encore obtenir, en octets
+/// (#8558). Linux seulement : le MINIMUM de `MemAvailable` (`/proc/meminfo`)
+/// et de la marge sous chaque plafond cgroup v2 (`memory.max`) du cgroup du
+/// processus et de ses ancêtres, lu via `/proc/self/cgroup` — une unité
+/// systemd bornée ou un conteneur `--memory` se voient ainsi, même quand le
+/// plafond est posé sur un parent et non à la racine.
+///
+/// La marge d'un cgroup est `memory.max − (memory.current − inactive_file)` :
+/// `memory.current` compte le cache de pages, que le noyau récupère avant de
+/// tuer quiconque. Sans ce retrait, un conteneur qui a lu quelques albums
+/// paraissait plein (marge ≈ 0).
+///
+/// `None` hors Linux, ou si rien ne se lit : l'appelant ne doit rien inventer.
+/// Le cgroup v1 n'est pas lu ici (`MemAvailable` seul).
+///
+/// ⚠️ `audio::embedding` a sa propre lecture (cgroup v1 compris), derrière la
+/// fonctionnalité `audio-embedding` : à fusionner ici quand on y touchera.
+pub fn memoire_disponible() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let lire = |p: &str| std::fs::read_to_string(p).ok();
+        let meminfo = lire("/proc/meminfo")
+            .as_deref()
+            .and_then(memoire_disponible_de_meminfo);
+        let marges = lire("/proc/self/cgroup")
+            .as_deref()
+            .and_then(chemin_du_cgroup_v2)
+            .map(|chemin| {
+                dossiers_du_cgroup_et_de_ses_parents("/sys/fs/cgroup", &chemin)
+                    .into_iter()
+                    .filter_map(|d| {
+                        marge_du_cgroup(
+                            lire(&format!("{d}/memory.max")).as_deref(),
+                            lire(&format!("{d}/memory.current")).as_deref(),
+                            lire(&format!("{d}/memory.stat")).as_deref(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        plus_petite_marge(meminfo, marges)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Le chemin du cgroup v2 du processus, tiré de `/proc/self/cgroup` (la ligne
+/// `0::/chemin`). `None` en cgroup v1 pur.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn chemin_du_cgroup_v2(proc_self_cgroup: &str) -> Option<String> {
+    proc_self_cgroup
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(|c| c.trim().to_string())
+}
+
+/// Le dossier du cgroup sous `racine`, puis chacun de ses parents jusqu'à la
+/// racine comprise. Un chemin qui remonte (`..`) est refusé : on ne lit que
+/// sous `racine`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn dossiers_du_cgroup_et_de_ses_parents(racine: &str, chemin: &str) -> Vec<String> {
+    let morceaux: Vec<&str> = chemin.split('/').filter(|m| !m.is_empty()).collect();
+    if morceaux.contains(&"..") {
+        return vec![racine.to_string()];
+    }
+    (0..=morceaux.len())
+        .rev()
+        .map(|n| {
+            let mut d = racine.to_string();
+            for m in &morceaux[..n] {
+                d.push('/');
+                d.push_str(m);
+            }
+            d
+        })
+        .collect()
+}
+
+/// Marge sous le plafond d'UN cgroup v2, en octets : `memory.max` moins
+/// `memory.current` dont on retire `inactive_file` (cache de pages
+/// récupérable, `memory.stat`). `None` sans plafond (`max`, fichier absent ou
+/// illisible).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn marge_du_cgroup(plafond: Option<&str>, usage: Option<&str>, stat: Option<&str>) -> Option<u64> {
+    let plafond: u64 = plafond?.trim().parse().ok()?;
+    let usage: u64 = usage?.trim().parse().ok()?;
+    let recuperable: u64 = stat
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("inactive_file "))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0);
+    Some(plafond.saturating_sub(usage.saturating_sub(recuperable)))
+}
+
+/// Le plus petit de `MemAvailable` et des marges des cgroups. `None` si rien
+/// n'a été lu.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn plus_petite_marge(meminfo: Option<u64>, marges: Vec<u64>) -> Option<u64> {
+    meminfo.into_iter().chain(marges).min()
+}
+
+/// `MemAvailable` de `/proc/meminfo`, en octets.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn memoire_disponible_de_meminfo(meminfo: &str) -> Option<u64> {
+    let kio: u64 = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kio.saturating_mul(1024))
+}
+
 /// Plancher du plafond d'un cache posé en mémoire : de quoi garder la piste
 /// en cours et la suivante, même sur une petite machine.
 pub const PLANCHER_CACHE_EN_MEMOIRE: u64 = 128 * 1024 * 1024;
@@ -240,6 +358,68 @@ pub fn plafond_de_cache_pour(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memoire_disponible_lit_le_cgroup_puis_meminfo_8558() {
+        // Sans plafond, pas de marge de cgroup.
+        assert_eq!(marge_du_cgroup(Some("max\n"), Some("100\n"), None), None);
+        assert_eq!(marge_du_cgroup(None, Some("1"), None), None);
+        assert_eq!(
+            marge_du_cgroup(Some("1000\n"), Some("300\n"), None),
+            Some(700)
+        );
+        assert_eq!(marge_du_cgroup(Some("100"), Some("300"), None), Some(0));
+        // Le cache de pages récupérable (`inactive_file`) est rendu à la
+        // marge : un conteneur qui a lu des albums n'est pas « plein ».
+        let stat = "anon 100\nfile 900\ninactive_file 800\nactive_file 100\n";
+        assert_eq!(
+            marge_du_cgroup(Some("1000"), Some("1000"), Some(stat)),
+            Some(800)
+        );
+        // Un `inactive_file` incohérent (> usage) ne fait pas déborder.
+        assert_eq!(
+            marge_du_cgroup(Some("1000"), Some("10"), Some("inactive_file 50\n")),
+            Some(1000)
+        );
+        assert_eq!(
+            memoire_disponible_de_meminfo(
+                "MemTotal:  4177920 kB\nMemFree: 1 kB\nMemAvailable:   3460000 kB\n"
+            ),
+            Some(3_460_000 * 1024)
+        );
+        assert_eq!(memoire_disponible_de_meminfo("MemTotal: 1 kB\n"), None);
+        // Le minimum de tout ce qui a été lu.
+        assert_eq!(plus_petite_marge(Some(500), vec![700, 300]), Some(300));
+        assert_eq!(plus_petite_marge(Some(200), vec![700]), Some(200));
+        assert_eq!(plus_petite_marge(None, vec![]), None);
+    }
+
+    #[test]
+    fn le_cgroup_du_processus_et_ses_parents_8558() {
+        assert_eq!(
+            chemin_du_cgroup_v2("0::/system.slice/tune.service\n"),
+            Some("/system.slice/tune.service".into())
+        );
+        // cgroup v1 pur : rien.
+        assert_eq!(chemin_du_cgroup_v2("4:memory:/docker/abc\n"), None);
+        assert_eq!(
+            dossiers_du_cgroup_et_de_ses_parents("/sys/fs/cgroup", "/system.slice/tune.service"),
+            vec![
+                "/sys/fs/cgroup/system.slice/tune.service".to_string(),
+                "/sys/fs/cgroup/system.slice".to_string(),
+                "/sys/fs/cgroup".to_string(),
+            ]
+        );
+        // Conteneur avec espace de noms cgroup : `0::/` — la racine seule.
+        assert_eq!(
+            dossiers_du_cgroup_et_de_ses_parents("/sys/fs/cgroup", "/"),
+            vec!["/sys/fs/cgroup".to_string()]
+        );
+        assert_eq!(
+            dossiers_du_cgroup_et_de_ses_parents("/sys/fs/cgroup", "/../etc"),
+            vec!["/sys/fs/cgroup".to_string()]
+        );
+    }
+
     use super::*;
 
     /// Le témoin de #4770 : **deux utilisateurs ne se marchent pas dessus**.
