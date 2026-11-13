@@ -444,6 +444,11 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // la passe de fond les NOMMENT.
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS country TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS country_mbid TEXT",
+    // #8668 — le pays d'édition MusicBrainz et la release dont il a été lu
+    // (PG 118). Ici AUSSI : une base de bascule ne rejoue pas la 118, et les
+    // facettes comme la passe de fond les NOMMENT.
+    "ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country TEXT",
+    "ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country_mbid TEXT",
     // #7765 — la source d'un crédit de piste (PG 102). Ici AUSSI : tous les
     // écrivains de crédits et les passes « à faire » NOMMENT la colonne.
     // L'index JUSTE APRÈS la colonne.

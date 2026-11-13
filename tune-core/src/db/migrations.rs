@@ -2907,7 +2907,27 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "alarms_interrupt_playback",
         up: "",
     },
+    // #8668 — le pays d'ÉDITION lu sur la release MusicBrainz de l'album :
+    // `albums.release_country` (code ISO 3166-1 alpha-2, '' quand MusicBrainz
+    // n'en donne aucun) et `albums.release_country_mbid`, l'identifiant de
+    // release dont il a été lu. Seuls ~50 albums sur 9 490 portaient la
+    // balise RELEASECOUNTRY au .18, 858 ont un `musicbrainz_release_id`.
+    // Colonnes posées dans le bloc de version et dans la passe finale (même
+    // règle qu'à la 133). Jumelle PG : 118. 🔴 #8656 (ouverte) réclame aussi
+    // 152 / PG 118 : la seconde fusionnée se renumérote.
+    Migration {
+        version: 152,
+        name: "albums_release_country",
+        up: "",
+    },
 ];
+
+/// Pose `albums.release_country` et `albums.release_country_mbid` (#8668) —
+/// bloc de version de la 152 et passe finale.
+fn pays_des_editions(db: &SqliteDb) {
+    add_column_if_missing(db, "albums", "release_country", "TEXT");
+    add_column_if_missing(db, "albums", "release_country_mbid", "TEXT");
+}
 
 /// Pose `alarms.interrupt_playback` (#8615) — bloc de version de la 151 et
 /// passe finale. 1 pour l'existant : l'option est cochée par défaut.
@@ -4432,6 +4452,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // #8615 — « Interrompre la lecture en cours », cochée par défaut.
             interruption_par_le_reveil(db);
         }
+        if migration.version == 152 {
+            // #8668 — le pays d'édition MusicBrainz. NULL pour l'existant :
+            // la passe de fond le lit.
+            pays_des_editions(db);
+        }
         if migration.version == 137 {
             // #7765 — la source des crédits, puis l'attribution UNE fois des
             // lignes existantes. L'index vient APRES la colonne qu'il nomme.
@@ -5051,6 +5076,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // posée ICI aussi : le planificateur et les routes des réveils la
     // NOMMENT. PG : 117.
     interruption_par_le_reveil(db);
+    // Le pays d'édition MusicBrainz (migration 152, #8668) — posé ICI aussi :
+    // les facettes, le filtre Pays et la passe de fond le NOMMENT. PG : 118.
+    pays_des_editions(db);
     // L'ordre des etiquettes (migration 127, #6257) — pose ICI aussi :
     // l'INSERT des etiquettes le NOMME. Sans rangement : toutes a 0, la liste
     // reste rangee par nom (le nom departage). PG : migration 091.
@@ -6185,6 +6213,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         117,
         "alarms_interrupt_playback",
         include_str!("../../migrations/postgres/117_alarms_interrupt_playback.sql"),
+    ),
+    // Jumelle de la SQLite 152 (#8668) : `albums.release_country` et
+    // `albums.release_country_mbid`, le pays d'édition lu sur MusicBrainz.
+    (
+        118,
+        "albums_release_country",
+        include_str!("../../migrations/postgres/118_albums_release_country.sql"),
     ),
 ];
 
@@ -10052,7 +10087,10 @@ mod tests {
         // 117 : `alarms_interrupt_playback` (#8615), jumelle de la SQLite
         // 151. Pose l'option de réveil « Interrompre la lecture en cours »,
         // que le planificateur et les routes des réveils NOMMENT.
-        assert_eq!(pg_latest_version(), 117, "latest PG migration must be 117");
+        // 118 : `albums_release_country` (#8668), jumelle de la SQLite 152.
+        // Pose le pays d'édition MusicBrainz, que les facettes, le filtre
+        // Pays et la passe de fond NOMMENT.
+        assert_eq!(pg_latest_version(), 118, "latest PG migration must be 118");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
