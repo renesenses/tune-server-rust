@@ -11032,6 +11032,85 @@ async fn frequence_fixe_8428_url_directe_ne_contourne_pas_la_conversion() {
     assert!(pcm.iter().any(|b| *b != 0));
 }
 
+/// #8428 (re-relecture du 13/11) — un saut demandé sur une source SANS
+/// `Range` : le décodeur repart du début, et la session le dit en servant la
+/// piste entière (1 s à 48 kHz) au lieu d'un flux décalé sans le dire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_saut_sans_range_repart_du_debut() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed seek", Some("local"), Some("local:8428-seek"))
+        .unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let (url, serveur) = serveur_wav_8428(wav_sinus_8428(1), None).await;
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.track_id = None;
+    req.source = Some("upnp".into());
+    req.source_id = Some(url.clone());
+    req.output_device_id = Some("local:8428-seek".into());
+    req.sample_rate = Some(44_100);
+    req.bit_depth = Some(16);
+    req.duration_ms = Some(1000);
+    req.seek_ms = Some(500);
+    let resolu = orch.resolve_direct_url(&req).await.unwrap();
+    let sid = resolu.stream_id.expect("session convertie");
+    let octets_par_trame = 2 * usize::try_from(resolu.bit_depth.unwrap() / 8).unwrap();
+    let (cadence, pcm) = lire_la_session_wav_8428(&orch, &sid, octets_par_trame, 48_000).await;
+    orch.streamer.remove_session(&sid).await;
+    serveur.abort();
+    assert_eq!(cadence, 48_000);
+    let trames = pcm.len() / octets_par_trame;
+    assert!(
+        trames.abs_diff(48_000) <= 48,
+        "sans Range, le saut est ignoré : la seconde entière est servie, pas {trames} trames"
+    );
+}
+
+/// #8428 (re-relecture du 13/11) — un `.opus` poussé vers une zone à cadence
+/// fixe : le décodeur au fil de l'eau d'une source distante ne lit pas
+/// l'Opus. L'URL garde le chemin sans cadence fixe et la lecture aboutit
+/// (sortie factice), au lieu d'un `track_decode_failed` muet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_url_directe_opus_joue_sans_la_cadence_fixe() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed opus", Some("local"), Some("local:8428-opus"))
+        .unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "96000")
+        .unwrap();
+    let opus = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/test.opus"
+    ))
+    .unwrap();
+    let (url, serveur) = serveur_wav_8428(opus, None).await;
+    let url = url.replace("source.wav", "source.opus");
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.track_id = None;
+    req.source = Some("upnp".into());
+    req.source_id = Some(url.clone());
+    req.output_device_id = Some("local:8428-opus".into());
+    req.sample_rate = Some(48_000);
+    req.bit_depth = Some(16);
+    req.duration_ms = Some(1000);
+    let resolu = orch
+        .resolve_direct_url(&req)
+        .await
+        .expect("un .opus sur une zone à cadence fixe doit se lire");
+    assert_ne!(
+        resolu.sample_rate,
+        Some(96_000),
+        "l'Opus ne passe pas par la session WAV à cadence fixe"
+    );
+    if let Some(sid) = resolu.stream_id {
+        orch.streamer.remove_session(&sid).await;
+    }
+    serveur.abort();
+}
+
 /// #8428 (relecture du 12/11) — un flux poussé non étiqueté « radio » dont la
 /// fin n'arrive pas (BubbleUPnP, mconnect) : le premier son part sans
 /// attendre le dernier octet (aucun téléchargement préalable, donc aucun
