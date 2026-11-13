@@ -87,8 +87,10 @@ pub mod profil_par_appareil;
 pub mod profiles;
 pub mod radios;
 pub mod radios_annuaire;
+// Discussion #8273 (rc13) — sonde d'une adresse de station collée.
 pub mod radios_criteres_7466;
 pub mod radios_libelles;
+pub(crate) mod radios_sonde_8273;
 pub mod room_calibration;
 pub mod room_correction;
 pub mod roon_bridge;

@@ -264,12 +264,28 @@ fn est_un_dossier(entry: &std::fs::DirEntry) -> bool {
     }
 }
 
-/// Le corps de `GET /library/browse/dir`, exécuté HORS de l'exécuteur (#5677).
-fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Value, AppError> {
-    let debut = std::time::Instant::now();
+/// Le chemin demandé, résolu sur le disque (forme NFC ou NFD, voir
+/// [`resolve_browse_path`]) et vérifié SOUS un dossier musical configuré, avec
+/// la racine qui le contient.
+///
+/// Partagé par la lecture d'un répertoire et par la pochette de dossier
+/// (discussion #8273) : une seule porte d'entrée vers le disque, pour que la
+/// vignette ne puisse pas lire ce que la liste refuserait d'ouvrir.
+pub(super) fn chemin_dans_la_bibliotheque(
+    state: &AppState,
+    brut: &str,
+) -> Result<(String, String), AppError> {
     let normalized_query =
-        resolve_browse_path(&q.path).ok_or_else(|| AppError::bad_request("invalid path"))?;
-    let resolved = std::path::Path::new(&normalized_query);
+        resolve_browse_path(brut).ok_or_else(|| AppError::bad_request("invalid path"))?;
+    // `Path::starts_with` compare des composants, pas un chemin canonique : un
+    // segment `..` resterait « sous » la racine pour lui tout en en sortant
+    // sur le disque. Aucun dossier de la vue n'en porte ; on le refuse.
+    if std::path::Path::new(&normalized_query)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(AppError::bad_request("invalid path"));
+    }
 
     // Verify path is under a configured music dir.
     // Use std::path::Path::starts_with for OS-aware prefix matching
@@ -300,6 +316,14 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
         ));
     };
     let music_root = tune_core::scanner::walker::normalize_path(music_root);
+    Ok((normalized_query, music_root))
+}
+
+/// Le corps de `GET /library/browse/dir`, exécuté HORS de l'exécuteur (#5677).
+fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Value, AppError> {
+    let debut = std::time::Instant::now();
+    let (normalized_query, music_root) = chemin_dans_la_bibliotheque(state, &q.path)?;
+    let resolved = std::path::Path::new(&normalized_query);
 
     // List subdirectories. On lit le chemin RÉSOLU, pas `q.path` brut : c'est
     // celui dont on vient de vérifier l'existence et l'appartenance à un dossier

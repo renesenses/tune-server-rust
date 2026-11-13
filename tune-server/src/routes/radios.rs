@@ -258,7 +258,7 @@ pub(crate) fn valider_url_flux(saisie: &str) -> Result<String, ProblemeUrlFlux> 
 /// Court, délibérément : c'est un formulaire, l'utilisateur attend devant son
 /// écran. Passé ce délai on ENREGISTRE — voir [`sonder_le_flux`] : une station
 /// lente n'est pas une station fausse.
-const DELAI_SONDE_FLUX: std::time::Duration = std::time::Duration::from_secs(4);
+pub(crate) const DELAI_SONDE_FLUX: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Le serveur de la station rend-il, MAINTENANT, autre chose que de l'audio ?
 ///
@@ -408,7 +408,7 @@ fn meme_diffuseur(a: &str, b: &str) -> bool {
 /// pour que le comptage distingue « le serveur sait proposer » de « le serveur
 /// a proposé quelque chose » : `proposees = 0` est une information, pas une
 /// absence de trace.
-fn suggestions_du_catalogue(
+pub(crate) fn suggestions_du_catalogue(
     repo: &RadioRepo,
     nom_saisi: Option<&str>,
     url_refusee: &str,
@@ -469,7 +469,7 @@ fn suggestions_du_catalogue(
 /// présent, éventuellement vide — un écran n'a pas à distinguer « aucune
 /// suggestion » de « ce serveur n'en propose pas » (même règle que
 /// `corps_recherche`).
-fn refus_url(
+pub(crate) fn refus_url(
     probleme: &ProblemeUrlFlux,
     lang: &str,
     suggestions: &[RadioStation],
@@ -1533,6 +1533,9 @@ pub fn router() -> Router<AppState> {
         // #6516 — l'annuaire radio-metadata.fr complet, servi depuis le cache.
         .merge(super::radios_annuaire::router())
         .route("/add", get(add_from_web))
+        // Discussion #8273 (rc13) — sonder une adresse collée pour pré-remplir
+        // le formulaire d'ajout. Avant `/{id}` : chemin fixe, POST seul.
+        .route("/probe", post(super::radios_sonde_8273::sonder_une_station))
         .route(
             "/{id}",
             get(get_radio).put(update_radio).delete(delete_radio),

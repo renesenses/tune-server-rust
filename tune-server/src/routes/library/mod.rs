@@ -11,6 +11,8 @@ mod artists;
 mod artwork;
 mod better_quality;
 mod browse;
+// Discussion #8273 (rc13) — la pochette de chaque dossier de « Répertoires ».
+mod pochette_de_dossier_8273;
 // `pub(crate)` : `/tags/{id}/collections` (routes/tags.rs) rend les dossiers d'une
 // étiquette dans la forme SERVIE de `/library/collections` — même fonction,
 // mêmes `album_count` et `orphan_album_ids` (#4798).
@@ -717,6 +719,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/browse", get(browse::browse_roots))
         .route("/browse/dir", get(browse::browse_directory))
+        .route(
+            "/browse/cover",
+            get(pochette_de_dossier_8273::pochette_de_dossier),
+        )
         .route("/folders", get(browse::browse_folders))
         .route("/genres", get(genres::list_genres))
         .route("/genres/rename", post(genres::rename_genre))
