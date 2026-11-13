@@ -4062,6 +4062,23 @@
     "pl": "Spotify pozwala słuchać w aplikacji innej firmy, takiej jak Tune, tylko z kontem Spotify Premium, a to konto go nie ma. Przeglądanie (playlisty, albumy, wyszukiwanie) pozostaje dostępne; aby słuchać, użyj aplikacji Spotify lub przejdź na Premium.",
     "el": "Το Spotify επιτρέπει την ακρόαση σε εφαρμογή τρίτων όπως το Tune μόνο με λογαριασμό Spotify Premium, και αυτός ο λογαριασμός δεν έχει. Η περιήγηση (λίστες, άλμπουμ, αναζήτηση) παραμένει διαθέσιμη· για ακρόαση, χρησιμοποιήστε την εφαρμογή Spotify ή περάστε σε Premium."
   },
+  "spotify.playback.audioKeyRefused": {
+    "fr": "Spotify a refusé les clés audio de ce compte : ses titres ne peuvent pas être lus dans Tune. Ce refus vient de Spotify, pas de Tune.",
+    "en": "Spotify refused the audio keys for this account: its tracks cannot be played in Tune. The refusal comes from Spotify, not from Tune.",
+    "de": "Spotify hat die Audioschlüssel dieses Kontos verweigert: Seine Titel können in Tune nicht abgespielt werden. Die Ablehnung kommt von Spotify, nicht von Tune.",
+    "es": "Spotify ha rechazado las claves de audio de esta cuenta: sus canciones no se pueden reproducir en Tune. El rechazo viene de Spotify, no de Tune.",
+    "it": "Spotify ha rifiutato le chiavi audio di questo account: i suoi brani non possono essere riprodotti in Tune. Il rifiuto viene da Spotify, non da Tune.",
+    "zh": "Spotify 拒绝了此账户的音频密钥：其曲目无法在 Tune 中播放。拒绝来自 Spotify，而非 Tune。",
+    "ja": "Spotify がこのアカウントのオーディオキーを拒否しました。このアカウントの曲は Tune で再生できません。拒否しているのは Tune ではなく Spotify です。",
+    "ko": "Spotify가 이 계정의 오디오 키를 거부했습니다. 이 계정의 곡은 Tune에서 재생할 수 없습니다. 거부는 Tune이 아니라 Spotify에서 온 것입니다.",
+    "ro": "Spotify a refuzat cheile audio ale acestui cont: piesele sale nu pot fi redate în Tune. Refuzul vine de la Spotify, nu de la Tune.",
+    "sv": "Spotify har nekat ljudnycklarna för det här kontot: dess spår kan inte spelas i Tune. Nekandet kommer från Spotify, inte från Tune.",
+    "hu": "A Spotify elutasította ennek a fióknak a hangkulcsait: a számai nem játszhatók le a Tune-ban. Az elutasítás a Spotifytól származik, nem a Tune-tól.",
+    "vi": "Spotify đã từ chối khóa âm thanh của tài khoản này: không thể phát các bài hát của tài khoản trong Tune. Sự từ chối đến từ Spotify, không phải từ Tune.",
+    "nb": "Spotify har avvist lydnøklene for denne kontoen: sporene kan ikke spilles av i Tune. Avvisningen kommer fra Spotify, ikke fra Tune.",
+    "pl": "Spotify odrzucił klucze audio tego konta: jego utworów nie można odtworzyć w Tune. Odmowa pochodzi od Spotify, nie od Tune.",
+    "el": "Το Spotify απέρριψε τα κλειδιά ήχου αυτού του λογαριασμού: τα κομμάτια του δεν μπορούν να αναπαραχθούν στο Tune. Η άρνηση προέρχεται από το Spotify, όχι από το Tune."
+  },
   "spotify.playback.linkRequired": {
     "fr": "Spotify demande une étape unique : dans l'application Spotify (téléphone ou ordinateur, même réseau, même compte), choisissez une fois l'appareil « {device} ». Tune garde ensuite cette liaison.",
     "en": "Spotify needs a one-time step: in the Spotify app (phone or computer, same network, same account), select the “{device}” device once. Tune then keeps this link.",
