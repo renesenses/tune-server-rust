@@ -334,6 +334,20 @@ fn jamais_ecoute() -> String {
     )
 }
 
+/// Le tirage d'une source de « À découvrir », rendu dans un ordre TOTAL.
+///
+/// `ORDER BY RANDOM() LIMIT n` choisit QUELS albums viennent ; l'ordre dans
+/// lequel ils sortent du tirage n'est pas le même d'un moteur à l'autre (ni
+/// d'un appel à l'autre), et `melanger_les_sources` (tune-server) le garde tel quel. Les
+/// albums tirés sont donc reclassés par titre puis identifiant : à tirage
+/// égal, SQLite et PostgreSQL rendent la même rangée (#8280).
+///
+/// `colonnes` nomme les colonnes du tirage, qui doit les aliaser à
+/// l'identique (`title` et `id` au moins).
+fn tirage_ordonne(colonnes: &str, tirage: &str) -> String {
+    format!("SELECT {colonnes} FROM ({tirage}) tirage ORDER BY tirage.title, tirage.id")
+}
+
 /// Les albums jamais écoutés d'un artiste dont la bibliothèque compte au
 /// moins DEUX albums, au hasard.
 ///
@@ -347,8 +361,9 @@ pub fn albums_d_artistes_possedes_non_ecoutes(engine: Engine) -> String {
     let inconnu = ph(engine, 1);
     let limite = ph(engine, 2);
     let jamais = jamais_ecoute();
-    format!(
-        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, n.nb \
+    let tirage = format!(
+        "SELECT a.id AS id, a.title AS title, ar.name AS artist_name, a.year AS year, \
+                a.cover_path AS cover_path, a.genre AS genre, n.nb AS nb \
          FROM albums a \
          JOIN artists ar ON ar.id = a.artist_id \
          JOIN (SELECT artist_id, COUNT(*) AS nb FROM albums \
@@ -360,6 +375,10 @@ pub fn albums_d_artistes_possedes_non_ecoutes(engine: Engine) -> String {
            AND {jamais} \
          ORDER BY RANDOM() \
          LIMIT {limite}"
+    );
+    tirage_ordonne(
+        "id, title, artist_name, year, cover_path, genre, nb",
+        &tirage,
     )
 }
 
@@ -390,8 +409,9 @@ pub fn decennie_la_plus_ecoutee() -> String {
 pub fn albums_de_la_decennie_non_ecoutes(engine: Engine) -> String {
     let (debut, fin, limite) = (ph(engine, 1), ph(engine, 2), ph(engine, 3));
     let jamais = jamais_ecoute();
-    format!(
-        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
+    let tirage = format!(
+        "SELECT a.id AS id, a.title AS title, ar.name AS artist_name, a.year AS year, \
+                a.cover_path AS cover_path, a.genre AS genre \
          FROM albums a \
          LEFT JOIN artists ar ON a.artist_id = ar.id \
          LEFT JOIN {TITRES_AMBIGUS} amb ON amb.title = a.title \
@@ -399,7 +419,8 @@ pub fn albums_de_la_decennie_non_ecoutes(engine: Engine) -> String {
            AND {jamais} \
          ORDER BY RANDOM() \
          LIMIT {limite}"
-    )
+    );
+    tirage_ordonne("id, title, artist_name, year, cover_path, genre", &tirage)
 }
 
 /// Les albums PEU écoutés : ceux auxquels l'historique rattache au moins
@@ -421,8 +442,9 @@ pub fn albums_de_la_decennie_non_ecoutes(engine: Engine) -> String {
 pub fn albums_peu_ecoutes(engine: Engine) -> String {
     let (plafond, avant, limite) = (ph(engine, 1), ph(engine, 2), ph(engine, 3));
     let historique = historique_rattache_a_son_album("", None);
-    format!(
-        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, e.nb \
+    let tirage = format!(
+        "SELECT a.id AS id, a.title AS title, ar.name AS artist_name, a.year AS year, \
+                a.cover_path AS cover_path, a.genre AS genre, e.nb AS nb \
          FROM (SELECT h.album_rattache AS album_id, COUNT(*) AS nb \
                FROM {historique} h \
                GROUP BY h.album_rattache \
@@ -432,6 +454,10 @@ pub fn albums_peu_ecoutes(engine: Engine) -> String {
          LEFT JOIN artists ar ON a.artist_id = ar.id \
          ORDER BY RANDOM() \
          LIMIT {limite}"
+    );
+    tirage_ordonne(
+        "id, title, artist_name, year, cover_path, genre, nb",
+        &tirage,
     )
 }
 
