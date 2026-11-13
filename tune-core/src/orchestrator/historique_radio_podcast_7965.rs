@@ -110,6 +110,7 @@ impl PlaybackOrchestrator {
                 pochette: station.logo.as_deref(),
             },
             None,
+            None,
         );
     }
 
@@ -149,6 +150,7 @@ impl PlaybackOrchestrator {
                 titre: Some(podcast),
                 pochette,
             },
+            None,
             None,
         );
     }

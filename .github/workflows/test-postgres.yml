@@ -307,6 +307,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7980 -- --nocapture --test-threads=1
 
+      # #8714 — une écoute ne compte que pour SA piste (`track_id`), sinon
+      # pour le titre de son album, et seulement en dernier recours par titre
+      # + interprète (ancien historique) : la copie d'une compilation ne
+      # monte plus avec l'album d'origine.
+      - name: Écoutes rapprochées par piste puis par album sur PostgreSQL (#8714)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8714 -- --nocapture --test-threads=1
+
       # #8416 — les règles « nombre d'écoutes » et « dernière écoute » des
       # listes et collections intelligentes comptent les écoutes importées
       # (`imported_plays`) comme la Bibliothèque. Sans cette étape, le témoin

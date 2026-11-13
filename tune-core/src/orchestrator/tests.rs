@@ -7082,6 +7082,7 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
             None,
             crate::orchestrator::ContexteEcoute::default(),
             album_ref,
+            None,
         );
         // #7852 : l'écoute armée est écrite au seuil, réputé franchi ici.
         assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
@@ -7134,6 +7135,49 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
     );
 }
 
+/// #8714 — l'écoute d'une piste de la bibliothèque écrit sa `track_id` :
+/// sans elle, le compte se rapprochait par titre + interprète et toutes les
+/// copies du titre (autres albums, compilations) montaient ensemble.
+#[tokio::test]
+async fn record_listen_ecrit_la_piste_ecoutee_8714() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Zone 8714", None, None)
+        .unwrap();
+    let mut piste = crate::db::models::Track::new("Homburg".to_string());
+    piste.file_path = Some("/musique/homburg-8714.flac".into());
+    let track_id = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone())
+        .create(&piste)
+        .unwrap();
+    orch.record_listen(
+        "Homburg",
+        Some("Procol Harum"),
+        Some("Procol Harum"),
+        "local",
+        None,
+        None,
+        180_000,
+        zone_id,
+        None,
+        None,
+        crate::orchestrator::ContexteEcoute::default(),
+        None,
+        Some(track_id),
+    );
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
+    let ecrite = orch
+        .db
+        .query_one("SELECT track_id FROM listen_history LIMIT 1", &[])
+        .ok()
+        .flatten()
+        .and_then(|cols| cols.first().and_then(|v| v.as_i64()));
+    assert_eq!(
+        ecrite,
+        Some(track_id),
+        "#8714 : la piste écoutée n'est pas écrite"
+    );
+}
+
 #[tokio::test]
 async fn test_record_listen() {
     use crate::db::history_repo::HistoryRepo;
@@ -7163,6 +7207,7 @@ async fn test_record_listen() {
             titre: Some("Les indispensables"),
             pochette: None,
         },
+        None,
         None,
     );
     // #7852 : rien n'est écrit avant le seuil ; réputé franchi ici, le test

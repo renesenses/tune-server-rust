@@ -296,6 +296,11 @@ pub mod sql {
 
     /// L'écoute de plusieurs pistes d'un coup : compte et dernière fois (#3518).
     ///
+    /// 🔴 #8714 — depuis, `track_id` est écrit et le rapprochement suit
+    /// [`ecoute_de_la_piste`] : piste, puis album + titre, puis titre +
+    /// interprète pour l'ancien historique seulement. Ce qui suit décrit la
+    /// règle d'avant, qui ne vaut plus que pour ce dernier cas.
+    ///
     /// # Pourquoi le rapprochement se fait par titre + interprète
     ///
     /// Parce que `listen_history.track_id` est **toujours NULL**. Le seul site
@@ -341,18 +346,16 @@ pub mod sql {
     /// `id_list` n'est composé que d'entiers, produits par l'appelant à partir
     /// des identifiants qu'il a lus en base — jamais d'une chaîne du client.
     pub fn plays_for_tracks(id_list: &str) -> String {
+        // #8714 — même règle que `ecoute_de_la_piste` (piste, puis album +
+        // titre, puis titre + interprète pour l'ancien historique).
         format!(
             "SELECT t.id, COUNT(h.id), MAX(h.listened_at) \
              FROM tracks t \
-             LEFT JOIN artists a ON a.id = t.artist_id \
              LEFT JOIN listen_history h \
                     ON {} \
-                   AND h.title = t.title \
-                   AND (h.artist_name = a.name \
-                        OR (h.artist_name IS NULL AND a.name IS NULL)) \
              WHERE t.id IN ({id_list}) \
              GROUP BY t.id",
-            meme_provenance("h", "t")
+            ecoute_de_la_piste("t", "h")
         )
     }
 
@@ -377,11 +380,26 @@ pub mod sql {
     pub fn ecoute_de_la_piste(piste: &str, ecoute: &str) -> String {
         let interprete =
             format!("(SELECT ae.name FROM artists ae WHERE ae.id = {piste}.artist_id)");
+        // #8714 (Procol Harum 1967, fil 2806) — le titre + interprète seul
+        // donnait à TOUTES les copies d'un titre (autres albums, compilations)
+        // le même compte. Désormais, du plus sûr au moins sûr :
+        // 1. l'écoute désigne une piste (`track_id`, écrit depuis #8714) :
+        //    elle ne revient qu'à cette piste ;
+        // 2. sinon, son album est connu et existe encore : elle revient au
+        //    titre de même nom DE CET ALBUM ;
+        // 3. sinon seulement (ancien historique sans album, album disparu) :
+        //    titre + interprète, comme avant.
         format!(
             "{} AND ({ecoute}.track_id = {piste}.id \
-             OR ({ecoute}.title = {piste}.title \
-                 AND ({ecoute}.artist_name = {interprete} \
-                      OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))))",
+             OR ({ecoute}.track_id IS NULL \
+                 AND {ecoute}.title = {piste}.title \
+                 AND (({ecoute}.album_id IS NOT NULL \
+                       AND EXISTS (SELECT 1 FROM albums al_ecoute WHERE al_ecoute.id = {ecoute}.album_id) \
+                       AND {ecoute}.album_id = {piste}.album_id) \
+                      OR (({ecoute}.album_id IS NULL \
+                           OR NOT EXISTS (SELECT 1 FROM albums al_ecoute WHERE al_ecoute.id = {ecoute}.album_id)) \
+                          AND ({ecoute}.artist_name = {interprete} \
+                               OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))))))",
             meme_provenance(ecoute, piste)
         )
     }
@@ -2550,6 +2568,10 @@ mod ecoutes_d_une_piste_locale_7980_tests;
 #[cfg(test)]
 #[path = "ecoutes_importees_regles_8416_tests.rs"]
 mod ecoutes_importees_regles_8416_tests;
+
+#[cfg(test)]
+#[path = "ecoutes_par_piste_8714_tests.rs"]
+mod ecoutes_par_piste_8714_tests;
 
 #[cfg(test)]
 #[path = "podcast_hors_artistes_8645_tests.rs"]
