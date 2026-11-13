@@ -28,6 +28,10 @@ mod renderer_allume_avant_le_serveur_tests_6961;
 #[path = "discovery_setup/renderer_sans_services_de_rendu_tests_7279.rs"]
 mod renderer_sans_services_de_rendu_tests_7279;
 
+#[cfg(test)]
+#[path = "discovery_setup/zone_nommee_par_le_modele_tests_7572.rs"]
+mod zone_nommee_par_le_modele_tests_7572;
+
 #[cfg(all(test, feature = "oaat"))]
 #[path = "deux_pi_verox_oaat_airplay_tests_6947.rs"]
 mod deux_pi_verox_oaat_airplay_tests_6947;
@@ -873,6 +877,97 @@ pub(crate) fn appareil_ignore(
     )
 }
 
+/// #7572 — le nom qu'une zone reçoit à la découverte : `(court, long)`.
+///
+/// Le nom court est la partie de `friendlyName` avant « - » : « Chambre »
+/// pour « Chambre - Sonos Play:1 ». Le long sert quand le court est déjà pris.
+///
+/// Un Sonos s'annonce « 192.168.1.19 - Sonos Play:1 Media Renderer » : la
+/// partie avant « - » est son ADRESSE IP, et la zone s'appelait donc
+/// « 192.168.1.19 » (alec_eiffel, fil du 31/10/2026, rc9), alors que le
+/// descripteur donne le modèle (`modelName`). Quand la partie courte est une
+/// adresse, le nom court devient le modèle (à défaut, le reste du nom
+/// annoncé), et le long « <modèle> (<adresse>) » pour distinguer deux
+/// appareils du même modèle.
+pub(crate) fn nom_de_zone_decouverte(
+    nom_annonce: &str,
+    hote: &str,
+    modele: Option<&str>,
+) -> (String, String) {
+    let court = nom_annonce
+        .split(" - ")
+        .next()
+        .unwrap_or(nom_annonce)
+        .trim();
+    if !est_une_adresse(court, hote) {
+        return (court.to_string(), nom_annonce.to_string());
+    }
+    let reste = nom_annonce
+        .split_once(" - ")
+        .map(|(_, r)| r.trim())
+        .unwrap_or("");
+    let lisible = modele
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && !est_une_adresse(m, hote))
+        .or(Some(reste).filter(|r| !r.is_empty()));
+    match lisible {
+        Some(nom) => (nom.to_string(), format!("{nom} ({court})")),
+        None => (court.to_string(), nom_annonce.to_string()),
+    }
+}
+
+/// Le nom qu'une version antérieure à #7572 donnait à la zone quand la
+/// partie courte du nom annoncé était une adresse IP, ou `None`.
+pub(crate) fn ancien_nom_par_adresse<'a>(nom_annonce: &'a str, hote: &str) -> Option<&'a str> {
+    let court = nom_annonce
+        .split(" - ")
+        .next()
+        .unwrap_or(nom_annonce)
+        .trim();
+    est_une_adresse(court, hote).then_some(court)
+}
+
+fn est_une_adresse(texte: &str, hote: &str) -> bool {
+    !texte.is_empty() && (texte == hote || texte.parse::<std::net::IpAddr>().is_ok())
+}
+
+/// #7572 — une zone que la découverte avait nommée par l'ADRESSE de
+/// l'appareil prend le nom lisible, une fois. Une zone que l'utilisateur a
+/// nommée n'est jamais touchée : le renommage est conditionnel en base
+/// (`WHERE name = <ancien nom>`).
+fn renommer_zone_nommee_par_adresse(
+    zone_repo: &tune_core::db::zone_repo::ZoneRepo,
+    event_bus: &EventBus,
+    zone: &tune_core::db::zone_repo::Zone,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) {
+    let Some(zone_id) = zone.id else { return };
+    let Some(ancien) = ancien_nom_par_adresse(&dev.name, &dev.host) else {
+        return;
+    };
+    if zone.name != ancien {
+        return;
+    }
+    let (court, long) = nom_de_zone_decouverte(&dev.name, &dev.host, dev.model.as_deref());
+    if court == ancien {
+        return;
+    }
+    let pris = zone_repo
+        .list()
+        .unwrap_or_default()
+        .iter()
+        .any(|z| z.id != Some(zone_id) && z.name == court);
+    let nouveau = if pris { long } else { court };
+    match zone_repo.renommer_si_nom_inchange(zone_id, ancien, &nouveau) {
+        Ok(n) if n > 0 => {
+            info!(zone_id, ancien, nouveau = %nouveau, device = %dev.id, "ssdp_zone_nommee_par_adresse_renommee");
+            event_bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+        }
+        Ok(_) => {}
+        Err(e) => warn!(zone_id, error = %e, "ssdp_zone_renommage_echoue"),
+    }
+}
+
 async fn handle_ssdp_discovered(
     dev: &tune_core::discovery::device::DiscoveredDevice,
     outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>,
@@ -1142,6 +1237,8 @@ async fn handle_ssdp_discovered(
             // so a later UUID change (Denon restart) can reconnect by host (#942).
             let _ = zone_repo.set_host(zone_id, &dev.host);
         }
+        // #7572 — une zone nommée par l'adresse IP prend le nom du modèle.
+        renommer_zone_nommee_par_adresse(&zone_repo, event_bus, &zone, dev);
         info!(name = %dev.name, id = %dev.id, "zone_device_reconnected");
         event_bus.emit(
             "device.reconnected",
@@ -1285,7 +1382,11 @@ async fn handle_ssdp_discovered(
             return;
         }
 
-        let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
+        // #7572 — « 192.168.1.19 - Sonos Play:1 » donne « Sonos Play:1 », plus
+        // l'adresse.
+        let (nom_court, nom_long) =
+            nom_de_zone_decouverte(&dev.name, &dev.host, dev.model.as_deref());
+        let short_name = nom_court.as_str();
 
         // #1281 — l'appareil s'annonce sous PLUSIEURS identités SSDP (DLNA +
         // OpenHome, ou deux UUID : buchardt A700). Supprimer sa zone la masque
@@ -1296,10 +1397,18 @@ async fn handle_ssdp_discovered(
         // l'appareil. Le nom est exigé pour ne pas bloquer un NOUVEL appareil
         // qui hérite de l'adresse par le DHCP (leçon du ré-ancrage #1651 : une
         // IP seule n'identifie rien).
-        if let Some((zid, _)) = zone_repo
-            .hidden_zones_by_host(&dev.host)
-            .into_iter()
-            .find(|(_, n)| n.eq_ignore_ascii_case(&dev.name) || n.eq_ignore_ascii_case(short_name))
+        if let Some((zid, _)) =
+            zone_repo
+                .hidden_zones_by_host(&dev.host)
+                .into_iter()
+                .find(|(_, n)| {
+                    n.eq_ignore_ascii_case(&dev.name)
+                    || n.eq_ignore_ascii_case(short_name)
+                    || n.eq_ignore_ascii_case(&nom_long)
+                    // Une zone masquée avant #7572 porte encore l'adresse.
+                    || ancien_nom_par_adresse(&dev.name, &dev.host)
+                        .is_some_and(|a| n.eq_ignore_ascii_case(a))
+                })
         {
             tracing::debug!(
                 name = %dev.name,
@@ -1325,7 +1434,7 @@ async fn handle_ssdp_discovered(
         let existing_zones = zone_repo.list().unwrap_or_default();
         let name_taken = existing_zones.iter().any(|z| z.name == short_name);
         let zone_name = if name_taken {
-            dev.name.clone()
+            nom_long.clone()
         } else {
             short_name.to_string()
         };

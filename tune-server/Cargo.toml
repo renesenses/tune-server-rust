@@ -252,6 +252,12 @@ path = "tests/correction_de_piece_appliquee_7642.rs"
 name = "memoire_a_froid"
 path = "tests/memoire_a_froid.rs"
 
+# #8609 — la purge pendant une lecture locale, et sa ligne de journal. Abonné
+# `tracing` GLOBAL : un binaire, un test.
+[[test]]
+name = "memoire_rendue_pendant_lecture_locale_8609"
+path = "tests/memoire_rendue_pendant_lecture_locale_8609.rs"
+
 # `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
 # point d'accès Sendspin doit être une cible déclarée pour être compilé.
 [[test]]
@@ -2065,6 +2071,16 @@ path = "tests/profils_panne_de_base_6454.rs"
 [[test]]
 name = "politique_parentale_7856"
 path = "tests/politique_parentale_7856.rs"
+
+# #7913 — artiste bloqué : fiches refusées, sous-listes et totaux exacts.
+[[test]]
+name = "politique_parentale_7913"
+path = "tests/politique_parentale_7913.rs"
+
+# #7913 — coût du total exact : une relecture par liste, puis le cache.
+[[test]]
+name = "politique_parentale_cout_7913"
+path = "tests/politique_parentale_cout_7913.rs"
 
 # #8088 — contrôle parental : masquer et refuser les contenus explicites.
 [[test]]

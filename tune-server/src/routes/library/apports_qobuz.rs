@@ -688,7 +688,7 @@ pub(crate) async fn lancer_passe(state: &AppState) -> bool {
                 TACHE_APPORTS_QOBUZ,
                 n as u64 + 1,
                 total,
-                "albums",
+                crate::background_tasks::Phase::Albums,
             );
             tokio::time::sleep(PAUSE_ENTRE_ALBUMS).await;
         }

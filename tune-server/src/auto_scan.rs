@@ -285,12 +285,16 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             .ouvrir(tune_core::db::task_run_repo::TACHE_SCAN_DEMARRAGE);
 
         let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
-        let raw_dirs: Vec<String> = settings
+        let mut raw_dirs: Vec<String> = settings
             .get("music_dirs")
             .ok()
             .flatten()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        // #8189 — les racines des sources réseau (`tune-src://…`).
+        raw_dirs.extend(
+            tune_core::db::sources_reseau::SourcesReseauRepo::with_backend(db.clone()).racines(),
+        );
 
         let music_dirs: Vec<String> = raw_dirs
             .iter()

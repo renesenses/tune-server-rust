@@ -227,6 +227,11 @@ pub async fn auth_middleware(
             || (method == axum::http::Method::GET
                 && (path == "/cloud/sso/callback" || path == "/api/v1/cloud/sso/callback"))
             || path == "/ws"
+            // #8189 — la passerelle des sources réseau : un renderer n'a pas
+            // de session. Le gestionnaire exige le jeton signé, propre au
+            // fichier et de courte durée ; GET et HEAD seulement.
+            || ((method == axum::http::Method::GET || method == axum::http::Method::HEAD)
+                && crate::routes::sources_reseau::est_route_passerelle(path))
             || is_public_auth_route(&method, path))
     {
         return next.run(request).await;

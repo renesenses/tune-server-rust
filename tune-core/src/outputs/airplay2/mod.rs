@@ -1022,7 +1022,14 @@ impl OutputTarget for Airplay2Output {
         // #8402 — sans démon (zone arrêtée), la consigne est gardée pour la
         // session suivante au lieu d'être perdue en « daemon not running ».
         let precedent = std::mem::replace(&mut *self.volume.lock().await, volume);
-        let sourdine = self.muted.swap(false, Ordering::SeqCst);
+        // #8610 — une consigne de volume ne lève jamais la sourdine de
+        // l'appareil : limite abaissée, alarme ou sondeur rendaient le son à
+        // une zone affichée en sourdine. Le niveau est gardé et c'est
+        // `set_mute(false)` (le geste, #8165) qui le rendra au récepteur.
+        if self.muted.load(Ordering::SeqCst) {
+            info!(device = %self.name, volume, "airplay2: volume kept while muted");
+            return Ok(());
+        }
         match self
             .send(&serde_json::json!({
                 "cmd": "volume",
@@ -1037,7 +1044,6 @@ impl OutputTarget for Airplay2Output {
             }
             Err(error) => {
                 *self.volume.lock().await = precedent;
-                self.muted.store(sourdine, Ordering::SeqCst);
                 Err(error)
             }
         }
@@ -2347,6 +2353,10 @@ mod transport_tests {
 
 #[cfg(test)]
 pub(crate) mod position_relevee_tests_7084;
+
+// #8610 — `set_volume` ne lève jamais la sourdine de l'appareil.
+#[cfg(test)]
+mod sourdine_8610_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 mod retrait_sans_arret_tests_8029;

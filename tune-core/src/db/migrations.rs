@@ -2876,6 +2876,12 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     // d'autres PR qui fusionnent avant celle-ci.
     // Jumelle PG : 114.
     Migration { version: 148, name: "spectrogrammes", up: include_str!("../../migrations/spectrogrammes.sql") },
+    // #8189 — les sources réseau lues sans montage (socle « source
+    // distante », étape 2). Numérotée 149 / PG 115 le 11/11 : 143 / PG 109
+    // sont pris par #8119 dans le lot, 144 à 148 / PG 110 à 114 sont
+    // réservés à d'autres PR (dont #8160, spectrogrammes, en 148 / PG 114)
+    // qui fusionnent avant celle-ci.
+    Migration { version: 149, name: "sources_reseau", up: include_str!("../../migrations/sources_reseau.sql") },
     // #8170 (suite de #8152 et de tune-web-client#2730) — la position de
     // CHAQUE épisode de podcast commencé : `podcast_episode_positions`, une
     // ligne par épisode et par zone. `listening_resumes` n'en garde qu'une par
@@ -6129,6 +6135,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         114,
         "spectrogrammes",
         include_str!("../../migrations/postgres/114_spectrogrammes.sql"),
+    ),
+    // Jumelle de la SQLite 149 (#8189) : les sources réseau, même DDL
+    // (`migrations/sources_reseau.sql`).
+    (
+        115,
+        "sources_reseau",
+        include_str!("../../migrations/postgres/115_sources_reseau.sql"),
     ),
     // Jumelle de la SQLite 150 (#8170) : `podcast_episode_positions`, la
     // position de chaque épisode de podcast commencé. Naît vide.
@@ -9994,6 +10007,8 @@ mod tests {
         // la liste et le relevé NOMMENT.
         // 114 : `spectrogrammes` (#8160), jumelle de la SQLite 148. Crée la
         // trace datée des spectrogrammes conservés, que la fiche technique NOMME.
+        // 115 : `sources_reseau` (#8189), jumelle de la SQLite 149. Crée la
+        // table des sources réseau lues sans montage.
         // 116 : `podcast_episode_positions` (#8170), jumelle de la SQLite 150
         // (115 = `sources_reseau`, #8202, fusionnée avant).
         // Crée la position de chaque épisode de podcast commencé, que la

@@ -264,7 +264,7 @@ mod ombre_5081_tests {
         const RESOLVE_LOCAL: &str = include_str!("resolve_local.rs");
         assert!(
             RESOLVE_LOCAL.contains(
-                "super::crossfeed_bibliotheque_reseau::empreinte_avec_ombre(\n                empreinte_dsp,\n                crossfeed.as_ref().and_then(|(p, _)| p.ombre()),"
+                "super::crossfeed_bibliotheque_reseau::empreinte_avec_ombre(\n            empreinte_dsp,\n            crossfeed.as_ref().and_then(|(p, _)| p.ombre()),"
             ),
             "le filtre d'ombre n'entre plus dans la clé du cache de transcodage"
         );

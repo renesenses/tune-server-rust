@@ -255,6 +255,9 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     "sync_releve_pistes",
     "sync_releve_albums",
     "sync_releve_artistes",
+    // Sources réseau (#8189, script 115) : sans cette ligne, les sources
+    // configurées et leurs identifiants scellés seraient perdus à la bascule.
+    "sources_reseau",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",

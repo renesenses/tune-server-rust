@@ -130,7 +130,7 @@ pub(crate) async fn executer(state: &AppState) -> bool {
     let mut faites = 0u64;
     state
         .background_tasks
-        .update_progress(TACHE, 0, total, "Étiquettes");
+        .update_progress(TACHE, 0, total, crate::background_tasks::Phase::Tags);
     loop {
         // Une relance dont la mise en base avait échoué : nouvel essai.
         let en_echec = !relances_en_echec().is_empty();
@@ -165,7 +165,7 @@ pub(crate) async fn executer(state: &AppState) -> bool {
                     TACHE,
                     faites,
                     total.max(faites),
-                    "Étiquettes",
+                    crate::background_tasks::Phase::Tags,
                 );
             }
             Ok(Err(e)) => {

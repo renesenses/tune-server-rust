@@ -224,7 +224,12 @@ pub(crate) async fn write_tags_to_files(
         // Le total dès qu'il est connu. La sélection SQL précède la boucle :
         // publier ici évite un bandeau bloqué sur « 0/0 », que le client
         // n'affiche pas en fraction (il le lirait comme un arrêt).
-        taches.update_progress(TACHE_WRITE_TAGS, 0, total as u64, "Étiquettes");
+        taches.update_progress(
+            TACHE_WRITE_TAGS,
+            0,
+            total as u64,
+            crate::background_tasks::Phase::Tags,
+        );
 
         for row in &track_rows {
             // Avancement au registre, en TÊTE de boucle — sur le nombre de
@@ -247,7 +252,7 @@ pub(crate) async fn write_tags_to_files(
                     TACHE_WRITE_TAGS,
                     traitees.max(0) as u64,
                     total as u64,
-                    "Étiquettes",
+                    crate::background_tasks::Phase::Tags,
                 );
             }
 
