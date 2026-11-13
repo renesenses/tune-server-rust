@@ -348,13 +348,16 @@ async fn une_tache_de_telechargement_disparue_libere_le_lecteur_7266() {
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     tache.abort();
-    let fin = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || lecteur.attendre_la_fin()),
-    )
-    .await
-    .expect("le lecteur attend encore : la tâche disparue ne l'a pas libéré")
-    .unwrap();
+    // Un fil à part, pas `spawn_blocking` : sans la garde, le lecteur
+    // resterait bloqué et l'arrêt du runtime attendrait ce fil à vie (le test
+    // pendrait au lieu d'échouer).
+    let (envoi, reception) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = envoi.send(lecteur.attendre_la_fin());
+    });
+    let fin = reception
+        .recv_timeout(Duration::from_secs(5))
+        .expect("le lecteur attend encore : la tâche disparue ne l'a pas libéré");
     assert!(fin.is_err());
     assert!(!suivi.en_cours() && !suivi.est_complet());
 }
