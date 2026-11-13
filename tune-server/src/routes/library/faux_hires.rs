@@ -100,6 +100,10 @@ pub(super) async fn etat(State(state): State<AppState>) -> Json<Value> {
         "douteux_visible": douteux_visible(&state.backend),
         "restantes": compter_les_candidats(&state.backend),
         "rangees": rangees,
+        // rc12 — `GET /export/catalogue.html` accepte `hires_verdict=` : le
+        // client web n'active l'export d'un filtre « Hi-Res vérifié /
+        // douteux » que devant un serveur qui le dit.
+        "catalogue_hires_verdict": true,
     }))
 }
 
