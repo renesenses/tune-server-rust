@@ -1918,10 +1918,24 @@ fn assembler_les_etapes_lang(
     // conteneur 32 bits à la cadence de la source est reconnu : un fil WAV
     // 16 bits (radio tronquée, #4346) ou à une autre cadence (plafond de
     // fréquence) reste une vraie conversion, et garde son étape.
+    //
+    // #8629 (fil 2789, radio FLAC 96/24 vers un RME ADI-2 en ALSA) — le
+    // conteneur 32 bits n'est pas le seul fil intact : une radio sans perte
+    // décodée en WAV 24 bits à sa cadence porte exactement les échantillons
+    // de la source. Seule la règle LPCM 16 bits du DLNA la jugeait, et le
+    // panneau affichait une étape orange « FLAC 96kHz/24bit → FLAC
+    // 96kHz/24bit ». Un fil d'une profondeur au moins égale à celle d'une
+    // source sans perte, à la même cadence, est donc lui aussi le conteneur
+    // interne. Un fil plus étroit (24 → 16 bits) ou une source avec perte
+    // (profondeur inconnue) garde son étape.
+    let profondeur_preservee = wire_bit_depth == Some(32)
+        || (is_lossless
+            && bit_depth > 0
+            && wire_bit_depth.is_some_and(|b| i32::from(b) >= bit_depth));
     let conteneur_local_interne = wire_wav
         && output_type == "local"
         && !is_dsd
-        && wire_bit_depth == Some(32)
+        && profondeur_preservee
         && wire_sample_rate.is_none_or(|r| r as i64 == sample_rate as i64);
     let wire_transcode = wire_wav && !matches!(format_name, "WAV") && !conteneur_local_interne;
     let transcode_active = needs_transcode_for_output
