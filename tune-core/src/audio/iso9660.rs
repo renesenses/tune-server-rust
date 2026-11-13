@@ -179,9 +179,12 @@ pub fn chemin_virtuel(image: &Path, interne: &str) -> String {
     )
 }
 
-/// Dit si ce chemin désigne un fichier DANS une image.
+/// Dit si ce chemin désigne un fichier qui ne s'ouvre pas par son chemin :
+/// DANS une image, ou sur une source distante (#8189, `tune-src://…`). Les
+/// deux se lisent par [`ouvrir_fichier`] et se décrivent par
+/// [`taille_et_mtime`].
 pub fn est_chemin_virtuel(chemin: &str) -> bool {
-    decouper(chemin).is_some()
+    decouper(chemin).is_some() || crate::sources_reseau::est_chemin_distant(chemin)
 }
 
 // ─── Lecture des structures ─────────────────────────────────────────────
@@ -846,6 +849,10 @@ pub fn ouvrir_dans(image: &Path, interne: &str) -> io::Result<LecteurInterne> {
 /// Une image ne change pas sans que sa date change : c'est elle qui dit au scan
 /// incrémental qu'il faut relire les pistes qu'elle contient.
 pub fn stat(chemin: &str) -> Option<(u64, Option<std::time::SystemTime>)> {
+    // #8189 — un fichier d'une source distante.
+    if crate::sources_reseau::est_chemin_distant(chemin) {
+        return crate::sources_reseau::stat(chemin);
+    }
     let (image, interne) = decouper(chemin)?;
     let meta = std::fs::metadata(&image).ok()?;
     let index = index(&image).ok()?;
@@ -855,6 +862,9 @@ pub fn stat(chemin: &str) -> Option<(u64, Option<std::time::SystemTime>)> {
 
 /// Lit un fichier interne entier, borné à `plafond` octets (pochettes).
 pub fn lire_entier(chemin: &str, plafond: u64) -> io::Result<Vec<u8>> {
+    if crate::sources_reseau::est_chemin_distant(chemin) {
+        return crate::sources_reseau::lire_entier(chemin, plafond);
+    }
     let mut lecteur = ouvrir(chemin)?;
     if lecteur.taille() > plafond {
         return Err(invalide("fichier interne trop gros"));
@@ -968,6 +978,9 @@ pub fn contenu_pour_le_parcours(image: &Path) -> Option<ContenuAudio> {
 /// album : la pochette d'un coffret posée au-dessus de `CD1/` et `CD2/` vaut
 /// pour les deux. Rend le chemin VIRTUEL de l'image trouvée.
 pub fn chemin_de_pochette(chemin: &Path) -> Option<PathBuf> {
+    if crate::sources_reseau::est_chemin_distant(&chemin.to_string_lossy()) {
+        return crate::sources_reseau::chemin_de_pochette(&chemin.to_string_lossy());
+    }
     let (image, interne) = decouper(&chemin.to_string_lossy())?;
     let index = index(&image).ok()?;
     let mut dossiers = Vec::new();
@@ -1003,10 +1016,14 @@ pub fn chemin_de_pochette(chemin: &Path) -> Option<PathBuf> {
 // de ces fonctions d'abord : elles rendent `None` pour un chemin ordinaire, ce
 // qui laisse son comportement strictement inchangé.
 
-/// Ouvre le fichier interne si `chemin` est virtuel ; `None` sinon.
-pub fn ouvrir_si_virtuel(chemin: &Path) -> Option<io::Result<LecteurInterne>> {
+/// Ouvre le fichier si `chemin` est virtuel (dans une image, ou sur une
+/// source distante) ; `None` sinon.
+pub fn ouvrir_si_virtuel(chemin: &Path) -> Option<io::Result<FichierSource>> {
     let texte = chemin.to_string_lossy();
-    decouper(&texte).map(|(image, interne)| ouvrir_dans(&image, &interne))
+    if crate::sources_reseau::est_chemin_distant(&texte) {
+        return Some(crate::sources_reseau::ouvrir(&texte).map(FichierSource::Distant));
+    }
+    decouper(&texte).map(|(image, interne)| ouvrir_dans(&image, &interne).map(FichierSource::Image))
 }
 
 /// Un fichier de piste ouvert, sur le disque ou dans une image : ce que les
@@ -1016,6 +1033,8 @@ pub fn ouvrir_si_virtuel(chemin: &Path) -> Option<io::Result<LecteurInterne>> {
 pub enum FichierSource {
     Disque(File),
     Image(LecteurInterne),
+    /// #8189 — un fichier d'une source distante, lu par plages.
+    Distant(crate::sources_reseau::LecteurDistant),
 }
 
 impl FichierSource {
@@ -1024,6 +1043,7 @@ impl FichierSource {
         match self {
             Self::Disque(f) => f.metadata().map(|m| m.len()),
             Self::Image(l) => Ok(l.taille()),
+            Self::Distant(l) => Ok(l.taille()),
         }
     }
 }
@@ -1033,6 +1053,7 @@ impl Read for FichierSource {
         match self {
             Self::Disque(f) => f.read(tampon),
             Self::Image(l) => l.read(tampon),
+            Self::Distant(l) => l.read(tampon),
         }
     }
 }
@@ -1042,6 +1063,7 @@ impl Seek for FichierSource {
         match self {
             Self::Disque(f) => f.seek(depuis),
             Self::Image(l) => l.seek(depuis),
+            Self::Distant(l) => l.seek(depuis),
         }
     }
 }
@@ -1050,13 +1072,14 @@ impl symphonia::core::io::MediaSource for FichierSource {
     fn is_seekable(&self) -> bool {
         match self {
             Self::Disque(f) => symphonia::core::io::MediaSource::is_seekable(f),
-            Self::Image(_) => true,
+            Self::Image(_) | Self::Distant(_) => true,
         }
     }
     fn byte_len(&self) -> Option<u64> {
         match self {
             Self::Disque(f) => symphonia::core::io::MediaSource::byte_len(f),
             Self::Image(l) => Some(l.taille()),
+            Self::Distant(l) => Some(l.taille()),
         }
     }
 }
@@ -1067,7 +1090,7 @@ impl symphonia::core::io::MediaSource for FichierSource {
 pub fn ouvrir_fichier<P: AsRef<Path>>(chemin: P) -> io::Result<FichierSource> {
     let chemin = chemin.as_ref();
     match ouvrir_si_virtuel(chemin) {
-        Some(lecteur) => lecteur.map(FichierSource::Image),
+        Some(lecteur) => lecteur,
         None => File::open(chemin).map(FichierSource::Disque),
     }
 }
@@ -1114,9 +1137,9 @@ pub fn source_symphonia(
     chemin: &str,
 ) -> Option<Result<Box<dyn symphonia::core::io::MediaSource>, String>> {
     est_chemin_virtuel(chemin).then(|| {
-        ouvrir(chemin)
+        ouvrir_fichier(chemin)
             .map(|l| Box::new(l) as Box<dyn symphonia::core::io::MediaSource>)
-            .map_err(|e| format!("open (image ISO): {e}"))
+            .map_err(|e| format!("open (fichier virtuel): {e}"))
     })
 }
 
