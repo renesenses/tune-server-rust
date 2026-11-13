@@ -76,6 +76,53 @@ un dossier de musique de l'image : relancez une analyse de la bibliothèque. Si
 vous liez le partage ailleurs, ajoutez ce dossier aux dossiers de musique dans
 les réglages de Tune.
 
+## 3. Recréer le conteneur : un redémarrage ne suffit pas
+
+Docker fixe les volumes d'un conteneur **à sa création**. Ajouter un dossier
+lié, changer sa propagation ou passer de lecture seule à lecture-écriture ne
+prend effet qu'avec un **nouveau** conteneur : un simple redémarrage relance
+l'ancien, avec ses anciens volumes, et le partage n'y apparaît pas.
+
+- Avec `docker run` : `docker rm -f tune-server`, puis relancez la commande
+  `docker run` complète avec le nouveau `-v`. Le volume `tune-data` (base,
+  réglages, comptes) n'est pas supprimé par `docker rm` : rien n'est perdu.
+- Avec Compose : modifiez le fichier, puis `docker compose up -d`. Compose
+  voit que la définition a changé et recrée le conteneur.
+- Sur Synology (Container Manager) : arrêtez le conteneur et modifiez ses
+  réglages de volume, ou dupliquez-le avec le nouveau dossier lié, comme l'a
+  fait le testeur qui a signalé le cas (fil
+  [Cannot mount shares in NAS version](https://mozaiklabs.fr/forum/threads/cannot-mount-shares-in-nas-version-but-can-do-in-raspberry-version-QI2AhP)).
+  Pour un **Projet**, modifiez le fichier Compose et reconstruisez le projet.
+  Gardez le même dossier ou volume pour `/data`.
+
+## Si Tune ne trouve aucun fichier alors qu'un autre lecteur les voit
+
+Un autre serveur de musique (Lyrion, par exemple) lit les mêmes dossiers du
+NAS, mais Tune n'en trouve aucun. Trois causes sont possibles :
+
+- **Le dossier du conteneur n'est pas un dossier de musique de Tune.** L'image
+  analyse `/music` (`TUNE_MUSIC_DIRS='["/music"]'`). Si vous avez repris les
+  liaisons d'un autre conteneur, par exemple `/volume1/music:/mnt/music`, Tune
+  ne regarde pas `/mnt/music`. Liez le dossier sur `/music`, ou ajoutez le
+  chemin **vu depuis le conteneur** (`/mnt/music`, pas `/volume1/music`) aux
+  dossiers de musique dans les réglages de Tune, puis relancez une analyse.
+- **Le compte de Tune ne peut pas lire les fichiers.** Tune tourne sous
+  l'UID/GID `1000:1000`, et un autre conteneur peut tourner sous un autre
+  compte. Vérifiez avec
+  `docker exec tune-server ls -ln /music`. Si les fichiers ne sont pas
+  lisibles par ce compte, donnez-lui le droit de lecture dans DSM, ou lancez
+  le conteneur avec `-e PUID=<uid> -e PGID=<gid>` d'un compte qui les lit
+  (les identifiants de **votre** NAS, colonnes 3 et 4 de `ls -ln` sur l'hôte).
+- **Le partage est monté sur l'hôte après le démarrage du conteneur, sans
+  `rslave`.** Voir l'étape 2, puis l'étape 3.
+
+La recherche de partages SMB depuis les réglages de Tune (le bouton qui liste
+les partages d'une machine) ne sert pas dans un conteneur : même trouvé, le
+partage ne pourrait pas y être monté (voir plus haut). Sur une installation
+Linux hors conteneur, la liste des partages passe par l'outil `smbclient` :
+sans lui, aucun partage n'est listé. Installez le paquet `smbclient` de votre
+distribution.
+
 ## Si le conteneur ne démarre plus après l'ajout de `rslave`
 
 Avec `rslave` (ou `rshared`), Docker vérifie que le dossier de l'hôte est
@@ -100,7 +147,8 @@ C'est probablement le premier obstacle sur un NAS. Pour le lever :
 
 - **Redémarrez le conteneur** une fois le partage monté sur l'hôte. Docker
   reprend au démarrage les montages déjà présents sous le dossier lié, même
-  sans `rslave`.
+  sans `rslave`. Cela vaut pour un dossier **déjà lié** : un dossier que vous
+  venez d'ajouter aux volumes demande de recréer le conteneur (étape 3).
 - Vérifiez que le volume porte bien `rslave` : sans lui, un partage monté sur
   l'hôte après le démarrage du conteneur n'y apparaît pas.
 - Vérifiez depuis le conteneur : `docker exec tune-server ls /music`.
