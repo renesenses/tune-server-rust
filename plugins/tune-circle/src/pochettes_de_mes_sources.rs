@@ -41,8 +41,9 @@ use tokio::sync::Mutex;
 use tracing::debug;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::backend::DbBackend;
-use tune_core::library::track_matcher::normalize;
 use tune_core::streaming::ServiceRegistry;
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 
 use crate::resolution::Resolveur;
 use crate::resolution_groupee::{CacheBorne, PARALLELISME_MAX};
@@ -91,18 +92,40 @@ pub struct Cle {
 // Le verdict -----------------------------------------------------------------
 
 /// Minuscules, sans accents ni ponctuation, « & » lu « and », espaces simples.
+///
+/// Propre à ce module : `track_matcher::normalize` COUPE le texte au premier
+/// « (live) », « (feat », « ft »… — « Alive (Live) » y vaut « Alive » et
+/// « A feat. B » vaut « A », ce qui ferait passer un autre disque (et un autre
+/// artiste) pour le même, jusque dans la clé du cache. Ici rien n'est coupé.
 pub fn cle_de_texte(s: &str) -> String {
-    let plie = normalize(&s.replace('&', " and "));
+    let plie: String = s
+        .replace('&', " and ")
+        .nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            'æ' => 'a',
+            'œ' => 'o',
+            'ø' => 'o',
+            'ß' => 's',
+            'đ' => 'd',
+            'ł' => 'l',
+            c => c,
+        })
+        .collect();
     plie.split(|c: char| !c.is_alphanumeric())
         .filter(|m| !m.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Les mentions d'ÉDITION : une réédition reste le même disque. Pas « live »
-/// ni « remix » (sauf ce que `normalize` retire déjà) : d'autres disques.
-const EDITION: [&str; 10] = [
+/// Les mentions d'ÉDITION, en MOTS ENTIERS (comme la règle web de #7224) :
+/// une réédition reste le même disque. « (Monolith) », « (Expedition) »,
+/// « (Stereotypes) » ne sont pas des mentions. Pas « live » ni « remix » :
+/// d'autres disques.
+const EDITION: [&str; 11] = [
     "remaster",
+    "remastered",
     "deluxe",
     "edition",
     "expanded",
@@ -111,8 +134,16 @@ const EDITION: [&str; 10] = [
     "explicit",
     "mono",
     "stereo",
-    "hi-res",
+    "hires",
 ];
+
+/// Le groupe porte-t-il une mention d'édition, en mot entier ?
+fn mention_d_edition(groupe: &str) -> bool {
+    let cle = cle_de_texte(groupe);
+    let mots: Vec<&str> = cle.split(' ').collect();
+    mots.iter().any(|m| EDITION.contains(m))
+        || mots.windows(2).any(|p| p[0] == "hi" && p[1] == "res")
+}
 
 /// Le titre sans ses mentions d'édition finales : « (Remastered 2011) »,
 /// « [Deluxe] », « - 2011 Remaster ».
@@ -127,7 +158,7 @@ fn titre_nu(titre: &str) -> String {
             t.rfind(" - ")
         };
         match debut {
-            Some(i) if EDITION.iter().any(|m| t[i..].contains(m)) => {
+            Some(i) if mention_d_edition(&t[i..]) => {
                 t.truncate(i);
                 t = t.trim_end().to_string();
             }
@@ -397,6 +428,34 @@ mod tests {
         ));
         assert!(!meme_titre("Abbey Road", "Abbey Road Revisited"));
         assert!(!meme_titre("", "Abbey Road"));
+    }
+
+    /// Relecture de #8693 : rien n'est coupé à « (Live) » ni à « feat. ».
+    #[test]
+    fn une_version_live_n_est_pas_le_meme_disque() {
+        assert!(!meme_titre("Alive (Live)", "Alive"));
+        assert!(!meme_titre("Alive", "Alive (Live)"));
+        assert_ne!(cle_de_texte("Alive (Live)"), cle_de_texte("Alive"));
+        assert!(meme_titre("Alive (Live)", "alive [live]"));
+    }
+
+    #[test]
+    fn feat_ne_retire_pas_un_artiste_du_contact() {
+        assert!(!meme_artiste("A feat. B", "A"));
+        assert!(!meme_artiste("Daft Punk ft. Pharrell", "Daft Punk"));
+        assert!(meme_artiste("A feat. B", "A & B"));
+        assert_ne!(cle_de_texte("A feat. B"), cle_de_texte("A"));
+    }
+
+    #[test]
+    fn une_mention_d_edition_est_un_mot_entier() {
+        assert!(!meme_titre("Glow (Monolith)", "Glow"));
+        assert!(!meme_titre("Journey (Expedition)", "Journey"));
+        assert!(!meme_titre("Songs (Rendition)", "Songs"));
+        assert!(!meme_titre("Pop (Stereotypes)", "Pop"));
+        assert!(meme_titre("Pop", "Pop (Stereo)"));
+        assert!(meme_titre("Pop", "Pop [Hi-Res Edition]"));
+        assert!(meme_titre("Pop", "Pop - Remastered 2011"));
     }
 
     #[test]
