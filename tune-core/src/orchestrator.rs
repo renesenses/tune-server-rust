@@ -2068,6 +2068,10 @@ impl PlaybackOrchestrator {
     const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
 }
 
+// #8611 — contrôle parental : refus de lecture des artistes bloqués.
+pub mod artiste_bloque_8611;
+#[cfg(test)]
+mod artiste_bloque_8611_tests;
 pub mod bail_parental_7974;
 #[cfg(test)]
 mod bail_parental_7974_tests;

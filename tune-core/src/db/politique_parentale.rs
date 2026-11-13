@@ -24,6 +24,27 @@ pub const SQL_TABLE: &str = include_str!("../../migrations/politiques_parentales
 /// que rend la lecture refusée (`orchestrator::play`).
 pub const CODE_REFUS_EXPLICITE: &str = "parental_explicit_refused";
 
+/// #7913, #8611 — le code stable du refus d'un contenu dont l'artiste est
+/// bloqué : fiche ouverte directement (403) et lecture refusée (sentinelle de
+/// `orchestrator::play`).
+pub const CODE_REFUS_CONTENU_BLOQUE: &str = "parental_content_blocked";
+
+/// #8611 — le code stable d'une lecture refusée parce que la politique
+/// ENREGISTRÉE du profil ne se relit pas (ligne corrompue). Ce refus n'est
+/// PAS propre à la piste : il arrête la file au lieu de la faire sauter
+/// piste après piste (`source_url::arret_de_la_file`).
+pub const CODE_POLITIQUE_ILLISIBLE: &str = "parental_policy_unreadable";
+
+/// Tête de l'erreur de [`lire`] quand la ligne existe mais que son JSON ne
+/// se relit pas.
+const TETE_POLITIQUE_CORROMPUE: &str = "politique_parentale illisible";
+
+/// #8611 — l'erreur de [`lire`] dit-elle que la politique est enregistrée
+/// mais corrompue (et non que la base n'a pas répondu) ?
+pub fn politique_corrompue(erreur: &str) -> bool {
+    erreur.starts_with(TETE_POLITIQUE_CORROMPUE)
+}
+
 /// Plafonds de taille d'une politique : une liste plus longue est refusée.
 pub const ELEMENTS_MAX: usize = 5000;
 pub const PLAGES_MAX: usize = 64;
@@ -163,7 +184,7 @@ pub fn lire(
         return Ok(None);
     };
     let politique = serde_json::from_str(&row[3].as_string().unwrap_or_default())
-        .map_err(|e| format!("politique_parentale illisible: {e}"))?;
+        .map_err(|e| format!("{TETE_POLITIQUE_CORROMPUE}: {e}"))?;
     Ok(Some(PolitiqueEnregistree {
         profile_id: row[0].as_i64().unwrap_or(profile_id),
         superviseur_id: row[1].as_i64().unwrap_or(0),
@@ -305,6 +326,11 @@ pub enum Liste {
     Radios,
     /// Podcasts : ce qui n'est pas dans la liste blanche.
     Podcasts,
+    /// #8611 — résultats et favoris des services : les éléments d'un artiste
+    /// bloqué, reconnu par son NOM seulement. L'identifiant d'un service ne
+    /// désigne pas un artiste de la bibliothèque : le comparer aux
+    /// identifiants bloqués retirerait des éléments au hasard.
+    Services,
 }
 
 /// #7913 — la fiche ouverte directement, selon la route qui la sert.
@@ -411,6 +437,18 @@ impl Filtre {
                     .iter()
                     .any(|k| self.nom_bloque(o.get(*k)))
             }
+            Liste::Services if artistes => {
+                self.nom_bloque(o.get("name")) || self.nom_bloque(o.get("artist_name"))
+            }
+            Liste::Services => {
+                CLES_NOM_D_ARTISTE
+                    .iter()
+                    .any(|k| self.nom_bloque(o.get(*k)))
+                    // Un favori de service de type artiste porte son nom
+                    // dans `title`.
+                    || (o.get("item_type").and_then(Value::as_str) == Some("artist")
+                        && self.nom_bloque(o.get("title")))
+            }
             Liste::Radios => self.hors_liste(&self.radios, o, CLES_DE_RADIO),
             Liste::Podcasts => self.hors_liste(&self.podcasts, o, CLES_DE_PODCAST),
         }
@@ -440,6 +478,12 @@ impl Filtre {
         !self.ids_bloques.is_empty() || !self.noms_bloques.is_empty()
     }
 
+    /// #8611 — l'artiste (identifiant de bibliothèque, nom) est-il bloqué ?
+    pub fn artiste_bloque(&self, id: Option<i64>, nom: Option<&str>) -> bool {
+        id.is_some_and(|id| self.ids_bloques.contains(&id))
+            || nom.is_some_and(|n| self.noms_bloques.contains(&normaliser(n)))
+    }
+
     /// #7913 — la FICHE ouverte directement (album, artiste, piste, radio,
     /// podcast) est-elle bloquée pour ce profil ? Le filtre des listes ne
     /// retire que des éléments de tableaux : la racine d'une fiche lui
@@ -453,6 +497,16 @@ impl Filtre {
             Fiche::Album | Fiche::Piste => self.retire(o, Liste::Bibliotheque, false),
             Fiche::Radio => self.retire(o, Liste::Radios, false),
             Fiche::Podcast => self.retire(o, Liste::Podcasts, false),
+        }
+    }
+
+    /// #8611 — la fiche d'un album, d'une piste (`artiste` faux) ou d'un
+    /// artiste (`artiste` vrai) d'un SERVICE est-elle d'un artiste bloqué ?
+    /// Par le nom seul.
+    pub fn fiche_bloquee_de_service(&self, corps: &Value, artiste: bool) -> bool {
+        match corps {
+            Value::Object(o) => self.retire(o, Liste::Services, artiste),
+            _ => false,
         }
     }
 
@@ -503,7 +557,10 @@ impl Filtre {
                 let mut retires = avant - elements.len();
                 // Les éléments gardés ne sont pas fouillés : les flux d'une
                 // radio autorisée ou les pistes d'un album gardé restent.
-                if matches!(liste, Liste::Bibliotheque | Liste::Artistes) {
+                if matches!(
+                    liste,
+                    Liste::Bibliotheque | Liste::Artistes | Liste::Services
+                ) {
                     for e in elements.iter_mut() {
                         retires += self.parcourir_l_objet(e, liste);
                     }
@@ -675,6 +732,122 @@ impl MarquesLocales {
         }
     }
 }
+
+/// #8611 — les artistes d'une piste locale, tels que la bibliothèque les
+/// range : l'artiste de la piste, l'artiste de l'album, la balise
+/// `ALBUMARTIST`. Le FROM est celui de `TrackRepo` (jointures par clé
+/// primaire).
+const SQL_ARTISTES_DES_PISTES: &str = "SELECT t.id, t.artist_id, ar.name, al.artist_id, aal.name, t.album_artist \
+     FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
+     LEFT JOIN artists ar ON t.artist_id = ar.id \
+     LEFT JOIN artists aal ON al.artist_id = aal.id WHERE t.id IN ";
+const SQL_ARTISTES_DES_ALBUMS: &str = "SELECT al.id, al.artist_id, aal.name \
+     FROM albums al LEFT JOIN artists aal ON al.artist_id = aal.id WHERE al.id IN ";
+const SQL_NOMS_DES_ARTISTES: &str = "SELECT id, id, name FROM artists WHERE id IN ";
+
+/// Les identifiants d'une requête `IN (…)`, écrits dans le SQL : ce sont des
+/// entiers, rien ne s'y injecte, et la même chaîne vaut pour les deux moteurs.
+fn liste_d_entiers(ids: &[i64]) -> String {
+    let mut s = String::from("(");
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&id.to_string());
+    }
+    s.push(')');
+    s
+}
+
+/// Taille d'un lot `IN (…)`.
+const LOT_IN: usize = 500;
+
+/// #8611 — parmi `ids` (pistes, albums ou artistes de la bibliothèque, selon
+/// `sql`), ceux dont un artiste est bloqué. Lecture ciblée par clé primaire,
+/// par lots : la bibliothèque n'est pas relue.
+fn bloques_parmi(
+    db: &Arc<dyn DbBackend>,
+    filtre: &Filtre,
+    sql: &str,
+    ids: &[i64],
+) -> Result<HashSet<i64>, String> {
+    let mut bloques = HashSet::new();
+    if !filtre.bloque_des_artistes() {
+        return Ok(bloques);
+    }
+    for lot in ids.chunks(LOT_IN) {
+        for l in db.query_many(&format!("{sql}{}", liste_d_entiers(lot)), &[])? {
+            let Some(id) = l.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let int = |i: usize| l.get(i).and_then(|v| v.as_i64());
+            let txt = |i: usize| l.get(i).and_then(|v| v.as_string());
+            // Les colonnes vont par paires (identifiant, nom), puis une
+            // éventuelle balise de nom seul.
+            let mut bloque = false;
+            let mut i = 1;
+            while i < l.len() {
+                if i + 1 < l.len() {
+                    bloque |= filtre.artiste_bloque(int(i), txt(i + 1).as_deref());
+                    i += 2;
+                } else {
+                    bloque |= filtre.artiste_bloque(None, txt(i).as_deref());
+                    i += 1;
+                }
+            }
+            if bloque {
+                bloques.insert(id);
+            }
+        }
+    }
+    Ok(bloques)
+}
+
+/// #8611 — la piste locale `track_id` est-elle d'un artiste bloqué (artiste
+/// de la piste, de l'album, ou balise `ALBUMARTIST`) ?
+pub fn piste_locale_bloquee(
+    db: &Arc<dyn DbBackend>,
+    filtre: &Filtre,
+    track_id: i64,
+) -> Result<bool, String> {
+    Ok(bloques_parmi(db, filtre, SQL_ARTISTES_DES_PISTES, &[track_id])?.contains(&track_id))
+}
+
+/// #8611 — parmi des favoris de la bibliothèque (`item_type`, `item_id`),
+/// ceux qui désignent un artiste bloqué, un de ses albums ou une de ses
+/// pistes. Trois lectures ciblées au plus, par clé primaire.
+pub fn favoris_bloques(
+    db: &Arc<dyn DbBackend>,
+    filtre: &Filtre,
+    favoris: &[(String, i64)],
+) -> Result<HashSet<(String, i64)>, String> {
+    let mut sortie = HashSet::new();
+    if !filtre.bloque_des_artistes() {
+        return Ok(sortie);
+    }
+    for (genre, sql) in [
+        ("artist", SQL_NOMS_DES_ARTISTES),
+        ("album", SQL_ARTISTES_DES_ALBUMS),
+        ("track", SQL_ARTISTES_DES_PISTES),
+    ] {
+        let ids: Vec<i64> = favoris
+            .iter()
+            .filter(|(t, _)| t == genre)
+            .map(|(_, id)| *id)
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        for id in bloques_parmi(db, filtre, sql, &ids)? {
+            sortie.insert((genre.to_string(), id));
+        }
+    }
+    Ok(sortie)
+}
+
+#[cfg(test)]
+#[path = "politique_parentale_tests_8611.rs"]
+mod tests_8611;
 
 #[cfg(test)]
 #[path = "politique_parentale_tests_7856.rs"]
