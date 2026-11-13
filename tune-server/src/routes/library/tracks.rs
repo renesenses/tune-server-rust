@@ -461,6 +461,7 @@ pub(super) async fn list_tracks(
     profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<TrackFilterQuery>,
     RawQuery(raw): RawQuery,
+    recomptage: Option<axum::Extension<crate::routes::politique_parentale::RecomptageParental>>,
 ) -> Result<axum::response::Response, AppError> {
     // Facettes à plusieurs valeurs : la clé répétée (`?format=aiff&format=flac`)
     // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
@@ -482,6 +483,8 @@ pub(super) async fn list_tracks(
     })
     .await
     {
+        // #7913 — un recomptage parental : pas d'appel au site.
+        Ok(corps) if recomptage.is_some() => tune_http_types::json_hors_executeur(corps).await,
         Ok(mut corps) => {
             // #6738 — « So What (128) » : les écoutes de la communauté.
             tune_core::cloud::ecoutes_communaute::annoter_liste(
@@ -3757,6 +3760,7 @@ mod tests_termes_de_chemin_5192 {
                     ActiveProfile(1),
                     Query(TrackFilterQuery::default()),
                     RawQuery(Some(raw.to_string())),
+                    None,
                 )
                 .await
                 .ok()

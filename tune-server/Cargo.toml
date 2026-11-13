@@ -2072,6 +2072,16 @@ path = "tests/profils_panne_de_base_6454.rs"
 name = "politique_parentale_7856"
 path = "tests/politique_parentale_7856.rs"
 
+# #7913 — artiste bloqué : fiches refusées, sous-listes et totaux exacts.
+[[test]]
+name = "politique_parentale_7913"
+path = "tests/politique_parentale_7913.rs"
+
+# #7913 — coût du total exact : une relecture par liste, puis le cache.
+[[test]]
+name = "politique_parentale_cout_7913"
+path = "tests/politique_parentale_cout_7913.rs"
+
 # #8088 — contrôle parental : masquer et refuser les contenus explicites.
 [[test]]
 name = "politique_parentale_explicite_8088"
