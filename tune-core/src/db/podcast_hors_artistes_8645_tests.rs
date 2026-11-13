@@ -71,12 +71,17 @@ fn poser_le_temoin(repo: &HistoryRepo) {
     // Ligne de radio d'avant la v0.8.258 : l'interprète d'un titre ICY.
     repo.record(&ecoute("Titre ICY 8645", ICY, None, "radio", 0))
         .unwrap();
-    // Écoute d'avant la colonne `source` renseignée : NULL, donc musique.
+    // Écoute sans source, donc musique : NULL sur SQLite (lignes anciennes) ;
+    // PostgreSQL refuse NULL dans cette colonne, la forme vide y tient lieu.
+    let sans_source = match repo.db.engine() {
+        Engine::Postgres => "''",
+        Engine::Sqlite => "NULL",
+    };
     repo.db
         .execute(
             &format!(
                 "INSERT INTO listen_history (title, artist_name, album_title, source, duration_ms) \
-                 VALUES ('Titre ancien 8645', '{ANCIEN}', 'Album ancien 8645', NULL, {MS_ANCIEN})"
+                 VALUES ('Titre ancien 8645', '{ANCIEN}', 'Album ancien 8645', {sans_source}, {MS_ANCIEN})"
             ),
             &[],
         )
