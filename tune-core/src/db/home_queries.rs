@@ -307,6 +307,134 @@ pub fn albums_du_genre_non_ecoutes(engine: Engine, nb_genres: usize) -> String {
     )
 }
 
+// ── Discussion #8280 : varier les raisons de « À découvrir » ──────────────
+//
+// Trois sources de plus à côté des genres écoutés. Chacune ne propose que ce
+// que ses données justifient VRAIMENT, et se tait sinon : la rangée retombe
+// alors sur ce qui reste, et le hasard ne vient qu'en tout dernier.
+//
+// Mêmes règles que les requêtes ci-dessus : une écoute est rattachée à son
+// album par [`historique_rattache_a_son_album`] (clé, sinon titre et
+// artiste), « jamais écouté » s'écrit en deux `NOT EXISTS` (un par moitié
+// de la règle), et le tirage final est borné par `LIMIT`. Aucune n'ajoute
+// d'index : elles s'appuient sur `idx_albums_artist_id`,
+// `idx_listen_history_album_id` et le hachage des titres.
+
+/// « Cet album n'a jamais été écouté », les deux moitiés de la règle. Exige
+/// `a` (albums), `ar` (son artiste) et `amb` ([`TITRES_AMBIGUS`]).
+fn jamais_ecoute() -> String {
+    let repli = repli_par_artiste_ou_titre_seul("ar.name", "amb.title");
+    format!(
+        "NOT EXISTS (SELECT 1 FROM listen_history lh \
+                     WHERE lh.album_id = a.id) \
+         AND NOT EXISTS (SELECT 1 FROM listen_history lh \
+                         WHERE lh.album_id IS NULL \
+                           AND lh.album_title = a.title \
+                           AND {repli})"
+    )
+}
+
+/// Les albums jamais écoutés d'un artiste dont la bibliothèque compte au
+/// moins DEUX albums, au hasard.
+///
+/// Places tenues : `1` pour le nom de l'artiste inconnu (écarté : ce n'est
+/// pas un artiste), `2` pour la limite. Les « artistes divers » sont écartés
+/// côté serveur après lecture (leur nom se compare sans casse ni accents).
+///
+/// Colonnes rendues : `id, title, artist_name, year, cover_path, genre,
+/// albums_de_l_artiste`.
+pub fn albums_d_artistes_possedes_non_ecoutes(engine: Engine) -> String {
+    let inconnu = ph(engine, 1);
+    let limite = ph(engine, 2);
+    let jamais = jamais_ecoute();
+    format!(
+        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, n.nb \
+         FROM albums a \
+         JOIN artists ar ON ar.id = a.artist_id \
+         JOIN (SELECT artist_id, COUNT(*) AS nb FROM albums \
+               WHERE artist_id IS NOT NULL \
+               GROUP BY artist_id HAVING COUNT(*) >= 2) n \
+           ON n.artist_id = a.artist_id \
+         LEFT JOIN {TITRES_AMBIGUS} amb ON amb.title = a.title \
+         WHERE COALESCE(ar.name, '') <> '' AND ar.name <> {inconnu} \
+           AND {jamais} \
+         ORDER BY RANDOM() \
+         LIMIT {limite}"
+    )
+}
+
+/// La décennie la plus écoutée : celle de l'année des albums auxquels
+/// l'historique rattache ses écoutes. Les albums sans année (NULL, 0) ne
+/// comptent pas. Les ex aequo se départagent par la décennie la plus
+/// ancienne, pour que l'ordre soit le même sur les deux moteurs.
+///
+/// Colonnes rendues : `decennie` (1970 pour 1970..=1979), `cnt`.
+pub fn decennie_la_plus_ecoutee() -> String {
+    let historique = historique_rattache_a_son_album("", None);
+    "SELECT (a.year / 10) * 10 AS decennie, COUNT(*) AS cnt \
+     FROM {historique} h \
+     JOIN albums a ON a.id = h.album_rattache \
+     WHERE a.year >= 1000 AND a.year <= 9999 \
+     GROUP BY (a.year / 10) * 10 \
+     ORDER BY cnt DESC, decennie \
+     LIMIT 1"
+        .replace("{historique}", &historique)
+}
+
+/// Les albums jamais écoutés d'une décennie, au hasard.
+///
+/// Places tenues : `1` première année (incluse), `2` dernière année
+/// (exclue), `3` la limite.
+///
+/// Colonnes rendues : `id, title, artist_name, year, cover_path, genre`.
+pub fn albums_de_la_decennie_non_ecoutes(engine: Engine) -> String {
+    let (debut, fin, limite) = (ph(engine, 1), ph(engine, 2), ph(engine, 3));
+    let jamais = jamais_ecoute();
+    format!(
+        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
+         FROM albums a \
+         LEFT JOIN artists ar ON a.artist_id = ar.id \
+         LEFT JOIN {TITRES_AMBIGUS} amb ON amb.title = a.title \
+         WHERE a.year >= {debut} AND a.year < {fin} \
+           AND {jamais} \
+         ORDER BY RANDOM() \
+         LIMIT {limite}"
+    )
+}
+
+/// Les albums PEU écoutés : ceux auxquels l'historique rattache au moins
+/// une écoute, au plus le plafond, et AUCUNE depuis la date donnée. Une
+/// écoute est une piste jouée : un album de dix pistes écouté en entier en
+/// compte dix — le plafond est bas à dessein (« à peine entamé »). La date
+/// écarte ce qu'on est en train d'écouter : c'est « Continuer l'écoute »,
+/// pas une découverte.
+///
+/// `listened_at` est TEXT ISO-8601 sur les deux moteurs (`T` ou espace) :
+/// une date seule `AAAA-MM-JJ` se compare comme une chaîne, « avant ce
+/// jour-là ».
+///
+/// Places tenues : `1` le plafond (inclus), `2` la date (`AAAA-MM-JJ`,
+/// exclue), `3` la limite.
+///
+/// Colonnes rendues : `id, title, artist_name, year, cover_path, genre,
+/// ecoutes`.
+pub fn albums_peu_ecoutes(engine: Engine) -> String {
+    let (plafond, avant, limite) = (ph(engine, 1), ph(engine, 2), ph(engine, 3));
+    let historique = historique_rattache_a_son_album("", None);
+    format!(
+        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, e.nb \
+         FROM (SELECT h.album_rattache AS album_id, COUNT(*) AS nb \
+               FROM {historique} h \
+               GROUP BY h.album_rattache \
+               HAVING COUNT(*) <= {plafond} \
+                  AND MAX(h.listened_at) < {avant}) e \
+         JOIN albums a ON a.id = e.album_id \
+         LEFT JOIN artists ar ON a.artist_id = ar.id \
+         ORDER BY RANDOM() \
+         LIMIT {limite}"
+    )
+}
+
 /// Les colonnes d'album de « Continuer l'ecoute » et d'« Ajoutes recemment ».
 ///
 /// Repetees a l'identique dans le `GROUP BY` : PostgreSQL ne deduit `ar.name`
