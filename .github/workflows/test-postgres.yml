@@ -1159,6 +1159,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_7983 -- --nocapture --test-threads=1
 
+      # #8679 — « Albums douteux » : l'artiste du dossier écrit en base (piste
+      # rattachée à l'artiste existant, album d'un seul artiste), sur le
+      # schéma migré, lignes marquées puis retirées. Sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Artiste du dossier des albums douteux sur PostgreSQL (#8679)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_8679 -- --nocapture --test-threads=1
+
       # #4201 — les requêtes UPnP qui cherchent un favori, sur un
       # `favorites.item_id` BIGINT (PostgreSQL 18 migrée : « bigint = text »,
       # premier import complet `partial`) puis TEXT (`PG_FULL_SCHEMA`). Dans des
