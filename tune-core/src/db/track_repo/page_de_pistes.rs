@@ -200,7 +200,11 @@ impl ColonneDeTri {
             Self::Empreinte => ("t.audio_hash".into(), Vide::Texte),
             Self::Source => (expression_provenance(engine), Vide::Texte),
             Self::Duree => ("t.duration_ms".into(), Vide::NulOuZero),
-            Self::Annee => ("t.year".into(), Vide::NulOuZero),
+            // Go du 13/11 — l'année de la piste, à défaut celle de son album.
+            Self::Annee => (
+                crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE.into(),
+                Vide::NulOuZero,
+            ),
             Self::Frequence => ("t.sample_rate".into(), Vide::NulOuZero),
             Self::Profondeur => ("t.bit_depth".into(), Vide::NulOuZero),
             Self::Canaux => ("t.channels".into(), Vide::Nul),

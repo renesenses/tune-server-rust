@@ -417,9 +417,14 @@ pub fn generate_queue(
     count: usize,
 ) -> Vec<Value> {
     // Load seed track metadata
+    // Go du 13/11 — l'année de la piste, à défaut celle de son album, pour la
+    // graine comme pour les candidates.
     let seed = db
         .query_one(
-            "SELECT t.genre, t.year, t.bpm FROM tracks t WHERE t.id = ?",
+            &format!(
+                "SELECT t.genre, {}, t.bpm FROM tracks t WHERE t.id = ?",
+                crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE
+            ),
             &[&seed_track_id],
         )
         .ok()
@@ -452,7 +457,8 @@ pub fn generate_queue(
 
     if let Some(y) = year {
         conditions.push(format!(
-            "t.year BETWEEN ?{param_idx} AND ?{}",
+            "{} BETWEEN ?{param_idx} AND ?{}",
+            crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE_AVEC_AL,
             param_idx + 1
         ));
         owned_params.push((y - 5).to_sql_value());

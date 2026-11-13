@@ -1127,6 +1127,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_balises_6124 -- --nocapture --test-threads=1
 
+      # Go du 13/11 — l'année d'une piste sans année (NULL ou 0) lue sur son
+      # album : filtre `year`, facette Années, règle `year` des playlists. La
+      # sous-requête corrélée et les `NULLIF` sur colonnes INTEGER, sur
+      # PostgreSQL. Jumeau SQLite dans la suite ordinaire.
+      - name: Année de la piste repliée sur l album sur PostgreSQL
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test annee_repli_album pg_ -- --nocapture --test-threads=1
+
       # #5192 — la recherche et le texte libre d'Oxygen trouvent une piste par
       # le nom de son dernier dossier et celui de son fichier. Sur la VRAIE
       # base : l'expression SQL des termes égale la fonction Rust, le rang

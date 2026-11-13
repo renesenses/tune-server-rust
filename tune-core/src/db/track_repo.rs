@@ -2963,7 +2963,11 @@ impl TrackRepo {
             owned_params.extend(p);
         }
 
-        if let Some(c) = ph.in_list("t.year", f.years.len()) {
+        // Go du 13/11 — l'année de la piste, à défaut celle de son album.
+        if let Some(c) = ph.in_list(
+            crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE,
+            f.years.len(),
+        ) {
             conditions.push(c);
             for y in &f.years {
                 owned_params.push(SqlValue::Int(*y));

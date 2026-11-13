@@ -2,6 +2,7 @@ use axum::Json;
 use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE;
 use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::SqlValue;
@@ -365,8 +366,9 @@ fn build_facet_conditions(
         conds.push(c);
         params.extend(p);
     }
+    // Go du 13/11 — l'année de la piste, à défaut celle de son album.
     if exclude != "year"
-        && let Some(c) = ph.in_list("t.year", sel.years.len())
+        && let Some(c) = ph.in_list(ANNEE_DE_LA_PISTE, sel.years.len())
     {
         conds.push(c);
         for v in &sel.years {
@@ -811,7 +813,7 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 // Le classique se navigue par compositeur avant de se naviguer par
                 // artiste : colonne `tracks` directe, donc même facette de colonne.
                 "composer" => column_facet(state, "composer", limit, conds, params),
-                "year" => column_facet(state, "year", limit, conds, params),
+                "year" => year_facet(state, limit, conds, params),
                 "artist" => artist_facet(state, limit, conds, params),
                 // Technical dimensions an audiophile browses by (Bertrand): direct
                 // `tracks` columns, so a plain column facet — like genre/year.
@@ -1303,6 +1305,43 @@ fn column_facet(
         })
         .collect();
     fusionner_les_casses(brut)
+}
+
+/// Les années, comptées sur l'année de la piste À DÉFAUT celle de son album
+/// (go du 13/11) — la même expression que le filtre `year`, sans quoi une
+/// valeur de la facette ne retrouverait pas ses pistes une fois cochée.
+fn year_facet(
+    state: &AppState,
+    limit: Option<i64>,
+    conds: &[String],
+    params: &[SqlValue],
+) -> Vec<(String, i64)> {
+    let extra = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
+    let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let sql = format!(
+        "SELECT {ANNEE_DE_LA_PISTE} AS annee, COUNT(*) AS n FROM tracks t \
+         WHERE {ANNEE_DE_LA_PISTE} IS NOT NULL{extra} \
+         GROUP BY 1 ORDER BY n DESC{limit_clause}"
+    );
+    let bound: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+        .iter()
+        .map(|v| v as &dyn tune_core::db::backend::ToSqlValue)
+        .collect();
+    state
+        .backend
+        .query_many(&sql, &bound)
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.into_iter();
+            let annee = it.next()?.as_i64()?;
+            Some((annee.to_string(), it.next()?.as_i64().unwrap_or(0)))
+        })
+        .collect()
 }
 
 /// #5638 : le rail compte le genre principal seul, comme `bloc_genres`.
@@ -2141,7 +2180,7 @@ mod tests {
         let q = depuis("genre=Jazz&genre=Blues&year=1971");
         let (conds, params) = build_facet_conditions(&q, Engine::Postgres, "", None);
         assert_eq!(conds[0], "LOWER(t.genre) IN (LOWER($1), LOWER($2))");
-        assert_eq!(conds[1], "t.year = $3");
+        assert_eq!(conds[1], format!("{ANNEE_DE_LA_PISTE} = $3"));
         assert_eq!(
             params.iter().map(texte).collect::<Vec<_>>(),
             vec!["Jazz".to_string(), "Blues".to_string(), "1971".to_string(),]
@@ -2287,7 +2326,7 @@ mod tests {
             conds,
             vec![
                 "LOWER(t.genre) = LOWER($1)".to_string(),
-                "t.year = $2".to_string(),
+                format!("{ANNEE_DE_LA_PISTE} = $2"),
                 "LOWER(t.format) = LOWER($3)".to_string(),
                 "LOWER(t.label) LIKE LOWER($4)".to_string(),
                 "EXISTS (SELECT 1 FROM album_ratings arr WHERE arr.album_id = t.album_id \
