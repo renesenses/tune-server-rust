@@ -35,9 +35,11 @@ async fn titres(app: &axum::Router, requete: &str) -> (StatusCode, Vec<String>, 
     let resp = app
         .clone()
         .oneshot(
-            Request::get(format!("/api/v1/export/catalogue.html?covers=false&sort=title{requete}"))
-                .body(Body::empty())
-                .unwrap(),
+            Request::get(format!(
+                "/api/v1/export/catalogue.html?covers=false&sort=title{requete}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
         )
         .await
         .expect("la route doit répondre");
@@ -62,7 +64,10 @@ async fn le_catalogue_filtre_sur_le_verdict_hires_rc12() {
     let (s, t, html) = titres(&app, "&hires_verdict=verifie&lang=fr").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(t, vec!["Vrai"], "{html}");
-    assert!(html.contains("Hi-Res vérifié"), "le filtre est nommé : {html}");
+    assert!(
+        html.contains("Hi-Res vérifié"),
+        "le filtre est nommé : {html}"
+    );
     let (_, t, _) = titres(&app, "&hires_verdict=douteux").await;
     assert_eq!(t, vec!["Faux"]);
     let (_, t, _) = titres(&app, "&hires_verdict=verifie,douteux").await;
