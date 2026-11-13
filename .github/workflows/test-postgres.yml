@@ -316,6 +316,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8416 -- --nocapture --test-threads=1
 
+      # #8280 — raisons des recommandations de l'accueil : les sources disent
+      # vrai sur un vrai PostgreSQL, et la rangée tient sa mesure. Le témoin
+      # vide `listen_history`, `tracks`, `albums`, `artists` : il tourne seul,
+      # dans sa propre étape. Sans elle, il prendrait son saut annoncé.
+      - name: Raisons des recommandations sur PostgreSQL (#8280)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8280 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
