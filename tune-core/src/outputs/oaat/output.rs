@@ -16,7 +16,7 @@ mod volume_7333_tests;
 #[cfg(feature = "oaat")]
 use super::helpers::{
     BaseDeTempsOaat, StreamInfo, detect_and_parse, dsd_rate_from_sample_rate, duree_audio_envoyee,
-    extraire_payloads_fin_flux, format_rate_display,
+    extraire_payloads_fin_flux, format_rate_display, refus_dsd_natif,
 };
 
 #[cfg(feature = "oaat")]
@@ -1033,13 +1033,14 @@ impl OutputTarget for OaatOutput {
                             }
                         };
                         let dsd_mult = dsd_rate_from_sample_rate(dsf_info.sample_rate);
-                        if let (Some(m), Some(max)) =
-                            (dsd_mult, endpoint.info.capabilities.dsd_max_rate)
-                            && m > max
-                        {
+                        if let Some(refus) = refus_dsd_natif(
+                            dsf_info.sample_rate,
+                            endpoint.info.capabilities.dsd_max_rate,
+                        ) {
                             debug!(
-                                dsd = m,
-                                max, "DSD rate exceeds endpoint max, falling back to PCM"
+                                ?refus,
+                                sample_rate = dsf_info.sample_rate,
+                                "native DSD refused for this endpoint, falling back to PCM"
                             );
                             break 'direct false;
                         }

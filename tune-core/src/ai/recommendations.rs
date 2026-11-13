@@ -143,7 +143,7 @@ pub fn get_recommendations(
             "SELECT e.artist_name, CAST(SUM(e.n) AS BIGINT) as c FROM ( \
                SELECT artist_name, 1 AS n FROM listen_history \
                WHERE artist_name IS NOT NULL AND artist_name != '' \
-               AND source != 'radio' \
+               AND COALESCE(source, '') NOT IN ('radio', 'podcast') \
                UNION ALL \
                SELECT a.name, ip.play_count FROM imported_plays ip \
                JOIN tracks t ON t.id = ip.track_id \
@@ -511,6 +511,7 @@ pub fn smart_radio(
                      WHERE h1.artist_name = ? \
                      AND h2.artist_name != ? \
                      AND h2.artist_name IS NOT NULL \
+                     AND COALESCE(h2.source, '') NOT IN ('radio', 'podcast') \
                      GROUP BY h2.artist_name \
                      ORDER BY c DESC LIMIT 5",
                     &[art as &dyn ToSqlValue, art as &dyn ToSqlValue],
