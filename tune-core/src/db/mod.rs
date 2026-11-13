@@ -110,6 +110,8 @@ pub mod suggestions_ecartees;
 pub mod tag_repo;
 /// Registre des executions automatisees (#2080).
 pub mod task_run_repo;
+/// #8625 — le comptage de la bibliothèque partagé par tous les écrans.
+pub mod totaux_bibliotheque;
 pub mod track_metadata_repo;
 pub mod track_repo;
 /// Qui tient la transaction ouverte sur la connexion d'écriture, et qui
