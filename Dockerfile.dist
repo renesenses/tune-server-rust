@@ -41,11 +41,13 @@ ARG TARGETARCH
 # curl sert au HEALTHCHECK ; libstdc++6 et libgcc-s1 à fpcalc (arm64).
 # cdparanoia : extracteur du CD audio (#8141), cherché dans le PATH par
 # Bibliothèque › Extraction CD ; sans lui, « aucun outil d'extraction ».
+# smbclient : énumération des partages SMB (Emplacements › Partage SMB, #8628,
+# fil 2788) ; sans lui, la recherche répond « smbclient absent ».
 RUN apt-get update && \
     apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends \
       ca-certificates curl libasound2 python3-pip libstdc++6 libgcc-s1 \
-      cdparanoia && \
+      cdparanoia smbclient && \
     pip3 install --break-system-packages yt-dlp && \
     rm -rf /var/lib/apt/lists/*
 

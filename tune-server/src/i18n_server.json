@@ -2719,6 +2719,23 @@
     "pl": "Odmowa dostępu (gość). Spróbuj z nazwą użytkownika i hasłem. ({error})",
     "el": "Άρνηση πρόσβασης (επισκέπτης). Δοκιμάστε με όνομα χρήστη/κωδικό. ({error})"
   },
+  "net.smbclientMissing": {
+    "fr": "smbclient est introuvable sur ce serveur : impossible de lister les partages SMB. Installez le paquet smbclient (Alpine : samba-client), ou, en conteneur Docker, montez le partage sur l'hôte et liez-le au conteneur (docs/DOCKER-PARTAGE-SMB.md).",
+    "en": "smbclient was not found on this server, so SMB shares cannot be listed. Install the smbclient package (Alpine: samba-client), or, in a Docker container, mount the share on the host and bind it into the container (docs/DOCKER-PARTAGE-SMB.md).",
+    "de": "smbclient wurde auf diesem Server nicht gefunden, SMB-Freigaben können nicht aufgelistet werden. Installieren Sie das Paket smbclient (Alpine: samba-client) oder binden Sie die Freigabe im Docker-Container über einen Mount auf dem Host ein (docs/DOCKER-PARTAGE-SMB.md).",
+    "es": "No se encontró smbclient en este servidor: no se pueden listar los recursos SMB. Instale el paquete smbclient (Alpine: samba-client) o, en un contenedor Docker, monte el recurso en el host y vincúlelo al contenedor (docs/DOCKER-PARTAGE-SMB.md).",
+    "it": "smbclient non trovato su questo server: impossibile elencare le condivisioni SMB. Installa il pacchetto smbclient (Alpine: samba-client) oppure, in un container Docker, monta la condivisione sull'host e collegala al container (docs/DOCKER-PARTAGE-SMB.md).",
+    "zh": "此服务器上未找到 smbclient，无法列出 SMB 共享。请安装 smbclient 软件包（Alpine：samba-client），或在 Docker 容器中先在主机上挂载共享再绑定到容器（docs/DOCKER-PARTAGE-SMB.md）。",
+    "ja": "このサーバーに smbclient が見つからないため、SMB 共有を一覧できません。smbclient パッケージ（Alpine：samba-client）をインストールするか、Docker コンテナではホスト側で共有をマウントしてコンテナにバインドしてください（docs/DOCKER-PARTAGE-SMB.md）。",
+    "ko": "이 서버에서 smbclient를 찾을 수 없어 SMB 공유를 나열할 수 없습니다. smbclient 패키지(Alpine: samba-client)를 설치하거나, Docker 컨테이너에서는 호스트에 공유를 마운트한 뒤 컨테이너에 연결하세요(docs/DOCKER-PARTAGE-SMB.md).",
+    "ro": "smbclient nu a fost găsit pe acest server: partajările SMB nu pot fi listate. Instalați pachetul smbclient (Alpine: samba-client) sau, într-un container Docker, montați partajarea pe gazdă și legați-o în container (docs/DOCKER-PARTAGE-SMB.md).",
+    "sv": "smbclient hittades inte på den här servern, så SMB-resurser kan inte listas. Installera paketet smbclient (Alpine: samba-client), eller montera resursen på värden och koppla den till Docker-containern (docs/DOCKER-PARTAGE-SMB.md).",
+    "hu": "A smbclient nem található ezen a szerveren, ezért az SMB-megosztások nem listázhatók. Telepítse a smbclient csomagot (Alpine: samba-client), vagy Docker-konténerben csatolja a megosztást a gazdagépen, és kösse be a konténerbe (docs/DOCKER-PARTAGE-SMB.md).",
+    "vi": "Không tìm thấy smbclient trên máy chủ này nên không thể liệt kê thư mục chia sẻ SMB. Hãy cài gói smbclient (Alpine: samba-client), hoặc trong container Docker, gắn thư mục chia sẻ trên máy chủ rồi liên kết vào container (docs/DOCKER-PARTAGE-SMB.md).",
+    "nb": "smbclient ble ikke funnet på denne serveren, så SMB-delinger kan ikke listes. Installer pakken smbclient (Alpine: samba-client), eller monter delingen på verten og koble den til Docker-containeren (docs/DOCKER-PARTAGE-SMB.md).",
+    "pl": "Nie znaleziono smbclient na tym serwerze, więc nie można wyświetlić udziałów SMB. Zainstaluj pakiet smbclient (Alpine: samba-client) lub, w kontenerze Docker, zamontuj udział na hoście i podłącz go do kontenera (docs/DOCKER-PARTAGE-SMB.md).",
+    "el": "Το smbclient δεν βρέθηκε σε αυτόν τον διακομιστή, οπότε δεν είναι δυνατή η εμφάνιση των κοινόχρηστων SMB. Εγκαταστήστε το πακέτο smbclient (Alpine: samba-client) ή, σε κοντέινερ Docker, προσαρτήστε τον κοινόχρηστο φάκελο στον κεντρικό υπολογιστή και συνδέστε τον στο κοντέινερ (docs/DOCKER-PARTAGE-SMB.md)."
+  },
   "net.smbScanFailed": {
     "fr": "Impossible de scanner {host} : {error}",
     "en": "Unable to scan {host}: {error}",
