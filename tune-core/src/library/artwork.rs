@@ -752,7 +752,21 @@ pub fn cache_fetched_image(data: &[u8], cache_dir: &Path, ext: &str) -> Option<S
 /// image nommée — c'est pour cela qu'on relit les OCTETS au lieu de recopier
 /// `image_path`. Une URL distante n'a pas d'empreinte locale.
 pub fn empreinte_image_en_cache(cache_dir: &Path, image_path: &str) -> Option<String> {
-    if image_path.starts_with("http") {
+    let (chemin, _) = fichier_image_en_cache(cache_dir, image_path)?;
+    std::fs::read(chemin)
+        .ok()
+        .map(|octets| content_hash(&octets))
+}
+
+/// Le fichier du cache (et son type MIME) qu'un `image_path` d'artiste
+/// désigne : le condensat de contenu (depuis #1444) ou l'ancienne adresse
+/// `artwork_hash(...)` d'une image nommée. `None` pour une URL distante ou un
+/// fichier absent du cache.
+pub fn fichier_image_en_cache(
+    cache_dir: &Path,
+    image_path: &str,
+) -> Option<(PathBuf, &'static str)> {
+    if image_path.is_empty() || image_path.starts_with("http") {
         return None;
     }
     let hex = (image_path.len() == 32 || image_path.len() == 64)
@@ -762,10 +776,7 @@ pub fn empreinte_image_en_cache(cache_dir: &Path, image_path: &str) -> Option<St
     } else {
         artwork_hash(image_path)
     };
-    let (chemin, _) = find_cached(cache_dir, &adresse)?;
-    std::fs::read(chemin)
-        .ok()
-        .map(|octets| content_hash(&octets))
+    find_cached(cache_dir, &adresse)
 }
 
 /// Écarte une image d'artiste que l'utilisateur a déjà rejetée (#4837).

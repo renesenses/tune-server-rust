@@ -23,6 +23,8 @@ pub(crate) mod credits;
 pub(crate) mod credits_mb;
 /// #8325 — la relecture unique des balises classiques des fichiers importés.
 pub(crate) mod relecture_classique;
+/// rc12 — le renvoi unique des images d'artistes perdues par le site.
+pub(crate) mod renvoi_images_artistes;
 // #4805 — les crédits d'un album lus juste après son identification.
 mod credits_apres_identification;
 mod duplicates;
