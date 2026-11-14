@@ -22,7 +22,7 @@ use tracing::{info, warn};
 const DEFAULT_PROFILE_ID: i64 = 1;
 
 const SETTING_KEY: &str = "scan_folder_playlists";
-const DESC_PREFIX: &str = "Dossier : ";
+pub const DESC_PREFIX: &str = "Dossier : ";
 /// A folder needs at least this many direct tracks to become a playlist.
 const MIN_TRACKS: usize = 3;
 /// … and its tracks must span at least this many distinct albums.

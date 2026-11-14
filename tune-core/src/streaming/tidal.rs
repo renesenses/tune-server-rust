@@ -1230,6 +1230,14 @@ impl TidalService {
         Some(element)
     }
 
+    /// Fil 2694 — les pistes d'une réponse `/tracks/{id}/radio`.
+    fn pistes_de_la_radio(data: &serde_json::Value) -> Vec<StreamTrack> {
+        data["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_track).collect())
+            .unwrap_or_default()
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let tags = item["mediaMetadata"]["tags"].as_array();
         let is_hires = tags
@@ -2885,6 +2893,21 @@ impl StreamingService for TidalService {
     /// service (#5395, décision de Bertrand du 29/09/2026).
     fn propose_des_artistes_similaires(&self) -> bool {
         true
+    }
+
+    /// Fil 2694 — `GET /tracks/{id}/radio` (API v1, celle que lit `tidalapi`,
+    /// `Track.get_track_radio`) : la radio du titre, paginée en `items` comme
+    /// les autres listes. Sert la radio de fin de file.
+    async fn get_track_radio(
+        &self,
+        track_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamTrack>, TuneError> {
+        let id = urlencoding::encode(track_id);
+        let data = self
+            .api_get(&format!("/tracks/{id}/radio?limit={limit}"))
+            .await?;
+        Ok(Self::pistes_de_la_radio(&data))
     }
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
@@ -5798,6 +5821,11 @@ mod pays_du_catalogue_8481_tests;
 // #6334 — lecture par `trackManifests` v2, repli v1.
 #[path = "tidal_manifeste_v2.rs"]
 mod manifeste_v2;
+
+// Go du 13/11 (#8739) — les adresses de l'audio pour une analyse, sans
+// téléchargement sous le garde du service.
+#[path = "tidal_analyse_service.rs"]
+pub mod analyse_service;
 #[cfg(test)]
 #[path = "tidal_manifeste_v2_6334_tests.rs"]
 mod manifeste_v2_6334_tests;

@@ -325,6 +325,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8416 -- --nocapture --test-threads=1
 
+      # #8676 — « Remplacer le chemin » : réécrire le préfixe des chemins
+      # stockés en une transaction, identifiants conservés, réversible. Sans
+      # cette étape, le témoin prendrait son saut annoncé.
+      - name: Remplacer le chemin de la bibliothèque sur PostgreSQL (#8676)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8676 -- --nocapture --test-threads=1
+
       # #8280 — raisons des recommandations de l'accueil : les sources disent
       # vrai sur un vrai PostgreSQL, et la rangée tient sa mesure. Le témoin
       # vide `listen_history`, `tracks`, `albums`, `artists` : il tourne seul,
@@ -342,6 +350,11 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8645 -- --nocapture --test-threads=1
+
+      - name: Fin de podcast sur toutes les zones PostgreSQL (#8170)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8170 -- --nocapture --test-threads=1
 
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
@@ -1203,3 +1216,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_4201 -- --nocapture --test-threads=1
+
+      # Recette du 13/11 (n° 73) — la liste des collections intelligentes lit
+      # ses deux comptes (albums, pistes) en UNE requête : elle rend sur la
+      # VRAIE base ce que rendaient les deux requêtes d'avant, pour des règles
+      # de toutes les formes. Dans un schéma à elle ; sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Comptes des collections intelligentes en une passe sur PostgreSQL
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-smart-http --lib --no-default-features --features postgres pg_comptes_collections -- --nocapture --test-threads=1
