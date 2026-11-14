@@ -6,7 +6,8 @@
 //! `people` pour les rôles). `value` vaut `null` pour « inconnu » : le client
 //! traduit lui-même ce libellé.
 //!
-//! - codec : `tracks.format`, en minuscules ; vide ou absent → inconnu ;
+//! - codec : `tracks.format`, en minuscules, ramené à son CODEC
+//!   (`codec_canonique`) ; vide ou absent → inconnu ;
 //! - fréquence : `tracks.sample_rate` en Hz ; absente ou 0 → inconnue ;
 //! - décennie : l'année de la piste, à défaut celle de son album ; absente ou
 //!   nulle → inconnue ;
@@ -57,18 +58,28 @@ fn lignes(db: &dyn DbBackend, sql: &str) -> Result<Vec<Vec<SqlValue>>, String> {
 pub fn lire(db: &dyn DbBackend) -> Result<Repartitions, String> {
     let e = db.engine();
 
-    let by_codec = lignes(
-        db,
-        "SELECT NULLIF(LOWER(TRIM(COALESCE(format, ''))), '') AS codec, COUNT(*) \
-         FROM tracks GROUP BY 1",
-    )?
-    .iter()
-    .map(|l| Case {
-        value: l.first().and_then(|v| v.as_string()),
-        tracks: entier_de(l.get(1)),
-        people: None,
-    })
-    .collect();
+    // Recette du 14/11 : le format brut, plus « a-t-elle une profondeur de
+    // bits ? » (qui sépare ALAC d'AAC dans un MP4), puis le cumul par codec.
+    let profondeur = entier(e, "bit_depth");
+    let by_codec = cumul_par_codec(
+        lignes(
+            db,
+            &format!(
+                "SELECT NULLIF(LOWER(TRIM(COALESCE(format, ''))), '') AS codec, \
+                        CASE WHEN COALESCE({profondeur}, 0) > 0 THEN 1 ELSE 0 END, \
+                        COUNT(*) \
+                 FROM tracks GROUP BY 1, 2"
+            ),
+        )?
+        .iter()
+        .map(|l| {
+            (
+                l.first().and_then(|v| v.as_string()),
+                entier_de(l.get(1)) > 0,
+                entier_de(l.get(2)),
+            )
+        }),
+    );
 
     let frequence = entier(e, "sample_rate");
     let by_sample_rate = lignes(
@@ -138,6 +149,58 @@ pub fn lire(db: &dyn DbBackend) -> Result<Repartitions, String> {
     Ok(r)
 }
 
+/// Recette de Bertrand du 14/11 — la carte « Formats » listait « MPEG » ET
+/// « MP3 », « DSF » et « DSD », « MP4 » à côté de « AAC » / « ALAC ». Sur le
+/// .18, MPEG, DSD et MP4 viennent tous des pistes UPnP, dont le format est le
+/// sous-type MIME du serveur multimédia (`audio/mpeg`, `audio/dsd`,
+/// `audio/mp4`), pas une extension.
+///
+/// Le libellé d'une statistique est le CODEC, pas le conteneur :
+/// - `mpeg` / `mpga` → `mp3` ;
+/// - `dsf`, `dff`, `dsd` → `dsd` : le même flux DSD ; le `dsd` d'un serveur
+///   UPnP ne dit pas son conteneur, et le séparer de `dsf` coupait en deux la
+///   même chose ;
+/// - `mp4` / `m4a` → `alac` si la piste a une profondeur de bits (codec sans
+///   perte lu ; sur le .18, les 111 pistes MP4 sont à 24 bits), `m4a` sinon :
+///   le scanner écrit `m4a` quand il n'a PAS lu le codec (fil 2126, #5710 —
+///   un ALAC affiché « LOSSY AAC ») ; en faire un AAC referait cette erreur.
+///
+/// Un sous-type MIME (`audio/x-dsf`) est ramené à `dsf` d'abord. Même règle
+/// côté client (`formatCanonique`, `typeDeFichier.ts`), pour que la barre
+/// cliquée filtre la Bibliothèque sur le même codec.
+pub(crate) fn codec_canonique(format: &str, a_une_profondeur: bool) -> String {
+    let f = format.trim().to_lowercase();
+    let f = f.rsplit('/').next().unwrap_or("");
+    let f = f.strip_prefix("x-").unwrap_or(f);
+    match f {
+        "mpeg" | "mpga" => "mp3".into(),
+        "dsf" | "dff" | "dsdiff" => "dsd".into(),
+        "mp4" | "m4a" if a_une_profondeur => "alac".into(),
+        "mp4" | "m4a" => "m4a".into(),
+        autre => autre.into(),
+    }
+}
+
+/// Le cumul des pistes par codec (`codec_canonique`) ; l'ordre est posé
+/// ensuite par `ranger`.
+fn cumul_par_codec(lignes: impl Iterator<Item = (Option<String>, bool, i64)>) -> Vec<Case<String>> {
+    let mut cumul: std::collections::BTreeMap<Option<String>, i64> = Default::default();
+    for (format, profondeur, n) in lignes {
+        let codec = format
+            .map(|f| codec_canonique(&f, profondeur))
+            .filter(|c| !c.is_empty());
+        *cumul.entry(codec).or_default() += n;
+    }
+    cumul
+        .into_iter()
+        .map(|(value, tracks)| Case {
+            value,
+            tracks,
+            people: None,
+        })
+        .collect()
+}
+
 /// Le même ordre sur les deux moteurs (SQLite et PostgreSQL ne placent pas
 /// NULL au même endroit) : « inconnu » toujours en dernier ; codecs et rôles
 /// du plus fréquent au plus rare, fréquences et décennies croissantes.
@@ -163,4 +226,53 @@ fn ranger(r: &mut Repartitions) {
     par_nombre(&mut r.by_credit_role);
     par_valeur(&mut r.by_sample_rate);
     par_valeur(&mut r.by_decade);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn le_codec_et_non_le_conteneur_recette_14_11() {
+        assert_eq!(codec_canonique("mpeg", false), "mp3");
+        assert_eq!(codec_canonique("MP3", false), "mp3");
+        assert_eq!(codec_canonique("audio/mpeg", false), "mp3");
+        assert_eq!(codec_canonique("dsf", true), "dsd");
+        assert_eq!(codec_canonique("DFF", true), "dsd");
+        assert_eq!(codec_canonique("audio/x-dsd", true), "dsd");
+        assert_eq!(codec_canonique("mp4", true), "alac");
+        assert_eq!(codec_canonique("m4a", true), "alac");
+        assert_eq!(codec_canonique("mp4", false), "m4a");
+        assert_eq!(codec_canonique("m4a", false), "m4a");
+        assert_eq!(codec_canonique("alac", true), "alac");
+        assert_eq!(codec_canonique("aac", false), "aac");
+        assert_eq!(codec_canonique("flac", true), "flac");
+    }
+
+    #[test]
+    fn mpeg_et_mp3_ne_font_qu_une_case_recette_14_11() {
+        let c = cumul_par_codec(
+            vec![
+                (Some("mpeg".to_string()), false, 146),
+                (Some("mp3".to_string()), false, 143),
+                (Some("dsf".to_string()), true, 740),
+                (Some("dsd".to_string()), true, 636),
+                (Some("mp4".to_string()), true, 111),
+                (Some("alac".to_string()), true, 72),
+                (None, false, 3),
+            ]
+            .into_iter(),
+        );
+        let paires: Vec<(Option<&str>, i64)> =
+            c.iter().map(|k| (k.value.as_deref(), k.tracks)).collect();
+        assert_eq!(
+            paires,
+            vec![
+                (None, 3),
+                (Some("alac"), 183),
+                (Some("dsd"), 1376),
+                (Some("mp3"), 289),
+            ]
+        );
+    }
 }

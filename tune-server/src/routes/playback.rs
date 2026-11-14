@@ -7516,26 +7516,35 @@ struct CreateAlarm {
     fade_in_seconds: Option<i32>,
 }
 
-/// La source d'un réveil posé depuis l'écran de lecture (#7047).
+/// La source d'un réveil posé depuis l'écran de lecture (#7047, #8666).
 ///
 /// alec_eiffel (1.0.0-rc7) écoutait FIP et a posé un réveil à 21:31 depuis
 /// l'écran de lecture. Le client envoie `{"time": "21:31"}`, sans source : la
 /// route écrivait la nature `playlist` par défaut et un identifiant vide. Le
 /// réveil a sonné avec `source="playlist:"`, puis `unknown service: playlist`.
 ///
+/// #8666 (recette rc12 du 13/11) : la zone jouait un titre de la
+/// bibliothèque, et le réveil était refusé (`no source`) : seule une radio
+/// pouvait servir de source « depuis ce qui joue ».
+///
 /// Désormais, dans l'ordre :
 /// 1. une source nommée (`source_type` / `source_id`) est contrôlée ;
 /// 2. sinon `album_id` ou `playlist_id` ;
-/// 3. sinon la radio que la zone joue : c'est elle que l'utilisateur
-///    regardait en posant son réveil ;
-/// 4. sinon le réveil est refusé (400) : rien ne dit ce qu'il jouerait.
+/// 3. sinon ce que la zone joue :
+///    - une radio : sa station ;
+///    - un titre de la bibliothèque : son album, relu par `album_id` ou par
+///      la piste, et seulement s'il a au moins une piste à jouer ;
+/// 4. sinon le réveil est refusé (400 `alarm_source_required`) avec un motif
+///    (`reason`) : rien ne dit ce qu'il jouerait. Un titre de service hors
+///    bibliothèque (Qobuz, TIDAL…) ou une entrée audio n'est pas une source
+///    qu'un réveil sait rejouer (`NATURES_DE_SOURCE`).
 ///
 /// Rend `(nature, identifiant, nom affiché)`.
 async fn source_du_reveil_de_zone(
     state: &AppState,
     zone_id: i64,
     body: &CreateAlarm,
-) -> Result<(String, String, Option<String>), String> {
+) -> Result<(String, String, Option<String>), RefusDeSource> {
     if body.source_type.is_some() || body.source_id.is_some() {
         let id = match &body.source_id {
             Some(Value::String(s)) => Some(s.clone()),
@@ -7543,7 +7552,8 @@ async fn source_du_reveil_de_zone(
             _ => None,
         };
         let (nature, id) =
-            tune_core::alarms::valider_source(body.source_type.as_deref(), id.as_deref())?;
+            tune_core::alarms::valider_source(body.source_type.as_deref(), id.as_deref())
+                .map_err(RefusDeSource::Invalide)?;
         return Ok((nature, id, None));
     }
     if let Some(id) = body.album_id {
@@ -7552,18 +7562,86 @@ async fn source_du_reveil_de_zone(
     if let Some(id) = body.playlist_id {
         return Ok(("playlist".into(), id.to_string(), None));
     }
-    let en_cours = state.playback.get_state(zone_id).await.now_playing;
-    match en_cours.filter(|np| np.source == "radio") {
-        Some(np) => {
-            let (nature, id) =
-                tune_core::alarms::valider_source(Some("radio"), np.source_id.as_deref())?;
-            Ok((nature, id, Some(np.title).filter(|t| !t.trim().is_empty())))
-        }
-        None => Err(
-            "no source: name source_type and source_id, or set the alarm while the zone plays a radio"
-                .into(),
-        ),
+    let Some(np) = state.playback.get_state(zone_id).await.now_playing else {
+        return Err(RefusDeSource::Requise {
+            reason: "nothing_playing",
+            playing_source: None,
+            message: "no source: the zone plays nothing; name source_type and source_id".into(),
+        });
+    };
+    if np.source == "radio" {
+        let (nature, id) =
+            tune_core::alarms::valider_source(Some("radio"), np.source_id.as_deref()).map_err(
+                |e| RefusDeSource::Requise {
+                    reason: "radio_without_stream_url",
+                    playing_source: Some(np.source.clone()),
+                    message: format!("the radio playing on the zone cannot be replayed: {e}"),
+                },
+            )?;
+        return Ok((nature, id, Some(np.title).filter(|t| !t.trim().is_empty())));
     }
+    if let Some(album_id) = album_jouable_de_la_piste(state, &np) {
+        let nom = np.album_title.clone().filter(|t| !t.trim().is_empty());
+        return Ok(("album".into(), album_id.to_string(), nom));
+    }
+    let (reason, message) = if np.source == "local" {
+        (
+            "track_without_album",
+            "no source: the library track playing on the zone has no album to replay; \
+             name source_type and source_id"
+                .to_string(),
+        )
+    } else {
+        (
+            "source_not_replayable",
+            format!(
+                "no source: an alarm cannot replay what the zone plays ({} is not a radio, \
+                 a library album or a playlist); name source_type and source_id",
+                np.source
+            ),
+        )
+    };
+    Err(RefusDeSource::Requise {
+        reason,
+        playing_source: Some(np.source),
+        message,
+    })
+}
+
+/// Pourquoi `POST /zones/{id}/alarm` refuse la source d'un réveil.
+enum RefusDeSource {
+    /// La source NOMMÉE par le client est mal formée (#7047) :
+    /// `400 invalid_source`.
+    Invalide(String),
+    /// Aucune source nommée, et ce qui joue ne peut pas en servir (#8666) :
+    /// `400 alarm_source_required`, avec le motif dans `reason`.
+    Requise {
+        reason: &'static str,
+        playing_source: Option<String>,
+        message: String,
+    },
+}
+
+/// #8666 — l'album de la bibliothèque d'un titre en cours, s'il a au moins
+/// une piste à jouer : le réveil le rejouera par `contenu_du_reveil`, et une
+/// source qui ne jouerait rien est refusée à l'enregistrement (#7047), jamais
+/// découverte à l'heure du réveil.
+fn album_jouable_de_la_piste(
+    state: &AppState,
+    np: &tune_core::playback::NowPlaying,
+) -> Option<i64> {
+    let pistes = TrackRepo::with_backend(state.backend.clone());
+    let album = np.album_id.filter(|id| *id > 0).or_else(|| {
+        np.track_id
+            .and_then(|id| pistes.get(id).ok().flatten())
+            .and_then(|t| t.album_id)
+            .filter(|id| *id > 0)
+    })?;
+    let jouable = pistes
+        .list_by_album(album)
+        .map(|l| l.iter().any(|t| t.id.is_some()))
+        .unwrap_or(false);
+    jouable.then_some(album)
 }
 
 async fn create_alarm(
@@ -7576,11 +7654,32 @@ async fn create_alarm(
     let (source_type, source_id, source_name) =
         match source_du_reveil_de_zone(&state, zone_id, &body).await {
             Ok(s) => s,
-            Err(message) => {
+            Err(RefusDeSource::Invalide(message)) => {
                 info!(zone_id, error = %message, "alarm_source_refused");
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({ "error": "invalid_source", "message": message })),
+                )
+                    .into_response();
+            }
+            // #8666 — `error` ET `code` : le client web lit `code`, puis
+            // `error` (`apiError`). `reason` dit pourquoi ce qui joue ne peut
+            // pas servir de source.
+            Err(RefusDeSource::Requise {
+                reason,
+                playing_source,
+                message,
+            }) => {
+                info!(zone_id, reason, error = %message, "alarm_source_refused");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "alarm_source_required",
+                        "code": "alarm_source_required",
+                        "reason": reason,
+                        "playing_source": playing_source,
+                        "message": message,
+                    })),
                 )
                     .into_response();
             }

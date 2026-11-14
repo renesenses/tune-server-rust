@@ -14,6 +14,8 @@ pub mod cover_fetcher;
 pub mod debit_des_pistes;
 /// #6917 — ne dédoublonner que les copies d'une même racine de musique.
 pub mod dedoublonnage_par_racine;
+/// #8676 — « Remplacer le chemin » : réécrire le préfixe des chemins stockés.
+pub mod deplacer_racine;
 pub mod duplicate_detector;
 /// Les exemplaires d'une piste dans plusieurs répertoires (#4907).
 pub mod exemplaires;
