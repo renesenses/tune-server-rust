@@ -67,8 +67,9 @@ async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static 
 
 /// Les fiches des titres `ids` chez le service `nom` : le cache d'abord (cinq
 /// minutes), puis le service — quatre requêtes au plus en parallèle, trois
-/// secondes chacune, `delai` en tout. Un service absent, désactivé ou non
-/// connecté rend une table vide : rien n'est inventé.
+/// secondes chacune, `delai` en tout (`CACHE_SEUL` : le cache, sans aucun
+/// appel). Un service absent, désactivé ou non connecté rend une table
+/// vide : rien n'est inventé.
 async fn pistes_du_service(
     state: &AppState,
     nom: &str,
@@ -98,6 +99,10 @@ async fn pistes_du_service(
                 true
             }
         });
+    }
+    // Le cache seul (`CACHE_SEUL`) : aucun appel au service.
+    if delai.is_zero() || ids.is_empty() {
+        return connus;
     }
     // Quatre requêtes au plus ; un service en panne ne bloque pas indéfiniment
     // la fiche. Les succès partiels restent en cache pour la lecture suivante.
@@ -134,9 +139,16 @@ async fn pistes_du_service(
 /// Les services dont la fiche d'un titre porte sa durée.
 const SERVICES_A_DUREE: [&str; 2] = ["qobuz", "tidal"];
 
-/// Délai d'une complétion faite AVANT d'écrire une file ou une playlist :
-/// assez pour quelques fiches, jamais une attente perceptible au lancement.
-pub(crate) const DELAI_AVANT_ECRITURE: Duration = Duration::from_secs(5);
+/// Le cache des fiches seul, sans appel au service : ce que la LECTURE
+/// s'accorde avant de démarrer. Elle n'attend jamais le service.
+pub(crate) const CACHE_SEUL: Duration = Duration::ZERO;
+
+/// L'ajout à une playlist n'est pas une lecture : il peut attendre un peu la
+/// fiche, jamais plus de deux secondes.
+pub(crate) const DELAI_A_L_AJOUT: Duration = Duration::from_secs(2);
+
+/// La complétion en tâche de fond, après le démarrage de la lecture.
+const DELAI_EN_ARRIERE_PLAN: Duration = Duration::from_secs(30);
 
 /// Bug du 14/11 (recette de Bertrand, « Lecture en cours ») — un titre de
 /// service rangé dans une playlist SANS durée (`duration_ms` 0 ou nul : posé
@@ -184,6 +196,80 @@ pub(crate) async fn completer_durees(
                 s.album_source_id = piste.album_id.clone().filter(|a| !a.is_empty());
             }
         }
+    }
+}
+
+/// Après le démarrage d'une lecture (ou le versement dans la file) d'une
+/// playlist : complète EN TÂCHE DE FOND les titres de service qui n'ont pas
+/// de durée, depuis le cache puis le service. Chaque durée trouvée est
+/// réécrite dans `playlist_tracks` — la playlist n'est corrigée qu'une fois —
+/// et dans les lignes de la file de `zone_id` qui sont encore à 0 ; l'écran
+/// est prévenu par `playback.queue.updated`, qui recharge la file.
+pub(crate) fn completer_en_arriere_plan(state: &AppState, zone_id: i64, playlist_id: i64) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        completer_playlist_et_file(&state, zone_id, playlist_id, DELAI_EN_ARRIERE_PLAN).await;
+    });
+}
+
+/// Le corps de `completer_en_arriere_plan`, attendu (pour les tests).
+pub(crate) async fn completer_playlist_et_file(
+    state: &AppState,
+    zone_id: i64,
+    playlist_id: i64,
+    delai: Duration,
+) {
+    use tune_core::db::play_queue_repo::PlayQueueRepo;
+    use tune_core::db::playlist_repo::{EntryContent, PlaylistRepo};
+    let playlists = PlaylistRepo::with_backend(state.backend.clone());
+    let Ok(lignes) = playlists.get_entries(playlist_id) else {
+        return;
+    };
+    let mut titres: Vec<_> = lignes
+        .into_iter()
+        .filter_map(|e| match e.content {
+            EntryContent::Service(s)
+                if s.duration_ms.unwrap_or(0) <= 0
+                    && SERVICES_A_DUREE.contains(&s.source.as_str()) =>
+            {
+                Some(s)
+            }
+            _ => None,
+        })
+        .collect();
+    if titres.is_empty() {
+        return;
+    }
+    completer_durees(state, titres.iter_mut().collect(), delai).await;
+    let file = PlayQueueRepo::with_backend(state.backend.clone());
+    let mut en_file = 0usize;
+    for s in titres.iter().filter(|s| s.duration_ms.unwrap_or(0) > 0) {
+        let duree = s.duration_ms.unwrap_or(0);
+        if let Err(e) = playlists.completer_duree_de_service(
+            playlist_id,
+            &s.source,
+            &s.source_id,
+            duree,
+            s.album_source_id.as_deref(),
+        ) {
+            tracing::warn!(playlist_id, error = %e, "playlist_duree_non_reecrite");
+        }
+        match file.completer_duree_de_service(zone_id, &s.source, &s.source_id, duree) {
+            Ok(n) => en_file += n,
+            Err(e) => tracing::warn!(zone_id, error = %e, "file_duree_non_reecrite"),
+        }
+    }
+    if en_file > 0 {
+        tracing::info!(
+            zone_id,
+            playlist_id,
+            lignes = en_file,
+            "file_durees_completees"
+        );
+        state.event_bus.emit(
+            "playback.queue.updated",
+            serde_json::json!({ "zone_id": zone_id, "durations_completed": en_file }),
+        );
     }
 }
 

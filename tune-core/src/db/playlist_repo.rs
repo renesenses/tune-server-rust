@@ -10,6 +10,22 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
+    /// Recette du 14/11 — la durée (et l'album chez le service, s'il manque)
+    /// d'un titre de service enregistré sans durée.
+    pub fn completer_duree_de_service<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE playlist_tracks SET duration_ms = {}, \
+             album_source_id = COALESCE(album_source_id, {}) \
+             WHERE playlist_id = {} AND source = {} AND source_id = {} \
+             AND (duration_ms IS NULL OR duration_ms <= 0)",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5)
+        )
+    }
+
     pub fn create<D: SqlDialect>(d: &D) -> String {
         format!(
             "INSERT INTO playlists (name, description, profile_id) VALUES ({}, {}, {})",
@@ -1019,6 +1035,32 @@ impl PlaylistRepo {
         let params: [&dyn ToSqlValue; 1] = [&playlist_id];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().filter_map(|cols| row_to_entry(cols)).collect())
+    }
+
+    /// Recette du 14/11 — réécrit la durée trouvée d'un titre de service
+    /// enregistré sans durée (0 ou nul), pour que la playlist ne soit
+    /// corrigée qu'une fois. Une durée connue n'est jamais remplacée ;
+    /// l'album chez le service n'est posé que s'il manquait.
+    pub fn completer_duree_de_service(
+        &self,
+        playlist_id: i64,
+        source: &str,
+        source_id: &str,
+        duration_ms: i64,
+        album_source_id: Option<&str>,
+    ) -> Result<usize, String> {
+        let sql = self.dialect_sql(
+            sql::completer_duree_de_service,
+            sql::completer_duree_de_service,
+        );
+        let params: [&dyn ToSqlValue; 5] = [
+            &duration_ms,
+            &album_source_id,
+            &playlist_id,
+            &source,
+            &source_id,
+        ];
+        self.db.execute(&sql, &params)
     }
 
     /// La playlist porte-t-elle au moins un titre de service ?

@@ -3893,14 +3893,18 @@ async fn play(
                 Ok(mut entries) if entries.iter().any(|e| e.service().is_some()) => {
                     // Recette du 14/11 — un titre de service sans durée
                     // (posé depuis les Favoris) entrait en file avec 0 :
-                    // « À suivre » montrait « 0:00 ». Sa fiche la complète.
-                    crate::routes::playlists::metadonnees_7738::completer_durees(
+                    // « À suivre » montrait « 0:00 ». La lecture n'attend
+                    // JAMAIS le service : le cache des fiches seul avant de
+                    // démarrer, le reste en tâche de fond une fois la file
+                    // écrite (file et playlist réécrites, écran prévenu).
+                    use crate::routes::playlists::metadonnees_7738 as fiches;
+                    fiches::completer_durees(
                         &state,
-                        crate::routes::playlists::metadonnees_7738::titres_de_service(&mut entries),
-                        crate::routes::playlists::metadonnees_7738::DELAI_AVANT_ECRITURE,
+                        fiches::titres_de_service(&mut entries),
+                        fiches::CACHE_SEUL,
                     )
                     .await;
-                    return jouer_playlist_mixte(
+                    let reponse = jouer_playlist_mixte(
                         &state,
                         zone_id,
                         &queue_repo,
@@ -3909,6 +3913,8 @@ async fn play(
                         &lang,
                     )
                     .await;
+                    fiches::completer_en_arriere_plan(&state, zone_id, playlist_id);
+                    return reponse;
                 }
                 Ok(entries) => entries.iter().filter_map(|e| e.track_id()).collect(),
                 Err(e) => return lecture_base_echouee("play_pistes_de_playlist", zone_id, e),

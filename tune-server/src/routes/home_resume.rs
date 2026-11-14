@@ -57,6 +57,13 @@ pub(super) async fn resume_listening(
     };
     let shuffled = r.shuffled;
     resumes::restore(&state.backend, zone_id, &r).map_err(AppError::bad_request)?;
+    // Recette du 14/11 — les durées que le cache n'avait pas, en tâche de fond.
+    if r.context_type == "playlist"
+        && r.source == "local"
+        && let Ok(id) = r.context_id.parse::<i64>()
+    {
+        crate::routes::playlists::metadonnees_7738::completer_en_arriere_plan(&state, zone_id, id);
+    }
     state
         .playback
         .set_session_profile(zone_id, Some(profile.id()))
@@ -404,11 +411,13 @@ async fn complete_single_container(
                     .map_err(AppError::internal)?,
                 &crate::routes::radios::choix_du_flux_de_playlist(state),
             );
-            // Recette du 14/11 — la durée d'un titre de service qui n'en a pas.
+            // Recette du 14/11 — la durée d'un titre de service qui n'en a
+            // pas : le cache seul, la reprise n'attend jamais le service ; le
+            // reste vient en tâche de fond après `restore`.
             crate::routes::playlists::metadonnees_7738::completer_durees(
                 state,
                 crate::routes::playlists::metadonnees_7738::titres_de_service(&mut lignes),
-                crate::routes::playlists::metadonnees_7738::DELAI_AVANT_ECRITURE,
+                crate::routes::playlists::metadonnees_7738::CACHE_SEUL,
             )
             .await;
             lignes

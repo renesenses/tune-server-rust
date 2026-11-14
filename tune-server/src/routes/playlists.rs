@@ -484,7 +484,7 @@ async fn add_tracks(
     metadonnees_7738::completer_durees(
         &state,
         titres.iter_mut().collect(),
-        metadonnees_7738::DELAI_AVANT_ECRITURE,
+        metadonnees_7738::DELAI_A_L_AJOUT,
     )
     .await;
 
@@ -1954,11 +1954,12 @@ async fn transfer_playlist(
     let zone_id = body.zone_id.unwrap_or(1);
     let queue = PlayQueueRepo::with_backend(state.backend.clone());
     if entries.iter().any(|e| e.service().is_some()) {
-        // Recette du 14/11 — la durée d'un titre de service qui n'en a pas.
+        // Recette du 14/11 — la durée d'un titre de service qui n'en a pas :
+        // le cache seul ici, le service ensuite, en tâche de fond.
         metadonnees_7738::completer_durees(
             &state,
             metadonnees_7738::titres_de_service(&mut entries),
-            metadonnees_7738::DELAI_AVANT_ECRITURE,
+            metadonnees_7738::CACHE_SEUL,
         )
         .await;
         // #4889 — une playlist mixte passe par la file UNIFIÉE : chaque titre
@@ -1968,6 +1969,7 @@ async fn transfer_playlist(
         if let Err(e) = queue.append(zone_id, &items) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
+        metadonnees_7738::completer_en_arriere_plan(&state, zone_id, body.playlist_id);
         return Json(json!({ "transferred": items.len() })).into_response();
     }
     let track_ids: Vec<i64> = entries.iter().filter_map(|e| e.track_id()).collect();

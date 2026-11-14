@@ -17,6 +17,18 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
+    /// Recette du 14/11 — la durée d'un titre de service entré en file à 0.
+    pub fn completer_duree_de_service<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE queue_items SET duration_ms = {} WHERE zone_id = {} AND source = {} \
+             AND source_id = {} AND (duration_ms IS NULL OR duration_ms <= 0)",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
     pub fn queue_select_base() -> &'static str {
         "SELECT q.id, q.zone_id, q.track_id, q.position, q.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, COALESCE(t.cover_path, al.cover_path), t.format, t.sample_rate, t.bit_depth FROM queue_items q LEFT JOIN tracks t ON q.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
     }
@@ -1031,6 +1043,24 @@ impl PlayQueueRepo {
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
             .unwrap_or(0);
         Ok(n)
+    }
+
+    /// Recette du 14/11 — donne sa durée à un titre de service de la file
+    /// qui n'en a pas (0 ou nul). Une durée déjà connue n'est jamais
+    /// remplacée. Rend le nombre de lignes complétées.
+    pub fn completer_duree_de_service(
+        &self,
+        zone_id: i64,
+        source: &str,
+        source_id: &str,
+        duration_ms: i64,
+    ) -> Result<usize, String> {
+        let sql = self.dialect_sql(
+            sql::completer_duree_de_service,
+            sql::completer_duree_de_service,
+        );
+        let params: [&dyn ToSqlValue; 4] = [&duration_ms, &zone_id, &source, &source_id];
+        self.db.execute(&sql, &params)
     }
 
     pub fn clear(&self, zone_id: i64) -> Result<(), String> {
