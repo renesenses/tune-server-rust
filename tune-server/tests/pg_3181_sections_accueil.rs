@@ -295,11 +295,37 @@ async fn pg_3181_sections_accueil_rendent_les_memes_lignes_que_sqlite() {
 
     // « À découvrir » : l'album de Jazz pas encore écouté, proposé POUR SON
     // GENRE — pas un tirage au hasard maquillé en recommandation.
+    // Discussion #8280 : la rangée varie ses raisons. Les deux albums de
+    // Kate Bush, jamais rattachés à une écoute (« Hit Collection » n'est pas
+    // à elle), viennent pour l'ARTISTE possédé ; « Pastel Blues », écouté une
+    // fois en août, pour avoir été à peine entamé.
     let decouvrir = corps_de(&pg, "/api/v1/home/recommendations").await;
     let albums = decouvrir.as_array().expect("albums recommandés");
-    assert_eq!(albums.len(), 1, "albums recommandés : {albums:?}");
-    assert_eq!(albums[0]["title"].as_str(), Some("Wild Is the Wind"));
-    assert_eq!(albums[0]["reason"].as_str(), Some("genre_match"));
+    let titres_de = |reason: &str| -> Vec<&str> {
+        let mut t: Vec<&str> = albums
+            .iter()
+            .filter(|a| a["reason"].as_str() == Some(reason))
+            .filter_map(|a| a["title"].as_str())
+            .collect();
+        t.sort();
+        t
+    };
+    assert_eq!(
+        titres_de("genre_match"),
+        vec!["Wild Is the Wind"],
+        "{albums:?}"
+    );
+    assert_eq!(
+        titres_de("artist_match"),
+        vec!["Before The Dawn", "The Kick Inside"],
+        "{albums:?}"
+    );
+    assert_eq!(
+        titres_de("rarely_played"),
+        vec!["Pastel Blues"],
+        "{albums:?}"
+    );
+    assert_eq!(albums.len(), 4, "albums recommandés : {albums:?}");
 
     // « Top mixes » : un mix pour le seul genre écouté, garni de sa piste.
     let mixes = corps_de(&pg, "/api/v1/home/top-mixes").await;

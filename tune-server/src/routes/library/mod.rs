@@ -23,6 +23,8 @@ pub(crate) mod credits;
 pub(crate) mod credits_mb;
 /// #8325 — la relecture unique des balises classiques des fichiers importés.
 pub(crate) mod relecture_classique;
+/// rc12 — le renvoi unique des images d'artistes perdues par le site.
+pub(crate) mod renvoi_images_artistes;
 // #4805 — les crédits d'un album lus juste après son identification.
 mod credits_apres_identification;
 mod duplicates;
@@ -79,6 +81,9 @@ mod reports;
 pub(crate) mod requete_avancee;
 // tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
 // fichiers de CETTE machine.
+/// Fil du forum 2793 — la forme d'onde d'une piste (crêtes, RMS, écrêtage),
+/// en JSON, calculée à la demande pour sa fiche technique.
+mod forme_onde;
 pub(crate) mod reveler;
 mod search;
 /// #7857 — le spectrogramme d'une piste, en PNG, généré à la demande.
@@ -555,6 +560,8 @@ pub fn router() -> Router<AppState> {
             "/tracks/{id}/spectrogramme",
             post(spectrogramme::recalculer),
         )
+        // Fil 2793 — la forme d'onde de la fiche technique.
+        .route("/tracks/{id}/forme-onde", get(forme_onde::json))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
         // #2264 — les mêmes candidats, regroupés par enregistrement, avec la
@@ -750,6 +757,8 @@ pub fn router() -> Router<AppState> {
             axum::routing::patch(ambiances::update_ambiance).delete(ambiances::delete_ambiance),
         )
         .route("/stats", get(stats::library_stats))
+        // Go du 13/11 — chercher dans TOUT le classement des statistiques.
+        .route("/stats/rankings", get(classements_8264::rechercher))
         .route("/labels", get(labels::list_labels))
         // Écran « État du serveur » (01/11/2026) : avant `/labels/{nom}/…`,
         // qui ne capture de toute façon pas ces chemins (segment `artists`).

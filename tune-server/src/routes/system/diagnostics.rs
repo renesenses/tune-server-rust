@@ -3571,15 +3571,11 @@ async fn envoyer_le_rapport(
         Ok(resp) => {
             let status = resp.status().as_u16();
             journaliser_le_refus(status, nb_images, nb_journaux, resp.headers());
-            // #5068 — la limite d'envoi du site garde son 429 : ce n'est pas
-            // une panne, et un 5xx ferait lever à l'interface un bandeau
-            // « Server error » en plus de la phrase de l'écran.
-            let code = if status == 429 {
-                StatusCode::TOO_MANY_REQUESTS
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            (code, corps_du_refus(status, resp.headers()))
+            let entetes = resp.headers().clone();
+            // #8627 — le corps du site porte le MOTIF du refus (422 : « sa mise
+            // en forme aurait effacé votre texte… »). Il était jeté.
+            let corps_site = resp.text().await.unwrap_or_default();
+            refus_du_site(status, &entetes, &corps_site)
         }
         Err(e) => {
             tracing::warn!(error = %e, "bug_report_submit_failed");
@@ -3644,6 +3640,75 @@ fn corps_du_refus(status: u16, headers: &reqwest::header::HeaderMap) -> Value {
         return corps;
     }
     json!({ "error": "cloud rejected the report", "status": status })
+}
+
+/// Longueur maximale du motif du site recopié à l'écran (#8627) : une phrase,
+/// pas une page d'erreur entière.
+const MOTIF_DU_SITE_MAX_CHARS: usize = 500;
+
+/// Le statut et le corps rendus au client quand le site refuse le rapport.
+///
+/// #5068 — la limite d'envoi du site garde son 429 : ce n'est pas une panne, et
+/// un 5xx ferait lever à l'interface un bandeau « Server error » en plus de la
+/// phrase de l'écran.
+///
+/// #8627 — un 422 du site (validation : le texte du testeur ne survit pas à la
+/// mise en forme, site-mozaiklabs#529) n'est pas une panne non plus : il est
+/// rendu en 422, avec le code stable `site_rejected` et, sous `site_message`,
+/// la phrase que le site a écrite pour le testeur (`errors.*[0]`, sinon
+/// `message`). Avant, tout non-2xx hors 429 devenait un 502 muet et l'écran
+/// disait « Réessaie » — alors que réessayer le même rapport échoue pareil et
+/// consomme un envoi de plus. Les autres refus restent des 502, et portent le
+/// motif du site s'il en a donné un.
+fn refus_du_site(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    corps_site: &str,
+) -> (StatusCode, Value) {
+    if status == 429 {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            corps_du_refus(status, headers),
+        );
+    }
+    let motif = motif_du_site(corps_site);
+    if status == 422 {
+        let mut corps = json!({
+            "error": "site_rejected",
+            "code": "site_rejected",
+            "status": status,
+        });
+        if let Some(m) = motif {
+            corps["site_message"] = json!(m);
+        }
+        return (StatusCode::UNPROCESSABLE_ENTITY, corps);
+    }
+    let mut corps = corps_du_refus(status, headers);
+    if let Some(m) = motif {
+        corps["site_message"] = json!(m);
+    }
+    (StatusCode::BAD_GATEWAY, corps)
+}
+
+/// La phrase lisible d'un refus Laravel : la première erreur de validation
+/// (`errors.<champ>[0]`), sinon `message`. Un corps non JSON (page HTML d'un
+/// proxy) ne donne rien : on ne recopie pas de balises à l'écran.
+fn motif_du_site(corps_site: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(corps_site).ok()?;
+    let depuis_errors = v.get("errors").and_then(Value::as_object).and_then(|errs| {
+        errs.values().find_map(|e| match e {
+            Value::Array(a) => a.iter().find_map(Value::as_str).map(str::to_string),
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+    });
+    let phrase =
+        depuis_errors.or_else(|| v.get("message").and_then(Value::as_str).map(str::to_string))?;
+    let phrase = phrase.trim();
+    if phrase.is_empty() {
+        return None;
+    }
+    Some(phrase.chars().take(MOTIF_DU_SITE_MAX_CHARS).collect())
 }
 
 pub(super) async fn audio_check() -> Json<Value> {
@@ -5654,6 +5719,74 @@ mod tests_refus_du_rapport_5590 {
             "{ligne}"
         );
         assert!(!ligne.contains("retry_after"), "{ligne}");
+    }
+}
+
+#[cfg(test)]
+mod tests_motif_du_refus_8627 {
+    use super::refus_du_site;
+    use axum::http::StatusCode;
+
+    /// Le cas du ticket : le 422 de site-mozaiklabs#529. Le statut et la
+    /// phrase du site arrivent au client.
+    #[test]
+    fn un_422_du_site_rend_un_422_et_sa_phrase() {
+        let corps_site = r#"{"message":"Le rapport n'a pas été publié : sa mise en forme aurait effacé votre texte.","errors":{"body":["Le rapport n'a pas été publié : sa mise en forme aurait effacé votre texte. Rien n'a été enregistré."]}}"#;
+        let (code, corps) = refus_du_site(422, &reqwest::header::HeaderMap::new(), corps_site);
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{corps}");
+        assert_eq!(corps["code"], "site_rejected", "{corps}");
+        assert_eq!(corps["status"], 422, "{corps}");
+        assert_eq!(
+            corps["site_message"],
+            "Le rapport n'a pas été publié : sa mise en forme aurait effacé votre texte. Rien n'a été enregistré.",
+            "{corps}"
+        );
+    }
+
+    /// Sans `errors`, le `message` Laravel sert de motif.
+    #[test]
+    fn sans_errors_le_message_sert_de_motif() {
+        let (code, corps) = refus_du_site(
+            422,
+            &reqwest::header::HeaderMap::new(),
+            r#"{"message":"Corps invalide."}"#,
+        );
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(corps["site_message"], "Corps invalide.");
+    }
+
+    /// Une page HTML de proxy ne devient pas un motif, et une panne du site
+    /// reste un 502.
+    #[test]
+    fn une_page_html_ne_devient_pas_un_motif_et_le_5xx_reste_502() {
+        let (code, corps) = refus_du_site(
+            500,
+            &reqwest::header::HeaderMap::new(),
+            "<html><body>500 Internal Server Error</body></html>",
+        );
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
+        assert_eq!(corps["status"], 500);
+        assert!(corps.get("site_message").is_none(), "{corps}");
+    }
+
+    /// Le 429 garde son traitement (#5068).
+    #[test]
+    fn le_429_reste_rate_limited() {
+        let (code, corps) = refus_du_site(429, &reqwest::header::HeaderMap::new(), "{}");
+        assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(corps["code"], "rate_limited");
+    }
+
+    /// Le motif est borné : une phrase, pas une page.
+    #[test]
+    fn le_motif_est_borne() {
+        let long = "é".repeat(2000);
+        let (_, corps) = refus_du_site(
+            422,
+            &reqwest::header::HeaderMap::new(),
+            &format!(r#"{{"message":"{long}"}}"#),
+        );
+        assert_eq!(corps["site_message"].as_str().unwrap().chars().count(), 500);
     }
 }
 

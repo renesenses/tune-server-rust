@@ -115,6 +115,9 @@ pub mod m4a;
 /// un décodeur livré la lit, compté-nommé sinon (#3633).
 pub mod matroska;
 // #8513 — traitements de zone contournés pendant une mesure de pièce.
+/// La forme d'onde d'une piste (crêtes, RMS, écrêtage) pour sa fiche
+/// technique (fil du forum 2793).
+pub mod forme_onde;
 pub mod mesure_nue;
 pub mod mixer;
 /// Le repli mono dit quand il n'agit pas (#3254) — la disponibilité par zone du
