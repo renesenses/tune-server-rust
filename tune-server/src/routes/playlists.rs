@@ -476,8 +476,17 @@ async fn add_tracks(
     }
 
     let recus = body.streaming_tracks.as_deref().unwrap_or_default();
-    let titres: Vec<ServiceEntry> = recus.iter().filter_map(ServiceEntry::from_json).collect();
+    let mut titres: Vec<ServiceEntry> = recus.iter().filter_map(ServiceEntry::from_json).collect();
     let incomplets = recus.len() - titres.len();
+    // Recette du 14/11 — un titre posé depuis les Favoris arrive sans durée
+    // (la table des favoris n'en garde pas) : sa fiche la donne, et la ligne
+    // l'enregistre, pour que la file qui la jouera la porte.
+    metadonnees_7738::completer_durees(
+        &state,
+        titres.iter_mut().collect(),
+        metadonnees_7738::DELAI_AVANT_ECRITURE,
+    )
+    .await;
 
     // #8135 — une station inconnue n'entre pas : la ligne ne saurait ni se
     // nommer ni se jouer. Une demande qui ne porte que de telles stations
@@ -1932,7 +1941,7 @@ async fn transfer_playlist(
     if let Err(r) = owned_or_404_response(&repo, body.playlist_id, profile.id()) {
         return r;
     }
-    let entries = match repo.get_entries(body.playlist_id) {
+    let mut entries = match repo.get_entries(body.playlist_id) {
         // #8135 — une radio entre dans la file par son flux.
         Ok(e) => tune_core::db::playlist_radio_8135::lignes_a_jouer(
             &state.backend,
@@ -1945,6 +1954,13 @@ async fn transfer_playlist(
     let zone_id = body.zone_id.unwrap_or(1);
     let queue = PlayQueueRepo::with_backend(state.backend.clone());
     if entries.iter().any(|e| e.service().is_some()) {
+        // Recette du 14/11 — la durée d'un titre de service qui n'en a pas.
+        metadonnees_7738::completer_durees(
+            &state,
+            metadonnees_7738::titres_de_service(&mut entries),
+            metadonnees_7738::DELAI_AVANT_ECRITURE,
+        )
+        .await;
         // #4889 — une playlist mixte passe par la file UNIFIÉE : chaque titre
         // de service y entre comme une ligne de streaming, résolue à la
         // lecture comme n'importe quelle piste de service.
@@ -2641,3 +2657,7 @@ mod badge_de_cercle_6688 {
 #[cfg(test)]
 #[path = "playlists/import_audirvana_6998_tests.rs"]
 mod import_audirvana_6998_tests;
+
+#[cfg(test)]
+#[path = "playlists/durees_titres_de_service_tests.rs"]
+mod durees_titres_de_service_tests;

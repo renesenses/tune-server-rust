@@ -397,36 +397,44 @@ async fn complete_single_container(
         } else {
             // #8135 — une radio de la playlist reprend par son FLUX, comme
             // à la lecture ; une station retirée est sautée.
-            tune_core::db::playlist_radio_8135::lignes_a_jouer(
+            let mut lignes = tune_core::db::playlist_radio_8135::lignes_a_jouer(
                 &state.backend,
                 tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone())
                     .get_entries(id)
                     .map_err(AppError::internal)?,
                 &crate::routes::radios::choix_du_flux_de_playlist(state),
+            );
+            // Recette du 14/11 — la durée d'un titre de service qui n'en a pas.
+            crate::routes::playlists::metadonnees_7738::completer_durees(
+                state,
+                crate::routes::playlists::metadonnees_7738::titres_de_service(&mut lignes),
+                crate::routes::playlists::metadonnees_7738::DELAI_AVANT_ECRITURE,
             )
-            .into_iter()
-            .filter_map(|e| match e.content {
-                tune_core::db::playlist_repo::EntryContent::Local(track_id) => {
-                    Some(QueueInput::Local { track_id })
-                }
-                tune_core::db::playlist_repo::EntryContent::Service(s) => {
-                    Some(QueueInput::Streaming {
-                        source: s.source,
-                        source_id: s.source_id,
-                        title: s.title,
-                        artist: s.artist.unwrap_or_default(),
-                        album: s.album,
-                        cover_url: s.cover_url,
-                        duration_ms: s.duration_ms.unwrap_or(0),
-                        track_number: None,
-                        disc_number: None,
-                        album_ref: s.album_source_id,
-                        artist_ref: None,
-                    })
-                }
-                _ => None,
-            })
-            .collect()
+            .await;
+            lignes
+                .into_iter()
+                .filter_map(|e| match e.content {
+                    tune_core::db::playlist_repo::EntryContent::Local(track_id) => {
+                        Some(QueueInput::Local { track_id })
+                    }
+                    tune_core::db::playlist_repo::EntryContent::Service(s) => {
+                        Some(QueueInput::Streaming {
+                            source: s.source,
+                            source_id: s.source_id,
+                            title: s.title,
+                            artist: s.artist.unwrap_or_default(),
+                            album: s.album,
+                            cover_url: s.cover_url,
+                            duration_ms: s.duration_ms.unwrap_or(0),
+                            track_number: None,
+                            disc_number: None,
+                            album_ref: s.album_source_id,
+                            artist_ref: None,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect()
         }
     } else {
         let services = state.services.lock().await;

@@ -3890,7 +3890,16 @@ async fn play(
                 body.start_index = depart;
                 jouables
             }) {
-                Ok(entries) if entries.iter().any(|e| e.service().is_some()) => {
+                Ok(mut entries) if entries.iter().any(|e| e.service().is_some()) => {
+                    // Recette du 14/11 — un titre de service sans durée
+                    // (posé depuis les Favoris) entrait en file avec 0 :
+                    // « À suivre » montrait « 0:00 ». Sa fiche la complète.
+                    crate::routes::playlists::metadonnees_7738::completer_durees(
+                        &state,
+                        crate::routes::playlists::metadonnees_7738::titres_de_service(&mut entries),
+                        crate::routes::playlists::metadonnees_7738::DELAI_AVANT_ECRITURE,
+                    )
+                    .await;
                     return jouer_playlist_mixte(
                         &state,
                         zone_id,
