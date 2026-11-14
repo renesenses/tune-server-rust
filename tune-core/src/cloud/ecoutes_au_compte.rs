@@ -44,10 +44,14 @@
 //! la clé du dédoublonnage côté site), la date, la durée, le profil sous forme
 //! d'empreinte ([`empreinte_de_profil`]), et pour le morceau : ISRC et MBID
 //! d'enregistrement s'ils sont connus, MBID de la release et de l'artiste
-//! s'ils sont connus (#6738), titre, artiste, album, durée.
+//! s'ils sont connus (#6738), titre, artiste, album, durée ; et la
+//! provenance de l'écoute (`source` : `local`, le nom du service, `podcast`,
+//! #8645), pour que le site tienne les épisodes de podcast — dont l'artiste et
+//! l'album sont le nom de l'émission — hors de ses classements.
 //!
 //! Jamais : chemin de fichier, adresse IP, nom de zone, nom ou numéro de
-//! profil, pochette, identifiant de service. La requête qui lit l'historique
+//! profil, pochette, identifiant de service (le NOM du service part, pas
+//! l'identifiant de la piste chez lui). La requête qui lit l'historique
 //! ([`SQL_LOT`]) ne sélectionne aucune de ces colonnes : ce qui n'est pas lu
 //! ne peut pas partir.
 //!
@@ -354,7 +358,8 @@ pub const SQL_LOT: &str = "SELECT CAST(h.id AS BIGINT), h.listened_at, \
         AND a.musicbrainz_release_id IS NOT NULL AND a.musicbrainz_release_id <> '' LIMIT 1), \
      (SELECT ar.musicbrainz_id FROM tracks t JOIN artists ar ON ar.id = t.artist_id \
         WHERE t.title = h.title AND t.album_id = h.album_id \
-        AND ar.musicbrainz_id IS NOT NULL AND ar.musicbrainz_id <> '' LIMIT 1) \
+        AND ar.musicbrainz_id IS NOT NULL AND ar.musicbrainz_id <> '' LIMIT 1), \
+     COALESCE(NULLIF(h.source, ''), 'local') \
      FROM listen_history h \
      WHERE CAST(h.id AS BIGINT) > ? AND COALESCE(h.source, '') <> 'radio' \
        AND h.listened_at >= ? \
@@ -450,6 +455,9 @@ fn lire_le_lot(
                 "listened_at": ecoutee_le,
                 "duration_ms": duree,
                 "profile": profil.map(|p| empreinte_de_profil(server_id, p)),
+                // #8645 — champ additif : un site qui ne le connaît pas
+                // l'ignore ; le site le garde pour ses classements.
+                "source": borne(r.get(11).and_then(|v| v.as_string())),
                 "track": {
                     "isrc": borne(r.get(7).and_then(|v| v.as_string())),
                     "mbid": borne(r.get(8).and_then(|v| v.as_string())),

@@ -435,6 +435,11 @@ fn export_settings(backend: &Arc<dyn DbBackend>) -> Result<ReglagesExportes, Str
             debug!(key = %key, "config_export_skip_sensitive");
             continue;
         }
+        // Fil 2694 — les marques « ajouté par la radio » désignent des lignes
+        // de file de CETTE base : elles ne voyagent pas.
+        if crate::playback::radio_fin_de_file::cle_de_marques(&key) {
+            continue;
+        }
         if is_eq_preset_key(&key) {
             eq_presets.push(serde_json::json!({ "key": key, "value": value }));
         } else if is_room_profile_key(&key) {
@@ -1069,7 +1074,7 @@ fn import_settings(
     let mut sans_zone = 0usize;
     let mut volume_ecarte = 0usize;
     for (key, value) in settings_list {
-        if is_sensitive(key) {
+        if is_sensitive(key) || crate::playback::radio_fin_de_file::cle_de_marques(key) {
             continue;
         }
         if let Some((source, gabarit)) = crate::db::zone_repo::gabarit_de_cle_de_zone(key) {

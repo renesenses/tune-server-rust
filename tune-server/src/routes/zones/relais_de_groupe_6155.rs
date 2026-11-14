@@ -165,13 +165,36 @@ fn groupes_enregistres(state: &AppState) -> Vec<Value> {
     groupes_de(&state.backend)
 }
 
+/// Les groupes tels que le relais les lit : dans la règle « une zone, un
+/// groupe au plus » ([`groupes_dans_la_regle`]), quel que soit le réglage.
 fn groupes_de(backend: &Arc<dyn DbBackend>) -> Vec<Value> {
+    groupes_dans_la_regle(groupes_bruts(backend))
+}
+
+fn groupes_bruts(backend: &Arc<dyn DbBackend>) -> Vec<Value> {
     SettingsRepo::with_backend(backend.clone())
         .get("zone_groups")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// #8680 (fil 2800) — le relais ne lit jamais des groupes qui se chevauchent.
+///
+/// Des groupes enregistrés avant la rc11 comptaient la même zone plusieurs
+/// fois (zone 10 dans 23 groupes), et une suiveuse menait un autre groupe
+/// (11 suivait 10 et menait 16, 23 et 9). Le `started` émis par la suiveuse
+/// qui rejoignait sa meneuse déclenchait alors le relais de SES suiveuses :
+/// la lecture partait en cascade d'un groupe à l'autre, sur toutes les
+/// pièces, et la zone 9 était relancée deux fois. Dans la règle, une
+/// suiveuse ne mène aucun groupe : son `started` ne relaie rien, et une zone
+/// ne suit qu'une seule meneuse. Le démarrage réécrit le réglage
+/// (`normaliser_les_groupes_au_demarrage`) ; le relais, lui, ne se fie pas à
+/// ce que le réglage contient.
+pub(crate) fn groupes_dans_la_regle(mut groupes: Vec<Value>) -> Vec<Value> {
+    tune_core::zones::groupes_enregistres::normaliser(&mut groupes);
+    groupes
 }
 
 /// #7717 — la meneuse qu'un groupe avait avant qu'une lecture lancée sur une
@@ -256,9 +279,12 @@ fn changer_les_groupes<R>(
     let _garde = MENEUSES_EN_ECRITURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut groupes = groupes_de(backend);
+    // #8680 — la tête se prend sur des groupes dans la règle : une zone ne
+    // mène qu'un groupe, et le réglage relu ainsi est réécrit dans la règle.
+    let mut groupes = groupes_bruts(backend);
+    let normalises = tune_core::zones::groupes_enregistres::normaliser(&mut groupes);
     let rendu = changer(&mut groupes);
-    if !a_change(&rendu) {
+    if !a_change(&rendu) && !normalises {
         return Some(rendu);
     }
     let texte = serde_json::to_string(&groupes).ok()?;

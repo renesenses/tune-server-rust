@@ -1837,6 +1837,9 @@ mod zone_group_tests;
 mod groupe_asio_refuse_7759_tests;
 
 #[cfg(test)]
+mod groupes_chevauchants_8680_tests;
+
+#[cfg(test)]
 mod aac_passthrough_tests;
 
 /// Garde-fou : le PATCH d'une zone ne doit plus jamais échouer en silence.

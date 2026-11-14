@@ -7,6 +7,29 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
+/// #8645 — la condition d'une écoute de MUSIQUE, celle qui compte dans les
+/// classements par artiste, album ou titre : ni radio, ni podcast. Une écoute
+/// sans source (NULL, anciennes lignes) est de la musique.
+///
+/// Depuis #7965, un épisode de podcast s'écrit dans l'historique avec le NOM
+/// DE L'ÉMISSION en `artist_name` et en `album_title`
+/// (`enregistrer_ecoute_podcast`, `source = 'podcast'`) : sans cette
+/// condition, l'émission se classait parmi les « Artistes les plus écoutés »
+/// de l'accueil (Bertrand, 13/11/2026, rc11). Une ligne de radio d'avant la
+/// v0.8.258 porte, elle, l'interprète d'un titre ICY figé.
+///
+/// Ces écoutes restent dans les TOTAUX (nombre d'écoutes, temps d'écoute) :
+/// la condition ne s'ajoute qu'aux classements (artistes, albums, titres —
+/// décision de Bertrand du 13/11 pour les titres) et aux comptes d'artistes. `source` est la colonne `source` de `listen_history`, préfixée
+/// de son alias s'il y en a un.
+pub fn ecoute_de_musique(source: &str) -> String {
+    format!("COALESCE({source}, '') NOT IN ('radio', 'podcast')")
+}
+
+/// [`ecoute_de_musique`] sur la colonne nue `source`, pour les requêtes
+/// écrites en littéral.
+pub const ECOUTE_DE_MUSIQUE: &str = "COALESCE(source, '') NOT IN ('radio', 'podcast')";
+
 /// Engine-agnostic SQL builders for history_repo.
 ///
 /// Simple builders are dialect-aware. `full_dashboard` is still
@@ -179,7 +202,7 @@ pub mod sql {
             "WITH u AS (SELECT h.title AS title, h.artist_name AS artist_name, \
                     1 AS n, h.track_id AS tid, h.album_title AS alb, \
                     h.cover_url AS cu, h.id AS hid \
-                    FROM listen_history h WHERE h.source != 'radio' \
+                    FROM listen_history h WHERE {musique} \
                   UNION ALL \
                   SELECT t.title, a.name, ip.play_count, ip.track_id, al.title, \
                     NULL, NULL \
@@ -227,7 +250,9 @@ pub mod sql {
              CASE WHEN m.src <> 'local' THEN m.aref END AS album_ref \
              FROM m \
              ORDER BY m.plays DESC LIMIT {}",
-            d.placeholder(1)
+            d.placeholder(1),
+            // #8645 — ni radio, ni épisode de podcast.
+            musique = super::ecoute_de_musique("h.source"),
         )
     }
 
@@ -530,8 +555,9 @@ pub mod sql {
                   AND t.album_id = h.album_id \
              LEFT JOIN artists a ON h.source = 'local' AND a.name = h.artist_name \
              LEFT JOIN tracks t2 ON t2.artist_id = a.id AND t2.title = h.title \
-             WHERE h.source != 'radio' AND LOWER(h.artist_name) IN ({noms}) \
-             GROUP BY h.source, h.source_id, h.title, h.artist_name, h.duration_ms"
+             WHERE {} AND LOWER(h.artist_name) IN ({noms}) \
+             GROUP BY h.source, h.source_id, h.title, h.artist_name, h.duration_ms",
+            super::ecoute_de_musique("h.source")
         )
     }
 
@@ -564,14 +590,16 @@ pub mod sql {
 
     pub fn top_artists<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT artist_name, COUNT(*) as plays FROM listen_history WHERE artist_name IS NOT NULL AND source != 'radio' GROUP BY artist_name ORDER BY plays DESC LIMIT {}",
+            "SELECT artist_name, COUNT(*) as plays FROM listen_history WHERE artist_name IS NOT NULL AND {} GROUP BY artist_name ORDER BY plays DESC LIMIT {}",
+            super::ECOUTE_DE_MUSIQUE,
             d.placeholder(1)
         )
     }
 
     pub fn top_albums<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history WHERE album_title IS NOT NULL AND source != 'radio' GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT {}",
+            "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history WHERE album_title IS NOT NULL AND {} GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT {}",
+            super::ECOUTE_DE_MUSIQUE,
             d.placeholder(1)
         )
     }
@@ -590,8 +618,11 @@ pub mod sql {
          WHERE COALESCE(source, '') <> 'radio'"
     }
 
-    pub fn dashboard_unique_artists() -> &'static str {
-        "SELECT COUNT(DISTINCT artist_name) FROM listen_history WHERE artist_name IS NOT NULL"
+    pub fn dashboard_unique_artists() -> String {
+        format!(
+            "SELECT COUNT(DISTINCT artist_name) FROM listen_history WHERE artist_name IS NOT NULL AND {}",
+            super::ECOUTE_DE_MUSIQUE
+        )
     }
 
     /// Daily aggregation. Uses the date helpers so both engines emit
@@ -1273,7 +1304,7 @@ impl HistoryRepo {
             .unwrap_or(0);
         let unique_artists = self
             .db
-            .query_one(sql::dashboard_unique_artists(), &[])?
+            .query_one(&sql::dashboard_unique_artists(), &[])?
             .as_ref()
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
             .unwrap_or(0);
@@ -1390,7 +1421,7 @@ impl HistoryRepo {
         let dans = Self::lot_in(bas.len());
         let sql = format!(
             "SELECT LOWER(artist_name), source, COUNT(*) FROM listen_history \
-             WHERE source IS NOT NULL AND source NOT IN ('local', 'upnp', 'radio') \
+             WHERE source IS NOT NULL AND source NOT IN ('local', 'upnp', 'radio', 'podcast') \
              AND LOWER(artist_name) IN ({dans}) \
              GROUP BY LOWER(artist_name), source"
         );
@@ -1621,7 +1652,7 @@ impl HistoryRepo {
             "SELECT COUNT(*),
                     CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT),
                     COUNT(DISTINCT title || COALESCE(artist_name, '')),
-                    COUNT(DISTINCT CASE WHEN artist_name IS NOT NULL THEN artist_name END)
+                    COUNT(DISTINCT CASE WHEN artist_name IS NOT NULL AND {ECOUTE_DE_MUSIQUE} THEN artist_name END)
              FROM listen_history {simple_where}"
         );
         let totals_row = self
@@ -1655,9 +1686,11 @@ impl HistoryRepo {
         let artists_sql = format!(
             "SELECT lh.artist_name, COUNT(*) as plays, CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms
              FROM listen_history lh
-             {simple_where} {no_radio_and} {artiste} IS NOT NULL
+             {simple_where} {no_radio_and} {artiste} IS NOT NULL AND {d_artiste}
              GROUP BY {artiste} ORDER BY plays DESC, lh.artist_name LIMIT {top_n}",
             artiste = sans_index("lh.artist_name"),
+            // #8645 — ni l'émission d'un podcast, ni une radio.
+            d_artiste = ecoute_de_musique("lh.source"),
         );
         let artistes_bruts = self.db.query_many(&artists_sql, &[])?;
         let noms_artistes: Vec<String> = artistes_bruts
@@ -1700,11 +1733,13 @@ impl HistoryRepo {
             "SELECT h.album_title, h.artist_name, MAX(h.cover_url) as cover_url, COUNT(*) as plays,
                     MAX(h.source) as source, MAX(h.source_id) as source_id
              FROM listen_history h
-             {where_clause} {no_radio_and_h} {album} IS NOT NULL
+             {where_clause} {no_radio_and_h} {album} IS NOT NULL AND {d_artiste}
              GROUP BY {album}, {artiste}
              ORDER BY plays DESC, h.album_title, h.artist_name LIMIT {top_n}",
             album = sans_index("h.album_title"),
             artiste = sans_index("h.artist_name"),
+            // #8645 — l'émission d'un podcast est aussi son « album ».
+            d_artiste = ecoute_de_musique("h.source"),
         );
         let albums_bruts = self.db.query_many(&albums_sql, &[])?;
         let titres_albums: Vec<String> = albums_bruts
@@ -1741,10 +1776,12 @@ impl HistoryRepo {
                     MAX(lh.cover_url) as cover_url,
                     MAX(lh.source) as source, MAX(lh.source_id) as source_id
              FROM listen_history lh
-             {simple_where} {no_radio_and} {titre} IS NOT NULL
+             {simple_where} {no_radio_and} {titre} IS NOT NULL AND {musique}
              GROUP BY {titre}, {artiste} ORDER BY plays DESC, lh.title, lh.artist_name LIMIT {top_n}",
             titre = sans_index("lh.title"),
             artiste = sans_index("lh.artist_name"),
+            // #8645 — un épisode de podcast n'est pas un titre du classement.
+            musique = ecoute_de_musique("lh.source"),
         );
         // Ce bloc portait DEUX sous-requêtes corrélées sur `tracks` (47 118
         // lignes), l'une pour retrouver l'identifiant de piste, l'autre pour la
@@ -2513,6 +2550,10 @@ mod ecoutes_d_une_piste_locale_7980_tests;
 #[cfg(test)]
 #[path = "ecoutes_importees_regles_8416_tests.rs"]
 mod ecoutes_importees_regles_8416_tests;
+
+#[cfg(test)]
+#[path = "podcast_hors_artistes_8645_tests.rs"]
+mod podcast_hors_artistes_8645_tests;
 
 #[cfg(test)]
 mod tests {

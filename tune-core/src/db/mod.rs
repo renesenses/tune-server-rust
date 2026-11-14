@@ -113,6 +113,8 @@ pub mod suggestions_ecartees;
 pub mod tag_repo;
 /// Registre des executions automatisees (#2080).
 pub mod task_run_repo;
+/// #8625 — le comptage de la bibliothèque partagé par tous les écrans.
+pub mod totaux_bibliotheque;
 pub mod track_metadata_repo;
 pub mod track_repo;
 /// Qui tient la transaction ouverte sur la connexion d'écriture, et qui
@@ -153,6 +155,10 @@ mod notes_et_repartitions_7849_tests;
 mod pochette_source_pg_tests_5034;
 #[cfg(test)]
 mod recherche_debut_de_mot_7619_tests;
+/// Discussion #8280 — « À découvrir » varie ses raisons : les requêtes des
+/// nouvelles sources, SQLite et PostgreSQL, mesurées sur 10 000 albums.
+#[cfg(test)]
+mod recommandations_8280_tests;
 #[cfg(test)]
 mod replieur_wal_tests;
 /// Fil 2130 — « Reprendre l'écoute » : jointure en UNION ALL et index de

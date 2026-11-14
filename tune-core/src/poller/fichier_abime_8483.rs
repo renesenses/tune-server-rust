@@ -180,6 +180,8 @@ impl super::PositionPoller {
                 }),
             );
         }
+        // Fil 2694 — fin sur ERREUR : pas de radio de fin de file.
+        crate::playback::radio_fin_de_file::noter_fin_sur_erreur(zone_id);
         self.handle_track_end(zone_id, zone_state).await;
         true
     }

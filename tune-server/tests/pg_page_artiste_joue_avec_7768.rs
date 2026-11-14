@@ -264,3 +264,87 @@ async fn pg_7768_joue_avec_de_la_page_artiste() {
 
     menage(b);
 }
+
+/// #2961 (web) — jumeau PostgreSQL du duo du .18 : album servi deux fois
+/// (local et copie UPnP, même titre), personnel d'album recopié sur 4 des 5
+/// pistes, membres du duo crédités. Rend des enregistrements (pas 8 pistes),
+/// `album_wide`, et ni « A » ni « B » dans « joue avec » de « A & B ».
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2961_ni_membres_du_duo_ni_copies_comptees_deux_fois() {
+    let Some(url) = url_pg() else {
+        eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+        return;
+    };
+    let state = etat_postgres(&url);
+    let b: &dyn DbBackend = state.backend.as_ref();
+    menage(b);
+
+    // « joue-avec-7768 DjeuhDjoah & Lieutenant Nicholson » : parties
+    // « joue-avec-7768 DjeuhDjoah » et « Lieutenant Nicholson ».
+    let duo = artiste(b, "DjeuhDjoah & Lieutenant Nicholson", None);
+    for source in ["local", "upnp"] {
+        let a = album(b, "Aimez ces airs", duo, 2021);
+        b.execute(
+            "UPDATE albums SET source = ? WHERE id = ?",
+            &[&source as &dyn ToSqlValue, &a as &dyn ToSqlValue],
+        )
+        .expect("source de l'album");
+        for i in 1..=5i64 {
+            let titre = format!("{MARQUE} titre {i}");
+            let chemin = format!("/m/{source}/{i}.flac");
+            let t = b
+                .execute_returning_id(
+                    "INSERT INTO tracks (title, album_id, artist_id, file_path, duration_ms, format, disc_number, track_number) \
+                     VALUES (?, ?, ?, ?, 200000, 'flac', 1, ?)",
+                    &[
+                        &titre as &dyn ToSqlValue,
+                        &a as &dyn ToSqlValue,
+                        &duo as &dyn ToSqlValue,
+                        &chemin as &dyn ToSqlValue,
+                        &i as &dyn ToSqlValue,
+                    ],
+                )
+                .unwrap_or_else(|e| panic!("piste {titre} : {e}"));
+            if i <= 4 {
+                credit(b, t, None, "Alexis Valet", None, "performer", None);
+                credit(b, t, None, "Djeuhdjoah", None, "performer", None);
+                credit(b, t, None, "=Lieutenant Nicholson", None, "performer", None);
+            } else {
+                credit(b, t, None, "Ben Invité", None, "performer", None);
+            }
+        }
+    }
+
+    let lu = joue_avec(&state.backend, duo);
+    let resume_2961: Vec<(String, i64, i64, bool)> = lu
+        .iter()
+        .map(|j| {
+            (
+                j.artist_name.trim_start_matches(MARQUE).trim().to_string(),
+                j.shared_tracks,
+                j.shared_albums,
+                j.album_wide,
+            )
+        })
+        .collect();
+    assert_eq!(
+        resume_2961,
+        vec![
+            ("Alexis Valet".to_string(), 4, 1, true),
+            ("Ben Invité".to_string(), 1, 1, false),
+        ],
+        "{lu:?}"
+    );
+
+    let app = tune_server::routes::router(state.clone());
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/library/artists/{duo}/albums?sections=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["played_with"][0]["shared_albums"], 1, "{body}");
+    assert_eq!(body["played_with"][0]["album_wide"], true, "{body}");
+
+    menage(b);
+}

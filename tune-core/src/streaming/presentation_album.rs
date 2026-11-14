@@ -50,7 +50,7 @@ static BALISE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<[^>]*>").expect("regex des balises"));
 /// Une entité nommée ou numérique.
 static ENTITE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
+    Regex::new(r"&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31})(?:;|\b)")
         .expect("regex des entités")
 });
 /// Plus de deux sauts d'affilée.
@@ -123,6 +123,11 @@ fn decoder_entites(texte: &str) -> String {
     ENTITE
         .replace_all(texte, |c: &regex::Captures| {
             let corps = &c[1];
+            // Tolérer les noms sans « ; », mais jamais décoder un préfixe
+            // de mot ni élargir ici la syntaxe des références numériques.
+            if !c[0].ends_with(';') && corps.starts_with('#') {
+                return c[0].to_string();
+            }
             let car = if let Some(hex) = corps
                 .strip_prefix("#x")
                 .or_else(|| corps.strip_prefix("#X"))
@@ -266,6 +271,18 @@ mod tests {
                 language: Some("fr".into()),
             })
         );
+    }
+
+    #[test]
+    fn entites_qobuz_sans_point_virgule_8698() {
+        let album = json!({"description": "<p>&copy Matt Collar /TiVo &amp jazz &nbsp &eacute; &eacute !</p>"});
+        assert_eq!(
+            presentation_qobuz(&album).unwrap().description,
+            "© Matt Collar /TiVo & jazz \u{a0} é é !",
+            "les entités Qobuz sans point-virgule doivent être décodées"
+        );
+        assert_eq!(texte_de_presentation("&copyright &ampere &inconnue; &#233 &#233; &amp;copy &lt;script&gt;texte&lt;/script&gt;").unwrap(),
+            "&copyright &ampere &inconnue; &#233 é &copy <script>texte</script>");
     }
 
     #[test]

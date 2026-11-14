@@ -23,6 +23,10 @@ mod session_message;
 #[cfg(test)]
 #[path = "playback/titre_indisponible_7778_tests.rs"]
 mod titre_indisponible_7778_tests;
+// Recette rc12 — une piste du CD lancée sans disque : 409 nommé, pas 500.
+#[cfg(test)]
+#[path = "playback/cd_disque_absent_tests.rs"]
+mod cd_disque_absent_tests;
 // #6332 — le débit d'une piste locale dans l'état de zone.
 #[cfg(test)]
 #[path = "playback/debit_lecture_en_cours_6332_tests.rs"]
@@ -179,6 +183,10 @@ pub(crate) fn corps_du_refus_parental(e: &str, lang: &str) -> Option<Value> {
 
 /// #8154 — la route du récepteur Spotify Connect que le bouton « Activer le
 /// récepteur » appelle (`POST`, corps `{}`).
+/// #8565 — la phrase « Spotify a refusé les clés audio de ce compte »
+/// (`i18n_server.json`), rendue par la lecture et par le statut du récepteur.
+pub(crate) const CLE_CLES_AUDIO_REFUSEES: &str = "spotify.playback.audioKeyRefused";
+
 pub(crate) const ROUTE_ACTIVER_RECEPTEUR_SPOTIFY: &str = "/api/v1/spotify-connect/enable";
 
 /// #8154 — le refus « liaison Spotify Connect requise » : 409, code stable,
@@ -211,6 +219,13 @@ fn refus_liaison_spotify(
     }
     (StatusCode::CONFLICT, Json(corps)).into_response()
 }
+
+/// Le motif du greffon CD quand le disque a quitté le lecteur
+/// (`tune_cd::lecteur::ErreurCd::AucunDisque`, voir la garde
+/// `motif_cd_disque_absent_suit_le_greffon`).
+pub(crate) const MOTIF_CD_DISQUE_ABSENT: &str = "aucun disque dans le lecteur";
+/// Le code stable de ce refus, lu par le client web.
+pub(crate) const CODE_CD_DISQUE_ABSENT: &str = "cd_disc_absent";
 
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     if let Some(reponse) = refus_du_bail_parental(&e, lang) {
@@ -292,6 +307,29 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
             }),
             lang,
             "spotify.playback.premiumRequired",
+            &[],
+        );
+        if let Some(objet) = corps.as_object_mut() {
+            objet.insert("cause".into(), json!(cause));
+        }
+        return (StatusCode::CONFLICT, Json(corps)).into_response();
+    }
+    // #8565 (décision de Bertrand du 13/11) — Spotify refuse les clés audio
+    // du compte (librespot #1649) : le titre sautait sans un son. 409 au code
+    // stable, phrase traduite « Spotify a refusé les clés audio de ce
+    // compte ».
+    if let Some(pos) = e.find(tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES)
+    {
+        use tune_core::streaming::spotify_connect::CODE_CLES_AUDIO_REFUSEES;
+        use tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES;
+        let cause = e[pos + SENTINELLE_CLES_AUDIO_REFUSEES.len()..].trim();
+        let mut corps = crate::message_api::avec_message_en(
+            json!({
+                "error": CODE_CLES_AUDIO_REFUSEES,
+                "code": CODE_CLES_AUDIO_REFUSEES,
+            }),
+            lang,
+            CLE_CLES_AUDIO_REFUSEES,
             &[],
         );
         if let Some(objet) = corps.as_object_mut() {
@@ -425,6 +463,23 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     // aucune adresse de flux pour ce compte, cette région). 422 au code
     // stable, phrase traduite : sans cette branche, « no url » ne contenait
     // aucun mot du fourre-tout ci-dessous et finissait en 500 brut.
+    // Recette du .18, rc12 (13/11/2026) — une piste du CD lancée alors que le
+    // disque n'est plus dans le lecteur (titre phare écouté sur le CD avant
+    // son extraction) : le greffon CD rend « aucun disque dans le lecteur »,
+    // que le fourre-tout ci-dessous changeait en 500 `playback_error`, le
+    // texte brut dans le toast. 409 au code stable et phrase traduite : un
+    // état de l'appareil, pas une panne du serveur.
+    if e.contains(MOTIF_CD_DISQUE_ABSENT) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": CODE_CD_DISQUE_ABSENT,
+                "code": CODE_CD_DISQUE_ABSENT,
+                "message": crate::i18n::t(lang, "playback.cd_disc_absent"),
+            })),
+        )
+            .into_response();
+    }
     if tune_core::poller::refus_propre_a_la_piste(&e) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2547,6 +2602,39 @@ mod refus_de_format_3234 {
                     assert!(message.contains("Spotify app"), "{message}");
                 }
             }
+        }
+    }
+
+    /// #8565 (décision de Bertrand du 13/11) — Spotify refuse les clés audio
+    /// du compte : 409 au code stable `spotify_audio_key_refused` et la phrase
+    /// « Spotify a refusé les clés audio de ce compte », au lieu d'un titre
+    /// sauté sans un mot. Contre-épreuve : sans la branche, 502.
+    #[tokio::test]
+    async fn spotify_8565_cles_audio_refusees_dit_le_refus() {
+        let e = format!(
+            "source « spotify » : {}Spotify a refusé les clés audio de ce compte (librespot : « error audio key »)",
+            tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES
+        );
+        for (lang, phrase) in [
+            ("fr", "Spotify a refusé les clés audio de ce compte"),
+            ("en", "Spotify refused the audio keys for this account"),
+        ] {
+            let reponse = play_error_response(e.clone(), lang);
+            assert_eq!(reponse.status(), StatusCode::CONFLICT, "{lang}");
+            let corps = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+                .await
+                .expect("corps de la réponse");
+            let corps: Value = serde_json::from_slice(&corps).expect("corps JSON");
+            assert_eq!(corps["error"], "spotify_audio_key_refused");
+            assert_eq!(corps["code"], "spotify_audio_key_refused");
+            assert_eq!(corps["message_key"], super::CLE_CLES_AUDIO_REFUSEES);
+            let message = corps["message"].as_str().unwrap_or_default();
+            assert!(message.contains(phrase), "{lang} : {message}");
+            assert!(
+                corps["cause"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("audio key"))
+            );
         }
     }
 
@@ -5516,12 +5604,23 @@ async fn get_queue(
     } else {
         Default::default()
     };
+    // Fil 2694 — les lignes que la radio de fin de file a ajoutées : badge
+    // « ajouté par la radio » à l'écran.
+    let ajoutees_par_la_radio =
+        tune_core::playback::radio_fin_de_file::lignes_ajoutees_par_la_radio(
+            &state.backend,
+            zone_id,
+        );
     let tracks: Vec<Value> = entries[..affichees]
         .iter()
         .enumerate()
         .map(|(idx, e)| {
             let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
             if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "added_by_radio".into(),
+                    Value::Bool(ajoutees_par_la_radio.contains(&e.id)),
+                );
                 let bannie = match (e.track_id, e.source.as_deref(), e.source_id.as_deref()) {
                     (Some(id), _, _) => bannis.contains(&id),
                     (None, Some(src), Some(sid)) => bannis_de_service.contains(&(
@@ -6416,6 +6515,8 @@ async fn queue_clear(
     state.orchestrator.stop(zone_id, device_id.as_deref()).await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     queue_repo.clear(zone_id).ok();
+    // Fil 2694 — plus de ligne, plus de marque « ajouté par la radio ».
+    tune_core::playback::radio_fin_de_file::oublier_les_marques(&state.backend, zone_id);
     state.orchestrator.clear_prefetch().await;
     state.playback.stop_and_clear(zone_id).await;
     state.playback.update_queue_info(zone_id, 0, 0).await;
@@ -6477,6 +6578,10 @@ async fn queue_clear_suite(state: &AppState, zone_id: i64) -> impl IntoResponse 
         .update_queue_info(zone_id, curseur, longueur)
         .await;
     persist_queue_async(state, zone_id);
+    // Fil 2694 — « Vider la suite » dit « arrête-toi après celle-ci » : la
+    // radio de fin de file ne prolonge pas cette file-là (tant qu'elle n'a
+    // pas changé d'ici sa fin).
+    tune_core::playback::radio_fin_de_file::noter_fin_voulue(&state.backend, zone_id);
     info!(
         zone_id,
         curseur, retirees, longueur, "queue_cleared_after_current"
@@ -10638,6 +10743,103 @@ mod vider_la_suite_4169 {
         let apres = state.playback.get_state(zone_id).await;
         assert_eq!((apres.queue_position, apres.queue_length), (1, 2));
         assert_eq!(apres.state, PlayState::Playing);
+    }
+
+    /// Fil 2694 — « Vider la suite » dit « arrête-toi après celle-ci » : la
+    /// radio de fin de file ne prolonge pas CETTE file. La consigne est
+    /// posée par la route, et vaut tant que la file n'a pas changé.
+    #[tokio::test]
+    async fn vider_la_suite_pose_une_fin_voulue_2694() {
+        let file = [service("s0"), service("s1"), service("s2")];
+        let (state, zone_id) = zone_en_lecture(&file, 0).await;
+        let statut = envoyer(
+            &state,
+            Request::post(format!("/api/v1/zones/{zone_id}/queue/clear"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"keep_current": true}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert!(
+            tune_core::playback::radio_fin_de_file::fin_voulue(&state.backend, zone_id),
+            "la file vidée de sa suite finit là"
+        );
+    }
+
+    /// Fil 2694 — `GET /zones/{id}/queue` porte `added_by_radio` sur chaque
+    /// ligne : vrai pour les lignes que la radio de fin de file a ajoutées,
+    /// faux pour les autres. Vider la file oublie les marques.
+    #[tokio::test]
+    async fn la_file_dit_ce_que_la_radio_a_ajoute_2694() {
+        let file = [service("s0"), service("s1")];
+        let (state, zone_id) = zone_en_lecture(&file, 1).await;
+        let avant =
+            tune_core::playback::radio_fin_de_file::lignes_de_la_file(&state.backend, zone_id);
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zone_id, &[service("r0"), service("r1")])
+            .expect("lot de la radio");
+        assert_eq!(
+            tune_core::playback::radio_fin_de_file::marquer_les_ajouts(
+                &state.backend,
+                zone_id,
+                &avant,
+                2
+            )
+            .len(),
+            2
+        );
+        let reponse = crate::routes::router(state.clone())
+            .oneshot(
+                Request::get(format!("/api/v1/zones/{zone_id}/queue"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("réponse du routeur");
+        assert_eq!(reponse.status(), StatusCode::OK);
+        let octets = axum::body::to_bytes(reponse.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let corps: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+        let marques: Vec<(String, bool)> = corps["tracks"]
+            .as_array()
+            .expect("tracks")
+            .iter()
+            .map(|t| {
+                (
+                    t["source_id"].as_str().unwrap_or_default().to_string(),
+                    t["added_by_radio"]
+                        .as_bool()
+                        .expect("added_by_radio toujours présent"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            marques,
+            vec![
+                ("s0".to_string(), false),
+                ("s1".to_string(), false),
+                ("r0".to_string(), true),
+                ("r1".to_string(), true),
+            ]
+        );
+        let statut = envoyer(
+            &state,
+            Request::post(format!("/api/v1/zones/{zone_id}/queue/clear"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert!(
+            tune_core::playback::radio_fin_de_file::lignes_ajoutees_par_la_radio(
+                &state.backend,
+                zone_id
+            )
+            .is_empty()
+        );
     }
 }
 
