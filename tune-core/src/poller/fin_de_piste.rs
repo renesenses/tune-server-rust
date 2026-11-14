@@ -41,16 +41,8 @@ impl PositionPoller {
         // Fil 2694 — fin naturelle ou piste en erreur ? Un titre de radio
         // joué en entier fait « servir » son lot.
         let fin_sur_erreur = crate::playback::radio_fin_de_file::prendre_fin_sur_erreur(zone_id);
-        if !fin_sur_erreur && crate::playback::radio_fin_de_file::a_un_lot(zone_id) {
-            let pos = zone_state.queue_position.max(0) as usize;
-            if let Some(ligne) =
-                crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
-                    .get_ordered(zone_id)
-                    .ok()
-                    .and_then(|f| f.get(pos).map(|r| r.id))
-            {
-                crate::playback::radio_fin_de_file::noter_ligne_jouee(zone_id, ligne);
-            }
+        if !fin_sur_erreur {
+            self.noter_la_ligne_courante_jouee(zone_id, zone_state.queue_position);
         }
 
         let Some(next_pos) = Self::next_position(zone_state) else {
@@ -91,6 +83,26 @@ impl PositionPoller {
             return;
         }
         self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+    }
+
+    /// Fil 2694 — la ligne `position` de la file vient d'être jouée en
+    /// entier : si elle est du dernier lot de la radio, ce lot a « servi » et
+    /// la fin de file suivante peut en appeler un autre. Ne relit la file que
+    /// si la zone a un lot en cours.
+    pub(super) fn noter_la_ligne_courante_jouee(&self, zone_id: i64, position: i64) {
+        use crate::playback::radio_fin_de_file as rff;
+        if !rff::a_un_lot(zone_id) {
+            return;
+        }
+        let pos = position.max(0) as usize;
+        if let Some(ligne) =
+            crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
+                .get_ordered(zone_id)
+                .ok()
+                .and_then(|f| f.get(pos).map(|r| r.id))
+        {
+            rff::noter_ligne_jouee(zone_id, ligne);
+        }
     }
 
     /// Fin de file : plus rien à jouer après cette piste. Autoplay (piste

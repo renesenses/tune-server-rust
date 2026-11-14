@@ -305,6 +305,49 @@ async fn un_lot_qui_n_a_joue_aucun_titre_en_entier_n_en_appelle_pas_un_autre() {
     rien_n_est_ajoute(&b).await;
 }
 
+/// Relecture de #8656 — zone NAVIGATEUR : le lecteur passe par `POST /next`
+/// (#8480), jamais par `handle_track_end`. Un lot de radio joué jusqu'au
+/// bout doit en appeler un deuxième au lieu d'arrêter la zone.
+#[tokio::test]
+async fn zone_navigateur_un_lot_joue_jusqu_au_bout_en_appelle_un_deuxieme() {
+    let b = banc(crate::streaming::ServiceRegistry::new()).await;
+    b.db.execute(
+        "UPDATE zones SET output_type = 'browser' WHERE id = ?",
+        &[&b.zone_id as &dyn ToSqlValue],
+    )
+    .unwrap();
+    // Le premier lot de la radio : la piste 3, dernière de la file, en cours.
+    let lignes = rff::lignes_de_la_file(&b.db, b.zone_id);
+    rff::noter_lot(b.zone_id, vec![lignes[1]]);
+    b.playback
+        .play(
+            b.zone_id,
+            crate::playback::NowPlaying {
+                track_id: Some(3),
+                title: "Piste 3".into(),
+                artist_name: Some("Artiste".into()),
+                source: "local".into(),
+                duration_ms: 1000,
+                ..Default::default()
+            },
+        )
+        .await;
+    b.playback.update_queue_info(b.zone_id, 1, 2).await;
+    // Le lecteur a mesuré la piste à son terme.
+    b.playback.update_position(b.zone_id, 1000).await;
+
+    assert!(
+        b.poller.fin_de_file_du_lecteur(b.zone_id).await,
+        "la fin du lecteur est traitée"
+    );
+    let file = pistes_de_la_file(&b);
+    assert!(
+        file.len() > 2,
+        "le lot joué en entier en appelle un deuxième : {file:?}"
+    );
+    assert!(!rff::lignes_ajoutees_par_la_radio(&b.db, b.zone_id).is_empty());
+}
+
 #[tokio::test]
 async fn un_titre_ajoute_par_l_auditeur_pendant_l_appel_n_est_pas_marque() {
     let b = banc(crate::streaming::ServiceRegistry::new()).await;
