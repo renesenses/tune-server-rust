@@ -313,6 +313,10 @@ pub struct SuiviDuTelechargement {
     /// Octets écrits jusqu'ici : tant qu'ils augmentent, on attend.
     octets: std::sync::atomic::AtomicU64,
     fin: tokio::sync::Notify,
+    /// #8701 — la poignée du décodeur, sans la retenir (le téléchargement
+    /// s'abandonne quand plus personne ne la tient) : un saut dans la piste
+    /// pendant le téléchargement s'y raccroche et suit la même frontière.
+    croissance: Mutex<Option<std::sync::Weak<DashGrowth>>>,
 }
 
 const EN_COURS: u8 = 0;
@@ -326,7 +330,29 @@ impl SuiviDuTelechargement {
             attendants: std::sync::atomic::AtomicUsize::new(0),
             octets: std::sync::atomic::AtomicU64::new(0),
             fin: tokio::sync::Notify::new(),
+            croissance: Mutex::new(None),
         })
+    }
+
+    /// #8701 — retient (faiblement) la poignée que suit le décodeur.
+    pub fn lier_la_croissance(&self, growth: &Arc<DashGrowth>) {
+        *self.croissance.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(growth));
+    }
+
+    /// #8701 — la poignée d'un téléchargement toujours en cours et sain, pour
+    /// un second lecteur (un saut) : il lit ce qui est déjà écrit tout de
+    /// suite, et n'attend à la frontière que les octets qu'il lui faut.
+    /// `None` si le téléchargement est fini, perdu ou abandonné.
+    pub fn croissance_vivante(&self) -> Option<Arc<DashGrowth>> {
+        if !self.en_cours() {
+            return None;
+        }
+        self.croissance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .filter(|g| !g.a_echoue())
     }
 
     /// Le téléchargement est fini : `complet`, ou perdu.

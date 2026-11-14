@@ -26,6 +26,8 @@ pub mod coupure_connue_8483;
 pub mod crete_de_sortie;
 pub mod crete_vraie;
 pub mod crossfeed;
+/// #8701 — les fMP4 DASH des pistes en cours, gardés pour un saut.
+pub mod dash_epingles;
 pub mod dash_growth;
 pub mod decode;
 /// Balise d'avancement du décodage (#3140) — le débit réel de l'hôte, mesuré
