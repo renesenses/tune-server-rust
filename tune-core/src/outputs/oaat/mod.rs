@@ -2,6 +2,11 @@ pub(crate) mod cause_de_connexion;
 pub(crate) mod helpers;
 #[cfg(feature = "oaat")]
 mod horloge;
+// #7330 — fin naturelle : `stop` après l'échéance du dernier échantillon.
+#[cfg(feature = "oaat")]
+mod fin_jouee_7330;
+#[cfg(all(test, feature = "oaat"))]
+mod fin_jouee_7330_tests;
 mod integration_test;
 mod multiroom;
 mod output;
