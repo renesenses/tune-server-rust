@@ -192,6 +192,40 @@ pub fn bloc_pays_artiste(ph: &mut Placeholders, valeurs: &[String]) -> Option<Pr
     ))
 }
 
+/// #8668 — le pays d'ÉDITION qu'une passe de fond a lu sur la release
+/// MusicBrainz de l'album (`albums.release_country`), valable seulement s'il
+/// vient de son identifiant de release COURANT et n'est pas vide. `pe_al` est
+/// l'alias de `albums`. Un identifiant changé ou retiré le rend caduc.
+pub const PAYS_EDITION_MB_VALIDE: &str = "pe_al.release_country_mbid IS NOT NULL \
+     AND pe_al.release_country_mbid = LOWER(TRIM(pe_al.musicbrainz_release_id)) \
+     AND pe_al.release_country IS NOT NULL AND pe_al.release_country <> ''";
+
+/// #8668 — la BALISE prime : aucune piste de l'album `pe_al` ne porte de
+/// RELEASECOUNTRY. Le pays lu sur MusicBrainz ne sert qu'à ces albums-là ;
+/// un album balisé n'est jamais compté sous deux pays.
+pub const SANS_PAYS_DE_BALISE: &str = "NOT EXISTS (SELECT 1 FROM tracks pe_t \
+     JOIN track_metadata pe_tm ON pe_tm.track_id = pe_t.id \
+     WHERE pe_t.album_id = pe_al.id AND pe_tm.key = 'release_country' AND pe_tm.value <> '')";
+
+/// #8668 — le filtre « pays d'édition » (`?country=`) : la balise
+/// RELEASECOUNTRY de la piste, telle qu'écrite (comme avant), OU, pour un
+/// album sans balise, le pays de sa release MusicBrainz, sans la casse.
+pub fn bloc_pays_edition(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
+    let balise = ph.in_list("tm.value", valeurs.len())?;
+    let mb = ph.in_list_ci("pe_al.release_country", valeurs.len())?;
+    let mut liees: Vec<SqlValue> = valeurs.iter().map(|v| SqlValue::Text(v.clone())).collect();
+    liees.extend(valeurs.iter().map(|v| SqlValue::Text(v.clone())));
+    Some((
+        format!(
+            "(EXISTS (SELECT 1 FROM track_metadata tm \
+             WHERE tm.track_id = t.id AND tm.key = 'release_country' AND {balise}) \
+             OR t.album_id IN (SELECT pe_al.id FROM albums pe_al \
+             WHERE {PAYS_EDITION_MB_VALIDE} AND {mb} AND {SANS_PAYS_DE_BALISE}))"
+        ),
+        liees,
+    ))
+}
+
 /// Liste de lecture, par son nom, sans la casse.
 pub fn bloc_listes(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
     let c = ph.in_list_ci("pl.name", valeurs.len())?;

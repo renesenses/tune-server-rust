@@ -2203,3 +2203,10 @@ path = "tests/pays_artiste_8090.rs"
 name = "banc_albums_http_7774"
 path = "tests/banc_albums_http_7774.rs"
 required-features = ["postgres"]
+
+# #8668 — la carte des pays : pays d'édition lu sur MusicBrainz (balise
+# prioritaire) et pays de chaque album pour la carte qui suit les filtres.
+# Jumeau PostgreSQL `pg_8668`.
+[[test]]
+name = "pays_edition_8668"
+path = "tests/pays_edition_8668.rs"
