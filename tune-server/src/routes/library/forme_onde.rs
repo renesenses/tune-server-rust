@@ -10,7 +10,12 @@
 //!
 //! * calculé à la demande sur le PCM décodé par Tune (`tune_core::audio::forme_onde`),
 //!   jamais ffmpeg, aucun son ; pistes locales sans perte et avec perte ;
-//!   une piste de service (sans fichier) rend 422, comme le spectrogramme ;
+//! * une piste QOBUZ ou TIDAL (go du 13/11) : l'audio est téléchargé pour le
+//!   calcul puis effacé, seul le résultat reste en cache
+//!   (`audio_de_service`) ; sa clé porte le service, l'identifiant chez lui
+//!   et la qualité au lieu de l'empreinte du fichier ; la piste entière au
+//!   nombre de colonnes par défaut seulement (422 `zoom_non_disponible`
+//!   sinon). Une piste d'un autre service rend 422, comme avant ;
 //! * le résultat de la piste entière, au nombre de colonnes par défaut (le
 //!   seul que l'écran demande), est gardé dans
 //!   `<cache des pochettes>/formes-onde/`, sous une clé qui porte la piste,
@@ -42,6 +47,7 @@ use tune_core::db::models::Track;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::taches_de_fond::priorite;
 
+use super::audio_de_service::{self as service, AudioTemporaire, Limites, PisteDeService, Refus};
 use super::spectrogramme as spectro;
 use crate::state::AppState;
 
@@ -109,12 +115,37 @@ pub(crate) fn nom_en_cache(
     )
 }
 
+/// Le nom en cache d'une piste de service : la clé du service, de
+/// l'identifiant et de la qualité remplace l'empreinte du fichier.
+pub(crate) fn nom_en_cache_service(id: i64, piste: &PisteDeService, colonnes: usize) -> String {
+    format!("{id}-{}-{colonnes}.json", piste.cle())
+}
+
 pub(crate) async fn servir(
     state: &AppState,
     id: i64,
     p: Parametres,
     dossier: &CheminFs,
     plafond: u64,
+) -> Response {
+    servir_avec(
+        state,
+        id,
+        p,
+        dossier,
+        plafond,
+        Limites::de_l_environnement(),
+    )
+    .await
+}
+
+pub(crate) async fn servir_avec(
+    state: &AppState,
+    id: i64,
+    p: Parametres,
+    dossier: &CheminFs,
+    plafond: u64,
+    limites: Limites,
 ) -> Response {
     let colonnes = forme_onde::borner_colonnes(p.colonnes.unwrap_or(COLONNES_DEFAUT));
     let track = match TrackRepo::with_backend(state.backend.clone()).get(id) {
@@ -123,7 +154,15 @@ pub(crate) async fn servir(
         Err(e) => return erreur(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     if track.file_path.as_deref().is_none_or(str::is_empty) {
-        return erreur(StatusCode::UNPROCESSABLE_ENTITY, "track has no local file");
+        return match PisteDeService::de(&track) {
+            Some(piste) => {
+                servir_service(
+                    state, &track, id, &piste, p, colonnes, dossier, plafond, limites,
+                )
+                .await
+            }
+            None => Refus::NonPrisEnCharge.reponse(),
+        };
     }
     let Some((chemin, meta)) = fichier(&track) else {
         return erreur(StatusCode::UNPROCESSABLE_ENTITY, "track file not found");
@@ -136,7 +175,7 @@ pub(crate) async fn servir(
             Ok(plage) => plage,
             Err(r) => return r,
         };
-        return match calculer(id, chemin, colonnes, debut, duree, duree_piste_s).await {
+        return match calculer(id, chemin, None, colonnes, debut, duree, duree_piste_s).await {
             Ok(v) => reponse(serde_json::to_vec(&v).unwrap_or_default(), "plage"),
             Err(r) => r,
         };
@@ -145,7 +184,7 @@ pub(crate) async fn servir(
     // Seul le nombre de colonnes par défaut entre au cache : un autre
     // nombre ne fait pas pousser le cache d'une variante par valeur.
     if colonnes != COLONNES_DEFAUT {
-        return match calculer(id, chemin, colonnes, 0.0, None, duree_piste_s).await {
+        return match calculer(id, chemin, None, colonnes, 0.0, None, duree_piste_s).await {
             Ok(v) => reponse(serde_json::to_vec(&v).unwrap_or_default(), "hors-cache"),
             Err(r) => r,
         };
@@ -164,17 +203,73 @@ pub(crate) async fn servir(
         spectro::liberer(id, verrou);
         return reponse(octets, "hit");
     }
-    let issue = match calculer(id, chemin, colonnes, 0.0, None, duree_piste_s).await {
-        Ok(v) => {
-            let octets = serde_json::to_vec(&v).unwrap_or_default();
-            if let Err(e) = ecrire(&cible, &octets) {
-                tracing::warn!(track_id = id, error = %e, "forme_onde_cache_non_ecrit");
-            }
-            spectro::evincer_selon(dossier, plafond, &cible, "json");
-            reponse(octets, "miss")
-        }
+    let issue = match calculer(id, chemin, None, colonnes, 0.0, None, duree_piste_s).await {
+        Ok(v) => mettre_en_cache(id, &v, &cible, dossier, plafond),
         Err(r) => r,
     };
+    drop(garde);
+    spectro::liberer(id, verrou);
+    issue
+}
+
+fn mettre_en_cache(
+    id: i64,
+    v: &Value,
+    cible: &CheminFs,
+    dossier: &CheminFs,
+    plafond: u64,
+) -> Response {
+    let octets = serde_json::to_vec(v).unwrap_or_default();
+    if let Err(e) = ecrire(cible, &octets) {
+        tracing::warn!(track_id = id, error = %e, "forme_onde_cache_non_ecrit");
+    }
+    spectro::evincer_selon(dossier, plafond, cible, "json");
+    reponse(octets, "miss")
+}
+
+/// Une piste Qobuz ou TIDAL : la piste entière, au nombre de colonnes par
+/// défaut, depuis le cache ou téléchargée, calculée, puis effacée.
+#[allow(clippy::too_many_arguments)]
+async fn servir_service(
+    state: &AppState,
+    track: &Track,
+    id: i64,
+    piste: &PisteDeService,
+    p: Parametres,
+    colonnes: usize,
+    dossier: &CheminFs,
+    plafond: u64,
+    limites: Limites,
+) -> Response {
+    if p.debut_s.is_some() || p.fin_s.is_some() || colonnes != COLONNES_DEFAUT {
+        return Refus::ZoomNonDisponible.reponse();
+    }
+    let cible = dossier.join(nom_en_cache_service(id, piste, colonnes));
+    if let Some(octets) = spectro::lire_le_cache(&cible) {
+        return reponse(octets, "hit");
+    }
+    // Un seul calcul par piste à la fois, téléchargement compris.
+    let verrou = spectro::verrou_de(id);
+    let garde = verrou.clone().lock_owned().await;
+    if let Some(octets) = spectro::lire_le_cache(&cible) {
+        drop(garde);
+        spectro::liberer(id, verrou);
+        return reponse(octets, "hit");
+    }
+    let duree_piste_s = (track.duration_ms > 0).then(|| track.duration_ms as f64 / 1000.0);
+    let issue =
+        match service::telecharger(state, piste, &service::dossier_temporaire(dossier), limites)
+            .await
+        {
+            Ok(audio) => {
+                let chemin = audio.chemin().to_string_lossy().into_owned();
+                match calculer(id, chemin, Some(audio), colonnes, 0.0, None, duree_piste_s).await {
+                    Ok(v) => mettre_en_cache(id, &v, &cible, dossier, plafond),
+                    Err(r) => r,
+                }
+            }
+            Err(refus) => refus.reponse(),
+        };
     drop(garde);
     spectro::liberer(id, verrou);
     issue
@@ -228,9 +323,13 @@ impl Drop for ArretAuDrop {
     }
 }
 
+/// `audio` : le fichier téléchargé d'une piste de service, qui part (et
+/// s'efface) avec le travail bloquant — jamais pendant qu'il se décode.
+#[allow(clippy::too_many_arguments)]
 async fn calculer(
     id: i64,
     chemin: String,
+    audio: Option<AudioTemporaire>,
     colonnes: usize,
     debut_s: f64,
     duree_s: Option<f64>,
@@ -247,6 +346,7 @@ async fn calculer(
     let debut = std::time::Instant::now();
     let resultat = priorite::hors_du_fil_async_pour(ORIGINE, TACHE, move || {
         let _place = place;
+        let _audio = audio;
         if arret.load(Ordering::Relaxed) {
             return Err(forme_onde::INTERROMPU.to_string());
         }
@@ -332,17 +432,34 @@ pub(crate) fn en_json(id: i64, f: &FormeOnde, debut_s: f64, duree_calcul_ms: u64
 /// La section `forme_d_onde` de la fiche technique : `etat` (`a_jour` si la
 /// forme de la piste entière, au nombre de colonnes par défaut, est en cache
 /// pour le fichier d'aujourd'hui ; `absent` sinon) et l'URL à demander.
-/// `None` pour une piste sans fichier : même règle que le spectrogramme.
+/// Une piste Qobuz ou TIDAL l'a aussi (calculée par téléchargement) : elle
+/// porte alors `service`, et l'écran ne demande pas de plage. `None` pour une
+/// piste sans fichier d'un autre service.
 pub(crate) fn section(track: &Track, dossier: &CheminFs) -> Option<Value> {
     let id = track.id?;
-    let (chemin, meta) = fichier(track)?;
+    let url = format!("/api/v1/library/tracks/{id}/forme-onde?colonnes={COLONNES_DEFAUT}");
+    if let Some((chemin, meta)) = fichier(track) {
+        let presente = dossier
+            .join(nom_en_cache(id, &chemin, &meta, COLONNES_DEFAUT))
+            .is_file();
+        return Some(json!({
+            "etat": if presente { "a_jour" } else { "absent" },
+            "url": url,
+            "colonnes": COLONNES_DEFAUT,
+        }));
+    }
+    if track.file_path.as_deref().is_some_and(|c| !c.is_empty()) {
+        return None;
+    }
+    let piste = PisteDeService::de(track)?;
     let presente = dossier
-        .join(nom_en_cache(id, &chemin, &meta, COLONNES_DEFAUT))
+        .join(nom_en_cache_service(id, &piste, COLONNES_DEFAUT))
         .is_file();
     Some(json!({
         "etat": if presente { "a_jour" } else { "absent" },
-        "url": format!("/api/v1/library/tracks/{id}/forme-onde?colonnes={COLONNES_DEFAUT}"),
+        "url": url,
         "colonnes": COLONNES_DEFAUT,
+        "service": piste.service,
     }))
 }
 
