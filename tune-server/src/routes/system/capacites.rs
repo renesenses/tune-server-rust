@@ -26,7 +26,6 @@ pub(crate) fn capacites_payload(mobile: bool) -> Value {
     json!({
         "version": tune_core::version(),
         "mobile": mobile,
-        "bibliotheque": { "artiste_par_dossier": true },
         "sources_reseau": {
             // L'écran « Sources du réseau » : serveurs UPnP/DLNA
             // (`/network/media-servers*`) et autres serveurs Tune (`/peers`).
@@ -44,6 +43,7 @@ pub(crate) fn capacites_payload(mobile: bool) -> Value {
             // (`/system/music-dirs/move*`). Le client cache le bouton quand
             // la clé manque (serveur plus ancien).
             "remplacer_le_chemin": true,
+            "artiste_par_dossier": true,
         },
         "decouverte_reseau": {
             // Faux tant que l'application a différé la découverte et que
