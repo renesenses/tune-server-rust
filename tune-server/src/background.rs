@@ -34,6 +34,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // #8325 — une fois : relire WORK / MOVEMENTNAME / BAND des fichiers
     // déjà importés, sans scan à lancer par l'utilisateur.
     crate::routes::library::relecture_classique::armer(state);
+    // rc12 — une seule fois : renvoyer au site les images d'artistes
+    // qu'il a perdues (22/10 → 13/11/2026), si l'utilisateur partage.
+    crate::routes::library::renvoi_images_artistes::armer(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
     spawn_dash_temp_gc();

@@ -1849,7 +1849,7 @@ fn kv_facet(
 
 #[cfg(test)]
 #[path = "facets_socle_5977_tests.rs"]
-mod socle_5977_tests;
+pub(crate) mod socle_5977_tests;
 
 #[cfg(test)]
 #[path = "facettes_et_2108_tests.rs"]

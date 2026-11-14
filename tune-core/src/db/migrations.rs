@@ -2907,6 +2907,17 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "alarms_interrupt_playback",
         up: "",
     },
+    // Forum, fil 2694 (Ilan) ; décision de Bertrand du 13/11 — la radio de fin
+    // de file est ACTIVÉE par défaut, comme Roon. Bascule unique des zones
+    // « désactivé » (défaut historique depuis la 46) vers « titres
+    // similaires » ; les modes nommés (#2271) ne bougent pas. Les zones
+    // créées ensuite naissent à 1 (`ZoneRepo::create`). Jumelle PG : 118.
+    // Numérotée 152 / PG 118 le 13/11 : 151 / PG 117 sont pris par #8615.
+    Migration {
+        version: 152,
+        name: "radio_fin_de_file_par_defaut",
+        up: SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT,
+    },
     // #8668 — le pays d'ÉDITION lu sur la release MusicBrainz de l'album :
     // `albums.release_country` (code ISO 3166-1 alpha-2, '' quand MusicBrainz
     // n'en donne aucun) et `albums.release_country_mbid`, l'identifiant de
@@ -2941,6 +2952,11 @@ pub(crate) fn interruption_par_le_reveil(db: &SqliteDb) {
         "INTEGER NOT NULL DEFAULT 1",
     );
 }
+
+/// SQL de la migration 152 (fil 2694). SQLite range `'0'` en entier (affinité
+/// INTEGER) : la comparaison à 0 couvre les deux écritures.
+pub(crate) const SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT: &str = "UPDATE zones SET autoplay_enabled = 1 \
+     WHERE autoplay_enabled IS NULL OR autoplay_enabled = 0 OR autoplay_enabled = 'off'";
 
 /// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
 /// de la 146 et passe finale.
@@ -6215,6 +6231,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         117,
         "alarms_interrupt_playback",
         include_str!("../../migrations/postgres/117_alarms_interrupt_playback.sql"),
+    ),
+    // Jumelle de la SQLite 152 (fil 2694) : radio de fin de file activée par
+    // défaut — bascule unique des zones « désactivé », DEFAULT '1'.
+    (
+        118,
+        "radio_fin_de_file_par_defaut",
+        include_str!("../../migrations/postgres/118_radio_fin_de_file_par_defaut.sql"),
     ),
     // Jumelle de la SQLite 154 (#8668) : `albums.release_country` et
     // `albums.release_country_mbid`, le pays d'édition lu sur MusicBrainz.
@@ -10089,6 +10112,9 @@ mod tests {
         // 117 : `alarms_interrupt_playback` (#8615), jumelle de la SQLite
         // 151. Pose l'option de réveil « Interrompre la lecture en cours »,
         // que le planificateur et les routes des réveils NOMMENT.
+        // 118 : `radio_fin_de_file_par_defaut` (fil 2694), jumelle de la
+        // SQLite 152. Migration de DONNÉES : la radio de fin de file activée
+        // par défaut, et le DEFAULT de `zones.autoplay_enabled` à '1'.
         // 120 : `albums_release_country` (#8668), jumelle de la SQLite 154
         // (118 = #8656, 119 = #8678, fusionnées avant).
         // Pose le pays d'édition MusicBrainz, que les facettes, le filtre
