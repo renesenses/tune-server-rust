@@ -81,6 +81,9 @@ mod reports;
 pub(crate) mod requete_avancee;
 // tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
 // fichiers de CETTE machine.
+/// Go du 13/11 — forme d'onde et spectrogramme d'une piste Qobuz ou TIDAL :
+/// téléchargée pour le calcul, puis effacée.
+mod audio_de_service;
 /// Fil du forum 2793 — la forme d'onde d'une piste (crêtes, RMS, écrêtage),
 /// en JSON, calculée à la demande pour sa fiche technique.
 mod forme_onde;

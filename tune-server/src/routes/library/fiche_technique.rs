@@ -23,8 +23,11 @@
 //!   mesurées par la passe ReplayGain, quand elles existent.
 //!
 //! Une section que rien ne renseigne vaut `null` : une piste de service, sans
-//! fichier, n'a ni spectrogramme, ni DR mesuré, ni intégrité, et le client
-//! n'affiche pas de section vide. Lecture seule, rien n'est calculé ici :
+//! fichier, n'a ni DR mesuré, ni intégrité, et le client n'affiche pas de
+//! section vide. Une piste QOBUZ ou TIDAL (go du 13/11) a ses sections
+//! `spectrogramme` et `forme_d_onde`, calculées par téléchargement
+//! (`audio_de_service`) et marquées `service` ; pas de `sonie` tant que la
+//! passe ReplayGain ne l'a pas mesurée. Lecture seule, rien n'est calculé ici :
 //! `POST /library/tracks/{id}/spectrogramme` recalcule l'image.
 
 use std::path::Path as CheminFs;
@@ -133,8 +136,14 @@ pub(crate) fn construire(
     // Une section qui n'aurait que la durée et les canaux ne dit rien du format.
     .filter(|f| f.get("codec").is_some() || f.get("sample_rate").is_some());
 
-    let spectrogramme =
-        meta.and_then(|m| super::spectrogramme::section(state.backend.as_ref(), id, m, dossier));
+    let spectrogramme = match meta {
+        Some(m) => super::spectrogramme::section(state.backend.as_ref(), id, m, dossier),
+        None if track.file_path.as_deref().is_none_or(str::is_empty) => {
+            super::audio_de_service::PisteDeService::de(&track)
+                .map(|p| super::spectrogramme::section_service(id, &p, dossier))
+        }
+        None => None,
+    };
 
     let dynamic_range = metadonnees
         .get("dr_track")

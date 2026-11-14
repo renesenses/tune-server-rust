@@ -24,6 +24,12 @@
 //! cache quand une nouvelle la remplace ; une image évincée emporte sa ligne.
 //! `POST /library/tracks/{id}/spectrogramme` recalcule sans lire le cache et
 //! rend la section `spectrogramme` de la fiche.
+//!
+//! Go du 13/11 — une piste QOBUZ ou TIDAL a aussi son spectrogramme : l'audio
+//! est téléchargé pour le calcul puis effacé (`audio_de_service`), seule
+//! l'image reste en cache, sous une clé qui porte le service, l'identifiant
+//! chez lui et la qualité au lieu de l'empreinte du fichier. Pas de trace
+//! datée en base pour elle (aucun fichier dont suivre les changements).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -40,6 +46,7 @@ use tune_core::db::spectrogrammes;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::taches_de_fond::priorite;
 
+use super::audio_de_service::{self as service, AudioTemporaire, Limites, PisteDeService, Refus};
 use crate::state::AppState;
 
 /// Plafond du cache par défaut : 256 Mo (environ 2 000 images 1200 × 400).
@@ -140,9 +147,49 @@ pub(crate) async fn recalculer_dans(
         .get(id)
         .ok()
         .flatten()
-        .and_then(|t| super::fiche_technique::fichier_de_la_piste(&t))
-        .and_then(|(_, meta)| section(state.backend.as_ref(), id, &meta, dossier));
+        .and_then(|t| match super::fiche_technique::fichier_de_la_piste(&t) {
+            Some((_, meta)) => section(state.backend.as_ref(), id, &meta, dossier),
+            None => PisteDeService::de(&t).map(|p| section_service(id, &p, dossier)),
+        });
     axum::Json(section.unwrap_or(serde_json::Value::Null)).into_response()
+}
+
+/// Le nom en cache de l'image d'une piste de service : la clé du service,
+/// de l'identifiant et de la qualité remplace l'empreinte du fichier.
+pub(crate) fn nom_en_cache_service(
+    id: i64,
+    piste: &PisteDeService,
+    largeur: u32,
+    hauteur: u32,
+) -> String {
+    format!("{id}-{}-{largeur}x{hauteur}.png", piste.cle())
+}
+
+/// La section `spectrogramme` de la fiche d'une piste Qobuz ou TIDAL :
+/// `a_jour` quand l'image à la taille par défaut est en cache, `absent`
+/// sinon ; `service` dit qu'elle se calcule par téléchargement.
+pub(crate) fn section_service(
+    id: i64,
+    piste: &PisteDeService,
+    dossier: &CheminFs,
+) -> serde_json::Value {
+    let presente = dossier
+        .join(nom_en_cache_service(
+            id,
+            piste,
+            LARGEUR_DEFAUT,
+            HAUTEUR_DEFAUT,
+        ))
+        .is_file();
+    serde_json::json!({
+        "etat": if presente { "a_jour" } else { "absent" },
+        "url": format!(
+            "/api/v1/library/tracks/{id}/spectrogramme.png?largeur={LARGEUR_DEFAUT}&hauteur={HAUTEUR_DEFAUT}"
+        ),
+        "largeur": LARGEUR_DEFAUT,
+        "hauteur": HAUTEUR_DEFAUT,
+        "service": piste.service,
+    })
 }
 
 /// L'image de la piste : depuis le cache, ou générée (`forcer` : toujours
@@ -166,8 +213,26 @@ async fn obtenir(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response());
         }
     };
-    let Some(chemin) = track.file_path.as_deref() else {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "track has no local file").into_response());
+    let Some(chemin) = track.file_path.as_deref().filter(|c| !c.is_empty()) else {
+        // Recette du 14/11 — une piste d'un serveur multimédia (UPnP) n'a
+        // pas de fichier ici : un refus que l'écran sait dire.
+        if track.source == "upnp" {
+            return Err(Refus::SourceReseau.reponse());
+        }
+        let Some(piste) = PisteDeService::de(&track) else {
+            return Err(Refus::NonPrisEnCharge.reponse());
+        };
+        return obtenir_service(
+            state,
+            id,
+            &piste,
+            (largeur, hauteur),
+            track.duration_ms,
+            dossier,
+            plafond,
+            forcer,
+        )
+        .await;
     };
     // La graphie du disque, pas celle de la base (#1865).
     let chemin = tune_core::library::local_path::resolve_existing_local_path(chemin)
@@ -191,7 +256,7 @@ async fn obtenir(
         return Ok((octets, "hit"));
     }
     let debut = std::time::Instant::now();
-    let resultat = generer(chemin, largeur, hauteur, track.duration_ms).await;
+    let resultat = generer(chemin, None, largeur, hauteur, track.duration_ms).await;
     let duree_ms = debut.elapsed().as_millis() as i64;
     let issue = match resultat {
         Ok(octets) => {
@@ -325,8 +390,82 @@ pub(crate) fn section(
     })
 }
 
+/// L'image d'une piste Qobuz ou TIDAL : depuis le cache, ou téléchargée,
+/// calculée, puis l'audio effacé. Un seul calcul par piste à la fois,
+/// téléchargement compris.
+#[allow(clippy::too_many_arguments)]
+async fn obtenir_service(
+    state: &AppState,
+    id: i64,
+    piste: &PisteDeService,
+    (largeur, hauteur): (u32, u32),
+    duree_ms: i64,
+    dossier: &CheminFs,
+    plafond: u64,
+    forcer: bool,
+) -> Result<(Vec<u8>, &'static str), Response> {
+    // Une image par piste de service, à la taille de l'écran : une autre
+    // taille retéléchargerait la piste et ferait pousser le cache.
+    if (largeur, hauteur) != (LARGEUR_DEFAUT, HAUTEUR_DEFAUT) {
+        return Err(Refus::ZoomNonDisponible.reponse());
+    }
+    let cible = dossier.join(nom_en_cache_service(id, piste, largeur, hauteur));
+    if !forcer && let Some(octets) = lire_le_cache(&cible) {
+        return Ok((octets, "hit"));
+    }
+    let verrou = verrou_de(id);
+    let garde = verrou.clone().lock_owned().await;
+    if !forcer && let Some(octets) = lire_le_cache(&cible) {
+        drop(garde);
+        liberer(id, verrou);
+        return Ok((octets, "hit"));
+    }
+    let issue = match service::telecharger(
+        state,
+        piste,
+        &service::dossier_temporaire(dossier),
+        Limites::de_l_environnement(),
+    )
+    .await
+    {
+        Err(refus) => Err(refus.reponse()),
+        Ok(audio) => {
+            let chemin = audio.chemin().to_string_lossy().into_owned();
+            match generer(chemin, Some(audio), largeur, hauteur, duree_ms).await {
+                Ok(octets) => {
+                    if let Err(e) = ecrire(&cible, &octets) {
+                        tracing::warn!(track_id = id, error = %e, "spectrogramme_cache_non_ecrit");
+                    }
+                    let evincees = evincer(dossier, plafond, &cible);
+                    if !evincees.is_empty()
+                        && let Err(e) =
+                            spectrogrammes::oublier_les_fichiers(state.backend.as_ref(), &evincees)
+                    {
+                        tracing::warn!(error = %e, "spectrogramme_oubli_des_evincees");
+                    }
+                    Ok((octets, "miss"))
+                }
+                Err(e) => {
+                    tracing::info!(track_id = id, error = %e, "spectrogramme_impossible");
+                    Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("spectrogram failed: {e}"),
+                    )
+                        .into_response())
+                }
+            }
+        }
+    };
+    drop(garde);
+    liberer(id, verrou);
+    issue
+}
+
+/// `audio` : le fichier téléchargé d'une piste de service, qui part (et
+/// s'efface) avec le travail bloquant.
 async fn generer(
     chemin: String,
+    audio: Option<AudioTemporaire>,
     largeur: u32,
     hauteur: u32,
     duree_ms: i64,
@@ -341,6 +480,7 @@ async fn generer(
     // la lecture entre deux fenêtres (#8086), une seule génération à la fois
     // par piste et deux au plus au total, un nice modéré.
     let resultat = priorite::hors_du_fil_async_pour(ORIGINE, TACHE, move || {
+        let _audio = audio;
         spectrogramme::generer_png(&chemin, largeur, hauteur, duree_s, &|| {
             priorite::ceder_pour_bloquant(ORIGINE, TACHE);
         })
