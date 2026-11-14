@@ -75,7 +75,7 @@ impl Refus {
 /// fichier réécrit, comme après la gravure du DR (fil 2134) : la base porte
 /// déjà les valeurs écrites, et le surveillant ne relit pas le fichier pour
 /// rien. La date du fichier, elle, avance : le fichier a changé.
-pub(super) fn remettre_la_ligne_en_phase(
+pub(crate) fn remettre_la_ligne_en_phase(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     chemin: &str,
 ) {

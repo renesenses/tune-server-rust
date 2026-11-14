@@ -158,6 +158,8 @@ mod garde_ecriture_fichiers {
         ("tune-server/src/routes/library/tracks.rs", 1),
         ("tune-server/src/routes/library/write_tags.rs", 2),
         ("tune-server/src/routes/metadata.rs", 1),
+        // #8679 — la balise ARTIST lue dans le dossier, sous le réglage.
+        ("tune-server/src/routes/metadata/artiste_du_dossier.rs", 1),
         ("tune-server/src/routes/tagger.rs", 8),
     ];
 
