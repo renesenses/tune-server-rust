@@ -40,8 +40,8 @@ pub mod sql {
 
     /// Les mêmes colonnes, mais avec `track_id` RÉSOLU.
     ///
-    /// 🔴 `listen_history.track_id` est **toujours NULL** : le seul site
-    /// d'insertion passe `track_id: None`. La liste rendait donc ce NULL tel
+    /// Avant #8714, l'insertion ne conservait pas `track_id`. Ce repli reste
+    /// nécessaire pour ces lignes anciennes : la liste rendait ce NULL tel
     /// quel, et le client ne pouvait désigner aucune écoute locale.
     ///
     /// FabienM, fil forum 1739, 09/09/2026 : « Manque des contrôles dans les
@@ -173,15 +173,15 @@ pub mod sql {
             // scalaires (`MAX`), qui rendent au plus une valeur par groupe.
             //
             // #7777 : les écoutes IMPORTÉES (`imported_plays`, #7763) comptent
-            // aussi, avec la même règle que `plays_for_tracks` — titre +
-            // interprète de la piste. Une piste qui n'a QUE des écoutes
+            // aussi, regroupées par titre + interprète de la piste. Une piste qui n'a QUE des écoutes
             // importées entre dans le classement ; une piste qui a les deux
-            // les additionne dans un seul groupe. `listen_history.track_id`
-            // étant toujours NULL, `MAX(tid)` y prend l'identifiant de la
-            // piste importée. `CAST … AS BIGINT` : `SUM` d'un BIGINT rend un
+            // les additionne dans un seul groupe. `MAX(tid)` retient une
+            // piste explicite ou importée quand elle existe ; ce classement
+            // reste global, contrairement au compteur par copie de #8714.
+            // `CAST … AS BIGINT` : `SUM` d'un BIGINT rend un
             // NUMERIC sur PostgreSQL, que `as_i64` ne lit pas.
             //
-            // #8140 : `listen_history.track_id` étant toujours NULL, la piste
+            // #8140 : pour une écoute sans `listen_history.track_id`, la piste
             // locale se retrouvait par le TITRE SEUL (`t3.title = g.title`) :
             // l'écoute Deezer de « Marianne » d'un artiste A rendait la piste
             // homonyme d'un artiste B, et le client ouvrait l'album de B. Le
@@ -296,20 +296,13 @@ pub mod sql {
 
     /// L'écoute de plusieurs pistes d'un coup : compte et dernière fois (#3518).
     ///
-    /// # Pourquoi le rapprochement se fait par titre + interprète
+    /// #8714 — même rapprochement que les listes intelligentes : piste connue,
+    /// puis album + titre, puis titre + interprète pour l'ancien historique
+    /// sans album résoluble. Aucun historique ancien n'est réécrit.
     ///
-    /// Parce que `listen_history.track_id` est **toujours NULL**. Le seul site
-    /// qui écrit l'historique — `orchestrator::commun::record_listen` — passe
-    /// `track_id: None`, avec le commentaire qui l'explique. Une jointure sur
-    /// `h.track_id = t.id` rendrait donc `play_count = 0` pour la bibliothèque
-    /// entière : la colonne exacte que #3518 refuse, celle qui affiche « jamais
-    /// joué » pour une piste jouée cent fois.
-    ///
-    /// Le rapprochement est le MÊME que celui de `top_tracks` et de
-    /// `track_plays` — égalité stricte sur `title` et `artist_name` —, et c'est
-    /// délibéré : la colonne d'un album doit donner le même nombre que l'écran
-    /// « Titres les plus écoutés », sans quoi deux vues de la même donnée se
-    /// contrediraient à l'écran.
+    /// `top_tracks` reste volontairement groupé par titre + interprète, toutes
+    /// copies et provenances confondues : son total peut dépasser celui de la
+    /// piste d'un album particulier.
     ///
     /// # Seules les écoutes de la même provenance comptent (#7980)
     ///
@@ -333,55 +326,58 @@ pub mod sql {
     /// n'est rempli que si la requête de lecture portait un `X-Profile-Id` ; il
     /// est NULL sur la grande majorité des lignes, et `full_dashboard` filtre
     /// par égalité stricte, donc une vue par profil les écarterait toutes. Un
-    /// compte par profil rendrait aujourd'hui zéro presque partout. Global, il
-    /// donne le même nombre que `/library/history/top-tracks`, que le client
-    /// affiche déjà. Une variante par profil pourra s'ajouter en paramètre
+    /// compte par profil rendrait aujourd'hui zéro presque partout. Le compte
+    /// reste donc global. Une variante par profil pourra s'ajouter en paramètre
     /// sans changer la forme de la réponse.
     ///
     /// `id_list` n'est composé que d'entiers, produits par l'appelant à partir
     /// des identifiants qu'il a lus en base — jamais d'une chaîne du client.
     pub fn plays_for_tracks(id_list: &str) -> String {
+        // #8714 — même règle que `ecoute_de_la_piste` (piste, puis album +
+        // titre, puis titre + interprète pour l'ancien historique).
         format!(
             "SELECT t.id, COUNT(h.id), MAX(h.listened_at) \
              FROM tracks t \
-             LEFT JOIN artists a ON a.id = t.artist_id \
              LEFT JOIN listen_history h \
                     ON {} \
-                   AND h.title = t.title \
-                   AND (h.artist_name = a.name \
-                        OR (h.artist_name IS NULL AND a.name IS NULL)) \
              WHERE t.id IN ({id_list}) \
              GROUP BY t.id",
-            meme_provenance("h", "t")
+            ecoute_de_la_piste("t", "h")
         )
     }
 
-    /// La condition qui rattache une écoute `h` à une piste `t` (#7769) : la
-    /// règle de [`plays_for_tracks`], écrite pour servir DANS une autre
-    /// requête — les listes et collections intelligentes, qui comptaient par
-    /// `h.track_id = t.id`, une colonne toujours NULL. « = 0 » y rendait
-    /// toute la bibliothèque et « < 1 » rien du tout.
+    /// La condition qui rattache une écoute à une piste : même provenance,
+    /// piste explicite en priorité, sinon album + titre, et titre + interprète
+    /// pour l'ancien historique sans album résoluble (#8714).
     ///
-    /// Même règle, donc même nombre que la colonne de la Bibliothèque : même
-    /// provenance (#7980), même titre, et même interprète ou interprète absent
-    /// des deux côtés. L'interprète de la piste est relu par sous-requête pour ne
-    /// dépendre d'aucun alias de la requête englobante. `piste` et `ecoute`
-    /// sont des alias écrits par l'appelant, jamais une saisie.
-    ///
-    /// Une écoute dont `track_id` désigne la piste lui revient aussi, même
-    /// sans interprète enregistré : c'était la seule règle avant #7769, et
-    /// la retirer faisait perdre ces écoutes (`pg_date_relative_6122`). Une
-    /// seule ligne d'écoute ne compte qu'une fois : c'est un `OR` dans la
-    /// même condition. Sur les écoutes de la production, `track_id` vide, le
-    /// nombre reste celui de la Bibliothèque.
+    /// Commune à la colonne Bibliothèque et aux listes intelligentes (#7769).
+    /// Une ligne ne compte qu'une fois, même si plusieurs critères concordent.
+    /// Les alias sont écrits par l'appelant, jamais issus d'une saisie.
     pub fn ecoute_de_la_piste(piste: &str, ecoute: &str) -> String {
         let interprete =
             format!("(SELECT ae.name FROM artists ae WHERE ae.id = {piste}.artist_id)");
+        // #8714 (Procol Harum 1967, fil 2806) — le titre + interprète seul
+        // donnait à TOUTES les copies d'un titre (autres albums, compilations)
+        // le même compte. Désormais, du plus sûr au moins sûr :
+        // 1. l'écoute désigne une piste (`track_id`, écrit depuis #8714) :
+        //    elle ne revient qu'à cette piste ;
+        // 2. sinon, son album est connu et existe encore : elle revient au
+        //    titre de même nom DE CET ALBUM, sauf interprète explicitement différent ;
+        // 3. sinon seulement (ancien historique sans album, album disparu) :
+        //    titre + interprète, comme avant.
         format!(
             "{} AND ({ecoute}.track_id = {piste}.id \
-             OR ({ecoute}.title = {piste}.title \
-                 AND ({ecoute}.artist_name = {interprete} \
-                      OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))))",
+             OR ({ecoute}.track_id IS NULL \
+                 AND {ecoute}.title = {piste}.title \
+                 AND (({ecoute}.album_id IS NOT NULL \
+                       AND EXISTS (SELECT 1 FROM albums al_ecoute WHERE al_ecoute.id = {ecoute}.album_id) \
+                       AND {ecoute}.album_id = {piste}.album_id \
+                       AND ({ecoute}.artist_name IS NULL OR {interprete} IS NULL \
+                            OR {ecoute}.artist_name = {interprete})) \
+                      OR (({ecoute}.album_id IS NULL \
+                           OR NOT EXISTS (SELECT 1 FROM albums al_ecoute WHERE al_ecoute.id = {ecoute}.album_id)) \
+                          AND ({ecoute}.artist_name = {interprete} \
+                               OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))))))",
             meme_provenance(ecoute, piste)
         )
     }
@@ -2552,6 +2548,10 @@ mod ecoutes_d_une_piste_locale_7980_tests;
 mod ecoutes_importees_regles_8416_tests;
 
 #[cfg(test)]
+#[path = "ecoutes_par_piste_8714_tests.rs"]
+mod ecoutes_par_piste_8714_tests;
+
+#[cfg(test)]
 #[path = "podcast_hors_artistes_8645_tests.rs"]
 mod podcast_hors_artistes_8645_tests;
 
@@ -3344,7 +3344,7 @@ mod tests {
     }
 
     /// La cause du ticket, mise sous garde. `listen_history.track_id` est
-    /// TOUJOURS NULL — `record_listen` passe `track_id: None` — donc une
+    /// NULL sur l’ancien historique — donc une
     /// jointure sur cette colonne rendrait zéro partout. Ce test écrit
     /// l'historique par le vrai chemin (`record`) et exige que le compte
     /// remonte quand même.
@@ -3368,7 +3368,10 @@ mod tests {
             .expect("compte")
             .and_then(|c| c.first().and_then(|v| v.as_i64()))
             .unwrap_or(0);
-        assert_eq!(nuls, 1, "l'orchestrateur n'ecrit jamais de track_id");
+        assert_eq!(
+            nuls, 1,
+            "ce témoin représente une écoute ancienne sans track_id"
+        );
         assert_eq!(
             repo.plays_for_tracks(&[1])
                 .expect("lecture")

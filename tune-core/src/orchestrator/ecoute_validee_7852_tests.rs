@@ -120,6 +120,7 @@ async fn lancer(orch: &PlaybackOrchestrator, zone_id: i64, np: &NowPlaying) {
             pochette: None,
         },
         None,
+        None,
     );
 }
 

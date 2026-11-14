@@ -1536,15 +1536,19 @@ mod tests {
         assert!(a.contains("ar.name"), "{a}");
     }
 
-    /// « Jamais écoutée » : un compte nul des écoutes rattachées à la piste
-    /// par titre + interprète (#7769), ou par `track_id` quand il est
-    /// renseigné — jamais par `track_id` seul, toujours NULL en production.
-    /// Le comportement est tenu par `ecoutes_7769_tests`.
+    /// « Jamais écoutée » suit track_id en priorité (#8714), puis les
+    /// replis de l'ancien historique sans identifiant. Le comportement est
+    /// tenu par criteres_ecoutes_7769_tests, y compris les homonymes du même album.
     #[test]
     fn jamais_ecoutee_compte_les_ecoutes_de_la_piste() {
         let w = where_of(r#"[{"field":"play_count","op":"equals","value":"0"}]"#);
         assert!(w.contains("FROM listen_history he"), "{w}");
-        assert!(w.contains("OR (he.title = t.title"), "{w}");
+        assert!(w.contains("he.track_id = t.id"), "{w}");
+        assert!(
+            w.contains("OR (he.track_id IS NULL AND he.title = t.title"),
+            "{w}"
+        );
+        assert!(w.contains("he.album_id = t.album_id"), "{w}");
         assert!(w.ends_with("= 0"), "{w}");
     }
 

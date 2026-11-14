@@ -679,6 +679,9 @@ impl PlaybackOrchestrator {
         session_profile_id: Option<i64>,
         contexte: ContexteEcoute<'_>,
         album_ref: Option<&str>,
+        // #8714 — la piste de la BIBLIOTHÈQUE écoutée, quand le lanceur la
+        // connaît : son compte d'écoutes ne se rapproche plus par titre.
+        track_id: Option<i64>,
     ) {
         self.armer_l_ecoute(
             zone_id,
@@ -694,6 +697,7 @@ impl PlaybackOrchestrator {
                 session_profile_id,
                 contexte: super::ecoute_validee_7852::ContexteRetenu::de(&contexte),
                 album_ref: album_ref.map(Into::into),
+                track_id,
             },
         );
     }
@@ -733,7 +737,10 @@ impl PlaybackOrchestrator {
         let repo = HistoryRepo::with_backend(self.db.clone());
         repo.record(&ListenRecord {
             id: None,
-            track_id: None,
+            // #8714 — écrite, enfin : sans elle, le compte d'une piste se
+            // rapprochait par titre + interprète et toutes les copies du même
+            // titre (autres albums, compilations) montaient ensemble.
+            track_id: ecoute.track_id,
             title: title.into(),
             artist_name: artist.map(Into::into),
             album_title: album.map(Into::into),
@@ -915,6 +922,7 @@ impl PlaybackOrchestrator {
                     pochette: contexte.4.as_deref(),
                 },
                 None,
+                attente.track_id,
             );
         }
 
