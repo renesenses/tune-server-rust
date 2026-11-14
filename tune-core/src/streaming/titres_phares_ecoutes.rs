@@ -151,13 +151,56 @@ pub fn ajouter_mes_plus_ecoutes(
             return;
         }
     };
-    let ajouts: Vec<Value> = morceaux(ecoutes)
-        .into_iter()
-        .filter(|m| !deja_dans_la_liste(m, service, items))
-        .filter_map(|m| piste_jouable(&m, service))
-        .take(MES_PLUS_ECOUTES_MAX)
+    // web#3045 (fil 2822, Supertramp) — deux morceaux peuvent désigner le
+    // MÊME enregistrement : deux lignes d'historique d'un même titre, à des
+    // durées écartées de plus de la tolérance (tranches CUE), se résolvent
+    // sur la même piste. Les deux ajouts portaient la même désignation, et la
+    // liste du client, indexée par elle, se figeait (`each_key_duplicate`).
+    // Une désignation déjà présente, dans la liste ou parmi les ajouts, n'est
+    // jamais ajoutée une seconde fois ; un titre déjà ajouté non plus.
+    let mut vues: Vec<String> = items
+        .iter()
+        .filter_map(|v| designation(v, service))
         .collect();
+    let mut ajouts: Vec<Value> = Vec::new();
+    for m in morceaux(ecoutes) {
+        if ajouts.len() >= MES_PLUS_ECOUTES_MAX {
+            break;
+        }
+        if deja_dans_la_liste(&m, service, items) || deja_dans_la_liste(&m, service, &ajouts) {
+            continue;
+        }
+        let Some(piste) = piste_jouable(&m, service) else {
+            continue;
+        };
+        if let Some(cle) = designation(&piste, service) {
+            if vues.contains(&cle) {
+                continue;
+            }
+            vues.push(cle);
+        }
+        ajouts.push(piste);
+    }
     items.extend(ajouts);
+}
+
+/// La désignation d'un titre, celle qui l'indexe chez le client : sa source
+/// (celle du service à défaut) et son identifiant (`id`, sinon `source_id`).
+/// `None` pour un titre sans identifiant.
+fn designation(v: &Value, service: &str) -> Option<String> {
+    let source = v
+        .get("source")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| service.to_string());
+    let id = |c: &str| match v.get(c) {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    let id = id("id").or_else(|| id("source_id"))?;
+    Some(format!("{source}:{id}"))
 }
 
 /// L'interprète que nomment le plus souvent les titres (à égalité, le

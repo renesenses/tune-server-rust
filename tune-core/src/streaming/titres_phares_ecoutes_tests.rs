@@ -558,3 +558,84 @@ fn seules_les_sources_de_catalogue_designent_un_titre() {
         assert!(!est_une_source_de_catalogue(s), "{s}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// web#3045 (fil 2822, rc11) — page artiste de Supertramp : deux ajouts
+// désignaient le même enregistrement, et la liste du client se figeait.
+// ---------------------------------------------------------------------------
+
+const SUPERTRAMP: &str = "Supertramp";
+
+fn top_qobuz_supertramp() -> Vec<Value> {
+    vec![
+        json!({"source_id": "q-30", "title": "Breakfast in America",
+               "artist_name": SUPERTRAMP, "duration_ms": 158_000}),
+        json!({"source_id": "q-31", "title": "Goodbye Stranger",
+               "artist_name": SUPERTRAMP, "duration_ms": 350_000}),
+    ]
+}
+
+/// La clé de la désignation, comme le client l'indexe.
+fn cle(v: &Value) -> String {
+    let source = v["source"].as_str().unwrap_or("qobuz");
+    let id = if v["id"].is_null() {
+        v["source_id"].to_string()
+    } else {
+        v["id"].to_string()
+    };
+    format!("{source}:{id}")
+}
+
+#[test]
+fn deux_ecoutes_d_un_meme_enregistrement_a_des_durees_ecartees_ne_l_ajoutent_qu_une_fois() {
+    let b = base();
+    b.execute("INSERT INTO artists (name) VALUES (?1)", &[&SUPERTRAMP])
+        .unwrap();
+    b.execute(
+        "INSERT INTO tracks (title, artist_id, duration_ms) \
+         VALUES ('The Logical Song', (SELECT id FROM artists WHERE name = ?1), 248000)",
+        &[&SUPERTRAMP],
+    )
+    .unwrap();
+    // Le même fichier, écouté à deux durées écartées de plus de 3 s (une
+    // tranche CUE, puis le fichier entier) : deux morceaux, une seule piste.
+    for _ in 0..4 {
+        ecouter(&b, "local", None, "The Logical Song", SUPERTRAMP, 248_000);
+    }
+    for _ in 0..3 {
+        ecouter(&b, "local", None, "The Logical Song", SUPERTRAMP, 262_000);
+    }
+    // Le même titre Qobuz, sous deux durées : le même enregistrement.
+    for _ in 0..2 {
+        ecouter(&b, "tidal", Some("t-7"), "Dreamer", SUPERTRAMP, 211_000);
+    }
+    ecouter(&b, "tidal", Some("t-7"), "Dreamer", SUPERTRAMP, 230_000);
+    // Le titre phare du service, réécouté sous une autre durée : déjà là.
+    ecouter(
+        &b,
+        "qobuz",
+        Some("q-31"),
+        "Goodbye Stranger (Live)",
+        SUPERTRAMP,
+        400_000,
+    );
+
+    let mut items = top_qobuz_supertramp();
+    ajouter_mes_plus_ecoutes(&b, "qobuz", &mut items);
+
+    let mut cles: Vec<String> = items.iter().map(cle).collect();
+    let n = cles.len();
+    cles.sort();
+    cles.dedup();
+    assert_eq!(cles.len(), n, "aucune désignation en double : {items:?}");
+    assert_eq!(
+        titres(&items),
+        [
+            "Breakfast in America",
+            "Goodbye Stranger",
+            "The Logical Song",
+            "Dreamer"
+        ],
+        "chaque enregistrement une seule fois, le plus écouté d'abord"
+    );
+}
