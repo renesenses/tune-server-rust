@@ -271,6 +271,31 @@ async fn une_lecture_abandonnee_arrete_le_telechargement_7266() {
     assert!(!complet.unwrap().est_complet());
 }
 
+/// #8701 — un saut lâche l'ancien décodeur avant que le nouveau reprenne la
+/// poignée. Tant qu'une zone joue ce fichier (épinglé), son téléchargement
+/// n'est pas abandonné, même sans lecteur au-delà du délai d'abandon.
+#[tokio::test]
+async fn le_fichier_d_une_zone_qui_joue_n_est_pas_abandonne_8701() {
+    let (base, compteurs) = faux_cdn(None).await;
+    let (chemin, complet, _) = en_croissance(&base).await;
+    let zone = 8_701_201;
+    crate::audio::dash_epingles::noter_la_piste_resolue(zone, Some(&chemin));
+    drop(crate::audio::dash_growth::take_for(&chemin).expect("poignée inscrite"));
+    let complet = complet.unwrap();
+    let limite = Instant::now() + Duration::from_secs(20);
+    while complet.en_cours() && Instant::now() < limite {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    crate::audio::dash_epingles::liberer_la_zone(zone);
+    assert!(
+        complet.est_complet(),
+        "téléchargement abandonné alors que la zone joue encore ce fichier"
+    );
+    assert_eq!(compteurs.demandes.load(Ordering::SeqCst), SEGMENTS as usize);
+    assert!(std::path::Path::new(&chemin).exists());
+    let _ = std::fs::remove_file(&chemin);
+}
+
 /// Hors d'une résolution pour une sortie locale ou OAAT (renderer réseau,
 /// préchargement), rien ne change : le fichier rendu est complet. De même
 /// pour un codec autre que FLAC, même sur une sortie locale.

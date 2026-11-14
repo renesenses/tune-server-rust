@@ -2080,6 +2080,9 @@ impl PlaybackOrchestrator {
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(req.zone_id, "stopped")
             .ok();
+        // #8701 — la résolution vient d'épingler le fMP4 : la zone arrêtée
+        // ne le retient plus.
+        crate::audio::dash_epingles::liberer_la_zone(req.zone_id);
     }
 
     /// Donne au crête-mètre de la zone le gain que la sortie applique
@@ -3884,6 +3887,12 @@ impl PlaybackOrchestrator {
         self.annuler_preparation_fichier(zone_id).await;
         self.cleanup_gapless_session(zone_id).await;
         self.prefetch.clear().await;
+        // #8701 — zone arrêtée : `stop` (geste, fin de file, file vidée,
+        // suppression), une pause qui ne trouve rien à mettre en pause, une
+        // zone cédée à un tiers. Ses fMP4 DASH redeviennent nettoyables. Une
+        // pause ordinaire ne passe pas ici et garde le fichier pour la
+        // reprise.
+        crate::audio::dash_epingles::liberer_la_zone(zone_id);
         // Forget the last network-play record so a stop→replay of the SAME track
         // is not mistaken for the duplicate-send it guards against (play_inner).
         self.last_net_play.lock().await.remove(&zone_id);

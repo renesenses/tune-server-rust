@@ -10478,6 +10478,11 @@ mod vider_la_file_arrete_le_peripherique_3669 {
             0,
             "rien ne doit être arrêté avant le geste"
         );
+        // #8701 — le fMP4 DASH de la piste en cours de la zone.
+        // Un nom seulement : le registre ne lit que le chemin.
+        let fichier = "/nulle-part/tune-dash-8701-file-videe.mp4";
+        tune_core::audio::dash_epingles::noter_la_piste_resolue(zone_id, Some(fichier));
+        assert!(tune_core::audio::dash_epingles::est_epingle(fichier));
 
         let _ = super::queue_clear(
             State(state.clone()),
@@ -10505,6 +10510,10 @@ mod vider_la_file_arrete_le_peripherique_3669 {
                 .unwrap_or(-1),
             0,
             "et la file reste vidée — l'arrêt s'AJOUTE au geste, il ne le remplace pas"
+        );
+        assert!(
+            !tune_core::audio::dash_epingles::est_epingle(fichier),
+            "#8701 : file vidée, le fMP4 de la zone reste épinglé 4 h"
         );
     }
 

@@ -134,6 +134,24 @@ struct CachedUrl {
     suivi: Option<Arc<crate::audio::dash_growth::SuiviDuTelechargement>>,
 }
 
+impl CachedUrl {
+    fn stream_url(&self) -> StreamUrl {
+        StreamUrl {
+            url: self.url.clone(),
+            mime_type: self.mime_type.clone(),
+            quality: StreamQuality {
+                codec: self.codec.clone(),
+                sample_rate: self.sample_rate,
+                bit_depth: self.bit_depth,
+                bitrate: self.bitrate,
+                channels: 2,
+            },
+            expires_at: None,
+            headers: Vec::new(),
+        }
+    }
+}
+
 struct UrlCache {
     entries: HashMap<String, CachedUrl>,
     ttl: Duration,
@@ -147,16 +165,24 @@ impl UrlCache {
         }
     }
 
+    /// #8701 — une entrée vaut tant que son TTL court, OU tant qu'une zone
+    /// joue (ou prépare) le fMP4 DASH qu'elle désigne : le TTL de 240 s est
+    /// pensé pour une URL signée, pas pour un fichier local qu'un saut dans
+    /// la piste doit retrouver après 4 min d'écoute.
+    fn vivante(entry: &CachedUrl, ttl: Duration) -> bool {
+        entry.created.elapsed() < ttl || crate::audio::dash_epingles::est_epingle(&entry.url)
+    }
+
     fn get(&self, key: &str) -> Option<&CachedUrl> {
         self.entries
             .get(key)
-            .filter(|&entry| entry.created.elapsed() < self.ttl)
+            .filter(|&entry| Self::vivante(entry, self.ttl))
     }
 
     fn set(&mut self, key: String, entry: CachedUrl) {
         if self.entries.len() > 1000 {
             let ttl = self.ttl;
-            self.entries.retain(|_, e| e.created.elapsed() < ttl);
+            self.entries.retain(|_, e| Self::vivante(e, ttl));
         }
         self.entries.insert(key, entry);
     }
@@ -479,6 +505,7 @@ impl TidalService {
                     let growth = crate::audio::dash_growth::DashGrowth::new(total_bytes);
                     crate::audio::dash_growth::register(&tmp_path, growth.clone());
                     let suivi = crate::audio::dash_growth::SuiviDuTelechargement::new();
+                    suivi.lier_la_croissance(&growth);
                     info!(
                         track_id,
                         path = tmp_path.as_str(),
@@ -2374,19 +2401,25 @@ impl StreamingService for TidalService {
                     // ordinaire la tronquerait au dernier segment reçu.
                     || cached.suivi.as_ref().is_some_and(|s| !s.est_complet());
                 if !stale_dash {
-                    return Ok(StreamUrl {
-                        url: cached.url.clone(),
-                        mime_type: cached.mime_type.clone(),
-                        quality: StreamQuality {
-                            codec: cached.codec.clone(),
-                            sample_rate: cached.sample_rate,
-                            bit_depth: cached.bit_depth,
-                            bitrate: cached.bitrate,
-                            channels: 2,
-                        },
-                        expires_at: None,
-                        headers: Vec::new(),
-                    });
+                    return Ok(cached.stream_url());
+                }
+                // #8701 — un lecteur qui sait suivre un fichier en croissance
+                // (sortie locale ou OAAT, y compris pour un saut) se raccroche
+                // au téléchargement en cours : la poignée est réinscrite pour
+                // son décodeur, qui lit tout de suite ce qui est déjà écrit et
+                // n'attend à la frontière que le segment qu'il lui faut — ni
+                // la fin du téléchargement, ni un second téléchargement.
+                if crate::audio::dash_growth::decodage_en_croissance()
+                    && let Some(chemin) = cached.url.strip_prefix("file://")
+                    && let Some(growth) = cached.suivi.as_ref().and_then(|s| s.croissance_vivante())
+                {
+                    crate::audio::dash_growth::register(chemin, growth);
+                    info!(
+                        track_id,
+                        path = chemin,
+                        "tidal_dash_croissance_partagee_8701"
+                    );
+                    return Ok(cached.stream_url());
                 }
                 match en_croissance {
                     Some(suivi)
@@ -3756,8 +3789,14 @@ impl GardeCroissance {
 
     /// Plus personne ne lit ni n'attend : la garde tient la seule référence
     /// restante et le suivi n'a pas d'attendant.
+    ///
+    /// #8701 — et aucune zone ne joue ce fichier : entre l'ancien décodeur
+    /// lâché par un saut et le nouveau qui reprend la poignée, la piste reste
+    /// épinglée, son téléchargement n'est pas abandonné.
     fn personne_ne_lit(&self) -> bool {
-        self.growth().abandonnee() && !self.suivi.attendu()
+        self.growth().abandonnee()
+            && !self.suivi.attendu()
+            && !crate::audio::dash_epingles::est_epingle(&self.path)
     }
 
     fn finir(mut self) {
@@ -5797,6 +5836,14 @@ impl TidalService {
             token_expires: None,
         });
         svc
+    }
+
+    /// #8701 — le même faux TIDAL avec un autre TTL du cache d'URL : `0`
+    /// simule une piste qui joue depuis plus longtemps que le TTL (240 s).
+    #[cfg(test)]
+    pub(crate) fn avec_ttl_du_cache_d_url(mut self, secondes: u64) -> Self {
+        self.url_cache = Arc::new(Mutex::new(UrlCache::new(secondes)));
+        self
     }
 }
 

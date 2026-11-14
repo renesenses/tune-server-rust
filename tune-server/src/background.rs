@@ -1483,7 +1483,11 @@ fn spawn_dash_temp_gc() {
                     .and_then(|m| now.duration_since(m).ok())
                     .map(|age| age.as_secs() > 600) // 10 min ≫ 240s cache TTL
                     .unwrap_or(false);
-                if too_old && std::fs::remove_file(entry.path()).is_ok() {
+                // #8701 — le fichier d'une piste qu'une zone joue ou prépare
+                // reste : un saut dans la piste le relit.
+                let epingle =
+                    tune_core::audio::dash_epingles::est_epingle(&entry.path().to_string_lossy());
+                if too_old && !epingle && std::fs::remove_file(entry.path()).is_ok() {
                     removed += 1;
                 }
             }

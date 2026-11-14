@@ -484,13 +484,17 @@ mod youtube_dlna_demarrage_8228_tests;
 /// leur session WAV est servie en continu, sans longueur annoncée, et le
 /// décodeur suit la frontière d'écriture. Non pour un renderer réseau (DLNA,
 /// Chromecast, AirPlay : il leur faut le fichier complet et sa longueur), ni
-/// pour un départ à une position (le décodeur en croissance ne sait pas aller
-/// au-delà du téléchargé), ni si `TUNE_DASH_STREAM_DECODE=0`.
+/// si `TUNE_DASH_STREAM_DECODE=0`.
+///
+/// #8701 — un départ à une position (un saut) aussi : le démuxeur fMP4 lit
+/// les fragments dans l'ordre jusqu'à celui de la position, et la source en
+/// croissance ne bloque qu'au-delà de ce qui est écrit. Un saut dans la
+/// partie téléchargée joue tout de suite ; au-delà, il n'attend que le
+/// segment visé, plus la fin de tout le téléchargement.
 pub(super) fn decoder_pendant_le_telechargement(req: &PlayRequest) -> bool {
     req.output_device_id.as_deref().is_some_and(|id| {
         id.starts_with("local:") || id.starts_with("oaat:") || id.starts_with("oaat-group:")
-    }) && !req.seek_ms.is_some_and(|ms| ms > 0)
-        && !crate::audio::dash_growth::decodage_local_desarme()
+    }) && !crate::audio::dash_growth::decodage_local_desarme()
 }
 
 impl PlaybackOrchestrator {
