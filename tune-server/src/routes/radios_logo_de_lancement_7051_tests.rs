@@ -60,8 +60,10 @@ fn jouer_un_flux_retient_le_logo_de_lancement() {
 #[test]
 fn la_lecture_generique_d_une_radio_retient_le_logo_de_lancement() {
     let source = include_str!("playback.rs");
+    // #6465 : `play` enveloppe désormais `play_sans_conteneur_de_file`, qui
+    // porte le corps de la lecture générique (et donc la retenue du logo).
     let debut = source
-        .find("async fn play(")
+        .find("async fn play_sans_conteneur_de_file(")
         .expect("le play générique existe");
     let corps = &source[debut..];
     let fin = corps.find("\n}\n").expect("fin du play générique");
