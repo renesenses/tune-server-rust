@@ -325,6 +325,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8416 -- --nocapture --test-threads=1
 
+      # #8676 — « Remplacer le chemin » : réécrire le préfixe des chemins
+      # stockés en une transaction, identifiants conservés, réversible. Sans
+      # cette étape, le témoin prendrait son saut annoncé.
+      - name: Remplacer le chemin de la bibliothèque sur PostgreSQL (#8676)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8676 -- --nocapture --test-threads=1
+
       # #8280 — raisons des recommandations de l'accueil : les sources disent
       # vrai sur un vrai PostgreSQL, et la rangée tient sa mesure. Le témoin
       # vide `listen_history`, `tracks`, `albums`, `artists` : il tourne seul,
