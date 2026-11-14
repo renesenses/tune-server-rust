@@ -162,6 +162,43 @@ pub fn zone_suiveuse(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
     })
 }
 
+/// Ce qui vient de finir n'appelle PAS de musique derrière : épisode de
+/// podcast, radio, entrée audio, livre audio (album de la bibliothèque typé
+/// `audiobook` ou `audio drama` par MusicBrainz). Rend le motif journalisé,
+/// `None` quand la radio de fin de file peut prendre le relais.
+pub fn contenu_sans_radio(
+    db: &Arc<dyn DbBackend>,
+    np: Option<&crate::playback::NowPlaying>,
+) -> Option<&'static str> {
+    let np = np?;
+    let source = np.source.as_str();
+    if source == "podcast" {
+        return Some("podcast");
+    }
+    if source == "radio" {
+        return Some("radio");
+    }
+    if source.starts_with("entree") {
+        return Some("entree_audio");
+    }
+    let track_id = np
+        .track_id
+        .filter(|_| matches!(source, "local" | "library" | ""))?;
+    let types = db
+        .query_one(
+            "SELECT al.release_secondary_types FROM tracks t \
+             JOIN albums al ON al.id = t.album_id WHERE t.id = ?",
+            &[&track_id],
+        )
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_string()))?;
+    types
+        .split(crate::metadata::release_type::SEPARATEUR_SECONDAIRES)
+        .any(|t| matches!(t.trim(), "audiobook" | "audio drama"))
+        .then_some("livre_audio")
+}
+
 static FINS_SUR_ERREUR: LazyLock<Mutex<HashSet<i64>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 

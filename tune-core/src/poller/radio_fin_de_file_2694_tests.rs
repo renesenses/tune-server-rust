@@ -375,6 +375,38 @@ async fn les_lignes_de_radio_deja_jouees_sont_purgees_au_dela_du_seuil() {
     );
 }
 
+/// Relecture de #8656 — après un épisode de podcast, une radio ou une
+/// entrée audio, jamais de musique enchaînée.
+#[tokio::test]
+async fn ni_podcast_ni_radio_ni_entree_audio_n_appellent_la_radio() {
+    for source in ["podcast", "radio", "entree-audio"] {
+        let b = banc(crate::streaming::ServiceRegistry::new()).await;
+        let mut etat = fin_de_la_piste_3(b.zone_id);
+        if let Some(np) = etat.now_playing.as_mut() {
+            np.source = source.into();
+            np.track_id = None;
+            np.source_id = Some(format!("https://exemple.invalid/{source}"));
+        }
+        b.poller.handle_track_end(b.zone_id, &etat).await;
+        rien_n_est_ajoute(&b).await;
+    }
+}
+
+/// …ni après la dernière piste d'un livre audio de la bibliothèque.
+#[tokio::test]
+async fn un_livre_audio_n_appelle_pas_la_radio() {
+    let b = banc(crate::streaming::ServiceRegistry::new()).await;
+    b.db.execute(
+        "UPDATE albums SET release_secondary_types = 'audiobook' WHERE id = 1",
+        &[],
+    )
+    .unwrap();
+    b.poller
+        .handle_track_end(b.zone_id, &fin_de_la_piste_3(b.zone_id))
+        .await;
+    rien_n_est_ajoute(&b).await;
+}
+
 #[tokio::test]
 async fn controle_parental_aucun_titre_ajoute() {
     use crate::db::politique_parentale::{ArtisteBloque, PolitiqueParentale, poser};

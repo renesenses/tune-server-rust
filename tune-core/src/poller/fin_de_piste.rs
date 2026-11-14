@@ -54,8 +54,13 @@ impl PositionPoller {
         }
 
         let Some(next_pos) = Self::next_position(zone_state) else {
-            self.terminer_la_file_apres(zone_id, zone_state, device_id.as_deref(), fin_sur_erreur)
-                .await;
+            Box::pin(self.terminer_la_file_apres(
+                zone_id,
+                zone_state,
+                device_id.as_deref(),
+                fin_sur_erreur,
+            ))
+            .await;
             return;
         };
 
@@ -146,6 +151,18 @@ impl PositionPoller {
             self.orchestrator.stop(zone_id, device_id).await;
             return;
         }
+        // Relecture de #8656 — un épisode de podcast, une radio, une entrée
+        // audio ou un livre audio qui s'achève n'enchaîne JAMAIS sur de la
+        // musique, quel que soit le réglage de la zone.
+        if let Some(motif) = crate::playback::radio_fin_de_file::contenu_sans_radio(
+            &self.db,
+            zone_state.now_playing.as_ref(),
+        ) {
+            let _ = crate::playback::radio_fin_de_file::prendre_fin_voulue(zone_id);
+            info!(zone_id, motif, "radio_fin_de_file_ecartee");
+            self.orchestrator.stop(zone_id, device_id).await;
+            return;
+        }
         // #5395 — une radio artiste en cours passe AVANT le réglage d'auto-
         // lecture : elle est sans fin par décision, et c'est l'auditeur qui l'a
         // lancée. Sans contexte de radio, ou si la file ne s'achève pas sur un
@@ -231,16 +248,17 @@ impl PositionPoller {
                     file.iter().filter_map(|r| r.track_id).collect();
                 let deja_de_service: std::collections::HashSet<String> =
                     file.iter().filter_map(|r| r.source_id.clone()).collect();
-                let ajoutees = self
-                    .prolonger_la_file(
-                        zone_id,
-                        &etat,
-                        device_id,
-                        mode,
-                        &deja_dans_la_file,
-                        &deja_de_service,
-                    )
-                    .await;
+                // En tas : le futur du prolongement est gros, et la fin de
+                // piste tourne aussi sur de petites piles (épreuves).
+                let ajoutees = Box::pin(self.prolonger_la_file(
+                    zone_id,
+                    &etat,
+                    device_id,
+                    mode,
+                    &deja_dans_la_file,
+                    &deja_de_service,
+                ))
+                .await;
                 if ajoutees == 0 {
                     info!(
                         zone_id,
