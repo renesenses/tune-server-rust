@@ -3453,17 +3453,16 @@ async fn radio_picks(State(state): State<AppState>) -> Result<Json<Value>, AppEr
 fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
     let repo = RadioRepo::with_backend(state.backend.clone());
 
-    let mut items: Vec<Value> = repo
-        .favorites()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| {
-            let mut v = json!(r);
-            // web#916 — pourquoi elle est là : c'est une favorite.
-            v["raison"] = super::accueil_justifie::raison_radio(true, None);
-            v
-        })
-        .collect();
+    let mut items: Vec<Value> =
+        super::radios::une_station_par_flux(repo.favorites().unwrap_or_default())
+            .into_iter()
+            .map(|r| {
+                let mut v = json!(r);
+                // web#916 — pourquoi elle est là : c'est une favorite.
+                v["raison"] = super::accueil_justifie::raison_radio(true, None);
+                v
+            })
+            .collect();
 
     // `is_favorite = '0'` et non `= 0` (#3181). La colonne n'a pas le meme type
     // selon l'origine de la base : `SMALLINT` sur une installation PostgreSQL
