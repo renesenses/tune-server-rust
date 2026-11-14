@@ -154,6 +154,11 @@ pub(crate) async fn servir_avec(
         Err(e) => return erreur(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     if track.file_path.as_deref().is_none_or(str::is_empty) {
+        // Recette du 14/11 — une piste d'un serveur multimédia (UPnP) n'a
+        // pas de fichier ici : un refus que l'écran sait dire.
+        if track.source == "upnp" {
+            return Refus::SourceReseau.reponse();
+        }
         return match PisteDeService::de(&track) {
             Some(piste) => {
                 servir_service(

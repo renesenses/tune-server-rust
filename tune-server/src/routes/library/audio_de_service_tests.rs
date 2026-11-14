@@ -85,6 +85,15 @@ async fn servir_faux(app: axum::Router, journal: &Journal) -> String {
 /// Un faux Qobuz : `getFileUrl` rend l'adresse d'un WAV servi par le même
 /// serveur ; `attente` retarde l'audio (délai dépassé).
 async fn faux_qobuz(audio: Vec<u8>, attente: Option<std::time::Duration>) -> (String, Journal) {
+    faux_qobuz_vers(audio, attente, None).await
+}
+
+/// `adresse` : l'URL que rend `getFileUrl` à la place de celle du serveur.
+async fn faux_qobuz_vers(
+    audio: Vec<u8>,
+    attente: Option<std::time::Duration>,
+    adresse: Option<String>,
+) -> (String, Journal) {
     let journal: Journal = Arc::default();
     let base_audio = Arc::new(Mutex::new(String::new()));
     let pour_url = base_audio.clone();
@@ -94,10 +103,13 @@ async fn faux_qobuz(audio: Vec<u8>, attente: Option<std::time::Duration>) -> (St
             "/track/getFileUrl",
             axum::routing::get(move || {
                 let base = pour_url.lock().unwrap().clone();
+                let url = adresse
+                    .clone()
+                    .unwrap_or_else(|| format!("{base}/audio/piste.flac"));
                 async move {
                     axum::Json(json!({
                         "track_id": 1, "duration": 3,
-                        "url": format!("{base}/audio/piste.flac"),
+                        "url": url,
                         "mime_type": "audio/flac", "sampling_rate": 44.1, "bit_depth": 16
                     }))
                 }
@@ -138,6 +150,14 @@ fn qobuz_connecte(base: &str) -> tune_core::streaming::qobuz::QobuzService {
 /// plusieurs segments dont la réunion est un WAV — le chemin du fMP4 que
 /// TIDAL assemble lui-même.
 async fn faux_tidal(audio: Vec<u8>) -> (String, Journal) {
+    faux_tidal_lent(audio, None).await
+}
+
+/// `attente` : le délai de chaque segment (un téléchargement qui dure).
+async fn faux_tidal_lent(
+    audio: Vec<u8>,
+    attente: Option<std::time::Duration>,
+) -> (String, Journal) {
     let journal: Journal = Arc::default();
     let morceaux: Vec<Vec<u8>> = {
         let (init, reste) = audio.split_at(44);
@@ -181,6 +201,9 @@ async fn faux_tidal(audio: Vec<u8>) -> (String, Journal) {
             axum::routing::get(move |axum::extract::Path(n): axum::extract::Path<String>| {
                 let morceaux = morceaux.clone();
                 async move {
+                    if let Some(a) = attente {
+                        tokio::time::sleep(a).await;
+                    }
                     let i: usize = n.trim_end_matches(".mp4").parse().unwrap();
                     morceaux[i].clone().into_response()
                 }
@@ -277,10 +300,6 @@ fn limites() -> Limites {
     }
 }
 
-fn fichiers_dash() -> HashSet<PathBuf> {
-    fichiers_dash_presents()
-}
-
 #[tokio::test]
 async fn qobuz_forme_onde_calculee_audio_efface_puis_cache() {
     let (base, journal) = faux_qobuz(wav(3.0), None).await;
@@ -328,7 +347,6 @@ async fn qobuz_forme_onde_calculee_audio_efface_puis_cache() {
 async fn tidal_dash_forme_onde_calculee_fichier_du_service_efface() {
     let (base, journal) = faux_tidal(wav(3.0)).await;
     let banc = Banc::new(Box::new(tidal_connecte(&base)), 9102, "tidal").await;
-    let avant = fichiers_dash();
 
     let (statut, cache, v) = banc.onde(9102, None, limites()).await;
     assert_eq!(statut, StatusCode::OK, "{v}");
@@ -344,17 +362,6 @@ async fn tidal_dash_forme_onde_calculee_fichier_du_service_efface() {
         "audio gardé : {:?}",
         banc.audio_restant()
     );
-    // Le fMP4 que TIDAL a assemblé (la taille exacte de notre piste) ne
-    // reste pas ; d'autres témoins en parallèle peuvent en poser d'autres.
-    let taille = wav(3.0).len() as u64;
-    for f in fichiers_dash().difference(&avant) {
-        assert_ne!(
-            std::fs::metadata(f).map(|m| m.len()).unwrap_or(0),
-            taille,
-            "le fMP4 assemblé par TIDAL est resté : {}",
-            f.display()
-        );
-    }
 
     let (_, cache, _) = banc.onde(9102, None, limites()).await;
     assert_eq!(cache.as_deref(), Some("hit"));
@@ -431,10 +438,9 @@ async fn qobuz_plafond_de_taille() {
 }
 
 #[tokio::test]
-async fn tidal_plafond_de_taille_efface_le_fmp4() {
-    let (base, _) = faux_tidal(wav(2.5)).await;
+async fn tidal_plafond_verifie_pendant_l_assemblage() {
+    let (base, journal) = faux_tidal(wav(2.5)).await;
     let banc = Banc::new(Box::new(tidal_connecte(&base)), 9106, "tidal").await;
-    let avant = fichiers_dash();
     let petit = Limites {
         plafond_octets: 100_000,
         ..limites()
@@ -443,17 +449,139 @@ async fn tidal_plafond_de_taille_efface_le_fmp4() {
     assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(v["raison"], "trop_volumineux", "{v}");
     assert!(banc.audio_restant().is_empty());
-    // Les fMP4 nouveaux viennent d'autres témoins en parallèle, jamais de
-    // celui-ci : aucun ne fait la taille de notre piste.
-    let taille = wav(2.5).len() as u64;
-    for f in fichiers_dash().difference(&avant) {
-        assert_ne!(
-            std::fs::metadata(f).map(|m| m.len()).unwrap_or(0),
-            taille,
-            "fMP4 trop gros gardé : {}",
-            f.display()
+    // Arrêté au premier segment qui dépasse : les suivants ne partent pas.
+    assert!(
+        appels(&journal, "/seg/") < 5,
+        "{:?}",
+        journal.lock().unwrap()
+    );
+}
+
+/// Relecture de #8739 : une lecture TIDAL (qui prend le service en
+/// ÉCRITURE) lancée pendant le téléchargement d'une analyse n'attend pas.
+#[tokio::test]
+async fn une_lecture_n_attend_pas_une_analyse_tidal() {
+    let (base, journal) =
+        faux_tidal_lent(wav(3.0), Some(std::time::Duration::from_millis(400))).await;
+    let banc = Arc::new(Banc::new(Box::new(tidal_connecte(&base)), 9112, "tidal").await);
+    let b = banc.clone();
+    let analyse = tokio::spawn(async move { b.onde(9112, None, limites()).await });
+    let mut attente = 0;
+    while appels(&journal, "/seg/") == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        attente += 1;
+        assert!(attente < 500, "le téléchargement n'a pas commencé");
+    }
+    let svc = banc.state.services.lock().await.get("tidal").unwrap();
+    let ecriture = tokio::time::timeout(std::time::Duration::from_millis(200), svc.write()).await;
+    assert!(ecriture.is_ok(), "la lecture attend l'analyse");
+    drop(ecriture);
+    assert!(!analyse.is_finished(), "l'analyse était bien en cours");
+    let (statut, _, v) = analyse.await.unwrap();
+    assert_eq!(statut, StatusCode::OK, "{v}");
+    assert!(banc.audio_restant().is_empty());
+}
+
+/// Un serveur qui annonce `annonce` octets et n'en envoie que le début de
+/// `audio` avant de couper : une réponse tronquée.
+async fn serveur_tronque(audio: Vec<u8>, annonce: usize) -> (String, Arc<Mutex<usize>>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", ecoute.local_addr().unwrap());
+    let servis = Arc::new(Mutex::new(0usize));
+    let compte = servis.clone();
+    tokio::spawn(async move {
+        while let Ok((mut c, _)) = ecoute.accept().await {
+            *compte.lock().unwrap() += 1;
+            let mut tampon = [0u8; 4096];
+            let _ = c.read(&mut tampon).await;
+            let entete = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {annonce}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = c.write_all(entete.as_bytes()).await;
+            let _ = c.write_all(&audio).await;
+            let _ = c.shutdown().await;
+        }
+    });
+    (base, servis)
+}
+
+/// Relecture de #8739 — une réponse coupée avant sa longueur annoncée (un
+/// début de piste) n'est ni analysée ni mise en cache : le second appel
+/// retélécharge, et rien ne reste sur le disque.
+#[tokio::test]
+async fn reponse_tronquee_jamais_en_cache() {
+    let entier = wav(3.0);
+    let debut = entier[..entier.len() / 3].to_vec();
+    let (audio, servis) = serveur_tronque(debut, entier.len()).await;
+    let (base, _) = faux_qobuz_vers(wav(3.0), None, Some(format!("{audio}/piste.wav"))).await;
+    let banc = Banc::new(Box::new(qobuz_connecte(&base)), 9113, "qobuz").await;
+    for _ in 0..2 {
+        let (statut, cache, v) = banc.onde(9113, None, limites()).await;
+        assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+        assert_eq!(v["raison"], "telechargement_impossible", "{v}");
+        assert_eq!(cache, None);
+        assert!(
+            banc.audio_restant().is_empty(),
+            "{:?}",
+            banc.audio_restant()
         );
     }
+    assert_eq!(*servis.lock().unwrap(), 2, "rien n'a été mis en cache");
+    let r = spectrogramme::servir(
+        &banc.state,
+        9113,
+        Default::default(),
+        &banc.cache(),
+        256 << 20,
+    )
+    .await;
+    let (statut, _, v) = lire(r).await;
+    assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["raison"], "telechargement_impossible", "{v}");
+    assert!(
+        std::fs::read_dir(banc.cache())
+            .map(|d| d.flatten().all(|e| e.path().is_dir()))
+            .unwrap_or(true),
+        "un résultat partiel est en cache"
+    );
+}
+
+/// Le fichier d'un service (le fMP4 d'une lecture, peut-être en croissance)
+/// n'est jamais pris : seule une adresse réseau se télécharge. Le fichier
+/// reste intact.
+#[tokio::test]
+async fn jamais_le_fichier_d_un_service() {
+    let d = tempfile::tempdir().unwrap();
+    let fichier = d.path().join("tune-dash-lecture.mp4");
+    std::fs::write(&fichier, wav(3.0)).unwrap();
+    let (base, _) = faux_qobuz_vers(
+        wav(3.0),
+        None,
+        Some(format!("file://{}", fichier.display())),
+    )
+    .await;
+    let banc = Banc::new(Box::new(qobuz_connecte(&base)), 9114, "qobuz").await;
+    let (statut, _, v) = banc.onde(9114, None, limites()).await;
+    assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["raison"], "telechargement_impossible", "{v}");
+    assert_eq!(
+        std::fs::read(&fichier).unwrap(),
+        wav(3.0),
+        "le fichier de la lecture est intact"
+    );
+}
+
+#[tokio::test]
+async fn spectrogramme_de_service_a_la_taille_de_l_ecran_seulement() {
+    let (base, journal) = faux_qobuz(wav(3.0), None).await;
+    let banc = Banc::new(Box::new(qobuz_connecte(&base)), 9115, "qobuz").await;
+    let taille = serde_json::from_value(json!({"largeur": 800, "hauteur": 300})).unwrap();
+    let r = spectrogramme::servir(&banc.state, 9115, taille, &banc.cache(), 256 << 20).await;
+    let (statut, _, v) = lire(r).await;
+    assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["raison"], "zoom_non_disponible", "{v}");
+    assert_eq!(appels(&journal, "getFileUrl"), 0);
 }
 
 #[tokio::test]
@@ -614,4 +742,33 @@ fn l_audio_temporaire_s_efface() {
         chemin: chemin.clone(),
     });
     assert!(!chemin.exists());
+}
+
+/// Recette du 14/11 (.18, piste 190466) : une piste UPnP rend tout de
+/// suite 422 `source_reseau`, avec le texte d'avant pour un vieil écran, et
+/// la fiche ne promet aucun calcul.
+#[tokio::test]
+async fn piste_upnp_refus_clair() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let d = tempfile::tempdir().unwrap();
+    state
+        .backend
+        .execute(
+            "INSERT INTO tracks (id, title, duration_ms, source, source_id) VALUES (9121, 'I vostri sguardi', 3000, 'upnp', 'uuid:x|2')",
+            &[],
+        )
+        .unwrap();
+    let cache = d.path().join("cache");
+    let r = forme_onde::servir(&state, 9121, Default::default(), &cache, 1 << 20).await;
+    let (statut, _, v) = lire(r).await;
+    assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(v["raison"], "source_reseau", "{v}");
+    assert_eq!(v["error"], "track has no local file");
+    let r = spectrogramme::servir(&state, 9121, Default::default(), &cache, 1 << 20).await;
+    assert_eq!(lire(r).await.2["raison"], "source_reseau");
+    let piste = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
+        .get(9121)
+        .unwrap()
+        .unwrap();
+    assert!(forme_onde::section(&piste, &cache).is_none());
 }

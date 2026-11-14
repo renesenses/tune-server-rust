@@ -214,6 +214,11 @@ async fn obtenir(
         }
     };
     let Some(chemin) = track.file_path.as_deref().filter(|c| !c.is_empty()) else {
+        // Recette du 14/11 — une piste d'un serveur multimédia (UPnP) n'a
+        // pas de fichier ici : un refus que l'écran sait dire.
+        if track.source == "upnp" {
+            return Err(Refus::SourceReseau.reponse());
+        }
         let Some(piste) = PisteDeService::de(&track) else {
             return Err(Refus::NonPrisEnCharge.reponse());
         };
@@ -399,6 +404,11 @@ async fn obtenir_service(
     plafond: u64,
     forcer: bool,
 ) -> Result<(Vec<u8>, &'static str), Response> {
+    // Une image par piste de service, à la taille de l'écran : une autre
+    // taille retéléchargerait la piste et ferait pousser le cache.
+    if (largeur, hauteur) != (LARGEUR_DEFAUT, HAUTEUR_DEFAUT) {
+        return Err(Refus::ZoomNonDisponible.reponse());
+    }
     let cible = dossier.join(nom_en_cache_service(id, piste, largeur, hauteur));
     if !forcer && let Some(octets) = lire_le_cache(&cible) {
         return Ok((octets, "hit"));

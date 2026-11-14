@@ -5798,6 +5798,11 @@ mod pays_du_catalogue_8481_tests;
 // #6334 — lecture par `trackManifests` v2, repli v1.
 #[path = "tidal_manifeste_v2.rs"]
 mod manifeste_v2;
+
+// Go du 13/11 (#8739) — les adresses de l'audio pour une analyse, sans
+// téléchargement sous le garde du service.
+#[path = "tidal_analyse_service.rs"]
+pub mod analyse_service;
 #[cfg(test)]
 #[path = "tidal_manifeste_v2_6334_tests.rs"]
 mod manifeste_v2_6334_tests;

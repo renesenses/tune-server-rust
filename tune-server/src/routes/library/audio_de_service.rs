@@ -4,15 +4,21 @@
 //! Une piste de service n'a pas de fichier sur le disque. À la demande, et
 //! seulement quand le résultat n'est pas déjà en cache :
 //!
-//! 1. le flux est résolu comme pour la lecture, par le service lui-même
-//!    (`StreamingService::get_track_url`, à la qualité « Hi-Res » du
-//!    service) : une URL Qobuz d'un seul fichier, ou, pour TIDAL, l'URL d'un
-//!    seul fichier ou le fMP4 que le service assemble lui-même depuis les
-//!    segments DASH (rien n'est recopié de ce code-là) ;
-//! 2. l'audio est téléchargé dans un fichier temporaire, sous le dossier du
-//!    cache (`<cache>/telechargements/`), avec un plafond de taille
-//!    ([`PLAFOND_DEFAUT_OCTETS`], ou `TUNE_ANALYSE_SERVICE_MO`) et un délai
-//!    ([`DELAI_DEFAUT`], ou `TUNE_ANALYSE_SERVICE_DELAI_S`) ;
+//! 1. les ADRESSES de l'audio sont résolues par le service, à sa qualité
+//!    « Hi-Res », sous son garde de lecture : Qobuz par `get_track_url` (une
+//!    URL d'un seul fichier), TIDAL par `TidalService::flux_pour_analyse`
+//!    (une URL, ou l'initialisation et les segments d'un DASH — sans rien
+//!    télécharger, et sans toucher au cache d'adresses de la lecture) ;
+//! 2. le garde est RENDU, puis l'audio est téléchargé hors de lui (relecture
+//!    de #8739 : une lecture, qui prend le service en écriture, n'attend
+//!    jamais une analyse) dans un fichier temporaire sous le dossier du cache
+//!    (`<cache>/telechargements/`), segments bout à bout, avec un plafond de
+//!    taille vérifié en route ([`PLAFOND_DEFAUT_OCTETS`], ou
+//!    `TUNE_ANALYSE_SERVICE_MO`) et un délai ([`DELAI_DEFAUT`], ou
+//!    `TUNE_ANALYSE_SERVICE_DELAI_S`). Jamais le fichier d'un service (le
+//!    fMP4 d'une lecture peut être encore en croissance) ; une réponse plus
+//!    courte que sa longueur annoncée est un échec : un fichier incomplet
+//!    n'est ni analysé ni mis en cache ;
 //! 3. la forme d'onde ou l'image se calcule sur ce fichier, comme pour une
 //!    piste locale (mêmes verrous, même sémaphore de deux calculs) ;
 //! 4. le fichier audio est EFFACÉ ([`AudioTemporaire`] l'efface en partant,
@@ -21,13 +27,12 @@
 //!    l'identifiant de la piste chez lui et la qualité demandée.
 //!
 //! Ce n'est pas une écoute : aucun appel de compte rendu de lecture n'est
-//! fait (Qobuz `reportStreamingStart/End`, journal de lecture TIDAL) — ni ici,
-//! ni dans `get_track_url`, qui se contente de résoudre l'adresse.
+//! fait (Qobuz `reportStreamingStart/End`, journal de lecture TIDAL) : la
+//! résolution ne fait que demander les adresses.
 //!
 //! Les refus se disent en 422 avec un code (`raison`) que l'écran traduit :
 //! [`Refus`].
 
-use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -39,7 +44,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use tune_core::db::models::Track;
 use tune_core::streaming::quality::StreamingQualityPreference;
-use tune_core::streaming::traits::{StreamUrl, StreamingService};
+use tune_core::streaming::tidal::analyse_service::FluxPourAnalyse;
 
 use crate::state::AppState;
 
@@ -108,6 +113,9 @@ impl PisteDeService {
 pub(crate) enum Refus {
     /// Ni fichier local, ni service analysable (Spotify, YouTube…).
     NonPrisEnCharge,
+    /// Piste d'un serveur multimédia (UPnP) : pas de fichier sur ce disque
+    /// (recette du 14/11). Le texte reste celui d'avant pour un vieil écran.
+    SourceReseau,
     /// Service désactivé dans les Réglages.
     ServiceInactif,
     /// Service sans session (jamais connecté, session expirée).
@@ -132,6 +140,7 @@ impl Refus {
     pub(crate) fn code(self) -> &'static str {
         match self {
             Self::NonPrisEnCharge => "service_non_pris_en_charge",
+            Self::SourceReseau => "source_reseau",
             Self::ServiceInactif => "service_inactif",
             Self::ServiceNonConnecte => "service_non_connecte",
             Self::NonDiffusable => "non_diffusable",
@@ -147,7 +156,7 @@ impl Refus {
     /// piste sans service analysable : un écran d'avant le reconnaît.
     fn message(self) -> &'static str {
         match self {
-            Self::NonPrisEnCharge => "track has no local file",
+            Self::NonPrisEnCharge | Self::SourceReseau => "track has no local file",
             Self::ServiceInactif => "streaming service disabled",
             Self::ServiceNonConnecte => "streaming service not connected",
             Self::NonDiffusable => "track not streamable",
@@ -155,7 +164,9 @@ impl Refus {
             Self::TropVolumineux => "track too large to download for analysis",
             Self::DelaiDepasse => "download for analysis timed out",
             Self::TelechargementImpossible => "download for analysis failed",
-            Self::ZoomNonDisponible => "range not available for a streaming track",
+            Self::ZoomNonDisponible => {
+                "only the whole track at the default size is available for a streaming track"
+            }
         }
     }
 
@@ -306,15 +317,43 @@ async fn telecharger_sans_delai(
         tracing::warn!(error = %e, "analyse_service_dossier_impossible");
         Refus::TelechargementImpossible
     })?;
+    let flux = resoudre(state, piste).await?;
+    // Le garde du service est RENDU : le téléchargement se fait hors de lui,
+    // une lecture (qui prend le service en écriture) n'attend jamais une
+    // analyse (relecture de #8739).
+    match flux {
+        FluxPourAnalyse::Adresse { url, .. } if !url.starts_with("http") => {
+            // Jamais le fichier d'un service (un fMP4 de lecture, peut-être
+            // encore en croissance) : seule une adresse réseau se télécharge.
+            tracing::info!(service = %piste.service, "analyse_service_adresse_locale_refusee");
+            Err(Refus::TelechargementImpossible)
+        }
+        FluxPourAnalyse::Adresse { url, mime_type } => {
+            telecharger_http(&[url], &mime_type, dossier_tmp, plafond).await
+        }
+        FluxPourAnalyse::Segments {
+            init,
+            segments,
+            mime_type,
+        } => {
+            let mut adresses = Vec::with_capacity(segments.len() + 1);
+            adresses.push(init);
+            adresses.extend(segments);
+            telecharger_http(&adresses, &mime_type, dossier_tmp, plafond).await
+        }
+    }
+}
+
+/// Les adresses de l'audio, résolues sous le garde de LECTURE du service, que
+/// la fonction rend en sortant : TIDAL par `flux_pour_analyse` (adresses
+/// seulement, rien n'est téléchargé), les autres par `get_track_url`.
+async fn resoudre(state: &AppState, piste: &PisteDeService) -> Result<FluxPourAnalyse, Refus> {
     let svc = state
         .services
         .lock()
         .await
         .get(&piste.service)
         .ok_or(Refus::NonPrisEnCharge)?;
-    // Un garde de LECTURE : `get_track_url` est en `&self`. Il est rendu dès
-    // que l'adresse est résolue ; seul un fMP4 TIDAL se télécharge dessous
-    // (le service l'assemble lui-même), comme pour un préchargement.
     let service = svc.read().await;
     if !service.enabled() {
         return Err(Refus::ServiceInactif);
@@ -322,14 +361,26 @@ async fn telecharger_sans_delai(
     if !service.auth_status().await.authenticated {
         return Err(Refus::ServiceNonConnecte);
     }
-    let avant = fichiers_dash_presents();
-    let flux = match service
-        .get_track_url(&piste.id_service, Some(&piste.qualite))
-        .await
-    {
-        Ok(flux) => flux,
-        Err(e) => {
-            let message = e.to_string();
+    let tidal = service
+        .as_any()
+        .downcast_ref::<tune_core::streaming::tidal::TidalService>();
+    let issue = match tidal {
+        Some(t) => {
+            t.flux_pour_analyse(&piste.id_service, Some(&piste.qualite))
+                .await
+        }
+        None => service
+            .get_track_url(&piste.id_service, Some(&piste.qualite))
+            .await
+            .map(|f| FluxPourAnalyse::Adresse {
+                url: f.url,
+                mime_type: f.mime_type,
+            })
+            .map_err(|e| e.to_string()),
+    };
+    match issue {
+        Ok(flux) => Ok(flux),
+        Err(message) => {
             let disponible = service
                 .get_track(&piste.id_service)
                 .await
@@ -343,118 +394,31 @@ async fn telecharger_sans_delai(
                 raison = refus.code(),
                 "analyse_service_resolution_refusee"
             );
-            return Err(refus);
+            Err(refus)
         }
-    };
-    if let Some(local) = flux.url.strip_prefix("file://") {
-        // Toujours sous le garde : la lecture (qui prend le service en
-        // écriture) ne peut pas reprendre ce fichier pendant qu'il change de
-        // main.
-        let source = PathBuf::from(local);
-        let a_nous = !avant.contains(&source);
-        let dossier = dossier_tmp.to_path_buf();
-        let issue =
-            tokio::task::spawn_blocking(move || adopter(&source, a_nous, &dossier, plafond))
-                .await
-                .unwrap_or(Err(Refus::TelechargementImpossible));
-        drop(service);
-        return issue;
     }
-    drop(service);
-    telecharger_http(&flux, dossier_tmp, plafond).await
 }
 
-/// Les fMP4 DASH que TIDAL a déjà posés dans le dossier temporaire du
-/// système (`tune-dash-<uuid>.mp4`) : un fichier présent AVANT la résolution
-/// appartient à une lecture ou à un préchargement, il n'est pas à nous.
-fn fichiers_dash_presents() -> HashSet<PathBuf> {
-    // tmp-autorise: racine seulement LUE, pour reconnaître les fMP4 DASH (noms aléatoires) que TIDAL y pose.
-    let Ok(entrees) = std::fs::read_dir(std::env::temp_dir()) else {
-        return HashSet::new();
-    };
-    entrees
-        .flatten()
-        .filter(|e| {
-            let nom = e.file_name();
-            let nom = nom.to_string_lossy();
-            nom.starts_with("tune-dash-") && nom.ends_with(".mp4")
-        })
-        .map(|e| e.path())
-        .collect()
-}
-
-/// Le fichier que le service a écrit lui-même (fMP4 DASH de TIDAL) : le
-/// nôtre est DÉPLACÉ dans `dossier` (l'entrée du cache d'adresses du service
-/// devient périmée, une lecture le retéléchargera) ; celui d'une lecture en
-/// cours est COPIÉ, jamais touché.
-fn adopter(
-    source: &Path,
-    a_nous: bool,
-    dossier: &Path,
-    plafond: u64,
-) -> Result<AudioTemporaire, Refus> {
-    let echec = |e: std::io::Error| {
-        tracing::warn!(chemin = %source.display(), error = %e, "analyse_service_fichier_du_service");
-        Refus::TelechargementImpossible
-    };
-    let meta = std::fs::metadata(source).map_err(echec)?;
-    if meta.len() > plafond {
-        if a_nous {
-            let _ = std::fs::remove_file(source);
-        }
-        return Err(Refus::TropVolumineux);
-    }
-    let extension = extension_du_fichier(source, None);
-    let cible = AudioTemporaire {
-        chemin: dossier.join(format!("{}.{extension}", uuid::Uuid::new_v4())),
-    };
-    if a_nous {
-        if std::fs::rename(source, &cible.chemin).is_err() {
-            // Autre système de fichiers : copie, puis l'original part.
-            let copie = std::fs::copy(source, &cible.chemin);
-            let _ = std::fs::remove_file(source);
-            copie.map_err(echec)?;
-        }
-    } else {
-        std::fs::copy(source, &cible.chemin).map_err(echec)?;
-    }
-    Ok(cible)
-}
-
+/// Télécharge `adresses` bout à bout dans un seul fichier (une adresse : un
+/// fichier ; plusieurs : l'initialisation puis les segments d'un DASH). Le
+/// plafond se vérifie pendant le téléchargement ; une adresse refusée, une
+/// coupure ou le plafond font tout effacer : jamais de fichier partiel.
 async fn telecharger_http(
-    flux: &StreamUrl,
+    adresses: &[String],
+    mime_type: &str,
     dossier: &Path,
     plafond: u64,
 ) -> Result<AudioTemporaire, Refus> {
     use futures_util::StreamExt as _;
     use tokio::io::AsyncWriteExt as _;
 
+    if adresses.is_empty() {
+        return Err(Refus::TelechargementImpossible);
+    }
     let client = tune_core::http::client::builder()
         .connect_timeout(Duration::from_secs(15))
         .build()
         .map_err(|_| Refus::TelechargementImpossible)?;
-    let mut requete = client.get(&flux.url);
-    for (nom, valeur) in &flux.headers {
-        requete = requete.header(nom.as_str(), valeur.as_str());
-    }
-    let reponse = requete.send().await.map_err(|e| {
-        tracing::info!(error = %e, "analyse_service_telechargement_refuse");
-        Refus::TelechargementImpossible
-    })?;
-    let statut = reponse.status();
-    if !statut.is_success() {
-        tracing::info!(
-            statut = statut.as_u16(),
-            "analyse_service_telechargement_refuse"
-        );
-        return Err(match statut.as_u16() {
-            451 => Refus::Region,
-            _ => Refus::TelechargementImpossible,
-        });
-    }
-    if reponse.content_length().is_some_and(|n| n > plafond) {
-        return Err(Refus::TropVolumineux);
-    }
     // Le fichier partiel est déjà sous garde : une erreur ou une requête
     // abandonnée l'efface.
     let mut audio = AudioTemporaire {
@@ -465,24 +429,56 @@ async fn telecharger_http(
         .map_err(|_| Refus::TelechargementImpossible)?;
     let mut tete: Vec<u8> = Vec::with_capacity(16);
     let mut total: u64 = 0;
-    let mut morceaux = reponse.bytes_stream();
-    while let Some(morceau) = morceaux.next().await {
-        let morceau = morceau.map_err(|e| {
-            tracing::info!(error = %e, "analyse_service_telechargement_coupe");
+    for adresse in adresses {
+        let reponse = client.get(adresse).send().await.map_err(|e| {
+            tracing::info!(error = %e, "analyse_service_telechargement_refuse");
             Refus::TelechargementImpossible
         })?;
-        total += morceau.len() as u64;
-        if total > plafond {
+        let statut = reponse.status();
+        if !statut.is_success() {
+            tracing::info!(
+                statut = statut.as_u16(),
+                "analyse_service_telechargement_refuse"
+            );
+            return Err(match statut.as_u16() {
+                451 => Refus::Region,
+                _ => Refus::TelechargementImpossible,
+            });
+        }
+        let annonce = reponse.content_length();
+        if annonce.is_some_and(|n| total.saturating_add(n) > plafond) {
             return Err(Refus::TropVolumineux);
         }
-        if tete.len() < 16 {
-            let n = (16 - tete.len()).min(morceau.len());
-            tete.extend_from_slice(&morceau[..n]);
+        let avant = total;
+        let mut morceaux = reponse.bytes_stream();
+        while let Some(morceau) = morceaux.next().await {
+            let morceau = morceau.map_err(|e| {
+                tracing::info!(error = %e, "analyse_service_telechargement_coupe");
+                Refus::TelechargementImpossible
+            })?;
+            total += morceau.len() as u64;
+            if total > plafond {
+                return Err(Refus::TropVolumineux);
+            }
+            if tete.len() < 16 {
+                let n = (16 - tete.len()).min(morceau.len());
+                tete.extend_from_slice(&morceau[..n]);
+            }
+            fichier
+                .write_all(&morceau)
+                .await
+                .map_err(|_| Refus::TelechargementImpossible)?;
         }
-        fichier
-            .write_all(&morceau)
-            .await
-            .map_err(|_| Refus::TelechargementImpossible)?;
+        // Relecture de #8739 — une réponse plus courte que sa longueur
+        // annoncée n'est pas la piste : rien de tronqué n'entre au cache.
+        if annonce.is_some_and(|n| total - avant != n) {
+            tracing::info!(
+                annonce = ?annonce,
+                recu = total - avant,
+                "analyse_service_telechargement_incomplet"
+            );
+            return Err(Refus::TelechargementImpossible);
+        }
     }
     fichier
         .flush()
@@ -492,7 +488,7 @@ async fn telecharger_http(
     if total == 0 {
         return Err(Refus::TelechargementImpossible);
     }
-    let extension = extension_selon(&tete, Some(&flux.mime_type));
+    let extension = extension_selon(&tete, Some(mime_type));
     let fin = audio.chemin.with_extension(extension);
     std::fs::rename(&audio.chemin, &fin).map_err(|_| Refus::TelechargementImpossible)?;
     audio.chemin = fin;
@@ -501,15 +497,6 @@ async fn telecharger_http(
 
 /// L'extension d'un fichier d'après son contenu (le décodeur choisit son
 /// lecteur par l'extension), à défaut d'après le type annoncé.
-fn extension_du_fichier(chemin: &Path, mime: Option<&str>) -> &'static str {
-    use std::io::Read as _;
-    let mut tete = [0u8; 16];
-    let lus = std::fs::File::open(chemin)
-        .and_then(|mut f| f.read(&mut tete))
-        .unwrap_or(0);
-    extension_selon(&tete[..lus], mime)
-}
-
 pub(crate) fn extension_selon(tete: &[u8], mime: Option<&str>) -> &'static str {
     if tete.starts_with(b"fLaC") {
         return "flac";
