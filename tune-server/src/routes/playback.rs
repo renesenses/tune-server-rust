@@ -5604,12 +5604,23 @@ async fn get_queue(
     } else {
         Default::default()
     };
+    // Fil 2694 — les lignes que la radio de fin de file a ajoutées : badge
+    // « ajouté par la radio » à l'écran.
+    let ajoutees_par_la_radio =
+        tune_core::playback::radio_fin_de_file::lignes_ajoutees_par_la_radio(
+            &state.backend,
+            zone_id,
+        );
     let tracks: Vec<Value> = entries[..affichees]
         .iter()
         .enumerate()
         .map(|(idx, e)| {
             let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
             if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "added_by_radio".into(),
+                    Value::Bool(ajoutees_par_la_radio.contains(&e.id)),
+                );
                 let bannie = match (e.track_id, e.source.as_deref(), e.source_id.as_deref()) {
                     (Some(id), _, _) => bannis.contains(&id),
                     (None, Some(src), Some(sid)) => bannis_de_service.contains(&(
@@ -6504,6 +6515,8 @@ async fn queue_clear(
     state.orchestrator.stop(zone_id, device_id.as_deref()).await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     queue_repo.clear(zone_id).ok();
+    // Fil 2694 — plus de ligne, plus de marque « ajouté par la radio ».
+    tune_core::playback::radio_fin_de_file::oublier_les_marques(&state.backend, zone_id);
     state.orchestrator.clear_prefetch().await;
     state.playback.stop_and_clear(zone_id).await;
     state.playback.update_queue_info(zone_id, 0, 0).await;
@@ -6565,6 +6578,10 @@ async fn queue_clear_suite(state: &AppState, zone_id: i64) -> impl IntoResponse 
         .update_queue_info(zone_id, curseur, longueur)
         .await;
     persist_queue_async(state, zone_id);
+    // Fil 2694 — « Vider la suite » dit « arrête-toi après celle-ci » : la
+    // radio de fin de file ne prolonge pas cette file-là (tant qu'elle n'a
+    // pas changé d'ici sa fin).
+    tune_core::playback::radio_fin_de_file::noter_fin_voulue(&state.backend, zone_id);
     info!(
         zone_id,
         curseur, retirees, longueur, "queue_cleared_after_current"
@@ -7499,26 +7516,35 @@ struct CreateAlarm {
     fade_in_seconds: Option<i32>,
 }
 
-/// La source d'un réveil posé depuis l'écran de lecture (#7047).
+/// La source d'un réveil posé depuis l'écran de lecture (#7047, #8666).
 ///
 /// alec_eiffel (1.0.0-rc7) écoutait FIP et a posé un réveil à 21:31 depuis
 /// l'écran de lecture. Le client envoie `{"time": "21:31"}`, sans source : la
 /// route écrivait la nature `playlist` par défaut et un identifiant vide. Le
 /// réveil a sonné avec `source="playlist:"`, puis `unknown service: playlist`.
 ///
+/// #8666 (recette rc12 du 13/11) : la zone jouait un titre de la
+/// bibliothèque, et le réveil était refusé (`no source`) : seule une radio
+/// pouvait servir de source « depuis ce qui joue ».
+///
 /// Désormais, dans l'ordre :
 /// 1. une source nommée (`source_type` / `source_id`) est contrôlée ;
 /// 2. sinon `album_id` ou `playlist_id` ;
-/// 3. sinon la radio que la zone joue : c'est elle que l'utilisateur
-///    regardait en posant son réveil ;
-/// 4. sinon le réveil est refusé (400) : rien ne dit ce qu'il jouerait.
+/// 3. sinon ce que la zone joue :
+///    - une radio : sa station ;
+///    - un titre de la bibliothèque : son album, relu par `album_id` ou par
+///      la piste, et seulement s'il a au moins une piste à jouer ;
+/// 4. sinon le réveil est refusé (400 `alarm_source_required`) avec un motif
+///    (`reason`) : rien ne dit ce qu'il jouerait. Un titre de service hors
+///    bibliothèque (Qobuz, TIDAL…) ou une entrée audio n'est pas une source
+///    qu'un réveil sait rejouer (`NATURES_DE_SOURCE`).
 ///
 /// Rend `(nature, identifiant, nom affiché)`.
 async fn source_du_reveil_de_zone(
     state: &AppState,
     zone_id: i64,
     body: &CreateAlarm,
-) -> Result<(String, String, Option<String>), String> {
+) -> Result<(String, String, Option<String>), RefusDeSource> {
     if body.source_type.is_some() || body.source_id.is_some() {
         let id = match &body.source_id {
             Some(Value::String(s)) => Some(s.clone()),
@@ -7526,7 +7552,8 @@ async fn source_du_reveil_de_zone(
             _ => None,
         };
         let (nature, id) =
-            tune_core::alarms::valider_source(body.source_type.as_deref(), id.as_deref())?;
+            tune_core::alarms::valider_source(body.source_type.as_deref(), id.as_deref())
+                .map_err(RefusDeSource::Invalide)?;
         return Ok((nature, id, None));
     }
     if let Some(id) = body.album_id {
@@ -7535,18 +7562,86 @@ async fn source_du_reveil_de_zone(
     if let Some(id) = body.playlist_id {
         return Ok(("playlist".into(), id.to_string(), None));
     }
-    let en_cours = state.playback.get_state(zone_id).await.now_playing;
-    match en_cours.filter(|np| np.source == "radio") {
-        Some(np) => {
-            let (nature, id) =
-                tune_core::alarms::valider_source(Some("radio"), np.source_id.as_deref())?;
-            Ok((nature, id, Some(np.title).filter(|t| !t.trim().is_empty())))
-        }
-        None => Err(
-            "no source: name source_type and source_id, or set the alarm while the zone plays a radio"
-                .into(),
-        ),
+    let Some(np) = state.playback.get_state(zone_id).await.now_playing else {
+        return Err(RefusDeSource::Requise {
+            reason: "nothing_playing",
+            playing_source: None,
+            message: "no source: the zone plays nothing; name source_type and source_id".into(),
+        });
+    };
+    if np.source == "radio" {
+        let (nature, id) =
+            tune_core::alarms::valider_source(Some("radio"), np.source_id.as_deref()).map_err(
+                |e| RefusDeSource::Requise {
+                    reason: "radio_without_stream_url",
+                    playing_source: Some(np.source.clone()),
+                    message: format!("the radio playing on the zone cannot be replayed: {e}"),
+                },
+            )?;
+        return Ok((nature, id, Some(np.title).filter(|t| !t.trim().is_empty())));
     }
+    if let Some(album_id) = album_jouable_de_la_piste(state, &np) {
+        let nom = np.album_title.clone().filter(|t| !t.trim().is_empty());
+        return Ok(("album".into(), album_id.to_string(), nom));
+    }
+    let (reason, message) = if np.source == "local" {
+        (
+            "track_without_album",
+            "no source: the library track playing on the zone has no album to replay; \
+             name source_type and source_id"
+                .to_string(),
+        )
+    } else {
+        (
+            "source_not_replayable",
+            format!(
+                "no source: an alarm cannot replay what the zone plays ({} is not a radio, \
+                 a library album or a playlist); name source_type and source_id",
+                np.source
+            ),
+        )
+    };
+    Err(RefusDeSource::Requise {
+        reason,
+        playing_source: Some(np.source),
+        message,
+    })
+}
+
+/// Pourquoi `POST /zones/{id}/alarm` refuse la source d'un réveil.
+enum RefusDeSource {
+    /// La source NOMMÉE par le client est mal formée (#7047) :
+    /// `400 invalid_source`.
+    Invalide(String),
+    /// Aucune source nommée, et ce qui joue ne peut pas en servir (#8666) :
+    /// `400 alarm_source_required`, avec le motif dans `reason`.
+    Requise {
+        reason: &'static str,
+        playing_source: Option<String>,
+        message: String,
+    },
+}
+
+/// #8666 — l'album de la bibliothèque d'un titre en cours, s'il a au moins
+/// une piste à jouer : le réveil le rejouera par `contenu_du_reveil`, et une
+/// source qui ne jouerait rien est refusée à l'enregistrement (#7047), jamais
+/// découverte à l'heure du réveil.
+fn album_jouable_de_la_piste(
+    state: &AppState,
+    np: &tune_core::playback::NowPlaying,
+) -> Option<i64> {
+    let pistes = TrackRepo::with_backend(state.backend.clone());
+    let album = np.album_id.filter(|id| *id > 0).or_else(|| {
+        np.track_id
+            .and_then(|id| pistes.get(id).ok().flatten())
+            .and_then(|t| t.album_id)
+            .filter(|id| *id > 0)
+    })?;
+    let jouable = pistes
+        .list_by_album(album)
+        .map(|l| l.iter().any(|t| t.id.is_some()))
+        .unwrap_or(false);
+    jouable.then_some(album)
 }
 
 async fn create_alarm(
@@ -7559,11 +7654,32 @@ async fn create_alarm(
     let (source_type, source_id, source_name) =
         match source_du_reveil_de_zone(&state, zone_id, &body).await {
             Ok(s) => s,
-            Err(message) => {
+            Err(RefusDeSource::Invalide(message)) => {
                 info!(zone_id, error = %message, "alarm_source_refused");
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({ "error": "invalid_source", "message": message })),
+                )
+                    .into_response();
+            }
+            // #8666 — `error` ET `code` : le client web lit `code`, puis
+            // `error` (`apiError`). `reason` dit pourquoi ce qui joue ne peut
+            // pas servir de source.
+            Err(RefusDeSource::Requise {
+                reason,
+                playing_source,
+                message,
+            }) => {
+                info!(zone_id, reason, error = %message, "alarm_source_refused");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "alarm_source_required",
+                        "code": "alarm_source_required",
+                        "reason": reason,
+                        "playing_source": playing_source,
+                        "message": message,
+                    })),
                 )
                     .into_response();
             }
@@ -10726,6 +10842,103 @@ mod vider_la_suite_4169 {
         let apres = state.playback.get_state(zone_id).await;
         assert_eq!((apres.queue_position, apres.queue_length), (1, 2));
         assert_eq!(apres.state, PlayState::Playing);
+    }
+
+    /// Fil 2694 — « Vider la suite » dit « arrête-toi après celle-ci » : la
+    /// radio de fin de file ne prolonge pas CETTE file. La consigne est
+    /// posée par la route, et vaut tant que la file n'a pas changé.
+    #[tokio::test]
+    async fn vider_la_suite_pose_une_fin_voulue_2694() {
+        let file = [service("s0"), service("s1"), service("s2")];
+        let (state, zone_id) = zone_en_lecture(&file, 0).await;
+        let statut = envoyer(
+            &state,
+            Request::post(format!("/api/v1/zones/{zone_id}/queue/clear"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"keep_current": true}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert!(
+            tune_core::playback::radio_fin_de_file::fin_voulue(&state.backend, zone_id),
+            "la file vidée de sa suite finit là"
+        );
+    }
+
+    /// Fil 2694 — `GET /zones/{id}/queue` porte `added_by_radio` sur chaque
+    /// ligne : vrai pour les lignes que la radio de fin de file a ajoutées,
+    /// faux pour les autres. Vider la file oublie les marques.
+    #[tokio::test]
+    async fn la_file_dit_ce_que_la_radio_a_ajoute_2694() {
+        let file = [service("s0"), service("s1")];
+        let (state, zone_id) = zone_en_lecture(&file, 1).await;
+        let avant =
+            tune_core::playback::radio_fin_de_file::lignes_de_la_file(&state.backend, zone_id);
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zone_id, &[service("r0"), service("r1")])
+            .expect("lot de la radio");
+        assert_eq!(
+            tune_core::playback::radio_fin_de_file::marquer_les_ajouts(
+                &state.backend,
+                zone_id,
+                &avant,
+                2
+            )
+            .len(),
+            2
+        );
+        let reponse = crate::routes::router(state.clone())
+            .oneshot(
+                Request::get(format!("/api/v1/zones/{zone_id}/queue"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("réponse du routeur");
+        assert_eq!(reponse.status(), StatusCode::OK);
+        let octets = axum::body::to_bytes(reponse.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let corps: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+        let marques: Vec<(String, bool)> = corps["tracks"]
+            .as_array()
+            .expect("tracks")
+            .iter()
+            .map(|t| {
+                (
+                    t["source_id"].as_str().unwrap_or_default().to_string(),
+                    t["added_by_radio"]
+                        .as_bool()
+                        .expect("added_by_radio toujours présent"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            marques,
+            vec![
+                ("s0".to_string(), false),
+                ("s1".to_string(), false),
+                ("r0".to_string(), true),
+                ("r1".to_string(), true),
+            ]
+        );
+        let statut = envoyer(
+            &state,
+            Request::post(format!("/api/v1/zones/{zone_id}/queue/clear"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert!(
+            tune_core::playback::radio_fin_de_file::lignes_ajoutees_par_la_radio(
+                &state.backend,
+                zone_id
+            )
+            .is_empty()
+        );
     }
 }
 

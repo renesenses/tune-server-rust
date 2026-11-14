@@ -199,6 +199,7 @@ impl PositionPoller {
         seed_artist: &str,
         source: &str,
         seed_source_id: Option<&str>,
+        deja_de_service: &std::collections::HashSet<String>,
     ) -> usize {
         let Some(service) = self
             .orchestrator
@@ -212,11 +213,6 @@ impl PositionPoller {
             return 0;
         };
 
-        // Source 1 : l'API d'enrichissement. Elle ne repond que par MBID, et
-        // une piste de streaming n'en transporte aucun — en pratique elle rend
-        // toujours zero candidat sur une ecoute Qobuz (#1553).
-        let names = crate::playback::auto_dj::similar_artist_names(&self.db, seed_artist, 20).await;
-
         // Ne jamais reproposer ce qu'on vient d'entendre, ni ce qui est deja
         // dans la file : une radio qui rejoue la piste qui se termine n'est pas
         // une radio.
@@ -224,11 +220,8 @@ impl PositionPoller {
         if let Some(id) = seed_source_id {
             exclude.insert(id.to_string());
         }
-        if let Ok(rows) = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
-            .get_ordered(zone_id)
-        {
-            exclude.extend(rows.into_iter().filter_map(|r| r.source_id));
-        }
+        // La file, lue une fois par l'appelant (fil 2694).
+        exclude.extend(deja_de_service.iter().cloned());
         // #4806 — ni un titre de ce service BANNI par le profil actif : la
         // radio est une sélection automatique. L'exclusion se fait AVANT le
         // tirage, pour que les 10 titres demandés soient 10 titres jouables.
@@ -237,6 +230,42 @@ impl PositionPoller {
             source,
             &mut exclude,
         );
+
+        // Fil 2694 (Ilan, « comme Roon ») — la radio DU TITRE que le service
+        // compose (TIDAL), quand il en a une : c'est ce qu'entend l'auditeur
+        // de « My Daily Discovery » quand la dernière chanson se termine.
+        // Muette (service sans radio de titre, erreur, tout déjà entendu) :
+        // on passe aux artistes similaires comme avant.
+        if let Some(id) = seed_source_id.filter(|s| !s.is_empty()) {
+            let radio = service.read().await.get_track_radio(id, 50).await;
+            match radio {
+                Ok(pistes) => {
+                    let lot = lot_de_la_radio_du_titre(pistes, &exclude, 10);
+                    if !lot.is_empty() {
+                        info!(
+                            zone_id,
+                            source,
+                            count = lot.len(),
+                            "autoplay_streaming_track_radio"
+                        );
+                        return self.enfiler_la_radio_du_service(
+                            zone_id,
+                            source,
+                            seed_artist,
+                            &lot,
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(zone_id, source, error = %e, "autoplay_streaming_track_radio_failed");
+                }
+            }
+        }
+
+        // Source 1 : l'API d'enrichissement. Elle ne repond que par MBID, et
+        // une piste de streaming n'en transporte aucun — en pratique elle rend
+        // toujours zero candidat sur une ecoute Qobuz (#1553).
+        let names = crate::playback::auto_dj::similar_artist_names(&self.db, seed_artist, 20).await;
 
         // Source 2 (le service) et le passage « voisin → titre » vivent dans
         // `auto_dj::pistes_similaires_du_service`, partagés avec « Plus comme
@@ -276,6 +305,18 @@ impl PositionPoller {
             );
             return 0;
         }
+        self.enfiler_la_radio_du_service(zone_id, source, seed_artist, &found)
+    }
+
+    /// Ajoute en fin de file les pistes d'une radio de service et l'annonce.
+    /// Rend le nombre de pistes ajoutées (0 si l'écriture échoue).
+    fn enfiler_la_radio_du_service(
+        &self,
+        zone_id: i64,
+        source: &str,
+        seed_artist: &str,
+        found: &[crate::streaming::traits::StreamTrack],
+    ) -> usize {
         let items: Vec<crate::db::play_queue_repo::StreamingQueueItem> = found
             .iter()
             .map(|t| {
@@ -310,4 +351,21 @@ impl PositionPoller {
         }
         items.len()
     }
+}
+
+/// Fil 2694 — le lot tiré de la radio d'un titre : au plus `max` pistes, sans
+/// ce qui est exclu (titre qui s'achève, file, titres bannis) ni doublon dans
+/// le lot.
+pub(super) fn lot_de_la_radio_du_titre(
+    pistes: Vec<crate::streaming::traits::StreamTrack>,
+    exclude: &std::collections::HashSet<String>,
+    max: usize,
+) -> Vec<crate::streaming::traits::StreamTrack> {
+    let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
+    pistes
+        .into_iter()
+        .filter(|t| !t.id.is_empty() && !exclude.contains(&t.id))
+        .filter(|t| vus.insert(t.id.clone()))
+        .take(max)
+        .collect()
 }

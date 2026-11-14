@@ -1370,6 +1370,13 @@ path = "tests/alarm_days_5669.rs"
 name = "alarm_radio_7047"
 path = "tests/alarm_radio_7047.rs"
 
+# #8666 — le réveil posé depuis Lecture en cours sur un titre de la
+# bibliothèque rejoue son album ; ce qui ne peut pas être rejoué est refusé
+# en `alarm_source_required` avec un motif.
+[[test]]
+name = "alarm_lecture_en_cours_8666"
+path = "tests/alarm_lecture_en_cours_8666.rs"
+
 [[test]]
 name = "history_context_4036"
 path = "tests/history_context_4036.rs"

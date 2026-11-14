@@ -103,6 +103,12 @@ pub async fn similar_artist_names(
         .get("artist_enrichment_api")
         .ok()
         .flatten();
+    // Fil 2694 — la radio de fin de file est désormais active par défaut :
+    // sous test, aucune épreuve ne doit partir sur le vrai service
+    // d'enrichissement. Sans adresse posée par l'épreuve, aucun voisin.
+    if cfg!(test) && api_base.is_none() {
+        return Vec::new();
+    }
     let mut client =
         crate::metadata::artist_enrichment::ArtistEnrichmentClient::new(api_base.as_deref(), 5);
     // `get_similar` est indexée par MBID ; on lui passait le NOM de la graine.

@@ -2907,6 +2907,17 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "alarms_interrupt_playback",
         up: "",
     },
+    // Forum, fil 2694 (Ilan) ; décision de Bertrand du 13/11 — la radio de fin
+    // de file est ACTIVÉE par défaut, comme Roon. Bascule unique des zones
+    // « désactivé » (défaut historique depuis la 46) vers « titres
+    // similaires » ; les modes nommés (#2271) ne bougent pas. Les zones
+    // créées ensuite naissent à 1 (`ZoneRepo::create`). Jumelle PG : 118.
+    // Numérotée 152 / PG 118 le 13/11 : 151 / PG 117 sont pris par #8615.
+    Migration {
+        version: 152,
+        name: "radio_fin_de_file_par_defaut",
+        up: SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT,
+    },
 ];
 
 /// Pose `alarms.interrupt_playback` (#8615) — bloc de version de la 151 et
@@ -2919,6 +2930,11 @@ pub(crate) fn interruption_par_le_reveil(db: &SqliteDb) {
         "INTEGER NOT NULL DEFAULT 1",
     );
 }
+
+/// SQL de la migration 152 (fil 2694). SQLite range `'0'` en entier (affinité
+/// INTEGER) : la comparaison à 0 couvre les deux écritures.
+pub(crate) const SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT: &str = "UPDATE zones SET autoplay_enabled = 1 \
+     WHERE autoplay_enabled IS NULL OR autoplay_enabled = 0 OR autoplay_enabled = 'off'";
 
 /// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
 /// de la 146 et passe finale.
@@ -4139,6 +4155,44 @@ pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_me
 pub(crate) const TRACKS_ALBUM_GENRE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_tracks_album_genre ON tracks(album_id, genre)";
 
+/// Recette du 13/11/2026 (n° 73), puis du 14/11 — « Collections intelligentes
+/// très, trop lent » sur le .18 (9 488 albums, 96 438 pistes), malgré web#2972.
+///
+/// Même cause que #2149, pour les AUTRES colonnes de piste que lisent les
+/// règles : format (« SACD / DSD »), fréquence et résolution (« Audiophile »),
+/// année (`COALESCE(al.year, t.year)`, « 2025 », « 2026 »), date d'ajout
+/// (`file_mtime`, « Récents ») et répertoire (`file_path`). Les requêtes d'une
+/// collection joignent `tracks` par l'album ; aucun index ne portait ces
+/// colonnes à côté de `album_id`, et chaque piste de chaque album était relue
+/// dans la TABLE, dans le désordre — `LOWER()` et `CAST()` n'y sont pour
+/// rien : la colonne est lue, pas cherchée, et l'index n'a qu'à la PORTER.
+///
+/// Mesuré sur la copie de la base du .18 (Shrek, même SQL, mêmes résultats) :
+///
+/// | règle | avant | après |
+/// |---|---|---|
+/// | format = dsd | 368 ms | 39 ms |
+/// | fréquence ≥ 96 kHz et genre = Jazz | 344 ms | 26 ms |
+/// | répertoire commence par … | 363 ms | 74 ms |
+/// | année = 2026 | 195 ms | 22 ms |
+/// | ajoutés depuis 90 jours | 258 ms | 26 ms |
+///
+/// `genre` est repris dans le premier index pour qu'une règle qui le croise
+/// avec une colonne audio (« Audiophile ») reste couvrante ; une règle de
+/// genre seule garde `idx_tracks_album_genre`, plus étroit. Le répertoire a son
+/// propre index : un chemin est long, et l'ajouter au premier l'alourdirait
+/// pour toutes les autres règles.
+///
+/// SQLite seulement, dans la passe rejouée à chaque démarrage, comme
+/// [`TRACKS_ALBUM_GENRE_INDEX`] : pas de numéro de migration (aucune collision
+/// avec les PR ouvertes du lot), et PostgreSQL, dont le planificateur joint
+/// par hachage, n'en a pas l'usage. Les résultats ne changent pas : un index
+/// ne change que le chemin de lecture.
+pub(crate) const TRACKS_ALBUM_COLLECTIONS_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_album_audio \
+     ON tracks(album_id, format, sample_rate, bit_depth, year, genre, file_mtime);
+     CREATE INDEX IF NOT EXISTS idx_tracks_album_path ON tracks(album_id, file_path);";
+
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
@@ -5209,6 +5263,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(TRACKS_ALBUM_GENRE_INDEX) {
         warn!(error = %e, "sqlite_tracks_album_genre_index_failed");
     }
+    // Recette du 13/11 (n° 73) — les autres colonnes de piste des règles :
+    // même passe, même raison — voir la constante.
+    if let Err(e) = db.execute_batch(TRACKS_ALBUM_COLLECTIONS_INDEX) {
+        warn!(error = %e, "sqlite_tracks_album_collections_index_failed");
+    }
     // b209 — numéros 0 des pistes UPnP : même passe — voir la constante.
     if let Err(e) = db.execute_batch(UPNP_NUMEROS_ZERO_A_NULL) {
         warn!(error = %e, "sqlite_upnp_numeros_zero_a_null_failed");
@@ -6185,6 +6244,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         117,
         "alarms_interrupt_playback",
         include_str!("../../migrations/postgres/117_alarms_interrupt_playback.sql"),
+    ),
+    // Jumelle de la SQLite 152 (fil 2694) : radio de fin de file activée par
+    // défaut — bascule unique des zones « désactivé », DEFAULT '1'.
+    (
+        118,
+        "radio_fin_de_file_par_defaut",
+        include_str!("../../migrations/postgres/118_radio_fin_de_file_par_defaut.sql"),
     ),
 ];
 
@@ -10052,7 +10118,10 @@ mod tests {
         // 117 : `alarms_interrupt_playback` (#8615), jumelle de la SQLite
         // 151. Pose l'option de réveil « Interrompre la lecture en cours »,
         // que le planificateur et les routes des réveils NOMMENT.
-        assert_eq!(pg_latest_version(), 117, "latest PG migration must be 117");
+        // 118 : `radio_fin_de_file_par_defaut` (fil 2694), jumelle de la
+        // SQLite 152. Migration de DONNÉES : la radio de fin de file activée
+        // par défaut, et le DEFAULT de `zones.autoplay_enabled` à '1'.
+        assert_eq!(pg_latest_version(), 118, "latest PG migration must be 118");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
