@@ -196,7 +196,7 @@ async fn i8666_reveil_pose_sur_un_titre_de_la_bibliotheque_joue_son_album_quand_
         .unwrap();
     assert_eq!(
         file.iter().map(|t| t.track_id).collect::<Vec<_>>(),
-        b.pistes.map(Some)
+        b.pistes
     );
 }
 
