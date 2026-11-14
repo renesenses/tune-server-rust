@@ -91,6 +91,9 @@ pub struct SpotifyService {
     /// jeton révoqué produisait des 401 indéfiniment sans que rien ne tente
     /// de le renouveler.
     token_rejected: Arc<AtomicBool>,
+    /// #8766 — l'unité des attentes après un `429` : une seconde, raccourcie
+    /// par les essais pour ne pas attendre pour de vrai.
+    seconde_429: std::time::Duration,
     /// #6933 — les portées que Spotify dit avoir ACCORDÉES (champ `scope`
     /// de la réponse du jeton, à l'échange comme au rafraîchissement).
     /// `None` : inconnues (liaison restaurée d'une version qui ne les gardait
@@ -292,6 +295,9 @@ pub struct ErreurApi {
     /// `None` : pas de reponse (reseau, delai depasse) ou corps illisible.
     pub statut: Option<u16>,
     pub message: String,
+    /// #8766 — l'en-tête `Retry-After` d'un `429`, en secondes, quand
+    /// Spotify l'envoie (forme entière seulement).
+    pub reessayer_apres: Option<u64>,
 }
 
 /// #8198 — statut de `/me` pour un compte que l'application n'autorise pas.
@@ -302,6 +308,7 @@ impl ErreurApi {
         Self {
             statut: None,
             message: message.into(),
+            reessayer_apres: None,
         }
     }
 
@@ -344,6 +351,7 @@ async fn requete_api(
         return Err(ErreurApi {
             statut: Some(401),
             message: "token expired".into(),
+            reessayer_apres: None,
         });
     }
     // #7659 et #6825 — un refus (400, 403, 404, 429…) porte un corps JSON
@@ -354,18 +362,54 @@ async fn requete_api(
     // journalisé sans sa requête, le motif borné à 200 caractères.
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
+        let reessayer_apres = retry_after_secs(resp.headers());
         let corps = resp.text().await.unwrap_or_default();
         let message = motif_du_refus(&corps);
         let route = path.split('?').next().unwrap_or(path);
-        warn!(status, route, message = %message, "spotify_api_error");
+        warn!(status, route, message = %message, retry_after = ?reessayer_apres, "spotify_api_error");
         return Err(ErreurApi {
             statut: Some(status),
             message: format!("spotify GET {route}: HTTP {status} — {message}"),
+            reessayer_apres,
         });
     }
     resp.json()
         .await
         .map_err(|e| ErreurApi::sans_statut(format!("spotify json: {e}")))
+}
+
+/// #8766 — essais au plus d'un `GET` de l'API Web refusé en `429`, le
+/// premier compris.
+const ESSAIS_429: u32 = 4;
+/// #8766 — plafond d'une attente demandée par `Retry-After`, en secondes.
+const RETRY_AFTER_MAX_SECS: u64 = 60;
+
+/// #8766 — `Retry-After` en secondes entières. La forme date HTTP, que
+/// Spotify n'emploie pas, est ignorée : l'attente croissante prend le relais.
+fn retry_after_secs(entetes: &reqwest::header::HeaderMap) -> Option<u64> {
+    entetes
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// #8766 — l'attente avant l'essai suivant un `429`, en secondes (l'unité
+/// est une seconde en service, raccourcie en test). `essai` compte les
+/// `429` déjà reçus, à partir de 0. `Retry-After` présent : sa valeur,
+/// plafonnée à [`RETRY_AFTER_MAX_SECS`]. Absent : 1, 2, 4 puis 8 s, plus
+/// jusqu'à 25 % de hasard (`alea` de 0 à 255) pour que des appels refusés
+/// ensemble ne reviennent pas ensemble.
+fn attente_429(essai: u32, retry_after: Option<u64>, alea: u8) -> f64 {
+    match retry_after {
+        Some(secs) => secs.min(RETRY_AFTER_MAX_SECS) as f64,
+        None => {
+            let base = f64::from(1u32 << essai.min(3));
+            base * (1.0 + 0.25 * f64::from(alea) / 255.0)
+        }
+    }
 }
 
 /// #8198 — le dernier refus de connexion, que le verificateur rapporte.
@@ -685,6 +729,7 @@ impl SpotifyService {
             token_expires: None,
             enabled_override: None,
             token_rejected: Arc::new(AtomicBool::new(false)),
+            seconde_429: std::time::Duration::from_secs(1),
             portees: None,
             plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
             session_refusee: false,
@@ -798,16 +843,52 @@ impl SpotifyService {
     }
 
     /// [`Self::api_get`], le statut HTTP lisible ([`ErreurApi`]).
+    ///
+    /// #8766 — un `429` (« Too many requests ») est réessayé, au plus
+    /// [`ESSAIS_429`] appels en tout, après l'attente de [`attente_429`] :
+    /// `Retry-After` quand Spotify l'envoie, sinon une attente croissante.
+    /// Après le dernier `429`, l'erreur le dit en clair, statut 429 gardé ;
+    /// jamais une liste vide.
     async fn api_get_detaille(&self, path: &str) -> Result<serde_json::Value, ErreurApi> {
         let token = self
             .access_token
             .as_deref()
             .ok_or_else(|| ErreurApi::sans_statut("not authenticated"))?;
-        let reponse = requete_api(&self.client, &self.api_base, token, path, None).await;
-        if matches!(&reponse, Err(e) if e.jeton_refuse()) {
-            self.note_token_rejected();
+        let mut essai = 0u32;
+        loop {
+            let reponse = requete_api(&self.client, &self.api_base, token, path, None).await;
+            match reponse {
+                Err(e) if e.statut == Some(429) => {
+                    essai += 1;
+                    let route = path.split('?').next().unwrap_or(path);
+                    if essai >= ESSAIS_429 {
+                        let quand = match e.reessayer_apres {
+                            Some(n) => format!("dans {n} s"),
+                            None => "dans une minute".to_owned(),
+                        };
+                        warn!(route, essais = essai, "spotify_429_abandon");
+                        return Err(ErreurApi {
+                            statut: Some(429),
+                            message: format!(
+                                "Spotify limite temporairement les demandes (HTTP 429 sur \
+                                 {route}, {essai} essais) : réessayez {quand}"
+                            ),
+                            reessayer_apres: e.reessayer_apres,
+                        });
+                    }
+                    let [alea] = octets_aleatoires::<1>();
+                    let secs = attente_429(essai - 1, e.reessayer_apres, alea);
+                    warn!(route, essai, attente_s = secs, "spotify_429_nouvel_essai");
+                    tokio::time::sleep(self.seconde_429.mul_f64(secs)).await;
+                }
+                autre => {
+                    if matches!(&autre, Err(e) if e.jeton_refuse()) {
+                        self.note_token_rejected();
+                    }
+                    return autre;
+                }
+            }
         }
-        reponse
     }
 
     /// #8050 — taille d'une page des listes de l'utilisateur : le plafond
@@ -3619,6 +3700,149 @@ mod tests {
         assert!(err.contains("404"), "{err}");
         let genres = svc.get_genres(None).await.expect("200");
         assert_eq!(genres.len(), 1);
+    }
+
+    /// #8766 — un faux Spotify qui répond à `/v1/me/tracks` selon `reponses`
+    /// (statut, `Retry-After`), la dernière répétée ; rend sa base et les
+    /// instants des appels reçus.
+    async fn spotify_8766_faux_serveur(
+        reponses: Vec<(u16, Option<&'static str>)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<std::time::Instant>>>) {
+        type Etat = (
+            Arc<Vec<(u16, Option<&'static str>)>>,
+            Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+        );
+        let appels = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let etat: Etat = (Arc::new(reponses), Arc::clone(&appels));
+        let app = axum::Router::new()
+            .route(
+                "/v1/me/tracks",
+                axum::routing::get(
+                    |axum::extract::State((reponses, appels)): axum::extract::State<Etat>| async move {
+                        let rang = {
+                            let mut a = appels.lock().unwrap();
+                            a.push(std::time::Instant::now());
+                            a.len() - 1
+                        };
+                        let (statut, retry_after) = reponses[rang.min(reponses.len() - 1)];
+                        let mut r = axum::response::Response::builder().status(statut);
+                        if let Some(v) = retry_after {
+                            r = r.header("Retry-After", v);
+                        }
+                        let corps = if statut == 200 {
+                            json!({"items": [{"track": {
+                                "id": "t1", "name": "Titre", "duration_ms": 1000,
+                                "artists": [{"name": "Artiste"}],
+                                "album": {"id": "a1", "name": "Album", "images": []}
+                            }}], "total": 1, "next": null})
+                        } else {
+                            json!({"error": {"status": statut, "message": "Too many requests"}})
+                        };
+                        r.header("content-type", "application/json")
+                            .body(axum::body::Body::from(corps.to_string()))
+                            .unwrap()
+                    },
+                ),
+            )
+            .with_state(etat);
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", ecoute.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+        (base, appels)
+    }
+
+    /// #8766 — le service branché sur le faux Spotify, une « seconde »
+    /// d'attente raccourcie à 10 ms.
+    fn spotify_8766_service(base: &str) -> SpotifyService {
+        let mut svc =
+            SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(base);
+        svc.access_token = Some("jeton".into());
+        svc.seconde_429 = std::time::Duration::from_millis(10);
+        svc
+    }
+
+    /// #8766 — fil 2828 : un 429 avec `Retry-After: 30` n'est pas rappelé
+    /// avant 30 « secondes », puis le 200 rend les favoris.
+    #[tokio::test]
+    async fn spotify_8766_un_429_avec_retry_after_attend_puis_rend_les_favoris() {
+        let (base, appels) = spotify_8766_faux_serveur(vec![(429, Some("30")), (200, None)]).await;
+        let svc = spotify_8766_service(&base);
+        let titres = svc
+            .get_user_tracks()
+            .await
+            .expect("#8766 : le 429 suivi d'un 200 doit rendre les favoris");
+        assert_eq!(titres.len(), 1, "{titres:?}");
+        let appels = appels.lock().unwrap().clone();
+        assert_eq!(appels.len(), 2, "un seul nouvel essai");
+        let ecart = appels[1] - appels[0];
+        assert!(
+            ecart >= std::time::Duration::from_millis(300),
+            "Retry-After: 30 non respecté : rappel après {ecart:?}"
+        );
+    }
+
+    /// #8766 — un 429 sans `Retry-After` est réessayé après l'attente
+    /// croissante (1 « seconde » d'abord), puis le 200 rend les favoris.
+    #[tokio::test]
+    async fn spotify_8766_un_429_sans_retry_after_est_reessaye_apres_une_attente() {
+        let (base, appels) =
+            spotify_8766_faux_serveur(vec![(429, None), (429, None), (200, None)]).await;
+        let svc = spotify_8766_service(&base);
+        let titres = svc.get_user_tracks().await.expect("le 200 final");
+        assert_eq!(titres.len(), 1);
+        let appels = appels.lock().unwrap().clone();
+        assert_eq!(appels.len(), 3);
+        assert!(appels[1] - appels[0] >= std::time::Duration::from_millis(10));
+        assert!(appels[2] - appels[1] >= std::time::Duration::from_millis(20));
+    }
+
+    /// #8766 — un 429 répété : 4 appels au plus, puis une erreur claire
+    /// (statut 429, « limite temporairement »), jamais une liste vide.
+    #[tokio::test]
+    async fn spotify_8766_un_429_repete_abandonne_apres_4_essais_avec_une_erreur_claire() {
+        let (base, appels) = spotify_8766_faux_serveur(vec![(429, Some("1"))]).await;
+        let svc = spotify_8766_service(&base);
+        let err = svc
+            .api_get_detaille("/me/tracks?limit=50&offset=0")
+            .await
+            .expect_err("#8766 : un 429 répété doit finir en erreur");
+        assert_eq!(err.statut, Some(429));
+        assert!(
+            err.message.contains("limite temporairement") && err.message.contains("4 essais"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("dans 1 s"), "{}", err.message);
+        assert!(!err.message.contains("jeton"), "{}", err.message);
+        let err = svc
+            .get_user_tracks()
+            .await
+            .expect_err("#8766 : pas de liste vide présentée comme un succès")
+            .to_string();
+        assert!(err.contains("429"), "{err}");
+        assert_eq!(appels.lock().unwrap().len(), 2 * ESSAIS_429 as usize);
+    }
+
+    /// #8766 — les attentes : `Retry-After` plafonné à 60 s ; sans lui, 1, 2,
+    /// 4 puis 8 s plus au plus 25 % de hasard.
+    #[test]
+    fn spotify_8766_attentes_apres_un_429() {
+        assert_eq!(attente_429(0, Some(30), 255), 30.0);
+        assert_eq!(attente_429(0, Some(3600), 0), 60.0);
+        assert_eq!(attente_429(2, Some(0), 0), 0.0);
+        for (essai, base) in [(0, 1.0), (1, 2.0), (2, 4.0), (3, 8.0), (9, 8.0)] {
+            assert_eq!(attente_429(essai, None, 0), base);
+            assert_eq!(attente_429(essai, None, 255), base * 1.25);
+        }
+        let mut entetes = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_secs(&entetes), None);
+        entetes.insert(reqwest::header::RETRY_AFTER, " 12 ".parse().unwrap());
+        assert_eq!(retry_after_secs(&entetes), Some(12));
+        entetes.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after_secs(&entetes), None);
     }
 
     /// #8399 — fil 2750 : Spotify ferme `/browse/featured-playlists` aux
