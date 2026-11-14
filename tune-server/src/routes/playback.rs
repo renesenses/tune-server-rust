@@ -5604,12 +5604,23 @@ async fn get_queue(
     } else {
         Default::default()
     };
+    // Fil 2694 — les lignes que la radio de fin de file a ajoutées : badge
+    // « ajouté par la radio » à l'écran.
+    let ajoutees_par_la_radio =
+        tune_core::playback::radio_fin_de_file::lignes_ajoutees_par_la_radio(
+            &state.backend,
+            zone_id,
+        );
     let tracks: Vec<Value> = entries[..affichees]
         .iter()
         .enumerate()
         .map(|(idx, e)| {
             let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
             if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "added_by_radio".into(),
+                    Value::Bool(ajoutees_par_la_radio.contains(&e.id)),
+                );
                 let bannie = match (e.track_id, e.source.as_deref(), e.source_id.as_deref()) {
                     (Some(id), _, _) => bannis.contains(&id),
                     (None, Some(src), Some(sid)) => bannis_de_service.contains(&(
@@ -6504,6 +6515,8 @@ async fn queue_clear(
     state.orchestrator.stop(zone_id, device_id.as_deref()).await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     queue_repo.clear(zone_id).ok();
+    // Fil 2694 — plus de ligne, plus de marque « ajouté par la radio ».
+    tune_core::playback::radio_fin_de_file::oublier_les_marques(&state.backend, zone_id);
     state.orchestrator.clear_prefetch().await;
     state.playback.stop_and_clear(zone_id).await;
     state.playback.update_queue_info(zone_id, 0, 0).await;
@@ -6565,6 +6578,10 @@ async fn queue_clear_suite(state: &AppState, zone_id: i64) -> impl IntoResponse 
         .update_queue_info(zone_id, curseur, longueur)
         .await;
     persist_queue_async(state, zone_id);
+    // Fil 2694 — « Vider la suite » dit « arrête-toi après celle-ci » : la
+    // radio de fin de file ne prolonge pas cette file-là (tant qu'elle n'a
+    // pas changé d'ici sa fin).
+    tune_core::playback::radio_fin_de_file::noter_fin_voulue(&state.backend, zone_id);
     info!(
         zone_id,
         curseur, retirees, longueur, "queue_cleared_after_current"
@@ -10726,6 +10743,103 @@ mod vider_la_suite_4169 {
         let apres = state.playback.get_state(zone_id).await;
         assert_eq!((apres.queue_position, apres.queue_length), (1, 2));
         assert_eq!(apres.state, PlayState::Playing);
+    }
+
+    /// Fil 2694 — « Vider la suite » dit « arrête-toi après celle-ci » : la
+    /// radio de fin de file ne prolonge pas CETTE file. La consigne est
+    /// posée par la route, et vaut tant que la file n'a pas changé.
+    #[tokio::test]
+    async fn vider_la_suite_pose_une_fin_voulue_2694() {
+        let file = [service("s0"), service("s1"), service("s2")];
+        let (state, zone_id) = zone_en_lecture(&file, 0).await;
+        let statut = envoyer(
+            &state,
+            Request::post(format!("/api/v1/zones/{zone_id}/queue/clear"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"keep_current": true}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert!(
+            tune_core::playback::radio_fin_de_file::fin_voulue(&state.backend, zone_id),
+            "la file vidée de sa suite finit là"
+        );
+    }
+
+    /// Fil 2694 — `GET /zones/{id}/queue` porte `added_by_radio` sur chaque
+    /// ligne : vrai pour les lignes que la radio de fin de file a ajoutées,
+    /// faux pour les autres. Vider la file oublie les marques.
+    #[tokio::test]
+    async fn la_file_dit_ce_que_la_radio_a_ajoute_2694() {
+        let file = [service("s0"), service("s1")];
+        let (state, zone_id) = zone_en_lecture(&file, 1).await;
+        let avant =
+            tune_core::playback::radio_fin_de_file::lignes_de_la_file(&state.backend, zone_id);
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zone_id, &[service("r0"), service("r1")])
+            .expect("lot de la radio");
+        assert_eq!(
+            tune_core::playback::radio_fin_de_file::marquer_les_ajouts(
+                &state.backend,
+                zone_id,
+                &avant,
+                2
+            )
+            .len(),
+            2
+        );
+        let reponse = crate::routes::router(state.clone())
+            .oneshot(
+                Request::get(format!("/api/v1/zones/{zone_id}/queue"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("réponse du routeur");
+        assert_eq!(reponse.status(), StatusCode::OK);
+        let octets = axum::body::to_bytes(reponse.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let corps: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+        let marques: Vec<(String, bool)> = corps["tracks"]
+            .as_array()
+            .expect("tracks")
+            .iter()
+            .map(|t| {
+                (
+                    t["source_id"].as_str().unwrap_or_default().to_string(),
+                    t["added_by_radio"]
+                        .as_bool()
+                        .expect("added_by_radio toujours présent"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            marques,
+            vec![
+                ("s0".to_string(), false),
+                ("s1".to_string(), false),
+                ("r0".to_string(), true),
+                ("r1".to_string(), true),
+            ]
+        );
+        let statut = envoyer(
+            &state,
+            Request::post(format!("/api/v1/zones/{zone_id}/queue/clear"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert!(
+            tune_core::playback::radio_fin_de_file::lignes_ajoutees_par_la_radio(
+                &state.backend,
+                zone_id
+            )
+            .is_empty()
+        );
     }
 }
 
