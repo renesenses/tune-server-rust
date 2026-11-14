@@ -465,3 +465,336 @@ fn l_annuaire_compte_ses_facettes_sous_la_qualite_min() {
     assert_eq!(corps["total"], 2);
     assert_eq!(corps["countries"], json!([{"code": "FR", "count": 1}]));
 }
+
+/// Recette rc12 (13/11) — une fiche au seul flux donné, sous un nom.
+fn fiche_a_un_flux(nom: &str, codec: Option<&str>, frequence: i32) -> StationAnnuaire {
+    let url = format!("https://exemple.invalid/{nom}");
+    StationAnnuaire {
+        name: nom.into(),
+        stream_url: url.clone(),
+        codec: codec.map(Into::into),
+        flux: vec![FluxAnnuaire {
+            url,
+            codec: codec.map(Into::into),
+            bitrate: Some(320),
+            sample_rate: Some(frequence),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn hires_rc12_un_flux_avec_perte_n_est_jamais_hires() {
+    let c = criteres("hires=true");
+    // Les deux fiches de l'annuaire réel qui passaient à tort le 13/11.
+    for (nom, codec, frequence) in [
+        ("africa-mp3-192k", Some("MP3"), 192_000),
+        ("wrsi-aac-96k", Some("AAC"), 96_000),
+        ("aac-plus-96k", Some("AAC+"), 96_000),
+        ("opus-96k", Some("opus"), 96_000),
+        ("vorbis-96k", Some("Ogg Vorbis"), 96_000),
+        ("format-inconnu-96k", None, 96_000),
+        ("flac-cd", Some("FLAC"), 44_100),
+        ("flac-48k", Some("FLAC"), 48_000),
+    ] {
+        assert!(
+            !c.retient_la_fiche(&fiche_a_un_flux(nom, codec, frequence), None),
+            "{nom} : un flux avec perte, de format inconnu ou à 48 kHz au plus n'est pas Hi-Res"
+        );
+    }
+    for (nom, codec, frequence) in [
+        ("flac-96k", "FLAC", 96_000),
+        ("flac-192k", "flac", 192_000),
+        ("alac-88k", "ALAC", 88_200),
+        ("ogg-flac-96k", "Ogg FLAC", 96_000),
+    ] {
+        assert!(
+            c.retient_la_fiche(&fiche_a_un_flux(nom, Some(codec), frequence), None),
+            "{nom} : un flux sans perte au-delà de 48 kHz est Hi-Res"
+        );
+    }
+}
+
+#[test]
+fn hires_rc12_le_flux_sans_perte_doit_etre_celui_de_la_haute_frequence() {
+    // Un FLAC 44,1 kHz à côté d'un AAC 96 kHz : aucun flux n'est Hi-Res.
+    let mut f = fiche_a_un_flux("melange", Some("FLAC"), 44_100);
+    f.flux.push(flux(
+        "https://exemple.invalid/melange.aac",
+        "AAC",
+        320,
+        96_000,
+    ));
+    assert!(!criteres("hires=true").retient_la_fiche(&f, None));
+    // Un MP3 principal et un FLAC 192 kHz de secours : la station en a un.
+    let mut g = fiche_a_un_flux("secours", Some("MP3"), 44_100);
+    g.flux.push(flux(
+        "https://exemple.invalid/secours.flac",
+        "FLAC",
+        9216,
+        192_000,
+    ));
+    assert!(criteres("hires=true").retient_la_fiche(&g, None));
+}
+
+#[test]
+fn hires_rc12_mes_radios_juge_le_flux_ecoute() {
+    // « Mes radios » écoute le MP3 que l'annuaire dit à 192 kHz : pas Hi-Res.
+    let fiche = fiche_a_un_flux("africa", Some("MP3"), 192_000);
+    let st = station(
+        "Africa",
+        "https://exemple.invalid/africa",
+        "France",
+        "Pop",
+        None,
+        None,
+        false,
+    );
+    assert!(
+        criteres("hires=true")
+            .filtrer_les_stations(vec![st], &[fiche], &HashMap::new())
+            .is_empty(),
+        "un MP3 de « Mes radios » ne passe pas le filtre Hi-Res"
+    );
+}
+
+/// Recette rc12 (14/11, Rémi) — une fiche au seul flux donné : format, débit
+/// et fréquence, chacun pouvant manquer.
+fn fiche_flux(
+    nom: &str,
+    codec: &str,
+    debit: Option<i32>,
+    frequence: Option<i32>,
+) -> StationAnnuaire {
+    let url = format!("https://exemple.invalid/{nom}");
+    StationAnnuaire {
+        name: nom.into(),
+        stream_url: url.clone(),
+        codec: Some(codec.into()),
+        bitrate: debit,
+        flux: vec![FluxAnnuaire {
+            url,
+            codec: Some(codec.into()),
+            bitrate: debit,
+            sample_rate: frequence,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// (sans perte, haute qualité, Hi-Res) d'une fiche, chacun par son bouton.
+fn trois_boutons(f: &StationAnnuaire) -> (bool, bool, bool) {
+    (
+        criteres("sans_perte=true").retient_la_fiche(f, None),
+        criteres("haute_qualite=true").retient_la_fiche(f, None),
+        criteres("hires=true").retient_la_fiche(f, None),
+    )
+}
+
+#[test]
+fn boutons_rc12_sans_perte_haute_qualite_hires_flux_par_flux() {
+    for (f, attendu) in [
+        (
+            fiche_flux("mp3-320", "MP3", Some(320), Some(44_100)),
+            (false, true, false),
+        ),
+        (
+            fiche_flux("aac-256", "AAC", Some(256), Some(48_000)),
+            (false, true, false),
+        ),
+        (
+            fiche_flux("mp3-192", "MP3", Some(192), Some(44_100)),
+            (false, false, false),
+        ),
+        (
+            fiche_flux("flac-sans-debit", "FLAC", None, None),
+            (true, true, false),
+        ),
+        (
+            fiche_flux("flac-96k", "FLAC", Some(4608), Some(96_000)),
+            (true, true, true),
+        ),
+        // Contre-épreuves : juste sous le seuil, débit inconnu d'un flux avec
+        // perte, MP3 que l'annuaire dit à 192 kHz.
+        (
+            fiche_flux("mp3-255", "MP3", Some(255), Some(44_100)),
+            (false, false, false),
+        ),
+        (
+            fiche_flux("aac-sans-debit", "AAC+", None, Some(96_000)),
+            (false, false, false),
+        ),
+        (
+            fiche_flux("mp3-320-192k", "MP3", Some(320), Some(192_000)),
+            (false, true, false),
+        ),
+        (
+            fiche_flux("alac-cd", "ALAC", Some(1411), Some(44_100)),
+            (true, true, false),
+        ),
+        (
+            fiche_flux("ogg-flac", "Ogg FLAC", None, Some(48_000)),
+            (true, true, false),
+        ),
+    ] {
+        assert_eq!(trois_boutons(&f), attendu, "{}", f.name);
+    }
+}
+
+#[test]
+fn boutons_rc12_sans_perte_est_l_alias_de_lossless() {
+    let flac = fiche_flux("flac", "FLAC", None, None);
+    let mp3 = fiche_flux("mp3", "MP3", Some(320), None);
+    for requete in [
+        "sans_perte=true",
+        "lossless=true",
+        "lossless=true&sans_perte=true",
+    ] {
+        assert!(criteres(requete).retient_la_fiche(&flac, None), "{requete}");
+        assert!(!criteres(requete).retient_la_fiche(&mp3, None), "{requete}");
+    }
+    for requete in ["sans_perte=false", "haute_qualite=false", ""] {
+        assert!(criteres(requete).est_vide(), "{requete}");
+    }
+    assert!(!criteres("haute_qualite=true").est_vide());
+}
+
+#[test]
+fn boutons_rc12_une_station_passe_si_l_un_de_ses_flux_passe() {
+    // Un MP3 128 principal et un FLAC de secours : sans perte et haute qualité.
+    let mut f = fiche_flux("secours", "MP3", Some(128), Some(44_100));
+    f.flux.push(flux(
+        "https://exemple.invalid/secours.flac",
+        "FLAC",
+        1411,
+        44_100,
+    ));
+    assert_eq!(trois_boutons(&f), (true, true, false));
+    // Deux MP3, 128 et 320 : haute qualité seulement.
+    let mut g = fiche_flux("deux-mp3", "MP3", Some(128), Some(44_100));
+    g.flux.push(flux(
+        "https://exemple.invalid/deux-mp3-hq",
+        "MP3",
+        320,
+        44_100,
+    ));
+    assert_eq!(trois_boutons(&g), (false, true, false));
+}
+
+#[test]
+fn boutons_rc12_mes_radios_juge_le_flux_ecoute() {
+    // La fiche a un MP3 128 et un FLAC ; « Mes radios » écoute l'un ou l'autre.
+    let mut fiche = fiche_flux("double", "MP3", Some(128), Some(44_100));
+    fiche.flux.push(flux(
+        "https://exemple.invalid/double.flac",
+        "FLAC",
+        1411,
+        96_000,
+    ));
+    let ecoute = |url: &str, requete: &str| {
+        let st = station("Double", url, "France", "Pop", None, None, false);
+        !criteres(requete)
+            .filtrer_les_stations(vec![st], &[fiche.clone()], &HashMap::new())
+            .is_empty()
+    };
+    let mp3 = "https://exemple.invalid/double";
+    let flac = "https://exemple.invalid/double.flac";
+    for requete in ["sans_perte=true", "haute_qualite=true", "hires=true"] {
+        assert!(
+            !ecoute(mp3, requete),
+            "le MP3 128 écouté ne passe pas {requete}"
+        );
+        assert!(
+            ecoute(flac, requete),
+            "le FLAC 96 kHz écouté passe {requete}"
+        );
+    }
+    // Une station sans fiche : son propre format et son propre débit.
+    let seule = |codec: &str, debit: i32, requete: &str| {
+        let st = station(
+            "Seule",
+            "https://exemple.invalid/seule",
+            "France",
+            "Pop",
+            Some(codec),
+            Some(debit),
+            false,
+        );
+        !criteres(requete)
+            .filtrer_les_stations(vec![st], &[], &HashMap::new())
+            .is_empty()
+    };
+    assert!(seule("MP3", 320, "haute_qualite=true"));
+    assert!(!seule("MP3", 320, "sans_perte=true"));
+    assert!(!seule("MP3", 192, "haute_qualite=true"));
+    assert!(seule("FLAC", 0, "sans_perte=true"));
+    assert!(seule("FLAC", 0, "haute_qualite=true"));
+}
+
+#[test]
+fn boutons_rc12_l_annuaire_filtre_et_compte() {
+    let fiches = [
+        fiche_flux("mp3-320", "MP3", Some(320), Some(44_100)),
+        fiche_flux("mp3-192", "MP3", Some(192), Some(44_100)),
+        fiche_flux("flac-96k", "FLAC", None, Some(96_000)),
+    ];
+    let compte = |requete: &str| {
+        let corps = corps_annuaire(&fiches, &[], &filtres(requete), &EtatAnnuaire::default());
+        (
+            noms(&corps)
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+            corps["total"].clone(),
+        )
+    };
+    assert_eq!(
+        compte("haute_qualite=true"),
+        (vec!["mp3-320".into(), "flac-96k".into()], json!(2))
+    );
+    assert_eq!(
+        compte("sans_perte=true"),
+        (vec!["flac-96k".into()], json!(1))
+    );
+    assert_eq!(
+        compte("haute_qualite=true&hires=true"),
+        (vec!["flac-96k".into()], json!(1))
+    );
+    assert_eq!(
+        compte(""),
+        (
+            vec!["mp3-320".into(), "mp3-192".into(), "flac-96k".into()],
+            json!(3)
+        )
+    );
+}
+
+#[test]
+fn rc12_total_tous_genres_suit_les_filtres_meme_un_genre_choisi() {
+    let mut jazz_hq = fiche_flux("jazz-320", "MP3", Some(320), Some(44_100));
+    jazz_hq.genre = Some("jazz".into());
+    let mut news_hq = fiche_flux("news-flac", "FLAC", None, None);
+    news_hq.genre = Some("news".into());
+    let mut news_bas = fiche_flux("news-128", "MP3", Some(128), Some(44_100));
+    news_bas.genre = Some("news".into());
+    let fiches = [jazz_hq, news_hq, news_bas];
+    let tous = |requete: &str| {
+        corps_annuaire(&fiches, &[], &filtres(requete), &EtatAnnuaire::default())["total_all_genres"].clone()
+    };
+    assert_eq!(tous(""), json!(3));
+    assert_eq!(
+        tous("genre=jazz"),
+        json!(3),
+        "le genre choisi ne borne pas « Tous les genres »"
+    );
+    assert_eq!(tous("haute_qualite=true"), json!(2));
+    assert_eq!(
+        tous("genre=jazz&haute_qualite=true"),
+        json!(2),
+        "les critères le bornent, genre choisi ou non"
+    );
+    assert_eq!(tous("genre=jazz&sans_perte=true"), json!(1));
+    assert_eq!(tous("q=news&genre=jazz"), json!(2));
+}
