@@ -479,3 +479,101 @@ async fn la_relance_d_un_titre_de_service_deja_en_file_garde_la_playlist() {
         "la relance d'un titre de service déjà en file a remplacé le conteneur de la playlist"
     );
 }
+
+// ─── Le conteneur posé sur les lignes de file de « Lire » ────────────────────
+//
+// Fil 2302 point 7, fil 2559 point 2 (FabienM) : « le menu historique
+// n'historise plus la lecture des conteneurs, uniquement des titres ». Les
+// lignes posées par `POST /zones/{id}/play` restaient à `context_type` NULL et
+// suivaient le contexte de SESSION, effacé par une radio, un podcast, une
+// radio d'artiste, un préréglage (#6558) ou un redémarrage (#7889). Une radio
+// écoutée entre deux, puis un clic sur un titre de l'album resté en file : ce
+// titre et la suite s'inscrivaient au premier niveau. L'écoute lit d'abord le
+// conteneur de la ligne jouée (`contexte_de_la_piste_jouee`, celui
+// qu'`ecrire_l_ecoute` écrit) : il doit être là, sans la session.
+
+impl BancDeLecture {
+    /// Le conteneur que l'écoute de chaque ligne de file écrirait, la session
+    /// de la zone EFFACÉE (ce que font une radio, un podcast, un redémarrage).
+    async fn conteneurs_sans_session(&self) -> Vec<Option<(String, Option<String>)>> {
+        self.state
+            .playback
+            .effacer_contexte_de_session(self.zone)
+            .await;
+        tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(self.state.backend.clone())
+            .get_ordered(self.zone)
+            .unwrap()
+            .iter()
+            .map(|e| {
+                tune_core::db::contexte_de_file::contexte_de_la_piste_jouee(
+                    &self.state.backend,
+                    self.zone,
+                    e.position,
+                    e.track_id,
+                    e.source_id.as_deref(),
+                )
+                .map(|c| (c.nature, c.id))
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn les_titres_d_un_album_lu_gardent_l_album_sans_la_session() {
+    let banc = BancDeLecture::new().await;
+    assert_eq!(banc.play(json!({"album_id": 1})).await, StatusCode::OK);
+    let album = Some(("album".to_string(), Some("1".to_string())));
+    assert_eq!(
+        banc.conteneurs_sans_session().await,
+        vec![album.clone(), album.clone(), album],
+        "après une radio ou un redémarrage, les titres de l'album en file \
+         s'inscrivaient au premier niveau de l'Historique"
+    );
+}
+
+#[tokio::test]
+async fn les_titres_d_une_playlist_lue_gardent_la_playlist_sans_la_session() {
+    let banc = BancDeLecture::new().await;
+    assert_eq!(banc.play(json!({"playlist_id": 55})).await, StatusCode::OK);
+    assert_eq!(banc.file(), vec![Some(3), Some(1)]);
+    let liste = Some(("playlist".to_string(), Some("55".to_string())));
+    assert_eq!(
+        banc.conteneurs_sans_session().await,
+        vec![liste.clone(), liste],
+        "un titre lu depuis la playlist s'inscrivait au premier niveau (fil 2559, point 2)"
+    );
+}
+
+/// Garde-fou : un titre lancé SEUL n'a pas de conteneur à poser ; sa ligne
+/// suit la session (« track »), comme avant.
+#[tokio::test]
+async fn un_titre_lance_seul_ne_pose_aucun_conteneur_sur_la_file() {
+    let banc = BancDeLecture::new().await;
+    assert_eq!(banc.play(json!({"track_id": 4})).await, StatusCode::OK);
+    assert_eq!(banc.conteneurs_sans_session().await, vec![None]);
+}
+
+/// Garde-fou : « Lire » une playlist après un album ne réécrit pas les lignes
+/// d'avant — seules celles du geste prennent son conteneur.
+#[tokio::test]
+async fn un_nouveau_lire_ne_repeint_que_ses_propres_lignes() {
+    let banc = BancDeLecture::new().await;
+    assert_eq!(banc.play(json!({"album_id": 1})).await, StatusCode::OK);
+    let avant =
+        tune_core::db::contexte_de_file::dernier_identifiant(&banc.state.backend, banc.zone);
+    assert_eq!(banc.play(json!({"playlist_id": 55})).await, StatusCode::OK);
+    let lignes = banc
+        .state
+        .backend
+        .query_many(
+            "SELECT id, context_type FROM queue_items WHERE zone_id = ? ORDER BY id",
+            &[&banc.zone as &dyn tune_core::db::backend::ToSqlValue],
+        )
+        .unwrap();
+    assert!(!lignes.is_empty());
+    for l in lignes {
+        let id = l[0].as_i64().unwrap();
+        assert!(id > avant, "la file de l'album n'a pas été remplacée");
+        assert_eq!(l[1].as_string().as_deref(), Some("playlist"));
+    }
+}
