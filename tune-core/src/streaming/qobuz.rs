@@ -795,8 +795,7 @@ pub(crate) fn artiste_unique_du_nom(data: &serde_json::Value, nom: &str) -> Opti
 }
 
 /// La biographie d'une réponse `/artist/get`, en texte (même nettoyage que la
-/// note d'album, [`super::presentation_album::texte_de_presentation`] : il
-/// décode aussi les entités, ce que `strip_html_tags` ne fait pas), avec la
+/// note d'album, [`super::presentation_album::texte_de_presentation`]), avec la
 /// langue que Qobuz annonce (`biography.language`).
 pub(crate) fn bio_editoriale_de(
     data: &serde_json::Value,
@@ -3488,15 +3487,8 @@ impl QobuzService {
             bio: item["biography"]["content"]
                 .as_str()
                 .or_else(|| item["biography"]["summary"].as_str())
-                .map(Self::strip_html_tags)
-                .filter(|s| !s.is_empty()),
+                .and_then(super::presentation_album::texte_de_presentation),
         }
-    }
-
-    /// Strip HTML tags from Qobuz editorial text (biography content is HTML).
-    fn strip_html_tags(s: &str) -> String {
-        let re = regex::Regex::new(r"<[^>]+>").unwrap();
-        re.replace_all(s, "").trim().to_string()
     }
 }
 
@@ -6062,6 +6054,20 @@ mod tests {
         });
         let album = QobuzService::map_album(&json);
         assert_eq!(album.id, "abc123");
+    }
+
+    #[test]
+    fn map_artist_entites_8698() {
+        let item = json!({"id": 42, "name": "Duffy", "biography": {
+            "content": "<p>Soul &amp; pop. &copy Matt Collar /TiVo</p>", "language": "en"
+        }});
+        let attendu = "Soul & pop. © Matt Collar /TiVo";
+        assert_eq!(
+            QobuzService::map_artist(&item).bio.as_deref(),
+            Some(attendu),
+            "la fiche artiste doit décoder les mêmes entités que la biographie éditoriale"
+        );
+        assert_eq!(bio_editoriale_de(&item, "42").unwrap().texte, attendu);
     }
 
     #[test]
