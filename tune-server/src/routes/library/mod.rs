@@ -79,6 +79,9 @@ mod reports;
 pub(crate) mod requete_avancee;
 // tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
 // fichiers de CETTE machine.
+/// Fil du forum 2793 — la forme d'onde d'une piste (crêtes, RMS, écrêtage),
+/// en JSON, calculée à la demande pour sa fiche technique.
+mod forme_onde;
 pub(crate) mod reveler;
 mod search;
 /// #7857 — le spectrogramme d'une piste, en PNG, généré à la demande.
@@ -555,6 +558,8 @@ pub fn router() -> Router<AppState> {
             "/tracks/{id}/spectrogramme",
             post(spectrogramme::recalculer),
         )
+        // Fil 2793 — la forme d'onde de la fiche technique.
+        .route("/tracks/{id}/forme-onde", get(forme_onde::json))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
         // #2264 — les mêmes candidats, regroupés par enregistrement, avec la

@@ -78,20 +78,24 @@ pub(crate) async fn png(
     servir(&state, id, taille, &dossier_du_cache(), plafond()).await
 }
 
-/// Une génération à la fois par piste.
+/// Une génération à la fois par piste (spectrogramme et forme d'onde : un
+/// seul décodage lourd par piste à la fois).
 static VERROUS: LazyLock<Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Deux générations au plus en même temps, toutes pistes confondues.
-static GENERATIONS: LazyLock<tokio::sync::Semaphore> =
-    LazyLock::new(|| tokio::sync::Semaphore::new(2));
+/// Deux générations au plus en même temps, toutes pistes confondues (la
+/// forme d'onde, fil 2793, partage cette limite).
+/// Dans un `Arc` pour `acquire_owned` (la forme d'onde déplace sa place dans
+/// le travail bloquant).
+pub(super) static GENERATIONS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
 
-fn verrou_de(id: i64) -> Arc<tokio::sync::Mutex<()>> {
+pub(super) fn verrou_de(id: i64) -> Arc<tokio::sync::Mutex<()>> {
     let mut verrous = VERROUS.lock().unwrap_or_else(|e| e.into_inner());
     verrous.entry(id).or_default().clone()
 }
 
-fn liberer(id: i64, verrou: Arc<tokio::sync::Mutex<()>>) {
+pub(super) fn liberer(id: i64, verrou: Arc<tokio::sync::Mutex<()>>) {
     let mut verrous = VERROUS.lock().unwrap_or_else(|e| e.into_inner());
     // La table et nous : personne d'autre n'attend, l'entrée peut partir.
     if Arc::strong_count(&verrou) <= 2 {
@@ -360,6 +364,15 @@ pub(crate) fn nom_en_cache(
     largeur: u32,
     hauteur: u32,
 ) -> String {
+    format!(
+        "{id}-{:016x}-{largeur}x{hauteur}.png",
+        empreinte_du_fichier(chemin, meta)
+    )
+}
+
+/// Une empreinte du chemin, de la taille et de la date du fichier : elle
+/// change dès que le fichier est remplacé (forme d'onde comprise, fil 2793).
+pub(super) fn empreinte_du_fichier(chemin: &str, meta: &std::fs::Metadata) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     chemin.hash(&mut h);
     meta.len().hash(&mut h);
@@ -368,11 +381,11 @@ pub(crate) fn nom_en_cache(
         .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .hash(&mut h);
-    format!("{id}-{:016x}-{largeur}x{hauteur}.png", h.finish())
+    h.finish()
 }
 
 /// Lit une image en cache et la marque servie (sa date), pour l'éviction.
-fn lire_le_cache(cible: &CheminFs) -> Option<Vec<u8>> {
+pub(super) fn lire_le_cache(cible: &CheminFs) -> Option<Vec<u8>> {
     let octets = std::fs::read(cible).ok()?;
     if let Ok(f) = std::fs::File::options().write(true).open(cible) {
         let _ = f.set_modified(SystemTime::now());
@@ -394,13 +407,24 @@ fn ecrire(cible: &CheminFs, octets: &[u8]) -> std::io::Result<()> {
 /// récemment d'abord. `garder` (l'image qui vient d'être écrite) ne part pas.
 /// Rend les noms des images retirées (#8160 : leurs lignes s'effacent).
 pub(crate) fn evincer(dossier: &CheminFs, plafond: u64, garder: &CheminFs) -> Vec<String> {
+    evincer_selon(dossier, plafond, garder, "png")
+}
+
+/// [`evincer`] pour les fichiers d'extension `extension` (la forme d'onde,
+/// fil 2793, garde du JSON).
+pub(super) fn evincer_selon(
+    dossier: &CheminFs,
+    plafond: u64,
+    garder: &CheminFs,
+    extension: &str,
+) -> Vec<String> {
     let mut retirees = Vec::new();
     let Ok(entrees) = std::fs::read_dir(dossier) else {
         return retirees;
     };
     let mut fichiers: Vec<(PathBuf, u64, SystemTime)> = entrees
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == extension))
         .filter_map(|e| {
             let m = e.metadata().ok()?;
             m.is_file().then(|| {
