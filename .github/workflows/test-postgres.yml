@@ -1202,3 +1202,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_4201 -- --nocapture --test-threads=1
+
+      # Recette du 13/11 (n° 73) — la liste des collections intelligentes lit
+      # ses deux comptes (albums, pistes) en UNE requête : elle rend sur la
+      # VRAIE base ce que rendaient les deux requêtes d'avant, pour des règles
+      # de toutes les formes. Dans un schéma à elle ; sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Comptes des collections intelligentes en une passe sur PostgreSQL
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-smart-http --lib --no-default-features --features postgres pg_comptes_collections -- --nocapture --test-threads=1

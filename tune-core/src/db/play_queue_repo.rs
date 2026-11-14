@@ -1309,6 +1309,33 @@ impl PlayQueueRepo {
         self.insert_at(zone_id, items, None).map(|_| ())
     }
 
+    /// Fil 2694 — retire d'un coup les lignes `ids` de la file `entries` (lue
+    /// par l'appelant) et renumérote le reste en 0..N-1, dans une transaction.
+    /// Rend le nombre de lignes retirées.
+    pub fn retirer_les_lignes(&self, entries: &[QueueEntry], ids: &[i64]) -> Result<usize, String> {
+        let retirees = entries.iter().filter(|e| ids.contains(&e.id)).count();
+        if retirees == 0 {
+            return Ok(0);
+        }
+        let delete_sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
+        let set_pos_sql = self.dialect_sql(sql::set_position_by_id, sql::set_position_by_id);
+        self.db.write_tx(&mut |tx| {
+            let mut new_pos = 0i64;
+            for e in entries.iter() {
+                if ids.contains(&e.id) {
+                    let dp: [&dyn ToSqlValue; 1] = [&e.id];
+                    tx.execute(&delete_sql, &dp)?;
+                    continue;
+                }
+                let p: [&dyn ToSqlValue; 2] = [&new_pos, &e.id];
+                tx.execute(&set_pos_sql, &p)?;
+                new_pos += 1;
+            }
+            Ok(())
+        })?;
+        Ok(retirees)
+    }
+
     /// Remove the item at `position` (source-agnostic) and close the gap.
     pub fn remove_pos(&self, zone_id: i64, position: i64) -> Result<bool, String> {
         // `position` from the client is an ORDINAL into the displayed queue
