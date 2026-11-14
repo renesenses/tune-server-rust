@@ -2108,11 +2108,12 @@ async fn l_association_manuelle_prime_sur_le_rapprochement_8672() {
     assert_eq!(rick["bibliotheque"]["par"], "musicbrainz_album", "{rick}");
     let release = rick["release_id"].as_u64().unwrap();
 
+    // Déjà rapproché de l'album 1 : changer d'album se demande (#8678).
     let (code, r) = appel(
         &b.app,
         "PUT",
         &format!("/disques/{release}/association"),
-        Some(json!({"album_id": 3})),
+        Some(json!({"album_id": 3, "remplacer": true})),
     )
     .await;
     assert_eq!(code, StatusCode::OK, "{r}");
@@ -2135,4 +2136,87 @@ async fn l_association_manuelle_prime_sur_le_rapprochement_8672() {
     let (_, c) = appel(&b.app, "GET", "/collection", None).await;
     let rick = disque(&c, "Never Gonna Give You Up");
     assert_eq!(rick["bibliotheque"]["album_id"], 3, "{rick}");
+}
+
+/// #8678 : `PUT /disques/{release}/association` ne remplace plus en silence.
+/// Un disque déjà rattaché à un AUTRE album — par le rapprochement
+/// automatique ou par une association dont l'album est encore là — répond
+/// 409 `deja_associe` ; le même album reste accepté (200) ; changer d'album
+/// demande `remplacer: true`, ou « Dissocier » d'abord.
+#[tokio::test]
+async fn un_disque_deja_associe_refuse_un_autre_album_8678() {
+    let b = banc_avec(HoteEssai::new());
+    suivre(&b, "exemple").await;
+    synchro_complete(&b, "exemple").await;
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let rick = disque(&c, "Never Gonna Give You Up");
+    assert_eq!(rick["bibliotheque"]["album_id"], 1, "{rick}");
+    let release = rick["release_id"].as_u64().unwrap();
+    let chemin = format!("/disques/{release}/association");
+
+    // Rapproché automatiquement de l'album 1 : un autre album est refusé.
+    let (code, r) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 3}))).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{r}");
+    assert_eq!(r["error"], "collection_physique.deja_associe", "{r}");
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let rick = disque(&c, "Never Gonna Give You Up");
+    assert_eq!(rick["bibliotheque"]["album_id"], 1, "rien d'écrit : {rick}");
+    assert_eq!(rick["bibliotheque"]["par"], "musicbrainz_album", "{rick}");
+
+    // Le même album : accepté.
+    let (code, r) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 1}))).await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["album_id"], 1, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["par"], "manuel", "{r}");
+
+    // Associé à la main à l'album 1 : un autre album est refusé…
+    let (code, r) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 3}))).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{r}");
+    assert_eq!(r["error"], "collection_physique.deja_associe", "{r}");
+    // … `remplacer: false` aussi…
+    let (code, _) = appel(
+        &b.app,
+        "PUT",
+        &chemin,
+        Some(json!({"album_id": 3, "remplacer": false})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    // … sauf `remplacer: true`.
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &chemin,
+        Some(json!({"album_id": 3, "remplacer": true})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["album_id"], 3, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["par"], "manuel", "{r}");
+    // Le même album de nouveau : accepté.
+    let (code, _) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 3}))).await;
+    assert_eq!(code, StatusCode::OK);
+
+    // L'album 3 quitte la bibliothèque : le lien ne compte plus, mais le
+    // rapprochement automatique (album 1) refuse toujours un autre album.
+    b.hote.albums.lock().unwrap().retain(|a| a.id != 3);
+    let (code, r) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 2}))).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{r}");
+    assert_eq!(r["error"], "collection_physique.deja_associe", "{r}");
+
+    // « Dissocier » puis associer : le rapprochement automatique refuse
+    // encore un autre album, `remplacer: true` passe.
+    let (code, _) = appel(&b.app, "DELETE", &chemin, None).await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, _) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 2}))).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &chemin,
+        Some(json!({"album_id": 2, "remplacer": true})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["album_id"], 2, "{r}");
 }

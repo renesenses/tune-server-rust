@@ -718,11 +718,18 @@ async fn disque_relu(etat: &Etat, release: u64) -> Response {
 #[derive(Deserialize)]
 struct CorpsAssociation {
     album_id: i64,
+    /// Changer d'album en connaissance de cause (#8678) : sans lui, un
+    /// disque déjà rattaché à un AUTRE album est refusé (409).
+    #[serde(default)]
+    remplacer: bool,
 }
 
-/// `PUT /disques/{release}/association` (#8672) : `{album_id}`. 404
-/// `disque_inconnu` hors de la collection, 404 `album_inconnu` pour un album
-/// qui n'est pas (ou plus) un album local de la bibliothèque.
+/// `PUT /disques/{release}/association` (#8672) : `{album_id, remplacer?}`.
+/// 404 `disque_inconnu` hors de la collection, 404 `album_inconnu` pour un
+/// album qui n'est pas (ou plus) un album local de la bibliothèque, 409
+/// `deja_associe` quand le disque est déjà rattaché à un AUTRE album — par
+/// une association encore valable ou par le rapprochement automatique —
+/// sauf `remplacer: true` (#8678). Le même album est accepté (200).
 async fn associer(
     State(etat): State<Etat>,
     Path(release): Path<u64>,
@@ -731,15 +738,34 @@ async fn associer(
     let Ok(c) = serde_json::from_slice::<CorpsAssociation>(&corps) else {
         return refus(StatusCode::UNPROCESSABLE_ENTITY, "corps_invalide");
     };
-    if disque_suivi(&etat, release).is_none() {
+    let Some((m, d)) = disque_suivi(&etat, release) else {
         return refus(StatusCode::NOT_FOUND, "disque_inconnu");
-    }
+    };
     let albums = match albums_et_services(&etat).await {
         Ok((a, _)) => a,
         Err(r) => return r.into_response(),
     };
     if !albums.iter().any(|a| a.id == c.album_id) {
         return refus(StatusCode::NOT_FOUND, "album_inconnu");
+    }
+    if !c.remplacer {
+        // L'album auquel le disque est rattaché aujourd'hui : l'association
+        // manuelle si son album est encore là, sinon le rapprochement
+        // automatique (même règle que l'affichage, `vue`).
+        let index = Index::new(&albums);
+        let codes = m
+            .fiches
+            .get(&release)
+            .map(|f| f.codes_barres.clone())
+            .unwrap_or_default();
+        let mb = m.liens_mb.get(&release).map(|l| &l.liens);
+        let actuel = associations_manuelles(&etat)
+            .get(&release)
+            .and_then(|&id| index.album(id))
+            .or_else(|| index.trouver(&d, &codes, mb).map(|(a, _)| a));
+        if actuel.is_some_and(|a| a.id != c.album_id) {
+            return refus(StatusCode::CONFLICT, "deja_associe");
+        }
     }
     if let Err(e) =
         associations::associer(&etat.backend, release, c.album_id, synchro::maintenant())
