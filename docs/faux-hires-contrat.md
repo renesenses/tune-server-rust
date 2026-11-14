@@ -35,10 +35,14 @@ mesuré. Le verdict reste en base ; poser le réglage le montre partout.
 | Route | Corps | Réponse |
 |---|---|---|
 | `GET /library/hires-check` | — | `{"active", "douteux_visible", "restantes", "rangees"}` |
-| `POST /library/hires-check` | `{"active"?, "douteux_visible"?}` | `{"active", "douteux_visible"}` |
+| `POST` ou `PUT /library/hires-check` | `{"active"?, "douteux_visible"?}` | `{"active", "douteux_visible"}` |
 
-Les deux champs du `POST` sont facultatifs : un champ absent garde sa valeur.
-`{"active": true}` seul se comporte comme avant.
+Les deux champs sont facultatifs : un champ absent garde sa valeur, sauf un
+cas (rc12, décision du 13/11/2026). `{"active": true}` seul — ce qu'envoie
+l'interrupteur « Détecter les faux Hi-Res » de Réglages › Bibliothèque —
+arme la passe ET montre « douteux » ; `{"active": false}` seul la désarme et
+le masque. Un `douteux_visible` fourni dans le même corps l'emporte. Sans geste
+de l'utilisateur, rien ne change : passe éteinte, « douteux » masqué.
 
 ## Liste des albums : `GET /library/albums`
 
@@ -57,6 +61,16 @@ d'albums filtrés (comme pour une recherche). Tant que « douteux » est masqué
 aussi les albums douteux. Un mot inconnu ne rend rien, jamais toute la
 bibliothèque. Sans le paramètre, la réponse est celle d'avant, plus les deux
 champs.
+
+## Catalogue imprimable : `GET /export/catalogue.html` (rc12)
+
+`?hires_verdict=verifie,douteux` (un ou plusieurs mots, séparés par des
+virgules) : les albums de ces verdicts publiés, mêmes prédicats que la liste
+(« douteux » masqué ne rend rien, un mot inconnu non plus). C'est une valeur
+de plus de la facette Qualité : OU avec `quality`, comme les pastilles de la
+Bibliothèque. `GET /library/hires-check` rend `"catalogue_hires_verdict": true`
+sur un serveur qui le sait ; le client web n'active l'export d'un filtre
+« Hi-Res vérifié / douteux » que s'il le lit.
 
 ## Règles intelligentes : critère `hires_verdict`
 

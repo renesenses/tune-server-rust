@@ -99,7 +99,9 @@ acoustic analysis: [Synology model-cache setup](docs/INSTALL-SYNOLOGY.md).
 Tune cannot mount an SMB share itself inside the container. Mount the share on
 the host (your NAS), then bind it with `rslave` propagation
 (`-v /volume1/music:/music:ro,rslave`) so that a share mounted after the
-container started shows up in it:
+container started shows up in it. Adding or changing a volume takes a new
+container (`docker rm` then `docker run`, or `docker compose up -d`); a restart
+keeps the old volumes:
 [SMB share in Docker](docs/DOCKER-PARTAGE-SMB.md).
 
 ### Podman (Fedora)

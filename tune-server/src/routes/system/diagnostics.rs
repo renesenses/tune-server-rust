@@ -404,6 +404,114 @@ fn section_famine_anneau(releve: &[Value]) -> String {
     md
 }
 
+/// #8696 — le relevé JSON des sessions WASAPI exclusives en cours.
+fn releve_reveils_wasapi_json(
+    releve: &[tune_core::outputs::rendu_sans_bridage_8696::ReleveSessionWasapi],
+) -> Vec<Value> {
+    releve
+        .iter()
+        .map(|s| {
+            json!({
+                "device": s.peripherique,
+                "period_us": s.periode_us,
+                "late_wakeups": s.reveils_en_retard,
+                "max_wakeup_gap_us": s.ecart_max_us,
+                "underruns": s.underruns,
+                "deadline_misses": s.deadline_misses,
+                "persistent_late_wakeups": s.retards_persistants,
+                "power_throttling_opt_out": s.bridage_refuse,
+            })
+        })
+        .collect()
+}
+
+/// #8696 — la section « réveils du fil de rendu WASAPI » du rapport de bogue,
+/// pour les sessions EN COURS. Vide quand aucune ne joue (et hors Windows).
+fn section_reveils_wasapi(
+    releve: &[tune_core::outputs::rendu_sans_bridage_8696::ReleveSessionWasapi],
+) -> String {
+    if releve.is_empty() {
+        return String::new();
+    }
+    let mut md = String::from("## WASAPI exclusif — réveils du fil de rendu (session en cours)\n");
+    for s in releve {
+        let bridage = match s.bridage_refuse {
+            Some(true) => "EcoQoS refusé",
+            Some(false) => "⚠ EcoQoS NON refusé",
+            None => "EcoQoS sans objet",
+        };
+        md.push_str(&format!(
+            "- {} : {} réveil(s) en retard, écart max {} µs (période {} µs) ; {} anneau vide, {} échéance(s) manquée(s) ; {}{}\n",
+            s.peripherique,
+            s.reveils_en_retard,
+            s.ecart_max_us,
+            s.periode_us,
+            s.underruns,
+            s.deadline_misses,
+            bridage,
+            if s.retards_persistants {
+                " ; ⚠ RETARDS PERSISTANTS (plus de 10 s sans répit)"
+            } else {
+                ""
+            },
+        ));
+    }
+    md.push_str(
+        "  (un réveil en retard = le fil de rendu servi plus d'une période et \
+         demie après le précédent, anneau plein : panne d'ORDONNANCEMENT, pas \
+         de producteur)\n\n",
+    );
+    md
+}
+
+#[cfg(test)]
+mod reveils_wasapi_dans_le_rapport_8696 {
+    use super::*;
+    use tune_core::outputs::rendu_sans_bridage_8696::ReleveSessionWasapi;
+
+    fn session(persistants: bool) -> ReleveSessionWasapi {
+        ReleveSessionWasapi {
+            peripherique: "SMSL SU-8".to_string(),
+            periode_us: 10_000,
+            reveils_en_retard: 64,
+            ecart_max_us: 40_235,
+            underruns: 0,
+            deadline_misses: 0,
+            retards_persistants: persistants,
+            bridage_refuse: Some(true),
+        }
+    }
+
+    #[test]
+    fn aucune_session_aucune_section() {
+        assert_eq!(section_reveils_wasapi(&[]), "");
+        assert!(releve_reveils_wasapi_json(&[]).is_empty());
+    }
+
+    #[test]
+    fn la_session_en_cours_porte_ses_reveils_en_retard() {
+        let md = section_reveils_wasapi(&[session(false)]);
+        assert!(md.contains("(session en cours)"));
+        assert!(
+            md.contains(
+                "SMSL SU-8 : 64 réveil(s) en retard, écart max 40235 µs (période 10000 µs)"
+            )
+        );
+        assert!(md.contains("EcoQoS refusé"));
+        assert!(!md.contains("PERSISTANTS"));
+    }
+
+    #[test]
+    fn des_retards_persistants_se_voient_dans_le_texte_colle() {
+        let md = section_reveils_wasapi(&[session(true)]);
+        assert!(md.contains("RETARDS PERSISTANTS"));
+        let json = releve_reveils_wasapi_json(&[session(true)]);
+        assert_eq!(json[0]["late_wakeups"], 64);
+        assert_eq!(json[0]["persistent_late_wakeups"], true);
+        assert_eq!(json[0]["power_throttling_opt_out"], true);
+    }
+}
+
 /// #3801 — Didier, décrochages FLAC 16/44 en sortie locale WASAPI (fil 1741).
 ///
 /// Le dossier tient sur UNE mesure, et elle est déjà livrée chez lui :
@@ -1039,6 +1147,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // / `stream_ms` donnent le dénominateur qui rend le taux calculable.
         // À NE PAS confondre avec l'underrun ALSA : voir `releve_famine_anneau`.
         "ring_starvation": ring_starvation,
+        // #8696 — réveils du fil de rendu WASAPI exclusif, session en cours.
+        "wasapi_exclusive_sessions": releve_reveils_wasapi_json(
+            &tune_core::outputs::rendu_sans_bridage_8696::releve_des_sessions_en_cours(),
+        ),
         // #3479 — `eq_non_finite_samples` > 0 dit que l'étage d'égalisation a
         // remis des échantillons à ZÉRO : c'est du silence produit par l'EQ
         // lui-même, sur un anneau qui n'a pas eu faim. `eq_overs` dit
@@ -2774,13 +2886,22 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     if !oaat_endpoints.is_empty() {
         md.push_str(&format!("## OAAT Endpoints ({})\n", oaat_endpoints.len()));
         for ep in &oaat_endpoints {
+            let dsd_max = if ep["dsd_capabilities_received"].as_bool() == Some(true) {
+                ep["dsd_max_rate"]
+                    .as_u64()
+                    .map(|n| format!("DSD{n}"))
+                    .unwrap_or_else(|| "not advertised".into())
+            } else {
+                "unknown".into()
+            };
             md.push_str(&format!(
-                "- {} ({}): connected={}, packets={}, format={}\n",
+                "- {} ({}): connected={}, packets={}, format={}, DSD max={}\n",
                 ep["name"].as_str().unwrap_or("?"),
                 ep["host"].as_str().unwrap_or("?"),
                 ep["connected"].as_bool().unwrap_or(false),
                 ep["packets_sent"].as_u64().unwrap_or(0),
                 ep["format"].as_str().unwrap_or("?"),
+                dsd_max,
             ));
             if ep["stall_detected"].as_bool().unwrap_or(false) {
                 md.push_str("  **⚠ STALL DETECTED**\n");
@@ -2793,6 +2914,12 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // que le testeur colle sur le forum — et c'est ce rapport, sur un parc
     // réel, qui doit décider si le noyau RT de Tune OS sert à quelque chose.
     md.push_str(&section_famine_anneau(&ring_starvation));
+    // #8696 : les réveils du fil de rendu WASAPI exclusif de la session EN
+    // COURS — jusqu'ici `reveils_en_retard` ne sortait qu'à l'arrêt, et le
+    // rapport du fil 2805 a été envoyé pendant la session malade.
+    md.push_str(&section_reveils_wasapi(
+        &tune_core::outputs::rendu_sans_bridage_8696::releve_des_sessions_en_cours(),
+    ));
     // #5677 : les relevés de gel restaient sur la machine du testeur (tickets
     // 223, 224) ; le rapport joint désormais les deux plus récents. Lus hors
     // de l'exécuteur : ce sont des fichiers.
@@ -3013,6 +3140,10 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         },
         "oaat_endpoints": oaat_endpoints,
         "ring_starvation": ring_starvation,
+        // #8696 — réveils du fil de rendu WASAPI exclusif, session en cours.
+        "wasapi_exclusive_sessions": releve_reveils_wasapi_json(
+            &tune_core::outputs::rendu_sans_bridage_8696::releve_des_sessions_en_cours(),
+        ),
         // Le pendant JSON de la section markdown ci-dessus (#3479).
         "dsp_egaliseur": dsp_egaliseur,
         // Le pendant JSON de la section « DSP — ecretage » (#2218).
@@ -3571,15 +3702,11 @@ async fn envoyer_le_rapport(
         Ok(resp) => {
             let status = resp.status().as_u16();
             journaliser_le_refus(status, nb_images, nb_journaux, resp.headers());
-            // #5068 — la limite d'envoi du site garde son 429 : ce n'est pas
-            // une panne, et un 5xx ferait lever à l'interface un bandeau
-            // « Server error » en plus de la phrase de l'écran.
-            let code = if status == 429 {
-                StatusCode::TOO_MANY_REQUESTS
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            (code, corps_du_refus(status, resp.headers()))
+            let entetes = resp.headers().clone();
+            // #8627 — le corps du site porte le MOTIF du refus (422 : « sa mise
+            // en forme aurait effacé votre texte… »). Il était jeté.
+            let corps_site = resp.text().await.unwrap_or_default();
+            refus_du_site(status, &entetes, &corps_site)
         }
         Err(e) => {
             tracing::warn!(error = %e, "bug_report_submit_failed");
@@ -3644,6 +3771,75 @@ fn corps_du_refus(status: u16, headers: &reqwest::header::HeaderMap) -> Value {
         return corps;
     }
     json!({ "error": "cloud rejected the report", "status": status })
+}
+
+/// Longueur maximale du motif du site recopié à l'écran (#8627) : une phrase,
+/// pas une page d'erreur entière.
+const MOTIF_DU_SITE_MAX_CHARS: usize = 500;
+
+/// Le statut et le corps rendus au client quand le site refuse le rapport.
+///
+/// #5068 — la limite d'envoi du site garde son 429 : ce n'est pas une panne, et
+/// un 5xx ferait lever à l'interface un bandeau « Server error » en plus de la
+/// phrase de l'écran.
+///
+/// #8627 — un 422 du site (validation : le texte du testeur ne survit pas à la
+/// mise en forme, site-mozaiklabs#529) n'est pas une panne non plus : il est
+/// rendu en 422, avec le code stable `site_rejected` et, sous `site_message`,
+/// la phrase que le site a écrite pour le testeur (`errors.*[0]`, sinon
+/// `message`). Avant, tout non-2xx hors 429 devenait un 502 muet et l'écran
+/// disait « Réessaie » — alors que réessayer le même rapport échoue pareil et
+/// consomme un envoi de plus. Les autres refus restent des 502, et portent le
+/// motif du site s'il en a donné un.
+fn refus_du_site(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    corps_site: &str,
+) -> (StatusCode, Value) {
+    if status == 429 {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            corps_du_refus(status, headers),
+        );
+    }
+    let motif = motif_du_site(corps_site);
+    if status == 422 {
+        let mut corps = json!({
+            "error": "site_rejected",
+            "code": "site_rejected",
+            "status": status,
+        });
+        if let Some(m) = motif {
+            corps["site_message"] = json!(m);
+        }
+        return (StatusCode::UNPROCESSABLE_ENTITY, corps);
+    }
+    let mut corps = corps_du_refus(status, headers);
+    if let Some(m) = motif {
+        corps["site_message"] = json!(m);
+    }
+    (StatusCode::BAD_GATEWAY, corps)
+}
+
+/// La phrase lisible d'un refus Laravel : la première erreur de validation
+/// (`errors.<champ>[0]`), sinon `message`. Un corps non JSON (page HTML d'un
+/// proxy) ne donne rien : on ne recopie pas de balises à l'écran.
+fn motif_du_site(corps_site: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(corps_site).ok()?;
+    let depuis_errors = v.get("errors").and_then(Value::as_object).and_then(|errs| {
+        errs.values().find_map(|e| match e {
+            Value::Array(a) => a.iter().find_map(Value::as_str).map(str::to_string),
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+    });
+    let phrase =
+        depuis_errors.or_else(|| v.get("message").and_then(Value::as_str).map(str::to_string))?;
+    let phrase = phrase.trim();
+    if phrase.is_empty() {
+        return None;
+    }
+    Some(phrase.chars().take(MOTIF_DU_SITE_MAX_CHARS).collect())
 }
 
 pub(super) async fn audio_check() -> Json<Value> {
@@ -5654,6 +5850,74 @@ mod tests_refus_du_rapport_5590 {
             "{ligne}"
         );
         assert!(!ligne.contains("retry_after"), "{ligne}");
+    }
+}
+
+#[cfg(test)]
+mod tests_motif_du_refus_8627 {
+    use super::refus_du_site;
+    use axum::http::StatusCode;
+
+    /// Le cas du ticket : le 422 de site-mozaiklabs#529. Le statut et la
+    /// phrase du site arrivent au client.
+    #[test]
+    fn un_422_du_site_rend_un_422_et_sa_phrase() {
+        let corps_site = r#"{"message":"Le rapport n'a pas été publié : sa mise en forme aurait effacé votre texte.","errors":{"body":["Le rapport n'a pas été publié : sa mise en forme aurait effacé votre texte. Rien n'a été enregistré."]}}"#;
+        let (code, corps) = refus_du_site(422, &reqwest::header::HeaderMap::new(), corps_site);
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{corps}");
+        assert_eq!(corps["code"], "site_rejected", "{corps}");
+        assert_eq!(corps["status"], 422, "{corps}");
+        assert_eq!(
+            corps["site_message"],
+            "Le rapport n'a pas été publié : sa mise en forme aurait effacé votre texte. Rien n'a été enregistré.",
+            "{corps}"
+        );
+    }
+
+    /// Sans `errors`, le `message` Laravel sert de motif.
+    #[test]
+    fn sans_errors_le_message_sert_de_motif() {
+        let (code, corps) = refus_du_site(
+            422,
+            &reqwest::header::HeaderMap::new(),
+            r#"{"message":"Corps invalide."}"#,
+        );
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(corps["site_message"], "Corps invalide.");
+    }
+
+    /// Une page HTML de proxy ne devient pas un motif, et une panne du site
+    /// reste un 502.
+    #[test]
+    fn une_page_html_ne_devient_pas_un_motif_et_le_5xx_reste_502() {
+        let (code, corps) = refus_du_site(
+            500,
+            &reqwest::header::HeaderMap::new(),
+            "<html><body>500 Internal Server Error</body></html>",
+        );
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
+        assert_eq!(corps["status"], 500);
+        assert!(corps.get("site_message").is_none(), "{corps}");
+    }
+
+    /// Le 429 garde son traitement (#5068).
+    #[test]
+    fn le_429_reste_rate_limited() {
+        let (code, corps) = refus_du_site(429, &reqwest::header::HeaderMap::new(), "{}");
+        assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(corps["code"], "rate_limited");
+    }
+
+    /// Le motif est borné : une phrase, pas une page.
+    #[test]
+    fn le_motif_est_borne() {
+        let long = "é".repeat(2000);
+        let (_, corps) = refus_du_site(
+            422,
+            &reqwest::header::HeaderMap::new(),
+            &format!(r#"{{"message":"{long}"}}"#),
+        );
+        assert_eq!(corps["site_message"].as_str().unwrap().chars().count(), 500);
     }
 }
 

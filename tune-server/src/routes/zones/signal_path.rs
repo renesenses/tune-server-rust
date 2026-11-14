@@ -1027,16 +1027,33 @@ pub(super) fn pilote_du_dsd_natif_local() -> &'static str {
 /// #8248 — l'étape « DSD natif » : « DSD128 natif (ALSA) ». Bit-perfect : les
 /// bits du fichier partent tels quels, rangés en mots de 32 bits.
 pub(super) fn etape_dsd_natif_local(lang: &str, sample_rate: i32) -> Value {
+    etape_dsd_natif(lang, sample_rate, pilote_du_dsd_natif_local())
+}
+
+/// L'étape « DSD natif » d'une voie nommée par `voie` (ALSA, ASIO, OAAT).
+pub(super) fn etape_dsd_natif(lang: &str, sample_rate: i32, voie: &str) -> Value {
     json!({
         "name": "Transcoder",
         "code": "dsd_natif",
-        "description": fs(
-            lang,
-            "dsd_natif_local",
-            &[dsd_family_name(sample_rate), pilote_du_dsd_natif_local()],
-        ),
+        "description": fs(lang, "dsd_natif_local", &[dsd_family_name(sample_rate), voie]),
         "bit_perfect": true,
     })
+}
+
+/// #8647 (fil 2794) — la sortie OAAT de la zone sert-elle CE DSD en natif ?
+///
+/// La voie directe d'OAAT lit le `.dsf` et l'expédie en `DSD_U8` quand le
+/// récepteur le prend ; sinon elle lit le WAV préparé par l'orchestrateur.
+/// Seule la sortie le sait : elle le publie
+/// ([`tune_core::outputs::dsd_natif_oaat_8647`]) et on le lit ici.
+pub(super) fn dsd_natif_sur_la_sortie_oaat(
+    is_dsd: bool,
+    output_type: &str,
+    device_id: Option<&str>,
+) -> bool {
+    is_dsd
+        && output_type == "oaat"
+        && device_id.is_some_and(tune_core::outputs::dsd_natif_oaat_8647::est_actif)
 }
 
 /// « DSD64 over PCM (DoP) » — l'étage de sortie d'un DSD emballé en DoP
@@ -1288,7 +1305,12 @@ pub fn build_signal_path_lang(
 
     let output_type = zone.output_type.as_deref().unwrap_or("local");
 
-    let source = decrire_la_source(np, backend, wire, output_type);
+    let mut source = decrire_la_source(np, backend, wire, output_type);
+    // #8647 (fil 2794) — DSD256 vers OAAT affiché « → WAV 352 kHz/24 bits »
+    // pendant que le DAC recevait du DSD256 natif : la sortie, pas le
+    // réglage, dit ce qui part.
+    source.dsd_natif_oaat =
+        dsd_natif_sur_la_sortie_oaat(source.is_dsd, output_type, zone.output_device_id.as_deref());
     // Pour une sortie locale qui sait observer son dernier callback, le réel
     // prime sur toute déduction depuis les réglages. Les autres sorties
     // conservent le calcul historique jusqu'à ce qu'elles publient leur propre
@@ -1836,6 +1858,7 @@ fn assembler_les_etapes_lang(
         canaux_du_fil,
         dst_reconstruit_en_dsf,
         dsd_natif_local,
+        dsd_natif_oaat,
         variante_hls_refusee,
         ..
     } = analyse.source;
@@ -2152,6 +2175,34 @@ fn assembler_les_etapes_lang(
         {
             etape["code"] = json!("dsd_dop_ecarte");
             etape["detail"] = json!(ecart.raison());
+        }
+        if is_oaat
+            && is_dsd
+            && !dop_sur_le_fil
+            && let Some(repli) = zone
+                .output_device_id
+                .as_deref()
+                .and_then(tune_core::outputs::repli_dsd_oaat_8486::lire)
+                .and_then(|e| e.repli)
+        {
+            use tune_core::outputs::repli_dsd_oaat_8486::Raison;
+            let source = repli
+                .dsd_rate
+                .map(|n| format!("DSD{n}"))
+                .unwrap_or_else(|| "DSD".into());
+            let maximum = repli
+                .dsd_max_rate
+                .map(|n| format!("DSD{n}"))
+                .unwrap_or_else(|| "DSD".into());
+            let detail = match repli.raison {
+                Raison::SansDsd => ts(lang, "oaat_dsd_absent").to_string(),
+                Raison::Plafond => fs(lang, "oaat_dsd_plafond", &[&source, &maximum]),
+                Raison::Conteneur => ts(lang, "oaat_dsd_conteneur").to_string(),
+                Raison::Cadence => ts(lang, "oaat_dsd_cadence").to_string(),
+            };
+            etape["code"] = json!("oaat_dsd_pcm_fallback");
+            etape["detail"] = json!(detail);
+            etape["dsd_fallback"] = json!(repli);
         }
         if flac_ffmpeg_vers_le_reseau {
             // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
@@ -2654,6 +2705,10 @@ fn assembler_les_etapes_lang(
     // un DoP dit « DSD64 over PCM (DoP) » (étape Transcoder, code `dop`).
     if dsd_natif_local {
         steps.push(etape_dsd_natif_local(lang, sample_rate));
+    }
+    // #8647 — même étage pour OAAT : « DSD256 natif (OAAT) ».
+    if dsd_natif_oaat {
+        steps.push(etape_dsd_natif(lang, sample_rate, "OAAT"));
     }
 
     // Transport step
@@ -3169,6 +3224,7 @@ fn decider_les_forcages(
         is_dsd,
         sample_rate,
         bit_depth,
+        dsd_natif_oaat,
         ..
     } = *source;
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
@@ -3189,7 +3245,12 @@ fn decider_les_forcages(
     // envoyée telle quelle à un Eversolo DMP-A6 s'affichait « DSD128 5.6 MHz →
     // FLAC 5644kHz/1bit » : un transcodage qui n'a pas lieu, vers un conteneur
     // qui ne peut pas exister (#1315).
-    let dsd_passthrough = is_dsd && is_network_output && wire_carries_raw_dsd(wire);
+    //
+    // #8647 — OAAT n'est pas « réseau » au sens de ce fichier, et sa voie DSD
+    // native ne passe par aucune session : le WAV de la session n'est pas lu.
+    // Le constat de la sortie (`dsd_natif_oaat`) vaut passthrough.
+    let dsd_passthrough =
+        is_dsd && ((is_network_output && wire_carries_raw_dsd(wire)) || dsd_natif_oaat);
     // Un égaliseur ARMÉ n'atteint pas un flux DSD servi BRUT hors sortie
     // locale, et l'orchestrateur s'en abstient DÉLIBÉRÉMENT : convertir du DSD
     // natif en PCM pour y passer un EQ serait une dégradation décidée à la
@@ -3214,7 +3275,7 @@ fn decider_les_forcages(
     // « DSP contourné pour DoP » quand c'est le cas, et qui est plus juste que
     // toute déduction faite ici.
     let dsd_brut_hors_sortie_locale =
-        is_dsd && output_type != "local" && wire_carries_raw_dsd(wire);
+        is_dsd && output_type != "local" && (wire_carries_raw_dsd(wire) || dsd_natif_oaat);
     // « Armé » et « appliqué » ne sont pas la même chose.
     let dsp_applique = dsp_enabled && !dsd_brut_hors_sortie_locale;
     let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
@@ -3333,7 +3394,9 @@ fn decider_les_forcages(
     );
     // OAAT transcodes everything to WAV except WAV itself
     let is_oaat = output_type == "oaat";
+    // #8647 — sauf le DSD que la sortie sert en natif : rien n'est converti.
     let oaat_transcodes = is_oaat
+        && !dsd_natif_oaat
         && source_format
             .as_ref()
             .is_some_and(|f| *f != AudioFormat::Wav);
@@ -3572,6 +3635,12 @@ struct Source<'w> {
     /// (`audio::dsd_brut::MIME`) : ALSA `DSD_U32` sous Linux, ASIO sous
     /// Windows. Constaté sur la session, pas déduit du réglage.
     dsd_natif_local: bool,
+    /// #8647 (fil 2794) — la sortie OAAT de la zone sert ce DSD en NATIF : elle
+    /// lit le `.dsf` elle-même (`native_dsd_active`), et le WAV que
+    /// l'orchestrateur a préparé (`oaat_needs_wav`) n'est jamais lu. Constaté
+    /// sur la sortie ([`tune_core::outputs::dsd_natif_oaat_8647`]), pas
+    /// déduit de `dsd_mode`.
+    dsd_natif_oaat: bool,
     /// #6357 — le débit du codec mesuré par le décodeur radio (HLS), quand
     /// la lecture en cours n'en porte pas.
     debit_source_kbps: Option<u32>,
@@ -3675,6 +3744,7 @@ fn decrire_la_source<'w>(
             canaux_du_fil: None,
             dst_reconstruit_en_dsf: false,
             dsd_natif_local: false,
+            dsd_natif_oaat: false,
             debit_radio_kbps: radio.bitrate_kbps,
             variante_hls_refusee: radio.variante_refusee,
         };
@@ -3703,6 +3773,7 @@ fn decrire_la_source<'w>(
             canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
             dst_reconstruit_en_dsf: false,
             dsd_natif_local: false,
+            dsd_natif_oaat: false,
             debit_source_kbps: Some(qualite.bitrate_kbps),
             debit_radio_kbps: None,
             variante_hls_refusee: None,
@@ -3881,6 +3952,8 @@ fn decrire_la_source<'w>(
         dsd_natif_local: is_dsd
             && output_type == "local"
             && wire.is_some_and(|w| est_le_flux_dsd_natif_local(&w.mime_type)),
+        // Posé par `build_signal_path_lang`, qui connaît l'appareil de la zone.
+        dsd_natif_oaat: false,
         debit_radio_kbps: None,
         variante_hls_refusee: None,
     }

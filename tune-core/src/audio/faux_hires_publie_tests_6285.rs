@@ -256,3 +256,26 @@ fn la_liste_des_albums_se_filtre_sur_le_verdict_6285() {
         .unwrap();
     assert_eq!(tout.len(), 7, "sans filtre, toute la bibliothèque");
 }
+
+/// rc12 — le filtre `hires_verdict` du catalogue : les albums d'un ou de
+/// plusieurs verdicts (OU), « douteux » masqué ne rend rien, un mot inconnu
+/// non plus. Mêmes albums que la liste filtrée ci-dessus.
+#[test]
+fn les_albums_des_verdicts_du_catalogue_rc12() {
+    let db = bibliotheque();
+    let ids = |mots: &[&str], visible: bool| {
+        let mots: Vec<String> = mots.iter().map(|m| m.to_string()).collect();
+        let mut v: Vec<i64> = albums_des_verdicts(&db, &mots, visible)
+            .unwrap()
+            .into_iter()
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(ids(&["verifie"], false), vec![1, 6]);
+    assert_eq!(ids(&["douteux"], false), Vec::<i64>::new());
+    assert_eq!(ids(&["douteux"], true), vec![3]);
+    assert_eq!(ids(&["verifie", "douteux"], true), vec![1, 3, 6]);
+    assert_eq!(ids(&["hires"], true), Vec::<i64>::new());
+    assert_eq!(ids(&[], true), Vec::<i64>::new());
+}

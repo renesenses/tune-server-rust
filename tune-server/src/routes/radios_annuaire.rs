@@ -681,6 +681,10 @@ pub struct FiltresAnnuaire {
     /// #7718 — le niveau de qualité minimal d'au moins un flux.
     pub quality_min: Option<String>,
     pub lossless: Option<bool>,
+    /// Recette rc12 (14/11) — le bouton « Sans perte » (alias de `lossless`).
+    pub sans_perte: Option<bool>,
+    /// Recette rc12 (14/11) — le bouton « Haute qualité » : sans perte ou ≥ 256 kbit/s.
+    pub haute_qualite: Option<bool>,
     pub hires: Option<bool>,
     pub favorites_only: Option<bool>,
     pub rated_min: Option<f64>,
@@ -701,6 +705,7 @@ impl FiltresAnnuaire {
             self.metadata_plus,
         )
         .avec_qualite_min(self.quality_min.as_deref())
+        .avec_boutons_rc12(self.sans_perte, self.haute_qualite)
     }
 }
 
@@ -807,6 +812,14 @@ pub fn corps_annuaire_avec_liens(
             }
         }
     }
+    // Recette rc12 (14/11, Rémi) — le nombre de la puce « Tous les genres » :
+    // la recherche, le pays et les critères, AUCUN genre. Le client ne
+    // l'avait que d'une réponse sans genre ; un genre choisi, il le perdait
+    // dès qu'un autre filtre changeait.
+    let total_tous_genres = qui_cherchent
+        .iter()
+        .filter(|(_, f)| meme_pays(f, &criteres))
+        .count();
     let retenues: Vec<(usize, &StationAnnuaire)> = qui_cherchent
         .into_iter()
         .filter(|(_, f)| meme_pays(f, &criteres) && meme_genre(f, &criteres))
@@ -864,6 +877,7 @@ pub fn corps_annuaire_avec_liens(
     };
     json!({
         "total": total,
+        "total_all_genres": total_tous_genres,
         "offset": offset,
         "limit": limit,
         "count": items.len(),
