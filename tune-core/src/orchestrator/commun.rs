@@ -175,10 +175,22 @@ impl PlaybackOrchestrator {
     }
 
     pub(super) async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
-        if let Some(resolu) = self.reprendre_preparation_fichier(req).await {
-            return resolu;
+        let resolu = match self.reprendre_preparation_fichier(req).await {
+            Some(resolu) => resolu,
+            None => self.resolve_stream_frais(req).await,
+        };
+        // #8701 — le fMP4 DASH de la piste que la zone joue (ou prépare,
+        // `resolve_queue_item_url`) reste servi par le cache du service tant
+        // qu'elle en a besoin : un saut, même après 4 min d'écoute, reprend ce
+        // fichier au lieu de retélécharger tous les segments. Toute autre
+        // source (Qobuz, bibliothèque, radio…) libère la place.
+        if let Ok(ref r) = resolu {
+            crate::audio::dash_epingles::noter_la_piste_resolue(
+                req.zone_id,
+                Some(r.origin_url.as_deref().unwrap_or(&r.url)),
+            );
         }
-        self.resolve_stream_frais(req).await
+        resolu
     }
 
     pub(super) async fn resolve_stream_frais(

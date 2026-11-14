@@ -1001,6 +1001,9 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn advance_queue_metadata(&self, zone_id: i64, position: i64) -> Result<(), String> {
+        // #8701 — l'enchaînement sans blanc : le fMP4 préparé devient celui
+        // de la piste en cours, l'ancien redevient nettoyable.
+        crate::audio::dash_epingles::promouvoir_la_preparee(zone_id);
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
         // #4283 — jumelle de `play_from_queue` : lecture PUIS écriture du
         // curseur.
@@ -1430,6 +1433,22 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn resolve_queue_item_url(
+        &self,
+        zone_id: i64,
+        position: i64,
+    ) -> Result<ResolvedQueueItem, String> {
+        // #8701 — la piste SUIVANTE : son fMP4 DASH prend la place de la
+        // piste préparée, jamais celle de la piste qui joue. Sur le tas : la
+        // résolution est une grosse future, que la portée ne doit pas recopier
+        // sur la pile du sondeur.
+        crate::audio::dash_epingles::pendant_la_preparation(
+            zone_id,
+            Box::pin(self.resoudre_la_suivante_de_la_file(zone_id, position)),
+        )
+        .await
+    }
+
+    async fn resoudre_la_suivante_de_la_file(
         &self,
         zone_id: i64,
         position: i64,
