@@ -3946,6 +3946,11 @@ impl PlaybackOrchestrator {
 
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         let old_stream_id = self.arreter_l_etat_de_la_zone(zone_id).await;
+        // #8701 — zone arrêtée (geste, fin de file, file vidée, suppression) :
+        // ses fMP4 DASH redeviennent nettoyables. Pas dans
+        // `arreter_l_etat_de_la_zone` : une pause qui y passe doit garder le
+        // fichier pour la reprise à la position.
+        crate::audio::dash_epingles::liberer_la_zone(zone_id);
 
         // Resolve device_id: prefer explicit, fall back to zone DB
         let resolved_did = match device_id {

@@ -7,20 +7,24 @@
 //! était retéléchargée (89 segments) avant la moindre note à la nouvelle
 //! position, alors que le fichier complet était toujours sur le disque.
 //!
-//! Chaque zone garde au plus [`PAR_ZONE`] fichiers : la piste en cours et
-//! celle que le gapless prépare. Une nouvelle piste résolue pour la zone
-//! libère la plus ancienne (changement de piste). Une épingle oubliée (zone
-//! arrêtée sans nouvelle piste) ne vaut plus au-delà de [`DUREE_MAX`].
+//! Chaque zone tient au plus deux épingles, chacune à sa place :
+//! - la piste EN COURS ([`noter_la_piste_resolue`] hors préparation) : une
+//!   lecture, un saut, une reprise ;
+//! - la piste PRÉPARÉE par le gapless ([`pendant_la_preparation`]), promue
+//!   piste en cours à l'enchaînement ([`promouvoir_la_preparee`]).
+//!
+//! Préparer la suivante ne déloge donc jamais la piste qui joue. Une
+//! résolution qui ne rend pas de fMP4 DASH (Qobuz, bibliothèque, radio…) vide
+//! sa place ; l'arrêt de la zone, sa suppression ou une file vidée libèrent
+//! les deux ([`liberer_la_zone`]). Une épingle oubliée ne vaut plus au-delà de
+//! [`DUREE_MAX`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// La piste en cours et la suivante préparée par le gapless.
-pub const PAR_ZONE: usize = 2;
-
 /// Au-delà, une épingle ne retient plus le fichier : bien plus longue que
-/// n'importe quelle piste, elle borne ce qu'une zone arrêtée laisse sur le
+/// n'importe quelle piste, elle borne ce qu'une zone oubliée laisse sur le
 /// disque.
 pub const DUREE_MAX: Duration = Duration::from_secs(4 * 3600);
 
@@ -29,9 +33,48 @@ struct Epingle {
     depuis: Instant,
 }
 
-fn registre() -> &'static Mutex<HashMap<i64, VecDeque<Epingle>>> {
-    static R: OnceLock<Mutex<HashMap<i64, VecDeque<Epingle>>>> = OnceLock::new();
+impl Epingle {
+    fn de(chemin: Option<&str>) -> Option<Self> {
+        chemin.map(|c| Self {
+            chemin: c.to_string(),
+            depuis: Instant::now(),
+        })
+    }
+
+    fn vaut(&self, chemin: &str) -> bool {
+        self.chemin == chemin && self.depuis.elapsed() < DUREE_MAX
+    }
+}
+
+#[derive(Default)]
+struct Places {
+    courante: Option<Epingle>,
+    preparee: Option<Epingle>,
+}
+
+fn registre() -> &'static Mutex<HashMap<i64, Places>> {
+    static R: OnceLock<Mutex<HashMap<i64, Places>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn avec_le_registre<T>(f: impl FnOnce(&mut HashMap<i64, Places>) -> T) -> T {
+    f(&mut registre().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+tokio::task_local! {
+    /// Posé autour de la résolution de la piste SUIVANTE (gapless).
+    static EN_PREPARATION: ();
+}
+
+/// Exécute `f` (la résolution de la piste suivante, préparée par le gapless) :
+/// le fichier qu'elle rend prend la place de la piste préparée, jamais celle
+/// de la piste en cours.
+pub async fn pendant_la_preparation<F: std::future::Future>(f: F) -> F::Output {
+    EN_PREPARATION.scope((), f).await
+}
+
+fn en_preparation() -> bool {
+    EN_PREPARATION.try_with(|_| ()).is_ok()
 }
 
 /// Le chemin du fichier DASH désigné par `url_ou_chemin` (`file://…`, avec ou
@@ -46,25 +89,56 @@ fn chemin_dash(url_ou_chemin: &str) -> Option<&str> {
     (nom.starts_with("tune-dash-") && nom.ends_with(".mp4")).then_some(chemin)
 }
 
-/// La zone `zone_id` joue (ou prépare) le fichier DASH `url_ou_chemin` : il
-/// est épinglé. Au-delà de [`PAR_ZONE`] fichiers pour la zone, le plus ancien
-/// est libéré. Sans effet sur une URL qui n'est pas un fMP4 DASH de TIDAL.
-pub fn epingler(zone_id: i64, url_ou_chemin: &str) {
-    let Some(chemin) = chemin_dash(url_ou_chemin) else {
-        return;
-    };
-    let mut r = registre().lock().unwrap_or_else(|e| e.into_inner());
-    let file = r.entry(zone_id).or_default();
-    file.retain(|e| e.chemin != chemin);
-    file.push_back(Epingle {
-        chemin: chemin.to_string(),
-        depuis: Instant::now(),
-    });
-    while file.len() > PAR_ZONE {
-        if let Some(libere) = file.pop_front() {
-            tracing::debug!(zone_id, path = %libere.chemin, "dash_epingle_liberee_8701");
+/// Une piste vient d'être résolue pour la zone : `url` est ce que la source a
+/// rendu (`None`, ou toute URL qui n'est pas un fMP4 DASH de TIDAL : la place
+/// est vidée). Hors préparation, c'est la piste en cours ; pendant
+/// [`pendant_la_preparation`], la suivante.
+pub fn noter_la_piste_resolue(zone_id: i64, url: Option<&str>) {
+    let chemin = url.and_then(chemin_dash);
+    let preparation = en_preparation();
+    avec_le_registre(|r| {
+        let places = r.entry(zone_id).or_default();
+        if preparation {
+            places.preparee = if places.courante.as_ref().map(|e| e.chemin.as_str()) == chemin {
+                None
+            } else {
+                Epingle::de(chemin)
+            };
+        } else {
+            if places.preparee.as_ref().map(|e| e.chemin.as_str()) == chemin {
+                places.preparee = None;
+            }
+            places.courante = Epingle::de(chemin);
         }
-    }
+        if places.courante.is_none() && places.preparee.is_none() {
+            r.remove(&zone_id);
+        }
+    });
+    tracing::debug!(
+        zone_id,
+        preparation,
+        dash = chemin.is_some(),
+        "dash_epingle_notee_8701"
+    );
+}
+
+/// L'enchaînement sans blanc : la piste préparée devient la piste en cours,
+/// l'ancienne est libérée.
+pub fn promouvoir_la_preparee(zone_id: i64) {
+    avec_le_registre(|r| {
+        if let Some(places) = r.get_mut(&zone_id) {
+            places.courante = places.preparee.take();
+            if places.courante.is_none() {
+                r.remove(&zone_id);
+            }
+        }
+    });
+}
+
+/// La zone s'arrête, est supprimée, ou sa file est vidée : ses fichiers
+/// redeviennent nettoyables (ramasse-miettes, TTL du cache d'URL).
+pub fn liberer_la_zone(zone_id: i64) {
+    avec_le_registre(|r| r.remove(&zone_id));
 }
 
 /// Une zone joue-t-elle (ou prépare-t-elle) ce fichier DASH ?
@@ -72,75 +146,98 @@ pub fn est_epingle(url_ou_chemin: &str) -> bool {
     let Some(chemin) = chemin_dash(url_ou_chemin) else {
         return false;
     };
-    let r = registre().lock().unwrap_or_else(|e| e.into_inner());
-    r.values()
-        .flatten()
-        .any(|e| e.chemin == chemin && e.depuis.elapsed() < DUREE_MAX)
-}
-
-/// Libère toutes les épingles de la zone.
-pub fn liberer_la_zone(zone_id: i64) {
-    registre()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&zone_id);
+    avec_le_registre(|r| {
+        r.values().any(|p| {
+            p.courante.as_ref().is_some_and(|e| e.vaut(chemin))
+                || p.preparee.as_ref().is_some_and(|e| e.vaut(chemin))
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Un nom seulement : le registre ne lit que le chemin, aucun fichier
+    /// n'est créé.
     fn chemin(nom: &str) -> String {
-        std::env::temp_dir()
-            .join(format!("tune-dash-{nom}.mp4"))
-            .to_string_lossy()
-            .into_owned()
+        format!("/nulle-part/tune-dash-{nom}.mp4")
     }
 
-    #[test]
-    fn la_piste_en_cours_et_la_suivante_restent_epinglees_8701() {
+    fn courante(zone: i64, c: &str) {
+        noter_la_piste_resolue(zone, Some(&format!("file://{c}")));
+    }
+
+    async fn preparee(zone: i64, c: &str) {
+        pendant_la_preparation(async { noter_la_piste_resolue(zone, Some(c)) }).await;
+    }
+
+    #[tokio::test]
+    async fn preparer_la_suivante_ne_deloge_jamais_la_piste_en_cours_8701() {
         let zone = 870_101;
         let (a, b, c) = (chemin("ep-a"), chemin("ep-b"), chemin("ep-c"));
-        epingler(zone, &format!("file://{a}"));
+        courante(zone, &a);
         assert!(est_epingle(&a));
-        assert!(est_epingle(&format!("file://{a}")));
         assert!(est_epingle(&format!("{a}.decoding")));
-        epingler(zone, &b);
+        preparee(zone, &b).await;
         assert!(est_epingle(&a) && est_epingle(&b), "gapless : A et B");
-        // Changement de piste : C est résolue, A est libérée.
-        epingler(zone, &c);
-        assert!(!est_epingle(&a), "A n'est plus jouée ni préparée");
-        assert!(est_epingle(&b) && est_epingle(&c));
-        // Re-résoudre B (un saut) la rafraîchit sans rien libérer d'autre.
-        epingler(zone, &b);
-        assert!(est_epingle(&b) && est_epingle(&c));
+        // La préparée change (file réordonnée) : A, qui joue, reste.
+        preparee(zone, &c).await;
+        assert!(est_epingle(&a), "la piste en cours a été délogée");
+        assert!(est_epingle(&c) && !est_epingle(&b));
+        // Enchaînement : C joue, A est libérée.
+        promouvoir_la_preparee(zone);
+        assert!(!est_epingle(&a) && est_epingle(&c));
+        // Un saut dans C la garde.
+        courante(zone, &c);
+        assert!(est_epingle(&c));
         liberer_la_zone(zone);
-        assert!(!est_epingle(&b) && !est_epingle(&c));
+        assert!(!est_epingle(&c));
+    }
+
+    #[tokio::test]
+    async fn une_autre_source_libere_sa_place_8701() {
+        let zone = 870_102;
+        let (a, b) = (chemin("ep-src-a"), chemin("ep-src-b"));
+        courante(zone, &a);
+        preparee(zone, &b).await;
+        // La suivante préparée est un FLAC Qobuz : B redevient nettoyable.
+        pendant_la_preparation(async {
+            noter_la_piste_resolue(zone, Some("https://cdn.example/piste.flac"))
+        })
+        .await;
+        assert!(est_epingle(&a) && !est_epingle(&b));
+        // L'utilisateur lance une radio (ou une piste de la bibliothèque).
+        noter_la_piste_resolue(zone, Some("http://radio.example/flux"));
+        assert!(!est_epingle(&a), "la piste TIDAL quittée reste épinglée");
+        noter_la_piste_resolue(zone, Some(&a));
+        noter_la_piste_resolue(zone, None);
+        assert!(!est_epingle(&a));
     }
 
     #[test]
     fn seuls_les_fichiers_dash_de_tidal_s_epinglent_8701() {
-        let zone = 870_102;
-        epingler(zone, "https://cdn.example/piste.flac");
-        epingler(zone, "file:///musique/album/piste.flac");
-        assert!(!est_epingle("https://cdn.example/piste.flac"));
+        let zone = 870_103;
+        noter_la_piste_resolue(zone, Some("file:///musique/album/piste.flac"));
         assert!(!est_epingle("file:///musique/album/piste.flac"));
+        assert!(!est_epingle("https://cdn.example/piste.flac"));
         liberer_la_zone(zone);
     }
 
     #[test]
     fn les_zones_ne_se_liberent_pas_entre_elles_8701() {
-        let (z1, z2) = (870_103, 870_104);
+        let (z1, z2) = (870_104, 870_105);
         let a = chemin("ep-zones-a");
-        epingler(z1, &a);
+        courante(z1, &a);
         for n in 0..5 {
-            epingler(z2, &chemin(&format!("ep-zones-{n}")));
+            courante(z2, &chemin(&format!("ep-zones-{n}")));
         }
+        liberer_la_zone(z2);
         assert!(
             est_epingle(&a),
             "une autre zone ne libère pas le fichier de z1"
         );
         liberer_la_zone(z1);
-        liberer_la_zone(z2);
+        assert!(!est_epingle(&a));
     }
 }

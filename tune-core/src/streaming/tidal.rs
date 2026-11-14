@@ -3766,8 +3766,14 @@ impl GardeCroissance {
 
     /// Plus personne ne lit ni n'attend : la garde tient la seule référence
     /// restante et le suivi n'a pas d'attendant.
+    ///
+    /// #8701 — et aucune zone ne joue ce fichier : entre l'ancien décodeur
+    /// lâché par un saut et le nouveau qui reprend la poignée, la piste reste
+    /// épinglée, son téléchargement n'est pas abandonné.
     fn personne_ne_lit(&self) -> bool {
-        self.growth().abandonnee() && !self.suivi.attendu()
+        self.growth().abandonnee()
+            && !self.suivi.attendu()
+            && !crate::audio::dash_epingles::est_epingle(&self.path)
     }
 
     fn finir(mut self) {

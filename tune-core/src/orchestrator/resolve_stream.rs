@@ -754,11 +754,6 @@ impl PlaybackOrchestrator {
             source_id,
         )
         .await;
-        // #8701 — le fMP4 DASH de la piste que la zone joue (ou prépare)
-        // reste servi par le cache du service tant qu'elle en a besoin : un
-        // saut, même après 4 min d'écoute, reprend ce fichier au lieu de
-        // retélécharger tous les segments. Libéré au changement de piste.
-        crate::audio::dash_epingles::epingler(req.zone_id, &stream_data.url);
         let quality_observation = quality_preference.observe(service_name, &stream_data);
 
         info!(

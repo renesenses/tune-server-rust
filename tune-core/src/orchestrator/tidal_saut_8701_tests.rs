@@ -400,3 +400,80 @@ async fn un_saut_au_dela_du_telecharge_n_attend_que_son_segment_8701() {
     let lu = lire_jusqu_a_la_fin(&s, debut).await;
     assert_depart_a(&lu, pcm.len(), 15);
 }
+
+/// Le chemin du fMP4 DASH qu'une résolution de piste TIDAL a rendu.
+fn fichier_dash(r: &super::ResolvedStream) -> String {
+    r.origin_url
+        .as_deref()
+        .and_then(|u| u.strip_prefix("file://"))
+        .expect("la piste TIDAL est servie depuis son fMP4 DASH")
+        .to_string()
+}
+
+/// (3) L'épingle ne survit pas à la zone qui joue : l'arrêt la libère, un
+/// saut la reprend, et une piste d'une autre source (ici un fichier
+/// téléversé) libère le fMP4 de la piste TIDAL quittée. Le fichier
+/// redevient alors nettoyable (ramasse-miettes, TTL du cache d'URL).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l_arret_et_une_autre_source_liberent_le_fichier_8701() {
+    let pcm = pcm_cd();
+    let piste = Arc::new(decouper(&flac_cd(&pcm).await));
+    let cdn = faux_tidal(piste, usize::MAX).await;
+    let orch = orchestrateur();
+    let mut req = zone_locale(
+        &orch,
+        TidalService::pour_un_faux_tidal(cdn.base.clone()),
+        Some(8_701_100),
+    )
+    .await;
+    let premier = orch.resolve_stream(&req).await.expect("lecture");
+    let chemin = fichier_dash(&premier);
+    let s = session(&orch, &premier.stream_id.clone().expect("session")).await;
+    let _ = lire_jusqu_a_la_fin(&s, Vec::new()).await;
+    assert!(crate::audio::dash_epingles::est_epingle(&chemin));
+
+    orch.stop(req.zone_id, None).await;
+    assert!(
+        !crate::audio::dash_epingles::est_epingle(&chemin),
+        "zone arrêtée : son fMP4 reste épinglé"
+    );
+
+    // Relancée à 20 s : le fichier du cache sert, et il est de nouveau retenu.
+    req.seek_ms = Some(20_000);
+    let saut = orch.resolve_stream(&req).await.expect("saut");
+    assert_eq!(fichier_dash(&saut), chemin);
+    assert_eq!(cdn.inits.load(Ordering::SeqCst), 1);
+    assert!(crate::audio::dash_epingles::est_epingle(&chemin));
+    if let Some(sid) = saut.stream_id.as_deref() {
+        orch.streamer.remove_session(sid).await;
+    }
+
+    // Une piste d'une autre source : un WAV téléversé.
+    let wav = crate::test_scratch::scratch_file("tune-8701-autre-source", ".wav");
+    let silence = vec![0u8; SR as usize * 4];
+    std::fs::write(
+        &*wav,
+        [
+            crate::audio::wav::build_wav_header_with_data_size(2, SR, 16, silence.len() as u32)
+                .to_vec(),
+            silence,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let autre = PlayRequest {
+        source: Some("upload".into()),
+        source_id: Some(wav.to_string_lossy().into_owned()),
+        seek_ms: None,
+        title: Some("Autre source".into()),
+        ..req.clone()
+    };
+    orch.resolve_stream(&autre)
+        .await
+        .expect("fichier téléversé");
+    assert!(
+        !crate::audio::dash_epingles::est_epingle(&chemin),
+        "la piste TIDAL quittée pour une autre source reste épinglée"
+    );
+    let _ = std::fs::remove_file(&chemin);
+}
