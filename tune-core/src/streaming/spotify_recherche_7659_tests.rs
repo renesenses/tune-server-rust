@@ -212,5 +212,7 @@ async fn un_refus_persistant_donne_le_message_de_spotify_7659() {
     assert!(erreur.contains("429"), "{erreur}");
     // #8766 — `api_get` réessaie lui-même le 429 (`ESSAIS_429` appels) ;
     // l'attente de l'appareil s'arrête ensuite au lieu de redemander.
-    assert_eq!(*appels.lock().unwrap(), ESSAIS_429 as usize);
+    // (le budget des 429 peut l'arrêter un essai plus tôt).
+    let n = *appels.lock().unwrap();
+    assert!((2..=ESSAIS_429 as usize).contains(&n), "{n} appels");
 }

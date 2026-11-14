@@ -94,6 +94,9 @@ pub struct SpotifyService {
     /// #8766 — l'unité des attentes après un `429` : une seconde, raccourcie
     /// par les essais pour ne pas attendre pour de vrai.
     seconde_429: std::time::Duration,
+    /// #8766 — fin de la pénalité d'un `429` abandonné : avant elle, aucun
+    /// `GET` ne repart vers Spotify.
+    penalite_429: std::sync::Mutex<Option<std::time::Instant>>,
     /// #6933 — les portées que Spotify dit avoir ACCORDÉES (champ `scope`
     /// de la réponse du jeton, à l'échange comme au rafraîchissement).
     /// `None` : inconnues (liaison restaurée d'une version qui ne les gardait
@@ -381,7 +384,30 @@ async fn requete_api(
 /// #8766 — essais au plus d'un `GET` de l'API Web refusé en `429`, le
 /// premier compris.
 const ESSAIS_429: u32 = 4;
-/// #8766 — le début du message d'un `429` dont les essais sont épuisés.
+/// #8766 — budget d'un appel (ou d'une liste paginée) refusé en `429`,
+/// attentes comprises, en secondes.
+const BUDGET_429_SECS: u32 = 10;
+
+/// #8766 — le temps qu'un appel peut encore passer à attendre un `429`.
+struct Budget429 {
+    debut: std::time::Instant,
+    total: std::time::Duration,
+}
+
+impl Budget429 {
+    fn nouveau(seconde: std::time::Duration) -> Self {
+        Self {
+            debut: std::time::Instant::now(),
+            total: seconde.saturating_mul(BUDGET_429_SECS),
+        }
+    }
+
+    fn restant(&self) -> std::time::Duration {
+        self.total.saturating_sub(self.debut.elapsed())
+    }
+}
+
+/// #8766 — le début du message d'un `429` abandonné.
 const LIMITE_429: &str = "Spotify limite temporairement les demandes";
 /// #8766 — plafond d'une attente demandée par `Retry-After`, en secondes.
 const RETRY_AFTER_MAX_SECS: u64 = 60;
@@ -732,6 +758,7 @@ impl SpotifyService {
             enabled_override: None,
             token_rejected: Arc::new(AtomicBool::new(false)),
             seconde_429: std::time::Duration::from_secs(1),
+            penalite_429: std::sync::Mutex::new(None),
             portees: None,
             plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
             session_refusee: false,
@@ -846,42 +873,58 @@ impl SpotifyService {
 
     /// [`Self::api_get`], le statut HTTP lisible ([`ErreurApi`]).
     ///
-    /// #8766 — un `429` (« Too many requests ») est réessayé, au plus
-    /// [`ESSAIS_429`] appels en tout, après l'attente de [`attente_429`] :
-    /// `Retry-After` quand Spotify l'envoie, sinon une attente croissante.
-    /// Après le dernier `429`, l'erreur le dit en clair, statut 429 gardé ;
-    /// jamais une liste vide.
+    /// #8766 — un `429` (« Too many requests ») est réessayé : au plus
+    /// [`ESSAIS_429`] appels, et dans un budget de [`BUDGET_429_SECS`]
+    /// attentes comprises ([`Budget429`]). L'appelant tient le verrou en
+    /// lecture du service pendant l'appel (`&self`) : le budget borne ce que
+    /// le verrou peut attendre. Un `Retry-After` plus long que le budget
+    /// restant abandonne tout de suite, et la pénalité est retenue : aucun
+    /// appel ne repart vers Spotify avant sa fin. L'erreur le dit en clair,
+    /// statut 429 gardé ; jamais une liste vide.
     async fn api_get_detaille(&self, path: &str) -> Result<serde_json::Value, ErreurApi> {
+        let mut budget = Budget429::nouveau(self.seconde_429);
+        self.api_get_avec_budget(path, &mut budget).await
+    }
+
+    /// #8766 — [`Self::api_get_detaille`] dans un budget fourni : une liste
+    /// paginée partage UN budget entre toutes ses pages.
+    async fn api_get_avec_budget(
+        &self,
+        path: &str,
+        budget: &mut Budget429,
+    ) -> Result<serde_json::Value, ErreurApi> {
         let token = self
             .access_token
             .as_deref()
             .ok_or_else(|| ErreurApi::sans_statut("not authenticated"))?;
+        let route = path.split('?').next().unwrap_or(path);
         let mut essai = 0u32;
         loop {
+            if let Some(reste) = self.penalite_429_restante() {
+                return Err(self.erreur_limite(route, reste, None));
+            }
             let reponse = requete_api(&self.client, &self.api_base, token, path, None).await;
             match reponse {
                 Err(e) if e.statut == Some(429) => {
                     essai += 1;
-                    let route = path.split('?').next().unwrap_or(path);
-                    if essai >= ESSAIS_429 {
-                        let quand = match e.reessayer_apres {
-                            Some(n) => format!("dans {n} s"),
-                            None => "dans une minute".to_owned(),
-                        };
-                        warn!(route, essais = essai, "spotify_429_abandon");
-                        return Err(ErreurApi {
-                            statut: Some(429),
-                            message: format!(
-                                "{LIMITE_429} (HTTP 429 sur {route}, {essai} essais) : \
-                                 réessayez {quand}"
-                            ),
-                            reessayer_apres: e.reessayer_apres,
-                        });
-                    }
                     let [alea] = octets_aleatoires::<1>();
                     let secs = attente_429(essai - 1, e.reessayer_apres, alea);
+                    let attente = self.seconde_429.mul_f64(secs);
+                    // La pénalité annoncée entière (un `Retry-After` de
+                    // plusieurs heures vaut), l'attente seule est plafonnée.
+                    let penalite = match e.reessayer_apres {
+                        Some(n) => self
+                            .seconde_429
+                            .saturating_mul(u32::try_from(n).unwrap_or(u32::MAX)),
+                        None => attente,
+                    };
+                    if essai >= ESSAIS_429 || attente > budget.restant() {
+                        self.poser_penalite_429(penalite);
+                        warn!(route, essais = essai, retry_after = ?e.reessayer_apres, "spotify_429_abandon");
+                        return Err(self.erreur_limite(route, penalite, e.reessayer_apres));
+                    }
                     warn!(route, essai, attente_s = secs, "spotify_429_nouvel_essai");
-                    tokio::time::sleep(self.seconde_429.mul_f64(secs)).await;
+                    tokio::time::sleep(attente).await;
                 }
                 autre => {
                     if matches!(&autre, Err(e) if e.jeton_refuse()) {
@@ -890,6 +933,36 @@ impl SpotifyService {
                     return autre;
                 }
             }
+        }
+    }
+
+    /// #8766 — ce qui reste de la pénalité d'un `429` abandonné, s'il en reste.
+    fn penalite_429_restante(&self) -> Option<std::time::Duration> {
+        let fin = (*self.penalite_429.lock().unwrap_or_else(|e| e.into_inner()))?;
+        fin.checked_duration_since(std::time::Instant::now())
+            .filter(|reste| !reste.is_zero())
+    }
+
+    fn poser_penalite_429(&self, duree: std::time::Duration) {
+        let fin = std::time::Instant::now().checked_add(duree);
+        *self.penalite_429.lock().unwrap_or_else(|e| e.into_inner()) = fin;
+    }
+
+    /// #8766 — « Spotify limite temporairement les demandes : réessayez dans
+    /// N s », N en secondes entières (au moins 1).
+    fn erreur_limite(
+        &self,
+        route: &str,
+        reste: std::time::Duration,
+        reessayer_apres: Option<u64>,
+    ) -> ErreurApi {
+        let unite = self.seconde_429.as_secs_f64().max(f64::MIN_POSITIVE);
+        let n =
+            reessayer_apres.unwrap_or_else(|| (reste.as_secs_f64() / unite).ceil().max(1.0) as u64);
+        ErreurApi {
+            statut: Some(429),
+            message: format!("{LIMITE_429} : réessayez dans {n} s (HTTP 429, {route})"),
+            reessayer_apres: Some(n),
         }
     }
 
@@ -923,13 +996,19 @@ impl SpotifyService {
         let mut offset = 0usize;
         let mut total: Option<usize> = None;
         let mut termine = false;
+        // #8766 — un seul budget de 429 pour toute la liste, pas un par page.
+        let mut budget = Budget429::nouveau(self.seconde_429);
         for _ in 0..Self::PAGES_UTILISATEUR_MAX {
             let data = self
-                .api_get(&format!(
-                    "{chemin}{separateur}limit={}&offset={offset}",
-                    Self::PAGE_UTILISATEUR
-                ))
-                .await?;
+                .api_get_avec_budget(
+                    &format!(
+                        "{chemin}{separateur}limit={}&offset={offset}",
+                        Self::PAGE_UTILISATEUR
+                    ),
+                    &mut budget,
+                )
+                .await
+                .map_err(|e| e.message)?;
             let lot = data["items"].as_array().cloned().unwrap_or_default();
             let recus = lot.len();
             offset += recus;
@@ -980,17 +1059,23 @@ impl SpotifyService {
         let mut items: Vec<serde_json::Value> = Vec::new();
         let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut apres: Option<String> = None;
+        // #8766 — un seul budget de 429 pour toute la liste, pas un par page.
+        let mut budget = Budget429::nouveau(self.seconde_429);
         for _ in 0..Self::PAGES_UTILISATEUR_MAX {
             let curseur = apres
                 .as_deref()
                 .map(|a| format!("&after={}", urlencoding::encode(a)))
                 .unwrap_or_default();
             let data = self
-                .api_get(&format!(
-                    "/me/following?type=artist&limit={}{curseur}",
-                    Self::PAGE_UTILISATEUR
-                ))
-                .await?;
+                .api_get_avec_budget(
+                    &format!(
+                        "/me/following?type=artist&limit={}{curseur}",
+                        Self::PAGE_UTILISATEUR
+                    ),
+                    &mut budget,
+                )
+                .await
+                .map_err(|e| e.message)?;
             let page = &data["artists"];
             let lot = page["items"].as_array().cloned().unwrap_or_default();
             let recus = lot.len();
@@ -3714,17 +3799,26 @@ mod tests {
     async fn spotify_8766_faux_serveur(
         reponses: Vec<(u16, Option<&'static str>)>,
     ) -> (String, Arc<std::sync::Mutex<Vec<std::time::Instant>>>) {
+        spotify_8766_faux_serveur_pagine(reponses, 1).await
+    }
+
+    /// #8766 — [`spotify_8766_faux_serveur`], chaque 200 annonçant `total`
+    /// titres (une page d'un titre neuf à chaque fois).
+    async fn spotify_8766_faux_serveur_pagine(
+        reponses: Vec<(u16, Option<&'static str>)>,
+        total: u64,
+    ) -> (String, Arc<std::sync::Mutex<Vec<std::time::Instant>>>) {
         type Etat = (
             Arc<Vec<(u16, Option<&'static str>)>>,
             Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
         );
         let appels = Arc::new(std::sync::Mutex::new(Vec::new()));
         let etat: Etat = (Arc::new(reponses), Arc::clone(&appels));
+        // Toute route (`/me/tracks`, `/me/albums`, `/me/following`) compte :
+        // un appel parti pendant une pénalité se verrait.
         let app = axum::Router::new()
-            .route(
-                "/v1/me/tracks",
-                axum::routing::get(
-                    |axum::extract::State((reponses, appels)): axum::extract::State<Etat>| async move {
+            .fallback(
+                    move |axum::extract::State((reponses, appels)): axum::extract::State<Etat>| async move {
                         let rang = {
                             let mut a = appels.lock().unwrap();
                             a.push(std::time::Instant::now());
@@ -3737,10 +3831,10 @@ mod tests {
                         }
                         let corps = if statut == 200 {
                             json!({"items": [{"track": {
-                                "id": "t1", "name": "Titre", "duration_ms": 1000,
+                                "id": format!("t{rang}"), "name": "Titre", "duration_ms": 1000,
                                 "artists": [{"name": "Artiste"}],
                                 "album": {"id": "a1", "name": "Album", "images": []}
-                            }}], "total": 1, "next": null})
+                            }}], "total": total, "next": null})
                         } else {
                             json!({"error": {"status": statut, "message": "Too many requests"}})
                         };
@@ -3748,7 +3842,6 @@ mod tests {
                             .body(axum::body::Body::from(corps.to_string()))
                             .unwrap()
                     },
-                ),
             )
             .with_state(etat);
         let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3767,11 +3860,11 @@ mod tests {
         svc
     }
 
-    /// #8766 — fil 2828 : un 429 avec `Retry-After: 30` n'est pas rappelé
-    /// avant 30 « secondes », puis le 200 rend les favoris.
+    /// #8766 — un 429 avec un `Retry-After` court (dans le budget) est
+    /// attendu, puis le 200 rend les favoris.
     #[tokio::test]
     async fn spotify_8766_un_429_avec_retry_after_attend_puis_rend_les_favoris() {
-        let (base, appels) = spotify_8766_faux_serveur(vec![(429, Some("30")), (200, None)]).await;
+        let (base, appels) = spotify_8766_faux_serveur(vec![(429, Some("5")), (200, None)]).await;
         let svc = spotify_8766_service(&base);
         let titres = svc
             .get_user_tracks()
@@ -3782,9 +3875,59 @@ mod tests {
         assert_eq!(appels.len(), 2, "un seul nouvel essai");
         let ecart = appels[1] - appels[0];
         assert!(
-            ecart >= std::time::Duration::from_millis(300),
-            "Retry-After: 30 non respecté : rappel après {ecart:?}"
+            ecart >= std::time::Duration::from_millis(50),
+            "Retry-After: 5 non respecté : rappel après {ecart:?}"
         );
+    }
+
+    /// #8766 — fil 2828 (preuve de l'issue) : `Retry-After: 30` dépasse le
+    /// budget de 10 s. Abandon tout de suite, puis AUCUN appel à Spotify avant
+    /// la fin des 30 s ; ensuite, les favoris reviennent.
+    #[tokio::test]
+    async fn spotify_8766_retry_after_30_pas_de_rappel_avant_la_fin_puis_reprise() {
+        let (base, appels) = spotify_8766_faux_serveur(vec![(429, Some("30")), (200, None)]).await;
+        let svc = spotify_8766_service(&base);
+        let err = svc.get_user_tracks().await.expect_err("abandon immédiat");
+        assert!(err.to_string().contains("réessayez dans 30 s"), "{err}");
+        let err = svc.get_user_tracks().await.expect_err("pénalité en cours");
+        assert!(err.to_string().contains("429"), "{err}");
+        assert_eq!(
+            appels.lock().unwrap().len(),
+            1,
+            "aucun rappel pendant la pénalité"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+        let titres = svc.get_user_tracks().await.expect("pénalité finie");
+        assert_eq!(titres.len(), 1);
+        let appels = appels.lock().unwrap().clone();
+        assert_eq!(appels.len(), 2);
+        assert!(appels[1] - appels[0] >= std::time::Duration::from_millis(300));
+    }
+
+    /// #8766 — revue : un `Retry-After` de 120 s abandonne tout de suite,
+    /// sans attendre, avec l'erreur claire.
+    #[tokio::test]
+    async fn spotify_8766_retry_after_120_abandonne_sans_attendre() {
+        let (base, appels) = spotify_8766_faux_serveur(vec![(429, Some("120"))]).await;
+        let svc = spotify_8766_service(&base);
+        let debut = std::time::Instant::now();
+        let err = svc
+            .api_get_detaille("/me/tracks")
+            .await
+            .expect_err("#8766 : un Retry-After hors budget abandonne");
+        let duree = debut.elapsed();
+        assert_eq!(err.statut, Some(429));
+        assert!(
+            err.message
+                .starts_with("Spotify limite temporairement les demandes : réessayez dans 120 s"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("jeton"), "{}", err.message);
+        assert_eq!(appels.lock().unwrap().len(), 1);
+        // Une attente d'une « seconde » (10 ms) aurait suffi à dépasser 10 ms ;
+        // 120 « secondes » valent 1,2 s.
+        assert!(duree < std::time::Duration::from_millis(500), "{duree:?}");
     }
 
     /// #8766 — un 429 sans `Retry-After` est réessayé après l'attente
@@ -3803,30 +3946,81 @@ mod tests {
     }
 
     /// #8766 — un 429 répété : 4 appels au plus, puis une erreur claire
-    /// (statut 429, « limite temporairement »), jamais une liste vide.
+    /// (statut 429), jamais une liste vide.
     #[tokio::test]
     async fn spotify_8766_un_429_repete_abandonne_apres_4_essais_avec_une_erreur_claire() {
         let (base, appels) = spotify_8766_faux_serveur(vec![(429, Some("1"))]).await;
         let svc = spotify_8766_service(&base);
         let err = svc
-            .api_get_detaille("/me/tracks?limit=50&offset=0")
-            .await
-            .expect_err("#8766 : un 429 répété doit finir en erreur");
-        assert_eq!(err.statut, Some(429));
-        assert!(
-            err.message.contains("limite temporairement") && err.message.contains("4 essais"),
-            "{}",
-            err.message
-        );
-        assert!(err.message.contains("dans 1 s"), "{}", err.message);
-        assert!(!err.message.contains("jeton"), "{}", err.message);
-        let err = svc
             .get_user_tracks()
             .await
             .expect_err("#8766 : pas de liste vide présentée comme un succès")
             .to_string();
+        assert!(
+            err.contains("limite temporairement") && err.contains("réessayez dans 1 s"),
+            "{err}"
+        );
         assert!(err.contains("429"), "{err}");
-        assert_eq!(appels.lock().unwrap().len(), 2 * ESSAIS_429 as usize);
+        assert_eq!(appels.lock().unwrap().len(), ESSAIS_429 as usize);
+    }
+
+    /// #8766 — revue : des 429 courts répétés qui dépassent le budget
+    /// abandonnent avant le 4e essai. Unité de 20 ms : budget de 200 ms,
+    /// `Retry-After: 4` vaut 80 ms ; après deux attentes, il reste moins de
+    /// 80 ms.
+    #[tokio::test]
+    async fn spotify_8766_des_429_courts_au_dela_du_budget_abandonnent() {
+        let (base, appels) = spotify_8766_faux_serveur(vec![(429, Some("4"))]).await;
+        let mut svc = spotify_8766_service(&base);
+        svc.seconde_429 = std::time::Duration::from_millis(20);
+        let debut = std::time::Instant::now();
+        let err = svc
+            .api_get_detaille("/me/tracks")
+            .await
+            .expect_err("budget dépassé");
+        let duree = debut.elapsed();
+        assert!(
+            err.message.contains("réessayez dans 4 s"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            appels.lock().unwrap().len(),
+            3,
+            "abandon au 3e 429, avant le 4e essai"
+        );
+        assert!(duree < std::time::Duration::from_millis(400), "{duree:?}");
+    }
+
+    /// #8766 — revue : la pagination des favoris partage UN budget. Chaque
+    /// page passe par un 429 (`Retry-After: 4`, 80 ms) : sans budget commun,
+    /// les 200 pages attendraient 16 s ; ici la liste s'arrête dans le budget
+    /// (200 ms), et la pénalité laisse les deux listes suivantes de la
+    /// reprise échouer sans rappeler Spotify.
+    #[tokio::test]
+    async fn spotify_8766_la_pagination_partage_un_seul_budget() {
+        let mut reponses = Vec::new();
+        for _ in 0..50 {
+            reponses.push((429, Some("4")));
+            reponses.push((200, None));
+        }
+        let (base, appels) = spotify_8766_faux_serveur_pagine(reponses, 1000).await;
+        let mut svc = spotify_8766_service(&base);
+        svc.seconde_429 = std::time::Duration::from_millis(20);
+        let debut = std::time::Instant::now();
+        let err = svc
+            .get_user_tracks()
+            .await
+            .expect_err("budget de la liste épuisé");
+        let duree = debut.elapsed();
+        assert!(err.to_string().contains("429"), "{err}");
+        assert!(duree < std::time::Duration::from_millis(400), "{duree:?}");
+        let n = appels.lock().unwrap().len();
+        assert!(n <= 6, "{n} appels : le budget s'est cumulé par page");
+        // Les deux autres listes de la reprise, dans la pénalité : aucun appel.
+        assert!(svc.get_user_albums().await.is_err());
+        assert!(svc.get_user_artists().await.is_err());
+        assert_eq!(appels.lock().unwrap().len(), n);
     }
 
     /// #8766 — les attentes : `Retry-After` plafonné à 60 s ; sans lui, 1, 2,
