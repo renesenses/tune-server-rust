@@ -1036,6 +1036,9 @@ impl OutputTarget for OaatOutput {
             let mesure = endpoint.clock_measurement().await;
             let avance_pts_ns =
                 avance_demarrage_7331(mesure.as_ref().map(|m| (m.rtt_ns, m.jitter_ns)));
+            // #7330 — PTS du dernier paquet envoyé : la fin naturelle attend
+            // son échéance avant `stop` (qui purge la file du récepteur).
+            let mut fin_jouee = super::fin_jouee_7330::FinJouee::default();
 
             let http_client = crate::http::client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -1596,6 +1599,7 @@ impl OutputTarget for OaatOutput {
                                 {
                                     break;
                                 }
+                                fin_jouee.observer(pts_ns);
 
                                 sample_offset += bits_this as u64;
                                 diag.packets_sent.fetch_add(1, Ordering::Relaxed);
@@ -1722,6 +1726,7 @@ impl OutputTarget for OaatOutput {
                             )
                             .await
                             .ok();
+                        fin_jouee.attendre_avant_stop(&device_name).await;
                         endpoint.send_stop(&stream_id).await.ok();
                         playing.store(false, Ordering::SeqCst);
                         diag.connected.store(false, Ordering::SeqCst);
@@ -2329,6 +2334,7 @@ impl OutputTarget for OaatOutput {
                         {
                             break;
                         }
+                        fin_jouee.observer(pts_ns);
 
                         offset += chunk_bytes;
                         sample_offset += chunk_samples as u64;
@@ -2372,6 +2378,7 @@ impl OutputTarget for OaatOutput {
                         )
                         .await
                         .ok();
+                    fin_jouee.attendre_avant_stop(&device_name).await;
                     endpoint.send_stop(&stream_id).await.ok();
                     playing.store(false, Ordering::SeqCst);
                     diag.connected.store(false, Ordering::SeqCst);
@@ -3168,7 +3175,9 @@ impl OutputTarget for OaatOutput {
                                     if paquet.dernier {
                                         flags |= PacketFlags::LAST_PACKET;
                                     }
-                                    let _ = endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await;
+                                    if endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await.is_ok() {
+                                        fin_jouee.observer(pts_ns);
+                                    }
                                     if uses_byte_offset { byte_offset += payload.len() as u64; }
                                     else { sample_offset += (payload.len() / bytes_per_frame) as u64; }
                                     position_ms.store(
@@ -3414,6 +3423,7 @@ impl OutputTarget for OaatOutput {
 
                             match endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await {
                                 Ok(()) => {
+                                    fin_jouee.observer(pts_ns);
                                     reconnect_attempts = 0;
                                     diag.packets_sent.fetch_add(1, Ordering::Relaxed);
                                     diag.bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -3542,6 +3552,9 @@ impl OutputTarget for OaatOutput {
             // exit without a transition opens it.
             if !exited_on_stop {
                 chain_exhausted.store(true, Ordering::SeqCst);
+                // #7330 — fin naturelle : laisser jouer la file du récepteur
+                // jusqu'au dernier échantillon avant de la purger.
+                fin_jouee.attendre_avant_stop(&device_name).await;
             }
 
             endpoint.send_stop(&stream_id).await.ok();
