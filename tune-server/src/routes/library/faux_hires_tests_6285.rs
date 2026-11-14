@@ -337,3 +337,11 @@ async fn le_filtre_de_la_liste_sur_le_verdict_hires_6285() {
     let page = get(&app, "/api/v1/library/albums").await;
     assert_eq!(ids(&page), vec![5, 6, 7, 8], "{page}");
 }
+
+/// rc12 — l'état annonce que le catalogue imprimable suit `hires_verdict=`.
+#[tokio::test]
+async fn l_etat_annonce_le_filtre_du_catalogue_rc12() {
+    let (app, _) = banc();
+    let c = get(&app, "/api/v1/library/hires-check").await;
+    assert_eq!(c["catalogue_hires_verdict"], true, "{c}");
+}
