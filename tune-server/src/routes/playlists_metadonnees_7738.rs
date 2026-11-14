@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tune_core::db::play_queue_repo::QueueInput;
 use tune_core::streaming::traits::StreamTrack;
 
 #[derive(Default)]
@@ -24,62 +25,12 @@ async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static 
     if !items.iter().any(|v| v["source"] == nom) {
         return;
     }
-    // Ne jamais tenir le registre pendant les échanges réseau.
-    let service = { state.services.lock().await.get(nom) };
-    let Some(service) = service else { return };
-    let service = service.read().await;
-    if !service.enabled() || !service.auth_status().await.authenticated {
-        return;
-    }
-    let mut ids = items
+    let ids = items
         .iter()
         .filter(|v| v["source"] == nom)
         .filter_map(|v| v["source_id"].as_str().map(str::to_owned))
         .collect::<Vec<_>>();
-    ids.sort();
-    ids.dedup();
-    let mut connus = HashMap::new();
-    {
-        let mut cache = state.metadonnees_playlists.0.lock().await;
-        cache.retain(|_, (date, _)| date.elapsed() < Duration::from_secs(300));
-        ids.retain(|id| {
-            if let Some((_, piste)) = cache.get(&cle(nom, id)) {
-                connus.insert(id.clone(), piste.clone());
-                false
-            } else {
-                true
-            }
-        });
-    }
-    // Quatre requêtes au plus ; un service en panne ne bloque pas indéfiniment
-    // la fiche. Les succès partiels restent en cache pour la lecture suivante.
-    let lectures = stream::iter(ids.into_iter().map(|id| {
-        let service = &service;
-        async move {
-            let piste = tokio::time::timeout(Duration::from_secs(3), service.get_track(&id)).await;
-            (id, piste)
-        }
-    }))
-    .buffer_unordered(4);
-    tokio::pin!(lectures);
-    let limite = tokio::time::Instant::now() + Duration::from_secs(30);
-    while let Ok(Some((id, resultat))) = tokio::time::timeout_at(limite, lectures.next()).await {
-        let Ok(Ok(piste)) = resultat else { continue };
-        if piste.id != id {
-            continue;
-        }
-        let mut cache = state.metadonnees_playlists.0.lock().await;
-        if cache.len() >= 4096
-            && let Some(ancienne) = cache
-                .iter()
-                .min_by_key(|(_, (date, _))| *date)
-                .map(|(id, _)| id.clone())
-        {
-            cache.remove(&ancienne);
-        }
-        cache.insert(cle(nom, &id), (Instant::now(), piste.clone()));
-        connus.insert(id, piste);
-    }
+    let connus = pistes_du_service(state, nom, ids, Duration::from_secs(30)).await;
     for ligne in items {
         if ligne["source"] != nom {
             continue;
@@ -113,6 +64,149 @@ async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static 
             }
         }
     }
+}
+
+/// Recette du 14/11 (rc12) — « À suivre » et la file montraient 0:00 sur les
+/// titres Qobuz d'une playlist locale (« Caipirinha », « I Can't Go For
+/// That », « Giorgio by Moroder »). Leur ligne de playlist ne porte aucune
+/// durée (`playlist_tracks.duration_ms` vide ou 0) : la fiche
+/// `GET /playlists/{id}/tracks` la complète à la lecture ([`completer`]), mais
+/// la FILE est écrite depuis les lignes brutes (`entrees_de_file`) et gardait
+/// ce zéro.
+///
+/// Les lignes Qobuz de la file sans durée sont donc complétées ici, depuis le
+/// même cache que la fiche (la playlist vient presque toujours d'être
+/// affichée : aucune requête), puis depuis le catalogue dans un budget court —
+/// la lecture ne doit pas attendre. Une ligne que le catalogue ne rend pas
+/// garde ce qu'elle avait. Seule une ligne SANS DURÉE est cherchée ; on en
+/// profite pour remplir ses autres cases vides (pochette, album), jamais pour
+/// réécrire ce que la playlist porte déjà.
+pub(crate) async fn completer_file(state: &AppState, items: &mut [QueueInput]) {
+    const NOM: &str = "qobuz";
+    let a_completer = |item: &QueueInput| match item {
+        QueueInput::Streaming {
+            source,
+            duration_ms,
+            ..
+        } => source == NOM && *duration_ms <= 0,
+        QueueInput::Local { .. } => false,
+    };
+    let ids: Vec<String> = items
+        .iter()
+        .filter(|i| a_completer(i))
+        .filter_map(|i| match i {
+            QueueInput::Streaming { source_id, .. } => Some(source_id.clone()),
+            QueueInput::Local { .. } => None,
+        })
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let connus = pistes_du_service(state, NOM, ids, Duration::from_secs(5)).await;
+    for item in items.iter_mut() {
+        if !a_completer(item) {
+            continue;
+        }
+        let QueueInput::Streaming {
+            source_id,
+            title,
+            artist,
+            album,
+            cover_url,
+            duration_ms,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let Some(piste) = connus.get(source_id.as_str()) else {
+            continue;
+        };
+        if *duration_ms <= 0 && piste.duration_ms > 0 {
+            *duration_ms = i64::try_from(piste.duration_ms).unwrap_or(i64::MAX);
+        }
+        if cover_url.as_deref().unwrap_or("").is_empty()
+            && let Some(c) = piste.cover_path.as_deref().filter(|c| !c.is_empty())
+        {
+            *cover_url = Some(c.to_owned());
+        }
+        if album.as_deref().unwrap_or("").is_empty()
+            && let Some(a) = piste.album.as_deref().filter(|a| !a.is_empty())
+        {
+            *album = Some(a.to_owned());
+        }
+        if artist.is_empty() && !piste.artist.is_empty() {
+            *artist = piste.artist.clone();
+        }
+        if title.is_empty() && !piste.title.is_empty() {
+            *title = piste.title.clone();
+        }
+    }
+}
+
+/// Les fiches catalogue de `ids` chez le service `nom` : le cache de cinq
+/// minutes d'abord, puis le service, quatre requêtes au plus, dans la limite
+/// de `budget`. Un service absent, désactivé ou déconnecté ne rend rien.
+async fn pistes_du_service(
+    state: &AppState,
+    nom: &'static str,
+    mut ids: Vec<String>,
+    budget: Duration,
+) -> HashMap<String, StreamTrack> {
+    // Ne jamais tenir le registre pendant les échanges réseau.
+    let service = { state.services.lock().await.get(nom) };
+    let Some(service) = service else {
+        return HashMap::new();
+    };
+    let service = service.read().await;
+    if !service.enabled() || !service.auth_status().await.authenticated {
+        return HashMap::new();
+    }
+    ids.sort();
+    ids.dedup();
+    let mut connus = HashMap::new();
+    {
+        let mut cache = state.metadonnees_playlists.0.lock().await;
+        cache.retain(|_, (date, _)| date.elapsed() < Duration::from_secs(300));
+        ids.retain(|id| {
+            if let Some((_, piste)) = cache.get(&cle(nom, id)) {
+                connus.insert(id.clone(), piste.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+    // Quatre requêtes au plus ; un service en panne ne bloque pas indéfiniment
+    // la fiche. Les succès partiels restent en cache pour la lecture suivante.
+    let lectures = stream::iter(ids.into_iter().map(|id| {
+        let service = &service;
+        async move {
+            let piste = tokio::time::timeout(Duration::from_secs(3), service.get_track(&id)).await;
+            (id, piste)
+        }
+    }))
+    .buffer_unordered(4);
+    tokio::pin!(lectures);
+    let limite = tokio::time::Instant::now() + budget;
+    while let Ok(Some((id, resultat))) = tokio::time::timeout_at(limite, lectures.next()).await {
+        let Ok(Ok(piste)) = resultat else { continue };
+        if piste.id != id {
+            continue;
+        }
+        let mut cache = state.metadonnees_playlists.0.lock().await;
+        if cache.len() >= 4096
+            && let Some(ancienne) = cache
+                .iter()
+                .min_by_key(|(_, (date, _))| *date)
+                .map(|(id, _)| id.clone())
+        {
+            cache.remove(&ancienne);
+        }
+        cache.insert(cle(nom, &id), (Instant::now(), piste.clone()));
+        connus.insert(id, piste);
+    }
+    connus
 }
 
 /// La clé du cache : le service ET l'identifiant (#8066 — deux services

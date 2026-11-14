@@ -742,3 +742,201 @@ async fn preuve_reelle_m3u_qobuz_7738() {
     let (status, _) = poste(&app, &format!("/api/v1/zones/{zid}/stop"), json!({})).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// --- recette rc12 du 14/11 : durées des titres Qobuz dans la file ----------
+
+/// Un faux catalogue Qobuz qui ne connaît qu'un titre (`9140026`, 544 s), et
+/// compte ses appels à `/track/get`.
+async fn qobuz_factice(
+    state: &tune_server::state::AppState,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tune_core::streaming::traits::StreamingService;
+    let appels = Arc::new(AtomicUsize::new(0));
+    let compteur = appels.clone();
+    let api = axum::Router::new().route(
+        "/track/get",
+        axum::routing::get(move || {
+            compteur.fetch_add(1, Ordering::SeqCst);
+            async {
+                axum::Json(json!({
+                    "id": 9140026, "title": "Giorgio by Moroder", "duration": 544,
+                    "performer": {"id": 7, "name": "Daft Punk"},
+                    "album": {"id": "ram", "title": "Random Access Memories",
+                        "image": {"large": "https://example.invalid/ram.jpg"}}
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let serveur = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    let mut qobuz = tune_core::streaming::qobuz::QobuzService::avec_bases_de_test(
+        "app-factice".into(),
+        "secret-factice".into(),
+        tune_core::streaming::qobuz::BasesQobuz {
+            api: base.clone(),
+            proxy: base.clone(),
+            config_distante: base,
+        },
+    );
+    assert!(qobuz.restore_tokens(&json!({"user_auth_token":"factice"})));
+    state.services.lock().await.register(Box::new(qobuz));
+    (appels, serveur)
+}
+
+/// Une playlist locale [piste locale, titre Qobuz SANS durée] — la forme de
+/// « Écoutes récentes » sur le .18, où trois lignes Qobuz valaient 0 en base.
+async fn playlist_qobuz_sans_duree(
+    state: &tune_server::state::AppState,
+    app: &axum::Router,
+) -> i64 {
+    let local = piste(state, "El niño", "/musique/el-nino.flac");
+    let pl = playlist_vide(app, "Écoutes récentes").await;
+    let (st, v) = ajoute(
+        app,
+        pl,
+        json!({
+            "track_ids": [local],
+            "streaming_tracks": [{
+                "source": "qobuz",
+                "source_id": "9140026",
+                "title": "Giorgio by Moroder",
+                "artist_name": "Daft Punk",
+                "album_title": "Random Access Memories",
+                "duration_ms": 0,
+            }]
+        }),
+    )
+    .await;
+    assert!(st.is_success(), "ajout: {v}");
+    let (_, export) = lis(app, &format!("/api/v1/playlists/{pl}/export?format=json")).await;
+    assert!(
+        export.to_string().contains("9140026"),
+        "la ligne Qobuz est en playlist : {export}"
+    );
+    pl
+}
+
+async fn duree_en_file(app: &axum::Router, zid: i64, source_id: &str) -> i64 {
+    let (st, file) = lis(app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(st, StatusCode::OK, "{file}");
+    let ligne = file["tracks"]
+        .as_array()
+        .and_then(|l| l.iter().find(|t| t["source_id"] == source_id))
+        .unwrap_or_else(|| panic!("{source_id} absent de la file : {file}"))
+        .clone();
+    ligne["duration_ms"].as_i64().unwrap_or(0)
+}
+
+/// Lire la playlist (`POST /zones/{id}/play` + `playlist_id`) depuis sa ligne
+/// LOCALE : la ligne Qobuz qui suit est « À suivre », jamais résolue par la
+/// lecture. Elle entrait dans la file à 0 ms et l'écran montrait 0:00.
+#[tokio::test]
+async fn lire_une_playlist_donne_sa_duree_au_titre_qobuz_qui_suit() {
+    let st = etat();
+    let (appels, serveur) = qobuz_factice(&st).await;
+    let app = appli(&st);
+    let pl = playlist_qobuz_sans_duree(&st, &app).await;
+    let zid = zone(&st, "Salon");
+
+    // Le départ local peut échouer (fichier absent) : la file, elle, est écrite.
+    let _ = poste(
+        &app,
+        &format!("/api/v1/zones/{zid}/play"),
+        json!({ "playlist_id": pl, "start_index": 0 }),
+    )
+    .await;
+    assert_eq!(
+        duree_en_file(&app, zid, "9140026").await,
+        544_000,
+        "le titre Qobuz « À suivre » entre dans la file avec sa durée"
+    );
+    assert!(appels.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    let file = tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(st.backend.clone())
+        .get_ordered(zid)
+        .unwrap();
+    let q = file
+        .iter()
+        .find(|e| e.source_id.as_deref() == Some("9140026"))
+        .unwrap();
+    assert_eq!(
+        q.title.as_deref(),
+        Some("Giorgio by Moroder"),
+        "le titre de la playlist reste"
+    );
+    let _ = poste(&app, &format!("/api/v1/zones/{zid}/stop"), json!({})).await;
+    serveur.abort();
+}
+
+/// « Verser dans la file » (`POST /playlists/transfer`) : même règle.
+#[tokio::test]
+async fn verser_une_playlist_donne_sa_duree_au_titre_qobuz() {
+    let st = etat();
+    let (_appels, serveur) = qobuz_factice(&st).await;
+    let app = appli(&st);
+    let pl = playlist_qobuz_sans_duree(&st, &app).await;
+    let zid = zone(&st, "Cuisine");
+    let (status, corps) = poste(
+        &app,
+        "/api/v1/playlists/transfer",
+        json!({ "playlist_id": pl, "zone_id": zid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    assert_eq!(duree_en_file(&app, zid, "9140026").await, 544_000);
+    serveur.abort();
+}
+
+/// La fiche de la playlist vient d'être affichée : la file reprend son cache,
+/// sans réinterroger Qobuz.
+#[tokio::test]
+async fn la_file_reprend_le_cache_de_la_fiche_sans_rappeler_qobuz() {
+    let st = etat();
+    let (appels, serveur) = qobuz_factice(&st).await;
+    let app = appli(&st);
+    let pl = playlist_qobuz_sans_duree(&st, &app).await;
+    let lignes = pistes(&app, pl).await;
+    assert_eq!(lignes[1]["duration_ms"], 544_000, "la fiche complète déjà");
+    let apres_fiche = appels.load(std::sync::atomic::Ordering::SeqCst);
+    let zid = zone(&st, "Bureau");
+    let (status, _) = poste(
+        &app,
+        "/api/v1/playlists/transfer",
+        json!({ "playlist_id": pl, "zone_id": zid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(duree_en_file(&app, zid, "9140026").await, 544_000);
+    assert_eq!(
+        appels.load(std::sync::atomic::Ordering::SeqCst),
+        apres_fiche,
+        "la file a réinterrogé Qobuz alors que la fiche l'avait en cache"
+    );
+    serveur.abort();
+}
+
+/// Témoin : sans service Qobuz, la ligne garde ce qu'elle avait et la file
+/// s'écrit quand même.
+#[tokio::test]
+async fn sans_qobuz_la_file_s_ecrit_sans_duree() {
+    let st = etat();
+    let app = appli(&st);
+    let pl = playlist_qobuz_sans_duree(&st, &app).await;
+    let zid = zone(&st, "Atelier");
+    let (status, corps) = poste(
+        &app,
+        "/api/v1/playlists/transfer",
+        json!({ "playlist_id": pl, "zone_id": zid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    assert_eq!(corps["transferred"], 2, "{corps}");
+    assert_eq!(duree_en_file(&app, zid, "9140026").await, 0);
+}

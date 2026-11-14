@@ -684,7 +684,9 @@ async fn jouer_playlist_mixte(
     start_index: Option<i64>,
     lang: &str,
 ) -> axum::response::Response {
-    let items = entrees_de_file(entries);
+    let mut items = entrees_de_file(entries);
+    // Recette rc12 du 14/11 — une ligne Qobuz sans durée n'entre plus à 0:00.
+    crate::routes::playlists::metadonnees_7738::completer_file(state, &mut items).await;
     if let Err(e) = queue_repo.clear(zone_id) {
         return lecture_base_echouee("play_playlist_mixte_vider_file", zone_id, e);
     }

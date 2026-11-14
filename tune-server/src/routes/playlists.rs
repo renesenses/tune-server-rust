@@ -1948,7 +1948,9 @@ async fn transfer_playlist(
         // #4889 — une playlist mixte passe par la file UNIFIÉE : chaque titre
         // de service y entre comme une ligne de streaming, résolue à la
         // lecture comme n'importe quelle piste de service.
-        let items = crate::routes::playback::entrees_de_file(&entries);
+        let mut items = crate::routes::playback::entrees_de_file(&entries);
+        // Recette rc12 du 14/11 — une ligne Qobuz sans durée n'entre plus à 0:00.
+        metadonnees_7738::completer_file(&state, &mut items).await;
         if let Err(e) = queue.append(zone_id, &items) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
