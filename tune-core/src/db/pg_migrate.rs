@@ -235,6 +235,10 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Positions des épisodes de podcast (#8170), créées par le script 116 :
     // sans cette ligne, chaque épisode commencé repartirait du début.
     "podcast_episode_positions",
+    // Associations manuelles de « Ma collection physique » (#8672), créées
+    // par le script 119 : sans cette ligne, chaque disque associé à la main
+    // retomberait « nulle part » après la bascule.
+    "collection_physique_associations",
     // Écoutes importées (#7763, script 101) : sans cette ligne, les écoutes
     // reportées de Roon, Plex ou d'une liste m3u seraient perdues à la bascule.
     "imported_plays",
@@ -1930,6 +1934,7 @@ fn conflict_clause(table: &str) -> &'static str {
         "settings" => "ON CONFLICT (key) DO NOTHING",
         "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
         "podcast_episode_positions" => "ON CONFLICT (zone_id, episode_key) DO NOTHING",
+        "collection_physique_associations" => "ON CONFLICT (release_id) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",

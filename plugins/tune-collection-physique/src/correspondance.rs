@@ -75,6 +75,9 @@ pub enum Par {
     MusicbrainzAlbum,
     CodeBarre,
     ArtisteTitre,
+    /// Associé à la main par l'utilisateur (#8672) : prime sur tout le
+    /// reste, et se défait (« Dissocier »).
+    Manuel,
 }
 
 /// La clé d'artiste : « The Beatles » et « Beatles » se rejoignent, ainsi que
@@ -250,6 +253,8 @@ fn mbid(m: &str) -> String {
 /// L'index de la bibliothèque, construit une fois par requête.
 pub struct Index<'a> {
     albums: &'a [AlbumLocal],
+    /// Par identifiant d'album (#8672 : les associations manuelles).
+    par_id: HashMap<i64, usize>,
     par_release: HashMap<String, usize>,
     par_groupe: HashMap<String, usize>,
     par_code: HashMap<String, usize>,
@@ -285,7 +290,9 @@ impl<'a> Index<'a> {
         let mut par_code = HashMap::new();
         let mut par_titre: HashMap<String, Vec<usize>> = HashMap::new();
         let mut par_cle: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut par_id = HashMap::new();
         for (i, a) in albums.iter().enumerate() {
+            par_id.entry(a.id).or_insert(i);
             if let Some(r) = a.mb_release.as_deref().map(mbid).filter(|r| !r.is_empty()) {
                 par_release.entry(r).or_insert(i);
             }
@@ -306,6 +313,7 @@ impl<'a> Index<'a> {
         }
         Self {
             albums,
+            par_id,
             par_release,
             par_groupe,
             par_code,
@@ -369,30 +377,58 @@ impl<'a> Index<'a> {
             }
         }
         // Puis la clé assouplie : un seul album distinct, ou on ne choisit pas.
+        let candidats = self.candidats_assouplis(d, &artistes);
+        match candidats.as_slice() {
+            [] => Rapprochement::Aucun,
+            [a] => Rapprochement::Trouve(*a, Par::ArtisteTitre),
+            _ => Rapprochement::Plusieurs(candidats.len()),
+        }
+    }
+
+    /// L'album local d'identifiant `id`, s'il est (encore) dans la
+    /// bibliothèque.
+    pub fn album(&self, id: i64) -> Option<&'a AlbumLocal> {
+        self.par_id.get(&id).map(|&i| &self.albums[i])
+    }
+
+    /// Les albums que la clé assouplie désigne pour le disque, un par album
+    /// DISTINCT (titre et artiste normalisés), dans l'ordre de la
+    /// bibliothèque. Plus d'un : c'est « plusieurs correspondants », que
+    /// l'utilisateur départage à la main (#8672).
+    pub fn candidats(&self, d: &Disque) -> Vec<&'a AlbumLocal> {
+        let artistes = cles_d_artiste(d);
+        if artistes.is_empty() {
+            return Vec::new();
+        }
+        self.candidats_assouplis(d, &artistes)
+    }
+
+    fn candidats_assouplis(&self, d: &Disque, artistes: &HashSet<String>) -> Vec<&'a AlbumLocal> {
         let k = cle_de_titre(&d.titre);
         if k.is_empty() {
-            return Rapprochement::Aucun;
+            return Vec::new();
         }
-        let mut retenus: Vec<usize> = Vec::new();
+        let mut retenus: Vec<&'a AlbumLocal> = Vec::new();
         let mut distincts: HashSet<(String, String)> = HashSet::new();
         for &i in self.par_cle.get(&k).into_iter().flatten() {
             let a = &self.albums[i];
-            if meme_artiste(a) {
-                retenus.push(i);
-                distincts.insert((
+            let meme_artiste = a
+                .artiste
+                .as_deref()
+                .is_some_and(|n| !cles_d_un_artiste(n).is_disjoint(artistes));
+            if meme_artiste
+                && distincts.insert((
                     titre_normalise(&a.titre),
                     a.artiste
                         .as_deref()
                         .map(artiste_normalise)
                         .unwrap_or_default(),
-                ));
+                ))
+            {
+                retenus.push(a);
             }
         }
-        match (retenus.first(), distincts.len()) {
-            (None, _) => Rapprochement::Aucun,
-            (Some(&i), 1) => Rapprochement::Trouve(&self.albums[i], Par::ArtisteTitre),
-            (Some(_), n) => Rapprochement::Plusieurs(n),
-        }
+        retenus
     }
 }
 
@@ -670,6 +706,13 @@ mod tests {
         let d = disque("Fleetwood Mac", "Rumours: 35th Anniversary Edition");
         assert_eq!(idx.rapprocher(&d, &[], None), Rapprochement::Plusieurs(2));
         assert!(idx.trouver(&d, &[], None).is_none());
+        // #8672 : les candidats à départager à la main, un par album distinct.
+        assert_eq!(
+            idx.candidats(&d).iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(idx.album(2).map(|a| a.id), Some(2));
+        assert!(idx.album(99).is_none());
 
         let doublon = vec![
             album(1, "Fleetwood Mac", "Rumours - Remastered"),
