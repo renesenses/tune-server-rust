@@ -381,6 +381,8 @@ async fn requete_api(
 /// #8766 — essais au plus d'un `GET` de l'API Web refusé en `429`, le
 /// premier compris.
 const ESSAIS_429: u32 = 4;
+/// #8766 — le début du message d'un `429` dont les essais sont épuisés.
+const LIMITE_429: &str = "Spotify limite temporairement les demandes";
 /// #8766 — plafond d'une attente demandée par `Retry-After`, en secondes.
 const RETRY_AFTER_MAX_SECS: u64 = 60;
 
@@ -870,8 +872,8 @@ impl SpotifyService {
                         return Err(ErreurApi {
                             statut: Some(429),
                             message: format!(
-                                "Spotify limite temporairement les demandes (HTTP 429 sur \
-                                 {route}, {essai} essais) : réessayez {quand}"
+                                "{LIMITE_429} (HTTP 429 sur {route}, {essai} essais) : \
+                                 réessayez {quand}"
                             ),
                             reessayer_apres: e.reessayer_apres,
                         });
@@ -1186,6 +1188,10 @@ impl SpotifyService {
                     appareil = trouve;
                 }
                 Err(e) if e == "token expired" => return Err(e),
+                // #8766 — `api_get` a déjà réessayé le 429 jusqu'au bout
+                // (`ESSAIS_429`, `Retry-After`) : redemander 20 fois de plus
+                // prolongerait la pénalité de Spotify.
+                Err(e) if e.starts_with(LIMITE_429) => return Err(e),
                 Err(e) => derniere_erreur = Some(e),
             }
             if appareil.is_some() {
