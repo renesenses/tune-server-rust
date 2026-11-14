@@ -1545,7 +1545,7 @@ mod tests {
         assert!(w.contains("FROM listen_history he"), "{w}");
         assert!(w.contains("he.track_id = t.id"), "{w}");
         assert!(
-            w.contains("OR (he.track_id IS NULL AND he.title = t.title"),
+            w.contains("OR ((he.track_id IS NULL OR NOT EXISTS (SELECT 1 FROM tracks tr_ecoute WHERE tr_ecoute.id = he.track_id)) AND he.title = t.title"),
             "{w}"
         );
         assert!(w.contains("he.album_id = t.album_id"), "{w}");

@@ -273,7 +273,6 @@ pub mod sql {
             concat!("COALESCE(NULLIF(", $alias, ".source, ''), 'local')")
         };
     }
-    pub(crate) use provenance;
 
     /// [`provenance!`] pour un alias choisi par l'appelant, jamais une saisie.
     pub fn provenance_de(alias: &str) -> String {
@@ -361,13 +360,13 @@ pub mod sql {
         // le même compte. Désormais, du plus sûr au moins sûr :
         // 1. l'écoute désigne une piste (`track_id`, écrit depuis #8714) :
         //    elle ne revient qu'à cette piste ;
-        // 2. sinon, son album est connu et existe encore : elle revient au
+        // 2. sinon (piste absente ou disparue), son album connu existe : elle revient au
         //    titre de même nom DE CET ALBUM, sauf interprète explicitement différent ;
         // 3. sinon seulement (ancien historique sans album, album disparu) :
         //    titre + interprète, comme avant.
         format!(
             "{} AND ({ecoute}.track_id = {piste}.id \
-             OR ({ecoute}.track_id IS NULL \
+             OR (({ecoute}.track_id IS NULL OR NOT EXISTS (SELECT 1 FROM tracks tr_ecoute WHERE tr_ecoute.id = {ecoute}.track_id)) \
                  AND {ecoute}.title = {piste}.title \
                  AND (({ecoute}.album_id IS NOT NULL \
                        AND EXISTS (SELECT 1 FROM albums al_ecoute WHERE al_ecoute.id = {ecoute}.album_id) \
@@ -2653,8 +2652,8 @@ mod tests {
     /// historique. Exemple ici : le titre Racing in the street n'a aucun
     /// contrôle comme les 2 autres titres. »
     ///
-    /// `listen_history.track_id` est TOUJOURS NULL — le seul site d'insertion
-    /// passe `None`. Le client désigne une piste locale par son identifiant :
+    /// `listen_history.track_id` était NULL dans cet ancien historique — le site d’insertion
+    /// passait `None`. Le client désigne une piste locale par son identifiant :
     /// sans lui, `corpsDeLecture` rend `null` et TOUTE la barre d'actions
     /// disparaît. Une piste de service, elle, s'identifie par `source` +
     /// `source_id`, bien enregistrés — d'où l'inversion que Fabien a vue.

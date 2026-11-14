@@ -15,13 +15,11 @@
 //! envoie de vraies requêtes HTTP : la donnée doit traverser le handler, la
 //! sérialisation et la recopie.
 //!
-//! ## La cause que ces essais gardent
+//! ## Le cas historique que ces essais gardent
 //!
-//! `listen_history.track_id` est **toujours NULL** : le seul site qui écrit
-//! l'historique (`orchestrator::commun::record_listen`) passe `track_id: None`.
-//! Une jointure sur cette colonne rendrait `play_count = 0` pour la
-//! bibliothèque entière — la colonne fausse que l'issue refuse. Les écoutes
-//! posées ici le sont donc SANS `track_id`, comme en production.
+//! Avant #8714, les écoutes locales ne conservaient pas leur identifiant de
+//! piste. Les nouvelles écoutes le portent ; les anciennes doivent toujours
+//! retrouver leur piste par les métadonnées. Ce banc couvre ce repli.
 
 use axum::Router;
 use axum::body::Body;
@@ -63,7 +61,7 @@ fn bibliotheque(state: &AppState) {
     }
 }
 
-/// Une écoute, **sans `track_id`** — exactement ce que l'orchestrateur écrit.
+/// Une écoute, **sans `track_id`** — forme de l’ancien historique.
 fn ecoute(state: &AppState, titre: &str, quand: &str) {
     state
         .backend

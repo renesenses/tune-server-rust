@@ -329,6 +329,9 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // rejoue jamais la 079. Sans lui, « Reprendre l'écoute » reste juste mais
     // lent.
     "CREATE INDEX IF NOT EXISTS idx_listen_history_album_id ON listen_history(album_id)",
+    // #8714 — même garantie sur base neuve ou migrée : l'identifiant de
+    // piste est désormais écrit à l'écoute et utilisé par les rapprochements.
+    "CREATE INDEX IF NOT EXISTS idx_listen_history_track_id ON listen_history(track_id)",
     // BIGINT, pas TEXT : `profiles.id` est BIGINT et `history_repo` filtre par
     // `profile_id = <entier>`. En TEXT, PostgreSQL rend `operator does not
     // exist: text = bigint` et l'historique du profil rend une liste vide.

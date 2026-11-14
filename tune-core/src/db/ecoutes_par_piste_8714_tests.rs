@@ -18,6 +18,7 @@
 
 use super::*;
 use crate::db::migrations;
+use crate::db::track_repo::TrackRepo;
 
 const TITRE: &str = "Homburg 8714";
 const INTERPRETE: &str = "Procol Harum 8714";
@@ -100,7 +101,32 @@ fn compte(db: &Arc<dyn DbBackend>, piste: i64) -> i64 {
     colonne
 }
 
+// Des relations sans clé étrangère représentent le schéma PG migré.
+// Les mêmes requêtes sont exécutées sur SQLite et sur le PostgreSQL réel.
+fn verifier_identifiants_disparus(db: &Arc<dyn DbBackend>) {
+    for album in ["1", "999", "CAST(NULL AS BIGINT)"] {
+        let requete = format!(
+            "WITH artists(id, name) AS (VALUES (1, 'Artiste 8714')),
+             albums(id) AS (VALUES (1)),
+             tracks(id, title, artist_id, album_id, source) AS
+                 (VALUES (1, 'Titre 8714', 1, 1, 'local')),
+             listen_history(track_id, album_id, title, artist_name, source) AS
+                 (VALUES (999, {album}, 'Titre 8714', 'Artiste 8714', 'local'))
+             SELECT COUNT(*) FROM tracks t JOIN listen_history h ON {}",
+            sql::ecoute_de_la_piste("t", "h")
+        );
+        let compte = db.query_one(&requete, &[]).unwrap().unwrap()[0]
+            .as_i64()
+            .unwrap();
+        assert_eq!(
+            compte, 1,
+            "piste disparue et album {album} : conserver l'écoute"
+        );
+    }
+}
+
 fn verifier(db: &Arc<dyn DbBackend>, base: i64) {
+    verifier_identifiants_disparus(db);
     let (album_1967, compilation) = (base, base + 1);
 
     // 1. Écoute de la piste de l'album de 1967 (`track_id` écrit) : la
@@ -112,6 +138,26 @@ fn verifier(db: &Arc<dyn DbBackend>, base: i64) {
         0,
         "#8714 : l'écoute d'un titre a compté pour sa copie d un autre album"
     );
+
+    // Le tri doit placer la piste réellement écoutée avant ses homonymes,
+    // et ne doit pas multiplier le total de la page.
+    for cle in ["plays", "lastPlayed"] {
+        let page = TrackRepo::with_backend(db.clone())
+            .page_de_pistes(&crate::db::track_repo::DemandeDePistes {
+                recherche: Some(TITRE.into()),
+                tri: crate::db::track_repo::ColonneDeTri::depuis_cle(cle),
+                descendant: true,
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, 3, "le tri ne multiplie pas les pistes");
+        assert_eq!(
+            page.pistes[0].id,
+            Some(album_1967),
+            "tri {cle} = colonne affichée"
+        );
+    }
 
     // Précision du testeur du 14/11 : même titre ET même album, deux pistes.
     let reprise = base + 2;
@@ -206,6 +252,10 @@ async fn pg_8714_une_ecoute_ne_compte_que_pour_sa_piste() {
     // Comme au premier démarrage : les migrations créent les tables, puis
     // ensure_schema pose les colonnes complémentaires, dont source_id.
     postgres.ensure_schema().await;
+    let index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'listen_history' AND indexname = 'idx_listen_history_track_id'"
+    ).fetch_one(postgres.pool()).await.unwrap();
+    assert_eq!(index, 1, "index de piste présent aussi sur PostgreSQL");
     let pool = postgres.pool().clone();
     let db: Arc<dyn DbBackend> = Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
     let nettoyer = |db: &Arc<dyn DbBackend>| {
