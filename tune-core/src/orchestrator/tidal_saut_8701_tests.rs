@@ -477,3 +477,101 @@ async fn l_arret_et_une_autre_source_liberent_le_fichier_8701() {
     );
     let _ = std::fs::remove_file(&chemin);
 }
+
+/// Une zone locale du banc, servie par une sortie factice inscrite sous son
+/// appareil (`local:Casque`), et le fMP4 de la piste, déjà téléchargé en
+/// entier (une première lecture lue jusqu'au bout) et épinglé.
+async fn zone_sur_sortie_factice(
+    cdn: &Cdn,
+    apres: i64,
+    refuser: bool,
+) -> (PlaybackOrchestrator, PlayRequest, String) {
+    let orch = orchestrateur();
+    let req = zone_locale(
+        &orch,
+        TidalService::pour_un_faux_tidal(cdn.base.clone()),
+        Some(apres),
+    )
+    .await;
+    let sortie = crate::outputs::mock::MockOutput::new("local:Casque", "Casque").with_type("local");
+    if refuser {
+        sortie.refuser_la_lecture(Some("refus de lecture injecté 8701"));
+    }
+    orch.outputs.lock().await.register(Box::new(sortie));
+    let premier = orch.resolve_stream(&req).await.expect("lecture");
+    let chemin = fichier_dash(&premier);
+    let sid = premier.stream_id.clone().expect("session");
+    let s = session(&orch, &sid).await;
+    let _ = lire_jusqu_a_la_fin(&s, Vec::new()).await;
+    drop(s);
+    orch.streamer.remove_session(&sid).await;
+    assert!(crate::audio::dash_epingles::est_epingle(&chemin));
+    (orch, req, chemin)
+}
+
+/// (4) La sortie refuse la lecture : la zone passe à l'arrêt sans passer par
+/// `stop` (`arreter_sur_refus_de_sortie`). Le fMP4 que la résolution vient
+/// d'épingler ne reste pas retenu pour elle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_erreur_de_lecture_libere_le_fichier_8701() {
+    let pcm = pcm_cd();
+    let cdn = faux_tidal(Arc::new(decouper(&flac_cd(&pcm).await)), usize::MAX).await;
+    let (orch, req, chemin) = zone_sur_sortie_factice(&cdn, 8_701_300, true).await;
+
+    let r = orch.play(req.clone()).await.expect("play rend la main");
+    assert!(!r.output_sent, "la sortie factice devait refuser");
+    // La résolution du play a bien repris le fichier du cache (épinglé).
+    assert_eq!(cdn.inits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        orch.playback.get_state(req.zone_id).await.state,
+        crate::playback::PlayState::Stopped
+    );
+    assert!(
+        !crate::audio::dash_epingles::est_epingle(&chemin),
+        "zone arrêtée sur erreur de lecture : son fMP4 reste épinglé"
+    );
+    let _ = std::fs::remove_file(&chemin);
+}
+
+/// (5) Une pause puis une reprise gardent le fichier : un saut après la
+/// reprise le retrouve encore. Seul l'arrêt le libère.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_pause_puis_une_reprise_gardent_le_fichier_8701() {
+    let pcm = pcm_cd();
+    let cdn = faux_tidal(Arc::new(decouper(&flac_cd(&pcm).await)), usize::MAX).await;
+    let (orch, req, chemin) = zone_sur_sortie_factice(&cdn, 8_701_400, false).await;
+    let appareil = req.output_device_id.clone();
+
+    let r = orch.play(req.clone()).await.expect("lecture");
+    assert!(r.output_sent, "la sortie factice devait accepter");
+    assert!(crate::audio::dash_epingles::est_epingle(&chemin));
+
+    orch.pause(req.zone_id, appareil.as_deref())
+        .await
+        .expect("pause");
+    assert_eq!(
+        orch.playback.get_state(req.zone_id).await.state,
+        crate::playback::PlayState::Paused
+    );
+    assert!(
+        crate::audio::dash_epingles::est_epingle(&chemin),
+        "la pause a libéré le fichier de la reprise"
+    );
+
+    orch.resume(req.zone_id, appareil.as_deref())
+        .await
+        .expect("reprise");
+    assert!(
+        crate::audio::dash_epingles::est_epingle(&chemin),
+        "la reprise a libéré le fichier"
+    );
+    assert_eq!(
+        cdn.inits.load(Ordering::SeqCst),
+        1,
+        "aucun retéléchargement"
+    );
+
+    orch.stop(req.zone_id, appareil.as_deref()).await;
+    assert!(!crate::audio::dash_epingles::est_epingle(&chemin));
+    let _ = std::fs::remove_file(&chemin);
+}

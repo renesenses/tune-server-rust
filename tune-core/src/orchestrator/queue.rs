@@ -1441,9 +1441,10 @@ impl PlaybackOrchestrator {
         // piste préparée, jamais celle de la piste qui joue. Sur le tas : la
         // résolution est une grosse future, que la portée ne doit pas recopier
         // sur la pile du sondeur.
-        crate::audio::dash_epingles::pendant_la_preparation(Box::pin(
-            self.resoudre_la_suivante_de_la_file(zone_id, position),
-        ))
+        crate::audio::dash_epingles::pendant_la_preparation(
+            zone_id,
+            Box::pin(self.resoudre_la_suivante_de_la_file(zone_id, position)),
+        )
         .await
     }
 
