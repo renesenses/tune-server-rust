@@ -78,6 +78,11 @@ pub(super) struct Etat {
     /// Début de cet audit (RFC 3339).
     #[serde(default)]
     debut: Option<String>,
+    /// Mesure du lancement courant uniquement, hors attente de lecture.
+    #[serde(default)]
+    mesure_actif_ms: u64,
+    #[serde(default)]
+    mesure_traites: u64,
     /// Fin du dernier audit complet TERMINÉ (RFC 3339), d'un audit à l'autre :
     /// le rappel périodique part de là. Un audit rapide ne la change pas.
     #[serde(default)]
@@ -113,6 +118,7 @@ pub(super) struct Vue {
     #[serde(flatten)]
     etat: Etat,
     rappel: Rappel,
+    eta_seconds: Option<u64>,
 }
 
 fn cle_ligne(generation: &str, id: i64) -> String {
@@ -213,7 +219,34 @@ fn vue(db: &Arc<dyn DbBackend>, mut etat: Etat) -> Vue {
     );
     // Un audit en cours n'a pas à être rappelé.
     rappel.du &= etat.status != "running";
-    Vue { etat, rappel }
+    let eta_seconds = estimer_audit(&etat);
+    Vue {
+        etat,
+        rappel,
+        eta_seconds,
+    }
+}
+
+fn estimer_audit(etat: &Etat) -> Option<u64> {
+    if etat.status != "running" || etat.lecture_prioritaire || etat.mesure_actif_ms == 0 {
+        return None;
+    }
+    tune_core::taches_de_fond::avancement::estimer_le_reste(
+        i64::try_from(etat.mesure_traites).ok()?,
+        i64::try_from(etat.total.saturating_sub(etat.traites)).ok()?,
+        Duration::from_millis(etat.mesure_actif_ms),
+    )
+}
+fn reinitialiser_mesure(etat: &mut Etat) {
+    etat.mesure_actif_ms = 0;
+    etat.mesure_traites = 0;
+}
+fn mesurer_progression(etat: &mut Etat, depart: u64, ecoule: Duration, attente: Duration) {
+    etat.mesure_actif_ms = ecoule
+        .saturating_sub(attente)
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    etat.mesure_traites = etat.traites.saturating_sub(depart).saturating_add(1);
 }
 
 pub(super) async fn status(State(state): State<AppState>) -> Response {
@@ -263,6 +296,7 @@ fn preparer(db: &Arc<dyn DbBackend>, options: &Lancement) -> Result<Etat, String
             ..Default::default()
         };
     }
+    reinitialiser_mesure(&mut etat);
     etat.status = "running".into();
     etat.erreur = None;
     taches_de_fond::reprendre(db, Tache::Integrite)?;
@@ -419,8 +453,17 @@ fn resultat_reutilisable(
 }
 
 fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
+    let debut = std::time::Instant::now();
+    let depart = etat.traites;
+    let attente = std::cell::Cell::new(Duration::ZERO);
+    let continuer_mesure = || {
+        let avant = std::time::Instant::now();
+        let suite = continuer();
+        attente.set(attente.get().saturating_add(avant.elapsed()));
+        suite
+    };
     loop {
-        if !continuer() {
+        if !continuer_mesure() {
             etat.status = "paused".into();
             return sauver(db, etat, None);
         }
@@ -448,7 +491,7 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
             if perimetre != perimetre_sql(db) {
                 break;
             }
-            if !continuer() {
+            if !continuer_mesure() {
                 etat.status = "paused".into();
                 return sauver(db, etat, None);
             }
@@ -468,6 +511,7 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
             let taille_sans_nouvelle_date =
                 taille_changee_sans_date(avant.as_ref(), ligne[2].as_i64(), ligne[3].as_f64());
             if let Some(reprise) = resultat_reutilisable(db, etat, id, &chemin, avant.as_ref())? {
+                mesurer_progression(etat, depart, debut.elapsed(), attente.get());
                 enregistrer(
                     db,
                     etat,
@@ -480,7 +524,7 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
                 continue;
             }
             let Some(mut resultat) =
-                audit_integrite::verifier_selon(etat.mode, Path::new(&ouvrable), continuer)
+                audit_integrite::verifier_selon(etat.mode, Path::new(&ouvrable), continuer_mesure)
             else {
                 etat.status = "paused".into();
                 return sauver(db, etat, None);
@@ -501,6 +545,7 @@ fn executer(db: &Arc<dyn DbBackend>, etat: &mut Etat) -> Result<(), String> {
                     unites_controlees: resultat.unites_controlees,
                 };
             }
+            mesurer_progression(etat, depart, debut.elapsed(), attente.get());
             enregistrer(
                 db,
                 etat,
@@ -737,26 +782,214 @@ fn ligne_csv(l: &Ligne) -> String {
     .join(",")
         + "\r\n"
 }
-pub(super) async fn csv(State(state): State<AppState>) -> Response {
+pub(super) async fn csv(State(state): State<AppState>, Query(page): Query<Page>) -> Response {
+    let nom = match page.verdict.as_ref() {
+        Some(Verdict::Sain) => "integrite-bibliotheque-sain.csv",
+        Some(Verdict::Corrompu) => "integrite-bibliotheque-corrompu.csv",
+        Some(Verdict::NonVerifiable) => "integrite-bibliotheque-non_verifiable.csv",
+        None => "integrite-bibliotheque.csv",
+    };
     match bloquant(move || {
         let etat = lire(&state.backend)?;
         let mut csv = String::from("\u{feff}chemin,état,code,erreur,position_trames,trames_décodées,taille_sans_nouvelle_date,mode,unité_fautive,numéro,octet,fautes\r\n");
         let mut offset = 0;
-        loop { let rows = lignes(&state.backend, &etat, offset, 1000, None)?; if rows.is_empty() { break; } offset += rows.len() as u64; for l in rows { csv.push_str(&ligne_csv(&l)); } }
+        loop { let rows = lignes(&state.backend, &etat, offset, 1000, page.verdict.as_ref())?; if rows.is_empty() { break; } offset += rows.len() as u64; for l in rows { csv.push_str(&ligne_csv(&l)); } }
         Ok(csv)
     }).await {
-        Ok(csv) => ([(header::CONTENT_TYPE, "text/csv; charset=utf-8"), (header::CONTENT_DISPOSITION, "attachment; filename=integrite-bibliotheque.csv")], csv).into_response(), Err(e) => e,
+        Ok(csv) => ([(header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()), (header::CONTENT_DISPOSITION, format!("attachment; filename={nom}"))], csv).into_response(), Err(e) => e,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn estimation_8690_exclut_la_pause_et_le_travail_anterieur() {
+        let mut etat = Etat {
+            status: "running".into(),
+            total: 100,
+            traites: 59,
+            ..Default::default()
+        };
+        mesurer_progression(
+            &mut etat,
+            50,
+            Duration::from_secs(120),
+            Duration::from_secs(100),
+        );
+        etat.traites += 1; // enregistrer valide le dixième fichier de la reprise.
+        assert_eq!(
+            estimer_audit(&etat),
+            Some(80),
+            "40 fichiers restants à 2 secondes actives par fichier"
+        );
+        etat.lecture_prioritaire = true;
+        assert_eq!(estimer_audit(&etat), None);
+        etat.lecture_prioritaire = false;
+        etat.status = "paused".into();
+        assert_eq!(estimer_audit(&etat), None);
+        etat.status = "running".into();
+        reinitialiser_mesure(&mut etat);
+        assert_eq!(
+            estimer_audit(&etat),
+            None,
+            "aucun ancien débit après reprise"
+        );
+    }
+    #[test]
+    fn estimation_8690_ancienne_mesure_absente_et_fin() {
+        let mut etat = Etat {
+            status: "running".into(),
+            total: 10,
+            traites: 5,
+            ..Default::default()
+        };
+        assert_eq!(estimer_audit(&etat), None);
+        etat.mesure_actif_ms = 20_000;
+        etat.mesure_traites = 5;
+        assert_eq!(estimer_audit(&etat), Some(20));
+        let reponse = Vue {
+            eta_seconds: estimer_audit(&etat),
+            rappel: rappel::echeance(0, None, chrono::Utc::now()),
+            etat: etat.clone(),
+        };
+        assert_eq!(
+            serde_json::to_value(reponse).unwrap()["eta_seconds"],
+            20,
+            "le contrat API porte le temps restant"
+        );
+        etat.traites = 10;
+        assert_eq!(estimer_audit(&etat), Some(0));
+        etat.status = "completed".into();
+        assert_eq!(estimer_audit(&etat), None);
+        assert_eq!(
+            serde_json::to_value(Vue {
+                eta_seconds: estimer_audit(&etat),
+                rappel: rappel::echeance(0, None, chrono::Utc::now()),
+                etat
+            })
+            .unwrap()["eta_seconds"],
+            serde_json::Value::Null
+        );
+    }
     fn base() -> Arc<dyn DbBackend> {
         let db: Arc<dyn DbBackend> =
             Arc::new(tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap());
         db.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT); CREATE TABLE tracks (id INTEGER PRIMARY KEY, file_path TEXT, cue_media_path TEXT, file_size INTEGER, file_mtime REAL, source TEXT)").unwrap();
         db
+    }
+    #[tokio::test]
+    async fn csv_filtre_2925_exporte_toutes_les_pages_du_seul_verdict() {
+        use axum::{
+            Router,
+            body::{Body, to_bytes},
+            http::{Request, StatusCode},
+            routing::get,
+        };
+        use tower::ServiceExt;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let etat = Etat {
+            generation: "csv-2925".into(),
+            status: "completed".into(),
+            ..Default::default()
+        };
+        for id in 1..=1003 {
+            let verdict = match id {
+                1 => Verdict::Sain,
+                2 => Verdict::NonVerifiable,
+                _ => Verdict::Corrompu,
+            };
+            let mut resultat = Resultat::defaut("temoin", "synthétique", None, 0);
+            resultat.verdict = verdict;
+            let ligne = Ligne {
+                id,
+                chemin: format!("/synthetique/{id}.flac"),
+                taille: Some(40),
+                taille_sans_nouvelle_date: false,
+                resultat,
+                date: None,
+                verifie_par: None,
+                mode: Mode::Complet,
+            };
+            sauver(&state.backend, &etat, Some(&ligne)).unwrap();
+        }
+        let app = Router::new()
+            .route("/csv", get(csv))
+            .route("/json", get(report))
+            .with_state(state);
+        for (filtre, nombre, nom) in [
+            (
+                "?verdict=corrompu",
+                1001,
+                "integrite-bibliotheque-corrompu.csv",
+            ),
+            ("?verdict=sain", 1, "integrite-bibliotheque-sain.csv"),
+            (
+                "?verdict=non_verifiable",
+                1,
+                "integrite-bibliotheque-non_verifiable.csv",
+            ),
+            ("", 1003, "integrite-bibliotheque.csv"),
+        ] {
+            let reponse = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/csv{filtre}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(reponse.status(), StatusCode::OK);
+            assert_eq!(
+                reponse.headers()[header::CONTENT_DISPOSITION],
+                format!("attachment; filename={nom}")
+            );
+            let texte = String::from_utf8(
+                to_bytes(reponse.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            let lignes: Vec<_> = texte.lines().skip(1).collect();
+            assert_eq!(
+                lignes.len(),
+                nombre,
+                "export CSV 2925 : seules les lignes filtrées, toutes pages comprises"
+            );
+            if let Some(verdict) = filtre.strip_prefix("?verdict=") {
+                let attendu = if verdict == "non_verifiable" {
+                    "non vérifiable"
+                } else {
+                    verdict
+                };
+                assert!(
+                    lignes
+                        .iter()
+                        .all(|l| l.split(',').nth(1).map(|s| s.trim_matches('"')) == Some(attendu)),
+                    "aucun autre verdict dans le CSV : {filtre}"
+                );
+            }
+        }
+        for route in ["/csv", "/json"] {
+            let reponse = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{route}?verdict=inconnu"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                reponse.status(),
+                StatusCode::BAD_REQUEST,
+                "même validation JSON/CSV"
+            );
+        }
     }
     #[test]
     fn rapport_et_curseur_survivent_a_la_relecture() {

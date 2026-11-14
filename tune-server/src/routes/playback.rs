@@ -23,6 +23,10 @@ mod session_message;
 #[cfg(test)]
 #[path = "playback/titre_indisponible_7778_tests.rs"]
 mod titre_indisponible_7778_tests;
+// Recette rc12 — une piste du CD lancée sans disque : 409 nommé, pas 500.
+#[cfg(test)]
+#[path = "playback/cd_disque_absent_tests.rs"]
+mod cd_disque_absent_tests;
 // #6332 — le débit d'une piste locale dans l'état de zone.
 #[cfg(test)]
 #[path = "playback/debit_lecture_en_cours_6332_tests.rs"]
@@ -179,6 +183,10 @@ pub(crate) fn corps_du_refus_parental(e: &str, lang: &str) -> Option<Value> {
 
 /// #8154 — la route du récepteur Spotify Connect que le bouton « Activer le
 /// récepteur » appelle (`POST`, corps `{}`).
+/// #8565 — la phrase « Spotify a refusé les clés audio de ce compte »
+/// (`i18n_server.json`), rendue par la lecture et par le statut du récepteur.
+pub(crate) const CLE_CLES_AUDIO_REFUSEES: &str = "spotify.playback.audioKeyRefused";
+
 pub(crate) const ROUTE_ACTIVER_RECEPTEUR_SPOTIFY: &str = "/api/v1/spotify-connect/enable";
 
 /// #8154 — le refus « liaison Spotify Connect requise » : 409, code stable,
@@ -212,6 +220,13 @@ fn refus_liaison_spotify(
     (StatusCode::CONFLICT, Json(corps)).into_response()
 }
 
+/// Le motif du greffon CD quand le disque a quitté le lecteur
+/// (`tune_cd::lecteur::ErreurCd::AucunDisque`, voir la garde
+/// `motif_cd_disque_absent_suit_le_greffon`).
+pub(crate) const MOTIF_CD_DISQUE_ABSENT: &str = "aucun disque dans le lecteur";
+/// Le code stable de ce refus, lu par le client web.
+pub(crate) const CODE_CD_DISQUE_ABSENT: &str = "cd_disc_absent";
+
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     if let Some(reponse) = refus_du_bail_parental(&e, lang) {
         return reponse;
@@ -220,6 +235,20 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     // du profil qui écoute : 403 au code stable, phrase traduite.
     if e.contains(tune_core::db::politique_parentale::CODE_REFUS_EXPLICITE) {
         return super::politique_parentale::refus_explicite(lang);
+    }
+    // #8611 — une piste d'un artiste bloqué par la politique parentale du
+    // profil qui écoute : 403 au code stable `parental_content_blocked`.
+    if e.contains(tune_core::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE) {
+        return super::politique_parentale::refus_contenu_bloque(lang);
+    }
+    // #8611 — la politique parentale enregistrée du profil ne se relit pas.
+    if e.contains(tune_core::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE) {
+        let code = tune_core::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": code, "code": code})),
+        )
+            .into_response();
     }
     // Sentinelle « plafond de zones » de orchestrator.play() → 402 traduit,
     // avec le code stable et les deux nombres. Le format est
@@ -278,6 +307,29 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
             }),
             lang,
             "spotify.playback.premiumRequired",
+            &[],
+        );
+        if let Some(objet) = corps.as_object_mut() {
+            objet.insert("cause".into(), json!(cause));
+        }
+        return (StatusCode::CONFLICT, Json(corps)).into_response();
+    }
+    // #8565 (décision de Bertrand du 13/11) — Spotify refuse les clés audio
+    // du compte (librespot #1649) : le titre sautait sans un son. 409 au code
+    // stable, phrase traduite « Spotify a refusé les clés audio de ce
+    // compte ».
+    if let Some(pos) = e.find(tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES)
+    {
+        use tune_core::streaming::spotify_connect::CODE_CLES_AUDIO_REFUSEES;
+        use tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES;
+        let cause = e[pos + SENTINELLE_CLES_AUDIO_REFUSEES.len()..].trim();
+        let mut corps = crate::message_api::avec_message_en(
+            json!({
+                "error": CODE_CLES_AUDIO_REFUSEES,
+                "code": CODE_CLES_AUDIO_REFUSEES,
+            }),
+            lang,
+            CLE_CLES_AUDIO_REFUSEES,
             &[],
         );
         if let Some(objet) = corps.as_object_mut() {
@@ -411,6 +463,23 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     // aucune adresse de flux pour ce compte, cette région). 422 au code
     // stable, phrase traduite : sans cette branche, « no url » ne contenait
     // aucun mot du fourre-tout ci-dessous et finissait en 500 brut.
+    // Recette du .18, rc12 (13/11/2026) — une piste du CD lancée alors que le
+    // disque n'est plus dans le lecteur (titre phare écouté sur le CD avant
+    // son extraction) : le greffon CD rend « aucun disque dans le lecteur »,
+    // que le fourre-tout ci-dessous changeait en 500 `playback_error`, le
+    // texte brut dans le toast. 409 au code stable et phrase traduite : un
+    // état de l'appareil, pas une panne du serveur.
+    if e.contains(MOTIF_CD_DISQUE_ABSENT) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": CODE_CD_DISQUE_ABSENT,
+                "code": CODE_CD_DISQUE_ABSENT,
+                "message": crate::i18n::t(lang, "playback.cd_disc_absent"),
+            })),
+        )
+            .into_response();
+    }
     if tune_core::poller::refus_propre_a_la_piste(&e) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2533,6 +2602,39 @@ mod refus_de_format_3234 {
                     assert!(message.contains("Spotify app"), "{message}");
                 }
             }
+        }
+    }
+
+    /// #8565 (décision de Bertrand du 13/11) — Spotify refuse les clés audio
+    /// du compte : 409 au code stable `spotify_audio_key_refused` et la phrase
+    /// « Spotify a refusé les clés audio de ce compte », au lieu d'un titre
+    /// sauté sans un mot. Contre-épreuve : sans la branche, 502.
+    #[tokio::test]
+    async fn spotify_8565_cles_audio_refusees_dit_le_refus() {
+        let e = format!(
+            "source « spotify » : {}Spotify a refusé les clés audio de ce compte (librespot : « error audio key »)",
+            tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES
+        );
+        for (lang, phrase) in [
+            ("fr", "Spotify a refusé les clés audio de ce compte"),
+            ("en", "Spotify refused the audio keys for this account"),
+        ] {
+            let reponse = play_error_response(e.clone(), lang);
+            assert_eq!(reponse.status(), StatusCode::CONFLICT, "{lang}");
+            let corps = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+                .await
+                .expect("corps de la réponse");
+            let corps: Value = serde_json::from_slice(&corps).expect("corps JSON");
+            assert_eq!(corps["error"], "spotify_audio_key_refused");
+            assert_eq!(corps["code"], "spotify_audio_key_refused");
+            assert_eq!(corps["message_key"], super::CLE_CLES_AUDIO_REFUSEES);
+            let message = corps["message"].as_str().unwrap_or_default();
+            assert!(message.contains(phrase), "{lang} : {message}");
+            assert!(
+                corps["cause"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("audio key"))
+            );
         }
     }
 

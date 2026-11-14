@@ -2068,6 +2068,10 @@ impl PlaybackOrchestrator {
     const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
 }
 
+// #8611 — contrôle parental : refus de lecture des artistes bloqués.
+pub mod artiste_bloque_8611;
+#[cfg(test)]
+mod artiste_bloque_8611_tests;
 pub mod bail_parental_7974;
 #[cfg(test)]
 mod bail_parental_7974_tests;
@@ -2452,6 +2456,10 @@ mod tidal_aac_annonce_6334_tests;
 /// un faux renderer DLNA : durée de chaque étape et borne du démarrage.
 #[cfg(test)]
 mod tidal_cd_dash_jusqu_au_play_7266;
+/// #7266 — sortie locale ou OAAT : la première note sans attendre la fin du
+/// téléchargement DASH.
+#[cfg(test)]
+mod tidal_premiere_note_7266_tests;
 
 /// #6401 — le préchargement sans blanc et la sonde de niveaux après une
 /// avance sans blanc passent par le même repli Qobuz en 16/44,1 que la

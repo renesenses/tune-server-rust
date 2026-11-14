@@ -16,6 +16,23 @@
     "pl": "Ta treść jest oznaczona jako dosadna: kontrola rodzicielska tego profilu nie pozwala jej wyświetlać ani odtwarzać.",
     "el": "Αυτό το περιεχόμενο έχει σημανθεί ως ακατάλληλο: ο γονικός έλεγχος αυτού του προφίλ δεν επιτρέπει την εμφάνιση ή την αναπαραγωγή του."
   },
+  "parental.content.blocked": {
+    "fr": "Cet artiste est bloqué : le contrôle parental de ce profil en interdit l'affichage et la lecture.",
+    "en": "This artist is blocked: this profile's parental controls do not allow it to be shown or played.",
+    "de": "Dieser Künstler ist gesperrt: Die Kindersicherung dieses Profils erlaubt weder Anzeige noch Wiedergabe.",
+    "es": "Este artista está bloqueado: el control parental de este perfil no permite mostrarlo ni reproducirlo.",
+    "it": "Questo artista è bloccato: il controllo parentale di questo profilo non ne consente la visualizzazione né la riproduzione.",
+    "zh": "此艺人已被屏蔽：此配置文件的家长控制不允许显示或播放。",
+    "ja": "このアーティストはブロックされています。このプロフィールのペアレンタルコントロールにより、表示も再生もできません。",
+    "ko": "이 아티스트는 차단되었습니다. 이 프로필의 자녀 보호 설정으로 표시와 재생이 허용되지 않습니다.",
+    "ro": "Acest artist este blocat: controlul parental al acestui profil nu permite afișarea sau redarea lui.",
+    "sv": "Den här artisten är blockerad: profilens föräldrakontroll tillåter inte att den visas eller spelas upp.",
+    "hu": "Ez az előadó le van tiltva: a profil szülői felügyelete nem engedi megjeleníteni vagy lejátszani.",
+    "vi": "Nghệ sĩ này đã bị chặn: kiểm soát của phụ huynh trên hồ sơ này không cho phép hiển thị hoặc phát.",
+    "nb": "Denne artisten er blokkert: foreldrekontrollen for denne profilen tillater ikke at den vises eller spilles av.",
+    "pl": "Ten wykonawca jest zablokowany: kontrola rodzicielska tego profilu nie pozwala go wyświetlać ani odtwarzać.",
+    "el": "Αυτός ο καλλιτέχνης είναι αποκλεισμένος: ο γονικός έλεγχος αυτού του προφίλ δεν επιτρέπει την εμφάνιση ή την αναπαραγωγή του."
+  },
   "plugin.unavailable": {
     "fr": "Ce plugin doit être installé et activé.",
     "en": "This plugin must be installed and enabled.",
@@ -2719,6 +2736,23 @@
     "pl": "Odmowa dostępu (gość). Spróbuj z nazwą użytkownika i hasłem. ({error})",
     "el": "Άρνηση πρόσβασης (επισκέπτης). Δοκιμάστε με όνομα χρήστη/κωδικό. ({error})"
   },
+  "net.smbclientMissing": {
+    "fr": "smbclient est introuvable sur ce serveur : impossible de lister les partages SMB. Installez le paquet smbclient (Alpine : samba-client), ou, en conteneur Docker, montez le partage sur l'hôte et liez-le au conteneur (docs/DOCKER-PARTAGE-SMB.md).",
+    "en": "smbclient was not found on this server, so SMB shares cannot be listed. Install the smbclient package (Alpine: samba-client), or, in a Docker container, mount the share on the host and bind it into the container (docs/DOCKER-PARTAGE-SMB.md).",
+    "de": "smbclient wurde auf diesem Server nicht gefunden, SMB-Freigaben können nicht aufgelistet werden. Installieren Sie das Paket smbclient (Alpine: samba-client) oder binden Sie die Freigabe im Docker-Container über einen Mount auf dem Host ein (docs/DOCKER-PARTAGE-SMB.md).",
+    "es": "No se encontró smbclient en este servidor: no se pueden listar los recursos SMB. Instale el paquete smbclient (Alpine: samba-client) o, en un contenedor Docker, monte el recurso en el host y vincúlelo al contenedor (docs/DOCKER-PARTAGE-SMB.md).",
+    "it": "smbclient non trovato su questo server: impossibile elencare le condivisioni SMB. Installa il pacchetto smbclient (Alpine: samba-client) oppure, in un container Docker, monta la condivisione sull'host e collegala al container (docs/DOCKER-PARTAGE-SMB.md).",
+    "zh": "此服务器上未找到 smbclient，无法列出 SMB 共享。请安装 smbclient 软件包（Alpine：samba-client），或在 Docker 容器中先在主机上挂载共享再绑定到容器（docs/DOCKER-PARTAGE-SMB.md）。",
+    "ja": "このサーバーに smbclient が見つからないため、SMB 共有を一覧できません。smbclient パッケージ（Alpine：samba-client）をインストールするか、Docker コンテナではホスト側で共有をマウントしてコンテナにバインドしてください（docs/DOCKER-PARTAGE-SMB.md）。",
+    "ko": "이 서버에서 smbclient를 찾을 수 없어 SMB 공유를 나열할 수 없습니다. smbclient 패키지(Alpine: samba-client)를 설치하거나, Docker 컨테이너에서는 호스트에 공유를 마운트한 뒤 컨테이너에 연결하세요(docs/DOCKER-PARTAGE-SMB.md).",
+    "ro": "smbclient nu a fost găsit pe acest server: partajările SMB nu pot fi listate. Instalați pachetul smbclient (Alpine: samba-client) sau, într-un container Docker, montați partajarea pe gazdă și legați-o în container (docs/DOCKER-PARTAGE-SMB.md).",
+    "sv": "smbclient hittades inte på den här servern, så SMB-resurser kan inte listas. Installera paketet smbclient (Alpine: samba-client), eller montera resursen på värden och koppla den till Docker-containern (docs/DOCKER-PARTAGE-SMB.md).",
+    "hu": "A smbclient nem található ezen a szerveren, ezért az SMB-megosztások nem listázhatók. Telepítse a smbclient csomagot (Alpine: samba-client), vagy Docker-konténerben csatolja a megosztást a gazdagépen, és kösse be a konténerbe (docs/DOCKER-PARTAGE-SMB.md).",
+    "vi": "Không tìm thấy smbclient trên máy chủ này nên không thể liệt kê thư mục chia sẻ SMB. Hãy cài gói smbclient (Alpine: samba-client), hoặc trong container Docker, gắn thư mục chia sẻ trên máy chủ rồi liên kết vào container (docs/DOCKER-PARTAGE-SMB.md).",
+    "nb": "smbclient ble ikke funnet på denne serveren, så SMB-delinger kan ikke listes. Installer pakken smbclient (Alpine: samba-client), eller monter delingen på verten og koble den til Docker-containeren (docs/DOCKER-PARTAGE-SMB.md).",
+    "pl": "Nie znaleziono smbclient na tym serwerze, więc nie można wyświetlić udziałów SMB. Zainstaluj pakiet smbclient (Alpine: samba-client) lub, w kontenerze Docker, zamontuj udział na hoście i podłącz go do kontenera (docs/DOCKER-PARTAGE-SMB.md).",
+    "el": "Το smbclient δεν βρέθηκε σε αυτόν τον διακομιστή, οπότε δεν είναι δυνατή η εμφάνιση των κοινόχρηστων SMB. Εγκαταστήστε το πακέτο smbclient (Alpine: samba-client) ή, σε κοντέινερ Docker, προσαρτήστε τον κοινόχρηστο φάκελο στον κεντρικό υπολογιστή και συνδέστε τον στο κοντέινερ (docs/DOCKER-PARTAGE-SMB.md)."
+  },
   "net.smbScanFailed": {
     "fr": "Impossible de scanner {host} : {error}",
     "en": "Unable to scan {host}: {error}",
@@ -4028,6 +4062,23 @@
     "pl": "Ten utwór nie jest dostępny do odtwarzania w serwisie (prawa, region lub subskrypcja).",
     "el": "Αυτό το κομμάτι δεν είναι διαθέσιμο για αναπαραγωγή από την υπηρεσία (δικαιώματα, περιοχή ή συνδρομή)."
   },
+  "playback.cd_disc_absent": {
+    "fr": "Le disque n'est plus dans le lecteur. Remettez le CD pour l'écouter, ou lisez sa copie dans la bibliothèque.",
+    "en": "The disc is no longer in the drive. Put the CD back in to listen to it, or play its copy from the library.",
+    "de": "Die Disc ist nicht mehr im Laufwerk. Legen Sie die CD wieder ein, um sie zu hören, oder spielen Sie ihre Kopie aus der Bibliothek ab.",
+    "es": "El disco ya no está en la unidad. Vuelva a introducir el CD para escucharlo o reproduzca su copia de la biblioteca.",
+    "it": "Il disco non è più nell'unità. Reinserisci il CD per ascoltarlo, oppure riproduci la sua copia dalla libreria.",
+    "zh": "光盘已不在光驱中。请重新放入 CD 收听，或播放资料库中的副本。",
+    "ja": "ディスクはもうドライブに入っていません。聴くには CD を入れ直すか、ライブラリにあるコピーを再生してください。",
+    "ko": "디스크가 더 이상 드라이브에 없습니다. CD를 다시 넣어 들으시거나 라이브러리의 사본을 재생하세요.",
+    "ro": "Discul nu mai este în unitate. Reintroduceți CD-ul pentru a-l asculta sau redați copia sa din bibliotecă.",
+    "sv": "Skivan finns inte längre i enheten. Sätt tillbaka cd-skivan för att lyssna på den, eller spela dess kopia från biblioteket.",
+    "hu": "A lemez már nincs a meghajtóban. Tegye vissza a CD-t a meghallgatáshoz, vagy játssza le a könyvtárban lévő másolatát.",
+    "vi": "Đĩa không còn trong ổ. Hãy đưa CD vào lại để nghe, hoặc phát bản sao của nó trong thư viện.",
+    "nb": "Platen er ikke lenger i stasjonen. Sett inn CD-en igjen for å lytte til den, eller spill av kopien i biblioteket.",
+    "pl": "Płyty nie ma już w napędzie. Włóż ponownie płytę CD, aby jej posłuchać, lub odtwórz jej kopię z biblioteki.",
+    "el": "Ο δίσκος δεν βρίσκεται πλέον στη μονάδα. Τοποθετήστε ξανά το CD για να το ακούσετε ή αναπαράγετε το αντίγραφό του από τη βιβλιοθήκη."
+  },
   "spotify.playback.disabled": {
     "fr": "Lecture Spotify non activée : l'option « Lecture Spotify (expérimental) » se trouve dans Réglages › Accès et jetons › Spotify Connect (niveau Avancé).",
     "en": "Spotify playback is not enabled: the “Spotify playback (experimental)” option is in Settings › Access and tokens › Spotify Connect (Advanced level).",
@@ -4061,6 +4112,23 @@
     "nb": "Spotify tillater bare lytting i en tredjepartsapp som Tune med en Spotify Premium-konto, og denne kontoen har ikke det. Blaing (spillelister, album, søk) er fortsatt tilgjengelig; for å lytte, bruk Spotify-appen eller oppgrader til Premium.",
     "pl": "Spotify pozwala słuchać w aplikacji innej firmy, takiej jak Tune, tylko z kontem Spotify Premium, a to konto go nie ma. Przeglądanie (playlisty, albumy, wyszukiwanie) pozostaje dostępne; aby słuchać, użyj aplikacji Spotify lub przejdź na Premium.",
     "el": "Το Spotify επιτρέπει την ακρόαση σε εφαρμογή τρίτων όπως το Tune μόνο με λογαριασμό Spotify Premium, και αυτός ο λογαριασμός δεν έχει. Η περιήγηση (λίστες, άλμπουμ, αναζήτηση) παραμένει διαθέσιμη· για ακρόαση, χρησιμοποιήστε την εφαρμογή Spotify ή περάστε σε Premium."
+  },
+  "spotify.playback.audioKeyRefused": {
+    "fr": "Spotify a refusé les clés audio de ce compte : ses titres ne peuvent pas être lus dans Tune. Ce refus vient de Spotify, pas de Tune.",
+    "en": "Spotify refused the audio keys for this account: its tracks cannot be played in Tune. The refusal comes from Spotify, not from Tune.",
+    "de": "Spotify hat die Audioschlüssel dieses Kontos verweigert: Seine Titel können in Tune nicht abgespielt werden. Die Ablehnung kommt von Spotify, nicht von Tune.",
+    "es": "Spotify ha rechazado las claves de audio de esta cuenta: sus canciones no se pueden reproducir en Tune. El rechazo viene de Spotify, no de Tune.",
+    "it": "Spotify ha rifiutato le chiavi audio di questo account: i suoi brani non possono essere riprodotti in Tune. Il rifiuto viene da Spotify, non da Tune.",
+    "zh": "Spotify 拒绝了此账户的音频密钥：其曲目无法在 Tune 中播放。拒绝来自 Spotify，而非 Tune。",
+    "ja": "Spotify がこのアカウントのオーディオキーを拒否しました。このアカウントの曲は Tune で再生できません。拒否しているのは Tune ではなく Spotify です。",
+    "ko": "Spotify가 이 계정의 오디오 키를 거부했습니다. 이 계정의 곡은 Tune에서 재생할 수 없습니다. 거부는 Tune이 아니라 Spotify에서 온 것입니다.",
+    "ro": "Spotify a refuzat cheile audio ale acestui cont: piesele sale nu pot fi redate în Tune. Refuzul vine de la Spotify, nu de la Tune.",
+    "sv": "Spotify har nekat ljudnycklarna för det här kontot: dess spår kan inte spelas i Tune. Nekandet kommer från Spotify, inte från Tune.",
+    "hu": "A Spotify elutasította ennek a fióknak a hangkulcsait: a számai nem játszhatók le a Tune-ban. Az elutasítás a Spotifytól származik, nem a Tune-tól.",
+    "vi": "Spotify đã từ chối khóa âm thanh của tài khoản này: không thể phát các bài hát của tài khoản trong Tune. Sự từ chối đến từ Spotify, không phải từ Tune.",
+    "nb": "Spotify har avvist lydnøklene for denne kontoen: sporene kan ikke spilles av i Tune. Avvisningen kommer fra Spotify, ikke fra Tune.",
+    "pl": "Spotify odrzucił klucze audio tego konta: jego utworów nie można odtworzyć w Tune. Odmowa pochodzi od Spotify, nie od Tune.",
+    "el": "Το Spotify απέρριψε τα κλειδιά ήχου αυτού του λογαριασμού: τα κομμάτια του δεν μπορούν να αναπαραχθούν στο Tune. Η άρνηση προέρχεται από το Spotify, όχι από το Tune."
   },
   "spotify.playback.linkRequired": {
     "fr": "Spotify demande une étape unique : dans l'application Spotify (téléphone ou ordinateur, même réseau, même compte), choisissez une fois l'appareil « {device} ». Tune garde ensuite cette liaison.",

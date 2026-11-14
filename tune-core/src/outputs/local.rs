@@ -1,4 +1,5 @@
 mod boucle_locale_5639;
+mod diagnostic_surechantillonnage_8259;
 mod lecture_http;
 mod retard_de_depart_8437;
 use lecture_http::LecteurHttpAnnulable;
@@ -868,6 +869,7 @@ pub struct LocalOutput {
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
     /// piste par l'orchestrateur, comme `pure_bypass`. Défaut désarmé.
     strict_bitperfect: Arc<AtomicBool>,
+    fixed_sample_rate: AtomicU32,
     /// #6132 — la seconde sortie de la zone qui joue ici (nom du périphérique
     /// B), ou `None`. Posée par piste par l'orchestrateur depuis
     /// `zone_{id}_sortie_double`, lue une fois par `play_url`.
@@ -889,6 +891,9 @@ pub struct LocalOutput {
     surechantillonnage: Arc<
         std::sync::Mutex<Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage>>,
     >,
+
+    /// #8259 — la cause de refus de la piste ouverte, distincte du réglage.
+    diagnostic_surechantillonnage: Arc<diagnostic_surechantillonnage_8259::Diagnostic>,
     /// Repli mono de la zone en cours de lecture sur cette sortie (#2362).
     ///
     /// Quand il est armé, la chaîne somme `M = (L + R) / 2` et réémet `M` sur
@@ -1493,6 +1498,7 @@ impl LocalOutput {
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
             pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
+            fixed_sample_rate: AtomicU32::new(0),
             seconde_sortie: std::sync::Mutex::new(Vec::new()),
             retard_de_depart_ms: AtomicU64::new(0),
             mono_downmix: Arc::new(AtomicBool::new(false)),
@@ -1504,6 +1510,7 @@ impl LocalOutput {
             // exactement comme avant #1590.
             soft_mute_ms: Arc::new(AtomicU32::new(0)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
+            diagnostic_surechantillonnage: Arc::default(),
             surechantillonnage: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
@@ -2106,6 +2113,11 @@ impl LocalOutput {
             .clone()
     }
 
+    pub fn set_fixed_sample_rate(&self, rate: Option<u32>) {
+        self.fixed_sample_rate
+            .store(rate.unwrap_or(0), Ordering::Relaxed);
+    }
+
     pub fn set_strict_bitperfect(&self, strict: bool) {
         self.strict_bitperfect.store(strict, Ordering::Relaxed);
     }
@@ -2370,8 +2382,23 @@ impl LocalOutput {
         &self,
         choix: Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage>,
     ) {
+        self.set_decision_surechantillonnage(
+            choix.ok_or(crate::audio::surechantillonnage::Ecarte::Desactive),
+        );
+    }
+
+    /// Le refus suit le choix, sans réécrire le diagnostic de la piste en cours.
+    pub fn set_decision_surechantillonnage(
+        &self,
+        choix: Result<
+            crate::audio::surechantillonnage::ChoixSurechantillonnage,
+            crate::audio::surechantillonnage::Ecarte,
+        >,
+    ) {
         if let Ok(mut slot) = self.surechantillonnage.lock() {
-            *slot = choix;
+            self.diagnostic_surechantillonnage
+                .demander(choix.as_ref().err().map(|e| e.code()));
+            *slot = choix.ok();
         }
     }
 
@@ -5318,27 +5345,37 @@ impl SurechDeLEtage<'_> {
     }
 }
 
+/// #8428 — la cadence fixe de la zone que l'ouverture du périphérique a
+/// RAMENÉE à la cadence que la sortie accepte : `Some((demandée, ouverte))`.
+/// `None` quand rien n'est demandé, que la cadence est tenue, ou que le flux
+/// est un porteur DoP, sous PURE ou bit-perfect strict (aucune conversion).
+///
+/// Décision de Bertrand du 12/11 : ce n'est JAMAIS un refus. La piste joue à
+/// la cadence ouverte, convertie comme toute autre ; le chemin du signal le
+/// dit (`fixed_rate_limit`, lu sur la cadence ouverte que la sortie déclare).
+pub(super) fn cadence_fixe_ramenee(
+    demandee: u32,
+    ouverte: u32,
+    dop: bool,
+    pure: bool,
+    strict: bool,
+) -> Option<(u32, u32)> {
+    (demandee != 0 && ouverte != 0 && demandee != ouverte && !dop && !pure && !strict)
+        .then_some((demandee, ouverte))
+}
+
 /// #7614 — le greffon peut-il s'ouvrir sur ce flux ? Jamais sous PURE, jamais
 /// sur un porteur DoP : un flux 24 bits dont l'amorce est un porteur, ou trop
 /// courte pour l'écarter, garde son chemin.
+#[cfg(test)]
 pub(super) fn surechantillonneur_admis_a_l_ouverture(
     spec: AudioSpec,
     amorce: &[u8],
     pure: bool,
     dop: bool,
 ) -> bool {
-    if pure || dop {
-        return false;
-    }
-    let canaux = spec.canaux();
-    let bits = spec.profondeur().bits_declares();
-    if bits == 24 {
-        let sonde = DOP_DETECT_FRAMES * usize::from(canaux) * 3;
-        if amorce.len() < sonde || is_dop_pcm(amorce, bits, canaux) {
-            return false;
-        }
-    }
-    true
+    diagnostic_surechantillonnage_8259::refus_a_l_ouverture(spec, amorce, pure, dop, false)
+        .is_none()
 }
 
 /// Ce qu'une poussée vers le puits a produit.
@@ -6679,6 +6716,7 @@ impl OutputTarget for LocalOutput {
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
+        let fixed_sample_rate = self.fixed_sample_rate.load(Ordering::Relaxed);
         // #6132 — lue UNE fois par piste, comme `strict_bitperfect`.
         let seconde_sortie = self.secondes_sorties();
         // #8437 — lu UNE fois par piste : une transition gapless ne repasse
@@ -6692,6 +6730,10 @@ impl OutputTarget for LocalOutput {
         let canaux_de_carte = self.canaux_de_carte();
         let crossfeed = self.crossfeed.clone();
         let surechantillonnage = self.surechantillonnage.clone();
+        let diagnostic_surechantillonnage = self.diagnostic_surechantillonnage.clone();
+        if let Ok(choix) = surechantillonnage.lock() {
+            diagnostic_surechantillonnage.ouvrir(choix.is_some());
+        }
         let dop_active = self.dop_active.clone();
         // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
         // plutôt que trois atomiques de plus dans des fermetures qui en portent
@@ -8035,15 +8077,20 @@ impl OutputTarget for LocalOutput {
             let choix_du_surechantillonneur = surechantillonnage
                 .lock()
                 .ok()
-                .and_then(|c| c.clone())
-                .filter(|_| seconde_sortie.is_empty())
+                .and_then(|c| {
+                    diagnostic_surechantillonnage.ouvrir(c.is_some());
+                    c.clone()
+                })
                 .filter(|_| {
-                    surechantillonneur_admis_a_l_ouverture(
+                    let refus = diagnostic_surechantillonnage_8259::refus_a_l_ouverture(
                         spec,
                         header_buf.get(data_offset..).unwrap_or_default(),
                         pure_bypass.load(Ordering::Relaxed),
                         dop_active.load(Ordering::Relaxed),
-                    )
+                        !seconde_sortie.is_empty(),
+                    );
+                    diagnostic_surechantillonnage.noter(refus);
+                    refus.is_none()
                 });
             let ouverture = match choix_du_surechantillonneur.as_ref() {
                 Some(choix) => {
@@ -8081,6 +8128,32 @@ impl OutputTarget for LocalOutput {
             let peripherique_suit_la_source = backend.suit_la_cadence_source();
 
             let output_sr = sortie.cadence;
+            // #8428 — décision de Bertrand du 12/11 : RAMENER AU PLAFOND. Le
+            // système a ouvert une autre cadence que la cadence fixe (WASAPI
+            // partagé, mixeur à 48 kHz) : la piste joue à la cadence ouverte,
+            // convertie comme toute autre, et le chemin du signal le dit
+            // (`fixed_rate_limit` : « 96 kHz demandé, 48 kHz appliqué », lu sur
+            // la cadence OUVERTE que la sortie déclare). Le DoP garde sa
+            // cadence de transport et n'est jamais rééchantillonné.
+            if let Some((demandee, ouverte)) = cadence_fixe_ramenee(
+                fixed_sample_rate,
+                output_sr,
+                dop_active.load(Ordering::Relaxed)
+                    || is_dop_pcm(
+                        header_buf.get(data_offset..).unwrap_or_default(),
+                        bit_depth,
+                        channels,
+                    ),
+                pure_bypass.load(Ordering::Relaxed),
+                strict_bitperfect,
+            ) {
+                warn!(
+                    device = %device_name,
+                    cadence_fixe_demandee = demandee,
+                    cadence_ouverte = ouverte,
+                    "frequence_fixe_ramenee_a_la_cadence_de_la_sortie"
+                );
+            }
             let output_ch = sortie.canaux;
             reaffectation.constater_l_ouverture(voies_de_la_matrice, output_ch, &device_name);
 
@@ -8150,6 +8223,11 @@ impl OutputTarget for LocalOutput {
                     }
                 });
             if choix_du_surechantillonneur.is_some() && etage_du_surechantillonneur.is_none() {
+                diagnostic_surechantillonnage.noter(Some(
+                    backend
+                        .refus_du_surechantillonneur()
+                        .unwrap_or("filter_initialization_failed"),
+                ));
                 info!(
                     device = %device_name,
                     source_sr = sample_rate,
@@ -9061,6 +9139,7 @@ impl OutputTarget for LocalOutput {
         if let Ok(mut slot) = self.signal_path_status.lock() {
             *slot = None;
         }
+        self.diagnostic_surechantillonnage.noter(None);
         if let Ok(mut slot) = self.transformations_reelles.lock() {
             *slot = None;
         }
@@ -9239,7 +9318,10 @@ impl OutputTarget for LocalOutput {
         // le voyant nomme ce gain au lieu d'un « DSP appliqué » ambigu.
         let garde = self.preampli_garde();
         mesure.map(|t| {
-            let t = t.avec_fondu_enchaine(fondu);
+            let t = self
+                .diagnostic_surechantillonnage
+                .declarer(t)
+                .avec_fondu_enchaine(fondu);
             match garde {
                 Some(g) => t.avec_preampli_garde(g.db, g.en_retour),
                 None => t,

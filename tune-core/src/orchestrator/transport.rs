@@ -363,6 +363,9 @@ impl PlaybackOrchestrator {
         // #8088 — un contenu marqué explicite, pour un profil dont la
         // politique parentale le masque : rien ne part.
         self.verifier_le_contenu_explicite(&req).await?;
+        // #8611 — une piste d'un artiste bloqué par la politique parentale
+        // du profil : rien ne part.
+        self.verifier_l_artiste_bloque(&req).await?;
 
         // Re-tap dedup (#1271): a controller (Flutter/web) can emit `play` TWICE
         // for the SAME track a few seconds apart. The first play already sent
@@ -2364,6 +2367,9 @@ impl PlaybackOrchestrator {
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
+                    local_output.set_fixed_sample_rate(crate::audio::frequence_fixe::active(
+                        &self.db, zone_id,
+                    ));
                     // #3973 — « bit-perfect strict » de la zone, posé à chaque
                     // lecture comme PURE : c'est lui que `play_url` transmet à
                     // l'ouverture cpal (`DemandeDOuverture::strict_bitperfect`).
@@ -2396,14 +2402,15 @@ impl PlaybackOrchestrator {
                     // zone has crossfeed disabled OR is in PURE mode, so a PURE
                     // zone stays bit-perfect. Rebuilt per-play at the resolved
                     // stream sample rate so the delay line matches the DAC clock.
-                    let cf_sr = media.sample_rate.unwrap_or(44100);
+                    let cf_sr = crate::audio::frequence_fixe::active(&self.db, zone_id)
+                        .unwrap_or_else(|| media.sample_rate.unwrap_or(44100));
                     local_output.set_crossfeed(self.load_crossfeed_processor(zone_id, cf_sr));
                     // #7614 — le greffon de suréchantillonnage de la zone :
                     // `None` sous PURE, sans Premium, sans greffon installé,
                     // désactivé (défaut) ou sans test de la machine. La sortie
                     // le lit à l'ouverture de CETTE piste, jamais pendant.
-                    local_output.set_surechantillonnage(
-                        self.choix_du_surechantillonneur(zone_id, zone_audiophile),
+                    local_output.set_decision_surechantillonnage(
+                        self.decision_du_surechantillonneur(zone_id, zone_audiophile),
                     );
                     // Zone equalizer, applied by the output itself for a local
                     // DAC — exactly like the crossfeed above, and for the same
@@ -3261,6 +3268,20 @@ impl PlaybackOrchestrator {
             return format!(
                 "Impossible de lire la piste {geste} : contenu marqué explicite, \
                  interdit par le contrôle parental de ce profil"
+            );
+        }
+        // #8611 — la politique du profil ne se relit pas : la file s'arrête.
+        if cause.contains(crate::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE) {
+            return format!(
+                "Impossible de lire la piste {geste} : la politique de contrôle \
+                 parental de ce profil est illisible"
+            );
+        }
+        // #8611 — de même pour un artiste bloqué.
+        if cause.contains(crate::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE) {
+            return format!(
+                "Impossible de lire la piste {geste} : artiste bloqué par le \
+                 contrôle parental de ce profil"
             );
         }
         // #8227 — fil 2723 : « Suivant » a enjambé les 8 titres restants d'un

@@ -57,8 +57,13 @@ impl RefusDUrl {
 }
 
 /// Ce message demande-t-il d'arrêter la file ?
+///
+/// #8611 — aussi la lecture refusée parce que la politique parentale du
+/// profil est corrompue : chaque piste serait refusée de même, la file
+/// s'arrête au premier refus au lieu d'être sautée jusqu'au bout.
 pub fn arret_de_la_file(message: &str) -> bool {
     message.contains(MOTIF_ARRET_DE_LA_FILE)
+        || message.contains(crate::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE)
 }
 
 /// Ce que le fournisseur rend : l'URL, et le format du fichier quand il le

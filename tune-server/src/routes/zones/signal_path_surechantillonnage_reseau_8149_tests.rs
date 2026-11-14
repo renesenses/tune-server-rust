@@ -161,3 +161,43 @@ fn le_texte_du_strict_existe_dans_toutes_les_langues_8149() {
         assert!(v.is_some_and(|v| !v.is_empty()), "manque en {lang}");
     }
 }
+
+/// #8428 — sous une cadence fixe, le greffon de suréchantillonnage est écarté
+/// (dsp.rs) : la ligne le dit, au lieu du « non appliqué… à la piste
+/// suivante » muet. Contre-épreuve : sans cadence fixe, la raison redevient
+/// celle d'avant.
+#[test]
+fn zone_locale_a_cadence_fixe_dit_la_raison_8428() {
+    let (backend, zone, _ps) = zone("local");
+    let id = zone.id.unwrap();
+    let settings = SettingsRepo::with_backend(backend.clone());
+    settings
+        .set(&tune_core::audio::frequence_fixe::cle_de_zone(id), "48000")
+        .unwrap();
+    let (etat, etape) =
+        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None).unwrap();
+    assert_eq!(etat["reason"], "fixed_rate", "{etat}");
+    let d = etape["description"].as_str().unwrap();
+    assert_eq!(
+        d,
+        super::textes_signal::texte("fr", "upsampling_fixed_rate")
+    );
+    assert!(!d.contains("suivante"), "{d}");
+    settings
+        .delete(&tune_core::audio::frequence_fixe::cle_de_zone(id))
+        .unwrap();
+    let (etat, _) =
+        etat_du_surechantillonneur_lang("fr", &backend, id, false, "local", None).unwrap();
+    assert_ne!(etat["reason"], "fixed_rate", "{etat}");
+}
+
+#[test]
+fn le_texte_de_la_cadence_fixe_existe_dans_toutes_les_langues_8428() {
+    let textes: serde_json::Map<String, Value> =
+        serde_json::from_str(include_str!("textes_signal.json")).unwrap();
+    assert_eq!(textes.len(), 15);
+    for (lang, t) in &textes {
+        let v = t["upsampling_fixed_rate"].as_str();
+        assert!(v.is_some_and(|v| !v.is_empty()), "manque en {lang}");
+    }
+}

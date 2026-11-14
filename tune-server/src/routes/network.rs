@@ -722,6 +722,69 @@ async fn list_shares() -> Json<Value> {
     }
 }
 
+/// Outil d'énumération des partages SMB sous Linux (et en conteneur Docker).
+const SMBCLIENT: &str = "smbclient";
+
+/// Code stable renvoyé quand `smbclient` est introuvable (#8628).
+const SMBCLIENT_MISSING_CODE: &str = "smbclient_missing";
+
+/// Issue d'un lancement de `smbclient -L`.
+#[derive(Debug)]
+enum SmbclientRun {
+    /// Le programme a tourné : sa sortie standard (vide si rien de lisible).
+    Output(String),
+    /// Le programme n'existe pas dans le PATH (image sans `smbclient`).
+    Missing,
+    /// Autre échec de lancement (droits, etc.).
+    SpawnFailed(String),
+    TimedOut,
+}
+
+/// Lance `program` (normalement [`SMBCLIENT`]) ; le nom est un paramètre pour
+/// que les tests puissent simuler un binaire introuvable.
+async fn run_smbclient(program: &str, args: &[String], timeout: Duration) -> SmbclientRun {
+    match tokio::time::timeout(timeout, Command::new(program).args(args).output()).await {
+        Ok(Ok(out)) => SmbclientRun::Output(String::from_utf8_lossy(&out.stdout).to_string()),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => SmbclientRun::Missing,
+        Ok(Err(e)) => SmbclientRun::SpawnFailed(e.to_string()),
+        Err(_) => SmbclientRun::TimedOut,
+    }
+}
+
+/// Corps d'erreur de `scan-host` (SMB) quand aucun outil n'a rien rendu.
+///
+/// `smbclient` absent l'emporte, sauf sous macOS et Windows, où l'erreur de
+/// `smbutil` ou de `net view` (identifiants refusés…) est la bonne raison.
+fn smb_scan_error(
+    lang: &str,
+    host: &str,
+    last_error: &str,
+    smbclient_missing: bool,
+) -> Option<Value> {
+    let native_tool = cfg!(any(target_os = "macos", target_os = "windows"));
+    if smbclient_missing && (last_error.trim().is_empty() || !native_tool) {
+        return Some(json!({
+            "shares": [],
+            "code": SMBCLIENT_MISSING_CODE,
+            "error": crate::i18n::t(lang, "net.smbclientMissing"),
+        }));
+    }
+    if last_error.is_empty() {
+        return None;
+    }
+    let msg = if last_error.contains("Authentication")
+        || last_error.contains("auth")
+        || last_error.contains("STATUS_ACCESS_DENIED")
+    {
+        crate::i18n::t(lang, "net.smbAccessDenied").replace("{error}", last_error)
+    } else {
+        crate::i18n::t(lang, "net.smbScanFailed")
+            .replace("{host}", host)
+            .replace("{error}", last_error)
+    };
+    Some(json!({ "shares": [], "error": msg }))
+}
+
 /// Scan a specific host for SMB or NFS shares.
 async fn scan_host(
     headers: axum::http::HeaderMap,
@@ -736,6 +799,7 @@ async fn scan_host(
         let mut output = String::new();
         let mut success = false;
         let mut last_error = String::new();
+        let mut smbclient_missing = false;
 
         // Windows: net view \\host
         if !success {
@@ -809,20 +873,18 @@ async fn scan_host(
             } else {
                 smb_args.push("-N".to_string());
             }
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                Command::new("smbclient").args(&smb_args).output(),
-            )
-            .await
-            {
-                Ok(Ok(out)) => {
-                    output = String::from_utf8_lossy(&out.stdout).to_string();
+            match run_smbclient(SMBCLIENT, &smb_args, Duration::from_secs(10)).await {
+                SmbclientRun::Output(out) => output = out,
+                SmbclientRun::Missing => {
+                    // #8628 (fil 2788) : image Docker sans smbclient. Sans ce
+                    // repère, la route répondait `{"shares": []}` sans raison.
+                    tracing::warn!(host = %host, "network_smb_smbclient_missing");
+                    smbclient_missing = true;
                 }
-                Ok(Err(e)) => {
-                    // smbclient not available — use last_error from previous tools
-                    tracing::warn!(host = %host, error = %e, "network_smb_smbclient_spawn_failed (smbclient not installed?)");
+                SmbclientRun::SpawnFailed(e) => {
+                    tracing::warn!(host = %host, error = %e, "network_smb_smbclient_spawn_failed");
                 }
-                Err(_) => {
+                SmbclientRun::TimedOut => {
                     tracing::warn!(host = %host, "network_smb_scan_timed_out (smbclient -L)");
                     return (
                         StatusCode::GATEWAY_TIMEOUT,
@@ -833,19 +895,11 @@ async fn scan_host(
             }
         }
 
-        if output.trim().is_empty() && !last_error.is_empty() {
-            tracing::warn!(host = %host, error = %last_error.trim(), "network_smb_scan_failed");
-            let msg = if last_error.contains("Authentication")
-                || last_error.contains("auth")
-                || last_error.contains("STATUS_ACCESS_DENIED")
-            {
-                crate::i18n::t(&lang, "net.smbAccessDenied").replace("{error}", &last_error)
-            } else {
-                crate::i18n::t(&lang, "net.smbScanFailed")
-                    .replace("{host}", host)
-                    .replace("{error}", &last_error)
-            };
-            return (StatusCode::OK, Json(json!({ "shares": [], "error": msg }))).into_response();
+        if output.trim().is_empty() {
+            if let Some(body) = smb_scan_error(&lang, host, &last_error, smbclient_missing) {
+                tracing::warn!(host = %host, error = %last_error.trim(), smbclient_missing, "network_smb_scan_failed");
+                return (StatusCode::OK, Json(body)).into_response();
+            }
         }
 
         output
@@ -4345,5 +4399,50 @@ mod tests_echec_du_montage_8069 {
         )
         .await;
         assert_eq!(statut, StatusCode::CONFLICT);
+    }
+}
+
+#[cfg(test)]
+mod tests_smbclient_absent_8628 {
+    use super::*;
+
+    #[tokio::test]
+    async fn binaire_introuvable_donne_missing() {
+        let run = run_smbclient(
+            "tune-8628-smbclient-introuvable",
+            &[
+                "-L".to_string(),
+                "//127.0.0.1".to_string(),
+                "-N".to_string(),
+            ],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(matches!(run, SmbclientRun::Missing), "{run:?}");
+    }
+
+    #[test]
+    fn smbclient_absent_donne_une_erreur_stable_et_traduite() {
+        let fr = smb_scan_error("fr", "nas", "", true).expect("erreur attendue");
+        assert_eq!(fr["code"], SMBCLIENT_MISSING_CODE);
+        assert_eq!(fr["shares"], json!([]));
+        let msg = fr["error"].as_str().unwrap();
+        assert!(msg.contains("smbclient"), "{msg}");
+        assert_ne!(msg, "net.smbclientMissing", "clé non traduite");
+
+        let en = smb_scan_error("en", "nas", "", true).unwrap();
+        assert_ne!(en["error"], fr["error"], "le message suit la langue");
+    }
+
+    #[test]
+    fn sans_smbclient_absent_ni_erreur_pas_de_corps() {
+        assert!(smb_scan_error("fr", "nas", "", false).is_none());
+    }
+
+    #[test]
+    fn erreur_d_un_autre_outil_garde_son_message() {
+        let body = smb_scan_error("en", "nas", "boom", false).unwrap();
+        assert!(body.get("code").is_none());
+        assert!(body["error"].as_str().unwrap().contains("boom"));
     }
 }

@@ -7245,3 +7245,7 @@ mod dossiers_exclus_de_l_enrichissement_7538_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "consentements_patch_partiel_8521_tests.rs"]
+mod consentements_patch_partiel_8521_tests;

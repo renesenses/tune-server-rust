@@ -244,6 +244,10 @@ async fn le_lot_porte_le_morceau_et_rien_de_la_machine() {
     assert_eq!(so_what["profile"], json!(empreinte_de_profil(SERVEUR, 3)));
     assert_eq!(so_what["profile"].as_str().unwrap().len(), 16);
 
+    // #8645 — la provenance part avec chaque écoute.
+    assert_eq!(so_what["source"], json!("local"));
+    assert_eq!(ecoutes[1]["source"], json!("qobuz"));
+
     // Une piste de service : pas d'ISRC connu, pas de profil.
     assert_eq!(ecoutes[1]["track"]["isrc"], Value::Null);
     assert_eq!(ecoutes[1]["profile"], Value::Null);
@@ -261,7 +265,14 @@ async fn le_lot_porte_le_morceau_et_rien_de_la_machine() {
     cles.sort();
     assert_eq!(
         cles,
-        ["duration_ms", "event_id", "listened_at", "profile", "track"],
+        [
+            "duration_ms",
+            "event_id",
+            "listened_at",
+            "profile",
+            "source",
+            "track"
+        ],
         "une clé inattendue est partie"
     );
 }
@@ -857,4 +868,41 @@ async fn un_libelle_de_flux_sans_artiste_ne_part_pas() {
     ] {
         assert!(!libelle_de_flux(t), "« {t} » est un vrai titre");
     }
+}
+
+/// #8645 — un épisode de podcast part avec `source = "podcast"` : son artiste
+/// et son album sont le nom de l'émission, le site les tient hors de ses
+/// classements (site-mozaiklabs). Une écoute sans source part en `local`.
+#[tokio::test]
+async fn la_source_part_avec_l_ecoute_8645() {
+    let (url, site) = faux_site().await;
+    let b = base();
+    ecoute(
+        &b,
+        1,
+        "Épisode du jour",
+        None,
+        "podcast",
+        "2026-10-18T20:00:00Z",
+        None,
+    );
+    b.execute(
+        "INSERT INTO listen_history (id, title, artist_name, source, duration_ms, listened_at) \
+         VALUES (2, 'Ancienne écoute', 'Miles Davis', NULL, 562000, '2026-10-18T20:10:00Z')",
+        &[],
+    )
+    .unwrap();
+    relier(&b, &url);
+    activer(&b);
+
+    let issue = passe(&b, &http(), maintenant()).await;
+    assert!(matches!(issue, Issue::Envoye { .. }), "{issue:?}");
+    let site = site.lock().unwrap();
+    let sources: Vec<&str> = site.corps[0]["listens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(sources, ["podcast", "local"]);
 }

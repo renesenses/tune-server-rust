@@ -550,6 +550,10 @@ struct SearchQuery {
     /// #7718 — le niveau de qualité minimal d'au moins un flux.
     quality_min: Option<String>,
     lossless: Option<bool>,
+    /// Recette rc12 (14/11) — le bouton « Sans perte » (alias de `lossless`).
+    sans_perte: Option<bool>,
+    /// Recette rc12 (14/11) — le bouton « Haute qualité » : sans perte ou ≥ 256 kbit/s.
+    haute_qualite: Option<bool>,
     hires: Option<bool>,
     favorites_only: Option<bool>,
     rated_min: Option<f64>,
@@ -570,6 +574,7 @@ impl SearchQuery {
             self.metadata_plus,
         )
         .avec_qualite_min(self.quality_min.as_deref())
+        .avec_boutons_rc12(self.sans_perte, self.haute_qualite)
     }
 }
 
@@ -3784,7 +3789,7 @@ pub fn alarms_router() -> Router<AppState> {
 
 async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let rows = state.backend.query_many(
-        "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, CAST(source_id AS TEXT), source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds, days_of_week, multi_zone_ids FROM alarms ORDER BY time",
+        "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, CAST(source_id AS TEXT), source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds, days_of_week, multi_zone_ids, interrupt_playback FROM alarms ORDER BY time",
         &[],
     ).map_err(AppError::internal)?;
     let items: Vec<Value> = rows
@@ -3809,6 +3814,8 @@ async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppEr
                 "fade_in_seconds": r.get(15).and_then(|v| v.as_i64()),
                 "days_of_week": r.get(16).and_then(|v| v.as_string()),
                 "multi_zone_ids": r.get(17).and_then(|v| v.as_string()),
+                // #8615 — « Interrompre la lecture en cours », cochée par défaut.
+                "interrupt_playback": r.get(18).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
             })
         })
         .collect();
@@ -3834,6 +3841,8 @@ struct CreateAlarmGlobal {
     days_of_week: Option<String>,
     /// JSON array of zone IDs, e.g. "[1,3,5]". Premium only.
     multi_zone_ids: Option<String>,
+    /// #8615 — « Interrompre la lecture en cours ». Absent : coché.
+    interrupt_playback: Option<bool>,
 }
 
 /// Le masque `days_of_week` effectif d'une écriture de réveil (#5669).
@@ -3960,6 +3969,11 @@ async fn create_alarm_global(
     } else {
         0
     };
+    let interrupt_playback_int: i32 = if body.interrupt_playback.unwrap_or(true) {
+        1
+    } else {
+        0
+    };
 
     use tune_core::db::backend::ToSqlValue;
     let name = body.name.unwrap_or_else(|| "Alarm".into());
@@ -3973,8 +3987,8 @@ async fn create_alarm_global(
     };
     let profile_id = profile.id();
     match state.backend.execute_returning_id(
-        "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled, days_of_week, multi_zone_ids, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        &[&name as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &one_shot_int as &dyn ToSqlValue, &skip_holidays_int as &dyn ToSqlValue, &body.zone_id as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &source_id as &dyn ToSqlValue, &body.source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_duration_s as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &enabled_int as &dyn ToSqlValue, &days_of_week as &dyn ToSqlValue, &multi_zone_ids_opt as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
+        "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled, days_of_week, multi_zone_ids, profile_id, interrupt_playback) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&name as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &one_shot_int as &dyn ToSqlValue, &skip_holidays_int as &dyn ToSqlValue, &body.zone_id as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &source_id as &dyn ToSqlValue, &body.source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_duration_s as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &enabled_int as &dyn ToSqlValue, &days_of_week as &dyn ToSqlValue, &multi_zone_ids_opt as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue, &interrupt_playback_int as &dyn ToSqlValue],
     ) {
         Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
@@ -4000,6 +4014,8 @@ struct UpdateAlarm {
     enabled: Option<bool>,
     days_of_week: Option<String>,
     multi_zone_ids: Option<String>,
+    /// #8615 — « Interrompre la lecture en cours ». Absent : inchangé.
+    interrupt_playback: Option<bool>,
 }
 
 async fn update_alarm(
@@ -4100,6 +4116,10 @@ async fn update_alarm(
     if let Some(skip_holidays) = body.skip_holidays {
         sets.push("skip_holidays = ?".into());
         values.push((skip_holidays as i32).to_sql_value());
+    }
+    if let Some(interrupt_playback) = body.interrupt_playback {
+        sets.push("interrupt_playback = ?".into());
+        values.push((interrupt_playback as i32).to_sql_value());
     }
     if let Some(zone_id) = body.zone_id {
         sets.push("zone_id = ?".into());

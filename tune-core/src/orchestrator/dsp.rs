@@ -2471,6 +2471,22 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         pure: bool,
     ) -> Option<crate::audio::surechantillonnage::ChoixSurechantillonnage> {
+        self.decision_du_surechantillonneur(zone_id, pure).ok()
+    }
+
+    /// #8259 — conserver le refus pour le chemin du signal de la piste ouverte.
+    pub fn decision_du_surechantillonneur(
+        &self,
+        zone_id: i64,
+        pure: bool,
+    ) -> Result<
+        crate::audio::surechantillonnage::ChoixSurechantillonnage,
+        crate::audio::surechantillonnage::Ecarte,
+    > {
+        // #8428 — la cadence fixe porte déjà le flux décodé : ne pas la multiplier.
+        if crate::audio::frequence_fixe::active(&self.db, zone_id).is_some() {
+            return Err(crate::audio::surechantillonnage::Ecarte::FrequenceFixe);
+        }
         let premium = self
             .license
             .as_ref()
@@ -2478,12 +2494,12 @@ impl PlaybackOrchestrator {
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         match crate::audio::surechantillonnage::choix_de_la_zone(&settings, premium, pure, zone_id)
         {
-            Ok(choix) => Some(choix),
+            Ok(choix) => Ok(choix),
             Err(ecarte) => {
                 if ecarte != crate::audio::surechantillonnage::Ecarte::Desactive {
                     tracing::info!(zone_id, reason = ecarte.code(), "upsampler_not_engaged");
                 }
-                None
+                Err(ecarte)
             }
         }
     }
@@ -2501,7 +2517,7 @@ impl PlaybackOrchestrator {
                 return;
             }
             let pure = self.zone_audiophile(zone_id);
-            let choix = self.choix_du_surechantillonneur(zone_id, pure);
+            let choix = self.decision_du_surechantillonneur(zone_id, pure);
             let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
                 return;
             };
@@ -2510,7 +2526,9 @@ impl PlaybackOrchestrator {
                 .as_any()
                 .downcast_ref::<crate::outputs::local::LocalOutput>()
             {
-                local.set_surechantillonnage(choix);
+                local.set_decision_surechantillonnage(choix);
+                local
+                    .set_fixed_sample_rate(crate::audio::frequence_fixe::active(&self.db, zone_id));
             }
         }
     }

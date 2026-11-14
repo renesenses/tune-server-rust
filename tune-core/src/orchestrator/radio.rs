@@ -329,6 +329,7 @@ struct CanauxRadio<'a> {
     /// devrait relever (`renderer_safe_wav_rate`) est refusée, pas convertie.
     strict_bitperfect: bool,
     sortie_locale: bool,
+    frequence_fixe: Option<u32>,
 }
 
 /// Ce que rend une connexion sondée : le lecteur de conteneur, le décodeur
@@ -442,6 +443,35 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
     en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
     sortie_locale: bool,
 ) -> Result<(), String> {
+    decode_radio_stream_to_pcm_avec_cadence(
+        url,
+        replis,
+        tx,
+        data_ready,
+        session,
+        eq_profile,
+        levels_tx,
+        strict_bitperfect,
+        en_vol,
+        sortie_locale,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
+    url: String,
+    replis: Vec<String>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    session: std::sync::Arc<crate::http::streamer::StreamSession>,
+    eq_profile: Option<crate::audio::eq::EqProfile>,
+    levels_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
+    strict_bitperfect: bool,
+    en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
+    sortie_locale: bool,
+    frequence_fixe: Option<u32>,
+) -> Result<(), String> {
     // #6357 — le HLS ne s'arrête plus ici (#2307 le refusait avant le
     // moindre octet de réseau) : `sonder_la_station` le reconnaît et passe
     // par le chargeur de segments. Le reste du chemin — format de sortie,
@@ -469,6 +499,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
         rt: &rt,
         strict_bitperfect,
         sortie_locale,
+        frequence_fixe,
     };
 
     let mut url = url;
@@ -1017,7 +1048,9 @@ fn preparer_la_sortie(
     // Renderer-safe output rate: HE-AAC/aacPlus decodes at its AAC-LC core
     // rate (e.g. 22050 Hz) which many DLNA renderers reject as silence. We
     // upsample sub-44.1 kHz streams to 44100 Hz; 44.1/48 kHz+ pass through.
-    let output_sample_rate = renderer_safe_wav_rate(source_sample_rate);
+    let output_sample_rate = canaux
+        .frequence_fixe
+        .unwrap_or_else(|| renderer_safe_wav_rate(source_sample_rate));
     // #3973 — le site « décodage radio » de la règle bit-perfect : relever la
     // cadence EST une conversion. Strict ⇒ refuser, en le disant.
     if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(

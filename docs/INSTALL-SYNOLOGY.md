@@ -55,5 +55,7 @@ installation has not been reproduced as part of this documentation change.
 
 A Samba share mounted on the NAS (File Station › Mount Remote Folder) does not
 show up in the container unless it is bound with `rslave` propagation, and Tune
-cannot mount it itself from inside the container. See
+cannot mount it itself from inside the container. A new volume only takes effect
+in a re-created container (edit the stopped container's volumes, duplicate it,
+or rebuild the project): a restart keeps the old volumes. See
 [SMB share in Docker](DOCKER-PARTAGE-SMB.md).

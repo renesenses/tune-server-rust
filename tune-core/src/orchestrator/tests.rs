@@ -11047,6 +11047,635 @@ async fn une_session_retiree_sans_abandon_pendant_l_envoi_n_arrete_rien_6658() {
     assert_eq!(mock.stop_call_count(), 0, "rien ne doit arrêter la sortie");
 }
 
+#[tokio::test]
+async fn diagnostic_8259_frequence_fixe_8428_conserve_le_refus() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed PCM", Some("local"), Some("local:8428"))
+        .unwrap();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let refus = orch
+        .decision_du_surechantillonneur(zone_id, false)
+        .err()
+        .unwrap();
+    assert_eq!(
+        refus,
+        crate::audio::surechantillonnage::Ecarte::FrequenceFixe
+    );
+    assert_eq!(refus.code(), "fixed_rate");
+    assert!(orch.choix_du_surechantillonneur(zone_id, false).is_none());
+}
+
+#[tokio::test]
+async fn frequence_fixe_8428_services_traverse_les_familles() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("Fixed PCM", Some("local"), Some("local:8428"))
+        .unwrap();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let req = requete_locale_3234(zone_id, 1);
+    for source in [44_100, 48_000, 96_000, 176_400] {
+        let flux = flux_de_service_4759(source);
+        let (rate, _, wire) = orch.decider_le_wav_de_sortie(&req, &flux, true).unwrap();
+        assert_eq!(
+            rate, 48_000,
+            "la cadence fixe doit servir 48 kHz pour une source à {source} Hz"
+        );
+        assert_eq!(wire.sample_rate, rate);
+        assert_eq!(
+            orch.cadence_servie_pour_un_service(&req, &flux).unwrap(),
+            (source != 48_000).then_some(48_000)
+        );
+    }
+    settings
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    let (rate, _, _) = orch
+        .decider_le_wav_de_sortie(&req, &flux_de_service_4759(44_100), true)
+        .unwrap();
+    assert_eq!(rate, 44_100, "bit-perfect strict désactive la cadence fixe");
+}
+
+#[tokio::test]
+async fn frequence_fixe_8428_bibliotheque_decide_48_hors_famille() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed PCM", Some("local"), Some("local:8428-file"))
+        .unwrap();
+    piste_192k_3973(&orch);
+    orch.db
+        .execute("UPDATE tracks SET sample_rate = 44100 WHERE id = 1", &[])
+        .unwrap();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let sortie = orch
+        .format_de_sortie_pour_test(&requete_locale_3234(zone_id, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        sortie.out_sr, 48_000,
+        "le décodeur doit recevoir 48 kHz pour une piste 44,1 kHz"
+    );
+    let samples: Vec<f32> = (0..44_100)
+        .map(|i| (std::f32::consts::TAU * 997.0 * i as f32 / 44_100.0).sin() * 0.1)
+        .collect();
+    let pcm =
+        crate::audio::resample::rubato_resample_batch_exact(&samples, 44_100, sortie.out_sr, 1);
+    assert_eq!(
+        pcm.len(),
+        48_000,
+        "une seconde doit contenir 48000 trames, pas un en-tête renommé"
+    );
+    assert!(pcm.iter().all(|s| s.is_finite()));
+}
+
+/// #8428 — un serveur HTTP de test qui sert `corps` (WAV 44,1 kHz) à chaque
+/// connexion, sans `Range` (réponse 200 entière). Avec `retenir`, il n'envoie
+/// que `retenir` octets puis garde la connexion ouverte sans rien envoyer :
+/// un flux poussé dont la fin n'arrive pas.
+async fn serveur_wav_8428(
+    corps: Vec<u8>,
+    retenir: Option<usize>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/source.wav", listener.local_addr().unwrap());
+    let corps = std::sync::Arc::new(corps);
+    let serveur = tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            let corps = corps.clone();
+            tokio::spawn(async move {
+                let mut requete = [0u8; 4096];
+                let _ = client.read(&mut requete).await;
+                let entete = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    corps.len()
+                );
+                if client.write_all(entete.as_bytes()).await.is_err() {
+                    return;
+                }
+                let n = retenir.unwrap_or(corps.len()).min(corps.len());
+                let _ = client.write_all(&corps[..n]).await;
+                if retenir.is_some() {
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                }
+            });
+        }
+    });
+    (url, serveur)
+}
+
+/// #8428 — lit `trames` trames de la session WAV (en-tête compris) et rend
+/// (cadence de l'en-tête, PCM).
+async fn lire_la_session_wav_8428(
+    orch: &PlaybackOrchestrator,
+    sid: &str,
+    octets_par_trame: usize,
+    trames: usize,
+) -> (u32, Vec<u8>) {
+    let session = orch
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(sid)
+        .cloned()
+        .unwrap();
+    let octets = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut octets = Vec::new();
+        while octets.len() < 44 + trames * octets_par_trame {
+            match session.recv_chunk().await {
+                Some(bloc) => octets.extend(bloc),
+                None => break,
+            }
+        }
+        octets
+    })
+    .await
+    .expect("la session doit servir du PCM sans attendre la fin du téléchargement");
+    assert_eq!(&octets[..4], b"RIFF");
+    let cadence = u32::from_le_bytes(octets[24..28].try_into().unwrap());
+    let mut debut = 12;
+    while &octets[debut..debut + 4] != b"data" {
+        let n = u32::from_le_bytes(octets[debut + 4..debut + 8].try_into().unwrap()) as usize;
+        debut += 8 + n + n % 2;
+    }
+    (cadence, octets[debut + 8..].to_vec())
+}
+
+fn wav_sinus_8428(secondes: usize) -> Vec<u8> {
+    let trames = 44_100 * secondes;
+    let mut wav =
+        crate::audio::wav::build_wav_header_with_data_size(2, 44_100, 16, (trames * 4) as u32)
+            .to_vec();
+    for i in 0..trames {
+        let v = ((std::f32::consts::TAU * 997.0 * i as f32 / 44_100.0).sin() * 8000.0) as i16;
+        wav.extend_from_slice(&v.to_le_bytes());
+        wav.extend_from_slice(&v.to_le_bytes());
+    }
+    wav
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_url_directe_ne_contourne_pas_la_conversion() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed direct", Some("local"), Some("local:8428-direct"))
+        .unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let (url, serveur) = serveur_wav_8428(wav_sinus_8428(1), None).await;
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.track_id = None;
+    req.source = Some("upnp".into());
+    req.source_id = Some(url.clone());
+    req.output_device_id = Some("local:8428-direct".into());
+    req.sample_rate = Some(44_100);
+    req.bit_depth = Some(16);
+    req.duration_ms = Some(1000);
+    let resolu = orch.resolve_direct_url(&req).await.unwrap();
+    assert_eq!(
+        resolu.sample_rate,
+        Some(48_000),
+        "une URL directe doit aussi être convertie à la cadence fixe"
+    );
+    assert_ne!(
+        resolu.url, url,
+        "ne pas transmettre la source 44,1 kHz intacte"
+    );
+    let sid = resolu.stream_id.expect("session convertie");
+    let octets_par_trame = 2 * usize::try_from(resolu.bit_depth.unwrap() / 8).unwrap();
+    let (cadence, pcm) = lire_la_session_wav_8428(&orch, &sid, octets_par_trame, 48_000).await;
+    orch.streamer.remove_session(&sid).await;
+    serveur.abort();
+    assert_eq!(cadence, 48_000);
+    let trames = pcm.len() / octets_par_trame;
+    assert!(
+        trames.abs_diff(48_000) <= 48,
+        "une seconde à 44,1 kHz doit donner 48000 trames, pas {trames}"
+    );
+    assert!(pcm.iter().any(|b| *b != 0));
+}
+
+/// #8428 (re-relecture du 13/11) — un saut demandé sur une source SANS
+/// `Range` : le décodeur repart du début, et la session le dit en servant la
+/// piste entière (1 s à 48 kHz) au lieu d'un flux décalé sans le dire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_saut_sans_range_repart_du_debut() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed seek", Some("local"), Some("local:8428-seek"))
+        .unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let (url, serveur) = serveur_wav_8428(wav_sinus_8428(1), None).await;
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.track_id = None;
+    req.source = Some("upnp".into());
+    req.source_id = Some(url.clone());
+    req.output_device_id = Some("local:8428-seek".into());
+    req.sample_rate = Some(44_100);
+    req.bit_depth = Some(16);
+    req.duration_ms = Some(1000);
+    req.seek_ms = Some(500);
+    let resolu = orch.resolve_direct_url(&req).await.unwrap();
+    let sid = resolu.stream_id.expect("session convertie");
+    let octets_par_trame = 2 * usize::try_from(resolu.bit_depth.unwrap() / 8).unwrap();
+    let (cadence, pcm) = lire_la_session_wav_8428(&orch, &sid, octets_par_trame, 48_000).await;
+    orch.streamer.remove_session(&sid).await;
+    serveur.abort();
+    assert_eq!(cadence, 48_000);
+    let trames = pcm.len() / octets_par_trame;
+    assert!(
+        trames.abs_diff(48_000) <= 48,
+        "sans Range, le saut est ignoré : la seconde entière est servie, pas {trames} trames"
+    );
+}
+
+/// #8428 (re-relecture du 13/11) — un `.opus` poussé vers une zone à cadence
+/// fixe : le décodeur au fil de l'eau d'une source distante ne lit pas
+/// l'Opus. L'URL garde le chemin sans cadence fixe et la lecture aboutit
+/// (sortie factice), au lieu d'un `track_decode_failed` muet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_url_directe_opus_joue_sans_la_cadence_fixe() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed opus", Some("local"), Some("local:8428-opus"))
+        .unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "96000")
+        .unwrap();
+    let opus = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/test.opus"
+    ))
+    .unwrap();
+    let (url, serveur) = serveur_wav_8428(opus, None).await;
+    let url = url.replace("source.wav", "source.opus");
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.track_id = None;
+    req.source = Some("upnp".into());
+    req.source_id = Some(url.clone());
+    req.output_device_id = Some("local:8428-opus".into());
+    req.sample_rate = Some(48_000);
+    req.bit_depth = Some(16);
+    req.duration_ms = Some(1000);
+    let resolu = orch
+        .resolve_direct_url(&req)
+        .await
+        .expect("un .opus sur une zone à cadence fixe doit se lire");
+    assert_ne!(
+        resolu.sample_rate,
+        Some(96_000),
+        "l'Opus ne passe pas par la session WAV à cadence fixe"
+    );
+    if let Some(sid) = resolu.stream_id {
+        orch.streamer.remove_session(&sid).await;
+    }
+    serveur.abort();
+}
+
+/// #8428 (relecture du 12/11) — un flux poussé non étiqueté « radio » dont la
+/// fin n'arrive pas (BubbleUPnP, mconnect) : le premier son part sans
+/// attendre le dernier octet (aucun téléchargement préalable, donc aucun
+/// fichier `tune-stream-*` à laisser derrière soi en cas d'abandon).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_url_directe_sans_fin_joue_au_fil_de_l_eau() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed push", Some("local"), Some("local:8428-push"))
+        .unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    // 30 s annoncées, une seule servie, puis plus rien : l'ancien bras
+    // téléchargeait jusqu'au délai de 120 s avant d'échouer.
+    let corps = wav_sinus_8428(30);
+    let (url, serveur) = serveur_wav_8428(corps, Some(44 + 44_100 * 4)).await;
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.track_id = None;
+    req.source = Some("upnp".into());
+    req.source_id = Some(url.clone());
+    req.output_device_id = Some("local:8428-push".into());
+    req.sample_rate = Some(44_100);
+    req.bit_depth = Some(16);
+    req.duration_ms = None;
+    let debut = std::time::Instant::now();
+    let resolu = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        orch.resolve_direct_url(&req),
+    )
+    .await
+    .expect("la résolution ne doit pas attendre la fin du flux")
+    .unwrap();
+    assert_eq!(resolu.sample_rate, Some(48_000));
+    let sid = resolu.stream_id.expect("session convertie");
+    let octets_par_trame = 2 * usize::try_from(resolu.bit_depth.unwrap() / 8).unwrap();
+    // Une demi-seconde de PCM à 48 kHz, servie bien avant la fin du flux.
+    let (cadence, pcm) = lire_la_session_wav_8428(&orch, &sid, octets_par_trame, 24_000).await;
+    assert!(
+        debut.elapsed() < std::time::Duration::from_secs(10),
+        "premier son en {:?}",
+        debut.elapsed()
+    );
+    assert_eq!(cadence, 48_000);
+    assert!(pcm.len() / octets_par_trame >= 24_000);
+    orch.streamer.remove_session(&sid).await;
+    serveur.abort();
+}
+
+#[tokio::test]
+async fn frequence_fixe_8428_absente_preserve_le_service_et_airplay() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    for (numero, sortie) in ["local", "airplay", "airplay2"].into_iter().enumerate() {
+        let id = zones.create("Cadence témoin", Some(sortie), None).unwrap();
+        let nouveau = 984280 + numero as i64;
+        orch.db
+            .execute("UPDATE zones SET id = ? WHERE id = ?", &[&nouveau, &id])
+            .unwrap();
+        let id = nouveau;
+        let req = requete_locale_3234(id, 1);
+        let flux = flux_de_service_4759(44_100);
+        assert_eq!(
+            orch.decider_le_wav_de_sortie(&req, &flux, true).unwrap().0,
+            44_100
+        );
+        if sortie != "local" {
+            crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+                .set(&crate::audio::frequence_fixe::cle_de_zone(id), "48000")
+                .unwrap();
+            assert_eq!(
+                orch.decider_le_wav_de_sortie(&req, &flux, true).unwrap().0,
+                44_100,
+                "la cadence du protocole AirPlay ne doit pas être remplacée"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_la_lecture_locale_sert_vraiment_48000_trames() {
+    let orch = test_orchestrator();
+    let dir = tempfile::tempdir().unwrap();
+    let fichier = dir.path().join("source.wav");
+    ecrire_wav_carre(&fichier, 1000);
+    piste_3234(&orch, fichier.to_str().unwrap(), "wav");
+    orch.db
+        .execute("UPDATE tracks SET duration_ms = 1000 WHERE id = 1", &[])
+        .unwrap();
+    let id = ZoneRepo::with_backend(orch.db.clone())
+        .create("PCM fixe", Some("local"), Some("local:8428-reel"))
+        .unwrap();
+    orch.db
+        .execute("UPDATE zones SET id = 984284 WHERE id = ?", &[&id])
+        .unwrap();
+    let id = 984284;
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(id), "48000")
+        .unwrap();
+    let mut req = requete_locale_3234(id, 1);
+    req.output_device_id = Some("local:8428-reel".into());
+    let resolu = orch.resolve_local_track(&req).await.unwrap();
+    assert_eq!(resolu.sample_rate, Some(48_000));
+    let sid = resolu.stream_id.unwrap();
+    let session = orch
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(&sid)
+        .cloned()
+        .unwrap();
+    let octets_par_trame = usize::try_from(resolu.channels.unwrap()).unwrap()
+        * usize::try_from(resolu.bit_depth.unwrap() / 8).unwrap();
+    let octets = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut octets = Vec::new();
+        while octets.len() < 44 + 48_000 * octets_par_trame {
+            match session.recv_chunk().await {
+                Some(bloc) => octets.extend(bloc),
+                None => break,
+            }
+        }
+        octets
+    })
+    .await
+    .expect("le décodeur doit servir la seconde de WAV sans périphérique");
+    let en_trop =
+        tokio::time::timeout(std::time::Duration::from_millis(500), session.recv_chunk()).await;
+    assert!(
+        !matches!(en_trop, Ok(Some(ref b)) if !b.is_empty()),
+        "le décodeur ne doit pas servir plus d'une seconde"
+    );
+    orch.streamer.remove_session(&sid).await;
+    assert_eq!(&octets[..4], b"RIFF");
+    assert_eq!(
+        u32::from_le_bytes(octets[24..28].try_into().unwrap()),
+        48_000
+    );
+    let mut debut = 12;
+    while &octets[debut..debut + 4] != b"data" {
+        let n = u32::from_le_bytes(octets[debut + 4..debut + 8].try_into().unwrap()) as usize;
+        debut += 8 + n + n % 2;
+    }
+    let pcm = &octets[debut + 8..];
+    assert_eq!(
+        pcm.len() / octets_par_trame,
+        48_000,
+        "le chemin de lecture doit convertir les échantillons, pas seulement renommer l'en-tête"
+    );
+    assert!(pcm.iter().any(|b| *b != 0));
+
+    for mode in ["pure", "strict"] {
+        let cle = if mode == "pure" {
+            format!("zone_{id}_audiophile")
+        } else {
+            crate::audio::bitperfect_strict::cle_de_zone(id)
+        };
+        settings
+            .set(
+                &cle,
+                if mode == "pure" {
+                    r#"{"enabled":true}"#
+                } else {
+                    "true"
+                },
+            )
+            .unwrap();
+        let resolu = orch.resolve_local_track(&req).await.unwrap();
+        assert_eq!(
+            resolu.sample_rate,
+            Some(44_100),
+            "{mode} doit couper la cadence fixe sur la vraie résolution"
+        );
+        if let Some(sid) = resolu.stream_id {
+            orch.streamer.remove_session(&sid).await;
+        }
+        settings.delete(&cle).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn frequence_fixe_8428_le_plafond_borne_la_demande_sur_local_et_reseau() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    for sortie in ["local", "dlna", "oaat"] {
+        let id = zones
+            .create("Cadence plafonnée", Some(sortie), None)
+            .unwrap();
+        orch.db
+            .execute(
+                "UPDATE zones SET max_sample_rate = 96000 WHERE id = ?",
+                &[&id],
+            )
+            .unwrap();
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(&crate::audio::frequence_fixe::cle_de_zone(id), "192000")
+            .unwrap();
+        let req = requete_locale_3234(id, 1);
+        let flux = flux_de_service_4759(44_100);
+        assert_eq!(
+            orch.decider_le_wav_de_sortie(&req, &flux, sortie == "local")
+                .unwrap()
+                .0,
+            96_000
+        );
+        assert_eq!(
+            orch.cadence_servie_pour_un_service(&req, &flux).unwrap(),
+            Some(96_000)
+        );
+        assert_eq!(
+            crate::audio::frequence_fixe::lire(&orch.db, id),
+            Some(192_000)
+        );
+    }
+}
+
+/// #8428 — décision de Bertrand (12/11) : un DSD vers une cadence fixe HORS
+/// FAMILLE (Okto + convolueur à 48 kHz) joue. Il est décimé dans sa famille
+/// (88,2 kHz) puis rééchantillonné vers 48 kHz ; la sortie reçoit bien
+/// 48000 trames par seconde (sortie factice : aucun son).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_dsd64_vers_48_khz_fixe_joue() {
+    let orch = test_orchestrator();
+    let dir = tempfile::tempdir().unwrap();
+    let fichier = dir.path().join("source.dsf");
+    // Une seconde de DSD64 : 352 800 octets par canal.
+    crate::audio::decode::dop_deplacement_tests_6456::ecrire_dsf(&fichier, 352_800);
+    piste_3234(&orch, fichier.to_str().unwrap(), "dsf");
+    orch.db
+        .execute(
+            "UPDATE tracks SET sample_rate = 2822400, bit_depth = 1, duration_ms = 1000 WHERE id = 1",
+            &[],
+        )
+        .unwrap();
+    let id = ZoneRepo::with_backend(orch.db.clone())
+        .create("DSD fixe", Some("local"), Some("local:8428-dsd"))
+        .unwrap();
+    orch.db
+        .execute("UPDATE zones SET id = 984290 WHERE id = ?", &[&id])
+        .unwrap();
+    let id = 984290;
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(&crate::audio::frequence_fixe::cle_de_zone(id), "48000")
+        .unwrap();
+    let mut req = requete_locale_3234(id, 1);
+    req.output_device_id = Some("local:8428-dsd".into());
+    let resolu = orch
+        .resolve_local_track(&req)
+        .await
+        .expect("un DSD vers 48 kHz fixe ne doit plus être refusé");
+    assert_eq!(resolu.sample_rate, Some(48_000));
+    let sid = resolu.stream_id.expect("session PCM");
+    let octets_par_trame = usize::try_from(resolu.channels.unwrap()).unwrap()
+        * usize::try_from(resolu.bit_depth.unwrap() / 8).unwrap();
+    let (cadence, pcm) = lire_la_session_wav_8428(&orch, &sid, octets_par_trame, 48_000).await;
+    orch.streamer.remove_session(&sid).await;
+    assert_eq!(cadence, 48_000, "l'en-tête doit annoncer 48 kHz");
+    let trames = pcm.len() / octets_par_trame;
+    assert!(
+        trames.abs_diff(48_000) <= 48,
+        "une seconde de DSD64 doit donner 48000 trames à 48 kHz, pas {trames}"
+    );
+    assert!(pcm.iter().any(|b| *b != 0));
+
+    // Le décodage par le fichier entier (transcodage, analyse) suit la même règle.
+    let decode = crate::audio::decode::decode_to_pcm_routee(
+        fichier.to_str().unwrap(),
+        Some(48_000),
+        None,
+        0.0,
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(decode.sample_rate, 48_000);
+    let trames = decode.samples_i32.len() / decode.channels as usize;
+    assert!(
+        trames.abs_diff(48_000) <= 48,
+        "décodage entier : {trames} trames au lieu de 48000"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frequence_fixe_8428_epargne_le_dsd_brut_et_le_dop() {
+    for (numero, mode) in ["native", "dop"].into_iter().enumerate() {
+        let orch = test_orchestrator();
+        let dir = tempfile::tempdir().unwrap();
+        let fichier = dir.path().join("source.dsf");
+        crate::audio::decode::dop_deplacement_tests_6456::ecrire_dsf(&fichier, 352_800);
+        piste_3234(&orch, fichier.to_str().unwrap(), "dsf");
+        orch.db.execute("UPDATE tracks SET sample_rate = 2822400, bit_depth = 1, duration_ms = 1000 WHERE id = 1", &[]).unwrap();
+        let zones = ZoneRepo::with_backend(orch.db.clone());
+        let id = zones
+            .create("DSD", Some("dlna"), Some("dlna:8428-sans-reseau"))
+            .unwrap();
+        let nouveau = 984288 + numero as i64;
+        orch.db
+            .execute("UPDATE zones SET id = ? WHERE id = ?", &[&nouveau, &id])
+            .unwrap();
+        let id = nouveau;
+        zones.update_dsd_mode(id, mode).unwrap();
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(&crate::audio::frequence_fixe::cle_de_zone(id), "48000")
+            .unwrap();
+        let mut req = requete_locale_3234(id, 1);
+        req.output_device_id = Some("dlna:8428-sans-reseau".into());
+        let resolu = orch.resolve_local_track(&req).await.unwrap();
+        assert_eq!(
+            resolu.sample_rate,
+            Some(if mode == "native" { 2_822_400 } else { 176_400 }),
+            "le transport {mode} ne doit jamais prendre la cadence PCM fixe"
+        );
+        if let Some(sid) = resolu.stream_id {
+            orch.streamer.remove_session(&sid).await;
+        }
+        if mode == "native" {
+            assert!(
+                orch.format_de_sortie_pour_test(&req).await.is_ok(),
+                "même la décision de format doit ignorer la cadence PCM en passthrough DSD"
+            );
+        }
+    }
+}
+
 /// #8404 — fil 2748 : un second appareil lance un autre titre sur la zone
 /// DLNA où joue déjà la tablette. Mesure de l'hypothèse « le flux du titre
 /// remplacé n'est pas libéré » : après le remplacement, la session de la
