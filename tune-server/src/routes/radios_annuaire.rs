@@ -812,6 +812,14 @@ pub fn corps_annuaire_avec_liens(
             }
         }
     }
+    // Recette rc12 (14/11, Rémi) — le nombre de la puce « Tous les genres » :
+    // la recherche, le pays et les critères, AUCUN genre. Le client ne
+    // l'avait que d'une réponse sans genre ; un genre choisi, il le perdait
+    // dès qu'un autre filtre changeait.
+    let total_tous_genres = qui_cherchent
+        .iter()
+        .filter(|(_, f)| meme_pays(f, &criteres))
+        .count();
     let retenues: Vec<(usize, &StationAnnuaire)> = qui_cherchent
         .into_iter()
         .filter(|(_, f)| meme_pays(f, &criteres) && meme_genre(f, &criteres))
@@ -869,6 +877,7 @@ pub fn corps_annuaire_avec_liens(
     };
     json!({
         "total": total,
+        "total_all_genres": total_tous_genres,
         "offset": offset,
         "limit": limit,
         "count": items.len(),

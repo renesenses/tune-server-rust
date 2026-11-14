@@ -770,3 +770,31 @@ fn boutons_rc12_l_annuaire_filtre_et_compte() {
         )
     );
 }
+
+#[test]
+fn rc12_total_tous_genres_suit_les_filtres_meme_un_genre_choisi() {
+    let mut jazz_hq = fiche_flux("jazz-320", "MP3", Some(320), Some(44_100));
+    jazz_hq.genre = Some("jazz".into());
+    let mut news_hq = fiche_flux("news-flac", "FLAC", None, None);
+    news_hq.genre = Some("news".into());
+    let mut news_bas = fiche_flux("news-128", "MP3", Some(128), Some(44_100));
+    news_bas.genre = Some("news".into());
+    let fiches = [jazz_hq, news_hq, news_bas];
+    let tous = |requete: &str| {
+        corps_annuaire(&fiches, &[], &filtres(requete), &EtatAnnuaire::default())["total_all_genres"].clone()
+    };
+    assert_eq!(tous(""), json!(3));
+    assert_eq!(
+        tous("genre=jazz"),
+        json!(3),
+        "le genre choisi ne borne pas « Tous les genres »"
+    );
+    assert_eq!(tous("haute_qualite=true"), json!(2));
+    assert_eq!(
+        tous("genre=jazz&haute_qualite=true"),
+        json!(2),
+        "les critères le bornent, genre choisi ou non"
+    );
+    assert_eq!(tous("genre=jazz&sans_perte=true"), json!(1));
+    assert_eq!(tous("q=news&genre=jazz"), json!(2));
+}
