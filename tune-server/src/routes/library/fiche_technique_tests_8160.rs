@@ -289,19 +289,23 @@ async fn fiche_d_une_piste_de_service_sans_section_vide_8160() {
     assert_eq!(f["a_un_fichier"], false);
     assert_eq!(f["format"]["codec"], "flac");
     assert_eq!(f["format"]["sample_rate"], 96000);
-    for vide in [
-        "spectrogramme",
-        "dynamic_range",
-        "faux_hires",
-        "integrite",
-        "note",
-        "forme_d_onde",
-    ] {
+    for vide in ["dynamic_range", "faux_hires", "integrite", "note"] {
         assert!(
             f[vide].is_null(),
             "« {vide} » doit valoir null pour une piste de service : {f}"
         );
     }
+    // Go du 13/11 : une piste Qobuz a sa forme d'onde et son spectrogramme,
+    // calculés par téléchargement ; pas de sonie sans mesure.
+    assert_eq!(f["forme_d_onde"]["etat"], "absent", "{f}");
+    assert_eq!(f["forme_d_onde"]["service"], "qobuz", "{f}");
+    assert_eq!(
+        f["forme_d_onde"]["url"],
+        "/api/v1/library/tracks/2/forme-onde?colonnes=1000"
+    );
+    assert!(f["forme_d_onde"].get("sonie").is_none(), "{f}");
+    assert_eq!(f["spectrogramme"]["etat"], "absent", "{f}");
+    assert_eq!(f["spectrogramme"]["service"], "qobuz", "{f}");
     assert_eq!(f["provenance"]["source"], "qobuz");
     assert_eq!(f["provenance"]["source_id"], "q-2");
     assert!(
