@@ -166,7 +166,11 @@ fn jeu_d_essai(base: i64, suffixe: &str) -> Vec<String> {
                 genres[((i + n) % 7) as usize],
                 frequences[((i + n) % 4) as usize],
                 resolutions[((i * n) % 4) as usize],
-                maintenant - (i % 200) * 86_400,
+                // Une demi-journée de décalage : aucun album sur la borne
+                // d'un « depuis N jours » (90 j pour i = 90), sinon le compte
+                // du handler et celui de l'épreuve, lus à une seconde
+                // d'écart, rendent 90 ou 89.
+                maintenant - (i % 200) * 86_400 - 43_200,
                 200_000 + n * 30_000,
             ));
         }
