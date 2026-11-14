@@ -1813,6 +1813,9 @@ mod signal_path_dop_2029_tests;
 // #8569 — sortie au volume non réglable : pas d'étape Volume.
 #[cfg(test)]
 mod signal_path_volume_non_reglable_8569_tests;
+// #8647 — un DSD servi en natif par OAAT se dit « DSD256 natif (OAAT) ».
+#[cfg(test)]
+mod signal_path_dsd_natif_oaat_8647_tests;
 
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///
@@ -1832,6 +1835,9 @@ mod zone_group_tests;
 
 #[cfg(test)]
 mod groupe_asio_refuse_7759_tests;
+
+#[cfg(test)]
+mod groupes_chevauchants_8680_tests;
 
 #[cfg(test)]
 mod aac_passthrough_tests;

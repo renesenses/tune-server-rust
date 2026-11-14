@@ -221,6 +221,11 @@ pub struct TidalService {
     client: Client,
     tokens: Mutex<TokenState>,
     country_code: String,
+    /// #8481 — le pays du catalogue imposé dans les Réglages (comme « PL »
+    /// dans LMS). `None` : celui du compte (`country_code`). Il prime sur le
+    /// compte dans TOUTES les requêtes, lecture comprise, et `/users/me` ne
+    /// l'écrase pas : c'est un choix de l'utilisateur, pas une donnée lue.
+    pays_choisi: Option<String>,
     quality: String,
     username: Option<String>,
     user_id: Option<u64>,
@@ -273,6 +278,7 @@ impl TidalService {
                 token_expires: None,
             }),
             country_code: "US".into(),
+            pays_choisi: None,
             quality: "HI_RES_LOSSLESS".into(),
             username: None,
             user_id: None,
@@ -1049,7 +1055,7 @@ impl TidalService {
             .client
             .get(&url)
             .header("Authorization", format!("Bearer {token}"))
-            .query(&[("countryCode", &self.country_code)])
+            .query(&[("countryCode", self.pays_effectif())])
             .send()
             .await
             .map_err(|e| format!("tidal api: {e}"))?;
@@ -1063,7 +1069,7 @@ impl TidalService {
                         .client
                         .get(&url)
                         .header("Authorization", format!("Bearer {new_token}"))
-                        .query(&[("countryCode", &self.country_code)])
+                        .query(&[("countryCode", self.pays_effectif())])
                         .send()
                         .await
                         .map_err(|e| format!("tidal api retry: {e}"))?;
@@ -1374,7 +1380,7 @@ impl TidalService {
             ("audioquality", quality),
             ("playbackmode", "STREAM"),
             ("assetpresentation", "FULL"),
-            ("countryCode", self.country_code.as_str()),
+            ("countryCode", self.pays_effectif()),
         ];
 
         // Use a per-request timeout of 15 seconds (longer than the default
@@ -1574,10 +1580,30 @@ impl TidalService {
         }
         info!(avant = %self.country_code, apres = %nouveau, "tidal_pays_du_compte_adopte");
         self.country_code = nouveau;
+        self.vider_les_caches_du_pays();
+    }
+
+    /// #8481 — le pays qui part dans `countryCode` : celui que l'utilisateur
+    /// a choisi, à défaut celui du compte.
+    fn pays_effectif(&self) -> &str {
+        self.pays_choisi.as_deref().unwrap_or(&self.country_code)
+    }
+
+    /// Les caches dont la clé ne porte pas le pays : « À la une », mixes, et
+    /// adresses de flux (une adresse obtenue pour un pays n'a pas à servir
+    /// pour un autre).
+    fn vider_les_caches_du_pays(&self) {
         if let Ok(mut cache) = self.featured_cache.lock() {
             *cache = None;
         }
         self.vider_le_cache_des_mixes();
+        if let Ok(mut urls) = self.url_cache.try_lock() {
+            *urls = UrlCache::new(240);
+        } else {
+            // Une résolution est en cours : le cache des adresses de flux n'est
+            // pas vidé, ses entrées expirent d'elles-mêmes (4 min).
+            warn!("tidal_cache_des_urls_non_vide_verrou_occupe");
+        }
     }
 
     async fn api_post_form(
@@ -1607,7 +1633,7 @@ impl TidalService {
             .client
             .get(&url)
             .header("Authorization", format!("Bearer {token}"))
-            .query(&[("countryCode", &self.country_code)])
+            .query(&[("countryCode", self.pays_effectif())])
             .send()
             .await
             .map_err(|e| format!("tidal etag: {e}"))?;
@@ -1640,7 +1666,7 @@ impl TidalService {
             self.client
                 .post(&url)
                 .header("Authorization", format!("Bearer {token}"))
-                .query(&[("countryCode", &self.country_code)])
+                .query(&[("countryCode", self.pays_effectif())])
                 .form(form),
         )
         .send()
@@ -1654,7 +1680,7 @@ impl TidalService {
                     self.client
                         .post(&url)
                         .header("Authorization", format!("Bearer {new_token}"))
-                        .query(&[("countryCode", &self.country_code)])
+                        .query(&[("countryCode", self.pays_effectif())])
                         .form(form),
                 )
                 .send()
@@ -1685,7 +1711,7 @@ impl TidalService {
             .client
             .delete(&url)
             .header("Authorization", format!("Bearer {token}"))
-            .query(&[("countryCode", &self.country_code)])
+            .query(&[("countryCode", self.pays_effectif())])
             .send()
             .await
             .map_err(|e| format!("tidal delete: {e}"))?;
@@ -1697,7 +1723,7 @@ impl TidalService {
                     .client
                     .delete(&url)
                     .header("Authorization", format!("Bearer {new_token}"))
-                    .query(&[("countryCode", &self.country_code)])
+                    .query(&[("countryCode", self.pays_effectif())])
                     .send()
                     .await
                     .map_err(|e| format!("tidal delete retry: {e}"))?;
@@ -1797,7 +1823,7 @@ impl TidalService {
             .delete(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header(reqwest::header::IF_NONE_MATCH, etiquette)
-            .query(&[("countryCode", &self.country_code)])
+            .query(&[("countryCode", self.pays_effectif())])
             .send()
             .await
             .map_err(|e| format!("tidal delete: {e}"))?;
@@ -1986,6 +2012,44 @@ impl StreamingService for TidalService {
 
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled_override = Some(enabled);
+    }
+
+    fn pays_du_catalogue(&self) -> Option<super::traits::PaysDuCatalogue> {
+        let connecte = self
+            .tokens
+            .try_lock()
+            .map(|ts| ts.access_token.is_some())
+            .unwrap_or(true);
+        Some(super::traits::PaysDuCatalogue {
+            // Avant toute connexion, `country_code` n'est que le repli « US » :
+            // ce n'est pas le pays d'un compte, on ne le présente pas comme tel.
+            du_compte: connecte.then(|| self.country_code.clone()),
+            choisi: self.pays_choisi.clone(),
+            effectif: self.pays_effectif().to_string(),
+        })
+    }
+
+    fn choisir_le_pays_du_catalogue(&mut self, pays: Option<&str>) -> Result<(), String> {
+        let choisi = match pays.map(str::trim).filter(|p| !p.is_empty()) {
+            None => None,
+            Some(brut) => Some(
+                pays_iso3166(brut).ok_or_else(|| {
+                    format!(
+                        "pays invalide : « {brut} » n'est pas un code ISO 3166-1 alpha-2 (attendu : PL, GB, US…)"
+                    )
+                })?,
+            ),
+        };
+        if choisi == self.pays_choisi {
+            return Ok(());
+        }
+        let avant = self.pays_effectif().to_string();
+        self.pays_choisi = choisi;
+        info!(avant = %avant, apres = %self.pays_effectif(), choisi = ?self.pays_choisi, "tidal_pays_du_catalogue_choisi");
+        if avant != self.pays_effectif() {
+            self.vider_les_caches_du_pays();
+        }
+        Ok(())
     }
 
     async fn authenticate(
@@ -3540,6 +3604,16 @@ fn pays_iso2(brut: &str) -> Option<String> {
     let taille = brut.trim();
     (taille.len() == 2 && taille.chars().all(|c| c.is_ascii_alphabetic()))
         .then(|| taille.to_ascii_uppercase())
+}
+
+/// #8481 — les 249 codes ISO 3166-1 alpha-2 officiellement attribués.
+const CODES_ISO_3166_1: &str = "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW";
+
+/// #8481 — un pays CHOISI par l'utilisateur : deux lettres ET un code ISO
+/// 3166-1 attribué. `XX` ou `PO` ont la bonne forme mais ne désignent aucun
+/// pays ; TIDAL ne dirait rien, et le catalogue deviendrait vide sans un mot.
+fn pays_iso3166(brut: &str) -> Option<String> {
+    pays_iso2(brut).filter(|p| CODES_ISO_3166_1.split(' ').any(|c| c == p))
 }
 
 fn base64_decode_url(input: &str) -> Result<Vec<u8>, String> {
@@ -5738,6 +5812,11 @@ mod qualite_livree_6334_tests;
 #[cfg(test)]
 #[path = "tidal_mixes_7822_tests.rs"]
 mod mixes_7822_tests;
+
+// #8481 — le pays du catalogue choisi dans les Réglages.
+#[cfg(test)]
+#[path = "tidal_pays_du_catalogue_8481_tests.rs"]
+mod pays_du_catalogue_8481_tests;
 
 // #6334 — lecture par `trackManifests` v2, repli v1.
 #[path = "tidal_manifeste_v2.rs"]

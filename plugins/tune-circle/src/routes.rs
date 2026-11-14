@@ -271,16 +271,16 @@ async fn regler_le_partage_des_pochettes(
 async fn vignette_d_un_contact(
     State(e): State<Arc<EtatDesVignettes>>,
     Path((user_id, album_id)): Path<(String, String)>,
+    RawQuery(requete): RawQuery,
     entetes: axum::http::HeaderMap,
 ) -> Response {
     if !identifiant_valide(&user_id) || !identifiant_valide(&album_id) {
         return introuvable();
     }
     use crate::relais::IssueImage;
-    let cache = (
-        header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("private, max-age=3600"),
-    );
+    let version = requete
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("v=")));
     match e
         .relais
         .lire_image(
@@ -307,7 +307,10 @@ async fn vignette_d_un_contact(
             let mut r = (StatusCode::OK, Body::from(corps)).into_response();
             let h = r.headers_mut();
             h.insert(header::CONTENT_TYPE, type_mime);
-            h.insert(cache.0, cache.1);
+            h.insert(
+                header::CACHE_CONTROL,
+                cache_de_vignette(version, etag.as_ref()),
+            );
             h.insert(
                 header::X_CONTENT_TYPE_OPTIONS,
                 axum::http::HeaderValue::from_static("nosniff"),
@@ -319,7 +322,10 @@ async fn vignette_d_un_contact(
         }
         IssueImage::Inchangee { etag } => {
             let mut r = StatusCode::NOT_MODIFIED.into_response();
-            r.headers_mut().insert(cache.0, cache.1);
+            r.headers_mut().insert(
+                header::CACHE_CONTROL,
+                cache_de_vignette(version, etag.as_ref()),
+            );
             if let Some(v) = etag {
                 r.headers_mut().insert(header::ETAG, v);
             }
@@ -340,6 +346,46 @@ async fn vignette_d_un_contact(
             r
         }
     }
+}
+
+/// web#2985 — combien de temps le navigateur garde la vignette d'un contact.
+///
+/// Le client demande `…/thumbnail?v=<16 premiers caractères du sha256>` : la
+/// liste d'albums donne le condensat de la vignette, et le cloud rend ce même
+/// condensat en ETag. Quand `v` est bien le début de l'ETag rendu, l'adresse
+/// désigne CES octets-là et aucun autre — une vignette changée change
+/// d'adresse. Le navigateur peut alors la garder une semaine sans revalider
+/// (`immutable`) : rouvrir le catalogue d'un contact ne repart plus, pochette
+/// par pochette, vers le cloud (≈ 0,2 à 0,4 s chacune, et 600 par minute au
+/// plus chez mozaiklabs).
+///
+/// Rien n'est gardé par CE serveur : la règle du greffon (« une révocation
+/// vue par le cloud est vraie au prochain appel ») tient, puisque ces
+/// adresses ne s'obtiennent qu'en relisant la liste des albums, qui, elle,
+/// passe toujours par le cloud et répond 404 au partage coupé.
+///
+/// Sans `v`, ou avec un `v` qui ne correspond pas : une heure, comme avant.
+fn cache_de_vignette(
+    version: Option<&str>,
+    etag: Option<&axum::http::HeaderValue>,
+) -> axum::http::HeaderValue {
+    let condensat = etag
+        .and_then(|v| v.to_str().ok())
+        .map(|e| e.trim().trim_start_matches("W/").trim_matches('"'));
+    let figee = match (version, condensat) {
+        (Some(v), Some(c)) => {
+            (8..=64).contains(&v.len())
+                && v.bytes().all(|b| b.is_ascii_hexdigit())
+                && c.len() >= v.len()
+                && c.as_bytes()[..v.len()].eq_ignore_ascii_case(v.as_bytes())
+        }
+        _ => false,
+    };
+    axum::http::HeaderValue::from_static(if figee {
+        "private, max-age=604800, immutable"
+    } else {
+        "private, max-age=3600"
+    })
 }
 
 pub(crate) fn refus(statut: StatusCode, corps: Value) -> Response {
