@@ -2177,12 +2177,19 @@ impl PlaybackOrchestrator {
         //
         // `origin_host`, lui, reste absent : rien ne le persiste, et l'inventer
         // serait pire que de le laisser vide.
-        let (exclusive_mode, audio_backend) = self.reglages_sortie_locale();
+        let (exclusif_machine, audio_backend) = self.reglages_sortie_locale();
+        // #3245 — la zone de cet appareil décide (#8348), la machine en repli :
+        // sans cette ligne, la sortie recréée reprenait le mode de MACHINE, et
+        // une zone réglée « partagé » repartait en exclusif.
+        let exclusif_de_zone =
+            self.exclusif_de_la_sortie_recreee(device_id, &audio_backend, exclusif_machine);
+        let exclusive_mode = exclusif_de_zone.demande;
         let endpoint_id = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .endpoint_id_de_la_sortie(device_id);
         info!(
             device_id,
             exclusive_mode,
+            exclusif_par_la_zone = exclusif_de_zone.par_la_zone,
             audio_backend = %audio_backend,
             endpoint_id = endpoint_id.as_deref().unwrap_or("<aucun>"),
             "output_not_found_recreating_local_output"
