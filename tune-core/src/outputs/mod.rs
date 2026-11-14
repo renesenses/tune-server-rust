@@ -48,6 +48,7 @@ mod dlna_volume_apres_uri_tests_6008;
 /// #8647 — la sortie OAAT publie si elle sert un DSD natif. Hors `cfg` :
 /// le chemin du signal le lit partout ; sans OAAT, rien n'est inscrit.
 pub mod dsd_natif_oaat_8647;
+pub mod repli_dsd_oaat_8486;
 // #8151 — la sourdine tient à chaque nouvelle piste.
 #[cfg(test)]
 pub(crate) mod dlna_sourdine_8151_tests;

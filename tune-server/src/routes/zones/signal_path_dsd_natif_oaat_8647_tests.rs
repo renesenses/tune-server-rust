@@ -146,3 +146,58 @@ fn le_constat_suit_le_drapeau_de_la_sortie_8647() {
     assert!(!dsd_natif_sur_la_sortie_oaat(false, "oaat", Some(device)));
     assert!(!dsd_natif_sur_la_sortie_oaat(true, "dlna", Some(device)));
 }
+
+#[test]
+fn le_repli_oaat_nomme_la_cause_dans_le_chemin_du_signal_8486() {
+    use tune_core::outputs::repli_dsd_oaat_8486::{self, Observation, Raison, Repli};
+    let id = "oaat:signal-repli-8486";
+    let (db, zone) = zone_oaat(id);
+    let observation = Arc::new(std::sync::Mutex::new(Observation {
+        annonce_recue: true,
+        dsd_max_rate: Some(64),
+        repli: Some(Repli {
+            raison: Raison::Plafond,
+            dsd_rate: Some(256),
+            dsd_max_rate: Some(64),
+        }),
+    }));
+    repli_dsd_oaat_8486::inscrire(id, &observation);
+    let rendre = || {
+        build_signal_path_lang(
+            "fr",
+            &dsd256_en_lecture(),
+            &zone,
+            &db,
+            Some("OAAT"),
+            "none",
+            Some(&fil_wav_352()),
+        )
+        .unwrap()
+    };
+    let chemin = rendre();
+    let conversion = etape(&chemin, "code", "oaat_dsd_pcm_fallback")
+        .expect("le repli OAAT doit expliquer sa cause sur la zone");
+    assert_eq!(
+        conversion["detail"],
+        "DSD256 converti en PCM : le récepteur accepte au plus DSD64."
+    );
+    for (raison, fragment) in [
+        (Raison::SansDsd, "n’annonce pas"),
+        (Raison::Conteneur, "DFF"),
+        (Raison::Cadence, "non reconnue"),
+    ] {
+        observation.lock().unwrap().repli.as_mut().unwrap().raison = raison;
+        let chemin = rendre();
+        assert!(
+            etape(&chemin, "code", "oaat_dsd_pcm_fallback").unwrap()["detail"]
+                .as_str()
+                .unwrap()
+                .contains(fragment)
+        );
+    }
+    repli_dsd_oaat_8486::effacer_repli(&observation);
+    assert!(
+        etape(&rendre(), "code", "oaat_dsd_pcm_fallback").is_none(),
+        "pas de motif périmé après arrêt ou changement de piste"
+    );
+}
