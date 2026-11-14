@@ -139,13 +139,81 @@ async fn la_passe_est_desactivee_par_defaut_et_s_arme_6285() {
     assert_eq!(s, StatusCode::OK, "{c}");
     assert_eq!(c["active"], true, "{c}");
     assert_eq!(
-        c["douteux_visible"], false,
-        "un champ absent garde sa valeur — {c}"
+        c["douteux_visible"], true,
+        "rc12 : allumer la détection montre « douteux » — {c}"
     );
-    montrer_douteux(&app, true).await;
+    montrer_douteux(&app, false).await;
+    let c = get(&app, "/api/v1/library/hires-check").await;
+    assert_eq!(c["active"], true, "un champ absent garde sa valeur — {c}");
+    assert_eq!(c["douteux_visible"], false, "{c}");
+}
+
+async fn regler(app: &axum::Router, methode: &str, corps: Value) -> Value {
+    let (s, c) = appel(
+        app,
+        Request::builder()
+            .method(methode)
+            .uri("/api/v1/library/hires-check")
+            .header("content-type", "application/json")
+            .body(Body::from(corps.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{methode} {corps} : {c}");
+    c
+}
+
+/// rc12 (décision du 13/11) — l'interrupteur de Réglages › Bibliothèque
+/// n'envoie que `{active}` : allumé, le badge « douteux » se montre sur la
+/// fiche, dans la liste et par le filtre ; éteint, il se masque de nouveau.
+#[tokio::test]
+async fn l_interrupteur_de_l_utilisateur_montre_douteux_rc12() {
+    let (app, _) = banc_de_la_liste();
+    let c = regler(&app, "POST", json!({ "active": true })).await;
+    assert_eq!(c["active"], true, "{c}");
+    assert_eq!(c["douteux_visible"], true, "{c}");
+    let c = get(&app, "/api/v1/library/albums/5/hires").await;
+    assert_eq!(c["verdict"], "douteux", "{c}");
+    assert_eq!(c["raison"], "bande_de_cd", "{c}");
+    let page = get(&app, "/api/v1/library/albums?hires_verdict=douteux").await;
+    assert_eq!(ids(&page), vec![5], "{page}");
+
+    let c = regler(&app, "POST", json!({ "active": false })).await;
+    assert_eq!(c["active"], false, "{c}");
+    assert_eq!(
+        c["douteux_visible"], false,
+        "éteindre masque « douteux » — {c}"
+    );
+    let c = get(&app, "/api/v1/library/albums/5/hires").await;
+    assert_eq!(c["verdict"], "non_analyse", "{c}");
+}
+
+/// Un `douteux_visible` explicite garde la main sur l'interrupteur.
+#[tokio::test]
+async fn douteux_visible_explicite_l_emporte_rc12() {
+    let (app, _) = banc();
+    let c = regler(
+        &app,
+        "POST",
+        json!({ "active": true, "douteux_visible": false }),
+    )
+    .await;
+    assert_eq!(c["active"], true, "{c}");
+    assert_eq!(c["douteux_visible"], false, "{c}");
+    let c = get(&app, "/api/v1/library/albums/5/hires").await;
+    assert_eq!(c["verdict"], "non_analyse", "{c}");
+}
+
+/// `PUT` règle comme `POST`, et `GET` relit ce qui a été posé.
+#[tokio::test]
+async fn put_regle_l_etat_comme_post_rc12() {
+    let (app, _) = banc();
+    let c = regler(&app, "PUT", json!({ "active": true })).await;
+    assert_eq!(c["active"], true, "{c}");
     let c = get(&app, "/api/v1/library/hires-check").await;
     assert_eq!(c["active"], true, "{c}");
     assert_eq!(c["douteux_visible"], true, "{c}");
+    assert_eq!(c["restantes"], 1, "{c}");
 }
 
 /// La liste des albums avec un album de chaque verdict : 5 douteux (une piste
@@ -268,4 +336,12 @@ async fn le_filtre_de_la_liste_sur_le_verdict_hires_6285() {
     // Sans filtre : toute la bibliothèque, comme avant.
     let page = get(&app, "/api/v1/library/albums").await;
     assert_eq!(ids(&page), vec![5, 6, 7, 8], "{page}");
+}
+
+/// rc12 — l'état annonce que le catalogue imprimable suit `hires_verdict=`.
+#[tokio::test]
+async fn l_etat_annonce_le_filtre_du_catalogue_rc12() {
+    let (app, _) = banc();
+    let c = get(&app, "/api/v1/library/hires-check").await;
+    assert_eq!(c["catalogue_hires_verdict"], true, "{c}");
 }

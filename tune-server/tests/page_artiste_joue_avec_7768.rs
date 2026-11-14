@@ -276,10 +276,12 @@ async fn joue_avec_rend_les_audibles_ponderes_dans_l_ordre_7768() {
     assert_eq!(
         body["played_with"],
         json!([
-            { "artist_id": 2, "artist_name": "Nora Vidal", "shared_tracks": 4 },
-            { "artist_id": null, "artist_name": "Tomas Reyes", "shared_tracks": 2 },
-            { "artist_id": 9, "artist_name": "ana bell", "shared_tracks": 1 },
-            { "artist_id": 6, "artist_name": "DJ Okapi", "shared_tracks": 1 }
+            // #2961 : `shared_albums` et `album_wide` (Nora, artiste des 4
+            // pistes de son album de 4 : album entier).
+            { "artist_id": 2, "artist_name": "Nora Vidal", "shared_tracks": 4, "shared_albums": 1, "album_wide": true },
+            { "artist_id": null, "artist_name": "Tomas Reyes", "shared_tracks": 2, "shared_albums": 1, "album_wide": false },
+            { "artist_id": 9, "artist_name": "ana bell", "shared_tracks": 1, "shared_albums": 1, "album_wide": false },
+            { "artist_id": 6, "artist_name": "DJ Okapi", "shared_tracks": 1, "shared_albums": 1, "album_wide": false }
         ]),
         "played_with : {}",
         body["played_with"]
@@ -383,4 +385,65 @@ async fn vingt_au_plus_7768() {
     assert_eq!(liste[0]["shared_tracks"], 25);
     assert_eq!(liste[1]["artist_name"], "Musicien 24");
     assert_eq!(liste[19]["artist_name"], "Musicien 06");
+}
+
+/// #2961 (web) — le cas réel du .18 : un duo « A & B », un album servi deux
+/// fois (local et copie UPnP, deux lignes `albums` de même titre), des
+/// balises qui recopient le personnel de l'album sur presque chaque piste.
+/// Avant : « 20 pistes en commun » pour tous (13 + 7 copies) et les deux
+/// membres du duo dans sa propre liste.
+fn bibliotheque_duo() -> AppState {
+    let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+    artiste(&s, 50, "DjeuhDjoah & Lieutenant Nicholson");
+    artiste(&s, 51, "Lieutenant Nicholson");
+    for (album, source) in [(700, "local"), (701, "upnp")] {
+        exec(
+            &s,
+            &format!(
+                "INSERT INTO albums (id, title, artist_id, year, source, release_type, is_compilation) \
+                 VALUES ({album}, 'Aimez ces airs', 50, 2021, '{source}', 'album', 0)"
+            ),
+        );
+        for i in 1..=5 {
+            let id = album * 10 + i;
+            exec(
+                &s,
+                &format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, format, disc_number, track_number) \
+                     VALUES ({id}, 'Titre {i}', {album}, 50, '/m/{id}.flac', 200000, 'flac', 1, {i})"
+                ),
+            );
+            if i <= 4 {
+                for nom in ["Alexis Valet", "Djeuhdjoah", "Lieutenant Nicholson"] {
+                    credit(&s, id, None, nom, None, "performer", "balises");
+                }
+            } else {
+                credit(&s, id, None, "Ben Invité", None, "performer", "balises");
+            }
+        }
+    }
+    s
+}
+
+#[tokio::test]
+async fn ni_membres_du_duo_ni_copies_comptees_deux_fois_2961() {
+    let body = joue_avec(bibliotheque_duo(), 50).await;
+    assert_eq!(
+        body["played_with"],
+        json!([
+            { "artist_id": null, "artist_name": "Alexis Valet", "shared_tracks": 4, "shared_albums": 1, "album_wide": true },
+            { "artist_id": null, "artist_name": "Ben Invité", "shared_tracks": 1, "shared_albums": 1, "album_wide": false }
+        ]),
+        "played_with : {}",
+        body["played_with"]
+    );
+
+    // Page du membre : le duo dont il est une partie n'y est pas.
+    let body = joue_avec(bibliotheque_duo(), 51).await;
+    assert_eq!(
+        noms(&body),
+        vec!["Alexis Valet".to_string(), "Djeuhdjoah".to_string()],
+        "{}",
+        body["played_with"]
+    );
 }

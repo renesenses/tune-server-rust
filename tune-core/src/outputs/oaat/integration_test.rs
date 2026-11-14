@@ -1087,6 +1087,25 @@ mod tests {
     /// `.dsf` directly, with no orphaned DSD->PCM transcode). stop() (run before
     /// every play_media) clears native-DSD mode so a following PCM track goes
     /// back to the url-prefetch path.
+    /// #8647 (relecture) — la découverte construit une sortie neuve à chaque
+    /// ré-annonce mDNS puis la jette en gardant celle qui joue. La neuve ne
+    /// doit pas remplacer, dans le registre du chemin du signal, le drapeau
+    /// de la sortie qui joue.
+    #[tokio::test]
+    async fn une_sortie_neuve_jetee_ne_remplace_pas_celle_qui_joue_8647() {
+        use crate::outputs::dsd_natif_oaat_8647::est_actif;
+        let id = "oaat:reannonce-8647";
+        let a = OaatOutput::new("A".into(), "127.0.0.1".into(), 9999, id.into());
+        a.publier_le_drapeau_dsd_natif();
+        a.set_native_dsd_active_for_test(true);
+        assert!(est_actif(id));
+        let b = OaatOutput::new("B".into(), "127.0.0.1".into(), 9999, id.into());
+        drop(b);
+        assert!(est_actif(id), "la ré-annonce a effacé le DSD natif de A");
+        a.set_native_dsd_active_for_test(false);
+        assert!(!est_actif(id), "le registre suit toujours le drapeau de A");
+    }
+
     #[tokio::test]
     async fn oaat_gapless_capabilities_reflect_native_dsd() {
         let output = OaatOutput::new("Test".into(), "127.0.0.1".into(), 9999, "id".into());
@@ -2748,6 +2767,16 @@ mod tests {
         u16,
         tokio::task::JoinHandle<Vec<(oaat_core::wire::AudioPacketHeader, Vec<u8>)>>,
     ) {
+        spawn_dsd_mock_capacite(quiet, Some(512)).await
+    }
+
+    async fn spawn_dsd_mock_capacite(
+        quiet: std::time::Duration,
+        maximum: Option<u16>,
+    ) -> (
+        u16,
+        tokio::task::JoinHandle<Vec<(oaat_core::wire::AudioPacketHeader, Vec<u8>)>>,
+    ) {
         use oaat_core::wire::AudioPacketHeader;
 
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2830,13 +2859,20 @@ mod tests {
                                             capabilities: EndpointCapabilities {
                                                 pcm_max_rate: 384000,
                                                 pcm_max_bits: 32,
-                                                dsd_max_rate: Some(512),
+                                                dsd_max_rate: maximum,
                                                 channels_max: 2,
-                                                formats: vec![
-                                                    oaat_core::format::AudioFormat::PcmS16le,
-                                                    oaat_core::format::AudioFormat::PcmS24le,
-                                                    oaat_core::format::AudioFormat::DsdU8,
-                                                ],
+                                                formats: {
+                                                    let mut formats = vec![
+                                                        oaat_core::format::AudioFormat::PcmS16le,
+                                                        oaat_core::format::AudioFormat::PcmS24le,
+                                                    ];
+                                                    if maximum.is_some() {
+                                                        formats.push(
+                                                            oaat_core::format::AudioFormat::DsdU8,
+                                                        );
+                                                    }
+                                                    formats
+                                                },
                                                 volume: None,
                                                 gapless: true,
                                                 seek: false,
@@ -2867,6 +2903,110 @@ mod tests {
         });
 
         (control_port, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn le_repli_dsd_et_le_plafond_sont_observes_sur_le_fil_8486() {
+        use oaat_core::format::AudioFormat;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        for (nom, maximum, multiplicateur, attendu) in [
+            ("sans-dsd", None, 64u32, Some("no_dsd_capability")),
+            ("plafond", Some(64), 128, Some("dsd_rate_limit")),
+            ("dff", Some(512), 64, Some("unsupported_container")),
+            ("natif", Some(64), 64, None),
+        ] {
+            let fichier = dir.path().join(if nom == "dff" {
+                "source.dff"
+            } else {
+                "source.dsf"
+            });
+            if nom == "dff" {
+                std::fs::copy(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/dsd/ref_dsd64_stereo.dff"),
+                    &fichier,
+                )
+                .unwrap();
+            } else {
+                write_test_dsf(&fichier, 9, 8486);
+                let mut octets = std::fs::read(&fichier).unwrap();
+                octets[56..60].copy_from_slice(&(44_100 * multiplicateur).to_le_bytes());
+                std::fs::write(&fichier, octets).unwrap();
+            }
+            let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/pcm.wav", http.local_addr().unwrap());
+            let serveur = tokio::spawn(async move {
+                let (mut socket, _) = http.accept().await.unwrap();
+                let mut requete = Vec::new();
+                loop {
+                    let mut bloc = [0; 1024];
+                    let lus = socket.read(&mut bloc).await.unwrap();
+                    assert!(lus > 0, "requête HTTP du banc interrompue");
+                    requete.extend_from_slice(&bloc[..lus]);
+                    assert!(requete.len() <= 16 * 1024, "en-tête HTTP du banc trop long");
+                    if requete.windows(4).any(|fin| fin == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let wav = make_test_wav();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", wav.len()).as_bytes()).await.unwrap();
+                socket.write_all(&wav).await.unwrap();
+            });
+            let (port, capture) =
+                spawn_dsd_mock_capacite(Duration::from_millis(300), maximum).await;
+            let id = format!("oaat:8486-{nom}");
+            let output = OaatOutput::new(nom.into(), "127.0.0.1".into(), port, id.clone());
+            output
+                .play_media(&PlayMedia {
+                    url: &url,
+                    file_path: fichier.to_str(),
+                    duration_ms: Some(1000),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let paquets = tokio::time::timeout(Duration::from_secs(20), capture)
+                .await
+                .expect("capture OAAT expirée")
+                .unwrap();
+            let diag = output.diagnostics_snapshot();
+            assert!(!paquets.is_empty(), "{nom}: aucun paquet reçu");
+            assert_eq!(
+                diag["dsd_capabilities_received"], true,
+                "les capacités réelles du récepteur doivent être publiées"
+            );
+            assert_eq!(diag["dsd_max_rate"], serde_json::json!(maximum));
+            assert_eq!(
+                diag["dsd_pcm_fallback"]["reason"].as_str(),
+                attendu,
+                "le repli DSD doit dire sa cause pour {nom}"
+            );
+            if attendu.is_some() {
+                assert!(
+                    paquets.iter().all(|(h, _)| !h.format.is_dsd()),
+                    "le repli doit réellement envoyer du PCM"
+                );
+                assert_eq!(diag["dsd_pcm_fallback"]["dsd_rate"], multiplicateur);
+            } else {
+                assert!(
+                    paquets.iter().all(|(h, _)| h.format == AudioFormat::DsdU8),
+                    "le témoin natif doit rester natif"
+                );
+            }
+            output.stop().await.unwrap();
+            assert!(
+                output.diagnostics_snapshot()["dsd_pcm_fallback"].is_null(),
+                "stop doit effacer le motif ancien"
+            );
+            assert!(
+                crate::outputs::repli_dsd_oaat_8486::lire(&id)
+                    .unwrap()
+                    .repli
+                    .is_none()
+            );
+            serveur.abort();
+        }
     }
 
     /// #1513 — lecture fraîche : les octets UDP sont EXACTEMENT ceux du

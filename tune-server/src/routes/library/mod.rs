@@ -23,6 +23,8 @@ pub(crate) mod credits;
 pub(crate) mod credits_mb;
 /// #8325 — la relecture unique des balises classiques des fichiers importés.
 pub(crate) mod relecture_classique;
+/// rc12 — le renvoi unique des images d'artistes perdues par le site.
+pub(crate) mod renvoi_images_artistes;
 // #4805 — les crédits d'un album lus juste après son identification.
 mod credits_apres_identification;
 mod duplicates;
@@ -656,7 +658,9 @@ pub fn router() -> Router<AppState> {
         // défaut). Segment statique : aucun conflit avec `/albums/{id}`.
         .route(
             "/hires-check",
-            get(faux_hires::etat).post(faux_hires::regler),
+            get(faux_hires::etat)
+                .post(faux_hires::regler)
+                .put(faux_hires::regler),
         )
         // #6481 — les livrets PDF du dossier de l'album, et le fichier.
         // #8077 — les apports Qobuz d'un album local : lire (calcul à la
@@ -756,6 +760,8 @@ pub fn router() -> Router<AppState> {
             axum::routing::patch(ambiances::update_ambiance).delete(ambiances::delete_ambiance),
         )
         .route("/stats", get(stats::library_stats))
+        // Go du 13/11 — chercher dans TOUT le classement des statistiques.
+        .route("/stats/rankings", get(classements_8264::rechercher))
         .route("/labels", get(labels::list_labels))
         // Écran « État du serveur » (01/11/2026) : avant `/labels/{nom}/…`,
         // qui ne capture de toute façon pas ces chemins (segment `artists`).
