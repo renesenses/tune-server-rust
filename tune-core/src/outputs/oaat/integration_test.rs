@@ -2938,8 +2938,17 @@ mod tests {
             let url = format!("http://{}/pcm.wav", http.local_addr().unwrap());
             let serveur = tokio::spawn(async move {
                 let (mut socket, _) = http.accept().await.unwrap();
-                let mut requete = [0; 4096];
-                socket.read(&mut requete).await.unwrap();
+                let mut requete = Vec::new();
+                loop {
+                    let mut bloc = [0; 1024];
+                    let lus = socket.read(&mut bloc).await.unwrap();
+                    assert!(lus > 0, "requête HTTP du banc interrompue");
+                    requete.extend_from_slice(&bloc[..lus]);
+                    assert!(requete.len() <= 16 * 1024, "en-tête HTTP du banc trop long");
+                    if requete.windows(4).any(|fin| fin == b"\r\n\r\n") {
+                        break;
+                    }
+                }
                 let wav = make_test_wav();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", wav.len()).as_bytes()).await.unwrap();
                 socket.write_all(&wav).await.unwrap();
