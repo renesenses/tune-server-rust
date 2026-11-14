@@ -66,6 +66,8 @@ EOF
 cat > "$stubs/setpriv" <<'EOF'
 #!/bin/sh
 echo "setpriv $* HOME=$HOME" >> "$JOURNAL"
+# #8675 — the models folder the server would get (kept out of $JOURNAL).
+echo "${TUNE_EMBEDDING_MODELS_DIR-absente}" > "$JOURNAL.modeles"
 EOF
 # Group owning the fake sound nodes (63 = `audio` on a Fedora host), and the
 # fake CD drive (11 on a ZimaOS host, #8141).
@@ -81,6 +83,7 @@ EOF
 cat > "$stubs/serveur" <<'EOF'
 #!/bin/sh
 echo "serveur $*" >> "$JOURNAL"
+echo "${TUNE_EMBEDDING_MODELS_DIR-absente}" > "$JOURNAL.modeles"
 EOF
 chmod +x "$stubs"/*
 
@@ -98,7 +101,10 @@ lancer() {
     printf 'FAKE_EUID=%s\nTUNE_UID=1000\nTUNE_GID=1000\nFAKE_GROUP_ADD="%s"\nFAKE_SND_GID=%s\nFAKE_CD_GID=%s\n' \
         "$euid" "${GROUP_ADD:-}" "${SND_GID:-29}" "${CD_GID:-24}" > "$ETAT"
     : > "$JOURNAL"
-    rm -rf "$travail/data" "$travail/music" "$travail/snd" "$travail/cd"
+    rm -f "$JOURNAL.modeles"
+    rm -rf "$travail/data" "$travail/music" "$travail/snd" "$travail/cd" "$travail/app-modeles"
+    # MODELES_MONTES=1: a volume mounted on /app/embedding_models (#7028).
+    if [ -n "${MODELES_MONTES:-}" ]; then mkdir -p "$travail/app-modeles"; fi
     mkdir -p "$travail/data/artwork_cache" "$travail/music" "$travail/snd" "$travail/cd"
     # SND=1: /dev/snd passed to the container (a char device stands in).
     if [ -n "${SND:-}" ]; then ln -s /dev/null "$travail/snd/controlC0"; fi
@@ -113,9 +119,11 @@ lancer() {
     erreur="$(env -i PATH="$stubs:/usr/bin:/bin" HOME=/root ETAT="$ETAT" JOURNAL="$JOURNAL" \
         TUNE_ENTRYPOINT_BIN="$stubs/serveur" TUNE_ENTRYPOINT_DATA_DIR="$travail/data" \
         TUNE_ENTRYPOINT_SND_DIR="$travail/snd" TUNE_ENTRYPOINT_CD_DIR="$travail/cd" \
+        TUNE_ENTRYPOINT_LEGACY_MODELS_DIR="$travail/app-modeles" \
         "$@" sh "$ENTRYPOINT" --un "deux mots" 2>&1 >"$travail/stdout")" || sortie=$?
     stdout="$(cat "$travail/stdout")"
     journal="$(cat "$JOURNAL")"
+    modeles="$(cat "$JOURNAL.modeles" 2>/dev/null || echo 'serveur non lancé')"
 }
 
 a() { grep -qF -- "$1" <<<"$journal"; }
@@ -202,6 +210,40 @@ else
     else ko "/dev/sr0 (gid 11)" "sortie=$sortie err=$erreur
 $journal"; fi
 fi
+
+# 11. #8675 — the models go under /data in both images: /app is root's, and
+#     the server runs as `tune`. A relative default there could never be
+#     created (`mkdir embedding_models: Permission denied`).
+racine_depot="$(cd "$ici/../.." && pwd)"
+for f in Dockerfile Dockerfile.dist; do
+    if grep -qE '^[[:space:]]*TUNE_EMBEDDING_MODELS_DIR=/data/embedding_models[[:space:]]*\\$' "$racine_depot/$f" \
+        && grep -qE '^RUN mkdir -p .*/data/embedding_models.*chown -R tune:tune /data' "$racine_depot/$f"; then
+        ok "$f : modèles sous /data/embedding_models (ENV + dossier à tune)"
+    else ko "$f : TUNE_EMBEDDING_MODELS_DIR=/data/embedding_models absent" "$(grep -n 'embedding_models\|^ENV\|^RUN mkdir' "$racine_depot/$f")"; fi
+done
+
+# 12. #8675 — the image's value reaches the server untouched, root or not.
+for euid in 0 1000; do
+    lancer "$euid" TUNE_EMBEDDING_MODELS_DIR=/data/embedding_models
+    if [ "$sortie" = 0 ] && [ "$modeles" = /data/embedding_models ]; then
+        ok "uid $euid : modèles sous /data/embedding_models"
+    else ko "uid $euid : modèles sous /data" "sortie=$sortie modeles=$modeles err=$erreur"; fi
+done
+
+# 13. #8675 — a volume already mounted on /app/embedding_models (#7028) is
+#     kept, root or not: its model is not downloaded again.
+for euid in 0 1000; do
+    MODELES_MONTES=1 lancer "$euid" TUNE_EMBEDDING_MODELS_DIR=/data/embedding_models
+    if [ "$sortie" = 0 ] && [ "$modeles" = "$travail/app-modeles" ]; then
+        ok "uid $euid : volume /app/embedding_models déjà monté conservé"
+    else ko "uid $euid : volume /app/embedding_models conservé" "sortie=$sortie modeles=$modeles err=$erreur"; fi
+done
+
+# 14. #8675 — a path chosen by the user is never replaced.
+MODELES_MONTES=1 lancer 0 TUNE_EMBEDDING_MODELS_DIR=/srv/mes-modeles
+if [ "$sortie" = 0 ] && [ "$modeles" = /srv/mes-modeles ]; then
+    ok "TUNE_EMBEDDING_MODELS_DIR choisi par l'utilisateur : respecté"
+else ko "TUNE_EMBEDDING_MODELS_DIR choisi" "sortie=$sortie modeles=$modeles"; fi
 
 if [ "${1:-}" = "--conteneur" ]; then
     if ! docker info >/dev/null 2>&1; then

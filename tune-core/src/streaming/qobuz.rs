@@ -262,19 +262,41 @@ fn erreur_de_fiche((statut, message): (Option<u16>, String)) -> TuneError {
 enum AttemptError {
     /// Network-level failure (timeout, DNS, connect) — eligible for fallback.
     Network(String),
-    /// HTTP error status. 5xx is eligible for fallback; 4xx is final.
+    /// HTTP error status. 5xx is eligible for fallback; 4xx is final — sauf
+    /// le refus de la périphérie Akamai (#8694, [`AttemptError::refus_de_peripherie`]).
     Http { status: u16, body: String },
     /// Body of a successful response failed to parse — final, no fallback.
     Json(String),
 }
 
 impl AttemptError {
-    /// Whether the other endpoint should be tried (network error or 5xx).
+    /// Whether the other endpoint should be tried (network error, 5xx, or
+    /// the Akamai edge refusing the network — #8694).
     fn transient(&self) -> bool {
         match self {
             Self::Network(_) => true,
-            Self::Http { status, .. } => *status >= 500,
+            Self::Http { status, .. } => *status >= 500 || self.refus_de_peripherie(),
             Self::Json(_) => false,
+        }
+    }
+
+    /// Le 403 vient-il de la PÉRIPHÉRIE Akamai de Qobuz, et non de l'API ?
+    ///
+    /// #8694 (fil 2803, rc11 macOS) : toutes les requêtes du testeur vers
+    /// `www.qobuz.com/api.json/0.2`, `user/login` compris, recevaient
+    /// `403 <HTML>…Access Denied…` servi par `errors.edgesuite.net`. C'est le
+    /// réseau du testeur (VPN, pays, réputation de l'adresse) qui est refusé,
+    /// avant l'API : ni le jeton, ni le mot de passe, ni l'application. Le
+    /// traiter comme un 4xx de l'API privait du relais mozaiklabs, qui passe
+    /// par un autre réseau.
+    ///
+    /// L'API de Qobuz répond TOUJOURS en JSON (`{"status":"error",…}`) : un
+    /// 403 dont le corps n'est pas du JSON est la page de la périphérie. Un
+    /// 403 JSON (jeton périmé…) garde son traitement d'avant.
+    fn refus_de_peripherie(&self) -> bool {
+        match self {
+            Self::Http { status: 403, body } => corps_de_peripherie(body),
+            _ => false,
         }
     }
 
@@ -290,6 +312,38 @@ impl AttemptError {
         }
     }
 }
+
+/// Un corps de réponse qui n'est pas du JSON de l'API Qobuz : la page HTML
+/// « Access Denied » d'Akamai (`errors.edgesuite.net`), ou rien — #8694.
+fn corps_de_peripherie(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_err()
+}
+
+/// De deux tentatives ratées (primaire puis secours), celle qui explique le
+/// mieux l'échec — #8694.
+///
+/// Si l'une est un refus de la périphérie Akamai et que l'autre n'a pas eu de
+/// réponse de l'API (panne réseau, 5xx, autre refus de périphérie), c'est le
+/// refus de périphérie qui dit ce qui se passe : « Qobuz refuse votre
+/// réseau ». Une vraie réponse de l'API au secours (401 identifiants, 400
+/// application…) l'emporte toujours : elle seule parle du compte.
+fn echec_le_plus_parlant(primaire: AttemptError, secours: AttemptError) -> AttemptError {
+    if primaire.refus_de_peripherie() && secours.transient() && !secours.refus_de_peripherie() {
+        info!(error = %secours, "qobuz_fallback_failed_after_edge_refusal");
+        primaire
+    } else {
+        secours
+    }
+}
+
+/// Code stable rendu quand la périphérie de Qobuz refuse le réseau de
+/// l'utilisateur et que le relais n'a pas pu prendre le relais (#8694). Le
+/// client le traduit.
+pub const CODE_RESEAU_REFUSE: &str = "service_network_refused";
+
+/// Le texte du refus de réseau : il dit que le mot de passe n'est pas en cause.
+const MOTIF_RESEAU_REFUSE: &str = "qobuz login: Qobuz refuses connections from this network (VPN, country…); \
+     your password is not the cause";
 
 /// Ce que `POST /streaming/qobuz/auth` rend quand la connexion échoue
 /// (renesenses/tune-server-rust#7068).
@@ -320,6 +374,12 @@ impl AttemptError {
 fn erreur_de_connexion(err: &AttemptError) -> TuneError {
     if application_refusee(err) {
         return TuneError::AppRefused(MOTIF_APPLICATION_REFUSEE.to_string());
+    }
+    if err.refus_de_peripherie() {
+        return TuneError::Refused {
+            code: CODE_RESEAU_REFUSE,
+            message: MOTIF_RESEAU_REFUSE.to_string(),
+        };
     }
     match err.statut_http() {
         Some(401) => TuneError::Credentials("qobuz login: invalid credentials".to_string()),
@@ -355,6 +415,8 @@ fn application_refusee(err: &AttemptError) -> bool {
 fn nature_echec_connexion(err: &AttemptError) -> &'static str {
     if application_refusee(err) {
         "application_refusee"
+    } else if err.refus_de_peripherie() {
+        "reseau_refuse_par_la_peripherie"
     } else if err.statut_http() == Some(401) {
         "identifiants_refuses"
     } else {
@@ -386,6 +448,15 @@ impl std::fmt::Display for AttemptError {
 /// Log the primary-endpoint failure that triggers the fallback, keeping the
 /// historical proxy-first event names and their direct-first mirrors.
 fn log_fallback(proxy_first: bool, path: &str, err: &AttemptError) {
+    if err.refus_de_peripherie() {
+        let event = if proxy_first {
+            "qobuz_proxy_edge_refused_trying_direct"
+        } else {
+            "qobuz_direct_edge_refused_trying_proxy"
+        };
+        info!(path, event, "qobuz_edge_refused_trying_fallback");
+        return;
+    }
     match (proxy_first, err) {
         (true, AttemptError::Http { status, .. }) => {
             info!(path, status, "qobuz_proxy_5xx_trying_direct");
@@ -1374,6 +1445,7 @@ impl QobuzService {
                     .await
                     .map_err(|e| {
                         info!(path, error = %e, "qobuz_fallback_api_error");
+                        let e = echec_le_plus_parlant(err, e);
                         (e.statut_http(), format!("qobuz {path}: {e}"))
                     })
             }
@@ -3143,7 +3215,9 @@ impl QobuzService {
         match self.login_at(primary, app_id, username, password).await {
             Err(err) if err.transient() => {
                 log_fallback(self.proxy_first, "/user/login", &err);
-                self.login_at(fallback, app_id, username, password).await
+                self.login_at(fallback, app_id, username, password)
+                    .await
+                    .map_err(|e| echec_le_plus_parlant(err, e))
             }
             autre => autre,
         }
@@ -3234,9 +3308,10 @@ impl QobuzService {
             Ok(v) => Ok(v),
             Err(err) if err.transient() => {
                 log_fallback(self.proxy_first, path, &err);
-                self.api_post_at(fallback, path, params)
-                    .await
-                    .map_err(|e| (e.statut_http(), format!("qobuz {path}: {e}")))
+                self.api_post_at(fallback, path, params).await.map_err(|e| {
+                    let e = echec_le_plus_parlant(err, e);
+                    (e.statut_http(), format!("qobuz {path}: {e}"))
+                })
             }
             Err(err) => Err((err.statut_http(), format!("qobuz {path}: {err}"))),
         }
@@ -9322,6 +9397,10 @@ mod versions_mixes_8271_tests;
 #[path = "qobuz_application_distante_8134_tests.rs"]
 mod application_distante_8134_tests;
 
+#[cfg(test)]
+#[path = "qobuz_peripherie_akamai_8694_tests.rs"]
+mod peripherie_akamai_8694_tests;
+
 /// renesenses/tune-server-rust#7068 — un mauvais mot de passe Qobuz sortait en
 /// `qobuz login: 401 {"status":"error","code":401,"message":"Invalid
 /// username\/email and password combination"}` : le JSON du service, recopié
@@ -9416,9 +9495,11 @@ mod tests_erreur_de_connexion_7068 {
                 status: 500,
                 body: "boom".into(),
             },
+            // Un 403 de l'API (JSON). Celui de la périphérie Akamai (HTML) a
+            // désormais son propre refus : voir #8694.
             AttemptError::Http {
                 status: 403,
-                body: "akamai".into(),
+                body: r#"{"status":"error","code":403,"message":"forbidden"}"#.into(),
             },
             AttemptError::Network("timeout".into()),
             AttemptError::Json("eof".into()),
