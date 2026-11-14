@@ -960,9 +960,15 @@ fn postgresql_execute_les_requetes_de_tune_server() {
          le detecteur ne voit plus ce qu'il doit compter"
     );
     paquets.sort_unstable();
+    // Recette du 13/11 (n° 73, tune-server-rust#8755) — `tune-smart-http`
+    // entre dans l'inventaire : les comptes de la liste des collections
+    // intelligentes se jouent aussi sur PostgreSQL
+    // (`pg_comptes_collections_en_une_passe`). Le SQL des règles vit dans
+    // cette caisse ; l'éprouver là où il est écrit élargit la couverture que
+    // cette garde protège.
     assert_eq!(
         paquets,
-        ["tune-core", "tune-server"],
+        ["tune-core", "tune-server", "tune-smart-http"],
         "l'inventaire des paquets joues sur PostgreSQL a change : on n'en retire \
          jamais, et `tune-server` doit y rester — c'est la que vivent les \
          requetes des routes"

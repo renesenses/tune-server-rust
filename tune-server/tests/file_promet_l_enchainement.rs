@@ -294,6 +294,9 @@ async fn temoin_la_reponse_ne_gagne_que_gapless_next() {
         // clefs ADDITIVES, `null` quand rien n'est connu.
         "artist_id",
         "artist_id_service",
+        // …et la marque de la radio de fin de file (fil 2694), booléen
+        // ADDITIF, toujours présent : vrai pour une ligne ajoutée par la radio.
+        "added_by_radio",
     ];
     attendues.sort_unstable();
 

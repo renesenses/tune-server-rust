@@ -245,7 +245,8 @@ async fn i7047_reveil_de_zone_sans_source_et_sans_radio_refuse_en_400() {
             StatusCode::BAD_REQUEST,
             "#7047 : réveil sans source accepté ({en_cours:?}) → {v}"
         );
-        assert_eq!(v["error"], "invalid_source", "{v}");
+        // #8666 — ce qui joue ne peut pas servir de source : le refus le dit.
+        assert_eq!(v["error"], "alarm_source_required", "{v}");
     }
     assert_eq!(nombre_de_reveils(&s), 0, "rien n'a été écrit");
 }

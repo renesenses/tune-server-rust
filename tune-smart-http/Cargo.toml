@@ -19,6 +19,12 @@ tune-http-types = { path = "../tune-http-types" }
 # à l'horloge quand la règle se traduit. Déjà au graphe (tune-core).
 chrono = { workspace = true }
 
+# Recette du 13/11 (n° 73) — l'épreuve PostgreSQL des comptes en une passe
+# (`pg_comptes_collections_en_une_passe`, `TUNE_TEST_PG_URL`) : elle ouvre une
+# base par `tune_core::db::postgres`. Aucun effet sur le code servi.
+[features]
+postgres = ["tune-core/postgres"]
+
 # Pour éprouver le HANDLER, et pas seulement les fonctions qu'il appelle : le
 # débranchement d'un appel ne se voit dans aucune garde textuelle (#1231).
 [dev-dependencies]
