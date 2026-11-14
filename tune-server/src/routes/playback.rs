@@ -2875,10 +2875,19 @@ async fn play(
 ) -> axum::response::Response {
     let demande = body.as_ref().map(|Json(b)| contexte_de_lecture(b));
     let avant = tune_core::db::contexte_de_file::dernier_identifiant(&state.backend, zone_id);
-    let reponse =
-        play_sans_conteneur_de_file(State(state.clone()), profile, Path(zone_id), headers, body)
-            .await
-            .into_response();
+    // `Box::pin` : le gestionnaire de lecture est une très grosse machine à
+    // états. Posée en ligne dans celle-ci, elle doublait la pile des tests qui
+    // appellent `play` directement, jusqu'au débordement
+    // (`reprise_service_titre_seul_6380_tests`, `le_m3u_mixte_…_7738`).
+    let reponse = Box::pin(play_sans_conteneur_de_file(
+        State(state.clone()),
+        profile,
+        Path(zone_id),
+        headers,
+        body,
+    ))
+    .await
+    .into_response();
     if let Some((Some(nature), id, _)) = demande
         && CONTENEURS_DE_FILE.contains(&nature.as_str())
     {
