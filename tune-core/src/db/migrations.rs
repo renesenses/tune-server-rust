@@ -2918,6 +2918,18 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "radio_fin_de_file_par_defaut",
         up: SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT,
     },
+    // #8672 (décision de Bertrand du 13/11) — « Ma collection physique » :
+    // un disque « nulle part » associé À LA MAIN à un album de la
+    // bibliothèque, une ligne par release Discogs. Prime sur le rapprochement
+    // automatique, survit aux synchronisations (hors de `collection.json`).
+    // Naît vide. Jumelle PG : 119. Numérotée 153 / PG 119 le 13/11 : 152 /
+    // PG 118 sont pris par #8656 (radio de fin de file), en PR, qui DOIT
+    // fusionner avant celle-ci (garde de contiguïté) — sinon, renuméroter.
+    Migration {
+        version: 153,
+        name: "collection_physique_associations",
+        up: include_str!("../../migrations/collection_physique_associations.sql"),
+    },
 ];
 
 /// Pose `alarms.interrupt_playback` (#8615) — bloc de version de la 151 et
@@ -6252,6 +6264,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "radio_fin_de_file_par_defaut",
         include_str!("../../migrations/postgres/118_radio_fin_de_file_par_defaut.sql"),
     ),
+    // Jumelle de la SQLite 153 (#8672) : `collection_physique_associations`,
+    // les disques associés à la main à un album. Naît vide. (118 : #8656.)
+    (
+        119,
+        "collection_physique_associations",
+        include_str!("../../migrations/postgres/119_collection_physique_associations.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -8705,6 +8724,74 @@ mod tests {
         );
     }
 
+    /// #8672 — la migration 153 pose `collection_physique_associations` (les
+    /// disques associés à la main), sur une base NEUVE comme sur une base
+    /// MONTÉE juste avant ; la clé primaire est la release ; la jumelle PG 119
+    /// existe, marque son numéro, et la bascule copie la table.
+    #[test]
+    fn la_migration_153_pose_les_associations_manuelles_8672() {
+        let colonnes = |db: &SqliteDb| -> Vec<(String, i64)> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(collection_physique_associations)")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let attendues = vec![
+            ("release_id".to_string(), 1),
+            ("album_id".to_string(), 0),
+            ("associe_le".to_string(), 0),
+        ];
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(colonnes(&neuve), attendues, "base neuve");
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "DROP TABLE collection_physique_associations;
+                 DELETE FROM _migrations WHERE version >= 153;",
+            )
+            .unwrap();
+        assert!(colonnes(&montee).is_empty(), "préparation : table retirée");
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert_eq!(colonnes(&montee), attendues, "base montée sous la 153");
+        montee
+            .execute_batch(
+                "INSERT INTO collection_physique_associations \
+                 (release_id, album_id, associe_le) VALUES (249504, 7, 1);",
+            )
+            .unwrap();
+        assert!(
+            montee
+                .execute_batch(
+                    "INSERT INTO collection_physique_associations \
+                     (release_id, album_id, associe_le) VALUES (249504, 8, 2);",
+                )
+                .is_err(),
+            "une seule association par release"
+        );
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "119_collection_physique_associations.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(sql_pg.contains("VALUES (119, 'collection_physique_associations')"));
+        assert!(sql_pg.contains("release_id BIGINT NOT NULL PRIMARY KEY"));
+        assert!(include_str!("migrations.rs").contains(fichier));
+        let bascule = include_str!("pg_migrate.rs");
+        assert!(bascule.contains("\"collection_physique_associations\","));
+        assert!(bascule.contains("ON CONFLICT (release_id) DO NOTHING"));
+    }
+
     /// #8170 — la migration 150 pose `podcast_episode_positions` (la position
     /// de chaque épisode de podcast commencé), sur une base NEUVE comme sur une
     /// base MONTÉE juste avant ; la clé primaire est (zone, épisode) ; la
@@ -10121,7 +10208,10 @@ mod tests {
         // 118 : `radio_fin_de_file_par_defaut` (fil 2694), jumelle de la
         // SQLite 152. Migration de DONNÉES : la radio de fin de file activée
         // par défaut, et le DEFAULT de `zones.autoplay_enabled` à '1'.
-        assert_eq!(pg_latest_version(), 118, "latest PG migration must be 118");
+        // 119 : `collection_physique_associations` (#8672), jumelle de la
+        // SQLite 153 (118 = #8656, fusionnée avant). Crée les associations
+        // manuelles de « Ma collection physique », que le greffon NOMME.
+        assert_eq!(pg_latest_version(), 119, "latest PG migration must be 119");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
