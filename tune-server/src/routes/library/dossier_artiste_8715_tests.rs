@@ -121,3 +121,13 @@ async fn les_pistes_sont_filtrees_avant_les_copies_de_meilleure_qualite_8715() {
         "les gestes de lecture doivent garder la copie du dossier, avant dédoublonnage"
     );
 }
+
+#[tokio::test]
+async fn la_capacite_annonce_le_filtre_artiste_par_dossier_8715() {
+    let (app, _) = banc();
+    let capacites = lire(&app, "/api/v1/system/capabilities").await;
+    assert_eq!(
+        capacites["bibliotheque"]["artiste_par_dossier"], true,
+        "la télécommande doit pouvoir vérifier le filtre par dossier avant de le proposer"
+    );
+}
