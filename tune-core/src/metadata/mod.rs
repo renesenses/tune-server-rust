@@ -2632,6 +2632,21 @@ fn balise_utile(tag: &lofty::tag::Tag, path: &Path) -> bool {
             })
 }
 
+/// #8679 — l'artiste que le DOSSIER donne à un fichier, par la règle même du
+/// scan ([`album_artiste_du_chemin`] : dossier de disque et variante de
+/// mixage sautés, dossiers génériques, volumes et points de montage écartés).
+///
+/// Sert à « Albums douteux » : une piste sans balise d'artiste rangée sous
+/// `…/Pink Floyd/Animals/01.flac` montre « dossier : Pink Floyd » et propose
+/// de l'écrire. `None` quand l'arborescence ne dit rien d'exploitable.
+/// Aucune lecture du disque : le chemin seul.
+pub fn artiste_du_dossier(file_path: &str) -> Option<String> {
+    let (_, artiste, _) = album_artiste_du_chemin(Path::new(file_path));
+    artiste
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+}
+
 pub(crate) fn album_artiste_du_chemin(
     path: &Path,
 ) -> (Option<String>, Option<String>, Option<u32>) {
