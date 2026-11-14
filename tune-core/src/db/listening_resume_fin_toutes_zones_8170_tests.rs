@@ -52,7 +52,7 @@ fn un_episode_termine_sur_b_n_a_plus_de_position_sur_a_8170() {
 
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
-async fn pg_un_episode_termine_sur_b_n_a_plus_de_position_sur_a_8170() {
+async fn pg_8170_un_episode_termine_sur_b_n_a_plus_de_position_sur_a() {
     let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
         eprintln!("SAUT: TUNE_TEST_PG_URL absent");
         return;
