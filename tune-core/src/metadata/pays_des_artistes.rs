@@ -49,7 +49,7 @@ pub struct BilanPays {
 /// entier), `XE` (Europe), `XU` (inconnu).
 const PSEUDO_PAYS: &[&str] = &["XW", "XE", "XU"];
 
-fn code_de_pays(v: Option<&Value>) -> Option<String> {
+pub(crate) fn code_de_pays(v: Option<&Value>) -> Option<String> {
     let s = v?.as_str()?.trim().to_ascii_uppercase();
     (s.len() == 2
         && s.bytes().all(|b| b.is_ascii_uppercase())

@@ -65,6 +65,8 @@ pub mod artistes_par_le_reseau;
 pub mod noms_de_tri;
 /// #8090 — le pays de l'artiste, lu sur sa fiche MusicBrainz.
 pub mod pays_des_artistes;
+// #8668 — le pays d'édition des albums identifiés, lu sur MusicBrainz.
+pub mod pays_des_editions;
 pub mod tag_writer;
 /// #6463, B — la reprise des MBID d'artiste faux, par vérification MusicBrainz.
 pub mod verification_mbid_artistes;

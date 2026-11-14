@@ -308,6 +308,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8062 -- --nocapture --test-threads=1
 
+      # #8672 — « Ma collection physique » : la PG 119 pose
+      # `collection_physique_associations`, l'association manuelle passe par
+      # `$n` et `ON CONFLICT … DO UPDATE` (BIGINT), puis se défait. Sans cette
+      # étape, l'épreuve prendrait son saut annoncé.
+      - name: Associations manuelles de la collection physique sur PostgreSQL (#8672)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8672 -- --nocapture --test-threads=1
+
       # #7980 — une écoute ne compte que pour la piste de sa provenance
       # (locale, UPnP, service). Sans cette étape, le témoin prendrait son
       # saut annoncé.
@@ -1148,6 +1157,14 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pays_artiste_8090 -- --nocapture --test-threads=1
+
+      # #8668 — le pays d'édition lu sur MusicBrainz (`albums.release_country`,
+      # PG 120), la balise prioritaire, le filtre `country=` et la route
+      # `album-countries`, par le vrai routeur.
+      - name: Pays d'édition MusicBrainz sur PostgreSQL (#8668)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pays_edition_8668 -- --nocapture --test-threads=1
 
       # #6143 — « après », « avant », « entre » et `now-90d` des collections et
       # des playlists : bornes calculées en Rust (secondes pour `file_mtime`,

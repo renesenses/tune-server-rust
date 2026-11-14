@@ -3066,8 +3066,18 @@ impl TrackRepo {
 
         // Extended-tag filters via the open `track_metadata` k/v store. The key
         // is a fixed literal; only the values are bound parameters.
+        // #8668 — le pays d'édition : balise RELEASECOUNTRY, ou pays de la
+        // release MusicBrainz d'un album sans balise.
+        if let Some((c, p)) = combiner(
+            ph,
+            &f.countries,
+            f.est_en_et("country"),
+            crate::db::facet_filter::bloc_pays_edition,
+        ) {
+            conditions.push(c);
+            owned_params.extend(p);
+        }
         for (values, key, param) in [
-            (&f.countries, "release_country", "country"),
             (&f.moods, "mood", "mood"),
             (&f.source_medias, "source_media", "source_media"),
         ] {

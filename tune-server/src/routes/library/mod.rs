@@ -6,11 +6,13 @@ mod bio_liens;
 /// playlists et la recherche fédérée qui vivent hors de ce module.
 pub(crate) use albums::attacher_banni;
 mod albums_detailed;
+// #8668 — le pays de chaque album, pour la carte des pays.
 mod ambiances;
 mod artists;
 mod artwork;
 mod better_quality;
 mod browse;
+mod pays_des_albums;
 // `pub(crate)` : `/tags/{id}/collections` (routes/tags.rs) rend les dossiers d'une
 // étiquette dans la forme SERVIE de `/library/collections` — même fonction,
 // mêmes `album_count` et `orphan_album_ids` (#4798).
@@ -418,6 +420,9 @@ pub fn router() -> Router<AppState> {
             post(edition_par_filtre::annuler_fichiers),
         )
         .route("/albums-detailed", get(albums_detailed::albums_detailed))
+        // #8668 — le pays de chaque album (artiste ou édition), que la carte
+        // des pays croise avec les albums que la grille garde.
+        .route("/album-countries", get(pays_des_albums::pays_des_albums))
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
