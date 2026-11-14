@@ -96,7 +96,9 @@ fn semer(state: &AppState, chemin: &std::path::Path) {
         state,
         "INSERT INTO track_metadata (track_id, key, value) VALUES \
          (1, 'dr_track', '11'), (1, 'dr_source', 'analysis'), (1, 'dr_algo', 'tt-dr-v1'), \
-         (1, 'rg_analyzed', '1762682400')",
+         (1, 'rg_analyzed', '1762682400'), (1, 'rg_track_source', 'analysis'), \
+         (1, 'rg_track_gain', '-3.20 dB'), (1, 'rg_track_true_peak', '0.891251'), \
+         (1, 'rg_algo', 'bs1770-tp4x-v2')",
     );
     executer(
         state,
@@ -213,7 +215,28 @@ async fn fiche_d_une_piste_locale_8160() {
 
     assert_eq!(f["note"]["texte_md"], "**Pressage** japonais");
     assert!(f["note"]["maj_le"].as_str().is_some());
-    assert!(f["forme_d_onde"].is_null(), "place réservée à #8159");
+    // Fil 2793 — la forme d'onde : son URL, calculée à la demande.
+    assert_eq!(
+        f["forme_d_onde"]["url"], "/api/v1/library/tracks/1/forme-onde?colonnes=1000",
+        "{}",
+        f["forme_d_onde"]
+    );
+    assert!(
+        ["absent", "a_jour"].contains(&f["forme_d_onde"]["etat"].as_str().unwrap_or("")),
+        "{}",
+        f["forme_d_onde"]
+    );
+    // Réponse 11020 — la sonie déjà mesurée par la passe ReplayGain :
+    // −18 − (−3,20) = −14,8 LUFS ; crête vraie 0,891251 = −1,0 dBTP.
+    let sonie = &f["forme_d_onde"]["sonie"];
+    assert_eq!(sonie["integree_lufs"], -14.8, "{sonie}");
+    assert_eq!(sonie["crete_vraie_dbtp"], -1.0, "{sonie}");
+    assert_eq!(sonie["algo"], "bs1770-tp4x-v2");
+    assert_eq!(sonie["mesure_le"], "2025-11-09T10:00:00Z");
+    assert!(
+        sonie.get("plage_de_sonie_lu").is_none(),
+        "LRA jamais mesurée"
+    );
 
     // Recalcul, puis la fiche dit « à jour », datée.
     let (statut, s) = appel(&app, "POST", "/api/v1/library/tracks/1/spectrogramme", None).await;

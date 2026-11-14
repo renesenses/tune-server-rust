@@ -48,6 +48,7 @@ mod dlna_volume_apres_uri_tests_6008;
 /// #8647 — la sortie OAAT publie si elle sert un DSD natif. Hors `cfg` :
 /// le chemin du signal le lit partout ; sans OAAT, rien n'est inscrit.
 pub mod dsd_natif_oaat_8647;
+pub mod repli_dsd_oaat_8486;
 // #8151 — la sourdine tient à chaque nouvelle piste.
 #[cfg(test)]
 pub(crate) mod dlna_sourdine_8151_tests;
@@ -83,6 +84,11 @@ pub mod peripherique_introuvable;
 /// feature pour `tune-core`, et cette décision-ci doit pouvoir y être jugée.
 pub mod pseudo_peripherique_alsa;
 pub mod registry;
+/// #8696 — le fil de rendu WASAPI exclusif refuse le bridage d'énergie
+/// (EcoQoS) ; retards persistants et relevé de la session en cours pour le
+/// rapport de bogue. Public sur toutes les plateformes : le rapport le lit
+/// (relevé vide hors Windows).
+pub mod rendu_sans_bridage_8696;
 /// #4357 — les réveils EN RETARD de cette même boucle, et la tâche MMCSS du
 /// fil. Hors FFI pour la même raison : le seuil se juge par `cargo test`.
 #[cfg(any(target_os = "windows", test))]

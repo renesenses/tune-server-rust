@@ -550,6 +550,10 @@ struct SearchQuery {
     /// #7718 — le niveau de qualité minimal d'au moins un flux.
     quality_min: Option<String>,
     lossless: Option<bool>,
+    /// Recette rc12 (14/11) — le bouton « Sans perte » (alias de `lossless`).
+    sans_perte: Option<bool>,
+    /// Recette rc12 (14/11) — le bouton « Haute qualité » : sans perte ou ≥ 256 kbit/s.
+    haute_qualite: Option<bool>,
     hires: Option<bool>,
     favorites_only: Option<bool>,
     rated_min: Option<f64>,
@@ -570,6 +574,7 @@ impl SearchQuery {
             self.metadata_plus,
         )
         .avec_qualite_min(self.quality_min.as_deref())
+        .avec_boutons_rc12(self.sans_perte, self.haute_qualite)
     }
 }
 

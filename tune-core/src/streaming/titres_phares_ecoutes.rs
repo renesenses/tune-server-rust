@@ -245,12 +245,42 @@ fn deja_dans_la_liste(m: &Morceau, service: &str, items: &[Value]) -> bool {
     })
 }
 
+/// Les sources qui désignent un titre d'un CATALOGUE : un service qui le
+/// rejoue à la demande, aujourd'hui comme demain.
+///
+/// 🔴 Recette de Bertrand, .18, rc12 (13/11/2026) : fiche Genesis › Titres
+/// phares › « Dance on a Volcano » → « Erreur de lecture — HTTP 500 —
+/// aucun disque dans le lecteur ». Le titre avait été écouté 11 fois sur le
+/// CD (`source = "cd"`, `source_id` = disque/plage) avant d'être extrait ; la
+/// règle d'avant classait toute source non locale AVANT le fichier, et le
+/// titre ajouté désignait donc le CD, sorti du lecteur depuis. Un CD, un
+/// serveur UPnP, une entrée audio, une radio, un fichier glissé ne sont pas
+/// des catalogues : ce qu'ils désignaient n'est plus forcément là. Seul un
+/// service de cette liste, ou un fichier de la bibliothèque, désigne un titre
+/// phare.
+pub const SOURCES_DE_CATALOGUE: [&str; 7] = [
+    "qobuz", "tidal", "deezer", "spotify", "youtube", "amazon", "bandcamp",
+];
+
+/// La source désigne-t-elle un titre d'un catalogue (voir
+/// [`SOURCES_DE_CATALOGUE`]) ?
+pub fn est_une_source_de_catalogue(source: &str) -> bool {
+    SOURCES_DE_CATALOGUE.contains(&source.trim().to_ascii_lowercase().as_str())
+}
+
 /// Le titre ajouté, désigné par l'enregistrement le plus jouable du morceau.
+///
+/// Un enregistrement écouté sur un appareil (CD, serveur UPnP, entrée audio…)
+/// ne désigne jamais le titre : voir [`SOURCES_DE_CATALOGUE`]. Le morceau se
+/// désigne alors par un service ou par le fichier de la bibliothèque, et
+/// n'est pas ajouté s'il n'en a aucun.
 fn piste_jouable(m: &Morceau, service: &str) -> Option<Value> {
     let rang = |l: &EcouteDInterprete| -> Option<u8> {
         if l.source == "local" {
             l.track_id.map(|_| 2)
         } else if l.source_id.is_empty() {
+            None
+        } else if l.source != service && !est_une_source_de_catalogue(&l.source) {
             None
         } else if l.source == service {
             Some(0)
