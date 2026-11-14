@@ -2694,6 +2694,10 @@ mod profondeur_annoncee_egale_profondeur_ecrite;
 #[cfg(test)]
 mod recreation_locale_guard;
 
+// #3245 — la sortie recréée à la volée suit le réglage de sa zone.
+#[cfg(test)]
+mod recreation_exclusif_zone_3245_tests;
+
 #[cfg(test)]
 mod adoption_du_flux_pre_arme_3442;
 
