@@ -185,7 +185,11 @@ async fn i8666_reveil_pose_sur_un_titre_de_la_bibliotheque_joue_son_album_quand_
         .expect("le déclenchement rend la main");
     assert_eq!(zones.sonnees, vec![z], "{zones:?}");
     let etat = b.s.playback.get_state(z).await;
-    assert_eq!(etat.state, PlayState::Playing, "#8666 : le réveil n'a rien joué");
+    assert_eq!(
+        etat.state,
+        PlayState::Playing,
+        "#8666 : le réveil n'a rien joué"
+    );
     assert_eq!(etat.now_playing.unwrap().track_id, Some(b.pistes[0]));
     let file = PlayQueueRepo::with_backend(b.s.backend.clone())
         .get_queue(z)
@@ -212,7 +216,10 @@ async fn i8666_l_album_publie_par_la_lecture_en_cours_sert_de_source() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "{v}");
     let id = v["id"].as_i64().unwrap();
-    assert_eq!(source_du_planificateur(&b.s, id).0, format!("album:{ALBUM}"));
+    assert_eq!(
+        source_du_planificateur(&b.s, id).0,
+        format!("album:{ALBUM}")
+    );
 
     // Le corps de web#2962 (`album_id` envoyé) : même réveil.
     let (st, v) = request(
@@ -224,7 +231,10 @@ async fn i8666_l_album_publie_par_la_lecture_en_cours_sert_de_source() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "{v}");
     let id = v["id"].as_i64().unwrap();
-    assert_eq!(source_du_planificateur(&b.s, id).0, format!("album:{ALBUM}"));
+    assert_eq!(
+        source_du_planificateur(&b.s, id).0,
+        format!("album:{ALBUM}")
+    );
 }
 
 // ─── 2. Ce qui ne peut pas être rejoué : refus explicite ───────
@@ -284,10 +294,7 @@ async fn i8666_ce_qui_ne_peut_pas_etre_rejoue_est_refuse_avec_un_motif() {
         assert_eq!(v["error"], "alarm_source_required", "{v}");
         assert_eq!(v["reason"], motif, "{en_cours:?} → {v}");
         assert_eq!(v["playing_source"], source, "{v}");
-        assert!(
-            v["message"].as_str().is_some_and(|m| !m.is_empty()),
-            "{v}"
-        );
+        assert!(v["message"].as_str().is_some_and(|m| !m.is_empty()), "{v}");
     }
     assert_eq!(nombre_de_reveils(&b.s), 0, "rien n'a été écrit");
 }
