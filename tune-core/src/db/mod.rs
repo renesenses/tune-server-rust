@@ -95,6 +95,8 @@ pub mod rattrapage_metadonnees_5043;
 pub mod reference_d_album;
 /// #7849 — répartitions de la bibliothèque (codec, fréquence, décennie, rôle).
 pub mod repartitions_bibliotheque;
+// Go du 13/11 — l'année d'une piste à la lecture, repli sur celle de son album.
+pub mod annee_de_la_piste;
 /// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
 pub(crate) mod replieur_wal;
 pub mod settings_repo;

@@ -584,7 +584,7 @@ pub(crate) fn build_smart_query_rapport(
             match sort_by {
                 "artist" => "ar.name",
                 "album" => "al.title",
-                "year" => "t.year",
+                "year" => tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE,
                 "duration" => "t.duration_ms",
                 "added_at" => "t.id",
                 "play_count" => ecoutes.as_str(),
@@ -758,12 +758,17 @@ pub(crate) fn execute_smart_track_query(
         // `al.is_compilation` en 10 (#1957) : la ligne porte déjà quatre
         // colonnes d'album (`al.title`, `al.id`, `al.cover_path`, l'année),
         // et c'est d'elles que `smart_collection_albums` bâtit ses albums.
-        "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.format, t.genre, t.year, al.id, al.cover_path, al.is_compilation \
+        // Go du 13/11 — l'année affichée : celle de la piste, à défaut celle
+        // de son album, comme la règle `year` qui l'a peut-être retenue.
+        "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.format, t.genre, {}, al.id, al.cover_path, al.is_compilation \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
          {} {} {}",
-        where_clause, order, limit_clause
+        tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE_AVEC_AL,
+        where_clause,
+        order,
+        limit_clause
     );
 
     let rows = state
@@ -1573,7 +1578,13 @@ mod tests {
     #[test]
     fn year_contains_builds_condition() {
         let w = where_of(r#"[{"field":"year","op":"contains","value":"2025"}]"#);
-        assert!(w.contains("CAST(t.year AS TEXT) LIKE '%2025%'"), "got: {w}");
+        assert!(
+            w.contains(&format!(
+                "CAST({} AS TEXT) LIKE '%2025%'",
+                tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE
+            )),
+            "got: {w}"
+        );
     }
 
     #[test]
