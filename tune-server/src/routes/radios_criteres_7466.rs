@@ -23,6 +23,11 @@
 //! format (voir [`NiveauQualite`]) : la station passe si l'UN de ses flux est
 //! au moins de ce niveau. Un flux sans perte passe tout niveau avec perte,
 //! même sans débit publié, comme dans le rangement des flux du client web.
+//! Recette rc12 (14/11, Rémi) — deux boutons aux termes justes, jugés flux par
+//! flux : `sans_perte` (alias de `lossless`), un flux sans perte par son codec
+//! réel (voir [`est_sans_perte`]) ; `haute_qualite`, un flux sans perte OU d'au
+//! moins 256 kbit/s (voir [`FluxProfil::est_haute_qualite`]) — un FLAC sans
+//! débit publié en est.
 //! `language` n'est PAS proposé : ni l'annuaire ni le catalogue livré ne
 //! portent cette donnée, et un filtre sans donnée écarterait tout.
 
@@ -41,6 +46,10 @@ pub const SUGGESTIONS_MAX: usize = 200;
 
 /// Au-delà, un flux SANS PERTE est de la haute résolution.
 const FREQUENCE_HIRES: i32 = 48_000;
+
+/// Recette rc12 (14/11) — à partir de ce débit (kbit/s, compris), un flux avec
+/// perte est de « haute qualité ».
+const DEBIT_HAUTE_QUALITE: i32 = 256;
 
 /// La fréquence d'un CD, celle que suppose un flux sans perte muet.
 const FREQUENCE_CD: i32 = 44_100;
@@ -99,6 +108,14 @@ impl FluxProfil {
     /// par aucun annuaire : seule la fréquence départage.
     fn est_hires(&self) -> bool {
         self.sans_perte && self.frequence.is_some_and(|f| f > FREQUENCE_HIRES)
+    }
+
+    /// Recette rc12 (14/11, Rémi) — « Haute qualité » : un flux sans perte
+    /// (même sans débit publié, ce qui arrive aux FLAC), ou un flux avec perte
+    /// d'au moins 256 kbit/s (MP3 320, AAC 256). Un débit inconnu d'un flux
+    /// avec perte ne prouve rien : le flux n'en est pas.
+    fn est_haute_qualite(&self) -> bool {
+        self.sans_perte || self.debit.is_some_and(|d| d >= DEBIT_HAUTE_QUALITE)
     }
 }
 
@@ -196,6 +213,8 @@ pub struct Criteres {
     /// #7718 — `quality_min`.
     pub qualite_min: Option<NiveauQualite>,
     pub sans_perte: bool,
+    /// Recette rc12 (14/11) — `haute_qualite`.
+    pub haute_qualite: bool,
     pub hires: bool,
     pub favoris: bool,
     pub note_min: Option<f64>,
@@ -236,6 +255,7 @@ impl Criteres {
             debit_min: bitrate_min.filter(|b| *b > 0),
             qualite_min: None,
             sans_perte: lossless == Some(true),
+            haute_qualite: false,
             hires: hires == Some(true),
             favoris: favorites_only == Some(true),
             note_min: rated_min.filter(|n| n.is_finite() && *n > 0.0),
@@ -247,6 +267,19 @@ impl Criteres {
     /// [`Self::depuis`].
     pub fn avec_qualite_min(mut self, quality_min: Option<&str>) -> Self {
         self.qualite_min = quality_min.and_then(NiveauQualite::depuis);
+        self
+    }
+
+    /// Recette rc12 (14/11) — les deux boutons `sans_perte` (le même critère
+    /// que `lossless`, l'un ou l'autre suffit) et `haute_qualite`, à part pour
+    /// ne pas allonger [`Self::depuis`].
+    pub fn avec_boutons_rc12(
+        mut self,
+        sans_perte: Option<bool>,
+        haute_qualite: Option<bool>,
+    ) -> Self {
+        self.sans_perte |= sans_perte == Some(true);
+        self.haute_qualite = haute_qualite == Some(true);
         self
     }
 
@@ -287,7 +320,9 @@ impl Criteres {
             && self
                 .qualite_min
                 .is_none_or(|n| p.flux.iter().any(|x| n.atteint(x)))
-            && (!self.sans_perte || p.codecs.iter().any(|c| est_sans_perte(c)))
+            // Recette rc12 (14/11) — flux par flux, par le codec réel.
+            && (!self.sans_perte || p.flux.iter().any(|x| x.sans_perte))
+            && (!self.haute_qualite || p.flux.iter().any(FluxProfil::est_haute_qualite))
             && (!self.hires || p.flux.iter().any(FluxProfil::est_hires))
             && (!self.favoris || p.favori)
             && self.note_min.is_none_or(|min| {
