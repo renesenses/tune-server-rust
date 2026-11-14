@@ -270,7 +270,7 @@ pub(crate) fn compte_albums(
     match_mode: &str,
     profile_id: i64,
 ) -> i64 {
-    let (en_base, en_service) = compte_albums_ventile(
+    let (en_base, en_service, _) = compte_albums_ventile(
         backend,
         sql_bibliotheque,
         &[],
@@ -308,7 +308,7 @@ pub(crate) fn compte_albums_ventile(
     // #7872 — faux quand la collection porte une expression : les albums de
     // service n'y répondent jamais.
     avec_les_services: bool,
-) -> (i64, i64) {
+) -> (i64, i64, Option<i64>) {
     let un = |sql: &str, liens: &[&dyn ToSqlValue]| {
         backend
             .query_many(sql, liens)
@@ -316,9 +316,29 @@ pub(crate) fn compte_albums_ventile(
             .and_then(|rs| rs.first().and_then(|r| r.first()).and_then(|v| v.as_i64()))
             .unwrap_or(0)
     };
-    let en_base = un(sql_bibliotheque, liens_bibliotheque);
+    // Recette du 13/11 (n° 73) — le compte d'albums ET le compte de pistes de
+    // la bibliothèque viennent d'UNE lecture ([`sql_comptes_de_collection`]) :
+    // deux colonnes, une seule passe sur la jointure albums × pistes, au lieu
+    // de deux requêtes qui la refaisaient chacune. La seconde colonne est le
+    // compte de pistes ; une requête à une colonne (épreuves) n'en rend pas.
+    // Une lecture en échec rend 0 album et AUCUN compte de pistes, comme
+    // avant (`.ok()` sur la requête des pistes).
+    let lignes = backend
+        .query_many(sql_bibliotheque, liens_bibliotheque)
+        .ok();
+    let ligne = lignes.as_ref().and_then(|rs| rs.first());
+    let en_base = ligne
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let pistes_en_base = lignes.as_ref().map(|_| {
+        ligne
+            .and_then(|r| r.get(1))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    });
     if !avec_les_services {
-        return (en_base, 0);
+        return (en_base, 0, pistes_en_base);
     }
     // #5026 — les albums de service ÉTIQUETÉS s'ajoutent aux favoris de
     // service ; `etiquettes_streaming` écarte ceux que les favoris rendent déjà.
@@ -329,7 +349,7 @@ pub(crate) fn compte_albums_ventile(
             + etiquettes_streaming::requete_compte(rules_json, match_mode, profile_id)
                 .map(|sql| un(&sql, &[]))
                 .unwrap_or(0);
-    (en_base, en_service)
+    (en_base, en_service, pistes_en_base)
 }
 
 /// Faire tourner les lectures synchrones d'une route de collection
@@ -484,10 +504,10 @@ fn calculer_les_comptes(
     let where_clause = avec_l_expression(&where_clause, filtre.as_ref());
     let liens = liens_de(filtre.as_ref());
 
-    let album_count_sql = sql_compte_de_collection("al.id", &where_clause);
-    let (albums_en_base, albums_de_service) = compte_albums_ventile(
+    let comptes_sql = sql_comptes_de_collection(&where_clause);
+    let (albums_en_base, albums_de_service, pistes_en_base) = compte_albums_ventile(
         &*state.backend,
-        &album_count_sql,
+        &comptes_sql,
         &liens,
         rules_str,
         match_mode,
@@ -508,21 +528,8 @@ fn calculer_les_comptes(
     // (`SmartCollectionsView.svelte`) : la mention de pistes
     // disparaît, le nombre d'albums reste.
     let compte_complet = albums_de_service == 0;
-    let track_count = if compte_complet {
-        let track_count_sql = sql_compte_de_collection("t.id", &where_clause);
-        state
-            .backend
-            .query_many(&track_count_sql, &liens)
-            .ok()
-            .map(|rs| {
-                rs.first()
-                    .and_then(|r| r.first())
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-            })
-    } else {
-        None
-    };
+    // Lu dans la MÊME passe que le compte d'albums (recette du 13/11, n° 73).
+    let track_count = if compte_complet { pistes_en_base } else { None };
     crate::comptes::Comptes {
         album_count: albums_en_base + albums_de_service,
         track_count,
@@ -1355,11 +1362,35 @@ pub fn build_album_query(
 
 /// Le compte `COUNT(DISTINCT {objet})` d'une collection — `al.id` pour ses
 /// albums, `t.id` pour ses pistes — sur la même jointure que
-/// [`sql_albums_de_collection`]. Une seule écriture, pour que l'épreuve du plan
-/// (#2149) lise le SQL que la liste des collections joue.
+/// [`sql_albums_de_collection`].
+///
+/// C'est le SQL que la liste des collections jouait, deux fois par
+/// collection, jusqu'à la recette du 13/11/2026 : il ne sert plus qu'aux
+/// épreuves, comme RÉFÉRENCE de ce que [`sql_comptes_de_collection`] doit
+/// rendre à l'identique.
+#[cfg(test)]
 pub(crate) fn sql_compte_de_collection(objet: &str, where_clause: &str) -> String {
     format!(
         "SELECT COUNT(DISTINCT {objet}) FROM albums al \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
+    )
+}
+
+/// Les DEUX comptes d'une collection — albums, puis pistes — en une seule
+/// passe, sur la même jointure et la même clause que la liste d'albums
+/// ([`sql_albums_de_collection`]) : `COUNT(DISTINCT al.id)` et
+/// `COUNT(DISTINCT t.id)` lus ensemble rendent exactement ce que rendaient les
+/// deux requêtes jouées l'une après l'autre (épreuve
+/// `comptes_en_une_passe_egalent_les_deux_requetes`, SQLite et PostgreSQL).
+///
+/// Recette du 13/11/2026 (n° 73), .18 (9 488 albums, 96 438 pistes) : la liste
+/// des collections intelligentes rejouait pour CHAQUE collection deux
+/// comptes et la lecture de ses pochettes, trois passes complètes sur la
+/// jointure albums × pistes, entre 0,5 et 1 s chacune.
+pub(crate) fn sql_comptes_de_collection(where_clause: &str) -> String {
+    format!(
+        "SELECT COUNT(DISTINCT al.id), COUNT(DISTINCT t.id) FROM albums al \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
          LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
     )
@@ -1881,6 +1912,11 @@ async fn apercu_des_albums(
 #[cfg(test)]
 #[path = "expression_7872_tests.rs"]
 mod expression_7872_tests;
+
+// Recette du 13/11 (n° 73) — comptes en une passe et index des règles.
+#[cfg(test)]
+#[path = "comptes_en_une_passe_tests.rs"]
+mod comptes_en_une_passe_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3106,7 +3142,10 @@ mod apercu_note_5547 {
 /// `une_regle_de_genre_ne_lit_que_des_index_2149`.
 #[cfg(test)]
 mod genre_couvrant_2149 {
-    use super::{build_album_query, sql_albums_de_collection, sql_compte_de_collection};
+    use super::{
+        build_album_query, sql_albums_de_collection, sql_compte_de_collection,
+        sql_comptes_de_collection,
+    };
     use crate::smart_refs::{DbRefResolver, RefCtx};
     use std::sync::Arc;
     use tune_core::db::backend::DbBackend;
@@ -3178,6 +3217,7 @@ mod genre_couvrant_2149 {
                 ),
                 ("albums", sql_compte_de_collection("al.id", &where_clause)),
                 ("pistes", sql_compte_de_collection("t.id", &where_clause)),
+                ("comptes", sql_comptes_de_collection(&where_clause)),
             ] {
                 let p = plan(&db, &sql);
                 assert!(
