@@ -1290,7 +1290,9 @@ pub(crate) mod tests {
 /// provenance de la piste (#7980, `history_repo::sql::meme_provenance`) au
 /// lieu de toutes les écoutes hors radio. Enfin, toujours avec la
 /// Bibliothèque, elles ajoutent les écoutes importées (`imported_plays`,
-/// #8416).
+/// #8416). Depuis #8714, ces deux lignes suivent la priorité de la
+/// Bibliothèque : track_id, sinon album + titre, sinon titre + interprète.
+/// Les quatorze autres jeux restent identiques.
 #[cfg(test)]
 mod anciennes_regles {
     use crate::smart_playlists::build_smart_query_rapport;
