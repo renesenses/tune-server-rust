@@ -539,8 +539,27 @@ fn comparer_reponse(attendu: &Value, rendu: &Value) {
         "credit_counts : {}",
         rendu["credit_counts"]
     );
+    // #2961 a ajouté `shared_albums` et `album_wide` : l'exemple du contrat
+    // n'en parle pas, on compare les trois clés qu'il fixe.
+    let contrat = |v: &Value| -> Value {
+        match v.as_array() {
+            Some(a) => Value::Array(
+                a.iter()
+                    .map(|j| {
+                        serde_json::json!({
+                            "artist_id": j["artist_id"],
+                            "artist_name": j["artist_name"],
+                            "shared_tracks": j["shared_tracks"],
+                        })
+                    })
+                    .collect(),
+            ),
+            None => v.clone(),
+        }
+    };
     assert_eq!(
-        rendu["played_with"], attendu["played_with"],
+        contrat(&rendu["played_with"]),
+        contrat(&attendu["played_with"]),
         "played_with (#7768) : {}",
         rendu["played_with"]
     );

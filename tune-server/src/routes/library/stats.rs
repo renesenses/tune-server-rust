@@ -164,6 +164,17 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
         "total_size_bytes": total_size_bytes,
     });
     ajouter_ventilation(&mut corps, &VentilationParSource::lire(&state));
+    // #8625 (fil 2787) — LE total que montrent les listes (Titres, Albums) :
+    // les écrans l'affichent au lieu du compte des tables, et expliquent
+    // l'écart (`hidden_or_duplicate_*`) en infobulle. Clé ADDITIVE.
+    corps["library_totals"] =
+        match tune_core::db::totaux_bibliotheque::TotauxBibliotheque::lire(&state.backend) {
+            Ok(t) => json!(t),
+            Err(e) => {
+                tracing::warn!(erreur = %e, "library_stats_totaux");
+                Value::Null
+            }
+        };
     // Le compte `tracks_by_source.upnp` ne dit pas si l'import est entier :
     // le dernier bilan de chaque source synchronisée, lui, le sait (plafond
     // atteint, paginations interrompues…). Champ ADDITIF : rien d'existant ne
@@ -419,3 +430,7 @@ pub(super) async fn library_activity(
     let items = repo.recent(limit).unwrap_or_default();
     Json(json!(items))
 }
+
+#[cfg(test)]
+#[path = "totaux_8625_tests.rs"]
+mod totaux_8625_tests;
