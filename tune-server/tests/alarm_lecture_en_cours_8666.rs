@@ -113,13 +113,22 @@ fn source_du_planificateur(s: &AppState, id: i64) -> (String, Option<String>) {
         .get_alarm(id)
         .unwrap()
         .expect("le réveil se relit");
+    // `get_alarm` ne relit pas `source_name` : la colonne, telle quelle.
+    let nom = s
+        .backend
+        .query_one(
+            "SELECT source_name FROM alarms WHERE id = ?",
+            &[&id as &dyn tune_core::db::backend::ToSqlValue],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_string()));
     (
         format!(
             "{}:{}",
             a["source_type"].as_str().unwrap_or(""),
             a["source_id"].as_str().unwrap_or("")
         ),
-        a["source_name"].as_str().map(str::to_string),
+        nom,
     )
 }
 
