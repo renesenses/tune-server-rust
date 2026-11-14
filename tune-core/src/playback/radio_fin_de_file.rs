@@ -220,8 +220,10 @@ pub fn prendre_fin_sur_erreur(zone_id: i64) -> bool {
 
 /// Le dernier lot de la radio d'une zone, et si l'un de ses titres a été
 /// joué en entier.
-static DERNIERS_LOTS: LazyLock<Mutex<HashMap<i64, (Vec<i64>, bool)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Par zone : les lignes du dernier lot, et « un titre joué en entier ».
+type DerniersLots = HashMap<i64, (Vec<i64>, bool)>;
+
+static DERNIERS_LOTS: LazyLock<Mutex<DerniersLots>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Retient le lot que la radio vient d'ajouter.
 pub fn noter_lot(zone_id: i64, lignes: Vec<i64>) {
