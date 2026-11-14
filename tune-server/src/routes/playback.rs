@@ -23,6 +23,10 @@ mod session_message;
 #[cfg(test)]
 #[path = "playback/titre_indisponible_7778_tests.rs"]
 mod titre_indisponible_7778_tests;
+// Recette rc12 — une piste du CD lancée sans disque : 409 nommé, pas 500.
+#[cfg(test)]
+#[path = "playback/cd_disque_absent_tests.rs"]
+mod cd_disque_absent_tests;
 // #6332 — le débit d'une piste locale dans l'état de zone.
 #[cfg(test)]
 #[path = "playback/debit_lecture_en_cours_6332_tests.rs"]
@@ -215,6 +219,13 @@ fn refus_liaison_spotify(
     }
     (StatusCode::CONFLICT, Json(corps)).into_response()
 }
+
+/// Le motif du greffon CD quand le disque a quitté le lecteur
+/// (`tune_cd::lecteur::ErreurCd::AucunDisque`, voir la garde
+/// `motif_cd_disque_absent_suit_le_greffon`).
+pub(crate) const MOTIF_CD_DISQUE_ABSENT: &str = "aucun disque dans le lecteur";
+/// Le code stable de ce refus, lu par le client web.
+pub(crate) const CODE_CD_DISQUE_ABSENT: &str = "cd_disc_absent";
 
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     if let Some(reponse) = refus_du_bail_parental(&e, lang) {
@@ -452,6 +463,23 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     // aucune adresse de flux pour ce compte, cette région). 422 au code
     // stable, phrase traduite : sans cette branche, « no url » ne contenait
     // aucun mot du fourre-tout ci-dessous et finissait en 500 brut.
+    // Recette du .18, rc12 (13/11/2026) — une piste du CD lancée alors que le
+    // disque n'est plus dans le lecteur (titre phare écouté sur le CD avant
+    // son extraction) : le greffon CD rend « aucun disque dans le lecteur »,
+    // que le fourre-tout ci-dessous changeait en 500 `playback_error`, le
+    // texte brut dans le toast. 409 au code stable et phrase traduite : un
+    // état de l'appareil, pas une panne du serveur.
+    if e.contains(MOTIF_CD_DISQUE_ABSENT) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": CODE_CD_DISQUE_ABSENT,
+                "code": CODE_CD_DISQUE_ABSENT,
+                "message": crate::i18n::t(lang, "playback.cd_disc_absent"),
+            })),
+        )
+            .into_response();
+    }
     if tune_core::poller::refus_propre_a_la_piste(&e) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,

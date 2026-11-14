@@ -264,6 +264,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8088 -- --nocapture --test-threads=1
 
+      # #8680 (fil 2800) — normalisation des groupes enregistrés au démarrage :
+      # une zone dans un seul groupe, réglage `zone_groups` réécrit seulement
+      # s'il change, sur un vrai PostgreSQL. Sans cette étape, le témoin
+      # prendrait son saut annoncé.
+      - name: Groupes de zones normalisés sur PostgreSQL (#8680)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8680 -- --nocapture --test-threads=1
+
       # web#916 — « Pas pour moi » de l'accueil : la PG 111 pose
       # `suggestions_ecartees`, l'écart passe par `$n` et `ON CONFLICT … DO
       # UPDATE`, cloisonné par profil (BIGINT), puis rétabli. Sans cette
