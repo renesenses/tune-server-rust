@@ -3,6 +3,8 @@ pub(crate) mod helpers;
 #[cfg(feature = "oaat")]
 mod horloge;
 // #7330 — fin naturelle : `stop` après l'échéance du dernier échantillon.
+#[cfg(all(test, feature = "oaat"))]
+pub(crate) mod banc_fin_7330;
 #[cfg(feature = "oaat")]
 mod fin_jouee_7330;
 #[cfg(all(test, feature = "oaat"))]

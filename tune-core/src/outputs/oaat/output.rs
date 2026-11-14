@@ -2028,6 +2028,12 @@ impl OutputTarget for OaatOutput {
                         tokio::sync::oneshot::Receiver<Option<super::helpers::StagedDirectTrack>>,
                     > = None;
 
+                    // #7330 — rien à enchaîner : le poller ne l'apprend
+                    // qu'APRÈS l'attente de fin jouée. Levé avant, il voyait
+                    // une sortie « en lecture » figée à la durée sans gapless
+                    // interne (`reached_end_exclusive`), avançait la file et
+                    // interrompait l'attente : fin coupée, sans `stop`.
+                    let mut chaine_epuisee_7330 = false;
                     'direct_tracks: loop {
                         if !playing.load(Ordering::Relaxed) {
                             break 'direct_tracks;
@@ -2142,7 +2148,9 @@ impl OutputTarget for OaatOutput {
                                     // advances on its next tick (it re-reads
                                     // supports_internal_gapless while waiting)
                                     // instead of sitting out its guard.
-                                    chain_exhausted.store(true, Ordering::SeqCst);
+                                    // #7330 — signalé après l'attente de fin
+                                    // jouée, juste avant `stop`.
+                                    chaine_epuisee_7330 = true;
                                     break 'direct_tracks;
                                 }
                             }
@@ -2379,6 +2387,9 @@ impl OutputTarget for OaatOutput {
                         .await
                         .ok();
                     fin_jouee.attendre_avant_stop(&device_name).await;
+                    if chaine_epuisee_7330 {
+                        chain_exhausted.store(true, Ordering::SeqCst);
+                    }
                     endpoint.send_stop(&stream_id).await.ok();
                     playing.store(false, Ordering::SeqCst);
                     diag.connected.store(false, Ordering::SeqCst);
@@ -3551,10 +3562,15 @@ impl OutputTarget for OaatOutput {
             // end-of-track detection alone would not have closed that gap: ANY
             // exit without a transition opens it.
             if !exited_on_stop {
-                chain_exhausted.store(true, Ordering::SeqCst);
                 // #7330 — fin naturelle : laisser jouer la file du récepteur
-                // jusqu'au dernier échantillon avant de la purger.
+                // jusqu'au dernier échantillon avant de la purger. La chaîne
+                // n'est dite épuisée qu'APRÈS : levé avant l'attente, le drapeau
+                // faisait conclure au poller une fin « exclusive »
+                // (`reached_end_exclusive` : en lecture, figée à la durée, sans
+                // gapless interne). Il avançait la file au bout de trois sondes
+                // et interrompait l'attente : fin coupée, `stop` jamais envoyé.
                 fin_jouee.attendre_avant_stop(&device_name).await;
+                chain_exhausted.store(true, Ordering::SeqCst);
             }
 
             endpoint.send_stop(&stream_id).await.ok();

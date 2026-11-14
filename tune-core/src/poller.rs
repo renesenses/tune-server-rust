@@ -1608,6 +1608,9 @@ mod reprise_apres_pause_4666;
 
 #[cfg(test)]
 mod fin_hors_temps_reel_tests;
+// #7330 — le sondeur pendant l'attente de fin jouée d'une sortie OAAT.
+#[cfg(all(test, feature = "oaat"))]
+mod fin_oaat_jouee_7330_tests;
 
 /// #4661 — un fichier servi EN ENTIER se finit à l'HORLOGE DE PISTE, pas au
 /// bout d'un forfait de deux minutes.
