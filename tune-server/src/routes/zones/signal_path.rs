@@ -2176,6 +2176,34 @@ fn assembler_les_etapes_lang(
             etape["code"] = json!("dsd_dop_ecarte");
             etape["detail"] = json!(ecart.raison());
         }
+        if is_oaat
+            && is_dsd
+            && !dop_sur_le_fil
+            && let Some(repli) = zone
+                .output_device_id
+                .as_deref()
+                .and_then(tune_core::outputs::repli_dsd_oaat_8486::lire)
+                .and_then(|e| e.repli)
+        {
+            use tune_core::outputs::repli_dsd_oaat_8486::Raison;
+            let source = repli
+                .dsd_rate
+                .map(|n| format!("DSD{n}"))
+                .unwrap_or_else(|| "DSD".into());
+            let maximum = repli
+                .dsd_max_rate
+                .map(|n| format!("DSD{n}"))
+                .unwrap_or_else(|| "DSD".into());
+            let detail = match repli.raison {
+                Raison::SansDsd => ts(lang, "oaat_dsd_absent").to_string(),
+                Raison::Plafond => fs(lang, "oaat_dsd_plafond", &[&source, &maximum]),
+                Raison::Conteneur => ts(lang, "oaat_dsd_conteneur").to_string(),
+                Raison::Cadence => ts(lang, "oaat_dsd_cadence").to_string(),
+            };
+            etape["code"] = json!("oaat_dsd_pcm_fallback");
+            etape["detail"] = json!(detail);
+            etape["dsd_fallback"] = json!(repli);
+        }
         if flac_ffmpeg_vers_le_reseau {
             // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
             // même résolution ressemble à une erreur d'affichage.

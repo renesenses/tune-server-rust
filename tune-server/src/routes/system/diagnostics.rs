@@ -2774,13 +2774,22 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     if !oaat_endpoints.is_empty() {
         md.push_str(&format!("## OAAT Endpoints ({})\n", oaat_endpoints.len()));
         for ep in &oaat_endpoints {
+            let dsd_max = if ep["dsd_capabilities_received"].as_bool() == Some(true) {
+                ep["dsd_max_rate"]
+                    .as_u64()
+                    .map(|n| format!("DSD{n}"))
+                    .unwrap_or_else(|| "not advertised".into())
+            } else {
+                "unknown".into()
+            };
             md.push_str(&format!(
-                "- {} ({}): connected={}, packets={}, format={}\n",
+                "- {} ({}): connected={}, packets={}, format={}, DSD max={}\n",
                 ep["name"].as_str().unwrap_or("?"),
                 ep["host"].as_str().unwrap_or("?"),
                 ep["connected"].as_bool().unwrap_or(false),
                 ep["packets_sent"].as_u64().unwrap_or(0),
                 ep["format"].as_str().unwrap_or("?"),
+                dsd_max,
             ));
             if ep["stall_detected"].as_bool().unwrap_or(false) {
                 md.push_str("  **⚠ STALL DETECTED**\n");
