@@ -86,7 +86,11 @@
     "volume_dsd_natif": "Volume non appliqué (DSD natif)",
     "upsampling_fixed_rate": "Suréchantillonnage inactif : la fréquence de sortie fixe de la zone porte déjà la conversion ; retirez-la dans les réglages de la zone pour suréchantillonner",
     "fixed_rate_limit_name": "Fréquence de sortie",
-    "fixed_rate_limit": "{0} kHz demandé, {1} kHz appliqué"
+    "fixed_rate_limit": "{0} kHz demandé, {1} kHz appliqué",
+    "oaat_dsd_absent": "Le récepteur n’annonce pas de prise en charge DSD : conversion en PCM.",
+    "oaat_dsd_plafond": "{0} converti en PCM : le récepteur accepte au plus {1}.",
+    "oaat_dsd_conteneur": "DFF converti en PCM : la voie DSD native OAAT prend en charge les fichiers DSF.",
+    "oaat_dsd_cadence": "Cadence DSD non reconnue par la voie native OAAT : conversion en PCM."
   },
   "en": {
     "pregain": "auto pre-gain {0} dB",
@@ -175,7 +179,11 @@
     "volume_dsd_natif": "Volume not applied (native DSD)",
     "upsampling_fixed_rate": "Upsampling inactive: the zone's fixed output sample rate already performs the conversion; remove it in the zone settings to upsample",
     "fixed_rate_limit_name": "Output sample rate",
-    "fixed_rate_limit": "{0} kHz requested, {1} kHz applied"
+    "fixed_rate_limit": "{0} kHz requested, {1} kHz applied",
+    "oaat_dsd_absent": "The receiver does not advertise DSD support: converted to PCM.",
+    "oaat_dsd_plafond": "{0} converted to PCM: the receiver supports at most {1}.",
+    "oaat_dsd_conteneur": "DFF converted to PCM: the OAAT native DSD path supports DSF files.",
+    "oaat_dsd_cadence": "DSD rate not recognized by the OAAT native path: converted to PCM."
   },
   "de": {
     "pregain": "automatische Vorverstärkung {0} dB",
@@ -264,7 +272,11 @@
     "volume_dsd_natif": "Lautstärke nicht angewendet (natives DSD)",
     "upsampling_fixed_rate": "Upsampling inaktiv: Die feste Ausgabe-Abtastrate der Zone übernimmt bereits die Wandlung; entfernen Sie sie in den Zoneneinstellungen, um hochzurechnen",
     "fixed_rate_limit_name": "Ausgabe-Abtastrate",
-    "fixed_rate_limit": "{0} kHz angefordert, {1} kHz angewendet"
+    "fixed_rate_limit": "{0} kHz angefordert, {1} kHz angewendet",
+    "oaat_dsd_absent": "Der Empfänger meldet keine DSD-Unterstützung: Umwandlung in PCM.",
+    "oaat_dsd_plafond": "{0} in PCM umgewandelt: Der Empfänger unterstützt höchstens {1}.",
+    "oaat_dsd_conteneur": "DFF in PCM umgewandelt: Der native DSD-Pfad von OAAT unterstützt DSF-Dateien.",
+    "oaat_dsd_cadence": "DSD-Rate vom nativen OAAT-Pfad nicht erkannt: Umwandlung in PCM."
   },
   "es": {
     "pregain": "preganancia automática {0} dB",
@@ -353,7 +365,11 @@
     "volume_dsd_natif": "Volumen no aplicado (DSD nativo)",
     "upsampling_fixed_rate": "Sobremuestreo inactivo: la frecuencia de salida fija de la zona ya realiza la conversión; quítela en los ajustes de la zona para sobremuestrear",
     "fixed_rate_limit_name": "Frecuencia de salida",
-    "fixed_rate_limit": "{0} kHz solicitados, {1} kHz aplicados"
+    "fixed_rate_limit": "{0} kHz solicitados, {1} kHz aplicados",
+    "oaat_dsd_absent": "El receptor no anuncia compatibilidad con DSD: conversión a PCM.",
+    "oaat_dsd_plafond": "{0} convertido a PCM: el receptor admite como máximo {1}.",
+    "oaat_dsd_conteneur": "DFF convertido a PCM: la ruta DSD nativa de OAAT admite archivos DSF.",
+    "oaat_dsd_cadence": "La ruta nativa de OAAT no reconoce la frecuencia DSD: conversión a PCM."
   },
   "it": {
     "pregain": "pre-guadagno automatico {0} dB",
@@ -442,7 +458,11 @@
     "volume_dsd_natif": "Volume non applicato (DSD nativo)",
     "upsampling_fixed_rate": "Sovracampionamento inattivo: la frequenza di uscita fissa della zona esegue già la conversione; rimuovila nelle impostazioni della zona per sovracampionare",
     "fixed_rate_limit_name": "Frequenza di uscita",
-    "fixed_rate_limit": "{0} kHz richiesti, {1} kHz applicati"
+    "fixed_rate_limit": "{0} kHz richiesti, {1} kHz applicati",
+    "oaat_dsd_absent": "Il ricevitore non dichiara il supporto DSD: conversione in PCM.",
+    "oaat_dsd_plafond": "{0} convertito in PCM: il ricevitore supporta al massimo {1}.",
+    "oaat_dsd_conteneur": "DFF convertito in PCM: il percorso DSD nativo OAAT supporta i file DSF.",
+    "oaat_dsd_cadence": "Frequenza DSD non riconosciuta dal percorso nativo OAAT: conversione in PCM."
   },
   "zh": {
     "pregain": "自动预增益 {0} dB",
@@ -531,7 +551,11 @@
     "volume_dsd_natif": "未应用音量（原生 DSD）",
     "upsampling_fixed_rate": "升频未启用：此区域的固定输出采样率已完成转换；请在区域设置中移除它以启用升频",
     "fixed_rate_limit_name": "输出采样率",
-    "fixed_rate_limit": "请求 {0} kHz，实际应用 {1} kHz"
+    "fixed_rate_limit": "请求 {0} kHz，实际应用 {1} kHz",
+    "oaat_dsd_absent": "接收器未声明支持 DSD：转换为 PCM。",
+    "oaat_dsd_plafond": "{0} 已转换为 PCM：接收器最高支持 {1}。",
+    "oaat_dsd_conteneur": "DFF 已转换为 PCM：OAAT 原生 DSD 路径支持 DSF 文件。",
+    "oaat_dsd_cadence": "OAAT 原生路径无法识别此 DSD 采样率：转换为 PCM。"
   },
   "ja": {
     "pregain": "自動プリアンプ {0} dB",
@@ -620,7 +644,11 @@
     "volume_dsd_natif": "音量は適用されません（ネイティブ DSD）",
     "upsampling_fixed_rate": "アップサンプリング無効：このゾーンの固定出力サンプルレートがすでに変換を行っています。アップサンプリングするにはゾーン設定で解除してください",
     "fixed_rate_limit_name": "出力サンプルレート",
-    "fixed_rate_limit": "要求 {0} kHz、適用 {1} kHz"
+    "fixed_rate_limit": "要求 {0} kHz、適用 {1} kHz",
+    "oaat_dsd_absent": "受信機がDSD対応を通知していないため、PCMに変換します。",
+    "oaat_dsd_plafond": "{0}をPCMに変換：受信機の対応上限は{1}です。",
+    "oaat_dsd_conteneur": "DFFをPCMに変換：OAATのネイティブDSD経路はDSFファイルに対応しています。",
+    "oaat_dsd_cadence": "OAATのネイティブ経路でDSDレートを認識できないため、PCMに変換します。"
   },
   "ko": {
     "pregain": "자동 프리게인 {0} dB",
@@ -709,7 +737,11 @@
     "volume_dsd_natif": "볼륨 미적용 (네이티브 DSD)",
     "upsampling_fixed_rate": "업샘플링 비활성: 이 존의 고정 출력 샘플레이트가 이미 변환을 수행합니다. 업샘플링하려면 존 설정에서 해제하세요",
     "fixed_rate_limit_name": "출력 샘플레이트",
-    "fixed_rate_limit": "요청 {0} kHz, 적용 {1} kHz"
+    "fixed_rate_limit": "요청 {0} kHz, 적용 {1} kHz",
+    "oaat_dsd_absent": "수신기가 DSD 지원을 알리지 않아 PCM으로 변환합니다.",
+    "oaat_dsd_plafond": "{0}을 PCM으로 변환: 수신기는 최대 {1}을 지원합니다.",
+    "oaat_dsd_conteneur": "DFF를 PCM으로 변환: OAAT 네이티브 DSD 경로는 DSF 파일을 지원합니다.",
+    "oaat_dsd_cadence": "OAAT 네이티브 경로가 DSD 샘플레이트를 인식하지 못해 PCM으로 변환합니다."
   },
   "ro": {
     "pregain": "pre-amplificare automată {0} dB",
@@ -798,7 +830,11 @@
     "volume_dsd_natif": "Volum neaplicat (DSD nativ)",
     "upsampling_fixed_rate": "Supraeșantionare inactivă: frecvența de ieșire fixă a zonei face deja conversia; eliminați-o în setările zonei pentru a supraeșantiona",
     "fixed_rate_limit_name": "Frecvența de ieșire",
-    "fixed_rate_limit": "{0} kHz solicitat, {1} kHz aplicat"
+    "fixed_rate_limit": "{0} kHz solicitat, {1} kHz aplicat",
+    "oaat_dsd_absent": "Receptorul nu anunță suport DSD: conversie în PCM.",
+    "oaat_dsd_plafond": "{0} convertit în PCM: receptorul acceptă cel mult {1}.",
+    "oaat_dsd_conteneur": "DFF convertit în PCM: calea DSD nativă OAAT acceptă fișiere DSF.",
+    "oaat_dsd_cadence": "Rata DSD nu este recunoscută de calea nativă OAAT: conversie în PCM."
   },
   "sv": {
     "pregain": "automatisk förförstärkning {0} dB",
@@ -887,7 +923,11 @@
     "volume_dsd_natif": "Volym tillämpas inte (inbyggt DSD)",
     "upsampling_fixed_rate": "Uppsampling inaktiv: zonens fasta utgångsfrekvens utför redan konverteringen; ta bort den i zoninställningarna för att uppsampla",
     "fixed_rate_limit_name": "Utgångens samplingsfrekvens",
-    "fixed_rate_limit": "{0} kHz begärd, {1} kHz tillämpad"
+    "fixed_rate_limit": "{0} kHz begärd, {1} kHz tillämpad",
+    "oaat_dsd_absent": "Mottagaren anger inget DSD-stöd: konvertering till PCM.",
+    "oaat_dsd_plafond": "{0} konverteras till PCM: mottagaren stöder högst {1}.",
+    "oaat_dsd_conteneur": "DFF konverteras till PCM: OAAT:s inbyggda DSD-väg stöder DSF-filer.",
+    "oaat_dsd_cadence": "DSD-frekvensen känns inte igen av OAAT:s inbyggda väg: konvertering till PCM."
   },
   "vi": {
     "pregain": "tiền khuếch đại tự động {0} dB",
@@ -976,7 +1016,11 @@
     "volume_dsd_natif": "Không áp dụng âm lượng (DSD gốc)",
     "upsampling_fixed_rate": "Tăng tần số lấy mẫu không hoạt động: tần số đầu ra cố định của vùng đã thực hiện chuyển đổi; hãy bỏ nó trong cài đặt vùng để tăng tần số lấy mẫu",
     "fixed_rate_limit_name": "Tần số lấy mẫu đầu ra",
-    "fixed_rate_limit": "Yêu cầu {0} kHz, áp dụng {1} kHz"
+    "fixed_rate_limit": "Yêu cầu {0} kHz, áp dụng {1} kHz",
+    "oaat_dsd_absent": "Bộ thu không thông báo hỗ trợ DSD: chuyển đổi sang PCM.",
+    "oaat_dsd_plafond": "{0} được chuyển sang PCM: bộ thu hỗ trợ tối đa {1}.",
+    "oaat_dsd_conteneur": "DFF được chuyển sang PCM: đường DSD nguyên bản của OAAT hỗ trợ tệp DSF.",
+    "oaat_dsd_cadence": "Đường nguyên bản OAAT không nhận dạng tần số DSD: chuyển đổi sang PCM."
   },
   "hu": {
     "pregain": "automatikus előerősítés {0} dB",
@@ -1065,7 +1109,11 @@
     "volume_dsd_natif": "Hangerő nincs alkalmazva (natív DSD)",
     "upsampling_fixed_rate": "Felülmintavételezés inaktív: a zóna rögzített kimeneti frekvenciája már elvégzi az átalakítást; távolítsa el a zóna beállításaiban a felülmintavételezéshez",
     "fixed_rate_limit_name": "Kimeneti mintavételi frekvencia",
-    "fixed_rate_limit": "Kért: {0} kHz, alkalmazott: {1} kHz"
+    "fixed_rate_limit": "Kért: {0} kHz, alkalmazott: {1} kHz",
+    "oaat_dsd_absent": "A vevő nem jelzett DSD-támogatást: átalakítás PCM-re.",
+    "oaat_dsd_plafond": "{0} átalakítva PCM-re: a vevő legfeljebb {1} formátumot támogat.",
+    "oaat_dsd_conteneur": "DFF átalakítva PCM-re: az OAAT natív DSD útvonala DSF-fájlokat támogat.",
+    "oaat_dsd_cadence": "Az OAAT natív útvonala nem ismeri fel a DSD-frekvenciát: átalakítás PCM-re."
   },
   "nb": {
     "pregain": "automatisk forsterkning før behandling {0} dB",
@@ -1154,7 +1202,11 @@
     "volume_dsd_natif": "Volum ikke brukt (native DSD)",
     "upsampling_fixed_rate": "Oppsampling inaktiv: sonens faste utgangsfrekvens utfører allerede konverteringen; fjern den i soneinnstillingene for å oppsample",
     "fixed_rate_limit_name": "Samplingsfrekvens ut",
-    "fixed_rate_limit": "{0} kHz forespurt, {1} kHz brukt"
+    "fixed_rate_limit": "{0} kHz forespurt, {1} kHz brukt",
+    "oaat_dsd_absent": "Mottakeren oppgir ikke DSD-støtte: konvertering til PCM.",
+    "oaat_dsd_plafond": "{0} konverteres til PCM: mottakeren støtter maksimalt {1}.",
+    "oaat_dsd_conteneur": "DFF konverteres til PCM: OAATs native DSD-bane støtter DSF-filer.",
+    "oaat_dsd_cadence": "DSD-frekvensen gjenkjennes ikke av OAATs native bane: konvertering til PCM."
   },
   "pl": {
     "pregain": "automatyczne wzmocnienie wstępne {0} dB",
@@ -1243,7 +1295,11 @@
     "volume_dsd_natif": "Głośność nie jest stosowana (natywne DSD)",
     "upsampling_fixed_rate": "Nadpróbkowanie nieaktywne: stała częstotliwość wyjściowa strefy już wykonuje konwersję; usuń ją w ustawieniach strefy, aby nadpróbkowywać",
     "fixed_rate_limit_name": "Częstotliwość wyjściowa",
-    "fixed_rate_limit": "Żądano {0} kHz, zastosowano {1} kHz"
+    "fixed_rate_limit": "Żądano {0} kHz, zastosowano {1} kHz",
+    "oaat_dsd_absent": "Odbiornik nie zgłasza obsługi DSD: konwersja do PCM.",
+    "oaat_dsd_plafond": "{0} przekonwertowano do PCM: odbiornik obsługuje maksymalnie {1}.",
+    "oaat_dsd_conteneur": "DFF przekonwertowano do PCM: natywna ścieżka DSD OAAT obsługuje pliki DSF.",
+    "oaat_dsd_cadence": "Natywna ścieżka OAAT nie rozpoznaje częstotliwości DSD: konwersja do PCM."
   },
   "el": {
     "pregain": "αυτόματη προ-ενίσχυση {0} dB",
@@ -1332,6 +1388,10 @@
     "volume_dsd_natif": "Η ένταση δεν εφαρμόζεται (εγγενές DSD)",
     "upsampling_fixed_rate": "Η υπερδειγματοληψία είναι ανενεργή: η σταθερή συχνότητα εξόδου της ζώνης κάνει ήδη τη μετατροπή· αφαιρέστε την στις ρυθμίσεις της ζώνης για υπερδειγματοληψία",
     "fixed_rate_limit_name": "Συχνότητα δειγματοληψίας εξόδου",
-    "fixed_rate_limit": "Ζητήθηκαν {0} kHz, εφαρμόστηκαν {1} kHz"
+    "fixed_rate_limit": "Ζητήθηκαν {0} kHz, εφαρμόστηκαν {1} kHz",
+    "oaat_dsd_absent": "Ο δέκτης δεν δηλώνει υποστήριξη DSD: μετατροπή σε PCM.",
+    "oaat_dsd_plafond": "Το {0} μετατρέπεται σε PCM: ο δέκτης υποστηρίζει έως {1}.",
+    "oaat_dsd_conteneur": "Το DFF μετατρέπεται σε PCM: η εγγενής διαδρομή DSD του OAAT υποστηρίζει αρχεία DSF.",
+    "oaat_dsd_cadence": "Η εγγενής διαδρομή OAAT δεν αναγνωρίζει τη συχνότητα DSD: μετατροπή σε PCM."
   }
 }

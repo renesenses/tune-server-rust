@@ -4062,6 +4062,23 @@
     "pl": "Ten utwór nie jest dostępny do odtwarzania w serwisie (prawa, region lub subskrypcja).",
     "el": "Αυτό το κομμάτι δεν είναι διαθέσιμο για αναπαραγωγή από την υπηρεσία (δικαιώματα, περιοχή ή συνδρομή)."
   },
+  "playback.cd_disc_absent": {
+    "fr": "Le disque n'est plus dans le lecteur. Remettez le CD pour l'écouter, ou lisez sa copie dans la bibliothèque.",
+    "en": "The disc is no longer in the drive. Put the CD back in to listen to it, or play its copy from the library.",
+    "de": "Die Disc ist nicht mehr im Laufwerk. Legen Sie die CD wieder ein, um sie zu hören, oder spielen Sie ihre Kopie aus der Bibliothek ab.",
+    "es": "El disco ya no está en la unidad. Vuelva a introducir el CD para escucharlo o reproduzca su copia de la biblioteca.",
+    "it": "Il disco non è più nell'unità. Reinserisci il CD per ascoltarlo, oppure riproduci la sua copia dalla libreria.",
+    "zh": "光盘已不在光驱中。请重新放入 CD 收听，或播放资料库中的副本。",
+    "ja": "ディスクはもうドライブに入っていません。聴くには CD を入れ直すか、ライブラリにあるコピーを再生してください。",
+    "ko": "디스크가 더 이상 드라이브에 없습니다. CD를 다시 넣어 들으시거나 라이브러리의 사본을 재생하세요.",
+    "ro": "Discul nu mai este în unitate. Reintroduceți CD-ul pentru a-l asculta sau redați copia sa din bibliotecă.",
+    "sv": "Skivan finns inte längre i enheten. Sätt tillbaka cd-skivan för att lyssna på den, eller spela dess kopia från biblioteket.",
+    "hu": "A lemez már nincs a meghajtóban. Tegye vissza a CD-t a meghallgatáshoz, vagy játssza le a könyvtárban lévő másolatát.",
+    "vi": "Đĩa không còn trong ổ. Hãy đưa CD vào lại để nghe, hoặc phát bản sao của nó trong thư viện.",
+    "nb": "Platen er ikke lenger i stasjonen. Sett inn CD-en igjen for å lytte til den, eller spill av kopien i biblioteket.",
+    "pl": "Płyty nie ma już w napędzie. Włóż ponownie płytę CD, aby jej posłuchać, lub odtwórz jej kopię z biblioteki.",
+    "el": "Ο δίσκος δεν βρίσκεται πλέον στη μονάδα. Τοποθετήστε ξανά το CD για να το ακούσετε ή αναπαράγετε το αντίγραφό του από τη βιβλιοθήκη."
+  },
   "spotify.playback.disabled": {
     "fr": "Lecture Spotify non activée : l'option « Lecture Spotify (expérimental) » se trouve dans Réglages › Accès et jetons › Spotify Connect (niveau Avancé).",
     "en": "Spotify playback is not enabled: the “Spotify playback (experimental)” option is in Settings › Access and tokens › Spotify Connect (Advanced level).",

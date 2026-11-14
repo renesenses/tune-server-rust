@@ -21,6 +21,24 @@
 //!   sur ces pistes, puis, pour les retenus, à la fiche de même nom en base.
 //!
 //! Albums masqués exclus, comme partout sur la page artiste.
+//!
+//! #2961 (web) — les comptes « 20 pistes en commun » pour presque tous :
+//!
+//! * une piste et sa COPIE (le même album servi en local et par un serveur
+//!   UPnP, deux lignes `albums`) comptaient deux fois. On compte désormais des
+//!   ENREGISTREMENTS : même artiste d'album, même titre d'album replié, même
+//!   titre de piste replié (et même rang quand un titre revient dans un
+//!   album) ;
+//! * des balises qui recopient tout le personnel de l'album sur chaque piste
+//!   donnent le même compte à tout le monde. `album_wide` le dit : crédité
+//!   sur au moins 80 % des enregistrements de CHACUN de ses albums partagés
+//!   (3 enregistrements au moins), le client montre alors « N albums »
+//!   (`shared_albums`) plutôt que « N titres » ;
+//! * les membres d'un duo ou d'une collaboration (« A & B ») ne sont pas
+//!   « joue avec » de « A & B », ni « A & B » de A : parties du nom découpées
+//!   par [`split_artist_credit`] (noms de groupes connus jamais découpés).
+//!   Pas de table de relations entre artistes dans la base : le nom est le
+//!   seul indice.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -28,6 +46,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tracing::warn;
 
+use super::artist_split::split_artist_credit;
 use super::credits_release::{
     ROLES_AUDIBLES, credits_de_l_artiste_sql, est_artistes_divers, liste_sql,
 };
@@ -37,12 +56,26 @@ use crate::db::engine::Engine;
 /// Taille de la liste (contrat § 3.3).
 pub const TAILLE_JOUE_AVEC: usize = 20;
 
+/// Un album partagé est « entier » quand le musicien y est crédité sur au
+/// moins `NUMERATEUR / DENOMINATEUR` de ses enregistrements (#2961).
+const ALBUM_ENTIER_NUMERATEUR: usize = 4;
+const ALBUM_ENTIER_DENOMINATEUR: usize = 5;
+/// En dessous, un album est trop court pour distinguer crédit d'album et
+/// crédit de piste.
+const ALBUM_ENTIER_MIN_ENREGISTREMENTS: usize = 3;
+
 /// Un élément de `played_with`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoueAvec {
     pub artist_id: Option<i64>,
     pub artist_name: String,
+    /// Enregistrements distincts partagés (copies d'un même album confondues).
     pub shared_tracks: i64,
+    /// Albums distincts partagés (copies confondues), #2961.
+    pub shared_albums: i64,
+    /// Crédité sur (presque) tout chacun de ses albums partagés : les balises
+    /// tiennent alors un personnel d'album, compter des titres ne dit rien.
+    pub album_wide: bool,
 }
 
 impl JoueAvec {
@@ -51,6 +84,8 @@ impl JoueAvec {
             "artist_id": self.artist_id,
             "artist_name": self.artist_name,
             "shared_tracks": self.shared_tracks,
+            "shared_albums": self.shared_albums,
+            "album_wide": self.album_wide,
         })
     }
 }
@@ -82,6 +117,36 @@ pub fn replier(nom: &str) -> String {
         .join(" ")
 }
 
+/// Les parties repliées d'un nom de collaboration (« A & B » → `a`, `b`) ;
+/// vide quand le nom ne se découpe pas.
+pub fn parties_du_nom(nom: &str) -> Vec<String> {
+    let t = split_artist_credit(nom, &[], true);
+    if t.len() < 2 {
+        return Vec::new();
+    }
+    t.iter()
+        .map(|p| replier(p))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Où tombe une piste : l'album (copies confondues) et l'enregistrement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Enregistrement {
+    pub album: String,
+    pub cle: String,
+}
+
+impl Enregistrement {
+    /// Repli sans métadonnées : la piste est son propre album.
+    fn de_la_piste(track_id: i64) -> Self {
+        Self {
+            album: format!("#{track_id}"),
+            cle: format!("#{track_id}"),
+        }
+    }
+}
+
 fn mbid_utile(m: &Option<String>) -> Option<&str> {
     m.as_deref().map(str::trim).filter(|m| !m.is_empty())
 }
@@ -99,7 +164,29 @@ pub struct Groupe {
     pub fiche: Option<i64>,
     pub nom: String,
     pub mbid: Option<String>,
-    pub pistes: HashSet<i64>,
+    pub pistes: HashSet<Enregistrement>,
+}
+
+impl Groupe {
+    fn albums(&self) -> HashMap<&str, usize> {
+        let mut n: HashMap<&str, usize> = HashMap::new();
+        for e in &self.pistes {
+            *n.entry(e.album.as_str()).or_default() += 1;
+        }
+        n
+    }
+
+    /// Crédité sur (presque) tout chacun de ses albums partagés.
+    pub fn album_entier(&self, tailles: &HashMap<String, usize>) -> bool {
+        let albums = self.albums();
+        !albums.is_empty()
+            && albums.iter().all(|(a, n)| {
+                tailles.get(*a).is_some_and(|t| {
+                    *t >= ALBUM_ENTIER_MIN_ENREGISTREMENTS
+                        && n * ALBUM_ENTIER_DENOMINATEUR >= t * ALBUM_ENTIER_NUMERATEUR
+                })
+            })
+    }
 }
 
 /// Le cœur, sans base : écarte lui-même et « Various Artists », groupe par
@@ -107,17 +194,40 @@ pub struct Groupe {
 /// MBID vue dans `voisins`), compte les pistes distinctes et trie. Rend TOUS
 /// les groupes triés ; l'appelant coupe.
 pub fn grouper(voisins: &[Voisin], soi: &Soi) -> Vec<Groupe> {
+    grouper_par_enregistrement(voisins, soi, &HashMap::new())
+}
+
+/// Lui-même ou une partie de lui (un membre de « A & B »), ou une
+/// collaboration dont il est une partie.
+fn est_partie_de_soi(nom: &str, soi_nom: &str, soi_parties: &HashSet<String>) -> bool {
+    let n = replier(nom);
+    soi_parties.contains(&n)
+        || (!soi_nom.is_empty() && parties_du_nom(nom).iter().any(|p| p == soi_nom))
+}
+
+/// [`grouper`], les pistes comptées par enregistrement (`ou` : piste →
+/// enregistrement ; une piste absente est son propre enregistrement).
+pub fn grouper_par_enregistrement(
+    voisins: &[Voisin],
+    soi: &Soi,
+    ou: &HashMap<i64, Enregistrement>,
+) -> Vec<Groupe> {
     let soi_nom = replier(&soi.nom);
+    let soi_parties: HashSet<String> = parties_du_nom(&soi.nom).into_iter().collect();
     let soi_mbid = mbid_utile(&soi.mbid).map(str::to_string);
-    let est_soi = |v: &Voisin| {
+    let mut parties_vues: HashMap<String, bool> = HashMap::new();
+    let mut est_soi = |v: &Voisin| {
         v.fiche == Some(soi.artist_id)
             || (!soi_nom.is_empty() && replier(&v.nom) == soi_nom)
             || (soi_mbid.is_some() && mbid_utile(&v.mbid) == soi_mbid.as_deref())
+            || *parties_vues
+                .entry(v.nom.clone())
+                .or_insert_with(|| est_partie_de_soi(&v.nom, &soi_nom, &soi_parties))
     };
     let gardes: Vec<&Voisin> = voisins
         .iter()
         .filter(|v| !v.nom.trim().is_empty() || v.fiche.is_some())
-        .filter(|v| !est_soi(v) && !est_artistes_divers(&v.nom))
+        .filter(|v| !est_artistes_divers(&v.nom) && !est_soi(v))
         .collect();
 
     // Les fiches vues, par nom replié et par MBID.
@@ -160,7 +270,11 @@ pub fn grouper(voisins: &[Voisin], soi: &Soi) -> Vec<Groupe> {
         if g.mbid.is_none() {
             g.mbid = mbid_utile(&v.mbid).map(str::to_string);
         }
-        g.pistes.insert(v.track_id);
+        g.pistes.insert(
+            ou.get(&v.track_id)
+                .cloned()
+                .unwrap_or_else(|| Enregistrement::de_la_piste(v.track_id)),
+        );
     }
     let mut out: Vec<Groupe> = ordre
         .into_iter()
@@ -272,7 +386,8 @@ pub fn joue_avec(backend: &Arc<dyn DbBackend>, artist_id: i64) -> Vec<JoueAvec> 
         }
     }
 
-    let mut groupes = grouper(&voisins, &soi);
+    let (ou, tailles) = enregistrements(backend, &ses_pistes, &params[..4], masques);
+    let mut groupes = grouper_par_enregistrement(&voisins, &soi, &ou);
     // Les retenus sans fiche : la fiche de même MBID, sinon de même nom (sans
     // casse), quand elle existe en base. Au plus `TAILLE_JOUE_AVEC` lectures.
     let mut tete = groupes.len().min(TAILLE_JOUE_AVEC);
@@ -312,15 +427,88 @@ pub fn joue_avec(backend: &Arc<dyn DbBackend>, artist_id: i64) -> Vec<JoueAvec> 
             g.nom = nom;
         }
     }
+    // Une fiche retrouvée peut porter le nom d'un membre (#2961).
+    let soi_nom = replier(&soi.nom);
+    let soi_parties: HashSet<String> = parties_du_nom(&soi.nom).into_iter().collect();
+    groupes.retain(|g| {
+        g.fiche != Some(artist_id)
+            && replier(&g.nom) != soi_nom
+            && !est_partie_de_soi(&g.nom, &soi_nom, &soi_parties)
+    });
     trier(&mut groupes);
     groupes
         .into_iter()
-        .map(|g| JoueAvec {
-            artist_id: g.fiche,
-            artist_name: g.nom,
-            shared_tracks: g.pistes.len() as i64,
+        .map(|g| {
+            let album_wide = g.album_entier(&tailles);
+            JoueAvec {
+                artist_id: g.fiche,
+                shared_tracks: g.pistes.len() as i64,
+                shared_albums: g.albums().len() as i64,
+                album_wide,
+                artist_name: g.nom,
+            }
         })
         .collect()
+}
+
+/// Les enregistrements des albums où il est audible : piste →
+/// enregistrement, et nombre d'enregistrements par album (copies
+/// confondues). Une piste et sa copie d'un autre album de même artiste et de
+/// même titre (local et UPnP, #2961) tombent sur le même enregistrement.
+fn enregistrements(
+    backend: &Arc<dyn DbBackend>,
+    ses_pistes: &str,
+    params: &[&dyn ToSqlValue],
+    masques: &str,
+) -> (HashMap<i64, Enregistrement>, HashMap<String, usize>) {
+    let sql = format!(
+        "SELECT t.id, t.album_id, a.artist_id, a.title, t.title \
+         FROM tracks t JOIN albums a ON a.id = t.album_id \
+         WHERE t.album_id IN (SELECT album_id FROM tracks WHERE id IN ({ses_pistes})) \
+           AND {masques} \
+         ORDER BY t.album_id, t.disc_number, t.track_number, t.id"
+    );
+    let lignes = backend.query_many(&sql, params).unwrap_or_else(|e| {
+        warn!(erreur = %e, "joue_avec_enregistrements_illisibles");
+        Vec::new()
+    });
+    let mut ou: HashMap<i64, Enregistrement> = HashMap::new();
+    let mut rangs: HashMap<(i64, String), usize> = HashMap::new();
+    let mut par_album: HashMap<String, HashSet<String>> = HashMap::new();
+    for r in lignes {
+        let (Some(track_id), Some(album_id)) = (
+            r.first().and_then(|v| v.as_i64()),
+            r.get(1).and_then(|v| v.as_i64()),
+        ) else {
+            continue;
+        };
+        let artiste_album = r
+            .get(2)
+            .and_then(|v| v.as_i64())
+            .map(|i| i.to_string())
+            .unwrap_or_default();
+        let titre_album = replier(&r.get(3).and_then(|v| v.as_string()).unwrap_or_default());
+        let album = if titre_album.is_empty() {
+            format!("#a{album_id}")
+        } else {
+            format!("{artiste_album}\u{1f}{titre_album}")
+        };
+        let titre = replier(&r.get(4).and_then(|v| v.as_string()).unwrap_or_default());
+        let cle = if titre.is_empty() {
+            format!("#t{track_id}")
+        } else {
+            let rang = rangs.entry((album_id, titre.clone())).or_default();
+            *rang += 1;
+            format!("{album}\u{1f}{titre}\u{1f}{rang}")
+        };
+        par_album
+            .entry(album.clone())
+            .or_default()
+            .insert(cle.clone());
+        ou.insert(track_id, Enregistrement { album, cle });
+    }
+    let tailles = par_album.into_iter().map(|(a, e)| (a, e.len())).collect();
+    (ou, tailles)
 }
 
 fn retrouver_fiche(backend: &Arc<dyn DbBackend>, g: &Groupe) -> Option<i64> {
@@ -413,6 +601,75 @@ mod tests {
                 (None, "Tomas Reyes".into(), 1),
             ]
         );
+    }
+
+    fn duo() -> Soi {
+        Soi {
+            artist_id: 50,
+            nom: "DjeuhDjoah & Lieutenant Nicholson".into(),
+            mbid: None,
+        }
+    }
+
+    #[test]
+    fn les_membres_d_un_duo_n_en_sont_pas_les_partenaires_2961() {
+        let voisins = vec![
+            v(1, None, "Djeuhdjoah"),
+            v(1, None, "Lieutenant  Nicholson"),
+            v(1, None, "Alexis Valet"),
+        ];
+        assert_eq!(
+            resume(&grouper(&voisins, &duo())),
+            vec![(None, "Alexis Valet".into(), 1)]
+        );
+        // Et le duo n'est pas « joue avec » de son membre.
+        let membre = Soi {
+            artist_id: 51,
+            nom: "Lieutenant Nicholson".into(),
+            mbid: None,
+        };
+        let voisins = vec![
+            v(1, Some(50), "DjeuhDjoah & Lieutenant Nicholson"),
+            v(1, None, "Alexis Valet"),
+        ];
+        assert_eq!(
+            resume(&grouper(&voisins, &membre)),
+            vec![(None, "Alexis Valet".into(), 1)]
+        );
+        // Un nom de groupe connu ne se découpe pas.
+        assert!(parties_du_nom("Simon & Garfunkel").is_empty());
+    }
+
+    #[test]
+    fn une_copie_d_album_ne_double_pas_les_pistes_et_l_album_entier_se_voit_2961() {
+        let e = |album: &str, cle: &str| Enregistrement {
+            album: album.into(),
+            cle: cle.into(),
+        };
+        // Pistes 1..=4 (local) et 11..=14 (copie UPnP) : 4 enregistrements
+        // d'un album de 5 ; la piste 5 n'a que l'invité.
+        let mut ou = HashMap::new();
+        for i in 1..=5 {
+            ou.insert(i, e("A", &format!("A/{i}")));
+            ou.insert(10 + i, e("A", &format!("A/{i}")));
+        }
+        let mut voisins = Vec::new();
+        for i in (1..=4).chain(11..=14) {
+            voisins.push(v(i, None, "Alexis Valet"));
+        }
+        voisins.push(v(5, None, "Invité"));
+        voisins.push(v(15, None, "Invité"));
+        let g = grouper_par_enregistrement(&voisins, &duo(), &ou);
+        assert_eq!(
+            resume(&g),
+            vec![(None, "Alexis Valet".into(), 4), (None, "Invité".into(), 1)]
+        );
+        let tailles = HashMap::from([("A".to_string(), 5usize)]);
+        assert!(g[0].album_entier(&tailles), "4 sur 5 : personnel d'album");
+        assert!(!g[1].album_entier(&tailles), "1 sur 5 : crédit de piste");
+        // Trop court pour trancher.
+        let tailles = HashMap::from([("A".to_string(), 2usize)]);
+        assert!(!g[0].album_entier(&tailles));
     }
 
     #[test]

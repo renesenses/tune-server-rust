@@ -772,6 +772,12 @@ path = "tests/portee_audit_repertoire_3101.rs"
 name = "catalogue_imprimable_7671"
 path = "tests/catalogue_imprimable_7671.rs"
 
+# rc12 (13/11) : le catalogue suit le filtre « Hi-Res vérifié / douteux »
+# (`hires_verdict=`). Cible déclarée : `autotests = false`.
+[[test]]
+name = "catalogue_hires_verdict_rc12"
+path = "tests/catalogue_hires_verdict_rc12.rs"
+
 # #4101 : la vue Oxygen listait chaque piste de Led Zeppelin IV deux fois. Le
 # repli des copies de moindre qualite (#1362) etait pose sur la fiche d'album,
 # sur la file et sur `albums.track_count`, mais PAS sur `GET /library/tracks` —
