@@ -330,6 +330,34 @@ pub(crate) fn flux_normalise(url: &str) -> String {
     tune_core::radio_metadata_relais::flux_normalise(url)
 }
 
+/// #7773 — une station par flux dans ce que lit le client.
+///
+/// `radio_stations` ne porte aucune contrainte d'unicité (ni SQLite ni
+/// PostgreSQL) : un import M3U rejoué, un « Nouvelle station » sur un flux
+/// déjà présent ou deux ajouts depuis l'écran de lecture laissaient deux
+/// lignes pour la même adresse, et la radio s'affichait deux fois dans les
+/// favoris (Bilou, fil forum 2624). Sans migration, la lecture garde la
+/// PREMIÈRE ligne de chaque flux (règle [`tune_core::db::radio_repo::cle_du_flux`]) dans l'ordre déjà
+/// rendu par la base : favoris d'abord, puis par nom. Les lignes en trop
+/// restent en base, intactes ; aucune donnée n'est supprimée.
+pub(crate) fn une_station_par_flux(stations: Vec<RadioStation>) -> Vec<RadioStation> {
+    let mut vus = std::collections::HashSet::new();
+    stations
+        .into_iter()
+        .filter(|s| vus.insert(tune_core::db::radio_repo::cle_du_flux(&s.url)))
+        .collect()
+}
+
+/// #7773 — la station de « Mes radios » qui sert déjà ce flux, s'il y en a
+/// une (même règle que la lecture : [`tune_core::db::radio_repo::cle_du_flux`]).
+fn station_du_meme_flux(stations: &[RadioStation], url: &str) -> Option<RadioStation> {
+    let cle = tune_core::db::radio_repo::cle_du_flux(url);
+    stations
+        .iter()
+        .find(|s| tune_core::db::radio_repo::cle_du_flux(&s.url) == cle)
+        .cloned()
+}
+
 /// L'hôte d'une adresse, en minuscules et sans `www.` — ou `None` si l'adresse
 /// n'en porte pas.
 ///
@@ -1725,11 +1753,11 @@ async fn list_radios(
     let repo = RadioRepo::with_backend(state.backend.clone());
     // `favorites()` trie déjà par nom et filtre en SQL — même chemin que
     // `GET /radios/favorites`, plutôt qu'un second filtre à faire diverger.
-    let items = if q.favorite == Some(true) {
+    let items = une_station_par_flux(if q.favorite == Some(true) {
         repo.favorites().unwrap_or_default()
     } else {
         repo.list().unwrap_or_default()
-    };
+    });
     let mut corps = json!(items);
     radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(&headers));
     // #6516 — chaque station de « Mes radios » rapprochée de sa fiche
@@ -1779,6 +1807,28 @@ async fn create_radio(
             );
         }
     };
+    // #7773 — un flux déjà dans « Mes radios » n'y entre pas une seconde
+    // fois : la station existante est rendue (200 au lieu de 201), sans
+    // sonder le flux ni rien écrire. C'est ce qu'appellent « Nouvelle
+    // station » et « Ajouter à Mes radios » de l'écran de lecture : un second
+    // geste sur la même radio la faisait apparaître deux fois.
+    let connues = match repo.list() {
+        Ok(stations) => stations,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Some(existante) = station_du_meme_flux(&connues, &url) {
+        tracing::info!(
+            url = %url,
+            id = ?existante.id,
+            station = %existante.name,
+            "radio_creation_flux_deja_present"
+        );
+        return (
+            StatusCode::OK,
+            Json(station_localisee(&state, &existante, &headers)),
+        )
+            .into_response();
+    }
     // Puis ce que la FORME ne peut pas dire : le serveur rend-il un flux, ou
     // une page web ? Belkadi Yacine avait collé la page d'écoute de Radio
     // Paradise ; elle passe toutes les règles ci-dessus, et seule la LECTURE
@@ -1819,8 +1869,8 @@ async fn create_radio(
         last_played: None,
         play_count: 0,
     };
-    match repo.create(&station) {
-        Ok(id) => {
+    match repo.create_unique(&station) {
+        Ok((id, nouvelle)) => {
             state.event_bus.emit(
                 "library.radios_changed",
                 json!({"action": "created", "id": id}),
@@ -1831,7 +1881,11 @@ async fn create_radio(
                 ..station
             });
             (
-                StatusCode::CREATED,
+                if nouvelle {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
                 Json(station_localisee(&state, &created, &headers)),
             )
                 .into_response()
@@ -2238,7 +2292,7 @@ async fn search_radios(
 
 async fn list_favorites(headers: HeaderMap, State(state): State<AppState>) -> Json<Value> {
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let items = repo.favorites().unwrap_or_default();
+    let items = une_station_par_flux(repo.favorites().unwrap_or_default());
     let mut corps = json!(items);
     radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(&headers));
     // #6516 — chaque station de « Mes radios » rapprochée de sa fiche
@@ -2302,10 +2356,13 @@ async fn add_from_web(
     // rapprochement est une égalité d'adresse normalisée, pas une heuristique :
     // deux noms différents pour le même flux, c'est une seule station.
     //
-    // Cette porte ne vaut QUE pour ce chemin. `POST /api/v1/radios` continue
-    // de créer ce qu'on lui demande : c'est une API, son appelant sait ce
-    // qu'il fait, et un client qui compte sur le 201 ne doit pas changer de
-    // comportement sous ses pieds.
+    // #7773 — `POST /api/v1/radios` et les imports appliquent désormais la
+    // même porte : le flux déjà présent n'est pas recréé (200 et la station
+    // existante pour `POST`, `already_present` pour les imports). Ici seul le
+    // favori est en plus reposé, parce que c'est ce que ce geste demande.
+    // Le lien du site conserve sa normalisation historique (#3543).
+    // Les imports et le dédoublonnage général restent conservateurs : un
+    // chemin sensible à la casse ou terminé par / n'est pas effacé.
     if let Some(existante) = repo
         .list()
         .unwrap_or_default()
@@ -2358,8 +2415,8 @@ async fn add_from_web(
         last_played: None,
         play_count: 0,
     };
-    let html = match repo.create(&station) {
-        Ok(id) => {
+    let html = match repo.create_unique(&station) {
+        Ok((id, _)) => {
             repo.set_favorite(id, true).ok();
             state.event_bus.emit(
                 "library.radios_changed",
@@ -2433,7 +2490,7 @@ async fn toggle_favorite(
     let new_state = body
         .and_then(|b| b.favorite)
         .unwrap_or(!current.is_favorite);
-    match repo.set_favorite(id, new_state) {
+    match repo.set_favorite_for_flux(id, new_state) {
         Ok(_) => {
             state.event_bus.emit(
                 "library.radios_changed",
@@ -2563,11 +2620,20 @@ const REJETS_NOMMES_AU_PLUS: usize = 50;
 struct BilanImport {
     imported: i64,
     skipped: i64,
+    /// #7773 — lignes écartées parce que leur flux est déjà dans « Mes
+    /// radios » (ou plus haut dans le même fichier). Comptées aussi dans
+    /// `skipped` : rien n'a été écrit pour elles.
+    already_present: i64,
     rejected: i64,
     nommes: Vec<Value>,
 }
 
 impl BilanImport {
+    fn deja_present(&mut self) {
+        self.already_present += 1;
+        self.skipped += 1;
+    }
+
     fn rejeter(&mut self, index: usize, nom: &str, url: &str, code: &str, message: String) {
         self.rejected += 1;
         if self.nommes.len() < REJETS_NOMMES_AU_PLUS {
@@ -2604,6 +2670,7 @@ impl BilanImport {
         let mut corps = json!({
             "imported": self.imported,
             "skipped": self.skipped,
+            "already_present": self.already_present,
             "rejected": self.rejected,
             "total": total,
             "rejected_entries": self.nommes,
@@ -2672,8 +2739,9 @@ async fn import_radios(
             last_played: None,
             play_count: 0,
         };
-        match repo.create(&station) {
-            Ok(_) => bilan.imported += 1,
+        match repo.create_unique(&station) {
+            Ok((_, true)) => bilan.imported += 1,
+            Ok((_, false)) => bilan.deja_present(),
             Err(e) => bilan.rejeter(index, &s.name, &station.url, CODE_ECHEC_ECRITURE, e),
         }
     }
@@ -2741,6 +2809,8 @@ async fn import_radios_m3u(
                 continue;
             }
         };
+        // #7773 — rejouer le même fichier (ou en importer un second qui
+        // reprend des stations) ne double plus « Mes radios ».
         // Playlists use several logo attribute spellings (tvg-logo / url-logo /
         // logo); PLS carries none. Fall back to the stream host favicon so every
         // imported radio shows art (Bilou: "pourquoi ne pas les reprendre").
@@ -2767,8 +2837,9 @@ async fn import_radios_m3u(
             last_played: None,
             play_count: 0,
         };
-        match repo.create(&station) {
-            Ok(_) => bilan.imported += 1,
+        match repo.create_unique(&station) {
+            Ok((_, true)) => bilan.imported += 1,
+            Ok((_, false)) => bilan.deja_present(),
             Err(e) => {
                 tracing::debug!(url = %entry.path, error = %e, "radio_import_m3u_entry_failed");
                 // Et pas seulement dans le journal : l'échec d'écriture est

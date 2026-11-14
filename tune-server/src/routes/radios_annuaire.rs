@@ -1035,13 +1035,20 @@ async fn ajouter(
                 station.codec = flux.codec.map(|c| c.to_ascii_lowercase());
                 station.bitrate = flux.bitrate;
             }
-            match repo.create(&station) {
-                Ok(id) => {
+            match repo.create_unique(&station) {
+                Ok((id, nouvelle)) => {
                     state.event_bus.emit(
                         "library.radios_changed",
                         json!({"action": "created", "id": id, "external_id": external_id}),
                     );
-                    (Some(id), StatusCode::CREATED)
+                    (
+                        Some(id),
+                        if nouvelle {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::OK
+                        },
+                    )
                 }
                 Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
             }

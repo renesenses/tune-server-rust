@@ -1021,6 +1021,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_balises_8026 -- --nocapture --test-threads=1
 
+      # #7773 — une radio n'apparaît qu'une fois dans les favoris : lecture
+      # dédoublonnée par flux, « Nouvelle station » et imports sans seconde
+      # ligne, cœur appliqué aux deux lignes d'un doublon déjà en base.
+      - name: Radios sans doublon dans les favoris sur PostgreSQL (#7773)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test radios_doublons_7773 -- pg_ --nocapture --test-threads=1
+
       # #7027 — une bio rangée sans langue (`bio_lang` NULL ou vide, écrite
       # par le streaming ou le fonds communautaire) n'est jamais servie comme
       # de l'anglais. La cause porte sur la VALEUR de `bio_lang` : il faut le

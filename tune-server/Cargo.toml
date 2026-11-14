@@ -2196,3 +2196,10 @@ path = "tests/pays_artiste_8090.rs"
 name = "banc_albums_http_7774"
 path = "tests/banc_albums_http_7774.rs"
 required-features = ["postgres"]
+
+# #7773 — une radio n'apparaît qu'une fois dans les favoris : lecture
+# dédoublonnée par flux, création et imports sans doublon. Le cas PostgreSQL
+# (`pg_…`) est joué par une étape de `test-postgres.yml`.
+[[test]]
+name = "radios_doublons_7773"
+path = "tests/radios_doublons_7773.rs"
