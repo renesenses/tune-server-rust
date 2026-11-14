@@ -2875,9 +2875,10 @@ async fn play(
 ) -> axum::response::Response {
     let demande = body.as_ref().map(|Json(b)| contexte_de_lecture(b));
     let avant = tune_core::db::contexte_de_file::dernier_identifiant(&state.backend, zone_id);
-    let reponse = lancer_la_lecture(State(state.clone()), profile, Path(zone_id), headers, body)
-        .await
-        .into_response();
+    let reponse =
+        play_sans_conteneur_de_file(State(state.clone()), profile, Path(zone_id), headers, body)
+            .await
+            .into_response();
     if let Some((Some(nature), id, _)) = demande
         && CONTENEURS_DE_FILE.contains(&nature.as_str())
     {
@@ -2912,7 +2913,7 @@ async fn play(
     reponse
 }
 
-async fn lancer_la_lecture(
+async fn play_sans_conteneur_de_file(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Path(zone_id): Path<i64>,
