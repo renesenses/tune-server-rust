@@ -39,8 +39,12 @@ async fn appel(state: &AppState, methode: &str, route: &str, corps: Option<Value
         .await
         .unwrap();
     let texte = String::from_utf8_lossy(&octets).to_string();
-    assert!(statut.is_success(), "{methode} {route} → {statut} : {texte}");
-    serde_json::from_str(&texte).unwrap_or_else(|e| panic!("{route} : JSON illisible ({e}) : {texte}"))
+    assert!(
+        statut.is_success(),
+        "{methode} {route} → {statut} : {texte}"
+    );
+    serde_json::from_str(&texte)
+        .unwrap_or_else(|e| panic!("{route} : JSON illisible ({e}) : {texte}"))
 }
 
 fn titres(liste: &Value) -> Vec<String> {
@@ -109,9 +113,21 @@ async fn scenario(state: &AppState) {
     let t = |s: &str| format!("{MARQUE} {s}");
 
     // 1. Le filtre `year` de la liste des pistes.
-    let v = appel(state, "GET", &format!("/api/v1/library/tracks?year={ANNEE_ALBUM}&limit=500"), None).await;
+    let v = appel(
+        state,
+        "GET",
+        &format!("/api/v1/library/tracks?year={ANNEE_ALBUM}&limit=500"),
+        None,
+    )
+    .await;
     assert_eq!(titres(&v["items"]), vec![t("nulle"), t("zero")], "{v}");
-    let v = appel(state, "GET", &format!("/api/v1/library/tracks?year={ANNEE_PISTE}&limit=500"), None).await;
+    let v = appel(
+        state,
+        "GET",
+        &format!("/api/v1/library/tracks?year={ANNEE_PISTE}&limit=500"),
+        None,
+    )
+    .await;
     assert_eq!(titres(&v["items"]), vec![t("propre")], "{v}");
 
     // 2. La facette Années compte les pistes repliées sur l'album.
@@ -150,7 +166,11 @@ async fn scenario(state: &AppState) {
         Some(json!({"rules": [{"field": "year", "op": "between", "value": [ANNEE_ALBUM, ANNEE_PISTE]}], "match_mode": "all"})),
     )
     .await;
-    assert_eq!(titres(&r["tracks"]), vec![t("nulle"), t("propre"), t("zero")], "{r}");
+    assert_eq!(
+        titres(&r["tracks"]),
+        vec![t("nulle"), t("propre"), t("zero")],
+        "{r}"
+    );
 
     // 4. Rien n'est écrit : les pistes gardent leur année vide.
     let lignes = b
