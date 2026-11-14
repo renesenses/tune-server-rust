@@ -62,6 +62,16 @@ aussi les albums douteux. Un mot inconnu ne rend rien, jamais toute la
 bibliothèque. Sans le paramètre, la réponse est celle d'avant, plus les deux
 champs.
 
+## Catalogue imprimable : `GET /export/catalogue.html` (rc12)
+
+`?hires_verdict=verifie,douteux` (un ou plusieurs mots, séparés par des
+virgules) : les albums de ces verdicts publiés, mêmes prédicats que la liste
+(« douteux » masqué ne rend rien, un mot inconnu non plus). C'est une valeur
+de plus de la facette Qualité : OU avec `quality`, comme les pastilles de la
+Bibliothèque. `GET /library/hires-check` rend `"catalogue_hires_verdict": true`
+sur un serveur qui le sait ; le client web n'active l'export d'un filtre
+« Hi-Res vérifié / douteux » que s'il le lit.
+
 ## Règles intelligentes : critère `hires_verdict`
 
 Même nom aux deux niveaux, famille `hires_verdict`, opérateurs `=` et `!=`,

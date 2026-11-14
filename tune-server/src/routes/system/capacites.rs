@@ -26,6 +26,7 @@ pub(crate) fn capacites_payload(mobile: bool) -> Value {
     json!({
         "version": tune_core::version(),
         "mobile": mobile,
+        "bibliotheque": { "artiste_par_dossier": true },
         "sources_reseau": {
             // L'écran « Sources du réseau » : serveurs UPnP/DLNA
             // (`/network/media-servers*`) et autres serveurs Tune (`/peers`).

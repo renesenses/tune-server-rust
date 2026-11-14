@@ -1,10 +1,16 @@
 # Docker on Synology: writable model cache
 
-Tune's acoustic analysis downloads its model on first use. With the default
-settings, the image stores `clap-audio-music-2023.onnx` in
-`/app/embedding_models`. Text search models and the ONNX runtime also use this
-cache. `/data` contains the database and other persistent application data;
-mounting `/data` alone does not make `/app/embedding_models` writable.
+Tune's acoustic analysis downloads its model on first use. Since 1.0.0-rc12
+(#8675), the image stores `clap-audio-music-2023.onnx`, the text search models
+and the ONNX runtime in `/data/embedding_models`
+(`TUNE_EMBEDDING_MODELS_DIR`), next to the database: **mounting `/data` is
+enough, nothing below is needed any more.**
+
+The rest of this page describes the workaround for earlier images, where the
+cache was `/app/embedding_models`, which mounting `/data` alone did not make
+writable. An installation that already mounts `/app/embedding_models` keeps
+using that folder after the upgrade (the entrypoint detects the mount), so the
+model already downloaded there is not fetched again.
 
 Prepare a separate persistent folder before starting acoustic analysis. For
 example, in DSM File Station, create `docker/tune/embedding_models` on your data

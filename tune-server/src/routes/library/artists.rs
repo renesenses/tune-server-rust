@@ -1022,6 +1022,54 @@ pub(super) struct ArtistAlbumsQuery {
     /// client web, les clients natifs et le serveur média, et changer la
     /// forme pour tout le monde casserait ce qui marche.
     sections: Option<String>,
+    folder: Option<String>,
+}
+
+/// Portée de répertoire de la fiche et de ses gestes de lecture (#8715).
+/// Même sous-arbre NFC et même échappement des jokers que la Bibliothèque.
+#[derive(Default)]
+struct PorteeDossierArtiste {
+    albums: std::collections::HashSet<i64>,
+    pistes: std::collections::HashSet<i64>,
+}
+impl PorteeDossierArtiste {
+    fn charger(state: &AppState, dossier: Option<&str>) -> Option<Self> {
+        let dossier = dossier.filter(|d| !d.is_empty())?;
+        let mut ph = tune_core::db::facet_filter::Placeholders::new(state.backend.engine());
+        let sql = format!(
+            "SELECT id, album_id FROM tracks WHERE file_path LIKE {}{}",
+            ph.take(),
+            tune_core::db::track_repo::like_escape_clause()
+        );
+        let motif = tune_core::db::track_repo::folder_like_pattern(dossier);
+        let mut portee = Self::default();
+        match state.backend.query_many(&sql, &[&motif]) {
+            Ok(lignes) => {
+                for ligne in lignes {
+                    if let Some(id) = ligne[0].as_i64() {
+                        portee.pistes.insert(id);
+                    }
+                    if let Some(id) = ligne[1].as_i64() {
+                        portee.albums.insert(id);
+                    }
+                }
+            }
+            // Une lecture impossible ne doit jamais élargir la portée demandée.
+            Err(error) => {
+                tracing::warn!(%error, "lecture de la portée de répertoire de l'artiste impossible")
+            }
+        }
+        Some(portee)
+    }
+}
+
+fn garder_albums_du_dossier(
+    albums: &mut Vec<tune_core::db::models::Album>,
+    portee: Option<&PorteeDossierArtiste>,
+) {
+    if let Some(portee) = portee {
+        albums.retain(|a| a.id.is_some_and(|id| portee.albums.contains(&id)));
+    }
 }
 
 use tune_core::metadata::release_type;
@@ -1033,6 +1081,8 @@ pub(super) async fn artist_albums(
 ) -> Json<Value> {
     let repo = AlbumRepo::with_backend(state.backend.clone());
     let mut items = repo.list_by_artist(id).unwrap_or_default();
+    let portee = PorteeDossierArtiste::charger(&state, q.folder.as_deref());
+    garder_albums_du_dossier(&mut items, portee.as_ref());
     // La fiche artiste trie ses albums par date d'ajout (Bertrand,
     // 16/09/2026) ; `select_album()` ne porte pas la colonne.
     repo.attacher_added_at(&mut items);
@@ -1130,6 +1180,10 @@ pub(super) async fn artist_albums(
             continue;
         }
         let mut albums = albums;
+        garder_albums_du_dossier(&mut albums, portee.as_ref());
+        if albums.is_empty() {
+            continue;
+        }
         repo.attacher_added_at(&mut albums);
         let ids: Vec<i64> = albums.iter().filter_map(|a| a.id).collect();
         let canaux = super::albums::canaux_par_album(&repo, &ids);
@@ -1145,7 +1199,7 @@ pub(super) async fn artist_albums(
             .collect();
         obj.insert(cle.to_string(), json!(albums));
     }
-    inserer_sections_de_credits(&repo, &state, id, obj);
+    inserer_sections_de_credits(&repo, &state, id, obj, portee.as_ref());
     Json(reponse)
 }
 
@@ -1183,6 +1237,7 @@ fn inserer_sections_de_credits(
     state: &AppState,
     artist_id: i64,
     obj: &mut serde_json::Map<String, Value>,
+    portee: Option<&PorteeDossierArtiste>,
 ) {
     use tune_core::metadata::credits_release::{
         AlbumCredite, classer, compteurs_de_credits, credits_hors_discographie,
@@ -1215,6 +1270,7 @@ fn inserer_sections_de_credits(
         let (mut seuls, trouvees): (Vec<tune_core::db::models::Album>, Vec<&AlbumCredite>) =
             entrees
                 .iter()
+                .filter(|e| portee.is_none_or(|p| p.albums.contains(&e.album_id)))
                 .filter_map(|e| repo.get(e.album_id).ok().flatten().map(|a| (a, e)))
                 .unzip();
         repo.attacher_added_at(&mut seuls);
@@ -1276,9 +1332,15 @@ pub(super) async fn artist_tracks(
     State(state): State<AppState>,
     profile: crate::routes::active_profile::ActiveProfile,
     Path(id): Path<i64>,
+    Query(q): Query<ArtistAlbumsQuery>,
 ) -> Json<Value> {
     let repo = TrackRepo::with_backend(state.backend.clone());
-    let items = dedup_display_tracks(repo.list_by_artist(id).unwrap_or_default());
+    let mut items = repo.list_by_artist(id).unwrap_or_default();
+    if let Some(portee) = PorteeDossierArtiste::charger(&state, q.folder.as_deref()) {
+        items.retain(|p| p.id.is_some_and(|id| portee.pistes.contains(&id)));
+    }
+    // Le meilleur exemplaire doit être choisi DANS le dossier demandé.
+    let items = dedup_display_tracks(items);
     // #4806 — `banned` ici aussi : la liste ne change pas, elle s'annote.
     // Passer par `Vec<Value>` lui donne au passage `channel_badge` (additif).
     let mut items: Vec<Value> = items.iter().map(|t| t.to_json()).collect();
@@ -2338,3 +2400,7 @@ mod tests_absorption;
 #[cfg(test)]
 #[path = "identite_artiste_tests_6463.rs"]
 mod identite_artiste_tests_6463;
+
+#[cfg(test)]
+#[path = "dossier_artiste_8715_tests.rs"]
+mod dossier_artiste_8715_tests;
