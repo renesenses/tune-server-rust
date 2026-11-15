@@ -417,6 +417,69 @@ fn lignes_et_identifiants(state: &AppState, playlist_id: i64) -> Result<Vec<(i64
         .collect())
 }
 
+/// « # écoutes » et « Dernière écoute » vides dans la fiche d'une playlist
+/// (recette rc12 du 15/11) : la route ne posait ni `play_count` ni
+/// `last_played_at`, alors que la liste des pistes d'un album, la table des
+/// titres et les playlists d'un service les portent.
+///
+/// Même contrat que ces listes, et mêmes lecteurs :
+/// * ligne LOCALE : [`crate::routes::library::attacher_ecoutes`], la règle
+///   de la bibliothèque (`HistoryRepo::plays_for_tracks`, repli par les
+///   métadonnées compris) ;
+/// * ligne de SERVICE (Qobuz, TIDAL…) : les écoutes de ce serveur sur son
+///   `source_id` (`HistoryRepo::ecoutes_de_service_par_identifiant`, #8062),
+///   une requête par service présent dans la liste.
+///
+/// `0` / `null` pour une piste jamais jouée. Une radio et une ligne
+/// introuvable n'ont pas d'écoutes connaissables : aucune clé. Historique
+/// illisible : aucune clé non plus, un zéro dû à une panne se lirait
+/// « jamais jouée ».
+fn attacher_ecoutes_des_lignes(state: &AppState, items: &mut [Value]) {
+    crate::routes::library::attacher_ecoutes(state, items);
+    let de_service = |v: &Value| -> Option<(String, String)> {
+        if !v.get("id").is_none_or(Value::is_null)
+            || v.get("radio").is_some()
+            || v.get("missing").and_then(Value::as_bool) == Some(true)
+        {
+            return None;
+        }
+        let source = v.get("source")?.as_str()?.trim();
+        let source_id = v.get("source_id")?.as_str()?.trim();
+        if source.is_empty() || source_id.is_empty() || source.eq_ignore_ascii_case("local") {
+            return None;
+        }
+        Some((source.to_string(), source_id.to_string()))
+    };
+    let mut par_service: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (source, source_id) in items.iter().filter_map(de_service) {
+        par_service.entry(source).or_default().push(source_id);
+    }
+    let repo = tune_core::db::history_repo::HistoryRepo::with_backend(state.backend.clone());
+    for (service, ids) in par_service {
+        let ids_ref: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let ecoutes = match repo.ecoutes_de_service_par_identifiant(&service, &ids_ref) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(service, error = %e, "ecoutes_lignes_de_service_illisibles");
+                continue;
+            }
+        };
+        for item in items.iter_mut() {
+            let Some((source, source_id)) = de_service(item) else {
+                continue;
+            };
+            if source != service {
+                continue;
+            }
+            let (compte, derniere) = ecoutes.get(&source_id).cloned().unwrap_or((0, None));
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("play_count".into(), json!(compte));
+                obj.insert("last_played_at".into(), json!(derniere));
+            }
+        }
+    }
+}
+
 /// Une erreur de base ne doit PAS se déguiser en playlist vide (#2797) : le
 /// client ne peut alors pas distinguer « la playlist est vide » de « la
 /// requête a échoué », et l'utilisateur voit une playlist se vider toute
@@ -441,6 +504,7 @@ async fn get_tracks(
         })
         .collect();
     metadonnees_7738::completer(&state, &mut items).await;
+    attacher_ecoutes_des_lignes(&state, &mut items);
     // #4806 — un titre banni reste DANS la playlist, grisé : `banned` le dit.
     // Une ligne de service (`id` nul) n'est jamais bannie : le bannissement
     // désigne un `tracks.id`.
