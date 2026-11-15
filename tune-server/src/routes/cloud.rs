@@ -707,11 +707,35 @@ async fn marketplace_list(State(state): State<AppState>) -> Json<Value> {
     Json(json!(plugins))
 }
 
+/// Un nom de greffon tel que la boutique les forme : `^[a-z0-9][a-z0-9_-]{0,63}$`.
+/// Rien d'autre n'entre dans un chemin sous le dossier des greffons.
+fn nom_de_greffon_valide(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    name.len() <= 64
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 async fn marketplace_install(
+    // Sécurité : même garde que `/marketplace/plugins/{slug}/install`.
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if !nom_de_greffon_valide(&name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_plugin_name",
+                "message": "plugin name must match ^[a-z0-9][a-z0-9_-]{0,63}$",
+            })),
+        )
+            .into_response();
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
     let mp = PluginMarketplace::new(base_url.as_deref());
@@ -2718,6 +2742,7 @@ mod confinement_chemins_tests {
             .unwrap();
         for nom in ["../../dehors", "..", r"..\x", "a/b"] {
             let r = marketplace_install(
+                crate::auth::AdminOuCetteMachine,
                 Path(nom.to_string()),
                 State(b.state.clone()),
                 HeaderMap::new(),

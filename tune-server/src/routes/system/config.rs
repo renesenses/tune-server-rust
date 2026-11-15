@@ -3192,9 +3192,18 @@ pub(super) async fn get_scheduled_stop(State(state): State<AppState>) -> Json<Va
 /// de toutes les zones, pas seulement celle de l'appelant.
 pub(super) async fn set_scheduled_stop(
     _admin: crate::auth::RequireAdmin,
+    // Sécurité : éteindre la machine à l'heure dite, c'est `/appliance/shutdown`
+    // par une porte de côté — même garde, mais seulement pour `poweroff`
+    // (programmer un simple arrêt de la lecture reste ouvert).
+    garde_machine: Result<crate::auth::AdminOuCetteMachine, (StatusCode, Json<Value>)>,
     State(state): State<AppState>,
     Json(body): Json<tune_core::arret_programme::ArretProgramme>,
 ) -> axum::response::Response {
+    if body.action == tune_core::arret_programme::ActionArret::Poweroff
+        && let Err(refus) = garde_machine
+    {
+        return refus.into_response();
+    }
     // Éteindre la machine : Tune OS seulement. Refusé à l'enregistrement,
     // pas découvert à l'heure dite (la fonction d'extinction refuse aussi).
     if body.action == tune_core::arret_programme::ActionArret::Poweroff
@@ -4520,7 +4529,7 @@ pub(super) async fn stop(_admin: crate::auth::RequireAdmin) -> impl IntoResponse
     Json(json!({ "stopping": true }))
 }
 
-pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+pub(super) async fn restart(_garde: crate::auth::AdminOuCetteMachine) -> impl IntoResponse {
     if let Some(moteur) = crate::conteneur::detecter() {
         // #7074 — dans un conteneur, un `execv` qui échoue arrête le
         // conteneur : le journal le dit, c'est ce qu'on cherchera.

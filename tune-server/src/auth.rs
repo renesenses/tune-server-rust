@@ -339,7 +339,16 @@ fn appelant_sur_le_reseau_local(request: &Request) -> bool {
     request
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map(|ConnectInfo(peer)| adresse_locale(peer.ip()))
+        .map(|ConnectInfo(peer)| {
+            let ip = peer.ip();
+            // Sécurité : sur une appliance dont le relais du port 80 rouvre
+            // les connexions depuis 127.0.0.1, un pair en bouclage peut venir
+            // de n'importe où — il ne vaut plus « réseau local ».
+            if adresse_de_cette_machine(ip) && !crate::routes::appliance::bouclage_fiable() {
+                return false;
+            }
+            adresse_locale(ip)
+        })
         .unwrap_or(false)
 }
 
@@ -369,15 +378,15 @@ fn adresse_locale(ip: std::net::IpAddr) -> bool {
 }
 
 /// The only /auth/ endpoints reachable without a token when auth is enabled:
-/// login, logout, register (which can only create non-admin users), and the
-/// read-only config *status* (GET /auth/config). Everything else in the auth
-/// router — token minting, API-key generation/read, and mutating the auth
-/// config — must carry a valid token so the handler can enforce the admin role.
+/// login, logout, and the read-only config *status* (GET /auth/config).
+/// Everything else in the auth router — registration (only an
+/// administrator creates accounts once auth is on), token minting, API-key
+/// generation/read, and mutating the auth config — must carry a valid token so
+/// the handler can enforce the admin role.
 fn is_public_auth_route(method: &axum::http::Method, path: &str) -> bool {
     use axum::http::Method;
     path.ends_with("/auth/login")
         || path.ends_with("/auth/logout")
-        || path.ends_with("/auth/register")
         || (method == Method::GET && path.ends_with("/auth/config"))
 }
 
@@ -657,16 +666,10 @@ impl FromRequestParts<AppState> for BaseEntiereDepuisCetteMachine {
             return Ok(Self);
         }
         let relayee = crate::garde_du_relais::requete_relayee(&parts.headers);
-        // L'extracteur `ConnectInfo` lit l'extension posée par
-        // `aiguillage_des_flux` (et `MockConnectInfo` sous test) ; absente,
-        // il échoue et la requête n'est pas locale.
-        let locale =
-            <ConnectInfo<std::net::SocketAddr> as FromRequestParts<AppState>>::from_request_parts(
-                parts, state,
-            )
-            .await
-            .is_ok_and(|ConnectInfo(pair)| adresse_de_cette_machine(pair.ip()));
-        if locale && !relayee {
+        // Même lecture que `AdminOuCetteMachine` : adresse de la CONNEXION
+        // par l'extracteur `ConnectInfo` (absente : non), jamais une requête
+        // relayée, et pas de bouclage sur une appliance qui relaie le port 80.
+        if appel_depuis_cette_machine(parts, state).await {
             return Ok(Self);
         }
         tracing::warn!(
@@ -721,6 +724,105 @@ impl FromRequestParts<AppState> for RequireAdmin {
     }
 }
 
+/// Garde des actions qui engagent la machine (effacer un disque, éteindre,
+/// installer un greffon) : l'administrateur quand l'authentification est
+/// active ; sinon, SEULEMENT un appel émis depuis cette machine (adresse de
+/// bouclage réelle de la connexion, jamais une requête relayée). Même doctrine
+/// que la garde de la base pour la migration : « cette machine », pas « le réseau local ».
+///
+/// `RequireAdmin` laisse tout passer quand l'authentification est coupée ;
+/// cette garde ne le fait pas.
+pub struct AdminOuCetteMachine;
+
+/// L'appel vient-il de cette machine ? Lu dans `ConnectInfo` (posé par
+/// `into_make_service_with_connect_info`, ou `MockConnectInfo` sous test).
+/// **Absent, la réponse est NON.** Une requête relayée (vue de 127.0.0.1 mais
+/// émise ailleurs) n'est jamais locale.
+async fn appel_depuis_cette_machine(parts: &mut Parts, state: &AppState) -> bool {
+    if crate::garde_du_relais::requete_relayee(&parts.headers) {
+        return false;
+    }
+    // Appliance + relais du port 80 : le bouclage ne prouve rien (voir
+    // `appliance::bouclage_fiable`). Il faut alors un administrateur.
+    if !crate::routes::appliance::bouclage_fiable() {
+        return false;
+    }
+    adresse_de_l_appelant(parts, state)
+        .await
+        .is_some_and(adresse_de_cette_machine)
+}
+
+/// L'adresse réelle de la connexion, si la couche de service l'a posée.
+///
+/// Par l'EXTRACTEUR `ConnectInfo`, pas par une lecture directe de l'extension :
+/// sous test, `MockConnectInfo` pose sa propre extension et seul l'extracteur
+/// sait la lire. Une lecture directe voit « rien » et refuse tout.
+async fn adresse_de_l_appelant(parts: &mut Parts, state: &AppState) -> Option<std::net::IpAddr> {
+    <ConnectInfo<std::net::SocketAddr> as FromRequestParts<AppState>>::from_request_parts(
+        parts, state,
+    )
+    .await
+    .ok()
+    .map(|ConnectInfo(pair)| pair.ip())
+}
+
+impl FromRequestParts<AppState> for AdminOuCetteMachine {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if authentification_active(state) {
+            return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(|_| AdminOuCetteMachine);
+        }
+        if appel_depuis_cette_machine(parts, state).await {
+            return Ok(AdminOuCetteMachine);
+        }
+        let appelant = adresse_de_l_appelant(parts, state)
+            .await
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let relaye = crate::garde_du_relais::requete_relayee(&parts.headers);
+        let relais_port_80 = !crate::routes::appliance::bouclage_fiable();
+        tracing::warn!(
+            chemin = %parts.uri.path(),
+            %appelant,
+            relaye,
+            relais_port_80,
+            "action_machine_refusee_hors_de_cette_machine_sans_authentification"
+        );
+        // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
+        // suite pourquoi « depuis cette machine » n'a pas été reconnu.
+        let (motif, message) = if relais_port_80 {
+            (
+                "port80_relay",
+                "This appliance relays port 80 to the server from 127.0.0.1, so a local \
+                 call cannot be told apart from the network: enable authentication and \
+                 sign in as an administrator (or rebuild the Tune OS image).",
+            )
+        } else {
+            (
+                "not_local",
+                "This action requires authentication to be enabled, or a call from this \
+                 machine (localhost).",
+            )
+        };
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "auth_required",
+                "reason": motif,
+                "message": message,
+                "caller": appelant,
+                "relayed": relaye,
+            })),
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Auth routes
 // ---------------------------------------------------------------------------
@@ -749,9 +851,19 @@ struct RegisterRequest {
 
 async fn register(
     State(state): State<AppState>,
+    appelant: Option<AuthUser>,
     headers: axum::http::HeaderMap,
     Json(body): Json<RegisterRequest>,
 ) -> impl IntoResponse {
+    // Sécurité : l'inscription libre n'existe que tant que l'authentification
+    // est coupée (premier compte, à l'onboarding). Une fois active, seul un
+    // administrateur crée un compte — sinon n'importe qui sur le réseau
+    // s'ouvrait une session « user ».
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(resp) = ensure_admin_if_auth_enabled(&settings, appelant.as_ref()) {
+        return resp;
+    }
+    let cree_par_un_administrateur = appelant.is_some();
     let username = body.username.trim().to_string();
     if username.is_empty() || body.password.len() < 8 {
         return (
@@ -818,7 +930,6 @@ async fn register(
     let role = if is_admin { "admin" } else { "user" };
 
     // Generate JWT
-    let settings = SettingsRepo::with_backend(state.backend.clone());
     let secret = get_or_create_jwt_secret(&settings);
     let token = match sign_jwt(profile_id, role, &secret) {
         Ok(t) => t,
@@ -831,24 +942,32 @@ async fn register(
         }
     };
 
-    let cookie = session_cookie(&token, &headers);
+    let utilisateur = json!({
+        "id": profile_id,
+        "username": username,
+        "role": role,
+        "email": body.email,
+    });
+    // Un administrateur qui crée un compte ne reçoit NI le jeton du nouveau
+    // compte NI son cookie : il garde sa session, l'autre se connectera.
+    let mut response = if cree_par_un_administrateur {
+        Json(json!({ "user": utilisateur })).into_response()
+    } else {
+        Json(json!({
+            "token": token,
+            "token_type": "Bearer",
+            "expires_in": 86400,
+            "user": utilisateur,
+        }))
+        .into_response()
+    };
 
-    let mut response = Json(json!({
-        "token": token,
-        "token_type": "Bearer",
-        "expires_in": 86400,
-        "user": {
-            "id": profile_id,
-            "username": username,
-            "role": role,
-            "email": body.email,
-        }
-    }))
-    .into_response();
-
-    response
-        .headers_mut()
-        .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    if !cree_par_un_administrateur {
+        let cookie = session_cookie(&token, &headers);
+        response
+            .headers_mut()
+            .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    }
 
     (StatusCode::CREATED, response).into_response()
 }
@@ -876,9 +995,16 @@ static LOGIN_FAILURES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Le bouclage que l'on croit : l'opérateur local, et seulement lui
+/// (Sécurité : sur une appliance qui relaie le port 80 depuis 127.0.0.1, un
+/// pair en bouclage peut être n'importe qui du réseau).
+fn bouclage_de_l_operateur(ip: std::net::IpAddr) -> bool {
+    adresse_de_cette_machine(ip) && crate::routes::appliance::bouclage_fiable()
+}
+
 fn login_rate_limited(ip: std::net::IpAddr) -> bool {
     // The local operator is never locked out.
-    if ip.is_loopback() {
+    if bouclage_de_l_operateur(ip) {
         return false;
     }
     let mut map = LOGIN_FAILURES.lock().unwrap();
@@ -893,7 +1019,7 @@ fn login_rate_limited(ip: std::net::IpAddr) -> bool {
 }
 
 fn record_login_failure(ip: std::net::IpAddr) {
-    if ip.is_loopback() {
+    if bouclage_de_l_operateur(ip) {
         return;
     }
     let mut map = LOGIN_FAILURES.lock().unwrap();
@@ -988,7 +1114,7 @@ async fn login(
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
-    let passwordless_default_allowed = !auth_enabled || ip.is_loopback();
+    let passwordless_default_allowed = !auth_enabled || bouclage_de_l_operateur(ip);
 
     // Try argon2 hash first (password_hash_v2), then fall back to SHA-256 (password_hash)
     let valid_v2 = if let Some(ref h) = new_hash {
@@ -1255,6 +1381,36 @@ async fn set_auth_config(
 }
 
 #[cfg(test)]
+mod cette_machine_tests {
+    use super::adresse_de_cette_machine;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn seul_le_bouclage_est_cette_machine() {
+        for ok in ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1"] {
+            assert!(adresse_de_cette_machine(ip(ok)), "{ok}");
+        }
+        for ko in [
+            "192.168.1.50",
+            "10.0.0.1",
+            "169.254.169.254",
+            "::ffff:192.168.1.50",
+            "fe80::1",
+            "fd00::1",
+            "203.0.113.5",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(!adresse_de_cette_machine(ip(ko)), "{ko}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::is_public_auth_route;
     use axum::http::Method;
@@ -1264,7 +1420,6 @@ mod tests {
         // Public: login, logout, register, and the read-only config status (GET).
         assert!(is_public_auth_route(&Method::POST, "/api/v1/auth/login"));
         assert!(is_public_auth_route(&Method::POST, "/api/v1/auth/logout"));
-        assert!(is_public_auth_route(&Method::POST, "/api/v1/auth/register"));
         assert!(is_public_auth_route(&Method::GET, "/api/v1/auth/config"));
         // Nesting may strip the /api/v1 prefix — both spellings must hold.
         assert!(is_public_auth_route(&Method::POST, "/auth/login"));
@@ -1274,6 +1429,12 @@ mod tests {
     fn privileged_auth_routes_are_never_public() {
         // The P0: these must never be reachable without a token.
         assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/config"));
+        // Sécurité : l'inscription n'est plus publique sous authentification.
+        assert!(!is_public_auth_route(
+            &Method::POST,
+            "/api/v1/auth/register"
+        ));
+        assert!(!is_public_auth_route(&Method::POST, "/auth/register"));
         assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/token"));
         assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/token"));
         assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/api-key"));
