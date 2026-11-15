@@ -65,6 +65,8 @@ pub mod artistes_par_le_reseau;
 pub mod noms_de_tri;
 /// #8090 — le pays de l'artiste, lu sur sa fiche MusicBrainz.
 pub mod pays_des_artistes;
+// #8668 — le pays d'édition des albums identifiés, lu sur MusicBrainz.
+pub mod pays_des_editions;
 pub mod tag_writer;
 /// #6463, B — la reprise des MBID d'artiste faux, par vérification MusicBrainz.
 pub mod verification_mbid_artistes;
@@ -2630,6 +2632,21 @@ fn balise_utile(tag: &lofty::tag::Tag, path: &Path) -> bool {
                     .into_iter()
                     .any(|v| v.is_some_and(|s| !s.trim().is_empty()))
             })
+}
+
+/// #8679 — l'artiste que le DOSSIER donne à un fichier, par la règle même du
+/// scan ([`album_artiste_du_chemin`] : dossier de disque et variante de
+/// mixage sautés, dossiers génériques, volumes et points de montage écartés).
+///
+/// Sert à « Albums douteux » : une piste sans balise d'artiste rangée sous
+/// `…/Pink Floyd/Animals/01.flac` montre « dossier : Pink Floyd » et propose
+/// de l'écrire. `None` quand l'arborescence ne dit rien d'exploitable.
+/// Aucune lecture du disque : le chemin seul.
+pub fn artiste_du_dossier(file_path: &str) -> Option<String> {
+    let (_, artiste, _) = album_artiste_du_chemin(Path::new(file_path));
+    artiste
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
 }
 
 pub(crate) fn album_artiste_du_chemin(

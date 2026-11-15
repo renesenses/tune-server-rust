@@ -235,6 +235,10 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Positions des épisodes de podcast (#8170), créées par le script 116 :
     // sans cette ligne, chaque épisode commencé repartirait du début.
     "podcast_episode_positions",
+    // Associations manuelles de « Ma collection physique » (#8672), créées
+    // par le script 119 : sans cette ligne, chaque disque associé à la main
+    // retomberait « nulle part » après la bascule.
+    "collection_physique_associations",
     // Écoutes importées (#7763, script 101) : sans cette ligne, les écoutes
     // reportées de Roon, Plex ou d'une liste m3u seraient perdues à la bascule.
     "imported_plays",
@@ -1475,6 +1479,10 @@ ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS surcharge_locale TEXT;
 -- PG 117, #8615). TEXT pour la copie ; la 117, rejouee juste apres, la
 -- convertit.
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS interrupt_playback TEXT DEFAULT 1;
+-- albums: pays d'edition lu sur MusicBrainz et release dont il a ete lu
+-- (SQLite migration v154 / PG 120, #8668). TEXT des deux cotes.
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country_mbid TEXT;
 -- artists: provenance du nom de tri (SQLite migration v131 / PG 095, #6474).
 ALTER TABLE artists ADD COLUMN IF NOT EXISTS sort_name_source TEXT;
 -- artists: provenance du MBID (SQLite migration v133 / PG 097, #6463).
@@ -1926,6 +1934,7 @@ fn conflict_clause(table: &str) -> &'static str {
         "settings" => "ON CONFLICT (key) DO NOTHING",
         "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
         "podcast_episode_positions" => "ON CONFLICT (zone_id, episode_key) DO NOTHING",
+        "collection_physique_associations" => "ON CONFLICT (release_id) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",

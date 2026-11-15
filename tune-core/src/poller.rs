@@ -1260,6 +1260,9 @@ mod radio_metadata_deviceless_tests;
 /// bibliotheque garnie.
 #[cfg(test)]
 mod autoplay_source_tests;
+// Fil 2694 — la radio de fin de file activée par défaut, ses gardes, sa marque.
+#[cfg(test)]
+mod radio_fin_de_file_2694_tests;
 
 #[cfg(all(test, feature = "oaat"))]
 mod bascule_des_niveaux_tests {
@@ -1608,6 +1611,9 @@ mod reprise_apres_pause_4666;
 
 #[cfg(test)]
 mod fin_hors_temps_reel_tests;
+// #7330 — le sondeur pendant l'attente de fin jouée d'une sortie OAAT.
+#[cfg(all(test, feature = "oaat"))]
+mod fin_oaat_jouee_7330_tests;
 
 /// #4661 — un fichier servi EN ENTIER se finit à l'HORLOGE DE PISTE, pas au
 /// bout d'un forfait de deux minutes.

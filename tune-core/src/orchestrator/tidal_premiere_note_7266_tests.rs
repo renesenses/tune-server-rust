@@ -282,25 +282,25 @@ async fn sortie_locale_la_premiere_note_precede_la_fin_du_telechargement_7266() 
     );
 }
 
-/// Un saut (reprise à 20 s) ne passe pas par le décodeur en croissance, qui
-/// ne sait pas aller au-delà du téléchargé : fichier complet, comme avant,
-/// et la lecture part bien de 20 s.
+/// Un saut (reprise à 20 s) passe aussi par le décodeur en croissance
+/// (#8701) : la session est rendue avant la fin du téléchargement, et la
+/// lecture part bien de 20 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sortie_locale_un_saut_prend_le_fichier_complet_7266() {
+async fn sortie_locale_un_saut_n_attend_plus_le_fichier_complet_8701() {
     let (pcm, piste) = piste_cd().await;
     let (base, journal) = faux_tidal(piste, "flac", None).await;
     let orch = orchestrateur();
     let (r, debut, resolution) = resoudre_en_local(&orch, base, Some(20_000)).await;
+    let lu = lire_la_session(&orch, &r.stream_id.clone().expect("session")).await;
     let dernier_segment = journal
         .dernier_segment
         .lock()
         .unwrap()
         .expect("segments servis");
     assert!(
-        dernier_segment <= debut + resolution,
-        "un saut doit attendre le fichier complet avant de rendre la session"
+        debut + resolution < dernier_segment,
+        "un saut attend encore le fichier complet avant de rendre la session"
     );
-    let lu = lire_la_session(&orch, &r.stream_id.clone().expect("session")).await;
     let (trames, _) = trames_wav(&lu.octets);
     let attendues = pcm.len() / 4 - 20 * SR as usize;
     assert!(
@@ -374,7 +374,8 @@ async fn sortie_oaat_la_premiere_note_precede_la_fin_du_telechargement_7266() {
 }
 
 /// Qui décode pendant le téléchargement : les sorties locales et OAAT, au
-/// départ de la piste. Les renderers réseau gardent le fichier complet.
+/// départ de la piste comme pour un saut. Les renderers réseau gardent le
+/// fichier complet.
 #[test]
 fn seules_les_sorties_locales_et_oaat_decodent_pendant_le_telechargement_7266() {
     let req = |id: &str, seek_ms: Option<u64>| PlayRequest {
@@ -387,8 +388,9 @@ fn seules_les_sorties_locales_et_oaat_decodent_pendant_le_telechargement_7266() 
             super::resolve_stream::decoder_pendant_le_telechargement(&req(id, None)),
             "{id}"
         );
+        // #8701 — un saut aussi : le décodeur suit la frontière d'écriture.
         assert!(
-            !super::resolve_stream::decoder_pendant_le_telechargement(&req(id, Some(20_000))),
+            super::resolve_stream::decoder_pendant_le_telechargement(&req(id, Some(20_000))),
             "{id} avec un saut"
         );
     }
@@ -410,9 +412,10 @@ fn seules_les_sorties_locales_et_oaat_decodent_pendant_le_telechargement_7266() 
 }
 
 /// Au niveau du service : un `file://` encore en croissance n'est jamais
-/// resservi par le cache (un second lecteur le lirait tronqué) ; une fois
-/// complet, il sert comme avant (préchargement, reprise), sans nouveau
-/// téléchargement.
+/// resservi comme un fichier ordinaire (un second lecteur le lirait
+/// tronqué). Un second lecteur qui sait suivre la croissance (#8701) reçoit
+/// le MÊME fichier et la même poignée, sans second téléchargement ; une fois
+/// complet, il sert comme avant (préchargement, reprise).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn le_cache_ne_sert_que_les_fichiers_complets_7266() {
     let (_, piste) = piste_cd().await;
@@ -431,12 +434,22 @@ async fn le_cache_ne_sert_que_les_fichiers_complets_7266() {
     let chemin_a = a.url.strip_prefix("file://").unwrap().to_string();
     let poignee_a = crate::audio::dash_growth::take_for(&chemin_a)
         .expect("progressif : poignée de croissance inscrite");
-    // Pendant la croissance de A : B ne reçoit pas le fichier de A.
+    // Pendant la croissance de A : B suit le même téléchargement.
     let b = progressif().await.unwrap();
-    assert_ne!(b.url, a.url, "un fichier en croissance a été resservi");
-    assert_eq!(journal.inits.load(Ordering::SeqCst), 2);
-    let chemin_b = b.url.strip_prefix("file://").unwrap().to_string();
-    let poignee_b = crate::audio::dash_growth::take_for(&chemin_b).expect("poignée de B");
+    assert_eq!(
+        b.url, a.url,
+        "#8701 : le second lecteur suit le même fichier"
+    );
+    assert_eq!(
+        journal.inits.load(Ordering::SeqCst),
+        1,
+        "un seul téléchargement"
+    );
+    let poignee_b = crate::audio::dash_growth::take_for(&chemin_a).expect("poignée de B");
+    assert!(
+        Arc::ptr_eq(&poignee_a, &poignee_b),
+        "même frontière d'écriture"
+    );
     let (fin_a, fin_b) = tokio::task::spawn_blocking(move || {
         (poignee_a.attendre_la_fin(), poignee_b.attendre_la_fin())
     })
@@ -445,13 +458,12 @@ async fn le_cache_ne_sert_que_les_fichiers_complets_7266() {
     assert_eq!(fin_a.unwrap() as usize, total);
     assert_eq!(fin_b.unwrap() as usize, total);
 
-    // B complet : le préchargement (hors sortie locale) le reprend du cache.
+    // Complet : le préchargement (hors sortie locale) le reprend du cache.
     let complet = svc.get_track_url(PISTE, Some("LOSSLESS")).await.unwrap();
-    assert_eq!(complet.url, b.url, "le fichier complet du cache sert");
-    assert_eq!(journal.inits.load(Ordering::SeqCst), 2);
-    assert_eq!(std::fs::metadata(&chemin_b).unwrap().len() as usize, total);
+    assert_eq!(complet.url, a.url, "le fichier complet du cache sert");
+    assert_eq!(journal.inits.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::metadata(&chemin_a).unwrap().len() as usize, total);
     let _ = std::fs::remove_file(&chemin_a);
-    let _ = std::fs::remove_file(&chemin_b);
 }
 
 /// Un saut dans la piste pendant son téléchargement en croissance : l'ancien
