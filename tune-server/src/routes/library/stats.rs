@@ -52,6 +52,7 @@ use super::Pagination;
 /// porte le compte, à l'endroit exact où le client lit déjà `tracks` et
 /// `albums`. L'ajout est PUREMENT ADDITIF — `tracks`, `albums`, `artists`
 /// gardent la valeur qu'ils avaient hier.
+#[derive(Clone)]
 pub(crate) struct VentilationParSource {
     pistes: Vec<(String, i64)>,
     albums: Vec<(String, i64)>,
@@ -70,6 +71,15 @@ impl VentilationParSource {
             albums: AlbumRepo::with_backend(state.backend.clone())
                 .count_by_source()
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Aucune ventilation : ce qu'une erreur SQL rendait déjà (#8805, tâche
+    /// de comptage perdue).
+    pub(crate) fn vide() -> Self {
+        Self {
+            pistes: Vec::new(),
+            albums: Vec::new(),
         }
     }
 
@@ -114,6 +124,16 @@ pub(crate) fn ajouter_ventilation(cible: &mut Value, ventilation: &VentilationPa
 }
 
 pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    // #8805 — une douzaine de lectures sur toute la bibliothèque, dont des
+    // `SUM` et des `GROUP BY` sur `tracks` : hors des fils de l'exécuteur,
+    // comme les routes de #5438. Sous un disque saturé, chacune tenait un fil
+    // `tokio-rt-worker` aussi longtemps qu'elle lisait.
+    super::facets::hors_executeur("library_stats", move || lire_library_stats(&state))
+        .await?
+        .map(Json)
+}
+
+fn lire_library_stats(state: &AppState) -> Result<Value, AppError> {
     let b = &state.backend;
     let (dur_col, size_col) = match b.engine() {
         tune_core::db::engine::Engine::Sqlite => ("duration_ms", "file_size"),
@@ -163,7 +183,7 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
         "total_duration_ms": total_duration_ms,
         "total_size_bytes": total_size_bytes,
     });
-    ajouter_ventilation(&mut corps, &VentilationParSource::lire(&state));
+    ajouter_ventilation(&mut corps, &VentilationParSource::lire(state));
     // #8625 (fil 2787) — LE total que montrent les listes (Titres, Albums) :
     // les écrans l'affichent au lieu du compte des tables, et expliquent
     // l'écart (`hidden_or_duplicate_*`) en infobulle. Clé ADDITIVE.
@@ -195,7 +215,7 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
     // #8264 — artistes et genres classés par nombre de pistes. Clé ADDITIVE,
     // à côté de `distributions` (dont le contenu ne change pas).
     corps["rankings"] = super::classements_8264::lire(state.backend.as_ref());
-    Ok(Json(corps))
+    Ok(corps)
 }
 
 pub(super) async fn completeness_stats(

@@ -1407,14 +1407,22 @@ pub(super) async fn diagnostics_oaat(State(state): State<AppState>) -> Json<Valu
 
 pub(super) async fn health_monitor(State(state): State<AppState>) -> Json<Value> {
     let report = state.health_monitor.run_checks().await;
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .count()
+    // #8805 — le `COUNT(*) FROM tracks` de cette route a tenu un fil de
+    // l'exécuteur 108 s dans le rapport du fil 2841. Même cache que
+    // `/system/health`, qui compte la même table.
+    let tracks = super::comptages_8805::comptes_sante(&state, "system_health_monitor")
+        .await
+        .tracks
         .unwrap_or(0);
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let scan_status = settings
-        .get("scan_status")
-        .ok()
-        .flatten()
+    let lecteur = state.backend.clone();
+    let scan_status =
+        super::comptages_8805::lecture_hors_executeur("system_health_monitor", None, move || {
+            SettingsRepo::with_backend(lecteur)
+                .get("scan_status")
+                .ok()
+                .flatten()
+        })
+        .await
         .unwrap_or_else(|| "idle".into());
     Json(json!({
         "status": report.status,

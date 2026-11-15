@@ -72,8 +72,13 @@ pub(super) async fn version() -> Json<Value> {
 /// ici : ses sondes lancent un sous-processus `df`, ce qu'une route sollicitée
 /// par la découverte réseau et par une boucle de 700 ms ne peut pas payer.
 pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let tracks_result = TrackRepo::with_backend(state.backend.clone()).count();
-    let albums_result = AlbumRepo::with_backend(state.backend.clone()).count();
+    // #8805 — hors exécuteur, un seul comptage en vol, resservi s'il a été
+    // lent : cette sonde tourne en boucle, et sous un disque saturé chacun de
+    // ses deux `COUNT(*)` tenait un fil de l'exécuteur plus de 100 s.
+    let super::comptages_8805::ComptesSante {
+        tracks: tracks_result,
+        albums: albums_result,
+    } = super::comptages_8805::comptes_sante(&state, "system_health").await;
     let uptime_secs = state.started_at.elapsed().as_secs();
 
     // Le nom voyage AVEC la version (#2110). C'est la même requête que la barre
@@ -85,8 +90,13 @@ pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     // #5086 — par le pool de lecture : cette route est la sonde « le serveur
     // répond-il ? ». Par l'écrivain, elle attendait tout écrivain en cours, et
     // un serveur qui servait passait pour « injoignable ».
-    let name_result =
-        SettingsRepo::with_backend(state.backend.clone()).get_sans_ecrivain("server_name");
+    let lecteur = state.backend.clone();
+    let name_result = super::comptages_8805::lecture_hors_executeur(
+        "system_health",
+        Err("lecture du nom interrompue".to_string()),
+        move || SettingsRepo::with_backend(lecteur).get_sans_ecrivain("server_name"),
+    )
+    .await;
     let server_name = resolve_server_name(name_result.as_ref().ok().and_then(|v| v.as_deref()));
 
     let sondes = [
@@ -169,21 +179,18 @@ pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
-    let artists = ArtistRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
-    let albums = AlbumRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
-    let listens = HistoryRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
-    let zones = ZoneRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
+    // #8805 (fil 2841) — ces cinq `COUNT(*)` et la ventilation tournaient sur
+    // les fils de l'exécuteur : sous un scan qui sature le disque, deux appels
+    // à cette route tenaient deux des quatre fils plus de 100 s. Hors
+    // exécuteur, un seul comptage en vol, resservi s'il a été lent.
+    let super::comptages_8805::ComptesStats {
+        artists,
+        albums,
+        tracks,
+        listens,
+        zones,
+        ventilation,
+    } = super::comptages_8805::comptes_stats(&state).await;
     // Use timeout to avoid blocking if scanner/outputs mutex is held (e.g. during SSDP scan)
     let devices = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         state.scanner.devices().await.len()
@@ -214,10 +221,7 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
         "server_version": tune_core::version(),
         "server_engine": "rust",
     });
-    crate::routes::library::stats::ajouter_ventilation(
-        &mut corps,
-        &crate::routes::library::stats::VentilationParSource::lire(&state),
-    );
+    crate::routes::library::stats::ajouter_ventilation(&mut corps, &ventilation);
     Json(corps)
 }
 
