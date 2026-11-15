@@ -6578,6 +6578,23 @@
     "pl": "Ta funkcja jest dostępna tylko w sieci lokalnej.",
     "el": "Αυτή η λειτουργία είναι διαθέσιμη μόνο στο τοπικό δίκτυο."
   },
+  "api.database.localOnly": {
+    "fr": "Pour exporter, importer ou restaurer la base, ouvrez Tune sur la machine du serveur (http://localhost:8888) ou activez l'authentification et connectez-vous en administrateur.",
+    "en": "To export, import or restore the database, open Tune on the server machine itself (http://localhost:8888), or enable authentication and sign in as an administrator.",
+    "de": "Um die Datenbank zu exportieren, zu importieren oder wiederherzustellen, öffnen Sie Tune auf dem Server-Rechner selbst (http://localhost:8888) oder aktivieren Sie die Authentifizierung und melden Sie sich als Administrator an.",
+    "es": "Para exportar, importar o restaurar la base de datos, abra Tune en el propio equipo del servidor (http://localhost:8888) o active la autenticación e inicie sesión como administrador.",
+    "it": "Per esportare, importare o ripristinare il database, apri Tune sulla macchina del server (http://localhost:8888) oppure attiva l'autenticazione e accedi come amministratore.",
+    "el": "Για εξαγωγή, εισαγωγή ή επαναφορά της βάσης δεδομένων, ανοίξτε το Tune στον ίδιο τον υπολογιστή του διακομιστή (http://localhost:8888) ή ενεργοποιήστε τον έλεγχο ταυτότητας και συνδεθείτε ως διαχειριστής.",
+    "hu": "Az adatbázis exportálásához, importálásához vagy visszaállításához nyissa meg a Tune-t magán a szervergépen (http://localhost:8888), vagy kapcsolja be a hitelesítést, és jelentkezzen be rendszergazdaként.",
+    "ja": "データベースのエクスポート、インポート、復元を行うには、サーバーのマシン上で Tune を開く（http://localhost:8888）か、認証を有効にして管理者としてサインインしてください。",
+    "ko": "데이터베이스를 내보내거나 가져오거나 복원하려면 서버 컴퓨터에서 직접 Tune을 열거나(http://localhost:8888) 인증을 켜고 관리자로 로그인하세요.",
+    "nb": "For å eksportere, importere eller gjenopprette databasen, åpne Tune på selve servermaskinen (http://localhost:8888), eller slå på autentisering og logg inn som administrator.",
+    "pl": "Aby wyeksportować, zaimportować lub przywrócić bazę danych, otwórz Tune na samym komputerze serwera (http://localhost:8888) albo włącz uwierzytelnianie i zaloguj się jako administrator.",
+    "ro": "Pentru a exporta, importa sau restaura baza de date, deschideți Tune chiar pe mașina serverului (http://localhost:8888) sau activați autentificarea și conectați-vă ca administrator.",
+    "sv": "För att exportera, importera eller återställa databasen, öppna Tune på själva serverdatorn (http://localhost:8888), eller aktivera autentisering och logga in som administratör.",
+    "vi": "Để xuất, nhập hoặc khôi phục cơ sở dữ liệu, hãy mở Tune ngay trên máy chủ (http://localhost:8888), hoặc bật xác thực và đăng nhập với quyền quản trị viên.",
+    "zh": "如需导出、导入或恢复数据库，请在服务器本机上打开 Tune（http://localhost:8888），或启用身份验证并以管理员身份登录。"
+  },
   "home.section.continue": {
     "fr": "Continuer l'écoute",
     "en": "Continue listening",

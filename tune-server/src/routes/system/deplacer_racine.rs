@@ -45,6 +45,28 @@ fn refus(code: StatusCode, refusal: deplacer_racine::Refus) -> Response {
         .into_response()
 }
 
+/// Sécurité — le nouveau préfixe, et chaque dossier de musique
+/// qu'il produirait, passent le même périmètre que `POST
+/// /system/music-dirs/add` (`refus_de_racine_de_musique`) : ni `/`, ni un
+/// arbre système, ni `/Volumes`… Décidé AVANT tout calcul et toute écriture.
+fn refus_du_perimetre(state: &AppState, p: &Prefixes) -> Option<Response> {
+    let mut candidats = vec![p.nouveau.clone()];
+    candidats.extend(
+        super::get_music_dirs_list(&state.backend)
+            .iter()
+            .filter_map(|d| deplacer_racine::remplacer(d, p)),
+    );
+    candidats.into_iter().find_map(|chemin| {
+        super::config::refus_de_racine_de_musique(state, &chemin).map(|motif| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": motif, "path": chemin, "can_apply": false })),
+            )
+                .into_response()
+        })
+    })
+}
+
 async fn calculer_l_apercu(state: &AppState, p: Prefixes) -> Result<Apercu, String> {
     let db = state.backend.clone();
     tokio::task::spawn_blocking(move || {
@@ -69,6 +91,9 @@ pub(super) async fn apercu(
         Ok(p) => p,
         Err(r) => return refus(StatusCode::BAD_REQUEST, r),
     };
+    if let Some(r) = refus_du_perimetre(&state, &p) {
+        return r;
+    }
     match calculer_l_apercu(&state, p).await {
         Ok(a) => Json(a).into_response(),
         Err(e) => (
@@ -89,6 +114,9 @@ pub(super) async fn appliquer(
         Ok(p) => p,
         Err(r) => return refus(StatusCode::BAD_REQUEST, r),
     };
+    if let Some(r) = refus_du_perimetre(&state, &p) {
+        return r;
+    }
     // Le droit de scanner, tenu jusqu'à la fin de l'écriture.
     let Some(_droit) = super::scan::try_begin_scan() else {
         return (

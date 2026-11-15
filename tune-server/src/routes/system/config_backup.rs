@@ -172,7 +172,14 @@ pub(super) async fn import(
     };
     // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
     // écartées de la restauration et nommées dans `report.warnings`.
-    let ecartees = super::config::ecarter_les_cles_protegees(&state, &mut snapshot.settings);
+    let mut ecartees = super::config::ecarter_les_cles_protegees(&state, &mut snapshot.settings);
+    // Sécurité — une racine restaurée passe le périmètre de
+    // l'explorateur, comme `POST /system/music-dirs/add`.
+    ecartees.extend(super::config::ecarter_les_racines_hors_perimetre(
+        &state,
+        &mut snapshot.settings,
+        |v: &String| serde_json::from_str::<Vec<String>>(v).ok(),
+    ));
 
     info!(
         version = %snapshot.version,

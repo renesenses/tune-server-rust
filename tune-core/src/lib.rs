@@ -12,6 +12,8 @@ pub mod audio;
 pub mod bandcamp_veille;
 pub mod bug_report;
 pub mod cadence;
+/// Sécurité — chemins venus d'un client : normalisation lexicale, `..` refusé.
+pub mod chemin_sur;
 pub mod chemins_de_travail;
 pub mod cles_api;
 pub mod cloud;

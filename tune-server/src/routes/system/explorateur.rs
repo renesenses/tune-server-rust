@@ -88,6 +88,10 @@ pub(crate) enum Refus {
     RemonteVersLeParent,
     /// Le chemin tombe dans un arbre système.
     ArbreSysteme,
+    /// Sécurité — une racine de disque (`/`, `C:\`, `\\nas`) ou
+    /// un dossier qui CONTIENT un arbre système (`/private`) : l'explorateur
+    /// peut l'afficher, il ne peut pas devenir un dossier de musique.
+    TropLarge,
 }
 
 impl Refus {
@@ -96,6 +100,7 @@ impl Refus {
             Refus::PasAbsolu => "path must be absolute",
             Refus::RemonteVersLeParent => "path must not contain '..'",
             Refus::ArbreSysteme => "path is outside the browsable perimeter",
+            Refus::TropLarge => "path is too broad to be a music directory",
         }
     }
 }
@@ -195,6 +200,218 @@ pub(crate) fn la_cible_reste_dans_le_perimetre(chemin: &std::path::Path) -> bool
         None => true,
         Some(canonique) => !dans_un_arbre_systeme(&canonique),
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Sécurité — le périmètre d'une RACINE de bibliothèque
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Les segments du chemin, sur les deux séparateurs, sans vides ni `.`.
+fn segments_lexicaux(chemin: &str) -> Vec<&str> {
+    chemin
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect()
+}
+
+/// La forme repliée du chemin : séparateurs doublés et `.` retirés.
+/// `//etc` ou `/./etc` y redeviennent `/etc`, que la règle des arbres système
+/// reconnaît ; `C:\\.\\Windows` redevient `C:\Windows`.
+fn forme_repliee(chemin: &str) -> String {
+    let segs = segments_lexicaux(chemin);
+    match segs.split_first() {
+        Some((tete, reste)) if crate::chemin_inaccessible::lettre_de_lecteur(tete).is_some() => {
+            format!("{tete}\\{}", reste.join("\\"))
+        }
+        _ => format!("/{}", segs.join("/")),
+    }
+}
+
+/// `/`, `\`, `C:\`, `\\nas` (sans partage) : tout un disque, ou tout un
+/// serveur. Lu sur la forme repliée, donc `//`, `/./` ou `C:\.` comptent.
+fn est_une_racine_de_disque(chemin: &str) -> bool {
+    let segs = segments_lexicaux(chemin);
+    match segs.as_slice() {
+        [] => true,
+        [seul] => {
+            crate::chemin_inaccessible::lettre_de_lecteur(seul).is_some()
+                || crate::chemin_inaccessible::est_un_chemin_unc(chemin.trim_start())
+        }
+        _ => false,
+    }
+}
+
+/// Un arbre système vit-il SOUS ce chemin ? `/private` contient
+/// `/private/etc` : déclaré dossier de musique, il ouvrirait l'arbre entier.
+fn contient_un_arbre_systeme(chemin: &str) -> bool {
+    let c = forme_repliee(chemin);
+    ARBRES_SYSTEME
+        .iter()
+        .any(|systeme| sous_le_dossier(systeme, &c))
+}
+
+/// La garde de TOUTE écriture d'un dossier de musique (ajout, onboarding,
+/// `PATCH /system/config`, imports de configuration).
+///
+/// Les dossiers de musique sont le périmètre de toutes les autres gardes de
+/// chemin (`tune_core::chemin_sur`) : un client qui pourrait déclarer `/`
+/// défairait toutes ces gardes d'une requête. La règle est celle de
+/// l'explorateur, jamais plus large : absolu, sans `..` (forme encodée
+/// comprise), hors des arbres système — et en plus, ni une racine de disque,
+/// ni un dossier qui contient un arbre système, sur le TEXTE (replié) comme
+/// sur la CIBLE d'un lien symbolique.
+///
+/// Le disque n'est consulté que pour la forme canonique : un partage
+/// décroché (chemin illisible) n'est pas refusé pour autant, comme dans
+/// l'explorateur.
+pub(crate) fn verifier_une_racine_de_musique(chemin: &str) -> Result<(), Refus> {
+    verifier_une_racine_de_musique_avec(chemin, &[])
+}
+
+/// Dossiers qui ne sont ni un disque ni un arbre système, mais qui
+/// RASSEMBLENT les volumes de la machine : `/Volumes` porte sous macOS le
+/// lien `Macintosh HD → /`. Déclaré racine, il rendrait tout le disque
+/// « sous la bibliothèque » pour des gardes lexicales.
+const RASSEMBLEMENTS_DE_VOLUMES: &[&str] = &["/Volumes", "/System/Volumes"];
+
+/// Nombre maximal d'enfants directs inspectés à la déclaration d'une racine.
+const ENFANTS_INSPECTES_MAX: usize = 4096;
+
+/// Une cible (forme canonique) qui ouvrirait plus que de la musique : une
+/// racine de disque, un arbre système, un dossier qui en contient un, ou un
+/// partage d'administration.
+fn cible_trop_large(canonique: &str) -> bool {
+    dans_un_arbre_systeme(canonique)
+        || est_une_racine_de_disque(canonique)
+        || contient_un_arbre_systeme(canonique)
+        || est_un_rassemblement_de_volumes(canonique)
+        || est_un_chemin_windows_interdit(canonique)
+}
+
+fn est_un_rassemblement_de_volumes(chemin: &str) -> bool {
+    let c = forme_repliee(chemin);
+    RASSEMBLEMENTS_DE_VOLUMES
+        .iter()
+        .any(|v| c.eq_ignore_ascii_case(v))
+}
+
+/// Chemins Windows qu'aucune bibliothèque n'emprunte et qui ouvrent un disque
+/// entier : préfixes de périphérique (`\\?\`, `\\.\`, y compris
+/// `\\?\UNC\…`), partages d'administration (`\\hôte\C$`, `\\hôte\ADMIN$`),
+/// et partages servis par la machine elle-même (`\\localhost\…`,
+/// `\\127.0.0.1\…`, `\\[::1]\…`, `\\wsl.localhost\…`, `\\wsl$\…`).
+fn est_un_chemin_windows_interdit(chemin: &str) -> bool {
+    let c = chemin.trim_start();
+    let o = c.as_bytes();
+    if o.len() >= 4
+        && matches!(o[0], b'\\' | b'/')
+        && matches!(o[1], b'\\' | b'/')
+        && matches!(o[2], b'?' | b'.')
+        && matches!(o[3], b'\\' | b'/')
+    {
+        return true;
+    }
+    if !crate::chemin_inaccessible::est_un_chemin_unc(c) {
+        return false;
+    }
+    let segs = segments_lexicaux(c);
+    let hote = segs
+        .first()
+        .map(|h| h.to_ascii_lowercase())
+        .unwrap_or_default();
+    let hote_local = hote == "localhost"
+        || hote.starts_with("127.")
+        || hote == "::1"
+        || hote == "[::1]"
+        || hote == "0:0:0:0:0:0:0:1"
+        || hote == "0.0.0.0"
+        || hote == "wsl.localhost"
+        || hote == "wsl$"
+        || hote.ends_with(".ipv6-literal.net");
+    let partage_admin = segs.get(1).is_some_and(|p| p.ends_with('$'));
+    hote_local || partage_admin
+}
+
+/// Un enfant DIRECT de `racine` est-il un lien qui mène hors du périmètre ?
+/// (`/Volumes/Macintosh HD → /`, `~/.wine/dosdevices/z: → /`.) Le client n'a
+/// pas besoin de créer le lien : il lui suffirait de choisir le parent.
+/// `file_type` ne suit pas les liens : seuls les liens sont résolus.
+fn un_enfant_mene_hors_perimetre(racine: &std::path::Path) -> bool {
+    let Ok(lecture) = std::fs::read_dir(racine) else {
+        return false;
+    };
+    for entree in lecture.flatten().take(ENFANTS_INSPECTES_MAX) {
+        let est_un_lien = entree.file_type().is_ok_and(|t| t.is_symlink());
+        if est_un_lien
+            && let Some(cible) = forme_canonique(&entree.path())
+            && cible_trop_large(&cible)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Comme [`verifier_une_racine_de_musique`], avec les dossiers de montage
+/// réseau de Tune (`montages`) : une racine posée DANS l'un d'eux reste
+/// acceptée même s'il vit sous un arbre système (installation `.deb` :
+/// `/var/lib/tune/montages/<partage>`). Toutes les autres règles
+/// s'appliquent, et la forme canonique doit rester dans le montage.
+pub(crate) fn verifier_une_racine_de_musique_avec(
+    chemin: &str,
+    montages: &[String],
+) -> Result<(), Refus> {
+    let c = chemin.trim();
+    if !est_absolu(c) {
+        return Err(Refus::PasAbsolu);
+    }
+    if remonte_vers_le_parent(c) || tune_core::chemin_sur::sans_remontee(c).is_err() {
+        return Err(Refus::RemonteVersLeParent);
+    }
+    if est_un_chemin_windows_interdit(c) {
+        return Err(Refus::TropLarge);
+    }
+    let canonique = forme_canonique(std::path::Path::new(c));
+    let dans_un_montage = !montages.is_empty() && {
+        let replie = forme_repliee(c);
+        montages.iter().any(|m| {
+            let m_replie = forme_repliee(m);
+            let lexical = est_absolu(m)
+                && !est_une_racine_de_disque(&m_replie)
+                && tune_core::chemin_sur::sous_la_racine(&replie, &m_replie);
+            let reel = match (&canonique, forme_canonique(std::path::Path::new(m))) {
+                (Some(cc), Some(cm)) => tune_core::chemin_sur::sous_la_racine(cc, &cm),
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            lexical && reel
+        })
+    };
+    if !dans_un_montage && (dans_un_arbre_systeme(c) || dans_un_arbre_systeme(&forme_repliee(c))) {
+        return Err(Refus::ArbreSysteme);
+    }
+    if est_une_racine_de_disque(c)
+        || est_un_rassemblement_de_volumes(c)
+        || (!dans_un_montage && contient_un_arbre_systeme(c))
+    {
+        return Err(Refus::TropLarge);
+    }
+    if let Some(canonique) = &canonique {
+        if !dans_un_montage && dans_un_arbre_systeme(canonique) {
+            return Err(Refus::ArbreSysteme);
+        }
+        if est_une_racine_de_disque(canonique)
+            || est_un_rassemblement_de_volumes(canonique)
+            || est_un_chemin_windows_interdit(canonique)
+            || (!dans_un_montage && contient_un_arbre_systeme(canonique))
+        {
+            return Err(Refus::TropLarge);
+        }
+    }
+    if un_enfant_mene_hors_perimetre(std::path::Path::new(c)) {
+        return Err(Refus::TropLarge);
+    }
+    Ok(())
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -514,6 +731,215 @@ mod tests {
         let ordinaire = verbatim.strip_prefix(r"\\?\").unwrap();
         assert!(!dans_un_arbre_systeme(verbatim));
         assert!(dans_un_arbre_systeme(ordinaire));
+    }
+
+    // -----------------------------------------------------------------
+    // Sécurité — périmètre d'une racine de bibliothèque.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn une_racine_de_musique_n_est_ni_un_disque_ni_un_arbre_systeme() {
+        for (chemin, motif) in [
+            ("/", Refus::TropLarge),
+            ("//", Refus::TropLarge),
+            ("/./", Refus::TropLarge),
+            (r"\", Refus::PasAbsolu),
+            (r"C:\", Refus::TropLarge),
+            ("c:", Refus::TropLarge),
+            (r"D:\.\", Refus::TropLarge),
+            (r"\\NAS", Refus::TropLarge),
+            ("//NAS/", Refus::TropLarge),
+            ("/private", Refus::TropLarge),
+            ("/etc", Refus::ArbreSysteme),
+            ("//etc", Refus::ArbreSysteme),
+            ("/./etc/ssh", Refus::ArbreSysteme),
+            ("/root/", Refus::ArbreSysteme),
+            ("/proc/self", Refus::ArbreSysteme),
+            (r"C:\Windows", Refus::ArbreSysteme),
+            (r"C:\.\Windows\System32", Refus::ArbreSysteme),
+            ("/musique/../etc", Refus::RemonteVersLeParent),
+            ("/musique/%2e%2e/etc", Refus::RemonteVersLeParent),
+            ("musique", Refus::PasAbsolu),
+            ("", Refus::PasAbsolu),
+        ] {
+            assert_eq!(
+                verifier_une_racine_de_musique(chemin),
+                Err(motif),
+                "{chemin:?}"
+            );
+        }
+    }
+
+    /// S1 — `/Volumes` rassemble les volumes, dont `Macintosh HD → /`.
+    #[test]
+    fn le_dossier_des_volumes_n_est_pas_une_racine_de_musique() {
+        for c in [
+            "/Volumes",
+            "/Volumes/",
+            "//Volumes",
+            "/volumes",
+            "/System/Volumes",
+        ] {
+            assert!(verifier_une_racine_de_musique(c).is_err(), "{c:?} accepté");
+        }
+        assert_eq!(
+            verifier_une_racine_de_musique("/Volumes"),
+            Err(Refus::TropLarge)
+        );
+        // Contre-épreuve : un volume de musique, lui, se déclare.
+        assert_eq!(verifier_une_racine_de_musique("/Volumes/MUSIC_SSD"), Ok(()));
+    }
+
+    /// S1 — un dossier qui CONTIENT directement un lien vers `/` ou vers un
+    /// arbre système (`~/.wine/dosdevices/z: → /`) n'est pas une racine.
+    #[cfg(unix)]
+    #[test]
+    fn un_dossier_qui_contient_un_lien_vers_le_disque_n_est_pas_une_racine() {
+        for (cible, etiquette) in [("/", "racine"), ("/etc", "etc")] {
+            let base = tune_core::test_scratch::scratch_dir_in(
+                "/tmp",
+                &format!("tune-racine-enfant-{etiquette}"),
+            );
+            std::fs::create_dir_all(base.path().join("Album")).unwrap();
+            std::os::unix::fs::symlink(cible, base.path().join("Macintosh HD")).unwrap();
+            assert_eq!(
+                verifier_une_racine_de_musique(&base.path().to_string_lossy()),
+                Err(Refus::TropLarge),
+                "lien vers {cible}"
+            );
+            // L'enfant ordinaire, lui, se déclare toujours.
+            assert_eq!(
+                verifier_une_racine_de_musique(&base.path().join("Album").to_string_lossy()),
+                Ok(())
+            );
+        }
+        // Contre-épreuve : un lien vers un autre dossier de musique est permis.
+        let base = tune_core::test_scratch::scratch_dir_in("/tmp", "tune-racine-enfant-ok");
+        let ailleurs = tune_core::test_scratch::scratch_dir_in("/tmp", "tune-racine-ailleurs");
+        std::os::unix::fs::symlink(ailleurs.path(), base.path().join("Jazz")).unwrap();
+        assert_eq!(
+            verifier_une_racine_de_musique(&base.path().to_string_lossy()),
+            Ok(())
+        );
+    }
+
+    /// S4 — partages d'administration, partages de la machine elle-même et
+    /// préfixes de périphérique Windows.
+    #[test]
+    fn les_partages_windows_qui_ouvrent_un_disque_sont_refuses() {
+        for c in [
+            r"\\localhost\C$",
+            r"\\localhost\Musique",
+            r"\\LOCALHOST\c$\Users",
+            r"\\127.0.0.1\C$",
+            r"\\127.0.0.1\Musique",
+            r"\\[::1]\Musique",
+            r"\\NAS\C$",
+            r"\\NAS\ADMIN$",
+            r"\\?\UNC\localhost\C$",
+            r"\\?\UNC\NAS\Musique",
+            r"\\?\C:\Musique",
+            r"\\.\C:\Musique",
+            "//?/C:/Musique",
+            r"\\wsl.localhost\Ubuntu",
+            r"\\wsl$\Ubuntu\home",
+        ] {
+            assert_eq!(
+                verifier_une_racine_de_musique(c),
+                Err(Refus::TropLarge),
+                "{c:?}"
+            );
+        }
+        for c in [
+            r"\\NAS\Musique",
+            r"\\192.168.1.10\Musique",
+            "//NAS/Musique/Jazz",
+        ] {
+            assert_eq!(verifier_une_racine_de_musique(c), Ok(()), "{c:?}");
+        }
+    }
+
+    /// Montages SMB des installations `.deb` : `/var/lib/tune/montages`
+    /// reste une racine valide, rien d'autre sous `/var`.
+    #[test]
+    fn un_partage_monte_par_tune_reste_declarable_meme_sous_var() {
+        let montages = vec!["/var/lib/tune/montages".to_string()];
+        for c in [
+            "/var/lib/tune/montages/nas-musique",
+            "/var/lib/tune/montages/nas-musique/Jazz",
+        ] {
+            assert_eq!(
+                verifier_une_racine_de_musique_avec(c, &montages),
+                Ok(()),
+                "{c:?}"
+            );
+            assert_eq!(
+                verifier_une_racine_de_musique(c),
+                Err(Refus::ArbreSysteme),
+                "sans l'exception, {c:?} reste refusé"
+            );
+        }
+        for c in [
+            "/var/lib/tune",
+            "/var/lib/tune/montages/../tune.db",
+            "/var/lib/tune/montages2",
+            "/var/log",
+            "/etc",
+        ] {
+            assert!(
+                verifier_une_racine_de_musique_avec(c, &montages).is_err(),
+                "{c:?} accepté par l'exception des montages"
+            );
+        }
+        // Une racine de montage relative ne vaut rien.
+        assert!(verifier_une_racine_de_musique_avec("/var/x", &["var".to_string()]).is_err());
+    }
+
+    /// Contre-épreuve : ce que l'on déclare vraiment comme bibliothèque.
+    #[test]
+    fn une_vraie_bibliotheque_reste_declarable() {
+        for chemin in [
+            "/home/bertrand/Musique",
+            "/Users/bertrand/Music",
+            "/Volumes/Musique",
+            "/mnt/nas/Jazz",
+            "/media/bertrand/USB",
+            "/run/media/bertrand/USB",
+            "/srv/musique",
+            "/nas/Blues 2",
+            r"D:\Musique",
+            r"\\NAS\Musique",
+            "//NAS/Musique/Jazz",
+            "  /srv/musique  ",
+        ] {
+            assert_eq!(verifier_une_racine_de_musique(chemin), Ok(()), "{chemin:?}");
+        }
+    }
+
+    /// Un lien `~/Musique/tout → /` : le texte est sain, la cible est le
+    /// disque entier.
+    #[cfg(unix)]
+    #[test]
+    fn un_lien_vers_la_racine_n_est_pas_une_racine_de_musique() {
+        let base = tune_core::test_scratch::scratch_dir_in("/tmp", "tune-racine-lien");
+        let lien = base.join("tout");
+        std::os::unix::fs::symlink("/", &lien).expect("lien de test");
+        assert_eq!(
+            verifier_une_racine_de_musique(&lien.to_string_lossy()),
+            Err(Refus::TropLarge)
+        );
+        let lien_etc = base.join("conf");
+        std::os::unix::fs::symlink("/etc", &lien_etc).expect("lien de test");
+        assert_eq!(
+            verifier_une_racine_de_musique(&lien_etc.to_string_lossy()),
+            Err(Refus::ArbreSysteme)
+        );
+        let ordinaire = base.join("Musique");
+        std::fs::create_dir_all(&ordinaire).unwrap();
+        assert_eq!(
+            verifier_une_racine_de_musique(&ordinaire.to_string_lossy()),
+            Ok(())
+        );
     }
 
     // -----------------------------------------------------------------

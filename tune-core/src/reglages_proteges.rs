@@ -32,6 +32,9 @@ use crate::secrets::est_secret;
 
 /// Noms exacts protégés (comparaison en minuscules).
 const PROTEGES: &[&str] = &[
+    // Sécurité : l'arrêt programmé peut éteindre la machine ; il passe par sa
+    // route gardée, jamais par le réglage brut.
+    "scheduled_stop",
     "auth_enabled",
     "api_key",
     "jwt_secret",
@@ -48,6 +51,8 @@ const PROTEGES: &[&str] = &[
     "ha_token",
     "hue_bridge_ip",
     "hue_username",
+    // L'adresse du serveur Snapcast : le serveur lui envoie des requêtes.
+    "snapcast_host",
     "yt_dlp_path",
 ];
 
