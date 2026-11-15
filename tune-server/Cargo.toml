@@ -1365,6 +1365,13 @@ path = "tests/alarm_days_5669.rs"
 name = "alarm_radio_7047"
 path = "tests/alarm_radio_7047.rs"
 
+# #8666 — le réveil posé depuis Lecture en cours sur un titre de la
+# bibliothèque rejoue son album ; ce qui ne peut pas être rejoué est refusé
+# en `alarm_source_required` avec un motif.
+[[test]]
+name = "alarm_lecture_en_cours_8666"
+path = "tests/alarm_lecture_en_cours_8666.rs"
+
 [[test]]
 name = "history_context_4036"
 path = "tests/history_context_4036.rs"
@@ -2196,3 +2203,10 @@ path = "tests/pays_artiste_8090.rs"
 name = "banc_albums_http_7774"
 path = "tests/banc_albums_http_7774.rs"
 required-features = ["postgres"]
+
+# #8668 — la carte des pays : pays d'édition lu sur MusicBrainz (balise
+# prioritaire) et pays de chaque album pour la carte qui suit les filtres.
+# Jumeau PostgreSQL `pg_8668`.
+[[test]]
+name = "pays_edition_8668"
+path = "tests/pays_edition_8668.rs"

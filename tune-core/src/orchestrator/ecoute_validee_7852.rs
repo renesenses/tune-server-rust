@@ -154,6 +154,8 @@ pub(super) struct EcouteEnAttente {
     pub(super) session_profile_id: Option<i64>,
     pub(super) contexte: ContexteRetenu,
     pub(super) album_ref: Option<String>,
+    /// #8714 — la piste de la bibliothèque écoutée, si elle est connue.
+    pub(super) track_id: Option<i64>,
 }
 
 impl EcouteEnAttente {

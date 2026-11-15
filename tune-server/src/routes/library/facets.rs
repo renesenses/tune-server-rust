@@ -485,14 +485,27 @@ fn build_facet_conditions(
     }
     // Extended-tag filters via the open `track_metadata` k/v store. `source`
     // facet == source_media key. Key is a fixed literal; values are bound.
+    // #8668 — le pays d'édition : la balise RELEASECOUNTRY, ou, pour un album
+    // sans balise, le pays de sa release MusicBrainz (`albums.release_country`).
+    // `country_albums` est la facette « pays d'édition » comptée en albums
+    // (#8090) : elle ne se filtre pas elle-même non plus.
+    if exclude != "country"
+        && exclude != "country_albums"
+        && let Some((c, p)) = combiner(
+            &mut ph,
+            &sel.countries,
+            sel.est_en_et("country"),
+            tune_core::db::facet_filter::bloc_pays_edition,
+        )
+    {
+        conds.push(c);
+        params.extend(p);
+    }
     for (values, key, own, param) in [
-        (&sel.countries, "release_country", "country", "country"),
         (&sel.moods, "mood", "mood", "mood"),
         (&sel.source_medias, "source_media", "source", "source_media"),
     ] {
-        // #8090 — `country_albums` est la facette « pays d'édition » comptée
-        // en albums : elle ne se filtre pas elle-même non plus.
-        if exclude == own || (own == "country" && exclude == "country_albums") {
+        if exclude == own {
             continue;
         }
         if let Some((c, p)) = combiner(&mut ph, values, sel.est_en_et(param), bloc_metadonnee(key))
@@ -823,7 +836,9 @@ pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &Soc
                 // pays de l'artiste principal (MusicBrainz) et le pays
                 // d'édition. Absents du jeu par défaut : un client les demande.
                 "artist_country" => artist_country_facet(state, limit, conds, params),
-                "country_albums" => kv_album_facet(state, "release_country", limit, conds, params),
+                // #8668 — balise RELEASECOUNTRY, sinon pays de la release
+                // MusicBrainz de l'album.
+                "country_albums" => edition_album_facet(state, limit, conds, params),
                 "mood" => kv_facet(state, "mood", limit, conds, params),
                 "source" => kv_facet(state, "source_media", limit, conds, params),
                 "rating" => rating_facet(state, q.sel.profile_id, limit, conds, params),
@@ -1666,11 +1681,31 @@ fn artist_country_facet(
     compter_les_lignes(state, &sql, params)
 }
 
-/// #8090 — une métadonnée étendue (`release_country`) comptée en ALBUMS
-/// distincts : un album dont les pistes portent la valeur compte une fois.
-fn kv_album_facet(
+/// #8668 — `(album_id, pays)` du pays d'ÉDITION de chaque piste retenue :
+/// la balise RELEASECOUNTRY telle qu'écrite ; pour un album dont AUCUNE piste
+/// n'est balisée, le pays lu sur sa release MusicBrainz (code ISO en
+/// majuscules, passe de fond `metadata::pays_des_editions`). `pays` est NUL
+/// quand ni l'une ni l'autre n'existe. `extra` resserre sur `t` (facettes).
+pub(super) fn sql_pays_edition_par_piste(extra: &str) -> String {
+    let valide = tune_core::db::facet_filter::PAYS_EDITION_MB_VALIDE;
+    let sans_balise = tune_core::db::facet_filter::SANS_PAYS_DE_BALISE;
+    format!(
+        "SELECT t.album_id AS album_id, \
+         CASE WHEN tm.value IS NOT NULL THEN tm.value \
+              WHEN {valide} AND {sans_balise} THEN UPPER(pe_al.release_country) END AS pays \
+         FROM tracks t \
+         JOIN albums pe_al ON pe_al.id = t.album_id \
+         LEFT JOIN track_metadata tm ON tm.track_id = t.id \
+              AND tm.key = 'release_country' AND tm.value <> '' \
+         WHERE t.album_id IS NOT NULL{extra}"
+    )
+}
+
+/// #8090 / #8668 — le pays d'ÉDITION compté en ALBUMS distincts : un album
+/// dont les pistes portent la valeur compte une fois. La balise prime ; un
+/// album sans balise compte sous le pays de sa release MusicBrainz.
+fn edition_album_facet(
     state: &AppState,
-    key: &str,
     limit: Option<i64>,
     conds: &[String],
     params: &[SqlValue],
@@ -1681,11 +1716,11 @@ fn kv_album_facet(
         format!(" AND {}", conds.join(" AND "))
     };
     let limit_clause = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let par_piste = sql_pays_edition_par_piste(&extra);
     let sql = format!(
-        "SELECT tm.value, COUNT(DISTINCT t.album_id) AS n FROM track_metadata tm \
-         JOIN tracks t ON tm.track_id = t.id \
-         WHERE tm.key = '{key}' AND tm.value <> '' AND t.album_id IS NOT NULL{extra} \
-         GROUP BY tm.value ORDER BY n DESC, tm.value{limit_clause}"
+        "SELECT x.pays, COUNT(DISTINCT x.album_id) AS n FROM ({par_piste}) x \
+         WHERE x.pays IS NOT NULL \
+         GROUP BY x.pays ORDER BY n DESC, x.pays{limit_clause}"
     );
     compter_les_lignes(state, &sql, params)
 }

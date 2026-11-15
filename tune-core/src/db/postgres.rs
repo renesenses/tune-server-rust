@@ -329,6 +329,9 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // rejoue jamais la 079. Sans lui, « Reprendre l'écoute » reste juste mais
     // lent.
     "CREATE INDEX IF NOT EXISTS idx_listen_history_album_id ON listen_history(album_id)",
+    // #8714 — même garantie sur base neuve ou migrée : l'identifiant de
+    // piste est désormais écrit à l'écoute et utilisé par les rapprochements.
+    "CREATE INDEX IF NOT EXISTS idx_listen_history_track_id ON listen_history(track_id)",
     // BIGINT, pas TEXT : `profiles.id` est BIGINT et `history_repo` filtre par
     // `profile_id = <entier>`. En TEXT, PostgreSQL rend `operator does not
     // exist: text = bigint` et l'historique du profil rend une liste vide.
@@ -444,6 +447,11 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // la passe de fond les NOMMENT.
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS country TEXT",
     "ALTER TABLE artists ADD COLUMN IF NOT EXISTS country_mbid TEXT",
+    // #8668 — le pays d'édition MusicBrainz et la release dont il a été lu
+    // (PG 120). Ici AUSSI : une base de bascule ne rejoue pas la 120, et les
+    // facettes comme la passe de fond les NOMMENT.
+    "ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country TEXT",
+    "ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country_mbid TEXT",
     // #7765 — la source d'un crédit de piste (PG 102). Ici AUSSI : tous les
     // écrivains de crédits et les passes « à faire » NOMMENT la colonne.
     // L'index JUSTE APRÈS la colonne.

@@ -5,8 +5,9 @@
 //! [`tune_core::cloud::tune_tested_proposition`]. Le `GET` rend l'aperçu
 //! exact du corps que le `POST` envoie, identifiant d'instance compris : le
 //! client web montre ce qui part, sans rien recomposer. L'identité présentée
-//! au site est celle du rapport de bogue (jeton de compte, sinon clé de
-//! licence), par la même fonction du support.
+//! au site est celle du rapport de bogue (jeton de compte, puis clé de
+//! licence), par la même fonction du support : chacune est essayée dans
+//! l'ordre, la suivante après un 401 (#8792).
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -136,16 +137,17 @@ pub async fn proposer_tune_tested(
             );
         }
     };
-    let Some(identite) = crate::routes::support::identifiants_mozaiklabs(&settings)
-        .into_iter()
-        .next()
-    else {
+    // #8792 — TOUTES les identités, dans l'ordre (jeton de compte, puis clé de
+    // licence), comme le rapport de bogue depuis #7920 : un jeton révoqué ne
+    // masque plus la licence.
+    let identites = crate::routes::support::identifiants_mozaiklabs(&settings);
+    if identites.is_empty() {
         return refus(
             StatusCode::PRECONDITION_FAILED,
             "tune_tested_not_connected",
             json!({}),
         );
-    };
+    }
     let corps = corps_envoye(&settings, apercu);
     // L'aperçu est exact : si une piste s'est terminée depuis qu'il a été
     // montré, rien ne part et le client reçoit le nouveau à confirmer.
@@ -172,14 +174,37 @@ pub async fn proposer_tune_tested(
             );
         }
     };
-    // `Accept: application/json`, comme le rapport de bogue : sans lui, un
-    // refus de validation du site revient en redirection lue comme un succès.
-    let requete = client
-        .post(url_du_site(&settings))
-        .header(reqwest::header::ACCEPT, "application/json")
-        .json(&corps);
-    // Ni jeton ni clé ne sont journalisés.
-    match identite.apply(requete).send().await {
+    let url = url_du_site(&settings);
+    // #8792 — une identité refusée (401) passe la main à la suivante ; tout
+    // autre verdict du site (succès, 422, 429, panne) est rendu tel quel. Ni
+    // jeton ni clé ne sont journalisés.
+    let mut envoi = None;
+    for (rang, identite) in identites.iter().enumerate() {
+        // `Accept: application/json`, comme le rapport de bogue : sans lui, un
+        // refus de validation du site revient en redirection lue comme un succès.
+        let requete = client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&corps);
+        let reponse = identite.apply(requete).send().await;
+        let refusee = matches!(&reponse, Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED);
+        envoi = Some(reponse);
+        if !refusee {
+            break;
+        }
+        if rang + 1 < identites.len() {
+            tracing::info!(rang, "tune_tested_identite_refusee_essai_suivant");
+        }
+    }
+    let Some(envoi) = envoi else {
+        // Inatteignable : `identites` n'est pas vide.
+        return refus(
+            StatusCode::PRECONDITION_FAILED,
+            "tune_tested_not_connected",
+            json!({}),
+        );
+    };
+    match envoi {
         Ok(resp) if resp.status().is_success() => {
             if proposition::marquer_proposee(&settings, &apercu.device_key).is_err() {
                 tracing::warn!("tune_tested_proposition_non_retenue");

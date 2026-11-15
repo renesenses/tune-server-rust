@@ -365,6 +365,12 @@ pub(super) async fn get_artist(
                     json!(provenance.map(|p| p.as_str())),
                 );
             }
+            // #8668 — le pays de l'artiste (MusicBrainz, #8090), code ISO en
+            // majuscules, null s'il est inconnu ou lu d'un ancien MBID : la
+            // fiche l'affiche dans son en-tête, lien vers la carte des pays.
+            if let Some(obj) = j.as_object_mut() {
+                obj.insert("country".into(), json!(pays_de_l_artiste(&state, id)));
+            }
             // #6738 — le total des écoutes de la communauté, absent sous le seuil.
             ecoutes_communaute::annoter_un(
                 &state.backend,
@@ -378,6 +384,24 @@ pub(super) async fn get_artist(
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// #8668 — le pays VALIDE de l'artiste (même règle que la facette
+/// `artist_country`, [`tune_core::db::facet_filter::PAYS_ARTISTE_VALIDE`]).
+fn pays_de_l_artiste(state: &AppState, id: i64) -> Option<String> {
+    use tune_core::db::backend::ToSqlValue;
+    let valide = tune_core::db::facet_filter::PAYS_ARTISTE_VALIDE;
+    state
+        .backend
+        .query_one(
+            &format!(
+                "SELECT UPPER(pa_ar.country) FROM artists pa_ar WHERE pa_ar.id = ? AND {valide}"
+            ),
+            &[&id as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|l| l.first()?.as_string())
 }
 
 pub(super) async fn artist_bio(
