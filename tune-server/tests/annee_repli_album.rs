@@ -184,7 +184,7 @@ async fn scenario(state: &AppState) {
         .as_array()
         .unwrap()
         .iter()
-        .find(|carte| carte["id"] == a)
+        .find(|carte| carte["album_id"] == a)
         .expect("carte de l'album A");
     assert_eq!(carte["year"], ANNEE_ALBUM, "{cartes}");
     for ordre in ["asc", "desc"] {
