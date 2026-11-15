@@ -18,8 +18,10 @@
 //!   dans l'ordre de la file (l'ordre caché n'est plus jamais matérialisé) ;
 //! - l'ordre d'origine est retenu (identifiants de ligne) ; désactiver
 //!   l'aléatoire le rétablit, et la lecture continue sur le même titre ;
-//! - un ajout pendant l'aléatoire suit la règle de la route d'ajout : « Lire
-//!   ensuite » juste après le titre en cours, « Ajouter » en fin de file ;
+//! - un ajout pendant l'aléatoire : « Lire ensuite » juste après le titre en
+//!   cours ; « Ajouter » disperse les titres ajoutés au hasard parmi ceux qui
+//!   restent à jouer (#8796) — en fin de file, un album ajouté se jouait dans
+//!   l'ordre, à la suite ;
 //! - une file NEUVE lancée pendant l'aléatoire (album, liste…) est mélangée
 //!   autour du titre lancé : il joue en premier, tout le reste suit dans le
 //!   désordre — le comportement que le tirage caché donnait déjà.
@@ -110,6 +112,120 @@ pub fn melanger_une_file_neuve_hors(ids: &[i64], depart: usize, fixes: &HashSet<
     }
     melanger_a_partir_de(&mut nouvel, 1, fixes);
     nouvel
+}
+
+/// #8796 (forum VNAV) — un « Ajouter à la file » pendant l'aléatoire.
+///
+/// Les lignes `ajoutees` (posées en fin de file, dans leur ordre d'ajout) sont
+/// mélangées entre elles puis dispersées à des rangs tirés au hasard parmi les
+/// titres qui RESTENT à jouer. Rien ne passe avant le titre en cours ni parmi
+/// les titres déjà joués (`ids[..=courant]` inchangé). Une ligne radio fixe
+/// déjà en file (#8135) reste derrière les titres : les ajouts ne la
+/// dépassent pas ; une radio ajoutée, elle, reste en fin de file.
+pub fn disperser_les_ajouts(
+    ids: &[i64],
+    courant: Option<usize>,
+    ajoutees: &HashSet<i64>,
+    fixes: &HashSet<i64>,
+) -> Vec<i64> {
+    let debut = courant.map_or(0, |c| c.saturating_add(1)).min(ids.len());
+    let mut nouvel: Vec<i64> = ids[..debut].to_vec();
+    let mut reste: Vec<i64> = Vec::with_capacity(ids.len() - debut);
+    let mut a_disperser: Vec<i64> = Vec::new();
+    let mut en_queue: Vec<i64> = Vec::new();
+    for &id in &ids[debut..] {
+        if !ajoutees.contains(&id) {
+            reste.push(id);
+        } else if fixes.contains(&id) {
+            en_queue.push(id);
+        } else {
+            a_disperser.push(id);
+        }
+    }
+    let ordre = generate_shuffle_order(a_disperser.len(), usize::MAX);
+    let mut borne = reste
+        .iter()
+        .position(|id| fixes.contains(id))
+        .unwrap_or(reste.len());
+    for src in ordre {
+        let rang = tirer_au_plus(borne);
+        reste.insert(rang, a_disperser[src]);
+        borne += 1;
+    }
+    nouvel.extend(reste);
+    nouvel.extend(en_queue);
+    nouvel
+}
+
+/// Un entier tiré uniformément dans `0..=max`.
+fn tirer_au_plus(max: usize) -> usize {
+    use rand_core::{OsRng, RngCore};
+    (OsRng.next_u64() % (max as u64 + 1)) as usize
+}
+
+/// #8796 — après un « Ajouter à la file » (fin de file) sous l'aléatoire :
+/// disperse les lignes d'identifiant supérieur à `dernier_avant` (celles que
+/// l'ajout vient d'écrire) parmi les titres restants, et les ajoute à l'ordre
+/// d'origine retenu, en fin et dans leur ordre d'ajout : éteindre l'aléatoire
+/// les rend là où l'ajout les avait posées.
+///
+/// Rend le rang de chaque ligne ajoutée après dispersion (dans l'ordre
+/// d'ajout), ou `None` si rien n'a bougé (aléatoire éteint, rien d'ajouté,
+/// échec d'écriture journalisé : la file reste dans l'ordre d'ajout).
+pub async fn apres_ajout_en_fin(
+    db: &Arc<dyn DbBackend>,
+    playback: &PlaybackManager,
+    zone_id: i64,
+    dernier_avant: i64,
+) -> Option<Vec<i64>> {
+    let etat = playback.get_state(zone_id).await;
+    if !etat.shuffle {
+        return None;
+    }
+    let repo = PlayQueueRepo::with_backend(db.clone());
+    let entrees = match repo.get_ordered_fort(zone_id) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(zone_id, error = %e, "aleatoire_ajout_lecture_echouee");
+            return None;
+        }
+    };
+    let ids: Vec<i64> = entrees.iter().map(|e| e.id).collect();
+    let mut ajoutees_dans_l_ordre: Vec<i64> = ids
+        .iter()
+        .copied()
+        .filter(|&id| id > dernier_avant)
+        .collect();
+    ajoutees_dans_l_ordre.sort_unstable();
+    if ajoutees_dans_l_ordre.is_empty() {
+        return None;
+    }
+    let ajoutees: HashSet<i64> = ajoutees_dans_l_ordre.iter().copied().collect();
+    let courant = rang_courant(&entrees, etat.queue_position);
+    let nouvel = disperser_les_ajouts(&ids, courant, &ajoutees, &lignes_radio_fixes(&entrees));
+    if nouvel != ids
+        && let Err(e) = repo.reordonner(zone_id, &nouvel)
+    {
+        warn!(zone_id, error = %e, "aleatoire_ajout_ecriture_echouee");
+        return None;
+    }
+    let mut origine = playback.ordre_d_origine(zone_id);
+    if !origine.is_empty() {
+        origine.extend(ajoutees_dans_l_ordre.iter().copied());
+        playback.retenir_l_ordre_d_origine(zone_id, origine);
+    }
+    info!(
+        zone_id,
+        ajoutees = ajoutees_dans_l_ordre.len(),
+        longueur = nouvel.len(),
+        "aleatoire_ajout_disperse"
+    );
+    Some(
+        ajoutees_dans_l_ordre
+            .iter()
+            .filter_map(|id| nouvel.iter().position(|x| x == id).map(|p| p as i64))
+            .collect(),
+    )
 }
 
 /// L'ordre à rétablir quand l'aléatoire s'éteint.
@@ -452,6 +568,43 @@ mod tests {
         let nouvel = melanger_une_file_neuve(&origine, 7);
         assert_eq!(nouvel[0], origine[7]);
         assert_eq!(trie(nouvel), origine);
+    }
+
+    /// #8796 — un ajout en fin de file sous l'aléatoire est dispersé parmi
+    /// les titres restants : jamais avant le titre en cours, jamais parmi les
+    /// joués, et pas dans l'ordre d'ajout à la suite.
+    #[test]
+    fn un_ajout_sous_l_aleatoire_est_disperse_dans_la_suite_8796() {
+        let file: Vec<i64> = (1..=20).collect();
+        let mut ids = file.clone();
+        ids.extend(101..=110);
+        let ajoutees: HashSet<i64> = (101..=110).collect();
+        let mut a_bouge = false;
+        for _ in 0..30 {
+            let nouvel = disperser_les_ajouts(&ids, Some(4), &ajoutees, &HashSet::new());
+            assert_eq!(&nouvel[..5], &file[..5], "joués + en cours figés");
+            assert_eq!(trie(nouvel.clone()), ids, "une permutation");
+            let anciens: Vec<i64> = nouvel.iter().copied().filter(|id| *id <= 20).collect();
+            assert_eq!(anciens, file, "les titres déjà en file gardent leur ordre");
+            a_bouge |= nouvel[20..] != ids[20..];
+        }
+        assert!(
+            a_bouge,
+            "les ajouts restent à la suite, dans l'ordre d'ajout"
+        );
+    }
+
+    /// #8796 + #8135 — une radio déjà en fin de file reste derrière les ajouts.
+    #[test]
+    fn un_ajout_sous_l_aleatoire_ne_depasse_pas_une_radio_fixe_8796() {
+        let ids = vec![1, 2, 3, 4, 50, 101, 102, 103];
+        let ajoutees: HashSet<i64> = [101, 102, 103].into();
+        let fixes: HashSet<i64> = [50].into();
+        for _ in 0..30 {
+            let nouvel = disperser_les_ajouts(&ids, Some(1), &ajoutees, &fixes);
+            assert_eq!(&nouvel[..2], &[1, 2]);
+            assert_eq!(nouvel.last(), Some(&50), "la radio reste la dernière");
+        }
     }
 
     #[test]

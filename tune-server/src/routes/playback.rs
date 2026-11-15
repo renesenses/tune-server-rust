@@ -6317,8 +6317,25 @@ async fn queue_add(
             warn!(zone_id, error = %e, "queue_add_contexte_non_pose");
         }
     }
+    // #8796 (forum VNAV) — « Ajouter » pendant l'aléatoire : les titres
+    // ajoutés sont dispersés parmi ceux qui restent à jouer, au lieu d'être lus
+    // dans l'ordre à la suite. « Lire ensuite » (position donnée) n'y passe pas.
+    let rangs_disperses = if body.position.is_none() && bilan.inserted() > 0 {
+        tune_core::playback::melange::apres_ajout_en_fin(
+            &state.backend,
+            &state.playback,
+            zone_id,
+            dernier_avant,
+        )
+        .await
+    } else {
+        None
+    };
     let count = bilan.inserted();
-    let start = bilan.start;
+    let start = match &rangs_disperses {
+        Some(rangs) => rangs.iter().copied().min().or(bilan.start),
+        None => bilan.start,
+    };
     if bilan.has_loss() {
         let apercu: Vec<i64> = bilan.skipped.iter().take(10).copied().collect();
         warn!(
@@ -6356,7 +6373,14 @@ async fn queue_add(
         queue_length = total,
         "queue_add_ok"
     );
-    let enfiles = decrire_enfilage(&inputs, start, &bilan.retenus);
+    let mut enfiles = decrire_enfilage(&inputs, bilan.start, &bilan.retenus);
+    // #8796 — après dispersion, chaque ligne annonce le rang où elle a
+    // réellement atterri, pas celui de l'ajout en fin de file.
+    if let Some(rangs) = &rangs_disperses {
+        for (item, rang) in enfiles.iter_mut().zip(rangs) {
+            item["position"] = json!(rang);
+        }
+    }
     state.event_bus.emit(
         "playback.queue.track_added",
         json!({
