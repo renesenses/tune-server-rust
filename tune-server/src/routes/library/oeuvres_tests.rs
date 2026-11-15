@@ -771,3 +771,55 @@ async fn chaque_version_porte_ses_canaux_2731() {
         "pas de canaux connus, pas de clé : {seul}"
     );
 }
+
+/// web#3064 : chaque version porte son numéro de catalogue quand la
+/// bibliothèque le connaît ; sinon (inconnu ou vide) la clé est absente.
+#[tokio::test]
+async fn chaque_version_porte_son_numero_de_catalogue_quand_il_est_connu() {
+    let b = banc();
+    b.state
+        .backend
+        .execute(
+            "UPDATE albums SET catalog_number = ?1 WHERE id = ?2",
+            &[&"CDP 7 46001 2" as &dyn ToSqlValue, &b.dsotm],
+        )
+        .unwrap();
+    b.state
+        .backend
+        .execute(
+            "UPDATE albums SET catalog_number = '  ' WHERE id = ?1",
+            &[&b.hits_a as &dyn ToSqlValue],
+        )
+        .unwrap();
+    let (statut, corps) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{}/versions", b.dsotm),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(
+        version(&corps, b.dsotm)["catalog_number"],
+        json!("CDP 7 46001 2")
+    );
+    assert!(
+        version(&corps, b.dsotm_sacd)
+            .get("catalog_number")
+            .is_none(),
+        "pas de numéro connu, pas de clé : {corps}"
+    );
+
+    // Un numéro vide (que des blancs) vaut « inconnu ».
+    let (_, seul) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{}/versions", b.hits_a),
+        None,
+    )
+    .await;
+    assert!(
+        seul["versions"][0].get("catalog_number").is_none(),
+        "numéro vide, pas de clé : {seul}"
+    );
+}
