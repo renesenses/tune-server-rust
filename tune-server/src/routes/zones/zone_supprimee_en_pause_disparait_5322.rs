@@ -387,3 +387,20 @@ async fn supprimer_une_zone_en_pause_l_arrete_et_une_zone_arretee_ne_recoit_rien
         "une zone déjà à l'arrêt n'a pas à recevoir de stop"
     );
 }
+
+/// #8701 — une zone supprimée (même à l'arrêt) ne retient plus ses fMP4 DASH :
+/// le ramasse-miettes peut de nouveau les retirer.
+#[tokio::test]
+async fn une_zone_supprimee_libere_ses_fichiers_dash_8701() {
+    let banc = monter();
+    let salon = banc.id("Salon", "dlna");
+    // Un nom seulement : le registre ne lit que le chemin.
+    let fichier = "/nulle-part/tune-dash-8701-zone-supprimee.mp4";
+    tune_core::audio::dash_epingles::noter_la_piste_resolue(salon, Some(fichier));
+    assert!(tune_core::audio::dash_epingles::est_epingle(fichier));
+    assert_eq!(supprimer(&banc.state, salon).await, StatusCode::NO_CONTENT);
+    assert!(
+        !tune_core::audio::dash_epingles::est_epingle(fichier),
+        "le fichier de la zone supprimée reste épinglé 4 h"
+    );
+}

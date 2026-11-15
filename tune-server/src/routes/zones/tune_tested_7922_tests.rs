@@ -372,3 +372,113 @@ fn tune_tested_8084_le_chemin_est_celui_que_le_site_sert() {
     // `routes/api.php` du site : `Route::post('v1/tune-tested/propositions', …)`.
     assert_eq!(super::CHEMIN_DU_SITE, "/api/v1/tune-tested/propositions");
 }
+
+/// #8792 — un faux site qui refuse (401) tout jeton de compte, comme celui de
+/// Pierre dont les jetons sont révoqués, et accepte la clé de licence si
+/// `licence_acceptee`. Il note les en-têtes d'identité de CHAQUE appel.
+async fn faux_site_jeton_revoque(licence_acceptee: bool) -> (String, Arc<Mutex<Vec<Recu>>>) {
+    let appels: Arc<Mutex<Vec<Recu>>> = Arc::new(Mutex::new(Vec::new()));
+    let a = appels.clone();
+    let app = axum::Router::new().route(
+        super::CHEMIN_DU_SITE,
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, corps: axum::body::Bytes| {
+                let a = a.clone();
+                async move {
+                    let lire = |nom: &str| {
+                        headers
+                            .get(nom)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string)
+                    };
+                    let recu = Recu {
+                        corps: serde_json::from_slice(&corps).unwrap_or(Value::Null),
+                        authorization: lire("authorization"),
+                        license_key: lire("x-license-key"),
+                        accept: lire("accept"),
+                    };
+                    let par_licence = recu.authorization.is_none() && recu.license_key.is_some();
+                    a.lock().await.push(recu);
+                    if par_licence && licence_acceptee {
+                        (
+                            StatusCode::CREATED,
+                            axum::Json(json!({
+                                "status": "received",
+                                "proposition": { "id": 8792, "status": "pending" }
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            axum::Json(json!({ "message": "Unauthenticated." })),
+                        )
+                    }
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://127.0.0.1:{port}"), appels)
+}
+
+#[tokio::test]
+async fn tune_tested_8792_jeton_revoque_la_licence_prend_le_relais() {
+    let (base, appels) = faux_site_jeton_revoque(true).await;
+    let banc = banc(
+        &base,
+        &[
+            ("mozaik_access_token", "jeton-revoque-8792"),
+            ("license_key", "CLE-ESSAI-8792"),
+        ],
+    );
+    banc.ecouter(60);
+    let (statut, corps) = banc.appeler("POST").await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["status"], "ok");
+    assert_eq!(corps["proposal"]["id"], 8792);
+
+    let appels = appels.lock().await;
+    assert_eq!(appels.len(), 2, "le jeton, puis la licence");
+    // 1er essai : le jeton seul, refusé.
+    assert_eq!(
+        appels[0].authorization.as_deref(),
+        Some("Bearer jeton-revoque-8792")
+    );
+    assert!(appels[0].license_key.is_none());
+    // 2e essai : la licence seule, acceptée, même corps.
+    assert!(appels[1].authorization.is_none());
+    assert_eq!(appels[1].license_key.as_deref(), Some("CLE-ESSAI-8792"));
+    assert_eq!(appels[1].accept.as_deref(), Some("application/json"));
+    assert_eq!(appels[0].corps, appels[1].corps);
+    drop(appels);
+
+    // Proposée : l'état le retient après le succès.
+    let (_, etat) = banc.appeler("GET").await;
+    assert_eq!(etat["already_proposed"], true, "{etat}");
+}
+
+#[tokio::test]
+async fn tune_tested_8792_contre_epreuve_toutes_les_identites_refusees() {
+    // Jeton ET licence refusés : deux essais, puis le 401 du site est rendu à
+    // part (jamais en 401 vers le client), et rien n'est marqué proposé.
+    let (base, appels) = faux_site_jeton_revoque(false).await;
+    let banc = banc(
+        &base,
+        &[
+            ("mozaik_access_token", "jeton-revoque-8792"),
+            ("license_key", "CLE-REFUSEE-8792"),
+        ],
+    );
+    banc.ecouter(60);
+    let (statut, corps) = banc.appeler("POST").await;
+    assert_eq!(statut, StatusCode::BAD_GATEWAY, "{corps}");
+    assert_eq!(corps["error"], "tune_tested_site_refused");
+    assert_eq!(corps["status"], 401);
+    assert_eq!(appels.lock().await.len(), 2);
+    let (_, etat) = banc.appeler("GET").await;
+    assert_eq!(etat["already_proposed"], false, "{etat}");
+}

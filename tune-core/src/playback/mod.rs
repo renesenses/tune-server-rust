@@ -4,6 +4,7 @@ pub mod gapless;
 pub mod melange;
 pub mod queue;
 pub mod radio_artiste;
+pub mod radio_fin_de_file;
 // `crossfade` a été retiré ici (#2211), pour la même raison que
 // `radio_handler` juste en dessous : un module complet, **sans un seul
 // appelant** dans tout le dépôt depuis sa création.

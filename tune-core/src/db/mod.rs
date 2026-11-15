@@ -16,6 +16,9 @@ pub mod champs_tenus;
 pub mod cles_clients;
 pub mod coffrets_auto;
 pub mod collection_folder_repo;
+/// #8672 — « Ma collection physique » : les disques associés à la main à un
+/// album de la bibliothèque (SQLite 153 / PG 119).
+pub mod collection_physique_associations;
 /// Le conteneur de chaque élément de file (#6466).
 pub mod contexte_de_file;
 /// Un disque par dossier pour un album sans DISCNUMBER réparti en dossiers frères.

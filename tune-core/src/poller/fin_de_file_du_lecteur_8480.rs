@@ -85,6 +85,12 @@ impl PositionPoller {
             queue_len = etat.queue_length,
             "fin_de_file_du_lecteur_navigateur"
         );
+        // Fil 2694 (relecture de #8656) — la piste est allée à son terme : sur
+        // une zone navigateur, le `next` du lecteur ne passe jamais par
+        // `handle_track_end`, c'est donc ICI que le lot de la radio est noté
+        // joué. Sans cela, la fin du premier lot était écartée
+        // (`lot_precedent_sans_titre_joue`) et la zone s'arrêtait.
+        self.noter_la_ligne_courante_jouee(zone_id, etat.queue_position);
         let device_id = self.get_zone_device_id(zone_id);
         self.terminer_la_file(zone_id, &etat, device_id.as_deref())
             .await;

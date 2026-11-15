@@ -562,7 +562,15 @@ impl AlarmScheduler {
             return Err("contenu du réveil sans piste jouable".into());
         }
         self.orchestrator.clear_prefetch().await;
-        self.orchestrator.play_from_queue(zone, 0).await
+        let lecture = self.orchestrator.play_from_queue(zone, 0).await;
+        // Fil 2694 — la file d'un réveil s'arrête à sa fin : la radio de fin
+        // de file ne la prolonge pas (tant qu'on n'y a rien changé). La
+        // photo est prise APRÈS le lancement, sur la file telle qu'il l'a
+        // laissée.
+        if lecture.is_ok() {
+            crate::playback::radio_fin_de_file::noter_fin_voulue(&self.db, zone);
+        }
+        lecture
     }
 
     /// `essai` : `true` pour le bouton d'essai, `false` pour le planificateur.
@@ -1021,3 +1029,6 @@ mod contenus_album_playlist_7058;
 
 #[cfg(test)]
 mod interrompre_la_lecture_8615;
+
+#[cfg(test)]
+mod radio_fin_de_file_2694;
