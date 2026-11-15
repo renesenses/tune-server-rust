@@ -1853,6 +1853,22 @@ pub(super) async fn update_config(
     if let Some(refus) = refus_des_cles_protegees(&state, values.keys().map(String::as_str)) {
         return Ok(refus);
     }
+    // Sécurité — `music_dirs` reste écrivable ici (aller-retour de
+    // `GET /system/settings`), mais une racine AJOUTÉE passe le même périmètre
+    // que `POST /system/music-dirs/add`. Rien n'est écrit si l'une est refusée.
+    if let Some(valeur) = values.get("music_dirs") {
+        let Some(liste) = dirs_depuis_valeur(valeur) else {
+            return Err(AppError::bad_request("music_dirs must be a list of paths"));
+        };
+        let avant = super::get_music_dirs_list(&state.backend);
+        if let Some((chemin, motif)) = racines_ajoutees_refusees(&state, &liste, &avant).pop() {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": motif, "path": chemin, "key": "music_dirs" })),
+            )
+                .into_response());
+        }
+    }
     if let Some(value) = values.get(tune_core::db::listening_resume::REWIND_KEY) {
         if value
             .as_u64()
@@ -3053,7 +3069,12 @@ pub(super) async fn import_config(
     let mut fichier = ce::lire(body).map_err(AppError::bad_request)?;
     // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
     // elles sont écartées de l'import et nommées dans `warnings`.
-    let ecartees = ecarter_les_cles_protegees(&state, &mut fichier.settings);
+    let mut ecartees = ecarter_les_cles_protegees(&state, &mut fichier.settings);
+    ecartees.extend(ecarter_les_racines_hors_perimetre(
+        &state,
+        &mut fichier.settings,
+        dirs_depuis_valeur,
+    ));
     let mut plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
     plan.avertissements.extend(ecartees.iter().cloned());
     let mut reponse = ce::rapport(&plan);
@@ -3452,6 +3473,72 @@ pub(super) async fn estimate_dir(
     )
 }
 
+/// Sécurité — le motif du refus d'une racine de bibliothèque hors
+/// du périmètre de l'explorateur, ou `None` si elle peut être déclarée.
+/// Toutes les écritures de `music_dirs` passent ici : ajout, onboarding,
+/// `PATCH /system/config` et les deux imports de configuration.
+pub(crate) fn refus_de_racine_de_musique(state: &AppState, chemin: &str) -> Option<&'static str> {
+    // Les dossiers de montage réseau de Tune restent des racines valides,
+    // même sous `/var/lib/tune` (installation `.deb`).
+    let montages: Vec<String> = crate::routes::network::racines_des_montages(state)
+        .iter()
+        .map(|m| m.to_string_lossy().into_owned())
+        .collect();
+    super::explorateur::verifier_une_racine_de_musique_avec(chemin, &montages)
+        .err()
+        .map(|refus| {
+            tracing::warn!(path = %chemin, motif = ?refus, "racine_de_musique_refusee");
+            refus.libelle()
+        })
+}
+
+/// Les racines d'une nouvelle liste `music_dirs` qui n'y étaient pas déjà et
+/// que le périmètre refuse, avec leur motif. Une racine DÉJÀ déclarée n'est
+/// pas revérifiée : une installation existante ne casse pas à la mise à jour.
+pub(crate) fn racines_ajoutees_refusees(
+    state: &AppState,
+    nouvelles: &[String],
+    avant: &[String],
+) -> Vec<(String, &'static str)> {
+    let deja: Vec<String> = avant
+        .iter()
+        .map(|d| tune_core::scanner::walker::normalize_path(d))
+        .collect();
+    nouvelles
+        .iter()
+        .filter(|d| !deja.contains(&tune_core::scanner::walker::normalize_path(d)))
+        .filter_map(|d| refus_de_racine_de_musique(state, d).map(|m| (d.clone(), m)))
+        .collect()
+}
+
+/// Imports de configuration : la clé `music_dirs` est écartée (et nommée dans
+/// les avertissements) si elle est illisible ou si elle ajoute une racine que
+/// le périmètre refuse. Vaut avec ou sans authentification.
+pub(super) fn ecarter_les_racines_hors_perimetre<T>(
+    state: &AppState,
+    reglages: &mut Vec<(String, T)>,
+    lire: impl Fn(&T) -> Option<Vec<String>>,
+) -> Vec<String> {
+    let avant = super::get_music_dirs_list(&state.backend);
+    let mut avertissements = Vec::new();
+    reglages.retain(|(cle, valeur)| {
+        if cle != "music_dirs" {
+            return true;
+        }
+        let refus = match lire(valeur) {
+            None => vec![("?".to_string(), "music_dirs must be a list of paths")],
+            Some(liste) => racines_ajoutees_refusees(state, &liste, &avant),
+        };
+        for (chemin, motif) in &refus {
+            avertissements.push(format!(
+                "setting 'music_dirs' skipped: '{chemin}' refused ({motif})"
+            ));
+        }
+        refus.is_empty()
+    });
+    avertissements
+}
+
 #[derive(Deserialize)]
 pub(super) struct AddMusicDir {
     path: String,
@@ -3480,6 +3567,16 @@ pub(super) async fn add_music_dir(
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "path is empty" })),
+        )
+            .into_response());
+    }
+    // Sécurité — les dossiers de musique sont le périmètre de
+    // toutes les gardes de chemin : une racine se déclare dans le périmètre de
+    // l'explorateur, jamais au-delà (ni `/`, ni un arbre système, ni `..`).
+    if let Some(motif) = refus_de_racine_de_musique(&state, &normalized) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": motif, "path": normalized })),
         )
             .into_response());
     }
@@ -7249,3 +7346,28 @@ mod dossiers_exclus_de_l_enrichissement_7538_tests {
 #[cfg(test)]
 #[path = "consentements_patch_partiel_8521_tests.rs"]
 mod consentements_patch_partiel_8521_tests;
+
+/// Sécurité — une racine porteuse de `..` n'est pas ajoutée.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::banc;
+
+    #[tokio::test]
+    async fn une_racine_qui_remonte_n_est_pas_ajoutee() {
+        let b = banc();
+        let r = add_music_dir(
+            crate::auth::RequireAdmin,
+            State(b.state.clone()),
+            Json(AddMusicDir {
+                path: b.remontee(""),
+            }),
+        )
+        .await;
+        assert_eq!(
+            crate::routes::confinement::statut(r),
+            StatusCode::BAD_REQUEST,
+            "racine `..` ajoutée"
+        );
+    }
+}

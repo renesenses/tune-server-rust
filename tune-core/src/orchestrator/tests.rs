@@ -7918,8 +7918,29 @@ async fn un_televersement_illisible_est_refuse_avant_toute_session() {
     // #3030 — `test_scratch` et rien d'autre : le nettoyage passe par `Drop`,
     // donc il a lieu même si l'assertion ci-dessous panique.
     let dossier = crate::test_scratch::scratch_dir("3270-televersement");
-    let wma = dossier.join("concert.wma");
+    let _ = &dossier;
+    // Sécurité — un téléversement ne se lit que dans le dossier des
+    // téléversements : les fichiers du banc y sont déposés, sous un nom unique.
+    let televersements = crate::chemins_de_travail::racine_des_televersements();
+    std::fs::create_dir_all(&televersements).unwrap();
+    let unique = format!("banc-3270-{}-{}", std::process::id(), line!());
+    let wma = televersements.join(format!("{unique}.wma"));
     std::fs::write(&wma, b"pas de l'audio lisible").unwrap();
+    let flac_depose = televersements.join(format!("{unique}.flac"));
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        &flac_depose,
+    )
+    .unwrap();
+    struct Menage(Vec<std::path::PathBuf>);
+    impl Drop for Menage {
+        fn drop(&mut self) {
+            for f in &self.0 {
+                let _ = std::fs::remove_file(f);
+            }
+        }
+    }
+    let _menage = Menage(vec![wma.clone(), flac_depose.clone()]);
 
     let req = requete_locale_3234(21, 1);
     // `expect_err` demanderait `ResolvedStream: Debug`, qu'il n'implémente
@@ -7942,8 +7963,10 @@ async fn un_televersement_illisible_est_refuse_avant_toute_session() {
 
     // CONTRE-ÉPREUVE : un vrai FLAC, lui, est résolu. Sans elle, un refus qui
     // rejetterait TOUT resterait vert et le téléversement serait mort.
-    let flac = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac");
-    let Ok(resolu) = orch.resolve_uploaded_file(flac, &req).await else {
+    let Ok(resolu) = orch
+        .resolve_uploaded_file(flac_depose.to_str().unwrap(), &req)
+        .await
+    else {
         panic!("un FLAC téléversé doit toujours se lire");
     };
     assert_eq!(resolu.source, "upload");
@@ -11791,4 +11814,87 @@ async fn remplacer_la_lecture_d_une_zone_dlna_ferme_le_flux_remplace_8404() {
         url.contains(&sid_portable),
         "le renderer doit avoir reçu le flux du portable : {url}"
     );
+}
+
+/// Sécurité — un « téléversement » hors du dossier des
+/// téléversements n'est jamais lu, même s'il existe et qu'il est lisible.
+#[tokio::test]
+async fn un_televersement_hors_du_dossier_des_televersements_est_refuse() {
+    let orch = test_orchestrator();
+    let req = requete_locale_3234(22, 1);
+    let flac = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac");
+    assert!(std::path::Path::new(flac).is_file());
+    let racine = crate::chemins_de_travail::racine_des_televersements();
+    let remontee = format!(
+        "{}/../../{}",
+        racine.display(),
+        flac.trim_start_matches('/')
+    );
+    for chemin in [flac.to_string(), remontee] {
+        let Err(erreur) = orch.resolve_uploaded_file(&chemin, &req).await else {
+            panic!("{chemin} est hors du dossier des téléversements et a été lu");
+        };
+        assert!(erreur.starts_with("uploaded file not found"), "{erreur}");
+    }
+}
+
+/// Sécurité (B2) — `podcast`, `radio`, `bandcamp` et `upnp` :
+/// un `source_id` client qui n'est pas une adresse http(s) ne part jamais
+/// vers une sortie. AirPlay, Sendspin et la sortie locale ouvrent un chemin
+/// nu ou un `file://` comme un fichier de la machine.
+#[tokio::test]
+async fn une_source_directe_ne_lit_jamais_un_fichier_local() {
+    let orch = test_orchestrator();
+    let flac = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac");
+    assert!(std::path::Path::new(flac).is_file());
+    for source in ["podcast", "radio", "bandcamp", "upnp"] {
+        for source_id in [
+            flac.to_string(),
+            format!("file://{flac}"),
+            format!("  {flac}"),
+            format!("FILE://{flac}"),
+            "C:\\Users\\x\\prive.flac".to_string(),
+            "ftp://exemple.org/a.flac".to_string(),
+            "http://".to_string(),
+        ] {
+            let req = super::PlayRequest {
+                zone_id: 31,
+                source: Some(source.into()),
+                source_id: Some(source_id.clone()),
+                title: Some("x".into()),
+                ..Default::default()
+            };
+            let Err(erreur) = orch.resolve_stream(&req).await else {
+                panic!("{source} / {source_id:?} : un fichier local a été résolu pour la lecture");
+            };
+            assert!(
+                !erreur.contains("test.flac"),
+                "le refus ne doit pas répéter le chemin : {erreur}"
+            );
+        }
+    }
+}
+
+/// Contre-épreuve de B2 : une adresse http(s) passe toujours (sans quoi le
+/// refus pourrait tout rejeter et rester vert).
+#[tokio::test]
+async fn une_source_directe_http_reste_jouable() {
+    let orch = test_orchestrator();
+    for source in ["podcast", "radio"] {
+        let req = super::PlayRequest {
+            zone_id: 32,
+            source: Some(source.into()),
+            source_id: Some("  http://127.0.0.1:9/flux.mp3".into()),
+            title: Some("x".into()),
+            ..Default::default()
+        };
+        let Ok(resolu) = orch.resolve_stream(&req).await else {
+            panic!("{source} : une adresse http doit rester jouable");
+        };
+        let vue = resolu
+            .origin_url
+            .clone()
+            .unwrap_or_else(|| resolu.url.clone());
+        assert!(vue.starts_with("http"), "valeur rognée attendue : {vue:?}");
+    }
 }

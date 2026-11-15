@@ -31,6 +31,8 @@ pub mod reaffectation_canaux;
 /// #7614 — le greffon de suréchantillonnage (`/upsampler`).
 pub mod upsampler;
 pub use tune_streaming_http::deezer_proxy_handler;
+/// Sécurité — chemins clients confinés (lecture et écriture).
+pub(crate) mod confinement;
 pub mod developer_api;
 pub mod devialet_air;
 pub mod devices;

@@ -26,7 +26,13 @@ async fn remplacer_le_chemin_par_les_routes_8676() {
     let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
 
-    let base = tune_core::test_scratch::scratch_dir("deplacer-racine-8676");
+    // Sécurité — la nouvelle racine passe le périmètre des
+    // dossiers de musique : pas sous `/var/folders` (macOS), donc sous le
+    // répertoire courant, comme le banc #8083.
+    let base = tune_core::test_scratch::scratch_dir_in(
+        std::env::current_dir().unwrap(),
+        "deplacer-racine-8676",
+    );
     // L'ancienne racine n'existe pas sur cette machine ; la nouvelle porte les
     // fichiers.
     let ancienne = "/machine-d-origine-8676/Musique".to_string();

@@ -176,6 +176,10 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
         wav.extend((data.len() as u32).to_le_bytes());
         wav.extend(data);
         std::fs::write(&input, wav).unwrap();
+        // La source est lue : elle doit être dans un dossier de musique.
+        settings
+            .set("music_dirs", &json!([dir.path()]).to_string())
+            .unwrap();
         for tool in ["converter", "declick"] {
             let (status, response) = request(&app, "POST", &format!("/api/v1/{tool}/start"), json!({"sources":[{"path":input}],"format":"wav","options":{"output_format":"wav"}})).await;
             assert_eq!(

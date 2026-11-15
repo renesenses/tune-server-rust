@@ -448,11 +448,21 @@ async fn l_arret_et_une_autre_source_liberent_le_fichier_8701() {
         orch.streamer.remove_session(sid).await;
     }
 
-    // Une piste d'une autre source : un WAV téléversé.
-    let wav = crate::test_scratch::scratch_file("tune-8701-autre-source", ".wav");
+    // Une piste d'une autre source : un WAV téléversé, donc DANS le dossier
+    // des téléversements (seul endroit d'où un téléversement se lit).
+    let televersements = crate::chemins_de_travail::racine_des_televersements();
+    std::fs::create_dir_all(&televersements).unwrap();
+    let wav = televersements.join(format!(
+        "tune-8701-autre-source-{}-{}.wav",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let silence = vec![0u8; SR as usize * 4];
     std::fs::write(
-        &*wav,
+        &wav,
         [
             crate::audio::wav::build_wav_header_with_data_size(2, SR, 16, silence.len() as u32)
                 .to_vec(),
@@ -476,6 +486,7 @@ async fn l_arret_et_une_autre_source_liberent_le_fichier_8701() {
         "la piste TIDAL quittée pour une autre source reste épinglée"
     );
     let _ = std::fs::remove_file(&chemin);
+    let _ = std::fs::remove_file(&wav);
 }
 
 /// Une zone locale du banc, servie par une sortie factice inscrite sous son

@@ -13,6 +13,8 @@ pub(crate) mod cles_api;
 mod config;
 // Fil 2145 : « Oublier ce partage » retire ses racines par le MEME chemin.
 pub(crate) use config::{pistes_qui_partiraient, retirer_un_dossier};
+// Sécurité — l'onboarding déclare des racines par la même garde.
+pub(crate) use config::refus_de_racine_de_musique;
 mod config_backup;
 mod convert;
 mod database;

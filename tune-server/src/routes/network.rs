@@ -3194,8 +3194,29 @@ struct TestMountRequest {
 
 async fn test_mount(
     _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
     Json(body): Json<TestMountRequest>,
 ) -> impl IntoResponse {
+    // Sécurité — la route sondait n'importe quel dossier de la
+    // machine (existence, lisibilité, nombre d'entrées) ; `RequireAdmin` laisse
+    // passer quand l'authentification est éteinte. Confinée aux dossiers de
+    // musique et aux racines de montage.
+    let mut racines = crate::routes::confinement::racines_musicales(&state);
+    racines.extend(
+        racines_des_montages(&state)
+            .iter()
+            .map(|r| crate::routes::confinement::texte(r)),
+    );
+    if let Err(refus) = crate::routes::confinement::sous_les_racines(&body.path, &racines) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "path_outside_allowed_roots",
+                "message": crate::routes::confinement::message("path", refus),
+            })),
+        )
+            .into_response();
+    }
     let path = std::path::Path::new(&body.path);
     let exists = path.exists();
     let is_dir = path.is_dir();
@@ -3217,6 +3238,7 @@ async fn test_mount(
         "readable": readable,
         "file_count": file_count,
     }))
+    .into_response()
 }
 
 async fn get_share_detail(
@@ -4444,5 +4466,30 @@ mod tests_smbclient_absent_8628 {
         let body = smb_scan_error("en", "nas", "boom", false).unwrap();
         assert!(body.get("code").is_none());
         assert!(body["error"].as_str().unwrap().contains("boom"));
+    }
+}
+
+/// Sécurité — `POST /network/test-mount` ne sonde que ses racines.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::banc;
+
+    #[tokio::test]
+    async fn la_sonde_de_montage_ne_sort_pas_de_ses_racines() {
+        let b = banc();
+        let sonder = |chemin: String| {
+            test_mount(
+                crate::auth::RequireAdmin,
+                State(b.state.clone()),
+                Json(TestMountRequest { path: chemin }),
+            )
+        };
+        for chemin in [b.remontee(""), "/etc".to_string()] {
+            let r = sonder(chemin.clone()).await.into_response();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{chemin} a été sondé");
+        }
+        let r = sonder(b.dedans("/Album")).await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
     }
 }

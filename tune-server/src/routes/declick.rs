@@ -160,6 +160,16 @@ async fn start_job(
     headers: axum::http::HeaderMap,
     Json(body): Json<StartJobRequest>,
 ) -> Result<axum::response::Response, AppError> {
+    // Sécurité — même garde que le convertisseur, au même endroit
+    // (avant toute autre) : un `sources[].path` reste dans les dossiers de
+    // musique.
+    let racines = crate::routes::confinement::racines_musicales(&state);
+    for src in &body.sources {
+        if let Some(ref p) = src.path {
+            crate::routes::confinement::exiger("sources[].path", p, &racines)?;
+        }
+    }
+
     // Premium gate FIRST.
     if let Err(resp) =
         crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::Declick)
@@ -549,4 +559,40 @@ fn build_zip(dir: &Path) -> Result<Vec<u8>, String> {
     }
 
     Ok(buf)
+}
+
+/// Sécurité — `sources[].path` reste dans les dossiers de musique.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::{banc, statut};
+
+    async fn demander(b: &crate::routes::confinement::Banc, chemin: &str) -> StatusCode {
+        let corps: StartJobRequest =
+            serde_json::from_value(serde_json::json!({ "sources": [{ "path": chemin }] })).unwrap();
+        statut(
+            start_job(
+                State(b.state.clone()),
+                axum::http::HeaderMap::new(),
+                Json(corps),
+            )
+            .await,
+        )
+    }
+
+    #[tokio::test]
+    async fn une_source_hors_des_dossiers_de_musique_est_refusee() {
+        let b = banc();
+        for chemin in [b.remontee("/secret.flac"), b.remontee("")] {
+            assert_eq!(
+                demander(&b, &chemin).await,
+                StatusCode::BAD_REQUEST,
+                "{chemin} est hors des dossiers de musique et n'a pas été refusé"
+            );
+        }
+        assert_ne!(
+            demander(&b, &b.dedans("/Album")).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
 }
