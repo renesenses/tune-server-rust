@@ -10,6 +10,7 @@ mod backup;
 pub(crate) mod capacites;
 // Réglages ▸ Clés d'API (#4805, lot 1 MetaRust).
 pub(crate) mod cles_api;
+pub(crate) mod comptages_8805;
 mod config;
 // Fil 2145 : « Oublier ce partage » retire ses racines par le MEME chemin.
 pub(crate) use config::{pistes_qui_partiraient, retirer_un_dossier};
