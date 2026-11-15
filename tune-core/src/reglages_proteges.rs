@@ -51,6 +51,8 @@ const PROTEGES: &[&str] = &[
     "ha_token",
     "hue_bridge_ip",
     "hue_username",
+    // L'adresse du serveur Snapcast : le serveur lui envoie des requêtes.
+    "snapcast_host",
     "yt_dlp_path",
 ];
 

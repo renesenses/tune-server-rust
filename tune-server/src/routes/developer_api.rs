@@ -597,6 +597,17 @@ pub(crate) fn adresse_webhook_interdite(
     }
 }
 
+/// Une adresse réseau NUE : `hôte` ou `hôte:port` (nom, IPv4, IPv6 entre
+/// crochets), rien d'autre. Une intégration qui compose son URL par
+/// `http://{hôte}/chemin` ne peut alors viser que SON chemin : ni `/`, ni `?`,
+/// ni `#`, ni `@`, ni espace ou `%` pour déplacer la requête ailleurs.
+pub(crate) fn adresse_reseau_nue(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
+}
+
 fn nom_d_hote_local(nom: &str) -> bool {
     nom == "localhost"
         || [
@@ -618,6 +629,26 @@ pub(crate) fn juger_destination_resolue(
     resolution: Result<&[std::net::SocketAddr], ()>,
     moment: MomentWebhook,
     machine: &[std::net::IpAddr],
+) -> Result<DestinationWebhook, &'static str> {
+    juger_destination_resolue_avec(url, resolution, moment, machine, NomsLocaux::Refuses)
+}
+
+/// Les noms locaux (`.local`, `.lan`…) : refusés pour un webhook, admis pour
+/// une intégration du réseau local (Home Assistant répond sur
+/// `homeassistant.local`) — leurs adresses restent jugées. `localhost` est
+/// toujours refusé.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NomsLocaux {
+    Refuses,
+    Admis,
+}
+
+pub(crate) fn juger_destination_resolue_avec(
+    url: &str,
+    resolution: Result<&[std::net::SocketAddr], ()>,
+    moment: MomentWebhook,
+    machine: &[std::net::IpAddr],
+    noms_locaux: NomsLocaux,
 ) -> Result<DestinationWebhook, &'static str> {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return Err("unparseable url");
@@ -642,7 +673,11 @@ pub(crate) fn juger_destination_resolue(
         });
     }
     let nom = hote.trim_end_matches('.').to_ascii_lowercase();
-    if nom_d_hote_local(&nom) {
+    let refuse = match noms_locaux {
+        NomsLocaux::Refuses => nom_d_hote_local(&nom),
+        NomsLocaux::Admis => nom == "localhost" || nom.ends_with(".localhost"),
+    };
+    if refuse {
         return Err("local host name");
     }
     match resolution {
@@ -674,6 +709,15 @@ pub(crate) async fn juger_destination_webhook(
     url: &str,
     moment: MomentWebhook,
 ) -> Result<DestinationWebhook, &'static str> {
+    juger_destination_avec(url, moment, NomsLocaux::Refuses).await
+}
+
+/// Comme [`juger_destination_webhook`], en choisissant le sort des noms locaux.
+pub(crate) async fn juger_destination_avec(
+    url: &str,
+    moment: MomentWebhook,
+    noms_locaux: NomsLocaux,
+) -> Result<DestinationWebhook, &'static str> {
     let machine = tune_core::discovery::adresses_de_la_machine();
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return Err("unparseable url");
@@ -681,7 +725,7 @@ pub(crate) async fn juger_destination_webhook(
     let hote = parsed.host_str().unwrap_or_default().to_string();
     let litteral = hote.trim_start_matches('[').trim_end_matches(']');
     if hote.is_empty() || litteral.parse::<std::net::IpAddr>().is_ok() {
-        return juger_destination_resolue(url, Err(()), moment, &machine);
+        return juger_destination_resolue_avec(url, Err(()), moment, &machine, noms_locaux);
     }
     let port = parsed.port_or_known_default().unwrap_or(80);
     let adresses: Vec<std::net::SocketAddr> =
@@ -694,7 +738,7 @@ pub(crate) async fn juger_destination_webhook(
     } else {
         Ok(adresses.as_slice())
     };
-    juger_destination_resolue(url, resolution, moment, &machine)
+    juger_destination_resolue_avec(url, resolution, moment, &machine, noms_locaux)
 }
 
 /// Le client dédié aux webhooks : aucune redirection suivie (un 3xx vers la
@@ -1094,5 +1138,89 @@ mod destinations_webhook_tests {
             .await
             .unwrap();
         assert_eq!(reponse.status(), reqwest::StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod destinations_integration_tests {
+    use super::{MomentWebhook, NomsLocaux, adresse_reseau_nue, juger_destination_resolue_avec};
+    use std::net::SocketAddr;
+
+    fn a(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn une_integration_admet_les_noms_locaux_mais_juge_leurs_adresses() {
+        let machine = ["192.168.1.18".parse().unwrap()];
+        let url = "http://homeassistant.local:8123/api/states";
+        let lan = [a("192.168.1.20:8123")];
+        assert!(
+            juger_destination_resolue_avec(
+                url,
+                Ok(&lan),
+                MomentWebhook::Envoi,
+                &machine,
+                NomsLocaux::Admis
+            )
+            .is_ok()
+        );
+        // Le même nom pour un webhook reste refusé.
+        assert!(
+            juger_destination_resolue_avec(
+                url,
+                Ok(&lan),
+                MomentWebhook::Envoi,
+                &machine,
+                NomsLocaux::Refuses
+            )
+            .is_err()
+        );
+        for interdite in [a("127.0.0.1:8123"), a("192.168.1.18:8123")] {
+            assert!(
+                juger_destination_resolue_avec(
+                    url,
+                    Ok(&[interdite]),
+                    MomentWebhook::Envoi,
+                    &machine,
+                    NomsLocaux::Admis
+                )
+                .is_err(),
+                "{interdite}"
+            );
+        }
+        assert!(
+            juger_destination_resolue_avec(
+                "http://localhost:8123",
+                Err(()),
+                MomentWebhook::Creation,
+                &machine,
+                NomsLocaux::Admis
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn une_adresse_reseau_nue_n_a_ni_chemin_ni_requete() {
+        for ok in [
+            "localhost:1705",
+            "192.168.1.30",
+            "[fd00::4]:80",
+            "snap-server.lan",
+        ] {
+            assert!(adresse_reseau_nue(ok), "{ok}");
+        }
+        for ko in [
+            "",
+            "127.0.0.1:8888/api/v1/appliance/shutdown?",
+            "h#",
+            "u@127.0.0.1",
+            "h ost",
+            "h%2f",
+            "h\\x",
+        ] {
+            assert!(!adresse_reseau_nue(ko), "{ko}");
+        }
     }
 }

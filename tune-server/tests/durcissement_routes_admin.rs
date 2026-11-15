@@ -947,3 +947,138 @@ async fn le_refus_de_la_base_entiere_dit_quoi_faire_dans_la_langue_de_l_interfac
         );
     }
 }
+
+// ─── Intégrations : configuration réservée, la machine n'est pas une destination
+
+/// Sans authentification, l'adresse de Home Assistant ne se règle que depuis
+/// cette machine ; l'adresse de la machine elle-même est refusée, une adresse
+/// du réseau local admise.
+#[tokio::test]
+async fn l_adresse_de_home_assistant_ne_vise_jamais_la_machine() {
+    let state = new_state();
+    let chemin = "/api/v1/homeassistant/config";
+    let (st, _, rep) = appel_depuis(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::POST,
+        chemin,
+        None,
+        Some(r#"{"ha_url":"http://192.168.1.20:8123","ha_token":"x"}"#),
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "depuis le LAN : {rep}");
+    assert!(rep.contains("auth_required"), "{rep}");
+
+    for url in [
+        "http://127.0.0.1:8888",
+        "http://localhost:8888",
+        "http://[::1]:8888",
+        "http://0.0.0.0:8888",
+        "http://169.254.169.254",
+    ] {
+        let corps = format!(r#"{{"ha_url":"{url}","ha_token":"x"}}"#);
+        let (st, rep) = appel(&state, Method::POST, chemin, None, Some(&corps)).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{url} : {rep}");
+        assert!(rep.contains("ha_destination_refused"), "{url} : {rep}");
+    }
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    assert_eq!(reglages.get("ha_url").ok().flatten(), None);
+
+    let (st, rep) = appel(
+        &state,
+        Method::POST,
+        chemin,
+        None,
+        Some(r#"{"ha_url":"http://192.168.1.20:8123/","ha_token":"x"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rep}");
+    assert_eq!(
+        reglages.get("ha_url").ok().flatten().as_deref(),
+        Some("http://192.168.1.20:8123")
+    );
+}
+
+/// Une adresse de Home Assistant déjà enregistrée vers la machine n'est
+/// jamais appelée : chaque appel sortant est jugé avant de partir.
+#[tokio::test]
+async fn un_appel_home_assistant_vers_la_machine_ne_part_pas() {
+    let state = new_state();
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    reglages
+        .set("ha_url", "http://127.0.0.1:8888/api/v1/appliance/shutdown?")
+        .unwrap();
+    reglages.set("ha_token", "x").unwrap();
+    let (st, rep) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/homeassistant/entities/z/call",
+        None,
+        Some(r#"{"domain":"a","service":"b","service_data":{}}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{rep}");
+    assert!(rep.contains("ha_destination_refused"), "{rep}");
+    let (st, rep) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/homeassistant/automations/trigger",
+        None,
+        Some(r#"{"entity_id":"automation.x"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{rep}");
+    assert!(rep.contains("ha_destination_refused"), "{rep}");
+}
+
+/// Hue : sans authentification, la configuration du pont ne se règle que
+/// depuis cette machine, et seulement sous la forme `hôte[:port]` + jeton.
+#[tokio::test]
+async fn la_configuration_hue_est_reservee_et_nue() {
+    let state = new_state();
+    let chemin = "/api/v1/hue/config";
+    let corps = r#"{"hue_bridge_ip":"192.168.1.30","hue_username":"abc-DEF_1"}"#;
+    let (st, _, rep) = appel_depuis(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::POST,
+        chemin,
+        None,
+        Some(corps),
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "depuis le LAN : {rep}");
+    assert!(rep.contains("auth_required"), "{rep}");
+    for mauvais in [
+        r#"{"hue_bridge_ip":"127.0.0.1:8888/api/v1/appliance/shutdown?"}"#,
+        r#"{"hue_bridge_ip":"192.168.1.30#"}"#,
+        r#"{"hue_bridge_ip":"x@127.0.0.1"}"#,
+        r#"{"hue_username":"../../system/restart?"}"#,
+    ] {
+        let (st, rep) = appel(&state, Method::POST, chemin, None, Some(mauvais)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{mauvais} : {rep}");
+    }
+    let (st, rep) = appel(&state, Method::POST, chemin, None, Some(corps)).await;
+    assert_eq!(st, StatusCode::OK, "{rep}");
+}
+
+/// L'adresse du serveur Snapcast ne s'écrit plus par l'écriture générique des
+/// réglages sans administrateur.
+#[tokio::test]
+async fn l_adresse_snapcast_est_un_reglage_protege() {
+    let state = new_state();
+    let (st, rep) = appel(
+        &state,
+        Method::PATCH,
+        "/api/v1/system/config",
+        None,
+        Some(r#"{"snapcast_host":"192.168.1.40:1705"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{rep}");
+    assert!(rep.contains("snapcast_host"), "{rep}");
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    assert_eq!(reglages.get("snapcast_host").ok().flatten(), None);
+}
