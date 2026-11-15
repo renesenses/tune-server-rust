@@ -553,7 +553,9 @@ fn liberer_le_fichier_dash(flux: &StreamUrl) {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("tune-dash-") && n.ends_with(".mp4"));
-        if du_dash {
+        // #8701 — jamais le fichier d'une piste qu'une zone joue : le cache
+        // d'URL a pu le rendre à la sentinelle.
+        if du_dash && !crate::audio::dash_epingles::est_epingle(chemin) {
             let _ = std::fs::remove_file(p);
         }
     }

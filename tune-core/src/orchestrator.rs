@@ -2460,6 +2460,10 @@ mod tidal_cd_dash_jusqu_au_play_7266;
 /// téléchargement DASH.
 #[cfg(test)]
 mod tidal_premiere_note_7266_tests;
+/// #8701 — un saut dans une piste TIDAL DASH reprend le fichier (après le TTL
+/// du cache d'URL) ou le téléchargement en cours (sans en attendre la fin).
+#[cfg(test)]
+mod tidal_saut_8701_tests;
 
 /// #6401 — le préchargement sans blanc et la sonde de niveaux après une
 /// avance sans blanc passent par le même repli Qobuz en 16/44,1 que la
@@ -2693,6 +2697,10 @@ mod profondeur_annoncee_egale_profondeur_ecrite;
 /// texte du fichier quelles que soient les `cfg`.
 #[cfg(test)]
 mod recreation_locale_guard;
+
+// #3245 — la sortie recréée à la volée suit le réglage de sa zone.
+#[cfg(test)]
+mod recreation_exclusif_zone_3245_tests;
 
 #[cfg(test)]
 mod adoption_du_flux_pre_arme_3442;

@@ -175,10 +175,22 @@ impl PlaybackOrchestrator {
     }
 
     pub(super) async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
-        if let Some(resolu) = self.reprendre_preparation_fichier(req).await {
-            return resolu;
+        let resolu = match self.reprendre_preparation_fichier(req).await {
+            Some(resolu) => resolu,
+            None => self.resolve_stream_frais(req).await,
+        };
+        // #8701 — le fMP4 DASH de la piste que la zone joue (ou prépare,
+        // `resolve_queue_item_url`) reste servi par le cache du service tant
+        // qu'elle en a besoin : un saut, même après 4 min d'écoute, reprend ce
+        // fichier au lieu de retélécharger tous les segments. Toute autre
+        // source (Qobuz, bibliothèque, radio…) libère la place.
+        if let Ok(ref r) = resolu {
+            crate::audio::dash_epingles::noter_la_piste_resolue(
+                req.zone_id,
+                Some(r.origin_url.as_deref().unwrap_or(&r.url)),
+            );
         }
-        self.resolve_stream_frais(req).await
+        resolu
     }
 
     pub(super) async fn resolve_stream_frais(
@@ -445,6 +457,44 @@ impl PlaybackOrchestrator {
         // ici : une seule écriture pour les deux chemins.
         let effectif = crate::config::local_exclusive_mode_status(&backend, demande).effective;
         (effectif, backend)
+    }
+
+    /// #3245 — le mode exclusif de la sortie locale RECRÉÉE à la volée pour
+    /// `device_id`, réglage de sa ZONE compris.
+    ///
+    /// #8348 a fait du mode exclusif un réglage de zone
+    /// (`zone_<id>_exclusive_mode`, absent = la machine), lu aux deux sites qui
+    /// enregistrent une sortie locale (démarrage et rescan). Le troisième site,
+    /// `recreate_local_and_play`, ne lisait que [`Self::reglages_sortie_locale`],
+    /// c'est-à-dire la MACHINE : une zone réglée « partagé » repartait en
+    /// exclusif dès que sa sortie était recréée (appareil éteint au démarrage,
+    /// retiré puis retrouvé), parce que la case de machine avait été cochée pour
+    /// un autre appareil. C'est le débordement que ce ticket décrit.
+    ///
+    /// Sans réglage de zone, rien ne change : la valeur de machine passe telle
+    /// quelle. Avec un réglage de zone, la contrainte de plateforme reste
+    /// appliquée sur le backend de ce démarrage (ASIO sous Windows reste
+    /// exclusif par nature) ; le témoin « armé par ASIO » (#5353) ne concerne
+    /// que la demande de MACHINE et ne touche pas une demande de zone
+    /// (`temoin_asio_pour_la_demande`).
+    pub fn exclusif_de_la_sortie_recreee(
+        &self,
+        device_id: &str,
+        backend: &str,
+        exclusif_machine: bool,
+    ) -> crate::config::DemandeDExclusifDeZone {
+        let valeur = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .get_by_device_id(device_id)
+            .ok()
+            .flatten()
+            .and_then(|zone| zone.id)
+            .and_then(|zone_id| {
+                crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+                    .get(&crate::config::cle_exclusif_de_zone(zone_id))
+                    .ok()
+                    .flatten()
+            });
+        exclusif_recree_selon_la_zone(backend, valeur.as_deref(), exclusif_machine)
     }
 
     /// La position de lecture de cette zone est-elle ENTRETENUE ?
@@ -1140,5 +1190,26 @@ impl PlaybackOrchestrator {
                 )
                 .ok();
         }
+    }
+}
+
+/// #3245 — règle pure de [`PlaybackOrchestrator::exclusif_de_la_sortie_recreee`].
+///
+/// `exclusif_machine` est l'effectif déjà résolu pour la machine
+/// (`reglages_sortie_locale`). Il est rendu tel quel quand la zone n'a pas de
+/// réglage. Sinon, la demande de la zone remplace celle de la machine, et la
+/// contrainte de plateforme du backend est réappliquée.
+pub(crate) fn exclusif_recree_selon_la_zone(
+    backend: &str,
+    valeur_de_zone: Option<&str>,
+    exclusif_machine: bool,
+) -> crate::config::DemandeDExclusifDeZone {
+    let demande = crate::config::demande_d_exclusif_de_la_zone(valeur_de_zone, exclusif_machine);
+    if !demande.par_la_zone {
+        return demande;
+    }
+    crate::config::DemandeDExclusifDeZone {
+        demande: crate::config::local_exclusive_mode_status(backend, demande.demande).effective,
+        par_la_zone: true,
     }
 }

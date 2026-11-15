@@ -2210,3 +2210,10 @@ required-features = ["postgres"]
 [[test]]
 name = "radios_doublons_7773"
 path = "tests/radios_doublons_7773.rs"
+
+# #8668 — la carte des pays : pays d'édition lu sur MusicBrainz (balise
+# prioritaire) et pays de chaque album pour la carte qui suit les filtres.
+# Jumeau PostgreSQL `pg_8668`.
+[[test]]
+name = "pays_edition_8668"
+path = "tests/pays_edition_8668.rs"
