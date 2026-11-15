@@ -682,13 +682,17 @@ impl PlaybackOrchestrator {
         // après un redémarrage ne l'a pas : UNE lecture de `track/get`, et
         // seulement quand le gain servira (ReplayGain armé, zone hors PURE).
         if service_name == "qobuz"
+            && crate::audio::replaygain::services_enabled(&self.db)
             && !crate::audio::replaygain::service_contourne(&self.db, req.zone_id, req.piste_rg())
             && crate::audio::replaygain::services::lire("qobuz", source_id).is_none()
             && crate::audio::replaygain::ReplayGainSettings::load(&self.db).mode
                 != crate::audio::replaygain::ReplayGainMode::Off
             && !self.zone_audiophile(req.zone_id)
         {
-            let lu = svc.get_track(source_id).await.is_ok();
+            let lu =
+                tokio::time::timeout(std::time::Duration::from_secs(3), svc.get_track(source_id))
+                    .await
+                    .is_ok_and(|resultat| resultat.is_ok());
             debug!(
                 source_id,
                 lu,

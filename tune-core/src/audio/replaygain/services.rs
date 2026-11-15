@@ -16,8 +16,11 @@
 //!   réponses qui donnent l'URL du flux ; `replayGain` / `peak` sur l'objet
 //!   piste de l'API v1.
 //!
-//! Ce module les RETIENT au passage, dans un registre du processus, sans
-//! aucun appel supplémentaire, et rend le gain au même calcul que le local
+//! Ce module les retient au passage dans un registre du processus et rend
+//! le gain au même calcul que le local. À froid, la résolution Qobuz peut
+//! relire les métadonnées (trois secondes au plus), seulement si l'option
+//! dédiée est activée et que le gain peut s'appliquer.
+//! Le calcul est partagé avec les pistes locales
 //! ([`super::gain_factor_with_peak`]) : mode piste ou album, pré-gain,
 //! anti-écrêtage par le pic. Une donnée absente laisse la piste à 1,0 —
 //! exactement le comportement d'avant. PURE reste gardé par les appelants,

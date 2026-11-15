@@ -88,7 +88,7 @@ fn le_chemin_montre_le_replaygain_publie_par_qobuz_8689() {
     let etape = etape_replaygain(&sp)
         .unwrap_or_else(|| panic!("#8689 : aucune étape ReplayGain pour un titre Qobuz : {sp}"));
     assert_eq!(etape["gain_db"].as_f64(), Some(-8.0), "{sp}");
-    assert_eq!(etape["source"], "streaming_service", "{sp}");
+    assert_eq!(etape["gain_source"], "streaming_service", "{sp}");
 }
 
 #[test]

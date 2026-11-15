@@ -240,3 +240,24 @@ fn les_services_8689_restent_desactives_par_defaut_et_se_desactivent() {
         .unwrap();
     assert_eq!(facteur_de_lecture(&db, piste), 1.0, "désactivation");
 }
+
+/// Valeurs techniques relevées sur une réponse Qobuz réelle le 15/11,
+/// sans donnée de compte ni URL de lecture.
+#[test]
+fn qobuz_reponse_reelle_8689_gain_positif_et_pic_restent_proteges() {
+    let gains = GainsDuService::depuis_qobuz(&json!({
+        "audio_info": { "replaygain_track_gain": 2.53, "replaygain_track_peak": 0.666412 }
+    }))
+    .unwrap();
+    noter("qobuz", "8689-reponse-reelle", gains);
+    let db = base("track", "0");
+    let f = facteur_de_lecture(
+        &db,
+        PisteRg::new(None, Some("qobuz"), Some("8689-reponse-reelle")),
+    );
+    let borne = 1.0 / (0.666412 * 10f64.powf(3.0 / 20.0));
+    assert!(
+        (f - borne).abs() < 1e-12,
+        "le gain publié doit respecter le pic et la réserve"
+    );
+}

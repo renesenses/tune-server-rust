@@ -5939,6 +5939,23 @@ mod replaygain_source_tests {
     }
 
     #[tokio::test]
+    async fn services_replaygain_8689_desactives_par_defaut_et_persistes() {
+        let state = etat();
+        let cle = tune_core::audio::replaygain::SERVICES_ENABLED_KEY;
+        assert_eq!(config_de(&state).await[cle], false);
+        patch(&state, serde_json::json!({cle: true})).unwrap();
+        assert_eq!(config_de(&state).await[cle], true);
+        assert!(tune_core::audio::replaygain::services_enabled(
+            &state.backend
+        ));
+        patch(&state, serde_json::json!({cle: false})).unwrap();
+        assert_eq!(config_de(&state).await[cle], false);
+        assert!(!tune_core::audio::replaygain::services_enabled(
+            &state.backend
+        ));
+    }
+
+    #[tokio::test]
     async fn les_trois_modes_voyagent_dans_get_config() {
         let state = etat();
         let settings = SettingsRepo::with_backend(state.backend.clone());
