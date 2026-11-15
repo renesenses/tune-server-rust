@@ -622,6 +622,74 @@ pub fn refus_sans_authentification(message: &str) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// Sécurité — l'adresse est-elle CETTE machine ? Bouclage IPv4
+/// (`127.0.0.0/8`), IPv6 (`::1`) et la forme IPv4 d'une socket à double pile
+/// (`::ffff:127.x`). Le réseau local n'en fait PAS partie.
+pub fn adresse_de_cette_machine(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// Sécurité — garde des routes qui LISENT ou REMPLACENT la base
+/// entière (export, import, sauvegarde chiffrée, restauration).
+///
+/// Authentification active : rien de plus ici, `RequireAdmin` (à placer
+/// AVANT cet extracteur) exige déjà un jeton administrateur. Authentification
+/// coupée : `RequireAdmin` laisse passer tout le réseau, donc seule une
+/// requête venue de cette machine passe. L'adresse est celle de la
+/// CONNEXION (`ConnectInfo`, posé par `aiguillage_des_flux`), jamais un
+/// en-tête ; absente, la réponse est non. Une requête rejouée par le relais
+/// ou l'écoute directe (vue de 127.0.0.1, émise ailleurs) n'est jamais locale.
+pub struct BaseEntiereDepuisCetteMachine;
+
+impl FromRequestParts<AppState> for BaseEntiereDepuisCetteMachine {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if authentification_active(state) {
+            return Ok(Self);
+        }
+        let relayee = crate::garde_du_relais::requete_relayee(&parts.headers);
+        // L'extracteur `ConnectInfo` lit l'extension posée par
+        // `aiguillage_des_flux` (et `MockConnectInfo` sous test) ; absente,
+        // il échoue et la requête n'est pas locale.
+        let locale =
+            <ConnectInfo<std::net::SocketAddr> as FromRequestParts<AppState>>::from_request_parts(
+                parts, state,
+            )
+            .await
+            .is_ok_and(|ConnectInfo(pair)| adresse_de_cette_machine(pair.ip()));
+        if locale && !relayee {
+            return Ok(Self);
+        }
+        tracing::warn!(
+            chemin = %parts.uri.path(),
+            relayee,
+            "base_entiere_refusee_hors_machine_sans_authentification"
+        );
+        // Une phrase lisible, dans la langue de l'interface
+        // (`Accept-Language`, repli anglais), avec sa clé : le client web
+        // l'affiche telle quelle (contrat de `crate::message_api`).
+        let lang = crate::i18n::lang_from_header(&parts.headers);
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(crate::message_api::avec_message_en(
+                json!({ "error": "auth_required", "code": "auth_required" }),
+                &lang,
+                "api.database.localOnly",
+                &[],
+            )),
+        ))
+    }
+}
+
 impl FromRequestParts<AppState> for RequireAdmin {
     type Rejection = (StatusCode, Json<Value>);
 
