@@ -242,6 +242,11 @@ tune-core = { path = "../tune-core", default-features = false, features = [
 ] }
 
 # #7642 — un profil de correction de pièce appliqué atteint le DSP de la zone.
+# #8684 — le repli d'année doit être exécuté malgré autotests = false.
+[[test]]
+name = "annee_repli_album"
+path = "tests/annee_repli_album.rs"
+
 [[test]]
 name = "correction_de_piece_appliquee_7642"
 path = "tests/correction_de_piece_appliquee_7642.rs"

@@ -1101,7 +1101,9 @@ impl PlaybackOrchestrator {
                 stream_id: flux_adopte.clone(),
                 ..track
                     .as_ref()
-                    .map(crate::playback::NowPlaying::from_track)
+                    .map(|piste| {
+                        crate::playback::NowPlaying::from_track_avec_album(piste, &self.db)
+                    })
                     .unwrap_or_default()
             }
         } else {
@@ -1143,7 +1145,9 @@ impl PlaybackOrchestrator {
                 .source_id
                 .as_deref()
                 .and_then(|uri| self.piste_de_bibliotheque_designee_par_l_uri(uri))
-                .map(|(_, piste)| crate::playback::NowPlaying::from_track(&piste))
+                .map(|(_, piste)| {
+                    crate::playback::NowPlaying::from_track_avec_album(&piste, &self.db)
+                })
                 .unwrap_or_default();
             // Ce que le flux pré-armé a réellement servi prime ; la fiche de
             // bibliothèque ne comble que son absence.

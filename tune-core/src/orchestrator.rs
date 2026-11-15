@@ -2737,3 +2737,5 @@ mod plafond_16_bits_service_8188_tests;
 
 #[cfg(test)]
 mod format_m4a_sink_8722_tests;
+#[cfg(test)]
+mod reprise_dlna_701_8738_tests;
