@@ -5,7 +5,6 @@ use serde_json::{Value, json};
 
 use tracing::{info, warn};
 
-use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;

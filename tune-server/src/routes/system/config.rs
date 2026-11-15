@@ -8,10 +8,8 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
-use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
-use tune_core::db::zone_repo::ZoneRepo;
 
 use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSourceMode};
 
