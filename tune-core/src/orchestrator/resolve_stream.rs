@@ -3668,15 +3668,7 @@ mod replaygain_oaat_8689 {
                     .unwrap();
                 assert_eq!(&entete[..4], b"RIFF");
                 assert!(entete.len() <= 80);
-                let mut attendu = brut.pcm_bytes();
-                if actif && !pure && !strict {
-                    crate::audio::replaygain::apply_gain_pcm(
-                        &mut attendu,
-                        brut.bit_depth,
-                        10f64.powf(-6.0 / 20.0),
-                    );
-                    assert_ne!(attendu, brut.pcm_bytes());
-                }
+                let attendu = brut.pcm_bytes();
                 let mut recu = Vec::new();
                 while recu.len() < attendu.len() {
                     match tokio::time::timeout(Duration::from_secs(10), session.recv_chunk()).await
@@ -3686,10 +3678,36 @@ mod replaygain_oaat_8689 {
                     }
                 }
                 assert_eq!(recu.len(), attendu.len(), "PCM complet attendu");
-                assert!(
-                    recu == attendu,
-                    "#8689 : le WAV OAAT ignore le gain ou ses gardes : source={source}, actif={actif}, pure={pure}, strict={strict}"
-                );
+                if actif && !pure && !strict {
+                    // TPDF : au plus 1 LSB de bruit + 0,5 LSB d'arrondi.
+                    // Sa graine dépend du bloc : comparer les valeurs, pas
+                    // le bruit d'un tampon entier à celui des blocs réseau.
+                    assert_ne!(recu, attendu, "le gain doit modifier le signal");
+                    let largeur = usize::from(brut.bit_depth / 8);
+                    let facteur = 10f64.powf(-6.0 / 20.0);
+                    for (i, (octets, original)) in recu
+                        .chunks_exact(largeur)
+                        .zip(brut.samples_i32.iter())
+                        .enumerate()
+                    {
+                        let obtenu = match largeur {
+                            2 => i16::from_le_bytes([octets[0], octets[1]]) as i32,
+                            3 => i32::from_le_bytes([0, octets[0], octets[1], octets[2]]) >> 8,
+                            4 => i32::from_le_bytes(octets.try_into().unwrap()),
+                            _ => panic!("profondeur inattendue"),
+                        };
+                        let ideal = *original as f64 * facteur;
+                        assert!(
+                            (obtenu as f64 - ideal).abs() <= 1.51,
+                            "#8689 : gain absent ou incorrect dans le WAV OAAT : source={source}, échantillon={i}, obtenu={obtenu}, idéal={ideal}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        recu == attendu,
+                        "#8689 : garde ignorée dans le WAV OAAT : source={source}, actif={actif}, pure={pure}, strict={strict}"
+                    );
+                }
                 orch.streamer.remove_session(&sid).await;
             }
         }
