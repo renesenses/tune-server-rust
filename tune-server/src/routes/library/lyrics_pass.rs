@@ -149,7 +149,12 @@ pub(super) async fn lyrics_fetch(State(state): State<AppState>) -> impl IntoResp
         let local_tasks = bg_tasks.clone();
         let local = tokio::task::spawn_blocking(move || {
             lyrics_pass::run_local_index(&local_db, 0, |done, total| {
-                local_tasks.update_progress(TASK_ID, done as u64, total as u64, "Fichiers .lrc");
+                local_tasks.update_progress(
+                    TASK_ID,
+                    done as u64,
+                    total as u64,
+                    crate::background_tasks::Phase::LrcFiles,
+                );
             })
         })
         .await
@@ -195,7 +200,7 @@ pub(super) async fn lyrics_fetch(State(state): State<AppState>) -> impl IntoResp
                     TASK_ID,
                     r.requested as u64,
                     r.requested.max(1) as u64,
-                    "LRCLIB",
+                    crate::background_tasks::Phase::Source("LRCLIB"),
                 );
             },
             |cand| {
@@ -313,7 +318,7 @@ pub(super) async fn lyrics_write(State(state): State<AppState>) -> impl IntoResp
                         WRITE_TASK_ID,
                         r.written as u64,
                         r.examined.max(1) as u64,
-                        "Fichiers",
+                        crate::background_tasks::Phase::Files,
                     );
                 },
             )

@@ -12,7 +12,9 @@
 //!    ├─ réponse estimée à la place d'écoute (somme modale + son direct)
 //!    └─ correction : `correction::proposer` (C2) avec des bornes PLUS
 //!       serrées qu'une mesure ([`BANDES_MAX_ESTIMATION`],
-//!       [`COUPE_MAX_DB_ESTIMATION`]), coupes seules, marquée estimation
+//!       [`COUPE_MAX_DB_ESTIMATION`]), coupes seules, marquée estimation ;
+//!       en « mode expert » (#8332), demandé explicitement, les maxima
+//!       remontent à ceux d'une mesure, les défauts restent prudents
 //! ```
 //!
 //! Module pur : aucune E/S, aucun son. Le modèle idéalise la pièce (murs
@@ -79,6 +81,46 @@ pub const COUPE_MAX_DB_ESTIMATION: f64 = 6.0;
 /// Les défauts, sous les maxima.
 pub const BANDES_DEFAUT_ESTIMATION: usize = 3;
 pub const COUPE_DEFAUT_DB_ESTIMATION: f64 = 4.0;
+
+/// Ce que dit en plus une proposition faite en mode expert (#8332).
+pub const AVERTISSEMENT_EXPERT: &str = "mode expert : bornes relevées à celles d'une mesure sur une estimation sans micro ; correction valable à la place d'écoute seulement, à vérifier à l'oreille ou au micro";
+
+/// Les bornes d'une demande de correction sur une estimation, que l'écran
+/// lit dans la simulation au lieu de les recopier (#8332). Le mode expert
+/// relève les maxima jusqu'à ceux d'une mesure, jamais les défauts.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct BornesEstimation {
+    pub bandes_defaut: usize,
+    pub coupe_defaut_db: f64,
+    pub bandes_max: usize,
+    pub coupe_max_db: f64,
+}
+
+impl BornesEstimation {
+    pub fn pour(expert: bool) -> Self {
+        Self {
+            bandes_defaut: BANDES_DEFAUT_ESTIMATION,
+            coupe_defaut_db: COUPE_DEFAUT_DB_ESTIMATION,
+            bandes_max: if expert {
+                crate::correction::BANDES_MAX
+            } else {
+                BANDES_MAX_ESTIMATION
+            },
+            coupe_max_db: if expert {
+                crate::correction::COUPE_MAX_DB
+            } else {
+                COUPE_MAX_DB_ESTIMATION
+            },
+        }
+    }
+}
+
+/// Les deux jeux de bornes, rendus avec chaque simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct BornesCorrection {
+    pub prudentes: BornesEstimation,
+    pub expert: BornesEstimation,
+}
 
 /// Ce que dit toute sortie de ce module.
 pub const AVERTISSEMENT_ESTIMATION: &str = "estimation sans micro : pièce rectangulaire, murs idéalisés et enceintes ponctuelles ; à confirmer par une mesure au micro";
@@ -231,6 +273,8 @@ pub struct Simulation {
     /// Réponse estimée à la place d'écoute, en dB relatifs à sa médiane.
     pub reponse: ReponseEstimee,
     pub avertissements: Vec<String>,
+    /// Les bornes d'une demande de correction, prudentes et expert (#8332).
+    pub bornes_correction: BornesCorrection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -478,24 +522,33 @@ pub fn simuler(entree: &Entree) -> Result<Simulation, String> {
             db,
         },
         avertissements,
+        bornes_correction: BornesCorrection {
+            prudentes: BornesEstimation::pour(false),
+            expert: BornesEstimation::pour(true),
+        },
     })
 }
 
 /// La demande de correction ramenée aux bornes d'une estimation : défauts
 /// plus bas, maxima plus bas, zone limitée à la plage simulée. Ce qui
-/// dépasse est refusé, avec le motif.
-pub fn demande_prudente(d: &DemandeCorrection) -> Result<DemandeCorrection, String> {
+/// dépasse est refusé, avec le motif. En mode `expert` (#8332), les maxima
+/// sont ceux d'une mesure ; les défauts restent prudents.
+pub fn demande_prudente(d: &DemandeCorrection, expert: bool) -> Result<DemandeCorrection, String> {
     let mut d = d.clone();
-    let bandes = d.bandes_max.unwrap_or(BANDES_DEFAUT_ESTIMATION);
-    if !(1..=BANDES_MAX_ESTIMATION).contains(&bandes) {
+    let b = BornesEstimation::pour(expert);
+    let mode = if expert { " en mode expert" } else { "" };
+    let bandes = d.bandes_max.unwrap_or(b.bandes_defaut);
+    if !(1..=b.bandes_max).contains(&bandes) {
         return Err(format!(
-            "{bandes} bandes : entre 1 et {BANDES_MAX_ESTIMATION} sur une estimation sans micro"
+            "{bandes} bandes : entre 1 et {} sur une estimation sans micro{mode}",
+            b.bandes_max
         ));
     }
-    let coupe = d.coupe_max_db.unwrap_or(COUPE_DEFAUT_DB_ESTIMATION);
-    if !coupe.is_finite() || coupe <= 0.0 || coupe > COUPE_MAX_DB_ESTIMATION {
+    let coupe = d.coupe_max_db.unwrap_or(b.coupe_defaut_db);
+    if !coupe.is_finite() || coupe <= 0.0 || coupe > b.coupe_max_db {
         return Err(format!(
-            "coupe maximale {coupe} dB : entre 0 et {COUPE_MAX_DB_ESTIMATION} dB sur une estimation sans micro"
+            "coupe maximale {coupe} dB : entre 0 et {} dB sur une estimation sans micro{mode}",
+            b.coupe_max_db
         ));
     }
     if let Some(f) = d.f_max_hz
@@ -556,18 +609,22 @@ impl Magasin {
 }
 
 /// La proposition C2 sur la réponse estimée, bornée par [`demande_prudente`]
-/// et marquée comme estimation.
+/// et marquée comme estimation (et comme mode expert, le cas échéant).
 pub fn proposer_estimation(
     sim: &Simulation,
     demande: &DemandeCorrection,
+    expert: bool,
 ) -> Result<Proposition, String> {
-    let d = demande_prudente(demande)?;
+    let d = demande_prudente(demande, expert)?;
     let mut p = proposer(&sim.reponse_log(), &d)?;
     // Le C2 parle d'une « mesure en un point » : ici, rien n'a été mesuré.
     p.avertissements
         .retain(|a| !a.contains("position du micro"));
     p.avertissements
         .insert(0, AVERTISSEMENT_ESTIMATION.to_string());
+    if expert {
+        p.avertissements.insert(1, AVERTISSEMENT_EXPERT.to_string());
+    }
     Ok(p)
 }
 
@@ -764,7 +821,7 @@ mod tests {
     #[test]
     fn la_correction_estimee_ne_fait_que_couper_sous_le_plafond_prudent() {
         let s = simuler(&salon(Surfaces::toutes(Qualite::Reflechissante))).unwrap();
-        let p = proposer_estimation(&s, &DemandeCorrection::default()).unwrap();
+        let p = proposer_estimation(&s, &DemandeCorrection::default(), false).unwrap();
         assert!(!p.bandes.is_empty(), "rien à couper sur une pièce nue");
         assert!(p.bandes.iter().all(|b| b.gain <= 0.0), "{:?}", p.bandes);
         assert!(p.gain_max_db <= 1e-9, "gain max {}", p.gain_max_db);
@@ -789,7 +846,7 @@ mod tests {
             coupe_max_db: Some(COUPE_MAX_DB_ESTIMATION),
             ..Default::default()
         };
-        let p = proposer_estimation(&s, &d).unwrap();
+        let p = proposer_estimation(&s, &d, false).unwrap();
         assert!(p.bandes.len() <= BANDES_MAX_ESTIMATION);
         assert!(p.coupe_cumulee_db >= -COUPE_MAX_DB_ESTIMATION - 1e-6);
 
@@ -817,7 +874,82 @@ mod tests {
                 "s'arrête à 300",
             ),
         ] {
-            let e = proposer_estimation(&s, &d).expect_err("plafond prudent franchi");
+            let e = proposer_estimation(&s, &d, false).expect_err("plafond prudent franchi");
+            assert!(e.contains(motif), "{e}");
+        }
+    }
+
+    /// #8332 : en mode expert, ce qu'une mesure permet (10 bandes, 12 dB)
+    /// est accepté sur une estimation ; les défauts restent prudents, la
+    /// correction ne fait toujours que couper (niveau de sortie jamais plus
+    /// haut), et elle se dit expert. Au-delà des bornes de la mesure : refus.
+    #[test]
+    fn le_mode_expert_releve_les_maxima_jusqu_a_ceux_de_la_mesure() {
+        use crate::correction::{BANDES_MAX, COUPE_MAX_DB};
+        let s = simuler(&salon(Surfaces::toutes(Qualite::Reflechissante))).unwrap();
+        let b = s.bornes_correction;
+        assert_eq!(b.prudentes, BornesEstimation::pour(false));
+        assert_eq!(b.prudentes.bandes_max, BANDES_MAX_ESTIMATION);
+        assert_eq!(b.expert.bandes_max, BANDES_MAX);
+        assert_eq!(b.expert.coupe_max_db, COUPE_MAX_DB);
+        assert_eq!(b.expert.bandes_defaut, BANDES_DEFAUT_ESTIMATION);
+        assert_eq!(b.expert.coupe_defaut_db, COUPE_DEFAUT_DB_ESTIMATION);
+
+        // Défauts inchangés en mode expert.
+        let prudente = proposer_estimation(&s, &DemandeCorrection::default(), false).unwrap();
+        let expert = proposer_estimation(&s, &DemandeCorrection::default(), true).unwrap();
+        assert_eq!(prudente.bandes, expert.bandes);
+        assert_eq!(expert.avertissements[0], AVERTISSEMENT_ESTIMATION);
+        assert_eq!(expert.avertissements[1], AVERTISSEMENT_EXPERT);
+        assert!(
+            !prudente
+                .avertissements
+                .iter()
+                .any(|a| a == AVERTISSEMENT_EXPERT)
+        );
+
+        // Aux bornes d'une mesure : accepté, coupes seules.
+        let d = DemandeCorrection {
+            bandes_max: Some(BANDES_MAX),
+            coupe_max_db: Some(COUPE_MAX_DB),
+            ..Default::default()
+        };
+        let p = proposer_estimation(&s, &d, true).unwrap();
+        assert!(p.bandes.len() <= BANDES_MAX);
+        // Plus profond que le plafond prudent : la borne est bien relevée.
+        assert!(
+            p.coupe_cumulee_db < -COUPE_MAX_DB_ESTIMATION,
+            "coupe cumulée {} dB : {:?}",
+            p.coupe_cumulee_db,
+            p.bandes
+        );
+        assert!(p.coupe_cumulee_db >= -COUPE_MAX_DB - 1e-6);
+        assert!(p.bandes.iter().all(|b| b.gain <= 0.0), "{:?}", p.bandes);
+        assert!(p.gain_max_db <= 1e-9, "gain max {}", p.gain_max_db);
+        for (m, c) in p.courbes.mesure_db.iter().zip(&p.courbes.corrigee_db) {
+            assert!(c <= &(m + 1e-9), "un creux est remonté");
+        }
+        // La même demande sans le mode expert reste refusée.
+        assert!(proposer_estimation(&s, &d, false).is_err());
+
+        // Au-delà des bornes de la mesure : refusé, même en expert.
+        for (d, motif) in [
+            (
+                DemandeCorrection {
+                    bandes_max: Some(BANDES_MAX + 1),
+                    ..Default::default()
+                },
+                "entre 1 et 10 sur une estimation sans micro en mode expert",
+            ),
+            (
+                DemandeCorrection {
+                    coupe_max_db: Some(COUPE_MAX_DB + 0.5),
+                    ..Default::default()
+                },
+                "entre 0 et 12 dB",
+            ),
+        ] {
+            let e = proposer_estimation(&s, &d, true).expect_err("borne de la mesure franchie");
             assert!(e.contains(motif), "{e}");
         }
     }

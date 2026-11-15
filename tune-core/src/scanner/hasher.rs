@@ -11,7 +11,7 @@ pub fn compute_audio_hash(path: &Path) -> Option<String> {
     // l'image par son lecteur interne.
     if let Some(lecteur) = crate::audio::iso9660::ouvrir_si_virtuel(path) {
         let mut lecteur = lecteur.ok()?;
-        let taille = lecteur.taille();
+        let taille = lecteur.longueur().ok()?;
         return empreinte_echantillonnee(&mut lecteur, taille);
     }
     let mut file = File::open(path).ok()?;

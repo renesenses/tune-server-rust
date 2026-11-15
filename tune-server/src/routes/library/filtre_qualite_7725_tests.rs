@@ -232,3 +232,77 @@ async fn max_channels_est_servi_par_la_grille_et_la_fiche_artiste_7725() {
         .collect();
     assert_eq!(lus, attendu, "fiche artiste");
 }
+
+// ---------------------------------------------------------------------------
+// #8560 (fil forum 2713) — le choix « Stéréo », pendant de « Multicanal ».
+// Sur le même banc : Stéréo rend tout album dont UNE piste a un ou deux
+// canaux. « Surround » (6 + 2) sort sous les deux choix ; « DFF 5.1 » sous
+// Multicanal seulement.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn le_filtre_stereo_exclut_le_multicanal_seul_8560() {
+    let b = banc();
+    assert_eq!(
+        b.albums_sous("stereo").await,
+        titres(&["Stéréo CD", "Surround", "DSF stéréo", "SACD ISO", "Mono"]),
+        "Stéréo doit rendre les albums dont une piste a 1 ou 2 canaux, sans l'album tout multicanal"
+    );
+    // L'album qui mêle les deux sort sous les DEUX choix.
+    assert!(b.albums_sous("multichannel").await.contains("Surround"));
+}
+
+#[tokio::test]
+async fn la_fiche_filtree_stereo_ne_rend_que_les_pistes_stereo_8560() {
+    let b = banc();
+    let id = b.ids["Surround"];
+    let filtree = json(
+        &b.app,
+        &format!("/api/v1/library/albums/{id}/tracks?quality=stereo"),
+    )
+    .await;
+    let canaux: Vec<i64> = filtree
+        .as_array()
+        .expect("tableau de pistes")
+        .iter()
+        .map(|t| t["channels"].as_i64().expect("channels"))
+        .collect();
+    assert_eq!(
+        canaux,
+        vec![2],
+        "sous Stéréo, la fiche ne garde que la piste 2 canaux : {filtree}"
+    );
+}
+
+#[tokio::test]
+async fn min_channels_est_servi_par_la_grille_et_la_fiche_artiste_8560() {
+    let b = banc();
+    let attendu: BTreeMap<String, i64> = ALBUMS
+        .iter()
+        .map(|(t, _, _, _, c)| (t.to_string(), *c.iter().min().unwrap()))
+        .collect();
+    let grille = json(&b.app, "/api/v1/library/albums?limit=100&offset=0").await;
+    let lus: BTreeMap<String, i64> = grille["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|a| {
+            (
+                a["title"].as_str().unwrap().to_string(),
+                a["min_channels"]
+                    .as_i64()
+                    .unwrap_or_else(|| panic!("grille : min_channels absent sur {a}")),
+            )
+        })
+        .collect();
+    assert_eq!(lus, attendu, "grille de la Bibliothèque");
+    let fiche = json(&b.app, "/api/v1/library/artists/1/albums").await;
+    let surround = fiche
+        .as_array()
+        .expect("tableau d'albums")
+        .iter()
+        .find(|a| a["title"] == "Surround")
+        .expect("Surround dans la fiche artiste");
+    assert_eq!(surround["min_channels"], 2, "fiche artiste : {surround}");
+    assert_eq!(surround["max_channels"], 6, "fiche artiste : {surround}");
+}

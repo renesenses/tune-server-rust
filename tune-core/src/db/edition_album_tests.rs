@@ -899,3 +899,320 @@ pub(crate) fn scenario_balises_effectives(db: &Arc<dyn DbBackend>) {
 fn balises_effectives_sur_sqlite() {
     scenario_balises_effectives(&sqlite());
 }
+
+// ---------------------------------------------------------------------------
+// #8571 (fil 2763) — réordonner les albums d'un coffret composé à la main
+// ---------------------------------------------------------------------------
+
+/// Compose un coffret À LA MAIN comme `POST /library/albums/coffret` depuis
+/// #8463 : disques à la suite dans l'ordre reçu, marqueur qui retient pour
+/// chaque disque son album (`membre`) et son ancien numéro, sous-titres,
+/// disposition tenue. `albums` : `(id, titre, dossier)`.
+fn composer_a_la_main(db: &Arc<dyn DbBackend>, albums: &[(i64, &str, &str)], titre: &str) -> i64 {
+    let mut disques = Vec::new();
+    let mut suivant = 1u32;
+    for (rang, (id, t, dossier)) in albums.iter().enumerate() {
+        let mut cas = String::new();
+        for o in numeros_de_disque(db, *id).unwrap() {
+            disques.push(coffrets_auto::DisqueRetenu {
+                n: suivant,
+                titre: t.to_string(),
+                dossier: dossier.to_string(),
+                artiste_id: None,
+                membre: Some(rang as u32),
+                disque_origine: Some(o as u32),
+            });
+            cas.push_str(&format!(" WHEN {o} THEN {suivant}"));
+            suivant += 1;
+        }
+        db.execute(
+            &format!(
+                "UPDATE tracks SET disc_number = CASE COALESCE(disc_number, 1){cas} \
+                 ELSE disc_number END WHERE album_id = {}",
+                marque(db.engine(), 1)
+            ),
+            &[id as &dyn ToSqlValue],
+        )
+        .unwrap();
+    }
+    let cible = albums[0].0;
+    let repo = AlbumRepo::with_backend(db.clone());
+    for (id, _, _) in &albums[1..] {
+        repo.absorber(cible, *id).unwrap();
+    }
+    repo.force_update_title(cible, titre).unwrap();
+    let sous_titres = coffrets_auto::poser_les_sous_titres(db, cible, &disques, titre).unwrap();
+    let m = Marqueur {
+        disques,
+        titre_compose: Some(titre.to_string()),
+        sous_titres,
+        ..Marqueur::manuel()
+    };
+    poser_marqueur_coffret(db, cible, &m).unwrap();
+    tenir_la_disposition(db, cible, &[]).unwrap();
+    cible
+}
+
+/// `(chemin, album, disque)` de chaque piste, par chemin.
+fn rangement(db: &Arc<dyn DbBackend>) -> Vec<(String, i64, i64)> {
+    let mut v: Vec<(String, i64, i64)> = db
+        .query_many_strong(
+            "SELECT file_path, album_id, COALESCE(disc_number, 1) FROM tracks",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_string().unwrap_or_default(),
+                r[1].as_i64().unwrap_or(-1),
+                r[2].as_i64().unwrap_or(-1),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn membres(o: &OrdreDuCoffret) -> Vec<(u32, &str, Vec<i32>, i64)> {
+    o.membres
+        .iter()
+        .map(|m| (m.membre, m.titre.as_str(), m.disques.clone(), m.pistes))
+        .collect()
+}
+
+fn code_ordre<T: std::fmt::Debug>(r: Result<T, RefusEdition>) -> &'static str {
+    match r {
+        Err(RefusEdition::Invalide { code, .. }) => code,
+        autre => panic!("attendu un refus, obtenu {autre:?}"),
+    }
+}
+
+fn titre_album(db: &Arc<dyn DbBackend>, id: i64) -> String {
+    AlbumRepo::with_backend(db.clone())
+        .get(id)
+        .unwrap()
+        .map(|a| a.title)
+        .unwrap_or_default()
+}
+
+pub(crate) fn scenario_ordre_du_coffret_8571(db: &Arc<dyn DbBackend>) {
+    nettoyer(db);
+    let art = artiste(db, "Pink Floyd");
+    // Un album de DEUX disques, puis deux albums d'un disque.
+    let a = album(db, "Box A", art, "/m/A");
+    for cd in 1..=2 {
+        for n in 1..=2 {
+            piste(
+                db,
+                a,
+                art,
+                n,
+                cd,
+                None,
+                None,
+                &format!("/m/A/CD{cd}/{n:02}.flac"),
+            );
+        }
+    }
+    let b = album(db, "Single B", art, "/m/B");
+    piste(db, b, art, 1, 1, None, None, "/m/B/01.flac");
+    let c = album(db, "Single C", art, "/m/C");
+    piste(db, c, art, 1, 1, None, None, "/m/C/01.flac");
+    let coffret = composer_a_la_main(
+        db,
+        &[
+            (a, "Box A", "/m/A"),
+            (b, "Single B", "/m/B"),
+            (c, "Single C", "/m/C"),
+        ],
+        "Coffret",
+    );
+    assert_eq!(coffret, a);
+    assert!(vue(db, a).ordre_coffret, "la sonde de l'écran");
+
+    let o = ordre_du_coffret(db, a).unwrap();
+    assert_eq!(
+        membres(&o),
+        vec![
+            (0, "Box A", vec![1, 2], 4),
+            (1, "Single B", vec![3], 1),
+            (2, "Single C", vec![4], 1),
+        ]
+    );
+
+    // Les REFUS, sans rien écrire.
+    let avant = rangement(db);
+    for mauvais in [vec![0, 0, 1], vec![0, 1], vec![0, 1, 2, 3], vec![0, 1, 5]] {
+        assert_eq!(
+            code_ordre(reordonner_coffret(db, a, &mauvais)),
+            "ordre_invalide",
+            "{mauvais:?}"
+        );
+    }
+    assert_eq!(rangement(db), avant, "un refus n'écrit rien");
+
+    // C en tête, puis A (ses deux disques dans leur ordre), puis B.
+    let o = reordonner_coffret(db, a, &[2, 0, 1]).unwrap();
+    assert_eq!(
+        membres(&o),
+        vec![
+            (2, "Single C", vec![1], 1),
+            (0, "Box A", vec![2, 3], 4),
+            (1, "Single B", vec![4], 1),
+        ]
+    );
+    let attendu: Vec<(String, i64, i64)> = vec![
+        ("/m/A/CD1/01.flac".into(), a, 2),
+        ("/m/A/CD1/02.flac".into(), a, 2),
+        ("/m/A/CD2/01.flac".into(), a, 3),
+        ("/m/A/CD2/02.flac".into(), a, 3),
+        ("/m/B/01.flac".into(), a, 4),
+        ("/m/C/01.flac".into(), a, 1),
+    ];
+    assert_eq!(rangement(db), attendu);
+    // Les noms de disque suivent leurs pistes.
+    assert_eq!(
+        disques(&vue(db, a)),
+        vec![
+            (1, Some("Single C"), 1),
+            (2, Some("Box A"), 2),
+            (3, Some("Box A"), 2),
+            (4, Some("Single B"), 1),
+        ]
+    );
+    // Le marqueur suit : numéros, ordre croissant, sous-titres.
+    let m = marqueur_coffret(db, a).unwrap().unwrap();
+    let vu: Vec<(u32, Option<u32>, Option<u32>)> = m
+        .disques
+        .iter()
+        .map(|d| (d.n, d.membre, d.disque_origine))
+        .collect();
+    assert_eq!(
+        vu,
+        vec![
+            (1, Some(2), Some(1)),
+            (2, Some(0), Some(1)),
+            (3, Some(0), Some(2)),
+            (4, Some(1), Some(1)),
+        ]
+    );
+    assert_eq!(m.sous_titres, vec![1, 2, 3, 4]);
+    // La disposition TENUE suit, sinon un scan rendrait l'ordre d'avant.
+    let tenue = lire_edition(db, a).unwrap();
+    assert!(tenue.disposition);
+    for p in &tenue.pistes {
+        let chemin = p.chemin.clone().unwrap_or_default();
+        let ligne = attendu.iter().find(|(c, _, _)| *c == chemin).unwrap();
+        assert_eq!(p.disque as i64, ligne.2, "{chemin}");
+    }
+    // Rejouer le même ordre ne change rien.
+    reordonner_coffret(db, a, &[2, 0, 1]).unwrap();
+    assert_eq!(rangement(db), attendu);
+
+    // DÉFAIRE : chaque album retrouve ses numéros, et le coffret redevient
+    // l'album qui l'a fondé (A), même s'il n'est plus en tête.
+    let recrees = defaire_coffret_manuel(db, a).unwrap();
+    assert_eq!(recrees.len(), 2);
+    assert_eq!(titre_album(db, a), "Box A");
+    let defait = rangement(db);
+    for (chemin, album_id, disque) in &defait {
+        if chemin.starts_with("/m/A/") {
+            assert_eq!(*album_id, a, "{defait:?}");
+            let cd: i64 = chemin["/m/A/CD".len().."/m/A/CD".len() + 1]
+                .parse()
+                .unwrap();
+            assert_eq!(*disque, cd, "{defait:?}");
+        } else {
+            assert_ne!(*album_id, a, "{defait:?}");
+            assert_eq!(*disque, 1, "{defait:?}");
+        }
+    }
+    let titres: BTreeSet<String> = recrees.iter().map(|&r| titre_album(db, r)).collect();
+    assert_eq!(
+        titres,
+        ["Single B", "Single C"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    );
+    assert_eq!(code_ordre(ordre_du_coffret(db, a)), "pas_un_coffret_manuel");
+
+    // Un coffret d'AVANT #8463 (marqueur sans `membre`) : un album par
+    // disque, comme « Défaire » le lit déjà.
+    nettoyer(db);
+    let d = album(db, "101 - Disc A", art, "/m/101A");
+    piste(db, d, art, 1, 1, None, None, "/m/101A/01.flac");
+    let e = album(db, "101 - Disc B", art, "/m/101B");
+    piste(db, e, art, 1, 1, None, None, "/m/101B/01.flac");
+    composer_a_la_main(
+        db,
+        &[
+            (d, "101 - Disc A", "/m/101A"),
+            (e, "101 - Disc B", "/m/101B"),
+        ],
+        "101",
+    );
+    let mut m = marqueur_coffret(db, d).unwrap().unwrap();
+    for x in m.disques.iter_mut() {
+        x.membre = None;
+        x.disque_origine = None;
+    }
+    poser_marqueur_coffret(db, d, &m).unwrap();
+    assert_eq!(
+        membres(&ordre_du_coffret(db, d).unwrap()),
+        vec![
+            (0, "101 - Disc A", vec![1], 1),
+            (1, "101 - Disc B", vec![2], 1)
+        ]
+    );
+    reordonner_coffret(db, d, &[1, 0]).unwrap();
+    let r = rangement(db);
+    assert!(r.contains(&("/m/101A/01.flac".into(), d, 2)), "{r:?}");
+    assert!(r.contains(&("/m/101B/01.flac".into(), d, 1)), "{r:?}");
+    let recrees = defaire_coffret_manuel(db, d).unwrap();
+    assert_eq!(titre_album(db, d), "101 - Disc A");
+    let r = rangement(db);
+    assert!(r.contains(&("/m/101A/01.flac".into(), d, 1)), "{r:?}");
+    assert!(
+        r.contains(&("/m/101B/01.flac".into(), recrees[0], 1)),
+        "{r:?}"
+    );
+
+    // Un coffret dont les disques ont changé depuis la composition, ou formé
+    // par « attacher » (aucun disque retenu) : on ne devine pas.
+    nettoyer(db);
+    let f = album(db, "Attaché", art, "/m/F");
+    piste(db, f, art, 1, 1, None, None, "/m/F/01.flac");
+    piste(db, f, art, 1, 2, None, None, "/m/F/02.flac");
+    poser_marqueur_coffret(db, f, &Marqueur::manuel()).unwrap();
+    assert_eq!(code_ordre(ordre_du_coffret(db, f)), "ordre_indisponible");
+    let g = album(db, "Box G", art, "/m/G");
+    piste(db, g, art, 1, 1, None, None, "/m/G/01.flac");
+    let h = album(db, "Box H", art, "/m/H");
+    piste(db, h, art, 1, 1, None, None, "/m/H/01.flac");
+    composer_a_la_main(db, &[(g, "Box G", "/m/G"), (h, "Box H", "/m/H")], "Box");
+    db.execute(
+        &format!(
+            "UPDATE tracks SET disc_number = 7 WHERE album_id = {} AND disc_number = 2",
+            marque(db.engine(), 1)
+        ),
+        &[&g as &dyn ToSqlValue],
+    )
+    .unwrap();
+    assert_eq!(code_ordre(ordre_du_coffret(db, g)), "ordre_indisponible");
+    assert_eq!(
+        code_ordre(reordonner_coffret(db, g, &[1, 0])),
+        "ordre_indisponible"
+    );
+    // Un album inconnu.
+    assert!(matches!(
+        ordre_du_coffret(db, h + 1000),
+        Err(RefusEdition::AlbumInconnu(_))
+    ));
+}
+
+#[test]
+fn ordre_du_coffret_8571_sur_sqlite() {
+    scenario_ordre_du_coffret_8571(&sqlite());
+}

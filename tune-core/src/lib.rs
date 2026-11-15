@@ -6,10 +6,14 @@ pub use error::TuneError;
 pub mod ai;
 pub mod alarms;
 pub mod api_analytics;
+/// #8213 — arrêt programmé de la lecture à heure fixe.
+pub mod arret_programme;
 pub mod audio;
 pub mod bandcamp_veille;
 pub mod bug_report;
 pub mod cadence;
+/// Sécurité — chemins venus d'un client : normalisation lexicale, `..` refusé.
+pub mod chemin_sur;
 pub mod chemins_de_travail;
 pub mod cles_api;
 pub mod cloud;
@@ -92,6 +96,8 @@ pub mod social;
 pub mod source_pcm;
 pub mod source_url;
 pub mod sources_physiques;
+/// Le socle « source distante » : fichiers d'un NAS lus sans montage (#8189).
+pub mod sources_reseau;
 pub mod stream_cache;
 pub mod streaming;
 mod system_sleep;

@@ -192,13 +192,16 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
          FROM (SELECT LOWER(artist_name) AS cle, MIN(artist_name) AS artist_name, \
                       COUNT(*) AS plays \
                FROM listen_history \
-               WHERE artist_name IS NOT NULL \
+               WHERE artist_name IS NOT NULL AND {d_artiste} \
                GROUP BY LOWER(artist_name) \
                ORDER BY plays DESC, cle \
                LIMIT {p1}) h \
          LEFT JOIN artists ar ON ar.id = \
               (SELECT MIN(a2.id) FROM artists a2 WHERE LOWER(a2.name) = h.cle) \
-         ORDER BY h.plays DESC, h.cle"
+         ORDER BY h.plays DESC, h.cle",
+        // #8645 — ni l'émission d'un podcast, ni l'interprète d'un titre ICY
+        // d'une ancienne ligne de radio.
+        d_artiste = tune_core::db::history_repo::ECOUTE_DE_MUSIQUE,
     );
     use tune_core::db::backend::ToSqlValue;
     let rows = state
@@ -315,7 +318,7 @@ mod images_d_artistes_de_service {
         let dans = vec!["?"; cles.len()].join(", ");
         let sql = format!(
             "SELECT LOWER(artist_name), source, MAX(source_id) FROM listen_history \
-             WHERE source_id IS NOT NULL AND source NOT IN ('local', 'radio', 'upnp') \
+             WHERE source_id IS NOT NULL AND source NOT IN ('local', 'radio', 'upnp', 'podcast') \
              AND LOWER(artist_name) IN ({dans}) \
              GROUP BY LOWER(artist_name), source"
         );

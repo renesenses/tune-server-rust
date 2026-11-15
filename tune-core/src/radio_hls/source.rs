@@ -68,6 +68,17 @@ impl Default for Reglages {
     }
 }
 
+/// #7802 — la variante plus haute que le diffuseur a REFUSÉE (403, 451)
+/// avant celle qui joue. Le repli est respecté (aucun contournement) ; il
+/// est seulement dit, pour que l'auditeur sache pourquoi son débit est bas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefusDeVariante {
+    /// La bande que la liste maîtresse déclare pour cette variante (kbit/s).
+    pub(crate) bande_kbps: u32,
+    /// Le statut HTTP du refus (403 ou 451).
+    pub(crate) statut: u16,
+}
+
 /// Ce que l'ouverture a établi, pour le lecteur et le chemin du signal.
 #[derive(Debug, Clone)]
 pub(crate) struct InfosHls {
@@ -76,6 +87,18 @@ pub(crate) struct InfosHls {
     pub(crate) codecs: Option<String>,
     /// Le débit mesuré sur les trames ADTS du premier segment.
     pub(crate) debit_kbps: Option<u32>,
+    /// #7802 — la bande que la liste maîtresse DÉCLARE pour la variante
+    /// retenue (kbit/s ; `AVERAGE-BANDWIDTH`, sinon `BANDWIDTH`, surcoût du
+    /// conteneur compris). `None` : la station est une liste média seule.
+    pub(crate) bande_kbps: Option<u32>,
+    /// #7802 — la variante plus haute refusée par le diffuseur, s'il y en a
+    /// une : le chemin du signal l'explique.
+    pub(crate) refus: Option<RefusDeVariante>,
+}
+
+/// La bande déclarée d'une variante, en kbit/s.
+fn bande_kbps(variante: &liste::Variante) -> u32 {
+    u32::try_from(variante.bande_moyenne.unwrap_or(variante.bande) / 1000).unwrap_or(u32::MAX)
 }
 
 /// Un morceau de flux élémentaire : un segment démultiplexé.
@@ -118,6 +141,46 @@ impl EchecHttp {
 
 fn refus(raison: impl std::fmt::Display) -> String {
     format!("{RADIO_HLS_UNSUPPORTED}: {raison}")
+}
+
+/// L'échec d'ouverture d'une liste média : un refus du diffuseur garde son
+/// statut, pour que le repli vers une variante plus basse puisse le dire
+/// (#7802) ; tout le reste est le texte que le lecteur reçoit.
+enum EchecOuverture {
+    Refus { statut: u16, texte: String },
+    Autre(String),
+}
+
+impl From<EchecHttp> for EchecOuverture {
+    fn from(e: EchecHttp) -> Self {
+        match e.statut {
+            Some(statut @ (403 | 451)) => Self::Refus {
+                statut,
+                texte: e.en_erreur_radio(),
+            },
+            _ => Self::Autre(e.en_erreur_radio()),
+        }
+    }
+}
+
+impl From<String> for EchecOuverture {
+    fn from(texte: String) -> Self {
+        Self::Autre(texte)
+    }
+}
+
+impl From<&str> for EchecOuverture {
+    fn from(texte: &str) -> Self {
+        Self::Autre(texte.into())
+    }
+}
+
+impl EchecOuverture {
+    fn en_texte(self) -> String {
+        match self {
+            Self::Refus { texte, .. } | Self::Autre(texte) => texte,
+        }
+    }
 }
 
 struct Http {
@@ -187,11 +250,8 @@ enum Issue {
 }
 
 impl Chargeur {
-    fn lire_liste(&self) -> Result<ListeMedia, String> {
-        let (corps, finale) = self
-            .http
-            .obtenir(&self.url_media, PLAFOND_LISTE)
-            .map_err(EchecHttp::en_erreur_radio)?;
+    fn lire_liste(&self) -> Result<ListeMedia, EchecOuverture> {
+        let (corps, finale) = self.http.obtenir(&self.url_media, PLAFOND_LISTE)?;
         match liste::lire(&String::from_utf8_lossy(&corps), &finale)? {
             Liste::Media(m) => Ok(m),
             Liste::Maitresse { .. } => {
@@ -321,7 +381,11 @@ impl Chargeur {
                 return;
             }
             let debut = Instant::now();
-            let media = match liste.take().map(Ok).unwrap_or_else(|| self.lire_liste()) {
+            let media = match liste
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| self.lire_liste().map_err(EchecOuverture::en_texte))
+            {
                 Ok(m) => {
                     echecs = 0;
                     m
@@ -521,6 +585,7 @@ impl HlsSource {
         match liste::lire(&texte, &finale).map_err(|e| format!("radio HLS: {e}"))? {
             Liste::Media(media) => {
                 Self::ouvrir_media(url, http, reglages, finale, Some(media), None)
+                    .map_err(EchecOuverture::en_texte)
             }
             Liste::Maitresse {
                 variantes,
@@ -538,6 +603,9 @@ impl HlsSource {
                     )));
                 }
                 let mut derniere_erreur = String::new();
+                // #7802 — la plus haute variante que le diffuseur a refusée
+                // (l'ordre descend) : le chemin du signal expliquera le repli.
+                let mut refus_plus_haut: Option<RefusDeVariante> = None;
                 let mut http = Some(http);
                 for (rang, variante) in ordre.iter().enumerate() {
                     let client = match http.take() {
@@ -553,17 +621,31 @@ impl HlsSource {
                         None,
                         variante.codecs.clone(),
                     ) {
-                        Ok(source) => {
+                        Ok(mut source) => {
+                            let bande = bande_kbps(variante);
+                            source.infos.bande_kbps = Some(bande);
+                            // Un plafond réglé passe les variantes trop hautes
+                            // en dernier : un refus n'explique un débit plus
+                            // bas que s'il porte sur une qualité plus haute.
+                            source.infos.refus = refus_plus_haut.filter(|r| r.bande_kbps > bande);
                             info!(
                                 bande = variante.bande,
                                 codecs = ?variante.codecs,
                                 rang,
                                 variantes = ordre.len(),
+                                repli = ?source.infos.refus,
                                 "hls_variante_retenue"
                             );
                             return Ok(source);
                         }
                         Err(e) => {
+                            if let EchecOuverture::Refus { statut, .. } = e {
+                                refus_plus_haut.get_or_insert(RefusDeVariante {
+                                    bande_kbps: bande_kbps(variante),
+                                    statut,
+                                });
+                            }
+                            let e = e.en_texte();
                             warn!(bande = variante.bande, rang, erreur = %e, "hls_variante_refusee_repli");
                             derniere_erreur = e;
                         }
@@ -581,7 +663,7 @@ impl HlsSource {
         url_media: String,
         deja_lue: Option<ListeMedia>,
         codecs: Option<String>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, EchecOuverture> {
         let mut chargeur = Chargeur {
             http,
             url_media,
@@ -598,10 +680,10 @@ impl HlsSource {
             None => chargeur.lire_liste()?,
         };
         if media.carte.is_some() {
-            return Err(refus("segments fMP4/CMAF (EXT-X-MAP)"));
+            return Err(refus("segments fMP4/CMAF (EXT-X-MAP)").into());
         }
         if media.plages {
-            return Err(refus("segments en plages d'octets (EXT-X-BYTERANGE)"));
+            return Err(refus("segments en plages d'octets (EXT-X-BYTERANGE)").into());
         }
         // Le direct démarre à quelques segments de la fin ; une liste close
         // (`EXT-X-ENDLIST`) se lit depuis le début.
@@ -621,11 +703,10 @@ impl HlsSource {
         if let Cle::Autre(methode) = &premier.cle {
             return Err(refus(format!(
                 "segments chiffrés en {methode} (DRM), que Tune ne lit pas"
-            )));
+            ))
+            .into());
         }
-        let octets = chargeur
-            .telecharger(&premier)
-            .map_err(EchecHttp::en_erreur_radio)?;
+        let octets = chargeur.telecharger(&premier)?;
         let (charge, flux, titre_id3) =
             elementaire(&mut chargeur.demux, &octets).map_err(|e| refus(e.0))?;
         chargeur.charge = charge;
@@ -637,6 +718,8 @@ impl HlsSource {
             debit_kbps: (charge == Charge::Adts)
                 .then(|| ts::debit_adts_kbps(&flux))
                 .flatten(),
+            bande_kbps: None,
+            refus: None,
         };
         info!(
             charge = ?infos.charge,

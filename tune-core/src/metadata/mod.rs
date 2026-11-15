@@ -8,6 +8,8 @@ pub mod artistes_du_pressage;
 pub mod auto_fix;
 // Les balises réellement présentes dans un fichier, lues brutes (#6124).
 pub mod balises_brutes;
+/// Réglage « Balises du classique » (#8325, ESL63P).
+pub mod balises_classique;
 pub mod batch;
 pub mod bio_batch;
 pub mod bio_segments;
@@ -15,8 +17,10 @@ pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod completude;
 pub mod credits_balises;
+// « Joue avec » de la page artiste (#7768).
 #[cfg(test)]
 mod credits_balises_tests_7766;
+pub mod credits_joue_avec;
 pub mod credits_mb;
 pub mod credits_release;
 pub mod discogs_propositions;
@@ -35,23 +39,34 @@ pub mod liens_externes;
 pub mod lyrics;
 pub mod matcher;
 pub mod musicbrainz_release;
+#[cfg(test)]
+mod oeuvre_mouvement_tests_8325;
 // Les réponses `/release/{mbid}` gardées en base (#4805, idée 3 de MetaRust).
 pub mod musicbrainz_release_cache;
 // La note d'une piste lue dans ses balises, ramenée sur 0 à 5 (#6123).
 pub mod note;
 #[cfg(test)]
 mod note_balises_6123_tests;
+// Les crédits des balises pour la musique déjà scannée (#8026).
+pub mod rattrapage_credits_balises_8026;
 pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;
 // La source d'un crédit de piste et ses témoins (#7765).
 #[cfg(test)]
 mod credits_source_7765_tests;
+// Le banc de la page artiste (#7767) : 600 000 pistes, 3 millions de crédits.
+#[cfg(test)]
+mod credits_page_artiste_banc_7767_tests;
 pub mod source_des_credits;
 pub mod suggestions;
 // Le MBID des artistes par une recherche MusicBrainz confirmée (#4805, étape C).
 pub mod artistes_par_le_reseau;
 pub mod noms_de_tri;
+/// #8090 — le pays de l'artiste, lu sur sa fiche MusicBrainz.
+pub mod pays_des_artistes;
+// #8668 — le pays d'édition des albums identifiés, lu sur MusicBrainz.
+pub mod pays_des_editions;
 pub mod tag_writer;
 /// #6463, B — la reprise des MBID d'artiste faux, par vérification MusicBrainz.
 pub mod verification_mbid_artistes;
@@ -163,15 +178,36 @@ pub(crate) fn mb_choisir_artiste(data: &serde_json::Value, wanted: &str) -> Opti
     Some(choisi.to_string())
 }
 
-/// Deux noms d'artiste désignent-ils la MÊME entrée ? À la casse et aux espaces
-/// de bord près, rien d'autre : ni accents ni ponctuation repliés
-/// (« Motorhead » ≠ « Motörhead »). Même règle que
-/// `library::artwork::artist_name_matches_exactly`.
+/// Deux noms d'artiste désignent-ils la MÊME entrée ? À la casse, aux espaces
+/// de bord et à la GRAPHIE du trait d'union et de l'apostrophe près, rien
+/// d'autre : ni accents ni autre ponctuation repliés (« Motorhead » ≠
+/// « Motörhead »). Même règle que `library::artwork::artist_name_matches_exactly`.
+///
+/// #8524 — MusicBrainz, et le site qui reprend ses noms, écrivent
+/// « Jean‐Michel Jarre » avec le trait d'union typographique U+2010 (et
+/// « Guns N’ Roses » avec U+2019) ; les balises portent celui du clavier.
+/// Ce n'est pas un autre nom, seulement un autre caractère pour le même signe :
+/// sans ce repli, Jean-Jacques Goldman ne recevait ni MBID ni portrait.
 pub(crate) fn noms_d_artiste_identiques(candidate: &str, wanted: &str) -> bool {
     let candidate = candidate.trim();
     let wanted = wanted.trim();
     // Un nom vide se « retrouve » partout : il ne départage rien.
-    !candidate.is_empty() && !wanted.is_empty() && candidate.to_lowercase() == wanted.to_lowercase()
+    !candidate.is_empty()
+        && !wanted.is_empty()
+        && graphie_de_comparaison(candidate) == graphie_de_comparaison(wanted)
+}
+
+/// Le nom en minuscules, traits d'union (U+2010, U+2011) et apostrophes
+/// (U+2018, U+2019) typographiques ramenés à leur forme ASCII.
+fn graphie_de_comparaison(nom: &str) -> String {
+    nom.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            '\u{2010}' | '\u{2011}' => '-',
+            '\u{2018}' | '\u{2019}' => '\'',
+            autre => autre,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2598,6 +2634,21 @@ fn balise_utile(tag: &lofty::tag::Tag, path: &Path) -> bool {
             })
 }
 
+/// #8679 — l'artiste que le DOSSIER donne à un fichier, par la règle même du
+/// scan ([`album_artiste_du_chemin`] : dossier de disque et variante de
+/// mixage sautés, dossiers génériques, volumes et points de montage écartés).
+///
+/// Sert à « Albums douteux » : une piste sans balise d'artiste rangée sous
+/// `…/Pink Floyd/Animals/01.flac` montre « dossier : Pink Floyd » et propose
+/// de l'écrire. `None` quand l'arborescence ne dit rien d'exploitable.
+/// Aucune lecture du disque : le chemin seul.
+pub fn artiste_du_dossier(file_path: &str) -> Option<String> {
+    let (_, artiste, _) = album_artiste_du_chemin(Path::new(file_path));
+    artiste
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+}
+
 pub(crate) fn album_artiste_du_chemin(
     path: &Path,
 ) -> (Option<String>, Option<String>, Option<u32>) {
@@ -3438,10 +3489,18 @@ fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
 /// profil de test — où le témoin de #3816 (relecture de 501 pistes) passait
 /// ici 6,5 s sur 9 et dépassait son délai de 30 s sous charge.
 fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
+    find_vorbis_comments(data, field_name, 1).into_iter().next()
+}
+
+/// #8026 — toutes les trames d'un champ, jusqu'à `max`, dans l'ordre du
+/// fichier : un FLAC qui cite deux orchestres porte deux trames ENSEMBLE.
+/// Même parcours que [`find_vorbis_comment`], qui s'arrête à la première.
+fn find_vorbis_comments(data: &[u8], field_name: &str, max: usize) -> Vec<String> {
+    let mut valeurs = Vec::new();
     let needle = format!("{}=", field_name.to_ascii_uppercase());
     let nlen = needle.len();
-    if data.len() <= nlen {
-        return None;
+    if data.len() <= nlen || max == 0 {
+        return valeurs;
     }
     // `fin` parcourt les positions du `=` final : i = fin + 1 - nlen, i >= 4.
     let mut fin = nlen + 3;
@@ -3464,10 +3523,13 @@ fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
         if let Ok(value) = std::str::from_utf8(&data[i + nlen..i + len])
             && !value.is_empty()
         {
-            return Some(value.to_string());
+            valeurs.push(value.to_string());
+            if valeurs.len() >= max {
+                break;
+            }
         }
     }
-    None
+    valeurs
 }
 
 /// Provenance d'un `dr_track` LU DANS LE TAG du fichier (#3924).
@@ -4362,6 +4424,18 @@ pub const CLE_INTERPRETE_DE_LA_PISTE: &str = "track_artist";
 /// This extracts tags like composer, conductor, lyricist, performer, remixer,
 /// ReplayGain values, MusicBrainz IDs, and other extended fields.
 pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
+    read_extended_metadata_selon(path, &balises_classique::courante())
+}
+
+/// [`read_extended_metadata`] selon un réglage « Balises du classique »
+/// explicite (#8325, ESL63P) : les témoins le passent sans toucher au miroir
+/// global. Avec [`balises_classique::BalisesClassique::default`], la lecture
+/// est exactement celle d'avant le réglage.
+pub fn read_extended_metadata_selon(
+    path: &Path,
+    classique: &balises_classique::BalisesClassique,
+) -> HashMap<String, String> {
+    use balises_classique::{BalisesClassique, STANDARD_CHEF, STANDARD_MOUVEMENT, STANDARD_OEUVRE};
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::{Accessor, ItemKey};
 
@@ -4425,9 +4499,15 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // la TIPL (producer, arranger, engineer, mix, DJ-mix) sous les mêmes
     // `ItemKey`, MP4 ses atomes `----:com.apple.iTunes:*`. Elles deviennent
     // des lignes `track_credits` au scan (`credits_balises`).
+    // Le chef par lofty (CONDUCTOR, TPE3, atome MP4) seulement si le réglage
+    // « Balises du classique » garde le nom standard (défaut).
+    if BalisesClassique::lit_standard(&classique.conductor, STANDARD_CHEF)
+        && let Some(v) = toutes(ItemKey::Conductor)
+    {
+        meta.insert("conductor".into(), v);
+    }
     for (cle, item) in [
         ("composer", ItemKey::Composer),
-        ("conductor", ItemKey::Conductor),
         ("lyricist", ItemKey::Lyricist),
         ("writer", ItemKey::Writer),
         ("arranger", ItemKey::Arranger),
@@ -4459,6 +4539,30 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     }
     if let Some(v) = get(ItemKey::ContentGroup) {
         meta.insert("grouping".into(), v);
+    }
+    // #8325 — l'ŒUVRE et le MOUVEMENT, pour les facettes et les colonnes de
+    // la Collection. lofty les range sous `Work` / `Movement` : Vorbis WORK et
+    // MOVEMENTNAME, ID3v2 `TXXX:WORK` et MVNM, MP4 `©wrk` et `©mvn`, APE
+    // WORKTITLE et MOVEMENTNAME. Mêmes clés que l'assistant IA, qui ne les
+    // remplit que quand le fichier n'en dit rien. GROUPING reste aussi sous
+    // `grouping`.
+    // iTunes 12.5 et suivants écrivent l'œuvre dans la trame ID3 TIT1 et le
+    // regroupement dans GRP1 : quand GRP1 est présent, TIT1 est l'œuvre
+    // (c'est la désambiguïsation que lofty documente pour `ContentGroup`).
+    // Sans GRP1, TIT1 reste un regroupement quelconque et n'est pas repris.
+    // Réglage « Balises du classique » : WORK / MOVEMENTNAME retirés de leur
+    // liste coupent ces lectures standard.
+    if BalisesClassique::lit_standard(&classique.work, STANDARD_OEUVRE)
+        && let Some(v) = get(ItemKey::Work).or_else(|| {
+            get(ItemKey::AppleId3v2ContentGroup).and_then(|_| get(ItemKey::ContentGroup))
+        })
+    {
+        meta.insert("work".into(), v);
+    }
+    if BalisesClassique::lit_standard(&classique.movement, STANDARD_MOUVEMENT)
+        && let Some(v) = get(ItemKey::Movement)
+    {
+        meta.insert("movement".into(), v);
     }
     if let Some(v) = get(ItemKey::FlagCompilation) {
         meta.insert("compilation".into(), v);
@@ -4528,8 +4632,22 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
                 .iter()
                 .chain(balises_brutes::CLES_ANNEE_ORIGINALE.iter())
                 .chain(std::iter::once(&balises_brutes::CLE_VERSION))
-                .chain(credits_balises::CLES_ENSEMBLE.iter())
                 .filter_map(|k| find_vorbis_comment(h, k).map(|v| (k.to_string(), v)))
+                // #8026 — TOUTES les trames ENSEMBLE / ORCHESTRA : un fichier
+                // qui cite deux orchestres les crédite tous les deux.
+                // Réglage « Balises du classique » : les clés libres des
+                // quatre rôles (par défaut ENSEMBLE, ORCHESTRA, CHOIR).
+                .chain(
+                    classique
+                        .cles_brutes()
+                        .into_iter()
+                        .chain(std::iter::once(credits_balises::CLE_BAND.to_string()))
+                        .flat_map(|k| {
+                            find_vorbis_comments(h, &k, usize::MAX)
+                                .into_iter()
+                                .map(move |v| (k.clone(), v))
+                        }),
+                )
                 .collect(),
             None => balises_brutes::lire_balises_du_fichier(path)
                 .map(|b| b.paires())
@@ -4547,7 +4665,25 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
         // l'orchestre (ENSEMBLE, ORCHESTRA), la liste des musiciens ID3v2.4
         // (TMCL, « instrument: nom »), et l'arrangeur d'un MP4. Lu dans les
         // mêmes clés brutes, sans E/S de plus.
-        credits_balises::completer_par_les_cles_brutes(&mut meta, &brutes);
+        credits_balises::completer_par_les_cles_brutes_selon(
+            &mut meta,
+            &brutes,
+            &classique.ensemble,
+        );
+        // Les clés libres du chef, de l'œuvre et du mouvement (aucune par
+        // défaut).
+        classique.completer_par_les_noms_libres(&mut meta, &brutes);
+        // #8325 — BAND, quand il n'est ni l'artiste d'album (TPE2 chez
+        // foobar2000 / Mp3tag) ni celui de la piste : l'orchestre d'un classique.
+        credits_balises::completer_par_band_selon(
+            &mut meta,
+            &brutes,
+            &[
+                get(ItemKey::AlbumArtist).as_deref(),
+                get(ItemKey::TrackArtist).as_deref(),
+            ],
+            classique.band,
+        );
     }
     if let Some(v) = get(ItemKey::OriginalMediaType)
         .or_else(|| find_vorbis_comment(header.as_deref()?, "SOURCE"))
@@ -5488,6 +5624,50 @@ mod tests {
             mb_choisir_artiste(&reponse_mb_christophe(), "Jean‐Christophe"),
             Some("0df890e1-f4f2-4b21-a413-cd8af1af32d8".to_string())
         );
+    }
+
+    /// #8524 — réponse `ws/2/artist?query=artist:"Jean-Jacques Goldman"`
+    /// mesurée le 11/11/2026 (alias réduits) : le seul candidat porte le trait
+    /// d'union U+2010, et aucun alias n'a celui du clavier.
+    fn reponse_mb_goldman() -> serde_json::Value {
+        serde_json::json!({
+            "artists": [
+                {"id": "0b3819e6-3fa1-4a50-a84c-f2a62643185d", "score": 100,
+                 "name": "Jean\u{2010}Jacques Goldman",
+                 "aliases": [{"name": "JJG"}, {"name": "Jean Jacques Goldman"},
+                             {"name": "Jean-Jaques Goldman"}, {"name": "JJ Goldman"}]}
+            ]
+        })
+    }
+
+    #[test]
+    fn mb_le_trait_d_union_typographique_est_le_meme_nom_8524() {
+        assert_eq!(
+            mb_choisir_artiste(&reponse_mb_goldman(), "Jean-Jacques Goldman").as_deref(),
+            Some("0b3819e6-3fa1-4a50-a84c-f2a62643185d"),
+            "#8524 — « Jean-Jacques Goldman » (U+002D) doit recevoir le MBID de \
+             « Jean\u{2010}Jacques Goldman » (U+2010)"
+        );
+        assert!(noms_d_artiste_identiques(
+            "Jean\u{2010}Michel Jarre",
+            "jean-michel jarre"
+        ));
+        assert!(noms_d_artiste_identiques(
+            "Jean\u{2011}Michel Jarre",
+            "Jean-Michel Jarre"
+        ));
+        assert!(noms_d_artiste_identiques(
+            "Guns N\u{2019} Roses",
+            "Guns N' Roses"
+        ));
+        // Le repli s'arrête là : ni accents, ni espace pour un trait d'union,
+        // ni tiret long.
+        assert!(!noms_d_artiste_identiques("Motörhead", "Motorhead"));
+        assert!(!noms_d_artiste_identiques(
+            "Jean Jacques Goldman",
+            "Jean-Jacques Goldman"
+        ));
+        assert!(!noms_d_artiste_identiques("A\u{2014}B", "A-B"));
     }
 
     /// Build a minimal ID3v2.3 tag containing a single APIC frame.

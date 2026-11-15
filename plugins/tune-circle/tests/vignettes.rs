@@ -23,7 +23,7 @@ use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::test_scratch::{ScratchDir, scratch_dir};
 
-use commun::{JETON, appel, appel_avec_entetes, base};
+use commun::{JETON, Rendu, appel, appel_avec_entetes, base};
 
 const SERVEUR: &str = "srv-vignettes-6521";
 const LIAISON: &str = "jeton-de-liaison-6521";
@@ -123,6 +123,10 @@ async fn effacer(State(e): State<Partage>, h: HeaderMap) -> Response {
 }
 
 const IMAGE_DU_CONTACT: &[u8] = b"\xFF\xD8\xFF\xE0 octets-de-la-vignette";
+/// Le sha256 de la vignette, que le cloud rend en ETag (web#2985).
+const SHA_DU_CONTACT: &str = "7dd7622944e688de7d6cde44858de18dd49d835d1c4146427c36153bd2610d7b";
+const ETAG_DU_CONTACT: &str =
+    "\"7dd7622944e688de7d6cde44858de18dd49d835d1c4146427c36153bd2610d7b\"";
 
 async fn vignette_du_contact(Path((uid, album)): Path<(String, String)>, h: HeaderMap) -> Response {
     if uid != CONTACT || album != "10" {
@@ -138,14 +142,14 @@ async fn vignette_du_contact(Path((uid, album)): Path<(String, String)>, h: Head
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if h.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some("\"abc\"") {
-        return (StatusCode::NOT_MODIFIED, [(header::ETAG, "\"abc\"")]).into_response();
+    if h.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(ETAG_DU_CONTACT) {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, ETAG_DU_CONTACT)]).into_response();
     }
     (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "image/jpeg"),
-            (header::ETAG, "\"abc\""),
+            (header::ETAG, ETAG_DU_CONTACT),
         ],
         IMAGE_DU_CONTACT,
     )
@@ -498,7 +502,7 @@ async fn la_vignette_d_un_contact_est_relayee_avec_son_etag_et_304() {
     assert_eq!(r.statut, StatusCode::OK);
     assert_eq!(r.octets, IMAGE_DU_CONTACT);
     assert_eq!(r.entetes[header::CONTENT_TYPE], "image/jpeg");
-    assert_eq!(r.entetes[header::ETAG], "\"abc\"");
+    assert_eq!(r.entetes[header::ETAG], ETAG_DU_CONTACT);
     assert!(
         r.entetes[header::CACHE_CONTROL]
             .to_str()
@@ -511,7 +515,7 @@ async fn la_vignette_d_un_contact_est_relayee_avec_son_etag_et_304() {
         "GET",
         "/contacts/7/library/albums/10/thumbnail",
         None,
-        &[("if-none-match", "\"abc\"")],
+        &[("if-none-match", ETAG_DU_CONTACT)],
     )
     .await;
     assert_eq!(r.statut, StatusCode::NOT_MODIFIED);
@@ -531,6 +535,62 @@ async fn la_vignette_d_un_contact_est_relayee_avec_son_etag_et_304() {
         .unwrap();
     let r = appel(&app, "GET", "/contacts/7/library/albums/10/thumbnail", None).await;
     assert_eq!(r.statut, StatusCode::PRECONDITION_FAILED);
+}
+
+/// web#2985 — une adresse `?v=` qui désigne les octets rendus (début du
+/// sha256 = ETag du cloud) se garde une semaine sans revalider ; sans `v`, ou
+/// avec un `v` qui ne correspond pas (ou trop court pour désigner quoi que ce
+/// soit), une heure comme avant. Le 304 porte la même règle.
+#[tokio::test]
+async fn la_vignette_versionnee_se_garde_une_semaine_2985() {
+    let banc = demarrer().await;
+    let dossier = dossier_de_pochettes();
+    let backend = bibliotheque(&banc, &dossier, 0);
+    let relais = Arc::new(tune_circle::relais::Relais::new(backend.clone()));
+    let app = tune_circle::routes::router_des_vignettes(
+        relais,
+        Arc::new(vignettes_de(&banc, &backend, &dossier)),
+    );
+    let cache = |r: &Rendu| {
+        r.entetes[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    let v = &SHA_DU_CONTACT[..16];
+
+    let r = appel(
+        &app,
+        "GET",
+        &format!("/contacts/7/library/albums/10/thumbnail?v={v}"),
+        None,
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.octets, IMAGE_DU_CONTACT);
+    assert_eq!(cache(&r), "private, max-age=604800, immutable");
+
+    let r = appel_avec_entetes(
+        &app,
+        "GET",
+        &format!("/contacts/7/library/albums/10/thumbnail?v={v}"),
+        None,
+        &[("if-none-match", ETAG_DU_CONTACT)],
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::NOT_MODIFIED);
+    assert_eq!(cache(&r), "private, max-age=604800, immutable");
+
+    for autre in [
+        "/contacts/7/library/albums/10/thumbnail",
+        "/contacts/7/library/albums/10/thumbnail?v=0000000000000000",
+        "/contacts/7/library/albums/10/thumbnail?v=7dd7",
+        "/contacts/7/library/albums/10/thumbnail?v=7dd76229zz",
+    ] {
+        let r = appel(&app, "GET", autre, None).await;
+        assert_eq!(r.statut, StatusCode::OK, "{autre}");
+        assert_eq!(cache(&r), "private, max-age=3600", "{autre}");
+    }
 }
 
 // 5. #6733 — le débit et l'ordre ---------------------------------------------

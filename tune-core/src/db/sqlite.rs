@@ -640,7 +640,12 @@ CREATE TABLE IF NOT EXISTS artists (
     sort_name_source TEXT,
     -- Provenance du MBID (migration 133, #6463) : balise, nom, pressage,
     -- manuel ; NULL = inconnue.
-    musicbrainz_id_source TEXT
+    musicbrainz_id_source TEXT,
+    -- Pays de l'artiste lu sur MusicBrainz (migration 146, #8090) : code ISO
+    -- 3166-1 alpha-2, '' si MusicBrainz n'en donne aucun ; et le MBID dont il
+    -- a ete lu.
+    country TEXT,
+    country_mbid TEXT
 );
 
 CREATE TABLE IF NOT EXISTS albums (
@@ -708,7 +713,13 @@ CREATE TABLE IF NOT EXISTS albums (
     -- pour qu'un scan sache, d'un seul stat, que la source a change ou disparu.
     cover_source TEXT,
     cover_source_path TEXT,
-    cover_source_stamp TEXT
+    cover_source_stamp TEXT,
+    -- Pays d'edition lu sur la release MusicBrainz de l'album (migration 154,
+    -- #8668) : code ISO 3166-1 alpha-2, '' si MusicBrainz n'en donne aucun ;
+    -- et l'identifiant de release dont il a ete lu. La balise RELEASECOUNTRY
+    -- d'une piste prime toujours.
+    release_country TEXT,
+    release_country_mbid TEXT
 );
 
 -- No index on folder_path here: this batch runs against EXISTING databases too,
@@ -1048,6 +1059,21 @@ CREATE TABLE IF NOT EXISTS streaming_hidden_items (
 );
 CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
 
+-- « Pas pour moi » sur une suggestion de l'accueil (web#916, migration 145),
+-- par profil. Ne retire RIEN de la bibliothèque : seules les rangées de
+-- recommandation de `/home/*` la lisent.
+CREATE TABLE IF NOT EXISTS suggestions_ecartees (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    title TEXT,
+    subtitle TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, item_type, source, item_id)
+);
+
 -- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3
 -- de MetaRust) : l'identification les demande avec les `inc` des crédits, la
 -- passe des crédits les relit sans requête. `corps` = JSON compressé (zlib),
@@ -1182,6 +1208,32 @@ mod tests {
         assert!(tables.contains(&"albums".to_string()));
         assert!(tables.contains(&"tracks".to_string()));
         assert!(tables.contains(&"track_credits".to_string()));
+    }
+
+    /// #8196 (RUSTSEC-2026-0459 / CVE-2026-119375) — le SQLite embarqué par
+    /// `rusqlite` (feature `bundled`, libsqlite3-sys 0.39) doit être au moins
+    /// en 3.54.0. Ce garde rougit si un bump de dépendances fait retomber la
+    /// bibliothèque embarquée sous cette version.
+    #[test]
+    fn sqlite_embarque_au_moins_3_54_0_8196() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        let conn = db.conn.lock().unwrap();
+        let version: String = conn
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap();
+        let numero: Vec<u32> = version
+            .split('.')
+            .map(|p| p.parse::<u32>().unwrap_or(0))
+            .collect();
+        assert!(
+            numero.as_slice() >= [3, 54, 0].as_slice(),
+            "SQLite embarque {version}, attendu >= 3.54.0 (RUSTSEC-2026-0459)"
+        );
+        assert_eq!(
+            rusqlite::version(),
+            version,
+            "rusqlite::version() et sqlite_version() doivent parler de la meme bibliotheque"
+        );
     }
 
     /// #5397 — le SQLite embarqué est compilé SANS comptabilité mémoire

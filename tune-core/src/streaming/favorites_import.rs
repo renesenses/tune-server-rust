@@ -132,6 +132,10 @@ pub(crate) struct Entree {
     /// L'année de sortie et la qualité d'un favori ALBUM, quand le service
     /// les donne (#6482). Vide pour les pistes, les artistes et les playlists.
     pub(crate) annee_qualite: AnneeQualite,
+    /// L'identifiant de l'album d'une PISTE chez le service
+    /// (`StreamTrack.album_id`), quand il le donne (tune-web-client#2759).
+    /// `None` pour les autres types.
+    pub(crate) album_ref: Option<String>,
 }
 
 /// L'année et la qualité d'un album, lues dans sa projection sérialisée
@@ -193,14 +197,16 @@ async fn entrees_datees(
             .find_map(|c| v.get(*c).and_then(|x| x.as_str()))
             .map(str::to_string)
     };
+    let id_sous = |v: &serde_json::Value, c: &str| match v.get(c) {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
     let id = |v: &serde_json::Value| {
         ["source_id", "id"]
             .iter()
-            .find_map(|c| match v.get(*c) {
-                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
-                Some(serde_json::Value::Number(n)) => Some(n.to_string()),
-                _ => None,
-            })
+            .map(|c| id_sous(v, c))
+            .find(|s| !s.is_empty())
             .unwrap_or_default()
     };
     Some(Ok(items
@@ -219,6 +225,8 @@ async fn entrees_datees(
                 ai_generated: v.get("album_ai_generated").and_then(|x| x.as_bool()),
                 isrc: texte(v, &["isrc"]).filter(|i| !i.trim().is_empty()),
                 annee_qualite: AnneeQualite::default(),
+                // `StreamTrack.album_id`, sérialisé sous son nom.
+                album_ref: Some(id_sous(v, "album_id")).filter(|a| !a.is_empty()),
             },
             "album" => Entree {
                 item_type,
@@ -231,6 +239,7 @@ async fn entrees_datees(
                 ai_generated: v.get("ai_generated").and_then(|x| x.as_bool()),
                 isrc: None,
                 annee_qualite: annee_qualite_projetee(v),
+                album_ref: None,
             },
             _ => Entree {
                 item_type,
@@ -243,6 +252,7 @@ async fn entrees_datees(
                 ai_generated: None,
                 isrc: None,
                 annee_qualite: AnneeQualite::default(),
+                album_ref: None,
             },
         })
         .collect()))
@@ -276,6 +286,7 @@ pub(crate) async fn lire_les_favoris(
                 ai_generated: None,
                 isrc: t.isrc.filter(|i| !i.trim().is_empty()),
                 annee_qualite: AnneeQualite::default(),
+                album_ref: t.album_id.filter(|a| !a.trim().is_empty()),
             })
             .collect(),
         "albums" => svc
@@ -301,6 +312,7 @@ pub(crate) async fn lire_les_favoris(
                     sample_rate: a.quality.as_ref().map(|q| q.sample_rate),
                     bit_depth: a.quality.as_ref().map(|q| u32::from(q.bit_depth)),
                 },
+                album_ref: None,
             })
             .collect(),
         "artists" => svc
@@ -319,6 +331,7 @@ pub(crate) async fn lire_les_favoris(
                 ai_generated: None,
                 isrc: None,
                 annee_qualite: AnneeQualite::default(),
+                album_ref: None,
             })
             .collect(),
         autre => return Err(format!("type de favori non relu : {autre}")),
@@ -415,6 +428,7 @@ fn enregistrer(
                 }
                 poser_le_marquage_ia(repo, profile_id, service, &entree);
                 poser_annee_et_qualite(repo, profile_id, service, &entree);
+                poser_album_du_service(repo, profile_id, service, &entree);
                 continue;
             }
             Ok(false) => {}
@@ -439,6 +453,7 @@ fn enregistrer(
                 stats.ajoutes += 1;
                 poser_le_marquage_ia(repo, profile_id, service, &entree);
                 poser_annee_et_qualite(repo, profile_id, service, &entree);
+                poser_album_du_service(repo, profile_id, service, &entree);
             }
             Err(e) => {
                 warn!(service = %service, erreur = %e, "reprise_favoris_ecriture_impossible");
@@ -491,6 +506,29 @@ fn poser_annee_et_qualite(
         &entree.annee_qualite,
     ) {
         warn!(service = %service, erreur = %e, "reprise_favoris_annee_qualite_impossible");
+    }
+}
+
+/// tune-web-client#2759 — range l'identifiant d'album que le service donne
+/// avec une piste favorite. Même règle que le marquage IA : une absence ne
+/// touche à rien, un échec est journalisé, jamais compté.
+fn poser_album_du_service(
+    repo: &StreamingFavoritesRepo,
+    profile_id: i64,
+    service: &str,
+    entree: &Entree,
+) {
+    let Some(album) = entree.album_ref.as_deref() else {
+        return;
+    };
+    if let Err(e) = repo.completer_album_du_service(
+        profile_id,
+        entree.item_type,
+        service,
+        &entree.service_id,
+        album,
+    ) {
+        warn!(service = %service, erreur = %e, "reprise_favoris_album_impossible");
     }
 }
 
@@ -708,6 +746,7 @@ mod tests_dates {
             ai_generated: ia,
             isrc: None,
             annee_qualite: AnneeQualite::default(),
+            album_ref: None,
         };
         enregistrer(
             &repo,
@@ -1031,5 +1070,32 @@ mod tests_dates {
         };
         reprendre_les_favoris_du_service(&redate, 1, &backend).await;
         assert_eq!(vues(&backend), posee, "la date locale a été reposée");
+    }
+
+    /// tune-web-client#2759 — la reprise range l'album que TIDAL donne avec
+    /// une piste favorite, et la liste le rend sous `album_id_service` ; un
+    /// favori album ou artiste le rend `null`.
+    #[tokio::test]
+    async fn la_reprise_range_l_album_de_la_piste_2759() {
+        let backend = base();
+        let tidal = ServiceDate {
+            service: "tidal",
+            trois_types: true,
+            redate_epoch: None,
+        };
+        reprendre_les_favoris_du_service(&tidal, 1, &backend).await;
+        let repo = StreamingFavoritesRepo::with_backend(backend.clone());
+        let favoris = repo.list(1, None).unwrap();
+        let album_de = |t: &str, id: &str| {
+            favoris
+                .iter()
+                .find(|f| f.item_type == t && f.service_id == id)
+                .unwrap()
+                .album_id_service
+                .clone()
+        };
+        assert_eq!(album_de("track", "7").as_deref(), Some("789"));
+        assert_eq!(album_de("album", "789"), None);
+        assert_eq!(album_de("artist", "42"), None);
     }
 }

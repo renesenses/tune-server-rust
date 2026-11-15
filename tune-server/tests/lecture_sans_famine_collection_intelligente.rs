@@ -45,6 +45,31 @@
 //! `/smart-collections/{id}/albums` : la réponse JSON est sérialisée sur
 //! l'exécuteur.
 //!
+//! # #8555 — le même transport que le serveur livré
+//!
+//! Le banc appelait directement `axum::serve` sur les deux fils de l'API :
+//! il contournait ainsi `aiguillage_des_flux`, utilisé en production depuis
+//! #4645. Il éprouve désormais ce même aiguillage et affirme le moteur de
+//! chaque requête. La minuterie garde le contrôle de l'exécuteur principal,
+//! tandis que le renderer garde celui de la livraison et des reprises Range.
+//! Les gros JSON quittent aussi l'exécuteur principal ; un témoin sans seuil
+//! temporel vérifie leur sérialisation et leur destruction.
+//!
+//! # #8401 — indépendant de la charge de la machine
+//!
+//! Le banc échouait au hasard sur les runners partagés de la CI, saturés : un
+//! silence du flux ou un retard de minuterie peut venir de la MACHINE (le fil
+//! du renderer, ou celui de l'exécuteur, privé de processeur par d'autres
+//! travaux), et non de Tune. Un fil système TÉMOIN, hors de l'exécuteur, dort
+//! à la cadence du renderer et mesure son propre plus long réveil manqué
+//! pendant la rafale : c'est le gel que la machine impose à TOUS les fils,
+//! le banc compris. Les seuils s'en allongent (`SEUIL + 2 × gel`, gel plafonné à 1 s).
+//!
+//! Ce que le banc prouve ne change pas : une famine de l'exécuteur (0.9.168 :
+//! 2,5 à 6,7 s de silence) ne gèle PAS un fil système à part — le témoin
+//! reste à quelques ms et le seuil à ~1 s. Seule une machine elle-même figée
+//! élargit la marge, et d'autant seulement.
+//!
 //! ⚠️ `tune-server` porte `autotests = false` — ce fichier n'est compilé que
 //! par sa cible `[[test]]` dans `Cargo.toml`.
 use std::io::{Read, Write};
@@ -89,6 +114,54 @@ const TAILLE_FICHIER: usize = 48 * 1024 * 1024;
 const SEUIL_SILENCE: Duration = Duration::from_secs(1);
 /// Retard admis d'une minuterie de l'exécuteur, même raison.
 const SEUIL_RETARD: Duration = Duration::from_secs(1);
+
+/// #8401 — le seuil, élargi du gel que la machine a imposé au fil témoin.
+/// Deux fois le gel : le témoin et le fil mesuré ne sont pas gelés aux mêmes
+/// instants, et deux gels successifs peuvent se cumuler sur une fenêtre.
+/// Le gel compté est plafonné à [`GEL_MACHINE_MAX`] : une machine figée
+/// plusieurs secondes (pause de VM) ne doit pas rendre le banc aveugle.
+fn seuil_sous_charge(seuil: Duration, gel_machine: Duration) -> Duration {
+    seuil + gel_machine.min(GEL_MACHINE_MAX) * 2
+}
+
+/// #8401 — au-delà, le gel de la machine n'élargit plus le seuil.
+const GEL_MACHINE_MAX: Duration = Duration::from_secs(1);
+
+/// #8401 — le fil témoin : dort [`CADENCE_RENDERER`] en boucle, hors de
+/// l'exécuteur, et rend son plus long réveil manqué (au-delà de la cadence)
+/// pendant que `actif` est vrai.
+fn temoin_de_la_machine(actif: Arc<AtomicBool>, arret: Arc<AtomicBool>) -> Duration {
+    let mut pire = Duration::ZERO;
+    while !arret.load(Ordering::Relaxed) {
+        let t0 = Instant::now();
+        std::thread::sleep(CADENCE_RENDERER);
+        let manque = t0.elapsed().saturating_sub(CADENCE_RENDERER);
+        if actif.load(Ordering::Relaxed) {
+            pire = pire.max(manque);
+        }
+    }
+    pire
+}
+
+#[test]
+fn le_seuil_ne_s_elargit_que_du_gel_de_la_machine() {
+    // Machine calme : le seuil reste celui de la famine.
+    assert_eq!(
+        seuil_sous_charge(SEUIL_SILENCE, Duration::ZERO),
+        SEUIL_SILENCE
+    );
+    // La famine de la 0.9.168 (2,5 s au moins) reste rouge tant que la machine
+    // ne gèle pas elle-même ses fils plus de 700 ms.
+    assert!(
+        Duration::from_millis(2_500)
+            >= seuil_sous_charge(SEUIL_SILENCE, Duration::from_millis(700))
+    );
+    // Une machine figée 10 s n'ouvre pas un seuil de 21 s.
+    assert_eq!(
+        seuil_sous_charge(SEUIL_SILENCE, Duration::from_secs(10)),
+        Duration::from_secs(3)
+    );
+}
 
 fn env_ou(nom: &str, defaut: usize) -> usize {
     std::env::var(nom)
@@ -238,6 +311,15 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
     let pistes = env_ou("BANC_PISTES", PISTES as usize) as i64;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(fils)
+        .thread_name("banc-api-8555")
+        .enable_all()
+        .build()
+        .unwrap();
+    // Même séparation que le serveur livré : le transport accepte les
+    // connexions et sert /stream ; les routes de bibliothèque restent sur rt.
+    let transport = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(tune_server::aiguillage_des_flux::FILS_DU_TRANSPORT)
+        .thread_name("banc-transport-8555")
         .enable_all()
         .build()
         .unwrap();
@@ -249,8 +331,10 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
     let retard_max_us = Arc::new(AtomicU64::new(0));
     let mesurer_retard = Arc::new(AtomicBool::new(false));
 
-    let (addr, stream_id, collections, backend, albums) = rt.block_on(async {
+    let (arret_http, signal_http) = tokio::sync::oneshot::channel::<()>();
+    let (addr, stream_id, collections, backend, albums, serveur) = rt.block_on(async {
         let state = AppState::new(chemin_base.to_str().unwrap(), 0, Default::default()).unwrap();
+        eprintln!("#8555 moteur réel : {}", state.backend.engine());
         let t0 = Instant::now();
         let albums = remplir(&state, pistes);
         eprintln!(
@@ -280,7 +364,38 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
             .create_file_session(info, chemin_piste.to_str().unwrap().to_string(), true)
             .await;
         let backend = state.backend.clone();
-        let app = tune_server::routes::router(state);
+        // #8555 : attribuer un blocage à la route qui garde un fil async.
+        let app = tune_server::routes::router(state).layer(axum::middleware::from_fn(
+            |requete: axum::extract::Request, suivant: axum::middleware::Next| async move {
+                let chemin = requete.uri().path().to_owned();
+                let attendu = if chemin.starts_with("/stream/") {
+                    "banc-transport-8555"
+                } else {
+                    "banc-api-8555"
+                };
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some(attendu),
+                    "le banc doit emprunter l'aiguillage de production : {chemin}"
+                );
+                let mut travail = std::pin::pin!(suivant.run(requete));
+                let mut pire = Duration::ZERO;
+                let reponse = std::future::poll_fn(|cx| {
+                    let debut = Instant::now();
+                    let resultat = std::future::Future::poll(travail.as_mut(), cx);
+                    pire = pire.max(debut.elapsed());
+                    resultat
+                })
+                .await;
+                if pire > Duration::from_millis(100) {
+                    eprintln!(
+                        "#8555 poll {chemin} : {:.0} ms sans cession",
+                        pire.as_secs_f64() * 1000.
+                    );
+                }
+                reponse
+            },
+        ));
         // Tampon d'émission borné : les sockets acceptées l'héritent.
         let brute =
             socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
@@ -293,8 +408,22 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
         brute.set_nonblocking(true).unwrap();
         let ecoute = tokio::net::TcpListener::from_std(brute.into()).unwrap();
         let addr = ecoute.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
-        (addr, stream_id, collections, backend, albums)
+        let moteur_transport = transport.handle().clone();
+        let moteur_api = tokio::runtime::Handle::current();
+        let serveur = tokio::spawn(async move {
+            tune_server::aiguillage_des_flux::servir_sur(
+                moteur_transport,
+                moteur_api,
+                ecoute,
+                app,
+                async move {
+                    let _ = signal_http.await;
+                },
+            )
+            .await
+            .unwrap();
+        });
+        (addr, stream_id, collections, backend, albums, serveur)
     });
     assert!(
         collections.len() >= 8,
@@ -341,6 +470,11 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
             pire
         }
     });
+    // #8401 — le témoin de la machine, hors de l'exécuteur.
+    let temoin = std::thread::spawn({
+        let (actif, arret) = (mesurer_retard.clone(), arret.clone());
+        move || temoin_de_la_machine(actif, arret)
+    });
     // Le flux prend son rythme.
     std::thread::sleep(Duration::from_millis(500));
 
@@ -386,6 +520,11 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
     arret.store(true, Ordering::Relaxed);
     let arrivees = lecteur.join().unwrap();
     let pire_lecture_triviale = sonde.join().unwrap();
+    let gel_machine = temoin.join().unwrap();
+    let _ = arret_http.send(());
+    rt.block_on(serveur).unwrap();
+    let seuil_silence = seuil_sous_charge(SEUIL_SILENCE, gel_machine);
+    let seuil_retard = seuil_sous_charge(SEUIL_RETARD, gel_machine);
 
     let pire_silence = arrivees
         .windows(2)
@@ -398,7 +537,7 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
         "banc coupure : {} version {} ; {fils} fils ; {pistes} pistes, {albums} albums ; \
          {RAFALES} rafales de {} requêtes en {:.0} ms ; pire silence du flux {:.0} ms ; \
          pire retard de minuterie {:.0} ms ; pire attente d'une lecture triviale {:.0} ms ; \
-         {} lectures du renderer",
+         {} lectures du renderer ; gel de la machine (témoin) {:.0} ms",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
         chemins.len(),
@@ -407,20 +546,134 @@ fn la_lecture_dlna_ne_manque_pas_d_octets_pendant_une_grosse_collection_intellig
         retard.as_secs_f64() * 1e3,
         pire_lecture_triviale.as_secs_f64() * 1e3,
         arrivees.len(),
+        gel_machine.as_secs_f64() * 1e3,
     );
     for (statut, c) in &statuts {
         assert_eq!(*statut, 200, "{c}");
     }
     assert!(
-        pire_silence < SEUIL_SILENCE,
+        pire_silence < seuil_silence,
         "le renderer DLNA n'a rien reçu pendant {} ms pendant le chargement d'une grosse \
-         collection intelligente ({fils} fils, {pistes} pistes)",
-        pire_silence.as_millis()
+         collection intelligente ({fils} fils, {pistes} pistes ; seuil {} ms dont gel de \
+         la machine {} ms)",
+        pire_silence.as_millis(),
+        seuil_silence.as_millis(),
+        gel_machine.as_millis()
     );
     assert!(
-        retard < SEUIL_RETARD,
+        retard < seuil_retard,
         "une minuterie de l'exécuteur a pris {} ms de retard pendant le chargement d'une \
-         grosse collection intelligente ({fils} fils, {pistes} pistes)",
-        retard.as_millis()
+         grosse collection intelligente ({fils} fils, {pistes} pistes ; seuil {} ms dont gel \
+         de la machine {} ms)",
+        retard.as_millis(),
+        seuil_retard.as_millis(),
+        gel_machine.as_millis()
     );
+}
+
+/// Témoin sans seuil temporel : l'encodage et la destruction du modèle ne
+/// s'exécutent pas sur le fil async, même si la machine est surchargée.
+#[tokio::test(flavor = "current_thread")]
+async fn le_json_et_sa_liberation_quittent_le_fil_async_8555() {
+    use std::sync::Mutex;
+    struct Corps {
+        encodage: Arc<Mutex<Option<std::thread::ThreadId>>>,
+        liberation: Arc<Mutex<Option<std::thread::ThreadId>>>,
+    }
+    impl serde::Serialize for Corps {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            *self.encodage.lock().unwrap() = Some(std::thread::current().id());
+            serde::Serialize::serialize(&[1, 2, 3], s)
+        }
+    }
+    impl Drop for Corps {
+        fn drop(&mut self) {
+            *self.liberation.lock().unwrap() = Some(std::thread::current().id());
+        }
+    }
+    let fil_async = std::thread::current().id();
+    let encodage = Arc::new(Mutex::new(None));
+    let liberation = Arc::new(Mutex::new(None));
+    let reponse = tune_http_types::json_hors_executeur(Corps {
+        encodage: encodage.clone(),
+        liberation: liberation.clone(),
+    })
+    .await
+    .ok()
+    .unwrap();
+    assert_eq!(reponse.status(), axum::http::StatusCode::OK);
+    assert_eq!(reponse.headers()["content-type"], "application/json");
+    assert_eq!(
+        axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"[1,2,3]"
+    );
+    assert_ne!(
+        *encodage.lock().unwrap(),
+        Some(fil_async),
+        "le JSON bloque encore le fil async (#8555)"
+    );
+    assert_ne!(
+        *liberation.lock().unwrap(),
+        Some(fil_async),
+        "le modèle JSON est encore libéré sur le fil async (#8555)"
+    );
+    assert!(encodage.lock().unwrap().is_some());
+    assert!(liberation.lock().unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn les_deux_routes_gardent_leur_corps_json_8555() {
+    use tower::ServiceExt;
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    remplir(&state, 120);
+    let jazz = state
+        .backend
+        .query_one(
+            "SELECT id,name FROM smart_collections WHERE name LIKE '%Jazz%'",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    let id = jazz[0].as_i64().unwrap();
+    let nom = encoder(&jazz[1].as_string().unwrap());
+    let app = tune_server::routes::router(state);
+    for (chemin, liste) in [
+        (
+            format!("/api/v1/library/smart-collections/{id}/albums"),
+            true,
+        ),
+        (
+            format!("/api/v1/library/tracks?collection={nom}&limit=2000"),
+            false,
+        ),
+    ] {
+        let reponse = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(chemin)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reponse.status(), axum::http::StatusCode::OK);
+        assert_eq!(reponse.headers()["content-type"], "application/json");
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let corps: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+        let elements = if liste {
+            corps.as_array().expect("albums : tableau nu conservé")
+        } else {
+            corps["items"]
+                .as_array()
+                .expect("pistes : objet paginé conservé")
+        };
+        assert_eq!(elements.len(), if liste { 1 } else { 12 });
+        assert!(elements.iter().all(|x| x["genre"] == "Jazz"));
+    }
 }

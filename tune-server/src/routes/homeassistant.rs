@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::routes::developer_api::{
+    MomentWebhook, NomsLocaux, client_webhook, juger_destination_avec,
+};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -29,6 +32,50 @@ fn ha_settings(state: &AppState) -> (Option<String>, Option<String>) {
     (url, token)
 }
 
+/// Une adresse Home Assistant est jugée comme la destination d'un webhook
+/// (« refuser la machine, autoriser le LAN ») : jamais le bouclage, ni une
+/// adresse propre de la machine, ni le lien local. Les noms `.local` restent
+/// admis, leurs adresses jugées. À l'enregistrement, un nom qui ne résout pas
+/// encore passe ; avant chaque appel, non.
+async fn juger_adresse_ha(
+    url: &str,
+    moment: MomentWebhook,
+) -> Result<crate::routes::developer_api::DestinationWebhook, &'static str> {
+    juger_destination_avec(url, moment, NomsLocaux::Admis).await
+}
+
+fn refus_adresse_ha(motif: &str) -> axum::response::Response {
+    tracing::warn!(motif, "ha_destination_refusee");
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "ha_destination_refused",
+            "message": format!(
+                "Home Assistant address refused ({motif}): this machine itself is not \
+                 an accepted destination; use the address of Home Assistant on the network."
+            ),
+        })),
+    )
+        .into_response()
+}
+
+/// Le client d'UN appel vers Home Assistant : l'URL complète est jugée juste
+/// avant l'appel, l'hôte épinglé sur l'adresse jugée, aucune redirection
+/// suivie.
+async fn cible_ha(url: String) -> Result<(reqwest::Client, String), axum::response::Response> {
+    let destination = juger_adresse_ha(&url, MomentWebhook::Envoi)
+        .await
+        .map_err(refus_adresse_ha)?;
+    let client = client_webhook(&destination).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("HTTP client: {e}")})),
+        )
+            .into_response()
+    })?;
+    Ok((client, destination.url))
+}
+
 async fn ha_status(State(state): State<AppState>) -> impl IntoResponse {
     let (url, token) = ha_settings(&state);
     let (Some(url), Some(token)) = (url, token) else {
@@ -39,13 +86,11 @@ async fn ha_status(State(state): State<AppState>) -> impl IntoResponse {
         }))
         .into_response();
     };
-    match state
-        .http_client
-        .get(format!("{url}/api/"))
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
+    let (client, cible) = match cible_ha(format!("{url}/api/")).await {
+        Ok(c) => c,
+        Err(refus) => return refus,
+    };
+    match client.get(&cible).bearer_auth(&token).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));
             Json(json!({
@@ -93,17 +138,22 @@ struct HaConfigBody {
 }
 
 async fn set_ha_config(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<HaConfigBody>,
-) -> Json<Value> {
+) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Some(url) = &body.ha_url {
-        settings.set("ha_url", url.trim_end_matches('/')).ok();
+        let url = url.trim_end_matches('/');
+        if let Err(motif) = juger_adresse_ha(url, MomentWebhook::Creation).await {
+            return refus_adresse_ha(motif);
+        }
+        settings.set("ha_url", url).ok();
     }
     if let Some(token) = &body.ha_token {
         settings.set("ha_token", token).ok();
     }
-    Json(json!({"saved": true}))
+    Json(json!({"saved": true})).into_response()
 }
 
 async fn ha_entities(State(state): State<AppState>) -> impl IntoResponse {
@@ -115,13 +165,11 @@ async fn ha_entities(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response();
     };
-    match state
-        .http_client
-        .get(format!("{url}/api/states"))
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
+    let (client, cible) = match cible_ha(format!("{url}/api/states")).await {
+        Ok(c) => c,
+        Err(refus) => return refus,
+    };
+    match client.get(&cible).bearer_auth(&token).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!([]));
             Json(body).into_response()
@@ -155,13 +203,11 @@ async fn ha_entity_state(
         )
             .into_response();
     };
-    match state
-        .http_client
-        .get(format!("{url}/api/states/{entity_id}"))
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
+    let (client, cible) = match cible_ha(format!("{url}/api/states/{entity_id}")).await {
+        Ok(c) => c,
+        Err(refus) => return refus,
+    };
+    match client.get(&cible).bearer_auth(&token).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));
             Json(body).into_response()
@@ -206,9 +252,12 @@ async fn ha_call_service(
         obj.insert("entity_id".into(), json!(entity_id));
     }
     let api_url = format!("{url}/api/services/{}/{}", body.domain, body.service);
-    match state
-        .http_client
-        .post(&api_url)
+    let (client, cible) = match cible_ha(api_url.clone()).await {
+        Ok(c) => c,
+        Err(refus) => return refus,
+    };
+    match client
+        .post(&cible)
         .bearer_auth(&token)
         .json(&payload)
         .send()
@@ -244,13 +293,11 @@ async fn ha_media_players(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response();
     };
-    match state
-        .http_client
-        .get(format!("{url}/api/states"))
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
+    let (client, cible) = match cible_ha(format!("{url}/api/states")).await {
+        Ok(c) => c,
+        Err(refus) => return refus,
+    };
+    match client.get(&cible).bearer_auth(&token).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!([]));
             let players: Vec<&Value> = body
@@ -288,13 +335,11 @@ async fn ha_automations(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response();
     };
-    match state
-        .http_client
-        .get(format!("{url}/api/states"))
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
+    let (client, cible) = match cible_ha(format!("{url}/api/states")).await {
+        Ok(c) => c,
+        Err(refus) => return refus,
+    };
+    match client.get(&cible).bearer_auth(&token).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!([]));
             let automations: Vec<&Value> = body
@@ -341,9 +386,12 @@ async fn ha_trigger_automation(
             .into_response();
     };
     let payload = json!({"entity_id": body.entity_id});
-    match state
-        .http_client
-        .post(format!("{url}/api/services/automation/trigger"))
+    let (client, cible) = match cible_ha(format!("{url}/api/services/automation/trigger")).await {
+        Ok(c) => c,
+        Err(refus) => return refus,
+    };
+    match client
+        .post(&cible)
         .bearer_auth(&token)
         .json(&payload)
         .send()

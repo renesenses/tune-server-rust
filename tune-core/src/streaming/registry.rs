@@ -94,7 +94,14 @@ impl ServiceRegistry {
             let svc = svc.read().await;
             if let Some(tokens) = svc.save_tokens() {
                 let key = format!("auth_tokens_{name}");
-                settings.set(&key, &tokens.to_string()).ok();
+                let ligne = tokens.to_string();
+                // #8426 — chaque sauvegarde passe sur TOUS les services : une
+                // ligne inchangée n'est ni réécrite ni annoncée, sans quoi
+                // `tokens_saved` se lit pour un service que personne n'a touché.
+                if settings.get(&key).ok().flatten().as_deref() == Some(ligne.as_str()) {
+                    continue;
+                }
+                settings.set(&key, &ligne).ok();
                 info!(service = %name, "tokens_saved");
             }
         }
@@ -178,6 +185,19 @@ impl ServiceRegistry {
                 drop(svc_locked);
             }
 
+            // #8481 — le pays du catalogue choisi dans les Réglages. Avant les
+            // jetons : `post_restore` interroge déjà le service.
+            if let Some(pays) = settings
+                .get(&format!("streaming_{name}_catalog_country"))
+                .ok()
+                .flatten()
+            {
+                let mut svc_locked = svc.write().await;
+                if let Err(e) = svc_locked.choisir_le_pays_du_catalogue(Some(&pays)) {
+                    warn!(service = %name, pays = %pays, error = %e, "pays_du_catalogue_ignore");
+                }
+            }
+
             // Restore auth tokens
             let key = format!("auth_tokens_{name}");
             if let Some(json_str) = settings.get(&key).ok().flatten()
@@ -238,3 +258,7 @@ mod get_actif_tests {
         assert!(registre.get_actif("inconnu").await.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "registry_jetons_8426_tests.rs"]
+mod jetons_8426_tests;

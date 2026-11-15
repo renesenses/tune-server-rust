@@ -27,6 +27,7 @@ use super::{EVT_DEMARREE, EVT_TERMINEE, Extractions, ScanCible};
 use crate::ejection::tests::HoteTemoin;
 use crate::fournisseur::SOURCE;
 use crate::lecteur::{ErreurCd, ErreurEjection, LecteurDisque, Presence};
+use crate::memoire::{Fin, MemoireCd, Reglages};
 use crate::musicbrainz::{Consultation, InfosDisque, InfosPiste};
 use crate::routes::{EtatRoutes, router};
 use crate::simule::{LecteurSimule, contenu_des_secteurs};
@@ -1013,6 +1014,7 @@ fn une_ecriture_refusee_pendant_l_extraction_nomme_sa_cause_et_son_chemin_7105()
         dossier: dossier.clone(),
         pistes: Vec::new(),
         pochette: None,
+        ar: None,
     };
     let travail = Travail::new(EtatTravail {
         id: "t7105".into(),
@@ -1020,6 +1022,7 @@ fn une_ecriture_refusee_pendant_l_extraction_nomme_sa_cause_et_son_chemin_7105()
         format: Format::Flac,
         verification: Verification::default(),
         lecteur: String::new(),
+        source: "lecteur",
         disc_id: String::new(),
         metadonnees: "repli",
         artiste: String::new(),
@@ -1034,6 +1037,7 @@ fn une_ecriture_refusee_pendant_l_extraction_nomme_sa_cause_et_son_chemin_7105()
         debut: 0,
         fin: None,
         erreur: None,
+        accuraterip: None,
         scan: None,
     });
     let err = executer(&plan, &travail, &|| {}).unwrap_err();
@@ -1094,4 +1098,526 @@ fn les_erreurs_d_ecriture_sont_classees_par_cause_7105() {
         m.contains("/media/Artiste/Album") && m.contains("plus de place"),
         "{m}"
     );
+}
+
+// ─── #8514 : « Enregistrer dans la bibliothèque » depuis la mémoire ─────────
+
+/// Le disque simulé ENTIER chargé en mémoire (#6043), branché sur le banc.
+async fn charger_en_memoire(banc: &mut Banc, l: &Arc<LecteurSimule>) -> Arc<MemoireCd> {
+    let m = Arc::new(MemoireCd::new(Reglages {
+        actif: true,
+        plafond_octets: u64::MAX,
+    }));
+    let ld: Arc<dyn LecteurDisque> = l.clone();
+    let toc = petite_toc();
+    let c = m
+        .charger_le_disque(&ld, &toc, &crate::discid::disc_id(&toc), 0)
+        .unwrap();
+    let fin = tokio::task::spawn_blocking(move || c.attendre_la_fin())
+        .await
+        .unwrap();
+    assert_eq!(fin, Some(Fin::Termine));
+    banc.routes.memoire = Some(m.clone());
+    m
+}
+
+/// Le témoin principal de #8514 : le disque chargé en mémoire se verse dans
+/// la bibliothèque SANS une lecture de plus au lecteur — FLAC bit exact,
+/// balises et pochette, même dossier et mêmes noms que l'extraction depuis
+/// le lecteur, scan ciblé ; les CRC AccurateRip valent ceux calculés au
+/// chargement ; la mémoire reste chargée et la zone qui joue n'est pas
+/// coupée.
+#[tokio::test]
+async fn enregistrer_depuis_la_memoire_verse_les_pistes_sans_relire_le_lecteur() {
+    let l = simule();
+    let mut banc = Banc::new(l.clone(), Arc::new(AvecMusicBrainz));
+    let m = charger_en_memoire(&mut banc, &l).await;
+    // Une zone joue le disque (depuis la mémoire) : pas un refus ici.
+    banc.hote.sources.lock().await.insert(4, SOURCE.into());
+    banc.routes.zones.lock().await.insert(4);
+    let lectures_avant = l.appels();
+
+    let fin = banc.extraire(json!({ "depuis_memoire": true })).await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+    assert_eq!(fin["source"], "memoire");
+    assert_eq!(fin["scan"], "lance");
+    assert_eq!(
+        l.appels(),
+        lectures_avant,
+        "le lecteur a été relu pour enregistrer un disque déjà en mémoire"
+    );
+    assert!(banc.hote.arrets.lock().await.is_empty(), "zone coupée");
+
+    let album = banc.racine().join("Le Groupe").join("Un Album_ Live_");
+    assert_eq!(fin["dossier"], album.to_string_lossy().as_ref());
+    assert_eq!(
+        *banc.scan.dossiers.lock().unwrap(),
+        vec![album.to_string_lossy().to_string()]
+    );
+    let charge = m.progression().unwrap();
+    assert_eq!(charge.fin, Some(Fin::Termine), "la mémoire a été rendue");
+    let noms = [
+        "01 - Premier.flac",
+        "02 - Deuxième _ bis.flac",
+        "03 - Troisième.flac",
+    ];
+    for (i, (n, debut, fin_piste)) in PLAGES.iter().enumerate() {
+        let chemin = album.join(noms[i]);
+        assert_eq!(
+            pcm_relu(&chemin),
+            contenu_des_secteurs(*debut, fin_piste - debut),
+            "piste {n} : PCM relu ≠ secteurs du disque"
+        );
+        let p = &fin["pistes"][i];
+        let (v1, v2) = crc_attendu(*n, *debut, *fin_piste);
+        assert_eq!(
+            (p["accuraterip_v1"].as_str(), p["accuraterip_v2"].as_str()),
+            (Some(&*v1), Some(&*v2))
+        );
+        assert_eq!(
+            (
+                charge.accuraterip[i].v1.as_str(),
+                charge.accuraterip[i].v2.as_str()
+            ),
+            (&*v1, &*v2),
+            "piste {n} : CRC du chargement ≠ CRC de l'enregistrement"
+        );
+        let meta = tune_core::metadata::read_metadata(&chemin).expect("balises lisibles");
+        assert_eq!(meta.track_number, Some(*n as u32));
+        assert_eq!(meta.album.as_deref(), Some("Un Album: Live?"));
+        assert_eq!(meta.musicbrainz_release_id.as_deref(), Some("rel-1"));
+        use lofty::file::TaggedFileExt;
+        let lofty = lofty::read_from_path(&chemin).unwrap();
+        assert_eq!(lofty.primary_tag().unwrap().pictures()[0].data(), JPEG);
+    }
+    assert_eq!(std::fs::read(album.join("cover.jpg")).unwrap(), JPEG);
+    assert!(!m.enregistrement_en_cours());
+    m.liberer();
+}
+
+/// Le disque est sorti du lecteur mais gardé ENTIER en mémoire (#6410) :
+/// l'enregistrement se fait quand même, le lecteur vide n'est pas consulté.
+#[tokio::test]
+async fn enregistrer_un_disque_ejecte_mais_garde_en_memoire() {
+    let l = simule();
+    let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let m = charger_en_memoire(&mut banc, &l).await;
+    l.ejecter();
+    assert!(m.garder_apres_ejection());
+    let fin = banc
+        .extraire(json!({ "depuis_memoire": true, "format": "wav", "pistes": [2] }))
+        .await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+    let chemin = PathBuf::from(fin["pistes"][0]["fichier"].as_str().unwrap());
+    assert_eq!(chemin.file_name().unwrap(), "02 - Piste 02.wav");
+    assert_eq!(pcm_relu(&chemin), contenu_des_secteurs(40, 75));
+    m.liberer();
+}
+
+/// Contre-épreuve du contrat : sans disque entier en mémoire, refus
+/// `memoire_incomplete` — pas d'extraction silencieuse depuis le lecteur.
+#[tokio::test]
+async fn sans_disque_entier_en_memoire_l_enregistrement_est_refuse() {
+    let l = simule();
+    let banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::CONFLICT, Some("memoire_incomplete"))
+    );
+    assert_eq!(l.appels(), 0, "le lecteur a été lu");
+    assert!(banc.ex.liste().is_empty());
+
+    // Un refus ne laisse pas la mémoire retenue.
+    let m = Arc::new(MemoireCd::new(Reglages {
+        actif: true,
+        plafond_octets: u64::MAX,
+    }));
+    let mut banc = banc;
+    banc.routes.memoire = Some(m.clone());
+    let (code, _) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(
+        !m.enregistrement_en_cours(),
+        "retenue restée après un refus"
+    );
+
+    // Chargement interrompu (éjection) : toujours refusé.
+    l.ejecter_apres(2);
+    let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let m = Arc::new(MemoireCd::new(Reglages {
+        actif: true,
+        plafond_octets: u64::MAX,
+    }));
+    let ld: Arc<dyn LecteurDisque> = l.clone();
+    let c = m.charger_le_disque(&ld, &petite_toc(), "d", 0).unwrap();
+    let fin = tokio::task::spawn_blocking(move || c.attendre_la_fin())
+        .await
+        .unwrap();
+    assert_eq!(fin, Some(Fin::Ejecte));
+    banc.routes.memoire = Some(m);
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::CONFLICT, Some("memoire_incomplete"))
+    );
+}
+
+/// #8514 (relecture) — un secteur resté illisible au chargement est du
+/// silence en mémoire : l'enregistrement est refusé et le dit, au lieu
+/// d'écrire un FLAC « parfait » qui ne l'est pas. Une demande refusée
+/// (destination invalide) ne garde pas la mémoire retenue.
+#[tokio::test]
+async fn des_secteurs_perdus_au_chargement_refusent_l_enregistrement() {
+    let l = simule();
+    l.faire_echouer(50, u32::MAX);
+    let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let m = charger_en_memoire(&mut banc, &l).await;
+    assert_eq!(m.progression().unwrap().secteurs_perdus, 1);
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::CONFLICT, Some("memoire_secteurs_perdus")),
+        "{v}"
+    );
+    assert_eq!(v["secteurs_perdus"], 1);
+    assert!(banc.ex.liste().is_empty());
+    assert!(!m.enregistrement_en_cours());
+    m.liberer();
+
+    // Sans perte, une destination refusée relâche aussi la retenue.
+    let l = simule();
+    let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+    let m = charger_en_memoire(&mut banc, &l).await;
+    let (code, _) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true, "destination": "/hors/bibliotheque" })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(
+        !m.enregistrement_en_cours(),
+        "retenue restée après un refus"
+    );
+    m.liberer();
+}
+
+/// Une pochette qui attend le feu vert du témoin : l'enregistrement reste
+/// en cours tant qu'on ne l'a pas donné.
+struct PochetteRetenue(Arc<tokio::sync::Notify>);
+#[async_trait]
+impl Pochettes for PochetteRetenue {
+    async fn telecharger(&self, _: &str) -> Option<Vec<u8>> {
+        self.0.notified().await;
+        Some(JPEG.to_vec())
+    }
+}
+
+/// #8514 (relecture) — la mémoire est retenue PENDANT tout l'enregistrement
+/// (le surveillant ne rend pas un disque gardé qu'on lit), puis relâchée.
+#[tokio::test]
+async fn la_memoire_est_retenue_pendant_tout_l_enregistrement() {
+    let l = simule();
+    let mut banc = Banc::new(l.clone(), Arc::new(AvecMusicBrainz));
+    let feu = Arc::new(tokio::sync::Notify::new());
+    let ex = Arc::new(
+        Extractions::new(
+            banc.backend.clone(),
+            Some(banc.bus.clone()),
+            Some(banc.scan.clone()),
+        )
+        .avec_pochettes(Arc::new(PochetteRetenue(feu.clone()))),
+    );
+    banc.ex = ex.clone();
+    banc.routes.extraction = Some(ex);
+    let m = charger_en_memoire(&mut banc, &l).await;
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "depuis_memoire": true })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::ACCEPTED, "{v}");
+    assert!(
+        m.enregistrement_en_cours(),
+        "mémoire non retenue pendant l'enregistrement"
+    );
+    feu.notify_one();
+    let fin = banc.attendre(v["id"].as_str().unwrap()).await;
+    assert_eq!(fin["statut"], "terminee", "{fin}");
+    for _ in 0..200 {
+        if !m.enregistrement_en_cours() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!m.enregistrement_en_cours(), "retenue jamais relâchée");
+    m.liberer();
+}
+
+// ─── #8522 : la vérification AccurateRip réelle ─────────────────────────────
+
+mod verification_ar {
+    use super::*;
+    use crate::accuraterip_base::{self as ar, BaseAr, IdentifiantAr, SourceAr};
+    use crate::toc::OCTETS_PAR_SECTEUR;
+
+    /// Une base témoin : une réponse fixe (ou une panne).
+    struct SourceTemoin(Result<Option<Vec<u8>>, String>);
+    #[async_trait]
+    impl SourceAr for SourceTemoin {
+        async fn telecharger(&self, url: &str) -> Result<Option<Vec<u8>>, String> {
+            assert_eq!(url, IdentifiantAr::depuis_toc(&petite_toc()).url());
+            self.0.clone()
+        }
+    }
+
+    /// Les CRC (v1, v2) des pistes du disque simulé, au décalage `o`.
+    fn crcs(o: i32) -> Vec<(u32, u32)> {
+        let disque = contenu_des_secteurs(0, 145);
+        let mut lire = |lba: u32, n: u32, s: &mut [u8]| {
+            let a = lba as usize * OCTETS_PAR_SECTEUR;
+            s.copy_from_slice(&disque[a..a + n as usize * OCTETS_PAR_SECTEUR]);
+            Ok(())
+        };
+        PLAGES
+            .iter()
+            .map(|(n, d, f)| {
+                ar::crc_decale(&mut lire, (*d, *f), (0, 145), o, (*n == 1, *n == 3)).unwrap()
+            })
+            .collect()
+    }
+
+    /// La réponse de la base, comme la vraie : un pressage en CRC v1
+    /// (confiance 3), un en CRC v2 (confiance 7), au décalage `o`, et un
+    /// pressage d'autres CRC (confiance 2).
+    fn reponse(o: i32) -> Vec<u8> {
+        let id = IdentifiantAr::depuis_toc(&petite_toc());
+        let v1: Vec<(u8, u32, u32)> = crcs(o).iter().map(|(v1, _)| (3, *v1, 0)).collect();
+        let v2: Vec<(u8, u32, u32)> = crcs(o).iter().map(|(_, v2)| (7, *v2, 0)).collect();
+        ar::tests_communs::fixture(&id, &[&v1[..], &v2[..], &[(2u8, 0xABCDu32, 0u32); 3][..]])
+    }
+
+    fn avec_base(banc: &mut Banc, source: SourceTemoin) -> Arc<BaseAr> {
+        let base = Arc::new(BaseAr::new(Arc::new(source)));
+        let ex = Arc::new(
+            Extractions::new(
+                banc.backend.clone(),
+                Some(banc.bus.clone()),
+                Some(banc.scan.clone()),
+            )
+            .avec_pochettes(Arc::new(PochetteFixe))
+            .avec_base_ar(base.clone()),
+        );
+        banc.ex = ex.clone();
+        banc.routes.extraction = Some(ex);
+        base
+    }
+
+    fn statuts(fin: &Value) -> Vec<String> {
+        fin["pistes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                p["verification"]["statut"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Le témoin principal : extraction depuis le lecteur, base qui connaît
+    /// le disque → chaque piste « vérifiée » (v2, confiance 7), balise
+    /// `ACCURATERIPRESULT` dans le FLAC, résumé du disque dans l'état ; une
+    /// seconde extraction ne rappelle pas la base.
+    #[tokio::test]
+    async fn l_extraction_verifie_chaque_piste_contre_la_base() {
+        let mut banc = Banc::new(simule(), Arc::new(AvecMusicBrainz));
+        let base = avec_base(&mut banc, SourceTemoin(Ok(Some(reponse(0)))));
+        let fin = banc.extraire(json!({})).await;
+        assert_eq!(fin["statut"], "terminee", "{fin}");
+        assert_eq!(statuts(&fin), ["verifie", "verifie", "verifie"]);
+        let a = &fin["accuraterip"];
+        assert_eq!(a["base"], "trouvee");
+        assert_eq!(
+            a["identifiant"],
+            IdentifiantAr::depuis_toc(&petite_toc()).nom()
+        );
+        assert_eq!(a["decalage"], 0);
+        assert_eq!(a["pistes"].as_array().unwrap().len(), 3);
+        let p = &fin["pistes"][1]["verification"];
+        assert_eq!(
+            (p["version"].as_str(), p["confiance"].as_u64()),
+            (Some("v2"), Some(7))
+        );
+        let chemin = PathBuf::from(fin["pistes"][1]["fichier"].as_str().unwrap());
+        use lofty::file::AudioFile;
+        let flac = lofty::flac::FlacFile::read_from(
+            &mut std::fs::File::open(&chemin).unwrap(),
+            lofty::config::ParseOptions::new(),
+        )
+        .unwrap();
+        let vc = flac.vorbis_comments().expect("commentaires Vorbis");
+        let r = vc.get("ACCURATERIPRESULT").unwrap_or_default();
+        assert!(
+            r.starts_with("AccurateRip: Accurate (v2, confidence 7)"),
+            "{r}"
+        );
+        assert_eq!(
+            vc.get("ACCURATERIPDISCID"),
+            Some(&*IdentifiantAr::depuis_toc(&petite_toc()).nom())
+        );
+        // Les autres balises et la pochette n'ont pas bougé.
+        assert_eq!(vc.get("TITLE"), Some("Deuxième / bis"));
+        use lofty::file::TaggedFileExt;
+        let f = lofty::read_from_path(&chemin).unwrap();
+        assert_eq!(
+            f.primary_tag().unwrap().pictures().len(),
+            1,
+            "pochette dans le fichier"
+        );
+        let fin = banc.extraire(json!({ "ecraser": true })).await;
+        assert_eq!(statuts(&fin), ["verifie", "verifie", "verifie"]);
+        assert_eq!(
+            base.appels(),
+            1,
+            "la base a été rappelée pour le même disque"
+        );
+    }
+
+    /// Le décalage du lecteur se règle et s'applique : un lecteur qui lit à
+    /// +6 n'est vérifié qu'avec +6 ; à 0, « différent » (contre-épreuve).
+    #[tokio::test]
+    async fn le_decalage_regle_s_applique_a_l_extraction() {
+        let mut banc = Banc::new(simule(), Arc::new(SansReseau));
+        avec_base(&mut banc, SourceTemoin(Ok(Some(reponse(6)))));
+        let fin = banc.extraire(json!({ "format": "wav" })).await;
+        assert_eq!(statuts(&fin), ["different", "different", "different"]);
+        assert_eq!(fin["pistes"][0]["verification"]["confiance"], 12);
+        let (code, r) = banc
+            .appel(
+                "PUT",
+                "/extraction/reglages",
+                Some(json!({ "decalage_lecteur": 6 })),
+            )
+            .await;
+        assert_eq!(code, StatusCode::OK, "{r}");
+        assert_eq!(r["decalage_lecteur"], 6);
+        let fin = banc
+            .extraire(json!({ "format": "wav", "ecraser": true }))
+            .await;
+        assert_eq!(statuts(&fin), ["verifie", "verifie", "verifie"], "{fin}");
+        assert_eq!(fin["accuraterip"]["decalage"], 6);
+        // Le fichier, lui, garde les secteurs lus (bit exact).
+        let chemin = PathBuf::from(fin["pistes"][0]["fichier"].as_str().unwrap());
+        assert_eq!(pcm_relu(&chemin), contenu_des_secteurs(0, 40));
+        let (code, r) = banc
+            .appel(
+                "PUT",
+                "/extraction/reglages",
+                Some(json!({ "decalage_lecteur": 5000 })),
+            )
+            .await;
+        assert_eq!(
+            (code, r["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("decalage_invalide"))
+        );
+    }
+
+    /// Base injoignable (ou absente) : l'extraction se termine, les pistes
+    /// sont « non vérifiées » (ou « absentes ») — jamais un échec.
+    #[tokio::test]
+    async fn base_injoignable_ou_absente_l_extraction_aboutit() {
+        let mut banc = Banc::new(simule(), Arc::new(SansReseau));
+        avec_base(&mut banc, SourceTemoin(Err("hors ligne".into())));
+        let fin = banc.extraire(json!({ "format": "wav" })).await;
+        assert_eq!(fin["statut"], "terminee", "{fin}");
+        assert_eq!(fin["accuraterip"]["base"], "injoignable");
+        assert_eq!(statuts(&fin), ["non_verifie", "non_verifie", "non_verifie"]);
+        let mut banc = Banc::new(simule(), Arc::new(SansReseau));
+        avec_base(&mut banc, SourceTemoin(Ok(None)));
+        let fin = banc.extraire(json!({ "format": "wav" })).await;
+        assert_eq!(fin["statut"], "terminee", "{fin}");
+        assert_eq!(statuts(&fin), ["absent", "absent", "absent"]);
+    }
+
+    /// Le CD en mémoire : le décalage DÉTECTÉ à la vérification du
+    /// chargement sert à l'enregistrement dans la bibliothèque.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l_enregistrement_depuis_la_memoire_reprend_le_decalage_detecte() {
+        let l = simule();
+        let mut banc = Banc::new(l.clone(), Arc::new(SansReseau));
+        let base = avec_base(&mut banc, SourceTemoin(Ok(Some(reponse(6)))));
+        let m = Arc::new(MemoireCd::new(Reglages {
+            actif: true,
+            plafond_octets: u64::MAX,
+        }));
+        m.verifier_avec(crate::memoire::VerifieurAr {
+            base: base.clone(),
+            decalage: Arc::new(|| 0),
+            bus: None,
+            moteur: tokio::runtime::Handle::current(),
+        });
+        let ld: Arc<dyn LecteurDisque> = l.clone();
+        let toc = petite_toc();
+        let c = m
+            .charger_le_disque(&ld, &toc, &crate::discid::disc_id(&toc), 0)
+            .unwrap();
+        let c2 = c.clone();
+        tokio::task::spawn_blocking(move || c2.attendre_la_fin())
+            .await
+            .unwrap();
+        let mut v = None;
+        for _ in 0..500 {
+            v = c
+                .progression()
+                .verification_accuraterip
+                .filter(|v| v.base != "en_cours");
+            if v.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let v = v.expect("pas de verdict au chargement");
+        assert_eq!((v.decalage, v.decalage_detecte), (6, true), "{v:?}");
+        banc.routes.memoire = Some(m.clone());
+        let fin = banc
+            .extraire(json!({ "depuis_memoire": true, "format": "wav" }))
+            .await;
+        assert_eq!(fin["statut"], "terminee", "{fin}");
+        assert_eq!(fin["accuraterip"]["decalage"], 6);
+        assert_eq!(fin["accuraterip"]["decalage_detecte"], true);
+        assert_eq!(statuts(&fin), ["verifie", "verifie", "verifie"]);
+        assert_eq!(base.appels(), 1, "une seule consultation pour le disque");
+        m.liberer();
+    }
 }

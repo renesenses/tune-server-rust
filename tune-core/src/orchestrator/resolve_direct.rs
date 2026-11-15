@@ -229,6 +229,15 @@ impl PlaybackOrchestrator {
         file_path: &str,
         req: &PlayRequest,
     ) -> Result<ResolvedStream, String> {
+        // Sécurité — un fichier « téléversé » ne se lit QUE dans le
+        // dossier des téléversements. Le chemin vient du client
+        // (`temp_file_path`, ou `source_id` d'une entrée `upload`) : sans
+        // cette garde, n'importe quel fichier audio de la machine se jouait.
+        let racine = crate::chemins_de_travail::racine_des_televersements();
+        if crate::chemin_sur::racine_contenante(file_path, &[racine.to_string_lossy()]).is_err() {
+            warn!(file = %file_path, "uploaded_file_outside_upload_dir");
+            return Err(format!("uploaded file not found: {file_path}"));
+        }
         let path = std::path::Path::new(file_path);
         if !path.exists() {
             return Err(format!("uploaded file not found: {file_path}"));
@@ -586,7 +595,9 @@ impl PlaybackOrchestrator {
         let raw_url = url_retenue
             .as_deref()
             .or(req.source_id.as_deref())
-            .ok_or("source_id (audio URL) required for podcast/radio playback")?;
+            .ok_or("source_id (audio URL) required for podcast/radio playback")?
+            // Sécurité — la valeur VÉRIFIÉE est celle qui part.
+            .trim();
         // Une piste indexée dont l'instantané ne porte aucune URL jouable ne
         // doit pas partir « au cas où » : `source_id` est alors le condensat
         // d'identité, et le pousser à une sortie produirait une erreur de
@@ -599,6 +610,18 @@ impl PlaybackOrchestrator {
                  (POST /network/media-servers/<id>/indexer) la rétablira.",
                 req.title.as_deref().unwrap_or("cette piste")
             ));
+        }
+        // Sécurité — `podcast`, `radio` et `bandcamp` (et toute
+        // source qui passe par ici) : le `source_id` vient du client, et une
+        // sortie AirPlay, Sendspin ou locale lit un chemin nu ou un `file://`
+        // comme un fichier de la machine. Seule une adresse http(s) part.
+        if !est_une_url_http(raw_url) {
+            warn!(
+                zone_id = req.zone_id,
+                source = %source_apparente,
+                "lecture_directe_refusee_hors_http"
+            );
+            return Err(refus_hors_http(&source_apparente));
         }
         // Au niveau INFO, donc visible avec le `log_level` ordinaire : c'est la
         // ligne qui dit, pour une piste indexée, D'OÙ vient l'adresse jouée.
@@ -761,6 +784,16 @@ impl PlaybackOrchestrator {
             None
         };
         let audio_url: &str = bc_url_resignee.as_deref().unwrap_or(audio_url);
+        // Sécurité — ni une liste m3u/pls distante, ni une page
+        // Bandcamp, ni sa resignature ne peuvent ramener un chemin local.
+        if !est_une_url_http(audio_url) {
+            warn!(
+                zone_id = req.zone_id,
+                source = %source,
+                "lecture_directe_refusee_hors_http_apres_resolution"
+            );
+            return Err(refus_hors_http(&source));
+        }
 
         let is_local_output = req
             .output_device_id
@@ -928,6 +961,45 @@ impl PlaybackOrchestrator {
         } else {
             None
         };
+
+        // #8428 — les URL finies ne doivent pas contourner la cadence de zone.
+        // Réutiliser le chemin fichier porte aussi le DSP à la bonne cadence.
+        let plafond = crate::device_catalog::combine_max_sample_rate(
+            zone.as_ref().and_then(|z| z.max_sample_rate),
+            crate::device_catalog::resolve_zone_quirks(&self.db, req.zone_id).max_sample_rate,
+        );
+        // Re-relecture du 13/11 : l'Opus (`.opus`, Ogg-Opus annoncé) ne passe
+        // pas par le décodeur au fil de l'eau d'une source distante — sa
+        // branche libopus relit le FICHIER par son nom, que ce flux n'a pas.
+        // Il garde le chemin sans cadence fixe (il sort à 48 kHz, sa cadence
+        // native), et le chemin du signal dit la cadence appliquée.
+        let opus = opus_annonce(conteneur_depuis_url(audio_url, mime_type), mime_type);
+        if opus && crate::audio::frequence_fixe::cible(&self.db, req.zone_id, plafond)?.is_some() {
+            info!(
+                zone_id = req.zone_id,
+                url = %audio_url,
+                mime = mime_type,
+                "frequence_fixe_ecartee_pour_l_opus_d_une_url_directe"
+            );
+        }
+        if !est_dsd_brut(mime_type)
+            && !is_radio
+            && !opus
+            && let Some(cadence) =
+                crate::audio::frequence_fixe::cible(&self.db, req.zone_id, plafond)?
+        {
+            return Box::pin(self.direct_a_cadence_fixe(
+                req,
+                audio_url,
+                mime_type,
+                &title,
+                &source,
+                cadence,
+                is_local_output,
+                duration_ms,
+            ))
+            .await;
+        }
 
         let d = Directe {
             audio_url,
@@ -1126,18 +1198,23 @@ impl PlaybackOrchestrator {
         let err_zone = req.zone_id;
         // #3973 — lu avant la tâche détachée, comme la zone elle-même.
         let radio_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
+        let frequence_fixe = crate::audio::frequence_fixe::active(&self.db, req.zone_id);
         let err_station = title.clone();
         // #3756 — de quoi RETENIR l'échec, pas seulement le dire. Le sondeur
         // ne voit que le `Ok` de `play()` ; sans cette mémoire il relance une
         // station que le décodeur vient de déclarer irrécupérable.
         let refusees = self.radios_refusees.clone();
         let refus_source_id = req.source_id.clone();
+        // #8110 — les autres flux autorisés de la fiche, retenus par la route :
+        // le décodeur y passe si le diffuseur refuse celui-ci.
+        let radio_replis = super::radio_replis_8110::replis_retenus(req.source_id.as_deref());
         tokio::spawn(async move {
             // Download + decode in a blocking thread since symphonia and
             // reqwest::blocking are both synchronous.
             let result = tokio::task::spawn_blocking(move || {
-                decode_radio_stream_to_pcm_avec_profondeur(
+                decode_radio_stream_to_pcm_avec_cadence(
                     radio_url,
+                    radio_replis,
                     tx,
                     data_ready,
                     session,
@@ -1150,6 +1227,7 @@ impl PlaybackOrchestrator {
                     radio_strict,
                     en_vol,
                     is_local_output,
+                    frequence_fixe,
                 )
             })
             .await;
@@ -1406,6 +1484,9 @@ impl PlaybackOrchestrator {
                 };
                 let cadence = self.cadence_servie_pour_un_service(req, &stream_data)?;
                 let sr = cadence.unwrap_or(stream_data.quality.sample_rate);
+                // #8428 — une cadence fixe hors famille n'est plus refusée : le
+                // décodeur DSD décime dans la famille puis rééchantillonne
+                // vers `sr` (`dsd_to_pcm::cadence_de_decimation`).
                 let (url, session_id, mime) = if conteneur == "dsf" {
                     // Au fil de l'eau : mesuré sur le .18 (23/09, 17:xx UTC),
                     // le téléchargement ENTIER du DSF prenait 5 minutes — le
@@ -1474,7 +1555,7 @@ impl PlaybackOrchestrator {
             ..Default::default()
         };
         // #5114 — le porteur d'abord : le flux dit s'il cuit le crossfeed.
-        let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+        let dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr, 2);
         let info = StreamInfo {
             crossfeed: dsp.is_active() && dsp.crossfeed_executable(),
             compensation_db: dsp.compensation_cuite_db(),
@@ -1635,6 +1716,206 @@ impl PlaybackOrchestrator {
                 autre
             }
         }
+    }
+
+    /// #8428 — une URL directe (serveur média, flux poussé par BubbleUPnP ou
+    /// mconnect) vers une zone à cadence fixe : décodée et rééchantillonnée
+    /// AU FIL DE L'EAU vers une session WAV à `cadence`, comme le DSF distant
+    /// (`decoder_le_dsf_distant_en_wav`). La session est rendue tout de suite.
+    ///
+    /// Relecture du 12/11 : la première version téléchargeait l'URL ENTIÈRE
+    /// avant le premier son. Un flux sans fin non étiqueté « radio » attendait
+    /// le délai de 120 s puis échouait, un podcast de 2 h attendait son
+    /// dernier octet, et un abandon laissait un `tune-stream-*` orphelin. Ici,
+    /// aucun fichier temporaire : une source qui accepte `Range` est lue par
+    /// requêtes (saut possible), sinon le corps HTTP est décodé tel qu'il
+    /// arrive, sans fin si le flux n'en a pas.
+    #[allow(clippy::too_many_arguments)]
+    async fn direct_a_cadence_fixe(
+        &self,
+        req: &PlayRequest,
+        audio_url: &str,
+        mime_type: &str,
+        title: &str,
+        source: &str,
+        cadence: u32,
+        is_local_output: bool,
+        duration_ms: Option<i64>,
+    ) -> Result<ResolvedStream, String> {
+        let conteneur = conteneur_depuis_url(audio_url, mime_type).to_string();
+        // Sortie locale : WAV 32 bits et DSP dans son propre rappel, comme le
+        // bras local des services (`decider_le_wav_de_sortie`).
+        let bd: u16 = if is_local_output {
+            32
+        } else {
+            super::regles::cap_output_bit_depth(req.bit_depth.unwrap_or(24))
+        };
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: cadence,
+            bit_depth: bd,
+            channels: 2,
+            file_size: None,
+            duration_ms: duration_ms.filter(|d| *d > 0).map(|d| d as u64),
+            ..Default::default()
+        };
+        let dsp = (!is_local_output)
+            .then(|| self.load_streaming_dsp(req.zone_id, req.piste_rg(), cadence, 2))
+            .filter(|dsp| dsp.is_active());
+        let info = match dsp.as_ref() {
+            Some(dsp) => StreamInfo {
+                crossfeed: dsp.crossfeed_executable(),
+                compensation_db: dsp.compensation_cuite_db(),
+                ..info
+            },
+            None => info,
+        };
+        let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+        let tx = match dsp {
+            Some(mut dsp) => {
+                let poste = super::eq_en_vol::EqEnVol::pour_le_relais(dsp.compensation.is_some());
+                self.noter_eq_en_vol(req.zone_id, &session_id, poste.clone());
+                dsp.en_vol = Some(poste);
+                spawn_streaming_dsp_relay(dsp, bd, true, tx)
+            }
+            None => tx,
+        };
+        // L'en-tête WAV part DANS le canal : sans ce drapeau, `handle_stream`
+        // en préfixerait un second.
+        {
+            let sessions = self.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            if let Some(session) = sessions.get(&session_id) {
+                session
+                    .wav_header_included
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let mut seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
+        // La sonde `Range` AVANT le relais des niveaux : sans elle, la source
+        // ne sait pas sauter, et le relais doit partir de la même position que
+        // le décodeur (re-relecture du 13/11).
+        let url_sonde = audio_url.to_string();
+        // Bornée : un serveur qui accepte la connexion sans répondre ne doit
+        // pas retenir `/play` ; il est alors lu comme une source sans `Range`.
+        let sonde = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                crate::audio::http_range::HttpRangeSource::open(&url_sonde)
+            }),
+        )
+        .await;
+        let source_range = match sonde {
+            Ok(Ok(Ok(source))) => Some(source),
+            Ok(Ok(Err(e))) => {
+                debug!(url = %audio_url, error = %e, "frequence_fixe_url_directe_sans_range");
+                None
+            }
+            Ok(Err(e)) => {
+                warn!(url = %audio_url, error = %e, "frequence_fixe_url_directe_sonde_paniquee");
+                None
+            }
+            Err(_) => {
+                warn!(url = %audio_url, "frequence_fixe_url_directe_sonde_range_trop_longue");
+                None
+            }
+        };
+        if source_range.is_none() && seek_s > 0.0 {
+            warn!(
+                zone_id = req.zone_id,
+                url = %audio_url,
+                seek_s,
+                "frequence_fixe_url_directe_saut_ignore_sans_range"
+            );
+            seek_s = 0.0;
+        }
+        info!(
+            zone_id = req.zone_id,
+            url = %audio_url,
+            conteneur = %conteneur,
+            cadence,
+            bit_depth = bd,
+            range = source_range.is_some(),
+            "frequence_fixe_url_directe_au_fil_de_l_eau"
+        );
+
+        let ev_bus = self.event_bus.clone();
+        let playback = self.playback.clone();
+        let zone_id = req.zone_id;
+        let attach_levels = self.levels_attach_allowed(zone_id);
+        let url = audio_url.to_string();
+        tokio::spawn(async move {
+            let err_bus = ev_bus.clone();
+            let levels_tx = match ev_bus.filter(|_| attach_levels) {
+                Some(bus) => {
+                    let play_seq = playback.current_play_seq(zone_id).await;
+                    spawn_paced_levels_forwarder(
+                        bus,
+                        playback,
+                        zone_id,
+                        play_seq,
+                        (seek_s * 1000.0) as i64,
+                    )
+                }
+                None => tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0,
+            };
+            let url_decode = url.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                decoder_l_url_a_cadence_fixe(
+                    source_range,
+                    &url_decode,
+                    &conteneur,
+                    cadence,
+                    bd,
+                    tx,
+                    data_ready,
+                    levels_tx,
+                    seek_s,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => debug!(url = %url, "frequence_fixe_url_directe_terminee"),
+                Ok(Err(e)) => {
+                    warn!(url = %url, error = %e, "frequence_fixe_url_directe_decodage_echoue");
+                    if let Some(ref bus) = err_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "code": "track_decode_failed",
+                                "error": "The track could not be decoded.",
+                                "cause": e,
+                            }),
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(url = %url, error = %e, "frequence_fixe_url_directe_tache_paniquee")
+                }
+            }
+        });
+
+        let server_ip = self.server_ip();
+        Ok(ResolvedStream {
+            url: self.streamer.get_stream_url(&session_id, &server_ip, "wav"),
+            mime_type: "audio/wav".into(),
+            title: title.to_string(),
+            artist: req.artist_name.clone(),
+            album: req.album_title.clone(),
+            duration_ms,
+            source: source.to_string(),
+            cover_url: req.cover_url.clone(),
+            stream_id: Some(session_id),
+            file_size: None,
+            sample_rate: Some(cadence),
+            bit_depth: Some(u32::from(bd)),
+            channels: Some(2),
+            origin_url: Some(audio_url.to_string()),
+            bitrate_kbps: None,
+            format_source: None,
+        })
     }
 
     /// #8052 — un DSD reçu par la façade UPnP, vers la sortie LOCALE de la
@@ -2033,10 +2314,12 @@ impl PlaybackOrchestrator {
         // extension), soit 44 des 51 entrees de l'annuaire au 28/08/2026.
         // Seules les rares URL en .mp3/.flac/.wav prenaient ce raccourci —
         // TSF Jazz en fait partie, et c'est la station signalee.
-        let needs_proxy = req.output_device_id.is_some()
+        // #8422 — ce proxy reste nécessaire indépendamment de l'égaliseur.
+        let proxy_sans_egaliseur = req.output_device_id.is_some()
             || is_browser_output
             || !reliable_ext
-            || radio_eq_profile.is_some();
+            || crate::audio::frequence_fixe::active(&self.db, req.zone_id).is_some();
+        let needs_proxy = proxy_sans_egaliseur || radio_eq_profile.is_some();
 
         if needs_proxy {
             let wav_info = StreamInfo {
@@ -2059,7 +2342,7 @@ impl PlaybackOrchestrator {
             );
             // #4407 — le poste de relève : un changement d'égaliseur est posé
             // dans CE flux au paquet suivant, sans nouvelle session UPnP.
-            let en_vol = super::eq_en_vol::EqEnVol::pour_la_radio();
+            let en_vol = super::eq_en_vol::EqEnVol::pour_la_radio_servie(proxy_sans_egaliseur);
             self.noter_eq_en_vol(req.zone_id, &session_id, en_vol.clone());
             let radio_url = audio_url.to_string();
             // VU-mètres sur radio (DLNA) : forwarder de niveaux alimenté
@@ -2085,6 +2368,7 @@ impl PlaybackOrchestrator {
             let err_zone = req.zone_id;
             // #3973 — lu avant la tâche détachée, comme la zone elle-même.
             let radio_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
+            let frequence_fixe = crate::audio::frequence_fixe::active(&self.db, req.zone_id);
             let err_station = title.clone();
             // #3756 — même mémoire que le chemin local/OAAT. Le journal du
             // ticket vient d'une sortie ALSA, mais rien dans la boucle de
@@ -2092,10 +2376,13 @@ impl PlaybackOrchestrator {
             // deux chemins laisserait la relance sans fin sur l'autre.
             let refusees = self.radios_refusees.clone();
             let refus_source_id = req.source_id.clone();
+            // #8110 — même repli que le chemin local/OAAT.
+            let radio_replis = super::radio_replis_8110::replis_retenus(req.source_id.as_deref());
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    decode_radio_stream_to_pcm(
+                    decode_radio_stream_to_pcm_avec_cadence(
                         radio_url,
+                        radio_replis,
                         tx,
                         data_ready,
                         session,
@@ -2103,6 +2390,8 @@ impl PlaybackOrchestrator {
                         radio_levels_tx,
                         radio_strict,
                         Some(en_vol),
+                        false,
+                        frequence_fixe,
                     )
                 })
                 .await;
@@ -2330,6 +2619,69 @@ pub(crate) fn conteneur_dsd(url: &str, mime: &str) -> &'static str {
     }
 }
 
+/// #8428 — l'URL annonce-t-elle de l'Opus (`.opus`, `audio/opus`, ou Ogg dont
+/// le MIME porte `opus`) ? Un `.ogg` sans indication reste lu comme Vorbis.
+fn opus_annonce(conteneur: &str, mime: &str) -> bool {
+    conteneur == "opus"
+        || (matches!(conteneur, "ogg" | "oga") && mime.to_ascii_lowercase().contains("opus"))
+}
+
+/// #8428 — le décodage d'une URL directe vers la cadence fixe, sans fichier
+/// temporaire. `source_range` (sondée par l'appelant) est lue par requêtes et
+/// peut sauter à `seek_s` ; sans elle le corps HTTP est décodé tel qu'il
+/// arrive (flux poussé sans fin), depuis le début — l'appelant a alors déjà
+/// remis `seek_s` à 0.
+#[allow(clippy::too_many_arguments)]
+fn decoder_l_url_a_cadence_fixe(
+    source_range: Option<crate::audio::http_range::HttpRangeSource>,
+    url: &str,
+    conteneur: &str,
+    cadence: u32,
+    bd: u16,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
+    use symphonia::core::io::{MediaSource, ReadOnlySource};
+    let (source, seek_s): (Box<dyn MediaSource>, f64) = match source_range {
+        Some(source) => (Box::new(source), seek_s),
+        None => {
+            let reponse = crate::http::client::blocking_builder()
+                .timeout(None)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .and_then(|c| c.get(url).send())
+                .map_err(|e| format!("http: {}", crate::http::client::decrire_erreur_http(&e)))?;
+            if !reponse.status().is_success() {
+                return Err(format!("http: {}", reponse.status()));
+            }
+            (Box::new(ReadOnlySource::new(reponse)), 0.0)
+        }
+    };
+    crate::audio::decode::decode_source_to_pcm_streaming_a_cadence(
+        source, conteneur, cadence, 2, bd, tx, 32768, data_ready, levels_tx, seek_s,
+    )
+}
+
+#[cfg(test)]
+mod opus_annonce_8428_tests {
+    use super::opus_annonce;
+
+    #[test]
+    fn l_opus_annonce_est_reconnu_8428() {
+        assert!(opus_annonce("opus", "audio/opus"));
+        assert!(opus_annonce("opus", "audio/mpeg"));
+        assert!(opus_annonce("ogg", "audio/ogg; codecs=opus"));
+        assert!(opus_annonce("ogg", "audio/ogg; codecs=\"Opus\""));
+        // Contre-épreuve : Vorbis et le reste gardent la cadence fixe.
+        assert!(!opus_annonce("ogg", "audio/ogg"));
+        assert!(!opus_annonce("ogg", "audio/ogg; codecs=vorbis"));
+        assert!(!opus_annonce("flac", "audio/flac"));
+        assert!(!opus_annonce("mp3", "audio/mpeg"));
+    }
+}
+
 /// Supprime un fichier temporaire quand la session qui le lit n'existe plus.
 ///
 /// `anticiper_le_dop` décode dans une tâche bloquante qui ne rend rien à
@@ -2434,9 +2786,14 @@ pub(crate) const CLE_URL_DE_LECTURE_UPNP: &str = "upnp_res_url";
 /// Le seul test qui sépare une URL de lecture du CONDENSAT D'IDENTITÉ que
 /// `tracks.source_id` porte depuis la phase 2 (`uuid:…|9f3c…`). Sans lui, le
 /// condensat partirait à la sortie comme s'il était une adresse.
+/// Sécurité — le refus d'une source directe qui n'est pas une
+/// adresse http(s). Le texte ne répète pas la valeur reçue.
+pub(crate) fn refus_hors_http(source: &str) -> String {
+    format!("Lecture impossible : la source « {source} » n'accepte qu'une adresse http(s).")
+}
+
 pub(crate) fn est_une_url_http(valeur: &str) -> bool {
-    let v = valeur.trim();
-    (v.starts_with("http://") || v.starts_with("https://")) && v.len() > "https://".len()
+    crate::chemin_sur::est_une_adresse_http(valeur)
 }
 
 #[cfg(test)]

@@ -1,7 +1,9 @@
 //! Shared HTTP contracts used by the server and its route crates.
 
 pub mod error;
+mod json_hors_executeur;
 pub mod panne_sql;
+pub use json_hors_executeur::json_hors_executeur;
 
 pub use error::AppError;
 

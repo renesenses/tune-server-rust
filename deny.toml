@@ -9,13 +9,8 @@
 [advisories]
 version = 2
 ignore = [
-    # RUSTSEC-2026-0459 (CVE-2026-119375, libsqlite3-sys < 0.39 : SQLite < 3.54
-    # embarque). EXCEPTION TEMPORAIRE pour la rc11, decision de Bertrand du
-    # 09/11/2026 ; echeance : rc12. Vecteur LOCAL : il faut qu'un tiers depose
-    # une base et son -wal pieges dans le dossier de donnees de Tune. La montee
-    # (libsqlite3-sys 0.39 / rusqlite 0.41) doit aussi convenir a sqlx-sqlite,
-    # qui partage le meme libsqlite3-sys : chantier du lot rc12.
-    "RUSTSEC-2026-0459",
+    # RUSTSEC-2026-0459 (SQLite < 3.54 embarque) : exception de la rc11 levee
+    # par #8196 (rusqlite 0.41 / libsqlite3-sys 0.39 / SQLite 3.54.0).
     # paste 1.0.15 — unmaintained: the author archived the repo (RUSTSEC-2024-0436).
     # Pulled transitively via lofty / notify. It is a compile-time proc-macro helper
     # with no runtime code path and no known vulnerability; there is no safe upgrade

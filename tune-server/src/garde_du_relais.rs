@@ -256,6 +256,7 @@ mod tests {
             (Method::POST, "/api/v1/streaming/qobuz/favorites/add"),
             (Method::GET, "/api/v1/streaming/qobuz/album/1"),
             (Method::GET, "/api/v1/system/health"),
+            (Method::GET, "/api/v1/home/shortcuts"),
             (Method::GET, "/stream/2338763c.flac"),
             (Method::HEAD, "/stream/2338763c.flac"),
             (Method::GET, "/ws"),
@@ -263,6 +264,16 @@ mod tests {
         ] {
             assert!(ok(m.clone(), c), "{m} {c} doit rester relayable");
         }
+    }
+
+    /// Les raccourcis se lisent à distance par `/home/shortcuts` ; ni leur
+    /// écriture, ni la configuration complète ne s'ouvrent pour autant.
+    #[test]
+    fn raccourcis_lisibles_a_distance_sans_ouvrir_la_config() {
+        assert!(ok(Method::GET, "/api/v1/home/shortcuts"));
+        assert!(!ok(Method::POST, "/api/v1/home/shortcuts"));
+        assert!(!ok(Method::PATCH, "/api/v1/system/config"));
+        assert!(!ok(Method::GET, "/api/v1/system/config"));
     }
 
     #[test]

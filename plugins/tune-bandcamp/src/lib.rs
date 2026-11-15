@@ -771,6 +771,96 @@ pub(crate) async fn album_depuis_url(url: &str) -> Result<Value, EchecAlbum> {
     }
 }
 
+/// L'hôte et le chemin d'une adresse `https://` : `None` pour toute autre forme.
+fn hote_et_chemin(url: &str) -> Option<(&str, &str)> {
+    let reste = url.strip_prefix("https://")?;
+    let fin_hote = reste.find('/')?;
+    let (hote, chemin) = reste.split_at(fin_hote);
+    (!hote.is_empty()).then_some((hote, chemin))
+}
+
+/// Vrai pour un hôte `bandcamp.com` ou `*.bandcamp.com`, comparé par
+/// composant : ni `bandcamp.com.ailleurs`, ni identifiants, ni port.
+fn hote_bandcamp(hote: &str) -> bool {
+    if hote.contains(['@', ':', '?', '#', '\\']) {
+        return false;
+    }
+    let hote = hote.to_ascii_lowercase();
+    hote == "bandcamp.com"
+        || hote.strip_suffix(".bandcamp.com").is_some_and(|sous| {
+            !sous.is_empty()
+                && sous.split('.').all(|e| {
+                    !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                })
+        })
+}
+
+/// Vrai pour l'adresse d'une page de PISTE Bandcamp
+/// (`https://<artiste>.bandcamp.com/track/…`).
+pub fn est_une_page_de_piste(url: &str) -> bool {
+    hote_et_chemin(url)
+        .is_some_and(|(hote, chemin)| hote_bandcamp(hote) && chemin.starts_with("/track/"))
+}
+
+/// La page de l'ALBUM d'une page de piste, lue dans son `data-tralbum`.
+///
+/// tune-server-rust#7591 (FabienM, fil 2559 point 12). Un titre Bandcamp
+/// acheté ou mis en favori seul est rangé avec la page de la PISTE pour
+/// référence (`/track/…`, journal de FabienM du 30/10 :
+/// `bandcamp_page_de_piste_resolue page=https://tuxedomoonarchives.bandcamp.com/track/…`).
+/// `album-en-cours` la servait comme album, et la vignette ouvrait donc une
+/// fiche d'une seule piste, au titre du morceau : « la page du titre en
+/// cours ». La page de piste nomme pourtant son album : `album_url`, relatif
+/// à l'hôte (`/album/live-in-rome-2014`, mesuré le 11/11/2026 sur cette page).
+///
+/// `None` quand la page n'est pas une page de piste, que la piste n'appartient
+/// à aucun album (`album_url` nul : un single), ou que l'adresse lue n'est pas
+/// une page d'album du même hôte.
+pub(crate) fn page_d_album_parente(tralbum: &Value, page: &str) -> Option<String> {
+    if !est_une_page_de_piste(page) {
+        return None;
+    }
+    let (hote, _) = hote_et_chemin(page)?;
+    let brute = tralbum["album_url"].as_str()?.trim();
+    let chemin = match brute.strip_prefix("https://") {
+        // Absolue : acceptée seulement sur le même hôte que la page de piste.
+        Some(_) => match hote_et_chemin(brute) {
+            Some((h, c)) if h.eq_ignore_ascii_case(hote) => c,
+            _ => return None,
+        },
+        None => brute,
+    };
+    if !chemin.starts_with("/album/")
+        || chemin.len() <= "/album/".len()
+        || chemin.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(format!("https://{hote}{chemin}"))
+}
+
+/// La page d'album d'une page de piste Bandcamp, en lisant la page (un appel
+/// sortant), ou `None` : ce n'est pas une page de piste, la page ne répond
+/// pas, ou la piste n'appartient à aucun album. L'appelant garde alors la
+/// page de piste — la fiche d'un single, comme avant. #7591.
+pub async fn page_d_album_d_une_piste(page: &str) -> Option<String> {
+    if !est_une_page_de_piste(page) {
+        return None;
+    }
+    let reponse = tune_core::http::client::shared()
+        .get(page)
+        // Même en-tête que `album_depuis_url` : sans lui, page réduite.
+        .header("User-Agent", "Mozilla/5.0 (compatible; Tune)")
+        .send()
+        .await
+        .ok()?;
+    if !reponse.status().is_success() {
+        return None;
+    }
+    let html = reponse.text().await.ok()?;
+    page_d_album_parente(&extraire_tralbum(&html)?, page)
+}
+
 /// `GET /album?url=…` — résout une page Bandcamp en album jouable.
 ///
 /// Query et non segment de chemin : une adresse Bandcamp contient des `/` et
@@ -2781,5 +2871,87 @@ mod tests_favoris_2778 {
         assert_ne!(BC_WISHLIST_API, BC_COLLECTION_API);
         assert!(BC_WISHLIST_API.ends_with("wishlist_items"));
         assert!(BC_COLLECTION_API.ends_with("collection_items"));
+    }
+}
+
+/// tune-server-rust#7591 — l'album d'une page de PISTE Bandcamp.
+#[cfg(test)]
+mod tests_album_d_une_piste_7591 {
+    use super::*;
+
+    /// La page de piste du journal de FabienM (30/10/2026), réduite à son
+    /// `data-tralbum` tel que Bandcamp l'échappe (mesuré le 11/11/2026).
+    const PAGE: &str =
+        "https://tuxedomoonarchives.bandcamp.com/track/in-the-name-of-talent-italian-western-two";
+    const HTML: &str = r#"<div id="pagedata"></div><script data-tralbum="{&quot;item_type&quot;:&quot;track&quot;,&quot;url&quot;:&quot;https://tuxedomoonarchives.bandcamp.com/track/in-the-name-of-talent-italian-western-two&quot;,&quot;album_url&quot;:&quot;/album/live-in-rome-2014&quot;,&quot;artist&quot;:&quot;Tuxedomoon&quot;,&quot;current&quot;:{&quot;title&quot;:&quot;In The Name of Talent (Italian Western Two)&quot;},&quot;trackinfo&quot;:[{&quot;track_id&quot;:1,&quot;title&quot;:&quot;In The Name of Talent (Italian Western Two)&quot;,&quot;streaming&quot;:1,&quot;file&quot;:{&quot;mp3-128&quot;:&quot;https://t4.bcbits.com/stream/x/mp3-128/1&quot;}}]}"></script>"#;
+
+    #[test]
+    fn la_page_de_piste_mene_a_son_album() {
+        let tralbum = extraire_tralbum(HTML).expect("data-tralbum lisible");
+        // Ce que `album-en-cours` servait : une « fiche d'album » d'UNE piste,
+        // au titre du morceau — la page du titre en cours.
+        let fiche = album_jouable(&tralbum);
+        assert_eq!(fiche["track_count"], 1);
+        assert_eq!(
+            page_d_album_parente(&tralbum, PAGE).as_deref(),
+            Some("https://tuxedomoonarchives.bandcamp.com/album/live-in-rome-2014"),
+        );
+    }
+
+    #[test]
+    fn un_single_ou_une_page_d_album_n_a_pas_d_album_parent() {
+        let mut tralbum = extraire_tralbum(HTML).unwrap();
+        // Une page d'album n'est pas une page de piste : rien à suivre.
+        assert_eq!(
+            page_d_album_parente(
+                &tralbum,
+                "https://tuxedomoonarchives.bandcamp.com/album/live-in-rome-2014"
+            ),
+            None
+        );
+        // Un single : `album_url` nul.
+        tralbum["album_url"] = Value::Null;
+        assert_eq!(page_d_album_parente(&tralbum, PAGE), None);
+    }
+
+    #[test]
+    fn une_adresse_d_album_etrangere_ou_mal_formee_est_refusee() {
+        let mut tralbum = extraire_tralbum(HTML).unwrap();
+        for brute in [
+            "https://ailleurs.bandcamp.com/album/x",
+            "https://evil.example/album/x",
+            "/track/autre",
+            "/album/",
+            "/album/a b",
+        ] {
+            tralbum["album_url"] = json!(brute);
+            assert_eq!(page_d_album_parente(&tralbum, PAGE), None, "{brute}");
+        }
+        // Absolue sur le même hôte : acceptée.
+        tralbum["album_url"] =
+            json!("https://tuxedomoonarchives.bandcamp.com/album/live-in-rome-2014");
+        assert_eq!(
+            page_d_album_parente(&tralbum, PAGE).as_deref(),
+            Some("https://tuxedomoonarchives.bandcamp.com/album/live-in-rome-2014"),
+        );
+    }
+
+    #[test]
+    fn seules_les_pages_de_piste_sont_reconnues() {
+        assert!(est_une_page_de_piste(PAGE));
+        assert!(!est_une_page_de_piste("https://x.bandcamp.com/album/y"));
+        assert!(!est_une_page_de_piste(
+            "https://t4.bcbits.com/stream/a/mp3-128/1"
+        ));
+        assert!(!est_une_page_de_piste("http://x.bandcamp.com/track/y"));
+        // Garde d'hôte par composant : aucun appel sortant hors de Bandcamp.
+        for etrangere in [
+            "https://evil.example/track/x?bandcamp.com",
+            "https://bandcamp.com@evil.com/track/x",
+            "https://bandcamp.com.evil.com/track/x",
+            "https://x.bandcamp.com:8443/track/y",
+        ] {
+            assert!(!est_une_page_de_piste(etrangere), "{etrangere}");
+        }
     }
 }

@@ -139,6 +139,11 @@ pub(crate) const CRITERES: &[Critere] = &[
     deux("track_artist", Famille::Texte),
     deux("genre", Famille::Texte),
     deux("composer", Famille::Texte),
+    // #8325 — chef d'orchestre, ensemble / orchestre et œuvre : crédits,
+    // balises du scan et fiche d'album, comme les facettes de la Collection.
+    deux("conductor", Famille::Texte),
+    deux("ensemble", Famille::Texte),
+    deux("work", Famille::Texte),
     deux("label", Famille::Texte),
     deux("format", Famille::Texte),
     deux("source", Famille::Source),
@@ -354,7 +359,7 @@ pub(crate) mod tests {
     }
 
     /// Les identifiants des albums que retient une règle de COLLECTION.
-    fn albums(db: &SqliteDb, regles: &str) -> Vec<i64> {
+    pub(crate) fn albums(db: &SqliteDb, regles: &str) -> Vec<i64> {
         let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let (w, _o, _l) = build_album_query(regles, "all", "title", "asc", None, &ctx);
         assert!(
@@ -687,14 +692,15 @@ pub(crate) mod tests {
     /// collections (#5530 : « Généré par IA » ; #6123 : « Note de la piste » ;
     /// #6121 : « Artiste de l'album » ; #6124 : « Année de sortie originale »
     /// et « Version » ; #6232 : « Interprète » ; #6285 : « Verdict hi-res »,
-    /// que `smartRegles.ts` n'a pas encore). Si ce nombre bouge,
-    /// `smartRegles.ts` doit bouger aussi.
+    /// que `smartRegles.ts` n'a pas encore ; #8325 : « Chef d'orchestre »,
+    /// « Ensemble / orchestre » et « Œuvre », web#2762 → 37 / 35 côté client).
+    /// Si ce nombre bouge, `smartRegles.ts` doit bouger aussi.
     #[test]
     fn le_tableau_a_la_taille_de_celui_du_client() {
-        assert_eq!(CRITERES.len(), 35);
+        assert_eq!(CRITERES.len(), 38);
         assert_eq!(
             CRITERES.iter().filter(|c| c.collection.is_some()).count(),
-            33
+            36
         );
     }
     // ---------------------------------------------------------------------
@@ -1273,6 +1279,7 @@ pub(crate) mod tests {
 /// playlists du .18 et les formes que l'ancien éditeur écrivait (`equals`,
 /// `gte`, `operator`, `is_empty`, `branch_of`…). Chaque colonne — clause,
 /// tri, borne, refusées — doit ressortir au caractère près.
+/// #8684 : la ligne année suit désormais le repli sur l’album, comme la Bibliothèque.
 ///
 /// Seule retouche voulue depuis : la clause « Favori · est · Piste » (#5997,
 /// forum #2127) départage désormais les éditions par l'album et l'ISRC — la
@@ -1282,7 +1289,11 @@ pub(crate) mod tests {
 /// la Bibliothèque, `track_id` ne servant plus qu'en plus quand il est rempli.
 /// Puis, avec la Bibliothèque, elles ne comptent plus que les écoutes de la
 /// provenance de la piste (#7980, `history_repo::sql::meme_provenance`) au
-/// lieu de toutes les écoutes hors radio.
+/// lieu de toutes les écoutes hors radio. Enfin, toujours avec la
+/// Bibliothèque, elles ajoutent les écoutes importées (`imported_plays`,
+/// #8416). Depuis #8714, ces deux lignes suivent la priorité de la
+/// Bibliothèque : track_id, sinon album + titre, sinon titre + interprète.
+/// Les quatorze autres jeux restent identiques.
 #[cfg(test)]
 mod anciennes_regles {
     use crate::smart_playlists::build_smart_query_rapport;
@@ -1315,3 +1326,11 @@ mod hires_6285;
 #[cfg(test)]
 #[path = "criteres_ecoutes_7769_tests.rs"]
 mod ecoutes_7769;
+
+#[cfg(test)]
+#[path = "criteres_classiques_8325_tests.rs"]
+mod classiques_8325;
+
+#[cfg(test)]
+#[path = "criteres_ecoutes_importees_8416_tests.rs"]
+mod ecoutes_importees_8416;

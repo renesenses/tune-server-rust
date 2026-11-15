@@ -4,6 +4,7 @@ pub mod gapless;
 pub mod melange;
 pub mod queue;
 pub mod radio_artiste;
+pub mod radio_fin_de_file;
 // `crossfade` a été retiré ici (#2211), pour la même raison que
 // `radio_handler` juste en dessous : un module complet, **sans un seul
 // appelant** dans tout le dépôt depuis sa création.
@@ -179,6 +180,16 @@ pub struct VersionJouee {
 }
 
 impl NowPlaying {
+    /// #8689 — la piste dont le ReplayGain s'applique : bibliothèque, ou
+    /// titre Qobuz / TIDAL par son identifiant de service.
+    pub fn piste_rg(&self) -> crate::audio::replaygain::PisteRg<'_> {
+        crate::audio::replaygain::PisteRg::new(
+            self.track_id,
+            Some(self.source.as_str()),
+            self.source_id.as_deref(),
+        )
+    }
+
     /// Canonical mapping from a library [`Track`](crate::db::models::Track) row
     /// to a local `NowPlaying`.
     ///
@@ -194,6 +205,17 @@ impl NowPlaying {
     /// that need URL-resolved cover art or a zone-derived source override those
     /// fields on the returned value. `stream_id` is always `None` (local rows are
     /// not streamed sessions).
+    /// Variante utilisée par le démarrage et l'avance de la bibliothèque :
+    /// l'année de l'album ne sert qu'à cette copie pour l'affichage.
+    pub fn from_track_avec_album(
+        track: &crate::db::models::Track,
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    ) -> Self {
+        let mut lecture = Self::from_track(track);
+        lecture.year = crate::db::annee_de_la_piste::pour_affichage(track, db);
+        lecture
+    }
+
     pub fn from_track(track: &crate::db::models::Track) -> Self {
         Self {
             track_id: track.id,
@@ -992,6 +1014,20 @@ impl GainDemande {
         let facteur = u64::from(self.facteur_de_rendu.load(Ordering::SeqCst) & 0xFFFF);
         Some(((volume * facteur + unite / 2) / unite).min(u64::from(u32::MAX)) as u32)
     }
+
+    /// #8058 — le même produit demandé, en facteur exact (1,0 = gain unité),
+    /// sans l'arrondi aux millièmes de [`Self::units`] : sous 0,0005 il ne
+    /// vaut plus 0. `None` en DoP.
+    pub fn facteur(&self) -> Option<f64> {
+        use std::sync::atomic::Ordering;
+        if self.dop.load(Ordering::Relaxed) {
+            return None;
+        }
+        let volume = f64::from(self.volume_utilisateur.load(Ordering::SeqCst))
+            / f64::from(crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU);
+        let facteur = f64::from(self.facteur_de_rendu.load(Ordering::SeqCst) & 0xFFFF) / 1000.0;
+        Some(volume * facteur)
+    }
 }
 
 /// #7968 — le gain de rendu partagé par la sortie locale
@@ -1215,6 +1251,48 @@ impl PlaybackManager {
             .map_or(1000, |g| {
                 gain_de_rendu_en_millemes(g.load(std::sync::atomic::Ordering::SeqCst))
             })
+    }
+
+    /// #8058 — [`Self::gain_de_rendu_units`] en facteur EXACT, à l'unité fine
+    /// de la sortie locale (#7968). En millièmes, tout gain sous 0,0005
+    /// (curseur `db60` sous ~2,5 %) valait 0 : le son sortait, très faible,
+    /// et le crête-mètre tombait au plancher. `1.0` quand rien n'est branché.
+    pub fn gain_de_rendu(&self, zone_id: i64) -> f64 {
+        self.gains_de_sortie
+            .lock()
+            .expect("gains lock")
+            .get(&zone_id)
+            .map_or(1.0, |g| {
+                crate::audio::volume_scale::gain_des_unites(
+                    g.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            })
+    }
+
+    /// #8058 — [`Self::gain_de_sortie_units`] en facteur exact : gain de
+    /// rendu à l'unité fine × gain moyen du DSP. `1.0` quand rien n'est
+    /// branché.
+    pub fn gain_de_sortie(&self, zone_id: i64) -> f64 {
+        let dsp = self
+            .gains_moyens_du_dsp
+            .lock()
+            .expect("gains lock")
+            .get(&zone_id)
+            .map(|g| g.load(std::sync::atomic::Ordering::SeqCst));
+        let rendu = self.gain_de_rendu(zone_id);
+        match dsp {
+            Some(dsp) if dsp != 1000 => rendu * f64::from(dsp) / 1000.0,
+            _ => rendu,
+        }
+    }
+
+    /// #8058 — [`Self::gain_demande_units`] en facteur exact.
+    pub fn gain_demande(&self, zone_id: i64) -> Option<f64> {
+        self.gains_demandes
+            .lock()
+            .expect("gains_demandes lock")
+            .get(&zone_id)
+            .and_then(GainDemande::facteur)
     }
 
     /// Fil 1908 — partage l'horloge de la sortie locale qui va jouer cette

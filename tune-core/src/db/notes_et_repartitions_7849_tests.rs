@@ -373,6 +373,45 @@ fn verifier_repartitions(b: &dyn DbBackend) {
     assert_eq!(r.by_credit_role, attendu.role, "par rôle de crédit");
 }
 
+/// Recette du 14/11 — la carte « Formats » : une case par CODEC. MPEG et MP3
+/// fusionnés, DSF et DSD fusionnés, un MP4 à profondeur de bits compté en
+/// ALAC, un MP4 sans en M4A (codec non lu, #5710). Repart d'une table de
+/// pistes vide.
+fn verifier_codecs_canoniques(b: &dyn DbBackend) {
+    executer(b, "DELETE FROM track_credits");
+    executer(b, "DELETE FROM tracks");
+    executer(
+        b,
+        "INSERT INTO tracks (id, title, file_path, format, bit_depth) VALUES \
+            (2001, 'a', '/u/a', 'mpeg', NULL), \
+            (2002, 'b', '/u/b', 'mpeg', 0), \
+            (2003, 'c', '/u/c', 'mp3', NULL), \
+            (2004, 'd', '/u/d', 'dsf', 1), \
+            (2005, 'e', '/u/e', 'DSD', 1), \
+            (2006, 'f', '/u/f', 'mp4', 24), \
+            (2007, 'g', '/u/g', 'alac', 24), \
+            (2008, 'h', '/u/h', 'mp4', NULL), \
+            (2009, 'i', '/u/i', 'aac', NULL)",
+    );
+    let r = repartitions::lire(b).unwrap();
+    let paires: Vec<(Option<&str>, i64)> = r
+        .by_codec
+        .iter()
+        .map(|c| (c.value.as_deref(), c.tracks))
+        .collect();
+    assert_eq!(
+        paires,
+        vec![
+            (Some("mp3"), 3),
+            (Some("alac"), 2),
+            (Some("dsd"), 2),
+            (Some("aac"), 1),
+            (Some("m4a"), 1),
+        ],
+        "une case par codec"
+    );
+}
+
 // ── SQLite ──────────────────────────────────────────────────────────────────
 
 #[test]
@@ -448,6 +487,12 @@ fn repartitions_sur_un_jeu_connu_7849() {
     verifier_repartitions(b.as_ref());
 }
 
+#[test]
+fn repartitions_une_case_par_codec_recette_14_11() {
+    let (_db, b) = base();
+    verifier_codecs_canoniques(b.as_ref());
+}
+
 // ── PostgreSQL ──────────────────────────────────────────────────────────────
 
 #[cfg(feature = "postgres")]
@@ -504,4 +549,5 @@ async fn pg_7849_notes_et_repartitions() {
     verifier_separation_par_profil(b.as_ref());
     verifier_recherche(b.as_ref());
     verifier_repartitions(b.as_ref());
+    verifier_codecs_canoniques(b.as_ref());
 }

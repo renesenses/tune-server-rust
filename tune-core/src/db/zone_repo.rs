@@ -488,6 +488,17 @@ pub mod sql {
             .join(", ")
     }
 
+    /// #7572 — renommer SEULEMENT si le nom est encore celui qu'on croit :
+    /// un nom choisi par l'utilisateur entre-temps n'est jamais écrasé.
+    pub fn renommer_si_nom_inchange<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET name = {} WHERE id = {} AND name = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
     pub fn rename_generic_local_label<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE zones SET name = {} \
@@ -1320,7 +1331,23 @@ impl ZoneRepo {
         // the rowid we read reflects the INSERT we just did.
         let create_sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&name, &output_type, &output_device_id];
-        self.db.execute_returning_id(&create_sql, &params)
+        let id = self.db.execute_returning_id(&create_sql, &params)?;
+        self.radio_de_fin_de_file_par_defaut(id);
+        Ok(id)
+    }
+
+    /// Fil 2694 (décision de Bertrand du 13/11, « comme Roon ») : une zone
+    /// naît avec la radio de fin de file ACTIVÉE (mode « titres similaires »).
+    /// Désactivable par zone. Au mieux : une base trop ancienne pour avoir la
+    /// colonne crée sa zone quand même (le réglage y est de toute façon
+    /// illisible, donc éteint).
+    fn radio_de_fin_de_file_par_defaut(&self, id: i64) {
+        let sql = self.update_field_sql("autoplay_enabled");
+        let val = AutoplayMode::Similar.as_stocke().to_string();
+        let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        if let Err(e) = self.db.execute(&sql, &params) {
+            tracing::debug!(zone_id = id, error = %e, "radio_fin_de_file_defaut_non_pose");
+        }
     }
 
     /// Atomically get an existing zone by output_device_id, or create a new one.
@@ -2942,6 +2969,21 @@ impl ZoneRepo {
     /// EVERY local zone with the generic label, so a machine with several
     /// DACs showed indistinguishable twins (forum #1233, Alain Bonnel). Only
     /// the exact generic labels are touched — a user-renamed zone never is.
+    /// #7572 — donne `nouveau` à la zone `zone_id` si, et seulement si, elle
+    /// s'appelle encore `ancien` (le nom que la découverte lui avait donné).
+    /// Rend le nombre de lignes touchées : `0` quand l'utilisateur l'a
+    /// renommée, et c'est voulu.
+    pub fn renommer_si_nom_inchange(
+        &self,
+        zone_id: i64,
+        ancien: &str,
+        nouveau: &str,
+    ) -> Result<usize, String> {
+        let sql = self.dialect_sql(sql::renommer_si_nom_inchange, sql::renommer_si_nom_inchange);
+        let params: [&dyn ToSqlValue; 3] = [&nouveau, &zone_id, &ancien];
+        self.db.execute(&sql, &params)
+    }
+
     pub fn rename_generic_local_label(
         &self,
         zone_id: i64,
@@ -4956,13 +4998,15 @@ mod autoplay_mode_tests {
         assert!(lue(jamais).is_some(), "par identifiant aussi");
     }
 
-    /// Defaut inchange : une zone neuve n'enchaine rien.
+    /// Fil 2694 (décision de Bertrand du 13/11, « comme Roon ») : une zone
+    /// neuve enchaîne sur des titres similaires à la fin de la file. C'était
+    /// `Off` jusqu'à la rc12.
     #[test]
-    fn zone_neuve_est_eteinte() {
+    fn zone_neuve_a_la_radio_de_fin_de_file() {
         let repo = repo();
         let id = zone(&repo);
-        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Off);
-        assert!(!repo.get_autoplay_enabled(id));
+        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Similar);
+        assert!(repo.get_autoplay_enabled(id));
     }
 
     /// LE TEST DE NON-REGRESSION. Une zone dont l'autoplay etait actif avant

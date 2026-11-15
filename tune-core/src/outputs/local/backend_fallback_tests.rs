@@ -464,8 +464,9 @@ fn chaque_chemin_douverture_enregistre_le_peripherique_ouvert() {
     //    `find_device_with_fallback` a QUATRE sorties qui décident du son —
     //    « default » demandé, nom résolu, refus d'hôte étranger (#3230, la
     //    seule qui n'ouvre rien), repli sur le périphérique système
-    //    (#2207). Les quatre doivent enregistrer : une sortie muette, c'est
-    //    une zone qui affiche la consigne au lieu de la vérité.
+    //    (#2207), refus sous Windows d'un périphérique introuvable (#8171).
+    //    Les cinq doivent enregistrer : une sortie muette, c'est une zone qui
+    //    affiche la consigne au lieu de la vérité.
     let debut = resolution
         .find("fn find_device_with_fallback(")
         .expect("find_device_with_fallback introuvable");
@@ -477,13 +478,18 @@ fn chaque_chemin_douverture_enregistre_le_peripherique_ouvert() {
     let enregistrements = corps.matches("note_opened_device(").count()
         + corps.matches("note_device_outcome(").count();
     assert_eq!(
-        enregistrements, 4,
-        "find_device_with_fallback décide du son par quatre chemins mais n'en \
+        enregistrements, 5,
+        "find_device_with_fallback décide du son par cinq chemins mais n'en \
          enregistre que {enregistrements} : une sortie repart sans dire ce qu'elle a fait"
     );
     assert!(
         corps.contains("audio_device_not_found_falling_back_to_default"),
         "le repli sur le périphérique système a disparu — le cas à rendre visible n'existe plus"
+    );
+    assert!(
+        corps.contains("audio_device_not_found_refused"),
+        "le refus Windows d'un périphérique introuvable a disparu — la zone \
+         repartirait sur les haut-parleurs du PC (#8171)"
     );
     assert!(
         corps.contains("audio_device_foreign_host_refused"),

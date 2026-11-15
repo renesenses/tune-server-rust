@@ -25,8 +25,20 @@
 //!
 //! # Aucune donnée personnelle
 //!
-//! Le relevé est un GET anonyme de l'annuaire public : ni compte, ni profil,
-//! ni liste de stations de l'utilisateur ne part vers mozaiklabs.fr.
+//! Ni compte, ni profil, ni liste de stations de l'utilisateur ne part vers
+//! mozaiklabs.fr.
+//!
+//! # La relève s'identifie (#8156)
+//!
+//! Décision de Bertrand du 08/11/2026 : l'accès anonyme à l'annuaire sera
+//! fermé, en deux temps. Temps 1 (ici) : le relevé présente l'identifiant
+//! d'installation que le site connaît déjà par le battement de cœur
+//! (`server_id`, en-tête [`ENTETE_INSTALLATION`]) et la version de Tune
+//! (`User-Agent`). C'est un identifiant tiré au hasard, sans compte ni
+//! profil. Une installation qui a refusé la télémétrie ne bat pas et le site
+//! ne la connaît pas : son relevé reste anonyme, comme avant. Un refus du site
+//! (401, 403) laisse servir le relevé d'avant, et l'écran reçoit `refus` pour
+//! dire pourquoi l'annuaire n'est pas rafraîchi.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as CheminDisque, PathBuf};
@@ -47,6 +59,13 @@ use crate::state::AppState;
 
 /// L'annuaire v2 de mozaiklabs.fr.
 pub const ANNUAIRE_V2_URL: &str = "https://mozaiklabs.fr/api/v2/radios";
+
+/// #8156 — l'en-tête qui porte l'identifiant d'installation (`server_id`), le
+/// même nom que celui que le site lit déjà sur les appels signés du serveur.
+pub const ENTETE_INSTALLATION: &str = "X-Tune-Server-Id";
+
+/// #8156 — le code rendu à l'écran quand le site refuse le relevé.
+pub const CODE_REFUS: &str = "annuaire_refuse";
 
 /// Le relevé de fond se refait toutes les 6 h (#7043, décision de Bertrand du
 /// 25/10/2026 ; c'était 24 h).
@@ -79,6 +98,9 @@ pub struct EtatAnnuaire {
     /// un site injoignable ne doit pas être réinterrogé à chaque ouverture.
     #[serde(skip)]
     derniere_tentative: std::sync::Arc<AtomicI64>,
+    /// #8156 — statut HTTP (401, 403) du dernier relevé refusé par le site ;
+    /// `None` dès qu'un relevé passe de nouveau.
+    pub refus: Option<u16>,
 }
 
 /// Le fichier du cache : le corps v2 tel que reçu, plus son `ETag` et sa date.
@@ -99,6 +121,9 @@ pub enum Releve {
     /// Réseau en défaut, ou réponse vide/illisible. Le relevé d'avant (cache
     /// ou mémoire) reste servi.
     Injoignable,
+    /// #8156 — le site refuse le relevé (401, 403) : le relevé d'avant reste
+    /// servi, et l'écran dit pourquoi il n'est pas rafraîchi.
+    Refuse(u16),
 }
 
 impl Releve {
@@ -202,6 +227,34 @@ pub fn charger_le_cache_si_vide(state: &AppState, chemin: &CheminDisque) -> bool
     true
 }
 
+/// #8156 — l'identifiant d'installation que le relevé présente au site, ou
+/// `None` (relevé anonyme) quand la télémétrie est refusée : le site ne connaît
+/// alors pas ce serveur, et l'identifiant ne sort pas. Même accesseur que le
+/// battement de cœur, pour parler du même identifiant.
+pub fn identite_de_l_installation(
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+) -> Option<String> {
+    use tune_core::cloud::telemetry::TelemetryReporter;
+    if !TelemetryReporter::is_enabled_for(settings) {
+        return None;
+    }
+    Some(TelemetryReporter::get_or_create_server_id(settings)).filter(|id| !id.trim().is_empty())
+}
+
+/// #8156 — le refus du site tel que l'écran le reçoit, ou `null`.
+fn refus_pour_l_ecran(etat: &EtatAnnuaire) -> Value {
+    match etat.refus {
+        Some(status) => json!({ "status": status, "code": CODE_REFUS }),
+        None => Value::Null,
+    }
+}
+
+fn noter_le_refus(state: &AppState, refus: Option<u16>) {
+    if let Ok(mut e) = state.annuaire_etat.write() {
+        e.refus = refus;
+    }
+}
+
 /// Relève l'annuaire à `url` et met à jour le cache `chemin`.
 pub async fn rafraichir_depuis(state: &AppState, url: &str, chemin: &CheminDisque) -> Releve {
     // Le cache d'abord : un serveur qui démarre hors ligne sert l'annuaire de
@@ -213,9 +266,17 @@ pub async fn rafraichir_depuis(state: &AppState, url: &str, chemin: &CheminDisqu
     let mut requete = tune_core::http::client::shared()
         .get(url)
         .header("Accept", "application/json")
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("Tune/{} (https://mozaiklabs.fr)", tune_core::version()),
+        )
         .timeout(std::time::Duration::from_secs(20));
     if let Some(etag) = etag.as_deref() {
         requete = requete.header("If-None-Match", etag);
+    }
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    if let Some(id) = identite_de_l_installation(&reglages) {
+        requete = requete.header(ENTETE_INSTALLATION, id);
     }
     let Ok(reponse) = requete.send().await else {
         tracing::info!("radio_annuaire_injoignable");
@@ -233,12 +294,24 @@ pub async fn rafraichir_depuis(state: &AppState, url: &str, chemin: &CheminDisqu
         if let Ok(mut e) = state.annuaire_etat.write() {
             e.origine = "reseau";
             e.releve_le = Some(releve_le);
+            e.refus = None;
         }
         tracing::info!("radio_annuaire_non_modifie");
         return Releve::NonModifie;
     }
-    if !reponse.status().is_success() {
-        tracing::info!(status = %reponse.status(), "radio_annuaire_refus");
+    let statut = reponse.status();
+    if matches!(
+        statut,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        // #8156 — le site refuse ce relevé : le relevé d'avant reste servi, et
+        // l'écran saura pourquoi il n'est pas rafraîchi.
+        tracing::warn!(status = %statut, "radio_annuaire_refus");
+        noter_le_refus(state, Some(statut.as_u16()));
+        return Releve::Refuse(statut.as_u16());
+    }
+    if !statut.is_success() {
+        tracing::info!(status = %statut, "radio_annuaire_refus");
         return Releve::Injoignable;
     }
     let etag_recu = reponse
@@ -270,6 +343,7 @@ pub async fn rafraichir_depuis(state: &AppState, url: &str, chemin: &CheminDisqu
         e.origine = "reseau";
         e.releve_le = Some(releve_le);
         e.etag = etag_recu;
+        e.refus = None;
     }
     Releve::Nouveau(n)
 }
@@ -329,6 +403,10 @@ pub fn relever_a_l_ouverture(
         verrou.store(false, Ordering::SeqCst);
     }))
 }
+
+/// web#2795 — la surcharge locale d'une station de l'annuaire.
+#[path = "radios_surcharge_2795.rs"]
+pub(crate) mod surcharge;
 
 // ---------------------------------------------------------------------------
 // Rapprochement « Mes radios » ↔ annuaire
@@ -581,6 +659,12 @@ pub fn router() -> Router<AppState> {
             "/directory/preferred-stream/{radio_id}",
             post(choisir_le_flux),
         )
+        // web#2795 — « Revenir à la fiche de l'annuaire » : efface la
+        // surcharge locale.
+        .route(
+            "/directory/revert/{radio_id}",
+            post(surcharge::revenir_a_la_fiche),
+        )
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -597,6 +681,10 @@ pub struct FiltresAnnuaire {
     /// #7718 — le niveau de qualité minimal d'au moins un flux.
     pub quality_min: Option<String>,
     pub lossless: Option<bool>,
+    /// Recette rc12 (14/11) — le bouton « Sans perte » (alias de `lossless`).
+    pub sans_perte: Option<bool>,
+    /// Recette rc12 (14/11) — le bouton « Haute qualité » : sans perte ou ≥ 256 kbit/s.
+    pub haute_qualite: Option<bool>,
     pub hires: Option<bool>,
     pub favorites_only: Option<bool>,
     pub rated_min: Option<f64>,
@@ -617,6 +705,7 @@ impl FiltresAnnuaire {
             self.metadata_plus,
         )
         .avec_qualite_min(self.quality_min.as_deref())
+        .avec_boutons_rc12(self.sans_perte, self.haute_qualite)
     }
 }
 
@@ -685,10 +774,24 @@ pub fn corps_annuaire_avec_liens(
     // L'inverse du rapprochement : pour chaque fiche, la station locale.
     let index = IndexAnnuaire::new(fiches);
     let mut locales: HashMap<usize, &RadioStation> = HashMap::new();
+    let mut priorites: HashMap<usize, u8> = HashMap::new();
     for st in mes_radios {
         let ext = st.id.and_then(|id| liens.get(&id)).map(String::as_str);
-        if let Some((i, _)) = index.lien(ext, &st.name, &st.url) {
-            locales.entry(i).or_insert(st);
+        if let Some((i, lien)) = index.lien(ext, &st.name, &st.url) {
+            // Un homonyme ne doit pas masquer le flux exact, quel que soit
+            // l'ordre de la liste. Le lien enregistré reste prioritaire.
+            let priorite = match lien {
+                Lien::Id => 3,
+                Lien::Flux => 2,
+                Lien::Nom => 1,
+            };
+            if priorites
+                .get(&i)
+                .is_none_or(|ancienne| priorite > *ancienne)
+            {
+                locales.insert(i, st);
+                priorites.insert(i, priorite);
+            }
         }
     }
 
@@ -723,6 +826,14 @@ pub fn corps_annuaire_avec_liens(
             }
         }
     }
+    // Recette rc12 (14/11, Rémi) — le nombre de la puce « Tous les genres » :
+    // la recherche, le pays et les critères, AUCUN genre. Le client ne
+    // l'avait que d'une réponse sans genre ; un genre choisi, il le perdait
+    // dès qu'un autre filtre changeait.
+    let total_tous_genres = qui_cherchent
+        .iter()
+        .filter(|(_, f)| meme_pays(f, &criteres))
+        .count();
     let retenues: Vec<(usize, &StationAnnuaire)> = qui_cherchent
         .into_iter()
         .filter(|(_, f)| meme_pays(f, &criteres) && meme_genre(f, &criteres))
@@ -780,6 +891,7 @@ pub fn corps_annuaire_avec_liens(
     };
     json!({
         "total": total,
+        "total_all_genres": total_tous_genres,
         "offset": offset,
         "limit": limit,
         "count": items.len(),
@@ -789,6 +901,7 @@ pub fn corps_annuaire_avec_liens(
         "stations": fiches.len(),
         "origine": if fiches.is_empty() { "aucun" } else { etat.origine },
         "releve_le": etat.releve_le,
+        "refus": refus_pour_l_ecran(etat),
         "attribution": {
             "name": ATTRIBUTION_NOM,
             "url": ATTRIBUTION_URL,
@@ -841,6 +954,7 @@ async fn forcer_le_releve(State(state): State<AppState>) -> Json<Value> {
         "a_jour": bilan.annuaire_a_jour,
         "origine": if stations == 0 { "aucun" } else { etat.origine },
         "releve_le": etat.releve_le,
+        "refus": refus_pour_l_ecran(&etat),
     }))
 }
 
@@ -935,13 +1049,20 @@ async fn ajouter(
                 station.codec = flux.codec.map(|c| c.to_ascii_lowercase());
                 station.bitrate = flux.bitrate;
             }
-            match repo.create(&station) {
-                Ok(id) => {
+            match repo.create_unique(&station) {
+                Ok((id, nouvelle)) => {
                     state.event_bus.emit(
                         "library.radios_changed",
                         json!({"action": "created", "id": id, "external_id": external_id}),
                     );
-                    (Some(id), StatusCode::CREATED)
+                    (
+                        Some(id),
+                        if nouvelle {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::OK
+                        },
+                    )
                 }
                 Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
             }

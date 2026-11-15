@@ -194,6 +194,38 @@ impl FiltreHires {
     }
 }
 
+/// rc12 — les albums dont le verdict PUBLIÉ est l'un de `mots` (OU entre
+/// eux, comme les pastilles de la Bibliothèque) : le filtre `hires_verdict`
+/// du catalogue imprimable. Mêmes prédicats que `?hires_verdict=` de la
+/// liste ([`FiltreHires::predicat`]) : un mot inconnu ne rend rien, et
+/// « douteux » masqué ne rend rien non plus.
+pub fn albums_des_verdicts(
+    db: &Arc<dyn DbBackend>,
+    mots: &[String],
+    douteux_visible: bool,
+) -> Result<std::collections::HashSet<i64>, String> {
+    if mots.is_empty() {
+        return Ok(Default::default());
+    }
+    let ou = mots
+        .iter()
+        .map(|m| {
+            format!(
+                "({})",
+                FiltreHires::depuis_le_mot(m, douteux_visible).predicat("a.id")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let sql = format!("SELECT a.id FROM albums a WHERE {ou}");
+    Ok(db
+        .query_many(&sql, &[])
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+        .collect())
+}
+
 /// Le prédicat SQL « la piste `id_piste` (`t.id`) se PUBLIE avec ce
 /// verdict » : celui de sa ligne de `hires_verifications`. Sans ligne, ou
 /// `non_concluant`, elle est non analysée ; douteuse masquée aussi.

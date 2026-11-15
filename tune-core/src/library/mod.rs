@@ -14,6 +14,8 @@ pub mod cover_fetcher;
 pub mod debit_des_pistes;
 /// #6917 — ne dédoublonner que les copies d'une même racine de musique.
 pub mod dedoublonnage_par_racine;
+/// #8676 — « Remplacer le chemin » : réécrire le préfixe des chemins stockés.
+pub mod deplacer_racine;
 pub mod duplicate_detector;
 /// Les exemplaires d'une piste dans plusieurs répertoires (#4907).
 pub mod exemplaires;
@@ -50,6 +52,8 @@ pub mod quality;
 pub mod regle_compilation;
 /// Où vit la règle de choix des versions : par profil, puis globale (#2264).
 pub mod regle_de_version;
+/// #8325 — la relecture unique des balises classiques des fichiers importés.
+pub mod relecture_classique;
 /// La grammaire de requêtes de la bibliothèque et son compilateur SQL (#7848).
 pub mod requete;
 pub mod smart_collections;

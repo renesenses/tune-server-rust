@@ -83,7 +83,7 @@ fn crc8(octets: &[u8]) -> u8 {
 }
 /// CRC-16 FLAC : polynôme 0x8005, valeur initiale 0, sans réflexion. Celui
 /// d'une trame suivie de son propre CRC (gros-boutiste) vaut 0.
-fn crc16(crc: u16, octet: u8) -> u16 {
+pub(super) fn crc16(crc: u16, octet: u8) -> u16 {
     (crc << 8) ^ CRC16[((crc >> 8) as u8 ^ octet) as usize]
 }
 /// CRC-32 Ogg : polynôme 0x04C11DB7, valeur initiale 0, sans réflexion.

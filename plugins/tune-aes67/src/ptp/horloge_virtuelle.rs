@@ -158,6 +158,17 @@ impl HorlogeVirtuelle {
         f.base_virtuelle = f.virtuel(m);
         f.base_monotone = m;
     }
+    /// Même rebasage, à un instant explicite : le témoin n'a pas à comparer
+    /// deux lectures d'horloges séparées par un passage de l'ordonnanceur.
+    fn regler_frequence_a(&self, ppm: f64, m: u64) -> Time {
+        let mut f = self.formule();
+        Self::rebaser(&mut f, m);
+        f.ppm = ppm;
+        let maintenant = f.base_virtuelle;
+        drop(f);
+        self.0.corrections.fetch_add(1, Ordering::AcqRel);
+        Time::from_nanos(u64::try_from(maintenant.max(0)).unwrap_or(0))
+    }
 }
 
 impl Clock for HorlogeVirtuelle {
@@ -194,15 +205,7 @@ impl Clock for HorlogeVirtuelle {
 
     fn set_frequency(&mut self, ppm: f64) -> Result<Time, Self::Error> {
         let m = self.0.monotone.ns();
-        let mut f = self.formule();
-        Self::rebaser(&mut f, m);
-        f.ppm = ppm;
-        let maintenant = f.base_virtuelle;
-        drop(f);
-        self.0.corrections.fetch_add(1, Ordering::AcqRel);
-        Ok(Time::from_nanos(
-            u64::try_from(maintenant.max(0)).unwrap_or(0),
-        ))
+        Ok(self.regler_frequence_a(ppm, m))
     }
 
     fn set_properties(&mut self, _: &TimePropertiesDS) -> Result<(), Self::Error> {
@@ -255,19 +258,14 @@ mod tests {
     #[test]
     fn la_frequence_change_la_pente_sans_saut() {
         let (mut h, g) = horloge();
-        let m = HorlogeMonotone::new();
-        h.set_frequency(1000.0).unwrap(); // +1000 ppm : exagéré, pour mesurer.
-        let (v0, m0) = (h.maintenant_ns(), m.ns());
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let (v1, m1) = (h.maintenant_ns(), m.ns());
-        let dv = (v1 - v0) as f64;
-        let dm = (m1 - m0) as f64;
-        let ppm = (dv / dm - 1.0) * 1e6;
-        assert!((ppm - 1000.0).abs() < 50.0, "{ppm} ppm");
-        // Revenir à 0 ppm ne fait pas reculer le temps.
-        let avant = h.maintenant_ns();
-        h.set_frequency(0.0).unwrap();
-        assert!(h.maintenant_ns() >= avant);
+        let v0 = i128::from(ns_de(h.set_frequency(1000.0).unwrap()));
+        let m0 = h.formule().base_monotone;
+        let m1 = m0 + 200_000_000;
+        let v1 = h.formule().virtuel(m1);
+        assert_eq!(v1 - v0, 200_200_000, "+1000 ppm pendant 200 ms");
+        // Le changement de pente conserve toute la correction accumulée.
+        assert_eq!(i128::from(ns_de(h.regler_frequence_a(0.0, m1))), v1);
+        assert_eq!(h.formule().virtuel(m1 + 200_000_000) - v1, 200_000_000);
         assert_eq!(g.load(Ordering::Acquire), 0, "pas de saut");
         assert_eq!(h.corrections(), 2);
         assert_eq!(h.ppm(), 0.0);

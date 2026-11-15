@@ -176,6 +176,12 @@ tokenizers = { version = "0.20", default-features = false, features = ["onig"], 
 # macOS + Linux : statfs pour détecter les montages réseau (scanner/watcher.rs).
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# #8248 — sonder le DSD natif d'un PCM `hw:` (formats DSD_U32_BE/_LE et
+# cadences exactes) : cpal ne dit pas lequel des deux ordres il ouvre. Même
+# version que celle de vendor/cpal, déjà dans Cargo.lock.
+alsa = { version = "0.11", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "objc2-core-audio-types", "AudioHardware", "AudioHardwareDeprecated"], optional = true }
@@ -207,6 +213,19 @@ path = "tests/sendspin_poignee_s2a.rs"
 [[test]]
 name = "integration_contracts"
 path = "tests/integration_contracts.rs"
+
+# #8609 — la purge sous `mlockall` : binaire à lui seul (le verrou vaut pour
+# tout le processus), un seul test.
+[[test]]
+name = "purge_sous_mlockall_8609"
+path = "tests/purge_sous_mlockall_8609.rs"
+
+# Banc rc12 (#8609) — rétablissement du verrou refusé par le noyau, puis
+# retenté au relevé suivant. Binaire à lui seul (`mlockall` et
+# `RLIMIT_MEMLOCK` valent pour tout le processus).
+[[test]]
+name = "purge_reverrouillage_refuse_8609"
+path = "tests/purge_reverrouillage_refuse_8609.rs"
 
 # `autotests = false` : sans cette cible, le témoin ne serait jamais compilé.
 # Binaire à lui seul : le cache d'intérêt de tracing est un état de PROCESSUS
@@ -406,6 +425,12 @@ path = "tests/ape_incremental_i2505.rs"
 name = "ape_pic_memoire_i2505"
 path = "tests/ape_pic_memoire_i2505.rs"
 
+# #8558 — pic mémoire du transcodage vers fichier (FLAC 192/24 vers 96 kHz,
+# Chromecast). Binaire à lui seul : `#[global_allocator]` de mesure.
+[[test]]
+name = "transcodage_memoire_bornee_8558"
+path = "tests/transcodage_memoire_bornee_8558.rs"
+
 # #6168 — seuil mmap de la glibc fixé au démarrage. Binaire à lui seul : il
 # se relance en processus fils, l'état de l'allocateur est global.
 [[test]]
@@ -455,7 +480,7 @@ harness = false
 
 [features]
 default = ["local-audio"]
-local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio", "objc2-core-audio-types"]
+local-audio = ["cpal", "alsa", "coreaudio-rs", "objc2-core-audio", "objc2-core-audio-types"]
 # Lets plugins mount HTTP routes through `PluginContext::register_router`.
 # Gated so tune-cli — which links tune-core but serves no HTTP — does not
 # have to build axum. tune-server enables it.
@@ -732,6 +757,13 @@ required-features = ["local-audio"]
 name = "asio_dsd_5643"
 path = "tests/asio_dsd_5643.rs"
 
+# #8489 — capture d'un micro S24_3LE seul (UMIK-1/UMIK-2) : fonctions pures du
+# correctif de vendor/cpal (alsa/packed24.rs) par `#[path]`, plus un banc de
+# bout en bout contre un PCM ALSA privé sous `local-audio`.
+[[test]]
+name = "alsa_s24_3_8489"
+path = "tests/alsa_s24_3_8489.rs"
+
 # #4378 — la garde qui tient la fonctionnalité `dst` ARMÉE (licence acceptée le
 # 06/10/2026) : présente dans les lignes `--features` de toutes les recettes
 # qui PUBLIENT un artefact (release.yml, docker.yml, Dockerfile), bases
@@ -844,3 +876,9 @@ path = "tests/autoeq_canaux_7340.rs"
 [[test]]
 name = "pochettes_compilations_6077"
 path = "tests/pochettes_compilations_6077.rs"
+
+# #8239 : le journal de synchro après un scan, sur PostgreSQL (`IS DISTINCT
+# FROM`, tables de la migration 110). Sauté sans `TUNE_TEST_PG_URL`.
+[[test]]
+name = "journal_apres_scan_pg_8239"
+path = "tests/journal_apres_scan_pg_8239.rs"

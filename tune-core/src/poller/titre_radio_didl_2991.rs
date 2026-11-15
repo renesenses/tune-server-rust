@@ -89,9 +89,12 @@ fn journaliser(
     titre: &TitreRadio,
     issue: IssueRelai,
 ) -> IssueRelai {
-    let issue_txt = match &issue {
-        IssueRelai::Envoye { action } => *action,
-        IssueRelai::Ignore(raison) => raison,
+    let (issue_txt, piste_courante) = match &issue {
+        IssueRelai::Envoye {
+            action,
+            piste_courante,
+        } => (*action, *piste_courante),
+        IssueRelai::Ignore(raison) => (*raison, "-"),
     };
     info!(
         zone_id,
@@ -101,6 +104,7 @@ fn journaliser(
         titre = %titre.titre,
         pochette = titre.pochette.as_deref().unwrap_or("-"),
         issue = issue_txt,
+        piste_courante,
         "radio_didl_relai"
     );
     issue

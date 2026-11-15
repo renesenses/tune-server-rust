@@ -84,9 +84,12 @@ async fn ce_qui_tourne_dit_les_passes_la_lecture_l_avancement_et_la_chaleur_4681
         state
             .background_tasks
             .begin("enrich_all", "Enrichissement", "enrichment");
-    state
-        .background_tasks
-        .update_progress("enrich_all", 3, 7, "MusicBrainz");
+    state.background_tasks.update_progress(
+        "enrich_all",
+        3,
+        7,
+        tune_server::background_tasks::Phase::Source("MusicBrainz"),
+    );
 
     let lecture = lire(&app).await;
     assert_eq!(lecture["playback"]["active"], true, "{lecture}");
@@ -110,6 +113,12 @@ async fn ce_qui_tourne_dit_les_passes_la_lecture_l_avancement_et_la_chaleur_4681
     assert_eq!(en["progress"]["processed"], 3, "{en}");
     assert_eq!(en["progress"]["total"], 7, "{en}");
     assert_eq!(en["progress"]["detail"], "MusicBrainz", "{en}");
+    // #8282 — code stable et paramètre, à côté du texte historique.
+    assert_eq!(en["progress"]["detail_code"], "source", "{en}");
+    assert_eq!(
+        en["progress"]["detail_params"]["name"], "MusicBrainz",
+        "{en}"
+    );
 
     let freinees = ids(&lecture["throttled_for_playback"]);
     assert!(freinees.contains(&"replaygain") && freinees.contains(&"enrichment"));

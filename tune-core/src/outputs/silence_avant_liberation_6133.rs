@@ -63,6 +63,21 @@ impl SilenceAvantLiberation {
     /// appelle `liberer` (pause et abandon du flux). Rend `true` si le silence a
     /// été confirmé avant la libération.
     pub(crate) fn taire_puis_liberer(&self, borne: Duration, liberer: impl FnOnce()) -> bool {
+        self.taire_puis_liberer_tant_que(borne, || true, liberer)
+    }
+
+    /// CoreAudio : ne demander des blocs que tant que l'AudioUnit peut rappeler.
+    /// La sonde et l'attente vivent sur le fil producteur, jamais dans le rappel.
+    pub(crate) fn taire_puis_liberer_tant_que(
+        &self,
+        borne: Duration,
+        mut rendu_actif: impl FnMut() -> bool,
+        liberer: impl FnOnce(),
+    ) -> bool {
+        if !rendu_actif() {
+            liberer();
+            return false;
+        }
         self.blocs_muets.store(0, Ordering::Release);
         self.arme.store(true, Ordering::Release);
         let debut = Instant::now();
@@ -70,7 +85,7 @@ impl SilenceAvantLiberation {
             if self.blocs_muets.load(Ordering::Acquire) >= BLOCS_MUETS_REQUIS {
                 break true;
             }
-            if debut.elapsed() >= borne {
+            if !rendu_actif() || debut.elapsed() >= borne {
                 break false;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -107,6 +122,49 @@ pub(crate) fn remplir_le_bloc_dsd_natif(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn dop_7704_sortie_deja_arretee_ne_demande_aucun_rappel() {
+        let silence = SilenceAvantLiberation::default();
+        let liberee = std::cell::Cell::new(false);
+        assert!(!silence.taire_puis_liberer_tant_que(
+            BORNE_SILENCE_AVANT_LIBERATION,
+            || false,
+            || liberee.set(true),
+        ));
+        assert!(liberee.get());
+        assert!(
+            !silence.doit_se_taire(false),
+            "#7704 : une AudioUnit arrêtée ne doit pas attendre de blocs muets"
+        );
+    }
+
+    #[test]
+    fn dop_7704_arret_pendant_l_attente_ne_confirme_pas_un_repos_absent() {
+        let silence = SilenceAvantLiberation::default();
+        let mut actif = true;
+        let liberee = std::cell::Cell::new(false);
+        assert!(!silence.taire_puis_liberer_tant_que(
+            BORNE_SILENCE_AVANT_LIBERATION,
+            || std::mem::replace(&mut actif, false),
+            || liberee.set(true),
+        ));
+        assert!(liberee.get());
+        assert_eq!(silence.blocs_muets(), 0);
+    }
+
+    #[test]
+    fn dop_7704_sortie_active_confirme_tous_les_blocs_avant_liberation() {
+        let silence = SilenceAvantLiberation::default();
+        assert!(silence.taire_puis_liberer_tant_que(
+            BORNE_SILENCE_AVANT_LIBERATION,
+            || {
+                silence.doit_se_taire(false);
+                true
+            },
+            || assert!(silence.blocs_muets() >= BLOCS_MUETS_REQUIS),
+        ));
+    }
 
     /// #6133, volet DSD natif : anneau plein de musique, zone pas en pause.
     /// Silence de libération armé, le rappel écrit le silence DSD et compte

@@ -109,7 +109,8 @@ impl RaccordZones {
             if !meme {
                 return;
             }
-            reg.remove(id);
+            // #8029 — retirée, la sortie est aussi arrêtée.
+            tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(reg.remove(id));
         }
         crate::discovery_setup::set_zone_online(&self.bus, &self.db, id, false);
         self.bus

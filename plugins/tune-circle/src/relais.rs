@@ -15,7 +15,6 @@ use reqwest::header::{
 use reqwest::{Method, StatusCode, Url};
 use serde_json::Value;
 use tracing::{debug, info, warn};
-use tune_core::cloud::sso::{DEFAULT_CLIENT_ID, MozaikAuth};
 use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -132,6 +131,11 @@ impl Relais {
         let Some(jeton) = lire(&settings, "mozaik_access_token") else {
             return IssueImage::NonConnecte;
         };
+        // #8238 : session refusée par le site, plus rien ne part avant une
+        // nouvelle connexion.
+        if tune_core::cloud::sso::reconnexion_requise(&settings) {
+            return IssueImage::NonConnecte;
+        }
         let base = lire(&settings, "mozaik_base_url").unwrap_or_else(|| BASE_PAR_DEFAUT.into());
         let Some(url) = url_du_cercle(&base, segments) else {
             return IssueImage::Indisponible;
@@ -147,9 +151,9 @@ impl Relais {
             }
             r.send()
         };
-        let mut envoi = envoyer_image(jeton).await;
+        let mut envoi = envoyer_image(jeton.clone()).await;
         if matches!(&envoi, Ok(r) if r.status() == StatusCode::UNAUTHORIZED)
-            && let Some(nouveau) = rafraichir(&settings, &base).await
+            && let Some(nouveau) = rafraichir(&settings, &jeton).await
         {
             envoi = envoyer_image(nouveau).await;
         }
@@ -215,6 +219,12 @@ impl Relais {
             debug!(route, "circle_non_connecte");
             return Issue::NonConnecte;
         };
+        // #8238 : session refusée par le site, plus rien ne part avant une
+        // nouvelle connexion — ni l'appel, ni un renouvellement voué au refus.
+        if tune_core::cloud::sso::reconnexion_requise(&settings) {
+            debug!(route, "circle_reconnexion_requise");
+            return Issue::NonConnecte;
+        }
         let base = lire(&settings, "mozaik_base_url").unwrap_or_else(|| BASE_PAR_DEFAUT.into());
         let Some(mut url) = url_du_cercle(&base, segments) else {
             warn!(route, "circle_adresse_cloud_invalide");
@@ -227,7 +237,7 @@ impl Relais {
         // rafraîchissement, comme le battement de compte, puis le verdict du
         // cloud est relayé tel quel.
         if matches!(&envoi, Ok(r) if r.status() == StatusCode::UNAUTHORIZED)
-            && let Some(nouveau) = rafraichir(&settings, &base).await
+            && let Some(nouveau) = rafraichir(&settings, &jeton).await
         {
             envoi = envoyer(&url, &methode, &nouveau, corps, if_match).await;
         }
@@ -334,36 +344,17 @@ async fn envoyer(
 }
 
 /// Rafraîchit la session SSO du serveur — la même, pas une seconde — et rend
-/// le nouveau jeton d'accès. Même résolution du client OAuth que le battement
-/// de compte (`mozaik_client_id`, `TUNE_MOZAIK_CLIENT_ID`, puis le client
-/// public par défaut).
-async fn rafraichir(settings: &SettingsRepo, base: &str) -> Option<String> {
-    let jeton_de_rafraichissement = lire(settings, "mozaik_refresh_token")?;
-    let client_id = lire(settings, "mozaik_client_id")
-        .or_else(|| {
-            std::env::var("TUNE_MOZAIK_CLIENT_ID")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
-    match MozaikAuth::new(client_id, Some(base))
-        .refresh_token(&jeton_de_rafraichissement)
-        .await
-    {
-        Ok(t) => {
-            settings.set("mozaik_access_token", &t.access_token).ok();
-            if let Some(nouveau) = t.refresh_token.as_deref().filter(|s| !s.is_empty()) {
-                settings.set("mozaik_refresh_token", nouveau).ok();
-            }
-            info!("circle_session_rafraichie");
-            Some(t.access_token)
-        }
-        Err(e) => {
-            // Le message de `refresh_token` ne porte que le statut.
-            debug!(error = %e, "circle_rafraichissement_refuse");
-            None
-        }
+/// le jeton d'accès à présenter. Passe par le renouvellement UNIQUE du
+/// serveur (#8238) : Tune Circle ne renouvelle plus de son côté, en
+/// concurrence avec les autres tâches du compte.
+async fn rafraichir(settings: &SettingsRepo, refuse: &str) -> Option<String> {
+    let jeton = tune_core::cloud::sso::renouveler_la_session(settings, refuse).await;
+    if jeton.is_some() {
+        info!("circle_session_rafraichie");
+    } else {
+        debug!("circle_rafraichissement_refuse");
     }
+    jeton
 }
 
 #[cfg(test)]

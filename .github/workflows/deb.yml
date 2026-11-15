@@ -177,6 +177,11 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
+      # Seul scripts/ci est utile ici : scripts/ci/apt-robuste.sh, appele
+      # avant chaque `apt-get update` (panne DNS de security.ubuntu.com, 11/11).
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci
       - uses: actions/download-artifact@v4
         with:
           name: deb-amd64
@@ -185,6 +190,7 @@ jobs:
       - name: apt install
         run: |
           set -euo pipefail
+          bash scripts/ci/apt-robuste.sh
           sudo apt-get update -qq
           # `apt-get install ./fichier.deb` résout les dépendances déclarées,
           # là où `dpkg -i` les laisserait manquantes. C'est la commande que

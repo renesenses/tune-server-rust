@@ -96,8 +96,14 @@ pub(super) fn track_filter_from_raw(raw: Option<&str>) -> Result<TrackFilter, Ap
         labels: texts("label"),
         composers: texts("composer"),
         instruments: texts("instrument"),
+        // #8325 — `?conductor=…&ensemble=…&work=…`, clé répétée.
+        conductors: texts("conductor"),
+        ensembles: texts("ensemble"),
+        works: texts("work"),
         artists: texts("artist"),
         countries: texts("country"),
+        // #8090 — pays de l'artiste (MusicBrainz), à côté du pays d'édition.
+        artist_countries: texts("artist_country"),
         moods: texts("mood"),
         source_medias: texts("source_media"),
         ratings: ints(raw, "rating")?,

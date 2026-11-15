@@ -166,6 +166,9 @@ const MIGRATION_TABLES: &[&str] = &[
     // Qobuz/Tidal/Bandcamp bannis redeviendraient jouables par l'aleatoire
     // et la radio a la bascule SQLite -> PostgreSQL.
     "streaming_hidden_items",
+    // « Pas pour moi » de l'accueil (web#916). Sans cette ligne, toutes les
+    // suggestions écartées reviendraient à la bascule SQLite -> PostgreSQL.
+    "suggestions_ecartees",
     "favorites",
     // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
     // seraient perdus à la bascule SQLite → PostgreSQL.
@@ -229,6 +232,13 @@ const MIGRATION_TABLES: &[&str] = &[
 const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Reprises (#7280), créées par le script 100 : conserver leur file et position.
     "listening_resumes",
+    // Positions des épisodes de podcast (#8170), créées par le script 116 :
+    // sans cette ligne, chaque épisode commencé repartirait du début.
+    "podcast_episode_positions",
+    // Associations manuelles de « Ma collection physique » (#8672), créées
+    // par le script 119 : sans cette ligne, chaque disque associé à la main
+    // retomberait « nulle part » après la bascule.
+    "collection_physique_associations",
     // Écoutes importées (#7763, script 101) : sans cette ligne, les écoutes
     // reportées de Roon, Plex ou d'une liste m3u seraient perdues à la bascule.
     "imported_plays",
@@ -243,6 +253,15 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // apports après la bascule.
     "apports_service_albums",
     "apports_service",
+    // Relevé de la synchro cloud (#8239, script 110) : sans ces lignes, le
+    // premier scan après la bascule reprendrait un relevé de zéro et ne
+    // verrait pas ce qui a changé pendant ce scan.
+    "sync_releve_pistes",
+    "sync_releve_albums",
+    "sync_releve_artistes",
+    // Sources réseau (#8189, script 115) : sans cette ligne, les sources
+    // configurées et leurs identifiants scellés seraient perdus à la bascule.
+    "sources_reseau",
     // Temps d'écoute radio par station (#6682, script 096) : sans cette
     // ligne, « Mon écoute » repartirait de zéro à la bascule.
     "radio_ecoutes",
@@ -267,8 +286,25 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
 #[cfg_attr(not(test), allow(dead_code))]
 const TABLES_NON_COPIEES: &[(&str, &str)] = &[
     (
+        "sync_releve_pistes_neuf",
+        "état courant figé le temps d'une comparaison (#8239) : vide en dehors d'elle",
+    ),
+    (
+        "sync_releve_albums_neuf",
+        "état courant figé le temps d'une comparaison (#8239) : vide en dehors d'elle",
+    ),
+    (
+        "sync_releve_artistes_neuf",
+        "état courant figé le temps d'une comparaison (#8239) : vide en dehors d'elle",
+    ),
+    (
         "hires_verifications",
         "verdicts des faux hi-res (#6285) : mesures recalculables, la passe de fond les refait",
+    ),
+    (
+        "spectrogrammes",
+        "trace des spectrogrammes conservés (#8160) : images du cache, recalculables à la demande ; \
+         le cache des pochettes n'est pas recopié non plus",
     ),
     (
         "_migrations",
@@ -1197,6 +1233,18 @@ CREATE TABLE IF NOT EXISTS enrich_tentatives (
  mtime_vu TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_enrich_tentatives_issue ON enrich_tentatives(issue, reessai_apres);
+-- « Pas pour moi » de l'accueil (web#916, SQLite 145 / PG 111), par profil.
+CREATE TABLE IF NOT EXISTS suggestions_ecartees (
+    profile_id BIGINT NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    title TEXT,
+    subtitle TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, item_type, source, item_id)
+);
 -- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3 de
 -- MetaRust). Sans script numéroté : présente ici (bascule) ET dans
 -- `ENSURE_TABLES` (toute base, à chaque démarrage). Non copiée à la bascule :
@@ -1424,10 +1472,25 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cle_tri TEXT COLLATE "C";
 -- PG 090, #6516). TEXT des deux côtés : la copie texte n'a rien à convertir.
 ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id);
+-- radio_stations: surcharge locale d'une station de l'annuaire (SQLite
+-- migration v147 / PG 113, web#2795). TEXT des deux côtés.
+ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS surcharge_locale TEXT;
+-- alarms: option « Interrompre la lecture en cours » (SQLite migration v151 /
+-- PG 117, #8615). TEXT pour la copie ; la 117, rejouee juste apres, la
+-- convertit.
+ALTER TABLE alarms ADD COLUMN IF NOT EXISTS interrupt_playback TEXT DEFAULT 1;
+-- albums: pays d'edition lu sur MusicBrainz et release dont il a ete lu
+-- (SQLite migration v154 / PG 120, #8668). TEXT des deux cotes.
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country_mbid TEXT;
 -- artists: provenance du nom de tri (SQLite migration v131 / PG 095, #6474).
 ALTER TABLE artists ADD COLUMN IF NOT EXISTS sort_name_source TEXT;
 -- artists: provenance du MBID (SQLite migration v133 / PG 097, #6463).
 ALTER TABLE artists ADD COLUMN IF NOT EXISTS musicbrainz_id_source TEXT;
+-- artists: pays de l'artiste et MBID dont il a ete lu (SQLite migration v146 /
+-- PG 112, #8090). TEXT des deux cotes.
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS country TEXT;
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS country_mbid TEXT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE
@@ -1870,6 +1933,8 @@ fn conflict_clause(table: &str) -> &'static str {
     match table {
         "settings" => "ON CONFLICT (key) DO NOTHING",
         "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
+        "podcast_episode_positions" => "ON CONFLICT (zone_id, episode_key) DO NOTHING",
+        "collection_physique_associations" => "ON CONFLICT (release_id) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",
@@ -1886,6 +1951,8 @@ fn conflict_clause(table: &str) -> &'static str {
         "streaming_hidden_items" => {
             "ON CONFLICT (profile_id, item_type, source, source_id) DO NOTHING"
         }
+        // Même cas (web#916) : pas de colonne `id`, la clef est le quadruplet.
+        "suggestions_ecartees" => "ON CONFLICT (profile_id, item_type, source, item_id) DO NOTHING",
         // Meme cas : pas de colonne `id`, la clef primaire est l'UDN — la
         // seule identite d'un appareil UPnP qui survive a un changement de
         // port (#2219, phase 1).

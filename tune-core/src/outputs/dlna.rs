@@ -617,6 +617,10 @@ pub struct DlnaOutput {
     /// physique) n'est plus reflétée dans `GET /api/devices/{id}/status`,
     /// seule route qui expose ce champ.
     muted: AtomicBool,
+    /// #8151 — la sourdine tient par un volume NUL : l'appareil a refusé
+    /// `SetMute`. `dernier_volume_pct` garde la consigne d'avant, rendue à la
+    /// levée de la sourdine.
+    sourdine_par_volume_nul: AtomicBool,
     /// Micromega M-One uses a proprietary TCP protocol on port 7000 for volume.
     micromega_ip: Option<String>,
     /// Récepteur GENA partagé, `None` quand l'écoute n'a pas pu démarrer.
@@ -657,6 +661,17 @@ pub struct DlnaOutput {
     /// qu'au-delà d'une grâce qui suit cette demande : une lecture faite
     /// pendant un glissement de curseur n'est pas un saut de l'appareil.
     volume_demande_a: std::sync::Mutex<Option<std::time::Instant>>,
+    /// #8328 — valeur (en pour-cent) à laquelle l'appareil a sauté de
+    /// lui-même dans la fenêtre d'après pose, la dernière fois que Tune l'a
+    /// corrigé (`dlna_volume_reimpose_apres_saut`). `u64::MAX` = aucun saut vu.
+    /// Hors de la fenêtre, une hausse qui retombe sur cette valeur est le même
+    /// saut, pas un geste au bouton.
+    saut_de_l_appareil_pct: AtomicU64,
+    /// #8328 (relecture) — valeur (en pour-cent) de la dernière demande de
+    /// volume de Tune, notée AVANT l'acquittement : tant que `memoriser_volume`
+    /// n'a pas suivi, la consigne connue est encore l'ancienne. Une lecture
+    /// égale à cette demande, dans la grâce, est Tune lui-même, pas le saut.
+    volume_demande_pct: AtomicU64,
     /// #5793 — URL du SCPD de `RenderingControl`, telle que le descriptif de
     /// l'appareil l'annonce. `None` : sortie construite sans descriptif, le
     /// profil standard s'applique.
@@ -838,6 +853,7 @@ impl DlnaOutput {
             modele: None,
             didl_niveau_appris: NiveauDidlAppris::neuf(),
             muted: AtomicBool::new(false),
+            sourdine_par_volume_nul: AtomicBool::new(false),
             micromega_ip,
             event_listener: None,
             event_state: Arc::new(tokio::sync::Mutex::new(EventState::default())),
@@ -849,6 +865,8 @@ impl DlnaOutput {
             dernier_volume_pct: AtomicU64::new(u64::MAX),
             uri_posee_a: std::sync::Mutex::new(None),
             volume_demande_a: std::sync::Mutex::new(None),
+            saut_de_l_appareil_pct: AtomicU64::new(u64::MAX),
+            volume_demande_pct: AtomicU64::new(u64::MAX),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
             scpd_av_transport: std::sync::RwLock::new(None),
@@ -1430,9 +1448,102 @@ impl DlnaOutput {
         }
     }
 
+    /// #8151 — la sortie est-elle en sourdine posée par Tune ?
+    fn en_sourdine(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    /// #8151 — pose la sourdine sur l'appareil : `SetMute(1)`, ou un volume
+    /// nul s'il refuse `SetMute`. La consigne de volume n'est pas touchée :
+    /// c'est elle que la levée de la sourdine rend.
+    async fn poser_la_sourdine(&self) -> Result<&'static str, String> {
+        if self.sourdine_par_volume_nul.load(Ordering::Relaxed) {
+            return self.sourdine_par_volume_nul().await;
+        }
+        let reponse = self
+            .rc_action(
+                "SetMute",
+                "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>1</DesiredMute>",
+            )
+            .await;
+        // Seule une RÉPONSE de refus de l'appareil (défaut UPnP, ou statut
+        // d'échec sans corps) fait passer au volume nul : une panne réseau
+        // (délai dépassé) ne dit rien de sa sourdine, et basculer en repli
+        // durerait jusqu'à la levée.
+        let refus = match reponse {
+            Ok(r) if !r.contains("UPnPError") && !r.contains("<errorCode>") => None,
+            Ok(r) => Some(r),
+            Err(e) if e.starts_with(SOAP_HTTP_SANS_CORPS_PREFIX) => Some(e),
+            Err(e) => return Err(e),
+        };
+        let Some(refus) = refus else {
+            self.sourdine_par_volume_nul.store(false, Ordering::Relaxed);
+            self.event_state.lock().await.muted = Some(true);
+            return Ok("SetMute");
+        };
+        warn!(device = %self.name, response = %refus, "dlna_set_mute_rejected_volume_nul");
+        self.sourdine_par_volume_nul().await
+    }
+
+    /// #8151 — repli d'un appareil sans sourdine : volume 0, la consigne
+    /// d'avant gardée.
+    async fn sourdine_par_volume_nul(&self) -> Result<&'static str, String> {
+        let consigne = self.dernier_volume_pct.load(Ordering::Relaxed);
+        let pose = self.set_volume(0.0).await;
+        // `set_volume` a retenu 0 comme consigne : la consigne d'avant est
+        // celle que l'auditeur retrouvera.
+        self.dernier_volume_pct.store(consigne, Ordering::Relaxed);
+        if let Err(e) = pose {
+            // Un appareil à volume décoratif (#5575) refuse aussi le volume
+            // nul : ni sourdine ni volume, Tune ne peut pas le faire taire.
+            warn!(
+                device = %self.name,
+                device_id = %self.device_id,
+                error = %e,
+                "dlna_sourdine_impossible_ni_mute_ni_volume_nul"
+            );
+            return Err(e);
+        }
+        self.sourdine_par_volume_nul.store(true, Ordering::Relaxed);
+        Ok("volume_nul")
+    }
+
+    /// #8151 — réaffirme la sourdine d'une sortie en sourdine, et le journal
+    /// le dit sous `evenement`. Rien n'est envoyé hors sourdine.
+    async fn reimposer_la_sourdine(&self, evenement: &'static str) {
+        if !self.en_sourdine() {
+            return;
+        }
+        match self.poser_la_sourdine().await {
+            Ok(commande) => info!(
+                device = %self.name,
+                device_id = %self.device_id,
+                commande,
+                evenement,
+                "dlna_mute_reimpose"
+            ),
+            Err(e) => warn!(
+                device = %self.name,
+                device_id = %self.device_id,
+                error = %e,
+                evenement,
+                "dlna_mute_reimpose_echoue"
+            ),
+        }
+    }
+
     /// #6008 — après une pose d'URI acceptée, sur un appareil qui porte la
     /// règle « volume remonté à l'URI », repose le dernier volume connu.
+    ///
+    /// #8151 — en sourdine, c'est la SOURDINE qui est reposée, jamais le volume
+    /// seul : l'Eversolo DMP-A8 repartait avec le son à chaque piste. Vrai sur
+    /// tout appareil, avec ou sans la règle : une nouvelle URI peut lever la
+    /// sourdine d'un firmware comme elle remonte son volume.
     async fn reimposer_le_volume_apres_uri(&self) {
+        if self.en_sourdine() {
+            self.reimposer_la_sourdine("apres_uri").await;
+            return;
+        }
         if !super::dlna_repli_set_uri::volume_remonte_a_l_uri(&self.device_id) {
             return;
         }
@@ -1501,6 +1612,25 @@ impl DlnaOutput {
                 "dlna_volume_remonte_a_l_uri_detecte"
             );
             super::dlna_repli_set_uri::memoriser_volume_remonte_a_l_uri(&self.device_id);
+        }
+        // #8328 — la valeur du saut est retenue, sourdine comprise : hors de
+        // la fenêtre, le même saut se reconnaît à elle.
+        if lu - connu >= HAUSSE_QUI_APPREND {
+            self.saut_de_l_appareil_pct
+                .store((lu * 100.0).round() as u64, Ordering::Relaxed);
+        }
+        // #8151 — en sourdine, seule la sourdine est reposée, jamais un
+        // `SetVolume` : un firmware qui lève sa sourdine sur `SetVolume`
+        // jouerait la consigne le temps d'un aller-retour. La consigne reste
+        // dans `dernier_volume_pct`, et `set_mute(false)` la repose avant de
+        // lever la sourdine. Sans sourdine sur l'appareil, c'est le volume
+        // nul qui est reposé.
+        if self.en_sourdine() {
+            self.reimposer_la_sourdine("apres_saut").await;
+            if self.sourdine_par_volume_nul.load(Ordering::Relaxed) {
+                return 0.0;
+            }
+            return connu;
         }
         match self.set_volume(connu).await {
             Ok(()) => {
@@ -2487,7 +2617,12 @@ impl OutputTarget for DlnaOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, true, true, true, true).with_percent_volume()
+        // #5575 — un volume décoratif (acquitté, jamais appliqué) n'est pas un
+        // volume réglable : `can_set_volume: false` ôte le curseur du client
+        // au lieu de le laisser produire un refus à chaque geste (fil 2482).
+        let volume_reglable =
+            !volume_decoratif_5575::volume_decoratif(&self.device_id, self.modele.as_deref());
+        OutputCapabilities::v1(true, true, true, volume_reglable, true, true).with_percent_volume()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -2529,6 +2664,8 @@ impl OutputTarget for DlnaOutput {
         self.arrete_au_lieu_de_pause.store(false, Ordering::SeqCst);
         // #6059 — le départ que porte l'URL (flux natif relancé à la position).
         super::dlna_depart_natif::noter_url_posee(&self.device_id, media.url);
+        // #8082 — une autre URI que celle du flux continu en retire le plan.
+        super::dlna_flux_continu::noter_url_posee(&self.device_id, media.url);
         // Les abonnements de la piste précédente d'abord : sans ce retrait,
         // chaque lecture en empilerait deux de plus dans le récepteur, tous
         // renouvelés toutes les 250 s pour un flux mort.
@@ -2922,6 +3059,9 @@ impl OutputTarget for DlnaOutput {
 
         let play_delay = self.play_delay_ms.load(Ordering::Relaxed);
         self.attendre_apres_set_uri().await;
+        // #8151 — la nouvelle URI a pu lever la sourdine : elle est reposée
+        // AVANT `Play`, pour qu'aucune note ne sorte.
+        self.reimposer_la_sourdine("avant_play").await;
 
         // Retry Play with backoff — some renderers (Revox S100, stagefright-based)
         // reject Play immediately after SetAVTransportURI while still loading the URI.
@@ -3188,6 +3328,13 @@ impl OutputTarget for DlnaOutput {
         let response = self
             .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
             .await?;
+        if faute_commande_soap(&response) && est_701(&response) {
+            // #8738 — après un redémarrage, le renderer peut avoir perdu
+            // l'URI alors que Tune conserve encore sa session de flux.
+            // Le refus reste un refus ; l'orchestrateur rétablit UNE fois
+            // le titre à sa position par son chemin de session perdue.
+            self.arrete_au_lieu_de_pause.store(true, Ordering::SeqCst);
+        }
         acquitter_commande_soap("Play", response)
     }
 
@@ -3234,7 +3381,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        self.noter_demande_de_volume();
+        self.noter_demande_de_volume(volume);
         if let Some(ip) = &self.micromega_ip {
             let target_vol = volume * 100.0;
             let msg = format!("GET /volume HTTP/1.0\r\n\r\nvolume={target_vol:.1}\r\n");
@@ -3361,19 +3508,59 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
-        let val = if muted { "1" } else { "0" };
-        self.rc_action("SetMute", &format!(
-            "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>{val}</DesiredMute>"
-        )).await?;
+        if muted {
+            // #8151 — `SetMute(1)`, ou un volume nul sur un appareil qui le
+            // refuse ; journalisé dans les deux cas.
+            let commande = self.poser_la_sourdine().await?;
+            info!(device = %self.name, device_id = %self.device_id, commande, "dlna_set_mute_ok");
+            // Mémorisé seulement après une sourdine acceptée : `get_status` ne
+            // redemande plus rien au renderer (#2263), donc ce champ est la
+            // seule source du `muted` rendu — il ne doit jamais annoncer une
+            // coupure que l'appareil a refusée.
+            self.muted.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        // #8151 — la sourdine levée rend le volume. Sans sourdine sur
+        // l'appareil, c'est la consigne qui revient ; sur un appareil qui
+        // remonte son volume à l'URI, la consigne est reposée AVANT de lever
+        // la sourdine, pour ne pas rendre le son au niveau qu'il s'est donné.
+        let par_volume_nul = self.sourdine_par_volume_nul.load(Ordering::Relaxed);
+        let remonte = super::dlna_repli_set_uri::volume_remonte_a_l_uri(&self.device_id);
+        if (par_volume_nul || remonte)
+            && let Some(consigne) = self.volume_connu()
+        {
+            self.set_volume(consigne).await?;
+            info!(
+                device = %self.name,
+                device_id = %self.device_id,
+                volume_pct = (consigne * 100.0).round() as u64,
+                "dlna_volume_rendu_a_la_levee_de_sourdine"
+            );
+        }
+        if par_volume_nul {
+            self.sourdine_par_volume_nul.store(false, Ordering::Relaxed);
+            self.muted.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
+        let reponse = self
+            .rc_action(
+                "SetMute",
+                "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>0</DesiredMute>",
+            )
+            .await?;
+        if reponse.contains("UPnPError") || reponse.contains("<errorCode>") {
+            warn!(device = %self.name, response = %reponse, "dlna_set_mute_rejected");
+            return Err(format!(
+                "« {} » a refusé de lever la sourdine. Levez-la sur l'appareil lui-même.",
+                self.name
+            ));
+        }
+        info!(device = %self.name, device_id = %self.device_id, commande = "SetMute", "dlna_unmute_ok");
         // Même geste que `OpenHomeOutput::set_mute` : l'état poussé porte
-        // désormais la coupure, on ne le laisse pas en retard d'un évènement
+        // désormais la levée, on ne le laisse pas en retard d'un évènement
         // sur ce que Tune vient d'obtenir.
-        self.event_state.lock().await.muted = Some(muted);
-        // Mémorisé seulement après un SetMute accepté : `get_status` ne
-        // redemande plus rien au renderer (#2263), donc ce champ est la seule
-        // source du `muted` rendu — il ne doit jamais annoncer une coupure que
-        // l'appareil a refusée.
-        self.muted.store(muted, Ordering::Relaxed);
+        self.event_state.lock().await.muted = Some(false);
+        self.muted.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -4212,7 +4399,7 @@ pub(crate) fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities
 /// Marco), and forcing WAV on those wastes bandwidth and loses bit-perfect
 /// FLAC the renderer could decode natively.
 fn protocol_sink_supports_mime(mime: &str, protocols: &[String]) -> bool {
-    let mime_lower = mime.to_lowercase();
+    let mime_lower = mime.split(";").next().unwrap_or(mime).trim().to_lowercase();
     let mime_alt = if let Some(rest) = mime_lower.strip_prefix("audio/x-") {
         format!("audio/{rest}")
     } else if let Some(rest) = mime_lower.strip_prefix("audio/") {
@@ -4261,17 +4448,18 @@ fn advertised_mime_for_sink(desired: &str, sink: &[String]) -> String {
         .iter()
         .filter_map(|e| sink_entry_base_mime(e))
         .collect();
-    // Already listed verbatim (case-insensitive): announce as-is.
-    if listed.iter().any(|b| b.eq_ignore_ascii_case(desired)) {
+    // Conserver les paramètres du flux réel (notamment cadence/canaux L16).
+    let (base, params) = desired.split_once(";").unwrap_or((desired, ""));
+    if listed.iter().any(|b| b.eq_ignore_ascii_case(base)) {
         return desired.to_string();
     }
-    let aliases: &[&str] = match desired.to_lowercase().as_str() {
+    let aliases: &[&str] = match base.to_lowercase().as_str() {
         "audio/flac" => &["audio/x-flac"],
         "audio/x-flac" => &["audio/flac"],
         "audio/mpeg" => &["audio/mp3"],
         "audio/mp3" => &["audio/mpeg"],
-        "audio/wav" => &["audio/x-wav"],
-        "audio/x-wav" => &["audio/wav"],
+        "audio/wav" => &["audio/x-wav", "audio/wave", "audio/vnd.wave"],
+        "audio/x-wav" => &["audio/wav", "audio/wave", "audio/vnd.wave"],
         // Mêmes octets, autres orthographes — celles qu'une pile stricte
         // (upmpdcli : `audio/x-dsd`, `audio/aac`, `audio/x-aiff`…) publie
         // sans publier la nôtre. Le DSD ne s'aligne que sur les génériques :
@@ -4287,7 +4475,11 @@ fn advertised_mime_for_sink(desired: &str, sink: &[String]) -> String {
     };
     for alias in aliases {
         if let Some(found) = listed.iter().find(|b| b.eq_ignore_ascii_case(alias)) {
-            return found.clone();
+            return if params.is_empty() {
+                found.clone()
+            } else {
+                format!("{found};{params}")
+            };
         }
     }
     desired.to_string()
@@ -4962,6 +5154,18 @@ mod tests {
             "audio/flac",
             &["http-get:*:*:*".to_string()]
         ));
+    }
+
+    #[test]
+    fn mime_8722_l16_garde_sa_cadence_et_wav_accepte_les_alias() {
+        let sink = vec!["http-get:*:audio/L16;rate=44100;channels=2:*".into()];
+        let mime = "audio/L16;rate=44100;channels=2";
+        assert!(protocol_sink_supports_mime(mime, &sink));
+        assert_eq!(advertised_mime_for_sink(mime, &sink), mime);
+        for alias in ["audio/wave", "audio/vnd.wave"] {
+            let sink = vec![format!("http-get:*:{alias}:*")];
+            assert_eq!(advertised_mime_for_sink("audio/wav", &sink), alias);
+        }
     }
 
     #[test]

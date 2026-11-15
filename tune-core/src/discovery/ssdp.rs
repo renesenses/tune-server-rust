@@ -365,6 +365,11 @@ impl SsdpScanner {
     }
 
     pub async fn rescan(&self) -> Vec<DiscoveredDevice> {
+        // #8189 — découverte pas encore ouverte (iOS) : aucune émission, on
+        // rend ce qui est connu.
+        if !super::porte_multicast::est_ouverte() {
+            return self.devices().await;
+        }
         let reponses = rechercher_en_flux(&self.search_targets);
         let event_tx = self.event_tx.lock().await.clone();
         traiter_le_flux(&self.state, &event_tx, reponses).await;
@@ -380,6 +385,25 @@ impl SsdpScanner {
     pub async fn device_count(&self) -> usize {
         let state = self.state.lock().await;
         state.devices.len()
+    }
+
+    /// Inscrit un appareil comme le ferait une réponse SSDP, sans réseau :
+    /// banc d'essai du serveur (#7508). Même règle que
+    /// `enregistrer_l_appareil` : `DeviceDiscovered` part à la PREMIÈRE
+    /// inscription seulement, une réinscription ne fait que rafraîchir la
+    /// fiche, comme une réannonce réelle.
+    #[doc(hidden)]
+    pub async fn inscrire_sans_reseau(&self, device: DiscoveredDevice) {
+        let nouveau = {
+            let mut st = self.state.lock().await;
+            st.devices
+                .insert(device.id.clone(), device.clone())
+                .is_none()
+        };
+        if nouveau {
+            let tx = self.event_tx.lock().await.clone();
+            let _ = tx.send(SsdpEvent::DeviceDiscovered(Box::new(device))).await;
+        }
     }
 
     /// La vue FRAÎCHE des serveurs multimédia, telle que le balayage la tient.

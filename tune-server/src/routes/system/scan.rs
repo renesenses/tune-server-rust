@@ -880,6 +880,40 @@ pub(crate) fn sous_le_dossier(path: &str, dossier: &str) -> bool {
     tune_core::metadata::enrich_scope::sous_le_dossier(path, dossier)
 }
 
+/// La cible d'un scan ciblé (`POST /system/scan?path=`) est-elle sous un
+/// dossier de musique ?
+///
+/// Sécurité — `sous_le_dossier` seul est un test de PRÉFIXE de texte :
+/// `/musique/../home` y passait, et le scan indexait (donc rendait lisibles)
+/// les fichiers audio de n'importe quel dossier de la machine.
+/// `tune_core::chemin_sur` refuse d'abord tout `..`, sur les deux séparateurs.
+pub(crate) fn cible_autorisee(cible: &str, music_dirs: &[String]) -> bool {
+    tune_core::chemin_sur::racine_contenante(cible, music_dirs).is_ok()
+        && music_dirs.iter().any(|root| sous_le_dossier(cible, root))
+}
+
+#[cfg(test)]
+mod cible_autorisee_tests {
+    use super::cible_autorisee;
+
+    #[test]
+    fn une_cible_qui_remonte_hors_des_dossiers_est_refusee() {
+        let dirs = vec!["/mnt/musique".to_string(), r"D:\Musique".to_string()];
+        assert!(cible_autorisee("/mnt/musique/Jazz", &dirs));
+        assert!(cible_autorisee(r"D:\Musique\Jazz", &dirs));
+        for c in [
+            "/mnt/musique/../home/user",
+            "/mnt/musique/Jazz/../../../etc",
+            r"D:\Musique\..\Users",
+            "/mnt/musique/%2e%2e/home",
+            "/mnt/musique2/x",
+            "/etc",
+        ] {
+            assert!(!cible_autorisee(c, &dirs), "{c} doit être refusée");
+        }
+    }
+}
+
 /// Ce que la purge de fin de scan a le droit de faire d'une piste absente du
 /// disque.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1940,7 +1974,13 @@ async fn spawn_library_scan_avec_lecteur_par(
         let event_bus_pour_panne = event_bus.clone();
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
-        let raw_dirs = super::get_music_dirs_list(&db);
+        let mut raw_dirs = super::get_music_dirs_list(&db);
+        // #8189 — les racines des sources réseau (`tune-src://…`) : parcourues
+        // par leur protocole, protégées de la purge quand elles sont
+        // injoignables.
+        raw_dirs.extend(
+            tune_core::db::sources_reseau::SourcesReseauRepo::with_backend(db.clone()).racines(),
+        );
         if raw_dirs.is_empty() {
             // #6175 — un partage monté mais non déclaré est la cause la plus
             // probable d'un scan sans dossier : le dire ici, et à l'écran.
@@ -1995,7 +2035,7 @@ async fn spawn_library_scan_avec_lecteur_par(
             // scan ciblé ne pouvait aboutir — chacun retombait en scan complet,
             // silencieusement, en journalisant « outside music dirs » pour un
             // chemin qui était pourtant dedans.
-            if music_dirs.iter().any(|root| sous_le_dossier(p, root)) {
+            if cible_autorisee(p, &music_dirs) {
                 Some(p.clone())
             } else {
                 tracing::warn!(path = %p, dirs = ?music_dirs, "scan_targeted_path_outside_music_dirs — falling back to full scan");
@@ -2219,6 +2259,10 @@ async fn spawn_library_scan_avec_lecteur_par(
             .flatten()
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
+
+        // #8239 — l'état « avant » de la synchro cloud, s'il n'existe pas
+        // encore : la fin du scan n'en journalise que la différence.
+        tune_core::cloud::library_sync::preparer_le_releve(&db);
 
         // Load existing tracks BEFORE scanning to skip unchanged files.
         // A DB read error must ABORT the scan, not degrade into an empty map:
@@ -3456,6 +3500,13 @@ async fn spawn_library_scan_avec_lecteur_par(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "post_scan_hidden_albums_reconcile_failed"),
             }
+            // web#916 — les albums locaux écartés de l'accueil (« Pas pour
+            // moi ») : même mécanique, même garde `full_scan_ok`.
+            tune_core::db::suggestions_ecartees::reconcilier_journalise(
+                db.clone(),
+                full_scan_ok,
+                "fin_de_scan",
+            );
             // Les paires « ces deux albums ne sont pas des doublons » (#1276)
             // suivent la même mécanique et la même garde `full_scan_ok` : le
             // scan est précisément le moment où les rowids d'albums meurent et
@@ -3577,8 +3628,9 @@ async fn spawn_library_scan_avec_lecteur_par(
         }
 
         etapes.fin("index_de_recherche");
-        // Populate cloud sync changelog with all new/updated entities
-        tune_core::cloud::library_sync::populate_changelog_after_scan(&db);
+        // #8239 — seul ce qui a changé depuis le dernier relevé entre au
+        // journal de la synchro cloud ; plus jamais toute la bibliothèque.
+        tune_core::cloud::library_sync::journaliser_ce_qui_a_change(&db);
 
         // Turn any .m3u/.m3u8/.pls files found in the scanned dirs into local
         // playlists (Bertrand). Runs after import so every track is in the DB to

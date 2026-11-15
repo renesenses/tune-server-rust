@@ -7,6 +7,29 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
+/// #8645 — la condition d'une écoute de MUSIQUE, celle qui compte dans les
+/// classements par artiste, album ou titre : ni radio, ni podcast. Une écoute
+/// sans source (NULL, anciennes lignes) est de la musique.
+///
+/// Depuis #7965, un épisode de podcast s'écrit dans l'historique avec le NOM
+/// DE L'ÉMISSION en `artist_name` et en `album_title`
+/// (`enregistrer_ecoute_podcast`, `source = 'podcast'`) : sans cette
+/// condition, l'émission se classait parmi les « Artistes les plus écoutés »
+/// de l'accueil (Bertrand, 13/11/2026, rc11). Une ligne de radio d'avant la
+/// v0.8.258 porte, elle, l'interprète d'un titre ICY figé.
+///
+/// Ces écoutes restent dans les TOTAUX (nombre d'écoutes, temps d'écoute) :
+/// la condition ne s'ajoute qu'aux classements (artistes, albums, titres —
+/// décision de Bertrand du 13/11 pour les titres) et aux comptes d'artistes. `source` est la colonne `source` de `listen_history`, préfixée
+/// de son alias s'il y en a un.
+pub fn ecoute_de_musique(source: &str) -> String {
+    format!("COALESCE({source}, '') NOT IN ('radio', 'podcast')")
+}
+
+/// [`ecoute_de_musique`] sur la colonne nue `source`, pour les requêtes
+/// écrites en littéral.
+pub const ECOUTE_DE_MUSIQUE: &str = "COALESCE(source, '') NOT IN ('radio', 'podcast')";
+
 /// Engine-agnostic SQL builders for history_repo.
 ///
 /// Simple builders are dialect-aware. `full_dashboard` is still
@@ -17,8 +40,8 @@ pub mod sql {
 
     /// Les mêmes colonnes, mais avec `track_id` RÉSOLU.
     ///
-    /// 🔴 `listen_history.track_id` est **toujours NULL** : le seul site
-    /// d'insertion passe `track_id: None`. La liste rendait donc ce NULL tel
+    /// Avant #8714, l'insertion ne conservait pas `track_id`. Ce repli reste
+    /// nécessaire pour ces lignes anciennes : la liste rendait ce NULL tel
     /// quel, et le client ne pouvait désigner aucune écoute locale.
     ///
     /// FabienM, fil forum 1739, 09/09/2026 : « Manque des contrôles dans les
@@ -131,7 +154,7 @@ pub mod sql {
     pub fn top_tracks<D: SqlDialect>(d: &D) -> String {
         format!(
             // track_id: many history rows have a null track_id, so resolve it by
-            // title (t3) as a fallback. Without this the client can't play a top
+            // title + artist (t3, #8140) as a fallback. Without this the client can't play a top
             // track directly (it fell back to a fragile title search that failed),
             // so tapping a track on the home screen did nothing.
             //
@@ -150,46 +173,86 @@ pub mod sql {
             // scalaires (`MAX`), qui rendent au plus une valeur par groupe.
             //
             // #7777 : les écoutes IMPORTÉES (`imported_plays`, #7763) comptent
-            // aussi, avec la même règle que `plays_for_tracks` — titre +
-            // interprète de la piste. Une piste qui n'a QUE des écoutes
+            // aussi, regroupées par titre + interprète de la piste. Une piste qui n'a QUE des écoutes
             // importées entre dans le classement ; une piste qui a les deux
-            // les additionne dans un seul groupe. `listen_history.track_id`
-            // étant toujours NULL, `MAX(tid)` y prend l'identifiant de la
-            // piste importée. `CAST … AS BIGINT` : `SUM` d'un BIGINT rend un
-            // NUMERIC sur PostgreSQL, que `as_i64` ne lit pas. Une écoute
-            // importée vaut `src = 'local'` : son `track_id` désigne une piste
-            // de la bibliothèque, donc `MAX(src)` d'un groupe mixte peut
-            // passer de « deezer » à « local », ce qui reste cohérent.
+            // les additionne dans un seul groupe. `MAX(tid)` retient une
+            // piste explicite ou importée quand elle existe ; ce classement
+            // reste global, contrairement au compteur par copie de #8714.
+            // `CAST … AS BIGINT` : `SUM` d'un BIGINT rend un
+            // NUMERIC sur PostgreSQL, que `as_i64` ne lit pas.
+            //
+            // #8140 : pour une écoute sans `listen_history.track_id`, la piste
+            // locale se retrouvait par le TITRE SEUL (`t3.title = g.title`) :
+            // l'écoute Deezer de « Marianne » d'un artiste A rendait la piste
+            // homonyme d'un artiste B, et le client ouvrait l'album de B. Le
+            // rapprochement exige maintenant le titre ET l'interprète de la
+            // piste, comparé casse et accents ignorés (`LOWER(unaccent(…))`,
+            // la règle de la recherche) ; sans interprète, rien n'est résolu
+            // — un bouton absent vaut mieux que le mauvais morceau. Le titre
+            // reste comparé tel quel : c'est lui qui lit `idx_tracks_title`
+            // (`top_titres_index_tests`). Parmi plusieurs pistes du même titre
+            // et du même interprète, celle de l'album écouté passe d'abord.
+            //
+            // #8140 : `source`, `source_id`, l'album et la pochette du service
+            // viennent d'UNE ligne du groupe, la dernière écoute
+            // (`MAX(u.hid)`), et non plus de `MAX(u.src)` calculé à part (qui
+            // pouvait marier la source d'une écoute au titre d'album d'une
+            // autre). Un groupe fait seulement d'écoutes importées n'a pas de
+            // ligne d'historique : il est `local`.
             "WITH u AS (SELECT h.title AS title, h.artist_name AS artist_name, \
                     1 AS n, h.track_id AS tid, h.album_title AS alb, \
-                    h.cover_url AS cu, h.source AS src \
-                    FROM listen_history h WHERE h.source != 'radio' \
+                    h.cover_url AS cu, h.id AS hid \
+                    FROM listen_history h WHERE {musique} \
                   UNION ALL \
                   SELECT t.title, a.name, ip.play_count, ip.track_id, al.title, \
-                    NULL, 'local' \
+                    NULL, NULL \
                     FROM imported_plays ip JOIN tracks t ON t.id = ip.track_id \
                     LEFT JOIN artists a ON a.id = t.artist_id \
                     LEFT JOIN albums al ON al.id = t.album_id \
                     WHERE ip.play_count > 0), \
              g AS (SELECT u.title AS title, u.artist_name AS artist_name, \
                     CAST(SUM(u.n) AS BIGINT) AS plays, MAX(u.tid) AS tid, \
-                    MAX(u.alb) AS alb, MAX(u.cu) AS cu, MAX(u.src) AS src \
-                    FROM u GROUP BY u.title, u.artist_name) \
-             SELECT g.title, g.artist_name, g.plays, \
-             COALESCE((SELECT MAX(t.id) FROM tracks t WHERE t.id = g.tid), \
-                      (SELECT MAX(t3.id) FROM tracks t3 WHERE t3.title = g.title), g.tid) AS track_id, \
-             COALESCE((SELECT MAX(al.cover_path) FROM albums al \
-                          JOIN tracks t ON t.album_id = al.id WHERE t.id = g.tid), \
+                    MAX(u.alb) AS alb, MAX(u.cu) AS cu, MAX(u.hid) AS hid \
+                    FROM u GROUP BY u.title, u.artist_name), \
+             k AS (SELECT g.title AS title, g.artist_name AS artist_name, \
+                    g.plays AS plays, g.tid AS gtid, g.alb AS alb, g.cu AS cu, \
+                    COALESCE(NULLIF(r.source, ''), 'local') AS src, \
+                    r.source_id AS sid, r.album_title AS ralb, r.cover_url AS rcu, \
+                    r.album_ref AS aref \
+                    FROM g LEFT JOIN listen_history r ON r.id = g.hid), \
+             m AS (SELECT k.*, \
+                    COALESCE((SELECT MAX(t.id) FROM tracks t WHERE t.id = k.gtid), \
+                             (SELECT MAX(t3.id) FROM tracks t3 \
+                                JOIN artists a3 ON a3.id = t3.artist_id \
+                                JOIN albums al3 ON al3.id = t3.album_id \
+                                WHERE t3.title = k.title \
+                                  AND LOWER(unaccent(a3.name)) = LOWER(unaccent(k.artist_name)) \
+                                  AND LOWER(unaccent(al3.title)) = LOWER(unaccent(COALESCE(k.ralb, k.alb)))), \
+                             (SELECT MAX(t3.id) FROM tracks t3 \
+                                JOIN artists a3 ON a3.id = t3.artist_id \
+                                WHERE t3.title = k.title \
+                                  AND LOWER(unaccent(a3.name)) = LOWER(unaccent(k.artist_name))), \
+                             k.gtid) AS tid \
+                    FROM k) \
+             SELECT m.title, m.artist_name, m.plays, m.tid AS track_id, \
+             COALESCE(CASE WHEN m.src <> 'local' THEN m.rcu END, \
+                      (SELECT MAX(al.cover_path) FROM albums al \
+                          JOIN tracks t ON t.album_id = al.id WHERE t.id = m.tid), \
                       (SELECT MAX(al2.cover_path) FROM albums al2 \
-                          WHERE al2.title = g.alb AND al2.cover_path IS NOT NULL), \
-                      g.cu) AS cover_path, \
-             COALESCE((SELECT MAX(al.title) FROM albums al \
-                          JOIN tracks t ON t.album_id = al.id WHERE t.id = g.tid), \
-                      g.alb) AS album_title, \
-             g.src \
-             FROM g \
-             ORDER BY g.plays DESC LIMIT {}",
-            d.placeholder(1)
+                          WHERE al2.title = m.alb AND al2.cover_path IS NOT NULL), \
+                      m.cu) AS cover_path, \
+             COALESCE(CASE WHEN m.src <> 'local' THEN m.ralb END, \
+                      (SELECT MAX(al.title) FROM albums al \
+                          JOIN tracks t ON t.album_id = al.id WHERE t.id = m.tid), \
+                      m.ralb, m.alb) AS album_title, \
+             m.src, \
+             CASE WHEN m.src <> 'local' THEN m.sid END AS source_id, \
+             CASE WHEN m.src <> 'local' THEN m.aref END AS album_ref \
+             FROM m \
+             ORDER BY m.plays DESC LIMIT {}",
+            d.placeholder(1),
+            // #8645 — ni radio, ni épisode de podcast.
+            musique = super::ecoute_de_musique("h.source"),
         )
     }
 
@@ -210,7 +273,6 @@ pub mod sql {
             concat!("COALESCE(NULLIF(", $alias, ".source, ''), 'local')")
         };
     }
-    pub(crate) use provenance;
 
     /// [`provenance!`] pour un alias choisi par l'appelant, jamais une saisie.
     pub fn provenance_de(alias: &str) -> String {
@@ -233,20 +295,13 @@ pub mod sql {
 
     /// L'écoute de plusieurs pistes d'un coup : compte et dernière fois (#3518).
     ///
-    /// # Pourquoi le rapprochement se fait par titre + interprète
+    /// #8714 — même rapprochement que les listes intelligentes : piste connue,
+    /// puis album + titre, puis titre + interprète pour l'ancien historique
+    /// sans album résoluble. Aucun historique ancien n'est réécrit.
     ///
-    /// Parce que `listen_history.track_id` est **toujours NULL**. Le seul site
-    /// qui écrit l'historique — `orchestrator::commun::record_listen` — passe
-    /// `track_id: None`, avec le commentaire qui l'explique. Une jointure sur
-    /// `h.track_id = t.id` rendrait donc `play_count = 0` pour la bibliothèque
-    /// entière : la colonne exacte que #3518 refuse, celle qui affiche « jamais
-    /// joué » pour une piste jouée cent fois.
-    ///
-    /// Le rapprochement est le MÊME que celui de `top_tracks` et de
-    /// `track_plays` — égalité stricte sur `title` et `artist_name` —, et c'est
-    /// délibéré : la colonne d'un album doit donner le même nombre que l'écran
-    /// « Titres les plus écoutés », sans quoi deux vues de la même donnée se
-    /// contrediraient à l'écran.
+    /// `top_tracks` reste volontairement groupé par titre + interprète, toutes
+    /// copies et provenances confondues : son total peut dépasser celui de la
+    /// piste d'un album particulier.
     ///
     /// # Seules les écoutes de la même provenance comptent (#7980)
     ///
@@ -270,74 +325,130 @@ pub mod sql {
     /// n'est rempli que si la requête de lecture portait un `X-Profile-Id` ; il
     /// est NULL sur la grande majorité des lignes, et `full_dashboard` filtre
     /// par égalité stricte, donc une vue par profil les écarterait toutes. Un
-    /// compte par profil rendrait aujourd'hui zéro presque partout. Global, il
-    /// donne le même nombre que `/library/history/top-tracks`, que le client
-    /// affiche déjà. Une variante par profil pourra s'ajouter en paramètre
+    /// compte par profil rendrait aujourd'hui zéro presque partout. Le compte
+    /// reste donc global. Une variante par profil pourra s'ajouter en paramètre
     /// sans changer la forme de la réponse.
     ///
     /// `id_list` n'est composé que d'entiers, produits par l'appelant à partir
     /// des identifiants qu'il a lus en base — jamais d'une chaîne du client.
     pub fn plays_for_tracks(id_list: &str) -> String {
+        // #8714 — même règle que `ecoute_de_la_piste` (piste, puis album +
+        // titre, puis titre + interprète pour l'ancien historique).
         format!(
             "SELECT t.id, COUNT(h.id), MAX(h.listened_at) \
              FROM tracks t \
-             LEFT JOIN artists a ON a.id = t.artist_id \
              LEFT JOIN listen_history h \
                     ON {} \
-                   AND h.title = t.title \
-                   AND (h.artist_name = a.name \
-                        OR (h.artist_name IS NULL AND a.name IS NULL)) \
              WHERE t.id IN ({id_list}) \
              GROUP BY t.id",
-            meme_provenance("h", "t")
+            ecoute_de_la_piste("t", "h")
         )
     }
 
-    /// La condition qui rattache une écoute `h` à une piste `t` (#7769) : la
-    /// règle de [`plays_for_tracks`], écrite pour servir DANS une autre
-    /// requête — les listes et collections intelligentes, qui comptaient par
-    /// `h.track_id = t.id`, une colonne toujours NULL. « = 0 » y rendait
-    /// toute la bibliothèque et « < 1 » rien du tout.
+    /// La condition qui rattache une écoute à une piste : même provenance,
+    /// piste explicite en priorité, sinon album + titre, et titre + interprète
+    /// pour l'ancien historique sans album résoluble (#8714).
     ///
-    /// Même règle, donc même nombre que la colonne de la Bibliothèque : même
-    /// provenance (#7980), même titre, et même interprète ou interprète absent
-    /// des deux côtés. L'interprète de la piste est relu par sous-requête pour ne
-    /// dépendre d'aucun alias de la requête englobante. `piste` et `ecoute`
-    /// sont des alias écrits par l'appelant, jamais une saisie.
-    ///
-    /// Une écoute dont `track_id` désigne la piste lui revient aussi, même
-    /// sans interprète enregistré : c'était la seule règle avant #7769, et
-    /// la retirer faisait perdre ces écoutes (`pg_date_relative_6122`). Une
-    /// seule ligne d'écoute ne compte qu'une fois : c'est un `OR` dans la
-    /// même condition. Sur les écoutes de la production, `track_id` vide, le
-    /// nombre reste celui de la Bibliothèque.
+    /// Commune à la colonne Bibliothèque et aux listes intelligentes (#7769).
+    /// Une ligne ne compte qu'une fois, même si plusieurs critères concordent.
+    /// Les alias sont écrits par l'appelant, jamais issus d'une saisie.
     pub fn ecoute_de_la_piste(piste: &str, ecoute: &str) -> String {
         let interprete =
             format!("(SELECT ae.name FROM artists ae WHERE ae.id = {piste}.artist_id)");
+        // #8714 (Procol Harum 1967, fil 2806) — le titre + interprète seul
+        // donnait à TOUTES les copies d'un titre (autres albums, compilations)
+        // le même compte. Désormais, du plus sûr au moins sûr :
+        // 1. l'écoute désigne une piste (`track_id`, écrit depuis #8714) :
+        //    elle ne revient qu'à cette piste ;
+        // 2. sinon (piste absente ou disparue), son album connu existe : elle revient au
+        //    titre de même nom DE CET ALBUM, sauf interprète explicitement différent ;
+        // 3. sinon seulement (ancien historique sans album, album disparu) :
+        //    titre + interprète, comme avant.
         format!(
             "{} AND ({ecoute}.track_id = {piste}.id \
-             OR ({ecoute}.title = {piste}.title \
-                 AND ({ecoute}.artist_name = {interprete} \
-                      OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))))",
+             OR (({ecoute}.track_id IS NULL OR NOT EXISTS (SELECT 1 FROM tracks tr_ecoute WHERE tr_ecoute.id = {ecoute}.track_id)) \
+                 AND {ecoute}.title = {piste}.title \
+                 AND (({ecoute}.album_id IS NOT NULL \
+                       AND EXISTS (SELECT 1 FROM albums al_ecoute WHERE al_ecoute.id = {ecoute}.album_id) \
+                       AND {ecoute}.album_id = {piste}.album_id \
+                       AND ({ecoute}.artist_name IS NULL OR {interprete} IS NULL \
+                            OR {ecoute}.artist_name = {interprete})) \
+                      OR (({ecoute}.album_id IS NULL \
+                           OR NOT EXISTS (SELECT 1 FROM albums al_ecoute WHERE al_ecoute.id = {ecoute}.album_id)) \
+                          AND ({ecoute}.artist_name = {interprete} \
+                               OR ({ecoute}.artist_name IS NULL AND {interprete} IS NULL))))))",
             meme_provenance(ecoute, piste)
         )
     }
 
     /// Le nombre d'écoutes de la piste `piste`, en sous-requête corrélée :
     /// `0` pour une piste jamais écoutée, jamais NULL (#7769).
+    ///
+    /// 🔴 #8416 — c'est le nombre de la Bibliothèque
+    /// ([`super::HistoryRepo::plays_for_tracks`]) : les écoutes de
+    /// l'historique PLUS les écoutes importées (`imported_plays`, #7763). Les
+    /// deux tables ne partagent aucune ligne — un import n'écrit rien dans
+    /// l'historique — donc la somme ne compte aucune écoute deux fois ; et
+    /// `imported_plays` n'a qu'une ligne par piste (`track_id` en clé).
     pub fn ecoutes_de_la_piste(piste: &str) -> String {
         format!(
-            "(SELECT COUNT(*) FROM listen_history he WHERE {})",
-            ecoute_de_la_piste(piste, "he")
+            "((SELECT COUNT(*) FROM listen_history he WHERE {}) + {})",
+            ecoute_de_la_piste(piste, "he"),
+            ecoutes_importees_de_la_piste(piste)
+        )
+    }
+
+    /// Les écoutes importées de la piste `piste` (#7763, #8416) : `0` si
+    /// elle n'en a aucune, jamais NULL.
+    fn ecoutes_importees_de_la_piste(piste: &str) -> String {
+        format!(
+            "COALESCE((SELECT ip.play_count FROM imported_plays ip \
+             WHERE ip.track_id = {piste}.id), 0)"
         )
     }
 
     /// La dernière écoute de la piste `piste`, NULL si elle n'a jamais été
     /// écoutée (#7769) — le `MAX(listened_at)` de [`plays_for_tracks`].
+    ///
+    /// #8416 — la plus récente de l'historique et de la date importée, comme
+    /// la Bibliothèque. Les deux sont au même format (`AAAA-MM-JJTHH:MM:SSZ`,
+    /// TEXT des deux côtés) et se comparent comme des chaînes.
     pub fn derniere_ecoute_de_la_piste(piste: &str) -> String {
         format!(
-            "(SELECT MAX(he.listened_at) FROM listen_history he WHERE {})",
+            "(SELECT MAX(dates_8416.d) FROM (\
+             SELECT he.listened_at AS d FROM listen_history he WHERE {} \
+             UNION ALL \
+             SELECT ip.last_played_at AS d FROM imported_plays ip \
+             WHERE ip.track_id = {piste}.id) AS dates_8416)",
             ecoute_de_la_piste(piste, "he")
+        )
+    }
+
+    /// Les albums écoutés, pour les collections intelligentes (#8416) : une
+    /// table dérivée `(album_id, n, derniere)` — le nombre d'écoutes de
+    /// l'album (somme de celles de ses pistes, historique + importées) et sa
+    /// dernière écoute. Un album sans aucune écoute n'y figure pas ; une
+    /// piste sans album non plus (un `NULL` dans un `NOT IN` le rendrait
+    /// faux pour tous).
+    ///
+    /// Historique par la règle de la Bibliothèque ([`ecoute_de_la_piste`]),
+    /// importées par `imported_plays.track_id` : deux tables sans ligne
+    /// commune, aucune écoute comptée deux fois.
+    pub fn ecoutes_des_albums() -> String {
+        format!(
+            "(SELECT e.album_id AS album_id, CAST(SUM(e.n) AS BIGINT) AS n, \
+                     MAX(e.d) AS derniere \
+              FROM (SELECT t3.album_id AS album_id, COUNT(*) AS n, \
+                           MAX(lh.listened_at) AS d \
+                    FROM tracks t3 JOIN listen_history lh ON {} \
+                    GROUP BY t3.album_id \
+                    UNION ALL \
+                    SELECT t4.album_id AS album_id, ip.play_count AS n, \
+                           ip.last_played_at AS d \
+                    FROM tracks t4 JOIN imported_plays ip ON ip.track_id = t4.id) e \
+              WHERE e.album_id IS NOT NULL \
+              GROUP BY e.album_id)",
+            ecoute_de_la_piste("t3", "lh")
         )
     }
 
@@ -439,8 +550,9 @@ pub mod sql {
                   AND t.album_id = h.album_id \
              LEFT JOIN artists a ON h.source = 'local' AND a.name = h.artist_name \
              LEFT JOIN tracks t2 ON t2.artist_id = a.id AND t2.title = h.title \
-             WHERE h.source != 'radio' AND LOWER(h.artist_name) IN ({noms}) \
-             GROUP BY h.source, h.source_id, h.title, h.artist_name, h.duration_ms"
+             WHERE {} AND LOWER(h.artist_name) IN ({noms}) \
+             GROUP BY h.source, h.source_id, h.title, h.artist_name, h.duration_ms",
+            super::ecoute_de_musique("h.source")
         )
     }
 
@@ -473,14 +585,16 @@ pub mod sql {
 
     pub fn top_artists<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT artist_name, COUNT(*) as plays FROM listen_history WHERE artist_name IS NOT NULL AND source != 'radio' GROUP BY artist_name ORDER BY plays DESC LIMIT {}",
+            "SELECT artist_name, COUNT(*) as plays FROM listen_history WHERE artist_name IS NOT NULL AND {} GROUP BY artist_name ORDER BY plays DESC LIMIT {}",
+            super::ECOUTE_DE_MUSIQUE,
             d.placeholder(1)
         )
     }
 
     pub fn top_albums<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history WHERE album_title IS NOT NULL AND source != 'radio' GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT {}",
+            "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history WHERE album_title IS NOT NULL AND {} GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT {}",
+            super::ECOUTE_DE_MUSIQUE,
             d.placeholder(1)
         )
     }
@@ -499,8 +613,11 @@ pub mod sql {
          WHERE COALESCE(source, '') <> 'radio'"
     }
 
-    pub fn dashboard_unique_artists() -> &'static str {
-        "SELECT COUNT(DISTINCT artist_name) FROM listen_history WHERE artist_name IS NOT NULL"
+    pub fn dashboard_unique_artists() -> String {
+        format!(
+            "SELECT COUNT(DISTINCT artist_name) FROM listen_history WHERE artist_name IS NOT NULL AND {}",
+            super::ECOUTE_DE_MUSIQUE
+        )
     }
 
     /// Daily aggregation. Uses the date helpers so both engines emit
@@ -796,6 +913,14 @@ impl HistoryRepo {
                     "cover_path": cols.get(4).and_then(|v| v.as_string()),
                     "album_title": cols.get(5).and_then(|v| v.as_string()),
                     "source": cols.get(6).and_then(|v| v.as_string()),
+                    // #8140 : de la même ligne que `source` ; `null` pour
+                    // une écoute locale. `album_id_service` suit la règle de
+                    // `ListenRecord::album_id_service` (référence vide = rien).
+                    "source_id": cols.get(7).and_then(|v| v.as_string())
+                        .filter(|s| !s.trim().is_empty()),
+                    "album_id_service": cols.get(8).and_then(|v| v.as_string())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
                 })
             })
             .collect())
@@ -1174,7 +1299,7 @@ impl HistoryRepo {
             .unwrap_or(0);
         let unique_artists = self
             .db
-            .query_one(sql::dashboard_unique_artists(), &[])?
+            .query_one(&sql::dashboard_unique_artists(), &[])?
             .as_ref()
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
             .unwrap_or(0);
@@ -1291,7 +1416,7 @@ impl HistoryRepo {
         let dans = Self::lot_in(bas.len());
         let sql = format!(
             "SELECT LOWER(artist_name), source, COUNT(*) FROM listen_history \
-             WHERE source IS NOT NULL AND source NOT IN ('local', 'upnp', 'radio') \
+             WHERE source IS NOT NULL AND source NOT IN ('local', 'upnp', 'radio', 'podcast') \
              AND LOWER(artist_name) IN ({dans}) \
              GROUP BY LOWER(artist_name), source"
         );
@@ -1522,7 +1647,7 @@ impl HistoryRepo {
             "SELECT COUNT(*),
                     CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT),
                     COUNT(DISTINCT title || COALESCE(artist_name, '')),
-                    COUNT(DISTINCT CASE WHEN artist_name IS NOT NULL THEN artist_name END)
+                    COUNT(DISTINCT CASE WHEN artist_name IS NOT NULL AND {ECOUTE_DE_MUSIQUE} THEN artist_name END)
              FROM listen_history {simple_where}"
         );
         let totals_row = self
@@ -1556,9 +1681,11 @@ impl HistoryRepo {
         let artists_sql = format!(
             "SELECT lh.artist_name, COUNT(*) as plays, CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms
              FROM listen_history lh
-             {simple_where} {no_radio_and} {artiste} IS NOT NULL
+             {simple_where} {no_radio_and} {artiste} IS NOT NULL AND {d_artiste}
              GROUP BY {artiste} ORDER BY plays DESC, lh.artist_name LIMIT {top_n}",
             artiste = sans_index("lh.artist_name"),
+            // #8645 — ni l'émission d'un podcast, ni une radio.
+            d_artiste = ecoute_de_musique("lh.source"),
         );
         let artistes_bruts = self.db.query_many(&artists_sql, &[])?;
         let noms_artistes: Vec<String> = artistes_bruts
@@ -1601,11 +1728,13 @@ impl HistoryRepo {
             "SELECT h.album_title, h.artist_name, MAX(h.cover_url) as cover_url, COUNT(*) as plays,
                     MAX(h.source) as source, MAX(h.source_id) as source_id
              FROM listen_history h
-             {where_clause} {no_radio_and_h} {album} IS NOT NULL
+             {where_clause} {no_radio_and_h} {album} IS NOT NULL AND {d_artiste}
              GROUP BY {album}, {artiste}
              ORDER BY plays DESC, h.album_title, h.artist_name LIMIT {top_n}",
             album = sans_index("h.album_title"),
             artiste = sans_index("h.artist_name"),
+            // #8645 — l'émission d'un podcast est aussi son « album ».
+            d_artiste = ecoute_de_musique("h.source"),
         );
         let albums_bruts = self.db.query_many(&albums_sql, &[])?;
         let titres_albums: Vec<String> = albums_bruts
@@ -1642,10 +1771,12 @@ impl HistoryRepo {
                     MAX(lh.cover_url) as cover_url,
                     MAX(lh.source) as source, MAX(lh.source_id) as source_id
              FROM listen_history lh
-             {simple_where} {no_radio_and} {titre} IS NOT NULL
+             {simple_where} {no_radio_and} {titre} IS NOT NULL AND {musique}
              GROUP BY {titre}, {artiste} ORDER BY plays DESC, lh.title, lh.artist_name LIMIT {top_n}",
             titre = sans_index("lh.title"),
             artiste = sans_index("lh.artist_name"),
+            // #8645 — un épisode de podcast n'est pas un titre du classement.
+            musique = ecoute_de_musique("lh.source"),
         );
         // Ce bloc portait DEUX sous-requêtes corrélées sur `tracks` (47 118
         // lignes), l'une pour retrouver l'identifiant de piste, l'autre pour la
@@ -2412,6 +2543,18 @@ mod ecoutes_pistes_de_service_8062_tests;
 mod ecoutes_d_une_piste_locale_7980_tests;
 
 #[cfg(test)]
+#[path = "ecoutes_importees_regles_8416_tests.rs"]
+mod ecoutes_importees_regles_8416_tests;
+
+#[cfg(test)]
+#[path = "ecoutes_par_piste_8714_tests.rs"]
+mod ecoutes_par_piste_8714_tests;
+
+#[cfg(test)]
+#[path = "podcast_hors_artistes_8645_tests.rs"]
+mod podcast_hors_artistes_8645_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::migrations;
@@ -2509,8 +2652,8 @@ mod tests {
     /// historique. Exemple ici : le titre Racing in the street n'a aucun
     /// contrôle comme les 2 autres titres. »
     ///
-    /// `listen_history.track_id` est TOUJOURS NULL — le seul site d'insertion
-    /// passe `None`. Le client désigne une piste locale par son identifiant :
+    /// `listen_history.track_id` était NULL dans cet ancien historique — le site d’insertion
+    /// passait `None`. Le client désigne une piste locale par son identifiant :
     /// sans lui, `corpsDeLecture` rend `null` et TOUTE la barre d'actions
     /// disparaît. Une piste de service, elle, s'identifie par `source` +
     /// `source_id`, bien enregistrés — d'où l'inversion que Fabien a vue.
@@ -3200,7 +3343,7 @@ mod tests {
     }
 
     /// La cause du ticket, mise sous garde. `listen_history.track_id` est
-    /// TOUJOURS NULL — `record_listen` passe `track_id: None` — donc une
+    /// NULL sur l’ancien historique — donc une
     /// jointure sur cette colonne rendrait zéro partout. Ce test écrit
     /// l'historique par le vrai chemin (`record`) et exige que le compte
     /// remonte quand même.
@@ -3224,7 +3367,10 @@ mod tests {
             .expect("compte")
             .and_then(|c| c.first().and_then(|v| v.as_i64()))
             .unwrap_or(0);
-        assert_eq!(nuls, 1, "l'orchestrateur n'ecrit jamais de track_id");
+        assert_eq!(
+            nuls, 1,
+            "ce témoin représente une écoute ancienne sans track_id"
+        );
         assert_eq!(
             repo.plays_for_tracks(&[1])
                 .expect("lecture")

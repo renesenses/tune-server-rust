@@ -69,6 +69,20 @@ four same-origin addresses that are intercepted and never loaded:
 remote page. Pin and collapse states persist in `config.json`
 (`mini_epingle`, `mini_replie`).
 
+## Keyboard media keys and target zone (#8531)
+
+Global shortcuts: `Cmd/Ctrl+Shift+Space / → / ← / ↑ / ↓ / M`, plus the
+keyboard's **Play/Pause, Next and Previous** media keys. They drive the zone
+shown in the widget window: the page reports it by navigating to
+`/__widget/zone/<id>` (intercepted, never loaded; the full window is loaded
+with `?hote=widget` so it reports too). Until a zone is reported, the target
+is the zone that is playing, else a paused one, else the first
+(`zone_cible.rs`). The keyboard's volume keys stay with the OS (they set the
+computer's own output); the zone volume stays on `Cmd/Ctrl+Shift+↑/↓`.
+On macOS the media keys are captured through a `CGEventTap`, which requires
+the Accessibility permission; without it registration fails (logged as
+`global_shortcut_register_failed`) and the keys stay with other apps.
+
 ## Server contract
 
 `src/contrat.js` holds everything the interface reads from or sends to the

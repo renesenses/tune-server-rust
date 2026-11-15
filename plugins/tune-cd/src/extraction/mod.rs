@@ -158,6 +158,9 @@ pub struct EtatPiste {
     /// calculés sur les secteurs lus SANS correction du décalage du lecteur.
     pub accuraterip_v1: Option<String>,
     pub accuraterip_v2: Option<String>,
+    /// #8522 — le verdict AccurateRip de la piste (base consultée, CRC au
+    /// décalage du lecteur).
+    pub verification: Option<crate::accuraterip_base::VerdictPiste>,
     /// Chemin absolu du fichier écrit.
     pub fichier: Option<String>,
     pub erreur: Option<String>,
@@ -172,6 +175,10 @@ pub struct EtatTravail {
     pub format: Format,
     pub verification: Verification,
     pub lecteur: String,
+    /// #8514 — d'où viennent les secteurs : `lecteur` (le disque est relu)
+    /// ou `memoire` (« Enregistrer dans la bibliothèque » : le disque déjà
+    /// chargé en mémoire, sans relire le lecteur).
+    pub source: &'static str,
     pub disc_id: String,
     /// `musicbrainz` ou `repli` (« Piste NN »).
     pub metadonnees: &'static str,
@@ -190,6 +197,10 @@ pub struct EtatTravail {
     pub debut: i64,
     pub fin: Option<i64>,
     pub erreur: Option<ErreurTravail>,
+    /// #8522 — la vérification AccurateRip du disque : identifiant, état de
+    /// la base (`en_cours` tant qu'elle n'a pas répondu), décalage ; les
+    /// verdicts s'ajoutent piste par piste.
+    pub accuraterip: Option<crate::accuraterip_base::VerificationAr>,
     /// Suite donnée au scan ciblé : `lance`, `deja_en_cours`,
     /// `indisponible` (hôte sans scan) ou `non_lance` (aucun fichier écrit).
     pub scan: Option<&'static str>,
@@ -265,6 +276,8 @@ pub struct Extractions {
     pub pochettes: Arc<dyn routes::Pochettes>,
     /// #7105 — la place libre d'un disque (un témoin en test).
     pub espace_libre: fn(&std::path::Path) -> Option<u64>,
+    /// #8522 — la base AccurateRip (partagée avec le CD en mémoire).
+    pub base_ar: Arc<crate::accuraterip_base::BaseAr>,
     travaux: Mutex<Vec<Arc<Travail>>>,
 }
 
@@ -280,6 +293,7 @@ impl Extractions {
             scan,
             pochettes: Arc::new(routes::CoverArtArchive),
             espace_libre: destination::espace_libre,
+            base_ar: Arc::new(crate::accuraterip_base::BaseAr::par_defaut()),
             travaux: Mutex::new(Vec::new()),
         }
     }
@@ -287,6 +301,12 @@ impl Extractions {
     /// Une autre source de pochettes (témoins).
     pub fn avec_pochettes(mut self, p: Arc<dyn routes::Pochettes>) -> Self {
         self.pochettes = p;
+        self
+    }
+
+    /// #8522 — une autre base AccurateRip (la partagée, ou un témoin).
+    pub fn avec_base_ar(mut self, b: Arc<crate::accuraterip_base::BaseAr>) -> Self {
+        self.base_ar = b;
         self
     }
 

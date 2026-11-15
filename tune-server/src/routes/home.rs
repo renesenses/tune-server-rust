@@ -1,5 +1,5 @@
 use axum::extract::{Query, State};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -134,6 +134,67 @@ pub fn router() -> Router<AppState> {
         )
         .route("/radio-picks", get(radio_picks))
         .route("/streaming-highlights", get(streaming_highlights))
+        .route("/shortcuts", get(shortcuts))
+        // web#916 — « Pas pour moi », par profil (`X-Profile-Id`).
+        .route(
+            "/dismissed-suggestions",
+            get(super::accueil_justifie::lister).post(super::accueil_justifie::ecarter),
+        )
+        .route(
+            "/dismissed-suggestions/restore",
+            post(super::accueil_justifie::retablir),
+        )
+}
+
+/// Les raccourcis de l'accueil (posés depuis le client web), et rien d'autre.
+///
+/// Ils vivent dans le réglage `shortcuts`, que `GET /system/config` sert avec
+/// tout le reste ; or cette route-là est de l'administration et un appelant
+/// relayé ne l'atteint jamais (`garde_du_relais`). Les télécommandes en
+/// écoute à distance lisaient donc leurs raccourcis par une route fermée
+/// (403 `not_available_remotely`). Celle-ci ne sert que cette ligne, en
+/// lecture, sous `/home` — déjà relayable.
+async fn shortcuts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let brut = SettingsRepo::with_backend(state.backend.clone())
+        .get("shortcuts")
+        .map_err(|e| {
+            tracing::error!(erreur = %e, "raccourcis_illisibles");
+            AppError::service_unavailable("Server settings are temporarily unavailable")
+        })?;
+    Ok(Json(
+        json!({ "shortcuts": raccourcis_en_liste(brut.as_deref()) }),
+    ))
+}
+
+/// Le réglage est une chaîne de JSON ; tout ce qui n'est pas une liste donne
+/// une liste vide.
+fn raccourcis_en_liste(brut: Option<&str>) -> Value {
+    match brut.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => match serde_json::from_str::<Value>(s) {
+            Ok(v @ Value::Array(_)) => v,
+            _ => json!([]),
+        },
+        None => json!([]),
+    }
+}
+
+#[cfg(test)]
+mod raccourcis_tests {
+    use super::raccourcis_en_liste;
+    use serde_json::json;
+
+    #[test]
+    fn la_liste_stockee_est_rendue_telle_quelle() {
+        let v = raccourcis_en_liste(Some(r#"[{"id":"a","name":"Albums"}]"#));
+        assert_eq!(v, json!([{"id":"a","name":"Albums"}]));
+    }
+
+    #[test]
+    fn absent_vide_ou_illisible_donne_une_liste_vide() {
+        for brut in [None, Some(""), Some("  "), Some("{"), Some("{\"a\":1}")] {
+            assert_eq!(raccourcis_en_liste(brut), json!([]), "{brut:?}");
+        }
+    }
 }
 
 /// Returns a placeholder string appropriate for the engine.
@@ -145,23 +206,51 @@ fn ph(engine: Engine, idx: usize) -> String {
 }
 
 /// Aggregated home page: returns all sections in a single response.
-async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+///
+/// web#916 (go du 13/10/2026) — la page composée suit les mêmes règles que
+/// les routes qu'elle agrège : chaque élément porte sa `raison`, et ce que le
+/// profil qui regarde (`X-Profile-Id`) a écarté n'est plus proposé (reprises,
+/// plus écoutés, à découvrir ; les ajouts récents restent factuels). Les
+/// titres de section suivent la langue de l'interface (`Accept-Language`) au
+/// lieu d'être écrits en français ; `id` reste la clé stable.
+async fn home_page(
+    State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let lang = crate::i18n::lang_from_header(&headers);
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
     // No zone filter for the aggregated home page — show all zones.
     let en_cours = lectures_en_cours(&state).await;
-    let continue_items = continuer_l_ecoute(&state, 10, None, &en_cours)?;
+    let continue_items = reprises_du_profil(&state, &ecartees, 10, None, &en_cours)?;
     // L'accueil agrege garde SA fenetre de 7 jours : c'est une vignette, pas
     // l'onglet. La fenetre choisie vit sur `/home/recently-added` (#3039).
     let recent_items = fetch_recently_added(&state, 20, borne_basse_de_fenetre(None)?)?;
-    let top_tracks = fetch_top_tracks(&state, 20);
+    let marge = marge_d_ecarts(&ecartees);
+    let mut top_tracks: Vec<Value> = fetch_top_tracks(&state, 20 + marge)
+        .into_iter()
+        .filter(|t| !super::accueil_justifie::piste_ecartee(&ecartees, t))
+        .map(|mut t| {
+            if let Some(r) = t["plays"]
+                .as_i64()
+                .and_then(super::accueil_justifie::raison_souvent_ecoute)
+            {
+                t["raison"] = r;
+            }
+            t
+        })
+        .collect();
+    top_tracks.truncate(20);
     let radios = fetch_radio_picks(&state)?;
-    let discover = fetch_recommendations(&state, 20)?;
+    let discover = recommandations_du_profil(&state, &ecartees, 20)?;
+    let titre = |cle: &str| crate::i18n::t(&lang, cle);
 
     let mut sections = Vec::new();
 
     if !continue_items.is_empty() {
         sections.push(json!({
             "id": "continue",
-            "title": "Continuer l'\u{00e9}coute",
+            "title": titre("home.section.continue"),
             "type": "albums",
             "items": continue_items,
         }));
@@ -170,7 +259,7 @@ async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     if !recent_items.is_empty() {
         sections.push(json!({
             "id": "recent",
-            "title": "Ajout\u{00e9}s r\u{00e9}cemment",
+            "title": titre("home.section.recent"),
             "type": "albums",
             "items": recent_items,
         }));
@@ -179,7 +268,7 @@ async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     if !top_tracks.is_empty() {
         sections.push(json!({
             "id": "top",
-            "title": "Les plus \u{00e9}cout\u{00e9}s",
+            "title": titre("home.section.top"),
             "type": "tracks",
             "items": top_tracks,
         }));
@@ -188,7 +277,7 @@ async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     if !radios.is_empty() {
         sections.push(json!({
             "id": "radios",
-            "title": "Radios favorites",
+            "title": titre("home.section.radios"),
             "type": "radios",
             "items": radios,
         }));
@@ -197,7 +286,7 @@ async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     if !discover.is_empty() {
         sections.push(json!({
             "id": "discover",
-            "title": "\u{00c0} d\u{00e9}couvrir",
+            "title": titre("home.section.discover"),
             "type": "albums",
             "items": discover,
         }));
@@ -208,18 +297,48 @@ async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppErro
 
 /// Albums from listen history where the user hasn't finished the album
 /// (listened tracks < total tracks).
+///
+/// web#916 (go du 13/10/2026) — chaque entrée porte `raison: reprise` (la
+/// date de la dernière écoute), et ce que le profil qui regarde a écarté
+/// (« Pas pour moi ») n'y revient plus.
 async fn continue_listening(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<HomeParams>,
 ) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(10);
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
     // When zone_id is provided, filter continue-listening items to albums
     // that were played on that specific zone. This prevents zone mismatch:
     // the client sends the CURRENT active zone, not a stored zone from
     // history (DEvir QA B-09).
     let en_cours = lectures_en_cours(&state).await;
-    let items = continuer_l_ecoute(&state, limit, p.zone_id, &en_cours)?;
+    let items = reprises_du_profil(&state, &ecartees, limit, p.zone_id, &en_cours)?;
     Ok(Json(json!(items)))
+}
+
+/// Ce qu'un profil a écarté, en nombre d'éléments à demander en plus pour
+/// qu'une rangée reste pleine après filtrage.
+fn marge_d_ecarts(e: &tune_core::db::suggestions_ecartees::Ecartees) -> i64 {
+    i64::try_from(e.len()).unwrap_or(0).min(500)
+}
+
+/// « Continuer l'écoute » pour un profil : sans ce qu'il a écarté ni ce qui
+/// joue déjà (#8085, `en_cours`), coupée à `limit`.
+fn reprises_du_profil(
+    state: &AppState,
+    ecartees: &tune_core::db::suggestions_ecartees::Ecartees,
+    limit: i64,
+    zone_id: Option<i64>,
+    en_cours: &[LectureEnCours],
+) -> Result<Vec<Value>, AppError> {
+    if ecartees.est_vide() {
+        return continuer_l_ecoute(state, limit, zone_id, en_cours);
+    }
+    let mut items = continuer_l_ecoute(state, limit + marge_d_ecarts(ecartees), zone_id, en_cours)?;
+    items.retain(|i| !super::accueil_justifie::reprise_ecartee(ecartees, i));
+    items.truncate(usize::try_from(limit.max(0)).unwrap_or(0));
+    Ok(items)
 }
 
 /// Combien de contextes distincts on ramene avant de filtrer.
@@ -428,7 +547,9 @@ fn continuer_l_ecoute(
             "source": r.source, "title": r.title, "last_track_title": r.last_track_title,
             "artist_name": artist_name, "album_title": album_title,
             "cover_path": r.cover_path, "album_id": r.album_id, "id": r.album_id.unwrap_or(0),
-            "position": r.position, "position_ms": r.position_ms}));
+            "position": r.position, "position_ms": r.position_ms,
+            // web#916 — la raison d'une reprise : la date de sa dernière écoute.
+            "raison": super::accueil_justifie::raison_reprise(Some(&r.updated_at))}));
     }
     for old in fetch_continue_listening_borne(state, limit, zone_id, BORNE_SECOND_RANG)? {
         let nature = old["context_type"].as_str().unwrap_or("album");
@@ -634,7 +755,14 @@ fn fetch_continue_listening_borne(
             .then_with(|| a.1["context_id"].as_str().cmp(&b.1["context_id"].as_str()))
     });
     items.truncate(limit.max(0) as usize);
-    Ok(items.into_iter().map(|(_, item)| item).collect())
+    // web#916 — la raison d'une reprise : la date de sa dernière écoute.
+    Ok(items
+        .into_iter()
+        .map(|(date, mut item)| {
+            item["raison"] = super::accueil_justifie::raison_reprise(Some(&date));
+            item
+        })
+        .collect())
 }
 
 /// La derniere ecoute de chaque contexte distinct, enrichie de quoi l'afficher.
@@ -1297,7 +1425,10 @@ mod tests_homonymes {
     fn a_decouvrir_propose_un_album_du_genre_ecoute_pas_encore_entendu() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let (police, pulp) = deux_live(&state, Some("Rock"));
-        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+        // Au-dela du plafond : Pulp n'est pas « a peine entame » (#8280).
+        for _ in 0..=PLAFOND_PEU_ECOUTE {
+            ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+        }
 
         let Ok(items) = fetch_recommendations(&state, 20) else {
             panic!("la requete doit repondre")
@@ -1308,13 +1439,40 @@ mod tests_homonymes {
     }
 
     /// Reveiller la requete ne doit pas VIDER la section : quand tout ce qui
-    /// est du genre a deja ete ecoute, le hasard reprend, comme avant.
+    /// est du genre a deja ete ecoute, une autre raison prend le relais —
+    /// ici « a peine entame » (#8280), chaque album n'ayant qu'une ecoute.
     #[test]
-    fn a_decouvrir_retombe_sur_le_hasard_quand_le_genre_est_epuise() {
+    fn a_decouvrir_propose_le_peu_ecoute_quand_le_genre_est_epuise() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let (police, pulp) = deux_live(&state, Some("Rock"));
         ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
         ecoute(&state, "Roxanne", Some("The Police"), Some(police));
+
+        let Ok(items) = fetch_recommendations(&state, 20) else {
+            panic!("la requete doit repondre")
+        };
+        assert_eq!(items.len(), 2, "albums rendus : {items:?}");
+        for i in &items {
+            assert_eq!(i["reason"].as_str(), Some("rarely_played"), "{i}");
+            assert_eq!(
+                i["raison"],
+                json!({"type": "peu_ecoute", "ecoutes": 1}),
+                "{i}"
+            );
+        }
+    }
+
+    /// Et quand aucune raison ne tient — genre epuise, albums bien ecoutes,
+    /// pas d'annee, pas d'artiste a plusieurs albums —, le hasard reprend,
+    /// comme avant.
+    #[test]
+    fn a_decouvrir_retombe_sur_le_hasard_quand_le_genre_est_epuise() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (police, pulp) = deux_live(&state, Some("Rock"));
+        for _ in 0..=PLAFOND_PEU_ECOUTE {
+            ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+            ecoute(&state, "Roxanne", Some("The Police"), Some(police));
+        }
 
         let Ok(items) = fetch_recommendations(&state, 20) else {
             panic!("la requete doit repondre")
@@ -2098,6 +2256,11 @@ fn fetch_recently_added_par(
                 // temps que les clients migrent — il porte la meme valeur.
                 "added_at": cols.get(10).and_then(|v| v.as_f64()),
                 "added_mtime": cols.get(10).and_then(|v| v.as_f64()),
+                // web#916 — même raison que « Nouveautés dans votre
+                // bibliothèque » : la fenêtre est celle des AJOUTS.
+                "raison": super::accueil_justifie::raison_ajout_recent(
+                    cols.get(10).and_then(|v| v.as_f64())
+                ),
             })
         })
         .collect())
@@ -2105,16 +2268,83 @@ fn fetch_recently_added_par(
 
 /// Recommendations based on listening history: find most-played genres/artists,
 /// suggest albums from the same genres that haven't been listened to yet.
+///
+/// web#916 — chaque album porte sa `raison` quand la logique la connaît
+/// (`genre_frequent` : un des genres les plus écoutés), aucune quand il vient
+/// du repli au hasard. Ce que le profil qui regarde a écarté (« Pas pour
+/// moi ») n'est plus proposé : la requête demande d'autant plus d'albums,
+/// puis on filtre et on coupe.
 async fn home_recommendations(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<HomeParams>,
 ) -> Result<Json<Value>, AppError> {
-    let limit = p.limit.unwrap_or(20);
-    let items = fetch_recommendations(&state, limit)?;
-    Ok(Json(json!(items)))
+    let limit = p.limit.unwrap_or(20).clamp(1, 200);
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
+    Ok(Json(json!(recommandations_du_profil(
+        &state, &ecartees, limit
+    )?)))
+}
+
+/// Les recommandations d'un profil : la requête demande d'autant plus
+/// d'albums qu'il en a écarté, puis on filtre et on coupe.
+fn recommandations_du_profil(
+    state: &AppState,
+    ecartees: &tune_core::db::suggestions_ecartees::Ecartees,
+    limit: i64,
+) -> Result<Vec<Value>, AppError> {
+    let mut items = fetch_recommendations(state, limit + marge_d_ecarts(ecartees))?;
+    if !ecartees.est_vide() {
+        items.retain(|a| !super::accueil_justifie::album_local_ecarte(ecartees, a));
+    }
+    items.truncate(usize::try_from(limit.max(0)).unwrap_or(0));
+    Ok(items)
 }
 
 fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
+    fetch_recommendations_graine(state, limit, graine_du_jour())
+}
+
+/// La graine du mélange de « À découvrir » : le jour (UTC). Le même jour,
+/// la rangée alterne ses raisons dans le même ordre ; le lendemain, une
+/// autre raison ouvre la rangée.
+fn graine_du_jour() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0) / 86_400
+}
+
+/// Le plafond d'écoutes d'un album « peu écouté » (#8280). Une écoute est
+/// une piste jouée : trois, c'est un album à peine entamé.
+const PLAFOND_PEU_ECOUTE: i64 = 3;
+
+/// Un album « peu écouté » ne l'a pas été depuis au moins ce nombre de jours.
+const JOURS_SANS_ECOUTE: i64 = 30;
+
+/// « À découvrir », raisons variées (Discussion #8280).
+///
+/// Quatre sources, par ordre de PRIORITÉ — un album que deux sources
+/// proposent garde la raison de la première :
+///
+/// 1. `genre_match` — jamais écouté, d'un des 5 genres les plus écoutés ;
+/// 2. `artist_match` — jamais écouté, d'un artiste dont la bibliothèque
+///    compte au moins deux albums (`raison: artiste_possede`) ;
+/// 3. `year_match` — jamais écouté, de la décennie la plus écoutée
+///    (`raison: meme_epoque`) ;
+/// 4. `rarely_played` — à peine entamé, 1 à [`PLAFOND_PEU_ECOUTE`] écoutes,
+///    aucune depuis [`JOURS_SANS_ECOUTE`] jours (`raison: peu_ecoute`).
+///
+/// Chaque source se tait quand ses données manquent (pas d'historique, pas
+/// d'années, pas d'artiste à plusieurs albums). Les sources qui répondent
+/// sont entrelacées ([`melanger_les_sources`]) ; si aucune ne répond, le
+/// hasard reprend, comme avant (`random`, `raison: hasard`).
+///
+/// Coût : quatre requêtes bornées par `limit` au lieu d'une, sur les index
+/// existants — mesure sur 10 000 albums dans
+/// `tune-core/src/db/recommandations_8280_tests.rs`.
+fn fetch_recommendations_graine(
+    state: &AppState,
+    limit: i64,
+    graine: u64,
+) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
 
     // Find top genres from listen history
@@ -2127,17 +2357,22 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
         .collect();
 
     // Les albums des genres ecoutes que l'auditeur n'a pas encore entendus.
-    // S'il n'y en a aucun — pas d'historique, historique sans genre, ou tout
-    // le genre deja ecoute — on retombe sur le hasard, comme avant. Depuis
-    // #3181 la requete des genres repond enfin : la section ne doit pas se
-    // VIDER le jour ou elle se met a recommander pour de vrai.
+    // Depuis #3181 la requete des genres repond enfin : la section ne doit
+    // pas se VIDER le jour ou elle se met a recommander pour de vrai.
     let par_genre = if top_genres.is_empty() {
         Vec::new()
     } else {
         albums_du_genre_non_ecoutes(state, &top_genres, limit)
     };
-    if !par_genre.is_empty() {
-        return Ok(par_genre);
+    let sources = vec![
+        par_genre,
+        albums_d_artistes_possedes(state, limit),
+        albums_de_la_decennie_ecoutee(state, limit),
+        albums_a_peine_entames(state, limit),
+    ];
+    let melange = melanger_les_sources(sources, usize::try_from(limit.max(0)).unwrap_or(0), graine);
+    if !melange.is_empty() {
+        return Ok(melange);
     }
 
     // Fallback: return random albums
@@ -2156,6 +2391,105 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
         .iter()
         .map(|cols| album_recommande(cols, "random"))
         .collect())
+}
+
+/// Entrelace les sources de « À découvrir » (#8280), `limit` albums au plus.
+///
+/// * Sans doublon : un album déjà pris par une source de rang plus haut est
+///   ôté des suivantes (même identifiant) — il garde la raison la plus forte.
+/// * Déterministe : à listes égales et graine égale, même résultat. Les
+///   sources NON VIDES se relaient une à une ; la graine choisit celle qui
+///   ouvre (`graine % nombre de sources non vides`), les autres suivent dans
+///   l'ordre de priorité. Une source épuisée cède son tour.
+fn melanger_les_sources(sources: Vec<Vec<Value>>, limit: usize, graine: u64) -> Vec<Value> {
+    let mut vus = std::collections::HashSet::new();
+    let mut files: Vec<std::collections::VecDeque<Value>> = sources
+        .into_iter()
+        .map(|source| {
+            source
+                .into_iter()
+                .filter(|a| a["id"].as_i64().is_some_and(|id| vus.insert(id)))
+                .collect::<std::collections::VecDeque<Value>>()
+        })
+        .filter(|file| !file.is_empty())
+        .collect();
+    let mut rendus = Vec::new();
+    if files.is_empty() || limit == 0 {
+        return rendus;
+    }
+    let n = files.len();
+    let depart = usize::try_from(graine % n as u64).unwrap_or(0);
+    let mut tour = 0usize;
+    while rendus.len() < limit && files.iter().any(|f| !f.is_empty()) {
+        if let Some(album) = files[(depart + tour) % n].pop_front() {
+            rendus.push(album);
+        }
+        tour += 1;
+    }
+    rendus
+}
+
+/// Les albums jamais écoutés d'un artiste à plusieurs albums (#8280). Les
+/// « artistes divers » n'en sont pas : une pile de compilations ne dit rien
+/// de ce que l'auditeur aime.
+fn albums_d_artistes_possedes(state: &AppState, limit: i64) -> Vec<Value> {
+    let sql = home_queries::albums_d_artistes_possedes_non_ecoutes(state.backend.engine());
+    let inconnu = tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME;
+    let params: [&dyn ToSqlValue; 2] = [&inconnu, &limit];
+    state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise()
+        .iter()
+        .filter(|cols| {
+            cols.get(2).and_then(|v| v.as_string()).is_some_and(|nom| {
+                !tune_core::library::regle_compilation::est_artistes_divers(&nom)
+            })
+        })
+        .map(|cols| album_recommande(cols, "artist_match"))
+        .collect()
+}
+
+/// Les albums jamais écoutés de la décennie la plus écoutée (#8280). Rien
+/// quand l'historique ne rattache aucune écoute à un album daté.
+fn albums_de_la_decennie_ecoutee(state: &AppState, limit: i64) -> Vec<Value> {
+    let Some(decennie) = state
+        .backend
+        .query_many(&home_queries::decennie_la_plus_ecoutee(), &[])
+        .ou_defaut_journalise()
+        .first()
+        .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+    else {
+        return Vec::new();
+    };
+    let fin = decennie + 10;
+    let sql = home_queries::albums_de_la_decennie_non_ecoutes(state.backend.engine());
+    let params: [&dyn ToSqlValue; 3] = [&decennie, &fin, &limit];
+    state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise()
+        .iter()
+        .map(|cols| album_recommande(cols, "year_match"))
+        .collect()
+}
+
+/// Les albums à peine entamés, 1 à [`PLAFOND_PEU_ECOUTE`] écoutes, et
+/// aucune depuis [`JOURS_SANS_ECOUTE`] jours (#8280) : ce qu'on écoute en ce
+/// moment est dans « Continuer l'écoute », pas à découvrir.
+fn albums_a_peine_entames(state: &AppState, limit: i64) -> Vec<Value> {
+    let sql = home_queries::albums_peu_ecoutes(state.backend.engine());
+    let avant = (chrono::Utc::now() - chrono::Duration::days(JOURS_SANS_ECOUTE))
+        .format("%Y-%m-%d")
+        .to_string();
+    let params: [&dyn ToSqlValue; 3] = [&PLAFOND_PEU_ECOUTE, &avant, &limit];
+    state
+        .backend
+        .query_many(&sql, &params)
+        .ou_defaut_journalise()
+        .iter()
+        .map(|cols| album_recommande(cols, "rarely_played"))
+        .collect()
 }
 
 /// Les albums des `genres` donnes que l'historique ne connait pas, au hasard,
@@ -2182,25 +2516,68 @@ fn albums_du_genre_non_ecoutes(state: &AppState, genres: &[String], limit: i64) 
 
 /// Une ligne `a.id, a.title, ar.name, a.year, a.cover_path, a.genre` dans la
 /// forme que l'ecran lit, avec la raison pour laquelle on la propose.
+///
+/// `reason` (chaîne) reste pour les clients déployés ; `raison` (objet,
+/// web#916) : `genre_frequent` pour `genre_match` quand l'album a bien un
+/// genre, `hasard` pour le repli au hasard (go du 13/10/2026 : le hasard
+/// dit qu'il est le hasard). #8280 : `artiste_possede` pour `artist_match`,
+/// `meme_epoque` pour `year_match`, `peu_ecoute` pour `rarely_played` — les
+/// chaînes que la télécommande Flutter sait déjà nommer.
 fn album_recommande(cols: &[tune_core::db::backend::SqlValue], raison: &str) -> Value {
-    json!({
+    let genre = cols.get(5).and_then(|v| v.as_string());
+    let mut album = json!({
         "id": cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
         "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
         "artist_name": cols.get(2).and_then(|v| v.as_string()),
         "year": cols.get(3).and_then(|v| v.as_i64()),
         "cover_path": cols.get(4).and_then(|v| v.as_string()),
-        "genre": cols.get(5).and_then(|v| v.as_string()),
+        "genre": genre,
         "reason": raison,
-    })
+    });
+    if raison == "genre_match" {
+        if let Some(r) = genre
+            .as_deref()
+            .and_then(super::accueil_justifie::raison_genre_frequent)
+        {
+            album["raison"] = r;
+        }
+    } else if raison == "random" {
+        album["raison"] = super::accueil_justifie::raison_hasard();
+    } else {
+        // #8280 — la septième colonne porte le nombre qui justifie la raison.
+        let nombre = cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0);
+        let r = match raison {
+            "artist_match" => cols
+                .get(2)
+                .and_then(|v| v.as_string())
+                .and_then(|a| super::accueil_justifie::raison_artiste(&a, false, nombre)),
+            "year_match" => cols.get(3).and_then(|v| v.as_i64()).and_then(|annee| {
+                super::accueil_justifie::raison_meme_epoque(annee - annee.rem_euclid(10))
+            }),
+            "rarely_played" => super::accueil_justifie::raison_peu_ecoute(nombre),
+            _ => None,
+        };
+        if let Some(r) = r {
+            album["raison"] = r;
+        }
+    }
+    album
 }
 
 /// Auto-generated "mixes" by genre from top genres in history.
 /// Each mix = playlist of 20 tracks from that genre.
+///
+/// web#916 (go du 13/10/2026) — chaque mix porte `raison: genre_frequent` (il
+/// est bâti sur un des genres les plus écoutés), chaque piste son `album_id`,
+/// et les pistes d'un album ou d'un artiste que le profil a écarté n'y
+/// entrent plus.
 async fn top_mixes(
     State(state): State<AppState>,
     profile: crate::routes::active_profile::ActiveProfile,
 ) -> Result<Json<Value>, AppError> {
     let engine = state.backend.engine();
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
+    let marge = marge_d_ecarts(&ecartees);
 
     // Get top 5 genres from history
     let top_genres: Vec<(String, i64)> = state
@@ -2221,15 +2598,16 @@ async fn top_mixes(
     // par le profil qui regarde. Les deux genres sont parenthésés pour que
     // le socle s'applique aux deux branches du OR.
     let sans_bannis = tune_core::db::facet_filter::banned_tracks_excluded(profile.id());
+    let plafond = 20 + marge;
     let tracks_sql = format!(
         "SELECT t.id, t.title, ar.name, al.title, \
-                CAST(t.duration_ms AS BIGINT), al.cover_path \
+                CAST(t.duration_ms AS BIGINT), al.cover_path, t.album_id \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
          WHERE (t.genre = {p1} OR al.genre = {p2}) \
          AND {sans_bannis} \
-         ORDER BY RANDOM() LIMIT 20"
+         ORDER BY RANDOM() LIMIT {plafond}"
     );
 
     let mixes: Vec<Value> = top_genres
@@ -2249,20 +2627,25 @@ async fn top_mixes(
                         "album_title": cols.get(3).and_then(|v| v.as_string()),
                         "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
                         "cover_path": cols.get(5).and_then(|v| v.as_string()),
+                        "album_id": cols.get(6).and_then(|v| v.as_i64()),
                     })
                 })
+                .filter(|t| !super::accueil_justifie::piste_ecartee(&ecartees, t))
+                .take(20)
                 .collect();
 
             if tracks.is_empty() {
                 return None;
             }
 
+            let raison = super::accueil_justifie::raison_genre_frequent(&genre);
             Some(json!({
                 "genre": genre,
                 "title": format!("Mix {}", genre),
                 "play_count": play_count,
                 "track_count": tracks.len(),
                 "tracks": tracks,
+                "raison": raison,
             }))
         })
         .collect();
@@ -2313,6 +2696,11 @@ async fn new_in_library(
                 // Nom garde pour les clients deployes ; la valeur est la date
                 // d'ajout (#4546).
                 "file_mtime": cols.get(6).and_then(|v| v.as_f64()),
+                // web#916 — la rangée est triée par date d'AJOUT : c'est sa
+                // raison, et la date est celle qu'elle vient de lire.
+                "raison": super::accueil_justifie::raison_ajout_recent(
+                    cols.get(6).and_then(|v| v.as_f64())
+                ),
             })
         })
         .collect();
@@ -2517,12 +2905,18 @@ const ECOUTES_STREAMING: usize = 6;
 /// rendu. Le couper ne filtrerait pas la reponse, il la viderait.
 async fn other_versions(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<OtherVersionsParams>,
 ) -> Result<axum::response::Response, AppError> {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let fournisseur = fournisseur_streaming_reel(state.clone());
     let (groupes, en_preparation) = autres_versions(&state, &p, fournisseur)?;
+    // web#916 — la raison de chaque groupe (`autre_version`), et ce que le
+    // profil qui regarde a écarté retiré ; sur la réponse 202 comme sur la
+    // 200, puisque toutes deux portent la liste des groupes.
+    let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
+    let groupes = super::accueil_justifie::epurer_autres_versions(groupes, &ecartees);
     if en_preparation {
         // 202 + un corps qui reste LA LISTE des groupes (ceux que la
         // bibliotheque a deja rendus, vide au pire) : un client qui ne connait
@@ -3059,12 +3453,16 @@ async fn radio_picks(State(state): State<AppState>) -> Result<Json<Value>, AppEr
 fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
     let repo = RadioRepo::with_backend(state.backend.clone());
 
-    let mut items: Vec<Value> = repo
-        .favorites()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| json!(r))
-        .collect();
+    let mut items: Vec<Value> =
+        super::radios::une_station_par_flux(repo.favorites().unwrap_or_default())
+            .into_iter()
+            .map(|r| {
+                let mut v = json!(r);
+                // web#916 — pourquoi elle est là : c'est une favorite.
+                v["raison"] = super::accueil_justifie::raison_radio(true, None);
+                v
+            })
+            .collect();
 
     // `is_favorite = '0'` et non `= 0` (#3181). La colonne n'a pas le meme type
     // selon l'origine de la base : `SMALLINT` sur une installation PostgreSQL
@@ -3101,6 +3499,11 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
                 "last_played": cols.get(5).and_then(|v| v.as_string()),
                 "play_count": cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
                 "is_favorite": false,
+                // web#916 — écoutée récemment, à cette date.
+                "raison": super::accueil_justifie::raison_radio(
+                    false,
+                    cols.get(5).and_then(|v| v.as_string()).as_deref(),
+                ),
             })
         })
         .collect();
@@ -4246,3 +4649,261 @@ mod tests_autres_versions_grosse_bibliotheque {
 #[path = "home_resume.rs"]
 mod home_resume;
 use home_resume::resume_listening;
+
+/// Discussion #8280 — « À découvrir » varie ses raisons. Chaque raison est
+/// produite quand ses données existent, le hasard reprend sinon, et le
+/// mélange est déterministe, sans doublon, borné.
+#[cfg(test)]
+mod tests_raisons_8280 {
+    use super::*;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    fn sql(state: &AppState, requete: &str) {
+        state.backend.execute(requete, &[]).expect(requete);
+    }
+
+    fn recommandes(state: &AppState) -> Vec<Value> {
+        let Ok(items) = fetch_recommendations_graine(state, 20, 0) else {
+            panic!("la requete doit repondre")
+        };
+        items
+    }
+
+    fn par_raison<'a>(items: &'a [Value], reason: &str) -> Vec<&'a Value> {
+        items.iter().filter(|i| i["reason"] == reason).collect()
+    }
+
+    /// Miles Davis : trois albums, dont un écouté (une fois) ; aucun genre,
+    /// aucune année. Les deux autres viennent « parce que vous avez 3 albums
+    /// de Miles Davis », l'écouté « à peine entamé ».
+    #[test]
+    fn l_artiste_possede_et_le_peu_ecoute_sont_proposes() {
+        let state = etat();
+        sql(
+            &state,
+            "INSERT INTO artists (id, name) VALUES (1, 'Miles Davis'), (2, 'Seul')",
+        );
+        sql(
+            &state,
+            "INSERT INTO albums (id, title, artist_id) VALUES \
+             (1, 'Kind of Blue', 1), (2, 'Bitches Brew', 1), (3, 'Milestones', 1), \
+             (4, 'Unique', 2)",
+        );
+        sql(
+            &state,
+            "INSERT INTO listen_history (title, artist_name, album_title, album_id, listened_at) \
+             VALUES ('So What', 'Miles Davis', 'Kind of Blue', 1, '2026-10-01T10:00:00Z')",
+        );
+
+        let items = recommandes(&state);
+        let mut ids: Vec<i64> = items.iter().filter_map(|i| i["id"].as_i64()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "« Unique » n'a aucune raison : {items:?}"
+        );
+        for a in par_raison(&items, "artist_match") {
+            assert_eq!(
+                a["raison"],
+                json!({"type": "artiste_possede", "artiste": "Miles Davis", "albums": 3}),
+                "{a}"
+            );
+        }
+        assert_eq!(par_raison(&items, "artist_match").len(), 2, "{items:?}");
+        let peu = par_raison(&items, "rarely_played");
+        assert_eq!(peu.len(), 1, "{items:?}");
+        assert_eq!(peu[0]["id"], json!(1));
+        assert_eq!(
+            peu[0]["raison"],
+            json!({"type": "peu_ecoute", "ecoutes": 1})
+        );
+    }
+
+    /// Un album des années 70 écouté souvent : les autres albums des années
+    /// 70, jamais écoutés, viennent « de la même époque » ; celui de 1990
+    /// non.
+    #[test]
+    fn la_meme_epoque_est_proposee_quand_les_ecoutes_sont_datees() {
+        let state = etat();
+        sql(
+            &state,
+            "INSERT INTO artists (id, name) VALUES (1, 'A'), (2, 'B'), (3, 'C')",
+        );
+        sql(
+            &state,
+            "INSERT INTO albums (id, title, artist_id, year) VALUES \
+             (1, 'Ecoute', 1, 1975), (2, 'Meme epoque', 2, 1972), (3, 'Plus tard', 3, 1990)",
+        );
+        for _ in 0..=PLAFOND_PEU_ECOUTE {
+            sql(
+                &state,
+                "INSERT INTO listen_history (title, artist_name, album_title, album_id, listened_at) \
+                 VALUES ('T', 'A', 'Ecoute', 1, '2026-10-01T10:00:00Z')",
+            );
+        }
+
+        let items = recommandes(&state);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["id"], json!(2));
+        assert_eq!(items[0]["reason"], json!("year_match"));
+        assert_eq!(
+            items[0]["raison"],
+            json!({"type": "meme_epoque", "decennie": 1970})
+        );
+    }
+
+    /// Une pile de compilations n'est pas un artiste qu'on possède.
+    #[test]
+    fn les_artistes_divers_ne_sont_pas_un_artiste_possede() {
+        let state = etat();
+        sql(
+            &state,
+            "INSERT INTO artists (id, name) VALUES (1, 'Various Artists')",
+        );
+        sql(
+            &state,
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Hits 1', 1), (2, 'Hits 2', 1)",
+        );
+        let items = recommandes(&state);
+        assert!(
+            items.iter().all(|i| i["reason"] == "random"),
+            "seul le hasard reste : {items:?}"
+        );
+    }
+
+    /// Un album que le genre ET l'artiste proposent n'apparaît qu'une fois,
+    /// avec la raison du genre (la plus forte). Les deux raisons se
+    /// partagent la rangée.
+    #[test]
+    fn pas_de_doublon_et_le_genre_prime() {
+        let state = etat();
+        sql(
+            &state,
+            "INSERT INTO artists (id, name) VALUES (1, 'Miles Davis'), (2, 'Pulp')",
+        );
+        sql(
+            &state,
+            "INSERT INTO albums (id, title, artist_id, genre) VALUES \
+             (1, 'Kind of Blue', 1, 'Jazz'), (2, 'Bitches Brew', 1, 'Jazz'), \
+             (3, 'Milestones', 1, NULL), (4, 'His n Hers', 2, 'Rock'), (5, 'Different Class', 2, 'Rock')",
+        );
+        for _ in 0..=PLAFOND_PEU_ECOUTE {
+            sql(
+                &state,
+                "INSERT INTO listen_history (title, artist_name, album_title, album_id, listened_at) \
+                 VALUES ('So What', 'Miles Davis', 'Kind of Blue', 1, '2026-10-01T10:00:00Z')",
+            );
+        }
+        let items = recommandes(&state);
+        let ids: Vec<i64> = items.iter().filter_map(|i| i["id"].as_i64()).collect();
+        let uniques: std::collections::BTreeSet<i64> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), uniques.len(), "doublon : {items:?}");
+        let deux = items.iter().find(|i| i["id"] == 2).expect("album 2");
+        assert_eq!(deux["reason"], json!("genre_match"), "{deux}");
+        assert_eq!(
+            deux["raison"],
+            json!({"type": "genre_frequent", "genre": "Jazz"})
+        );
+        assert!(!par_raison(&items, "artist_match").is_empty(), "{items:?}");
+    }
+
+    /// Le contrat JSON : les champs que les clients lisent, pour chaque
+    /// raison nouvelle.
+    #[test]
+    fn le_contrat_json_des_albums_recommandes() {
+        let state = etat();
+        sql(
+            &state,
+            "INSERT INTO artists (id, name) VALUES (1, 'Miles Davis')",
+        );
+        sql(
+            &state,
+            "INSERT INTO albums (id, title, artist_id, year, cover_path) VALUES \
+             (1, 'Kind of Blue', 1, 1959, '/c/1.jpg'), (2, 'Milestones', 1, 1958, NULL)",
+        );
+        sql(
+            &state,
+            "INSERT INTO listen_history (title, artist_name, album_title, album_id, listened_at) \
+             VALUES ('So What', 'Miles Davis', 'Kind of Blue', 1, '2026-10-01T10:00:00Z')",
+        );
+        let items = recommandes(&state);
+        assert_eq!(items.len(), 2, "{items:?}");
+        for a in &items {
+            for champ in [
+                "id",
+                "title",
+                "artist_name",
+                "year",
+                "cover_path",
+                "genre",
+                "reason",
+                "raison",
+            ] {
+                assert!(a.get(champ).is_some(), "champ {champ} absent : {a}");
+            }
+            assert!(a["raison"]["type"].is_string(), "{a}");
+        }
+    }
+
+    fn album(id: i64) -> Value {
+        json!({"id": id})
+    }
+
+    fn ids(v: &[Value]) -> Vec<i64> {
+        v.iter().filter_map(|a| a["id"].as_i64()).collect()
+    }
+
+    #[test]
+    fn le_melange_alterne_les_sources_selon_la_graine() {
+        let sources = || {
+            vec![
+                vec![album(1), album(2), album(3)],
+                vec![],
+                vec![album(10), album(11)],
+                vec![album(20)],
+            ]
+        };
+        assert_eq!(
+            ids(&melanger_les_sources(sources(), 10, 0)),
+            vec![1, 10, 20, 2, 11, 3]
+        );
+        assert_eq!(
+            ids(&melanger_les_sources(sources(), 10, 1)),
+            vec![10, 20, 1, 11, 2, 3]
+        );
+        assert_eq!(
+            ids(&melanger_les_sources(sources(), 10, 2)),
+            vec![20, 1, 10, 2, 11, 3]
+        );
+        assert_eq!(
+            ids(&melanger_les_sources(sources(), 10, 3)),
+            ids(&melanger_les_sources(sources(), 10, 0)),
+            "trois sources non vides : la graine tourne modulo 3"
+        );
+        assert_eq!(
+            ids(&melanger_les_sources(sources(), 4, 0)),
+            vec![1, 10, 20, 2],
+            "borné"
+        );
+        assert!(melanger_les_sources(sources(), 0, 0).is_empty());
+        assert!(melanger_les_sources(vec![vec![], vec![]], 5, 7).is_empty());
+    }
+
+    #[test]
+    fn le_melange_ote_les_doublons_au_profit_de_la_source_prioritaire() {
+        let sources = vec![
+            vec![json!({"id": 1, "reason": "genre_match"})],
+            vec![
+                json!({"id": 1, "reason": "artist_match"}),
+                json!({"id": 2, "reason": "artist_match"}),
+            ],
+        ];
+        let rendus = melanger_les_sources(sources, 10, 1);
+        assert_eq!(ids(&rendus), vec![2, 1]);
+        assert_eq!(rendus[1]["reason"], json!("genre_match"));
+    }
+}

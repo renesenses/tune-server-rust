@@ -31,6 +31,9 @@ use crate::{
 };
 
 mod enumerate;
+// Tune (#8489): packed 24-bit capture (UMIK-1/UMIK-2).
+mod packed24;
+use self::packed24::{unpack_s24_3, Packed24, PACKED24_BYTES};
 
 // ALSA Buffer Size Behavior
 // =========================
@@ -366,7 +369,8 @@ impl Device {
             Ok(handle) => handle,
         };
 
-        let can_pause = set_hw_params_from_format(&handle, conf, sample_format)?;
+        let (can_pause, packed24) =
+            set_hw_params_from_format(&handle, conf, sample_format, stream_type)?;
         let period_samples = set_sw_params_from_format(&handle, conf, stream_type)?;
 
         handle.prepare()?;
@@ -410,6 +414,7 @@ impl Device {
             period_frames,
             silence_template,
             can_pause,
+            packed24,
             creation_instant,
             _context: self._context.clone(),
         };
@@ -528,6 +533,18 @@ impl Device {
             {
                 supported_formats.push(sample_format);
             }
+        }
+        // Tune (#8489): a capture device that only offers packed 24-bit
+        // samples is exposed as `I24`; the input worker unpacks them.
+        if Packed24::for_capture(
+            matches!(stream_t, alsa::Direction::Capture),
+            supported_formats.contains(&SampleFormat::I24),
+            hw_params.test_format(alsa::pcm::Format::S243LE).is_ok(),
+            hw_params.test_format(alsa::pcm::Format::S243BE).is_ok(),
+        )
+        .is_some()
+        {
+            supported_formats.push(SampleFormat::I24);
         }
 
         let min_rate = hw_params.get_rate_min()?;
@@ -690,6 +707,10 @@ struct StreamInner {
     period_frames: usize,
     silence_template: Box<[u8]>,
 
+    // Tune (#8489): the hardware delivers packed 24-bit samples (capture
+    // only); the worker unpacks them to `I24` before the callback.
+    packed24: Option<Packed24>,
+
     #[allow(dead_code)]
     // Whether or not the hardware supports pausing the stream.
     // TODO: We need an API to expose this. See #197, #284.
@@ -736,6 +757,8 @@ crate::assert_stream_sync!(Stream);
 struct StreamWorkerContext {
     descriptors: Box<[libc::pollfd]>,
     transfer_buffer: Box<[u8]>,
+    // Tune (#8489): one period as the hardware delivers it, when packed.
+    packed_buffer: Box<[u8]>,
     poll_timeout: i32,
 }
 
@@ -749,6 +772,10 @@ impl StreamWorkerContext {
 
         // Pre-allocate buffer to exactly one period size with proper equilibrium values.
         let transfer_buffer = stream.silence_template.clone();
+        let packed_buffer = match stream.packed24 {
+            Some(_) => vec![0u8; stream.period_samples * PACKED24_BYTES].into_boxed_slice(),
+            None => Box::default(),
+        };
 
         // Pre-allocate and initialize descriptors vector: 1 for self-pipe + stream.num_descriptors
         // for ALSA. The descriptor count is constant for the lifetime of stream parameters, and
@@ -781,6 +808,7 @@ impl StreamWorkerContext {
         Self {
             descriptors,
             transfer_buffer,
+            packed_buffer,
             poll_timeout,
         }
     }
@@ -826,6 +854,7 @@ fn input_stream_worker(
                 if let Err(err) = process_input(
                     stream,
                     &mut ctxt.transfer_buffer,
+                    &mut ctxt.packed_buffer,
                     status,
                     delay_frames,
                     data_callback,
@@ -1029,11 +1058,21 @@ fn recover_output_pcm_state(
 fn process_input(
     stream: &StreamInner,
     buffer: &mut [u8],
+    packed: &mut [u8],
     status: alsa::pcm::Status,
     delay_frames: usize,
     data_callback: &mut (dyn FnMut(&Data, &InputCallbackInfo) + Send + 'static),
 ) -> Result<(), BackendSpecificError> {
-    stream.channel.io_bytes().readi(buffer)?;
+    match stream.packed24 {
+        // Tune (#8489): 3 bytes per sample from the hardware, `I24` to the user.
+        Some(layout) => {
+            stream.channel.io_bytes().readi(packed)?;
+            unpack_s24_3(layout, packed, buffer);
+        }
+        None => {
+            stream.channel.io_bytes().readi(buffer)?;
+        }
+    }
     let data = buffer.as_mut_ptr() as *mut ();
     let data = unsafe { Data::from_parts(data, stream.period_samples, stream.sample_format) };
     let callback = match stream.creation_instant {
@@ -1347,19 +1386,40 @@ fn init_hw_params<'a>(
     pcm_handle: &'a alsa::pcm::PCM,
     config: &StreamConfig,
     sample_format: SampleFormat,
-) -> Result<alsa::pcm::HwParams<'a>, BackendSpecificError> {
+    stream_type: alsa::Direction,
+) -> Result<(alsa::pcm::HwParams<'a>, Option<Packed24>), BackendSpecificError> {
     let hw_params = alsa::pcm::HwParams::any(pcm_handle)?;
     hw_params.set_access(alsa::pcm::Access::RWInterleaved)?;
 
     // Determine which endianness the hardware actually supports for this format.
     // We prefer native endian (no conversion needed) but fall back to the opposite
     // endian if that's all the hardware supports (e.g., LE USB DAC on BE system).
-    let alsa_format = sample_format_to_alsa_format(&hw_params, sample_format)?;
+    let (alsa_format, packed24) = match sample_format_to_alsa_format(&hw_params, sample_format) {
+        Ok(format) => (format, None),
+        // Tune (#8489): `I24` capture on a packed-only device.
+        Err(err) => match (
+            sample_format,
+            Packed24::for_capture(
+                matches!(stream_type, alsa::Direction::Capture),
+                false,
+                hw_params.test_format(alsa::pcm::Format::S243LE).is_ok(),
+                hw_params.test_format(alsa::pcm::Format::S243BE).is_ok(),
+            ),
+        ) {
+            (SampleFormat::I24, Some(Packed24::Le)) => {
+                (alsa::pcm::Format::S243LE, Some(Packed24::Le))
+            }
+            (SampleFormat::I24, Some(Packed24::Be)) => {
+                (alsa::pcm::Format::S243BE, Some(Packed24::Be))
+            }
+            _ => return Err(err),
+        },
+    };
     hw_params.set_format(alsa_format)?;
 
     hw_params.set_rate(config.sample_rate, alsa::ValueOr::Nearest)?;
     hw_params.set_channels(config.channels as u32)?;
-    Ok(hw_params)
+    Ok((hw_params, packed24))
 }
 
 /// Convert SampleFormat to the appropriate alsa::pcm::Format based on what the hardware supports.
@@ -1443,8 +1503,9 @@ fn set_hw_params_from_format(
     pcm_handle: &alsa::pcm::PCM,
     config: &StreamConfig,
     sample_format: SampleFormat,
-) -> Result<bool, BackendSpecificError> {
-    let hw_params = init_hw_params(pcm_handle, config, sample_format)?;
+    stream_type: alsa::Direction,
+) -> Result<(bool, Option<Packed24>), BackendSpecificError> {
+    let (hw_params, packed24) = init_hw_params(pcm_handle, config, sample_format, stream_type)?;
 
     // When BufferSize::Fixed(x) is specified, we configure double-buffering with
     // buffer_size = 2x and period_size = x. This provides consistent low-latency
@@ -1464,7 +1525,7 @@ fn set_hw_params_from_format(
     if config.buffer_size == BufferSize::Default {
         if let Ok(period) = hw_params.get_period_size() {
             // Re-initialize hw_params to clear previous constraints
-            let hw_params = init_hw_params(pcm_handle, config, sample_format)?;
+            let (hw_params, _) = init_hw_params(pcm_handle, config, sample_format, stream_type)?;
 
             // Set both period (to device's chosen value) and buffer (to 2 periods)
             hw_params.set_period_size_near(period, alsa::ValueOr::Nearest)?;
@@ -1475,7 +1536,7 @@ fn set_hw_params_from_format(
         }
     }
 
-    Ok(hw_params.can_pause())
+    Ok((hw_params.can_pause(), packed24))
 }
 
 fn set_sw_params_from_format(

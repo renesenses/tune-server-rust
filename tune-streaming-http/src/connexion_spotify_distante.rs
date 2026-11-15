@@ -30,13 +30,13 @@ use crate::etiquettes_langue::langues_demandees;
 use crate::{StreamingHttpState, get_svc, purge_contenu_utilisateur};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Langue {
+pub(crate) enum Langue {
     Fr,
     En,
 }
 
 /// La première de `fr` / `en` que demande la requête ; l'anglais à défaut.
-fn langue(headers: &HeaderMap) -> Langue {
+pub(crate) fn langue(headers: &HeaderMap) -> Langue {
     langues_demandees(headers)
         .iter()
         .find_map(|l| match l.as_str() {
@@ -50,7 +50,7 @@ fn langue(headers: &HeaderMap) -> Langue {
 /// Tout ce qui entre dans la page passe par ici : l'adresse d'autorisation
 /// (ses `&`), les messages d'erreur, qui peuvent reprendre un morceau de
 /// l'adresse collée (`?error=…`).
-fn echapper_html(texte: &str) -> String {
+pub(crate) fn echapper_html(texte: &str) -> String {
     let mut sortie = String::with_capacity(texte.len());
     for c in texte.chars() {
         match c {
@@ -65,7 +65,7 @@ fn echapper_html(texte: &str) -> String {
     sortie
 }
 
-fn page(langue: Langue, statut: StatusCode, corps: &str) -> Response {
+pub(crate) fn page(langue: Langue, statut: StatusCode, corps: &str) -> Response {
     let lang = match langue {
         Langue::Fr => "fr",
         Langue::En => "en",
@@ -104,6 +104,7 @@ pub(crate) async fn page_connexion(
     headers: HeaderMap,
 ) -> Response {
     let langue = langue(&headers);
+    crate::spotify_relais::preparer(&state).await;
     let svc = match get_svc(&state, "spotify").await {
         Ok(s) => s,
         Err((statut, message)) => return page_erreur(langue, statut, &message),
@@ -111,6 +112,7 @@ pub(crate) async fn page_connexion(
     // Un corps sans `code`, `callback_url` ni `poll` démarre une autorisation
     // PKCE ; ses tentatives précédentes sont gardées (fil 221).
     let debut = svc.write().await.authenticate(&json!({})).await;
+    crate::spotify_relais::persister(&state).await;
     let url = match debut {
         Ok(status) => match status.verification_url {
             Some(url) => url,
@@ -178,6 +180,7 @@ pub(crate) async fn terminer_connexion(
     Form(colle): Form<AdresseCollee>,
 ) -> Response {
     let langue = langue(&headers);
+    crate::spotify_relais::preparer(&state).await;
     let svc = match get_svc(&state, "spotify").await {
         Ok(s) => s,
         Err((statut, message)) => return page_erreur(langue, statut, &message),
@@ -187,6 +190,7 @@ pub(crate) async fn terminer_connexion(
         .authenticate(&json!({"callback_url": colle.adresse}))
         .await;
     drop(svc);
+    crate::spotify_relais::persister(&state).await;
     match issue {
         Ok(status) if status.authenticated => {
             state.save_tokens().await;

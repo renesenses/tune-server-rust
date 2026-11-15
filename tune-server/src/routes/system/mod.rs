@@ -6,14 +6,21 @@ mod admin;
 // et un test qui recopierait la fusion la répliquerait au lieu de la garder.
 pub use admin::peers_payload;
 mod backup;
+// #8189 — `GET /system/capabilities`.
+pub(crate) mod capacites;
 // Réglages ▸ Clés d'API (#4805, lot 1 MetaRust).
 pub(crate) mod cles_api;
+pub(crate) mod comptages_8805;
 mod config;
 // Fil 2145 : « Oublier ce partage » retire ses racines par le MEME chemin.
 pub(crate) use config::{pistes_qui_partiraient, retirer_un_dossier};
+// Sécurité — l'onboarding déclare des racines par la même garde.
+pub(crate) use config::refus_de_racine_de_musique;
 mod config_backup;
 mod convert;
 mod database;
+/// #8676 — « Remplacer le chemin » : déplacer la racine de la bibliothèque.
+mod deplacer_racine;
 #[cfg(test)]
 mod diagnostic_sans_ecrivain_tests;
 pub(crate) mod diagnostics;
@@ -54,6 +61,8 @@ mod replaygain;
 // recopier la règle au lieu de l'appeler — un test qui réplique le code ne le
 // garde pas. Les items du module restent `pub(crate)` sauf ceux exposés
 // expressément.
+/// Réglage « Balises du classique » (#8325, ESL63P).
+mod balises_classique;
 /// « Ce qui tourne » : passes de fond, cession à la lecture, avancement,
 /// garde thermique (#4681).
 pub(crate) mod ce_qui_tourne;
@@ -88,6 +97,9 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/version", get(config::version))
+        .route("/capabilities", get(capacites::capacites))
+        // #7371 — profil réseau actif et règle de pare-feu (Windows).
+        .route("/pare-feu", get(crate::pare_feu_windows::route_etat))
         .route("/health", get(config::health))
         .route("/stats", get(config::stats))
         .route("/profile", get(profile::system_profile))
@@ -115,6 +127,19 @@ pub fn router() -> Router<AppState> {
         .route(
             "/settings/default-zone",
             get(config::get_default_zone).put(config::set_default_zone),
+        )
+        // #8325 / ESL63P — les balises lues pour le chef, l'ensemble,
+        // l'œuvre et le mouvement, et le sort de BAND.
+        .route(
+            "/settings/classical-tags",
+            get(balises_classique::get_classical_tags).put(balises_classique::set_classical_tags),
+        )
+        // #8213 — arrêt programmé de la lecture à heure fixe.
+        .route(
+            "/settings/scheduled-stop",
+            get(config::get_scheduled_stop)
+                .put(config::set_scheduled_stop)
+                .delete(config::delete_scheduled_stop),
         )
         .route("/library/clear", post(scan::library_clear))
         .route("/scan", post(scan::trigger_scan))
@@ -209,6 +234,8 @@ pub fn router() -> Router<AppState> {
         .route("/music-dirs/add", post(config::add_music_dir))
         .route("/music-dirs/remove", post(config::remove_music_dir))
         .route("/music-dirs/orphans", get(config::orphan_tracks))
+        .route("/music-dirs/move/preview", post(deplacer_racine::apercu))
+        .route("/music-dirs/move", post(deplacer_racine::appliquer))
         .route(
             "/music-dirs/purge-orphans",
             post(config::purge_orphan_tracks),

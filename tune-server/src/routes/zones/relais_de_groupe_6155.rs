@@ -28,9 +28,12 @@
 //! un arrêt fugace de la meneuse entre deux pistes ne coupe pas les
 //! suiveuses ([`DELAI_AVANT_D_ARRETER`]).
 //!
-//! Seuls les gestes de la MENEUSE sont relayés : une pause, une reprise, un
-//! arrêt, un suivant ou un précédent donnés sur une suiveuse ne valent que
-//! pour elle.
+//! Le relais n'écoute que les événements de la MENEUSE. #8445 (Jon, fil
+//! 2760) — une pause, une reprise ou un arrêt donnés sur une SUIVEUSE valent
+//! désormais pour tout le groupe, comme si la meneuse les avait reçus : la
+//! route du geste les lui transmet ([`relayer_le_geste_d_un_membre`]), et le
+//! relais fait suivre les autres. Un suivant ou un précédent donnés sur une
+//! suiveuse ne valent toujours que pour elle.
 //!
 //! #7717 — une exception : une NOUVELLE lecture lancée sur une zone du groupe,
 //! depuis n'importe quel client, fait de cette zone la meneuse
@@ -38,7 +41,9 @@
 //! /zones/{id}/play` avec un corps (le corps vide, Lecture après Arrêt, est une
 //! reprise et n'y compte pas), le saut dans la file, la radio (« Mes radios »
 //! et l'annuaire, par `jouer_un_flux`), l'épisode de podcast, le préréglage
-//! épinglé, la radio d'artiste et la lecture aléatoire de la bibliothèque. Un
+//! épinglé, la radio d'artiste et la lecture aléatoire de la bibliothèque —
+//! et, depuis #8021, le `Play` d'un point de contrôle UPnP externe sur la
+//! façade MediaRenderer d'une zone, et la lecture lancée par un greffon. Un
 //! lancement refusé (réponse d'échec, radio qui ne part pas) rend la tête à la
 //! meneuse d'avant. Le groupe
 //! formé depuis la fiche de la Chromecast suivait la Chromecast seule : une
@@ -48,11 +53,13 @@
 //! émet elle aussi `started`, elle deviendrait meneuse à son tour et les deux
 //! zones se renverraient la lecture.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 use tracing::{info, warn};
 
+use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::playback::{PlayState, ZoneState};
@@ -155,12 +162,39 @@ pub(crate) fn geste_pour_la_suiveuse(meneuse: &Instantane, suiveuse: &Instantane
 }
 
 fn groupes_enregistres(state: &AppState) -> Vec<Value> {
-    SettingsRepo::with_backend(state.backend.clone())
+    groupes_de(&state.backend)
+}
+
+/// Les groupes tels que le relais les lit : dans la règle « une zone, un
+/// groupe au plus » ([`groupes_dans_la_regle`]), quel que soit le réglage.
+fn groupes_de(backend: &Arc<dyn DbBackend>) -> Vec<Value> {
+    groupes_dans_la_regle(groupes_bruts(backend))
+}
+
+fn groupes_bruts(backend: &Arc<dyn DbBackend>) -> Vec<Value> {
+    SettingsRepo::with_backend(backend.clone())
         .get("zone_groups")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// #8680 (fil 2800) — le relais ne lit jamais des groupes qui se chevauchent.
+///
+/// Des groupes enregistrés avant la rc11 comptaient la même zone plusieurs
+/// fois (zone 10 dans 23 groupes), et une suiveuse menait un autre groupe
+/// (11 suivait 10 et menait 16, 23 et 9). Le `started` émis par la suiveuse
+/// qui rejoignait sa meneuse déclenchait alors le relais de SES suiveuses :
+/// la lecture partait en cascade d'un groupe à l'autre, sur toutes les
+/// pièces, et la zone 9 était relancée deux fois. Dans la règle, une
+/// suiveuse ne mène aucun groupe : son `started` ne relaie rien, et une zone
+/// ne suit qu'une seule meneuse. Le démarrage réécrit le réglage
+/// (`normaliser_les_groupes_au_demarrage`) ; le relais, lui, ne se fie pas à
+/// ce que le réglage contient.
+pub(crate) fn groupes_dans_la_regle(mut groupes: Vec<Value>) -> Vec<Value> {
+    tune_core::zones::groupes_enregistres::normaliser(&mut groupes);
+    groupes
 }
 
 /// #7717 — la meneuse qu'un groupe avait avant qu'une lecture lancée sur une
@@ -238,20 +272,23 @@ static MENEUSES_EN_ECRITURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Relit les groupes, applique `changer`, et réécrit s'il a changé quelque
 /// chose, sous [`MENEUSES_EN_ECRITURE`].
 fn changer_les_groupes<R>(
-    state: &AppState,
+    backend: &Arc<dyn DbBackend>,
     changer: impl FnOnce(&mut [Value]) -> R,
     a_change: impl Fn(&R) -> bool,
 ) -> Option<R> {
     let _garde = MENEUSES_EN_ECRITURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut groupes = groupes_enregistres(state);
+    // #8680 — la tête se prend sur des groupes dans la règle : une zone ne
+    // mène qu'un groupe, et le réglage relu ainsi est réécrit dans la règle.
+    let mut groupes = groupes_bruts(backend);
+    let normalises = tune_core::zones::groupes_enregistres::normaliser(&mut groupes);
     let rendu = changer(&mut groupes);
-    if !a_change(&rendu) {
+    if !a_change(&rendu) && !normalises {
         return Some(rendu);
     }
     let texte = serde_json::to_string(&groupes).ok()?;
-    match SettingsRepo::with_backend(state.backend.clone()).set("zone_groups", &texte) {
+    match SettingsRepo::with_backend(backend.clone()).set("zone_groups", &texte) {
         Ok(()) => Some(rendu),
         Err(error) => {
             warn!(%error, "zone_group_leader_change_failed");
@@ -267,8 +304,17 @@ fn changer_les_groupes<R>(
 /// Appelé par les routes de lancement AVANT de lancer (le relais réagit au
 /// `started`), jamais par le relais. Voir [`lancer_en_tete_du_groupe`].
 pub(crate) fn prendre_la_tete_du_groupe(state: &AppState, zone: i64) -> Vec<MeneuseRemplacee> {
+    prendre_la_tete_du_groupe_sur(&state.backend, zone)
+}
+
+/// #8021 — [`prendre_la_tete_du_groupe`] pour qui n'a que la base : l'hôte des
+/// greffons ne tient pas d'`AppState` (voir `plugins_host::AppStateHost`).
+pub(crate) fn prendre_la_tete_du_groupe_sur(
+    backend: &Arc<dyn DbBackend>,
+    zone: i64,
+) -> Vec<MeneuseRemplacee> {
     let remplacees = changer_les_groupes(
-        state,
+        backend,
         |groupes| mener_les_groupes_de(groupes, zone),
         |r| !r.is_empty(),
     )
@@ -290,10 +336,20 @@ pub(crate) fn rendre_la_tete_du_groupe(
     zone: i64,
     remplacees: &[MeneuseRemplacee],
 ) {
+    rendre_la_tete_du_groupe_sur(&state.backend, zone, remplacees);
+}
+
+/// #8021 — [`rendre_la_tete_du_groupe`] pour qui n'a que la base.
+pub(crate) fn rendre_la_tete_du_groupe_sur(
+    backend: &Arc<dyn DbBackend>,
+    zone: i64,
+    remplacees: &[MeneuseRemplacee],
+) {
     if remplacees.is_empty() {
         return;
     }
-    if changer_les_groupes(state, |g| rendre_les_groupes(g, zone, remplacees), |c| *c) == Some(true)
+    if changer_les_groupes(backend, |g| rendre_les_groupes(g, zone, remplacees), |c| *c)
+        == Some(true)
     {
         info!(zone, "zone_group_leader_restored");
     }
@@ -370,6 +426,250 @@ pub(crate) async fn aligner_les_suiveuses(state: &AppState, meneuse: i64) {
     }
 }
 
+/// #8445 — un geste de transport donné par l'utilisateur sur une zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GesteDUnMembre {
+    Pause,
+    Reprise,
+    Arret,
+}
+
+/// #8445 — ce que la meneuse fait du geste donné sur une de ses suiveuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PourLaMeneuse {
+    /// La meneuse reçoit le geste ; le relais, à son événement, fait suivre
+    /// les autres suiveuses.
+    Transmettre,
+    /// La meneuse est déjà dans l'état voulu : seules les autres suiveuses
+    /// sont alignées sur elle.
+    Aligner,
+    /// Reprise sur une suiveuse alors que la meneuse est arrêtée : la
+    /// suiveuse, seule à rejouer, prend la tête du groupe et les autres la
+    /// rejoignent (comme une lecture lancée sur elle, #7717).
+    PrendreLaTete,
+    /// Rien à faire pour le groupe (pause d'une suiveuse sous une meneuse
+    /// arrêtée).
+    Rien,
+}
+
+/// #8445 — la décision, sur le seul état de la meneuse relu au moment d'agir.
+pub(crate) fn pour_la_meneuse(geste: GesteDUnMembre, meneuse: PlayState) -> PourLaMeneuse {
+    use GesteDUnMembre as G;
+    match (geste, meneuse) {
+        (G::Pause, PlayState::Playing) => PourLaMeneuse::Transmettre,
+        (G::Pause, PlayState::Paused) => PourLaMeneuse::Aligner,
+        (G::Pause, PlayState::Stopped) => PourLaMeneuse::Rien,
+        (G::Reprise, PlayState::Paused) => PourLaMeneuse::Transmettre,
+        (G::Reprise, PlayState::Playing) => PourLaMeneuse::Aligner,
+        (G::Reprise, PlayState::Stopped) => PourLaMeneuse::PrendreLaTete,
+        (G::Arret, PlayState::Stopped) => PourLaMeneuse::Aligner,
+        (G::Arret, _) => PourLaMeneuse::Transmettre,
+    }
+}
+
+/// #8445 — les meneuses des groupes où `zone` est SUIVEUSE (vide : zone hors
+/// groupe, ou meneuse de son groupe — ses gestes passent déjà par le relais).
+pub(crate) fn meneuses_de(groupes: &[Value], zone: i64) -> Vec<i64> {
+    let mut meneuses = Vec::new();
+    for groupe in groupes {
+        let Some(meneuse) = meneuse_du_groupe(groupe) else {
+            continue;
+        };
+        if meneuse != zone
+            && zones_du_groupe(groupe).contains(&zone)
+            && !meneuses.contains(&meneuse)
+        {
+            meneuses.push(meneuse);
+        }
+    }
+    meneuses
+}
+
+/// #8445 (Jon, fil 2760) — une pause, une reprise ou un arrêt donnés par
+/// l'utilisateur sur une SUIVEUSE valent pour tout son groupe.
+///
+/// Appelé par les routes `pause`, `resume` (et donc `playpause`), `stop` et
+/// `play` sans corps, une fois le geste réussi sur la zone elle-même ; jamais
+/// par le relais. Il n'y a donc pas de boucle : la meneuse reçoit le geste par
+/// l'orchestrateur, pas par une route ; le relais réagit à l'événement de la
+/// meneuse et commande les suiveuses par l'orchestrateur ; les événements des
+/// suiveuses ne relaient rien (elles ne mènent aucun groupe). Un arrêt de
+/// groupe ne défait pas le groupe : `zone_groups` n'est touché que par
+/// [`PourLaMeneuse::PrendreLaTete`].
+///
+/// Le travail part détaché : prévenir un renderer DLNA peut prendre plusieurs
+/// secondes, la réponse de la route n'attend pas le groupe. Rend la tâche, ou
+/// `None` si `zone` n'est suiveuse d'aucun groupe (rien n'est lancé).
+pub(crate) fn relayer_le_geste_d_un_membre(
+    state: &AppState,
+    zone: i64,
+    geste: GesteDUnMembre,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let meneuses = meneuses_de(&groupes_enregistres(state), zone);
+    if meneuses.is_empty() {
+        return None;
+    }
+    let state = state.clone();
+    Some(tokio::spawn(async move {
+        for meneuse in meneuses {
+            let etat = state.playback.get_state(meneuse).await.state;
+            let decision = pour_la_meneuse(geste, etat);
+            info!(zone, meneuse, geste = ?geste, decision = ?decision, "zone_group_member_gesture_relayed");
+            match decision {
+                PourLaMeneuse::Transmettre => {
+                    let device_id = ZoneRepo::with_backend(state.backend.clone())
+                        .get(meneuse)
+                        .ok()
+                        .flatten()
+                        .and_then(|z| z.output_device_id);
+                    let resultat = match geste {
+                        GesteDUnMembre::Pause => state
+                            .orchestrator
+                            .pause(meneuse, device_id.as_deref())
+                            .await
+                            .map_err(|e| format!("{e:?}")),
+                        GesteDUnMembre::Reprise => state
+                            .orchestrator
+                            .resume(meneuse, device_id.as_deref())
+                            .await
+                            .map_err(|e| format!("{e:?}")),
+                        GesteDUnMembre::Arret => {
+                            state.orchestrator.stop(meneuse, device_id.as_deref()).await;
+                            Ok(())
+                        }
+                    };
+                    if let Err(error) = resultat {
+                        warn!(zone, meneuse, geste = ?geste, %error, "zone_group_member_gesture_failed");
+                    }
+                }
+                PourLaMeneuse::Aligner => aligner_les_suiveuses(&state, meneuse).await,
+                PourLaMeneuse::PrendreLaTete => {
+                    if state.playback.get_state(zone).await.state == PlayState::Playing {
+                        prendre_la_tete_du_groupe(&state, zone);
+                        aligner_les_suiveuses(&state, zone).await;
+                    }
+                }
+                PourLaMeneuse::Rien => {}
+            }
+        }
+    }))
+}
+
+/// #7759 (relecture de #8254) — les déplacements relayés d'une meneuse, par
+/// numéro de génération.
+///
+/// Chaque `seek` reçu sur une meneuse prend un numéro, dans l'ordre d'arrivée
+/// à la route ; le relais aux suiveuses part détaché. En glissant le curseur,
+/// plusieurs relais sont en vol à la fois, et un relais plus ancien pouvait
+/// finir le dernier : la suiveuse restait à une position intermédiaire. Les
+/// relais d'une même meneuse passent donc un à un, et seul celui de la
+/// dernière demande s'applique ; un relais dépassé ne touche plus aucune
+/// suiveuse.
+#[derive(Default)]
+pub struct DeplacementsDeGroupe {
+    par_meneuse: std::sync::Mutex<std::collections::HashMap<i64, Arc<FileDeDeplacements>>>,
+}
+
+#[derive(Default)]
+struct FileDeDeplacements {
+    derniere: std::sync::atomic::AtomicU64,
+    un_a_la_fois: tokio::sync::Mutex<()>,
+}
+
+/// Une demande de déplacement d'une meneuse, numérotée à son arrivée.
+pub struct DemandeDeDeplacement {
+    file: Arc<FileDeDeplacements>,
+    generation: u64,
+}
+
+impl DeplacementsDeGroupe {
+    /// Numérote une nouvelle demande pour `meneuse` : elle dépasse toutes les
+    /// précédentes. À appeler dans la route, AVANT de détacher le relais.
+    pub fn nouvelle_demande(&self, meneuse: i64) -> DemandeDeDeplacement {
+        let file = self
+            .par_meneuse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(meneuse)
+            .or_default()
+            .clone();
+        let generation = file
+            .derniere
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        DemandeDeDeplacement { file, generation }
+    }
+}
+
+impl DemandeDeDeplacement {
+    fn est_la_derniere(&self) -> bool {
+        self.file.derniere.load(std::sync::atomic::Ordering::SeqCst) == self.generation
+    }
+}
+
+/// #7759 (fil 2215) — un déplacement dans la piste, donné sur la meneuse, est
+/// relayé à chaque suiveuse qui joue la même piste.
+///
+/// Le relais n'écoute que `started`, `paused`, `resumed` et `stopped` : une
+/// suiveuse déjà sur la bonne piste n'avait aucune raison de bouger
+/// ([`geste_pour_la_suiveuse`] rend `None`). Après un déplacement de la
+/// meneuse, elle continuait donc à l'ancienne position : « une seule piste
+/// avance ». Journal du testeur (rc10, deux DAC en ASIO) : chaque
+/// `seek_local_output_complete` de la meneuse, aucune ligne pour la suiveuse.
+///
+/// Appelé par la route `seek`, une fois par geste, et non sur l'événement
+/// `seek` du gestionnaire de lecture, que l'orchestrateur émet aussi pour ses
+/// déplacements internes (garde du sondeur pendant une recréation de flux).
+/// Une suiveuse qui ne joue pas la même piste n'est pas touchée : le relais
+/// ordinaire l'aligne déjà, à la position de la meneuse.
+///
+/// `demande` vient de [`DeplacementsDeGroupe::nouvelle_demande`] : les relais
+/// d'une meneuse passent un à un, et un relais dépassé par une demande plus
+/// récente n'applique rien.
+pub async fn deplacer_les_suiveuses(
+    state: &AppState,
+    meneuse: i64,
+    position_ms: u64,
+    demande: DemandeDeDeplacement,
+) {
+    let _un_a_la_fois = demande.file.un_a_la_fois.lock().await;
+    if !demande.est_la_derniere() {
+        info!(meneuse, position_ms, "zone_group_follower_seek_superseded");
+        return;
+    }
+    let suiveuses = zones_suiveuses(&groupes_enregistres(state), meneuse);
+    if suiveuses.is_empty() {
+        return;
+    }
+    let tete = Instantane::de(&state.playback.get_state(meneuse).await);
+    if tete.piste.is_none() {
+        return;
+    }
+    for suiveuse in suiveuses {
+        if !demande.est_la_derniere() {
+            info!(meneuse, position_ms, "zone_group_follower_seek_superseded");
+            return;
+        }
+        let etat = Instantane::de(&state.playback.get_state(suiveuse).await);
+        if etat.piste != tete.piste || etat.etat == PlayState::Stopped {
+            continue;
+        }
+        let device_id = ZoneRepo::with_backend(state.backend.clone())
+            .get(suiveuse)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id);
+        info!(meneuse, suiveuse, position_ms, "zone_group_follower_seeked");
+        if let Err(error) = state
+            .orchestrator
+            .seek(suiveuse, position_ms, device_id.as_deref())
+            .await
+        {
+            warn!(meneuse, suiveuse, position_ms, error = ?error, "zone_group_follower_seek_failed");
+        }
+    }
+}
+
 /// Lance le relais : une tâche qui écoute le canal de lecture et aligne les
 /// suiveuses après chaque geste d'une meneuse. Appelé une fois au démarrage
 /// (`background.rs`).
@@ -407,3 +707,7 @@ pub fn lancer_le_relais_de_groupe(state: &AppState) {
 #[cfg(test)]
 #[path = "relais_de_groupe_6155_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "relais_de_groupe_8445_tests.rs"]
+mod tests_8445;

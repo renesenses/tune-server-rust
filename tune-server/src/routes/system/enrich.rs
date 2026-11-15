@@ -496,7 +496,7 @@ pub(super) async fn enrich_credits_releases(
                 cr::TACHE_CREDITS_RELEASES,
                 av.processed as u64,
                 av.total as u64,
-                "Crédits",
+                crate::background_tasks::Phase::Credits,
             );
         };
         cr::remplir_credits_depuis_musicbrainz(db.clone(), &id_tache, &sur_avancement).await;

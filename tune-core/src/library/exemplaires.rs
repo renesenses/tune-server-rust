@@ -78,10 +78,51 @@ fn ph(db: &dyn DbBackend, n: usize) -> String {
 
 // ─── Répertoires ─────────────────────────────────────────────────────────
 
+/// #7876 — les dossiers du FICHIER de configuration, par base : le serveur
+/// les inscrit à la création de son état. Ils servent quand le réglage
+/// `music_dirs` est absent, comme pour `GET /system/config` qui les affiche.
+/// La base est retrouvée par son adresse ; une entrée dont la base a été
+/// libérée est ignorée (et purgée), une autre base ne peut donc pas en hériter.
+type DossiersDuFichier = Vec<(std::sync::Weak<dyn DbBackend>, Vec<String>)>;
+
+fn dossiers_du_fichier_inscrits() -> &'static Mutex<DossiersDuFichier> {
+    static R: OnceLock<Mutex<DossiersDuFichier>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn meme_base(a: &dyn DbBackend, b: &dyn DbBackend) -> bool {
+    std::ptr::addr_eq(a as *const dyn DbBackend, b as *const dyn DbBackend)
+}
+
+/// #7876 — inscrit les dossiers du fichier de configuration de `db`.
+pub fn inscrire_les_dossiers_du_fichier(db: &std::sync::Arc<dyn DbBackend>, dossiers: &[String]) {
+    let Ok(mut r) = dossiers_du_fichier_inscrits().lock() else {
+        return;
+    };
+    r.retain(|(w, _)| w.strong_count() > 0 && !w.upgrade().is_some_and(|b| meme_base(&*b, &**db)));
+    r.push((std::sync::Arc::downgrade(db), dossiers.to_vec()));
+}
+
+fn dossiers_du_fichier(db: &dyn DbBackend) -> Vec<String> {
+    let Ok(r) = dossiers_du_fichier_inscrits().lock() else {
+        return Vec::new();
+    };
+    r.iter()
+        .find_map(|(w, d)| {
+            w.upgrade()
+                .filter(|b| meme_base(&**b, db))
+                .map(|_| d.clone())
+        })
+        .unwrap_or_default()
+}
+
 /// Les dossiers de musique configurés (`settings['music_dirs']`), normalisés
-/// comme le scan les normalise, dans leur ordre.
+/// comme le scan les normalise, dans leur ordre. #7876 : réglage absent ⇒
+/// les dossiers du fichier de configuration
+/// ([`inscrire_les_dossiers_du_fichier`]), ceux que l'écran affiche.
 pub fn dossiers_de_musique(db: &dyn DbBackend) -> Vec<String> {
-    let brut: Vec<String> = lire_liste(db, "music_dirs");
+    let brut: Vec<String> =
+        lire_liste_si_posee(db, "music_dirs").unwrap_or_else(|| dossiers_du_fichier(db));
     let mut out: Vec<String> = Vec::new();
     for d in brut {
         let d = crate::scanner::walker::normalize_path(&d);
@@ -102,6 +143,11 @@ pub fn ordre_regle(db: &dyn DbBackend) -> Vec<String> {
 }
 
 fn lire_liste(db: &dyn DbBackend, cle: &str) -> Vec<String> {
+    lire_liste_si_posee(db, cle).unwrap_or_default()
+}
+
+/// La liste du réglage `cle`, `None` s'il est absent ou illisible.
+fn lire_liste_si_posee(db: &dyn DbBackend, cle: &str) -> Option<Vec<String>> {
     // La requête de `SettingsRepo::get`, lue sur un `&dyn DbBackend` : le
     // dépôt veut un `Arc`, que le scan et l'orchestrateur n'ont pas toujours
     // sous la main à cet endroit.
@@ -112,7 +158,6 @@ fn lire_liste(db: &dyn DbBackend, cle: &str) -> Vec<String> {
         .flatten()
         .and_then(|r| r.first().and_then(|v| v.as_string()))
         .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-        .unwrap_or_default()
 }
 
 /// L'ordre EFFECTIF : les entrées réglées qui sont encore des dossiers de

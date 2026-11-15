@@ -51,10 +51,13 @@ const CANDIDATES: &str = "SELECT t.id FROM tracks t \
                       AND m.value LIKE '%/api/v1/radios/%/audio%')";
 
 /// Une candidate qu'un favori de piste ou une playlist référence.
-const LIEE: &str = "SELECT 1 FROM tracks t WHERE t.id = ? AND ( \
+///
+/// #4201 — `favorites.item_id` est INTEGER, TEXT ou BIGINT selon la base :
+/// les deux côtés passent en texte (`bigint = text` n'existe pas sur PG).
+pub const LIEE: &str = "SELECT 1 FROM tracks t WHERE t.id = ? AND ( \
        EXISTS (SELECT 1 FROM playlist_tracks pt WHERE pt.track_id = t.id) \
        OR EXISTS (SELECT 1 FROM favorites f \
-                   WHERE f.item_type = 'track' AND f.item_id = CAST(t.id AS TEXT)))";
+                   WHERE f.item_type = 'track' AND CAST(f.item_id AS TEXT) = CAST(t.id AS TEXT)))";
 
 /// Ce que la passe a fait.
 #[derive(Debug, Default, PartialEq, Eq)]

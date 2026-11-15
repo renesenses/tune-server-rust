@@ -124,6 +124,18 @@ pub(super) async fn patch_zone(
         .await;
     }
 
+    // #3245 — le mode exclusif réglé sur la zone atteint sa sortie locale :
+    // tout de suite au repos, sinon dès que la lecture rend le périphérique.
+    #[cfg(feature = "local-audio")]
+    if body.exclusive_mode.is_some()
+        && let Some(device_id) = repo.get(id).ok().flatten().and_then(|z| z.output_device_id)
+    {
+        let _ = crate::exclusif_par_zone_3245::aligner_maintenant_ou_apres_la_lecture(
+            &state, &device_id,
+        )
+        .await;
+    }
+
     if body.brand.is_some() || body.model.is_some() {
         push_device_correction(&state, id).await;
         // Dans la foulée : les réglages qui marchent chez cet utilisateur pour
@@ -143,6 +155,31 @@ fn valider_le_patch(
     zone_before: &Zone,
     body: &PatchZone,
 ) -> Result<Option<f64>, axum::response::Response> {
+    let type_sortie = body
+        .output_type
+        .as_deref()
+        .or(zone_before.output_type.as_deref())
+        .unwrap_or("");
+    if matches!(body.fixed_sample_rate, Some(Some(_)))
+        && !tune_core::audio::frequence_fixe::sortie_compatible(type_sortie)
+    {
+        return Err(refus_de_valeur(
+            id,
+            "fixed_sample_rate",
+            type_sortie,
+            "AirPlay uses its protocol sample rate; fixed_sample_rate is unavailable for this output",
+        ));
+    }
+    if let Some(Some(rate)) = body.fixed_sample_rate
+        && !tune_core::audio::frequence_fixe::CADENCES.contains(&rate)
+    {
+        return Err(refus_de_valeur(
+            id,
+            "fixed_sample_rate",
+            &rate.to_string(),
+            "unsupported PCM sample rate",
+        ));
+    }
     // Les valeurs que cette route peut juger seule, avant toute écriture : un
     // PATCH est atomique du point de vue de l'utilisateur, il ne doit pas
     // laisser la moitié de ses champs écrits derrière lui.
@@ -312,6 +349,14 @@ async fn commander_la_sortie(
         return Err(crate::routes::playback::output_command_error_response(
             error,
         ));
+    }
+    // #8165 — un geste de volume lève la sourdine, sauf quand ce même PATCH
+    // dit lui-même ce qu'elle doit être (pas de levée puis de remise).
+    if volume_demande.is_some() && body.muted.is_none() {
+        state
+            .orchestrator
+            .lever_la_sourdine_au_geste_de_volume(id, command_device_id)
+            .await;
     }
     if let Some(muted) = body.muted
         && let Err(error) = state
@@ -732,6 +777,19 @@ async fn persister_l_upnp(
         };
         ecrire!("dlna_radio_title", mode.as_str(), r);
     }
+    // #8082 — flux continu entre les pistes → setting
+    // zone_{id}_dlna_flux_continu. Clé supprimée à la désactivation ; lu à
+    // chaque lecture, rien à rafraîchir en vol.
+    if let Some(enabled) = body.dlna_flux_continu {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::outputs::dlna_flux_continu::cle(id);
+        let r = if enabled {
+            settings.set(&key, "true")
+        } else {
+            settings.delete(&key)
+        };
+        ecrire!("dlna_flux_continu", enabled, r);
+    }
     // Silence UPnP (#2263) → setting zone_{id}_upnp_silence. Même forme que
     // `upnp_renderer` : clé supprimée à la désactivation.
     if let Some(enabled) = body.upnp_silence {
@@ -857,6 +915,16 @@ async fn persister_le_son(
         // réglage-ci se vérifie précisément à l'oreille, musique en cours.
         state.orchestrator.refresh_zone_mono_downmix(id).await;
     }
+    if let Some(rate) = body.fixed_sample_rate {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::audio::frequence_fixe::cle_de_zone(id);
+        let r = match rate {
+            Some(rate) => settings.set(&key, &rate.to_string()),
+            None => settings.delete(&key),
+        };
+        ecrire!("fixed_sample_rate", format!("{rate:?}"), r);
+        state.orchestrator.refresh_zone_upsampler(id).await;
+    }
     // #3973 — « bit-perfect strict » → setting zone_{id}_strict_bitperfect.
     // Même forme que `mono_downmix` : clé supprimée à la désactivation, pour
     // que l'absence et le défaut désarmé soient un seul état. Lu à chaque
@@ -870,6 +938,19 @@ async fn persister_le_son(
             settings.delete(&key)
         };
         ecrire!("strict_bitperfect", enabled, r);
+    }
+    // #3245 — mode exclusif de la zone → setting zone_{id}_exclusive_mode ;
+    // `null` supprime la clé (la zone suit la machine). La sortie est alignée
+    // par `patch_zone`, après la persistance.
+    if let Some(valeur) = body.exclusive_mode {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::config::cle_exclusif_de_zone(id);
+        let r = match valeur {
+            Some(true) => settings.set(&key, "true"),
+            Some(false) => settings.set(&key, "false"),
+            None => settings.delete(&key),
+        };
+        ecrire!("exclusive_mode", format!("{valeur:?}"), r);
     }
     // Trim de gain par renderer → setting zone_{id}_gain_trim_db (±12 dB, 0 = efface).
     if let Some(db) = body.gain_trim_db {
@@ -1319,7 +1400,7 @@ pub(super) async fn delete_all_zones(State(state): State<AppState>) -> impl Into
 /// #7937 — une zone ressuscitée par `POST /zones` (même appareil, même
 /// numéro) repart sans groupe de lecture. Un échec d'écriture est journalisé
 /// et ne fait pas échouer la création : la zone est bien revenue.
-fn sortir_la_zone_recreee_des_groupes(state: &AppState, id: i64) {
+pub(super) fn sortir_la_zone_recreee_des_groupes(state: &AppState, id: i64) {
     match tune_core::zones::groupes_enregistres::retirer_des_groupes_enregistres(
         &state.backend,
         &[id],
@@ -1374,6 +1455,9 @@ pub(super) async fn delete_zone(
             ),
         }
     }
+    // #8701 — même une zone déjà à l'arrêt : ses fMP4 DASH ne sont plus
+    // retenus pour elle.
+    tune_core::audio::dash_epingles::liberer_la_zone(id);
     match repo.delete(id) {
         Ok(0) => {
             warn!(zone_id = id, "zone_delete_aucune_zone_de_cet_identifiant");
@@ -1568,7 +1652,7 @@ pub(super) async fn update_volume(
             .into_response();
     }
 
-    match state
+    let resultat = state
         .orchestrator
         .set_volume_avec_garde(
             id,
@@ -1576,8 +1660,15 @@ pub(super) async fn update_volume(
             device_id.as_deref(),
             tune_core::audio::garde_de_hausse::Hausse::depuis_confirmation(body.confirm_increase),
         )
-        .await
-    {
+        .await;
+    // #8165 — un geste de volume lève la sourdine de la zone.
+    if resultat.is_ok() {
+        state
+            .orchestrator
+            .lever_la_sourdine_au_geste_de_volume(id, device_id.as_deref())
+            .await;
+    }
+    match resultat {
         // #6721 — 204 comme avant pour une consigne appliquée telle quelle ;
         // 200 et le gain retenu quand la garde l'a plafonnée, pour que le
         // client propose de confirmer (`confirm_increase`).

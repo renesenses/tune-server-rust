@@ -285,12 +285,16 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             .ouvrir(tune_core::db::task_run_repo::TACHE_SCAN_DEMARRAGE);
 
         let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
-        let raw_dirs: Vec<String> = settings
+        let mut raw_dirs: Vec<String> = settings
             .get("music_dirs")
             .ok()
             .flatten()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        // #8189 — les racines des sources réseau (`tune-src://…`).
+        raw_dirs.extend(
+            tune_core::db::sources_reseau::SourcesReseauRepo::with_backend(db.clone()).racines(),
+        );
 
         let music_dirs: Vec<String> = raw_dirs
             .iter()
@@ -1366,6 +1370,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "auto_scan_hidden_albums_reconcile_failed"),
             }
+            // web#916 — les albums locaux écartés de l'accueil (« Pas pour
+            // moi ») : même mécanique, même garde `full_scan_ok`.
+            tune_core::db::suggestions_ecartees::reconcilier_journalise(
+                db.clone(),
+                full_scan_ok,
+                "scan_auto",
+            );
             // Les paires « pas des doublons » (#1276) : même mécanique, même
             // garde `full_scan_ok`. Un arbitrage perdu ne se voit pas — il se
             // paie à la fusion suivante, qui supprime la ligne perdante.

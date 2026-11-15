@@ -223,6 +223,27 @@ impl Album {
         )
     }
 
+    /// La clé du filtre Stéréo (#8560, fil forum 2713), pendant de
+    /// [`Self::QUALITE_MULTICANAL`] : ce qui n'est PAS multicanal.
+    pub const QUALITE_STEREO: &'static str = "stereo";
+
+    /// Le prédicat qui garde les PISTES stéréo d'alias `alias` : un ou deux
+    /// canaux (le mono n'est pas du multicanal, il sort ici). Une piste sans
+    /// nombre de canaux connu n'est ni stéréo ni multicanale : on ne sait pas.
+    pub fn stereo_sql_piste(alias: &str) -> String {
+        format!("({alias}.channels BETWEEN 1 AND {MULTICANAL_AU_DELA_DE})")
+    }
+
+    /// Le prédicat qui garde les ALBUMS d'alias `alias` dont au moins une
+    /// piste est stéréo (#8560). Un album qui mêle pistes stéréo et
+    /// multicanales sort sous les DEUX filtres, comme le demande le fil 2713.
+    pub fn stereo_sql_album(alias: &str) -> String {
+        format!(
+            "EXISTS (SELECT 1 FROM tracks tst WHERE tst.album_id = {alias}.id AND {})",
+            Self::stereo_sql_piste("tst")
+        )
+    }
+
     pub fn new(title: String) -> Self {
         Self {
             id: None,

@@ -137,6 +137,13 @@ pub struct TuneConfig {
     pub peer_discovery_enabled: bool,
 
     // UPnP
+    /// ⚠️ Ces deux champs-ci ne pilotent RIEN (#8374) : `from_env` n'a aucun
+    /// appelant (voir `auto_update`). `TUNE_UPNP_SERVER_ENABLED` et
+    /// `TUNE_UPNP_SERVER_NAME` sont lues là où l'annonce se décide —
+    /// `upnp_server::annonce_voulue` et `upnp_server::nom_publie` — comme
+    /// valeur par défaut quand la clé `upnp_enabled` / `upnp_friendly_name`
+    /// est absente de la base. Laissés en place : retirer un champ d'une
+    /// configuration publique est un arbitrage de Bertrand.
     pub upnp_server_enabled: bool,
     pub upnp_server_name: String,
 
@@ -690,6 +697,60 @@ pub fn demande_d_exclusif_du_peripherique(
         && configured_backend.trim().eq_ignore_ascii_case("asio")
         && !backend_ouvrable.trim().eq_ignore_ascii_case("asio");
     requested && !echo_d_asio_sur_une_sortie_non_asio
+}
+
+/// #3245 — la clé du réglage « mode exclusif » d'UNE zone.
+///
+/// Absente : la zone suit le réglage de machine `local_exclusive_mode`, ce qui
+/// garde intactes les installations existantes. `"true"` ou `"false"` : la
+/// zone décide pour l'appareil qu'elle joue, quoi que dise la machine.
+pub fn cle_exclusif_de_zone(zone_id: i64) -> String {
+    format!("zone_{zone_id}_exclusive_mode")
+}
+
+/// #3245 — la demande d'exclusif qui vaut pour l'appareil d'une zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DemandeDExclusifDeZone {
+    /// Ce qui est demandé pour cet appareil.
+    pub demande: bool,
+    /// `true` quand la valeur vient du réglage de la ZONE, `false` quand elle
+    /// vient du réglage de machine (repli).
+    pub par_la_zone: bool,
+}
+
+/// #3245 — fonction pure : la valeur enregistrée pour la zone l'emporte, le
+/// réglage de machine sert de repli. Une valeur illisible vaut absence.
+pub fn demande_d_exclusif_de_la_zone(
+    valeur_de_zone: Option<&str>,
+    demande_machine: bool,
+) -> DemandeDExclusifDeZone {
+    match valeur_de_zone
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("true" | "1" | "yes") => DemandeDExclusifDeZone {
+            demande: true,
+            par_la_zone: true,
+        },
+        Some("false" | "0" | "no") => DemandeDExclusifDeZone {
+            demande: false,
+            par_la_zone: true,
+        },
+        _ => DemandeDExclusifDeZone {
+            demande: demande_machine,
+            par_la_zone: false,
+        },
+    }
+}
+
+/// #3245 — le témoin « exclusif armé par ASIO » (#5353) ne retire que l'ÉCHO
+/// du choix d'ASIO recopié dans le réglage de MACHINE. Une demande faite sur la
+/// zone elle-même est celle de l'utilisateur : le témoin ne la touche pas.
+pub fn temoin_asio_pour_la_demande(
+    exclusif_arme_par_asio: bool,
+    demande: DemandeDExclusifDeZone,
+) -> bool {
+    exclusif_arme_par_asio && !demande.par_la_zone
 }
 
 /// Même règle, câblée sur la plateforme de ce binaire. C'est celle que les deux
@@ -1701,5 +1762,70 @@ mod nom_de_zone_locale_i1770 {
         assert!(est_etiquette_locale_generique("this computer"));
         assert!(!est_etiquette_locale_generique("Salon"));
         assert!(!est_etiquette_locale_generique("Speakers"));
+    }
+}
+
+#[cfg(test)]
+mod exclusif_par_zone_3245 {
+    use super::*;
+
+    #[test]
+    fn la_zone_l_emporte_sur_la_machine_3245() {
+        let d = demande_d_exclusif_de_la_zone(Some("true"), false);
+        assert_eq!(
+            d,
+            DemandeDExclusifDeZone {
+                demande: true,
+                par_la_zone: true
+            }
+        );
+        let d = demande_d_exclusif_de_la_zone(Some("false"), true);
+        assert_eq!(
+            d,
+            DemandeDExclusifDeZone {
+                demande: false,
+                par_la_zone: true
+            },
+            "une zone réglée « partagé » reste partagée même si la machine dit exclusif"
+        );
+    }
+
+    #[test]
+    fn sans_reglage_de_zone_la_machine_decide_3245() {
+        for machine in [true, false] {
+            for valeur in [None, Some(""), Some("peut-être")] {
+                assert_eq!(
+                    demande_d_exclusif_de_la_zone(valeur, machine),
+                    DemandeDExclusifDeZone {
+                        demande: machine,
+                        par_la_zone: false
+                    }
+                );
+            }
+        }
+        assert_eq!(cle_exclusif_de_zone(7), "zone_7_exclusive_mode");
+    }
+
+    /// L'écho d'ASIO (#5353) ne retire que la demande de MACHINE : une zone
+    /// WASAPI réglée « exclusif » par l'utilisateur reste exclusive.
+    #[test]
+    fn le_temoin_asio_ne_touche_pas_une_demande_de_zone_3245() {
+        let zone = demande_d_exclusif_de_la_zone(Some("true"), true);
+        let temoin = temoin_asio_pour_la_demande(true, zone);
+        assert!(!temoin);
+        let s = exclusive_mode_du_peripherique("asio", Some("WASAPI"), zone.demande, temoin, true);
+        assert!(
+            s.effective,
+            "l'exclusif demandé par la zone doit être honoré"
+        );
+
+        let machine = demande_d_exclusif_de_la_zone(None, true);
+        let temoin = temoin_asio_pour_la_demande(true, machine);
+        let s =
+            exclusive_mode_du_peripherique("asio", Some("WASAPI"), machine.demande, temoin, true);
+        assert!(
+            !s.effective,
+            "l'écho d'ASIO ne vaut rien pour une sortie WASAPI (#5353)"
+        );
     }
 }

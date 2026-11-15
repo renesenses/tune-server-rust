@@ -1,4 +1,5 @@
-//! Ce que chaque pilote ASIO a DÉCLARÉ du DSD natif (#5643, lot D).
+//! Ce que chaque pilote ASIO a DÉCLARÉ du DSD natif (#5643, lot D) — et,
+//! depuis #8248, ce que chaque pilote ALSA `hw:` offre en `DSD_U32`.
 //!
 //! La capacité se sonde UNE fois par périphérique (bascule du pilote en DSD,
 //! `kAsioCanSampleRate` pour chaque cadence, retour au PCM : voir
@@ -17,12 +18,16 @@ use std::sync::{Mutex, OnceLock};
 /// Ce qu'une sortie locale a déclaré, la dernière fois qu'on l'a regardée.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapaciteConnue {
-    /// La sortie ne passe pas par le bras ASIO exclusif (WASAPI, partagé,
-    /// autre plateforme) : pas de DSD natif.
+    /// La sortie n'a pas de bras DSD natif : ni ASIO exclusif, ni ALSA
+    /// `hw:` (WASAPI, partagé, macOS, PCM ALSA logiciel). Le libellé API
+    /// reste `sortie_non_asio`, que les clients connaissent.
     SortieNonAsio,
     /// Pilote ASIO sondé : les cadences DSD qu'il accepte (vide = aucune,
     /// pilote PCM seulement).
     Asio { cadences: Vec<u32> },
+    /// #8248 — PCM ALSA `hw:` sondé : les cadences DSD qu'il accepte en
+    /// `DSD_U32_BE`/`DSD_U32_LE` (vide = aucun format DSD natif offert).
+    AlsaDsdU32 { cadences: Vec<u32> },
 }
 
 fn table() -> &'static Mutex<HashMap<String, CapaciteConnue>> {
@@ -53,18 +58,25 @@ pub fn retenir(device_name: &str, capacite: CapaciteConnue) {
 /// retire, pour que la piste suivante parte en DoP au lieu d'échouer encore.
 pub fn oublier_cadence(device_name: &str, cadence: u32) {
     let mut t = table().lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(CapaciteConnue::Asio { cadences }) = t.get_mut(device_name) {
+    if let Some(CapaciteConnue::Asio { cadences } | CapaciteConnue::AlsaDsdU32 { cadences }) =
+        t.get_mut(device_name)
+    {
         cadences.retain(|c| *c != cadence);
     }
 }
 
 /// Ce que l'API publie : « natif » si la sortie `output_device_id`
-/// (`local:<nom>`) est connue comme ASIO avec au moins une cadence DSD
-/// déclarée. Ne sonde jamais : une route de lecture ne touche pas au pilote.
+/// (`local:<nom>`) est connue comme ASIO ou ALSA `hw:` avec au moins une
+/// cadence DSD déclarée. Ne sonde jamais : une route de lecture ne touche pas
+/// au pilote.
 #[must_use]
 pub fn natif_annonce(output_device_id: Option<&str>) -> bool {
     let Some(nom) = output_device_id.and_then(|id| id.strip_prefix("local:")) else {
         return false;
     };
-    matches!(connue(nom), Some(CapaciteConnue::Asio { cadences }) if !cadences.is_empty())
+    matches!(
+        connue(nom),
+        Some(CapaciteConnue::Asio { cadences } | CapaciteConnue::AlsaDsdU32 { cadences })
+            if !cadences.is_empty()
+    )
 }

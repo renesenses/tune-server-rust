@@ -198,6 +198,9 @@ pub(super) async fn rebuild_fts(
 
 pub(super) async fn export_database(
     _admin: crate::auth::RequireAdmin,
+    // Sécurité — la base entière : sans authentification,
+    // depuis cette machine seulement.
+    _ici: crate::auth::BaseEntiereDepuisCetteMachine,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     // Use the resolved path from config: on Windows/macOS a relative db_path is
@@ -277,6 +280,9 @@ fn multipart_failure(err: axum::extract::multipart::MultipartError) -> Response 
 /// une sauvegarde de sécurité, redémarrer ensuite — sont désormais tenues.
 pub(super) async fn database_import(
     _admin: crate::auth::RequireAdmin,
+    // Sécurité — la base entière : sans authentification,
+    // depuis cette machine seulement.
+    _ici: crate::auth::BaseEntiereDepuisCetteMachine,
     State(state): State<AppState>,
     mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
@@ -715,50 +721,59 @@ fn restart_after_migration() {
     });
 }
 
-/// A3 — l'hôte d'une URL PostgreSQL est-il cette machine ou le réseau local ?
-/// (adresse de bouclage, privée, de lien local, `localhost`, nom sans point ou
-/// en `.local`). Un socket Unix (`host=/run/postgresql`) est local.
-pub(crate) fn base_cible_locale(pg_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(pg_url) else {
+/// Sécurité — la base cible d'une migration est-elle sur CETTE
+/// machine ? Seuls l'adresse de bouclage (`127.0.0.0/8`, `::1`, y compris
+/// `::ffff:127.x`), le nom exact `localhost` et un socket Unix
+/// (`host=/run/postgresql`) le sont.
+///
+/// Le réseau local n'est PAS local ici : la copie emporte toute la table
+/// `settings` (jetons, secrets) et le serveur redémarre sur la base cible,
+/// qui fixe alors elle-même tous les réglages. Sans authentification, tout
+/// client du réseau passe `RequireAdmin` : il ne doit pas pouvoir désigner
+/// SON PostgreSQL. Toute autre cible exige l'authentification activée (donc
+/// un jeton administrateur).
+pub(crate) fn base_cible_sur_cette_machine(pg_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(pg_url.trim()) else {
         return false;
     };
-    // `?host=` / `?hostaddr=` remplacent l'hôte de l'URL : seul un socket
-    // Unix y est admis.
-    if url
-        .query_pairs()
-        .any(|(k, v)| (k == "host" || k == "hostaddr") && !v.starts_with('/'))
-    {
-        return false;
+    let mut socket_unix = false;
+    for (k, v) in url.query_pairs() {
+        match k.as_ref() {
+            // `?host=` / `?hostaddr=` remplacent l'hôte de l'URL : seul un
+            // socket Unix y est admis.
+            "host" | "hostaddr" => {
+                if !v.starts_with('/') || v.contains(',') {
+                    return false;
+                }
+                socket_unix = true;
+            }
+            // `service=` lit l'hôte dans `pg_service.conf` : invérifiable.
+            "service" => return false,
+            _ => {}
+        }
     }
     let hote = match url.host_str().filter(|h| !h.is_empty()) {
         Some(h) => h
             .trim_start_matches('[')
             .trim_end_matches(']')
             .to_ascii_lowercase(),
-        None => {
-            // `postgresql:///base?host=/run/postgresql` : socket Unix.
-            return true;
-        }
+        // `postgresql:///base?host=/run/postgresql`, ou `postgresql:///base`
+        // (libpq prend alors le socket Unix par défaut).
+        None => return true,
     };
+    if socket_unix && hote.is_empty() {
+        return true;
+    }
     // Liste d'hôtes (`a,b`) : refusée, un seul hôte est jugé.
     if hote.contains(',') {
         return false;
     }
     match hote.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
         Ok(std::net::IpAddr::V6(ip)) => {
-            let s = ip.segments()[0];
-            ip.is_loopback() || (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
         }
-        Err(_) => {
-            let hote = hote.trim_end_matches('.');
-            hote == "localhost"
-                || hote.ends_with(".localhost")
-                || hote.ends_with(".local")
-                || hote.ends_with(".lan")
-                || hote.ends_with(".home.arpa")
-                || !hote.contains('.')
-        }
+        Err(_) => hote.trim_end_matches('.') == "localhost",
     }
 }
 
@@ -803,13 +818,17 @@ pub(super) async fn migrate_database(
             .into_response();
     }
 
-    // A3 : la copie emporte toute la table `settings`, secrets compris. Sans
+    // Sécurité — la copie emporte toute la table `settings`,
+    // secrets compris, et le serveur redémarre sur la base cible. Sans
     // authentification, `RequireAdmin` laisse passer tout appelant : la base
-    // cible doit alors être sur cette machine ou sur le réseau local.
-    if !crate::auth::authentification_active(&state) && !base_cible_locale(pg_url) {
+    // cible doit alors être sur CETTE machine (bouclage ou socket Unix). Toute
+    // autre cible, réseau local compris, exige l'authentification activée,
+    // c'est-à-dire un jeton administrateur.
+    if !crate::auth::authentification_active(&state) && !base_cible_sur_cette_machine(pg_url) {
+        tracing::warn!("migration_refusee_cible_hors_machine_sans_authentification");
         return crate::auth::refus_sans_authentification(
-            "Migrating to a PostgreSQL server outside the local network requires \
-             authentication.",
+            "Migrating to a PostgreSQL server other than this machine (localhost or a \
+             Unix socket) requires authentication to be enabled.",
         )
         .into_response();
     }
@@ -996,35 +1015,52 @@ mod tests_import {
     }
 }
 
-/// A3 : la base cible d'une migration sans authentification.
+/// Sécurité : la base cible d'une migration sans authentification.
 #[cfg(test)]
-mod base_cible_locale_tests {
-    use super::base_cible_locale;
+mod base_cible_sur_cette_machine_tests {
+    use super::base_cible_sur_cette_machine;
 
     #[test]
-    fn seules_les_bases_locales_sont_admises() {
+    fn seule_cette_machine_est_admise_sans_authentification() {
         for ok in [
             "postgresql://tune:x@localhost:5432/tune",
+            "postgresql://tune:x@LOCALHOST./tune",
             "postgresql://tune@127.0.0.1/tune",
-            "postgres://tune@192.168.1.20/tune",
-            "postgresql://tune@10.0.0.4/tune",
+            "postgresql://tune@127.0.0.2:5433/tune",
             "postgresql://tune@[::1]/tune",
-            "postgresql://tune@[fd00::4]/tune",
-            "postgresql://tune@nas.local/tune",
-            "postgresql://tune@nas/tune",
+            "postgresql://tune@[::ffff:127.0.0.1]/tune",
             "postgresql:///tune?host=/run/postgresql",
+            "postgresql:///tune?host=%2Fvar%2Frun%2Fpostgresql",
+            "postgresql:///tune",
+            "postgresql://localhost/tune?host=/tmp",
         ] {
-            assert!(base_cible_locale(ok), "{ok}");
+            assert!(base_cible_sur_cette_machine(ok), "{ok}");
         }
         for ko in [
+            // Le réseau local n'est plus « local » (décision du 14/11).
+            "postgres://tune@192.168.1.20/tune",
+            "postgresql://tune@10.0.0.4/tune",
+            "postgresql://tune@172.16.0.9/tune",
+            "postgresql://tune@169.254.1.1/tune",
+            "postgresql://tune@[fd00::4]/tune",
+            "postgresql://tune@[fe80::1]/tune",
+            "postgresql://tune@nas.local/tune",
+            "postgresql://tune@nas/tune",
+            "postgresql://tune@nas.lan/tune",
+            "postgresql://tune@evil.localhost/tune",
+            "postgresql://tune@0.0.0.0/tune",
             "postgresql://tune@203.0.113.5/tune",
             "postgresql://tune@pg.example.com/tune",
-            "postgresql://tune@192.168.1.20/tune?host=203.0.113.5",
-            "postgresql://tune@192.168.1.20/tune?hostaddr=203.0.113.5",
             "postgresql://tune@[2001:db8::1]/tune",
+            // L'hôte de l'URL est remplacé par un paramètre.
+            "postgresql://tune@localhost/tune?host=192.168.1.20",
+            "postgresql://tune@localhost/tune?hostaddr=192.168.1.20",
+            "postgresql://tune@localhost/tune?host=/tmp,192.168.1.20",
+            "postgresql://tune@localhost/tune?service=prod",
+            "postgresql://tune@127.0.0.1,192.168.1.20/tune",
             "pas une url",
         ] {
-            assert!(!base_cible_locale(ko), "{ko}");
+            assert!(!base_cible_sur_cette_machine(ko), "{ko}");
         }
     }
 }

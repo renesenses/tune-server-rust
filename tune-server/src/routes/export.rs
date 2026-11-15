@@ -136,9 +136,13 @@ async fn export_library_audit_csv(
     let music_dirs = crate::routes::system::get_music_dirs_list(&state.backend);
     let dirs: Vec<String> = match q.get("dir").map(|d| d.trim().trim_end_matches(['/', '\\'])) {
         Some(d) if !d.is_empty() => {
-            let autorise = music_dirs
-                .iter()
-                .any(|root| crate::routes::system::scan::sous_le_dossier(d, root));
+            // Sécurité — `sous_le_dossier` (préfixe de texte) prenait
+            // `/musique/../home` pour un dossier de la bibliothèque, et l'audit
+            // listait les fichiers audio de n'importe quel dossier.
+            let autorise = crate::routes::confinement::sous_les_racines(d, &music_dirs).is_ok()
+                && music_dirs
+                    .iter()
+                    .any(|root| crate::routes::system::scan::sous_le_dossier(d, root));
             if !autorise {
                 return crate::message_api::refus(
                     StatusCode::BAD_REQUEST,
@@ -320,5 +324,31 @@ async fn export_library_audit_csv(
     match csv_response(csv, "audit-bibliotheque.csv") {
         Ok(r) => r.into_response(),
         Err(e) => e.into_response(),
+    }
+}
+
+/// Sécurité — l'audit CSV ne parcourt que les dossiers de musique.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::banc;
+
+    #[tokio::test]
+    async fn un_dossier_d_audit_qui_remonte_est_refuse() {
+        let b = banc();
+        let auditer = |dir: String| {
+            export_library_audit_csv(
+                State(b.state.clone()),
+                axum::extract::Query(std::collections::HashMap::from([("dir".to_string(), dir)])),
+            )
+        };
+        let r = auditer(b.remontee("")).await.into_response();
+        assert_eq!(
+            r.status(),
+            StatusCode::BAD_REQUEST,
+            "audit hors bibliothèque accepté"
+        );
+        let r = auditer(b.dedans("/Album")).await.into_response();
+        assert_ne!(r.status(), StatusCode::BAD_REQUEST);
     }
 }

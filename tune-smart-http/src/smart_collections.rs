@@ -270,7 +270,7 @@ pub(crate) fn compte_albums(
     match_mode: &str,
     profile_id: i64,
 ) -> i64 {
-    let (en_base, en_service) = compte_albums_ventile(
+    let (en_base, en_service, _) = compte_albums_ventile(
         backend,
         sql_bibliotheque,
         &[],
@@ -308,7 +308,7 @@ pub(crate) fn compte_albums_ventile(
     // #7872 — faux quand la collection porte une expression : les albums de
     // service n'y répondent jamais.
     avec_les_services: bool,
-) -> (i64, i64) {
+) -> (i64, i64, Option<i64>) {
     let un = |sql: &str, liens: &[&dyn ToSqlValue]| {
         backend
             .query_many(sql, liens)
@@ -316,9 +316,29 @@ pub(crate) fn compte_albums_ventile(
             .and_then(|rs| rs.first().and_then(|r| r.first()).and_then(|v| v.as_i64()))
             .unwrap_or(0)
     };
-    let en_base = un(sql_bibliotheque, liens_bibliotheque);
+    // Recette du 13/11 (n° 73) — le compte d'albums ET le compte de pistes de
+    // la bibliothèque viennent d'UNE lecture ([`sql_comptes_de_collection`]) :
+    // deux colonnes, une seule passe sur la jointure albums × pistes, au lieu
+    // de deux requêtes qui la refaisaient chacune. La seconde colonne est le
+    // compte de pistes ; une requête à une colonne (épreuves) n'en rend pas.
+    // Une lecture en échec rend 0 album et AUCUN compte de pistes, comme
+    // avant (`.ok()` sur la requête des pistes).
+    let lignes = backend
+        .query_many(sql_bibliotheque, liens_bibliotheque)
+        .ok();
+    let ligne = lignes.as_ref().and_then(|rs| rs.first());
+    let en_base = ligne
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let pistes_en_base = lignes.as_ref().map(|_| {
+        ligne
+            .and_then(|r| r.get(1))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    });
     if !avec_les_services {
-        return (en_base, 0);
+        return (en_base, 0, pistes_en_base);
     }
     // #5026 — les albums de service ÉTIQUETÉS s'ajoutent aux favoris de
     // service ; `etiquettes_streaming` écarte ceux que les favoris rendent déjà.
@@ -329,7 +349,7 @@ pub(crate) fn compte_albums_ventile(
             + etiquettes_streaming::requete_compte(rules_json, match_mode, profile_id)
                 .map(|sql| un(&sql, &[]))
                 .unwrap_or(0);
-    (en_base, en_service)
+    (en_base, en_service, pistes_en_base)
 }
 
 /// Faire tourner les lectures synchrones d'une route de collection
@@ -484,10 +504,10 @@ fn calculer_les_comptes(
     let where_clause = avec_l_expression(&where_clause, filtre.as_ref());
     let liens = liens_de(filtre.as_ref());
 
-    let album_count_sql = sql_compte_de_collection("al.id", &where_clause);
-    let (albums_en_base, albums_de_service) = compte_albums_ventile(
+    let comptes_sql = sql_comptes_de_collection(&where_clause);
+    let (albums_en_base, albums_de_service, pistes_en_base) = compte_albums_ventile(
         &*state.backend,
-        &album_count_sql,
+        &comptes_sql,
         &liens,
         rules_str,
         match_mode,
@@ -508,21 +528,8 @@ fn calculer_les_comptes(
     // (`SmartCollectionsView.svelte`) : la mention de pistes
     // disparaît, le nombre d'albums reste.
     let compte_complet = albums_de_service == 0;
-    let track_count = if compte_complet {
-        let track_count_sql = sql_compte_de_collection("t.id", &where_clause);
-        state
-            .backend
-            .query_many(&track_count_sql, &liens)
-            .ok()
-            .map(|rs| {
-                rs.first()
-                    .and_then(|r| r.first())
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-            })
-    } else {
-        None
-    };
+    // Lu dans la MÊME passe que le compte d'albums (recette du 13/11, n° 73).
+    let track_count = if compte_complet { pistes_en_base } else { None };
     crate::comptes::Comptes {
         album_count: albums_en_base + albums_de_service,
         track_count,
@@ -1032,7 +1039,15 @@ pub fn build_album_query(
             // 🔴 #7769 — les écoutes d'une piste de l'album par la règle de la
             // Bibliothèque (titre + interprète) : `lh.track_id`, toujours NULL,
             // ne rattachait aucune écoute à aucun album.
-            let on = tune_core::db::history_repo::sql::ecoute_de_la_piste("t3", "lh");
+            // 🔴 #8416 — et les écoutes IMPORTÉES (`imported_plays`, #7763),
+            // que la Bibliothèque compte aussi : `ecoutes_des_albums` rend, par
+            // album écouté, la somme des deux et la plus récente des dates.
+            let albums = tune_core::db::history_repo::sql::ecoutes_des_albums();
+            let parmi =
+                |cond: &str| format!("al.id IN (SELECT ea.album_id FROM {albums} ea WHERE {cond})");
+            let hors = |cond: &str| {
+                format!("al.id NOT IN (SELECT ea.album_id FROM {albums} ea WHERE {cond})")
+            };
             // Un nombre d'écoutes illisible ne vaut plus 0 : la règle rend
             // FAUX (#1231), comme côté pistes.
             let int_v = match value.trim().parse::<i64>() {
@@ -1044,45 +1059,14 @@ pub fn build_album_query(
                 Err(_) => 0,
             };
             let cond = match (field, op) {
-                ("play_count", "=" | "==") if int_v == 0 => format!(
-                    "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on})"
-                ),
-                ("play_count", "=") => format!(
-                    "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on} \
-                     GROUP BY t3.album_id HAVING COUNT(*) = {int_v})"
-                ),
-                ("play_count", ">=") => format!(
-                    "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on} \
-                     GROUP BY t3.album_id HAVING COUNT(*) >= {int_v})"
-                ),
-                ("play_count", ">") => format!(
-                    "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on} \
-                     GROUP BY t3.album_id HAVING COUNT(*) > {int_v})"
-                ),
-                ("play_count", "<") => format!(
-                    "al.id NOT IN (SELECT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on} \
-                     GROUP BY t3.album_id HAVING COUNT(*) >= {int_v})"
-                ),
-                ("last_played_at", ">" | ">=") => {
+                ("play_count", "=" | "==") if int_v == 0 => hors("ea.n > 0"),
+                ("play_count", "=") => parmi(&format!("ea.n = {int_v}")),
+                ("play_count", ">=") => parmi(&format!("ea.n >= {int_v}")),
+                ("play_count", ">") => parmi(&format!("ea.n > {int_v}")),
+                ("play_count", "<") => hors(&format!("ea.n >= {int_v}")),
+                ("last_played_at", ">" | ">=" | "<" | "<=") => {
                     let ts = resolve_timestamp_sql(&value);
-                    format!(
-                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON {on} \
-                         WHERE lh.listened_at {op} {ts} GROUP BY t3.album_id)"
-                    )
-                }
-                ("last_played_at", "<" | "<=") => {
-                    let ts = resolve_timestamp_sql(&value);
-                    format!(
-                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON {on} \
-                         GROUP BY t3.album_id HAVING MAX(lh.listened_at) {op} {ts})"
-                    )
+                    parmi(&format!("ea.derniere {op} {ts}"))
                 }
                 // #5547 — « entre » : l'éditeur le propose pour les deux
                 // champs, et le moteur n'avait aucun bras. La règle tombait
@@ -1091,18 +1075,11 @@ pub fn build_album_query(
                     let Some((lo, hi)) = crate::regles_sql::bornes_de_nombres(value_raw) else {
                         continue;
                     };
-                    let dans = format!(
-                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON {on} \
-                         GROUP BY t3.album_id HAVING COUNT(*) BETWEEN {lo} AND {hi})"
-                    );
+                    let dans = parmi(&format!("ea.n BETWEEN {lo} AND {hi}"));
                     if lo <= 0 {
                         // Zéro écoute n'a pas de ligne : « entre 0 et N »
                         // doit garder les albums jamais écoutés.
-                        format!(
-                            "(al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
-                             JOIN listen_history lh ON {on}) OR {dans})"
-                        )
+                        format!("({} OR {dans})", hors("ea.n > 0"))
                     } else {
                         dans
                     }
@@ -1111,29 +1088,18 @@ pub fn build_album_query(
                     let Some((lo, hi)) = crate::regles_sql::bornes_de_dates(value_raw) else {
                         continue;
                     };
-                    format!(
-                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                         JOIN listen_history lh ON {on} \
-                         GROUP BY t3.album_id HAVING MAX(lh.listened_at) BETWEEN {lo} AND {hi})"
-                    )
+                    parmi(&format!("ea.derniere BETWEEN {lo} AND {hi}"))
                 }
                 // #6122 — « écouté dans les N derniers jours » : une écoute au
                 // moins depuis le seuil, lu à l'horloge à chaque requête.
                 ("last_played_at", crate::regles_sql::DANS_LES_DERNIERS_JOURS) => {
                     match crate::regles_sql::seuil_de(value_raw) {
-                        Some(s) => format!(
-                            "al.id IN (SELECT t3.album_id FROM tracks t3 \
-                             JOIN listen_history lh ON {on} \
-                             WHERE lh.listened_at >= {} GROUP BY t3.album_id)",
-                            s.iso
-                        ),
+                        Some(s) => parmi(&format!("ea.derniere >= {}", s.iso)),
                         None => crate::regles_sql::FAUX.to_string(),
                     }
                 }
-                ("last_played_at", "is_null") => format!(
-                    "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
-                     JOIN listen_history lh ON {on})"
-                ),
+                // « jamais » : ni écoute ni date, comme côté pistes (#8416).
+                ("last_played_at", "is_null") => hors("ea.n > 0 OR ea.derniere IS NOT NULL"),
                 _ => continue,
             };
             conditions.push(cond);
@@ -1174,6 +1140,20 @@ pub fn build_album_query(
             {
                 conditions.push(c);
             }
+            continue;
+        }
+
+        // #8325 — chef, ensemble, œuvre : un album passe dès qu'UNE de ses
+        // pistes porte la valeur ; « différent », « ne contient pas » et
+        // « vide » demandent qu'AUCUNE piste ne la porte.
+        if let Some(r) = crate::regles_sql::condition_classique(field, op, value_raw) {
+            conditions.push(match r {
+                Some((c, false)) => c,
+                Some((c, true)) => {
+                    format!("NOT EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = al.id AND {c})")
+                }
+                None => crate::regles_sql::FAUX.to_string(),
+            });
             continue;
         }
 
@@ -1382,11 +1362,35 @@ pub fn build_album_query(
 
 /// Le compte `COUNT(DISTINCT {objet})` d'une collection — `al.id` pour ses
 /// albums, `t.id` pour ses pistes — sur la même jointure que
-/// [`sql_albums_de_collection`]. Une seule écriture, pour que l'épreuve du plan
-/// (#2149) lise le SQL que la liste des collections joue.
+/// [`sql_albums_de_collection`].
+///
+/// C'est le SQL que la liste des collections jouait, deux fois par
+/// collection, jusqu'à la recette du 13/11/2026 : il ne sert plus qu'aux
+/// épreuves, comme RÉFÉRENCE de ce que [`sql_comptes_de_collection`] doit
+/// rendre à l'identique.
+#[cfg(test)]
 pub(crate) fn sql_compte_de_collection(objet: &str, where_clause: &str) -> String {
     format!(
         "SELECT COUNT(DISTINCT {objet}) FROM albums al \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
+    )
+}
+
+/// Les DEUX comptes d'une collection — albums, puis pistes — en une seule
+/// passe, sur la même jointure et la même clause que la liste d'albums
+/// ([`sql_albums_de_collection`]) : `COUNT(DISTINCT al.id)` et
+/// `COUNT(DISTINCT t.id)` lus ensemble rendent exactement ce que rendaient les
+/// deux requêtes jouées l'une après l'autre (épreuve
+/// `comptes_en_une_passe_egalent_les_deux_requetes`, SQLite et PostgreSQL).
+///
+/// Recette du 13/11/2026 (n° 73), .18 (9 488 albums, 96 438 pistes) : la liste
+/// des collections intelligentes rejouait pour CHAQUE collection deux
+/// comptes et la lecture de ses pochettes, trois passes complètes sur la
+/// jointure albums × pistes, entre 0,5 et 1 s chacune.
+pub(crate) fn sql_comptes_de_collection(where_clause: &str) -> String {
+    format!(
+        "SELECT COUNT(DISTINCT al.id), COUNT(DISTINCT t.id) FROM albums al \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
          LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
     )
@@ -1457,6 +1461,31 @@ fn execute_album_query(
             })
         })
         .collect())
+}
+
+/// #7903 (fil 2656) — joint `added_at` (la date d'ajout dans Tune, la même
+/// que la liste de la Bibliothèque) aux albums d'une collection ouverte : le
+/// tri « Ordre d'ajout dans Tune » se fait à l'écran, sur ces lignes. Une
+/// requête groupée pour toute la liste ; un échec la laisse sans date, et le
+/// journal le dit — rien n'est inventé. Pas sur la liste des collections
+/// (`pochettes_de_la_liste`), qui n'en a pas l'usage.
+fn joindre_dates_d_ajout(state: &SmartHttpState, albums: &mut [Value]) {
+    let ids: Vec<i64> = albums.iter().filter_map(|a| a["id"].as_i64()).collect();
+    if ids.is_empty() {
+        return;
+    }
+    let ajouts = tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+        .added_at_by_ids(&ids)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "added_at_by_ids a échoué — collection sans date d'ajout");
+            std::collections::HashMap::new()
+        });
+    for a in albums.iter_mut() {
+        let date = a["id"].as_i64().and_then(|i| ajouts.get(&i).copied());
+        if let Some(o) = a.as_object_mut() {
+            o.insert("added_at".into(), json!(date));
+        }
+    }
 }
 
 /// Ajoute les ALBUMS favoris des services que nomme une règle « Source »
@@ -1625,7 +1654,8 @@ async fn resolve_albums(
     // (DecodingError.typeMismatch: expected Array, found dictionary) when
     // opening a smart collection in remote mode; the web client already
     // accepts either shape.
-    Ok(Json(albums).into_response())
+    // #8555 — la sérialisation de milliers d’albums retenait encore le fil async.
+    tune_http_types::json_hors_executeur(albums).await
 }
 
 /// Les albums d'une collection pour un profil, tels que la vue les rend :
@@ -1689,13 +1719,14 @@ fn albums_de_la_bibliotheque(
     };
     let filtre = condition_de_l_expression(&*state.backend, expression.as_deref(), profile_id);
     let where_clause = avec_l_expression(&where_clause, filtre.as_ref());
-    let albums = execute_album_query(
+    let mut albums = execute_album_query(
         state,
         &where_clause,
         &order,
         &limit_clause,
         &liens_de(filtre.as_ref()),
     )?;
+    joindre_dates_d_ajout(state, &mut albums);
     if filtre.is_some() {
         return Ok(Some((albums, rules_json, max_limit, true)));
     }
@@ -1842,13 +1873,14 @@ async fn apercu_des_albums(
             let filtre =
                 condition_de_l_expression(&*state.backend, expression.as_deref(), profile_id);
             let where_clause = avec_l_expression(&where_clause, filtre.as_ref());
-            let albums = execute_album_query(
+            let mut albums = execute_album_query(
                 &state,
                 &where_clause,
                 &order,
                 &limit_clause,
                 &liens_de(filtre.as_ref()),
             )?;
+            joindre_dates_d_ajout(&state, &mut albums);
             if filtre.is_some() {
                 return Ok(albums);
             }
@@ -1880,6 +1912,11 @@ async fn apercu_des_albums(
 #[cfg(test)]
 #[path = "expression_7872_tests.rs"]
 mod expression_7872_tests;
+
+// Recette du 13/11 (n° 73) — comptes en une passe et index des règles.
+#[cfg(test)]
+#[path = "comptes_en_une_passe_tests.rs"]
+mod comptes_en_une_passe_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3105,7 +3142,10 @@ mod apercu_note_5547 {
 /// `une_regle_de_genre_ne_lit_que_des_index_2149`.
 #[cfg(test)]
 mod genre_couvrant_2149 {
-    use super::{build_album_query, sql_albums_de_collection, sql_compte_de_collection};
+    use super::{
+        build_album_query, sql_albums_de_collection, sql_compte_de_collection,
+        sql_comptes_de_collection,
+    };
     use crate::smart_refs::{DbRefResolver, RefCtx};
     use std::sync::Arc;
     use tune_core::db::backend::DbBackend;
@@ -3177,6 +3217,7 @@ mod genre_couvrant_2149 {
                 ),
                 ("albums", sql_compte_de_collection("al.id", &where_clause)),
                 ("pistes", sql_compte_de_collection("t.id", &where_clause)),
+                ("comptes", sql_comptes_de_collection(&where_clause)),
             ] {
                 let p = plan(&db, &sql);
                 assert!(
@@ -3223,5 +3264,51 @@ mod date_de_sortie_2206 {
         let giant = lignes.iter().find(|a| a["id"] == 2).expect("album 2");
         assert!(giant["release_date"].is_null(), "{giant}");
         assert!(giant["original_date"].is_null(), "{giant}");
+    }
+}
+
+/// #7903 (fil 2656) — les albums d'une collection intelligente portent leur
+/// date d'ajout dans Tune (`added_at`, la même que la Bibliothèque) : le tri
+/// « Ordre d'ajout dans Tune » de la collection ouverte se fait à l'écran.
+#[cfg(test)]
+mod ordre_d_ajout_7903 {
+    use std::sync::Arc;
+
+    use crate::SmartHttpState;
+
+    #[test]
+    fn les_albums_d_une_collection_portent_leur_date_d_ajout() {
+        let db = crate::criteres::tests::bibliotheque();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let attendu = tune_core::db::album_repo::AlbumRepo::with_backend(backend.clone())
+            .added_at_by_ids(&[1, 2])
+            .expect("dates d'ajout de la bibliothèque");
+        let etat = SmartHttpState::new(backend);
+        let Ok(mut lignes) = super::execute_album_query(&etat, "", "ORDER BY al.id ASC", "", &[])
+        else {
+            panic!("la requête des albums de la collection échoue");
+        };
+        super::joindre_dates_d_ajout(&etat, &mut lignes);
+        for id in [1_i64, 2] {
+            let album = lignes.iter().find(|a| a["id"] == id).expect("album");
+            let lu = album["added_at"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("added_at absent : {album}"));
+            assert_eq!(
+                Some(&lu),
+                attendu.get(&id),
+                "même date que la Bibliothèque : {album}"
+            );
+        }
+        // Kind of Blue (2024) a été ajouté après Giant Steps (2019).
+        let date = |id: i64| {
+            lignes.iter().find(|a| a["id"] == id).unwrap()["added_at"]
+                .as_f64()
+                .unwrap()
+        };
+        assert!(
+            date(1) > date(2),
+            "l'ordre d'ajout doit se lire dans added_at"
+        );
     }
 }

@@ -553,6 +553,9 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // puisse nommer ce a quoi revenir. Independant de `record_post_update_result`,
     // qui rend la main tot sur les chemins d'echec : voir `noter_la_version_vue`.
     crate::routes::system::update::noter_la_version_vue(state);
+    // #8189 — les sources réseau configurées : enregistrées AVANT le scan de
+    // démarrage, qui parcourt leurs racines.
+    crate::routes::sources_reseau::demarrer(state);
 
     // Warm the ASIO device cache once at boot, while the audio devices are still
     // idle. An ASIO driver — notably SOtM Diretta — can't be re-enumerated once a
@@ -612,6 +615,16 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
         let backend = state.backend.clone();
         tokio::task::spawn_blocking(move || {
             tune_core::db::rattrapage_dates_ajout_2138::rattrapage_journalise(&backend);
+        });
+    }
+    // #8026 — les crédits lus dans les balises pour la musique déjà scannée :
+    // une fois, dérivés de `track_metadata` (aucun fichier rouvert), puis à
+    // chaque démarrage les lignes `balises` sans fiche rattachées par le nom
+    // replié. Hors du chemin du démarrage ; une erreur se journalise.
+    {
+        let backend = state.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            tune_core::metadata::rattrapage_credits_balises_8026::passes_journalisees(&backend);
         });
     }
     cleanup_orphan_queues(state);
@@ -1148,6 +1161,14 @@ fn reconcile_favorites(state: &AppState) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "hidden_albums_reconcile_failed"),
     }
+    // web#916 — les suggestions d'accueil écartées (« Pas pour moi ») sur un
+    // album local suivent la même mécanique, et la même règle : rien n'est
+    // supprimé au démarrage.
+    tune_core::db::suggestions_ecartees::reconcilier_journalise(
+        state.backend.clone(),
+        false,
+        "demarrage",
+    );
     // Les paires « ces deux albums ne sont pas des doublons » (#1276) suivent
     // la MÊME mécanique et la même règle : au démarrage on ne supprime jamais
     // une paire introuvable. Perdre l'arbitrage rouvrirait la fusion
@@ -2516,11 +2537,14 @@ pub(crate) async fn enregistrer_les_sorties_locales(
         // la même raison : sans elle, un nom WASAPI héritait de l'exclusif
         // imposé par ASIO et Tune ouvrait WASAPI en mode exclusif, coupant
         // le son de toutes les autres applications de la machine.
+        // #3245 — la DEMANDE aussi est celle de la zone qui joue cet appareil,
+        // le réglage de machine ne servant plus que de repli.
+        let demande_de_zone = state.demande_d_exclusif_de_l_appareil(&device_id, exclusive_demande);
         let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
             audio_backend,
             Some(dev.backend.as_str()),
-            exclusive_demande,
-            exclusif_arme_par_asio,
+            demande_de_zone.demande,
+            tune_core::config::temoin_asio_pour_la_demande(exclusif_arme_par_asio, demande_de_zone),
         );
         let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
             dev.name.clone(),
@@ -2532,7 +2556,8 @@ pub(crate) async fn enregistrer_les_sorties_locales(
         info!(
             device_id = %device_id,
             hote_origine = %dev.backend,
-            demande = exclusive_demande,
+            demande = demande_de_zone.demande,
+            demande_par_la_zone = demande_de_zone.par_la_zone,
             effectif = statut_exclusif.effective,
             impose = statut_exclusif.forced,
             "local_output_exclusive_mode_par_peripherique"
@@ -2902,6 +2927,9 @@ pub(crate) async fn basculer_le_repli_wasapi_sur_asio(
     BASCULE_ASIO_TENTEE.store(true, Ordering::Release);
     let repli = repli.unwrap_or_default();
     let rapport = remplacer_le_repli_wasapi(state, &asio, &repli).await;
+    // #7759 — les zones viennent de passer en ASIO : leurs groupes sont
+    // défaits, la lecture groupée n'étant possible qu'en WASAPI.
+    crate::routes::zones::defaire_les_groupes_asio(state).await;
     if rapport.gardees_en_lecture.is_empty() {
         *REPLI_WASAPI_DE_DEMARRAGE
             .lock()

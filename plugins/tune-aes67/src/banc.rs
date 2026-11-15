@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::net::{SocketAddrV4, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,7 @@ pub struct RecepteurDeTest {
     adresse: SocketAddrV4,
     arret: Arc<AtomicBool>,
     fil: JoinHandle<Vec<DatagrammeRecu>>,
+    nombre_recus: Arc<AtomicUsize>,
 }
 
 impl RecepteurDeTest {
@@ -51,6 +52,8 @@ impl RecepteurDeTest {
         };
         let arret = Arc::new(AtomicBool::new(false));
         let drapeau = arret.clone();
+        let nombre_recus = Arc::new(AtomicUsize::new(0));
+        let compteur = nombre_recus.clone();
         let fil = std::thread::Builder::new()
             .name("aes67-banc".into())
             .spawn(move || {
@@ -58,14 +61,17 @@ impl RecepteurDeTest {
                 let mut tampon = vec![0u8; 65_536];
                 while !drapeau.load(Ordering::Acquire) {
                     match socket.recv_from(&mut tampon) {
-                        Ok((n, std::net::SocketAddr::V4(source))) => recus.push(DatagrammeRecu {
-                            arrivee: Instant::now(),
-                            arrivee_unix: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default(),
-                            source,
-                            donnees: tampon[..n].to_vec(),
-                        }),
+                        Ok((n, std::net::SocketAddr::V4(source))) => {
+                            recus.push(DatagrammeRecu {
+                                arrivee: Instant::now(),
+                                arrivee_unix: SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default(),
+                                source,
+                                donnees: tampon[..n].to_vec(),
+                            });
+                            compteur.fetch_add(1, Ordering::Release);
+                        }
                         Ok(_) => {}
                         Err(e)
                             if matches!(
@@ -81,11 +87,18 @@ impl RecepteurDeTest {
             adresse,
             arret,
             fil,
+            nombre_recus,
         })
     }
 
     pub fn adresse(&self) -> SocketAddrV4 {
         self.adresse
+    }
+
+    /// Nombre de datagrammes réellement rangés dans la capture.
+    /// Permet aux bancs à horloge manuelle d'attendre le récepteur, sans délai fixe.
+    pub fn nombre_recus(&self) -> usize {
+        self.nombre_recus.load(Ordering::Acquire)
     }
 
     /// Arrête l'écoute et rend la capture.

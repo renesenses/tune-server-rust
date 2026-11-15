@@ -164,3 +164,56 @@ async fn unknown_status_does_not_poison_the_next_valid_poll_6515() {
     assert_eq!(recovered.position_ms, 12_500);
     server.await.unwrap();
 }
+
+/// #8395 — HQPlayer 3 Desktop (journal 3.18.2) : pas de `position`, mais
+/// `min` et `sec`. La position doit avancer, la durée rester inconnue.
+#[tokio::test]
+async fn hqplayer_3_min_sec_donnent_la_position_8395() {
+    for (reply, position_ms) in [
+        (
+            r#"<Status state="2" track="1" min="0" sec="2" clips="0"/>"#,
+            2_000,
+        ),
+        (
+            r#"<Status state="2" track="1" min="3" sec="7" clips="0"/>"#,
+            187_000,
+        ),
+    ] {
+        let (status, unknown) = status_from_peer(reply).await;
+        let status = status.expect("état valide");
+        assert_eq!(status.state, TransportState::Playing, "{reply}");
+        assert!(!unknown);
+        assert_eq!(status.position_ms, position_ms, "{reply}");
+        assert_eq!(status.duration_ms, 0, "durée inconnue : {reply}");
+    }
+}
+
+/// #8395 — HQPlayer 4+ donne `position` : elle prime sur `min`/`sec`.
+#[tokio::test]
+async fn position_explicite_prime_sur_min_sec_8395() {
+    let (status, _) =
+        status_from_peer(r#"<Status state="2" min="9" sec="9" position="21.5" length="110"/>"#)
+            .await;
+    let status = status.expect("état valide");
+    assert_eq!(status.position_ms, 21_500);
+    assert_eq!(status.duration_ms, 110_000);
+}
+
+#[test]
+fn min_sec_lus_sur_les_attributs_exacts_8395() {
+    assert_eq!(
+        position_min_sec(r#"<Status total_min="5" total_sec="300" min="0" sec="2"/>"#),
+        Some(2.0)
+    );
+    assert_eq!(
+        position_min_sec(r#"<Status total_min="5" total_sec="300"/>"#),
+        None
+    );
+    assert_eq!(position_min_sec(r#"<Status min="1"/>"#), None);
+    assert_eq!(position_min_sec(r#"<Status min="x" sec="2"/>"#), None);
+    assert_eq!(
+        position_min_sec(r#"<Status min="18446744073709551615" sec="2"/>"#),
+        None,
+        "pas de dépassement sur une valeur venue du réseau"
+    );
+}

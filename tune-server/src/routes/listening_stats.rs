@@ -63,7 +63,7 @@ async fn listening_stats(
                 "SELECT CAST(COALESCE(SUM(e.n), 0) AS BIGINT), \
                  CAST(COALESCE(SUM(e.duree), 0) AS BIGINT), \
                  COUNT(DISTINCT COALESCE(e.title,'') || '::' || COALESCE(e.artist_name,'')), \
-                 COUNT(DISTINCT e.artist_name) \
+                 COUNT(DISTINCT CASE WHEN e.musique = 1 THEN e.artist_name END) \
                  FROM ({ECOUTES_TOUS_TEMPS}) e"
             ),
             &[],
@@ -267,10 +267,15 @@ async fn wrapped(
     // --- Totals for the year ---
     let row = b
         .query_one(
-            "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0), \
-             COUNT(DISTINCT artist_name), \
+            // #8645 — un podcast compte dans les écoutes et le temps, pas
+            // comme un artiste.
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0), \
+             COUNT(DISTINCT CASE WHEN {} THEN artist_name END), \
              COUNT(DISTINCT COALESCE(title,'') || '::' || COALESCE(artist_name,'')) \
              FROM listen_history WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio'",
+                tune_core::db::history_repo::ECOUTE_DE_MUSIQUE
+            ),
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
         .map_err(AppError::internal)?
@@ -285,9 +290,12 @@ async fn wrapped(
     // --- Top artists for the year ---
     let top_artists: Vec<Value> = b
         .query_many(
-            "SELECT artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' AND artist_name IS NOT NULL \
-             GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
+            &format!(
+                "SELECT artist_name, COUNT(*) as plays FROM listen_history \
+                 WHERE listened_at >= ? AND listened_at < ? AND {} AND artist_name IS NOT NULL \
+                 GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
+                tune_core::db::history_repo::ECOUTE_DE_MUSIQUE
+            ),
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
         .ou_defaut_journalise()
@@ -303,9 +311,13 @@ async fn wrapped(
     // --- Top tracks for the year ---
     let top_tracks: Vec<Value> = b
         .query_many(
-            "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' \
-             GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10",
+            // #8645 — ni radio, ni épisode de podcast.
+            &format!(
+                "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
+                 WHERE listened_at >= ? AND listened_at < ? AND {} \
+                 GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10",
+                tune_core::db::history_repo::ECOUTE_DE_MUSIQUE
+            ),
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
         .ou_defaut_journalise()
@@ -322,9 +334,12 @@ async fn wrapped(
     // --- Top albums for the year ---
     let top_albums: Vec<Value> = b
         .query_many(
-            "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? AND COALESCE(source, '') <> 'radio' AND album_title IS NOT NULL \
-             GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT 10",
+            &format!(
+                "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history \
+                 WHERE listened_at >= ? AND listened_at < ? AND {} AND album_title IS NOT NULL \
+                 GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT 10",
+                tune_core::db::history_repo::ECOUTE_DE_MUSIQUE
+            ),
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
         .ou_defaut_journalise()
@@ -405,10 +420,17 @@ async fn wrapped(
 /// dans les vues par période (heatmap, historique par jour, rétrospective
 /// annuelle), qui restent sur `listen_history` seul. La réponse le dit
 /// (`imported_plays`).
+///
+/// `musique` (#8645) vaut 1 quand la ligne compte dans les classements par
+/// artiste, album ou titre ([`tune_core::db::history_repo::ECOUTE_DE_MUSIQUE`]) :
+/// 0 pour un épisode de podcast, dont `artist_name` et `album_title` portent le
+/// nom de l'émission. Il compte dans les totaux, pas dans les classements.
 const ECOUTES_TOUS_TEMPS: &str = "SELECT title, artist_name, album_title, 1 AS n, \
-     duration_ms AS duree FROM listen_history WHERE COALESCE(source, '') <> 'radio' \
+     duration_ms AS duree, \
+     CASE WHEN COALESCE(source, '') <> 'podcast' THEN 1 ELSE 0 END AS musique \
+     FROM listen_history WHERE COALESCE(source, '') <> 'radio' \
      UNION ALL \
-     SELECT t.title, a.name, al.title, ip.play_count, 0 \
+     SELECT t.title, a.name, al.title, ip.play_count, 0, 1 \
      FROM imported_plays ip JOIN tracks t ON t.id = ip.track_id \
      LEFT JOIN artists a ON a.id = t.artist_id \
      LEFT JOIN albums al ON al.id = t.album_id \
@@ -422,7 +444,7 @@ fn query_top_artists(
         .query_many(
             &format!(
                 "SELECT e.artist_name, CAST(SUM(e.n) AS BIGINT) AS plays \
-                 FROM ({ECOUTES_TOUS_TEMPS}) e WHERE e.artist_name IS NOT NULL \
+                 FROM ({ECOUTES_TOUS_TEMPS}) e WHERE e.artist_name IS NOT NULL AND e.musique = 1 \
                  GROUP BY e.artist_name ORDER BY plays DESC LIMIT ?"
             ),
             &[&limit as &dyn ToSqlValue],
@@ -448,7 +470,7 @@ fn query_top_albums(
         .query_many(
             &format!(
                 "SELECT e.album_title, e.artist_name, CAST(SUM(e.n) AS BIGINT) AS plays \
-                 FROM ({ECOUTES_TOUS_TEMPS}) e WHERE e.album_title IS NOT NULL \
+                 FROM ({ECOUTES_TOUS_TEMPS}) e WHERE e.album_title IS NOT NULL AND e.musique = 1 \
                  GROUP BY e.album_title, e.artist_name ORDER BY plays DESC LIMIT ?"
             ),
             &[&limit as &dyn ToSqlValue],
@@ -475,7 +497,7 @@ fn query_top_tracks(
         .query_many(
             &format!(
                 "SELECT e.title, e.artist_name, CAST(SUM(e.n) AS BIGINT) AS plays \
-                 FROM ({ECOUTES_TOUS_TEMPS}) e \
+                 FROM ({ECOUTES_TOUS_TEMPS}) e WHERE e.musique = 1 \
                  GROUP BY e.title, e.artist_name ORDER BY plays DESC LIMIT ?"
             ),
             &[&limit as &dyn ToSqlValue],

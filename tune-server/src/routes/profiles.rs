@@ -703,6 +703,7 @@ async fn add_streaming_favorite(
             isrc: body.isrc.clone(),
             created_at: None,
             annee_qualite: Default::default(),
+            album_ref: None,
         };
         return match tune_core::streaming::favorites_mirror::ajouter(&arc, &state.backend, id, &fav)
             .await
@@ -1067,8 +1068,10 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
         .query_many(
             &format!(
                 "SELECT artist_name, COUNT(*) as plays FROM listen_history \
-                 WHERE {profile_filter} AND artist_name IS NOT NULL \
-                 GROUP BY artist_name ORDER BY plays DESC LIMIT 10"
+                 WHERE {profile_filter} AND artist_name IS NOT NULL AND {d_artiste} \
+                 GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
+                // #8645 — ni l'émission d'un podcast, ni une radio.
+                d_artiste = tune_core::db::history_repo::ECOUTE_DE_MUSIQUE,
             ),
             &[],
         )
@@ -1086,8 +1089,10 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
         .query_many(
             &format!(
                 "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
-                 WHERE {profile_filter} \
-                 GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10"
+                 WHERE {profile_filter} AND {musique} \
+                 GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10",
+                // #8645 — ni radio, ni épisode de podcast.
+                musique = tune_core::db::history_repo::ECOUTE_DE_MUSIQUE,
             ),
             &[],
         )

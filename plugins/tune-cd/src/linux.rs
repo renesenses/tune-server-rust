@@ -276,6 +276,24 @@ impl LecteurLinux {
     }
 }
 
+/// #8141 — le premier lecteur optique de `dossier` (`/dev`) que ce compte n'a
+/// pas le droit d'ouvrir, avec son groupe propriétaire.
+pub fn premier_lecteur_refuse(dossier: &Path) -> Option<crate::lecteur::AccesRefuse> {
+    use std::os::unix::fs::MetadataExt;
+    peripheriques_optiques(dossier)
+        .into_iter()
+        .find_map(|chemin| {
+            let ouverture = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&chemin)
+                .map(drop)
+                .map_err(|e| e.kind());
+            let groupe = std::fs::metadata(&chemin).ok().map(|m| m.gid());
+            crate::lecteur::acces_refuse(&chemin, ouverture, groupe)
+        })
+}
+
 /// Tous les lecteurs optiques de `dossier` (`/dev`) : les `srN`, dans l'ordre
 /// de N (`sr2` avant `sr10`). Fil 2135 : seul `/dev/sr0..3` était regardé,
 /// et seul le premier présent était gardé.
@@ -596,6 +614,37 @@ mod tests {
             ["sr0", "sr1", "sr4", "sr10"].map(|n| format!("{d}/{n}"))
         );
         assert!(peripheriques_optiques(&dossier.join("absent")).is_empty());
+    }
+
+    /// #8141 — LE TÉMOIN : un `/dev/sr0` branché que ce compte ne peut pas
+    /// ouvrir est NOMMÉ, au lieu de passer pour « aucun lecteur ».
+    #[test]
+    fn le_temoin_un_lecteur_interdit_est_nomme() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: lecture de l'uid effectif, sans effet de bord.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("root ouvre tout : #8141 ne se reproduit pas, cas sauté");
+            return;
+        }
+        let dossier = tune_core::test_scratch::scratch_dir("cd-8141-dev");
+        let sr0 = dossier.join("sr0");
+        std::fs::write(&sr0, b"").unwrap();
+        std::fs::set_permissions(&sr0, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refus = premier_lecteur_refuse(&dossier);
+        // Remis lisible : le dossier jetable doit pouvoir s'effacer.
+        std::fs::set_permissions(&sr0, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let refus = refus.expect("un sr0 interdit doit être nommé");
+        assert_eq!(refus.lecteur, sr0.to_string_lossy());
+        assert!(refus.groupe.is_some(), "{refus:?}");
+    }
+
+    /// Le témoin dans l'autre sens : un lecteur qui s'ouvre n'est pas refusé.
+    #[test]
+    fn le_temoin_un_lecteur_ouvrable_n_est_pas_refuse() {
+        let dossier = tune_core::test_scratch::scratch_dir("cd-8141-ouvrable");
+        std::fs::write(dossier.join("sr0"), b"").unwrap();
+        assert_eq!(premier_lecteur_refuse(&dossier), None);
+        assert_eq!(premier_lecteur_refuse(&dossier.join("absent")), None);
     }
 
     #[test]

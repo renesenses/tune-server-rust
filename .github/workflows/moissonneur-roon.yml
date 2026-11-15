@@ -76,7 +76,9 @@ jobs:
       - name: Outils musl
         if: runner.os == 'Linux'
         timeout-minutes: 10
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          bash scripts/ci/apt-robuste.sh
+          sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
         shell: bash

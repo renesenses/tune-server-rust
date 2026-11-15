@@ -612,3 +612,164 @@ fn radio_reelle_de_reference() {
     assert!(cadence > 0 && canaux > 0);
     eprintln!("radio de référence : {cadence} Hz, {canaux} canaux");
 }
+
+// ── #8443 : lectures courtes et coupure du CDN ─────────────────────────────
+
+/// Un FLAC 44,1 kHz / 16 bits stéréo de 2 s (sinus et bruit déterministe),
+/// fabriqué par l'encodeur du dépôt.
+fn flac_2s() -> Vec<u8> {
+    let trames = 44_100 * 2;
+    let mut pcm = Vec::with_capacity(trames * 4);
+    let mut graine: u32 = 0x8443;
+    for i in 0..trames {
+        let t = i as f64 / 44_100.0;
+        for voie in 0..2 {
+            graine = graine.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let bruit = ((graine >> 20) as f64 / 4096.0 - 0.5) * 0.02;
+            let f = if voie == 0 { 440.0 } else { 660.0 };
+            let v = (std::f64::consts::TAU * f * t).sin() * 0.5 + bruit;
+            pcm.extend_from_slice(&((v * i16::MAX as f64) as i16).to_le_bytes());
+        }
+    }
+    let mut encodeur = crate::audio::encoder::AudioEncoder::new("flac", 44_100, 16, 2);
+    encodeur.start_sync().expect("début FLAC");
+    encodeur.write_sync(&pcm).expect("écriture FLAC");
+    encodeur.finish_sync().expect("fin FLAC")
+}
+
+/// Ce que sert [`serveur_par_morceaux`].
+#[derive(Clone, Copy)]
+enum Service {
+    /// Le corps entier, ses `tete` premiers octets écrits par morceaux de
+    /// `taille`, chacun poussé seul sur le réseau.
+    ParMorceaux { taille: usize, tete: usize },
+    /// Le premier octet, puis la connexion fermée, avec la longueur entière
+    /// annoncée : le cas réel de Qobuz (« 66 », 328 084 816 annoncés).
+    CoupeApresUnOctet,
+}
+
+/// Un serveur HTTP/1.1 qui sert `corps` en `audio/flac` selon `service`.
+async fn serveur_par_morceaux(corps: Vec<u8>, service: Service) -> String {
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port d'essai");
+    let adresse = ecoute.local_addr().expect("adresse");
+    let corps = Arc::new(corps);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut flux, _)) = ecoute.accept().await else {
+                return;
+            };
+            let _ = flux.set_nodelay(true);
+            let corps = corps.clone();
+            tokio::spawn(async move {
+                let mut tampon = vec![0u8; 8192];
+                let mut lu = 0;
+                loop {
+                    let Ok(n) = flux.read(&mut tampon[lu..]).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    lu += n;
+                    if tampon[..lu].windows(4).any(|w| w == b"\r\n\r\n") || lu == tampon.len() {
+                        break;
+                    }
+                }
+                let entete = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/flac\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    corps.len()
+                );
+                if flux.write_all(entete.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = flux.flush().await;
+                match service {
+                    Service::CoupeApresUnOctet => {
+                        let _ = flux.write_all(&corps[..1]).await;
+                        let _ = flux.flush().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Service::ParMorceaux { taille, tete } => {
+                        let tete = tete.min(corps.len());
+                        for morceau in corps[..tete].chunks(taille) {
+                            if flux.write_all(morceau).await.is_err() {
+                                return;
+                            }
+                            let _ = flux.flush().await;
+                            // Chaque morceau part seul : le client le lit seul.
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                        let _ = flux.write_all(&corps[tete..]).await;
+                    }
+                }
+                let _ = flux.shutdown().await;
+            });
+        }
+    });
+    format!("http://{adresse}/piste.flac")
+}
+
+#[tokio::test]
+async fn un_flac_servi_par_morceaux_d_un_octet_se_decode() {
+    let url = serveur_par_morceaux(
+        flac_2s(),
+        Service::ParMorceaux {
+            taille: 1,
+            tete: 1024,
+        },
+    )
+    .await;
+    let d = sonder_un_flux(&flux(url, "FLAC"))
+        .await
+        .expect("#8443 : des lectures d'un octet doivent être cumulées avant la sonde du format");
+    assert_eq!((d.sample_rate, d.channels), (44_100, 2));
+}
+
+#[tokio::test]
+async fn un_flac_servi_par_morceaux_de_sept_octets_se_decode() {
+    let url = serveur_par_morceaux(
+        flac_2s(),
+        Service::ParMorceaux {
+            taille: 7,
+            tete: 4096,
+        },
+    )
+    .await;
+    let d = sonder_un_flux(&flux(url, "FLAC"))
+        .await
+        .expect("#8443 : des lectures de 7 octets doivent être cumulées avant la sonde du format");
+    assert_eq!((d.sample_rate, d.channels), (44_100, 2));
+}
+
+#[tokio::test]
+async fn un_cdn_qui_coupe_apres_un_octet_rougit_en_http_coupe_et_non_en_decodage() {
+    let corps = flac_2s();
+    let annonce = corps.len();
+    let url = serveur_par_morceaux(corps, Service::CoupeApresUnOctet).await;
+    let echec = sonder_un_flux(&flux(format!("{url}?sig=SECRET8443"), "FLAC"))
+        .await
+        .expect_err("un octet seul ne se décode pas");
+    assert_eq!(
+        echec.cause,
+        Cause::Http,
+        "#8443 : une coupure du CDN n'est pas un défaut de décodage : {echec:?}"
+    );
+    for attendu in [
+        format!("flux coupé après 1 octets sur {annonce} annoncés"),
+        "premiers octets : 66".to_string(),
+        "octets lus : 1".to_string(),
+    ] {
+        assert!(
+            echec.detail.contains(&attendu),
+            "#8443 : le détail doit contenir « {attendu} » : {}",
+            echec.detail
+        );
+    }
+    assert!(
+        !echec.detail.contains("SECRET8443") && !echec.detail.contains("127.0.0.1"),
+        "l'adresse signée ne part jamais dans le détail : {}",
+        echec.detail
+    );
+}

@@ -27,6 +27,11 @@ use super::negociation_format_exclusif_3837::{
     CandidatFormat, ResultatSonde, message_peripherique_occupe,
 };
 #[cfg(target_os = "windows")]
+use super::rendu_sans_bridage_8696::{
+    CompteursSession, Episode, PersistanceDesRetards, RESOLUTION_MINUTEUR_MS,
+    THREAD_POWER_THROTTLING, inscrire_session, refus_du_bridage,
+};
+#[cfg(target_os = "windows")]
 use super::reveil_en_retard_4357::{Reveil, SuiviDesReveils, microsecondes, tache_mmcss_utf16};
 #[cfg(target_os = "windows")]
 use super::reveil_rendu_4357::{ATTENTE_RENDU_MS, ReveilRendu, reveil_rendu};
@@ -194,6 +199,32 @@ mod ffi {
         /// #4357 — l'horloge des réveils de la boucle de rendu.
         pub fn QueryPerformanceCounter(lpPerformanceCount: *mut i64) -> i32;
         pub fn QueryPerformanceFrequency(lpFrequency: *mut i64) -> i32;
+        /// #8696 — refuser le bridage d'énergie (EcoQoS) au fil de rendu.
+        pub fn GetCurrentThread() -> HANDLE;
+        pub fn SetThreadInformation(
+            hThread: HANDLE,
+            ThreadInformationClass: i32,
+            ThreadInformation: *const c_void,
+            ThreadInformationSize: u32,
+        ) -> i32;
+        /// #8696 — le cœur qui exécute le fil, au premier retard grave.
+        pub fn GetCurrentProcessorNumberEx(ProcNumber: *mut PROCESSOR_NUMBER);
+    }
+
+    /// #8696 — `PROCESSOR_NUMBER` (winnt.h).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct PROCESSOR_NUMBER {
+        pub Group: WORD,
+        pub Number: u8,
+        pub Reserved: u8,
+    }
+
+    // #8696 — la résolution du minuteur pendant la lecture.
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        pub fn timeBeginPeriod(uPeriod: u32) -> u32;
+        pub fn timeEndPeriod(uPeriod: u32) -> u32;
     }
 
     // #4357 — MMCSS : le fil de rendu passe dans la tâche « Pro Audio ».
@@ -685,6 +716,8 @@ pub struct WasapiExclusiveOutput {
     channels: u32,
     ring: Arc<NativePcmRing>,
     paused: Arc<AtomicBool>,
+    #[cfg(target_os = "windows")]
+    silence: Arc<super::silence_avant_liberation_6133::SilenceAvantLiberation>,
     /// #7264 — le volume effectif de la zone, appliqué par le fil de rendu
     /// aux mots tirés de l'anneau (`pop_pcm_bytes_au_gain`). `None` : rendu
     /// à l'unité, identique au bit près à la sérialisation seule.
@@ -1138,6 +1171,7 @@ impl WasapiExclusiveOutput {
                 ring,
                 paused,
                 volume_au_rendu: None,
+                silence: Arc::new(Default::default()),
                 audio_client,
                 render_client,
                 event_handle: event,
@@ -1182,6 +1216,8 @@ impl WasapiExclusiveOutput {
             self.channels,
         );
 
+        let mut dop = crate::audio::dop_continu::SuiviDoP::new(self.channels as u16);
+
         // Exclusive event-driven rendering uses two endpoint buffers. Prime
         // the first one completely before Start so the driver never begins on
         // an unowned/uninitialised buffer. The producer may not have reached
@@ -1203,13 +1239,15 @@ impl WasapiExclusiveOutput {
             let buffer_bytes =
                 (self.buffer_frame_count * self.channels * (self.bit_depth / 8)) as usize;
             let out = std::slice::from_raw_parts_mut(buf, buffer_bytes);
-            let written = if self.paused.load(Ordering::Relaxed) {
-                0
-            } else {
-                self.ring
-                    .pop_pcm_bytes_au_gain(out, self.bit_depth as u16, &mut gain)
-            };
-            out[written..].fill(0);
+            super::dop_au_rendu_7704::rendre_octets(
+                &self.ring,
+                out,
+                self.bit_depth as u16,
+                &mut gain,
+                &mut dop,
+                self.silence
+                    .doit_se_taire(self.paused.load(Ordering::Relaxed)),
+            );
 
             let release_buffer: ReleaseBufferFn = std::mem::transmute(*vtable.add(4));
             let hr = release_buffer(self.render_client, self.buffer_frame_count, 0);
@@ -1234,6 +1272,7 @@ impl WasapiExclusiveOutput {
 
         let ring = self.ring.clone();
         let paused = self.paused.clone();
+        let silence = self.silence.clone();
         let running = self.running.clone();
         let render_client = self.render_client as usize; // Send as usize (pointer)
         let event_handle = self.event_handle as usize;
@@ -1250,6 +1289,8 @@ impl WasapiExclusiveOutput {
         let late_wakeups = self.late_wakeups.clone();
         let max_wakeup_gap_us = self.max_wakeup_gap_us.clone();
         let period_100ns = self.period_100ns;
+        // #8696 — le nom de l'appareil, pour le relevé de la session en cours.
+        let peripherique = self.device_name.clone();
 
         let handle = std::thread::spawn(move || {
             const S_OK_LOCAL: i32 = 0;
@@ -1297,6 +1338,38 @@ impl WasapiExclusiveOutput {
                 );
             }
 
+            // #8696 — refuser le bridage d'énergie (EcoQoS / Power Throttling).
+            // Sur un processeur hybride, Windows peut placer un fil jugé peu
+            // important sur un cœur lent ou à fréquence réduite, MMCSS ou
+            // non : fil 2805, réveils ~39 ms en retard une session sur deux,
+            // guéris par arrêt/relance (le fil est recréé). Un refus (Windows
+            // antérieur à 10 1709) ne coûte que la ligne de journal.
+            let etat_bridage = refus_du_bridage();
+            let bridage_refuse = unsafe {
+                ffi::SetThreadInformation(
+                    ffi::GetCurrentThread(),
+                    THREAD_POWER_THROTTLING,
+                    &etat_bridage as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of_val(&etat_bridage) as u32,
+                )
+            } != 0;
+            if bridage_refuse {
+                info!(
+                    "wasapi_exclusive_bridage_energie_refuse — EcoQoS désactivé pour le fil de rendu (#8696)"
+                );
+            } else {
+                let code = unsafe { ffi::GetLastError() };
+                warn!(
+                    code,
+                    "wasapi_exclusive_bridage_energie_non_refuse — SetThreadInformation(ThreadPowerThrottling) a échoué (#8696)"
+                );
+            }
+            // #8696 — résolution du minuteur à 1 ms tant que le fil joue,
+            // rendue à sa sortie. Ne touche pas au réveil par l'événement du
+            // pilote ; réduit la granularité de l'ordonnanceur quand Windows
+            // l'a relâchée.
+            let minuteur = unsafe { ffi::timeBeginPeriod(RESOLUTION_MINUTEUR_MS) } == 0;
+
             // #4357 — l'horloge des réveils. Sans fréquence lisible, pas de
             // mesure : la lecture, elle, ne dépend jamais de ce suivi.
             let mut frequence: i64 = 0;
@@ -1305,6 +1378,22 @@ impl WasapiExclusiveOutput {
             } else {
                 None
             };
+
+            // #8696 — un épisode de retards qui dure, et la session en cours
+            // inscrite au relevé du rapport de bogue tant que le fil vit.
+            let mut persistance = PersistanceDesRetards::nouveau(frequence);
+            let persistant = Arc::new(AtomicBool::new(false));
+            let mut premier_retard_grave = true;
+            let _inscription = inscrire_session(CompteursSession {
+                peripherique,
+                periode_us: u64::try_from(period_100ns / 10).unwrap_or(0),
+                reveils_en_retard: late_wakeups.clone(),
+                ecart_max_us: max_wakeup_gap_us.clone(),
+                underruns: underruns.clone(),
+                deadline_misses: deadline_misses.clone(),
+                persistant: persistant.clone(),
+                bridage_refuse: Some(bridage_refuse),
+            });
 
             while running.load(Ordering::SeqCst) {
                 let wait_result =
@@ -1324,13 +1413,15 @@ impl WasapiExclusiveOutput {
                 // #4357 — l'instant du réveil, comparé au précédent. La ligne
                 // de journal éventuelle attend que le tampon soit rendu.
                 let mut retard_a_journaliser: Option<u64> = None;
+                let mut persistance_a_journaliser: Option<u64> = None;
                 if let Some(suivi) = suivi.as_mut() {
                     let mut maintenant: i64 = 0;
                     if unsafe { ffi::QueryPerformanceCounter(&mut maintenant) } != 0 {
-                        match suivi.observer(maintenant as u64) {
-                            Reveil::Premier | Reveil::AHeure => {}
+                        let en_retard = match suivi.observer(maintenant as u64) {
+                            Reveil::Premier | Reveil::AHeure => false,
                             Reveil::EnRetard { .. } => {
                                 late_wakeups.fetch_add(1, Ordering::Relaxed);
+                                true
                             }
                             Reveil::TresEnRetard {
                                 ecart_ticks,
@@ -1340,44 +1431,23 @@ impl WasapiExclusiveOutput {
                                 if journaliser {
                                     retard_a_journaliser = Some(ecart_ticks);
                                 }
+                                true
                             }
+                        };
+                        // #8696 — des retards sans répit pendant 10 s.
+                        if en_retard
+                            && let Some(p) = persistance.as_mut()
+                            && let Episode::DevientPersistant { duree_ticks } =
+                                p.retard(maintenant as u64)
+                        {
+                            persistant.store(true, Ordering::Relaxed);
+                            persistance_a_journaliser = Some(duree_ticks);
                         }
                         max_wakeup_gap_us.store(
                             microsecondes(suivi.ecart_max_ticks(), frequence),
                             Ordering::Relaxed,
                         );
                     }
-                }
-
-                if paused.load(Ordering::SeqCst) {
-                    unsafe {
-                        let mut buf: *mut u8 = std::ptr::null_mut();
-                        type GetBufferFn = unsafe extern "system" fn(
-                            *mut std::ffi::c_void,
-                            u32,
-                            *mut *mut u8,
-                        )
-                            -> i32;
-                        let vtable = *(render_client as *const *const *const std::ffi::c_void);
-                        let get_buf: GetBufferFn = std::mem::transmute(*vtable.add(3));
-                        let hr = get_buf(render_client, buffer_frame_count, &mut buf);
-                        if hr == S_OK_LOCAL {
-                            std::ptr::write_bytes(
-                                buf,
-                                0,
-                                (buffer_frame_count * frame_bytes) as usize,
-                            );
-                            type RelBufFn =
-                                unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> i32;
-                            let rel_buf: RelBufFn = std::mem::transmute(*vtable.add(4));
-                            if rel_buf(render_client, buffer_frame_count, 0) != S_OK_LOCAL {
-                                callback_errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                        } else {
-                            callback_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    continue;
                 }
 
                 unsafe {
@@ -1402,11 +1472,16 @@ impl WasapiExclusiveOutput {
                         buf,
                         (buffer_frame_count * frame_bytes) as usize,
                     );
-                    let written = ring.pop_pcm_bytes_au_gain(out_slice, bit_depth, &mut gain);
-                    if written < out_slice.len() {
+                    if super::dop_au_rendu_7704::rendre_octets(
+                        &ring,
+                        out_slice,
+                        bit_depth,
+                        &mut gain,
+                        &mut dop,
+                        silence.doit_se_taire(paused.load(Ordering::SeqCst)),
+                    ) {
                         underruns.fetch_add(1, Ordering::Relaxed);
                     }
-                    out_slice[written..].fill(0);
 
                     type RelBufFn =
                         unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> i32;
@@ -1424,7 +1499,34 @@ impl WasapiExclusiveOutput {
                         reveils_en_retard = suivi.reveils_en_retard(),
                         "wasapi_exclusive_reveil_tres_en_retard — plus de deux périodes entre deux réveils du fil de rendu (#4357)"
                     );
+                    // #8696 — le cœur qui exécute le fil, au premier retard
+                    // grave de la session : un cœur E le désignerait.
+                    if premier_retard_grave {
+                        premier_retard_grave = false;
+                        let mut coeur = ffi::PROCESSOR_NUMBER::default();
+                        unsafe { ffi::GetCurrentProcessorNumberEx(&mut coeur) };
+                        warn!(
+                            groupe = coeur.Group,
+                            coeur = coeur.Number,
+                            bridage_refuse,
+                            "wasapi_exclusive_coeur_au_premier_retard (#8696)"
+                        );
+                    }
                 }
+                if let Some(duree_ticks) = persistance_a_journaliser {
+                    warn!(
+                        duree_ms = microsecondes(duree_ticks, frequence) / 1_000,
+                        reveils_en_retard = late_wakeups.load(Ordering::Relaxed),
+                        ecart_max_us = max_wakeup_gap_us.load(Ordering::Relaxed),
+                        bridage_refuse,
+                        "wasapi_exclusive_reveils_en_retard_persistants — le fil de rendu WASAPI n'est plus réveillé à temps depuis plus de 10 s : coupures audibles probables. Arrêter puis relancer la lecture recrée le fil (#8696)"
+                    );
+                }
+            }
+
+            // #8696 — rendre la résolution du minuteur.
+            if minuteur {
+                unsafe { ffi::timeEndPeriod(RESOLUTION_MINUTEUR_MS) };
             }
 
             // #4357 — rendre la promotion MMCSS depuis le fil qui l'a obtenue.
@@ -1451,6 +1553,12 @@ impl WasapiExclusiveOutput {
     pub fn stop(&mut self) {
         if self.resources_released {
             return;
+        }
+        if self.running.load(Ordering::SeqCst) {
+            self.silence.taire_puis_liberer(
+                super::silence_avant_liberation_6133::BORNE_SILENCE_AVANT_LIBERATION,
+                || {},
+            );
         }
         let was_running = self.running.swap(false, Ordering::SeqCst);
 

@@ -390,6 +390,49 @@ pub async fn signal_path_sous_licence(
     .await
 }
 
+/// #8569 (reliquat de #8462, kiran, fil 2762) — une sortie qui ne règle pas
+/// le volume (`can_set_volume == false`) n'a pas d'étape « Volume » dans le
+/// chemin du signal.
+///
+/// Cas d'origine : le volume DÉCORATIF d'un Diretta UPnP Renderer, que #8538
+/// annonce non réglable. La zone garde le volume enregistré d'avant (50 %),
+/// que le curseur grisé ne permet plus de changer, et la branche sans sonde
+/// de [`build_signal_path_lang`] affichait « Volume du renderer 50 % » pour un
+/// niveau que l'appareil n'applique jamais. Décision du 12/11 : pas d'étape.
+///
+/// Même règle que les autres volumes fixes déjà en place : zone en volume
+/// fixe (`fixed_volume`) et PURE verrouillé (volume tenu à 100 %) ne
+/// produisent pas d'étape. Le constructeur ne voit pas les capacités de la
+/// sortie (elles vivent derrière le registre asynchrone des sorties) : la
+/// règle s'applique ici, à la sortie du constructeur, comme la licence de la
+/// correction de pièce. Sans capacités connues (sortie non enregistrée), rien
+/// ne change. L'étape était marquée intacte : le verdict ne bouge pas.
+pub fn sans_volume_d_une_sortie_non_reglable(
+    signal_path: Option<Value>,
+    capacites: Option<&tune_core::outputs::OutputCapabilities>,
+) -> Option<Value> {
+    let mut sp = signal_path?;
+    if capacites.is_some_and(|c| !c.can_set_volume) {
+        if let Some(etapes) = sp.get_mut("steps").and_then(Value::as_array_mut) {
+            etapes.retain(|e| e.get("name").and_then(Value::as_str) != Some("Volume"));
+        }
+    }
+    Some(sp)
+}
+
+/// [`sans_volume_d_une_sortie_non_reglable`] avec les capacités de la sortie
+/// enregistrée pour la zone (`output_device_id`), lues comme `GET /zones`
+/// les publie (`output_capabilities`).
+pub async fn signal_path_selon_la_sortie(
+    state: &AppState,
+    output_device_id: Option<&str>,
+    signal_path: Option<Value>,
+) -> Option<Value> {
+    signal_path.as_ref()?;
+    let capacites = super::output_capabilities(state, output_device_id).await;
+    sans_volume_d_une_sortie_non_reglable(signal_path, capacites.as_ref())
+}
+
 /// Description du traitement EQ réellement configuré, y compris le headroom
 /// automatique.
 ///
@@ -595,13 +638,15 @@ pub(super) fn zone_replaygain_step_lang(
     lang: &str,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     zone_id: i64,
-    track_id: Option<i64>,
+    piste: tune_core::audio::replaygain::PisteRg<'_>,
 ) -> Option<ReplayGainStep> {
     // PURE : le PCM atteint la sortie intact, le gain n'est jamais appliqué.
-    if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
+    if tune_core::audio::audiophile::zone_enabled(backend, zone_id)
+        || tune_core::audio::replaygain::service_contourne(backend, zone_id, piste)
+    {
         return None;
     }
-    replaygain_step_hors_pure_lang(lang, backend, track_id?)
+    replaygain_step_hors_pure_lang(lang, backend, piste)
 }
 
 /// L'étape ReplayGain telle qu'elle serait HORS PURE — le corps de
@@ -610,14 +655,15 @@ pub(super) fn zone_replaygain_step_lang(
 fn replaygain_step_hors_pure_lang(
     lang: &str,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
-    tid: i64,
+    piste: tune_core::audio::replaygain::PisteRg<'_>,
 ) -> Option<ReplayGainStep> {
     use tune_core::audio::replaygain::{
-        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_factor_with_peak,
-        stored_gain_source, stored_gain_with_peak,
+        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_de_piste, gain_factor_with_peak,
+        stored_gain_source,
     };
     let settings = ReplayGainSettings::load(backend);
-    let (gain, source, peak_kind) = stored_gain_with_peak(backend, tid, settings.mode)?;
+    // #8689 — un titre Qobuz / TIDAL : le gain que le service publie.
+    let (gain, source, peak_kind) = gain_de_piste(backend, piste, settings.mode)?;
     let (factor, retenue) = gain_factor_with_peak(gain, settings, peak_kind);
     let peak_headroom_db = peak_kind.headroom_db(settings);
     let alters_audio = (factor - 1.0).abs() > 1e-6;
@@ -638,7 +684,10 @@ fn replaygain_step_hors_pure_lang(
     // La provenance porte sur la granularité qui a fourni la valeur, pas sur
     // le mode demandé. Une base illisible ne doit rien inventer : on retombe
     // sur la description d'avant, sans mention d'origine.
-    let origin = stored_gain_source(backend, tid, source);
+    let origin = match piste.track_id {
+        Some(tid) => stored_gain_source(backend, tid, source),
+        None => Some(GainSource::StreamingService),
+    };
     let mut description = if refus {
         // Dire les DEUX choses : ce que les tags demandaient, et pourquoi ça
         // ne s'applique pas. Le gain demandé est celui du tag plus le
@@ -691,12 +740,12 @@ fn replaygain_step_hors_pure_lang(
 pub(super) fn replaygain_ignore_par_pure(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     zone_id: i64,
-    track_id: Option<i64>,
+    piste: tune_core::audio::replaygain::PisteRg<'_>,
 ) -> Option<Value> {
     if !tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
         return None;
     }
-    let rg = replaygain_step_hors_pure_lang("fr", backend, track_id?)?;
+    let rg = replaygain_step_hors_pure_lang("fr", backend, piste)?;
     if !rg.alters_audio {
         return None;
     }
@@ -715,15 +764,14 @@ pub(super) fn replaygain_ignore_par_pure(
 /// l'appelant.
 pub(super) fn replaygain_sans_gain_tague(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
-    track_id: Option<i64>,
+    piste: tune_core::audio::replaygain::PisteRg<'_>,
 ) -> Option<Value> {
-    use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSettings, stored_gain_with_peak};
+    use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSettings, gain_de_piste};
     let settings = ReplayGainSettings::load(backend);
-    if settings.mode == ReplayGainMode::Off {
+    if settings.mode == ReplayGainMode::Off || !piste.est_identifiee() {
         return None;
     }
-    let tid = track_id?;
-    if stored_gain_with_peak(backend, tid, settings.mode).is_some() {
+    if gain_de_piste(backend, piste, settings.mode).is_some() {
         return None;
     }
     Some(json!({
@@ -946,6 +994,8 @@ pub(super) fn zone_reaffectation_ignoree_lang(
 /// disent la même chose.
 pub(super) fn dsd_family_name(sample_rate: i32) -> &'static str {
     match sample_rate {
+        // #8248 — DSD1024 (45,2 / 49,2 MHz) se disait « DSD512 » (fil 2730).
+        r if r >= 44_000_000 => "DSD1024",
         r if r >= 22_000_000 => "DSD512",
         r if r >= 11_000_000 => "DSD256",
         r if r >= 5_000_000 => "DSD128",
@@ -961,6 +1011,54 @@ pub(super) fn dsd_resolution_label(sample_rate: i32) -> String {
         name = dsd_family_name(sample_rate),
         mhz = sample_rate as f64 / 1_000_000.0
     )
+}
+
+/// #8248 — la session sert-elle le flux DSD brut de la sortie locale native
+/// (ASIO, ALSA `DSD_U32`) ? Son MIME n'appartient qu'à elle.
+pub(super) fn est_le_flux_dsd_natif_local(mime_type: &str) -> bool {
+    mime_type.eq_ignore_ascii_case(tune_core::audio::dsd_brut::MIME)
+}
+
+/// #8248 — le pilote qui reçoit le DSD natif d'une sortie locale : ASIO sous
+/// Windows, ALSA (`DSD_U32`) ailleurs — les deux seuls bras natifs.
+pub(super) fn pilote_du_dsd_natif_local() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "ASIO"
+    } else {
+        "ALSA"
+    }
+}
+
+/// #8248 — l'étape « DSD natif » : « DSD128 natif (ALSA) ». Bit-perfect : les
+/// bits du fichier partent tels quels, rangés en mots de 32 bits.
+pub(super) fn etape_dsd_natif_local(lang: &str, sample_rate: i32) -> Value {
+    etape_dsd_natif(lang, sample_rate, pilote_du_dsd_natif_local())
+}
+
+/// L'étape « DSD natif » d'une voie nommée par `voie` (ALSA, ASIO, OAAT).
+pub(super) fn etape_dsd_natif(lang: &str, sample_rate: i32, voie: &str) -> Value {
+    json!({
+        "name": "Transcoder",
+        "code": "dsd_natif",
+        "description": fs(lang, "dsd_natif_local", &[dsd_family_name(sample_rate), voie]),
+        "bit_perfect": true,
+    })
+}
+
+/// #8647 (fil 2794) — la sortie OAAT de la zone sert-elle CE DSD en natif ?
+///
+/// La voie directe d'OAAT lit le `.dsf` et l'expédie en `DSD_U8` quand le
+/// récepteur le prend ; sinon elle lit le WAV préparé par l'orchestrateur.
+/// Seule la sortie le sait : elle le publie
+/// ([`tune_core::outputs::dsd_natif_oaat_8647`]) et on le lit ici.
+pub(super) fn dsd_natif_sur_la_sortie_oaat(
+    is_dsd: bool,
+    output_type: &str,
+    device_id: Option<&str>,
+) -> bool {
+    is_dsd
+        && output_type == "oaat"
+        && device_id.is_some_and(tune_core::outputs::dsd_natif_oaat_8647::est_actif)
 }
 
 /// « DSD64 over PCM (DoP) » — l'étage de sortie d'un DSD emballé en DoP
@@ -1212,7 +1310,12 @@ pub fn build_signal_path_lang(
 
     let output_type = zone.output_type.as_deref().unwrap_or("local");
 
-    let source = decrire_la_source(np, backend, wire, output_type);
+    let mut source = decrire_la_source(np, backend, wire, output_type);
+    // #8647 (fil 2794) — DSD256 vers OAAT affiché « → WAV 352 kHz/24 bits »
+    // pendant que le DAC recevait du DSD256 natif : la sortie, pas le
+    // réglage, dit ce qui part.
+    source.dsd_natif_oaat =
+        dsd_natif_sur_la_sortie_oaat(source.is_dsd, output_type, zone.output_device_id.as_deref());
     // Pour une sortie locale qui sait observer son dernier callback, le réel
     // prime sur toute déduction depuis les réglages. Les autres sorties
     // conservent le calcul historique jusqu'à ce qu'elles publient leur propre
@@ -1399,7 +1502,7 @@ pub fn build_signal_path_lang(
         // #5633 — PURE ignore le ReplayGain, et le dit : le gain que la piste
         // en cours recevrait hors PURE. Clé ABSENTE hors PURE ou sans gain.
         if pure
-            && let Some(rg) = replaygain_ignore_par_pure(backend, zone_id_courant, np.track_id)
+            && let Some(rg) = replaygain_ignore_par_pure(backend, zone_id_courant, np.piste_rg())
         {
             v["pure_replaygain_ignored"] = rg;
         }
@@ -1408,7 +1511,7 @@ pub fn build_signal_path_lang(
         // ReplayGain disparaissait sans un mot, et un préampli réglé
         // semblait sans effet. Clé ABSENTE sous PURE, en mode off ou quand
         // la piste a un gain.
-        if !pure && let Some(rg) = replaygain_sans_gain_tague(backend, np.track_id) {
+        if !pure && let Some(rg) = replaygain_sans_gain_tague(backend, np.piste_rg()) {
             v["replaygain_untagged"] = rg;
         }
         // #6946 — Spotify : le format et le débit reçus, et pourquoi pas
@@ -1493,10 +1596,44 @@ pub(super) fn etat_du_surechantillonneur_lang(
     if !reglages.enabled {
         return None;
     }
-    let (raison, cle) = if pure {
+    // #8259 — le réglage de zone survit à la désinstallation du greffon
+    // (configuration préservée). Greffon absent ou désactivé : rien ne
+    // tournera, à cette piste ni à la suivante ; pas de ligne.
+    if !tune_core::audio::premium_plugins::enabled(
+        &settings,
+        tune_core::audio::surechantillonnage::ID,
+    ) {
+        return None;
+    }
+    let refus_observe = transformations_reelles.and_then(|t| t.refus_surechantillonnage());
+    let (raison, cle) = if let Some(raison) = refus_observe.filter(|_| output_type == "local") {
+        (raison, texte_du_refus_surechantillonnage(raison))
+    } else if pure {
         ("pure", "upsampling_pure")
     } else if output_type != "local" {
-        ("output_not_supported", "upsampling_not_applied")
+        // #8149 — une zone réseau (DLNA, AirPlay…) n'a pas de
+        // suréchantillonneur : « à la piste suivante » y était faux, rien ne
+        // s'appliquera jamais. Le dire, avec la raison.
+        ("output_not_supported", "upsampling_zone_not_supported")
+    } else if tune_core::audio::bitperfect_strict::zone_enabled(backend, zone_id) {
+        // #8149 (GgB, fil 2742) — le « bit-perfect strict » de la zone refuse
+        // toute conversion de cadence : la sortie locale écarte le
+        // suréchantillonneur (`RefusDeCadenceDuGreffon::BitPerfectStrict`,
+        // même code). Le dire, au lieu du « non appliqué » muet qui promet
+        // la piste suivante.
+        ("strict_bitperfect", "upsampling_strict_bitperfect")
+    } else if tune_core::audio::frequence_fixe::active(backend, zone_id).is_some() {
+        // #8428 — la cadence fixe de la zone porte déjà la conversion : le
+        // greffon est écarté (`choix_du_surechantillonneur` dans dsp.rs), et
+        // le chemin du signal le dit au lieu d'un « non appliqué » muet.
+        ("fixed_rate", "upsampling_fixed_rate")
+    } else if tune_core::audio::surechantillonnage::verdict_enregistre(&settings).is_none() {
+        // #8259 — la raison que `choix_de_la_zone` donne, au lieu d'un
+        // « non appliqué » muet.
+        (
+            tune_core::audio::surechantillonnage::Ecarte::TestDeLaMachineAbsent.code(),
+            "upsampling_machine_test_missing",
+        )
     } else {
         ("not_applied", "upsampling_not_applied")
     };
@@ -1509,6 +1646,29 @@ pub(super) fn etat_du_surechantillonneur_lang(
             "bit_perfect": true,
         }),
     ))
+}
+
+/// #8259 — codes observés, sans déduire une cause du seul réglage actuel.
+fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
+    match raison {
+        "fixed_rate" => "upsampling_fixed_rate",
+        "pure" => "upsampling_pure",
+        "strict_bitperfect" => "upsampling_strict",
+        "disabled" => "upsampling_disabled_at_open",
+        "plugin_not_installed" => "upsampling_plugin_absent_at_open",
+        "premium_required" => "upsampling_premium_required",
+        "machine_test_missing" => "upsampling_machine_test_missing",
+        "rates_not_measured" => "upsampling_rates_not_measured",
+        "no_candidate_rate_accepted_by_device" => "upsampling_device_rates",
+        "machine_test_rejects_accepted_rates" => "upsampling_machine_rates",
+        "settings_caps_exclude_admitted_rates" => "upsampling_settings_caps",
+        "source_rate_unknown" | "source_probe_incomplete" => "upsampling_source_unknown",
+        "output_path_not_supported" => "upsampling_output_path",
+        "dop" => "upsampling_dop",
+        "multiple_outputs" => "upsampling_multiple_outputs",
+        "output_rate_open_failed" | "filter_initialization_failed" => "upsampling_opening_failed",
+        _ => "upsampling_not_applied",
+    }
 }
 
 /// #6946 — pose la raison du plafond de librespot sur l'étape Source et la
@@ -1702,6 +1862,9 @@ fn assembler_les_etapes_lang(
         canaux_source,
         canaux_du_fil,
         dst_reconstruit_en_dsf,
+        dsd_natif_local,
+        dsd_natif_oaat,
+        variante_hls_refusee,
         ..
     } = analyse.source;
     let Traitements {
@@ -1728,6 +1891,8 @@ fn assembler_les_etapes_lang(
         oaat_transcodes,
         wire_wav,
         max_sample_rate,
+        cadence_pcm_servie,
+        cadence_fixe_demandee,
         // #4354 — la description des étapes n'en a pas besoin : le drapeau ne
         // sert qu'au verdict de transport et au badge PURE.
         dsd_decime_en_pcm: _,
@@ -1762,6 +1927,16 @@ fn assembler_les_etapes_lang(
         "description": source_desc,
         "bit_perfect": true,
     })];
+    // #7802 — une radio HLS repliée sur une variante plus basse le DIT : le
+    // diffuseur a refusé la qualité au-dessus (souvent une restriction
+    // géographique), et l'auditeur sait pourquoi il reçoit 96 et non 320.
+    if let Some(refus) = variante_hls_refusee {
+        steps[0]["detail"] = json!(fs(
+            lang,
+            "hls_variant_refused",
+            &[&refus.bande_kbps.to_string(), &refus.statut.to_string()]
+        ));
+    }
     // #4346 — l'étape qui nomme un codec inconnu le DIT par un code stable.
     let marquer_codec_inconnu = |etape: &mut Value| {
         if !codec_connu {
@@ -1804,10 +1979,24 @@ fn assembler_les_etapes_lang(
     // conteneur 32 bits à la cadence de la source est reconnu : un fil WAV
     // 16 bits (radio tronquée, #4346) ou à une autre cadence (plafond de
     // fréquence) reste une vraie conversion, et garde son étape.
+    //
+    // #8629 (fil 2789, radio FLAC 96/24 vers un RME ADI-2 en ALSA) — le
+    // conteneur 32 bits n'est pas le seul fil intact : une radio sans perte
+    // décodée en WAV 24 bits à sa cadence porte exactement les échantillons
+    // de la source. Seule la règle LPCM 16 bits du DLNA la jugeait, et le
+    // panneau affichait une étape orange « FLAC 96kHz/24bit → FLAC
+    // 96kHz/24bit ». Un fil d'une profondeur au moins égale à celle d'une
+    // source sans perte, à la même cadence, est donc lui aussi le conteneur
+    // interne. Un fil plus étroit (24 → 16 bits) ou une source avec perte
+    // (profondeur inconnue) garde son étape.
+    let profondeur_preservee = wire_bit_depth == Some(32)
+        || (is_lossless
+            && bit_depth > 0
+            && wire_bit_depth.is_some_and(|b| i32::from(b) >= bit_depth));
     let conteneur_local_interne = wire_wav
         && output_type == "local"
         && !is_dsd
-        && wire_bit_depth == Some(32)
+        && profondeur_preservee
         && wire_sample_rate.is_none_or(|r| r as i64 == sample_rate as i64);
     let wire_transcode = wire_wav && !matches!(format_name, "WAV") && !conteneur_local_interne;
     let transcode_active = needs_transcode_for_output
@@ -1838,7 +2027,29 @@ fn assembler_les_etapes_lang(
         && !transcode_active
         && !dsp_applique
         && replaygain_step.is_none();
-    if !is_dsd && !decode_par_la_sortie {
+    // #8462 (kiran, fil 2762, renderer « Diretta UPnP ») — décision de
+    // Bertrand du 11/11 : même règle sur une sortie DLNA ou UPnP (OpenHome)
+    // en PASSTHROUGH. Le FLAC part tel quel et c'est le renderer qui le
+    // décode ; « Decoder FLAC » prêtait ce décodage à Tune. L'étape reste dès
+    // que Tune décode lui-même : transcodage (WAV forcé, plafond LPCM 16 bits,
+    // repli WAV du fil, conteneur réécrit), rééchantillonnage, DSP,
+    // ReplayGain, compensation de niveau, crossfeed, réaffectation de canaux,
+    // correction de pièce. Une radio garde son décodeur : son fil n'est pas
+    // forcément l'octet de la source (HLS, relais). Spotify aussi : librespot
+    // décode l'Ogg Vorbis dans Tune, même avant que le fil soit connu.
+    let decode_par_le_renderer = matches!(output_type, "dlna" | "openhome")
+        && !transcode_active
+        && !dsp_applique
+        && replaygain_step.is_none()
+        && !resampling_active
+        && compensation_reseau_db.is_none()
+        && !crossfeed_du_flux
+        && reaffectation_step.is_none()
+        && !correction_piece.as_ref().is_some_and(|cp| cp.applied)
+        && ps.now_playing.as_ref().is_none_or(|np| {
+            np.source != "radio" && np.source != tune_core::streaming::spotify_lecture::SOURCE
+        });
+    if !is_dsd && !decode_par_la_sortie && !decode_par_le_renderer {
         let mut decodeur = json!({
             "name": "Decoder",
             "description": format_name,
@@ -1849,6 +2060,10 @@ fn assembler_les_etapes_lang(
         // a pu s'intercaler.
         steps.insert(1, decodeur);
     }
+    // #8428 — un DSD décimé DANS SA FAMILLE puis rééchantillonné vers une
+    // cadence fixe hors famille (DSD64 → 88,2 kHz → 48 kHz) : les deux
+    // étapes sont nommées, la seconde par l'étape « Resampler » plus bas.
+    let mut dsd_reechantillonne: Option<(u32, u32)> = None;
     if transcode_active {
         // OAAT lossless PCM → WAV preserves all audio data, but DSD → WAV is a
         // lossy domain conversion (see the "oaat" transport arm above). A DLNA
@@ -1912,8 +2127,24 @@ fn assembler_les_etapes_lang(
         // `dsd_mode`, qui dit ce qui a été demandé (#1595).
         let dop_sur_le_fil =
             is_dsd && ps.dop_active && !is_dsd_resolution(out_sample_rate, out_bit_depth);
+        if is_dsd
+            && !dop_sur_le_fil
+            && sample_rate > 0
+            && out_sample_rate > 0
+            && !is_dsd_resolution(out_sample_rate, out_bit_depth)
+        {
+            let decimee = tune_core::audio::dsd_to_pcm::cadence_de_decimation(
+                sample_rate as u32,
+                out_sample_rate as u32,
+            );
+            if decimee != out_sample_rate as u32 {
+                dsd_reechantillonne = Some((decimee, out_sample_rate as u32));
+            }
+        }
         let out_desc = if dop_sur_le_fil {
             dop_stage_label(sample_rate)
+        } else if let Some((decimee, _)) = dsd_reechantillonne {
+            output_stage_label("PCM", decimee as i32, out_bit_depth)
         } else {
             output_stage_label(output_format_name, out_sample_rate, out_bit_depth)
         };
@@ -1949,6 +2180,34 @@ fn assembler_les_etapes_lang(
         {
             etape["code"] = json!("dsd_dop_ecarte");
             etape["detail"] = json!(ecart.raison());
+        }
+        if is_oaat
+            && is_dsd
+            && !dop_sur_le_fil
+            && let Some(repli) = zone
+                .output_device_id
+                .as_deref()
+                .and_then(tune_core::outputs::repli_dsd_oaat_8486::lire)
+                .and_then(|e| e.repli)
+        {
+            use tune_core::outputs::repli_dsd_oaat_8486::Raison;
+            let source = repli
+                .dsd_rate
+                .map(|n| format!("DSD{n}"))
+                .unwrap_or_else(|| "DSD".into());
+            let maximum = repli
+                .dsd_max_rate
+                .map(|n| format!("DSD{n}"))
+                .unwrap_or_else(|| "DSD".into());
+            let detail = match repli.raison {
+                Raison::SansDsd => ts(lang, "oaat_dsd_absent").to_string(),
+                Raison::Plafond => fs(lang, "oaat_dsd_plafond", &[&source, &maximum]),
+                Raison::Conteneur => ts(lang, "oaat_dsd_conteneur").to_string(),
+                Raison::Cadence => ts(lang, "oaat_dsd_cadence").to_string(),
+            };
+            etape["code"] = json!("oaat_dsd_pcm_fallback");
+            etape["detail"] = json!(detail);
+            etape["dsd_fallback"] = json!(repli);
         }
         if flac_ffmpeg_vers_le_reseau {
             // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
@@ -1996,6 +2255,30 @@ fn assembler_les_etapes_lang(
     // c'est elle que le client affiche « 192 → 96 kHz, pas bit-perfect », et
     // elle qui fait dire « PURE dégradé » (`pure_degraded`).
     let mut rate_conversion: Option<(u32, u32)> = None;
+    if let Some((de, vers)) = dsd_reechantillonne {
+        rate_conversion = Some((de, vers));
+        steps.push(json!({
+            "name": "Resampler", "code": "rate_conversion",
+            "from_hz": de, "to_hz": vers,
+            "description": format!("{} kHz → {} kHz", de as f64 / 1000.0, vers as f64 / 1000.0),
+            "bit_perfect": false,
+        }));
+    } else if let Some(rate) = cadence_pcm_servie.filter(|rate| {
+        *rate != sample_rate as u32
+            && !reel.is_some_and(|t| {
+                t.reechantillonnage()
+                    && t.entree().cadence() == sample_rate as u32
+                    && t.ouvert().cadence == *rate
+            })
+    }) {
+        rate_conversion = Some((sample_rate as u32, rate));
+        steps.push(json!({
+            "name": "Resampler", "code": "rate_conversion",
+            "from_hz": sample_rate, "to_hz": rate,
+            "description": format!("{} kHz → {} kHz", sample_rate as f64 / 1000.0, rate as f64 / 1000.0),
+            "bit_perfect": false,
+        }));
+    }
     if let Some((t, (filtre, reserve_db))) = reel
         .filter(|t| t.reechantillonnage())
         .and_then(|t| t.surechantillonnage().map(|s| (t, s)))
@@ -2022,7 +2305,9 @@ fn assembler_les_etapes_lang(
             "description": fs(lang, "measured", &[&format!("{src_khz}kHz → {dst_khz}kHz")]),
             "bit_perfect": false,
         }));
-    } else if let Some(max_sr) = max_sample_rate.filter(|_| resampling_active) {
+    } else if let Some(max_sr) =
+        max_sample_rate.filter(|_| resampling_active && rate_conversion.is_none())
+    {
         // #5524 — la cadence SERVIE (même famille sous le plafond), celle
         // de la décision : 176,4 sous 96 s'annonce « → 88,2 kHz », pas 96.
         let cible =
@@ -2037,6 +2322,23 @@ fn assembler_les_etapes_lang(
             "to_hz": cible,
             "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz"),
             "bit_perfect": false,
+        }));
+    }
+
+    if !is_dsd
+        && let Some(demandee) = cadence_fixe_demandee
+        && let Some(appliquee) = reel
+            .map(|t| t.ouvert().cadence)
+            .or(cadence_pcm_servie)
+            .filter(|r| *r > 0)
+        && demandee != appliquee
+    {
+        steps.push(json!({
+            "name": ts(lang, "fixed_rate_limit_name"),
+            "code": "fixed_rate_limit",
+            "requested_hz": demandee, "applied_hz": appliquee,
+            "description": fs(lang, "fixed_rate_limit", &[&(demandee as f64 / 1000.0).to_string(), &(appliquee as f64 / 1000.0).to_string()]),
+            "bit_perfect": true,
         }));
     }
 
@@ -2076,7 +2378,17 @@ fn assembler_les_etapes_lang(
     // La sonde locale tranche si le gain a réellement été appliqué. Pour les
     // sorties sans sonde, conserver l'affichage historique fondé sur le
     // réglage de zone.
-    if let Some(runtime) = runtime_signal_path {
+    if dsd_natif_local {
+        // #8248 — DSD natif : aucun volume logiciel sur du 1 bit. L'étape le
+        // dit au lieu d'afficher un pourcentage qui n'est pas appliqué.
+        if !volume_full {
+            steps.push(json!({
+                "name": "Volume",
+                "description": ts(lang, "volume_dsd_natif"),
+                "bit_perfect": true,
+            }));
+        }
+    } else if let Some(runtime) = runtime_signal_path {
         match runtime.volume {
             // Le même fait ne peut pas être peint de deux couleurs selon la
             // plateforme : la branche sans sonde (macOS, Linux, navigateur,
@@ -2098,9 +2410,24 @@ fn assembler_les_etapes_lang(
             OutputVolumeState::Unity => {}
         }
     } else if !volume_full {
+        let pourcent = ((ui_volume * 100.0).round() as i32).to_string();
+        // #8462 (kiran, fil 2762) — sur une sortie réseau, le volume n'est pas
+        // dans le flux : c'est une commande (SetVolume) au renderer. « Volume
+        // 50% » se lisait comme un traitement de Tune. Le verdict ne change
+        // pas : l'étape était déjà marquée intacte. Le refus du volume par le
+        // renderer (502 sur PUT volume) n'est mémorisé par aucun état que ce
+        // calcul lit : seul le volume fixe (`fixed_volume`) retire l'étape
+        // ici. #8569 — une sortie qui annonce `can_set_volume == false`
+        // (volume décoratif Diretta, #8538) la perd en sortie de
+        // constructeur : `sans_volume_d_une_sortie_non_reglable`.
+        let description = if tune_core::orchestrator::is_network_output_type(Some(output_type)) {
+            fs(lang, "renderer_volume", &[&pourcent])
+        } else {
+            format!("Volume {pourcent}%")
+        };
         steps.push(json!({
             "name": "Volume",
-            "description": format!("Volume {}%", (ui_volume * 100.0).round() as i32),
+            "description": description,
             "bit_perfect": true,
         }));
     }
@@ -2379,6 +2706,16 @@ fn assembler_les_etapes_lang(
         }));
     }
 
+    // #8248 — DSD natif local : l'étage qui dit « DSD natif (ALSA) », là où
+    // un DoP dit « DSD64 over PCM (DoP) » (étape Transcoder, code `dop`).
+    if dsd_natif_local {
+        steps.push(etape_dsd_natif_local(lang, sample_rate));
+    }
+    // #8647 — même étage pour OAAT : « DSD256 natif (OAAT) ».
+    if dsd_natif_oaat {
+        steps.push(etape_dsd_natif(lang, sample_rate, "OAAT"));
+    }
+
     // Transport step
     steps.push(json!({
         "name": "Transport",
@@ -2474,15 +2811,18 @@ fn rendre_les_verdicts(
     // ouvert, c'est ELLE qui dit s'il y a eu rééchantillonnage — dans les
     // deux sens. Le plafond n'est plus qu'une prédiction, utile seulement
     // tant que personne n'a mesuré.
-    let resampling_active = match transformations_reelles {
-        Some(reel) => reel.reechantillonnage(),
-        None => {
-            !is_dsd
-                && forcages
-                    .max_sample_rate
-                    .is_some_and(|max| (sample_rate as u32) > max)
-        }
-    };
+    let resampling_active = forcages
+        .cadence_pcm_servie
+        .is_some_and(|rate| rate != sample_rate as u32)
+        || match transformations_reelles {
+            Some(reel) => reel.reechantillonnage(),
+            None => {
+                !is_dsd
+                    && forcages
+                        .max_sample_rate
+                        .is_some_and(|max| (sample_rate as u32) > max)
+            }
+        };
     // Un DSP ou une adaptation de canaux DÉCLARÉS par la sortie font tomber
     // le verdict, quoi que les réglages aient prédit ; leur absence ne le
     // relève jamais — la sortie n'observe pas ce que fait l'orchestrateur
@@ -2541,10 +2881,12 @@ fn rendre_les_verdicts(
     // hériter du chiffre de l'extrait.
     // #6821 — une radio n'a pas de fiche : son débit est celui qu'elle annonce
     // (`icy-br`), relevé à la connexion. Même filtre : jamais sur un FLAC.
+    // #7802 — le débit MESURÉ sur les trames (HLS) prime sur celui que la
+    // station déclare : la bande d'une liste maîtresse compte le conteneur.
     let bitrate_label = np
         .bitrate_kbps
-        .or(source.debit_radio_kbps)
         .or(source.debit_source_kbps)
+        .or(source.debit_radio_kbps)
         .filter(|kbps| *kbps > 0 && !is_lossless)
         .map(|kbps| format!(" {kbps} kbit/s"))
         .unwrap_or_default();
@@ -2859,6 +3201,9 @@ struct Forcages {
     /// Plafond de fréquence EFFECTIF : réglage de zone et catalogue d'appareils
     /// combinés en `min`, comme `resolve_local_track` (#3183).
     max_sample_rate: Option<u32>,
+    /// Cadence constatée dans la session PCM, avant le périphérique (#8428).
+    cadence_pcm_servie: Option<u32>,
+    cadence_fixe_demandee: Option<u32>,
     /// #4354 — le DSD est-il DÉCIMÉ en PCM multibit ?
     ///
     /// Vrai seulement pour une conversion de domaine réelle : ni le DSD servi
@@ -2884,6 +3229,7 @@ fn decider_les_forcages(
         is_dsd,
         sample_rate,
         bit_depth,
+        dsd_natif_oaat,
         ..
     } = *source;
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
@@ -2904,7 +3250,12 @@ fn decider_les_forcages(
     // envoyée telle quelle à un Eversolo DMP-A6 s'affichait « DSD128 5.6 MHz →
     // FLAC 5644kHz/1bit » : un transcodage qui n'a pas lieu, vers un conteneur
     // qui ne peut pas exister (#1315).
-    let dsd_passthrough = is_dsd && is_network_output && wire_carries_raw_dsd(wire);
+    //
+    // #8647 — OAAT n'est pas « réseau » au sens de ce fichier, et sa voie DSD
+    // native ne passe par aucune session : le WAV de la session n'est pas lu.
+    // Le constat de la sortie (`dsd_natif_oaat`) vaut passthrough.
+    let dsd_passthrough =
+        is_dsd && ((is_network_output && wire_carries_raw_dsd(wire)) || dsd_natif_oaat);
     // Un égaliseur ARMÉ n'atteint pas un flux DSD servi BRUT hors sortie
     // locale, et l'orchestrateur s'en abstient DÉLIBÉRÉMENT : convertir du DSD
     // natif en PCM pour y passer un EQ serait une dégradation décidée à la
@@ -2929,7 +3280,7 @@ fn decider_les_forcages(
     // « DSP contourné pour DoP » quand c'est le cas, et qui est plus juste que
     // toute déduction faite ici.
     let dsd_brut_hors_sortie_locale =
-        is_dsd && output_type != "local" && wire_carries_raw_dsd(wire);
+        is_dsd && output_type != "local" && (wire_carries_raw_dsd(wire) || dsd_natif_oaat);
     // « Armé » et « appliqué » ne sont pas la même chose.
     let dsp_applique = dsp_enabled && !dsd_brut_hors_sortie_locale;
     let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
@@ -3048,7 +3399,9 @@ fn decider_les_forcages(
     );
     // OAAT transcodes everything to WAV except WAV itself
     let is_oaat = output_type == "oaat";
+    // #8647 — sauf le DSD que la sortie sert en natif : rien n'est converti.
     let oaat_transcodes = is_oaat
+        && !dsd_natif_oaat
         && source_format
             .as_ref()
             .is_some_and(|f| *f != AudioFormat::Wav);
@@ -3080,6 +3433,9 @@ fn decider_les_forcages(
             is_network_output,
             &ZoneRepo::with_backend(backend.clone()).get_dsd_mode(zone_id),
         ) == tune_core::orchestrator::TransportDsd::Pcm;
+    let cadence_fixe_demandee = (!is_dsd)
+        .then(|| tune_core::audio::frequence_fixe::demandee_active(backend, zone_id))
+        .flatten();
     Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
@@ -3091,6 +3447,12 @@ fn decider_les_forcages(
         oaat_transcodes,
         wire_wav,
         max_sample_rate,
+        cadence_pcm_servie: wire
+            .filter(|w| {
+                !is_dsd && sample_rate > 0 && w.sample_rate > 0 && cadence_fixe_demandee.is_some()
+            })
+            .map(|w| w.sample_rate),
+        cadence_fixe_demandee,
         dsd_decime_en_pcm,
     }
 }
@@ -3163,7 +3525,7 @@ fn relever_les_traitements_lang(
     // ReplayGain effectivement appliqué à la piste en cours (#1627) : même
     // traitement que l'EQ — une étape dans le chemin, et le verdict bit-perfect
     // en tient compte. `None` en PURE, en mode off, ou sans gain stocké.
-    let replaygain_step = zone_replaygain_step_lang(lang, &backend, zid, np.track_id);
+    let replaygain_step = zone_replaygain_step_lang(lang, &backend, zid, np.piste_rg());
 
     // Sortie mono (#2362) : sortie locale seulement, jamais en PURE. C'est une
     // vraie transformation — elle réécrit chaque échantillon — donc elle porte
@@ -3274,12 +3636,25 @@ struct Source<'w> {
     /// (`StreamInfo::dsd_reconstruit_depuis_dst`, posé par la session) : DSD
     /// natif décompressé, aucune conversion PCM.
     dst_reconstruit_en_dsf: bool,
+    /// #8248 — le fil porte le flux DSD BRUT de la sortie locale native
+    /// (`audio::dsd_brut::MIME`) : ALSA `DSD_U32` sous Linux, ASIO sous
+    /// Windows. Constaté sur la session, pas déduit du réglage.
+    dsd_natif_local: bool,
+    /// #8647 (fil 2794) — la sortie OAAT de la zone sert ce DSD en NATIF : elle
+    /// lit le `.dsf` elle-même (`native_dsd_active`), et le WAV que
+    /// l'orchestrateur a préparé (`oaat_needs_wav`) n'est jamais lu. Constaté
+    /// sur la sortie ([`tune_core::outputs::dsd_natif_oaat_8647`]), pas
+    /// déduit de `dsd_mode`.
+    dsd_natif_oaat: bool,
     /// #6357 — le débit du codec mesuré par le décodeur radio (HLS), quand
     /// la lecture en cours n'en porte pas.
     debit_source_kbps: Option<u32>,
     /// #6821 — le débit qu'une RADIO annonce (`icy-br`), relevé par la sonde.
     /// `None` hors radio : le débit d'un fichier vient de `NowPlaying`.
     debit_radio_kbps: Option<u32>,
+    /// #7802 — la variante HLS plus haute que le diffuseur a refusée avant
+    /// celle qui joue : l'étape Source explique le débit plus bas.
+    variante_hls_refusee: Option<tune_core::http::streamer::VarianteRefusee>,
 }
 
 /// The radio decoder emits 16-bit PCM and can adapt low source rates.
@@ -3373,7 +3748,10 @@ fn decrire_la_source<'w>(
             canaux_source: None,
             canaux_du_fil: None,
             dst_reconstruit_en_dsf: false,
+            dsd_natif_local: false,
+            dsd_natif_oaat: false,
             debit_radio_kbps: radio.bitrate_kbps,
+            variante_hls_refusee: radio.variante_refusee,
         };
     }
     // #6946 — un titre Spotify est le PCM que librespot a DÉCODÉ d'un Ogg
@@ -3399,8 +3777,11 @@ fn decrire_la_source<'w>(
             canaux_source: None,
             canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
             dst_reconstruit_en_dsf: false,
+            dsd_natif_local: false,
+            dsd_natif_oaat: false,
             debit_source_kbps: Some(qualite.bitrate_kbps),
             debit_radio_kbps: None,
+            variante_hls_refusee: None,
         };
     }
     // Verbatim proxy radios keep their existing wire/NowPlaying metadata
@@ -3573,7 +3954,13 @@ fn decrire_la_source<'w>(
             .map(|c| c as u16),
         canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
         dst_reconstruit_en_dsf: is_dsd && wire.is_some_and(|w| w.dsd_reconstruit_depuis_dst),
+        dsd_natif_local: is_dsd
+            && output_type == "local"
+            && wire.is_some_and(|w| est_le_flux_dsd_natif_local(&w.mime_type)),
+        // Posé par `build_signal_path_lang`, qui connaît l'appareil de la zone.
+        dsd_natif_oaat: false,
         debit_radio_kbps: None,
+        variante_hls_refusee: None,
     }
 }
 

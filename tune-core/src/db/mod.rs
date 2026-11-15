@@ -16,6 +16,9 @@ pub mod champs_tenus;
 pub mod cles_clients;
 pub mod coffrets_auto;
 pub mod collection_folder_repo;
+/// #8672 — « Ma collection physique » : les disques associés à la main à un
+/// album de la bibliothèque (SQLite 153 / PG 119).
+pub mod collection_physique_associations;
 /// Le conteneur de chaque élément de file (#6466).
 pub mod contexte_de_file;
 /// Un disque par dossier pour un album sans DISCNUMBER réparti en dossiers frères.
@@ -29,6 +32,8 @@ pub mod engine;
 /// #7983 — la trace des tentatives de la passe d'enrichissement des métadonnées.
 pub mod enrich_tentatives;
 pub mod facet_filter;
+/// #8325 — chef, ensemble, œuvre : facettes et colonnes de la Collection.
+pub mod facettes_classiques;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
 /// #5314 — le genre posé sur un album vaut pour ses pistes.
@@ -69,6 +74,7 @@ mod pg_sqlite_type_parity;
 /// #7695 — les photos et vidéos indexées comme pistes par l'UPnP, retirées.
 pub mod photos_indexees_upnp_7695;
 pub mod play_queue_repo;
+pub mod playlist_radio_8135;
 pub mod playlist_repo;
 pub mod playlists_reconcile;
 /// Contrôle parental, étape 1 (#7856) : politique d'un profil supervisé.
@@ -92,15 +98,25 @@ pub mod rattrapage_metadonnees_5043;
 pub mod reference_d_album;
 /// #7849 — répartitions de la bibliothèque (codec, fréquence, décennie, rôle).
 pub mod repartitions_bibliotheque;
+// Go du 13/11 — l'année d'une piste à la lecture, repli sur celle de son album.
+pub mod annee_de_la_piste;
 /// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
 pub(crate) mod replieur_wal;
 pub mod settings_repo;
 pub mod source_link_repo;
+/// Les sources réseau lues sans montage (#8189).
+pub mod sources_reseau;
+/// #8160 — la trace datée du spectrogramme conservé d'une piste.
+pub mod spectrogrammes;
 pub mod sqlite;
 pub mod streaming_favorites_repo;
+/// « Pas pour moi » — suggestions d'accueil écartées, par profil (web#916).
+pub mod suggestions_ecartees;
 pub mod tag_repo;
 /// Registre des executions automatisees (#2080).
 pub mod task_run_repo;
+/// #8625 — le comptage de la bibliothèque partagé par tous les écrans.
+pub mod totaux_bibliotheque;
 pub mod track_metadata_repo;
 pub mod track_repo;
 /// Qui tient la transaction ouverte sur la connexion d'écriture, et qui
@@ -113,6 +129,8 @@ pub mod zone_repo;
 
 #[cfg(test)]
 mod album_dr_provenance_tests;
+#[cfg(test)]
+mod consentements_redemarrage_8521_tests;
 #[cfg(test)]
 mod ecrivains_pendant_un_lot_de_scan_tests;
 #[cfg(test)]
@@ -139,6 +157,10 @@ mod notes_et_repartitions_7849_tests;
 mod pochette_source_pg_tests_5034;
 #[cfg(test)]
 mod recherche_debut_de_mot_7619_tests;
+/// Discussion #8280 — « À découvrir » varie ses raisons : les requêtes des
+/// nouvelles sources, SQLite et PostgreSQL, mesurées sur 10 000 albums.
+#[cfg(test)]
+mod recommandations_8280_tests;
 #[cfg(test)]
 mod replieur_wal_tests;
 /// Fil 2130 — « Reprendre l'écoute » : jointure en UNION ALL et index de

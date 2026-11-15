@@ -55,6 +55,10 @@ pub struct AppState {
     /// non en `static` : chaque état a sa base, et un test ne pollue pas le
     /// suivant.
     pub comptes_collections: Arc<tune_smart_http::comptes::CacheDesComptes>,
+    /// Les comptages de `/system/stats`, `/system/health` et
+    /// `/system/health/monitor`, hors exécuteur et resservis s'ils ont été
+    /// lents (#8805). Tenu ici et non en `static` : chaque état a sa base.
+    pub(crate) comptages: Arc<crate::routes::system::comptages_8805::Comptages>,
     /// Registry of in-progress background tasks (enrichment, artwork, bios) for
     /// the UI "tâches de fond" indicator. See [`crate::background_tasks`].
     pub background_tasks: crate::background_tasks::BackgroundTasks,
@@ -129,6 +133,11 @@ pub struct AppState {
     /// déplacement reçu deux fois coup sur coup (ticket 193, voir
     /// [`crate::routes::playback::seek_en_double`]).
     pub derniers_seeks: Arc<std::sync::Mutex<HashMap<i64, (u64, Instant)>>>,
+    /// #7759 — les déplacements relayés aux suiveuses d'un groupe, numérotés
+    /// par meneuse : seul le dernier s'applique (voir
+    /// [`crate::routes::zones::relais_de_groupe_6155::DeplacementsDeGroupe`]).
+    pub deplacements_de_groupe:
+        Arc<crate::routes::zones::relais_de_groupe_6155::DeplacementsDeGroupe>,
     /// mDNS scanner handle, populated by
     /// [`crate::discovery_setup::spawn_mdns_handler`] once discovery starts. Kept
     /// here (not just as a local `_mdns_handle`) so routes can list the peer Tune
@@ -371,6 +380,28 @@ impl AppState {
         )
     }
 
+    /// #3245 — la demande d'exclusif pour l'appareil `device_id` : celle de la
+    /// zone qui le joue quand elle en a une, sinon `demande_machine`
+    /// ([`Self::requested_exclusive_mode`], lu une fois par l'appelant).
+    pub fn demande_d_exclusif_de_l_appareil(
+        &self,
+        device_id: &str,
+        demande_machine: bool,
+    ) -> tune_core::config::DemandeDExclusifDeZone {
+        let valeur = tune_core::db::zone_repo::ZoneRepo::with_backend(self.backend.clone())
+            .get_by_device_id(device_id)
+            .ok()
+            .flatten()
+            .and_then(|zone| zone.id)
+            .and_then(|zone_id| {
+                tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
+                    .get(&tune_core::config::cle_exclusif_de_zone(zone_id))
+                    .ok()
+                    .flatten()
+            });
+        tune_core::config::demande_d_exclusif_de_la_zone(valeur.as_deref(), demande_machine)
+    }
+
     /// Vrai si c'est le CHOIX D'ASIO, et non l'utilisateur, qui a armé
     /// `local_exclusive_mode` (témoin posé par `PATCH /system/config`, #4184).
     ///
@@ -483,6 +514,13 @@ impl AppState {
         // Build the backend: PG when configured + feature-enabled, else SQLite.
         let backend: Arc<dyn DbBackend> =
             Self::create_backend(selected_engine, &tune_config, sqlite_db.as_ref(), db_path)?;
+        // #7876 — les dossiers du fichier de configuration servent de repli
+        // quand le réglage `music_dirs` est absent (ordre des répertoires,
+        // exemplaire lu), comme `GET /system/config` qui les affiche.
+        tune_core::library::exemplaires::inscrire_les_dossiers_du_fichier(
+            &backend,
+            &tune_config.music_dirs,
+        );
 
         // Le ménage des `tune-transcode-*` laissés par un plantage ne se fait
         // PAS ici : il se fait au DÉMARRAGE du processus, dans
@@ -619,6 +657,16 @@ impl AppState {
                 ),
             ),
         );
+        // #8565 — une lecture lancée depuis l'application Spotify vers le
+        // récepteur : session PCM en direct sur la zone exposée.
+        orch.sources_pcm().inscrire(
+            tune_core::streaming::spotify_connect_session::SOURCE,
+            Arc::new(
+                tune_core::streaming::spotify_connect_session::FournisseurConnect::new(
+                    spotify_connect.clone(),
+                ),
+            ),
+        );
         let orchestrator = Arc::new(orch);
 
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);
@@ -649,7 +697,8 @@ impl AppState {
         ));
         skin_manager.ensure_dirs();
 
-        let loader = crate::plugins::build_loader(&event_bus, backend.clone(), license.clone());
+        let loader =
+            crate::plugins::build_loader(&event_bus, backend.clone(), license.clone(), db_path);
         let plugin_setup_report = loader.setup_report();
         let plugins = Arc::new(Mutex::new(loader));
 
@@ -670,6 +719,7 @@ impl AppState {
             scanner,
             event_bus,
             comptes_collections,
+            comptages: Arc::default(),
             background_tasks,
             passe_dr: Arc::new(tune_core::audio::replaygain::plage_dynamique::PasseDr::new()),
             bibliotheque_rg: Arc::new(
@@ -702,6 +752,7 @@ impl AppState {
             upnp_index_lock: Arc::new(Mutex::new(())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             derniers_seeks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            deplacements_de_groupe: Arc::default(),
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             active_audio_backend: Arc::new(std::sync::RwLock::new(None)),
             annuaire_radios: Arc::new(std::sync::RwLock::new(Vec::new())),

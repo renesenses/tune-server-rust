@@ -19,6 +19,27 @@ type FluxHttps = (String, Option<String>, String, Option<u64>);
 /// session, type MIME servi, taille du fichier.
 type FluxDash = (String, Option<String>, String, Option<u64>);
 
+/// #7738, #8229 — une fiche Qobuz qui n'a que son titre (titre importé d'un
+/// M3U : titre et durée, ni artiste, ni album, ni pochette) n'est pas une
+/// fiche complète : il faut la compléter auprès du service. Les autres
+/// services gardent la règle du titre seul.
+///
+/// Une seule règle pour tous les chemins de lecture : la résolution directe
+/// (`resolve_streaming_url`, trois bras) et le tampon de préchargement
+/// (`etiqueter_le_prefetch`, `dsp.rs`), qui sert le titre atteint par
+/// l'enchaînement.
+pub(super) fn fiche_qobuz_incomplete(
+    service: &str,
+    artiste: &Option<String>,
+    album: &Option<String>,
+    pochette: &Option<String>,
+) -> bool {
+    service == "qobuz"
+        && [artiste, album, pochette]
+            .into_iter()
+            .any(|s| s.as_deref().is_none_or(|s| s.trim().is_empty()))
+}
+
 /// Décision du cache chaud DASH (opt-in `TUNE_DASH_WARM_CACHE`) : chemin
 /// dans le cache et format qui a servi de clef.
 struct DashWarm {
@@ -269,7 +290,23 @@ pub(super) fn telecharger_amont(
     entetes: &[(String, String)],
     vers: &str,
 ) -> Result<(), String> {
-    let mut resp = crate::http::client::blocking_builder()
+    let mut resp = ouvrir_amont(url, entetes)?;
+    // #4833 — les octets vont directement sur le disque, sans mémoire tampon
+    // de la taille du fichier : un DSD64 fait 300 Mio, un DSD256 dépasse le
+    // gigaoctet (`telecharger_dans_un_fichier_temporaire`).
+    let mut fichier = std::fs::File::create(vers).map_err(|e| format!("write dl: {e}"))?;
+    resp.copy_to(&mut fichier)
+        .map_err(|e| format!("download: {e}"))?;
+    Ok(())
+}
+
+/// La requête amont de [`telecharger_amont`], jusqu'au statut : un refus est
+/// rendu (et journalisé) avant le premier octet du corps.
+fn ouvrir_amont(
+    url: &str,
+    entetes: &[(String, String)],
+) -> Result<reqwest::blocking::Response, String> {
+    let resp = crate::http::client::blocking_builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .and_then(|c| rejouer_les_entetes(c.get(url), entetes).send())
@@ -286,13 +323,66 @@ pub(super) fn telecharger_amont(
         );
         return Err(format!("upstream HTTP {}", resp.status()));
     }
-    // #4833 — les octets vont directement sur le disque, sans mémoire tampon
-    // de la taille du fichier : un DSD64 fait 300 Mio, un DSD256 dépasse le
-    // gigaoctet (`telecharger_dans_un_fichier_temporaire`).
-    let mut fichier = std::fs::File::create(vers).map_err(|e| format!("write dl: {e}"))?;
-    resp.copy_to(&mut fichier)
-        .map_err(|e| format!("download: {e}"))?;
-    Ok(())
+    Ok(resp)
+}
+
+/// #8228 — copie le corps amont dans `fichier` en publiant chaque avancée à
+/// `growth`, que le décodeur lit au fil de l'eau
+/// (`decode::opus_en_croissance`).
+///
+/// La copie s'arrête d'elle-même quand plus personne ne tient la poignée :
+/// ni le registre (`dash_growth::take_for` l'a retirée) ni un décodeur. Une
+/// lecture arrêtée ne laisse donc pas un téléchargement courir jusqu'au bout.
+fn copier_en_croissance(
+    mut corps: impl std::io::Read,
+    mut fichier: std::fs::File,
+    growth: Arc<crate::audio::dash_growth::DashGrowth>,
+) {
+    use std::io::Write;
+    /// Une panique de la copie ne doit pas laisser le décodeur bloqué à la
+    /// frontière : la poignée est marquée en échec si rien ne l'a close.
+    struct Garde(Arc<crate::audio::dash_growth::DashGrowth>);
+    impl Drop for Garde {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.fail();
+            }
+        }
+    }
+    let _garde = Garde(growth.clone());
+    let mut tampon = vec![0u8; 64 * 1024];
+    let mut recus: u64 = 0;
+    loop {
+        // Plus personne ne lit : ni le registre ni un décodeur (la garde
+        // ci-dessus tient la seconde référence).
+        if Arc::strong_count(&growth) == 2 {
+            debug!(octets = recus, "telechargement_en_croissance_abandonne");
+            growth.fail();
+            return;
+        }
+        match corps.read(&mut tampon) {
+            Ok(0) => {
+                debug!(octets = recus, "telechargement_en_croissance_fini");
+                growth.finish();
+                return;
+            }
+            Ok(n) => {
+                if let Err(e) = fichier.write_all(&tampon[..n]) {
+                    warn!(error = %e, octets = recus, "telechargement_en_croissance_echec_ecriture");
+                    growth.fail();
+                    return;
+                }
+                recus += n as u64;
+                growth.advance(recus);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                warn!(error = %e, octets = recus, "telechargement_en_croissance_echec");
+                growth.fail();
+                return;
+            }
+        }
+    }
 }
 
 /// Ce que le producteur du canal AAC → WAV reçoit du bras qui l'a monté.
@@ -350,6 +440,9 @@ async fn produire_le_canal_aac(c: CanalAac) {
         )
     })
     .await;
+    // #8228 — un téléchargement en croissance que le décodeur n'a pas pris
+    // (échec avant l'ouverture) : lâcher la poignée arrête la copie.
+    drop(crate::audio::dash_growth::take_for(&fichier));
     let _ = std::fs::remove_file(&fichier);
     match result {
         Ok(Ok(_)) => {
@@ -381,6 +474,28 @@ async fn produire_le_canal_aac(c: CanalAac) {
 #[cfg(test)]
 #[path = "canal_aac_fin_notee_6298_tests.rs"]
 mod canal_aac_fin_notee_6298_tests;
+
+#[cfg(test)]
+#[path = "youtube_dlna_demarrage_8228_tests.rs"]
+mod youtube_dlna_demarrage_8228_tests;
+
+/// #7266 — la résolution d'une piste pour cette lecture peut-elle rendre un
+/// fMP4 DASH encore en téléchargement ? Oui pour une sortie locale ou OAAT :
+/// leur session WAV est servie en continu, sans longueur annoncée, et le
+/// décodeur suit la frontière d'écriture. Non pour un renderer réseau (DLNA,
+/// Chromecast, AirPlay : il leur faut le fichier complet et sa longueur), ni
+/// si `TUNE_DASH_STREAM_DECODE=0`.
+///
+/// #8701 — un départ à une position (un saut) aussi : le démuxeur fMP4 lit
+/// les fragments dans l'ordre jusqu'à celui de la position, et la source en
+/// croissance ne bloque qu'au-delà de ce qui est écrit. Un saut dans la
+/// partie téléchargée joue tout de suite ; au-delà, il n'attend que le
+/// segment visé, plus la fin de tout le téléchargement.
+pub(super) fn decoder_pendant_le_telechargement(req: &PlayRequest) -> bool {
+    req.output_device_id.as_deref().is_some_and(|id| {
+        id.starts_with("local:") || id.starts_with("oaat:") || id.starts_with("oaat-group:")
+    }) && !crate::audio::dash_growth::decodage_local_desarme()
+}
 
 impl PlaybackOrchestrator {
     /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
@@ -481,19 +596,20 @@ impl PlaybackOrchestrator {
         // (DEvir: seek on a TIDAL track → title stays but music stops.)
         // Only consider the prefetch buffer when NOT seeking.
         //
-        // #2723 — le tampon de préchargement est TOUJOURS rempli au maximum du
-        // service. Le servir alors que la zone demande autre chose ferait
-        // mentir le sélecteur : on l'ignore dès que la préférence n'est pas
-        // `max`.
+        // #2723 — servir un tampon d'une autre qualité que celle de la zone
+        // ferait mentir le sélecteur. Depuis #7266, le préchargement suit la
+        // qualité de la zone : le tampon est servi quand il a été rempli à la
+        // qualité que la zone demande maintenant (un tampon en qualité CD sert
+        // une zone en qualité CD), ignoré sinon.
         let quality_preference = self.streaming_quality_preference(req.zone_id);
         let provider_quality = quality_preference.service_token(service_name);
 
-        let prefetched = if req.seek_ms.is_some_and(|ms| ms > 0)
-            || quality_preference != StreamingQualityPreference::Max
-        {
+        let prefetched = if req.seek_ms.is_some_and(|ms| ms > 0) {
             None
         } else {
-            self.prefetch.take_prefetched(service_name, source_id).await
+            self.prefetch
+                .take_prefetched_en_qualite(service_name, source_id, provider_quality)
+                .await
         };
         if let Some(prefetched) = prefetched {
             let is_network = req
@@ -541,6 +657,12 @@ impl PlaybackOrchestrator {
             }
         }
 
+        // #8215 / #7266 — un préchargement d'une AUTRE piste tient peut-être
+        // le verrou du service le temps d'un téléchargement DASH entier : la
+        // lecture ne l'attend plus, elle l'abandonne. Celui de la piste
+        // demandée est gardé (`prendre_dash_complet`, #7247).
+        self.prefetch
+            .abandonner_pour_une_autre_piste(req.zone_id, service_name, source_id);
         let registry = self.services.lock().await;
         let svc = registry
             .get(service_name)
@@ -553,6 +675,31 @@ impl PlaybackOrchestrator {
             return Err(format!("service désactivé : {service_name}"));
         }
         let mut svc = svc.write().await;
+
+        // #8689 — Qobuz ne publie son ReplayGain que sur l'objet piste
+        // (`audio_info`), que la navigation a d'ordinaire déjà lu (album,
+        // playlist, recherche : `map_track` le retient). Une file restaurée
+        // après un redémarrage ne l'a pas : UNE lecture de `track/get`, et
+        // seulement quand le gain servira (ReplayGain armé, zone hors PURE).
+        if service_name == "qobuz"
+            && crate::audio::replaygain::services_enabled(&self.db)
+            && !crate::audio::replaygain::service_contourne(&self.db, req.zone_id, req.piste_rg())
+            && crate::audio::replaygain::services::lire("qobuz", source_id).is_none()
+            && crate::audio::replaygain::ReplayGainSettings::load(&self.db).mode
+                != crate::audio::replaygain::ReplayGainMode::Off
+            && !self.zone_audiophile(req.zone_id)
+        {
+            let lu =
+                tokio::time::timeout(std::time::Duration::from_secs(3), svc.get_track(source_id))
+                    .await
+                    .is_ok_and(|resultat| resultat.is_ok());
+            debug!(
+                source_id,
+                lu,
+                trouve = crate::audio::replaygain::services::lire("qobuz", source_id).is_some(),
+                "qobuz_replaygain_lu_pour_la_lecture"
+            );
+        }
 
         // Chronomètre de la PREMIÈRE étape (#3568). Pour Tidal en DASH
         // multi-segments, `get_track_url()` ne rend pas une adresse : il
@@ -577,11 +724,11 @@ impl PlaybackOrchestrator {
         // retry. Passing `None` means the provider's highest/default quality.
         // Relu après acquisition du service : l'assemblage DASH en cours
         // sous ce verrou a alors publié le téléchargement complet (#7247).
-        let deja_telecharge = if quality_preference == StreamingQualityPreference::Max
-            && !req.seek_ms.is_some_and(|ms| ms > 0)
-        {
+        // Relecture de #8249 — servi quand il a été téléchargé à la qualité
+        // que la zone demande (le préchargement suit la zone, #7266).
+        let deja_telecharge = if !req.seek_ms.is_some_and(|ms| ms > 0) {
             self.prefetch
-                .prendre_dash_complet(service_name, source_id)
+                .prendre_dash_complet(service_name, source_id, provider_quality)
                 .await
         } else {
             None
@@ -594,7 +741,16 @@ impl PlaybackOrchestrator {
                 );
                 flux
             }
-            None => request_stream_at_quality(&mut **svc, source_id, provider_quality).await?,
+            // #7266 — pour une sortie locale ou OAAT, un fMP4 DASH FLAC revient
+            // dès son init et son premier segment, et se décode pendant que les
+            // autres arrivent : la première note n'attend plus la piste entière.
+            None => {
+                crate::audio::dash_growth::pendant_le_telechargement(
+                    decoder_pendant_le_telechargement(req),
+                    request_stream_at_quality(&mut **svc, source_id, provider_quality),
+                )
+                .await?
+            }
         };
         // #6401 — un flux Qobuz haute résolution qui échoue au démarrage
         // (erreur HTTP, flux coupé avant le premier octet) est redemandé UNE
@@ -677,11 +833,24 @@ impl PlaybackOrchestrator {
         // #6370 — une sortie d'agent relancée à une position reçoit, comme
         // une sortie locale, le WAV décodé à partir de `seek_ms` : le
         // mandataire du CDN, lui, la servirait depuis l'octet 0.
+        // #7972 — une zone AirPlay 2 rétablie à une position après une pause :
+        // son démon lit le flux depuis le début, il lui faut le WAV décodé à
+        // partir de `seek_ms` (voir [`airplay2_relance_a_la_position`]).
         let is_local_stream = req
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"))
-            || agent_relance_a_la_position(req.output_device_id.as_deref(), req.seek_ms);
+            || agent_relance_a_la_position(req.output_device_id.as_deref(), req.seek_ms)
+            || (req.seek_ms.is_some_and(|ms| ms > 0)
+                && airplay2_relance_a_la_position(
+                    ZoneRepo::with_backend(self.db.clone())
+                        .get(req.zone_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|z| z.output_type)
+                        .as_deref(),
+                    req.seek_ms,
+                ));
 
         // Local and OAAT outputs expect raw PCM in a WAV container.
         // Streaming services deliver compressed audio (FLAC, AAC, etc.)
@@ -715,8 +884,20 @@ impl PlaybackOrchestrator {
         };
 
         let (stream_url, sid, out_mime, stream_file_size) = if is_local_stream || is_oaat_stream {
-            self.resoudre_flux_local_ou_oaat(req, service_name, &stream_data, is_local_stream)
-                .await?
+            match self
+                .resoudre_flux_local_ou_oaat(req, service_name, &stream_data, is_local_stream)
+                .await
+            {
+                Ok(flux) => flux,
+                Err(e) => {
+                    // #7266 — aucun décodeur ne prendra la poignée d'un fMP4
+                    // en croissance : la lâcher arrête son téléchargement.
+                    if let Some(chemin) = stream_data.url.strip_prefix("file://") {
+                        drop(crate::audio::dash_growth::take_for(chemin));
+                    }
+                    return Err(e);
+                }
+            }
         } else if is_dash_file {
             match self
                 .resoudre_flux_dash(
@@ -763,10 +944,12 @@ impl PlaybackOrchestrator {
         // et une durée, mais aucun artiste, album ni pochette. Compléter aussi
         // ce cas ; une fiche Qobuz complète garde le chemin sans requête.
         let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
-            && (service_name != "qobuz"
-                || [&req.artist_name, &req.album_title, &req.cover_url]
-                    .into_iter()
-                    .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
+            && !fiche_qobuz_incomplete(
+                service_name,
+                &req.artist_name,
+                &req.album_title,
+                &req.cover_url,
+            );
         let (title, artist, album, mut duration_ms, cover_path) = if has_title {
             (
                 req.title.clone().unwrap_or_default(),
@@ -829,6 +1012,16 @@ impl PlaybackOrchestrator {
         // when we are handing out the upstream unchanged.
         let origin_url = (stream_url != stream_data.url).then(|| stream_data.url.clone());
 
+        // #8188 — la profondeur ANNONCÉE est celle qui part sur le fil, comme
+        // la cadence (#4759) : un FLAC ramené à 16 bits pour une zone
+        // plafonnée (ou un WAV/LPCM de repli) ne doit pas porter
+        // `bitsPerSample="24"` dans le DIDL, que les puces Frontier Silicon
+        // lisent strictement. Vers une sortie réseau seulement : la sortie
+        // locale lit l'en-tête de son WAV 32 bits, l'annonce n'y décide rien.
+        let profondeur_servie = self
+            .profondeur_servie_sur_le_fil(sid.as_deref(), !is_local_stream && !is_oaat_stream)
+            .await;
+
         Ok(ResolvedStream {
             url: stream_url,
             mime_type: out_mime,
@@ -849,13 +1042,32 @@ impl PlaybackOrchestrator {
             // celui d'un FLAC CD.
             bit_depth: profondeur_annoncee_par_le_service(
                 &stream_data.quality,
-                stream_data.quality.bit_depth,
+                profondeur_servie.unwrap_or(stream_data.quality.bit_depth),
             ),
             channels: Some(2),
             origin_url,
             bitrate_kbps: debit_annonce_par_le_service(&stream_data.quality),
             format_source: format_livre_par_le_service(&stream_data.quality),
         })
+    }
+
+    /// #8188 — la profondeur que la session `sid` sert RÉELLEMENT sur le fil,
+    /// pour l'annonce du DIDL (`<res bitsPerSample>`). `None` hors sortie
+    /// réseau, sans session, ou pour une session sans profondeur connue :
+    /// l'appelant garde alors celle du service.
+    pub(super) async fn profondeur_servie_sur_le_fil(
+        &self,
+        sid: Option<&str>,
+        sortie_reseau: bool,
+    ) -> Option<u16> {
+        if !sortie_reseau {
+            return None;
+        }
+        self.streamer
+            .stream_output_wire(sid?)
+            .await
+            .map(|i| i.bit_depth)
+            .filter(|bd| *bd > 0)
     }
 
     /// #4759 — la cadence RÉELLEMENT servie par le bras des SERVICES, plafond
@@ -889,6 +1101,9 @@ impl PlaybackOrchestrator {
                 .and_then(|z| z.max_sample_rate),
             crate::device_catalog::resolve_zone_quirks(&self.db, req.zone_id).max_sample_rate,
         );
+        if let Some(rate) = crate::audio::frequence_fixe::cible(&self.db, req.zone_id, plafond)? {
+            return Ok((rate != stream_data.quality.sample_rate).then_some(rate));
+        }
         match plafond_de_flux_de_service(
             stream_data.quality.sample_rate,
             plafond,
@@ -940,6 +1155,34 @@ impl PlaybackOrchestrator {
             let (session_id, tx, data_ready) = self
                 .ouvrir_la_session_wav(wav_info, service_name, &codec, sr, bd)
                 .await;
+
+            // #8689 — la sortie locale applique le gain au rendu. OAAT
+            // reçoit les octets du WAV : son gain de service doit donc être
+            // porté ici, une seule fois, sans ajouter les autres DSP de zone.
+            let tx = if !is_local_stream && !self.zone_audiophile(req.zone_id) {
+                let facteur = crate::audio::replaygain::facteur_de_zone(
+                    &self.db,
+                    req.zone_id,
+                    req.piste_rg(),
+                );
+                if (facteur - 1.0).abs() > 1e-6 {
+                    spawn_streaming_dsp_relay(
+                        StreamingDsp {
+                            replaygain: Some(facteur),
+                            channels: 2,
+                            sample_rate: sr,
+                            ..Default::default()
+                        },
+                        bd,
+                        true,
+                        tx,
+                    )
+                } else {
+                    tx
+                }
+            } else {
+                tx
+            };
 
             let tache = self.capturer_pour_le_transcodage(
                 req,
@@ -1086,6 +1329,11 @@ impl PlaybackOrchestrator {
                 "streaming_zone_max_sample_rate_cap_applied"
             );
             sr = cible;
+        }
+        if let Some(rate) =
+            crate::audio::frequence_fixe::cible(&self.db, req.zone_id, zone_max_sample_rate)?
+        {
+            sr = rate;
         }
         // Local output: 32-bit to avoid 24-bit byte misalignment noise
         // (see local_needs_wav comment in resolve_local_track).
@@ -1247,6 +1495,9 @@ impl PlaybackOrchestrator {
         // streaming-service content played through local/OAAT outputs.
         // Paced to the playback clock by the forwarder; without a bus,
         // the receiver is dropped and the decoder's sends are no-ops.
+        // #7266 — pour signaler une piste coupée en route (le bus ci-dessous
+        // ne sert aux niveaux que si la zone les demande).
+        let bus_des_erreurs = ev_bus.clone();
         let levels_tx = match ev_bus.filter(|_| attach_levels) {
             Some(bus) => {
                 let play_seq = playback.current_play_seq(zone_id).await;
@@ -1363,6 +1614,55 @@ impl PlaybackOrchestrator {
                         .unwrap_or(0);
                     info!(path = %file_path, file_size, "streaming_dash_file_already_on_disk");
                     file_path
+                } else if opus_decode_pendant_le_telechargement(&codec, sr, seek_s) {
+                    // #8444 — l'Opus de YouTube n'attend plus son dernier
+                    // octet : le décodeur le lit pendant qu'il arrive (même
+                    // mécanisme que le DLNA, #8228). Sinon la sortie restait
+                    // à 0:00 tout le téléchargement (~ moitié du titre) et le
+                    // chien de garde #5522 arrêtait la zone au bout de 8 s.
+                    match download::telecharger_en_croissance_pour_session(
+                        &streamer_for_eof,
+                        &session_id_for_eof,
+                        &upstream_url,
+                        &upstream_headers,
+                        &codec,
+                        // tmp-autorise: base seule : le fichier y est créé par tempfile, au nom aléatoire.
+                        &std::env::temp_dir(),
+                    )
+                    .await
+                    {
+                        Ok(Some(file)) => {
+                            info!(
+                                stream_id = %session_id_for_eof,
+                                "streaming_opus_decode_pendant_le_telechargement"
+                            );
+                            let path = file.path().to_string_lossy().into_owned();
+                            downloaded_file = Some(file);
+                            path
+                        }
+                        Ok(None) => {
+                            info!(
+                                stream_id = %session_id_for_eof,
+                                zone_id,
+                                "streaming_download_cancelled_session_removed"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(
+                                stream_id = %session_id_for_eof,
+                                error = %e,
+                                "streaming_transcode_download_failed"
+                            );
+                            abandonner_la_session_de_transcodage(
+                                &streamer_for_eof,
+                                &session_id_for_eof,
+                                None,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
                 } else {
                     let debut_telechargement = std::time::Instant::now();
                     match download::telecharger_pour_session(
@@ -1441,6 +1741,15 @@ impl PlaybackOrchestrator {
 
         // Le decodeur a rendu son fichier. Le garde ne possede que les
         // telechargements HTTP ; les fichiers DASH du cache restent intacts.
+        // #8444 — un décodeur sorti avant d'avoir pris la poignée du
+        // téléchargement en croissance la laisse au registre : on la retire
+        // et la clôt, pour que la copie amont s'arrête aussi.
+        if let Some(fichier) = downloaded_file.as_ref()
+            && let Some(poignee) =
+                crate::audio::dash_growth::take_for(&fichier.path().to_string_lossy())
+        {
+            poignee.fail();
+        }
         drop(downloaded_file);
 
         match decode_result {
@@ -1461,6 +1770,21 @@ impl PlaybackOrchestrator {
             }
             Ok(Err(e)) => {
                 warn!(error = %e, "streaming_transcode_decode_failed");
+                // #7266 — un fMP4 DASH perdu en cours de téléchargement : la
+                // zone l'apprend, au lieu de passer en silence à la suite.
+                if e.starts_with(crate::audio::decode::TELECHARGEMENT_DASH_INTERROMPU)
+                    && let Some(ref bus) = bus_des_erreurs
+                {
+                    bus.emit(
+                        "zone.playback_error",
+                        serde_json::json!({
+                            "zone_id": zone_id,
+                            "code": "track_decode_failed",
+                            "error": "The track could not be decoded.",
+                            "cause": e,
+                        }),
+                    );
+                }
             }
             Err(e) => {
                 warn!(error = %e, "streaming_transcode_decode_task_panic");
@@ -1561,7 +1885,7 @@ impl PlaybackOrchestrator {
         // ⚠️ Ce bras ne chargeait que l'ÉGALISEUR (#2863) : le convolveur de
         // correction de pièce et le ReplayGain y étaient perdus, exactement
         // comme sur les bras non-DASH. `StreamingDsp` porte les trois.
-        let dash_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr_servie, 2);
+        let dash_dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr_servie, 2);
         let dash_dsp_active = dash_dsp.is_active();
 
         // Browser (Web Audio) zones pull the stream themselves via <audio> and
@@ -1667,10 +1991,12 @@ impl PlaybackOrchestrator {
                 self.spawn_warm_next_streaming(req.zone_id, source_id.to_string(), w.enc_format);
 
                 let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
-                    && (service_name != "qobuz"
-                        || [&req.artist_name, &req.album_title, &req.cover_url]
-                            .into_iter()
-                            .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
+                    && !fiche_qobuz_incomplete(
+                        service_name,
+                        &req.artist_name,
+                        &req.album_title,
+                        &req.cover_url,
+                    );
                 let (title, artist, album, duration_ms, cover_path) = if has_title {
                     (
                         req.title.clone().unwrap_or_default(),
@@ -1904,10 +2230,12 @@ impl PlaybackOrchestrator {
                 .get_stream_url(&session_id, &server_ip, "flac");
 
             let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty())
-                && (service_name != "qobuz"
-                    || [&req.artist_name, &req.album_title, &req.cover_url]
-                        .into_iter()
-                        .all(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty())));
+                && !fiche_qobuz_incomplete(
+                    service_name,
+                    &req.artist_name,
+                    &req.album_title,
+                    &req.cover_url,
+                );
             let (title, artist, album, duration_ms, cover_path) = if has_title {
                 (
                     req.title.clone().unwrap_or_default(),
@@ -2016,98 +2344,107 @@ impl PlaybackOrchestrator {
             // `tidal_dash_multi_segment_download_complete`, qui porte déjà son
             // `elapsed_ms` (`streaming/tidal.rs`).
             let pre_transcode_start = std::time::Instant::now();
-            let transcode_result = tokio::task::spawn_blocking(move || {
-                // Fast path: Tidal HI-RES DASH is ALREADY FLAC (frames inside an
-                // fMP4). If the renderer takes FLAC and no zone EQ is active, REMUX
-                // (copy the FLAC frames + STREAMINFO into a .flac) instead of
-                // decode→PCM→re-encode — a ~59s CPU transcode becomes a sub-second
-                // I/O copy, bit-identical (#1146). WAV renderers, zone DSP and
-                // capped zones fall through to the decode path.
-                //
-                // #7266 — c'est désormais le chemin par défaut : le FLAC CD de
-                // TIDAL arrive par ce bras depuis la rc8 (#6334), et le
-                // ré-encodage FLAC→FLAC de la piste entière retenait le Play.
-                // `TUNE_DASH_REMUX=0` rend l'ancien comportement.
-                if remux_dash_sans_perte(
-                    source_flac,
-                    dash_is_wav,
-                    dash_dsp_active,
-                    dash_plafond_16,
-                    plafonnee,
-                ) {
-                    match crate::audio::decode::remux_flac_dash(&unique_path_clone, &tmp_path_clone)
-                    {
-                        Ok(remuxe) => {
-                            // Les VU-mètres décrivaient le PCM du transcodage.
-                            // Le remux n'en produit pas : un décodage À CÔTÉ,
-                            // après coup, les nourrit sans retarder le Play (le
-                            // forwarder se cale sur la position de lecture). Il
-                            // lit son propre lien du fichier : le service peut
-                            // renommer ou effacer l'original.
-                            if let Some(ltx) = dash_levels_tx {
-                                nourrir_les_vu_apres_le_remux(&tmp_path_clone, ltx);
+            // #6718 — même garde que le bras HTTPS : un pré-transcodage DASH
+            // abandonné ne laisse ni sa source ni son fichier.
+            let fichiers_de_la_tache = vec![unique_path.clone(), tmp_path.clone()];
+            let transcode_result = super::pretranscode_abandonne_6718::attendre_ou_nettoyer(
+                tokio::task::spawn_blocking(move || {
+                    // Fast path: Tidal HI-RES DASH is ALREADY FLAC (frames inside an
+                    // fMP4). If the renderer takes FLAC and no zone EQ is active, REMUX
+                    // (copy the FLAC frames + STREAMINFO into a .flac) instead of
+                    // decode→PCM→re-encode — a ~59s CPU transcode becomes a sub-second
+                    // I/O copy, bit-identical (#1146). WAV renderers, zone DSP and
+                    // capped zones fall through to the decode path.
+                    //
+                    // #7266 — c'est désormais le chemin par défaut : le FLAC CD de
+                    // TIDAL arrive par ce bras depuis la rc8 (#6334), et le
+                    // ré-encodage FLAC→FLAC de la piste entière retenait le Play.
+                    // `TUNE_DASH_REMUX=0` rend l'ancien comportement.
+                    if remux_dash_sans_perte(
+                        source_flac,
+                        dash_is_wav,
+                        dash_dsp_active,
+                        dash_plafond_16,
+                        plafonnee,
+                    ) {
+                        match crate::audio::decode::remux_flac_dash(
+                            &unique_path_clone,
+                            &tmp_path_clone,
+                        ) {
+                            Ok(remuxe) => {
+                                // Les VU-mètres décrivaient le PCM du transcodage.
+                                // Le remux n'en produit pas : un décodage À CÔTÉ,
+                                // après coup, les nourrit sans retarder le Play (le
+                                // forwarder se cale sur la position de lecture). Il
+                                // lit son propre lien du fichier : le service peut
+                                // renommer ou effacer l'original.
+                                if let Some(ltx) = dash_levels_tx {
+                                    nourrir_les_vu_apres_le_remux(&tmp_path_clone, ltx);
+                                }
+                                return Ok(remuxe);
                             }
-                            return Ok(remuxe);
+                            // #7266 — un fMP4 qui n'a pas les trames FLAC attendues
+                            // (codec mal annoncé, STREAMINFO absent) se décode
+                            // comme avant : la piste joue, plus lentement.
+                            Err(e) => warn!(error = %e, "streaming_dash_remux_echec_decodage"),
                         }
-                        // #7266 — un fMP4 qui n'a pas les trames FLAC attendues
-                        // (codec mal annoncé, STREAMINFO absent) se décode
-                        // comme avant : la piste joue, plus lentement.
-                        Err(e) => warn!(error = %e, "streaming_dash_remux_echec_decodage"),
                     }
-                }
 
-                let decoded = crate::audio::decode::decode_to_pcm(
-                    &unique_path_clone,
-                    Some(sr),
-                    Some(2),
-                    0.0,
-                    0.0,
-                )?;
+                    let decoded = crate::audio::decode::decode_to_pcm(
+                        &unique_path_clone,
+                        Some(sr),
+                        Some(2),
+                        0.0,
+                        0.0,
+                    )?;
 
-                let mut pcm_bytes = decoded.pcm_bytes();
-                let mut actual_bd = decoded.bit_depth;
+                    let mut pcm_bytes = decoded.pcm_bytes();
+                    let mut actual_bd = decoded.bit_depth;
 
-                if (dash_is_wav || dash_plafond_16) && actual_bd > 16 {
-                    pcm_bytes = crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
-                    actual_bd = 16;
-                }
+                    if (dash_is_wav || dash_plafond_16) && actual_bd > 16 {
+                        pcm_bytes =
+                            crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
+                        actual_bd = 16;
+                    }
 
-                // ReplayGain, égaliseur, puis convolveur FIR — l'ordre de
-                // `transcode_source_to_file`. Ce bras n'appliquait que le
-                // deuxième (#2863).
-                dash_dsp.process(&mut pcm_bytes, actual_bd);
+                    // ReplayGain, égaliseur, puis convolveur FIR — l'ordre de
+                    // `transcode_source_to_file`. Ce bras n'appliquait que le
+                    // deuxième (#2863).
+                    dash_dsp.process(&mut pcm_bytes, actual_bd);
 
-                // Niveaux post-EQ : les VU décrivent ce qui sera entendu.
-                if let Some(ref ltx) = dash_levels_tx {
-                    crate::audio::tap::send_windowed_pcm(
-                        ltx,
-                        &pcm_bytes,
-                        actual_bd,
-                        decoded.channels as u16,
-                        decoded.sample_rate,
-                    );
-                }
+                    // Niveaux post-EQ : les VU décrivent ce qui sera entendu.
+                    if let Some(ref ltx) = dash_levels_tx {
+                        crate::audio::tap::send_windowed_pcm(
+                            ltx,
+                            &pcm_bytes,
+                            actual_bd,
+                            decoded.channels as u16,
+                            decoded.sample_rate,
+                        );
+                    }
 
-                let rt = tokio::runtime::Handle::try_current()
-                    .map_err(|e| format!("no tokio runtime: {e}"))?;
-                let encoded_data = rt.block_on(async {
-                    let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                        dash_enc_format,
-                        decoded.sample_rate,
-                        actual_bd as u32,
-                        decoded.channels,
-                    );
-                    encoder.start().await?;
-                    encoder.write(&pcm_bytes).await?;
-                    encoder.finish().await
-                })?;
+                    let rt = tokio::runtime::Handle::try_current()
+                        .map_err(|e| format!("no tokio runtime: {e}"))?;
+                    let encoded_data = rt.block_on(async {
+                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                            dash_enc_format,
+                            decoded.sample_rate,
+                            actual_bd as u32,
+                            decoded.channels,
+                        );
+                        encoder.start().await?;
+                        encoder.write(&pcm_bytes).await?;
+                        encoder.finish().await
+                    })?;
 
-                std::fs::write(&tmp_path_clone, &encoded_data)
-                    .map_err(|e| format!("write temp file: {e}"))?;
+                    std::fs::write(&tmp_path_clone, &encoded_data)
+                        .map_err(|e| format!("write temp file: {e}"))?;
 
-                let file_size = encoded_data.len() as u64;
-                Ok::<(u64, u16, u32), String>((file_size, actual_bd, decoded.sample_rate))
-            })
+                    let file_size = encoded_data.len() as u64;
+                    Ok::<(u64, u16, u32), String>((file_size, actual_bd, decoded.sample_rate))
+                }),
+                fichiers_de_la_tache,
+            )
             .await;
 
             let _ = std::fs::remove_file(&unique_path);
@@ -2312,6 +2649,32 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #8228 — comme [`Self::telecharger_dans_un_fichier_temporaire`], mais
+    /// rend le chemin dès la réponse amont acceptée : le corps continue
+    /// d'arriver en tâche de fond, et le décodeur Opus le lit au fil de l'eau
+    /// (poignée `dash_growth` inscrite sous ce chemin). Un refus amont (403)
+    /// reste rendu ici, avant toute session.
+    pub(super) async fn telecharger_en_croissance(
+        upstream_url: String,
+        upstream_headers: Vec<(String, String)>,
+        codec: &str,
+    ) -> Result<String, String> {
+        let reponse =
+            tokio::task::spawn_blocking(move || ouvrir_amont(&upstream_url, &upstream_headers))
+                .await
+                .map_err(|e| format!("download task panic: {e}"))??;
+        // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
+        let tmp_dl = std::env::temp_dir()
+            .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
+            .to_string_lossy()
+            .to_string();
+        let fichier = std::fs::File::create(&tmp_dl).map_err(|e| format!("write dl: {e}"))?;
+        let growth = crate::audio::dash_growth::DashGrowth::new(0);
+        crate::audio::dash_growth::register(&tmp_dl, growth.clone());
+        tokio::task::spawn_blocking(move || copier_en_croissance(reponse, fichier, growth));
+        Ok(tmp_dl)
+    }
+
     /// Premier temps, codecs que les renderers DLNA anciens refusent (AAC,
     /// MP4, Opus) : téléchargement puis pré-transcodage en FLAC, servi par
     /// une session de fichier avec Content-Length.
@@ -2367,13 +2730,33 @@ impl PlaybackOrchestrator {
             // ligne `amont_refuse_entetes_rejouees` reste écrite sur un refus,
             // et le fichier temporaire est supprimé par l'assistant en cas
             // d'échec comme de panique de la tâche.
-            let tmp_dl = match Self::telecharger_dans_un_fichier_temporaire(
-                stream_data.url.clone(),
-                stream_data.headers.clone(),
-                &codec_lower,
-            )
-            .await
+            //
+            // #8228 — l'Opus (YouTube) n'attend plus le fichier entier : le
+            // décodeur le lit pendant qu'il arrive. `googlevideo` ne débite
+            // qu'environ deux fois le temps réel ; l'attente valait la moitié
+            // de la durée du titre (190 s mesurées, fil 2724).
+            // Seulement si le décodeur sait servir la cible au fil de l'eau
+            // (48 kHz) : une zone plafonnée plus bas garde le téléchargement
+            // complet AVANT la session, sans quoi le renderer ouvrirait un
+            // flux muet pendant tout le téléchargement.
+            let telechargement = if codec_lower == "opus"
+                && crate::audio::decode::opus_servi_pendant_le_telechargement(Some(sr), Some(2))
             {
+                Self::telecharger_en_croissance(
+                    stream_data.url.clone(),
+                    stream_data.headers.clone(),
+                    &codec_lower,
+                )
+                .await
+            } else {
+                Self::telecharger_dans_un_fichier_temporaire(
+                    stream_data.url.clone(),
+                    stream_data.headers.clone(),
+                    &codec_lower,
+                )
+                .await
+            };
+            let tmp_dl = match telechargement {
                 Ok(chemin) => chemin,
                 Err(e) => {
                     warn!(error = %e, "streaming_aac_download_failed");
@@ -2395,7 +2778,7 @@ impl PlaybackOrchestrator {
             // fil de l'eau, sans rien bufferiser de plus — le démarrage
             // immédiat conquis en 0.9.106 est préservé. Sans traitement
             // actif, le canal reste celui d'avant, à l'octet près.
-            let aac_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+            let aac_dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr, 2);
             // #5114 — chargé avant la session : le flux dit s'il cuit le crossfeed.
             let info = StreamInfo {
                 crossfeed: aac_dsp.is_active() && aac_dsp.crossfeed_executable(),
@@ -2523,13 +2906,23 @@ impl PlaybackOrchestrator {
             // SERVIE, pas à celle du service : ses coefficients sont calculés
             // pour le fil.
             let sr = cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate);
-            let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+            let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr, 2);
             let https_dsp_active = https_dsp.is_active();
             // #5114 — lu avant que le porteur parte dans la tâche de décodage.
             let https_crossfeed = https_dsp_active && https_dsp.crossfeed_executable();
             let https_compensation = https_dsp
                 .compensation_cuite_db()
                 .filter(|_| https_dsp_active);
+            // #8188 — le plafond 16 bits de la zone (« Limiter à 16 bits »,
+            // ou le quirk `force_16bit` du catalogue), QUATRIÈME raison de ne
+            // pas relayer verbatim. #6909 l'avait branché sur le seul bras
+            // DASH (`reglages_dash`) : le bras HTTPS — Qobuz — relayait le
+            // FLAC 24/96 du CDN tel quel vers un Ruark R3 ou un Roberts
+            // Stream 94i+ (puces Frontier Silicon, 16 bits seulement), qui
+            // jouaient du SILENCE malgré le réglage (fil 2714). Même règle que
+            // le bras DASH et la bibliothèque (`dlna_cap_16bit_applies`).
+            let plafond_16 =
+                reglages_dash(&self.db, req.zone_id, stream_data.quality.bit_depth).plafond_16;
 
             let depart_qobuz = if service_name == "qobuz"
                 && codec_lower == "flac"
@@ -2554,6 +2947,7 @@ impl PlaybackOrchestrator {
                 && renderer_supports_mime
                 && !https_dsp_active
                 && cadence_plafonnee.is_none()
+                && !plafond_16
             {
                 return self
                     .servir_qobuz_natif_a_la_position(req, stream_data, depart_qobuz)
@@ -2575,6 +2969,7 @@ impl PlaybackOrchestrator {
                         zone_output_type.as_deref(),
                         device_id,
                         renderer_supports_mime,
+                        plafond_16,
                         &https_dsp,
                     )
                     .await
@@ -2597,6 +2992,7 @@ impl PlaybackOrchestrator {
                     renderer_supports_mime,
                     https_dsp_active,
                     cadence_plafonnee.is_some(),
+                    plafond_16,
                 )
             {
                 // Deux raisons d'arriver ici : le renderer ne sait pas lire
@@ -2618,6 +3014,7 @@ impl PlaybackOrchestrator {
                     enc_format,
                     dsp_active = https_dsp_active,
                     renderer_supports_mime,
+                    plafond_16,
                     "streaming_pretranscode_for_renderer_or_dsp"
                 );
 
@@ -2651,85 +3048,95 @@ impl PlaybackOrchestrator {
                 let wav_levels_tx = self
                     .levels_forwarder_if_allowed(req.zone_id, depart_qobuz as i64)
                     .await;
-                let transcode_result = tokio::task::spawn_blocking(move || {
-                    // 1. Download — #4366 : même chemin, même ligne de journal.
-                    telecharger_amont(&upstream_url, &upstream_headers, &tmp_dl_clone)?;
+                // #6718 — si cette résolution est abandonnée (préparation de la
+                // suivante hors budget), la tâche va au bout : ses fichiers
+                // sont alors supprimés à sa fin au lieu de rester orphelins.
+                let fichiers_de_la_tache = vec![tmp_dl.clone(), tmp_wav.clone()];
+                let transcode_result = super::pretranscode_abandonne_6718::attendre_ou_nettoyer(
+                    tokio::task::spawn_blocking(move || {
+                        // 1. Download — #4366 : même chemin, même ligne de journal.
+                        telecharger_amont(&upstream_url, &upstream_headers, &tmp_dl_clone)?;
 
-                    // 2. Decode to PCM
-                    let decoded = crate::audio::decode::decode_to_pcm(
-                        &tmp_dl_clone,
-                        Some(sr),
-                        Some(2),
-                        depart_qobuz as f64 / 1000.0,
-                        0.0,
-                    )?;
-                    let mut pcm_bytes = decoded.pcm_bytes();
-                    let mut actual_bd = decoded.bit_depth;
-                    let actual_sr = decoded.sample_rate;
-                    let actual_ch = decoded.channels;
+                        // 2. Decode to PCM
+                        let decoded = crate::audio::decode::decode_to_pcm(
+                            &tmp_dl_clone,
+                            Some(sr),
+                            Some(2),
+                            depart_qobuz as f64 / 1000.0,
+                            0.0,
+                        )?;
+                        let mut pcm_bytes = decoded.pcm_bytes();
+                        let mut actual_bd = decoded.bit_depth;
+                        let actual_sr = decoded.sample_rate;
+                        let actual_ch = decoded.channels;
 
-                    // Plafond 16 bits : UNIQUEMENT quand on retombe sur
-                    // WAV/LPCM. Le renderer a rejeté le FLAC, on sert donc
-                    // sous `DLNA.ORG_PN=LPCM`, un profil 16 bits seulement —
-                    // un Hi-Res 24 bits servi dessous joue du SILENCE sur un
-                    // Ruark R3 / LHC-62 (Yves, #1137).
-                    //
-                    // Quand c'est le TRAITEMENT qui impose le
-                    // pré-transcodage (#2863), le renderer sait lire le
-                    // FLAC : on ré-encode en FLAC pleine profondeur, et le
-                    // plafond n'a pas lieu d'être. Sans cette distinction,
-                    // armer un égaliseur ferait tomber tout le Hi-Res Qobuz
-                    // à 16 bits — une dégradation jamais demandée.
-                    if enc_is_wav && actual_bd > 16 {
-                        pcm_bytes =
-                            crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
-                        actual_bd = 16;
-                    }
+                        // Plafond 16 bits : UNIQUEMENT quand on retombe sur
+                        // WAV/LPCM. Le renderer a rejeté le FLAC, on sert donc
+                        // sous `DLNA.ORG_PN=LPCM`, un profil 16 bits seulement —
+                        // un Hi-Res 24 bits servi dessous joue du SILENCE sur un
+                        // Ruark R3 / LHC-62 (Yves, #1137).
+                        //
+                        // Quand c'est le TRAITEMENT qui impose le
+                        // pré-transcodage (#2863), le renderer sait lire le
+                        // FLAC : on ré-encode en FLAC pleine profondeur, et le
+                        // plafond n'a pas lieu d'être. Sans cette distinction,
+                        // armer un égaliseur ferait tomber tout le Hi-Res Qobuz
+                        // à 16 bits — une dégradation jamais demandée.
+                        //
+                        // #8188 — et quand la ZONE plafonne à 16 bits (Ruark R3,
+                        // Roberts Stream 94i+) : FLAC, mais 16 bits.
+                        if (enc_is_wav || plafond_16) && actual_bd > 16 {
+                            pcm_bytes =
+                                crate::audio::decode::convert_pcm_bytes(&pcm_bytes, actual_bd, 16);
+                            actual_bd = 16;
+                        }
 
-                    // ReplayGain, égaliseur, puis convolveur FIR — l'ordre
-                    // de `transcode_source_to_file`. Sans traitement actif,
-                    // `pcm_bytes` n'est pas touché d'un octet.
-                    https_dsp.process(&mut pcm_bytes, actual_bd);
+                        // ReplayGain, égaliseur, puis convolveur FIR — l'ordre
+                        // de `transcode_source_to_file`. Sans traitement actif,
+                        // `pcm_bytes` n'est pas touché d'un octet.
+                        https_dsp.process(&mut pcm_bytes, actual_bd);
 
-                    // Niveaux post-traitement : les VU décrivent ce qui sera
-                    // entendu, comme sur le bras DASH.
-                    if let Some(ref ltx) = wav_levels_tx {
-                        crate::audio::tap::send_windowed_pcm(
-                            ltx,
-                            &pcm_bytes,
+                        // Niveaux post-traitement : les VU décrivent ce qui sera
+                        // entendu, comme sur le bras DASH.
+                        if let Some(ref ltx) = wav_levels_tx {
+                            crate::audio::tap::send_windowed_pcm(
+                                ltx,
+                                &pcm_bytes,
+                                actual_bd,
+                                actual_ch as u16,
+                                actual_sr,
+                            );
+                        }
+
+                        // 3. Encode
+                        let rt = tokio::runtime::Handle::try_current()
+                            .map_err(|e| format!("no tokio runtime: {e}"))?;
+                        let encoded_data = rt.block_on(async {
+                            let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                                enc_format,
+                                actual_sr,
+                                actual_bd as u32,
+                                actual_ch,
+                            );
+                            encoder.start().await?;
+                            encoder.write(&pcm_bytes).await?;
+                            encoder.finish().await
+                        })?;
+
+                        std::fs::write(&tmp_wav_clone, &encoded_data)
+                            .map_err(|e| format!("write pre-transcode: {e}"))?;
+
+                        let _ = std::fs::remove_file(&tmp_dl_clone);
+                        let file_size = encoded_data.len() as u64;
+                        Ok::<(u64, u16, u32, u16), String>((
+                            file_size,
                             actual_bd,
+                            actual_sr,
                             actual_ch as u16,
-                            actual_sr,
-                        );
-                    }
-
-                    // 3. Encode
-                    let rt = tokio::runtime::Handle::try_current()
-                        .map_err(|e| format!("no tokio runtime: {e}"))?;
-                    let encoded_data = rt.block_on(async {
-                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            enc_format,
-                            actual_sr,
-                            actual_bd as u32,
-                            actual_ch,
-                        );
-                        encoder.start().await?;
-                        encoder.write(&pcm_bytes).await?;
-                        encoder.finish().await
-                    })?;
-
-                    std::fs::write(&tmp_wav_clone, &encoded_data)
-                        .map_err(|e| format!("write pre-transcode: {e}"))?;
-
-                    let _ = std::fs::remove_file(&tmp_dl_clone);
-                    let file_size = encoded_data.len() as u64;
-                    Ok::<(u64, u16, u32, u16), String>((
-                        file_size,
-                        actual_bd,
-                        actual_sr,
-                        actual_ch as u16,
-                    ))
-                })
+                        ))
+                    }),
+                    fichiers_de_la_tache,
+                )
                 .await;
 
                 match transcode_result {
@@ -2915,6 +3322,8 @@ impl PlaybackOrchestrator {
         zone_output_type: Option<&str>,
         device_id: &str,
         renderer_supports_mime: bool,
+        // #8188 — plafond 16 bits de la zone.
+        plafond_16: bool,
         dsp: &StreamingDsp,
     ) -> Option<u16> {
         let decodable = decodage_progressif_par_range(service_name, codec_lower, &stream_data.url);
@@ -2937,7 +3346,7 @@ impl PlaybackOrchestrator {
         if !service_en_wav_progressif(actif, sortie_reseau, consenti, decodable, true) {
             return None;
         }
-        let bd = if renderer_supports_mime {
+        let bd = if renderer_supports_mime && !plafond_16 {
             cap_output_bit_depth(stream_data.quality.bit_depth)
         } else {
             16
@@ -3058,6 +3467,16 @@ pub(crate) fn decodage_progressif_par_range(service: &str, codec: &str, url: &st
         && codec == "flac"
 }
 
+/// #8444 — l'Opus d'un service (YouTube) vers une sortie locale ou OAAT se
+/// décode-t-il PENDANT son téléchargement ? Oui quand le décodeur au fil de
+/// l'eau sert la cible telle quelle (48 kHz ou libre, stéréo) et sans seek ;
+/// sinon le chemin d'avant (téléchargement complet, puis décodage) reste.
+pub(crate) fn opus_decode_pendant_le_telechargement(codec: &str, sr: u32, seek_s: f64) -> bool {
+    codec.eq_ignore_ascii_case("opus")
+        && seek_s <= 0.0
+        && crate::audio::decode::opus_servi_pendant_le_telechargement(Some(sr), Some(2))
+}
+
 #[cfg(test)]
 mod decodage_progressif_3568_tests {
     use super::decodage_progressif_par_range as progressif;
@@ -3160,5 +3579,137 @@ mod remux_par_defaut_7266_tests {
             !remux(source_dash_en_flac("AAC"), false, false, false, false),
             "un AAC DASH sans traitement prend le remux FLAC, qui échoue"
         );
+    }
+}
+
+#[cfg(test)]
+mod replaygain_oaat_8689 {
+    use super::super::service_wav_progressif_5080::{
+        cdn_par_range, flux_qobuz, orchestrateur, requete_qobuz,
+    };
+    use crate::audio::replaygain::{
+        MODE_KEY, PREAMP_KEY, SERVICES_ENABLED_KEY,
+        services::{GainsDuService, noter},
+    };
+    use crate::db::{settings_repo::SettingsRepo, zone_repo::ZoneRepo};
+    use std::time::Duration;
+
+    /// Le vrai producteur WAV, un CDN synthétique, aucune sortie audio.
+    /// Le gain doit atteindre les octets OAAT, pas seulement le calcul DSP.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn le_wav_oaat_des_services_porte_le_gain_8689() {
+        let orch = orchestrateur();
+        let zone = ZoneRepo::with_backend(orch.db.clone())
+            .create("RG OAAT", Some("oaat"), Some("oaat:8689-test"))
+            .unwrap();
+        let reglages = SettingsRepo::with_backend(orch.db.clone());
+        reglages.set(MODE_KEY, "track").unwrap();
+        reglages.set(PREAMP_KEY, "2").unwrap();
+        let brut = crate::audio::decode::decode_to_pcm(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+            None,
+            Some(2),
+            0.0,
+            0.0,
+        )
+        .unwrap();
+        let flux = flux_qobuz(cdn_par_range().await, brut.sample_rate, brut.bit_depth);
+        for source in ["qobuz", "tidal"] {
+            let mut req = requete_qobuz(zone);
+            req.source = Some(source.into());
+            req.source_id = Some("8689301".into());
+            noter(
+                source,
+                "8689301",
+                GainsDuService {
+                    piste_db: Some(-8.0),
+                    piste_pic: Some(0.5),
+                    ..Default::default()
+                },
+            );
+            for (actif, pure, strict) in [
+                (false, false, false),
+                (true, true, false),
+                (true, false, true),
+                (true, false, false),
+            ] {
+                reglages
+                    .set(SERVICES_ENABLED_KEY, if actif { "true" } else { "false" })
+                    .unwrap();
+                reglages
+                    .set(
+                        &format!("zone_{zone}_audiophile"),
+                        &format!("{{\"enabled\":{pure}}}"),
+                    )
+                    .unwrap();
+                reglages
+                    .set(
+                        &crate::audio::bitperfect_strict::cle_de_zone(zone),
+                        if strict { "true" } else { "false" },
+                    )
+                    .unwrap();
+                let (_, sid, mime, _) = orch
+                    .resoudre_flux_local_ou_oaat(&req, source, &flux, false)
+                    .await
+                    .unwrap();
+                assert_eq!(mime, "audio/wav");
+                let sid = sid.unwrap();
+                let session = orch
+                    .streamer
+                    .sessions_state()
+                    .lock()
+                    .await
+                    .get(&sid)
+                    .unwrap()
+                    .clone();
+                let entete = tokio::time::timeout(Duration::from_secs(10), session.recv_chunk())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&entete[..4], b"RIFF");
+                assert!(entete.len() <= 80);
+                let attendu = brut.pcm_bytes();
+                let mut recu = Vec::new();
+                while recu.len() < attendu.len() {
+                    match tokio::time::timeout(Duration::from_secs(10), session.recv_chunk()).await
+                    {
+                        Ok(Some(chunk)) => recu.extend_from_slice(&chunk),
+                        _ => break,
+                    }
+                }
+                assert_eq!(recu.len(), attendu.len(), "PCM complet attendu");
+                if actif && !pure && !strict {
+                    // TPDF : au plus 1 LSB de bruit + 0,5 LSB d'arrondi.
+                    // Sa graine dépend du bloc : comparer les valeurs, pas
+                    // le bruit d'un tampon entier à celui des blocs réseau.
+                    assert_ne!(recu, attendu, "le gain doit modifier le signal");
+                    let largeur = usize::from(brut.bit_depth / 8);
+                    let facteur = 10f64.powf(-6.0 / 20.0);
+                    for (i, (octets, original)) in recu
+                        .chunks_exact(largeur)
+                        .zip(brut.samples_i32.iter())
+                        .enumerate()
+                    {
+                        let obtenu = match largeur {
+                            2 => i16::from_le_bytes([octets[0], octets[1]]) as i32,
+                            3 => i32::from_le_bytes([0, octets[0], octets[1], octets[2]]) >> 8,
+                            4 => i32::from_le_bytes(octets.try_into().unwrap()),
+                            _ => panic!("profondeur inattendue"),
+                        };
+                        let ideal = *original as f64 * facteur;
+                        assert!(
+                            (obtenu as f64 - ideal).abs() <= 1.51,
+                            "#8689 : gain absent ou incorrect dans le WAV OAAT : source={source}, échantillon={i}, obtenu={obtenu}, idéal={ideal}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        recu == attendu,
+                        "#8689 : garde ignorée dans le WAV OAAT : source={source}, actif={actif}, pure={pure}, strict={strict}"
+                    );
+                }
+                orch.streamer.remove_session(&sid).await;
+            }
+        }
     }
 }

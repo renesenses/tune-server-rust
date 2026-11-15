@@ -248,6 +248,11 @@ fn champ_de(nom: &str) -> Option<&'static str> {
         ("interprete", "track_artist"),
         ("artiste_album", "album_artist"),
         ("compositeur", "composer"),
+        // #8325
+        ("chef", "conductor"),
+        ("ensemble", "ensemble"),
+        ("orchestre", "ensemble"),
+        ("oeuvre", "work"),
         ("dossier", "folder"),
         ("annee", "year"),
         ("annee_originale", "original_year"),

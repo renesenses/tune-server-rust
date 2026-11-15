@@ -132,7 +132,10 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
         // Une source de SERVICE ne rend rien ici — c'est `source_streaming`
         // qui ajoute les favoris du service au résultat.
         "source" => texte("COALESCE(NULLIF(t.source, ''), 'local')"),
-        "year" => nombre("t.year"),
+        // Go du 13/11 — l'année de la piste, à défaut celle de son album
+        // (lecture seule : rien n'est écrit). `al` est joint par toutes les
+        // requêtes de pistes des playlists ; la sous-requête n'en dépend pas.
+        "year" => nombre(tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE),
         "sample_rate" => nombre("t.sample_rate"),
         "bit_depth" => nombre("t.bit_depth"),
         "duration_ms" | "duration" => nombre("t.duration_ms"),
@@ -452,6 +455,37 @@ pub(crate) fn normaliser_op(brut: &str) -> &str {
         // moteur de tune-core (`Operator::NotContains`).
         "not_contains" | "does_not_contain" | "not_like" => NE_CONTIENT_PAS,
         autre => autre,
+    }
+}
+
+/// #8325 — chef, ensemble, œuvre : la condition d'une règle de PISTE
+/// (`nier` posé sur la piste elle-même), ou `None` si le champ n'en est pas
+/// un. `Some(None)` : opérateur ou valeur intraduisible.
+pub(crate) fn condition_classique(
+    champ: &str,
+    op: &str,
+    valeur: Option<&serde_json::Value>,
+) -> Option<Option<(String, bool)>> {
+    let c = tune_core::db::facettes_classiques::Champ::facette(champ)?;
+    Some(tune_core::db::facettes_classiques::regle(
+        c,
+        op,
+        &valeurs_de_regle(op, valeur),
+        "t.id",
+    ))
+}
+
+/// Les valeurs d'une règle texte : une liste (`in`, tableau ou « a, b »)
+/// ou la valeur seule.
+pub(crate) fn valeurs_de_regle(op: &str, valeur: Option<&serde_json::Value>) -> Vec<String> {
+    match (op, valeur) {
+        ("in", Some(serde_json::Value::Array(arr))) => {
+            arr.iter().map(|v| texte_de(Some(v))).collect()
+        }
+        ("in", Some(serde_json::Value::String(s))) => {
+            s.split(',').map(|x| x.trim().to_string()).collect()
+        }
+        _ => vec![texte_de(valeur)],
     }
 }
 
@@ -820,15 +854,19 @@ mod tests {
         assert!(
             condition(c, ">=", "1969")
                 .unwrap()
-                .contains("t.year >= 1969")
+                .contains(&format!("{} >= 1969", c.sql))
         );
-        assert!(condition(c, "<", "1969").unwrap().contains("t.year < 1969"));
+        assert!(
+            condition(c, "<", "1969")
+                .unwrap()
+                .contains(&format!("{} < 1969", c.sql))
+        );
         // « Contient » sur un nombre porte sur sa forme textuelle : « 202 »
         // trouve une décennie (#1008).
         assert!(
             condition(c, "contains", "202")
                 .unwrap()
-                .contains("CAST(t.year AS TEXT)"),
+                .contains(&format!("CAST({} AS TEXT)", c.sql)),
             "le contains d'un nombre doit passer par le texte"
         );
     }

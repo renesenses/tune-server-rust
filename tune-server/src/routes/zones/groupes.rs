@@ -21,7 +21,7 @@ pub(super) struct CreateGroup {
 /// Kept separate from the HTTP layer so the rules can be unit-tested without a
 /// database, and so every refusal is forced to carry the words explaining it.
 #[derive(Debug, PartialEq)]
-pub(super) enum GroupRefusal {
+pub(crate) enum GroupRefusal {
     /// Fewer than two *distinct* zones.
     NotEnoughZones,
     /// A zone id that no longer exists (stale list on the client's side).
@@ -33,8 +33,16 @@ pub(super) enum GroupRefusal {
     /// message can say *which* zones clash.
     SameOutput(String, String),
     /// #6132 — deux zones locales de la machine, sous ASIO : le pilote ne
-    /// tient qu'un flux par machine, « une zone à la fois ».
+    /// tient qu'un flux par machine, « une zone à la fois ». Depuis #7759,
+    /// création et extension refusent avant ([`GroupRefusal::AsioUnsupported`]) ;
+    /// ne reste que le recalcul de la sortie double.
     AsioOneZoneAtATime(String, String),
+    /// #7759 — décision de Bertrand du 11/11 : la lecture groupée n'est
+    /// possible qu'en WASAPI. Un membre dont la sortie s'ouvre en ASIO (nommé
+    /// ici) suffit à refuser le groupe, quelle que soit la forme du groupe :
+    /// en ASIO le groupe perdait le gapless et coupait quelques secondes
+    /// (Didier, fil 2215), et le testeur préfère un refus à un mode dégradé.
+    AsioUnsupported(String),
 }
 
 /// #6132 — les sorties suiveuses d'un groupe : le meneur est une zone locale,
@@ -80,6 +88,161 @@ pub(super) fn refus_asio(
     let asio = |b: Option<&str>| b.is_some_and(|b| b.eq_ignore_ascii_case("asio"));
     (asio(backend_meneur) || asio(backend_suiveur))
         .then(|| GroupRefusal::AsioOneZoneAtATime(nom_meneur.to_string(), nom_suiveur.to_string()))
+}
+
+/// #7759 — le premier membre du groupe dont la sortie s'ouvre en ASIO, ou
+/// `None`. `backends` donne, dans l'ordre du groupe, `(nom de la zone,
+/// backend ouvrable de sa sortie)` ; une sortie réseau n'a pas de backend
+/// local (`None`) et n'est jamais refusée ici.
+pub(super) fn membre_asio(backends: &[(String, Option<String>)]) -> Option<GroupRefusal> {
+    backends
+        .iter()
+        .find(|(_, b)| {
+            b.as_deref()
+                .is_some_and(|b| b.trim().eq_ignore_ascii_case("asio"))
+        })
+        .map(|(nom, _)| GroupRefusal::AsioUnsupported(nom.clone()))
+}
+
+/// #7759 — refuser un groupe dont un membre sort par ASIO. Le backend est
+/// celui de [`backend_de_la_sortie`] : la sortie enregistrée d'abord, le
+/// backend réglé pour la machine pour une sortie locale pas encore vue.
+pub(crate) async fn refus_du_groupe_asio(
+    state: &AppState,
+    zone_ids: &[i64],
+    zones: &[Zone],
+) -> Option<GroupRefusal> {
+    let mut backends = Vec::with_capacity(zone_ids.len());
+    for id in zone_ids {
+        let sortie = zones
+            .iter()
+            .find(|z| z.id == Some(*id))
+            .and_then(|z| z.output_device_id.clone());
+        backends.push((
+            nom_de_zone(zones, *id),
+            backend_de_la_sortie(state, sortie.as_deref()).await,
+        ));
+    }
+    membre_asio(&backends)
+}
+
+/// #7759 — parmi `groups`, ceux qu'il faut défaire : un membre dont la sortie
+/// ENREGISTRÉE s'ouvre en ASIO. Rend `(index du groupe, zone ASIO)`.
+///
+/// `backend_enregistre` ne connaît que les sorties présentes au registre, sans
+/// repli sur le réglage de la machine : défaire est irréversible, et une
+/// sortie absente (DAC débranché, « Speakers » WASAPI enregistré plus tard
+/// sur une machine réglée en ASIO, réglage `asio` hérité hors Windows) ne
+/// doit jamais coûter un groupe valide. Le repli reste bon pour REFUSER une
+/// création, que l'utilisateur peut corriger sur-le-champ.
+pub(super) fn groupes_a_defaire(
+    groups: &[Value],
+    zones: &[Zone],
+    backend_enregistre: &std::collections::HashMap<i64, String>,
+) -> Vec<(usize, String)> {
+    groups
+        .iter()
+        .enumerate()
+        .filter_map(|(i, g)| {
+            let backends: Vec<(String, Option<String>)> = g["zone_ids"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| (nom_de_zone(zones, id), backend_enregistre.get(&id).cloned()))
+                .collect();
+            match membre_asio(&backends) {
+                Some(GroupRefusal::AsioUnsupported(zone)) => Some((i, zone)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// #7759 — défaire chaque groupe enregistré dont un membre sort désormais par
+/// ASIO. Rend les numéros des groupes défaits.
+///
+/// Pourquoi défaire, et pourquoi ici : le choix ASIO/WASAPI est un réglage de
+/// la machine, et les sorties locales ne s'ouvrent sous le nouveau backend
+/// qu'au démarrage suivant (ou à la bascule à chaud d'un repli WASAPI vers
+/// ASIO, #5353). C'est donc au démarrage, et après cette bascule, que la
+/// zone « passe en ASIO » pour de bon. Garder le groupe en le signalant
+/// laisserait le mode dégradé que le testeur refuse ; le refuser ne se peut
+/// plus, il existe déjà. On le défait, comme le ferait « Dégrouper » : les
+/// zones rejouent chacune de leur côté, rien d'autre n'est touché. Seules
+/// les sorties enregistrées comptent ([`groupes_a_defaire`]).
+pub async fn defaire_les_groupes_asio(state: &AppState) -> Vec<i64> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let mut groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let zones = ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap_or_default();
+    let mut backend_enregistre = std::collections::HashMap::new();
+    for z in &zones {
+        if let Some(id) = z.id
+            && let Some(b) = crate::routes::zones::backend_de_la_sortie_de_la_zone(
+                state,
+                z.output_device_id.as_deref(),
+            )
+            .await
+        {
+            backend_enregistre.insert(id, b);
+        }
+    }
+    defaire_les_groupes_selon(state, &settings, &mut groups, &zones, &backend_enregistre)
+}
+
+/// Le corps de [`defaire_les_groupes_asio`], les backends donnés.
+pub(super) fn defaire_les_groupes_selon(
+    state: &AppState,
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    groups: &mut Vec<Value>,
+    zones: &[Zone],
+    backend_enregistre: &std::collections::HashMap<i64, String>,
+) -> Vec<i64> {
+    let a_defaire = groupes_a_defaire(groups, zones, backend_enregistre);
+    if a_defaire.is_empty() {
+        return Vec::new();
+    }
+    let mut defaits = Vec::new();
+    for (i, zone) in a_defaire.iter().rev() {
+        let mut group = groups.remove(*i);
+        if let Some(meneur) = group["leader_id"].as_i64().or_else(|| {
+            group["zone_ids"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(Value::as_i64)
+        }) {
+            poser_la_sortie_double(settings, &mut group, meneur, Vec::new());
+        }
+        let gid = group.get("id").and_then(Value::as_i64);
+        warn!(
+            group_id = ?gid,
+            zone = %zone,
+            "groupe_asio_defait — la lecture groupée n'est possible qu'en WASAPI (#7759)"
+        );
+        if let Some(gid) = gid {
+            defaits.push(gid);
+        }
+    }
+    if let Ok(texte) = serde_json::to_string(&*groups) {
+        settings.set("zone_groups", &texte).ok();
+    }
+    for id in &defaits {
+        state.event_bus.emit_typed(
+            tune_core::event_types::EventType::GroupDeleted,
+            json!({ "id": id, "reason": "group_asio_unsupported" }),
+        );
+    }
+    defaits
 }
 
 /// Le nom d'une zone, pour un message.
@@ -166,12 +329,66 @@ fn poser_la_sortie_double(
     });
 }
 
+/// #8680 (fil 2800) — au démarrage : une zone n'appartient plus qu'à UN
+/// groupe enregistré (le plus récent gagne, voir
+/// [`tune_core::zones::groupes_enregistres::normaliser`]).
+///
+/// Les groupes empilés avant la rc11 se chevauchaient (une zone dans 23
+/// groupes, une suiveuse meneuse d'un autre groupe) et le relais allumait
+/// toutes les pièces en cascade. Une meneuse dont le groupe disparaît, ou qui
+/// ne mène plus rien, perd aussi sa sortie double : le réglage interne que sa
+/// lecture lit ne doit pas survivre au groupe. Les groupes qui restent la
+/// retrouvent au recalcul qui suit. Rien n'est réécrit si les groupes sont
+/// déjà dans la règle.
+pub(crate) fn normaliser_les_groupes_au_demarrage(state: &AppState) {
+    let fait = match tune_core::zones::groupes_enregistres::normaliser_les_groupes_enregistres(
+        &state.backend,
+    ) {
+        Ok(Some(fait)) => fait,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(%error, "zone_groups_normalisation_echouee");
+            return;
+        }
+    };
+    let meneuse = |g: &Value| {
+        g["leader_id"].as_i64().or_else(|| {
+            g["zone_ids"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(Value::as_i64)
+        })
+    };
+    let meneuses_apres: Vec<i64> = fait.apres.iter().filter_map(meneuse).collect();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    for groupe in fait
+        .avant
+        .iter()
+        .filter(|g| g.get("sortie_double").is_some())
+    {
+        if let Some(m) = meneuse(groupe)
+            && !meneuses_apres.contains(&m)
+        {
+            settings
+                .delete(&tune_core::outputs::sortie_double::cle_de_zone(m))
+                .ok();
+        }
+    }
+}
+
 /// #6132 — au démarrage : recalculer la sortie double de chaque groupe
 /// enregistré, pour que les groupes faits avant cette version (ou avant
 /// qu'une zone ne change de sortie) jouent ensemble sans geste de
 /// l'utilisateur. Un groupe qu'ASIO interdit perd sa sortie double, sans
 /// être supprimé : il reste un groupe de volume, comme avant.
 pub async fn recalculer_les_sorties_doubles(state: &AppState) {
+    // #8680 — d'abord la règle « une zone, un groupe au plus » sur les
+    // groupes enregistrés avant la rc11 : le recalcul qui suit part de
+    // groupes qui ne se chevauchent plus.
+    normaliser_les_groupes_au_demarrage(state);
+    // #7759 — un groupe dont un membre sort désormais par ASIO est défait
+    // avant tout recalcul.
+    defaire_les_groupes_asio(state).await;
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -257,38 +474,48 @@ pub(super) fn validate_group(zone_ids: &[i64], zones: &[Zone]) -> Result<Vec<i64
 
 /// Turn a refusal into the error envelope the web client understands:
 /// `error` is the machine code, `message` the sentence it displays.
-pub(super) fn group_refusal_response(
+pub(crate) fn group_refusal_response(
     refusal: &GroupRefusal,
     lang: &str,
 ) -> axum::response::Response {
-    let (status, code, message) = match refusal {
+    // `message_key` et `params` (#7077) : le client web n'affiche la phrase du
+    // serveur que si elle se dit traduite ; sans eux, il montrait « le serveur
+    // n'a pas pu traiter la demande » à la place de la raison du refus.
+    let (status, code, cle, params): (StatusCode, &str, &str, Vec<(&str, String)>) = match refusal {
         GroupRefusal::NotEnoughZones => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "group_needs_two_zones",
-            crate::i18n::t(lang, "zonegroup.needsTwoZones"),
+            "zonegroup.needsTwoZones",
+            Vec::new(),
         ),
         GroupRefusal::UnknownZone(id) => (
             StatusCode::NOT_FOUND,
             "group_unknown_zone",
-            crate::i18n::t(lang, "zonegroup.unknownZone").replace("{id}", &id.to_string()),
+            "zonegroup.unknownZone",
+            vec![("id", id.to_string())],
         ),
         GroupRefusal::SameOutput(a, b) => (
             StatusCode::CONFLICT,
             "group_same_output",
-            crate::i18n::t(lang, "zonegroup.sameOutput")
-                .replace("{a}", a)
-                .replace("{b}", b),
+            "zonegroup.sameOutput",
+            vec![("a", a.clone()), ("b", b.clone())],
         ),
         GroupRefusal::AsioOneZoneAtATime(a, b) => (
             StatusCode::CONFLICT,
             "group_asio_one_zone",
-            crate::i18n::t(lang, "zonegroup.asioOneZone")
-                .replace("{a}", a)
-                .replace("{b}", b),
+            "zonegroup.asioOneZone",
+            vec![("a", a.clone()), ("b", b.clone())],
+        ),
+        GroupRefusal::AsioUnsupported(zone) => (
+            StatusCode::BAD_REQUEST,
+            "group_asio_unsupported",
+            "zonegroup.asioUnsupported",
+            vec![("zone", zone.clone())],
         ),
     };
-    warn!(code, message = %message, "zone_group_refused");
-    (status, Json(json!({ "error": code, "message": message }))).into_response()
+    let corps = crate::message_api::avec_message_en(json!({ "error": code }), lang, cle, &params);
+    warn!(code, message = %corps["message"].as_str().unwrap_or_default(), "zone_group_refused");
+    (status, Json(corps)).into_response()
 }
 
 pub(super) async fn list_groups(State(state): State<AppState>) -> Json<Value> {
@@ -316,6 +543,65 @@ pub(super) async fn list_groups(State(state): State<AppState>) -> Json<Value> {
     Json(json!(groups))
 }
 
+/// #7937, #8680 — `zone_ids` quittent les groupes de `groups` (une zone
+/// n'appartient qu'à UN groupe), pour la création d'un groupe comme pour la
+/// recomposition d'un groupe existant (`groups` ne compte alors plus ce
+/// groupe).
+///
+/// #6132 — un groupe touché perd d'abord sa sortie double : celle de sa
+/// meneuse ne doit pas survivre à un groupe défait. Celui qui reste (encore
+/// deux zones ou plus) la retrouve, recalculée sur sa nouvelle composition,
+/// juste après.
+async fn retirer_des_autres_groupes(
+    state: &AppState,
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    groups: &mut Vec<Value>,
+    zone_ids: &[i64],
+    zones: &[Zone],
+) {
+    use tune_core::zones::groupes_enregistres::retirer_les_zones;
+    let touches: Vec<i64> = groups
+        .iter_mut()
+        .filter(|g| {
+            g["zone_ids"].as_array().is_some_and(|a| {
+                a.iter()
+                    .filter_map(Value::as_i64)
+                    .any(|z| zone_ids.contains(&z))
+            })
+        })
+        .filter_map(|g| {
+            let gid = g.get("id").and_then(Value::as_i64);
+            if g.get("sortie_double").is_some()
+                && let Some(ancien_meneur) = g["leader_id"].as_i64()
+            {
+                poser_la_sortie_double(settings, g, ancien_meneur, Vec::new());
+            }
+            gid
+        })
+        .collect();
+    retirer_les_zones(groups, zone_ids);
+    for g in groups.iter_mut().filter(|g| {
+        g.get("id")
+            .and_then(Value::as_i64)
+            .is_some_and(|gid| touches.contains(&gid))
+    }) {
+        let restants: Vec<i64> = g["zone_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_i64).collect())
+            .unwrap_or_default();
+        let Some(meneur) = g["leader_id"]
+            .as_i64()
+            .or_else(|| restants.first().copied())
+        else {
+            continue;
+        };
+        let choix = sorties_doubles_du_groupe(state, meneur, &restants, zones)
+            .await
+            .unwrap_or_default();
+        poser_la_sortie_double(settings, g, meneur, choix);
+    }
+}
+
 pub(super) async fn create_group(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -339,6 +625,10 @@ pub(super) async fn create_group(
         Ok(ids) => ids,
         Err(refusal) => return Ok(group_refusal_response(&refusal, &lang)),
     };
+    // #7759 — la lecture groupée n'est possible qu'en WASAPI.
+    if let Some(refusal) = refus_du_groupe_asio(&state, &zone_ids, &zones).await {
+        return Ok(group_refusal_response(&refusal, &lang));
+    }
 
     let name = body
         .name
@@ -376,51 +666,8 @@ pub(super) async fn create_group(
     // quittent les précédents. Sans cela l'ancien groupe survivait au
     // nouveau (le client web regroupe sans dégrouper d'abord), et défaire
     // l'un laissait l'autre — le groupe « revenait ».
-    use tune_core::zones::groupes_enregistres::{prochain_numero, retirer_les_zones};
-    // #6132 — un groupe touché perd d'abord sa sortie double : celle de sa
-    // meneuse ne doit pas survivre à un groupe défait. Celui qui reste
-    // (encore deux zones ou plus) la retrouve, recalculée sur sa nouvelle
-    // composition, juste après.
-    let touches: Vec<i64> = groups
-        .iter_mut()
-        .filter(|g| {
-            g["zone_ids"].as_array().is_some_and(|a| {
-                a.iter()
-                    .filter_map(Value::as_i64)
-                    .any(|z| zone_ids.contains(&z))
-            })
-        })
-        .filter_map(|g| {
-            let gid = g.get("id").and_then(Value::as_i64);
-            if g.get("sortie_double").is_some()
-                && let Some(ancien_meneur) = g["leader_id"].as_i64()
-            {
-                poser_la_sortie_double(&settings, g, ancien_meneur, Vec::new());
-            }
-            gid
-        })
-        .collect();
-    retirer_les_zones(&mut groups, &zone_ids);
-    for g in groups.iter_mut().filter(|g| {
-        g.get("id")
-            .and_then(Value::as_i64)
-            .is_some_and(|gid| touches.contains(&gid))
-    }) {
-        let restants: Vec<i64> = g["zone_ids"]
-            .as_array()
-            .map(|a| a.iter().filter_map(Value::as_i64).collect())
-            .unwrap_or_default();
-        let Some(meneur) = g["leader_id"]
-            .as_i64()
-            .or_else(|| restants.first().copied())
-        else {
-            continue;
-        };
-        let choix = sorties_doubles_du_groupe(&state, meneur, &restants, &zones)
-            .await
-            .unwrap_or_default();
-        poser_la_sortie_double(&settings, g, meneur, choix);
-    }
+    use tune_core::zones::groupes_enregistres::prochain_numero;
+    retirer_des_autres_groupes(&state, &settings, &mut groups, &zone_ids, &zones).await;
     let id = prochain_numero(&groups);
     let mut group = json!({
         "id": id,
@@ -486,25 +733,56 @@ pub(super) async fn patch_group(
         .iter()
         .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
     match idx {
-        Some(i) => {
+        Some(mut i) => {
             if let Some(ref name) = body.name {
                 groups[i]["name"] = json!(name);
             }
-            if let Some(ref zone_ids) = body.zone_ids {
+            if let Some(ref demandees) = body.zone_ids {
                 // #6132 — la sortie double suit la composition du groupe.
                 let zones = ZoneRepo::with_backend(state.backend.clone())
                     .list()
                     .unwrap_or_default();
+                // #8680 — même contrôle qu'à la création : deux zones
+                // distinctes au moins, qui existent, sur deux sorties.
+                let zone_ids = match validate_group(demandees, &zones) {
+                    Ok(ids) => ids,
+                    Err(refusal) => return Ok(group_refusal_response(&refusal, &lang)),
+                };
+                // #7759 — étendre un groupe à une zone ASIO est refusé comme
+                // le créer.
+                if let Some(refusal) = refus_du_groupe_asio(&state, &zone_ids, &zones).await {
+                    return Ok(group_refusal_response(&refusal, &lang));
+                }
+                // #8680 — une meneuse retirée du groupe cède sa place à la
+                // première zone : une meneuse hors de ses zones relayait sans
+                // être du groupe.
                 let leader_id = groups[i]["leader_id"]
                     .as_i64()
-                    .or_else(|| zone_ids.first().copied())
-                    .unwrap_or_default();
+                    .filter(|id| zone_ids.contains(id))
+                    .unwrap_or(zone_ids[0]);
                 let choix =
-                    match sorties_doubles_du_groupe(&state, leader_id, zone_ids, &zones).await {
+                    match sorties_doubles_du_groupe(&state, leader_id, &zone_ids, &zones).await {
                         Ok(choix) => choix,
                         Err(refusal) => return Ok(group_refusal_response(&refusal, &lang)),
                     };
+                // #8680 (fil 2800) — une zone n'appartient qu'à UN groupe,
+                // comme à la création (#7937) : celles ajoutées ici quittent
+                // leurs autres groupes. Le groupe recomposé passe en fin de
+                // liste, il devient le plus récent.
+                let mut groupe = groups.remove(i);
+                if groupe.get("sortie_double").is_some()
+                    && let Some(ancien_meneur) = groupe["leader_id"].as_i64()
+                    && ancien_meneur != leader_id
+                {
+                    poser_la_sortie_double(&settings, &mut groupe, ancien_meneur, Vec::new());
+                }
+                retirer_des_autres_groupes(&state, &settings, &mut groups, &zone_ids, &zones).await;
+                groups.push(groupe);
+                i = groups.len() - 1;
                 groups[i]["zone_ids"] = json!(zone_ids);
+                if groups[i].get("leader_id").is_some() {
+                    groups[i]["leader_id"] = json!(leader_id);
+                }
                 poser_la_sortie_double(&settings, &mut groups[i], leader_id, choix);
             }
             let result = groups[i].clone();
@@ -525,7 +803,51 @@ pub(super) async fn group_volume(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
     Json(body): Json<GroupVolumeRequest>,
-) -> Result<impl IntoResponse, AppError> {
+) -> axum::response::Response {
+    appliquer_le_volume_du_groupe(&state, group_id, body.master_volume, body.offsets).await
+}
+
+/// #8445 — le volume que chaque membre d'un groupe reçoit du volume maître.
+///
+/// `effectif = maître + décalage du membre`, borné à 0..1. Le décalage vient
+/// de la requête si elle en porte, sinon de ceux que le groupe a ENREGISTRÉS :
+/// avant #8445, une requête qui ne portait que `master_volume` (le curseur du
+/// client web) remettait chaque décalage à zéro à l'application, alors même
+/// que le groupe les gardait en base. Un membre en volume fixe (#2811) n'en
+/// reçoit aucun : il reste à 100 %, bit-perfect.
+pub(crate) fn volumes_des_membres(
+    zone_ids: &[i64],
+    master: f64,
+    decalages: &serde_json::Map<String, Value>,
+    fixes: &[i64],
+) -> Vec<(i64, f64)> {
+    zone_ids
+        .iter()
+        .filter(|zid| !fixes.contains(zid))
+        .map(|zid| {
+            let decalage = decalages
+                .get(&zid.to_string())
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            (*zid, (master + decalage).clamp(0.0, 1.0))
+        })
+        .collect()
+}
+
+/// #8445 — `POST /zones/groups/{id}/volume` et `POST
+/// /zone-manager/groups/{id}/volume` : un seul chemin pour le volume maître.
+///
+/// Les deux routes portaient chacune une copie de ce code. Un membre qui
+/// refuse le volume (verrou PURE, appareil injoignable) ne prive plus les
+/// suivants du leur : ils sont tous servis, et la réponse nomme ceux qui ont
+/// refusé (`zones_refusees`). Seul un groupe dont AUCUN membre n'a accepté
+/// rend l'erreur du premier refus.
+pub(crate) async fn appliquer_le_volume_du_groupe(
+    state: &AppState,
+    group_id: i64,
+    master_volume: Option<f64>,
+    offsets: Option<std::collections::HashMap<String, f64>>,
+) -> axum::response::Response {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -534,53 +856,84 @@ pub(super) async fn group_volume(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let idx = groups
+    let Some(i) = groups
         .iter()
-        .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
-    match idx {
-        Some(i) => {
-            let master = body
-                .master_volume
-                .unwrap_or(groups[i]["master_volume"].as_f64().unwrap_or(0.5));
-            groups[i]["master_volume"] = json!(master);
-            if let Some(ref offsets) = body.offsets {
-                groups[i]["offsets"] = json!(offsets);
-            }
-            let zone_ids: Vec<i64> = groups[i]["zone_ids"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
-                .unwrap_or_default();
-            settings
-                .set("zone_groups", &serde_json::to_string(&groups)?)
-                .ok();
-
-            for zid in &zone_ids {
-                let offset = body
-                    .offsets
-                    .as_ref()
-                    .and_then(|o| o.get(&zid.to_string()))
-                    .copied()
-                    .unwrap_or(0.0);
-                let effective = (master + offset).clamp(0.0, 1.0);
-                let device_id = ZoneRepo::with_backend(state.backend.clone())
-                    .get(*zid)
-                    .ok()
-                    .flatten()
-                    .and_then(|zone| zone.output_device_id);
-                if let Err(error) = state
-                    .orchestrator
-                    .set_volume(*zid, effective, device_id.as_deref())
-                    .await
-                {
-                    return Ok(crate::routes::playback::output_command_error_response(
-                        error,
-                    ));
-                }
-            }
-            Ok(Json(json!({"group_id": group_id, "master_volume": master})).into_response())
-        }
-        None => Ok(StatusCode::NOT_FOUND.into_response()),
+        .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let master = master_volume
+        .unwrap_or(groups[i]["master_volume"].as_f64().unwrap_or(0.5))
+        .clamp(0.0, 1.0);
+    groups[i]["master_volume"] = json!(master);
+    if let Some(ref offsets) = offsets {
+        groups[i]["offsets"] = json!(offsets);
     }
+    let decalages = groups[i]["offsets"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let zone_ids: Vec<i64> = groups[i]["zone_ids"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+    if let Ok(texte) = serde_json::to_string(&groups) {
+        settings.set("zone_groups", &texte).ok();
+    }
+
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let fixes: Vec<i64> = zone_ids
+        .iter()
+        .copied()
+        .filter(|zid| {
+            repo.get(*zid)
+                .ok()
+                .flatten()
+                .is_some_and(|zone| zone.fixed_volume)
+        })
+        .collect();
+    let mut acceptees = 0usize;
+    let mut refusees = Vec::new();
+    let mut premier_refus = None;
+    for (zid, effectif) in volumes_des_membres(&zone_ids, master, &decalages, &fixes) {
+        let device_id = repo
+            .get(zid)
+            .ok()
+            .flatten()
+            .and_then(|zone| zone.output_device_id);
+        match state
+            .orchestrator
+            .set_volume(zid, effectif, device_id.as_deref())
+            .await
+        {
+            Ok(()) => {
+                // #8165 — le curseur du groupe est un geste de volume : il
+                // lève la sourdine de chaque membre.
+                state
+                    .orchestrator
+                    .lever_la_sourdine_au_geste_de_volume(zid, device_id.as_deref())
+                    .await;
+                acceptees += 1
+            }
+            Err(error) => {
+                warn!(group_id, zone_id = zid, error = ?error, "zone_group_volume_member_refused");
+                refusees.push(zid);
+                premier_refus.get_or_insert(error);
+            }
+        }
+    }
+    if acceptees == 0
+        && let Some(error) = premier_refus
+    {
+        return crate::routes::playback::output_command_error_response(error);
+    }
+    Json(json!({
+        "group_id": group_id,
+        "master_volume": master,
+        "zones_volume_fixe": fixes,
+        "zones_refusees": refusees,
+    }))
+    .into_response()
 }
 
 pub(super) async fn calibrate_group(

@@ -318,10 +318,13 @@ async fn un_echec_backend_ne_change_pas_le_statut_confirme() {
         "airplay2-1".into(),
         "00:11:22:33:44:55".into(),
     );
-    assert!(airplay2.checked_set_volume(0.25).await.is_err());
+    // #8402 (fil 2749) : AirPlay 2 sans démon garde aussi la consigne, que
+    // `play_media` donne au démon avant `play` — elle ne part plus à 0 dB.
+    // Une commande de transport sans démon reste refusée.
+    airplay2.checked_set_volume(0.25).await.unwrap();
     assert!(airplay2.resume().await.is_err());
     let status = airplay2.get_status().await.unwrap();
-    assert_eq!(status.volume, 1.0);
+    assert_eq!(status.volume, 0.25);
     assert!(!status.muted);
 }
 

@@ -346,6 +346,18 @@ async fn create_webhook(
         )
             .into_response());
     }
+    // Sécurité : un webhook ne vise jamais le serveur lui-même ni le réseau
+    // local — le POST partirait de 127.0.0.1 et passerait pour un appel local.
+    if let Err(motif) = juger_destination_webhook(&url, MomentWebhook::Creation).await {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "webhook_destination_refused",
+                "message": format!("webhook destination refused: {motif}"),
+            })),
+        )
+            .into_response());
+    }
 
     // Validate events
     for ev in &body.events {
@@ -465,19 +477,22 @@ async fn test_webhooks(
         },
     });
 
-    let client = state.http_client.clone();
     let mut sent = 0u32;
     let mut errors = Vec::new();
 
     for hook in &hooks {
-        let result = client
-            .post(&hook.url)
-            .header("Content-Type", "application/json")
-            .header("User-Agent", "Tune-Webhook/2.0")
-            .json(&test_payload)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await;
+        let result = match juger_destination_webhook(&hook.url, MomentWebhook::Envoi).await {
+            Err(motif) => {
+                warn!(url = %hook.url, motif, "webhook_destination_refusee");
+                errors.push(json!({
+                    "webhook_id": hook.id,
+                    "url": hook.url,
+                    "error": format!("destination refused ({motif})"),
+                }));
+                continue;
+            }
+            Ok(destination) => envoyer_webhook(&destination, &test_payload).await,
+        };
 
         match result {
             Ok(resp) => {
@@ -517,15 +532,251 @@ async fn test_webhooks(
 /// Spawn a background task that listens for playback events and dispatches
 /// matching events to registered webhook URLs.  Fire-and-forget: webhook
 /// failures never block playback.
+/// Pourquoi une destination de webhook est refusée, ou `None` si elle passe :
+/// hôte littéral interdit (bouclage, non spécifié, privé, lien local,
+/// multidiffusion…), nom local (`localhost`, `.local`, `.lan`, `.internal`,
+/// `.home.arpa`), ou nom qui RÉSOUT vers une adresse interdite. Vérifié à la
+/// création ET avant chaque envoi (le DNS peut changer entre les deux).
+/// Quand la destination d'un webhook est jugée.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MomentWebhook {
+    /// À l'enregistrement : un nom qui ne résout pas encore est admis (DNS
+    /// absent, domaine réservé aux tests) — il sera rejugé à l'envoi.
+    Creation,
+    /// Avant chaque envoi : un nom qui ne résout pas n'est pas appelé.
+    Envoi,
+}
+
+/// Une destination de webhook jugée bonne : l'URL telle qu'enregistrée, son
+/// hôte, et l'adresse ÉPINGLÉE quand l'hôte est un nom — le client n'en
+/// résoudra pas une autre entre le jugement et la connexion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DestinationWebhook {
+    pub url: String,
+    pub hote: String,
+    pub epinglee: Option<std::net::SocketAddr>,
+}
+
+/// Politique des destinations (décision du 15/11 : « refuser la machine,
+/// autoriser le LAN ») : refusés le bouclage, l'adresse non spécifiée, le lien
+/// local (dont les métadonnées cloud 169.254.169.254), les adresses propres de
+/// la machine, le multicast et le broadcast ; admis le reste, dont RFC 1918 et
+/// ULA (Home Assistant, n8n sur le réseau local).
+pub(crate) fn adresse_webhook_interdite(
+    ip: std::net::IpAddr,
+    machine: &[std::net::IpAddr],
+) -> bool {
+    use std::net::IpAddr;
+    fn canonique(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
+            v4 => v4,
+        }
+    }
+    let ip = canonique(ip);
+    if machine.iter().any(|m| canonique(*m) == ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.is_multicast()
+        }
+    }
+}
+
+/// Une adresse réseau NUE : `hôte` ou `hôte:port` (nom, IPv4, IPv6 entre
+/// crochets), rien d'autre. Une intégration qui compose son URL par
+/// `http://{hôte}/chemin` ne peut alors viser que SON chemin : ni `/`, ni `?`,
+/// ni `#`, ni `@`, ni espace ou `%` pour déplacer la requête ailleurs.
+pub(crate) fn adresse_reseau_nue(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
+}
+
+fn nom_d_hote_local(nom: &str) -> bool {
+    nom == "localhost"
+        || [
+            ".localhost",
+            ".local",
+            ".lan",
+            ".internal",
+            ".home.arpa",
+            ".home",
+        ]
+        .iter()
+        .any(|s| nom.ends_with(s))
+}
+
+/// Juge une destination dont la résolution est déjà faite (pure, testable).
+/// `resolution` : `Err(())` si le nom ne résout pas (ou pas encore).
+pub(crate) fn juger_destination_resolue(
+    url: &str,
+    resolution: Result<&[std::net::SocketAddr], ()>,
+    moment: MomentWebhook,
+    machine: &[std::net::IpAddr],
+) -> Result<DestinationWebhook, &'static str> {
+    juger_destination_resolue_avec(url, resolution, moment, machine, NomsLocaux::Refuses)
+}
+
+/// Les noms locaux (`.local`, `.lan`…) : refusés pour un webhook, admis pour
+/// une intégration du réseau local (Home Assistant répond sur
+/// `homeassistant.local`) — leurs adresses restent jugées. `localhost` est
+/// toujours refusé.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NomsLocaux {
+    Refuses,
+    Admis,
+}
+
+pub(crate) fn juger_destination_resolue_avec(
+    url: &str,
+    resolution: Result<&[std::net::SocketAddr], ()>,
+    moment: MomentWebhook,
+    machine: &[std::net::IpAddr],
+    noms_locaux: NomsLocaux,
+) -> Result<DestinationWebhook, &'static str> {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return Err("unparseable url");
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("scheme must be http or https");
+    }
+    let Some(hote) = parsed.host_str() else {
+        return Err("missing host");
+    };
+    let hote = hote.to_string();
+    // Littéral IPv4, ou IPv6 entre crochets : jugé tel quel, rien à épingler.
+    let litteral = hote.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = litteral.parse::<std::net::IpAddr>() {
+        if adresse_webhook_interdite(ip, machine) {
+            return Err("forbidden address");
+        }
+        return Ok(DestinationWebhook {
+            url: url.to_string(),
+            hote,
+            epinglee: None,
+        });
+    }
+    let nom = hote.trim_end_matches('.').to_ascii_lowercase();
+    let refuse = match noms_locaux {
+        NomsLocaux::Refuses => nom_d_hote_local(&nom),
+        NomsLocaux::Admis => nom == "localhost" || nom.ends_with(".localhost"),
+    };
+    if refuse {
+        return Err("local host name");
+    }
+    match resolution {
+        Ok(adresses) if !adresses.is_empty() => {
+            if adresses
+                .iter()
+                .any(|a| adresse_webhook_interdite(a.ip(), machine))
+            {
+                return Err("resolves to a forbidden address");
+            }
+            Ok(DestinationWebhook {
+                url: url.to_string(),
+                hote,
+                epinglee: Some(adresses[0]),
+            })
+        }
+        _ if moment == MomentWebhook::Creation => Ok(DestinationWebhook {
+            url: url.to_string(),
+            hote,
+            epinglee: None,
+        }),
+        _ => Err("host does not resolve"),
+    }
+}
+
+/// Juge une destination : résout le nom s'il y a lieu, puis
+/// [`juger_destination_resolue`] avec les adresses propres de la machine.
+pub(crate) async fn juger_destination_webhook(
+    url: &str,
+    moment: MomentWebhook,
+) -> Result<DestinationWebhook, &'static str> {
+    juger_destination_avec(url, moment, NomsLocaux::Refuses).await
+}
+
+/// Comme [`juger_destination_webhook`], en choisissant le sort des noms locaux.
+pub(crate) async fn juger_destination_avec(
+    url: &str,
+    moment: MomentWebhook,
+    noms_locaux: NomsLocaux,
+) -> Result<DestinationWebhook, &'static str> {
+    let machine = tune_core::discovery::adresses_de_la_machine();
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return Err("unparseable url");
+    };
+    let hote = parsed.host_str().unwrap_or_default().to_string();
+    let litteral = hote.trim_start_matches('[').trim_end_matches(']');
+    if hote.is_empty() || litteral.parse::<std::net::IpAddr>().is_ok() {
+        return juger_destination_resolue_avec(url, Err(()), moment, &machine, noms_locaux);
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let adresses: Vec<std::net::SocketAddr> =
+        match tokio::net::lookup_host((hote.as_str(), port)).await {
+            Ok(it) => it.collect(),
+            Err(_) => Vec::new(),
+        };
+    let resolution = if adresses.is_empty() {
+        Err(())
+    } else {
+        Ok(adresses.as_slice())
+    };
+    juger_destination_resolue_avec(url, resolution, moment, &machine, noms_locaux)
+}
+
+/// Le client dédié aux webhooks : aucune redirection suivie (un 3xx vers la
+/// machine ne mène nulle part), délai court, et l'hôte épinglé sur l'adresse
+/// jugée — une seconde résolution ne peut pas renvoyer ailleurs.
+pub(crate) fn client_webhook(destination: &DestinationWebhook) -> reqwest::Result<reqwest::Client> {
+    // Depuis le constructeur partagé (rustls, délais) : la couture HTTP du
+    // dépôt l'exige, et la build FFI n'a pas de vérificateur TLS de plateforme.
+    let mut b = tune_core::http::client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("Tune-Webhook/2.0");
+    if let Some(adresse) = destination.epinglee {
+        b = b.resolve(&destination.hote, adresse);
+    }
+    b.build()
+}
+
+/// Envoie la charge utile à une destination jugée bonne.
+async fn envoyer_webhook(
+    destination: &DestinationWebhook,
+    corps: &Value,
+) -> reqwest::Result<reqwest::Response> {
+    client_webhook(destination)?
+        .post(&destination.url)
+        .header("Content-Type", "application/json")
+        .json(corps)
+        .send()
+        .await
+}
+
 pub fn spawn_webhook_dispatcher(state: &AppState) {
     let playback = state.playback.clone();
     let backend = state.backend.clone();
-    let http_client = state.http_client.clone();
     let event_bus = state.event_bus.clone();
 
     // Clone before moving into first spawn
     let backend2 = backend.clone();
-    let http_client2 = http_client.clone();
 
     // Subscribe to playback events (broadcast channel)
     let mut playback_rx = playback.subscribe();
@@ -572,19 +823,19 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
                     });
 
                     for hook in matching {
-                        let client = http_client.clone();
                         let url = hook.url.clone();
                         let body = payload.clone();
                         // Fire-and-forget — don't block on webhook delivery
                         tokio::spawn(async move {
-                            let result = client
-                                .post(&url)
-                                .header("Content-Type", "application/json")
-                                .header("User-Agent", "Tune-Webhook/2.0")
-                                .json(&body)
-                                .timeout(std::time::Duration::from_secs(10))
-                                .send()
-                                .await;
+                            let destination =
+                                match juger_destination_webhook(&url, MomentWebhook::Envoi).await {
+                                    Ok(d) => d,
+                                    Err(motif) => {
+                                        warn!(%url, motif, "webhook_destination_refusee");
+                                        return;
+                                    }
+                                };
+                            let result = envoyer_webhook(&destination, &body).await;
 
                             if let Err(e) = result {
                                 warn!(
@@ -638,18 +889,18 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
                     });
 
                     for hook in matching {
-                        let client = http_client2.clone();
                         let url = hook.url.clone();
                         let body = payload.clone();
                         tokio::spawn(async move {
-                            let result = client
-                                .post(&url)
-                                .header("Content-Type", "application/json")
-                                .header("User-Agent", "Tune-Webhook/2.0")
-                                .json(&body)
-                                .timeout(std::time::Duration::from_secs(10))
-                                .send()
-                                .await;
+                            let destination =
+                                match juger_destination_webhook(&url, MomentWebhook::Envoi).await {
+                                    Ok(d) => d,
+                                    Err(motif) => {
+                                        warn!(%url, motif, "webhook_destination_refusee");
+                                        return;
+                                    }
+                                };
+                            let result = envoyer_webhook(&destination, &body).await;
 
                             if let Err(e) = result {
                                 warn!(
@@ -671,4 +922,305 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod destinations_webhook_tests {
+    use super::{
+        DestinationWebhook, MomentWebhook, adresse_webhook_interdite, client_webhook,
+        juger_destination_resolue,
+    };
+    use std::net::{IpAddr, SocketAddr};
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn la_machine_est_refusee_le_lan_est_admis() {
+        let machine = [ip("192.168.1.18"), ip("fd00::18"), ip("127.0.0.1")];
+        for ko in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+            "::ffff:127.0.0.1",
+            "0.0.0.0",
+            "::",
+            "169.254.169.254",
+            "169.254.1.1",
+            "fe80::1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "ff02::1",
+            "192.168.1.18",
+            "fd00::18",
+            "::ffff:192.168.1.18",
+        ] {
+            assert!(adresse_webhook_interdite(ip(ko), &machine), "{ko}");
+        }
+        for ok in [
+            "192.168.1.10",
+            "10.0.0.5",
+            "172.16.0.2",
+            "fd00::10",
+            "203.0.113.5",
+            "::ffff:192.168.1.10",
+        ] {
+            assert!(!adresse_webhook_interdite(ip(ok), &machine), "{ok}");
+        }
+    }
+
+    #[test]
+    fn un_litteral_du_lan_passe_et_la_machine_est_refusee() {
+        let machine = [ip("192.168.1.18")];
+        let ok = juger_destination_resolue(
+            "http://192.168.1.10:8123/api/webhook/x",
+            Err(()),
+            MomentWebhook::Envoi,
+            &machine,
+        )
+        .unwrap();
+        assert_eq!(ok.epinglee, None);
+        assert_eq!(ok.hote, "192.168.1.10");
+        for url in [
+            "http://127.0.0.1:8888/api/v1/appliance/reboot",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8888/x",
+            "http://0.0.0.0/x",
+            "http://192.168.1.18:8888/x",
+            "http://localhost:8888/x",
+            "http://tune.local/x",
+            "ftp://192.168.1.10/x",
+        ] {
+            assert!(
+                juger_destination_resolue(url, Err(()), MomentWebhook::Envoi, &machine).is_err(),
+                "{url}"
+            );
+            assert!(
+                juger_destination_resolue(url, Err(()), MomentWebhook::Creation, &machine).is_err(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn un_nom_qui_resout_en_bouclage_est_refuse_a_l_envoi_et_epingle_sinon() {
+        let machine = [ip("192.168.1.18")];
+        let bouclage: &[SocketAddr] = &["127.0.0.1:80".parse().unwrap()];
+        assert_eq!(
+            juger_destination_resolue(
+                "http://hook.exemple.test/h",
+                Ok(bouclage),
+                MomentWebhook::Envoi,
+                &machine
+            ),
+            Err("resolves to a forbidden address")
+        );
+        // Une seule adresse interdite parmi d'autres suffit.
+        let melange: &[SocketAddr] = &[
+            "192.168.1.10:80".parse().unwrap(),
+            "127.0.0.1:80".parse().unwrap(),
+        ];
+        assert!(
+            juger_destination_resolue(
+                "http://hook.exemple.test/h",
+                Ok(melange),
+                MomentWebhook::Envoi,
+                &machine
+            )
+            .is_err()
+        );
+        let lan: &[SocketAddr] = &["192.168.1.10:80".parse().unwrap()];
+        let d = juger_destination_resolue(
+            "http://hook.exemple.test/h",
+            Ok(lan),
+            MomentWebhook::Envoi,
+            &machine,
+        )
+        .unwrap();
+        assert_eq!(d.epinglee, Some("192.168.1.10:80".parse().unwrap()));
+        // Pas encore résolu : admis à la création, refusé à l'envoi.
+        assert!(
+            juger_destination_resolue(
+                "http://hook.exemple.test/h",
+                Err(()),
+                MomentWebhook::Creation,
+                &machine
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            juger_destination_resolue(
+                "http://hook.exemple.test/h",
+                Err(()),
+                MomentWebhook::Envoi,
+                &machine
+            ),
+            Err("host does not resolve")
+        );
+    }
+
+    /// Le client des webhooks ne suit pas un 307 : un serveur du LAN qui
+    /// renverrait vers 127.0.0.1 n'atteint pas la machine. Le serveur témoin
+    /// écoute en bouclage — on exerce ici le CLIENT, pas la politique
+    /// d'adresse (testée au-dessus), d'où la destination posée à la main.
+    #[tokio::test]
+    async fn un_307_vers_le_bouclage_n_est_pas_suivi() {
+        use axum::{Router, response::IntoResponse, routing::post};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let touches = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = listener.local_addr().unwrap();
+        let cible = format!("http://127.0.0.1:{}/cible", adresse.port());
+        let t = touches.clone();
+        let app = Router::new()
+            .route(
+                "/depart",
+                post(move || {
+                    let cible = cible.clone();
+                    async move {
+                        (
+                            axum::http::StatusCode::TEMPORARY_REDIRECT,
+                            [(axum::http::header::LOCATION, cible)],
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/cible",
+                post(move || {
+                    t.fetch_add(1, Ordering::SeqCst);
+                    async { "touche" }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let destination = DestinationWebhook {
+            url: format!("http://127.0.0.1:{}/depart", adresse.port()),
+            hote: "127.0.0.1".into(),
+            epinglee: None,
+        };
+        let reponse = client_webhook(&destination)
+            .unwrap()
+            .post(&destination.url)
+            .json(&serde_json::json!({"event": "test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reponse.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            touches.load(Ordering::SeqCst),
+            0,
+            "la cible du 307 a été appelée"
+        );
+    }
+
+    /// L'adresse épinglée est bien celle que le client utilise : un nom
+    /// quelconque, épinglé sur le serveur témoin, y arrive sans DNS.
+    #[tokio::test]
+    async fn l_adresse_epinglee_est_celle_du_client() {
+        use axum::{Router, routing::post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = listener.local_addr().unwrap();
+        let app = Router::new().route("/h", post(|| async { "ok" }));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let destination = DestinationWebhook {
+            url: format!("http://hook.exemple.test:{}/h", adresse.port()),
+            hote: "hook.exemple.test".into(),
+            epinglee: Some(adresse),
+        };
+        let reponse = client_webhook(&destination)
+            .unwrap()
+            .post(&destination.url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reponse.status(), reqwest::StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod destinations_integration_tests {
+    use super::{MomentWebhook, NomsLocaux, adresse_reseau_nue, juger_destination_resolue_avec};
+    use std::net::SocketAddr;
+
+    fn a(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn une_integration_admet_les_noms_locaux_mais_juge_leurs_adresses() {
+        let machine = ["192.168.1.18".parse().unwrap()];
+        let url = "http://homeassistant.local:8123/api/states";
+        let lan = [a("192.168.1.20:8123")];
+        assert!(
+            juger_destination_resolue_avec(
+                url,
+                Ok(&lan),
+                MomentWebhook::Envoi,
+                &machine,
+                NomsLocaux::Admis
+            )
+            .is_ok()
+        );
+        // Le même nom pour un webhook reste refusé.
+        assert!(
+            juger_destination_resolue_avec(
+                url,
+                Ok(&lan),
+                MomentWebhook::Envoi,
+                &machine,
+                NomsLocaux::Refuses
+            )
+            .is_err()
+        );
+        for interdite in [a("127.0.0.1:8123"), a("192.168.1.18:8123")] {
+            assert!(
+                juger_destination_resolue_avec(
+                    url,
+                    Ok(&[interdite]),
+                    MomentWebhook::Envoi,
+                    &machine,
+                    NomsLocaux::Admis
+                )
+                .is_err(),
+                "{interdite}"
+            );
+        }
+        assert!(
+            juger_destination_resolue_avec(
+                "http://localhost:8123",
+                Err(()),
+                MomentWebhook::Creation,
+                &machine,
+                NomsLocaux::Admis
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn une_adresse_reseau_nue_n_a_ni_chemin_ni_requete() {
+        for ok in [
+            "localhost:1705",
+            "192.168.1.30",
+            "[fd00::4]:80",
+            "snap-server.lan",
+        ] {
+            assert!(adresse_reseau_nue(ok), "{ok}");
+        }
+        for ko in [
+            "",
+            "127.0.0.1:8888/api/v1/appliance/shutdown?",
+            "h#",
+            "u@127.0.0.1",
+            "h ost",
+            "h%2f",
+            "h\\x",
+        ] {
+            assert!(!adresse_reseau_nue(ko), "{ko}");
+        }
+    }
 }

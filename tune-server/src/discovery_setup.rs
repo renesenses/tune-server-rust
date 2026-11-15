@@ -28,6 +28,14 @@ mod renderer_allume_avant_le_serveur_tests_6961;
 #[path = "discovery_setup/renderer_sans_services_de_rendu_tests_7279.rs"]
 mod renderer_sans_services_de_rendu_tests_7279;
 
+#[cfg(test)]
+#[path = "discovery_setup/zone_nommee_par_le_modele_tests_7572.rs"]
+mod zone_nommee_par_le_modele_tests_7572;
+
+#[cfg(test)]
+#[path = "discovery_setup/deblocage_rejoue_la_decouverte_7508_tests.rs"]
+mod deblocage_rejoue_la_decouverte_7508_tests;
+
 #[cfg(all(test, feature = "oaat"))]
 #[path = "deux_pi_verox_oaat_airplay_tests_6947.rs"]
 mod deux_pi_verox_oaat_airplay_tests_6947;
@@ -506,7 +514,10 @@ fn spawn_ssdp_event_handler(
                     let soap_wakeable =
                         matches!(reg.type_of(&id).as_deref(), Some("dlna") | Some("openhome"));
                     if !soap_wakeable {
-                        reg.remove(&id);
+                        // #8029 — retirée, la sortie est aussi arrêtée.
+                        tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(
+                            reg.remove(&id),
+                        );
                     }
                     set_zone_online(&event_bus, &db, &id, false);
                     event_bus.emit_typed(
@@ -870,6 +881,169 @@ pub(crate) fn appareil_ignore(
     )
 }
 
+/// #7572 — le nom qu'une zone reçoit à la découverte : `(court, long)`.
+///
+/// Le nom court est la partie de `friendlyName` avant « - » : « Chambre »
+/// pour « Chambre - Sonos Play:1 ». Le long sert quand le court est déjà pris.
+///
+/// Un Sonos s'annonce « 192.168.1.19 - Sonos Play:1 Media Renderer » : la
+/// partie avant « - » est son ADRESSE IP, et la zone s'appelait donc
+/// « 192.168.1.19 » (alec_eiffel, fil du 31/10/2026, rc9), alors que le
+/// descripteur donne le modèle (`modelName`). Quand la partie courte est une
+/// adresse, le nom court devient le modèle (à défaut, le reste du nom
+/// annoncé), et le long « <modèle> (<adresse>) » pour distinguer deux
+/// appareils du même modèle.
+pub(crate) fn nom_de_zone_decouverte(
+    nom_annonce: &str,
+    hote: &str,
+    modele: Option<&str>,
+) -> (String, String) {
+    let court = nom_annonce
+        .split(" - ")
+        .next()
+        .unwrap_or(nom_annonce)
+        .trim();
+    if !est_une_adresse(court, hote) {
+        return (court.to_string(), nom_annonce.to_string());
+    }
+    let reste = nom_annonce
+        .split_once(" - ")
+        .map(|(_, r)| r.trim())
+        .unwrap_or("");
+    let lisible = modele
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && !est_une_adresse(m, hote))
+        .or(Some(reste).filter(|r| !r.is_empty()));
+    match lisible {
+        Some(nom) => (nom.to_string(), format!("{nom} ({court})")),
+        None => (court.to_string(), nom_annonce.to_string()),
+    }
+}
+
+/// Le nom qu'une version antérieure à #7572 donnait à la zone quand la
+/// partie courte du nom annoncé était une adresse IP, ou `None`.
+pub(crate) fn ancien_nom_par_adresse<'a>(nom_annonce: &'a str, hote: &str) -> Option<&'a str> {
+    let court = nom_annonce
+        .split(" - ")
+        .next()
+        .unwrap_or(nom_annonce)
+        .trim();
+    est_une_adresse(court, hote).then_some(court)
+}
+
+fn est_une_adresse(texte: &str, hote: &str) -> bool {
+    !texte.is_empty() && (texte == hote || texte.parse::<std::net::IpAddr>().is_ok())
+}
+
+/// #7572 — une zone que la découverte avait nommée par l'ADRESSE de
+/// l'appareil prend le nom lisible, une fois. Une zone que l'utilisateur a
+/// nommée n'est jamais touchée : le renommage est conditionnel en base
+/// (`WHERE name = <ancien nom>`).
+fn renommer_zone_nommee_par_adresse(
+    zone_repo: &tune_core::db::zone_repo::ZoneRepo,
+    event_bus: &EventBus,
+    zone: &tune_core::db::zone_repo::Zone,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) {
+    let Some(zone_id) = zone.id else { return };
+    let Some(ancien) = ancien_nom_par_adresse(&dev.name, &dev.host) else {
+        return;
+    };
+    if zone.name != ancien {
+        return;
+    }
+    let (court, long) = nom_de_zone_decouverte(&dev.name, &dev.host, dev.model.as_deref());
+    if court == ancien {
+        return;
+    }
+    let pris = zone_repo
+        .list()
+        .unwrap_or_default()
+        .iter()
+        .any(|z| z.id != Some(zone_id) && z.name == court);
+    let nouveau = if pris { long } else { court };
+    match zone_repo.renommer_si_nom_inchange(zone_id, ancien, &nouveau) {
+        Ok(n) if n > 0 => {
+            info!(zone_id, ancien, nouveau = %nouveau, device = %dev.id, "ssdp_zone_nommee_par_adresse_renommee");
+            event_bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+        }
+        Ok(_) => {}
+        Err(e) => warn!(zone_id, error = %e, "ssdp_zone_renommage_echoue"),
+    }
+}
+
+/// #7508 — rejoue la découverte des appareils qu'on vient de débloquer.
+///
+/// Le scanner SSDP n'émet `DeviceDiscovered` qu'à la PREMIÈRE inscription
+/// d'un appareil ; les réannonces ne font que rafraîchir sa fiche. Un appareil
+/// ignoré à ce moment-là a été écarté par [`handle_ssdp_discovered`], et rien
+/// ne le lui représentait ensuite : la zone revenait au déblocage, mais sans
+/// sortie, et chaque lecture échouait en « Device not yet discovered »
+/// jusqu'au redémarrage (Zeppelin B&W en DLNA, fil 2835).
+///
+/// On repasse donc la fiche que le scanner connaît déjà par le MÊME chemin
+/// qu'une découverte vivante. Seuls les identifiants libérés sont rejoués, et
+/// jamais une sortie déjà enregistrée : une lecture en cours n'est pas touchée.
+///
+/// mDNS (AirPlay, Chromecast…) a le même travers : `mdns-sd` ne renvoie
+/// `ServiceResolved` que sur un enregistrement modifié. Relancer les
+/// recherches lui fait relire son cache et réémettre chaque service connu,
+/// que le gestionnaire mDNS traite alors comme une mise à jour.
+///
+/// Rend le nombre d'appareils SSDP rejoués.
+pub(crate) async fn rejouer_les_appareils_debloques(state: &AppState, liberes: &[String]) -> usize {
+    if liberes.is_empty() {
+        return 0;
+    }
+    let deja_enregistres: std::collections::HashSet<String> = {
+        let reg = state.outputs.lock().await;
+        liberes
+            .iter()
+            .filter(|id| reg.contains(id))
+            .cloned()
+            .collect()
+    };
+    let a_rejouer: Vec<tune_core::discovery::device::DiscoveredDevice> = state
+        .scanner
+        .devices()
+        .await
+        .into_iter()
+        .filter(|d| liberes.contains(&d.id) && !deja_enregistres.contains(&d.id))
+        .collect();
+
+    if !a_rejouer.is_empty() {
+        let oh_listener: Option<Arc<UpnpEventListener>> =
+            crate::startup::create_oh_listener().await;
+        let mut seen_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for dev in &a_rejouer {
+            handle_ssdp_discovered(
+                dev,
+                &state.outputs,
+                &state.backend,
+                &state.config,
+                &state.event_bus,
+                &oh_listener,
+                &state.playback,
+                &state.license,
+                &mut seen_hosts,
+            )
+            .await;
+            info!(id = %dev.id, name = %dev.name, host = %dev.host, "ssdp_appareil_debloque_rejoue");
+        }
+    }
+
+    let mdns = state.mdns_scanner.lock().ok().and_then(|g| g.clone());
+    if let Some(mdns) = mdns {
+        mdns.relancer_recherches();
+        info!(
+            liberes = liberes.len(),
+            "mdns_recherches_relancees_apres_deblocage"
+        );
+    }
+
+    a_rejouer.len()
+}
+
 async fn handle_ssdp_discovered(
     dev: &tune_core::discovery::device::DiscoveredDevice,
     outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>,
@@ -1139,6 +1313,8 @@ async fn handle_ssdp_discovered(
             // so a later UUID change (Denon restart) can reconnect by host (#942).
             let _ = zone_repo.set_host(zone_id, &dev.host);
         }
+        // #7572 — une zone nommée par l'adresse IP prend le nom du modèle.
+        renommer_zone_nommee_par_adresse(&zone_repo, event_bus, &zone, dev);
         info!(name = %dev.name, id = %dev.id, "zone_device_reconnected");
         event_bus.emit(
             "device.reconnected",
@@ -1282,7 +1458,11 @@ async fn handle_ssdp_discovered(
             return;
         }
 
-        let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
+        // #7572 — « 192.168.1.19 - Sonos Play:1 » donne « Sonos Play:1 », plus
+        // l'adresse.
+        let (nom_court, nom_long) =
+            nom_de_zone_decouverte(&dev.name, &dev.host, dev.model.as_deref());
+        let short_name = nom_court.as_str();
 
         // #1281 — l'appareil s'annonce sous PLUSIEURS identités SSDP (DLNA +
         // OpenHome, ou deux UUID : buchardt A700). Supprimer sa zone la masque
@@ -1293,10 +1473,18 @@ async fn handle_ssdp_discovered(
         // l'appareil. Le nom est exigé pour ne pas bloquer un NOUVEL appareil
         // qui hérite de l'adresse par le DHCP (leçon du ré-ancrage #1651 : une
         // IP seule n'identifie rien).
-        if let Some((zid, _)) = zone_repo
-            .hidden_zones_by_host(&dev.host)
-            .into_iter()
-            .find(|(_, n)| n.eq_ignore_ascii_case(&dev.name) || n.eq_ignore_ascii_case(short_name))
+        if let Some((zid, _)) =
+            zone_repo
+                .hidden_zones_by_host(&dev.host)
+                .into_iter()
+                .find(|(_, n)| {
+                    n.eq_ignore_ascii_case(&dev.name)
+                    || n.eq_ignore_ascii_case(short_name)
+                    || n.eq_ignore_ascii_case(&nom_long)
+                    // Une zone masquée avant #7572 porte encore l'adresse.
+                    || ancien_nom_par_adresse(&dev.name, &dev.host)
+                        .is_some_and(|a| n.eq_ignore_ascii_case(a))
+                })
         {
             tracing::debug!(
                 name = %dev.name,
@@ -1322,7 +1510,7 @@ async fn handle_ssdp_discovered(
         let existing_zones = zone_repo.list().unwrap_or_default();
         let name_taken = existing_zones.iter().any(|z| z.name == short_name);
         let zone_name = if name_taken {
-            dev.name.clone()
+            nom_long.clone()
         } else {
             short_name.to_string()
         };
@@ -1798,6 +1986,18 @@ async fn rattacher_les_renderers_connus(
 /// Spawn the mDNS handler that registers Chromecast/AirPlay/BluOS/OAAT/Squeezebox outputs.
 ///
 /// Returns the `MdnsScanner` handle (must be kept alive for the scanner to keep running).
+/// Le nom annoncé de ce serveur (#8189), le même pour mDNS et UPnP : le
+/// réglage `server_name`, sinon le nom de l'appareil, suffixé s'il est
+/// générique. Voir `tune_core::discovery::nom_annonce`.
+pub fn nom_annonce_du_serveur(state: &AppState) -> String {
+    let reglage = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get("server_name")
+        .ok()
+        .flatten();
+    let udn = state.upnp.as_ref().map(|u| u.uuid.as_str()).unwrap_or("");
+    tune_core::discovery::nom_annonce::nom_annonce(reglage.as_deref(), udn)
+}
+
 pub fn spawn_mdns_handler(
     state: &AppState,
 ) -> Option<std::sync::Arc<tune_core::discovery::mdns::MdnsScanner>> {
@@ -1824,7 +2024,8 @@ pub fn spawn_mdns_handler(
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(8888u16);
-        if let Err(e) = mdns.register_self(port, tune_core::version()) {
+        let nom = nom_annonce_du_serveur(state);
+        if let Err(e) = mdns.register_self_nomme(port, tune_core::version(), &nom) {
             tracing::warn!(error = %e, "mdns_register_self_failed");
         }
         // #3326 S2-a — l'autre moitié de la découverte Sendspin. La
@@ -1926,6 +2127,9 @@ pub fn spawn_mdns_handler(
                                     dev.id.clone(),
                                     ap_dev_id,
                                 );
+                                // #8402 — elle part du volume mémorisé de sa
+                                // zone, jamais de la pleine échelle.
+                                ap2.ensemencer_depuis_la_base(&db).await;
                                 tune_core::outputs::airplay2::composant_manquant_7084::retablir(
                                     &dev.id,
                                 );
@@ -2095,7 +2299,11 @@ pub fn spawn_mdns_handler(
                 }
                 MdnsEvent::DeviceLost(id) => {
                     let mut reg = outputs.lock().await;
-                    reg.remove(&id);
+                    // #8029 — retirée, la sortie est aussi arrêtée (démon
+                    // AirPlay 2, tâches réseau).
+                    tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(
+                        reg.remove(&id),
+                    );
                     drop(reg);
                     set_zone_online(&event_bus, &db, &id, false);
                     event_bus.emit_typed(
@@ -2285,7 +2493,10 @@ async fn enregistrer_la_sortie_mdns_et_sa_zone(
         {
             // Remove the old lower-priority output
             if let Some(ref old_dev_id) = z.output_device_id {
-                reg.remove(old_dev_id);
+                // #8029 — l'ancienne sortie ne garde rien en marche.
+                tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(
+                    reg.remove(old_dev_id),
+                );
             }
             let _ = zone_repo.changer_d_appareil(
                 zid,
@@ -2608,8 +2819,10 @@ async fn probe_airplay_for_bluos(
                 );
 
                 let mut reg = outputs.lock().await;
-                // Remove the old AirPlay output
-                reg.remove(dev_id);
+                // Remove the old AirPlay output — #8029 : et l'arrêter.
+                tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(
+                    reg.remove(dev_id),
+                );
                 reg.register(Box::new(bluos));
                 drop(reg);
 

@@ -942,7 +942,12 @@ async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mu
         retenu_moins_de_noms = c.retenu_moins_de_noms,
         "compositeur_depuis_credits_termine"
     );
-    taches.update_progress(TACHE, total as u64, total as u64, "Compositeur");
+    taches.update_progress(
+        TACHE,
+        total as u64,
+        total as u64,
+        crate::background_tasks::Phase::Composer,
+    );
     // Fin de parcours : le curseur retombe à zéro, sans quoi une relance après
     // un `done` ne verrait plus rien.
     c.derniere_piste = 0;
@@ -968,7 +973,12 @@ fn publier(
     if !traitees.is_multiple_of(JALON_AVANCEMENT) {
         return;
     }
-    taches.update_progress(TACHE, traitees as u64, total as u64, "Compositeur");
+    taches.update_progress(
+        TACHE,
+        traitees as u64,
+        total as u64,
+        crate::background_tasks::Phase::Composer,
+    );
     ecrire_etat(
         &state.backend,
         &etat_en_json(task_id, "running", total, c, retenues, None),

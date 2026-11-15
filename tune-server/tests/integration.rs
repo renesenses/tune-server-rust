@@ -2329,14 +2329,27 @@ async fn autoplay_active_est_rapporte_par_le_detail_de_la_zone() {
 }
 
 #[tokio::test]
-async fn autoplay_inactif_reste_inactif() {
-    // Le defaut ne doit pas basculer dans l'autre sens en corrigeant le bug.
+async fn autoplay_actif_par_defaut_et_desactivable_2694() {
+    // Fil 2694 (décision de Bertrand du 13/11, « comme Roon ») : une zone neuve
+    // enchaîne sur des titres similaires ; le réglage se coupe et reste coupé.
     let app = make_app();
     let zid = make_zone(&app, "AutoPlay Defaut").await;
 
     let (status, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(zone["autoplay_enabled"], false, "defaut attendu : {zone}");
+    assert_eq!(zone["autoplay_enabled"], true, "defaut attendu : {zone}");
+
+    patch_json(
+        &app,
+        &format!("/api/v1/zones/{zid}"),
+        json!({ "autoplay_enabled": false }),
+    )
+    .await;
+    let (_, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
+    assert_eq!(
+        zone["autoplay_enabled"], false,
+        "coupé, il reste coupé : {zone}"
+    );
 }
 
 /// Une playlist bâtie depuis les favoris radio doit dire ce qui n'a PAS marché.
@@ -2644,6 +2657,17 @@ async fn favoris_radio_vers_streaming_rend_les_trois_compteurs_de_l_ecran() {
         .await;
         assert!(st.is_success(), "favori « {title} » refusé (statut {st})");
     }
+    // #8067 — `saved_at` est à la seconde : les trois favoris tombent le plus
+    // souvent dans la même seconde, pas toujours. Le témoin les y met tous,
+    // pour que l'ordre promis (du plus récent au plus ancien) se joue sur le
+    // départage et non sur l'horloge.
+    state
+        .backend
+        .execute(
+            "UPDATE radio_favorites SET saved_at = '2026-11-07T10:00:00Z'",
+            &[],
+        )
+        .unwrap();
 
     // Le corps EXACT du client : api.ts:3248-3253.
     let (status, body) = post_json(
@@ -2660,8 +2684,11 @@ async fn favoris_radio_vers_streaming_rend_les_trois_compteurs_de_l_ecran() {
     // Qobuz pendant que l'écran affichait 0.
     assert_eq!(
         *ajouts.lock().unwrap(),
-        vec!["t-sure".to_string(), "t-approx".to_string()],
-        "les deux pistes rapprochées doivent être poussées sur le service"
+        // Du plus récent au plus ancien (#8067) : « Nightswimming » est le
+        // dernier favori posé, il part en tête, même à seconde égale.
+        vec!["t-approx".to_string(), "t-sure".to_string()],
+        "les deux pistes rapprochées doivent être poussées sur le service, \
+         la plus récente d'abord (#8067)"
     );
 
     // ── LE DÉFAUT #3022 : les quatre noms que l'écran lit ──

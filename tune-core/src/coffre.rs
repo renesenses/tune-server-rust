@@ -67,7 +67,8 @@ struct Scelle {
 }
 
 /// Un coffre : le chemin de sa clé maîtresse. Ne garde jamais la clé en
-/// mémoire au-delà d'un appel.
+/// mémoire au-delà d'un appel — sauf le coffre [`Coffre::en_memoire`], dont
+/// la clé, fournie par l'application hôte, n'existe QUE en mémoire.
 #[derive(Debug, Clone)]
 pub struct Coffre {
     chemin: PathBuf,
@@ -75,6 +76,18 @@ pub struct Coffre {
     /// ([`Coffre::avec_ancien_fichier`]) : elle OUVRE encore ce qu'elle a
     /// scellé, elle ne scelle plus rien.
     ancien: Option<PathBuf>,
+    /// #8189 — une clé maîtresse tenue en mémoire, jamais écrite.
+    memoire: Option<CleEnMemoire>,
+}
+
+/// Une clé maîtresse en mémoire, effacée à sa libération, jamais affichée.
+#[derive(Clone)]
+struct CleEnMemoire(zeroize::Zeroizing<[u8; 32]>);
+
+impl std::fmt::Debug for CleEnMemoire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CleEnMemoire(<masquée>)")
+    }
 }
 
 impl Coffre {
@@ -89,6 +102,18 @@ impl Coffre {
         Self {
             chemin: dossier.join(fichier),
             ancien: None,
+            memoire: None,
+        }
+    }
+
+    /// Un coffre dont la clé maîtresse est `cle`, fournie par l'application
+    /// hôte (trousseau iOS, Keystore Android) et JAMAIS écrite sur le disque
+    /// (#8189). Même format de valeur scellée que le coffre à fichier.
+    pub fn en_memoire(cle: [u8; 32]) -> Self {
+        Self {
+            chemin: PathBuf::new(),
+            ancien: None,
+            memoire: Some(CleEnMemoire(zeroize::Zeroizing::new(cle))),
         }
     }
 
@@ -125,6 +150,9 @@ impl Coffre {
     }
 
     fn lire_la_cle(&self) -> Result<Option<[u8; 32]>, String> {
+        if let Some(m) = &self.memoire {
+            return Ok(Some(*m.0));
+        }
         lire_la_cle_de(&self.chemin)
     }
 
@@ -154,6 +182,9 @@ impl Coffre {
     /// Ouvre une valeur scellée par [`Coffre::sceller`] — ou, pour un coffre
     /// [`Coffre::avec_ancien_fichier`], par l'ancienne clé maîtresse.
     pub fn ouvrir(&self, scelle: &str) -> Result<String, String> {
+        if let Some(m) = &self.memoire {
+            return dechiffrer(&m.0, scelle);
+        }
         match ouvrir_avec(&self.chemin, scelle) {
             Ok(clair) => Ok(clair),
             // L'erreur rendue reste celle de la clé PRINCIPALE : c'est elle
@@ -231,12 +262,22 @@ fn ouvrir_avec(chemin: &Path, scelle: &str) -> Result<String, String> {
         return Err(format!("version de scellement inconnue : {}", s.v));
     }
     let cle = lire_la_cle_de(chemin)?.ok_or_else(|| "clé maîtresse absente".to_string())?;
+    dechiffrer(&cle, scelle)
+}
+
+/// Ouvre `scelle` avec la clé maîtresse `cle`.
+fn dechiffrer(cle: &[u8; 32], scelle: &str) -> Result<String, String> {
+    let s: Scelle =
+        serde_json::from_str(scelle).map_err(|_| "valeur scellée illisible".to_string())?;
+    if s.v != 1 {
+        return Err(format!("version de scellement inconnue : {}", s.v));
+    }
     let nonce = hex_decode(&s.nonce).map_err(|_| "nonce illisible".to_string())?;
     if nonce.len() != 24 {
         return Err("nonce de longueur inattendue".into());
     }
     let ct = hex_decode(&s.ct).map_err(|_| "valeur scellée illisible".to_string())?;
-    let clair = XChaCha20Poly1305::new((&cle).into())
+    let clair = XChaCha20Poly1305::new(cle.into())
         .decrypt(XNonce::from_slice(&nonce), ct.as_slice())
         .map_err(|_| "la valeur ne s'ouvre pas avec cette clé maîtresse".to_string())?;
     String::from_utf8(clair).map_err(|_| "valeur ouverte non UTF-8".to_string())

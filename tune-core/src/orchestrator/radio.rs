@@ -329,6 +329,7 @@ struct CanauxRadio<'a> {
     /// devrait relever (`renderer_safe_wav_rate`) est refusée, pas convertie.
     strict_bitperfect: bool,
     sortie_locale: bool,
+    frequence_fixe: Option<u32>,
 }
 
 /// Ce que rend une connexion sondée : le lecteur de conteneur, le décodeur
@@ -408,6 +409,7 @@ pub(super) fn decode_radio_stream_to_pcm(
 ) -> Result<(), String> {
     decode_radio_stream_to_pcm_avec_profondeur(
         url,
+        Vec::new(),
         tx,
         data_ready,
         session,
@@ -421,9 +423,17 @@ pub(super) fn decode_radio_stream_to_pcm(
 
 /// Seule la sortie locale relève le PCM à 24 bits quand la source le demande.
 /// Les autres appelants conservent leur contrat réseau 16 bits (#1654).
+///
+/// #8110 — `replis` : les autres flux autorisés de la fiche, du meilleur au
+/// moins bon. Quand le diffuseur REFUSE le flux joué (403, 451 :
+/// `radio_flux_interdit`), la lecture passe au suivant sur la MÊME session,
+/// sans que l'auditeur ait à choisir ; l'erreur n'est rendue que si tous ont
+/// été refusés. Une coupure réseau, une page web ou un HLS illisible gardent
+/// le comportement d'avant : reconnexion sur le même flux, ou échec dit.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
     url: String,
+    replis: Vec<String>,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
     session: std::sync::Arc<crate::http::streamer::StreamSession>,
@@ -432,6 +442,35 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
     strict_bitperfect: bool,
     en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
     sortie_locale: bool,
+) -> Result<(), String> {
+    decode_radio_stream_to_pcm_avec_cadence(
+        url,
+        replis,
+        tx,
+        data_ready,
+        session,
+        eq_profile,
+        levels_tx,
+        strict_bitperfect,
+        en_vol,
+        sortie_locale,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
+    url: String,
+    replis: Vec<String>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    session: std::sync::Arc<crate::http::streamer::StreamSession>,
+    eq_profile: Option<crate::audio::eq::EqProfile>,
+    levels_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
+    strict_bitperfect: bool,
+    en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
+    sortie_locale: bool,
+    frequence_fixe: Option<u32>,
 ) -> Result<(), String> {
     // #6357 — le HLS ne s'arrête plus ici (#2307 le refusait avant le
     // moindre octet de réseau) : `sonder_la_station` le reconnaît et passe
@@ -460,11 +499,39 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
         rt: &rt,
         strict_bitperfect,
         sortie_locale,
+        frequence_fixe,
     };
 
+    let mut url = url;
+    let mut replis = replis.into_iter();
     'reconnect: loop {
         match une_connexion(&mut etat, &url, &canaux) {
             SuiteRadio::Reconnecter => continue 'reconnect,
+            // #8110 — le diffuseur refuse CE flux avant le moindre PCM : le
+            // suivant de la fiche, s'il y en a un, comme une première
+            // connexion (la relance bornée repart de zéro, c'est une autre
+            // adresse). Un refus en cours d'écoute garde le comportement
+            // d'avant : le WAV est déjà annoncé au format du premier flux, et
+            // un repli d'un autre format finirait en arrêt muet.
+            SuiteRadio::Rendre(Err(e))
+                if !etat.first_chunk_sent
+                    && super::radio_replis_8110::flux_refuse_par_le_diffuseur(&e) =>
+            {
+                match replis.next() {
+                    Some(suivant) => {
+                        tracing::warn!(
+                            refuse = %url,
+                            suivant = %suivant,
+                            error = %e,
+                            "radio_flux_refuse_repli_8110"
+                        );
+                        url = suivant;
+                        etat.reconnects = 0;
+                        continue 'reconnect;
+                    }
+                    None => return Err(e),
+                }
+            }
             SuiteRadio::Rendre(resultat) => return resultat,
         }
     }
@@ -577,7 +644,15 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .and_then(|c| c.get(url).send())
-        .map_err(|e| format!("radio HTTP fetch failed: {e}"))?;
+        // #8008 — la cause, pas seulement « error sending request » : le
+        // rapport du 06/11 ne disait pas pourquoi la station ne répondait
+        // pas (refus, nom introuvable, délai, TLS).
+        .map_err(|e| {
+            format!(
+                "radio HTTP fetch failed: {e} ({})",
+                crate::http::client::decrire_erreur_http(&e)
+            )
+        })?;
     if !response.status().is_success() {
         return Err(format!("radio HTTP error: {}", response.status()));
     }
@@ -866,6 +941,17 @@ fn sonder_hls(url: &str, deja_lue: Option<(String, String)>) -> Result<Sonde, St
         (true, false, _) => None,
     };
     source_info.debit_kbps = infos.debit_kbps;
+    // #7802 — ce que la liste maîtresse déclare pour la variante jouée, et la
+    // variante plus haute que le diffuseur a refusée : le chemin du signal
+    // explique ainsi un débit plus bas que prévu.
+    source_info.bitrate_kbps = infos.bande_kbps;
+    source_info.variante_refusee =
+        infos
+            .refus
+            .map(|refus| crate::http::streamer::VarianteRefusee {
+                bande_kbps: refus.bande_kbps,
+                statut: refus.statut,
+            });
     source_info.sample_rate = Some(source_sample_rate);
     source_info.channels = Some(source_channels).filter(|n| *n > 0);
     info!(
@@ -875,6 +961,8 @@ fn sonder_hls(url: &str, deja_lue: Option<(String, String)>) -> Result<Sonde, St
         sortie_hz = source_sample_rate,
         canaux = source_channels,
         debit_kbps = ?infos.debit_kbps,
+        bande_kbps = ?infos.bande_kbps,
+        repli = ?infos.refus,
         "radio_hls_sonde"
     );
 
@@ -960,7 +1048,9 @@ fn preparer_la_sortie(
     // Renderer-safe output rate: HE-AAC/aacPlus decodes at its AAC-LC core
     // rate (e.g. 22050 Hz) which many DLNA renderers reject as silence. We
     // upsample sub-44.1 kHz streams to 44100 Hz; 44.1/48 kHz+ pass through.
-    let output_sample_rate = renderer_safe_wav_rate(source_sample_rate);
+    let output_sample_rate = canaux
+        .frequence_fixe
+        .unwrap_or_else(|| renderer_safe_wav_rate(source_sample_rate));
     // #3973 — le site « décodage radio » de la règle bit-perfect : relever la
     // cadence EST une conversion. Strict ⇒ refuser, en le disant.
     if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
@@ -1253,3 +1343,11 @@ mod radio_ogg;
 #[cfg(test)]
 #[path = "radio_source_tests.rs"]
 mod radio_source_tests;
+
+#[cfg(test)]
+#[path = "radio_cause_8008_tests.rs"]
+mod radio_cause_8008_tests;
+
+#[cfg(test)]
+#[path = "radio_repli_8110_tests.rs"]
+mod radio_repli_8110_tests;
