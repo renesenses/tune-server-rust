@@ -1009,6 +1009,33 @@ const MODEL_SHA256: &str = "d888118262b6144033928e5d7bed57a51bacde7899c4c4a109de
 /// onnxruntime au lieu de la télécharger deux fois. Chemin relatif, comme
 /// `artwork_cache` : résolu depuis le répertoire de travail du serveur.
 const DEFAULT_MODEL_DIR: &str = "embedding_models";
+
+/// Variable d'environnement qui remplace [`DEFAULT_MODEL_DIR`] — #8675.
+///
+/// L'image Docker tourne dans `WORKDIR /app`, qui appartient à root, sous le
+/// compte `tune` : le défaut relatif visait `/app/embedding_models`, que
+/// `tune` ne peut pas créer, et le modèle ne se téléchargeait jamais
+/// (`mkdir embedding_models: Permission denied`, toutes les 15 minutes).
+/// L'image pose `TUNE_EMBEDDING_MODELS_DIR=/data/embedding_models`, sur le
+/// volume de données — comme `TUNE_ARTWORK_DIR=/data/artwork_cache`. Sans
+/// elle, rien ne change de place : les autres installations gardent leur
+/// dossier et le modèle déjà téléchargé.
+pub(crate) const MODELS_DIR_ENV: &str = "TUNE_EMBEDDING_MODELS_DIR";
+
+/// Le dossier des modèles (audio, texte, runtime onnxruntime) quand ni le
+/// réglage ni `TUNE_AUDIO_EMBED_MODEL` ne le disent : la valeur de
+/// [`MODELS_DIR_ENV`] si elle est posée et non vide, sinon [`DEFAULT_MODEL_DIR`].
+pub(crate) fn repertoire_des_modeles_depuis(variable: Option<std::ffi::OsString>) -> PathBuf {
+    match variable {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(DEFAULT_MODEL_DIR),
+    }
+}
+
+/// [`repertoire_des_modeles_depuis`] lu sur l'environnement du processus.
+pub(crate) fn repertoire_des_modeles() -> PathBuf {
+    repertoire_des_modeles_depuis(std::env::var_os(MODELS_DIR_ENV))
+}
 /// Nom de fichier par défaut — celui de l'archive publiée.
 const DEFAULT_MODEL_FILE: &str = "clap-audio-music-2023.onnx";
 
@@ -1261,7 +1288,7 @@ fn configured_model_path(settings: &crate::db::settings_repo::SettingsRepo) -> P
         .flatten()
         .or_else(|| std::env::var("TUNE_AUDIO_EMBED_MODEL").ok())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR).join(DEFAULT_MODEL_FILE))
+        .unwrap_or_else(|| repertoire_des_modeles().join(DEFAULT_MODEL_FILE))
 }
 
 /// Make sure the model exists at `dest`, downloading + checksum-verifying it if
@@ -2396,6 +2423,25 @@ mod tests {
             p.file_name(),
             Some(std::ffi::OsStr::new(super::DEFAULT_MODEL_FILE))
         );
+    }
+
+    #[test]
+    fn la_variable_du_dossier_des_modeles_remplace_le_defaut_relatif_8675() {
+        // #8675 — dans l'image Docker, le défaut relatif visait
+        // `/app/embedding_models` (root, non inscriptible par `tune`) :
+        // `TUNE_EMBEDDING_MODELS_DIR=/data/embedding_models` doit l'emporter.
+        assert_eq!(
+            super::repertoire_des_modeles_depuis(Some("/data/embedding_models".into())),
+            std::path::PathBuf::from("/data/embedding_models")
+        );
+        // Sans la variable (ou vide), rien ne change de place.
+        for absente in [None, Some(std::ffi::OsString::new())] {
+            assert_eq!(
+                super::repertoire_des_modeles_depuis(absente),
+                std::path::PathBuf::from(super::DEFAULT_MODEL_DIR)
+            );
+        }
+        assert_eq!(super::MODELS_DIR_ENV, "TUNE_EMBEDDING_MODELS_DIR");
     }
 
     #[test]

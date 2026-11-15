@@ -77,6 +77,7 @@ pub(super) async fn import_roon(
     let backend = state.backend.clone();
     let event_bus = state.event_bus.clone();
     let tid = task_id.clone();
+    let racines_import = racines_des_fichiers_importes(&state);
 
     // Store initial task status
     let settings = SettingsRepo::with_backend(backend.clone());
@@ -111,7 +112,15 @@ pub(super) async fn import_roon(
             errors.extend(echecs);
         }
         // --- Path B: SQLite database path ---
-        else if let Some(ref db_path) = body.roon_db_path {
+        //
+        // Sécurité — une base ouverte à un chemin choisi par le
+        // client : dossiers de musique ou dossier des téléversements seulement.
+        else if let Some(ref db_path) = body.roon_db_path
+            && let Err(refus) =
+                crate::routes::confinement::sous_les_racines(db_path, &racines_import)
+        {
+            errors.push(crate::routes::confinement::message("roon_db_path", refus));
+        } else if let Some(ref db_path) = body.roon_db_path {
             match rusqlite::Connection::open_with_flags(
                 db_path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1527,6 +1536,16 @@ fn uuid_v4() -> String {
     format!("{a:08x}-{b:04x}-{c:04x}-{d:04x}-{e:012x}")
 }
 
+/// Où un fichier d'import désigné par son chemin (base Roon, XML JRiver)
+/// peut se trouver : les dossiers de musique et le dossier des téléversements.
+fn racines_des_fichiers_importes(state: &AppState) -> Vec<String> {
+    let mut racines = crate::routes::confinement::racines_musicales(state);
+    racines.push(crate::routes::confinement::texte(
+        &tune_core::chemins_de_travail::racine_des_televersements(),
+    ));
+    racines
+}
+
 #[derive(Deserialize)]
 pub(super) struct ImportJriverRequest {
     xml_path: String,
@@ -1537,6 +1556,20 @@ pub(super) async fn import_jriver(
     State(state): State<AppState>,
     Json(body): Json<ImportJriverRequest>,
 ) -> impl IntoResponse {
+    // Sécurité — fichier lu à un chemin choisi par le client.
+    if let Err(refus) = crate::routes::confinement::sous_les_racines(
+        &body.xml_path,
+        &racines_des_fichiers_importes(&state),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "xml_path_outside_allowed_roots",
+                "message": crate::routes::confinement::message("xml_path", refus),
+            })),
+        )
+            .into_response();
+    }
     let task_id = uuid_v4();
     let backend = state.backend.clone();
     let xml_path = body.xml_path.clone();
@@ -1792,9 +1825,13 @@ mod tests {
         let body = ImportJriverRequest {
             xml_path: xml.to_string_lossy().to_string(),
         };
-        // C1 : la piste est sous un dossier de musique déclaré.
+        // C1 : la piste est sous un dossier de musique déclaré. sécurité : le XML
+        // lui-même doit être dans un dossier autorisé — son dossier est déclaré.
         SettingsRepo::with_backend(state.backend.clone())
-            .set("music_dirs", r#"["/music"]"#)
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&["/music", dir.path().to_str().unwrap()]).unwrap(),
+            )
             .unwrap();
         let _ = import_jriver(crate::auth::RequireAdmin, State(state.clone()), Json(body)).await;
 
@@ -1804,6 +1841,37 @@ mod tests {
         );
         assert_eq!(ev.data["source"], "jriver_import");
         assert_eq!(ev.data["imported"], 1);
+    }
+
+    /// Sécurité — un XML hors des dossiers autorisés n'est pas lu.
+    #[tokio::test]
+    async fn un_xml_jriver_hors_des_dossiers_autorises_est_refuse() {
+        let state = etat();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("music_dirs", r#"["/music"]"#)
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("library.xml");
+        std::fs::write(&xml, "<MPL></MPL>").unwrap();
+        for chemin in [
+            xml.to_string_lossy().into_owned(),
+            format!(
+                "/music/../{}",
+                xml.to_string_lossy().trim_start_matches('/')
+            ),
+        ] {
+            let body = ImportJriverRequest {
+                xml_path: chemin.clone(),
+            };
+            let r = import_jriver(crate::auth::RequireAdmin, State(state.clone()), Json(body))
+                .await
+                .into_response();
+            assert_eq!(
+                r.status(),
+                StatusCode::BAD_REQUEST,
+                "{chemin} a été accepté"
+            );
+        }
     }
 
     /// Un import qui n'a rien écrit ne doit RIEN annoncer.

@@ -149,42 +149,65 @@ async fn show_notification(title: &str, body: &str, _icon_path: Option<&str>) {
         if let Some(icon) = _icon_path {
             cmd.args(["-i", icon]);
         }
+        // `--` : un titre qui commence par `-` n'est pas une option.
+        cmd.arg("--");
         cmd.args([title, body]);
         cmd.output().await.ok();
     }
 
     #[cfg(target_os = "windows")]
     {
-        let ps = format!(
-            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
-             [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null; \
-             $template = '<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>'; \
-             $xml = New-Object Windows.Data.Xml.Dom.XmlDocument; \
-             $xml.LoadXml($template); \
-             $toast = [Windows.UI.Notifications.ToastNotification]::new($xml); \
-             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Tune Server').Show($toast)",
-            escape_xml(title),
-            escape_xml(body)
-        );
+        let toast = commande_toast_windows(title, body);
         tokio::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &ps])
+            .args(["-NoProfile", "-NonInteractive", "-Command", toast.script])
+            .envs(toast.variables.iter().map(|(k, v)| (*k, v.as_str())))
             .output()
             .await
             .ok();
     }
 }
 
+/// Variable d'environnement qui porte le titre du toast Windows.
+pub const VARIABLE_TITRE_TOAST: &str = "TUNE_NOTIF_TITLE";
+/// Variable d'environnement qui porte le corps du toast Windows.
+pub const VARIABLE_CORPS_TOAST: &str = "TUNE_NOTIF_BODY";
+
+/// Le script PowerShell du toast : CONSTANT. Le titre et le corps ne sont
+/// jamais composés dans la ligne de commande ; ils arrivent par deux variables
+/// d'environnement et sont échappés côté PowerShell
+/// (`SecurityElement::Escape`) avant d'entrer dans le XML du toast.
+pub const SCRIPT_TOAST_WINDOWS: &str = "\
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; \
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null; \
+$titre = [System.Security.SecurityElement]::Escape($env:TUNE_NOTIF_TITLE); \
+$corps = [System.Security.SecurityElement]::Escape($env:TUNE_NOTIF_BODY); \
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument; \
+$xml.LoadXml('<toast><visual><binding template=\"ToastGeneric\"><text>' + $titre + '</text><text>' + $corps + '</text></binding></visual></toast>'); \
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); \
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Tune Server').Show($toast)";
+
+/// Ce que `powershell` reçoit pour un toast : le script constant et les deux
+/// variables d'environnement. Pure, pour être vérifiable sur toute plateforme.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandeToast {
+    pub script: &'static str,
+    pub variables: [(&'static str, String); 2],
+}
+
+/// Compose le toast Windows SANS jamais insérer le texte dans le script.
+pub fn commande_toast_windows(title: &str, body: &str) -> CommandeToast {
+    CommandeToast {
+        script: SCRIPT_TOAST_WINDOWS,
+        variables: [
+            (VARIABLE_TITRE_TOAST, title.to_string()),
+            (VARIABLE_CORPS_TOAST, body.to_string()),
+        ],
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn escape_applescript(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-#[cfg(target_os = "windows")]
-fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 pub fn spawn_notification_listener(
@@ -327,5 +350,42 @@ mod tests {
     fn applescript_escaping() {
         assert_eq!(escape_applescript(r#"It's a "test""#), r#"It's a \"test\""#);
         assert_eq!(escape_applescript(r"back\slash"), r"back\\slash");
+    }
+}
+
+#[cfg(test)]
+mod toast_windows_tests {
+    use super::{
+        CommandeToast, SCRIPT_TOAST_WINDOWS, VARIABLE_CORPS_TOAST, VARIABLE_TITRE_TOAST,
+        commande_toast_windows,
+    };
+
+    /// Sécurité : un titre qui ferme la chaîne PowerShell ne compose aucune
+    /// commande. Le script reste l'octet pour octet le même, le texte voyage
+    /// en données.
+    #[test]
+    fn le_texte_ne_compose_jamais_la_commande() {
+        let titre = "a'; calc; '";
+        let corps = "b\"; Start-Process notepad; \"";
+        let CommandeToast { script, variables } = commande_toast_windows(titre, corps);
+        assert_eq!(script, SCRIPT_TOAST_WINDOWS);
+        assert!(!script.contains("calc"), "{script}");
+        assert!(!script.contains("notepad"), "{script}");
+        assert!(!script.contains(titre) && !script.contains(corps));
+        assert_eq!(variables[0], (VARIABLE_TITRE_TOAST, titre.to_string()));
+        assert_eq!(variables[1], (VARIABLE_CORPS_TOAST, corps.to_string()));
+    }
+
+    /// Le script lit bien les deux variables, échappées, et ne contient
+    /// aucune autre interpolation.
+    #[test]
+    fn le_script_lit_les_variables_echappees() {
+        assert!(SCRIPT_TOAST_WINDOWS.contains("Escape($env:TUNE_NOTIF_TITLE)"));
+        assert!(SCRIPT_TOAST_WINDOWS.contains("Escape($env:TUNE_NOTIF_BODY)"));
+        assert!(!SCRIPT_TOAST_WINDOWS.contains("{}"));
+        assert_eq!(
+            commande_toast_windows("x", "y").script,
+            commande_toast_windows("z", "w").script
+        );
     }
 }

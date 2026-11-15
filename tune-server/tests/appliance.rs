@@ -12,7 +12,67 @@ use tower::ServiceExt;
 
 fn make_app() -> axum::Router {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
-    tune_server::routes::router(state)
+    // Sécurité : sans authentification, les actions d'appliance ne sont
+    // acceptées que depuis cette machine — le test se présente en 127.0.0.1.
+    tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+    ))
+}
+
+/// Sécurité : sur une appliance dont le relais du port 80 rouvre les
+/// connexions depuis 127.0.0.1, le bouclage ne prouve plus rien : les actions
+/// machine exigent un administrateur, même vues de 127.0.0.1. L'image corrigée
+/// retire les unités et le bouclage redevient fiable.
+#[tokio::test]
+async fn le_relais_du_port_80_ferme_l_exemption_cette_machine() {
+    let _environment = crate::lock_environment();
+    struct Retirer;
+    impl Drop for Retirer {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("TUNE_APPLIANCE");
+                std::env::remove_var("TUNE_WEB80_RELAIS");
+            }
+        }
+    }
+    let _retirer = Retirer;
+    unsafe {
+        std::env::set_var("TUNE_APPLIANCE", "1");
+        std::env::set_var("TUNE_WEB80_RELAIS", "1");
+    }
+    assert!(!tune_server::routes::appliance::bouclage_fiable());
+    let app = make_app();
+    // La garde refuse AVANT le gestionnaire : rien ne redémarre ici.
+    let (status, body) = post_json(&app, "/api/v1/appliance/reboot", json!(null)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], json!("auth_required"), "{body}");
+    assert_eq!(body["reason"], json!("port80_relay"), "{body}");
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/appliance/install-to-disk",
+        json!({"device": "sda", "confirm": "oui"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["reason"], json!("port80_relay"), "{body}");
+
+    // La base entière suit la même règle : vue de 127.0.0.1 derrière le
+    // relais, sans authentification, l'export est refusé.
+    let (status, body) = get(&app, "/api/v1/system/database/export").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], json!("auth_required"), "{body}");
+
+    // Image corrigée : plus d'unité de relais, le bouclage vaut de nouveau.
+    unsafe { std::env::set_var("TUNE_WEB80_RELAIS", "0") };
+    assert!(tune_server::routes::appliance::bouclage_fiable());
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/appliance/install-to-disk",
+        json!({"device": "sda", "confirm": "oui"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "confirm invalide : {body}");
+    assert_ne!(body["error"], json!("auth_required"), "{body}");
 }
 
 async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {

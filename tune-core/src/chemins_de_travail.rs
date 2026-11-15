@@ -85,6 +85,16 @@ pub fn uid_courant() -> u32 {
     }
 }
 
+/// Le dossier où `POST /zones/upload` dépose les fichiers téléversés, et le
+/// SEUL d'où un fichier « téléversé » (`temp_file_path`, `source = "upload"`)
+/// peut être lu.
+pub const ETIQUETTE_TELEVERSEMENTS: &str = "tune-upload";
+
+/// [`racine_de_travail`] de [`ETIQUETTE_TELEVERSEMENTS`].
+pub fn racine_des_televersements() -> PathBuf {
+    racine_de_travail(ETIQUETTE_TELEVERSEMENTS)
+}
+
 /// La racine de travail de l'utilisateur courant pour une `etiquette` donnée.
 ///
 /// `etiquette` nomme le chantier (`"tune-convert"`, `"tune-declick"`) ; c'est

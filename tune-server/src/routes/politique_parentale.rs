@@ -30,6 +30,17 @@
 //! ou d'une piste explicite est refusée (403, `parental_explicit_refused`).
 //! Sans la case, ces routes ne relisent rien de plus qu'avant.
 //!
+//! #8611 — un artiste bloqué l'est partout : playlists, historique
+//! (`/history`, `/profiles/{id}/history`), favoris de la bibliothèque
+//! (`/profiles/{id}/favorites`, résolus par lectures ciblées en base),
+//! favoris et résultats des services (`/streaming/*`,
+//! `/profiles/{id}/favorites/streaming`, par le NOM seul : un identifiant
+//! de service n'est pas un artiste de la bibliothèque). Le flux d'une piste
+//! demandé par son identifiant (`/library/tracks/{id}/audio`, adresse du flux
+//! d'un service) est refusé (403 `parental_content_blocked`) quand l'appelant
+//! se nomme (`X-Profile-Id` ou session) : un renderer qui tire le flux sans
+//! se nommer joue ce que l'orchestrateur, gardé lui aussi, lui a envoyé.
+//!
 //! Le profil appelant est celui d'[`ActiveProfile`] : avec l'authentification
 //! active, celui du compte connecté.
 
@@ -191,6 +202,16 @@ fn liste_de_la_route(chemin: &str) -> Option<Liste> {
         | "/podcasts/discover"
         | "/podcasts/top"
         | "/podcasts/catalogue" => Some(Liste::Podcasts),
+        // #8611 — l'historique, les playlists (pistes, fiche, partagées,
+        // collaboratives) et l'historique d'un profil.
+        c if c == "/history" || c.starts_with("/history/") => Some(Liste::Bibliotheque),
+        c if c == "/playlists" || c.starts_with("/playlists/") => Some(Liste::Bibliotheque),
+        c if c.starts_with("/profiles/") && c.ends_with("/history") => Some(Liste::Bibliotheque),
+        // #8611 — les services : résultats, fiches, favoris ; par le nom.
+        c if c.starts_with("/streaming/") => Some(Liste::Services),
+        c if c.starts_with("/profiles/") && c.ends_with("/favorites/streaming") => {
+            Some(Liste::Services)
+        }
         // #7913 — les rangées de l'accueil, les genres, les collections, les
         // listes intelligentes et les sous-listes de la bibliothèque (albums
         // d'un artiste, pistes d'un album…) : un artiste bloqué n'y paraît
@@ -218,8 +239,122 @@ fn fiche_de_la_route(chemin: &str) -> Option<Fiche> {
     }
 }
 
-/// #7913 — le code du refus d'une fiche bloquée.
-pub(crate) const CODE_REFUS_FICHE_BLOQUEE: &str = "parental_content_blocked";
+/// #7913 — le code du refus d'une fiche bloquée ; #8611 — et d'une lecture.
+pub(crate) const CODE_REFUS_FICHE_BLOQUEE: &str = pp::CODE_REFUS_CONTENU_BLOQUE;
+
+/// #8611 — le corps du refus d'un contenu dont l'artiste est bloqué : code
+/// stable et phrase traduite.
+pub(crate) fn corps_du_refus_contenu_bloque(lang: &str) -> Value {
+    json!({
+        "error": CODE_REFUS_FICHE_BLOQUEE,
+        "code": CODE_REFUS_FICHE_BLOQUEE,
+        "message": crate::i18n::t(lang, "parental.content.blocked"),
+    })
+}
+
+/// #8611 — le refus d'un contenu dont l'artiste est bloqué : 403.
+pub(crate) fn refus_contenu_bloque(lang: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(corps_du_refus_contenu_bloque(lang)),
+    )
+        .into_response()
+}
+
+/// #8611 — la fiche d'un album, d'un artiste ou d'une piste d'un service
+/// (`/streaming/{service}/albums|artists|tracks/{id}`) : `Some(true)` pour
+/// un artiste.
+fn fiche_de_service(uri: &axum::http::Uri) -> Option<bool> {
+    let chemin = uri.path();
+    let chemin = chemin.strip_prefix("/api/v1").unwrap_or(chemin);
+    let segments: Vec<&str> = chemin.trim_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["streaming", _, "artists", _] => Some(true),
+        ["streaming", _, "albums" | "tracks", _] => Some(false),
+        _ => None,
+    }
+}
+
+/// #8611 — la liste des favoris de la bibliothèque d'un profil
+/// (`/profiles/{id}/favorites`) : des couples (`item_type`, `item_id`) dont
+/// l'artiste se lit en base.
+fn favoris_de_la_route(chemin: &str) -> bool {
+    let chemin = chemin.strip_prefix("/api/v1").unwrap_or(chemin);
+    let segments: Vec<&str> = chemin.trim_matches('/').split('/').collect();
+    matches!(segments.as_slice(), ["profiles", _, "favorites"])
+}
+
+/// #8611 — les routes qui servent le flux d'UNE piste désignée par son
+/// identifiant : la demande de lecture qu'elles valent.
+fn flux_de_la_route(chemin: &str) -> Option<tune_core::orchestrator::PlayRequest> {
+    let chemin = chemin.strip_prefix("/api/v1").unwrap_or(chemin);
+    let segments: Vec<&str> = chemin.trim_matches('/').split('/').collect();
+    let demande = |source: &str, id: &str| tune_core::orchestrator::PlayRequest {
+        source: Some(source.to_string()),
+        source_id: Some(id.to_string()),
+        ..Default::default()
+    };
+    match segments.as_slice() {
+        ["library", "tracks", id, "audio"] => {
+            id.parse::<i64>()
+                .ok()
+                .map(|id| tune_core::orchestrator::PlayRequest {
+                    track_id: Some(id),
+                    ..Default::default()
+                })
+        }
+        ["streaming", service, "tracks", id, "url"] => Some(demande(service, id)),
+        ["soundcloud", "tracks", id, "stream"] => Some(demande("soundcloud", id)),
+        _ => None,
+    }
+}
+
+/// #8611 — le profil que l'appelant NOMME (`X-Profile-Id`, ou session
+/// authentifiée), `None` s'il ne se nomme pas (renderer, serveur média).
+async fn profil_nomme(parts: &mut axum::http::request::Parts, state: &AppState) -> Option<i64> {
+    let nomme = parts.headers.contains_key("X-Profile-Id")
+        || parts.extensions.get::<crate::auth::AuthUser>().is_some();
+    if !nomme {
+        return None;
+    }
+    match ActiveProfile::from_request_parts(parts, state).await {
+        Ok(ActiveProfile(p)) => Some(p),
+        Err(never) => match never {},
+    }
+}
+
+/// #8611 — garde du flux d'une piste par son identifiant. `Some(refus)` si
+/// l'artiste de la piste est bloqué pour le profil nommé.
+async fn garder_le_flux(
+    state: &AppState,
+    parts: &mut axum::http::request::Parts,
+    demande: &tune_core::orchestrator::PlayRequest,
+) -> Option<Response> {
+    let profil = profil_nomme(parts, state).await?;
+    let politique = match pp::lire(&state.backend, profil) {
+        Ok(Some(p)) => p.politique,
+        Ok(None) => return None,
+        Err(e) if pp::table_absente(&e) => return None,
+        Err(e) => return Some(interne(e)),
+    };
+    let filtre = Filtre::depuis(&politique);
+    if !state
+        .orchestrator
+        .demande_d_un_artiste_bloque(&filtre, demande)
+        .await
+    {
+        return None;
+    }
+    tracing::info!(
+        profil,
+        track_id = ?demande.track_id,
+        source = ?demande.source,
+        source_id = ?demande.source_id,
+        "parental_content_blocked_stream"
+    );
+    let lang = crate::i18n::lang_from_header(&parts.headers);
+    Some(refus_contenu_bloque(&lang))
+}
 
 /// #7913 — marque posée sur les requêtes INTERNES de recomptage : les
 /// handlers de listes n'y font pas leurs annotations (écoutes de la
@@ -461,13 +596,24 @@ pub(crate) async fn filtrer_les_listes(
     req: Request,
     next: Next,
 ) -> Response {
+    // #8611 — le flux d'une piste par son identifiant (GET et HEAD).
+    if matches!(*req.method(), Method::GET | Method::HEAD)
+        && let Some(demande) = flux_de_la_route(req.uri().path())
+    {
+        let (mut parts, body) = req.into_parts();
+        if let Some(refus) = garder_le_flux(&state, &mut parts, &demande).await {
+            return refus;
+        }
+        return next.run(Request::from_parts(parts, body)).await;
+    }
     if req.method() != Method::GET {
         return next.run(req).await;
     }
     let liste = liste_de_la_route(req.uri().path());
     let contenus = route_a_contenus(req.uri().path());
     let fiche = fiche_de_la_route(req.uri().path());
-    if liste.is_none() && !contenus && fiche.is_none() {
+    let favoris = favoris_de_la_route(req.uri().path());
+    if liste.is_none() && !contenus && fiche.is_none() && !favoris {
         return next.run(req).await;
     }
     let lang = crate::i18n::lang_from_header(req.headers());
@@ -492,9 +638,11 @@ pub(crate) async fn filtrer_les_listes(
     // #7913 — toutes les routes de la bibliothèque passent désormais par le
     // filtre des artistes : sans artiste bloqué, elles n'ont rien à relire.
     let liste = liste.filter(|l| {
-        !matches!(l, Liste::Bibliotheque | Liste::Artistes) || filtre.bloque_des_artistes()
+        !matches!(l, Liste::Bibliotheque | Liste::Artistes | Liste::Services)
+            || filtre.bloque_des_artistes()
     });
-    if liste.is_none() && fiche.is_none() && !politique.masquer_explicite {
+    let favoris = favoris && filtre.bloque_des_artistes();
+    if liste.is_none() && fiche.is_none() && !favoris && !politique.masquer_explicite {
         return next.run(req).await;
     }
     // #8088 — les marques explicites de la bibliothèque locale, lues une
@@ -537,10 +685,48 @@ pub(crate) async fn filtrer_les_listes(
         && filtre.fiche_bloquee(&valeur, f)
     {
         tracing::debug!(profil, fiche = ?f, "politique_parentale_fiche_bloquee_refusee");
-        return refus(StatusCode::FORBIDDEN, CODE_REFUS_FICHE_BLOQUEE);
+        return refus_contenu_bloque(&lang);
+    }
+    // #8611 — les fiches des services (album, artiste, piste) : la racine,
+    // reconnue par le nom de son artiste.
+    if liste == Some(Liste::Services)
+        && let Some(f) = fiche_de_service(&gabarit.0)
+        && filtre.fiche_bloquee_de_service(&valeur, f)
+    {
+        tracing::debug!(profil, "politique_parentale_fiche_de_service_refusee");
+        return refus_contenu_bloque(&lang);
+    }
+    // #8611 — les favoris de la bibliothèque : leur artiste se lit en base,
+    // par lectures ciblées.
+    let mut retires_favoris = 0usize;
+    if favoris && let Value::Array(elements) = &mut valeur {
+        let couples: Vec<(String, i64)> = elements
+            .iter()
+            .filter_map(|e| {
+                Some((
+                    e.get("item_type")?.as_str()?.to_string(),
+                    e.get("item_id")?.as_i64()?,
+                ))
+            })
+            .collect();
+        let bloques = match pp::favoris_bloques(&state.backend, &filtre, &couples) {
+            Ok(b) => b,
+            Err(e) => return interne(e),
+        };
+        if !bloques.is_empty() {
+            let avant = elements.len();
+            elements.retain(|e| {
+                let cle = e
+                    .get("item_type")
+                    .and_then(Value::as_str)
+                    .zip(e.get("item_id").and_then(Value::as_i64));
+                !cle.is_some_and(|(t, i)| bloques.contains(&(t.to_string(), i)))
+            });
+            retires_favoris = avant - elements.len();
+        }
     }
     let total_servi = valeur.get("total").and_then(Value::as_u64);
-    let mut retires = liste.map_or(0, |l| filtre.filtrer(&mut valeur, l));
+    let mut retires = liste.map_or(0, |l| filtre.filtrer(&mut valeur, l)) + retires_favoris;
     // #7913 — le total d'une liste paginée compte seulement ce que le profil
     // peut voir, sur TOUTES les pages.
     if let (Some(l @ (Liste::Bibliotheque | Liste::Artistes)), Some(total)) = (liste, total_servi)
@@ -604,6 +790,59 @@ mod tests_8088 {
         ] {
             assert!(!route_a_contenus(c), "{c}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_8611 {
+    use super::{
+        Liste, favoris_de_la_route, fiche_de_service, flux_de_la_route, liste_de_la_route,
+    };
+
+    #[test]
+    fn les_listes_restantes_sont_filtrees_8611() {
+        for c in [
+            "/api/v1/playlists/3/tracks",
+            "/api/v1/playlists/3",
+            "/api/v1/playlists/collaborative/4/tracks",
+            "/api/v1/history",
+            "/api/v1/history/top-tracks",
+            "/api/v1/profiles/2/history",
+        ] {
+            assert_eq!(liste_de_la_route(c), Some(Liste::Bibliotheque), "{c}");
+        }
+        for c in [
+            "/api/v1/streaming/qobuz/search",
+            "/api/v1/streaming/tidal/albums/9",
+            "/api/v1/profiles/2/favorites/streaming",
+        ] {
+            assert_eq!(liste_de_la_route(c), Some(Liste::Services), "{c}");
+        }
+        assert!(favoris_de_la_route("/api/v1/profiles/2/favorites"));
+        assert!(!favoris_de_la_route(
+            "/api/v1/profiles/2/favorites/streaming"
+        ));
+        assert!(!favoris_de_la_route("/api/v1/profiles/2/favorites/facets"));
+        assert_eq!(liste_de_la_route("/api/v1/historyx"), None);
+        assert_eq!(
+            liste_de_la_route("/api/v1/profiles/2/favorites/facets"),
+            None
+        );
+    }
+
+    #[test]
+    fn le_flux_d_une_piste_par_son_id_8611() {
+        let d = flux_de_la_route("/api/v1/library/tracks/700/audio").unwrap();
+        assert_eq!(d.track_id, Some(700));
+        let d = flux_de_la_route("/api/v1/streaming/qobuz/tracks/123/url").unwrap();
+        assert_eq!(d.source.as_deref(), Some("qobuz"));
+        assert_eq!(d.source_id.as_deref(), Some("123"));
+        assert!(flux_de_la_route("/api/v1/library/tracks/700").is_none());
+        assert!(flux_de_la_route("/api/v1/library/tracks/abc/audio").is_none());
+        let fiche = |c: &str| fiche_de_service(&c.parse().unwrap());
+        assert_eq!(fiche("/api/v1/streaming/qobuz/artists/5"), Some(true));
+        assert_eq!(fiche("/api/v1/streaming/qobuz/albums/5"), Some(false));
+        assert_eq!(fiche("/api/v1/streaming/qobuz/albums/5/tracks"), None);
     }
 }
 

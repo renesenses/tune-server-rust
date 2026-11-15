@@ -589,6 +589,11 @@ pub struct LibrespotDaemon {
     /// démarrage) : une session Connect ouverte sous un AUTRE lancement est
     /// morte (renommage, plantage, relance pour la liaison).
     lancements: AtomicU64,
+    /// #8565 (fil 2778, décision de Bertrand du 13/11) — Spotify a refusé la
+    /// clé audio du dernier titre demandé (`error audio key …`, librespot
+    /// #1649) et aucun titre n'a joué depuis. Remis à `false` au premier
+    /// `playing`, à chaque démarrage et à chaque lancement de titre par Tune.
+    cles_audio_refusees: Arc<AtomicBool>,
 }
 
 /// #6933 — une ligne de stderr de librespot est-elle une erreur ? Le format
@@ -623,6 +628,23 @@ pub fn ligne_d_avertissement_librespot(ligne: &str) -> Option<String> {
 /// parce qu'il n'est pas Premium : Spotify Connect par librespot l'exige.
 pub const CODE_PREMIUM_EXIGE: &str = "spotify_premium_required";
 
+/// #8565 (décision de Bertrand du 13/11) — le code stable du refus des clés
+/// audio : Spotify répond `AesKeyError` à la demande de clé de chaque titre
+/// (librespot-org/librespot#1649, refus attaché au COMPTE). librespot passe
+/// alors au titre suivant sans un son ; Tune le dit au lieu de se taire.
+pub const CODE_CLES_AUDIO_REFUSEES: &str = "spotify_audio_key_refused";
+
+/// #8565 — une ligne de librespot dit-elle que Spotify a refusé la clé audio
+/// d'un titre ? librespot 0.8.0 écrit `error audio key {:x} {:x}`
+/// (`librespot-core/src/audio_key.rs`, paquet `AesKeyError`) ; d'autres
+/// versions disent `Audio key error` ou nomment `AesKeyError`.
+pub fn cle_audio_refusee(ligne: &str) -> bool {
+    let bas = ligne.to_lowercase();
+    bas.contains("error audio key")
+        || bas.contains("audio key error")
+        || bas.contains("aeskeyerror")
+}
+
 /// #8565 — une ligne (ou une erreur) de librespot dit-elle que le compte
 /// n'est pas Premium ? librespot nomme le refus `PremiumAccountRequired`
 /// (code d'échec de connexion de Spotify) ou parle de « premium ».
@@ -656,6 +678,7 @@ impl LibrespotDaemon {
             dernier_lance: std::sync::Mutex::new(None),
             relais: Arc::new(std::sync::Mutex::new(None)),
             lancements: AtomicU64::new(0),
+            cles_audio_refusees: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -714,6 +737,18 @@ impl LibrespotDaemon {
     /// #6933 — la dernière erreur de librespot depuis son dernier démarrage.
     pub fn derniere_erreur(&self) -> Option<String> {
         self.derniere_erreur.lock().ok().and_then(|e| e.clone())
+    }
+
+    /// #8565 — Spotify a-t-il refusé la clé audio du dernier titre demandé,
+    /// sans qu'aucun titre n'ait joué depuis ?
+    pub fn cles_audio_refusees(&self) -> bool {
+        self.cles_audio_refusees.load(Ordering::SeqCst)
+    }
+
+    /// #8565 — un nouveau titre est demandé : le refus d'avant ne vaut pas
+    /// pour lui.
+    pub fn oublier_le_refus_des_cles(&self) {
+        self.cles_audio_refusees.store(false, Ordering::SeqCst);
     }
 
     pub fn binaire(&self) -> String {
@@ -876,10 +911,12 @@ impl LibrespotDaemon {
         if let Ok(mut e) = self.derniere_erreur.lock() {
             *e = None;
         }
+        self.cles_audio_refusees.store(false, Ordering::SeqCst);
         if let Some(stderr) = proc.stderr.take() {
             let pompe = self.pompe.clone();
             let relais = self.relais.clone();
             let derniere_erreur = self.derniere_erreur.clone();
+            let cles_audio_refusees = self.cles_audio_refusees.clone();
             tokio::spawn(async move {
                 let reader = tokio::io::BufReader::new(stderr);
                 let mut lines = reader.lines();
@@ -891,6 +928,10 @@ impl LibrespotDaemon {
                             titre = ?ev.titre,
                             "librespot_evenement"
                         );
+                        if ev.evenement == "playing" {
+                            // Un titre joue : le compte reçoit ses clés.
+                            cles_audio_refusees.store(false, Ordering::SeqCst);
+                        }
                         if ev.termine() {
                             pompe.signaler_fin(ev.piste.as_deref());
                         }
@@ -902,6 +943,12 @@ impl LibrespotDaemon {
                         on_event(ev.evenement, ev.piste);
                     } else if let Some(erreur) = ligne_d_erreur_librespot(&line) {
                         warn!(erreur = %erreur, "librespot_erreur");
+                        if cle_audio_refusee(&erreur) {
+                            // #8565 — retenu à part : la ligne « Skipping to
+                            // next track » qui suit écrase `derniere_erreur`.
+                            warn!(erreur = %erreur, "librespot_cles_audio_refusees");
+                            cles_audio_refusees.store(true, Ordering::SeqCst);
+                        }
                         if let Ok(mut e) = derniere_erreur.lock() {
                             *e = Some(erreur);
                         }
@@ -1143,6 +1190,17 @@ impl SpotifyConnectManager {
         self.daemon.derniere_erreur()
     }
 
+    /// #8565 — Spotify refuse-t-il les clés audio de ce compte (dernier titre
+    /// demandé refusé, aucun joué depuis) ?
+    pub fn cles_audio_refusees(&self) -> bool {
+        self.daemon.cles_audio_refusees()
+    }
+
+    /// #8565 — à appeler avant de lancer un titre depuis Tune.
+    pub fn oublier_le_refus_des_cles(&self) {
+        self.daemon.oublier_le_refus_des_cles()
+    }
+
     /// #6933 — le binaire librespot que Tune lance.
     pub fn binaire_librespot(&self) -> String {
         self.daemon.binaire()
@@ -1267,13 +1325,27 @@ impl SpotifyConnectManager {
             // #8565 — la dernière session lancée depuis l'application Spotify
             // n'a pas pu jouer dans la zone exposée : pourquoi.
             "session_error": self.erreur_de_session.lock().ok().and_then(|e| e.clone()),
-            // #8565 — un refus que l'écran sait dire : compte non Premium.
-            "receiver_error_code": self
-                .daemon
-                .derniere_erreur()
-                .filter(|e| exige_premium(e))
-                .map(|_| CODE_PREMIUM_EXIGE),
+            // #8565 — un refus que l'écran sait dire : compte non Premium,
+            // ou clés audio refusées par Spotify (décision du 13/11).
+            "receiver_error_code": self.code_d_erreur_du_recepteur(),
         })
+    }
+}
+
+impl SpotifyConnectManager {
+    /// #8565 — le refus que l'écran sait dire, du plus fondamental au plus
+    /// précis : compte non Premium, puis clés audio refusées.
+    pub fn code_d_erreur_du_recepteur(&self) -> Option<&'static str> {
+        if self
+            .daemon
+            .derniere_erreur()
+            .is_some_and(|e| exige_premium(&e))
+        {
+            return Some(CODE_PREMIUM_EXIGE);
+        }
+        self.daemon
+            .cles_audio_refusees()
+            .then_some(CODE_CLES_AUDIO_REFUSEES)
     }
 }
 

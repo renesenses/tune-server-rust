@@ -217,3 +217,47 @@ fn une_ecoute_rattachee_par_track_id_compte_sans_interprete_7769() {
         "collections : la dernière écoute rattachée par track_id est perdue"
     );
 }
+
+/// #8714 — mêmes titre et interprète, deux pistes du même album et une
+/// copie d'un autre album : les nouvelles écoutes ne se propagent pas.
+#[test]
+fn les_playlists_departagent_les_homonymes_par_identifiant_8714() {
+    let db = bibliotheque();
+    db.execute_batch(
+        "DELETE FROM listen_history;
+         INSERT INTO tracks (id,album_id,artist_id,title,file_path) VALUES
+           (5,1,1,'Blue in Green','/m/reprise.flac'),
+           (6,2,1,'Blue in Green','/m/compilation.flac');
+         INSERT INTO listen_history (track_id,album_id,title,artist_name,source,listened_at)
+           VALUES (1,1,'Blue in Green','Miles Davis','local','2024-07-02T10:00:00Z');",
+    )
+    .unwrap();
+    assert_eq!(
+        pistes(&db, &regle("play_count", "=", json!(1))),
+        vec![1],
+        "l'identifiant doit exclure même la reprise homonyme du même album"
+    );
+    assert_eq!(
+        pistes(&db, &regle("last_played_at", ">", json!("2024-07-01"))),
+        vec![1]
+    );
+    db.execute_batch(
+        "INSERT INTO listen_history (album_id,title,artist_name,source,listened_at)
+           VALUES (1,'Blue in Green','Miles Davis','local','2020-01-01T10:00:00Z');",
+    )
+    .unwrap();
+    assert_eq!(pistes(&db, &regle("play_count", "=", json!(2))), vec![1]);
+    assert_eq!(
+        pistes(&db, &regle("play_count", "=", json!(1))),
+        vec![5],
+        "l'ancien historique sans identifiant reste borné à son album"
+    );
+    db.execute_batch(
+        "INSERT INTO listen_history (title,artist_name,source,listened_at)
+           VALUES ('Blue in Green','Miles Davis','local','2019-01-01T10:00:00Z');",
+    )
+    .unwrap();
+    assert_eq!(pistes(&db, &regle("play_count", "=", json!(3))), vec![1]);
+    assert_eq!(pistes(&db, &regle("play_count", "=", json!(2))), vec![5]);
+    assert_eq!(pistes(&db, &regle("play_count", "=", json!(1))), vec![6]);
+}

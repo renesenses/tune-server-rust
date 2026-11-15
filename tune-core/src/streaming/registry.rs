@@ -185,6 +185,19 @@ impl ServiceRegistry {
                 drop(svc_locked);
             }
 
+            // #8481 — le pays du catalogue choisi dans les Réglages. Avant les
+            // jetons : `post_restore` interroge déjà le service.
+            if let Some(pays) = settings
+                .get(&format!("streaming_{name}_catalog_country"))
+                .ok()
+                .flatten()
+            {
+                let mut svc_locked = svc.write().await;
+                if let Err(e) = svc_locked.choisir_le_pays_du_catalogue(Some(&pays)) {
+                    warn!(service = %name, pays = %pays, error = %e, "pays_du_catalogue_ignore");
+                }
+            }
+
             // Restore auth tokens
             let key = format!("auth_tokens_{name}");
             if let Some(json_str) = settings.get(&key).ok().flatten()

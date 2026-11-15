@@ -631,10 +631,11 @@ async fn un_import_de_bonnes_adresses_entre_toujours_en_entier() {
         avant + 5,
         "les cinq bonnes stations doivent être en base"
     );
-    // Les attributs de la playlist sont toujours repris (logo, groupe).
+    // Les attributs du flux importé sont repris (logo, groupe).
+    // Le catalogue peut contenir une autre station portant le même nom.
     let tsf = stations
         .iter()
-        .find(|s| s.name == "TSF Jazz")
+        .find(|s| s.url == "https://exemple.test/tsfjazz.mp3")
         .expect("TSF Jazz doit être importée");
     assert_eq!(
         tsf.logo_url.as_deref(),

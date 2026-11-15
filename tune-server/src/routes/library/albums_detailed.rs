@@ -146,13 +146,16 @@ pub(super) fn lire_les_cartes_sur(state: &AppState, q: FacetQuery, socle: &Socle
     // `MAX(...)` sur les colonnes d'album : elles sont constantes au sein d'un
     // groupe (même album), et un agrégat évite d'avoir à les lister dans le
     // GROUP BY — PostgreSQL l'exigerait, SQLite non. Écrire pour les deux.
+    // Go du 13/11 — l'année de la carte : celle des pistes, à défaut celle de
+    // l'album (lecture seule).
+    const ANNEE: &str = tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE_AVEC_AL;
     let select_cartes = format!(
         "SELECT t.album_id, \
                 MAX(al.title), \
                 MAX({ARTISTE_DE_CARTE}), \
                 MAX(al.cover_path), \
                 MAX(t.label), \
-                MAX(t.year), \
+                MAX({ANNEE}), \
                 SUM(COALESCE(t.duration_ms, 0)), \
                 COUNT(DISTINCT COALESCE(t.disc_number, 1)), \
                 COUNT(*), \

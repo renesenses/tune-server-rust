@@ -1279,6 +1279,7 @@ pub(crate) mod tests {
 /// playlists du .18 et les formes que l'ancien éditeur écrivait (`equals`,
 /// `gte`, `operator`, `is_empty`, `branch_of`…). Chaque colonne — clause,
 /// tri, borne, refusées — doit ressortir au caractère près.
+/// #8684 : la ligne année suit désormais le repli sur l’album, comme la Bibliothèque.
 ///
 /// Seule retouche voulue depuis : la clause « Favori · est · Piste » (#5997,
 /// forum #2127) départage désormais les éditions par l'album et l'ISRC — la
@@ -1290,7 +1291,9 @@ pub(crate) mod tests {
 /// provenance de la piste (#7980, `history_repo::sql::meme_provenance`) au
 /// lieu de toutes les écoutes hors radio. Enfin, toujours avec la
 /// Bibliothèque, elles ajoutent les écoutes importées (`imported_plays`,
-/// #8416).
+/// #8416). Depuis #8714, ces deux lignes suivent la priorité de la
+/// Bibliothèque : track_id, sinon album + titre, sinon titre + interprète.
+/// Les quatorze autres jeux restent identiques.
 #[cfg(test)]
 mod anciennes_regles {
     use crate::smart_playlists::build_smart_query_rapport;

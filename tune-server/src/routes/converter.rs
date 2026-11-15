@@ -386,6 +386,17 @@ async fn start_job(
     headers: axum::http::HeaderMap,
     Json(body): Json<StartJobRequest>,
 ) -> Result<axum::response::Response, AppError> {
+    // Sécurité — un `sources[].path` est lu (converti, puis rendu
+    // en archive) : il doit rester dans les dossiers de musique. Vérifié AVANT
+    // toute autre garde : un chemin hors périmètre est refusé quel que soit
+    // le reste de la demande.
+    let racines = crate::routes::confinement::racines_musicales(&state);
+    for src in &body.sources {
+        if let Some(ref p) = src.path {
+            crate::routes::confinement::exiger("sources[].path", p, &racines)?;
+        }
+    }
+
     // Premium gate: batch converter requires Premium
     if let Err(resp) = crate::premium_guard::require_premium(
         &state.license,
@@ -2804,5 +2815,51 @@ Conversion failed!"#;
             let sh = resolve_tool("sh").expect("sh must exist on unix PATH");
             assert!(sh.is_file());
         }
+    }
+}
+
+/// Sécurité — `sources[].path` reste dans les dossiers de musique.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::{banc, statut};
+
+    async fn demander(b: &crate::routes::confinement::Banc, chemin: &str) -> StatusCode {
+        let corps: StartJobRequest = serde_json::from_value(serde_json::json!({
+            "sources": [{ "path": chemin }],
+            "format": "flac",
+        }))
+        .unwrap();
+        statut(
+            start_job(
+                State(b.state.clone()),
+                Ok(crate::auth::RequireAdmin),
+                axum::http::HeaderMap::new(),
+                Json(corps),
+            )
+            .await,
+        )
+    }
+
+    #[tokio::test]
+    async fn une_source_hors_des_dossiers_de_musique_est_refusee() {
+        let b = banc();
+        for chemin in [
+            b.remontee("/secret.flac"),
+            b.remontee(""),
+            b.dehors.join("secret.flac").to_string_lossy().into_owned(),
+        ] {
+            assert_eq!(
+                demander(&b, &chemin).await,
+                StatusCode::BAD_REQUEST,
+                "{chemin} est hors des dossiers de musique et n'a pas été refusé"
+            );
+        }
+        // Dedans : la garde laisse passer (la suite peut refuser pour une
+        // autre raison — Premium —, mais pas par un 400 de chemin).
+        assert_ne!(
+            demander(&b, &b.dedans("/Album")).await,
+            StatusCode::BAD_REQUEST
+        );
     }
 }

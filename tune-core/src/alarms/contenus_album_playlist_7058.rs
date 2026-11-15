@@ -11,17 +11,17 @@ use crate::playback::{PlayState, PlaybackManager};
 use crate::streaming::ServiceRegistry;
 use serde_json::json;
 
-struct Banc {
+pub(super) struct Banc {
     _dossier: tempfile::TempDir,
-    db: Arc<dyn DbBackend>,
-    orch: Arc<PlaybackOrchestrator>,
-    zone: i64,
+    pub(super) db: Arc<dyn DbBackend>,
+    pub(super) orch: Arc<PlaybackOrchestrator>,
+    pub(super) zone: i64,
     profil: i64,
-    playlist: i64,
-    pistes: [i64; 2],
+    pub(super) playlist: i64,
+    pub(super) pistes: [i64; 2],
 }
 impl Banc {
-    async fn nouveau() -> Self {
+    pub(super) async fn nouveau() -> Self {
         let sql = SqliteDb::open_in_memory().unwrap();
         sql.init_schema().unwrap();
         run_migrations(&sql).unwrap();
@@ -84,7 +84,7 @@ impl Banc {
             pistes,
         }
     }
-    fn alarme(&self, source: &str, id: i64) -> serde_json::Value {
+    pub(super) fn alarme(&self, source: &str, id: i64) -> serde_json::Value {
         json!({"id":7058,"name":"Réveil", "zone_id":self.zone,"profile_id":self.profil,
             "source_type":source,"source_id":id.to_string(),"volume":0.5,"fade_duration_s":0})
     }

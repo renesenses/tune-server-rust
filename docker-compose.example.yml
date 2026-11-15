@@ -19,9 +19,9 @@ services:
       #   bind:
       #     propagation: rslave
       - tune-data:/data
-      # Synology : cache des modeles accessible en ecriture au compte Tune.
-      # Creer ce dossier et adapter les droits avant de retirer le commentaire.
-      # Voir docs/INSTALL-SYNOLOGY.md (adapter volume2 a votre NAS).
+      # Depuis la rc12 (#8675), les modeles d'analyse acoustique vont dans
+      # /data/embedding_models : ce montage n'est plus necessaire. Une
+      # installation qui le monte deja le garde (docs/INSTALL-SYNOLOGY.md).
       # - /volume2/docker/tune/embedding_models:/app/embedding_models
     # Sortie audio locale vers un DAC USB de cette machine (#5968) : les
     # peripheriques son de l'hote, et le groupe qui les ouvre. A retirer si

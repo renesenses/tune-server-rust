@@ -927,6 +927,8 @@ impl PositionPoller {
                         );
                     }
                     poll_states.remove(&zone_id);
+                    // Fil 2694 — fin sur ERREUR : pas de radio de fin de file.
+                    crate::playback::radio_fin_de_file::noter_fin_sur_erreur(zone_id);
                     self.handle_track_end(zone_id, zone_state).await;
                     continue;
                 }
@@ -4461,7 +4463,9 @@ impl PositionPoller {
 
             if demarrage_fige != demarrage_fige_5522::Verdict::Attendre {
                 poll_states.remove(&zone_id);
-                self.agir_sur_un_demarrage_fige(zone_id, zone_state, demarrage_fige)
+                // Cette relance rare ouvre toute la chaîne de lecture. Ne pas
+                // conserver son gros futur dans celui du sondeur.
+                Box::pin(self.agir_sur_un_demarrage_fige(zone_id, zone_state, demarrage_fige))
                     .await;
             } else if force_stop {
                 self.noter_tune_tested(zone_state, &device_id, false).await;

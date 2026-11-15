@@ -23,6 +23,10 @@ mod session_message;
 #[cfg(test)]
 #[path = "playback/titre_indisponible_7778_tests.rs"]
 mod titre_indisponible_7778_tests;
+// Recette rc12 — une piste du CD lancée sans disque : 409 nommé, pas 500.
+#[cfg(test)]
+#[path = "playback/cd_disque_absent_tests.rs"]
+mod cd_disque_absent_tests;
 // #6332 — le débit d'une piste locale dans l'état de zone.
 #[cfg(test)]
 #[path = "playback/debit_lecture_en_cours_6332_tests.rs"]
@@ -179,6 +183,10 @@ pub(crate) fn corps_du_refus_parental(e: &str, lang: &str) -> Option<Value> {
 
 /// #8154 — la route du récepteur Spotify Connect que le bouton « Activer le
 /// récepteur » appelle (`POST`, corps `{}`).
+/// #8565 — la phrase « Spotify a refusé les clés audio de ce compte »
+/// (`i18n_server.json`), rendue par la lecture et par le statut du récepteur.
+pub(crate) const CLE_CLES_AUDIO_REFUSEES: &str = "spotify.playback.audioKeyRefused";
+
 pub(crate) const ROUTE_ACTIVER_RECEPTEUR_SPOTIFY: &str = "/api/v1/spotify-connect/enable";
 
 /// #8154 — le refus « liaison Spotify Connect requise » : 409, code stable,
@@ -212,6 +220,13 @@ fn refus_liaison_spotify(
     (StatusCode::CONFLICT, Json(corps)).into_response()
 }
 
+/// Le motif du greffon CD quand le disque a quitté le lecteur
+/// (`tune_cd::lecteur::ErreurCd::AucunDisque`, voir la garde
+/// `motif_cd_disque_absent_suit_le_greffon`).
+pub(crate) const MOTIF_CD_DISQUE_ABSENT: &str = "aucun disque dans le lecteur";
+/// Le code stable de ce refus, lu par le client web.
+pub(crate) const CODE_CD_DISQUE_ABSENT: &str = "cd_disc_absent";
+
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     if let Some(reponse) = refus_du_bail_parental(&e, lang) {
         return reponse;
@@ -220,6 +235,20 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     // du profil qui écoute : 403 au code stable, phrase traduite.
     if e.contains(tune_core::db::politique_parentale::CODE_REFUS_EXPLICITE) {
         return super::politique_parentale::refus_explicite(lang);
+    }
+    // #8611 — une piste d'un artiste bloqué par la politique parentale du
+    // profil qui écoute : 403 au code stable `parental_content_blocked`.
+    if e.contains(tune_core::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE) {
+        return super::politique_parentale::refus_contenu_bloque(lang);
+    }
+    // #8611 — la politique parentale enregistrée du profil ne se relit pas.
+    if e.contains(tune_core::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE) {
+        let code = tune_core::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": code, "code": code})),
+        )
+            .into_response();
     }
     // Sentinelle « plafond de zones » de orchestrator.play() → 402 traduit,
     // avec le code stable et les deux nombres. Le format est
@@ -278,6 +307,29 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
             }),
             lang,
             "spotify.playback.premiumRequired",
+            &[],
+        );
+        if let Some(objet) = corps.as_object_mut() {
+            objet.insert("cause".into(), json!(cause));
+        }
+        return (StatusCode::CONFLICT, Json(corps)).into_response();
+    }
+    // #8565 (décision de Bertrand du 13/11) — Spotify refuse les clés audio
+    // du compte (librespot #1649) : le titre sautait sans un son. 409 au code
+    // stable, phrase traduite « Spotify a refusé les clés audio de ce
+    // compte ».
+    if let Some(pos) = e.find(tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES)
+    {
+        use tune_core::streaming::spotify_connect::CODE_CLES_AUDIO_REFUSEES;
+        use tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES;
+        let cause = e[pos + SENTINELLE_CLES_AUDIO_REFUSEES.len()..].trim();
+        let mut corps = crate::message_api::avec_message_en(
+            json!({
+                "error": CODE_CLES_AUDIO_REFUSEES,
+                "code": CODE_CLES_AUDIO_REFUSEES,
+            }),
+            lang,
+            CLE_CLES_AUDIO_REFUSEES,
             &[],
         );
         if let Some(objet) = corps.as_object_mut() {
@@ -411,6 +463,23 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     // aucune adresse de flux pour ce compte, cette région). 422 au code
     // stable, phrase traduite : sans cette branche, « no url » ne contenait
     // aucun mot du fourre-tout ci-dessous et finissait en 500 brut.
+    // Recette du .18, rc12 (13/11/2026) — une piste du CD lancée alors que le
+    // disque n'est plus dans le lecteur (titre phare écouté sur le CD avant
+    // son extraction) : le greffon CD rend « aucun disque dans le lecteur »,
+    // que le fourre-tout ci-dessous changeait en 500 `playback_error`, le
+    // texte brut dans le toast. 409 au code stable et phrase traduite : un
+    // état de l'appareil, pas une panne du serveur.
+    if e.contains(MOTIF_CD_DISQUE_ABSENT) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": CODE_CD_DISQUE_ABSENT,
+                "code": CODE_CD_DISQUE_ABSENT,
+                "message": crate::i18n::t(lang, "playback.cd_disc_absent"),
+            })),
+        )
+            .into_response();
+    }
     if tune_core::poller::refus_propre_a_la_piste(&e) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2536,6 +2605,39 @@ mod refus_de_format_3234 {
         }
     }
 
+    /// #8565 (décision de Bertrand du 13/11) — Spotify refuse les clés audio
+    /// du compte : 409 au code stable `spotify_audio_key_refused` et la phrase
+    /// « Spotify a refusé les clés audio de ce compte », au lieu d'un titre
+    /// sauté sans un mot. Contre-épreuve : sans la branche, 502.
+    #[tokio::test]
+    async fn spotify_8565_cles_audio_refusees_dit_le_refus() {
+        let e = format!(
+            "source « spotify » : {}Spotify a refusé les clés audio de ce compte (librespot : « error audio key »)",
+            tune_core::streaming::spotify_lecture::SENTINELLE_CLES_AUDIO_REFUSEES
+        );
+        for (lang, phrase) in [
+            ("fr", "Spotify a refusé les clés audio de ce compte"),
+            ("en", "Spotify refused the audio keys for this account"),
+        ] {
+            let reponse = play_error_response(e.clone(), lang);
+            assert_eq!(reponse.status(), StatusCode::CONFLICT, "{lang}");
+            let corps = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+                .await
+                .expect("corps de la réponse");
+            let corps: Value = serde_json::from_slice(&corps).expect("corps JSON");
+            assert_eq!(corps["error"], "spotify_audio_key_refused");
+            assert_eq!(corps["code"], "spotify_audio_key_refused");
+            assert_eq!(corps["message_key"], super::CLE_CLES_AUDIO_REFUSEES);
+            let message = corps["message"].as_str().unwrap_or_default();
+            assert!(message.contains(phrase), "{lang} : {message}");
+            assert!(
+                corps["cause"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("audio key"))
+            );
+        }
+    }
+
     /// Compte Spotify gratuit : 409 au code stable `spotify_premium_required`,
     /// phrase traduite qui dit que Premium est exigé par Spotify et que la
     /// navigation reste possible ; la cause technique reste dans `cause`.
@@ -2737,7 +2839,90 @@ async fn play_en_tete_du_groupe(
     .await
 }
 
+/// Les natures de conteneur que la file garde sur ses lignes (#6465).
+///
+/// `track` n'en est pas : un titre lancé seul n'a pas de conteneur à
+/// rendre, et la suite que le serveur enfile derrière lui (son album, #5372)
+/// ne doit pas s'inscrire sous ce titre.
+const CONTENEURS_DE_FILE: [&str; 4] = ["album", "playlist", "artist", "label"];
+
+/// `POST /zones/{id}/play`, puis le conteneur du geste posé sur les lignes de
+/// file qu'il vient de créer (#6465).
+///
+/// FabienM, fils 2302 (point 7), 2379 et 2559 (point 2) : « le menu historique
+/// n'historise plus la lecture des conteneurs, uniquement des titres ». Les
+/// lignes posées par « Lire » restaient à `context_type` NULL et suivaient le
+/// contexte de SESSION de la zone, qui ne vit qu'en mémoire et que tout geste
+/// sans conteneur efface (radio, podcast, radio d'artiste, préréglage —
+/// #6558 —, redémarrage du serveur — #7889). Il suffisait donc d'une radio
+/// écoutée entre deux, puis d'un clic sur un titre de l'album resté dans la
+/// file, pour que ce titre et toute la suite s'inscrivent au premier niveau.
+///
+/// Chaque ligne porte désormais le conteneur qui l'a mise en file, comme
+/// celles de « Lire ensuite » et « Ajouter à la file » (#6466) : l'écoute le
+/// lit d'abord (`contexte_de_la_piste_jouee`), quelle que soit la session.
+/// Rien n'est dédoublé : une écoute reste une ligne d'historique, seul son
+/// conteneur est désormais fiable. Seules les lignes de CE geste sont
+/// touchées (identifiant > dernier identifiant d'avant), et seulement quand
+/// le geste a bien posé ce conteneur sur la session (une relance dans la file
+/// garde ses lignes et n'en crée pas).
 async fn play(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<PlayRequest>>,
+) -> axum::response::Response {
+    let demande = body.as_ref().map(|Json(b)| contexte_de_lecture(b));
+    let avant = tune_core::db::contexte_de_file::dernier_identifiant(&state.backend, zone_id);
+    // `Box::pin` : le gestionnaire de lecture est une très grosse machine à
+    // états. Posée en ligne dans celle-ci, elle doublait la pile des tests qui
+    // appellent `play` directement, jusqu'au débordement
+    // (`reprise_service_titre_seul_6380_tests`, `le_m3u_mixte_…_7738`).
+    let reponse = Box::pin(play_sans_conteneur_de_file(
+        State(state.clone()),
+        profile,
+        Path(zone_id),
+        headers,
+        body,
+    ))
+    .await
+    .into_response();
+    if let Some((Some(nature), id, _)) = demande
+        && CONTENEURS_DE_FILE.contains(&nature.as_str())
+    {
+        let session = state.playback.get_state(zone_id).await;
+        if session.session_context_type.as_deref() == Some(nature.as_str())
+            && session.session_context_id == id
+        {
+            let contexte = tune_core::db::contexte_de_file::ContexteDeFile {
+                nature,
+                id,
+                service: session.session_context_source,
+                titre: session.session_context_title,
+                pochette: session.session_context_cover,
+            };
+            match tune_core::db::contexte_de_file::poser_apres(
+                &state.backend,
+                zone_id,
+                avant,
+                &contexte,
+            ) {
+                Ok(n) if n > 0 => info!(
+                    zone_id,
+                    nature = %contexte.nature,
+                    lignes = n,
+                    "conteneur_pose_sur_la_file_6465"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(zone_id, erreur = %e, "conteneur_de_file_non_pose_6465"),
+            }
+        }
+    }
+    reponse
+}
+
+async fn play_sans_conteneur_de_file(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Path(zone_id): Path<i64>,
@@ -3788,8 +3973,21 @@ async fn play(
                 body.start_index = depart;
                 jouables
             }) {
-                Ok(entries) if entries.iter().any(|e| e.service().is_some()) => {
-                    return jouer_playlist_mixte(
+                Ok(mut entries) if entries.iter().any(|e| e.service().is_some()) => {
+                    // Recette du 14/11 — un titre de service sans durée
+                    // (posé depuis les Favoris) entrait en file avec 0 :
+                    // « À suivre » montrait « 0:00 ». La lecture n'attend
+                    // JAMAIS le service : le cache des fiches seul avant de
+                    // démarrer, le reste en tâche de fond une fois la file
+                    // écrite (file et playlist réécrites, écran prévenu).
+                    use crate::routes::playlists::metadonnees_7738 as fiches;
+                    fiches::completer_durees(
+                        &state,
+                        fiches::titres_de_service(&mut entries),
+                        fiches::CACHE_SEUL,
+                    )
+                    .await;
+                    let reponse = jouer_playlist_mixte(
                         &state,
                         zone_id,
                         &queue_repo,
@@ -3798,6 +3996,8 @@ async fn play(
                         &lang,
                     )
                     .await;
+                    fiches::completer_en_arriere_plan(&state, zone_id, playlist_id);
+                    return reponse;
                 }
                 Ok(entries) => entries.iter().filter_map(|e| e.track_id()).collect(),
                 Err(e) => return lecture_base_echouee("play_pistes_de_playlist", zone_id, e),
@@ -5502,12 +5702,23 @@ async fn get_queue(
     } else {
         Default::default()
     };
+    // Fil 2694 — les lignes que la radio de fin de file a ajoutées : badge
+    // « ajouté par la radio » à l'écran.
+    let ajoutees_par_la_radio =
+        tune_core::playback::radio_fin_de_file::lignes_ajoutees_par_la_radio(
+            &state.backend,
+            zone_id,
+        );
     let tracks: Vec<Value> = entries[..affichees]
         .iter()
         .enumerate()
         .map(|(idx, e)| {
             let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
             if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "added_by_radio".into(),
+                    Value::Bool(ajoutees_par_la_radio.contains(&e.id)),
+                );
                 let bannie = match (e.track_id, e.source.as_deref(), e.source_id.as_deref()) {
                     (Some(id), _, _) => bannis.contains(&id),
                     (None, Some(src), Some(sid)) => bannis_de_service.contains(&(
@@ -6106,8 +6317,34 @@ async fn queue_add(
             warn!(zone_id, error = %e, "queue_add_contexte_non_pose");
         }
     }
+    // #8796 (forum VNAV) — « Ajouter » pendant l'aléatoire : les titres
+    // ajoutés sont dispersés parmi ceux qui restent à jouer, au lieu d'être lus
+    // dans l'ordre à la suite. « Lire ensuite » (position donnée) n'y passe pas.
+    // `dernier_identifiant` rend 0 quand la lecture en base échoue : sur une
+    // file qui n'était pas vide, on ne saurait plus distinguer les ajouts, et
+    // l'ajout reste en fin de file plutôt que de tout remélanger.
+    let ajouts_reperables =
+        dernier_avant > 0 || queue_repo.count_all(zone_id).unwrap_or(-1) == bilan.inserted() as i64;
+    let rangs_disperses = if body.position.is_none() && bilan.inserted() > 0 && ajouts_reperables {
+        tune_core::playback::melange::apres_ajout_en_fin(
+            &state.backend,
+            &state.playback,
+            zone_id,
+            dernier_avant,
+        )
+        .await
+    } else {
+        None
+    };
+    if rangs_disperses.is_some() {
+        // Le suivant préchargé n'est plus forcément le suivant de la file.
+        state.orchestrator.clear_prefetch().await;
+    }
     let count = bilan.inserted();
-    let start = bilan.start;
+    let start = match &rangs_disperses {
+        Some(rangs) => rangs.iter().copied().min().or(bilan.start),
+        None => bilan.start,
+    };
     if bilan.has_loss() {
         let apercu: Vec<i64> = bilan.skipped.iter().take(10).copied().collect();
         warn!(
@@ -6145,7 +6382,14 @@ async fn queue_add(
         queue_length = total,
         "queue_add_ok"
     );
-    let enfiles = decrire_enfilage(&inputs, start, &bilan.retenus);
+    let mut enfiles = decrire_enfilage(&inputs, bilan.start, &bilan.retenus);
+    // #8796 — après dispersion, chaque ligne annonce le rang où elle a
+    // réellement atterri, pas celui de l'ajout en fin de file.
+    if let Some(rangs) = &rangs_disperses {
+        for (item, rang) in enfiles.iter_mut().zip(rangs) {
+            item["position"] = json!(rang);
+        }
+    }
     state.event_bus.emit(
         "playback.queue.track_added",
         json!({
@@ -6402,6 +6646,8 @@ async fn queue_clear(
     state.orchestrator.stop(zone_id, device_id.as_deref()).await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     queue_repo.clear(zone_id).ok();
+    // Fil 2694 — plus de ligne, plus de marque « ajouté par la radio ».
+    tune_core::playback::radio_fin_de_file::oublier_les_marques(&state.backend, zone_id);
     state.orchestrator.clear_prefetch().await;
     state.playback.stop_and_clear(zone_id).await;
     state.playback.update_queue_info(zone_id, 0, 0).await;
@@ -6463,6 +6709,10 @@ async fn queue_clear_suite(state: &AppState, zone_id: i64) -> impl IntoResponse 
         .update_queue_info(zone_id, curseur, longueur)
         .await;
     persist_queue_async(state, zone_id);
+    // Fil 2694 — « Vider la suite » dit « arrête-toi après celle-ci » : la
+    // radio de fin de file ne prolonge pas cette file-là (tant qu'elle n'a
+    // pas changé d'ici sa fin).
+    tune_core::playback::radio_fin_de_file::noter_fin_voulue(&state.backend, zone_id);
     info!(
         zone_id,
         curseur, retirees, longueur, "queue_cleared_after_current"
@@ -7397,26 +7647,35 @@ struct CreateAlarm {
     fade_in_seconds: Option<i32>,
 }
 
-/// La source d'un réveil posé depuis l'écran de lecture (#7047).
+/// La source d'un réveil posé depuis l'écran de lecture (#7047, #8666).
 ///
 /// alec_eiffel (1.0.0-rc7) écoutait FIP et a posé un réveil à 21:31 depuis
 /// l'écran de lecture. Le client envoie `{"time": "21:31"}`, sans source : la
 /// route écrivait la nature `playlist` par défaut et un identifiant vide. Le
 /// réveil a sonné avec `source="playlist:"`, puis `unknown service: playlist`.
 ///
+/// #8666 (recette rc12 du 13/11) : la zone jouait un titre de la
+/// bibliothèque, et le réveil était refusé (`no source`) : seule une radio
+/// pouvait servir de source « depuis ce qui joue ».
+///
 /// Désormais, dans l'ordre :
 /// 1. une source nommée (`source_type` / `source_id`) est contrôlée ;
 /// 2. sinon `album_id` ou `playlist_id` ;
-/// 3. sinon la radio que la zone joue : c'est elle que l'utilisateur
-///    regardait en posant son réveil ;
-/// 4. sinon le réveil est refusé (400) : rien ne dit ce qu'il jouerait.
+/// 3. sinon ce que la zone joue :
+///    - une radio : sa station ;
+///    - un titre de la bibliothèque : son album, relu par `album_id` ou par
+///      la piste, et seulement s'il a au moins une piste à jouer ;
+/// 4. sinon le réveil est refusé (400 `alarm_source_required`) avec un motif
+///    (`reason`) : rien ne dit ce qu'il jouerait. Un titre de service hors
+///    bibliothèque (Qobuz, TIDAL…) ou une entrée audio n'est pas une source
+///    qu'un réveil sait rejouer (`NATURES_DE_SOURCE`).
 ///
 /// Rend `(nature, identifiant, nom affiché)`.
 async fn source_du_reveil_de_zone(
     state: &AppState,
     zone_id: i64,
     body: &CreateAlarm,
-) -> Result<(String, String, Option<String>), String> {
+) -> Result<(String, String, Option<String>), RefusDeSource> {
     if body.source_type.is_some() || body.source_id.is_some() {
         let id = match &body.source_id {
             Some(Value::String(s)) => Some(s.clone()),
@@ -7424,7 +7683,8 @@ async fn source_du_reveil_de_zone(
             _ => None,
         };
         let (nature, id) =
-            tune_core::alarms::valider_source(body.source_type.as_deref(), id.as_deref())?;
+            tune_core::alarms::valider_source(body.source_type.as_deref(), id.as_deref())
+                .map_err(RefusDeSource::Invalide)?;
         return Ok((nature, id, None));
     }
     if let Some(id) = body.album_id {
@@ -7433,18 +7693,86 @@ async fn source_du_reveil_de_zone(
     if let Some(id) = body.playlist_id {
         return Ok(("playlist".into(), id.to_string(), None));
     }
-    let en_cours = state.playback.get_state(zone_id).await.now_playing;
-    match en_cours.filter(|np| np.source == "radio") {
-        Some(np) => {
-            let (nature, id) =
-                tune_core::alarms::valider_source(Some("radio"), np.source_id.as_deref())?;
-            Ok((nature, id, Some(np.title).filter(|t| !t.trim().is_empty())))
-        }
-        None => Err(
-            "no source: name source_type and source_id, or set the alarm while the zone plays a radio"
-                .into(),
-        ),
+    let Some(np) = state.playback.get_state(zone_id).await.now_playing else {
+        return Err(RefusDeSource::Requise {
+            reason: "nothing_playing",
+            playing_source: None,
+            message: "no source: the zone plays nothing; name source_type and source_id".into(),
+        });
+    };
+    if np.source == "radio" {
+        let (nature, id) =
+            tune_core::alarms::valider_source(Some("radio"), np.source_id.as_deref()).map_err(
+                |e| RefusDeSource::Requise {
+                    reason: "radio_without_stream_url",
+                    playing_source: Some(np.source.clone()),
+                    message: format!("the radio playing on the zone cannot be replayed: {e}"),
+                },
+            )?;
+        return Ok((nature, id, Some(np.title).filter(|t| !t.trim().is_empty())));
     }
+    if let Some(album_id) = album_jouable_de_la_piste(state, &np) {
+        let nom = np.album_title.clone().filter(|t| !t.trim().is_empty());
+        return Ok(("album".into(), album_id.to_string(), nom));
+    }
+    let (reason, message) = if np.source == "local" {
+        (
+            "track_without_album",
+            "no source: the library track playing on the zone has no album to replay; \
+             name source_type and source_id"
+                .to_string(),
+        )
+    } else {
+        (
+            "source_not_replayable",
+            format!(
+                "no source: an alarm cannot replay what the zone plays ({} is not a radio, \
+                 a library album or a playlist); name source_type and source_id",
+                np.source
+            ),
+        )
+    };
+    Err(RefusDeSource::Requise {
+        reason,
+        playing_source: Some(np.source),
+        message,
+    })
+}
+
+/// Pourquoi `POST /zones/{id}/alarm` refuse la source d'un réveil.
+enum RefusDeSource {
+    /// La source NOMMÉE par le client est mal formée (#7047) :
+    /// `400 invalid_source`.
+    Invalide(String),
+    /// Aucune source nommée, et ce qui joue ne peut pas en servir (#8666) :
+    /// `400 alarm_source_required`, avec le motif dans `reason`.
+    Requise {
+        reason: &'static str,
+        playing_source: Option<String>,
+        message: String,
+    },
+}
+
+/// #8666 — l'album de la bibliothèque d'un titre en cours, s'il a au moins
+/// une piste à jouer : le réveil le rejouera par `contenu_du_reveil`, et une
+/// source qui ne jouerait rien est refusée à l'enregistrement (#7047), jamais
+/// découverte à l'heure du réveil.
+fn album_jouable_de_la_piste(
+    state: &AppState,
+    np: &tune_core::playback::NowPlaying,
+) -> Option<i64> {
+    let pistes = TrackRepo::with_backend(state.backend.clone());
+    let album = np.album_id.filter(|id| *id > 0).or_else(|| {
+        np.track_id
+            .and_then(|id| pistes.get(id).ok().flatten())
+            .and_then(|t| t.album_id)
+            .filter(|id| *id > 0)
+    })?;
+    let jouable = pistes
+        .list_by_album(album)
+        .map(|l| l.iter().any(|t| t.id.is_some()))
+        .unwrap_or(false);
+    jouable.then_some(album)
 }
 
 async fn create_alarm(
@@ -7457,11 +7785,32 @@ async fn create_alarm(
     let (source_type, source_id, source_name) =
         match source_du_reveil_de_zone(&state, zone_id, &body).await {
             Ok(s) => s,
-            Err(message) => {
+            Err(RefusDeSource::Invalide(message)) => {
                 info!(zone_id, error = %message, "alarm_source_refused");
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({ "error": "invalid_source", "message": message })),
+                )
+                    .into_response();
+            }
+            // #8666 — `error` ET `code` : le client web lit `code`, puis
+            // `error` (`apiError`). `reason` dit pourquoi ce qui joue ne peut
+            // pas servir de source.
+            Err(RefusDeSource::Requise {
+                reason,
+                playing_source,
+                message,
+            }) => {
+                info!(zone_id, reason, error = %message, "alarm_source_refused");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "alarm_source_required",
+                        "code": "alarm_source_required",
+                        "reason": reason,
+                        "playing_source": playing_source,
+                        "message": message,
+                    })),
                 )
                     .into_response();
             }
@@ -8587,7 +8936,7 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
     // #4770 : un dossier par compte, sous `TMPDIR`. `/tmp/tune-upload` était
     // un nom fixe : créé par le premier compte venu, il refusait les
     // téléversements de tous les autres.
-    let upload_dir = tune_core::chemins_de_travail::racine_de_travail("tune-upload");
+    let upload_dir = tune_core::chemins_de_travail::racine_des_televersements();
     let _ = std::fs::create_dir_all(&upload_dir);
     let file_id = uuid::Uuid::new_v4().to_string();
 
@@ -10245,6 +10594,11 @@ mod vider_la_file_arrete_le_peripherique_3669 {
             0,
             "rien ne doit être arrêté avant le geste"
         );
+        // #8701 — le fMP4 DASH de la piste en cours de la zone.
+        // Un nom seulement : le registre ne lit que le chemin.
+        let fichier = "/nulle-part/tune-dash-8701-file-videe.mp4";
+        tune_core::audio::dash_epingles::noter_la_piste_resolue(zone_id, Some(fichier));
+        assert!(tune_core::audio::dash_epingles::est_epingle(fichier));
 
         let _ = super::queue_clear(
             State(state.clone()),
@@ -10272,6 +10626,10 @@ mod vider_la_file_arrete_le_peripherique_3669 {
                 .unwrap_or(-1),
             0,
             "et la file reste vidée — l'arrêt s'AJOUTE au geste, il ne le remplace pas"
+        );
+        assert!(
+            !tune_core::audio::dash_epingles::est_epingle(fichier),
+            "#8701 : file vidée, le fMP4 de la zone reste épinglé 4 h"
         );
     }
 
@@ -10624,6 +10982,103 @@ mod vider_la_suite_4169 {
         let apres = state.playback.get_state(zone_id).await;
         assert_eq!((apres.queue_position, apres.queue_length), (1, 2));
         assert_eq!(apres.state, PlayState::Playing);
+    }
+
+    /// Fil 2694 — « Vider la suite » dit « arrête-toi après celle-ci » : la
+    /// radio de fin de file ne prolonge pas CETTE file. La consigne est
+    /// posée par la route, et vaut tant que la file n'a pas changé.
+    #[tokio::test]
+    async fn vider_la_suite_pose_une_fin_voulue_2694() {
+        let file = [service("s0"), service("s1"), service("s2")];
+        let (state, zone_id) = zone_en_lecture(&file, 0).await;
+        let statut = envoyer(
+            &state,
+            Request::post(format!("/api/v1/zones/{zone_id}/queue/clear"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"keep_current": true}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert!(
+            tune_core::playback::radio_fin_de_file::fin_voulue(&state.backend, zone_id),
+            "la file vidée de sa suite finit là"
+        );
+    }
+
+    /// Fil 2694 — `GET /zones/{id}/queue` porte `added_by_radio` sur chaque
+    /// ligne : vrai pour les lignes que la radio de fin de file a ajoutées,
+    /// faux pour les autres. Vider la file oublie les marques.
+    #[tokio::test]
+    async fn la_file_dit_ce_que_la_radio_a_ajoute_2694() {
+        let file = [service("s0"), service("s1")];
+        let (state, zone_id) = zone_en_lecture(&file, 1).await;
+        let avant =
+            tune_core::playback::radio_fin_de_file::lignes_de_la_file(&state.backend, zone_id);
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zone_id, &[service("r0"), service("r1")])
+            .expect("lot de la radio");
+        assert_eq!(
+            tune_core::playback::radio_fin_de_file::marquer_les_ajouts(
+                &state.backend,
+                zone_id,
+                &avant,
+                2
+            )
+            .len(),
+            2
+        );
+        let reponse = crate::routes::router(state.clone())
+            .oneshot(
+                Request::get(format!("/api/v1/zones/{zone_id}/queue"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("réponse du routeur");
+        assert_eq!(reponse.status(), StatusCode::OK);
+        let octets = axum::body::to_bytes(reponse.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let corps: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+        let marques: Vec<(String, bool)> = corps["tracks"]
+            .as_array()
+            .expect("tracks")
+            .iter()
+            .map(|t| {
+                (
+                    t["source_id"].as_str().unwrap_or_default().to_string(),
+                    t["added_by_radio"]
+                        .as_bool()
+                        .expect("added_by_radio toujours présent"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            marques,
+            vec![
+                ("s0".to_string(), false),
+                ("s1".to_string(), false),
+                ("r0".to_string(), true),
+                ("r1".to_string(), true),
+            ]
+        );
+        let statut = envoyer(
+            &state,
+            Request::post(format!("/api/v1/zones/{zone_id}/queue/clear"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert!(
+            tune_core::playback::radio_fin_de_file::lignes_ajoutees_par_la_radio(
+                &state.backend,
+                zone_id
+            )
+            .is_empty()
+        );
     }
 }
 

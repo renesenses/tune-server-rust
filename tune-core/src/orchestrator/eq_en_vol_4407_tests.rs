@@ -369,7 +369,7 @@ async fn bascule_pure_avec_crossfeed_sur_une_radio_dlna_sans_dlna_stop_8422() {
         )
         .unwrap();
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_id, None),
+        orch.traitement_que_pure_gouverne(zone_id, crate::audio::replaygain::PisteRg::AUCUNE),
         Some("crossfeed"),
         "prémisse : PURE gouverne le crossfeed de cette zone"
     );

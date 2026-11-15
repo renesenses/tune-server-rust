@@ -4,6 +4,7 @@ pub mod gapless;
 pub mod melange;
 pub mod queue;
 pub mod radio_artiste;
+pub mod radio_fin_de_file;
 // `crossfade` a été retiré ici (#2211), pour la même raison que
 // `radio_handler` juste en dessous : un module complet, **sans un seul
 // appelant** dans tout le dépôt depuis sa création.
@@ -179,6 +180,16 @@ pub struct VersionJouee {
 }
 
 impl NowPlaying {
+    /// #8689 — la piste dont le ReplayGain s'applique : bibliothèque, ou
+    /// titre Qobuz / TIDAL par son identifiant de service.
+    pub fn piste_rg(&self) -> crate::audio::replaygain::PisteRg<'_> {
+        crate::audio::replaygain::PisteRg::new(
+            self.track_id,
+            Some(self.source.as_str()),
+            self.source_id.as_deref(),
+        )
+    }
+
     /// Canonical mapping from a library [`Track`](crate::db::models::Track) row
     /// to a local `NowPlaying`.
     ///
@@ -194,6 +205,17 @@ impl NowPlaying {
     /// that need URL-resolved cover art or a zone-derived source override those
     /// fields on the returned value. `stream_id` is always `None` (local rows are
     /// not streamed sessions).
+    /// Variante utilisée par le démarrage et l'avance de la bibliothèque :
+    /// l'année de l'album ne sert qu'à cette copie pour l'affichage.
+    pub fn from_track_avec_album(
+        track: &crate::db::models::Track,
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    ) -> Self {
+        let mut lecture = Self::from_track(track);
+        lecture.year = crate::db::annee_de_la_piste::pour_affichage(track, db);
+        lecture
+    }
+
     pub fn from_track(track: &crate::db::models::Track) -> Self {
         Self {
             track_id: track.id,

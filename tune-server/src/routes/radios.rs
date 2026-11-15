@@ -330,6 +330,34 @@ pub(crate) fn flux_normalise(url: &str) -> String {
     tune_core::radio_metadata_relais::flux_normalise(url)
 }
 
+/// #7773 — une station par flux dans ce que lit le client.
+///
+/// `radio_stations` ne porte aucune contrainte d'unicité (ni SQLite ni
+/// PostgreSQL) : un import M3U rejoué, un « Nouvelle station » sur un flux
+/// déjà présent ou deux ajouts depuis l'écran de lecture laissaient deux
+/// lignes pour la même adresse, et la radio s'affichait deux fois dans les
+/// favoris (Bilou, fil forum 2624). Sans migration, la lecture garde la
+/// PREMIÈRE ligne de chaque flux (règle [`tune_core::db::radio_repo::cle_du_flux`]) dans l'ordre déjà
+/// rendu par la base : favoris d'abord, puis par nom. Les lignes en trop
+/// restent en base, intactes ; aucune donnée n'est supprimée.
+pub(crate) fn une_station_par_flux(stations: Vec<RadioStation>) -> Vec<RadioStation> {
+    let mut vus = std::collections::HashSet::new();
+    stations
+        .into_iter()
+        .filter(|s| vus.insert(tune_core::db::radio_repo::cle_du_flux(&s.url)))
+        .collect()
+}
+
+/// #7773 — la station de « Mes radios » qui sert déjà ce flux, s'il y en a
+/// une (même règle que la lecture : [`tune_core::db::radio_repo::cle_du_flux`]).
+fn station_du_meme_flux(stations: &[RadioStation], url: &str) -> Option<RadioStation> {
+    let cle = tune_core::db::radio_repo::cle_du_flux(url);
+    stations
+        .iter()
+        .find(|s| tune_core::db::radio_repo::cle_du_flux(&s.url) == cle)
+        .cloned()
+}
+
 /// L'hôte d'une adresse, en minuscules et sans `www.` — ou `None` si l'adresse
 /// n'en porte pas.
 ///
@@ -550,6 +578,10 @@ struct SearchQuery {
     /// #7718 — le niveau de qualité minimal d'au moins un flux.
     quality_min: Option<String>,
     lossless: Option<bool>,
+    /// Recette rc12 (14/11) — le bouton « Sans perte » (alias de `lossless`).
+    sans_perte: Option<bool>,
+    /// Recette rc12 (14/11) — le bouton « Haute qualité » : sans perte ou ≥ 256 kbit/s.
+    haute_qualite: Option<bool>,
     hires: Option<bool>,
     favorites_only: Option<bool>,
     rated_min: Option<f64>,
@@ -570,6 +602,7 @@ impl SearchQuery {
             self.metadata_plus,
         )
         .avec_qualite_min(self.quality_min.as_deref())
+        .avec_boutons_rc12(self.sans_perte, self.haute_qualite)
     }
 }
 
@@ -1720,11 +1753,11 @@ async fn list_radios(
     let repo = RadioRepo::with_backend(state.backend.clone());
     // `favorites()` trie déjà par nom et filtre en SQL — même chemin que
     // `GET /radios/favorites`, plutôt qu'un second filtre à faire diverger.
-    let items = if q.favorite == Some(true) {
+    let items = une_station_par_flux(if q.favorite == Some(true) {
         repo.favorites().unwrap_or_default()
     } else {
         repo.list().unwrap_or_default()
-    };
+    });
     let mut corps = json!(items);
     radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(&headers));
     // #6516 — chaque station de « Mes radios » rapprochée de sa fiche
@@ -1774,6 +1807,28 @@ async fn create_radio(
             );
         }
     };
+    // #7773 — un flux déjà dans « Mes radios » n'y entre pas une seconde
+    // fois : la station existante est rendue (200 au lieu de 201), sans
+    // sonder le flux ni rien écrire. C'est ce qu'appellent « Nouvelle
+    // station » et « Ajouter à Mes radios » de l'écran de lecture : un second
+    // geste sur la même radio la faisait apparaître deux fois.
+    let connues = match repo.list() {
+        Ok(stations) => stations,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Some(existante) = station_du_meme_flux(&connues, &url) {
+        tracing::info!(
+            url = %url,
+            id = ?existante.id,
+            station = %existante.name,
+            "radio_creation_flux_deja_present"
+        );
+        return (
+            StatusCode::OK,
+            Json(station_localisee(&state, &existante, &headers)),
+        )
+            .into_response();
+    }
     // Puis ce que la FORME ne peut pas dire : le serveur rend-il un flux, ou
     // une page web ? Belkadi Yacine avait collé la page d'écoute de Radio
     // Paradise ; elle passe toutes les règles ci-dessus, et seule la LECTURE
@@ -1814,8 +1869,8 @@ async fn create_radio(
         last_played: None,
         play_count: 0,
     };
-    match repo.create(&station) {
-        Ok(id) => {
+    match repo.create_unique(&station) {
+        Ok((id, nouvelle)) => {
             state.event_bus.emit(
                 "library.radios_changed",
                 json!({"action": "created", "id": id}),
@@ -1826,7 +1881,11 @@ async fn create_radio(
                 ..station
             });
             (
-                StatusCode::CREATED,
+                if nouvelle {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
                 Json(station_localisee(&state, &created, &headers)),
             )
                 .into_response()
@@ -1941,7 +2000,11 @@ async fn update_radio(
     }
     if let Some(fav) = body.favorite {
         station.is_favorite = fav;
-        repo.set_favorite(id, fav).ok();
+        if let Err(e) = repo.set_favorite_for_flux(id, fav) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // repo.update ne modifie que les métadonnées, pas is_favorite :
+        // la propagation aux jumelles est donc conservée.
     }
     match repo.update(&station) {
         Ok(()) => {
@@ -2233,7 +2296,7 @@ async fn search_radios(
 
 async fn list_favorites(headers: HeaderMap, State(state): State<AppState>) -> Json<Value> {
     let repo = RadioRepo::with_backend(state.backend.clone());
-    let items = repo.favorites().unwrap_or_default();
+    let items = une_station_par_flux(repo.favorites().unwrap_or_default());
     let mut corps = json!(items);
     radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(&headers));
     // #6516 — chaque station de « Mes radios » rapprochée de sa fiche
@@ -2297,10 +2360,13 @@ async fn add_from_web(
     // rapprochement est une égalité d'adresse normalisée, pas une heuristique :
     // deux noms différents pour le même flux, c'est une seule station.
     //
-    // Cette porte ne vaut QUE pour ce chemin. `POST /api/v1/radios` continue
-    // de créer ce qu'on lui demande : c'est une API, son appelant sait ce
-    // qu'il fait, et un client qui compte sur le 201 ne doit pas changer de
-    // comportement sous ses pieds.
+    // #7773 — `POST /api/v1/radios` et les imports appliquent désormais la
+    // même porte : le flux déjà présent n'est pas recréé (200 et la station
+    // existante pour `POST`, `already_present` pour les imports). Ici seul le
+    // favori est en plus reposé, parce que c'est ce que ce geste demande.
+    // Le lien du site conserve sa normalisation historique (#3543).
+    // Les imports et le dédoublonnage général restent conservateurs : un
+    // chemin sensible à la casse ou terminé par / n'est pas effacé.
     if let Some(existante) = repo
         .list()
         .unwrap_or_default()
@@ -2353,8 +2419,8 @@ async fn add_from_web(
         last_played: None,
         play_count: 0,
     };
-    let html = match repo.create(&station) {
-        Ok(id) => {
+    let html = match repo.create_unique(&station) {
+        Ok((id, _)) => {
             repo.set_favorite(id, true).ok();
             state.event_bus.emit(
                 "library.radios_changed",
@@ -2428,7 +2494,7 @@ async fn toggle_favorite(
     let new_state = body
         .and_then(|b| b.favorite)
         .unwrap_or(!current.is_favorite);
-    match repo.set_favorite(id, new_state) {
+    match repo.set_favorite_for_flux(id, new_state) {
         Ok(_) => {
             state.event_bus.emit(
                 "library.radios_changed",
@@ -2558,11 +2624,20 @@ const REJETS_NOMMES_AU_PLUS: usize = 50;
 struct BilanImport {
     imported: i64,
     skipped: i64,
+    /// #7773 — lignes écartées parce que leur flux est déjà dans « Mes
+    /// radios » (ou plus haut dans le même fichier). Comptées aussi dans
+    /// `skipped` : rien n'a été écrit pour elles.
+    already_present: i64,
     rejected: i64,
     nommes: Vec<Value>,
 }
 
 impl BilanImport {
+    fn deja_present(&mut self) {
+        self.already_present += 1;
+        self.skipped += 1;
+    }
+
     fn rejeter(&mut self, index: usize, nom: &str, url: &str, code: &str, message: String) {
         self.rejected += 1;
         if self.nommes.len() < REJETS_NOMMES_AU_PLUS {
@@ -2599,6 +2674,7 @@ impl BilanImport {
         let mut corps = json!({
             "imported": self.imported,
             "skipped": self.skipped,
+            "already_present": self.already_present,
             "rejected": self.rejected,
             "total": total,
             "rejected_entries": self.nommes,
@@ -2667,8 +2743,9 @@ async fn import_radios(
             last_played: None,
             play_count: 0,
         };
-        match repo.create(&station) {
-            Ok(_) => bilan.imported += 1,
+        match repo.create_unique(&station) {
+            Ok((_, true)) => bilan.imported += 1,
+            Ok((_, false)) => bilan.deja_present(),
             Err(e) => bilan.rejeter(index, &s.name, &station.url, CODE_ECHEC_ECRITURE, e),
         }
     }
@@ -2736,6 +2813,8 @@ async fn import_radios_m3u(
                 continue;
             }
         };
+        // #7773 — rejouer le même fichier (ou en importer un second qui
+        // reprend des stations) ne double plus « Mes radios ».
         // Playlists use several logo attribute spellings (tvg-logo / url-logo /
         // logo); PLS carries none. Fall back to the stream host favicon so every
         // imported radio shows art (Bilou: "pourquoi ne pas les reprendre").
@@ -2762,8 +2841,9 @@ async fn import_radios_m3u(
             last_played: None,
             play_count: 0,
         };
-        match repo.create(&station) {
-            Ok(_) => bilan.imported += 1,
+        match repo.create_unique(&station) {
+            Ok((_, true)) => bilan.imported += 1,
+            Ok((_, false)) => bilan.deja_present(),
             Err(e) => {
                 tracing::debug!(url = %entry.path, error = %e, "radio_import_m3u_entry_failed");
                 // Et pas seulement dans le journal : l'échec d'écriture est
@@ -3784,7 +3864,7 @@ pub fn alarms_router() -> Router<AppState> {
 
 async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let rows = state.backend.query_many(
-        "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, CAST(source_id AS TEXT), source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds, days_of_week, multi_zone_ids FROM alarms ORDER BY time",
+        "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, CAST(source_id AS TEXT), source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds, days_of_week, multi_zone_ids, interrupt_playback FROM alarms ORDER BY time",
         &[],
     ).map_err(AppError::internal)?;
     let items: Vec<Value> = rows
@@ -3809,6 +3889,8 @@ async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppEr
                 "fade_in_seconds": r.get(15).and_then(|v| v.as_i64()),
                 "days_of_week": r.get(16).and_then(|v| v.as_string()),
                 "multi_zone_ids": r.get(17).and_then(|v| v.as_string()),
+                // #8615 — « Interrompre la lecture en cours », cochée par défaut.
+                "interrupt_playback": r.get(18).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
             })
         })
         .collect();
@@ -3834,6 +3916,8 @@ struct CreateAlarmGlobal {
     days_of_week: Option<String>,
     /// JSON array of zone IDs, e.g. "[1,3,5]". Premium only.
     multi_zone_ids: Option<String>,
+    /// #8615 — « Interrompre la lecture en cours ». Absent : coché.
+    interrupt_playback: Option<bool>,
 }
 
 /// Le masque `days_of_week` effectif d'une écriture de réveil (#5669).
@@ -3960,6 +4044,11 @@ async fn create_alarm_global(
     } else {
         0
     };
+    let interrupt_playback_int: i32 = if body.interrupt_playback.unwrap_or(true) {
+        1
+    } else {
+        0
+    };
 
     use tune_core::db::backend::ToSqlValue;
     let name = body.name.unwrap_or_else(|| "Alarm".into());
@@ -3973,8 +4062,8 @@ async fn create_alarm_global(
     };
     let profile_id = profile.id();
     match state.backend.execute_returning_id(
-        "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled, days_of_week, multi_zone_ids, profile_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        &[&name as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &one_shot_int as &dyn ToSqlValue, &skip_holidays_int as &dyn ToSqlValue, &body.zone_id as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &source_id as &dyn ToSqlValue, &body.source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_duration_s as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &enabled_int as &dyn ToSqlValue, &days_of_week as &dyn ToSqlValue, &multi_zone_ids_opt as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
+        "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled, days_of_week, multi_zone_ids, profile_id, interrupt_playback) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&name as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &one_shot_int as &dyn ToSqlValue, &skip_holidays_int as &dyn ToSqlValue, &body.zone_id as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &source_id as &dyn ToSqlValue, &body.source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_duration_s as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &enabled_int as &dyn ToSqlValue, &days_of_week as &dyn ToSqlValue, &multi_zone_ids_opt as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue, &interrupt_playback_int as &dyn ToSqlValue],
     ) {
         Ok(id) => {
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
@@ -4000,6 +4089,8 @@ struct UpdateAlarm {
     enabled: Option<bool>,
     days_of_week: Option<String>,
     multi_zone_ids: Option<String>,
+    /// #8615 — « Interrompre la lecture en cours ». Absent : inchangé.
+    interrupt_playback: Option<bool>,
 }
 
 async fn update_alarm(
@@ -4100,6 +4191,10 @@ async fn update_alarm(
     if let Some(skip_holidays) = body.skip_holidays {
         sets.push("skip_holidays = ?".into());
         values.push((skip_holidays as i32).to_sql_value());
+    }
+    if let Some(interrupt_playback) = body.interrupt_playback {
+        sets.push("interrupt_playback = ?".into());
+        values.push((interrupt_playback as i32).to_sql_value());
     }
     if let Some(zone_id) = body.zone_id {
         sets.push("zone_id = ?".into());

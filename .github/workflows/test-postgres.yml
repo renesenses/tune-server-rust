@@ -264,6 +264,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8088 -- --nocapture --test-threads=1
 
+      # #8680 (fil 2800) — normalisation des groupes enregistrés au démarrage :
+      # une zone dans un seul groupe, réglage `zone_groups` réécrit seulement
+      # s'il change, sur un vrai PostgreSQL. Sans cette étape, le témoin
+      # prendrait son saut annoncé.
+      - name: Groupes de zones normalisés sur PostgreSQL (#8680)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8680 -- --nocapture --test-threads=1
+
       # web#916 — « Pas pour moi » de l'accueil : la PG 111 pose
       # `suggestions_ecartees`, l'écart passe par `$n` et `ON CONFLICT … DO
       # UPDATE`, cloisonné par profil (BIGINT), puis rétabli. Sans cette
@@ -299,6 +308,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8062 -- --nocapture --test-threads=1
 
+      # #8672 — « Ma collection physique » : la PG 119 pose
+      # `collection_physique_associations`, l'association manuelle passe par
+      # `$n` et `ON CONFLICT … DO UPDATE` (BIGINT), puis se défait. Sans cette
+      # étape, l'épreuve prendrait son saut annoncé.
+      - name: Associations manuelles de la collection physique sur PostgreSQL (#8672)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8672 -- --nocapture --test-threads=1
+
       # #7980 — une écoute ne compte que pour la piste de sa provenance
       # (locale, UPnP, service). Sans cette étape, le témoin prendrait son
       # saut annoncé.
@@ -306,6 +324,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7980 -- --nocapture --test-threads=1
+
+      # #8714 — une écoute ne compte que pour SA piste (`track_id`), sinon
+      # pour le titre de son album, et seulement en dernier recours par titre
+      # + interprète (ancien historique) : la copie d'une compilation ne
+      # monte plus avec l'album d'origine.
+      - name: Écoutes rapprochées par piste puis par album sur PostgreSQL (#8714)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8714 -- --nocapture --test-threads=1
 
       # #8416 — les règles « nombre d'écoutes » et « dernière écoute » des
       # listes et collections intelligentes comptent les écoutes importées
@@ -315,6 +342,37 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8416 -- --nocapture --test-threads=1
+
+      # #8676 — « Remplacer le chemin » : réécrire le préfixe des chemins
+      # stockés en une transaction, identifiants conservés, réversible. Sans
+      # cette étape, le témoin prendrait son saut annoncé.
+      - name: Remplacer le chemin de la bibliothèque sur PostgreSQL (#8676)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8676 -- --nocapture --test-threads=1
+
+      # #8280 — raisons des recommandations de l'accueil : les sources disent
+      # vrai sur un vrai PostgreSQL, et la rangée tient sa mesure. Le témoin
+      # vide `listen_history`, `tracks`, `albums`, `artists` : il tourne seul,
+      # dans sa propre étape. Sans elle, il prendrait son saut annoncé.
+      - name: Raisons des recommandations sur PostgreSQL (#8280)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8280 -- --nocapture --test-threads=1
+
+      # #8645 — une émission de podcast (nom écrit en artiste et en album)
+      # n'entre dans aucun classement par artiste, album ou titre ; ses
+      # épisodes restent dans le temps d'écoute. Sans cette étape, le témoin
+      # prendrait son saut annoncé.
+      - name: Podcasts hors des classements sur PostgreSQL (#8645)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8645 -- --nocapture --test-threads=1
+
+      - name: Fin de podcast sur toutes les zones PostgreSQL (#8170)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8170 -- --nocapture --test-threads=1
 
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
@@ -994,6 +1052,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_balises_8026 -- --nocapture --test-threads=1
 
+      # #7773 — une radio n'apparaît qu'une fois dans les favoris : lecture
+      # dédoublonnée par flux, « Nouvelle station » et imports sans seconde
+      # ligne, cœur appliqué aux deux lignes d'un doublon déjà en base.
+      - name: Radios sans doublon dans les favoris sur PostgreSQL (#7773)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test radios_doublons_7773 -- pg_ --nocapture --test-threads=1
+
       # #7027 — une bio rangée sans langue (`bio_lang` NULL ou vide, écrite
       # par le streaming ou le fonds communautaire) n'est jamais servie comme
       # de l'anglais. La cause porte sur la VALEUR de `bio_lang` : il faut le
@@ -1109,6 +1175,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pays_artiste_8090 -- --nocapture --test-threads=1
 
+      # #8668 — le pays d'édition lu sur MusicBrainz (`albums.release_country`,
+      # PG 120), la balise prioritaire, le filtre `country=` et la route
+      # `album-countries`, par le vrai routeur.
+      - name: Pays d'édition MusicBrainz sur PostgreSQL (#8668)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pays_edition_8668 -- --nocapture --test-threads=1
+
       # #6143 — « après », « avant », « entre » et `now-90d` des collections et
       # des playlists : bornes calculées en Rust (secondes pour `file_mtime`,
       # ISO pour `listened_at`) au lieu de `DATETIME()`, propre à SQLite. Sans
@@ -1126,6 +1200,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_balises_6124 -- --nocapture --test-threads=1
+
+      # Go du 13/11 — l'année d'une piste sans année (NULL ou 0) lue sur son
+      # album : filtre `year`, facette Années, règle `year` des playlists. La
+      # sous-requête corrélée et les `NULLIF` sur colonnes INTEGER, sur
+      # PostgreSQL. Jumeau SQLite dans la suite ordinaire.
+      - name: Année de la piste repliée sur l album sur PostgreSQL
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test annee_repli_album pg_ -- --nocapture --test-threads=1
 
       # #5192 — la recherche et le texte libre d'Oxygen trouvent une piste par
       # le nom de son dernier dossier et celui de son fichier. Sur la VRAIE
@@ -1159,6 +1242,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_7983 -- --nocapture --test-threads=1
 
+      # #8679 — « Albums douteux » : l'artiste du dossier écrit en base (piste
+      # rattachée à l'artiste existant, album d'un seul artiste), sur le
+      # schéma migré, lignes marquées puis retirées. Sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Artiste du dossier des albums douteux sur PostgreSQL (#8679)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_8679 -- --nocapture --test-threads=1
+
       # #4201 — les requêtes UPnP qui cherchent un favori, sur un
       # `favorites.item_id` BIGINT (PostgreSQL 18 migrée : « bigint = text »,
       # premier import complet `partial`) puis TEXT (`PG_FULL_SCHEMA`). Dans des
@@ -1167,3 +1259,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_4201 -- --nocapture --test-threads=1
+
+      # Recette du 13/11 (n° 73) — la liste des collections intelligentes lit
+      # ses deux comptes (albums, pistes) en UNE requête : elle rend sur la
+      # VRAIE base ce que rendaient les deux requêtes d'avant, pour des règles
+      # de toutes les formes. Dans un schéma à elle ; sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Comptes des collections intelligentes en une passe sur PostgreSQL
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-smart-http --lib --no-default-features --features postgres pg_comptes_collections -- --nocapture --test-threads=1

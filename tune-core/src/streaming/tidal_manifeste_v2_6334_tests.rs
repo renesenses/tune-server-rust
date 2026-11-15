@@ -197,6 +197,25 @@ async fn la_v2_rend_le_flac_que_la_v1_refusait_6334() {
     assert!(j.v1.is_empty(), "la v1 n'est pas appelée : {:?}", j.v1);
 }
 
+/// #8689 — la normalisation que la v2 publie est retenue à la lecture, sans
+/// autre appel : piste ET album, pics compris.
+#[tokio::test]
+async fn la_lecture_v2_retient_le_replaygain_publie_8689() {
+    let v2 = HashMap::from([(
+        "FLAC".to_string(),
+        (200, document_v2(&["FLAC"], "flac", 44_100, URL_FLAC_V2)),
+    )]);
+    let (svc, journal) = faux_tidal(v2, v1_du_defaut()).await;
+    svc.get_track_url("61681502", Some("LOSSLESS"))
+        .await
+        .expect("un flux");
+    let g = crate::audio::replaygain::services::lire("tidal", "61681502")
+        .expect("#8689 : le ReplayGain de trackManifests n'a pas été retenu");
+    assert_eq!((g.piste_db, g.piste_pic), (Some(-7.9), Some(0.98)));
+    assert_eq!((g.album_db, g.album_pic), (Some(-8.1), Some(0.99)));
+    assert_eq!(journal.lock().unwrap().v2, ["FLAC"], "aucun appel de plus");
+}
+
 /// La requête v2 : MPEG-DASH, URI `data:`, lecture, JSON:API, le jeton de la
 /// session (celui du code appareil / PKCE, inchangé).
 #[tokio::test]

@@ -84,6 +84,13 @@ pub struct TitreSaute {
 
 /// La raison lisible d'un refus propre au titre.
 pub fn raison_du_refus(cause: &str) -> &'static str {
+    // #8088, #8611 — un refus du contrôle parental se dit comme tel.
+    if cause.contains(crate::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE) {
+        return "artiste bloqué par le contrôle parental";
+    }
+    if cause.contains(crate::db::politique_parentale::CODE_REFUS_EXPLICITE) {
+        return "contenu explicite interdit par le contrôle parental";
+    }
     if cause
         .to_lowercase()
         .contains(crate::source_url::MOTIF_PISTE_REFUSEE)

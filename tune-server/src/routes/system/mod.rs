@@ -10,12 +10,17 @@ mod backup;
 pub(crate) mod capacites;
 // Réglages ▸ Clés d'API (#4805, lot 1 MetaRust).
 pub(crate) mod cles_api;
+pub(crate) mod comptages_8805;
 mod config;
 // Fil 2145 : « Oublier ce partage » retire ses racines par le MEME chemin.
 pub(crate) use config::{pistes_qui_partiraient, retirer_un_dossier};
+// Sécurité — l'onboarding déclare des racines par la même garde.
+pub(crate) use config::refus_de_racine_de_musique;
 mod config_backup;
 mod convert;
 mod database;
+/// #8676 — « Remplacer le chemin » : déplacer la racine de la bibliothèque.
+mod deplacer_racine;
 #[cfg(test)]
 mod diagnostic_sans_ecrivain_tests;
 pub(crate) mod diagnostics;
@@ -229,6 +234,8 @@ pub fn router() -> Router<AppState> {
         .route("/music-dirs/add", post(config::add_music_dir))
         .route("/music-dirs/remove", post(config::remove_music_dir))
         .route("/music-dirs/orphans", get(config::orphan_tracks))
+        .route("/music-dirs/move/preview", post(deplacer_racine::apercu))
+        .route("/music-dirs/move", post(deplacer_racine::appliquer))
         .route(
             "/music-dirs/purge-orphans",
             post(config::purge_orphan_tracks),

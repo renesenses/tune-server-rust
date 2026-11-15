@@ -20,21 +20,35 @@ pub fn router() -> Router<AppState> {
         .route("/groups/{id}/stream", post(set_group_stream))
 }
 
+/// L'adresse du serveur Snapcast. Une valeur qui n'est pas une adresse nue
+/// (`hôte:port`) est ignorée au profit de la valeur par défaut : l'URL
+/// composée ne vise jamais que `/jsonrpc`.
 fn snapcast_host(state: &AppState) -> String {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    settings
-        .get("snapcast_host")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "localhost:1705".into())
+    match settings.get("snapcast_host").ok().flatten() {
+        Some(h) if crate::routes::developer_api::adresse_reseau_nue(h.trim()) => {
+            h.trim().to_string()
+        }
+        Some(h) => {
+            tracing::warn!(valeur = %h, "snapcast_host_ignore");
+            "localhost:1705".into()
+        }
+        None => "localhost:1705".into(),
+    }
 }
 
-async fn jsonrpc_call(
-    client: &reqwest::Client,
-    host: &str,
-    method: &str,
-    params: Value,
-) -> Result<Value, String> {
+/// Client des appels Snapcast : aucune redirection suivie (une réponse 3xx ne
+/// renvoie pas l'appel ailleurs).
+fn client_snapcast() -> Result<reqwest::Client, String> {
+    tune_core::http::client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("snapcast client: {e}"))
+}
+
+async fn jsonrpc_call(host: &str, method: &str, params: Value) -> Result<Value, String> {
+    let client = client_snapcast()?;
     let url = format!("http://{host}/jsonrpc");
     let body = json!({
         "id": 1,
@@ -60,7 +74,7 @@ async fn jsonrpc_call(
 
 async fn snapcast_status(State(state): State<AppState>) -> impl IntoResponse {
     let host = snapcast_host(&state);
-    match jsonrpc_call(&state.http_client, &host, "Server.GetStatus", json!({})).await {
+    match jsonrpc_call(&host, "Server.GetStatus", json!({})).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -68,7 +82,7 @@ async fn snapcast_status(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn list_clients(State(state): State<AppState>) -> impl IntoResponse {
     let host = snapcast_host(&state);
-    match jsonrpc_call(&state.http_client, &host, "Server.GetStatus", json!({})).await {
+    match jsonrpc_call(&host, "Server.GetStatus", json!({})).await {
         Ok(result) => {
             let clients = result
                 .pointer("/server/groups")
@@ -106,7 +120,7 @@ async fn set_client_volume(
         "id": id,
         "volume": { "percent": body.volume, "muted": false },
     });
-    match jsonrpc_call(&state.http_client, &host, "Client.SetVolume", params).await {
+    match jsonrpc_call(&host, "Client.SetVolume", params).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -127,7 +141,7 @@ async fn mute_client(
         "id": id,
         "volume": { "muted": body.muted },
     });
-    match jsonrpc_call(&state.http_client, &host, "Client.SetVolume", params).await {
+    match jsonrpc_call(&host, "Client.SetVolume", params).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -135,7 +149,7 @@ async fn mute_client(
 
 async fn list_groups(State(state): State<AppState>) -> impl IntoResponse {
     let host = snapcast_host(&state);
-    match jsonrpc_call(&state.http_client, &host, "Server.GetStatus", json!({})).await {
+    match jsonrpc_call(&host, "Server.GetStatus", json!({})).await {
         Ok(result) => {
             let groups = result
                 .pointer("/server/groups")
@@ -162,7 +176,7 @@ async fn set_group_stream(
         "id": id,
         "stream_id": body.stream_id,
     });
-    match jsonrpc_call(&state.http_client, &host, "Group.SetStream", params).await {
+    match jsonrpc_call(&host, "Group.SetStream", params).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }

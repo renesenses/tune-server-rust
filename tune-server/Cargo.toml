@@ -242,6 +242,11 @@ tune-core = { path = "../tune-core", default-features = false, features = [
 ] }
 
 # #7642 — un profil de correction de pièce appliqué atteint le DSP de la zone.
+# #8684 — le repli d'année doit être exécuté malgré autotests = false.
+[[test]]
+name = "annee_repli_album"
+path = "tests/annee_repli_album.rs"
+
 [[test]]
 name = "correction_de_piece_appliquee_7642"
 path = "tests/correction_de_piece_appliquee_7642.rs"
@@ -771,6 +776,12 @@ path = "tests/portee_audit_repertoire_3101.rs"
 [[test]]
 name = "catalogue_imprimable_7671"
 path = "tests/catalogue_imprimable_7671.rs"
+
+# rc12 (13/11) : le catalogue suit le filtre « Hi-Res vérifié / douteux »
+# (`hires_verdict=`). Cible déclarée : `autotests = false`.
+[[test]]
+name = "catalogue_hires_verdict_rc12"
+path = "tests/catalogue_hires_verdict_rc12.rs"
 
 # #4101 : la vue Oxygen listait chaque piste de Led Zeppelin IV deux fois. Le
 # repli des copies de moindre qualite (#1362) etait pose sur la fiche d'album,
@@ -1359,6 +1370,13 @@ path = "tests/alarm_days_5669.rs"
 name = "alarm_radio_7047"
 path = "tests/alarm_radio_7047.rs"
 
+# #8666 — le réveil posé depuis Lecture en cours sur un titre de la
+# bibliothèque rejoue son album ; ce qui ne peut pas être rejoué est refusé
+# en `alarm_source_required` avec un motif.
+[[test]]
+name = "alarm_lecture_en_cours_8666"
+path = "tests/alarm_lecture_en_cours_8666.rs"
+
 [[test]]
 name = "history_context_4036"
 path = "tests/history_context_4036.rs"
@@ -1893,6 +1911,12 @@ path = "tests/playlists_pistes_de_service.rs"
 name = "playlist_retrait_par_ligne_6687"
 path = "tests/playlist_retrait_par_ligne_6687.rs"
 
+# Recette rc12 du 15/11 : « # écoutes » et « Dernière écoute » des lignes
+# d'une playlist (`GET /playlists/{id}/tracks`).
+[[test]]
+name = "playlist_ecoutes_par_ligne"
+path = "tests/playlist_ecoutes_par_ligne.rs"
+
 # Favoris LOCAUX sur PostgreSQL (chasse PG du 25/09/2026) : `ProfileRepo` liait
 # `favorites.profile_id`/`item_id` en chaine alors que ces colonnes sont BIGINT
 # sur les deux naissances d'une base PG. PAS de `required-features` : la
@@ -2077,10 +2101,21 @@ path = "tests/politique_parentale_7856.rs"
 name = "politique_parentale_7913"
 path = "tests/politique_parentale_7913.rs"
 
+# Banc rc12 (#7913) — accueil, genres, collections, recherche et pistes
+# sans l'artiste bloqué. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "banc_rc12_politique_parentale_listes_7913"
+path = "tests/banc_rc12_politique_parentale_listes_7913.rs"
+
 # #7913 — coût du total exact : une relecture par liste, puis le cache.
 [[test]]
 name = "politique_parentale_cout_7913"
 path = "tests/politique_parentale_cout_7913.rs"
+
+# #8611 — artiste bloqué : playlists, historique, favoris, services, lecture.
+[[test]]
+name = "politique_parentale_8611"
+path = "tests/politique_parentale_8611.rs"
 
 # #8088 — contrôle parental : masquer et refuser les contenus explicites.
 [[test]]
@@ -2179,3 +2214,17 @@ path = "tests/pays_artiste_8090.rs"
 name = "banc_albums_http_7774"
 path = "tests/banc_albums_http_7774.rs"
 required-features = ["postgres"]
+
+# #7773 — une radio n'apparaît qu'une fois dans les favoris : lecture
+# dédoublonnée par flux, création et imports sans doublon. Le cas PostgreSQL
+# (`pg_…`) est joué par une étape de `test-postgres.yml`.
+[[test]]
+name = "radios_doublons_7773"
+path = "tests/radios_doublons_7773.rs"
+
+# #8668 — la carte des pays : pays d'édition lu sur MusicBrainz (balise
+# prioritaire) et pays de chaque album pour la carte qui suit les filtres.
+# Jumeau PostgreSQL `pg_8668`.
+[[test]]
+name = "pays_edition_8668"
+path = "tests/pays_edition_8668.rs"

@@ -807,17 +807,13 @@ impl PlaybackOrchestrator {
     pub(super) fn zone_replaygain_changes_audio(
         &self,
         zone_id: i64,
-        track_id: Option<i64>,
+        piste: crate::audio::replaygain::PisteRg<'_>,
     ) -> bool {
-        if self.zone_audiophile(zone_id) {
+        if self.zone_audiophile(zone_id) || !piste.est_identifiee() {
             return false;
         }
-        match track_id {
-            Some(tid) => {
-                (crate::audio::replaygain::playback_factor(&self.db, tid) - 1.0).abs() > 1e-6
-            }
-            None => false,
-        }
+        // #8689 — un titre Qobuz / TIDAL compte aussi : son gain publié.
+        (crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste) - 1.0).abs() > 1e-6
     }
 
     /// Réappliquer l'égaliseur d'une zone à la sortie locale qui joue, sans
@@ -1083,7 +1079,11 @@ impl PlaybackOrchestrator {
     /// Approximation dans le sens sûr : la radio ne cuit que l'égaliseur, le
     /// bras fichier ne cuit pas le crossfeed — une empreinte qui bouge sur ces
     /// étages relance un flux qui n'en avait pas besoin, jamais l'inverse.
-    pub(super) fn empreinte_du_traitement(&self, zone_id: i64, track_id: Option<i64>) -> String {
+    pub(super) fn empreinte_du_traitement(
+        &self,
+        zone_id: i64,
+        piste: crate::audio::replaygain::PisteRg<'_>,
+    ) -> String {
         if self.zone_audiophile(zone_id) {
             return "pure".to_string();
         }
@@ -1109,8 +1109,9 @@ impl PlaybackOrchestrator {
                 },
             )
             .unwrap_or_default();
-        let replaygain = track_id
-            .map(|tid| crate::audio::replaygain::playback_factor(&self.db, tid))
+        let replaygain = piste
+            .est_identifiee()
+            .then(|| crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste))
             .filter(|f| (f - 1.0).abs() > 1e-6)
             .map(|f| f.to_bits().to_string())
             .unwrap_or_default();
@@ -1226,7 +1227,7 @@ impl PlaybackOrchestrator {
         let profil = self
             .load_eq_profile(zone_id)
             .filter(|p| crate::audio::eq::EqProcessor::new(p, 44_100, 2).is_enabled());
-        let voulu = self.empreinte_du_traitement(zone_id, np.track_id);
+        let voulu = self.empreinte_du_traitement(zone_id, np.piste_rg());
         if !poste.cuit_seulement_l_egaliseur {
             if poste.compensation_cuite
                 || (profil.is_some() && self.zone_compensation_de_niveau(zone_id))
@@ -1316,7 +1317,7 @@ impl PlaybackOrchestrator {
         self.noter_traitement_du_flux(
             zone_id,
             sid,
-            self.empreinte_du_traitement(zone_id, np.track_id),
+            self.empreinte_du_traitement(zone_id, np.piste_rg()),
         );
         info!(
             zone_id,
@@ -1372,7 +1373,7 @@ impl PlaybackOrchestrator {
             .unwrap()
             .get(&zone_id)
             .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
-        servi.is_some_and(|e| e == self.empreinte_du_traitement(zone_id, np.track_id))
+        servi.is_some_and(|e| e == self.empreinte_du_traitement(zone_id, np.piste_rg()))
     }
 
     /// LA trace qui tranche, à l'activation de l'égaliseur (#3479).
@@ -1843,12 +1844,8 @@ impl PlaybackOrchestrator {
             };
             // Le track_id est lu AVANT de prendre le verrou de la sortie : le
             // ReplayGain en dépend, et `get_state` prend ses propres verrous.
-            let track_id = self
-                .playback
-                .get_state(zone_id)
-                .await
-                .now_playing
-                .and_then(|np| np.track_id);
+            let en_cours = self.playback.get_state(zone_id).await.now_playing;
+            let track_id = en_cours.as_ref().and_then(|np| np.track_id);
             let output = output_arc.lock().await;
             let Some(local_output) = output
                 .as_any()
@@ -1884,8 +1881,10 @@ impl PlaybackOrchestrator {
             // Mêmes expressions que le bloc du chemin de lecture, à dessein :
             // toutes trois rendent `None`/1.0 en PURE, donc l'état repoussé est
             // celui qu'une lecture démarrée maintenant produirait.
-            let rg = match (pure, track_id) {
-                (false, Some(tid)) => crate::audio::replaygain::playback_factor(&self.db, tid),
+            let rg = match (pure, en_cours.as_ref()) {
+                (false, Some(np)) => {
+                    crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, np.piste_rg())
+                }
                 _ => 1.0,
             };
             local_output.set_compensation_de_niveau(self.zone_compensation_de_niveau(zone_id));
@@ -1978,16 +1977,16 @@ impl PlaybackOrchestrator {
     pub(super) fn load_streaming_dsp(
         &self,
         zone_id: i64,
-        track_id: Option<i64>,
+        piste: crate::audio::replaygain::PisteRg<'_>,
         sample_rate: u32,
         channels: u16,
     ) -> StreamingDsp {
         let _tout = EtapeDePreparation::debut(zone_id, "dsp_flux_reseau");
         let replaygain = {
             let _e = EtapeDePreparation::debut(zone_id, "dsp_replaygain");
-            match track_id {
-                Some(tid) if !self.zone_audiophile(zone_id) => {
-                    let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+            match piste {
+                p if p.est_identifiee() && !self.zone_audiophile(zone_id) => {
+                    let f = crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, p);
                     if (f - 1.0).abs() > 1e-6 {
                         Some(f)
                     } else {
@@ -2185,7 +2184,7 @@ impl PlaybackOrchestrator {
     pub(super) fn traitement_que_pure_gouverne(
         &self,
         zone_id: i64,
-        track_id: Option<i64>,
+        piste: crate::audio::replaygain::PisteRg<'_>,
     ) -> Option<&'static str> {
         if self
             .eq_profile_configure(zone_id)
@@ -2205,9 +2204,10 @@ impl PlaybackOrchestrator {
         if !self.etages_tiers_configures(zone_id).is_empty() {
             return Some("greffon_natif_tiers");
         }
-        if track_id.is_some_and(|tid| {
-            (crate::audio::replaygain::playback_factor(&self.db, tid) - 1.0).abs() > 1e-6
-        }) {
+        if piste.est_identifiee()
+            && (crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste) - 1.0).abs()
+                > 1e-6
+        {
             return Some("replaygain");
         }
         None
@@ -2239,7 +2239,8 @@ impl PlaybackOrchestrator {
     /// ASIO). Sans piste connue, seule la règle de zone est lue.
     #[cfg(feature = "local-audio")]
     pub(super) fn pure_contourne_un_reglage(&self, zone_id: i64, track_id: Option<i64>) -> bool {
-        self.traitement_que_pure_gouverne(zone_id, None).is_some()
+        self.traitement_que_pure_gouverne(zone_id, crate::audio::replaygain::PisteRg::AUCUNE)
+            .is_some()
             || Self::zone_mono_downmix_configure_with(&self.db, zone_id)
             || Self::reaffectation_de_zone_armee_with(&self.db, zone_id)
             || track_id.is_some_and(|tid| Self::reaffectation_d_album_armee_with(&self.db, tid))
@@ -2471,9 +2472,21 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         pure: bool,
     ) -> Option<crate::audio::surechantillonnage::ChoixSurechantillonnage> {
+        self.decision_du_surechantillonneur(zone_id, pure).ok()
+    }
+
+    /// #8259 — conserver le refus pour le chemin du signal de la piste ouverte.
+    pub fn decision_du_surechantillonneur(
+        &self,
+        zone_id: i64,
+        pure: bool,
+    ) -> Result<
+        crate::audio::surechantillonnage::ChoixSurechantillonnage,
+        crate::audio::surechantillonnage::Ecarte,
+    > {
         // #8428 — la cadence fixe porte déjà le flux décodé : ne pas la multiplier.
         if crate::audio::frequence_fixe::active(&self.db, zone_id).is_some() {
-            return None;
+            return Err(crate::audio::surechantillonnage::Ecarte::FrequenceFixe);
         }
         let premium = self
             .license
@@ -2482,12 +2495,12 @@ impl PlaybackOrchestrator {
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         match crate::audio::surechantillonnage::choix_de_la_zone(&settings, premium, pure, zone_id)
         {
-            Ok(choix) => Some(choix),
+            Ok(choix) => Ok(choix),
             Err(ecarte) => {
                 if ecarte != crate::audio::surechantillonnage::Ecarte::Desactive {
                     tracing::info!(zone_id, reason = ecarte.code(), "upsampler_not_engaged");
                 }
-                None
+                Err(ecarte)
             }
         }
     }
@@ -2505,7 +2518,7 @@ impl PlaybackOrchestrator {
                 return;
             }
             let pure = self.zone_audiophile(zone_id);
-            let choix = self.choix_du_surechantillonneur(zone_id, pure);
+            let choix = self.decision_du_surechantillonneur(zone_id, pure);
             let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
                 return;
             };
@@ -2514,7 +2527,7 @@ impl PlaybackOrchestrator {
                 .as_any()
                 .downcast_ref::<crate::outputs::local::LocalOutput>()
             {
-                local.set_surechantillonnage(choix);
+                local.set_decision_surechantillonnage(choix);
                 local
                     .set_fixed_sample_rate(crate::audio::frequence_fixe::active(&self.db, zone_id));
             }
@@ -2817,12 +2830,7 @@ impl PlaybackOrchestrator {
             };
             // Lu AVANT le verrou de la sortie, comme dans
             // `refresh_zone_pure_dsp` : `get_state` prend ses propres verrous.
-            let track_id = self
-                .playback
-                .get_state(zone_id)
-                .await
-                .now_playing
-                .and_then(|np| np.track_id);
+            let en_cours = self.playback.get_state(zone_id).await.now_playing;
             let pure = self.zone_audiophile(zone_id);
             let output = output_arc.lock().await;
             let Some(local_output) = output
@@ -2831,8 +2839,10 @@ impl PlaybackOrchestrator {
             else {
                 return false;
             };
-            let rg = match (pure, track_id) {
-                (false, Some(tid)) => crate::audio::replaygain::playback_factor(&self.db, tid),
+            let rg = match (pure, en_cours.as_ref()) {
+                (false, Some(np)) => {
+                    crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, np.piste_rg())
+                }
                 _ => 1.0,
             };
             local_output.set_replaygain_factor(rg);

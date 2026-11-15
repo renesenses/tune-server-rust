@@ -55,6 +55,10 @@ pub struct AppState {
     /// non en `static` : chaque état a sa base, et un test ne pollue pas le
     /// suivant.
     pub comptes_collections: Arc<tune_smart_http::comptes::CacheDesComptes>,
+    /// Les comptages de `/system/stats`, `/system/health` et
+    /// `/system/health/monitor`, hors exécuteur et resservis s'ils ont été
+    /// lents (#8805). Tenu ici et non en `static` : chaque état a sa base.
+    pub(crate) comptages: Arc<crate::routes::system::comptages_8805::Comptages>,
     /// Registry of in-progress background tasks (enrichment, artwork, bios) for
     /// the UI "tâches de fond" indicator. See [`crate::background_tasks`].
     pub background_tasks: crate::background_tasks::BackgroundTasks,
@@ -715,6 +719,7 @@ impl AppState {
             scanner,
             event_bus,
             comptes_collections,
+            comptages: Arc::default(),
             background_tasks,
             passe_dr: Arc::new(tune_core::audio::replaygain::plage_dynamique::PasseDr::new()),
             bibliotheque_rg: Arc::new(

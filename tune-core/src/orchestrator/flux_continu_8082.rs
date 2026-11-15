@@ -191,8 +191,9 @@ impl PlaybackOrchestrator {
         let track_id = track_id?;
         // Gardes parentales (#8088, #7974) : une piste DANS le flux est jouée
         // sans repasser par elles. Profil qui masque l'explicite, ou bail
-        // d'écoute borné : pas de flux continu, chemin normal.
-        if self.masque_l_explicite(zone_id).await
+        // d'écoute borné : pas de flux continu, chemin normal. #8611 : de
+        // même pour un profil qui bloque des artistes.
+        if self.garde_parentale_par_piste(zone_id).await
             || !self
                 .bail_couvre_l_enchainement(zone_id, std::time::Duration::from_secs(86_400))
                 .await

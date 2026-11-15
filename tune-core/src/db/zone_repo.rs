@@ -1331,7 +1331,23 @@ impl ZoneRepo {
         // the rowid we read reflects the INSERT we just did.
         let create_sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 3] = [&name, &output_type, &output_device_id];
-        self.db.execute_returning_id(&create_sql, &params)
+        let id = self.db.execute_returning_id(&create_sql, &params)?;
+        self.radio_de_fin_de_file_par_defaut(id);
+        Ok(id)
+    }
+
+    /// Fil 2694 (décision de Bertrand du 13/11, « comme Roon ») : une zone
+    /// naît avec la radio de fin de file ACTIVÉE (mode « titres similaires »).
+    /// Désactivable par zone. Au mieux : une base trop ancienne pour avoir la
+    /// colonne crée sa zone quand même (le réglage y est de toute façon
+    /// illisible, donc éteint).
+    fn radio_de_fin_de_file_par_defaut(&self, id: i64) {
+        let sql = self.update_field_sql("autoplay_enabled");
+        let val = AutoplayMode::Similar.as_stocke().to_string();
+        let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        if let Err(e) = self.db.execute(&sql, &params) {
+            tracing::debug!(zone_id = id, error = %e, "radio_fin_de_file_defaut_non_pose");
+        }
     }
 
     /// Atomically get an existing zone by output_device_id, or create a new one.
@@ -4982,13 +4998,15 @@ mod autoplay_mode_tests {
         assert!(lue(jamais).is_some(), "par identifiant aussi");
     }
 
-    /// Defaut inchange : une zone neuve n'enchaine rien.
+    /// Fil 2694 (décision de Bertrand du 13/11, « comme Roon ») : une zone
+    /// neuve enchaîne sur des titres similaires à la fin de la file. C'était
+    /// `Off` jusqu'à la rc12.
     #[test]
-    fn zone_neuve_est_eteinte() {
+    fn zone_neuve_a_la_radio_de_fin_de_file() {
         let repo = repo();
         let id = zone(&repo);
-        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Off);
-        assert!(!repo.get_autoplay_enabled(id));
+        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Similar);
+        assert!(repo.get_autoplay_enabled(id));
     }
 
     /// LE TEST DE NON-REGRESSION. Une zone dont l'autoplay etait actif avant

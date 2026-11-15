@@ -215,7 +215,12 @@ async fn relocation_full_flow() {
         ..Default::default()
     };
     let state = tune_server::state::AppState::new(&config.db_path.clone(), 0, config).unwrap();
-    let app = tune_server::routes::router(state);
+    // Sécurité : sans authentification, installer sur disque n'est accepté
+    // que depuis cette machine — le test se présente donc en 127.0.0.1.
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
 
     // Volumes candidats visibles.
     let (status, body) = get(&app, "/api/v1/appliance/storage").await;

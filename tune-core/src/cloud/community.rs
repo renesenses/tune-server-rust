@@ -3,7 +3,7 @@ use tracing::{debug, info};
 
 use crate::cloud::refusal::CloudError;
 
-const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
+pub const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 
 /// A community-approved album cover returned by mozaiklabs.fr.
 #[derive(Debug, Clone, Deserialize)]
@@ -316,6 +316,136 @@ pub async fn submit_artist_image(
     }
 
     info!(mbid, artist_name, "community_artist_image_submitted");
+    Ok(())
+}
+
+/// Refus du site pendant le renvoi des images d'artistes perdues
+/// (`cloud::renvoi_images_artistes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefusDuSite {
+    /// À retenter plus tard : réseau, 404 (route pas encore déployée), 408,
+    /// 429, 5xx — dont le 503 « stockage indisponible » du site.
+    /// `retry_after` est le délai annoncé par le site, jamais fabriqué.
+    Transitoire {
+        raison: String,
+        retry_after: Option<u64>,
+    },
+    /// Refus qui ne changera pas en réessayant la même requête (422…).
+    Definitif(String),
+}
+
+impl std::fmt::Display for RefusDuSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transitoire { raison, .. } | Self::Definitif(raison) => f.write_str(raison),
+        }
+    }
+}
+
+fn refus_depuis_reponse(contexte: &str, resp: &reqwest::Response) -> RefusDuSite {
+    let status = resp.status();
+    let raison = format!("{contexte}: {status}");
+    let transitoire = status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::NOT_FOUND;
+    if transitoire {
+        RefusDuSite::Transitoire {
+            raison,
+            retry_after: crate::cloud::rate_limit::retry_after_secs(resp.headers()),
+        }
+    } else {
+        RefusDuSite::Definitif(raison)
+    }
+}
+
+/// Nombre de MBID au plus par appel de [`artist_images_missing`] (borne du
+/// site).
+pub const MBID_MANQUANTS_PAR_LOT: usize = 500;
+
+/// « Parmi ces MBID, lesquels n'ont AUCUNE image d'artiste approuvée ou en
+/// attente sur le site ? » — `POST /api/v1/community/artist-images/missing`
+/// (site-mozaiklabs, rc12). Même garde que le dépôt : l'installation doit être
+/// connue du site.
+pub async fn artist_images_missing(
+    base_url: &str,
+    instance_id: &str,
+    mbids: &[String],
+) -> Result<Vec<String>, RefusDuSite> {
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{base}/api/v1/community/artist-images/missing");
+    let resp = crate::http::client::shared()
+        .post(&url)
+        .json(&serde_json::json!({ "instance_id": instance_id, "mbids": mbids }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| RefusDuSite::Transitoire {
+            raison: format!("artist images missing failed: {e}"),
+            retry_after: None,
+        })?;
+    if !resp.status().is_success() {
+        let refus = refus_depuis_reponse("artist images missing", &resp);
+        debug!(error = %refus, "artist_images_missing_rejected");
+        return Err(refus);
+    }
+
+    #[derive(Deserialize)]
+    struct Reponse {
+        missing: Vec<String>,
+    }
+    let r: Reponse = resp.json().await.map_err(|e| RefusDuSite::Transitoire {
+        raison: format!("parse artist images missing: {e}"),
+        retry_after: None,
+    })?;
+    Ok(r.missing)
+}
+
+/// [`submit_artist_image`] pour le renvoi : le type MIME du fichier en cache,
+/// et un refus classé (un 503 se retente, un 422 non). « already submitted »
+/// et « rejected » répondent 200 : succès, comme à l'envoi d'origine.
+pub async fn resubmit_artist_image(
+    base_url: &str,
+    mbid: &str,
+    artist_name: &str,
+    instance_id: &str,
+    source: &str,
+    mime: &str,
+    image_data: Vec<u8>,
+) -> Result<(), RefusDuSite> {
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{base}/api/v1/community/artist-images");
+    let extension = match mime {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        _ => "jpg",
+    };
+    let image_part = reqwest::multipart::Part::bytes(image_data)
+        .file_name(format!("{mbid}.{extension}"))
+        .mime_str(mime)
+        .map_err(|e| RefusDuSite::Definitif(format!("mime error: {e}")))?;
+    let form = reqwest::multipart::Form::new()
+        .text("mbid", mbid.to_string())
+        .text("artist_name", artist_name.to_string())
+        .text("instance_id", instance_id.to_string())
+        .text("source", source.to_string())
+        .part("image", image_part);
+
+    let resp = crate::http::client::shared()
+        .post(&url)
+        .multipart(form)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| RefusDuSite::Transitoire {
+            raison: format!("resubmit artist image failed: {e}"),
+            retry_after: None,
+        })?;
+    if !resp.status().is_success() {
+        let refus = refus_depuis_reponse("resubmit artist image", &resp);
+        debug!(mbid, error = %refus, "artist_image_resubmit_rejected");
+        return Err(refus);
+    }
     Ok(())
 }
 

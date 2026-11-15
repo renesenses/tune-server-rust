@@ -96,7 +96,14 @@ impl Drop for Environnement {
 async fn demarrer(db: &Path) -> (AppState, axum::Router) {
     let state = AppState::new(db.to_str().unwrap(), 0, Default::default()).unwrap();
     tune_server::plugins_host::load_wasm_plugins(&state).await;
-    let app = tune_server::routes::router(state.clone());
+    // Sécurité : sans authentification, l'installation depuis la boutique
+    // n'est acceptée que depuis cette machine — le test se présente en 127.0.0.1.
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     (state, app)
 }
 

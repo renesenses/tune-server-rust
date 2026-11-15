@@ -2529,7 +2529,7 @@ pub(super) async fn update_check(State(state): State<AppState>) -> Json<Value> {
 /// directly under the warning that playback will stop. It does NOT override
 /// the restart deferral — see [`defer_restart_until_quiet`].
 pub(super) async fn update_install(
-    _admin: crate::auth::RequireAdmin,
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<UpdateInstallParams>,

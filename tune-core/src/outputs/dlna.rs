@@ -3328,6 +3328,13 @@ impl OutputTarget for DlnaOutput {
         let response = self
             .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
             .await?;
+        if faute_commande_soap(&response) && est_701(&response) {
+            // #8738 — après un redémarrage, le renderer peut avoir perdu
+            // l'URI alors que Tune conserve encore sa session de flux.
+            // Le refus reste un refus ; l'orchestrateur rétablit UNE fois
+            // le titre à sa position par son chemin de session perdue.
+            self.arrete_au_lieu_de_pause.store(true, Ordering::SeqCst);
+        }
         acquitter_commande_soap("Play", response)
     }
 
@@ -4392,7 +4399,7 @@ pub(crate) fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities
 /// Marco), and forcing WAV on those wastes bandwidth and loses bit-perfect
 /// FLAC the renderer could decode natively.
 fn protocol_sink_supports_mime(mime: &str, protocols: &[String]) -> bool {
-    let mime_lower = mime.to_lowercase();
+    let mime_lower = mime.split(";").next().unwrap_or(mime).trim().to_lowercase();
     let mime_alt = if let Some(rest) = mime_lower.strip_prefix("audio/x-") {
         format!("audio/{rest}")
     } else if let Some(rest) = mime_lower.strip_prefix("audio/") {
@@ -4441,17 +4448,18 @@ fn advertised_mime_for_sink(desired: &str, sink: &[String]) -> String {
         .iter()
         .filter_map(|e| sink_entry_base_mime(e))
         .collect();
-    // Already listed verbatim (case-insensitive): announce as-is.
-    if listed.iter().any(|b| b.eq_ignore_ascii_case(desired)) {
+    // Conserver les paramètres du flux réel (notamment cadence/canaux L16).
+    let (base, params) = desired.split_once(";").unwrap_or((desired, ""));
+    if listed.iter().any(|b| b.eq_ignore_ascii_case(base)) {
         return desired.to_string();
     }
-    let aliases: &[&str] = match desired.to_lowercase().as_str() {
+    let aliases: &[&str] = match base.to_lowercase().as_str() {
         "audio/flac" => &["audio/x-flac"],
         "audio/x-flac" => &["audio/flac"],
         "audio/mpeg" => &["audio/mp3"],
         "audio/mp3" => &["audio/mpeg"],
-        "audio/wav" => &["audio/x-wav"],
-        "audio/x-wav" => &["audio/wav"],
+        "audio/wav" => &["audio/x-wav", "audio/wave", "audio/vnd.wave"],
+        "audio/x-wav" => &["audio/wav", "audio/wave", "audio/vnd.wave"],
         // Mêmes octets, autres orthographes — celles qu'une pile stricte
         // (upmpdcli : `audio/x-dsd`, `audio/aac`, `audio/x-aiff`…) publie
         // sans publier la nôtre. Le DSD ne s'aligne que sur les génériques :
@@ -4467,7 +4475,11 @@ fn advertised_mime_for_sink(desired: &str, sink: &[String]) -> String {
     };
     for alias in aliases {
         if let Some(found) = listed.iter().find(|b| b.eq_ignore_ascii_case(alias)) {
-            return found.clone();
+            return if params.is_empty() {
+                found.clone()
+            } else {
+                format!("{found};{params}")
+            };
         }
     }
     desired.to_string()
@@ -5142,6 +5154,18 @@ mod tests {
             "audio/flac",
             &["http-get:*:*:*".to_string()]
         ));
+    }
+
+    #[test]
+    fn mime_8722_l16_garde_sa_cadence_et_wav_accepte_les_alias() {
+        let sink = vec!["http-get:*:audio/L16;rate=44100;channels=2:*".into()];
+        let mime = "audio/L16;rate=44100;channels=2";
+        assert!(protocol_sink_supports_mime(mime, &sink));
+        assert_eq!(advertised_mime_for_sink(mime, &sink), mime);
+        for alias in ["audio/wave", "audio/vnd.wave"] {
+            let sink = vec![format!("http-get:*:{alias}:*")];
+            assert_eq!(advertised_mime_for_sink("audio/wav", &sink), alias);
+        }
     }
 
     #[test]

@@ -43,6 +43,18 @@ const ATTENTE_DE_FIN: Duration = Duration::from_millis(1500);
 /// soit NORMALE (complétée par du silence) et non une interruption.
 const MARGE_DE_FIN: u64 = 3 * OCTETS_PAR_SECONDE as u64;
 
+/// #8565 — combien de temps l'ouverture d'un titre guette son premier son,
+/// ou le refus de sa clé audio par Spotify (librespot #1649 : Jon, fil 2778,
+/// titre sauté au bout de ~3 s). Passé ce délai sans l'un ni l'autre, le
+/// flux est remis tel quel, comme avant : son lecteur attend encore.
+const ATTENTE_DU_PREMIER_SON: Duration = Duration::from_secs(5);
+
+/// #8565 (décision de Bertrand du 13/11) — préfixe du refus « Spotify a
+/// refusé les clés audio de ce compte », reconnu par la route de lecture qui
+/// le rend en 409 au code [`crate::streaming::spotify_connect::CODE_CLES_AUDIO_REFUSEES`]
+/// avec une phrase traduite, au lieu d'un titre sauté sans un son.
+pub const SENTINELLE_CLES_AUDIO_REFUSEES: &str = "spotify_audio_key_refused:";
+
 pub const MOTIF_NON_CONNECTE: &str =
     "Spotify n'est pas connecté : se connecter dans Réglages → Services → Spotify.";
 
@@ -111,6 +123,16 @@ pub fn est_un_refus_premium(erreur: &str) -> bool {
         || bas.contains("compte spotify premium est exigé")
 }
 
+/// #8764 — le motif d'un lancement refusé hors refus d'identifiants :
+/// l'erreur de l'API Web, puis la dernière ligne ERROR de librespot en
+/// complément, s'il y en a une.
+pub fn motif_echec_de_la_commande(echec: &str, erreur_librespot: Option<&str>) -> String {
+    match erreur_librespot {
+        Some(l) => format!("{echec} (librespot : « {l} »)"),
+        None => echec.to_string(),
+    }
+}
+
 /// #6933 — ce que le motif d'échec doit savoir du récepteur.
 pub struct ContexteDeLibrespot<'a> {
     /// Le binaire lancé, décrit (chemin, origine, version).
@@ -140,9 +162,7 @@ pub fn motif_echec_librespot(
 ) -> String {
     let binaire = ctx.binaire;
     if !est_un_refus_d_identifiants(erreur) {
-        return format!(
-            "librespot ({binaire}) s'est arrêté sans se connecter au compte Spotify : « {erreur} »."
-        );
+        return format!("librespot ({binaire}) a refusé la commande de lecture : « {erreur} ».");
     }
     if porte_la_lecture == Some(false) {
         return format!(
@@ -387,7 +407,9 @@ impl FournisseurPcm for FournisseurSpotify {
         // « Le dernier geste gagne » (Bertrand, 12/11) : une session Spotify
         // Connect ouverte perd la pompe.
         let session_connect = pompe.consommateur_continu();
-        let rx = pompe.attacher(Some(piste.clone()));
+        let mut rx = pompe.attacher(Some(piste.clone()));
+        // #8565 — un refus de clé d'un titre d'avant ne vaut pas pour celui-ci.
+        self.recepteur.oublier_le_refus_des_cles();
         let lancement = rt.block_on(self.pilote.lancer(
             &self.recepteur.device_name(),
             &piste,
@@ -430,9 +452,26 @@ impl FournisseurPcm for FournisseurSpotify {
                 tracing::warn!(detail = %detail, "spotify_lecture_premium_requis");
                 return Err(format!("{SENTINELLE_PREMIUM_REQUIS}{detail}"));
             }
+            // #8764 — hors refus d'identifiants, la raison de l'échec est
+            // celle de l'API Web (`e`) : une ligne ERROR de librespot, même
+            // ancienne (une commande Spotify Connect refusée, librespot
+            // connecté), n'en est que le complément. Elle n'est plus rendue
+            // comme « librespot s'est arrêté sans se connecter ».
+            let erreur_librespot = self.recepteur.derniere_erreur_librespot();
+            if !erreur_librespot
+                .as_deref()
+                .is_some_and(est_un_refus_d_identifiants)
+            {
+                tracing::warn!(
+                    echec = %e,
+                    erreur_librespot = ?erreur_librespot,
+                    "spotify_lecture_commande_refusee"
+                );
+                return Err(motif_echec_de_la_commande(&e, erreur_librespot.as_deref()));
+            }
             // #6933 — si librespot a dit pourquoi il ne s'est pas connecté,
             // c'est SA raison qui est rendue, pas un « reconnecter » générique.
-            if let Some(erreur) = self.recepteur.derniere_erreur_librespot() {
+            if let Some(erreur) = erreur_librespot {
                 let portee = rt.block_on(self.pilote.porte_la_lecture());
                 let lance = self.recepteur.librespot_lance();
                 let binaire = lance
@@ -486,6 +525,26 @@ impl FournisseurPcm for FournisseurSpotify {
             }
             return Err(e);
         }
+        // #8565 — le premier son, ou le refus de la clé audio : Spotify qui
+        // refuse les clés du compte faisait sauter le titre sans un son ni
+        // un mot. Le dire, comme « Premium exigé » (#8577).
+        let premier = rt.block_on(attendre_le_premier_son(
+            &mut rx,
+            &self.recepteur,
+            ATTENTE_DU_PREMIER_SON,
+        ));
+        let courant = match premier {
+            PremierSon::Bloc(bloc) => bloc,
+            PremierSon::Rien => Vec::new(),
+            PremierSon::ClesRefusees => {
+                pompe.detacher();
+                tracing::warn!(piste = %piste, "spotify_lecture_cles_audio_refusees");
+                return Err(format!(
+                    "{SENTINELLE_CLES_AUDIO_REFUSEES}Spotify a refusé les clés audio de ce compte \
+                     (librespot : « error audio key »)"
+                ));
+            }
+        };
         let octets = octets_a_servir(duree_ms, depuis_ms);
         tracing::info!(piste = %piste, depuis_ms, duree_ms, octets, "spotify_lecture_ouverte");
         Ok(FluxPcm {
@@ -495,7 +554,7 @@ impl FournisseurPcm for FournisseurSpotify {
             lecteur: Box::new(LecteurDePompe {
                 rx,
                 rt,
-                courant: Vec::new(),
+                courant,
                 pos: 0,
                 restant: octets,
                 silence: false,
@@ -517,6 +576,39 @@ impl FournisseurPcm for FournisseurSpotify {
             codec: q.codec.to_string(),
             debit_kbps: Some(q.bitrate_kbps),
         })
+    }
+}
+
+/// #8565 — ce que l'ouverture d'un titre a vu en premier.
+enum PremierSon {
+    /// Le premier bloc de PCM : le titre joue.
+    Bloc(Vec<u8>),
+    /// Spotify a refusé la clé audio du titre (librespot #1649).
+    ClesRefusees,
+    /// Ni l'un ni l'autre dans le délai (ou flux fermé) : comme avant.
+    Rien,
+}
+
+/// #8565 — guette le premier bloc de PCM, ou le refus de la clé audio que
+/// librespot écrit sur stderr (`error audio key …`). Un bloc arrivé gagne.
+async fn attendre_le_premier_son(
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    recepteur: &SpotifyConnectManager,
+    attente: Duration,
+) -> PremierSon {
+    let fin = tokio::time::Instant::now() + attente;
+    loop {
+        match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            Ok(Some(bloc)) => return PremierSon::Bloc(bloc),
+            Ok(None) => return PremierSon::Rien,
+            Err(_) => {}
+        }
+        if recepteur.cles_audio_refusees() {
+            return PremierSon::ClesRefusees;
+        }
+        if tokio::time::Instant::now() >= fin {
+            return PremierSon::Rien;
+        }
     }
 }
 
@@ -611,6 +703,15 @@ while :; do
   if [ -f "$D/jouer" ]; then
     read N P < "$D/jouer"
     rm -f "$D/jouer"
+    case "$P" in
+      *cleRefusee*)
+        # #8565 : Spotify refuse la clé audio (librespot #1649).
+        [ -n "$EV" ] && PLAYER_EVENT=loading TRACK_ID="$P" $EV
+        echo "[2026-11-12T20:49:00Z ERROR librespot_core::audio_key] error audio key 0 1" >&2
+        echo "[2026-11-12T20:49:00Z ERROR librespot_playback::player] Skipping to next track, unable to load track <SpotifyUri>: ()" >&2
+        [ -n "$EV" ] && PLAYER_EVENT=unavailable TRACK_ID="$P" $EV
+        continue ;;
+    esac
     [ -n "$EV" ] && PLAYER_EVENT=track_changed TRACK_ID="$P" NAME="Titre essai" $EV
     [ -n "$EV" ] && PLAYER_EVENT=playing TRACK_ID="$P" POSITION_MS=0 $EV
     head -c "$N" /dev/zero | tr '\000' '\125'
@@ -1089,6 +1190,97 @@ exit 1
         assert!(!m.to_lowercase().contains("reconnect"), "{m}");
     }
 
+    /// #8764 — librespot connecté qui refuse une commande Spotify Connect
+    /// (`StateError::NoContext`, écrit par `handle_connect_state_request`).
+    const LIBRESPOT_SANS_CONTEXTE: &str = r#"#!/bin/sh
+echo "[2026-11-14T10:00:00Z INFO  librespot] librespot 0.8.0 (Built on 2025-10-01)" >&2
+echo "[2026-11-14T10:00:01Z ERROR librespot_connect::spirc] failed to handle request: Invalid state { context is not available. type: Default }" >&2
+exit 1
+"#;
+
+    /// #8764 — le `PUT /me/player/play` de Tune échoue (l'API Web répond).
+    struct PiloteLectureRefusee;
+
+    const ECHEC_API_WEB_8764: &str =
+        "Spotify /me/player/play : HTTP 502 « Player command failed: Restriction violated »";
+
+    #[async_trait]
+    impl PiloteSpotify for PiloteLectureRefusee {
+        async fn jeton(&self) -> Result<String, String> {
+            Ok("jeton-essai".into())
+        }
+        async fn duree_ms(&self, _: &str) -> Result<u64, String> {
+            Ok(1000)
+        }
+        async fn lancer(&self, _: &str, _: &str, _: u64) -> Result<(), String> {
+            // librespot a le temps d'écrire sa ligne ERROR.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Err(ECHEC_API_WEB_8764.into())
+        }
+        async fn porte_la_lecture(&self) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    /// #8764 — hors refus d'identifiants, l'écran montre l'erreur de l'API
+    /// Web, la ligne de librespot en complément, et plus « s'est arrêté sans
+    /// se connecter » : librespot était connecté.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_8764_erreur_connect_ne_masque_pas_l_erreur_de_l_api_web() {
+        let refus = tokio::task::spawn_blocking(|| {
+            refus_avec(LIBRESPOT_SANS_CONTEXTE, Arc::new(PiloteLectureRefusee))
+        })
+        .await
+        .unwrap();
+        assert!(
+            refus.contains(ECHEC_API_WEB_8764),
+            "l'erreur de l'API Web est masquée : {refus}"
+        );
+        assert!(
+            refus.contains("(librespot : « ") && refus.contains("context is not available"),
+            "la ligne de librespot doit rester en complément : {refus}"
+        );
+        assert!(!refus.contains("s'est arrêté"), "{refus}");
+        assert!(
+            LiaisonRequise::depuis_sentinelle(&refus).is_none()
+                && !refus.starts_with(SENTINELLE_PREMIUM_REQUIS),
+            "{refus}"
+        );
+    }
+
+    /// #8764 — contre-épreuve : le refus d'identifiants garde son motif
+    /// (#6933/#8154), même quand l'API Web a aussi échoué.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_8764_le_refus_d_identifiants_garde_son_motif() {
+        let refus = tokio::task::spawn_blocking(|| {
+            refus_avec(LIBRESPOT_REFUSE, Arc::new(PiloteLectureRefusee))
+        })
+        .await
+        .unwrap();
+        let enveloppe = format!("source « spotify » : {refus}");
+        let liaison = LiaisonRequise::depuis_sentinelle(&enveloppe)
+            .unwrap_or_else(|| panic!("le refus d'identifiants perd son code : {refus}"));
+        assert!(
+            liaison.detail.contains("INVALID_CREDENTIALS"),
+            "{}",
+            liaison.detail
+        );
+        assert!(
+            !liaison.detail.contains(ECHEC_API_WEB_8764),
+            "{}",
+            liaison.detail
+        );
+    }
+
+    #[test]
+    fn spotify_8764_motif_de_la_commande() {
+        assert_eq!(motif_echec_de_la_commande("HTTP 404", None), "HTTP 404");
+        assert_eq!(
+            motif_echec_de_la_commande("HTTP 404", Some("oups")),
+            "HTTP 404 (librespot : « oups »)"
+        );
+    }
+
     /// « Le dernier geste gagne » — un pilote dont le lancement réussit ou
     /// échoue, et qui note les pauses demandées.
     struct PiloteReprise {
@@ -1305,6 +1497,73 @@ exit 1
         ));
         assert!(!est_un_refus_d_identifiants(
             "Login failed with reason: Premium account required"
+        ));
+    }
+
+    /// #8565 (fil 2778, décision de Bertrand du 13/11) — Spotify refuse la
+    /// clé audio du titre (`error audio key 0 1`, librespot #1649) : le titre
+    /// lancé depuis Tune n'est plus sauté sans un mot. `ouvrir` rend le code
+    /// stable `spotify_audio_key_refused`, et le statut du récepteur le
+    /// porte (`receiver_error_code`). Aucun son : faux librespot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_8565_cles_audio_refusees_le_titre_n_est_plus_saute_en_silence() {
+        let b = banc(1000, OCTETS_PAR_SECONDE as u64);
+        let recepteur = b.recepteur.clone();
+        let f = b.fournisseur();
+        let refus = tokio::task::spawn_blocking(move || {
+            f.ouvrir("spotify:track:cleRefusee8565AAAAAAAA", 0)
+                .err()
+                .expect("clé refusée : l'ouverture doit échouer")
+        })
+        .await
+        .unwrap();
+        assert!(
+            refus.starts_with(SENTINELLE_CLES_AUDIO_REFUSEES),
+            "le refus ne porte pas le code stable : {refus}"
+        );
+        assert!(
+            refus.contains("Spotify a refusé les clés audio de ce compte"),
+            "{refus}"
+        );
+        assert!(recepteur.cles_audio_refusees());
+        assert_eq!(
+            recepteur.status().await["receiver_error_code"],
+            crate::streaming::spotify_connect::CODE_CLES_AUDIO_REFUSEES
+        );
+        drop(b);
+    }
+
+    /// #8565 — contre-épreuve : un titre dont la clé est accordée joue, et
+    /// efface le refus d'un titre d'avant (le refus n'est pas collant).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_8565_un_titre_qui_joue_efface_le_refus_des_cles() {
+        let b = banc(1000, OCTETS_PAR_SECONDE as u64);
+        let recepteur = b.recepteur.clone();
+        let f = b.fournisseur();
+        let tout = tokio::task::spawn_blocking(move || {
+            assert!(f.ouvrir("spotify:track:cleRefusee8565AAAAAAAA", 0).is_err());
+            ouvrir(f, "spotify:track:4uLU6hMCjMI75M1A2tKUQC", 0).1
+        })
+        .await
+        .unwrap();
+        assert_eq!(tout.len() as u64, OCTETS_PAR_SECONDE as u64);
+        assert!(tout.iter().all(|&o| o == 0x55), "le PCM du faux librespot");
+        assert!(!recepteur.cles_audio_refusees());
+        assert!(recepteur.status().await["receiver_error_code"].is_null());
+        drop(b);
+    }
+
+    #[test]
+    fn spotify_8565_la_ligne_de_refus_de_cle_est_reconnue() {
+        use crate::streaming::spotify_connect::{cle_audio_refusee, ligne_d_erreur_librespot};
+        let ligne = "[2026-11-12T20:49:00Z ERROR librespot_core::audio_key] error audio key 0 1";
+        assert!(cle_audio_refusee(&ligne_d_erreur_librespot(ligne).unwrap()));
+        assert!(cle_audio_refusee("Audio key error"));
+        assert!(!cle_audio_refusee(
+            "Skipping to next track, unable to load track <SpotifyUri>: ()"
+        ));
+        assert!(!cle_audio_refusee(
+            "Unable to read audio file: Symphonia Decoder Error"
         ));
     }
 }

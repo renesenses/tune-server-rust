@@ -1455,6 +1455,9 @@ pub(super) async fn delete_zone(
             ),
         }
     }
+    // #8701 — même une zone déjà à l'arrêt : ses fMP4 DASH ne sont plus
+    // retenus pour elle.
+    tune_core::audio::dash_epingles::liberer_la_zone(id);
     match repo.delete(id) {
         Ok(0) => {
             warn!(zone_id = id, "zone_delete_aucune_zone_de_cet_identifiant");

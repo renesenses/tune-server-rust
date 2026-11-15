@@ -892,8 +892,22 @@ pub(super) async fn play_episode(
     Path(zone_id): Path<i64>,
     headers: axum::http::HeaderMap,
     profile: crate::routes::active_profile::ActiveProfile,
-    Json(body): Json<PlayEpisodeRequest>,
+    Json(mut body): Json<PlayEpisodeRequest>,
 ) -> impl IntoResponse {
+    // Sécurité — l'épisode part tel quel vers la sortie (une sortie
+    // locale ou AirPlay ouvre un chemin nu comme un fichier de la machine) :
+    // seule une adresse http(s) est acceptée, et c'est la valeur rognée,
+    // celle qu'on vient de vérifier, qui sert ensuite.
+    if !tune_core::chemin_sur::est_une_adresse_http(&body.audio_url) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "audio_url must be an http(s) address",
+                "code": "podcast_adresse_refusee",
+            })),
+        );
+    }
+    body.audio_url = body.audio_url.trim().to_string();
     // #7974 — l'épisode sur une sortie réseau ne passe pas par `play()` : le
     // bail d'écoute du profil qui le lance est demandé ici.
     state
