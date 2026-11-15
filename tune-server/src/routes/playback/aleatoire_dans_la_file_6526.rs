@@ -307,3 +307,120 @@ async fn une_file_neuve_sous_l_aleatoire_part_du_titre_lance() {
     assert_eq!(trie(titres.clone()), trie(origine.clone()));
     assert_ne!(titres, origine, "file neuve non mélangée");
 }
+
+/// #8796 (forum VNAV) — « Ajouter à la file » pendant l'aléatoire : les titres
+/// ajoutés sont dispersés parmi ceux qui restent à jouer. Avant, ils étaient
+/// posés en fin de file et lus dans l'ordre d'ajout, à la suite. Les titres
+/// joués et le titre en cours ne bougent pas ; éteindre l'aléatoire rend les
+/// ajouts en fin de file, dans leur ordre d'ajout.
+#[tokio::test]
+async fn ajouter_pendant_l_aleatoire_disperse_les_titres_dans_la_suite_8796() {
+    let (app, state) = serveur();
+    let n = 12;
+    let zone_id = zone_avec_une_file(&state, n, 3).await;
+    let uri = format!("/api/v1/zones/{zone_id}/shuffle");
+    appeler(&app, "POST", &format!("{uri}?enabled=true"), None).await;
+    let (avant, _) = file_relue(&app, zone_id).await;
+
+    let album = pistes(&state, 300, 12);
+    let (statut, v) = appeler(
+        &app,
+        "POST",
+        &format!("/api/v1/zones/{zone_id}/queue/add"),
+        Some(json!({ "track_ids": album })),
+    )
+    .await;
+    assert!(statut.is_success(), "queue/add : {statut} {v}");
+    assert_eq!(v["added"], 12, "{v}");
+
+    let (titres, position) = file_relue(&app, zone_id).await;
+    assert_eq!(position, 3, "le titre en cours ne bouge pas");
+    assert_eq!(
+        &titres[..4],
+        &avant[..4],
+        "joués + en cours figés : {titres:?}"
+    );
+    let ajoutes: Vec<String> = (300..312).map(|i| format!("Piste {i}")).collect();
+    assert_ne!(
+        &titres[n..],
+        &ajoutes[..],
+        "les titres ajoutés sont lus dans l'ordre d'ajout, à la suite (#8796)"
+    );
+    let anciens: Vec<String> = titres
+        .iter()
+        .filter(|t| !ajoutes.contains(t))
+        .cloned()
+        .collect();
+    assert_eq!(anciens, avant, "la suite déjà mélangée garde son ordre");
+    // Chaque ligne annonce le rang où elle a réellement atterri.
+    for item in v["items"].as_array().unwrap() {
+        let rang = item["position"].as_i64().unwrap() as usize;
+        let id = item["track_id"].as_i64().unwrap();
+        let rang_attendu = 300 + album.iter().position(|&a| a == id).unwrap();
+        assert_eq!(titres[rang], format!("Piste {rang_attendu}"), "{v}");
+    }
+    let etat = state.playback.get_state(zone_id).await;
+    assert_eq!(etat.queue_length, 2 * n as i64);
+    assert_eq!(etat.queue_position, 3);
+
+    appeler(&app, "POST", &format!("{uri}?enabled=false"), None).await;
+    let (titres, position) = file_relue(&app, zone_id).await;
+    let mut attendu = titres_d_origine(n);
+    attendu.extend(ajoutes);
+    assert_eq!(
+        titres, attendu,
+        "rétabli, les ajouts reviennent en fin de file"
+    );
+    assert_eq!(position, 3);
+}
+
+/// #8796 (relecture) — « Lire ensuite » PUIS « Ajouter » sous l'aléatoire : le
+/// titre « Lire ensuite » reste le suivant, aucun titre ajouté ne passe devant
+/// lui, et il le reste une fois l'aléatoire éteint.
+#[tokio::test]
+async fn lire_ensuite_puis_ajouter_garde_le_suivant_8796() {
+    let (app, state) = serveur();
+    // Peu de titres restants et beaucoup d'ajouts : sans la garde, un ajout
+    // passe devant le « Lire ensuite » presque à tous les coups (≈ 94 %).
+    let n = 5;
+    let zone_id = zone_avec_une_file(&state, n, 3).await;
+    let uri = format!("/api/v1/zones/{zone_id}/shuffle");
+    appeler(&app, "POST", &format!("{uri}?enabled=true"), None).await;
+
+    let ensuite = pistes(&state, 100, 1)[0];
+    let (statut, v) = appeler(
+        &app,
+        "POST",
+        &format!("/api/v1/zones/{zone_id}/queue/add"),
+        Some(json!({ "track_ids": [ensuite], "position": 4 })),
+    )
+    .await;
+    assert!(statut.is_success(), "lire ensuite : {statut} {v}");
+
+    let album = pistes(&state, 300, 30);
+    let (statut, v) = appeler(
+        &app,
+        "POST",
+        &format!("/api/v1/zones/{zone_id}/queue/add"),
+        Some(json!({ "track_ids": album })),
+    )
+    .await;
+    assert!(statut.is_success(), "ajouter : {statut} {v}");
+
+    let (titres, position) = file_relue(&app, zone_id).await;
+    assert_eq!(position, 3);
+    assert_eq!(
+        titres[4], "Piste 100",
+        "« Lire ensuite » doublé : {titres:?}"
+    );
+    let etat = state.playback.get_state(zone_id).await;
+    assert_eq!(PositionPoller::next_position(&etat), Some(4));
+
+    appeler(&app, "POST", &format!("{uri}?enabled=false"), None).await;
+    let (titres, position) = file_relue(&app, zone_id).await;
+    let mut attendu = titres_d_origine(n);
+    attendu.insert(4, "Piste 100".into());
+    attendu.extend((300..330).map(|i| format!("Piste {i}")));
+    assert_eq!(titres, attendu, "rétabli : {titres:?}");
+    assert_eq!(position, 3);
+}
