@@ -380,7 +380,9 @@ async fn ajouter_pendant_l_aleatoire_disperse_les_titres_dans_la_suite_8796() {
 #[tokio::test]
 async fn lire_ensuite_puis_ajouter_garde_le_suivant_8796() {
     let (app, state) = serveur();
-    let n = 20;
+    // Peu de titres restants et beaucoup d'ajouts : sans la garde, un ajout
+    // passe devant le « Lire ensuite » presque à tous les coups (≈ 94 %).
+    let n = 5;
     let zone_id = zone_avec_une_file(&state, n, 3).await;
     let uri = format!("/api/v1/zones/{zone_id}/shuffle");
     appeler(&app, "POST", &format!("{uri}?enabled=true"), None).await;
@@ -395,7 +397,7 @@ async fn lire_ensuite_puis_ajouter_garde_le_suivant_8796() {
     .await;
     assert!(statut.is_success(), "lire ensuite : {statut} {v}");
 
-    let album = pistes(&state, 300, 12);
+    let album = pistes(&state, 300, 30);
     let (statut, v) = appeler(
         &app,
         "POST",
@@ -418,7 +420,7 @@ async fn lire_ensuite_puis_ajouter_garde_le_suivant_8796() {
     let (titres, position) = file_relue(&app, zone_id).await;
     let mut attendu = titres_d_origine(n);
     attendu.insert(4, "Piste 100".into());
-    attendu.extend((300..312).map(|i| format!("Piste {i}")));
+    attendu.extend((300..330).map(|i| format!("Piste {i}")));
     assert_eq!(titres, attendu, "rétabli : {titres:?}");
     assert_eq!(position, 3);
 }
