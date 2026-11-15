@@ -5,6 +5,9 @@ mod bio_liens;
 /// #4806 — le drapeau `banned` des listes de pistes, partagé avec les
 /// playlists et la recherche fédérée qui vivent hors de ce module.
 pub(crate) use albums::attacher_banni;
+/// « # écoutes » et « Dernière écoute » des lignes d'une playlist, sur la
+/// même règle que les autres listes de pistes.
+pub(crate) use albums::attacher_ecoutes;
 mod albums_detailed;
 // #8668 — le pays de chaque album, pour la carte des pays.
 mod ambiances;
