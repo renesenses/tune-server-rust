@@ -153,6 +153,10 @@ struct MusicDirsBody {
 
 /// Step 2: Configure music directories and trigger first scan.
 async fn step_music_dirs(
+    // Sécurité — cette étape FIXE les dossiers de musique, donc le
+    // périmètre de toutes les gardes de chemin : même rôle que
+    // `POST /system/music-dirs/add`.
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<MusicDirsBody>,
 ) -> impl IntoResponse {
@@ -169,6 +173,12 @@ async fn step_music_dirs(
     let mut invalid_dirs = Vec::new();
     for dir in &body.dirs {
         let normalized = tune_core::scanner::walker::normalize_path(dir);
+        // Sécurité — même périmètre que `POST /system/music-dirs/add`
+        // (celui de l'explorateur) : ni `/`, ni arbre système, ni `..`.
+        if crate::routes::system::refus_de_racine_de_musique(&state, &normalized).is_some() {
+            invalid_dirs.push(dir.clone());
+            continue;
+        }
         if std::path::Path::new(&normalized).is_dir() {
             valid_dirs.push(normalized);
         } else {
@@ -493,5 +503,31 @@ mod tests {
         assert!(onboarding_termine(true, 0, 0));
         assert!(onboarding_termine(true, 6, 0));
         assert!(onboarding_termine(true, 3, 12));
+    }
+}
+
+/// Sécurité — une racine porteuse de `..` n'est pas enregistrée.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::banc;
+
+    #[tokio::test]
+    async fn une_racine_qui_remonte_n_est_pas_un_dossier_de_musique() {
+        let b = banc();
+        let r = step_music_dirs(
+            crate::auth::RequireAdmin,
+            State(b.state.clone()),
+            Json(MusicDirsBody {
+                dirs: vec![b.remontee("")],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            r.status(),
+            StatusCode::BAD_REQUEST,
+            "racine `..` enregistrée"
+        );
     }
 }

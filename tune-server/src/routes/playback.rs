@@ -8903,7 +8903,7 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
     // #4770 : un dossier par compte, sous `TMPDIR`. `/tmp/tune-upload` était
     // un nom fixe : créé par le premier compte venu, il refusait les
     // téléversements de tous les autres.
-    let upload_dir = tune_core::chemins_de_travail::racine_de_travail("tune-upload");
+    let upload_dir = tune_core::chemins_de_travail::racine_des_televersements();
     let _ = std::fs::create_dir_all(&upload_dir);
     let file_id = uuid::Uuid::new_v4().to_string();
 

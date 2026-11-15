@@ -6,6 +6,20 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
+/// #7773 — identité conservative du flux : chemin, requête et schéma
+/// restent distincts. Le fragment ne part pas au serveur ; Url normalise
+/// l'hôte et le port par défaut.
+pub fn cle_du_flux(url: &str) -> String {
+    let url = url.trim();
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) if matches!(parsed.scheme(), "http" | "https") => {
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        _ => url.to_string(),
+    }
+}
+
 /// Engine-agnostic SQL builders for radio_repo.
 ///
 /// SQLite's `COLLATE NOCASE` is replaced by `LOWER(col)` for case-
@@ -26,9 +40,8 @@ pub mod sql {
 
     /// Retrouver une station par l'URL exacte de son flux.
     ///
-    /// `(name, url)` porte la contrainte d'unicité, pas `url` seule : deux
-    /// lignes peuvent partager un flux sous deux noms. `ORDER BY id` rend donc
-    /// le résultat déterministe plutôt que dépendant du plan de requête.
+    /// Les bases historiques peuvent contenir plusieurs lignes par flux.
+    /// ORDER BY id rend le résultat déterministe.
     pub fn get_by_url<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT {COLS} FROM radio_stations WHERE url = {} ORDER BY id LIMIT 1",
@@ -37,11 +50,13 @@ pub mod sql {
     }
 
     pub fn list_all() -> String {
-        format!("SELECT {COLS} FROM radio_stations ORDER BY is_favorite DESC, LOWER(name)")
+        format!("SELECT {COLS} FROM radio_stations ORDER BY is_favorite DESC, LOWER(name), id")
     }
 
     pub fn favorites() -> String {
-        format!("SELECT {COLS} FROM radio_stations WHERE is_favorite = '1' ORDER BY LOWER(name)")
+        format!(
+            "SELECT {COLS} FROM radio_stations WHERE is_favorite = '1' ORDER BY LOWER(name), id"
+        )
     }
 
     pub fn create<D: SqlDialect>(d: &D) -> String {
@@ -225,6 +240,69 @@ impl RadioRepo {
             &i64::from(station.is_favorite),
         ];
         self.db.execute_returning_id(&sql, &params)
+    }
+
+    /// #7773 — recherche et insertion indivisibles, y compris entre deux
+    /// requêtes simultanées. Rend (identifiant, ligne réellement créée).
+    /// create reste disponible pour restaurer les bases historiques.
+    pub fn create_unique(&self, station: &RadioStation) -> Result<(i64, bool), String> {
+        let insert = self.dialect_sql(sql::create, sql::create);
+        let favorite = i64::from(station.is_favorite);
+        let params: [&dyn ToSqlValue; 10] = [
+            &station.name,
+            &station.url,
+            &station.homepage,
+            &station.logo_url,
+            &station.country,
+            &station.language,
+            &station.genre,
+            &station.codec,
+            &station.bitrate,
+            &favorite,
+        ];
+        let cle = cle_du_flux(&station.url);
+        let mut resultat = None;
+        self.db.write_tx(&mut |tx| {
+            // Protéger aussi l'absence de ligne sous PostgreSQL.
+            // SQLite tient déjà la connexion d'écriture pendant write_tx.
+            if self.db.engine() == Engine::Postgres {
+                tx.execute("LOCK TABLE radio_stations IN SHARE ROW EXCLUSIVE MODE", &[])?;
+            }
+            for cols in tx.query_many(&sql::list_all(), &[])? {
+                let connue = row_to_radio(&cols);
+                if cle_du_flux(&connue.url) == cle {
+                    resultat = connue.id.map(|id| (id, false));
+                    return Ok(());
+                }
+            }
+            tx.execute(&insert, &params)?;
+            resultat = Some((tx.last_insert_rowid(), true));
+            Ok(())
+        })?;
+        resultat.ok_or_else(|| "radio sans identifiant après insertion".to_string())
+    }
+
+    /// Le cœur vaut pour toutes les anciennes lignes du même flux : retirer
+    /// le favori visible ne doit pas faire réapparaître sa jumelle.
+    pub fn set_favorite_for_flux(&self, id: i64, favorite: bool) -> Result<(), String> {
+        let get = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let update = self.dialect_sql(sql::set_favorite, sql::set_favorite);
+        let val = i64::from(favorite);
+        self.db.write_tx(&mut |tx| {
+            if self.db.engine() == Engine::Postgres {
+                tx.execute("LOCK TABLE radio_stations IN SHARE ROW EXCLUSIVE MODE", &[])?;
+            }
+            let cols = tx.query_one(&get, &[&id])?.ok_or("radio inconnue")?;
+            let cle = cle_du_flux(&row_to_radio(&cols).url);
+            for cols in tx.query_many(&sql::list_all(), &[])? {
+                let station = row_to_radio(&cols);
+                if cle_du_flux(&station.url) == cle {
+                    let id = station.id.ok_or("radio sans identifiant")?;
+                    tx.execute(&update, &[&val, &id])?;
+                }
+            }
+            Ok(())
+        })
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {

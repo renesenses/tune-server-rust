@@ -357,8 +357,16 @@ pub async fn executer(
             if !tenue && !libre {
                 return Err(pas_tenue());
             }
+            // Sécurité — le maître envoie l'adresse de SON flux :
+            // un chemin nu ferait lire à la sortie un fichier de cette machine.
+            if !tune_core::chemin_sur::est_une_adresse_http(&url) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "url must be an http(s) address".to_string(),
+                ));
+            }
             let media = PlayMedia {
-                url: &url,
+                url: url.trim(),
                 mime_type: &mime_type,
                 title: titre.as_deref(),
                 artist: artiste.as_deref(),

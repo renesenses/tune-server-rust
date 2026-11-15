@@ -174,10 +174,17 @@ async fn le_refus_garde_les_champs_que_lisait_deja_le_client() {
     let (app, _) = app();
     exiger_machine_nue(&app).await;
 
+    // Sécurité — `output_dir` est confiné (musique, dossier
+    // configuré, dossier de travail) : `/tmp/x` serait refusé en 400. Le
+    // témoin vise donc un sous-dossier du dossier de travail de l'extraction.
+    let sortie = tune_core::chemins_de_travail::racine_de_travail("tune-rip")
+        .join("x")
+        .to_string_lossy()
+        .into_owned();
     let (_, corps) = post(
         &app,
         "/cd-rip/rip",
-        json!({ "output_dir": "/tmp/x", "format": "aiff", "device": "/dev/sr0" }),
+        json!({ "output_dir": sortie, "format": "aiff", "device": "/dev/sr0" }),
     )
     .await;
 
@@ -187,7 +194,7 @@ async fn le_refus_garde_les_champs_que_lisait_deja_le_client() {
             "champ historique disparu de la réponse : {champ} — {corps}"
         );
     }
-    assert_eq!(corps["output_dir"].as_str(), Some("/tmp/x"));
+    assert_eq!(corps["output_dir"].as_str(), Some(sortie.as_str()));
     assert_eq!(corps["format"].as_str(), Some("aiff"));
     assert_eq!(corps["device"].as_str(), Some("/dev/sr0"));
 }

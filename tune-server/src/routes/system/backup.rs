@@ -160,6 +160,9 @@ pub(super) async fn create_backup(
 
 pub(super) async fn restore_backup(
     _admin: crate::auth::RequireAdmin,
+    // Sécurité — la base entière : sans authentification,
+    // depuis cette machine seulement.
+    _ici: crate::auth::BaseEntiereDepuisCetteMachine,
     State(state): State<AppState>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> impl IntoResponse {
@@ -185,6 +188,9 @@ pub(super) async fn restore_backup(
 
 pub(super) async fn create_encrypted_backup(
     _admin: crate::auth::RequireAdmin,
+    // Sécurité — la base entière : sans authentification,
+    // depuis cette machine seulement.
+    _ici: crate::auth::BaseEntiereDepuisCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {

@@ -159,10 +159,31 @@ struct OfflineConfigReq {
 async fn set_offline_config(
     State(state): State<AppState>,
     Json(body): Json<OfflineConfigReq>,
-) -> Json<Value> {
+) -> Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Some(ref dir) = body.cache_dir {
-        settings.set("offline_cache_dir", dir).ok();
+        // Sécurité — le cache hors ligne est un dossier d'ÉCRITURE
+        // choisi par le client : dossiers de musique ou dossier de travail
+        // `tune-offline` ; vide = retour au défaut.
+        if dir.trim().is_empty() {
+            settings.delete("offline_cache_dir").ok();
+        } else {
+            let mut racines = crate::routes::confinement::racines_musicales(&state);
+            racines.push(crate::routes::confinement::texte(
+                &tune_core::chemins_de_travail::racine_de_travail("tune-offline"),
+            ));
+            if let Err(refus) = crate::routes::confinement::sous_les_racines(dir, &racines) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "cache_dir_outside_allowed_roots",
+                        "message": crate::routes::confinement::message("cache_dir", refus),
+                    })),
+                )
+                    .into_response();
+            }
+            settings.set("offline_cache_dir", dir).ok();
+        }
     }
     if let Some(size) = body.max_size_mb {
         settings.set("offline_max_size_mb", &size.to_string()).ok();
@@ -172,7 +193,7 @@ async fn set_offline_config(
             .set("offline_auto_sync", if sync { "true" } else { "false" })
             .ok();
     }
-    Json(json!({"status": "ok"}))
+    Json(json!({"status": "ok"})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -215,6 +236,22 @@ async fn download_single_track(
     source_id: &str,
     quality: &str,
 ) -> Response {
+    // Sécurité — `source` et `source_id` deviennent un dossier et
+    // un nom de fichier sous le cache : un seul segment chacun, sans `..`.
+    for (champ, valeur) in [("source", source), ("source_id", source_id)] {
+        if let Err(refus) =
+            crate::routes::confinement::segment_sous(std::path::Path::new("."), valeur)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_name",
+                    "message": crate::routes::confinement::message(champ, refus),
+                })),
+            )
+                .into_response();
+        }
+    }
     // Insert or update the offline_cache entry
     use tune_core::db::backend::ToSqlValue;
     let id = match state.backend.execute_returning_id(
@@ -684,3 +721,50 @@ async fn clear_offline(State(state): State<AppState>) -> Result<impl IntoRespons
 
 // Placeholder type alias for response
 use axum::response::Response;
+
+/// Sécurité — cache hors ligne : dossier et noms confinés.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::banc;
+
+    #[tokio::test]
+    async fn le_cache_hors_ligne_reste_dans_ses_dossiers() {
+        let b = banc();
+        for dir in [b.remontee("/cache"), "/etc/tune".to_string()] {
+            let r = set_offline_config(
+                State(b.state.clone()),
+                Json(OfflineConfigReq {
+                    cache_dir: Some(dir.clone()),
+                    max_size_mb: None,
+                    auto_sync: None,
+                }),
+            )
+            .await;
+            assert_eq!(
+                r.status(),
+                StatusCode::BAD_REQUEST,
+                "{dir} accepté comme cache"
+            );
+        }
+        let r = set_offline_config(
+            State(b.state.clone()),
+            Json(OfflineConfigReq {
+                cache_dir: Some(b.dedans("/Cache")),
+                max_size_mb: None,
+                auto_sync: None,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+
+        for (source, id) in [
+            ("../../dehors", "1"),
+            ("qobuz", "../../../x"),
+            ("qobuz", r"..\x"),
+        ] {
+            let r = download_single_track(&b.state, source, id, "lossless").await;
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{source}/{id} accepté");
+        }
+    }
+}

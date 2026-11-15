@@ -503,7 +503,11 @@ pub fn sniff_image_ext(data: &[u8]) -> Option<&'static str> {
 /// condensat n'a aucun fichier : l'annoncer en base est alors un mensonge.
 pub fn find_cached(cache_dir: &Path, hash: &str) -> Option<(PathBuf, &'static str)> {
     for ext in CACHE_EXTENSIONS {
-        let path = cache_dir.join(format!("{hash}.{ext}"));
+        // `hash` vient du chemin de l'URL, décodé : `..%2F..%2Fetc%2Fx`
+        // sortait du cache. Joint par `chemin_sur`, il ne peut plus en sortir.
+        let Ok(path) = crate::chemin_sur::joindre_sous(cache_dir, &format!("{hash}.{ext}")) else {
+            return None;
+        };
         if path.exists() {
             return Some((path, cache_mime(ext)));
         }
@@ -4689,5 +4693,34 @@ mod tests_source_image_artiste {
     #[test]
     fn une_image_venue_du_site_ne_lui_est_pas_renvoyee() {
         assert!(!S::Mozaiklabs.a_partager());
+    }
+}
+
+/// Sécurité — `GET /library/artwork/{hash}` : le `hash` décodé ne sort jamais du
+/// cache.
+#[cfg(test)]
+mod find_cached_remontee_tests {
+    use super::find_cached;
+
+    #[test]
+    fn un_hash_qui_remonte_ne_lit_rien_hors_du_cache() {
+        let d = tempfile::tempdir().unwrap();
+        let cache = d.path().join("cache").join("artwork");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(d.path().join("photo.jpg"), b"PRIVE").unwrap();
+        std::fs::write(cache.join("8865c2f2e1a6f89c34ab584ec5b8e158.jpg"), b"IMAGE").unwrap();
+        assert!(find_cached(&cache, "8865c2f2e1a6f89c34ab584ec5b8e158").is_some());
+        let absolu = d.path().join("photo");
+        for hash in [
+            "../../photo".to_string(),
+            r"..\..\photo".to_string(),
+            "%2e%2e/%2e%2e/photo".to_string(),
+            absolu.to_string_lossy().into_owned(),
+        ] {
+            assert!(
+                find_cached(&cache, &hash).is_none(),
+                "{hash} a atteint un fichier hors du cache"
+            );
+        }
     }
 }

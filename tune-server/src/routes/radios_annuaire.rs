@@ -774,10 +774,24 @@ pub fn corps_annuaire_avec_liens(
     // L'inverse du rapprochement : pour chaque fiche, la station locale.
     let index = IndexAnnuaire::new(fiches);
     let mut locales: HashMap<usize, &RadioStation> = HashMap::new();
+    let mut priorites: HashMap<usize, u8> = HashMap::new();
     for st in mes_radios {
         let ext = st.id.and_then(|id| liens.get(&id)).map(String::as_str);
-        if let Some((i, _)) = index.lien(ext, &st.name, &st.url) {
-            locales.entry(i).or_insert(st);
+        if let Some((i, lien)) = index.lien(ext, &st.name, &st.url) {
+            // Un homonyme ne doit pas masquer le flux exact, quel que soit
+            // l'ordre de la liste. Le lien enregistré reste prioritaire.
+            let priorite = match lien {
+                Lien::Id => 3,
+                Lien::Flux => 2,
+                Lien::Nom => 1,
+            };
+            if priorites
+                .get(&i)
+                .is_none_or(|ancienne| priorite > *ancienne)
+            {
+                locales.insert(i, st);
+                priorites.insert(i, priorite);
+            }
         }
     }
 
@@ -1035,13 +1049,20 @@ async fn ajouter(
                 station.codec = flux.codec.map(|c| c.to_ascii_lowercase());
                 station.bitrate = flux.bitrate;
             }
-            match repo.create(&station) {
-                Ok(id) => {
+            match repo.create_unique(&station) {
+                Ok((id, nouvelle)) => {
                     state.event_bus.emit(
                         "library.radios_changed",
                         json!({"action": "created", "id": id, "external_id": external_id}),
                     );
-                    (Some(id), StatusCode::CREATED)
+                    (
+                        Some(id),
+                        if nouvelle {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::OK
+                        },
+                    )
                 }
                 Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
             }

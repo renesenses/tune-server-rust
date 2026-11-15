@@ -235,18 +235,30 @@ pub fn restore_backup(db_path: &str, filename: &str) -> bool {
         Some(p) => p.join("backups"),
         None => return false,
     };
-    let backup_path = backup_dir.join(filename);
+    // Sécurité — `filename` vient du client : un NOM de fichier
+    // du dossier `backups`, jamais un chemin. Le contrôle est lexical et ne
+    // dépend plus de `canonicalize` (qui, en échec, laissait tout passer) :
+    // sous Windows `..\` se résolvait et un fichier quelconque remplaçait la
+    // base.
+    if filename.contains(['/', '\\']) {
+        warn!("path_traversal_blocked");
+        return false;
+    }
+    let Ok(backup_path) = crate::chemin_sur::joindre_sous(&backup_dir, filename) else {
+        warn!("path_traversal_blocked");
+        return false;
+    };
 
-    if !backup_path.exists() {
+    if !backup_path.is_file() {
         return false;
     }
 
-    if let Ok(resolved) = backup_path.canonicalize()
-        && let Ok(dir_resolved) = backup_dir.canonicalize()
-        && !resolved.starts_with(&dir_resolved)
-    {
-        warn!("path_traversal_blocked");
-        return false;
+    match (backup_path.canonicalize(), backup_dir.canonicalize()) {
+        (Ok(resolved), Ok(dir_resolved)) if resolved.starts_with(&dir_resolved) => {}
+        _ => {
+            warn!("path_traversal_blocked");
+            return false;
+        }
     }
 
     match replace_database(db_path, &backup_path) {
@@ -453,6 +465,33 @@ mod tests {
     #[test]
     fn restore_nonexistent() {
         assert!(!restore_backup("/tmp/test.db", "nonexistent_backup.db"));
+    }
+
+    /// Sécurité (N4) — un nom de sauvegarde qui sort du dossier
+    /// `backups` n'est jamais restauré, même quand `backups/` n'existe pas
+    /// (le contrôle par `canonicalize` sautait alors) et même sous la forme
+    /// Windows `..\`.
+    #[test]
+    fn une_sauvegarde_hors_du_dossier_backups_n_est_pas_restauree() {
+        let dossier = tempfile::tempdir().unwrap();
+        let db = dossier.path().join("tune.db");
+        std::fs::write(&db, b"base active").unwrap();
+        // Un fichier quelconque, voisin de la base, qui n'est pas une sauvegarde.
+        std::fs::write(dossier.path().join("intrus.db"), b"pas une sauvegarde").unwrap();
+        let db_s = db.to_str().unwrap();
+        for nom in [
+            "../intrus.db",
+            "..\\intrus.db",
+            "..",
+            "",
+            "/etc/hosts",
+            "C:\\intrus.db",
+            "sous/../../intrus.db",
+            "%2e%2e/intrus.db",
+        ] {
+            assert!(!restore_backup(db_s, nom), "{nom:?} restauré");
+            assert_eq!(std::fs::read(&db).unwrap(), b"base active", "{nom:?}");
+        }
     }
 
     /// #5973 — la sauvegarde prise avant « Vider la bibliothèque » contient
