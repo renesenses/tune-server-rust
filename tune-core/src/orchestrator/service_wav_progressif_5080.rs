@@ -309,7 +309,7 @@ async fn le_wav_progressif_d_un_service_porte_l_egaliseur_de_la_zone_5080() {
 
     let attendu_brut = brut.pcm_bytes();
     let mut attendu = attendu_brut.clone();
-    orch.load_streaming_dsp(zone_id, None, sr, 2)
+    orch.load_streaming_dsp(zone_id, crate::audio::replaygain::PisteRg::AUCUNE, sr, 2)
         .process(&mut attendu, bd);
     assert_ne!(
         attendu, attendu_brut,

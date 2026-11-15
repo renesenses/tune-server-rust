@@ -234,7 +234,7 @@ mod ombre_5081_tests {
             .unwrap();
         let p = orch.load_crossfeed_processor(1, 48_000).expect("crossfeed");
         assert_eq!(p.ombre(), None, "un réglage d'avant #5081 allume le filtre");
-        let sans = orch.empreinte_du_traitement(1, None);
+        let sans = orch.empreinte_du_traitement(1, crate::audio::replaygain::PisteRg::AUCUNE);
 
         let reglage = |fc: f32| {
             format!(
@@ -248,9 +248,9 @@ mod ombre_5081_tests {
             ombre(1200.0, 4.5),
             "le filtre enregistré n'est pas chargé"
         );
-        let a = orch.empreinte_du_traitement(1, None);
+        let a = orch.empreinte_du_traitement(1, crate::audio::replaygain::PisteRg::AUCUNE);
         settings.set("zone_1_crossfeed", &reglage(700.0)).unwrap();
-        let b = orch.empreinte_du_traitement(1, None);
+        let b = orch.empreinte_du_traitement(1, crate::audio::replaygain::PisteRg::AUCUNE);
         assert!(
             sans != a && a != b,
             "l'empreinte ignore le filtre : {sans} / {a} / {b}"

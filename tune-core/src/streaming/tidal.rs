@@ -1231,6 +1231,14 @@ impl TidalService {
     }
 
     fn map_track(item: &serde_json::Value) -> StreamTrack {
+        // #8689 — `replayGain` / `peak` de l'objet piste v1, retenus pour la
+        // lecture (la réponse de lecture y ajoutera le gain d'album).
+        if let (Some(id), Some(gains)) = (
+            item["id"].as_u64(),
+            crate::audio::replaygain::services::GainsDuService::depuis_tidal_piste(item),
+        ) {
+            crate::audio::replaygain::services::noter("tidal", &id.to_string(), gains);
+        }
         let tags = item["mediaMetadata"]["tags"].as_array();
         let is_hires = tags
             .map(|t| {
@@ -2569,6 +2577,14 @@ impl StreamingService for TidalService {
         let data = data.ok_or_else(|| {
             format!("tidal: no usable stream found for track {track_id} (all qualities failed)")
         })?;
+
+        // #8689 — le ReplayGain publié dans la réponse de lecture (v1, ou v2
+        // ramenée à la forme v1), retenu pour le facteur de lecture.
+        if let Some(gains) =
+            crate::audio::replaygain::services::GainsDuService::depuis_tidal_lecture(&data)
+        {
+            crate::audio::replaygain::services::noter("tidal", track_id, gains);
+        }
 
         // #6334 — d'où vient la réponse retenue (journalisé avec le format reçu).
         let voie = data["voie"]

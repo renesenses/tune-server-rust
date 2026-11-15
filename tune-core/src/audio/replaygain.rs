@@ -47,7 +47,10 @@ pub mod reessai;
 /// Refaire, sur demande, les mesures prises avant le correctif du vrai pic
 /// (#5882) : la campagne qui les rend à la passe, par lots.
 pub mod remesure;
+/// #8689 — le ReplayGain publié par Qobuz et TIDAL pour leurs titres.
+pub mod services;
 pub use rattrapage_crete::{ALBUM_TRUE_PEAK_ALGO_KEY, TRUE_PEAK_ALGO, TRUE_PEAK_ALGO_KEY};
+pub use services::PisteRg;
 
 use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, DbTxHandle, ToSqlValue};
@@ -2790,6 +2793,17 @@ pub(crate) fn parse_gain_db(s: String) -> Option<f64> {
 
 /// Setting: `off` (default), `track` or `album`.
 pub const MODE_KEY: &str = "replaygain_mode";
+/// Activation volontaire des gains publiés par Qobuz/TIDAL, absente = faux.
+pub const SERVICES_ENABLED_KEY: &str = "replaygain_services_enabled";
+
+pub fn services_enabled(backend: &Arc<dyn DbBackend>) -> bool {
+    crate::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+        .get(SERVICES_ENABLED_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+}
 /// Setting: extra dB applied on top of the tag, e.g. `+3` for a quiet system.
 pub const PREAMP_KEY: &str = "replaygain_preamp_db";
 /// Setting: pull the gain back when the tagged peak says it would clip.
@@ -2844,6 +2858,9 @@ pub enum GainSource {
     /// version d'algorithme. Ne comble qu'un vide ; une mesure locale ou un
     /// tag ne sont jamais remplacés.
     Community,
+    /// #8689 — publié par le service de streaming (Qobuz, TIDAL) pour le
+    /// titre joué. Rien n'est écrit en base.
+    StreamingService,
 }
 
 impl GainSource {
@@ -2854,6 +2871,7 @@ impl GainSource {
             Self::Analysis => "analysis",
             Self::FooDrApprox => "foo_dr_approx",
             Self::Community => "community",
+            Self::StreamingService => "streaming_service",
         }
     }
 
@@ -2864,6 +2882,7 @@ impl GainSource {
             Self::Analysis => "analyse Tune",
             Self::FooDrApprox => "approché (foo_dr)",
             Self::Community => "communauté (mesure partagée)",
+            Self::StreamingService => "données du service",
         }
     }
 }
@@ -3616,8 +3635,65 @@ impl Drop for GainReplay {
 /// Convenience: the factor to apply for `track_id`, or `1.0` when ReplayGain is
 /// off, unmeasured, or unreadable.
 pub fn playback_factor(backend: &Arc<dyn DbBackend>, track_id: i64) -> f64 {
+    facteur_de_lecture(backend, PisteRg::bibliotheque(track_id))
+}
+
+/// #8689 — le gain d'une piste de la bibliothèque OU d'un titre de service
+/// (Qobuz, TIDAL : le gain qu'ils publient, retenu par [`services`]).
+/// Même forme que [`stored_gain_with_peak`] ; `None` en mode off ou sans
+/// donnée.
+pub fn gain_de_piste(
+    backend: &Arc<dyn DbBackend>,
+    piste: PisteRg<'_>,
+    mode: ReplayGainMode,
+) -> Option<(TrackGain, ReplayGainMode, PeakKind)> {
+    if mode == ReplayGainMode::Off {
+        return None;
+    }
+    match (piste.track_id, piste.service) {
+        (Some(tid), _) => stored_gain_with_peak(backend, tid, mode),
+        (None, Some((source, id))) if services_enabled(backend) => {
+            services::lire(source, id)?.choisir(mode)
+        }
+        (None, Some(_)) => None,
+        (None, None) => None,
+    }
+}
+
+/// #8689 — un gain de service ne doit jamais modifier une zone en mode
+/// bit-perfect strict, même si PURE est désarmé.
+pub fn service_contourne(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    zone_id: i64,
+    piste: PisteRg<'_>,
+) -> bool {
+    piste.track_id.is_none()
+        && piste.service.is_some()
+        && crate::audio::bitperfect_strict::zone_enabled(backend, zone_id)
+}
+
+/// Facteur de lecture avec la contrainte de zone des services. Les gardes
+/// PURE des chemins de lecture restent communes aux sources locales/services.
+pub fn facteur_de_zone(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    zone_id: i64,
+    piste: PisteRg<'_>,
+) -> f64 {
+    if service_contourne(backend, zone_id, piste) {
+        1.0
+    } else {
+        facteur_de_lecture(backend, piste)
+    }
+}
+
+/// [`playback_factor`] pour toute piste identifiée (#8689) : `1.0` quand
+/// ReplayGain est coupé, sans piste, ou sans gain connu.
+pub fn facteur_de_lecture(backend: &Arc<dyn DbBackend>, piste: PisteRg<'_>) -> f64 {
+    if !piste.est_identifiee() {
+        return 1.0;
+    }
     let settings = ReplayGainSettings::load(backend);
-    match stored_gain_with_peak(backend, track_id, settings.mode) {
+    match gain_de_piste(backend, piste, settings.mode) {
         Some((gain, _, kind)) => gain_factor_with_peak(gain, settings, kind).0,
         None => 1.0,
     }

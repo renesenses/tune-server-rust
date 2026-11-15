@@ -2410,6 +2410,18 @@ impl QobuzService {
 
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let album = &item["album"];
+        // #8689 — le ReplayGain que Qobuz publie (`audio_info`) est retenu au
+        // passage : la lecture le retrouvera sans nouvel appel.
+        if let Some(gains) = crate::audio::replaygain::services::GainsDuService::depuis_qobuz(item)
+        {
+            let id = item["id"]
+                .as_u64()
+                .map(|i| i.to_string())
+                .or_else(|| item["id"].as_str().map(String::from));
+            if let Some(id) = id {
+                crate::audio::replaygain::services::noter("qobuz", &id, gains);
+            }
+        }
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: Self::titre_avec_version(item),
@@ -5433,6 +5445,20 @@ mod tests {
             "album": {"title": "A", "id": 9},
         }));
         assert_eq!(muet.disponible, None);
+    }
+
+    /// #8689 — `map_track` retient le ReplayGain d'`audio_info` : la lecture
+    /// d'un titre parcouru (album, playlist, recherche) le retrouve sans appel.
+    #[test]
+    fn map_track_retient_le_replaygain_publie_8689() {
+        QobuzService::map_track(&json!({
+            "id": 868_9001, "title": "Fort", "performer": {"name": "X"},
+            "album": {"title": "A", "id": 9},
+            "audio_info": {"replaygain_track_gain": -9.5, "replaygain_track_peak": 1.0}
+        }));
+        let g = crate::audio::replaygain::services::lire("qobuz", "8689001")
+            .expect("gain Qobuz retenu par map_track");
+        assert_eq!((g.piste_db, g.piste_pic), (Some(-9.5), Some(1.0)));
     }
 
     fn map_track_basic() {

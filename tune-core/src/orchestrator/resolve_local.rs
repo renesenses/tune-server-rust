@@ -1927,7 +1927,7 @@ impl PlaybackOrchestrator {
                 // as the EQ — and would be discarded in the same way on a
                 // passthrough. Enabling it is an explicit choice of processing;
                 // PURE zones are excluded upstream.
-                replaygain: self.zone_replaygain_changes_audio(req.zone_id, req.track_id),
+                replaygain: self.zone_replaygain_changes_audio(req.zone_id, req.piste_rg()),
             }
         } else {
             TraitementsDeZone::default()
@@ -2688,8 +2688,12 @@ impl PlaybackOrchestrator {
             DecisionOuResolu::Resolu(_) => return Err("résolu sans transcodage".into()),
         };
         let format = self.decider_le_format_de_sortie(req, &decision, None)?;
-        let dsp =
-            self.load_streaming_dsp(req.zone_id, req.track_id, format.out_sr, decision.channels);
+        let dsp = self.load_streaming_dsp(
+            req.zone_id,
+            req.piste_rg(),
+            format.out_sr,
+            decision.channels,
+        );
         let actif = dsp.is_active();
         Ok((
             actif,
@@ -3238,10 +3242,10 @@ impl PlaybackOrchestrator {
         // played at -12 dB, quietly.
         let replaygain_factor = match (
             is_local_output || self.zone_audiophile(req.zone_id),
-            req.track_id,
+            req.piste_rg(),
         ) {
-            (false, Some(tid)) => {
-                let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+            (false, p) if p.est_identifiee() => {
+                let f = crate::audio::replaygain::facteur_de_zone(&self.db, req.zone_id, p);
                 if (f - 1.0).abs() > 1e-6 {
                     Some(f)
                 } else {
@@ -3982,7 +3986,7 @@ impl PlaybackOrchestrator {
             // Chargé AVANT la session (#5114) : le flux doit dire, dans son
             // `StreamInfo`, s'il porte le crossfeed — et seul le porteur
             // réellement posé sur le canal le sait.
-            let mut dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
+            let mut dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), out_sr, channels);
             let relais = relais_dsp_progressif(dsp.is_active(), is_local_output);
             let mut info = info;
             info.crossfeed = relais && dsp.crossfeed_executable();

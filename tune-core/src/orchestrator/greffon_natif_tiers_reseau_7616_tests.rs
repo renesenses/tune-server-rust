@@ -96,7 +96,9 @@ async fn greffon_natif_tiers_sur_zone_reseau_7616() {
     {
         let m = monter(Renderer::AnnonceLeLpcm, None).await;
         etage_tiers_seul(&m);
-        let mut chaine = m.orch.load_streaming_dsp(m.zone_id, None, SR, 2);
+        let mut chaine =
+            m.orch
+                .load_streaming_dsp(m.zone_id, crate::audio::replaygain::PisteRg::AUCUNE, SR, 2);
         assert!(chaine.is_active(), "le relais réseau ignore l'étage tiers");
         let mut pcm = pcm_source();
         chaine.process(&mut pcm, 16);

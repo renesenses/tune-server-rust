@@ -142,7 +142,12 @@ fn banc(etiquette: &str, pistes: i64) -> Banc {
 /// Le témoin que le banc est monté : tous les étages sont armés. Sans lui,
 /// une préparation rapide pourrait n'être qu'une préparation VIDE.
 fn tous_les_etages_sont_armes(b: &Banc) {
-    let dsp = b.orch.load_streaming_dsp(b.zone_id, Some(1), 44_100, 2);
+    let dsp = b.orch.load_streaming_dsp(
+        b.zone_id,
+        crate::audio::replaygain::PisteRg::bibliotheque(1),
+        44_100,
+        2,
+    );
     assert!(dsp.replaygain.is_some(), "ReplayGain d'album non armé");
     assert!(dsp.eq.is_some(), "égaliseur non armé");
     assert!(dsp.crossfeed.is_some(), "crossfeed non armé");
@@ -189,7 +194,12 @@ fn load_streaming_dsp_reste_sous_la_borne_pendant_des_ecritures() {
     let mut pire = Duration::ZERO;
     for _ in 0..5 {
         let debut = Instant::now();
-        let dsp = b.orch.load_streaming_dsp(b.zone_id, Some(1), 44_100, 2);
+        let dsp = b.orch.load_streaming_dsp(
+            b.zone_id,
+            crate::audio::replaygain::PisteRg::bibliotheque(1),
+            44_100,
+            2,
+        );
         pire = pire.max(debut.elapsed());
         assert!(dsp.eq.is_some() && dsp.replaygain.is_some());
     }
@@ -264,7 +274,12 @@ fn banc_5871_load_streaming_dsp_pendant_un_scan() {
         let mut d: Vec<u128> = (0..10)
             .map(|_| {
                 let t = Instant::now();
-                let _ = b.orch.load_streaming_dsp(b.zone_id, Some(4242), 44_100, 2);
+                let _ = b.orch.load_streaming_dsp(
+                    b.zone_id,
+                    crate::audio::replaygain::PisteRg::bibliotheque(4242),
+                    44_100,
+                    2,
+                );
                 t.elapsed().as_millis()
             })
             .collect();

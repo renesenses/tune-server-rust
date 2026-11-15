@@ -141,6 +141,21 @@ pub(super) fn interpreter_manifeste_v2(
     } else {
         return Err(format!("v2 : codec inconnu dans le manifeste ({codec})"));
     }
+    // #8689 — la normalisation publiée par la v2, sous les noms de la v1 :
+    // un seul lecteur (`GainsDuService::depuis_tidal_lecture`) pour les deux.
+    if let Some(g) = crate::audio::replaygain::services::GainsDuService::depuis_tidal_v2(attributs)
+    {
+        for (cle, valeur) in [
+            ("trackReplayGain", g.piste_db),
+            ("trackPeakAmplitude", g.piste_pic),
+            ("albumReplayGain", g.album_db),
+            ("albumPeakAmplitude", g.album_pic),
+        ] {
+            if let Some(v) = valeur {
+                reponse[cle] = json!(v);
+            }
+        }
+    }
     Ok(reponse)
 }
 

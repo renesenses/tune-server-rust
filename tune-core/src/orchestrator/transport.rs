@@ -1704,7 +1704,7 @@ impl PlaybackOrchestrator {
                     req.seek_ms,
                     zone_audiophile,
                     req.zone_id,
-                    req.track_id,
+                    req.piste_rg(),
                 )
                 .await;
             let result = self
@@ -2272,8 +2272,9 @@ impl PlaybackOrchestrator {
         start_position_ms: Option<u64>,
         zone_audiophile: bool,
         zone_id: i64,
-        track_id: Option<i64>,
+        piste: crate::audio::replaygain::PisteRg<'_>,
     ) -> (bool, Option<String>) {
+        let track_id = piste.track_id;
         let lock_start = std::time::Instant::now();
         let (output_arc, used_device_id) = {
             let outputs = self.outputs.lock().await;
@@ -2387,11 +2388,12 @@ impl PlaybackOrchestrator {
                     // A PURE zone is left strictly alone: applying a gain would
                     // multiply every sample and the path would no longer be
                     // bit-perfect, which is the one thing PURE promises.
-                    let rg = match (zone_audiophile, track_id) {
-                        (false, Some(tid)) => {
-                            crate::audio::replaygain::playback_factor(&self.db, tid)
-                        }
-                        _ => 1.0,
+                    // #8689 — un titre Qobuz / TIDAL reçoit le gain que le
+                    // service publie, au même calcul qu'une piste locale.
+                    let rg = if zone_audiophile {
+                        1.0
+                    } else {
+                        crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste)
                     };
                     // #4685 — posé AVANT le facteur et les processeurs : chacun
                     // recompose le gain de rendu à son installation.

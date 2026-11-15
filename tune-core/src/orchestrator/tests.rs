@@ -6517,7 +6517,7 @@ async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
     let zr = ZoneRepo::with_backend(orch.db.clone());
     let zone_vide = zr.create("Vide", Some("dlna"), Some("dlna:vide")).unwrap();
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_vide, None),
+        orch.traitement_que_pure_gouverne(zone_vide, crate::audio::replaygain::PisteRg::AUCUNE),
         None,
         "sans réglage, rien n'est armé"
     );
@@ -6535,18 +6535,18 @@ async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
         )
         .unwrap();
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_eq, None),
+        orch.traitement_que_pure_gouverne(zone_eq, crate::audio::replaygain::PisteRg::AUCUNE),
         None,
         "un profil activé mais inaudible ne change pas le signal"
     );
     armer_un_egaliseur_audible(&orch, zone_eq);
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_eq, None),
+        orch.traitement_que_pure_gouverne(zone_eq, crate::audio::replaygain::PisteRg::AUCUNE),
         Some("egaliseur")
     );
     regler_pure(&orch, zone_eq, true);
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_eq, None),
+        orch.traitement_que_pure_gouverne(zone_eq, crate::audio::replaygain::PisteRg::AUCUNE),
         Some("egaliseur"),
         "PURE ne doit pas cacher le réglage au prédicat : c'est lui qui décide si PURE a un effet"
     );
@@ -6557,7 +6557,7 @@ async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
         .set(&format!("ir_path_{zone_ir}"), "/nulle/part/ir.wav")
         .unwrap();
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_ir, None),
+        orch.traitement_que_pure_gouverne(zone_ir, crate::audio::replaygain::PisteRg::AUCUNE),
         None,
         "un fichier absent ne sera pas convolué : rien ne change"
     );
@@ -6566,7 +6566,7 @@ async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
         .set(&format!("ir_path_{zone_ir}"), &ir.path().to_string_lossy())
         .unwrap();
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_ir, None),
+        orch.traitement_que_pure_gouverne(zone_ir, crate::audio::replaygain::PisteRg::AUCUNE),
         Some("correction_de_piece")
     );
 
@@ -6579,7 +6579,7 @@ async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
         )
         .unwrap();
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_cf, None),
+        orch.traitement_que_pure_gouverne(zone_cf, crate::audio::replaygain::PisteRg::AUCUNE),
         None,
         "amount nul = identité"
     );
@@ -6590,7 +6590,7 @@ async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
         )
         .unwrap();
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_cf, None),
+        orch.traitement_que_pure_gouverne(zone_cf, crate::audio::replaygain::PisteRg::AUCUNE),
         Some("crossfeed")
     );
 
@@ -6605,7 +6605,10 @@ async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
         .set(tid, "rg_track_gain", "-6.00 dB")
         .unwrap();
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_rg, Some(tid)),
+        orch.traitement_que_pure_gouverne(
+            zone_rg,
+            crate::audio::replaygain::PisteRg::bibliotheque(tid)
+        ),
         None,
         "mode ReplayGain éteint : le gain tagué n'est pas appliqué"
     );
@@ -6613,11 +6616,14 @@ async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
         .set(crate::audio::replaygain::MODE_KEY, "track")
         .unwrap();
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_rg, Some(tid)),
+        orch.traitement_que_pure_gouverne(
+            zone_rg,
+            crate::audio::replaygain::PisteRg::bibliotheque(tid)
+        ),
         Some("replaygain")
     );
     assert_eq!(
-        orch.traitement_que_pure_gouverne(zone_rg, None),
+        orch.traitement_que_pure_gouverne(zone_rg, crate::audio::replaygain::PisteRg::AUCUNE),
         None,
         "sans piste identifiée (radio), aucun gain ne s'applique"
     );
@@ -6675,7 +6681,14 @@ async fn transport_timeout_keeps_the_stream_session_but_refusal_drops_it() {
             ..Default::default()
         };
         let (output_sent, output_error) = orch
-            .send_to_output(device_id, &media, None, false, 1, None)
+            .send_to_output(
+                device_id,
+                &media,
+                None,
+                false,
+                1,
+                crate::audio::replaygain::PisteRg::AUCUNE,
+            )
             .await;
         assert!(!output_sent, "{device_id} : l'envoi doit échouer");
         let err = output_error.expect("une erreur doit être remontée");
@@ -6722,7 +6735,14 @@ async fn streaming_seek_on_local_output_is_producer_preseeked_no_consumer_skip()
         ..Default::default()
     };
     let (sent, err) = orch
-        .send_to_output(device_id, &media, Some(270_000), false, 1, None)
+        .send_to_output(
+            device_id,
+            &media,
+            Some(270_000),
+            false,
+            1,
+            crate::audio::replaygain::PisteRg::AUCUNE,
+        )
         .await;
     assert!(sent, "play_media doit partir : {err:?}");
 
@@ -6765,7 +6785,14 @@ async fn gain_de_la_sortie_recreee(volume: f64, fixe: bool, trim_db: &str) -> u3
         ..Default::default()
     };
     let _ = orch
-        .send_to_output(device_id, &media, None, false, zone_id, None)
+        .send_to_output(
+            device_id,
+            &media,
+            None,
+            false,
+            zone_id,
+            crate::audio::replaygain::PisteRg::AUCUNE,
+        )
         .await;
 
     let arc = orch
@@ -9013,7 +9040,14 @@ async fn output_send_error_fails_fast_to_stopped() {
         ..Default::default()
     };
     let (output_sent, output_error) = orch
-        .send_to_output(device_id, &media, None, false, 1, None)
+        .send_to_output(
+            device_id,
+            &media,
+            None,
+            false,
+            1,
+            crate::audio::replaygain::PisteRg::AUCUNE,
+        )
         .await;
     assert!(
         !output_sent,
@@ -10724,7 +10758,8 @@ async fn une_zone_reseau_sans_opt_in_entend_le_crossfeed_sur_un_flux_2742() {
         pcm.extend_from_slice(&((l * 32767.0) as i16).to_le_bytes());
         pcm.extend_from_slice(&0i16.to_le_bytes());
     }
-    let mut chaine = orch.load_streaming_dsp(zone_id, None, 44100, 2);
+    let mut chaine =
+        orch.load_streaming_dsp(zone_id, crate::audio::replaygain::PisteRg::AUCUNE, 44100, 2);
     chaine.process(&mut pcm, 16);
     let voie = |c: usize| -> f64 {
         let e: f64 = pcm
@@ -11746,4 +11781,92 @@ async fn remplacer_la_lecture_d_une_zone_dlna_ferme_le_flux_remplace_8404() {
         url.contains(&sid_portable),
         "le renderer doit avoir reçu le flux du portable : {url}"
     );
+}
+
+/// #8689 — mesure sur les échantillons, sans sortie audio ni appel réseau.
+/// Le bras réseau utilise cette même chaîne DSP pour les titres de service.
+#[tokio::test]
+async fn les_gains_des_services_modifient_le_pcm_sauf_pure_et_strict_8689() {
+    use crate::audio::replaygain::services::{GainsDuService, noter};
+    use crate::audio::replaygain::{MODE_KEY, PREAMP_KEY, PisteRg};
+    let orch = test_orchestrator();
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .create(
+            "Banc RG services",
+            Some("dlna"),
+            Some("uuid:8689-synthetique"),
+        )
+        .unwrap();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings.set(PREAMP_KEY, "2").unwrap();
+    for (source, id, mode, gains, attendu_db) in [
+        (
+            "qobuz",
+            "8689201",
+            "track",
+            GainsDuService::depuis_qobuz(&serde_json::json!({"audio_info": {
+                "replaygain_track_gain": -8.0, "replaygain_track_peak": 0.5
+            }}))
+            .unwrap(),
+            -6.0,
+        ),
+        (
+            "tidal",
+            "8689202",
+            "album",
+            GainsDuService::depuis_tidal_v2(&serde_json::json!({
+                "trackAudioNormalizationData": {"replayGain": -9.0, "peakAmplitude": 0.5},
+                "albumAudioNormalizationData": {"replayGain": -4.0, "peakAmplitude": 0.5}
+            }))
+            .unwrap(),
+            -2.0,
+        ),
+    ] {
+        noter(source, id, gains);
+        settings
+            .set(crate::audio::replaygain::SERVICES_ENABLED_KEY, "true")
+            .unwrap();
+        settings.set(MODE_KEY, mode).unwrap();
+        let piste = PisteRg::new(None, Some(source), Some(id));
+        let original: Vec<u8> = [10_000i16.to_le_bytes(); 512].concat();
+        let mut pcm = original.clone();
+        orch.load_streaming_dsp(zone, piste, 44_100, 2)
+            .process(&mut pcm, 16);
+        let attendu = 10_000.0 * 10f64.powf(attendu_db / 20.0);
+        for frame in pcm.chunks_exact(2) {
+            let obtenu = i16::from_le_bytes([frame[0], frame[1]]) as f64;
+            assert!(
+                (obtenu - attendu).abs() <= 2.0,
+                "#8689 : {source} reste sans gain ou reçoit le mauvais gain : {obtenu}, attendu {attendu}"
+            );
+        }
+        assert!(orch.zone_replaygain_changes_audio(zone, piste));
+
+        settings
+            .set(&format!("zone_{zone}_audiophile"), r#"{"enabled":true}"#)
+            .unwrap();
+        let mut pure = original.clone();
+        orch.load_streaming_dsp(zone, piste, 44_100, 2)
+            .process(&mut pure, 16);
+        assert_eq!(pure, original, "PURE doit laisser les échantillons intacts");
+        assert!(!orch.zone_replaygain_changes_audio(zone, piste));
+        settings
+            .set(&format!("zone_{zone}_audiophile"), r#"{"enabled":false}"#)
+            .unwrap();
+
+        settings
+            .set(&crate::audio::bitperfect_strict::cle_de_zone(zone), "true")
+            .unwrap();
+        let mut strict = original.clone();
+        orch.load_streaming_dsp(zone, piste, 44_100, 2)
+            .process(&mut strict, 16);
+        assert_eq!(
+            strict, original,
+            "bit-perfect strict doit laisser les échantillons intacts"
+        );
+        assert!(!orch.zone_replaygain_changes_audio(zone, piste));
+        settings
+            .set(&crate::audio::bitperfect_strict::cle_de_zone(zone), "false")
+            .unwrap();
+    }
 }

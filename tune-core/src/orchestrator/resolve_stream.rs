@@ -672,6 +672,27 @@ impl PlaybackOrchestrator {
         }
         let mut svc = svc.write().await;
 
+        // #8689 — Qobuz ne publie son ReplayGain que sur l'objet piste
+        // (`audio_info`), que la navigation a d'ordinaire déjà lu (album,
+        // playlist, recherche : `map_track` le retient). Une file restaurée
+        // après un redémarrage ne l'a pas : UNE lecture de `track/get`, et
+        // seulement quand le gain servira (ReplayGain armé, zone hors PURE).
+        if service_name == "qobuz"
+            && !crate::audio::replaygain::service_contourne(&self.db, req.zone_id, req.piste_rg())
+            && crate::audio::replaygain::services::lire("qobuz", source_id).is_none()
+            && crate::audio::replaygain::ReplayGainSettings::load(&self.db).mode
+                != crate::audio::replaygain::ReplayGainMode::Off
+            && !self.zone_audiophile(req.zone_id)
+        {
+            let lu = svc.get_track(source_id).await.is_ok();
+            debug!(
+                source_id,
+                lu,
+                trouve = crate::audio::replaygain::services::lire("qobuz", source_id).is_some(),
+                "qobuz_replaygain_lu_pour_la_lecture"
+            );
+        }
+
         // Chronomètre de la PREMIÈRE étape (#3568). Pour Tidal en DASH
         // multi-segments, `get_track_url()` ne rend pas une adresse : il
         // assemble le fMP4 ENTIER sur disque avant de rendre un `file://`.
@@ -1828,7 +1849,7 @@ impl PlaybackOrchestrator {
         // ⚠️ Ce bras ne chargeait que l'ÉGALISEUR (#2863) : le convolveur de
         // correction de pièce et le ReplayGain y étaient perdus, exactement
         // comme sur les bras non-DASH. `StreamingDsp` porte les trois.
-        let dash_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr_servie, 2);
+        let dash_dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr_servie, 2);
         let dash_dsp_active = dash_dsp.is_active();
 
         // Browser (Web Audio) zones pull the stream themselves via <audio> and
@@ -2721,7 +2742,7 @@ impl PlaybackOrchestrator {
             // fil de l'eau, sans rien bufferiser de plus — le démarrage
             // immédiat conquis en 0.9.106 est préservé. Sans traitement
             // actif, le canal reste celui d'avant, à l'octet près.
-            let aac_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+            let aac_dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr, 2);
             // #5114 — chargé avant la session : le flux dit s'il cuit le crossfeed.
             let info = StreamInfo {
                 crossfeed: aac_dsp.is_active() && aac_dsp.crossfeed_executable(),
@@ -2849,7 +2870,7 @@ impl PlaybackOrchestrator {
             // SERVIE, pas à celle du service : ses coefficients sont calculés
             // pour le fil.
             let sr = cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate);
-            let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+            let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr, 2);
             let https_dsp_active = https_dsp.is_active();
             // #5114 — lu avant que le porteur parte dans la tâche de décodage.
             let https_crossfeed = https_dsp_active && https_dsp.crossfeed_executable();

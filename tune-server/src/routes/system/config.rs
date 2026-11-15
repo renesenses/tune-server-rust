@@ -496,6 +496,10 @@ pub(super) async fn get_config(
         // ReplayGain application at playback. Off by default: it multiplies
         // every sample, so it must be an explicit choice, never a surprise.
         ("replaygain_mode", json!("off")),
+        (
+            tune_core::audio::replaygain::SERVICES_ENABLED_KEY,
+            json!(false),
+        ),
         ("replaygain_preamp_db", json!(0.0)),
         ("replaygain_prevent_clipping", json!(true)),
         // Plafond dBTP de l'anti-écrêtage (#1694) : 0 (défaut, comportement
