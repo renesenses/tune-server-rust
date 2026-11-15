@@ -309,9 +309,13 @@ impl Banc {
     }
 
     async fn tic(&mut self) {
-        self.poller
-            .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
-            .await;
+        // Le sondage peut relancer une lecture complète. Garder sa grosse
+        // future sur le tas évite de la répéter dans chaque état du banc.
+        Box::pin(
+            self.poller
+                .tick(&mut self.poll_states, &mut self.idle, &Instant::now()),
+        )
+        .await;
     }
 
     /// 19:16:47 — la fenêtre d'armement : `SetNext` acquitté par le
@@ -753,3 +757,17 @@ mod set_next_coupe_la_piste_6477;
 /// DSD et `SetNext` ; la garde de #402 gardée pour les autres.
 #[cfg(test)]
 mod dsd_suivant_dlna_6910;
+
+/// Budget du cadre de sondage du banc : il est emboîté plusieurs fois dans
+/// les scénarios d'adoption, sur la petite pile des threads de test macOS.
+#[tokio::test]
+async fn le_sondage_du_banc_garde_un_cadre_borne_8785() {
+    let mut banc = Banc::monter().await;
+    let sondage = banc.tic();
+    let taille = std::mem::size_of_val(&sondage);
+    eprintln!("#8785 : cadre du sondage = {taille} octets");
+    assert!(
+        taille <= 32 * 1024,
+        "cadre du sondage trop gros : {taille} octets"
+    );
+}
