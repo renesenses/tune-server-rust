@@ -186,6 +186,8 @@ async fn service_appareils(refus: usize) -> (SpotifyService, Arc<Mutex<usize>>) 
     let mut svc =
         SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(&base);
     svc.access_token = Some("jeton".into());
+    // #8766 — les attentes après un 429, raccourcies.
+    svc.seconde_429 = std::time::Duration::from_millis(5);
     (svc, appels)
 }
 
@@ -208,5 +210,9 @@ async fn un_refus_persistant_donne_le_message_de_spotify_7659() {
         .await
         .expect_err("refus à chaque essai");
     assert!(erreur.contains("429"), "{erreur}");
-    assert_eq!(*appels.lock().unwrap(), 20);
+    // #8766 — `api_get` réessaie lui-même le 429 (`ESSAIS_429` appels) ;
+    // l'attente de l'appareil s'arrête ensuite au lieu de redemander.
+    // (le budget des 429 peut l'arrêter un essai plus tôt).
+    let n = *appels.lock().unwrap();
+    assert!((2..=ESSAIS_429 as usize).contains(&n), "{n} appels");
 }
