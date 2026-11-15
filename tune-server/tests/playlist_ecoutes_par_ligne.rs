@@ -57,7 +57,12 @@ fn ecoute_de_service(state: &tune_server::state::AppState, source_id: &str, quan
         .expect("ecoute de service");
 }
 
-async fn appel(app: &axum::Router, methode: &str, path: &str, corps: Option<Value>) -> (StatusCode, Value) {
+async fn appel(
+    app: &axum::Router,
+    methode: &str,
+    path: &str,
+    corps: Option<Value>,
+) -> (StatusCode, Value) {
     let mut req = Request::builder()
         .method(methode)
         .uri(path)
@@ -89,7 +94,13 @@ async fn lignes() -> Vec<Value> {
     ecoute_de_service(&state, "q-ecoutes", "2026-11-12T08:00:00Z");
     let app = tune_server::routes::router(state);
 
-    let (st, v) = appel(&app, "POST", "/api/v1/playlists", Some(json!({"name": "ecoutes"}))).await;
+    let (st, v) = appel(
+        &app,
+        "POST",
+        "/api/v1/playlists",
+        Some(json!({"name": "ecoutes"})),
+    )
+    .await;
     assert_eq!(st, StatusCode::CREATED, "{v}");
     let id = v["id"].as_i64().unwrap();
     let (st, v) = appel(
