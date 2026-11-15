@@ -33,6 +33,23 @@ pub const ANNEE_DE_LA_PISTE_AVEC_AL: &str = "COALESCE(NULLIF(t.year, 0), NULLIF(
 pub const ANNEE_DE_LA_PISTE: &str = "COALESCE(NULLIF(t.year, 0), \
      (SELECT NULLIF(al_an.year, 0) FROM albums al_an WHERE al_an.id = t.album_id))";
 
+/// Année destinée à l'affichage de lecture, sans altérer la fiche de piste.
+/// La requête d'album n'est faite que si la piste ne porte pas son année.
+pub fn pour_affichage(
+    piste: &crate::db::models::Track,
+    db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+) -> Option<i32> {
+    piste.year.filter(|annee| *annee != 0).or_else(|| {
+        let id = piste.album_id?;
+        crate::db::album_repo::AlbumRepo::with_backend(db.clone())
+            .get(id)
+            .ok()
+            .flatten()
+            .and_then(|album| album.year)
+            .filter(|annee| *annee != 0)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -106,10 +106,10 @@ async fn scenario(state: &AppState) {
         )
         .expect("piste")
     };
-    piste(a, "nulle", None);
-    piste(a, "zero", Some(0));
-    piste(a, "propre", Some(ANNEE_PISTE));
-    piste(sans, "orpheline", None);
+    let nulle = piste(a, "nulle", None);
+    let zero = piste(a, "zero", Some(0));
+    let propre = piste(a, "propre", Some(ANNEE_PISTE));
+    let orpheline = piste(sans, "orpheline", None);
     let t = |s: &str| format!("{MARQUE} {s}");
 
     // 1. Le filtre `year` de la liste des pistes.
@@ -170,6 +170,86 @@ async fn scenario(state: &AppState) {
         titres(&r["tracks"]),
         vec![t("nulle"), t("propre"), t("zero")],
         "{r}"
+    );
+
+    // Carte filtrée et tri : même année effective que les facettes.
+    let cartes = appel(
+        state,
+        "GET",
+        &format!("/api/v1/library/albums-detailed?year={ANNEE_ALBUM}&limit=500"),
+        None,
+    )
+    .await;
+    let carte = cartes["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|carte| carte["id"] == a)
+        .expect("carte de l'album A");
+    assert_eq!(carte["year"], ANNEE_ALBUM, "{cartes}");
+    for ordre in ["asc", "desc"] {
+        let page = appel(
+            state,
+            "GET",
+            &format!("/api/v1/library/tracks?sort=year&order={ordre}&search={MARQUE}&limit=500"),
+            None,
+        )
+        .await;
+        let ids: Vec<i64> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 4, "{page}");
+        let position = |id| ids.iter().position(|v| *v == id).unwrap();
+        for id in [nulle, zero] {
+            assert_eq!(position(id) < position(propre), ordre == "asc", "{page}");
+        }
+    }
+    // Cette répartition appliquait déjà le repli avant #8684 : garde de
+    // non-régression, sans prétendre réparer les années vraiment inconnues.
+    let stats = appel(state, "GET", "/api/v1/library/stats", None).await;
+    let decennie = stats["distributions"]["by_decade"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["value"] == 1810)
+        .expect("décennie 1810");
+    assert_eq!(decennie["tracks"], 3, "{stats}");
+
+    // Lecture en cours : les chemins de démarrage et d'avance emploient
+    // le même repli d'affichage ; les fiches gardent leur valeur brute.
+    let repo = tune_core::db::track_repo::TrackRepo::with_backend(b.clone());
+    for (id, brut, attendu) in [
+        (nulle, None, Some(ANNEE_ALBUM as i32)),
+        (zero, Some(0), Some(ANNEE_ALBUM as i32)),
+        (propre, Some(ANNEE_PISTE as i32), Some(ANNEE_PISTE as i32)),
+        (orpheline, None, None),
+    ] {
+        let piste = repo.get(id).unwrap().unwrap();
+        assert_eq!(piste.year, brut);
+        assert_eq!(
+            tune_core::db::annee_de_la_piste::pour_affichage(&piste, &b),
+            attendu
+        );
+        assert_eq!(
+            tune_core::playback::NowPlaying::from_track_avec_album(&piste, &b).year,
+            attendu
+        );
+    }
+    // Une vraie écriture d'un autre tag ne doit pas enregistrer l'année
+    // d'affichage : l'éditeur relit la fiche brute.
+    appel(
+        state,
+        "PUT",
+        &format!("/api/v1/library/tracks/{nulle}"),
+        Some(json!({"genre": "Test lecture seule 8684"})),
+    )
+    .await;
+    assert_eq!(
+        repo.get(nulle).unwrap().unwrap().genre.as_deref(),
+        Some("Test lecture seule 8684")
     );
 
     // 4. Rien n'est écrit : les pistes gardent leur année vide.
