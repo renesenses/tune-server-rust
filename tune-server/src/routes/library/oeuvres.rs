@@ -448,6 +448,18 @@ fn version_json(a: &Album, nom: &Option<String>, canaux: &super::albums::CanauxP
     });
     if let Some(obj) = v.as_object_mut() {
         super::albums::inserer_max_channels(obj, a, canaux);
+        // Le numéro de catalogue de l'édition (colonne `albums.catalog_number`,
+        // remplie par la balise CATALOGNUMBER ou par Discogs) : l'onglet
+        // Versions de la fiche album le montre (web#3064). Inconnu ou vide :
+        // la clé est ABSENTE, comme `max_channels`.
+        if let Some(cat) = a
+            .catalog_number
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            obj.insert("catalog_number".into(), json!(cat));
+        }
     }
     v
 }
