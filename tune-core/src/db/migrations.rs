@@ -2918,7 +2918,41 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "radio_fin_de_file_par_defaut",
         up: SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT,
     },
+    // #8672 (décision de Bertrand du 13/11) — « Ma collection physique » :
+    // un disque « nulle part » associé À LA MAIN à un album de la
+    // bibliothèque, une ligne par release Discogs. Prime sur le rapprochement
+    // automatique, survit aux synchronisations (hors de `collection.json`).
+    // Naît vide. Jumelle PG : 119. Numérotée 153 / PG 119 le 13/11 : 152 /
+    // PG 118 sont pris par #8656 (radio de fin de file), en PR, qui DOIT
+    // fusionner avant celle-ci (garde de contiguïté) — sinon, renuméroter.
+    Migration {
+        version: 153,
+        name: "collection_physique_associations",
+        up: include_str!("../../migrations/collection_physique_associations.sql"),
+    },
+    // #8668 — le pays d'ÉDITION lu sur la release MusicBrainz de l'album :
+    // `albums.release_country` (code ISO 3166-1 alpha-2, '' quand MusicBrainz
+    // n'en donne aucun) et `albums.release_country_mbid`, l'identifiant de
+    // release dont il a été lu. Seuls ~50 albums sur 9 490 portaient la
+    // balise RELEASECOUNTRY au .18, 858 ont un `musicbrainz_release_id`.
+    // Colonnes posées dans le bloc de version et dans la passe finale (même
+    // règle qu'à la 133). Jumelle PG : 120. Numérotée 154 / PG 120 le 13/11 :
+    // 152 / PG 118 sont pris par #8656 et 153 / PG 119 par #8678, qui
+    // fusionnent AVANT celle-ci (ordre #8656 → #8678 → #8687) ; la garde de
+    // contiguïté ne passe qu'une fois les deux fusionnées.
+    Migration {
+        version: 154,
+        name: "albums_release_country",
+        up: "",
+    },
 ];
+
+/// Pose `albums.release_country` et `albums.release_country_mbid` (#8668) —
+/// bloc de version de la 154 et passe finale.
+fn pays_des_editions(db: &SqliteDb) {
+    add_column_if_missing(db, "albums", "release_country", "TEXT");
+    add_column_if_missing(db, "albums", "release_country_mbid", "TEXT");
+}
 
 /// Pose `alarms.interrupt_playback` (#8615) — bloc de version de la 151 et
 /// passe finale. 1 pour l'existant : l'option est cochée par défaut.
@@ -4486,6 +4520,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // #8615 — « Interrompre la lecture en cours », cochée par défaut.
             interruption_par_le_reveil(db);
         }
+        if migration.version == 154 {
+            // #8668 — le pays d'édition MusicBrainz. NULL pour l'existant :
+            // la passe de fond le lit.
+            pays_des_editions(db);
+        }
         if migration.version == 137 {
             // #7765 — la source des crédits, puis l'attribution UNE fois des
             // lignes existantes. L'index vient APRES la colonne qu'il nomme.
@@ -5105,6 +5144,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // posée ICI aussi : le planificateur et les routes des réveils la
     // NOMMENT. PG : 117.
     interruption_par_le_reveil(db);
+    // Le pays d'édition MusicBrainz (migration 154, #8668) — posé ICI aussi :
+    // les facettes, le filtre Pays et la passe de fond le NOMMENT. PG : 120.
+    pays_des_editions(db);
     // L'ordre des etiquettes (migration 127, #6257) — pose ICI aussi :
     // l'INSERT des etiquettes le NOMME. Sans rangement : toutes a 0, la liste
     // reste rangee par nom (le nom departage). PG : migration 091.
@@ -6251,6 +6293,20 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         118,
         "radio_fin_de_file_par_defaut",
         include_str!("../../migrations/postgres/118_radio_fin_de_file_par_defaut.sql"),
+    ),
+    // Jumelle de la SQLite 153 (#8672) : `collection_physique_associations`,
+    // les disques associés à la main à un album. Naît vide. (118 : #8656.)
+    (
+        119,
+        "collection_physique_associations",
+        include_str!("../../migrations/postgres/119_collection_physique_associations.sql"),
+    ),
+    // Jumelle de la SQLite 154 (#8668) : `albums.release_country` et
+    // `albums.release_country_mbid`, le pays d'édition lu sur MusicBrainz.
+    (
+        120,
+        "albums_release_country",
+        include_str!("../../migrations/postgres/120_albums_release_country.sql"),
     ),
 ];
 
@@ -8705,6 +8761,74 @@ mod tests {
         );
     }
 
+    /// #8672 — la migration 153 pose `collection_physique_associations` (les
+    /// disques associés à la main), sur une base NEUVE comme sur une base
+    /// MONTÉE juste avant ; la clé primaire est la release ; la jumelle PG 119
+    /// existe, marque son numéro, et la bascule copie la table.
+    #[test]
+    fn la_migration_153_pose_les_associations_manuelles_8672() {
+        let colonnes = |db: &SqliteDb| -> Vec<(String, i64)> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(collection_physique_associations)")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let attendues = vec![
+            ("release_id".to_string(), 1),
+            ("album_id".to_string(), 0),
+            ("associe_le".to_string(), 0),
+        ];
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(colonnes(&neuve), attendues, "base neuve");
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "DROP TABLE collection_physique_associations;
+                 DELETE FROM _migrations WHERE version >= 153;",
+            )
+            .unwrap();
+        assert!(colonnes(&montee).is_empty(), "préparation : table retirée");
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert_eq!(colonnes(&montee), attendues, "base montée sous la 153");
+        montee
+            .execute_batch(
+                "INSERT INTO collection_physique_associations \
+                 (release_id, album_id, associe_le) VALUES (249504, 7, 1);",
+            )
+            .unwrap();
+        assert!(
+            montee
+                .execute_batch(
+                    "INSERT INTO collection_physique_associations \
+                     (release_id, album_id, associe_le) VALUES (249504, 8, 2);",
+                )
+                .is_err(),
+            "une seule association par release"
+        );
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "119_collection_physique_associations.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(sql_pg.contains("VALUES (119, 'collection_physique_associations')"));
+        assert!(sql_pg.contains("release_id BIGINT NOT NULL PRIMARY KEY"));
+        assert!(include_str!("migrations.rs").contains(fichier));
+        let bascule = include_str!("pg_migrate.rs");
+        assert!(bascule.contains("\"collection_physique_associations\","));
+        assert!(bascule.contains("ON CONFLICT (release_id) DO NOTHING"));
+    }
+
     /// #8170 — la migration 150 pose `podcast_episode_positions` (la position
     /// de chaque épisode de podcast commencé), sur une base NEUVE comme sur une
     /// base MONTÉE juste avant ; la clé primaire est (zone, épisode) ; la
@@ -10121,7 +10245,14 @@ mod tests {
         // 118 : `radio_fin_de_file_par_defaut` (fil 2694), jumelle de la
         // SQLite 152. Migration de DONNÉES : la radio de fin de file activée
         // par défaut, et le DEFAULT de `zones.autoplay_enabled` à '1'.
-        assert_eq!(pg_latest_version(), 118, "latest PG migration must be 118");
+        // 119 : `collection_physique_associations` (#8672), jumelle de la
+        // SQLite 153 (118 = #8656, fusionnée avant). Crée les associations
+        // manuelles de « Ma collection physique », que le greffon NOMME.
+        // 120 : `albums_release_country` (#8668), jumelle de la SQLite 154
+        // (118 = #8656, 119 = #8678, fusionnées avant).
+        // Pose le pays d'édition MusicBrainz, que les facettes, le filtre
+        // Pays et la passe de fond NOMMENT.
+        assert_eq!(pg_latest_version(), 120, "latest PG migration must be 120");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

@@ -541,16 +541,14 @@ pub fn noter_position_d_episode(
     Ok(())
 }
 
-/// #8170 — l'épisode `url` est écouté jusqu'au bout sur la zone : il n'a
-/// plus de position à rendre.
-fn oublier_position_d_episode(
-    db: &Arc<dyn DbBackend>,
-    zone_id: i64,
-    url: &str,
-) -> Result<(), String> {
+/// #8170 — l'épisode `url` est écouté jusqu'au bout : il n'a plus de
+/// position à rendre, sur AUCUNE zone. Commencé sur A puis terminé sur B, la
+/// ligne de A ferait encore proposer « reprendre » à la fiche du podcast
+/// ([`positions_des_episodes`] retombe sur les autres zones).
+fn oublier_position_d_episode(db: &Arc<dyn DbBackend>, url: &str) -> Result<(), String> {
     db.execute(
-        "DELETE FROM podcast_episode_positions WHERE zone_id = ? AND episode_key = ?",
-        &[&zone_id as &dyn ToSqlValue, &cle_d_episode(url)],
+        "DELETE FROM podcast_episode_positions WHERE episode_key = ?",
+        &[&cle_d_episode(url) as &dyn ToSqlValue],
     )?;
     Ok(())
 }
@@ -601,9 +599,10 @@ pub fn positions_des_episodes(
     Ok(retenues)
 }
 
-/// Retire la reprise de l'épisode `url` sur cette zone (épisode écouté).
+/// Retire la reprise de l'épisode `url` sur cette zone (épisode écouté), et
+/// sa position d'épisode sur toutes les zones (#8170).
 pub fn podcast_termine(db: &Arc<dyn DbBackend>, zone_id: i64, url: &str) -> Result<usize, String> {
-    oublier_position_d_episode(db, zone_id, url)?;
+    oublier_position_d_episode(db, url)?;
     let mut retirees = 0;
     for (r, _) in reprises_d_episodes(db, Some(zone_id))?
         .into_iter()
@@ -943,3 +942,7 @@ mod reprise_terminee_7415;
 #[cfg(test)]
 #[path = "listening_resume_7352_tests.rs"]
 mod reprise_services_7352;
+
+#[cfg(test)]
+#[path = "listening_resume_fin_toutes_zones_8170_tests.rs"]
+mod fin_d_episode_toutes_zones_8170;

@@ -32,6 +32,10 @@ mod renderer_sans_services_de_rendu_tests_7279;
 #[path = "discovery_setup/zone_nommee_par_le_modele_tests_7572.rs"]
 mod zone_nommee_par_le_modele_tests_7572;
 
+#[cfg(test)]
+#[path = "discovery_setup/deblocage_rejoue_la_decouverte_7508_tests.rs"]
+mod deblocage_rejoue_la_decouverte_7508_tests;
+
 #[cfg(all(test, feature = "oaat"))]
 #[path = "deux_pi_verox_oaat_airplay_tests_6947.rs"]
 mod deux_pi_verox_oaat_airplay_tests_6947;
@@ -966,6 +970,78 @@ fn renommer_zone_nommee_par_adresse(
         Ok(_) => {}
         Err(e) => warn!(zone_id, error = %e, "ssdp_zone_renommage_echoue"),
     }
+}
+
+/// #7508 — rejoue la découverte des appareils qu'on vient de débloquer.
+///
+/// Le scanner SSDP n'émet `DeviceDiscovered` qu'à la PREMIÈRE inscription
+/// d'un appareil ; les réannonces ne font que rafraîchir sa fiche. Un appareil
+/// ignoré à ce moment-là a été écarté par [`handle_ssdp_discovered`], et rien
+/// ne le lui représentait ensuite : la zone revenait au déblocage, mais sans
+/// sortie, et chaque lecture échouait en « Device not yet discovered »
+/// jusqu'au redémarrage (Zeppelin B&W en DLNA, fil 2835).
+///
+/// On repasse donc la fiche que le scanner connaît déjà par le MÊME chemin
+/// qu'une découverte vivante. Seuls les identifiants libérés sont rejoués, et
+/// jamais une sortie déjà enregistrée : une lecture en cours n'est pas touchée.
+///
+/// mDNS (AirPlay, Chromecast…) a le même travers : `mdns-sd` ne renvoie
+/// `ServiceResolved` que sur un enregistrement modifié. Relancer les
+/// recherches lui fait relire son cache et réémettre chaque service connu,
+/// que le gestionnaire mDNS traite alors comme une mise à jour.
+///
+/// Rend le nombre d'appareils SSDP rejoués.
+pub(crate) async fn rejouer_les_appareils_debloques(state: &AppState, liberes: &[String]) -> usize {
+    if liberes.is_empty() {
+        return 0;
+    }
+    let deja_enregistres: std::collections::HashSet<String> = {
+        let reg = state.outputs.lock().await;
+        liberes
+            .iter()
+            .filter(|id| reg.contains(id))
+            .cloned()
+            .collect()
+    };
+    let a_rejouer: Vec<tune_core::discovery::device::DiscoveredDevice> = state
+        .scanner
+        .devices()
+        .await
+        .into_iter()
+        .filter(|d| liberes.contains(&d.id) && !deja_enregistres.contains(&d.id))
+        .collect();
+
+    if !a_rejouer.is_empty() {
+        let oh_listener: Option<Arc<UpnpEventListener>> =
+            crate::startup::create_oh_listener().await;
+        let mut seen_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for dev in &a_rejouer {
+            handle_ssdp_discovered(
+                dev,
+                &state.outputs,
+                &state.backend,
+                &state.config,
+                &state.event_bus,
+                &oh_listener,
+                &state.playback,
+                &state.license,
+                &mut seen_hosts,
+            )
+            .await;
+            info!(id = %dev.id, name = %dev.name, host = %dev.host, "ssdp_appareil_debloque_rejoue");
+        }
+    }
+
+    let mdns = state.mdns_scanner.lock().ok().and_then(|g| g.clone());
+    if let Some(mdns) = mdns {
+        mdns.relancer_recherches();
+        info!(
+            liberes = liberes.len(),
+            "mdns_recherches_relancees_apres_deblocage"
+        );
+    }
+
+    a_rejouer.len()
 }
 
 async fn handle_ssdp_discovered(
