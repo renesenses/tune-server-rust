@@ -2179,8 +2179,11 @@ async fn unignore_device(
                     .event_bus
                     .emit("zone.updated", json!({ "zone_id": zone_id }));
             }
-            // L'appareil ne revient qu'au prochain passage de découverte —
-            // l'événement fait recharger Réglages > Réseau, où il réapparaîtra.
+            // #7508 — le scanner ne réannonce jamais un appareil qu'il
+            // connaît déjà : sans ce rejeu, la zone revenait sans sortie et
+            // chaque lecture échouait jusqu'au redémarrage du serveur.
+            crate::discovery_setup::rejouer_les_appareils_debloques(&state, &liberes).await;
+            // L'événement fait recharger Réglages > Réseau.
             state.event_bus.emit_typed(
                 tune_core::event_types::EventType::DeviceDiscovered,
                 json!({ "device_id": device_id, "reason": "unignored" }),
