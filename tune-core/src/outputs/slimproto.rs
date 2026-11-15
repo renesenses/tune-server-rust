@@ -244,6 +244,14 @@ impl OutputTarget for SlimProtoOutput {
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
         // SlimProto digital gain is fixed-point with 65536 = unity.
         let volume = volume.clamp(0.0, 1.0);
+        // #8624 — un lecteur en sourdine le reste : la consigne est gardée
+        // et `set_mute(false)` l'enverra. Seul un geste de volume (#8165,
+        // `lever_la_sourdine_au_geste_de_volume`) lève la sourdine ; une
+        // limite, une alarme, le sondeur ou une reprise ne la lèvent pas.
+        if self.muted.load(Ordering::Relaxed) {
+            *self.volume.lock().await = volume;
+            return Ok(());
+        }
         let g = (volume * 65536.0).round() as u32;
         self.send(ServerMessage::Audg {
             left_gain: g,
@@ -252,7 +260,6 @@ impl OutputTarget for SlimProtoOutput {
         })
         .await?;
         *self.volume.lock().await = volume;
-        self.muted.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -340,6 +347,10 @@ impl OutputTarget for SlimProtoOutput {
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "slimproto_sourdine_tests_8624.rs"]
+mod sourdine_tests_8624;
 
 #[cfg(test)]
 mod tests {

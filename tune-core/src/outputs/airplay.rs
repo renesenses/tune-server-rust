@@ -1049,6 +1049,20 @@ impl OutputTarget for AirplayOutput {
         let volume = volume.clamp(0.0, 1.0);
         let db = linear_to_airplay_db(volume);
         let mut session = self.rtsp_session.lock().await;
+        // #8624 — une enceinte en sourdine le reste : la consigne est gardée
+        // et `set_mute(false)` l'enverra. Seul un geste de volume (#8165,
+        // `lever_la_sourdine_au_geste_de_volume`) lève la sourdine ; une
+        // limite, une alarme, le sondeur ou une reprise ne la lèvent pas.
+        if self.muted.load(Ordering::SeqCst) {
+            if session.is_none() {
+                // La session suivante partira muette (#8151) ; la consigne
+                // attend la levée de la sourdine.
+                *self.volume_en_attente.lock().await = Some(volume);
+            }
+            *self.volume.lock().await = volume;
+            info!(device = %self.name, volume, "airplay_volume_garde_en_sourdine");
+            return Ok(());
+        }
         let Some(session) = session.as_mut() else {
             // Fil 2553 (Zeppelin Air, rc9) : la consigne donnée zone arrêtée
             // était refusée (« requires an active RTSP session ») et PERDUE.
@@ -1059,14 +1073,12 @@ impl OutputTarget for AirplayOutput {
             // piste (#2395).
             *self.volume_en_attente.lock().await = Some(volume);
             *self.volume.lock().await = volume;
-            self.muted.store(false, Ordering::SeqCst);
             info!(device = %self.name, volume, "airplay_volume_en_attente_de_session");
             return Ok(());
         };
         session.set_volume_rtsp(db).await?;
         *self.volume_en_attente.lock().await = None;
         *self.volume.lock().await = volume;
-        self.muted.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -2274,3 +2286,6 @@ mod volume_hors_session_tests_2553;
 #[cfg(test)]
 #[path = "airplay_sourdine_hors_session_tests_8151.rs"]
 mod sourdine_hors_session_tests_8151;
+#[cfg(test)]
+#[path = "airplay_sourdine_set_volume_tests_8624.rs"]
+mod sourdine_set_volume_tests_8624;
