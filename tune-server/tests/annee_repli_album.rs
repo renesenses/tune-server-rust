@@ -159,6 +159,18 @@ async fn scenario(state: &AppState) {
     )
     .await;
     assert_eq!(titres(&r["tracks"]), vec![t("nulle"), t("zero")], "{r}");
+    for piste in r["tracks"].as_array().unwrap() {
+        if piste["title"]
+            .as_str()
+            .is_some_and(|titre| titre.starts_with(MARQUE))
+        {
+            assert_eq!(
+                piste["year"], ANNEE_ALBUM,
+                "année affichée dans l'aperçu : {piste}"
+            );
+        }
+    }
+
     let r = appel(
         state,
         "POST",
