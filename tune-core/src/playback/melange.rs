@@ -122,13 +122,25 @@ pub fn melanger_une_file_neuve_hors(ids: &[i64], depart: usize, fixes: &HashSet<
 /// les titres déjà joués (`ids[..=courant]` inchangé). Une ligne radio fixe
 /// déjà en file (#8135) reste derrière les titres : les ajouts ne la
 /// dépassent pas ; une radio ajoutée, elle, reste en fin de file.
+///
+/// `origine` est l'ordre d'origine retenu. Les lignes qui suivent juste le
+/// titre en cours et n'y figurent pas sont des « Lire ensuite » posés pendant
+/// l'aléatoire : elles gardent leur place, les ajouts se dispersent derrière
+/// elles. Sans ordre retenu (`origine` vide), rien n'est protégé.
 pub fn disperser_les_ajouts(
     ids: &[i64],
     courant: Option<usize>,
     ajoutees: &HashSet<i64>,
     fixes: &HashSet<i64>,
+    origine: &HashSet<i64>,
 ) -> Vec<i64> {
-    let debut = courant.map_or(0, |c| c.saturating_add(1)).min(ids.len());
+    let mut debut = courant.map_or(0, |c| c.saturating_add(1)).min(ids.len());
+    if !origine.is_empty() {
+        while debut < ids.len() && !origine.contains(&ids[debut]) && !ajoutees.contains(&ids[debut])
+        {
+            debut += 1;
+        }
+    }
     let mut nouvel: Vec<i64> = ids[..debut].to_vec();
     let mut reste: Vec<i64> = Vec::with_capacity(ids.len() - debut);
     let mut a_disperser: Vec<i64> = Vec::new();
@@ -202,14 +214,21 @@ pub async fn apres_ajout_en_fin(
     }
     let ajoutees: HashSet<i64> = ajoutees_dans_l_ordre.iter().copied().collect();
     let courant = rang_courant(&entrees, etat.queue_position);
-    let nouvel = disperser_les_ajouts(&ids, courant, &ajoutees, &lignes_radio_fixes(&entrees));
+    let mut origine = playback.ordre_d_origine(zone_id);
+    let dans_l_origine: HashSet<i64> = origine.iter().copied().collect();
+    let nouvel = disperser_les_ajouts(
+        &ids,
+        courant,
+        &ajoutees,
+        &lignes_radio_fixes(&entrees),
+        &dans_l_origine,
+    );
     if nouvel != ids
         && let Err(e) = repo.reordonner(zone_id, &nouvel)
     {
         warn!(zone_id, error = %e, "aleatoire_ajout_ecriture_echouee");
         return None;
     }
-    let mut origine = playback.ordre_d_origine(zone_id);
     if !origine.is_empty() {
         origine.extend(ajoutees_dans_l_ordre.iter().copied());
         playback.retenir_l_ordre_d_origine(zone_id, origine);
@@ -581,7 +600,8 @@ mod tests {
         let ajoutees: HashSet<i64> = (101..=110).collect();
         let mut a_bouge = false;
         for _ in 0..30 {
-            let nouvel = disperser_les_ajouts(&ids, Some(4), &ajoutees, &HashSet::new());
+            let nouvel =
+                disperser_les_ajouts(&ids, Some(4), &ajoutees, &HashSet::new(), &HashSet::new());
             assert_eq!(&nouvel[..5], &file[..5], "joués + en cours figés");
             assert_eq!(trie(nouvel.clone()), ids, "une permutation");
             let anciens: Vec<i64> = nouvel.iter().copied().filter(|id| *id <= 20).collect();
@@ -601,9 +621,25 @@ mod tests {
         let ajoutees: HashSet<i64> = [101, 102, 103].into();
         let fixes: HashSet<i64> = [50].into();
         for _ in 0..30 {
-            let nouvel = disperser_les_ajouts(&ids, Some(1), &ajoutees, &fixes);
+            let nouvel = disperser_les_ajouts(&ids, Some(1), &ajoutees, &fixes, &HashSet::new());
             assert_eq!(&nouvel[..2], &[1, 2]);
             assert_eq!(nouvel.last(), Some(&50), "la radio reste la dernière");
+        }
+    }
+
+    /// #8796 (relecture) — un « Lire ensuite » posé pendant l'aléatoire (hors
+    /// ordre d'origine) reste juste après le titre en cours : les ajouts se
+    /// dispersent derrière lui, jamais devant ni entre deux « Lire ensuite ».
+    #[test]
+    fn un_ajout_ne_passe_pas_devant_un_lire_ensuite_8796() {
+        // Origine 1..=10, en cours 3 ; 90 et 91 posés en « Lire ensuite ».
+        let ids = vec![1, 2, 3, 90, 91, 6, 4, 9, 5, 10, 8, 7, 101, 102, 103, 104];
+        let origine: HashSet<i64> = (1..=10).collect();
+        let ajoutees: HashSet<i64> = (101..=104).collect();
+        for _ in 0..50 {
+            let nouvel = disperser_les_ajouts(&ids, Some(2), &ajoutees, &HashSet::new(), &origine);
+            assert_eq!(&nouvel[..5], &[1, 2, 3, 90, 91], "{nouvel:?}");
+            assert_eq!(trie(nouvel), trie(ids.clone()));
         }
     }
 

@@ -6320,7 +6320,12 @@ async fn queue_add(
     // #8796 (forum VNAV) — « Ajouter » pendant l'aléatoire : les titres
     // ajoutés sont dispersés parmi ceux qui restent à jouer, au lieu d'être lus
     // dans l'ordre à la suite. « Lire ensuite » (position donnée) n'y passe pas.
-    let rangs_disperses = if body.position.is_none() && bilan.inserted() > 0 {
+    // `dernier_identifiant` rend 0 quand la lecture en base échoue : sur une
+    // file qui n'était pas vide, on ne saurait plus distinguer les ajouts, et
+    // l'ajout reste en fin de file plutôt que de tout remélanger.
+    let ajouts_reperables =
+        dernier_avant > 0 || queue_repo.count_all(zone_id).unwrap_or(-1) == bilan.inserted() as i64;
+    let rangs_disperses = if body.position.is_none() && bilan.inserted() > 0 && ajouts_reperables {
         tune_core::playback::melange::apres_ajout_en_fin(
             &state.backend,
             &state.playback,
@@ -6331,6 +6336,10 @@ async fn queue_add(
     } else {
         None
     };
+    if rangs_disperses.is_some() {
+        // Le suivant préchargé n'est plus forcément le suivant de la file.
+        state.orchestrator.clear_prefetch().await;
+    }
     let count = bilan.inserted();
     let start = match &rangs_disperses {
         Some(rangs) => rangs.iter().copied().min().or(bilan.start),

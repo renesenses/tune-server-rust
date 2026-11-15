@@ -373,3 +373,52 @@ async fn ajouter_pendant_l_aleatoire_disperse_les_titres_dans_la_suite_8796() {
     );
     assert_eq!(position, 3);
 }
+
+/// #8796 (relecture) — « Lire ensuite » PUIS « Ajouter » sous l'aléatoire : le
+/// titre « Lire ensuite » reste le suivant, aucun titre ajouté ne passe devant
+/// lui, et il le reste une fois l'aléatoire éteint.
+#[tokio::test]
+async fn lire_ensuite_puis_ajouter_garde_le_suivant_8796() {
+    let (app, state) = serveur();
+    let n = 20;
+    let zone_id = zone_avec_une_file(&state, n, 3).await;
+    let uri = format!("/api/v1/zones/{zone_id}/shuffle");
+    appeler(&app, "POST", &format!("{uri}?enabled=true"), None).await;
+
+    let ensuite = pistes(&state, 100, 1)[0];
+    let (statut, v) = appeler(
+        &app,
+        "POST",
+        &format!("/api/v1/zones/{zone_id}/queue/add"),
+        Some(json!({ "track_ids": [ensuite], "position": 4 })),
+    )
+    .await;
+    assert!(statut.is_success(), "lire ensuite : {statut} {v}");
+
+    let album = pistes(&state, 300, 12);
+    let (statut, v) = appeler(
+        &app,
+        "POST",
+        &format!("/api/v1/zones/{zone_id}/queue/add"),
+        Some(json!({ "track_ids": album })),
+    )
+    .await;
+    assert!(statut.is_success(), "ajouter : {statut} {v}");
+
+    let (titres, position) = file_relue(&app, zone_id).await;
+    assert_eq!(position, 3);
+    assert_eq!(
+        titres[4], "Piste 100",
+        "« Lire ensuite » doublé : {titres:?}"
+    );
+    let etat = state.playback.get_state(zone_id).await;
+    assert_eq!(PositionPoller::next_position(&etat), Some(4));
+
+    appeler(&app, "POST", &format!("{uri}?enabled=false"), None).await;
+    let (titres, position) = file_relue(&app, zone_id).await;
+    let mut attendu = titres_d_origine(n);
+    attendu.insert(4, "Piste 100".into());
+    attendu.extend((300..312).map(|i| format!("Piste {i}")));
+    assert_eq!(titres, attendu, "rétabli : {titres:?}");
+    assert_eq!(position, 3);
+}
