@@ -88,6 +88,19 @@ async fn verifier_source(
     strict: bool,
     aac: bool,
 ) {
+    verifier_traitement(sink, attendu, signature, plafond, strict, aac, false).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verifier_traitement(
+    sink: &'static str,
+    attendu: &str,
+    signature: &[u8],
+    plafond: Option<u32>,
+    strict: bool,
+    aac: bool,
+    eq: bool,
+) {
     let sqlite = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
     sqlite.init_schema().unwrap();
     crate::db::migrations::run_migrations(&sqlite).unwrap();
@@ -126,6 +139,32 @@ async fn verifier_source(
     let zone = ZoneRepo::with_backend(db.clone())
         .create("Banc 8722", Some("dlna"), Some("uuid:8722"))
         .unwrap();
+    ZoneRepo::with_backend(db.clone())
+        .update_alac_passthrough(zone, false)
+        .unwrap();
+    if eq {
+        crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .set("plugin_equalizer_installed", "true")
+            .unwrap();
+        let profile = crate::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![crate::audio::eq::EqBandSpec {
+                freq: 80.0,
+                gain: 3.0,
+                q: 0.71,
+                band_type: "low_shelf".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .set(
+                &format!("zone_{zone}_eq_profile"),
+                &serde_json::to_string(&profile).unwrap(),
+            )
+            .unwrap();
+        assert!(orch.zone_has_active_eq(zone));
+    }
     if let Some(plafond) = plafond {
         ZoneRepo::with_backend(db.clone())
             .update_max_sample_rate(zone, Some(plafond))
@@ -248,11 +287,11 @@ async fn m4a_8722_sink_flac_seul_recoit_du_vrai_flac() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn m4a_8722_le_natif_prime_sur_flac_sans_traitement() {
+async fn m4a_8722_flac_prime_sur_le_natif_sans_opt_in() {
     verifier(
         "http-get:*:audio/mp4:*,http-get:*:audio/flac:*",
-        "audio/mp4",
-        b"ftyp",
+        "audio/flac",
+        b"fLaC",
     )
     .await;
 }
@@ -297,6 +336,35 @@ async fn m4a_8722_aac_scanned_dans_mp4_annonce_le_conteneur() {
         "audio/mp4",
         b"ftyp",
         None,
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4a_8722_mp4_et_flac_preservent_l_egaliseur_sans_opt_in() {
+    for aac in [false, true] {
+        verifier_traitement(
+            "http-get:*:audio/mp4:*,http-get:*:audio/flac:*",
+            "audio/flac",
+            b"fLaC",
+            None,
+            false,
+            aac,
+            true,
+        )
+        .await;
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4a_8722_mp4_seul_ne_supprime_pas_l_egaliseur() {
+    verifier_traitement(
+        "http-get:*:audio/mp4:*",
+        "refus",
+        b"",
+        None,
+        false,
         false,
         true,
     )

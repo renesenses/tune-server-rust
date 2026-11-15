@@ -154,6 +154,7 @@ pub(super) struct FormatDeSortie {
     pub(super) target_format_str: String,
     pub(super) use_file_transcode: bool,
     l16: bool,
+    conteneur_natif: bool,
     pub(super) info: StreamInfo,
 }
 
@@ -182,7 +183,6 @@ fn est_un_conteneur_mp4(chemin: &str) -> bool {
 /// `tracks` et de la zone, lu par tous les temps suivants (REF-2 phase 2,
 /// #2219). Les champs portent les noms des `let` d'origine.
 struct SourceEtZone {
-    conteneur_mp4: bool,
     sample_rate: u32,
     bit_depth: u16,
     channels: u16,
@@ -1201,7 +1201,6 @@ impl PlaybackOrchestrator {
             device_quirks.max_sample_rate,
         );
         SourceEtZone {
-            conteneur_mp4: track.file_path.as_deref().is_some_and(est_un_conteneur_mp4),
             sample_rate,
             bit_depth,
             channels,
@@ -1668,64 +1667,14 @@ impl PlaybackOrchestrator {
         // plafond 16 bits — un ALAC 96 kHz ne se lit pas sur un renderer qui
         // plafonne à 48 kHz, et le laisser « voulu » sautait la négociation
         // FLAC (`will_be_flac`) tout en faisant mentir le panneau.
-        // #8722 — un Sink qui annonce explicitement MP4/M4A peut recevoir
-        // le conteneur original. Une sortie absente, factice ou une sonde
-        // inconcluante ne vaut pas une annonce de capacité.
-        let m4a_annonce = if zone_output_type.as_deref() == Some("dlna")
-            && (matches!(source_format, Some(AudioFormat::Alac | AudioFormat::M4a))
-                || (source_format == Some(AudioFormat::Aac) && source.conteneur_mp4))
-            && !dlna_force_wav
-        {
-            let did = identifiant_du_renderer(
-                req.output_device_id.as_deref(),
-                zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
-            );
-            let output = { self.outputs.lock().await.get(did) };
-            if let Some(output) = output {
-                let locked = output.lock().await;
-                if let Some(dlna) = locked
-                    .as_any()
-                    .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
-                {
-                    let caps = dlna.probe_capabilities().await;
-                    caps.probed
-                        && caps.sink.iter().any(|entry| {
-                            entry.split(':').nth(2).is_some_and(|mime| {
-                                matches!(
-                                    mime.split(';')
-                                        .next()
-                                        .unwrap_or("")
-                                        .trim()
-                                        .to_ascii_lowercase()
-                                        .as_str(),
-                                    "audio/mp4" | "audio/m4a" | "audio/x-m4a" | "*"
-                                )
-                            })
-                        })
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
         let alac_passthrough = alac_passthrough_applies(
             zone_output_type.as_deref(),
-            if m4a_annonce && source_format == Some(AudioFormat::M4a) {
-                Some(AudioFormat::Alac)
-            } else {
-                source_format
-            },
+            source_format,
             *sample_rate,
             *zone_max_sample_rate,
             dlna_force_wav,
             dlna_cap_16bit,
-            || {
-                m4a_annonce
-                    || ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id)
-            },
+            || ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id),
         );
         // Même mécanique pour l'AAC (Marco Polo, #1424) : un Marantz SR7009 ou
         // un Denon RC12 le décodent nativement, et le transcoder en FLAC ne fait
@@ -1740,8 +1689,7 @@ impl PlaybackOrchestrator {
             && is_network_output
             && !dlna_force_wav
             && zone_max_sample_rate.is_none_or(|max| *sample_rate <= max)
-            && (m4a_annonce
-                || ZoneRepo::with_backend(self.db.clone()).get_aac_passthrough(req.zone_id));
+            && ZoneRepo::with_backend(self.db.clone()).get_aac_passthrough(req.zone_id);
 
         // Chromecast's Default Media Receiver decodes a narrower set than most
         // DLNA renderers — notably it cannot play AIFF (which DLNA plays
@@ -2624,6 +2572,9 @@ impl PlaybackOrchestrator {
         String,
     > {
         let format = self.format_de_sortie_avec_bascule(req, decision).await?;
+        if format.conteneur_natif {
+            return self.servir_en_passthrough(req, decision).await;
+        }
         if format.use_file_transcode {
             self.transcoder_vers_fichier(req, decision, format).await
         } else {
@@ -3228,6 +3179,7 @@ impl PlaybackOrchestrator {
             target_format_str,
             use_file_transcode,
             l16: false,
+            conteneur_natif: false,
             info,
         })
     }
@@ -3406,11 +3358,13 @@ impl PlaybackOrchestrator {
         if !matches!(
             decision.source_format,
             Some(AudioFormat::Alac | AudioFormat::M4a)
-        ) || decision
-            .zone
-            .as_ref()
-            .and_then(|z| z.output_type.as_deref())
-            != Some("dlna")
+        ) && !(decision.source_format == Some(AudioFormat::Aac)
+            && est_un_conteneur_mp4(&decision.file_path))
+            || decision
+                .zone
+                .as_ref()
+                .and_then(|z| z.output_type.as_deref())
+                != Some("dlna")
         {
             return Ok(());
         }
@@ -3498,6 +3452,34 @@ impl PlaybackOrchestrator {
         } else if wav {
             ("wav", format.out_bd, false)
         } else {
+            // Le conteneur original n'est qu'un dernier recours. Il ne doit
+            // jamais effacer un traitement, une limite ou un forçage de zone.
+            let natif_annonce = caps.sink.iter().any(|entry| {
+                entry.split(':').nth(2).is_some_and(|mime| {
+                    matches!(
+                        mime.split(';')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "audio/mp4" | "audio/m4a" | "audio/x-m4a" | "*"
+                    )
+                })
+            });
+            let zones = ZoneRepo::with_backend(self.db.clone());
+            let sans_traitement = decision
+                .motifs_de_transcodage
+                .iter()
+                .all(|motif| matches!(*motif, "needs_transcode_for_output" | "dlna_needs_wav"));
+            if natif_annonce
+                && sans_traitement
+                && !zones.get_dlna_lpcm(req.zone_id)
+                && !zones.get_dlna_wav24(req.zone_id)
+            {
+                format.conteneur_natif = true;
+                return Ok(());
+            }
             return Err(format!(
                 "Le lecteur DLNA n'annonce aucun format de sortie compatible avec ce M4A à {} Hz / {} canaux (FLAC, L16 ou WAV).",
                 format.out_sr, decision.channels
@@ -3543,7 +3525,7 @@ impl PlaybackOrchestrator {
         use super::bascule_progressive_8558 as b;
         let mut format = self.decider_le_format_de_sortie(req, decision, None)?;
         self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
-        if format.l16 || !format.use_file_transcode {
+        if format.conteneur_natif || format.l16 || !format.use_file_transcode {
             return Ok(format);
         }
         let src_fmt = decision.source_format.unwrap_or(AudioFormat::Flac);
