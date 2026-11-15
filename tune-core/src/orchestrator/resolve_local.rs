@@ -153,6 +153,7 @@ pub(super) struct FormatDeSortie {
     pub(super) out_ext: String,
     pub(super) target_format_str: String,
     pub(super) use_file_transcode: bool,
+    l16: bool,
     pub(super) info: StreamInfo,
 }
 
@@ -169,10 +170,19 @@ struct TraitementsDuFichier {
     empreinte_dsp: Option<[u8; 32]>,
 }
 
+/// Distingue le conteneur du codec AAC enregistré au scan.
+fn est_un_conteneur_mp4(chemin: &str) -> bool {
+    std::path::Path::new(chemin)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("m4a") || ext.eq_ignore_ascii_case("mp4"))
+}
+
 /// Ce que le premier temps de `decider_la_lecture_locale` relève de la ligne
 /// `tracks` et de la zone, lu par tous les temps suivants (REF-2 phase 2,
 /// #2219). Les champs portent les noms des `let` d'origine.
 struct SourceEtZone {
+    conteneur_mp4: bool,
     sample_rate: u32,
     bit_depth: u16,
     channels: u16,
@@ -1191,6 +1201,7 @@ impl PlaybackOrchestrator {
             device_quirks.max_sample_rate,
         );
         SourceEtZone {
+            conteneur_mp4: track.file_path.as_deref().is_some_and(est_un_conteneur_mp4),
             sample_rate,
             bit_depth,
             channels,
@@ -1657,14 +1668,64 @@ impl PlaybackOrchestrator {
         // plafond 16 bits — un ALAC 96 kHz ne se lit pas sur un renderer qui
         // plafonne à 48 kHz, et le laisser « voulu » sautait la négociation
         // FLAC (`will_be_flac`) tout en faisant mentir le panneau.
+        // #8722 — un Sink qui annonce explicitement MP4/M4A peut recevoir
+        // le conteneur original. Une sortie absente, factice ou une sonde
+        // inconcluante ne vaut pas une annonce de capacité.
+        let m4a_annonce = if zone_output_type.as_deref() == Some("dlna")
+            && (matches!(source_format, Some(AudioFormat::Alac | AudioFormat::M4a))
+                || (source_format == Some(AudioFormat::Aac) && source.conteneur_mp4))
+            && !dlna_force_wav
+        {
+            let did = identifiant_du_renderer(
+                req.output_device_id.as_deref(),
+                zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
+            );
+            let output = { self.outputs.lock().await.get(did) };
+            if let Some(output) = output {
+                let locked = output.lock().await;
+                if let Some(dlna) = locked
+                    .as_any()
+                    .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+                {
+                    let caps = dlna.probe_capabilities().await;
+                    caps.probed
+                        && caps.sink.iter().any(|entry| {
+                            entry.split(':').nth(2).is_some_and(|mime| {
+                                matches!(
+                                    mime.split(';')
+                                        .next()
+                                        .unwrap_or("")
+                                        .trim()
+                                        .to_ascii_lowercase()
+                                        .as_str(),
+                                    "audio/mp4" | "audio/m4a" | "audio/x-m4a" | "*"
+                                )
+                            })
+                        })
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let alac_passthrough = alac_passthrough_applies(
             zone_output_type.as_deref(),
-            source_format,
+            if m4a_annonce && source_format == Some(AudioFormat::M4a) {
+                Some(AudioFormat::Alac)
+            } else {
+                source_format
+            },
             *sample_rate,
             *zone_max_sample_rate,
             dlna_force_wav,
             dlna_cap_16bit,
-            || ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id),
+            || {
+                m4a_annonce
+                    || ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id)
+            },
         );
         // Même mécanique pour l'AAC (Marco Polo, #1424) : un Marantz SR7009 ou
         // un Denon RC12 le décodent nativement, et le transcoder en FLAC ne fait
@@ -1678,7 +1739,9 @@ impl PlaybackOrchestrator {
         let aac_passthrough = source_format == Some(AudioFormat::Aac)
             && is_network_output
             && !dlna_force_wav
-            && ZoneRepo::with_backend(self.db.clone()).get_aac_passthrough(req.zone_id);
+            && zone_max_sample_rate.is_none_or(|max| *sample_rate <= max)
+            && (m4a_annonce
+                || ZoneRepo::with_backend(self.db.clone()).get_aac_passthrough(req.zone_id));
 
         // Chromecast's Default Media Receiver decodes a narrower set than most
         // DLNA renderers — notably it cannot play AIFF (which DLNA plays
@@ -3164,6 +3227,7 @@ impl PlaybackOrchestrator {
             out_ext,
             target_format_str,
             use_file_transcode,
+            l16: false,
             info,
         })
     }
@@ -3331,6 +3395,133 @@ impl PlaybackOrchestrator {
         )
     }
 
+    /// #8722 — si le format prévu est refusé par un Sink concluant,
+    /// choisir des octets encodables qu'il accepte, avant tout Play.
+    async fn ajuster_m4a_au_sink(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+        format: &mut FormatDeSortie,
+    ) -> Result<(), String> {
+        if !matches!(
+            decision.source_format,
+            Some(AudioFormat::Alac | AudioFormat::M4a)
+        ) || decision
+            .zone
+            .as_ref()
+            .and_then(|z| z.output_type.as_deref())
+            != Some("dlna")
+        {
+            return Ok(());
+        }
+        let did = identifiant_du_renderer(
+            req.output_device_id.as_deref(),
+            decision
+                .zone
+                .as_ref()
+                .and_then(|z| z.output_device_id.as_deref()),
+        );
+        let output = { self.outputs.lock().await.get(did) };
+        let Some(output) = output else { return Ok(()) };
+        let caps = {
+            let locked = output.lock().await;
+            let Some(dlna) = locked
+                .as_any()
+                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+            else {
+                return Ok(());
+            };
+            dlna.probe_capabilities().await
+        };
+        if !caps.probed {
+            return Ok(());
+        }
+        let wav = caps.wav
+            || caps.sink.iter().any(|entry| {
+                entry.split(':').nth(2).is_some_and(|mime| {
+                    matches!(
+                        mime.split(';')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "audio/wave" | "audio/vnd.wave"
+                    )
+                })
+            });
+        if (format.target_format_str == "flac" && caps.flac)
+            || (format.target_format_str == "wav" && wav)
+        {
+            return Ok(());
+        }
+        let l16 = caps.sink.iter().any(|entry| {
+            let Some(mime) = entry.split(':').nth(2) else {
+                return false;
+            };
+            let mut fields = mime.split(';');
+            if !fields
+                .next()
+                .is_some_and(|m| m.trim().eq_ignore_ascii_case("audio/l16"))
+            {
+                return false;
+            }
+            fields.all(|field| {
+                let Some((k, v)) = field.trim().split_once('=') else {
+                    return true;
+                };
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "rate" => v.trim().parse::<u32>() == Ok(format.out_sr),
+                    "channels" => v.trim().parse::<u16>() == Ok(decision.channels),
+                    _ => true,
+                }
+            })
+        });
+        let (target, bits, raw_l16) = if caps.flac {
+            (
+                "flac",
+                if decision.dlna_cap_16bit {
+                    16
+                } else {
+                    decision.bit_depth.clamp(16, 24)
+                },
+                false,
+            )
+        } else if l16 {
+            if decision.bit_depth > 16
+                && (decision.dlna_wav24
+                    || crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id))
+            {
+                return Err("Le lecteur DLNA ne propose que du L16 : le réglage actuel interdit la réduction à 16 bits.".into());
+            }
+            ("wav", 16, true)
+        } else if wav {
+            ("wav", format.out_bd, false)
+        } else {
+            return Err(format!(
+                "Le lecteur DLNA n'annonce aucun format de sortie compatible avec ce M4A à {} Hz / {} canaux (FLAC, L16 ou WAV).",
+                format.out_sr, decision.channels
+            ));
+        };
+        format.target_format_str = target.into();
+        format.out_ext = target.into();
+        format.out_bd = bits;
+        format.l16 = raw_l16;
+        format.out_mime = if raw_l16 {
+            format!(
+                "audio/L16;rate={};channels={}",
+                format.out_sr, decision.channels
+            )
+        } else {
+            format!("audio/{target}")
+        };
+        format.info.format = if raw_l16 { "l16" } else { target }.into();
+        format.info.mime_type = format.out_mime.clone();
+        format.info.bit_depth = bits;
+        format.use_file_transcode = true;
+        Ok(())
+    }
+
     /// #8558 (volet B) — le format de sortie, avec la bascule vers le WAV
     /// progressif d'une piste trop lourde pour le bras FICHIER (la piste
     /// entière en mémoire). Forum, fil 2777 : un FLAC 192/24 vers un
@@ -3350,8 +3541,9 @@ impl PlaybackOrchestrator {
         decision: &DecisionLocale,
     ) -> Result<FormatDeSortie, String> {
         use super::bascule_progressive_8558 as b;
-        let format = self.decider_le_format_de_sortie(req, decision, None)?;
-        if !format.use_file_transcode {
+        let mut format = self.decider_le_format_de_sortie(req, decision, None)?;
+        self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
+        if format.l16 || !format.use_file_transcode {
             return Ok(format);
         }
         let src_fmt = decision.source_format.unwrap_or(AudioFormat::Flac);
@@ -3430,7 +3622,9 @@ impl PlaybackOrchestrator {
             profondeur = ?profondeur,
             "bras_fichier_trop_lourd_session_progressive_8558"
         );
-        self.decider_le_format_de_sortie(req, decision, Some(profondeur))
+        let mut format = self.decider_le_format_de_sortie(req, decision, Some(profondeur))?;
+        self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
+        Ok(format)
     }
 
     /// Deuxième temps, sorties réseau : décodage → encodage → fichier
@@ -3458,6 +3652,7 @@ impl PlaybackOrchestrator {
             out_mime,
             out_ext,
             target_format_str,
+            l16,
             ..
         } = format;
         let flux = {
@@ -3539,8 +3734,19 @@ impl PlaybackOrchestrator {
                 crate::transcode_cache::touch(cp);
                 let file_size = std::fs::metadata(cp).map(|m| m.len()).unwrap_or(0);
                 info!(file = %file_path, cache = %cp, file_size, "transcode_cache_hit");
+                let source_l16: Option<Arc<dyn crate::http::streamer::SourceVirtuelle>> = if l16 {
+                    Some(Arc::new(
+                        crate::audio::l16_depuis_wav::L16DepuisWav::ouvrir_pour_mime(
+                            std::path::Path::new(cp),
+                            &out_mime,
+                        )?,
+                    ))
+                } else {
+                    None
+                };
+                let file_size = source_l16.as_ref().map_or(file_size, |s| s.total());
                 let file_info = StreamInfo {
-                    format: out_ext.clone(),
+                    format: if l16 { "l16".into() } else { out_ext.clone() },
                     mime_type: out_mime.clone(),
                     sample_rate: out_sr,
                     bit_depth: out_bd,
@@ -3555,6 +3761,11 @@ impl PlaybackOrchestrator {
                     .streamer
                     .create_file_session(file_info, cp.clone(), false)
                     .await;
+                if let Some(source) = source_l16 {
+                    self.streamer
+                        .set_source_virtuelle(&session_id, source)
+                        .await;
+                }
                 self.streamer
                     .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
                     .await;
@@ -3643,7 +3854,7 @@ impl PlaybackOrchestrator {
                 (
                     session_id,
                     out_mime,
-                    out_ext,
+                    if l16 { "l16".into() } else { out_ext },
                     Some(file_size),
                     Some(out_sr),
                     Some(out_bd as u32),
@@ -3805,8 +4016,20 @@ impl PlaybackOrchestrator {
 
                         // Create a file session — HTTP handler serves with
                         // Content-Length and Range support.
+                        let source_l16: Option<Arc<dyn crate::http::streamer::SourceVirtuelle>> =
+                            if l16 {
+                                Some(Arc::new(
+                                    crate::audio::l16_depuis_wav::L16DepuisWav::ouvrir_pour_mime(
+                                        std::path::Path::new(&serve_path),
+                                        &out_mime,
+                                    )?,
+                                ))
+                            } else {
+                                None
+                            };
+                        let file_size = source_l16.as_ref().map_or(file_size, |s| s.total());
                         let file_info = StreamInfo {
-                            format: out_ext.clone(),
+                            format: if l16 { "l16".into() } else { out_ext.clone() },
                             mime_type: out_mime.clone(),
                             sample_rate: out_sr,
                             bit_depth: out_bd,
@@ -3821,6 +4044,11 @@ impl PlaybackOrchestrator {
                             .streamer
                             .create_file_session(file_info, serve_path, false)
                             .await;
+                        if let Some(source) = source_l16 {
+                            self.streamer
+                                .set_source_virtuelle(&session_id, source)
+                                .await;
+                        }
                         self.streamer
                             .noter_la_voie(
                                 &session_id,
@@ -3849,7 +4077,7 @@ impl PlaybackOrchestrator {
                         (
                             session_id,
                             out_mime,
-                            out_ext,
+                            if l16 { "l16".into() } else { out_ext },
                             Some(file_size),
                             Some(out_sr),
                             Some(out_bd as u32),
@@ -4361,6 +4589,9 @@ impl PlaybackOrchestrator {
                 cap.get(did)
                     .and_then(|c| c.dsf_mime.clone())
                     .unwrap_or_else(|| "application/x-dsd".into())
+            } else if source_format == Some(AudioFormat::Aac) && est_un_conteneur_mp4(file_path) {
+                // Le codec AAC scanné ne distingue pas ADTS du conteneur MP4.
+                "audio/mp4".into()
             } else {
                 source_format
                     .map(|f| f.mime_type().to_string())

@@ -139,7 +139,7 @@ pub struct StreamInfo {
 /// #6221 — un fichier VIRTUEL servi par la branche fichier (`serve_file`) :
 /// taille connue d'avance, octets calculés à la demande pour une tranche
 /// quelconque — donc `Content-Length` exact et requêtes `Range` honorées.
-/// Le seul producteur est le DSF fabriqué depuis un DST
+/// Producteurs : L16 depuis WAV (#8722) et DSF fabriqué depuis un DST
 /// (`audio::dsf_depuis_dst::DsfDepuisDst`).
 pub trait SourceVirtuelle: Send + Sync + std::fmt::Debug {
     /// Taille totale du fichier virtuel.
