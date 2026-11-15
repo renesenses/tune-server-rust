@@ -72,7 +72,7 @@ impl PlaybackOrchestrator {
             .flatten();
         format!(
             "{}|{}|{:?}",
-            self.empreinte_du_traitement(demande.zone_id, demande.track_id),
+            self.empreinte_du_traitement(demande.zone_id, demande.piste_rg()),
             self.streaming_quality_preference(demande.zone_id),
             zone.as_ref().map(|z| z.max_sample_rate)
         )
@@ -103,7 +103,12 @@ impl PlaybackOrchestrator {
     /// WAV progressif (#5080) n'est pas consenti ; consenti, la résolution est
     /// courte si le renderer annonce le LPCM, et rien n'est préparé d'avance.
     fn pretranscode_complet_attendu(&self, zone_id: i64) -> bool {
-        let dsp = self.load_streaming_dsp(zone_id, None, 44_100, 2);
+        let dsp = self.load_streaming_dsp(
+            zone_id,
+            crate::audio::replaygain::PisteRg::AUCUNE,
+            44_100,
+            2,
+        );
         if !dsp.is_active() {
             return false;
         }

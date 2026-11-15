@@ -200,7 +200,7 @@ impl PlaybackOrchestrator {
         // #4407 — le traitement lu AVANT la résolution : si un réglage change
         // pendant qu'elle tourne, l'empreinte notée est l'ancienne, et le
         // prochain changement relancera. Jamais l'inverse.
-        let empreinte = self.empreinte_du_traitement(req.zone_id, req.track_id);
+        let empreinte = self.empreinte_du_traitement(req.zone_id, req.piste_rg());
         let resolu = self.resolve_stream_sans_noter(req).await?;
         if let Some(ref sid) = resolu.stream_id {
             self.noter_traitement_du_flux(req.zone_id, sid, empreinte);
@@ -631,7 +631,7 @@ impl PlaybackOrchestrator {
             return PorteeDuReglage::RienNeJoue;
         }
         let pure = self.zone_audiophile(zone_id);
-        match self.traitement_que_pure_gouverne(zone_id, np.track_id) {
+        match self.traitement_que_pure_gouverne(zone_id, np.piste_rg()) {
             // #7556 — zone EN PAUSE : la relance la remettrait en lecture. On
             // garde le flux ; la bascule portera sur la piste suivante.
             Some(traitement) if etat.state != crate::playback::PlayState::Playing => {

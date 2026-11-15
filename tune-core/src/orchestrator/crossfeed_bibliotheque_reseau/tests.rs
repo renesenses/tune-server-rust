@@ -479,7 +479,9 @@ async fn une_sortie_locale_ne_recoit_jamais_le_crossfeed_du_serveur_2742() {
 async fn le_chemin_des_services_garde_une_seule_passe_2742() {
     let m = monter(Renderer::AnnonceLeLpcm, None).await;
     let mut pcm = pcm_source();
-    let mut chaine = m.orch.load_streaming_dsp(m.zone_id, None, SR, 2);
+    let mut chaine =
+        m.orch
+            .load_streaming_dsp(m.zone_id, crate::audio::replaygain::PisteRg::AUCUNE, SR, 2);
     chaine.process(&mut pcm, 16);
     let s = Servi {
         mime: "audio/flac".into(),

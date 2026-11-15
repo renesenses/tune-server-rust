@@ -1783,6 +1783,9 @@ mod signal_path_reaffectation_6044_tests;
 // #5633 — PURE ignore le ReplayGain, et le chemin du signal le dit.
 #[cfg(test)]
 mod signal_path_pure_replaygain_5633_tests;
+// #8689 — le ReplayGain publié par Qobuz / TIDAL dans le chemin du signal.
+#[cfg(test)]
+mod signal_path_replaygain_services_8689_tests;
 // #7632 — l'étape « Correction de pièce » dit si la RI de la zone est appliquée.
 #[cfg(test)]
 mod signal_path_correction_piece_7632_tests;

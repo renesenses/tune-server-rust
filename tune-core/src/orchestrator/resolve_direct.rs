@@ -1555,7 +1555,7 @@ impl PlaybackOrchestrator {
             ..Default::default()
         };
         // #5114 — le porteur d'abord : le flux dit s'il cuit le crossfeed.
-        let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+        let dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr, 2);
         let info = StreamInfo {
             crossfeed: dsp.is_active() && dsp.crossfeed_executable(),
             compensation_db: dsp.compensation_cuite_db(),
@@ -1761,7 +1761,7 @@ impl PlaybackOrchestrator {
             ..Default::default()
         };
         let dsp = (!is_local_output)
-            .then(|| self.load_streaming_dsp(req.zone_id, req.track_id, cadence, 2))
+            .then(|| self.load_streaming_dsp(req.zone_id, req.piste_rg(), cadence, 2))
             .filter(|dsp| dsp.is_active());
         let info = match dsp.as_ref() {
             Some(dsp) => StreamInfo {

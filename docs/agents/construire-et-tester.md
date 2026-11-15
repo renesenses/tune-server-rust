@@ -87,6 +87,14 @@ nohup cargo test -p tune-server --lib <filtre> > target/x.log 2>&1 &
 
 ## Écrire un test dans tune-core
 
+Pour un témoin PCM avec ReplayGain, le dither TPDF dépend du contenu de
+chaque bloc. Comparer le résultat d’un tampon entier à celui de blocs réseau
+par égalité des octets peut donc échouer même avec le bon gain (#8689).
+Comparer chaque échantillon à sa valeur idéale, avec au plus 1 LSB de bruit
+plus 0,5 LSB d’arrondi ; conserver une égalité exacte pour le chemin sans
+traitement. La contre-épreuve doit toujours échouer avec ce même témoin
+lorsque le relais de gain est retiré.
+
 - Les tests de l'orchestrateur sont des modules `#[cfg(test)]` déclarés dans
   `tune-core/src/orchestrator.rs` ; un nouveau fichier de tests doit y être
   déclaré.

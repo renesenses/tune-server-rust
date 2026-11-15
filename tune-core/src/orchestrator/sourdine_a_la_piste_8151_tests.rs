@@ -73,7 +73,14 @@ async fn une_zone_dlna_en_sourdine_ne_repart_jamais_avec_le_son() {
         "http://127.0.0.1:9/stream/8151-zone-podcast.mp3",
     ] {
         let (envoyee, erreur) = orch
-            .send_to_output(udn, &piste(url), None, false, zone_id, None)
+            .send_to_output(
+                udn,
+                &piste(url),
+                None,
+                false,
+                zone_id,
+                crate::audio::replaygain::PisteRg::AUCUNE,
+            )
             .await;
         assert!(envoyee, "la piste doit partir : {erreur:?}");
         assert_eq!(
@@ -121,7 +128,7 @@ async fn une_zone_hors_sourdine_ne_recoit_aucune_sourdine() {
             None,
             false,
             zone_id,
-            None,
+            crate::audio::replaygain::PisteRg::AUCUNE,
         )
         .await;
     assert!(envoyee, "la piste doit partir : {erreur:?}");

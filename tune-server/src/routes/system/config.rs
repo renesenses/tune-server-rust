@@ -498,6 +498,10 @@ pub(super) async fn get_config(
         // ReplayGain application at playback. Off by default: it multiplies
         // every sample, so it must be an explicit choice, never a surprise.
         ("replaygain_mode", json!("off")),
+        (
+            tune_core::audio::replaygain::SERVICES_ENABLED_KEY,
+            json!(false),
+        ),
         ("replaygain_preamp_db", json!(0.0)),
         ("replaygain_prevent_clipping", json!(true)),
         // Plafond dBTP de l'anti-écrêtage (#1694) : 0 (défaut, comportement
@@ -6040,6 +6044,23 @@ mod replaygain_source_tests {
         .await
         .unwrap_or_else(|_| panic!("configuration illisible"))
         .0
+    }
+
+    #[tokio::test]
+    async fn services_replaygain_8689_desactives_par_defaut_et_persistes() {
+        let state = etat();
+        let cle = tune_core::audio::replaygain::SERVICES_ENABLED_KEY;
+        assert_eq!(config_de(&state).await[cle], false);
+        patch(&state, serde_json::json!({cle: true})).unwrap();
+        assert_eq!(config_de(&state).await[cle], true);
+        assert!(tune_core::audio::replaygain::services_enabled(
+            &state.backend
+        ));
+        patch(&state, serde_json::json!({cle: false})).unwrap();
+        assert_eq!(config_de(&state).await[cle], false);
+        assert!(!tune_core::audio::replaygain::services_enabled(
+            &state.backend
+        ));
     }
 
     #[tokio::test]

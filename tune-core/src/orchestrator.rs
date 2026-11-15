@@ -1503,6 +1503,18 @@ impl Drop for LevelsPrewarmScope<'_> {
     }
 }
 
+impl PlayRequest {
+    /// #8689 — la piste dont le ReplayGain s'applique : bibliothèque, ou
+    /// titre Qobuz / TIDAL par son identifiant de service.
+    pub fn piste_rg(&self) -> crate::audio::replaygain::PisteRg<'_> {
+        crate::audio::replaygain::PisteRg::new(
+            self.track_id,
+            self.source.as_deref(),
+            self.source_id.as_deref(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PlayRequest {
     pub zone_id: i64,
