@@ -1,0 +1,49 @@
+# Branche jetable : prouve que les cibles ARM « cross » de release.yml compilent
+# sur le lot gelé rc12 (f26573bab, versé par #8826 ; RC dcd756a51) avant de taguer v1.0.0-rc12.
+# La CI des PR ne construit pas musl. À supprimer après le tag.
+name: Preuve musl v1.0.0-rc12
+on:
+  push:
+    branches: ["test/preuve-musl-rc12-8df74e"]
+permissions:
+  contents: read
+jobs:
+  cross:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
+          - target: aarch64-unknown-linux-gnu
+            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
+    env:
+      TUNE_VERSION: 1.0.0-rc12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-ubuntu-22.04-${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+      - name: Build (cross) — ligne identique à release.yml
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
+      - name: airplay-daemon (meme recette que release.yml, #8112)
+        run: |
+          CROSS=(--cross)
+          python scripts/build-airplay-daemon.py --target ${{ matrix.target }} --output "$RUNNER_TEMP/apd" --work "$RUNNER_TEMP/apd-src" "${CROSS[@]}"
+          file "$RUNNER_TEMP/apd/bin/airplay-daemon"
+          file "$RUNNER_TEMP/apd/bin/airplay-daemon" | grep -q 'ARM aarch64'
+      - run: file target/${{ matrix.target }}/release/tune-server
+      - name: Sortie locale dans l'ELF (garde #3621)
+        run: strings target/${{ matrix.target }}/release/tune-server | grep -q snd_pcm_open
+      - name: Le binaire se declare 1.0.0-rc12
+        run: |
+          n=$(strings target/${{ matrix.target }}/release/tune-server | grep -c '1\.0\.0-rc12' || true)
+          echo "occurrences de 1.0.0-rc12 : $n"
+          test "$n" -gt 0
