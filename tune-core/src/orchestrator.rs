@@ -2734,3 +2734,6 @@ mod deplacement_qobuz_6982_tests;
 // #8188 — plafond 16 bits de la zone sur le bras HTTPS des services (Qobuz).
 #[cfg(test)]
 mod plafond_16_bits_service_8188_tests;
+
+#[cfg(test)]
+mod reprise_dlna_701_8738_tests;
