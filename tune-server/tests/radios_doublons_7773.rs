@@ -208,6 +208,36 @@ async fn scenario(state: AppState) {
         marquees(&favoris)
     );
 
+    // 3 bis. Le client web utilise PUT, pas POST /favorite. Réactiver
+    // puis retirer le cœur doit toucher toutes les anciennes jumelles.
+    for favori in [true, false] {
+        let (status, corps) = envoyer(
+            &app,
+            Request::put(format!("/api/v1/radios/{a}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(json!({"favorite": favori}).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{corps}");
+        let favoris = lire(&app, "/api/v1/radios/favorites").await;
+        assert_eq!(
+            marquees(&favoris).len(),
+            usize::from(favori),
+            "PUT : la jumelle ne doit pas réapparaître après retrait du cœur"
+        );
+        let repo = RadioRepo::with_backend(state.backend.clone());
+        for station in repo.list().unwrap().into_iter().filter(|s| {
+            tune_core::db::radio_repo::cle_du_flux(&s.url)
+                == tune_core::db::radio_repo::cle_du_flux(FLUX)
+        }) {
+            assert_eq!(
+                station.is_favorite, favori,
+                "PUT doit propager le cœur à chaque jumelle"
+            );
+        }
+    }
+
     // 4. Import M3U rejoué (et ligne répétée dans le fichier) : une station.
     let m3u = format!(
         "#EXTM3U\n#EXTINF:-1,Autre 7773\n{FLUX_M3U}\n#EXTINF:-1,Autre 7773 (copie)\n{}\n",

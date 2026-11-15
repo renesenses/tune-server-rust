@@ -2000,7 +2000,11 @@ async fn update_radio(
     }
     if let Some(fav) = body.favorite {
         station.is_favorite = fav;
-        repo.set_favorite(id, fav).ok();
+        if let Err(e) = repo.set_favorite_for_flux(id, fav) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // repo.update ne modifie que les métadonnées, pas is_favorite :
+        // la propagation aux jumelles est donc conservée.
     }
     match repo.update(&station) {
         Ok(()) => {
