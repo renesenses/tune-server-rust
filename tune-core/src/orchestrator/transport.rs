@@ -1408,7 +1408,9 @@ impl PlaybackOrchestrator {
                 resolved.source == "local",
             ),
             genre: track_meta.as_ref().and_then(|t| t.genre.clone()),
-            year: track_meta.as_ref().and_then(|t| t.year),
+            year: track_meta
+                .as_ref()
+                .and_then(|t| crate::db::annee_de_la_piste::pour_affichage(t, &self.db)),
             // L'album et l'artiste par IDENTIFIANT. Sans eux, le client devait
             // deviner l'album depuis son TITRE : cliquer sur « Entreat (2010) »
             // ouvrait la page de The Cure (FabienM, v0.9.102). `track_meta` les

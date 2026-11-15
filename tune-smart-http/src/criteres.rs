@@ -1279,6 +1279,7 @@ pub(crate) mod tests {
 /// playlists du .18 et les formes que l'ancien éditeur écrivait (`equals`,
 /// `gte`, `operator`, `is_empty`, `branch_of`…). Chaque colonne — clause,
 /// tri, borne, refusées — doit ressortir au caractère près.
+/// #8684 : la ligne année suit désormais le repli sur l’album, comme la Bibliothèque.
 ///
 /// Seule retouche voulue depuis : la clause « Favori · est · Piste » (#5997,
 /// forum #2127) départage désormais les éditions par l'album et l'ISRC — la

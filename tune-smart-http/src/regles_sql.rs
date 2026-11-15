@@ -132,7 +132,10 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
         // Une source de SERVICE ne rend rien ici — c'est `source_streaming`
         // qui ajoute les favoris du service au résultat.
         "source" => texte("COALESCE(NULLIF(t.source, ''), 'local')"),
-        "year" => nombre("t.year"),
+        // Go du 13/11 — l'année de la piste, à défaut celle de son album
+        // (lecture seule : rien n'est écrit). `al` est joint par toutes les
+        // requêtes de pistes des playlists ; la sous-requête n'en dépend pas.
+        "year" => nombre(tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE),
         "sample_rate" => nombre("t.sample_rate"),
         "bit_depth" => nombre("t.bit_depth"),
         "duration_ms" | "duration" => nombre("t.duration_ms"),
@@ -851,15 +854,19 @@ mod tests {
         assert!(
             condition(c, ">=", "1969")
                 .unwrap()
-                .contains("t.year >= 1969")
+                .contains(&format!("{} >= 1969", c.sql))
         );
-        assert!(condition(c, "<", "1969").unwrap().contains("t.year < 1969"));
+        assert!(
+            condition(c, "<", "1969")
+                .unwrap()
+                .contains(&format!("{} < 1969", c.sql))
+        );
         // « Contient » sur un nombre porte sur sa forme textuelle : « 202 »
         // trouve une décennie (#1008).
         assert!(
             condition(c, "contains", "202")
                 .unwrap()
-                .contains("CAST(t.year AS TEXT)"),
+                .contains(&format!("CAST({} AS TEXT)", c.sql)),
             "le contains d'un nombre doit passer par le texte"
         );
     }
