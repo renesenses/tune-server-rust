@@ -1284,6 +1284,7 @@ impl PlaybackOrchestrator {
                     pochette: contexte.4.as_deref(),
                 },
                 None,
+                advance_track_id,
             );
         }
 

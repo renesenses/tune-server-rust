@@ -1989,6 +1989,7 @@ impl PlaybackOrchestrator {
                     pochette: context.4.as_deref(),
                 },
                 req.album_ref.as_deref(),
+                req.track_id,
             );
         }
     }
