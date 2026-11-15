@@ -14,14 +14,20 @@
 //! de stations, l'annuaire est en mémoire).
 //!
 //! Critères livrés : `genre` (liste séparée par des virgules), `country` (code
-//! ISO alpha-2), `codec`, `bitrate_min`, `lossless`, `hires` (un flux au-delà
-//! de 48 kHz — la profondeur en bits n'est publiée nulle part), `favorites_only`,
+//! ISO alpha-2), `codec`, `bitrate_min`, `lossless`, `hires` (un flux SANS
+//! PERTE au-delà de 48 kHz, voir [`FluxProfil::est_hires`] — la profondeur en
+//! bits n'est publiée nulle part), `favorites_only`,
 //! `rated_min` (la note moyenne radio-metadata.fr, `avg_rating`) et
 //! `metadata_plus` (la fiche a une clé radio-metadata.fr : le badge Metadata+).
 //! #7718 — `quality_min`, un niveau de qualité de flux sans distinction de
 //! format (voir [`NiveauQualite`]) : la station passe si l'UN de ses flux est
 //! au moins de ce niveau. Un flux sans perte passe tout niveau avec perte,
 //! même sans débit publié, comme dans le rangement des flux du client web.
+//! Recette rc12 (14/11, Rémi) — deux boutons aux termes justes, jugés flux par
+//! flux : `sans_perte` (alias de `lossless`), un flux sans perte par son codec
+//! réel (voir [`est_sans_perte`]) ; `haute_qualite`, un flux sans perte OU d'au
+//! moins 256 kbit/s (voir [`FluxProfil::est_haute_qualite`]) — un FLAC sans
+//! débit publié en est.
 //! `language` n'est PAS proposé : ni l'annuaire ni le catalogue livré ne
 //! portent cette donnée, et un filtre sans donnée écarterait tout.
 
@@ -38,8 +44,12 @@ use super::radios_libelles::{cle_genre, code_pays};
 /// (sans texte) : l'annuaire entier se parcourt par `GET /radios/directory`.
 pub const SUGGESTIONS_MAX: usize = 200;
 
-/// Au-delà, c'est de la haute résolution.
+/// Au-delà, un flux SANS PERTE est de la haute résolution.
 const FREQUENCE_HIRES: i32 = 48_000;
+
+/// Recette rc12 (14/11) — à partir de ce débit (kbit/s, compris), un flux avec
+/// perte est de « haute qualité ».
+const DEBIT_HAUTE_QUALITE: i32 = 256;
 
 /// La fréquence d'un CD, celle que suppose un flux sans perte muet.
 const FREQUENCE_CD: i32 = 44_100;
@@ -85,6 +95,28 @@ struct FluxProfil {
     sans_perte: bool,
     debit: Option<i32>,
     frequence: Option<i32>,
+}
+
+impl FluxProfil {
+    /// Recette rc12 (13/11) — LA définition du Hi-Res d'une radio : un flux
+    /// SANS PERTE (FLAC, ALAC, WAV… selon son codec réel) au-delà de 48 kHz.
+    /// Un MP3 ou un AAC n'est jamais Hi-Res, quels que soient son débit et la
+    /// fréquence que l'annuaire lui prête (« Africa Radio » : MP3 « 192 kHz »,
+    /// « WRSI » : AAC 96 kHz) ; un flux de format inconnu non plus. Avant, la
+    /// station passait sur la plus haute fréquence de N'IMPORTE LEQUEL de ses
+    /// flux, sans regarder le format. La profondeur en bits n'est publiée
+    /// par aucun annuaire : seule la fréquence départage.
+    fn est_hires(&self) -> bool {
+        self.sans_perte && self.frequence.is_some_and(|f| f > FREQUENCE_HIRES)
+    }
+
+    /// Recette rc12 (14/11, Rémi) — « Haute qualité » : un flux sans perte
+    /// (même sans débit publié, ce qui arrive aux FLAC), ou un flux avec perte
+    /// d'au moins 256 kbit/s (MP3 320, AAC 256). Un débit inconnu d'un flux
+    /// avec perte ne prouve rien : le flux n'en est pas.
+    fn est_haute_qualite(&self) -> bool {
+        self.sans_perte || self.debit.is_some_and(|d| d >= DEBIT_HAUTE_QUALITE)
+    }
 }
 
 /// Un nombre JSON, écrit en nombre ou en texte (`4.7` ou `"4.7"`).
@@ -166,7 +198,6 @@ struct Profil<'a> {
     codecs: Vec<String>,
     /// #7718 — chaque flux, jugé un par un.
     flux: Vec<FluxProfil>,
-    frequence_max: Option<i32>,
     note_centiemes: Option<i32>,
     favori: bool,
     metadata_plus: bool,
@@ -182,6 +213,8 @@ pub struct Criteres {
     /// #7718 — `quality_min`.
     pub qualite_min: Option<NiveauQualite>,
     pub sans_perte: bool,
+    /// Recette rc12 (14/11) — `haute_qualite`.
+    pub haute_qualite: bool,
     pub hires: bool,
     pub favoris: bool,
     pub note_min: Option<f64>,
@@ -222,6 +255,7 @@ impl Criteres {
             debit_min: bitrate_min.filter(|b| *b > 0),
             qualite_min: None,
             sans_perte: lossless == Some(true),
+            haute_qualite: false,
             hires: hires == Some(true),
             favoris: favorites_only == Some(true),
             note_min: rated_min.filter(|n| n.is_finite() && *n > 0.0),
@@ -233,6 +267,19 @@ impl Criteres {
     /// [`Self::depuis`].
     pub fn avec_qualite_min(mut self, quality_min: Option<&str>) -> Self {
         self.qualite_min = quality_min.and_then(NiveauQualite::depuis);
+        self
+    }
+
+    /// Recette rc12 (14/11) — les deux boutons `sans_perte` (le même critère
+    /// que `lossless`, l'un ou l'autre suffit) et `haute_qualite`, à part pour
+    /// ne pas allonger [`Self::depuis`].
+    pub fn avec_boutons_rc12(
+        mut self,
+        sans_perte: Option<bool>,
+        haute_qualite: Option<bool>,
+    ) -> Self {
+        self.sans_perte |= sans_perte == Some(true);
+        self.haute_qualite = haute_qualite == Some(true);
         self
     }
 
@@ -273,8 +320,10 @@ impl Criteres {
             && self
                 .qualite_min
                 .is_none_or(|n| p.flux.iter().any(|x| n.atteint(x)))
-            && (!self.sans_perte || p.codecs.iter().any(|c| est_sans_perte(c)))
-            && (!self.hires || p.frequence_max.is_some_and(|f| f > FREQUENCE_HIRES))
+            // Recette rc12 (14/11) — flux par flux, par le codec réel.
+            && (!self.sans_perte || p.flux.iter().any(|x| x.sans_perte))
+            && (!self.haute_qualite || p.flux.iter().any(FluxProfil::est_haute_qualite))
+            && (!self.hires || p.flux.iter().any(FluxProfil::est_hires))
             && (!self.favoris || p.favori)
             && self.note_min.is_none_or(|min| {
                 p.note_centiemes
@@ -368,7 +417,6 @@ fn profil_de_fiche(f: &StationAnnuaire, favori: Option<bool>) -> Profil<'_> {
         pays: f.country.clone(),
         codecs,
         flux,
-        frequence_max: f.flux.iter().filter_map(|x| x.sample_rate).max(),
         note_centiemes: f.note_centiemes,
         favori: favori == Some(true),
         metadata_plus: f.radio_metadata_key.is_some(),
@@ -414,7 +462,6 @@ fn profil_de_station<'a>(st: &'a RadioStation, fiche: Option<&'a StationAnnuaire
         pays: st.country.clone(),
         codecs: codec.map(|c| famille_codec(&c)).into_iter().collect(),
         flux: vec![ecoute],
-        frequence_max: flux.and_then(|x| x.sample_rate),
         note_centiemes: fiche.and_then(|f| f.note_centiemes),
         favori: st.is_favorite,
         metadata_plus: fiche.is_some_and(|f| f.radio_metadata_key.is_some()),

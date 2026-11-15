@@ -156,7 +156,15 @@ pub fn lire(db: &Arc<dyn DbBackend>) -> Option<ArretProgramme> {
         }
     };
     match serde_json::from_str::<ArretProgramme>(&brut) {
-        Ok(r) => Some(r),
+        // Relu par `valider` : un réglage écrit à côté de la route (import,
+        // base éditée) ne vaut pas plus qu'un réglage reçu.
+        Ok(r) => match r.valider() {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!(error = %e, "scheduled_stop_invalid");
+                None
+            }
+        },
         Err(e) => {
             warn!(error = %e, "scheduled_stop_unreadable");
             None

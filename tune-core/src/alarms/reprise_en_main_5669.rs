@@ -113,8 +113,10 @@ impl Banc {
     fn reveil(&self, id: i64) -> serde_json::Value {
         self.db
             .execute(
-                "INSERT INTO alarms (id, name, time, zone_id, source_type, source_id, volume, fade_duration_s, enabled, one_shot, days_of_week) \
-                 VALUES (?, 'Réveil', '10:42', ?, 'radio', 'http://127.0.0.1:9/franceinter-hifi.aac', 0.5, 0, '1', 0, '1111111')",
+                // #8615 : option « Interrompre la lecture en cours » DÉCOCHÉE —
+                // la règle de #5669 que gardent ces tests.
+                "INSERT INTO alarms (id, name, time, zone_id, source_type, source_id, volume, fade_duration_s, enabled, one_shot, days_of_week, interrupt_playback) \
+                 VALUES (?, 'Réveil', '10:42', ?, 'radio', 'http://127.0.0.1:9/franceinter-hifi.aac', 0.5, 0, '1', 0, '1111111', 0)",
                 &[&id as &dyn ToSqlValue, &self.zone_id],
             )
             .unwrap();

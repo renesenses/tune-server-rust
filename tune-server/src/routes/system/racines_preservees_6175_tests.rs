@@ -31,7 +31,11 @@ fn erreur(result: Result<impl IntoResponse, AppError>) {
 #[tokio::test]
 async fn une_valeur_illisible_reste_intacte_apres_ajout_et_retrait_6175() {
     let state = etat();
-    let dir = tempfile::tempdir().unwrap();
+    // Sécurité — `tempdir()` tombe sous `/var/folders` sur macOS,
+    // arbre système refusé comme racine : le dossier vit sous le répertoire
+    // courant, comme le banc #8083.
+    let dir =
+        tune_core::test_scratch::scratch_dir_in(std::env::current_dir().unwrap(), "racines-6175");
     let path = dir.path().to_str().unwrap();
     for invalide in ["[\"racine-privee\",", "null", "{}", "[42]", "\"/musique\""] {
         reglages(&state).set("music_dirs", invalide).unwrap();
@@ -51,7 +55,11 @@ async fn une_valeur_illisible_reste_intacte_apres_ajout_et_retrait_6175() {
 #[tokio::test]
 async fn une_erreur_sql_de_lecture_refuse_les_deux_modifications_6175() {
     let state = etat();
-    let dir = tempfile::tempdir().unwrap();
+    // Sécurité — `tempdir()` tombe sous `/var/folders` sur macOS,
+    // arbre système refusé comme racine : le dossier vit sous le répertoire
+    // courant, comme le banc #8083.
+    let dir =
+        tune_core::test_scratch::scratch_dir_in(std::env::current_dir().unwrap(), "racines-6175");
     let path = dir.path().to_str().unwrap();
     reglages(&state)
         .set("music_dirs", "[\"/musique\"]")
@@ -81,7 +89,11 @@ async fn une_erreur_sql_de_lecture_refuse_les_deux_modifications_6175() {
 #[tokio::test]
 async fn une_erreur_sql_d_ecriture_ne_repond_pas_succes_6175() {
     let state = etat();
-    let dir = tempfile::tempdir().unwrap();
+    // Sécurité — `tempdir()` tombe sous `/var/folders` sur macOS,
+    // arbre système refusé comme racine : le dossier vit sous le répertoire
+    // courant, comme le banc #8083.
+    let dir =
+        tune_core::test_scratch::scratch_dir_in(std::env::current_dir().unwrap(), "racines-6175");
     let path = dir.path().to_str().unwrap();
     let valeur = "[\"/musique\",\"/autre\"]";
     reglages(&state).set("music_dirs", valeur).unwrap();
@@ -99,7 +111,11 @@ async fn une_erreur_sql_d_ecriture_ne_repond_pas_succes_6175() {
 #[tokio::test]
 async fn un_ajout_deja_present_et_un_retrait_gardent_les_autres_racines_6175() {
     let state = etat();
-    let dir = tempfile::tempdir().unwrap();
+    // Sécurité — `tempdir()` tombe sous `/var/folders` sur macOS,
+    // arbre système refusé comme racine : le dossier vit sous le répertoire
+    // courant, comme le banc #8083.
+    let dir =
+        tune_core::test_scratch::scratch_dir_in(std::env::current_dir().unwrap(), "racines-6175");
     let path = dir.path().to_str().unwrap();
     let normalise = tune_core::scanner::walker::normalize_path(path);
     let autre = tune_core::scanner::walker::normalize_path("/autre-musique");

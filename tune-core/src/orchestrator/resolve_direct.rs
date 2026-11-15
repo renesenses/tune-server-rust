@@ -229,6 +229,15 @@ impl PlaybackOrchestrator {
         file_path: &str,
         req: &PlayRequest,
     ) -> Result<ResolvedStream, String> {
+        // Sécurité — un fichier « téléversé » ne se lit QUE dans le
+        // dossier des téléversements. Le chemin vient du client
+        // (`temp_file_path`, ou `source_id` d'une entrée `upload`) : sans
+        // cette garde, n'importe quel fichier audio de la machine se jouait.
+        let racine = crate::chemins_de_travail::racine_des_televersements();
+        if crate::chemin_sur::racine_contenante(file_path, &[racine.to_string_lossy()]).is_err() {
+            warn!(file = %file_path, "uploaded_file_outside_upload_dir");
+            return Err(format!("uploaded file not found: {file_path}"));
+        }
         let path = std::path::Path::new(file_path);
         if !path.exists() {
             return Err(format!("uploaded file not found: {file_path}"));
@@ -586,7 +595,9 @@ impl PlaybackOrchestrator {
         let raw_url = url_retenue
             .as_deref()
             .or(req.source_id.as_deref())
-            .ok_or("source_id (audio URL) required for podcast/radio playback")?;
+            .ok_or("source_id (audio URL) required for podcast/radio playback")?
+            // Sécurité — la valeur VÉRIFIÉE est celle qui part.
+            .trim();
         // Une piste indexée dont l'instantané ne porte aucune URL jouable ne
         // doit pas partir « au cas où » : `source_id` est alors le condensat
         // d'identité, et le pousser à une sortie produirait une erreur de
@@ -599,6 +610,18 @@ impl PlaybackOrchestrator {
                  (POST /network/media-servers/<id>/indexer) la rétablira.",
                 req.title.as_deref().unwrap_or("cette piste")
             ));
+        }
+        // Sécurité — `podcast`, `radio` et `bandcamp` (et toute
+        // source qui passe par ici) : le `source_id` vient du client, et une
+        // sortie AirPlay, Sendspin ou locale lit un chemin nu ou un `file://`
+        // comme un fichier de la machine. Seule une adresse http(s) part.
+        if !est_une_url_http(raw_url) {
+            warn!(
+                zone_id = req.zone_id,
+                source = %source_apparente,
+                "lecture_directe_refusee_hors_http"
+            );
+            return Err(refus_hors_http(&source_apparente));
         }
         // Au niveau INFO, donc visible avec le `log_level` ordinaire : c'est la
         // ligne qui dit, pour une piste indexée, D'OÙ vient l'adresse jouée.
@@ -761,6 +784,16 @@ impl PlaybackOrchestrator {
             None
         };
         let audio_url: &str = bc_url_resignee.as_deref().unwrap_or(audio_url);
+        // Sécurité — ni une liste m3u/pls distante, ni une page
+        // Bandcamp, ni sa resignature ne peuvent ramener un chemin local.
+        if !est_une_url_http(audio_url) {
+            warn!(
+                zone_id = req.zone_id,
+                source = %source,
+                "lecture_directe_refusee_hors_http_apres_resolution"
+            );
+            return Err(refus_hors_http(&source));
+        }
 
         let is_local_output = req
             .output_device_id
@@ -2753,9 +2786,14 @@ pub(crate) const CLE_URL_DE_LECTURE_UPNP: &str = "upnp_res_url";
 /// Le seul test qui sépare une URL de lecture du CONDENSAT D'IDENTITÉ que
 /// `tracks.source_id` porte depuis la phase 2 (`uuid:…|9f3c…`). Sans lui, le
 /// condensat partirait à la sortie comme s'il était une adresse.
+/// Sécurité — le refus d'une source directe qui n'est pas une
+/// adresse http(s). Le texte ne répète pas la valeur reçue.
+pub(crate) fn refus_hors_http(source: &str) -> String {
+    format!("Lecture impossible : la source « {source} » n'accepte qu'une adresse http(s).")
+}
+
 pub(crate) fn est_une_url_http(valeur: &str) -> bool {
-    let v = valeur.trim();
-    (v.starts_with("http://") || v.starts_with("https://")) && v.len() > "https://".len()
+    crate::chemin_sur::est_une_adresse_http(valeur)
 }
 
 #[cfg(test)]

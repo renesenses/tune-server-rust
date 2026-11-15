@@ -363,6 +363,9 @@ impl PlaybackOrchestrator {
         // #8088 — un contenu marqué explicite, pour un profil dont la
         // politique parentale le masque : rien ne part.
         self.verifier_le_contenu_explicite(&req).await?;
+        // #8611 — une piste d'un artiste bloqué par la politique parentale
+        // du profil : rien ne part.
+        self.verifier_l_artiste_bloque(&req).await?;
 
         // Re-tap dedup (#1271): a controller (Flutter/web) can emit `play` TWICE
         // for the SAME track a few seconds apart. The first play already sent
@@ -1405,7 +1408,9 @@ impl PlaybackOrchestrator {
                 resolved.source == "local",
             ),
             genre: track_meta.as_ref().and_then(|t| t.genre.clone()),
-            year: track_meta.as_ref().and_then(|t| t.year),
+            year: track_meta
+                .as_ref()
+                .and_then(|t| crate::db::annee_de_la_piste::pour_affichage(t, &self.db)),
             // L'album et l'artiste par IDENTIFIANT. Sans eux, le client devait
             // deviner l'album depuis son TITRE : cliquer sur « Entreat (2010) »
             // ouvrait la page de The Cure (FabienM, v0.9.102). `track_meta` les
@@ -1986,6 +1991,7 @@ impl PlaybackOrchestrator {
                     pochette: context.4.as_deref(),
                 },
                 req.album_ref.as_deref(),
+                req.track_id,
             );
         }
     }
@@ -2077,6 +2083,9 @@ impl PlaybackOrchestrator {
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(req.zone_id, "stopped")
             .ok();
+        // #8701 — la résolution vient d'épingler le fMP4 : la zone arrêtée
+        // ne le retient plus.
+        crate::audio::dash_epingles::liberer_la_zone(req.zone_id);
     }
 
     /// Donne au crête-mètre de la zone le gain que la sortie applique
@@ -2174,12 +2183,19 @@ impl PlaybackOrchestrator {
         //
         // `origin_host`, lui, reste absent : rien ne le persiste, et l'inventer
         // serait pire que de le laisser vide.
-        let (exclusive_mode, audio_backend) = self.reglages_sortie_locale();
+        let (exclusif_machine, audio_backend) = self.reglages_sortie_locale();
+        // #3245 — la zone de cet appareil décide (#8348), la machine en repli :
+        // sans cette ligne, la sortie recréée reprenait le mode de MACHINE, et
+        // une zone réglée « partagé » repartait en exclusif.
+        let exclusif_de_zone =
+            self.exclusif_de_la_sortie_recreee(device_id, &audio_backend, exclusif_machine);
+        let exclusive_mode = exclusif_de_zone.demande;
         let endpoint_id = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .endpoint_id_de_la_sortie(device_id);
         info!(
             device_id,
             exclusive_mode,
+            exclusif_par_la_zone = exclusif_de_zone.par_la_zone,
             audio_backend = %audio_backend,
             endpoint_id = endpoint_id.as_deref().unwrap_or("<aucun>"),
             "output_not_found_recreating_local_output"
@@ -2406,8 +2422,8 @@ impl PlaybackOrchestrator {
                     // `None` sous PURE, sans Premium, sans greffon installé,
                     // désactivé (défaut) ou sans test de la machine. La sortie
                     // le lit à l'ouverture de CETTE piste, jamais pendant.
-                    local_output.set_surechantillonnage(
-                        self.choix_du_surechantillonneur(zone_id, zone_audiophile),
+                    local_output.set_decision_surechantillonnage(
+                        self.decision_du_surechantillonneur(zone_id, zone_audiophile),
                     );
                     // Zone equalizer, applied by the output itself for a local
                     // DAC — exactly like the crossfeed above, and for the same
@@ -3267,6 +3283,20 @@ impl PlaybackOrchestrator {
                  interdit par le contrôle parental de ce profil"
             );
         }
+        // #8611 — la politique du profil ne se relit pas : la file s'arrête.
+        if cause.contains(crate::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE) {
+            return format!(
+                "Impossible de lire la piste {geste} : la politique de contrôle \
+                 parental de ce profil est illisible"
+            );
+        }
+        // #8611 — de même pour un artiste bloqué.
+        if cause.contains(crate::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE) {
+            return format!(
+                "Impossible de lire la piste {geste} : artiste bloqué par le \
+                 contrôle parental de ce profil"
+            );
+        }
         // #8227 — fil 2723 : « Suivant » a enjambé les 8 titres restants d'un
         // album, tous refusés par le service, et l'auditeur lisait « ce titre
         // n'est pas disponible », comme si un seul titre manquait. La file
@@ -3867,6 +3897,12 @@ impl PlaybackOrchestrator {
         self.annuler_preparation_fichier(zone_id).await;
         self.cleanup_gapless_session(zone_id).await;
         self.prefetch.clear().await;
+        // #8701 — zone arrêtée : `stop` (geste, fin de file, file vidée,
+        // suppression), une pause qui ne trouve rien à mettre en pause, une
+        // zone cédée à un tiers. Ses fMP4 DASH redeviennent nettoyables. Une
+        // pause ordinaire ne passe pas ici et garde le fichier pour la
+        // reprise.
+        crate::audio::dash_epingles::liberer_la_zone(zone_id);
         // Forget the last network-play record so a stop→replay of the SAME track
         // is not mistaken for the duplicate-send it guards against (play_inner).
         self.last_net_play.lock().await.remove(&zone_id);

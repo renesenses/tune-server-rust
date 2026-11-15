@@ -49,6 +49,24 @@ async fn statut_complet(state: &AppState) -> Value {
         );
         qualite.insert("reason_key".into(), json!(CLE_RAISON_DU_PLAFOND));
     }
+    // #8565 (décision du 13/11) — Spotify refuse les clés audio du compte :
+    // la phrase, dans la langue de l'interface, à côté du code stable.
+    if statut.get("receiver_error_code").and_then(Value::as_str)
+        == Some(tune_core::streaming::spotify_connect::CODE_CLES_AUDIO_REFUSEES)
+        && let Some(objet) = statut.as_object_mut()
+    {
+        objet.insert(
+            "receiver_error_message".into(),
+            json!(crate::message_api::texte(
+                crate::routes::playback::CLE_CLES_AUDIO_REFUSEES,
+                &[]
+            )),
+        );
+        objet.insert(
+            "receiver_error_key".into(),
+            json!(crate::routes::playback::CLE_CLES_AUDIO_REFUSEES),
+        );
+    }
     statut
 }
 

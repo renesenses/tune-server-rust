@@ -3328,6 +3328,13 @@ impl OutputTarget for DlnaOutput {
         let response = self
             .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
             .await?;
+        if faute_commande_soap(&response) && est_701(&response) {
+            // #8738 — après un redémarrage, le renderer peut avoir perdu
+            // l'URI alors que Tune conserve encore sa session de flux.
+            // Le refus reste un refus ; l'orchestrateur rétablit UNE fois
+            // le titre à sa position par son chemin de session perdue.
+            self.arrete_au_lieu_de_pause.store(true, Ordering::SeqCst);
+        }
         acquitter_commande_soap("Play", response)
     }
 

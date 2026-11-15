@@ -277,6 +277,16 @@ async fn hqp_play(
     State(state): State<AppState>,
     Json(body): Json<HqpPlayRequest>,
 ) -> impl IntoResponse {
+    // Sécurité — HQPlayer tourne souvent sur la machine du
+    // serveur : un chemin nu lui ferait lire n'importe quel fichier audio de
+    // l'hôte. Cette route n'envoie qu'une adresse http(s).
+    if !tune_core::chemin_sur::est_une_adresse_http(&body.uri) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "uri must be an http(s) address" })),
+        )
+            .into_response();
+    }
     let (host, port, _) = hqp_settings(&state);
 
     // Create a temporary output to send commands
@@ -288,7 +298,7 @@ async fn hqp_play(
     );
 
     let media = tune_core::outputs::traits::PlayMedia {
-        url: &body.uri,
+        url: body.uri.trim(),
         ..Default::default()
     };
 

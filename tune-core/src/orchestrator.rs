@@ -2068,6 +2068,10 @@ impl PlaybackOrchestrator {
     const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
 }
 
+// #8611 — contrôle parental : refus de lecture des artistes bloqués.
+pub mod artiste_bloque_8611;
+#[cfg(test)]
+mod artiste_bloque_8611_tests;
 pub mod bail_parental_7974;
 #[cfg(test)]
 mod bail_parental_7974_tests;
@@ -2452,6 +2456,14 @@ mod tidal_aac_annonce_6334_tests;
 /// un faux renderer DLNA : durée de chaque étape et borne du démarrage.
 #[cfg(test)]
 mod tidal_cd_dash_jusqu_au_play_7266;
+/// #7266 — sortie locale ou OAAT : la première note sans attendre la fin du
+/// téléchargement DASH.
+#[cfg(test)]
+mod tidal_premiere_note_7266_tests;
+/// #8701 — un saut dans une piste TIDAL DASH reprend le fichier (après le TTL
+/// du cache d'URL) ou le téléchargement en cours (sans en attendre la fin).
+#[cfg(test)]
+mod tidal_saut_8701_tests;
 
 /// #6401 — le préchargement sans blanc et la sonde de niveaux après une
 /// avance sans blanc passent par le même repli Qobuz en 16/44,1 que la
@@ -2686,6 +2698,10 @@ mod profondeur_annoncee_egale_profondeur_ecrite;
 #[cfg(test)]
 mod recreation_locale_guard;
 
+// #3245 — la sortie recréée à la volée suit le réglage de sa zone.
+#[cfg(test)]
+mod recreation_exclusif_zone_3245_tests;
+
 #[cfg(test)]
 mod adoption_du_flux_pre_arme_3442;
 
@@ -2718,3 +2734,6 @@ mod deplacement_qobuz_6982_tests;
 // #8188 — plafond 16 bits de la zone sur le bras HTTPS des services (Qobuz).
 #[cfg(test)]
 mod plafond_16_bits_service_8188_tests;
+
+#[cfg(test)]
+mod reprise_dlna_701_8738_tests;

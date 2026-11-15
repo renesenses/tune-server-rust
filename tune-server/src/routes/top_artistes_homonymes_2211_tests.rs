@@ -181,3 +181,43 @@ async fn la_limite_compte_des_artistes_et_non_des_fiches() {
     assert_eq!(top[0]["name"], "Ella Fitzgerald 2211");
     assert_eq!(top[1]["name"], "Oscar Peterson 2211");
 }
+
+/// #8645 — ni l'émission d'un podcast (écrite en `artist_name` depuis
+/// #7965), ni l'interprète du titre ICY d'une ancienne ligne de radio ne
+/// sont des « artistes les plus écoutés » (portraits de l'accueil, rangée de
+/// la Recherche). La route ne filtrait aucune source.
+#[tokio::test]
+async fn ni_podcast_ni_radio_dans_les_artistes_les_plus_ecoutes_8645() {
+    let state = serveur();
+    ecoutes(&state, "Interprète 8645", 2);
+    for (artiste, source, n) in [
+        ("Émission 8645", "podcast", 6),
+        ("Interprète ICY 8645", "radio", 4),
+    ] {
+        for _ in 0..n {
+            state
+                .backend
+                .execute(
+                    &format!(
+                        "INSERT INTO listen_history (title, artist_name, album_title, source, duration_ms) \
+                         VALUES ('Épisode', '{artiste}', '{artiste}', '{source}', 1800000)"
+                    ),
+                    &[],
+                )
+                .unwrap();
+        }
+    }
+
+    let top = top(state, 20).await;
+    assert!(
+        lignes_de(&top, "Émission 8645").is_empty(),
+        "podcast classé : {top:?}"
+    );
+    assert!(
+        lignes_de(&top, "Interprète ICY 8645").is_empty(),
+        "radio classée : {top:?}"
+    );
+    let interprete = lignes_de(&top, "Interprète 8645");
+    assert_eq!(interprete.len(), 1, "{top:?}");
+    assert_eq!(interprete[0]["plays"], 2);
+}

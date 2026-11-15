@@ -7082,6 +7082,7 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
             None,
             crate::orchestrator::ContexteEcoute::default(),
             album_ref,
+            None,
         );
         // #7852 : l'écoute armée est écrite au seuil, réputé franchi ici.
         assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
@@ -7134,6 +7135,49 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
     );
 }
 
+/// #8714 — l'écoute d'une piste de la bibliothèque écrit sa `track_id` :
+/// sans elle, le compte se rapprochait par titre + interprète et toutes les
+/// copies du titre (autres albums, compilations) montaient ensemble.
+#[tokio::test]
+async fn record_listen_ecrit_la_piste_ecoutee_8714() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Zone 8714", None, None)
+        .unwrap();
+    let mut piste = crate::db::models::Track::new("Homburg".to_string());
+    piste.file_path = Some("/musique/homburg-8714.flac".into());
+    let track_id = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone())
+        .create(&piste)
+        .unwrap();
+    orch.record_listen(
+        "Homburg",
+        Some("Procol Harum"),
+        Some("Procol Harum"),
+        "local",
+        None,
+        None,
+        180_000,
+        zone_id,
+        None,
+        None,
+        crate::orchestrator::ContexteEcoute::default(),
+        None,
+        Some(track_id),
+    );
+    assert!(orch.ecrire_l_ecoute_en_attente(zone_id));
+    let ecrite = orch
+        .db
+        .query_one("SELECT track_id FROM listen_history LIMIT 1", &[])
+        .ok()
+        .flatten()
+        .and_then(|cols| cols.first().and_then(|v| v.as_i64()));
+    assert_eq!(
+        ecrite,
+        Some(track_id),
+        "#8714 : la piste écoutée n'est pas écrite"
+    );
+}
+
 #[tokio::test]
 async fn test_record_listen() {
     use crate::db::history_repo::HistoryRepo;
@@ -7163,6 +7207,7 @@ async fn test_record_listen() {
             titre: Some("Les indispensables"),
             pochette: None,
         },
+        None,
         None,
     );
     // #7852 : rien n'est écrit avant le seuil ; réputé franchi ici, le test
@@ -7873,8 +7918,29 @@ async fn un_televersement_illisible_est_refuse_avant_toute_session() {
     // #3030 — `test_scratch` et rien d'autre : le nettoyage passe par `Drop`,
     // donc il a lieu même si l'assertion ci-dessous panique.
     let dossier = crate::test_scratch::scratch_dir("3270-televersement");
-    let wma = dossier.join("concert.wma");
+    let _ = &dossier;
+    // Sécurité — un téléversement ne se lit que dans le dossier des
+    // téléversements : les fichiers du banc y sont déposés, sous un nom unique.
+    let televersements = crate::chemins_de_travail::racine_des_televersements();
+    std::fs::create_dir_all(&televersements).unwrap();
+    let unique = format!("banc-3270-{}-{}", std::process::id(), line!());
+    let wma = televersements.join(format!("{unique}.wma"));
     std::fs::write(&wma, b"pas de l'audio lisible").unwrap();
+    let flac_depose = televersements.join(format!("{unique}.flac"));
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        &flac_depose,
+    )
+    .unwrap();
+    struct Menage(Vec<std::path::PathBuf>);
+    impl Drop for Menage {
+        fn drop(&mut self) {
+            for f in &self.0 {
+                let _ = std::fs::remove_file(f);
+            }
+        }
+    }
+    let _menage = Menage(vec![wma.clone(), flac_depose.clone()]);
 
     let req = requete_locale_3234(21, 1);
     // `expect_err` demanderait `ResolvedStream: Debug`, qu'il n'implémente
@@ -7897,8 +7963,10 @@ async fn un_televersement_illisible_est_refuse_avant_toute_session() {
 
     // CONTRE-ÉPREUVE : un vrai FLAC, lui, est résolu. Sans elle, un refus qui
     // rejetterait TOUT resterait vert et le téléversement serait mort.
-    let flac = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac");
-    let Ok(resolu) = orch.resolve_uploaded_file(flac, &req).await else {
+    let Ok(resolu) = orch
+        .resolve_uploaded_file(flac_depose.to_str().unwrap(), &req)
+        .await
+    else {
         panic!("un FLAC téléversé doit toujours se lire");
     };
     assert_eq!(resolu.source, "upload");
@@ -11048,6 +11116,28 @@ async fn une_session_retiree_sans_abandon_pendant_l_envoi_n_arrete_rien_6658() {
 }
 
 #[tokio::test]
+async fn diagnostic_8259_frequence_fixe_8428_conserve_le_refus() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Fixed PCM", Some("local"), Some("local:8428"))
+        .unwrap();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(&crate::audio::frequence_fixe::cle_de_zone(zone_id), "48000")
+        .unwrap();
+    let refus = orch
+        .decision_du_surechantillonneur(zone_id, false)
+        .err()
+        .unwrap();
+    assert_eq!(
+        refus,
+        crate::audio::surechantillonnage::Ecarte::FrequenceFixe
+    );
+    assert_eq!(refus.code(), "fixed_rate");
+    assert!(orch.choix_du_surechantillonneur(zone_id, false).is_none());
+}
+
+#[tokio::test]
 async fn frequence_fixe_8428_services_traverse_les_familles() {
     let orch = test_orchestrator();
     let zones = ZoneRepo::with_backend(orch.db.clone());
@@ -11724,4 +11814,87 @@ async fn remplacer_la_lecture_d_une_zone_dlna_ferme_le_flux_remplace_8404() {
         url.contains(&sid_portable),
         "le renderer doit avoir reçu le flux du portable : {url}"
     );
+}
+
+/// Sécurité — un « téléversement » hors du dossier des
+/// téléversements n'est jamais lu, même s'il existe et qu'il est lisible.
+#[tokio::test]
+async fn un_televersement_hors_du_dossier_des_televersements_est_refuse() {
+    let orch = test_orchestrator();
+    let req = requete_locale_3234(22, 1);
+    let flac = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac");
+    assert!(std::path::Path::new(flac).is_file());
+    let racine = crate::chemins_de_travail::racine_des_televersements();
+    let remontee = format!(
+        "{}/../../{}",
+        racine.display(),
+        flac.trim_start_matches('/')
+    );
+    for chemin in [flac.to_string(), remontee] {
+        let Err(erreur) = orch.resolve_uploaded_file(&chemin, &req).await else {
+            panic!("{chemin} est hors du dossier des téléversements et a été lu");
+        };
+        assert!(erreur.starts_with("uploaded file not found"), "{erreur}");
+    }
+}
+
+/// Sécurité (B2) — `podcast`, `radio`, `bandcamp` et `upnp` :
+/// un `source_id` client qui n'est pas une adresse http(s) ne part jamais
+/// vers une sortie. AirPlay, Sendspin et la sortie locale ouvrent un chemin
+/// nu ou un `file://` comme un fichier de la machine.
+#[tokio::test]
+async fn une_source_directe_ne_lit_jamais_un_fichier_local() {
+    let orch = test_orchestrator();
+    let flac = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac");
+    assert!(std::path::Path::new(flac).is_file());
+    for source in ["podcast", "radio", "bandcamp", "upnp"] {
+        for source_id in [
+            flac.to_string(),
+            format!("file://{flac}"),
+            format!("  {flac}"),
+            format!("FILE://{flac}"),
+            "C:\\Users\\x\\prive.flac".to_string(),
+            "ftp://exemple.org/a.flac".to_string(),
+            "http://".to_string(),
+        ] {
+            let req = super::PlayRequest {
+                zone_id: 31,
+                source: Some(source.into()),
+                source_id: Some(source_id.clone()),
+                title: Some("x".into()),
+                ..Default::default()
+            };
+            let Err(erreur) = orch.resolve_stream(&req).await else {
+                panic!("{source} / {source_id:?} : un fichier local a été résolu pour la lecture");
+            };
+            assert!(
+                !erreur.contains("test.flac"),
+                "le refus ne doit pas répéter le chemin : {erreur}"
+            );
+        }
+    }
+}
+
+/// Contre-épreuve de B2 : une adresse http(s) passe toujours (sans quoi le
+/// refus pourrait tout rejeter et rester vert).
+#[tokio::test]
+async fn une_source_directe_http_reste_jouable() {
+    let orch = test_orchestrator();
+    for source in ["podcast", "radio"] {
+        let req = super::PlayRequest {
+            zone_id: 32,
+            source: Some(source.into()),
+            source_id: Some("  http://127.0.0.1:9/flux.mp3".into()),
+            title: Some("x".into()),
+            ..Default::default()
+        };
+        let Ok(resolu) = orch.resolve_stream(&req).await else {
+            panic!("{source} : une adresse http doit rester jouable");
+        };
+        let vue = resolu
+            .origin_url
+            .clone()
+            .unwrap_or_else(|| resolu.url.clone());
+        assert!(vue.starts_with("http"), "valeur rognée attendue : {vue:?}");
+    }
 }

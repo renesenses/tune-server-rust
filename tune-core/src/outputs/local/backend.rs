@@ -398,6 +398,7 @@ pub(super) struct BackendCpal<'a> {
     /// #7614 — la cadence ouverte POUR le greffon de suréchantillonnage,
     /// quand il a négocié une cadence et que le flux s'y est ouvert.
     cadence_du_surechantillonneur: Option<u32>,
+    refus_du_surechantillonneur: Option<&'static str>,
     /// #6132 — l'hôte ouvert, pour ouvrir la seconde sortie sur le même.
     host: cpal::Host,
     /// #6132 — ce que le rappel `f32` de A consulte à chaque période.
@@ -417,6 +418,14 @@ impl BackendCpal<'_> {
     pub(super) fn cadence_du_surechantillonneur(&self) -> Option<u32> {
         self.cadence_du_surechantillonneur
             .filter(|&c| c == self.sortie.cadence)
+    }
+
+    pub(super) fn refus_du_surechantillonneur(&self) -> Option<&'static str> {
+        if self.cadence_du_surechantillonneur().is_some() {
+            None
+        } else {
+            self.refus_du_surechantillonneur
+        }
     }
 
     /// #6132 — ouvrir les sorties suiveuses et y recopier ce que A joue,
@@ -624,6 +633,7 @@ impl<'a> BackendCpal<'a> {
         demande: &DemandeDOuverture<'a>,
         surechantillonnage: Option<&crate::audio::surechantillonnage::ChoixSurechantillonnage>,
     ) -> Result<Self, RefusDOuverture> {
+        let mut refus_du_surechantillonneur = surechantillonnage.map(|_| "output_rate_open_failed");
         let device_name = demande.device_name.to_string();
         let sample_rate = demande.spec.cadence();
         let channels = demande.spec.canaux();
@@ -762,6 +772,7 @@ impl<'a> BackendCpal<'a> {
                         },
                     )
                     .inspect_err(|refus| {
+                        refus_du_surechantillonneur = Some(refus.code());
                         // #8149 — la raison du refus, et ce que cpal
                         // énumère : sans elles, un « non appliqué » de
                         // terrain ne se départage pas.
@@ -1251,6 +1262,7 @@ impl<'a> BackendCpal<'a> {
             starvation,
             position_ms: demande.position_ms,
             cadence_du_surechantillonneur,
+            refus_du_surechantillonneur,
             host,
             recopie,
             recopie_possible,

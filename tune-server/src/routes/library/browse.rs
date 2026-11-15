@@ -178,6 +178,11 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
 /// s'arrêtait là (retour Yves Corbat, NAS Synology en SMB).
 ///
 /// Renvoie le chemin absolu qui existe réellement, ou `None`.
+/// Sécurité — l'unique message de refus de `GET
+/// /library/browse/dir` : chemin vide, relatif, porteur de `..`, hors des
+/// dossiers de musique ou absent du disque, la réponse est la même.
+pub(crate) const REFUS_DE_PARCOURS: &str = "path not under a configured music directory";
+
 fn resolve_browse_path(raw: &str) -> Option<String> {
     let base = tune_core::scanner::walker::normalize_path(raw);
     let nfc: String = base.nfc().collect();
@@ -267,13 +272,12 @@ fn est_un_dossier(entry: &std::fs::DirEntry) -> bool {
 /// Le corps de `GET /library/browse/dir`, exécuté HORS de l'exécuteur (#5677).
 fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Value, AppError> {
     let debut = std::time::Instant::now();
-    let normalized_query =
-        resolve_browse_path(&q.path).ok_or_else(|| AppError::bad_request("invalid path"))?;
-    let resolved = std::path::Path::new(&normalized_query);
-
-    // Verify path is under a configured music dir.
-    // Use std::path::Path::starts_with for OS-aware prefix matching
-    // (handles both `/` and `\` separators on Windows).
+    // Sécurité — l'appartenance à un dossier de musique est
+    // tranchée AVANT tout accès au disque, sur le texte demandé (rogné et
+    // replié en NFC), et chaque refus porte le MÊME message : sans quoi
+    // « n'existe pas » et « existe hors de la bibliothèque » se distinguent,
+    // et la route devient un oracle d'existence pour toute la machine.
+    let refus = || AppError::bad_request(REFUS_DE_PARCOURS);
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let dirs: Vec<String> = settings
         .get("music_dirs")
@@ -281,24 +285,36 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| state.config.music_dirs.clone());
-    // Comparaison sur une forme Unicode commune : le chemin résolu peut être en
-    // NFD (ce qu'expose le partage SMB) alors que le dossier musical configuré
-    // est en NFC. Sans cela, un chemin pourtant valide était déclaré hors des
-    // dossiers musicaux — le même défaut que la résolution ci-dessus, une ligne
-    // plus loin.
-    let resolved_nfc: String = normalized_query.nfc().collect();
-    let resolved_nfc = std::path::Path::new(&resolved_nfc);
-    let music_root = dirs.iter().find(|d| {
-        let norm_dir: String = tune_core::scanner::walker::normalize_path(d)
-            .nfc()
-            .collect();
-        resolved_nfc.starts_with(&norm_dir)
-    });
-    let Some(music_root) = music_root else {
-        return Err(AppError::bad_request(
-            "path not under a configured music directory",
-        ));
+    // Comparaison sur une forme Unicode commune : le chemin demandé peut être
+    // en NFD (ce qu'expose le partage SMB) alors que le dossier musical
+    // configuré est en NFC.
+    let racines_nfc: Vec<String> = dirs
+        .iter()
+        .map(|d| {
+            tune_core::scanner::walker::normalize_path(d)
+                .nfc()
+                .collect()
+        })
+        .collect();
+    let racine_de = |chemin: &str| -> Option<usize> {
+        let nfc: String = chemin.nfc().collect();
+        tune_core::chemin_sur::racine_contenante(&nfc, &racines_nfc)
+            .ok()
+            .and_then(|r| racines_nfc.iter().position(|x| x == r))
     };
+    let demande = tune_core::scanner::walker::normalize_path(&q.path);
+    if racine_de(&demande).is_none() {
+        return Err(refus());
+    }
+    // Seulement maintenant, le disque : la forme (NFC, NFD ou brute) qui
+    // existe réellement. Elle ne diffère de la demande que par sa forme
+    // Unicode ; l'appartenance est revérifiée sur elle, au même message.
+    let normalized_query = resolve_browse_path(&demande).ok_or_else(refus)?;
+    let resolved = std::path::Path::new(&normalized_query);
+    let Some(i) = racine_de(&normalized_query) else {
+        return Err(refus());
+    };
+    let music_root = &dirs[i];
     let music_root = tune_core::scanner::walker::normalize_path(music_root);
 
     // List subdirectories. On lit le chemin RÉSOLU, pas `q.path` brut : c'est
@@ -840,5 +856,94 @@ mod hors_executeur_5677 {
              racines : `browse_roots` tient les fils de l'exécuteur (#5677)",
             pire.as_millis()
         );
+    }
+}
+
+/// Sécurité — `GET /library/browse/dir` ne sort jamais des dossiers de musique.
+#[cfg(test)]
+mod garde_de_remontee_tests {
+    use super::{BrowseQuery, lire_le_repertoire};
+    use crate::state::AppState;
+
+    struct Banc {
+        state: AppState,
+        racine: std::path::PathBuf,
+        secret: std::path::PathBuf,
+        _rt: tokio::runtime::Runtime,
+        _dossier: tempfile::TempDir,
+    }
+
+    fn banc() -> Banc {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dossier = tempfile::tempdir().unwrap();
+        let racine = dossier.path().join("musique");
+        std::fs::create_dir_all(racine.join("Jazz")).unwrap();
+        let secret = dossier.path().join("secret");
+        std::fs::create_dir_all(secret.join("NE_PAS_LISTER")).unwrap();
+        let base = dossier.path().join("tune.db");
+        let state = rt.block_on(async {
+            AppState::new(base.to_str().unwrap(), 0, Default::default()).unwrap()
+        });
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&[racine.to_str().unwrap()]).unwrap(),
+            )
+            .unwrap();
+        Banc {
+            state,
+            racine,
+            secret,
+            _rt: rt,
+            _dossier: dossier,
+        }
+    }
+
+    fn lire(b: &Banc, chemin: &str) -> Result<serde_json::Value, crate::error::AppError> {
+        lire_le_repertoire(
+            &b.state,
+            "fr",
+            BrowseQuery {
+                path: chemin.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn un_dossier_de_la_bibliotheque_se_lit() {
+        let b = banc();
+        let Ok(v) = lire(&b, b.racine.to_str().unwrap()) else {
+            panic!("la racine de la bibliothèque doit se lire");
+        };
+        assert!(v.to_string().contains("Jazz"), "{v}");
+    }
+
+    #[test]
+    fn une_remontee_hors_de_la_bibliotheque_est_refusee() {
+        let b = banc();
+        let r = b.racine.to_str().unwrap();
+        assert!(b.secret.is_dir());
+        for chemin in [
+            format!("{r}/../secret"),
+            format!("{r}/Jazz/../../secret"),
+            format!("{r}/./../secret/"),
+            format!("{r}\\..\\secret"),
+        ] {
+            let lu = lire(&b, &chemin);
+            assert!(
+                lu.is_err(),
+                "{chemin} est hors de la bibliothèque et a été listé : {:?}",
+                lu.ok()
+            );
+        }
+        // Encodée : l'extracteur de requête la décode avant la route.
+        let enc = urlencoding::encode(&format!("{r}/%2e%2e/secret")).into_owned();
+        let decode = urlencoding::decode(&urlencoding::decode(&enc).unwrap())
+            .unwrap()
+            .into_owned();
+        assert!(lire(&b, &decode).is_err(), "{decode}");
     }
 }

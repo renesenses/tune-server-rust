@@ -16,11 +16,18 @@
 //! * `provenance` : la source de la piste, ses identifiants, les champs tenus
 //!   à la main dans Tune, les crédits par source, la date du fichier lu ;
 //! * `note` : la note personnelle du profil appelant (#7849) ;
-//! * `forme_d_onde` : réservée à l'étude #8159, toujours `null` ici.
+//! * `forme_d_onde` (fil 2793) : son état (`a_jour` si elle est en cache
+//!   pour le fichier d'aujourd'hui, `absent` sinon) et l'URL de
+//!   `GET /library/tracks/{id}/forme-onde` ; `null` sans fichier. Sa clé
+//!   `sonie` reprend la sonie intégrée (LUFS) et la crête vraie (dBTP) déjà
+//!   mesurées par la passe ReplayGain, quand elles existent.
 //!
 //! Une section que rien ne renseigne vaut `null` : une piste de service, sans
-//! fichier, n'a ni spectrogramme, ni DR mesuré, ni intégrité, et le client
-//! n'affiche pas de section vide. Lecture seule, rien n'est calculé ici :
+//! fichier, n'a ni DR mesuré, ni intégrité, et le client n'affiche pas de
+//! section vide. Une piste QOBUZ ou TIDAL (go du 13/11) a ses sections
+//! `spectrogramme` et `forme_d_onde`, calculées par téléchargement
+//! (`audio_de_service`) et marquées `service` ; pas de `sonie` tant que la
+//! passe ReplayGain ne l'a pas mesurée. Lecture seule, rien n'est calculé ici :
 //! `POST /library/tracks/{id}/spectrogramme` recalcule l'image.
 
 use std::path::Path as CheminFs;
@@ -129,8 +136,14 @@ pub(crate) fn construire(
     // Une section qui n'aurait que la durée et les canaux ne dit rien du format.
     .filter(|f| f.get("codec").is_some() || f.get("sample_rate").is_some());
 
-    let spectrogramme =
-        meta.and_then(|m| super::spectrogramme::section(state.backend.as_ref(), id, m, dossier));
+    let spectrogramme = match meta {
+        Some(m) => super::spectrogramme::section(state.backend.as_ref(), id, m, dossier),
+        None if track.file_path.as_deref().is_none_or(str::is_empty) => {
+            super::audio_de_service::PisteDeService::de(&track)
+                .map(|p| super::spectrogramme::section_service(id, &p, dossier))
+        }
+        None => None,
+    };
 
     let dynamic_range = metadonnees
         .get("dr_track")
@@ -171,6 +184,17 @@ pub(crate) fn construire(
 
     let provenance = provenance(state, &track, date_du_fichier.clone())?;
 
+    let forme_d_onde = super::forme_onde::section(&track, &super::forme_onde::dossier_du_cache())
+        .map(|mut s| {
+            // Fil 2793 (réponse 11020) — la sonie EBU R128 que la passe
+            // ReplayGain a DÉJÀ mesurée, à côté des chiffres de la forme
+            // d'onde. Aucune mesure nouvelle ici.
+            if let (Some(o), Some(v)) = (s.as_object_mut(), sonie(&metadonnees)) {
+                o.insert("sonie".to_string(), v);
+            }
+            s
+        });
+
     let note = notes::lire(state.backend.as_ref(), profile_id, TypeDObjet::Track, id)
         .map_err(AppError::internal)?
         .map(|n| json!({ "texte_md": n.texte_md, "maj_le": n.maj_le }));
@@ -190,8 +214,47 @@ pub(crate) fn construire(
         "integrite": integrite,
         "provenance": provenance,
         "note": note,
-        // #8159 — la forme d'onde : place réservée, pas encore calculée ici.
-        "forme_d_onde": Value::Null,
+        // Fil 2793 — la forme d'onde : état et URL, calculée par sa route.
+        "forme_d_onde": forme_d_onde,
+    }))
+}
+
+/// Fil 2793 — la sonie EBU R128 de la piste, telle que la passe ReplayGain
+/// de Tune l'a mesurée (ITU-R BS.1770, `tune_core::audio::replaygain`) :
+///
+/// * `integree_lufs` : la sonie intégrée, `REFERENCE_LUFS − rg_track_gain` ;
+/// * `crete_vraie_dbtp` : la crête vraie (`rg_track_true_peak`, linéaire) ;
+/// * l'algorithme et la date de la mesure.
+///
+/// Seulement pour une mesure de Tune (`rg_track_source = analysis`) : un
+/// gain lu dans les balises n'a pas de référence sûre (ReplayGain 1 ou 2).
+/// La plage de sonie (LRA) n'est mesurée nulle part : absente.
+fn sonie(m: &std::collections::HashMap<String, String>) -> Option<Value> {
+    use tune_core::audio::replaygain as rg;
+    if m.get(rg::TRACK_SOURCE_KEY).map(String::as_str) != Some(rg::SOURCE_ANALYSIS) {
+        return None;
+    }
+    let lufs = m
+        .get("rg_track_gain")
+        .and_then(|g| g.trim().trim_end_matches("dB").trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite())
+        .map(|g| ((rg::REFERENCE_LUFS - g) * 10.0).round() / 10.0);
+    let dbtp = m
+        .get("rg_track_true_peak")
+        .and_then(|p| p.trim().parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .map(|p| (20.0 * p.log10() * 10.0).round() / 10.0);
+    if lufs.is_none() && dbtp.is_none() {
+        return None;
+    }
+    sans_vides(json!({
+        "integree_lufs": lufs,
+        "crete_vraie_dbtp": dbtp,
+        "algo": m.get(rg::RG_ALGO_KEY),
+        "mesure_le": m
+            .get("rg_analyzed")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .and_then(date_de),
     }))
 }
 

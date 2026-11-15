@@ -707,6 +707,11 @@ where
             "/{service}/favorites/{fav_type}/{item_id}",
             post(service_add_favorite).delete(service_remove_favorite),
         )
+        // #8481 — le pays du catalogue (TIDAL ; Qobuz répond 422).
+        .route(
+            "/{service}/catalog-country",
+            get(service_catalog_country).put(service_set_catalog_country),
+        )
         .route("/{service}/enable", post(service_enable))
         .route("/{service}/disable", post(service_disable))
         .route("/{service}/auth/url", get(service_auth_url))
@@ -2503,6 +2508,93 @@ async fn service_disable(
         .ok();
     // #6173 — `disableStreamingService` (web) lit `status`.
     Json(json!({"service": service, "enabled": false, "status": "disabled"})).into_response()
+}
+
+/// #8481 — la clé de réglage qui garde le pays du catalogue choisi.
+pub fn cle_pays_du_catalogue(service: &str) -> String {
+    format!("streaming_{service}_catalog_country")
+}
+
+/// #8481 — `GET /streaming/{service}/catalog-country` : le pays du compte, le
+/// pays choisi et celui qui part réellement. 422 pour un service qui ne le
+/// laisse pas choisir.
+async fn service_catalog_country(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.read().await;
+    match svc.pays_du_catalogue() {
+        Some(pays) => Json(json!({
+            "service": service,
+            "supported": true,
+            "account_country": pays.du_compte,
+            "chosen_country": pays.choisi,
+            "effective_country": pays.effectif,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"service": service, "supported": false})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CorpsPaysDuCatalogue {
+    /// `"PL"` pour imposer, `null` ou `""` pour revenir au pays du compte.
+    country: Option<String>,
+}
+
+/// #8481 — `PUT /streaming/{service}/catalog-country` `{"country": "PL"}`.
+/// Le choix est gardé en réglage et remis au démarrage.
+async fn service_set_catalog_country(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+    Json(corps): Json<CorpsPaysDuCatalogue>,
+) -> Response {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let mut svc = svc.write().await;
+    if svc.pays_du_catalogue().is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"service": service, "supported": false})),
+        )
+            .into_response();
+    }
+    if let Err(e) = svc.choisir_le_pays_du_catalogue(corps.country.as_deref()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
+    // Favoris et playlists mémorisés ont été lus sous l'ancien pays : leurs
+    // disponibilités ne valent plus.
+    purge_contenu_utilisateur(&service);
+    let Some(pays) = svc.pays_du_catalogue() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let cle = cle_pays_du_catalogue(&service);
+    let ecrit = match &pays.choisi {
+        Some(p) => settings.set(&cle, p),
+        None => settings.delete(&cle),
+    };
+    if let Err(e) = ecrit {
+        tracing::warn!(service, error = %e, "pays_du_catalogue_non_garde");
+    }
+    Json(json!({
+        "service": service,
+        "supported": true,
+        "account_country": pays.du_compte,
+        "chosen_country": pays.choisi,
+        "effective_country": pays.effectif,
+    }))
+    .into_response()
 }
 
 async fn service_auth_url(
@@ -4587,6 +4679,10 @@ mod temoin_rubriques_dans_la_langue_demandee {
 
 #[cfg(test)]
 mod service_desactive_jamais_appele_tests;
+
+#[cfg(test)]
+#[path = "pays_du_catalogue_8481_tests.rs"]
+mod pays_du_catalogue_8481_tests;
 
 #[cfg(test)]
 mod favoris_sans_gel_7729_tests;

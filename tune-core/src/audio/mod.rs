@@ -26,6 +26,8 @@ pub mod coupure_connue_8483;
 pub mod crete_de_sortie;
 pub mod crete_vraie;
 pub mod crossfeed;
+/// #8701 — les fMP4 DASH des pistes en cours, gardés pour un saut.
+pub mod dash_epingles;
 pub mod dash_growth;
 pub mod decode;
 /// Balise d'avancement du décodage (#3140) — le débit réel de l'hôte, mesuré
@@ -115,6 +117,9 @@ pub mod m4a;
 /// un décodeur livré la lit, compté-nommé sinon (#3633).
 pub mod matroska;
 // #8513 — traitements de zone contournés pendant une mesure de pièce.
+/// La forme d'onde d'une piste (crêtes, RMS, écrêtage) pour sa fiche
+/// technique (fil du forum 2793).
+pub mod forme_onde;
 pub mod mesure_nue;
 pub mod mixer;
 /// Le repli mono dit quand il n'agit pas (#3254) — la disponibilité par zone du

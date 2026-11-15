@@ -12,7 +12,9 @@
 //! |-------------------|-------------------------|------------------------------------------|
 //! | `genre_frequent`  | `genre`                 | `/home/recommendations` : l'album est d'un des 5 genres les plus présents dans `listen_history`, et n'a jamais été écouté |
 //! | `artiste_favori`  | `artiste`               | `/home/artist-releases` : l'artiste est en favori (local ou chez un service) |
-//! | `artiste_possede` | `artiste`, `albums`     | `/home/artist-releases` : `albums` albums de l'artiste dans la bibliothèque |
+//! | `artiste_possede` | `artiste`, `albums`     | `/home/artist-releases`, et `/home/recommendations` (#8280 : album jamais écouté d'un artiste dont la bibliothèque compte `albums` ≥ 2 albums) : `albums` albums de l'artiste dans la bibliothèque |
+//! | `meme_epoque`     | `decennie`              | `/home/recommendations` (#8280) : album jamais écouté de la décennie (1970 = années 70) la plus présente dans l'historique |
+//! | `peu_ecoute`      | `ecoutes`               | `/home/recommendations` (#8280) : album que l'historique ne rattache qu'à `ecoutes` écoutes (1 à 3) |
 //! | `autre_version`   | `titre`                 | `/home/other-versions` : une autre version de `titre`, écouté récemment |
 //! | `ajout_recent`    | `ajoute_le` (s, option) | `/home/new-in-library`, `/home/recently-added` : la date d'AJOUT |
 //! | `hasard`          | —                       | `/home/recommendations`, repli : tiré au hasard dans la bibliothèque (go du 13/10) |
@@ -92,6 +94,18 @@ pub(crate) fn raison_ajout_recent(ajoute_le: Option<f64>) -> Value {
         Some(s) => json!({"type": "ajout_recent", "ajoute_le": s.floor() as i64}),
         None => json!({"type": "ajout_recent"}),
     }
+}
+
+/// Discussion #8280 — un album de la décennie la plus écoutée. `decennie`
+/// est la première année (1970 pour les années 70).
+pub(crate) fn raison_meme_epoque(decennie: i64) -> Option<Value> {
+    (decennie >= 1000 && decennie % 10 == 0)
+        .then(|| json!({"type": "meme_epoque", "decennie": decennie}))
+}
+
+/// Discussion #8280 — un album à peine entamé : `ecoutes` écoutes en tout.
+pub(crate) fn raison_peu_ecoute(ecoutes: i64) -> Option<Value> {
+    (ecoutes > 0).then(|| json!({"type": "peu_ecoute", "ecoutes": ecoutes}))
 }
 
 /// Tiré au hasard dans la bibliothèque : le repli des recommandations.

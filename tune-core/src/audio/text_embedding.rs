@@ -228,7 +228,8 @@ fn text_paths(settings: &SettingsRepo) -> (PathBuf, PathBuf) {
         .flatten()
         .or_else(|| std::env::var("TUNE_AUDIO_EMBED_MODEL").ok())
         .and_then(|audio| Path::new(&audio).parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("embedding_models"));
+        // #8675 : `TUNE_EMBEDDING_MODELS_DIR` (image Docker) ou `embedding_models`.
+        .unwrap_or_else(super::embedding::repertoire_des_modeles);
     let model = settings
         .get(TEXT_MODEL_PATH_KEY)
         .ok()

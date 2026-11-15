@@ -1325,6 +1325,21 @@ async fn pg_6285_filtre_et_regles_du_verdict_hires() {
             );
         }
     }
+    // rc12 — le filtre `hires_verdict` du catalogue, sur PostgreSQL.
+    let du_catalogue = |mots: &[&str], visible: bool| {
+        let mots: Vec<String> = mots.iter().map(|m| m.to_string()).collect();
+        let mut v: Vec<i64> =
+            crate::audio::faux_hires_publie::albums_des_verdicts(&db, &mots, visible)
+                .unwrap()
+                .into_iter()
+                .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(du_catalogue(&["verifie"], false), vec![1, 6]);
+    assert!(du_catalogue(&["douteux"], false).is_empty());
+    assert_eq!(du_catalogue(&["verifie", "douteux"], true), vec![1, 3, 6]);
+    assert!(du_catalogue(&["hires"], true).is_empty());
     let pistes_de = |v, visible| {
         ids_de(format!(
             "SELECT t.id FROM tracks t WHERE {} ORDER BY t.id",

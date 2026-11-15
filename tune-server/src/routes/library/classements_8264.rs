@@ -43,8 +43,13 @@ pub(crate) struct Classement {
     pub total: usize,
 }
 
-fn classer(mut rangs: Vec<Rang>) -> Classement {
+/// L'ordre du classement : nombre décroissant, puis libellé.
+fn trier(rangs: &mut [Rang]) {
     rangs.sort_by(|a, b| b.tracks.cmp(&a.tracks).then_with(|| a.value.cmp(&b.value)));
+}
+
+fn classer(mut rangs: Vec<Rang>) -> Classement {
+    trier(&mut rangs);
     let total = rangs.len();
     rangs.truncate(PLAFOND_CLASSEMENT);
     Classement {
@@ -55,6 +60,11 @@ fn classer(mut rangs: Vec<Rang>) -> Classement {
 
 /// Les artistes par nombre de pistes.
 pub(crate) fn par_artiste(db: &dyn DbBackend) -> Result<Classement, String> {
+    Ok(classer(rangs_par_artiste(db)?))
+}
+
+/// Tous les artistes et leur nombre de pistes, dans le désordre.
+fn rangs_par_artiste(db: &dyn DbBackend) -> Result<Vec<Rang>, String> {
     let lignes = db.query_many(
         "SELECT TRIM(ar.name), COUNT(*) FROM tracks t \
          JOIN artists ar ON ar.id = t.artist_id \
@@ -71,11 +81,16 @@ pub(crate) fn par_artiste(db: &dyn DbBackend) -> Result<Classement, String> {
             })
         })
         .collect();
-    Ok(classer(rangs))
+    Ok(rangs)
 }
 
 /// Les genres (de l'album) par nombre de pistes.
 pub(crate) fn par_genre(db: &dyn DbBackend) -> Result<Classement, String> {
+    Ok(classer(rangs_par_genre(db)?))
+}
+
+/// Tous les genres et leur nombre de pistes, dans le désordre.
+fn rangs_par_genre(db: &dyn DbBackend) -> Result<Vec<Rang>, String> {
     let lignes = db.query_many(
         "SELECT al.genre, al.genres, COUNT(*) FROM tracks t \
          JOIN albums al ON al.id = t.album_id \
@@ -94,7 +109,7 @@ pub(crate) fn par_genre(db: &dyn DbBackend) -> Result<Classement, String> {
             )
         })
         .collect();
-    Ok(classer(cumul_par_genre(&tuples)))
+    Ok(cumul_par_genre(&tuples))
 }
 
 /// Le cumul des pistes par clé de genre, sous le libellé le plus fréquent
@@ -136,6 +151,113 @@ pub(crate) fn lire(db: &dyn DbBackend) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Chercher dans TOUT le classement — go de Bertrand du 13/11 (lot rc12).
+//
+// L'écran Statistiques ne montre que les cent premiers (« Les 100 premiers sur
+// 2 957 ») : un artiste ou un genre plus loin dans la liste n'y était pas
+// trouvable. `GET /library/stats/rankings?by=artist|genre&q=…&limit=…` cherche
+// dans le classement ENTIER et rend, pour chaque entrée trouvée, son RANG dans
+// ce classement complet (pas dans la liste filtrée) et son nombre de pistes.
+// Même définition que `rankings` de `/library/stats` : mêmes requêtes, même
+// ordre — le rang 1 de la recherche est le premier de la carte.
+// ---------------------------------------------------------------------------
+
+/// Combien d'entrées une recherche rend au plus (par défaut, et plafond).
+pub(crate) const LIMITE_RECHERCHE_DEFAUT: usize = 100;
+pub(crate) const LIMITE_RECHERCHE_MAX: usize = 500;
+
+/// Une entrée trouvée : son rang dans le classement COMPLET (à partir de 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RangTrouve {
+    pub rank: usize,
+    pub value: String,
+    pub tracks: i64,
+}
+
+/// Le résultat d'une recherche : les entrées trouvées (au plus `limit`),
+/// combien correspondent en tout (`matched`) et la taille du classement
+/// complet (`total`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Recherche {
+    pub items: Vec<RangTrouve>,
+    pub matched: usize,
+    pub total: usize,
+}
+
+/// Replie accents et casse : « dvorak » trouve « Antonín Dvořák ».
+fn plier(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Filtre un classement (trié ici) sur `q` — sous-chaîne, sans accents ni
+/// casse ; `q` vide garde tout. Fonction pure : c'est elle que gardent les
+/// témoins.
+fn chercher_dans(mut rangs: Vec<Rang>, q: &str, limite: usize) -> Recherche {
+    trier(&mut rangs);
+    let total = rangs.len();
+    let aiguille = plier(q.trim());
+    let mut items = Vec::new();
+    let mut matched = 0;
+    for (i, r) in rangs.into_iter().enumerate() {
+        if !aiguille.is_empty() && !plier(&r.value).contains(&aiguille) {
+            continue;
+        }
+        matched += 1;
+        if items.len() < limite {
+            items.push(RangTrouve {
+                rank: i + 1,
+                value: r.value,
+                tracks: r.tracks,
+            });
+        }
+    }
+    Recherche {
+        items,
+        matched,
+        total,
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ParamsRecherche {
+    by: String,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `GET /library/stats/rankings?by=artist|genre&q=…&limit=…`
+pub(super) async fn rechercher(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Query(p): axum::extract::Query<ParamsRecherche>,
+) -> Result<axum::Json<Value>, crate::error::AppError> {
+    let db = state.backend.as_ref();
+    let rangs = match p.by.as_str() {
+        "artist" => rangs_par_artiste(db),
+        "genre" => rangs_par_genre(db),
+        _ => {
+            return Err(crate::error::AppError::bad_request(
+                "by must be \"artist\" or \"genre\"",
+            ));
+        }
+    }
+    .map_err(crate::error::AppError::internal)?;
+    let limite = p
+        .limit
+        .unwrap_or(LIMITE_RECHERCHE_DEFAUT)
+        .clamp(1, LIMITE_RECHERCHE_MAX);
+    let r = chercher_dans(rangs, p.q.as_deref().unwrap_or(""), limite);
+    let mut corps = json!(r);
+    corps["by"] = json!(p.by);
+    Ok(axum::Json(corps))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +296,38 @@ mod tests {
         assert_eq!(c.total, PLAFOND_CLASSEMENT + 5);
         assert_eq!(c.items.len(), PLAFOND_CLASSEMENT);
         assert_eq!(c.items[0].tracks, PLAFOND_CLASSEMENT as i64 + 4);
+    }
+
+    #[test]
+    fn la_recherche_rend_le_rang_dans_le_classement_complet() {
+        let mut rangs: Vec<Rang> = (0..150)
+            .map(|i| rang(&format!("Artiste {i:03}"), 1000 - i))
+            .collect();
+        rangs.push(rang("Antonín Dvořák", 1));
+        let r = chercher_dans(rangs, "  DVORAK ", 10);
+        assert_eq!(r.total, 151);
+        assert_eq!(r.matched, 1);
+        assert_eq!(
+            r.items,
+            vec![RangTrouve {
+                rank: 151,
+                value: "Antonín Dvořák".into(),
+                tracks: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn la_recherche_est_plafonnee_et_compte_toutes_les_correspondances() {
+        let rangs = (0..30).map(|i| rang(&format!("B{i:02}"), 30 - i)).collect();
+        let r = chercher_dans(rangs, "b", 5);
+        assert_eq!((r.matched, r.total, r.items.len()), (30, 30, 5));
+        assert_eq!(r.items[0].rank, 1);
+        assert_eq!(r.items[4].rank, 5);
+        // `q` vide : tout le classement, dans l'ordre.
+        let r = chercher_dans(vec![rang("X", 1), rang("Y", 9)], "", 10);
+        assert_eq!(r.items[0].value, "Y");
+        assert_eq!(r.matched, 2);
     }
 
     #[test]

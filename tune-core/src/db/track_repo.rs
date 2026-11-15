@@ -2963,7 +2963,11 @@ impl TrackRepo {
             owned_params.extend(p);
         }
 
-        if let Some(c) = ph.in_list("t.year", f.years.len()) {
+        // Go du 13/11 — l'année de la piste, à défaut celle de son album.
+        if let Some(c) = ph.in_list(
+            crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE,
+            f.years.len(),
+        ) {
             conditions.push(c);
             for y in &f.years {
                 owned_params.push(SqlValue::Int(*y));
@@ -3066,8 +3070,18 @@ impl TrackRepo {
 
         // Extended-tag filters via the open `track_metadata` k/v store. The key
         // is a fixed literal; only the values are bound parameters.
+        // #8668 — le pays d'édition : balise RELEASECOUNTRY, ou pays de la
+        // release MusicBrainz d'un album sans balise.
+        if let Some((c, p)) = combiner(
+            ph,
+            &f.countries,
+            f.est_en_et("country"),
+            crate::db::facet_filter::bloc_pays_edition,
+        ) {
+            conditions.push(c);
+            owned_params.extend(p);
+        }
         for (values, key, param) in [
-            (&f.countries, "release_country", "country"),
             (&f.moods, "mood", "mood"),
             (&f.source_medias, "source_media", "source_media"),
         ] {

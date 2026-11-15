@@ -17,6 +17,18 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
+    /// Recette du 14/11 — la durée d'un titre de service entré en file à 0.
+    pub fn completer_duree_de_service<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE queue_items SET duration_ms = {} WHERE zone_id = {} AND source = {} \
+             AND source_id = {} AND (duration_ms IS NULL OR duration_ms <= 0)",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
     pub fn queue_select_base() -> &'static str {
         "SELECT q.id, q.zone_id, q.track_id, q.position, q.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, COALESCE(t.cover_path, al.cover_path), t.format, t.sample_rate, t.bit_depth FROM queue_items q LEFT JOIN tracks t ON q.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
     }
@@ -1033,6 +1045,24 @@ impl PlayQueueRepo {
         Ok(n)
     }
 
+    /// Recette du 14/11 — donne sa durée à un titre de service de la file
+    /// qui n'en a pas (0 ou nul). Une durée déjà connue n'est jamais
+    /// remplacée. Rend le nombre de lignes complétées.
+    pub fn completer_duree_de_service(
+        &self,
+        zone_id: i64,
+        source: &str,
+        source_id: &str,
+        duration_ms: i64,
+    ) -> Result<usize, String> {
+        let sql = self.dialect_sql(
+            sql::completer_duree_de_service,
+            sql::completer_duree_de_service,
+        );
+        let params: [&dyn ToSqlValue; 4] = [&duration_ms, &zone_id, &source, &source_id];
+        self.db.execute(&sql, &params)
+    }
+
     pub fn clear(&self, zone_id: i64) -> Result<(), String> {
         // Delete both subsets (local + streaming) of the unified table.
         let delete_local = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
@@ -1307,6 +1337,33 @@ impl PlayQueueRepo {
     /// Append items at the end of the unified queue.
     pub fn append(&self, zone_id: i64, items: &[QueueInput]) -> Result<(), String> {
         self.insert_at(zone_id, items, None).map(|_| ())
+    }
+
+    /// Fil 2694 — retire d'un coup les lignes `ids` de la file `entries` (lue
+    /// par l'appelant) et renumérote le reste en 0..N-1, dans une transaction.
+    /// Rend le nombre de lignes retirées.
+    pub fn retirer_les_lignes(&self, entries: &[QueueEntry], ids: &[i64]) -> Result<usize, String> {
+        let retirees = entries.iter().filter(|e| ids.contains(&e.id)).count();
+        if retirees == 0 {
+            return Ok(0);
+        }
+        let delete_sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
+        let set_pos_sql = self.dialect_sql(sql::set_position_by_id, sql::set_position_by_id);
+        self.db.write_tx(&mut |tx| {
+            let mut new_pos = 0i64;
+            for e in entries.iter() {
+                if ids.contains(&e.id) {
+                    let dp: [&dyn ToSqlValue; 1] = [&e.id];
+                    tx.execute(&delete_sql, &dp)?;
+                    continue;
+                }
+                let p: [&dyn ToSqlValue; 2] = [&new_pos, &e.id];
+                tx.execute(&set_pos_sql, &p)?;
+                new_pos += 1;
+            }
+            Ok(())
+        })?;
+        Ok(retirees)
     }
 
     /// Remove the item at `position` (source-agnostic) and close the gap.

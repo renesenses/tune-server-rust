@@ -477,7 +477,7 @@ async fn update_group(
         .iter()
         .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(id));
     match idx {
-        Some(i) => {
+        Some(mut i) => {
             if let Some(ref name) = body.name {
                 groups[i]["name"] = json!(name);
             }
@@ -486,7 +486,14 @@ async fn update_group(
                 if let Some(refus) = refus_asio_du_gestionnaire(&state, zone_ids).await {
                     return refus;
                 }
-                groups[i]["zone_ids"] = json!(zone_ids);
+                // #8680 — une zone n'appartient qu'à UN groupe (même règle
+                // que `create_group`) : celles du groupe recomposé quittent
+                // les autres, et le groupe passe en fin de liste.
+                i = tune_core::zones::groupes_enregistres::recomposer_le_groupe(
+                    &mut groups,
+                    i,
+                    zone_ids,
+                );
             }
             let result = groups[i].clone();
             save_json_setting(&settings, "zone_groups", &groups);

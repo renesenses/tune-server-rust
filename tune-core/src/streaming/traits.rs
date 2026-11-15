@@ -747,6 +747,19 @@ pub enum RubriqueRetirable {
 /// panne. Valeur : `1`.
 pub const ENTETE_RUBRIQUE_RETIREE: &str = "x-tune-rubrique-retiree";
 
+/// #8481 — le pays dont le service sert le catalogue.
+///
+/// `du_compte` est celui que le compte annonce ; `choisi`, celui que
+/// l'utilisateur impose dans les Réglages (comme « PL » dans LMS) ; `effectif`,
+/// celui qui part réellement dans les requêtes (`choisi`, à défaut
+/// `du_compte`, à défaut le repli du service).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PaysDuCatalogue {
+    pub du_compte: Option<String>,
+    pub choisi: Option<String>,
+    pub effectif: String,
+}
+
 #[async_trait::async_trait]
 pub trait StreamingService: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
@@ -754,6 +767,23 @@ pub trait StreamingService: Send + Sync {
     fn name(&self) -> &str;
     fn enabled(&self) -> bool;
     fn set_enabled(&mut self, enabled: bool);
+
+    /// #8481 — le pays du catalogue, pour les services qui le laissent
+    /// choisir. `None` : le service ne le permet pas (Qobuz, par exemple, sert
+    /// toujours le magasin du compte, aucune requête n'accepte de pays).
+    fn pays_du_catalogue(&self) -> Option<PaysDuCatalogue> {
+        None
+    }
+
+    /// #8481 — imposer (`Some("PL")`) ou rendre au compte (`None`) le pays du
+    /// catalogue. Refuse un code qui n'est pas ISO 3166-1 alpha-2, et tout
+    /// service qui ne le permet pas.
+    fn choisir_le_pays_du_catalogue(&mut self, _pays: Option<&str>) -> Result<(), String> {
+        Err(format!(
+            "{} : le pays du catalogue ne se choisit pas",
+            self.name()
+        ))
+    }
 
     async fn authenticate(
         &mut self,
@@ -915,6 +945,19 @@ pub trait StreamingService: Send + Sync {
     /// (les deux derniers depuis #5395).
     fn propose_des_artistes_similaires(&self) -> bool {
         false
+    }
+    /// Fil 2694 (Ilan, « comme Roon ») — la radio d'UN titre telle que le
+    /// service la compose (TIDAL : `GET /tracks/{id}/radio`). Sert la radio de
+    /// fin de file, qui la préfère aux artistes similaires quand la piste qui
+    /// s'achève vient de ce service. Défaut vide : un service sans radio de
+    /// titre laisse la main au chemin des artistes similaires.
+    async fn get_track_radio(
+        &self,
+        track_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamTrack>, TuneError> {
+        let _ = (track_id, limit);
+        Ok(vec![])
     }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;

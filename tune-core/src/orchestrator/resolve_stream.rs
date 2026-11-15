@@ -479,6 +479,24 @@ mod canal_aac_fin_notee_6298_tests;
 #[path = "youtube_dlna_demarrage_8228_tests.rs"]
 mod youtube_dlna_demarrage_8228_tests;
 
+/// #7266 — la résolution d'une piste pour cette lecture peut-elle rendre un
+/// fMP4 DASH encore en téléchargement ? Oui pour une sortie locale ou OAAT :
+/// leur session WAV est servie en continu, sans longueur annoncée, et le
+/// décodeur suit la frontière d'écriture. Non pour un renderer réseau (DLNA,
+/// Chromecast, AirPlay : il leur faut le fichier complet et sa longueur), ni
+/// si `TUNE_DASH_STREAM_DECODE=0`.
+///
+/// #8701 — un départ à une position (un saut) aussi : le démuxeur fMP4 lit
+/// les fragments dans l'ordre jusqu'à celui de la position, et la source en
+/// croissance ne bloque qu'au-delà de ce qui est écrit. Un saut dans la
+/// partie téléchargée joue tout de suite ; au-delà, il n'attend que le
+/// segment visé, plus la fin de tout le téléchargement.
+pub(super) fn decoder_pendant_le_telechargement(req: &PlayRequest) -> bool {
+    req.output_device_id.as_deref().is_some_and(|id| {
+        id.starts_with("local:") || id.starts_with("oaat:") || id.starts_with("oaat-group:")
+    }) && !crate::audio::dash_growth::decodage_local_desarme()
+}
+
 impl PlaybackOrchestrator {
     /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
     /// radios du MediaServer.
@@ -698,7 +716,16 @@ impl PlaybackOrchestrator {
                 );
                 flux
             }
-            None => request_stream_at_quality(&mut **svc, source_id, provider_quality).await?,
+            // #7266 — pour une sortie locale ou OAAT, un fMP4 DASH FLAC revient
+            // dès son init et son premier segment, et se décode pendant que les
+            // autres arrivent : la première note n'attend plus la piste entière.
+            None => {
+                crate::audio::dash_growth::pendant_le_telechargement(
+                    decoder_pendant_le_telechargement(req),
+                    request_stream_at_quality(&mut **svc, source_id, provider_quality),
+                )
+                .await?
+            }
         };
         // #6401 — un flux Qobuz haute résolution qui échoue au démarrage
         // (erreur HTTP, flux coupé avant le premier octet) est redemandé UNE
@@ -832,8 +859,20 @@ impl PlaybackOrchestrator {
         };
 
         let (stream_url, sid, out_mime, stream_file_size) = if is_local_stream || is_oaat_stream {
-            self.resoudre_flux_local_ou_oaat(req, service_name, &stream_data, is_local_stream)
-                .await?
+            match self
+                .resoudre_flux_local_ou_oaat(req, service_name, &stream_data, is_local_stream)
+                .await
+            {
+                Ok(flux) => flux,
+                Err(e) => {
+                    // #7266 — aucun décodeur ne prendra la poignée d'un fMP4
+                    // en croissance : la lâcher arrête son téléchargement.
+                    if let Some(chemin) = stream_data.url.strip_prefix("file://") {
+                        drop(crate::audio::dash_growth::take_for(chemin));
+                    }
+                    return Err(e);
+                }
+            }
         } else if is_dash_file {
             match self
                 .resoudre_flux_dash(
@@ -1403,6 +1442,9 @@ impl PlaybackOrchestrator {
         // streaming-service content played through local/OAAT outputs.
         // Paced to the playback clock by the forwarder; without a bus,
         // the receiver is dropped and the decoder's sends are no-ops.
+        // #7266 — pour signaler une piste coupée en route (le bus ci-dessous
+        // ne sert aux niveaux que si la zone les demande).
+        let bus_des_erreurs = ev_bus.clone();
         let levels_tx = match ev_bus.filter(|_| attach_levels) {
             Some(bus) => {
                 let play_seq = playback.current_play_seq(zone_id).await;
@@ -1675,6 +1717,21 @@ impl PlaybackOrchestrator {
             }
             Ok(Err(e)) => {
                 warn!(error = %e, "streaming_transcode_decode_failed");
+                // #7266 — un fMP4 DASH perdu en cours de téléchargement : la
+                // zone l'apprend, au lieu de passer en silence à la suite.
+                if e.starts_with(crate::audio::decode::TELECHARGEMENT_DASH_INTERROMPU)
+                    && let Some(ref bus) = bus_des_erreurs
+                {
+                    bus.emit(
+                        "zone.playback_error",
+                        serde_json::json!({
+                            "zone_id": zone_id,
+                            "code": "track_decode_failed",
+                            "error": "The track could not be decoded.",
+                            "cause": e,
+                        }),
+                    );
+                }
             }
             Err(e) => {
                 warn!(error = %e, "streaming_transcode_decode_task_panic");

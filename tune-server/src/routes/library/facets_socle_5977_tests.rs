@@ -30,7 +30,7 @@ const GENRE: &str = "Atmospheric Black Metal";
 ///
 /// La liste rend donc 6 + 2 = 8 pistes ; sans socle, le rail en compterait
 /// 6 + 3 + 6 + 2 + 2 = 19, et 15 pour le genre.
-fn bibliotheque() -> (axum::Router, AppState) {
+pub(crate) fn bibliotheque() -> (axum::Router, AppState) {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     let mut sql = String::from(
         "INSERT INTO artists (id, name) VALUES (1, 'Alda (US)'), (2, 'Masqué'), (3, 'Jazzman');\n\
@@ -129,7 +129,7 @@ fn bibliotheque() -> (axum::Router, AppState) {
     (routeur, state)
 }
 
-async fn get(app: &axum::Router, chemin: &str) -> Value {
+pub(crate) async fn get(app: &axum::Router, chemin: &str) -> Value {
     let reponse = app
         .clone()
         .oneshot(Request::get(chemin).body(Body::empty()).unwrap())
