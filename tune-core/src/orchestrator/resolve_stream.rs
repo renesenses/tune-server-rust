@@ -1156,6 +1156,34 @@ impl PlaybackOrchestrator {
                 .ouvrir_la_session_wav(wav_info, service_name, &codec, sr, bd)
                 .await;
 
+            // #8689 — la sortie locale applique le gain au rendu. OAAT
+            // reçoit les octets du WAV : son gain de service doit donc être
+            // porté ici, une seule fois, sans ajouter les autres DSP de zone.
+            let tx = if !is_local_stream && !self.zone_audiophile(req.zone_id) {
+                let facteur = crate::audio::replaygain::facteur_de_zone(
+                    &self.db,
+                    req.zone_id,
+                    req.piste_rg(),
+                );
+                if (facteur - 1.0).abs() > 1e-6 {
+                    spawn_streaming_dsp_relay(
+                        StreamingDsp {
+                            replaygain: Some(facteur),
+                            channels: 2,
+                            sample_rate: sr,
+                            ..Default::default()
+                        },
+                        bd,
+                        true,
+                        tx,
+                    )
+                } else {
+                    tx
+                }
+            } else {
+                tx
+            };
+
             let tache = self.capturer_pour_le_transcodage(
                 req,
                 service_name,
@@ -3551,5 +3579,119 @@ mod remux_par_defaut_7266_tests {
             !remux(source_dash_en_flac("AAC"), false, false, false, false),
             "un AAC DASH sans traitement prend le remux FLAC, qui échoue"
         );
+    }
+}
+
+#[cfg(test)]
+mod replaygain_oaat_8689 {
+    use super::super::service_wav_progressif_5080::{
+        cdn_par_range, flux_qobuz, orchestrateur, requete_qobuz,
+    };
+    use crate::audio::replaygain::{
+        MODE_KEY, PREAMP_KEY, SERVICES_ENABLED_KEY,
+        services::{GainsDuService, noter},
+    };
+    use crate::db::{settings_repo::SettingsRepo, zone_repo::ZoneRepo};
+    use std::time::Duration;
+
+    /// Le vrai producteur WAV, un CDN synthétique, aucune sortie audio.
+    /// Le gain doit atteindre les octets OAAT, pas seulement le calcul DSP.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn le_wav_oaat_des_services_porte_le_gain_8689() {
+        let orch = orchestrateur();
+        let zone = ZoneRepo::with_backend(orch.db.clone())
+            .create("RG OAAT", Some("oaat"), Some("oaat:8689-test"))
+            .unwrap();
+        let reglages = SettingsRepo::with_backend(orch.db.clone());
+        reglages.set(MODE_KEY, "track").unwrap();
+        reglages.set(PREAMP_KEY, "2").unwrap();
+        let brut = crate::audio::decode::decode_to_pcm(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+            None,
+            Some(2),
+            0.0,
+            0.0,
+        )
+        .unwrap();
+        let flux = flux_qobuz(cdn_par_range().await, brut.sample_rate, brut.bit_depth);
+        for source in ["qobuz", "tidal"] {
+            let mut req = requete_qobuz(zone);
+            req.source = Some(source.into());
+            req.source_id = Some("8689301".into());
+            noter(
+                source,
+                "8689301",
+                GainsDuService {
+                    piste_db: Some(-8.0),
+                    piste_pic: Some(0.5),
+                    ..Default::default()
+                },
+            );
+            for (actif, pure, strict) in [
+                (false, false, false),
+                (true, true, false),
+                (true, false, true),
+                (true, false, false),
+            ] {
+                reglages
+                    .set(SERVICES_ENABLED_KEY, if actif { "true" } else { "false" })
+                    .unwrap();
+                reglages
+                    .set(
+                        &format!("zone_{zone}_audiophile"),
+                        &format!("{{\"enabled\":{pure}}}"),
+                    )
+                    .unwrap();
+                reglages
+                    .set(
+                        &crate::audio::bitperfect_strict::cle_de_zone(zone),
+                        if strict { "true" } else { "false" },
+                    )
+                    .unwrap();
+                let (_, sid, mime, _) = orch
+                    .resoudre_flux_local_ou_oaat(&req, source, &flux, false)
+                    .await
+                    .unwrap();
+                assert_eq!(mime, "audio/wav");
+                let sid = sid.unwrap();
+                let session = orch
+                    .streamer
+                    .sessions_state()
+                    .lock()
+                    .await
+                    .get(&sid)
+                    .unwrap()
+                    .clone();
+                let entete = tokio::time::timeout(Duration::from_secs(10), session.recv_chunk())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&entete[..4], b"RIFF");
+                assert!(entete.len() <= 80);
+                let mut attendu = brut.pcm_bytes();
+                if actif && !pure && !strict {
+                    crate::audio::replaygain::apply_gain_pcm(
+                        &mut attendu,
+                        brut.bit_depth,
+                        10f64.powf(-6.0 / 20.0),
+                    );
+                    assert_ne!(attendu, brut.pcm_bytes());
+                }
+                let mut recu = Vec::new();
+                while recu.len() < attendu.len() {
+                    match tokio::time::timeout(Duration::from_secs(10), session.recv_chunk()).await
+                    {
+                        Ok(Some(chunk)) => recu.extend_from_slice(&chunk),
+                        _ => break,
+                    }
+                }
+                assert_eq!(recu.len(), attendu.len(), "PCM complet attendu");
+                assert!(
+                    recu == attendu,
+                    "#8689 : le WAV OAAT ignore le gain ou ses gardes : source={source}, actif={actif}, pure={pure}, strict={strict}"
+                );
+                orch.streamer.remove_session(&sid).await;
+            }
+        }
     }
 }
