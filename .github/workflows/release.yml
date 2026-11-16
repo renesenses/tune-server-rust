@@ -203,7 +203,7 @@ jobs:
             ext: zip
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75  # Build ${{ matrix.target }} — 26 min au pire, macOS x86_64
+    timeout-minutes: 120  # Build ${{ matrix.target }} — macOS x86_64 : ~90 min le 16/11 (compilation 55 min + librespot + DMG + notarisation), coupé deux fois à 75
     env:
       ARTIFACT: tune-server-${{ github.ref_name }}-${{ matrix.platform }}
       # Exposé au niveau du job pour être lisible depuis un `if:` d'étape : le
