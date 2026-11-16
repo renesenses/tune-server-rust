@@ -236,6 +236,36 @@ async fn bitperfect_strict_3973_est_persiste_par_la_route() {
     );
 }
 
+/// #8869 — silence de verrouillage : publié à 0 par défaut, borné à 2000 ms
+/// par la route, persisté sous `zone_{id}_silence_verrouillage_ms`, et 0
+/// SUPPRIME la clé.
+#[tokio::test]
+async fn silence_de_verrouillage_8869_est_persiste_borne_par_la_route() {
+    let (app, state) = serveur();
+    let id = zone_dlna(&app).await;
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    let cle = tune_core::audio::silence_de_verrouillage::cle_de_zone(id);
+
+    assert_eq!(fiche(&app, id).await["silence_verrouillage_ms"], json!(0));
+
+    let (statut, reponse) = patch(&app, id, json!({ "silence_verrouillage_ms": 750 })).await;
+    assert_eq!(statut, StatusCode::OK, "PATCH refusé : {reponse}");
+    assert_eq!(fiche(&app, id).await["silence_verrouillage_ms"], json!(750));
+    assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("750"));
+
+    let (statut, _) = patch(&app, id, json!({ "silence_verrouillage_ms": 9000 })).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(
+        fiche(&app, id).await["silence_verrouillage_ms"],
+        json!(2000)
+    );
+
+    let (statut, _) = patch(&app, id, json!({ "silence_verrouillage_ms": 0 })).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(fiche(&app, id).await["silence_verrouillage_ms"], json!(0));
+    assert!(reglages.get(&cle).unwrap().is_none(), "0 SUPPRIME la clé");
+}
+
 /// #2991 — « Envoyer le titre radio par DLNA » : absent = `off`, `next` et
 /// `reload` se persistent et se relisent, `off` supprime la clé, une voie
 /// inconnue est refusée sans rien écrire.

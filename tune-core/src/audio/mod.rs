@@ -158,6 +158,8 @@ pub mod sacd;
 /// #5297 — une piste d'ISO SACD emprunte le chemin DSD existant (PCM, DoP).
 #[cfg(test)]
 mod sacd_lecture_5297_tests;
+/// #8869 — silence de verrouillage au changement de format (réglage de zone).
+pub mod silence_de_verrouillage;
 /// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
 pub mod soft_mute;
 /// Le spectrogramme d'une piste en PNG, calculé sur le PCM décodé (#7857).

@@ -180,6 +180,9 @@ pub(super) struct EntreesDsdNatifAlsa {
     pub(super) dop_active: Arc<AtomicBool>,
     pub(super) chain_exhausted: Arc<AtomicBool>,
     pub(super) device_gone: Arc<AtomicBool>,
+    /// #8869 — le silence de verrouillage dont le flux est précédé.
+    pub(super) silence_de_verrouillage:
+        crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
 }
 
 /// Ce que le rappel écrit dans un tampon `DSD_U32` : le motif de repos tant
@@ -244,6 +247,7 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
         dop_active,
         chain_exhausted,
         device_gone,
+        silence_de_verrouillage,
     } = entrees;
     let canaux = usize::from(entete.canaux);
 
@@ -378,6 +382,15 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     );
     note_opened_device("ALSA", &device_name, &pcm, Some(pcm.as_str()));
 
+    // #8869 — au changement de format, du repos DSD avant le premier octet.
+    super::silence_de_verrouillage_8869::pousser_dans_l_anneau_dsd(
+        &silence_de_verrouillage,
+        &anneau,
+        entete.cadence,
+        entete.canaux,
+        octets_par_trame,
+        || force_silent.load(Ordering::Relaxed) || device_gone.load(Ordering::Relaxed),
+    );
     // ── Alimentation : DsdU8 → mots DSD_U32 → anneau. ──
     let mut mots: Vec<u8> = Vec::new();
     empaqueteur.pousser(header_buf.get(ENTETE_LEN..).unwrap_or_default(), &mut mots);
