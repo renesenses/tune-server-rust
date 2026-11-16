@@ -2945,10 +2945,21 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "albums_release_country",
         up: "",
     },
+    Migration {
+        version: 155,
+        name: "queue_items_format_streaming",
+        up: "",
+    },
 ];
 
-/// Pose `albums.release_country` et `albums.release_country_mbid` (#8668) —
-/// bloc de version de la 154 et passe finale.
+/// #8788 — le format des pistes UPnP, migration 155 et réparation idempotente.
+fn format_des_elements_de_file(db: &SqliteDb) {
+    add_column_if_missing(db, "queue_items", "media_format", "TEXT");
+    add_column_if_missing(db, "queue_items", "sample_rate", "INTEGER");
+    add_column_if_missing(db, "queue_items", "bit_depth", "INTEGER");
+}
+
+/// Pose le pays d'édition MusicBrainz (#8668), migration 154 et passe finale.
 fn pays_des_editions(db: &SqliteDb) {
     add_column_if_missing(db, "albums", "release_country", "TEXT");
     add_column_if_missing(db, "albums", "release_country_mbid", "TEXT");
@@ -4440,6 +4451,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // Index des identifiants d'enregistrement (#2264).
             index_des_identifiants_d_enregistrement(db);
         }
+        if migration.version == 155 {
+            format_des_elements_de_file(db);
+        }
         if migration.version == 123 {
             // L'artiste d'une piste de service chez son service (#6079). Sans
             // défaut : NULL = INCONNU pour toute ligne existante.
@@ -5120,6 +5134,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // #6079) — posé ICI aussi : l'écriture de la file le NOMME, et une base
     // arrivée sans lui ne pourrait plus rien mettre en file. PG : migration 087.
     add_column_if_missing(db, "queue_items", "artist_ref", "TEXT");
+    format_des_elements_de_file(db);
     // La note de la piste (migration 124, #6123) — posée ICI aussi : l'INSERT
     // et l'UPDATE des pistes la NOMMENT, et une base arrivée sans elle ne
     // pourrait plus rien scanner. PG : migration 088.
@@ -6307,6 +6322,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         120,
         "albums_release_country",
         include_str!("../../migrations/postgres/120_albums_release_country.sql"),
+    ),
+    (
+        121,
+        "queue_items_format_streaming",
+        include_str!("../../migrations/postgres/121_queue_items_format_streaming.sql"),
     ),
 ];
 
@@ -10252,7 +10272,8 @@ mod tests {
         // (118 = #8656, 119 = #8678, fusionnées avant).
         // Pose le pays d'édition MusicBrainz, que les facettes, le filtre
         // Pays et la passe de fond NOMMENT.
-        assert_eq!(pg_latest_version(), 120, "latest PG migration must be 120");
+        // 121 : format des pistes UPnP en file (#8788), SQLite 155.
+        assert_eq!(pg_latest_version(), 121, "latest PG migration must be 121");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

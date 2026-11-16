@@ -5191,6 +5191,9 @@ mod restauration_piste_de_service_6380_tests {
         let file = PlayQueueRepo::with_backend(state.backend.clone());
         let lignes: Vec<QueueInput> = (1..=5)
             .map(|n| QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: "qobuz".into(),
                 source_id: format!("qobuz-{n}"),
                 title: format!("Titre {n}"),

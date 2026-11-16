@@ -146,6 +146,9 @@ mod tests {
 
     fn entree(source_id: &str, album_ref: Option<&str>) -> QueueInput {
         QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "bandcamp".into(),
             source_id: source_id.into(),
             title: "Meet Her At The Love Parade".into(),

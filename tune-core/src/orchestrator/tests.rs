@@ -7132,6 +7132,9 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
         .append(
             zone_id,
             &[QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: "bandcamp".into(),
                 source_id: "https://t4.bcbits.com/stream/e4/mp3-128/29192493?ts=1791020000".into(),
                 title: "Meet Her".into(),
@@ -12020,4 +12023,63 @@ async fn une_source_directe_http_reste_jouable() {
             .unwrap_or_else(|| resolu.url.clone());
         assert!(vue.starts_with("http"), "valeur rognée attendue : {vue:?}");
     }
+}
+
+#[tokio::test]
+async fn le_format_upnp_suit_lecture_preparation_et_avance_de_file_8788() {
+    use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    let orch = test_orchestrator();
+    let device = "mock-format-8788";
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .create("Format UPnP factice", Some("mock"), Some(device))
+        .unwrap();
+    orch.outputs
+        .lock()
+        .await
+        .register(Box::new(MockOutput::new(device, "Sortie muette")));
+    let items = (0..2)
+        .map(|i| {
+            serde_json::from_value::<QueueInput>(serde_json::json!({"Streaming": {
+                "source": "upnp", "source_id": format!("http://127.0.0.1:9/ressource/{i}"),
+                "title": format!("Piste {i}"), "artist": "Banc", "album": null, "cover_url": null,
+                "duration_ms": 1000, "track_number": null, "disc_number": null,
+                "album_ref": null, "artist_ref": null,
+                "media_format": "wav", "sample_rate": 705600, "bit_depth": 24
+            }}))
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    PlayQueueRepo::with_backend(orch.db.clone())
+        .append(zone, &items)
+        .unwrap();
+    let suivante = orch.resolve_queue_item_url(zone, 1).await.unwrap();
+    assert_eq!(
+        suivante.mime_type, "audio/wav",
+        "#8788 : le préchargement oublie le conteneur UPnP sans extension"
+    );
+    assert_eq!(
+        suivante.sample_rate,
+        Some(705600),
+        "#8788 : le préchargement oublie la cadence"
+    );
+    assert_eq!(suivante.bit_depth, Some(24));
+    orch.play_from_queue(zone, 0).await.unwrap();
+    let premiere = orch.playback.get_state(zone).await.now_playing.unwrap();
+    assert_eq!(
+        premiere.format.as_deref(),
+        Some("wav"),
+        "#8788 : Lire depuis la file oublie le conteneur"
+    );
+    assert_eq!(premiere.sample_rate, Some(705600));
+    assert_eq!(premiere.bit_depth, Some(24));
+    orch.advance_queue_metadata(zone, 1).await.unwrap();
+    let seconde = orch.playback.get_state(zone).await.now_playing.unwrap();
+    assert_eq!(seconde.title, "Piste 1");
+    assert_eq!(
+        seconde.format.as_deref(),
+        Some("wav"),
+        "#8788 : l'avance sans blanc oublie le conteneur"
+    );
+    assert_eq!(seconde.sample_rate, Some(705600));
+    assert_eq!(seconde.bit_depth, Some(24));
 }

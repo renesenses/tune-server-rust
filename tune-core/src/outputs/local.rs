@@ -3480,6 +3480,23 @@ fn pcm_container_bit_depth(block_align: u16, channels: u16) -> Option<u16> {
     }
 }
 
+/// #8788 — ne livrer que le chunk audio, jamais les métadonnées qui suivent.
+/// Les deux tailles sentinelles des WAV en continu restent sans borne.
+fn borner_donnees_wav(octets: &mut Vec<u8>, data_offset: usize) -> Option<u64> {
+    let taille = u32::from_le_bytes(
+        octets
+            .get(data_offset.checked_sub(4)?..data_offset)?
+            .try_into()
+            .ok()?,
+    );
+    if taille == u32::MAX || taille == 0x7FFF_FFFF - 36 {
+        return None;
+    }
+    let deja_lus = octets.len().saturating_sub(data_offset) as u64;
+    octets.truncate(data_offset.saturating_add(taille as usize));
+    Some(u64::from(taille).saturating_sub(deja_lus))
+}
+
 fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
     if header.len() < 44 {
         return None;
@@ -7636,6 +7653,8 @@ impl OutputTarget for LocalOutput {
                 return;
             };
 
+            reader.borner(borner_donnees_wav(&mut header_buf, data_offset));
+
             // Format definitif du flux PCM : c'est CE couple que voit
             // `apply_local_dsp`, donc celui auquel un EqProcessor doit etre
             // bati. Memorise ici pour qu'un profil modifie EN COURS de lecture
@@ -8644,6 +8663,7 @@ impl OutputTarget for LocalOutput {
                 else {
                     break;
                 };
+                next_reader.borner(entete_suivante.restant);
                 let nouvelle_spec = entete_suivante.spec;
                 let new_sr = nouvelle_spec.cadence();
                 let new_ch = nouvelle_spec.canaux();

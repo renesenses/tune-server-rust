@@ -368,6 +368,9 @@ async fn les_lignes_de_radio_deja_jouees_sont_purgees_au_dela_du_seuil() {
     file.clear(b.zone_id).unwrap();
     let anciennes: Vec<QueueInput> = (0..rff::GARDER_JOUEES + 5)
         .map(|i| QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "tidal".into(),
             source_id: format!("x{i}"),
             title: format!("Ancienne {i}"),
@@ -609,6 +612,9 @@ async fn la_radio_du_titre_tidal_prolonge_la_file_sans_doublon() {
         .append(
             b.zone_id,
             &[QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: "tidal".into(),
                 source_id: "deja".into(),
                 title: "Déjà là".into(),
