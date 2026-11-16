@@ -211,6 +211,11 @@ jobs:
             psql -h localhost -U tune -d tune_test -v ON_ERROR_STOP=1 -q -f "$migration"
           done
 
+      - name: Format UPnP conservé dans la file PostgreSQL (#8788)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8788 -- --nocapture --test-threads=1
+
       - name: Schema-drift regression (#1706)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
