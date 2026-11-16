@@ -1,0 +1,17 @@
+# Service utilisateur systemd du compagnon MPRIS (#8824).
+#
+#   cp tune-mpris.service ~/.config/systemd/user/
+#   systemctl --user edit tune-mpris   # Environment=TUNE_SERVER=http://nas:8888 TUNE_ZONE=Salon
+#   systemctl --user enable --now tune-mpris
+[Unit]
+Description=Tune : zone sur MPRIS (touches multimedia, applets, playerctl)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/tune-mpris
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
